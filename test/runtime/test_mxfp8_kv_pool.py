@@ -191,6 +191,107 @@ def _make_slab_pool(size: int = 512):
         )
 
 
+def _make_lcm_pool():
+    from unittest import mock
+
+    from tokenspeed.runtime.configs import paged_cache_spec
+    from tokenspeed.runtime.configs.flat_memory_plan import (
+        inkling_lcm_field_specs,
+        plan_lcm_fields,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache import mha as mha_mod
+    from tokenspeed.runtime.layers.attention.kv_cache.mha import (
+        MHATokenToKVPoolMXFP8,
+    )
+    from tokenspeed.runtime.layers.attention.registry import (
+        _inkling_checkpoint_group_specs,
+    )
+
+    layer_types = ("full_attention", "sliding_attention_0")
+    fields = inkling_lcm_field_specs(
+        layer_group_ids=layer_types,
+        logical_block_tokens=128,
+        layer_kv_heads=(2, 4),
+        head_dim=HEAD_DIM,
+        kv_element_size=1,
+        hidden_size=256,
+        checkpoint_rows=3,
+        kvconv_element_size=2,
+        hiddenconv_element_size=1,
+        kv_scale_block_size=32,
+        kv_scale_element_size=1,
+    )
+    prototype = plan_lcm_fields(
+        fields,
+        logical_block_tokens=128,
+        budget_bytes=1 << 30,
+        max_padding_fraction=16.0,
+    )
+    plan = plan_lcm_fields(
+        fields,
+        logical_block_tokens=128,
+        budget_bytes=3 * prototype.lcm_block_bytes,
+        max_padding_fraction=16.0,
+    )
+    size = (
+        plan.num_lcm_blocks
+        * max(group.cache_blocks_per_lcm_block for group in plan.groups)
+        * plan.logical_block_tokens
+    )
+    with mock.patch.object(
+        paged_cache_spec, "scheduler_ext_flat_kvcache", return_value=True
+    ), mock.patch.object(
+        mha_mod.paged_cache_spec, "scheduler_ext_flat_kvcache", return_value=True
+    ):
+        return MHATokenToKVPoolMXFP8(
+            size=size,
+            dtype=torch.float8_e4m3fn,
+            head_num=HEADS,
+            head_dim=HEAD_DIM,
+            layer_num=len(layer_types),
+            device="cuda",
+            enable_memory_saver=False,
+            max_batch_size=8,
+            max_context_len=size,
+            page_size=128,
+            rank=0,
+            layer_types=layer_types,
+            sliding_window_tokens=512,
+            max_scheduled_tokens=size,
+            extra_paged_groups=_inkling_checkpoint_group_specs(plan),
+            slot_tokens=128,
+            layer_kv_head_counts=(2, 4),
+            kv_alloc_head_count=4,
+            lcm_memory_plan=plan,
+            layer_cache_group_ids=layer_types,
+        )
+
+
+def test_lcm_scale_views_keep_uniform_logical_page_tokens():
+    pool = _make_lcm_pool()
+
+    assert pool._layer_page_tokens(0) == 128
+    assert pool._layer_page_tokens(1) == 128
+    full, _ = pool.get_kv_scale_buffer(0)
+    swa, _ = pool.get_kv_scale_buffer(1)
+    assert full.shape[1:] == (2, 1, 32, SF_DIM, SF_DIM)
+    assert swa.shape[1:] == (4, 1, 32, SF_DIM, SF_DIM)
+
+
+@pytest.mark.parametrize("layer_id, heads", [(0, 2), (1, 4)])
+def test_lcm_kv_rows_preserve_native_head_page_addressing(layer_id: int, heads: int):
+    pool = _make_lcm_pool()
+    pages = pool._lcm_arena.field_tensor(f"layer.{layer_id}.k", pool.store_dtype)
+    rows = pool.get_key_buffer(layer_id)
+
+    assert rows.shape == (pages.shape[0] * pool.page_size, heads, HEAD_DIM)
+
+    page_id = pages.shape[0] - 1
+    offset = pool.page_size - 1
+    rows[page_id * pool.page_size + offset].fill_(layer_id + 1)
+    assert torch.all(pages[page_id, offset] == layer_id + 1)
+
+
 def test_slab_geometry_and_aliasing():
     pool = _make_slab_pool()
     num_ids = (pool.size + pool._slot_tokens) // pool.page_size

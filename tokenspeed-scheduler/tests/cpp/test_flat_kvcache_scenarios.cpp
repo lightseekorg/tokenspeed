@@ -137,6 +137,112 @@ TEST_F(FlatChunkedPrefillSuite, MultiChunkPrefillGrowsFullTableThenDecodes) {
         << "all pages returned to the pool after a chunked-prefill request finishes";
 }
 
+class FlatMambaChunkAlignmentSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.block_size = 4;
+        cfg.device_allocator.total_pages = 64;
+        cfg.host_allocator.total_pages = 64;
+        cfg.max_scheduled_tokens = 6;
+        cfg.max_batch_size = 8;
+        cfg.enable_l3_storage = false;
+        cfg.disable_l2_cache = true;
+        cfg.disable_prefix_cache = true;
+        cfg.paged_cache_groups = {
+            MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
+                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
+            MakeGroup("state", cfg.block_size, cfg.device_allocator.total_pages,
+                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::State),
+        };
+        return cfg;
+    }
+};
+
+TEST_F(FlatMambaChunkAlignmentSuite, PartialPrefillEndsAtStatePageBoundary) {
+    Submit(MakeRequestSpec("r1", /*num_pages=*/3));  // 12 tokens
+
+    for (std::int32_t expected_prefix : {0, 4, 8}) {
+        ExecutionPlan plan = PlanOnce();
+        const FlatForwardOperation* op = FindFlatOp(plan);
+        ASSERT_NE(op, nullptr);
+        ASSERT_EQ(op->input_lengths.size(), 1u);
+        ASSERT_EQ(op->extend_prefix_lens.size(), 1u);
+        EXPECT_EQ(op->input_lengths[0], 4);
+        EXPECT_EQ(op->extend_prefix_lens[0], expected_prefix);
+    }
+}
+
+class FlatMambaMixedBudgetSuite : public FlatMambaChunkAlignmentSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = FlatMambaChunkAlignmentSuite::MakeConfig();
+        cfg.max_scheduled_tokens = cfg.block_size;
+        cfg.enable_mixed_prefill_decode = true;
+        return cfg;
+    }
+};
+
+TEST_F(FlatMambaMixedBudgetSuite, StatePrefillKeepsOnePageOfMixedBudget) {
+    Submit(MakeRequestSpec("decode", /*num_pages=*/1));
+    PlanOnce();
+    SendForwardDone("decode", {42});
+
+    Submit(MakeRequestSpec("prefill", /*num_pages=*/2, /*start=*/101));
+    ExecutionPlan plan = PlanOnce();
+    const FlatForwardOperation* op = FindFlatOp(plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids.size(), 1u);
+    EXPECT_EQ(op->request_ids.front(), "prefill");
+    EXPECT_EQ(op->input_lengths.front(), config_.block_size);
+}
+
+class FlatMambaMixedSpareBudgetSuite : public FlatMambaMixedBudgetSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = FlatMambaMixedBudgetSuite::MakeConfig();
+        cfg.max_scheduled_tokens = cfg.block_size + cfg.decode_input_tokens;
+        return cfg;
+    }
+};
+
+TEST_F(FlatMambaMixedSpareBudgetSuite, DecodeUsesOnlyBudgetAboveReservedStatePage) {
+    Submit(MakeRequestSpec("decode", /*num_pages=*/1));
+    PlanOnce();
+    SendForwardDone("decode", {42});
+
+    Submit(MakeRequestSpec("prefill", /*num_pages=*/2, /*start=*/101));
+    ExecutionPlan plan = PlanOnce();
+    const FlatForwardOperation* op = FindFlatOp(plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids.size(), 2u);
+    const auto decode = std::ranges::find(op->request_ids, "decode");
+    const auto prefill = std::ranges::find(op->request_ids, "prefill");
+    ASSERT_NE(decode, op->request_ids.end());
+    ASSERT_NE(prefill, op->request_ids.end());
+    EXPECT_EQ(op->input_lengths[std::distance(op->request_ids.begin(), decode)], config_.decode_input_tokens);
+    EXPECT_EQ(op->input_lengths[std::distance(op->request_ids.begin(), prefill)], config_.block_size);
+}
+
+TEST(FlatMambaChunkAlignmentConfigTest, RejectsBudgetSmallerThanStatePage) {
+    SchedulerConfig cfg{};
+    cfg.block_size = 4;
+    cfg.device_allocator.total_pages = 64;
+    cfg.host_allocator.total_pages = 64;
+    cfg.max_scheduled_tokens = 3;
+    cfg.max_batch_size = 8;
+    cfg.disable_l2_cache = true;
+    cfg.disable_prefix_cache = true;
+    cfg.paged_cache_groups = {
+        MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
+                  PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
+        MakeGroup("state", cfg.block_size, cfg.device_allocator.total_pages,
+                  PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::State),
+    };
+
+    EXPECT_THROW((void)Scheduler(std::move(cfg)), std::invalid_argument);
+}
+
 // ---------------------------------------------------------------------------
 // Three cache groups: full + two sliding windows. Group 0 stays full-history
 // to honor the flat consumer's block_tables_[0] contract.

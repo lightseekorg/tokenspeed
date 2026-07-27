@@ -407,7 +407,7 @@ class PrefillGraph:
             self._input_embeds_buf[num_tokens:bucket].zero_()
 
     def _dummy_flat_tables(self, num_tokens: int) -> dict[str, "torch.Tensor"]:
-        """Dummy batch must carry flat tables (else the non-flat path gets captured); zeros = null block 0."""
+        """Build capture tables: null KV pages and one writable state page."""
         backend = self.attn_backend
         if not getattr(backend, "uses_flat_cache_groups", False):
             return {}
@@ -422,9 +422,13 @@ class PrefillGraph:
         # ALL groups, state included: hybrid wrappers forward the dict to the
         # mamba child, which requires its state group; KV children shed state
         # groups themselves (_shed_state_groups).
+        state_group_ids = getattr(backend, "flat_state_group_ids", frozenset())
         return {
-            str(spec.group_id): torch.zeros(
-                (1, width), dtype=torch.int32, device=self.config.device
+            str(spec.group_id): torch.full(
+                (1, width),
+                1 if str(spec.group_id) in state_group_ids else 0,
+                dtype=torch.int32,
+                device=self.config.device,
             )
             for spec in getattr(self.token_to_kv_pool, "paged_cache_group_specs", ())
         }

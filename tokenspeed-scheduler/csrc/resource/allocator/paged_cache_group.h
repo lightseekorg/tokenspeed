@@ -64,6 +64,8 @@ struct PagedCacheGroupConfig {
     std::optional<std::int32_t> sliding_window_tokens{};
     // History groups form a chain; State groups only need the trailing window.
     PagedCacheGroupFamily family{PagedCacheGroupFamily::History};
+    // Producer capability: every completed State boundary has been written.
+    bool materializes_all_boundaries{false};
 
     std::int32_t RawTokensPerPage() const { return rows_per_page * entry_stride_tokens; }
 

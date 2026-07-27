@@ -64,6 +64,8 @@ struct KvCacheSpec {
     // Number of this group's logical cache blocks packed into one physical
     // LCM block. It affects placement only, never prefix-match granularity.
     std::int32_t cache_blocks_per_lcm_block{1};
+    // True only when the producer writes every completed State boundary.
+    bool materializes_all_boundaries{false};
 };
 
 // Per-request logical-page -> physical-page mapping.
@@ -88,13 +90,16 @@ private:
 };
 
 // Per-group input for one admission. completed_page_hashes publishes only the
-// full pages produced since the previous admission; num_tokens is the capacity
-// needed by the next step. The request retains ownership of table.
+// full pages produced since the previous admission; completed_end_tokens says
+// whether a legacy final-only State producer ended on an aligned boundary.
+// num_tokens is the capacity needed by the next step. The request retains
+// ownership of table.
 struct GroupDemand {
     BlockTable* table{nullptr};
     std::int32_t num_tokens{0};
     std::span<const std::string> completed_page_hashes{};
     std::int32_t completed_first_page_slot{0};
+    std::int32_t completed_end_tokens{-1};
     std::int32_t num_computed_tokens{-1};
     std::int32_t reserve_tokens{0};
 };

@@ -50,6 +50,8 @@ def _load(mod_name: str, file_name: str):
 
 _plan = _load("flat_memory_plan_gdn_assembly_under_test", "flat_memory_plan.py")
 equalized_block_size = _plan.equalized_block_size
+hybrid_lcm_field_specs = _plan.hybrid_lcm_field_specs
+plan_lcm_fields = _plan.plan_lcm_fields
 
 
 # Qwen3.5-ish interleaving: 3 linear layers then 1 full, times 12 (48 layers).
@@ -232,6 +234,12 @@ class GdnFlatPoolAssemblyTest(unittest.TestCase):
             sorted(spec.group_id for spec in pool.paged_cache_group_specs),
             ["full_attention", "linear_attention"],
         )
+        self.assertTrue(
+            all(
+                not spec.materializes_all_boundaries
+                for spec in pool.paged_cache_group_specs
+            )
+        )
         # Plan-sized coverage (M18a T4): the k/v lists stay layer-indexed,
         # but state layers carry no KV tensors (None slots) -- only the
         # full-attention layer allocates.
@@ -247,6 +255,60 @@ class GdnFlatPoolAssemblyTest(unittest.TestCase):
     def test_geometry_raises_at_original_page_size(self):
         with self.assertRaisesRegex(ValueError, "pre-equalized"):
             self._pool(page_size=4)
+
+    def test_lcm_plan_allocates_one_backing_and_four_group_views(self):
+        from tokenspeed.runtime.configs.paged_cache_spec import (
+            split_recurrent_state_groups,
+        )
+
+        page_size = 8
+        group_ids = tuple(split_recurrent_state_groups(self.LAYER_TYPES))
+        fields = hybrid_lcm_field_specs(
+            layer_types=self.LAYER_TYPES,
+            layer_group_ids=group_ids,
+            logical_block_tokens=page_size,
+            kv_shape=(page_size, 1, 8),
+            kv_element_size=2,
+            conv_shape=self.CONV_SHAPE,
+            conv_element_size=2,
+            ssm_shape=self.TEMPORAL_SHAPE,
+            ssm_element_size=4,
+        )
+        plan = plan_lcm_fields(
+            fields,
+            logical_block_tokens=page_size,
+            budget_bytes=4 * 256,
+            alignment=8,
+            max_padding_fraction=2.0,
+        )
+        config = self._config(page_size)
+        config.layer_cache_group_ids = group_ids
+        config.lcm_memory_plan = plan
+        with mock.patch(_PKG_FLAT_PROBE, return_value=True):
+            pool = config.create_pool(
+                len(self.LAYER_TYPES),
+                plan.num_lcm_blocks * page_size,
+                0,
+                False,
+            )
+
+        backing_storage = pool._lcm_arena.backing.untyped_storage().data_ptr()
+        for tensor in [
+            *(value for value in pool.k_buffer if value is not None),
+            *(value for value in pool.v_buffer if value is not None),
+            *(tensor for pair in pool.state_slabs for tensor in pair),
+        ]:
+            self.assertEqual(tensor.untyped_storage().data_ptr(), backing_storage)
+        self.assertEqual(len(pool.paged_cache_group_specs), 4)
+        self.assertEqual(
+            {spec.group_id for spec in pool.paged_cache_group_specs},
+            set(group_ids),
+        )
+        for spec in pool.paged_cache_group_specs:
+            self.assertEqual(
+                spec.materializes_all_boundaries,
+                spec.family == "state",
+            )
 
 
 if __name__ == "__main__":

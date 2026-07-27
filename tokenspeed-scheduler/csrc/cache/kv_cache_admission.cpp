@@ -301,7 +301,7 @@ std::optional<KvCacheCoordinator::AdmissionResult> KvCacheCoordinator::Admit(Pre
         const GroupDemand& demand = demands[i];
         if (!demand.completed_page_hashes.empty()) {
             cacheFullBlocksForGroup(i, *demand.table, demand.completed_page_hashes, demand.completed_first_page_slot,
-                                    demand.num_computed_tokens);
+                                    demand.completed_end_tokens);
         }
         if (demand.num_computed_tokens >= 0) {
             groups_[i].Manager().ReclaimExpired(pool_, *demand.table, demand.num_computed_tokens);

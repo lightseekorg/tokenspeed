@@ -61,6 +61,9 @@ from tokenspeed.runtime.layers.attention.backends.base import (
 from tokenspeed.runtime.layers.attention.backends.mha import (
     _scrub_extend_padding,
 )
+from tokenspeed.runtime.layers.attention.backends.shortconv_checkpoint import (
+    plan_shortconv_checkpoint_writes,
+)
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
@@ -68,6 +71,18 @@ logger = get_colorful_logger(__name__)
 
 # Matches the runtime causal_conv1d kernels' padded-slot sentinel.
 PAD_SLOT_ID = -1
+
+
+@dataclass
+class ShortConvCheckpointMetadata:
+    """Device indices for restoring and publishing boundary checkpoints."""
+
+    restore_pages: dict[str, torch.Tensor]
+    write_pages: dict[str, torch.Tensor]
+    write_requests: torch.Tensor
+    packed_rows: torch.Tensor | None = None
+    prior_state_rows: torch.Tensor | None = None
+    packed_row_mask: torch.Tensor | None = None
 
 
 @dataclass
@@ -113,6 +128,7 @@ class InklingConvMetadata:
     col_page_table: dict[str, torch.Tensor] | None = None
     col_seq_lens: torch.Tensor | None = None
     col_prefix_lens: torch.Tensor | None = None
+    checkpoints: ShortConvCheckpointMetadata | None = None
     # Lazy cache of ``_write_lag_extend``'s md-only index math (one forward's
     # streams share it; md is rebuilt every forward).
     lag_extend_cache: tuple | None = None
@@ -233,6 +249,159 @@ class InklingAttnBackend(AttentionBackend):
     # ------------------------------------------------------------------
     # Conv metadata
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _checkpoint_pages_at_boundaries(
+        table: torch.Tensor,
+        lengths: torch.Tensor,
+        page_size: int,
+    ) -> torch.Tensor:
+        """Resolve aligned boundary lengths to page ids; zero means no action."""
+        lengths = lengths.to(dtype=torch.int64)
+        is_boundary = (lengths > 0) & (lengths.remainder(page_size) == 0)
+        slots = torch.div(lengths, page_size, rounding_mode="floor") - 1
+        slots = slots.clamp(min=0, max=table.shape[1] - 1)
+        pages = table.gather(1, slots.unsqueeze(1)).squeeze(1).to(torch.int32)
+        torch._assert_async(
+            ((~is_boundary) | (pages > 0)).all(),
+            "ShortConv checkpoint boundary is a hole or pad",
+        )
+        return torch.where(is_boundary, pages, torch.zeros_like(pages))
+
+    def _build_checkpoint_metadata(
+        self,
+        *,
+        bs: int,
+        seq_lens: torch.Tensor,
+        forward_mode: ForwardMode,
+        col_page_table: dict[str, torch.Tensor] | None,
+        extend_seq_lens_cpu: torch.Tensor | None,
+        extend_prefix_lens: torch.Tensor | None,
+        extend_prefix_lens_cpu: torch.Tensor | None,
+    ) -> ShortConvCheckpointMetadata | None:
+        geometry = getattr(self, "conv_columns", None)
+        if (
+            geometry is None
+            or geometry.get("mode") != "checkpoint"
+            or col_page_table is None
+        ):
+            return None
+        if not forward_mode.is_extend_or_mixed() and self.conv_spec_num_tokens > 1:
+            raise RuntimeError(
+                "Inkling LCM checkpoints do not yet support speculative decode"
+            )
+
+        page_size = int(geometry["block_tokens"])
+        groups = tuple(geometry["group_block_tokens"])
+        if forward_mode.is_extend_or_mixed():
+            if extend_prefix_lens is None or extend_prefix_lens_cpu is None:
+                raise RuntimeError(
+                    "ShortConv checkpoints require extend prefix lengths on "
+                    "both CPU and device"
+                )
+            before_device = extend_prefix_lens[:bs]
+        else:
+            # Decode consumes one token per request. Restoring on an aligned
+            # boundary is harmless for a live request and initializes a
+            # fully-cached request whose first execution step is decode.
+            before_device = seq_lens[:bs] - 1
+
+        restore_pages = {
+            group_id: self._checkpoint_pages_at_boundaries(
+                col_page_table[group_id][:bs],
+                before_device,
+                page_size,
+            )
+            for group_id in groups
+        }
+
+        if not forward_mode.is_extend_or_mixed():
+            write_requests = torch.arange(bs, dtype=torch.int64, device=seq_lens.device)
+            return ShortConvCheckpointMetadata(
+                restore_pages=restore_pages,
+                write_pages={
+                    group_id: self._checkpoint_pages_at_boundaries(
+                        col_page_table[group_id][:bs],
+                        seq_lens[:bs],
+                        page_size,
+                    )
+                    for group_id in groups
+                },
+                write_requests=write_requests,
+            )
+
+        if extend_seq_lens_cpu is None:
+            raise RuntimeError("ShortConv checkpoints require CPU extend lengths")
+        before = tuple(int(value) for value in extend_prefix_lens_cpu[:bs])
+        extend = tuple(int(value) for value in extend_seq_lens_cpu[:bs])
+        after = tuple(prefix + length for prefix, length in zip(before, extend))
+        query_start_loc = [0]
+        for length in extend:
+            query_start_loc.append(query_start_loc[-1] + length)
+        writes = plan_shortconv_checkpoint_writes(
+            page_size=page_size,
+            state_rows=self.conv_pool.kernel_size - 1,
+            seq_lens_before=before,
+            seq_lens_after=after,
+            query_start_loc=query_start_loc,
+        )
+        device = seq_lens.device
+        if not writes:
+            empty = torch.empty(0, dtype=torch.int64, device=device)
+            return ShortConvCheckpointMetadata(
+                restore_pages=restore_pages,
+                write_pages={group_id: empty.to(torch.int32) for group_id in groups},
+                write_requests=empty,
+            )
+
+        write_requests = torch.tensor(
+            [write.request_index for write in writes],
+            dtype=torch.int64,
+            device=device,
+        )
+        page_slots = torch.tensor(
+            [write.page_slot for write in writes],
+            dtype=torch.int64,
+            device=device,
+        )
+        write_pages = {}
+        for group_id in groups:
+            pages = col_page_table[group_id][write_requests, page_slots].to(torch.int32)
+            torch._assert_async(
+                (pages > 0).all(),
+                "ShortConv checkpoint destination is a hole or pad",
+            )
+            write_pages[group_id] = pages
+
+        packed_rows = torch.tensor(
+            [
+                [0 if row is None else row for row in write.packed_rows]
+                for write in writes
+            ],
+            dtype=torch.int64,
+            device=device,
+        )
+        prior_state_rows = torch.tensor(
+            [
+                [0 if row is None else row for row in write.prior_state_rows]
+                for write in writes
+            ],
+            dtype=torch.int64,
+            device=device,
+        )
+        packed_row_mask = torch.tensor(
+            [[row is not None for row in write.packed_rows] for write in writes],
+            dtype=torch.bool,
+            device=device,
+        )
+        return ShortConvCheckpointMetadata(
+            restore_pages=restore_pages,
+            write_pages=write_pages,
+            write_requests=write_requests,
+            packed_rows=packed_rows,
+            prior_state_rows=prior_state_rows,
+            packed_row_mask=packed_row_mask,
+        )
 
     def _decode_query_start_loc(self, bs: int, device) -> torch.Tensor:
         if self._decode_qsl is None or self._decode_qsl.shape[0] < bs + 1:
@@ -370,6 +539,15 @@ class InklingAttnBackend(AttentionBackend):
                 bs, dtype=torch.bool, device=req_pool_indices.device
             )
             is_decode = True
+        checkpoints = self._build_checkpoint_metadata(
+            bs=bs,
+            seq_lens=seq_lens,
+            forward_mode=forward_mode,
+            col_page_table=col_page_table,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+        )
         self.conv_metadata = InklingConvMetadata(
             query_start_loc=query_start_loc,
             cache_indices=cache_indices,
@@ -381,6 +559,7 @@ class InklingAttnBackend(AttentionBackend):
             col_page_table=col_page_table,
             col_seq_lens=seq_lens[:bs] if col_page_table is not None else None,
             col_prefix_lens=col_prefix_lens,
+            checkpoints=checkpoints,
         )
 
     # ------------------------------------------------------------------
@@ -498,6 +677,91 @@ class InklingAttnBackend(AttentionBackend):
         state a decode-window lookback row actually follows.
         """
         return self._draft_lag_conv_state[layer_id]
+
+    @staticmethod
+    def restore_shortconv_checkpoint(
+        state: torch.Tensor,
+        checkpoint_buffers: tuple[torch.Tensor, ...],
+        metadata: InklingConvMetadata,
+        group_id: str,
+    ) -> None:
+        """Restore an aligned cached boundary into request rolling slots."""
+        checkpoints = metadata.checkpoints
+        if checkpoints is None:
+            return
+        pages = checkpoints.restore_pages[group_id]
+        slots = metadata.cache_indices[: pages.shape[0]].to(torch.int64)
+        valid = (pages > 0) & (slots >= 0)
+        valid_rows = torch.nonzero(valid, as_tuple=False).flatten()
+        pages = pages[valid_rows].to(torch.int64)
+        slots = slots[valid_rows]
+        restored = torch.cat(
+            [buffer[pages].to(state.dtype) for buffer in checkpoint_buffers],
+            dim=-1,
+        )
+        if restored.shape[-1] != state.shape[-1]:
+            raise ValueError(
+                f"ShortConv checkpoint width {restored.shape[-1]} does not "
+                f"match rolling state width {state.shape[-1]}"
+            )
+        state[slots] = restored
+
+    @staticmethod
+    def publish_shortconv_checkpoints(
+        x: torch.Tensor,
+        state: torch.Tensor,
+        checkpoint_buffers: tuple[torch.Tensor, ...],
+        metadata: InklingConvMetadata,
+        group_id: str,
+    ) -> None:
+        """Publish completed boundaries without changing the rolling state."""
+        checkpoints = metadata.checkpoints
+        if checkpoints is None:
+            return
+        pages = checkpoints.write_pages[group_id]
+        if pages.numel() == 0:
+            return
+        if checkpoints.packed_rows is None:
+            # Single-token decode has already advanced the rolling window.
+            slots = metadata.cache_indices[: pages.shape[0]].to(torch.int64)
+            valid = (pages > 0) & (slots >= 0)
+            valid_rows = torch.nonzero(valid, as_tuple=False).flatten()
+            pages = pages[valid_rows]
+            rows = state[slots[valid_rows]]
+        else:
+            requests = checkpoints.write_requests
+            slots = metadata.cache_indices[requests].to(torch.int64)
+            torch._assert_async(
+                (slots >= 0).all(),
+                "ShortConv prefill checkpoint references a padded request",
+            )
+            old_state = state[slots.clamp_min(0)]
+            old_rows = torch.gather(
+                old_state,
+                1,
+                checkpoints.prior_state_rows[..., None].expand(
+                    -1, -1, old_state.shape[-1]
+                ),
+            )
+            packed_rows = x[checkpoints.packed_rows]
+            rows = torch.where(
+                checkpoints.packed_row_mask[..., None],
+                packed_rows,
+                old_rows,
+            )
+
+        offset = 0
+        pages = pages.to(torch.int64)
+        for buffer in checkpoint_buffers:
+            width = buffer.shape[-1]
+            new_rows = rows[..., offset : offset + width].to(buffer.dtype)
+            buffer[pages] = new_rows
+            offset += width
+        if offset != rows.shape[-1]:
+            raise ValueError(
+                f"ShortConv checkpoint buffers cover {offset} channels but "
+                f"rolling state has {rows.shape[-1]}"
+            )
 
     def apply_conv_state_update(
         self,
@@ -1012,6 +1276,12 @@ class InklingAttnBackend(AttentionBackend):
                 "Inkling prefill graph needs fully-paged sconv; rolling conv "
                 "state is per-batch-shaped and cannot be graphed by token bucket"
             )
+        if geo.get("mode") == "checkpoint":
+            raise RuntimeError(
+                "Inkling ShortConv boundary checkpoints currently use "
+                "dynamic per-boundary metadata; prefill graph is disabled "
+                "until that metadata has static bucket buffers"
+            )
         if geo.get("hidden_group_of_layer") is None:
             raise RuntimeError(
                 "Inkling prefill graph needs paged hidden conv; the ATTN/MLP "
@@ -1064,6 +1334,11 @@ class InklingAttnBackend(AttentionBackend):
         self._decode_qsl = torch.arange(max_bs + 1, dtype=torch.int32, device=device)
         self._graph_seq_lens = seq_lens_buf
         if getattr(self, "conv_columns", None) is not None:
+            if self.conv_columns.get("mode") == "checkpoint":
+                raise RuntimeError(
+                    "Inkling ShortConv boundary checkpoints require eager "
+                    "execution until their graph metadata uses static buffers"
+                )
             # Adopted stacked views are filled by the mixin's packed unpack; pad rows hit dummy slot 0.
             inner_tabs = getattr(self.inner, "cuda_graph_flat_page_tables", {})
             groups = self.conv_columns["group_block_tokens"]

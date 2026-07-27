@@ -24,6 +24,7 @@ from dataclasses import dataclass
 
 import torch
 
+from tokenspeed.runtime.configs.flat_memory_plan import LcmMemoryPlan
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.configs.paged_cache_spec import (
     STATE_LAYER_TYPES,
@@ -64,6 +65,10 @@ class MHAConfig(BaseAttnConfig):
     temporal_state_shape: tuple[int, ...] | None = None
     conv_dtype: torch.dtype | None = None
     ssm_dtype: torch.dtype | None = None
+    # Optional two-level Flat layout. Radix and non-LCM Flat paths leave these
+    # unset and retain their existing allocation.
+    lcm_memory_plan: LcmMemoryPlan | None = None
+    layer_cache_group_ids: tuple[str, ...] = ()
 
     @classmethod
     def generate(
@@ -209,4 +214,6 @@ class MHAConfig(BaseAttnConfig):
             temporal_state_shape=self.temporal_state_shape,
             conv_dtype=self.conv_dtype,
             ssm_dtype=self.ssm_dtype,
+            lcm_memory_plan=self.lcm_memory_plan,
+            layer_cache_group_ids=self.layer_cache_group_ids,
         )

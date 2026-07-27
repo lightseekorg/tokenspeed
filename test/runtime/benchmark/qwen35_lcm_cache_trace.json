@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "model": "nvidia/Qwen3.5-397B-A17B-NVFP4",
+  "logical_block_tokens": 128,
+  "full_cache_blocks_per_lcm_block": 32,
+  "state_group_count": 3,
+  "capacity_prompt_bucket": "bulk_32k_plus_1",
+  "max_scheduled_tokens": 8192,
+  "decode_reserve_tokens": 1,
+  "seed": 20260726,
+  "token_id_min": 1024,
+  "token_id_max_exclusive": 32768,
+  "no_pressure_fraction": 0.45,
+  "fixed_pressure_fraction": 0.9,
+  "boundary_tree": [
+    "cache_block",
+    "full_parent",
+    "parent_plus_child"
+  ],
+  "buckets": [
+    {
+      "name": "cache_block",
+      "pages": 1
+    },
+    {
+      "name": "full_parent",
+      "pages": 32
+    },
+    {
+      "name": "parent_plus_child",
+      "pages": 33
+    },
+    {
+      "name": "bulk_32k_plus_1",
+      "pages": 256,
+      "tail_tokens": 1
+    }
+  ]
+}

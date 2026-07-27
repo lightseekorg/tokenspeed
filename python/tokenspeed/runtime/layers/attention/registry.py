@@ -29,13 +29,18 @@ import torch
 from tokenspeed.runtime.configs.flat_memory_plan import (
     components_from_layers,
     equalized_block_size,
+    hybrid_lcm_field_specs,
+    inkling_lcm_field_specs,
     plan_component_tensors,
+    plan_lcm_fields,
     state_const_bytes,
 )
 from tokenspeed.runtime.configs.model_config import AttentionArch, is_deepseek_v4
 from tokenspeed.runtime.configs.paged_cache_spec import (
+    PagedCacheGroupSpec,
     hybrid_slab_group_size,
     scheduler_ext_flat_kvcache,
+    split_recurrent_state_groups,
 )
 from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
@@ -55,7 +60,6 @@ from tokenspeed.runtime.utils.env import envs
 logger = logging.getLogger(__name__)
 
 _CI_SMALL_KV_SIZE = envs.TOKENSPEED_CI_SMALL_KV_SIZE.get_set_value_or(None)
-
 if TYPE_CHECKING:
     from tokenspeed.runtime.configs.model_config import ModelConfig
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -99,7 +103,112 @@ def _resolve_draft_cache_cell_size_for_profile(
         return draft_profile_cache_cell_size
     if draft_attn_config is None or draft_model_config is None:
         return 0
-    return draft_attn_config.cache_cell_size() * draft_model_config.num_attention_layers
+    storage_layers = _kv_profile_layer_divisor(
+        draft_model_config.num_attention_layers,
+        draft_attn_config.layer_types,
+        sliding_window_tokens=draft_attn_config.sliding_window_tokens,
+    )
+    return draft_attn_config.cache_cell_size() * storage_layers
+
+
+def _max_lcm_packing(plan, group_ids=None) -> int:
+    """Largest child page-id span among the selected LCM groups."""
+    packing = {
+        group.group_id: int(group.cache_blocks_per_lcm_block) for group in plan.groups
+    }
+    if group_ids is None:
+        return max(packing.values())
+    selected = [packing[group_id] for group_id in group_ids if group_id in packing]
+    if not selected:
+        raise ValueError(
+            f"LCM plan has none of the requested groups: {sorted(group_ids)}"
+        )
+    return max(selected)
+
+
+def _pool_allocated_bytes(pool) -> int:
+    if pool is None:
+        return 0
+    plan = getattr(pool, "_lcm_memory_plan", None)
+    if plan is not None:
+        arena = getattr(pool, "_lcm_arena", None)
+        if arena is None:
+            raise RuntimeError("LCM pool has no allocated arena")
+        return int(arena.backing.nbytes)
+    sizes = pool.get_kv_size_bytes()
+    if isinstance(sizes, tuple):
+        return sum(int(size) for size in sizes)
+    return int(sizes)
+
+
+def _cache_storage_report(
+    *,
+    configured_cache_bytes: int,
+    pool,
+    draft_pool,
+    mamba_pool,
+) -> dict:
+    """Describe cache storage from allocated tensors, not scheduler counts."""
+    plan = getattr(pool, "_lcm_memory_plan", None)
+    if plan is not None:
+        packing = {
+            group.group_id: int(group.cache_blocks_per_lcm_block)
+            for group in plan.groups
+        }
+        physical_token_capacity = (
+            int(plan.num_lcm_blocks)
+            * max(packing.values())
+            * int(plan.logical_block_tokens)
+        )
+        if physical_token_capacity != int(pool.size):
+            raise RuntimeError(
+                "LCM geometry capacity does not match the allocated pool size"
+            )
+        capacity_source = "lcm_geometry"
+        geometry = {
+            "logical_block_tokens": int(plan.logical_block_tokens),
+            "num_lcm_blocks": int(plan.num_lcm_blocks),
+            "cache_blocks_per_lcm_block": packing,
+        }
+    else:
+        rows = {
+            int(tensor.shape[0])
+            for tensor in getattr(pool, "k_buffer", ())
+            if tensor is not None
+        }
+        slot_tokens = int(getattr(pool, "_slot_tokens", pool.page_size))
+        capacities = {row - slot_tokens for row in rows}
+        if capacities != {int(pool.size)}:
+            raise RuntimeError(
+                "allocated KV rows do not match the profiled token capacity"
+            )
+        physical_token_capacity = capacities.pop()
+        capacity_source = "allocated_token_rows"
+        geometry = {
+            "logical_block_tokens": int(pool.page_size),
+            "allocated_rows": physical_token_capacity + slot_tokens,
+            "reserved_rows": slot_tokens,
+        }
+
+    target_bytes = _pool_allocated_bytes(pool)
+    draft_bytes = _pool_allocated_bytes(draft_pool)
+    mamba_bytes = (
+        int(mamba_pool.conv_state.nbytes) + int(mamba_pool.ssm_state.nbytes)
+        if mamba_pool is not None
+        else 0
+    )
+    return {
+        "configured_cache_bytes": int(configured_cache_bytes),
+        "allocated_cache_bytes": target_bytes + draft_bytes + mamba_bytes,
+        "physical_token_capacity": physical_token_capacity,
+        "capacity_source": capacity_source,
+        "geometry": geometry
+        | {
+            "target_bytes": target_bytes,
+            "draft_bytes": draft_bytes,
+            "mamba_bytes": mamba_bytes,
+        },
+    }
 
 
 # ---------- backend registry ----------
@@ -122,8 +231,9 @@ _HYBRID_GDN_ARCHITECTURES = {
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5ForConditionalGenerationNextN",
 }
+_LCM_MAX_PADDING_FRACTION = 1.0
 
-# Inkling stays on the plain dense path (thin sconv wrapper); deliberately NOT hybrid-GDN
+# Inkling uses the MHA backend plus its thin sconv wrapper; it is not hybrid-GDN.
 _INKLING_ARCHITECTURES = {
     "InklingForConditionalGeneration",
     "InklingForConditionalGenerationNextN",
@@ -426,15 +536,62 @@ def _floor_tokens_to_layout_grid(max_num_tokens: int, config) -> int:
     return floored
 
 
-def _apply_inkling_hetero_kv(config, model_config) -> None:
+def _apply_inkling_hetero_kv(config, model_config, *, lcm: bool = False) -> None:
     """Zero-padding slots: full=256 fills the slot, swa=128 leads (tail padded); ids sized by slot."""
     from tokenspeed.runtime.configs.inkling_config import inkling_kv_heads_for_layer
 
-    config.slot_tokens = 256
-    config.group_page_sizes = {"full_attention": 256}
+    config.slot_tokens = 128 if lcm else 256
+    config.group_page_sizes = {} if lcm else {"full_attention": 256}
     tc = model_config.hf_config.get_text_config()
     config.layer_kv_head_counts = tuple(
         inkling_kv_heads_for_layer(tc, i, True) for i in range(tc.num_hidden_layers)
+    )
+
+
+def _inkling_checkpoint_group_specs(plan) -> tuple[PagedCacheGroupSpec, ...]:
+    """Publish the two ShortConv checkpoint groups from their LCM geometry."""
+    packing = {
+        group.group_id: group.cache_blocks_per_lcm_block for group in plan.groups
+    }
+    missing = {"kvconv", "hiddenconv"} - packing.keys()
+    if missing:
+        raise ValueError(f"Inkling LCM plan is missing groups: {sorted(missing)}")
+    return tuple(
+        PagedCacheGroupSpec(
+            group_id=group_id,
+            retention="full_history",
+            rows_per_page=plan.logical_block_tokens,
+            entry_stride_tokens=1,
+            sliding_window_tokens=None,
+            family="state",
+            cache_blocks_per_lcm_block=packing[group_id],
+            materializes_all_boundaries=True,
+        )
+        for group_id in ("kvconv", "hiddenconv")
+    )
+
+
+def _inkling_lcm_fields(config, text_config, logical_block_tokens):
+    """Map one Inkling config to the model-independent LCM field planner."""
+    per_rank_heads = tuple(
+        max(1, heads // config.attn_tp_size) for heads in config.layer_kv_head_counts
+    )
+    hiddenconv_element_size = (
+        2 if os.environ.get("INKLING_FP8_SCONV", "0") == "0" else 1
+    )
+    return inkling_lcm_field_specs(
+        layer_group_ids=config.layer_types,
+        logical_block_tokens=logical_block_tokens,
+        layer_kv_heads=per_rank_heads,
+        head_dim=config.head_dim,
+        kv_element_size=config.kv_cache_dtype.itemsize,
+        hidden_size=text_config.hidden_size,
+        checkpoint_rows=text_config.sconv_kernel_size - 1,
+        # K/V ShortConv activations remain BF16 even when KV is MXFP8.
+        kvconv_element_size=2,
+        hiddenconv_element_size=hiddenconv_element_size,
+        kv_scale_block_size=32 if config.kv_cache_mxfp8 else 0,
+        kv_scale_element_size=1 if config.kv_cache_mxfp8 else 0,
     )
 
 
@@ -531,12 +688,31 @@ def _wrap_inkling_backend(inner, text_config, attn_config, *, num_layers, is_dra
     return backend, conv_pool
 
 
-def _inkling_conv_columns(pool, text_config, conv_bt, hbt):
+def _inkling_conv_columns(pool, text_config, conv_bt=None, hbt=None):
     """kvconv-as-swa geometry for the backend (None if no kvconv pages).
 
     Columns live in the layers' own K/V slots; backend gets only geometry + layer->group map.
     """
     layer_labels = text_config.paged_cache_layer_types
+    if pool._lcm_memory_plan is not None:
+        block_tokens = pool._lcm_memory_plan.logical_block_tokens
+        conv_columns = {
+            "mode": "checkpoint",
+            "block_tokens": block_tokens,
+            "conv_group_of_layer": ("kvconv",) * len(layer_labels),
+            "hidden_group_of_layer": ("hiddenconv",) * len(layer_labels),
+            "group_block_tokens": {
+                "kvconv": block_tokens,
+                "hiddenconv": block_tokens,
+            },
+        }
+        logger.info(
+            "Inkling ShortConv boundary checkpoints: P=%d, groups=%s",
+            block_tokens,
+            tuple(conv_columns["group_block_tokens"]),
+        )
+        return conv_columns
+
     labels = list(dict.fromkeys(layer_labels))
     num_conv_blocks = sum(
         pool.paged_cache_group_page_counts.get(f"kvconv_{label}", 0) for label in labels
@@ -641,11 +817,13 @@ def create_attn_components(
     int,
     int,
     object | None,
+    dict | None,
 ]:
     arch = model_config.attention_arch
 
     architectures = getattr(model_config.hf_config, "architectures", None) or []
     is_hybrid_gdn = any(a in _HYBRID_GDN_ARCHITECTURES for a in architectures)
+    is_inkling = any(a in _INKLING_ARCHITECTURES for a in architectures)
     is_deepseek_v4_model = is_deepseek_v4(model_config.hf_config)
     is_deepseek_v4_draft_model = draft_model_config is not None and is_deepseek_v4(
         draft_model_config.hf_config
@@ -669,7 +847,21 @@ def create_attn_components(
             server_args.drafter_attention_backend = None
 
     config = _create_attn_config(server_args, model_config)
-    is_flat_gdn = getattr(config, "conv_state_shape", None) is not None
+    has_gdn_state = getattr(config, "conv_state_shape", None) is not None
+    use_lcm_gdn = is_hybrid_gdn and has_gdn_state and scheduler_ext_flat_kvcache()
+    # Keep the production Inkling path unchanged until boundary checkpoints
+    # cover prefill graphs and speculative decoding as well as eager/decode.
+    use_lcm_inkling = (
+        is_inkling
+        and scheduler_ext_flat_kvcache()
+        and os.environ.get("INKLING_LCM", "0") == "1"
+    )
+    inkling_bf16_checkpoints = (
+        use_lcm_inkling and os.environ.get("INKLING_FP8_SCONV", "0") == "0"
+    )
+    lcm_max_padding_fraction = (
+        float("inf") if inkling_bf16_checkpoints else _LCM_MAX_PADDING_FRACTION
+    )
     gdn_state_bytes = (
         state_const_bytes(
             config.conv_state_shape,
@@ -677,10 +869,62 @@ def create_attn_components(
             config.temporal_state_shape,
             config.ssm_dtype,
         )
-        if is_flat_gdn
+        if has_gdn_state
         else None
     )
-    if is_flat_gdn:
+    flat_lcm_fields = None
+    if use_lcm_gdn:
+        if config.kv_cache_mxfp8:
+            raise RuntimeError(
+                "Qwen LCM backing does not yet support the MXFP8 interleaved "
+                "scale layout"
+            )
+        logical_block_tokens = 128
+        if server_args.block_size != logical_block_tokens:
+            logger.info(
+                "Setting Qwen LCM logical block size to %d tokens "
+                "(configured block size %d)",
+                logical_block_tokens,
+                server_args.block_size,
+            )
+            server_args.block_size = logical_block_tokens
+            config.page_size = logical_block_tokens
+        layer_group_ids = tuple(split_recurrent_state_groups(config.layer_types))
+        config.layer_cache_group_ids = layer_group_ids
+        flat_lcm_fields = hybrid_lcm_field_specs(
+            layer_types=config.layer_types,
+            layer_group_ids=layer_group_ids,
+            logical_block_tokens=logical_block_tokens,
+            kv_shape=(
+                logical_block_tokens,
+                max(config.num_kv_heads // config.attn_tp_size, 1),
+                config.head_dim,
+            ),
+            kv_element_size=config.kv_cache_dtype.itemsize,
+            conv_shape=config.conv_state_shape,
+            conv_element_size=config.conv_dtype.itemsize,
+            ssm_shape=config.temporal_state_shape,
+            ssm_element_size=config.ssm_dtype.itemsize,
+        )
+    elif use_lcm_inkling:
+        logical_block_tokens = 128
+        if server_args.block_size != logical_block_tokens:
+            logger.info(
+                "Setting Inkling LCM logical block size to %d tokens "
+                "(configured block size %d)",
+                logical_block_tokens,
+                server_args.block_size,
+            )
+            server_args.block_size = logical_block_tokens
+            config.page_size = logical_block_tokens
+        _apply_inkling_hetero_kv(config, model_config, lcm=True)
+        config.layer_cache_group_ids = tuple(config.layer_types)
+        flat_lcm_fields = _inkling_lcm_fields(
+            config,
+            model_config.hf_config.get_text_config(),
+            logical_block_tokens,
+        )
+    elif has_gdn_state:
         equalized_block_size_value = equalized_block_size(
             layer_types=list(config.layer_types),
             kv_bytes_per_slot=config.cache_cell_size(),
@@ -765,8 +1009,10 @@ def create_attn_components(
     has_mamba = getattr(model_config, "mambaish_config", None) is not None or (
         has_mamba_layers
     )
+    cache_budget_bytes = None
     mamba_pool_total_chunks = 0
     mamba_pool = None
+    draft_max_num_tokens = None
 
     _profile_kwargs = dict(
         attn_config=config,
@@ -824,7 +1070,97 @@ def create_attn_components(
             server_args.block_size,
             server_args.max_total_tokens,
         )
-    elif has_mamba and is_flat_gdn:
+    elif use_lcm_gdn or use_lcm_inkling:
+        cache_memory = profile_available_cache_memory_bytes(
+            attn_config=config,
+            gpu_id=gpu_id,
+            tp_size=server_args.mapping.world_size,
+            gpu_memory_utilization=server_args.gpu_memory_utilization,
+            total_gpu_memory=gpu_memory,
+            world_group=server_args.mapping.world_group,
+        )
+        cache_budget_bytes = cache_memory
+        flat_plan = plan_lcm_fields(
+            flat_lcm_fields,
+            logical_block_tokens=server_args.block_size,
+            budget_bytes=cache_memory,
+            alignment=256,
+            # Separate contiguous K/V planes currently cost up to one raw
+            # CacheBlock of padding per group slot. Explicit BF16 Inkling
+            # checkpoints trade capacity for a dedicated precision plane, so
+            # their measured geometry, rather than this heuristic, is the
+            # relevant acceptance check.
+            max_padding_fraction=lcm_max_padding_fraction,
+        )
+        max_packing = _max_lcm_packing(flat_plan)
+        draft_packing = max_packing
+        draft_bytes_per_token = 0
+        if draft_attn_config is not None:
+            # The draft pool consumes the target layers' flat page tables,
+            # not extra state/checkpoint groups. Size its dense page-id
+            # space from those groups only (Inkling checkpoint K can be
+            # 21/42 while its attention K is at most 2).
+            draft_packing = _max_lcm_packing(
+                flat_plan, set(config.layer_cache_group_ids)
+            )
+            draft_bytes_per_token = _resolve_draft_cache_cell_size_for_profile(
+                draft_attn_config, draft_model_config, draft_profile_cache_cell_size
+            )
+        bytes_per_usable_parent = flat_plan.lcm_block_bytes + (
+            draft_bytes_per_token * server_args.block_size * draft_packing
+        )
+        # The target arena materializes one full null LCM parent. The dense
+        # draft pool needs only page id 0, i.e. one P-row dummy page rather
+        # than K draft pages.
+        fixed_null_bytes = flat_plan.lcm_block_bytes + (
+            draft_bytes_per_token * server_args.block_size
+        )
+        num_lcm_blocks = (cache_memory - fixed_null_bytes) // bytes_per_usable_parent
+        if num_lcm_blocks < 1:
+            raise ValueError(
+                "cache budget must hold a null parent and one usable LCM parent"
+            )
+        token_limit = server_args.max_total_tokens
+        if _CI_SMALL_KV_SIZE is not None and int(_CI_SMALL_KV_SIZE) > 0:
+            ci_limit = int(_CI_SMALL_KV_SIZE)
+            token_limit = (
+                ci_limit if token_limit is None else min(token_limit, ci_limit)
+            )
+        if token_limit is not None:
+            requested_lcm_blocks = token_limit // server_args.block_size // max_packing
+            if requested_lcm_blocks < 1:
+                raise ValueError(
+                    "the configured token limit must hold at least one LCM parent "
+                    f"({server_args.block_size * max_packing} child tokens)"
+                )
+            num_lcm_blocks = min(num_lcm_blocks, requested_lcm_blocks)
+        flat_plan = plan_lcm_fields(
+            flat_lcm_fields,
+            logical_block_tokens=server_args.block_size,
+            budget_bytes=(num_lcm_blocks + 1) * flat_plan.lcm_block_bytes,
+            alignment=256,
+            max_padding_fraction=lcm_max_padding_fraction,
+        )
+        config.lcm_memory_plan = flat_plan
+        if use_lcm_inkling:
+            config.extra_paged_groups = _inkling_checkpoint_group_specs(flat_plan)
+        max_total_num_pages = flat_plan.num_lcm_blocks
+        logger.info(
+            "Flat LCM profile: lcm_block_bytes=%d, P=%d, "
+            "num_lcm_blocks=%d, groups=%s",
+            flat_plan.lcm_block_bytes,
+            server_args.block_size,
+            flat_plan.num_lcm_blocks,
+            {
+                group.group_id: group.cache_blocks_per_lcm_block
+                for group in flat_plan.groups
+            },
+        )
+        max_num_tokens = flat_plan.num_lcm_blocks * max_packing * server_args.block_size
+        draft_max_num_tokens = (
+            flat_plan.num_lcm_blocks * draft_packing * server_args.block_size
+        )
+    elif has_mamba and has_gdn_state:
         draft_row_bytes = 0
         if draft_attn_config is not None:
             draft_row_bytes = (
@@ -841,6 +1177,7 @@ def create_attn_components(
             total_gpu_memory=gpu_memory,
             world_group=server_args.mapping.world_group,
         )
+        cache_budget_bytes = cache_memory
         flat_plan = plan_component_tensors(
             components_from_layers(
                 layer_types=list(config.layer_types),
@@ -865,6 +1202,14 @@ def create_attn_components(
         )
     elif has_mamba and server_args.max_mamba_cache_size is not None:
         mamba_pool_total_chunks = server_args.max_mamba_cache_size
+        cache_budget_bytes = profile_available_cache_memory_bytes(
+            attn_config=config,
+            gpu_id=gpu_id,
+            tp_size=server_args.mapping.world_size,
+            gpu_memory_utilization=server_args.gpu_memory_utilization,
+            total_gpu_memory=gpu_memory,
+            world_group=server_args.mapping.world_group,
+        )
         full_attn_layer_ids = getattr(text_config, "full_attention_layer_ids", None)
         num_kv_layers = (
             len(full_attn_layer_ids)
@@ -904,7 +1249,11 @@ def create_attn_components(
             if full_attn_layer_ids is not None
             else num_layers - num_mamba_layers
         )
-        kv_max_num_pages, mamba_pool_total_chunks = profile_cache_budget(
+        (
+            kv_max_num_pages,
+            mamba_pool_total_chunks,
+            cache_budget_bytes,
+        ) = profile_cache_budget(
             **{**_profile_kwargs, "num_attention_layers": num_kv_layers},
             mem_fraction_static=server_args.gpu_memory_utilization,
             mamba_memory_per_chunk=memory_per_mamba_chunk,
@@ -945,8 +1294,14 @@ def create_attn_components(
             server_args.max_total_tokens,
         )
 
-    if _CI_SMALL_KV_SIZE is not None and int(_CI_SMALL_KV_SIZE) > 0:
+    if (
+        config.lcm_memory_plan is None
+        and _CI_SMALL_KV_SIZE is not None
+        and int(_CI_SMALL_KV_SIZE) > 0
+    ):
         max_num_tokens = int(_CI_SMALL_KV_SIZE)
+    if draft_max_num_tokens is None:
+        draft_max_num_tokens = max_num_tokens
     if max_num_tokens <= 0:
         raise ValueError(
             f"KV cache token pool size must be positive, got {max_num_tokens}"
@@ -994,16 +1349,15 @@ def create_attn_components(
             mamba_pool_total_chunks=mamba_pool_total_chunks,
         )
     else:
-        is_inkling = any(a in _INKLING_ARCHITECTURES for a in architectures)
         # Hetero KV + paged sconv are unconditional for Inkling (the
         # INKLING_HETERO_KV / INKLING_PAGED_SCONV bisection gates were
         # retired 2026-07-15 after the experiments settled).
         paged_sconv = is_inkling
-        if is_inkling:
+        if is_inkling and not use_lcm_inkling:
             _apply_inkling_hetero_kv(config, model_config)
             # Must run AFTER the hetero fields exist on the config.
             max_num_tokens = _floor_tokens_to_layout_grid(max_num_tokens, config)
-        if paged_sconv:
+        if paged_sconv and not use_lcm_inkling:
             _conv_bt, _hbt = _publish_inkling_conv_groups(
                 config, model_config, server_args
             )
@@ -1026,7 +1380,12 @@ def create_attn_components(
                 _start_inkling_pool_probe(pool, conv_pool, rank, _probe_dir)
             conv_columns = None
             if paged_sconv:
-                conv_columns = _inkling_conv_columns(pool, text_config, _conv_bt, _hbt)
+                conv_columns = _inkling_conv_columns(
+                    pool,
+                    text_config,
+                    _conv_bt if not use_lcm_inkling else None,
+                    _hbt if not use_lcm_inkling else None,
+                )
             backend.conv_columns = conv_columns
             if conv_columns is not None:
                 # Wrapper-owned conv groups: the attention mixin skips their write-loc math and capture fills
@@ -1047,7 +1406,7 @@ def create_attn_components(
                 draft_model_config.attention_arch, draft_attn_config
             )
             draft_pool = DeepseekV4TokenToKVPool(
-                size=max_num_tokens,
+                size=draft_max_num_tokens,
                 model_dtype=draft_model_config.dtype,
                 layout=draft_deepseek_v4_layout,
                 layer_num=draft_model_config.num_attention_layers,
@@ -1071,7 +1430,7 @@ def create_attn_components(
                 draft_model_config,
                 draft_attn_config,
                 draft_model_config.attention_arch,
-                max_num_tokens,
+                draft_max_num_tokens,
                 rank,
                 enable_memory_saver,
                 full_attn_backend_name=(
@@ -1103,7 +1462,15 @@ def create_attn_components(
             # allocation. (The former num_kv_heads pin + explicit 2x row
             # sizing described the all-full-attention special case of this
             # same byte math.)
-            _apply_inkling_hetero_kv(draft_attn_config, draft_model_config)
+            _apply_inkling_hetero_kv(
+                draft_attn_config,
+                draft_model_config,
+                lcm=use_lcm_inkling,
+            )
+            if use_lcm_inkling:
+                draft_attn_config.layer_cache_group_ids = tuple(
+                    draft_attn_config.layer_types
+                )
             logger.info(
                 "Inkling MTP draft pool: hetero KV layer head counts=%s, "
                 "layer types=%s, group page sizes=%s (%d depths, %d ids)",
@@ -1111,7 +1478,7 @@ def create_attn_components(
                 draft_attn_config.layer_types,
                 draft_attn_config.group_page_sizes,
                 num_depths,
-                max_num_tokens // config.page_size,
+                draft_max_num_tokens // config.page_size,
             )
             draft_attn_backend = _create_attn_backend(
                 draft_model_config.attention_arch, draft_attn_config
@@ -1119,7 +1486,7 @@ def create_attn_components(
             draft_pool = _create_attn_pool(
                 draft_attn_config,
                 num_depths,
-                max_num_tokens,
+                draft_max_num_tokens,
                 rank,
                 enable_memory_saver,
             )
@@ -1138,10 +1505,21 @@ def create_attn_components(
             draft_pool = _create_attn_pool(
                 draft_attn_config,
                 draft_layers,
-                max_num_tokens,
+                draft_max_num_tokens,
                 rank,
                 enable_memory_saver,
             )
+
+    cache_storage = None
+    if is_hybrid_gdn or use_lcm_inkling:
+        if cache_budget_bytes is None:
+            raise RuntimeError("LCM cache profile did not record its byte budget")
+        cache_storage = _cache_storage_report(
+            configured_cache_bytes=cache_budget_bytes,
+            pool=pool,
+            draft_pool=draft_pool,
+            mamba_pool=mamba_pool,
+        )
 
     return (
         backend,
@@ -1151,4 +1529,5 @@ def create_attn_components(
         max_num_tokens,
         mamba_pool_total_chunks,
         mamba_pool,
+        cache_storage,
     )

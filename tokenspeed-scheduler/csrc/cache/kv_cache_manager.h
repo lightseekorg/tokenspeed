@@ -219,8 +219,6 @@ public:
         return (over + cache_block_tokens_ - 1) / cache_block_tokens_;
     }
 
-    virtual bool RegistersAlignedFinalPageOnly() const { return false; }
-
     void CacheBlock(BlockPool& pool, CacheBlockRef& block_ref, const CacheKey& key, std::uint64_t& next_recency,
                     std::int32_t logical_block_index = -1,
                     std::vector<std::pair<CacheKey, CacheBlockRef>>* newly_cached = nullptr) {

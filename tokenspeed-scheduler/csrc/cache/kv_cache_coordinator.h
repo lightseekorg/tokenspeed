@@ -54,6 +54,7 @@ public:
     std::int32_t NumGroups() const { return static_cast<std::int32_t>(groups_.size()); }
 
     std::int32_t CacheBlockTokens() const noexcept { return cache_block_tokens_; }
+    bool HasMambaStateGroup() const;
 
     KvCacheManager& GroupManager(std::int32_t i) { return groups_[static_cast<std::size_t>(i)].Manager(); }
     const KvCacheManager& GroupManager(std::int32_t i) const { return groups_[static_cast<std::size_t>(i)].Manager(); }
@@ -88,9 +89,8 @@ public:
     std::int32_t BlocksNeededFor(std::int32_t num_tokens) const;
     std::int32_t NumAvailableLcmBlocks() const;
 
-    // end_tokens = the chunk's end position (-1 = unknown/legacy): aligned-final-page-only
-    // groups register nothing without it, since only an aligned chunk end holds a real snapshot.
-    // registered slots are skipped per slot, so repeated coverage is idempotent.
+    // Legacy State producers only materialize an aligned chunk-end snapshot.
+    // Producers that advertise materializes_all_boundaries register the whole range.
     void CacheFullBlocks(std::span<BlockTable> tables, std::span<const std::string> content_hashes,
                          std::int32_t first_slot = 0, std::int32_t end_tokens = -1);
     void ReclaimExpired(std::span<BlockTable> tables, std::int32_t num_computed_tokens);

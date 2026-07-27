@@ -4,8 +4,8 @@ Prefill-graph replay pads q/k/v rows to the bucket while flat per-group
 write locs cover only the real (leading) tokens; the mha KV write must trim
 the padded tail or the store kernel walks past the loc array (IAE on the
 first padded replay -- reproduced on gpt-oss + flat + default prefill graph).
-Capture must also exercise the flat metadata branch via all-zero dummy
-tables so capture and replay take the same code path.
+Capture must also exercise the flat metadata branch via dummy block tables
+so capture and replay take the same code path.
 """
 
 from __future__ import annotations
@@ -61,7 +61,7 @@ class TrimKvToLocsTest(unittest.TestCase):
 
 
 class DummyFlatTablesTest(unittest.TestCase):
-    """Capture-time dummy tables: one all-zero row per non-state flat group."""
+    """Capture-time dummy tables: null KV pages and writable state pages."""
 
     def setUp(self):
         try:
@@ -79,7 +79,7 @@ class DummyFlatTablesTest(unittest.TestCase):
         pg.config = SimpleNamespace(device="cpu")
         return pg
 
-    def test_flat_backend_gets_zero_tables_per_group(self):
+    def test_flat_backend_gets_writable_state_tables(self):
         backend = SimpleNamespace(
             uses_flat_cache_groups=True,
             page_size=32,
@@ -100,7 +100,12 @@ class DummyFlatTablesTest(unittest.TestCase):
         )
         for t in tables.values():
             self.assertEqual(t.shape, (1, 4))  # ceil(100/32)
-            self.assertEqual(int(t.abs().sum()), 0)  # null block 0 only
+        self.assertEqual(int(tables["full_attention"].abs().sum()), 0)
+        self.assertEqual(int(tables["sliding_attention"].abs().sum()), 0)
+        self.assertTrue(
+            bool((tables["linear_attention"] == 1).all()),
+            "state checkpoints need a writable dummy page during graph capture",
+        )
 
     def test_full_width_for_stride_deriving_backends(self):
         # trtllm-style: row stride comes from max_kv_len, so dummy tables

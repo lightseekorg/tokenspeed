@@ -52,6 +52,11 @@ KvCacheCoordinator::KvCacheCoordinator(std::vector<CacheGroup> groups, std::int3
     }
 }
 
+bool KvCacheCoordinator::HasMambaStateGroup() const {
+    return std::ranges::any_of(groups_,
+                               [](const CacheGroup& group) { return group.Spec().kind == AttnKind::kMambaState; });
+}
+
 std::vector<CacheKey> KvCacheCoordinator::keysForGroup(std::span<const std::string> content_hashes,
                                                        GroupId group_id) const {
     std::vector<CacheKey> keys;
@@ -228,7 +233,8 @@ void KvCacheCoordinator::cacheFullBlocksForGroup(std::size_t group_index, BlockT
     std::vector<CacheKey> keys = keysForGroup(content_hashes, groups_[group_index].Id());
     std::int32_t group_first_slot = first_slot;
     std::span<const CacheKey> group_keys = keys;
-    if (groups_[group_index].Manager().RegistersAlignedFinalPageOnly()) {
+    const KvCacheSpec& spec = groups_[group_index].Spec();
+    if (spec.kind == AttnKind::kMambaState && !spec.materializes_all_boundaries) {
         if (end_tokens < 0 || end_tokens % cache_block_tokens_ != 0 || keys.empty()) {
             return;
         }

@@ -20,16 +20,9 @@
 
 """GDN/mamba2 state-slab management for the flat KV pool.
 
-Extracted verbatim from ``MHATokenToKVPool`` so the "MHA" (multi-head
-attention KV) class no longer mixes recurrent-state bookkeeping into its
-attention-KV responsibility. Behavior is byte-identical: same equalization
-pre-check, same flat-GDN gate, same slab shapes/dtypes/count, same null-page
-(row 0) convention, and the same ``get_state_buffers`` return values and
-error cases.
-
-The state slabs live under the SAME page-id space as the KV pages (a single
-block-id space): one ``(conv, ssm)`` pair per state LAYER, row-indexed by
-page id, row 0 the never-written null page.
+The legacy path allocates one ``(conv, ssm)`` tensor pair per state layer.
+The LCM path binds group-local page views owned by the pool's shared arena.
+Both use row 0 as the never-written null page.
 """
 
 from __future__ import annotations
@@ -38,6 +31,7 @@ import torch
 
 from tokenspeed.runtime.configs import paged_cache_spec
 from tokenspeed.runtime.configs.flat_memory_plan import (
+    LcmMemoryPlan,
     equalized_block_size,
     state_const_bytes,
 )
@@ -59,8 +53,7 @@ class FlatStateSlabs:
         conv_dtype / ssm_dtype: State dtypes; default to ``default_dtype``.
         default_dtype: Pool store dtype used when a state dtype is ``None``.
         page_size: The (already-equalized) page size P.
-        size: Total token slots (the flat pool size; must be whole pages
-            when slabs are active).
+        size: Total token slots used by the legacy allocation path.
         kv_bytes_per_slot: Bytes one KV history slot occupies
             (``2 * head_num * head_dim * store_dtype.itemsize``); used only
             by the equalization pre-check.
@@ -82,6 +75,7 @@ class FlatStateSlabs:
         page_size: int,
         size: int,
         kv_bytes_per_slot: int,
+        lcm_memory_plan: LcmMemoryPlan | None = None,
     ):
         self._layer_types = tuple(layer_types or ())
         # Per-state-layer mamba2 shapes (configs' mamba2_cache_params);
@@ -110,7 +104,8 @@ class FlatStateSlabs:
         }
 
         if (
-            self._conv_state_shape is not None
+            lcm_memory_plan is None
+            and self._conv_state_shape is not None
             and self._temporal_state_shape is not None
         ):
             # The flat plan packs [conv|ssm] state rows and KV rows into one
@@ -178,11 +173,10 @@ class FlatStateSlabs:
         if not self._flat_gdn:
             self.state_slabs = []
             return
-        # State slabs (GDN/mamba2 conv+ssm rows): one (conv, ssm) pair per
-        # state LAYER (n-th state layer -> pair n), row-indexed by page id
-        # over the SAME page-id space as the KV pages; row 0 is the null
-        # page, never written -- mirrors the KV buffers' +page_size
-        # dummy-page convention.
+        if self.state_slabs:
+            return
+        # Legacy flat layout: one (conv, ssm) pair per state layer. Row 0 is
+        # the null page, mirroring the KV buffers' +page_size dummy page.
         assert self.size % self.page_size == 0, "flat pool size must be whole pages"
         self.num_pages_with_null = self.size // self.page_size + 1
         # The config publishes SSM rows directly in the kernels' native K-last
@@ -207,6 +201,27 @@ class FlatStateSlabs:
             len(self._layer_state_pair),
             self.num_pages_with_null,
         )
+
+    def bind_lcm_slabs(
+        self, slabs_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]]
+    ) -> None:
+        """Bind stable views owned by the pool's single LCM arena."""
+        if not self._flat_gdn:
+            raise ValueError("cannot bind LCM state slabs when flat state is inactive")
+        missing = set(self._layer_state_pair) - set(slabs_by_layer)
+        if missing:
+            raise ValueError(f"missing LCM state slabs for layers {sorted(missing)}")
+        self.state_slabs = [
+            slabs_by_layer[layer_id]
+            for layer_id, _ in sorted(
+                self._layer_state_pair.items(), key=lambda item: item[1]
+            )
+        ]
+        page_counts = {int(conv.shape[0]) for conv, _ in self.state_slabs}
+        page_counts.update(int(ssm.shape[0]) for _, ssm in self.state_slabs)
+        # Kept for legacy callers. LCM groups may legally have different K,
+        # and therefore different page counts.
+        self.num_pages_with_null = page_counts.pop() if len(page_counts) == 1 else None
 
     def get_state_buffers(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
         """(conv, ssm) state slab pair for a state layer; the n-th state

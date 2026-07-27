@@ -200,6 +200,7 @@ class EventLoop:
             self.max_total_num_tokens,
             mamba_pool_total_chunks,
             mamba_pool,
+            self.cache_storage,
         ) = create_attn_components(
             server_args,
             self.model_config,
@@ -380,7 +381,13 @@ class EventLoop:
         if required_groups is not None and server_args.enable_prefix_caching:
             prefix_cache_adjunct = pool_to_prefix_cache_adjunct_spec(required_groups)
         scheduler_cfg = make_config(
-            num_device_pages=self.max_total_num_tokens // server_args.block_size,
+            num_device_pages=(
+                # Scheduler reserves page/parent 0 and constructs BlockPool
+                # from total_pages - 1.
+                token_to_kv_pool.num_lcm_blocks + 1
+                if getattr(token_to_kv_pool, "num_lcm_blocks", None) is not None
+                else self.max_total_num_tokens // server_args.block_size
+            ),
             max_scheduled_tokens=server_args.chunked_prefill_size,
             max_batch_size=per_rank_max_batch,
             page_size=server_args.block_size,
@@ -1894,6 +1901,7 @@ def run_event_loop(
                 "max_num_seqs": server_args.max_num_seqs,
                 "chunked_prefill_size": server_args.chunked_prefill_size,
                 "max_model_len": event_loop.model_config.context_len,
+                "cache_storage": event_loop.cache_storage,
             }
         )
 

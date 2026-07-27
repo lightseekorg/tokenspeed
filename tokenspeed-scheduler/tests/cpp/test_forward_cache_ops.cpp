@@ -353,6 +353,7 @@ TEST(MakeSpecsFromConfigTest, StateFamilyMapsToMambaStateKind) {
     PagedCacheGroupConfig state_grp;
     state_grp.group_id = "linear_attention";
     state_grp.family = PagedCacheGroupFamily::State;
+    state_grp.materializes_all_boundaries = true;
     config.paged_cache_groups = {full_grp, state_grp};
 
     std::vector<KvCacheSpec> specs = MakeSpecsFromConfig(config);
@@ -361,14 +362,15 @@ TEST(MakeSpecsFromConfigTest, StateFamilyMapsToMambaStateKind) {
     EXPECT_EQ(specs[1].kind, AttnKind::kMambaState);
     EXPECT_EQ(specs[1].sliding_window, 0);
     EXPECT_EQ(specs[1].cache_blocks_per_lcm_block, 1);
+    EXPECT_TRUE(specs[1].materializes_all_boundaries);
 }
 
-TEST(MakeSpecsFromConfigTest, Qwen35UsesOneLogicalPAndPerGroupPacking) {
+TEST(MakeSpecsFromConfigTest, Qwen35Fp8UsesOneLogicalPAndPerGroupPacking) {
     SchedulerConfig config;
     config.block_size = 128;
     PagedCacheGroupConfig full;
     full.group_id = "full";
-    full.cache_blocks_per_lcm_block = 8;
+    full.cache_blocks_per_lcm_block = 16;
     PagedCacheGroupConfig state0;
     state0.group_id = "state0";
     state0.family = PagedCacheGroupFamily::State;
@@ -381,7 +383,7 @@ TEST(MakeSpecsFromConfigTest, Qwen35UsesOneLogicalPAndPerGroupPacking) {
     std::vector<KvCacheSpec> specs = MakeSpecsFromConfig(config);
 
     ASSERT_EQ(specs.size(), 4u);
-    EXPECT_EQ(specs[0].cache_blocks_per_lcm_block, 8);
+    EXPECT_EQ(specs[0].cache_blocks_per_lcm_block, 16);
     EXPECT_EQ(specs[1].cache_blocks_per_lcm_block, 1);
     EXPECT_EQ(specs[2].cache_blocks_per_lcm_block, 1);
     EXPECT_EQ(specs[3].cache_blocks_per_lcm_block, 1);

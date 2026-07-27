@@ -35,6 +35,10 @@ class PagedCacheGroupSpec:
     family: Family = "history"
     # Per-group page tokens; None -> scheduler global block_size, else a multiple of it.
     block_size: int | None = None
+    # Physical child CacheBlocks packed into one shared LCM parent.
+    cache_blocks_per_lcm_block: int = 1
+    # True only when the runtime writes every completed State boundary.
+    materializes_all_boundaries: bool = False
 
 
 _PAGED_CACHE_GROUP_DUMMY_PAGES = 1
@@ -182,6 +186,15 @@ def validate_flat_scheduler_config(
     if not flat_kvcache_ext:
         return
     pool_name = type(kv_pool).__name__
+    if speculative_algorithm is not None and not getattr(
+        attn_backend, "flat_spec_capable", True
+    ):
+        raise RuntimeError(
+            "flat scheduler build (TOKENSPEED_FLAT_KVCACHE): attention backend "
+            f"{type(attn_backend).__name__} does not support flat cache groups "
+            "with speculative decoding yet. Use a non-speculative run or a "
+            "radix-built tokenspeed_scheduler extension."
+        )
     backend = _flat_kv_backend(attn_backend)
     backend_name = type(backend).__name__
     uses_paged = bool(getattr(backend, "uses_paged_cache_groups", False))
@@ -435,12 +448,34 @@ def layer_group_ids(
     return [gid for gid, _, _ in _layer_specs(layer_types, sliding_window_tokens)]
 
 
+def split_recurrent_state_groups(layer_types: Sequence[str]) -> list[str]:
+    """Split each recurrent run by its position between history layers.
+
+    Qwen3.5 repeats ``state-0, state-1, state-2, full``. The three state
+    positions have independent physical layouts while repeated occurrences of
+    one position remain one cache group.
+    """
+    group_ids = []
+    state_position = 0
+    for label in layer_types:
+        if label in STATE_LAYER_TYPES:
+            group_ids.append(f"{label}_{state_position}")
+            state_position += 1
+        else:
+            group_ids.append(label)
+            state_position = 0
+    return group_ids
+
+
 def group_specs_from_layer_types(
     *,
     layer_types: Sequence[str],
+    group_ids: Sequence[str] | None = None,
     sliding_window_tokens: int | Sequence[int | None] | None,
     page_size: int,
     page_sizes: Mapping[str, int] | None = None,
+    cache_blocks_per_lcm_block: Mapping[str, int] | None = None,
+    materializes_all_state_boundaries: bool = False,
 ) -> list[PagedCacheGroupSpec]:
     """Derive paged-cache group specs from per-layer attention types.
 
@@ -451,6 +486,8 @@ def group_specs_from_layer_types(
         layer_types: Per-layer labels: "full_attention" / "sliding_attention"
             (or sliding sub-group labels "sliding_attention_<k>") /
             "linear_attention" (state-family, e.g. Qwen3.5 GDN).
+        group_ids: Optional physical group id per layer. Retention and family
+            still come from ``layer_types``.
         sliding_window_tokens: One window for all sliding layers (today's HF
             scalar), or a per-layer sequence (multi-window models; full-layer
             positions must be None).
@@ -458,6 +495,11 @@ def group_specs_from_layer_types(
         page_sizes: Per-group page sizes keyed by group id (heterogeneous
             block sizes); values must be positive multiples of page_size.
             Groups not listed use page_size.
+        cache_blocks_per_lcm_block: Per-group physical packing. Omitted groups
+            use one CacheBlock per physical parent.
+        materializes_all_state_boundaries: Whether the runtime writes every
+            completed logical boundary for State groups. History groups ignore
+            this capability.
 
     Raises:
         ValueError: unknown label; window sequence length mismatch; sliding
@@ -470,13 +512,40 @@ def group_specs_from_layer_types(
                 f"page_sizes[{gid!r}] = {ps} must be a positive "
                 f"multiple of page_size {page_size}"
             )
+    packing = dict(cache_blocks_per_lcm_block or {})
+    for gid, count in packing.items():
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            raise ValueError(
+                f"cache_blocks_per_lcm_block[{gid!r}] = {count!r} must be "
+                "a positive int"
+            )
+    layer_specs = _layer_specs(layer_types, sliding_window_tokens)
+    resolved_group_ids = (
+        list(group_ids) if group_ids is not None else [gid for gid, _, _ in layer_specs]
+    )
+    if len(resolved_group_ids) != len(layer_types):
+        raise ValueError(
+            f"group_ids has {len(resolved_group_ids)} entries but layer_types "
+            f"has {len(layer_types)}"
+        )
+
     specs: list[PagedCacheGroupSpec] = []
-    seen: set[str] = set()
-    for gid, retention, window in _layer_specs(layer_types, sliding_window_tokens):
+    seen: dict[str, tuple[Retention, int | None, Family]] = {}
+    for layer_id, ((_, retention, window), gid) in enumerate(
+        zip(layer_specs, resolved_group_ids)
+    ):
+        if not gid:
+            raise ValueError(f"group_ids[{layer_id}] must be non-empty")
+        family: Family = (
+            "state" if layer_types[layer_id] in STATE_LAYER_TYPES else "history"
+        )
         if gid in seen:
+            if seen[gid] != (retention, window, family):
+                raise ValueError(f"group_id {gid!r} mixes incompatible layer policies")
             continue
-        seen.add(gid)
+        seen[gid] = (retention, window, family)
         ps = sizes.pop(gid, None) or page_size
+        group_packing = packing.pop(gid, 1)
         specs.append(
             PagedCacheGroupSpec(
                 group_id=gid,
@@ -484,22 +553,33 @@ def group_specs_from_layer_types(
                 rows_per_page=ps,
                 entry_stride_tokens=1,
                 sliding_window_tokens=window,
-                family="state" if gid in STATE_LAYER_TYPES else "history",
+                family=family,
                 # Always explicit: unset groups inherit the C++ gcd base, which a finer extra group silently lowers.
                 block_size=ps,
+                cache_blocks_per_lcm_block=group_packing,
+                materializes_all_boundaries=(
+                    family == "state" and materializes_all_state_boundaries
+                ),
             )
         )
     if sizes:
         raise ValueError(f"page_sizes for unknown groups: {sorted(sizes)}")
+    if packing:
+        raise ValueError(
+            "cache_blocks_per_lcm_block for unknown groups: " f"{sorted(packing)}"
+        )
     return specs
 
 
 def publish_paged_cache_groups(
     *,
     layer_types: Sequence[str],
+    group_ids: Sequence[str] | None = None,
     sliding_window_tokens: int | Sequence[int | None] | None,
     page_size: int,
     page_sizes: Mapping[str, int] | None = None,
+    cache_blocks_per_lcm_block: Mapping[str, int] | None = None,
+    materializes_all_state_boundaries: bool = False,
     extra_groups: Sequence[PagedCacheGroupSpec] = (),
     max_live_requests: int,
     max_scheduled_tokens: int,
@@ -529,11 +609,23 @@ def publish_paged_cache_groups(
     """
     if not scheduler_ext_flat_kvcache():
         return None
+    packing = dict(cache_blocks_per_lcm_block or {})
+    for spec in extra_groups:
+        planned = packing.pop(spec.group_id, None)
+        if planned is not None and planned != spec.cache_blocks_per_lcm_block:
+            raise ValueError(
+                f"extra_groups[{spec.group_id!r}] packing "
+                f"{spec.cache_blocks_per_lcm_block} does not match LCM plan "
+                f"{planned}"
+            )
     specs = group_specs_from_layer_types(
         layer_types=tuple(layer_types) or (FULL_ATTENTION,),
+        group_ids=group_ids,
         sliding_window_tokens=sliding_window_tokens,
         page_size=page_size,
         page_sizes=page_sizes,
+        cache_blocks_per_lcm_block=packing,
+        materializes_all_state_boundaries=materializes_all_state_boundaries,
     )
     # Model-declared groups outside the layer-type vocabulary (e.g. paged sconv columns).
     for spec in extra_groups:
@@ -542,6 +634,11 @@ def publish_paged_cache_groups(
         # Smaller extra-group blocks lower the gcd base by design; MakeCoordinator asserts divisibility.
         if spec.block_size is not None and spec.block_size <= 0:
             raise ValueError(f"extra_groups[{spec.group_id!r}]: block_size must be > 0")
+        if spec.cache_blocks_per_lcm_block <= 0:
+            raise ValueError(
+                f"extra_groups[{spec.group_id!r}]: "
+                "cache_blocks_per_lcm_block must be > 0"
+            )
         specs.append(spec)
     counts = compute_paged_cache_group_page_counts(
         specs,
@@ -629,5 +726,6 @@ __all__ = [
     "layer_group_ids",
     "publish_paged_cache_groups",
     "scheduler_ext_flat_kvcache",
+    "split_recurrent_state_groups",
     "validate_flat_scheduler_config",
 ]

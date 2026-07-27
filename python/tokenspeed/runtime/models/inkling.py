@@ -388,7 +388,12 @@ def _sconv_apply(
     md = backend.conv_metadata
 
     geo = backend.conv_columns if md.col_page_table is not None else None
-    if geo is not None and conv_group in ("attnconv", "mlpconv"):
+    checkpoint_mode = geo is not None and geo.get("mode") == "checkpoint"
+    if (
+        geo is not None
+        and not checkpoint_mode
+        and conv_group in ("attnconv", "mlpconv")
+    ):
         if geo.get("hidden_group_of_layer") is None:
             geo = None  # hidden sites stay rolling without their groups
         else:
@@ -427,7 +432,7 @@ def _sconv_apply(
                 use_residual=True,
             )
 
-    if geo is not None and conv_group == "kvconv":
+    if geo is not None and not checkpoint_mode and conv_group == "kvconv":
         # kvconv-as-swa: columns stay 3D views — a 2D reshape would silently COPY, breaking persistence.
         table = md.col_page_table[geo["conv_group_of_layer"][layer_id]]
         k_cols, v_cols = ctx.token_to_kv_pool.kvconv_slot_views_for_layer(
@@ -478,9 +483,36 @@ def _sconv_apply(
     )
     state = pool_state[:, :, channel_offset : channel_offset + dim]
 
+    checkpoint_buffers = ()
+    checkpoint_group = None
+    if checkpoint_mode:
+        if md.lookback > 0 or md.update_mode != "inplace":
+            raise RuntimeError(
+                "Inkling LCM checkpoints do not yet support speculative "
+                "ShortConv state updates"
+            )
+        if conv_group == "kvconv":
+            checkpoint_group = "kvconv"
+            checkpoint_buffers = (
+                ctx.token_to_kv_pool.inkling_checkpoint_view(layer_id, "kvconv_k"),
+                ctx.token_to_kv_pool.inkling_checkpoint_view(layer_id, "kvconv_v"),
+            )
+        elif conv_group in ("attnconv", "mlpconv"):
+            checkpoint_group = "hiddenconv"
+            checkpoint_buffers = (
+                ctx.token_to_kv_pool.inkling_checkpoint_view(layer_id, conv_group),
+            )
+        if checkpoint_buffers:
+            backend.restore_shortconv_checkpoint(
+                state,
+                checkpoint_buffers,
+                md,
+                checkpoint_group,
+            )
+
     if md.is_decode:
         # Fused conv + residual + in-place cache shift.
-        return sconv_decode(
+        y = sconv_decode(
             x,
             weight,
             state,
@@ -489,6 +521,15 @@ def _sconv_apply(
             use_residual=True,
             enable_pdl=pdl_enabled(),
         )
+        if checkpoint_buffers:
+            backend.publish_shortconv_checkpoints(
+                x,
+                state,
+                checkpoint_buffers,
+                md,
+                checkpoint_group,
+            )
+        return y
     y = sconv_prefill(
         x,
         weight,
@@ -500,6 +541,14 @@ def _sconv_apply(
         activation=None,
         use_residual=True,
     )
+    if checkpoint_buffers:
+        backend.publish_shortconv_checkpoints(
+            x,
+            state,
+            checkpoint_buffers,
+            md,
+            checkpoint_group,
+        )
     # Backend owns the window write: mode-dependent under spec decoding (verify stash / catch-up).
     backend.apply_conv_state_update(
         x,

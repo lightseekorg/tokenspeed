@@ -36,6 +36,8 @@ _pcs = _load("paged_cache_spec_under_test", "paged_cache_spec.py")
 group_specs_from_layer_types = _pcs.group_specs_from_layer_types
 layer_group_ids = _pcs.layer_group_ids
 PagedCacheGroupSpec = _pcs.PagedCacheGroupSpec
+publish_paged_cache_groups = _pcs.publish_paged_cache_groups
+split_recurrent_state_groups = _pcs.split_recurrent_state_groups
 
 
 class GroupSpecsFromLayerTypesTest(unittest.TestCase):
@@ -161,7 +163,85 @@ class GroupSpecsFromLayerTypesTest(unittest.TestCase):
         self.assertEqual(state.family, "state")
         self.assertEqual(state.retention, "full_history")
         self.assertIsNone(state.sliding_window_tokens)
+        self.assertFalse(state.materializes_all_boundaries)
         self.assertEqual(by_id["full_attention"].family, "history")
+
+    def test_all_boundary_capability_applies_only_to_state_groups(self):
+        specs = group_specs_from_layer_types(
+            layer_types=["linear_attention", "full_attention"],
+            sliding_window_tokens=None,
+            page_size=128,
+            materializes_all_state_boundaries=True,
+        )
+        by_id = {spec.group_id: spec for spec in specs}
+        self.assertTrue(by_id["linear_attention"].materializes_all_boundaries)
+        self.assertFalse(by_id["full_attention"].materializes_all_boundaries)
+
+    def test_lcm_packing_is_explicit_per_group(self):
+        specs = group_specs_from_layer_types(
+            layer_types=["linear_attention", "full_attention"],
+            sliding_window_tokens=None,
+            page_size=128,
+            cache_blocks_per_lcm_block={
+                "linear_attention": 1,
+                "full_attention": 8,
+            },
+        )
+        by_id = {spec.group_id: spec for spec in specs}
+        self.assertEqual(
+            by_id["full_attention"].cache_blocks_per_lcm_block,
+            8,
+        )
+        self.assertEqual(
+            by_id["linear_attention"].cache_blocks_per_lcm_block,
+            1,
+        )
+
+    def test_lcm_packing_rejects_unknown_group(self):
+        with self.assertRaisesRegex(ValueError, "unknown groups"):
+            group_specs_from_layer_types(
+                layer_types=["full_attention"],
+                sliding_window_tokens=None,
+                page_size=128,
+                cache_blocks_per_lcm_block={"missing": 8},
+            )
+
+    def test_qwen35_state_runs_split_into_three_groups(self):
+        layer_types = (["linear_attention"] * 3 + ["full_attention"]) * 2
+        group_ids = split_recurrent_state_groups(layer_types)
+        self.assertEqual(
+            group_ids,
+            [
+                "linear_attention_0",
+                "linear_attention_1",
+                "linear_attention_2",
+                "full_attention",
+            ]
+            * 2,
+        )
+
+        specs = group_specs_from_layer_types(
+            layer_types=layer_types,
+            group_ids=group_ids,
+            sliding_window_tokens=None,
+            page_size=128,
+            cache_blocks_per_lcm_block={
+                "full_attention": 8,
+                "linear_attention_0": 1,
+                "linear_attention_1": 1,
+                "linear_attention_2": 1,
+            },
+        )
+        self.assertEqual(
+            [spec.group_id for spec in specs],
+            [
+                "linear_attention_0",
+                "linear_attention_1",
+                "linear_attention_2",
+                "full_attention",
+            ],
+        )
+        self.assertTrue(all(spec.family == "state" for spec in specs[:3]))
 
     def test_qwen35_mixed_with_sliding_and_state_layers(self):
         layer_types = ["sliding_attention", "linear_attention", "full_attention"]
@@ -175,6 +255,47 @@ class GroupSpecsFromLayerTypesTest(unittest.TestCase):
         self.assertEqual(by_id["sliding_attention"].sliding_window_tokens, 128)
         self.assertEqual(by_id["linear_attention"].family, "state")
         self.assertIsNone(by_id["linear_attention"].sliding_window_tokens)
+
+    def test_lcm_packing_includes_model_declared_state_groups(self):
+        checkpoint = PagedCacheGroupSpec(
+            group_id="kvconv",
+            retention="full_history",
+            rows_per_page=128,
+            entry_stride_tokens=1,
+            sliding_window_tokens=None,
+            family="state",
+            cache_blocks_per_lcm_block=21,
+            materializes_all_boundaries=True,
+        )
+        original_probe = _pcs.scheduler_ext_flat_kvcache
+        original_counts = _pcs.compute_paged_cache_group_page_counts
+        _pcs.scheduler_ext_flat_kvcache = lambda: True
+        _pcs.compute_paged_cache_group_page_counts = lambda specs, **_: {
+            spec.group_id: 1 for spec in specs
+        }
+        try:
+            specs, _ = publish_paged_cache_groups(
+                layer_types=["full_attention"],
+                sliding_window_tokens=None,
+                page_size=128,
+                cache_blocks_per_lcm_block={
+                    "full_attention": 2,
+                    "kvconv": 21,
+                },
+                extra_groups=[checkpoint],
+                max_live_requests=1,
+                max_scheduled_tokens=128,
+                max_total_tokens=256,
+                max_context_len=256,
+            )
+        finally:
+            _pcs.scheduler_ext_flat_kvcache = original_probe
+            _pcs.compute_paged_cache_group_page_counts = original_counts
+
+        self.assertEqual(
+            [(spec.group_id, spec.cache_blocks_per_lcm_block) for spec in specs],
+            [("full_attention", 2), ("kvconv", 21)],
+        )
 
 
 class LayerGroupIdsTest(unittest.TestCase):
@@ -389,6 +510,42 @@ class PoolToPagedCacheGroupsIntegrationTest(unittest.TestCase):
         self.assertEqual(len(groups), 2)
         group_ids = {g.group_id for g in groups}
         self.assertEqual(group_ids, {"full_attention", "sliding_attention"})
+
+    def test_lcm_packing_reaches_scheduler_config(self):
+        from types import SimpleNamespace
+
+        pool_to_paged_cache_groups = self._import_converter()
+        specs = group_specs_from_layer_types(
+            layer_types=["full_attention"],
+            sliding_window_tokens=None,
+            page_size=128,
+            cache_blocks_per_lcm_block={"full_attention": 8},
+        )
+        fake_pool = SimpleNamespace(
+            paged_cache_group_specs=specs,
+            paged_cache_group_page_counts={"full_attention": 1024},
+        )
+
+        (group,) = pool_to_paged_cache_groups(fake_pool)
+        self.assertEqual(group.cache_blocks_per_lcm_block, 8)
+
+    def test_state_boundary_capability_reaches_scheduler_config(self):
+        from types import SimpleNamespace
+
+        pool_to_paged_cache_groups = self._import_converter()
+        specs = group_specs_from_layer_types(
+            layer_types=["linear_attention"],
+            sliding_window_tokens=None,
+            page_size=128,
+            materializes_all_state_boundaries=True,
+        )
+        fake_pool = SimpleNamespace(
+            paged_cache_group_specs=specs,
+            paged_cache_group_page_counts={"linear_attention": 1024},
+        )
+
+        (group,) = pool_to_paged_cache_groups(fake_pool)
+        self.assertTrue(group.materializes_all_boundaries)
 
     def test_empty_specs_convert_to_no_groups(self):
         pool_to_paged_cache_groups = self._import_converter()

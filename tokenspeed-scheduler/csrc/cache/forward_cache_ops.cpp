@@ -42,6 +42,7 @@ std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
                 .kind = AttnKind::kMambaState,
                 .sliding_window = 0,
                 .cache_blocks_per_lcm_block = group.cache_blocks_per_lcm_block,
+                .materializes_all_boundaries = group.materializes_all_boundaries,
             });
             continue;
         }
@@ -50,6 +51,7 @@ std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
             .kind = is_swa ? AttnKind::kSlidingWindow : AttnKind::kFull,
             .sliding_window = is_swa ? group.sliding_window_tokens.value_or(0) : 0,
             .cache_blocks_per_lcm_block = group.cache_blocks_per_lcm_block,
+            .materializes_all_boundaries = group.materializes_all_boundaries,
         });
     }
     return specs;

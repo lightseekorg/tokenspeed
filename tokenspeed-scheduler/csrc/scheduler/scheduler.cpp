@@ -86,6 +86,12 @@ Scheduler::Scheduler(SchedulerConfig config)
     if (config_.overlap_schedule_depth > 0 && config_.decode_input_tokens == 0) {
         throw std::invalid_argument("Scheduler: overlapped decode requires decode_input_tokens > 0");
     }
+#if TOKENSPEED_FLAT_KVCACHE
+    if (coordinator_.HasMambaStateGroup() && config_.max_scheduled_tokens < coordinator_.CacheBlockTokens()) {
+        throw std::invalid_argument(
+            "Scheduler: flat Mamba max_scheduled_tokens must cover one state CacheBlock");
+    }
+#endif
 #if !TOKENSPEED_FLAT_KVCACHE
     radix_page_table_emissions_.resize(static_cast<std::size_t>(config_.max_batch_size) + 1);
 #endif

@@ -32,7 +32,11 @@ from tokenspeed_kernel.ops.kvcache.triton import (
 )
 
 from tokenspeed.runtime.configs import paged_cache_spec
-from tokenspeed.runtime.configs.flat_memory_plan import occurrence_index
+from tokenspeed.runtime.configs.flat_memory_plan import (
+    LcmArena,
+    LcmMemoryPlan,
+    occurrence_index,
+)
 from tokenspeed.runtime.configs.paged_cache_spec import hybrid_slab_group_size
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.flat_state_slabs import (
@@ -82,6 +86,8 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         temporal_state_shape: tuple[int, ...] | None = None,
         conv_dtype: torch.dtype | None = None,
         ssm_dtype: torch.dtype | None = None,
+        lcm_memory_plan: LcmMemoryPlan | None = None,
+        layer_cache_group_ids: tuple[str, ...] = (),
     ):
         super().__init__(
             size, dtype, device, max_batch_size, max_context_len, page_size, rank
@@ -100,11 +106,13 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         # Per-layer views absorb the geometry; _slot_tokens tracks the
         # LARGEST block for dummy-slot sizing only.
         self._slot_tokens = int(slot_tokens or page_size)
-        # Hiddenconv column dtype: fp8-e5m2 direct cast; INKLING_FP8_SCONV=0
-        # restores bf16.
+        # LCM boundary checkpoints are BF16 by default. Direct FP8-E5M2
+        # storage is an explicit capacity mode because its restore error can
+        # affect model output. Keep the legacy non-LCM column default unchanged.
+        fp8_sconv_default = "0" if lcm_memory_plan is not None else "1"
         self.conv_col_dtype = (
             torch.bfloat16
-            if os.environ.get("INKLING_FP8_SCONV", "1") == "0"
+            if os.environ.get("INKLING_FP8_SCONV", fp8_sconv_default) == "0"
             else torch.float8_e5m2
         )
         self._group_page_sizes = dict(group_page_sizes or {})
@@ -125,6 +133,9 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             int(kv_alloc_head_count) if kv_alloc_head_count else None
         )
         self._layer_types = tuple(layer_types or ())
+        self.layer_cache_group_ids = tuple(layer_cache_group_ids or ())
+        self._lcm_memory_plan = lcm_memory_plan
+        self._lcm_checkpoint_buffers = {}
         self._pd_disaggregation_enabled = pd_disaggregation_enabled
         self._slab_group_size = hybrid_slab_group_size(
             self._layer_types,
@@ -146,6 +157,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             page_size=self.page_size,
             size=self.size,
             kv_bytes_per_slot=2 * head_num * head_dim * self.store_dtype.itemsize,
+            lcm_memory_plan=lcm_memory_plan,
         )
         self._create_buffers()
 
@@ -172,9 +184,19 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         # (module-attr call so tests can patch the flat-ext probe at call time).
         published = paged_cache_spec.publish_paged_cache_groups(
             layer_types=self._layer_types,
+            group_ids=self.layer_cache_group_ids or None,
             sliding_window_tokens=sliding_window_tokens,
             page_size=page_size,
             page_sizes=self._group_page_sizes or None,
+            cache_blocks_per_lcm_block=(
+                {
+                    group.group_id: group.cache_blocks_per_lcm_block
+                    for group in self._lcm_memory_plan.groups
+                }
+                if self._lcm_memory_plan is not None
+                else None
+            ),
+            materializes_all_state_boundaries=self._lcm_memory_plan is not None,
             extra_groups=extra_paged_groups,
             max_live_requests=max_batch_size,
             max_scheduled_tokens=max_scheduled_tokens,
@@ -186,11 +208,24 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             self.paged_cache_group_page_counts = {}
         else:
             specs, counts = published
+            if self._lcm_memory_plan is not None:
+                counts.update(
+                    {
+                        group.group_id: group.page_count
+                        for group in self._lcm_memory_plan.groups
+                    }
+                )
             self.paged_cache_group_specs = tuple(specs)
             self.paged_cache_group_page_counts = counts
         # Slab aliasing is only safe under the single-BlockPool ownership the
         # published groups configure.
         assert self._slab_group_size is None or self.paged_cache_group_specs
+
+    @property
+    def num_lcm_blocks(self) -> int | None:
+        if self._lcm_memory_plan is None:
+            return None
+        return int(self._lcm_memory_plan.num_lcm_blocks)
 
     def _slab_pair_index(self) -> list[int]:
         """Map layer_id -> slab index: the i-th layer of every group binds
@@ -255,87 +290,150 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                         "check for residual allocations on a rank)."
                     )
 
+    def _create_lcm_buffers(self):
+        plan = self._lcm_memory_plan
+        if plan.logical_block_tokens != self.page_size:
+            raise ValueError(
+                f"LCM plan P={plan.logical_block_tokens} does not match pool "
+                f"page_size={self.page_size}"
+            )
+        max_packing = max(group.cache_blocks_per_lcm_block for group in plan.groups)
+        expected_size = plan.num_lcm_blocks * max_packing * self.page_size
+        if self.size != expected_size:
+            raise ValueError(
+                f"LCM pool size {self.size} does not match plan child capacity "
+                f"{expected_size}"
+            )
+
+        self._lcm_arena = LcmArena.allocate(plan, self.device)
+        self.k_buffer = [None] * self.layer_num
+        self.v_buffer = [None] * self.layer_num
+        state_slabs = {}
+        for layer_id, label in enumerate(self._layer_types):
+            if label in paged_cache_spec.STATE_LAYER_TYPES:
+                conv = self._lcm_arena.field_tensor(
+                    f"layer.{layer_id}.conv", self._state._conv_dtype
+                )
+                ssm = self._lcm_arena.field_tensor(
+                    f"layer.{layer_id}.ssm", self._state._ssm_dtype
+                )
+                # The GDN decode kernel addresses state pages as
+                # idx * HV * V * K, so a gap between pages does not fault --
+                # it silently reads the wrong rows. Refuse at startup instead.
+                if ssm.stride(0) != int(np.prod(ssm.shape[1:])):
+                    raise ValueError(
+                        f"LCM state plane for layer {layer_id} has padding "
+                        "between pages; the GDN decode ABI requires "
+                        "contiguous state page rows"
+                    )
+                state_slabs[layer_id] = (conv, ssm)
+                continue
+
+            k_pages = self._lcm_arena.field_tensor(
+                f"layer.{layer_id}.k", self.store_dtype
+            )
+            v_pages = self._lcm_arena.field_tensor(
+                f"layer.{layer_id}.v", self.store_dtype
+            )
+            contiguous_page_elements = int(np.prod(k_pages.shape[1:]))
+            if (
+                k_pages.stride(0) != contiguous_page_elements
+                or v_pages.stride(0) != contiguous_page_elements
+            ):
+                raise ValueError(
+                    f"LCM history plane for layer {layer_id} has padding "
+                    "between child pages; the current attention ABI requires "
+                    "contiguous flattened page rows"
+                )
+            self.k_buffer[layer_id] = k_pages.view(-1, self.head_num, self.head_dim)
+            self.v_buffer[layer_id] = v_pages.view(-1, self.head_num, self.head_dim)
+
+        group_ids = {group.group_id for group in plan.groups}
+        if {"kvconv", "hiddenconv"} <= group_ids:
+            checkpoint_fields = (
+                ("kvconv_k", torch.bfloat16),
+                ("kvconv_v", torch.bfloat16),
+                ("attnconv", self.conv_col_dtype),
+                ("mlpconv", self.conv_col_dtype),
+            )
+            for layer_id in range(self.layer_num):
+                for suffix, dtype in checkpoint_fields:
+                    self._lcm_checkpoint_buffers[(layer_id, suffix)] = (
+                        self._lcm_arena.field_tensor(
+                            f"layer.{layer_id}.{suffix}", dtype
+                        )
+                    )
+
+        if self._state.is_active:
+            self._state.bind_lcm_slabs(state_slabs)
+        self.supports_hierarchical_kv_cache = False
+
+    def inkling_checkpoint_view(self, layer_id: int, stream: str) -> torch.Tensor:
+        """Return one layer/stream's ``[page, W-1, channels]`` LCM view."""
+        try:
+            return self._lcm_checkpoint_buffers[(layer_id, stream)]
+        except KeyError as exc:
+            raise ValueError(
+                f"Inkling checkpoint field {stream!r} is not planned for "
+                f"layer {layer_id}"
+            ) from exc
+
+    def _create_legacy_buffers(self):
+        # Page 0 is the zero-initialized dummy page: padded tokens write there.
+        def alloc():
+            return torch.zeros(
+                (self.size + self._slot_tokens, self.head_num, self.head_dim),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+
+        flat_state_layers = set(self._state.state_layer_ids)
+        if self._state.is_active:
+            self.supports_hierarchical_kv_cache = False
+
+        if self._slab_group_size is not None:
+            self._check_slab_guards()
+            pair_index = self._slab_pair_index()
+            k_slabs = [alloc() for _ in range(self._slab_group_size)]
+            v_slabs = [alloc() for _ in range(self._slab_group_size)]
+            self.k_buffer = [
+                k_slabs[pair_index[layer_id]] for layer_id in range(self.layer_num)
+            ]
+            self.v_buffer = [
+                v_slabs[pair_index[layer_id]] for layer_id in range(self.layer_num)
+            ]
+            self.supports_hierarchical_kv_cache = False
+            logger.info(
+                "KV layout: hybrid slab (%d slabs x %d rows; slot %d)",
+                self._slab_group_size,
+                self.size + self._slot_tokens,
+                self._slot_tokens,
+            )
+            return
+
+        self.k_buffer = [
+            None if layer_id in flat_state_layers else alloc()
+            for layer_id in range(self.layer_num)
+        ]
+        self.v_buffer = [
+            None if layer_id in flat_state_layers else alloc()
+            for layer_id in range(self.layer_num)
+        ]
+        logger.info(
+            "KV layout: per-layer (%d of %d layers carry KV buffers)",
+            self.layer_num - len(flat_state_layers),
+            self.layer_num,
+        )
+
     def _create_buffers(self):
         # Tag as "kv_cache", no CPU backup: KV is discarded on sleep and rebuilt
         # after wake (paging overwrites; clear_kv_buffers zeros the remapped pages).
         with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
-            # Page 0 is the zero-initialized dummy page: padded tokens write
-            # there, and kernels may read it past valid seq_len, so its slots
-            # must stay finite to keep softmax well-defined.
-            def _alloc():
-                return torch.zeros(
-                    (self.size + self._slot_tokens, self.head_num, self.head_dim),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
-
-            # State-layer bookkeeping lives in FlatStateSlabs. The KV skip
-            # set below (which layers carry None KV) and the state-slab
-            # allocation are gated by the SAME flat-GDN predicate -- the plan
-            # sizing (registry) charges exactly full-layer KV + state rows,
-            # so the two decisions must never diverge. state_layer_ids is
-            # empty unless the gate is on, so non-flat profiles keep full KV.
-            flat_state_layers = set(self._state.state_layer_ids)
-            if self._state.is_active:
-                # Gates event_loop's retraction offload: state layers carry no
-                # per-layer KV, so the radix offload executor (and its host
-                # pool, sized for ALL layers) cannot represent this pool.
-                self.supports_hierarchical_kv_cache = False
-
-            if self._slab_group_size is not None:
-                # Paired layers alias the same slab tensor; live rows never
-                # overlap (page-ownership contract in hybrid_slab_group_size).
-                self._check_slab_guards()
-                pair_index = self._slab_pair_index()
-                k_slabs = [_alloc() for _ in range(self._slab_group_size)]
-                v_slabs = [_alloc() for _ in range(self._slab_group_size)]
-                self.k_buffer = [
-                    k_slabs[pair_index[layer_id]] for layer_id in range(self.layer_num)
-                ]
-                self.v_buffer = [
-                    v_slabs[pair_index[layer_id]] for layer_id in range(self.layer_num)
-                ]
-                # Gates event_loop's retraction offload (built even with the
-                # kvstore off): per-layer host copies would alias shared slabs.
-                self.supports_hierarchical_kv_cache = False
-                logger.info(
-                    "KV layout: hybrid slab (%d slabs x %d rows; slot %d; "
-                    "%d ids = %d full-tok / %d swa-tok capacity; paired "
-                    "layers share storage; M12)",
-                    self._slab_group_size,
-                    self.size + self._slot_tokens,
-                    self._slot_tokens,
-                    self.size // self.page_size,
-                    (self.size // self.page_size)
-                    * max(self._group_page_sizes.values(), default=self.page_size),
-                    (self.size // self.page_size) * self.page_size,
-                )
+            if self._lcm_memory_plan is not None:
+                self._create_lcm_buffers()
             else:
-                # The hybrid-slab branch above never sees state labels
-                # (hybrid_slab_group_size excludes them), so the skip set
-                # only applies here.
-                self.k_buffer = [
-                    None if layer_id in flat_state_layers else _alloc()
-                    for layer_id in range(self.layer_num)
-                ]
-                self.v_buffer = [
-                    None if layer_id in flat_state_layers else _alloc()
-                    for layer_id in range(self.layer_num)
-                ]
-                if flat_state_layers:
-                    logger.info(
-                        "KV layout: per-layer (%d of %d layers carry KV "
-                        "buffers; state layers carry none)",
-                        self.layer_num - len(flat_state_layers),
-                        self.layer_num,
-                    )
-                else:
-                    logger.info(
-                        "KV layout: per-layer (%d buffers; hybrid slab "
-                        "inactive: predicate returned None -- radix ext "
-                        "or non-uniform/single-group layer_types)",
-                        self.layer_num,
-                    )
+                self._create_legacy_buffers()
+
             # Pointer/stride tables carry the REAL tensors only: _kv_copy
             # launches one block per data_ptrs entry (grid = numel), so a
             # placeholder entry for a skipped state layer would be
@@ -730,6 +828,21 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
     def _create_buffers(self):
         assert self.head_dim % self.MXFP8_SCALE_BLOCK_SIZE == 0
         self.store_dtype = torch.float8_e4m3fn
+        if self._lcm_memory_plan is not None:
+            super()._create_buffers()
+            self.k_scale_buffer = [
+                self._lcm_arena.field_tensor(
+                    f"layer.{layer_id}.k_scale", torch.float8_e8m0fnu
+                )
+                for layer_id in range(self.layer_num)
+            ]
+            self.v_scale_buffer = [
+                self._lcm_arena.field_tensor(
+                    f"layer.{layer_id}.v_scale", torch.float8_e8m0fnu
+                )
+                for layer_id in range(self.layer_num)
+            ]
+            return
         if self._slab_group_size is not None:
             super()._create_buffers()
             with self.memory_saver_adapter.region(
@@ -803,8 +916,12 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         ]
 
     def _layer_page_tokens(self, layer_id: int) -> int:
-        """Tokens per page for one layer under byte-uniform slots (the
-        slot's fixed bytes factorized through the layer's head count)."""
+        """Tokens represented by one page id for this layer."""
+        if self._lcm_memory_plan is not None:
+            return self.page_size
+        # Legacy byte-uniform slots factor one id through the layer's head
+        # count. LCM instead expresses that ratio as K pages per parent, so
+        # every child page keeps the shared logical P.
         heads_l = self._layer_heads_per_rank(layer_id)
         return self.page_size * self.head_num // heads_l
 
