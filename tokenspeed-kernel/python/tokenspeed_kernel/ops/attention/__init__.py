@@ -295,10 +295,10 @@ def msa_extend_with_kvcache(
     attention_scale: float,
     init_blocks: int,
     local_blocks: int,
+    seq_lens_cpu: Sequence[int],
     k_scale: float | torch.Tensor | None = None,
     v_scale: float | torch.Tensor | None = None,
     query_lens_cpu: Sequence[int] | None = None,
-    seq_lens_cpu: Sequence[int] | None = None,
     override: str | None = None,
     solution: str | None = None,
 ) -> torch.Tensor:
@@ -335,7 +335,7 @@ def msa_extend_with_kvcache(
         query_lens_cpu: Optional host-side per-request new-token counts;
             with ``seq_lens_cpu`` this lets the indexer plan its fmha
             OnlyScore path without a device sync.
-        seq_lens_cpu: Optional host-side per-request total sequence lengths.
+        seq_lens_cpu: Host-side per-request total sequence lengths.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
