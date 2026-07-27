@@ -10,11 +10,11 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 # Intel XPU kernels are provided by vllm-xpu-kernels (SYCL/DPC++ + oneDNN).
-# Pinned to v0.1.7, which targets PyTorch 2.11 (matching the TokenSpeed XPU
-# bring-up torch==2.11.0+xpu). torch itself comes from the XPU base image and
-# is intentionally not pinned here to avoid clobbering the platform torch-xpu.
+# Pinned to v0.1.10, validated with torch==2.12.0+xpu. torch itself comes from
+# the XPU base image and is intentionally not pinned here to avoid clobbering
+# the platform torch-xpu.
 dependencies = [
-    "vllm-xpu-kernels==0.1.7",
+    "vllm-xpu-kernels==0.1.10",
 ]
 
 [project.urls]

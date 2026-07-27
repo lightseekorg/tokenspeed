@@ -42,8 +42,12 @@ def silu_and_mul(
 ) -> torch.Tensor:
     """SiLU(x[..., :d]) * x[..., d:] on Intel XPU, written into ``out``.
 
-    TODO(intel): verify exact vllm op name/arg order vs v0.1.7. ``enable_pdl``
-    is accepted for signature parity with the Triton kernel and ignored.
+    Op schema (verified against v0.1.10, unchanged from v0.1.7)::
+
+        silu_and_mul(Tensor! result, Tensor input)
+
+    ``enable_pdl`` is accepted for signature parity with the Triton kernel and
+    ignored.
     """
     _C.silu_and_mul(out, x)
     return out

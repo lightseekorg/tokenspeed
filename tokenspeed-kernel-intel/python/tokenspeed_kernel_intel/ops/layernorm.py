@@ -45,8 +45,11 @@ def rmsnorm(
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """RMSNorm on Intel XPU. Contract matches the Triton ``rmsnorm``.
 
-    TODO(intel): verify exact vllm op names/arg order vs v0.1.7 and validate
-    against the numerics reference (dtype upcast, epsilon placement).
+    Op schemas (verified against v0.1.10, unchanged from v0.1.7)::
+
+        rms_norm(Tensor! result, Tensor input, Tensor weight, float epsilon)
+        fused_add_rms_norm(Tensor! input, Tensor! residual, Tensor weight,
+                           float epsilon)
     """
     if x.shape[0] == 0:
         if residual is None:

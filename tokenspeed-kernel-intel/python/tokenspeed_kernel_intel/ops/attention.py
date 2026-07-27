@@ -23,13 +23,13 @@
 Registers XPU-specialized MHA kernels into the shared TokenSpeed registry.
 Compute is delegated to ``vllm_xpu_kernels.flash_attn_interface`` (SYCL/DPC++).
 
-vllm-xpu-kernels v0.1.7 exposes a single entry point,
-``flash_attn_varlen_func``, which serves BOTH:
+vllm-xpu-kernels exposes a single entry point, ``flash_attn_varlen_func``,
+which serves BOTH:
 
 * non-paged variable-length prefill  -> pass ``cu_seqlens_k``
 * paged decode                       -> pass ``block_table`` + ``seqused_k``
 
-Its signature (v0.1.7)::
+Its signature (verified against v0.1.10)::
 
     flash_attn_varlen_func(
         q, k, v,
@@ -43,8 +43,13 @@ Its signature (v0.1.7)::
         block_table=None,         # paged KV cache
         return_softmax_lse=False,
         s_aux=None,               # attention sinks
+        host_kv_lens=None,        # v0.1.10: host per-seq KV len -> seqused_k
+        num_splits_kv=None,       # v0.1.10: split-KV plan for paged decode
         ...
     ) -> out | (out, softmax_lse)
+
+The prefill path below uses only the kwargs shared across versions, so it is
+unchanged by the v0.1.7 -> v0.1.10 upgrade.
 """
 
 from __future__ import annotations
@@ -146,38 +151,93 @@ if _XPU_FA_AVAILABLE:
 # ---------------------------------------------------------------------------
 # Paged decode (mha_decode_with_kvcache)
 # ---------------------------------------------------------------------------
-# NOT registered yet: paged decode requires mapping TokenSpeed's KV-cache /
-# page-table layout onto vllm's ``block_table`` + ``seqused_k`` convention, and
-# constructing ``cu_seqlens_q`` for the decode queries. These layout details
-# (block size, [num_blocks, block, heads, dim] ordering, per-request q lengths)
-# MUST be verified on hardware against the numerics reference before enabling.
-# Until then, decode falls back to the portable Triton kernel automatically
-# (no XPU decode kernel is registered, so the selector skips this vendor for the
-# mha_decode_with_kvcache mode).
-#
-# Template to finish, then wrap with @register_kernel(
-#     "attention", "mha_decode_with_kvcache", name="xpu_mha_decode_with_kvcache",
-#     solution="xpu", capability=CapabilityRequirement(vendors={"intel"}),
-#     signatures=format_signatures(("q","k_cache","v_cache"), "dense",
-#                                  {torch.float16, torch.bfloat16}),
-#     priority=_XPU_ATTENTION_PRIORITY, traits={...}, tags={"xpu"}):
-#
-# def xpu_mha_decode_with_kvcache(q, k_cache, v_cache, page_table, cache_seqlens,
-#                                 max_seqlen_k, max_seqlen_q=1, window_left=-1,
-#                                 logit_cap=0.0, sinks=None, return_lse=False,
-#                                 softmax_scale=None, q_scale=None, k_scale=None,
-#                                 v_scale=None):
-#     if softmax_scale is None:
-#         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
-#     # Build cu_seqlens_q for the decode queries (e.g. arange(0, B+1, int32)
-#     # when max_seqlen_q == 1). Verify q packing first.
-#     out = _xpu_fa.flash_attn_varlen_func(
-#         q, k_cache, v_cache,
-#         max_seqlen_q=max_seqlen_q, cu_seqlens_q=cu_seqlens_q,
-#         max_seqlen_k=max_seqlen_k,
-#         seqused_k=cache_seqlens,     # paged: per-seq KV length
-#         block_table=page_table,      # paged KV cache
-#         softmax_scale=softmax_scale, causal=True,
-#         window_size=_window(window_left), softcap=logit_cap, s_aux=sinks,
-#     )
-#     return out
+# vllm-xpu-kernels >= 0.1.10 exposes a mature paged decode path through the same
+# ``flash_attn_varlen_func`` entry point: pass ``block_table`` + ``seqused_k``
+# for the paged KV cache and a ``cu_seqlens_q`` describing the (usually length-1)
+# decode queries. The KV cache is laid out as
+# ``[num_blocks, block_size, num_kv_heads, head_dim]``, which matches the layout
+# TokenSpeed hands to the decode kernel (the Triton path views it identically),
+# so no relayout is required.
+
+
+if _XPU_FA_AVAILABLE:
+
+    @register_kernel(
+        "attention",
+        "mha_decode_with_kvcache",
+        name="xpu_mha_decode_with_kvcache",
+        solution="xpu",
+        capability=CapabilityRequirement(vendors=frozenset({"intel"})),
+        signatures=format_signatures(
+            ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+        ),
+        priority=_XPU_ATTENTION_PRIORITY,
+        traits={
+            "sliding_window": frozenset({False, True}),
+            "support_sinks": frozenset({False, True}),
+            "support_logit_cap": frozenset({False, True}),
+            # LSE return not wired up for decode yet; those paths fall back to
+            # the portable Triton kernel.
+            "return_lse": frozenset({False}),
+        },
+        tags={"xpu"},
+    )
+    def xpu_mha_decode_with_kvcache(
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        max_seqlen_k: int,
+        max_seqlen_q: int = 1,
+        window_left: int = -1,
+        logit_cap: float = 0.0,
+        sinks: torch.Tensor | None = None,
+        return_lse: bool = False,
+        softmax_scale: float | None = None,
+        q_scale: torch.Tensor | None = None,
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Paged-KV decode MHA on Intel XPU.
+
+        ``q`` is packed ``[batch * max_seqlen_q, num_heads, head_dim]``.
+        ``k_cache`` / ``v_cache`` are paged
+        ``[num_blocks, block_size, num_kv_heads, head_dim]`` and indexed through
+        ``page_table`` (``block_table``) with per-request KV length
+        ``cache_seqlens`` (``seqused_k``).
+        """
+        if softmax_scale is None:
+            softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+
+        batch = cache_seqlens.shape[0]
+        # One contiguous run of ``max_seqlen_q`` query tokens per request:
+        # cu_seqlens_q = [0, m, 2m, ..., batch*m], int32 on device.
+        cu_seqlens_q = torch.arange(
+            0,
+            (batch + 1) * max_seqlen_q,
+            max_seqlen_q,
+            dtype=torch.int32,
+            device=q.device,
+        )
+        seqused_k = cache_seqlens.to(torch.int32)
+        block_table = page_table.to(torch.int32)
+
+        out = _xpu_fa.flash_attn_varlen_func(
+            q,
+            k_cache,
+            v_cache,
+            max_seqlen_q=max_seqlen_q,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_k=max_seqlen_k,
+            seqused_k=seqused_k,  # paged: per-seq KV length
+            block_table=block_table,  # paged KV cache
+            softmax_scale=softmax_scale,
+            # Pure decode (single query token) is non-causal; speculative /
+            # multi-token decode (max_seqlen_q > 1) needs the causal mask.
+            causal=max_seqlen_q > 1,
+            window_size=_window(window_left),
+            softcap=logit_cap,
+            s_aux=sinks,
+        )
+        return out.view_as(q)

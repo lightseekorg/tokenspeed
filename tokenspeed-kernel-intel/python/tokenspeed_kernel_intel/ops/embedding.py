@@ -78,9 +78,13 @@ if _XPU_ROPE_OP is not None:
     ) -> None:
         """Apply rotary embedding in place on ``q`` and ``k`` (XPU).
 
-        TODO(intel): verify the vllm rotary op signature/layout vs v0.1.7,
-        especially cos_sin_cache packing (concat(cos, sin) on last dim) and the
-        expected [num_tokens, num_heads * head_size] q/k layout.
+        Op schema (verified against v0.1.10, unchanged from v0.1.7)::
+
+            rotary_embedding(Tensor positions, Tensor! query, Tensor!? key,
+                             int head_size, Tensor cos_sin_cache, bool is_neox)
+
+        ``cos_sin_cache`` is concat(cos, sin) on the last dim and the runtime
+        stores it as float32, so it is cast to the q/k dtype below.
         """
         # vllm's rotary op requires cos_sin_cache to match the q/k dtype (it is
         # commonly stored as float32 in the runtime), so cast when needed.

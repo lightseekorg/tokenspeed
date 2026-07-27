@@ -20,25 +20,25 @@ falls back to Triton where an XPU kernel is not (yet) provided.
 
 ## Requirements
 
-- Intel GPU (XPU) with a `torch` XPU build (e.g. `torch==2.11.0+xpu`).
-- `vllm-xpu-kernels==0.1.7` (targets PyTorch 2.11).
+- Intel GPU (XPU) with a `torch` XPU build (e.g. `torch==2.12.0+xpu`).
+- `vllm-xpu-kernels==0.1.10` (validated with torch 2.12.0+xpu).
 - Intel oneAPI runtime (for the SYCL/oneDNN kernels shipped by vllm-xpu-kernels).
 
 ## Status
 
-Scaffold with wired templates. Every wrapper must be verified against the exact
-`vllm_xpu_kernels` v0.1.7 API and validated against the TokenSpeed numerics
-reference before it is trusted.
+Wrappers target the `vllm_xpu_kernels` v0.1.10 API (op schemas verified against
+upstream `csrc/torch_bindings.cpp`). Validate each wrapper against the TokenSpeed
+numerics reference before trusting it on new models/shapes.
 
 Covered (Qwen3 dense bf16 path):
 
 | Op | Module | Integration | State |
 |----|--------|-------------|-------|
-| MHA prefill | `ops/attention.py` | registry (`attention.mha_prefill`) | wired template |
-| MHA paged decode | `ops/attention.py` | registry | NOT registered (falls back to Triton; layout TODO) |
-| Rotary embedding | `ops/embedding.py` | registry (`embedding.rope`) | wired template |
-| RMSNorm / fused-add | `ops/layernorm.py` | direct call (runtime prefers it on XPU) | wired template |
-| SiLU-and-mul | `ops/activation.py` | direct call (runtime prefers it on XPU) | wired template |
+| MHA prefill | `ops/attention.py` | registry (`attention.mha_prefill`) | registered |
+| MHA paged decode | `ops/attention.py` | registry (`attention.mha_decode_with_kvcache`) | registered |
+| Rotary embedding | `ops/embedding.py` | registry (`embedding.rope`) | registered |
+| RMSNorm / fused-add | `ops/layernorm.py` | direct call (runtime prefers it on XPU) | registered |
+| SiLU-and-mul | `ops/activation.py` | direct call (runtime prefers it on XPU) | registered |
 
 Not yet covered: GEMM (bf16 already uses torch/oneDNN; quantized fp8/mxfp4 TODO),
 MoE, sampling. Add following the same pattern.
