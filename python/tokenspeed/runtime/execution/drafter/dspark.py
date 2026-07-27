@@ -51,18 +51,12 @@ class DSpark(DFlash):
         block_ids: torch.Tensor,
         next_tokens: torch.Tensor,
     ) -> torch.Tensor:
-        """Semi-autoregressive greedy proposal over the block positions.
-
-        Position 0 is the (known) anchor token. For position ``k`` in
-        ``1 .. spec_num_tokens - 1`` the base logits from the draft hidden state
-        are corrected by the Markov bias conditioned on the previously sampled
-        token ``next_tokens[:, k - 1]``, then argmax'd.
-        """
+        """Semi-autoregressive greedy proposal over the block positions."""
         next_tokens[:, 0] = block_ids[:, 0]
         for k in range(1, self.spec_num_tokens):
             bias_fn = self._make_step_bias_fn(next_tokens[:, k - 1])
             self._greedy_argmax_vocab_parallel(
-                draft_hidden[:, k, :],
+                draft_hidden[:, k - 1, :],
                 out=next_tokens[:, k],
                 bias_fn=bias_fn,
             )
