@@ -769,6 +769,7 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
 
 
 @requires_cuda
+@requires_fla
 @pytest.mark.skipif(
     not current_platform().is_amd,
     reason="indexed FlatKV KDA decode is an AMD-specific contract",
