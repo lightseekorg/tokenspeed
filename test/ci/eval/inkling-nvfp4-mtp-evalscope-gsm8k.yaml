@@ -25,6 +25,7 @@ server:
     --gpu-memory-utilization 0.95
     --disable-cuda-graph-padding
     --trust-remote-code
+    --weight-loader-prefetch-checkpoints
     --attention-backend fa4
     --moe-backend flashinfer_trtllm
     --enable-prefix-caching

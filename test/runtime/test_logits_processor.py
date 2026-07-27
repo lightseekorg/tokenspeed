@@ -22,6 +22,7 @@ from tokenspeed.runtime.layers.logits_processor import (  # noqa: E402
     LogitsProcessor,
     fused_softcap,
 )
+from tokenspeed.runtime.utils.env import global_server_args_dict  # noqa: E402
 
 
 def test_logits_processor_only_uses_fused_lm_head_for_kimi(monkeypatch):
@@ -88,6 +89,37 @@ def test_tp_logits_all_gather_handles_zero_rows(monkeypatch):
 
     assert calls["all_gather"] == 1
     assert tuple(output.next_token_logits.shape) == (0, 6)
+
+
+def test_tp_logits_custom_collectives_skip_cross_node_group(monkeypatch):
+    monkeypatch.setitem(
+        global_server_args_dict,
+        "mapping",
+        SimpleNamespace(nprocs_per_node=4),
+    )
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=64),
+        tp_rank=0,
+        tp_size=8,
+        tp_group=tuple(range(8)),
+    )
+    lm_head = SimpleNamespace(weight=torch.ones((8, 2), dtype=torch.float32))
+
+    monkeypatch.setattr(
+        logits_processor_module,
+        "create_state",
+        lambda **kwargs: pytest.fail("cross-node TP must not create RSAG state"),
+    )
+    monkeypatch.setattr(
+        logits_processor_module,
+        "create_dist_argmax_state",
+        lambda **kwargs: pytest.fail(
+            "cross-node TP must not create distributed-argmax state"
+        ),
+    )
+
+    assert processor._init_all_gather_state(lm_head) is None
+    assert processor._init_dist_argmax_state(lm_head) is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
