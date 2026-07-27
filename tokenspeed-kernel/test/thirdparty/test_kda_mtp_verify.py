@@ -25,6 +25,8 @@ kernel one token at a time, and each per-position state page must match the
 pool kernel's state after the corresponding step.
 """
 
+from importlib.util import find_spec
+
 import pytest
 import torch
 from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
@@ -34,6 +36,11 @@ from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
+if find_spec("fla") is None:
+    pytest.skip(
+        "flash-linear-attention (fla) required for the KDA reference kernel",
+        allow_module_level=True,
+    )
 
 # K3 TP8 per-rank KDA geometry.
 H, HV, K, V = 4, 4, 128, 128

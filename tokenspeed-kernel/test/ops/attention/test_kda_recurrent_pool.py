@@ -6,6 +6,8 @@ negative write ids skip the store, read ids independent of write ids, and pages
 not addressed by the batch stay untouched.
 """
 
+from importlib.util import find_spec
+
 import pytest
 import torch
 from tokenspeed_kernel.ops.attention.triton.linear.kda import (
@@ -15,6 +17,11 @@ from tokenspeed_kernel.ops.attention.triton.linear.kda import (
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
+if find_spec("fla") is None:
+    pytest.skip(
+        "flash-linear-attention (fla) required for the KDA reference kernel",
+        allow_module_level=True,
+    )
 
 # K3 decode shapes (TP8 rank): 12 heads, K=V=128; lower_bound from config.
 HV, K, V = 12, 128, 128
