@@ -48,6 +48,11 @@ struct HashChain {
     std::int32_t num_hashed_pages{0};
     std::string last_hash;
 };
+
+struct FlatCacheProgress {
+    HashChain hash_chain;
+    std::uint64_t access_epoch{0};
+};
 #endif
 
 inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* token_container,
@@ -184,9 +189,9 @@ struct ForwardState : public BaseState {
     std::int32_t GetReqPoolIndex() const { return req_pool_index_ ? req_pool_index_->slot_ : -1; }
 
 #if TOKENSPEED_FLAT_KVCACHE
-    HashChain TakeHashChain() && { return std::move(hash_chain_); }
-    void SetHashChain(HashChain chain) { hash_chain_ = std::move(chain); }
-    const HashChain& HashChainValue() const { return hash_chain_; }
+    FlatCacheProgress TakeFlatCacheProgress() && { return std::move(flat_cache_progress_); }
+    void SetFlatCacheProgress(FlatCacheProgress progress) { flat_cache_progress_ = std::move(progress); }
+    const FlatCacheProgress& FlatCacheProgressValue() const { return flat_cache_progress_; }
 #endif
 
     // Flat: group-0 sample of LCM parent ids. Operation construction uses this
@@ -229,7 +234,7 @@ struct ForwardState : public BaseState {
 private:
     std::unique_ptr<ReqPoolIndex> req_pool_index_;
 #if TOKENSPEED_FLAT_KVCACHE
-    HashChain hash_chain_{};
+    FlatCacheProgress flat_cache_progress_{};
 #endif
 };
 

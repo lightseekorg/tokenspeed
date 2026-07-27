@@ -35,7 +35,6 @@ import pathlib
 import subprocess
 from collections.abc import Callable, Iterable, Iterator, Mapping
 
-
 _ARM_NAMES = ("main_radix", "branch_radix", "branch_flat_lcm")
 _ROUND_NAMES = ("prime", "replay")
 _MIN_RADIX_RESIDENT_HIT_RATE = 0.7
@@ -59,9 +58,7 @@ def _working_set_tokens(
     prompt_lengths: list[int],
     boundary_indices: list[int],
 ) -> int:
-    total = sum(
-        count * length for count, length in zip(counts, prompt_lengths)
-    )
+    total = sum(count * length for count, length in zip(counts, prompt_lengths))
     if boundary_indices:
         shared_lengths = [prompt_lengths[index] for index in boundary_indices]
         total -= sum(shared_lengths) - max(shared_lengths)
@@ -87,19 +84,18 @@ def _bucket_counts(
     return counts
 
 
-def _flat_capacity_model(
-    spec: Mapping, flat_probe: Mapping
-) -> tuple[int, int, int]:
+def _flat_capacity_model(spec: Mapping, flat_probe: Mapping) -> tuple[int, int, int]:
     """Return safe tokens, State checkpoints/request, and admission parents."""
     geometry = flat_probe.get("geometry")
     if not isinstance(geometry, Mapping):
         raise ValueError("Flat probe is missing LCM geometry")
-    block_tokens = _positive_int(
-        spec["logical_block_tokens"], "logical_block_tokens"
-    )
-    if _positive_int(
-        geometry.get("logical_block_tokens"), "geometry logical block tokens"
-    ) != block_tokens:
+    block_tokens = _positive_int(spec["logical_block_tokens"], "logical_block_tokens")
+    if (
+        _positive_int(
+            geometry.get("logical_block_tokens"), "geometry logical block tokens"
+        )
+        != block_tokens
+    ):
         raise ValueError("trace and Flat geometry use different logical blocks")
     packings = geometry.get("cache_blocks_per_lcm_block")
     if not isinstance(packings, Mapping):
@@ -117,26 +113,18 @@ def _flat_capacity_model(
         for name, value in packings.items()
         if str(name).startswith("linear_attention")
     ]
-    state_group_count = _positive_int(
-        spec["state_group_count"], "state_group_count"
-    )
+    state_group_count = _positive_int(spec["state_group_count"], "state_group_count")
     if len(state_packings) != state_group_count:
         raise ValueError("trace and Flat geometry use different State group counts")
 
     capacity_bucket = str(spec["capacity_prompt_bucket"])
     try:
         capacity_spec = next(
-            bucket
-            for bucket in spec["buckets"]
-            if bucket["name"] == capacity_bucket
+            bucket for bucket in spec["buckets"] if bucket["name"] == capacity_bucket
         )
     except StopIteration as exc:
-        raise ValueError(
-            f"unknown capacity_prompt_bucket {capacity_bucket!r}"
-        ) from exc
-    prompt_pages = _positive_int(
-        capacity_spec["pages"], f"{capacity_bucket} pages"
-    )
+        raise ValueError(f"unknown capacity_prompt_bucket {capacity_bucket!r}") from exc
+    prompt_pages = _positive_int(capacity_spec["pages"], f"{capacity_bucket} pages")
     tail_tokens = int(capacity_spec.get("tail_tokens", 0))
     if not 0 <= tail_tokens < block_tokens:
         raise ValueError(
@@ -144,9 +132,7 @@ def _flat_capacity_model(
         )
     prompt_tokens = prompt_pages * block_tokens + tail_tokens
     state_checkpoints_per_request = 1 if tail_tokens else 2
-    num_parents = _positive_int(
-        geometry.get("num_lcm_blocks"), "number of LCM blocks"
-    )
+    num_parents = _positive_int(geometry.get("num_lcm_blocks"), "number of LCM blocks")
     scheduled_tokens = _positive_int(
         spec["max_scheduled_tokens"], "max_scheduled_tokens"
     )
@@ -156,12 +142,9 @@ def _flat_capacity_model(
     transient_blocks = (
         scheduled_tokens + decode_reserve_tokens + block_tokens - 1
     ) // block_tokens
-    transient_parents = (
-        transient_blocks + full_packing - 1
-    ) // full_packing
+    transient_parents = (transient_blocks + full_packing - 1) // full_packing
     transient_parents += sum(
-        (transient_blocks + packing - 1) // packing
-        for packing in state_packings
+        (transient_blocks + packing - 1) // packing for packing in state_packings
     )
     resident_parents = num_parents - transient_parents
     if resident_parents <= 0:
@@ -203,9 +186,7 @@ def build_trace(
     if lcm_capacity <= radix_capacity:
         raise ValueError("LCM capacity must exceed Radix capacity")
 
-    block_tokens = _positive_int(
-        spec["logical_block_tokens"], "logical_block_tokens"
-    )
+    block_tokens = _positive_int(spec["logical_block_tokens"], "logical_block_tokens")
     buckets = []
     for item in spec["buckets"]:
         pages = _positive_int(item["pages"], f"{item['name']} pages")
@@ -224,9 +205,7 @@ def build_trace(
     if not buckets:
         raise ValueError("trace needs at least one boundary bucket")
     prompt_lengths = [bucket["prompt_tokens"] for bucket in buckets]
-    bucket_indices = {
-        bucket["name"]: index for index, bucket in enumerate(buckets)
-    }
+    bucket_indices = {bucket["name"]: index for index, bucket in enumerate(buckets)}
     boundary_tree = [str(name) for name in spec["boundary_tree"]]
     if len(boundary_tree) < 2 or len(set(boundary_tree)) != len(boundary_tree):
         raise ValueError("boundary_tree must contain distinct boundary buckets")
@@ -277,8 +256,7 @@ def build_trace(
                 "name": name,
                 "working_set_tokens": working_set,
                 "request_counts": {
-                    bucket["name"]: count
-                    for bucket, count in zip(buckets, counts)
+                    bucket["name"]: count for bucket, count in zip(buckets, counts)
                 },
             }
         )
@@ -321,9 +299,7 @@ def _request_token_ids(trace: Mapping, request_id: str, length: int) -> list[int
     span = token_max - token_min
     output = []
     for _ in range(length):
-        state = (6364136223846793005 * state + 1442695040888963407) & (
-            (1 << 64) - 1
-        )
+        state = (6364136223846793005 * state + 1442695040888963407) & ((1 << 64) - 1)
         output.append(token_min + state % span)
     return output
 
@@ -435,15 +411,9 @@ def _validate_result(result: Mapping, expected_arm: str, trace_hash: str) -> Non
         raise ValueError(f"result {expected_arm!r} has mismatched arm name")
     if result.get("trace_sha256") != trace_hash:
         raise ValueError("all arms must use the same trace")
-    _positive_int(
-        result.get("configured_cache_bytes"), "configured cache bytes"
-    )
-    _positive_int(
-        result.get("allocated_cache_bytes"), "allocated cache bytes"
-    )
-    capacity = _positive_int(
-        result.get("max_total_num_tokens"), "max_total_num_tokens"
-    )
+    _positive_int(result.get("configured_cache_bytes"), "configured cache bytes")
+    _positive_int(result.get("allocated_cache_bytes"), "allocated cache bytes")
+    capacity = _positive_int(result.get("max_total_num_tokens"), "max_total_num_tokens")
     physical = _positive_int(
         result.get("physical_token_capacity"), "physical_token_capacity"
     )
@@ -473,9 +443,7 @@ def compare_results(results: Mapping[str, Mapping]) -> dict:
     for arm in _ARM_NAMES:
         _validate_result(results[arm], arm, trace_hash)
 
-    configured = {
-        int(result["configured_cache_bytes"]) for result in results.values()
-    }
+    configured = {int(result["configured_cache_bytes"]) for result in results.values()}
     if len(configured) != 1:
         raise ValueError("configured cache bytes differ across arms")
 
@@ -496,9 +464,7 @@ def compare_results(results: Mapping[str, Mapping]) -> dict:
     if not radix_capacity < cliff < flat_capacity:
         raise ValueError("capacity-cliff working set is outside the capacity gap")
 
-    bucket_sets = [
-        set(result["summary"]["buckets"]) for result in results.values()
-    ]
+    bucket_sets = [set(result["summary"]["buckets"]) for result in results.values()]
     if any(item != bucket_sets[0] for item in bucket_sets[1:]):
         raise ValueError("reported prefix-length buckets differ across arms")
 
@@ -518,9 +484,7 @@ def compare_results(results: Mapping[str, Mapping]) -> dict:
                 f"{arm} no-pressure replay hit rate {no_pressure_rate:.6f} "
                 f"is below {minimum:.1f}"
             )
-    flat_cliff_rate = float(
-        flat["summary"]["phases"][cliff_key]["cache_hit_rate"]
-    )
+    flat_cliff_rate = float(flat["summary"]["phases"][cliff_key]["cache_hit_rate"])
     if flat_cliff_rate < _MIN_FLAT_RESIDENT_HIT_RATE:
         raise ValueError(
             f"Flat capacity-cliff replay hit rate {flat_cliff_rate:.6f} "
@@ -544,9 +508,7 @@ def compare_results(results: Mapping[str, Mapping]) -> dict:
     buckets = {}
     for key in sorted(bucket_sets[0]):
         main_rate = float(main["summary"]["buckets"][key]["cache_hit_rate"])
-        branch_rate = float(
-            branch_radix["summary"]["buckets"][key]["cache_hit_rate"]
-        )
+        branch_rate = float(branch_radix["summary"]["buckets"][key]["cache_hit_rate"])
         flat_rate = float(flat["summary"]["buckets"][key]["cache_hit_rate"])
         baseline = max(main_rate, branch_rate)
         if flat_rate < baseline:
@@ -656,9 +618,7 @@ def probe_arm(
 def build_trace_from_probes(spec: Mapping, probes: Mapping[str, Mapping]) -> dict:
     if set(probes) != set(_ARM_NAMES):
         raise ValueError(f"probes must contain exactly {list(_ARM_NAMES)}")
-    configured = {
-        int(probe["configured_cache_bytes"]) for probe in probes.values()
-    }
+    configured = {int(probe["configured_cache_bytes"]) for probe in probes.values()}
     if len(configured) != 1:
         raise ValueError("configured cache bytes differ across arms")
     radix_capacity = max(
@@ -708,9 +668,7 @@ def run_arm(
         engine = engine_factory(**dict(engine_args))
         try:
             phase_scheduler_info = engine.scheduler_info
-            phase_storage = _cache_storage(
-                phase_scheduler_info, cache_storage_override
-            )
+            phase_storage = _cache_storage(phase_scheduler_info, cache_storage_override)
             if scheduler_info is None:
                 scheduler_info = phase_scheduler_info
                 storage = phase_storage
@@ -758,8 +716,7 @@ def run_arm(
         "capacity_model": trace.get("capacity_model", {}).get(capacity_key, ""),
         **storage,
         "working_sets": {
-            phase["name"]: int(phase["working_set_tokens"])
-            for phase in trace["phases"]
+            phase["name"]: int(phase["working_set_tokens"]) for phase in trace["phases"]
         },
         "summary": summarize_observations(observations),
         "provenance": dict(provenance or _git_provenance()),
@@ -794,9 +751,7 @@ def _read_json(value: str) -> dict:
 
 
 def _write_json(path: str, value: Mapping) -> None:
-    pathlib.Path(path).write_text(
-        json.dumps(value, indent=2, sort_keys=True) + "\n"
-    )
+    pathlib.Path(path).write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
 def _parser() -> argparse.ArgumentParser:

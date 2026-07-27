@@ -33,12 +33,23 @@ namespace tokenspeed {
 
 struct KvCacheCoordinatorTestAccess {
     static auto MatchPrefix(KvCacheCoordinator& coordinator, std::span<const std::string> content_hashes) {
-        return coordinator.acquirePrefix(coordinator.ProbePrefix(content_hashes));
+        return coordinator.acquirePrefix(coordinator.ProbePrefix(content_hashes), ++coordinator.next_access_epoch_);
+    }
+
+    static std::uint64_t NextAccessEpoch(KvCacheCoordinator& coordinator) {
+        return ++coordinator.next_access_epoch_;
     }
 };
 
 inline auto MatchPrefixForTest(KvCacheCoordinator& coordinator, std::span<const std::string> content_hashes) {
     return KvCacheCoordinatorTestAccess::MatchPrefix(coordinator, content_hashes);
+}
+
+inline void CacheFullBlocksForTest(KvCacheCoordinator& coordinator, std::span<BlockTable> tables,
+                                   std::span<const std::string> content_hashes, std::int32_t first_slot = 0,
+                                   std::int32_t end_tokens = -1) {
+    coordinator.CacheFullBlocks(tables, content_hashes, KvCacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
+                                first_slot, end_tokens);
 }
 
 inline std::optional<KvCacheCoordinator::AdmissionResult> AdmitForTest(

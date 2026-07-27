@@ -24,7 +24,6 @@ import pathlib
 import tempfile
 import unittest
 
-
 _HERE = pathlib.Path(__file__).resolve().parent
 _MODULE_PATH = _HERE / "qwen35_lcm_cache_e2e.py"
 _TRACE_PATH = _HERE / "qwen35_lcm_cache_trace.json"
@@ -69,9 +68,7 @@ class Qwen35LcmCacheE2ETest(unittest.TestCase):
             phases["no_pressure"]["working_set_tokens"],
             131_072 // 2,
         )
-        fixed_target = int(
-            131_072 * float(self.trace_spec["fixed_pressure_fraction"])
-        )
+        fixed_target = int(131_072 * float(self.trace_spec["fixed_pressure_fraction"]))
         self.assertLessEqual(
             phases["fixed_pressure"]["working_set_tokens"], fixed_target
         )
@@ -80,9 +77,7 @@ class Qwen35LcmCacheE2ETest(unittest.TestCase):
             32_768,
         )
         self.assertTrue(
-            131_072
-            < phases["capacity_cliff"]["working_set_tokens"]
-            < 262_144
+            131_072 < phases["capacity_cliff"]["working_set_tokens"] < 262_144
         )
 
         first = next(self.harness.iter_trace_requests(trace_a))
@@ -210,12 +205,8 @@ class Qwen35LcmCacheE2ETest(unittest.TestCase):
         aligned_spec = json.loads(json.dumps(self.trace_spec))
         aligned_spec["capacity_prompt_bucket"] = "bulk_32k"
         aligned_spec["buckets"][-1] = {"name": "bulk_32k", "pages": 256}
-        aligned_trace = self.harness.build_trace_from_probes(
-            aligned_spec, probes
-        )
-        self.assertEqual(
-            aligned_trace["capacities"]["flat_lcm"], 257 * 32_768
-        )
+        aligned_trace = self.harness.build_trace_from_probes(aligned_spec, probes)
+        self.assertEqual(aligned_trace["capacities"]["flat_lcm"], 257 * 32_768)
         self.assertEqual(
             aligned_trace["capacity_model"]["flat_lcm"],
             "bulk_32k exact replay with two retained checkpoints per State "
@@ -259,9 +250,7 @@ class Qwen35LcmCacheE2ETest(unittest.TestCase):
                     "phases": {
                         "no_pressure/replay": {
                             "prompt_tokens": 100,
-                            "cached_tokens": (
-                                95 if arm == "branch_flat_lcm" else 75
-                            ),
+                            "cached_tokens": (95 if arm == "branch_flat_lcm" else 75),
                             "executed_prefill_tokens": (
                                 5 if arm == "branch_flat_lcm" else 25
                             ),

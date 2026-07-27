@@ -55,18 +55,19 @@ public:
 
     PrefixMatch Match(BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_blocks,
                       std::int32_t max_blocks) {
-        return AcquireMatchedBlocks(pool, keys, begin_blocks, Probe(pool, keys, begin_blocks, max_blocks), recency_);
+        return AcquireMatchedBlocks(pool, keys, begin_blocks, Probe(pool, keys, begin_blocks, max_blocks),
+                                    ++next_access_epoch_);
     }
     void CacheBlock(BlockPool& pool, CacheBlockRef& block, const CacheKey& key) {
-        ::tokenspeed::SwaManager::CacheBlock(pool, block, key, recency_);
+        ::tokenspeed::SwaManager::CacheBlock(pool, block, key, ++next_access_epoch_);
     }
     void CacheFullBlocks(BlockPool& pool, BlockTable& table, std::span<const CacheKey> keys,
                          std::int32_t first_slot = 0) {
-        ::tokenspeed::SwaManager::CacheFullBlocks(pool, table, keys, recency_, first_slot);
+        ::tokenspeed::SwaManager::CacheFullBlocks(pool, table, keys, ++next_access_epoch_, first_slot);
     }
 
 private:
-    std::uint64_t recency_{0};
+    std::uint64_t next_access_epoch_{0};
 };
 
 // Cache then free, so the page is prefix-hittable via MatchPrefix.

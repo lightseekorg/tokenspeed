@@ -89,9 +89,7 @@ class ShortConvCheckpointRuntimeTest(unittest.TestCase):
 
         self.assertTrue(torch.equal(first[0], page_zero_before[0]))
         self.assertTrue(torch.equal(second[0], page_zero_before[1]))
-        self.assertTrue(
-            torch.equal(torch.cat((first[5], second[5]), -1), state[2])
-        )
+        self.assertTrue(torch.equal(torch.cat((first[5], second[5]), -1), state[2]))
 
 
 if __name__ == "__main__":

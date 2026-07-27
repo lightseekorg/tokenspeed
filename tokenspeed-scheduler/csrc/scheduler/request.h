@@ -209,13 +209,14 @@ public:
             state_);
     }
 
-    fsm::HashChain FlatHashChain() const {
+    fsm::FlatCacheProgress FlatCacheProgress() const {
         return std::visit(Overloaded{
-            []<typename T>(const T& state) -> fsm::HashChain
+            []<typename T>(const T& state) -> fsm::FlatCacheProgress
                 requires(std::derived_from<T, fsm::ForwardState>)
-            { return state.HashChainValue(); },
-            [this](const auto&) -> fsm::HashChain {
-                throw std::logic_error("Request::FlatHashChain: expected a forward state; got state=" + StateName());
+            { return state.FlatCacheProgressValue(); },
+            [this](const auto&) -> fsm::FlatCacheProgress {
+                throw std::logic_error("Request::FlatCacheProgress: expected a forward state; got state=" +
+                                       StateName());
             },
             },
             state_);

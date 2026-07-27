@@ -269,16 +269,20 @@ void Scheduler::resolveFlatStarvation(const std::vector<Request*>& candidates, b
 }
 
 std::optional<KvCacheCoordinator::AdmissionResult> Scheduler::flatAdmit(KvCacheCoordinator::PrefixProbe&& prefix,
-                                                                        std::span<const GroupDemand> demands) {
-    std::optional<KvCacheCoordinator::AdmissionResult> result = coordinator_.Admit(std::move(prefix), demands);
+                                                                        std::span<const GroupDemand> demands,
+                                                                        std::optional<std::uint64_t>
+                                                                            request_access_epoch) {
+    std::optional<KvCacheCoordinator::AdmissionResult> result =
+        coordinator_.Admit(std::move(prefix), demands, request_access_epoch);
     if (!result) {
         flat_no_lcm_placement_ = true;
     }
     return result;
 }
 
-std::optional<KvCacheCoordinator::AdmissionResult> Scheduler::flatAdmit(std::span<const GroupDemand> demands) {
-    return flatAdmit(coordinator_.ProbePrefix({}), demands);
+std::optional<KvCacheCoordinator::AdmissionResult> Scheduler::flatAdmit(std::span<const GroupDemand> demands,
+                                                                        std::uint64_t request_access_epoch) {
+    return flatAdmit(coordinator_.ProbePrefix({}), demands, request_access_epoch);
 }
 #endif
 
@@ -391,7 +395,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     flat_admission = std::move(*admission);
     if (!flat_match.ext_hashes.empty()) {
         coordinator_.CacheFullBlocks(
-            flat_tables, flat_match.ext_hashes,
+            flat_tables, flat_match.ext_hashes, flat_admission.access_epoch,
             /*first_slot=*/flat_admission.device_prefix_tokens / coordinator_.CacheBlockTokens(),
             /*end_tokens=*/flat_hit_tokens);
     }
@@ -413,7 +417,10 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         &coordinator_,
         std::move(flat_tables),
         flat_hit_tokens,
-        std::move(flat_match.hash_chain),
+        fsm::FlatCacheProgress{
+            .hash_chain = std::move(flat_match.hash_chain),
+            .access_epoch = flat_admission.access_epoch,
+        },
         std::move(flat_admission.load_pairs),
 #endif
     };
@@ -467,12 +474,13 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
 #if TOKENSPEED_FLAT_KVCACHE
     PrefillInfo previous = request->GetPrefillInfo();
     const std::int32_t flat_num_computed = previous.already_scheduled_len + previous.extend_len;
-    fsm::HashChain flat_hash_chain = request->FlatHashChain();
-    const std::int32_t completed_first_page_slot = flat_hash_chain.num_hashed_pages;
+    fsm::FlatCacheProgress flat_cache_progress = request->FlatCacheProgress();
+    const std::int32_t completed_first_page_slot = flat_cache_progress.hash_chain.num_hashed_pages;
     std::vector<std::string> completed_page_hashes;
     const std::int32_t filled_pages = flat_num_computed / coordinator_.CacheBlockTokens();
-    if (filled_pages > flat_hash_chain.num_hashed_pages) {
-        completed_page_hashes = advanceHashChain(flat_hash_chain, request->GetFullPagedTokens(false), filled_pages);
+    if (filled_pages > flat_cache_progress.hash_chain.num_hashed_pages) {
+        completed_page_hashes =
+            advanceHashChain(flat_cache_progress.hash_chain, request->GetFullPagedTokens(false), filled_pages);
     }
     std::vector<BlockTable>& flat_tables = request->FlatBlockTablesRef();
     std::vector<GroupDemand> flat_demands =
@@ -484,7 +492,7 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
                                           .num_computed_tokens = flat_num_computed,
                                           .reserve_tokens = flat_decode_reserve,
                                       });
-    if (!flatAdmit(flat_demands)) {
+    if (!flatAdmit(flat_demands, flat_cache_progress.access_epoch)) {
         return {};
     }
 #endif
@@ -493,7 +501,7 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
                                      hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr
 #if TOKENSPEED_FLAT_KVCACHE
                                      ,
-                                     std::move(flat_hash_chain)
+                                     std::move(flat_cache_progress)
 #endif
     };
 }
@@ -533,7 +541,7 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
 #if TOKENSPEED_FLAT_KVCACHE
     std::vector<BlockTable>& flat_tables = request->FlatBlockTablesRef();
     const std::int32_t reserve_tokens = request->GetReserveNumTokensInNextScheduleEvent();
-    fsm::HashChain flat_hash_chain = request->FlatHashChain();
+    fsm::FlatCacheProgress flat_cache_progress = request->FlatCacheProgress();
     std::int32_t num_computed_tokens;
     if (request->Is<fsm::PrefillDone>()) {
         PrefillInfo previous = request->GetPrefillInfo();
@@ -541,11 +549,12 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
     } else {
         num_computed_tokens = request->TokenSize() - config_.decode_input_tokens;
     }
-    const std::int32_t completed_first_page_slot = flat_hash_chain.num_hashed_pages;
+    const std::int32_t completed_first_page_slot = flat_cache_progress.hash_chain.num_hashed_pages;
     std::vector<std::string> completed_page_hashes;
     const std::int32_t filled_pages = num_computed_tokens / coordinator_.CacheBlockTokens();
-    if (filled_pages > flat_hash_chain.num_hashed_pages) {
-        completed_page_hashes = advanceHashChain(flat_hash_chain, request->GetFullPagedTokens(false), filled_pages);
+    if (filled_pages > flat_cache_progress.hash_chain.num_hashed_pages) {
+        completed_page_hashes =
+            advanceHashChain(flat_cache_progress.hash_chain, request->GetFullPagedTokens(false), filled_pages);
     }
     if (completed_page_hashes.empty() &&
         canConsumeAvailable(coordinator_, flat_tables, reserve_tokens, num_computed_tokens)) {
@@ -559,7 +568,7 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
                                               .completed_end_tokens = num_computed_tokens,
                                               .num_computed_tokens = num_computed_tokens,
                                           });
-        if (!flatAdmit(demands)) {
+        if (!flatAdmit(demands, flat_cache_progress.access_epoch)) {
             return {};
         }
     }
@@ -568,7 +577,7 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
     return fsm::ScheduleDecodeEvent{config_.decode_input_tokens, hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr
 #if TOKENSPEED_FLAT_KVCACHE
                                     ,
-                                    std::move(flat_hash_chain)
+                                    std::move(flat_cache_progress)
 #endif
     };
 }

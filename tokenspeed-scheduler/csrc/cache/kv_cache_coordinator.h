@@ -44,7 +44,7 @@ struct CoordinatorMatch {
 };
 
 // Multi-group fan-out over the per-attention managers, one shared BlockPool. Holds no per-request
-// state; the only cross-round mutable state is the streaming-sink mailbox, drained every round.
+// state; the request access clock is global, while each request carries its issued epoch.
 class KvCacheCoordinator {
 public:
     // The host tier is fixed at construction: bound, CacheFullBlocks feeds the sink mailbox.
@@ -72,16 +72,19 @@ public:
     struct AdmissionResult {
         std::int32_t device_prefix_tokens{0};
         std::int32_t host_prefix_tokens{0};
+        std::uint64_t access_epoch{0};
         std::vector<BlockTransfer> load_pairs;
     };
 
     // ProbePrefix is read-only. Flat cache state must not change before its
     // result is passed to Admit. Admit consumes the probe even when admission
-    // fails. It returns nullopt before committing when capacity is unavailable;
-    // once commit starts, an internal plan/pool mismatch is fatal because
-    // partial commit is not rolled back.
+    // fails. It returns nullopt before committing when capacity is unavailable.
+    // A missing epoch starts a new request; a supplied epoch continues that
+    // request. Once commit starts, an internal plan/pool mismatch is fatal
+    // because partial commit is not rolled back.
     PrefixProbe ProbePrefix(std::span<const std::string> content_hashes) const;
-    std::optional<AdmissionResult> Admit(PrefixProbe&& prefix, std::span<const GroupDemand> demands);
+    std::optional<AdmissionResult> Admit(PrefixProbe&& prefix, std::span<const GroupDemand> demands,
+                                         std::optional<std::uint64_t> request_access_epoch = std::nullopt);
 
     // Single home of the gate-side page math.
     std::int32_t BlocksNeededFor(std::span<const BlockTable> tables, std::int32_t num_tokens) const;
@@ -92,7 +95,8 @@ public:
     // Legacy State producers only materialize an aligned chunk-end snapshot.
     // Producers that advertise materializes_all_boundaries register the whole range.
     void CacheFullBlocks(std::span<BlockTable> tables, std::span<const std::string> content_hashes,
-                         std::int32_t first_slot = 0, std::int32_t end_tokens = -1);
+                         std::uint64_t access_epoch, std::int32_t first_slot = 0,
+                         std::int32_t end_tokens = -1);
     void ReclaimExpired(std::span<BlockTable> tables, std::int32_t num_computed_tokens);
     void ConsumeAvailable(std::span<BlockTable> tables, std::int32_t num_tokens);
     void Free(std::span<BlockTable> tables);
@@ -123,18 +127,19 @@ private:
     PrefixProbe::Tier probeTierWithKeys(const BlockPool& pool, std::span<const std::vector<CacheKey>> group_keys,
                                         std::int32_t num_cache_blocks, std::int32_t floor_tokens) const;
     CoordinatorMatch acquireTierWithKeys(BlockPool& pool, std::span<const std::vector<CacheKey>> group_keys,
-                                         std::int32_t floor_tokens, PrefixProbe::Tier&& probe);
-    AcquiredPrefix acquirePrefix(PrefixProbe&& probe);
+                                         std::int32_t floor_tokens, PrefixProbe::Tier&& probe,
+                                         std::uint64_t access_epoch);
+    AcquiredPrefix acquirePrefix(PrefixProbe&& probe, std::uint64_t access_epoch);
     void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table,
                                  std::span<const std::string> content_hashes, std::int32_t first_slot,
-                                 std::int32_t end_tokens);
+                                 std::int32_t end_tokens, std::uint64_t access_epoch);
     std::vector<CacheGroup> groups_;
     // Closed groups first, so non-closed groups match against a settled bound.
     std::vector<std::size_t> match_order_;
     BlockPool& pool_;
     BlockPool* host_pool_{nullptr};
     std::int32_t cache_block_tokens_{0};
-    std::uint64_t next_recency_{0};
+    std::uint64_t next_access_epoch_{0};
     std::vector<StoreCandidate> pending_stores_;
 };
 

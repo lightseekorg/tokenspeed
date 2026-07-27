@@ -138,8 +138,11 @@ private:
     };
     FlatAdmissionMatch matchFlatPrefixAtAdmission(Request* request);
     std::optional<KvCacheCoordinator::AdmissionResult> flatAdmit(KvCacheCoordinator::PrefixProbe&& prefix,
-                                                                 std::span<const GroupDemand> demands);
-    std::optional<KvCacheCoordinator::AdmissionResult> flatAdmit(std::span<const GroupDemand> demands);
+                                                                 std::span<const GroupDemand> demands,
+                                                                 std::optional<std::uint64_t> request_access_epoch =
+                                                                     std::nullopt);
+    std::optional<KvCacheCoordinator::AdmissionResult> flatAdmit(std::span<const GroupDemand> demands,
+                                                                 std::uint64_t request_access_epoch);
     bool flatPoolWedged(const std::vector<Request*>& candidates) const;
     void resolveFlatStarvation(const std::vector<Request*>& candidates, bool made_progress);
 #endif

@@ -150,14 +150,15 @@ KvCacheCoordinator::PrefixProbe::Tier KvCacheCoordinator::probeTierWithKeys(
 
 CoordinatorMatch KvCacheCoordinator::acquireTierWithKeys(BlockPool& pool,
                                                          std::span<const std::vector<CacheKey>> group_keys,
-                                                         std::int32_t floor_tokens, PrefixProbe::Tier&& probe) {
+                                                         std::int32_t floor_tokens, PrefixProbe::Tier&& probe,
+                                                         std::uint64_t access_epoch) {
     CoordinatorMatch out;
     out.num_common_tokens = probe.num_common_tokens;
     out.per_group.resize(groups_.size());
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         const std::int32_t floor_blocks = floor_tokens / cache_block_tokens_;
         out.per_group[i] = groups_[i].Manager().AcquireMatchedBlocks(pool, group_keys[i], floor_blocks,
-                                                                     probe.per_group[i], next_recency_);
+                                                                     probe.per_group[i], access_epoch);
     }
     return out;
 }
@@ -177,12 +178,14 @@ KvCacheCoordinator::PrefixProbe KvCacheCoordinator::ProbePrefix(std::span<const 
     return out;
 }
 
-KvCacheCoordinator::AcquiredPrefix KvCacheCoordinator::acquirePrefix(PrefixProbe&& probe) {
+KvCacheCoordinator::AcquiredPrefix KvCacheCoordinator::acquirePrefix(PrefixProbe&& probe,
+                                                                      std::uint64_t access_epoch) {
     AcquiredPrefix out;
-    out.device = acquireTierWithKeys(pool_, probe.group_keys, /*floor_tokens=*/0, std::move(probe.device));
+    out.device =
+        acquireTierWithKeys(pool_, probe.group_keys, /*floor_tokens=*/0, std::move(probe.device), access_epoch);
     if (host_pool_ != nullptr) {
-        out.host =
-            acquireTierWithKeys(*host_pool_, probe.group_keys, out.device.num_common_tokens, std::move(probe.host));
+        out.host = acquireTierWithKeys(*host_pool_, probe.group_keys, out.device.num_common_tokens,
+                                       std::move(probe.host), access_epoch);
     }
     return out;
 }
@@ -217,19 +220,20 @@ std::int32_t KvCacheCoordinator::NumAvailableLcmBlocks() const {
 }
 
 void KvCacheCoordinator::CacheFullBlocks(std::span<BlockTable> tables, std::span<const std::string> content_hashes,
-                                         std::int32_t first_slot, std::int32_t end_tokens) {
+                                         std::uint64_t access_epoch, std::int32_t first_slot,
+                                         std::int32_t end_tokens) {
     _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
     if (content_hashes.empty()) {
         return;  // hot decode rounds usually fill no page
     }
     for (std::size_t i = 0; i < groups_.size(); ++i) {
-        cacheFullBlocksForGroup(i, tables[i], content_hashes, first_slot, end_tokens);
+        cacheFullBlocksForGroup(i, tables[i], content_hashes, first_slot, end_tokens, access_epoch);
     }
 }
 
 void KvCacheCoordinator::cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table,
                                                  std::span<const std::string> content_hashes, std::int32_t first_slot,
-                                                 std::int32_t end_tokens) {
+                                                 std::int32_t end_tokens, std::uint64_t access_epoch) {
     std::vector<CacheKey> keys = keysForGroup(content_hashes, groups_[group_index].Id());
     std::int32_t group_first_slot = first_slot;
     std::span<const CacheKey> group_keys = keys;
@@ -245,7 +249,7 @@ void KvCacheCoordinator::cacheFullBlocksForGroup(std::size_t group_index, BlockT
                 "state registration range must end at the aligned boundary");
     }
     std::vector<std::pair<CacheKey, CacheBlockRef>> newly_cached;
-    groups_[group_index].Manager().CacheFullBlocks(pool_, table, group_keys, next_recency_, group_first_slot,
+    groups_[group_index].Manager().CacheFullBlocks(pool_, table, group_keys, access_epoch, group_first_slot,
                                                    host_pool_ != nullptr ? &newly_cached : nullptr);
     for (auto& [key, block_ref] : newly_cached) {
         pending_stores_.push_back(StoreCandidate{
@@ -317,7 +321,7 @@ std::int32_t KvCacheCoordinator::NumPinnedHostCachedBlocks() const {
 void KvCacheCoordinator::CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key) {
     _assert(host_pool_ != nullptr, "CacheHostBlock requires a host pool");
     _assert(key.group_id < groups_.size(), "CacheHostBlock group id out of range");
-    groups_[key.group_id].Manager().CacheBlock(*host_pool_, block_ref, key, next_recency_);
+    groups_[key.group_id].Manager().CacheBlock(*host_pool_, block_ref, key, ++next_access_epoch_);
 }
 
 KvCacheCoordinator MakeCoordinator(std::span<const KvCacheSpec> specs, std::int32_t cache_block_tokens, BlockPool& pool,

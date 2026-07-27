@@ -80,7 +80,7 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
                                    KvCacheCoordinator* coordinator = nullptr,
                                    std::vector<BlockTable> flat_tables = {},
                                    std::int32_t flat_hit_tokens = 0,
-                                   HashChain flat_hash_chain = {},
+                                   FlatCacheProgress flat_cache_progress = {},
                                    std::vector<BlockTransfer> flat_load_pairs = {}
 #endif
                                    )
@@ -101,7 +101,7 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
           coordinator_(coordinator),
           flat_tables_(std::move(flat_tables)),
           flat_hit_tokens_(flat_hit_tokens),
-          flat_hash_chain_(std::move(flat_hash_chain)),
+          flat_cache_progress_(std::move(flat_cache_progress)),
           flat_load_pairs_(std::move(flat_load_pairs))
 #endif
     {
@@ -137,7 +137,7 @@ private:
     KvCacheCoordinator* coordinator_{};
     std::vector<BlockTable> flat_tables_;
     std::int32_t flat_hit_tokens_{0};
-    HashChain flat_hash_chain_;
+    FlatCacheProgress flat_cache_progress_;
     std::vector<BlockTransfer> flat_load_pairs_{};
 #endif
 };
@@ -148,7 +148,7 @@ struct SchedulePrefillEvent : InvalidTransitionHandler<SchedulePrefillEvent> {
                          HybridPrefixCache* hybrid_prefix_cache = nullptr
 #if TOKENSPEED_FLAT_KVCACHE
                          ,
-                         HashChain flat_hash_chain = {}
+                         FlatCacheProgress flat_cache_progress = {}
 #endif
                          )
         : tokens_this_round_(tokens_this_round),
@@ -156,7 +156,7 @@ struct SchedulePrefillEvent : InvalidTransitionHandler<SchedulePrefillEvent> {
           hybrid_prefix_cache_(hybrid_prefix_cache)
 #if TOKENSPEED_FLAT_KVCACHE
           ,
-          flat_hash_chain_(std::move(flat_hash_chain))
+          flat_cache_progress_(std::move(flat_cache_progress))
 #endif
     {
     }
@@ -169,7 +169,7 @@ private:
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
     HybridPrefixCache* hybrid_prefix_cache_{};
 #if TOKENSPEED_FLAT_KVCACHE
-    HashChain flat_hash_chain_;
+    FlatCacheProgress flat_cache_progress_;
 #endif
 };
 
@@ -179,14 +179,14 @@ struct ScheduleDecodeEvent : InvalidTransitionHandler<ScheduleDecodeEvent> {
     ScheduleDecodeEvent(std::int32_t decode_input_tokens, HybridPrefixCache* hybrid_prefix_cache = nullptr
 #if TOKENSPEED_FLAT_KVCACHE
                         ,
-                        HashChain flat_hash_chain = {}
+                        FlatCacheProgress flat_cache_progress = {}
 #endif
                         )
         : decode_input_tokens_(decode_input_tokens),
           hybrid_prefix_cache_(hybrid_prefix_cache)
 #if TOKENSPEED_FLAT_KVCACHE
           ,
-          flat_hash_chain_(std::move(flat_hash_chain))
+          flat_cache_progress_(std::move(flat_cache_progress))
 #endif
     {
     }
@@ -198,7 +198,7 @@ private:
     std::int32_t decode_input_tokens_;
     HybridPrefixCache* hybrid_prefix_cache_{};
 #if TOKENSPEED_FLAT_KVCACHE
-    HashChain flat_hash_chain_;
+    FlatCacheProgress flat_cache_progress_;
 #endif
 };
 

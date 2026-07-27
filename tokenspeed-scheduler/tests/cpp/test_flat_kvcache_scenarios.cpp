@@ -1713,15 +1713,19 @@ TEST(FlatRetractEvent, PrefillDoneVictimReleasesPagesAndRequeues) {
     RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*page_size=*/2)};
     Request request{spec, /*page_size=*/2, Role::kFused};
     std::vector<BlockTable> tables(coordinator.NumGroups());
-    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
+    const std::optional<KvCacheCoordinator::AdmissionResult> admission =
+        AdmitForTest(coordinator, tables, /*num_tokens=*/4);
+    ASSERT_TRUE(admission);
 
     // Whole 4-token prompt in one chunk -> PrefillDone: holds pages, no decode yet.
     request.Apply(fsm::SchedulePrefillFirstChunkEvent{
         /*tokens_this_round=*/4, /*decode_input_tokens=*/1, /*device_allocator=*/nullptr, &req_pool, MatchResult{},
         Role::kFused, /*kv_prefix_cache=*/nullptr, /*disable_l2_cache=*/true, /*loadback_diff=*/{},
         /*hybrid_prefix_cache=*/nullptr, /*mamba_allocator=*/nullptr, /*mamba_loadback_nodes=*/{}, &coordinator,
-        std::move(tables)});
+        std::move(tables), /*flat_hit_tokens=*/0,
+        fsm::FlatCacheProgress{.access_epoch = admission->access_epoch}});
     ASSERT_TRUE(request.Is<fsm::PrefillDone>());
+    EXPECT_EQ(request.FlatCacheProgress().access_epoch, admission->access_epoch);
     ASSERT_LT(pool.NumEmptyLcmBlocks(), 8);
 
     // The last chunk's ExtendResult lands while still PrefillDone.

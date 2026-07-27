@@ -90,7 +90,7 @@ TEST(ForwardCacheOpsPrefill, FirstChunkClaimsHitThenAcquiresOnlyRemainder) {
     }
     std::vector<BlockTable> r1(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, r1, /*num_tokens=*/8));
-    coordinator.CacheFullBlocks(r1, hashes8);
+    CacheFullBlocksForTest(coordinator, r1, hashes8);
     const std::vector<std::int32_t> r1_full_ids = BlockTableLcmBlockIds(r1[0]);
     const std::vector<std::int32_t> r1_swa_ids = BlockTableLcmBlockIds(r1[1]);
     FreeRequest(coordinator, r1);
@@ -277,7 +277,7 @@ TEST(ForwardCacheOpsDecode, DecodeStepRegistersFilledPages) {
     for (std::size_t i = 0; i < hashes.size(); ++i) {
         hashes[i] = std::string(64, static_cast<char>('a' + i));
     }
-    coordinator.CacheFullBlocks(tables, std::span<const std::string>(hashes).first(2));
+    CacheFullBlocksForTest(coordinator, tables, std::span<const std::string>(hashes).first(2));
     ASSERT_EQ(MatchPrefixForTest(coordinator, hashes).device.num_common_tokens, 4);
 
     const std::vector<std::string> fresh(hashes.begin() + 2, hashes.end());

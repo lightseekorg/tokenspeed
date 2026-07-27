@@ -85,8 +85,9 @@ private:
     struct VictimCandidate {
         GroupId group_id;
         CacheBlockLocation location;
-        std::uint64_t last_access;
+        std::uint64_t last_access_epoch;
         std::int32_t logical_block_index;
+        bool is_full;
         bool is_state;
         bool was_prefix_hit;
     };
@@ -135,16 +136,17 @@ private:
             if (protected_locations.contains(location) || !candidates.insert(location).second) {
                 return;
             }
-            const std::uint64_t last_access = groups_[group_id]
-                                                  .Manager()
-                                                  .CachedBlockLastAccess(pool_, location)
-                                                  .value_or(std::numeric_limits<std::uint64_t>::max());
+            const std::uint64_t last_access_epoch = groups_[group_id]
+                                                        .Manager()
+                                                        .CachedBlockLastAccessEpoch(pool_, location)
+                                                        .value_or(std::numeric_limits<std::uint64_t>::max());
             victim_candidates_.push_back(VictimCandidate{
                 .group_id = group_id,
                 .location = location,
-                .last_access = last_access,
+                .last_access_epoch = last_access_epoch,
                 .logical_block_index =
                     groups_[group_id].Manager().CachedBlockLogicalIndex(pool_, location).value_or(-1),
+                .is_full = groups_[group_id].Spec().kind == AttnKind::kFull,
                 .is_state = groups_[group_id].Spec().kind == AttnKind::kMambaState,
                 .was_prefix_hit = groups_[group_id].Manager().CachedBlockWasPrefixHit(pool_, location),
             });
@@ -164,15 +166,21 @@ private:
             }
         }
         std::ranges::sort(victim_candidates_, [](const VictimCandidate& lhs, const VictimCandidate& rhs) {
-            if (lhs.was_prefix_hit != rhs.was_prefix_hit) {
-                return !lhs.was_prefix_hit;
+            const auto eviction_class = [](const VictimCandidate& candidate) {
+                if (!candidate.was_prefix_hit && candidate.is_state && candidate.logical_block_index >= 0) {
+                    return 0;
+                }
+                if (candidate.is_full) {
+                    return 1;
+                }
+                return candidate.was_prefix_hit ? 3 : 2;
+            };
+            const int lhs_class = eviction_class(lhs);
+            const int rhs_class = eviction_class(rhs);
+            if (lhs_class != rhs_class) {
+                return lhs_class < rhs_class;
             }
-            const bool lhs_is_unhit_state = !lhs.was_prefix_hit && lhs.is_state && lhs.logical_block_index >= 0;
-            const bool rhs_is_unhit_state = !rhs.was_prefix_hit && rhs.is_state && rhs.logical_block_index >= 0;
-            if (lhs_is_unhit_state != rhs_is_unhit_state) {
-                return lhs_is_unhit_state;
-            }
-            if (lhs_is_unhit_state && lhs.logical_block_index != rhs.logical_block_index) {
+            if (lhs_class == 0 && lhs.logical_block_index != rhs.logical_block_index) {
                 // Dense State checkpoints are alternative resume points. Until
                 // one proves useful, retain the longer checkpoint and evict an
                 // earlier one instead of letting insertion order erase the
@@ -181,8 +189,13 @@ private:
             }
             // An uncached prospective reclaim may be registered immediately
             // before sliding releases its table ref. Treat it as newest.
-            if (lhs.last_access != rhs.last_access) {
-                return lhs.last_access < rhs.last_access;
+            if (lhs.last_access_epoch != rhs.last_access_epoch) {
+                return lhs.last_access_epoch < rhs.last_access_epoch;
+            }
+            if (lhs_class == 1 && lhs.logical_block_index != rhs.logical_block_index) {
+                // Full KV is prefix-closed: after comparing request access
+                // epochs, reclaim the suffix before an earlier page.
+                return lhs.logical_block_index > rhs.logical_block_index;
             }
             if (lhs.group_id != rhs.group_id) {
                 return lhs.group_id < rhs.group_id;
@@ -264,7 +277,9 @@ std::optional<AdmissionPlan> planAdmission(const std::vector<CacheGroup>& groups
 }  // namespace
 
 std::optional<KvCacheCoordinator::AdmissionResult> KvCacheCoordinator::Admit(PrefixProbe&& prefix,
-                                                                             std::span<const GroupDemand> demands) {
+                                                                             std::span<const GroupDemand> demands,
+                                                                             std::optional<std::uint64_t>
+                                                                                 request_access_epoch) {
     std::optional<AdmissionPlan> candidate = planAdmission(groups_, pool_, std::move(prefix), demands);
     if (!candidate) {
         return std::nullopt;
@@ -276,10 +291,17 @@ std::optional<KvCacheCoordinator::AdmissionResult> KvCacheCoordinator::Admit(Pre
         _assert(demand.table != nullptr, "group demand requires a block table");
     }
 
-    AcquiredPrefix acquired_prefix = acquirePrefix(std::move(plan.prefix));
+    if (request_access_epoch.has_value()) {
+        _assert(*request_access_epoch > 0 && *request_access_epoch <= next_access_epoch_,
+                "request access epoch was not issued by this coordinator");
+    }
+    const std::uint64_t access_epoch =
+        request_access_epoch.has_value() ? *request_access_epoch : ++next_access_epoch_;
+    AcquiredPrefix acquired_prefix = acquirePrefix(std::move(plan.prefix), access_epoch);
     AdmissionResult result{
         .device_prefix_tokens = acquired_prefix.device.num_common_tokens,
         .host_prefix_tokens = acquired_prefix.host.num_common_tokens,
+        .access_epoch = access_epoch,
     };
     if (acquired_prefix.device.num_common_tokens > 0) {
         for (std::size_t i = 0; i < groups_.size(); ++i) {
@@ -301,7 +323,7 @@ std::optional<KvCacheCoordinator::AdmissionResult> KvCacheCoordinator::Admit(Pre
         const GroupDemand& demand = demands[i];
         if (!demand.completed_page_hashes.empty()) {
             cacheFullBlocksForGroup(i, *demand.table, demand.completed_page_hashes, demand.completed_first_page_slot,
-                                    demand.completed_end_tokens);
+                                    demand.completed_end_tokens, access_epoch);
         }
         if (demand.num_computed_tokens >= 0) {
             groups_[i].Manager().ReclaimExpired(pool_, *demand.table, demand.num_computed_tokens);
