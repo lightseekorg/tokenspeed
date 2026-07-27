@@ -42,6 +42,8 @@ def moe_sigmoid_bias_topk(
     *,
     routed_scaling_factor: float = 1.0,
     normalize_topk_weights: bool = True,
+    logical_to_physical_map: torch.Tensor | None = None,
+    weights_dtype: torch.dtype = torch.float32,
     solution: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select experts using ``sigmoid(logits) + correction_bias``.
@@ -52,11 +54,17 @@ def moe_sigmoid_bias_topk(
         topk: Number of experts selected per token.
         routed_scaling_factor: Scale applied after optional normalization.
         normalize_topk_weights: Normalize selected sigmoid scores when true.
+        logical_to_physical_map: Optional ``[experts]`` integer map applying
+            static expert-location dispatch to the selected ids (fused into
+            the specialized decode kernel; a gather elsewhere).
+        weights_dtype: Output dtype for the route weights (selection always
+            runs in FP32).
         solution: Optional implementation override.
 
     Returns:
         ``(topk_weights, topk_ids)`` with shapes ``[tokens, topk]``. Weights
-        are FP32 and ids are INT32.
+        are ``weights_dtype`` and ids are INT32 (physical ids when a dispatch
+        map is given).
     """
     if router_logits.dim() != 2:
         raise ValueError("router_logits must have shape [tokens, experts]")
@@ -70,22 +78,29 @@ def moe_sigmoid_bias_topk(
     if tokens == 0:
         shape = (0, topk)
         return (
-            torch.empty(shape, device=router_logits.device, dtype=torch.float32),
+            torch.empty(shape, device=router_logits.device, dtype=weights_dtype),
             torch.empty(shape, device=router_logits.device, dtype=torch.int32),
         )
+    platform = Platform.get()
     if (
         solution is None
-        and Platform.get().is_cdna4
+        and (platform.is_cdna4 or platform.is_nvidia)
         and router_logits.shape == (1, 896)
         and router_logits.dtype == torch.float32
         and correction_bias.dtype == torch.float32
         and topk == 16
     ):
+        # The packed-key single-CTA kernel wins on both vendors for the K3
+        # decode shape: one bitonic top-16 instead of the grouped multi-pass
+        # (NVIDIA B300: 3.7us vs 7.0us for the minimax path, bit-identical
+        # selection and weights).
         return kimi3_sigmoid_bias_topk(
             router_logits,
             correction_bias,
             routed_scaling_factor=routed_scaling_factor,
             normalize_topk_weights=normalize_topk_weights,
+            logical_to_physical_map=logical_to_physical_map,
+            weights_dtype=weights_dtype,
         )
     if solution is None and not _gluon_eligible(router_logits, correction_bias, topk):
         solution = "torch"
@@ -96,13 +111,18 @@ def moe_sigmoid_bias_topk(
         format_signature(router_logits=dense_tensor_format(router_logits.dtype)),
         solution=solution,
     )
-    return kernel(
+    topk_weights, topk_ids = kernel(
         router_logits=router_logits,
         correction_bias=correction_bias,
         topk=topk,
         routed_scaling_factor=routed_scaling_factor,
         normalize_topk_weights=normalize_topk_weights,
     )
+    if logical_to_physical_map is not None:
+        topk_ids = logical_to_physical_map[topk_ids.long()].to(torch.int32)
+    if topk_weights.dtype != weights_dtype:
+        topk_weights = topk_weights.to(weights_dtype)
+    return topk_weights, topk_ids
 
 
 @register_kernel(
