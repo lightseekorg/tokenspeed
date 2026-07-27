@@ -1,0 +1,31 @@
+name: Cancel PR Tests on Close
+
+# Fork pull_request workflows can require approval for every new run, including
+# the closed event. Use the base repository's trusted workflow to ensure closing
+# or merging a fork PR still cancels its in-progress test runs.
+on:
+  pull_request_target:
+    types: [closed]
+
+permissions:
+  contents: read
+
+jobs:
+  cancel:
+    name: Cancel ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: PR Test AMD
+            group: pr-test-amd
+          - name: PR Test NVIDIA
+            group: pr-test-nvidia
+          - name: PR Test NVIDIA ARM
+            group: pr-test-nvidia-arm
+    concurrency:
+      group: ${{ matrix.group }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      - name: Confirm cancellation
+        run: echo "Cancelled in-progress ${{ matrix.name }} runs for PR #${{ github.event.pull_request.number }}"
