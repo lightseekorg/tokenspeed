@@ -348,6 +348,8 @@ TEST(KvCacheCoordinatorAdmissionTest, RejectedCachedHitDoesNotRefreshLru) {
         EXPECT_TRUE(tables[0].Blocks().empty());
         EXPECT_EQ(coordinator.GroupManager(0).EvictableBlockLocations(pool),
                   (std::vector<CacheBlockLocation>{{.lcm_block_id = cached_hit, .slot_index = 0}}));
+        EXPECT_FALSE(coordinator.GroupManager(0).CachedBlockWasPrefixHit(
+            pool, CacheBlockLocation{.lcm_block_id = cached_hit, .slot_index = 0}));
     }
 }
 
@@ -579,6 +581,90 @@ TEST(KvCacheCoordinatorAdmissionTest, EvictsOldestCachedChildNeededForCapacity) 
 
     EXPECT_FALSE(coordinator.GroupManager(0).ContainsCachedBlock(pool, Key(hashes[0], 0)));
     EXPECT_TRUE(coordinator.GroupManager(0).ContainsCachedBlock(pool, Key(hashes[1], 0)));
+}
+
+TEST(KvCacheCoordinatorAdmissionTest, EvictsNeverHitBlockBeforeOlderPrefixHitBlock) {
+    BlockPool pool(2);
+    const std::vector<KvCacheSpec> specs = {
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, 4, pool);
+    const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
+    CacheForGroup(coordinator, pool, hashes[0], 0);
+
+    std::vector<BlockTable> hit_tables(coordinator.NumGroups());
+    const std::array<std::int32_t, 1> no_new_tokens{0};
+    std::vector<GroupDemand> hit_demands = FreshDemands(hit_tables, no_new_tokens);
+    ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix(std::span{hashes}.first(1)), hit_demands));
+    coordinator.Free(hit_tables);
+
+    CacheForGroup(coordinator, pool, hashes[1], 0);
+    ASSERT_EQ(pool.NumEmptyLcmBlocks(), 0);
+
+    std::vector<BlockTable> fresh_tables(coordinator.NumGroups());
+    ASSERT_TRUE(AdmitForTest(coordinator, fresh_tables, /*num_tokens=*/4));
+
+    EXPECT_TRUE(coordinator.GroupManager(0).ContainsCachedBlock(pool, Key(hashes[0], 0)));
+    EXPECT_FALSE(coordinator.GroupManager(0).ContainsCachedBlock(pool, Key(hashes[1], 0)));
+}
+
+TEST(KvCacheCoordinatorAdmissionTest, EvictsEarlierNeverHitStateCheckpointBeforeOlderLateCheckpoint) {
+    BlockPool pool(2);
+    const std::vector<KvCacheSpec> specs = {
+        {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, 4, pool);
+    KvCacheManager& manager = coordinator.GroupManager(0);
+    const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
+
+    CacheBlockRef late_checkpoint = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+    manager.CacheBlock(pool, late_checkpoint, Key(hashes[0], 0), TestRecency(), /*logical_block_index=*/10);
+    late_checkpoint.reset();
+
+    CacheBlockRef early_checkpoint = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+    manager.CacheBlock(pool, early_checkpoint, Key(hashes[1], 0), TestRecency(), /*logical_block_index=*/0);
+    early_checkpoint.reset();
+
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
+
+    EXPECT_TRUE(manager.ContainsCachedBlock(pool, Key(hashes[0], 0)));
+    EXPECT_FALSE(manager.ContainsCachedBlock(pool, Key(hashes[1], 0)));
+}
+
+TEST(KvCacheCoordinatorAdmissionTest, DenseStateCheckpointsRetainTwoRequestFrontiers) {
+    BlockPool pool(8);
+    const std::vector<KvCacheSpec> specs = {
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 4},
+        {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+        {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+        {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, 4, pool);
+    const std::vector<std::string> first_hashes =
+        ContentHashes({{1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}, {4, 4, 4, 4}});
+    const std::vector<std::string> second_hashes =
+        ContentHashes({{5, 5, 5, 5}, {6, 6, 6, 6}, {7, 7, 7, 7}, {8, 8, 8, 8}});
+
+    const auto cache_dense_request = [&](std::span<const std::string> hashes) {
+        for (std::size_t block_index = 0; block_index < hashes.size(); ++block_index) {
+            std::vector<BlockTable> tables(coordinator.NumGroups());
+            ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
+            for (std::int32_t group_id = 0; group_id < coordinator.NumGroups(); ++group_id) {
+                CacheBlockRef block_ref = tables[static_cast<std::size_t>(group_id)].Blocks()[0];
+                coordinator.GroupManager(group_id).CacheBlock(
+                    pool, block_ref, Key(hashes[block_index], static_cast<GroupId>(group_id)), TestRecency(),
+                    static_cast<std::int32_t>(block_index));
+            }
+            coordinator.Free(tables);
+        }
+    };
+
+    cache_dense_request(first_hashes);
+    cache_dense_request(second_hashes);
+
+    EXPECT_EQ(MatchPrefixForTest(coordinator, first_hashes).device.num_common_tokens, 16);
+    EXPECT_EQ(MatchPrefixForTest(coordinator, second_hashes).device.num_common_tokens, 16);
 }
 
 TEST(KvCacheCoordinatorAdmissionTest, RebindsOnlyAfterEvictingWholeForeignParent) {

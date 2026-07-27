@@ -86,6 +86,9 @@ private:
         GroupId group_id;
         CacheBlockLocation location;
         std::uint64_t last_access;
+        std::int32_t logical_block_index;
+        bool is_state;
+        bool was_prefix_hit;
     };
 
     void initializeCapacity() {
@@ -140,6 +143,10 @@ private:
                 .group_id = group_id,
                 .location = location,
                 .last_access = last_access,
+                .logical_block_index =
+                    groups_[group_id].Manager().CachedBlockLogicalIndex(pool_, location).value_or(-1),
+                .is_state = groups_[group_id].Spec().kind == AttnKind::kMambaState,
+                .was_prefix_hit = groups_[group_id].Manager().CachedBlockWasPrefixHit(pool_, location),
             });
         };
 
@@ -157,6 +164,21 @@ private:
             }
         }
         std::ranges::sort(victim_candidates_, [](const VictimCandidate& lhs, const VictimCandidate& rhs) {
+            if (lhs.was_prefix_hit != rhs.was_prefix_hit) {
+                return !lhs.was_prefix_hit;
+            }
+            const bool lhs_is_unhit_state = !lhs.was_prefix_hit && lhs.is_state && lhs.logical_block_index >= 0;
+            const bool rhs_is_unhit_state = !rhs.was_prefix_hit && rhs.is_state && rhs.logical_block_index >= 0;
+            if (lhs_is_unhit_state != rhs_is_unhit_state) {
+                return lhs_is_unhit_state;
+            }
+            if (lhs_is_unhit_state && lhs.logical_block_index != rhs.logical_block_index) {
+                // Dense State checkpoints are alternative resume points. Until
+                // one proves useful, retain the longer checkpoint and evict an
+                // earlier one instead of letting insertion order erase the
+                // previous request's live frontier.
+                return lhs.logical_block_index < rhs.logical_block_index;
+            }
             // An uncached prospective reclaim may be registered immediately
             // before sliding releases its table ref. Treat it as newest.
             if (lhs.last_access != rhs.last_access) {

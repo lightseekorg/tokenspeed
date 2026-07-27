@@ -46,6 +46,11 @@ private:
         CacheKey key;
         CacheBlockRef block_ref;
         std::uint64_t last_access{0};
+        // Position in the request's logical prefix. Host-only entries may not
+        // have a device-table position yet.
+        std::int32_t logical_block_index{-1};
+        // New cache entries stay probationary until a request actually resumes from them.
+        bool was_prefix_hit{false};
     };
 
     using LruEntries = std::list<CacheEntry>;
@@ -115,6 +120,7 @@ public:
             _assert(cache_index != nullptr, "cached pool disappeared between match probe and acquisition");
             CacheEntryIterator entry_it = findEntry(*cache_index, keys[static_cast<std::size_t>(begin_blocks) + i]);
             _assert(entry_it != cache_index->lru.end(), "cached block disappeared between match probe and acquisition");
+            entry_it->was_prefix_hit = true;
             touch(*cache_index, entry_it, next_recency);
             match.blocks[i] = entry_it->block_ref;
             ++match.num_hit_blocks;
@@ -216,6 +222,7 @@ public:
     virtual bool RegistersAlignedFinalPageOnly() const { return false; }
 
     void CacheBlock(BlockPool& pool, CacheBlockRef& block_ref, const CacheKey& key, std::uint64_t& next_recency,
+                    std::int32_t logical_block_index = -1,
                     std::vector<std::pair<CacheKey, CacheBlockRef>>* newly_cached = nullptr) {
         _assert(block_ref && block_ref.IsOwnedBy(pool), "cache block must belong to the target pool");
         validateKey(key);
@@ -237,6 +244,7 @@ public:
             .key = key,
             .block_ref = block_ref,
             .last_access = ++next_recency,
+            .logical_block_index = logical_block_index,
         });
         CacheEntryIterator entry_it = std::prev(cache_index.lru.end());
         cache_index.by_key.emplace(entry_it->key, entry_it);
@@ -257,7 +265,7 @@ public:
             if (!block_ref) {
                 continue;
             }
-            CacheBlock(pool, block_ref, keys[j], next_recency, newly_cached);
+            CacheBlock(pool, block_ref, keys[j], next_recency, first_slot + static_cast<std::int32_t>(j), newly_cached);
         }
     }
 
@@ -279,6 +287,26 @@ public:
             return std::nullopt;
         }
         return entry_it->last_access;
+    }
+    bool CachedBlockWasPrefixHit(const BlockPool& pool, CacheBlockLocation location) const {
+        const CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) {
+            return false;
+        }
+        ConstCacheEntryIterator entry_it = findEntry(*cache_index, location);
+        return entry_it != cache_index->lru.end() && entry_it->was_prefix_hit;
+    }
+    std::optional<std::int32_t> CachedBlockLogicalIndex(const BlockPool& pool,
+                                                        CacheBlockLocation location) const {
+        const CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) {
+            return std::nullopt;
+        }
+        ConstCacheEntryIterator entry_it = findEntry(*cache_index, location);
+        if (entry_it == cache_index->lru.end() || entry_it->logical_block_index < 0) {
+            return std::nullopt;
+        }
+        return entry_it->logical_block_index;
     }
     std::int32_t NumCachedBlocks(const BlockPool& pool) const {
         const CacheEntries* cache_index = findCacheEntries(pool);
