@@ -62,6 +62,9 @@ public:
     struct PrefixProbe {
         struct Tier {
             std::int32_t num_common_tokens{0};
+            // Common coverage after all prefix-closed groups, before a
+            // window/state group shortens the resumable boundary.
+            std::int32_t prefix_closed_tokens{0};
             std::vector<GroupPrefixProbe> per_group;
         };
 
@@ -72,6 +75,8 @@ public:
     struct AdmissionResult {
         std::int32_t device_prefix_tokens{0};
         std::int32_t host_prefix_tokens{0};
+        // Device-only boundary worth materializing for non-closed groups.
+        std::int32_t promotion_boundary_tokens{0};
         std::uint64_t access_epoch{0};
         std::vector<BlockTransfer> load_pairs;
     };

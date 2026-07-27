@@ -69,6 +69,11 @@ std::vector<CacheKey> KvCacheCoordinator::keysForGroup(std::span<const std::stri
 
 namespace {
 
+struct ConvergedBoundary {
+    std::int32_t common_tokens{0};
+    std::int32_t prefix_closed_tokens{0};
+};
+
 // Shared match skeleton: one ordered sweep (closed groups first), then re-match any window
 // group left above the settled bound -- with 2+ window groups a later group can shrink the
 // bound UNDER an earlier one's boundary-dependent match. A re-matched group lands at or
@@ -77,14 +82,18 @@ namespace {
 //
 // Bounds align down to the shared logical CacheBlock granularity P.
 template <typename MatchGroup, typename ExtentTokens>
-std::int32_t SweepThenConverge(std::span<const std::size_t> order, const std::vector<CacheGroup>& groups,
-                               std::int32_t bound_tokens, std::int32_t align_tokens, const MatchGroup& match,
-                               const ExtentTokens& extent) {
+ConvergedBoundary SweepThenConverge(std::span<const std::size_t> order, const std::vector<CacheGroup>& groups,
+                                    std::int32_t bound_tokens, std::int32_t align_tokens, const MatchGroup& match,
+                                    const ExtentTokens& extent) {
     const auto align_down = [align_tokens](std::int32_t tokens) { return tokens - tokens % align_tokens; };
     bound_tokens = align_down(bound_tokens);
+    std::int32_t prefix_closed_tokens = 0;
     for (std::size_t i : order) {
         match(i, bound_tokens);
         bound_tokens = std::min(bound_tokens, align_down(extent(i)));
+        if (groups[i].Manager().MatchIsPrefixClosed()) {
+            prefix_closed_tokens = bound_tokens;
+        }
     }
     for (bool changed = true; changed;) {
         changed = false;
@@ -97,7 +106,10 @@ std::int32_t SweepThenConverge(std::span<const std::size_t> order, const std::ve
             changed = true;
         }
     }
-    return bound_tokens;
+    return {
+        .common_tokens = bound_tokens,
+        .prefix_closed_tokens = prefix_closed_tokens,
+    };
 }
 
 }  // namespace
@@ -123,7 +135,7 @@ KvCacheCoordinator::PrefixProbe::Tier KvCacheCoordinator::probeTierWithKeys(
     if (groups_.empty()) {
         return out;
     }
-    const std::int32_t boundary_tokens = SweepThenConverge(
+    const ConvergedBoundary boundary = SweepThenConverge(
         match_order_, groups_, num_cache_blocks * cache_block_tokens_, cache_block_tokens_,
         [&](std::size_t i, std::int32_t bound_tokens) {
             out.per_group[i] = groups_[i].Manager().Probe(pool, group_keys[i], floor_tokens / cache_block_tokens_,
@@ -139,12 +151,14 @@ KvCacheCoordinator::PrefixProbe::Tier KvCacheCoordinator::probeTierWithKeys(
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         GroupPrefixProbe& probe = out.per_group[i];
         const std::int32_t floor_blocks = floor_tokens / cache_block_tokens_;
-        if ((floor_blocks + static_cast<std::int32_t>(probe.hits.size())) * cache_block_tokens_ > boundary_tokens) {
+        if ((floor_blocks + static_cast<std::int32_t>(probe.hits.size())) * cache_block_tokens_ >
+            boundary.common_tokens) {
             _assert(groups_[i].Manager().MatchIsPrefixClosed(), "window group left above the converged boundary");
-            probe.hits.resize(static_cast<std::size_t>(boundary_tokens / cache_block_tokens_ - floor_blocks));
+            probe.hits.resize(static_cast<std::size_t>(boundary.common_tokens / cache_block_tokens_ - floor_blocks));
         }
     }
-    out.num_common_tokens = boundary_tokens;
+    out.num_common_tokens = boundary.common_tokens;
+    out.prefix_closed_tokens = boundary.prefix_closed_tokens;
     return out;
 }
 

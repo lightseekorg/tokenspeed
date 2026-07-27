@@ -25,6 +25,26 @@
 
 namespace tokenspeed {
 
+std::int32_t AlignFlatPrefillChunk(std::int32_t first_pos, std::int32_t unscheduled, std::int32_t token_budget,
+                                   std::int32_t page_size, std::int32_t promotion_boundary_tokens) {
+    _assert(first_pos >= 0 && unscheduled >= 0 && token_budget >= 0, "prefill positions must be non-negative");
+    _assert(page_size > 0, "page_size must be > 0");
+    std::int32_t chunk_size = std::min(unscheduled, token_budget);
+    if (promotion_boundary_tokens > first_pos) {
+        chunk_size = std::min(chunk_size, promotion_boundary_tokens - first_pos);
+    }
+    if (chunk_size == unscheduled) {
+        return chunk_size;
+    }
+
+    const std::int32_t page_offset = first_pos % page_size;
+    if (page_offset != 0) {
+        const std::int32_t tokens_to_boundary = page_size - page_offset;
+        return token_budget >= tokens_to_boundary ? tokens_to_boundary : 0;
+    }
+    return chunk_size - chunk_size % page_size;
+}
+
 std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
     _assert(config.block_size > 0, "cache_block_tokens must be > 0");
     std::vector<KvCacheSpec> specs;

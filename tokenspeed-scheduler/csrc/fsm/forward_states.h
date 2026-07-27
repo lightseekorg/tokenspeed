@@ -47,6 +47,8 @@ struct FlatCacheProgress {
     // history needed to publish a resumable boundary across chunk edges.
     std::vector<std::string> page_hashes;
     std::uint64_t access_epoch{0};
+    // Pending closed-prefix boundary; zero once published or when absent.
+    std::int32_t promotion_boundary_tokens{0};
 };
 #endif
 

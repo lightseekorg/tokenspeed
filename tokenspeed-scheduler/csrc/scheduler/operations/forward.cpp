@@ -144,19 +144,12 @@ bool canConsumeAvailable(const KvCacheCoordinator& coordinator, std::span<const 
     return true;
 }
 
-std::int32_t alignStatePrefillChunk(std::int32_t first_pos, std::int32_t unscheduled, std::int32_t token_budget,
-                                    std::int32_t page_size) {
-    std::int32_t chunk_size = std::min(unscheduled, token_budget);
-    if (chunk_size == unscheduled) {
-        return chunk_size;
+CacheBoundaryKind completedBoundaryKind(std::int32_t num_computed_tokens, std::int32_t prefill_size,
+                                        std::int32_t promotion_boundary_tokens) {
+    if (promotion_boundary_tokens > 0 && num_computed_tokens == promotion_boundary_tokens) {
+        return CacheBoundaryKind::kPromoted;
     }
-
-    const std::int32_t page_offset = first_pos % page_size;
-    if (page_offset != 0) {
-        const std::int32_t tokens_to_boundary = page_size - page_offset;
-        return token_budget >= tokens_to_boundary ? tokens_to_boundary : 0;
-    }
-    return chunk_size - chunk_size % page_size;
+    return num_computed_tokens == prefill_size ? CacheBoundaryKind::kEndpoint : CacheBoundaryKind::kChunk;
 }
 
 // Decoding/PrefillDone requests hold pool pages a flat retract can release.
@@ -325,11 +318,20 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     // Overwrite the radix-sourced locals: the radix tree is never written on flat builds.
     const std::int32_t flat_hit_tokens =
         std::max(flat_match.probe.device.num_common_tokens, flat_match.probe.host.num_common_tokens);
+    const std::int32_t promotion_boundary_tokens =
+        !coordinator_.HasHostTier() &&
+                flat_match.probe.device.prefix_closed_tokens > flat_match.probe.device.num_common_tokens
+            ? flat_match.probe.device.prefix_closed_tokens
+            : 0;
+    _assert(promotion_boundary_tokens == 0 ||
+                (promotion_boundary_tokens % coordinator_.CacheBlockTokens() == 0 &&
+                 promotion_boundary_tokens > flat_hit_tokens),
+            "flat promotion boundary must be page-aligned and beyond the common prefix");
     unscheduled = request->PrefillSize() - flat_hit_tokens;
     tokens_this_round = std::min(remaining, unscheduled);
-    if (coordinator_.HasMambaStateGroup()) {
-        tokens_this_round =
-            alignStatePrefillChunk(flat_hit_tokens, unscheduled, remaining, coordinator_.CacheBlockTokens());
+    if (coordinator_.HasMambaStateGroup() || promotion_boundary_tokens > 0) {
+        tokens_this_round = AlignFlatPrefillChunk(flat_hit_tokens, unscheduled, remaining,
+                                                 coordinator_.CacheBlockTokens(), promotion_boundary_tokens);
         if (tokens_this_round == 0) {
             return {};
         }
@@ -386,6 +388,8 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         return {};
     }
     flat_admission = std::move(*admission);
+    _assert(flat_admission.promotion_boundary_tokens == promotion_boundary_tokens,
+            "flat promotion boundary changed between probe and admission");
     if (!flat_match.ext_hashes.empty()) {
         coordinator_.CacheFullBlocks(
             flat_tables, flat_match.ext_hashes, flat_admission.access_epoch,
@@ -412,6 +416,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         fsm::FlatCacheProgress{
             .page_hashes = std::move(flat_match.page_hashes),
             .access_epoch = flat_admission.access_epoch,
+            .promotion_boundary_tokens = flat_admission.promotion_boundary_tokens,
         },
         std::move(flat_admission.load_pairs),
 #endif
@@ -426,8 +431,11 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
 
 #if TOKENSPEED_FLAT_KVCACHE
     const std::int32_t first_pos = request->PrefillSize() - unscheduled;
-    if (coordinator_.HasMambaStateGroup()) {
-        tokens_this_round = alignStatePrefillChunk(first_pos, unscheduled, remaining, coordinator_.CacheBlockTokens());
+    fsm::FlatCacheProgress flat_cache_progress = request->FlatCacheProgress();
+    if (coordinator_.HasMambaStateGroup() || flat_cache_progress.promotion_boundary_tokens > 0) {
+        tokens_this_round =
+            AlignFlatPrefillChunk(first_pos, unscheduled, remaining, coordinator_.CacheBlockTokens(),
+                                  flat_cache_progress.promotion_boundary_tokens);
         if (tokens_this_round == 0) {
             return {};
         }
@@ -466,7 +474,6 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
 #if TOKENSPEED_FLAT_KVCACHE
     PrefillInfo previous = request->GetPrefillInfo();
     const std::int32_t flat_num_computed = previous.already_scheduled_len + previous.extend_len;
-    fsm::FlatCacheProgress flat_cache_progress = request->FlatCacheProgress();
     const std::int32_t first_new_page_slot = static_cast<std::int32_t>(flat_cache_progress.page_hashes.size());
     const std::int32_t filled_pages = flat_num_computed / coordinator_.CacheBlockTokens();
     if (filled_pages > static_cast<std::int32_t>(flat_cache_progress.page_hashes.size())) {
@@ -479,14 +486,19 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
                                           .page_hashes = flat_cache_progress.page_hashes,
                                           .first_new_page_slot = first_new_page_slot,
                                           .completed_end_tokens = flat_num_computed,
-                                          .boundary_kind = flat_num_computed == request->PrefillSize()
-                                                               ? CacheBoundaryKind::kEndpoint
-                                                               : CacheBoundaryKind::kChunk,
+                                          .boundary_kind = completedBoundaryKind(
+                                              flat_num_computed, request->PrefillSize(),
+                                              flat_cache_progress.promotion_boundary_tokens),
                                           .num_computed_tokens = flat_num_computed,
                                           .reserve_tokens = flat_decode_reserve,
                                       });
     if (!flatAdmit(flat_demands, flat_cache_progress.access_epoch)) {
         return {};
+    }
+    if (flat_cache_progress.promotion_boundary_tokens > 0 &&
+        (flat_num_computed >= flat_cache_progress.promotion_boundary_tokens ||
+         flat_num_computed >= request->PrefillSize())) {
+        flat_cache_progress.promotion_boundary_tokens = 0;
     }
 #endif
 
@@ -557,14 +569,19 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
                                               .page_hashes = flat_cache_progress.page_hashes,
                                               .first_new_page_slot = first_new_page_slot,
                                               .completed_end_tokens = num_computed_tokens,
-                                              .boundary_kind = num_computed_tokens == request->PrefillSize()
-                                                                   ? CacheBoundaryKind::kEndpoint
-                                                                   : CacheBoundaryKind::kChunk,
+                                              .boundary_kind = completedBoundaryKind(
+                                                  num_computed_tokens, request->PrefillSize(),
+                                                  flat_cache_progress.promotion_boundary_tokens),
                                               .num_computed_tokens = num_computed_tokens,
                                           });
         if (!flatAdmit(demands, flat_cache_progress.access_epoch)) {
             return {};
         }
+    }
+    if (flat_cache_progress.promotion_boundary_tokens > 0 &&
+        (num_computed_tokens >= flat_cache_progress.promotion_boundary_tokens ||
+         num_computed_tokens >= request->PrefillSize())) {
+        flat_cache_progress.promotion_boundary_tokens = 0;
     }
 #endif
 

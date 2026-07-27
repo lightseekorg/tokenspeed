@@ -1371,6 +1371,131 @@ TEST(CoordinatorMatchTest, SwaShorterThanFullTruncatesFull) {
     ExpectSwaWindowIntact(m.per_group[1], /*window=*/10, /*block_size=*/4);
 }
 
+TEST(CoordinatorPromotionTest, ProbePreservesClosedCoverageBeforeWindowConvergence) {
+    BlockPool pool(64);
+    const std::vector<KvCacheSpec> specs = {
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+        {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, /*cache_block_tokens=*/4, pool);
+    const std::vector<std::string> hashes =
+        ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3},
+                       {4, 4, 4, 4}, {5, 5, 5, 5}, {6, 6, 6, 6}, {7, 7, 7, 7}});
+    for (const std::string& hash : hashes) {
+        CacheForGroup(coordinator, pool, hash, /*group_id=*/0);
+    }
+    CacheForGroup(coordinator, pool, hashes[3], /*group_id=*/1);
+
+    KvCacheCoordinator::PrefixProbe probe = coordinator.ProbePrefix(hashes);
+
+    EXPECT_EQ(probe.device.num_common_tokens, 16);
+    EXPECT_EQ(probe.device.prefix_closed_tokens, 32);
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    std::vector<GroupDemand> demands = FreshDemands(tables, std::array<std::int32_t, 2>{0, 0});
+    const std::optional<KvCacheCoordinator::AdmissionResult> admission =
+        coordinator.Admit(std::move(probe), demands);
+    ASSERT_TRUE(admission);
+    EXPECT_EQ(admission->promotion_boundary_tokens, 32);
+}
+
+TEST(CoordinatorPromotionTest, ClosedCoverageIsMinimumAcrossClosedGroups) {
+    BlockPool pool(64);
+    const std::vector<KvCacheSpec> specs = {
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+        {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, /*cache_block_tokens=*/4, pool);
+    const std::vector<std::string> hashes =
+        ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3},
+                       {4, 4, 4, 4}, {5, 5, 5, 5}, {6, 6, 6, 6}, {7, 7, 7, 7}});
+    for (const std::string& hash : hashes) {
+        CacheForGroup(coordinator, pool, hash, /*group_id=*/0);
+    }
+    for (const std::string& hash : std::span{hashes}.first(6)) {
+        CacheForGroup(coordinator, pool, hash, /*group_id=*/1);
+    }
+    CacheForGroup(coordinator, pool, hashes[3], /*group_id=*/2);
+
+    const KvCacheCoordinator::PrefixProbe probe = coordinator.ProbePrefix(hashes);
+
+    EXPECT_EQ(probe.device.num_common_tokens, 16);
+    EXPECT_EQ(probe.device.prefix_closed_tokens, 24);
+}
+
+TEST(CoordinatorPromotionTest, LongerWindowHitDoesNotCreatePromotion) {
+    BlockPool pool(64);
+    const std::vector<KvCacheSpec> specs = {
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+        {.kind = AttnKind::kSlidingWindow, .sliding_window = 10, .cache_blocks_per_lcm_block = 1},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, /*cache_block_tokens=*/4, pool);
+    const std::vector<std::string> hashes =
+        ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3},
+                       {4, 4, 4, 4}, {5, 5, 5, 5}, {6, 6, 6, 6}, {7, 7, 7, 7}});
+    for (const std::string& hash : std::span{hashes}.first(4)) {
+        CacheForGroup(coordinator, pool, hash, /*group_id=*/0);
+    }
+    for (std::size_t i : {1u, 2u, 3u, 5u, 6u, 7u}) {
+        CacheForGroup(coordinator, pool, hashes[i], /*group_id=*/1);
+    }
+
+    KvCacheCoordinator::PrefixProbe probe = coordinator.ProbePrefix(hashes);
+    EXPECT_EQ(probe.device.num_common_tokens, 16);
+    EXPECT_EQ(probe.device.prefix_closed_tokens, 16);
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    std::vector<GroupDemand> demands = FreshDemands(tables, std::array<std::int32_t, 2>{0, 0});
+    const std::optional<KvCacheCoordinator::AdmissionResult> admission =
+        coordinator.Admit(std::move(probe), demands);
+    ASSERT_TRUE(admission);
+    EXPECT_EQ(admission->promotion_boundary_tokens, 0);
+}
+
+TEST(CoordinatorPromotionTest, PureWindowGroupsHaveNoClosedCoverage) {
+    BlockPool pool(32);
+    const std::vector<KvCacheSpec> specs = {
+        {.kind = AttnKind::kSlidingWindow, .sliding_window = 5, .cache_blocks_per_lcm_block = 1},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, /*cache_block_tokens=*/4, pool);
+    const std::vector<std::string> hashes =
+        ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
+    CacheForGroup(coordinator, pool, hashes[2], /*group_id=*/0);
+    CacheForGroup(coordinator, pool, hashes[3], /*group_id=*/0);
+
+    const KvCacheCoordinator::PrefixProbe probe = coordinator.ProbePrefix(hashes);
+
+    EXPECT_EQ(probe.device.num_common_tokens, 16);
+    EXPECT_EQ(probe.device.prefix_closed_tokens, 0);
+}
+
+TEST(CoordinatorPromotionTest, HostTierDisablesPromotion) {
+    BlockPool device_pool(64);
+    BlockPool host_pool(64);
+    const std::vector<KvCacheSpec> specs = {
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+        {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+    };
+    KvCacheCoordinator coordinator =
+        MakeCoordinator(specs, /*cache_block_tokens=*/4, device_pool, &host_pool);
+    const std::vector<std::string> hashes =
+        ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3},
+                       {4, 4, 4, 4}, {5, 5, 5, 5}, {6, 6, 6, 6}, {7, 7, 7, 7}});
+    for (const std::string& hash : hashes) {
+        CacheForGroup(coordinator, device_pool, hash, /*group_id=*/0);
+    }
+    CacheForGroup(coordinator, device_pool, hashes[3], /*group_id=*/1);
+
+    KvCacheCoordinator::PrefixProbe probe = coordinator.ProbePrefix(hashes);
+    ASSERT_EQ(probe.device.num_common_tokens, 16);
+    ASSERT_EQ(probe.device.prefix_closed_tokens, 32);
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    std::vector<GroupDemand> demands = FreshDemands(tables, std::array<std::int32_t, 2>{0, 0});
+    const std::optional<KvCacheCoordinator::AdmissionResult> admission =
+        coordinator.Admit(std::move(probe), demands);
+    ASSERT_TRUE(admission);
+    EXPECT_EQ(admission->promotion_boundary_tokens, 0);
+}
+
 TEST(CoordinatorMatchTest, TwoSwaGroupsSharedBoundaryMatches) {
     // pages_needed 3. full: 5; both SWA groups cache {1,2,3}, so each accepts
     // the SAME boundary 4 in the single sweep -- no cascade, full truncates 5 -> 4.

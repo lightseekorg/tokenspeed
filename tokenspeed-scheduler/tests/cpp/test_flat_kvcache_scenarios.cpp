@@ -1700,6 +1700,44 @@ TEST_F(FlatRetractStateGroupSuite, StateGroupVictimRetractsCleanly) {
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
 }
 
+TEST(FlatCacheProgressTest, PromotionBoundarySurvivesPrefillRounds) {
+    BlockPool pool(/*num_lcm_blocks=*/8);
+    std::vector<KvCacheSpec> specs{
+        KvCacheSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+        KvCacheSpec{.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    ReqPoolAllocator req_pool{4};
+
+    RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/6, /*page_size=*/2)};
+    Request request{spec, /*page_size=*/2, Role::kFused};
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    const std::optional<KvCacheCoordinator::AdmissionResult> admission =
+        AdmitForTest(coordinator, tables, /*num_tokens=*/4);
+    ASSERT_TRUE(admission);
+
+    request.Apply(fsm::SchedulePrefillFirstChunkEvent{
+        /*tokens_this_round=*/4, /*decode_input_tokens=*/1, /*device_allocator=*/nullptr, &req_pool, MatchResult{},
+        Role::kFused, /*kv_prefix_cache=*/nullptr, /*disable_l2_cache=*/true, /*loadback_diff=*/{},
+        /*hybrid_prefix_cache=*/nullptr, /*mamba_allocator=*/nullptr, /*mamba_loadback_nodes=*/{}, &coordinator,
+        std::move(tables), /*flat_hit_tokens=*/0,
+        fsm::FlatCacheProgress{
+            .access_epoch = admission->access_epoch,
+            .promotion_boundary_tokens = 8,
+        }});
+    ASSERT_TRUE(request.Is<fsm::Prefilling>());
+    EXPECT_EQ(request.FlatCacheProgress().promotion_boundary_tokens, 8);
+
+    request.Apply(fsm::SchedulePrefillEvent{
+        /*tokens_this_round=*/4,
+        /*reserve_num_tokens_in_next_schedule_event=*/1,
+        /*hybrid_prefix_cache=*/nullptr,
+        request.FlatCacheProgress(),
+    });
+    ASSERT_TRUE(request.Is<fsm::Prefilling>());
+    EXPECT_EQ(request.FlatCacheProgress().promotion_boundary_tokens, 8);
+}
+
 // Drive the FSM directly to pin the PrefillDone retract overload.
 TEST(FlatRetractEvent, PrefillDoneVictimReleasesPagesAndRequeues) {
     BlockPool pool(/*num_lcm_blocks=*/8);

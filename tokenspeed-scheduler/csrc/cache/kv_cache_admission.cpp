@@ -297,10 +297,15 @@ std::optional<KvCacheCoordinator::AdmissionResult> KvCacheCoordinator::Admit(Pre
     }
     const std::uint64_t access_epoch =
         request_access_epoch.has_value() ? *request_access_epoch : ++next_access_epoch_;
+    const std::int32_t promotion_boundary_tokens =
+        host_pool_ == nullptr && plan.prefix.device.prefix_closed_tokens > plan.prefix.device.num_common_tokens
+            ? plan.prefix.device.prefix_closed_tokens
+            : 0;
     AcquiredPrefix acquired_prefix = acquirePrefix(std::move(plan.prefix), access_epoch);
     AdmissionResult result{
         .device_prefix_tokens = acquired_prefix.device.num_common_tokens,
         .host_prefix_tokens = acquired_prefix.host.num_common_tokens,
+        .promotion_boundary_tokens = promotion_boundary_tokens,
         .access_epoch = access_epoch,
     };
     if (acquired_prefix.device.num_common_tokens > 0) {
