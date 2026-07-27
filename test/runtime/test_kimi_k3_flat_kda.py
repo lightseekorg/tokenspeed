@@ -28,7 +28,12 @@ import torch
 from tokenspeed_kernel.platform import current_platform
 
 # CI Registration (parsed via AST, runtime no-op)
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# ``test/`` (for ``ci_system``) and the repo root (for ``test.runtime.*``
+# absolute imports) both need to be importable when run_ci_suite executes this
+# file as a standalone script.
+_TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _TEST_DIR)
+sys.path.insert(0, os.path.dirname(_TEST_DIR))
 from test.runtime.conftest import KIMI_STATE_GROUPS as _STATE_GROUPS
 from test.runtime.conftest import flat_metadata_for as _metadata_for
 from test.runtime.conftest import layer_for_group as _kda_layer_for_group

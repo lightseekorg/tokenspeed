@@ -146,6 +146,9 @@ from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.context import ForwardContext
+    from tokenspeed.runtime.multimodal.encoder_cudagraph import (
+        EncoderCudaGraphWrapper,
+    )
 
 logger = logging.getLogger(__name__)
 
