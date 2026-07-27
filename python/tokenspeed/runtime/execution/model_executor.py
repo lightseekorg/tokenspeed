@@ -1496,10 +1496,19 @@ class ModelExecutor:
             return None
         zero_pages = getattr(self.token_to_kv_pool, "zero_pages", None)
         if not callable(zero_pages):
-            raise RuntimeError(
-                "scheduler emitted flat_page_ids_to_zero but the active KV pool "
-                "does not implement physical-page sanitization"
-            )
+            # A pool only needs sanitization if it aliases recurrent-state and
+            # KV bytes in one slab (it then declares this and implements
+            # zero_pages). Pure-attention pools do not alias state -- reused
+            # pages are overwritten and their tails are never read past
+            # seq_len -- so the scheduler's page-reuse list is safely ignored.
+            # Still fail loudly if a pool that *declares* it needs zeroing
+            # forgot to implement it.
+            if getattr(self.token_to_kv_pool, "flat_kv_requires_page_zeroing", False):
+                raise RuntimeError(
+                    "scheduler emitted flat_page_ids_to_zero but the active KV "
+                    "pool does not implement physical-page sanitization"
+                )
+            return None
         with nvtx_range("zero_flat_cache_pages", color="purple"):
             zero_pages(page_ids)
         if torch.device(self.device).type != "cuda":

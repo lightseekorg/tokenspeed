@@ -535,6 +535,9 @@ def _build_flat_pd_contract(
 
 class FlatHybridCachePool:
     supports_hierarchical_kv_cache = False
+    # Aliases recurrent-state and KV bytes in one slab; reused pages must be
+    # sanitized (see ``zero_pages``) to avoid poisoned tails.
+    flat_kv_requires_page_zeroing = True
 
     def __init__(
         self,
