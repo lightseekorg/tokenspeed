@@ -50,8 +50,8 @@ private:
         // have a device-table position yet.
         std::int32_t logical_block_index{-1};
         CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
-        // New cache entries stay probationary until a request actually resumes from them.
-        bool was_prefix_hit{false};
+        // Set only after a successful request admission acquires this entry.
+        bool was_acquired{false};
     };
 
     using LruEntries = std::list<CacheEntry>;
@@ -67,6 +67,14 @@ private:
     };
 
 public:
+    // Read-only admission snapshot from one cache-index lookup; owns no block.
+    struct CachedBlockMetadata {
+        std::uint64_t last_access_epoch;
+        std::int32_t logical_block_index;
+        CacheBoundaryKind boundary_kind;
+        bool was_acquired;
+    };
+
     explicit KvCacheManager(std::int32_t cache_block_tokens, std::int32_t cache_blocks_per_lcm_block = 1,
                             GroupId group_id = 0)
         : cache_block_tokens_{cache_block_tokens},
@@ -122,7 +130,7 @@ public:
             _assert(cache_index != nullptr, "cached pool disappeared between match probe and acquisition");
             CacheEntryIterator entry_it = findEntry(*cache_index, keys[static_cast<std::size_t>(begin_blocks) + i]);
             _assert(entry_it != cache_index->lru.end(), "cached block disappeared between match probe and acquisition");
-            entry_it->was_prefix_hit = true;
+            entry_it->was_acquired = true;
             touch(*cache_index, entry_it, access_epoch);
             match.blocks[i] = entry_it->block_ref;
             ++match.num_hit_blocks;
@@ -287,8 +295,8 @@ public:
         const CacheEntries* cache_index = findCacheEntries(pool);
         return cache_index != nullptr && findEntry(*cache_index, location) != cache_index->lru.end();
     }
-    std::optional<std::uint64_t> CachedBlockLastAccessEpoch(const BlockPool& pool,
-                                                            CacheBlockLocation location) const {
+    std::optional<CachedBlockMetadata> CachedBlockMetadataFor(const BlockPool& pool,
+                                                              CacheBlockLocation location) const {
         const CacheEntries* cache_index = findCacheEntries(pool);
         if (cache_index == nullptr) {
             return std::nullopt;
@@ -297,39 +305,12 @@ public:
         if (entry_it == cache_index->lru.end()) {
             return std::nullopt;
         }
-        return entry_it->last_access_epoch;
-    }
-    bool CachedBlockWasPrefixHit(const BlockPool& pool, CacheBlockLocation location) const {
-        const CacheEntries* cache_index = findCacheEntries(pool);
-        if (cache_index == nullptr) {
-            return false;
-        }
-        ConstCacheEntryIterator entry_it = findEntry(*cache_index, location);
-        return entry_it != cache_index->lru.end() && entry_it->was_prefix_hit;
-    }
-    std::optional<std::int32_t> CachedBlockLogicalIndex(const BlockPool& pool,
-                                                        CacheBlockLocation location) const {
-        const CacheEntries* cache_index = findCacheEntries(pool);
-        if (cache_index == nullptr) {
-            return std::nullopt;
-        }
-        ConstCacheEntryIterator entry_it = findEntry(*cache_index, location);
-        if (entry_it == cache_index->lru.end() || entry_it->logical_block_index < 0) {
-            return std::nullopt;
-        }
-        return entry_it->logical_block_index;
-    }
-    std::optional<CacheBoundaryKind> CachedBlockBoundaryKind(const BlockPool& pool,
-                                                             CacheBlockLocation location) const {
-        const CacheEntries* cache_index = findCacheEntries(pool);
-        if (cache_index == nullptr) {
-            return std::nullopt;
-        }
-        ConstCacheEntryIterator entry_it = findEntry(*cache_index, location);
-        if (entry_it == cache_index->lru.end()) {
-            return std::nullopt;
-        }
-        return entry_it->boundary_kind;
+        return CachedBlockMetadata{
+            .last_access_epoch = entry_it->last_access_epoch,
+            .logical_block_index = entry_it->logical_block_index,
+            .boundary_kind = entry_it->boundary_kind,
+            .was_acquired = entry_it->was_acquired,
+        };
     }
     std::int32_t NumCachedBlocks(const BlockPool& pool) const {
         const CacheEntries* cache_index = findCacheEntries(pool);

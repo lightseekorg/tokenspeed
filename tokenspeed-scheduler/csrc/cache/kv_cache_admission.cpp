@@ -87,9 +87,10 @@ private:
         CacheBlockLocation location;
         std::uint64_t last_access_epoch;
         std::int32_t logical_block_index;
+        CacheBoundaryKind boundary_kind;
         bool is_full;
-        bool is_state;
-        bool was_prefix_hit;
+        bool is_prefix_closed;
+        bool was_acquired;
     };
 
     void initializeCapacity() {
@@ -136,19 +137,19 @@ private:
             if (protected_locations.contains(location) || !candidates.insert(location).second) {
                 return;
             }
-            const std::uint64_t last_access_epoch = groups_[group_id]
-                                                        .Manager()
-                                                        .CachedBlockLastAccessEpoch(pool_, location)
-                                                        .value_or(std::numeric_limits<std::uint64_t>::max());
+            const KvCacheManager& manager = groups_[group_id].Manager();
+            const std::optional<KvCacheManager::CachedBlockMetadata> metadata =
+                manager.CachedBlockMetadataFor(pool_, location);
             victim_candidates_.push_back(VictimCandidate{
                 .group_id = group_id,
                 .location = location,
-                .last_access_epoch = last_access_epoch,
-                .logical_block_index =
-                    groups_[group_id].Manager().CachedBlockLogicalIndex(pool_, location).value_or(-1),
+                .last_access_epoch =
+                    metadata ? metadata->last_access_epoch : std::numeric_limits<std::uint64_t>::max(),
+                .logical_block_index = metadata ? metadata->logical_block_index : -1,
+                .boundary_kind = metadata ? metadata->boundary_kind : CacheBoundaryKind::kChunk,
                 .is_full = groups_[group_id].Spec().kind == AttnKind::kFull,
-                .is_state = groups_[group_id].Spec().kind == AttnKind::kMambaState,
-                .was_prefix_hit = groups_[group_id].Manager().CachedBlockWasPrefixHit(pool_, location),
+                .is_prefix_closed = manager.MatchIsPrefixClosed(),
+                .was_acquired = metadata && metadata->was_acquired,
             });
         };
 
@@ -171,28 +172,22 @@ private:
             if (lhs.last_access_epoch != rhs.last_access_epoch) {
                 return lhs.last_access_epoch < rhs.last_access_epoch;
             }
-            const auto eviction_class = [](const VictimCandidate& candidate) {
-                if (!candidate.was_prefix_hit && candidate.is_state && candidate.logical_block_index >= 0) {
-                    return 0;
-                }
-                if (candidate.is_full) {
-                    return 1;
-                }
-                return candidate.was_prefix_hit ? 3 : 2;
+            const auto is_ordinary_non_closed = [](const VictimCandidate& candidate) {
+                return !candidate.is_prefix_closed && candidate.boundary_kind == CacheBoundaryKind::kChunk &&
+                       !candidate.was_acquired && candidate.logical_block_index >= 0;
             };
-            const int lhs_class = eviction_class(lhs);
-            const int rhs_class = eviction_class(rhs);
-            if (lhs_class != rhs_class) {
-                return lhs_class < rhs_class;
+            const bool lhs_ordinary = is_ordinary_non_closed(lhs);
+            const bool rhs_ordinary = is_ordinary_non_closed(rhs);
+            if (lhs_ordinary != rhs_ordinary) {
+                return lhs_ordinary;
             }
-            if (lhs_class == 0 && lhs.logical_block_index != rhs.logical_block_index) {
-                // Dense State checkpoints are alternative resume points. Until
-                // one proves useful, retain the longer checkpoint and evict an
-                // earlier one instead of letting insertion order erase the
-                // previous request's live frontier.
+            if (lhs_ordinary && lhs.logical_block_index != rhs.logical_block_index) {
+                // Ordinary non-closed boundaries are alternative resume
+                // points. Retain the longer unproven frontier.
                 return lhs.logical_block_index < rhs.logical_block_index;
             }
-            if (lhs_class == 1 && lhs.logical_block_index != rhs.logical_block_index) {
+            if (!lhs_ordinary && !rhs_ordinary && lhs.is_full && rhs.is_full &&
+                lhs.logical_block_index != rhs.logical_block_index) {
                 // Full KV is prefix-closed: after comparing request access
                 // epochs, reclaim the suffix before an earlier page.
                 return lhs.logical_block_index > rhs.logical_block_index;
