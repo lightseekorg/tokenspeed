@@ -84,6 +84,10 @@ def test_rocm_install_requires_exclude_cuda_dependencies(monkeypatch) -> None:
         "torch",
     } <= requirements.keys()
     assert {
+        specifier.operator
+        for specifier in requirements["tokenspeed-kernel-amd"].specifier
+    } == {">="}
+    assert {
         "flashinfer-python",
         "nvidia-cutlass-dsl",
         "nvidia-cutlass-dsl-libs-cu13",

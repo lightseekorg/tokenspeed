@@ -555,6 +555,11 @@ class ModelExecutor:
             sampling_backend=self.sampling_backend,
             runtime_states=self.runtime_states,
         )
+        # Eager warmup can be DP-asymmetric; prewarm RSAG under uniform dummy inputs.
+        if config.enforce_eager:
+            logger.info("Prewarming Triton RSAG communication states")
+            self.forward_step.prewarm_comm_states(batch_sizes=(1,))
+            logger.info("Finished prewarming Triton RSAG communication states")
 
         # Breakable prefill (extend) CUDA graphs, the extend-mode analogue of
         # the decode wrapper above; captures in __init__, borrowing the decode
@@ -1627,13 +1632,10 @@ class ModelExecutor:
         if not changed:
             return None
 
-        self.input_buffers._mamba_cow_src_indices_cpu[:bs].copy_(
-            torch.as_tensor(cow_src_indices, dtype=torch.int32)
-        )
+        (cow_src_indices_cpu,) = self.input_buffers._bulk_pinned((bs, torch.int32))
+        cow_src_indices_cpu.copy_(torch.as_tensor(cow_src_indices, dtype=torch.int32))
         cow_src_buf = self.input_buffers.mamba_cow_src_indices_buf
-        cow_src_buf[:bs].copy_(
-            self.input_buffers._mamba_cow_src_indices_cpu[:bs], non_blocking=True
-        )
+        cow_src_buf[:bs].copy_(cow_src_indices_cpu, non_blocking=True)
         return torch.tensor(skipped_mask, dtype=torch.bool, device=cow_src_buf.device)
 
     @staticmethod

@@ -1,0 +1,157 @@
+name: Publish NVIDIA Release Docker Image
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: publish-release-docker-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: lightseekorg/tokenspeed
+
+jobs:
+  metadata:
+    if: github.repository == 'lightseekorg/tokenspeed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve release metadata
+        id: metadata
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          pyproject_path = Path("python/pyproject.toml")
+          data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+          project = data.get("project")
+          if not isinstance(project, dict) or project.get("name") != "tokenspeed":
+              raise SystemExit(f"{pyproject_path} does not describe tokenspeed")
+
+          version = project.get("version")
+          if not isinstance(version, str):
+              raise SystemExit(f"{pyproject_path} project.version must be a string")
+          if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", version):
+              raise SystemExit(
+                  f"invalid Docker image tag from {pyproject_path}: {version}"
+              )
+
+          with Path(os.environ["GITHUB_OUTPUT"]).open(
+              "a", encoding="utf-8"
+          ) as output:
+              print(f"version={version}", file=output)
+          print(f"::notice::Docker image tag: {version}")
+          PY
+
+  build:
+    if: github.repository == 'lightseekorg/tokenspeed'
+    needs: metadata
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            artifact: linux-amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            artifact: linux-arm64
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: false
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Configure these at repository or organization scope. The account must
+      # have push access to the lightseekorg Docker Hub namespace.
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.release
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          no-cache: true
+          provenance: false
+
+      - name: Export digest
+        run: |
+          mkdir -p "${RUNNER_TEMP}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${RUNNER_TEMP}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.artifact }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    if: github.repository == 'lightseekorg/tokenspeed'
+    needs: [metadata, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digests-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+
+      # Configure these at repository or organization scope. The account must
+      # have push access to the lightseekorg Docker Hub namespace.
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create multi-platform manifest
+        env:
+          TAG: ${{ needs.metadata.outputs.version }}
+        run: |
+          refs=()
+          for digest in "${RUNNER_TEMP}"/digests/*; do
+            refs+=("${IMAGE}@sha256:$(basename "${digest}")")
+          done
+          docker buildx imagetools create \
+            --tag "${IMAGE}:${TAG}" \
+            "${refs[@]}"

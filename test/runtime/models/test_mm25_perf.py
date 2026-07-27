@@ -46,16 +46,6 @@ import unittest
 from typing import Dict, List, Optional, Tuple
 
 import requests
-
-# /test on sys.path so "ci_system.ci_register" resolves from test/ci_system/.
-sys.path.insert(
-    0,
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-)
-from ci_system.ci_register import register_cuda_ci  # noqa: E402
-
-register_cuda_ci(est_time=2400, suite="runtime-minimax-m2")
-
 from tokenspeed_kernel.platform import current_platform  # noqa: E402
 
 from tokenspeed.runtime.utils.process import kill_process_tree  # noqa: E402

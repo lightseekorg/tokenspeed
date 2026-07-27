@@ -1,4 +1,4 @@
 -r common.txt
-tokenspeed-kernel-amd==0.1.3
+tokenspeed-kernel-amd>=0.1.3
 --extra-index-url https://download.pytorch.org/whl/rocm7.2
 torch==2.11.0+rocm7.2

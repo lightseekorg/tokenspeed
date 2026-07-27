@@ -285,11 +285,23 @@ class LogitsProcessor(nn.Module):
             num_tokens_per_req=n,
         )
 
+    def _tp_group_spans_nodes(self) -> bool:
+        if self.tp_group is None:
+            return False
+
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        mapping = global_server_args_dict.get("mapping")
+        nprocs_per_node = getattr(mapping, "nprocs_per_node", None)
+        if not nprocs_per_node:
+            return False
+        return len({rank // nprocs_per_node for rank in self.tp_group}) > 1
+
     def _init_all_gather_state(self, lm_head: VocabParallelEmbedding):
         if not current_platform().is_nvidia:
             return None
 
-        if self.tp_size == 1 or self.skip_all_gather:
+        if self.tp_size == 1 or self.skip_all_gather or self._tp_group_spans_nodes():
             return None
 
         vocab_padded = lm_head.weight.size(0) * self.tp_size
@@ -310,7 +322,12 @@ class LogitsProcessor(nn.Module):
         if not current_platform().is_nvidia:
             return None
 
-        if self.tp_size == 1 or self.skip_all_gather or self.dp_sampling_enabled:
+        if (
+            self.tp_size == 1
+            or self.skip_all_gather
+            or self.dp_sampling_enabled
+            or self._tp_group_spans_nodes()
+        ):
             return None
 
         vocab_per_rank = lm_head.weight.size(0)
