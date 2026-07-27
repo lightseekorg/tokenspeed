@@ -26,7 +26,19 @@ falls back to Triton where an XPU kernel is not (yet) provided.
 
 ## Status
 
-Scaffold. `ops/attention.py` is a wired template demonstrating the full
-registration pattern; other families are TODO stubs. Each wrapper must be
-verified against the exact `vllm_xpu_kernels` API and against the TokenSpeed
-numerics reference before it is trusted.
+Scaffold with wired templates. Every wrapper must be verified against the exact
+`vllm_xpu_kernels` v0.1.7 API and validated against the TokenSpeed numerics
+reference before it is trusted.
+
+Covered (Qwen3 dense bf16 path):
+
+| Op | Module | Integration | State |
+|----|--------|-------------|-------|
+| MHA prefill | `ops/attention.py` | registry (`attention.mha_prefill`) | wired template |
+| MHA paged decode | `ops/attention.py` | registry | NOT registered (falls back to Triton; layout TODO) |
+| Rotary embedding | `ops/embedding.py` | registry (`embedding.rope`) | wired template |
+| RMSNorm / fused-add | `ops/layernorm.py` | direct call (runtime prefers it on XPU) | wired template |
+| SiLU-and-mul | `ops/activation.py` | direct call (runtime prefers it on XPU) | wired template |
+
+Not yet covered: GEMM (bf16 already uses torch/oneDNN; quantized fp8/mxfp4 TODO),
+MoE, sampling. Add following the same pattern.

@@ -41,12 +41,26 @@ _use_triton_activation = _is_amd or _is_intel
 if _use_triton_activation:
     from tokenspeed_kernel.ops.activation.triton import silu_and_mul
 
+    # On Intel XPU, prefer the vllm-xpu-kernels silu_and_mul when available.
+    if _is_intel:
+        try:
+            from tokenspeed_kernel_intel.ops.activation import silu_and_mul
+        except ImportError:
+            pass
+
 else:
     from tokenspeed_kernel.ops.activation.flashinfer import (
         silu_and_mul,
     )
 
 logger = get_colorful_logger(__name__)
+
+# Surface which SiLU-and-mul implementation is active (vllm-xpu-kernels on Intel
+# XPU vs portable Triton vs flashinfer).
+logger.info(
+    "[tokenspeed] SiluAndMul backend: %s",
+    getattr(silu_and_mul, "__module__", "unknown"),
+)
 
 
 class SiluAndMul(torch.nn.Module):

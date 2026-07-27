@@ -55,6 +55,16 @@ if _use_triton_rmsnorm:
     from tokenspeed_kernel.ops.layernorm.triton import (
         rmsnorm_fused_parallel as triton_rmsnorm_fused_parallel,
     )
+
+    # On Intel XPU, prefer the vllm-xpu-kernels rmsnorm when available; it keeps
+    # the same call signature, so it transparently replaces the Triton import.
+    if _is_intel:
+        try:
+            from tokenspeed_kernel_intel.ops.layernorm import (
+                rmsnorm as triton_rmsnorm,
+            )
+        except ImportError:
+            pass
 else:
     from tokenspeed_kernel.ops.layernorm.cuda import rmsnorm_fused_parallel
     from tokenspeed_kernel.ops.layernorm.flashinfer import (
@@ -67,6 +77,15 @@ else:
 
 
 logger = get_colorful_logger(__name__)
+
+# Surface which RMSNorm implementation is active (e.g. the vllm-xpu-kernels
+# backend on Intel XPU vs the portable Triton kernel).
+logger.info(
+    "[tokenspeed] RMSNorm backend: %s",
+    getattr(triton_rmsnorm, "__module__", "unknown")
+    if _use_triton_rmsnorm
+    else "flashinfer/cuda",
+)
 
 
 def _get_process_group(group: tuple[int, ...]):

@@ -34,6 +34,10 @@ from tokenspeed_kernel.signature import FormatSignature
 
 logger = logging.getLogger(__name__)
 
+# Tracks (family, mode, kernel_name) already logged so the selected-backend
+# INFO line is emitted once per unique kernel rather than on every selection.
+_logged_backends: set[tuple[str, str, str]] = set()
+
 __all__ = [
     "NoKernelFoundError",
     "SelectedKernel",
@@ -540,7 +544,24 @@ def _log_selection(
     platform: PlatformInfo,
     objective: SelectionObjective,
 ) -> None:
-    """Log selection result if verbose mode is enabled."""
+    """Log selection result.
+
+    A one-line INFO is emitted once per unique (family, mode, kernel) so the
+    selected backend (solution) is visible without flooding the logs. Set
+    ``TOKENSPEED_KERNEL_VERBOSE=1`` for a detailed per-selection breakdown.
+    """
+    backend_key = (family, mode, winner.name)
+    if backend_key not in _logged_backends:
+        _logged_backends.add(backend_key)
+        logger.info(
+            "[tokenspeed_kernel] %s.%s -> kernel=%s solution=%s (%s)",
+            family,
+            mode,
+            winner.name,
+            winner.solution,
+            platform.arch,
+        )
+
     if not os.environ.get("TOKENSPEED_KERNEL_VERBOSE"):
         return
 

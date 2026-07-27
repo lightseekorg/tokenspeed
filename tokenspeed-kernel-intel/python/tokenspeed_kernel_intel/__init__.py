@@ -53,7 +53,10 @@ except Exception as exc:  # pragma: no cover - environment dependent
 
 if _VLLM_XPU_KERNELS_AVAILABLE:
     # Side-effect imports: each submodule registers its kernels via
-    # @register_kernel. Add new families here as they are implemented.
+    # @register_kernel. Add new registry-dispatched families here as they are
+    # implemented. (layernorm / activation are direct-call helpers imported by
+    # the runtime layer, not registry-dispatched, so they are not imported here.)
     from tokenspeed_kernel_intel.ops import attention  # noqa: F401
+    from tokenspeed_kernel_intel.ops import embedding  # noqa: F401
 
 __all__ = ["_VLLM_XPU_KERNELS_AVAILABLE"]
