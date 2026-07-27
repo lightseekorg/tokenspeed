@@ -46,6 +46,7 @@ public:
 
     // Non-closed: shortening a match can cut its trailing run below the window, so match bound-first.
     bool MatchIsPrefixClosed() const override { return false; }
+    std::int32_t BoundaryLookbackBlocks() const override { return pagesNeededToResume(); }
 
     // Right->left scan for a run backing a resumable boundary; slots left of it stay holes.
     GroupPrefixProbe Probe(const BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_blocks,

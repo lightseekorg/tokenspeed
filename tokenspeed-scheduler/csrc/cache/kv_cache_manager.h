@@ -49,6 +49,7 @@ private:
         // Position in the request's logical prefix. Host-only entries may not
         // have a device-table position yet.
         std::int32_t logical_block_index{-1};
+        CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
         // New cache entries stay probationary until a request actually resumes from them.
         bool was_prefix_hit{false};
     };
@@ -103,6 +104,7 @@ public:
     }
 
     virtual bool MatchIsPrefixClosed() const = 0;
+    virtual std::int32_t BoundaryLookbackBlocks() const = 0;
     virtual GroupPrefixProbe Probe(const BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_blocks,
                                    std::int32_t max_blocks) const = 0;
 
@@ -221,6 +223,7 @@ public:
 
     void CacheBlock(BlockPool& pool, CacheBlockRef& block_ref, const CacheKey& key, std::uint64_t access_epoch,
                     std::int32_t logical_block_index = -1,
+                    CacheBoundaryKind boundary_kind = CacheBoundaryKind::kChunk,
                     std::vector<std::pair<CacheKey, CacheBlockRef>>* newly_cached = nullptr) {
         _assert(block_ref && block_ref.IsOwnedBy(pool), "cache block must belong to the target pool");
         validateKey(key);
@@ -228,11 +231,17 @@ public:
         CacheEntryIterator existing_it = findEntry(cache_index, block_ref->Location());
         if (existing_it != cache_index.lru.end()) {
             _assert(existing_it->key == key, "one cache block location cannot change cache key");
+            if (existing_it->boundary_kind < boundary_kind) {
+                existing_it->boundary_kind = boundary_kind;
+            }
             touch(cache_index, existing_it, access_epoch);
             return;
         }
         CacheEntryIterator canonical_it = findEntry(cache_index, key);
         if (canonical_it != cache_index.lru.end()) {
+            if (canonical_it->boundary_kind < boundary_kind) {
+                canonical_it->boundary_kind = boundary_kind;
+            }
             touch(cache_index, canonical_it, access_epoch);
             block_ref = canonical_it->block_ref;
             return;
@@ -243,6 +252,7 @@ public:
             .block_ref = block_ref,
             .last_access_epoch = access_epoch,
             .logical_block_index = logical_block_index,
+            .boundary_kind = boundary_kind,
         });
         CacheEntryIterator entry_it = std::prev(cache_index.lru.end());
         cache_index.by_key.emplace(entry_it->key, entry_it);
@@ -254,6 +264,7 @@ public:
 
     void CacheFullBlocks(BlockPool& pool, BlockTable& table, std::span<const CacheKey> keys,
                          std::uint64_t access_epoch, std::int32_t first_slot = 0,
+                         CacheBoundaryKind boundary_kind = CacheBoundaryKind::kChunk,
                          std::vector<std::pair<CacheKey, CacheBlockRef>>* newly_cached = nullptr) {
         _assert(first_slot >= 0, "first_slot must be >= 0");
         _assert(static_cast<std::int64_t>(first_slot) + static_cast<std::int64_t>(keys.size()) <= table.NumBlocks(),
@@ -264,7 +275,7 @@ public:
                 continue;
             }
             CacheBlock(pool, block_ref, keys[j], access_epoch, first_slot + static_cast<std::int32_t>(j),
-                       newly_cached);
+                       boundary_kind, newly_cached);
         }
     }
 
@@ -307,6 +318,18 @@ public:
             return std::nullopt;
         }
         return entry_it->logical_block_index;
+    }
+    std::optional<CacheBoundaryKind> CachedBlockBoundaryKind(const BlockPool& pool,
+                                                             CacheBlockLocation location) const {
+        const CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) {
+            return std::nullopt;
+        }
+        ConstCacheEntryIterator entry_it = findEntry(*cache_index, location);
+        if (entry_it == cache_index->lru.end()) {
+            return std::nullopt;
+        }
+        return entry_it->boundary_kind;
     }
     std::int32_t NumCachedBlocks(const BlockPool& pool) const {
         const CacheEntries* cache_index = findCacheEntries(pool);

@@ -46,10 +46,9 @@ inline auto MatchPrefixForTest(KvCacheCoordinator& coordinator, std::span<const 
 }
 
 inline void CacheFullBlocksForTest(KvCacheCoordinator& coordinator, std::span<BlockTable> tables,
-                                   std::span<const std::string> content_hashes, std::int32_t first_slot = 0,
-                                   std::int32_t end_tokens = -1) {
+                                   std::span<const std::string> content_hashes, std::int32_t first_slot = 0) {
     coordinator.CacheFullBlocks(tables, content_hashes, KvCacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
-                                first_slot, end_tokens);
+                                first_slot);
 }
 
 inline std::optional<KvCacheCoordinator::AdmissionResult> AdmitForTest(

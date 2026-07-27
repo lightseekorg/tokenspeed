@@ -40,6 +40,7 @@ public:
     using KvCacheManager::KvCacheManager;
 
     bool MatchIsPrefixClosed() const override { return true; }
+    std::int32_t BoundaryLookbackBlocks() const override { return 0; }
 
     GroupPrefixProbe Probe(const BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_blocks,
                            std::int32_t max_blocks) const override {

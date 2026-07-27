@@ -92,11 +92,11 @@ public:
     std::int32_t BlocksNeededFor(std::int32_t num_tokens) const;
     std::int32_t NumAvailableLcmBlocks() const;
 
-    // Legacy State producers only materialize an aligned chunk-end snapshot.
-    // Producers that advertise materializes_all_boundaries register the whole range.
+    // Registers an exact range, used for transferred prefix blocks and tests.
+    // Runtime publication during Admit follows each manager's boundary contract.
     void CacheFullBlocks(std::span<BlockTable> tables, std::span<const std::string> content_hashes,
                          std::uint64_t access_epoch, std::int32_t first_slot = 0,
-                         std::int32_t end_tokens = -1);
+                         CacheBoundaryKind boundary_kind = CacheBoundaryKind::kChunk);
     void ReclaimExpired(std::span<BlockTable> tables, std::int32_t num_computed_tokens);
     void ConsumeAvailable(std::span<BlockTable> tables, std::int32_t num_tokens);
     void Free(std::span<BlockTable> tables);
@@ -132,7 +132,9 @@ private:
     AcquiredPrefix acquirePrefix(PrefixProbe&& probe, std::uint64_t access_epoch);
     void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table,
                                  std::span<const std::string> content_hashes, std::int32_t first_slot,
-                                 std::int32_t end_tokens, std::uint64_t access_epoch);
+                                 std::uint64_t access_epoch, CacheBoundaryKind boundary_kind);
+    void cacheCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand,
+                                      std::uint64_t access_epoch);
     std::vector<CacheGroup> groups_;
     // Closed groups first, so non-closed groups match against a settled bound.
     std::vector<std::size_t> match_order_;

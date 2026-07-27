@@ -35,6 +35,10 @@ namespace tokenspeed {
 
 enum class AttnKind { kFull, kSlidingWindow, kMambaState };
 
+// Why a resumable cache boundary was retained. The declaration order is its
+// monotonic promotion order.
+enum class CacheBoundaryKind { kChunk, kEndpoint, kPromoted };
+
 using CacheNamespaceId = std::uint32_t;
 using ContentHash = std::string;
 
@@ -89,17 +93,18 @@ private:
     std::int32_t available_tokens_{0};
 };
 
-// Per-group input for one admission. completed_page_hashes publishes only the
-// full pages produced since the previous admission; completed_end_tokens says
-// whether a legacy final-only State producer ended on an aligned boundary.
-// num_tokens is the capacity needed by the next step. The request retains
-// ownership of table.
+// Per-group input for one admission. page_hashes is the request's cumulative
+// completed-page history; first_new_page_slot splits the newly completed
+// suffix used by prefix-closed groups. Non-closed groups select the trailing
+// pages required to resume completed_end_tokens. The request owns table and
+// the storage behind page_hashes.
 struct GroupDemand {
     BlockTable* table{nullptr};
     std::int32_t num_tokens{0};
-    std::span<const std::string> completed_page_hashes{};
-    std::int32_t completed_first_page_slot{0};
+    std::span<const std::string> page_hashes{};
+    std::int32_t first_new_page_slot{0};
     std::int32_t completed_end_tokens{-1};
+    CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
     std::int32_t num_computed_tokens{-1};
     std::int32_t reserve_tokens{0};
 };

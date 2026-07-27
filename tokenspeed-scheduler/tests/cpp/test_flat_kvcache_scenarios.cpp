@@ -2610,7 +2610,7 @@ protected:
         SchedulerConfig cfg{};
         cfg.block_size = 2;
         cfg.device_allocator.total_pages = 64;
-        cfg.host_allocator.total_pages = 9;  // 8 usable + the null placeholder (page 0, device convention)
+        cfg.host_allocator.total_pages = 7;  // 6 usable + the null placeholder (page 0, device convention)
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
         cfg.enable_l3_storage = false;
@@ -2659,19 +2659,19 @@ TEST_F(FlatStreamingSinkSuite, RegisteredPagesEmitWriteBackAndIndexOnDone) {
     auto wb = FindFlatWriteBack(finalize);
     ASSERT_TRUE(wb.has_value()) << "finalize-registered pages must emit a streaming write-back";
     ASSERT_EQ(wb->op_ids.size(), 1u);
-    EXPECT_EQ(wb->src_pages.at(0).size(), 8u) << "4 registered pages x 2 groups = 8 D2H pairs";
-    EXPECT_EQ(wb->dst_pages.at(0).size(), 8u);
+    EXPECT_EQ(wb->src_pages.at(0).size(), 6u) << "4 Full pages + the 2-page SWA resume tail";
+    EXPECT_EQ(wb->dst_pages.at(0).size(), 6u);
     EXPECT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 0) << "nothing indexed until WriteBackDone";
-    EXPECT_EQ(scheduler_->FlatHostPoolFreeBlocks(), 0) << "all 8 host pages held in flight";
+    EXPECT_EQ(scheduler_->FlatHostPoolFreeBlocks(), 0) << "all 6 host pages held in flight";
 
     FinishAndReap("r1");
-    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 8)
-        << "the 8 pinned sources stay off the free list past request finish";
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 6)
+        << "the 6 pinned sources stay off the free list past request finish";
     EXPECT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 0);
 
     SendWriteBackDone(wb->op_ids.at(0), /*success=*/true);
     PlanOnce();
-    EXPECT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 8);
+    EXPECT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 6);
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "commit unpins every source block";
 }
 
@@ -2684,7 +2684,7 @@ TEST_F(FlatStreamingSinkSuite, DuplicateRegistrationsAreDroppedAtDrain) {
     FinishAndReap("r1");
     SendWriteBackDone(wb1->op_ids.at(0), /*success=*/true);
     PlanOnce();
-    ASSERT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 8);
+    ASSERT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 6);
     ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
 
     ExecutionPlan finalize2 = RunToFinalize(MakeRequestSpec("r2", /*num_pages=*/4));  // identical tokens
@@ -2692,7 +2692,7 @@ TEST_F(FlatStreamingSinkSuite, DuplicateRegistrationsAreDroppedAtDrain) {
     FinishAndReap("r2");
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start)
         << "duplicate candidates are unpinned at drain, pool back to baseline";
-    EXPECT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 8);
+    EXPECT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 6);
 }
 
 TEST_F(FlatStreamingSinkSuite, FailedWriteBackAbortsAndUnpins) {
@@ -2702,11 +2702,11 @@ TEST_F(FlatStreamingSinkSuite, FailedWriteBackAbortsAndUnpins) {
     auto wb = FindFlatWriteBack(finalize);
     ASSERT_TRUE(wb.has_value());
     FinishAndReap("r1");
-    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 8);
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 6);
 
     SendWriteBackDone(wb->op_ids.at(0), /*success=*/false);
     EXPECT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 0) << "a failed transfer must not be indexed";
-    EXPECT_EQ(scheduler_->FlatHostPoolFreeBlocks(), 8) << "aborted host pages return to the host pool";
+    EXPECT_EQ(scheduler_->FlatHostPoolFreeBlocks(), 6) << "aborted host pages return to the host pool";
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "abort still unpins the sources";
 }
 
@@ -2717,26 +2717,26 @@ TEST_F(FlatStreamingSinkSuite, HostPoolExhaustionSkipsSilently) {
     auto wb1 = FindFlatWriteBack(finalize1);
     ASSERT_TRUE(wb1.has_value());
     FinishAndReap("r1");
-    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 8);
-    ASSERT_EQ(scheduler_->FlatHostPoolFreeBlocks(), 0) << "r1 holds all 8 host pages in flight";
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 6);
+    ASSERT_EQ(scheduler_->FlatHostPoolFreeBlocks(), 0) << "r1 holds all 6 host pages in flight";
 
     ExecutionPlan finalize2 = RunToFinalize(MakeRequestSpec("r2", /*num_pages=*/4, /*start=*/501));
     EXPECT_FALSE(FindFlatWriteBack(finalize2).has_value())
         << "a fully-consumed host pool drops every candidate: no op at all";
     FinishAndReap("r2");
-    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 8)
-        << "r2's candidates unpinned at drain; only r1's 8 pins remain";
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 6)
+        << "r2's candidates unpinned at drain; only r1's 6 pins remain";
 
     SendWriteBackDone(wb1->op_ids.at(0), /*success=*/true);
-    EXPECT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 8);
+    EXPECT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 6);
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "everything balances after r1's commit";
 }
 
 TEST_F(FlatStreamingSinkSuite, SameRoundDuplicateKeysDedupeAtDrain) {
-    // Host pool with headroom (16 usable) so duplicates are dropped by the drain's batch
+    // Host pool with headroom (12 usable) so duplicates are dropped by the drain's batch
     // dedupe, NOT by pool exhaustion: two IDENTICAL prompts registering in one round drain
-    // 16 candidates into 8 pairs.
-    config_.host_allocator.total_pages = 17;
+    // 12 candidates into 6 pairs.
+    config_.host_allocator.total_pages = 13;
     scheduler_ = std::make_unique<Scheduler>(config_);
     const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
 
@@ -2749,23 +2749,23 @@ TEST_F(FlatStreamingSinkSuite, SameRoundDuplicateKeysDedupeAtDrain) {
     auto wb = FindFlatWriteBack(finalize);
     ASSERT_TRUE(wb.has_value());
     ASSERT_EQ(wb->op_ids.size(), 1u);
-    EXPECT_EQ(wb->src_pages.at(0).size(), 8u) << "each key must be emitted at most once across both requests";
-    EXPECT_EQ(scheduler_->FlatHostPoolFreeBlocks(), 8) << "duplicates must not consume host pages";
+    EXPECT_EQ(wb->src_pages.at(0).size(), 6u) << "each key must be emitted at most once across both requests";
+    EXPECT_EQ(scheduler_->FlatHostPoolFreeBlocks(), 6) << "duplicates must not consume host pages";
     EXPECT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 0);
 
     FinishAndReap("r1");
     FinishAndReap("r2");
-    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 8)
-        << "only the emitted op's 8 pins survive; the duplicate candidates unpinned at drain";
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 6)
+        << "only the emitted op's 6 pins survive; the duplicate candidates unpinned at drain";
 
     SendWriteBackDone(wb->op_ids.at(0), /*success=*/true);
-    EXPECT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 8);
-    EXPECT_EQ(scheduler_->FlatHostPoolFreeBlocks(), 16) << "published pages are free-and-cached";
+    EXPECT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 6);
+    EXPECT_EQ(scheduler_->FlatHostPoolFreeBlocks(), 6) << "the six cached host pages remain occupied";
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
 }
 
 TEST_F(FlatStreamingSinkSuite, MidDrainPoolFillEmitsPartialOp) {
-    // 4 usable host pages against 8 candidates: the drain emits the 4 that fit and drops the
+    // 4 usable host pages against 6 candidates: the drain emits the 4 that fit and drops the
     // rest -- a partial op IS the contract when the pool fills mid-batch.
     config_.host_allocator.total_pages = 5;
     scheduler_ = std::make_unique<Scheduler>(config_);
@@ -2774,7 +2774,7 @@ TEST_F(FlatStreamingSinkSuite, MidDrainPoolFillEmitsPartialOp) {
     ExecutionPlan finalize = RunToFinalize(MakeRequestSpec("r1", /*num_pages=*/4));
     auto wb = FindFlatWriteBack(finalize);
     ASSERT_TRUE(wb.has_value());
-    EXPECT_EQ(wb->src_pages.at(0).size(), 4u) << "4 of 8 candidates fit";
+    EXPECT_EQ(wb->src_pages.at(0).size(), 4u) << "4 of 6 candidates fit";
     EXPECT_EQ(scheduler_->FlatHostPoolFreeBlocks(), 0);
 
     FinishAndReap("r1");
@@ -2791,13 +2791,13 @@ TEST_F(FlatStreamingSinkSuite, DuplicateWriteBackDoneIsIgnored) {
     const std::int32_t free_after_reap = scheduler_->FlatPoolFreeBlocks();
 
     SendWriteBackDone(wb->op_ids.at(0), /*success=*/true);
-    ASSERT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 8);
+    ASSERT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 6);
     const std::int32_t free_after_ack = scheduler_->FlatPoolFreeBlocks();
-    EXPECT_EQ(free_after_ack, free_after_reap + 8);
+    EXPECT_EQ(free_after_ack, free_after_reap + 6);
 
     // A replayed ack must be a no-op (the ledger already retired the op).
     SendWriteBackDone(wb->op_ids.at(0), /*success=*/true);
-    EXPECT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 8);
+    EXPECT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 6);
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_after_ack);
 }
 
@@ -2812,9 +2812,9 @@ protected:
         SchedulerConfig cfg = FlatStreamingSinkSuite::MakeConfig();
         cfg.disable_prefix_cache = false;
         // 13 device pages -> 12 free (page 0 is null): the 5-page churn request's peak
-        // (10 prefill + 2 reserve) spans the whole free list, recycling r1's 8 cached pages.
+        // (10 prefill + 2 reserve) spans the whole free list, recycling r1's 6 cached pages.
         cfg.device_allocator.total_pages = 13;
-        cfg.host_allocator.total_pages = 33;  // ample (+null page 0): r1's 8 + the churn's 10 entries fit un-evicted
+        cfg.host_allocator.total_pages = 33;  // ample (+null page 0): r1's 6 + the churn's 7 entries fit un-evicted
         for (auto& g : cfg.paged_cache_groups) {
             g.total_pages = cfg.device_allocator.total_pages;
         }
@@ -2838,21 +2838,20 @@ protected:
         return FindFlatWriteBack(finalize);
     }
 
-    // r1 (tokens 1..8) indexes 8 host entries (4 pages x 2 groups); the churn request
+    // r1 (tokens 1..8) indexes 6 host entries (4 Full + 2 SWA); the churn request
     // then floods the free list so r1's pages survive ONLY on the host tier.
     void SeedHostThenEvictDevice() {
         auto wb1 = RunSinkLifecycle(MakeRequestSpec("r1", /*num_pages=*/4));
         ASSERT_TRUE(wb1.has_value());
         SendWriteBackDone(wb1->op_ids.at(0), /*success=*/true);
-        ASSERT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 8);
-        // Published pages return to the free list cached-and-evictable (device convention),
-        // so the full 32 usable pages stay allocatable while 8 of them are hittable.
-        ASSERT_EQ(scheduler_->FlatHostPoolFreeBlocks(), 32);
+        ASSERT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 6);
+        // Host cache entries retain their host blocks until host eviction.
+        ASSERT_EQ(scheduler_->FlatHostPoolFreeBlocks(), 26);
 
         auto wb3 = RunSinkLifecycle(MakeRequestSpec("churn", /*num_pages=*/5, /*start=*/501));
         ASSERT_TRUE(wb3.has_value());
         SendWriteBackDone(wb3->op_ids.at(0), /*success=*/true);
-        ASSERT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 18);
+        ASSERT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 13);
         ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 12) << "both seeding requests fully retired";
     }
 };

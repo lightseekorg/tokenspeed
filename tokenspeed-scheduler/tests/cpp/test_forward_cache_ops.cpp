@@ -146,7 +146,8 @@ TEST(ForwardCacheOpsPrefill, ChunkAcquiresAndCachesFullBlocks) {
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
                                  .num_tokens = 4,
-                                 .completed_page_hashes = hashes2,
+                                 .page_hashes = hashes2,
+                                 .completed_end_tokens = 4,
                                  .num_computed_tokens = 4,
                              }));
     EXPECT_EQ(tables[0].NumBlocks(), 4);
@@ -175,7 +176,8 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowAndKeepsPunchedPageHashes) {
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
                                  .num_tokens = 4,
-                                 .completed_page_hashes = hashes,
+                                 .page_hashes = hashes,
+                                 .completed_end_tokens = 8,
                                  .num_computed_tokens = 8,
                              }));
 
@@ -190,14 +192,18 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowAndKeepsPunchedPageHashes) {
         EXPECT_TRUE(tables[1].Blocks()[i]) << "slot " << i;
     }
 
-    // The manager cache owner retains the two slid-out pages; Task 3 admission
-    // may evict them before charging the four fresh pages.
-    EXPECT_EQ(pool.NumEmptyLcmBlocks(), free_before_chunk - 4);
+    // Only the two-page resume tail is cached. The older two SWA pages become
+    // free before four fresh pages are acquired, for a net cost of two.
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), free_before_chunk - 2);
 
-    for (const std::string& h : {hashes[0], hashes[1]}) {
-        EXPECT_TRUE(coordinator.GroupManager(1).ContainsCachedBlock(pool, CacheKey{.group_id = 1, .content_hash = h}))
-            << "slid-out page must keep its registered hash";
-    }
+    EXPECT_FALSE(
+        coordinator.GroupManager(1).ContainsCachedBlock(pool, CacheKey{.group_id = 1, .content_hash = hashes[0]}));
+    EXPECT_FALSE(
+        coordinator.GroupManager(1).ContainsCachedBlock(pool, CacheKey{.group_id = 1, .content_hash = hashes[1]}));
+    EXPECT_TRUE(
+        coordinator.GroupManager(1).ContainsCachedBlock(pool, CacheKey{.group_id = 1, .content_hash = hashes[2]}));
+    EXPECT_TRUE(
+        coordinator.GroupManager(1).ContainsCachedBlock(pool, CacheKey{.group_id = 1, .content_hash = hashes[3]}));
 }
 
 // The first decode step (query at position P) only reads keys back to P - W + 1.
@@ -219,7 +225,8 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowBeforeAcquire) {
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
                                  .num_tokens = 1,
-                                 .completed_page_hashes = hashes,
+                                 .page_hashes = hashes,
+                                 .completed_end_tokens = 12,
                                  .num_computed_tokens = 12,
                              }));
 
@@ -231,8 +238,9 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowBeforeAcquire) {
         EXPECT_TRUE(tables[1].Blocks()[i]) << "slot " << i;
     }
     EXPECT_EQ(tables[0].NumBlocks(), 7);
-    // Pool: slide freed 4, reserve acquire took 1/group = 2 -> net +2.
-    EXPECT_EQ(pool.NumEmptyLcmBlocks(), free_before - 2);
+    // Pool: the uncached SWA prefix frees four parents, then one page per group
+    // consumes two parents.
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), free_before + 2);
 }
 
 TEST(ForwardCacheOpsDecode, StepAcquiresAndSlidesSwaWindow) {
@@ -280,12 +288,11 @@ TEST(ForwardCacheOpsDecode, DecodeStepRegistersFilledPages) {
     CacheFullBlocksForTest(coordinator, tables, std::span<const std::string>(hashes).first(2));
     ASSERT_EQ(MatchPrefixForTest(coordinator, hashes).device.num_common_tokens, 4);
 
-    const std::vector<std::string> fresh(hashes.begin() + 2, hashes.end());
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
                                  .num_tokens = 1,
-                                 .completed_page_hashes = fresh,
-                                 .completed_first_page_slot = 2,
+                                 .page_hashes = hashes,
+                                 .first_new_page_slot = 2,
                                  .num_computed_tokens = 8,
                              }));
 

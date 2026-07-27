@@ -166,6 +166,11 @@ private:
             }
         }
         std::ranges::sort(victim_candidates_, [](const VictimCandidate& lhs, const VictimCandidate& rhs) {
+            // A real request access is the primary cache-value signal. The
+            // probationary flag only breaks ties inside one request epoch.
+            if (lhs.last_access_epoch != rhs.last_access_epoch) {
+                return lhs.last_access_epoch < rhs.last_access_epoch;
+            }
             const auto eviction_class = [](const VictimCandidate& candidate) {
                 if (!candidate.was_prefix_hit && candidate.is_state && candidate.logical_block_index >= 0) {
                     return 0;
@@ -186,11 +191,6 @@ private:
                 // earlier one instead of letting insertion order erase the
                 // previous request's live frontier.
                 return lhs.logical_block_index < rhs.logical_block_index;
-            }
-            // An uncached prospective reclaim may be registered immediately
-            // before sliding releases its table ref. Treat it as newest.
-            if (lhs.last_access_epoch != rhs.last_access_epoch) {
-                return lhs.last_access_epoch < rhs.last_access_epoch;
             }
             if (lhs_class == 1 && lhs.logical_block_index != rhs.logical_block_index) {
                 // Full KV is prefix-closed: after comparing request access
@@ -321,9 +321,8 @@ std::optional<KvCacheCoordinator::AdmissionResult> KvCacheCoordinator::Admit(Pre
     }
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         const GroupDemand& demand = demands[i];
-        if (!demand.completed_page_hashes.empty()) {
-            cacheFullBlocksForGroup(i, *demand.table, demand.completed_page_hashes, demand.completed_first_page_slot,
-                                    demand.completed_end_tokens, access_epoch);
+        if (!demand.page_hashes.empty()) {
+            cacheCompletedBlocksForGroup(i, demand, access_epoch);
         }
         if (demand.num_computed_tokens >= 0) {
             groups_[i].Manager().ReclaimExpired(pool_, *demand.table, demand.num_computed_tokens);

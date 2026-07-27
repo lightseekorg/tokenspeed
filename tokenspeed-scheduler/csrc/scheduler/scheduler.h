@@ -134,7 +134,7 @@ private:
     struct FlatAdmissionMatch {
         KvCacheCoordinator::PrefixProbe probe;
         std::vector<std::string> ext_hashes;
-        fsm::HashChain hash_chain;
+        std::vector<std::string> page_hashes;
     };
     FlatAdmissionMatch matchFlatPrefixAtAdmission(Request* request);
     std::optional<KvCacheCoordinator::AdmissionResult> flatAdmit(KvCacheCoordinator::PrefixProbe&& prefix,

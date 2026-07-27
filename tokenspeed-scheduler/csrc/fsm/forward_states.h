@@ -42,15 +42,10 @@
 namespace tokenspeed::fsm {
 
 #if TOKENSPEED_FLAT_KVCACHE
-// Rolling logical-CacheBlock hash chain. Pages [0, num_hashed_pages) are
-// registered and last_hash seeds the next increment.
-struct HashChain {
-    std::int32_t num_hashed_pages{0};
-    std::string last_hash;
-};
-
 struct FlatCacheProgress {
-    HashChain hash_chain;
+    // One source of truth for both the next hash-chain seed and the cumulative
+    // history needed to publish a resumable boundary across chunk edges.
+    std::vector<std::string> page_hashes;
     std::uint64_t access_epoch{0};
 };
 #endif

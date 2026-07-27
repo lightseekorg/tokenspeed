@@ -221,35 +221,22 @@ std::int32_t KvCacheCoordinator::NumAvailableLcmBlocks() const {
 
 void KvCacheCoordinator::CacheFullBlocks(std::span<BlockTable> tables, std::span<const std::string> content_hashes,
                                          std::uint64_t access_epoch, std::int32_t first_slot,
-                                         std::int32_t end_tokens) {
+                                         CacheBoundaryKind boundary_kind) {
     _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
     if (content_hashes.empty()) {
         return;  // hot decode rounds usually fill no page
     }
     for (std::size_t i = 0; i < groups_.size(); ++i) {
-        cacheFullBlocksForGroup(i, tables[i], content_hashes, first_slot, end_tokens, access_epoch);
+        cacheFullBlocksForGroup(i, tables[i], content_hashes, first_slot, access_epoch, boundary_kind);
     }
 }
 
 void KvCacheCoordinator::cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table,
                                                  std::span<const std::string> content_hashes, std::int32_t first_slot,
-                                                 std::int32_t end_tokens, std::uint64_t access_epoch) {
+                                                 std::uint64_t access_epoch, CacheBoundaryKind boundary_kind) {
     std::vector<CacheKey> keys = keysForGroup(content_hashes, groups_[group_index].Id());
-    std::int32_t group_first_slot = first_slot;
-    std::span<const CacheKey> group_keys = keys;
-    const KvCacheSpec& spec = groups_[group_index].Spec();
-    if (spec.kind == AttnKind::kMambaState && !spec.materializes_all_boundaries) {
-        if (end_tokens < 0 || end_tokens % cache_block_tokens_ != 0 || keys.empty()) {
-            return;
-        }
-        const std::int32_t past_end_slot = group_first_slot + static_cast<std::int32_t>(keys.size());
-        group_first_slot = past_end_slot - 1;
-        group_keys = group_keys.last(1);
-        _assert(past_end_slot == end_tokens / cache_block_tokens_,
-                "state registration range must end at the aligned boundary");
-    }
     std::vector<std::pair<CacheKey, CacheBlockRef>> newly_cached;
-    groups_[group_index].Manager().CacheFullBlocks(pool_, table, group_keys, access_epoch, group_first_slot,
+    groups_[group_index].Manager().CacheFullBlocks(pool_, table, keys, access_epoch, first_slot, boundary_kind,
                                                    host_pool_ != nullptr ? &newly_cached : nullptr);
     for (auto& [key, block_ref] : newly_cached) {
         pending_stores_.push_back(StoreCandidate{
@@ -257,6 +244,39 @@ void KvCacheCoordinator::cacheFullBlocksForGroup(std::size_t group_index, BlockT
             .block_ref = std::move(block_ref),
         });
     }
+}
+
+void KvCacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand,
+                                                      std::uint64_t access_epoch) {
+    _assert(demand.first_new_page_slot >= 0 &&
+                static_cast<std::size_t>(demand.first_new_page_slot) <= demand.page_hashes.size(),
+            "first new page slot is outside the hash history");
+    if (static_cast<std::size_t>(demand.first_new_page_slot) == demand.page_hashes.size()) {
+        return;
+    }
+
+    const KvCacheManager& manager = groups_[group_index].Manager();
+    if (manager.MatchIsPrefixClosed()) {
+        cacheFullBlocksForGroup(group_index, *demand.table,
+                                demand.page_hashes.subspan(static_cast<std::size_t>(demand.first_new_page_slot)),
+                                demand.first_new_page_slot, access_epoch, demand.boundary_kind);
+        return;
+    }
+    if (demand.completed_end_tokens < 0 || demand.completed_end_tokens % cache_block_tokens_ != 0) {
+        return;
+    }
+
+    const std::int32_t boundary_slot = demand.completed_end_tokens / cache_block_tokens_;
+    _assert(boundary_slot == static_cast<std::int32_t>(demand.page_hashes.size()),
+            "non-closed boundary must end at the hash history tail");
+    const std::int32_t lookback = std::min(manager.BoundaryLookbackBlocks(), boundary_slot);
+    if (lookback == 0) {
+        return;
+    }
+    const std::int32_t first_slot = boundary_slot - lookback;
+    cacheFullBlocksForGroup(group_index, *demand.table,
+                            demand.page_hashes.subspan(static_cast<std::size_t>(first_slot)), first_slot, access_epoch,
+                            demand.boundary_kind);
 }
 
 void KvCacheCoordinator::ReclaimExpired(std::span<BlockTable> tables, std::int32_t num_computed_tokens) {
