@@ -198,12 +198,29 @@ TEST_F(FlatKimi128KUndersizedPoolSuite, DefersBeforeAllSixteenChunksComplete) {
         .tokens = std::vector<token_t>(131072, 1),
     });
 
-    std::int32_t completed_chunks = 0;
-    for (; completed_chunks < 16; ++completed_chunks) {
+    // With only 85 usable pages the 128K history (needs 86 history + state
+    // pages) cannot be fully prefilled, so the scheduler must reject the
+    // request rather than run all sixteen chunks. Rejection manifests as
+    // retraction -- the request stops appearing in the flat op -- not as a
+    // null plan (once no work remains the scheduler still emits idle forward
+    // ops with zero requests). Count only chunks that carry real prefill work
+    // for "128k" and require the request to drop out before all sixteen.
+    std::int32_t real_chunks = 0;
+    for (; real_chunks < 16; ++real_chunks) {
         ExecutionPlan plan = PlanOnce();
-        if (FindFlatOp(plan) == nullptr) break;
+        const FlatForwardOperation* op = FindFlatOp(plan);
+        const bool carries_request =
+            op != nullptr && std::find(op->request_ids.begin(), op->request_ids.end(), "128k") != op->request_ids.end();
+        if (!carries_request) break;
     }
-    EXPECT_LT(completed_chunks, 16) << "85 usable pages must not advertise successful 128K admission";
+    EXPECT_LT(real_chunks, 16) << "85 usable pages must not fully prefill a 128K request; it must be "
+                                  "retracted before all sixteen chunks complete";
+    // Retraction frees the request's pages on the following plan step; let it
+    // settle, then require the whole pool back.
+    for (int i = 0; i < 4 && scheduler_->FlatPoolFreeBlocks() != 85; ++i) {
+        PlanOnce();
+    }
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), 85) << "a retracted request must return all of its pages to the pool";
 }
 
 // ---------------------------------------------------------------------------
