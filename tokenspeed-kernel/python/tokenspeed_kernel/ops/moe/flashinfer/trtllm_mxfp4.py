@@ -27,6 +27,7 @@ import torch
 from tokenspeed_kernel.ops.tuning import (
     autotune_frozen,
     flashinfer_tuning_cache_active,
+    get_autotune_max_num_tokens,
 )
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -39,7 +40,6 @@ from tokenspeed_kernel.signature import format_signatures
 logger = logging.getLogger(__name__)
 
 platform = current_platform()
-next_power_of_2 = lambda value: 1 if value <= 1 else 1 << (value - 1).bit_length()
 
 _permute_indices_cache: dict[tuple[str, torch.Size], torch.Tensor] = {}
 _permute_indices_device_cache: dict[
@@ -115,7 +115,6 @@ if platform.is_nvidia:
         nvfp4_block_scale_interleave,
         trtllm_fp4_block_scale_moe,
     )
-    from flashinfer.autotuner import autotune
     from flashinfer.fused_moe.core import (
         _maybe_get_cached_w3_w1_permute_indices as maybe_get_cached_w3_w1_permute_indices,
     )
@@ -442,7 +441,7 @@ if platform.is_nvidia:
             routed_scaling_factor=None,
             routing_method_type=1,
             do_finalize=True,
-            tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
+            tune_max_num_tokens=get_autotune_max_num_tokens(),
             output=output,
         )[0]
 
@@ -591,16 +590,6 @@ if platform.is_nvidia:
         output = torch.empty(
             x_quant.shape[0], h_dim, dtype=torch.bfloat16, device=x_quant.device
         )
-
-        # Autotune per pow-2 token class, frozen once serving starts (see ops.tuning).
-        if not hasattr(w, "_flashinfer_trtllm_autotuned_sizes"):
-            w._flashinfer_trtllm_autotuned_sizes = set()
-        tuned_sizes = w._flashinfer_trtllm_autotuned_sizes
-        size_class = next_power_of_2(x_quant.shape[0])
-        if size_class not in tuned_sizes and not autotune_frozen():
-            with autotune():
-                _call_mxfp4_moe(w, router_logits, x_quant, x_scale, output)
-            tuned_sizes.add(size_class)
 
         result = _call_mxfp4_moe(w, router_logits, x_quant, x_scale, output)
         if hidden_original != hidden_padded:

@@ -25,10 +25,10 @@
 the captured region: graphs start from a static input-embeds buffer, filled at
 replay by an eager ``embed_tokens`` gather (text) or by precomputed merged
 embeddings (multimodal, via the model's ``multimodal_input_embeds`` seam).
-Constructed after the decode
-:class:`~tokenspeed.runtime.execution.cuda_graph_wrapper.CudaGraphWrapper`,
-borrowing its capture stream; buckets share one private mempool, deliberately
-not the decode graphs' pool (see :meth:`capture`). At serving time
+Capture borrows the decode
+:class:`~tokenspeed.runtime.execution.cuda_graph_wrapper.CudaGraphWrapper`'s
+stream; buckets share one private mempool, deliberately not the decode graphs'
+pool (see :meth:`capture`). At serving time
 the executor's target-forward dispatch is a flat
 three-way -- decode & captured replays the decode graph (one level up, since
 it captures the whole step), prefill & captured replays here (:meth:`can_run`
@@ -185,15 +185,12 @@ class PrefillGraph:
     """The breakable prefill (extend) CUDA graphs.
 
     A pure graph object -- :meth:`can_run` / :meth:`replay` -- holding no
-    reference to any other component. Constructed AFTER the decode
-    ``CudaGraphWrapper`` and captures in ``__init__`` like it: the decode
-    wrapper is used transiently for its capture stream and dummy paged-cache
-    tables, not kept. (The executor's target-forward dispatch therefore mode-
-    checks before touching this object -- decode capture runs that dispatch
-    while this object does not exist yet.) The dispatch checks :meth:`can_run`
-    and calls :meth:`replay`; the eager path stays a direct
-    ``model_runner.forward`` call at that call site. Capture failure degrades
-    to eager -- world-agreed, so DP/TP ranks stay in lockstep.
+    reference to any other component. The executor calls :meth:`capture` once
+    kernel tuning has run, passing the decode wrapper transiently for its
+    capture stream and dummy paged-cache tables; it is not kept. The dispatch
+    checks :meth:`can_run` and calls :meth:`replay`; the eager path stays a
+    direct ``model_runner.forward`` call at that call site. Capture failure
+    degrades to eager -- world-agreed, so DP/TP ranks stay in lockstep.
 
     Args:
         model_runner: The target ModelRunner. Supplies the loaded model
@@ -218,7 +215,6 @@ class PrefillGraph:
         config: ModelExecutorConfig,
         req_to_page: torch.Tensor | None,
         drafter=None,
-        decode_wrapper: CudaGraphWrapper | None = None,
         num_warmup: int = 3,
     ) -> None:
         model = model_runner.model if model_runner is not None else None
@@ -276,9 +272,6 @@ class PrefillGraph:
         self._captures: dict[int, BreakableCapture] = {}
         self._outputs: dict[int, CapturedForward] = {}
 
-        if not self.disable:
-            self.capture(decode_wrapper)
-
     # ------------------------------------------------------------------
     # Graph capture
     # ------------------------------------------------------------------
@@ -286,9 +279,9 @@ class PrefillGraph:
     def capture(self, decode_wrapper: CudaGraphWrapper | None = None) -> None:
         """Capture one breakable graph per token bucket (no-op when disabled).
 
-        Called from ``__init__``; ``decode_wrapper`` supplies the shared
-        capture stream and dummy paged-cache block tables (used here only,
-        not stored). Buckets share one PRIVATE mempool (first capture
+        ``decode_wrapper`` supplies the shared capture stream and dummy
+        paged-cache block tables (used here only, not stored). Buckets share
+        one PRIVATE mempool (first capture
         allocates it), so graph memory stays ~the largest bucket's peak --
         but never the decode graphs' pool: eager ops cache raw pointers to
         buffers they lazily allocated inside a decode capture (flashinfer's
@@ -362,7 +355,7 @@ class PrefillGraph:
                 capture_range.set_description(
                     f"Capturing prefill buckets ({bucket=} {avail_mem=:.2f} GB)"
                 )
-            self._ctx = self._make_dummy_batch(bucket, decode_wrapper)
+            self._ctx = self.make_dummy_batch(bucket, decode_wrapper)
             self._land_input_embeds(
                 self._embed_tokens(self.input_buffers.input_ids_buf[:bucket]), bucket
             )
@@ -466,7 +459,7 @@ class PrefillGraph:
             for spec in specs
         }
 
-    def _make_dummy_batch(
+    def make_dummy_batch(
         self, num_tokens: int, decode_wrapper: CudaGraphWrapper | None
     ) -> ForwardContext:
         """Populate the static buffers + attention metadata for a dummy bs=1 extend
@@ -507,6 +500,9 @@ class PrefillGraph:
                 CaptureHiddenMode.FULL
                 if self.drafter is not None
                 else CaptureHiddenMode.NULL
+            ),
+            gather_ids=torch.tensor(
+                [num_tokens - 1], dtype=torch.int64, device=self.config.device
             ),
         )
         if self.dp_size > 1:
@@ -634,7 +630,7 @@ class PrefillGraph:
                         device=weight.device,
                     )
                     with maybe_inference_mode():
-                        self._ctx = self._make_dummy_batch(tokens, decode_wrapper)
+                        self._ctx = self.make_dummy_batch(tokens, decode_wrapper)
                         self._land_input_embeds(
                             self._embed_tokens(
                                 self.input_buffers.input_ids_buf[:tokens]

@@ -20,11 +20,15 @@
 
 """Kernel autotune lifecycle.
 
-Ops that autotune lazily (e.g. the flashinfer trtllm MoE) consult
-:func:`autotune_frozen` before starting a new tuning run. The runtime calls
-:func:`freeze_autotuning` once engine startup (model load, CUDA-graph capture,
-warmup) completes, because an autotune during serving is a hazard twice over:
-it blocks the launch thread for the whole profiling run, and under tensor
+Tunable kernels (the flashinfer MoE and GEMM families) profile their candidate
+tactics only while the tuning window is open, and take each library's heuristic
+tactic otherwise. The runtime opens exactly one window during engine startup,
+around a dummy forward at the largest token count it will ever serve, and closes
+it before any CUDA-graph capture -- a captured graph records the tactic chosen
+at capture time, so tuning afterwards cannot change a replay.
+
+The window is CLOSED by default. Tuning during serving would be a hazard twice
+over: it blocks the launch thread for the whole profiling run, and under tensor
 parallelism ranks that tune at different times miss their next collective and
 deadlock. Shapes first seen after the freeze run on each library's fallback
 tactics instead -- slower, never stalled.
@@ -36,20 +40,28 @@ pass entirely -- and every rank loading the same table picks the same tactics,
 removing the rank-divergence hazard above for covered shapes.
 """
 
+import contextlib
 import functools
 import logging
 import os
+from collections.abc import Generator
 
 __all__ = [
+    "autotune",
     "autotune_frozen",
     "flashinfer_tuning_cache_active",
     "freeze_autotuning",
+    "get_autotune_max_num_tokens",
     "load_flashinfer_tuning_cache",
     "load_packaged_flashinfer_tuning_cache",
+    "set_autotune_max_num_tokens",
 ]
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_AUTOTUNE_MAX_NUM_TOKENS = 8192
+
+_autotune_max_num_tokens = _DEFAULT_AUTOTUNE_MAX_NUM_TOKENS
 _frozen = False
 _tuning_cache_active = False
 
@@ -69,6 +81,54 @@ def flashinfer_tuning_cache_active() -> bool:
 def autotune_frozen() -> bool:
     """Whether lazy autotuning is frozen (engine is serving)."""
     return _frozen
+
+
+def set_autotune_max_num_tokens(num_tokens: int) -> None:
+    """Set the token count MoE tuning buckets are generated up to.
+
+    Call once at startup, before :func:`autotune` is first entered. The value must stay
+    constant for the process lifetime: flashinfer builds the bucket *mapper*
+    from it and consults that mapper on every serving call to compute the
+    tactic cache key, so a value derived from the current batch makes lookups
+    resolve to the wrong bucket.
+
+    Args:
+        num_tokens: Largest token count a single forward can carry (the
+            runtime's ``chunked_prefill_size``). Raised to flashinfer's own
+            default floor when smaller.
+    """
+    global _autotune_max_num_tokens
+    _autotune_max_num_tokens = max(int(num_tokens), _DEFAULT_AUTOTUNE_MAX_NUM_TOKENS)
+
+
+def get_autotune_max_num_tokens() -> int:
+    """Token count MoE tuning buckets are generated up to.
+
+    Returns:
+        The value set by :func:`set_autotune_max_num_tokens`, or the default floor.
+    """
+    return _autotune_max_num_tokens
+
+
+@contextlib.contextmanager
+def autotune() -> Generator[None]:
+    """Enable kernel autotuning for the enclosed block, process-wide.
+
+    Kernels invoked inside the block profile their candidate tactics and cache
+    the winner per shape bucket; outside it they are a cache lookup with a
+    heuristic fallback. A no-op when the tuning backend is unavailable.
+
+    Yields:
+        ``None``; tuning is disabled again when the block exits, including on
+        error.
+    """
+    try:
+        from flashinfer.autotuner import autotune as _flashinfer_autotune
+    except ImportError:
+        yield
+        return
+    with _flashinfer_autotune():
+        yield
 
 
 def freeze_autotuning() -> None:
