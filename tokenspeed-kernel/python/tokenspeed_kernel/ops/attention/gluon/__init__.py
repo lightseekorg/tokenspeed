@@ -55,7 +55,7 @@ if current_platform().is_amd:
         gluon_mha_decode_gfx950 as _decode_impl,
     )
     from tokenspeed_kernel_amd.ops.attention.gluon.mha_decode_gfx1250 import (
-        gluon_paged_gqa_decode_gfx1250 as _decode_gfx1250_impl,
+        gluon_mha_decode_gfx1250 as _decode_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.attention.gluon.mha_extend_gfx950 import (
         gluon_mha_extend_gfx950 as _extend_impl,

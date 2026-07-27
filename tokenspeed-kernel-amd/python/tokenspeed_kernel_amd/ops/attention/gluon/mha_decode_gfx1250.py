@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Paged grouped-query decode attention for AMD GFX1250."""
+"""MHA decode Gluon kernel optimized for AMD GFX1250."""
 
 from __future__ import annotations
 
@@ -28,58 +28,14 @@ from typing import NamedTuple
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon
 
-
-def _compute_split_factor(batch, num_head_groups, seq_len_k, block_n):
-    target_total_wrkgrps = 1024
-    tasks = batch * num_head_groups
-    if tasks == 0:
-        return 1
-    ideal_split = target_total_wrkgrps // tasks
-    max_possible_splits = (seq_len_k + block_n - 1) // block_n
-
-    split_factor = max(min(ideal_split, max_possible_splits), 1)
-    num_tiles = max_possible_splits
-    while split_factor > 1:
-        tiles_per_split = (num_tiles + split_factor - 1) // split_factor
-        if (split_factor - 1) * tiles_per_split < num_tiles:
-            break
-        split_factor -= 1
-    return split_factor
-
-
-def _compute_peeled_split_factor(batch, num_head_groups, seq_len_k, block_n):
-    split_factor = _compute_split_factor(batch, num_head_groups, seq_len_k, block_n)
-    num_tiles = (seq_len_k + block_n - 1) // block_n
-    split_factor = min(split_factor, max(num_tiles // 4, 1))
-    while split_factor > 1:
-        tiles_per_split = (num_tiles + split_factor - 1) // split_factor
-        last_split_tiles = num_tiles - (split_factor - 1) * tiles_per_split
-        if last_split_tiles >= 4:
-            break
-        split_factor -= 1
-    return split_factor
-
-
-class _LaunchConfig(NamedTuple):
-    batch_size: int
-    seqlen_k: int
-    num_q_heads: int
-    num_kv_heads: int
-    head_dim: int
-    block_m: int
-    block_n: int
-    decode_stage: str
-    split_factor: int
-    gqa_block_h: int
-    num_warps: int
-    cache_modifier: str
-    hot_wait_count: int
-    skip_final_wait: bool
+# ===-----------------------------------------------------------------------===#
+# Kernel Config
+# ===-----------------------------------------------------------------------===#
 
 
 @gluon.aggregate
 class AttentionConfig:
-    HEAD_SZ: gl.constexpr
+    HEAD_DIM: gl.constexpr
     BLOCK_M: gl.constexpr
     BLOCK_N: gl.constexpr
     NUM_BUFFERS: gl.constexpr
@@ -96,10 +52,10 @@ class AttentionConfig:
     p_layout: gl.constexpr
 
     @gluon.constexpr_function
-    def __init__(self, HEAD_SZ, BLOCK_M, BLOCK_N, NUM_BUFFERS, NUM_WARPS):
+    def __init__(self, HEAD_DIM, BLOCK_M, BLOCK_N, NUM_BUFFERS, NUM_WARPS):
 
         # constants
-        self.HEAD_SZ = gl.constexpr(HEAD_SZ)
+        self.HEAD_DIM = gl.constexpr(HEAD_DIM)
         self.BLOCK_M = gl.constexpr(BLOCK_M)
         self.BLOCK_N = gl.constexpr(BLOCK_N)
         self.NUM_BUFFERS = gl.constexpr(NUM_BUFFERS)
@@ -125,12 +81,12 @@ class AttentionConfig:
         # tensor layouts
         self.k_smem_layout = gl.constexpr(
             gl.PaddedSharedLayout.with_identity_for(
-                [[HEAD_SZ, 8]], [BLOCK_N, HEAD_SZ], [1, 0]
+                [[HEAD_DIM, 8]], [BLOCK_N, HEAD_DIM], [1, 0]
             )
         )
         self.v_smem_layout = gl.constexpr(
             gl.PaddedSharedLayout.with_identity_for(
-                [[HEAD_SZ, 16]], [BLOCK_N, HEAD_SZ], [1, 0]
+                [[HEAD_DIM, 16]], [BLOCK_N, HEAD_DIM], [1, 0]
             )
         )
 
@@ -140,12 +96,17 @@ class AttentionConfig:
         self.p_layout = gl.constexpr(gl.DotOperandLayout(0, self.pv_layout, 8))
 
 
+# ===-----------------------------------------------------------------------===#
+# Kernel Program
+# ===-----------------------------------------------------------------------===#
+
+
 @gluon.jit
-def attn_decode_fwd_paged_gqa_kernel(
+def _mha_decode(
     q_ptr,
     k_ptr,
     v_ptr,
-    block_table_ptr,
+    page_table_ptr,
     cache_seqlens_ptr,
     mid_o_ptr,
     mid_l_ptr,
@@ -175,7 +136,7 @@ def attn_decode_fwd_paged_gqa_kernel(
     SEQLEN_K: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
-    HEAD_SZ: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
     GQA_GROUP_SIZE: gl.constexpr,
     GQA_BLOCK_H: gl.constexpr,
     GQA_GROUPS_PER_K_HEAD: gl.constexpr,
@@ -187,7 +148,7 @@ def attn_decode_fwd_paged_gqa_kernel(
 ):
     NUM_BUFFERS: gl.constexpr = 1
     NUM_WARPS: gl.constexpr = DECODE_NUM_WARPS
-    cfg = AttentionConfig(HEAD_SZ, BLOCK_M, BLOCK_N, NUM_BUFFERS, NUM_WARPS)
+    cfg = AttentionConfig(HEAD_DIM, BLOCK_M, BLOCK_N, NUM_BUFFERS, NUM_WARPS)
 
     off_z = gl.program_id(0)
     off_head_group = gl.program_id(1)
@@ -198,7 +159,7 @@ def attn_decode_fwd_paged_gqa_kernel(
     q_head_start = off_k_head * GQA_GROUP_SIZE + q_group_in_k_head * GQA_BLOCK_H
 
     q_rows = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.q_layout))
-    q_cols = gl.arange(0, HEAD_SZ, layout=gl.SliceLayout(0, cfg.q_layout))
+    q_cols = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, cfg.q_layout))
     q_heads = q_head_start + q_rows
     q_offs = (
         stride_qz * off_z + stride_qh * q_heads[:, None] + stride_qk * q_cols[None, :]
@@ -210,9 +171,9 @@ def attn_decode_fwd_paged_gqa_kernel(
 
     k_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=k_ptr,
-        shape=(BLOCK_N, HEAD_SZ),
+        shape=(BLOCK_N, HEAD_DIM),
         strides=(stride_kn, stride_kk),
-        block_shape=(BLOCK_N, HEAD_SZ),
+        block_shape=(BLOCK_N, HEAD_DIM),
         layout=cfg.k_smem_layout,
     )
     k_buffer = gl.allocate_shared_memory(
@@ -220,9 +181,9 @@ def attn_decode_fwd_paged_gqa_kernel(
     )
     v_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=v_ptr,
-        shape=(BLOCK_N, HEAD_SZ),
+        shape=(BLOCK_N, HEAD_DIM),
         strides=(stride_vn, stride_vk),
-        block_shape=(BLOCK_N, HEAD_SZ),
+        block_shape=(BLOCK_N, HEAD_DIM),
         layout=cfg.v_smem_layout,
     )
     v_buffer = gl.allocate_shared_memory(
@@ -238,7 +199,7 @@ def attn_decode_fwd_paged_gqa_kernel(
     l_i = gl.full(
         [BLOCK_M], 0.0, dtype=gl.float32, layout=gl.SliceLayout(1, cfg.pv_layout)
     )
-    acc = gl.zeros([BLOCK_M, HEAD_SZ], dtype=gl.float32, layout=cfg.pv_layout)
+    acc = gl.zeros([BLOCK_M, HEAD_DIM], dtype=gl.float32, layout=cfg.pv_layout)
     sm_scale_dot_rcp_ln2: gl.constexpr = SM_SCALE * 1.4426950408889634
 
     start_k = split_id * CHUNK_SIZE
@@ -248,17 +209,15 @@ def attn_decode_fwd_paged_gqa_kernel(
     for current_k in range(start_k, split_end_k, BLOCK_N):
         logical_page = current_k // BLOCK_N
         page_offset = current_k - logical_page * BLOCK_N
-        physical_page = gl.load(
-            block_table_ptr + off_z * PAGES_PER_BATCH + logical_page
-        )
+        physical_page = gl.load(page_table_ptr + off_z * PAGES_PER_BATCH + logical_page)
         tile_active = current_k < end_k
         physical_page = gl.where(tile_active, physical_page, 0)
 
         k_tile_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=k_ptr + physical_page * stride_kp + off_k_head * stride_kh,
-            shape=(BLOCK_N, HEAD_SZ),
+            shape=(BLOCK_N, HEAD_DIM),
             strides=(stride_kn, stride_kk),
-            block_shape=(BLOCK_N, HEAD_SZ),
+            block_shape=(BLOCK_N, HEAD_DIM),
             layout=cfg.k_smem_layout,
         )
         gl.amd.gfx1250.tdm.async_load(
@@ -291,9 +250,9 @@ def attn_decode_fwd_paged_gqa_kernel(
 
         v_tile_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=v_ptr + physical_page * stride_vp + off_k_head * stride_vh,
-            shape=(BLOCK_N, HEAD_SZ),
+            shape=(BLOCK_N, HEAD_DIM),
             strides=(stride_vn, stride_vk),
-            block_shape=(BLOCK_N, HEAD_SZ),
+            block_shape=(BLOCK_N, HEAD_DIM),
             layout=cfg.v_smem_layout,
         )
         gl.amd.gfx1250.tdm.async_load(
@@ -308,7 +267,7 @@ def attn_decode_fwd_paged_gqa_kernel(
         acc = gl.amd.gfx1250.wmma(p, v, acc)
 
     store_rows = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.pv_layout))
-    store_cols = gl.arange(0, HEAD_SZ, layout=gl.SliceLayout(0, cfg.pv_layout))
+    store_cols = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, cfg.pv_layout))
     store_q_heads = q_head_start + store_rows
     store_mask = (store_rows < GQA_BLOCK_H) & (
         store_q_heads < (off_k_head + 1) * GQA_GROUP_SIZE
@@ -338,11 +297,11 @@ def attn_decode_fwd_paged_gqa_kernel(
 
 
 @gluon.jit
-def attn_decode_fwd_paged_pipeline_peeled_kernel(
+def _mha_decode_peeled(
     q_ptr,
     k_ptr,
     v_ptr,
-    block_table_ptr,
+    page_table_ptr,
     cache_seqlens_ptr,
     mid_o_ptr,
     mid_l_ptr,
@@ -372,7 +331,7 @@ def attn_decode_fwd_paged_pipeline_peeled_kernel(
     SEQLEN_K: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
-    HEAD_SZ: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
     GQA_GROUP_SIZE: gl.constexpr,
     SPLIT_FACTOR: gl.constexpr,
     GQA_BLOCK_H: gl.constexpr,
@@ -387,7 +346,7 @@ def attn_decode_fwd_paged_pipeline_peeled_kernel(
 ):
     NUM_BUFFERS: gl.constexpr = 2
     NUM_WARPS: gl.constexpr = DECODE_NUM_WARPS
-    cfg = AttentionConfig(HEAD_SZ, BLOCK_M, BLOCK_N, NUM_BUFFERS, NUM_WARPS)
+    cfg = AttentionConfig(HEAD_DIM, BLOCK_M, BLOCK_N, NUM_BUFFERS, NUM_WARPS)
 
     off_z = gl.program_id(0)
     off_head_group = gl.program_id(1)
@@ -395,7 +354,7 @@ def attn_decode_fwd_paged_pipeline_peeled_kernel(
     q_group_in_k_head = off_head_group - off_k_head * GQA_GROUPS_PER_K_HEAD
     q_head_start = off_k_head * GQA_GROUP_SIZE + q_group_in_k_head * GQA_BLOCK_H
     q_rows = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.q_layout))
-    q_cols = gl.arange(0, HEAD_SZ, layout=gl.SliceLayout(0, cfg.q_layout))
+    q_cols = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, cfg.q_layout))
     q_heads = q_head_start + q_rows
     q_offs = (
         stride_qz * off_z + stride_qh * q_heads[:, None] + stride_qk * q_cols[None, :]
@@ -418,13 +377,13 @@ def attn_decode_fwd_paged_pipeline_peeled_kernel(
     logical_k_0 = start_k
     start_page = start_k // BLOCK_N
     page_idx_0 = start_page
-    physical_page_0 = gl.load(block_table_ptr + off_z * PAGES_PER_BATCH + page_idx_0)
+    physical_page_0 = gl.load(page_table_ptr + off_z * PAGES_PER_BATCH + page_idx_0)
     physical_page_0 = gl.where(logical_k_0 < end_k, physical_page_0, 0)
     k_desc_0 = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=k_ptr + physical_page_0 * stride_kp + off_k_head * stride_kh,
-        shape=(BLOCK_N, HEAD_SZ),
+        shape=(BLOCK_N, HEAD_DIM),
         strides=(stride_kn, stride_kk),
-        block_shape=(BLOCK_N, HEAD_SZ),
+        block_shape=(BLOCK_N, HEAD_DIM),
         layout=cfg.k_smem_layout,
     )
     k_buffer = gl.allocate_shared_memory(
@@ -434,9 +393,9 @@ def attn_decode_fwd_paged_pipeline_peeled_kernel(
     )
     v_desc_0 = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=v_ptr + physical_page_0 * stride_vp + off_k_head * stride_vh,
-        shape=(BLOCK_N, HEAD_SZ),
+        shape=(BLOCK_N, HEAD_DIM),
         strides=(stride_vn, stride_vk),
-        block_shape=(BLOCK_N, HEAD_SZ),
+        block_shape=(BLOCK_N, HEAD_DIM),
         layout=cfg.v_smem_layout,
     )
     v_buffer = gl.allocate_shared_memory(
@@ -454,7 +413,7 @@ def attn_decode_fwd_paged_pipeline_peeled_kernel(
     l_i = gl.full(
         [BLOCK_M], 1.0, dtype=gl.float32, layout=gl.SliceLayout(1, cfg.pv_layout)
     )
-    acc = gl.zeros([BLOCK_M, HEAD_SZ], dtype=gl.float32, layout=cfg.pv_layout)
+    acc = gl.zeros([BLOCK_M, HEAD_DIM], dtype=gl.float32, layout=cfg.pv_layout)
     sm_scale_dot_rcp_ln2: gl.constexpr = SM_SCALE * 1.4426950408889634
 
     gl.amd.gfx1250.tdm.async_load(
@@ -466,13 +425,13 @@ def attn_decode_fwd_paged_pipeline_peeled_kernel(
 
     logical_k_1 = start_k + BLOCK_N
     page_idx_1 = start_page + 1
-    physical_page_1 = gl.load(block_table_ptr + off_z * PAGES_PER_BATCH + page_idx_1)
+    physical_page_1 = gl.load(page_table_ptr + off_z * PAGES_PER_BATCH + page_idx_1)
     physical_page_1 = gl.where(logical_k_1 < end_k, physical_page_1, 0)
     k_desc_1 = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=k_ptr + physical_page_1 * stride_kp + off_k_head * stride_kh,
-        shape=(BLOCK_N, HEAD_SZ),
+        shape=(BLOCK_N, HEAD_DIM),
         strides=(stride_kn, stride_kk),
-        block_shape=(BLOCK_N, HEAD_SZ),
+        block_shape=(BLOCK_N, HEAD_DIM),
         layout=cfg.k_smem_layout,
     )
     gl.amd.gfx1250.tdm.async_load(
@@ -511,13 +470,13 @@ def attn_decode_fwd_paged_pipeline_peeled_kernel(
     tile_2: gl.constexpr = 2 * BLOCK_N
     logical_k_2 = start_k + tile_2
     page_idx_2 = start_page + 2
-    physical_page_2 = gl.load(block_table_ptr + off_z * PAGES_PER_BATCH + page_idx_2)
+    physical_page_2 = gl.load(page_table_ptr + off_z * PAGES_PER_BATCH + page_idx_2)
     physical_page_2 = gl.where(logical_k_2 < end_k, physical_page_2, 0)
     k_desc_2 = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=k_ptr + physical_page_2 * stride_kp + off_k_head * stride_kh,
-        shape=(BLOCK_N, HEAD_SZ),
+        shape=(BLOCK_N, HEAD_DIM),
         strides=(stride_kn, stride_kk),
-        block_shape=(BLOCK_N, HEAD_SZ),
+        block_shape=(BLOCK_N, HEAD_DIM),
         layout=cfg.k_smem_layout,
     )
     gl.amd.gfx1250.tdm.async_load(
@@ -529,9 +488,9 @@ def attn_decode_fwd_paged_pipeline_peeled_kernel(
 
     v_desc_1 = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=v_ptr + physical_page_1 * stride_vp + off_k_head * stride_vh,
-        shape=(BLOCK_N, HEAD_SZ),
+        shape=(BLOCK_N, HEAD_DIM),
         strides=(stride_vn, stride_vk),
-        block_shape=(BLOCK_N, HEAD_SZ),
+        block_shape=(BLOCK_N, HEAD_DIM),
         layout=cfg.v_smem_layout,
     )
     gl.amd.gfx1250.tdm.async_load(
@@ -561,7 +520,7 @@ def attn_decode_fwd_paged_pipeline_peeled_kernel(
         page_idx_k_next = start_page + iter_id + 3
         page_is_valid = (logical_t_3 < end_k) & (page_idx_k_next < PAGES_PER_BATCH)
         physical_page_k_next = gl.load(
-            block_table_ptr + off_z * PAGES_PER_BATCH + page_idx_k_next,
+            page_table_ptr + off_z * PAGES_PER_BATCH + page_idx_k_next,
             mask=page_is_valid,
             other=0,
         )
@@ -585,9 +544,9 @@ def attn_decode_fwd_paged_pipeline_peeled_kernel(
 
         k_desc_next = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=k_ptr + physical_page_k_next * stride_kp + off_k_head * stride_kh,
-            shape=(BLOCK_N, HEAD_SZ),
+            shape=(BLOCK_N, HEAD_DIM),
             strides=(stride_kn, stride_kk),
-            block_shape=(BLOCK_N, HEAD_SZ),
+            block_shape=(BLOCK_N, HEAD_DIM),
             layout=cfg.k_smem_layout,
         )
         gl.amd.gfx1250.tdm.async_load(
@@ -618,9 +577,9 @@ def attn_decode_fwd_paged_pipeline_peeled_kernel(
 
         v_desc_next = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=v_ptr + physical_page_for_next_v * stride_vp + off_k_head * stride_vh,
-            shape=(BLOCK_N, HEAD_SZ),
+            shape=(BLOCK_N, HEAD_DIM),
             strides=(stride_vn, stride_vk),
-            block_shape=(BLOCK_N, HEAD_SZ),
+            block_shape=(BLOCK_N, HEAD_DIM),
             layout=cfg.v_smem_layout,
         )
         gl.amd.gfx1250.tdm.async_load(
@@ -669,9 +628,9 @@ def attn_decode_fwd_paged_pipeline_peeled_kernel(
 
     v_desc_3 = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=v_ptr + physical_page_for_next_v * stride_vp + off_k_head * stride_vh,
-        shape=(BLOCK_N, HEAD_SZ),
+        shape=(BLOCK_N, HEAD_DIM),
         strides=(stride_vn, stride_vk),
-        block_shape=(BLOCK_N, HEAD_SZ),
+        block_shape=(BLOCK_N, HEAD_DIM),
         layout=cfg.v_smem_layout,
     )
     gl.amd.gfx1250.tdm.async_load(
@@ -721,7 +680,7 @@ def attn_decode_fwd_paged_pipeline_peeled_kernel(
         gl.amd.gfx1250.tdm.async_wait(0)
 
     store_rows = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.pv_layout))
-    store_cols = gl.arange(0, HEAD_SZ, layout=gl.SliceLayout(0, cfg.pv_layout))
+    store_cols = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, cfg.pv_layout))
     store_q_heads = q_head_start + store_rows
     store_mask = (store_rows < GQA_BLOCK_H) & (
         store_q_heads < (off_k_head + 1) * GQA_GROUP_SIZE
@@ -766,7 +725,7 @@ def attn_decode_fwd_paged_pipeline_peeled_kernel(
 
 
 @gluon.jit
-def attn_decode_reduce_row1_kernel(
+def _mha_decode_reduce(
     mid_o_ptr,
     mid_l_ptr,
     mid_m_ptr,
@@ -787,7 +746,7 @@ def attn_decode_reduce_row1_kernel(
     SM_SCALE: gl.constexpr,
     SPLIT_FACTOR: gl.constexpr,
     BLOCK_M: gl.constexpr,
-    HEAD_SZ: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
     BLOCK_N: gl.constexpr,
 ):
     # Decode specialization for one query token per request.
@@ -796,13 +755,13 @@ def attn_decode_reduce_row1_kernel(
 
     NUM_BUFFERS: gl.constexpr = 1
     NUM_WARPS: gl.constexpr = 4
-    cfg = AttentionConfig(HEAD_SZ, BLOCK_M, BLOCK_N, NUM_BUFFERS, NUM_WARPS)
+    cfg = AttentionConfig(HEAD_DIM, BLOCK_M, BLOCK_N, NUM_BUFFERS, NUM_WARPS)
     head_layout: gl.constexpr = gl.SliceLayout(0, cfg.pv_layout)
 
-    offs_n = gl.arange(0, HEAD_SZ, layout=head_layout)
+    offs_n = gl.arange(0, HEAD_DIM, layout=head_layout)
     m_global = -float("inf")
     l_global = 0.0
-    acc_global = gl.zeros([HEAD_SZ], dtype=gl.float32, layout=head_layout)
+    acc_global = gl.zeros([HEAD_DIM], dtype=gl.float32, layout=head_layout)
 
     rcp_ln2 = 1.4426950408889634
 
@@ -845,21 +804,21 @@ def attn_decode_reduce_row1_kernel(
     gl.amd.gfx1250.buffer_store(out.to(out_ptr.dtype.element_ty), out_ptr, o_offs)
 
 
-def _launch_paged_gqa_decode_gfx1250(
-    config: _LaunchConfig,
-    q,
-    k_cache,
-    v_cache,
-    block_table,
-    cache_seqlens,
-    o,
-    sm_scale,
-):
+def _launch_mha_decode(
+    config: LaunchConfig,
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    output: torch.Tensor,
+    softmax_scale: float,
+) -> None:
     BATCH = config.batch_size
-    SEQLEN_K = config.seqlen_k
+    SEQLEN_K = config.max_seqlen_k
     NUM_Q_HEADS = config.num_q_heads
     NUM_K_HEADS = config.num_kv_heads
-    HEAD_SZ = config.head_dim
+    HEAD_DIM = config.head_dim
     BLOCK_M = config.block_m
     BLOCK_N = config.block_n
     pages_per_batch = (SEQLEN_K + BLOCK_N - 1) // BLOCK_N
@@ -873,7 +832,7 @@ def _launch_paged_gqa_decode_gfx1250(
     gqa_groups_per_k_head = (gqa_group_size + gqa_block_h - 1) // gqa_block_h
     num_gqa_head_groups = NUM_K_HEADS * gqa_groups_per_k_head
     decode_stage = config.decode_stage
-    split_factor = config.split_factor
+    split_factor = config.num_kv_splits
 
     chunk_size = (SEQLEN_K + split_factor - 1) // split_factor
     chunk_size = ((chunk_size + BLOCK_N - 1) // BLOCK_N) * BLOCK_N
@@ -881,21 +840,21 @@ def _launch_paged_gqa_decode_gfx1250(
     min_tiles_per_split = (last_chunk_size + BLOCK_N - 1) // BLOCK_N
 
     def launch_row1_reduce(src_o, src_l, src_m, src_split_factor):
-        attn_decode_reduce_row1_kernel[(BATCH, NUM_Q_HEADS, 1)](
+        _mha_decode_reduce[(BATCH, NUM_Q_HEADS, 1)](
             src_o,
             src_l,
             src_m,
-            o,
+            output,
             *src_o.stride(),
             *src_l.stride(),
             *src_m.stride(),
-            o.stride(0),
-            o.stride(1),
-            o.stride(3),
-            sm_scale,
+            output.stride(0),
+            output.stride(1),
+            output.stride(3),
+            softmax_scale,
             src_split_factor,
             BLOCK_M,
-            HEAD_SZ,
+            HEAD_DIM,
             BLOCK_N,
             num_warps=4,
             waves_per_eu=1,
@@ -908,35 +867,35 @@ def _launch_paged_gqa_decode_gfx1250(
             raise RuntimeError(
                 "full-gqa-peeled-direct requires at least four K/V tiles"
             )
-        attn_decode_fwd_paged_pipeline_peeled_kernel[(BATCH, num_gqa_head_groups, 1)](
+        _mha_decode_peeled[(BATCH, num_gqa_head_groups, 1)](
             q,
             k_cache,
             v_cache,
-            block_table,
+            page_table,
             cache_seqlens,
-            o,
-            o,
-            o,
+            output,
+            output,
+            output,
             q.stride(0),
             q.stride(1),
             q.stride(3),
             *k_cache.stride(),
             *v_cache.stride(),
-            o.stride(0),
-            o.stride(1),
+            output.stride(0),
+            output.stride(1),
             0,
-            o.stride(3),
-            o.stride(0),
-            o.stride(1),
+            output.stride(3),
+            output.stride(0),
+            output.stride(1),
             0,
-            o.stride(0),
-            o.stride(1),
+            output.stride(0),
+            output.stride(1),
             0,
-            sm_scale,
+            softmax_scale,
             SEQLEN_K,
             BLOCK_M,
             BLOCK_N,
-            HEAD_SZ,
+            HEAD_DIM,
             gqa_group_size,
             1,
             gqa_block_h,
@@ -954,7 +913,7 @@ def _launch_paged_gqa_decode_gfx1250(
         return
 
     mid_o = torch.empty(
-        (BATCH, NUM_Q_HEADS, split_factor, HEAD_SZ),
+        (BATCH, NUM_Q_HEADS, split_factor, HEAD_DIM),
         dtype=torch.float32,
         device=q.device,
     )
@@ -974,13 +933,11 @@ def _launch_paged_gqa_decode_gfx1250(
             raise RuntimeError(
                 "full-gqa-peeled requires at least four K/V tiles per split"
             )
-        attn_decode_fwd_paged_pipeline_peeled_kernel[
-            (BATCH, num_gqa_head_groups, split_factor)
-        ](
+        _mha_decode_peeled[(BATCH, num_gqa_head_groups, split_factor)](
             q,
             k_cache,
             v_cache,
-            block_table,
+            page_table,
             cache_seqlens,
             mid_o,
             mid_l,
@@ -993,11 +950,11 @@ def _launch_paged_gqa_decode_gfx1250(
             *mid_o.stride(),
             *mid_l.stride(),
             *mid_m.stride(),
-            sm_scale,
+            softmax_scale,
             SEQLEN_K,
             BLOCK_M,
             BLOCK_N,
-            HEAD_SZ,
+            HEAD_DIM,
             gqa_group_size,
             split_factor,
             gqa_block_h,
@@ -1013,11 +970,11 @@ def _launch_paged_gqa_decode_gfx1250(
             waves_per_eu=1,
         )
     else:
-        attn_decode_fwd_paged_gqa_kernel[(BATCH, num_gqa_head_groups, split_factor)](
+        _mha_decode[(BATCH, num_gqa_head_groups, split_factor)](
             q,
             k_cache,
             v_cache,
-            block_table,
+            page_table,
             cache_seqlens,
             mid_o,
             mid_l,
@@ -1030,11 +987,11 @@ def _launch_paged_gqa_decode_gfx1250(
             *mid_o.stride(),
             *mid_l.stride(),
             *mid_m.stride(),
-            sm_scale,
+            softmax_scale,
             SEQLEN_K,
             BLOCK_M,
             BLOCK_N,
-            HEAD_SZ,
+            HEAD_DIM,
             gqa_group_size,
             gqa_block_h,
             gqa_groups_per_k_head,
@@ -1050,11 +1007,69 @@ def _launch_paged_gqa_decode_gfx1250(
     launch_row1_reduce(mid_o, mid_l, mid_m, split_factor)
 
 
-def _get_launch_config(
+class LaunchConfig(NamedTuple):
+    batch_size: int
+    max_seqlen_k: int
+    num_q_heads: int
+    num_kv_heads: int
+    head_dim: int
+    block_m: int
+    block_n: int
+    decode_stage: str
+    num_kv_splits: int
+    gqa_block_h: int
+    num_warps: int
+    cache_modifier: str
+    hot_wait_count: int
+    skip_final_wait: bool
+
+
+def _compute_split_factor(
+    batch: int,
+    num_head_groups: int,
+    max_seqlen_k: int,
+    block_n: int,
+) -> int:
+    target_total_workgroups = 1024
+    tasks = batch * num_head_groups
+    if tasks == 0:
+        return 1
+    ideal_split = target_total_workgroups // tasks
+    num_tiles = math.ceil(max_seqlen_k / block_n)
+
+    split_factor = max(min(ideal_split, num_tiles), 1)
+    while split_factor > 1:
+        tiles_per_split = math.ceil(num_tiles / split_factor)
+        if (split_factor - 1) * tiles_per_split < num_tiles:
+            break
+        split_factor -= 1
+    return split_factor
+
+
+def _compute_peeled_split_factor(
+    batch: int,
+    num_head_groups: int,
+    max_seqlen_k: int,
+    block_n: int,
+) -> int:
+    split_factor = _compute_split_factor(batch, num_head_groups, max_seqlen_k, block_n)
+    num_tiles = math.ceil(max_seqlen_k / block_n)
+    split_factor = min(split_factor, max(num_tiles // 4, 1))
+    while split_factor > 1:
+        tiles_per_split = math.ceil(num_tiles / split_factor)
+        last_split_tiles = num_tiles - (split_factor - 1) * tiles_per_split
+        if last_split_tiles >= 4:
+            break
+        split_factor -= 1
+    return split_factor
+
+
+def get_config(
+    *,
     q: torch.Tensor,
     k_cache: torch.Tensor,
     max_seqlen_k: int,
-) -> _LaunchConfig:
+) -> LaunchConfig:
     batch_size, num_q_heads, head_dim = q.shape
     page_size = k_cache.shape[1]
     num_kv_heads = k_cache.shape[2]
@@ -1085,16 +1100,16 @@ def _get_launch_config(
                 batch_size, num_head_groups, max_seqlen_k, block_n
             )
 
-    return _LaunchConfig(
+    return LaunchConfig(
         batch_size=batch_size,
-        seqlen_k=max_seqlen_k,
+        max_seqlen_k=max_seqlen_k,
         num_q_heads=num_q_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         block_m=block_m,
         block_n=block_n,
         decode_stage=decode_stage,
-        split_factor=split_factor,
+        num_kv_splits=split_factor,
         gqa_block_h=gqa_block_h,
         num_warps=8,
         cache_modifier=".cs",
@@ -1103,7 +1118,7 @@ def _get_launch_config(
     )
 
 
-def gluon_paged_gqa_decode_gfx1250(
+def gluon_mha_decode_gfx1250(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -1196,7 +1211,7 @@ def gluon_paged_gqa_decode_gfx1250(
     page_table = page_table[:, :pages_per_sequence].contiguous()
     cache_seqlens = cache_seqlens.contiguous()
 
-    config = _get_launch_config(q, k_cache, max_seqlen_k)
+    config = get_config(q=q, k_cache=k_cache, max_seqlen_k=max_seqlen_k)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
 
@@ -1204,7 +1219,7 @@ def gluon_paged_gqa_decode_gfx1250(
     output = torch.empty(q_4d.shape, dtype=q.dtype, device=q.device)
     k_cache_tdm = k_cache.permute(0, 2, 1, 3)
     v_cache_tdm = v_cache.permute(0, 2, 1, 3)
-    _launch_paged_gqa_decode_gfx1250(
+    _launch_mha_decode(
         config,
         q_4d,
         k_cache_tdm,
