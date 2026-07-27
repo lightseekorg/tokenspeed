@@ -55,15 +55,6 @@ Start with the recipe closest to your model family, then tune:
 - `--all2all-backend`
 - `--deepep-mode`
 
-Qwen3.5 NVFP4 uses DeepEP only with
-`--moe-backend flashinfer_cutedsl --all2all-backend deepep`. When MTP uses a
-different draft MoE backend, the draft experts use their regular EP
-communication path instead of inheriting the target model's DeepEP backend.
-Its dense-TP shared experts follow the enclosing MoE layer's row layout: when
-the routed-expert layout is scattered, they gather and reduce-scatter token
-rows even if attention TP and dense TP have the same size. This lets attention
-DP ranks use different local batch sizes without mismatched collectives.
-
 ## Multi-Node
 
 Set these explicitly:
