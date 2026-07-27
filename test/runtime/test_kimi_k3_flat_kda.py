@@ -20,12 +20,21 @@ from __future__ import annotations
 
 import os
 import sys
+from importlib.util import find_spec
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 from tokenspeed_kernel.platform import current_platform
+
+# The chunked-prefill KDA path resolves to the flash-linear-attention ("fla")
+# solution, an optional reference dependency not installed in CI. Tests that
+# exercise it skip when it is absent (mirrors the kernel-level KDA tests).
+requires_fla = pytest.mark.skipif(
+    find_spec("fla") is None,
+    reason="flash-linear-attention (fla) required for the KDA prefill kernel",
+)
 
 # CI Registration (parsed via AST, runtime no-op)
 # ``test/`` (for ``ci_system``) and the repo root (for ``test.runtime.*``
@@ -525,6 +534,7 @@ def _assert_close(actual, expected, what, mean_tol=2e-3, atol=1e-1, rtol=1e-2):
 
 
 @requires_cuda
+@requires_fla
 def test_kda_three_groups_zero_state_same_page_and_crossing() -> None:
     """Prefill from zero state, same-page decode, boundary-crossing decode,
     per-group table independence — vs naive fp32 recurrence AND FLA."""
@@ -633,6 +643,7 @@ def test_kda_three_groups_zero_state_same_page_and_crossing() -> None:
 
 
 @requires_cuda
+@requires_fla
 def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
     """Prefix hit at a P boundary: the shared snapshot page is read-only for
     both branches (CoW), and batched decode keeps requests isolated."""
