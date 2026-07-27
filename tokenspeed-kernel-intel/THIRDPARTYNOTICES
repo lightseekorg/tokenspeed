@@ -1,0 +1,19 @@
+TokenSpeed Intel XPU kernels — Third-Party Notices
+===================================================
+
+This package dispatches to third-party kernels provided by:
+
+vllm-xpu-kernels
+  https://github.com/vllm-project/vllm-xpu-kernels
+  License: Apache License 2.0
+  Copyright (c) the vLLM project contributors.
+
+  The Intel XPU kernels (SYCL/DPC++ and oneDNN based) are authored and
+  distributed by the vLLM project. TokenSpeed only wraps their public
+  interfaces behind the TokenSpeed kernel registry; no source is vendored
+  here. See the upstream repository for full license text and notices.
+
+oneDNN
+  https://github.com/oneapi-src/oneDNN
+  License: Apache License 2.0
+  Used transitively by vllm-xpu-kernels for deep-learning primitives.

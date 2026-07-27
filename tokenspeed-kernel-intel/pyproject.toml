@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=69.5.1", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tokenspeed-kernel-intel"
+version = "0.0.1"
+description = "TokenSpeed Intel XPU-specific high-performance kernels."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+# Intel XPU kernels are provided by vllm-xpu-kernels (SYCL/DPC++ + oneDNN).
+# Pinned to v0.1.7, which targets PyTorch 2.11 (matching the TokenSpeed XPU
+# bring-up torch==2.11.0+xpu). torch itself comes from the XPU base image and
+# is intentionally not pinned here to avoid clobbering the platform torch-xpu.
+dependencies = [
+    "vllm-xpu-kernels==0.1.7",
+]
+
+[project.urls]
+Homepage = "https://github.com/lightseekorg/tokenspeed/tokenspeed-kernel-intel"
+Repository = "https://github.com/lightseekorg/tokenspeed/tokenspeed-kernel-intel"
+
+[tool.setuptools]
+license-files = ["LICENSE", "THIRDPARTYNOTICES"]
+
+[tool.setuptools.packages.find]
+where = ["python"]

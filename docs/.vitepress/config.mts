@@ -57,6 +57,19 @@ export default defineConfig({
       {
         text: "Serving",
         items: [{ text: "Parallelism", link: "/serving/parallelism" }]
+      },
+      {
+        text: "Evaluation",
+        items: [
+          {
+            text: "TokenSpeed vs vLLM on Intel GPU",
+            link: "/evaluation/tokenspeed-vllm-intel"
+          },
+          {
+            text: "Technical Sharing Outline",
+            link: "/evaluation/tokenspeed-sharing-outline"
+          }
+        ]
       }
     ],
     search: {

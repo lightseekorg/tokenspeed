@@ -52,6 +52,15 @@ from tokenspeed_kernel.signature import (
     tensor_format,
 )
 
+# Intel XPU specialized kernels (optional out-of-tree package). Registers
+# vendors={"intel"} attention kernels at a higher priority than the portable
+# Triton path; a no-op on non-Intel platforms or when the package is absent.
+if current_platform().is_intel:
+    try:
+        import tokenspeed_kernel_intel.ops.attention  # noqa: F401
+    except ImportError:
+        pass
+
 AttentionResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]
 
 # One UE8M0 scale per 32 consecutive head_dim elements (MXFP8).

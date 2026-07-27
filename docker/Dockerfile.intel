@@ -40,6 +40,13 @@ RUN MAX_JOBS=${MAX_JOBS} \
     python3 -m pip install tokenspeed-kernel/python/ --no-build-isolation && \
     python3 -m pip install tokenspeed-scheduler/ \
         --config-settings=cmake.define.TOKENSPEED_FLAT_KVCACHE=ON && \
-    python3 -m pip install ./python --no-build-isolation
+    python3 -m pip install ./python --no-deps --no-build-isolation
+
+# Optional: Intel XPU-specialized kernels (vllm-xpu-kernels backend, SYCL/oneDNN).
+# Requires the oneAPI toolchain in the base image. When present, the selector
+# prefers these over the portable Triton path on Intel XPU. Skipped gracefully
+# at runtime if the wheel/toolchain is unavailable.
+RUN python3 -m pip install ./tokenspeed-kernel-intel --no-build-isolation || \
+    echo "tokenspeed-kernel-intel not installed; falling back to Triton kernels."
 
 CMD ["/bin/bash"]
