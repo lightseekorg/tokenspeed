@@ -26,18 +26,17 @@ import math
 from collections import defaultdict
 from dataclasses import dataclass
 
+# Planner/runtime limits, not model layout inputs.
+_MAX_LCM_BLOCK_BYTES = (1 << 63) - 1
+_MAX_KERNEL_PAGE_ID = (1 << 31) - 1
+_MAX_PACKING = 128
+
 
 @dataclass(frozen=True)
 class LcmGroupLayout:
     group_id: str
-    raw_cache_block_bytes: int
-    slot_stride_bytes: int
     cache_blocks_per_lcm_block: int
     page_count: int
-
-    @property
-    def padding_bytes_per_slot(self) -> int:
-        return self.slot_stride_bytes - self.raw_cache_block_bytes
 
 
 @dataclass(frozen=True)
@@ -70,9 +69,12 @@ class LcmFieldLayout:
     plane_id: str
     shape: tuple[int, ...]
     element_size: int
-    payload_bytes: int
     field_offset_bytes: int
     page_stride_bytes: int
+
+    @property
+    def payload_bytes(self) -> int:
+        return math.prod(self.shape) * self.element_size
 
 
 @dataclass(frozen=True)
@@ -85,10 +87,13 @@ class LcmMemoryPlan:
     logical_block_tokens: int
     lcm_block_bytes: int
     num_lcm_blocks: int
-    arena_bytes: int
     groups: tuple[LcmGroupLayout, ...]
     planes: tuple[LcmPlaneLayout, ...] = ()
     fields: tuple[LcmFieldLayout, ...] = ()
+
+    @property
+    def arena_bytes(self) -> int:
+        return (self.num_lcm_blocks + 1) * self.lcm_block_bytes
 
     def group(self, group_id: str) -> LcmGroupLayout:
         for group in self.groups:
@@ -113,7 +118,7 @@ def _align_up(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
-def _solve_packing(fields, *, max_packing):
+def _solve_packing(fields):
     """Derive per-group cache blocks per LCM block from exact field ratios."""
     exact_by_plane: dict[str, dict[str, int]] = {}
     groups = set()
@@ -174,7 +179,7 @@ def _solve_packing(fields, *, max_packing):
             {group_id: count // smallest for group_id, count in counts.items()}
         )
 
-    if any(count > max_packing for count in packing.values()):
+    if any(count > _MAX_PACKING for count in packing.values()):
         return None
     return packing
 
@@ -217,10 +222,7 @@ def plan_lcm_fields(
     logical_block_tokens,
     budget_bytes,
     alignment=1,
-    max_lcm_block_bytes=(1 << 63) - 1,
-    max_kernel_page_id=(1 << 31) - 1,
     max_padding_fraction=0.25,
-    max_packing=128,
 ):
     """Plan a plane-major arena whose fields overlay across cache groups."""
     if logical_block_tokens <= 0:
@@ -229,12 +231,8 @@ def plan_lcm_fields(
         raise ValueError("budget_bytes must be >= 0")
     if alignment <= 0:
         raise ValueError("alignment must be > 0")
-    if max_lcm_block_bytes <= 0:
-        raise ValueError("max_lcm_block_bytes must be > 0")
     if max_padding_fraction < 0:
         raise ValueError("max_padding_fraction must be >= 0")
-    if max_packing <= 0:
-        raise ValueError("max_packing must be > 0")
 
     ordered_fields = tuple(
         sorted(
@@ -265,7 +263,7 @@ def plan_lcm_fields(
 
     ordered_group_ids = tuple(sorted(raw_by_group))
     packing = _packing_by_group_ratio(raw_by_group)
-    constrained = _solve_packing(ordered_fields, max_packing=max_packing)
+    constrained = _solve_packing(ordered_fields)
     if constrained is not None:
         packing.update(constrained)
 
@@ -322,7 +320,7 @@ def plan_lcm_fields(
             if not all(plane_id in fixed_plane_bytes for plane_id in occupied_planes):
                 continue
             upper = min(
-                max_packing,
+                _MAX_PACKING,
                 *(
                     fixed_plane_bytes[plane_id] // payload_bytes
                     for plane_id, payload_bytes in occupied_planes.items()
@@ -364,10 +362,10 @@ def plan_lcm_fields(
                 plane_alignment = (
                     plane_alignment // math.gcd(plane_alignment, required) * required
                 )
-                if plane_alignment > max_lcm_block_bytes:
+                if plane_alignment > _MAX_LCM_BLOCK_BYTES:
                     raise ValueError(
                         f"LCM block size alignment {plane_alignment} exceeds "
-                        f"limit {max_lcm_block_bytes}"
+                        f"limit {_MAX_LCM_BLOCK_BYTES}"
                     )
         plane_bytes[plane_id] = _align_up(required_bytes, plane_alignment)
 
@@ -377,9 +375,9 @@ def plan_lcm_fields(
     for count in packing.values():
         parent_alignment = parent_alignment // math.gcd(parent_alignment, count) * count
     lcm_block_bytes = _align_up(sum(plane_bytes.values()), parent_alignment)
-    if lcm_block_bytes > max_lcm_block_bytes:
+    if lcm_block_bytes > _MAX_LCM_BLOCK_BYTES:
         raise ValueError(
-            f"LCM block size {lcm_block_bytes} exceeds limit {max_lcm_block_bytes}"
+            f"LCM block size {lcm_block_bytes} exceeds limit {_MAX_LCM_BLOCK_BYTES}"
         )
 
     # Parent 0 backs kernel page 0 and is never schedulable.
@@ -402,16 +400,14 @@ def plan_lcm_fields(
                 f"cache group {group_id!r}: padding fraction "
                 f"{padding_fraction:.6f} exceeds limit {max_padding_fraction:.6f}"
             )
-        if num_lcm_blocks * count > max_kernel_page_id:
+        if num_lcm_blocks * count > _MAX_KERNEL_PAGE_ID:
             raise ValueError(
                 f"cache group {group_id!r}: kernel page id exceeds "
-                f"{max_kernel_page_id}"
+                f"{_MAX_KERNEL_PAGE_ID}"
             )
         groups.append(
             LcmGroupLayout(
                 group_id=group_id,
-                raw_cache_block_bytes=raw_by_group[group_id],
-                slot_stride_bytes=stride,
                 cache_blocks_per_lcm_block=count,
                 page_count=1 + num_lcm_blocks * count,
             )
@@ -433,7 +429,6 @@ def plan_lcm_fields(
                 plane_id=field.plane_id,
                 shape=field.shape,
                 element_size=field.element_size,
-                payload_bytes=field.payload_bytes,
                 field_offset_bytes=field_offsets[field.field_id],
                 page_stride_bytes=plane_bytes[field.plane_id]
                 // packing[field.group_id],
@@ -444,7 +439,6 @@ def plan_lcm_fields(
         logical_block_tokens=logical_block_tokens,
         lcm_block_bytes=lcm_block_bytes,
         num_lcm_blocks=num_lcm_blocks,
-        arena_bytes=(num_lcm_blocks + 1) * lcm_block_bytes,
         groups=tuple(groups),
         planes=tuple(planes),
         fields=tuple(field_layouts),

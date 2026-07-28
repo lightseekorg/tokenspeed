@@ -177,7 +177,6 @@ TEST(ForwardCacheOpsPrefill, ChunkAcquiresAndCachesFullBlocks) {
                              GroupDemand{
                                  .num_tokens = 4,
                                  .page_hashes = hashes2,
-                                 .completed_end_tokens = 4,
                                  .num_computed_tokens = 4,
                              }));
     EXPECT_EQ(tables[0].NumBlocks(), 4);
@@ -207,7 +206,6 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowAndKeepsPunchedPageHashes) {
                              GroupDemand{
                                  .num_tokens = 4,
                                  .page_hashes = hashes,
-                                 .completed_end_tokens = 8,
                                  .num_computed_tokens = 8,
                              }));
 
@@ -256,7 +254,6 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowBeforeAcquire) {
                              GroupDemand{
                                  .num_tokens = 1,
                                  .page_hashes = hashes,
-                                 .completed_end_tokens = 12,
                                  .num_computed_tokens = 12,
                              }));
 

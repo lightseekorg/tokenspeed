@@ -437,7 +437,7 @@ TEST(KvCacheCoordinatorAdmissionTest, LaterChunksReuseRequestAccessEpoch) {
             .num_tokens = 8,
             .page_hashes = std::span<const std::string>(hashes).first(2),
             .first_new_page_slot = 0,
-            .completed_end_tokens = 8,
+            .num_computed_tokens = 8,
         },
     };
     const std::optional<KvCacheCoordinator::AdmissionResult> second =
@@ -450,7 +450,7 @@ TEST(KvCacheCoordinatorAdmissionTest, LaterChunksReuseRequestAccessEpoch) {
             .table = &tables[0],
             .page_hashes = hashes,
             .first_new_page_slot = 2,
-            .completed_end_tokens = 16,
+            .num_computed_tokens = 16,
         },
     };
     const std::optional<KvCacheCoordinator::AdmissionResult> final =
@@ -1106,7 +1106,6 @@ TEST(KvCacheCoordinatorAdmissionTest, QwenScaleChunkLifecyclePublishesOneStateSn
                 .num_tokens = kChunkPages * kBlockTokens,
                 .page_hashes = std::span<const std::string>{hashes}.first(first_page),
                 .first_new_page_slot = std::max(first_page - kChunkPages, 0),
-                .completed_end_tokens = first_page * kBlockTokens,
                 .boundary_kind = CacheBoundaryKind::kChunk,
                 .num_computed_tokens = first_page * kBlockTokens,
                 .reserve_tokens = chunk == kPromptPages / kChunkPages - 1 ? 1 : 0,
@@ -1126,7 +1125,6 @@ TEST(KvCacheCoordinatorAdmissionTest, QwenScaleChunkLifecyclePublishesOneStateSn
             .num_tokens = 1,
             .page_hashes = hashes,
             .first_new_page_slot = kPromptPages - kChunkPages,
-            .completed_end_tokens = kPromptPages * kBlockTokens,
             .boundary_kind = CacheBoundaryKind::kEndpoint,
             .num_computed_tokens = kPromptPages * kBlockTokens,
         });
@@ -1251,7 +1249,6 @@ TEST(KvCacheCoordinatorAdmissionTest, EvictsProspectiveVictimCachedDuringCommit)
             .num_tokens = 4,
             .page_hashes = hashes,
             .first_new_page_slot = 0,
-            .completed_end_tokens = 8,
             .num_computed_tokens = 8,
         },
     };
@@ -2655,8 +2652,8 @@ TEST(MambaStateRegistrationTest, MambaPublishesOnlyChunkBoundary) {
             .table = &table,
             .page_hashes = ch,
             .first_new_page_slot = 0,
-            .completed_end_tokens = 12,
             .boundary_kind = CacheBoundaryKind::kChunk,
+            .num_computed_tokens = 12,
         });
     }
     ASSERT_TRUE(coord.Admit(coord.ProbePrefix({}), demands));
@@ -2680,8 +2677,8 @@ TEST(MambaStateRegistrationTest, MambaPublishesAlignedEndpoint) {
         .table = &tables[0],
         .page_hashes = ch,
         .first_new_page_slot = 0,
-        .completed_end_tokens = 12,
         .boundary_kind = CacheBoundaryKind::kEndpoint,
+        .num_computed_tokens = 12,
     }};
     ASSERT_TRUE(coord.Admit(coord.ProbePrefix({}), demands));
     EXPECT_FALSE(coord.GroupManager(0).ContainsCachedBlock(pool, Key(ch[0], 0)));
@@ -2706,8 +2703,8 @@ TEST(MambaStateRegistrationTest, MambaPublishesNoUnalignedBoundary) {
         .table = &tables[0],
         .page_hashes = ch,
         .first_new_page_slot = 0,
-        .completed_end_tokens = 10,
         .boundary_kind = CacheBoundaryKind::kEndpoint,
+        .num_computed_tokens = 10,
     }};
     ASSERT_TRUE(coord.Admit(coord.ProbePrefix({}), demands));
     EXPECT_EQ(coord.GroupManager(0).NumCachedBlocks(pool), 0);
@@ -2727,8 +2724,8 @@ TEST(SwaRegistrationTest, SwaBoundaryRequiresTrailingWindow) {
         .page_hashes = ch,
         // Only page 3 is new; the two-page resume tail crosses the prior chunk.
         .first_new_page_slot = 3,
-        .completed_end_tokens = 16,
         .boundary_kind = CacheBoundaryKind::kChunk,
+        .num_computed_tokens = 16,
     }};
     ASSERT_TRUE(coord.Admit(coord.ProbePrefix({}), demands));
     EXPECT_FALSE(coord.GroupManager(0).ContainsCachedBlock(pool, Key(ch[0], 0)));

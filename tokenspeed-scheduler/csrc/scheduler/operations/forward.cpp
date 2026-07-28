@@ -496,7 +496,6 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
                                           .num_tokens = tokens_this_round,
                                           .page_hashes = flat_cache_progress.page_hashes,
                                           .first_new_page_slot = first_new_page_slot,
-                                          .completed_end_tokens = flat_num_computed,
                                           .boundary_kind = completedBoundaryKind(
                                               flat_num_computed, request->PrefillSize(),
                                               flat_cache_progress.promotion_boundary_tokens),
@@ -579,7 +578,6 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
                                               .num_tokens = reserve_tokens,
                                               .page_hashes = flat_cache_progress.page_hashes,
                                               .first_new_page_slot = first_new_page_slot,
-                                              .completed_end_tokens = num_computed_tokens,
                                               .boundary_kind = completedBoundaryKind(
                                                   num_computed_tokens, request->PrefillSize(),
                                                   flat_cache_progress.promotion_boundary_tokens),

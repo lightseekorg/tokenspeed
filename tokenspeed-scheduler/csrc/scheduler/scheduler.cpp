@@ -252,9 +252,9 @@ std::size_t Scheduler::RetractedSize() const {
 std::size_t Scheduler::AvailableKvPages() const {
 #if TOKENSPEED_FLAT_KVCACHE
     // The flat path never draws from the radix device_allocator_, so reporting it would show a
-    // permanently-full pool to Python monitoring. Report the flat BlockPool instead: one flat
-    // block is one pool row, interpreted at each group's own block_size. Block 0 is the
-    // never-allocated null placeholder, so an idle pool reports total_pages - 1.
+    // permanently-full pool to Python monitoring. Report available LCM parents from the flat
+    // BlockPool instead. Parent 0 is the never-allocated null placeholder, so an idle pool
+    // reports total parents minus one.
     return static_cast<std::size_t>(coordinator_.NumAvailableLcmBlocks());
 #else
     return device_allocator_.AvailablePages();

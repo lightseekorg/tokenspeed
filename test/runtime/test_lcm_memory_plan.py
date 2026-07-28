@@ -108,6 +108,32 @@ class LcmMemoryPlanTest(unittest.TestCase):
             8,
         )
 
+    def test_layout_constructors_derive_sizes_from_geometry(self):
+        group = self.plan_module.LcmGroupLayout(
+            group_id="history",
+            cache_blocks_per_lcm_block=4,
+            page_count=17,
+        )
+        field = self.plan_module.LcmFieldLayout(
+            group_id="history",
+            field_id="history.k",
+            plane_id="plane.a",
+            shape=(8, 16),
+            element_size=2,
+            field_offset_bytes=0,
+            page_stride_bytes=256,
+        )
+        plan = self.plan_module.LcmMemoryPlan(
+            logical_block_tokens=128,
+            lcm_block_bytes=1024,
+            num_lcm_blocks=4,
+            groups=(group,),
+            fields=(field,),
+        )
+
+        self.assertEqual(field.payload_bytes, 256)
+        self.assertEqual(plan.arena_bytes, 5120)
+
     def test_duplicate_field_ids_are_rejected(self):
         field = self.plan_module.LcmFieldSpec
         fields = (

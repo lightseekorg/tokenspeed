@@ -259,11 +259,11 @@ void KvCacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, c
                                 demand.first_new_page_slot, access_epoch, demand.boundary_kind);
         return;
     }
-    if (demand.completed_end_tokens < 0 || demand.completed_end_tokens % cache_block_tokens_ != 0) {
+    if (demand.num_computed_tokens < 0 || demand.num_computed_tokens % cache_block_tokens_ != 0) {
         return;
     }
 
-    const std::int32_t boundary_slot = demand.completed_end_tokens / cache_block_tokens_;
+    const std::int32_t boundary_slot = demand.num_computed_tokens / cache_block_tokens_;
     _assert(boundary_slot == static_cast<std::int32_t>(demand.page_hashes.size()),
             "non-closed boundary must end at the hash history tail");
     const std::int32_t lookback = std::min(manager.BoundaryLookbackBlocks(), boundary_slot);
