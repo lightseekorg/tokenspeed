@@ -62,6 +62,7 @@ from tokenspeed.runtime.layers.attention.backends.mha import (
     _scrub_extend_padding,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed.runtime.utils.common import maybe_inference_mode
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 logger = get_colorful_logger(__name__)
@@ -1223,7 +1224,10 @@ class InklingAttnBackend(AttentionBackend):
         state[:, idx] = torch.where(
             from_old, old.gather(2, rows_old), chunk.gather(2, rows_new)
         )
-        self._publish_accepted_shortconv_checkpoints(accept_lengths[:n])
+        # LCM field views may be inference tensors allocated during executor
+        # initialization, while this post-verify hook runs outside the forward.
+        with maybe_inference_mode():
+            self._publish_accepted_shortconv_checkpoints(accept_lengths[:n])
 
     def _cached_arange_w1(self, w1: int, device) -> torch.Tensor:
         buf = getattr(self, "_arange_w1_buf", None)

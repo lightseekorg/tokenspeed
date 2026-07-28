@@ -225,13 +225,17 @@ class TestInklingConvSpecState(unittest.TestCase):
             col_page_table={"state": table},
             col_seq_lens=torch.full((3,), 8, dtype=torch.int32, device="cuda"),
         )
-        checkpoint = torch.full(
-            (40, self.W - 1, self.DIM),
-            -7,
-            dtype=pool.conv_state.dtype,
-            device="cuda",
-        )
-        checkpoint[0].zero_()
+        # LCM checkpoint views are backed by tensors allocated while the model
+        # executor is in inference mode. The post-verify hook runs afterward,
+        # outside that context.
+        with torch.inference_mode():
+            checkpoint = torch.full(
+                (40, self.W - 1, self.DIM),
+                -7,
+                dtype=pool.conv_state.dtype,
+                device="cuda",
+            )
+            checkpoint[0].zero_()
         backend._checkpoint_streams = {(0, 0, self.DIM, "state"): (checkpoint,)}
 
         accept = torch.tensor([4, 3, 0], dtype=torch.int32, device="cuda")
