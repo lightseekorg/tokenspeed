@@ -229,41 +229,22 @@ def test_attnres_combine_matches_ipc_backend():
         torch.testing.assert_close(a, b, atol=1e-3, rtol=1e-3)
 
 
-def test_latent_norm_matches_ipc_backend():
+def test_latent_norm_stays_on_ipc_workspace():
+    """kAllReduceLatentNorm is deliberately NOT served by the mnnvl kernel:
+    the cluster geometry loses on the wide [latent|hidden] lane (measured
+    8.60us vs 6.64 on 8x B300), so supports() must route it to the IPC
+    lamport workspace."""
     from tokenspeed_kernel.thirdparty.cuda.trtllm import AllReduceFusionPattern
 
     ws = _skip_unless_mnnvl()
-    rank, dev = ws["rank"], ws["dev"]
-    token_num, lane_dim = 2, L + H
-    torch.manual_seed(400 + rank)
-    torch.manual_seed(7)
-    gamma = torch.randn(L, dtype=torch.bfloat16, device=dev).contiguous()
-
-    results = {}
-    for label in ("ipc", "mnnvl"):
-        torch.manual_seed(400 + rank)
-        lane = (
-            torch.randn(token_num, lane_dim, dtype=torch.bfloat16, device=dev) * 0.1
-        ).contiguous()
-        _run_ar(
-            ws[label],
-            lane,
-            lane,
-            dict(
-                pattern_code=AllReduceFusionPattern.kAllReduceLatentNorm,
-                allreduce_out=lane,
-                rms_gamma=gamma,
-                rms_eps=EPS,
-                latent_width=L,
-            ),
-            token_num,
-            lane_dim,
-        )
-        torch.cuda.synchronize()
-        results[label] = lane
-        dist.barrier()
-
-    torch.testing.assert_close(results["ipc"], results["mnnvl"], atol=1e-3, rtol=1e-3)
+    assert not ws["mnnvl"].supports(
+        2,
+        L + H,
+        torch.bfloat16,
+        ws["world"],
+        AllReduceFusionPattern.kAllReduceLatentNorm,
+        use_oneshot=True,
+    )
 
 
 def test_graph_replay_self_reset():
