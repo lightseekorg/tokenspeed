@@ -409,7 +409,12 @@ class Qwen3_5MoeForConditionalGenerationNextN(Qwen3_5ForConditionalGenerationNex
         )
 
 
+class Qwen3_5MoeForCausalLMNextN(Qwen3_5MoeForConditionalGenerationNextN):
+    """MTP draft head for text-only flat checkpoints."""
+
+
 EntryClass = [
     Qwen3_5ForConditionalGenerationNextN,
     Qwen3_5MoeForConditionalGenerationNextN,
+    Qwen3_5MoeForCausalLMNextN,
 ]

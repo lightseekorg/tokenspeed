@@ -123,6 +123,8 @@ _HYBRID_GDN_ARCHITECTURES = {
     "Qwen3_5MoeForConditionalGenerationNextN",
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5ForConditionalGenerationNextN",
+    "Qwen3_5MoeForCausalLM",
+    "Qwen3_5MoeForCausalLMNextN",
 }
 
 # Hybrid linear-attention models whose full-attention layers are MLA (not MHA)

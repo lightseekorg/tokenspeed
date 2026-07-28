@@ -39,6 +39,7 @@ from tokenspeed_kernel.ops.layernorm.triton import (
 from tokenspeed.runtime.configs.paged_cache_spec import FULL_ATTENTION
 from tokenspeed.runtime.configs.qwen3_5_config import (
     Qwen3_5Config,
+    Qwen3_5MoeConfig,
     Qwen3_5TextConfig,
 )
 from tokenspeed.runtime.configs.utils import get_rope_parameters
@@ -1132,7 +1133,10 @@ class Qwen3_5ForCausalLM(nn.Module):
         return loaded_params
 
 
-class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
+class Qwen3_5MoeModel(Qwen3_5ForCausalLM):
+    """MoE backbone (internal). The ``Qwen3_5MoeForCausalLM`` name is taken by
+    the registry entry class for text-only flat checkpoints below."""
+
     def __init__(
         self,
         config: Qwen3_5TextConfig,
@@ -1585,7 +1589,7 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
 class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
     """Qwen3.5 MoE Vision-Language Model."""
 
-    model_cls = Qwen3_5MoeForCausalLM
+    model_cls = Qwen3_5MoeModel
 
     def __init__(
         self,
@@ -1722,6 +1726,43 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             num_layers=text_config.num_hidden_layers,
             num_logical_experts=text_config.num_experts,
             num_groups=None,
+        )
+
+
+class Qwen3_5MoeForCausalLM(Qwen3_5MoeForConditionalGeneration):
+    """Text-only Qwen3.5-MoE entry."""
+
+    def __init__(
+        self,
+        config,
+        mapping: Mapping,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        if not hasattr(config, "text_config"):
+            archs = list(getattr(config, "architectures", None) or [])
+            config = Qwen3_5MoeConfig(text_config=config)
+            config.__dict__["architectures"] = archs or ["Qwen3_5MoeForCausalLM"]
+        super().__init__(
+            config=config,
+            mapping=mapping,
+            quant_config=quant_config,
+            prefix=prefix,
+            is_multimodal_active=False,
+        )
+
+    def resolve_model(
+        self,
+        config,
+        mapping: Mapping,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ):
+        return self.model_cls(
+            config=config,
+            mapping=mapping,
+            quant_config=quant_config,
+            prefix=add_prefix("model", prefix), # no ``model.language_model`` scope
         )
 
 
@@ -1881,4 +1922,8 @@ def fused_qkvzba_split_reshape_cat_contiguous(
     return mixed_qkv, z, b, a
 
 
-EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]
+EntryClass = [
+    Qwen3_5MoeForConditionalGeneration,
+    Qwen3_5ForConditionalGeneration,
+    Qwen3_5MoeForCausalLM,
+]
