@@ -195,6 +195,7 @@ def triton_nvidia_kda_fused_paged_decode(
     head_dim: int,
     cu_seqlens: torch.Tensor,
     lower_bound: float | None,
+    enable_pdl: bool = False,
 ) -> torch.Tensor:
     """Adapt dev's NVIDIA conv/GEMV/recurrent megafusion."""
     from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
@@ -217,6 +218,7 @@ def triton_nvidia_kda_fused_paged_decode(
         head_dim=head_dim,
         cu_seqlens=cu_seqlens,
         lower_bound=lower_bound,
+        enable_pdl=enable_pdl,
     ).view(1, -1, num_heads, head_dim)
 
 

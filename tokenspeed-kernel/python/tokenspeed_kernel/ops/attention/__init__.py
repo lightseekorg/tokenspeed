@@ -910,6 +910,7 @@ def try_kda_fused_paged_decode(
     head_dim: int,
     cu_seqlens: torch.Tensor,
     lower_bound: float | None = -5.0,
+    enable_pdl: bool = False,
     override: str | None = None,
     solution: str | None = None,
 ) -> torch.Tensor | None:
@@ -917,6 +918,8 @@ def try_kda_fused_paged_decode(
 
     Returns ``None`` only when no implementation supports the current
     platform. Invalid inputs and execution failures remain visible.
+    ``enable_pdl`` chains the fused kernel after its same-stream producer
+    (the packed qkv GEMV) via programmatic dependent launch.
     """
     signature = _attention_format_signature(
         q=mixed_qkv,
@@ -950,6 +953,7 @@ def try_kda_fused_paged_decode(
         head_dim=head_dim,
         cu_seqlens=cu_seqlens,
         lower_bound=lower_bound,
+        enable_pdl=enable_pdl,
     )
 
 
