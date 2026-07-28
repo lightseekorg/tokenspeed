@@ -58,8 +58,8 @@ public:
         return AcquireMatchedBlocks(pool, keys, begin_blocks, Probe(pool, keys, begin_blocks, max_blocks),
                                     ++next_access_epoch_);
     }
-    void CacheBlock(BlockPool& pool, CacheBlockRef& block, const CacheKey& key) {
-        ::tokenspeed::SwaManager::CacheBlock(pool, block, key, ++next_access_epoch_);
+    void RegisterCachedBlock(BlockPool& pool, CacheBlockRef& block, const CacheKey& key) {
+        ::tokenspeed::SwaManager::RegisterCachedBlock(pool, block, key, ++next_access_epoch_);
     }
     void CacheFullBlocks(BlockPool& pool, BlockTable& table, std::span<const CacheKey> keys,
                          std::int32_t first_slot = 0) {
@@ -74,7 +74,7 @@ private:
 std::int32_t CacheOnePage(SwaManager& manager, BlockPool& pool, const CacheKey& key) {
     CacheBlockRef got = pool.AcquireBlock(manager.Id(), manager.CacheBlocksPerLcmBlock());
     const std::int32_t id = got->Location().lcm_block_id;
-    manager.CacheBlock(pool, got, key);
+    manager.RegisterCachedBlock(pool, got, key);
     got.reset();
     return id;
 }

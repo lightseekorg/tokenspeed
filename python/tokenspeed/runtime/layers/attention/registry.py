@@ -21,20 +21,17 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 from typing import TYPE_CHECKING
 
 import torch
 
-from tokenspeed.runtime.configs.flat_memory_plan import (
-    components_from_layers,
-    equalized_block_size,
-    hybrid_lcm_field_specs,
-    inkling_lcm_field_specs,
-    plan_component_tensors,
-    plan_lcm_fields,
-    state_const_bytes,
+from tokenspeed.runtime.configs.lcm_layouts import (
+    inkling_lcm_fields,
+    qwen_gdn_lcm_fields,
 )
+from tokenspeed.runtime.configs.lcm_memory_plan import plan_lcm_fields
 from tokenspeed.runtime.configs.model_config import AttentionArch, is_deepseek_v4
 from tokenspeed.runtime.configs.paged_cache_spec import (
     PagedCacheGroupSpec,
@@ -384,11 +381,11 @@ def _create_hybrid_linear_attn(
     flat_kvcache = scheduler_ext_flat_kvcache()
     if flat_kvcache:
         # Flat path: the pool covers ALL layers, so pool indices == global
-        # layer ids, its layer_types line up with the state slabs, and the
+        # layer ids, its layer_types line up with the planned state fields, and the
         # group specs publish both the "full_attention" and
         # "linear_attention" groups. State layers carry NO k/v tensors
-        # (None slots, M18a T4) -- matching the plan sizing, which charges
-        # only full-layer KV + state rows. The identity mapping keeps
+        # (None slots) -- matching the LCM plan, which contains history KV
+        # and recurrent-state fields separately. The identity mapping keeps
         # the wrapper type identical to the radix path.
         num_total_layers = len(text_config.layers_block_type)
         inner_pool = config.create_pool(
@@ -432,7 +429,7 @@ def _create_hybrid_linear_attn(
 
     if flat_kvcache:
         # Flat mode never touches a SimpleMambaPool: the recurrent state
-        # lives in the KV pool's state slabs, addressed by the flat block
+        # lives in the KV pool's LCM arena, addressed by the flat block
         # tables (set_kv_pool below activates the dual-index state paging),
         # so skip the pool and its set_pool binding entirely.
         mamba_pool = None
@@ -470,7 +467,7 @@ def _create_hybrid_linear_attn(
             max_req_pool_size=req_pool_padding_index,
         )
         linear_attn_backend.set_pool(mamba_pool)
-    # Flat state paging (dual-index) keys off the KV pool's state slabs +
+    # Flat state paging (dual-index) keys off the KV pool's state field views +
     # published "linear_attention" group; no-op on the radix path.
     linear_attn_backend.set_kv_pool(pool)
 
@@ -482,7 +479,7 @@ def _create_hybrid_linear_attn(
         len(full_attn_layers),
         len(mamba_layer_ids),
         (
-            "flat state slabs (no mamba slot pool)"
+            "flat LCM state fields (no mamba slot pool)"
             if mamba_pool is None
             else f"mamba pool size {mamba_pool.size}"
         ),
@@ -579,7 +576,7 @@ def _inkling_lcm_fields(config, text_config, logical_block_tokens):
     hiddenconv_element_size = (
         2 if os.environ.get("INKLING_FP8_SCONV", "0") == "0" else 1
     )
-    return inkling_lcm_field_specs(
+    return inkling_lcm_fields(
         layer_group_ids=config.layer_types,
         logical_block_tokens=logical_block_tokens,
         layer_kv_heads=per_rank_heads,
@@ -847,30 +844,19 @@ def create_attn_components(
             server_args.drafter_attention_backend = None
 
     config = _create_attn_config(server_args, model_config)
+    flat_kvcache = scheduler_ext_flat_kvcache()
     has_gdn_state = getattr(config, "conv_state_shape", None) is not None
-    use_lcm_gdn = is_hybrid_gdn and has_gdn_state and scheduler_ext_flat_kvcache()
+    use_lcm_gdn = is_hybrid_gdn and has_gdn_state and flat_kvcache
     # Keep the production Inkling path unchanged until boundary checkpoints
     # cover prefill graphs and speculative decoding as well as eager/decode.
     use_lcm_inkling = (
-        is_inkling
-        and scheduler_ext_flat_kvcache()
-        and os.environ.get("INKLING_LCM", "0") == "1"
+        is_inkling and flat_kvcache and os.environ.get("INKLING_LCM", "0") == "1"
     )
     inkling_bf16_checkpoints = (
         use_lcm_inkling and os.environ.get("INKLING_FP8_SCONV", "0") == "0"
     )
     lcm_max_padding_fraction = (
         float("inf") if inkling_bf16_checkpoints else _LCM_MAX_PADDING_FRACTION
-    )
-    gdn_state_bytes = (
-        state_const_bytes(
-            config.conv_state_shape,
-            config.conv_dtype,
-            config.temporal_state_shape,
-            config.ssm_dtype,
-        )
-        if has_gdn_state
-        else None
     )
     flat_lcm_fields = None
     if use_lcm_gdn:
@@ -891,7 +877,7 @@ def create_attn_components(
             config.page_size = logical_block_tokens
         layer_group_ids = tuple(split_recurrent_state_groups(config.layer_types))
         config.layer_cache_group_ids = layer_group_ids
-        flat_lcm_fields = hybrid_lcm_field_specs(
+        flat_lcm_fields = qwen_gdn_lcm_fields(
             layer_types=config.layer_types,
             layer_group_ids=layer_group_ids,
             logical_block_tokens=logical_block_tokens,
@@ -924,22 +910,11 @@ def create_attn_components(
             model_config.hf_config.get_text_config(),
             logical_block_tokens,
         )
-    elif has_gdn_state:
-        equalized_block_size_value = equalized_block_size(
-            layer_types=list(config.layer_types),
-            kv_bytes_per_slot=config.cache_cell_size(),
-            state_const_bytes=gdn_state_bytes,
-            block_size=server_args.block_size,
+    elif has_gdn_state and flat_kvcache:
+        raise RuntimeError(
+            "Flat State cache requires an LCM layout recipe; none is "
+            f"registered for architectures={architectures!r}"
         )
-        if equalized_block_size_value != server_args.block_size:
-            logger.info(
-                "Setting attention block size to %d tokens to cover the GDN "
-                "state row (configured block size %d)",
-                equalized_block_size_value,
-                server_args.block_size,
-            )
-            server_args.block_size = equalized_block_size_value
-            config.page_size = equalized_block_size_value
     draft_attn_config = None
     if draft_model_config:
         draft_attn_config = _create_attn_config(
@@ -1160,46 +1135,6 @@ def create_attn_components(
         draft_max_num_tokens = (
             flat_plan.num_lcm_blocks * draft_packing * server_args.block_size
         )
-    elif has_mamba and has_gdn_state:
-        draft_row_bytes = 0
-        if draft_attn_config is not None:
-            draft_row_bytes = (
-                _resolve_draft_cache_cell_size_for_profile(
-                    draft_attn_config, draft_model_config, draft_profile_cache_cell_size
-                )
-                * server_args.block_size
-            )
-        cache_memory = profile_available_cache_memory_bytes(
-            attn_config=config,
-            gpu_id=gpu_id,
-            tp_size=server_args.mapping.world_size,
-            gpu_memory_utilization=server_args.gpu_memory_utilization,
-            total_gpu_memory=gpu_memory,
-            world_group=server_args.mapping.world_group,
-        )
-        cache_budget_bytes = cache_memory
-        flat_plan = plan_component_tensors(
-            components_from_layers(
-                layer_types=list(config.layer_types),
-                kv_bytes_per_slot=config.cache_cell_size(),
-                state_const_bytes=gdn_state_bytes,
-            ),
-            block_size=server_args.block_size,
-            budget_bytes=cache_memory,
-            reserved_bytes_per_block=draft_row_bytes,
-        )
-        max_total_num_pages = flat_plan.geometry.num_blocks
-        logger.info(
-            "Flat GDN KV profile: block_bytes=%d (%d component tensors, "
-            "block_size=%d), max_total_num_pages=%d",
-            flat_plan.geometry.block_bytes,
-            len(flat_plan.tensors),
-            server_args.block_size,
-            max_total_num_pages,
-        )
-        max_num_tokens = _resolve_max_num_tokens(
-            max_total_num_pages, server_args.block_size, server_args.max_total_tokens
-        )
     elif has_mamba and server_args.max_mamba_cache_size is not None:
         mamba_pool_total_chunks = server_args.max_mamba_cache_size
         cache_budget_bytes = profile_available_cache_memory_bytes(
@@ -1234,13 +1169,9 @@ def create_attn_components(
             if server_args.speculative_algorithm is not None
             else 0
         )
-        per_layer_mamba_chunk_memory = sum(
-            state_const_bytes(
-                mamba_conv_state_shape,
-                mamba_conv_dtype,
-                mamba_temporal_state_shape,
-                mamba_ssm_dtype,
-            ).values()
+        per_layer_mamba_chunk_memory = (
+            math.prod(mamba_conv_state_shape) * mamba_conv_dtype.itemsize
+            + math.prod(mamba_temporal_state_shape) * mamba_ssm_dtype.itemsize
         ) * (1 + speculative_num_draft_tokens)
         memory_per_mamba_chunk = num_mamba_layers * per_layer_mamba_chunk_memory
         full_attn_layer_ids = getattr(text_config, "full_attention_layer_ids", None)

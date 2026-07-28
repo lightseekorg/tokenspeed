@@ -80,7 +80,7 @@ std::int32_t CacheForGroup(KvCacheCoordinator& coordinator, BlockPool& pool, con
     KvCacheManager& manager = coordinator.GroupManager(static_cast<std::int32_t>(group_id));
     CacheBlockRef got = pool.AcquireBlock(group_id, manager.CacheBlocksPerLcmBlock());
     const std::int32_t id = got->Location().lcm_block_id;
-    manager.CacheBlock(pool, got, key, NextTestAccessEpoch());
+    manager.RegisterCachedBlock(pool, got, key, NextTestAccessEpoch());
     got.reset();
     return id;
 }
@@ -93,7 +93,8 @@ CacheBlockLocation CacheBoundaryForGroup(KvCacheCoordinator& coordinator, BlockP
     CacheBlockRef block_ref = pool.AcquireBlock(group_id, manager.CacheBlocksPerLcmBlock());
     _assert(static_cast<bool>(block_ref), "test cache block allocation failed");
     const CacheBlockLocation location = block_ref->Location();
-    manager.CacheBlock(pool, block_ref, Key(content_hash, group_id), access_epoch, logical_block_index, boundary_kind);
+    manager.RegisterCachedBlock(pool, block_ref, Key(content_hash, group_id), access_epoch, logical_block_index,
+                                boundary_kind);
     block_ref.reset();
     return location;
 }
@@ -131,18 +132,9 @@ TEST(MakeCoordinatorTest, Qwen35UsesUniformLogicalPWithDifferentPacking) {
     BlockPool pool(32);
     const std::vector<KvCacheSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 8},
-        {.kind = AttnKind::kMambaState,
-         .sliding_window = 0,
-         .cache_blocks_per_lcm_block = 1,
-         .materializes_all_boundaries = true},
-        {.kind = AttnKind::kMambaState,
-         .sliding_window = 0,
-         .cache_blocks_per_lcm_block = 1,
-         .materializes_all_boundaries = true},
-        {.kind = AttnKind::kMambaState,
-         .sliding_window = 0,
-         .cache_blocks_per_lcm_block = 1,
-         .materializes_all_boundaries = true},
+        {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+        {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+        {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
     };
     KvCacheCoordinator coord = MakeCoordinator(specs, /*cache_block_tokens=*/128, pool);
 
@@ -151,7 +143,6 @@ TEST(MakeCoordinatorTest, Qwen35UsesUniformLogicalPWithDifferentPacking) {
     EXPECT_EQ(coord.GroupManager(1).CacheBlockTokens(), 128);
     EXPECT_EQ(coord.GroupManager(0).CacheBlocksPerLcmBlock(), 8);
     EXPECT_EQ(coord.GroupManager(1).CacheBlocksPerLcmBlock(), 1);
-    EXPECT_EQ(coord.BlocksNeededFor(/*num_tokens=*/128), 4);
 
     std::vector<BlockTable> tables(coord.NumGroups());
     ASSERT_TRUE(AdmitForTest(coord, tables, /*num_tokens=*/128));
@@ -197,6 +188,17 @@ TEST(KvCacheCoordinatorTest, RejectsManagerGeometryThatDiffersFromDomainOrSpec) 
         KvCacheSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 8},
         std::make_unique<FullAttnManager>(/*cache_block_tokens=*/128, /*cache_blocks_per_lcm_block=*/1));
     EXPECT_THROW(KvCacheCoordinator(std::move(wrong_k), /*cache_block_tokens=*/128, pool), std::runtime_error);
+}
+
+TEST(KvCacheCoordinatorTest, RejectsManagerGroupIdThatDiffersFromItsIndex) {
+    BlockPool pool(8);
+    std::vector<CacheGroup> groups;
+    groups.emplace_back(
+        KvCacheSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+        std::make_unique<FullAttnManager>(/*cache_block_tokens=*/128, /*cache_blocks_per_lcm_block=*/1,
+                                          /*group_id=*/1));
+
+    EXPECT_THROW(KvCacheCoordinator(std::move(groups), /*cache_block_tokens=*/128, pool), std::runtime_error);
 }
 
 TEST(KvCacheManagerTest, ResolvesAffineKernelPageIdsAndRejectsInvalidLocations) {
@@ -666,7 +668,7 @@ TEST(KvCacheCoordinatorAdmissionTest, ReservedCapacityLivesInBlockTableUntilCons
 
     EXPECT_TRUE(result->load_pairs.empty());
     EXPECT_EQ(tables[0].NumBlocks(), 3);
-    EXPECT_EQ(coordinator.BlocksNeededFor(tables, /*num_tokens=*/8), 0);
+    EXPECT_EQ(coordinator.GroupManager(0).BlocksNeededFor(tables[0], /*num_tokens=*/8), 0);
     const std::int32_t free_before_consume = pool.NumEmptyLcmBlocks();
     coordinator.ConsumeAvailable(tables, /*num_tokens=*/8);
     EXPECT_EQ(tables[0].AvailableTokens(), 3);
@@ -857,22 +859,19 @@ TEST(KvCacheCoordinatorAdmissionTest, FullEvictionUsesAccessEpochInsteadOfPerman
 TEST(KvCacheCoordinatorAdmissionTest, StateEvictionUsesAccessEpochBeforePosition) {
     BlockPool pool(2);
     const std::vector<KvCacheSpec> specs = {
-        {.kind = AttnKind::kMambaState,
-         .sliding_window = 0,
-         .cache_blocks_per_lcm_block = 1,
-         .materializes_all_boundaries = true},
+        {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
     };
     KvCacheCoordinator coordinator = MakeCoordinator(specs, 4, pool);
     KvCacheManager& manager = coordinator.GroupManager(0);
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
 
     CacheBlockRef late_checkpoint = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
-    manager.CacheBlock(pool, late_checkpoint, Key(hashes[0], 0), NextTestAccessEpoch(),
+    manager.RegisterCachedBlock(pool, late_checkpoint, Key(hashes[0], 0), NextTestAccessEpoch(),
                        /*logical_block_index=*/10);
     late_checkpoint.reset();
 
     CacheBlockRef early_checkpoint = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
-    manager.CacheBlock(pool, early_checkpoint, Key(hashes[1], 0), NextTestAccessEpoch(),
+    manager.RegisterCachedBlock(pool, early_checkpoint, Key(hashes[1], 0), NextTestAccessEpoch(),
                        /*logical_block_index=*/0);
     early_checkpoint.reset();
 
@@ -1021,6 +1020,59 @@ TEST(KvCacheCoordinatorAdmissionTest, EndpointIsNotBelowEveryPreviouslyHitBlock)
 
     EXPECT_FALSE(manager.ContainsCachedBlock(pool, Key(hashes[0], 0)));
     EXPECT_TRUE(manager.ContainsCachedBlock(pool, Key(hashes[1], 0)));
+}
+
+TEST(KvCacheCoordinatorAdmissionTest, MixedGroupTieEvictsNonClosedBeforeFullHistory) {
+    BlockPool pool(3);
+    const std::vector<KvCacheSpec> specs = {
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+        {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, 4, pool);
+    const std::vector<std::string> hashes = ContentHashes({{1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
+    constexpr std::uint64_t kSameAccessEpoch = 7;
+
+    CacheBoundaryForGroup(coordinator, pool, hashes[0], /*group_id=*/0, kSameAccessEpoch,
+                          /*logical_block_index=*/1);
+    CacheBoundaryForGroup(coordinator, pool, hashes[1], /*group_id=*/1, kSameAccessEpoch,
+                          /*logical_block_index=*/3, CacheBoundaryKind::kEndpoint);
+    CacheBoundaryForGroup(coordinator, pool, hashes[2], /*group_id=*/2, kSameAccessEpoch,
+                          /*logical_block_index=*/9);
+
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    std::vector<GroupDemand> demands = {
+        {.table = &tables[0], .num_tokens = 4},
+        {.table = &tables[1]},
+        {.table = &tables[2]},
+    };
+    ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands));
+
+    EXPECT_TRUE(coordinator.GroupManager(0).ContainsCachedBlock(pool, Key(hashes[0], 0)));
+    EXPECT_FALSE(coordinator.GroupManager(1).ContainsCachedBlock(pool, Key(hashes[1], 1)));
+    EXPECT_TRUE(coordinator.GroupManager(2).ContainsCachedBlock(pool, Key(hashes[2], 2)));
+}
+
+TEST(KvCacheCoordinatorAdmissionTest, ProspectiveUncachedReclaimDoesNotEvictCachedBlock) {
+    BlockPool pool(3);
+    const std::vector<KvCacheSpec> specs = {
+        {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, 4, pool);
+    const std::string cached_hash = ContentHashes({{1, 1, 1, 1}}).front();
+    CacheBoundaryForGroup(coordinator, pool, cached_hash, /*group_id=*/0, /*access_epoch=*/1,
+                          /*logical_block_index=*/0);
+
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/8));
+    ASSERT_EQ(pool.NumEmptyLcmBlocks(), 0);
+
+    std::vector<GroupDemand> demands = {
+        {.table = &tables[0], .num_tokens = 4, .num_computed_tokens = 8},
+    };
+    ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands));
+
+    EXPECT_TRUE(coordinator.GroupManager(0).ContainsCachedBlock(pool, Key(cached_hash, 0)));
 }
 
 TEST(KvCacheCoordinatorAdmissionTest, QwenScaleChunkLifecyclePublishesOneStateSnapshotPerChunk) {
@@ -2168,7 +2220,7 @@ std::int32_t HostPut(KvCacheCoordinator& coordinator, BlockPool& host_pool, cons
     KvCacheManager& manager = coordinator.GroupManager(static_cast<std::int32_t>(gid));
     CacheBlockRef block_ref = host_pool.AcquireBlock(gid, manager.CacheBlocksPerLcmBlock());
     const std::int32_t id = block_ref->Location().lcm_block_id;
-    manager.CacheBlock(host_pool, block_ref, key, NextTestAccessEpoch());
+    manager.RegisterCachedBlock(host_pool, block_ref, key, NextTestAccessEpoch());
     block_ref.reset();
     return id;
 }
@@ -2457,7 +2509,7 @@ TEST(MambaAnalogTest, HitIsSingleSnapshotPlusLeadingHoles) {
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
     for (std::int32_t slot : {0, 1, 3}) {
         CacheBlockRef block_ref = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
-        mgr.CacheBlock(pool, block_ref, Key(ch[static_cast<std::size_t>(slot)], 0), NextTestAccessEpoch());
+        mgr.RegisterCachedBlock(pool, block_ref, Key(ch[static_cast<std::size_t>(slot)], 0), NextTestAccessEpoch());
         block_ref.reset();
     }
 
@@ -2592,8 +2644,7 @@ TEST(MambaStateRegistrationTest, MambaPublishesOnlyChunkBoundary) {
     std::vector<KvCacheSpec> specs = {{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
                                       {.kind = AttnKind::kMambaState,
                                        .sliding_window = 0,
-                                       .cache_blocks_per_lcm_block = 1,
-                                       .materializes_all_boundaries = true}};
+                                       .cache_blocks_per_lcm_block = 1}};
     KvCacheCoordinator coord = MakeCoordinator(specs, 4, pool);
     std::vector<BlockTable> tables(coord.NumGroups());
     ASSERT_TRUE(AdmitForTest(coord, tables, /*num_tokens=*/12));  // 3 pages
@@ -2693,11 +2744,11 @@ TEST(KvCacheManagerBoundaryTest, BoundaryPromotionIsMonotonic) {
     CacheBlockRef block_ref = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
     const CacheKey key = Key(std::string(64, 'a'), 0);
 
-    manager.CacheBlock(pool, block_ref, key, /*access_epoch=*/1, /*logical_block_index=*/0,
+    manager.RegisterCachedBlock(pool, block_ref, key, /*access_epoch=*/1, /*logical_block_index=*/0,
                        CacheBoundaryKind::kChunk);
-    manager.CacheBlock(pool, block_ref, key, /*access_epoch=*/2, /*logical_block_index=*/0,
+    manager.RegisterCachedBlock(pool, block_ref, key, /*access_epoch=*/2, /*logical_block_index=*/0,
                        CacheBoundaryKind::kPromoted);
-    manager.CacheBlock(pool, block_ref, key, /*access_epoch=*/3, /*logical_block_index=*/0,
+    manager.RegisterCachedBlock(pool, block_ref, key, /*access_epoch=*/3, /*logical_block_index=*/0,
                        CacheBoundaryKind::kChunk);
 
     const std::optional<KvCacheManager::CachedBlockMetadata> metadata =

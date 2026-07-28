@@ -229,10 +229,10 @@ public:
         return (over + cache_block_tokens_ - 1) / cache_block_tokens_;
     }
 
-    void CacheBlock(BlockPool& pool, CacheBlockRef& block_ref, const CacheKey& key, std::uint64_t access_epoch,
-                    std::int32_t logical_block_index = -1,
-                    CacheBoundaryKind boundary_kind = CacheBoundaryKind::kChunk,
-                    std::vector<std::pair<CacheKey, CacheBlockRef>>* newly_cached = nullptr) {
+    void RegisterCachedBlock(BlockPool& pool, CacheBlockRef& block_ref, const CacheKey& key,
+                             std::uint64_t access_epoch, std::int32_t logical_block_index = -1,
+                             CacheBoundaryKind boundary_kind = CacheBoundaryKind::kChunk,
+                             std::vector<std::pair<CacheKey, CacheBlockRef>>* newly_cached = nullptr) {
         _assert(block_ref && block_ref.IsOwnedBy(pool), "cache block must belong to the target pool");
         validateKey(key);
         CacheEntries& cache_index = cacheEntries(pool);
@@ -282,8 +282,8 @@ public:
             if (!block_ref) {
                 continue;
             }
-            CacheBlock(pool, block_ref, keys[j], access_epoch, first_slot + static_cast<std::int32_t>(j),
-                       boundary_kind, newly_cached);
+            RegisterCachedBlock(pool, block_ref, keys[j], access_epoch,
+                                first_slot + static_cast<std::int32_t>(j), boundary_kind, newly_cached);
         }
     }
 

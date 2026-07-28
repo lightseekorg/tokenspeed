@@ -94,10 +94,6 @@ public:
     std::optional<AdmissionResult> Admit(PrefixProbe&& prefix, std::span<const GroupDemand> demands,
                                          std::optional<std::uint64_t> request_access_epoch = std::nullopt);
 
-    // Single home of the gate-side page math.
-    std::int32_t BlocksNeededFor(std::span<const BlockTable> tables, std::int32_t num_tokens) const;
-    // Fresh-table overload for a not-yet-allocated request (no tail credit).
-    std::int32_t BlocksNeededFor(std::int32_t num_tokens) const;
     std::int32_t NumAvailableLcmBlocks() const;
 
     // Registers an exact range, used for transferred prefix blocks and tests.

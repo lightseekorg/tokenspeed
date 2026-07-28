@@ -37,6 +37,7 @@ KvCacheCoordinator::KvCacheCoordinator(std::vector<CacheGroup> groups, std::int3
     : groups_{std::move(groups)}, pool_{pool}, host_pool_{host_pool}, cache_block_tokens_{cache_block_tokens} {
     _assert(cache_block_tokens_ > 0, "coordinator needs positive cache_block_tokens");
     for (std::size_t i = 0; i < groups_.size(); ++i) {
+        _assert(groups_[i].Id() == static_cast<GroupId>(i), "cache manager group id must equal its group index");
         _assert(groups_[i].Manager().CacheBlockTokens() == cache_block_tokens_,
                 "every cache manager must use the domain cache_block_tokens");
         _assert(groups_[i].Manager().CacheBlocksPerLcmBlock() == groups_[i].Spec().cache_blocks_per_lcm_block,
@@ -204,24 +205,6 @@ KvCacheCoordinator::AcquiredPrefix KvCacheCoordinator::acquirePrefix(PrefixProbe
     return out;
 }
 
-std::int32_t KvCacheCoordinator::BlocksNeededFor(std::span<const BlockTable> tables, std::int32_t num_tokens) const {
-    _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
-    std::int32_t total_needed = 0;
-    for (std::size_t i = 0; i < groups_.size(); ++i) {
-        total_needed += groups_[i].Manager().BlocksNeededFor(tables[i], num_tokens);
-    }
-    return total_needed;
-}
-
-std::int32_t KvCacheCoordinator::BlocksNeededFor(std::int32_t num_tokens) const {
-    const BlockTable fresh;
-    std::int32_t total_needed = 0;
-    for (const CacheGroup& group : groups_) {
-        total_needed += group.Manager().BlocksNeededFor(fresh, num_tokens);
-    }
-    return total_needed;
-}
-
 std::int32_t KvCacheCoordinator::NumAvailableLcmBlocks() const {
     std::int32_t available = 0;
     for (std::int32_t parent_id = 1; parent_id <= pool_.NumLcmBlocks(); ++parent_id) {
@@ -355,7 +338,7 @@ std::int32_t KvCacheCoordinator::NumPinnedHostCachedBlocks() const {
 void KvCacheCoordinator::CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key) {
     _assert(host_pool_ != nullptr, "CacheHostBlock requires a host pool");
     _assert(key.group_id < groups_.size(), "CacheHostBlock group id out of range");
-    groups_[key.group_id].Manager().CacheBlock(*host_pool_, block_ref, key, ++next_access_epoch_);
+    groups_[key.group_id].Manager().RegisterCachedBlock(*host_pool_, block_ref, key, ++next_access_epoch_);
 }
 
 KvCacheCoordinator MakeCoordinator(std::span<const KvCacheSpec> specs, std::int32_t cache_block_tokens, BlockPool& pool,

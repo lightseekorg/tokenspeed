@@ -68,8 +68,6 @@ struct KvCacheSpec {
     // Number of this group's logical cache blocks packed into one physical
     // LCM block. It affects placement only, never prefix-match granularity.
     std::int32_t cache_blocks_per_lcm_block{1};
-    // True only when the producer writes every completed State boundary.
-    bool materializes_all_boundaries{false};
 };
 
 // Per-request logical-page -> physical-page mapping.

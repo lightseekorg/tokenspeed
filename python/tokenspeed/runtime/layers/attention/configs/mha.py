@@ -24,7 +24,7 @@ from dataclasses import dataclass
 
 import torch
 
-from tokenspeed.runtime.configs.flat_memory_plan import LcmMemoryPlan
+from tokenspeed.runtime.configs.lcm_memory_plan import LcmMemoryPlan
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.configs.paged_cache_spec import (
     STATE_LAYER_TYPES,
@@ -50,10 +50,9 @@ class MHAConfig(BaseAttnConfig):
     # guards consume it.
     pd_disaggregation_enabled: bool = False
     # Mamba2/GDN per-state-layer shapes and dtypes (the configs'
-    # mamba2_cache_params), forwarded to the pool's state slabs. Populated
-    # only on a flat-built scheduler ext — the radix path keeps its
-    # SimpleMambaPool state ownership byte-identical (None here means the
-    # pool neither allocates state slabs nor runs the page-geometry check).
+    # mamba2_cache_params), forwarded to the pool's LCM field binding.
+    # Populated only on a flat-built scheduler ext — the radix path keeps its
+    # SimpleMambaPool state ownership byte-identical.
     conv_state_shape: tuple[int, ...] | None = None
     # Extra model-declared paged-cache groups (e.g. Inkling paged sconv); forwarded to publication
     extra_paged_groups: tuple[PagedCacheGroupSpec, ...] = ()
@@ -65,7 +64,7 @@ class MHAConfig(BaseAttnConfig):
     temporal_state_shape: tuple[int, ...] | None = None
     conv_dtype: torch.dtype | None = None
     ssm_dtype: torch.dtype | None = None
-    # Optional two-level Flat layout. Radix and non-LCM Flat paths leave these
+    # Two-level Flat State layout. Radix and ordinary non-State pools leave it
     # unset and retain their existing allocation.
     lcm_memory_plan: LcmMemoryPlan | None = None
     layer_cache_group_ids: tuple[str, ...] = ()
@@ -109,7 +108,7 @@ class MHAConfig(BaseAttnConfig):
             and scheduler_ext_flat_kvcache()
         ):
             # GDN hybrid on the flat ext: the KV pool owns the recurrent
-            # state (state slabs), so it needs the mamba2 shapes/dtypes.
+            # state LCM fields, so it needs the mamba2 shapes/dtypes.
             # Radix branch untouched: SimpleMambaPool owns the state there.
             text_config = getattr(hf_config, "text_config", hf_config)
             (

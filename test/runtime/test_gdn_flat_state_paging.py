@@ -164,6 +164,8 @@ class PoollessFlatMetadataTest(unittest.TestCase):
         stub_pool = SimpleNamespace(
             state_slabs=[(object(), object())],
             paged_cache_group_specs=(SimpleNamespace(group_id="linear_attention"),),
+            _layer_types=("linear_attention",),
+            layer_cache_group_ids=("linear_attention",),
             page_size=self.P,
         )
         # set_pool is intentionally never called: flat mode has no
@@ -187,8 +189,8 @@ class PoollessFlatMetadataTest(unittest.TestCase):
         )
         md = backend.forward_metadata
         # before = 8 -> page slot 1 (row 2); after = 9 -> page slot 2 (row 3).
-        self.assertEqual(md.state_in_pages.tolist(), [2])
-        self.assertEqual(md.state_out_pages.tolist(), [3])
+        self.assertEqual(md.state_in_pages["linear_attention"].tolist(), [2])
+        self.assertEqual(md.state_out_pages["linear_attention"].tolist(), [3])
 
     def test_extend_metadata_without_pool(self):
         torch = self.torch
@@ -204,8 +206,8 @@ class PoollessFlatMetadataTest(unittest.TestCase):
             },
         )
         md = backend.forward_metadata
-        self.assertEqual(md.state_in_pages.tolist(), [0])
-        self.assertEqual(md.state_out_pages.tolist(), [2])
+        self.assertEqual(md.state_in_pages["linear_attention"].tolist(), [0])
+        self.assertEqual(md.state_out_pages["linear_attention"].tolist(), [2])
 
     def test_capture_replay_metadata_without_pool(self):
         torch = self.torch
@@ -220,8 +222,8 @@ class PoollessFlatMetadataTest(unittest.TestCase):
         )
         md = backend.forward_metadata
         # Capture binds the persistent pad-filled buffers.
-        self.assertEqual(md.state_in_pages.tolist(), [-1])
-        self.assertEqual(md.state_out_pages.tolist(), [-1])
+        self.assertEqual(md.state_in_pages["linear_attention"].tolist(), [-1])
+        self.assertEqual(md.state_out_pages["linear_attention"].tolist(), [-1])
 
         backend.init_forward_metadata_replay_cuda_graph(
             bs=1,
@@ -233,8 +235,8 @@ class PoollessFlatMetadataTest(unittest.TestCase):
             },
         )
         md = backend.forward_metadata
-        self.assertEqual(md.state_in_pages.tolist(), [2])
-        self.assertEqual(md.state_out_pages.tolist(), [3])
+        self.assertEqual(md.state_in_pages["linear_attention"].tolist(), [2])
+        self.assertEqual(md.state_out_pages["linear_attention"].tolist(), [3])
 
 
 class GDNFlatStatePagingGPUTest(unittest.TestCase):
@@ -414,8 +416,14 @@ class GDNFlatStatePagingGPUTest(unittest.TestCase):
                 )
             },
         )
-        self.assertEqual(backend.forward_metadata.state_in_pages.tolist(), [0])
-        self.assertEqual(backend.forward_metadata.state_out_pages.tolist(), [2])
+        self.assertEqual(
+            backend.forward_metadata.state_in_pages["linear_attention"].tolist(),
+            [0],
+        )
+        self.assertEqual(
+            backend.forward_metadata.state_out_pages["linear_attention"].tolist(),
+            [2],
+        )
         outputs = [
             backend.forward_extend(
                 None,
@@ -450,11 +458,11 @@ class GDNFlatStatePagingGPUTest(unittest.TestCase):
                 flat_block_tables={"linear_attention": rows},
             )
             self.assertEqual(
-                backend.forward_metadata.state_in_pages.tolist(),
+                backend.forward_metadata.state_in_pages["linear_attention"].tolist(),
                 [expected_pages[i][0]],
             )
             self.assertEqual(
-                backend.forward_metadata.state_out_pages.tolist(),
+                backend.forward_metadata.state_out_pages["linear_attention"].tolist(),
                 [expected_pages[i][1]],
             )
             outputs.append(

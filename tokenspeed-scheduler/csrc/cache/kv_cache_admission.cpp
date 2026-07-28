@@ -22,8 +22,8 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <limits>
 #include <optional>
+#include <tuple>
 #include <unordered_set>
 
 #include "utils.h"
@@ -82,13 +82,24 @@ public:
     }
 
 private:
+    // Current prefix hits are protected before candidates reach this policy.
+    // A request-only block with no CacheEntry is reclaimed first. Cached
+    // entries then compare request access epoch, followed within one epoch by
+    // the tier order below. Position keeps the deeper unproven non-closed
+    // boundary, while a closed prefix is reclaimed from its suffix.
+    enum class EvictionTier {
+        kUncached,  // physically allocated, but owned only by the request table
+        kProbationaryBoundary,
+        kEstablishedBoundary,
+        kClosedPrefix,
+    };
+
     struct VictimCandidate {
         GroupId group_id;
         CacheBlockLocation location;
         std::uint64_t last_access_epoch;
         std::int32_t logical_block_index;
         CacheBoundaryKind boundary_kind;
-        bool is_full;
         bool is_prefix_closed;
         bool was_acquired;
     };
@@ -143,11 +154,11 @@ private:
             victim_candidates_.push_back(VictimCandidate{
                 .group_id = group_id,
                 .location = location,
-                .last_access_epoch =
-                    metadata ? metadata->last_access_epoch : std::numeric_limits<std::uint64_t>::max(),
+                // Access epochs start at one. Zero puts an uncached block
+                // ahead of every reusable cache entry.
+                .last_access_epoch = metadata ? metadata->last_access_epoch : 0,
                 .logical_block_index = metadata ? metadata->logical_block_index : -1,
                 .boundary_kind = metadata ? metadata->boundary_kind : CacheBoundaryKind::kChunk,
-                .is_full = groups_[group_id].Spec().kind == AttnKind::kFull,
                 .is_prefix_closed = manager.MatchIsPrefixClosed(),
                 .was_acquired = metadata && metadata->was_acquired,
             });
@@ -166,39 +177,33 @@ private:
                 }
             }
         }
-        std::ranges::sort(victim_candidates_, [](const VictimCandidate& lhs, const VictimCandidate& rhs) {
-            // A real request access is the primary cache-value signal. The
-            // probationary flag only breaks ties inside one request epoch.
-            if (lhs.last_access_epoch != rhs.last_access_epoch) {
-                return lhs.last_access_epoch < rhs.last_access_epoch;
+        const auto eviction_key = [](const VictimCandidate& candidate) {
+            const bool is_probationary_boundary =
+                !candidate.is_prefix_closed && candidate.boundary_kind == CacheBoundaryKind::kChunk &&
+                !candidate.was_acquired && candidate.logical_block_index >= 0;
+            const EvictionTier eviction_tier = [&] {
+                if (candidate.last_access_epoch == 0) {
+                    return EvictionTier::kUncached;
+                }
+                if (is_probationary_boundary) {
+                    return EvictionTier::kProbationaryBoundary;
+                }
+                return candidate.is_prefix_closed ? EvictionTier::kClosedPrefix
+                                                  : EvictionTier::kEstablishedBoundary;
+            }();
+            std::int64_t position_rank = 0;
+            if (is_probationary_boundary) {
+                // Retain the longer unproven frontier.
+                position_rank = candidate.logical_block_index;
+            } else if (candidate.is_prefix_closed && candidate.logical_block_index >= 0) {
+                // Reclaim a closed prefix from its suffix.
+                position_rank = -static_cast<std::int64_t>(candidate.logical_block_index);
             }
-            const auto is_ordinary_non_closed = [](const VictimCandidate& candidate) {
-                return !candidate.is_prefix_closed && candidate.boundary_kind == CacheBoundaryKind::kChunk &&
-                       !candidate.was_acquired && candidate.logical_block_index >= 0;
-            };
-            const bool lhs_ordinary = is_ordinary_non_closed(lhs);
-            const bool rhs_ordinary = is_ordinary_non_closed(rhs);
-            if (lhs_ordinary != rhs_ordinary) {
-                return lhs_ordinary;
-            }
-            if (lhs_ordinary && lhs.logical_block_index != rhs.logical_block_index) {
-                // Ordinary non-closed boundaries are alternative resume
-                // points. Retain the longer unproven frontier.
-                return lhs.logical_block_index < rhs.logical_block_index;
-            }
-            if (!lhs_ordinary && !rhs_ordinary && lhs.is_full && rhs.is_full &&
-                lhs.logical_block_index != rhs.logical_block_index) {
-                // Full KV is prefix-closed: after comparing request access
-                // epochs, reclaim the suffix before an earlier page.
-                return lhs.logical_block_index > rhs.logical_block_index;
-            }
-            if (lhs.group_id != rhs.group_id) {
-                return lhs.group_id < rhs.group_id;
-            }
-            if (lhs.location.lcm_block_id != rhs.location.lcm_block_id) {
-                return lhs.location.lcm_block_id < rhs.location.lcm_block_id;
-            }
-            return lhs.location.slot_index < rhs.location.slot_index;
+            return std::tuple{candidate.last_access_epoch, eviction_tier, position_rank, candidate.group_id,
+                              candidate.location.lcm_block_id, candidate.location.slot_index};
+        };
+        std::ranges::sort(victim_candidates_, [&](const VictimCandidate& lhs, const VictimCandidate& rhs) {
+            return eviction_key(lhs) < eviction_key(rhs);
         });
     }
 

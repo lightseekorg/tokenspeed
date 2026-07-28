@@ -42,17 +42,17 @@ CacheKey RealKey(const std::vector<std::int32_t>& tokens, GroupId group_id) {
 
 class FullAttnManager : public ::tokenspeed::FullAttnManager {
 public:
-    using ::tokenspeed::FullAttnManager::CacheBlock;
     using ::tokenspeed::FullAttnManager::CacheFullBlocks;
     using ::tokenspeed::FullAttnManager::FullAttnManager;
+    using ::tokenspeed::FullAttnManager::RegisterCachedBlock;
 
     PrefixMatch Match(BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_blocks,
                       std::int32_t max_blocks) {
         return AcquireMatchedBlocks(pool, keys, begin_blocks, Probe(pool, keys, begin_blocks, max_blocks),
                                     ++next_access_epoch_);
     }
-    void CacheBlock(BlockPool& pool, CacheBlockRef& block, const CacheKey& key) {
-        ::tokenspeed::FullAttnManager::CacheBlock(pool, block, key, ++next_access_epoch_);
+    void RegisterCachedBlock(BlockPool& pool, CacheBlockRef& block, const CacheKey& key) {
+        ::tokenspeed::FullAttnManager::RegisterCachedBlock(pool, block, key, ++next_access_epoch_);
     }
     void CacheFullBlocks(BlockPool& pool, BlockTable& table, std::span<const CacheKey> keys,
                          std::int32_t first_slot = 0) {
@@ -110,10 +110,10 @@ TEST(FullAttnManagerTest, MatchStopsAtFirstMiss) {
 
     CacheBlockRef a = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
     const std::int32_t a_id = a->Location().lcm_block_id;
-    mgr.CacheBlock(pool, a, k0);
+    mgr.RegisterCachedBlock(pool, a, k0);
     CacheBlockRef b = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
     const std::int32_t b_id = b->Location().lcm_block_id;
-    mgr.CacheBlock(pool, b, k1);
+    mgr.RegisterCachedBlock(pool, b, k1);
     a.reset();
     b.reset();
 
@@ -130,7 +130,7 @@ TEST(FullAttnManagerTest, MatchPinsUntilResultDies) {
     FullAttnManager mgr(4);
     const CacheKey k0 = RealKey({1, 2, 3, 4}, 0);
     CacheBlockRef a = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
-    mgr.CacheBlock(pool, a, k0);
+    mgr.RegisterCachedBlock(pool, a, k0);
     a.reset();
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 7);
 
@@ -149,7 +149,7 @@ TEST(FullAttnManagerTest, ClaimHitBlocksClaimsAndAppends) {
     const CacheKey k0 = RealKey({1, 2, 3, 4}, 0);
     CacheBlockRef a = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
     const std::int32_t id = a->Location().lcm_block_id;
-    mgr.CacheBlock(pool, a, k0);
+    mgr.RegisterCachedBlock(pool, a, k0);
     a.reset();
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 7);
 
@@ -397,7 +397,7 @@ TEST(FullAttnManagerTest, ClaimThenAcquireStartsFreshPage) {
     FullAttnManager mgr(4);
     const CacheKey k0 = RealKey({1, 2, 3, 4}, 0);
     CacheBlockRef a = pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
-    mgr.CacheBlock(pool, a, k0);
+    mgr.RegisterCachedBlock(pool, a, k0);
     a.reset();
 
     std::vector<CacheKey> keys{k0};
@@ -601,8 +601,8 @@ TEST(FullAttnManagerLcmTest, LocationBasedEvictionIsScopedToItsPool) {
     const CacheKey device_key = RealKey({1, 2, 3, 4}, 0);
     const CacheKey host_key = RealKey({5, 6, 7, 8}, 0);
     std::uint64_t next_access_epoch = 0;
-    mgr.CacheBlock(device_pool, device, device_key, ++next_access_epoch);
-    mgr.CacheBlock(host_pool, host, host_key, ++next_access_epoch);
+    mgr.RegisterCachedBlock(device_pool, device, device_key, ++next_access_epoch);
+    mgr.RegisterCachedBlock(host_pool, host, host_key, ++next_access_epoch);
     device.reset();
     host.reset();
 

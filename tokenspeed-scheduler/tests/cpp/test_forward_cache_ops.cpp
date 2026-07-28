@@ -134,13 +134,13 @@ TEST(ForwardCacheOpsPrefill, FirstChunkClaimsHitThenAcquiresOnlyRemainder) {
     }
 
     // Claimed pages carry no available capacity: the next allocation starts a fresh block.
-    // BlocksNeededFor(4 new tokens) = ceil(4/2) = 2 pages/group = 4 total.
     {
         std::vector<BlockTable> probe(coordinator.NumGroups());
         ASSERT_TRUE(AdmitForTest(coordinator, probe, coordinator.ProbePrefix(hashes8), GroupDemand{}));
         EXPECT_EQ(probe[0].AvailableTokens(), 0);
         EXPECT_EQ(probe[1].AvailableTokens(), 0);
-        EXPECT_EQ(coordinator.BlocksNeededFor(probe, /*num_tokens=*/4), 4);
+        EXPECT_EQ(coordinator.GroupManager(0).BlocksNeededFor(probe[0], /*num_tokens=*/4), 2);
+        EXPECT_EQ(coordinator.GroupManager(1).BlocksNeededFor(probe[1], /*num_tokens=*/4), 2);
         FreeRequest(coordinator, probe);
     }
 
@@ -390,7 +390,6 @@ TEST(MakeSpecsFromConfigTest, StateFamilyMapsToMambaStateKind) {
     PagedCacheGroupConfig state_grp;
     state_grp.group_id = "linear_attention";
     state_grp.family = PagedCacheGroupFamily::State;
-    state_grp.materializes_all_boundaries = true;
     config.paged_cache_groups = {full_grp, state_grp};
 
     std::vector<KvCacheSpec> specs = MakeSpecsFromConfig(config);
@@ -399,7 +398,6 @@ TEST(MakeSpecsFromConfigTest, StateFamilyMapsToMambaStateKind) {
     EXPECT_EQ(specs[1].kind, AttnKind::kMambaState);
     EXPECT_EQ(specs[1].sliding_window, 0);
     EXPECT_EQ(specs[1].cache_blocks_per_lcm_block, 1);
-    EXPECT_TRUE(specs[1].materializes_all_boundaries);
 }
 
 TEST(MakeSpecsFromConfigTest, Qwen35Fp8UsesOneLogicalPAndPerGroupPacking) {

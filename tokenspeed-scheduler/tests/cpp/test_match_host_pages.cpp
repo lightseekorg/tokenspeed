@@ -51,8 +51,8 @@ public:
         return this->AcquireMatchedBlocks(pool, keys, begin_blocks, this->Probe(pool, keys, begin_blocks, max_blocks),
                                           recency_);
     }
-    void CacheBlock(BlockPool& pool, CacheBlockRef& block, const CacheKey& key) {
-        Base::CacheBlock(pool, block, key, recency_);
+    void RegisterCachedBlock(BlockPool& pool, CacheBlockRef& block, const CacheKey& key) {
+        Base::RegisterCachedBlock(pool, block, key, recency_);
     }
 
 private:
@@ -76,7 +76,7 @@ template <typename Manager>
 std::int32_t Put(Manager& manager, BlockPool& host_pool, const CacheKey& key) {
     CacheBlockRef block = host_pool.AcquireBlock(manager.Id(), manager.CacheBlocksPerLcmBlock());
     const std::int32_t id = block->Location().lcm_block_id;
-    manager.CacheBlock(host_pool, block, key);
+    manager.RegisterCachedBlock(host_pool, block, key);
     block.reset();
     return id;
 }
