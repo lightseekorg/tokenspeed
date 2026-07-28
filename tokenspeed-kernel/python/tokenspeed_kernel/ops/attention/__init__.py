@@ -910,6 +910,7 @@ def try_kda_fused_paged_decode(
     head_dim: int,
     cu_seqlens: torch.Tensor,
     lower_bound: float | None = -5.0,
+    onorm=None,
     enable_pdl: bool = False,
     override: str | None = None,
     solution: str | None = None,
@@ -919,7 +920,12 @@ def try_kda_fused_paged_decode(
     Returns ``None`` only when no implementation supports the current
     platform. Invalid inputs and execution failures remain visible.
     ``enable_pdl`` chains the fused kernel after its same-stream producer
-    (the packed qkv GEMV) via programmatic dependent launch.
+    (the packed qkv GEMV) via programmatic dependent launch. ``onorm`` is an
+    optional attempt-and-verify stash
+    (:class:`~tokenspeed_kernel.ops.attention.kda_utils.KdaGatedNormRequest`)
+    for the output gated RMSNorm: an implementation that folds it into its
+    epilogue sets ``onorm.consumed``, and the caller applies the norm itself
+    only when the stash comes back unconsumed.
     """
     signature = _attention_format_signature(
         q=mixed_qkv,
@@ -953,6 +959,7 @@ def try_kda_fused_paged_decode(
         head_dim=head_dim,
         cu_seqlens=cu_seqlens,
         lower_bound=lower_bound,
+        onorm=onorm,
         enable_pdl=enable_pdl,
     )
 

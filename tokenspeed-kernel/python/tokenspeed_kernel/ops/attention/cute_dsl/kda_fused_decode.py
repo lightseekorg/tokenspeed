@@ -89,8 +89,13 @@ from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, vector
 from cutlass.cutlass_dsl import T, dsl_user_op
 from quack.compile_utils import make_fake_stream, make_fake_tensor
+from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.primitives import (
+    map_shared_to_peer,
+    store_shared_cluster_f32,
+)
 
 _IDX_DTYPES = {torch.int32: Int32, torch.int64: Int64}
+_NORM_W_DTYPES = {torch.bfloat16: BFloat16, torch.float32: Float32}
 
 _NUM_WARPS = 8
 
@@ -260,6 +265,12 @@ class KdaFusedDecodeKernel:
             (varlen decode; sequences with zero tokens are skipped) or each
             sequence ``n`` reads token row ``n``.
         nv: Column-split blocks per (sequence, head); 1, 2, or 4.
+        onorm_eps: When not ``None``, the output gated RMSNorm
+            (``rmsnorm(o) * weight * sigmoid(gate)``, per head over V) is
+            fused into the epilogue with this epsilon, replacing the separate
+            norm kernel launch. Supported for nv 1 (block-local reduction)
+            and 2 (sibling partials exchanged through distributed shared
+            memory on the existing cluster-barrier phase).
         enable_pdl: Launch with programmatic dependent launch and fence via
             ``griddepcontrol`` (wait on the producer GEMV at entry, release
             dependents at exit).
@@ -274,6 +285,7 @@ class KdaFusedDecodeKernel:
         lower_bound: float | None,
         has_cu_seqlens: bool,
         nv: int,
+        onorm_eps: float | None,
         enable_pdl: bool,
     ):
         if head_dim != 128:
@@ -283,6 +295,8 @@ class KdaFusedDecodeKernel:
             raise ValueError("f_a width must be a multiple of 128")
         if nv not in (1, 2, 4):
             raise ValueError("nv must be 1, 2, or 4")
+        if onorm_eps is not None and nv not in (1, 2):
+            raise ValueError("fused output norm supports nv 1 and 2 only")
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.d_fa = d_fa
@@ -291,6 +305,8 @@ class KdaFusedDecodeKernel:
         self.use_lower_bound = lower_bound is not None
         self.has_cu_seqlens = has_cu_seqlens
         self.nv = nv
+        self.onorm_eps = onorm_eps
+        self.apply_onorm = onorm_eps is not None
         self.enable_pdl = enable_pdl
 
     @cute.jit
@@ -308,6 +324,8 @@ class KdaFusedDecodeKernel:
         h_pool: cute.Tensor,  # [pages, HV, K, V] fp32
         read_indices: cute.Tensor,  # [N] int
         write_indices: cute.Tensor,  # [N] int
+        onorm_w: cute.Tensor,  # [V] norm weight (placeholder when unused)
+        onorm_gate: cute.Tensor,  # [T, P] gate logits (placeholder when unused)
         cu_seqlens: cute.Tensor,  # [N+1] int32 (placeholder when unused)
         stream: CUstream,
     ):
@@ -334,6 +352,8 @@ class KdaFusedDecodeKernel:
             h_pool,
             read_indices,
             write_indices,
+            onorm_w,
+            onorm_gate,
             cu_seqlens,
         ).launch(
             grid=grid,
@@ -358,6 +378,8 @@ class KdaFusedDecodeKernel:
         h_pool: cute.Tensor,
         read_indices: cute.Tensor,
         write_indices: cute.Tensor,
+        onorm_w: cute.Tensor,
+        onorm_gate: cute.Tensor,
         cu_seqlens: cute.Tensor,
     ):
         K = self.head_dim
@@ -574,7 +596,10 @@ class KdaFusedDecodeKernel:
             # arrive would additionally drain the in-flight cp.async state
             # stream and cost ~0.6us; the Triton megafusion instead relies on
             # same-wave residency, which stops holding beyond one wave.)
-            if cutlass.const_expr(self.nv > 1):
+            # With the fused output norm the arrive moves into the epilogue
+            # (it must also publish the DSM o^2 partial), so it is skipped
+            # here in that configuration.
+            if cutlass.const_expr(self.nv > 1 and not self.apply_onorm):
                 cute.arch.cluster_arrive_relaxed()
 
             # ---- phase 2: delta-rule recurrence over the state slab ----
@@ -624,7 +649,12 @@ class KdaFusedDecodeKernel:
 
             # Pass 2: rank-1 update from registers, stream rows back (one
             # vector store per row), and accumulate the per-column output
-            # dots o = <h_new[:, col], q>.
+            # dots o = <h_new[:, col], q>. Under the fused norm at nv > 1
+            # the state writeback is deferred past the cluster barrier: the
+            # epilogue's release-arrive would otherwise have to drain the
+            # freshly issued h-store stream (~0.8us measured); deferred, the
+            # release only covers shared memory.
+            defer_h = cutlass.const_expr(self.apply_onorm and self.nv > 1)
             o_acc = cute.make_rmem_tensor(CPL, Float32)
             for c in cutlass.range_constexpr(CPL):
                 o_acc[c] = Float32(0.0)
@@ -637,7 +667,10 @@ class KdaFusedDecodeKernel:
                     h_val = h_reg[j, c] + v_new_k[c] * kv
                     h_out[c] = h_val
                     o_acc[c] += h_val * qv
-                if write_ok:
+                if cutlass.const_expr(defer_h):
+                    for c in cutlass.range_constexpr(CPL):
+                        h_reg[j, c] = h_out[c]
+                elif write_ok:
                     dst = h_pool.iterator + cute.crd2idx(
                         (w_page, i_hv, row, col), h_pool.layout
                     )
@@ -652,19 +685,81 @@ class KdaFusedDecodeKernel:
 
             cute.arch.barrier()
 
-            # First CPL warps combine and store this block's BV outputs.
-            if warp < CPL:
-                oc = warp * 32 + lane
-                o_col = Float32(0.0)
-                for w in cutlass.range_constexpr(_NUM_WARPS):
-                    o_col += s_red_o[w, oc]
-                o[bos, i_hv, i_v * BV + oc] = BFloat16(o_col * q_inv)
+            # First CPL warps combine this block's BV output columns; the
+            # remaining warps compute duplicates (warp % CPL) so the fused
+            # norm's reductions stay branch-free.
+            oc = (warp % CPL) * 32 + lane
+            o_col = Float32(0.0)
+            for w in cutlass.range_constexpr(_NUM_WARPS):
+                o_col += s_red_o[w, oc]
+            o_val = o_col * q_inv
+
+            if cutlass.const_expr(self.apply_onorm):
+                # ---- fused output gated RMSNorm ----
+                # rmsnorm(o) * weight * sigmoid(gate), per head over V, on
+                # the fp32 o values (the separate norm kernel reads o back
+                # after a bf16 round-trip; the fused path skips that rounding
+                # — a tiny, favorable difference).
+                part = cute.arch.warp_reduction_sum(o_val * o_val)
+                if lane == 0 and warp < CPL:
+                    # s_norm's L2 partials are long consumed (q_inv/k_inv
+                    # live in registers since before pass 1).
+                    s_norm[warp] = part
+                cute.arch.barrier()
+                ssq = s_norm[0]
+                for wsl in cutlass.range_constexpr(1, CPL):
+                    ssq += s_norm[wsl]
+                if cutlass.const_expr(self.nv > 1):
+                    # Exchange the block-local o^2 partial with the sibling
+                    # through distributed shared memory; the release-arrive /
+                    # acquire-wait pair publishes it AND still orders the
+                    # sibling's early conv-window reads before the tail
+                    # stores (single cluster-barrier phase, two jobs).
+                    if tid == 0:
+                        peer = map_shared_to_peer(s_norm.iterator + CPL, Int32(1) - i_v)
+                        store_shared_cluster_f32(peer, ssq)
+                    cute.arch.cluster_arrive()
+                    cute.arch.cluster_wait()
+                    ssq += s_norm[CPL]
+                rsig = cute.math.rsqrt(
+                    ssq * Float32(1.0 / V) + Float32(self.onorm_eps),
+                    fastmath=True,
+                )
+                if warp < CPL:
+                    gcol = i_v * BV + oc
+                    g_sig = _sigmoid(Float32(onorm_gate[bos, i_hv * V + gcol]))
+                    w_n = Float32(onorm_w[gcol])
+                    o[bos, i_hv, gcol] = BFloat16(o_val * rsig * w_n * g_sig)
+                # Deferred state writeback (see the pass-2 note).
+                if cutlass.const_expr(self.nv > 1):
+                    if write_ok:
+                        for j in cutlass.range_constexpr(ROWS):
+                            row = warp * ROWS + j
+                            dst = h_pool.iterator + cute.crd2idx(
+                                (w_page, i_hv, row, col), h_pool.layout
+                            )
+                            if cutlass.const_expr(CPL == 1):
+                                h_pool[w_page, i_hv, row, col] = h_reg[j, 0]
+                            elif cutlass.const_expr(CPL == 2):
+                                _store_global_f32x2(dst, h_reg[j, 0], h_reg[j, 1])
+                            else:
+                                _store_global_f32x4(
+                                    dst,
+                                    h_reg[j, 0],
+                                    h_reg[j, 1],
+                                    h_reg[j, 2],
+                                    h_reg[j, 3],
+                                )
+            else:
+                if warp < CPL:
+                    o[bos, i_hv, i_v * BV + oc] = BFloat16(o_val)
 
             # ---- tail: deferred conv-window shift stores ----
             # By now every sibling block has long arrived, so the wait is
             # free; the q/k window (bx == 0 only) and this block's v window
-            # are stored once per page.
-            if cutlass.const_expr(self.nv > 1):
+            # are stored once per page. (With the fused norm at nv > 1 the
+            # wait already ran in the epilogue above.)
+            if cutlass.const_expr(self.nv > 1 and not self.apply_onorm):
                 cute.arch.cluster_wait()
             if write_ok:
                 if i_v == 0:
@@ -691,6 +786,8 @@ def _compile_kda_fused_decode(
     has_cu_seqlens: bool,
     idx_dtype,
     nv: int,
+    onorm_eps: float | None,
+    onorm_w_dtype,
     enable_pdl: bool,
 ):
     """Compile (once per config) the fused decode kernel with symbolic shapes.
@@ -714,6 +811,14 @@ def _compile_kda_fused_decode(
     n_seq = cute.sym_int()
     read_indices = make_fake_tensor(idx_dtype, (n_seq,))
     write_indices = make_fake_tensor(idx_dtype, (n_seq,))
+    # Unused optional operands are compiled against the specs of harmless
+    # placeholders the launcher passes in their place (never read).
+    if onorm_eps is not None:
+        onorm_w = make_fake_tensor(onorm_w_dtype, (head_dim,))
+        onorm_gate = make_fake_tensor(BFloat16, (tokens, p))
+    else:
+        onorm_w = make_fake_tensor(Float32, (num_heads,))  # placeholder: A_log
+        onorm_gate = make_fake_tensor(BFloat16, (tokens, num_heads))  # beta
     # When dense-indexed the launcher passes read_indices as a never-read
     # placeholder, so the fake dtype must follow the index dtype.
     cu_seqlens = make_fake_tensor(
@@ -727,6 +832,7 @@ def _compile_kda_fused_decode(
         lower_bound,
         has_cu_seqlens,
         nv,
+        onorm_eps,
         enable_pdl,
     )
     return cute.compile(
@@ -743,6 +849,8 @@ def _compile_kda_fused_decode(
         h_pool,
         read_indices,
         write_indices,
+        onorm_w,
+        onorm_gate,
         cu_seqlens,
         make_fake_stream(),
         options="--enable-tvm-ffi",
@@ -767,6 +875,7 @@ def cutedsl_fused_recurrent_kda_megafuse(
     scale: float | None = None,
     cu_seqlens: torch.Tensor | None = None,
     lower_bound: float | None = None,
+    onorm=None,
     enable_pdl: bool = False,
 ) -> torch.Tensor:
     """Single-step KDA decode with conv1d(+SiLU) and the f_b GEMV fused in.
@@ -799,11 +908,18 @@ def cutedsl_fused_recurrent_kda_megafuse(
             per sequence; zero-length sequences are skipped).
         lower_bound: safe-gate lower bound; ``None`` selects the softplus
             gate.
+        onorm: optional :class:`~tokenspeed_kernel.ops.attention.kda_utils.
+            KdaGatedNormRequest`. When the shapes/dtypes are fusable, the
+            output gated RMSNorm runs in the kernel epilogue on the fp32
+            outputs (skipping the separate norm kernel's bf16 round-trip)
+            and ``onorm.consumed`` is set; otherwise the stash is left
+            untouched and the caller applies the norm itself.
         enable_pdl: chain after the same-stream producer via programmatic
             dependent launch.
 
     Returns:
-        o: ``[T, HV, V]`` attention output (bf16).
+        o: ``[T, HV, V]`` attention output (bf16); gated-normed when
+        ``onorm`` was consumed.
     """
     hv = num_heads
     k = head_dim
@@ -829,6 +945,22 @@ def cutedsl_fused_recurrent_kda_megafuse(
     n = t if cu_seqlens is None else cu_seqlens.numel() - 1
     assert read_indices.numel() == n and write_indices.numel() == n
 
+    # Attempt-and-verify output-norm handoff: fuse when the operands match
+    # what the epilogue supports, and tell the caller through the stash.
+    # The decision depends only on shapes/dtypes/strides, so it is stable
+    # across CUDA-graph capture and replay.
+    fuse_onorm = (
+        onorm is not None
+        and onorm.weight.numel() == k
+        and onorm.weight.dtype in _NORM_W_DTYPES
+        and onorm.weight.is_contiguous()
+        and onorm.gate.dtype == qkv_raw.dtype
+        and onorm.gate.dim() == 2
+        and onorm.gate.shape[0] == t
+        and onorm.gate.shape[1] == p
+        and onorm.gate.stride(-1) == 1
+    )
+
     out = torch.empty(t, hv, k, dtype=qkv_raw.dtype, device=qkv_raw.device)
     kernel = _compile_kda_fused_decode(
         hv,
@@ -839,6 +971,8 @@ def cutedsl_fused_recurrent_kda_megafuse(
         cu_seqlens is not None,
         _IDX_DTYPES[read_indices.dtype],
         _pick_nv(n, hv),
+        float(onorm.eps) if fuse_onorm else None,
+        _NORM_W_DTYPES[onorm.weight.dtype] if fuse_onorm else None,
         bool(enable_pdl),
     )
     kernel(
@@ -854,9 +988,14 @@ def cutedsl_fused_recurrent_kda_megafuse(
         h_pool,
         read_indices,
         write_indices,
+        # Placeholders when the norm is not fused: never read by the kernel.
+        onorm.weight if fuse_onorm else A_log,
+        onorm.gate if fuse_onorm else beta,
         # Placeholder when dense-indexed: the compiled kernel never reads it.
         cu_seqlens if cu_seqlens is not None else read_indices,
     )
+    if fuse_onorm:
+        onorm.consumed = True
     return out
 
 

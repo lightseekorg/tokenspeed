@@ -127,9 +127,7 @@ def _deferred_raw(w, ids, weights, x):
         trtllm_fp4_block_scale_moe_raw,
     )
 
-    output = torch.empty(
-        x.shape[0], x.shape[1], dtype=torch.bfloat16, device=x.device
-    )
+    output = torch.empty(x.shape[0], x.shape[1], dtype=torch.bfloat16, device=x.device)
     result = trtllm_fp4_block_scale_moe_raw(
         RoutingInputMode.UNPACKED_PRECOMPUTED,
         None,
@@ -208,9 +206,9 @@ def test_deferred_writes_stay_inside_returned_buffers(situ_weights, num_tokens):
 
     g2b, idxb = _deferred_raw(situ_weights, ids, weights, x)
     torch.cuda.synchronize()
-    assert idxb.data_ptr() + idxb.numel() * 4 == idx_end, (
-        "allocator did not reuse the probed block; rerun (layout-dependent)"
-    )
+    assert (
+        idxb.data_ptr() + idxb.numel() * 4 == idx_end
+    ), "allocator did not reuse the probed block; rerun (layout-dependent)"
 
     tail_bytes = _d2h(idx_end, tail)
     dirty = sum(1 for b in tail_bytes if b != 0xAB)

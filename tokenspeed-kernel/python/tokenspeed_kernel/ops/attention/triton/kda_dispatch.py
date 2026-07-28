@@ -210,9 +210,16 @@ if _CUTEDSL_FUSED_AVAILABLE:
         head_dim: int,
         cu_seqlens: torch.Tensor,
         lower_bound: float | None,
+        onorm=None,
         enable_pdl: bool = False,
     ) -> torch.Tensor:
-        """Adapt the CuTe DSL conv/GEMV/recurrent decode fusion."""
+        """Adapt the CuTe DSL conv/GEMV/recurrent decode fusion.
+
+        ``onorm`` is the attempt-and-verify gated-RMSNorm stash
+        (:class:`~tokenspeed_kernel.ops.attention.kda_utils.
+        KdaGatedNormRequest`); when the wrapper fuses it into the epilogue it
+        sets ``onorm.consumed`` and the caller skips its norm.
+        """
         from tokenspeed_kernel.ops.attention.cute_dsl.kda_fused_decode import (
             cutedsl_fused_recurrent_kda_megafuse,
         )
@@ -233,6 +240,7 @@ if _CUTEDSL_FUSED_AVAILABLE:
             head_dim=head_dim,
             cu_seqlens=cu_seqlens,
             lower_bound=lower_bound,
+            onorm=onorm,
             enable_pdl=enable_pdl,
         ).view(1, -1, num_heads, head_dim)
 

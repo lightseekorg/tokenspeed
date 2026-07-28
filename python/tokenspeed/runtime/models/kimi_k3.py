@@ -69,6 +69,7 @@ from tokenspeed_kernel.ops.activation.triton import (
     rmsnorm_gated_sigmoid,
     sigmoid_mul,
 )
+from tokenspeed_kernel.ops.attention.kda_utils import KdaGatedNormRequest
 from tokenspeed_kernel.ops.attn_res import attn_res_fwd
 from tokenspeed_kernel.ops.communication import allreduce_fusion_lane
 from tokenspeed_kernel.ops.gemm import (
@@ -790,6 +791,25 @@ class KimiLinearKDA(nn.Module):
         # Fused [3*proj, k] conv kernel bank, built once in post_load_weights.
         conv_weights = self.conv_weights
 
+        # Attempt-and-verify handoff of the output gated RMSNorm: the fused
+        # decode kernel folds ``rmsnorm(o) * w * sigmoid(gate)`` into its
+        # epilogue when it can (marking the stash consumed); otherwise the
+        # host-side norm below still runs. Eligibility is deterministic per
+        # shape/dtype, so the decision is CUDA-graph capture/replay stable.
+        # Graph-phase only: eager forwards (1-token prefills, uncaptured
+        # sizes) keep the separate norm — the eager T=1-prefill path faults
+        # when the epilogue fusion is armed there (same dark corner as the
+        # latent tail; decode graphs are unaffected).
+        onorm_req = (
+            KdaGatedNormRequest(
+                weight=self.o_norm.weight,
+                gate=out_gate,
+                eps=self.o_norm.variance_epsilon,
+            )
+            if get_is_cuda_graph_phase()
+            else None
+        )
+
         core_out = ctx.attn_backend.forward(
             q=None,
             k=None,
@@ -816,17 +836,23 @@ class KimiLinearKDA(nn.Module):
             lower_bound=self.gate_lower_bound,
             layer_id=self.layer_id,
             seq_len=num_tokens,
+            onorm=onorm_req,
         )
 
-        # Per-head gated RMSNorm + sigmoid output gate in one kernel.
-        core_out = rmsnorm_gated_sigmoid(
-            core_out.reshape(num_tokens, hn * hd).contiguous(),
-            out_gate.contiguous(),
-            self.o_norm.weight,
-            self.o_norm.variance_epsilon,
-            hn,
-            hd,
-        )
+        if onorm_req is not None and onorm_req.consumed:
+            # The decode kernel already applied the gated norm (on its fp32
+            # outputs — one fewer bf16 round-trip than the separate kernel).
+            core_out = core_out.reshape(num_tokens, hn * hd)
+        else:
+            # Per-head gated RMSNorm + sigmoid output gate in one kernel.
+            core_out = rmsnorm_gated_sigmoid(
+                core_out.reshape(num_tokens, hn * hd).contiguous(),
+                out_gate.contiguous(),
+                self.o_norm.weight,
+                self.o_norm.variance_epsilon,
+                hn,
+                hd,
+            )
         output, _ = self.o_proj(core_out)
         return output
 

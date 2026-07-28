@@ -34,6 +34,7 @@ from tokenspeed_kernel.ops.attention.cute_dsl import (  # noqa: E402
 from tokenspeed_kernel.ops.attention.cute_dsl.kda_fused_decode import (  # noqa: E402
     cutedsl_fused_recurrent_kda_megafuse,
 )
+from tokenspeed_kernel.ops.attention.kda_utils import KdaGatedNormRequest  # noqa: E402
 
 # K3 decode shapes (TP8 rank): 12 heads, K = V = 128, D_FA = 128.
 HV, K, V = 12, 128, 128
@@ -57,6 +58,8 @@ def _make_inputs(bs, pages=64, seed=0, pad_every=0):
         h_pool=torch.randn(pages, HV, K, V, dtype=torch.float32, device=dev),
         ri=torch.randperm(pages, device=dev)[:bs].to(torch.int32),
         cu=torch.arange(bs + 1, dtype=torch.int32, device=dev),
+        gate=torch.randn(bs, P, dtype=torch.bfloat16, device=dev),
+        norm_w=torch.rand(V, dtype=torch.bfloat16, device=dev) + 0.5,
     )
     x["wi"] = x["ri"].clone()
     if pad_every:
@@ -71,7 +74,7 @@ def _clone(x):
     return {k: (v.clone() if torch.is_tensor(v) else v) for k, v in x.items()}
 
 
-def _run(x, *, lower_bound=LOWER_BOUND, cu=True, enable_pdl=False):
+def _run(x, *, lower_bound=LOWER_BOUND, cu=True, enable_pdl=False, onorm=None):
     return cutedsl_fused_recurrent_kda_megafuse(
         x["qkv"],
         x["conv_w"],
@@ -88,11 +91,16 @@ def _run(x, *, lower_bound=LOWER_BOUND, cu=True, enable_pdl=False):
         head_dim=K,
         cu_seqlens=x["cu"] if cu else None,
         lower_bound=lower_bound,
+        onorm=onorm,
         enable_pdl=enable_pdl,
     )
 
 
-def _torch_reference(x, *, lower_bound=LOWER_BOUND):
+def _onorm_request(x, eps=1e-6):
+    return KdaGatedNormRequest(weight=x["norm_w"], gate=x["gate"], eps=eps)
+
+
+def _torch_reference(x, *, lower_bound=LOWER_BOUND, apply_onorm=False):
     """fp32 torch reference of one fused decode step (mutates the pools)."""
     qkv = x["qkv"].float()
     conv_w = x["conv_w"].float()
@@ -141,6 +149,16 @@ def _torch_reference(x, *, lower_bound=LOWER_BOUND):
         out[n] = torch.einsum("hkv,hk->hv", h, q)
         if w >= 0:
             x["h_pool"][w] = h
+    if apply_onorm:
+        # Gated RMSNorm on the fp32 outputs (matching the fused epilogue,
+        # which never rounds o to bf16 before normalizing).
+        var = (out * out).mean(-1, keepdim=True)
+        out = (
+            out
+            * torch.rsqrt(var + 1e-6)
+            * x["norm_w"].float()
+            * torch.sigmoid(x["gate"].float()).view(bs, HV, V)
+        )
     return out.to(torch.bfloat16)
 
 
@@ -180,6 +198,112 @@ class TestKdaFusedDecodeCutedsl:
         # in/out, like the engine's decode graph).
         x["h_pool"].copy_(_make_inputs(bs, seed=8)["h_pool"])
         x["conv_pool"].copy_(_make_inputs(bs, seed=8)["conv_pool"])
+        g.replay()
+        torch.cuda.synchronize()
+        _assert_step_close(x, o, ref_x, ref_o)
+
+    @pytest.mark.parametrize("bs", [1, 4, 8, 16])  # covers nv=2 and nv=1
+    def test_onorm_fused_matches_reference(self, bs):
+        x = _make_inputs(bs, seed=20 + bs)
+        ref_x = _clone(x)
+        req = _onorm_request(x)
+        o = _run(x, onorm=req)
+        ref_o = _torch_reference(ref_x, apply_onorm=True)
+        torch.cuda.synchronize()
+        assert req.consumed
+        _assert_step_close(x, o, ref_x, ref_o)
+
+    def test_onorm_fused_vs_separate_chain(self):
+        # The separate norm kernel reads o back after a bf16 round-trip; the
+        # fused epilogue norms the fp32 values, so the two agree only to
+        # bf16 rounding (~2^-8 relative — a tiny, favorable difference).
+        from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
+
+        bs = 4
+        x = _make_inputs(bs, seed=30)
+        xc = _clone(x)
+        o_raw = _run(xc)
+        torch.cuda.synchronize()
+        o_chain = rmsnorm_gated_sigmoid(
+            o_raw.reshape(bs, P).contiguous(),
+            x["gate"].contiguous(),
+            x["norm_w"],
+            1e-6,
+            HV,
+            K,
+        ).view(bs, HV, V)
+        req = _onorm_request(x)
+        o_fused = _run(x, onorm=req)
+        torch.cuda.synchronize()
+        assert req.consumed
+        # Same state evolution regardless of the epilogue.
+        assert torch.equal(x["h_pool"], xc["h_pool"])
+        assert torch.equal(x["conv_pool"], xc["conv_pool"])
+        torch.testing.assert_close(
+            o_fused.float(), o_chain.float(), atol=3e-2, rtol=8e-3
+        )
+
+    def test_onorm_strided_gate(self):
+        # Gate as a column slice of a wider projection output (the runtime
+        # passes the merged-projection g section without materializing it).
+        bs = 3
+        x = _make_inputs(bs, seed=31)
+        wide = torch.randn(bs, 5 * P, dtype=torch.bfloat16, device="cuda")
+        wide[:, 3 * P : 4 * P] = x["gate"]
+        x["gate"] = wide[:, 3 * P : 4 * P]
+        assert not x["gate"].is_contiguous()
+        ref_x = _clone(x)
+        req = _onorm_request(x)
+        o = _run(x, onorm=req)
+        ref_o = _torch_reference(ref_x, apply_onorm=True)
+        torch.cuda.synchronize()
+        assert req.consumed
+        _assert_step_close(x, o, ref_x, ref_o)
+
+    def test_onorm_ineligible_left_unconsumed(self):
+        bs = 2
+        x = _make_inputs(bs, seed=32)
+        ref_x = _clone(x)
+        # Wrong weight width: the kernel must decline and return raw output.
+        req = KdaGatedNormRequest(
+            weight=torch.ones(64, dtype=torch.bfloat16, device="cuda"),
+            gate=x["gate"],
+            eps=1e-6,
+        )
+        o = _run(x, onorm=req)
+        ref_o = _torch_reference(ref_x, apply_onorm=False)
+        torch.cuda.synchronize()
+        assert not req.consumed
+        _assert_step_close(x, o, ref_x, ref_o)
+
+    def test_onorm_padded_rows(self):
+        bs = 8
+        x = _make_inputs(bs, seed=33, pad_every=3)
+        ref_x = _clone(x)
+        req = _onorm_request(x)
+        o = _run(x, onorm=req)
+        ref_o = _torch_reference(ref_x, apply_onorm=True)
+        torch.cuda.synchronize()
+        assert req.consumed
+        _assert_step_close(x, o, ref_x, ref_o)
+
+    @pytest.mark.parametrize("bs", [1, 8])
+    def test_onorm_cuda_graph_capture(self, bs):
+        x = _make_inputs(bs, seed=34)
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                _run(_clone(x), onorm=_onorm_request(x))
+        torch.cuda.synchronize()
+        ref_x = _clone(x)
+        ref_o = _torch_reference(ref_x, apply_onorm=True)
+        g = torch.cuda.CUDAGraph()
+        req = _onorm_request(x)
+        with torch.cuda.graph(g, stream=stream):
+            o = _run(x, onorm=req)
+        assert req.consumed  # decided at capture, stable across replays
+        x["h_pool"].copy_(_make_inputs(bs, seed=34)["h_pool"])
+        x["conv_pool"].copy_(_make_inputs(bs, seed=34)["conv_pool"])
         g.replay()
         torch.cuda.synchronize()
         _assert_step_close(x, o, ref_x, ref_o)
