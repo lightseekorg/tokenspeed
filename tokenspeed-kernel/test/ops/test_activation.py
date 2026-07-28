@@ -325,3 +325,44 @@ def test_situ_and_mul_preallocated_out(device: str) -> None:
             beta=4.0,
             linear_beta=25.0,
         )
+
+
+# --- rmsnorm_gated_sigmoid tests ---
+
+
+def _rmsnorm_gated_ref(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    num_heads: int,
+    head_dim: int,
+) -> torch.Tensor:
+    xf = x.to(torch.float32).view(-1, num_heads, head_dim)
+    gf = gate.to(torch.float32).view(-1, num_heads, head_dim)
+    variance = xf.pow(2).mean(dim=-1, keepdim=True)
+    y = xf * torch.rsqrt(variance + eps) * weight.to(torch.float32)
+    y = y * torch.sigmoid(gf)
+    return y.view(x.shape).to(x.dtype)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 32, 100])
+@pytest.mark.parametrize("num_heads", [12, 16])
+def test_rmsnorm_gated_sigmoid_matches_reference(
+    num_tokens: int, num_heads: int, device: str
+) -> None:
+    """Covers both launch layouts: head-split (small T) and fat-CTA (T>64)."""
+    from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
+
+    head_dim = 128
+    eps = 1e-6
+    x = torch.randn(
+        num_tokens, num_heads * head_dim, device=device, dtype=torch.bfloat16
+    )
+    gate = torch.randn_like(x)
+    weight = torch.rand(head_dim, device=device, dtype=torch.bfloat16) + 0.5
+
+    out = rmsnorm_gated_sigmoid(x, gate, weight, eps, num_heads, head_dim)
+
+    ref = _rmsnorm_gated_ref(x, gate, weight, eps, num_heads, head_dim)
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)

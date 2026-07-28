@@ -36,6 +36,9 @@ from tokenspeed_kernel.ops.attention.tokenspeed_mla import mla_kv_pack_quantize_
 from tokenspeed_kernel.ops.attention.triton.mla_query_assemble import (
     mla_nope_query_fp8,
 )
+from tokenspeed_kernel.ops.attention.triton.mla_query_kv_fp8 import (
+    mla_nope_query_kv_fp8,
+)
 from tokenspeed_kernel.ops.embedding import apply_rope_mla
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.gemm.cute_dsl import (
@@ -897,7 +900,28 @@ class DeepseekV3AttentionMLA(nn.Module):
             and q_nope.size(0) > 0
         ):
             # NoPE + fp8: assemble the query straight into fp8; the KV write casts the bf16 latents in-kernel.
-            Q = mla_nope_query_fp8(Q[..., : self.kv_lora_rank], q_pe)
+            # When the pool can hand out its flat fp8 view, the KV commit
+            # rides the same launch (the pair is launch-latency bound at
+            # decode batch sizes); otherwise the two-kernel path stands.
+            commit_view = getattr(ctx.token_to_kv_pool, "mla_fp8_commit_view", None)
+            view = (
+                commit_view(self.attn_mqa, out_cache_loc)
+                if commit_view is not None
+                else None
+            )
+            if view is not None and K is not None:
+                Q = mla_nope_query_kv_fp8(
+                    Q[..., : self.kv_lora_rank],
+                    q_pe,
+                    K,
+                    view,
+                    out_cache_loc,
+                    sanitize=True,
+                    enable_pdl=pdl_enabled(),
+                )
+                K = None  # latents committed; skip the separate KV write
+            else:
+                Q = mla_nope_query_fp8(Q[..., : self.kv_lora_rank], q_pe)
         else:
             Q[..., self.kv_lora_rank :] = q_pe
 

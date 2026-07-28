@@ -216,7 +216,11 @@ def sigmoid_mul(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
     if n == 0:
         return x
 
-    BLOCK_SIZE = 1024
+    # Small (decode-gate) inputs are launch-latency bound: 512-wide blocks
+    # give 2-4 light CTAs that spread across SMs and shave ~0.2us over one
+    # or two 1024-wide CTAs (graph-replay ranked); large inputs keep the
+    # bandwidth-shaped 1024 config.
+    BLOCK_SIZE = 512 if n <= 8192 else 1024
     grid = ((n + BLOCK_SIZE - 1) // BLOCK_SIZE,)
     _sigmoid_mul_kernel[grid](
         x,
@@ -468,7 +472,11 @@ def situ_and_mul(
     if n == 0:
         return out
 
-    block_size = 1024
+    # 512 wins or ties 1024 from single-token decode rows (2-3 CTAs spread
+    # across SMs instead of one fat CTA) through prefill-sized inputs on
+    # SM90+/SM100+ parts; ranked via CUDA-graph replay against Inductor's
+    # autotuned pointwise configs for the same shapes.
+    block_size = 512
     grid = (triton.cdiv(n, block_size),)
     _situ_and_mul_kernel[grid](
         flat_x,
@@ -628,7 +636,11 @@ def _rmsnorm_gated_kernel(
     BLOCK_H: tl.constexpr,
 ):
     token = tl.program_id(0)
-    offs_h = tl.arange(0, BLOCK_H)
+    # Head-block grid axis: one CTA per (token, BLOCK_H heads). With
+    # BLOCK_H >= num_heads the axis is 1 and this is the classic one-CTA-per
+    # -token layout; decode-sized inputs split the heads across light CTAs
+    # instead (launch-latency bound regime, graph-replay ranked).
+    offs_h = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
     offs_d = tl.arange(0, head_dim)
     mask_h = offs_h < num_heads
     idx = token * num_heads * head_dim + offs_h[:, None] * head_dim + offs_d[None, :]
@@ -663,7 +675,17 @@ def rmsnorm_gated_sigmoid(
     """
     assert x.is_contiguous() and gate.is_contiguous()
     out = torch.empty_like(x)
-    _rmsnorm_gated_kernel[(x.shape[0],)](
+    num_tokens = x.shape[0]
+    if num_tokens <= 64:
+        # Launch-latency bound: split the heads over one-warp CTAs (a
+        # [2, head_dim] tile each) so the per-head norms run in parallel
+        # across SMs; ~0.25us faster than the one-fat-CTA layout at decode
+        # sizes (graph-replay ranked) and occupancy-light next to aux-stream
+        # work.
+        block_h, num_warps = 2, 1
+    else:
+        block_h, num_warps = triton.next_power_of_2(num_heads), 4
+    _rmsnorm_gated_kernel[(num_tokens, triton.cdiv(num_heads, block_h))](
         x,
         gate,
         weight,
@@ -671,8 +693,8 @@ def rmsnorm_gated_sigmoid(
         eps,
         num_heads=num_heads,
         head_dim=head_dim,
-        BLOCK_H=triton.next_power_of_2(num_heads),
-        num_warps=4,
+        BLOCK_H=block_h,
+        num_warps=num_warps,
     )
     return out
 

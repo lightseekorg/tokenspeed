@@ -535,3 +535,100 @@ def test_fused_qk_rmsnorm_rope_non_contiguous_input(
 
     torch.testing.assert_close(q_fused, q_contig_fused, atol=0, rtol=0)
     torch.testing.assert_close(k_fused, k_contig_fused, atol=0, rtol=0)
+
+
+# --- rmsnorm_dual_parallel tests ---
+
+
+def _dual_ref(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
+    xf = x.to(torch.float32)
+    variance = xf.pow(2).mean(dim=-1, keepdim=True)
+    return (xf * torch.rsqrt(variance + eps) * w.to(torch.float32)).to(x.dtype)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 7, 129])
+def test_rmsnorm_dual_parallel_matches_reference(num_tokens: int, device: str) -> None:
+    from tokenspeed_kernel.ops.layernorm.triton import rmsnorm_dual_parallel
+
+    eps = 1e-6
+    n1, n2 = 1536, 512
+    # Column slices of one packed projection row (the MLA q_a|kv_a layout).
+    packed = torch.randn(num_tokens, n1 + n2 + 640, device=device, dtype=torch.bfloat16)
+    input1 = packed[:, :n1]
+    input2 = packed[:, n1 : n1 + n2]
+    w1 = torch.randn(n1, device=device, dtype=torch.bfloat16)
+    w2 = torch.randn(n2, device=device, dtype=torch.bfloat16)
+    out1 = torch.empty(num_tokens, n1, device=device, dtype=torch.bfloat16)
+
+    ref1 = _dual_ref(input1, w1, eps)
+    ref2 = _dual_ref(input2, w2, eps)
+
+    # output2 aliases input2 (the runtime normalizes kv_a in place).
+    rmsnorm_dual_parallel(input1, w1, out1, input2, w2, input2, eps)
+
+    torch.testing.assert_close(out1, ref1, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(input2.contiguous(), ref2, atol=2e-2, rtol=2e-2)
+
+
+def test_rmsnorm_dual_parallel_matches_serial_variant(device: str) -> None:
+    from tokenspeed_kernel.ops.layernorm.triton import (
+        rmsnorm_dual_parallel,
+        rmsnorm_fused_parallel,
+    )
+
+    eps = 1e-6
+    input1 = torch.randn(5, 1536, device=device, dtype=torch.bfloat16)
+    input2 = torch.randn(5, 512, device=device, dtype=torch.bfloat16)
+    w1 = torch.randn(1536, device=device, dtype=torch.bfloat16)
+    w2 = torch.randn(512, device=device, dtype=torch.bfloat16)
+    out1_a = torch.empty_like(input1)
+    out2_a = torch.empty_like(input2)
+    out1_b = torch.empty_like(input1)
+    out2_b = torch.empty_like(input2)
+
+    rmsnorm_fused_parallel(input1, w1, out1_a, input2, w2, out2_a, eps)
+    rmsnorm_dual_parallel(input1, w1, out1_b, input2, w2, out2_b, eps)
+
+    torch.testing.assert_close(out1_a, out1_b, atol=0, rtol=0)
+    torch.testing.assert_close(out2_a, out2_b, atol=0, rtol=0)
+
+
+def test_rmsnorm_dual_parallel_rejects_bad_shapes(device: str) -> None:
+    from tokenspeed_kernel.ops.layernorm.triton import rmsnorm_dual_parallel
+
+    input1 = torch.randn(2, 64, device=device, dtype=torch.bfloat16)
+    input2 = torch.randn(3, 32, device=device, dtype=torch.bfloat16)
+    w1 = torch.randn(64, device=device, dtype=torch.bfloat16)
+    w2 = torch.randn(32, device=device, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="row mismatch"):
+        rmsnorm_dual_parallel(input1, w1, input1, input2, w2, input2, 1e-6)
+
+
+def test_rmsnorm_dual_parallel_cuda_graph_capture(device: str) -> None:
+    from tokenspeed_kernel.ops.layernorm.triton import rmsnorm_dual_parallel
+
+    eps = 1e-6
+    input1 = torch.randn(1, 1536, device=device, dtype=torch.bfloat16)
+    input2 = torch.randn(1, 512, device=device, dtype=torch.bfloat16)
+    w1 = torch.randn(1536, device=device, dtype=torch.bfloat16)
+    w2 = torch.randn(512, device=device, dtype=torch.bfloat16)
+    out1 = torch.empty_like(input1)
+    out2 = torch.empty_like(input2)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        rmsnorm_dual_parallel(input1, w1, out1, input2, w2, out2, eps)
+    torch.cuda.current_stream().wait_stream(stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        rmsnorm_dual_parallel(input1, w1, out1, input2, w2, out2, eps)
+
+    input1.copy_(torch.randn_like(input1))
+    input2.copy_(torch.randn_like(input2))
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(out1, _dual_ref(input1, w1, eps), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(out2, _dual_ref(input2, w2, eps), atol=2e-2, rtol=2e-2)

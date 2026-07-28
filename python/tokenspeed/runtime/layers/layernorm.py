@@ -53,13 +53,18 @@ if _is_amd:
         rmsnorm_fused_parallel as triton_rmsnorm_fused_parallel,
     )
 else:
-    from tokenspeed_kernel.ops.layernorm.cuda import rmsnorm_fused_parallel
+    # Dual-RMSNorm: the Triton parallel kernel replaces the flashinfer
+    # RMSNormFusedParallel CUDA kernel on NVIDIA — it wins across decode and
+    # prefill row counts (lighter grid, one CTA per (row, norm), real PDL).
     from tokenspeed_kernel.ops.layernorm.flashinfer import (
         fused_add_rmsnorm,
         gemma_fused_add_rmsnorm,
         gemma_rmsnorm,
         layernorm,
         rmsnorm,
+    )
+    from tokenspeed_kernel.ops.layernorm.triton import (
+        rmsnorm_dual_parallel as rmsnorm_fused_parallel,
     )
 
 

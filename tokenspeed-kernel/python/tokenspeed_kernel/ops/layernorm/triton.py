@@ -521,6 +521,138 @@ def rmsnorm_fused_parallel(
 
 
 @triton.jit
+def _rmsnorm_dual_parallel_kernel(
+    input1_ptr,
+    weight1_ptr,
+    output1_ptr,
+    input2_ptr,
+    weight2_ptr,
+    output2_ptr,
+    n_cols1: tl.constexpr,
+    n_cols2: tl.constexpr,
+    stride_input1,
+    stride_output1,
+    stride_input2,
+    stride_output2,
+    eps: tl.constexpr,
+    BLOCK1: tl.constexpr,
+    BLOCK2: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    """Two independent RMSNorms, one CTA per (row, which-norm).
+
+    Unlike ``_rmsnorm_fused_parallel_kernel`` (one CTA runs both norms
+    serially), the second grid axis splits the two norms across CTAs so their
+    latencies overlap; at decode row counts the whole launch is a handful of
+    CTAs and stays launch-latency bound.
+
+    Provenance: shape/latency behavior cross-checked offline against
+    torch.compile/Inductor codegen of our own dual-RMSNorm repro module
+    (Inductor emitted two separate reduction launches; this kernel keeps the
+    single launch of the cuda/flashinfer path with a lighter grid). No
+    third-party code involved.
+    """
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+
+    row = tl.program_id(0)
+    which = tl.program_id(1)
+
+    if which == 0:
+        offsets = tl.arange(0, BLOCK1)
+        mask = offsets < n_cols1
+        x = tl.load(input1_ptr + row * stride_input1 + offsets, mask=mask, other=0.0)
+        x = x.to(tl.float32)
+        variance = tl.sum(x * x, axis=0) / n_cols1
+        w = tl.load(weight1_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        y = x * tl.rsqrt(variance + eps) * w
+        tl.store(output1_ptr + row * stride_output1 + offsets, y, mask=mask)
+    else:
+        offsets2 = tl.arange(0, BLOCK2)
+        mask2 = offsets2 < n_cols2
+        x2 = tl.load(input2_ptr + row * stride_input2 + offsets2, mask=mask2, other=0.0)
+        x2 = x2.to(tl.float32)
+        variance2 = tl.sum(x2 * x2, axis=0) / n_cols2
+        w2 = tl.load(weight2_ptr + offsets2, mask=mask2, other=0.0).to(tl.float32)
+        y2 = x2 * tl.rsqrt(variance2 + eps) * w2
+        tl.store(output2_ptr + row * stride_output2 + offsets2, y2, mask=mask2)
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+def rmsnorm_dual_parallel(
+    input1: torch.Tensor,
+    weight1: torch.Tensor,
+    output1: torch.Tensor,
+    input2: torch.Tensor,
+    weight2: torch.Tensor,
+    output2: torch.Tensor,
+    eps: float,
+    enable_pdl: bool = False,
+) -> None:
+    """RMSNorm two row-batched tensors in one launch, norms split over CTAs.
+
+    Drop-in signature match for ``rmsnorm_fused_parallel`` (same validation,
+    same in-place-capable outputs) with two differences: the two norms run in
+    parallel CTAs instead of serially inside one CTA, and ``enable_pdl``
+    actually arms programmatic dependent launch instead of being ignored.
+
+    Args:
+        input1: ``[T, n1]`` first input (unit inner stride; may be a column
+            slice of a wider projection).
+        weight1: ``[n1]`` first norm weight.
+        output1: ``[T, n1]`` first output (may alias ``input1``).
+        input2: ``[T, n2]`` second input.
+        weight2: ``[n2]`` second norm weight.
+        output2: ``[T, n2]`` second output (may alias ``input2``).
+        eps: Variance epsilon shared by both norms.
+        enable_pdl: Launch with programmatic dependent launch and fence with
+            ``gdc_wait``/``gdc_launch_dependents``.
+
+    Returns:
+        None; results are written into ``output1``/``output2``.
+    """
+    if input1.shape[0] == 0:
+        return
+    if input1.dim() != 2 or input2.dim() != 2:
+        raise ValueError("rmsnorm_dual_parallel expects 2D inputs")
+    if input1.shape[0] != input2.shape[0]:
+        raise ValueError(f"input row mismatch: {input1.shape[0]} vs {input2.shape[0]}")
+    if input1.shape != output1.shape or input2.shape != output2.shape:
+        raise ValueError("outputs must match their input shapes")
+    if input1.shape[-1] != weight1.shape[0] or input2.shape[-1] != weight2.shape[0]:
+        raise ValueError("weight shapes must match the input hidden sizes")
+    tensors = (input1, weight1, output1, input2, weight2, output2)
+    if any(t.stride(-1) != 1 for t in tensors):
+        raise ValueError("rmsnorm_dual_parallel requires contiguous last dimension")
+
+    n_cols1 = input1.shape[-1]
+    n_cols2 = input2.shape[-1]
+    extra_kwargs = {"launch_pdl": True} if enable_pdl else {}
+    _rmsnorm_dual_parallel_kernel[(input1.shape[0], 2)](
+        input1,
+        weight1,
+        output1,
+        input2,
+        weight2,
+        output2,
+        n_cols1,
+        n_cols2,
+        input1.stride(0),
+        output1.stride(0),
+        input2.stride(0),
+        output2.stride(0),
+        eps,
+        BLOCK1=triton.next_power_of_2(n_cols1),
+        BLOCK2=triton.next_power_of_2(n_cols2),
+        ENABLE_PDL=enable_pdl,
+        num_warps=4,
+        **extra_kwargs,
+    )
+
+
+@triton.jit
 def _fused_qk_rmsnorm_rope_kernel(
     q_ptr,
     k_ptr,
@@ -680,4 +812,5 @@ __all__ = [
     "fused_qk_rmsnorm_rope_gate",
     "fused_qk_rmsnorm_rope",
     "rmsnorm_fused_parallel",
+    "rmsnorm_dual_parallel",
 ]
