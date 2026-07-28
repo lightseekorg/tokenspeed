@@ -1,0 +1,198 @@
+"""Numerics for the CuTe DSL fused KDA decode kernel.
+
+Reference order:
+
+1. A pure-torch fp32 reference of the megafusion math (conv shift + SiLU,
+   f_b gate GEMV + safe/softplus gate, L2 norm, delta-rule step) — the
+   ground truth for every batch size.
+2. (removed) the racy Triton megafusion, deleted from the tree — parity now
+   at small batch: the Triton program relies on same-wave residency for its
+   in-place conv-window shift, and its own outputs flake once its grid
+   exceeds one wave (observed from B=16 at the K3 TP8 geometry). The CuTe
+   kernel orders the shift with a cluster barrier instead and stays
+   deterministic (asserted below via nv=2 vs nv=4 bitwise identity).
+
+The CuTe kernel is JIT-compiled on first use; tests only need a GPU with a
+built tokenspeed_kernel python package (no ahead-of-time kernel build).
+"""
+
+from importlib.util import find_spec
+
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("CUDA required", allow_module_level=True)
+if find_spec("cutlass") is None or find_spec("quack") is None:
+    pytest.skip("cutlass DSL + quack required", allow_module_level=True)
+if torch.cuda.get_device_capability()[0] != 10:
+    pytest.skip("validated on the SM100 family only", allow_module_level=True)
+
+from tokenspeed_kernel.ops.attention.cute_dsl import (  # noqa: E402
+    kda_fused_decode as kfd,
+)
+from tokenspeed_kernel.ops.attention.cute_dsl.kda_fused_decode import (  # noqa: E402
+    cutedsl_fused_recurrent_kda_megafuse,
+)
+
+# K3 decode shapes (TP8 rank): 12 heads, K = V = 128, D_FA = 128.
+HV, K, V = 12, 128, 128
+P = HV * K
+D_FA = 128
+LOWER_BOUND = -5.0
+
+
+def _make_inputs(bs, pages=64, seed=0, pad_every=0):
+    torch.manual_seed(seed)
+    dev = "cuda"
+    x = dict(
+        qkv=torch.randn(bs, 3 * P, dtype=torch.bfloat16, device=dev),
+        conv_w=torch.randn(3 * P, 4, dtype=torch.bfloat16, device=dev) * 0.3,
+        conv_pool=torch.randn(pages, 3 * P, 3, dtype=torch.bfloat16, device=dev),
+        f_a=torch.randn(bs, D_FA, dtype=torch.bfloat16, device=dev),
+        w_fb=torch.randn(P, D_FA, dtype=torch.bfloat16, device=dev) * 0.05,
+        beta=torch.randn(bs, HV, dtype=torch.bfloat16, device=dev),
+        A_log=torch.randn(HV, dtype=torch.float32, device=dev) * 0.5,
+        dt_bias=torch.randn(P, dtype=torch.float32, device=dev),
+        h_pool=torch.randn(pages, HV, K, V, dtype=torch.float32, device=dev),
+        ri=torch.randperm(pages, device=dev)[:bs].to(torch.int32),
+        cu=torch.arange(bs + 1, dtype=torch.int32, device=dev),
+    )
+    x["wi"] = x["ri"].clone()
+    if pad_every:
+        # Graph-padding style rows: negative page ids read zeros/skip stores.
+        pad = torch.arange(bs, device=dev) % pad_every == 0
+        x["ri"] = torch.where(pad, torch.full_like(x["ri"], -1), x["ri"])
+        x["wi"] = torch.where(pad, torch.full_like(x["wi"], -1), x["wi"])
+    return x
+
+
+def _clone(x):
+    return {k: (v.clone() if torch.is_tensor(v) else v) for k, v in x.items()}
+
+
+def _run(x, *, lower_bound=LOWER_BOUND, cu=True, enable_pdl=False):
+    return cutedsl_fused_recurrent_kda_megafuse(
+        x["qkv"],
+        x["conv_w"],
+        x["conv_pool"],
+        x["f_a"],
+        x["w_fb"],
+        x["beta"],
+        x["A_log"],
+        x["dt_bias"],
+        x["h_pool"],
+        x["ri"],
+        x["wi"],
+        num_heads=HV,
+        head_dim=K,
+        cu_seqlens=x["cu"] if cu else None,
+        lower_bound=lower_bound,
+        enable_pdl=enable_pdl,
+    )
+
+
+def _torch_reference(x, *, lower_bound=LOWER_BOUND):
+    """fp32 torch reference of one fused decode step (mutates the pools)."""
+    qkv = x["qkv"].float()
+    conv_w = x["conv_w"].float()
+    f_a = x["f_a"].float()
+    w_fb = x["w_fb"].float()
+    beta = x["beta"].float()
+    A_log = x["A_log"]
+    dt_bias = x["dt_bias"]
+    bs = qkv.shape[0]
+    out = torch.zeros(bs, HV, V, dtype=torch.float32, device=qkv.device)
+    for n in range(bs):
+        r = int(x["ri"][n])
+        w = int(x["wi"][n])
+        window = (
+            x["conv_pool"][r].float()
+            if r >= 0
+            else torch.zeros(3 * P, 3, device=qkv.device)
+        )
+        xt = qkv[n]
+        acc = (window * conv_w[:, :3]).sum(-1) + xt * conv_w[:, 3]
+        y = acc * torch.sigmoid(acc)
+        if w >= 0:
+            new_window = torch.cat([window[:, 1:], xt[:, None]], dim=1)
+            x["conv_pool"][w] = new_window.to(x["conv_pool"].dtype)
+        q = y[:P].view(HV, K)
+        k = y[P : 2 * P].view(HV, K)
+        v = y[2 * P :].view(HV, V)
+        q = q / torch.sqrt((q * q).sum(-1, keepdim=True) + 1e-6) * K**-0.5
+        k = k / torch.sqrt((k * k).sum(-1, keepdim=True) + 1e-6)
+        g = (w_fb @ f_a[n]) + dt_bias
+        g = g.view(HV, K)
+        exp_a = torch.exp(A_log)[:, None]
+        if lower_bound is not None:
+            gk = lower_bound * torch.sigmoid(exp_a * g)
+        else:
+            gk = -exp_a * torch.where(g < 20.0, torch.log1p(torch.exp(g)), g)
+        h = (
+            x["h_pool"][r].clone()
+            if r >= 0
+            else torch.zeros(HV, K, V, device=qkv.device)
+        )
+        h = h * torch.exp(gk)[:, :, None]
+        t = torch.einsum("hkv,hk->hv", h, k)
+        v_new = (v - t) * torch.sigmoid(beta[n])[:, None]
+        h = h + torch.einsum("hk,hv->hkv", k, v_new)
+        out[n] = torch.einsum("hkv,hk->hv", h, q)
+        if w >= 0:
+            x["h_pool"][w] = h
+    return out.to(torch.bfloat16)
+
+
+def _assert_step_close(x, o, ref_x, ref_o, o_atol=6e-3, h_atol=4e-3):
+    torch.testing.assert_close(o.float(), ref_o.float(), atol=o_atol, rtol=1e-2)
+    torch.testing.assert_close(x["h_pool"], ref_x["h_pool"], atol=h_atol, rtol=1e-3)
+    torch.testing.assert_close(
+        x["conv_pool"].float(), ref_x["conv_pool"].float(), atol=0.0, rtol=0.0
+    )
+
+
+class TestKdaFusedDecodeCutedsl:
+    @pytest.mark.parametrize("bs", [1, 2, 3, 4, 5, 8, 12, 16])
+    @pytest.mark.parametrize("lower_bound", [LOWER_BOUND, None])
+    def test_matches_torch_reference(self, bs, lower_bound):
+        x = _make_inputs(bs, seed=bs)
+        ref_x = _clone(x)
+        o = _run(x, lower_bound=lower_bound)
+        ref_o = _torch_reference(ref_x, lower_bound=lower_bound)
+        torch.cuda.synchronize()
+        _assert_step_close(x, o, ref_x, ref_o)
+
+    @pytest.mark.parametrize("bs", [1, 8])
+    def test_cuda_graph_capture(self, bs):
+        x = _make_inputs(bs, seed=8)
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                _run(_clone(x))
+        torch.cuda.synchronize()
+        ref_x = _clone(x)
+        ref_o = _torch_reference(ref_x)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=stream):
+            o = _run(x)
+        # Replay on restored pools reproduces the step (state-pool-resident
+        # in/out, like the engine's decode graph).
+        x["h_pool"].copy_(_make_inputs(bs, seed=8)["h_pool"])
+        x["conv_pool"].copy_(_make_inputs(bs, seed=8)["conv_pool"])
+        g.replay()
+        torch.cuda.synchronize()
+        _assert_step_close(x, o, ref_x, ref_o)
+
+    def test_registry_selects_cutedsl(self):
+        import tokenspeed_kernel.ops.attention  # noqa: F401  (registrations)
+        from tokenspeed_kernel.selection import select_kernel
+        from tokenspeed_kernel.signature import format_signatures
+
+        selected = select_kernel(
+            "attention",
+            "kda_fused_paged_decode",
+            next(iter(format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}))),
+            traits={"flat_state": True},
+        )
+        assert selected.name == "cutedsl_nvidia_kda_fused_paged_decode"

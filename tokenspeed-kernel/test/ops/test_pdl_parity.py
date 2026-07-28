@@ -92,57 +92,6 @@ def test_kimi3_sigmoid_topk_pdl_matches(device: str) -> None:
     torch.testing.assert_close(i_on, i_off, atol=0, rtol=0)
 
 
-def test_kda_megafuse_pdl_matches(device: str) -> None:
-    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
-        fused_recurrent_kda_megafuse,
-    )
-
-    hv, kk, vv, d, pages = 4, 64, 64, 32, 8
-    p = hv * kk
-    args = dict(
-        qkv_raw=torch.randn(1, 3 * p, dtype=torch.bfloat16, device=device),
-        conv_w=torch.randn(3 * p, 4, dtype=torch.bfloat16, device=device).contiguous(),
-        f_a=torch.randn(1, d, dtype=torch.bfloat16, device=device),
-        w_fb=torch.randn(p, d, dtype=torch.bfloat16, device=device).contiguous(),
-        beta=torch.randn(1, hv, dtype=torch.bfloat16, device=device),
-        A_log=torch.randn(hv, dtype=torch.float32, device=device),
-        dt_bias=torch.randn(hv * kk, dtype=torch.float32, device=device),
-        read_indices=torch.tensor([1], dtype=torch.int64, device=device),
-        write_indices=torch.tensor([2], dtype=torch.int64, device=device),
-    )
-    conv0 = torch.randn(pages, 3 * p, 3, dtype=torch.bfloat16, device=device)
-    h0 = torch.randn(pages, hv * kk * vv, dtype=torch.bfloat16, device=device)
-
-    def run(pdl: bool):
-        cp, hp = conv0.clone(), h0.clone()
-        o = fused_recurrent_kda_megafuse(
-            args["qkv_raw"],
-            args["conv_w"],
-            cp,
-            args["f_a"],
-            args["w_fb"],
-            args["beta"],
-            args["A_log"],
-            args["dt_bias"],
-            hp,
-            args["read_indices"],
-            args["write_indices"],
-            num_heads=hv,
-            head_dim=kk,
-            enable_pdl=pdl,
-        )
-        return o, cp, hp
-
-    o_off, cp_off, hp_off = run(False)
-    o_on, cp_on, hp_on = run(True)
-    torch.testing.assert_close(o_on, o_off, atol=0, rtol=0)
-    torch.testing.assert_close(cp_on, cp_off, atol=0, rtol=0)
-    torch.testing.assert_close(hp_on, hp_off, atol=0, rtol=0)
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA graph capture requires a GPU."
-)
 def test_pdl_chained_producer_consumer_cuda_graph(device: str) -> None:
     """PDL-armed consumer chained after a PDL-armed producer in one graph.
 
