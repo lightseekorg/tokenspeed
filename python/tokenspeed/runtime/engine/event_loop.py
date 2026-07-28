@@ -409,8 +409,6 @@ class EventLoop:
                 unsupported.append("layerwise cache transfer")
             if server_args.enable_memory_saver:
                 unsupported.append("memory saver/release")
-            if server_args.enable_prefix_caching:
-                unsupported.append("prefix caching/reuse")
             if server_args.enable_kvstore:
                 unsupported.append("KVStore/host cache")
             # Prefill is forced onto the non-overlap loop by
@@ -1670,28 +1668,35 @@ class EventLoop:
     def _shutdown_complete(self) -> bool:
         return self.shutdown_event.is_set()
 
-    def _flat_page_ids_to_zero(self, execution_plan):
-        """Page ids the scheduler retired for reuse this step.
+    def _flat_pages_to_zero(self, execution_plan):
+        """Group-aware child pages the scheduler assigned in this step.
 
-        A flat-cache pool aliases recurrent-state bytes and fp8 KV in one
-        slab, so a plan that cannot report pages to zero means poisoned KV
-        tails. Fail loudly on that contract mismatch (e.g. a scheduler wheel
-        older than the runtime) instead of silently skipping sanitization.
+        The group is part of the address under two-level placement. Older
+        single-level schedulers expose one global page-id vector instead.
         """
         try:
-            return execution_plan.flat_page_ids_to_zero
+            return execution_plan.flat_pages_to_zero
         except AttributeError:
-            zero_pages = getattr(
-                self.model_executor.token_to_kv_pool, "zero_pages", None
-            )
-            if callable(zero_pages):
+            try:
+                return execution_plan.flat_page_ids_to_zero
+            except AttributeError:
+                pass
+            if getattr(
+                self.model_executor.token_to_kv_pool,
+                "flat_kv_requires_page_zeroing",
+                False,
+            ):
                 raise RuntimeError(
                     "flat KV cache is active but the scheduler's ExecutionPlan "
-                    "has no flat_page_ids_to_zero; the installed "
+                    "has no fresh-page sanitization payload; the installed "
                     "tokenspeed-scheduler build predates page-reuse zeroing — "
                     "rebuild it from this checkout"
                 ) from None
             return ()
+
+    def _flat_page_ids_to_zero(self, execution_plan):
+        """Compatibility alias for tests and older event-loop integrations."""
+        return self._flat_pages_to_zero(execution_plan)
 
     def event_loop(self):
         """Non-overlapping scheduler loop."""
@@ -1710,7 +1715,7 @@ class EventLoop:
             self._publish_scheduler_kv_events()
             self._handle_flat_oom_terminals(execution_plan)
             flat_cache_zero_event = self.model_executor.zero_flat_cache_pages(
-                self._flat_page_ids_to_zero(execution_plan)
+                self._flat_pages_to_zero(execution_plan)
             )
             self._submit_cache_ops(execution_plan)
 
@@ -1867,7 +1872,7 @@ class EventLoop:
             self._handle_flat_oom_terminals(execution_plan)
 
             flat_cache_zero_event = self.model_executor.zero_flat_cache_pages(
-                self._flat_page_ids_to_zero(execution_plan)
+                self._flat_pages_to_zero(execution_plan)
             )
             self._submit_cache_ops(execution_plan)
 

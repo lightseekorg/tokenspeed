@@ -64,10 +64,12 @@ struct CacheKeyHash {
 
 struct KvCacheSpec {
     AttnKind kind;
-    std::int32_t sliding_window;  // 0 for full attention
+    // Only kSlidingWindow uses this value. Mamba's one-checkpoint lookback is
+    // an internal Manager policy rather than a model window.
+    std::int32_t sliding_window;
     // Number of this group's logical cache blocks packed into one physical
     // LCM block. It affects placement only, never prefix-match granularity.
-    std::int32_t cache_blocks_per_lcm_block{1};
+    std::int32_t cache_blocks_per_lcm_block;
 };
 
 // Per-request logical-page -> physical-page mapping.
@@ -104,6 +106,10 @@ struct GroupDemand {
     CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
     std::int32_t num_computed_tokens{-1};
     std::int32_t reserve_tokens{0};
+    // -1 materializes the ordinary dense suffix. A non-negative value keeps
+    // earlier logical slots as null holes and materializes only this suffix.
+    // Decode-side PD uses this for latest-snapshot state groups.
+    std::int32_t materialized_suffix_start{-1};
 };
 
 // LCM ownership ids for scheduler accounting/debugging. Kernel-facing page
@@ -119,7 +125,14 @@ inline std::vector<std::int32_t> BlockTableLcmBlockIds(const BlockTable& table) 
 
 struct PrefixMatch {
     std::vector<CacheBlockRef> blocks{};
-    std::int32_t num_hit_blocks{0};
+
+    std::int32_t NumHitBlocks() const {
+        std::int32_t count = 0;
+        for (const CacheBlockRef& block_ref : blocks) {
+            count += block_ref ? 1 : 0;
+        }
+        return count;
+    }
 };
 
 // Non-owning match shape. A nonzero slot is acquired only after the coordinator

@@ -130,6 +130,118 @@ class TestInklingConvSpecState(unittest.TestCase):
                     f"layer {layer} req {i} accept {a}",
                 )
 
+    def test_checkpoint_metadata_keeps_only_chunk_endpoint(self):
+        from tokenspeed.runtime.layers.attention.backends.inkling import (
+            InklingAttnBackend,
+        )
+
+        pool = self._make_pool()
+        backend = InklingAttnBackend.__new__(InklingAttnBackend)
+        backend.conv_pool = pool
+        backend.conv_columns = {
+            "mode": "checkpoint",
+            "block_tokens": 4,
+            "group_block_tokens": {"state": 4},
+        }
+        metadata = backend._new_checkpoint_metadata(
+            size=2,
+            groups=("state",),
+            device=torch.device("cuda"),
+            include_prefill_rows=True,
+        )
+        pointers = tuple(
+            tensor.data_ptr()
+            for tensor in (
+                metadata.restore_pages["state"],
+                metadata.write_pages["state"],
+                metadata.packed_rows,
+            )
+        )
+        table = torch.tensor([[11, 12, 13], [21, 22, 23]], device="cuda")
+        backend._fill_checkpoint_metadata(
+            metadata,
+            before=torch.tensor([0, 7], device="cuda"),
+            after=torch.tensor([8, 8], device="cuda"),
+            query_start_loc=torch.tensor([0, 8, 9], device="cuda"),
+            col_page_table={"state": table},
+            write_endpoint=True,
+        )
+
+        self.assertEqual(metadata.restore_pages["state"].tolist(), [0, 0])
+        # Request 0 crosses two boundaries, but only its published endpoint is
+        # materialized. Request 1 borrows two rows from its prior window.
+        self.assertEqual(metadata.write_pages["state"].tolist(), [12, 22])
+        self.assertEqual(
+            metadata.packed_row_mask.tolist(), [[True] * 3, [False, False, True]]
+        )
+        self.assertEqual(metadata.packed_rows.tolist(), [[5, 6, 7], [6, 7, 8]])
+        self.assertEqual(metadata.prior_state_rows.tolist(), [[2, 2, 2], [1, 2, 2]])
+        self.assertEqual(
+            pointers,
+            tuple(
+                tensor.data_ptr()
+                for tensor in (
+                    metadata.restore_pages["state"],
+                    metadata.write_pages["state"],
+                    metadata.packed_rows,
+                )
+            ),
+        )
+
+    def test_verify_publishes_only_accepted_aligned_endpoint(self):
+        from tokenspeed.runtime.layers.attention.backends.inkling import (
+            InklingAttnBackend,
+            InklingConvMetadata,
+        )
+
+        pool = self._make_pool()
+        backend = InklingAttnBackend.__new__(InklingAttnBackend)
+        backend.conv_pool = pool
+        backend.conv_spec_num_tokens = self.K
+        backend.conv_columns = {
+            "mode": "checkpoint",
+            "block_tokens": 4,
+            "group_block_tokens": {"state": 4},
+        }
+        backend._verify_stash = torch.randn(
+            self.LAYERS,
+            3 * self.K,
+            self.DIM,
+            device="cuda",
+        )
+        table = torch.tensor(
+            [[11, 12, 13], [21, 22, 23], [31, 32, 33]],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        cache_indices = torch.tensor([1, 2, 3], dtype=torch.int32, device="cuda")
+        backend.conv_metadata = InklingConvMetadata(
+            query_start_loc=torch.arange(0, 3 * self.K + 1, self.K, device="cuda"),
+            cache_indices=cache_indices,
+            has_initial_state=torch.ones(3, dtype=torch.bool, device="cuda"),
+            is_decode=False,
+            update_mode="stash",
+            tokens_per_req=self.K,
+            col_page_table={"state": table},
+            col_seq_lens=torch.full((3,), 8, dtype=torch.int32, device="cuda"),
+        )
+        checkpoint = torch.full(
+            (40, self.W - 1, self.DIM),
+            -7,
+            dtype=pool.conv_state.dtype,
+            device="cuda",
+        )
+        checkpoint[0].zero_()
+        backend._checkpoint_streams = {(0, 0, self.DIM, "state"): (checkpoint,)}
+
+        accept = torch.tensor([4, 3, 0], dtype=torch.int32, device="cuda")
+        backend.update_mamba_state_after_mtp_verify(accept, None)
+
+        self.assertTrue(torch.equal(checkpoint[12], pool.conv_state[0, 1]))
+        self.assertTrue(bool((checkpoint[22] == -7).all()))
+        self.assertTrue(bool((checkpoint[31] == -7).all()))
+        self.assertTrue(bool((checkpoint[0] == 0).all()))
+
     def test_verify_select_padded_batch_oversized_stash(self):
         """Post-verify select with graph-padded shapes: the stash is larger
         than the round's n*k rows (sliced view), accept_lengths covers fewer

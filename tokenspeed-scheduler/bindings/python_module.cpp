@@ -386,11 +386,6 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                 return op.flat_block_tables;
             },
             nb::rv_policy::reference_internal)
-        .def_prop_ro(
-            "new_page_ids",
-            [](const tokenspeed::FlatForwardOperation& op)
-                -> const std::map<std::string, std::vector<std::int32_t>>& { return op.new_page_ids; },
-            nb::rv_policy::reference_internal)
         .def("flat_block_tables_arrays",
              [](nb::handle self) {
                  // Zero-copy 2-D int32 views over the contiguous export
@@ -478,7 +473,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_prop_ro("forward", collect_forward)
         .def_prop_ro("cache", collect_cache)
         .def_ro("flat_oom_request_ids", &tokenspeed::ExecutionPlan::flat_oom_request_ids)
-        .def_ro("flat_page_ids_to_zero", &tokenspeed::ExecutionPlan::flat_page_ids_to_zero)
+        .def_ro("flat_pages_to_zero", &tokenspeed::ExecutionPlan::flat_pages_to_zero)
         .def_ro("flat_terminal_errors", &tokenspeed::ExecutionPlan::flat_terminal_errors);
 
     nb::class_<tokenspeed::Scheduler>(m, "Scheduler")

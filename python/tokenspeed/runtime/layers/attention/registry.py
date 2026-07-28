@@ -30,6 +30,7 @@ import torch
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.lcm_layouts import (
+    draft_history_lcm_fields,
     inkling_lcm_fields,
     qwen_gdn_lcm_fields,
 )
@@ -125,6 +126,69 @@ def _max_lcm_packing(plan, group_ids=None) -> int:
     return max(selected)
 
 
+def _lcm_packing(plan) -> dict[str, int]:
+    return {
+        group.group_id: int(group.cache_blocks_per_lcm_block) for group in plan.groups
+    }
+
+
+def _prepare_draft_lcm_fields(
+    *,
+    server_args,
+    target_plan,
+    draft_attn_config,
+    draft_model_config,
+    qwen_gdn: bool,
+    inkling: bool,
+):
+    """Bind a draft's history layers to the target's cache groups."""
+    num_layers = draft_model_config.num_attention_layers
+    if qwen_gdn:
+        group_ids = ("full_attention",) * num_layers
+        draft_attn_config.layer_types = group_ids
+        layer_kv_heads = (
+            max(draft_attn_config.num_kv_heads // draft_attn_config.attn_tp_size, 1),
+        ) * num_layers
+    elif inkling:
+        num_steps = server_args.speculative_num_steps
+        if num_steps > num_layers:
+            raise ValueError(
+                f"Inkling MTP has {num_layers} depth layers; "
+                f"--speculative-num-steps {num_steps} would wrap depths "
+                "with no trained meaning."
+            )
+        _apply_inkling_hetero_kv(
+            draft_attn_config,
+            draft_model_config,
+            lcm=True,
+        )
+        group_ids = tuple(draft_attn_config.layer_types)
+        layer_kv_heads = tuple(
+            max(1, heads // draft_attn_config.attn_tp_size)
+            for heads in draft_attn_config.layer_kv_head_counts
+        )
+    else:
+        raise ValueError("LCM draft planning requires a registered model recipe")
+
+    target_group_ids = set(_lcm_packing(target_plan))
+    unknown = set(group_ids) - target_group_ids
+    if unknown:
+        raise ValueError(
+            f"draft cache groups are not present in the target plan: {sorted(unknown)}"
+        )
+    draft_attn_config.layer_cache_group_ids = group_ids
+    return draft_history_lcm_fields(
+        layer_group_ids=group_ids,
+        enabled_layer_ids=range(num_layers),
+        logical_block_tokens=target_plan.logical_block_tokens,
+        layer_kv_heads=layer_kv_heads,
+        head_dim=draft_attn_config.head_dim,
+        kv_element_size=draft_attn_config.kv_cache_dtype.itemsize,
+        kv_scale_block_size=32 if draft_attn_config.kv_cache_mxfp8 else 0,
+        kv_scale_element_size=1 if draft_attn_config.kv_cache_mxfp8 else 0,
+    )
+
+
 def _pool_allocated_bytes(pool) -> int:
     if pool is None:
         return 0
@@ -140,12 +204,84 @@ def _pool_allocated_bytes(pool) -> int:
     return int(sizes)
 
 
+def _validate_shared_lcm_geometry(pool, draft_pool) -> None:
+    """Validate the draft's independent arena against target-owned tables."""
+    if draft_pool is None:
+        return
+    target_plan = getattr(pool, "_lcm_memory_plan", None)
+    draft_plan = getattr(draft_pool, "_lcm_memory_plan", None)
+    if draft_plan is None:
+        return
+    if target_plan is None:
+        raise RuntimeError("an LCM draft pool requires an LCM target pool")
+    if (
+        draft_plan.logical_block_tokens != target_plan.logical_block_tokens
+        or draft_plan.num_lcm_blocks != target_plan.num_lcm_blocks
+    ):
+        raise RuntimeError("target and draft LCM parent geometry does not match")
+
+    target_groups = {group.group_id: group for group in target_plan.groups}
+    for draft_group in draft_plan.groups:
+        target_group = target_groups.get(draft_group.group_id)
+        if target_group is None:
+            raise RuntimeError(
+                f"draft LCM group {draft_group.group_id!r} is absent from target"
+            )
+        if (
+            draft_group.cache_blocks_per_lcm_block
+            != target_group.cache_blocks_per_lcm_block
+            or draft_group.page_count != target_group.page_count
+        ):
+            raise RuntimeError(
+                f"target and draft LCM group {draft_group.group_id!r} "
+                "do not share page-id geometry"
+            )
+
+    target_specs = {
+        spec.group_id: spec for spec in getattr(pool, "paged_cache_group_specs", ())
+    }
+    for draft_spec in getattr(draft_pool, "paged_cache_group_specs", ()):
+        target_spec = target_specs.get(draft_spec.group_id)
+        if target_spec is None:
+            raise RuntimeError(
+                f"draft cache group {draft_spec.group_id!r} is absent from target"
+            )
+        shared_policy = (
+            "retention",
+            "rows_per_page",
+            "entry_stride_tokens",
+            "sliding_window_tokens",
+            "family",
+            "block_size",
+            "cache_blocks_per_lcm_block",
+        )
+        if any(
+            getattr(draft_spec, field) != getattr(target_spec, field)
+            for field in shared_policy
+        ):
+            raise RuntimeError(
+                f"target and draft cache group {draft_spec.group_id!r} "
+                "do not share scheduler semantics"
+            )
+
+    target_arena = getattr(pool, "_lcm_arena", None)
+    draft_arena = getattr(draft_pool, "_lcm_arena", None)
+    if target_arena is None or draft_arena is None:
+        raise RuntimeError("LCM target and draft pools must allocate their arenas")
+    if (
+        target_arena.backing.untyped_storage().data_ptr()
+        == draft_arena.backing.untyped_storage().data_ptr()
+    ):
+        raise RuntimeError("target and draft LCM arenas must not share backing")
+
+
 def _cache_storage_report(
     *,
     configured_cache_bytes: int,
     pool,
     draft_pool,
     mamba_pool,
+    fixed_workspace_bytes: int = 0,
 ) -> dict:
     """Describe cache storage from allocated tensors, not scheduler counts."""
     plan = getattr(pool, "_lcm_memory_plan", None)
@@ -196,9 +332,17 @@ def _cache_storage_report(
         if mamba_pool is not None
         else 0
     )
+    allocated_cache_bytes = (
+        target_bytes + draft_bytes + mamba_bytes + fixed_workspace_bytes
+    )
+    if allocated_cache_bytes > configured_cache_bytes:
+        raise RuntimeError(
+            "allocated cache storage exceeds its profiled budget: "
+            f"{allocated_cache_bytes} > {configured_cache_bytes}"
+        )
     return {
         "configured_cache_bytes": int(configured_cache_bytes),
-        "allocated_cache_bytes": target_bytes + draft_bytes + mamba_bytes,
+        "allocated_cache_bytes": allocated_cache_bytes,
         "physical_token_capacity": physical_token_capacity,
         "capacity_source": capacity_source,
         "geometry": geometry
@@ -206,6 +350,7 @@ def _cache_storage_report(
             "target_bytes": target_bytes,
             "draft_bytes": draft_bytes,
             "mamba_bytes": mamba_bytes,
+            "fixed_workspace_bytes": fixed_workspace_bytes,
         },
     }
 
@@ -924,6 +1069,33 @@ def _wrap_inkling_backend(inner, text_config, attn_config, *, num_layers, is_dra
     return backend, conv_pool
 
 
+def _inkling_fixed_workspace_bytes(
+    *,
+    text_config,
+    attn_config,
+    num_layers: int,
+    verify_tokens: int = 0,
+    lagged_window: bool = False,
+) -> int:
+    """Price persistent rolling/speculative ShortConv state before LCM sizing."""
+    from tokenspeed.runtime.configs.inkling_config import inkling_conv_total_dim
+
+    rows = int(attn_config.max_bs) + 2
+    state_rows = int(text_config.sconv_kernel_size) - 1
+    conv_dim = inkling_conv_total_dim(text_config, attn_config.attn_tp_size)
+    element_size = torch.empty((), dtype=torch.bfloat16).element_size()
+    rolling = num_layers * rows * state_rows * conv_dim * element_size
+    verify = (
+        num_layers
+        * int(attn_config.max_bs)
+        * int(verify_tokens)
+        * conv_dim
+        * element_size
+    )
+    lag = rolling if lagged_window else 0
+    return rolling + verify + lag
+
+
 def _inkling_conv_columns(pool, text_config, conv_bt=None, hbt=None):
     """kvconv-as-swa geometry for the backend (None if no kvconv pages).
 
@@ -1089,6 +1261,12 @@ def create_attn_components(
 
     config = _create_attn_config(server_args, model_config)
     flat_kvcache = scheduler_ext_flat_kvcache()
+    if (
+        is_inkling
+        and flat_kvcache
+        and server_args.disaggregation_mode in ("prefill", "decode")
+    ):
+        raise NotImplementedError("Inkling FlatKV PD is not supported")
     has_gdn_state = getattr(config, "conv_state_shape", None) is not None
     use_lcm_gdn = is_hybrid_gdn and has_gdn_state and flat_kvcache
     # Keep the production Inkling path unchanged until boundary checkpoints
@@ -1229,11 +1407,45 @@ def create_attn_components(
         has_mamba_layers
     )
     cache_budget_bytes = None
+    fixed_workspace_bytes = 0
     mamba_pool_total_chunks = 0
     mamba_pool = None
     draft_max_num_tokens = None
     # Kimi-K3 FlatKV contract plan; None on every other model's path.
     kimi_flat_plan = None
+    if use_lcm_gdn and draft_attn_config is not None:
+        draft_token_num = int(server_args.speculative_num_draft_tokens)
+        verify_rows = config.max_bs * (draft_token_num + 1)
+        fixed_workspace_bytes = verify_rows * sum(
+            field.payload_bytes
+            for field in flat_lcm_fields
+            if field.field_id.endswith((".conv", ".ssm"))
+        )
+    elif use_lcm_inkling:
+        text_config = model_config.hf_config.get_text_config()
+        draft_token_num = (
+            int(server_args.speculative_num_draft_tokens)
+            if draft_attn_config is not None
+            else 0
+        )
+        fixed_workspace_bytes = _inkling_fixed_workspace_bytes(
+            text_config=text_config,
+            attn_config=config,
+            num_layers=text_config.num_hidden_layers,
+            verify_tokens=draft_token_num,
+        )
+        if draft_attn_config is not None:
+            draft_text_config = draft_model_config.hf_config.get_text_config()
+            lagged_window = (
+                int(server_args.speculative_num_steps) > 1
+                and os.environ.get("INKLING_MTP_DECODE_LOOKBACK", "1") != "0"
+            )
+            fixed_workspace_bytes += _inkling_fixed_workspace_bytes(
+                text_config=draft_text_config,
+                attn_config=draft_attn_config,
+                num_layers=draft_model_config.num_attention_layers,
+                lagged_window=lagged_window,
+            )
 
     _profile_kwargs = dict(
         attn_config=config,
@@ -1367,30 +1579,39 @@ def create_attn_components(
             # relevant acceptance check.
             max_padding_fraction=lcm_max_padding_fraction,
         )
+        target_packing = _lcm_packing(flat_plan)
         max_packing = _max_lcm_packing(flat_plan)
+        draft_fields = None
+        draft_group_packing = {}
+        draft_parent_bytes = 0
         draft_packing = max_packing
-        draft_bytes_per_token = 0
         if draft_attn_config is not None:
-            # The draft pool consumes the target layers' flat page tables,
-            # not extra state/checkpoint groups. Size its dense page-id
-            # space from those groups only (Inkling checkpoint K can be
-            # 21/42 while its attention K is at most 2).
-            draft_packing = _max_lcm_packing(
-                flat_plan, set(config.layer_cache_group_ids)
+            draft_fields = _prepare_draft_lcm_fields(
+                server_args=server_args,
+                target_plan=flat_plan,
+                draft_attn_config=draft_attn_config,
+                draft_model_config=draft_model_config,
+                qwen_gdn=use_lcm_gdn,
+                inkling=use_lcm_inkling,
             )
-            draft_bytes_per_token = _resolve_draft_cache_cell_size_for_profile(
-                draft_attn_config, draft_model_config, draft_profile_cache_cell_size
+            draft_group_ids = {field.group_id for field in draft_fields}
+            draft_group_packing = {
+                group_id: target_packing[group_id] for group_id in draft_group_ids
+            }
+            draft_geometry = plan_lcm_fields(
+                draft_fields,
+                logical_block_tokens=server_args.block_size,
+                num_lcm_blocks=1,
+                cache_blocks_per_lcm_block=draft_group_packing,
+                alignment=256,
+                max_padding_fraction=lcm_max_padding_fraction,
             )
-        bytes_per_usable_parent = flat_plan.lcm_block_bytes + (
-            draft_bytes_per_token * server_args.block_size * draft_packing
-        )
-        # The target arena materializes one full null LCM parent. The dense
-        # draft pool needs only page id 0, i.e. one P-row dummy page rather
-        # than K draft pages.
-        fixed_null_bytes = flat_plan.lcm_block_bytes + (
-            draft_bytes_per_token * server_args.block_size
-        )
-        num_lcm_blocks = (cache_memory - fixed_null_bytes) // bytes_per_usable_parent
+            draft_parent_bytes = draft_geometry.lcm_block_bytes
+            draft_packing = _max_lcm_packing(draft_geometry)
+        parent_bytes = flat_plan.lcm_block_bytes + draft_parent_bytes
+        # Both arenas reserve parent 0 as their kernel-safe null parent.
+        usable_cache_bytes = cache_memory - fixed_workspace_bytes
+        num_lcm_blocks = usable_cache_bytes // parent_bytes - 1
         if num_lcm_blocks < 1:
             raise ValueError(
                 "cache budget must hold a null parent and one usable LCM parent"
@@ -1412,18 +1633,30 @@ def create_attn_components(
         flat_plan = plan_lcm_fields(
             flat_lcm_fields,
             logical_block_tokens=server_args.block_size,
-            budget_bytes=(num_lcm_blocks + 1) * flat_plan.lcm_block_bytes,
+            num_lcm_blocks=num_lcm_blocks,
+            cache_blocks_per_lcm_block=target_packing,
             alignment=256,
             max_padding_fraction=lcm_max_padding_fraction,
         )
+        if draft_fields is not None:
+            draft_lcm_plan = plan_lcm_fields(
+                draft_fields,
+                logical_block_tokens=server_args.block_size,
+                num_lcm_blocks=num_lcm_blocks,
+                cache_blocks_per_lcm_block=draft_group_packing,
+                alignment=256,
+                max_padding_fraction=lcm_max_padding_fraction,
+            )
+            draft_attn_config.lcm_memory_plan = draft_lcm_plan
         config.lcm_memory_plan = flat_plan
         if use_lcm_inkling:
             config.extra_paged_groups = _inkling_checkpoint_group_specs(flat_plan)
         max_total_num_pages = flat_plan.num_lcm_blocks
         logger.info(
-            "Flat LCM profile: lcm_block_bytes=%d, P=%d, "
-            "num_lcm_blocks=%d, groups=%s",
+            "Flat LCM profile: target_parent_bytes=%d, draft_parent_bytes=%d, "
+            "P=%d, num_lcm_blocks=%d, groups=%s",
             flat_plan.lcm_block_bytes,
+            draft_parent_bytes,
             server_args.block_size,
             flat_plan.num_lcm_blocks,
             {
@@ -1679,12 +1912,6 @@ def create_attn_components(
         elif any(a in _INKLING_ARCHITECTURES for a in draft_archs):
             draft_text_config = draft_model_config.hf_config.get_text_config()
             num_depths = draft_model_config.num_attention_layers
-            if server_args.speculative_num_steps > num_depths:
-                raise ValueError(
-                    f"Inkling MTP has {num_depths} depth layers; "
-                    f"--speculative-num-steps {server_args.speculative_num_steps} "
-                    "would wrap depths with no trained meaning."
-                )
             # Hetero KV, symmetric with the target pool: per-depth head
             # counts come from the MTP text config's own local ids
             # (ModelConfig swapped it in for the draft worker), giving the
@@ -1698,14 +1925,11 @@ def create_attn_components(
             # allocation. (The former num_kv_heads pin + explicit 2x row
             # sizing described the all-full-attention special case of this
             # same byte math.)
-            _apply_inkling_hetero_kv(
-                draft_attn_config,
-                draft_model_config,
-                lcm=use_lcm_inkling,
-            )
-            if use_lcm_inkling:
-                draft_attn_config.layer_cache_group_ids = tuple(
-                    draft_attn_config.layer_types
+            if not use_lcm_inkling:
+                _apply_inkling_hetero_kv(
+                    draft_attn_config,
+                    draft_model_config,
+                    lcm=False,
                 )
             logger.info(
                 "Inkling MTP draft pool: hetero KV layer head counts=%s, "
@@ -1746,6 +1970,39 @@ def create_attn_components(
                 enable_memory_saver,
             )
 
+    _validate_shared_lcm_geometry(pool, draft_pool)
+    if use_lcm_gdn and fixed_workspace_bytes:
+        actual_workspace_bytes = (
+            backend.linear_attn_backend.preallocate_flat_verify_workspace(
+                config.max_bs,
+                int(server_args.speculative_num_draft_tokens),
+            )
+        )
+        if actual_workspace_bytes != fixed_workspace_bytes:
+            raise RuntimeError(
+                "planned GDN verify workspace does not match allocated tensors: "
+                f"{fixed_workspace_bytes} planned, {actual_workspace_bytes} allocated"
+            )
+    elif use_lcm_inkling:
+        backend.preallocate_verify_workspace(config.max_bs)
+        if draft_attn_backend is not None:
+            lookback = (
+                int(server_args.speculative_num_steps) - 1
+                if int(server_args.speculative_num_steps) > 1
+                and os.environ.get("INKLING_MTP_DECODE_LOOKBACK", "1") != "0"
+                else 0
+            )
+            if lookback and not draft_attn_backend.configure_draft_lookback(lookback):
+                raise RuntimeError("Inkling MTP draft rejected its planned lookback")
+        actual_workspace_bytes = backend.fixed_workspace_bytes()
+        if draft_attn_backend is not None:
+            actual_workspace_bytes += draft_attn_backend.fixed_workspace_bytes()
+        if actual_workspace_bytes != fixed_workspace_bytes:
+            raise RuntimeError(
+                "planned Inkling workspace does not match allocated tensors: "
+                f"{fixed_workspace_bytes} planned, {actual_workspace_bytes} allocated"
+            )
+
     cache_storage = None
     if is_hybrid_gdn or use_lcm_inkling:
         if cache_budget_bytes is None:
@@ -1755,6 +2012,7 @@ def create_attn_components(
             pool=pool,
             draft_pool=draft_pool,
             mamba_pool=mamba_pool,
+            fixed_workspace_bytes=fixed_workspace_bytes,
         )
 
     return (

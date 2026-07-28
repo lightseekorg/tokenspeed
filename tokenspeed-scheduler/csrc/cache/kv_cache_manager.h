@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <iterator>
 #include <limits>
 #include <list>
 #include <optional>
@@ -41,31 +42,6 @@ namespace tokenspeed {
 // Per-attention-type token policy plus cache metadata for one group. Physical
 // placement remains entirely in BlockPool.
 class KvCacheManager {
-private:
-    struct CacheEntry {
-        CacheKey key;
-        CacheBlockRef block_ref;
-        std::uint64_t last_access_epoch{0};
-        // Position in the request's logical prefix. Host-only entries may not
-        // have a device-table position yet.
-        std::int32_t logical_block_index{-1};
-        CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
-        // Set only after a successful request admission acquires this entry.
-        bool was_acquired{false};
-    };
-
-    using LruEntries = std::list<CacheEntry>;
-    using CacheEntryIterator = LruEntries::iterator;
-    using ConstCacheEntryIterator = LruEntries::const_iterator;
-
-    struct CacheEntries {
-        // Owns each CacheEntry once in LRU order. The maps are non-owning
-        // secondary indices into stable list nodes for key and location lookup.
-        LruEntries lru;
-        std::unordered_map<CacheKey, CacheEntryIterator, CacheKeyHash> by_key;
-        std::unordered_map<CacheBlockLocation, CacheEntryIterator, CacheBlockLocationHash> by_location;
-    };
-
 public:
     // Read-only admission snapshot from one cache-index lookup; owns no block.
     struct CachedBlockMetadata {
@@ -129,11 +105,11 @@ public:
             }
             _assert(cache_index != nullptr, "cached pool disappeared between match probe and acquisition");
             CacheEntryIterator entry_it = findEntry(*cache_index, keys[static_cast<std::size_t>(begin_blocks) + i]);
-            _assert(entry_it != cache_index->lru.end(), "cached block disappeared between match probe and acquisition");
+            _assert(entry_it != cache_index->entries.end(),
+                    "cached block disappeared between match probe and acquisition");
             entry_it->was_acquired = true;
-            touch(*cache_index, entry_it, access_epoch);
+            entry_it->last_access_epoch = access_epoch;
             match.blocks[i] = entry_it->block_ref;
-            ++match.num_hit_blocks;
         }
         return match;
     }
@@ -153,7 +129,7 @@ public:
             _assert(cache_index != nullptr, "cached pool disappeared between match probes");
             ConstCacheEntryIterator entry_it =
                 findEntry(*cache_index, keys[static_cast<std::size_t>(begin_blocks) + i]);
-            _assert(entry_it != cache_index->lru.end(), "cached block disappeared between match probes");
+            _assert(entry_it != cache_index->entries.end(), "cached block disappeared between match probes");
             locations.push_back(entry_it->block_ref->Location());
         }
         return locations;
@@ -209,24 +185,59 @@ public:
         _assert(destination_it == destination_refs.end(), "unused host extension destination");
     }
 
-private:
-    void appendBlocks(BlockTable& table, std::int32_t num_tokens, std::vector<CacheBlockRef> block_refs) {
-        const std::int32_t added_tokens = static_cast<std::int32_t>(block_refs.size()) * cache_block_tokens_;
-        _assert(num_tokens <= table.available_tokens_ + added_tokens,
-                "allocated blocks do not cover the immediate token demand");
-        for (CacheBlockRef& block_ref : block_refs) {
-            table.blocks_.push_back(std::move(block_ref));
-        }
-        table.available_tokens_ += added_tokens - num_tokens;
-    }
-
-public:
     std::int32_t BlocksNeededFor(const BlockTable& table, std::int32_t num_tokens) const {
         if (num_tokens <= table.available_tokens_) {
             return 0;
         }
         const std::int32_t over = num_tokens - table.available_tokens_;
         return (over + cache_block_tokens_ - 1) / cache_block_tokens_;
+    }
+
+    std::int32_t BlocksNeededFor(const BlockTable& table, const GroupDemand& demand) const {
+        if (demand.materialized_suffix_start < 0) {
+            return BlocksNeededFor(table, demand.num_tokens + demand.reserve_tokens);
+        }
+
+        // Decode-side prefix acquisition may have already installed aligned
+        // null holes for state. They carry no ownership and remain safe to
+        // extend sparsely up to the remote endpoint snapshot.
+        _assert(table.available_tokens_ == 0, "sparse suffix materialization requires a page boundary");
+        _assert(table.blocks_.size() <= static_cast<std::size_t>(demand.materialized_suffix_start),
+                "sparse suffix overlaps the existing block table");
+        _assert(std::ranges::all_of(table.blocks_, [](const CacheBlockRef& block_ref) { return !block_ref; }),
+                "sparse suffix prefix must contain only null holes");
+        _assert(demand.num_tokens > 0 && demand.reserve_tokens >= 0,
+                "sparse suffix materialization requires a positive extent");
+        const std::int64_t extent = static_cast<std::int64_t>(demand.num_tokens) + demand.reserve_tokens;
+        _assert(extent <= std::numeric_limits<std::int32_t>::max(), "sparse suffix extent exceeds int32 range");
+        const std::int32_t last_block = static_cast<std::int32_t>((extent - 1) / cache_block_tokens_);
+        _assert(demand.materialized_suffix_start <= last_block,
+                "materialized suffix starts beyond the requested extent");
+        return last_block - demand.materialized_suffix_start + 1;
+    }
+
+    bool Acquire(BlockPool& pool, BlockTable& table, const GroupDemand& demand) {
+        if (demand.materialized_suffix_start < 0) {
+            return Acquire(pool, table, demand.num_tokens, demand.reserve_tokens);
+        }
+
+        const std::int32_t num_blocks = BlocksNeededFor(table, demand);
+        std::vector<CacheBlockRef> block_refs =
+            pool.AcquireBlocks(group_id_, cache_blocks_per_lcm_block_, num_blocks);
+        if (static_cast<std::int32_t>(block_refs.size()) != num_blocks) {
+            return false;
+        }
+
+        const std::int64_t extent = static_cast<std::int64_t>(demand.num_tokens) + demand.reserve_tokens;
+        const std::int32_t logical_blocks = static_cast<std::int32_t>(
+            (extent + cache_block_tokens_ - 1) / cache_block_tokens_);
+        table.blocks_.resize(static_cast<std::size_t>(logical_blocks));
+        for (std::size_t i = 0; i < block_refs.size(); ++i) {
+            table.blocks_[static_cast<std::size_t>(demand.materialized_suffix_start) + i] =
+                std::move(block_refs[i]);
+        }
+        table.available_tokens_ = logical_blocks * cache_block_tokens_ - demand.num_tokens;
+        return true;
     }
 
     void RegisterCachedBlock(BlockPool& pool, CacheBlockRef& block_ref, const CacheKey& key,
@@ -237,32 +248,32 @@ public:
         validateKey(key);
         CacheEntries& cache_index = cacheEntries(pool);
         CacheEntryIterator existing_it = findEntry(cache_index, block_ref->Location());
-        if (existing_it != cache_index.lru.end()) {
+        if (existing_it != cache_index.entries.end()) {
             _assert(existing_it->key == key, "one cache block location cannot change cache key");
             if (existing_it->boundary_kind < boundary_kind) {
                 existing_it->boundary_kind = boundary_kind;
             }
-            touch(cache_index, existing_it, access_epoch);
+            existing_it->last_access_epoch = access_epoch;
             return;
         }
         CacheEntryIterator canonical_it = findEntry(cache_index, key);
-        if (canonical_it != cache_index.lru.end()) {
+        if (canonical_it != cache_index.entries.end()) {
             if (canonical_it->boundary_kind < boundary_kind) {
                 canonical_it->boundary_kind = boundary_kind;
             }
-            touch(cache_index, canonical_it, access_epoch);
+            canonical_it->last_access_epoch = access_epoch;
             block_ref = canonical_it->block_ref;
             return;
         }
 
-        cache_index.lru.push_back(CacheEntry{
+        cache_index.entries.push_back(CacheEntry{
             .key = key,
             .block_ref = block_ref,
             .last_access_epoch = access_epoch,
             .logical_block_index = logical_block_index,
             .boundary_kind = boundary_kind,
         });
-        CacheEntryIterator entry_it = std::prev(cache_index.lru.end());
+        CacheEntryIterator entry_it = std::prev(cache_index.entries.end());
         cache_index.by_key.emplace(entry_it->key, entry_it);
         cache_index.by_location.emplace(entry_it->block_ref->Location(), entry_it);
         if (newly_cached != nullptr) {
@@ -289,11 +300,11 @@ public:
 
     bool ContainsCachedBlock(const BlockPool& pool, const CacheKey& key) const {
         const CacheEntries* cache_index = findCacheEntries(pool);
-        return cache_index != nullptr && findEntry(*cache_index, key) != cache_index->lru.end();
+        return cache_index != nullptr && findEntry(*cache_index, key) != cache_index->entries.end();
     }
     bool ContainsCachedBlock(const BlockPool& pool, CacheBlockLocation location) const {
         const CacheEntries* cache_index = findCacheEntries(pool);
-        return cache_index != nullptr && findEntry(*cache_index, location) != cache_index->lru.end();
+        return cache_index != nullptr && findEntry(*cache_index, location) != cache_index->entries.end();
     }
     std::optional<CachedBlockMetadata> CachedBlockMetadataFor(const BlockPool& pool,
                                                               CacheBlockLocation location) const {
@@ -302,7 +313,7 @@ public:
             return std::nullopt;
         }
         ConstCacheEntryIterator entry_it = findEntry(*cache_index, location);
-        if (entry_it == cache_index->lru.end()) {
+        if (entry_it == cache_index->entries.end()) {
             return std::nullopt;
         }
         return CachedBlockMetadata{
@@ -314,7 +325,7 @@ public:
     }
     std::int32_t NumCachedBlocks(const BlockPool& pool) const {
         const CacheEntries* cache_index = findCacheEntries(pool);
-        return cache_index == nullptr ? 0 : static_cast<std::int32_t>(cache_index->lru.size());
+        return cache_index == nullptr ? 0 : static_cast<std::int32_t>(cache_index->entries.size());
     }
     std::int32_t NumPinnedCachedBlocks(const BlockPool& pool) const {
         const CacheEntries* cache_index = findCacheEntries(pool);
@@ -322,7 +333,8 @@ public:
             return 0;
         }
         return static_cast<std::int32_t>(std::ranges::count_if(
-            cache_index->lru, [](const CacheEntry& cache_entry) { return cache_entry.block_ref.use_count() > 1; }));
+            cache_index->entries,
+            [](const CacheEntry& cache_entry) { return cache_entry.block_ref.use_count() > 1; }));
     }
 
     std::vector<CacheBlockLocation> EvictableBlockLocations(const BlockPool& pool) const {
@@ -331,7 +343,7 @@ public:
             return {};
         }
         std::vector<CacheBlockLocation> locations;
-        for (const CacheEntry& cache_entry : cache_index->lru) {
+        for (const CacheEntry& cache_entry : cache_index->entries) {
             if (cache_entry.block_ref.unique()) {
                 locations.push_back(cache_entry.block_ref->Location());
             }
@@ -345,7 +357,7 @@ public:
             return false;
         }
         CacheEntryIterator entry_it = findEntry(*cache_index, location);
-        if (entry_it == cache_index->lru.end() || !entry_it->block_ref.unique()) {
+        if (entry_it == cache_index->entries.end() || !entry_it->block_ref.unique()) {
             return false;
         }
         eraseEntry(*cache_index, entry_it);
@@ -353,18 +365,24 @@ public:
     }
 
     bool ParentIsFullyEvictable(const BlockPool& pool, std::int32_t lcm_block_id) const {
-        const std::vector<CacheBlockLocation> locations = pool.OccupiedLocations(lcm_block_id);
-        if (locations.empty()) {
+        if (pool.OccupiedCount(lcm_block_id) == 0) {
             return false;
         }
         const CacheEntries* cache_index = findCacheEntries(pool);
         if (cache_index == nullptr) {
             return false;
         }
-        return std::ranges::all_of(locations, [&](CacheBlockLocation location) {
+        for (std::int32_t slot = 0; slot < cache_blocks_per_lcm_block_; ++slot) {
+            const CacheBlockLocation location{.lcm_block_id = lcm_block_id, .slot_index = slot};
+            if (!pool.IsOccupied(location)) {
+                continue;
+            }
             ConstCacheEntryIterator entry_it = findEntry(*cache_index, location);
-            return entry_it != cache_index->lru.end() && entry_it->block_ref.unique();
-        });
+            if (entry_it == cache_index->entries.end() || !entry_it->block_ref.unique()) {
+                return false;
+            }
+        }
+        return true;
     }
 
     virtual void ReclaimExpired(BlockPool& /*pool*/, BlockTable& /*table*/, std::int32_t /*num_computed_tokens*/) {}
@@ -384,6 +402,8 @@ public:
     }
 
     void Free(BlockTable& table) {
+        // Release the logical suffix first so newly emptied LCM parents enter
+        // the FIFO free queue in deterministic table order.
         for (auto it = table.blocks_.rbegin(); it != table.blocks_.rend(); ++it) {
             it->reset();
         }
@@ -407,6 +427,41 @@ protected:
     GroupId group_id_;
 
 private:
+    struct CacheEntry {
+        CacheKey key;
+        CacheBlockRef block_ref;
+        std::uint64_t last_access_epoch{0};
+        // Position in the request's logical prefix. Host-only entries may not
+        // have a device-table position yet.
+        std::int32_t logical_block_index{-1};
+        CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
+        // Set only after a successful request admission acquires this entry.
+        bool was_acquired{false};
+    };
+
+    using CacheEntryList = std::list<CacheEntry>;
+    using CacheEntryIterator = CacheEntryList::iterator;
+    using ConstCacheEntryIterator = CacheEntryList::const_iterator;
+
+    struct CacheEntries {
+        // Owns each CacheEntry once. The maps are non-owning secondary indices
+        // into stable list nodes for key and location lookup. Global eviction
+        // order is derived by AdmissionPlanner from CacheEntry metadata.
+        CacheEntryList entries;
+        std::unordered_map<CacheKey, CacheEntryIterator, CacheKeyHash> by_key;
+        std::unordered_map<CacheBlockLocation, CacheEntryIterator, CacheBlockLocationHash> by_location;
+    };
+
+    void appendBlocks(BlockTable& table, std::int32_t num_tokens, std::vector<CacheBlockRef> block_refs) {
+        const std::int32_t added_tokens = static_cast<std::int32_t>(block_refs.size()) * cache_block_tokens_;
+        _assert(num_tokens <= table.available_tokens_ + added_tokens,
+                "allocated blocks do not cover the immediate token demand");
+        for (CacheBlockRef& block_ref : block_refs) {
+            table.blocks_.push_back(std::move(block_ref));
+        }
+        table.available_tokens_ += added_tokens - num_tokens;
+    }
+
     CacheEntries& cacheEntries(const BlockPool& pool) {
         return cache_entries_by_pool_.try_emplace(&pool).first->second;
     }
@@ -425,29 +480,25 @@ private:
     CacheEntryIterator findEntry(CacheEntries& cache_index, const CacheKey& key) {
         validateKey(key);
         auto index_it = cache_index.by_key.find(key);
-        return index_it == cache_index.by_key.end() ? cache_index.lru.end() : index_it->second;
+        return index_it == cache_index.by_key.end() ? cache_index.entries.end() : index_it->second;
     }
     CacheEntryIterator findEntry(CacheEntries& cache_index, CacheBlockLocation location) {
         auto index_it = cache_index.by_location.find(location);
-        return index_it == cache_index.by_location.end() ? cache_index.lru.end() : index_it->second;
+        return index_it == cache_index.by_location.end() ? cache_index.entries.end() : index_it->second;
     }
     ConstCacheEntryIterator findEntry(const CacheEntries& cache_index, const CacheKey& key) const {
         validateKey(key);
         auto index_it = cache_index.by_key.find(key);
-        return index_it == cache_index.by_key.end() ? cache_index.lru.end() : index_it->second;
+        return index_it == cache_index.by_key.end() ? cache_index.entries.end() : index_it->second;
     }
     ConstCacheEntryIterator findEntry(const CacheEntries& cache_index, CacheBlockLocation location) const {
         auto index_it = cache_index.by_location.find(location);
-        return index_it == cache_index.by_location.end() ? cache_index.lru.end() : index_it->second;
+        return index_it == cache_index.by_location.end() ? cache_index.entries.end() : index_it->second;
     }
     void eraseEntry(CacheEntries& cache_index, CacheEntryIterator entry_it) {
         cache_index.by_key.erase(entry_it->key);
         cache_index.by_location.erase(entry_it->block_ref->Location());
-        cache_index.lru.erase(entry_it);
-    }
-    void touch(CacheEntries& cache_index, CacheEntryIterator entry_it, std::uint64_t access_epoch) {
-        entry_it->last_access_epoch = access_epoch;
-        cache_index.lru.splice(cache_index.lru.end(), cache_index.lru, entry_it);
+        cache_index.entries.erase(entry_it);
     }
 
     // Indices are pool-scoped because the same Manager can serve device and

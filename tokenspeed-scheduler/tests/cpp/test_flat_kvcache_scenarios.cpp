@@ -2892,51 +2892,55 @@ TEST_F(FlatHostHitSuite, HostHitLoadsBackAfterDeviceEviction) {
     ASSERT_EQ(free_at_start, 12);
     SeedHostThenEvictDevice();
 
-    // r2 == r1's tokens: hash cap = (8-1)/2 = 3 pages, device common 0 (all recycled) ->
-    // host extension 3 blocks; real pages = full 3 + swa tail ceil((W-1)/P) = 2 -> 5 pairs.
-    Submit(MakeRequestSpec("r2", /*num_pages=*/4));
+    // r2 extends r1 by one page, so r1's 8-token endpoint is a matchable boundary:
+    // full extension 4 blocks + SWA resume tail 2 blocks = 6 transfer pairs.
+    Submit(MakeRequestSpec("r2", /*num_pages=*/5));
     ExecutionPlan plan = PlanOnce();
     auto lb = FindFlatLoadBack(plan);
     ASSERT_TRUE(lb.has_value());
     ASSERT_EQ(lb->op_ids.size(), 1u);
-    ASSERT_EQ(lb->src_pages.at(0).size(), 5u);
-    ASSERT_EQ(lb->dst_pages.at(0).size(), 5u);
+    ASSERT_EQ(lb->src_pages.at(0).size(), 6u);
+    ASSERT_EQ(lb->dst_pages.at(0).size(), 6u);
 
     const FlatForwardOperation* op = FindFlatOp(plan);
     ASSERT_NE(op, nullptr);
     ASSERT_EQ(op->request_ids.size(), 1u);
-    // The input window skips the 6 host-hit tokens exactly as a device hit would.
+    // The input window skips the 8 host-hit tokens exactly as a device hit would.
     EXPECT_EQ(op->input_lengths.at(0), 2);
-    EXPECT_EQ(op->extend_prefix_lens.at(0), 6);
-    EXPECT_EQ(op->prefill_lengths.at(0), 8);
-    EXPECT_EQ(op->input_ids, MakeTokens(/*count=*/2, /*start=*/7));
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 8);
+    EXPECT_EQ(op->prefill_lengths.at(0), 10);
+    EXPECT_EQ(op->input_ids, MakeTokens(/*count=*/2, /*start=*/9));
     EXPECT_EQ(op->begins.at(0), 0);
-    EXPECT_EQ(op->sizes.at(0), 4) << "3 extension + 1 fresh page, all new to the table";
+    EXPECT_EQ(op->sizes.at(0), 6) << "4 extension + 2 fresh pages, all new to the table";
 
-    // Wire pairs are group-major: full ext slots 0..2, then swa slots 1..2 (slot 0
-    // is a pre-window hole = the null page 0).
+    // Wire pairs are group-major: full ext slots 0..3, then SWA slots 2..3.
     const auto& full_row = op->flat_block_tables.at("full").at(0);
     const auto& swa_row = op->flat_block_tables.at("swa").at(0);
-    ASSERT_EQ(full_row.size(), 4u);
-    ASSERT_EQ(swa_row.size(), 4u);
+    ASSERT_EQ(full_row.size(), 6u);
+    ASSERT_EQ(swa_row.size(), 6u);
     const auto& dst = lb->dst_pages.at(0);
     EXPECT_EQ(dst.at(0), full_row.at(0));
     EXPECT_EQ(dst.at(1), full_row.at(1));
     EXPECT_EQ(dst.at(2), full_row.at(2));
+    EXPECT_EQ(dst.at(3), full_row.at(3));
     EXPECT_EQ(swa_row.at(0), 0) << "swa slot 0 is the pre-window hole";
-    EXPECT_EQ(dst.at(3), swa_row.at(1));
+    EXPECT_EQ(swa_row.at(1), 0) << "swa slot 1 is the pre-window hole";
     EXPECT_EQ(dst.at(4), swa_row.at(2));
+    EXPECT_EQ(dst.at(5), swa_row.at(3));
 
-    // The 5 matched host entries stay load-pinned until LoadBackDone retires the op.
-    EXPECT_EQ(scheduler_->FlatHostPoolPinnedBlocks(), 5);
+    // The 6 matched host entries stay load-pinned until LoadBackDone retires the op.
+    EXPECT_EQ(scheduler_->FlatHostPoolPinnedBlocks(), 6);
     SendLoadBackDone(lb->op_ids.at(0));
     EXPECT_EQ(scheduler_->FlatHostPoolPinnedBlocks(), 0);
 
-    // r2 holds full 3 ext + 1 fresh and swa 2 ext + 1 fresh = 7 blocks.
-    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 7);
+    // r2 holds 6 loaded blocks and 4 fresh blocks.
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 10);
 
     SendForwardDone("r2", {9001});
-    PlanOnce();  // finalize: page-3 keys are already indexed, so no new write-back pins
+    ExecutionPlan finalize = PlanOnce();
+    auto wb = FindFlatWriteBack(finalize);
+    ASSERT_TRUE(wb.has_value()) << "r2's extended endpoint must be persisted";
+    SendWriteBackDone(wb->op_ids.at(0), /*success=*/true);
     SendForwardDone("r2", {9002});
     SendFinish("r2");
     PlanOnce();  // reap
@@ -2959,14 +2963,14 @@ TEST_F(FlatHostHitSuite, AbandonedAdmissionUnpins) {
     Submit(MakeRequestSpec("filler", /*num_pages=*/5, /*start=*/701));
     PlanOnce();
     SendForwardDone("filler", {9001});
-    ExecutionPlan filler_finalize = PlanOnce();  // acquires the reserve: free = 0
+    ExecutionPlan filler_finalize = PlanOnce();  // finalization slides three expired SWA pages: free = 3
     auto filler_wb = FindFlatWriteBack(filler_finalize);
     ASSERT_TRUE(filler_wb.has_value());
-    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 0);
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 3);
 
-    // r2's host match takes 5 pins, but the gate needs 4 + 5 ext > 0 free: the
+    // r2's host match takes 6 pins, but the gate needs 4 + 6 ext > 3 free: the
     // abandoning return must give the pins back.
-    Submit(MakeRequestSpec("r2", /*num_pages=*/4));
+    Submit(MakeRequestSpec("r2", /*num_pages=*/5));
     ExecutionPlan starved = PlanOnce();
     EXPECT_FALSE(FindFlatLoadBack(starved).has_value());
     EXPECT_EQ(scheduler_->FlatHostPoolPinnedBlocks(), 0) << "an abandoned admission must unpin its host match";
@@ -2979,14 +2983,17 @@ TEST_F(FlatHostHitSuite, AbandonedAdmissionUnpins) {
     ExecutionPlan plan = PlanOnce();
     auto lb = FindFlatLoadBack(plan);
     ASSERT_TRUE(lb.has_value());
-    EXPECT_EQ(lb->src_pages.at(0).size(), 5u);
-    EXPECT_EQ(scheduler_->FlatHostPoolPinnedBlocks(), 5);
+    EXPECT_EQ(lb->src_pages.at(0).size(), 6u);
+    EXPECT_EQ(scheduler_->FlatHostPoolPinnedBlocks(), 6);
     EXPECT_EQ(scheduler_->WaitingSize(), 0u);
 
     SendLoadBackDone(lb->op_ids.at(0));
     EXPECT_EQ(scheduler_->FlatHostPoolPinnedBlocks(), 0);
     SendForwardDone("r2", {9001});
-    PlanOnce();
+    ExecutionPlan finalize = PlanOnce();
+    auto wb = FindFlatWriteBack(finalize);
+    ASSERT_TRUE(wb.has_value()) << "r2's extended endpoint must be persisted";
+    SendWriteBackDone(wb->op_ids.at(0), /*success=*/true);
     SendForwardDone("r2", {9002});
     SendFinish("r2");
     PlanOnce();
@@ -2997,20 +3004,20 @@ TEST_F(FlatHostHitSuite, AbortDuringLoadKeepsPagesPinned) {
     const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
     SeedHostThenEvictDevice();
 
-    Submit(MakeRequestSpec("r2", /*num_pages=*/4));
+    Submit(MakeRequestSpec("r2", /*num_pages=*/5));
     ExecutionPlan plan = PlanOnce();
     auto lb = FindFlatLoadBack(plan);
     ASSERT_TRUE(lb.has_value());
-    ASSERT_EQ(lb->dst_pages.at(0).size(), 5u);
-    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 7);
+    ASSERT_EQ(lb->dst_pages.at(0).size(), 6u);
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 10);
 
-    // Abort while the H2D copy is in flight: the reap returns only the 2 fresh pages;
-    // the 5 load destinations must stay off the free list until LoadBackDone.
+    // Abort while the H2D copy is in flight: the reap returns only the 4 fresh pages;
+    // the 6 load destinations must stay off the free list until LoadBackDone.
     SendAbort(*scheduler_, "r2");
     PlanOnce();  // reap
-    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 5)
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 6)
         << "in-flight load destinations must not be reusable";
-    EXPECT_EQ(scheduler_->FlatHostPoolPinnedBlocks(), 5) << "the host sources stay pinned too";
+    EXPECT_EQ(scheduler_->FlatHostPoolPinnedBlocks(), 6) << "the host sources stay pinned too";
 
     SendLoadBackDone(lb->op_ids.at(0));
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "LoadBackDone releases the destinations";
@@ -3024,16 +3031,16 @@ TEST_F(FlatHostHitSuite, StarvationWaitsForInFlightLoads) {
     const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
     SeedHostThenEvictDevice();
 
-    // Same shape as AbortDuringLoadKeepsPagesPinned: 5 destinations stay ticket-held.
-    Submit(MakeRequestSpec("r2", /*num_pages=*/4));
+    // Same shape as AbortDuringLoadKeepsPagesPinned: 6 destinations stay ticket-held.
+    Submit(MakeRequestSpec("r2", /*num_pages=*/5));
     ExecutionPlan plan = PlanOnce();
     auto lb = FindFlatLoadBack(plan);
     ASSERT_TRUE(lb.has_value());
     SendAbort(*scheduler_, "r2");
     PlanOnce();  // reap
-    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 5);
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 6);
 
-    // r3 (fresh tokens, no host hit) charges 8 prefill + 2 reserve = 10 > 7 free: deferred.
+    // r3 (fresh tokens, no host hit) charges 8 prefill + 2 reserve = 10 > 6 free: deferred.
     Submit(MakeRequestSpec("r3", /*num_pages=*/4, /*start=*/901));
     ExecutionPlan starved1 = PlanOnce();
     ASSERT_NE(FindFlatOp(starved1), nullptr);
@@ -3046,7 +3053,7 @@ TEST_F(FlatHostHitSuite, StarvationWaitsForInFlightLoads) {
     EXPECT_TRUE(starved2.flat_oom_request_ids.empty()) << "in-flight load pages must hold off the retract path";
     EXPECT_EQ(scheduler_->WaitingSize(), 1u) << "deferred r3 stays intact in the waiting set";
 
-    // LoadBackDone frees the 5 destinations: r3's 10-block gate now clears.
+    // LoadBackDone frees the 6 destinations: r3's 10-block gate now clears.
     SendLoadBackDone(lb->op_ids.at(0));
     ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
     ExecutionPlan admitted = PlanOnce();
@@ -3063,23 +3070,26 @@ TEST_F(FlatHostHitSuite, DuplicateLoadBackDoneIsIgnored) {
     const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
     SeedHostThenEvictDevice();
 
-    Submit(MakeRequestSpec("r2", /*num_pages=*/4));
+    Submit(MakeRequestSpec("r2", /*num_pages=*/5));
     ExecutionPlan plan = PlanOnce();
     auto lb = FindFlatLoadBack(plan);
     ASSERT_TRUE(lb.has_value());
-    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 7);
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 10);
 
     SendLoadBackDone(lb->op_ids.at(0));
     EXPECT_EQ(scheduler_->FlatHostPoolPinnedBlocks(), 0);
     const std::int32_t free_after_first = scheduler_->FlatPoolFreeBlocks();
-    EXPECT_EQ(free_after_first, free_at_start - 7) << "destinations still table-held: no free-list change";
+    EXPECT_EQ(free_after_first, free_at_start - 10) << "destinations still table-held: no free-list change";
 
     SendLoadBackDone(lb->op_ids.at(0));  // duplicate
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_after_first) << "a duplicate Done must not double-free";
     EXPECT_EQ(scheduler_->FlatHostPoolPinnedBlocks(), 0);
 
     SendForwardDone("r2", {9001});
-    PlanOnce();
+    ExecutionPlan finalize = PlanOnce();
+    auto wb = FindFlatWriteBack(finalize);
+    ASSERT_TRUE(wb.has_value()) << "r2's extended endpoint must be persisted";
+    SendWriteBackDone(wb->op_ids.at(0), /*success=*/true);
     SendForwardDone("r2", {9002});
     SendFinish("r2");
     PlanOnce();
@@ -3173,13 +3183,14 @@ TEST_F(FlatChunkedHostHitSuite, ChunkedPrefillAfterHostHit) {
     EXPECT_EQ(op2->extend_prefix_lens.at(0), 12) << "chunk 2 must see ext(8) + chunk1(4) as computed";
     EXPECT_EQ(op2->input_lengths.at(0), 4);
     AckWriteBacks(c2);  // pages 4,5 registered this round; ack so only the ticket pins remain
-    // Punched destinations withheld: chunk 2 acquired 4, punched 2 stay ticket-held.
-    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 14);
+    // Four input tokens plus one decode-reserve token require 3 new pages per
+    // group; the 2 punched load destinations stay ticket-held.
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 16);
     EXPECT_EQ(scheduler_->FlatHostPoolPinnedBlocks(), 6) << "the copy is still in flight";
 
     // LoadBackDone releases exactly the 2 punched destinations (the other 4 stay table-held).
     SendLoadBackDone(lb->op_ids.at(0));
-    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 12);
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 14);
     EXPECT_EQ(scheduler_->FlatHostPoolPinnedBlocks(), 0);
 
     SendForwardDone("r2", {9001});

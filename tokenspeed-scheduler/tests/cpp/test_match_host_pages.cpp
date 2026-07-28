@@ -93,7 +93,7 @@ TEST(HostTierMatchTest, FullWalksContiguousRunFromBegin) {
     // Slots below begin=1 are device-valid; the run covers all extension slots, no holes.
     PrefixMatch m = mgr.Match(host_pool, keys, /*begin_blocks=*/1, /*max_blocks=*/5);
     EXPECT_EQ(BlockIds(m.blocks), put);
-    EXPECT_EQ(m.num_hit_blocks, 4);
+    EXPECT_EQ(m.NumHitBlocks(), 4);
 }
 
 TEST(HostTierMatchTest, FullStopsAtFirstMiss) {
@@ -127,7 +127,7 @@ TEST(HostTierMatchTest, SwaTrailingRunAtEnd) {
     // Trailing run [2, 5) covers the window at boundary 5; slots below stay holes.
     PrefixMatch m = mgr.Match(host_pool, keys, 0, 5);
     EXPECT_EQ(BlockIds(m.blocks), (std::vector<std::int32_t>{0, 0, p2, p3, p4}));
-    EXPECT_EQ(m.num_hit_blocks, 3);
+    EXPECT_EQ(m.NumHitBlocks(), 3);
 }
 
 TEST(HostTierMatchTest, SwaInteriorBoundaryShrink) {
@@ -165,7 +165,7 @@ TEST(HostTierMatchTest, SwaBeginAboveZeroInteriorBoundary) {
     // covers [3, 6): hole at slot 3, pages for 4 and 5.
     PrefixMatch m = mgr.Match(host_pool, keys, /*begin_blocks=*/3, /*max_blocks=*/7);
     EXPECT_EQ(BlockIds(m.blocks), (std::vector<std::int32_t>{0, p4, p5}));
-    EXPECT_EQ(m.num_hit_blocks, 2);
+    EXPECT_EQ(m.NumHitBlocks(), 2);
 }
 
 TEST(HostTierMatchTest, SwaAllMissReturnsEmpty) {
@@ -182,7 +182,7 @@ TEST(HostTierMatchTest, SwaZeroNeededWindowAcceptsAllAsHoles) {
     // Zero needed pages: every boundary is resumable with no host page at all.
     PrefixMatch m = mgr.Match(host_pool, keys, 1, 3);
     EXPECT_EQ(BlockIds(m.blocks), (std::vector<std::int32_t>{0, 0}));
-    EXPECT_EQ(m.num_hit_blocks, 0);
+    EXPECT_EQ(m.NumHitBlocks(), 0);
 }
 
 }  // namespace

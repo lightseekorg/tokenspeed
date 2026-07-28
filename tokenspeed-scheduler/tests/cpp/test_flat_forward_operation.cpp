@@ -68,16 +68,6 @@ TEST(FlatForwardOperation, EmptyOpsProducesEmpty) {
     EXPECT_TRUE(flat_op.flat_block_tables.empty());
 }
 
-TEST(FlatForwardOperation, CarriesFreshPageIdsByGroup) {
-    FlatForwardOperation flat_op{
-        std::vector<ForwardOperation>{MakePrefill("r0", FlatTable{{"full", {10}}})},
-        {{"full", {10, 11}}, {"state", {3}}},
-    };
-
-    EXPECT_EQ(flat_op.new_page_ids.at("full"), (std::vector<std::int32_t>{10, 11}));
-    EXPECT_EQ(flat_op.new_page_ids.at("state"), (std::vector<std::int32_t>{3}));
-}
-
 TEST(FlatForwardOperation, MultiRequestPadsRaggedRowsWithMinusOne) {
     std::vector<ForwardOperation> ops;
     ops.emplace_back(MakePrefill("r0", FlatTable{{"full", {10, 11, 12}}}));

@@ -25,6 +25,105 @@ from __future__ import annotations
 from tokenspeed.runtime.configs.lcm_memory_plan import LcmFieldSpec
 
 
+def draft_history_lcm_fields(
+    *,
+    layer_group_ids,
+    enabled_layer_ids,
+    logical_block_tokens,
+    layer_kv_heads,
+    head_dim,
+    kv_element_size,
+    kv_scale_block_size=0,
+    kv_scale_element_size=0,
+) -> tuple[LcmFieldSpec, ...]:
+    """Describe the enabled draft model's attention history fields."""
+    if len(layer_group_ids) != len(layer_kv_heads):
+        raise ValueError(
+            f"layer_group_ids has {len(layer_group_ids)} entries but "
+            f"layer_kv_heads has {len(layer_kv_heads)}"
+        )
+    if logical_block_tokens <= 0 or head_dim <= 0 or kv_element_size <= 0:
+        raise ValueError("draft history geometry must be positive")
+    if bool(kv_scale_block_size) != bool(kv_scale_element_size):
+        raise ValueError(
+            "kv_scale_block_size and kv_scale_element_size must both be zero "
+            "or both be positive"
+        )
+    if kv_scale_block_size and (
+        logical_block_tokens % 128
+        or head_dim % kv_scale_block_size
+        or kv_scale_block_size <= 0
+    ):
+        raise ValueError("draft scale geometry is incompatible with the KV shape")
+
+    enabled_layer_ids = tuple(enabled_layer_ids)
+    if len(set(enabled_layer_ids)) != len(enabled_layer_ids) or any(
+        isinstance(layer_id, bool)
+        or not isinstance(layer_id, int)
+        or layer_id < 0
+        or layer_id >= len(layer_group_ids)
+        for layer_id in enabled_layer_ids
+    ):
+        raise ValueError("enabled draft layer ids must be unique valid layer ids")
+
+    occurrences: dict[str, int] = {}
+    fields = []
+    for layer_id in enabled_layer_ids:
+        group_id = layer_group_ids[layer_id]
+        kv_heads = layer_kv_heads[layer_id]
+        if kv_heads <= 0:
+            raise ValueError("draft layer KV heads must be positive")
+        unit = occurrences.get(group_id, 0)
+        occurrences[group_id] = unit + 1
+        kv_shape = (logical_block_tokens, kv_heads, head_dim)
+        fields.extend(
+            (
+                LcmFieldSpec(
+                    group_id,
+                    f"layer.{layer_id}.k",
+                    f"unit.{unit}.k",
+                    kv_shape,
+                    kv_element_size,
+                ),
+                LcmFieldSpec(
+                    group_id,
+                    f"layer.{layer_id}.v",
+                    f"unit.{unit}.v",
+                    kv_shape,
+                    kv_element_size,
+                ),
+            )
+        )
+        if kv_scale_block_size:
+            scale_dim = head_dim // kv_scale_block_size
+            scale_shape = (
+                kv_heads,
+                logical_block_tokens // 128,
+                32,
+                scale_dim,
+                scale_dim,
+            )
+            fields.extend(
+                (
+                    LcmFieldSpec(
+                        group_id,
+                        f"layer.{layer_id}.k_scale",
+                        f"unit.{unit}.k_scale",
+                        scale_shape,
+                        kv_scale_element_size,
+                    ),
+                    LcmFieldSpec(
+                        group_id,
+                        f"layer.{layer_id}.v_scale",
+                        f"unit.{unit}.v_scale",
+                        scale_shape,
+                        kv_scale_element_size,
+                    ),
+                )
+            )
+    return tuple(fields)
+
+
 def qwen_gdn_lcm_fields(
     *,
     layer_types,

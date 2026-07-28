@@ -158,6 +158,123 @@ class LcmMemoryPlanTest(unittest.TestCase):
                 budget_bytes=2048,
             )
 
+    def test_fixed_parent_count_and_explicit_packing(self):
+        field = self.plan_module.LcmFieldSpec
+        fields = (
+            field("history", "history.k", "plane.k", (128, 8), 2),
+            field("state", "state.ssm", "plane.k", (128, 2), 2),
+        )
+
+        plan = self.plan_module.plan_lcm_fields(
+            fields,
+            logical_block_tokens=128,
+            num_lcm_blocks=7,
+            cache_blocks_per_lcm_block={"history": 1, "state": 4},
+            alignment=256,
+        )
+
+        self.assertEqual(plan.num_lcm_blocks, 7)
+        self.assertEqual(plan.group("history").cache_blocks_per_lcm_block, 1)
+        self.assertEqual(plan.group("state").cache_blocks_per_lcm_block, 4)
+        self.assertEqual(plan.group("history").page_count, 8)
+        self.assertEqual(plan.group("state").page_count, 29)
+
+    def test_requires_exactly_one_capacity_input(self):
+        field = self.plan_module.LcmFieldSpec
+        fields = (field("history", "history.k", "plane.k", (128, 8), 2),)
+
+        for kwargs in (
+            {},
+            {"budget_bytes": 4096, "num_lcm_blocks": 2},
+        ):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaisesRegex(
+                    ValueError, "exactly one of budget_bytes and num_lcm_blocks"
+                ):
+                    self.plan_module.plan_lcm_fields(
+                        fields,
+                        logical_block_tokens=128,
+                        **kwargs,
+                    )
+
+    def test_fixed_parent_count_must_be_a_positive_integer(self):
+        field = self.plan_module.LcmFieldSpec
+        fields = (field("history", "history.k", "plane.k", (128, 8), 2),)
+
+        for count in (0, -1, True, 1.5, "2"):
+            with self.subTest(count=count):
+                with self.assertRaisesRegex(ValueError, "positive integer"):
+                    self.plan_module.plan_lcm_fields(
+                        fields,
+                        logical_block_tokens=128,
+                        num_lcm_blocks=count,
+                    )
+
+    def test_explicit_packing_keys_must_match_groups(self):
+        field = self.plan_module.LcmFieldSpec
+        fields = (
+            field("history", "history.k", "plane.k", (128, 8), 2),
+            field("state", "state.ssm", "plane.s", (128, 2), 2),
+        )
+
+        for packing in (
+            {"history": 1},
+            {"history": 1, "state": 4, "extra": 1},
+        ):
+            with self.subTest(packing=packing):
+                with self.assertRaisesRegex(ValueError, "exactly the cache groups"):
+                    self.plan_module.plan_lcm_fields(
+                        fields,
+                        logical_block_tokens=128,
+                        num_lcm_blocks=2,
+                        cache_blocks_per_lcm_block=packing,
+                    )
+
+    def test_explicit_packing_rejects_invalid_count(self):
+        field = self.plan_module.LcmFieldSpec
+        fields = (field("history", "history.k", "plane.k", (128, 8), 2),)
+
+        for count in (0, -1, True, 129):
+            with self.subTest(count=count):
+                with self.assertRaisesRegex(ValueError, "packing"):
+                    self.plan_module.plan_lcm_fields(
+                        fields,
+                        logical_block_tokens=128,
+                        num_lcm_blocks=2,
+                        cache_blocks_per_lcm_block={"history": count},
+                    )
+
+    def test_explicit_packing_preserves_exact_stride_validation(self):
+        field = self.plan_module.LcmFieldSpec
+        fields = (
+            field("history", "history.k", "plane.shared", (128, 8), 2),
+            field("state", "state.ssm", "plane.shared", (128, 3), 2),
+        )
+
+        with self.assertRaisesRegex(ValueError, "needs page stride"):
+            self.plan_module.plan_lcm_fields(
+                fields,
+                logical_block_tokens=128,
+                num_lcm_blocks=2,
+                cache_blocks_per_lcm_block={"history": 1, "state": 2},
+            )
+
+    def test_draft_history_recipe_emits_only_enabled_kv_fields(self):
+        fields = self.layouts_module.draft_history_lcm_fields(
+            layer_group_ids=("full", "swa", "unused"),
+            enabled_layer_ids=(0, 1),
+            logical_block_tokens=128,
+            layer_kv_heads=(2, 4, 8),
+            head_dim=64,
+            kv_element_size=2,
+        )
+
+        self.assertEqual(
+            {field.field_id for field in fields},
+            {"layer.0.k", "layer.0.v", "layer.1.k", "layer.1.v"},
+        )
+        self.assertEqual({field.group_id for field in fields}, {"full", "swa"})
+
     def test_inkling_bf16_and_fp8_checkpoint_planes(self):
         bf16 = self.layouts_module.inkling_lcm_fields(
             layer_group_ids=("swa",),

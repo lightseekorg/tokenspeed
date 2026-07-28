@@ -20,6 +20,7 @@
 
 #include <gtest/gtest.h>
 
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -91,7 +92,7 @@ TEST(SwaManagerTest, MatchAllMissReturnsEmpty) {
     SwaManager mgr(4, 10);
     std::vector<CacheKey> hashes = {RealKey({1, 2, 3, 4}, 0), RealKey({5, 6, 7, 8}, 0)};
     PrefixMatch m = mgr.Match(pool, hashes, 0, static_cast<std::int32_t>(hashes.size()));
-    EXPECT_EQ(m.num_hit_blocks, 0);
+    EXPECT_EQ(m.NumHitBlocks(), 0);
     EXPECT_TRUE(m.blocks.empty());
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 8);  // no hit, so nothing pinned
 }
@@ -112,13 +113,13 @@ TEST(SwaManagerTest, MatchStopsAfterContiguousNeededFromRight) {
     std::vector<CacheKey> keys{h0, h1, h2, h3, h4};
     PrefixMatch m = mgr.Match(pool, keys, 0, 5);
     // Right->left: h4 miss; h3,h2,h1 hit -> run reaches 3, stop. run_end = 3.
-    // keep [0..3] -> [NULL, b1, b2, b3]; num_hit_blocks = 3.
+    // Keep [0..3] -> [NULL, b1, b2, b3], so NumHitBlocks() is 3.
     ASSERT_EQ(m.blocks.size(), 4u);
     EXPECT_FALSE(m.blocks[0]);
     EXPECT_EQ(m.blocks[1]->Location().lcm_block_id, b1);
     EXPECT_EQ(m.blocks[2]->Location().lcm_block_id, b2);
     EXPECT_EQ(m.blocks[3]->Location().lcm_block_id, b3);
-    EXPECT_EQ(m.num_hit_blocks, 3);
+    EXPECT_EQ(m.NumHitBlocks(), 3);
 }
 
 TEST(SwaManagerTest, BoundedMatchEnforcesRunAgainstBoundedEnd) {
@@ -138,11 +139,11 @@ TEST(SwaManagerTest, BoundedMatchEnforcesRunAgainstBoundedEnd) {
 
     PrefixMatch unbounded = mgr.Match(pool, hashes, 0, /*max_blocks=*/5);
     EXPECT_EQ(unbounded.blocks.size(), 5u);
-    EXPECT_EQ(unbounded.num_hit_blocks, 3);
+    EXPECT_EQ(unbounded.NumHitBlocks(), 3);
 
     PrefixMatch bounded = mgr.Match(pool, hashes, 0, /*max_blocks=*/4);
     EXPECT_TRUE(bounded.blocks.empty());
-    EXPECT_EQ(bounded.num_hit_blocks, 0);
+    EXPECT_EQ(bounded.NumHitBlocks(), 0);
 }
 
 TEST(SwaManagerTest, MatchTrimsTailAfterWindow) {
@@ -162,7 +163,7 @@ TEST(SwaManagerTest, MatchTrimsTailAfterWindow) {
     EXPECT_FALSE(m.blocks[0]);
     EXPECT_FALSE(m.blocks[1]);
     EXPECT_EQ(m.blocks[2]->Location().lcm_block_id, b2);
-    EXPECT_EQ(m.num_hit_blocks, 1);
+    EXPECT_EQ(m.NumHitBlocks(), 1);
     (void)b0;
 }
 
@@ -181,7 +182,7 @@ TEST(SwaManagerTest, MatchAcceptsRunShorterThanContiguousNeeded) {
     ASSERT_EQ(m.blocks.size(), 2u);
     EXPECT_EQ(m.blocks[0]->Location().lcm_block_id, b0);
     EXPECT_EQ(m.blocks[1]->Location().lcm_block_id, b1);
-    EXPECT_EQ(m.num_hit_blocks, 2);
+    EXPECT_EQ(m.NumHitBlocks(), 2);
 }
 
 TEST(SwaManagerTest, MatchRequiresContiguityNotAnyHit) {
@@ -204,10 +205,10 @@ TEST(SwaManagerTest, MatchRequiresContiguityNotAnyHit) {
     ASSERT_EQ(m.blocks.size(), 2u);
     EXPECT_EQ(m.blocks[0]->Location().lcm_block_id, b0);
     EXPECT_EQ(m.blocks[1]->Location().lcm_block_id, b1);
-    EXPECT_EQ(m.num_hit_blocks, 2);
+    EXPECT_EQ(m.NumHitBlocks(), 2);
 }
 
-TEST(SwaManagerTest, SpeculativeHitsDoNotRefreshEvictionOrder) {
+TEST(SwaManagerTest, SpeculativeHitsDoNotRefreshAccessEpoch) {
     BlockPool pool(7);
     SwaManager mgr(4, 10);  // pages_needed = 3
     CacheKey h0 = RealKey({0, 0, 0, 0}, 0);
@@ -219,14 +220,19 @@ TEST(SwaManagerTest, SpeculativeHitsDoNotRefreshEvictionOrder) {
     const std::int32_t b1 = CacheOnePage(mgr, pool, h1);
     const std::int32_t b3 = CacheOnePage(mgr, pool, h3);
     CacheOnePage(mgr, pool, h4);
+    const CacheBlockLocation speculative_location{.lcm_block_id = b3, .slot_index = 0};
+    const std::optional<KvCacheManager::CachedBlockMetadata> before =
+        mgr.CachedBlockMetadataFor(pool, speculative_location);
+    ASSERT_TRUE(before);
 
     std::vector<CacheKey> keys{h0, h1, h2, h3, h4};
     PrefixMatch match = mgr.Match(pool, keys, 0, 5);
     ASSERT_EQ(BlockIds(match.blocks), (std::vector<std::int32_t>{b0, b1}));
 
-    std::vector<CacheBlockLocation> candidates = mgr.EvictableBlockLocations(pool);
-    ASSERT_FALSE(candidates.empty());
-    EXPECT_EQ(candidates.front().lcm_block_id, b3);
+    const std::optional<KvCacheManager::CachedBlockMetadata> after =
+        mgr.CachedBlockMetadataFor(pool, speculative_location);
+    ASSERT_TRUE(after);
+    EXPECT_EQ(after->last_access_epoch, before->last_access_epoch);
 }
 
 // Pins the device-tier W=1 semantic: no lookback means every boundary is resumable,
@@ -240,7 +246,7 @@ TEST(SwaManagerTest, MatchWindowOneCoversAllAsHoles) {
     std::vector<CacheKey> keys{h0, CacheKey{.content_hash = "k1"}, CacheKey{.content_hash = "k2"}};
     PrefixMatch m = mgr.Match(pool, keys, 0, 3);
     EXPECT_EQ(BlockIds(m.blocks), (std::vector<std::int32_t>{0, 0, 0}));
-    EXPECT_EQ(m.num_hit_blocks, 0);
+    EXPECT_EQ(m.NumHitBlocks(), 0);
 }
 
 TEST(SwaManagerTest, MatchPinsUntilResultDies) {
@@ -252,7 +258,7 @@ TEST(SwaManagerTest, MatchPinsUntilResultDies) {
 
     std::vector<CacheKey> keys{h0};
     PrefixMatch m = mgr.Match(pool, keys, 0, 1);
-    EXPECT_EQ(m.num_hit_blocks, 1);
+    EXPECT_EQ(m.NumHitBlocks(), 1);
     EXPECT_EQ(m.blocks.front().use_count(), 2);
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 7);
     m = {};
@@ -275,7 +281,7 @@ TEST(SwaManagerTest, ClaimHitBlocksSkipsNullHoles) {
     PrefixMatch m = mgr.Match(pool, keys, 0, 4);
     ASSERT_EQ(m.blocks.size(), 4u);
     ASSERT_FALSE(m.blocks[0]);
-    ASSERT_EQ(m.num_hit_blocks, 3);
+    ASSERT_EQ(m.NumHitBlocks(), 3);
 
     BlockTable table;
     mgr.ClaimHitBlocks(table, std::move(m));
@@ -314,7 +320,7 @@ TEST(SwaManagerTest, InheritedCacheFullBlocksMakesPagesHittable) {
 
     std::vector<CacheKey> keys{h0};
     PrefixMatch m = mgr.Match(pool, keys, 0, 1);
-    EXPECT_EQ(m.num_hit_blocks, 1);
+    EXPECT_EQ(m.NumHitBlocks(), 1);
     EXPECT_EQ(m.blocks.back()->Location().lcm_block_id, a.Blocks()[0]->Location().lcm_block_id);
 }
 

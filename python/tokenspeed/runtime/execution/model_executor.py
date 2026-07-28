@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -1490,27 +1491,43 @@ class ModelExecutor:
                 req_to_page=self.req_to_page,
             )
 
-    def zero_flat_cache_pages(self, page_ids):
+    def zero_flat_cache_pages(self, pages):
         """Clear newly owned pages and return a CUDA completion event when needed."""
-        if not page_ids:
+        if not pages:
             return None
+        zero_new_pages = getattr(self.token_to_kv_pool, "zero_new_pages", None)
         zero_pages = getattr(self.token_to_kv_pool, "zero_pages", None)
-        if not callable(zero_pages):
+        if isinstance(pages, Mapping) and callable(zero_new_pages):
+            sanitizer = zero_new_pages
+            sanitizer_arg = pages
+        elif callable(zero_pages):
+            if isinstance(pages, Mapping):
+                page_ids = sorted(
+                    {
+                        int(page_id)
+                        for group_pages in pages.values()
+                        for page_id in group_pages
+                    }
+                )
+            else:
+                page_ids = pages
+            sanitizer = zero_pages
+            sanitizer_arg = page_ids
+        else:
             # A pool only needs sanitization if it aliases recurrent-state and
             # KV bytes in one slab (it then declares this and implements
-            # zero_pages). Pure-attention pools do not alias state -- reused
-            # pages are overwritten and their tails are never read past
-            # seq_len -- so the scheduler's page-reuse list is safely ignored.
+            # a sanitizer). Pure-attention pools do not alias state, so reused
+            # pages are overwritten and their tails are never read past seq_len.
             # Still fail loudly if a pool that *declares* it needs zeroing
             # forgot to implement it.
             if getattr(self.token_to_kv_pool, "flat_kv_requires_page_zeroing", False):
                 raise RuntimeError(
-                    "scheduler emitted flat_page_ids_to_zero but the active KV "
+                    "scheduler emitted flat pages to zero but the active KV "
                     "pool does not implement physical-page sanitization"
                 )
             return None
         with nvtx_range("zero_flat_cache_pages", color="purple"):
-            zero_pages(page_ids)
+            sanitizer(sanitizer_arg)
         if torch.device(self.device).type != "cuda":
             return None
         done = torch.cuda.Event()
@@ -1775,13 +1792,6 @@ class ModelExecutor:
             bs = len(forward_op.request_ids)
             # Outside the graph: in-graph sites only OR into the flag buffer.
             self.nan_guard.reset(bs)
-            new_page_ids = getattr(forward_op, "new_page_ids", None)
-            if new_page_ids:
-                zero_new_history_pages = getattr(
-                    self.token_to_kv_pool, "zero_new_history_pages", None
-                )
-                if zero_new_history_pages is not None:
-                    zero_new_history_pages(new_page_ids)
             flat_cache_metadata = None
             if self._flat_runtime_contract is not None and bs > 0:
                 # FlatKV contract path: validate + pack the per-group tables

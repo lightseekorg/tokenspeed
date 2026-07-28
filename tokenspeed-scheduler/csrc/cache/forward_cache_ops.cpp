@@ -82,9 +82,13 @@ std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
             continue;
         }
         const bool is_swa = group.retention == PagedCacheGroupConfig::Retention::SlidingWindow;
+        if (is_swa && (!group.sliding_window_tokens || *group.sliding_window_tokens <= 0)) {
+            throw std::invalid_argument("Flat cache group '" + group.group_id +
+                                        "' requires positive sliding_window_tokens");
+        }
         specs.push_back(KvCacheSpec{
             .kind = is_swa ? AttnKind::kSlidingWindow : AttnKind::kFull,
-            .sliding_window = is_swa ? group.sliding_window_tokens.value_or(0) : 0,
+            .sliding_window = is_swa ? *group.sliding_window_tokens : 0,
             .cache_blocks_per_lcm_block = group.cache_blocks_per_lcm_block,
         });
     }

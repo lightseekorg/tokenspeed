@@ -389,11 +389,7 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     }
 
     auto [fwd_ops, cache_ops] = newForwardOperation(candidates);
-#if TOKENSPEED_FLAT_KVCACHE
-    plan.With(FlatForwardOperation{std::move(fwd_ops), std::exchange(new_flat_page_ids_, {})});
-#else
     plan.With(FlatForwardOperation{std::move(fwd_ops)});
-#endif
 #if TOKENSPEED_FLAT_KVCACHE
     plan.flat_oom_request_ids = std::exchange(flat_oom_request_ids_, {});
 #endif
@@ -449,6 +445,12 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
             plan.With(CacheOperation{FlatLoadBackOperation{*lb}});
         }
     }
+#if TOKENSPEED_FLAT_KVCACHE
+    // Drain after every operation has been constructed. This payload belongs
+    // to the whole plan: a PD decode bootstrap may submit RDMA without running
+    // a model forward, but its fresh destination pages still need sanitizing.
+    plan.flat_pages_to_zero = std::exchange(new_flat_page_ids_, {});
+#endif
     if (std::getenv("DEBUG_MEM")) {
         check_device_mem();
     }

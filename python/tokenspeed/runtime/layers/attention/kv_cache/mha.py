@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 from collections import Counter
+from dataclasses import replace
 
 import numpy as np
 import torch
@@ -130,6 +131,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         self._layer_types = tuple(layer_types or ())
         self.layer_cache_group_ids = tuple(layer_cache_group_ids or ())
         self._lcm_memory_plan = lcm_memory_plan
+        self.flat_kv_requires_page_zeroing = self._lcm_memory_plan is not None
         self._lcm_arena: LcmArena | None = None
         self._lcm_field_views: dict[tuple[str, torch.dtype], torch.Tensor] = {}
         self._conv_state_shape = (
@@ -212,6 +214,18 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             self.paged_cache_group_page_counts = {}
         else:
             specs, counts = published
+            if self._lcm_memory_plan is not None and self._pd_disaggregation_enabled:
+                specs = [
+                    replace(
+                        spec,
+                        transfer_policy=(
+                            "latest_snapshot"
+                            if spec.family == "state"
+                            else "full_suffix"
+                        ),
+                    )
+                    for spec in specs
+                ]
             if self._lcm_memory_plan is not None:
                 counts.update(
                     {
@@ -224,6 +238,35 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         # Slab aliasing is only safe under the single-BlockPool ownership the
         # published groups configure.
         assert self._slab_group_size is None or self.paged_cache_group_specs
+
+    @property
+    def supports_disaggregation(self) -> bool:
+        return self._lcm_memory_plan is not None and self._pd_disaggregation_enabled
+
+    def get_flatkv_pd_contract(self):
+        """Expose the LCM arena through main's FlatKV PD lifecycle."""
+        if not self.supports_disaggregation or self._lcm_arena is None:
+            raise RuntimeError("FlatKV PD requires an enabled LCM arena")
+        from tokenspeed.runtime.pd.flatkv import build_lcm_flatkv_pd_contract
+
+        field_dtypes = {}
+        for field in self._lcm_memory_plan.fields:
+            cached = [
+                dtype
+                for (field_id, dtype) in self._lcm_field_views
+                if field_id == field.field_id
+            ]
+            if len(cached) != 1:
+                raise RuntimeError(
+                    f"LCM PD field {field.field_id!r} does not have one runtime dtype"
+                )
+            field_dtypes[field.field_id] = str(cached[0]).removeprefix("torch.")
+        return build_lcm_flatkv_pd_contract(
+            plan=self._lcm_memory_plan,
+            backing=self._lcm_arena.backing,
+            group_specs=self.paged_cache_group_specs,
+            field_dtypes=field_dtypes,
+        )
 
     @property
     def num_lcm_blocks(self) -> int | None:
@@ -361,19 +404,13 @@ class MHATokenToKVPool(BaseTokenToKVPool):
 
         self.supports_hierarchical_kv_cache = False
 
-    def zero_new_history_pages(self, new_page_ids: dict[str, list[int]]) -> None:
-        """Clear newly bound history pages before their first kernel use."""
+    def zero_new_pages(self, new_page_ids: dict[str, list[int]]) -> None:
+        """Clear newly bound LCM pages before their first kernel use."""
         if self._lcm_memory_plan is None or not new_page_ids:
             return
-        history_group_ids = {
-            str(spec.group_id)
-            for spec in self.paged_cache_group_specs
-            if spec.family == "history"
-        }
         segments = [
             segment
             for group_id, page_ids in new_page_ids.items()
-            if group_id in history_group_ids
             for segment in self._lcm_arena.page_byte_segments(group_id, page_ids)
         ]
         zero_byte_segments(self._lcm_arena.backing, segments)
@@ -838,15 +875,11 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         if self._lcm_memory_plan is not None:
             super()._create_buffers()
             self.k_scale_buffer = [
-                self._lcm_arena.field_view(
-                    f"layer.{layer_id}.k_scale", torch.float8_e8m0fnu
-                )
+                self.get_lcm_field(f"layer.{layer_id}.k_scale", torch.float8_e8m0fnu)
                 for layer_id in range(self.layer_num)
             ]
             self.v_scale_buffer = [
-                self._lcm_arena.field_view(
-                    f"layer.{layer_id}.v_scale", torch.float8_e8m0fnu
-                )
+                self.get_lcm_field(f"layer.{layer_id}.v_scale", torch.float8_e8m0fnu)
                 for layer_id in range(self.layer_num)
             ]
             return

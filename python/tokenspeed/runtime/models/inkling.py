@@ -486,10 +486,10 @@ def _sconv_apply(
     checkpoint_buffers = ()
     checkpoint_group = None
     if checkpoint_mode:
-        if md.lookback > 0 or md.update_mode != "inplace":
+        if md.lookback > 0 or md.update_mode == "valid_len":
             raise RuntimeError(
-                "Inkling LCM checkpoints do not yet support speculative "
-                "ShortConv state updates"
+                "Inkling LCM checkpoints do not support draft ShortConv "
+                "state updates"
             )
         if conv_group == "kvconv":
             checkpoint_group = "kvconv"
@@ -510,6 +510,13 @@ def _sconv_apply(
                 ),
             )
         if checkpoint_buffers:
+            backend.register_shortconv_checkpoint_stream(
+                layer_id=layer_id,
+                channel_offset=channel_offset,
+                dim=dim,
+                group_id=checkpoint_group,
+                buffers=checkpoint_buffers,
+            )
             backend.restore_shortconv_checkpoint(
                 state,
                 checkpoint_buffers,
@@ -528,7 +535,7 @@ def _sconv_apply(
             use_residual=True,
             enable_pdl=pdl_enabled(),
         )
-        if checkpoint_buffers:
+        if checkpoint_buffers and md.update_mode == "inplace":
             backend.publish_shortconv_checkpoints(
                 x,
                 state,
@@ -548,7 +555,7 @@ def _sconv_apply(
         activation=None,
         use_residual=True,
     )
-    if checkpoint_buffers:
+    if checkpoint_buffers and md.update_mode == "inplace":
         backend.publish_shortconv_checkpoints(
             x,
             state,

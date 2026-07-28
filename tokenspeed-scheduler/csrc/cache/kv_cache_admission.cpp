@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <tuple>
 #include <unordered_set>
 
@@ -59,25 +60,33 @@ public:
         }
 
         collectCandidates();
-        for (const VictimCandidate& candidate : victim_candidates_) {
+        while (!fits()) {
+            if (victim_candidates_.empty()) {
+                return false;
+            }
+            std::ranges::pop_heap(victim_candidates_, evictedAfter);
+            const VictimCandidate candidate = victim_candidates_.back();
+            victim_candidates_.pop_back();
             removeOccupant(candidate.group_id, candidate.location);
-        }
-        if (!fits()) {
-            return false;
+            admission_.victims.emplace_back(candidate.group_id, candidate.location);
         }
 
-        // Start from the all-evicted feasible state, then restore newest
-        // entries whenever capacity still fits. The remaining victims are the
-        // oldest cache entries that admission actually requires.
-        for (std::size_t i = victim_candidates_.size(); i > 0; --i) {
-            const VictimCandidate& candidate = victim_candidates_[i - 1];
-            restoreOccupant(candidate.group_id, candidate.location);
+        // Once removing an eviction prefix fits, keeping the entire unpopped
+        // tail also fits. Tentatively restore the prefix newest-first using
+        // only the planner's shadow occupancy. If a restore makes admission
+        // infeasible, undo it and keep that block as a required victim.
+        std::vector<std::pair<GroupId, CacheBlockLocation>> required_victims;
+        required_victims.reserve(admission_.victims.size());
+        for (std::size_t i = admission_.victims.size(); i > 0; --i) {
+            const auto& [group_id, location] = admission_.victims[i - 1];
+            restoreOccupant(group_id, location);
             if (!fits()) {
-                removeOccupant(candidate.group_id, candidate.location);
-                admission_.victims.emplace_back(candidate.group_id, candidate.location);
+                removeOccupant(group_id, location);
+                required_victims.emplace_back(group_id, location);
             }
         }
-        std::ranges::reverse(admission_.victims);
+        std::ranges::reverse(required_victims);
+        admission_.victims = std::move(required_victims);
         return true;
     }
 
@@ -98,11 +107,18 @@ private:
         GroupId group_id;
         CacheBlockLocation location;
         std::uint64_t last_access_epoch;
-        std::int32_t logical_block_index;
-        CacheBoundaryKind boundary_kind;
-        bool is_prefix_closed;
-        bool was_acquired;
+        EvictionTier eviction_tier;
+        std::int64_t position_rank;
     };
+
+    static auto evictionKey(const VictimCandidate& candidate) {
+        return std::tuple{candidate.last_access_epoch, candidate.eviction_tier, candidate.position_rank,
+                          candidate.group_id, candidate.location.lcm_block_id, candidate.location.slot_index};
+    }
+
+    static bool evictedAfter(const VictimCandidate& lhs, const VictimCandidate& rhs) {
+        return evictionKey(rhs) < evictionKey(lhs);
+    }
 
     void initializeCapacity() {
         _assert(demands_.size() == groups_.size(), "demands/groups size mismatch");
@@ -110,8 +126,7 @@ private:
             const GroupDemand& demand = demands_[i];
             _assert(demand.table != nullptr, "group demand requires a block table");
             const KvCacheManager& manager = groups_[i].Manager();
-            const std::int32_t device_blocks =
-                manager.BlocksNeededFor(*demand.table, demand.num_tokens + demand.reserve_tokens);
+            const std::int32_t device_blocks = manager.BlocksNeededFor(*demand.table, demand);
             const std::int32_t host_blocks = admission_.prefix.host.per_group.empty()
                                                  ? 0
                                                  : static_cast<std::int32_t>(std::ranges::count(
@@ -151,16 +166,39 @@ private:
             const KvCacheManager& manager = groups_[group_id].Manager();
             const std::optional<KvCacheManager::CachedBlockMetadata> metadata =
                 manager.CachedBlockMetadataFor(pool_, location);
+            const std::uint64_t last_access_epoch = metadata ? metadata->last_access_epoch : 0;
+            const std::int32_t logical_block_index = metadata ? metadata->logical_block_index : -1;
+            const CacheBoundaryKind boundary_kind =
+                metadata ? metadata->boundary_kind : CacheBoundaryKind::kChunk;
+            const bool is_prefix_closed = manager.MatchIsPrefixClosed();
+            const bool is_probationary_boundary =
+                !is_prefix_closed && boundary_kind == CacheBoundaryKind::kChunk &&
+                !(metadata && metadata->was_acquired) && logical_block_index >= 0;
+            const EvictionTier eviction_tier = [&] {
+                if (last_access_epoch == 0) {
+                    return EvictionTier::kUncached;
+                }
+                if (is_probationary_boundary) {
+                    return EvictionTier::kProbationaryBoundary;
+                }
+                return is_prefix_closed ? EvictionTier::kClosedPrefix : EvictionTier::kEstablishedBoundary;
+            }();
+            std::int64_t position_rank = 0;
+            if (is_probationary_boundary) {
+                // Retain the longer unproven frontier.
+                position_rank = logical_block_index;
+            } else if (is_prefix_closed && logical_block_index >= 0) {
+                // Reclaim a closed prefix from its suffix.
+                position_rank = -static_cast<std::int64_t>(logical_block_index);
+            }
             victim_candidates_.push_back(VictimCandidate{
                 .group_id = group_id,
                 .location = location,
                 // Access epochs start at one. Zero puts an uncached block
                 // ahead of every reusable cache entry.
-                .last_access_epoch = metadata ? metadata->last_access_epoch : 0,
-                .logical_block_index = metadata ? metadata->logical_block_index : -1,
-                .boundary_kind = metadata ? metadata->boundary_kind : CacheBoundaryKind::kChunk,
-                .is_prefix_closed = manager.MatchIsPrefixClosed(),
-                .was_acquired = metadata && metadata->was_acquired,
+                .last_access_epoch = last_access_epoch,
+                .eviction_tier = eviction_tier,
+                .position_rank = position_rank,
             });
         };
 
@@ -177,34 +215,7 @@ private:
                 }
             }
         }
-        const auto eviction_key = [](const VictimCandidate& candidate) {
-            const bool is_probationary_boundary =
-                !candidate.is_prefix_closed && candidate.boundary_kind == CacheBoundaryKind::kChunk &&
-                !candidate.was_acquired && candidate.logical_block_index >= 0;
-            const EvictionTier eviction_tier = [&] {
-                if (candidate.last_access_epoch == 0) {
-                    return EvictionTier::kUncached;
-                }
-                if (is_probationary_boundary) {
-                    return EvictionTier::kProbationaryBoundary;
-                }
-                return candidate.is_prefix_closed ? EvictionTier::kClosedPrefix
-                                                  : EvictionTier::kEstablishedBoundary;
-            }();
-            std::int64_t position_rank = 0;
-            if (is_probationary_boundary) {
-                // Retain the longer unproven frontier.
-                position_rank = candidate.logical_block_index;
-            } else if (candidate.is_prefix_closed && candidate.logical_block_index >= 0) {
-                // Reclaim a closed prefix from its suffix.
-                position_rank = -static_cast<std::int64_t>(candidate.logical_block_index);
-            }
-            return std::tuple{candidate.last_access_epoch, eviction_tier, position_rank, candidate.group_id,
-                              candidate.location.lcm_block_id, candidate.location.slot_index};
-        };
-        std::ranges::sort(victim_candidates_, [&](const VictimCandidate& lhs, const VictimCandidate& rhs) {
-            return eviction_key(lhs) < eviction_key(rhs);
-        });
+        std::ranges::make_heap(victim_candidates_, evictedAfter);
     }
 
     void removeOccupant(GroupId group_id, CacheBlockLocation location) {
@@ -347,11 +358,13 @@ std::optional<KvCacheCoordinator::AdmissionResult> KvCacheCoordinator::Admit(Pre
                 pool_, *demand.table, std::move(acquired_prefix.host.per_group[i].blocks), result.load_pairs);
         }
         const std::int32_t first_new_block = demand.table->NumBlocks();
-        const bool acquired =
-            groups_[i].Manager().Acquire(pool_, *demand.table, demand.num_tokens, demand.reserve_tokens);
+        const bool acquired = groups_[i].Manager().Acquire(pool_, *demand.table, demand);
         FatalCheck(acquired, "admission plan no longer fits the block pool");
         const std::span<const CacheBlockRef> blocks = demand.table->Blocks();
         for (std::int32_t block = first_new_block; block < demand.table->NumBlocks(); ++block) {
+            if (!blocks[static_cast<std::size_t>(block)]) {
+                continue;
+            }
             result.new_page_ids[i].push_back(
                 groups_[i].Manager().ResolveKernelPageId(blocks[static_cast<std::size_t>(block)]->Location()));
         }

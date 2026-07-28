@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 # Planner/runtime limits, not model layout inputs.
@@ -220,15 +221,34 @@ def plan_lcm_fields(
     fields,
     *,
     logical_block_tokens,
-    budget_bytes,
+    budget_bytes=None,
+    num_lcm_blocks=None,
+    cache_blocks_per_lcm_block: Mapping[str, int] | None = None,
     alignment=1,
     max_padding_fraction=0.25,
 ):
-    """Plan a plane-major arena whose fields overlay across cache groups."""
+    """Plan a plane-major arena whose fields overlay across cache groups.
+
+    Capacity can be derived from ``budget_bytes`` or fixed by
+    ``num_lcm_blocks``. Explicit per-group packing preserves an existing
+    target arena's parent geometry, as required by a colocated draft cache.
+    """
     if logical_block_tokens <= 0:
         raise ValueError("logical_block_tokens must be > 0")
-    if budget_bytes < 0:
+    if (budget_bytes is None) == (num_lcm_blocks is None):
+        raise ValueError(
+            "exactly one of budget_bytes and num_lcm_blocks must be provided"
+        )
+    if budget_bytes is not None and (
+        isinstance(budget_bytes, bool) or budget_bytes < 0
+    ):
         raise ValueError("budget_bytes must be >= 0")
+    if num_lcm_blocks is not None and (
+        isinstance(num_lcm_blocks, bool)
+        or not isinstance(num_lcm_blocks, int)
+        or num_lcm_blocks < 1
+    ):
+        raise ValueError("num_lcm_blocks must be a positive integer")
     if alignment <= 0:
         raise ValueError("alignment must be > 0")
     if max_padding_fraction < 0:
@@ -262,10 +282,28 @@ def plan_lcm_fields(
         )
 
     ordered_group_ids = tuple(sorted(raw_by_group))
-    packing = _packing_by_group_ratio(raw_by_group)
-    constrained = _solve_packing(ordered_fields)
-    if constrained is not None:
-        packing.update(constrained)
+    has_explicit_packing = cache_blocks_per_lcm_block is not None
+    if has_explicit_packing:
+        if set(cache_blocks_per_lcm_block) != set(ordered_group_ids):
+            raise ValueError(
+                "cache_blocks_per_lcm_block must contain exactly the cache groups"
+            )
+        packing = dict(cache_blocks_per_lcm_block)
+        if any(
+            isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < 1
+            or count > _MAX_PACKING
+            for count in packing.values()
+        ):
+            raise ValueError(
+                f"cache group packing must be an integer in [1, {_MAX_PACKING}]"
+            )
+    else:
+        packing = _packing_by_group_ratio(raw_by_group)
+        constrained = _solve_packing(ordered_fields)
+        if constrained is not None:
+            packing.update(constrained)
 
     plane_fields: dict[str, dict[str, list[LcmFieldSpec]]] = {}
     for field in ordered_fields:
@@ -290,7 +328,7 @@ def plan_lcm_fields(
         field.group_id for field in ordered_fields if field.exact_page_stride
     }
     flexible_groups = set(ordered_group_ids) - exact_groups
-    if flexible_groups:
+    if flexible_groups and not has_explicit_packing:
         fixed_plane_bytes = {}
         for plane_id, by_group in plane_fields.items():
             fixed_alignment = alignment
@@ -381,7 +419,8 @@ def plan_lcm_fields(
         )
 
     # Parent 0 backs kernel page 0 and is never schedulable.
-    num_lcm_blocks = budget_bytes // lcm_block_bytes - 1
+    if budget_bytes is not None:
+        num_lcm_blocks = budget_bytes // lcm_block_bytes - 1
     if num_lcm_blocks < 1:
         raise ValueError("budget must hold a null parent and one usable LCM block")
 

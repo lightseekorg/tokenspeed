@@ -97,32 +97,81 @@ void Scheduler::handleEvent(const cache::PrefetchDone& event) {
 }
 
 void Scheduler::handleEvent(const pd::BootstrappedEvent& event) {
-    requests_.at(event.request_id)->Apply(fsm::BootstrappedEvent{});
+    Request* request = find_request(event.request_id);
+    if (request == nullptr || !request->Is<fsm::Bootstrapping>()) {
+        return;
+    }
+    request->Apply(fsm::BootstrappedEvent{});
 }
 
-void Scheduler::handleEvent(const pd::FailedEvent& event) {}
-
-void Scheduler::handleEvent(const pd::SucceededEvent& event) {
+void Scheduler::handleEvent(const pd::FailedEvent& event) {
+    Request* request = find_request(event.request_id);
+    if (request == nullptr || request->Is<fsm::Finished>()) {
+        return;
+    }
+    if (request->Is<fsm::WritingBack>()) {
+        throw std::logic_error("PD FailedEvent cannot terminalize an in-flight scheduler writeback");
+    }
 #if TOKENSPEED_FLAT_KVCACHE
     pending_forward_results_.erase(event.request_id);
+    flat_pd_transfer_pins_.erase(event.request_id);
+#endif
+    request->Apply(fsm::AbortEvent{
+#if TOKENSPEED_FLAT_KVCACHE
+        &coordinator_
+#endif
+    });
+}
+
+void Scheduler::handleEvent(const pd::SucceededEvent& event) {
+    Request* request = find_request(event.request_id);
+    if (request == nullptr || request->Is<fsm::Finished>()) {
+        return;
+    }
+    if (!request->Is<fsm::PrefillDone>() && !request->Is<fsm::Decoding>()) {
+        throw std::logic_error("PD SucceededEvent received in state " + request->StateName());
+    }
+#if TOKENSPEED_FLAT_KVCACHE
+    pending_forward_results_.erase(event.request_id);
+    flat_pd_transfer_pins_.erase(event.request_id);
 #endif
     std::vector<std::string> page_hashes;
-    requests_.at(event.request_id)
-        ->Apply(fsm::FinishEvent{&kv_prefix_cache_, &host_allocator_, std::move(page_hashes), config_.disable_l2_cache,
-                                 hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr
+    request->Apply(fsm::FinishEvent{&kv_prefix_cache_, &host_allocator_, std::move(page_hashes),
+                                    config_.disable_l2_cache, hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr
 #if TOKENSPEED_FLAT_KVCACHE
-                                 ,
-                                 &coordinator_
+                                    ,
+                                    &coordinator_
 #endif
-        });
+    });
 }
 
 void Scheduler::handleEvent(const pd::RemotePrefillDoneEvent& event) {
-    requests_.at(event.request_id)->Apply(fsm::RemotePrefillDoneEvent{event.bootstrap_token});
+    Request* request = find_request(event.request_id);
+    if (request == nullptr) {
+        return;
+    }
+    if (request->Is<fsm::Prefilling>()) {
+        if (event.bootstrap_token < 0) {
+            throw std::invalid_argument("PD RemotePrefillDoneEvent requires a non-negative bootstrap token");
+        }
+#if TOKENSPEED_FLAT_KVCACHE
+        flat_pd_transfer_pins_.erase(event.request_id);
+#endif
+        request->Apply(fsm::RemotePrefillDoneEvent{event.bootstrap_token});
+        return;
+    }
+    if (request->Is<fsm::PrefillDone>() || request->Is<fsm::Decoding>() || request->Is<fsm::Finished>()) {
+        return;
+    }
+    throw std::logic_error("PD RemotePrefillDoneEvent received before decode destination admission; state=" +
+                           request->StateName());
 }
 
 void Scheduler::handleEvent(const forward::Finish& event) {
 #if TOKENSPEED_FLAT_KVCACHE
+    if (config_.enable_flatkv_pd && flat_pd_transfer_pins_.contains(event.request_id)) {
+        throw std::logic_error("FlatKV PD Finish received while transfer pages are pinned");
+    }
     pending_forward_results_.erase(event.request_id);
 #endif
     if (auto req = find_request(event.request_id)) {
@@ -177,6 +226,7 @@ void Scheduler::handleEvent(const forward::Abort& event) {
     // prefill-completing admission and the PrefillDone->Decoding transition must
     // not leave a permanent phantom reservation deflating every later gate.
     pending_forward_results_.erase(event.request_id);
+    flat_pd_transfer_pins_.erase(event.request_id);
 #endif
     auto iter = requests_.find(event.request_id);
     if (iter == requests_.end()) {

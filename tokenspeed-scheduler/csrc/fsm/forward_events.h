@@ -54,6 +54,7 @@ class TreeNode;
 
 namespace tokenspeed::fsm {
 
+struct Bootstrapping;
 struct PrefetchDone;
 struct Prefetching;
 
@@ -291,6 +292,7 @@ struct AbortEvent : InvalidTransitionHandler<AbortEvent> {
     explicit AbortEvent(KvCacheCoordinator* coordinator = nullptr) : coordinator_(coordinator) {}
 #endif
 
+    Finished operator()(Bootstrapping&&);
     Finished operator()(Submitted&& state);
     Aborting operator()(Prefetching&& state);
     Finished operator()(PrefetchDone&&);

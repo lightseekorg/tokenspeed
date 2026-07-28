@@ -168,9 +168,15 @@ bool isFlatDeferred(const Request* req) {
 // token math, the gate charge and window.begin. Claiming in-flight pages is stream-ordering safe
 // (forward_cache_ops.h).
 Scheduler::FlatAdmissionMatch Scheduler::matchFlatPrefixAtAdmission(Request* request) {
+    const auto probe_prefix = [this](std::span<const std::string> hashes) {
+        if (config_.enable_flatkv_pd && config_.role == Role::kD) {
+            return coordinator_.ProbeDecodeDestinationPrefix(hashes);
+        }
+        return coordinator_.ProbePrefix(hashes);
+    };
     if (config_.disable_prefix_cache) {
         FlatAdmissionMatch match;
-        match.probe = coordinator_.ProbePrefix({});
+        match.probe = probe_prefix({});
         return match;
     }
     // Hash input must be byte-identical to the REGISTRATION form (GetFullPagedTokens(false)); radix's
@@ -183,7 +189,7 @@ Scheduler::FlatAdmissionMatch Scheduler::matchFlatPrefixAtAdmission(Request* req
     }
     const std::vector<std::string> flat_hashes = ComputePagedHashes(paged_tokens, "");
     FlatAdmissionMatch match;
-    match.probe = coordinator_.ProbePrefix(flat_hashes);
+    match.probe = probe_prefix(flat_hashes);
     const std::int32_t hit_pages =
         std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens) / cache_block_tokens;
     match.page_hashes.assign(flat_hashes.begin(), flat_hashes.begin() + hit_pages);
@@ -388,12 +394,22 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     }
 
 #if TOKENSPEED_FLAT_KVCACHE
-    const std::int32_t immediate_tokens = tokens_this_round + (config_.role == Role::kD ? flat_decode_reserve : 0);
-    std::vector<GroupDemand> flat_demands =
-        makeGroupDemands(flat_tables, GroupDemand{
-                                          .num_tokens = immediate_tokens,
-                                          .reserve_tokens = config_.role == Role::kD ? 0 : flat_decode_reserve,
-                                      });
+    std::vector<GroupDemand> flat_demands = makeGroupDemands(
+        flat_tables, GroupDemand{
+                         .num_tokens = tokens_this_round,
+                         .reserve_tokens = flat_decode_reserve,
+                     });
+    if (config_.enable_flatkv_pd && config_.role == Role::kD) {
+        const std::int32_t final_prompt_block = (request->PrefillSize() - 1) / coordinator_.CacheBlockTokens();
+        for (std::size_t i = 0; i < flat_demands.size(); ++i) {
+            if (config_.paged_cache_groups[i].transfer_policy == PagedCacheTransferPolicy::LatestSnapshot) {
+                // State prefix slots are null alignment holes. The only live
+                // state suffix is the prompt endpoint plus decode reserve.
+                flat_demands[i].num_tokens = request->PrefillSize();
+                flat_demands[i].materialized_suffix_start = final_prompt_block;
+            }
+        }
+    }
     std::optional<KvCacheCoordinator::AdmissionResult> admission = flatAdmit(std::move(flat_match.probe), flat_demands);
     if (!admission) {
         return {};
@@ -405,6 +421,13 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         coordinator_.CacheFullBlocks(
             flat_tables, flat_match.ext_hashes, flat_admission.access_epoch,
             /*first_slot=*/flat_admission.device_prefix_tokens / coordinator_.CacheBlockTokens());
+    }
+    if (config_.enable_flatkv_pd && config_.role == Role::kD && flat_decode_reserve > 0) {
+        // The destination admission reserves the bootstrap decode token, while
+        // RemotePrefillDoneEvent intentionally carries a zero next-step reserve.
+        // Charge it here so every Flat table reaches the next page boundary at
+        // the same token as the model.
+        coordinator_.ConsumeAvailable(flat_tables, flat_decode_reserve);
     }
 #endif
     return fsm::SchedulePrefillFirstChunkEvent{
@@ -1138,6 +1161,11 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
             std::int32_t reserver_num_tokens = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
             if (auto ev = schedulePrefill(request, token_budget, reserver_num_tokens, simulated_free)) {
                 push_op(applyEventAndGenerateOp(request, *ev));
+#if TOKENSPEED_FLAT_KVCACHE
+                if (config_.enable_flatkv_pd) {
+                    flat_pd_transfer_pins_.insert(request->Id());
+                }
+#endif
                 note_result_owed(request);
             }
         } else if (request->Is<fsm::Submitted>() || request->Is<fsm::PrefetchDone>()) {
@@ -1153,6 +1181,11 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
                 std::vector<TreeNode*> loadback_diff = ev->GetLoadbackDiff();
                 std::vector<TreeNode*> mamba_loadback_nodes = ev->GetMambaLoadbackNodes();
                 push_op(applyEventAndGenerateOp(request, std::move(*ev), loadback_ops));
+#if TOKENSPEED_FLAT_KVCACHE
+                if (config_.enable_flatkv_pd) {
+                    flat_pd_transfer_pins_.insert(request->Id());
+                }
+#endif
                 note_result_owed(request);
                 // will be empty when disable_l2_cache
                 if (!loadback_diff.empty() || !mamba_loadback_nodes.empty()) {

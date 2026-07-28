@@ -442,6 +442,41 @@ TEST(MakeSpecsFromConfigTest, RejectsNonPositivePerGroupPacking) {
     EXPECT_THROW(MakeSpecsFromConfig(config), std::runtime_error);
 }
 
+TEST(MakeSpecsFromConfigTest, RejectsMissingSlidingWindowWithGroupId) {
+    SchedulerConfig config;
+    config.block_size = 128;
+    PagedCacheGroupConfig group;
+    group.group_id = "missing_window";
+    group.retention = PagedCacheGroupConfig::Retention::SlidingWindow;
+    config.paged_cache_groups = {group};
+
+    try {
+        (void)MakeSpecsFromConfig(config);
+        FAIL() << "missing sliding_window_tokens was accepted";
+    } catch (const std::invalid_argument& error) {
+        EXPECT_NE(std::string{error.what()}.find(group.group_id), std::string::npos);
+    }
+}
+
+TEST(MakeSpecsFromConfigTest, RejectsNonPositiveSlidingWindowWithGroupId) {
+    SchedulerConfig config;
+    config.block_size = 128;
+    PagedCacheGroupConfig group;
+    group.group_id = "nonpositive_window";
+    group.retention = PagedCacheGroupConfig::Retention::SlidingWindow;
+    config.paged_cache_groups = {group};
+
+    for (const std::int32_t window : {0, -1}) {
+        config.paged_cache_groups[0].sliding_window_tokens = window;
+        try {
+            (void)MakeSpecsFromConfig(config);
+            FAIL() << "sliding_window_tokens=" << window << " was accepted";
+        } catch (const std::invalid_argument& error) {
+            EXPECT_NE(std::string{error.what()}.find(group.group_id), std::string::npos);
+        }
+    }
+}
+
 TEST(MakeSpecsFromConfigTest, PagedCacheGroupConfigRejectsNonPositivePacking) {
     PagedCacheGroupConfig group;
     group.group_id = "full";

@@ -586,6 +586,10 @@ Retracted WriteBackDoneEvent::operator()(Retracting&& state) {
 #endif
 }
 
+Finished AbortEvent::operator()(Bootstrapping&&) {
+    return Finished{};
+}
+
 Finished AbortEvent::operator()(Submitted&&) {
     return Finished{};
 }

@@ -91,6 +91,10 @@ public:
     // request. Once commit starts, an internal plan/pool mismatch is fatal
     // because partial commit is not rolled back.
     PrefixProbe ProbePrefix(std::span<const std::string> content_hashes) const;
+    // Decode-side PD reuses local history pages, while final-state groups are
+    // restored from the remote endpoint snapshot. Their aligned null holes do
+    // not count as cache hits.
+    PrefixProbe ProbeDecodeDestinationPrefix(std::span<const std::string> content_hashes) const;
     std::optional<AdmissionResult> Admit(PrefixProbe&& prefix, std::span<const GroupDemand> demands,
                                          std::optional<std::uint64_t> request_access_epoch = std::nullopt);
 
@@ -129,7 +133,8 @@ private:
     std::vector<CacheKey> keysForGroup(std::span<const std::string> content_hashes, GroupId group_id) const;
     std::vector<std::vector<CacheKey>> buildGroupKeys(std::span<const std::string> content_hashes) const;
     PrefixProbe::Tier probeTierWithKeys(const BlockPool& pool, std::span<const std::vector<CacheKey>> group_keys,
-                                        std::int32_t num_cache_blocks, std::int32_t floor_tokens) const;
+                                        std::span<const std::size_t> match_order, std::int32_t num_cache_blocks,
+                                        std::int32_t floor_tokens) const;
     CoordinatorMatch acquireTierWithKeys(BlockPool& pool, std::span<const std::vector<CacheKey>> group_keys,
                                          std::int32_t floor_tokens, PrefixProbe::Tier&& probe,
                                          std::uint64_t access_epoch);

@@ -23,7 +23,6 @@
 #include <algorithm>
 #include <cstdint>
 #include <span>
-#include <string>
 #include <vector>
 
 #include "cache/block_pool.h"

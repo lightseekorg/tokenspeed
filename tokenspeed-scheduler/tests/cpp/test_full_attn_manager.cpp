@@ -77,7 +77,7 @@ TEST(FullAttnManagerTest, MatchEmptyListReturnsNoHit) {
     FullAttnManager mgr(4);
     std::vector<CacheKey> empty_hashes;
     PrefixMatch m = mgr.Match(pool, empty_hashes, 0, static_cast<std::int32_t>(empty_hashes.size()));
-    EXPECT_EQ(m.num_hit_blocks, 0);
+    EXPECT_EQ(m.NumHitBlocks(), 0);
     EXPECT_TRUE(m.blocks.empty());
 }
 
@@ -86,7 +86,7 @@ TEST(FullAttnManagerTest, MatchAllMissReturnsNoHitAndDoesNotChangeRefs) {
     FullAttnManager mgr(4);
     std::vector<CacheKey> hashes = {RealKey({1, 2, 3, 4}, 0), RealKey({5, 6, 7, 8}, 0)};
     PrefixMatch m = mgr.Match(pool, hashes, 0, static_cast<std::int32_t>(hashes.size()));
-    EXPECT_EQ(m.num_hit_blocks, 0);
+    EXPECT_EQ(m.NumHitBlocks(), 0);
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 8);  // nothing claimed
 }
 
@@ -119,7 +119,7 @@ TEST(FullAttnManagerTest, MatchStopsAtFirstMiss) {
 
     std::vector<CacheKey> keys{k0, k1, k2};
     PrefixMatch m = mgr.Match(pool, keys, 0, 3);
-    EXPECT_EQ(m.num_hit_blocks, 2);
+    EXPECT_EQ(m.NumHitBlocks(), 2);
     ASSERT_EQ(m.blocks.size(), 2u);
     EXPECT_EQ(m.blocks[0]->Location().lcm_block_id, a_id);
     EXPECT_EQ(m.blocks[1]->Location().lcm_block_id, b_id);
@@ -136,7 +136,7 @@ TEST(FullAttnManagerTest, MatchPinsUntilResultDies) {
 
     std::vector<CacheKey> keys{k0};
     PrefixMatch m = mgr.Match(pool, keys, 0, 1);
-    EXPECT_EQ(m.num_hit_blocks, 1);
+    EXPECT_EQ(m.NumHitBlocks(), 1);
     EXPECT_EQ(m.blocks.front().use_count(), 2);  // Manager cache owner + match
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 7);
     m = {};
@@ -269,7 +269,7 @@ TEST(FullAttnManagerTest, CacheFullBlocksMakesPagesPrefixHittable) {
 
     std::vector<CacheKey> keys{k0, k1};
     PrefixMatch m = mgr.Match(pool, keys, 0, 2);
-    EXPECT_EQ(m.num_hit_blocks, 2);
+    EXPECT_EQ(m.NumHitBlocks(), 2);
     EXPECT_EQ(m.blocks[0]->Location().lcm_block_id, a.Blocks()[0]->Location().lcm_block_id);
     EXPECT_EQ(m.blocks[1]->Location().lcm_block_id, a.Blocks()[1]->Location().lcm_block_id);
 }
@@ -287,7 +287,7 @@ TEST(FullAttnManagerTest, CacheFullBlocksSkipsTailPage) {
 
     std::vector<CacheKey> keys{k0};
     PrefixMatch m = mgr.Match(pool, keys, 0, 1);
-    EXPECT_EQ(m.num_hit_blocks, 1);
+    EXPECT_EQ(m.NumHitBlocks(), 1);
     EXPECT_TRUE(mgr.ContainsCachedBlock(pool, a.Blocks()[0]->Location()));
     EXPECT_FALSE(mgr.ContainsCachedBlock(pool, a.Blocks()[1]->Location()));
 }
@@ -308,7 +308,7 @@ TEST(FullAttnManagerTest, CacheFullBlocksIsIdempotentAcrossCalls) {
     EXPECT_TRUE(mgr.ContainsCachedBlock(pool, a.Blocks()[1]->Location()));
     std::vector<CacheKey> keys{k0, k1};
     PrefixMatch m = mgr.Match(pool, keys, 0, 2);
-    EXPECT_EQ(m.num_hit_blocks, 2);
+    EXPECT_EQ(m.NumHitBlocks(), 2);
 }
 
 TEST(FullAttnManagerTest, FreeReturnsPagesAndClearsTable) {
@@ -337,7 +337,7 @@ TEST(FullAttnManagerTest, FreedCachedPageStaysPrefixReusable) {
 
     std::vector<CacheKey> keys{k0};
     PrefixMatch m = mgr.Match(pool, keys, 0, 1);
-    EXPECT_EQ(m.num_hit_blocks, 1);
+    EXPECT_EQ(m.NumHitBlocks(), 1);
 }
 
 TEST(FullAttnManagerTest, EndToEndTwoRequestsSharePrefix) {
@@ -350,7 +350,7 @@ TEST(FullAttnManagerTest, EndToEndTwoRequestsSharePrefix) {
     {
         std::vector<CacheKey> keys{k0, k1};
         PrefixMatch m = mgr.Match(pool, keys, 0, 2);
-        EXPECT_EQ(m.num_hit_blocks, 0);
+        EXPECT_EQ(m.NumHitBlocks(), 0);
         BlockTable a;
         mgr.ClaimHitBlocks(a, std::move(m));
         ASSERT_TRUE(mgr.Acquire(pool, a, 8));
@@ -362,7 +362,7 @@ TEST(FullAttnManagerTest, EndToEndTwoRequestsSharePrefix) {
     {
         std::vector<CacheKey> keys{k0, k1};
         PrefixMatch m = mgr.Match(pool, keys, 0, 2);
-        EXPECT_EQ(m.num_hit_blocks, 2);
+        EXPECT_EQ(m.NumHitBlocks(), 2);
         BlockTable b;
         mgr.ClaimHitBlocks(b, std::move(m));
         EXPECT_EQ(b.NumBlocks(), 2);
@@ -386,7 +386,7 @@ TEST(FullAttnManagerTest, RejectsKeyForAnotherGroup) {
 
     std::vector<CacheKey> keys_g0{g0};
     std::vector<CacheKey> keys_g1{g1};
-    EXPECT_EQ(mgr.Match(pool, keys_g0, 0, 1).num_hit_blocks, 1);
+    EXPECT_EQ(mgr.Match(pool, keys_g0, 0, 1).NumHitBlocks(), 1);
     EXPECT_THROW(mgr.Match(pool, keys_g1, 0, 1), std::runtime_error);
 }
 
@@ -460,10 +460,10 @@ TEST(FullAttnManagerTest, ChainedPriorPreventsSecondPageCollision) {
     mgr.CacheFullBlocks(pool, a, keys_a);
 
     PrefixMatch miss = mgr.Match(pool, keys_b, 0, static_cast<std::int32_t>(keys_b.size()));
-    EXPECT_EQ(miss.num_hit_blocks, 0);
+    EXPECT_EQ(miss.NumHitBlocks(), 0);
 
     PrefixMatch hit = mgr.Match(pool, keys_a, 0, static_cast<std::int32_t>(keys_a.size()));
-    EXPECT_EQ(hit.num_hit_blocks, 2);
+    EXPECT_EQ(hit.NumHitBlocks(), 2);
 }
 
 TEST(FullAttnManagerLcmTest, ManagerOnlyCacheOwnerRetainsChild) {
@@ -546,7 +546,7 @@ TEST(FullAttnManagerLcmTest, CrossGroupRebindRequiresErasingEveryChildEntry) {
     EXPECT_EQ(pool.BoundGroup(1), std::optional<GroupId>{1});
 }
 
-TEST(FullAttnManagerLcmTest, DuplicateRegistrationCanonicalizesAndTouchesEntry) {
+TEST(FullAttnManagerLcmTest, DuplicateRegistrationUpdatesEpochWithoutReorderingEntries) {
     BlockPool pool(2);
     FullAttnManager mgr(4, 2, 0);
     BlockTable first;
@@ -569,7 +569,11 @@ TEST(FullAttnManagerLcmTest, DuplicateRegistrationCanonicalizesAndTouchesEntry) 
     mgr.Free(duplicate);
 
     EXPECT_EQ(mgr.NumCachedBlocks(pool), 2);
-    EXPECT_EQ(mgr.EvictableBlockLocations(pool), (std::vector<CacheBlockLocation>{other_location, first_location}));
+    EXPECT_EQ(mgr.EvictableBlockLocations(pool), (std::vector<CacheBlockLocation>{first_location, other_location}));
+    const std::optional<KvCacheManager::CachedBlockMetadata> metadata =
+        mgr.CachedBlockMetadataFor(pool, first_location);
+    ASSERT_TRUE(metadata);
+    EXPECT_EQ(metadata->last_access_epoch, next_access_epoch);
     EXPECT_EQ(pool.NumOccupiedSlots(), 2);
 }
 
