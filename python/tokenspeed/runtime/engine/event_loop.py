@@ -55,6 +55,7 @@ from tokenspeed.runtime.engine.pause import PauseController
 from tokenspeed.runtime.engine.request_handler import RequestHandler
 from tokenspeed.runtime.engine.scheduler_utils import (
     advance_forward,
+    aligned_max_scheduled_tokens,
     cache_event_from_payload,
     cache_event_key,
     cache_event_to_payload,
@@ -439,9 +440,27 @@ class EventLoop:
         required_groups = token_to_kv_pool.prefix_cache_required_group_ids
         if required_groups is not None and server_args.enable_prefix_caching:
             prefix_cache_adjunct = pool_to_prefix_cache_adjunct_spec(required_groups)
+        # State-snapshot groups only register prefix-cache pages when a chunk
+        # ends page-aligned; floor the chunk size to that grain or reuse is 0.
+        max_scheduled_tokens = server_args.chunked_prefill_size
+        if server_args.enable_prefix_caching:
+            max_scheduled_tokens = aligned_max_scheduled_tokens(
+                server_args.chunked_prefill_size,
+                paged_cache_groups,
+                geometry.page_size,
+            )
+            if max_scheduled_tokens != server_args.chunked_prefill_size:
+                logger.warning(
+                    "chunked_prefill_size=%s is not a multiple of the "
+                    "state-snapshot page grain; using %s so recurrent-state "
+                    "pages can register for prefix-cache reuse.",
+                    server_args.chunked_prefill_size,
+                    max_scheduled_tokens,
+                )
+                server_args.chunked_prefill_size = max_scheduled_tokens
         scheduler_cfg = make_config(
             num_device_pages=geometry.num_device_pages,
-            max_scheduled_tokens=server_args.chunked_prefill_size,
+            max_scheduled_tokens=max_scheduled_tokens,
             max_batch_size=per_rank_max_batch,
             page_size=geometry.page_size,
             num_host_pages=num_host_pages,
