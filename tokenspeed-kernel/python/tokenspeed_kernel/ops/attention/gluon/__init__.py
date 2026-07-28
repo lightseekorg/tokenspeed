@@ -64,7 +64,16 @@ if current_platform().is_amd:
         gluon_mha_prefill_gfx950 as _prefill_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
-        gluon_mla_decode_bf16xbf16_gfx950 as _mla_decode_bf16xbf16_impl,
+        gluon_mla_decode_bf16xbf16_gfx950_bh16_multiblock as _mla_decode_bf16xbf16_bh16_multiblock_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
+        gluon_mla_decode_bf16xbf16_gfx950_bh16bn64 as _mla_decode_bf16xbf16_bh16bn64_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
+        gluon_mla_decode_bf16xbf16_gfx950_bh64 as _mla_decode_bf16xbf16_bh64_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
+        gluon_mla_decode_bf16xbf16_gfx950_bh64_small as _mla_decode_bf16xbf16_bh64_small_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
         gluon_mla_decode_bf16xfp8_gfx950 as _mla_decode_bf16xfp8_impl,
@@ -314,12 +323,12 @@ if current_platform().is_amd:
         },
     )
     def gluon_mla_decode_bf16xbf16_gfx950_bh16bn64(*args, **kwargs):
-        return _mla_decode_bf16xbf16_impl(*args, **kwargs)
+        return _mla_decode_bf16xbf16_bh16bn64_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",
         "mla_decode_with_kvcache",
-        name="gluon_mla_decode_bf16xbf16_gfx950_h64_small_batch",
+        name="gluon_mla_decode_bf16xbf16_gfx950_bh16_multiblock",
         solution="gluon",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 5),
@@ -333,7 +342,7 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "batch_size": frozenset({1, 2, 4}),
+            "batch_size": frozenset({1}),
             "q_len": frozenset({1}),
             "num_q_heads": frozenset({64}),
             "batch_size_div_64": frozenset({False}),
@@ -344,8 +353,39 @@ if current_platform().is_amd:
             "return_lse": frozenset({False, True}),
         },
     )
-    def gluon_mla_decode_bf16xbf16_gfx950_h64_small_batch(*args, **kwargs):
-        return _mla_decode_bf16xbf16_impl(*args, **kwargs)
+    def gluon_mla_decode_bf16xbf16_gfx950_bh16_multiblock(*args, **kwargs):
+        return _mla_decode_bf16xbf16_bh16_multiblock_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "mla_decode_with_kvcache",
+        name="gluon_mla_decode_bf16xbf16_gfx950_bh64_small",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=format_signatures(
+            ("q", "kv_cache"),
+            "dense",
+            {torch.bfloat16},
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "batch_size": frozenset({2, 4}),
+            "q_len": frozenset({1}),
+            "num_q_heads": frozenset({64}),
+            "batch_size_div_64": frozenset({False}),
+            "page_size": frozenset({64}),
+            "kv_lora_rank": frozenset({512}),
+            "qk_rope_head_dim": frozenset({64}),
+            "support_logit_cap": frozenset({False}),
+            "return_lse": frozenset({False, True}),
+        },
+    )
+    def gluon_mla_decode_bf16xbf16_gfx950_bh64_small(*args, **kwargs):
+        return _mla_decode_bf16xbf16_bh64_small_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",
@@ -441,7 +481,7 @@ if current_platform().is_amd:
         },
     )
     def gluon_mla_decode_bf16xbf16_gfx950_bh64(*args, **kwargs):
-        return _mla_decode_bf16xbf16_impl(*args, **kwargs)
+        return _mla_decode_bf16xbf16_bh64_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",

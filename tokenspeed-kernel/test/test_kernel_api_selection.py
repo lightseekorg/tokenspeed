@@ -32,8 +32,8 @@ import-guarded on missing optional backend packages are skipped.
 from __future__ import annotations
 
 import importlib
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 import pytest
 import tokenspeed_kernel
@@ -795,6 +795,29 @@ def _attention_decode() -> object:
         cache_seqlens,
         max_seqlen_k=128,
         max_seqlen_q=1,
+    )
+
+
+def _attention_mla_decode(
+    batch_size: int,
+    *,
+    override: str | None = None,
+) -> object:
+    q = torch.empty((batch_size, 1, 64, 576), dtype=torch.bfloat16)
+    kv_cache = torch.empty((batch_size, 64, 1, 576), dtype=torch.bfloat16)
+    page_table = torch.arange(batch_size, dtype=torch.int32).view(batch_size, 1)
+    cache_seqlens = torch.full((batch_size,), 64, dtype=torch.int32)
+    return tokenspeed_kernel.mla_decode_with_kvcache(
+        q=q,
+        kv_cache=kv_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_k=64,
+        qk_nope_head_dim=128,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        softmax_scale=1.0,
+        override=override,
     )
 
 
@@ -2774,15 +2797,50 @@ def test_attn_merge_state_routes_to_triton_on_cdna4(
         registry.clear_cache()
 
 
+_GLUON_MLA_FIXED_KERNELS = (
+    "gluon_mla_decode_bf16xbf16_gfx950_bh16bn64",
+    "gluon_mla_decode_bf16xbf16_gfx950_bh64",
+    "gluon_mla_decode_bf16xbf16_gfx950_bh16_multiblock",
+    "gluon_mla_decode_bf16xbf16_gfx950_bh64_small",
+)
+
+
+def _require_gluon_mla_fixed_kernel(name: str):
+    registry = KernelRegistry.get()
+    if registry.get_by_name(_GLUON_MLA_FIXED_KERNELS[0]) is None:
+        pytest.skip("gfx950 Gluon MLA registrations are unavailable")
+    spec = registry.get_by_name(name)
+    assert spec is not None
+    return spec
+
+
+@pytest.mark.parametrize("name", _GLUON_MLA_FIXED_KERNELS)
+def test_gluon_mla_fixed_entrypoints_are_registered(name: str) -> None:
+    _require_gluon_mla_fixed_kernel(name)
+
+
+@pytest.mark.parametrize(
+    "name,expected_batches",
+    [
+        pytest.param(
+            "gluon_mla_decode_bf16xbf16_gfx950_bh16_multiblock",
+            frozenset({1}),
+            id="bh16-multiblock",
+        ),
+        pytest.param(
+            "gluon_mla_decode_bf16xbf16_gfx950_bh64_small",
+            frozenset({2, 4}),
+            id="bh64-small",
+        ),
+    ],
+)
 @pytest.mark.parametrize("batch", [1, 2, 3, 4, 64])
-def test_gluon_mla_h64_small_batch_registration_matches_supported_batches(
+def test_gluon_mla_small_batch_registrations_have_disjoint_traits(
+    name: str,
+    expected_batches: frozenset[int],
     batch: int,
 ) -> None:
-    spec = KernelRegistry.get().get_by_name(
-        "gluon_mla_decode_bf16xbf16_gfx950_h64_small_batch"
-    )
-    if spec is None:
-        pytest.skip("gfx950 Gluon MLA registrations are unavailable")
+    spec = _require_gluon_mla_fixed_kernel(name)
 
     traits = {
         "batch_size": batch,
@@ -2795,7 +2853,62 @@ def test_gluon_mla_h64_small_batch_registration_matches_supported_batches(
         "support_logit_cap": False,
         "return_lse": False,
     }
-    assert spec_matches_traits(spec, traits) is (batch in {1, 2, 4})
+    assert spec_matches_traits(spec, traits) is (batch in expected_batches)
+
+
+@pytest.mark.parametrize(
+    "batch,expected",
+    [
+        pytest.param(
+            1,
+            "gluon_mla_decode_bf16xbf16_gfx950_bh16_multiblock",
+            id="b1-bh16-multiblock",
+        ),
+        pytest.param(
+            2,
+            "gluon_mla_decode_bf16xbf16_gfx950_bh64_small",
+            id="b2-bh64-small",
+        ),
+        pytest.param(
+            4,
+            "gluon_mla_decode_bf16xbf16_gfx950_bh64_small",
+            id="b4-bh64-small",
+        ),
+        pytest.param(
+            64,
+            "gluon_mla_decode_bf16xbf16_gfx950_bh64",
+            id="b64-bh64",
+        ),
+    ],
+)
+def test_gluon_mla_fixed_regime_auto_selection(
+    batch: int,
+    expected: str,
+    mi350_platform: PlatformInfo,
+    selected_kernel_spy,
+) -> None:
+    _require_gluon_mla_fixed_kernel(expected)
+    case = _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "mla_decode_with_kvcache",
+        expected,
+        lambda: _attention_mla_decode(batch),
+    )
+    host_platform = Platform.get()
+    active_case, calls = selected_kernel_spy
+    active_case["case"] = case
+    registry = KernelRegistry.get()
+    try:
+        Platform.override(mi350_platform)
+        registry.clear_cache()
+        case.invoke()
+    finally:
+        Platform.override(host_platform)
+        registry.clear_cache()
+
+    assert calls == [expected]
 
 
 _CASE_PLATFORM_PARAMS = [

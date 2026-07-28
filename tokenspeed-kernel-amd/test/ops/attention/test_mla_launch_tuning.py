@@ -22,18 +22,19 @@
 from __future__ import annotations
 
 import pytest
+import torch
 
 mla_decode = pytest.importorskip(
-    "tokenspeed_kernel_amd.ops.attention.gluon.mla_decode_gfx950",
+    "tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode",
     reason="tokenspeed-kernel-amd is required for MLA launch tuning tests",
 )
 
 
-def test_small_batch_launch_defaults_match_measured_winners() -> None:
-    assert mla_decode._DEFAULT_SMALL_BATCH_LAUNCH == {
-        1: ("bh16-multiblock", 256),
-        2: ("bh64-small", 128),
-        4: ("bh64-small", 256),
+def test_small_batch_target_workgroup_defaults_match_measured_winners() -> None:
+    assert mla_decode._DEFAULT_SMALL_BATCH_TARGET_WORKGROUPS == {
+        1: 256,
+        2: 128,
+        4: 256,
     }
 
 
@@ -90,3 +91,59 @@ def test_small_batch_split_selection_caps_at_available_kv_blocks() -> None:
         )
         == 2
     )
+
+
+@pytest.mark.parametrize(
+    "entrypoint,batch,num_heads",
+    [
+        pytest.param(
+            "gluon_mla_decode_bf16xbf16_gfx950_bh16_multiblock",
+            1,
+            16,
+            id="bh16-multiblock-invalid-heads",
+        ),
+        pytest.param(
+            "gluon_mla_decode_bf16xbf16_gfx950_bh16_multiblock",
+            3,
+            64,
+            id="bh16-multiblock-invalid-batch",
+        ),
+        pytest.param(
+            "gluon_mla_decode_bf16xbf16_gfx950_bh64_small",
+            1,
+            16,
+            id="bh64-small-invalid-heads",
+        ),
+        pytest.param(
+            "gluon_mla_decode_bf16xbf16_gfx950_bh64_small",
+            3,
+            64,
+            id="bh64-small-invalid-batch",
+        ),
+    ],
+)
+def test_small_batch_fixed_entrypoints_reject_unsupported_shapes(
+    entrypoint: str,
+    batch: int,
+    num_heads: int,
+) -> None:
+    q = torch.empty((batch, 1, num_heads, 576), dtype=torch.bfloat16)
+    kv_cache = torch.empty((batch, 64, 1, 576), dtype=torch.bfloat16)
+    page_table = torch.arange(batch, dtype=torch.int32).view(batch, 1)
+    cache_seqlens = torch.full((batch,), 64, dtype=torch.int32)
+
+    with pytest.raises(
+        NotImplementedError,
+        match="requires num_q_heads=64 and batch_size",
+    ):
+        getattr(mla_decode, entrypoint)(
+            q=q,
+            kv_cache=kv_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            max_seqlen_k=64,
+            qk_nope_head_dim=128,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            softmax_scale=1.0,
+        )
