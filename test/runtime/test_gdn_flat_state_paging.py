@@ -13,6 +13,7 @@ import os
 import sys
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -29,14 +30,12 @@ class ComputeStatePageIndicesTest(unittest.TestCase):
             import torch
 
             from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (  # noqa: E501
-                compute_state_checkpoint_indices,
                 compute_state_page_indices,
             )
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
         self.torch = torch
         self.fn = compute_state_page_indices
-        self.checkpoint_fn = compute_state_checkpoint_indices
 
     def _run(self, rows, before, after, page_size=4):
         torch = self.torch
@@ -130,64 +129,34 @@ class ComputeStatePageIndicesTest(unittest.TestCase):
         self.assertEqual(state_in.tolist(), [0])
         self.assertEqual(state_out.tolist(), [0])
 
-    def test_checkpoint_indices_cover_every_interior_p_boundary(self):
+    def test_group_indices_compute_common_slots_once(self):
         torch = self.torch
-        (
-            request_indices,
-            page_slots,
-            flashinfer_sources,
-            fla_sources,
-            conv_indices,
-        ) = self.checkpoint_fn(
-            page_size=128,
-            seq_lens_before=torch.tensor([0, 128], dtype=torch.int32),
-            seq_lens_after=torch.tensor([300, 428], dtype=torch.int32),
-            query_start_loc=torch.tensor([0, 300, 600], dtype=torch.int32),
-            conv_state_len=3,
-        )
-        self.assertEqual(request_indices.tolist(), [0, 0, 1, 1])
-        self.assertEqual(page_slots.tolist(), [0, 1, 1, 2])
-        self.assertEqual(flashinfer_sources.tolist(), [1, 3, 5, 7])
-        self.assertEqual(fla_sources.tolist(), [2, 4, 7, 9])
-        # Request 1 starts at packed offset 300: packed offsets need not be
-        # page- or kernel-chunk-aligned.
-        self.assertEqual(
-            conv_indices.tolist(),
-            [[125, 126, 127], [253, 254, 255], [425, 426, 427], [553, 554, 555]],
+        from tokenspeed.runtime.layers.attention.backends import (
+            hybrid_linear_attn,
         )
 
-    def test_checkpoint_indices_leave_aligned_final_to_final_state(self):
-        torch = self.torch
-        result = self.checkpoint_fn(
-            page_size=128,
-            seq_lens_before=torch.tensor([0], dtype=torch.int32),
-            seq_lens_after=torch.tensor([256], dtype=torch.int32),
-            query_start_loc=torch.tensor([0, 256], dtype=torch.int32),
-            conv_state_len=3,
+        self.assertTrue(
+            hasattr(hybrid_linear_attn, "compute_state_page_indices_by_group"),
+            "multi-group state paging needs one shared boundary calculation",
         )
-        self.assertEqual(result[1].tolist(), [0])
-
-    def test_checkpoint_indices_allow_recovery_chunk_ending_at_boundary(self):
-        torch = self.torch
-        result = self.checkpoint_fn(
-            page_size=128,
-            seq_lens_before=torch.tensor([100], dtype=torch.int32),
-            seq_lens_after=torch.tensor([128], dtype=torch.int32),
-            query_start_loc=torch.tensor([0, 28], dtype=torch.int32),
-            conv_state_len=3,
-        )
-        self.assertEqual(result[0].numel(), 0)
-
-    def test_checkpoint_indices_require_cpu_lengths(self):
-        torch = self.torch
-        with self.assertRaisesRegex(ValueError, "CPU"):
-            self.checkpoint_fn(
-                page_size=128,
-                seq_lens_before=torch.empty(1, dtype=torch.int32, device="meta"),
-                seq_lens_after=torch.empty(1, dtype=torch.int32, device="meta"),
-                query_start_loc=torch.empty(2, dtype=torch.int32, device="meta"),
-                conv_state_len=3,
+        fn = hybrid_linear_attn.compute_state_page_indices_by_group
+        rows_by_group = {
+            "state_a": torch.tensor([[7, 9, 12]], dtype=torch.int32),
+            "state_b": torch.tensor([[17, 19, 22]], dtype=torch.int32),
+        }
+        with mock.patch.object(torch, "div", wraps=torch.div) as div:
+            state_in, state_out = fn(
+                rows_by_group,
+                page_size=4,
+                seq_lens_before=torch.tensor([4], dtype=torch.int32),
+                seq_lens_after=torch.tensor([5], dtype=torch.int32),
             )
+
+        self.assertEqual(div.call_count, 2)
+        self.assertEqual(state_in["state_a"].tolist(), [7])
+        self.assertEqual(state_out["state_a"].tolist(), [9])
+        self.assertEqual(state_in["state_b"].tolist(), [17])
+        self.assertEqual(state_out["state_b"].tolist(), [19])
 
 
 class PrepareFlatPrefillStateInputsTest(unittest.TestCase):
@@ -633,7 +602,7 @@ class GDNFlatStatePagingGPUTest(unittest.TestCase):
         self.assertGreater(ssm_slab[2].abs().max().item(), 0.0)
         self.assertGreater(ssm_slab[3].abs().max().item(), 0.0)
 
-    def test_prefill_materializes_every_p128_boundary(self):
+    def test_prefill_materializes_only_final_state(self):
         torch = self.torch
         ForwardMode = self.ForwardMode
         from tokenspeed_kernel.ops.attention.triton.linear.chunk import (
@@ -662,7 +631,7 @@ class GDNFlatStatePagingGPUTest(unittest.TestCase):
         a = torch.randn(total, H, device="cuda", dtype=torch.float32)
         b = torch.randn(total, H, device="cuda", dtype=torch.float32)
 
-        def oracle(boundary):
+        def oracle():
             conv_state = torch.zeros(
                 1,
                 conv_dim,
@@ -671,7 +640,7 @@ class GDNFlatStatePagingGPUTest(unittest.TestCase):
                 dtype=torch.bfloat16,
             )
             conv_out = causal_conv1d_fn(
-                mixed[:boundary].transpose(0, 1),
+                mixed.transpose(0, 1),
                 conv_weights,
                 bias,
                 activation="silu",
@@ -679,28 +648,26 @@ class GDNFlatStatePagingGPUTest(unittest.TestCase):
                 has_initial_state=torch.zeros(1, dtype=torch.bool, device="cuda"),
                 cache_indices=torch.zeros(1, dtype=torch.int32, device="cuda"),
                 query_start_loc=torch.tensor(
-                    [0, boundary], dtype=torch.int32, device="cuda"
+                    [0, total], dtype=torch.int32, device="cuda"
                 ),
-                seq_lens_cpu=torch.tensor([boundary], dtype=torch.int32),
+                seq_lens_cpu=torch.tensor([total], dtype=torch.int32),
             ).transpose(0, 1)
             query, key, value = torch.split(
                 conv_out, [key_dim, key_dim, value_dim], dim=-1
             )
-            g = fused_gdn_gating(A_log, a[:boundary], dt_bias).view(1, boundary, H)
-            beta = b[:boundary].sigmoid().to(torch.bfloat16).view(1, boundary, H)
+            g = fused_gdn_gating(A_log, a, dt_bias).view(1, total, H)
+            beta = b.sigmoid().to(torch.bfloat16).view(1, total, H)
             _, final_state = chunk_gated_delta_rule(
-                q=query.view(1, boundary, H, D),
-                k=key.view(1, boundary, H, D),
-                v=value.view(1, boundary, H, D),
+                q=query.view(1, total, H, D),
+                k=key.view(1, total, H, D),
+                v=value.view(1, total, H, D),
                 g=g,
                 beta=beta,
                 initial_state=torch.zeros(
                     1, H, D, D, device="cuda", dtype=torch.float32
                 ),
                 output_final_state=True,
-                cu_seqlens=torch.tensor(
-                    [0, boundary], dtype=torch.int64, device="cuda"
-                ),
+                cu_seqlens=torch.tensor([0, total], dtype=torch.int64, device="cuda"),
                 head_first=False,
                 use_qk_l2norm_in_kernel=True,
             )
@@ -708,9 +675,7 @@ class GDNFlatStatePagingGPUTest(unittest.TestCase):
             # chunk_gated_delta_rule's direct oracle returns [H, K, V].
             return conv_state[0], final_state[0].transpose(-2, -1)
 
-        expected = {
-            boundary: oracle(boundary) for boundary in (page_size, 2 * page_size)
-        }
+        expected_conv, expected_ssm = oracle()
         conv_slab = torch.zeros(
             4,
             conv_dim,
@@ -719,6 +684,12 @@ class GDNFlatStatePagingGPUTest(unittest.TestCase):
             dtype=torch.bfloat16,
         )
         ssm_slab = torch.zeros(4, H, D, D, device="cuda", dtype=torch.float32)
+        conv_slab[1].fill_(11)
+        conv_slab[2].fill_(12)
+        ssm_slab[1].fill_(21)
+        ssm_slab[2].fill_(22)
+        interior_conv_before = conv_slab[1:3].clone()
+        interior_ssm_before = ssm_slab[1:3].clone()
 
         previous_page_size = self.P
         self.P = page_size
@@ -740,10 +711,6 @@ class GDNFlatStatePagingGPUTest(unittest.TestCase):
                     [[1, 2, 3]], dtype=torch.int32, device="cuda"
                 )
             },
-        )
-        self.assertEqual(
-            backend.forward_metadata.flat_checkpoint_pages["linear_attention"].tolist(),
-            [1, 2],
         )
         backend.forward_extend(
             None,
@@ -771,13 +738,11 @@ class GDNFlatStatePagingGPUTest(unittest.TestCase):
             layer_id=0,
         )
 
-        for page, boundary in ((1, page_size), (2, 2 * page_size)):
-            expected_conv, expected_ssm = expected[boundary]
-            torch.testing.assert_close(
-                conv_slab[page], expected_conv, atol=1e-2, rtol=1e-2
-            )
-            state_diff = (ssm_slab[page] - expected_ssm.float()).abs()
-            self.assertLess(state_diff.mean().item(), 1e-3)
+        self.assertTrue(torch.equal(conv_slab[1:3], interior_conv_before))
+        self.assertTrue(torch.equal(ssm_slab[1:3], interior_ssm_before))
+        torch.testing.assert_close(conv_slab[3], expected_conv, atol=1e-2, rtol=1e-2)
+        state_diff = (ssm_slab[3] - expected_ssm.float()).abs()
+        self.assertLess(state_diff.mean().item(), 1e-3)
 
 
 if __name__ == "__main__":
