@@ -968,8 +968,13 @@ def cutedsl_fused_recurrent_kda_megafuse(
     # what the epilogue supports, and tell the caller through the stash.
     # The decision depends only on shapes/dtypes/strides, so it is stable
     # across CUDA-graph capture and replay.
+    # Fusion wins only while launch overhead dominates: measured crossover on
+    # B300 is between B=16 (+0.02ms/step) and B=32 (-0.08ms/step; -0.19 at
+    # B=64), where the epilogue's per-row reductions serialize inside the
+    # kernel while the standalone norm amortizes its launch cost.
     fuse_onorm = (
         onorm is not None
+        and t <= 16
         and onorm.weight.numel() == k
         and onorm.weight.dtype in _NORM_W_DTYPES
         and onorm.weight.is_contiguous()

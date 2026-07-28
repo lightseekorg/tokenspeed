@@ -280,6 +280,20 @@ class TestKdaFusedDecodeCutedsl:
         assert not req.consumed
         _assert_step_close(x, o, ref_x, ref_o)
 
+    def test_onorm_large_batch_left_unconsumed(self):
+        # Above the measured B300 crossover (t > 16) the standalone norm is
+        # faster than the fused epilogue, so the wrapper must decline and
+        # leave the stash for the host-side norm.
+        bs = 32
+        x = _make_inputs(bs, seed=36)
+        ref_x = _clone(x)
+        req = _onorm_request(x)
+        o = _run(x, onorm=req)
+        ref_o = _torch_reference(ref_x, apply_onorm=False)
+        torch.cuda.synchronize()
+        assert not req.consumed
+        _assert_step_close(x, o, ref_x, ref_o)
+
     def test_onorm_padded_rows(self):
         bs = 8
         x = _make_inputs(bs, seed=33, pad_every=3)
