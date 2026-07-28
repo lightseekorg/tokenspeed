@@ -236,6 +236,198 @@ def _destroy_ipc_workspace(
 
 
 # ---------------------------------------------------------------------------
+# MNNVL-structured one-shot workspace (NVLS multicast + Lamport rotation)
+# ---------------------------------------------------------------------------
+
+# Mirror of kMnnvlOneShotMaxToken in trtllm_mnnvl_allreduce_fusion.cuh: the
+# mnnvl kernel is a decode-latency one-shot path; larger payloads stay on the
+# IPC lamport/twoshot fallback, so the workspace is sized (and clamped) for
+# this many tokens at most.
+MNNVL_ONESHOT_MAX_TOKEN = 128
+
+_MNNVL_SUPPORTED_PATTERNS = frozenset(
+    {
+        AllReduceFusionPattern.kAllReduce,
+        AllReduceFusionPattern.kARResidualRMSNorm,
+        AllReduceFusionPattern.kARResidualAttnResCombine,
+        # kAllReduceLatentNorm stays on the IPC lamport path: the mnnvl
+        # cluster geometry loses on the wide [latent|hidden] lane (measured
+        # 8.60us vs 6.64 on 8x B300; every other pattern wins there).
+    }
+)
+
+_MNNVL_SUPPORTED_WORLD_SIZES = (2, 4, 8)
+
+
+def _mnnvl_grid_config_ok(hidden_dim: int, elem_size: int) -> bool:
+    """Mirror of mnnvl_oneshot_grid_config's feasibility check (exact,
+    warp-aligned partition of the hidden dim across one cluster)."""
+    vec = 16 // elem_size
+    if hidden_dim % vec != 0:
+        return False
+    threads = hidden_dim // vec
+    cluster = 1
+    while threads // cluster > 1024:
+        cluster *= 2
+    return cluster <= 8 and threads % cluster == 0 and (threads // cluster) % 32 == 0
+
+
+class MnnvlAllReduceFusionWorkspace:
+    """Symmetric-memory workspace for the MNNVL-structured one-shot AR.
+
+    Layout: one symm_mem allocation = 3 lamport buffers of
+    ``buffer_size_bytes`` each, pre-filled with the fp32 -0.0 sentinel, plus a
+    9-word uint32 ``buffer_flags`` rotation-state array (see the protocol notes
+    in trtllm_mnnvl_allreduce_fusion.cuh). Passing an instance of this class as
+    ``workspace_ptrs`` to :func:`trtllm_allreduce_fusion` routes the call onto
+    the mnnvl kernel; a plain int64 tensor keeps the IPC lamport path.
+    """
+
+    backend = "mnnvl"
+
+    def __init__(
+        self,
+        tp_rank: int,
+        tp_size: int,
+        max_token_num: int,
+        hidden_dim: int,
+        buffer_size_bytes: int,
+        multicast_ptr: int,
+        local_ptr: int,
+        buffer_flags: torch.Tensor,
+        refs: tuple,
+    ):
+        self.tp_rank = tp_rank
+        self.tp_size = tp_size
+        self.max_token_num = max_token_num
+        self.hidden_dim = hidden_dim
+        self.buffer_size_bytes = buffer_size_bytes
+        self.multicast_ptr = multicast_ptr
+        self.local_ptr = local_ptr
+        self.buffer_flags = buffer_flags
+        self._refs = refs  # keep the symm_mem tensor + handle alive
+
+    def supports(
+        self,
+        token_num: int,
+        hidden_dim: int,
+        dtype: torch.dtype,
+        world_size: int,
+        pattern_code: int,
+        use_oneshot: bool = True,
+        residual_reduce_scattered: bool = False,
+    ) -> bool:
+        """Whether this call shape can run on the mnnvl kernel.
+
+        Args:
+            token_num: number of tokens in this call.
+            hidden_dim: hidden (lane) width of this call.
+            dtype: payload dtype (fp16/bf16 only).
+            world_size: TP world size of this call.
+            pattern_code: AllReduceFusionPattern value.
+            use_oneshot: resolved one-shot decision (twoshot unsupported).
+            residual_reduce_scattered: RS-residual mode (unsupported).
+
+        Returns:
+            True when the mnnvl path can serve the call; callers must fall
+            back to the IPC lamport workspace otherwise.
+        """
+        if not use_oneshot or residual_reduce_scattered:
+            return False
+        if world_size != self.tp_size or world_size not in _MNNVL_SUPPORTED_WORLD_SIZES:
+            return False
+        if dtype not in (torch.bfloat16, torch.float16):
+            return False
+        if pattern_code not in _MNNVL_SUPPORTED_PATTERNS:
+            return False
+        if token_num > MNNVL_ONESHOT_MAX_TOKEN:
+            return False
+        payload = token_num * hidden_dim * world_size * dtype.itemsize
+        if payload > self.buffer_size_bytes:
+            return False
+        return _mnnvl_grid_config_ok(hidden_dim, dtype.itemsize)
+
+
+def trtllm_create_mnnvl_workspace_for_all_reduce_fusion(
+    tp_rank: int,
+    tp_size: int,
+    max_token_num: int,
+    hidden_dim: int,
+    group: Optional[ProcessGroup] = None,
+    dtype_elem_size: int = 2,
+) -> MnnvlAllReduceFusionWorkspace:
+    """Create the symmetric-memory workspace for the mnnvl one-shot AR.
+
+    Collective: every rank of ``group`` must call this in lockstep (symm_mem
+    rendezvous). Raises when NVLS multicast is unavailable; callers should
+    probe capabilities first (see ops/communication/trtllm.py).
+
+    Args:
+        tp_rank: this rank within the group.
+        tp_size: group world size (2, 4 or 8).
+        max_token_num: maximum tokens per call; clamped to
+            ``MNNVL_ONESHOT_MAX_TOKEN`` (larger calls use the IPC fallback).
+        hidden_dim: maximum hidden (lane) width the workspace must hold.
+        group: the process group to rendezvous over.
+        dtype_elem_size: payload element size in bytes (2 for bf16/fp16).
+
+    Returns:
+        MnnvlAllReduceFusionWorkspace bound to this group.
+    """
+    import torch.distributed._symmetric_memory as symm_mem
+
+    if tp_size not in _MNNVL_SUPPORTED_WORLD_SIZES:
+        raise RuntimeError(f"mnnvl workspace: unsupported tp_size {tp_size}")
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    oneshot_max_token = min(max_token_num, MNNVL_ONESHOT_MAX_TOKEN)
+    bytes_per_buffer = _round_up(
+        oneshot_max_token * hidden_dim * tp_size * dtype_elem_size, 16
+    )
+    total_bytes = 3 * bytes_per_buffer
+
+    buf = symm_mem.empty(total_bytes // 4, dtype=torch.float32, device=device)
+    handle = symm_mem.rendezvous(buf, group)
+    multicast_ptr = handle.multicast_ptr
+    if multicast_ptr is None or multicast_ptr == 0:
+        raise RuntimeError("mnnvl workspace: NVLS multicast mapping unavailable")
+
+    # The allocation may be larger than requested; partition the actual size
+    # and initialize the WHOLE local allocation (not just the requested
+    # prefix) with the fp32 -0.0 Lamport sentinel.
+    buffer_size_bytes = handle.buffer_size // 3 // 16 * 16
+    if buffer_size_bytes < bytes_per_buffer:
+        raise RuntimeError("mnnvl workspace: symmetric allocation too small")
+    handle.get_buffer(tp_rank, (handle.buffer_size // 4,), torch.float32).fill_(-0.0)
+
+    # Rotation state, same layout as flashinfer's buffer_flags:
+    # [cur idx, dirty idx, bytes per buffer, dirty stages, bytes_to_clear[4],
+    #  arrival counter]
+    buffer_flags = torch.tensor(
+        [0, 2, buffer_size_bytes, 0, 0, 0, 0, 0, 0],
+        dtype=torch.uint32,
+        device=device,
+    )
+    local_ptr = int(handle.buffer_ptrs[tp_rank])
+
+    torch.cuda.synchronize()
+    if dist.is_initialized():
+        dist.barrier(group=group)
+
+    return MnnvlAllReduceFusionWorkspace(
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+        max_token_num=oneshot_max_token,
+        hidden_dim=hidden_dim,
+        buffer_size_bytes=buffer_size_bytes,
+        multicast_ptr=int(multicast_ptr),
+        local_ptr=local_ptr,
+        buffer_flags=buffer_flags,
+        refs=(buf, handle),
+    )
+
+
+# ---------------------------------------------------------------------------
 # AllReduce fusion
 # ---------------------------------------------------------------------------
 
@@ -339,6 +531,51 @@ def trtllm_allreduce_fusion(
         use_oneshot = _ar_should_use_oneshot(
             token_num, hidden_dim, allreduce_in.dtype, world_size
         )
+
+    if isinstance(workspace_ptrs, MnnvlAllReduceFusionWorkspace):
+        # MNNVL-structured one-shot path: single NVLS multicast payload store,
+        # local-buffer Lamport polling, same FusedOp epilogues.
+        assert workspace_ptrs.supports(
+            token_num,
+            hidden_dim,
+            allreduce_in.dtype,
+            world_size,
+            pattern_code,
+            use_oneshot=use_oneshot,
+            residual_reduce_scattered=residual_reduce_scattered,
+        ), (
+            "mnnvl workspace does not support this call "
+            f"(token_num={token_num}, hidden_dim={hidden_dim}, "
+            f"dtype={allreduce_in.dtype}, pattern={pattern_code}, "
+            f"use_oneshot={use_oneshot})"
+        )
+        _load_trtllm_comm_module().trtllm_mnnvl_allreduce_fusion(
+            allreduce_in,
+            world_size,
+            world_rank,
+            token_num,
+            hidden_dim,
+            workspace_ptrs.multicast_ptr,
+            workspace_ptrs.local_ptr,
+            workspace_ptrs.buffer_flags,
+            launch_with_pdl,
+            trigger_completion_at_end,
+            fp32_acc,
+            pattern_code,
+            allreduce_out,
+            residual_in,
+            residual_out,
+            norm_out,
+            rms_gamma,
+            rms_eps,
+            attnres_m,
+            attnres_s,
+            attnres_acc,
+            attnres_res_w,
+            attnres_out_norm_w,
+            latent_width,
+        )
+        return
 
     if not use_oneshot:
         assert not residual_reduce_scattered, "Currently not supported!"

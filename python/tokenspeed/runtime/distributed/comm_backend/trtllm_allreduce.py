@@ -94,9 +94,26 @@ class TrtllmAllReduceBackend(CommBackend):
                 )
             )
 
+            # NVLS variant for the plain one-shot path (capability-gated,
+            # collective, symmetric fallback): the fused-pattern wrappers in
+            # the kernel package arm their own copy; this one serves the
+            # backend-level all_reduce (post-restructure attention ARs).
+            from tokenspeed_kernel.ops.communication.trtllm import (
+                _try_create_mnnvl_workspace,
+            )
+
+            mnnvl_workspace = _try_create_mnnvl_workspace(
+                rank,
+                len(group),
+                max_token_num,
+                hidden_dim,
+                device_group,
+            )
+
             self._resources[group] = {
                 "ipc_handles": ipc_handles,
                 "workspace": workspace_tensor,
+                "mnnvl": mnnvl_workspace,
                 "rank": rank,
                 "world_size": len(group),
                 "max_token_num": max_token_num,
@@ -200,13 +217,25 @@ class TrtllmAllReduceBackend(CommBackend):
 
         allreduce_out = torch.empty_like(tensor_2d)
 
+        workspace = res["workspace"]
+        mnnvl = res.get("mnnvl")
+        if mnnvl is not None and mnnvl.supports(
+            token_num,
+            hidden_dim,
+            tensor_2d.dtype,
+            res["world_size"],
+            AllReduceFusionPattern.kAllReduce,
+            use_oneshot=True,
+        ):
+            workspace = mnnvl
+
         trtllm_allreduce_fusion(
             allreduce_in=tensor_2d,
             world_size=res["world_size"],
             world_rank=res["rank"],
             token_num=token_num,
             hidden_dim=hidden_dim,
-            workspace_ptrs=res["workspace"],
+            workspace_ptrs=workspace,
             launch_with_pdl=pdl_enabled(),
             use_oneshot=True,
             trigger_completion_at_end=True,

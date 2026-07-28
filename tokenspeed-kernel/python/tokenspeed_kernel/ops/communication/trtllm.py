@@ -60,21 +60,99 @@ if current_platform().is_nvidia:
         AllGatherFusionPattern,
         AllReduceFusionPattern,
         ReduceScatterFusionPattern,
+        _ar_should_use_oneshot,
+        _load_trtllm_comm_module,
         minimax_allreduce_rms_qk,
         trtllm_allgather_fusion,
         trtllm_allreduce_fusion,
         trtllm_create_ipc_workspace_for_all_reduce_fusion,
         trtllm_create_ipc_workspace_for_minimax,
+        trtllm_create_mnnvl_workspace_for_all_reduce_fusion,
         trtllm_destroy_ipc_workspace_for_all_reduce_fusion,
         trtllm_reducescatter_fusion,
     )
 
     _workspace_manager = None
 
+    def _mnnvl_locally_available(world_size: int) -> bool:
+        """Non-collective capability probe for the MNNVL one-shot AR path.
+
+        Checks the compiled kernel symbol, torch symmetric-memory support and
+        NVLS multicast availability on this device. Purely local: safe to call
+        before any collective.
+        """
+        if world_size not in (2, 4, 8):
+            return False
+        try:
+            if torch.cuda.get_device_capability()[0] < 9:
+                return False
+            from torch._C._autograd import DeviceType
+            from torch._C._distributed_c10d import _SymmetricMemory
+            from torch.distributed import _symmetric_memory  # noqa: F401
+
+            if not _SymmetricMemory.has_multicast_support(
+                DeviceType.CUDA, torch.cuda.current_device()
+            ):
+                return False
+            return hasattr(_load_trtllm_comm_module(), "trtllm_mnnvl_allreduce_fusion")
+        except Exception as exc:  # noqa: BLE001 - capability probe must not raise
+            logger.debug("mnnvl capability probe failed: %s", exc)
+            return False
+
+    def _try_create_mnnvl_workspace(
+        rank: int,
+        world_size: int,
+        max_token_num: int,
+        hidden_dim: int,
+        group,
+    ):
+        """Collectively arm the mnnvl workspace; returns None on fallback.
+
+        Two-phase agreement so every rank takes the same path: (1) all-reduce
+        the local capability probe before the symm_mem rendezvous, (2)
+        all-reduce the creation result. No environment knobs: capability
+        auto-detection only.
+        """
+        device = torch.device("cuda", torch.cuda.current_device())
+        ok = torch.tensor(
+            [1 if _mnnvl_locally_available(world_size) else 0],
+            dtype=torch.int32,
+            device=device,
+        )
+        dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=group)
+        if ok.item() == 0:
+            return None
+
+        workspace = None
+        try:
+            workspace = trtllm_create_mnnvl_workspace_for_all_reduce_fusion(
+                rank, world_size, max_token_num, hidden_dim, group=group
+            )
+        except Exception as exc:  # noqa: BLE001 - fall back to the IPC path
+            logger.warning("mnnvl workspace creation failed, using IPC: %s", exc)
+
+        ok = torch.tensor(
+            [1 if workspace is not None else 0], dtype=torch.int32, device=device
+        )
+        dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=group)
+        if ok.item() == 0:
+            return None
+        logger.info(
+            "MNNVL one-shot AR workspace armed: rank=%s world_size=%s "
+            "max_token_num=%s hidden_dim=%s buffer=%s bytes",
+            rank,
+            world_size,
+            workspace.max_token_num,
+            hidden_dim,
+            workspace.buffer_size_bytes,
+        )
+        return workspace
+
     class TrtllmFusionWorkspaceManager:
         def __init__(self):
             self.workspace_tensor = None
             self.ipc_handles = None
+            self.mnnvl_workspace = None
             self.world_size = None
             self.rank = None
             self.max_token_num = None
@@ -116,6 +194,13 @@ if current_platform().is_nvidia:
                     use_fp32_lamport=use_fp32_lamport,
                 )
             )
+            # Additionally arm the MNNVL one-shot AR workspace (NVLS multicast
+            # + Lamport rotation). Capability auto-detected; the IPC workspace
+            # above stays as the always-available fallback and continues to
+            # serve allgather/reducescatter and unsupported AR shapes.
+            self.mnnvl_workspace = _try_create_mnnvl_workspace(
+                rank, world_size, max_token_num, hidden_dim, group
+            )
 
             self.world_size = world_size
             self.rank = rank
@@ -144,6 +229,9 @@ if current_platform().is_nvidia:
                 finally:
                     self.workspace_tensor = None
                     self.ipc_handles = None
+                    # symm_mem allocations are process-lifetime; dropping the
+                    # reference is all we can (and need to) do here.
+                    self.mnnvl_workspace = None
                     self.initialized = False
                     self.world_size = None
                     self.rank = None
@@ -215,6 +303,28 @@ if current_platform().is_nvidia:
             )
 
         return _workspace_manager.initialized
+
+    def _ar_fusion_workspace(
+        token_num: int,
+        hidden_dim: int,
+        dtype: torch.dtype,
+        pattern_code: int,
+        use_oneshot: bool,
+        residual_reduce_scattered: bool = False,
+    ):
+        """Pick the AR workspace for one call: mnnvl when eligible, else IPC."""
+        mnnvl = _workspace_manager.mnnvl_workspace
+        if mnnvl is not None and mnnvl.supports(
+            token_num,
+            hidden_dim,
+            dtype,
+            _workspace_manager.world_size,
+            pattern_code,
+            use_oneshot=use_oneshot,
+            residual_reduce_scattered=residual_reduce_scattered,
+        ):
+            return mnnvl
+        return _workspace_manager.workspace_tensor
 
     def get_num_tokens_per_rank(world_size: int, total_tokens_in_group: int) -> list:
         token_list_in_group = []
@@ -307,13 +417,29 @@ if current_platform().is_nvidia:
         if residual_reduce_scattered or has_partial_norm_out:
             use_oneshot = True
 
+        resolved_oneshot = (
+            use_oneshot
+            if use_oneshot is not None
+            else _ar_should_use_oneshot(
+                token_num, hidden_dim, input_tensor.dtype, world_size
+            )
+        )
+        workspace = _ar_fusion_workspace(
+            token_num,
+            hidden_dim,
+            input_tensor.dtype,
+            pattern_code,
+            resolved_oneshot,
+            residual_reduce_scattered,
+        )
+
         trtllm_allreduce_fusion(
             allreduce_in=input_tensor,
             world_size=world_size,
             world_rank=rank,
             token_num=token_num,
             hidden_dim=hidden_dim,
-            workspace_ptrs=_workspace_manager.workspace_tensor,
+            workspace_ptrs=workspace,
             launch_with_pdl=launch_with_pdl,
             use_oneshot=use_oneshot,
             trigger_completion_at_end=trigger_completion_at_end,
@@ -380,13 +506,20 @@ if current_platform().is_nvidia:
         residual_out = torch.empty_like(residual)
         norm_out = torch.empty_like(input_tensor)
         m, s_, acc = scratch
+        workspace = _ar_fusion_workspace(
+            token_num,
+            hidden_dim,
+            input_tensor.dtype,
+            AllReduceFusionPattern.kARResidualAttnResCombine,
+            use_oneshot=True,
+        )
         trtllm_allreduce_fusion(
             allreduce_in=input_tensor,
             world_size=world_size,
             world_rank=rank,
             token_num=token_num,
             hidden_dim=hidden_dim,
-            workspace_ptrs=_workspace_manager.workspace_tensor,
+            workspace_ptrs=workspace,
             launch_with_pdl=launch_with_pdl,
             use_oneshot=True,
             trigger_completion_at_end=trigger_completion_at_end,
@@ -446,13 +579,20 @@ if current_platform().is_nvidia:
         ):
             raise RuntimeError("TRT-LLM fusion workspace not available")
 
+        workspace = _ar_fusion_workspace(
+            token_num,
+            lane_dim,
+            lane.dtype,
+            AllReduceFusionPattern.kAllReduceLatentNorm,
+            use_oneshot=True,
+        )
         trtllm_allreduce_fusion(
             allreduce_in=lane,
             world_size=world_size,
             world_rank=rank,
             token_num=token_num,
             hidden_dim=lane_dim,
-            workspace_ptrs=_workspace_manager.workspace_tensor,
+            workspace_ptrs=workspace,
             launch_with_pdl=launch_with_pdl,
             use_oneshot=True,
             trigger_completion_at_end=trigger_completion_at_end,
