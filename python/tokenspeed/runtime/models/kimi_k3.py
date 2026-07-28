@@ -82,7 +82,6 @@ from tokenspeed_kernel.ops.gemm import (
 from tokenspeed_kernel.ops.gemm.triton_gemv import (
     decode_gemv,
 )
-from tokenspeed_kernel.ops.gemm.triton_gemv_mcast import rowcta_gemv_mcast
 from torch import nn
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiK3Config, KimiLinearConfig
@@ -288,28 +287,6 @@ class KimiLinearMLP(nn.Module):
         return x
 
 
-def _o_proj_prestage_store(attn_out: torch.Tensor, weight: torch.Tensor, ws) -> None:
-    """Producer half of the fused o_proj-GEMM + all-reduce decode path.
-
-    Runs the M=1 row-per-CTA o_proj GEMV with a multicast-store epilogue:
-    the bf16 partial lands (sanitized) in the mnnvl workspace's CURRENT
-    Lamport buffer at slot [token 0][rank], addressed in-kernel from the
-    device-side ``buffer_flags`` rotation state. The immediately following
-    ``_reduce_attn_accumulate`` call must run the mnnvl AR with
-    ``input_prestaged=True`` (skip-store variant) -- the decoder layer's
-    gating guarantees the pairing (design source: the SGLang K3 gemm_ar
-    concept, Apache-2.0).
-    """
-    rowcta_gemv_mcast(
-        attn_out,
-        weight,
-        mcast_ptr=ws.multicast_ptr,
-        buffer_flags=ws.buffer_flags,
-        rank=ws.tp_rank,
-        enable_pdl=pdl_enabled(),
-    )
-
-
 class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
     """Kimi-K3 full-attention layer: NoPE MLA + optional sigmoid output gate.
 
@@ -452,8 +429,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         out_cache_loc: torch.Tensor,
         comm_manager,
         block_scale: torch.Tensor | None = None,
-        o_proj_prestage=None,
-    ) -> torch.Tensor | None:
+    ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
         if self.use_output_gate:
@@ -470,12 +446,6 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             # Fused in-place fp32 sigmoid+mul; the gate shard matches the
             # head-sharded attn_output.
             attn_output = sigmoid_mul(attn_output, gate)
-        if o_proj_prestage is not None:
-            # Fused o_proj + AR: multicast-store this rank's partial straight
-            # into the mnnvl Lamport slot; the decoder layer's AR consumes it
-            # (input_prestaged). Returns None -- no local o_proj output exists.
-            _o_proj_prestage_store(attn_output, self.o_proj.weight, o_proj_prestage)
-            return None
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -796,8 +766,7 @@ class KimiLinearKDA(nn.Module):
         out_cache_loc: torch.Tensor,
         comm_manager,
         block_scale: torch.Tensor | None = None,
-        o_proj_prestage=None,
-    ) -> torch.Tensor | None:
+    ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
 
@@ -858,12 +827,6 @@ class KimiLinearKDA(nn.Module):
             hn,
             hd,
         )
-        if o_proj_prestage is not None:
-            # Fused o_proj + AR: multicast-store this rank's partial straight
-            # into the mnnvl Lamport slot; the decoder layer's AR consumes it
-            # (input_prestaged). Returns None -- no local o_proj output exists.
-            _o_proj_prestage_store(core_out, self.o_proj.weight, o_proj_prestage)
-            return None
         output, _ = self.o_proj(core_out)
         return output
 
@@ -1496,22 +1459,6 @@ class KimiLinearDecoderLayer(nn.Module):
         )
         self._dummy_norm.weight.requires_grad_(False)
 
-        # Fused o_proj-GEMM + all-reduce (M == 1 decode): the attention output
-        # projection multicast-stores its bf16 partial straight into the mnnvl
-        # Lamport staging slot and the AR-combine kernel consumes it with its
-        # own store phase skipped. Armed only when the consumer AR of this
-        # exact shape is guaranteed to run on the mnnvl kernel; block-write
-        # layers stay unfused (their attention reduce is the plain all_reduce,
-        # not the fused combine). Weight dtype/layout is re-checked in
-        # post_load_weights; fallback is the unfused GEMM + AR chain.
-        # NOTE: only the *decision* is cached — the workspace object itself is
-        # re-resolved per forward (see _resolve_gemm_ar_ws) because the fusion
-        # workspace manager may re-create the mnnvl workspace when a later
-        # caller widens it; a cached object would point at dead buffers.
-        self._attn_gemm_ar_armed = False
-        if self._attn_ar_residual_fusion and not self.is_block_write_layer:
-            self._attn_gemm_ar_armed = self._resolve_gemm_ar_ws() is not None
-
         self.attn_fork = StreamFork(alt_stream)
         # (proj_w_getter, norm, valid_blocks) for the NEXT layer's attn-side
         # mix; set by the backbone after all layers exist. The partial launches
@@ -1533,36 +1480,11 @@ class KimiLinearDecoderLayer(nn.Module):
             post_attn_layernorm=self.post_attention_layernorm,
         )
 
-    def _resolve_gemm_ar_ws(self):
-        """The CURRENT mnnvl workspace iff the fused o_proj+AR path can run.
-
-        Resolved per call (cheap, python-only): the fusion workspace manager
-        may tear down and re-create the mnnvl workspace when another caller
-        widens it, so holding a workspace object across forwards would risk
-        staging into retired buffers. Within one forward (and hence one CUDA
-        graph capture) the producer GEMV and the consumer AR resolve the same
-        object; post-capture stability is the same contract every captured
-        mnnvl AR call already relies on.
-        """
-        from tokenspeed_kernel.ops.communication.trtllm import (
-            AllReduceFusionPattern,
-            mnnvl_prestage_workspace,
-        )
-
-        return mnnvl_prestage_workspace(
-            self.mapping.attn.tp_size,
-            1,
-            self.config.hidden_size,
-            torch.bfloat16,
-            AllReduceFusionPattern.kARResidualAttnResCombine,
-        )
-
     def _reduce_attn_accumulate(
         self,
-        attn_partial: torch.Tensor | None,
+        attn_partial: torch.Tensor,
         prefix_sum: torch.Tensor | None,
         combine: tuple | None = None,
-        prestaged: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """All-reduce the attention partial and accumulate the residual.
 
@@ -1571,20 +1493,8 @@ class KimiLinearDecoderLayer(nn.Module):
         mlp-side AttnRes prefix combine also rides its epilogue and the mixed
         hidden comes back as the second return (else None -- block-write
         layers, large batches and the plain-reduce fallback).
-
-        With ``prestaged`` (fused o_proj + AR) the partial was already
-        multicast-stored into the mnnvl Lamport slot by the o_proj GEMV and
-        ``attn_partial`` is None; the forward gate mirrors this method's
-        fused-combine conditions exactly, so the combine path is guaranteed
-        and the AR kernel runs with ``input_prestaged=True``.
         """
-        if prestaged:
-            # The gate in forward() only prestages when these hold.
-            assert attn_partial is None and prefix_sum is not None
-            assert combine is not None and self._attn_ar_residual_fusion
-            num_tokens = prefix_sum.shape[0]
-        else:
-            num_tokens = attn_partial.shape[0]
+        num_tokens = attn_partial.shape[0]
         if (
             prefix_sum is not None
             and self._attn_ar_residual_fusion
@@ -1600,9 +1510,7 @@ class KimiLinearDecoderLayer(nn.Module):
 
                 scratch, res_w, rms_w, out_norm_w, eps = combine
                 h, residual_out = allreduce_residual_attnres_combine(
-                    # Prestaged: shape/dtype carrier only, never dereferenced
-                    # (the payload sits in the Lamport staging buffer).
-                    prefix_sum if prestaged else attn_partial,
+                    attn_partial,
                     prefix_sum,
                     res_w,
                     rms_w,
@@ -1613,7 +1521,6 @@ class KimiLinearDecoderLayer(nn.Module):
                     eps=eps,
                     max_token_num=global_server_args_dict["comm_fusion_max_num_tokens"],
                     launch_with_pdl=pdl_enabled(),
-                    input_prestaged=prestaged,
                 )
                 return residual_out, h
             _, residual_out, *_ = self._dummy_norm.forward_with_allreduce_fusion(
@@ -1727,33 +1634,15 @@ class KimiLinearDecoderLayer(nn.Module):
                         self.mlp_res_norm.variance_epsilon,
                         scratch,
                     )
-            # Fused o_proj + AR gate: must imply the fused-combine branch of
-            # _reduce_attn_accumulate (the staged payload has no other
-            # consumer), so it mirrors that branch's conditions at M == 1.
-            o_proj_prestage = (
-                self._resolve_gemm_ar_ws()
-                if (
-                    self._attn_gemm_ar_armed
-                    and prefix_sum is not None
-                    and ar_combine is not None
-                    and num_tokens == 1
-                    and global_server_args_dict["comm_fusion_max_num_tokens"] >= 1
-                )
-                else None
-            )
             attn_out = self.self_attn(
                 positions=positions,
                 hidden_states=h,
                 ctx=ctx,
                 out_cache_loc=out_cache_loc,
                 comm_manager=self.comm_manager,
-                o_proj_prestage=o_proj_prestage,
             )
             prefix_sum, h_fused = self._reduce_attn_accumulate(
-                attn_out,
-                prefix_sum,
-                combine=ar_combine,
-                prestaged=o_proj_prestage is not None,
+                attn_out, prefix_sum, combine=ar_combine
             )
         # --- mlp: AttnRes mixing -> norm -> FFN -> accumulate ---
         if h_fused is not None:
@@ -2076,19 +1965,6 @@ class KimiLinearForCausalLM(BaseCausalLM):
                 layer.mlp_res_norm.weight.float()
                 * layer.mlp_res_proj.weight.reshape(-1).float()
             ).to(torch.bfloat16)
-
-        # Fused o_proj + AR needs the loaded o_proj weight in the GEMV's
-        # envelope (contiguous bf16, hidden-sized output); disarm otherwise.
-        for layer in self.model.layers:
-            if not getattr(layer, "_attn_gemm_ar_armed", False):
-                continue
-            w = layer.self_attn.o_proj.weight
-            if (
-                w.dtype != torch.bfloat16
-                or w.stride(-1) != 1
-                or w.shape[0] != self.config.hidden_size
-            ):
-                layer._attn_gemm_ar_armed = False
 
 
 # ===----------------------------------------------------------------------=== #
