@@ -312,11 +312,20 @@ std::vector<std::int32_t> Scheduler::GetRequestPagedCachePageIds(const std::stri
 }
 
 std::int32_t Scheduler::GetRequestPagedCacheBaseLogicalPage(const std::string& request_id,
-                                                            const std::string& group_id) const {
+                                                             const std::string& group_id) const {
     if (!hybrid_prefix_cache_) {
         throw std::out_of_range("Scheduler::GetRequestPagedCacheBaseLogicalPage: group_id not configured");
     }
     return hybrid_prefix_cache_->GetRequestPagedCacheBaseLogicalPage(request_id, group_id);
+}
+
+bool Scheduler::FlatPdTransferPinned(const std::string& request_id) const {
+#if TOKENSPEED_FLAT_KVCACHE
+    return flat_pd_transfer_pins_.contains(request_id);
+#else
+    (void)request_id;
+    return false;
+#endif
 }
 
 std::int32_t Scheduler::GetRequestTokenSize(const std::string& id) const {

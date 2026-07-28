@@ -691,6 +691,12 @@ class OutputProcesser:
                         int(x)
                         for x in model_execution_results.next_input_ids[i].tolist()
                     ]
+                    if spec_candidate_ids and spec_candidate_ids[0] != bootstrap_token:
+                        raise RuntimeError(
+                            "Prefill bootstrap token mismatch: sampled token "
+                            f"{bootstrap_token} != speculative candidate "
+                            f"{spec_candidate_ids[0]} for request {rid}"
+                        )
 
                 on_first_token(
                     rid,
@@ -818,6 +824,32 @@ class OutputProcesser:
         state = self.rid_to_state[req_id]
         state.output_ids.append(bootstrap_token)
         state.check_finished()
+
+    def finish_remote_prefill_only_request(self, req_id: str) -> list:
+        """Finish after remote prefill when no decode step is needed.
+
+        FlatKV Prefill computes the first real output token.  A one-token
+        request is therefore already complete when Decode receives
+        ``RemotePrefillDoneEvent`` and must not be scheduled for an additional
+        decode forward. An aborted request follows the same transport fence
+        before its scheduler Abort is emitted.
+        """
+        state = self.rid_to_state.get(req_id)
+        if state is None or not state.finished:
+            return []
+
+        now = time.time()
+        state.stats.mark_prefill_done(now)
+        if not state.to_abort:
+            state.stats.mark_first_token(now)
+        self._log_request_stats(req_id, state, now)
+        if not state.to_abort or state.abort_notify_client:
+            self.stream_output([req_id], [state])
+        state.release_pending_multimodal_features()
+        self.rid_to_state.pop(req_id)
+        return [
+            make_abort_event(req_id) if state.to_abort else make_finish_event(req_id)
+        ]
 
     def finish_prefill_request(self, req_id: str) -> list:
         """Finish a prefill-instance request when KV transfer succeeds (SucceededEvent).

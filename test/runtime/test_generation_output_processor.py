@@ -565,3 +565,43 @@ def test_prefill_first_token_checks_spec_candidate_bootstrap():
             is_prefill_instance=True,
             on_first_token=lambda *args: None,
         )
+
+
+def test_flat_pd_one_token_request_finishes_at_remote_prefill_done():
+    sender = _Sender()
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
+    state = _state([1, 2, 3], computed_length=3)
+    state.sampling_params.max_new_tokens = 1
+    processor.rid_to_state["decode"] = state
+
+    processor.on_remote_prefill_done("decode", 101)
+    events = processor.finish_remote_prefill_only_request("decode")
+
+    assert state.output_ids == [101]
+    assert state.finished
+    assert "decode" not in processor.rid_to_state
+    assert [type(event).__name__ for event in events] == ["Finish"]
+    assert events[0].request_id == "decode"
+    assert len(sender.items) == 1
+    output = sender.items[0]
+    assert output.rids == ["decode"]
+    assert output.output_ids == [[101]]
+    assert output.completion_tokens == [1]
+    assert output.finished_reasons[0] == {"type": "length", "length": 1}
+
+
+def test_flat_pd_multi_token_request_continues_after_remote_prefill_done():
+    sender = _Sender()
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
+    state = _state([1, 2, 3], computed_length=3)
+    state.sampling_params.max_new_tokens = 2
+    processor.rid_to_state["decode"] = state
+
+    processor.on_remote_prefill_done("decode", 101)
+    events = processor.finish_remote_prefill_only_request("decode")
+
+    assert state.output_ids == [101]
+    assert not state.finished
+    assert processor.rid_to_state["decode"] is state
+    assert events == []
+    assert sender.items == []

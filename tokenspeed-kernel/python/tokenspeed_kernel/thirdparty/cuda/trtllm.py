@@ -117,6 +117,8 @@ class AllReduceFusionPattern:
     kARResidualRMSNormFP8BlockWiseQuant = 6
     kARResidualRMSNormPartialOutFP8BlockWiseQuant = 7
     kARResidualRMSNormPartialOut = 8
+    kARResidualAttnResCombine = 9
+    kAllReduceLatentNorm = 10
 
 
 class AllGatherFusionPattern:
@@ -326,6 +328,12 @@ def trtllm_allreduce_fusion(
     metadata: Optional[dict] = None,
     residual_reduce_scattered: bool = False,
     max_sm_to_use: Optional[int] = None,
+    attnres_m: Optional[torch.Tensor] = None,
+    attnres_s: Optional[torch.Tensor] = None,
+    attnres_acc: Optional[torch.Tensor] = None,
+    attnres_res_w: Optional[torch.Tensor] = None,
+    attnres_out_norm_w: Optional[torch.Tensor] = None,
+    latent_width: Optional[int] = None,
 ) -> None:
     if use_oneshot is None:
         use_oneshot = _ar_should_use_oneshot(
@@ -380,6 +388,12 @@ def trtllm_allreduce_fusion(
         scale_factor,
         layout_code,
         max_sm_to_use,
+        attnres_m,
+        attnres_s,
+        attnres_acc,
+        attnres_res_w,
+        attnres_out_norm_w,
+        latent_width,
     )
 
 

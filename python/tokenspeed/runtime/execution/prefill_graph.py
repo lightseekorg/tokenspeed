@@ -243,6 +243,12 @@ class PrefillGraph:
             or self._embed_tokens is None
             or model_runner is None
             or not model_runner.is_generation
+            # The FlatKV decode graph is wired, but its breakable prefill graph
+            # is not: the dummy batch carries no operation-bound
+            # FlatCacheBatchMetadata, so a contract-bound MLA/KDA backend would
+            # refuse capture. Use eager prefill until that metadata can be
+            # represented during capture. TODO(flatkv-prefill-graph).
+            or getattr(token_to_kv_pool, "runtime_contract", None) is not None
             # DP replay decisions must come from replicated state, and a
             # forward's multimodal-ness is rank-local: one rank running its mm
             # prefill eager while text-only peers replay desyncs the EP

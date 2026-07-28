@@ -23,9 +23,11 @@ from __future__ import annotations
 import logging
 import math
 import os
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.lcm_layouts import (
     inkling_lcm_fields,
@@ -230,7 +232,16 @@ _HYBRID_GDN_ARCHITECTURES = {
 }
 _LCM_MAX_PADDING_FRACTION = 1.0
 
-# Inkling uses the MHA backend plus its thin sconv wrapper; it is not hybrid-GDN.
+# Hybrid linear-attention models whose full-attention layers are MLA (not MHA)
+# and whose linear layers are KDA (per-channel gated delta rule), not GDN.
+# They share the same HybridLinearAttnBackend wrapper + SimpleMambaPool; the
+# base sub-backend auto-resolves to MLA from the arch, and the linear
+# sub-backend runs the KDA kernels (MambaAttnBackend.is_kda branch).
+_HYBRID_MLA_KDA_ARCHITECTURES = {
+    "KimiK3ForConditionalGeneration",
+}
+
+# Inkling stays on the MHA path plus its thin sconv wrapper; it is not hybrid-GDN.
 _INKLING_ARCHITECTURES = {
     "InklingForConditionalGeneration",
     "InklingForConditionalGenerationNextN",
@@ -330,6 +341,139 @@ def _create_attn_pool(
     )
 
 
+# Kimi-K3's effective FlatKV block size must be a multiple of every kernel page
+# constraint. An alignment of 128 covers the CuteDSL MLA page sizes (32/64).
+_KIMI_K3_FLAT_KERNEL_ALIGNMENT = 128
+
+
+def _create_kimi_k3_flat_plan(
+    server_args: ServerArgs,
+    model_config: ModelConfig,
+    config: BaseAttnConfig,
+    gpu_id: int,
+    gpu_memory: int,
+    *,
+    max_total_tokens_cap: int | None,
+    max_live_requests: int,
+    max_scheduled_tokens: int,
+    decode_input_tokens: int,
+    overlap_schedule_depth: int,
+):
+    """Plan the Kimi-K3 FlatKV cache from the profiled free-memory budget.
+
+    The byte budget is derived exactly like the other flat sizing paths
+    (``profile_available_cache_memory_bytes`` over
+    ``--gpu-memory-utilization``); the planner turns it into whole page sets
+    (24 aliased physical slabs per page). A user token cap
+    (``--max-total-tokens`` / CI small-KV override) re-plans with the byte
+    budget of the requested page count so the plan remains the single
+    geometry authority; a cap below the planner's minimum admission
+    requirement fails loudly.
+
+    Args:
+        server_args: Serving arguments (block size, memory fraction, mapping).
+        model_config: Target model config; its text config feeds the adapter.
+        config: The MLA attention config (dtype/quant/TP geometry source).
+        gpu_id: Profiling device ordinal.
+        gpu_memory: Total GPU memory bytes for the profile.
+        max_total_tokens_cap: Optional token-capacity cap.
+
+    Returns:
+        The validated ``FlatHybridCachePlan``.
+    """
+    from tokenspeed.runtime.configs.hybrid_cache_plan import (
+        format_flat_hybrid_cache_plan,
+    )
+    from tokenspeed.runtime.configs.kimi_k3_cache_spec import (
+        kimi_k3_shared_pool_pages,
+        kimi_k3_token_capacity_for_shared_pool,
+        plan_kimi_k3_flat_cache,
+    )
+
+    hf_config = model_config.hf_config
+    text_config = getattr(hf_config, "text_config", hf_config)
+    cache_memory = profile_available_cache_memory_bytes(
+        attn_config=config,
+        gpu_id=gpu_id,
+        tp_size=server_args.mapping.world_size,
+        gpu_memory_utilization=server_args.gpu_memory_utilization,
+        total_gpu_memory=gpu_memory,
+        world_group=server_args.mapping.world_group,
+    )
+    plan_kwargs = dict(
+        flat_kvcache_enabled=scheduler_ext_flat_kvcache(),
+        tp_size=config.attn_tp_size,
+        mla_cache_dtype=config.kv_cache_dtype,
+        mla_quant_method=config.kv_cache_quant_method or None,
+        preferred_block_size=server_args.block_size,
+        kernel_alignment=_KIMI_K3_FLAT_KERNEL_ALIGNMENT,
+    )
+    plan = plan_kimi_k3_flat_cache(
+        text_config, cache_budget_bytes=cache_memory, **plan_kwargs
+    )
+    sizing_kwargs = dict(
+        max_scheduled_tokens=max_scheduled_tokens,
+        max_live_requests=max_live_requests,
+        decode_input_tokens=decode_input_tokens,
+        overlap_schedule_depth=overlap_schedule_depth,
+    )
+    if max_total_tokens_cap is not None:
+        requested_token_pages = max_total_tokens_cap // plan.block_size
+        if requested_token_pages < 1:
+            raise ValueError(
+                f"max_total_tokens={max_total_tokens_cap} must contain at "
+                f"least one full flat page (block_size={plan.block_size})"
+            )
+        required_pages = kimi_k3_shared_pool_pages(
+            plan, token_capacity=max_total_tokens_cap, **sizing_kwargs
+        )
+        if required_pages < plan.usable_pages:
+            plan = plan_kimi_k3_flat_cache(
+                text_config,
+                cache_budget_bytes=(required_pages + 1)
+                * plan.diagnostics.bytes_per_page_set,
+                **plan_kwargs,
+            )
+        if required_pages <= plan.usable_pages:
+            token_capacity = max_total_tokens_cap
+        else:
+            token_capacity = kimi_k3_token_capacity_for_shared_pool(
+                plan,
+                usable_pages=plan.usable_pages,
+                upper_bound_tokens=max_total_tokens_cap,
+                **sizing_kwargs,
+            )
+            logger.warning(
+                "Kimi-K3 FlatKV max_total_tokens=%d requires %d shared pages, "
+                "but only %d were profiled; clamping token capacity to %d",
+                max_total_tokens_cap,
+                required_pages,
+                plan.usable_pages,
+                token_capacity,
+            )
+    else:
+        token_capacity = kimi_k3_token_capacity_for_shared_pool(
+            plan,
+            usable_pages=plan.usable_pages,
+            **sizing_kwargs,
+        )
+    plan = replace(plan, token_capacity=token_capacity)
+    logger.info(
+        "Kimi-K3 FlatKV plan: block_size=%d physical_page_bytes=%d "
+        "usable_pages=%d token_capacity=%d total_allocated_bytes=%d "
+        "(profiled budget %d bytes, cap %s)",
+        plan.block_size,
+        plan.physical_page_bytes,
+        plan.usable_pages,
+        plan.token_capacity,
+        plan.diagnostics.total_allocated_bytes,
+        cache_memory,
+        max_total_tokens_cap,
+    )
+    logger.debug("%s", format_flat_hybrid_cache_plan(plan))
+    return plan
+
+
 def _attention_use_fp4_indexer_cache(server_args: "ServerArgs", hf_config) -> bool:
     if getattr(server_args, "attention_use_fp4_indexer_cache", None) is not None:
         return bool(server_args.attention_use_fp4_indexer_cache)
@@ -337,6 +481,42 @@ def _attention_use_fp4_indexer_cache(server_args: "ServerArgs", hf_config) -> bo
     if isinstance(attention_config, dict):
         return bool(attention_config.get("use_fp4_indexer_cache", False))
     return bool(getattr(attention_config, "use_fp4_indexer_cache", False))
+
+
+def _resolve_kda_backend(kda_backend: str) -> str:
+    """Resolve the KDA prefill backend policy to a concrete choice.
+
+    ``auto`` picks the fastest available kernel — ``cutedsl_kda`` (the tokenspeed-cutedsl-kda AOT build
+    matching this device), then ``flashkda`` (optional source-built package),
+    falling back to the portable FLA scan. ``fla`` forces the portable scan.
+    Explicit choices are validated against availability and fail fast with an
+    install hint instead of silently mis-routing. Decode is unaffected either
+    way.
+    """
+    from tokenspeed_kernel.ops.attention.cutedsl_kda import is_cutedsl_kda_installed
+    from tokenspeed_kernel.ops.attention.flash_kda import is_flash_kda_installed
+
+    if kda_backend == "auto":
+        if is_cutedsl_kda_installed():
+            resolved = "cutedsl_kda"
+        elif is_flash_kda_installed():
+            resolved = "flashkda"
+        else:
+            resolved = "fla"
+        logger.info("KDA prefill backend auto-resolved to %s", resolved)
+        return resolved
+    if kda_backend == "flashkda" and not is_flash_kda_installed():
+        raise ValueError(
+            "--kda-backend flashkda requires the tokenspeed-flashkda "
+            "package (SM90+, CUDA 12.9+): pip install tokenspeed-flashkda"
+        )
+    if kda_backend == "cutedsl_kda" and not is_cutedsl_kda_installed():
+        raise ValueError(
+            "--kda-backend cutedsl_kda requires the tokenspeed-cutedsl-kda package with a "
+            "build matching this device (sm_100a / sm_103a) and the public "
+            "nvidia-cutlass-dsl, apache-tvm-ffi, cuda-python wheels"
+        )
+    return kda_backend
 
 
 def _create_hybrid_linear_attn(
@@ -349,8 +529,21 @@ def _create_hybrid_linear_attn(
     enable_memory_saver: bool = False,
     full_attn_backend_name: str = None,
     mamba_pool_total_chunks: int = 0,
+    is_kda: bool = False,
+    flat_contract_plan: object | None = None,
 ) -> tuple[AttentionBackend, BaseTokenToKVPool, object]:
-    """Create a hybrid backend + pool for GDN hybrid models (Qwen3.5, Qwen3Next)."""
+    """Create a hybrid backend + pool for a linear-attention model.
+
+    GDN (Qwen3.5, MHA base) or, when ``is_kda`` is set, KDA (Kimi-K3, MLA base):
+    the ``MambaAttnBackend`` + ``SimpleMambaPool`` run the KDA per-channel kernels
+    instead of GDN. The base full-attention backend is arch-driven (MHA vs MLA).
+
+    ``flat_contract_plan`` (Kimi-K3 FlatKV only) selects the contract path:
+    a single ``FlatHybridCachePool`` built from the plan replaces both the
+    per-layer KV pool and the ``SimpleMambaPool`` — the recurrent state lives
+    in the plan's aliased state slabs, addressed by the flat group tables.
+    Missing FlatKV pieces on that path are errors, never fallback signals.
+    """
     from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
         HybridLinearAttnBackend,
         LayerMappedKVPool,
@@ -362,6 +555,17 @@ def _create_hybrid_linear_attn(
     text_config = getattr(hf_config, "text_config", hf_config)
     full_attn_layers = text_config.full_attention_layer_ids
 
+    if (
+        flat_contract_plan is not None
+        and full_attn_backend_name is None
+        and not current_platform().is_amd
+    ):
+        # NVIDIA defaults to its CuteDSL FlatKV history consumer. AMD keeps the
+        # default ``mla`` backend, whose Gluon path consumes the same FlatKV
+        # history contract without changing compute kernels. Explicit choices
+        # remain authoritative and are checked by the family guard.
+        full_attn_backend_name = "tokenspeed_mla"
+
     # Create the full attention backend for standard MHA layers.
     # Use user's original choice if provided, otherwise auto-select.
     full_attn_backend = _create_attn_backend_with_name(
@@ -369,6 +573,12 @@ def _create_hybrid_linear_attn(
         arch,
         config,
     )
+
+    if flat_contract_plan is not None:
+        # FlatKV contract: see CuteDSLMLABackend.mark_flat_contract.
+        mark_flat_contract = getattr(full_attn_backend, "mark_flat_contract", None)
+        if mark_flat_contract is not None:
+            mark_flat_contract()
 
     # Create mamba/linear attention backend. Only propagate the configured
     # verify width when spec-dec is actually enabled — matches MLAConfig /
@@ -379,7 +589,31 @@ def _create_hybrid_linear_attn(
         config.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
 
     flat_kvcache = scheduler_ext_flat_kvcache()
-    if flat_kvcache:
+    if flat_contract_plan is not None:
+        # One Kimi-K3 FlatHybridCachePool
+        # owns the four groups' aliased raw slabs and publishes the runtime
+        # contract every downstream consumer keys off (scheduler geometry,
+        # per-step FlatCacheBatchMetadata, MLA/KDA component views). The
+        # plan binds GLOBAL layer ids, so no LayerMappedKVPool wrapper; the
+        # MLA latent split geometry enables the pool's MLA read adapters.
+        from tokenspeed.runtime.layers.attention.kv_cache.flat_hybrid import (
+            FlatHybridCachePool,
+        )
+
+        if not flat_kvcache:
+            raise RuntimeError(
+                "Kimi-K3 FlatKV contract pool requires a flat-built "
+                "tokenspeed_scheduler extension; legacy and radix fallbacks "
+                "are forbidden"
+            )
+        pool = FlatHybridCachePool(
+            plan=flat_contract_plan,
+            device=config.device,
+            enable_memory_saver=enable_memory_saver,
+            mla_kv_lora_rank=config.kv_lora_rank,
+            mla_qk_rope_head_dim=config.qk_rope_head_dim,
+        )
+    elif flat_kvcache:
         # Flat path: the pool covers ALL layers, so pool indices == global
         # layer ids, its layer_types line up with the planned state fields, and the
         # group specs publish both the "full_attention" and
@@ -425,7 +659,12 @@ def _create_hybrid_linear_attn(
         )
         return full_attn_backend, pool, None
 
-    linear_attn_backend = MambaAttnBackend(config)
+    kda_backend = (getattr(server_args, "kda_backend", None) or "auto").strip().lower()
+    if is_kda:
+        kda_backend = _resolve_kda_backend(kda_backend)
+    linear_attn_backend = MambaAttnBackend(
+        config, is_kda=is_kda, kda_backend=kda_backend
+    )
 
     if flat_kvcache:
         # Flat mode never touches a SimpleMambaPool: the recurrent state
@@ -466,6 +705,7 @@ def _create_hybrid_linear_attn(
             # padding sentinel.
             max_req_pool_size=req_pool_padding_index,
         )
+        mamba_pool.is_kda_cache = is_kda
         linear_attn_backend.set_pool(mamba_pool)
     # Flat state paging (dual-index) keys off the KV pool's state field views +
     # published "linear_attention" group; no-op on the radix path.
@@ -820,6 +1060,10 @@ def create_attn_components(
     architectures = getattr(model_config.hf_config, "architectures", None) or []
     is_hybrid_gdn = any(a in _HYBRID_GDN_ARCHITECTURES for a in architectures)
     is_inkling = any(a in _INKLING_ARCHITECTURES for a in architectures)
+    is_hybrid_mla_kda = any(a in _HYBRID_MLA_KDA_ARCHITECTURES for a in architectures)
+    # Both take the hybrid-linear path; they differ only in the linear kernel
+    # (GDN scalar decay vs KDA per-channel) and the base attn arch (MHA vs MLA).
+    is_hybrid_linear = is_hybrid_gdn or is_hybrid_mla_kda
     is_deepseek_v4_model = is_deepseek_v4(model_config.hf_config)
     is_deepseek_v4_draft_model = draft_model_config is not None and is_deepseek_v4(
         draft_model_config.hf_config
@@ -829,9 +1073,10 @@ def create_attn_components(
         server_args.attention_backend = "deepseek_v4"
     if is_deepseek_v4_draft_model:
         server_args.drafter_attention_backend = "deepseek_v4"
-    if is_hybrid_gdn:
-        # Qwen3.5 GDN hybrid models always need hybrid_linear_attn.
-        # Save the user's original choice for the full-attention sub-backend.
+    if is_hybrid_linear:
+        # GDN (Qwen3.5) / KDA (Kimi-K3) hybrid models always need
+        # hybrid_linear_attn. Save the user's original choice for the
+        # full-attention sub-backend (MHA for GDN, MLA for KDA).
         server_args.attention_backend = "hybrid_linear_attn"
     elif server_args.attention_backend == "hybrid_linear_attn":
         logger.warning(
@@ -987,6 +1232,8 @@ def create_attn_components(
     mamba_pool_total_chunks = 0
     mamba_pool = None
     draft_max_num_tokens = None
+    # Kimi-K3 FlatKV contract plan; None on every other model's path.
+    kimi_flat_plan = None
 
     _profile_kwargs = dict(
         attn_config=config,
@@ -1044,6 +1291,60 @@ def create_attn_components(
             server_args.block_size,
             server_args.max_total_tokens,
         )
+    elif is_hybrid_mla_kda:
+        # The Kimi-K3 FlatKV plan is the single cache-geometry authority; the
+        # SimpleMambaPool / radix mamba
+        # sizing arms below are structurally unreachable for this
+        # architecture. Excluded features fail loudly here instead of dying
+        # deep inside capture or the C++ scheduler.
+        token_caps = [
+            cap
+            for cap in (
+                server_args.max_total_tokens,
+                (
+                    int(_CI_SMALL_KV_SIZE)
+                    if _CI_SMALL_KV_SIZE is not None and int(_CI_SMALL_KV_SIZE) > 0
+                    else None
+                ),
+            )
+            if cap is not None
+        ]
+        kimi_flat_plan = _create_kimi_k3_flat_plan(
+            server_args,
+            model_config,
+            config,
+            gpu_id,
+            gpu_memory,
+            max_total_tokens_cap=min(token_caps) if token_caps else None,
+            max_live_requests=config.max_bs,
+            max_scheduled_tokens=server_args.chunked_prefill_size,
+            decode_input_tokens=decode_input_tokens,
+            overlap_schedule_depth=overlap_schedule_depth,
+        )
+        max_num_tokens = kimi_flat_plan.token_capacity
+        if draft_model_config is not None:
+            # The MTP draft is a single MLA layer on a classic paged pool
+            # sharing the target's token-id space; the flat plan consumed the
+            # whole profiled budget, so re-plan with the draft's per-token
+            # bytes carved out (mirrors the flat-GDN draft_row_bytes charge).
+            draft_cell = _resolve_draft_cache_cell_size_for_profile(
+                draft_attn_config, draft_model_config, draft_profile_cache_cell_size
+            )
+            draft_bytes = draft_cell * max_num_tokens
+            token_caps.append(max_num_tokens)
+            kimi_flat_plan = _create_kimi_k3_flat_plan(
+                server_args,
+                model_config,
+                config,
+                gpu_id,
+                gpu_memory - draft_bytes,
+                max_total_tokens_cap=min(token_caps),
+                max_live_requests=config.max_bs,
+                max_scheduled_tokens=server_args.chunked_prefill_size,
+                decode_input_tokens=decode_input_tokens,
+                overlap_schedule_depth=overlap_schedule_depth,
+            )
+            max_num_tokens = kimi_flat_plan.token_capacity
     elif use_lcm_gdn or use_lcm_inkling:
         cache_memory = profile_available_cache_memory_bytes(
             attn_config=config,
@@ -1226,9 +1527,12 @@ def create_attn_components(
 
     if (
         config.lcm_memory_plan is None
+        and kimi_flat_plan is None
         and _CI_SMALL_KV_SIZE is not None
         and int(_CI_SMALL_KV_SIZE) > 0
     ):
+        # Flat plans already folded the CI cap into their physical geometry;
+        # clobbering here would desynchronize tokens from that plan.
         max_num_tokens = int(_CI_SMALL_KV_SIZE)
     if draft_max_num_tokens is None:
         draft_max_num_tokens = max_num_tokens
@@ -1259,7 +1563,7 @@ def create_attn_components(
             decode_input_tokens=decode_input_tokens,
             overlap_schedule_depth=overlap_schedule_depth,
         )
-    elif is_hybrid_gdn:
+    elif is_hybrid_linear:
         resolved_original_backend = _BACKEND_ALIASES.get(
             original_attn_backend, original_attn_backend
         )
@@ -1277,6 +1581,8 @@ def create_attn_components(
                 else None
             ),
             mamba_pool_total_chunks=mamba_pool_total_chunks,
+            is_kda=is_hybrid_mla_kda,
+            flat_contract_plan=kimi_flat_plan,
         )
     else:
         # Hetero KV + paged sconv are unconditional for Inkling (the

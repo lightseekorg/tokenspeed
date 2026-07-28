@@ -112,6 +112,9 @@ struct SchedulerConfig {
 
     std::int32_t num_pages_reserved_for_retracted_or_running{};
     Role role{Role::kFused};
+    // Explicit opt-in for the Flat KV Prefill/Decode lifecycle. This keeps
+    // legacy non-flat PD and Flat standalone scheduling unchanged.
+    bool enable_flatkv_pd{false};
 
     bool disable_prefix_cache{false};
     bool enable_mamba{false};

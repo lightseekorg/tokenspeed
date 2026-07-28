@@ -25,6 +25,10 @@ from tokenspeed_scheduler import PD, Forward
 
 from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo
 from tokenspeed.runtime.pd.base.status import TransferPoll
+from tokenspeed.runtime.pd.flatkv import (
+    build_flatkv_page_manifest,
+    flatkv_manifest_page_ids,
+)
 from tokenspeed.runtime.pd.mooncake.decode import MooncakeKVManagerDecode
 from tokenspeed.runtime.pd.mooncake.receiver import MooncakeKVReceiver
 from tokenspeed.runtime.pd.utils import (
@@ -49,7 +53,9 @@ class DisaggDecodeExecutor:
                 (Forward.FlatForwardOp, self._prefill),
             ]
         )
-        self.receivers: dict[int, MooncakeKVReceiver] = {}
+        self.is_flatkv = kv_args.flat_layout is not None
+        self.flat_layout = kv_args.flat_layout
+        self.receivers: dict[str, MooncakeKVReceiver] = {}
         self.kv_manager = MooncakeKVManagerDecode(args, kv_args)
         self.gloo_group = gloo_group
         self._local_states = {}
@@ -99,7 +105,61 @@ class DisaggDecodeExecutor:
                 slots.append(slot)
         return np.array(slots, dtype=np.int64)
 
+    def _flat_prefill(self, op) -> None:
+        pending = []
+        num_extends = op.num_extends()
+        if num_extends != len(op.request_ids):
+            raise RuntimeError(
+                "FlatKV decode destination admission does not support mixed batches"
+            )
+        for index, request_id in enumerate(op.request_ids):
+            receiver = self.receivers.get(request_id)
+            if receiver is None:
+                continue
+            prefix_len = int(op.extend_prefix_lens[index])
+            manifest = build_flatkv_page_manifest(
+                op,
+                layout=self.flat_layout,
+                request_row=index,
+                prefix_len=prefix_len,
+                prompt_len=int(op.prefill_lengths[index]),
+            )
+            page_ids = np.asarray(
+                flatkv_manifest_page_ids(
+                    manifest,
+                    layout=self.flat_layout,
+                    peer="destination",
+                ),
+                dtype=np.int64,
+            )
+            pending.append(
+                (
+                    request_id,
+                    receiver,
+                    op.request_pool_indices[index],
+                    prefix_len,
+                    manifest,
+                    page_ids,
+                )
+            )
+
+        # Validate every row before publishing any destination vector. A later
+        # invalid row must not leave an earlier Prefill sender waiting forever.
+        for request_id, receiver, aux_index, prefix_len, manifest, page_ids in pending:
+            self._request_pool_indices[request_id] = aux_index
+            receiver.prefill(
+                page_ids,
+                aux_index,
+                prefix_len,
+                None,
+                None,
+                flat_manifest=manifest,
+            )
+
     def _prefill(self, op):
+        if self.is_flatkv:
+            self._flat_prefill(op)
+            return
         logger.debug(
             "[decode][_prefill] op: request_ids=%s occupied_pages=%s "
             "begins=%s sizes=%s request_pool_indices=%s extend_prefix_lens=%s",
@@ -139,7 +199,11 @@ class DisaggDecodeExecutor:
                 mamba_indices,
             )
 
-    def register(self, request_id: str, bootstrap_info: BootstrapInfo):
+    def register(
+        self,
+        request_id: str,
+        bootstrap_info: BootstrapInfo,
+    ):
         self._local_states[request_id] = TransferPoll.Bootstrapping
         self._bootstrap(request_id, bootstrap_info)
 
@@ -241,6 +305,15 @@ class DisaggDecodeExecutor:
         self, forward_op, runtime_states, execution_stream, device
     ):
         num_extends = forward_op.num_extends()
+        if num_extends <= 0:
+            return
+
+        # A decode destination never executes the prompt locally, so the
+        # model executor cannot infer this state from a forward pass.  Seed
+        # the runtime row with the complete remotely-computed prompt length
+        # before the first local decode.  This is required for both cache
+        # layouts: FlatKV additionally uses the resulting sequence length to
+        # select the transferred recurrent-state snapshot page.
         extend_request_pool_indices = torch.tensor(
             forward_op.request_pool_indices[:num_extends],
             dtype=torch.int64,

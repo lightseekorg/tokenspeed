@@ -85,6 +85,7 @@ public:
                                                           const std::string& group_id) const;
     // Compact-view base logical-page offset; 0 for full-history / unseen.
     std::int32_t GetRequestPagedCacheBaseLogicalPage(const std::string& request_id, const std::string& group_id) const;
+    bool FlatPdTransferPinned(const std::string& request_id) const;
 #if TOKENSPEED_FLAT_KVCACHE
     // Empty or fully evictable LCM parents; capacity metrics remain approximate for K_g > 1.
     std::int32_t FlatPoolFreeBlocks() const { return coordinator_.NumAvailableLcmBlocks(); }
@@ -213,6 +214,8 @@ private:
     // ExtendResults the executor still owes per request (erased on Finish/Abort/PD-success); non-empty means
     // an in-flight forward can still free pool pages, which flatPoolWedged keys off.
     std::unordered_map<std::string, std::int32_t> pending_forward_results_;
+    // Requests with an active P->D transfer must retain their cache blocks.
+    std::unordered_set<std::string> flat_pd_transfer_pins_;
     // Set only when exact LCM placement rejects an otherwise schedulable request
     // in the current round. Starvation recovery must not react to unrelated gates.
     bool flat_no_lcm_placement_{false};

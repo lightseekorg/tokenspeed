@@ -136,6 +136,15 @@ class InputProcessor:
             isinstance(obj, GenerateReqInput)
             and obj.precomputed_multimodal_inputs is not None
         )
+        if (
+            precomputed_mm
+            and self.engine.server_args.disaggregation_mode == "decode"
+            and self.engine.server_args.language_model_only
+            and self.engine.model_config.is_multimodal
+        ):
+            # Decode only needs the expanded prompt length to size its remote-KV
+            # destination; it never executes the multimodal prefill.
+            precomputed_mm = False
         if precomputed_mm:
             # Gateway-side preprocess path (e.g. SMG): mm tensors are already
             # built by an upstream preprocessor and the input_ids carry the

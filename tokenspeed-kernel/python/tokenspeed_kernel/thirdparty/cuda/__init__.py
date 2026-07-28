@@ -25,7 +25,6 @@ from tokenspeed_kernel.thirdparty.cuda.activation import (
     silu_and_mul_fuse_nvfp4_quant,
 )
 from tokenspeed_kernel.thirdparty.cuda.dsv3_gemm import dsv3_router_gemm
-from tokenspeed_kernel.thirdparty.cuda.fp32_router_gemm import fp32_router_gemm
 from tokenspeed_kernel.thirdparty.cuda.fused_topk_topp import (
     fused_topk_topp_renorm,
     fused_topk_topp_workspace_size,
@@ -51,7 +50,6 @@ __all__ = [
     "apply_rope_with_cos_sin_cache_inplace",
     "chain_speculative_sampling_target_only",
     "dsv3_router_gemm",
-    "fp32_router_gemm",
     "fused_topk_topp_prepare",
     "fused_topk_topp_renorm",
     "fused_topk_topp_workspace_size",

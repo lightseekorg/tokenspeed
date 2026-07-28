@@ -56,6 +56,14 @@ pip_install_with_retry() {
     done
 }
 
+run_as_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
 ensure_flashinfer_jit_cache_for_gb200() {
     if [[ "${CI_RUNNER_LABEL:-}" != gb200* ]]; then
         return 0
@@ -82,12 +90,21 @@ echo "=========================================="
 # Step 1: Determine CUDA index and FlashInfer architecture
 # ============================================================
 echo "=== Step 1: Determine CUDA index and architecture ==="
-case "${CUDA_VERSION}" in
-    12.9.1) CUINDEX=129 ;;
-    13.0.1) CUINDEX=130 ;;
-    *)      CUINDEX=130 ;;
+TORCH_CUDA_VERSION="$(python3 -c \
+    'import torch; print(torch.version.cuda or "")' 2>/dev/null || true)"
+case "${TORCH_CUDA_VERSION}" in
+    12.9*) CUINDEX=129 ;;
+    13.0*) CUINDEX=130 ;;
+    *)
+        case "${CUDA_VERSION}" in
+            12.9*) CUINDEX=129 ;;
+            13.0*) CUINDEX=130 ;;
+            *)     CUINDEX=130 ;;
+        esac
+        ;;
 esac
-echo "PyTorch CUDA index: cu${CUINDEX}"
+echo "PyTorch CUDA version: ${TORCH_CUDA_VERSION:-unknown}"
+echo "PyTorch wheel index: cu${CUINDEX}"
 
 case "${SM}" in
     sm103) FI_ARCH="10.3a" ;;
@@ -100,9 +117,16 @@ echo "FlashInfer architecture: ${FI_ARCH}"
 # ============================================================
 # Step 2: Upgrade base tools
 # ============================================================
-sudo apt install -y openmpi-bin libopenmpi-dev libssl-dev pkg-config -y
+if ! dpkg -s openmpi-bin libopenmpi-dev libssl-dev pkg-config > /dev/null 2>&1; then
+    run_as_root apt-get -o DPkg::Lock::Timeout=600 update
+    run_as_root apt-get -o DPkg::Lock::Timeout=600 install -y \
+        openmpi-bin libopenmpi-dev libssl-dev pkg-config
+else
+    echo "apt packages already installed, skipping apt"
+fi
 echo "=== Step 2: Upgrade pip/setuptools/wheel ==="
-python3 -m pip install --upgrade pip setuptools wheel
+python3 -m pip install --upgrade --ignore-installed --break-system-packages \
+    pip setuptools wheel
 
 # ============================================================
 # Step 3: Sync FlashInfer JIT cache on GB200
@@ -211,8 +235,8 @@ echo "=== Step 9: Fix Triton ptxas ==="
 if [ "${CUDA_VERSION%%.*}" = "13" ]; then
     TRITON_BIN="/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin"
     if [ -d "${TRITON_BIN}" ]; then
-        rm -f "${TRITON_BIN}/ptxas" 2>/dev/null || sudo rm -f "${TRITON_BIN}/ptxas" 2>/dev/null || true
-        ln -sf /usr/local/cuda/bin/ptxas "${TRITON_BIN}/ptxas" 2>/dev/null || sudo ln -sf /usr/local/cuda/bin/ptxas "${TRITON_BIN}/ptxas" 2>/dev/null || true
+        rm -f "${TRITON_BIN}/ptxas" 2>/dev/null || run_as_root rm -f "${TRITON_BIN}/ptxas" 2>/dev/null || true
+        ln -sf /usr/local/cuda/bin/ptxas "${TRITON_BIN}/ptxas" 2>/dev/null || run_as_root ln -sf /usr/local/cuda/bin/ptxas "${TRITON_BIN}/ptxas" 2>/dev/null || true
     fi
 fi
 

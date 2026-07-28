@@ -72,6 +72,7 @@ class IndexDecodeScoreKernel:
         scale: float,
         init_blocks: int,
         local_blocks: int,
+        enable_pdl: bool = False,
     ):
         self.dtype = dtype
         self.num_heads = num_heads
@@ -81,6 +82,7 @@ class IndexDecodeScoreKernel:
         self.scale = scale
         self.init_blocks = init_blocks
         self.local_blocks = local_blocks
+        self.enable_pdl = enable_pdl
 
     @cute.jit
     def __call__(
@@ -140,7 +142,7 @@ class IndexDecodeScoreKernel:
             score,
             seq_lens,
             decode_query_len,
-        ).launch(grid=grid, block=block, stream=stream, use_pdl=True)
+        ).launch(grid=grid, block=block, stream=stream, use_pdl=self.enable_pdl)
 
     @cute.kernel
     def kernel(
@@ -437,6 +439,7 @@ class IndexDecodeScoreKernel:
         scale: float,
         init_blocks: int,
         local_blocks: int,
+        enable_pdl: bool = False,
     ):
         bs = cute.sym_int()
         total_tokens = cute.sym_int()
@@ -462,6 +465,7 @@ class IndexDecodeScoreKernel:
             scale,
             init_blocks,
             local_blocks,
+            enable_pdl,
         )
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         return cute.compile(
@@ -487,6 +491,7 @@ def minimax_index_decode_score(
     init_blocks: int,
     local_blocks: int,
     decode_query_len: int,
+    enable_pdl: bool = False,
 ) -> None:
     """Score visible 128-token blocks for decode via the CuteDSL kernel.
 
@@ -504,6 +509,9 @@ def minimax_index_decode_score(
         init_blocks: Leading blocks forced into the selection.
         local_blocks: Most-recent blocks forced into the selection.
         decode_query_len: Uniform queries per request.
+        enable_pdl: Request Programmatic Dependent Launch (SM90+) for the score
+            kernel; when False it launches without the stream-serialization
+            attribute (the in-kernel grid-dependency waits become no-ops).
 
     Returns:
         None; ``scores`` is written in place.
@@ -518,6 +526,7 @@ def minimax_index_decode_score(
         float(scale),
         int(init_blocks),
         int(local_blocks),
+        bool(enable_pdl),
     )
     kernel(
         index_q,

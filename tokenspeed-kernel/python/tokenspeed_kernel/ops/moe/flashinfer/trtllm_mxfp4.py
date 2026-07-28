@@ -20,6 +20,10 @@
 
 from __future__ import annotations
 
+import inspect
+import logging
+import math
+
 import torch
 from tokenspeed_kernel.ops.tuning import autotune_frozen
 from tokenspeed_kernel.platform import (
@@ -29,6 +33,8 @@ from tokenspeed_kernel.platform import (
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
+
+logger = logging.getLogger(__name__)
 
 platform = current_platform()
 next_power_of_2 = lambda value: 1 if value <= 1 else 1 << (value - 1).bit_length()
@@ -93,6 +99,16 @@ if platform.is_nvidia:
     from flashinfer.fused_moe.core import (
         get_w2_permute_indices_with_cache,
     )
+
+    try:
+        from tokenspeed_situ import (
+            mxfp4_situ_routed_moe as _sidecar_mxfp4_situ_routed_moe,
+        )
+
+        _sidecar_import_error: ImportError | None = None
+    except ImportError as exc:
+        _sidecar_mxfp4_situ_routed_moe = None
+        _sidecar_import_error = exc
 
     def _get_device_permute_indices(
         x: torch.Tensor,
@@ -163,14 +179,90 @@ if platform.is_nvidia:
             else getattr(w, name, default)
         )
 
-    def flashinfer_trtllm_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
+    def _validate_private_situ_runtime() -> None:
+        if _sidecar_mxfp4_situ_routed_moe is None:
+            raise RuntimeError(
+                "Kimi-K3 SiTU requires tokenspeed-situ>=0.1.0.post20260726; "
+                f"the optional sidecar could not be imported: {_sidecar_import_error}"
+            )
+        try:
+            parameters = inspect.signature(_sidecar_mxfp4_situ_routed_moe).parameters
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("cannot inspect the K3 SiTU sidecar API") from exc
+        missing = {
+            "num_experts",
+            "top_k",
+            "intermediate_size",
+            "local_expert_offset",
+            "local_num_experts",
+            "tactic",
+        }.difference(parameters)
+        if missing:
+            raise RuntimeError(
+                "K3 SiTU sidecar API lacks dev2 EP parameters: " f"{sorted(missing)}"
+            )
+
+    def private_situ_runtime_status() -> str | None:
+        """Report whether the K3 SiTU sidecar runtime is usable in-process.
+
+        Returns:
+            None when ``tokenspeed_situ`` is importable and exposes the
+            dev2 EP API consumed by ``_call_mxfp4_situ_routed_moe``; otherwise
+            a human-readable reason (e.g. the sidecar import error), suitable
+            for surfacing in model-level configuration errors.
+        """
+        try:
+            _validate_private_situ_runtime()
+        except RuntimeError as exc:
+            return str(exc)
+        return None
+
+    def _positive_situ_value(w: torch.nn.Module, *names: str) -> float:
+        routing_config = getattr(w, "routing_config", {})
+        if not isinstance(routing_config, dict):
+            routing_config = {}
+
+        value = None
+        for name in names:
+            value = routing_config.get(name)
+            if value is not None:
+                break
+        if value is None:
+            for name in names:
+                value = getattr(w, name, None)
+                if value is not None:
+                    break
+        if value is None:
+            joined_names = ", ".join(names)
+            raise ValueError(f"SiTU requires one of: {joined_names}")
+
+        value = float(value)
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(
+                f"SiTU parameter {names[0]} must be finite and positive, got {value}"
+            )
+        return value
+
+    def _flashinfer_trtllm_mxfp4_moe_weights(
+        plan: dict,
+        w: torch.nn.Module,
+        *,
+        situ: bool,
+    ):
+        if situ:
+            _validate_private_situ_runtime()
         sf_block_size = 32
         num_experts = w.w13_weight.shape[0]
         ispp_padded = w.w13_weight.shape[1] // 2
         hidden_padded = w.w2_weight.shape[1]
 
-        swiglu_arg = getattr(w, "swiglu_arg", None)
-        if swiglu_arg is None:
+        if situ:
+            alpha = _positive_situ_value(w, "activation_situ_beta", "situ_beta")
+            beta = _positive_situ_value(
+                w, "activation_situ_linear_beta", "situ_linear_beta"
+            )
+            limit = None
+        elif (swiglu_arg := getattr(w, "swiglu_arg", None)) is None:
             alpha = 1.702
             limit = 7.0
             beta = 1.0
@@ -297,6 +389,17 @@ if platform.is_nvidia:
         w._flashinfer_trtllm_autotuned = False
         return None
 
+    def flashinfer_trtllm_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
+        return _flashinfer_trtllm_mxfp4_moe_weights(plan, w, situ=False)
+
+    def flashinfer_trtllm_mxfp4_situ_moe_weights(
+        plan: dict,
+        w: torch.nn.Module,
+    ):
+        # The private SiTU kernel uses the same standard TRT-LLM [up|gate]
+        # physical layout as SwiGLU; keep the shared reorder/shuffle above.
+        return _flashinfer_trtllm_mxfp4_moe_weights(plan, w, situ=True)
+
     def _call_mxfp4_moe(
         w: torch.nn.Module,
         router_logits: torch.Tensor,
@@ -338,6 +441,57 @@ if platform.is_nvidia:
             tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
             output=output,
         )[0]
+
+    def _call_mxfp4_situ_routed_moe(
+        w: torch.nn.Module,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        x: torch.Tensor,
+        output: torch.Tensor,
+        enable_pdl: bool,
+        hidden_states_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        local_experts = getattr(w, "num_local_experts", w.w13_weight.shape[0])
+        if local_experts != w.w13_weight.shape[0]:
+            raise RuntimeError(
+                f"expected {local_experts} local experts, "
+                f"got {w.w13_weight.shape[0]} weight batches"
+            )
+        local_expert_offset = getattr(w, "ep_rank", 0) * local_experts
+        num_experts = getattr(w, "num_experts")
+        if local_expert_offset < 0 or local_expert_offset + local_experts > num_experts:
+            raise RuntimeError(
+                f"invalid local expert range [{local_expert_offset}, "
+                f"{local_expert_offset + local_experts}) for {num_experts} experts"
+            )
+        topk = (
+            topk_ids.to(torch.int32).contiguous(),
+            topk_weights.to(torch.bfloat16).contiguous(),
+        )
+        # hidden_states_scale is None for the bf16-activation (w4a16) chain and
+        # the MXFP8 block scale for the w4a8 chain; the native runner deduces
+        # the activation dtype from the (fp8 + scale) pair.
+        _sidecar_mxfp4_situ_routed_moe(
+            topk_ids=topk[0],
+            topk_weights=topk[1],
+            hidden_states=x,
+            gemm1_weights=w.w13_weight,
+            gemm1_weights_scale=w.w13_weight_scale.view(torch.float8_e4m3fn),
+            gemm1_alpha=w.gemm1_alpha,
+            gemm1_beta=w.gemm1_beta,
+            gemm2_weights=w.w2_weight,
+            gemm2_weights_scale=w.w2_weight_scale.view(torch.float8_e4m3fn),
+            output=output,
+            intermediate_size=getattr(w, "intermediate_size_per_partition"),
+            local_expert_offset=local_expert_offset,
+            local_num_experts=local_experts,
+            hidden_states_scale=hidden_states_scale,
+            num_experts=num_experts,
+            top_k=getattr(w, "top_k"),
+            enable_pdl=enable_pdl,
+            tactic=(-1, -1),
+        )
+        return output
 
     @register_kernel(
         "moe",
@@ -432,6 +586,131 @@ if platform.is_nvidia:
             tuned_sizes.add(size_class)
 
         result = _call_mxfp4_moe(w, router_logits, x_quant, x_scale, output)
+        if hidden_original != hidden_padded:
+            result = result[:, :hidden_original].contiguous()
+        return result
+
+    def _register_private_situ_kernel(function):
+        reason = private_situ_runtime_status()
+        if reason is not None:
+            # Skipping is normal for deployments that don't serve Kimi-K3, so
+            # log at INFO -- but keep the reason (e.g. the sidecar import
+            # error), which otherwise vanishes and makes "kernel not found"
+            # failures hard to trace back here.
+            logger.info("Kimi-K3 SiTU sidecar kernel not registered: %s", reason)
+            return function
+        return register_kernel(
+            "moe",
+            "apply",
+            name="flashinfer_trtllm_mxfp4_situ_routed_moe_apply",
+            solution="flashinfer_trtllm",
+            weight_preprocessor=flashinfer_trtllm_mxfp4_situ_moe_weights,
+            capability=CapabilityRequirement(
+                vendors=frozenset({"nvidia"}),
+                min_arch_version=ArchVersion(10, 3),
+                max_arch_version=ArchVersion(10, 3),
+            ),
+            signatures=format_signatures(
+                "x",
+                "dense",
+                {torch.bfloat16},
+            ),
+            traits={
+                "weight_dtype": frozenset({"mxfp4"}),
+                "activation": frozenset({"situ"}),
+                "routing_mode": frozenset({"precomputed_topk"}),
+                "supports_deferred_finalize": frozenset({False}),
+                "supports_ep": frozenset({True}),
+                "supports_all_to_all_ep": frozenset({False}),
+                "ispp_alignment": frozenset({1}),
+                # Activation precision is a run-wide deployment choice carried by
+                # the plan's internal_activation_dtype: "input" keeps bf16
+                # (w4a16), "fp8" block-quantizes to MXFP8 (w4a8). Both flow
+                # through this one solution; the choice is not per-batch.
+                "internal_activation_dtype": frozenset({"input", "fp8"}),
+                "supports_bias": frozenset({False}),
+            },
+            priority=Priority.SPECIALIZED,
+        )(function)
+
+    @_register_private_situ_kernel
+    def flashinfer_trtllm_mxfp4_situ_routed_moe_apply(
+        plan: dict,
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        num_tokens_global: int | None = None,
+        max_num_tokens_per_gpu: int | None = None,
+        do_finalize: bool = True,
+        enable_pdl: bool = False,
+    ):
+        if topk_weights is None or topk_ids is None:
+            raise ValueError("precomputed_topk plan requires topk_weights and topk_ids")
+        if not do_finalize:
+            raise NotImplementedError("FlashInfer MXFP4 SiTU requires finalization")
+        if x.dtype != torch.bfloat16:
+            raise TypeError("FlashInfer MXFP4 SiTU requires bf16 input")
+
+        # Run-wide activation precision, carried by the plan's
+        # internal_activation_dtype (set once at layer construction, never a
+        # per-batch switch): "input" keeps bf16 activation (w4a16); "fp8"
+        # block-quantizes to MXFP8 (w4a8).
+        act_dtype = plan.get(
+            "internal_activation_dtype",
+            getattr(w, "internal_activation_dtype", "input"),
+        )
+        if act_dtype not in ("input", "fp8"):
+            raise NotImplementedError(
+                f"SiTU MoE supports internal_activation_dtype input|fp8, "
+                f"got {act_dtype!r}"
+            )
+
+        hidden_padded = getattr(w, "hidden_size_padded", w.w2_weight_scale.shape[1])
+        hidden_original = getattr(w, "hidden_size_original", hidden_padded)
+        if x.shape[0] == 0:
+            return x.new_empty(0, hidden_original)
+        if x.shape[-1] > hidden_padded:
+            raise RuntimeError(
+                f"expected hidden size at most {hidden_padded}, got {x.shape[-1]}"
+            )
+        if x.shape[-1] != hidden_padded:
+            x = torch.nn.functional.pad(
+                x,
+                (0, hidden_padded - x.shape[-1]),
+                mode="constant",
+                value=0.0,
+            )
+
+        hidden_states_scale = None
+        if act_dtype == "fp8":
+            x, x_scale = mxfp8_quantize(x, False, alignment=hidden_padded)
+            hidden_states_scale = x_scale.view(torch.float8_e4m3fn).reshape(
+                x.shape[0], -1
+            )
+
+        out_buf = getattr(w, "_situ_output_buffer", None)
+        if (
+            out_buf is not None
+            and out_buf.shape == (x.shape[0], hidden_padded)
+            and out_buf.is_contiguous()
+        ):
+            # Caller-owned destination (e.g. a fused all-reduce lane slice).
+            output = out_buf
+        else:
+            output = torch.empty(
+                x.shape[0], hidden_padded, dtype=torch.bfloat16, device=x.device
+            )
+        result = _call_mxfp4_situ_routed_moe(
+            w,
+            topk_weights,
+            topk_ids,
+            x,
+            output,
+            enable_pdl,
+            hidden_states_scale=hidden_states_scale,
+        )
         if hidden_original != hidden_padded:
             result = result[:, :hidden_original].contiguous()
         return result

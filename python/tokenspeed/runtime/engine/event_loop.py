@@ -20,6 +20,7 @@
 
 import faulthandler
 import signal
+import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -41,6 +42,7 @@ from tokenspeed.runtime.cache.executor.memory_executor import (
 from tokenspeed.runtime.cache.transfer.types import CacheKind
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.configs.paged_cache_spec import (
+    preflight_kimi_k3_flat_consumers,
     scheduler_ext_flat_kvcache,
     validate_flat_scheduler_config,
 )
@@ -61,6 +63,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     pool_to_paged_cache_groups,
     pool_to_prefix_cache_adjunct_spec,
     pop_common_cache_event_payloads,
+    scheduler_cache_geometry_from_pool,
     should_use_overlap_schedule,
 )
 from tokenspeed.runtime.execution.distributed_initializer import (
@@ -159,6 +162,7 @@ class EventLoop:
         attn_tp_rank: int,
         dp_rank: int,
         global_rank: int,
+        shutdown_event: threading.Event | None = None,
     ) -> None:
         # Do not pass server_args further down the stack after this point.
 
@@ -166,6 +170,7 @@ class EventLoop:
         self.port_args = port_args
         self.gpu_id = gpu_id
         self.global_rank = global_rank
+        self.shutdown_event = shutdown_event or threading.Event()
 
         self.model_config = self._load_model_config(server_args.model)
         if server_args.speculative_draft_model_path is not None:
@@ -175,6 +180,8 @@ class EventLoop:
             )
         else:
             draft_model_config = None
+
+        preflight_kimi_k3_flat_consumers(self.model_config, draft_model_config)
 
         min_per_gpu_mem = self._init_distributed()
 
@@ -213,7 +220,14 @@ class EventLoop:
             overlap_schedule_depth=self.overlap_schedule_depth,
         )
 
-        num_total_pages = self.max_total_num_tokens // server_args.block_size
+        self._scheduler_cache_geometry = scheduler_cache_geometry_from_pool(
+            token_to_kv_pool,
+            fallback_token_capacity=self.max_total_num_tokens,
+            fallback_page_size=server_args.block_size,
+        )
+        geometry = self._scheduler_cache_geometry
+        self.max_total_num_tokens = geometry.token_capacity
+        num_total_pages = geometry.num_device_pages
         hf_config = getattr(self.model_config, "hf_config", None)
         text_config = getattr(hf_config, "text_config", None) if hf_config else None
         has_mamba = getattr(self.model_config, "mambaish_config", None) is not None or (
@@ -323,6 +337,15 @@ class EventLoop:
                     "flat scheduler build (TOKENSPEED_FLAT_KVCACHE) has no L3 "
                     "storage tier yet; unset --kvstore-storage-backend."
                 )
+            if getattr(token_to_kv_pool, "runtime_contract", None) is not None:
+                # FlatKV contract pools (Kimi-K3) have no host tier yet:
+                # FlatMemoryExecutor mirrors k_buffer/v_buffer layouts the
+                # raw-slab pool does not expose. Reject this unsupported
+                # combination at startup.
+                raise NotImplementedError(
+                    "the flat host tier (kvstore L2) does not support FlatKV "
+                    "contract pools (Kimi-K3) yet; pass --disable-kvstore."
+                )
             self.memory_executor = FlatMemoryExecutor(
                 device_pool=token_to_kv_pool,
                 host_ratio=server_args.kvstore_ratio,
@@ -368,6 +391,43 @@ class EventLoop:
 
         # Adjunct enabled only when pool opts in AND prefix-caching switch is on.
         paged_cache_groups = pool_to_paged_cache_groups(token_to_kv_pool)
+        self._flatkv_pd_enabled = bool(
+            server_args.disaggregation_mode in ("prefill", "decode")
+            and getattr(token_to_kv_pool, "supports_disaggregation", False) is True
+        )
+        if self._flatkv_pd_enabled:
+            unsupported = []
+            if self.has_dp:
+                unsupported.append("data-parallel attention")
+            if server_args.enable_mixed_batch:
+                unsupported.append("mixed prefill/decode batches")
+            if server_args.speculative_algorithm is not None:
+                unsupported.append("speculative/MTP decoding")
+            if server_args.enable_mla_l1_5_cache:
+                unsupported.append("MLA L1.5 cache transfer")
+            if server_args.disaggregation_layerwise_interval > 0:
+                unsupported.append("layerwise cache transfer")
+            if server_args.enable_memory_saver:
+                unsupported.append("memory saver/release")
+            if server_args.enable_prefix_caching:
+                unsupported.append("prefix caching/reuse")
+            if server_args.enable_kvstore:
+                unsupported.append("KVStore/host cache")
+            # Prefill is forced onto the non-overlap loop by
+            # should_use_overlap_schedule(). Decode uses the ordinary overlap
+            # loop and the scheduler's one-step protected FlatKV reservation.
+            if (
+                self.use_overlap_schedule
+                and server_args.disaggregation_mode != "decode"
+            ):
+                unsupported.append("overlap scheduling outside the Decode role")
+            backend = server_args.disaggregation_transfer_backend
+            if getattr(backend, "value", backend) != "mooncake":
+                unsupported.append("non-Mooncake transfer backend")
+            if unsupported:
+                raise NotImplementedError(
+                    "FlatKV PD currently does not support: " + ", ".join(unsupported)
+                )
         validate_flat_scheduler_config(
             flat_kvcache_ext=scheduler_ext_flat_kvcache(),
             paged_cache_groups=paged_cache_groups,
@@ -381,16 +441,10 @@ class EventLoop:
         if required_groups is not None and server_args.enable_prefix_caching:
             prefix_cache_adjunct = pool_to_prefix_cache_adjunct_spec(required_groups)
         scheduler_cfg = make_config(
-            num_device_pages=(
-                # Scheduler reserves page/parent 0 and constructs BlockPool
-                # from total_pages - 1.
-                token_to_kv_pool.num_lcm_blocks + 1
-                if getattr(token_to_kv_pool, "num_lcm_blocks", None) is not None
-                else self.max_total_num_tokens // server_args.block_size
-            ),
+            num_device_pages=geometry.num_device_pages,
             max_scheduled_tokens=server_args.chunked_prefill_size,
             max_batch_size=per_rank_max_batch,
-            page_size=server_args.block_size,
+            page_size=geometry.page_size,
             num_host_pages=num_host_pages,
             disable_l2_cache=not server_args.enable_kvstore,
             enable_l3_storage=server_args.kvstore_storage_backend is not None,
@@ -409,6 +463,7 @@ class EventLoop:
             enable_mixed_prefill_decode=server_args.enable_mixed_batch,
             prefix_cache_adjunct=prefix_cache_adjunct,
         )
+        scheduler_cfg.enable_flatkv_pd = self._flatkv_pd_enabled
         logger.info(
             "Scheduler config: block_size=%s num_device_pages=%s "
             "max_scheduled_tokens=%s decode_input_tokens=%s "
@@ -818,6 +873,7 @@ class EventLoop:
         dp_metadata=None,
         stats=None,
         grammar_inputs=None,
+        flat_cache_zero_event=None,
     ):
         """Execute one forward step; return (results, on_first_token).
 
@@ -874,6 +930,12 @@ class EventLoop:
                     self.model_executor.execution_stream,
                     self.model_executor.device,
                 )
+                if self._flatkv_pd_enabled and flat_cache_zero_event is not None:
+                    # zero_flat_cache_pages runs asynchronously on a CUDA stream,
+                    # while Mooncake/GPUDirect writes are not ordered by that
+                    # stream. Do not publish the destination manifest until the
+                    # newly assigned pages are fully sanitized.
+                    flat_cache_zero_event.synchronize()
                 self.kv_transfer.execute(forward_op)
                 self.model_executor.reset_remote_prefill_mamba_inputs(forward_op)
                 return None, None
@@ -1124,6 +1186,15 @@ class EventLoop:
             return False
         return True
 
+    def _request_abort_or_mark(
+        self, request_id: str, _reason: str, *, notify_client: bool = False
+    ) -> None:
+        """Mark an abort; scheduler release follows the normal lifecycle event."""
+        if notify_client:
+            self.output_processor.mark_abort(request_id, notify_client=True)
+        else:
+            self.output_processor.mark_abort(request_id)
+
     def _process_new_requests(self):
         recv_reqs = self.request_handler.recv_reqs()
         # Snapshot the pause state before dispatch: process_requests may flip it
@@ -1146,7 +1217,7 @@ class EventLoop:
         # would finish compiling and get admitted before being noticed.
         grammar_manager = self.request_handler.grammar_manager
         for rid in abort_rids:
-            self.output_processor.mark_abort(rid)
+            self._request_abort_or_mark(rid, "client cancelled request")
             grammar_manager.mark_abort(rid)
 
         # A pause(mode="abort") cancels every in-flight request through the same
@@ -1156,7 +1227,9 @@ class EventLoop:
             for rid in list(self.output_processor.rid_to_state.keys()):
                 # notify_client=True: pause aborts a passive client's request,
                 # so it must receive a terminating finish (unlike a client abort).
-                self.output_processor.mark_abort(rid, notify_client=True)
+                self._request_abort_or_mark(
+                    rid, "request aborted by pause", notify_client=True
+                )
                 grammar_manager.mark_abort(rid)
 
         # abort/wait also cancel requests still compiling in the grammar queue:
@@ -1225,6 +1298,11 @@ class EventLoop:
                 )
                 continue
 
+            if self._flatkv_pd_enabled:
+                if bootstrap is None:
+                    raise ValueError(
+                        "FlatKV PD request is missing bootstrap information"
+                    )
             if isinstance(self.kv_transfer, DisaggDecodeExecutor):
                 state.computed_length = state.input_length
             self.output_processor.register(spec.request_id, state)
@@ -1381,7 +1459,15 @@ class EventLoop:
             elif isinstance(event, PD.RemotePrefillDoneEvent):
                 req_id = event.request_id
                 bootstrap_token = event.bootstrap_token
-                self.output_processor.on_remote_prefill_done(req_id, bootstrap_token)
+                state = self.output_processor.rid_to_state.get(req_id)
+                if state is None or not state.to_abort:
+                    self.output_processor.on_remote_prefill_done(
+                        req_id, bootstrap_token
+                    )
+                if self._flatkv_pd_enabled:
+                    processed.extend(
+                        self.output_processor.finish_remote_prefill_only_request(req_id)
+                    )
                 if isinstance(self.kv_transfer, DisaggDecodeExecutor):
                     candidate_info = self.kv_transfer.pop_remote_spec_candidate_ids(
                         req_id
@@ -1394,23 +1480,26 @@ class EventLoop:
             elif isinstance(event, PD.FailedEvent):
                 # A PD/EPD transfer failed: the decode KV receiver timed out (e.g. the
                 # prefill aborted on embedding timeout so the KV never arrives), or a
-                # transfer errored. The C++ scheduler's FailedEvent handler is a no-op,
-                # so without this the request is never finished and the CLIENT HANGS
-                # FOREVER (the decode is its response stream). Finish it with an abort
-                # (streams the error to the client) and abort it in the scheduler so its
-                # slot/KV is freed. AbortEvent is valid from the decode-waiting state
-                # (forward_events.cpp: AbortEvent(Prefilling&&) -> Finished).
+                # transfer errored. Publish the client-visible failure here. Legacy
+                # PD still needs a following Forward.Abort because its C++ FailedEvent
+                # handler is a no-op; FlatKV FailedEvent atomically terminalizes and
+                # fences the leased scheduler resources itself.
                 req_id = event.request_id
                 state = self.output_processor.rid_to_state.get(req_id)
                 if state is not None:
-                    state.set_finish_with_abort(
-                        "PD/EPD remote transfer failed or timed out"
-                    )
-                    self.output_processor.publish_finished_at_admission(req_id, state)
-                    abort = ForwardEvent.Abort()
-                    abort.request_id = req_id
-                    processed.append(abort)
-
+                    if state.finished:
+                        self.output_processor.reap_finished_orphan(req_id, state)
+                    else:
+                        state.set_finish_with_abort(
+                            "PD/EPD remote transfer failed or timed out"
+                        )
+                        self.output_processor.publish_finished_at_admission(
+                            req_id, state
+                        )
+                    if not self._flatkv_pd_enabled:
+                        abort = ForwardEvent.Abort()
+                        abort.request_id = req_id
+                        processed.append(abort)
         return processed
 
     def _get_load(self):
@@ -1418,8 +1507,7 @@ class EventLoop:
         from tokenspeed.runtime.engine.io_struct import GetLoadReqOutput
 
         available = self.scheduler.available_kv_pages()
-        num_total_pages = self.max_total_num_tokens // self.server_args.block_size
-        num_used_pages = num_total_pages - available
+        num_used_pages = self._scheduler_cache_geometry.num_usable_pages - available
         num_waiting = self.scheduler.waiting_size()
         # num_reqs: running + waiting (used by SHORTEST_QUEUE balancing)
         num_running = len(self.output_processor.rid_to_state)
@@ -1491,10 +1579,11 @@ class EventLoop:
         """Query scheduler for page usage and queue depth."""
         available = self.scheduler.available_kv_pages()
         active = self.scheduler.active_kv_pages()
-        num_total_pages = self.max_total_num_tokens // self.server_args.block_size
         return {
             "num_active_pages": active,
-            "num_cached_pages": num_total_pages - available,
+            "num_cached_pages": (
+                self._scheduler_cache_geometry.num_usable_pages - available
+            ),
             "num_queue_reqs": self.scheduler.waiting_size(),
         }
 
@@ -1505,7 +1594,7 @@ class EventLoop:
             running=len(self.output_processor.rid_to_state),
             waiting=stats["num_queue_reqs"],
             num_active_pages=stats["num_active_pages"],
-            num_total_pages=self.max_total_num_tokens // self.server_args.block_size,
+            num_total_pages=self._scheduler_cache_geometry.num_usable_pages,
             num_iteration_tokens=num_iteration_tokens,
         )
 
@@ -1578,9 +1667,35 @@ class EventLoop:
     # Event loops
     # ------------------------------------------------------------------
 
+    def _shutdown_complete(self) -> bool:
+        return self.shutdown_event.is_set()
+
+    def _flat_page_ids_to_zero(self, execution_plan):
+        """Page ids the scheduler retired for reuse this step.
+
+        A flat-cache pool aliases recurrent-state bytes and fp8 KV in one
+        slab, so a plan that cannot report pages to zero means poisoned KV
+        tails. Fail loudly on that contract mismatch (e.g. a scheduler wheel
+        older than the runtime) instead of silently skipping sanitization.
+        """
+        try:
+            return execution_plan.flat_page_ids_to_zero
+        except AttributeError:
+            zero_pages = getattr(
+                self.model_executor.token_to_kv_pool, "zero_pages", None
+            )
+            if callable(zero_pages):
+                raise RuntimeError(
+                    "flat KV cache is active but the scheduler's ExecutionPlan "
+                    "has no flat_page_ids_to_zero; the installed "
+                    "tokenspeed-scheduler build predates page-reuse zeroing — "
+                    "rebuild it from this checkout"
+                ) from None
+            return ()
+
     def event_loop(self):
         """Non-overlapping scheduler loop."""
-        while True:
+        while not self._shutdown_complete():
             self._process_new_requests()
             # EPD prefill: admit requests whose async embedding receives completed
             # this cycle (rank-synced). Fixed position right after
@@ -1594,6 +1709,9 @@ class EventLoop:
             execution_plan = self.scheduler.next_execution_plan()
             self._publish_scheduler_kv_events()
             self._handle_flat_oom_terminals(execution_plan)
+            flat_cache_zero_event = self.model_executor.zero_flat_cache_pages(
+                self._flat_page_ids_to_zero(execution_plan)
+            )
             self._submit_cache_ops(execution_plan)
 
             forward_op = self._get_forward_op(execution_plan)
@@ -1630,6 +1748,7 @@ class EventLoop:
                     dp_metadata=dp_metadata,
                     stats=stats,
                     grammar_inputs=grammar_inputs,
+                    flat_cache_zero_event=flat_cache_zero_event,
                 )
                 if results is not None:
                     request_changes.extend(
@@ -1726,7 +1845,7 @@ class EventLoop:
         prev_results: ModelExecutionResult = None
         prev_forward_op = None
 
-        while True:
+        while not self._shutdown_complete():
             # Order this iter's default-stream writes (KVAllocator,
             # update_block_table, prefix_cache writes to req_to_page)
             # after the prev iter's forward on execution_stream that
@@ -1747,6 +1866,9 @@ class EventLoop:
             self._publish_scheduler_kv_events()
             self._handle_flat_oom_terminals(execution_plan)
 
+            flat_cache_zero_event = self.model_executor.zero_flat_cache_pages(
+                self._flat_page_ids_to_zero(execution_plan)
+            )
             self._submit_cache_ops(execution_plan)
 
             forward_op = self._get_forward_op(execution_plan)
@@ -1827,6 +1949,7 @@ class EventLoop:
                     dp_metadata=dp_metadata,
                     stats=stats,
                     grammar_inputs=grammar_inputs,
+                    flat_cache_zero_event=flat_cache_zero_event,
                 )
 
             # ---- post-process previous step (overlapped with current forward) ----
@@ -1854,6 +1977,11 @@ class EventLoop:
             prev_results = curr_results
             prev_forward_op = forward_op
 
+    def close(self) -> None:
+        close_transfer = getattr(self.kv_transfer, "close", None)
+        if callable(close_transfer):
+            close_transfer()
+
 
 def run_event_loop(
     server_args: ServerArgs,
@@ -1874,6 +2002,9 @@ def run_event_loop(
     prefix = f" ATTN TP RANK {attn_tp_rank}"
     configure_logger(server_args, prefix=prefix)
 
+    event_loop = None
+    shutdown_event = threading.Event()
+    previous_sigterm_handler = None
     try:
         if server_args.disaggregation_mode == "encode":
             # The encode role is LM-free; run the lightweight vision-tower loop
@@ -1885,6 +2016,15 @@ def run_event_loop(
             run_encode_loop(server_args, port_args, pipe_writer, gpu_id, global_rank)
             return
 
+        # Convert SIGTERM into a loop-owned stop request so the current
+        # scheduler iteration and ordinary runtime cleanup can finish.
+        if threading.current_thread() is threading.main_thread():
+            previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
+            signal.signal(
+                signal.SIGTERM,
+                lambda _signum, _frame: shutdown_event.set(),
+            )
+
         event_loop = EventLoop(
             server_args,
             port_args,
@@ -1892,6 +2032,7 @@ def run_event_loop(
             attn_tp_rank,
             dp_rank,
             global_rank,
+            shutdown_event,
         )
         pipe_writer.send(
             {
@@ -1919,3 +2060,18 @@ def run_event_loop(
         traceback = get_exception_traceback()
         logger.error("Scheduler hit an exception: %s", traceback)
         parent_process.send_signal(signal.SIGUSR1)
+    finally:
+        if event_loop is not None:
+            try:
+                event_loop.close()
+            except Exception:
+                logger.error(
+                    "Scheduler transport shutdown failed: %s",
+                    get_exception_traceback(),
+                )
+                parent_process.send_signal(signal.SIGUSR1)
+        if (
+            previous_sigterm_handler is not None
+            and threading.current_thread() is threading.main_thread()
+        ):
+            signal.signal(signal.SIGTERM, previous_sigterm_handler)

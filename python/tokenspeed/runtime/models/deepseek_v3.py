@@ -33,6 +33,9 @@ import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.attention import attn_merge_state
 from tokenspeed_kernel.ops.attention.tokenspeed_mla import mla_kv_pack_quantize_fp8
+from tokenspeed_kernel.ops.attention.triton.mla_query_assemble import (
+    mla_nope_query_fp8,
+)
 from tokenspeed_kernel.ops.embedding import apply_rope_mla
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.gemm.cute_dsl import (
@@ -224,7 +227,6 @@ class DeepseekV3MLP(nn.Module):
 
 
 class MoEGate(nn.Module):
-    _DSV3_ROUTER_GEMM_EXPERTS = (256, 384, 768)
     _DSV3_ROUTER_GEMM_HIDDEN = (3072, 6144, 7168)
 
     def __init__(self, config, prefix: str = ""):
@@ -242,11 +244,10 @@ class MoEGate(nn.Module):
         self.use_dsv3_router_gemm = (
             _is_hopper_plus
             and self.weight.dtype in (torch.bfloat16, torch.float32)
-            and config.n_routed_experts in self._DSV3_ROUTER_GEMM_EXPERTS
             and config.hidden_size in self._DSV3_ROUTER_GEMM_HIDDEN
         )
 
-    def forward(self, hidden_states, comm_manager=None):
+    def forward(self, hidden_states):
         if self.use_dsv3_router_gemm and hidden_states.size(0) > 0:
             logits = dsv3_router_gemm(
                 hidden_states,
@@ -784,6 +785,12 @@ class DeepseekV3AttentionMLA(nn.Module):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Model-owned KV writes route their locations through the backend:
+        # identity on the legacy path (base AttentionBackend hook), the
+        # group-derived locations on the FlatKV path.
+        out_cache_loc = ctx.attn_backend.select_out_cache_loc(
+            self.attn_mqa, out_cache_loc, ctx.forward_mode
+        )
         q = q.view(-1, self.num_local_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
@@ -877,6 +884,20 @@ class DeepseekV3AttentionMLA(nn.Module):
                 )
                 Q[..., self.kv_lora_rank :].copy_(q_pe)
                 K[..., self.kv_lora_rank :].copy_(k_pe)
+        elif (
+            self.attention_backend in self._MLA_KERNEL_BACKENDS
+            # Hybrid models: data_type lives on the full-attention sub-backend.
+            and getattr(
+                getattr(ctx.attn_backend, "full_attn_backend", ctx.attn_backend),
+                "data_type",
+                None,
+            )
+            == torch.float8_e4m3fn
+            and k_scale == 1.0
+            and q_nope.size(0) > 0
+        ):
+            # NoPE + fp8: assemble the query straight into fp8; the KV write casts the bf16 latents in-kernel.
+            Q = mla_nope_query_fp8(Q[..., : self.kv_lora_rank], q_pe)
         else:
             Q[..., self.kv_lora_rank :] = q_pe
 
@@ -964,6 +985,11 @@ class DeepseekV3AttentionMLA(nn.Module):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # See forward_absorb_qkv_proj: backend-selected write locations
+        # (identity off the FlatKV path).
+        out_cache_loc = ctx.attn_backend.select_out_cache_loc(
+            self.attn_mha, out_cache_loc, ctx.forward_mode
+        )
         kv_a, k_pe = latent_cache.split(
             [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
@@ -1419,6 +1445,10 @@ class DeepseekV3Model(nn.Module):
         # For EAGLE3 support: set of layer indices whose *input* hidden states
         # are captured. Populated by set_eagle3_layers_to_capture().
         self.layers_to_capture: set = set()
+        self._dflash_incremental_callback = None
+        self._dflash_slot_bufs = None
+        self._dflash_capture_idx_map = {}
+        self._dflash_incr_active = False
 
     def forward(
         self,
@@ -1452,6 +1482,16 @@ class DeepseekV3Model(nn.Module):
                     hidden_states + residual if residual is not None else hidden_states
                 )
                 gathered = self.layers[i].comm_manager.gather_residual(aux, ctx)
+                capture_idx = self._dflash_capture_idx_map.get(i)
+                if (
+                    self._dflash_incr_active
+                    and self._dflash_incremental_callback is not None
+                    and self._dflash_slot_bufs is not None
+                    and capture_idx is not None
+                ):
+                    num_tokens = gathered.shape[0]
+                    self._dflash_slot_bufs[capture_idx][:num_tokens].copy_(gathered)
+                    self._dflash_incremental_callback(capture_idx, num_tokens)
                 aux_hidden_states.append(
                     gathered if gathered is aux else gathered.clone()
                 )
@@ -1538,7 +1578,12 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
         else:
             self.model.layers_to_capture = {val + 1 for val in layer_ids}
 
-    def set_dflash_layers_to_capture(self, layer_ids: list[int]):
+    def set_dflash_layers_to_capture(
+        self,
+        layer_ids: list[int],
+        incremental_callback=None,
+        slot_bufs: list | None = None,
+    ):
         # DFlash checkpoints name 0-indexed target layer outputs. The capture
         # check runs before layer i, so capture at i + 1 for layer i's output.
         num_layers = len(self.model.layers)
@@ -1553,6 +1598,12 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
                 f"[0, {num_layers - 2}] for {num_layers} target layers."
             )
         self.model.layers_to_capture = {val + 1 for val in layer_ids}
+        self.model._dflash_capture_idx_map = {
+            layer_idx: i
+            for i, layer_idx in enumerate(sorted(self.model.layers_to_capture))
+        }
+        self.model._dflash_incremental_callback = incremental_callback
+        self.model._dflash_slot_bufs = slot_bufs
 
     def get_param(self, params_dict, name):
         if name in params_dict:
@@ -1975,6 +2026,17 @@ class Eagle3MlaModel(nn.Module):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.fc_norm = (
+            nn.ModuleList(
+                [
+                    RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                    for _ in range(self.num_fc_input_dim)
+                ]
+            )
+            if getattr(config, "fc_norm", False)
+            else None
+        )
+        self.norm_output = getattr(config, "norm_output", False)
 
     def forward(
         self,
@@ -1994,6 +2056,15 @@ class Eagle3MlaModel(nn.Module):
 
         hidden_states = captured_hidden_states
         if hidden_states.size(-1) != embeds.size(-1):
+            if self.fc_norm is not None:
+                chunks = hidden_states.chunk(self.num_fc_input_dim, dim=-1)
+                hidden_states = torch.cat(
+                    [
+                        norm(chunk)
+                        for norm, chunk in zip(self.fc_norm, chunks, strict=True)
+                    ],
+                    dim=-1,
+                )
             hidden_states, _ = self.fc(hidden_states)
 
         residual = None
@@ -2026,6 +2097,10 @@ class Eagle3MlaModel(nn.Module):
             hidden_states_to_aux, _ = comm_manager.post_final_norm_comm(
                 hidden_states_to_aux, None, ctx
             )
+
+        if self.norm_output:
+            hidden_states_to_aux = hidden_states_to_logits
+
         return hidden_states_to_logits, [hidden_states_to_aux]
 
 

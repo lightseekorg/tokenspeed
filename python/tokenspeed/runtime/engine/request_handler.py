@@ -130,6 +130,7 @@ class RequestHandler:
         mapping = server_args.mapping
         self.attn_tp_size = mapping.attn.tp_size
         self.attn_tp_rank = mapping.attn.tp_rank
+        self.attn_global_rank = mapping.attn.rank
         self.attn_tp_cpu_group = pg_manager.get_process_group(
             "gloo", mapping.attn.tp_group
         )
@@ -179,7 +180,7 @@ class RequestHandler:
         if self.attn_tp_size != 1:
             recv_reqs = broadcast_pyobj(
                 recv_reqs,
-                self.attn_tp_rank,
+                self.attn_global_rank,
                 self.attn_tp_cpu_group,
                 src=self.attn_tp_src_rank,
             )

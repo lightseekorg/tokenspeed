@@ -243,6 +243,7 @@ def run_encode_loop(server_args, port_args, pipe_writer, gpu_id, global_rank):
     # ZMQ; it broadcasts each drained batch to the TP group so all ranks submit
     # the same requests and step together. (TP=1 -> rank 0 only, no broadcast.)
     attn_tp_rank = server_args.mapping.attn.tp_rank
+    attn_global_rank = server_args.mapping.attn.rank
     attn_tp_size = server_args.attn_tp_size or server_args.mapping.attn.tp_size
     tp_cpu_group = None
     broadcast_pyobj = None
@@ -294,7 +295,7 @@ def run_encode_loop(server_args, port_args, pipe_writer, gpu_id, global_rank):
             # Unconditional every iteration: this is the TP rendezvous that keeps
             # all ranks stepping the (collective) vision tower in lockstep.
             new_reqs = broadcast_pyobj(
-                new_reqs, attn_tp_rank, tp_cpu_group, src=attn_tp_src_rank
+                new_reqs, attn_global_rank, tp_cpu_group, src=attn_tp_src_rank
             )
 
         for request in new_reqs:

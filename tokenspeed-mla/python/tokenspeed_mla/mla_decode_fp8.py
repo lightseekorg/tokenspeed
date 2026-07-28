@@ -1463,6 +1463,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 if k_tile_count > 0:
                     mma_common_params = SimpleNamespace(
                         blk_coord=blk_coord,
+                        K=cache_seqs[blk_coord[2]],
+                        k_index=k_index,
                         local_split_kv=local_split_kv,
                         load_q_pipeline=load_q_pipeline,
                         load_k_pipeline=load_k_pipeline,
@@ -2431,6 +2433,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # mma O accumulates on K, so the accumulate flag is set to False once before all K blocks.
         tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, False)
         load_q_pipeline = common_params.load_q_pipeline
+        pv_k_index = common_params.k_index
         if common_params.is_leader_cta:
             load_q_release_state = load_q_consumer_state.clone()
             (
@@ -2476,11 +2479,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 ) = self.mma_pv(
                     common_params,
                     pv_params,
+                    pv_k_index,
                     tiled_mma_pv,
                     load_v_consumer_state,
                     p_mma_consumer_state,
                     mma_o_producer_state,
                 )
+                pv_k_index = pv_k_index + 1
                 k_tile_count -= 1
             # release q consumer states
             load_q_pipeline.consumer_release(load_q_release_state)
@@ -2493,6 +2498,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             ) = self.mma_pv(
                 common_params,
                 pv_params,
+                pv_k_index,
                 tiled_mma_pv,
                 load_v_consumer_state,
                 p_mma_consumer_state,
@@ -2635,6 +2641,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self,
         common_params: SimpleNamespace,
         pv_params: SimpleNamespace,
+        k_index: cutlass.Int32,
         tiled_mma_pv: cute.TiledMma,
         load_v_consumer_state: pipeline.PipelineState,
         p_mma_consumer_state: pipeline.PipelineState,

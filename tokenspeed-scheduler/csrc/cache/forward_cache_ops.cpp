@@ -20,6 +20,8 @@
 
 #include "cache/forward_cache_ops.h"
 
+#include <stdexcept>
+
 #include "resource/allocator/paged_cache_group.h"
 #include "scheduler/types.h"
 
@@ -56,8 +58,22 @@ std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
         // family=State marks trailing-window prefix reuse and covers both SWA and
         // linear-attention groups; only a State group WITHOUT SlidingWindow
         // retention is a mamba-style state group.
-        if (group.family == PagedCacheGroupFamily::State &&
-            group.retention != PagedCacheGroupConfig::Retention::SlidingWindow) {
+        const bool final_state_manager = group.family == PagedCacheGroupFamily::State &&
+                                         group.retention != PagedCacheGroupConfig::Retention::SlidingWindow;
+        if (config.enable_flatkv_pd) {
+            const PagedCacheTransferPolicy expected =
+                final_state_manager ? PagedCacheTransferPolicy::LatestSnapshot : PagedCacheTransferPolicy::FullSuffix;
+            if (group.transfer_policy == PagedCacheTransferPolicy::Unspecified) {
+                throw std::invalid_argument("FlatKV PD cache group '" + group.group_id +
+                                            "' requires an explicit transfer_policy");
+            }
+            if (group.transfer_policy != expected) {
+                throw std::invalid_argument("FlatKV PD cache group '" + group.group_id +
+                                            "' transfer_policy does not match its scheduler "
+                                            "destination layout");
+            }
+        }
+        if (final_state_manager) {
             specs.push_back(KvCacheSpec{
                 .kind = AttnKind::kMambaState,
                 .sliding_window = 0,

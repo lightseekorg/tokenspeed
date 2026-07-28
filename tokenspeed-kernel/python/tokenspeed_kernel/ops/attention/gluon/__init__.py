@@ -63,8 +63,14 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.attention.gluon.mha_prefill_gfx1250 import (
         gluon_mha_prefill_gfx1250 as _prefill_gfx1250_impl,
     )
-    from tokenspeed_kernel_amd.ops.attention.gluon.mla_decode_bf16_gfx950 import (
-        gluon_mla_decode_bf16_gfx950 as _mla_decode_impl,
+    from tokenspeed_kernel_amd.ops.attention.gluon.mla_decode_gfx950 import (
+        gluon_mla_decode_bf16xbf16_gfx950 as _mla_decode_bf16xbf16_impl,
+    )
+    from tokenspeed_kernel_amd.ops.attention.gluon.mla_decode_gfx950 import (
+        gluon_mla_decode_bf16xfp8_gfx950 as _mla_decode_bf16xfp8_impl,
+    )
+    from tokenspeed_kernel_amd.ops.attention.gluon.mla_decode_gfx950 import (
+        gluon_mla_decode_fp8xfp8_gfx950 as _mla_decode_fp8xfp8_impl,
     )
     from tokenspeed_kernel_amd.ops.attention.gluon.mla_prefill_bf16_gfx950 import (
         gluon_mla_prefill_bf16_gfx950 as _mla_prefill_impl,
@@ -211,7 +217,7 @@ if current_platform().is_amd:
     @register_kernel(
         "attention",
         "mla_decode_with_kvcache",
-        name="gluon_mla_decode_bf16_gfx950_bh16bn64",
+        name="gluon_mla_decode_bf16xbf16_gfx950_bh16bn64",
         solution="gluon",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 5),
@@ -234,13 +240,79 @@ if current_platform().is_amd:
             "return_lse": frozenset({False, True}),
         },
     )
-    def gluon_mla_decode_bf16_gfx950_bh16bn64(*args, **kwargs):
-        return _mla_decode_impl(*args, **kwargs)
+    def gluon_mla_decode_bf16xbf16_gfx950_bh16bn64(*args, **kwargs):
+        return _mla_decode_bf16xbf16_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",
         "mla_decode_with_kvcache",
-        name="gluon_mla_decode_bf16_gfx950_bh64",
+        name="gluon_mla_decode_bf16xfp8_gfx950_bh16bn128",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            format_signature(
+                q=dense_tensor_format(q_dtype),
+                kv_cache=dense_tensor_format(kv_dtype),
+            )
+            for q_dtype, kv_dtype in (
+                (torch.bfloat16, torch.float8_e4m3fn),
+                (torch.bfloat16, torch.float8_e5m2),
+            )
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "q_len": frozenset({1}),
+            "num_q_heads": frozenset(range(1, 17)),
+            "page_size": frozenset({64}),
+            "kv_lora_rank": frozenset({512}),
+            "qk_rope_head_dim": frozenset({64}),
+            "support_logit_cap": frozenset({False}),
+            "return_lse": frozenset({False, True}),
+        },
+    )
+    def gluon_mla_decode_bf16xfp8_gfx950_bh16bn128(*args, **kwargs):
+        return _mla_decode_bf16xfp8_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "mla_decode_with_kvcache",
+        name="gluon_mla_decode_fp8xfp8_gfx950_bh16bn128",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    q=dense_tensor_format(torch.float8_e4m3fn),
+                    kv_cache=dense_tensor_format(torch.float8_e4m3fn),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "q_len": frozenset({1}),
+            "num_q_heads": frozenset(range(1, 17)),
+            "page_size": frozenset({64}),
+            "kv_lora_rank": frozenset({512}),
+            "qk_rope_head_dim": frozenset({64}),
+            "support_logit_cap": frozenset({False}),
+            "return_lse": frozenset({False, True}),
+        },
+    )
+    def gluon_mla_decode_fp8xfp8_gfx950_bh16bn128(*args, **kwargs):
+        return _mla_decode_fp8xfp8_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "mla_decode_with_kvcache",
+        name="gluon_mla_decode_bf16xbf16_gfx950_bh64",
         solution="gluon",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 5),
@@ -264,8 +336,8 @@ if current_platform().is_amd:
             "return_lse": frozenset({False, True}),
         },
     )
-    def gluon_mla_decode_bf16_gfx950_bh64(*args, **kwargs):
-        return _mla_decode_impl(*args, **kwargs)
+    def gluon_mla_decode_bf16xbf16_gfx950_bh64(*args, **kwargs):
+        return _mla_decode_bf16xbf16_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",
@@ -346,6 +418,7 @@ if current_platform().is_amd:
         traits={
             "head_dim": frozenset({128}),
             "topk": frozenset({512, 1024, 2048}),
+            "page_size": frozenset({64}),
             "index_k_format": frozenset({"fp8_scaled"}),
         },
     )

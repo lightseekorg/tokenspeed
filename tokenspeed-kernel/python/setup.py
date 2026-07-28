@@ -317,20 +317,18 @@ KERNEL_GROUPS = [
         [],
     ),
     (
+        "minimax_m3_fused",
+        [
+            CUDA_CSRC_DIR / "fused_minimax_m3_qknorm_rope_kv_insert.cu",
+        ],
+        [],
+    ),
+    (
         "dsv3_gemm",
         [
             CUDA_CSRC_DIR / "dsv3_router_gemm_float_out.cu",
             CUDA_CSRC_DIR / "dsv3_router_gemm.cu",
             CUDA_CSRC_DIR / "dsv3_router_gemm_binding.cu",
-        ],
-        ["-lcublas", "-lcublasLt"],
-    ),
-    (
-        "fp32_router_gemm",
-        [
-            CUDA_CSRC_DIR / "fp32_router_gemm.cu",
-            CUDA_CSRC_DIR / "fp32_router_gemm_entry.cu",
-            CUDA_CSRC_DIR / "fp32_router_gemm_binding.cu",
         ],
         ["-lcublas", "-lcublasLt"],
     ),
@@ -435,6 +433,14 @@ KERNEL_GROUPS = [
             CUDA_CSRC_DIR / "trtllm_reducescatter_fusion.cu",
             CUDA_CSRC_DIR / "trtllm_allgather_fusion.cu",
             CUDA_CSRC_DIR / "minimax_reduce_rms.cu",
+        ],
+        [],
+    ),
+    (
+        "attn_res",
+        [
+            CUDA_CSRC_DIR / "attn_res" / "attn_res_fwd_tma.cu",
+            CUDA_CSRC_DIR / "attn_res_binding.cu",
         ],
         [],
     ),

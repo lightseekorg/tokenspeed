@@ -30,6 +30,12 @@ import numpy.typing as npt
 import requests
 
 from tokenspeed.runtime.pd.base.status import TransferPoll
+from tokenspeed.runtime.pd.flatkv import (
+    FlatKVPDPageManifest,
+    flatkv_manifest_page_ids,
+    validate_flatkv_manifest_pair,
+    validate_flatkv_peer_layout,
+)
 from tokenspeed.runtime.pd.mooncake.conn import MooncakeKVManagerBase
 from tokenspeed.runtime.pd.mooncake.entities import (
     KVArgs,
@@ -248,6 +254,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         kv_chunk: TransferKVChunk,
         req: TransferInfo,
     ) -> TransferIndexResolution:
+        self._validate_flat_transfer(kv_chunk, req)
         src_indices = kv_chunk.prefill_kv_indices
         dst_indices = req.dst_kv_indices[kv_chunk.index_slice]
 
@@ -342,6 +349,69 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             dst_indices=dst_local,
         )
 
+    def _validate_flat_transfer(
+        self,
+        kv_chunk: TransferKVChunk,
+        req: TransferInfo,
+    ) -> None:
+        layout = getattr(self.kv_args, "flat_layout", None)
+        flat_metadata_present = any(
+            value is not None
+            for value in (
+                kv_chunk.flat_manifest,
+                req.flat_manifest,
+                req.flat_peer_layout,
+            )
+        )
+        if layout is None:
+            if flat_metadata_present:
+                raise ValueError("legacy Mooncake transfer received FlatKV metadata")
+            return
+
+        if (
+            kv_chunk.flat_manifest is None
+            or req.flat_manifest is None
+            or req.flat_peer_layout is None
+        ):
+            raise ValueError("FlatKV transfer is missing layout or manifest metadata")
+        if req.transfer_fragments:
+            raise ValueError("FlatKV raw-slab transfer requires an identity TP route")
+        if not kv_chunk.is_last:
+            raise ValueError("FlatKV transfer must be submitted as one final chunk")
+        if kv_chunk.index_slice.start not in (
+            None,
+            0,
+        ) or kv_chunk.index_slice.step not in (
+            None,
+            1,
+        ):
+            raise ValueError("FlatKV transfer page vector must start at offset zero")
+
+        validate_flatkv_peer_layout(layout, req.flat_peer_layout)
+        validate_flatkv_manifest_pair(
+            kv_chunk.flat_manifest,
+            req.flat_manifest,
+            layout,
+            dst_num_pages_with_null=req.flat_peer_layout.num_pages_with_null,
+        )
+        expected_src = flatkv_manifest_page_ids(
+            kv_chunk.flat_manifest,
+            layout=layout,
+            peer="source",
+        )
+        expected_dst = flatkv_manifest_page_ids(
+            req.flat_manifest,
+            layout=layout,
+            num_pages_with_null=req.flat_peer_layout.num_pages_with_null,
+            peer="destination",
+        )
+        actual_src = tuple(int(page) for page in kv_chunk.prefill_kv_indices)
+        actual_dst = tuple(int(page) for page in req.dst_kv_indices)
+        if actual_src != expected_src or actual_dst != expected_dst:
+            raise ValueError("FlatKV manifest and Mooncake page vector disagree")
+        if kv_chunk.index_slice.stop != len(expected_src):
+            raise ValueError("FlatKV transfer page slice is incomplete")
+
     def _transfer_data(self, mooncake_session_id, transfer_blocks):
         if not transfer_blocks:
             return 0
@@ -359,7 +429,37 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         dst_kv_indices: npt.NDArray[np.int64],
         executor: concurrent.futures.ThreadPoolExecutor,
         transfer_fragments: tuple[TransferFragment, ...] = (),
+        src_flat_manifest: FlatKVPDPageManifest | None = None,
+        dst_flat_manifest: FlatKVPDPageManifest | None = None,
+        dst_flat_num_pages_with_null: int | None = None,
     ):
+        if (src_flat_manifest is None) != (dst_flat_manifest is None):
+            raise ValueError(
+                "FlatKV transfer requires both source and destination manifests"
+            )
+        if src_flat_manifest is not None:
+            if dst_flat_manifest is None:
+                raise ValueError(
+                    "FlatKV transfer requires both source and destination manifests"
+                )
+            if dst_flat_num_pages_with_null is None:
+                raise ValueError("FlatKV transfer requires destination capacity")
+            if transfer_fragments:
+                raise ValueError(
+                    "FlatKV raw-slab transfer cannot use TP transfer fragments"
+                )
+            transfer_blocks = self._flat_transfer_blocks(
+                dst_ptrs=dst_kv_ptrs,
+                src_indices=prefill_kv_indices,
+                dst_indices=dst_kv_indices,
+                src_manifest=src_flat_manifest,
+                dst_manifest=dst_flat_manifest,
+                dst_num_pages_with_null=dst_flat_num_pages_with_null,
+            )
+            return self._transfer_data(mooncake_session_id, transfer_blocks)
+        if dst_flat_num_pages_with_null is not None:
+            raise ValueError("legacy Mooncake transfer received FlatKV capacity")
+
         # Group by indices
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_kv_indices, dst_kv_indices
@@ -382,6 +482,65 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             transfer_fragments=transfer_fragments,
         )
         return self._transfer_data(mooncake_session_id, transfer_blocks)
+
+    def _flat_transfer_blocks(
+        self,
+        *,
+        dst_ptrs: list[int],
+        src_indices: npt.NDArray[np.int64],
+        dst_indices: npt.NDArray[np.int64],
+        src_manifest: FlatKVPDPageManifest,
+        dst_manifest: FlatKVPDPageManifest,
+        dst_num_pages_with_null: int,
+    ) -> list[tuple[int, int, int]]:
+        layout = self.kv_args.flat_layout
+        if layout is None:
+            raise ValueError("legacy Mooncake transfer received FlatKV manifests")
+        validate_flatkv_manifest_pair(
+            src_manifest,
+            dst_manifest,
+            layout,
+            dst_num_pages_with_null=dst_num_pages_with_null,
+        )
+
+        transfer_blocks = []
+        page_offset = 0
+        for layout_group, src_group, dst_group in zip(
+            layout.groups,
+            src_manifest.groups,
+            dst_manifest.groups,
+            strict=True,
+        ):
+            page_count = len(src_group.page_ids)
+            group_src_indices = src_indices[page_offset : page_offset + page_count]
+            group_dst_indices = dst_indices[page_offset : page_offset + page_count]
+            if (
+                tuple(int(page) for page in group_src_indices) != src_group.page_ids
+                or tuple(int(page) for page in group_dst_indices) != dst_group.page_ids
+            ):
+                raise ValueError("FlatKV manifest and Mooncake page vector disagree")
+            src_blocks, dst_blocks = group_concurrent_contiguous(
+                group_src_indices, group_dst_indices
+            )
+            for physical_slot in layout_group.physical_slots:
+                src_ptr = self.kv_args.kv_data_ptrs[physical_slot]
+                dst_ptr = dst_ptrs[physical_slot]
+                item_len = self.kv_args.kv_item_lens[physical_slot]
+                if item_len != layout.physical_page_bytes:
+                    raise ValueError("FlatKV Mooncake page size disagrees with layout")
+                for src_block, dst_block in zip(src_blocks, dst_blocks, strict=True):
+                    transfer_blocks.append(
+                        (
+                            src_ptr + int(src_block[0]) * item_len,
+                            dst_ptr + int(dst_block[0]) * item_len,
+                            len(src_block) * item_len,
+                        )
+                    )
+            page_offset += page_count
+
+        if page_offset != len(src_indices) or page_offset != len(dst_indices):
+            raise ValueError("FlatKV transfer page vector has trailing entries")
+        return transfer_blocks
 
     def _layer_transfer_blocks(
         self,
@@ -707,13 +866,23 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         self.update_status(room, TransferPoll.Failed)
         for req in list(self.transfer_infos.get(room, {}).values()):
             if not req.is_dummy:
-                self.sync_status_to_decode_endpoint(
-                    req.endpoint,
-                    req.dst_port,
-                    req.room,
-                    TransferPoll.Failed,
-                    self.attn_tp_rank,
-                )
+                try:
+                    self.sync_status_to_decode_endpoint(
+                        req.endpoint,
+                        req.dst_port,
+                        req.room,
+                        TransferPoll.Failed,
+                        self.attn_tp_rank,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to notify Decode about room-level transfer "
+                        "failure (room=%s endpoint=%s:%s)",
+                        room,
+                        req.endpoint,
+                        req.dst_port,
+                    )
+        self.transfer_infos.pop(room, None)
 
     def transfer_worker(
         self, queue: FastQueue, executor: concurrent.futures.ThreadPoolExecutor
@@ -757,7 +926,18 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                                     self.attn_tp_rank,
                                 )
                                 break
-                        resolved = self.resolve_transfer_indices(kv_chunk, req)
+                        try:
+                            resolved = self.resolve_transfer_indices(kv_chunk, req)
+                        except ValueError as exc:
+                            logger.exception(
+                                "Rejecting malformed transfer metadata for room=%s",
+                                kv_chunk.room,
+                            )
+                            self.abort_room(
+                                kv_chunk.room,
+                                f"invalid transfer metadata: {exc}",
+                            )
+                            break
 
                         logger.debug(
                             "[TRANSFER_WORKER] Calling send_kvcache for room %s, session %s",
@@ -780,6 +960,13 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                                 resolved.dst_indices,
                                 executor,
                                 req.transfer_fragments,
+                                src_flat_manifest=kv_chunk.flat_manifest,
+                                dst_flat_manifest=req.flat_manifest,
+                                dst_flat_num_pages_with_null=(
+                                    req.flat_peer_layout.num_pages_with_null
+                                    if req.flat_peer_layout is not None
+                                    else None
+                                ),
                             )
                         else:
                             ret = self.send_kvcache_layerwise(
@@ -993,6 +1180,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         wait_for_bootstrap_token: bool = False,
         mamba_indices: npt.NDArray[np.int64] | None = None,
         spec_candidate_ids: list[int] | None = None,
+        flat_manifest: FlatKVPDPageManifest | None = None,
     ):
         if self.disaggregation_mode != DisaggregationMode.PREFILL:
             raise RuntimeError("Transfer requests can only be added in prefill mode.")
@@ -1034,6 +1222,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 wait_for_bootstrap_token=wait_for_bootstrap_token,
                 prefill_mamba_indices=mamba_indices,
                 spec_candidate_ids=spec_candidate_ids,
+                flat_manifest=flat_manifest,
             )
         )
 
@@ -1078,6 +1267,10 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             "state_item_lens": self.kv_args.state_item_lens,
             "state_unit_lens": getattr(self.kv_args, "state_unit_lens", []),
         }
+        if self.kv_args.flat_layout is not None:
+            payload["flat_layout"] = (
+                self.kv_args.flat_layout.peer.to_wire_bytes().decode("ascii")
+            )
 
         try:
             response = requests.put(url, json=payload, timeout=5)

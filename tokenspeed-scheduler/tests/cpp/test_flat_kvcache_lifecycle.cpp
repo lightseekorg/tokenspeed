@@ -25,7 +25,9 @@
 #if TOKENSPEED_FLAT_KVCACHE
 
 #include <algorithm>
+#include <array>
 #include <optional>
+#include <set>
 
 #include "integration_test_helper.h"
 
@@ -64,13 +66,6 @@ protected:
 
         cfg.paged_cache_groups = {full_grp, swa_grp};
         return cfg;
-    }
-
-    static const FlatForwardOperation* FindFlatOp(const ExecutionPlan& plan) {
-        for (const auto& op : plan.Operations()) {
-            if (const auto* f = std::get_if<FlatForwardOperation>(&op)) return f;
-        }
-        return nullptr;
     }
 };
 
@@ -179,20 +174,11 @@ TEST_F(FlatKvCacheLifecycleTestSuite, TwoRequests_BatchedFlatBlockTables) {
                          std::any_of(full.at(1).begin(), full.at(1).end(), [](std::int32_t id) { return id == -1; });
     EXPECT_TRUE(any_pad) << "unequal prompt lengths should force -1 padding in one full row";
 
-    auto assert_no_page_collision = [](const std::vector<std::vector<std::int32_t>>& group) {
-        std::vector<std::int32_t> real;
-        for (const auto& row : group) {
-            for (std::int32_t id : row) {
-                if (id > 0) real.push_back(id);
-            }
-        }
-        std::vector<std::int32_t> sorted = real;
-        std::sort(sorted.begin(), sorted.end());
-        EXPECT_EQ(std::adjacent_find(sorted.begin(), sorted.end()), sorted.end())
-            << "two requests must not be handed the same physical page";
-    };
-    assert_no_page_collision(full);
-    assert_no_page_collision(swa);
+    // Two requests must not be handed the same physical page within a group.
+    std::set<std::int32_t> full_pages;
+    CollectDisjointRealPages(full, full_pages, "full");
+    std::set<std::int32_t> swa_pages;
+    CollectDisjointRealPages(swa, swa_pages, "swa");
 
     SendForwardDone("r1", {42});
     SendForwardDone("r2", {142});
@@ -201,6 +187,74 @@ TEST_F(FlatKvCacheLifecycleTestSuite, TwoRequests_BatchedFlatBlockTables) {
     PlanOnce();
     EXPECT_EQ(scheduler_->DecodingSize(), 0u);
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
+}
+
+// FlatKimiFourGroupSuite (integration_test_helper.h) is shared with the
+// four-group scenario tests in test_flat_kvcache_scenarios.cpp.
+
+TEST_F(FlatKimiFourGroupSuite, FourTablesUseDisjointGlobalPages) {
+    const std::size_t before = scheduler_->AvailableKvPages();
+    ASSERT_EQ(before, 32u);
+    Submit(MakeRequestSpec("r1", /*num_pages=*/2));
+    ExecutionPlan plan = PlanOnce();
+    const FlatForwardOperation* op = FindFlatOp(plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->flat_block_tables.size(), GroupIds().size());
+
+    std::set<std::int32_t> all_real;
+    std::size_t fresh_positive_entries = 0;
+    for (const auto& group_id : GroupIds()) {
+        ASSERT_EQ(op->flat_block_tables.count(group_id), 1u) << group_id;
+        ASSERT_EQ(op->flat_block_tables.at(group_id).size(), 1u) << group_id;
+        const std::size_t group_entries =
+            CollectDisjointRealPages(op->flat_block_tables.at(group_id), all_real, group_id);
+        EXPECT_GT(group_entries, 0u) << group_id;
+        fresh_positive_entries += group_entries;
+    }
+    EXPECT_EQ(all_real.size(), fresh_positive_entries);
+    EXPECT_EQ(std::set<std::int32_t>(plan.flat_page_ids_to_zero.begin(), plan.flat_page_ids_to_zero.end()), all_real)
+        << "every freshly-owned physical page must be sanitized before forward";
+
+    AbortRequest("r1");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->AvailableKvPages(), before);
+}
+
+TEST_F(FlatKimiFourGroupSuite, FinishAndAbortRestoreAllUsablePages) {
+    const std::size_t before = scheduler_->AvailableKvPages();
+    ASSERT_EQ(before, 32u);
+
+    Submit(MakeRequestSpec("finished", /*num_pages=*/2));
+    ASSERT_NE(FindFlatOp(PlanOnce()), nullptr);
+    SendForwardDone("finished", {42});
+    SendFinish("finished");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->AvailableKvPages(), before);
+
+    Submit(MakeRequestSpec("aborted", /*num_pages=*/2, /*start=*/101));
+    ASSERT_NE(FindFlatOp(PlanOnce()), nullptr);
+    AbortRequest("aborted");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->AvailableKvPages(), before);
+}
+
+TEST_F(FlatKimiFourGroupSuite, OomDoesNotPartiallyCommitTables) {
+    const std::size_t before = scheduler_->AvailableKvPages();
+    ASSERT_EQ(before, 32u);
+    Submit(MakeRequestSpec("oom", /*num_pages=*/8));
+
+    for (int round = 0; round < 3; ++round) {
+        ExecutionPlan deferred = PlanOnce();
+        const FlatForwardOperation* op = FindFlatOp(deferred);
+        ASSERT_NE(op, nullptr);
+        EXPECT_TRUE(op->request_ids.empty()) << "round " << round;
+        for (const auto& [group_id, table] : op->flat_block_tables) {
+            EXPECT_TRUE(table.empty()) << group_id << " round " << round;
+        }
+        EXPECT_TRUE(deferred.flat_oom_request_ids.empty()) << "round " << round;
+        EXPECT_EQ(scheduler_->AvailableKvPages(), before) << "round " << round;
+    }
+    EXPECT_EQ(scheduler_->WaitingSize(), 1u);
 }
 
 }  // namespace tokenspeed::test

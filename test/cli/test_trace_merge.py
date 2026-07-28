@@ -117,6 +117,36 @@ def _proton_trace() -> dict:
     }
 
 
+def _add_viztracer_proton_flow(report: dict, scope_id: int) -> None:
+    report["traceEvents"].append(
+        {
+            "ph": "s",
+            "ts": 99.0,
+            "pid": 4242,
+            "tid": 4242,
+            "name": "viztracer->proton",
+            "cat": "tokenspeed.proton",
+            "id": scope_id,
+            "bp": "e",
+        }
+    )
+
+
+def _add_proton_cpu_scope(trace: dict, scope_id: int) -> None:
+    trace["traceEvents"].append(
+        {
+            "ph": "X",
+            "ts": 20.0,
+            "dur": 5.0,
+            "pid": 0,
+            "tid": 1,
+            "name": "gemm.mm",
+            "cat": "scope",
+            "args": {"scope_id": scope_id},
+        }
+    )
+
+
 def _write(tmp_path, name: str, payload: dict) -> str:
     path = tmp_path / name
     path.write_text(json.dumps(payload))
@@ -152,6 +182,35 @@ def test_merge_shifts_proton_events_onto_viztracer_axis(tmp_path):
     flow_ts = sorted(e["ts"] for e in events if e.get("cat") == "flow")
     assert flow_ts == [8.0 + EXPECTED_OFFSET_US, 10.0 + EXPECTED_OFFSET_US]
     assert {e["id"] for e in events if e.get("cat") == "flow"} == {1}
+
+
+def test_merge_links_viztracer_flow_to_matching_proton_cpu_scope(tmp_path):
+    scope_id = 42
+    report = _viztracer_report()
+    trace = _proton_trace()
+    _add_viztracer_proton_flow(report, scope_id)
+    _add_proton_cpu_scope(trace, scope_id)
+    viztracer_path = _write(tmp_path, "run.viztracer.json", report)
+    proton_path = _write(tmp_path, "run.proton.chrome_trace", trace)
+    output_path = tmp_path / "merged.json"
+
+    merge_proton_viztracer(viztracer_path, proton_path, output_path)
+
+    events = json.loads(output_path.read_text())["traceEvents"]
+    flow_events = [
+        event for event in events if event.get("name") == "viztracer->proton"
+    ]
+    assert len(flow_events) == 2
+    starts = [event for event in flow_events if event["ph"] == "s"]
+    finishes = [event for event in flow_events if event["ph"] == "f"]
+    assert len(starts) == len(finishes) == 1
+    assert starts[0]["id"] == finishes[0]["id"] == (1 << 52) | scope_id
+    assert starts[0]["ts"] == 99.0
+    assert (finishes[0]["ts"], finishes[0]["pid"], finishes[0]["tid"]) == (
+        20.0 + EXPECTED_OFFSET_US,
+        0,
+        1,
+    )
 
 
 def test_merge_rejects_viztracer_report_without_anchor(tmp_path):
@@ -267,6 +326,45 @@ def test_merge_all_ranks_aligns_timelines_and_namespaces_flow_ids(tmp_path):
         (1 << 32) | 1,
     }
     assert all(isinstance(event["id"], int) for event in flow_events)
+
+
+def test_merge_all_ranks_namespaces_viztracer_proton_flows(tmp_path):
+    scope_id = 42
+    rank0_report = _rank_viztracer_report(base_time_ns=VIZTRACER_BASE_NS, pid=4242)
+    rank0_trace = _rank_proton_trace(base_time_ns=PROTON_BASE_NS)
+    _add_viztracer_proton_flow(rank0_report, scope_id)
+    _add_proton_cpu_scope(rank0_trace, scope_id)
+    rank0_viz = _write(tmp_path, "run-TP0.viztracer.json", rank0_report)
+    rank0_proton = _write(tmp_path, "run-TP0.proton.chrome_trace", rank0_trace)
+
+    rank1_report = _rank_viztracer_report(base_time_ns=VIZTRACER_BASE_NS, pid=4243)
+    rank1_trace = _rank_proton_trace(base_time_ns=PROTON_BASE_NS)
+    _add_viztracer_proton_flow(rank1_report, scope_id)
+    _add_proton_cpu_scope(rank1_trace, scope_id)
+    rank1_viz = _write(tmp_path, "run-TP1.viztracer.json", rank1_report)
+    rank1_proton = _write(tmp_path, "run-TP1.proton.chrome_trace", rank1_trace)
+
+    output_path = tmp_path / "all-ranks.json"
+    merge_all_ranks(
+        [(0, rank0_viz, rank0_proton), (1, rank1_viz, rank1_proton)],
+        output_path,
+    )
+
+    events = json.loads(output_path.read_text())["traceEvents"]
+    flow_events = [
+        event for event in events if event.get("name") == "viztracer->proton"
+    ]
+    starts = [event for event in flow_events if event["ph"] == "s"]
+    finishes = [event for event in flow_events if event["ph"] == "f"]
+    assert {event["id"] for event in starts} == {
+        (1 << 52) | scope_id,
+        (1 << 52) | (1 << 32) | scope_id,
+    }
+    assert {event["id"] for event in finishes} == {event["id"] for event in starts}
+    assert {(event["pid"], event["id"]) for event in finishes} == {
+        (10000, (1 << 52) | scope_id),
+        (10001, (1 << 52) | (1 << 32) | scope_id),
+    }
 
 
 def test_all_ranks_cli_merges_explicit_rank_triples(tmp_path, capsys):

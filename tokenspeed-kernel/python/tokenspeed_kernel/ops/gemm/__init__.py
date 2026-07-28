@@ -30,6 +30,15 @@ import tokenspeed_kernel.ops.gemm.gluon  # noqa: F401
 import tokenspeed_kernel.ops.gemm.triton  # noqa: F401
 import tokenspeed_kernel.ops.gemm.trtllm  # noqa: F401
 import torch
+from tokenspeed_kernel.ops.gemm.kimi3 import (
+    kimi3_latent_projection,
+    kimi3_latent_projection_add3,
+    kimi3_mla_qkv_gate_projection,
+    kimi3_qkvfab_projection,
+    kimi3_router_projection,
+    kimi3_shared_down_projection,
+    kimi3_shared_situ_projection,
+)
 from tokenspeed_kernel.platform import ArchVersion, Platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
@@ -43,7 +52,17 @@ from tokenspeed_kernel.signature import (
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["bmm", "mm"]
+__all__ = [
+    "bmm",
+    "kimi3_latent_projection",
+    "kimi3_mla_qkv_gate_projection",
+    "kimi3_latent_projection_add3",
+    "kimi3_qkvfab_projection",
+    "kimi3_router_projection",
+    "kimi3_shared_down_projection",
+    "kimi3_shared_situ_projection",
+    "mm",
+]
 
 _platform = Platform.get()
 _fp8_dtype = _platform.fp8e4m3fn.dtype
@@ -164,11 +183,16 @@ def _online_quantize_mxfp8(
     A: torch.Tensor,
     block_size: list[int],
     kernel_name: str,
+    enable_pdl: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Perform online activation quantization for mxfp8 block-scaled GEMM.
 
     The quantization approach is chosen based on the selected kernel's
     name because different backends require different scale layouts.
+
+    Args:
+        enable_pdl: Request Programmatic Dependent Launch for the quantize
+            kernel. Only the flashinfer path honors it; other backends ignore it.
     """
     block_k = block_size[1]
 
@@ -177,7 +201,7 @@ def _online_quantize_mxfp8(
 
         # True = F8_128x4 swizzled scales (the bool form predates the
         # SfLayout enum overload and works on flashinfer 0.6.15).
-        return mxfp8_quantize(A, is_sf_swizzled_layout=True)
+        return mxfp8_quantize(A, is_sf_swizzled_layout=True, enable_pdl=enable_pdl)
 
     if kernel_name == "triton_mm_fp8_blockscale" and block_k == 32:
         from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
@@ -393,7 +417,9 @@ def mm(
         assert (
             block_size is not None
         ), "block_size is required for online activation quantization"
-        A, A_scales = _online_quantize_mxfp8(A, block_size, kernel.name)
+        A, A_scales = _online_quantize_mxfp8(
+            A, block_size, kernel.name, enable_pdl=enable_pdl
+        )
 
     kernel_args = (A, B, A_scales, B_scales, out_dtype)
     kernel_kwargs: dict[str, object] = {
@@ -540,7 +566,9 @@ def bmm(
         assert (
             block_size is not None
         ), "block_size is required for online activation quantization"
-        A, A_scales = _online_quantize_mxfp8(A, block_size, kernel.name)
+        A, A_scales = _online_quantize_mxfp8(
+            A, block_size, kernel.name, enable_pdl=enable_pdl
+        )
 
     kernel_args = (A, B, A_scales, B_scales, out_dtype)
     kernel_kwargs: dict[str, object] = {

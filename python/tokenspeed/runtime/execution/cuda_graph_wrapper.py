@@ -523,6 +523,77 @@ class CudaGraphWrapper:
 
         return graph, out
 
+    def prewarm_comm_states(self, batch_sizes: tuple[int, ...] = (1,)) -> None:
+        """Initialize lazy comm state with capture-style dummy forwards."""
+        if self._forward_func is None:
+            return
+
+        global _is_cuda_graph_phase
+        old_cuda_graph_phase = _is_cuda_graph_phase
+        _is_cuda_graph_phase = True
+        try:
+            for bs in batch_sizes:
+                ctx = ForwardContext(
+                    attn_backend=self.attn_backend,
+                    token_to_kv_pool=self.token_to_kv_pool,
+                    bs=bs,
+                    num_extends=0,
+                    input_num_tokens=bs * self.max_tokens_per_req,
+                    forward_mode=ForwardMode.DECODE,
+                    capture_hidden_mode=(
+                        CaptureHiddenMode.FULL
+                        if self.drafter is not None
+                        else CaptureHiddenMode.NULL
+                    ),
+                )
+                if self.dp_size > 1:
+                    ctx.global_num_tokens = [
+                        bs * self.max_tokens_per_req
+                    ] * self.world_size
+                    ctx.global_bs = [bs] * self.world_size
+
+                sampling_info = SamplingBatchInfo(
+                    req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
+                    valid_cache_lengths=(
+                        self.runtime_states.valid_cache_lengths
+                        if self.runtime_states is not None
+                        else None
+                    ),
+                    is_all_greedy=False,
+                    vocab_size=self.vocab_size,
+                    device=self.device,
+                )
+
+                from tokenspeed.runtime.grammar.capturable_grammar import (
+                    bind_grammar_mask_buf,
+                )
+
+                bind_grammar_mask_buf(
+                    sampling_info,
+                    self.eager_grammar_buffers,
+                    bs,
+                    spec=self.drafter is not None,
+                    capturable=self.capturable_grammar,
+                    grammar_backend=self.grammar_backend,
+                )
+
+                torch.cuda.synchronize()
+                dist.barrier()
+                self._prepare_sampling_capture(
+                    bs=bs,
+                    variant=CUDA_GRAPH_VARIANT_DEFAULT,
+                )
+                self.input_buffers.seq_lens_buf[:bs].fill_(self.max_tokens_per_req)
+                self._init_capture_metadata(bs)
+                self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
+                torch.cuda.synchronize()
+                dist.barrier()
+
+                if self.sampling_backend is not None:
+                    self.sampling_backend.reset_capture_state()
+        finally:
+            _is_cuda_graph_phase = old_cuda_graph_phase
+
     def _capture_paged_cache_block_tables(self, bs: int, pool) -> dict | None:
         specs = tuple(pool.paged_cache_group_specs)
         if not specs:
@@ -1016,6 +1087,8 @@ class CudaGraphWrapper:
         paged_cache_block_tables: dict | None = None,
         paged_cache_block_table_base_offsets: dict | None = None,
         flat_block_tables: dict | None = None,
+        flat_cache_metadata=None,
+        flat_cache_forward_op=None,
     ):
         """
         Unified forward entry point.
@@ -1075,6 +1148,18 @@ class CudaGraphWrapper:
         if mamba_track_pool_indices is not None:
             mamba_kwargs["mamba_track_pool_indices"] = mamba_track_pool_indices
 
+        # MLA/KDA backends build their eager metadata from the FlatKV contract
+        # and refresh their captured decode buffers from it during replay.
+        # Thread it only when present so non-contract paths remain unchanged.
+        flat_kwargs = (
+            {
+                "flat_cache_metadata": flat_cache_metadata,
+                "flat_cache_forward_op": flat_cache_forward_op,
+            }
+            if flat_cache_metadata is not None
+            else {}
+        )
+
         if use_graph:
             if (
                 bs == 0
@@ -1106,6 +1191,7 @@ class CudaGraphWrapper:
                     paged_cache_block_table_base_offsets
                 ),
                 flat_block_tables=flat_block_tables,
+                **flat_kwargs,
                 **mamba_kwargs,
             )
 
@@ -1192,6 +1278,7 @@ class CudaGraphWrapper:
                     if self.attn_backend.uses_flat_cache_groups
                     else None
                 ),
+                **flat_kwargs,
                 **mamba_kwargs,
             )
 

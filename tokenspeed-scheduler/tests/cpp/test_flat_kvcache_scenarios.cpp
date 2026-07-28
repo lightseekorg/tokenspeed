@@ -38,13 +38,6 @@ namespace tokenspeed::test {
 
 namespace {
 
-const FlatForwardOperation* FindFlatOp(const ExecutionPlan& plan) {
-    for (const auto& op : plan.Operations()) {
-        if (const auto* f = std::get_if<FlatForwardOperation>(&op)) return f;
-    }
-    return nullptr;
-}
-
 PagedCacheGroupConfig MakeGroup(const std::string& id, std::int32_t block_size, std::int32_t total_pages,
                                 PagedCacheGroupConfig::Retention retention, PagedCacheGroupFamily family,
                                 std::int32_t sliding_window_tokens = 0) {

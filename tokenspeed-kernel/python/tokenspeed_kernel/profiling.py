@@ -188,6 +188,47 @@ class _NoopScope:
 
 _NOOP_SCOPE = _NoopScope()
 _BOOTSTRAPPED = False
+_VIZTRACER_PROTON_FLOW_NAME = "viztracer->proton"
+_VIZTRACER_PROTON_FLOW_CATEGORY = "tokenspeed.proton"
+
+
+def _active_viztracer():
+    """Return the active process-local VizTracer instance, if any."""
+    try:
+        from viztracer import get_tracer
+    except ImportError:
+        return None
+
+    tracer = get_tracer()
+    return tracer if tracer is not None and tracer.enable else None
+
+
+class _VizTracerProtonScope:
+    """Emit a VizTracer flow start immediately before a Proton CPU scope."""
+
+    def __init__(self, scope: Any) -> None:
+        self._scope = scope
+
+    def __enter__(self) -> Any:
+        tracer = _active_viztracer()
+        timestamp = tracer.getts() if tracer is not None else None
+        entered_scope = self._scope.__enter__()
+        scope_id = getattr(self._scope, "id", None)
+        if tracer is not None and scope_id is not None:
+            tracer.add_raw(
+                {
+                    "name": _VIZTRACER_PROTON_FLOW_NAME,
+                    "cat": _VIZTRACER_PROTON_FLOW_CATEGORY,
+                    "ph": "s",
+                    "ts": timestamp,
+                    "id": scope_id,
+                    "bp": "e",
+                }
+            )
+        return entered_scope
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> Any:
+        return self._scope.__exit__(exc_type, exc_value, traceback)
 
 
 def _proton_metrics(metrics: dict[str, object]) -> dict[str, object]:
@@ -344,7 +385,7 @@ def kernel_scope(
 
     name = f"{family}.{mode}[{kernel_name}]" if kernel_name else f"{family}.{mode}"
     scope_metrics = _proton_metrics(metrics)
-    return proton.scope(name, metrics=scope_metrics)
+    return _VizTracerProtonScope(proton.scope(name, metrics=scope_metrics))
 
 
 def _atexit_stop_profiling() -> None:

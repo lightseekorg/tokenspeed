@@ -26,6 +26,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from tokenspeed_kernel.ops.communication import triton as triton_communication
 from tokenspeed_kernel.ops.communication.triton import (
     all_gather,
     all_reduce,
@@ -41,6 +42,33 @@ def get_open_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("", 0))
         return sock.getsockname()[1]
+
+
+def test_alloc_symm_escapes_inference_mode(monkeypatch):
+    process_group = object()
+    handle = object()
+
+    def fake_empty(shape, *, dtype, device):
+        assert not torch.is_inference_mode_enabled()
+        assert not torch.is_grad_enabled()
+        return torch.empty(shape, dtype=dtype, device=device)
+
+    def fake_rendezvous(tensor, *, group):
+        assert tensor.shape == (2, 3)
+        assert group is process_group
+        return handle
+
+    monkeypatch.setattr(triton_communication.symm_mem, "empty", fake_empty)
+    monkeypatch.setattr(triton_communication.symm_mem, "rendezvous", fake_rendezvous)
+
+    with torch.inference_mode():
+        tensor, result_handle = triton_communication._alloc_symm(
+            (2, 3), torch.float32, torch.device("cpu"), process_group
+        )
+
+    assert not tensor.is_inference()
+    assert result_handle is handle
+    tensor.copy_(torch.ones_like(tensor))
 
 
 def token_cases(world_size: int) -> List[List[int]]:
