@@ -65,6 +65,14 @@ variable in GitHub Actions (`Settings` -> `Secrets and variables` -> `Actions`
 -> `Variables`) to a non-empty runner family, such as `b200`, to override the
 default without editing task YAML.
 
+Only `b200v2-*` jobs enable a persistent, node-local package cache. They reuse
+pip downloads from `/raid/cache/pip` and explicitly downloaded release wheels
+from `/raid/cache/wheelhouse`; when `FLASHINFER_CACHE_DIR` points elsewhere,
+the two directories are created beside that cache instead. This survives
+runner pod recreation and avoids downloading the same large wheels again on
+that node. Other runner families keep their existing cache behavior because
+their cluster storage layouts may differ.
+
 To enable `push` and `workflow_dispatch` runs of the three PR test workflows
 outside the official repository, set the `TOKENSPEED_CI_REPOSITORY` repository
 variable at the same settings path to the configured repository's exact
