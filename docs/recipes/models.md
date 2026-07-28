@@ -220,6 +220,16 @@ Plain TP8 (drop `--ep-size 8`) works too. The fused MoE path needs a
 Blackwell GPU (B200/B300); on other NVIDIA platforms use
 `--moe-backend triton`.
 
+On plain TP8/TP16 (no expert parallelism), short decode batches take a
+multicast latent-MoE tail inside the decode CUDA graphs: one kernel fuses the
+latent all-reduce, RMSNorm, and the shared-expert reduce-scatter; the latent
+up-projection then runs sharded per rank (1/tp of the weight traffic) and
+multicast-stores its shard into every rank's mailbox (NVLS via PyTorch
+symmetric memory), gathered barrier-free. This is worth ~0.6 ms per decode
+step at bs1 on 8x B300 (~95 -> ~100 tok/s). It engages automatically when
+supported (SM100-family, bf16, NVLS available); set
+`TOKENSPEED_K3_MULTICAST_TAIL=0` to fall back to the fused-AR tail.
+
 ### AMD
 
 The standard AMD path on 8x gfx950 uses the `mla` backend. For TP8/EP8,
