@@ -20,12 +20,27 @@
 
 #pragma once
 
+#include <cstdint>
+#include <string>
 #include <variant>
 #include <vector>
 
 #include "scheduler/operations/inc.h"
 
 namespace tokenspeed {
+
+enum class FlatTerminalReason {
+    kPromptExceedsPoolCapacity,
+    kDecodeExceedsPoolCapacity,
+};
+
+struct FlatTerminalError {
+    std::string request_id;
+    FlatTerminalReason reason{FlatTerminalReason::kPromptExceedsPoolCapacity};
+    std::int32_t required_pages{0};
+    std::int32_t capacity_pages{0};
+    std::string message;
+};
 
 class ExecutionPlan {
 public:
@@ -49,6 +64,15 @@ public:
     // unretractable mid-prefill holders (possibly the request itself, or a mutual wedge)
     // with no Decoding/PrefillDone victim to retract. Always empty on the radix path.
     std::vector<std::string> flat_oom_request_ids;
+    // Structured companion to flat_oom_request_ids. The legacy ID vector is
+    // retained for runtime compatibility while callers migrate to precise
+    // phase/reason diagnostics.
+    std::vector<FlatTerminalError> flat_terminal_errors;
+
+    // Flat KV-cache physical pages newly assigned to an owner in this plan.
+    // The runtime zeros the complete page set before cache transfers/forward.
+    // Cached prefix hits are intentionally absent.
+    std::vector<std::int32_t> flat_page_ids_to_zero;
 
 private:
     std::vector<Operation> operations_;

@@ -47,6 +47,8 @@ platform = current_platform()
 AllReduceFusionPattern = ErrorClass
 allgather_dual_rmsnorm = error_fn
 allreduce_residual_rmsnorm = error_fn
+allreduce_residual_attnres_combine = error_fn
+allreduce_lane_latent_norm = error_fn
 minimax_allreduce_rms_qk = error_fn
 reducescatter_residual_rmsnorm = error_fn
 trtllm_allreduce_fusion = error_fn
@@ -335,6 +337,142 @@ if current_platform().is_nvidia:
             return quant_out, residual_out, scale_out, partial_norm_out
         else:
             return norm_out, residual_out, None, partial_norm_out
+
+    def allreduce_residual_attnres_combine(
+        input_tensor: torch.Tensor,
+        residual: torch.Tensor,
+        res_w: torch.Tensor,
+        rms_w: torch.Tensor,
+        out_norm_w: torch.Tensor | None,
+        scratch: tuple,
+        rank: int,
+        group: dist.ProcessGroup,
+        eps: float = 1e-6,
+        max_token_num: int = 2048,
+        trigger_completion_at_end: bool = False,
+        launch_with_pdl: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """AR + residual + AttnRes prefix combine in one kernel (Kimi-K3).
+
+        Args:
+            input_tensor: per-rank partial to all-reduce, ``[T, H]``.
+            residual: running prefix stream before this accumulate.
+            res_w/rms_w: the mix projection and RMS weights (``[H]``).
+            out_norm_w: optional fused out-norm gamma.
+            scratch: (m [T], s [T], acc [T, H] fp32) blocks partial.
+
+        Returns:
+            (norm_out, residual_out): the combined hidden and the new prefix.
+        """
+        world_size = group.size()
+        assert world_size > 1, "Single GPU, no need for allreduce fusion"
+        assert input_tensor.shape[0] <= max_token_num
+        if not ensure_workspace_initialized(
+            rank=rank,
+            group=group,
+            max_token_num=max_token_num,
+            hidden_dim=input_tensor.shape[-1],
+            use_fp32_lamport=(input_tensor.dtype == torch.float32),
+        ):
+            raise RuntimeError("TRT-LLM fusion workspace not available")
+
+        token_num, hidden_dim = input_tensor.shape
+        residual_out = torch.empty_like(residual)
+        norm_out = torch.empty_like(input_tensor)
+        m, s_, acc = scratch
+        trtllm_allreduce_fusion(
+            allreduce_in=input_tensor,
+            world_size=world_size,
+            world_rank=rank,
+            token_num=token_num,
+            hidden_dim=hidden_dim,
+            workspace_ptrs=_workspace_manager.workspace_tensor,
+            launch_with_pdl=launch_with_pdl,
+            use_oneshot=True,
+            trigger_completion_at_end=trigger_completion_at_end,
+            fp32_acc=False,
+            pattern_code=AllReduceFusionPattern.kARResidualAttnResCombine,
+            allreduce_out=None,
+            residual_in=residual,
+            residual_out=residual_out,
+            norm_out=norm_out,
+            quant_out=None,
+            scale_out=None,
+            rms_gamma=rms_w,
+            rms_eps=eps,
+            scale_factor=None,
+            layout_code=None,
+            residual_reduce_scattered=False,
+            max_sm_to_use=None,
+            attnres_m=m,
+            attnres_s=s_,
+            attnres_acc=acc,
+            attnres_res_w=res_w,
+            attnres_out_norm_w=out_norm_w,
+        )
+        return norm_out, residual_out
+
+    def allreduce_lane_latent_norm(
+        lane: torch.Tensor,
+        gamma: torch.Tensor,
+        latent_width: int,
+        rank: int,
+        group: dist.ProcessGroup,
+        eps: float = 1e-6,
+        max_token_num: int = 2048,
+        trigger_completion_at_end: bool = False,
+        launch_with_pdl: bool = False,
+    ) -> torch.Tensor:
+        """All-reduce the [latent | hidden] lane and RMS-norm the latent slice.
+
+        Args:
+            lane: ``[T, latent_width + hidden]`` concatenated partials;
+                reduced and written back in place.
+            gamma: latent RMS weight (``[latent_width]``).
+
+        Returns:
+            ``lane`` (reduced, latent slice normed).
+        """
+        world_size = group.size()
+        assert world_size > 1, "Single GPU, no need for allreduce fusion"
+        token_num, lane_dim = lane.shape
+        assert token_num <= max_token_num
+        if not ensure_workspace_initialized(
+            rank=rank,
+            group=group,
+            max_token_num=max_token_num,
+            hidden_dim=lane_dim,
+            use_fp32_lamport=(lane.dtype == torch.float32),
+        ):
+            raise RuntimeError("TRT-LLM fusion workspace not available")
+
+        trtllm_allreduce_fusion(
+            allreduce_in=lane,
+            world_size=world_size,
+            world_rank=rank,
+            token_num=token_num,
+            hidden_dim=lane_dim,
+            workspace_ptrs=_workspace_manager.workspace_tensor,
+            launch_with_pdl=launch_with_pdl,
+            use_oneshot=True,
+            trigger_completion_at_end=trigger_completion_at_end,
+            fp32_acc=False,
+            pattern_code=AllReduceFusionPattern.kAllReduceLatentNorm,
+            allreduce_out=lane,
+            residual_in=None,
+            residual_out=None,
+            norm_out=None,
+            quant_out=None,
+            scale_out=None,
+            rms_gamma=gamma,
+            rms_eps=eps,
+            scale_factor=None,
+            layout_code=None,
+            residual_reduce_scattered=False,
+            max_sm_to_use=None,
+            latent_width=latent_width,
+        )
+        return lane
 
     def reducescatter_residual_rmsnorm(
         input_tensor: torch.Tensor,

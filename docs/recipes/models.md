@@ -201,6 +201,12 @@ Notes:
   chat renderer and multimodal processor. Preserve the checkpoint's
   `media_proc_cfg.in_patch_limit=65536`; silently falling back to K2.5's
   16384-patch default reduces OCR resolution.
+- KDA recurrent-state pages register for prefix-cache reuse only when a
+  prefill chunk ends exactly on a FlatKV page boundary. The engine floors
+  `--chunked-prefill-size` to the plan's page grain automatically (logged as
+  a warning when it adjusts); the page grain is budget-dependent (e.g. 1472
+  at 32k context, 1536 at 1M), so do not hand-tune the chunk size against a
+  hard-coded page value. Prefix hits are page-granular.
 
 ### NVIDIA
 

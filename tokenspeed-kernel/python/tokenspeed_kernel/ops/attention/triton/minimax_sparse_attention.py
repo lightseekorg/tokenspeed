@@ -757,10 +757,10 @@ def triton_minimax_msa_extend_with_kvcache(
     attention_scale: float,
     init_blocks: int,
     local_blocks: int,
+    seq_lens_cpu: Sequence[int],
     k_scale: float | torch.Tensor | None = None,
     v_scale: float | torch.Tensor | None = None,
     query_lens_cpu: Sequence[int] | None = None,
-    seq_lens_cpu: Sequence[int] | None = None,
 ) -> torch.Tensor:
     """Run MiniMax sparse-attention extend over paged caches."""
 

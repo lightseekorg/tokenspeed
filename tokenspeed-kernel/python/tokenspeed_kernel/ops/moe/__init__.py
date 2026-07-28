@@ -29,10 +29,23 @@ from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
+    "kimi3_native_moe_available",
     "moe_apply",
+    "moe_grouped_routing",
     "moe_plan",
     "moe_process_weights",
+    "moe_sigmoid_bias_topk",
+    "moe_unfused_apply",
 ]
+
+from tokenspeed_kernel.ops.moe.grouped_routing import (  # noqa: E402
+    moe_grouped_routing,
+)
+from tokenspeed_kernel.ops.moe.kimi3 import (  # noqa: E402
+    kimi3_native_moe_available,
+)
+from tokenspeed_kernel.ops.moe.sigmoid_topk import moe_sigmoid_bias_topk  # noqa: E402
+from tokenspeed_kernel.ops.moe.unfused import moe_unfused_apply  # noqa: E402
 
 
 def _normalize_weight_dtype(weight_dtype: str) -> str:
@@ -88,6 +101,12 @@ def _build_traits(
     traits["supports_all_to_all_ep"] = all_to_all_ep
     if all_to_all_ep or (ep_size is not None and ep_size > 1):
         traits["supports_ep"] = True
+    if ep_size is not None:
+        # ``supports_ep`` distinguishes EP from non-EP plans. Keep the exact
+        # degree as a separate selection trait so narrowly tuned EP kernels
+        # (for example the gfx950 K3 EP8 Gluon path) do not become automatic
+        # winners for unvalidated EP degrees.
+        traits["ep_size"] = int(ep_size)
 
     if ispp is not None:
         traits["ispp"] = int(ispp)
@@ -130,6 +149,8 @@ def moe_plan(
         a2a_backend: Optional all-to-all backend. deepep selects the DeepEP
             solution when solution is not set.
         ep_size: Optional expert-parallel size. Values > 1 require EP support.
+            The exact value is also passed as a selection trait when a kernel
+            declares an ``ep_size`` constraint.
         ispp: Optional intermediate size per partition for alignment checks.
         fp8_scale_block_shape: Optional FP8 block-scale shape requirement.
         internal_activation_dtype: Optional internal activation dtype requirement.
@@ -184,6 +205,7 @@ def moe_plan(
     )
     return {
         "weight_dtype": weight_dtype,
+        "activation": activation,
         "apply_kernel_name": apply_spec.name,
         "weight_preprocessor": apply_spec.weight_preprocessor,
         "a2a_backend": a2a_backend,

@@ -53,6 +53,9 @@ public:
     // GCD/LCM of every group's block_size: the granularity keys fold at, and the one they align to.
     std::int32_t BaseBlockSize() const { return base_block_size_; }
     std::int32_t LcmBlockSize() const { return lcm_block_size_; }
+    // LCM of dense decode-destination groups only. Final-state groups must not
+    // lower a reusable history boundary merely because their page size differs.
+    std::int32_t DecodeMatchLcmBlockSize() const { return decode_match_lcm_block_size_; }
 
     KvCacheManager& GroupManager(std::int32_t i) { return groups_[static_cast<std::size_t>(i)].Manager(); }
     const KvCacheManager& GroupManager(std::int32_t i) const { return groups_[static_cast<std::size_t>(i)].Manager(); }
@@ -75,6 +78,10 @@ public:
     // Split probing from ownership acquisition so admission checks can defer
     // without refreshing free cached blocks in the eviction order.
     AdmissionProbe ProbePrefix(std::span<const std::string> content_hashes) const;
+    // Role-D lookup: dense/history groups alone determine reuse. Final-state
+    // groups receive aligned null holes because the remote final snapshot
+    // supersedes any local cached state.
+    AdmissionProbe ProbeDecodeDestinationPrefix(std::span<const std::string> content_hashes) const;
     AdmissionMatch AcquirePrefix(std::span<const std::string> content_hashes, AdmissionProbe&& probe);
     AdmissionMatch MatchPrefix(std::span<const std::string> content_hashes);
 
@@ -91,6 +98,13 @@ public:
     std::int32_t BlocksNeededFor(std::span<const BlockTable> tables, std::int32_t num_tokens) const;
     // Fresh-table overload for a not-yet-allocated request (no tail credit).
     std::int32_t BlocksNeededFor(std::int32_t num_tokens) const;
+
+    // Exact all-group Role-D footprint and atomic acquisition after selective
+    // prefix claim/load.
+    std::int32_t BlocksNeededForDecodeDestination(std::int32_t prompt_tokens, std::int32_t remaining_prompt_tokens,
+                                                  std::int32_t reserve_tokens) const;
+    bool AcquireDecodeDestination(std::span<BlockTable> tables, std::int32_t prompt_tokens,
+                                  std::int32_t remaining_prompt_tokens, std::int32_t reserve_tokens);
 
     // end_tokens = the chunk's end position (-1 = unknown/legacy): aligned-final-page-only
     // groups register nothing without it, since only an aligned chunk end holds a real snapshot.
@@ -119,15 +133,21 @@ private:
     std::vector<std::vector<std::string>> buildGroupKeys(std::span<const std::string> content_hashes) const;
     CoordinatorProbe probeTierWithKeys(const BlockPool& pool, std::span<const std::vector<std::string>> group_keys,
                                        std::int32_t num_base_pages, std::int32_t floor_tokens) const;
+    CoordinatorProbe probeDecodeDestinationTierWithKeys(const BlockPool& pool,
+                                                        std::span<const std::vector<std::string>> group_keys,
+                                                        std::int32_t num_base_pages, std::int32_t floor_tokens) const;
     CoordinatorMatch acquireTierWithKeys(BlockPool& pool, std::span<const std::vector<std::string>> group_keys,
                                          std::int32_t floor_tokens, CoordinatorProbe&& probe) const;
     std::vector<CacheGroup> groups_;
     // Closed groups first, so non-closed groups match against a settled bound.
     std::vector<std::size_t> match_order_;
+    // Selective match order and alignment for dense destination groups.
+    std::vector<std::size_t> decode_match_order_;
     BlockPool& pool_;
     BlockPool* host_pool_{nullptr};
     std::int32_t base_block_size_{0};
     std::int32_t lcm_block_size_{0};
+    std::int32_t decode_match_lcm_block_size_{0};
     std::vector<StoreCandidate> pending_stores_;
 };
 

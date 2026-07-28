@@ -79,6 +79,22 @@ TEST(BlockPoolTest, AcquireReturnsOwningRefs) {
     EXPECT_EQ(pool.NumFreeBlocks(), 4);  // 7 free - 3 claimed
 }
 
+TEST(BlockPoolTest, FreshOwnershipReportsPagesForSanitization) {
+    BlockPool pool(4);
+    auto blocks = pool.AcquireBlocks(3);
+
+    EXPECT_EQ(pool.TakePageIdsToZero(), (std::vector<std::int32_t>{1, 2, 3}));
+    EXPECT_TRUE(pool.TakePageIdsToZero().empty());
+
+    // A page returned and reacquired in the same drain interval is reported
+    // once, even though both ownership assignments require the same zero.
+    blocks[0].reset();
+    BlockRef reused = pool.AcquireBlock();
+    reused.reset();
+    BlockRef reused_again = pool.AcquireBlock();
+    EXPECT_EQ(pool.TakePageIdsToZero(), (std::vector<std::int32_t>{1}));
+}
+
 TEST(BlockPoolTest, AcquireFailsWhenCapacityShort) {
     BlockPool pool(4);  // 3 free after null reservation
     auto blocks = pool.AcquireBlocks(4);
@@ -113,6 +129,7 @@ TEST(BlockPoolTest, CachedFreeBlockSurvivesAndIsReusable) {
     const std::string key = RealKey({1, 2, 3, 4}, 0);
 
     BlockRef block = pool.AcquireBlock();
+    EXPECT_EQ(pool.TakePageIdsToZero().size(), 1u);
     const std::int32_t block_id = block->BlockId();
     pool.CacheFullBlock(block, key);
     EXPECT_TRUE(block->IsCached());
@@ -125,6 +142,7 @@ TEST(BlockPoolTest, CachedFreeBlockSurvivesAndIsReusable) {
     EXPECT_TRUE(hit->IsCached());
     EXPECT_EQ(hit.use_count(), 1);
     EXPECT_EQ(pool.NumFreeBlocks(), 6);
+    EXPECT_TRUE(pool.TakePageIdsToZero().empty());
 }
 
 TEST(BlockPoolTest, ActiveCachedBlockCanBeShared) {
@@ -192,6 +210,7 @@ TEST(BlockPoolTest, EvictionDropsCachedContentWhenReused) {
     const std::string key = RealKey({1, 2, 3, 4}, 0);
 
     BlockRef first = pool.AcquireBlock();
+    pool.TakePageIdsToZero();
     const std::int32_t block_id = first->BlockId();
     pool.CacheFullBlock(first, key);
     first.reset();  // cached + free
@@ -201,6 +220,7 @@ TEST(BlockPoolTest, EvictionDropsCachedContentWhenReused) {
     EXPECT_EQ(second->BlockId(), block_id);  // same physical block reused
     EXPECT_FALSE(second->IsCached());
     EXPECT_FALSE(pool.ContainsCachedBlock(key));  // content gone from the map
+    EXPECT_EQ(pool.TakePageIdsToZero(), (std::vector<std::int32_t>{block_id}));
 }
 
 TEST(BlockPoolTest, BatchAcquireDropsCachedContentWhenReused) {

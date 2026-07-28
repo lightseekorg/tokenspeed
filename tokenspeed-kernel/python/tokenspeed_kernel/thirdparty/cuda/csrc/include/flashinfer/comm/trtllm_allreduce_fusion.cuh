@@ -721,6 +721,12 @@ enum class AllReduceFusionPattern : int {
   kARResidualRMSNormFP8BlockWiseQuant = 6,
   kARResidualRMSNormPartialOutFP8BlockWiseQuant= 7,
   kARResidualRMSNormPartialOut = 8,
+  // AttnRes: residual_out = prefix; norm_out = online-softmax combine of the
+  // prefix candidate with a precomputed blocks partial (Kimi-K3).
+  kARResidualAttnResCombine = 9,
+  // Lane AR for the latent MoE: all-reduce [routed latent | shared hidden]
+  // and RMS-normalize the latent slice in the epilogue (Kimi-K3).
+  kAllReduceLatentNorm = 10,
 };
 
 enum class QuantType : int { kNone = 0, kFP8 = 1, kFP4 = 2, kFP8BlockWise = 3 };
@@ -759,6 +765,10 @@ DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormPartialOu
                              true, true, true, false, true, QuantType::kFP8BlockWise);
 DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormPartialOut, false,
                              true, true, true, false, true, QuantType::kNone);
+DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualAttnResCombine, false,
+                             true, true, false, false, false, QuantType::kNone);
+DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kAllReduceLatentNorm, true, false, false,
+                             false, false, false, QuantType::kNone);
 #undef DEFINE_FUSION_PATTERN_TRAITS
 
 template <AllReduceFusionPattern Pattern>
@@ -774,6 +784,11 @@ constexpr bool HasNormOut = FusionPatternTraits<Pattern>::kHasNormOut;
 template <AllReduceFusionPattern Pattern>
 constexpr bool HasPartialOutBeforeQuant = FusionPatternTraits<Pattern>::kHasPartialNormedOut;
 template <AllReduceFusionPattern Pattern>
+constexpr bool HasLatentNorm = Pattern == AllReduceFusionPattern::kAllReduceLatentNorm;
+template <AllReduceFusionPattern Pattern>
+constexpr bool HasAttnResCombine =
+    Pattern == AllReduceFusionPattern::kARResidualAttnResCombine;
+template <AllReduceFusionPattern Pattern>
 constexpr QuantType GetQuantType = FusionPatternTraits<Pattern>::kQuantType;
 
 template <typename T>
@@ -788,6 +803,16 @@ struct AllReduceFusionParams {
   void* allreduce_out;
   void* residual_in;
   void* residual_out;
+  // AttnRes combine epilogue (kARResidualAttnResCombine): fp32 scratch of the
+  // blocks partial (m/s/acc), the mix projection weight (rms_gamma carries the
+  // mix RMS weight, rms_eps the epsilon) and an optional out-norm gamma.
+  void* attnres_m = nullptr;
+  void* attnres_s = nullptr;
+  void* attnres_acc = nullptr;
+  void* attnres_res_w = nullptr;
+  void* attnres_out_norm_w = nullptr;
+  // Latent-slice width for kAllReduceLatentNorm (rms_gamma/rms_eps reused).
+  int latent_width = 0;
   void* norm_out;
   void* partial_normed_out;
   void* quant_out;
@@ -944,6 +969,22 @@ class FusedOp {
       m_gamma_val.load(reinterpret_cast<T*>(m_params.rms_gamma) +
                        m_access_id_in_token * VEC_SIZE);
     }
+    if constexpr (HasLatentNorm<Pattern>) {
+      if (m_access_id_in_token * VEC_SIZE < m_params.latent_width) {
+        m_gamma_val.load(reinterpret_cast<T*>(m_params.rms_gamma) +
+                         m_access_id_in_token * VEC_SIZE);
+      }
+    }
+    if constexpr (HasAttnResCombine<Pattern>) {
+      m_gamma_val.load(reinterpret_cast<T*>(m_params.rms_gamma) +
+                       m_access_id_in_token * VEC_SIZE);
+      m_resw_val.load(reinterpret_cast<T*>(m_params.attnres_res_w) +
+                      m_access_id_in_token * VEC_SIZE);
+      if (m_params.attnres_out_norm_w != nullptr) {
+        m_outw_val.load(reinterpret_cast<T*>(m_params.attnres_out_norm_w) +
+                        m_access_id_in_token * VEC_SIZE);
+      }
+    }
     if (!m_params.residual_reduce_scattered) {
       if constexpr (HasResidual<Pattern>) {
         m_residual_val.load(reinterpret_cast<T*>(m_params.residual_in) + m_access_id * VEC_SIZE);
@@ -991,6 +1032,9 @@ class FusedOp {
   __device__ __forceinline__ void operator()(vec_t<T, VEC_SIZE> val, int token_id,
                                              bool skip_residual_add, bool skip_residual_store, bool skip_partial_store,
                                              int residual_access_id, int partial_out_access_id) {
+    if constexpr (HasLatentNorm<Pattern>) {
+      val = latent_norm(val);
+    }
     if constexpr (HasAllReduceOut<Pattern>) {
       val.store(reinterpret_cast<T*>(m_params.allreduce_out) + m_access_id * VEC_SIZE);
     }
@@ -1009,6 +1053,10 @@ class FusedOp {
       if constexpr (HasNormOut<Pattern>) {
         val.store(reinterpret_cast<T*>(m_params.norm_out) + m_access_id * VEC_SIZE);
       }
+    }
+    if constexpr (HasAttnResCombine<Pattern>) {
+      val = attnres_combine(val, token_id);
+      val.store(reinterpret_cast<T*>(m_params.norm_out) + m_access_id * VEC_SIZE);
     }
 
     if constexpr (HasPartialOutBeforeQuant<Pattern>){
@@ -1126,6 +1174,154 @@ class FusedOp {
     return norm_out;
   }
 
+  // RMS-normalize the latent slice (cols < latent_width) of the lane row;
+  // masked block/cluster reduction, other columns pass through untouched.
+  __device__ __forceinline__ vec_t<T, VEC_SIZE> latent_norm(vec_t<T, VEC_SIZE> val) {
+    __shared__ float s_lat;
+    bool in_latent = m_access_id_in_token * VEC_SIZE < m_params.latent_width;
+    float acc = 0.f;
+    if (in_latent) {
+#pragma unroll
+      for (int i = 0; i < VEC_SIZE; ++i) {
+        float v = static_cast<float>(reinterpret_cast<T const*>(&val)[i]);
+        acc += v * v;
+      }
+    }
+    utils::blockReduceSumV2<float, 1>(&acc);
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    namespace cg = cooperative_groups;
+    cg::cluster_group cluster = cg::this_cluster();
+    if (cluster.num_blocks() > 1) {
+      if (threadIdx.x == 0) {
+        s_lat = acc;
+        acc = 0.f;
+      }
+      cluster.sync();
+      if (threadIdx.x == 0) {
+        for (int i = 0; i < cluster.num_blocks(); ++i) {
+          acc += *cluster.map_shared_rank(&s_lat, i);
+        }
+      }
+      cluster.sync();
+    }
+#endif
+    if (threadIdx.x == 0) {
+      s_lat = rsqrtf(acc / m_params.latent_width + m_params.rms_eps);
+    }
+    __syncthreads();
+    if (in_latent) {
+      float rsig = s_lat;
+#pragma unroll
+      for (int i = 0; i < VEC_SIZE; ++i) {
+        float v = static_cast<float>(reinterpret_cast<T const*>(&val)[i]);
+        float g = static_cast<float>(reinterpret_cast<T const*>(&m_gamma_val)[i]);
+        reinterpret_cast<T*>(&val)[i] = static_cast<T>(v * rsig * g);
+      }
+    }
+    return val;
+  }
+
+  // Online-softmax fold of the prefix candidate (val) into the precomputed
+  // blocks partial; mirrors rms_norm's block/cluster reduction shape.
+  __device__ __forceinline__ vec_t<T, VEC_SIZE> attnres_combine(vec_t<T, VEC_SIZE> prefix,
+                                                                int token_id) {
+    __shared__ float s_red[2];
+    __shared__ float s_fac[3];
+    float sq = 0.f, dot = 0.f;
+#pragma unroll
+    for (int i = 0; i < VEC_SIZE; ++i) {
+      float v = static_cast<float>(reinterpret_cast<T const*>(&prefix)[i]);
+      float w = static_cast<float>(reinterpret_cast<T const*>(&m_gamma_val)[i]) *
+                static_cast<float>(reinterpret_cast<T const*>(&m_resw_val)[i]);
+      sq += v * v;
+      dot += v * w;
+    }
+    float red[2] = {sq, dot};
+    utils::blockReduceSumV2<float, 2>(red);
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    namespace cg = cooperative_groups;
+    cg::cluster_group cluster = cg::this_cluster();
+    if (cluster.num_blocks() > 1) {
+      if (threadIdx.x == 0) {
+        s_red[0] = red[0];
+        s_red[1] = red[1];
+        red[0] = 0.f;
+        red[1] = 0.f;
+      }
+      cluster.sync();
+      if (threadIdx.x == 0) {
+        for (int i = 0; i < cluster.num_blocks(); ++i) {
+          red[0] += cluster.map_shared_rank(&s_red[0], i)[0];
+          red[1] += cluster.map_shared_rank(&s_red[1], i)[0];
+        }
+      }
+      cluster.sync();
+    }
+#endif
+    if (threadIdx.x == 0) {
+      float logit =
+          red[1] * rsqrtf(red[0] / m_params.hidden_dim + m_params.rms_eps);
+      float m_b = reinterpret_cast<float const*>(m_params.attnres_m)[token_id];
+      float s_b = reinterpret_cast<float const*>(m_params.attnres_s)[token_id];
+      float m = fmaxf(m_b, logit);
+      float corr = __expf(m_b - m);
+      float w_p = __expf(logit - m);
+      s_fac[0] = corr;
+      s_fac[1] = w_p;
+      s_fac[2] = 1.f / (s_b * corr + w_p);
+    }
+    __syncthreads();
+    float corr = s_fac[0], w_p = s_fac[1], inv_s = s_fac[2];
+    float const* acc = reinterpret_cast<float const*>(m_params.attnres_acc) +
+                       (size_t)token_id * m_params.hidden_dim +
+                       m_access_id_in_token * VEC_SIZE;
+    vec_t<T, VEC_SIZE> mix;
+    float mix_sq = 0.f;
+#pragma unroll
+    for (int i = 0; i < VEC_SIZE; ++i) {
+      float v = static_cast<float>(reinterpret_cast<T const*>(&prefix)[i]);
+      float x = (acc[i] * corr + w_p * v) * inv_s;
+      // bf16 round to match the standalone combine kernel's output dtype.
+      T xr = static_cast<T>(x);
+      reinterpret_cast<T*>(&mix)[i] = xr;
+      float xf = static_cast<float>(xr);
+      mix_sq += xf * xf;
+    }
+    if (m_params.attnres_out_norm_w == nullptr) {
+      return mix;
+    }
+    float red2[2] = {mix_sq, 0.f};
+    utils::blockReduceSumV2<float, 2>(red2);
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    if (cluster.num_blocks() > 1) {
+      if (threadIdx.x == 0) {
+        s_red[0] = red2[0];
+        red2[0] = 0.f;
+      }
+      cluster.sync();
+      if (threadIdx.x == 0) {
+        for (int i = 0; i < cluster.num_blocks(); ++i) {
+          red2[0] += cluster.map_shared_rank(&s_red[0], i)[0];
+        }
+      }
+      cluster.sync();
+    }
+#endif
+    if (threadIdx.x == 0) {
+      s_fac[0] = rsqrtf(red2[0] / m_params.hidden_dim + m_params.rms_eps);
+    }
+    __syncthreads();
+    float rsig = s_fac[0];
+    vec_t<T, VEC_SIZE> out;
+#pragma unroll
+    for (int i = 0; i < VEC_SIZE; ++i) {
+      float xf = static_cast<float>(reinterpret_cast<T const*>(&mix)[i]);
+      float w = static_cast<float>(reinterpret_cast<T const*>(&m_outw_val)[i]);
+      reinterpret_cast<T*>(&out)[i] = static_cast<T>(xf * rsig * w);
+    }
+    return out;
+  }
+
  private:
   AllReduceFusionParams<T> const& m_params;
   int m_access_id;
@@ -1133,6 +1329,8 @@ class FusedOp {
   float m_scale_factor;
   vec_t<T, VEC_SIZE> m_residual_val;
   vec_t<T, VEC_SIZE> m_gamma_val;
+  vec_t<T, VEC_SIZE> m_resw_val;
+  vec_t<T, VEC_SIZE> m_outw_val;
 };
 
 template <typename T>
@@ -1625,6 +1823,12 @@ cudaError_t allreduce_fusion_op(AllReduceFusionParams<T> const& params, bool lau
       break;                                                                                     \
     case AllReduceFusionPattern::kARResidualRMSNormPartialOut:                  \
       DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormPartialOut, NRanks); \
+      break;                                                                                     \
+    case AllReduceFusionPattern::kARResidualAttnResCombine:                                      \
+      DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualAttnResCombine, NRanks);           \
+      break;                                                                                     \
+    case AllReduceFusionPattern::kAllReduceLatentNorm:                                           \
+      DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kAllReduceLatentNorm, NRanks);                \
       break;                                                                                     \
     case AllReduceFusionPattern::kARResidualRMSNormFP4Quant:                                     \
       if constexpr (!std::is_same_v<T, float> && CUDA_VERSION >= 12080) {                        \

@@ -330,9 +330,15 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         loc: torch.Tensor,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
+        sanitize: bool = False,
     ):
         layer_id = layer.layer_id
         if self.quant_method == "per_token_head":
+            # Preserve the writer's sanitization contract for the quantized
+            # fallback. The BF16 path below folds this work into Triton.
+            if sanitize:
+                cache_k_nope = torch.nan_to_num(cache_k_nope)
+                cache_k_rope = torch.nan_to_num(cache_k_rope)
             k_lora = cache_k_nope.float()
             k_rope = cache_k_rope.float()
             scale = k_lora.abs().amax(dim=-1, keepdim=True).clamp(1e-26) / 448.0
@@ -342,12 +348,14 @@ class MLATokenToKVPool(BaseTokenToKVPool):
             self.kv_buffer[layer_id][1][loc] = scale
             self.kv_buffer[layer_id][2][loc] = k_rope
         else:
-            if cache_k_nope.dtype != self.dtype:
-                cache_k_nope = cache_k_nope.to(self.dtype)
-                cache_k_rope = cache_k_rope.to(self.dtype)
             if self.store_dtype != self.dtype:
+                # Bitwise-viewed pool: pre-cast and re-view for the raw word copy.
+                if cache_k_nope.dtype != self.dtype:
+                    cache_k_nope = cache_k_nope.to(self.dtype)
+                    cache_k_rope = cache_k_rope.to(self.dtype)
                 cache_k_nope = cache_k_nope.view(self.store_dtype)
                 cache_k_rope = cache_k_rope.view(self.store_dtype)
+            # else: the write kernel casts to the buffer dtype on store.
 
             set_mla_kv_buffer_triton(
                 self.kv_buffer[layer_id],
@@ -355,6 +363,7 @@ class MLATokenToKVPool(BaseTokenToKVPool):
                 cache_k_nope,
                 cache_k_rope,
                 enable_pdl=pdl_enabled(),
+                sanitize=sanitize,
             )
 
     def get_mla_kv_buffer(

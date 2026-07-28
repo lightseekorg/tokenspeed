@@ -22,6 +22,7 @@ from tokenspeed_kernel.profiling import bootstrap_profiling_from_env
 
 bootstrap_profiling_from_env()
 
+from tokenspeed_kernel.ops.activation import add3, situ_and_mul
 from tokenspeed_kernel.ops.attention import (
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
@@ -47,8 +48,23 @@ from tokenspeed_kernel.ops.attention import (
     rel_mha_plan,
     rel_mha_prefill,
 )
-from tokenspeed_kernel.ops.gemm import bmm, mm
-from tokenspeed_kernel.ops.moe import moe_apply, moe_plan, moe_process_weights
+from tokenspeed_kernel.ops.gemm import (
+    bmm,
+    kimi3_latent_projection,
+    kimi3_latent_projection_add3,
+    kimi3_mla_qkv_gate_projection,
+    kimi3_qkvfab_projection,
+    kimi3_router_projection,
+    kimi3_shared_down_projection,
+    kimi3_shared_situ_projection,
+    mm,
+)
+from tokenspeed_kernel.ops.moe import (
+    moe_apply,
+    moe_plan,
+    moe_process_weights,
+    moe_sigmoid_bias_topk,
+)
 from tokenspeed_kernel.ops.quantization import (
     quantize_fp8,
     quantize_fp8_with_scale,
@@ -65,6 +81,13 @@ __all__ = [
     "NoKernelFoundError",
     # gemm
     "bmm",
+    "kimi3_latent_projection",
+    "kimi3_mla_qkv_gate_projection",
+    "kimi3_latent_projection_add3",
+    "kimi3_qkvfab_projection",
+    "kimi3_router_projection",
+    "kimi3_shared_down_projection",
+    "kimi3_shared_situ_projection",
     "mm",
     # attention
     "mha_plan",
@@ -90,10 +113,14 @@ __all__ = [
     "gdn_decode_mtp",
     "GdnCheckpointLayout",
     "GdnChunkPrefillResult",
+    # activation
+    "add3",
+    "situ_and_mul",
     # moe
     "moe_apply",
     "moe_plan",
     "moe_process_weights",
+    "moe_sigmoid_bias_topk",
     # quantization
     "quantize_fp8",
     "quantize_fp8_with_scale",

@@ -54,6 +54,7 @@ class TreeNode;
 
 namespace tokenspeed::fsm {
 
+struct Bootstrapping;
 struct PrefetchDone;
 struct Prefetching;
 
@@ -83,7 +84,8 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
                                    CoordinatorMatch flat_hit = {},
                                    // Host-tier match above flat_hit's boundary; real pages are
                                    // already pinned by its BlockRefs.
-                                   CoordinatorMatch flat_host = {}, std::vector<std::string> flat_ext_hashes = {}
+                                   CoordinatorMatch flat_host = {}, std::vector<std::string> flat_ext_hashes = {},
+                                   bool enable_flatkv_pd = false
 #endif
                                    )
         : tokens_this_round_(tokens_this_round),
@@ -103,7 +105,8 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
           coordinator_(coordinator),
           flat_hit_(std::move(flat_hit)),
           flat_host_(std::move(flat_host)),
-          flat_ext_hashes_(std::move(flat_ext_hashes))
+          flat_ext_hashes_(std::move(flat_ext_hashes)),
+          enable_flatkv_pd_(enable_flatkv_pd)
 #endif
     {
     }
@@ -140,6 +143,7 @@ private:
     CoordinatorMatch flat_host_{};
     std::vector<std::string> flat_ext_hashes_{};
     std::vector<BlockTransfer> flat_load_pairs_{};
+    bool enable_flatkv_pd_{false};
 #endif
 };
 
@@ -292,6 +296,7 @@ struct AbortEvent : InvalidTransitionHandler<AbortEvent> {
     explicit AbortEvent(KvCacheCoordinator* coordinator = nullptr) : coordinator_(coordinator) {}
 #endif
 
+    Finished operator()(Bootstrapping&& state);
     Finished operator()(Submitted&& state);
     Aborting operator()(Prefetching&& state);
     Finished operator()(PrefetchDone&&);

@@ -23,6 +23,7 @@
 import math
 import os
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -34,10 +35,13 @@ from tokenspeed_scheduler import (
     PagedCacheGroupConfig,
     PagedCacheGroupFamily,
     PagedCacheRetention,
+    PagedCacheTransferPolicy,
     PrefixCacheAdjunctSpec,
     RequestSpec,
     SchedulerConfig,
 )
+
+from tokenspeed.runtime.configs.flat_cache_runtime import require_positive_int
 
 _CACHE_EVENT_TYPES = {
     "WriteBackDoneEvent": Cache.WriteBackDoneEvent,
@@ -60,6 +64,47 @@ _FAMILY_MAP = {
     "history": PagedCacheGroupFamily.History,
     "state": PagedCacheGroupFamily.State,
 }
+_TRANSFER_POLICY_MAP = {
+    "full_suffix": PagedCacheTransferPolicy.FullSuffix,
+    "latest_snapshot": PagedCacheTransferPolicy.LatestSnapshot,
+}
+
+
+@dataclass(frozen=True)
+class SchedulerCacheGeometry:
+    page_size: int
+    num_device_pages: int
+    num_usable_pages: int
+    token_capacity: int
+
+
+def scheduler_cache_geometry_from_pool(
+    pool: Any,
+    *,
+    fallback_token_capacity: int,
+    fallback_page_size: int,
+) -> SchedulerCacheGeometry:
+    contract = getattr(pool, "runtime_contract", None)
+    if contract is not None:
+        return SchedulerCacheGeometry(
+            page_size=contract.block_size,
+            num_device_pages=contract.num_device_pages_with_null,
+            num_usable_pages=contract.usable_pages,
+            token_capacity=contract.token_capacity,
+        )
+    if fallback_page_size <= 0 or fallback_token_capacity <= 0:
+        raise ValueError("fallback scheduler cache geometry must be positive")
+    if fallback_token_capacity % fallback_page_size:
+        raise ValueError(
+            "fallback token capacity must be divisible by fallback page size"
+        )
+    pages = fallback_token_capacity // fallback_page_size
+    return SchedulerCacheGeometry(
+        page_size=fallback_page_size,
+        num_device_pages=pages,
+        num_usable_pages=pages,
+        token_capacity=fallback_token_capacity,
+    )
 
 
 def resolve_scheduler_block_size(page_size: int, paged_cache_groups) -> int:
@@ -69,6 +114,51 @@ def resolve_scheduler_block_size(page_size: int, paged_cache_groups) -> int:
         gb = int(getattr(group, "block_size", 0) or 0) or page_size
         base = math.gcd(base, gb)
     return base
+
+
+def aligned_max_scheduled_tokens(
+    max_scheduled_tokens: int,
+    paged_cache_groups,
+    page_size: int,
+) -> int:
+    """Floor ``max_scheduled_tokens`` to the state-snapshot grain, if any.
+
+    Recurrent-state groups (family=State, retention=FullHistory — the C++
+    ``final_state_manager`` criterion) register their state snapshot only when
+    a prefill chunk ends exactly on a page boundary
+    (``RegistersAlignedFinalPageOnly``); interior boundaries never received a
+    state write. A chunk size that is not a multiple of every such group's
+    page size therefore never registers a state page, and since the admission
+    probe takes the minimum hit across groups, prefix-cache reuse silently
+    degrades to zero for the whole model.
+
+    Args:
+        max_scheduled_tokens: Requested per-step token budget
+            (``--chunked-prefill-size``).
+        paged_cache_groups: Scheduler ``PagedCacheGroupConfig`` sequence, or
+            None/empty when the model declares no paged cache groups.
+        page_size: Global page size in tokens; the fallback grain for groups
+            whose ``block_size`` is 0 (= unset, global base).
+
+    Returns:
+        ``max_scheduled_tokens`` floored to the LCM of the state groups' page
+        sizes, but never below one page (a smaller chunk could not register a
+        snapshot at all). Returned unchanged when no such group exists or the
+        value is already aligned.
+    """
+    require_positive_int("max_scheduled_tokens", max_scheduled_tokens)
+    require_positive_int("page_size", page_size)
+    grain = 1
+    for group in paged_cache_groups or ():
+        if group.family != PagedCacheGroupFamily.State:
+            continue
+        if group.retention == PagedCacheRetention.SlidingWindow:
+            continue
+        group_block = int(getattr(group, "block_size", 0) or 0) or page_size
+        grain = math.lcm(grain, group_block)
+    if grain == 1:
+        return max_scheduled_tokens
+    return max(max_scheduled_tokens - max_scheduled_tokens % grain, grain)
 
 
 def make_spec(rid: str, tokens: list[int]) -> RequestSpec:
@@ -138,11 +228,16 @@ def make_config(
 
 
 def pool_to_paged_cache_groups(pool: Any) -> list:
-    """Convert a KV pool's paged_cache_group_specs to scheduler configs."""
-    specs = pool.paged_cache_group_specs
+    """Convert authoritative contract specs, or legacy pool properties."""
+    contract = getattr(pool, "runtime_contract", None)
+    if contract is not None:
+        specs = contract.group_specs
+        counts = contract.group_page_counts
+    else:
+        specs = pool.paged_cache_group_specs
+        counts = pool.paged_cache_group_page_counts
     if not specs:
         return []
-    counts = pool.paged_cache_group_page_counts
     out = []
     for spec in specs:
         retention = _RETENTION_MAP.get(spec.retention)
@@ -165,6 +260,15 @@ def pool_to_paged_cache_groups(pool: Any) -> list:
             retention=retention,
             family=family,
         )
+        transfer_policy = getattr(spec, "transfer_policy", None)
+        if transfer_policy is not None:
+            mapped_policy = _TRANSFER_POLICY_MAP.get(transfer_policy)
+            if mapped_policy is None:
+                raise ValueError(
+                    "pool_to_paged_cache_groups: unsupported transfer policy "
+                    f"{transfer_policy!r} for group {spec.group_id!r}"
+                )
+            kwargs["transfer_policy"] = mapped_policy
         if spec.retention == "sliding_window":
             kwargs["sliding_window_tokens"] = int(spec.sliding_window_tokens)
         cfg = PagedCacheGroupConfig(**kwargs)
@@ -390,6 +494,8 @@ def flat_block_tables_from_forward_op(
     device: "torch.device | str",
     *,
     num_reqs: int | None = None,
+    expected_group_ids: tuple[str, ...] | None = None,
+    max_page_id: int | None = None,
 ) -> dict[str, torch.Tensor]:
     """Bridge the flat per-group block tables to GPU int32 tensors: absolute
     page indices, null hole = 0 preserved, ragged-row padding -1. No
@@ -401,23 +507,103 @@ def flat_block_tables_from_forward_op(
     (``_flat_try_packed_unpack``). Per-group uploads would fail its
     same-storage check and fall back to per-group copy/fill chains
     (~40 tiny transfers per decode step).
+
+    Args:
+        forward_op: Scheduler forward operation exporting CPU NumPy tables.
+        device: Destination device for the packed tensor.
+        num_reqs: Optional expected row count for every group.
+        expected_group_ids: Optional contract order and exact key set.
+        max_page_id: Optional inclusive upper bound for page IDs.
+
+    Returns:
+        Per-group tensor views in ``expected_group_ids`` order when supplied,
+        otherwise preserving producer order.
+
+    Raises:
+        ValueError: If strict contract validation fails before device transfer.
     """
+    strict_validation = expected_group_ids is not None or max_page_id is not None
+    if strict_validation and num_reqs is not None:
+        require_positive_int("num_reqs", num_reqs)
+    if expected_group_ids is not None:
+        seen_group_ids: set[str] = set()
+        duplicate_group_ids: set[str] = set()
+        for group_id in expected_group_ids:
+            if group_id in seen_group_ids:
+                duplicate_group_ids.add(group_id)
+            seen_group_ids.add(group_id)
+        if duplicate_group_ids:
+            raise ValueError(
+                f"expected_group_ids contains duplicates: {sorted(duplicate_group_ids)}"
+            )
     arrays = getattr(forward_op, "flat_block_tables_arrays", None)
     if not callable(arrays):
         if getattr(forward_op, "flat_block_tables", None) is None:
-            # Radix builds / idle ops carry no flat tables at all.
+            if expected_group_ids is not None:
+                raise ValueError(
+                    "flat group keys disagree: "
+                    f"missing={sorted(expected_group_ids)} extra=[]"
+                )
+            # Callers without a runtime contract preserve the no-table path
+            # used by idle and non-flat forward operations.
             return {}
         raise RuntimeError(
             "flat scheduler ext does not expose flat_block_tables_arrays; "
             "rebuild tokenspeed-scheduler (the per-element nested-list export "
             "path was removed)."
         )
+    array_items = [(str(key), arr) for key, arr in arrays().items()]
+    if strict_validation:
+        normalized_group_ids: set[str] = set()
+        collided_ids: set[str] = set()
+        for group_id, _ in array_items:
+            if group_id in normalized_group_ids:
+                collided_ids.add(group_id)
+            normalized_group_ids.add(group_id)
+        if collided_ids:
+            raise ValueError(
+                "flat group keys collide after string normalization: "
+                f"{sorted(collided_ids)}"
+            )
+    arrays_by_id = dict(array_items)
+    if expected_group_ids is not None:
+        actual = set(arrays_by_id)
+        expected = set(expected_group_ids)
+        if actual != expected:
+            raise ValueError(
+                f"flat group keys disagree: missing={sorted(expected - actual)} "
+                f"extra={sorted(actual - expected)}"
+            )
+        ordered_items = [
+            (group_id, arrays_by_id[group_id]) for group_id in expected_group_ids
+        ]
+    else:
+        ordered_items = array_items
+    if strict_validation:
+        for group_id, arr in ordered_items:
+            if not isinstance(arr, np.ndarray):
+                raise ValueError(f"flat group {group_id!r} must be a NumPy array")
+            if arr.dtype != np.int32:
+                raise ValueError(f"flat group {group_id!r} must use int32")
+            if arr.ndim != 2:
+                raise ValueError(f"flat group {group_id!r} has invalid shape")
+            if arr.shape[0] == 0:
+                raise ValueError(f"flat group {group_id!r} has zero rows")
+            # rows-vs-num_reqs is checked once in the packing loop below.
+            if arr.shape[1] == 0:
+                raise ValueError(f"flat group {group_id!r} has zero width")
+            if max_page_id is not None:
+                invalid = (arr < -1) | (arr > max_page_id)
+                if bool(invalid.any()):
+                    raise ValueError(
+                        f"flat group {group_id!r} contains a page ID outside "
+                        f"-1..{max_page_id}"
+                    )
     device = torch.device(device) if isinstance(device, str) else device
     out: dict[str, torch.Tensor] = {}
     packable: list[tuple[str, Any, int]] = []
     total = 0
-    for key_obj, arr in arrays().items():
-        key = str(key_obj)
+    for key, arr in ordered_items:
         if num_reqs is not None and arr.shape[0] != num_reqs:
             raise ValueError(
                 f"flat_block_tables_arrays[{key}] has {arr.shape[0]} rows "

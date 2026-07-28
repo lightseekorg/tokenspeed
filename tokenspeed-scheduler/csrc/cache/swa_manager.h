@@ -104,6 +104,18 @@ public:
         return freed;
     }
 
+    std::int32_t BlocksReclaimableIgnoringRefsAt(const BlockTable& table,
+                                                 std::int32_t num_computed_tokens) const override {
+        const std::int32_t skipped_blocks = fullySlidOutBlocks(table, num_computed_tokens);
+        std::int32_t freed = 0;
+        for (std::int32_t i = skipped_blocks - 1; i >= 0; --i) {
+            if (table.Blocks()[static_cast<std::size_t>(i)]) {
+                ++freed;
+            }
+        }
+        return freed;
+    }
+
 private:
     // Cached pages a boundary needs behind it: they cover the window's last (window - 1) tokens.
     std::int32_t pagesNeededToResume() const { return (sliding_window_ - 1 + block_size_ - 1) / block_size_; }

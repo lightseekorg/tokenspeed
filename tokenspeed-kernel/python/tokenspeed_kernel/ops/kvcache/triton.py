@@ -38,6 +38,7 @@ _ALL_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_ALL_LAYER_GRID_CAP", "32
 _is_nvidia = current_platform().is_nvidia
 
 __all__ = [
+    "copy_state_rows",
     "fused_fp8_set_kv_buffer",
     "flat_decode_locs",
     "flat_tables_unpack",
@@ -51,7 +52,198 @@ __all__ = [
     "transfer_kv_all_layer_mla",
     "transfer_kv_per_layer",
     "transfer_kv_per_layer_mla",
+    "zero_flat_cache_pages",
 ]
+
+
+# -----------------------------------------------------------------------------
+# Batched state-row copies across per-layer slabs (pointer table)
+# -----------------------------------------------------------------------------
+
+
+@triton.jit
+def _copy_state_rows_kernel(
+    src_addresses_ptr,
+    dst_addresses_ptr,
+    src_strides_ptr,
+    dst_strides_ptr,
+    src_rows_ptr,
+    dst_rows_ptr,
+    rows_per_layer,
+    ROW_I32: tl.constexpr,
+    BLOCK_I32: tl.constexpr,
+):
+    """Copy one state row between two slabs of one layer.
+
+    Row strides are per-layer (int32 units) so page-interleaved ``as_strided``
+    slab views and dense scratch tensors mix freely. A negative source row id
+    stores zeros instead (seed-invalid fill).
+    """
+    work_index = tl.program_id(0)
+    chunk_index = tl.program_id(1)
+    layer_index = work_index // rows_per_layer
+
+    src_address = tl.load(src_addresses_ptr + layer_index)
+    dst_address = tl.load(dst_addresses_ptr + layer_index)
+    src_ptr = tl.cast(src_address, tl.pointer_type(tl.int32))
+    dst_ptr = tl.cast(dst_address, tl.pointer_type(tl.int32))
+    src_stride = tl.load(src_strides_ptr + layer_index)
+    dst_stride = tl.load(dst_strides_ptr + layer_index)
+
+    src_row = tl.load(src_rows_ptr + work_index).to(tl.int64)
+    dst_row = tl.load(dst_rows_ptr + work_index).to(tl.int64)
+
+    offsets = chunk_index * BLOCK_I32 + tl.arange(0, BLOCK_I32)
+    mask = offsets < ROW_I32
+    values = tl.load(
+        src_ptr + src_row * src_stride + offsets.to(tl.int64),
+        mask=mask & (src_row >= 0),
+        other=0,
+    )
+    tl.store(dst_ptr + dst_row * dst_stride + offsets.to(tl.int64), values, mask=mask)
+
+
+def copy_state_rows(
+    src_addresses: torch.Tensor,
+    dst_addresses: torch.Tensor,
+    src_rows: torch.Tensor,
+    dst_rows: torch.Tensor,
+    *,
+    row_bytes: int,
+    src_row_strides: torch.Tensor,
+    dst_row_strides: torch.Tensor,
+) -> None:
+    """Copy state rows between per-layer slab pairs in one Triton launch.
+
+    Replaces per-layer ``dst[dst_rows] = src[src_rows]`` gather/scatter chains
+    (e.g. MTP verify-scratch seeding and post-verify state commit) with a
+    single kernel across all layers of one uniform row size. Per-layer row
+    strides let page-interleaved ``as_strided`` slab views and dense scratch
+    tensors participate on either side.
+
+    Args:
+        src_addresses: CUDA uint64 ``[num_layers]`` base addresses of the
+            source slabs (address of row 0).
+        dst_addresses: CUDA uint64 ``[num_layers]`` destination base addresses.
+        src_rows: CUDA int64 ``[num_layers * rows_per_layer]`` source row ids,
+            layer-major. A negative id zero-fills its destination row.
+        dst_rows: CUDA int64 tensor, same layout, destination row ids.
+        row_bytes: Byte width of the copied row payload (divisible by 4).
+        src_row_strides: CUDA int64 ``[num_layers]`` row-to-row strides of the
+            source slabs in int32 units (``stride_bytes // 4``).
+        dst_row_strides: CUDA int64 ``[num_layers]`` destination row strides in
+            int32 units.
+
+    Returns:
+        None. Rows are copied in place in one launch.
+    """
+    total = src_rows.numel()
+    if total == 0:
+        return
+    num_layers = src_addresses.numel()
+    if num_layers == 0 or total % num_layers:
+        raise ValueError("src_rows must hold rows_per_layer ids per layer")
+    if src_addresses.dtype != torch.uint64 or dst_addresses.dtype != torch.uint64:
+        raise ValueError("slab address tables must have dtype torch.uint64")
+    if src_rows.dtype != torch.int64 or dst_rows.dtype != torch.int64:
+        raise ValueError("row id tensors must have dtype torch.int64")
+    if (
+        src_row_strides.dtype != torch.int64
+        or dst_row_strides.dtype != torch.int64
+        or src_row_strides.numel() != num_layers
+        or dst_row_strides.numel() != num_layers
+    ):
+        raise ValueError("row stride tables must be int64 with one entry per layer")
+    if dst_rows.numel() != total or dst_addresses.numel() != num_layers:
+        raise ValueError("source/destination table sizes must match")
+    if row_bytes <= 0 or row_bytes % 4:
+        raise ValueError("row_bytes must be positive and divisible by 4")
+
+    row_i32 = row_bytes // 4
+    block_i32 = 1024
+    chunks = triton.cdiv(row_i32, block_i32)
+    _copy_state_rows_kernel[(total, chunks)](
+        src_addresses,
+        dst_addresses,
+        src_row_strides,
+        dst_row_strides,
+        src_rows,
+        dst_rows,
+        total // num_layers,
+        ROW_I32=row_i32,
+        BLOCK_I32=block_i32,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Flat hybrid cache page sanitization
+# -----------------------------------------------------------------------------
+
+
+@triton.jit
+def _zero_flat_cache_pages_kernel(
+    slab_addresses_ptr,
+    page_ids_ptr,
+    PAGE_SIZE_I32: tl.constexpr,
+    CHUNKS_PER_PAGE: tl.constexpr,
+    BLOCK_I32: tl.constexpr,
+):
+    """Zero one physical page across separately allocated cache slabs."""
+    page_index = tl.program_id(0)
+    work_index = tl.program_id(1)
+    slab_index = work_index // CHUNKS_PER_PAGE
+    chunk_index = work_index % CHUNKS_PER_PAGE
+
+    slab_address = tl.load(slab_addresses_ptr + slab_index)
+    slab_ptr = tl.cast(slab_address, tl.pointer_type(tl.int32))
+    page_id = tl.load(page_ids_ptr + page_index).to(tl.int64)
+    offsets = chunk_index * BLOCK_I32 + tl.arange(0, BLOCK_I32)
+    mask = offsets < PAGE_SIZE_I32
+    slab_offsets = page_id * PAGE_SIZE_I32 + offsets.to(tl.int64)
+    tl.store(slab_ptr + slab_offsets, 0, mask=mask)
+
+
+def zero_flat_cache_pages(
+    slab_addresses: torch.Tensor,
+    page_ids: torch.Tensor,
+    *,
+    page_size_bytes: int,
+) -> None:
+    """Zero physical pages across every slab of a flat hybrid cache.
+
+    Args:
+        slab_addresses: CUDA uint64 tensor containing one base address per
+            contiguous raw slab.
+        page_ids: CUDA integer tensor of physical page IDs to clear.
+        page_size_bytes: Uniform byte stride of one page in every slab.
+
+    Returns:
+        None. The selected pages are zeroed in place in one Triton launch.
+    """
+    if page_ids.numel() == 0:
+        return
+    if not slab_addresses.is_cuda or not page_ids.is_cuda:
+        raise ValueError("flat cache page zeroing requires CUDA tensors")
+    if slab_addresses.dtype != torch.uint64:
+        raise ValueError("slab_addresses must have dtype torch.uint64")
+    if page_ids.dtype not in (torch.int32, torch.int64):
+        raise ValueError("page_ids must have dtype torch.int32 or torch.int64")
+    if page_size_bytes <= 0 or page_size_bytes % 4:
+        raise ValueError("page_size_bytes must be positive and divisible by 4")
+    if slab_addresses.numel() == 0:
+        raise ValueError("slab_addresses must be non-empty")
+
+    page_size_i32 = page_size_bytes // 4
+    block_i32 = 1024
+    chunks_per_page = triton.cdiv(page_size_i32, block_i32)
+    grid = (page_ids.numel(), slab_addresses.numel() * chunks_per_page)
+    _zero_flat_cache_pages_kernel[grid](
+        slab_addresses,
+        page_ids,
+        PAGE_SIZE_I32=page_size_i32,
+        CHUNKS_PER_PAGE=chunks_per_page,
+        BLOCK_I32=block_i32,
+    )
 
 
 # -----------------------------------------------------------------------------

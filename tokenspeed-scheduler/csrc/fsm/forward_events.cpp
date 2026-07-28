@@ -31,6 +31,7 @@
 #include "fsm/cache_states.h"
 #include "fsm/forward_events.h"
 #include "fsm/forward_states.h"
+#include "fsm/pd_states.h"
 #include "resource/allocator/kv_allocator.h"
 #include "resource/allocator/owned_pages.h"
 #include "resource/allocator/req_pool_allocator.h"
@@ -227,10 +228,19 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
     coordinator_->CacheFullBlocks(tables, flat_ext_hashes_,
                                   /*first_slot=*/device_hit_tokens / state.GetPageSize(),
                                   /*end_tokens=*/hit_tokens);
-    // Role kD cannot defer its decode reserve until RemotePrefillDone: the
-    // remote transfer may complete after other requests consume the pool.
-    const std::int32_t tokens_to_acquire = tokens_this_round_ + (role_ == Role::kD ? decode_input_tokens_ : 0);
-    if (!coordinator_->Acquire(tables, tokens_to_acquire)) {
+    bool acquired = false;
+    if (role_ == Role::kD && enable_flatkv_pd_) {
+        _assert(hit_tokens + tokens_this_round_ == token_container->PrefillSize(),
+                "FlatKV PD decode destination must acquire the complete prompt atomically");
+        acquired = coordinator_->AcquireDecodeDestination(tables, token_container->PrefillSize(), tokens_this_round_,
+                                                          decode_input_tokens_);
+    } else {
+        // Role kD cannot defer its decode reserve until RemotePrefillDone: the
+        // remote transfer may complete after other requests consume the pool.
+        const std::int32_t tokens_to_acquire = tokens_this_round_ + (role_ == Role::kD ? decode_input_tokens_ : 0);
+        acquired = coordinator_->Acquire(tables, tokens_to_acquire);
+    }
+    if (!acquired) {
         _assert(false, "flat path: allocation failure unsupported in C slice");
     }
 
@@ -676,6 +686,10 @@ Retracted WriteBackDoneEvent::operator()(Retracting&& state) {
     return Retracted{token_container, page_size, std::move(host_ref), std::move(local_device_allocator),
                      std::move(local_mamba_allocator)};
 #endif
+}
+
+Finished AbortEvent::operator()(Bootstrapping&&) {
+    return Finished{};
 }
 
 Finished AbortEvent::operator()(Submitted&&) {

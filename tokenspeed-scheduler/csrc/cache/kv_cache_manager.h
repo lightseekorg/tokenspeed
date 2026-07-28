@@ -21,6 +21,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <string>
 #include <utility>
@@ -32,6 +33,15 @@
 #include "utils.h"
 
 namespace tokenspeed {
+
+// Physical layout a decode-side PD destination needs for one cache group.
+// DenseHistory keeps every prompt page; FinalStateSnapshot keeps logical
+// alignment with null holes and materializes only the prompt-final state page
+// plus the page needed by the first local decode token.
+enum class DecodeDestinationLayout {
+    kDenseHistory,
+    kFinalStateSnapshot,
+};
 
 // Pure per-attention-type policy over block_size (+ window): holds no pool and no per-request
 // state -- every operation acts on the pool it is handed, identically for any tier.
@@ -133,6 +143,82 @@ public:
         return (over + block_size_ - 1) / block_size_;
     }
 
+    // Models opt into the final-snapshot layout by overriding this policy. The
+    // coordinator and PD lifecycle stay group-generic.
+    virtual DecodeDestinationLayout DecodeDestinationLayoutPolicy() const {
+        return DecodeDestinationLayout::kDenseHistory;
+    }
+
+    // Exact, side-effect-free page count for a decode-side PD destination.
+    // Dense groups append the prompt suffix and the first local decode input.
+    // Final-state groups preserve absolute logical slots with null holes and
+    // materialize only prompt-final..reserve-final inclusive.
+    std::int32_t DecodeDestinationBlocksNeeded(const BlockTable& table, std::int32_t prompt_tokens,
+                                               std::int32_t remaining_prompt_tokens,
+                                               std::int32_t reserve_tokens) const {
+        _assert(prompt_tokens > 0, "decode destination requires a non-empty prompt");
+        _assert(remaining_prompt_tokens >= 0 && remaining_prompt_tokens <= prompt_tokens,
+                "invalid decode destination prompt suffix");
+        _assert(reserve_tokens >= 0, "decode destination reserve must be non-negative");
+
+        if (DecodeDestinationLayoutPolicy() == DecodeDestinationLayout::kDenseHistory) {
+            const std::int64_t extent = static_cast<std::int64_t>(remaining_prompt_tokens) + reserve_tokens;
+            _assert(extent <= std::numeric_limits<std::int32_t>::max(), "dense decode destination extent overflow");
+            return BlocksNeededFor(table, static_cast<std::int32_t>(extent));
+        }
+
+        // The Flat PD baseline intentionally supports one local decode input.
+        // Wider speculative/MTP reservations need a model-defined contract for
+        // which intermediate state snapshots are live, so fail closed here.
+        _assert(reserve_tokens <= 1, "final-state decode destination supports at most one reserved token");
+        const std::int64_t extent64 = static_cast<std::int64_t>(prompt_tokens) + reserve_tokens;
+        _assert(extent64 <= std::numeric_limits<std::int32_t>::max(), "final-state decode destination extent overflow");
+        const std::int32_t extent_tokens = static_cast<std::int32_t>(extent64);
+        const std::int32_t first_real_slot = (prompt_tokens - 1) / block_size_;
+        const std::int32_t last_real_slot = (extent_tokens - 1) / block_size_;
+        _assert(table.NumBlocks() <= last_real_slot + 1, "state prefix exceeds decode destination extent");
+        for (const BlockRef& block : table.Blocks()) {
+            _assert(!block, "decode destination state prefix must contain null holes only");
+        }
+        return last_real_slot - first_real_slot + 1;
+    }
+
+    // All-or-nothing for one group. The coordinator prechecks the sum across
+    // every group before calling this, so a multi-group destination is atomic.
+    bool AcquireDecodeDestination(BlockPool& pool, BlockTable& table, std::int32_t prompt_tokens,
+                                  std::int32_t remaining_prompt_tokens, std::int32_t reserve_tokens) {
+        if (DecodeDestinationLayoutPolicy() == DecodeDestinationLayout::kDenseHistory) {
+            const std::int64_t extent = static_cast<std::int64_t>(remaining_prompt_tokens) + reserve_tokens;
+            _assert(extent <= std::numeric_limits<std::int32_t>::max(), "dense decode destination extent overflow");
+            return Acquire(pool, table, static_cast<std::int32_t>(extent));
+        }
+
+        const std::int32_t needed =
+            DecodeDestinationBlocksNeeded(table, prompt_tokens, remaining_prompt_tokens, reserve_tokens);
+        std::vector<BlockRef> new_blocks = pool.AcquireBlocks(needed);
+        if (static_cast<std::int32_t>(new_blocks.size()) != needed) {
+            return false;
+        }
+
+        const std::int32_t extent_tokens = static_cast<std::int32_t>(static_cast<std::int64_t>(prompt_tokens) +
+                                                                     static_cast<std::int64_t>(reserve_tokens));
+        const std::int32_t first_real_slot = (prompt_tokens - 1) / block_size_;
+        const std::int32_t last_real_slot = (extent_tokens - 1) / block_size_;
+        while (table.NumBlocks() <= last_real_slot) {
+            table.blocks_.emplace_back();
+        }
+        std::size_t next = 0;
+        for (std::int32_t slot = first_real_slot; slot <= last_real_slot; ++slot) {
+            BlockRef& ref = table.blocks_[static_cast<std::size_t>(slot)];
+            _assert(!ref, "decode destination state slot aliases cached state");
+            ref = std::move(new_blocks[next++]);
+        }
+        _assert(next == new_blocks.size(), "decode destination state allocation count drifted");
+        const std::int32_t used_in_tail = extent_tokens % block_size_;
+        table.tail_avail_ = used_in_tail == 0 ? 0 : block_size_ - used_in_tail;
+        return true;
+    }
+
     // State snapshots are only boundary-correct where a forward call ended page-aligned:
     // such groups register just the final full page of an aligned range.
     virtual bool RegistersAlignedFinalPageOnly() const { return false; }
@@ -166,6 +252,14 @@ public:
     // Pure twin of ReclaimExpired (pages a pending reclaim would free), overridden in lockstep with it.
     virtual std::int32_t BlocksReclaimableAt(const BlockTable& /*table*/, std::int32_t /*num_computed_tokens*/,
                                              bool /*count_uncached*/) const {
+        return 0;
+    }
+
+    // Capacity upper bound used only to distinguish permanent OOM from
+    // contention: count pages this request's pending retention slide could
+    // release after other references disappear.
+    virtual std::int32_t BlocksReclaimableIgnoringRefsAt(const BlockTable& /*table*/,
+                                                         std::int32_t /*num_computed_tokens*/) const {
         return 0;
     }
 
