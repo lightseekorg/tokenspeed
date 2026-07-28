@@ -77,3 +77,35 @@ def test_partial_dual_matches_two_singles(T, KB):
     for got, ref in ((sa, ra), (sb, rb)):
         for x, y in zip(got, ref):
             torch.testing.assert_close(x, y, atol=1e-4, rtol=1e-4)
+
+
+def test_attnres_pdl_bit_identical():
+    """PDL fences are memory-ordering only: on/off outputs must be identical."""
+    T, KB = 1, 8
+    torch.manual_seed(1234)
+    prefix = torch.randn(T, H, dtype=torch.bfloat16, device="cuda")
+    blocks = torch.randn(KB, T, H, dtype=torch.bfloat16, device="cuda")
+    wp = torch.randn(H, dtype=torch.bfloat16, device="cuda")
+    wp_b = torch.randn(H, dtype=torch.bfloat16, device="cuda")
+    out_w = torch.rand(H, dtype=torch.bfloat16, device="cuda") + 0.5
+    eps = 1e-5
+
+    s_off, s_on = _scratch(T), _scratch(T)
+    attnres_partial(blocks, wp, eps, s_off)
+    attnres_partial(blocks, wp, eps, s_on, enable_pdl=True)
+    for a, b in zip(s_off, s_on):
+        torch.testing.assert_close(a, b, atol=0, rtol=0)
+
+    o_off = torch.empty(T, H, dtype=torch.bfloat16, device="cuda")
+    o_on = torch.empty_like(o_off)
+    attnres_combine(prefix, wp, out_w, eps, s_off, o_off)
+    attnres_combine(prefix, wp, out_w, eps, s_on, o_on, enable_pdl=True)
+    torch.testing.assert_close(o_on, o_off, atol=0, rtol=0)
+
+    da_off, db_off = _scratch(T), _scratch(T)
+    da_on, db_on = _scratch(T), _scratch(T)
+    attnres_partial_dual(blocks, wp, wp_b, eps, da_off, db_off)
+    attnres_partial_dual(blocks, wp, wp_b, eps, da_on, db_on, enable_pdl=True)
+    for got, ref in ((da_on, da_off), (db_on, db_off)):
+        for a, b in zip(got, ref):
+            torch.testing.assert_close(a, b, atol=0, rtol=0)

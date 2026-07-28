@@ -27,6 +27,7 @@ from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.ops.gemm.fp8_utils import (
     create_per_token_group_quant_fp8_output_scale,
 )
+from tokenspeed_kernel.platform import current_platform
 
 __all__ = [
     "add3",
@@ -150,7 +151,12 @@ def _sigmoid_mul_kernel(
     gate_row_stride: tl.constexpr,
     gate_head_stride: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        # Both x and gate are predecessor projection outputs; fence the whole
+        # elementwise op before the first dependent load.
+        tl.extra.cuda.gdc_wait()
     pid = tl.program_id(0).to(tl.int64)
     block_start = pid * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
@@ -166,9 +172,13 @@ def _sigmoid_mul_kernel(
     g = tl.load(gate_addrs, mask=mask).to(tl.float32)
     out = x * tl.sigmoid(g)
     tl.store(x_ptr + offsets, out, mask=mask)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
-def sigmoid_mul(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+def sigmoid_mul(
+    x: torch.Tensor, gate: torch.Tensor, *, enable_pdl: bool = False
+) -> torch.Tensor:
     """In-place ``x *= sigmoid(gate)``.
 
     ``x`` must be contiguous 2D ``[num_tokens, hidden_dim]`` and is mutated.
@@ -181,6 +191,11 @@ def sigmoid_mul(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
 
     The strided form lets callers skip the ``.reshape(-1)`` copy after the
     chunk; both layouts share the same kernel via the explicit gate strides.
+
+    ``enable_pdl`` launches with programmatic dependent launch and fences the
+    x/gate reads with ``gdc_wait`` / ``gdc_launch_dependents`` (NVIDIA only;
+    ignored elsewhere). Safe only when the projection kernels that write
+    ``x``/``gate`` are chained on the same stream/graph.
     """
     if x.ndim != 2:
         raise ValueError(f"x must be 2D, got {x.ndim}D")
@@ -216,6 +231,9 @@ def sigmoid_mul(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
     if n == 0:
         return x
 
+    pdl_kwargs = (
+        {"launch_pdl": True} if enable_pdl and current_platform().is_nvidia else {}
+    )
     # Small (decode-gate) inputs are launch-latency bound: 512-wide blocks
     # give 2-4 light CTAs that spread across SMs and shave ~0.2us over one
     # or two 1024-wide CTAs (graph-replay ranked); large inputs keep the
@@ -231,6 +249,8 @@ def sigmoid_mul(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         gate_row_stride=gate_row_stride,
         gate_head_stride=gate_head_stride,
         BLOCK_SIZE=BLOCK_SIZE,
+        ENABLE_PDL=enable_pdl,
+        **pdl_kwargs,
     )
     return x
 
@@ -244,7 +264,11 @@ def _silu_and_mul_kernel(
     input_stride_row: tl.constexpr,
     out_stride_row: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        # x_ptr (packed gate|up) is the predecessor projection output.
+        tl.extra.cuda.gdc_wait()
     pid = tl.program_id(0).to(tl.int64)
     block_start = pid * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
@@ -259,6 +283,8 @@ def _silu_and_mul_kernel(
     up = tl.load(up_addrs, mask=mask).to(tl.float32)
     out = gate * tl.sigmoid(gate) * up
     tl.store(out_ptr + row * out_stride_row + col, out, mask=mask)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def silu_and_mul(
@@ -271,8 +297,12 @@ def silu_and_mul(
 
     ``x`` is interpreted as ``[..., 2 * D]`` with gate values in the first half
     and up values in the second half. The output has shape ``[..., D]``.
+
+    ``enable_pdl`` launches with programmatic dependent launch and fences the
+    ``x`` read with ``gdc_wait`` / ``gdc_launch_dependents`` (NVIDIA only;
+    ignored elsewhere). Safe only when the projection kernel that writes ``x``
+    is chained on the same stream/graph.
     """
-    del enable_pdl
     if x.shape[-1] % 2 != 0:
         raise ValueError(f"last dimension must be even, got {x.shape[-1]}")
     if x.stride(-1) != 1:
@@ -294,6 +324,9 @@ def silu_and_mul(
     if n == 0:
         return out
 
+    pdl_kwargs = (
+        {"launch_pdl": True} if enable_pdl and current_platform().is_nvidia else {}
+    )
     BLOCK_SIZE = 1024
     grid = ((n + BLOCK_SIZE - 1) // BLOCK_SIZE,)
     _silu_and_mul_kernel[grid](
@@ -304,6 +337,8 @@ def silu_and_mul(
         input_stride_row=flat_x.stride(0),
         out_stride_row=flat_out.stride(0),
         BLOCK_SIZE=BLOCK_SIZE,
+        ENABLE_PDL=enable_pdl,
+        **pdl_kwargs,
     )
     return out
 
@@ -393,7 +428,11 @@ def _situ_and_mul_kernel(
     out_stride_row: tl.constexpr,
     HAS_LINEAR_BETA: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        # x_ptr (packed gate|up) is the predecessor projection output.
+        tl.extra.cuda.gdc_wait()
     pid = tl.program_id(0).to(tl.int64)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
@@ -409,6 +448,8 @@ def _situ_and_mul_kernel(
     if HAS_LINEAR_BETA:
         up = linear_beta * libdevice.tanh(up / linear_beta)
     tl.store(out_ptr + row * out_stride_row + col, gate * up, mask=mask)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def situ_and_mul(
@@ -431,12 +472,14 @@ def situ_and_mul(
         out: Optional output tensor shaped ``[..., D]``.
         beta: Positive gate soft-clipping scale.
         linear_beta: Optional positive up-branch soft-clipping scale.
-        enable_pdl: Reserved for API compatibility; ignored on this kernel.
+        enable_pdl: Launch with programmatic dependent launch and fence the
+            ``x`` read with ``gdc_wait`` / ``gdc_launch_dependents`` (NVIDIA
+            only; ignored elsewhere). Safe only when the projection kernel
+            that writes ``x`` is chained on the same stream/graph.
 
     Returns:
         Tensor shaped ``[..., D]`` in the same dtype and device as ``x``.
     """
-    del enable_pdl
     if x.shape[-1] % 2 != 0:
         raise ValueError(f"last dimension must be even, got {x.shape[-1]}")
     if beta <= 0.0:
@@ -476,6 +519,9 @@ def situ_and_mul(
     # across SMs instead of one fat CTA) through prefill-sized inputs on
     # SM90+/SM100+ parts; ranked via CUDA-graph replay against Inductor's
     # autotuned pointwise configs for the same shapes.
+    pdl_kwargs = (
+        {"launch_pdl": True} if enable_pdl and current_platform().is_nvidia else {}
+    )
     block_size = 512
     grid = (triton.cdiv(n, block_size),)
     _situ_and_mul_kernel[grid](
@@ -489,7 +535,9 @@ def situ_and_mul(
         out_stride_row=flat_out.stride(0),
         HAS_LINEAR_BETA=linear_beta is not None,
         BLOCK_SIZE=block_size,
+        ENABLE_PDL=enable_pdl,
         num_warps=4,
+        **pdl_kwargs,
     )
     if kernel_out is not out:
         out.copy_(kernel_out)
@@ -634,7 +682,12 @@ def _rmsnorm_gated_kernel(
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        # x and gate are predecessor outputs (weight is a static parameter but
+        # x is read first): fence the whole per-head norm up front.
+        tl.extra.cuda.gdc_wait()
     token = tl.program_id(0)
     # Head-block grid axis: one CTA per (token, BLOCK_H heads). With
     # BLOCK_H >= num_heads the axis is 1 and this is the classic one-CTA-per
@@ -651,6 +704,8 @@ def _rmsnorm_gated_kernel(
     g = tl.load(gate_ptr + idx, mask=mask_h[:, None], other=0.0).to(tl.float32)
     y = x * rsig[:, None] * w[None, :] * tl.sigmoid(g)
     tl.store(out_ptr + idx, y.to(out_ptr.dtype.element_ty), mask=mask_h[:, None])
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def rmsnorm_gated_sigmoid(
@@ -660,6 +715,8 @@ def rmsnorm_gated_sigmoid(
     eps: float,
     num_heads: int,
     head_dim: int,
+    *,
+    enable_pdl: bool = False,
 ) -> torch.Tensor:
     """Per-head RMSNorm fused with a sigmoid output gate: ``rmsnorm(x)*w*sigmoid(g)``.
 
@@ -669,6 +726,10 @@ def rmsnorm_gated_sigmoid(
         weight: ``[head_dim]`` RMSNorm weight.
         eps: RMSNorm epsilon.
         num_heads / head_dim: per-head norm geometry.
+        enable_pdl: Launch with programmatic dependent launch and fence the
+            x/gate reads with ``gdc_wait`` / ``gdc_launch_dependents`` (NVIDIA
+            only; ignored elsewhere). Safe only when the kernels writing
+            ``x``/``gate`` are chained on the same stream/graph.
 
     Returns:
         ``[num_tokens, num_heads*head_dim]`` tensor of ``x``'s dtype.
@@ -685,6 +746,9 @@ def rmsnorm_gated_sigmoid(
         block_h, num_warps = 2, 1
     else:
         block_h, num_warps = triton.next_power_of_2(num_heads), 4
+    pdl_kwargs = (
+        {"launch_pdl": True} if enable_pdl and current_platform().is_nvidia else {}
+    )
     _rmsnorm_gated_kernel[(num_tokens, triton.cdiv(num_heads, block_h))](
         x,
         gate,
@@ -694,7 +758,9 @@ def rmsnorm_gated_sigmoid(
         num_heads=num_heads,
         head_dim=head_dim,
         BLOCK_H=block_h,
+        ENABLE_PDL=enable_pdl,
         num_warps=num_warps,
+        **pdl_kwargs,
     )
     return out
 
@@ -770,12 +836,16 @@ def _attnres_partial_kernel(
     stride_bt,
     eps,
     BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     """Online-softmax partial over the static block candidates (aux stream).
 
     Score weights and the running accumulator stay in registers; each block
     row is read from global memory exactly once.
     """
+    if ENABLE_PDL:
+        # ``blocks`` snapshots are written by the predecessor; wp is static.
+        tl.extra.cuda.gdc_wait()
     t = tl.program_id(0)
     offs = tl.arange(0, BLOCK)
     n_iters: tl.constexpr = (n_cols + BLOCK - 1) // BLOCK
@@ -813,6 +883,8 @@ def _attnres_partial_kernel(
     tl.store(acc_ptr + t * n_cols + col1, acc1, mask=mask1)
     tl.store(m_ptr + t, m_run)
     tl.store(s_ptr + t, s_run)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -832,6 +904,7 @@ def _attnres_partial_dual_kernel(
     stride_bt,
     eps,
     BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     """Two online-softmax partials over the same block sweep (aux stream).
 
@@ -839,6 +912,9 @@ def _attnres_partial_dual_kernel(
     mix. Both consume the identical block-snapshot set, so one kernel pays
     the global reads and the single-CTA latency once for both.
     """
+    if ENABLE_PDL:
+        # ``blocks`` snapshots are written by the predecessor; weights static.
+        tl.extra.cuda.gdc_wait()
     t = tl.program_id(0)
     offs = tl.arange(0, BLOCK)
     n_iters: tl.constexpr = (n_cols + BLOCK - 1) // BLOCK
@@ -895,6 +971,8 @@ def _attnres_partial_dual_kernel(
     tl.store(acc_b_ptr + t * n_cols + col1, acc_b1, mask=mask1)
     tl.store(m_b_ptr + t, m_b)
     tl.store(s_b_ptr + t, s_b)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -912,11 +990,15 @@ def _attnres_combine_kernel(
     eps,
     HAS_OUTNORM: tl.constexpr,
     BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     """Fold the prefix candidate into the block partial; optional out-norm.
 
     All operands are read once and stay register-resident.
     """
+    if ENABLE_PDL:
+        # prefix and the m/s/acc partial are predecessor outputs; wp static.
+        tl.extra.cuda.gdc_wait()
     t = tl.program_id(0)
     offs = tl.arange(0, BLOCK)
     n_iters: tl.constexpr = (n_cols + BLOCK - 1) // BLOCK
@@ -973,12 +1055,21 @@ def _attnres_combine_kernel(
             mix1.to(out_ptr.dtype.element_ty),
             mask=mask1,
         )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
-def attnres_partial(blocks, wp, eps, scratch):
-    """Blocks-side online-softmax partial. scratch = (m [T], s [T], acc [T,H] fp32)."""
+def attnres_partial(blocks, wp, eps, scratch, *, enable_pdl: bool = False):
+    """Blocks-side online-softmax partial. scratch = (m [T], s [T], acc [T,H] fp32).
+
+    ``enable_pdl`` fences the ``blocks`` read with ``gdc_wait`` /
+    ``gdc_launch_dependents`` (NVIDIA only; ignored elsewhere).
+    """
     KB, T, H = blocks.shape
     m, s_, acc = scratch
+    pdl_kwargs = (
+        {"launch_pdl": True} if enable_pdl and current_platform().is_nvidia else {}
+    )
     _attnres_partial_kernel[(T,)](
         blocks,
         wp,
@@ -991,11 +1082,15 @@ def attnres_partial(blocks, wp, eps, scratch):
         stride_bt=blocks.stride(1),
         eps=eps,
         BLOCK=4096,
+        ENABLE_PDL=enable_pdl,
         num_warps=8,
+        **pdl_kwargs,
     )
 
 
-def attnres_partial_dual(blocks, wp_a, wp_b, eps, scratch_a, scratch_b):
+def attnres_partial_dual(
+    blocks, wp_a, wp_b, eps, scratch_a, scratch_b, *, enable_pdl: bool = False
+):
     """Both mix partials (mlp-side A, next-layer attn-side B) in one sweep.
 
     Args:
@@ -1003,10 +1098,15 @@ def attnres_partial_dual(blocks, wp_a, wp_b, eps, scratch_a, scratch_b):
         wp_a/wp_b: precomputed ``rms_w * res_w`` products per side (``[H]``).
         eps: shared RMS epsilon.
         scratch_a/scratch_b: (m [T], s [T], acc [T, H] fp32) per side.
+        enable_pdl: Fence the ``blocks`` read with ``gdc_wait`` /
+            ``gdc_launch_dependents`` (NVIDIA only; ignored elsewhere).
     """
     KB, T, H = blocks.shape
     m_a, s_a, acc_a = scratch_a
     m_b, s_b, acc_b = scratch_b
+    pdl_kwargs = (
+        {"launch_pdl": True} if enable_pdl and current_platform().is_nvidia else {}
+    )
     _attnres_partial_dual_kernel[(T,)](
         blocks,
         wp_a,
@@ -1023,11 +1123,15 @@ def attnres_partial_dual(blocks, wp_a, wp_b, eps, scratch_a, scratch_b):
         stride_bt=blocks.stride(1),
         eps=eps,
         BLOCK=4096,
+        ENABLE_PDL=enable_pdl,
         num_warps=8,
+        **pdl_kwargs,
     )
 
 
-def attnres_combine(prefix, wp, out_norm_w, eps, scratch, out):
+def attnres_combine(
+    prefix, wp, out_norm_w, eps, scratch, out, *, enable_pdl: bool = False
+):
     """Merge the prefix candidate into the partial; optional fused out-norm.
 
     Args:
@@ -1040,6 +1144,9 @@ def attnres_combine(prefix, wp, out_norm_w, eps, scratch, out):
     """
     T, H = prefix.shape
     m, s_, acc = scratch
+    pdl_kwargs = (
+        {"launch_pdl": True} if enable_pdl and current_platform().is_nvidia else {}
+    )
     _attnres_combine_kernel[(T,)](
         prefix,
         wp,
@@ -1054,6 +1161,8 @@ def attnres_combine(prefix, wp, out_norm_w, eps, scratch, out):
         eps=eps,
         HAS_OUTNORM=out_norm_w is not None,
         BLOCK=4096,
+        ENABLE_PDL=enable_pdl,
         num_warps=8,
+        **pdl_kwargs,
     )
     return out

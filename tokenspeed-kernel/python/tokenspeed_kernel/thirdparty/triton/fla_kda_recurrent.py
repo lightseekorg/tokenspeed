@@ -533,7 +533,14 @@ def fused_recurrent_kda_megafuse_fwd_kernel(
     IS_VARLEN: tl.constexpr,
     HAS_DT_BIAS: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
+    if ENABLE_PDL:
+        # qkv_raw / f_a / beta are the fused-QKV projection outputs written by
+        # the predecessor kernel; conv/state weights and the recurrent pools
+        # are either static or prior-step state. Fence the whole kernel before
+        # the first projection load (conservative whole-kernel placement).
+        tl.extra.cuda.gdc_wait()
     pid = tl.program_id(0)
     NV = tl.cdiv(V, BV)
     i_v = pid % NV
@@ -688,6 +695,9 @@ def fused_recurrent_kda_megafuse_fwd_kernel(
         + o_v[None, :]
     )
     tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h & (b_write >= 0))
+    if ENABLE_PDL:
+        # o and the state page are written; release the dependent kernel.
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.heuristics({"USE_LOWER_BOUND": lambda args: args["lower_bound"] is not None})
@@ -1005,6 +1015,7 @@ def fused_recurrent_kda_megafuse(
     scale: float | None = None,
     cu_seqlens: torch.Tensor | None = None,
     lower_bound: float | None = None,
+    enable_pdl: bool = False,
 ) -> torch.Tensor:
     """Single-step KDA decode with conv1d(+silu) and the f_b gate GEMV fused in.
 
@@ -1016,6 +1027,11 @@ def fused_recurrent_kda_megafuse(
         beta: ``[T, HV]`` raw logits (sigmoid in-kernel).
         h_pool / read_indices / write_indices: as in the pool kernel.
         num_heads/head_dim: per-rank head geometry (P = num_heads*head_dim).
+        enable_pdl: Launch with programmatic dependent launch and fence the
+            projection reads with ``gdc_wait`` / ``gdc_launch_dependents``
+            (NVIDIA/CUDA only; ignored on ROCm). Safe only when the fused-QKV
+            projection that writes ``qkv_raw``/``f_a``/``beta`` is chained on
+            the same stream/graph.
 
     Returns:
         o: ``[T, HV, V]`` attention output (bf16).
@@ -1032,6 +1048,11 @@ def fused_recurrent_kda_megafuse(
     out = torch.empty(T, HV, V, dtype=qkv_raw.dtype, device=qkv_raw.device)
     BV = 32
     grid = (triton.cdiv(V, BV) * N * HV,)
+    # launch_pdl is a CUDA-only launch attribute; gate on the torch build so
+    # the ROCm backend (which lacks the option) is never handed the kwarg.
+    pdl_kwargs = (
+        {"launch_pdl": True} if enable_pdl and torch.version.hip is None else {}
+    )
     fused_recurrent_kda_megafuse_fwd_kernel[grid](
         qkv_raw=qkv_raw,
         conv_w=conv_w,
@@ -1063,7 +1084,9 @@ def fused_recurrent_kda_megafuse(
         BV=BV,
         stride_state_page=h_pool.stride(0),
         stride_conv_page=conv_pool.stride(0),
+        ENABLE_PDL=enable_pdl,
         num_warps=4,
         num_stages=2,
+        **pdl_kwargs,
     )
     return out

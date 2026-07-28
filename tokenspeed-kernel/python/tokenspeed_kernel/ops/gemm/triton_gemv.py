@@ -35,6 +35,7 @@ import functools
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
@@ -50,10 +51,16 @@ def _rowcta_gemv_add3_kernel(
     out_ptr,
     K: tl.constexpr,
     BK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     """Row dot-product with a fused two-addend epilogue:
     ``out[n] = a[n] + x . w[n] + c[n]`` (the MoE residual accumulate rides
     the up-projection store; a/c row strides support lane column slices)."""
+    if ENABLE_PDL:
+        # x/a/c are all written by the predecessor projection kernels; the
+        # weight loop and the epilogue both consume them, so wait up front
+        # before the first dependent read (conservative whole-kernel fence).
+        tl.extra.cuda.gdc_wait()
     n = tl.program_id(0)
     acc = tl.zeros([BK], tl.float32)
     for kb in tl.static_range(0, K, BK):
@@ -68,6 +75,9 @@ def _rowcta_gemv_add3_kernel(
         out_ptr + n,
         (av + tl.sum(acc) + cv).to(out_ptr.dtype.element_ty),
     )
+    if ENABLE_PDL:
+        # Output row stored; release the dependent (MoE/norm) kernel's launch.
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -77,7 +87,12 @@ def _rowcta_gemv_kernel(
     out_ptr,
     K: tl.constexpr,
     BK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        # x is the predecessor's activation row (weight is a static parameter,
+        # but x is consumed inside the reduction loop): fence before the loop.
+        tl.extra.cuda.gdc_wait()
     n = tl.program_id(0)
     acc = tl.zeros([BK], tl.float32)
     for kb in tl.static_range(0, K, BK):
@@ -87,10 +102,16 @@ def _rowcta_gemv_kernel(
         wv = tl.load(w_ptr + n * K + offs, mask=mask, other=0.0).to(tl.float32)
         acc += wv * xv
     tl.store(out_ptr + n, tl.sum(acc).to(out_ptr.dtype.element_ty))
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def rowcta_gemv(
-    x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None = None
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor | None = None,
+    *,
+    enable_pdl: bool = False,
 ) -> torch.Tensor:
     """``x @ weight.T`` for ``M == 1`` decode activations.
 
@@ -98,6 +119,10 @@ def rowcta_gemv(
         x: ``[1, K]`` contiguous bf16 activation row.
         weight: ``[N, K]`` contiguous bf16 weight.
         out: optional ``[1, N]`` destination.
+        enable_pdl: Launch with programmatic dependent launch and fence the
+            activation read with ``gdc_wait`` / ``gdc_launch_dependents``
+            (NVIDIA only; ignored elsewhere). Safe only when the predecessor
+            kernel that writes ``x`` is chained on the same stream/graph.
 
     Returns:
         ``[1, N]`` output in ``x``'s dtype.
@@ -106,6 +131,9 @@ def rowcta_gemv(
     n, k = weight.shape
     if out is None:
         out = torch.empty(1, n, dtype=x.dtype, device=x.device)
+    pdl_kwargs = (
+        {"launch_pdl": True} if enable_pdl and current_platform().is_nvidia else {}
+    )
     # BK=512 (4 fp32 accumulator regs/thread): standalone parity, and aux-stream kernels co-reside instead of stalling behind the GEMV wave.
     _rowcta_gemv_kernel[(n,)](
         x.view(-1),
@@ -113,7 +141,9 @@ def rowcta_gemv(
         out.view(-1),
         K=k,
         BK=512,
+        ENABLE_PDL=enable_pdl,
         num_warps=4,
+        **pdl_kwargs,
     )
     return out
 
@@ -202,6 +232,8 @@ def rowcta_gemv_add3(
     a: torch.Tensor,
     c: torch.Tensor,
     out: torch.Tensor | None = None,
+    *,
+    enable_pdl: bool = False,
 ) -> torch.Tensor:
     """``a + x @ weight.T + c`` for ``M == 1`` (fused MoE residual epilogue).
 
@@ -209,6 +241,10 @@ def rowcta_gemv_add3(
         x: ``[1, K]`` bf16 latent row; weight: ``[N, K]``.
         a/c: ``[1, N]`` addends (``c`` may be a wider-lane column slice --
             only unit inner stride is required).
+        enable_pdl: Launch with programmatic dependent launch and fence the
+            predecessor reads with ``gdc_wait`` / ``gdc_launch_dependents``
+            (NVIDIA only; ignored elsewhere). Safe only when the kernels
+            writing ``x``/``a``/``c`` are chained on the same stream/graph.
 
     Returns:
         ``[1, N]`` prefix row.
@@ -218,6 +254,9 @@ def rowcta_gemv_add3(
     n, k = weight.shape
     if out is None:
         out = torch.empty(1, n, dtype=x.dtype, device=x.device)
+    pdl_kwargs = (
+        {"launch_pdl": True} if enable_pdl and current_platform().is_nvidia else {}
+    )
     _rowcta_gemv_add3_kernel[(n,)](
         x.view(-1),
         weight,
@@ -226,6 +265,8 @@ def rowcta_gemv_add3(
         out,
         K=k,
         BK=512,
+        ENABLE_PDL=enable_pdl,
         num_warps=4,
+        **pdl_kwargs,
     )
     return out
