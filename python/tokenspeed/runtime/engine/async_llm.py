@@ -335,7 +335,12 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         )
         self.rid_to_state[obj.rid] = state
         mm_inputs = getattr(tokenized_obj, "multimodal_inputs", None)
-        if mm_inputs is not None:
+        # POSIX SHM names are only meaningful on the host that created them.
+        # With multiple nodes the DP controller can route this request to a
+        # remote worker, and TP itself may span hosts, so keep tensors inline
+        # for ZMQ/Gloo serialization. Single-node deployments retain the SHM
+        # fast path and its pinned-memory staging behavior.
+        if mm_inputs is not None and self.server_args.mapping.nnodes == 1:
             mm_inputs.publish_shm_features()
         self.engine_core_client.send_to_scheduler.send_pyobj(tokenized_obj)
 
