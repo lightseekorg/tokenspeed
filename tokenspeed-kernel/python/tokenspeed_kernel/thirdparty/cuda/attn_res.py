@@ -48,6 +48,15 @@ def has_attn_res_fwd() -> bool:
     return hasattr(module, "attn_res_fwd")
 
 
+def has_attn_res_fwd_v2() -> bool:
+    """True when the online-softmax v2 kernel is built and loadable."""
+    try:
+        module = _load_attn_res_module()
+    except Exception:
+        return False
+    return hasattr(module, "attn_res_fwd_v2")
+
+
 def attn_res_fwd_packed(
     layer_residual: torch.Tensor,
     block_residual: torch.Tensor,
@@ -107,5 +116,71 @@ def attn_res_fwd_packed(
             probs,
             logits,
             float(rms_eps),
+        )
+    return output
+
+
+def attn_res_fwd_v2_packed(
+    prefix: torch.Tensor,
+    delta: torch.Tensor | None,
+    blocks: torch.Tensor,
+    res_weight: torch.Tensor,
+    rms_weight: torch.Tensor,
+    out_norm_weight: torch.Tensor,
+    rms_eps: float,
+    out_norm_eps: float,
+    enable_pdl: bool = False,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Warp-specialized online-softmax AttnRes forward (v2, SM100, H=7168).
+
+    Candidates are ``blocks[0..KB-1]`` then ``prefix`` (N = KB + 1); the mix is
+    followed by a fused RMSNorm with ``out_norm_weight``. When ``delta`` is
+    given, ``prefix += delta`` is folded in first (bf16, written back in place)
+    and the updated stream is the prefix candidate.
+
+    Args:
+        prefix: bf16 ``[T, H]`` contiguous residual stream. Updated IN PLACE
+            when ``delta`` is given.
+        delta: optional bf16 ``[T, H]`` contiguous residual increment.
+        blocks: bf16 ``[KB, T, H]`` snapshots, KB in [1, 8]; leading dims may
+            be strided (16-byte aligned), rows must be dense.
+        res_weight: bf16 ``[H]`` scorer projection weight.
+        rms_weight: bf16 ``[H]`` candidate RMSNorm weight.
+        out_norm_weight: bf16 ``[H]`` fused following-RMSNorm weight.
+        rms_eps: candidate RMSNorm epsilon.
+        out_norm_eps: following RMSNorm epsilon.
+        enable_pdl: launch with programmatic stream serialization (PDL).
+        out: optional preallocated bf16 ``[T, H]`` destination.
+
+    Returns:
+        bf16 ``[T, H]`` normed mix (``out`` when given).
+    """
+    output = torch.empty_like(prefix) if out is None else out
+    module = _load_attn_res_module()
+    if delta is None:
+        module.attn_res_fwd_v2(
+            prefix,
+            blocks,
+            res_weight,
+            rms_weight,
+            out_norm_weight,
+            output,
+            float(rms_eps),
+            float(out_norm_eps),
+            bool(enable_pdl),
+        )
+    else:
+        module.attn_res_fwd_v2_delta(
+            prefix,
+            delta,
+            blocks,
+            res_weight,
+            rms_weight,
+            out_norm_weight,
+            output,
+            float(rms_eps),
+            float(out_norm_eps),
+            bool(enable_pdl),
         )
     return output

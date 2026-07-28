@@ -25,7 +25,7 @@
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
-__all__ = ["attn_res_fwd"]
+__all__ = ["attn_res_fwd", "attn_res_fwd_v2", "attn_res_fwd_v2_cuda_available"]
 
 # Blackwell kernel coverage. This must stay a subset of the authoritative
 # TVM_FFI_ICHECK bounds in csrc/attn_res_binding.cu; this gate only decides when
@@ -33,6 +33,12 @@ __all__ = ["attn_res_fwd"]
 _SUPPORTED_H = frozenset({4096, 5120, 6144, 7168, 8192})
 _MAX_T = 16384
 _MAX_N = 12
+
+# v2 (online-softmax, PDL) kernel coverage; subset of the TVM_FFI_ICHECK bounds
+# in csrc/attn_res_v2_binding.cu.
+_V2_H = 7168
+_V2_MAX_KB = 8
+_V2_MAX_T = 16384
 
 
 def attn_res_fwd(
@@ -86,6 +92,96 @@ def attn_res_fwd(
         rms_weight=rms_weight,
         eps=eps,
         out_norm_weight=out_norm_weight,
+    )
+
+
+def attn_res_fwd_v2_cuda_available(hidden_size: int, max_num_blocks: int) -> bool:
+    """Capability probe: can ``attn_res_fwd_v2`` serve every mix of this model
+    on the CUDA solution (no silent torch fallback in the hot path)?
+
+    Args:
+        hidden_size: model hidden size (only 7168 is instantiated).
+        max_num_blocks: largest candidate-block count any mix will pass.
+
+    Returns:
+        True when the SM100 v2 kernel is loadable and covers the shapes.
+    """
+    from tokenspeed_kernel.ops.attn_res.cuda import _HAS_CUDA_KERNEL_V2
+
+    return (
+        _HAS_CUDA_KERNEL_V2
+        and hidden_size == _V2_H
+        and 1 <= max_num_blocks <= _V2_MAX_KB
+    )
+
+
+def attn_res_fwd_v2(
+    prefix,
+    delta,
+    block_residual,
+    res_weight,
+    rms_weight,
+    out_norm_weight,
+    eps,
+    out_norm_eps,
+    enable_pdl=False,
+    out=None,
+):
+    """Single-kernel AttnRes forward: optional residual accumulate + mix + norm.
+
+    Candidates are ``block_residual[0..KB-1]`` followed by ``prefix``
+    (N = KB + 1). Computes ``softmax_n(<RMSNorm(v_n), rms_weight *
+    res_weight>)`` over candidates, the weighted sum of the raw candidates,
+    then the following RMSNorm with ``out_norm_weight``.
+
+    Args:
+        prefix: bf16 ``[T, H]`` contiguous residual stream. When ``delta`` is
+            given, updated IN PLACE with ``prefix += delta`` (bf16) before the
+            mix, so the caller's residual accumulate is fused away.
+        delta: optional bf16 ``[T, H]`` contiguous residual increment (e.g. the
+            all-reduced attention output).
+        block_residual: bf16 ``[KB, T, H]`` snapshots; leading dims may be
+            strided, rows dense.
+        res_weight: bf16 ``[H]`` scorer projection weight.
+        rms_weight: bf16 ``[H]`` candidate RMSNorm weight.
+        out_norm_weight: bf16 ``[H]`` fused following-RMSNorm weight.
+        eps: candidate RMSNorm epsilon.
+        out_norm_eps: following RMSNorm epsilon.
+        enable_pdl: launch with programmatic stream serialization when the CUDA
+            solution runs (ignored by the torch fallback).
+        out: optional preallocated bf16 ``[T, H]`` destination.
+
+    Returns:
+        bf16 ``[T, H]`` normed mix.
+    """
+    T, H = prefix.shape
+    KB = block_residual.shape[0]
+    eligible = H == _V2_H and 1 <= T <= _V2_MAX_T and 1 <= KB <= _V2_MAX_KB
+    signature = format_signature(
+        prefix=dense_tensor_format(prefix.dtype),
+        block_residual=dense_tensor_format(block_residual.dtype),
+    )
+    kernel = select_kernel(
+        "attn_res",
+        "fwd_v2",
+        signature,
+        traits={
+            "has_delta": delta is not None,
+            "large_prefill": T > 32,
+        },
+        solution=None if eligible else "torch",
+    )
+    return kernel(
+        prefix=prefix,
+        delta=delta,
+        block_residual=block_residual,
+        res_weight=res_weight,
+        rms_weight=rms_weight,
+        out_norm_weight=out_norm_weight,
+        eps=eps,
+        out_norm_eps=out_norm_eps,
+        enable_pdl=enable_pdl,
+        out=out,
     )
 
 
