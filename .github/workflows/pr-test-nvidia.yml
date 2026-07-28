@@ -44,7 +44,7 @@ on:
 env:
   PIP_BREAK_SYSTEM_PACKAGES: 1
   CUDA_VERSION: 13.0.1
-  TOKENSPEED_B200_RUNNER_LABEL: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL }}
+  TOKENSPEED_B200_RUNNER_LABEL: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL || 'b200v2' }}
 
 concurrency:
   group: pr-test-nvidia-${{ github.event.pull_request.number || github.ref }}
@@ -81,7 +81,7 @@ jobs:
       - name: Build task matrix
         id: scan
         env:
-          TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS: ${{ vars.TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS }}
+          TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS: h100,${{ vars.TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS }}
         run: |
           MATRIX=$(python3 test/ci_system/pipeline.py scan \
             --root test/ci \
