@@ -177,12 +177,9 @@ def _prepare_draft_lcm_fields(
 def _pool_allocated_bytes(pool) -> int:
     if pool is None:
         return 0
-    plan = getattr(pool, "_lcm_memory_plan", None)
-    if plan is not None:
-        arena = getattr(pool, "_lcm_arena", None)
-        if arena is None:
-            raise RuntimeError("LCM pool has no allocated arena")
-        return int(arena.backing.nbytes)
+    lcm_pool = getattr(pool, "lcm_pool", None)
+    if lcm_pool is not None:
+        return int(lcm_pool.backing.nbytes)
     sizes = pool.get_kv_size_bytes()
     if isinstance(sizes, tuple):
         return sum(int(size) for size in sizes)
@@ -249,13 +246,13 @@ def _validate_shared_lcm_geometry(pool, draft_pool) -> None:
                 "do not share scheduler semantics"
             )
 
-    target_arena = getattr(pool, "_lcm_arena", None)
-    draft_arena = getattr(draft_pool, "_lcm_arena", None)
-    if target_arena is None or draft_arena is None:
+    target_lcm_pool = getattr(pool, "lcm_pool", None)
+    draft_lcm_pool = getattr(draft_pool, "lcm_pool", None)
+    if target_lcm_pool is None or draft_lcm_pool is None:
         raise RuntimeError("LCM target and draft pools must allocate their arenas")
     if (
-        target_arena.backing.untyped_storage().data_ptr()
-        == draft_arena.backing.untyped_storage().data_ptr()
+        target_lcm_pool.backing.untyped_storage().data_ptr()
+        == draft_lcm_pool.backing.untyped_storage().data_ptr()
     ):
         raise RuntimeError("target and draft LCM arenas must not share backing")
 

@@ -30,14 +30,13 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     quantize_store_kv_mxfp8,
     store_kv_cache,
     store_sf_interleaved,
-    zero_byte_segments,
 )
 
 from tokenspeed.runtime.configs import paged_cache_spec
 from tokenspeed.runtime.configs.lcm_memory_plan import LcmMemoryPlan
 from tokenspeed.runtime.configs.paged_cache_spec import hybrid_slab_group_size
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
-from tokenspeed.runtime.layers.attention.kv_cache.lcm_arena import LcmArena
+from tokenspeed.runtime.layers.attention.kv_cache.lcm import LcmCachePool
 from tokenspeed.runtime.layers.attention.kv_cache.utils import (
     copy_all_layer_kv_cache_tiled,
     move_kv_cache_native,
@@ -132,8 +131,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         self.layer_cache_group_ids = tuple(layer_cache_group_ids or ())
         self._lcm_memory_plan = lcm_memory_plan
         self.flat_kv_requires_page_zeroing = self._lcm_memory_plan is not None
-        self._lcm_arena: LcmArena | None = None
-        self._lcm_field_views: dict[tuple[str, torch.dtype], torch.Tensor] = {}
+        self.lcm_pool: LcmCachePool | None = None
         self._conv_state_shape = (
             tuple(conv_state_shape) if conv_state_shape is not None else None
         )
@@ -245,28 +243,9 @@ class MHATokenToKVPool(BaseTokenToKVPool):
 
     def get_flatkv_pd_contract(self):
         """Expose the LCM arena through main's FlatKV PD lifecycle."""
-        if not self.supports_disaggregation or self._lcm_arena is None:
+        if not self.supports_disaggregation or self.lcm_pool is None:
             raise RuntimeError("FlatKV PD requires an enabled LCM arena")
-        from tokenspeed.runtime.pd.flatkv import build_lcm_flatkv_pd_contract
-
-        field_dtypes = {}
-        for field in self._lcm_memory_plan.fields:
-            cached = [
-                dtype
-                for (field_id, dtype) in self._lcm_field_views
-                if field_id == field.field_id
-            ]
-            if len(cached) != 1:
-                raise RuntimeError(
-                    f"LCM PD field {field.field_id!r} does not have one runtime dtype"
-                )
-            field_dtypes[field.field_id] = str(cached[0]).removeprefix("torch.")
-        return build_lcm_flatkv_pd_contract(
-            plan=self._lcm_memory_plan,
-            backing=self._lcm_arena.backing,
-            group_specs=self.paged_cache_group_specs,
-            field_dtypes=field_dtypes,
-        )
+        return self.lcm_pool.pd_contract(self.paged_cache_group_specs)
 
     @property
     def num_lcm_blocks(self) -> int | None:
@@ -357,7 +336,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                 f"{expected_size}"
             )
 
-        self._lcm_arena = LcmArena.allocate(plan, self.device)
+        self.lcm_pool = LcmCachePool(plan, self.device)
         self.k_buffer = [None] * self.layer_num
         self.v_buffer = [None] * self.layer_num
         for layer_id, label in enumerate(self._layer_types):
@@ -406,28 +385,15 @@ class MHATokenToKVPool(BaseTokenToKVPool):
 
     def zero_new_pages(self, new_page_ids: dict[str, list[int]]) -> None:
         """Clear newly bound LCM pages before their first kernel use."""
-        if self._lcm_memory_plan is None or not new_page_ids:
+        if self.lcm_pool is None or not new_page_ids:
             return
-        segments = [
-            segment
-            for group_id, page_ids in new_page_ids.items()
-            for segment in self._lcm_arena.page_byte_segments(group_id, page_ids)
-        ]
-        zero_byte_segments(self._lcm_arena.backing, segments)
+        self.lcm_pool.zero_pages(new_page_ids)
 
     def get_lcm_field(self, field_id: str, dtype: torch.dtype) -> torch.Tensor:
         """Return one typed field view from the pool's shared LCM arena."""
-        if self._lcm_arena is None:
+        if self.lcm_pool is None:
             raise ValueError("LCM fields are unavailable without an LCM memory plan")
-        key = (field_id, dtype)
-        if key in self._lcm_field_views:
-            return self._lcm_field_views[key]
-        try:
-            view = self._lcm_arena.field_view(field_id, dtype)
-        except KeyError as exc:
-            raise ValueError(f"LCM field {field_id!r} is not planned") from exc
-        self._lcm_field_views[key] = view
-        return view
+        return self.lcm_pool.field(field_id, dtype)
 
     def _create_non_lcm_buffers(self):
         # Page 0 is the zero-initialized dummy page: padded tokens write there.
