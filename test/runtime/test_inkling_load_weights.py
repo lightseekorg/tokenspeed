@@ -1,48 +1,54 @@
 """Inkling ``load_weights`` unit test against a synthetic real-name checkpoint.
 
 Builds an in-memory checkpoint using the REAL checkpoint tensor names
-(``model.llm.layers.N.attn.wq_du.weight`` etc.), with gate/up-interleaved w13
-tensors and asymmetric full/SWA KV heads like the real model, then asserts
-every parameter is covered and the values land where the reference
-implementation puts them: qkvr fusion order, full-layer KV replication,
-and w13 de-interleaving (dense, routed and shared experts).
+(``model.llm.layers.N.attn.wq_du.weight`` etc.) at the released config's
+geometry (layer-truncated; see ``inkling_fixtures``), with gate/up-interleaved
+w13 tensors and the real asymmetric full/SWA KV heads, then asserts every
+parameter is covered and the values land where the reference implementation
+puts them: qkvr fusion order, full-layer KV replication, and w13
+de-interleaving (dense, routed and shared experts).
 
-NOTE: intentionally not registered in CI. This file is the only loader
-coverage Inkling gets (the gated checkpoint rules out the
-boot-real-weights CI gate other models use) — run it locally after loader
-changes. Needs any CUDA GPU (weight copies only, no kernels).
+Synthetic tensors keep the values independently reproducible for
+exact-placement asserts and make the TP/EP slice tests single-process.
 """
 
-import json
 import os
 import sys
-import tempfile
 import unittest
 
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
 from runtime.models.inkling_fixtures import (  # noqa: E402
-    TINY_MM_CONFIG,
-    make_inkling_dummy_checkpoint,
+    NUM_TEST_EXPERTS,
+    has_blackwell,
+    load_inkling_config,
 )
+
+register_cuda_ci(
+    est_time=120,
+    suite="runtime-1gpu",
+    disabled_on_runners=["amd-*", "h100-*"],
+)
+
+if not has_blackwell():
+    raise unittest.SkipTest("Inkling loader tests require an NVIDIA Blackwell GPU")
 
 SEED = 1234
 
 
-def _build_model(ckpt: str, quant_config=None, rank=0, world_size=1, **mapping_kw):
+def _build_model(config, quant_config=None, rank=0, world_size=1, **mapping_kw):
     from tokenspeed.runtime.distributed.mapping import Mapping
     from tokenspeed.runtime.layers.moe import utils as moe_utils
     from tokenspeed.runtime.models.inkling import InklingForConditionalGeneration
     from tokenspeed.runtime.utils.env import global_server_args_dict
-    from tokenspeed.runtime.utils.hf_transformers_utils import get_config
 
     # Same precomputed-topk backend the engine resolves for Inkling.
     moe_utils.MOE_BACKEND = moe_utils.MoeBackend.FLASHINFER_CUTLASS
     mapping = Mapping(rank=rank, world_size=world_size, **mapping_kw)
     global_server_args_dict["mapping"] = mapping
     global_server_args_dict["enable_prefix_caching"] = False
-    config = get_config(ckpt, trust_remote_code=False, revision=None)
     with torch.device("cuda"):
         torch.set_default_dtype(torch.bfloat16)
         try:
@@ -59,6 +65,22 @@ def _deinterleave_rows(w: torch.Tensor) -> torch.Tensor:
     return torch.cat([w[..., 0::2, :], w[..., 1::2, :]], dim=-2)
 
 
+def _make_tower_tensors(model) -> dict[str, torch.Tensor]:
+    """Audio/vision tower tensors under their real checkpoint names, shaped
+    from the constructed towers (TP-replicated)."""
+    gen = torch.Generator(device="cuda").manual_seed(SEED + 1)
+    return {
+        "model."
+        + name.replace("visual.vision_encoder.", "visual."): torch.randn(
+            p.shape, generator=gen, dtype=torch.float32, device="cuda"
+        )
+        .to(p.dtype)
+        .cpu()
+        for name, p in model.named_parameters()
+        if name.startswith(("audio.", "visual."))
+    }
+
+
 def _make_checkpoint_tensors(
     text, fp4_layers: set[int] = frozenset()
 ) -> dict[str, torch.Tensor]:
@@ -68,16 +90,24 @@ def _make_checkpoint_tensors(
     format (packed U8 + F8 block scales + scale2 + input_amax) instead of
     BF16, mirroring the real FP4 snapshot's mixed precision.
     """
-    gen = torch.Generator().manual_seed(SEED)
+    # Generate on GPU (CPU randn is slow at the real widths), stage to host.
+    gen = torch.Generator(device="cuda").manual_seed(SEED)
 
     def rand(*shape, dtype=torch.bfloat16):
-        return torch.randn(*shape, generator=gen, dtype=torch.float32).to(dtype)
+        return (
+            torch.randn(*shape, generator=gen, dtype=torch.float32, device="cuda")
+            .to(dtype)
+            .cpu()
+        )
 
     def rand_bytes(*shape, dtype=torch.uint8):
         return (
-            torch.randint(0, 256, shape, generator=gen, dtype=torch.int64)
+            torch.randint(
+                0, 256, shape, generator=gen, dtype=torch.int64, device="cuda"
+            )
             .to(torch.uint8)
             .view(dtype)
+            .cpu()
         )
 
     h = text.hidden_size
@@ -156,15 +186,16 @@ class TestInklingLoadWeights(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         os.environ["INKLING_TORCH_MOE"] = "1"  # experts as plain parameters
-        cls._tmpdir = tempfile.TemporaryDirectory()
-        ckpt_dir = make_inkling_dummy_checkpoint(cls._tmpdir.name, tiny=True)
-        cls.model, cls.text = _build_model(str(ckpt_dir))
-        cls.ckpt = _make_checkpoint_tensors(cls.text)
+        config = load_inkling_config(num_experts=NUM_TEST_EXPERTS)
+        cls.ckpt = _make_checkpoint_tensors(config.get_text_config())
+        cls.model, cls.text = _build_model(config)
+        cls.ckpt.update(_make_tower_tensors(cls.model))
         cls.loaded = cls.model.load_weights(iter(cls.ckpt.items()))
 
     @classmethod
     def tearDownClass(cls):
-        cls._tmpdir.cleanup()
+        del cls.model, cls.ckpt
+        torch.cuda.empty_cache()
 
     def _param(self, name: str) -> torch.Tensor:
         return dict(self.model.named_parameters())[name].data.cpu()
@@ -338,18 +369,13 @@ class TestInklingMoeBlockDeferredFinalize(unittest.TestCase):
         ):
             self.skipTest("routed trtllm MoE kernels need SM100")
 
-        from tokenspeed.runtime.configs.inkling_config import InklingModelConfig
         from tokenspeed.runtime.distributed.mapping import Mapping
         from tokenspeed.runtime.layers.moe import utils as moe_utils
         from tokenspeed.runtime.models.inkling import InklingSparseMoeBlock
         from tokenspeed.runtime.utils.env import global_server_args_dict
 
         torch.manual_seed(SEED)
-        # The routed unquant trtllm kernel requires ispp % 128 == 0; the tiny
-        # fixture's intermediate 64 doesn't qualify, so widen it here.
-        cfg = dict(TINY_MM_CONFIG["text_config"])
-        cfg["intermediate_size"] = 256
-        text = InklingModelConfig(**cfg)
+        text = load_inkling_config(num_experts=NUM_TEST_EXPERTS).get_text_config()
 
         saved_backend = moe_utils.MOE_BACKEND
         saved_torch_moe = os.environ.pop("INKLING_TORCH_MOE", None)
@@ -413,20 +439,18 @@ class TestInklingLoadWeightsParallel(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         os.environ.pop("INKLING_TORCH_MOE", None)  # real MoELayer path
-        cls._tmpdir = tempfile.TemporaryDirectory()
-        cls.ckpt_dir = str(make_inkling_dummy_checkpoint(cls._tmpdir.name, tiny=True))
-        cls.ckpt = None  # built after the first model gives us the text config
+        cls.config = load_inkling_config(num_experts=NUM_TEST_EXPERTS)
+        cls.ckpt = _make_checkpoint_tensors(cls.config.get_text_config())
 
     @classmethod
     def tearDownClass(cls):
-        cls._tmpdir.cleanup()
+        del cls.ckpt
+        torch.cuda.empty_cache()
 
     def _load_rank(self, rank, world_size, **mapping_kw):
         model, text = _build_model(
-            self.ckpt_dir, rank=rank, world_size=world_size, **mapping_kw
+            self.config, rank=rank, world_size=world_size, **mapping_kw
         )
-        if type(self).ckpt is None:
-            type(self).ckpt = _make_checkpoint_tensors(text)
         model.load_weights(iter(self.ckpt.items()))
         return model, text
 
@@ -438,16 +462,19 @@ class TestInklingLoadWeightsParallel(unittest.TestCase):
             inkling_kv_heads_for_layer,
         )
 
-        hd = 32
         hetero = True  # gate retired 2026-07-15; hetero KV is unconditional
         for rank in range(2):
             model, text = self._load_rank(rank, 2)
+            hd = text.head_dim
             tp = 2
-            q_heads = text.num_attention_heads // tp  # 4 per rank
+            q_heads = text.num_attention_heads // tp
             # Layer 4 is local (ckpt KV == served). Layer 5 is full: hetero
-            # (default) serves its native 2 heads (1 per rank, factor 1);
-            # uniform mode replicates 2 -> 4.
-            for layer, ckpt_kv in ((4, 4), (5, 2)):
+            # (default) serves its native 8 heads (4 per rank, factor 1);
+            # uniform mode replicates 8 -> 16.
+            for layer, ckpt_kv in (
+                (4, text.swa_num_key_value_heads),
+                (5, text.ckpt_num_key_value_heads),
+            ):
                 served = max(inkling_kv_heads_for_layer(text, layer, hetero), tp)
                 p = f"model.llm.layers.{layer}.attn"
                 qkvr = self._param(model, f"model.layers.{layer}.attn.qkvr.weight")
@@ -522,13 +549,19 @@ class TestInklingLoadWeightsParallel(unittest.TestCase):
             del model
             torch.cuda.empty_cache()
 
-    def test_attention_tp8_kv_replication(self):
-        """TP (8) beyond the served KV head count (4): one KV head per rank,
-        replicated block-contiguously; ckpt head = (rank * ckpt_kv) // tp."""
-        hd, tp = 32, 8
-        for rank in (0, 3, 5, 7):
+    def test_attention_tp16_kv_replication(self):
+        """TP (16) beyond the full layers' served KV head count (8): one KV
+        head per rank, replicated block-contiguously; ckpt head =
+        (rank * ckpt_kv) // tp. SWA layers serve exactly one native head per
+        rank (factor 1), covered by the same formula."""
+        tp = 16
+        for rank in (0, 3, 5, 15):
             model, text = self._load_rank(rank, tp)
-            for layer, ckpt_kv in ((4, 4), (5, 2)):
+            hd = text.head_dim
+            for layer, ckpt_kv in (
+                (4, text.swa_num_key_value_heads),
+                (5, text.ckpt_num_key_value_heads),
+            ):
                 p = f"model.llm.layers.{layer}.attn"
                 qkvr = self._param(model, f"model.layers.{layer}.attn.qkvr.weight")
                 q_rows = (text.num_attention_heads // tp) * hd  # 1 head
@@ -631,34 +664,24 @@ class TestInklingLoadWeightsNvfp4(unittest.TestCase):
         from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
 
         os.environ.pop("INKLING_TORCH_MOE", None)  # real MoELayer path
-        cls._tmpdir = tempfile.TemporaryDirectory()
-        ckpt_dir = make_inkling_dummy_checkpoint(cls._tmpdir.name, tiny=True)
-        cfg_path = os.path.join(str(ckpt_dir), "config.json")
-        with open(cfg_path) as f:
-            cfg = json.load(f)
-        cfg["text_config"]["use_global_scale"] = True
-        with open(cfg_path, "w") as f:
-            json.dump(cfg, f)
-
-        from tokenspeed.runtime.configs.inkling_config import InklingModelConfig
-
-        text_probe = InklingModelConfig(**cfg["text_config"])
+        config = load_inkling_config(num_experts=NUM_TEST_EXPERTS)
+        text_probe = config.get_text_config()
         quant = Nvfp4Config(
             group_size=16,
             exclude_modules=_checkpoint_style_exclude_list(text_probe),
         )
-        cls.model, cls.text = _build_model(str(ckpt_dir), quant_config=quant)
         cls.fp4_layers = set(
-            range(cls.text.dense_mlp_idx + 1, cls.text.num_hidden_layers)
+            range(text_probe.dense_mlp_idx + 1, text_probe.num_hidden_layers)
         )
-        cls.ckpt = _make_checkpoint_tensors(cls.text, fp4_layers=cls.fp4_layers)
+        cls.ckpt = _make_checkpoint_tensors(text_probe, fp4_layers=cls.fp4_layers)
+        cls.model, cls.text = _build_model(config, quant_config=quant)
+        cls.ckpt.update(_make_tower_tensors(cls.model))
         cls.loaded = cls.model.load_weights(iter(cls.ckpt.items()))
 
     @classmethod
     def tearDownClass(cls):
-        del cls.model
+        del cls.model, cls.ckpt
         torch.cuda.empty_cache()
-        cls._tmpdir.cleanup()
 
     def _param(self, name: str) -> torch.Tensor:
         return dict(self.model.named_parameters())[name].data.cpu()

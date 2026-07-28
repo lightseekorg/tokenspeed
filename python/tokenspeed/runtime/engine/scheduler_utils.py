@@ -145,6 +145,51 @@ def resolve_scheduler_block_size(page_size: int, paged_cache_groups) -> int:
     return base
 
 
+def aligned_max_scheduled_tokens(
+    max_scheduled_tokens: int,
+    paged_cache_groups,
+    page_size: int,
+) -> int:
+    """Floor ``max_scheduled_tokens`` to the state-snapshot grain, if any.
+
+    Recurrent-state groups (family=State, retention=FullHistory — the C++
+    ``final_state_manager`` criterion) register their state snapshot only when
+    a prefill chunk ends exactly on a page boundary
+    (``RegistersAlignedFinalPageOnly``); interior boundaries never received a
+    state write. A chunk size that is not a multiple of every such group's
+    page size therefore never registers a state page, and since the admission
+    probe takes the minimum hit across groups, prefix-cache reuse silently
+    degrades to zero for the whole model.
+
+    Args:
+        max_scheduled_tokens: Requested per-step token budget
+            (``--chunked-prefill-size``).
+        paged_cache_groups: Scheduler ``PagedCacheGroupConfig`` sequence, or
+            None/empty when the model declares no paged cache groups.
+        page_size: Global page size in tokens; the fallback grain for groups
+            whose ``block_size`` is 0 (= unset, global base).
+
+    Returns:
+        ``max_scheduled_tokens`` floored to the LCM of the state groups' page
+        sizes, but never below one page (a smaller chunk could not register a
+        snapshot at all). Returned unchanged when no such group exists or the
+        value is already aligned.
+    """
+    require_positive_int("max_scheduled_tokens", max_scheduled_tokens)
+    require_positive_int("page_size", page_size)
+    grain = 1
+    for group in paged_cache_groups or ():
+        if group.family != PagedCacheGroupFamily.State:
+            continue
+        if group.retention == PagedCacheRetention.SlidingWindow:
+            continue
+        group_block = int(getattr(group, "block_size", 0) or 0) or page_size
+        grain = math.lcm(grain, group_block)
+    if grain == 1:
+        return max_scheduled_tokens
+    return max(max_scheduled_tokens - max_scheduled_tokens % grain, grain)
+
+
 def make_spec(rid: str, tokens: list[int]) -> RequestSpec:
     spec = RequestSpec()
     spec.request_id = rid
