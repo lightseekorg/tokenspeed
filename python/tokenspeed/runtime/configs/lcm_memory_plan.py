@@ -30,7 +30,6 @@ from dataclasses import dataclass
 # Planner/runtime limits, not model layout inputs.
 _MAX_LCM_BLOCK_BYTES = (1 << 63) - 1
 _MAX_KERNEL_PAGE_ID = (1 << 31) - 1
-_MAX_PACKING = 128
 
 
 @dataclass(frozen=True)
@@ -180,8 +179,6 @@ def _solve_packing(fields):
             {group_id: count // smallest for group_id, count in counts.items()}
         )
 
-    if any(count > _MAX_PACKING for count in packing.values()):
-        return None
     return packing
 
 
@@ -290,15 +287,10 @@ def plan_lcm_fields(
             )
         packing = dict(cache_blocks_per_lcm_block)
         if any(
-            isinstance(count, bool)
-            or not isinstance(count, int)
-            or count < 1
-            or count > _MAX_PACKING
+            isinstance(count, bool) or not isinstance(count, int) or count < 1
             for count in packing.values()
         ):
-            raise ValueError(
-                f"cache group packing must be an integer in [1, {_MAX_PACKING}]"
-            )
+            raise ValueError("cache group packing must be a positive integer")
     else:
         packing = _packing_by_group_ratio(raw_by_group)
         constrained = _solve_packing(ordered_fields)
@@ -358,11 +350,8 @@ def plan_lcm_fields(
             if not all(plane_id in fixed_plane_bytes for plane_id in occupied_planes):
                 continue
             upper = min(
-                _MAX_PACKING,
-                *(
-                    fixed_plane_bytes[plane_id] // payload_bytes
-                    for plane_id, payload_bytes in occupied_planes.items()
-                ),
+                fixed_plane_bytes[plane_id] // payload_bytes
+                for plane_id, payload_bytes in occupied_planes.items()
             )
             element_alignment_by_plane = {}
             for plane_id, group_fields in plane_fields.items():

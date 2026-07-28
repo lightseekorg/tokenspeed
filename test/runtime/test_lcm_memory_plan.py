@@ -179,6 +179,38 @@ class LcmMemoryPlanTest(unittest.TestCase):
         self.assertEqual(plan.group("history").page_count, 8)
         self.assertEqual(plan.group("state").page_count, 29)
 
+    def test_explicit_packing_is_bounded_by_page_ids_not_a_magic_count(self):
+        field = self.plan_module.LcmFieldSpec
+        plan = self.plan_module.plan_lcm_fields(
+            (field("history", "history.k", "plane.k", (1,), 1),),
+            logical_block_tokens=16,
+            num_lcm_blocks=2,
+            cache_blocks_per_lcm_block={"history": 256},
+        )
+
+        self.assertEqual(
+            plan.group("history").cache_blocks_per_lcm_block,
+            256,
+        )
+        self.assertEqual(plan.group("history").page_count, 513)
+
+    def test_automatic_packing_keeps_large_exact_byte_ratio(self):
+        field = self.plan_module.LcmFieldSpec
+        plan = self.plan_module.plan_lcm_fields(
+            (
+                field("history", "history.k", "plane.shared", (1,), 1),
+                field("state", "state.ssm", "plane.shared", (256,), 1),
+            ),
+            logical_block_tokens=16,
+            num_lcm_blocks=2,
+        )
+
+        self.assertEqual(
+            plan.group("history").cache_blocks_per_lcm_block,
+            256,
+        )
+        self.assertEqual(plan.group("state").cache_blocks_per_lcm_block, 1)
+
     def test_requires_exactly_one_capacity_input(self):
         field = self.plan_module.LcmFieldSpec
         fields = (field("history", "history.k", "plane.k", (128, 8), 2),)
@@ -234,7 +266,7 @@ class LcmMemoryPlanTest(unittest.TestCase):
         field = self.plan_module.LcmFieldSpec
         fields = (field("history", "history.k", "plane.k", (128, 8), 2),)
 
-        for count in (0, -1, True, 129):
+        for count in (0, -1, True, 1.5, "2"):
             with self.subTest(count=count):
                 with self.assertRaisesRegex(ValueError, "packing"):
                     self.plan_module.plan_lcm_fields(

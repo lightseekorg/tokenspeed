@@ -111,21 +111,6 @@ def _resolve_draft_cache_cell_size_for_profile(
     return draft_attn_config.cache_cell_size() * storage_layers
 
 
-def _max_lcm_packing(plan, group_ids=None) -> int:
-    """Largest child page-id span among the selected LCM groups."""
-    packing = {
-        group.group_id: int(group.cache_blocks_per_lcm_block) for group in plan.groups
-    }
-    if group_ids is None:
-        return max(packing.values())
-    selected = [packing[group_id] for group_id in group_ids if group_id in packing]
-    if not selected:
-        raise ValueError(
-            f"LCM plan has none of the requested groups: {sorted(group_ids)}"
-        )
-    return max(selected)
-
-
 def _lcm_packing(plan) -> dict[str, int]:
     return {
         group.group_id: int(group.cache_blocks_per_lcm_block) for group in plan.groups
@@ -1580,7 +1565,7 @@ def create_attn_components(
             max_padding_fraction=lcm_max_padding_fraction,
         )
         target_packing = _lcm_packing(flat_plan)
-        max_packing = _max_lcm_packing(flat_plan)
+        max_packing = max(target_packing.values())
         draft_fields = None
         draft_group_packing = {}
         draft_parent_bytes = 0
@@ -1607,7 +1592,7 @@ def create_attn_components(
                 max_padding_fraction=lcm_max_padding_fraction,
             )
             draft_parent_bytes = draft_geometry.lcm_block_bytes
-            draft_packing = _max_lcm_packing(draft_geometry)
+            draft_packing = max(_lcm_packing(draft_geometry).values())
         parent_bytes = flat_plan.lcm_block_bytes + draft_parent_bytes
         # Both arenas reserve parent 0 as their kernel-safe null parent.
         usable_cache_bytes = cache_memory - fixed_workspace_bytes
