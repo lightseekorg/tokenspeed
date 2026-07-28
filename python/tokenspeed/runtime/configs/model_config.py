@@ -58,6 +58,8 @@ _MLA_ARCHITECTURES = frozenset(
         "Eagle3DeepseekV2ForCausalLM",
         "LongcatFlashForCausalLM",
         "KimiK25ForConditionalGeneration",
+        "KimiK3ForConditionalGeneration",
+        "KimiK3ForConditionalGenerationNextN",
     }
 )
 _DSA_ARCHITECTURES = frozenset(
@@ -755,6 +757,7 @@ def is_multimodal_model(model_architectures: list[str] | None):
         "Qwen3OmniMoeForConditionalGeneration",
         "Qwen3ASRForConditionalGeneration",
         "KimiK25ForConditionalGeneration",
+        "KimiK3ForConditionalGeneration",
         "InklingForConditionalGeneration",
         "MiniMaxM3SparseForConditionalGeneration",
     }

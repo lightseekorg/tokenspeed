@@ -58,6 +58,12 @@ from tokenspeed.runtime.utils import get_colorful_logger
 logger = get_colorful_logger(__name__)
 
 
+def _force_deterministic_rsag() -> bool:
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    return bool(global_server_args_dict.get("force_deterministic_rsag", False))
+
+
 @dataclasses.dataclass
 class LogitsProcessorOutput:
     ## Part 1: This part will be assigned in python/tokenspeed/runtime/layers/logits_processor.py::LogitsProcessor
@@ -298,7 +304,7 @@ class LogitsProcessor(nn.Module):
         return len({rank // nprocs_per_node for rank in self.tp_group}) > 1
 
     def _init_all_gather_state(self, lm_head: VocabParallelEmbedding):
-        if not current_platform().is_nvidia:
+        if not current_platform().is_nvidia or _force_deterministic_rsag():
             return None
 
         if self.tp_size == 1 or self.skip_all_gather or self._tp_group_spans_nodes():
@@ -319,7 +325,7 @@ class LogitsProcessor(nn.Module):
         return self._LOGITS_AG_STATES[key]
 
     def _init_dist_argmax_state(self, lm_head: VocabParallelEmbedding):
-        if not current_platform().is_nvidia:
+        if not current_platform().is_nvidia or _force_deterministic_rsag():
             return None
 
         if (

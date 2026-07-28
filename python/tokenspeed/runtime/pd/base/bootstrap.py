@@ -51,21 +51,72 @@ class DisaggBootstrapServerBase:
     fields) and :meth:`_extra_parallel_info` (add them to the GET sync response).
     """
 
+    _STARTUP_TIMEOUT_SECONDS = 10.0
+    _SHUTDOWN_TIMEOUT_SECONDS = 5.0
+
     def __init__(self, port: int):
         self.port = port
         self.app = web.Application()
         self.lock = asyncio.Lock()
-        self._setup_routes()
         self.world_size = None
         self.dp_size = None
         self.tp_size_per_dp_rank = None
         self.prefill_port_table: dict[int, dict[int, dict[str, str | int]]] = {}
 
+        # Initialize every field shared with the server thread before starting
+        # it.  In particular, close() may race with startup when construction
+        # times out, so it must never observe partially-created attributes.
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._runner: web.AppRunner | None = None
+        self._site: web.BaseSite | None = None
+        self._startup_error: BaseException | None = None
+        self._runtime_error: BaseException | None = None
+        self._startup_complete = threading.Event()
+        self._stop_requested = threading.Event()
+        self._lifecycle_lock = threading.Lock()
+        self._thread_started = False
+
+        self._setup_routes()
         self.thread = threading.Thread(target=self._run_server, daemon=True)
         self.run()
 
     def run(self):
-        self.thread.start()
+        with self._lifecycle_lock:
+            if self._thread_started:
+                if (
+                    self._startup_complete.is_set()
+                    and self._startup_error is None
+                    and self.thread.is_alive()
+                ):
+                    return
+                raise RuntimeError("Bootstrap server thread cannot be restarted")
+            self._thread_started = True
+            self.thread.start()
+
+        if not self._startup_complete.wait(self._STARTUP_TIMEOUT_SECONDS):
+            self._request_stop()
+            self.thread.join(timeout=self._SHUTDOWN_TIMEOUT_SECONDS)
+            thread_state = (
+                " and its thread is still running" if self.thread.is_alive() else ""
+            )
+            raise TimeoutError(
+                "Bootstrap server did not bind within "
+                f"{self._STARTUP_TIMEOUT_SECONDS:.1f}s{thread_state}"
+            )
+
+        if self._startup_error is not None:
+            self.thread.join(timeout=self._SHUTDOWN_TIMEOUT_SECONDS)
+            raise RuntimeError(
+                f"Bootstrap server failed to bind on port {self.port}"
+            ) from self._startup_error
+
+        # _startup_complete is published only after TCPSite.start() returns.
+        # A dead thread here means the loop failed between publishing readiness
+        # and the constructor observing it; do not return a broken server.
+        if not self.thread.is_alive():
+            raise RuntimeError(
+                f"Bootstrap server stopped while starting on port {self.port}"
+            ) from self._runtime_error
 
     def _setup_routes(self):
         self.app.router.add_route("*", "/route", self._handle_route)
@@ -161,35 +212,89 @@ class DisaggBootstrapServerBase:
         Default: none."""
         return {}
 
+    def _request_stop(self) -> None:
+        self._stop_requested.set()
+        loop = self._loop
+        if loop is None or loop.is_closed() or not loop.is_running():
+            return
+        try:
+            loop.call_soon_threadsafe(loop.stop)
+        except RuntimeError:
+            # The loop can close between is_closed() and the thread-safe call.
+            # In that case the server thread is already on its way out.
+            return
+
     def _run_server(self):
+        loop: asyncio.AbstractEventLoop | None = None
+        runner: web.AppRunner | None = None
+        startup_succeeded = False
         try:
             # Event Loop
-            self._loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self._loop)
+            loop = asyncio.new_event_loop()
+            self._loop = loop
+            asyncio.set_event_loop(loop)
 
             access_log = None
             if logging.getLogger(__name__).getEffectiveLevel() <= logging.DEBUG:
                 access_log = self.app.logger
 
-            self._runner = web.AppRunner(self.app, access_log=access_log)
-            self._loop.run_until_complete(self._runner.setup())
+            runner = web.AppRunner(self.app, access_log=access_log)
+            self._runner = runner
+            loop.run_until_complete(runner.setup())
 
-            site = web.TCPSite(self._runner, port=self.port)
-            self._loop.run_until_complete(site.start())
-            self._loop.run_forever()
-        except Exception as exc:
-            logger.error("Server error: %s", str(exc))
+            site = web.TCPSite(runner, port=self.port)
+            self._site = site
+            loop.run_until_complete(site.start())
+            startup_succeeded = True
+            self._startup_complete.set()
+
+            if not self._stop_requested.is_set():
+                loop.run_forever()
+        except BaseException as exc:
+            if startup_succeeded:
+                self._runtime_error = exc
+                logger.exception("Bootstrap server failed after startup")
+            else:
+                self._startup_error = exc
+                logger.error("Bootstrap server startup failed: %s", str(exc))
         finally:
-            # Cleanup
-            self._loop.run_until_complete(self._runner.cleanup())
-            self._loop.close()
+            # Wake a constructor waiting for startup even when loop creation,
+            # runner setup, or TCP bind failed.
+            self._startup_complete.set()
+
+            if loop is not None and not loop.is_closed():
+                if runner is not None:
+                    try:
+                        loop.run_until_complete(runner.cleanup())
+                    except BaseException as exc:
+                        if self._runtime_error is None:
+                            self._runtime_error = exc
+                        logger.exception("Bootstrap server cleanup failed")
+                loop.close()
 
     def close(self):
-        """Shutdown"""
-        if self._loop is not None and self._loop.is_running():
-            self._loop.call_soon_threadsafe(self._loop.stop)
-            logger.info("Stopping server loop...")
+        """Stop the rendezvous server and wait for all socket cleanup.
 
-        if self.thread.is_alive():
-            self.thread.join(timeout=2)
-            logger.info("Server thread stopped")
+        The operation is idempotent.  A bounded join prevents shutdown from
+        hanging indefinitely, but a live thread after that bound is surfaced to
+        the caller instead of being logged as if shutdown had succeeded.
+        """
+
+        with self._lifecycle_lock:
+            if not self._thread_started or not self.thread.is_alive():
+                return
+            if threading.current_thread() is self.thread:
+                self._request_stop()
+                raise RuntimeError(
+                    "Bootstrap server cannot synchronously close from its own thread"
+                )
+
+            self._request_stop()
+            logger.info("Stopping bootstrap server loop...")
+            self.thread.join(timeout=self._SHUTDOWN_TIMEOUT_SECONDS)
+            if self.thread.is_alive():
+                raise RuntimeError(
+                    "Bootstrap server thread did not stop within "
+                    f"{self._SHUTDOWN_TIMEOUT_SECONDS:.1f}s"
+                )
+            logger.info("Bootstrap server thread stopped")

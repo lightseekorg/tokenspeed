@@ -91,6 +91,38 @@ def test_tp_logits_all_gather_handles_zero_rows(monkeypatch):
     assert tuple(output.next_token_logits.shape) == (0, 6)
 
 
+@pytest.mark.parametrize(
+    "initializer_name",
+    ["_init_all_gather_state", "_init_dist_argmax_state"],
+)
+def test_force_deterministic_rsag_disables_logits_symm_mem(
+    monkeypatch, initializer_name
+):
+    monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", True)
+    monkeypatch.setattr(
+        logits_processor_module,
+        "create_state",
+        lambda *args, **kwargs: pytest.fail(
+            "symmetric-memory state must not initialize"
+        ),
+    )
+    monkeypatch.setattr(
+        logits_processor_module,
+        "create_dist_argmax_state",
+        lambda *args, **kwargs: pytest.fail(
+            "symmetric-memory state must not initialize"
+        ),
+    )
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=8),
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+    )
+
+    assert getattr(processor, initializer_name)(SimpleNamespace()) is None
+
+
 def test_tp_logits_custom_collectives_skip_cross_node_group(monkeypatch):
     monkeypatch.setitem(
         global_server_args_dict,

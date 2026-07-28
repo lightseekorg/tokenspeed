@@ -1086,6 +1086,8 @@ class CudaGraphWrapper:
         paged_cache_block_tables: dict | None = None,
         paged_cache_block_table_base_offsets: dict | None = None,
         flat_block_tables: dict | None = None,
+        flat_cache_metadata=None,
+        flat_cache_forward_op=None,
     ):
         """
         Unified forward entry point.
@@ -1145,6 +1147,18 @@ class CudaGraphWrapper:
         if mamba_track_pool_indices is not None:
             mamba_kwargs["mamba_track_pool_indices"] = mamba_track_pool_indices
 
+        # MLA/KDA backends build their eager metadata from the FlatKV contract
+        # and refresh their captured decode buffers from it during replay.
+        # Thread it only when present so non-contract paths remain unchanged.
+        flat_kwargs = (
+            {
+                "flat_cache_metadata": flat_cache_metadata,
+                "flat_cache_forward_op": flat_cache_forward_op,
+            }
+            if flat_cache_metadata is not None
+            else {}
+        )
+
         if use_graph:
             if (
                 bs == 0
@@ -1176,6 +1190,7 @@ class CudaGraphWrapper:
                     paged_cache_block_table_base_offsets
                 ),
                 flat_block_tables=flat_block_tables,
+                **flat_kwargs,
                 **mamba_kwargs,
             )
 
@@ -1262,6 +1277,7 @@ class CudaGraphWrapper:
                     if self.attn_backend.uses_flat_cache_groups
                     else None
                 ),
+                **flat_kwargs,
                 **mamba_kwargs,
             )
 

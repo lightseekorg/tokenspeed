@@ -37,6 +37,15 @@ from tokenspeed_kernel.ops.attention.gdn_utils import (
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
 )
+from tokenspeed_kernel.ops.attention.kda_utils import KdaPrefillResult
+from tokenspeed_kernel.ops.attention.triton.kda import (
+    kda_recurrent,
+    kda_recurrent_decode,
+    kda_state_scatter,
+)
+from tokenspeed_kernel.ops.attention.triton.kda_chunk import (
+    kda_chunk_prefill,
+)
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry, Priority
@@ -112,6 +121,15 @@ __all__ = [
     "gdn_chunk_prefill",
     "gdn_decode_step",
     "gdn_decode_mtp",
+    "kda_recurrent",
+    "kda_recurrent_decode",
+    "kda_chunk_prefill",
+    "kda_state_scatter",
+    "kda_paged_prefill",
+    "kda_paged_decode",
+    "try_kda_fused_paged_decode",
+    "try_kda_fused_paged_verify",
+    "KdaPrefillResult",
     "GdnCheckpointLayout",
     "GdnChunkPrefillResult",
     "mla_prefill",
@@ -731,6 +749,274 @@ def gdn_decode_mtp(
             intermediate_states_buffer=intermediate_states_buffer,
             output_state_indices=output_state_indices,
         )
+
+
+def kda_paged_prefill(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g_raw: torch.Tensor,
+    beta_logits: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    lower_bound: float | None = -5.0,
+    override: str | None = None,
+    solution: str | None = None,
+) -> KdaPrefillResult:
+    """Run packed KDA prefill through capability-based kernel selection.
+
+    Args:
+        q/k/g_raw: Packed tensors ``[1, total_tokens, heads, key_dim]``.
+        v: Values ``[1, total_tokens, heads, value_dim]``.
+        beta_logits: Raw beta logits ``[1, total_tokens, heads]``.
+        A_log/dt_bias: FP32 gate parameters.
+        initial_state: One backend-owned recurrent state per sequence.
+        cu_seqlens: Device sequence boundaries ``[num_sequences + 1]``.
+        lower_bound: Optional safe lower bound for log decay.
+        override: Optional exact kernel name.
+        solution: Optional registered solution name.
+
+    Returns:
+        Packed output and final state.
+
+    The state's internal ``[K,V]`` versus ``[V,K]`` interpretation remains
+    private to the selected implementation.
+    """
+    if q.ndim != 4 or q.shape[0] != 1:
+        raise ValueError("KDA q must be [1, total_tokens, heads, key_dim]")
+    if k.shape != q.shape or g_raw.shape != q.shape:
+        raise ValueError("KDA q, k, and g_raw must have identical shapes")
+    if v.ndim != 4 or v.shape[:3] != q.shape[:3]:
+        raise ValueError("KDA v must match q through the head dimension")
+    if beta_logits.shape != q.shape[:-1]:
+        raise ValueError("KDA beta logits must be [1, total_tokens, heads]")
+    num_sequences = cu_seqlens.numel() - 1
+    if initial_state.ndim != 4 or initial_state.shape[0] != num_sequences:
+        raise ValueError("KDA initial_state must contain one row per sequence")
+    # AMD historically ignores the NVIDIA prefill policy labels and uses its
+    # registered Triton implementation.
+    if current_platform().is_amd and solution in {"fla", "flashkda", "cutedsl_kda"}:
+        solution = "triton"
+    kernel = select_kernel(
+        "attention",
+        "kda_paged_prefill",
+        _attention_format_signature(q=q, k=k, v=v),
+        solution=solution,
+        override=override,
+    )
+    return kernel(
+        q=q,
+        k=k,
+        v=v,
+        g_raw=g_raw,
+        beta_logits=beta_logits,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        initial_state=initial_state,
+        cu_seqlens=cu_seqlens,
+        lower_bound=lower_bound,
+    )
+
+
+def kda_paged_decode(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g_raw: torch.Tensor,
+    beta_logits: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    state_pool: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    lower_bound: float | None = -5.0,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """Run post-convolution KDA decode against an indexed state pool.
+
+    Args:
+        q/k/g_raw: Packed tensors ``[1, batch, heads, key_dim]``.
+        v: Packed values ``[1, batch, heads, value_dim]``.
+        beta_logits: Raw beta logits ``[1, batch, heads]``.
+        A_log/dt_bias: FP32 gate parameters.
+        state_pool: Backend-owned recurrent-state pool.
+        read_indices/write_indices: Independent source/destination rows.
+        cu_seqlens: Device boundaries ``[batch + 1]``.
+        lower_bound: Optional safe lower bound for log decay.
+        override: Optional exact kernel name.
+        solution: Optional registered solution name.
+
+    Returns:
+        KDA output with the same shape as ``v``.
+    """
+    if q.ndim != 4 or q.shape[0] != 1:
+        raise ValueError("KDA decode q must be [1, batch, heads, key_dim]")
+    if k.shape != q.shape or g_raw.shape != q.shape:
+        raise ValueError("KDA decode q, k, and g_raw must have identical shapes")
+    if v.ndim != 4 or v.shape[:3] != q.shape[:3]:
+        raise ValueError("KDA decode v must match q through the head dimension")
+    if beta_logits.shape != q.shape[:-1]:
+        raise ValueError("KDA beta logits must be [1, total_tokens, heads]")
+    num_sequences = read_indices.numel()
+    if read_indices.ndim != 1 or write_indices.shape != (num_sequences,):
+        raise ValueError("KDA decode requires one read/write index per sequence")
+    if cu_seqlens.numel() != num_sequences + 1:
+        raise ValueError("KDA decode cu_seqlens must contain one boundary per sequence")
+
+    kernel = select_kernel(
+        "attention",
+        "kda_paged_decode",
+        _attention_format_signature(q=q, k=k, v=v),
+        traits={"indexed_state": True},
+        solution=solution,
+        override=override,
+    )
+    return kernel(
+        q=q,
+        k=k,
+        v=v,
+        g_raw=g_raw,
+        beta_logits=beta_logits,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        state_pool=state_pool,
+        read_indices=read_indices,
+        write_indices=write_indices,
+        cu_seqlens=cu_seqlens,
+        lower_bound=lower_bound,
+    )
+
+
+def try_kda_fused_paged_decode(
+    mixed_qkv: torch.Tensor,
+    conv_weights: torch.Tensor,
+    conv_states: torch.Tensor,
+    f_a_out: torch.Tensor,
+    f_b_weight: torch.Tensor,
+    beta_logits: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    state_pool: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    cu_seqlens: torch.Tensor,
+    lower_bound: float | None = -5.0,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor | None:
+    """Try a registered pre-convolution KDA decode fusion.
+
+    Returns ``None`` only when no implementation supports the current
+    platform. Invalid inputs and execution failures remain visible.
+    """
+    signature = _attention_format_signature(
+        q=mixed_qkv,
+        k=mixed_qkv,
+        v=mixed_qkv,
+    )
+    try:
+        kernel = select_kernel(
+            "attention",
+            "kda_fused_paged_decode",
+            signature,
+            traits={"flat_state": True},
+            solution=solution,
+            override=override,
+        )
+    except NoKernelFoundError:
+        return None
+    return kernel(
+        mixed_qkv=mixed_qkv,
+        conv_weights=conv_weights,
+        conv_states=conv_states,
+        f_a_out=f_a_out,
+        f_b_weight=f_b_weight,
+        beta_logits=beta_logits,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        state_pool=state_pool,
+        read_indices=read_indices,
+        write_indices=write_indices,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        cu_seqlens=cu_seqlens,
+        lower_bound=lower_bound,
+    )
+
+
+def try_kda_fused_paged_verify(
+    mixed_qkv: torch.Tensor,
+    conv_weights: torch.Tensor,
+    conv_states: torch.Tensor,
+    conv_scratch: torch.Tensor,
+    f_a_out: torch.Tensor,
+    f_b_weight: torch.Tensor,
+    beta_logits: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    state_pool: torch.Tensor,
+    state_scratch: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    draft_token_num: int,
+    lower_bound: float | None = -5.0,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor | None:
+    """Try a registered pre-convolution KDA target-verify fusion.
+
+    Mirrors ``try_kda_fused_paged_decode`` for the speculative verify batch:
+    per-position conv windows and recurrent states land in the verify
+    scratches for partial-accept commit. Returns ``None`` only when no
+    implementation supports the current platform.
+    """
+    signature = _attention_format_signature(
+        q=mixed_qkv,
+        k=mixed_qkv,
+        v=mixed_qkv,
+    )
+    try:
+        kernel = select_kernel(
+            "attention",
+            "kda_fused_paged_verify",
+            signature,
+            traits={"flat_state": True},
+            solution=solution,
+            override=override,
+        )
+    except NoKernelFoundError:
+        return None
+    return kernel(
+        mixed_qkv=mixed_qkv,
+        conv_weights=conv_weights,
+        conv_states=conv_states,
+        conv_scratch=conv_scratch,
+        f_a_out=f_a_out,
+        f_b_weight=f_b_weight,
+        beta_logits=beta_logits,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        state_pool=state_pool,
+        state_scratch=state_scratch,
+        read_indices=read_indices,
+        write_indices=write_indices,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        draft_token_num=draft_token_num,
+        lower_bound=lower_bound,
+    )
 
 
 # ===-----------------------------------------------------------------------===#
@@ -1630,6 +1916,7 @@ def mla_decode_with_kvcache(
         v_head_dim.
     """
     traits = {
+        "batch_size": q.shape[0],
         "page_size": kv_cache.shape[1],
         "q_len": q.shape[1],
         "num_q_heads": q.shape[2],
@@ -1641,14 +1928,28 @@ def mla_decode_with_kvcache(
         "return_lse": return_lse,
     }
     signature = _attention_format_signature(q=q, kv_cache=kv_cache)
-    kernel = select_kernel(
-        "attention",
-        "mla_decode_with_kvcache",
-        signature,
-        traits=traits,
-        solution=solution,
-        override=override,
-    )
+    try:
+        kernel = select_kernel(
+            "attention",
+            "mla_decode_with_kvcache",
+            signature,
+            traits=traits,
+            solution=solution,
+            override=override,
+        )
+    except NoKernelFoundError:
+        if q.dtype == kv_cache.dtype:
+            raise
+        q = q.to(kv_cache.dtype)
+        signature = _attention_format_signature(q=q, kv_cache=kv_cache)
+        kernel = select_kernel(
+            "attention",
+            "mla_decode_with_kvcache",
+            signature,
+            traits=traits,
+            solution=solution,
+            override=override,
+        )
 
     shape_params = {
         "batch_size": q.shape[0],

@@ -372,6 +372,12 @@ class MultimodalEncoderAttention(nn.Module):
         self.tp_rank = self.vision.tp_rank
         self.tp_group = self.vision.tp_group
         self.head_size = head_size if head_size is not None else embed_dim // num_heads
+        if num_heads % self.tp_size != 0:
+            raise ValueError(
+                f"Vision attention has {num_heads} heads, which is not divisible "
+                f"by vision TP size {self.tp_size}. Use "
+                "--mm-encoder-tp-mode data to run the encoder with TP1 item-DP."
+            )
         self.num_attention_heads_per_partition = dist_utils.divide(
             num_heads, self.tp_size
         )

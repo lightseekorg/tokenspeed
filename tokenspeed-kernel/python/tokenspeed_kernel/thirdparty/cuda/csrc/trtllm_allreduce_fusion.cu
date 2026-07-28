@@ -59,7 +59,11 @@ void trtllm_allreduce_fusion(TensorView allreduce_in, int64_t world_size, int64_
                              Optional<TensorView> partial_normed_out, Optional<TensorView> quant_out,
                              Optional<TensorView> scale_out, Optional<TensorView> rms_gamma, Optional<double> rms_eps,
                              Optional<TensorView> scale_factor, Optional<int64_t> layout_code,
-                             Optional<int64_t> max_sm_to_use) {
+                             Optional<int64_t> max_sm_to_use,
+                             Optional<TensorView> attnres_m, Optional<TensorView> attnres_s,
+                             Optional<TensorView> attnres_acc, Optional<TensorView> attnres_res_w,
+                             Optional<TensorView> attnres_out_norm_w,
+                             Optional<int64_t> latent_width) {
   cudaSetDevice(allreduce_in.device().device_id);
   // todo(Yingyi): add dispatch for float and bfloat16
 
@@ -97,6 +101,21 @@ void trtllm_allreduce_fusion(TensorView allreduce_in, int64_t world_size, int64_
     }
     params.rms_gamma =
         rms_gamma.has_value() ? reinterpret_cast<void*>(rms_gamma.value().data_ptr()) : nullptr;
+    params.attnres_m =
+        attnres_m.has_value() ? reinterpret_cast<void*>(attnres_m.value().data_ptr()) : nullptr;
+    params.attnres_s =
+        attnres_s.has_value() ? reinterpret_cast<void*>(attnres_s.value().data_ptr()) : nullptr;
+    params.attnres_acc =
+        attnres_acc.has_value() ? reinterpret_cast<void*>(attnres_acc.value().data_ptr()) : nullptr;
+    params.attnres_res_w = attnres_res_w.has_value()
+                               ? reinterpret_cast<void*>(attnres_res_w.value().data_ptr())
+                               : nullptr;
+    params.latent_width =
+        latent_width.has_value() ? static_cast<int>(latent_width.value()) : 0;
+    params.attnres_out_norm_w =
+        attnres_out_norm_w.has_value()
+            ? reinterpret_cast<void*>(attnres_out_norm_w.value().data_ptr())
+            : nullptr;
     params.rms_eps = rms_eps.has_value() ? static_cast<float>(rms_eps.value()) : 0.0f;
     params.scale_factor = scale_factor.has_value()
                               ? reinterpret_cast<float*>(scale_factor.value().data_ptr())

@@ -58,6 +58,17 @@ public:
     std::int32_t TotalBlocks() const noexcept { return total_num_blocks_; }
     std::int32_t NumFreeBlocks() const noexcept { return static_cast<std::int32_t>(free_list_.size()); }
 
+    // Device cache memory is byte-blind to the scheduler. Every block handed
+    // to a new owner through AcquireBlock must be sanitized before either a
+    // model forward or a host loadback writes it. Prefix hits use
+    // AcquireCachedBlock instead and deliberately never enter this list.
+    std::vector<std::int32_t> TakePageIdsToZero() {
+        std::ranges::sort(page_ids_to_zero_);
+        auto unique_end = std::ranges::unique(page_ids_to_zero_).begin();
+        page_ids_to_zero_.erase(unique_end, page_ids_to_zero_.end());
+        return std::exchange(page_ids_to_zero_, {});
+    }
+
     std::vector<BlockRef> AcquireBlocks(std::int32_t num) {
         std::vector<BlockRef> out;
         if (num <= 0 || static_cast<std::int32_t>(free_list_.size()) < num) {
@@ -78,6 +89,7 @@ public:
         if (control.Object().IsCached()) {
             evictCached(control);
         }
+        page_ids_to_zero_.push_back(control.Object().BlockId());
         return BlockRef{control};
     }
 
@@ -201,6 +213,7 @@ private:
     internal_block_ref::BlockControl::ControlList free_list_{};
     internal_block_ref::BlockControl::ControlList in_use_{};
     std::unordered_map<std::string, std::vector<internal_block_ref::BlockControl*>> cache_index_{};
+    std::vector<std::int32_t> page_ids_to_zero_{};
 };
 
 }  // namespace tokenspeed

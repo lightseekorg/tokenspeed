@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 from tokenspeed.runtime.layers.moe.expert import MoELayer
+from tokenspeed.runtime.layers.moe.latent import Kimi3LatentProjection, LatentMoELayer
 from tokenspeed.runtime.layers.moe.loader import (
     MoECheckpointLoader,
     MoECheckpointLoadError,
@@ -28,6 +29,8 @@ from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
 
 __all__ = [
     "ExpertCheckpointSchema",
+    "LatentMoELayer",
+    "Kimi3LatentProjection",
     "MoECheckpointLoadError",
     "MoECheckpointLoader",
     "MoELayer",

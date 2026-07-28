@@ -275,7 +275,19 @@ class Engine(EngineBase):
         # stale-reference error.
         if getattr(self, "llm", None) is not None:
             self.llm.shutdown()
-        kill_process_tree(os.getpid(), include_parent=False)
+        bootstrap_server = getattr(
+            getattr(self, "tokenizer_manager", None),
+            "bootstrap_server",
+            None,
+        )
+        close_bootstrap = getattr(bootstrap_server, "close", None)
+        try:
+            if callable(close_bootstrap):
+                close_bootstrap()
+        except Exception:
+            logger.exception("Failed to close the disaggregation bootstrap server")
+        finally:
+            kill_process_tree(os.getpid(), include_parent=False)
 
     def __enter__(self):
         return self

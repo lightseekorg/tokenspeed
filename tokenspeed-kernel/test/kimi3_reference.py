@@ -1,0 +1,194 @@
+"""Torch references shared by the Kimi K3 MXFP4 latent-MoE tests."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+
+import torch
+import torch.nn.functional as F
+
+
+def rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    """Kimi RMSNorm with FP32 variance accumulation."""
+
+    x_fp32 = x.float()
+    normalized = x_fp32 * torch.rsqrt(x_fp32.square().mean(dim=-1, keepdim=True) + eps)
+    return (normalized * weight.float()).to(x.dtype)
+
+
+def situ_and_mul(
+    x: torch.Tensor,
+    *,
+    beta: float = 4.0,
+    linear_beta: float | None = 25.0,
+) -> torch.Tensor:
+    """Moonshot SiTU gated activation."""
+
+    if x.shape[-1] % 2:
+        raise ValueError("SiTU input width must be even")
+    gate, up = x.float().chunk(2, dim=-1)
+    gate = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
+    if linear_beta is not None:
+        up = linear_beta * torch.tanh(up / linear_beta)
+    return (gate * up).to(x.dtype)
+
+
+_E2M1_VALUES = torch.tensor(
+    [
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        -0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
+    ],
+    dtype=torch.float32,
+)
+
+
+def dequantize_mxfp4(
+    packed: torch.Tensor,
+    scales: torch.Tensor,
+    *,
+    group_size: int = 32,
+) -> torch.Tensor:
+    """Decode packed OCP E2M1 values with one UE8M0 scale per group."""
+
+    if packed.dtype != torch.uint8 or scales.dtype != torch.uint8:
+        raise ValueError("MXFP4 payload and scales must use uint8 storage")
+    low = packed & 0x0F
+    high = packed >> 4
+    codes = torch.stack((low, high), dim=-1).flatten(-2)
+    values = _E2M1_VALUES.to(packed.device)[codes.long()]
+    scale_values = torch.exp2(scales.float() - 127.0)
+    expanded_scales = scale_values.repeat_interleave(group_size, dim=-1)
+    if values.shape != expanded_scales.shape:
+        raise ValueError("packed values and scale groups describe different shapes")
+    return values * expanded_scales
+
+
+def _mxfp4_linear(
+    x: torch.Tensor,
+    packed_weight: torch.Tensor,
+    scales: torch.Tensor,
+) -> torch.Tensor:
+    return F.linear(x.float(), dequantize_mxfp4(packed_weight, scales)).to(x.dtype)
+
+
+def a16w4_mxfp4_moe_reference(
+    hidden_states: torch.Tensor,
+    w13_packed: torch.Tensor,
+    w13_scales: torch.Tensor,
+    w2_packed: torch.Tensor,
+    w2_scales: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    situ_beta: float = 1.0,
+    situ_linear_beta: float | None = None,
+) -> torch.Tensor:
+    """A16W4 routed experts with BF16 boundaries around FP32 SiTU."""
+
+    combined = torch.zeros_like(hidden_states, dtype=torch.float32)
+    for expert_id in range(w13_packed.shape[0]):
+        routes = (topk_ids == expert_id).nonzero(as_tuple=False)
+        if not routes.numel():
+            continue
+        token_ids, slot_ids = routes.unbind(dim=1)
+        gate_up = _mxfp4_linear(
+            hidden_states.index_select(0, token_ids),
+            w13_packed[expert_id],
+            w13_scales[expert_id],
+        )
+        output = _mxfp4_linear(
+            situ_and_mul(
+                gate_up,
+                beta=situ_beta,
+                linear_beta=situ_linear_beta,
+            ),
+            w2_packed[expert_id],
+            w2_scales[expert_id],
+        )
+        route_weights = topk_weights[token_ids, slot_ids].float().unsqueeze(-1)
+        combined.index_add_(0, token_ids, output.float() * route_weights)
+    return combined.to(hidden_states.dtype)
+
+
+def mxfp4_situ_latent_moe_reference(
+    hidden_states: torch.Tensor,
+    router_weight: torch.Tensor,
+    correction_bias: torch.Tensor,
+    down_proj_weight: torch.Tensor,
+    up_proj_weight: torch.Tensor,
+    w13_packed: torch.Tensor,
+    w13_scales: torch.Tensor,
+    w2_packed: torch.Tensor,
+    w2_scales: torch.Tensor,
+    *,
+    top_k: int,
+    num_expert_group: int,
+    topk_group: int,
+    scoring_func: str = "sigmoid",
+    renormalize: bool = True,
+    routed_scaling_factor: float = 1.0,
+    situ_beta: float = 1.0,
+    situ_linear_beta: float | None = None,
+    rms_norm_weight: torch.Tensor | None = None,
+    rms_norm_eps: float = 1e-6,
+    reduce_latent: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    shared_expert: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    reduce_shared: Callable[[torch.Tensor], torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """K3 H-wide routing around packed latent routed experts."""
+
+    if (num_expert_group, topk_group, scoring_func) != (1, 1, "sigmoid"):
+        raise ValueError("the K3 reference expects one sigmoid routing group")
+    logits = F.linear(hidden_states.float(), router_weight.float())
+    scores = torch.sigmoid(logits)
+    selected = scores + correction_bias.float()
+    topk_ids = selected.topk(top_k, dim=-1, sorted=False).indices
+    topk_weights = scores.gather(1, topk_ids)
+    if top_k > 1 and renormalize:
+        topk_weights /= topk_weights.sum(-1, keepdim=True) + 1e-20
+    topk_weights *= routed_scaling_factor
+
+    routed_input = F.linear(hidden_states.float(), down_proj_weight.float()).to(
+        hidden_states.dtype
+    )
+    routed = a16w4_mxfp4_moe_reference(
+        routed_input,
+        w13_packed,
+        w13_scales,
+        w2_packed,
+        w2_scales,
+        topk_ids,
+        topk_weights,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+    )
+    if reduce_latent is not None:
+        routed = reduce_latent(routed)
+    if rms_norm_weight is not None:
+        routed = rms_norm(routed, rms_norm_weight, eps=rms_norm_eps)
+    routed = F.linear(routed.float(), up_proj_weight.float()).to(hidden_states.dtype)
+
+    if shared_expert is None:
+        return routed
+    shared = shared_expert(hidden_states)
+    if reduce_shared is not None:
+        shared = reduce_shared(shared)
+    return routed + shared

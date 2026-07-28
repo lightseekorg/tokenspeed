@@ -113,6 +113,45 @@ class TrtllmAllReduceBackend(CommBackend):
     def has_trtllm_ar(self, group: Group) -> bool:
         return group in self._resources
 
+    def oneshot_hidden_dim(self, group: Group) -> int:
+        """Armed one-shot lane width for *group* (0 when unavailable)."""
+        res = self._resources.get(group)
+        return int(res["hidden_dim"]) if res else 0
+
+    def ensure_group_lane(self, group: Group, hidden_dim: int) -> bool:
+        """Widen *group*'s one-shot lane to at least *hidden_dim*.
+
+        Collective (all ranks of *group* must call in the same order); only
+        widens an already-configured group -- initial arming stays with
+        ``configure_group``. Returns True when the lane covers *hidden_dim*.
+        """
+        res = self._resources.get(group)
+        if res is None:
+            return False
+        if res["hidden_dim"] >= hidden_dim:
+            return True
+        from tokenspeed_kernel.ops.communication.trtllm import (
+            trtllm_destroy_ipc_workspace_for_all_reduce_fusion,
+        )
+
+        try:
+            trtllm_destroy_ipc_workspace_for_all_reduce_fusion(
+                res["ipc_handles"], group=res["device_group"]
+            )
+            del self._resources[group]
+            return (
+                self.configure_group(
+                    rank=res["rank"],
+                    group=group,
+                    max_token_num=res["max_token_num"],
+                    hidden_dim=hidden_dim,
+                )
+                and self.oneshot_hidden_dim(group) >= hidden_dim
+            )
+        except Exception:
+            self._resources.pop(group, None)
+            return False
+
     # ------------------------------------------------------------------
     # CommBackend interface
     # ------------------------------------------------------------------

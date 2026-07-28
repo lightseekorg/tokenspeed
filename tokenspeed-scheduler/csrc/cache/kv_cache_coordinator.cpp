@@ -21,6 +21,7 @@
 #include "cache/kv_cache_coordinator.h"
 
 #include <algorithm>
+#include <limits>
 #include <memory>
 #include <numeric>
 
@@ -49,6 +50,15 @@ KvCacheCoordinator::KvCacheCoordinator(std::vector<CacheGroup> groups, BlockPool
         if (!groups_[i].Manager().MatchIsPrefixClosed()) {
             match_order_.push_back(i);
         }
+    }
+    for (std::size_t i : match_order_) {
+        if (groups_[i].Manager().DecodeDestinationLayoutPolicy() != DecodeDestinationLayout::kDenseHistory) {
+            continue;
+        }
+        decode_match_order_.push_back(i);
+        const std::int32_t block_size = groups_[i].Spec().block_size;
+        decode_match_lcm_block_size_ =
+            decode_match_lcm_block_size_ == 0 ? block_size : std::lcm(decode_match_lcm_block_size_, block_size);
     }
 }
 
@@ -150,6 +160,59 @@ KvCacheCoordinator::CoordinatorProbe KvCacheCoordinator::probeTierWithKeys(
     return out;
 }
 
+KvCacheCoordinator::CoordinatorProbe KvCacheCoordinator::probeDecodeDestinationTierWithKeys(
+    const BlockPool& pool, std::span<const std::vector<std::string>> group_keys, std::int32_t num_base_pages,
+    std::int32_t floor_tokens) const {
+    CoordinatorProbe out;
+    out.per_group.resize(groups_.size());
+    if (decode_match_order_.empty()) {
+        return out;
+    }
+
+    const std::int32_t boundary_tokens = SweepThenConverge(
+        decode_match_order_, groups_, num_base_pages * base_block_size_, decode_match_lcm_block_size_,
+        [&](std::size_t i, std::int32_t bound_tokens) {
+            const std::int32_t group_block_size = groups_[i].Spec().block_size;
+            out.per_group[i] = groups_[i].Manager().Probe(pool, group_keys[i], floor_tokens / group_block_size,
+                                                          bound_tokens / group_block_size);
+        },
+        [&](std::size_t i) {
+            const std::int32_t group_block_size = groups_[i].Spec().block_size;
+            return (floor_tokens / group_block_size + static_cast<std::int32_t>(out.per_group[i].hits.size())) *
+                   group_block_size;
+        });
+
+    for (std::size_t i : decode_match_order_) {
+        const std::int32_t group_block_size = groups_[i].Spec().block_size;
+        PrefixProbe& probe = out.per_group[i];
+        const std::int32_t floor_blocks = floor_tokens / group_block_size;
+        const std::int32_t boundary_blocks = boundary_tokens / group_block_size;
+        if (floor_blocks + static_cast<std::int32_t>(probe.hits.size()) > boundary_blocks) {
+            _assert(groups_[i].Manager().MatchIsPrefixClosed(),
+                    "decode destination window group left above converged boundary");
+            probe.hits.resize(static_cast<std::size_t>(boundary_blocks - floor_blocks));
+        }
+        for (std::size_t j = 0; j < probe.hits.size(); ++j) {
+            if (probe.hits[j] != 0 &&
+                pool.IsCachedBlockFree(group_keys[i][static_cast<std::size_t>(floor_blocks) + j])) {
+                ++out.num_free_hit_blocks;
+            }
+        }
+    }
+
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        if (groups_[i].Manager().DecodeDestinationLayoutPolicy() == DecodeDestinationLayout::kDenseHistory) {
+            continue;
+        }
+        const std::int32_t group_block_size = groups_[i].Spec().block_size;
+        const std::int32_t holes = boundary_tokens / group_block_size - floor_tokens / group_block_size;
+        _assert(holes >= 0, "decode destination state hole count underflow");
+        out.per_group[i].hits.assign(static_cast<std::size_t>(holes), 0);
+    }
+    out.num_common_tokens = boundary_tokens;
+    return out;
+}
+
 CoordinatorMatch KvCacheCoordinator::acquireTierWithKeys(BlockPool& pool,
                                                          std::span<const std::vector<std::string>> group_keys,
                                                          std::int32_t floor_tokens, CoordinatorProbe&& probe) const {
@@ -172,6 +235,19 @@ KvCacheCoordinator::AdmissionProbe KvCacheCoordinator::ProbePrefix(std::span<con
     if (host_pool_ != nullptr) {
         out.host = probeTierWithKeys(*host_pool_, group_keys, num_base_pages,
                                      /*floor_tokens=*/out.device.num_common_tokens);
+    }
+    return out;
+}
+
+KvCacheCoordinator::AdmissionProbe KvCacheCoordinator::ProbeDecodeDestinationPrefix(
+    std::span<const std::string> content_hashes) const {
+    const std::vector<std::vector<std::string>> group_keys = buildGroupKeys(content_hashes);
+    const std::int32_t num_base_pages = static_cast<std::int32_t>(content_hashes.size());
+    AdmissionProbe out;
+    out.device = probeDecodeDestinationTierWithKeys(pool_, group_keys, num_base_pages, /*floor_tokens=*/0);
+    if (host_pool_ != nullptr) {
+        out.host = probeDecodeDestinationTierWithKeys(*host_pool_, group_keys, num_base_pages,
+                                                      /*floor_tokens=*/out.device.num_common_tokens);
     }
     return out;
 }
@@ -233,6 +309,39 @@ std::int32_t KvCacheCoordinator::BlocksNeededFor(std::int32_t num_tokens) const 
         total_needed += group.Manager().BlocksNeededFor(fresh, num_tokens);
     }
     return total_needed;
+}
+
+std::int32_t KvCacheCoordinator::BlocksNeededForDecodeDestination(std::int32_t prompt_tokens,
+                                                                  std::int32_t remaining_prompt_tokens,
+                                                                  std::int32_t reserve_tokens) const {
+    const BlockTable fresh;
+    std::int64_t total_needed = 0;
+    for (const CacheGroup& group : groups_) {
+        total_needed += group.Manager().DecodeDestinationBlocksNeeded(fresh, prompt_tokens, remaining_prompt_tokens,
+                                                                      reserve_tokens);
+    }
+    _assert(total_needed <= std::numeric_limits<std::int32_t>::max(), "decode destination page count overflow");
+    return static_cast<std::int32_t>(total_needed);
+}
+
+bool KvCacheCoordinator::AcquireDecodeDestination(std::span<BlockTable> tables, std::int32_t prompt_tokens,
+                                                  std::int32_t remaining_prompt_tokens, std::int32_t reserve_tokens) {
+    _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
+    std::int64_t total_needed = 0;
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        total_needed += groups_[i].Manager().DecodeDestinationBlocksNeeded(tables[i], prompt_tokens,
+                                                                           remaining_prompt_tokens, reserve_tokens);
+    }
+    _assert(total_needed <= std::numeric_limits<std::int32_t>::max(), "decode destination page count overflow");
+    if (total_needed > pool_.NumFreeBlocks()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        const bool acquired = groups_[i].Manager().AcquireDecodeDestination(pool_, tables[i], prompt_tokens,
+                                                                            remaining_prompt_tokens, reserve_tokens);
+        _assert(acquired, "pre-checked decode destination acquire must succeed");
+    }
+    return true;
 }
 
 bool KvCacheCoordinator::Acquire(std::span<BlockTable> tables, std::int32_t num_tokens) {

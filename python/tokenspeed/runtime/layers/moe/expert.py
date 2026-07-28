@@ -59,6 +59,8 @@ class MoELayer(torch.nn.Module):
         ep_size: int | None = None,
         zero_expert_type: str = "",
         activation: str = "silu",
+        activation_situ_beta: float | None = None,
+        activation_situ_linear_beta: float | None = None,
         activation_alpha=None,
         swiglu_limit=None,
         swiglu_beta: float | None = None,
@@ -66,9 +68,13 @@ class MoELayer(torch.nn.Module):
         with_bias=False,
         routing_config: dict = {},
         routing_mode: str | None = None,
+        internal_activation_dtype_override: str | None = None,
     ):
         super().__init__()
         self.layer_index = layer_index
+        # Deployment-level override for the activation precision (e.g. a K3
+        # w4a8 flag), forcing the value the quant_config would otherwise derive.
+        self._internal_activation_dtype_override = internal_activation_dtype_override
         self.prefix = prefix
         self.top_k = top_k
         self.num_experts = num_experts
@@ -80,6 +86,17 @@ class MoELayer(torch.nn.Module):
         ]
         self.zero_expert_type = zero_expert_type
         self.activation = activation
+        self.activation_situ_beta = activation_situ_beta
+        self.activation_situ_linear_beta = activation_situ_linear_beta
+        if self.activation == "situ" and (
+            activation_situ_beta is None
+            or activation_situ_beta <= 0
+            or (
+                activation_situ_linear_beta is not None
+                and activation_situ_linear_beta <= 0
+            )
+        ):
+            raise ValueError("SiTU beta values must be positive")
         self.swiglu_arg = None
         if self.activation == "swiglu":
             self.swiglu_arg = SwigluArg(alpha=activation_alpha, limit=swiglu_limit)
@@ -110,6 +127,11 @@ class MoELayer(torch.nn.Module):
         if tp_size > 1 and ep_size > 1:
             raise ValueError("Mixed TP and EP is not supported yet.")
 
+        if num_experts % self.ep_size:
+            raise ValueError(
+                f"num_experts ({num_experts}) must be divisible by ep_size "
+                f"({self.ep_size}) for contiguous expert ownership"
+            )
         num_local_experts = num_experts // self.ep_size
 
         self.num_local_experts = num_local_experts
@@ -168,6 +190,8 @@ class MoELayer(torch.nn.Module):
                 internal_activation_dtype = "fp8"
             elif getattr(self.quant_config, "use_dynamic_mxfp4_activations", False):
                 internal_activation_dtype = "input"
+        if self._internal_activation_dtype_override is not None:
+            internal_activation_dtype = self._internal_activation_dtype_override
 
         input_dtype = torch.get_default_dtype()
         if input_dtype not in {torch.float16, torch.bfloat16}:

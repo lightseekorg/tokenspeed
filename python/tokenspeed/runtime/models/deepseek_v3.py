@@ -33,6 +33,9 @@ import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.attention import attn_merge_state
 from tokenspeed_kernel.ops.attention.tokenspeed_mla import mla_kv_pack_quantize_fp8
+from tokenspeed_kernel.ops.attention.triton.mla_query_assemble import (
+    mla_nope_query_fp8,
+)
 from tokenspeed_kernel.ops.embedding import apply_rope_mla
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.gemm.cute_dsl import (
@@ -782,6 +785,12 @@ class DeepseekV3AttentionMLA(nn.Module):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Model-owned KV writes route their locations through the backend:
+        # identity on the legacy path (base AttentionBackend hook), the
+        # group-derived locations on the FlatKV path.
+        out_cache_loc = ctx.attn_backend.select_out_cache_loc(
+            self.attn_mqa, out_cache_loc, ctx.forward_mode
+        )
         q = q.view(-1, self.num_local_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
@@ -875,6 +884,20 @@ class DeepseekV3AttentionMLA(nn.Module):
                 )
                 Q[..., self.kv_lora_rank :].copy_(q_pe)
                 K[..., self.kv_lora_rank :].copy_(k_pe)
+        elif (
+            self.attention_backend in self._MLA_KERNEL_BACKENDS
+            # Hybrid models: data_type lives on the full-attention sub-backend.
+            and getattr(
+                getattr(ctx.attn_backend, "full_attn_backend", ctx.attn_backend),
+                "data_type",
+                None,
+            )
+            == torch.float8_e4m3fn
+            and k_scale == 1.0
+            and q_nope.size(0) > 0
+        ):
+            # NoPE + fp8: assemble the query straight into fp8; the KV write casts the bf16 latents in-kernel.
+            Q = mla_nope_query_fp8(Q[..., : self.kv_lora_rank], q_pe)
         else:
             Q[..., self.kv_lora_rank :] = q_pe
 
@@ -962,6 +985,11 @@ class DeepseekV3AttentionMLA(nn.Module):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # See forward_absorb_qkv_proj: backend-selected write locations
+        # (identity off the FlatKV path).
+        out_cache_loc = ctx.attn_backend.select_out_cache_loc(
+            self.attn_mha, out_cache_loc, ctx.forward_mode
+        )
         kv_a, k_pe = latent_cache.split(
             [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )

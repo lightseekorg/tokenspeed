@@ -30,6 +30,15 @@ import tokenspeed_kernel.ops.gemm.gluon  # noqa: F401
 import tokenspeed_kernel.ops.gemm.triton  # noqa: F401
 import tokenspeed_kernel.ops.gemm.trtllm  # noqa: F401
 import torch
+from tokenspeed_kernel.ops.gemm.kimi3 import (
+    kimi3_latent_projection,
+    kimi3_latent_projection_add3,
+    kimi3_mla_qkv_gate_projection,
+    kimi3_qkvfab_projection,
+    kimi3_router_projection,
+    kimi3_shared_down_projection,
+    kimi3_shared_situ_projection,
+)
 from tokenspeed_kernel.platform import ArchVersion, Platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
@@ -43,7 +52,17 @@ from tokenspeed_kernel.signature import (
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["bmm", "mm"]
+__all__ = [
+    "bmm",
+    "kimi3_latent_projection",
+    "kimi3_mla_qkv_gate_projection",
+    "kimi3_latent_projection_add3",
+    "kimi3_qkvfab_projection",
+    "kimi3_router_projection",
+    "kimi3_shared_down_projection",
+    "kimi3_shared_situ_projection",
+    "mm",
+]
 
 _platform = Platform.get()
 _fp8_dtype = _platform.fp8e4m3fn.dtype

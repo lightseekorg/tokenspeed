@@ -1,3 +1,4 @@
+# Copyright (c) 2024-2026 Advanced Micro Devices, Inc. All rights reserved.
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -18,12 +19,19 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""MLA decode Gluon kernels for AMD GFX950 (bf16 Q + bf16 KV).
+"""MLA decode Gluon kernels for AMD GFX950.
 
-Two regimes share one kernel, dispatched by ``num_q_heads``:
+The FP8 layout and ``bh16bn128`` regime are adapted from ROCm/AITER's
+MIT-licensed ``aiter/ops/triton/gluon/mla_gluon.py`` at commit
+``ae0bae8954110b12655e3232f68262dd63cd694e``. The implementation here retains
+TokenSpeed's paged-cache interface (page IDs plus an arbitrary page size).
 
-* ``bh16bn64`` -- BLOCK_H=16, BLOCK_N=64, ``num_q_heads <= 16``, 2-D
-  (batch, split) grid.
+The shared kernel supports three regimes:
+
+* ``bh16bn128`` -- BF16/FP8 Q + FP8 KV, BLOCK_H=16, BLOCK_N=128 and
+  ``num_q_heads <= 16`` and arbitrary batch sizes.
+* ``bh16bn64`` -- BF16 Q + BF16 KV, BLOCK_H=16, BLOCK_N=64,
+  ``num_q_heads <= 16``.
 * ``bh64`` -- BLOCK_H=64, BLOCK_N=64, ``num_q_heads in {64, 128}``, 3-D
   XCD-aware grid, ``batch_size`` divisible by 64.
 """
@@ -47,11 +55,13 @@ class AttentionConfig:
     PAGE_SIZE: gl.constexpr
     HEAD_DIM_CKV: gl.constexpr
     HEAD_DIM_KPE: gl.constexpr
+    Q_PE_BLOCK_H: gl.constexpr
     KV_PE_OFFSET: gl.constexpr
     WITHIN_2GB: gl.constexpr
     NUM_XCDS: gl.constexpr
     NHEAD: gl.constexpr
     REGIME: gl.constexpr
+    IS_FP8_Q: gl.constexpr
     RETURN_LSE: gl.constexpr
     stride_q_nope_bs: gl.constexpr
     stride_q_nope_h: gl.constexpr
@@ -73,8 +83,10 @@ class AttentionConfig:
     blocked_q_pe: gl.constexpr
     shared_q_pe: gl.constexpr
     mfma_layout: gl.constexpr
-    mfma_layout_a: gl.constexpr
-    mfma_layout_b: gl.constexpr
+    q_layout: gl.constexpr
+    k_layout: gl.constexpr
+    p_layout: gl.constexpr
+    v_layout: gl.constexpr
     blocked_kv: gl.constexpr
     shared_kv: gl.constexpr
     blocked_kpe: gl.constexpr
@@ -99,6 +111,7 @@ class AttentionConfig:
         NUM_XCDS,
         NHEAD,
         REGIME,
+        IS_FP8_Q,
         RETURN_LSE,
         stride_q_nope_bs,
         stride_q_nope_h,
@@ -180,6 +193,83 @@ class AttentionConfig:
                 transposed=True,
                 warps_per_cta=[4, 1],
             )
+        elif IS_FP8_Q:
+            # Stage FP8 Q as [K, H] so K is the contiguous 16-byte DMA
+            # dimension, then permute the descriptor for operand-A loads.
+            blocked_q_nope = gl.DistributedLinearLayout(
+                reg_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 4)),
+                lane_bases=(
+                    (16, 0),
+                    (32, 0),
+                    (64, 0),
+                    (128, 0),
+                    (256, 0),
+                    (0, 8),
+                ),
+                warp_bases=((0, 1), (0, 2)),
+                block_bases=[],
+                shape=[512, 16],
+            )
+            shared_q_nope = gl.PaddedSharedLayout(
+                interval_padding_pairs=[[1024, 32], [8192, 16]],
+                offset_bases=[
+                    [1, 0],
+                    [2, 0],
+                    [4, 0],
+                    [8, 0],
+                    [16, 0],
+                    [32, 0],
+                    [64, 0],
+                    [128, 0],
+                    [256, 0],
+                    [0, 8],
+                    [0, 1],
+                    [0, 2],
+                    [0, 4],
+                ],
+                cga_layout=[],
+                shape=[512, 16],
+            )
+            # Pad the small Q-PE head tile to 64 so FP8 DMA remains legal.
+            blocked_q_pe = gl.DistributedLinearLayout(
+                reg_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 2)),
+                lane_bases=(
+                    (16, 0),
+                    (32, 0),
+                    (0, 4),
+                    (0, 8),
+                    (0, 16),
+                    (0, 32),
+                ),
+                warp_bases=((0, 0), (0, 1)),
+                block_bases=[],
+                shape=[64, 64],
+            )
+            shared_q_pe = gl.PaddedSharedLayout(
+                interval_padding_pairs=[[2048, 16]],
+                offset_bases=[
+                    [1, 0],
+                    [2, 0],
+                    [4, 0],
+                    [8, 0],
+                    [16, 0],
+                    [32, 0],
+                    [0, 4],
+                    [0, 8],
+                    [0, 16],
+                    [0, 32],
+                    [0, 1],
+                    [0, 2],
+                ],
+                cga_layout=[],
+                shape=[64, 64],
+            )
+            mfma_layout = gl.amd.AMDMFMALayout(
+                version=4,
+                instr_shape=[16, 16, 32],
+                transposed=True,
+                warps_per_cta=[1, 4],
+            )
         else:
             # bh16bn64: Q is [16, 512] / [16, 64]; warps tile K.
             blocked_q_nope = gl.BlockedLayout(
@@ -225,77 +315,203 @@ class AttentionConfig:
                 warps_per_cta=[1, 4],
             )
 
-        # KV-side layouts (BLOCK_N=64, bf16 KV): K is [512, 64], KPE is [64, 64].
-        # Shared by both regimes.
-        blocked_kv = gl.DistributedLinearLayout(
-            reg_bases=((1, 0), (2, 0), (4, 0), (0, 8), (0, 4), (0, 16), (0, 32)),
-            lane_bases=((8, 0), (16, 0), (32, 0), (64, 0), (128, 0), (256, 0)),
-            warp_bases=((0, 1), (0, 2)),
-            block_bases=[],
-            shape=[512, 64],
-        )
-        shared_kv = gl.PaddedSharedLayout(
-            interval_padding_pairs=[[512, 16]],
-            offset_bases=[
-                [1, 0],
-                [2, 0],
-                [4, 0],
-                [8, 0],
-                [16, 0],
-                [32, 0],
-                [64, 0],
-                [128, 0],
-                [256, 0],
-                [0, 1],
-                [0, 2],
-                [0, 8],
-                [0, 4],
-                [0, 16],
-                [0, 32],
-            ],
-            cga_layout=[],
-            shape=[512, 64],
-        )
-        blocked_kpe = gl.DistributedLinearLayout(
-            reg_bases=((1, 0), (2, 0), (4, 0), (0, 32)),
-            lane_bases=((8, 0), (16, 0), (32, 0), (0, 4), (0, 8), (0, 16)),
-            warp_bases=((0, 1), (0, 2)),
-            block_bases=[],
-            shape=[64, 64],
-        )
-        shared_kpe = gl.PaddedSharedLayout(
-            interval_padding_pairs=[[512, 16]],
-            offset_bases=[
-                [1, 0],
-                [2, 0],
-                [4, 0],
-                [8, 0],
-                [16, 0],
-                [32, 0],
-                [0, 4],
-                [0, 8],
-                [0, 16],
-                [0, 1],
-                [0, 2],
-                [0, 32],
-            ],
-            cga_layout=[],
-            shape=[64, 64],
-        )
-        blocked_page = gl.DistributedLinearLayout(
-            reg_bases=((0,),),
-            lane_bases=((1,), (2,), (4,), (8,), (16,), (32,)),
-            warp_bases=((0,), (0,)),
-            block_bases=[],
-            shape=[64],
-        )
-        blocked_kv_slice = gl.DistributedLinearLayout(
-            reg_bases=((1, 0), (2, 0), (4, 0), (0, 8), (0, 4), (0, 16)),
-            lane_bases=((8, 0), (16, 0), (32, 0), (64, 0), (128, 0), (256, 0)),
-            warp_bases=((0, 1), (0, 2)),
-            block_bases=[],
-            shape=[512, 32],
-        )
+        # FP8 KV uses a 128-token tile; BF16 KV uses 64. These layouts are
+        # adapted from AITER's bh16bn128/bh16bn64 implementation.
+        if BLOCK_N == 128:
+            blocked_kv = gl.DistributedLinearLayout(
+                reg_bases=(
+                    (1, 0),
+                    (2, 0),
+                    (4, 0),
+                    (8, 0),
+                    (0, 8),
+                    (0, 4),
+                    (0, 32),
+                    (0, 64),
+                ),
+                lane_bases=(
+                    (16, 0),
+                    (32, 0),
+                    (64, 0),
+                    (128, 0),
+                    (256, 0),
+                    (0, 16),
+                ),
+                warp_bases=((0, 1), (0, 2)),
+                block_bases=[],
+                shape=[512, 128],
+            )
+            shared_kv = gl.PaddedSharedLayout(
+                interval_padding_pairs=[[1024, 32], [8192, 16]],
+                offset_bases=[
+                    [1, 0],
+                    [2, 0],
+                    [4, 0],
+                    [8, 0],
+                    [16, 0],
+                    [32, 0],
+                    [64, 0],
+                    [128, 0],
+                    [256, 0],
+                    [0, 16],
+                    [0, 1],
+                    [0, 2],
+                    [0, 8],
+                    [0, 4],
+                    [0, 32],
+                    [0, 64],
+                ],
+                cga_layout=[],
+                shape=[512, 128],
+            )
+            blocked_kpe = gl.DistributedLinearLayout(
+                reg_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 2)),
+                lane_bases=((16, 0), (32, 0), (0, 4), (0, 8), (0, 16), (0, 32)),
+                warp_bases=((0, 64), (0, 1)),
+                block_bases=[],
+                shape=[64, 128],
+            )
+            shared_kpe = gl.PaddedSharedLayout(
+                interval_padding_pairs=[[2048, 16]],
+                offset_bases=[
+                    [1, 0],
+                    [2, 0],
+                    [4, 0],
+                    [8, 0],
+                    [16, 0],
+                    [32, 0],
+                    [0, 4],
+                    [0, 8],
+                    [0, 16],
+                    [0, 32],
+                    [0, 64],
+                    [0, 1],
+                    [0, 2],
+                ],
+                cga_layout=[],
+                shape=[64, 128],
+            )
+            blocked_page = gl.DistributedLinearLayout(
+                reg_bases=((0,),),
+                lane_bases=((1,), (2,), (4,), (8,), (16,), (32,)),
+                warp_bases=((64,), (0,)),
+                block_bases=[],
+                shape=[128],
+            )
+            blocked_kv_slice = gl.DistributedLinearLayout(
+                reg_bases=(
+                    (1, 0),
+                    (2, 0),
+                    (4, 0),
+                    (8, 0),
+                    (0, 8),
+                    (0, 4),
+                    (0, 32),
+                ),
+                lane_bases=(
+                    (16, 0),
+                    (32, 0),
+                    (64, 0),
+                    (128, 0),
+                    (256, 0),
+                    (0, 16),
+                ),
+                warp_bases=((0, 1), (0, 2)),
+                block_bases=[],
+                shape=[512, 64],
+            )
+        else:
+            blocked_kv = gl.DistributedLinearLayout(
+                reg_bases=(
+                    (1, 0),
+                    (2, 0),
+                    (4, 0),
+                    (0, 8),
+                    (0, 4),
+                    (0, 16),
+                    (0, 32),
+                ),
+                lane_bases=(
+                    (8, 0),
+                    (16, 0),
+                    (32, 0),
+                    (64, 0),
+                    (128, 0),
+                    (256, 0),
+                ),
+                warp_bases=((0, 1), (0, 2)),
+                block_bases=[],
+                shape=[512, 64],
+            )
+            shared_kv = gl.PaddedSharedLayout(
+                interval_padding_pairs=[[512, 16]],
+                offset_bases=[
+                    [1, 0],
+                    [2, 0],
+                    [4, 0],
+                    [8, 0],
+                    [16, 0],
+                    [32, 0],
+                    [64, 0],
+                    [128, 0],
+                    [256, 0],
+                    [0, 1],
+                    [0, 2],
+                    [0, 8],
+                    [0, 4],
+                    [0, 16],
+                    [0, 32],
+                ],
+                cga_layout=[],
+                shape=[512, 64],
+            )
+            blocked_kpe = gl.DistributedLinearLayout(
+                reg_bases=((1, 0), (2, 0), (4, 0), (0, 32)),
+                lane_bases=((8, 0), (16, 0), (32, 0), (0, 4), (0, 8), (0, 16)),
+                warp_bases=((0, 1), (0, 2)),
+                block_bases=[],
+                shape=[64, 64],
+            )
+            shared_kpe = gl.PaddedSharedLayout(
+                interval_padding_pairs=[[512, 16]],
+                offset_bases=[
+                    [1, 0],
+                    [2, 0],
+                    [4, 0],
+                    [8, 0],
+                    [16, 0],
+                    [32, 0],
+                    [0, 4],
+                    [0, 8],
+                    [0, 16],
+                    [0, 1],
+                    [0, 2],
+                    [0, 32],
+                ],
+                cga_layout=[],
+                shape=[64, 64],
+            )
+            blocked_page = gl.DistributedLinearLayout(
+                reg_bases=((0,),),
+                lane_bases=((1,), (2,), (4,), (8,), (16,), (32,)),
+                warp_bases=((0,), (0,)),
+                block_bases=[],
+                shape=[64],
+            )
+            blocked_kv_slice = gl.DistributedLinearLayout(
+                reg_bases=((1, 0), (2, 0), (4, 0), (0, 8), (0, 4), (0, 16)),
+                lane_bases=(
+                    (8, 0),
+                    (16, 0),
+                    (32, 0),
+                    (64, 0),
+                    (128, 0),
+                    (256, 0),
+                ),
+                warp_bases=((0, 1), (0, 2)),
+                block_bases=[],
+                shape=[512, 32],
+            )
 
         # V is the latent slice of K, read back transposed for the PV dot.
         # bh64 tiles M across warps (degenerate warp_bases + extra reg bases);
@@ -318,6 +534,23 @@ class AttentionConfig:
                 block_bases=[],
                 shape=[512, 64],
             )
+        elif REGIME == "bh16bn128":
+            linear_v = gl.DistributedLinearLayout(
+                reg_bases=(
+                    (0, 1),
+                    (0, 2),
+                    (0, 4),
+                    (0, 32),
+                    (0, 64),
+                    (64, 0),
+                    (128, 0),
+                    (256, 0),
+                ),
+                lane_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 8), (0, 16)),
+                warp_bases=((16, 0), (32, 0)),
+                block_bases=[],
+                shape=[512, 128],
+            )
         else:
             linear_v = gl.DistributedLinearLayout(
                 reg_bases=(
@@ -335,11 +568,19 @@ class AttentionConfig:
                 shape=[512, 64],
             )
 
-        mfma_layout_a = gl.DotOperandLayout(
-            operand_index=0, parent=mfma_layout, k_width=8
+        qk_k_width = 16 if IS_FP8_Q else 8
+        pv_k_width = 8
+        q_layout = gl.DotOperandLayout(
+            operand_index=0, parent=mfma_layout, k_width=qk_k_width
         )
-        mfma_layout_b = gl.DotOperandLayout(
-            operand_index=1, parent=mfma_layout, k_width=8
+        k_layout = gl.DotOperandLayout(
+            operand_index=1, parent=mfma_layout, k_width=qk_k_width
+        )
+        p_layout = gl.DotOperandLayout(
+            operand_index=0, parent=mfma_layout, k_width=pv_k_width
+        )
+        v_layout = gl.DotOperandLayout(
+            operand_index=1, parent=mfma_layout, k_width=pv_k_width
         )
         # Page-number scratch + lse store layouts (regime-independent).
         shared_page = gl.SwizzledSharedLayout(
@@ -355,11 +596,13 @@ class AttentionConfig:
         self.PAGE_SIZE = gl.constexpr(PAGE_SIZE)
         self.HEAD_DIM_CKV = gl.constexpr(HEAD_DIM_CKV)
         self.HEAD_DIM_KPE = gl.constexpr(HEAD_DIM_KPE)
+        self.Q_PE_BLOCK_H = gl.constexpr(64 if IS_FP8_Q else BLOCK_H)
         self.KV_PE_OFFSET = gl.constexpr(KV_PE_OFFSET)
         self.WITHIN_2GB = gl.constexpr(WITHIN_2GB)
         self.NUM_XCDS = gl.constexpr(NUM_XCDS)
         self.NHEAD = gl.constexpr(NHEAD)
         self.REGIME = gl.constexpr(REGIME)
+        self.IS_FP8_Q = gl.constexpr(IS_FP8_Q)
         self.RETURN_LSE = gl.constexpr(RETURN_LSE)
         self.stride_q_nope_bs = gl.constexpr(stride_q_nope_bs)
         self.stride_q_nope_h = gl.constexpr(stride_q_nope_h)
@@ -381,8 +624,10 @@ class AttentionConfig:
         self.blocked_q_pe = gl.constexpr(blocked_q_pe)
         self.shared_q_pe = gl.constexpr(shared_q_pe)
         self.mfma_layout = gl.constexpr(mfma_layout)
-        self.mfma_layout_a = gl.constexpr(mfma_layout_a)
-        self.mfma_layout_b = gl.constexpr(mfma_layout_b)
+        self.q_layout = gl.constexpr(q_layout)
+        self.k_layout = gl.constexpr(k_layout)
+        self.p_layout = gl.constexpr(p_layout)
+        self.v_layout = gl.constexpr(v_layout)
         self.blocked_kv = gl.constexpr(blocked_kv)
         self.shared_kv = gl.constexpr(shared_kv)
         self.blocked_kpe = gl.constexpr(blocked_kpe)
@@ -525,58 +770,99 @@ class AttentionProgram:
     @gluon.jit
     def issue_load_q_nope(self, buf):
         cfg = self.cfg
-        offs_d_ckv = gl.arange(
-            0, cfg.HEAD_DIM_CKV, layout=gl.SliceLayout(0, cfg.blocked_q_nope)
-        )
-        cur_head = self.cur_head_id * cfg.BLOCK_H + gl.arange(
-            0, cfg.BLOCK_H, layout=gl.SliceLayout(1, cfg.blocked_q_nope)
-        )
-        offs_q_nope = (
-            self.cur_batch * cfg.stride_q_nope_bs
-            + cur_head[:, None] * cfg.stride_q_nope_h
-            + offs_d_ckv[None, :]
-        )
+        if cfg.IS_FP8_Q:
+            offs_d_ckv = gl.arange(
+                0, cfg.HEAD_DIM_CKV, layout=gl.SliceLayout(1, cfg.blocked_q_nope)
+            )
+            cur_head = self.cur_head_id * cfg.BLOCK_H + gl.arange(
+                0, cfg.BLOCK_H, layout=gl.SliceLayout(0, cfg.blocked_q_nope)
+            )
+            offs_q_nope = (
+                self.cur_batch * cfg.stride_q_nope_bs
+                + cur_head[None, :] * cfg.stride_q_nope_h
+                + offs_d_ckv[:, None]
+            )
+            mask = (cur_head < cfg.NHEAD)[None, :]
+        else:
+            offs_d_ckv = gl.arange(
+                0, cfg.HEAD_DIM_CKV, layout=gl.SliceLayout(0, cfg.blocked_q_nope)
+            )
+            cur_head = self.cur_head_id * cfg.BLOCK_H + gl.arange(
+                0, cfg.BLOCK_H, layout=gl.SliceLayout(1, cfg.blocked_q_nope)
+            )
+            offs_q_nope = (
+                self.cur_batch * cfg.stride_q_nope_bs
+                + cur_head[:, None] * cfg.stride_q_nope_h
+                + offs_d_ckv[None, :]
+            )
+            mask = (cur_head < cfg.NHEAD)[:, None] if cfg.NHEAD < cfg.BLOCK_H else None
         # For nhead < BLOCK_H, mask OOB heads to zero on Q load and skip OOB O
         # stores; wasted MFMA lanes are free (memory-bound).
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             buf,
             self.Q_nope,
             offs_q_nope,
-            mask=(cur_head < cfg.NHEAD)[:, None] if cfg.NHEAD < cfg.BLOCK_H else None,
+            mask=mask,
         )
         gl.amd.cdna4.async_copy.commit_group()
 
     @gluon.jit
     def issue_load_q_pe(self, buf):
         cfg = self.cfg
-        offs_d_kpe = gl.arange(
-            0, cfg.HEAD_DIM_KPE, layout=gl.SliceLayout(0, cfg.blocked_q_pe)
-        )
-        cur_head_qpe = self.cur_head_id * cfg.BLOCK_H + gl.arange(
-            0, cfg.BLOCK_H, layout=gl.SliceLayout(1, cfg.blocked_q_pe)
-        )
-        offs_q_pe = (
-            self.cur_batch * cfg.stride_q_pe_bs
-            + cur_head_qpe[:, None] * cfg.stride_q_pe_h
-            + offs_d_kpe[None, :]
-        )
+        if cfg.IS_FP8_Q:
+            offs_d_kpe = gl.arange(
+                0, cfg.HEAD_DIM_KPE, layout=gl.SliceLayout(1, cfg.blocked_q_pe)
+            )
+            cur_head_qpe = self.cur_head_id * cfg.BLOCK_H + gl.arange(
+                0, cfg.Q_PE_BLOCK_H, layout=gl.SliceLayout(0, cfg.blocked_q_pe)
+            )
+            offs_q_pe = (
+                self.cur_batch * cfg.stride_q_pe_bs
+                + cur_head_qpe[None, :] * cfg.stride_q_pe_h
+                + offs_d_kpe[:, None]
+            )
+            mask = (cur_head_qpe < cfg.NHEAD)[None, :]
+        else:
+            offs_d_kpe = gl.arange(
+                0, cfg.HEAD_DIM_KPE, layout=gl.SliceLayout(0, cfg.blocked_q_pe)
+            )
+            cur_head_qpe = self.cur_head_id * cfg.BLOCK_H + gl.arange(
+                0, cfg.BLOCK_H, layout=gl.SliceLayout(1, cfg.blocked_q_pe)
+            )
+            offs_q_pe = (
+                self.cur_batch * cfg.stride_q_pe_bs
+                + cur_head_qpe[:, None] * cfg.stride_q_pe_h
+                + offs_d_kpe[None, :]
+            )
+            mask = (
+                (cur_head_qpe < cfg.NHEAD)[:, None] if cfg.NHEAD < cfg.BLOCK_H else None
+            )
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             buf,
             self.Q_pe,
             offs_q_pe,
-            mask=(
-                (cur_head_qpe < cfg.NHEAD)[:, None] if cfg.NHEAD < cfg.BLOCK_H else None
-            ),
+            mask=mask,
         )
         gl.amd.cdna4.async_copy.commit_group()
 
     @gluon.jit
     def local_load_q(self, buf_q_nope, buf_q_pe):
         cfg = self.cfg
-        q_nope = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            buf_q_nope, cfg.mfma_layout_a
-        )
-        q_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(buf_q_pe, cfg.mfma_layout_a)
+        if cfg.IS_FP8_Q:
+            q_nope = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                buf_q_nope.permute([1, 0]), cfg.q_layout
+            )
+            q_pe_buffer = buf_q_pe.permute([1, 0])
+            if cfg.Q_PE_BLOCK_H != cfg.BLOCK_H:
+                q_pe_buffer = q_pe_buffer.slice(0, cfg.BLOCK_H, 0)
+            q_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                q_pe_buffer, cfg.q_layout
+            )
+        else:
+            q_nope = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                buf_q_nope, cfg.q_layout
+            )
+            q_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(buf_q_pe, cfg.q_layout)
         return q_nope, q_pe
 
     @gluon.jit
@@ -605,19 +891,17 @@ class AttentionProgram:
         cfg = self.cfg
         dtype = self.Q_nope.type.element_ty
         if RELAXED:
-            k_c = gl.amd.cdna4.async_copy.load_shared_relaxed(kv_buf, cfg.mfma_layout_b)
+            k_c = gl.amd.cdna4.async_copy.load_shared_relaxed(kv_buf, cfg.k_layout)
         else:
-            k_c = kv_buf.load(layout=cfg.mfma_layout_b)
+            k_c = kv_buf.load(layout=cfg.k_layout)
         zeros = gl.zeros(
             [cfg.BLOCK_H, cfg.BLOCK_N], dtype=gl.float32, layout=cfg.mfma_layout
         )
         qk = gl.amd.cdna4.mfma(q_nope, k_c.to(dtype), zeros)
         if RELAXED:
-            k_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                kpe_buf, cfg.mfma_layout_b
-            )
+            k_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(kpe_buf, cfg.k_layout)
         else:
-            k_pe = kpe_buf.load(layout=cfg.mfma_layout_b)
+            k_pe = kpe_buf.load(layout=cfg.k_layout)
         qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(dtype), qk)
         return qk
 
@@ -638,7 +922,7 @@ class AttentionProgram:
         e_sum = e_sum * re_scale + gl.sum(p, 1)
         e_max = n_e_max
         p = p.to(dtype)
-        p = gl.convert_layout(p, cfg.mfma_layout_a)
+        p = gl.convert_layout(p, cfg.p_layout)
         acc *= re_scale[:, None]
         return p, e_max, e_sum, acc
 
@@ -652,14 +936,14 @@ class AttentionProgram:
             v_c = kv_buf.load(layout=cfg.linear_v)
         v_c = v_c.to(dtype)
         v_c = gl.permute(v_c, [1, 0])
-        v_c = gl.convert_layout(v_c, cfg.mfma_layout_b)
+        v_c = gl.convert_layout(v_c, cfg.v_layout)
         acc = gl.amd.cdna4.mfma(p, v_c, acc)
         return acc
 
     @gluon.jit
     def store_output(self, acc, e_sum):
         cfg = self.cfg
-        dtype = self.Q_nope.type.element_ty
+        out_dtype = self.Out.type.element_ty
         cur_head_o = self.cur_head_id * cfg.BLOCK_H + gl.arange(
             0, cfg.BLOCK_H, layout=gl.SliceLayout(1, cfg.mfma_layout)
         )
@@ -674,7 +958,7 @@ class AttentionProgram:
         )
         acc *= self.kv_scale
         rcp = 1.0 / e_sum
-        stored_value = (acc * rcp[:, None]).to(dtype)
+        stored_value = (acc * rcp[:, None]).to(out_dtype)
         if cfg.NHEAD < cfg.BLOCK_H:
             gl.amd.cdna4.buffer_store(
                 stored_value,
@@ -774,6 +1058,7 @@ def _mla_decode_gluon(
     NUM_XCDS: gl.constexpr,
     NHEAD: gl.constexpr,
     REGIME: gl.constexpr,
+    IS_FP8_Q: gl.constexpr,
     RETURN_LSE: gl.constexpr,
 ):
     cfg = AttentionConfig(
@@ -788,6 +1073,7 @@ def _mla_decode_gluon(
         NUM_XCDS,
         NHEAD,
         REGIME,
+        IS_FP8_Q,
         RETURN_LSE,
         stride_q_nope_bs,
         stride_q_nope_h,
@@ -824,12 +1110,20 @@ def _mla_decode_gluon(
     dtype = Q_nope.type.element_ty
     kvtype = Kv_c_cache.type.element_ty
 
-    buf_q_nope = gl.allocate_shared_memory(
-        dtype, shape=[cfg.BLOCK_H, cfg.HEAD_DIM_CKV], layout=cfg.shared_q_nope
-    )
-    buf_q_pe = gl.allocate_shared_memory(
-        dtype, shape=[cfg.BLOCK_H, cfg.HEAD_DIM_KPE], layout=cfg.shared_q_pe
-    )
+    if cfg.IS_FP8_Q:
+        buf_q_nope = gl.allocate_shared_memory(
+            dtype, shape=[cfg.HEAD_DIM_CKV, cfg.BLOCK_H], layout=cfg.shared_q_nope
+        )
+        buf_q_pe = gl.allocate_shared_memory(
+            dtype, shape=[cfg.HEAD_DIM_KPE, cfg.Q_PE_BLOCK_H], layout=cfg.shared_q_pe
+        )
+    else:
+        buf_q_nope = gl.allocate_shared_memory(
+            dtype, shape=[cfg.BLOCK_H, cfg.HEAD_DIM_CKV], layout=cfg.shared_q_nope
+        )
+        buf_q_pe = gl.allocate_shared_memory(
+            dtype, shape=[cfg.BLOCK_H, cfg.HEAD_DIM_KPE], layout=cfg.shared_q_pe
+        )
 
     # load q_nope / q_pe
     program.issue_load_q_nope(buf_q_nope)
@@ -1184,6 +1478,31 @@ def _select_num_kv_splits_bh16bn64(
     return max(1, min(occupancy_cap, blocks))
 
 
+def _select_num_kv_splits_bh16bn128(
+    *, batch: int, max_seqlen_k: int, block_n: int
+) -> int:
+    occupancy_cap = (_WAVE_WORKGROUPS // 2) // batch
+    blocks = (max_seqlen_k + block_n - 1) // block_n
+    return max(1, min(occupancy_cap, blocks))
+
+
+def _select_num_kv_splits_bh16bn128_fp8(
+    *, batch: int, max_seqlen_k: int, block_n: int
+) -> int:
+    blocks = (max_seqlen_k + block_n - 1) // block_n
+    # For short contexts, the split-reduction launch costs more than the
+    # additional stage-1 parallelism saves.
+    if blocks <= 8:
+        return 1
+
+    # Keep at most four KV blocks in each split until the stage-1 grid reaches
+    # the device-wide occupancy target. Large batches need fewer splits because
+    # the batch dimension already contributes parallel workgroups.
+    work_cap = (blocks + 3) // 4
+    occupancy_cap = max(1, _WAVE_WORKGROUPS // batch)
+    return max(1, min(occupancy_cap, work_cap))
+
+
 def _select_num_kv_splits_bh64(
     *, batch: int, nhead: int, num_xcds: int, block_h: int
 ) -> int:
@@ -1191,7 +1510,7 @@ def _select_num_kv_splits_bh64(
     return max(1, triton.next_power_of_2(triton.cdiv(_WAVE_WORKGROUPS, base_grid)))
 
 
-def gluon_mla_decode_bf16_gfx950(
+def _gluon_mla_decode_gfx950(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
     page_table: torch.Tensor,
@@ -1206,19 +1525,20 @@ def gluon_mla_decode_bf16_gfx950(
     return_lse: bool = False,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Absorbed MLA decode over a paged compressed KV cache (gfx950, bf16).
+    """Absorbed MLA decode over a paged compressed KV cache on gfx950.
 
     ``q`` is ``[batch, 1, num_q_heads, kv_lora_rank + qk_rope_head_dim]`` and
     ``kv_cache`` is ``[num_pages, page_size, 1, kv_lora_rank + qk_rope_head_dim]``
     (first ``kv_lora_rank`` latent, last ``qk_rope_head_dim`` RoPE). Output is
-    ``[batch, 1, num_q_heads, kv_lora_rank]``. ``num_q_heads`` selects the
-    regime: ``bh16bn64`` (``<= 16``) or ``bh64`` (``{64, 128}``, ``batch_size``
-    divisible by 64).
+    BF16 with shape ``[batch, 1, num_q_heads, kv_lora_rank]``.
+
+    BF16 Q/KV selects ``bh16bn64`` (``num_q_heads <= 16``) or ``bh64``
+    (``num_q_heads in {64, 128}``). BF16 Q with FP8 KV selects AITER's
+    ``bh16bn128`` regime (``num_q_heads <= 16``). E4M3 Q with E4M3 KV selects
+    the native FP8 variant. Both FP8-KV variants support arbitrary batch sizes.
     """
     if logit_cap != 0.0:
-        raise NotImplementedError(
-            "gluon_mla_decode_bf16_gfx950 does not support logit_cap"
-        )
+        raise NotImplementedError("gluon_mla_decode_gfx950 does not support logit_cap")
     if q.dim() != 4 or q.shape[1] != 1:
         raise ValueError(
             f"q must be [batch, 1, num_q_heads, R + rope], got {tuple(q.shape)}"
@@ -1231,10 +1551,28 @@ def gluon_mla_decode_bf16_gfx950(
             "gluon MLA decode requires kv_lora_rank=512, qk_rope_head_dim=64, "
             f"got {kv_lora_rank}/{qk_rope_head_dim}"
         )
+    is_fp8_q = q.dtype == torch.float8_e4m3fn
+    valid_bf16_q = q.dtype == torch.bfloat16 and kv_cache.dtype in (
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    )
+    valid_fp8_q = is_fp8_q and kv_cache.dtype == torch.float8_e4m3fn
+    if not (valid_bf16_q or valid_fp8_q):
+        raise NotImplementedError(
+            "gluon MLA decode requires bf16 q with bf16/fp8 kv_cache or "
+            "float8_e4m3fn q with float8_e4m3fn kv_cache, got "
+            f"{q.dtype}/{kv_cache.dtype}"
+        )
+    is_fp8_kv = kv_cache.dtype != torch.bfloat16
+
     batch_size, _, nhead, _ = q.shape
     if nhead in (64, 128):
+        if kv_cache.dtype != torch.bfloat16:
+            raise NotImplementedError("gluon MLA bh64 requires bf16 q and kv_cache")
         regime = "bh64"
         block_h = 64
+        block_n = 64
         num_xcds = _NUM_XCDS
         if batch_size % 64 != 0:
             raise NotImplementedError(
@@ -1242,7 +1580,12 @@ def gluon_mla_decode_bf16_gfx950(
                 f"batch_size divisible by 64, got {batch_size}"
             )
     elif 1 <= nhead <= 16:
-        regime = "bh16bn64"
+        if is_fp8_kv:
+            regime = "bh16bn128"
+            block_n = 128
+        else:
+            regime = "bh16bn64"
+            block_n = 64
         block_h = 16
         num_xcds = 1  # unused by the 2-D (batch, split) grid
     else:
@@ -1250,9 +1593,6 @@ def gluon_mla_decode_bf16_gfx950(
             "gluon MLA decode supports num_q_heads in [1, 16] (bh16bn64) or "
             f"{{64, 128}} (bh64), got {nhead}"
         )
-    if q.dtype != torch.bfloat16:
-        raise NotImplementedError(f"gluon MLA decode requires bf16 q, got {q.dtype}")
-
     if kv_cache.dim() == 4:
         if kv_cache.shape[2] != 1 or kv_cache.shape[3] != qk_dim:
             raise ValueError(
@@ -1262,10 +1602,6 @@ def gluon_mla_decode_bf16_gfx950(
         page_size = kv_cache.shape[1]
     else:
         raise ValueError(f"kv_cache must be 4D, got {kv_cache.dim()}D")
-    if kv_cache.dtype != torch.bfloat16:
-        raise NotImplementedError(
-            f"gluon MLA decode requires bf16 kv_cache, got {kv_cache.dtype}"
-        )
     if not kv_cache.is_contiguous():
         raise ValueError("kv_cache must be contiguous")
     if cache_seqlens.dtype != torch.int32:
@@ -1279,8 +1615,12 @@ def gluon_mla_decode_bf16_gfx950(
 
     if out is None:
         out = torch.empty(
-            (batch_size, 1, nhead, kv_lora_rank), dtype=q.dtype, device=q.device
+            (batch_size, 1, nhead, kv_lora_rank),
+            dtype=torch.bfloat16,
+            device=q.device,
         )
+    elif out.dtype != torch.bfloat16:
+        raise ValueError(f"gluon MLA decode requires bf16 out, got {out.dtype}")
     o = out.view(batch_size, nhead, kv_lora_rank)
 
     if return_lse:
@@ -1301,9 +1641,20 @@ def gluon_mla_decode_bf16_gfx950(
         num_kv_splits = _select_num_kv_splits_bh64(
             batch=batch_size, nhead=nhead, num_xcds=num_xcds, block_h=block_h
         )
+    elif regime == "bh16bn128":
+        split_selector = (
+            _select_num_kv_splits_bh16bn128_fp8
+            if is_fp8_q
+            else _select_num_kv_splits_bh16bn128
+        )
+        num_kv_splits = split_selector(
+            batch=batch_size,
+            max_seqlen_k=max_seqlen_k,
+            block_n=block_n,
+        )
     else:
         num_kv_splits = _select_num_kv_splits_bh16bn64(
-            batch=batch_size, max_seqlen_k=max_seqlen_k, block_n=64
+            batch=batch_size, max_seqlen_k=max_seqlen_k, block_n=block_n
         )
 
     def _grid(splits: int) -> tuple[int, ...]:
@@ -1318,7 +1669,7 @@ def gluon_mla_decode_bf16_gfx950(
 
     common_kwargs = dict(
         BLOCK_H=block_h,
-        BLOCK_N=64,
+        BLOCK_N=block_n,
         NUM_KV_SPLITS=num_kv_splits,
         PAGE_SIZE=page_size,
         HEAD_DIM_CKV=kv_lora_rank,
@@ -1328,6 +1679,7 @@ def gluon_mla_decode_bf16_gfx950(
         NUM_XCDS=num_xcds,
         NHEAD=nhead,
         REGIME=regime,
+        IS_FP8_Q=is_fp8_q,
         RETURN_LSE=return_lse,
         num_warps=4,
     )
@@ -1372,7 +1724,7 @@ def gluon_mla_decode_bf16_gfx950(
         # short sequence leaves behind.
         logits = torch.empty(
             (batch_size, nhead, num_kv_splits, kv_lora_rank),
-            dtype=q.dtype,
+            dtype=out.dtype,
             device=q.device,
         )
         mid_lse = torch.empty(
@@ -1437,3 +1789,119 @@ def gluon_mla_decode_bf16_gfx950(
     if return_lse:
         return out, final_lse.view(batch_size, 1, nhead)
     return out
+
+
+def gluon_mla_decode_bf16xbf16_gfx950(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    max_seqlen_k: int,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    *,
+    logit_cap: float = 0.0,
+    return_lse: bool = False,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Run the BF16-Q/BF16-KV GFX950 MLA decode regimes."""
+    if q.dtype != torch.bfloat16 or kv_cache.dtype != torch.bfloat16:
+        raise NotImplementedError(
+            "gluon_mla_decode_bf16xbf16_gfx950 requires bf16 q and kv_cache"
+        )
+    return _gluon_mla_decode_gfx950(
+        q=q,
+        kv_cache=kv_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_k=max_seqlen_k,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        softmax_scale=softmax_scale,
+        logit_cap=logit_cap,
+        return_lse=return_lse,
+        out=out,
+    )
+
+
+def gluon_mla_decode_bf16xfp8_gfx950(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    max_seqlen_k: int,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    *,
+    logit_cap: float = 0.0,
+    return_lse: bool = False,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Run BF16-Q/FP8-KV MLA decode with the GFX950 ``bh16bn128`` regime."""
+    if q.dtype != torch.bfloat16 or kv_cache.dtype not in (
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    ):
+        raise NotImplementedError(
+            "gluon_mla_decode_bf16xfp8_gfx950 requires bf16 q and fp8 kv_cache"
+        )
+    return _gluon_mla_decode_gfx950(
+        q=q,
+        kv_cache=kv_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_k=max_seqlen_k,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        softmax_scale=softmax_scale,
+        logit_cap=logit_cap,
+        return_lse=return_lse,
+        out=out,
+    )
+
+
+def gluon_mla_decode_fp8xfp8_gfx950(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    max_seqlen_k: int,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    *,
+    logit_cap: float = 0.0,
+    return_lse: bool = False,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Run native FP8-Q/FP8-KV MLA decode with BF16 output.
+
+    Query and cache values use unscaled E4M3 semantics.
+    """
+    if q.dtype != torch.float8_e4m3fn or kv_cache.dtype != torch.float8_e4m3fn:
+        raise NotImplementedError(
+            "gluon_mla_decode_fp8xfp8_gfx950 requires float8_e4m3fn q and kv_cache"
+        )
+    if out is not None and out.dtype != torch.bfloat16:
+        raise ValueError(f"native FP8 MLA requires bf16 out, got {out.dtype}")
+    return _gluon_mla_decode_gfx950(
+        q=q,
+        kv_cache=kv_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_k=max_seqlen_k,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        softmax_scale=softmax_scale,
+        logit_cap=logit_cap,
+        return_lse=return_lse,
+        out=out,
+    )
