@@ -524,6 +524,7 @@ def test_msa_fp8_kv_descale_matches_dequant_reference(phase: str) -> None:
                 ),
                 max_seqlen_q=new_tokens,
                 max_seqlen_k=total_len,
+                seq_lens_cpu=[total_len],
             )
 
         got = op(
@@ -575,8 +576,11 @@ def _two_request_extend_case(kv_cache_dtype: torch.dtype):
     new_tokens = [7, 129]
     total_lens = [p + n for p, n in zip(prefix_lens, new_tokens)]
     num_blocks = [math.ceil(total / _BLOCK_SIZE) for total in total_lens]
+    total_kv_blocks = sum(num_blocks)
+    assert total_kv_blocks == 25
+    assert math.ceil(sum(total_lens) / _BLOCK_SIZE) == 24
     max_blocks = max(num_blocks)
-    num_pages = 1 + sum(num_blocks)  # Physical page zero is the dummy page.
+    num_pages = 1 + total_kv_blocks  # Physical page zero is the dummy page.
 
     block_table = torch.zeros((2, max_blocks), dtype=torch.int32, device="cuda")
     next_page = 1
@@ -641,6 +645,8 @@ def _two_request_extend_case(kv_cache_dtype: torch.dtype):
         attention_scale=_HEAD_DIM**-0.5,
         init_blocks=0,
         local_blocks=1,
+        query_lens_cpu=new_tokens,
+        seq_lens_cpu=total_lens,
     )
     return kwargs
 

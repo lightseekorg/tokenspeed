@@ -10,26 +10,31 @@ Unlike the end-to-end logprob parity test, this localizes any numerical
 divergence to the exact layer and phase where it first appears, and leaves
 no room for compensating errors.
 
-NOTE: intentionally NOT registered in CI while the Inkling port is
-confidential/local-only. Requires Blackwell (FA4).
+Runs on the released config (layer-truncated, experts shrunk; see
+``inkling_fixtures``) with dummy weights. Requires Blackwell (FA4).
 """
 
 import os
 import sys
-import tempfile
 import unittest
 from types import SimpleNamespace
 
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from runtime.models.inkling_fixtures import make_inkling_dummy_checkpoint  # noqa: E402
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
 from runtime.test_inkling_reference_parity import (  # noqa: E402
     _build_replica,
     _has_blackwell,
     _ref_sconv,
     _rel_attention,
     _rms_norm,
+)
+
+register_cuda_ci(
+    est_time=90,
+    suite="runtime-1gpu",
+    disabled_on_runners=["amd-*", "h100-*"],
 )
 
 PROMPT_IDS = [11, 25, 3, 999, 42, 7, 128, 55, 1023, 64, 2, 300, 17, 500]
@@ -54,11 +59,12 @@ def _reference_layer_states(model, text, input_ids):
 
     head_dim = text.head_dim
     num_heads = text.num_attention_heads
-    num_kv = text.num_key_value_heads
     T = len(input_ids)
 
     for li, layer in enumerate(m.layers):
         attn = layer.attn
+        # Per-layer native KV width (hetero serving).
+        num_kv = attn.kv_size // head_dim
         x = _rms_norm(h, layer.attn_norm.weight, text.rms_norm_eps).to(h.dtype)
         qkvr = x @ attn.qkvr.weight.t()
         q, k, v, r = qkvr.split(
@@ -244,7 +250,9 @@ class _Harness:
         return self._layer_states(ids, positions, ForwardMode.DECODE, out_cache_loc)
 
     def _layer_states(self, ids, positions, mode, out_cache_loc):
-        """Run embed + layers through the real stack, yielding per-layer h."""
+        """Run embed + layers through the real stack, yielding per-layer h
+        (fused add-norm convention: the comparable value is output+residual).
+        """
         m = self.model.model
         ctx = self._ctx(mode)
         states = []
@@ -252,11 +260,12 @@ class _Harness:
         if m.embed_norm is not None:
             h = m.embed_norm(h)
         states.append(("embed", h.clone()))
-        tau = None  # log_scaling_n_floor is null in the fixture config
+        tau = None  # exactly 1.0 below log_scaling_n_floor; off on both sides
+        residual = None
         for li, layer in enumerate(m.layers):
-            h = layer(h, ctx, out_cache_loc, log_scaling_tau=tau)
-            states.append((f"layer{li}", h.clone()))
-        h = m.norm(h)
+            h, residual = layer(h, residual, ctx, out_cache_loc, log_scaling_tau=tau)
+            states.append((f"layer{li}", (h + residual).clone()))
+        h, _ = m.norm(h, residual)
         states.append(("final_norm", h.clone()))
         return states
 
@@ -266,13 +275,7 @@ class TestInklingActivationParity(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         os.environ["INKLING_TORCH_MOE"] = "1"  # experts as plain parameters
-        cls._tmpdir = tempfile.TemporaryDirectory()
-        ckpt = str(make_inkling_dummy_checkpoint(cls._tmpdir.name, tiny=True))
-        cls.model, cls.text = _build_replica(ckpt)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls._tmpdir.cleanup()
+        cls.model, cls.text = _build_replica()
 
     def _compare(self, phase, got_states, ref_states, positions):
         report = []
