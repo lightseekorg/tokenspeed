@@ -386,8 +386,9 @@ def _floor_tokens_to_layout_grid(max_num_tokens: int, config) -> int:
     The profile is memory-dependent (``--gpu-memory-utilization`` over the
     free bytes at boot), so the raw value can land ANYWHERE on the 128-token
     page grid — but the hetero slot layout is only viewable on a coarser
-    grid. With ``slot_tokens`` S and a largest group page P (Inkling: S=256,
-    P=256, base page 128), the pool row counts that must divide are:
+    grid. With ``slot_tokens`` S and a largest group page P (both derived
+    from the config's KV head counts), the pool row counts that must divide
+    are:
 
     - target hybrid slab: rows = size + S viewed at base-page granularity
       after the per-layer head reinterpretation -> needs ``128 | size``
@@ -427,15 +428,44 @@ def _floor_tokens_to_layout_grid(max_num_tokens: int, config) -> int:
 
 
 def _apply_inkling_hetero_kv(config, model_config) -> None:
-    """Zero-padding slots: full=256 fills the slot, swa=128 leads (tail padded); ids sized by slot."""
+    """Publish the byte-uniform slot layout: per-group page sizes and per-layer KV head counts.
+
+    A layer serving ``heads_l`` of the slab's ``num_kv_heads`` allocation
+    width reinterprets one slot's bytes as ``page_size * alloc // heads_l``
+    tokens -- the same ratio ``MHATokenToKVPool._layer_page_tokens`` applies
+    when it views the slab. Both sides derive from the config's KV head
+    counts rather than a fixed pairing, so any
+    ``swa_num_key_value_heads`` / ``ckpt_num_key_value_heads`` combination
+    stays consistent. A published page wider than the slot's bytes afford
+    would over-subscribe that group's ids.
+
+    ``alloc`` comes from ``config.num_kv_heads`` (what the pool receives as
+    ``kv_alloc_head_count``), not ``max(counts)``: an all-narrow pool whose
+    own layers never include an alloc-width layer is still allocated at the
+    config max and must keep its widened page.
+
+    Args:
+        config: The attention config to populate in place.
+        model_config: Model config supplying the Inkling text config.
+    """
     from tokenspeed.runtime.configs.inkling_config import inkling_kv_heads_for_layer
 
-    config.slot_tokens = 256
-    config.group_page_sizes = {"full_attention": 256}
     tc = model_config.hf_config.get_text_config()
-    config.layer_kv_head_counts = tuple(
+    counts = tuple(
         inkling_kv_heads_for_layer(tc, i, True) for i in range(tc.num_hidden_layers)
     )
+    alloc = config.num_kv_heads
+    page_tokens = {
+        label: config.page_size * alloc // heads
+        for label, heads in zip(tc.paged_cache_layer_types, counts, strict=True)
+    }
+    config.slot_tokens = max(page_tokens.values(), default=config.page_size)
+    config.group_page_sizes = {
+        label: pages
+        for label, pages in page_tokens.items()
+        if pages != config.page_size
+    }
+    config.layer_kv_head_counts = counts
 
 
 def _publish_inkling_conv_groups(config, model_config, server_args) -> tuple[int, int]:
@@ -1093,16 +1123,12 @@ def create_attn_components(
             # Hetero KV, symmetric with the target pool: per-depth head
             # counts come from the MTP text config's own local ids
             # (ModelConfig swapped it in for the draft worker), giving the
-            # draft the same byte-uniform slot layout as the target — full
-            # depths at 256 tokens/id x ckpt heads, SWA depths at the base
-            # 128 x swa heads. The pool shares the TARGET's page-id space
-            # (the drafter consumes the target's per-group flat tables), so
-            # it is sized at the same max_num_tokens; per-layer views turn
-            # the max-head allocation into the group geometry, and the
-            # profile's max-head draft charge prices exactly that
-            # allocation. (The former num_kv_heads pin + explicit 2x row
-            # sizing described the all-full-attention special case of this
-            # same byte math.)
+            # draft the same byte-uniform slot layout as the target. The pool
+            # shares the TARGET's page-id space (the drafter consumes the
+            # target's per-group flat tables), so it is sized at the same
+            # max_num_tokens; per-layer views turn the max-head allocation
+            # into the group geometry, and the profile's max-head draft charge
+            # prices exactly that allocation.
             _apply_inkling_hetero_kv(draft_attn_config, draft_model_config)
             logger.info(
                 "Inkling MTP draft pool: hetero KV layer head counts=%s, "
