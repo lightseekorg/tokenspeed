@@ -167,9 +167,6 @@ def pool_to_paged_cache_groups(pool: Any) -> list:
             cache_blocks_per_lcm_block=int(
                 getattr(spec, "cache_blocks_per_lcm_block", 1)
             ),
-            materializes_all_boundaries=bool(
-                getattr(spec, "materializes_all_boundaries", False)
-            ),
         )
         if spec.retention == "sliding_window":
             kwargs["sliding_window_tokens"] = int(spec.sliding_window_tokens)

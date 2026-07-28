@@ -201,7 +201,6 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                 if self._lcm_memory_plan is not None
                 else None
             ),
-            materializes_all_state_boundaries=self._lcm_memory_plan is not None,
             extra_groups=extra_paged_groups,
             max_live_requests=max_batch_size,
             max_scheduled_tokens=max_scheduled_tokens,

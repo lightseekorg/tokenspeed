@@ -37,8 +37,6 @@ class PagedCacheGroupSpec:
     block_size: int | None = None
     # Physical child CacheBlocks packed into one shared LCM parent.
     cache_blocks_per_lcm_block: int = 1
-    # True only when the runtime writes every completed State boundary.
-    materializes_all_boundaries: bool = False
 
 
 _PAGED_CACHE_GROUP_DUMMY_PAGES = 1
@@ -475,7 +473,6 @@ def group_specs_from_layer_types(
     page_size: int,
     page_sizes: Mapping[str, int] | None = None,
     cache_blocks_per_lcm_block: Mapping[str, int] | None = None,
-    materializes_all_state_boundaries: bool = False,
 ) -> list[PagedCacheGroupSpec]:
     """Derive paged-cache group specs from per-layer attention types.
 
@@ -497,9 +494,6 @@ def group_specs_from_layer_types(
             Groups not listed use page_size.
         cache_blocks_per_lcm_block: Per-group physical packing. Omitted groups
             use one CacheBlock per physical parent.
-        materializes_all_state_boundaries: Whether the runtime writes every
-            completed logical boundary for State groups. History groups ignore
-            this capability.
 
     Raises:
         ValueError: unknown label; window sequence length mismatch; sliding
@@ -557,9 +551,6 @@ def group_specs_from_layer_types(
                 # Always explicit: unset groups inherit the C++ gcd base, which a finer extra group silently lowers.
                 block_size=ps,
                 cache_blocks_per_lcm_block=group_packing,
-                materializes_all_boundaries=(
-                    family == "state" and materializes_all_state_boundaries
-                ),
             )
         )
     if sizes:
@@ -579,7 +570,6 @@ def publish_paged_cache_groups(
     page_size: int,
     page_sizes: Mapping[str, int] | None = None,
     cache_blocks_per_lcm_block: Mapping[str, int] | None = None,
-    materializes_all_state_boundaries: bool = False,
     extra_groups: Sequence[PagedCacheGroupSpec] = (),
     max_live_requests: int,
     max_scheduled_tokens: int,
@@ -625,7 +615,6 @@ def publish_paged_cache_groups(
         page_size=page_size,
         page_sizes=page_sizes,
         cache_blocks_per_lcm_block=packing,
-        materializes_all_state_boundaries=materializes_all_state_boundaries,
     )
     # Model-declared groups outside the layer-type vocabulary (e.g. paged sconv columns).
     for spec in extra_groups:

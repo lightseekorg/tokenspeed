@@ -39,12 +39,7 @@ def _load_lcm_modules():
             _PYTHON_DIR / "tokenspeed" / "runtime" / "layers" / "attention"
         ),
         "tokenspeed.runtime.layers.attention.kv_cache": (
-            _PYTHON_DIR
-            / "tokenspeed"
-            / "runtime"
-            / "layers"
-            / "attention"
-            / "kv_cache"
+            _PYTHON_DIR / "tokenspeed" / "runtime" / "layers" / "attention" / "kv_cache"
         ),
     }
     for package_name, package_path in package_paths.items():
@@ -57,8 +52,7 @@ def _load_lcm_modules():
     )
     arena = _load(
         "tokenspeed.runtime.layers.attention.kv_cache.lcm_arena",
-        package_paths["tokenspeed.runtime.layers.attention.kv_cache"]
-        / "lcm_arena.py",
+        package_paths["tokenspeed.runtime.layers.attention.kv_cache"] / "lcm_arena.py",
     )
     return plan, arena
 

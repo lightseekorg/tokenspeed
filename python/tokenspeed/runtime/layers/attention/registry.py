@@ -562,7 +562,6 @@ def _inkling_checkpoint_group_specs(plan) -> tuple[PagedCacheGroupSpec, ...]:
             sliding_window_tokens=None,
             family="state",
             cache_blocks_per_lcm_block=packing[group_id],
-            materializes_all_boundaries=True,
         )
         for group_id in ("kvconv", "hiddenconv")
     )

@@ -170,7 +170,9 @@ def _solve_packing(fields, *, max_packing):
         smallest = 0
         for count in counts.values():
             smallest = math.gcd(smallest, count)
-        packing.update({group_id: count // smallest for group_id, count in counts.items()})
+        packing.update(
+            {group_id: count // smallest for group_id, count in counts.items()}
+        )
 
     if any(count > max_packing for count in packing.values()):
         return None
@@ -373,9 +375,7 @@ def plan_lcm_fields(
 
     parent_alignment = alignment
     for count in packing.values():
-        parent_alignment = (
-            parent_alignment // math.gcd(parent_alignment, count) * count
-        )
+        parent_alignment = parent_alignment // math.gcd(parent_alignment, count) * count
     lcm_block_bytes = _align_up(sum(plane_bytes.values()), parent_alignment)
     if lcm_block_bytes > max_lcm_block_bytes:
         raise ValueError(
