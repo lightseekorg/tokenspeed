@@ -50,7 +50,7 @@ _MOE_WEIGHT_DTYPES = {
 }
 
 _FUSED_PROJECTION_SHARDS = {
-    "qkv_proj": ("q_proj", "k_proj", "v_proj"),
+    "qkv_proj": ("q_proj", "k_proj", "v_proj", "index_q_proj", "index_k_proj"),
     "gate_up_proj": ("gate_proj", "up_proj"),
 }
 

@@ -25,6 +25,7 @@ from typing import Any, Literal, NamedTuple, Protocol, runtime_checkable
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.ops.moe import moe_sigmoid_bias_topk
 from tokenspeed_kernel.ops.moe.triton.inkling_topk import inkling_topk
 from tokenspeed_kernel.thirdparty.cuda import routing_flash as cuda_routing_flash
 from tokenspeed_kernel.thirdparty.triton import minimax_biased_grouped_topk
@@ -293,6 +294,8 @@ class TopKConfig:
     output_format: TopKOutputFormat | None = None
     zero_expert_num: int | None = 0
     topk_indices_dtype: torch.dtype | None = torch.int32
+    # Weights dtype for the biased-grouped path; bf16 lets consumers skip a cast.
+    topk_weights_dtype: torch.dtype = torch.float32
     # Shared-expert sink (Inkling)
     num_sink_experts: int = 0
     sink_global_scale: torch.Tensor | None = None
@@ -351,6 +354,7 @@ class TopK(torch.nn.Module):
         output_format: TopKOutputFormat | None = None,
         zero_expert_num: int | None = 0,
         topk_indices_dtype=torch.int32,
+        topk_weights_dtype: torch.dtype = torch.float32,
         num_sink_experts: int = 0,
         sink_global_scale: torch.Tensor | None = None,
     ):
@@ -376,6 +380,7 @@ class TopK(torch.nn.Module):
             output_format=output_format,
             zero_expert_num=zero_expert_num,
             topk_indices_dtype=topk_indices_dtype,
+            topk_weights_dtype=topk_weights_dtype,
             num_sink_experts=num_sink_experts,
             sink_global_scale=sink_global_scale,
         )
@@ -508,18 +513,38 @@ def select_experts(
                     expert_location_dispatch_info.partial_logical_to_rank_dispatch_physical_map
                 )
                 mapped_in_kernel = True
-            topk_weights, topk_ids = minimax_biased_grouped_topk(
-                hidden_states,
-                router_logits,
-                correction_bias,
-                topk=top_k,
-                renormalize=renormalize,
-                num_expert_group=num_expert_group,
-                topk_group=topk_group,
-                num_fused_shared_experts=num_fused_shared_experts,
-                routed_scaling_factor=routed_scaling_factor,
-                logical_to_physical_map=logical_to_physical_map,
+            num_experts = router_logits.shape[1]
+            use_sigmoid_bias_topk = (
+                0 < top_k <= num_experts
+                and num_expert_group == 1
+                and topk_group == 1
+                and num_fused_shared_experts == 0
+                and routed_scaling_factor is not None
+                and num_token_non_padded is None
+                and expert_location_dispatch_info is None
             )
+            if use_sigmoid_bias_topk:
+                topk_weights, topk_ids = moe_sigmoid_bias_topk(
+                    router_logits,
+                    correction_bias,
+                    top_k,
+                    routed_scaling_factor=float(routed_scaling_factor),
+                    normalize_topk_weights=renormalize,
+                )
+            else:
+                topk_weights, topk_ids = minimax_biased_grouped_topk(
+                    hidden_states,
+                    router_logits,
+                    correction_bias,
+                    topk=top_k,
+                    renormalize=renormalize,
+                    num_expert_group=num_expert_group,
+                    topk_group=topk_group,
+                    num_fused_shared_experts=num_fused_shared_experts,
+                    routed_scaling_factor=routed_scaling_factor,
+                    logical_to_physical_map=logical_to_physical_map,
+                    weights_dtype=topk_config.topk_weights_dtype,
+                )
             if mapped_in_kernel:
                 expert_location_dispatch_info = None
 

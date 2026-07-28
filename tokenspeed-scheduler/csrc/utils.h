@@ -22,10 +22,14 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <variant>
 #include <vector>
+
+#include <spdlog/spdlog.h>
 
 #if defined(__has_include)
 #if __has_include(<source_location>)
@@ -110,6 +114,28 @@ inline void _assert(bool condition, const char* message = "Assertion failed",
         std::string msg = message;
         msg = msg + " at " + loc.file_name() + ":" + std::to_string(loc.line()) + " in " + loc.function_name();
         throw std::runtime_error(msg);
+    }
+}
+
+inline void FatalCheck(bool condition, const char* message = "Fatal check failed",
+                       SourceLocation loc = SourceLocation::current()) noexcept {
+    if (!condition) [[unlikely]] {
+        bool logged = false;
+        try {
+            if (auto logger = spdlog::default_logger()) {
+                logger->critical("Fatal check failed: {} at {}:{} in {}", message, loc.file_name(), loc.line(),
+                                 loc.function_name());
+                logger->flush();
+                logged = true;
+            }
+        } catch (...) {
+        }
+        if (!logged) {
+            std::fprintf(stderr, "Fatal check failed: %s at %s:%lu in %s\n", message, loc.file_name(),
+                         static_cast<unsigned long>(loc.line()), loc.function_name());
+            std::fflush(stderr);
+        }
+        std::abort();
     }
 }
 

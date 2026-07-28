@@ -26,6 +26,7 @@
 #if TOKENSPEED_FLAT_KVCACHE
 
 #include <algorithm>
+#include <array>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -36,13 +37,6 @@
 namespace tokenspeed::test {
 
 namespace {
-
-const FlatForwardOperation* FindFlatOp(const ExecutionPlan& plan) {
-    for (const auto& op : plan.Operations()) {
-        if (const auto* f = std::get_if<FlatForwardOperation>(&op)) return f;
-    }
-    return nullptr;
-}
 
 PagedCacheGroupConfig MakeGroup(const std::string& id, std::int32_t block_size, std::int32_t total_pages,
                                 PagedCacheGroupConfig::Retention retention, PagedCacheGroupFamily family,
@@ -58,6 +52,29 @@ PagedCacheGroupConfig MakeGroup(const std::string& id, std::int32_t block_size, 
         g.sliding_window_tokens = sliding_window_tokens;
     }
     return g;
+}
+
+SchedulerConfig MakeKimi128KConfig(std::int32_t total_pages) {
+    SchedulerConfig cfg{};
+    cfg.block_size = 1536;
+    cfg.device_allocator.total_pages = total_pages;
+    cfg.host_allocator.total_pages = total_pages;
+    cfg.max_scheduled_tokens = 8192;
+    cfg.max_batch_size = 1;
+    cfg.enable_l3_storage = false;
+    cfg.disable_l2_cache = true;
+    cfg.disable_prefix_cache = true;
+    cfg.paged_cache_groups = {
+        MakeGroup("full_attention", cfg.block_size, total_pages, PagedCacheGroupConfig::Retention::FullHistory,
+                  PagedCacheGroupFamily::History),
+        MakeGroup("linear_attention_0", cfg.block_size, total_pages, PagedCacheGroupConfig::Retention::FullHistory,
+                  PagedCacheGroupFamily::State),
+        MakeGroup("linear_attention_1", cfg.block_size, total_pages, PagedCacheGroupConfig::Retention::FullHistory,
+                  PagedCacheGroupFamily::State),
+        MakeGroup("linear_attention_2", cfg.block_size, total_pages, PagedCacheGroupConfig::Retention::FullHistory,
+                  PagedCacheGroupFamily::State),
+    };
+    return cfg;
 }
 
 // Collect every real (>0) physical page id across all rows of a group.
@@ -134,6 +151,76 @@ TEST_F(FlatChunkedPrefillSuite, MultiChunkPrefillGrowsFullTableThenDecodes) {
     EXPECT_EQ(scheduler_->DecodingSize(), 0u);
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start)
         << "all pages returned to the pool after a chunked-prefill request finishes";
+}
+
+class FlatKimi128KCorrectedPoolSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        // 107 usable pages plus page 0: 86 history + 3 * 7 state.
+        return MakeKimi128KConfig(/*total_pages=*/108);
+    }
+};
+
+TEST_F(FlatKimi128KCorrectedPoolSuite, AllSixteenChunksCompleteAndReleasePages) {
+    const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
+    ASSERT_EQ(free_at_start, 107);
+    Submit(RequestSpec{
+        .request_id = "128k",
+        .tokens = std::vector<token_t>(131072, 1),
+    });
+
+    for (std::int32_t chunk = 0; chunk < 16; ++chunk) {
+        ExecutionPlan plan = PlanOnce();
+        const FlatForwardOperation* op = FindFlatOp(plan);
+        ASSERT_NE(op, nullptr) << "128K prefill deferred at chunk " << chunk;
+        ASSERT_EQ(op->request_ids.size(), 1u);
+    }
+    SendForwardDone("128k", {2});
+    ExecutionPlan decode = PlanOnce();
+    ASSERT_NE(FindFlatOp(decode), nullptr) << "decode transition must fit";
+
+    SendFinish("128k");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
+}
+
+class FlatKimi128KUndersizedPoolSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        // Old single-history geometry: 85 usable pages plus page 0.
+        return MakeKimi128KConfig(/*total_pages=*/86);
+    }
+};
+
+TEST_F(FlatKimi128KUndersizedPoolSuite, DefersBeforeAllSixteenChunksComplete) {
+    Submit(RequestSpec{
+        .request_id = "128k",
+        .tokens = std::vector<token_t>(131072, 1),
+    });
+
+    // With only 85 usable pages the 128K history (needs 86 history + state
+    // pages) cannot be fully prefilled, so the scheduler must reject the
+    // request rather than run all sixteen chunks. Rejection manifests as
+    // retraction -- the request stops appearing in the flat op -- not as a
+    // null plan (once no work remains the scheduler still emits idle forward
+    // ops with zero requests). Count only chunks that carry real prefill work
+    // for "128k" and require the request to drop out before all sixteen.
+    std::int32_t real_chunks = 0;
+    for (; real_chunks < 16; ++real_chunks) {
+        ExecutionPlan plan = PlanOnce();
+        const FlatForwardOperation* op = FindFlatOp(plan);
+        const bool carries_request =
+            op != nullptr && std::find(op->request_ids.begin(), op->request_ids.end(), "128k") != op->request_ids.end();
+        if (!carries_request) break;
+    }
+    EXPECT_LT(real_chunks, 16) << "85 usable pages must not fully prefill a 128K request; it must be "
+                                  "retracted before all sixteen chunks complete";
+    // Retraction frees the request's pages on the following plan step; let it
+    // settle, then require the whole pool back.
+    for (int i = 0; i < 4 && scheduler_->FlatPoolFreeBlocks() != 85; ++i) {
+        PlanOnce();
+    }
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), 85) << "a retracted request must return all of its pages to the pool";
 }
 
 // ---------------------------------------------------------------------------
@@ -1842,7 +1929,7 @@ TEST(FlatSwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
         /*hybrid_prefix_cache=*/nullptr, /*mamba_allocator=*/nullptr, /*mamba_loadback_nodes=*/{}, &coordinator});
     ASSERT_TRUE(request.Is<fsm::PrefillDone>());
 
-    const auto swa_slot_null = [&](std::int32_t i) { return request.FlatBlockTablesRef()[1].Blocks()[i]->IsNull(); };
+    const auto swa_slot_null = [&](std::int32_t i) { return !request.FlatBlockTablesRef()[1].Blocks()[i]; };
 
     // Size 5, decode transition (no slide): 3 pages.
     request.Apply(fsm::ExtendResultEvent{"r1", {100}});
@@ -1873,8 +1960,8 @@ TEST(FlatSwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
     EXPECT_TRUE(swa_slot_null(1));
     EXPECT_FALSE(swa_slot_null(2));
 
-    for (CacheBlock* b : request.FlatBlockTablesRef()[0].Blocks()) {
-        EXPECT_FALSE(b->IsNull());
+    for (const BlockRef& block : request.FlatBlockTablesRef()[0].Blocks()) {
+        EXPECT_TRUE(block);
     }
 
     request.Apply(fsm::AbortEvent{&coordinator});
@@ -2078,6 +2165,19 @@ TEST_F(FlatPrefixHitSuite, TwoRequestsSharePrefixReusePages) {
 
     ExpectRowPrefixEq(op->flat_block_tables.at("full").at(0), r1_rows.at("full"), "full row");
     ExpectRowPrefixEq(op->flat_block_tables.at("swa").at(0), r1_rows.at("swa"), "swa row");
+
+    std::set<std::int32_t> prefix_pages;
+    std::set<std::int32_t> fresh_pages;
+    for (const char* group_id : {"full", "swa"}) {
+        const auto& row = op->flat_block_tables.at(group_id).at(0);
+        prefix_pages.insert(row.begin(), row.begin() + 4);
+        fresh_pages.insert(row.begin() + 4, row.end());
+    }
+    const std::set<std::int32_t> pages_to_zero(plan.flat_page_ids_to_zero.begin(), plan.flat_page_ids_to_zero.end());
+    EXPECT_EQ(pages_to_zero, fresh_pages);
+    for (std::int32_t prefix_page : prefix_pages) {
+        EXPECT_FALSE(pages_to_zero.contains(prefix_page)) << "a prefix-cache hit must retain its cached contents";
+    }
 
     // Pool: claim 4/group (8) + acquire ceil(4/2) = 2/group (4) = 12. The
     // decode reserve is only PROMISED here (ledger), not acquired.
@@ -3591,6 +3691,228 @@ TEST(HeteroBlockSize, BaseAndLcmForThreeGroups) {
     auto coord = MakeCoordinatorFrom({4, 6, 8});
     EXPECT_EQ(coord->BaseBlockSize(), 2);  // gcd(4,6,8)
     EXPECT_EQ(coord->LcmBlockSize(), 24);  // lcm(4,6,8)
+}
+
+// FlatKimiFourGroupSuite (integration_test_helper.h) is shared with the
+// four-group lifecycle tests in test_flat_kvcache_lifecycle.cpp.
+
+TEST_F(FlatKimiFourGroupSuite, PrefixBranchUsesSharedPrefixAndFreshTail) {
+    const std::size_t before = scheduler_->AvailableKvPages();
+    ASSERT_EQ(before, 32u);
+    Submit(MakeRequestSpec("r1", /*num_pages=*/4));
+    ExecutionPlan r1_prefill = PlanOnce();
+    const FlatForwardOperation* r1_op = FindFlatOp(r1_prefill);
+    ASSERT_NE(r1_op, nullptr);
+    std::map<std::string, std::vector<std::int32_t>> r1_rows;
+    for (const auto& group_id : GroupIds()) {
+        r1_rows[group_id] = r1_op->flat_block_tables.at(group_id).at(0);
+        ASSERT_EQ(r1_rows.at(group_id).size(), 4u) << group_id;
+    }
+    SendForwardDone("r1", {9001});
+    PlanOnce();
+    SendForwardDone("r1", {9002});
+    SendFinish("r1");
+    PlanOnce();
+    ASSERT_EQ(scheduler_->AvailableKvPages(), before);
+
+    token_vec_t branch_tokens = MakeAlignedTokens(/*num_pages=*/4, PageSize());
+    const token_vec_t tail = MakeTokens(/*count=*/4, /*start=*/901);
+    branch_tokens.insert(branch_tokens.end(), tail.begin(), tail.end());
+    Submit(RequestSpec{.request_id = "r2", .tokens = branch_tokens});
+    ExecutionPlan branch = PlanOnce();
+    const FlatForwardOperation* branch_op = FindFlatOp(branch);
+    ASSERT_NE(branch_op, nullptr);
+    ASSERT_EQ(branch_op->request_ids.size(), 1u);
+    EXPECT_EQ(branch_op->extend_prefix_lens.at(0), 8);
+    EXPECT_EQ(branch_op->input_lengths.at(0), 4);
+
+    std::set<std::int32_t> shared;
+    for (const auto& [group_id, row] : r1_rows) {
+        CollectDisjointRealPages({row}, shared, group_id);
+    }
+    std::set<std::int32_t> all_fresh;
+    std::size_t fresh_positive_entries = 0;
+    for (const auto& group_id : GroupIds()) {
+        const auto& row = branch_op->flat_block_tables.at(group_id).at(0);
+        ASSERT_EQ(row.size(), 6u) << group_id;
+        std::size_t shared_positive_entries = 0;
+        for (std::size_t i = 0; i < r1_rows.at(group_id).size(); ++i) {
+            if (row[i] > 0) {
+                ++shared_positive_entries;
+                EXPECT_EQ(row[i], r1_rows.at(group_id)[i]) << group_id << " shared slot " << i;
+            }
+        }
+        EXPECT_GT(shared_positive_entries, 0u) << group_id << " must claim at least one complete prefix page";
+        for (std::size_t i = r1_rows.at(group_id).size(); i < row.size(); ++i) {
+            ASSERT_GT(row[i], 0) << group_id << " fresh tail slot " << i;
+            ++fresh_positive_entries;
+            EXPECT_EQ(shared.count(row[i]), 0u) << group_id << " reused a shared page for its branch tail";
+            EXPECT_TRUE(all_fresh.insert(row[i]).second) << "fresh global page " << row[i] << " collides";
+        }
+    }
+    EXPECT_EQ(all_fresh.size(), fresh_positive_entries);
+
+    SendForwardDone("r2", {199});
+    PlanOnce();
+    SendForwardDone("r2", {200});
+    SendFinish("r2");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->AvailableKvPages(), before);
+}
+
+TEST_F(FlatKimiFourGroupSuite, RetractAndReadmitRestorePageBalance) {
+    const std::size_t before = scheduler_->AvailableKvPages();
+    ASSERT_EQ(before, 32u);
+    const std::array<std::string, 4> request_ids{"a", "b", "c", "d"};
+    for (std::size_t i = 0; i < request_ids.size(); ++i) {
+        Submit(MakeRequestSpec(request_ids[i], /*num_pages=*/1, /*start=*/1 + static_cast<int>(i) * 100));
+    }
+
+    ExecutionPlan prefill = PlanOnce();
+    const FlatForwardOperation* prefill_op = FindFlatOp(prefill);
+    ASSERT_NE(prefill_op, nullptr);
+    ASSERT_EQ(prefill_op->request_ids.size(), request_ids.size());
+    for (std::size_t i = 0; i < request_ids.size(); ++i) {
+        SendForwardDone(request_ids[i], {1000 + static_cast<int>(i)});
+    }
+
+    std::map<std::string, std::map<std::size_t, std::int32_t>> pre_retract_pages;
+    const auto record_positive_slots = [&](const FlatForwardOperation& op, std::size_t row_index) {
+        for (const auto& group_id : GroupIds()) {
+            const auto& row = op.flat_block_tables.at(group_id).at(row_index);
+            for (std::size_t logical_slot = 0; logical_slot < row.size(); ++logical_slot) {
+                const std::int32_t page = row[logical_slot];
+                if (page <= 0) continue;
+                const auto [entry, inserted] = pre_retract_pages[group_id].emplace(logical_slot, page);
+                EXPECT_TRUE(inserted || entry->second == page)
+                    << group_id << " changed page at logical slot " << logical_slot;
+            }
+        }
+    };
+    record_positive_slots(*prefill_op, 0);
+    int consecutive_empty_rounds = 0;
+    int next_token = 2000;
+    for (int round = 0; round < 32 && consecutive_empty_rounds < 2; ++round) {
+        ExecutionPlan plan = PlanOnce();
+        const FlatForwardOperation* op = FindFlatOp(plan);
+        ASSERT_NE(op, nullptr);
+        if (op->request_ids.empty()) {
+            ++consecutive_empty_rounds;
+            continue;
+        }
+        consecutive_empty_rounds = 0;
+        const auto a = std::find(op->request_ids.begin(), op->request_ids.end(), "a");
+        if (a != op->request_ids.end()) {
+            const std::size_t a_row = static_cast<std::size_t>(std::distance(op->request_ids.begin(), a));
+            record_positive_slots(*op, a_row);
+        }
+        for (const auto& request_id : op->request_ids) {
+            SendForwardDone(request_id, {next_token++});
+        }
+    }
+    ASSERT_EQ(consecutive_empty_rounds, 2);
+    EXPECT_EQ(scheduler_->AvailableKvPages(), 11u);
+    EXPECT_EQ(scheduler_->WaitingSize(), 1u);
+    EXPECT_EQ(scheduler_->DecodingSize(), 3u);
+    EXPECT_EQ(scheduler_->GetRequestTokenSize("a"), 11);
+
+    for (const auto& request_id : {"b", "c", "d"}) SendFinish(request_id);
+
+    ExecutionPlan readmit = PlanOnce();
+    const FlatForwardOperation* readmit_op = FindFlatOp(readmit);
+    ASSERT_NE(readmit_op, nullptr);
+    ASSERT_EQ(readmit_op->request_ids.size(), 1u);
+    EXPECT_EQ(readmit_op->request_ids.at(0), "a");
+    EXPECT_EQ(readmit_op->prefill_lengths.at(0), 11);
+    EXPECT_EQ(readmit_op->extend_prefix_lens.at(0) + readmit_op->input_lengths.at(0), 11);
+    ASSERT_EQ(readmit_op->flat_block_tables.size(), GroupIds().size());
+    ASSERT_EQ(readmit_op->extend_prefix_lens.at(0) % PageSize(), 0);
+    const std::size_t prefix_slots = static_cast<std::size_t>(readmit_op->extend_prefix_lens.at(0) / PageSize());
+    ASSERT_EQ(prefix_slots, 4u);
+    const std::size_t expected_slots =
+        static_cast<std::size_t>((readmit_op->prefill_lengths.at(0) + PageSize() - 1) / PageSize());
+    ASSERT_EQ(expected_slots, 6u);
+
+    std::set<std::int32_t> all_positive;
+    std::set<std::int32_t> restored_pages;
+    std::set<std::int32_t> fresh_tail;
+    std::size_t raw_positive_entries = 0;
+    std::size_t raw_fresh_tail_entries = 0;
+    for (const auto& group_id : GroupIds()) {
+        const auto& row = readmit_op->flat_block_tables.at(group_id).at(0);
+        ASSERT_EQ(row.size(), expected_slots) << group_id;
+        ASSERT_EQ(row.size() - prefix_slots, 2u) << group_id;
+        std::size_t group_positive_entries = 0;
+        std::size_t group_restored_entries = 0;
+        for (std::size_t i = 0; i < row.size(); ++i) {
+            const std::int32_t id = row[i];
+            if (id > 0) {
+                ++raw_positive_entries;
+                ++group_positive_entries;
+                EXPECT_TRUE(all_positive.insert(id).second) << "readmit global page " << id << " collides";
+            }
+            if (i < prefix_slots && id > 0) {
+                ++group_restored_entries;
+                const auto original = pre_retract_pages.at(group_id).find(i);
+                ASSERT_NE(original, pre_retract_pages.at(group_id).end())
+                    << group_id << " has no pre-retract page at restored logical slot " << i;
+                EXPECT_EQ(id, original->second) << group_id << " restored complete-prefix slot " << i;
+                EXPECT_TRUE(restored_pages.insert(id).second) << "restored page " << id << " collides";
+            }
+            if (i >= prefix_slots) {
+                ASSERT_GT(id, 0) << group_id << " fresh tail slot " << i;
+                ++raw_fresh_tail_entries;
+                EXPECT_EQ(restored_pages.count(id), 0u) << group_id << " fresh tail reused restored page " << id;
+                EXPECT_TRUE(fresh_tail.insert(id).second) << "fresh tail global page " << id << " collides";
+            }
+        }
+        EXPECT_GT(group_positive_entries, 0u) << group_id << " readmit row must reconstruct a positive page";
+        EXPECT_GT(group_restored_entries, 0u) << group_id << " must restore a positive checkpoint page";
+    }
+    EXPECT_EQ(all_positive.size(), raw_positive_entries);
+    EXPECT_EQ(fresh_tail.size(), raw_fresh_tail_entries);
+
+    SendForwardDone("a", {3000});
+    PlanOnce();
+    SendForwardDone("a", {3001});
+    SendFinish("a");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->AvailableKvPages(), before);
+}
+
+TEST_F(FlatKimiFourGroupSuite, HighestGlobalPageIdIsReachable) {
+    const std::size_t before = scheduler_->AvailableKvPages();
+    ASSERT_EQ(before, 32u);
+    const std::array<std::string, 4> request_ids{"a", "b", "c", "d"};
+    for (std::size_t i = 0; i < request_ids.size(); ++i) {
+        Submit(MakeRequestSpec(request_ids[i], /*num_pages=*/1, /*start=*/1 + static_cast<int>(i) * 100));
+    }
+    ASSERT_NE(FindFlatOp(PlanOnce()), nullptr);
+    for (std::size_t i = 0; i < request_ids.size(); ++i) {
+        SendForwardDone(request_ids[i], {1000 + static_cast<int>(i)});
+    }
+
+    ExecutionPlan full_pool = PlanOnce();
+    const FlatForwardOperation* op = FindFlatOp(full_pool);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(scheduler_->AvailableKvPages(), 0u);
+    std::set<std::int32_t> all_real;
+    std::size_t fresh_positive_entries = 0;
+    for (const auto& group_id : GroupIds()) {
+        ASSERT_EQ(op->flat_block_tables.at(group_id).size(), request_ids.size()) << group_id;
+        fresh_positive_entries += CollectDisjointRealPages(op->flat_block_tables.at(group_id), all_real, group_id);
+    }
+    EXPECT_EQ(all_real.size(), fresh_positive_entries);
+    EXPECT_EQ(all_real.size(), before);
+    ASSERT_FALSE(all_real.empty());
+    EXPECT_EQ(*all_real.rbegin(), 32);
+
+    for (std::size_t i = 0; i < request_ids.size(); ++i) {
+        SendForwardDone(request_ids[i], {2000 + static_cast<int>(i)});
+        SendFinish(request_ids[i]);
+    }
+    PlanOnce();
+    EXPECT_EQ(scheduler_->AvailableKvPages(), before);
 }
 
 }  // namespace tokenspeed::test

@@ -29,9 +29,19 @@ from enum import IntEnum
 
 import torch
 import torch.distributed
-from tokenspeed_kernel.ops.communication.trtllm import (
+from tokenspeed_kernel.ops.communication import (
     allgather_dual_rmsnorm,
+)
+from tokenspeed_kernel.ops.communication import (
+    allreduce_lane_latent_norm as kernel_allreduce_lane_latent_norm,
+)
+from tokenspeed_kernel.ops.communication import (
     allreduce_residual_rmsnorm,
+)
+from tokenspeed_kernel.ops.communication import (
+    prepare_allreduce_fusion as kernel_prepare_allreduce_fusion,
+)
+from tokenspeed_kernel.ops.communication import (
     reducescatter_residual_rmsnorm,
 )
 
@@ -119,6 +129,89 @@ def all_reduce(
     if backend is None:
         backend = get_global_backend()
     return backend.all_reduce(tensor, group, op=op)
+
+
+def all_reduce_two(
+    first: torch.Tensor,
+    second: torch.Tensor,
+    group: Group,
+    backend: CommBackend | None = None,
+    op: torch.distributed.ReduceOp = torch.distributed.ReduceOp.SUM,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """All-reduce two tensors, using a fused backend primitive when available.
+
+    Args:
+        first: First tensor to reduce.
+        second: Second tensor to reduce.
+        group: Global ranks participating in both reductions.
+        backend: Optional communication backend override.
+        op: Reduction operation.
+
+    Returns:
+        The two reduced tensors in input order.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.all_reduce_two(first, second, group, op=op)
+
+
+def prepare_all_reduce_lane(
+    group: Group,
+    hidden_dim: int,
+    backend: CommBackend | None = None,
+) -> bool:
+    """Prepare a backend-owned one-shot lane for a wider fused reduction."""
+
+    if backend is None:
+        backend = get_global_backend()
+    # No try/except: "backend can't do it" is already the base-class default
+    # (returns False), and this call is COLLECTIVE — swallowing a real error
+    # on one rank while peers succeed would leave the group disagreeing on
+    # the lane width. Let real failures propagate loudly.
+    return backend.prepare_all_reduce_lane(group, hidden_dim)
+
+
+def prepare_all_reduce_fusion(
+    group: Group,
+    hidden_dim: int,
+    max_token_num: int,
+) -> bool:
+    """Prepare fused all-reduce kernels before graph capture."""
+
+    try:
+        process_group = _get_process_group(group)
+        return kernel_prepare_allreduce_fusion(
+            rank=process_group.rank(),
+            group=process_group,
+            max_token_num=max_token_num,
+            hidden_dim=hidden_dim,
+        )
+    except Exception:
+        return False
+
+
+def all_reduce_latent_norm(
+    lane: torch.Tensor,
+    norm_weight: torch.Tensor,
+    latent_width: int,
+    group: Group,
+    *,
+    eps: float,
+    max_token_num: int,
+) -> torch.Tensor:
+    """All-reduce a routed/shared lane and RMS-normalize its routed prefix."""
+
+    process_group = _get_process_group(group)
+    return kernel_allreduce_lane_latent_norm(
+        lane,
+        norm_weight,
+        latent_width,
+        rank=process_group.rank(),
+        group=process_group,
+        eps=eps,
+        max_token_num=max_token_num,
+        launch_with_pdl=pdl_enabled(),
+    )
 
 
 def all_gather(

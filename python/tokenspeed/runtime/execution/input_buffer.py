@@ -115,20 +115,6 @@ class InputBuffers:
         # NOT pinned: python readers only; the H2D uses the per-step bulk pinned staging (_bulk_pinned).
         self.extend_prefix_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
         self.extend_seq_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
-        if has_mamba:
-            # TODO(overlap-safety): migrate to the per-step bulk (_bulk_pinned).
-            self._mamba_pool_indices_cpu = torch.full(
-                (max_bs,), -1, dtype=torch.int32, pin_memory=True
-            )
-            self._mamba_cow_src_indices_cpu = torch.full(
-                (max_bs,), -1, dtype=torch.int32, pin_memory=True
-            )
-            self._mamba_branching_seqlens_cpu = torch.full(
-                (max_bs,), -1, dtype=torch.int32, pin_memory=True
-            )
-            self._mamba_track_pool_indices_cpu = torch.full(
-                (max_bs,), -1, dtype=torch.int32, pin_memory=True
-            )
 
     def _bulk_pinned(self, *specs):
         """One pinned allocation for this step, sliced per (numel, dtype).
@@ -428,30 +414,41 @@ class InputBuffers:
             and hasattr(forward_op, "mamba_pool_indices")
             and forward_op.mamba_pool_indices
         ):
-            self._mamba_pool_indices_cpu[:batch_size].copy_(
+            (
+                mamba_pool_indices_cpu,
+                mamba_cow_src_indices_cpu,
+                mamba_branching_seqlens_cpu,
+                mamba_track_pool_indices_cpu,
+            ) = self._bulk_pinned(
+                (batch_size, torch.int32),
+                (batch_size, torch.int32),
+                (batch_size, torch.int32),
+                (batch_size, torch.int32),
+            )
+            mamba_pool_indices_cpu.copy_(
                 torch.as_tensor(forward_op.mamba_pool_indices, dtype=torch.int32)
             )
-            self._mamba_cow_src_indices_cpu[:batch_size].copy_(
+            mamba_cow_src_indices_cpu.copy_(
                 torch.as_tensor(forward_op.mamba_cow_src_indices, dtype=torch.int32)
             )
-            self._mamba_branching_seqlens_cpu[:batch_size].copy_(
+            mamba_branching_seqlens_cpu.copy_(
                 torch.as_tensor(forward_op.mamba_branching_seqlens, dtype=torch.int32)
             )
-            self._mamba_track_pool_indices_cpu[:batch_size].copy_(
+            mamba_track_pool_indices_cpu.copy_(
                 torch.as_tensor(forward_op.mamba_track_pool_indices, dtype=torch.int32)
             )
 
             self.mamba_pool_indices_buf[:batch_size].copy_(
-                self._mamba_pool_indices_cpu[:batch_size], non_blocking=True
+                mamba_pool_indices_cpu, non_blocking=True
             )
             self.mamba_cow_src_indices_buf[:batch_size].copy_(
-                self._mamba_cow_src_indices_cpu[:batch_size], non_blocking=True
+                mamba_cow_src_indices_cpu, non_blocking=True
             )
             self.mamba_branching_seqlens_buf[:batch_size].copy_(
-                self._mamba_branching_seqlens_cpu[:batch_size], non_blocking=True
+                mamba_branching_seqlens_cpu, non_blocking=True
             )
             self.mamba_track_pool_indices_buf[:batch_size].copy_(
-                self._mamba_track_pool_indices_cpu[:batch_size], non_blocking=True
+                mamba_track_pool_indices_cpu, non_blocking=True
             )
             if batch_size < self.mamba_pool_indices_buf.shape[0]:
                 self.mamba_pool_indices_buf[batch_size:].fill_(-1)

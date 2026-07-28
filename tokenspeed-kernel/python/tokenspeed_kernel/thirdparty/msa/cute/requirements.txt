@@ -1,0 +1,2 @@
+nvidia-cutlass-dsl>=4.6.0
+quack-kernels>=0.6.1

@@ -167,6 +167,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .value("History", tokenspeed::PagedCacheGroupFamily::History)
         .value("State", tokenspeed::PagedCacheGroupFamily::State);
 
+    nb::enum_<tokenspeed::PagedCacheTransferPolicy>(m, "PagedCacheTransferPolicy")
+        .value("Unspecified", tokenspeed::PagedCacheTransferPolicy::Unspecified)
+        .value("FullSuffix", tokenspeed::PagedCacheTransferPolicy::FullSuffix)
+        .value("LatestSnapshot", tokenspeed::PagedCacheTransferPolicy::LatestSnapshot);
+
     nb::class_<tokenspeed::PagedCacheGroupConfig>(m, "PagedCacheGroupConfig")
         .def(nb::init<>())
         .def(
@@ -174,15 +179,17 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             [](tokenspeed::PagedCacheGroupConfig* self, std::string group_id, std::int32_t rows_per_page,
                std::int32_t entry_stride_tokens, std::int32_t total_pages,
                tokenspeed::PagedCacheGroupConfig::Retention retention,
-               std::optional<std::int32_t> sliding_window_tokens, tokenspeed::PagedCacheGroupFamily family) {
+               std::optional<std::int32_t> sliding_window_tokens, tokenspeed::PagedCacheGroupFamily family,
+               tokenspeed::PagedCacheTransferPolicy transfer_policy) {
                 new (self) tokenspeed::PagedCacheGroupConfig{
                     std::move(group_id), rows_per_page, entry_stride_tokens,   total_pages,
-                    /*block_size=*/0,    retention,     sliding_window_tokens, family};
+                    /*block_size=*/0,    retention,     sliding_window_tokens, family,      transfer_policy};
             },
             nb::arg("group_id"), nb::arg("rows_per_page"), nb::arg("entry_stride_tokens"), nb::arg("total_pages"),
             nb::arg("retention") = tokenspeed::PagedCacheGroupConfig::Retention::FullHistory,
             nb::arg("sliding_window_tokens") = std::nullopt,
-            nb::arg("family") = tokenspeed::PagedCacheGroupFamily::History)
+            nb::arg("family") = tokenspeed::PagedCacheGroupFamily::History,
+            nb::arg("transfer_policy") = tokenspeed::PagedCacheTransferPolicy::Unspecified)
         .def_rw("group_id", &tokenspeed::PagedCacheGroupConfig::group_id)
         .def_rw("rows_per_page", &tokenspeed::PagedCacheGroupConfig::rows_per_page)
         .def_rw("entry_stride_tokens", &tokenspeed::PagedCacheGroupConfig::entry_stride_tokens)
@@ -191,6 +198,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("retention", &tokenspeed::PagedCacheGroupConfig::retention)
         .def_rw("sliding_window_tokens", &tokenspeed::PagedCacheGroupConfig::sliding_window_tokens)
         .def_rw("family", &tokenspeed::PagedCacheGroupConfig::family)
+        .def_rw("transfer_policy", &tokenspeed::PagedCacheGroupConfig::transfer_policy)
         .def("raw_tokens_per_page", &tokenspeed::PagedCacheGroupConfig::RawTokensPerPage)
         .def("validate", &tokenspeed::PagedCacheGroupConfig::Validate);
 
@@ -237,6 +245,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("decode_input_tokens", &tokenspeed::SchedulerConfig::decode_input_tokens)
         .def_rw("overlap_schedule_depth", &tokenspeed::SchedulerConfig::overlap_schedule_depth)
         .def_rw("role", &tokenspeed::SchedulerConfig::role)
+        .def_rw("enable_flatkv_pd", &tokenspeed::SchedulerConfig::enable_flatkv_pd)
         .def_prop_rw(
             "num_device_pages", [](const tokenspeed::SchedulerConfig& c) { return c.device_allocator.total_pages; },
             [](tokenspeed::SchedulerConfig& c, std::int32_t v) { c.device_allocator.total_pages = v; })
@@ -438,11 +447,24 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         return result;
     };
 
+    nb::enum_<tokenspeed::FlatTerminalReason>(m, "FlatTerminalReason")
+        .value("PromptExceedsPoolCapacity", tokenspeed::FlatTerminalReason::kPromptExceedsPoolCapacity)
+        .value("DecodeExceedsPoolCapacity", tokenspeed::FlatTerminalReason::kDecodeExceedsPoolCapacity);
+
+    nb::class_<tokenspeed::FlatTerminalError>(m, "FlatTerminalError")
+        .def_ro("request_id", &tokenspeed::FlatTerminalError::request_id)
+        .def_ro("reason", &tokenspeed::FlatTerminalError::reason)
+        .def_ro("required_pages", &tokenspeed::FlatTerminalError::required_pages)
+        .def_ro("capacity_pages", &tokenspeed::FlatTerminalError::capacity_pages)
+        .def_ro("message", &tokenspeed::FlatTerminalError::message);
+
     nb::class_<tokenspeed::ExecutionPlan>(m, "ExecutionPlan")
         .def(nb::init<>())
         .def_prop_ro("forward", collect_forward)
         .def_prop_ro("cache", collect_cache)
-        .def_ro("flat_oom_request_ids", &tokenspeed::ExecutionPlan::flat_oom_request_ids);
+        .def_ro("flat_oom_request_ids", &tokenspeed::ExecutionPlan::flat_oom_request_ids)
+        .def_ro("flat_page_ids_to_zero", &tokenspeed::ExecutionPlan::flat_page_ids_to_zero)
+        .def_ro("flat_terminal_errors", &tokenspeed::ExecutionPlan::flat_terminal_errors);
 
     nb::class_<tokenspeed::Scheduler>(m, "Scheduler")
         .def(nb::init<tokenspeed::SchedulerConfig>(), nb::arg("config") = tokenspeed::SchedulerConfig{})
@@ -464,6 +486,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("waiting_size", &tokenspeed::Scheduler::WaitingSize)
         .def("decoding_size", &tokenspeed::Scheduler::DecodingSize)
         .def("prefilling_size", &tokenspeed::Scheduler::PrefillSize)
+        .def("flat_pd_transfer_pinned", &tokenspeed::Scheduler::FlatPdTransferPinned, nb::arg("request_id"))
         .def("retract_count", &tokenspeed::Scheduler::RetractedSize)
         .def("available_kv_pages", &tokenspeed::Scheduler::AvailableKvPages)
         .def("active_kv_pages", &tokenspeed::Scheduler::ActiveKvPages)

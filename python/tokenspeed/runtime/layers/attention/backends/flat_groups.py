@@ -36,7 +36,6 @@ the null page 0 by the scheduler export.
 
 from __future__ import annotations
 
-import os
 from dataclasses import replace
 
 import torch
@@ -45,6 +44,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     flat_tables_unpack,
 )
 
+from tokenspeed.runtime.configs.flat_cache_runtime import flat_cache_debug_enabled
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.common import ceil_div
 
@@ -306,7 +306,7 @@ class FlatCacheGroupsMixin:
         dummy rows would trip the non-hole assert (see the padding contract
         in _flat_replay_fill).
         """
-        if os.environ.get("TOKENSPEED_FLAT_DEBUG") != "1":
+        if not flat_cache_debug_enabled():
             return
         for gid, locs in out_cache_locs.items():
             pages = (locs // self._group_page_size(gid)).to(torch.int32)

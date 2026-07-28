@@ -536,16 +536,16 @@ def test_sigmoid_bias_topk_route_gluon_matches_reference():
     torch.testing.assert_close(topk_weights, expected_weights, atol=5e-3, rtol=5e-3)
 
 
-def test_sigmoid_bias_topk_route_gluon_matches_bf16_kimi_shape():
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8])
+def test_sigmoid_bias_topk_route_gluon_matches_kimi_k3_shape(num_tokens: int):
     device = "cuda"
-    num_tokens = 8
-    num_experts = 384
-    topk = 8
+    num_experts = 896
+    topk = 16
     generator = torch.Generator(device=device).manual_seed(990611)
     router = torch.randn(
         (num_tokens, num_experts),
         device=device,
-        dtype=torch.bfloat16,
+        dtype=torch.float32,
         generator=generator,
     )
     correction_bias = (
@@ -576,6 +576,46 @@ def test_sigmoid_bias_topk_route_gluon_matches_bf16_kimi_shape():
 
     torch.testing.assert_close(topk_ids, expected_ids)
     torch.testing.assert_close(topk_weights, expected_weights, atol=5e-3, rtol=5e-3)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 8])
+def test_sigmoid_bias_topk_route_gluon_kimi_k3_is_cuda_graph_capturable(
+    num_tokens: int,
+):
+    generator = torch.Generator(device="cuda").manual_seed(20260720 + num_tokens)
+    router = torch.randn(
+        (num_tokens, 896),
+        device="cuda",
+        dtype=torch.float32,
+        generator=generator,
+    )
+    correction_bias = torch.randn(
+        (896,), device="cuda", dtype=torch.float32, generator=generator
+    )
+
+    eager_ids, eager_weights = invoke_sigmoid_bias_topk_route_gluon(
+        router,
+        correction_bias,
+        16,
+        routed_scaling_factor=1.0,
+        normalize_topk_weights=True,
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_ids, graph_weights = invoke_sigmoid_bias_topk_route_gluon(
+            router,
+            correction_bias,
+            16,
+            routed_scaling_factor=1.0,
+            normalize_topk_weights=True,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(graph_ids, eager_ids, rtol=0, atol=0)
+    torch.testing.assert_close(graph_weights, eager_weights, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("num_tokens", [1, 2, 4, 8])

@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 import tokenspeed_kernel.contracts.ops.attention  # noqa: F401
 
@@ -31,11 +32,21 @@ import tokenspeed_kernel.ops.attention.flash_attn  # noqa: F401
 import tokenspeed_kernel.ops.attention.flash_mla  # noqa: F401
 import tokenspeed_kernel.ops.attention.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.attention.gluon  # noqa: F401
+import tokenspeed_kernel.ops.attention.msa  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton  # noqa: F401
 import torch
 from tokenspeed_kernel.ops.attention.gdn_utils import (
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
+)
+from tokenspeed_kernel.ops.attention.kda_utils import KdaPrefillResult
+from tokenspeed_kernel.ops.attention.triton.kda import (
+    kda_recurrent,
+    kda_recurrent_decode,
+    kda_state_scatter,
+)
+from tokenspeed_kernel.ops.attention.triton.kda_chunk import (
+    kda_chunk_prefill,
 )
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
@@ -112,6 +123,15 @@ __all__ = [
     "gdn_chunk_prefill",
     "gdn_decode_step",
     "gdn_decode_mtp",
+    "kda_recurrent",
+    "kda_recurrent_decode",
+    "kda_chunk_prefill",
+    "kda_state_scatter",
+    "kda_paged_prefill",
+    "kda_paged_decode",
+    "try_kda_fused_paged_decode",
+    "try_kda_fused_paged_verify",
+    "KdaPrefillResult",
     "GdnCheckpointLayout",
     "GdnChunkPrefillResult",
     "mla_prefill",
@@ -151,6 +171,8 @@ def msa_decode_with_kvcache(
     max_seqlen_k: int,
     k_scale: float | torch.Tensor | None = None,
     v_scale: float | torch.Tensor | None = None,
+    score_out: torch.Tensor | None = None,
+    enable_pdl: bool = False,
     override: str | None = None,
     solution: str | None = None,
 ) -> torch.Tensor:
@@ -181,6 +203,12 @@ def msa_decode_with_kvcache(
             divided by this scale before quantization. None means 1.0.
         v_scale: Optional scalar descale for an FP8 ``v_cache``, with the
             same convention as ``k_scale``.
+        score_out: Optional caller-owned index-score buffer, pre-filled with
+            ``-inf`` and reused across layers; forwarded to the kernel to avoid
+            a per-layer allocation + fill. Ignored by kernels that do not
+            accept it or when its shape does not match.
+        enable_pdl: Request Programmatic Dependent Launch (SM90+) for the
+            indexer's index-key store; forwarded to the kernel.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -261,6 +289,8 @@ def msa_decode_with_kvcache(
             max_seqlen_k=max_seqlen_k,
             k_scale=k_scale,
             v_scale=v_scale,
+            score_out=score_out,
+            enable_pdl=enable_pdl,
         )
 
 
@@ -285,8 +315,10 @@ def msa_extend_with_kvcache(
     attention_scale: float,
     init_blocks: int,
     local_blocks: int,
+    seq_lens_cpu: Sequence[int],
     k_scale: float | torch.Tensor | None = None,
     v_scale: float | torch.Tensor | None = None,
+    query_lens_cpu: Sequence[int] | None = None,
     override: str | None = None,
     solution: str | None = None,
 ) -> torch.Tensor:
@@ -320,6 +352,10 @@ def msa_extend_with_kvcache(
             divided by this scale before quantization. None means 1.0.
         v_scale: Optional scalar descale for an FP8 ``v_cache``, with the
             same convention as ``k_scale``.
+        query_lens_cpu: Optional host-side per-request new-token counts;
+            with ``seq_lens_cpu`` this lets the indexer plan its fmha
+            OnlyScore path without a device sync.
+        seq_lens_cpu: Host-side per-request total sequence lengths.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -402,6 +438,8 @@ def msa_extend_with_kvcache(
             local_blocks=local_blocks,
             k_scale=k_scale,
             v_scale=v_scale,
+            query_lens_cpu=query_lens_cpu,
+            seq_lens_cpu=seq_lens_cpu,
         )
 
 
@@ -713,6 +751,274 @@ def gdn_decode_mtp(
             intermediate_states_buffer=intermediate_states_buffer,
             output_state_indices=output_state_indices,
         )
+
+
+def kda_paged_prefill(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g_raw: torch.Tensor,
+    beta_logits: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    lower_bound: float | None = -5.0,
+    override: str | None = None,
+    solution: str | None = None,
+) -> KdaPrefillResult:
+    """Run packed KDA prefill through capability-based kernel selection.
+
+    Args:
+        q/k/g_raw: Packed tensors ``[1, total_tokens, heads, key_dim]``.
+        v: Values ``[1, total_tokens, heads, value_dim]``.
+        beta_logits: Raw beta logits ``[1, total_tokens, heads]``.
+        A_log/dt_bias: FP32 gate parameters.
+        initial_state: One backend-owned recurrent state per sequence.
+        cu_seqlens: Device sequence boundaries ``[num_sequences + 1]``.
+        lower_bound: Optional safe lower bound for log decay.
+        override: Optional exact kernel name.
+        solution: Optional registered solution name.
+
+    Returns:
+        Packed output and final state.
+
+    The state's internal ``[K,V]`` versus ``[V,K]`` interpretation remains
+    private to the selected implementation.
+    """
+    if q.ndim != 4 or q.shape[0] != 1:
+        raise ValueError("KDA q must be [1, total_tokens, heads, key_dim]")
+    if k.shape != q.shape or g_raw.shape != q.shape:
+        raise ValueError("KDA q, k, and g_raw must have identical shapes")
+    if v.ndim != 4 or v.shape[:3] != q.shape[:3]:
+        raise ValueError("KDA v must match q through the head dimension")
+    if beta_logits.shape != q.shape[:-1]:
+        raise ValueError("KDA beta logits must be [1, total_tokens, heads]")
+    num_sequences = cu_seqlens.numel() - 1
+    if initial_state.ndim != 4 or initial_state.shape[0] != num_sequences:
+        raise ValueError("KDA initial_state must contain one row per sequence")
+    # AMD historically ignores the NVIDIA prefill policy labels and uses its
+    # registered Triton implementation.
+    if current_platform().is_amd and solution in {"fla", "flashkda", "cutedsl_kda"}:
+        solution = "triton"
+    kernel = select_kernel(
+        "attention",
+        "kda_paged_prefill",
+        _attention_format_signature(q=q, k=k, v=v),
+        solution=solution,
+        override=override,
+    )
+    return kernel(
+        q=q,
+        k=k,
+        v=v,
+        g_raw=g_raw,
+        beta_logits=beta_logits,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        initial_state=initial_state,
+        cu_seqlens=cu_seqlens,
+        lower_bound=lower_bound,
+    )
+
+
+def kda_paged_decode(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g_raw: torch.Tensor,
+    beta_logits: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    state_pool: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    lower_bound: float | None = -5.0,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """Run post-convolution KDA decode against an indexed state pool.
+
+    Args:
+        q/k/g_raw: Packed tensors ``[1, batch, heads, key_dim]``.
+        v: Packed values ``[1, batch, heads, value_dim]``.
+        beta_logits: Raw beta logits ``[1, batch, heads]``.
+        A_log/dt_bias: FP32 gate parameters.
+        state_pool: Backend-owned recurrent-state pool.
+        read_indices/write_indices: Independent source/destination rows.
+        cu_seqlens: Device boundaries ``[batch + 1]``.
+        lower_bound: Optional safe lower bound for log decay.
+        override: Optional exact kernel name.
+        solution: Optional registered solution name.
+
+    Returns:
+        KDA output with the same shape as ``v``.
+    """
+    if q.ndim != 4 or q.shape[0] != 1:
+        raise ValueError("KDA decode q must be [1, batch, heads, key_dim]")
+    if k.shape != q.shape or g_raw.shape != q.shape:
+        raise ValueError("KDA decode q, k, and g_raw must have identical shapes")
+    if v.ndim != 4 or v.shape[:3] != q.shape[:3]:
+        raise ValueError("KDA decode v must match q through the head dimension")
+    if beta_logits.shape != q.shape[:-1]:
+        raise ValueError("KDA beta logits must be [1, total_tokens, heads]")
+    num_sequences = read_indices.numel()
+    if read_indices.ndim != 1 or write_indices.shape != (num_sequences,):
+        raise ValueError("KDA decode requires one read/write index per sequence")
+    if cu_seqlens.numel() != num_sequences + 1:
+        raise ValueError("KDA decode cu_seqlens must contain one boundary per sequence")
+
+    kernel = select_kernel(
+        "attention",
+        "kda_paged_decode",
+        _attention_format_signature(q=q, k=k, v=v),
+        traits={"indexed_state": True},
+        solution=solution,
+        override=override,
+    )
+    return kernel(
+        q=q,
+        k=k,
+        v=v,
+        g_raw=g_raw,
+        beta_logits=beta_logits,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        state_pool=state_pool,
+        read_indices=read_indices,
+        write_indices=write_indices,
+        cu_seqlens=cu_seqlens,
+        lower_bound=lower_bound,
+    )
+
+
+def try_kda_fused_paged_decode(
+    mixed_qkv: torch.Tensor,
+    conv_weights: torch.Tensor,
+    conv_states: torch.Tensor,
+    f_a_out: torch.Tensor,
+    f_b_weight: torch.Tensor,
+    beta_logits: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    state_pool: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    cu_seqlens: torch.Tensor,
+    lower_bound: float | None = -5.0,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor | None:
+    """Try a registered pre-convolution KDA decode fusion.
+
+    Returns ``None`` only when no implementation supports the current
+    platform. Invalid inputs and execution failures remain visible.
+    """
+    signature = _attention_format_signature(
+        q=mixed_qkv,
+        k=mixed_qkv,
+        v=mixed_qkv,
+    )
+    try:
+        kernel = select_kernel(
+            "attention",
+            "kda_fused_paged_decode",
+            signature,
+            traits={"flat_state": True},
+            solution=solution,
+            override=override,
+        )
+    except NoKernelFoundError:
+        return None
+    return kernel(
+        mixed_qkv=mixed_qkv,
+        conv_weights=conv_weights,
+        conv_states=conv_states,
+        f_a_out=f_a_out,
+        f_b_weight=f_b_weight,
+        beta_logits=beta_logits,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        state_pool=state_pool,
+        read_indices=read_indices,
+        write_indices=write_indices,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        cu_seqlens=cu_seqlens,
+        lower_bound=lower_bound,
+    )
+
+
+def try_kda_fused_paged_verify(
+    mixed_qkv: torch.Tensor,
+    conv_weights: torch.Tensor,
+    conv_states: torch.Tensor,
+    conv_scratch: torch.Tensor,
+    f_a_out: torch.Tensor,
+    f_b_weight: torch.Tensor,
+    beta_logits: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    state_pool: torch.Tensor,
+    state_scratch: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    draft_token_num: int,
+    lower_bound: float | None = -5.0,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor | None:
+    """Try a registered pre-convolution KDA target-verify fusion.
+
+    Mirrors ``try_kda_fused_paged_decode`` for the speculative verify batch:
+    per-position conv windows and recurrent states land in the verify
+    scratches for partial-accept commit. Returns ``None`` only when no
+    implementation supports the current platform.
+    """
+    signature = _attention_format_signature(
+        q=mixed_qkv,
+        k=mixed_qkv,
+        v=mixed_qkv,
+    )
+    try:
+        kernel = select_kernel(
+            "attention",
+            "kda_fused_paged_verify",
+            signature,
+            traits={"flat_state": True},
+            solution=solution,
+            override=override,
+        )
+    except NoKernelFoundError:
+        return None
+    return kernel(
+        mixed_qkv=mixed_qkv,
+        conv_weights=conv_weights,
+        conv_states=conv_states,
+        conv_scratch=conv_scratch,
+        f_a_out=f_a_out,
+        f_b_weight=f_b_weight,
+        beta_logits=beta_logits,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        state_pool=state_pool,
+        state_scratch=state_scratch,
+        read_indices=read_indices,
+        write_indices=write_indices,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        draft_token_num=draft_token_num,
+        lower_bound=lower_bound,
+    )
 
 
 # ===-----------------------------------------------------------------------===#
@@ -1612,6 +1918,7 @@ def mla_decode_with_kvcache(
         v_head_dim.
     """
     traits = {
+        "batch_size": q.shape[0],
         "page_size": kv_cache.shape[1],
         "q_len": q.shape[1],
         "num_q_heads": q.shape[2],
@@ -1623,14 +1930,28 @@ def mla_decode_with_kvcache(
         "return_lse": return_lse,
     }
     signature = _attention_format_signature(q=q, kv_cache=kv_cache)
-    kernel = select_kernel(
-        "attention",
-        "mla_decode_with_kvcache",
-        signature,
-        traits=traits,
-        solution=solution,
-        override=override,
-    )
+    try:
+        kernel = select_kernel(
+            "attention",
+            "mla_decode_with_kvcache",
+            signature,
+            traits=traits,
+            solution=solution,
+            override=override,
+        )
+    except NoKernelFoundError:
+        if q.dtype == kv_cache.dtype:
+            raise
+        q = q.to(kv_cache.dtype)
+        signature = _attention_format_signature(q=q, kv_cache=kv_cache)
+        kernel = select_kernel(
+            "attention",
+            "mla_decode_with_kvcache",
+            signature,
+            traits=traits,
+            solution=solution,
+            override=override,
+        )
 
     shape_params = {
         "batch_size": q.shape[0],
@@ -1919,10 +2240,16 @@ def dsa_prefill_topk(
         index_k_fp8: FP8 index-K rows in workspace-row order. Used by DeepGEMM.
         index_k_scale: FP8 index-K scales in workspace-row order. Used by DeepGEMM.
         max_logits_bytes: Optional temporary logits memory cap.
-        out: Optional int32 output buffer with shape [tokens, topk].
-        lens_out: Optional int32 output buffer with shape [tokens].
+        out: Optional contiguous int32 output buffer on q's device with shape
+            [tokens, topk].
+        lens_out: Optional contiguous int32 output buffer on q's device with
+            shape [tokens].
         override: Optional exact kernel override name.
         solution: Optional kernel solution to force through normal selection.
+
+    Gluon requires q, weights, index_k_cache, kv_workspace_slots, row_starts,
+    and row_ends to be contiguous on q's device. kv_workspace_slots must be
+    int64; row_starts and row_ends must be int32.
 
     Returns:
         Tuple of workspace row ids and valid counts. Returned indices are
@@ -1939,6 +2266,7 @@ def dsa_prefill_topk(
     traits = {
         "head_dim": q.shape[-1],
         "topk": int(topk),
+        "page_size": None if page_size is None else int(page_size),
     }
     has_fp8 = index_k_cache is not None or (
         index_k_fp8 is not None and index_k_scale is not None
@@ -2026,10 +2354,15 @@ def dsa_decode_topk(
         index_k_cache: Packed FP8 index-K cache with scales (uint8). Used by
             both Triton and DeepGEMM.
         plan: Optional opaque backend-specific plan.
-        out: Optional int32 output buffer with shape [tokens, topk].
-        lens_out: Optional int32 output buffer with shape [tokens].
+        out: Optional contiguous int32 output buffer on q's device with shape
+            [tokens, topk].
+        lens_out: Optional contiguous int32 output buffer on q's device with
+            shape [tokens].
         override: Optional exact kernel override name.
         solution: Optional kernel solution to force through normal selection.
+
+    Gluon requires q, weights, index_k_cache, seq_lens, and block_table to be
+    contiguous on q's device. seq_lens and block_table must be int32.
 
     Returns:
         Tuple of global KV slots and valid counts; invalid entries are -1.

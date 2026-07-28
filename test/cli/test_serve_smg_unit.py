@@ -45,6 +45,8 @@ from tokenspeed.cli.serve_smg import (
     INKLING_ATTENTION_BACKEND,
     INKLING_REASONING_PARSER,
     INKLING_TOOL_CALL_PARSER,
+    KIMI_K3_REASONING_PARSER,
+    KIMI_K3_TOOL_CALL_PARSER,
     _args_with_default_model_parsers,
     _gateway_args_with_default_log_level,
     _gateway_args_with_default_policy,
@@ -55,6 +57,7 @@ from tokenspeed.cli.serve_smg import (
     _gateway_args_with_smg_disable_defaults,
     _is_deepseek_v4_model,
     _is_inkling_model,
+    _is_kimi_k3_model,
     _prewarm_hf_tokenizer,
     _set_default_grpc_max_message_bytes,
     _user_host_port_from_gateway_args,
@@ -366,6 +369,67 @@ def test_local_deepseek_v4_config_is_detected(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "deepseek_v4"}))
 
     assert _is_deepseek_v4_model(str(tmp_path))
+
+
+def _make_kimi_k3_model_dir(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "kimi_k3",
+                "architectures": ["KimiK3ForConditionalGeneration"],
+            }
+        )
+    )
+    return str(tmp_path)
+
+
+def test_kimi_k3_model_is_detected_from_id_or_local_config(tmp_path):
+    assert _is_kimi_k3_model("moonshotai/Kimi-K3")
+    assert _is_kimi_k3_model(_make_kimi_k3_model_dir(tmp_path))
+    assert not _is_kimi_k3_model("deepseek-ai/DeepSeek-V4-Flash")
+    assert not _is_kimi_k3_model(None)
+
+
+def test_kimi_k3_model_gets_default_parsers(tmp_path):
+    model = _make_kimi_k3_model_dir(tmp_path)
+
+    engine_args, gateway_args = _args_with_default_model_parsers(
+        ["--model", model],
+        ["--model", model],
+    )
+
+    assert engine_args == [
+        "--model",
+        model,
+        "--reasoning-parser",
+        KIMI_K3_REASONING_PARSER,
+    ]
+    assert gateway_args == [
+        "--model",
+        model,
+        "--reasoning-parser",
+        KIMI_K3_REASONING_PARSER,
+        "--tool-call-parser",
+        KIMI_K3_TOOL_CALL_PARSER,
+    ]
+
+
+def test_kimi_k3_parser_defaults_preserve_explicit_values(tmp_path):
+    model = _make_kimi_k3_model_dir(tmp_path)
+    engine_args = ["--model", model, "--reasoning-parser", "custom_reasoning"]
+    gateway_args = [
+        "--model",
+        model,
+        "--reasoning-parser",
+        "custom_reasoning",
+        "--tool-call-parser",
+        "custom_tools",
+    ]
+
+    assert _args_with_default_model_parsers(engine_args, gateway_args) == (
+        engine_args,
+        gateway_args,
+    )
 
 
 def _make_inkling_model_dir(tmp_path):

@@ -33,6 +33,10 @@ class MambaStateManager : public SwaManager {
 public:
     explicit MambaStateManager(std::int32_t block_size) : SwaManager(block_size, /*sliding_window=*/2) {}
 
+    DecodeDestinationLayout DecodeDestinationLayoutPolicy() const override {
+        return DecodeDestinationLayout::kFinalStateSnapshot;
+    }
+
     bool RegistersAlignedFinalPageOnly() const override { return true; }
 };
 

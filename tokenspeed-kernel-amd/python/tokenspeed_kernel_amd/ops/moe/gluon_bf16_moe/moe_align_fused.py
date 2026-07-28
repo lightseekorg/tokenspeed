@@ -25,10 +25,11 @@ atomics). One kernel:
 
   * in-kernel sentinel/zero init of the output + ``gl.barrier`` (folds away the
     separate init-kernel launch),
-  * ``gl.histogram`` -> per-expert counts (masked; EP = num_experts, no dump bin),
-  * **single-block collapse**: at M <= block_m each of the M tokens routes to
-    distinct experts so count[e] <= M <= block_m -> every hit expert is exactly
-    one block. So blocks_pe = (count>0), row_off = block_off*block_m, and
+  * EP localization from global expert IDs plus ``gl.histogram`` -> per-expert
+    counts (remote routes are masked; EP = num_experts, no dump bin),
+  * **single-block collapse**: top-k contains each expert at most once per
+    token, so at M <= block_m, count[e] <= M <= block_m and every hit expert is
+    exactly one block. So blocks_pe = (count>0), row_off = block_off*block_m, and
     ``sorted_expert_ids`` is a cheap O(E) scatter (no [NB, E] tile),
   * a [G, G] compare-tile stable rank (no atomics),
   * ``gl.gather`` of the per-expert block offset + scatter each slot to
@@ -69,6 +70,7 @@ def _fused_align_kernel(
     TOPK: gl.constexpr,
     GP: gl.constexpr,  # next_pow2(G)  (>= NB_MAX == G)
     EP: gl.constexpr,  # next_pow2(num_experts)
+    EXPERT_START: gl.constexpr,
     NB_MAX: gl.constexpr,  # == G (max blocks) == sei length
     EM_MAX: gl.constexpr,  # == NB_MAX * block_m
     INIT_TILE: gl.constexpr,
@@ -92,14 +94,17 @@ def _fused_align_kernel(
 
     g = gl.arange(0, GP, layout=LG)
     gmask = g < G
-    idx = gl.load(ids_ptr + g, mask=gmask, other=0)
-    vals = gl.load(wts_ptr + g, mask=gmask, other=0.0)
+    global_idx = gl.load(ids_ptr + g, mask=gmask, other=EXPERT_START)
+    idx = global_idx - EXPERT_START
+    route_mask = gmask & (idx >= 0) & (idx < num_experts)
+    safe_idx = gl.where(route_mask, idx, 0)
+    vals = gl.load(wts_ptr + g, mask=route_mask, other=0.0)
     tok = g // TOPK
     slot = g % TOPK
     packed = ((slot << 24) | tok).to(gl.int32)
 
     # ---- per-expert counts (masked histogram -> masked lanes excluded) ----
-    counts = gl.histogram(idx, EP, mask=gmask, layout=LE)
+    counts = gl.histogram(safe_idx, EP, mask=route_mask, layout=LE)
     e = gl.arange(0, EP, layout=LE)
     valid_e = e < num_experts
     # single-block collapse: 1 block per hit expert (count<=M<=block_m)
@@ -113,17 +118,33 @@ def _fused_align_kernel(
     gl.store(sei_ptr + block_off, e.to(gl.int32), mask=hit)
 
     # ---- stable per-expert rank via [G, G] compare tile ----
-    idx_row = gl.expand_dims(gl.convert_layout(idx, gl.SliceLayout(1, LT)), 1)
-    idx_col = gl.expand_dims(gl.convert_layout(idx, gl.SliceLayout(0, LT)), 0)
+    idx_row = gl.expand_dims(
+        gl.convert_layout(safe_idx, gl.SliceLayout(1, LT)),
+        1,
+    )
+    idx_col = gl.expand_dims(
+        gl.convert_layout(safe_idx, gl.SliceLayout(0, LT)),
+        0,
+    )
+    valid_row = gl.expand_dims(
+        gl.convert_layout(route_mask, gl.SliceLayout(1, LT)),
+        1,
+    )
+    valid_col = gl.expand_dims(
+        gl.convert_layout(route_mask, gl.SliceLayout(0, LT)),
+        0,
+    )
     g_row = gl.expand_dims(gl.arange(0, GP, layout=gl.SliceLayout(1, LT)), 1)
     g_col = gl.expand_dims(gl.arange(0, GP, layout=gl.SliceLayout(0, LT)), 0)
-    match = ((idx_row == idx_col) & (g_col < g_row)).to(gl.int32)
+    match = ((idx_row == idx_col) & (g_col < g_row) & valid_row & valid_col).to(
+        gl.int32
+    )
     rank = gl.convert_layout(gl.sum(match, axis=1), LG)  # [GP]
 
     # ---- dest = block_off[expert]*block_m + rank, then scatter ----
-    dest = gl.gather(block_off, idx, axis=0) * block_m + rank
-    gl.store(sti_ptr + dest, packed, mask=gmask)
-    gl.store(sw_ptr + dest, vals, mask=gmask)
+    dest = gl.gather(block_off, safe_idx, axis=0) * block_m + rank
+    gl.store(sti_ptr + dest, packed, mask=route_mask)
+    gl.store(sw_ptr + dest, vals, mask=route_mask)
 
 
 def moe_align_block_size_fused(
@@ -131,10 +152,19 @@ def moe_align_block_size_fused(
     topk_weights: torch.Tensor,  # [M, topk] float
     num_experts: int,
     block_m: int,
+    *,
+    expert_start: int = 0,
 ):
     """Single-kernel sync-free decode block-align (pure Gluon). Same return
-    contract as ``moe_align_block_size``."""
+    contract as ``moe_align_block_size``.
+
+    ``topk_ids`` may use global expert IDs. ``expert_start`` identifies the
+    first expert owned by this rank; routes outside the contiguous local range
+    are ignored without a separate localization kernel.
+    """
     assert topk_ids.shape == topk_weights.shape
+    if expert_start < 0:
+        raise ValueError("expert_start must be non-negative")
     device = topk_ids.device
     M, topk = topk_ids.shape
     G = M * topk
@@ -167,6 +197,7 @@ def moe_align_block_size_fused(
         TOPK=topk,
         GP=GP,
         EP=EP,
+        EXPERT_START=expert_start,
         NB_MAX=NB_MAX,
         EM_MAX=EM_MAX,
         INIT_TILE=_next_pow2(min(1024, EM_MAX)),

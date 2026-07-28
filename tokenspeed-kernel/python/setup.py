@@ -208,9 +208,19 @@ def _read_requirements(path: Path, seen=None) -> list[str]:
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
+        include = None
         if line.startswith("-r ") or line.startswith("--requirement "):
             include = line.split(maxsplit=1)[1]
+        elif line.startswith("-r") and len(line) > 2:
+            include = line[2:].strip()
+        elif line.startswith("--requirement="):
+            include = line.split("=", maxsplit=1)[1].strip()
+        if include:
             requirements.extend(_read_requirements(path.parent / include, seen))
+            continue
+        if line.startswith("-"):
+            # Installer options such as --extra-index-url are not valid
+            # project dependency metadata.
             continue
         requirements.append(line)
     return requirements
@@ -218,7 +228,7 @@ def _read_requirements(path: Path, seen=None) -> list[str]:
 
 def _selected_install_requires() -> list[str]:
     backend = _selected_backend()
-    requirements = []
+    requirements = _read_requirements(REQUIREMENTS_DIR / f"{backend}.txt")
     requirements.extend(
         _read_requirements(REQUIREMENTS_DIR / f"{backend}-thirdparty.txt")
     )
@@ -307,20 +317,18 @@ KERNEL_GROUPS = [
         [],
     ),
     (
+        "minimax_m3_fused",
+        [
+            CUDA_CSRC_DIR / "fused_minimax_m3_qknorm_rope_kv_insert.cu",
+        ],
+        [],
+    ),
+    (
         "dsv3_gemm",
         [
             CUDA_CSRC_DIR / "dsv3_router_gemm_float_out.cu",
             CUDA_CSRC_DIR / "dsv3_router_gemm.cu",
             CUDA_CSRC_DIR / "dsv3_router_gemm_binding.cu",
-        ],
-        ["-lcublas", "-lcublasLt"],
-    ),
-    (
-        "fp32_router_gemm",
-        [
-            CUDA_CSRC_DIR / "fp32_router_gemm.cu",
-            CUDA_CSRC_DIR / "fp32_router_gemm_entry.cu",
-            CUDA_CSRC_DIR / "fp32_router_gemm_binding.cu",
         ],
         ["-lcublas", "-lcublasLt"],
     ),
@@ -425,6 +433,14 @@ KERNEL_GROUPS = [
             CUDA_CSRC_DIR / "trtllm_reducescatter_fusion.cu",
             CUDA_CSRC_DIR / "trtllm_allgather_fusion.cu",
             CUDA_CSRC_DIR / "minimax_reduce_rms.cu",
+        ],
+        [],
+    ),
+    (
+        "attn_res",
+        [
+            CUDA_CSRC_DIR / "attn_res" / "attn_res_fwd_tma.cu",
+            CUDA_CSRC_DIR / "attn_res_binding.cu",
         ],
         [],
     ),
@@ -881,6 +897,21 @@ setup(
     packages=find_packages(),
     package_data={
         "tokenspeed_kernel.thirdparty.cuda": ["objs/**/*.so"],
+        # Vendored MiniMax MSA CuTe sources: cute/ has no __init__.py (it is
+        # loaded via the upstream sys.path bootstrap), so ship it as data.
+        "tokenspeed_kernel.thirdparty.msa": [
+            "README.md",
+            "cute/**/*.py",
+            "cute/**/*.cu",
+            "cute/README.md",
+            "cute/requirements.txt",
+            # nvcc-JIT FMHA sources: compiled at runtime by jit.py, so the
+            # kernel sources and headers must ship with the wheel.
+            "csrc/*.cu",
+            "csrc/*.h",
+            "csrc/*.jinja",
+            "csrc/include/*",
+        ],
     },
     cmdclass={
         "build_native": BuildNative,
