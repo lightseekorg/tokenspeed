@@ -533,14 +533,28 @@ def kimi3_shared_situ_projection(
         and gate_up_width == KIMI3_SHARED_GATE_UP_LOCAL_SIZE
     )
     if solution == "auto":
-        solution = "triton_gemv" if Platform.get().is_cdna4 and specialized else "torch"
+        platform = Platform.get()
+        if specialized and (platform.is_cdna4 or platform.is_nvidia):
+            solution = "triton_gemv"
+        else:
+            solution = "torch"
     if solution == "triton_gemv":
         if not specialized:
             raise ValueError(
-                "Kimi K3 shared SiTU Triton GEMV requires contiguous gfx950 "
+                "Kimi K3 shared SiTU Triton GEMV requires contiguous "
                 "BF16 [1, 7168] input and [1536, 7168] weight"
             )
-        block_n, block_k, num_warps = 4, 1024, 4
+        if Platform.get().is_cdna4:
+            block_n, block_k, num_warps = 4, 1024, 4
+            extra = {"waves_per_eu": 1}
+        else:
+            # NVIDIA decode: one output row per CTA, K tile a power of two
+            # that divides 7168 (tl.arange demands the power of two; an
+            # undivided tile would read past K on the unmasked fast path).
+            # Measured best on B300: 8.0us vs 9.2 for the mm+situ pair, and
+            # light enough to co-reside on the aux fork it runs on.
+            block_n, block_k, num_warps = 1, 1024, 4
+            extra = {}
         _kimi3_shared_situ_projection_gemv_kernel[
             (triton.cdiv(KIMI3_SHARED_LOCAL_SIZE, block_n),)
         ](
@@ -556,7 +570,7 @@ def kimi3_shared_situ_projection(
             HAS_LINEAR_BETA=linear_beta is not None,
             num_warps=num_warps,
             num_stages=1,
-            waves_per_eu=1,
+            **extra,
         )
         return out
 
