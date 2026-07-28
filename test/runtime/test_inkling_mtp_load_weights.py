@@ -1,7 +1,8 @@
 """Inkling NextN (MTP draft) ``load_weights`` unit test.
 
 Builds an in-memory ``model.mtp.*`` checkpoint using the REAL checkpoint
-tensor names for a tiny config with ``mtp_config`` set, then asserts every
+tensor names for the released config (layer-truncated; see
+``inkling_fixtures``) with the test's own MTP layout, then asserts every
 draft parameter is covered (embedding/lm_head excepted — those are shared
 from the target via ``set_embed_and_head``) and that the block transforms
 land like the base loader: qkvr fusion order, KV replication to the uniform
@@ -11,8 +12,8 @@ remaps. Also asserts the depth blocks come out full-attention + dense-MLP
 (4d71c3ea+), that SWA depths build local attention at the swa head count and
 that depths pruned by ``--speculative-num-steps`` are skipped by the loader.
 
-NOTE: intentionally not registered in CI; run locally after loader changes.
-Needs any CUDA GPU (weight copies only, no kernels).
+Needs any CUDA GPU (weight copies only, no kernels); CI runs it on the
+Blackwell runners alongside the other Inkling suites.
 """
 
 import os
@@ -22,34 +23,34 @@ import unittest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from runtime.models.inkling_fixtures import TINY_MM_CONFIG  # noqa: E402
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+from runtime.models.inkling_fixtures import load_inkling_config  # noqa: E402
+
+register_cuda_ci(
+    est_time=60,
+    suite="runtime-1gpu",
+    disabled_on_runners=["amd-*", "h100-*"],
+)
 
 SEED = 4321
 NUM_DEPTHS = 2
 
 
-def _tiny_nextn_config(num_depths=NUM_DEPTHS, mtp_local_layer_ids=()):
-    from tokenspeed.runtime.configs.inkling_config import InklingMMConfig
-
-    cfg_dict = {
-        **TINY_MM_CONFIG,
-        "architectures": ["InklingForConditionalGenerationNextN"],
-        "mtp_config": {
-            "num_nextn_predict_layers": num_depths,
-            "chain_hidden_post_norm": True,
-            "local_layer_ids": list(mtp_local_layer_ids),
-        },
-    }
-    cfg_dict = {
-        k: v for k, v in cfg_dict.items() if k not in ("model_type", "architectures")
-    }
-    return InklingMMConfig(**cfg_dict)
+def _nextn_config(num_depths=NUM_DEPTHS, mtp_local_layer_ids=()):
+    """The released config with the test's own MTP head layout (the same
+    fields ``InklingMMConfig`` parses out of ``mtp_config``)."""
+    config = load_inkling_config()
+    text = config.get_text_config()
+    text.num_nextn_predict_layers = num_depths
+    text.chain_hidden_post_norm = True
+    text.mtp_local_layer_ids = list(mtp_local_layer_ids)
+    return config
 
 
 def _make_mtp_checkpoint(
     text, num_depths=NUM_DEPTHS, local_layer_ids=()
 ) -> dict[str, torch.Tensor]:
-    """One tensor per real-checkpoint ``model.mtp.*`` name (tiny dims).
+    """One tensor per real-checkpoint ``model.mtp.*`` name.
 
     SWA depths (``local_layer_ids``) ship the swa KV head count and a
     rel-logits extent of the sliding window, like the 4d71c3ea checkpoint.
@@ -133,7 +134,7 @@ class TestInklingMTPLoadWeights(unittest.TestCase):
         mapping = Mapping(rank=0, world_size=1)
         global_server_args_dict["mapping"] = mapping
         global_server_args_dict["enable_prefix_caching"] = False
-        cls.config = _tiny_nextn_config()
+        cls.config = _nextn_config()
         cls.text = cls.config.get_text_config()
         with torch.device("cuda"):
             torch.set_default_dtype(torch.bfloat16)
@@ -283,7 +284,7 @@ class TestInklingMTPLoadWeightsSWADepths(unittest.TestCase):
         cls.mapping = Mapping(rank=0, world_size=1)
         global_server_args_dict["mapping"] = cls.mapping
         global_server_args_dict["enable_prefix_caching"] = False
-        cls.config = _tiny_nextn_config(cls.NUM_DEPTHS, cls.LOCAL_IDS)
+        cls.config = _nextn_config(cls.NUM_DEPTHS, cls.LOCAL_IDS)
         cls.text = cls.config.get_text_config()
         with torch.device("cuda"):
             torch.set_default_dtype(torch.bfloat16)
@@ -348,7 +349,7 @@ class TestInklingMTPLoadWeightsSWADepths(unittest.TestCase):
         )
 
         # Simulate ModelConfig's draft-worker swap at --speculative-num-steps 2.
-        config = _tiny_nextn_config(self.NUM_DEPTHS, self.LOCAL_IDS)
+        config = _nextn_config(self.NUM_DEPTHS, self.LOCAL_IDS)
         config.text_config = inkling_mtp_text_config(
             config.get_text_config(), num_steps=2
         )
