@@ -18,6 +18,24 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+class TestInklingFlatContract(unittest.TestCase):
+    def test_wrapper_consumes_history_and_checkpoint_state(self):
+        from tokenspeed.runtime.layers.attention.backends.inkling import (
+            InklingAttnBackend,
+        )
+
+        class HistoryBackend:
+            flat_cache_consumer_families = frozenset({"history"})
+
+        backend = InklingAttnBackend.__new__(InklingAttnBackend)
+        backend.inner = HistoryBackend()
+
+        self.assertEqual(
+            backend.flat_cache_consumer_families,
+            frozenset({"history", "state"}),
+        )
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
 class TestInklingConvSpecState(unittest.TestCase):
     W = 4  # sconv kernel size (window W-1 = 3)

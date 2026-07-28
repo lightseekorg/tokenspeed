@@ -1131,11 +1131,7 @@ def create_attn_components(
     has_gdn_state = getattr(config, "conv_state_shape", None) is not None
     use_lcm_gdn = is_hybrid_gdn and has_gdn_state and flat_kvcache
     use_lcm_k3 = is_hybrid_mla_kda and flat_kvcache
-    # Keep the production Inkling path unchanged until boundary checkpoints
-    # cover prefill graphs and speculative decoding as well as eager/decode.
-    use_lcm_inkling = (
-        is_inkling and flat_kvcache and os.environ.get("INKLING_LCM", "0") == "1"
-    )
+    use_lcm_inkling = is_inkling and flat_kvcache
     inkling_bf16_checkpoints = (
         use_lcm_inkling and os.environ.get("INKLING_FP8_SCONV", "0") == "0"
     )

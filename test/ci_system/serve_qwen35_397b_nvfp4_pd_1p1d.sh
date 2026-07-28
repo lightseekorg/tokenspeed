@@ -123,9 +123,10 @@ COMMON_ARGS=(
   --quantization "$QUANTIZATION"
   --kv-cache-dtype "$KV_CACHE_DTYPE"
   --kvstore-ratio "$KVSTORE_RATIO"
+  --disable-kvstore
   --enable-cache-report
   --disaggregation-transfer-backend mooncake
-  --disaggregation-layerwise-interval 1
+  --disaggregation-layerwise-interval 0
   --skip-server-warmup
 )
 

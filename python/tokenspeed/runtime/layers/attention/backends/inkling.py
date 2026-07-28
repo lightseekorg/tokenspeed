@@ -255,6 +255,12 @@ class InklingAttnBackend(AttentionBackend):
     def uses_flat_cache_groups(self):
         return self.inner.uses_flat_cache_groups
 
+    @property
+    def flat_cache_consumer_families(self):
+        return frozenset(getattr(self.inner, "flat_cache_consumer_families", ())) | {
+            "state"
+        }
+
     # ------------------------------------------------------------------
     # Conv metadata
     # ------------------------------------------------------------------
