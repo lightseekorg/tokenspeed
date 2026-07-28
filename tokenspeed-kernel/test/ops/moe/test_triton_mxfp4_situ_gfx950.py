@@ -252,6 +252,104 @@ def test_ep_decode_matches_kimi_k3_shape_gfx950(
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize("num_tokens", [8, 17])
+def test_gluon_warp_decode_tuned_shapes_match_kimi_k3_gfx950(
+    num_tokens: int,
+) -> None:
+    from tokenspeed_kernel_amd.ops.moe.gluon_a16w4_situ_decode import (
+        gluon_a16w4_situ_warp_decode_ep_gfx950,
+    )
+
+    generator = torch.Generator(device="cuda").manual_seed(20260728 + num_tokens)
+    num_local_experts = 2
+    num_experts = 16
+    ep_rank = 3
+    top_k = 16
+    latent_size = 3584
+    intermediate_size = 3072
+    module, raw = _make_mxfp4_module(
+        num_experts=num_local_experts,
+        latent_size=latent_size,
+        intermediate_size=intermediate_size,
+        top_k=top_k,
+        generator=generator,
+    )
+    module.num_experts = num_experts
+    module.num_local_experts = num_local_experts
+    module.ep_size = 8
+    module.ep_rank = ep_rank
+    hidden_states = (
+        torch.randn(
+            (num_tokens, latent_size),
+            dtype=torch.bfloat16,
+            device="cuda",
+            generator=generator,
+        )
+        * 0.1
+    )
+    expert_ids = torch.arange(num_experts, dtype=torch.int32, device="cuda")
+    topk_ids = torch.stack(
+        [torch.roll(expert_ids, token) for token in range(num_tokens)]
+    )
+    topk_weights = torch.softmax(
+        torch.randn(
+            (num_tokens, top_k),
+            dtype=torch.float32,
+            device="cuda",
+            generator=generator,
+        ),
+        dim=-1,
+    )
+    plan = tokenspeed_kernel.moe_plan(
+        "mxfp4",
+        input_dtype=torch.bfloat16,
+        activation="situ",
+        routing_mode="precomputed_topk",
+        ep_size=8,
+        ispp=intermediate_size,
+        internal_activation_dtype="input",
+        solution="gluon",
+    )
+    tokenspeed_kernel.moe_process_weights(plan, module)
+    expert_start = ep_rank * num_local_experts
+    actual = gluon_a16w4_situ_warp_decode_ep_gfx950(
+        hidden_states,
+        module.w13_weight,
+        module.w13_weight_scale,
+        module.w2_weight,
+        module.w2_weight_scale,
+        topk_weights,
+        topk_ids,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+        expert_start=expert_start,
+        linear_weights=True,
+        w13_interleaved=False,
+    )
+
+    local_ids = topk_ids - expert_start
+    local_mask = (local_ids >= 0) & (local_ids < num_local_experts)
+    local_ids = torch.where(local_mask, local_ids, torch.full_like(local_ids, -1))
+    local_weights = torch.where(
+        local_mask, topk_weights, torch.zeros_like(topk_weights)
+    )
+    expected = a16w4_mxfp4_moe_reference(
+        hidden_states,
+        raw["w13_weight"],
+        raw["w13_scale"],
+        raw["w2_weight"],
+        raw["w2_scale"],
+        local_ids,
+        local_weights,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    )
+
+    assert actual.shape == (num_tokens, latent_size)
+    assert actual.dtype == torch.bfloat16
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
 @pytest.mark.parametrize("num_tokens", [1, 2, 4, 8])
 @pytest.mark.parametrize("solution", ["triton", "gluon"])
 def test_ep_decode_all_remote_routes_return_zero_gfx950(

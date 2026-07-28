@@ -43,12 +43,18 @@ from tokenspeed_kernel_amd.ops.moe.gluon_a4w4_gfx950.decode_kernels import (
 _LANES = gl.constexpr(64)
 # Kimi K3's packed K dimensions exactly fit these maximum tiles. Smaller
 # supported shapes step down to the largest exact 128-byte multiple below.
-WARP_DECODE_STAGE1_BLOCK_N = 4
-WARP_DECODE_STAGE1_BLOCK_KB = 256
-WARP_DECODE_STAGE1_NUM_WARPS = 4
-WARP_DECODE_STAGE2_BLOCK_N = 8
-WARP_DECODE_STAGE2_BLOCK_KB = 512
-WARP_DECODE_STAGE2_NUM_WARPS = 8
+# BLOCK_N, BLOCK_KB, NUM_WARPS, N_LANES. Wider N tiles reduce route-grid
+# overhead, while four N lanes produce contiguous 16-byte packed-K loads.
+WARP_DECODE_STAGE1_DEFAULT_CONFIG = (4, 256, 4, 1)
+WARP_DECODE_STAGE1_CONFIGS = {
+    2: (16, 256, 4, 4),
+    4: (32, 256, 4, 4),
+    8: (32, 256, 8, 4),
+    17: (64, 256, 8, 4),
+}
+# BLOCK_N, BLOCK_KB, NUM_WARPS.
+WARP_DECODE_STAGE2_DEFAULT_CONFIG = (8, 512, 8)
+WARP_DECODE_STAGE2_CONFIGS = {17: (16, 512, 8)}
 _MIN_WARP_DECODE_BLOCK_KB = 128
 
 
@@ -94,6 +100,7 @@ def _stage1_a16w4_situ_warp_gemv(
     BLOCK_N: gl.constexpr,
     BLOCK_KB: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    N_LANES: gl.constexpr,
 ):
     pid = gl.program_id(0)
     route = pid // NUM_PID_N
@@ -109,17 +116,24 @@ def _stage1_a16w4_situ_warp_gemv(
         return
 
     # Warps span output neurons while each wave's lanes reduce packed K bytes.
+    k_lanes: gl.constexpr = _LANES // N_LANES
     layout: gl.constexpr = gl.BlockedLayout(
-        [(BLOCK_N + NUM_WARPS - 1) // NUM_WARPS, BLOCK_KB // _LANES],
-        [1, _LANES],
+        [
+            (BLOCK_N + NUM_WARPS * N_LANES - 1) // (NUM_WARPS * N_LANES),
+            BLOCK_KB // k_lanes,
+        ],
+        [N_LANES, k_lanes],
         [NUM_WARPS, 1],
         [1, 0],
     )
     n_layout: gl.constexpr = gl.SliceLayout(1, layout)
     k_layout: gl.constexpr = gl.SliceLayout(0, layout)
     expanded_layout: gl.constexpr = gl.BlockedLayout(
-        [(BLOCK_N + NUM_WARPS - 1) // NUM_WARPS, (2 * BLOCK_KB) // _LANES],
-        [1, _LANES],
+        [
+            (BLOCK_N + NUM_WARPS * N_LANES - 1) // (NUM_WARPS * N_LANES),
+            (2 * BLOCK_KB) // k_lanes,
+        ],
+        [N_LANES, k_lanes],
         [NUM_WARPS, 1],
         [1, 0],
     )
@@ -470,12 +484,13 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
-    stage1_block_n = WARP_DECODE_STAGE1_BLOCK_N
+    stage1_block_n, stage1_max_block_kb, stage1_warps, stage1_n_lanes = (
+        WARP_DECODE_STAGE1_CONFIGS.get(num_tokens, WARP_DECODE_STAGE1_DEFAULT_CONFIG)
+    )
     stage1_block_kb = _largest_exact_block_kb(
         packed_hidden,
-        WARP_DECODE_STAGE1_BLOCK_KB,
+        stage1_max_block_kb,
     )
-    stage1_warps = WARP_DECODE_STAGE1_NUM_WARPS
     if intermediate_dim % stage1_block_n or packed_hidden % stage1_block_kb:
         raise ValueError("unmasked stage1 requires exact N and packed-K tiles")
     stage1_grid = num_tokens * top_k * triton.cdiv(intermediate_dim, stage1_block_n)
@@ -511,17 +526,19 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
         BLOCK_N=stage1_block_n,
         BLOCK_KB=stage1_block_kb,
         NUM_WARPS=stage1_warps,
+        N_LANES=stage1_n_lanes,
         num_warps=stage1_warps,
     )
 
     out = torch.empty_like(hidden_states)
-    stage2_block_n = WARP_DECODE_STAGE2_BLOCK_N
+    stage2_block_n, stage2_max_block_kb, stage2_warps = WARP_DECODE_STAGE2_CONFIGS.get(
+        num_tokens, WARP_DECODE_STAGE2_DEFAULT_CONFIG
+    )
     packed_intermediate = intermediate_dim // 2
     stage2_block_kb = _largest_exact_block_kb(
         packed_intermediate,
-        WARP_DECODE_STAGE2_BLOCK_KB,
+        stage2_max_block_kb,
     )
-    stage2_warps = WARP_DECODE_STAGE2_NUM_WARPS
     if hidden_dim % stage2_block_n or packed_intermediate % stage2_block_kb:
         raise ValueError("unmasked stage2 requires exact N and packed-K tiles")
     stage2_grid = num_tokens * triton.cdiv(hidden_dim, stage2_block_n)
