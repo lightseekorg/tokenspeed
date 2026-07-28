@@ -2,7 +2,6 @@ import os
 import subprocess
 from pathlib import Path
 
-
 SCRIPT = Path(__file__).with_name("package_cache.sh")
 
 
@@ -18,19 +17,35 @@ def run_bash(command: str, env: dict[str, str]) -> subprocess.CompletedProcess[s
 
 def test_other_clusters_do_not_enable_package_cache(tmp_path: Path):
     env = os.environ.copy()
-    env.update({"CI_RUNNER_LABEL": "gb200-4gpu", "FLASHINFER_CACHE_DIR": str(tmp_path / "flashinfer")})
+    env.update(
+        {
+            "CI_RUNNER_LABEL": "gb200-4gpu",
+            "FLASHINFER_CACHE_DIR": str(tmp_path / "flashinfer"),
+        }
+    )
     env.pop("PIP_CACHE_DIR", None)
     env.pop("CI_WHEEL_CACHE_DIR", None)
-    result = run_bash('configure_b200v2_package_cache; printf "%s|%s" "${PIP_CACHE_DIR:-}" "${CI_WHEEL_CACHE_DIR:-}"', env)
+    result = run_bash(
+        'configure_b200v2_package_cache; printf "%s|%s" "${PIP_CACHE_DIR:-}" "${CI_WHEEL_CACHE_DIR:-}"',
+        env,
+    )
     assert result.stdout == "|"
 
 
 def test_b200v2_uses_persistent_cache_next_to_flashinfer(tmp_path: Path):
     env = os.environ.copy()
-    env.update({"CI_RUNNER_LABEL": "b200v2-8gpu", "FLASHINFER_CACHE_DIR": str(tmp_path / "flashinfer")})
+    env.update(
+        {
+            "CI_RUNNER_LABEL": "b200v2-8gpu",
+            "FLASHINFER_CACHE_DIR": str(tmp_path / "flashinfer"),
+        }
+    )
     env.pop("PIP_CACHE_DIR", None)
     env.pop("CI_WHEEL_CACHE_DIR", None)
-    result = run_bash('configure_b200v2_package_cache >/dev/null; printf "%s|%s" "${PIP_CACHE_DIR}" "${CI_WHEEL_CACHE_DIR}"', env)
+    result = run_bash(
+        'configure_b200v2_package_cache >/dev/null; printf "%s|%s" "${PIP_CACHE_DIR}" "${CI_WHEEL_CACHE_DIR}"',
+        env,
+    )
     assert result.stdout == f"{tmp_path / 'pip'}|{tmp_path / 'wheelhouse'}"
     assert (tmp_path / "pip").is_dir()
     assert (tmp_path / "wheelhouse").is_dir()
@@ -56,7 +71,13 @@ exit 1
 """)
     fake_curl.chmod(0o755)
     env = os.environ.copy()
-    env.update({"CI_WHEEL_CACHE_DIR": str(cache_dir), "CURL_CALLS": str(tmp_path / "curl-calls"), "PATH": f"{bin_dir}:{env['PATH']}"})
+    env.update(
+        {
+            "CI_WHEEL_CACHE_DIR": str(cache_dir),
+            "CURL_CALLS": str(tmp_path / "curl-calls"),
+            "PATH": f"{bin_dir}:{env['PATH']}",
+        }
+    )
     command = 'for i in 1 2 3 4; do cache_remote_wheel "https://example.test/pkg.whl" & done; wait'
     result = run_bash(command, env)
     assert result.stdout.splitlines() == [str(cache_dir / "pkg.whl")] * 4
