@@ -22,6 +22,7 @@ from typing import Literal
 
 Retention = Literal["full_history", "sliding_window"]
 Family = Literal["history", "state"]
+TransferPolicy = Literal["full_suffix", "latest_snapshot"]
 
 
 @dataclass(frozen=True)
@@ -35,9 +36,44 @@ class PagedCacheGroupSpec:
     family: Family = "history"
     # Per-group page tokens; None -> scheduler global block_size, else a multiple of it.
     block_size: int | None = None
+    # None preserves standalone/non-PD behavior; Flat PD plans set this explicitly.
+    transfer_policy: TransferPolicy | None = None
 
 
 _PAGED_CACHE_GROUP_DUMMY_PAGES = 1
+
+
+_KIMI_K3_ARCHITECTURES = frozenset({"KimiK3ForConditionalGeneration"})
+_KIMI_K3_FLATKV_REQUIRED_DIAGNOSTIC = (
+    "Kimi-K3 is FlatKV-only: the installed tokenspeed_scheduler extension "
+    "is not a TOKENSPEED_FLAT_KVCACHE build, and legacy/radix scheduler "
+    "fallbacks are forbidden. Rebuild with "
+    'SKBUILD_CMAKE_DEFINE="TOKENSPEED_FLAT_KVCACHE=ON" pip install -e '
+    "tokenspeed-scheduler/ to serve KimiK3ForConditionalGeneration."
+)
+
+
+def preflight_kimi_k3_flat_consumers(*model_configs: object | None) -> None:
+    """Admit Kimi-K3 configs onto the FlatKV path, and only that path.
+
+    Kimi-K3 requires a flat-built ``tokenspeed_scheduler`` extension: a
+    radix/legacy ext never delivers the per-group flat tables its MLA and
+    KDA consumers run on. A silent radix fallback is forbidden, so a
+    non-FlatKV build is a startup error here.
+
+    Both target and draft configs pass through this shared architecture-only
+    check.  Keeping it torch-free lets EventLoop invoke it immediately after
+    loading configs, while the attention registry reuses it as defense in
+    depth for direct callers.  Non-Kimi architectures are never affected.
+    """
+    for model_config in model_configs:
+        if model_config is None:
+            continue
+        hf_config = getattr(model_config, "hf_config", None)
+        architectures = getattr(hf_config, "architectures", None) or ()
+        if any(arch in _KIMI_K3_ARCHITECTURES for arch in architectures):
+            if not scheduler_ext_flat_kvcache():
+                raise RuntimeError(_KIMI_K3_FLATKV_REQUIRED_DIAGNOSTIC)
 
 
 def scheduler_ext_flat_kvcache() -> bool:
@@ -179,6 +215,12 @@ def validate_flat_scheduler_config(
     consume the per-group flat tables, or zero published groups. No-op on a
     radix build.
     """
+    contract = getattr(kv_pool, "runtime_contract", None)
+    if contract is not None and not flat_kvcache_ext:
+        raise RuntimeError(
+            "KV pool publishes a runtime contract and requires a flat scheduler "
+            "build; legacy and radix scheduler fallbacks are forbidden"
+        )
     if not flat_kvcache_ext:
         return
     pool_name = type(kv_pool).__name__
@@ -211,11 +253,19 @@ def validate_flat_scheduler_config(
             "decode is unsupported on the flat path. Use a radix-built "
             "tokenspeed_scheduler extension."
         )
-    if len(paged_cache_groups) > 1 and not uses_flat:
+    if len(paged_cache_groups) > 1 and not uses_flat and contract is None:
         # A table-blind backend on a multi-group pool would index every
         # layer through the C++ single-table fallback (a first-group
         # sample) — with slab-aliased layouts that silently corrupts KV
         # past the sliding window. Refuse at startup instead.
+        #
+        # Contract pools (FlatHybridCachePool, Kimi-K3) are exempt from
+        # this flag check: their consumers travel FlatCacheBatchMetadata
+        # (never the C++ single-table fallback or req_to_page) and are
+        # validated by the family-coverage check below.
+        # The MLA sub-backend's uses_flat_cache_groups flag deliberately
+        # stays False so DeepSeek flat builds keep the non-flat CUDA-graph
+        # capture path that flag routes.
         raise RuntimeError(
             "flat scheduler build (TOKENSPEED_FLAT_KVCACHE): KV pool "
             f"{pool_name} publishes {len(paged_cache_groups)} cache groups "
@@ -232,6 +282,19 @@ def validate_flat_scheduler_config(
             "(e.g. mamba/state-only pools). Use a radix-built "
             "tokenspeed_scheduler extension for this model."
         )
+    if contract is not None:
+        required_families = frozenset(spec.family for spec in contract.group_specs)
+        supported_families = frozenset(
+            getattr(attn_backend, "flat_cache_consumer_families", ())
+        )
+        missing_families = required_families - supported_families
+        if missing_families:
+            raise RuntimeError(
+                "flat cache pool requires consumer families "
+                f"{sorted(required_families)}, but backend "
+                f"{type(attn_backend).__name__} is missing "
+                f"{sorted(missing_families)}"
+            )
 
 
 def compute_paged_cache_group_page_counts(
@@ -628,6 +691,7 @@ __all__ = [
     "hybrid_slab_group_size",
     "layer_group_ids",
     "publish_paged_cache_groups",
+    "preflight_kimi_k3_flat_consumers",
     "scheduler_ext_flat_kvcache",
     "validate_flat_scheduler_config",
 ]

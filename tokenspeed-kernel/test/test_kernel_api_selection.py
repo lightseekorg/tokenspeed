@@ -784,6 +784,60 @@ def _attention_decode() -> object:
     )
 
 
+def _attention_mla_decode_fp8_k3() -> object:
+    q = torch.empty((1, 1, 12, 576), dtype=torch.bfloat16)
+    kv_cache = torch.empty((2, 64, 1, 576), dtype=torch.float8_e4m3fn)
+    page_table = torch.tensor([[0, 1]], dtype=torch.int32)
+    cache_seqlens = torch.tensor([128], dtype=torch.int32)
+    return tokenspeed_kernel.mla_decode_with_kvcache(
+        q=q,
+        kv_cache=kv_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_k=300_000,
+        qk_nope_head_dim=128,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        softmax_scale=192**-0.5,
+    )
+
+
+def _attention_mla_decode_fp8q_k3() -> object:
+    q = torch.empty((1, 1, 12, 576), dtype=torch.float8_e4m3fn)
+    kv_cache = torch.empty((2, 64, 1, 576), dtype=torch.float8_e4m3fn)
+    page_table = torch.tensor([[0, 1]], dtype=torch.int32)
+    cache_seqlens = torch.tensor([128], dtype=torch.int32)
+    return tokenspeed_kernel.mla_decode_with_kvcache(
+        q=q,
+        kv_cache=kv_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_k=300_000,
+        qk_nope_head_dim=128,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        softmax_scale=192**-0.5,
+    )
+
+
+def _attention_mla_decode_fp8q_unsupported_heads() -> object:
+    q = torch.empty((1, 1, 32, 576), dtype=torch.float8_e4m3fn)
+    kv_cache = torch.empty((2, 64, 1, 576), dtype=torch.float8_e4m3fn)
+    page_table = torch.tensor([[0, 1]], dtype=torch.int32)
+    cache_seqlens = torch.tensor([128], dtype=torch.int32)
+    return tokenspeed_kernel.mla_decode_with_kvcache(
+        q=q,
+        kv_cache=kv_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_k=300_000,
+        qk_nope_head_dim=128,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        softmax_scale=192**-0.5,
+    )
+
+
 def _attention_rel_prefill() -> object:
     q = torch.empty((4, 16, 64), dtype=torch.bfloat16)
     k = torch.empty((4, 8, 64), dtype=torch.bfloat16)
@@ -1030,7 +1084,12 @@ def _attention_dsa_decode_topk() -> object:
     )
 
 
-def _attention_dsa_prefill_topk() -> object:
+def _attention_dsa_prefill_topk(
+    *,
+    page_size: int = 64,
+    solution: str | None = None,
+    override: str | None = None,
+) -> object:
     q = torch.empty((2, 2, 128), dtype=torch.bfloat16)
     weights = torch.empty((2, 2), dtype=torch.float32)
     index_k = torch.zeros((128, 132), dtype=torch.uint8)
@@ -1046,7 +1105,9 @@ def _attention_dsa_prefill_topk() -> object:
         topk=512,
         softmax_scale=1.0,
         index_k_cache=index_k,
-        page_size=64,
+        page_size=page_size,
+        solution=solution,
+        override=override,
     )
 
 
@@ -1116,6 +1177,25 @@ def test_gluon_mxfp4_swiglu_args_default_missing_values_to_standard_swiglu() -> 
     w.swiglu_beta = 1.0
 
     assert _moe_gluon_mxfp4._swiglu_args(w) == (1.702, 7.0, 1.0)
+
+
+def test_gluon_dsa_prefill_topk_rejects_unsupported_page_size() -> None:
+    registry = KernelRegistry.get()
+    if registry.get_by_name("gluon_dsa_prefill_topk_fp8_gfx950") is None:
+        pytest.skip("Gluon DSA top-k is AMD-only")
+
+    with pytest.raises(tokenspeed_kernel.NoKernelFoundError, match="traits"):
+        _attention_dsa_prefill_topk(page_size=32, solution="gluon")
+
+
+def test_gluon_dsa_prefill_topk_exact_override_checks_page_size() -> None:
+    registry = KernelRegistry.get()
+    kernel_name = "gluon_dsa_prefill_topk_fp8_gfx950"
+    if registry.get_by_name(kernel_name) is None:
+        pytest.skip("Gluon DSA top-k is AMD-only")
+
+    with pytest.raises(ValueError, match="page_size=64"):
+        _attention_dsa_prefill_topk(page_size=32, override=kernel_name)
 
 
 def test_gluon_mxfp4_apply_priority_prefers_dynamic_over_precomputed() -> None:
@@ -1191,6 +1271,87 @@ def test_gluon_mxfp4_plan_selects_dynamic_apply_on_cdna4(
     # support_routing is True because the selected (dynamic) kernel advertises
     # kernel_routing; precomputed top-k is still forwarded as an optimization.
     assert plan["support_routing"] is True
+
+
+@pytest.mark.parametrize(
+    "ep_size,solution,kernel_name,preprocessor",
+    [
+        (1, "triton", "triton_mxfp4_precomputed_moe_apply", "triton_mxfp4_moe_weights"),
+        (2, None, "triton_mxfp4_ep_precomputed_moe_apply", "triton_mxfp4_moe_weights"),
+        (4, None, "triton_mxfp4_ep_precomputed_moe_apply", "triton_mxfp4_moe_weights"),
+        (
+            8,
+            None,
+            "gluon_mxfp4_a16w4_situ_ep_precomputed_moe_apply",
+            "validate_linear_mxfp4_moe_weights",
+        ),
+        (
+            8,
+            "gluon",
+            "gluon_mxfp4_a16w4_situ_ep_precomputed_moe_apply",
+            "validate_linear_mxfp4_moe_weights",
+        ),
+    ],
+)
+def test_kimi3_mxfp4_situ_selection_on_cdna4(
+    mi350_platform: PlatformInfo,
+    ep_size: int,
+    solution: str | None,
+    kernel_name: str,
+    preprocessor: str,
+) -> None:
+    registry = KernelRegistry.get()
+    if registry.get_by_name(kernel_name) is None:
+        pytest.skip(f"{kernel_name} is unavailable")
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi350_platform)
+        registry.clear_cache()
+        plan = tokenspeed_kernel.moe_plan(
+            "mxfp4",
+            input_dtype=torch.bfloat16,
+            activation="situ",
+            routing_mode="precomputed_topk",
+            ep_size=ep_size,
+            ispp=3072,
+            internal_activation_dtype="input",
+            solution=solution,
+        )
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+    _assert_moe_plan(plan, apply=kernel_name, preprocessor=preprocessor)
+    assert plan["activation"] == "situ"
+    assert plan["support_routing"] is False
+
+
+def test_kimi3_mxfp4_situ_ep8_auto_falls_back_to_triton_on_cdna3(
+    mi300_platform: PlatformInfo,
+) -> None:
+    """The gfx950-only Gluon fast path must not displace the AMD fallback."""
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi300_platform)
+        KernelRegistry.get().clear_cache()
+        plan = tokenspeed_kernel.moe_plan(
+            "mxfp4",
+            input_dtype=torch.bfloat16,
+            activation="situ",
+            routing_mode="precomputed_topk",
+            ep_size=8,
+            ispp=3072,
+            internal_activation_dtype="input",
+        )
+    finally:
+        Platform.override(real_platform)
+        KernelRegistry.get().clear_cache()
+
+    _assert_moe_plan(
+        plan,
+        apply="triton_mxfp4_ep_precomputed_moe_apply",
+        preprocessor="triton_mxfp4_moe_weights",
+    )
 
 
 def _make_fake_gluon_mxfp4_layer(top_k: int) -> torch.nn.Module:
@@ -1856,6 +2017,30 @@ _CASES = [
         "mha_decode_with_kvcache",
         "gluon_mha_decode_gfx950",
         _attention_decode,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "mla_decode_with_kvcache",
+        "gluon_mla_decode_bf16xfp8_gfx950_bh16bn128",
+        _attention_mla_decode_fp8_k3,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "mla_decode_with_kvcache",
+        "gluon_mla_decode_fp8xfp8_gfx950_bh16bn128",
+        _attention_mla_decode_fp8q_k3,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "mla_decode_with_kvcache",
+        "triton_mla_decode_with_kvcache",
+        _attention_mla_decode_fp8q_unsupported_heads,
     ),
     _case(
         _is_cdna4,

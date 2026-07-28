@@ -101,20 +101,158 @@ def test_mla_prefill(
 
 
 @pytest.mark.parametrize(
-    "solution,dtype,num_heads,kv_lora_rank,qk_rope_head_dim,batch_size,page_size",
+    "solution,q_dtype,kv_dtype,num_heads,kv_lora_rank,qk_rope_head_dim,batch_size,page_size",
     [
-        pytest.param("triton", torch.bfloat16, 128, 512, 64, 2, 4, id="triton-bf16"),
         pytest.param(
-            "triton", platform.fp8e4m3fn.dtype, 128, 512, 64, 2, 4, id="triton-fp8"
+            "triton",
+            torch.bfloat16,
+            torch.bfloat16,
+            128,
+            512,
+            64,
+            2,
+            4,
+            id="triton-bf16",
         ),
-        pytest.param("gluon", torch.bfloat16, 16, 512, 64, 4, 64, id="gluon-bh16bn64"),
-        pytest.param("gluon", torch.bfloat16, 128, 512, 64, 64, 64, id="gluon-bh64"),
+        pytest.param(
+            "triton",
+            platform.fp8e4m3fn.dtype,
+            platform.fp8e4m3fn.dtype,
+            128,
+            512,
+            64,
+            2,
+            4,
+            id="triton-fp8",
+        ),
+        pytest.param(
+            "gluon",
+            torch.bfloat16,
+            torch.bfloat16,
+            16,
+            512,
+            64,
+            4,
+            64,
+            id="gluon-bh16bn64",
+        ),
+        pytest.param(
+            "gluon",
+            torch.bfloat16,
+            platform.fp8e4m3fn.dtype,
+            12,
+            512,
+            64,
+            1,
+            64,
+            id="gluon-fp8-bh16bn128-k3",
+        ),
+        pytest.param(
+            "gluon",
+            torch.bfloat16,
+            platform.fp8e4m3fn.dtype,
+            12,
+            512,
+            64,
+            8,
+            64,
+            id="gluon-bf16q-fp8kv-bh16bn128-k3-batch8",
+        ),
+        pytest.param(
+            "gluon",
+            torch.bfloat16,
+            platform.fp8e4m3fn.dtype,
+            12,
+            512,
+            64,
+            32,
+            64,
+            id="gluon-bf16q-fp8kv-bh16bn128-k3-batch32",
+        ),
+        pytest.param(
+            "gluon",
+            torch.bfloat16,
+            platform.fp8e4m3fn.dtype,
+            12,
+            512,
+            64,
+            64,
+            64,
+            id="gluon-bf16q-fp8kv-bh16bn128-k3-batch64",
+        ),
+        pytest.param(
+            "gluon",
+            platform.fp8e4m3fn.dtype,
+            platform.fp8e4m3fn.dtype,
+            12,
+            512,
+            64,
+            1,
+            64,
+            id="gluon-native-fp8q-fp8kv-bh16bn128-k3",
+        ),
+        pytest.param(
+            "gluon",
+            platform.fp8e4m3fn.dtype,
+            platform.fp8e4m3fn.dtype,
+            12,
+            512,
+            64,
+            8,
+            64,
+            id="gluon-native-fp8q-fp8kv-bh16bn128-k3-batch8",
+        ),
+        pytest.param(
+            "gluon",
+            platform.fp8e4m3fn.dtype,
+            platform.fp8e4m3fn.dtype,
+            12,
+            512,
+            64,
+            32,
+            64,
+            id="gluon-native-fp8q-fp8kv-bh16bn128-k3-batch32",
+        ),
+        pytest.param(
+            "gluon",
+            platform.fp8e4m3fn.dtype,
+            platform.fp8e4m3fn.dtype,
+            12,
+            512,
+            64,
+            64,
+            64,
+            id="gluon-native-fp8q-fp8kv-bh16bn128-k3-batch64",
+        ),
+        pytest.param(
+            "gluon",
+            torch.bfloat16,
+            torch.float8_e5m2,
+            12,
+            512,
+            64,
+            1,
+            64,
+            id="gluon-fp8-e5m2-bh16bn128-k3",
+        ),
+        pytest.param(
+            "gluon",
+            torch.bfloat16,
+            torch.bfloat16,
+            128,
+            512,
+            64,
+            64,
+            64,
+            id="gluon-bh64",
+        ),
     ],
 )
 def test_mla_decode_with_kvcache(
     device: str,
     solution: str,
-    dtype: torch.dtype,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
     num_heads: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
@@ -122,7 +260,7 @@ def test_mla_decode_with_kvcache(
     page_size: int,
     require,
 ) -> None:
-    require("attention", "mla_decode_with_kvcache", solution, dtype, "q")
+    require("attention", "mla_decode_with_kvcache", solution, q_dtype, "q")
 
     q_len = 1
     qk_nope_head_dim = 128
@@ -134,18 +272,25 @@ def test_mla_decode_with_kvcache(
     cache_seqlens_list = [
         seqlen_cycle[i % len(seqlen_cycle)] for i in range(batch_size)
     ]
-    max_seqlen_k = max(cache_seqlens_list)
-    max_pages = (max_seqlen_k + page_size - 1) // page_size
+    visible_max_seqlen_k = max(cache_seqlens_list)
+    max_seqlen_k = visible_max_seqlen_k
+    if solution == "gluon" and kv_dtype in _FP8_DTYPES:
+        # K3 reserves a 300K context even when the visible cache is short. This
+        # selects 256 split-K workgroups and exercises the empty-split
+        # sanitization used by production long-context decode.
+        max_seqlen_k = 300_000
+    max_pages = (visible_max_seqlen_k + page_size - 1) // page_size
     num_pages = batch_size * max_pages
 
-    init_dtype = torch.bfloat16 if dtype in _FP8_DTYPES else dtype
+    q_init_dtype = torch.bfloat16 if q_dtype in _FP8_DTYPES else q_dtype
+    kv_init_dtype = torch.bfloat16 if kv_dtype in _FP8_DTYPES else kv_dtype
     q = torch.randn(
         batch_size,
         q_len,
         num_heads,
         qk_head_dim,
         device=device,
-        dtype=init_dtype,
+        dtype=q_init_dtype,
     )
     kv_cache = torch.randn(
         num_pages,
@@ -153,11 +298,12 @@ def test_mla_decode_with_kvcache(
         1,
         qk_head_dim,
         device=device,
-        dtype=init_dtype,
+        dtype=kv_init_dtype,
     )
-    if dtype != init_dtype:
-        q = q.to(dtype)
-        kv_cache = kv_cache.to(dtype)
+    if q_dtype != q_init_dtype:
+        q = q.to(q_dtype)
+    if kv_dtype != kv_init_dtype:
+        kv_cache = kv_cache.to(kv_dtype)
 
     cache_seqlens = torch.tensor(cache_seqlens_list, device=device, dtype=torch.int32)
     page_table = torch.arange(num_pages, device=device, dtype=torch.int32).reshape(
@@ -196,7 +342,9 @@ def test_mla_decode_with_kvcache(
     lse_ref = torch.stack(ref_lses, dim=0)
 
     assert out.shape == (batch_size, q_len, num_heads, kv_lora_rank)
+    if q_dtype in _FP8_DTYPES:
+        assert out.dtype == torch.bfloat16
     assert lse.shape == (batch_size, q_len, num_heads)
-    out_tol = 1e-1 if dtype in _FP8_DTYPES else 8e-2
+    out_tol = 1e-1 if q_dtype in _FP8_DTYPES or kv_dtype in _FP8_DTYPES else 8e-2
     torch.testing.assert_close(out.float(), out_ref, rtol=out_tol, atol=out_tol)
     torch.testing.assert_close(lse, lse_ref, rtol=8e-2, atol=8e-2)

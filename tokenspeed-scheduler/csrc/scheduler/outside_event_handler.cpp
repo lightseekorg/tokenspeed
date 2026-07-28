@@ -34,15 +34,11 @@ namespace tokenspeed {
 #if TOKENSPEED_FLAT_KVCACHE
 namespace {
 
-// Batched ref surrender in ticket order: after an abort these pins are the LAST refs, and
-// FreeBlocks recycles the batch tail-first (vector dtor order is impl-defined, so no per-ref dtors).
-void FreeAll(BlockPool& pool, std::vector<BlockRef>&& refs) {
-    std::vector<CacheBlock*> batch;
-    batch.reserve(refs.size());
-    for (BlockRef& ref : refs) {
-        batch.push_back(ref.Release());
+// Release explicitly in reverse; vector destruction order is not our eviction policy.
+void FreeAll(std::vector<BlockRef>&& refs) {
+    for (auto it = refs.rbegin(); it != refs.rend(); ++it) {
+        it->reset();
     }
-    pool.FreeBlocks(batch);
 }
 
 }  // namespace
@@ -101,35 +97,94 @@ void Scheduler::handleEvent(const cache::PrefetchDone& event) {
 }
 
 void Scheduler::handleEvent(const pd::BootstrappedEvent& event) {
-    requests_.at(event.request_id)->Apply(fsm::BootstrappedEvent{});
+    Request* request = find_request(event.request_id);
+    if (request == nullptr || !request->Is<fsm::Bootstrapping>()) {
+        // Missing means the request was already reaped; any other state means
+        // this bootstrap acknowledgement is a duplicate/late delivery.
+        return;
+    }
+    request->Apply(fsm::BootstrappedEvent{});
 }
 
-void Scheduler::handleEvent(const pd::FailedEvent& event) {}
-
-void Scheduler::handleEvent(const pd::SucceededEvent& event) {
+void Scheduler::handleEvent(const pd::FailedEvent& event) {
+    Request* request = find_request(event.request_id);
+    if (request == nullptr || request->Is<fsm::Finished>()) {
+        return;
+    }
+    if (request->Is<fsm::WritingBack>()) {
+        throw std::logic_error("PD FailedEvent cannot terminalize an in-flight scheduler writeback");
+    }
 #if TOKENSPEED_FLAT_KVCACHE
     pending_forward_results_.erase(event.request_id);
     flat_reserved_pages_.erase(event.request_id);
+    flat_pd_completion_reserved_pages_.erase(event.request_id);
+    flat_pd_transfer_pins_.erase(event.request_id);
+#endif
+    request->Apply(fsm::AbortEvent{
+#if TOKENSPEED_FLAT_KVCACHE
+        &coordinator_
+#endif
+    });
+}
+
+void Scheduler::handleEvent(const pd::SucceededEvent& event) {
+    Request* request = find_request(event.request_id);
+    if (request == nullptr || request->Is<fsm::Finished>()) {
+        return;
+    }
+    if (!request->Is<fsm::PrefillDone>() && !request->Is<fsm::Decoding>()) {
+        throw std::logic_error("PD SucceededEvent received in state " + request->StateName());
+    }
+#if TOKENSPEED_FLAT_KVCACHE
+    pending_forward_results_.erase(event.request_id);
+    flat_reserved_pages_.erase(event.request_id);
+    flat_pd_completion_reserved_pages_.erase(event.request_id);
+    flat_pd_transfer_pins_.erase(event.request_id);
 #endif
     std::vector<std::string> page_hashes;
-    requests_.at(event.request_id)
-        ->Apply(fsm::FinishEvent{&kv_prefix_cache_, &host_allocator_, std::move(page_hashes), config_.disable_l2_cache,
-                                 hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr
+    request->Apply(fsm::FinishEvent{&kv_prefix_cache_, &host_allocator_, std::move(page_hashes),
+                                    config_.disable_l2_cache, hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr
 #if TOKENSPEED_FLAT_KVCACHE
-                                 ,
-                                 &coordinator_
+                                    ,
+                                    &coordinator_
 #endif
-        });
+    });
 }
 
 void Scheduler::handleEvent(const pd::RemotePrefillDoneEvent& event) {
-    requests_.at(event.request_id)->Apply(fsm::RemotePrefillDoneEvent{event.bootstrap_token});
+    Request* request = find_request(event.request_id);
+    if (request == nullptr) {
+        return;
+    }
+    if (request->Is<fsm::Prefilling>()) {
+        if (event.bootstrap_token < 0) {
+            throw std::invalid_argument("PD RemotePrefillDoneEvent requires a non-negative bootstrap token");
+        }
+#if TOKENSPEED_FLAT_KVCACHE
+        flat_pd_transfer_pins_.erase(event.request_id);
+#endif
+        request->Apply(fsm::RemotePrefillDoneEvent{event.bootstrap_token});
+        return;
+    }
+    if (request->Is<fsm::PrefillDone>() || request->Is<fsm::Decoding>() || request->Is<fsm::Finished>()) {
+        // Duplicate completion or a delivery that lost the race with terminal
+        // cleanup. Never re-apply the bootstrap token.
+        return;
+    }
+    throw std::logic_error(
+        "PD RemotePrefillDoneEvent received before decode "
+        "destination admission; state=" +
+        request->StateName());
 }
 
 void Scheduler::handleEvent(const forward::Finish& event) {
 #if TOKENSPEED_FLAT_KVCACHE
+    if (config_.enable_flatkv_pd && flat_pd_transfer_pins_.contains(event.request_id)) {
+        throw std::logic_error("FlatKV PD Finish received while transfer pages are pinned");
+    }
     pending_forward_results_.erase(event.request_id);
     flat_reserved_pages_.erase(event.request_id);
+    flat_pd_completion_reserved_pages_.erase(event.request_id);
 #endif
     if (auto req = find_request(event.request_id)) {
         // except_last=true: exclude the tail page, matching FinishEvent's InsertDevice behavior
@@ -184,6 +239,8 @@ void Scheduler::handleEvent(const forward::Abort& event) {
     // not leave a permanent phantom reservation deflating every later gate.
     pending_forward_results_.erase(event.request_id);
     flat_reserved_pages_.erase(event.request_id);
+    flat_pd_completion_reserved_pages_.erase(event.request_id);
+    flat_pd_transfer_pins_.erase(event.request_id);
 #endif
     auto iter = requests_.find(event.request_id);
     if (iter == requests_.end()) {
@@ -204,17 +261,15 @@ void Scheduler::handleEvent(const cache::WriteBackDone& event) {
         // Publish-at-ack: hashing the host block makes it hittable; either way it returns to the
         // host free list (hash-intact = reusable, unhashed = plain recycling). Batched frees in
         // ticket order keep both pools' recycling order deterministic.
-        std::vector<CacheBlock*> device_batch;
-        std::vector<CacheBlock*> host_batch;
         for (FlatStoreTicket& t : tickets) {
             if (event.success) {
-                flat_host_pool_.CacheFullBlock(t.host_block.Get(), t.key);
+                flat_host_pool_.CacheFullBlock(t.host_block, t.key);
             }
-            device_batch.push_back(t.device_block.Release());
-            host_batch.push_back(t.host_block.Release());
         }
-        block_pool_.FreeBlocks(device_batch);
-        flat_host_pool_.FreeBlocks(host_batch);
+        for (auto it = tickets.rbegin(); it != tickets.rend(); ++it) {
+            it->device_block.reset();
+            it->host_block.reset();
+        }
         return;
     }
 #endif
@@ -243,8 +298,8 @@ void Scheduler::handleEvent(const cache::LoadBackDone& event) {
         // The loaded device pages are already claimed as computed KV: a failed copy
         // means the request would decode over garbage bytes -- fail loud.
         _assert(event.success, "flat host loadback failed: host bytes integrity");
-        FreeAll(flat_host_pool_, std::move(flat_it->second.host_pins));
-        FreeAll(block_pool_, std::move(flat_it->second.device_blocks));
+        FreeAll(std::move(flat_it->second.host_pins));
+        FreeAll(std::move(flat_it->second.device_blocks));
         flat_load_ops_.erase(flat_it);
         return;
     }

@@ -206,6 +206,38 @@ def test_choose_mfma_lds_mediumm_config_uses_tuned_medium_m_tiles() -> None:
     assert _choose_mfma_lds_mediumm_config(128, 2560, 2048) == (32, 32, 64, 2, 2, 3)
     assert _choose_mfma_lds_mediumm_config(128, 1280, 2880) == (32, 32, 64, 2, 2, 3)
     assert _choose_mfma_lds_mediumm_config(128, 4096, 4096) == (16, 128, 64, 1, 4, 3)
+    assert _choose_mfma_lds_mediumm_config(768, 3584, 7168) == (
+        128,
+        128,
+        64,
+        2,
+        4,
+        3,
+    )
+    assert _choose_mfma_lds_mediumm_config(1024, 3584, 7168) == (
+        128,
+        128,
+        64,
+        2,
+        4,
+        3,
+    )
+    assert _choose_mfma_lds_mediumm_config(384, 7168, 3584) == (
+        128,
+        128,
+        64,
+        2,
+        4,
+        3,
+    )
+    assert _choose_mfma_lds_mediumm_config(512, 7168, 3584) == (
+        128,
+        128,
+        64,
+        2,
+        4,
+        3,
+    )
 
 
 def test_choose_mfma_lds_mediumm_config_falls_back_for_slow_shapes() -> None:
@@ -220,14 +252,21 @@ def test_choose_mfma_lds_mediumm_config_falls_back_for_slow_shapes() -> None:
     assert _choose_mfma_lds_mediumm_config(256, 1280, 1024) is None
     assert _choose_mfma_lds_mediumm_config(512, 4096, 4096) is None
     assert _choose_mfma_lds_mediumm_config(1024, 8192, 8192) is None
+    assert _choose_mfma_lds_mediumm_config(640, 3584, 7168) is None
+    assert _choose_mfma_lds_mediumm_config(1152, 3584, 7168) is None
+    assert _choose_mfma_lds_mediumm_config(320, 7168, 3584) is None
+    assert _choose_mfma_lds_mediumm_config(576, 7168, 3584) is None
 
 
 def test_use_mediumm_routes_configured_shapes() -> None:
     assert _use_mfma_lds_mediumm(8, 1280, 1024)
     assert _use_mfma_lds_mediumm(64, 1280, 2880)
     assert _use_mfma_lds_mediumm(128, 4096, 4096)
+    assert _use_mfma_lds_mediumm(768, 3584, 7168)
+    assert _use_mfma_lds_mediumm(512, 7168, 3584)
     assert not _use_mfma_lds_mediumm(4, 1280, 1024)
     assert not _use_mfma_lds_mediumm(256, 1280, 1024)
+    assert not _use_mfma_lds_mediumm(640, 3584, 7168)
 
 
 def test_supports_largem_shape_covers_aligned_prefill_tiles() -> None:

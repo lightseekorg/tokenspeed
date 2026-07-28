@@ -39,6 +39,10 @@ tokenspeed serve <model> \
 | `--enable-expert-parallel` | Expert parallelism across the selected world size. |
 | `--expert-parallel-size` | Explicit expert parallel size. |
 
+Kimi-K3 TP8 deployments must combine `--tensor-parallel-size 8` with
+`--mm-encoder-tp-mode data`. This keeps the text model at TP8 while running the
+wide-QKV MoonViT encoder at TP1 with whole-item DP8.
+
 ## MoE Deployments
 
 Large MoE models usually choose one of these shapes:
@@ -70,6 +74,31 @@ tokenspeed serve <model> \
 
 Each node must use the same model, backend, precision, and scheduler settings.
 Only `--node-rank` should differ between nodes.
+
+Apply the same NCCL transport and channel settings on every node as well. In
+particular, do not mix IB and Socket selection or different
+`NCCL_MIN_NCHANNELS` / `NCCL_MAX_NCHANNELS` values across ranks.
+
+## Runtime Notes
+
+Overlap scheduling can prepare the next forward on the CPU while the previous
+forward's non-blocking host-to-device copies are still in flight. Any pinned CPU
+staging buffer used for per-step model inputs must therefore have per-step
+lifetime, or use an explicit synchronization before reuse. This applies to
+MTP/GDN mamba state indices as well as token, length, and request-pool inputs.
+
+CUDA IPC and symmetric-memory collectives are node-local. `AutoBackend` routes
+cross-node all-reduce, all-gather, and token all-gather/reduce-scatter groups to
+NCCL. Logits all-gather and distributed argmax use the same cross-node fallback.
+This is required for layouts such as attention DP with dense TP or MoE EP
+spanning nodes.
+
+On ARM systems, [NCCL 2.29.3](https://github.com/NVIDIA/nccl/releases/tag/v2.29.3-1)
+fixes a weak compare-and-swap failure that can hang NCCL when it was compiled
+with GCC older than 10. Affected NCCL builds older than 2.29.3 can exhaust proxy
+operations during repeated multi-node CUDA graph replay. Use NCCL 2.29.3 or
+newer for this configuration. Disabling CUDA graphs avoids the affected path,
+but is not required with the fixed NCCL runtime.
 
 ## Validation
 

@@ -48,7 +48,7 @@ MFMA_LDS_NUM_WARPS = 4
 MFMA_LDS_REDUCE_M = 4
 MFMA_LDS_SPLIT_K = 8
 GROUP_SIZE_M = 2
-MAX_M = 256
+MAX_M = 1024
 LARGEM_DISPATCH_MIN_M = 2048
 
 _SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
@@ -1113,6 +1113,10 @@ def _choose_mfma_lds_mediumm_config(
 ) -> tuple[int, int, int, int, int, int] | None:
     if M < 8 or K % DENSE16_BLOCK_K != 0 or N % DENSE16_BLOCK_N != 0:
         return None
+    if (K, N) == (7168, 3584) and 768 <= M <= 1024 and M % 128 == 0:
+        return 128, 128, DENSE16_BLOCK_K, 2, 4, 3
+    if (K, N) == (3584, 7168) and 384 <= M <= 512 and M % 64 == 0:
+        return 128, 128, DENSE16_BLOCK_K, 2, 4, 3
     if M <= 32:
         block_m = 16 if M <= 16 else 32
         if K == DENSE16_BLOCK_K:
@@ -1356,8 +1360,8 @@ def gluon_mm_a16w16_mfma_lds_mediumm_gfx950(
 ) -> torch.Tensor:
     """Compute tuned medium-M dense ``A @ B.T`` with MFMA/LDS tiling.
 
-    Intended for selected ``8 <= M <= 128`` dense16 decode/prefill tiles where
-    the Gluon route is competitive with torch.mm.
+    Intended for selected dense16 decode/prefill tiles where the Gluon route is
+    competitive with torch.mm, including K3's middle-M latent projections.
     """
     if A.ndim != 2 or B.ndim != 2:
         raise ValueError(
@@ -1391,9 +1395,9 @@ def gluon_mm_a16w16_mfma_lds_mediumm_gfx950(
     config = _choose_mfma_lds_mediumm_config(M, N, K)
     if config is None:
         raise ValueError(
-            "medium-M dense16 MFMA LDS GEMM requires 8 <= M <= 128, "
-            f"N divisible by {DENSE16_BLOCK_N}, and K divisible by {DENSE16_BLOCK_K}; "
-            f"got M={M}, N={N}, K={K}"
+            "unsupported medium-M dense16 MFMA LDS GEMM shape; expected a tuned "
+            f"shape with N divisible by {DENSE16_BLOCK_N} and K divisible by "
+            f"{DENSE16_BLOCK_K}; got M={M}, N={N}, K={K}"
         )
 
     block_m, block_n, block_k, warps_m, warps_n, num_buffers = config

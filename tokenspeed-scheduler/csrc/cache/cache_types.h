@@ -22,7 +22,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <ranges>
 #include <span>
 #include <utility>
 #include <vector>
@@ -44,29 +43,13 @@ struct KvCacheSpec {
 // Per-request logical-page -> physical-page mapping.
 class BlockTable {
 public:
-    // Read-only view of the pages as CacheBlock*; refcounts stay sealed inside BlockRef.
-    using BlockView = std::ranges::transform_view<std::span<const BlockRef>, decltype(&BlockRef::Get)>;
-
-    BlockView Blocks() const { return BlockView{std::span{blocks_}, &BlockRef::Get}; }
+    std::span<const BlockRef> Blocks() const noexcept { return blocks_; }
     std::int32_t NumBlocks() const { return static_cast<std::int32_t>(blocks_.size()); }
     std::int32_t TailAvailableTokens() const { return tail_avail_; }
 
-    // Replace slot `index` with a null hole (slot alignment kept) and return the
-    // displaced block for the caller to free; nullptr if already a hole.
-    CacheBlock* EvictToNull(std::int32_t index, CacheBlock* null_block) {
+    BlockRef EvictToNull(std::int32_t index) {
         _assert(0 <= index && index < static_cast<std::int32_t>(blocks_.size()), "EvictToNull index out of range");
-        BlockRef& slot = blocks_[static_cast<std::size_t>(index)];
-        CacheBlock* old = slot.Get();
-        _assert(old != nullptr, "EvictToNull on a moved-out slot");
-        if (old == null_block) {
-            return nullptr;
-        }
-        // Order is load-bearing: surrender the displaced ref BEFORE the move-assign,
-        // or the assignment would double-decrement it.
-        BlockRef hole = BlockRef::Share(*slot.pool_, null_block);
-        slot.Release();
-        slot = std::move(hole);
-        return old;
+        return std::exchange(blocks_[static_cast<std::size_t>(index)], {});
     }
 
 private:
@@ -76,21 +59,30 @@ private:
     std::int32_t tail_avail_{0};
 };
 
-// The single flattening authority: BlockId() per logical slot, null holes written as 0, no compaction.
 inline std::vector<std::int32_t> BlockTablePageIds(const BlockTable& table) {
     std::vector<std::int32_t> ids;
     ids.reserve(static_cast<std::size_t>(table.NumBlocks()));
-    for (CacheBlock* b : table.Blocks()) {
-        ids.push_back(b->IsNull() ? 0 : b->BlockId());
+    for (const BlockRef& block : table.Blocks()) {
+        ids.push_back(block ? block->BlockId() : 0);
     }
     return ids;
 }
 
-// blocks maps logical page -> physical page, unmatched / out-of-window slots as null_block
-// holes; num_hit_blocks counts only the real cached pages (holes excluded).
 struct PrefixMatch {
-    std::vector<CacheBlock*> blocks{};
+    std::vector<BlockRef> blocks{};
     std::int32_t num_hit_blocks{0};
+};
+
+// Non-owning match shape. A nonzero slot is acquired only after the coordinator
+// converges every group to the final common boundary.
+struct PrefixProbe {
+    std::vector<std::uint8_t> hits{};
+};
+
+// Pinned source/destination pages for one asynchronous cache transfer.
+struct BlockTransfer {
+    BlockRef source;
+    BlockRef destination;
 };
 
 }  // namespace tokenspeed

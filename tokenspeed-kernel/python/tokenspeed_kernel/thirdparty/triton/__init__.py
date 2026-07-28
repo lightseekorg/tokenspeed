@@ -229,37 +229,48 @@ def _minimax_biased_grouped_topk_kernel(
         other=-float("inf"),
     ).to(tl.float32)
     scores = tl.sigmoid(logits)
-    choice_scores = tl.where(expert_mask, scores + bias, -float("inf"))
+    # Squash NaN (padding rows) to -inf so argmax never emits an OOB expert id.
+    choice_scores = scores + bias
+    choice_scores = tl.where(
+        expert_mask & (choice_scores == choice_scores),
+        choice_scores,
+        -float("inf"),
+    )
 
+    # static_range unrolls: per-k weights stay in registers, no store/load round-trip.
     weights_sum = 0.0
+    kept_weights = ()
     for k in tl.static_range(0, TOPK):
         best_choice_score = tl.max(choice_scores, axis=0)
         best_expert = tl.min(
             tl.where(choice_scores == best_choice_score, offs_e, BLOCK_E), axis=0
         )
+        # Belt-and-braces: keep the emitted id inside [0, num_experts).
+        best_expert = tl.minimum(best_expert, num_experts - 1)
         best_weight = tl.max(tl.where(offs_e == best_expert, scores, 0.0), axis=0)
         stored_expert = best_expert
         if has_static_expert_map:
             stored_expert = tl.load(static_logical_to_physical_map_ptr + best_expert)
         weights_sum += best_weight
+        kept_weights = kept_weights + (best_weight,)
 
         tl.store(
             topk_ids_ptr + token_id * stride_im + k * stride_ik,
             stored_expert.to(tl.int32),
         )
-        tl.store(
-            topk_weights_ptr + token_id * stride_wm + k * stride_wk,
-            best_weight,
-        )
         choice_scores = tl.where(offs_e == best_expert, -float("inf"), choice_scores)
 
+    # Reference semantics: scaling applies only under renormalize.
     if renormalize:
         denom = tl.where(weights_sum != 0.0, weights_sum, 1.0)
-        for k in tl.static_range(0, TOPK):
-            weight = tl.load(topk_weights_ptr + token_id * stride_wm + k * stride_wk)
-            weight = weight / denom
-            weight = weight * routed_scaling_factor
-            tl.store(topk_weights_ptr + token_id * stride_wm + k * stride_wk, weight)
+        factor = routed_scaling_factor
+    else:
+        denom = 1.0
+        factor = 1.0
+    for k in tl.static_range(0, TOPK):
+        weight = kept_weights[k] / denom * factor
+        # tl.store casts to the output pointer dtype.
+        tl.store(topk_weights_ptr + token_id * stride_wm + k * stride_wk, weight)
 
 
 def _biased_grouped_topk_reference(
@@ -347,21 +358,22 @@ def minimax_biased_grouped_topk(
     routed_scaling_factor: Optional[float] = 1.0,
     num_token_non_padded: Optional[torch.Tensor] = None,
     logical_to_physical_map: Optional[torch.Tensor] = None,
+    weights_dtype: torch.dtype = torch.float32,
 ):
     if (
         gating_output.ndim != 2
         or correction_bias.ndim != 1
         or hidden_states.shape[0] != gating_output.shape[0]
         or gating_output.shape[1] != correction_bias.shape[0]
-        or gating_output.shape[1] > 256
-        or not (1 <= topk <= 8)
+        or gating_output.shape[1] > 1024
+        or not (1 <= topk <= 16)
         or num_expert_group != 1
         or topk_group != 1
         or num_fused_shared_experts != 0
         or routed_scaling_factor is None
         or num_token_non_padded is not None
     ):
-        return _biased_grouped_topk_reference(
+        ref_w, ref_i = _biased_grouped_topk_reference(
             hidden_states,
             gating_output,
             correction_bias,
@@ -374,10 +386,11 @@ def minimax_biased_grouped_topk(
             num_token_non_padded=num_token_non_padded,
             logical_to_physical_map=logical_to_physical_map,
         )
+        return ref_w.to(weights_dtype), ref_i
 
     num_tokens, num_experts = gating_output.shape
     topk_weights = torch.empty(
-        (num_tokens, topk), dtype=torch.float32, device=gating_output.device
+        (num_tokens, topk), dtype=weights_dtype, device=gating_output.device
     )
     topk_ids = torch.empty(
         (num_tokens, topk), dtype=torch.int32, device=gating_output.device

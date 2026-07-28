@@ -20,21 +20,22 @@
 
 #include "cache/forward_cache_ops.h"
 
+#include <stdexcept>
+
 #include "resource/allocator/paged_cache_group.h"
 #include "scheduler/types.h"
 
 namespace tokenspeed {
 
-bool PrefillFirstChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables, const CoordinatorMatch& hit,
+bool PrefillFirstChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables, CoordinatorMatch&& hit,
                        std::int32_t num_new_tokens) {
-    coordinator.ClaimCommonPrefix(tables, hit);
+    coordinator.ClaimCommonPrefix(tables, std::move(hit));
     return coordinator.Acquire(tables, num_new_tokens);
 }
 
-std::vector<std::pair<CacheBlock*, CacheBlock*>> LoadHostExtension(KvCacheCoordinator& coordinator,
-                                                                   std::vector<BlockTable>& tables,
-                                                                   const CoordinatorMatch& host) {
-    return coordinator.LoadHostExtension(tables, host);
+std::vector<BlockTransfer> LoadHostExtension(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
+                                             CoordinatorMatch&& host) {
+    return coordinator.LoadHostExtension(tables, std::move(host));
 }
 
 bool PrefillChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
@@ -70,8 +71,22 @@ std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
         // family=State marks trailing-window prefix reuse and covers both SWA and
         // linear-attention groups; only a State group WITHOUT SlidingWindow
         // retention is a mamba-style state group.
-        if (group.family == PagedCacheGroupFamily::State &&
-            group.retention != PagedCacheGroupConfig::Retention::SlidingWindow) {
+        const bool final_state_manager = group.family == PagedCacheGroupFamily::State &&
+                                         group.retention != PagedCacheGroupConfig::Retention::SlidingWindow;
+        if (config.enable_flatkv_pd) {
+            const PagedCacheTransferPolicy expected =
+                final_state_manager ? PagedCacheTransferPolicy::LatestSnapshot : PagedCacheTransferPolicy::FullSuffix;
+            if (group.transfer_policy == PagedCacheTransferPolicy::Unspecified) {
+                throw std::invalid_argument("FlatKV PD cache group '" + group.group_id +
+                                            "' requires an explicit transfer_policy");
+            }
+            if (group.transfer_policy != expected) {
+                throw std::invalid_argument("FlatKV PD cache group '" + group.group_id +
+                                            "' transfer_policy does not match its scheduler "
+                                            "destination layout");
+            }
+        }
+        if (final_state_manager) {
             specs.push_back(KvCacheSpec{
                 .kind = AttnKind::kMambaState,
                 .block_size = block_size,

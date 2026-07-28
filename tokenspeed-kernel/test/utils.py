@@ -30,6 +30,64 @@ from tokenspeed_kernel.signature import FormatSignature, format_signatures
 SampleRegistration = tuple[dict, Callable]
 
 
+def make_mxfp4_moe_weights(
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    generator: torch.Generator,
+    *,
+    device: str = "cuda",
+    scale_range: tuple[int, int] = (120, 121),
+) -> dict[str, torch.Tensor]:
+    def scales(*shape: int) -> torch.Tensor:
+        return torch.randint(
+            *scale_range,
+            shape,
+            dtype=torch.uint8,
+            device=device,
+            generator=generator,
+        )
+
+    return {
+        "w13_weight": torch.randint(
+            0,
+            256,
+            (num_experts, 2 * intermediate_size, hidden_size // 2),
+            dtype=torch.uint8,
+            device=device,
+            generator=generator,
+        ),
+        "w13_scale": scales(num_experts, 2 * intermediate_size, hidden_size // 32),
+        "w2_weight": torch.randint(
+            0,
+            256,
+            (num_experts, hidden_size, intermediate_size // 2),
+            dtype=torch.uint8,
+            device=device,
+            generator=generator,
+        ),
+        "w2_scale": scales(num_experts, hidden_size, intermediate_size // 32),
+    }
+
+
+def make_round_robin_topk(
+    num_tokens: int,
+    num_experts: int,
+    top_k: int,
+    *,
+    device: str = "cuda",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    ids = (
+        torch.arange(num_tokens, device=device)[:, None]
+        + torch.arange(top_k, device=device)
+    ) % num_experts
+    weights = torch.arange(1, top_k + 1, device=device, dtype=torch.float32)
+    return (
+        (weights / weights.sum()).expand(num_tokens, -1).contiguous(),
+        ids.to(torch.int32),
+    )
+
+
 def dummy_impl(name: str) -> Callable:
     def impl(*args, **kwargs):
         return name

@@ -24,6 +24,11 @@ import numpy as np
 
 from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo
 from tokenspeed.runtime.pd.base.status import TransferPoll
+from tokenspeed.runtime.pd.flatkv import (
+    build_flatkv_page_manifest,
+    flatkv_manifest_page_ids,
+    validate_flatkv_manifest_pair,
+)
 from tokenspeed.runtime.pd.mooncake.prefill import (
     MooncakeKVManagerPrefill,
     MooncakeKVSender,
@@ -52,7 +57,9 @@ class DisaggPrefillExecutor:
                 (Forward.FlatForwardOp, self._decode),
             ]
         )
-        self.senders: dict[int, MooncakeKVSender] = {}
+        self.is_flatkv = kv_args.flat_layout is not None
+        self.flat_layout = kv_args.flat_layout
+        self.senders: dict[str, MooncakeKVSender] = {}
         self.kv_manager = MooncakeKVManagerPrefill(args, kv_args)
         self.gloo_group = gloo_group
         self._local_states = {}
@@ -72,6 +79,14 @@ class DisaggPrefillExecutor:
         spec_candidate_ids: list[int] | None = None,
     ) -> None:
         """Called by event_loop after prefill forward to record the first output token."""
+        if self.is_flatkv and spec_candidate_ids is not None:
+            raise NotImplementedError(
+                "FlatKV PD does not support speculative/MTP bootstrap candidates"
+            )
+        if self.is_flatkv and (
+            isinstance(token, bool) or not isinstance(token, int) or token < 0
+        ):
+            raise ValueError("FlatKV PD requires a non-negative bootstrap token")
         self._request_token[request_id] = token
         if spec_candidate_ids is not None:
             self._request_spec_candidate_ids[request_id] = spec_candidate_ids
@@ -91,6 +106,10 @@ class DisaggPrefillExecutor:
             self._layerwise_token_published.add(request_id)
 
     def register_layerwise_step_counter(self, step_counter, interval: int) -> None:
+        if self.is_flatkv:
+            raise NotImplementedError(
+                "FlatKV PD does not support layerwise cache transfer"
+            )
         self._layerwise_enabled = True
         self._layerwise_interval = max(int(interval), 1)
         self.kv_manager.register_layerwise_step_counter(
@@ -193,6 +212,8 @@ class DisaggPrefillExecutor:
         )
 
     def prepare_prefill(self, op) -> None:
+        if self.is_flatkv:
+            return
         if not self._layerwise_enabled or op.num_extends() == 0:
             return
         begin_cache_step = self.kv_manager.reserve_layerwise_cache_steps()
@@ -221,6 +242,9 @@ class DisaggPrefillExecutor:
             )
 
     def _decode(self, op):
+        if self.is_flatkv:
+            self._flat_decode(op)
+            return
         is_last = True
 
         for i, request_id in enumerate(op.request_ids):
@@ -274,7 +298,80 @@ class DisaggPrefillExecutor:
                 mamba_indices=mamba_indices,
             )
 
-    def register(self, request_id: str, bootstrap_info: BootstrapInfo):
+    def _flat_decode(self, op) -> None:
+        pending = []
+        for index, request_id in enumerate(op.request_ids):
+            sender = self.senders.get(request_id)
+            if sender is None:
+                continue
+            transfer_infos = self.kv_manager.transfer_infos.get(
+                sender.bootstrap_room, {}
+            )
+            destinations = [
+                info for info in transfer_infos.values() if not info.is_dummy
+            ]
+            if len(destinations) != 1:
+                raise RuntimeError(
+                    "FlatKV PD requires exactly one identity-routed destination"
+                )
+            destination = destinations[0]
+            if (
+                destination.flat_manifest is None
+                or destination.flat_peer_layout is None
+            ):
+                raise RuntimeError("FlatKV destination metadata is unavailable")
+            manifest = build_flatkv_page_manifest(
+                op,
+                layout=self.flat_layout,
+                request_row=index,
+                prefix_len=destination.flat_manifest.prefix_len,
+                prompt_len=destination.flat_manifest.prompt_len,
+            )
+            validate_flatkv_manifest_pair(
+                manifest,
+                destination.flat_manifest,
+                self.flat_layout,
+                dst_num_pages_with_null=(
+                    destination.flat_peer_layout.num_pages_with_null
+                ),
+            )
+            token = self._request_token.get(request_id)
+            if isinstance(token, bool) or not isinstance(token, int) or token < 0:
+                raise RuntimeError("FlatKV bootstrap token is unavailable")
+            page_ids = np.asarray(
+                flatkv_manifest_page_ids(
+                    manifest,
+                    layout=self.flat_layout,
+                    peer="source",
+                ),
+                dtype=np.int64,
+            )
+            pending.append(
+                (
+                    request_id,
+                    sender,
+                    op.request_pool_indices[index],
+                    token,
+                    manifest,
+                    page_ids,
+                )
+            )
+
+        for request_id, sender, aux_index, token, manifest, page_ids in pending:
+            sender.send(
+                page_ids,
+                aux_index,
+                True,
+                bootstrap_token=token,
+                flat_manifest=manifest,
+            )
+            self._request_token.pop(request_id, None)
+
+    def register(
+        self,
+        request_id: str,
+        bootstrap_info: BootstrapInfo,
+    ):
         self._local_states[request_id] = TransferPoll.Bootstrapping
         self._bootstrap(request_id, bootstrap_info)
 
@@ -283,6 +380,8 @@ class DisaggPrefillExecutor:
         (embedding receive timed out). Signal the dual-dispatched decode so its KV
         receiver fails instead of waiting forever. No sender was registered, so
         there is nothing to tear down on this side."""
+        if self.is_flatkv:
+            raise NotImplementedError("FlatKV PD does not support EPD admission")
         self.kv_manager.abort_room(
             bootstrap_info.bootstrap_room,
             f"EPD: prefill aborted request {request_id} (embedding receive timed out)",

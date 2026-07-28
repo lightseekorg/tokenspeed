@@ -194,9 +194,9 @@ struct ForwardState : public BaseState {
         }
         std::vector<std::int32_t> ids;
         for (const BlockTable& table : block_tables_) {
-            for (CacheBlock* b : table.Blocks()) {
-                if (!b->IsNull()) {
-                    ids.push_back(b->BlockId());
+            for (const BlockRef& block : table.Blocks()) {
+                if (block) {
+                    ids.push_back(block->BlockId());
                 }
             }
         }
