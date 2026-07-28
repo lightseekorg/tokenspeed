@@ -750,7 +750,7 @@ class MambaAttnBackend(AttentionBackend):
         self.flat_state_out_list: list[dict[str, torch.Tensor]] = []
         self._state_group_ids: tuple[str, ...] = ()
         self._state_group_for_layer: dict[int, str] = {}
-        # FlatKV contract path (FlatHybridCachePool): state group ids in
+        # FlatKV contract path: state group ids in
         # contract order; empty when not contract-bound.
         self._flat_contract_bound = False
         self._flat_state_group_ids: tuple[str, ...] = ()
@@ -767,7 +767,7 @@ class MambaAttnBackend(AttentionBackend):
         """Bind the (layer-mapped) KV pool. Two structurally gated flat modes:
 
         - FlatKV contract pool: the pool publishes a
-          ``runtime_contract`` (FlatHybridCachePool). Every ``family="state"``
+          ``runtime_contract``. Every ``family="state"``
           group becomes a KDA state group; the pool must resolve layers
           (``group_id_for_layer``) and per-layer component views
           (``get_component``). A contract with no state group is a hard

@@ -20,11 +20,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
+from tokenspeed.runtime.configs.lcm_memory_plan import LcmMemoryPlan
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.configs.paged_cache_spec import (
+    LINEAR_ATTENTION,
+    scheduler_ext_flat_kvcache,
+)
 from tokenspeed.runtime.layers.attention.configs.base import (
     BaseAttnConfig,
     resolve_dtype,
@@ -41,6 +46,16 @@ class MLAConfig(BaseAttnConfig):
     v_head_dim: int
     scaling: float
     kv_cache_dim: int
+    layer_types: tuple[str, ...] = field(default=(), kw_only=True)
+    layer_cache_group_ids: tuple[str, ...] = field(default=(), kw_only=True)
+    max_scheduled_tokens: int = field(default=0, kw_only=True)
+    pd_disaggregation_enabled: bool = field(default=False, kw_only=True)
+    conv_state_shape: tuple[int, ...] | None = field(default=None, kw_only=True)
+    recurrent_state_shape: tuple[int, ...] | None = field(default=None, kw_only=True)
+    conv_dtype: torch.dtype | None = field(default=None, kw_only=True)
+    recurrent_dtype: torch.dtype | None = field(default=None, kw_only=True)
+    lcm_memory_plan: LcmMemoryPlan | None = field(default=None, kw_only=True)
+    token_capacity: int | None = field(default=None, kw_only=True)
 
     @classmethod
     def generate(
@@ -52,6 +67,27 @@ class MLAConfig(BaseAttnConfig):
                 speculative_num_steps=server_args.speculative_num_steps,
                 speculative_num_draft_tokens=server_args.speculative_num_draft_tokens,
             )
+        hf_config = getattr(model_config, "hf_config", None)
+        text_config = getattr(hf_config, "text_config", hf_config)
+        layer_types = tuple(
+            getattr(hf_config, "paged_cache_layer_types", None)
+            or getattr(hf_config, "layer_types", None)
+            or ()
+        )
+        conv_state_shape = recurrent_state_shape = None
+        conv_dtype = recurrent_dtype = None
+        if (
+            scheduler_ext_flat_kvcache()
+            and LINEAR_ATTENTION in layer_types
+            and hasattr(text_config, "mamba2_cache_params")
+        ):
+            (
+                conv_state_shape,
+                recurrent_state_shape,
+                conv_dtype,
+                recurrent_dtype,
+                _,
+            ) = text_config.mamba2_cache_params
         return cls(
             device=server_args.device,
             context_len=model_config.context_len,
@@ -78,6 +114,16 @@ class MLAConfig(BaseAttnConfig):
             v_head_dim=model_config.v_head_dim,
             scaling=model_config.scaling,
             kv_cache_dim=model_config.kv_lora_rank + model_config.qk_rope_head_dim,
+            layer_types=layer_types,
+            max_scheduled_tokens=getattr(server_args, "chunked_prefill_size", 8192),
+            pd_disaggregation_enabled=getattr(
+                server_args, "disaggregation_mode", "null"
+            )
+            != "null",
+            conv_state_shape=conv_state_shape,
+            recurrent_state_shape=recurrent_state_shape,
+            conv_dtype=conv_dtype,
+            recurrent_dtype=recurrent_dtype,
             **kwargs,
         )
 
@@ -117,4 +163,14 @@ class MLAConfig(BaseAttnConfig):
             max_context_len=self.context_len,
             page_size=self.page_size,
             rank=rank,
+            layer_types=self.layer_types,
+            layer_cache_group_ids=self.layer_cache_group_ids,
+            max_scheduled_tokens=self.max_scheduled_tokens,
+            pd_disaggregation_enabled=self.pd_disaggregation_enabled,
+            conv_state_shape=self.conv_state_shape,
+            recurrent_state_shape=self.recurrent_state_shape,
+            conv_dtype=self.conv_dtype,
+            recurrent_dtype=self.recurrent_dtype,
+            lcm_memory_plan=self.lcm_memory_plan,
+            token_capacity=self.token_capacity,
         )

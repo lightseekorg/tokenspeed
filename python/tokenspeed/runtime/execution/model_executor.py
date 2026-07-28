@@ -280,7 +280,7 @@ class ModelExecutor:
         self.sampling_backend = sampling_backend
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
-        # FlatKV contract pools (FlatHybridCachePool) publish a runtime
+        # FlatKV contract pools publish a runtime
         # contract; on that path per-step tables travel as
         # FlatCacheBatchMetadata and the legacy req_to_page mirror is
         # forbidden.

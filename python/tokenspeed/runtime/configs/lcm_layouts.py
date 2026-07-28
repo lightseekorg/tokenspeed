@@ -25,6 +25,33 @@ from __future__ import annotations
 from tokenspeed.runtime.configs.lcm_memory_plan import LcmFieldSpec
 
 
+def mla_history_lcm_fields(
+    *,
+    layer_group_ids,
+    logical_block_tokens,
+    latent_width,
+    element_size,
+) -> tuple[LcmFieldSpec, ...]:
+    """Describe MLA latent-history fields."""
+    if logical_block_tokens <= 0 or latent_width <= 0 or element_size <= 0:
+        raise ValueError("MLA history geometry must be positive")
+    occurrences: dict[str, int] = {}
+    fields = []
+    for layer_id, group_id in enumerate(layer_group_ids):
+        slot = occurrences.get(group_id, 0)
+        occurrences[group_id] = slot + 1
+        fields.append(
+            LcmFieldSpec(
+                group_id,
+                f"layer.{layer_id}.latent_kv",
+                f"slot.{slot}",
+                (logical_block_tokens, 1, latent_width),
+                element_size,
+            )
+        )
+    return tuple(fields)
+
+
 def draft_history_lcm_fields(
     *,
     layer_group_ids,
@@ -324,4 +351,66 @@ def inkling_lcm_fields(
                     ),
                 )
             )
+    return tuple(fields)
+
+
+def kimi_k3_lcm_fields(
+    *,
+    layer_group_ids,
+    logical_block_tokens,
+    latent_width,
+    mla_element_size,
+    conv_shape,
+    conv_element_size,
+    recurrent_shape,
+    recurrent_element_size,
+) -> tuple[LcmFieldSpec, ...]:
+    """Describe Kimi-K3 MLA history and KDA state in 24 shared planes."""
+    if logical_block_tokens <= 0 or latent_width <= 0 or mla_element_size <= 0:
+        raise ValueError("Kimi-K3 MLA geometry must be positive")
+    if (
+        not conv_shape
+        or not recurrent_shape
+        or conv_element_size <= 0
+        or recurrent_element_size <= 0
+    ):
+        raise ValueError("Kimi-K3 KDA state geometry must be positive")
+
+    occurrences: dict[str, int] = {}
+    fields = []
+    for layer_id, group_id in enumerate(layer_group_ids):
+        slot = occurrences.get(group_id, 0)
+        occurrences[group_id] = slot + 1
+        plane_id = f"slot.{slot}"
+        if group_id == "full_attention":
+            fields.append(
+                LcmFieldSpec(
+                    group_id,
+                    f"layer.{layer_id}.latent_kv",
+                    plane_id,
+                    (logical_block_tokens, 1, latent_width),
+                    mla_element_size,
+                )
+            )
+            continue
+        fields.extend(
+            (
+                LcmFieldSpec(
+                    group_id,
+                    f"layer.{layer_id}.conv_state",
+                    plane_id,
+                    tuple(conv_shape),
+                    conv_element_size,
+                    exact_page_stride=False,
+                ),
+                LcmFieldSpec(
+                    group_id,
+                    f"layer.{layer_id}.recurrent_state",
+                    plane_id,
+                    tuple(recurrent_shape),
+                    recurrent_element_size,
+                    exact_page_stride=False,
+                ),
+            )
+        )
     return tuple(fields)

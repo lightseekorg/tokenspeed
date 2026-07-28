@@ -85,24 +85,41 @@ def scheduler_cache_geometry_from_pool(
     fallback_page_size: int,
 ) -> SchedulerCacheGeometry:
     contract = getattr(pool, "runtime_contract", None)
-    if contract is not None:
-        return SchedulerCacheGeometry(
-            page_size=contract.block_size,
-            num_device_pages=contract.num_device_pages_with_null,
-            num_usable_pages=contract.usable_pages,
-            token_capacity=contract.token_capacity,
-        )
     num_lcm_blocks = getattr(pool, "num_lcm_blocks", None)
     if num_lcm_blocks is not None:
         num_lcm_blocks = require_positive_int("num_lcm_blocks", num_lcm_blocks)
+        if contract is not None and contract.num_lcm_blocks != num_lcm_blocks:
+            raise ValueError("pool and runtime contract disagree on num_lcm_blocks")
         return SchedulerCacheGeometry(
-            page_size=require_positive_int("fallback_page_size", fallback_page_size),
+            page_size=require_positive_int(
+                "contract.block_size" if contract is not None else "fallback_page_size",
+                contract.block_size if contract is not None else fallback_page_size,
+            ),
             # Parent 0 is reserved as the null LCM block.
             num_device_pages=num_lcm_blocks + 1,
             num_usable_pages=num_lcm_blocks,
             token_capacity=require_positive_int(
-                "fallback_token_capacity", fallback_token_capacity
+                (
+                    "contract.token_capacity"
+                    if contract is not None
+                    else "fallback_token_capacity"
+                ),
+                (
+                    contract.token_capacity
+                    if contract is not None
+                    else fallback_token_capacity
+                ),
             ),
+        )
+    if contract is not None:
+        num_lcm_blocks = require_positive_int(
+            "contract.num_lcm_blocks", contract.num_lcm_blocks
+        )
+        return SchedulerCacheGeometry(
+            page_size=contract.block_size,
+            num_device_pages=num_lcm_blocks + 1,
+            num_usable_pages=num_lcm_blocks,
+            token_capacity=contract.token_capacity,
         )
     if fallback_page_size <= 0 or fallback_token_capacity <= 0:
         raise ValueError("fallback scheduler cache geometry must be positive")
@@ -466,6 +483,7 @@ def flat_block_tables_from_forward_op(
     num_reqs: int | None = None,
     expected_group_ids: tuple[str, ...] | None = None,
     max_page_id: int | None = None,
+    max_page_ids: Mapping[str, int] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Bridge the flat per-group block tables to GPU int32 tensors: absolute
     page indices, null hole = 0 preserved, ragged-row padding -1. No
@@ -483,7 +501,8 @@ def flat_block_tables_from_forward_op(
         device: Destination device for the packed tensor.
         num_reqs: Optional expected row count for every group.
         expected_group_ids: Optional contract order and exact key set.
-        max_page_id: Optional inclusive upper bound for page IDs.
+        max_page_id: Optional common inclusive upper bound for page IDs.
+        max_page_ids: Optional per-group inclusive upper bounds.
 
     Returns:
         Per-group tensor views in ``expected_group_ids`` order when supplied,
@@ -492,7 +511,13 @@ def flat_block_tables_from_forward_op(
     Raises:
         ValueError: If strict contract validation fails before device transfer.
     """
-    strict_validation = expected_group_ids is not None or max_page_id is not None
+    if max_page_id is not None and max_page_ids is not None:
+        raise ValueError("pass max_page_id or max_page_ids, not both")
+    strict_validation = (
+        expected_group_ids is not None
+        or max_page_id is not None
+        or max_page_ids is not None
+    )
     if strict_validation and num_reqs is not None:
         require_positive_int("num_reqs", num_reqs)
     if expected_group_ids is not None:
@@ -562,12 +587,17 @@ def flat_block_tables_from_forward_op(
             # rows-vs-num_reqs is checked once in the packing loop below.
             if arr.shape[1] == 0:
                 raise ValueError(f"flat group {group_id!r} has zero width")
-            if max_page_id is not None:
-                invalid = (arr < -1) | (arr > max_page_id)
+            group_max_page_id = (
+                max_page_ids.get(group_id) if max_page_ids is not None else max_page_id
+            )
+            if max_page_ids is not None and group_max_page_id is None:
+                raise ValueError(f"max_page_ids is missing flat group {group_id!r}")
+            if group_max_page_id is not None:
+                invalid = (arr < -1) | (arr > group_max_page_id)
                 if bool(invalid.any()):
                     raise ValueError(
                         f"flat group {group_id!r} contains a page ID outside "
-                        f"-1..{max_page_id}"
+                        f"-1..{group_max_page_id}"
                     )
     device = torch.device(device) if isinstance(device, str) else device
     out: dict[str, torch.Tensor] = {}

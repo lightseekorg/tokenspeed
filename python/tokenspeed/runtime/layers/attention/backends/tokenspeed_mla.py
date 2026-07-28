@@ -205,7 +205,7 @@ class CuteDSLMLABackend(AttentionBackend):
         """Mark this MLA backend as a Kimi-K3 FlatKV contract sub-backend.
 
         Called by the registry when the backend is constructed for the
-        FlatHybridCachePool contract path. Enables flat CUDA-graph
+        Kimi-K3 LCM contract path. Enables flat CUDA-graph
         capture/replay with stable full-attention block-table and write-location
         buffers; DeepSeek's shared backend is never marked and keeps the
         non-flat graph path unchanged.

@@ -270,7 +270,7 @@ def validate_flat_scheduler_config(
         # sample) — with slab-aliased layouts that silently corrupts KV
         # past the sliding window. Refuse at startup instead.
         #
-        # Contract pools (FlatHybridCachePool, Kimi-K3) are exempt from
+        # Contract pools (the Kimi-K3 LCM MLA pool) are exempt from
         # this flag check: their consumers travel FlatCacheBatchMetadata
         # (never the C++ single-table fallback or req_to_page) and are
         # validated by the family-coverage check below.
