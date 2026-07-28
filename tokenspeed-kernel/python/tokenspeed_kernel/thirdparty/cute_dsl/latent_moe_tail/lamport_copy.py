@@ -15,8 +15,10 @@ from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
 from .primitives import (
     VEC_BF16,
+    bf16x8_to_packed_u32x4,
     fragment_is_dirty,
     load_global_u32x4,
+    packed_u32x4_to_bf16x8,
     store_global_u32x4,
     store_lamport_sentinel_128,
     to_cute,
@@ -25,22 +27,31 @@ from .primitives import (
 
 
 class LamportCopy:
-    """Consume the local physical copy of an NVLS-multicast mailbox."""
+    """Consume the local physical copy of an NVLS-multicast mailbox.
 
-    def __init__(self, hidden_dim: int, ctas: int, threads: int):
+    With ``has_residual`` the copy fuses a same-shape addend into the gather
+    (``out = mailbox + residual``, fp32 add, bf16 round — the same rounding as
+    a separate eager add), absorbing the layer's residual accumulate.
+    """
+
+    def __init__(
+        self, hidden_dim: int, ctas: int, threads: int, has_residual: bool = False
+    ):
         self.hidden_dim = hidden_dim
         self.ctas = ctas
         self.threads = threads
+        self.has_residual = has_residual
 
     @cute.jit
     def __call__(
         self,
         symmetric_mailbox: cute.Tensor,
         local_output: cute.Tensor,
+        residual: cute.Tensor,
         m: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        self.kernel(symmetric_mailbox, local_output, m).launch(
+        self.kernel(symmetric_mailbox, local_output, residual, m).launch(
             grid=(self.ctas, 1, 1),
             block=(self.threads, 1, 1),
             stream=stream,
@@ -52,6 +63,7 @@ class LamportCopy:
         self,
         symmetric_mailbox: cute.Tensor,
         local_output: cute.Tensor,
+        residual: cute.Tensor,
         m: cutlass.Int32,
     ):
         # The CTA may be scheduled early, but mailbox inspection must not pass
@@ -76,6 +88,25 @@ class LamportCopy:
             packed = load_global_u32x4(source, volatile=True)
             while fragment_is_dirty(packed):
                 packed = load_global_u32x4(source, volatile=True)
+
+            if cutlass.const_expr(self.has_residual):
+                res_ptr = cute.make_ptr(
+                    cutlass.BFloat16,
+                    (residual.iterator + element).llvm_ptr,
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                res_packed = load_global_u32x4(res_ptr, volatile=False)
+                gathered = packed_u32x4_to_bf16x8(packed)
+                addend = packed_u32x4_to_bf16x8(res_packed)
+                fused = cute.make_rmem_tensor(
+                    cute.make_layout((VEC_BF16,)), cutlass.BFloat16
+                )
+                for i in cutlass.range_constexpr(VEC_BF16):
+                    fused[i] = (
+                        gathered[i].to(cutlass.Float32) + addend[i].to(cutlass.Float32)
+                    ).to(cutlass.BFloat16)
+                packed = bf16x8_to_packed_u32x4(fused.load())
 
             destination = cutlass.Int64((local_output.iterator + element).toint())
             store_global_u32x4(destination, packed, volatile=False)
@@ -105,6 +136,7 @@ def compile_kernel(
     ctas: int,
     threads: int,
     device_index: int,
+    has_residual: bool = False,
 ):
     if hidden_dim <= 0 or hidden_dim % VEC_BF16:
         raise ValueError("hidden_dim must be a positive multiple of 8")
@@ -123,10 +155,16 @@ def compile_kernel(
             (cute.sym_int32(divisibility=VEC_BF16),),
             assumed_align=16,
         )
+        residual = make_fake_compact_tensor(
+            cutlass.BFloat16,
+            (cute.sym_int32(divisibility=VEC_BF16),),
+            assumed_align=16,
+        )
         return cute.compile(
-            LamportCopy(hidden_dim, ctas, threads),
+            LamportCopy(hidden_dim, ctas, threads, has_residual),
             mailbox,
             output,
+            residual,
             cutlass.Int32(max_m),
             make_fake_stream(),
         )
@@ -141,6 +179,7 @@ def launch(
     max_m: int,
     ctas: int,
     threads: int,
+    residual: torch.Tensor | None = None,
 ) -> None:
     if not 1 <= m <= max_m:
         raise ValueError(f"runtime M={m} must be in [1, {max_m}]")
@@ -165,14 +204,30 @@ def launch(
     ):
         raise ValueError("local_output must be contiguous CUDA BF16 [1,M,H]")
 
+    if residual is not None and (
+        residual.shape != (m, hidden_dim)
+        or residual.dtype != torch.bfloat16
+        or residual.device != symmetric_mailbox.device
+        or not residual.is_contiguous()
+    ):
+        raise ValueError("residual must be contiguous CUDA BF16 [M,H]")
+
     device_index = symmetric_mailbox.device.index
     stream = cuda.CUstream(
         torch.cuda.current_stream(symmetric_mailbox.device).cuda_stream
     )
-    compile_kernel(hidden_dim, max_m, ctas, threads, device_index)(
+    residual_flat = local_output.flatten() if residual is None else residual.flatten()
+    compile_kernel(
+        hidden_dim, max_m, ctas, threads, device_index, residual is not None
+    )(
         to_cute(symmetric_mailbox.flatten(), 16),
         to_cute_dynamic_m(
             local_output.flatten(),
+            mode=0,
+            assumed_align=16,
+        ),
+        to_cute_dynamic_m(
+            residual_flat,
             mode=0,
             assumed_align=16,
         ),
@@ -196,15 +251,20 @@ class LamportCopyKernel:
         self.max_m = max_m
         self.ctas = ctas
         self.threads = threads
+        device_index = torch.accelerator.current_device_index()
+        compile_kernel(hidden_dim, max_m, ctas, threads, device_index)
         compile_kernel(
-            hidden_dim,
-            max_m,
-            ctas,
-            threads,
-            torch.accelerator.current_device_index(),
+            hidden_dim, max_m, ctas, threads, device_index, has_residual=True
         )
 
-    def __call__(self, symmetric_mailbox: torch.Tensor, *, m: int) -> torch.Tensor:
+    def __call__(
+        self,
+        symmetric_mailbox: torch.Tensor,
+        *,
+        m: int,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Gather the mailbox; with ``residual`` also fuse ``+ residual``."""
         if not symmetric_mailbox.is_cuda:
             raise ValueError("symmetric_mailbox must be a CUDA tensor")
         device = symmetric_mailbox.device
@@ -222,5 +282,6 @@ class LamportCopyKernel:
                 max_m=self.max_m,
                 ctas=self.ctas,
                 threads=self.threads,
+                residual=residual,
             )
         return output
