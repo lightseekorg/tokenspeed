@@ -56,7 +56,6 @@ Module hierarchy matches the checkpoint::
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import Iterable
 from functools import partial
 from typing import TYPE_CHECKING
@@ -1129,8 +1128,7 @@ class KimiLinearMoE(nn.Module):
         # decode batches; the replicated weight read drops to 1/tp per rank.
         self._latent_tail = None
         if (
-            os.environ.get("TOKENSPEED_K3_MULTICAST_TAIL", "1") == "1"
-            and not self.execution_plan.use_native
+            not self.execution_plan.use_native
             and self.routed_expert_norm is not None
             and mapping.moe.ep_size == 1
             and torch.distributed.is_initialized()
