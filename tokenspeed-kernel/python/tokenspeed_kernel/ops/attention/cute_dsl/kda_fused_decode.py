@@ -401,7 +401,14 @@ class KdaFusedDecodeKernel:
         s_k = smem.allocate_tensor(Float32, cute.make_layout((K,)))
         s_dec = smem.allocate_tensor(Float32, cute.make_layout((K,)))
         s_v = smem.allocate_tensor(Float32, cute.make_layout((BV,)))
-        s_norm = smem.allocate_tensor(Float32, cute.make_layout((_NUM_WARPS,)))
+        # Under the fused output norm at nv > 1 one extra tail slot receives
+        # the sibling's DSM o^2 partial. It must NOT alias s_norm[0..7]: the
+        # sibling's epilogue store is unordered against this block's phase-2
+        # reads of the L2 partials (q_inv/k_inv) — reusing s_norm[CPL] was a
+        # cross-CTA WAR race (racecheck: WAR at s_norm+CPL*4, DSM store from
+        # the sibling's tid 0 vs the local q_inv reads).
+        norm_slots = _NUM_WARPS + (1 if (self.apply_onorm and self.nv > 1) else 0)
+        s_norm = smem.allocate_tensor(Float32, cute.make_layout((norm_slots,)))
         # Row-major so partial writes and per-lane column reads are shared
         # memory bank conflict free.
         s_red_t = smem.allocate_tensor(
@@ -596,10 +603,13 @@ class KdaFusedDecodeKernel:
             # arrive would additionally drain the in-flight cp.async state
             # stream and cost ~0.6us; the Triton megafusion instead relies on
             # same-wave residency, which stops holding beyond one wave.)
-            # With the fused output norm the arrive moves into the epilogue
-            # (it must also publish the DSM o^2 partial), so it is skipped
-            # here in that configuration.
-            if cutlass.const_expr(self.nv > 1 and not self.apply_onorm):
+            # Under the fused output norm this early arrive additionally
+            # anchors phase A of a two-phase cluster handshake: the epilogue
+            # WAITS on it before its DSM store, guaranteeing the sibling has
+            # entered the kernel (a shared::cluster store to a CTA that has
+            # not begun execution is an illegal memory access) and that its
+            # conv-window reads are complete.
+            if cutlass.const_expr(self.nv > 1):
                 cute.arch.cluster_arrive_relaxed()
 
             # ---- phase 2: delta-rule recurrence over the state slab ----
@@ -702,8 +712,10 @@ class KdaFusedDecodeKernel:
                 # — a tiny, favorable difference).
                 part = cute.arch.warp_reduction_sum(o_val * o_val)
                 if lane == 0 and warp < CPL:
-                    # s_norm's L2 partials are long consumed (q_inv/k_inv
-                    # live in registers since before pass 1).
+                    # Local reuse of s_norm[0..CPL-1] is safe: every thread's
+                    # q_inv/k_inv reads of the L2 partials precede the block
+                    # barriers above (in-block ordering only — the sibling's
+                    # partial lands in the dedicated tail slot, never here).
                     s_norm[warp] = part
                 cute.arch.barrier()
                 ssq = s_norm[0]
@@ -711,16 +723,23 @@ class KdaFusedDecodeKernel:
                     ssq += s_norm[wsl]
                 if cutlass.const_expr(self.nv > 1):
                     # Exchange the block-local o^2 partial with the sibling
-                    # through distributed shared memory; the release-arrive /
-                    # acquire-wait pair publishes it AND still orders the
-                    # sibling's early conv-window reads before the tail
-                    # stores (single cluster-barrier phase, two jobs).
+                    # through distributed shared memory, in two cluster
+                    # phases. Phase A (arrive: the early relaxed arrive after
+                    # the front barrier; wait: here) proves the sibling has
+                    # entered the kernel before we store into its shared
+                    # memory — a shared::cluster store to a CTA that has not
+                    # begun execution faults — and orders its conv-window
+                    # reads before the tail stores. Phase B (release-arrive /
+                    # acquire-wait around the store) publishes the partial.
+                    cute.arch.cluster_wait()
                     if tid == 0:
-                        peer = map_shared_to_peer(s_norm.iterator + CPL, Int32(1) - i_v)
+                        peer = map_shared_to_peer(
+                            s_norm.iterator + _NUM_WARPS, Int32(1) - i_v
+                        )
                         store_shared_cluster_f32(peer, ssq)
                     cute.arch.cluster_arrive()
                     cute.arch.cluster_wait()
-                    ssq += s_norm[CPL]
+                    ssq += s_norm[_NUM_WARPS]
                 rsig = cute.math.rsqrt(
                     ssq * Float32(1.0 / V) + Float32(self.onorm_eps),
                     fastmath=True,

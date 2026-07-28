@@ -185,6 +185,10 @@ class TestKdaFusedDecodeCutedsl:
     def test_cuda_graph_capture(self, bs):
         x = _make_inputs(bs, seed=8)
         stream = torch.cuda.Stream()
+        # Order the side-stream launches after the default-stream input
+        # producers (randn/randperm): without this the kernel can read
+        # garbage page indices under load and fault OOB.
+        stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             for _ in range(3):
                 _run(_clone(x))
@@ -291,6 +295,10 @@ class TestKdaFusedDecodeCutedsl:
     def test_onorm_cuda_graph_capture(self, bs):
         x = _make_inputs(bs, seed=34)
         stream = torch.cuda.Stream()
+        # Order the side-stream launches after the default-stream input
+        # producers (randn/randperm): without this the kernel can read
+        # garbage page indices under load and fault OOB.
+        stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             for _ in range(3):
                 _run(_clone(x), onorm=_onorm_request(x))
