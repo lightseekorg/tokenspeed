@@ -73,8 +73,7 @@ def test_kimi_k3_pool_binds_mla_and_kda_to_one_lcm_backing() -> None:
     assert pool.runtime_contract is not None
     assert pool.runtime_contract.token_capacity == 1024
     assert {
-        spec.group_id: spec.transfer_policy
-        for spec in pool.paged_cache_group_specs
+        spec.group_id: spec.transfer_policy for spec in pool.paged_cache_group_specs
     } == {
         FULL_ATTENTION: "full_suffix",
         f"{LINEAR_ATTENTION}_0": "latest_snapshot",

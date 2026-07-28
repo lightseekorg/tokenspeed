@@ -60,6 +60,8 @@ class FlatCacheGroupsMixin:
     :meth:`_init_flat_graph_buffers` from ``init_cuda_graph_state``.
     """
 
+    flat_cache_consumer_families = frozenset({"history"})
+
     # family="state" group ids (GDN/mamba state pages); learned from the
     # pool's specs in init_cuda_graph_state, shed from every table here.
     flat_state_group_ids: frozenset[str] = frozenset()

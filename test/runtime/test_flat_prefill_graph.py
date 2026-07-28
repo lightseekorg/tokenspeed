@@ -145,6 +145,40 @@ class DummyFlatTablesTest(unittest.TestCase):
         pool = SimpleNamespace(paged_cache_group_specs=())
         self.assertEqual(self._bare(backend, pool)._dummy_flat_tables(64), {})
 
+    def test_runtime_contract_pool_is_eligible_for_capture(self):
+        from unittest import mock
+
+        inner_model = SimpleNamespace(embed_tokens=object())
+        model_runner = SimpleNamespace(
+            model=SimpleNamespace(model=inner_model),
+            is_generation=True,
+            is_multimodal=False,
+        )
+        config = SimpleNamespace(
+            enforce_eager=False,
+            disable_prefill_graph=False,
+            data_parallel_size=1,
+        )
+        pool = SimpleNamespace(runtime_contract=object())
+        with (
+            mock.patch(
+                "tokenspeed.runtime.execution.prefill_graph.get_prefill_token_buckets",
+                return_value=[64],
+            ),
+            mock.patch.object(self.PrefillGraph, "capture") as capture,
+        ):
+            graph = self.PrefillGraph(
+                model_runner=model_runner,
+                attn_backend=object(),
+                token_to_kv_pool=pool,
+                input_buffers=object(),
+                config=config,
+                req_to_page=object(),
+            )
+
+        self.assertFalse(graph.disable)
+        capture.assert_called_once()
+
 
 class TrtllmPrefillGraphSeamsTest(unittest.TestCase):
     """trtllm under the prefill graph: the extend prewrite must not bake
@@ -175,6 +209,12 @@ class TrtllmPrefillGraphSeamsTest(unittest.TestCase):
             self.mod, "is_breakable_capture_active", return_value=True
         ):
             self.assertFalse(b.support_kv_cache_prewrite(None))
+
+    def test_declares_history_contract_family(self):
+        self.assertEqual(
+            self.mod.TRTLLMMHAAttnBackend.flat_cache_consumer_families,
+            frozenset({"history"}),
+        )
 
 
 if __name__ == "__main__":

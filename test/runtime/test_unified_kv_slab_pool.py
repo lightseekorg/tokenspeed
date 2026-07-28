@@ -566,6 +566,20 @@ class LcmPoolFieldBindingTest(unittest.TestCase):
             .data_ptr(),
         )
 
+    def test_lcm_pool_publishes_runtime_contract_and_component_mapping(self):
+        pool = self._pool()
+
+        self.assertEqual(pool.runtime_contract.block_size, 4)
+        self.assertEqual(pool.runtime_contract.num_lcm_blocks, 1)
+        self.assertEqual(
+            pool.runtime_contract.group_page_counts,
+            {"linear_attention_0": 3, "full_attention": 2},
+        )
+        self.assertEqual(pool.group_id_for_layer(0), "linear_attention_0")
+        conv, ssm = pool.get_state_buffers(0)
+        self.assertIs(pool.get_component(0, "conv_state"), conv)
+        self.assertIs(pool.get_component(0, "recurrent_state"), ssm)
+
     def test_pool_rejects_unknown_state_layer_and_field(self):
         pool = self._pool()
 

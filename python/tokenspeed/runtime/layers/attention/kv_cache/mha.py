@@ -33,6 +33,9 @@ from tokenspeed_kernel.ops.kvcache.triton import (
 )
 
 from tokenspeed.runtime.configs import paged_cache_spec
+from tokenspeed.runtime.configs.flat_cache_runtime import (
+    FlatPagedCacheRuntimeContract,
+)
 from tokenspeed.runtime.configs.lcm_memory_plan import LcmMemoryPlan
 from tokenspeed.runtime.configs.paged_cache_spec import hybrid_slab_group_size
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
@@ -129,6 +132,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         )
         self._layer_types = tuple(layer_types or ())
         self.layer_cache_group_ids = tuple(layer_cache_group_ids or ())
+        self._group_ids_by_layer = dict(enumerate(self.layer_cache_group_ids))
         self._lcm_memory_plan = lcm_memory_plan
         self.flat_kv_requires_page_zeroing = self._lcm_memory_plan is not None
         self.lcm_pool: LcmCachePool | None = None
@@ -233,6 +237,17 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                 )
             self.paged_cache_group_specs = tuple(specs)
             self.paged_cache_group_page_counts = counts
+        self.runtime_contract = (
+            FlatPagedCacheRuntimeContract(
+                block_size=self.page_size,
+                num_lcm_blocks=self._lcm_memory_plan.num_lcm_blocks,
+                token_capacity=self.size,
+                group_specs=self.paged_cache_group_specs,
+                group_page_counts=self.paged_cache_group_page_counts,
+            )
+            if self._lcm_memory_plan is not None and self.paged_cache_group_specs
+            else None
+        )
         # Slab aliasing is only safe under the single-BlockPool ownership the
         # published groups configure.
         assert self._slab_group_size is None or self.paged_cache_group_specs
@@ -777,6 +792,20 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             return self._state_buffers_by_layer[layer_id]
         except KeyError as exc:
             raise ValueError(f"layer {layer_id} has no bound LCM state fields") from exc
+
+    def group_id_for_layer(self, layer_id: int) -> str:
+        try:
+            return self._group_ids_by_layer[layer_id]
+        except KeyError as exc:
+            raise ValueError(f"layer {layer_id} has no cache group") from exc
+
+    def get_component(self, layer_id: int, component_name: str) -> torch.Tensor:
+        conv, recurrent = self.get_state_buffers(layer_id)
+        if component_name == "conv_state":
+            return conv
+        if component_name == "recurrent_state":
+            return recurrent
+        raise ValueError(f"unknown state component {component_name!r}")
 
     def set_kv_buffer(
         self,
