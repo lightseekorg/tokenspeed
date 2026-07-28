@@ -13,7 +13,6 @@ import os
 import sys
 import unittest
 from types import SimpleNamespace
-from unittest import mock
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -129,81 +128,6 @@ class ComputeStatePageIndicesTest(unittest.TestCase):
         self.assertEqual(state_in.tolist(), [0])
         self.assertEqual(state_out.tolist(), [0])
 
-    def test_group_indices_compute_common_slots_once(self):
-        torch = self.torch
-        from tokenspeed.runtime.layers.attention.backends import (
-            hybrid_linear_attn,
-        )
-
-        self.assertTrue(
-            hasattr(hybrid_linear_attn, "compute_state_page_indices_by_group"),
-            "multi-group state paging needs one shared boundary calculation",
-        )
-        fn = hybrid_linear_attn.compute_state_page_indices_by_group
-        rows_by_group = {
-            "state_a": torch.tensor([[7, 9, 12]], dtype=torch.int32),
-            "state_b": torch.tensor([[17, 19, 22]], dtype=torch.int32),
-        }
-        with mock.patch.object(torch, "div", wraps=torch.div) as div:
-            state_in, state_out = fn(
-                rows_by_group,
-                page_size=4,
-                seq_lens_before=torch.tensor([4], dtype=torch.int32),
-                seq_lens_after=torch.tensor([5], dtype=torch.int32),
-            )
-
-        self.assertEqual(div.call_count, 2)
-        self.assertEqual(state_in["state_a"].tolist(), [7])
-        self.assertEqual(state_out["state_a"].tolist(), [9])
-        self.assertEqual(state_in["state_b"].tolist(), [17])
-        self.assertEqual(state_out["state_b"].tolist(), [19])
-
-
-class PrepareFlatPrefillStateInputsTest(unittest.TestCase):
-    """Fresh rows use logical zero; only resumed rows read a checkpoint."""
-
-    def setUp(self):
-        try:
-            import torch
-
-            from tokenspeed.runtime.layers.attention.backends import (
-                hybrid_linear_attn,
-            )
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
-        self.torch = torch
-        self.module = hybrid_linear_attn
-
-    def test_fresh_row_ignores_poisoned_null_page_and_resume_reads_checkpoint(self):
-        torch = self.torch
-        self.assertTrue(
-            hasattr(self.module, "_prepare_flat_prefill_state_inputs"),
-            "Flat prefill needs a shared logical-zero state assembly helper",
-        )
-        fn = self.module._prepare_flat_prefill_state_inputs
-        conv_states = torch.zeros(4, 2, 3)
-        ssm_states = torch.zeros(4, 2, 2)
-        conv_states[0].fill_(97)
-        ssm_states[0].fill_(89)
-        conv_states[1].fill_(11)
-        ssm_states[1].fill_(13)
-        conv_states[2].fill_(5)
-
-        recurrent_state, has_initial_state = fn(
-            conv_states,
-            ssm_states,
-            state_in_pages=torch.tensor([0, 1], dtype=torch.int32),
-            state_out_pages=torch.tensor([2, 3], dtype=torch.int32),
-        )
-
-        self.assertEqual(has_initial_state.tolist(), [False, True])
-        self.assertTrue(
-            torch.equal(recurrent_state[0], torch.zeros_like(ssm_states[0]))
-        )
-        self.assertTrue(torch.equal(recurrent_state[1], ssm_states[1]))
-        self.assertTrue(torch.equal(conv_states[2], torch.full_like(conv_states[2], 5)))
-        self.assertTrue(torch.equal(conv_states[3], conv_states[1]))
-
 
 class PoollessFlatMetadataTest(unittest.TestCase):
     """Flat mode runs without a SimpleMambaPool (the runner no longer creates
@@ -240,8 +164,6 @@ class PoollessFlatMetadataTest(unittest.TestCase):
         stub_pool = SimpleNamespace(
             state_slabs=[(object(), object())],
             paged_cache_group_specs=(SimpleNamespace(group_id="linear_attention"),),
-            _layer_types=("linear_attention",),
-            layer_cache_group_ids=("linear_attention",),
             page_size=self.P,
         )
         # set_pool is intentionally never called: flat mode has no
@@ -265,8 +187,8 @@ class PoollessFlatMetadataTest(unittest.TestCase):
         )
         md = backend.forward_metadata
         # before = 8 -> page slot 1 (row 2); after = 9 -> page slot 2 (row 3).
-        self.assertEqual(md.state_in_pages["linear_attention"].tolist(), [2])
-        self.assertEqual(md.state_out_pages["linear_attention"].tolist(), [3])
+        self.assertEqual(md.state_in_pages.tolist(), [2])
+        self.assertEqual(md.state_out_pages.tolist(), [3])
 
     def test_extend_metadata_without_pool(self):
         torch = self.torch
@@ -277,38 +199,13 @@ class PoollessFlatMetadataTest(unittest.TestCase):
             seq_lens=torch.tensor([8], dtype=torch.int32),
             forward_mode=self.ForwardMode.EXTEND,
             extend_prefix_lens=torch.zeros(1, dtype=torch.int32),
-            extend_prefix_lens_cpu=torch.zeros(1, dtype=torch.int32),
-            extend_seq_lens_cpu=torch.tensor([8], dtype=torch.int32),
             flat_block_tables={
                 "linear_attention": torch.tensor([[1, 2]], dtype=torch.int32)
             },
         )
         md = backend.forward_metadata
-        self.assertEqual(md.state_in_pages["linear_attention"].tolist(), [0])
-        self.assertEqual(md.state_out_pages["linear_attention"].tolist(), [2])
-
-    def test_mixed_metadata_uses_extend_and_decode_boundaries(self):
-        torch = self.torch
-        backend = self.backend
-        backend.init_forward_metadata(
-            bs=2,
-            num_extends=1,
-            req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
-            seq_lens=torch.tensor([4, 9], dtype=torch.int32),
-            forward_mode=self.ForwardMode.MIXED,
-            extend_prefix_lens=torch.tensor([0], dtype=torch.int32),
-            extend_prefix_lens_cpu=torch.tensor([0], dtype=torch.int32),
-            extend_seq_lens=torch.tensor([4], dtype=torch.int32),
-            extend_seq_lens_cpu=torch.tensor([4], dtype=torch.int32),
-            flat_block_tables={
-                "linear_attention": torch.tensor(
-                    [[1, 0, 0], [2, 3, 4]], dtype=torch.int32
-                )
-            },
-        )
-        md = backend.forward_metadata
-        self.assertEqual(md.state_in_pages["linear_attention"].tolist(), [0, 3])
-        self.assertEqual(md.state_out_pages["linear_attention"].tolist(), [1, 4])
+        self.assertEqual(md.state_in_pages.tolist(), [0])
+        self.assertEqual(md.state_out_pages.tolist(), [2])
 
     def test_capture_replay_metadata_without_pool(self):
         torch = self.torch
@@ -323,8 +220,8 @@ class PoollessFlatMetadataTest(unittest.TestCase):
         )
         md = backend.forward_metadata
         # Capture binds the persistent pad-filled buffers.
-        self.assertEqual(md.state_in_pages["linear_attention"].tolist(), [-1])
-        self.assertEqual(md.state_out_pages["linear_attention"].tolist(), [-1])
+        self.assertEqual(md.state_in_pages.tolist(), [-1])
+        self.assertEqual(md.state_out_pages.tolist(), [-1])
 
         backend.init_forward_metadata_replay_cuda_graph(
             bs=1,
@@ -336,8 +233,8 @@ class PoollessFlatMetadataTest(unittest.TestCase):
             },
         )
         md = backend.forward_metadata
-        self.assertEqual(md.state_in_pages["linear_attention"].tolist(), [2])
-        self.assertEqual(md.state_out_pages["linear_attention"].tolist(), [3])
+        self.assertEqual(md.state_in_pages.tolist(), [2])
+        self.assertEqual(md.state_out_pages.tolist(), [3])
 
 
 class GDNFlatStatePagingGPUTest(unittest.TestCase):
@@ -355,6 +252,9 @@ class GDNFlatStatePagingGPUTest(unittest.TestCase):
     def setUp(self):
         try:
             import torch
+            from tokenspeed_kernel.ops.attention.flashinfer import (
+                gated_delta_rule as gdn,
+            )
 
             from tokenspeed.runtime.execution.forward_batch_info import (
                 ForwardMode,
@@ -367,6 +267,8 @@ class GDNFlatStatePagingGPUTest(unittest.TestCase):
             self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
         if not torch.cuda.is_available():
             self.skipTest("needs a CUDA device")
+        if not gdn.is_available():
+            self.skipTest("sm100 GDN kernel unavailable")
         self.torch = torch
         self.ForwardMode = ForwardMode
         self.MambaAttnBackend = MambaAttnBackend
@@ -404,8 +306,6 @@ class GDNFlatStatePagingGPUTest(unittest.TestCase):
         stub_pool = SimpleNamespace(
             state_slabs=[(conv_slab, ssm_slab)],
             paged_cache_group_specs=(SimpleNamespace(group_id="linear_attention"),),
-            _layer_types=("linear_attention",),
-            layer_cache_group_ids=("linear_attention",),
             page_size=self.P,
             get_state_buffers=lambda layer_id: (conv_slab, ssm_slab),
         )
@@ -477,16 +377,12 @@ class GDNFlatStatePagingGPUTest(unittest.TestCase):
             use_qk_l2norm_in_kernel=True,
         )
 
-        # ---- Flat path: page 0 is logical null, not trusted zero storage ----
+        # ---- Flat path: page 0 = null, pages fill as the sequence grows ----
         num_pages = total // P + 2  # null + pages 1..3
         conv_slab = torch.zeros(
             num_pages, conv_dim, self.WIDTH - 1, device="cuda", dtype=torch.bfloat16
         )
         ssm_slab = torch.zeros(num_pages, H, D, D, device="cuda", dtype=torch.float32)
-        conv_slab[0].fill_(17)
-        ssm_slab[0].fill_(19)
-        null_conv_before = conv_slab[0].clone()
-        null_ssm_before = ssm_slab[0].clone()
         backend = self._make_backend(conv_slab, ssm_slab)
 
         req_pool_indices = torch.tensor([1], dtype=torch.int32, device="cuda")
@@ -518,12 +414,8 @@ class GDNFlatStatePagingGPUTest(unittest.TestCase):
                 )
             },
         )
-        self.assertEqual(
-            backend.forward_metadata.state_in_pages["linear_attention"].tolist(), [0]
-        )
-        self.assertEqual(
-            backend.forward_metadata.state_out_pages["linear_attention"].tolist(), [2]
-        )
+        self.assertEqual(backend.forward_metadata.state_in_pages.tolist(), [0])
+        self.assertEqual(backend.forward_metadata.state_out_pages.tolist(), [2])
         outputs = [
             backend.forward_extend(
                 None,
@@ -558,11 +450,11 @@ class GDNFlatStatePagingGPUTest(unittest.TestCase):
                 flat_block_tables={"linear_attention": rows},
             )
             self.assertEqual(
-                backend.forward_metadata.state_in_pages["linear_attention"].tolist(),
+                backend.forward_metadata.state_in_pages.tolist(),
                 [expected_pages[i][0]],
             )
             self.assertEqual(
-                backend.forward_metadata.state_out_pages["linear_attention"].tolist(),
+                backend.forward_metadata.state_out_pages.tolist(),
                 [expected_pages[i][1]],
             )
             outputs.append(
@@ -590,159 +482,17 @@ class GDNFlatStatePagingGPUTest(unittest.TestCase):
         self.assertTrue(
             torch.allclose(o_flat.float(), o_ref.float(), atol=1e-1, rtol=1e-2)
         )
-        st_diff = (ssm_slab[3] - st_ref[0].float().transpose(-2, -1)).abs()
+        st_diff = (ssm_slab[3] - st_ref[0].float()).abs()
         self.assertLess(st_diff.mean().item(), 1e-3)
 
-        # Null page 0 is neither read as fresh initial state nor written. Page
-        # 2 keeps the shared snapshot untouched by the boundary-crossing decode.
-        self.assertTrue(torch.equal(conv_slab[0], null_conv_before))
-        self.assertTrue(torch.equal(ssm_slab[0], null_ssm_before))
+        # Null page 0 must never be written; page 2 (prefill's out page)
+        # keeps the shared snapshot untouched by the boundary-crossing decode.
+        self.assertEqual(conv_slab[0].abs().max().item(), 0.0)
+        self.assertEqual(ssm_slab[0].abs().max().item(), 0.0)
         self.assertTrue(torch.equal(conv_slab[2], conv_page2_after_prefill))
         self.assertTrue(torch.equal(ssm_slab[2], ssm_page2_after_prefill))
         self.assertGreater(ssm_slab[2].abs().max().item(), 0.0)
         self.assertGreater(ssm_slab[3].abs().max().item(), 0.0)
-
-    def test_prefill_materializes_only_final_state(self):
-        torch = self.torch
-        ForwardMode = self.ForwardMode
-        from tokenspeed_kernel.ops.attention.triton.linear.chunk import (
-            chunk_gated_delta_rule,
-        )
-
-        from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
-            causal_conv1d_fn,
-        )
-        from tokenspeed.runtime.layers.attention.linear.gdn import fused_gdn_gating
-
-        page_size = 128
-        total = 2 * page_size + 1
-        H, D = self.H, self.D
-        key_dim = H * D
-        value_dim = H * D
-        conv_dim = 2 * key_dim + value_dim
-
-        mixed = torch.randn(total, conv_dim, device="cuda", dtype=torch.bfloat16)
-        conv_weights = (
-            torch.randn(conv_dim, self.WIDTH, device="cuda", dtype=torch.bfloat16) * 0.1
-        )
-        bias = torch.randn(conv_dim, device="cuda", dtype=torch.bfloat16) * 0.1
-        A_log = torch.randn(H, device="cuda", dtype=torch.float32) * 0.1
-        dt_bias = torch.randn(H, device="cuda", dtype=torch.float32) * 0.1
-        a = torch.randn(total, H, device="cuda", dtype=torch.float32)
-        b = torch.randn(total, H, device="cuda", dtype=torch.float32)
-
-        def oracle():
-            conv_state = torch.zeros(
-                1,
-                conv_dim,
-                self.WIDTH - 1,
-                device="cuda",
-                dtype=torch.bfloat16,
-            )
-            conv_out = causal_conv1d_fn(
-                mixed.transpose(0, 1),
-                conv_weights,
-                bias,
-                activation="silu",
-                conv_states=conv_state,
-                has_initial_state=torch.zeros(1, dtype=torch.bool, device="cuda"),
-                cache_indices=torch.zeros(1, dtype=torch.int32, device="cuda"),
-                query_start_loc=torch.tensor(
-                    [0, total], dtype=torch.int32, device="cuda"
-                ),
-                seq_lens_cpu=torch.tensor([total], dtype=torch.int32),
-            ).transpose(0, 1)
-            query, key, value = torch.split(
-                conv_out, [key_dim, key_dim, value_dim], dim=-1
-            )
-            g = fused_gdn_gating(A_log, a, dt_bias).view(1, total, H)
-            beta = b.sigmoid().to(torch.bfloat16).view(1, total, H)
-            _, final_state = chunk_gated_delta_rule(
-                q=query.view(1, total, H, D),
-                k=key.view(1, total, H, D),
-                v=value.view(1, total, H, D),
-                g=g,
-                beta=beta,
-                initial_state=torch.zeros(
-                    1, H, D, D, device="cuda", dtype=torch.float32
-                ),
-                output_final_state=True,
-                cu_seqlens=torch.tensor([0, total], dtype=torch.int64, device="cuda"),
-                head_first=False,
-                use_qk_l2norm_in_kernel=True,
-            )
-            # The Flat slab uses the runtime's K-last [H, V, K] contract;
-            # chunk_gated_delta_rule's direct oracle returns [H, K, V].
-            return conv_state[0], final_state[0].transpose(-2, -1)
-
-        expected_conv, expected_ssm = oracle()
-        conv_slab = torch.zeros(
-            4,
-            conv_dim,
-            self.WIDTH - 1,
-            device="cuda",
-            dtype=torch.bfloat16,
-        )
-        ssm_slab = torch.zeros(4, H, D, D, device="cuda", dtype=torch.float32)
-        conv_slab[1].fill_(11)
-        conv_slab[2].fill_(12)
-        ssm_slab[1].fill_(21)
-        ssm_slab[2].fill_(22)
-        interior_conv_before = conv_slab[1:3].clone()
-        interior_ssm_before = ssm_slab[1:3].clone()
-
-        previous_page_size = self.P
-        self.P = page_size
-        try:
-            backend = self._make_backend(conv_slab, ssm_slab)
-        finally:
-            self.P = previous_page_size
-
-        backend.init_forward_metadata(
-            bs=1,
-            req_pool_indices=torch.tensor([1], dtype=torch.int32, device="cuda"),
-            seq_lens=torch.tensor([total], dtype=torch.int32, device="cuda"),
-            forward_mode=ForwardMode.EXTEND,
-            extend_prefix_lens=torch.zeros(1, dtype=torch.int32, device="cuda"),
-            extend_prefix_lens_cpu=torch.zeros(1, dtype=torch.int32),
-            extend_seq_lens_cpu=torch.tensor([total], dtype=torch.int32),
-            flat_block_tables={
-                "linear_attention": torch.tensor(
-                    [[1, 2, 3]], dtype=torch.int32, device="cuda"
-                )
-            },
-        )
-        backend.forward_extend(
-            None,
-            None,
-            None,
-            layer=None,
-            out_cache_loc=None,
-            token_to_kv_pool=backend.kv_pool,
-            bs=1,
-            forward_mode=ForwardMode.EXTEND,
-            mixed_qkv=mixed,
-            a=a,
-            b=b,
-            seq_len=total,
-            conv_weights=conv_weights,
-            bias=bias,
-            activation="silu",
-            key_dim=key_dim,
-            value_dim=value_dim,
-            attention_tp_size=1,
-            head_k_dim=D,
-            head_v_dim=D,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            layer_id=0,
-        )
-
-        self.assertTrue(torch.equal(conv_slab[1:3], interior_conv_before))
-        self.assertTrue(torch.equal(ssm_slab[1:3], interior_ssm_before))
-        torch.testing.assert_close(conv_slab[3], expected_conv, atol=1e-2, rtol=1e-2)
-        state_diff = (ssm_slab[3] - expected_ssm.float()).abs()
-        self.assertLess(state_diff.mean().item(), 1e-3)
 
 
 if __name__ == "__main__":

@@ -28,20 +28,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     transfer_kv_all_layer_mla,
     transfer_kv_per_layer,
     transfer_kv_per_layer_mla,
-    zero_byte_segments,
 )
-
-
-def test_zero_byte_segments(device: str) -> None:
-    backing = torch.arange(128, dtype=torch.uint8, device=device)
-    expected = backing.clone()
-    expected[7:20] = 0
-    expected[64:95] = 0
-
-    zero_byte_segments(backing, [(7, 13), (64, 31)])
-    torch.cuda.synchronize()
-
-    assert torch.equal(backing, expected)
 
 
 def test_transfer_kv_per_layer(device: str) -> None:

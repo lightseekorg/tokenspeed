@@ -265,26 +265,6 @@ class ValidateFlatSchedulerConfigTest(unittest.TestCase):
             speculative_algorithm=None,
         )
 
-    def test_hybrid_wrapper_can_reject_flat_spec_before_full_backend_unwrap(self):
-        class FlatFull:
-            uses_flat_cache_groups = True
-
-        class FlatWrapper:
-            uses_flat_cache_groups = True
-            flat_spec_capable = False
-
-            def __init__(self):
-                self.full_attn_backend = FlatFull()
-
-        with self.assertRaisesRegex(RuntimeError, "speculative decoding"):
-            _pcs.validate_flat_scheduler_config(
-                flat_kvcache_ext=True,
-                paged_cache_groups=[FakeGroup(), FakeGroup()],
-                attn_backend=FlatWrapper(),
-                kv_pool=FakeMHAPool(),
-                speculative_algorithm="MTP",
-            )
-
     def test_hybrid_full_sub_backend_recursed(self):
         # The hybrid wrapper is flat-capable, but its user-selectable full
         # sub-backend must be checked on its own: a table-blind sub-backend

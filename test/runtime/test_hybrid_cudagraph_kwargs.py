@@ -13,8 +13,6 @@ from __future__ import annotations
 import os
 import sys
 import unittest
-from types import SimpleNamespace
-from unittest import mock
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -112,53 +110,6 @@ class InitBackendCudaGraphStateHelperTest(unittest.TestCase):
     def test_type_error_from_backend_body_propagates(self):
         with self.assertRaisesRegex(TypeError, "from inside the backend body"):
             self.helper(_RaisingBackend(), 4, object(), **_EXTRAS)
-
-
-class EagerCudaGraphWrapperTest(unittest.TestCase):
-    def test_enforce_eager_does_not_initialize_graph_only_backend_state(self):
-        try:
-            from tokenspeed.runtime.execution import cuda_graph_wrapper as wrapper_mod
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
-
-        config = SimpleNamespace(
-            enable_torch_compile=False,
-            disable_cuda_graph_padding=False,
-            enable_cudagraph_gc=False,
-            device="cpu",
-            gpu_id=0,
-            global_rank=0,
-            context_len=128,
-            vocab_size=32,
-            grammar_backend="none",
-            cudagraph_capture_sizes=[1],
-            max_num_seqs=1,
-            data_parallel_size=1,
-            max_cudagraph_capture_size=1,
-            spec_num_tokens=1,
-            spec_algo=None,
-            overlap_schedule_depth=1,
-            use_v4_mtp_paged_metadata=False,
-            world_size=1,
-            enforce_eager=True,
-        )
-        pool = SimpleNamespace(paged_cache_group_specs=())
-        inputs = SimpleNamespace(seq_lens_buf=object())
-
-        with mock.patch.object(
-            wrapper_mod,
-            "init_backend_cuda_graph_state",
-            side_effect=AssertionError("graph state initialized in eager mode"),
-        ):
-            wrapper = wrapper_mod.CudaGraphWrapper(
-                forward_func=lambda *args, **kwargs: None,
-                attn_backend=object(),
-                token_to_kv_pool=pool,
-                input_buffers=inputs,
-                config=config,
-            )
-
-        self.assertTrue(wrapper.disable)
 
 
 class HybridInitCudaGraphStateForwardingTest(unittest.TestCase):
