@@ -240,6 +240,16 @@ sidecar (tokenspeed-situ) >= 0.1.0.post20260726. Memory is identical either way 
 per rank after load, and `--gpu-memory-utilization 0.94` yields a KV capacity
 of 4,437,504 tokens.
 
+On plain TP8/TP16 (no expert parallelism), short decode batches take a
+multicast latent-MoE tail inside the decode CUDA graphs: one kernel fuses the
+latent all-reduce, RMSNorm, and the shared-expert reduce-scatter; the latent
+up-projection then runs sharded per rank (1/tp of the weight traffic) and
+multicast-stores its shard into every rank's mailbox (NVLS via PyTorch
+symmetric memory), gathered barrier-free. This is worth ~0.6 ms per decode
+step at bs1 on 8x B300 (~95 -> ~100 tok/s). It engages automatically when
+supported (SM100-family, bf16, NVLS available); set
+`TOKENSPEED_K3_MULTICAST_TAIL=0` to fall back to the fused-AR tail.
+
 The checked-in sidecar AOT bundle is a Linux x86_64 development artifact for
 B300/CUDA 13 (`sm103a`) only. On other NVIDIA platforms, fall back to the
 unfused Triton grouped-GEMM MoE backend: skip the sidecar install and

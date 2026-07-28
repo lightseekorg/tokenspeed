@@ -56,6 +56,7 @@ Module hierarchy matches the checkpoint::
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Iterable
 from functools import partial
 from typing import TYPE_CHECKING
@@ -94,7 +95,10 @@ from tokenspeed.runtime.distributed.comm_ops import (
     prepare_all_reduce_lane,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping
-from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
+from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+    get_is_capture_mode,
+    get_is_cuda_graph_phase,
+)
 from tokenspeed.runtime.layers.activation import SituAndMul
 from tokenspeed.runtime.layers.layernorm import (
     RMSNorm,
@@ -1118,6 +1122,43 @@ class KimiLinearMoE(nn.Module):
             else None
         )
 
+        # Multicast latent tail: one kernel for AR(latent)+norm+RS(shared),
+        # a per-rank-sharded up-projection whose epilogue multicast-stores
+        # into every rank's mailbox (NVLS all-gather), and a Lamport gather.
+        # Replaces the fused-AR + replicated up-projection tail on short
+        # decode batches; the replicated weight read drops to 1/tp per rank.
+        self._latent_tail = None
+        if (
+            os.environ.get("TOKENSPEED_K3_MULTICAST_TAIL", "1") == "1"
+            and not self.execution_plan.use_native
+            and self.routed_expert_norm is not None
+            and mapping.moe.ep_size == 1
+            and torch.distributed.is_initialized()
+            and mapping.moe.tp_size == torch.distributed.get_world_size()
+        ):
+            from tokenspeed_kernel.ops.moe.latent_tail import (
+                KimiK3LatentTailOp,
+                latent_tail_supported,
+            )
+
+            if latent_tail_supported(
+                tp_size=mapping.moe.tp_size,
+                hidden_size=config.hidden_size,
+                latent_size=self.routed_hidden,
+                dtype=torch.bfloat16,
+            ):
+                try:
+                    self._latent_tail = KimiK3LatentTailOp.initialize(
+                        group=torch.distributed.group.WORLD,
+                        hidden_size=config.hidden_size,
+                        latent_size=self.routed_hidden,
+                        rms_eps=self.routed_expert_norm.variance_epsilon,
+                        device=torch.device("cuda", torch.cuda.current_device()),
+                    )
+                except Exception:  # noqa: BLE001 - keep the fused-AR tail
+                    logger.exception("multicast latent tail unavailable; falling back")
+                    self._latent_tail = None
+
     def _routed_experts(
         self,
         routed_in: torch.Tensor,
@@ -1194,10 +1235,17 @@ class KimiLinearMoE(nn.Module):
         # under concurrent GEMMs). Topk is a single small CTA, so it overlaps
         # down_proj from the aux stream, followed by the shared chain.
         router_logits = self.gate(hidden_states)
+        # Graph-phase only: the tail is a decode-graph optimization; eager
+        # forwards (prefill, uncaptured sizes) keep the fused-AR path.
+        use_tail = (
+            self._latent_tail is not None
+            and get_is_cuda_graph_phase()
+            and 1 <= num_tokens <= self._latent_tail.max_num_tokens
+        )
         lane = allreduce_fusion_lane(
             hidden_states,
             self.routed_hidden + hidden_size,
-            enabled=self.execution_plan.fused_moe_ar,
+            enabled=self.execution_plan.fused_moe_ar and not use_tail,
         )
         if lane is not None:
             self.experts._situ_output_buffer = lane[:, : self.routed_hidden]
@@ -1222,12 +1270,21 @@ class KimiLinearMoE(nn.Module):
                 topk_output,
                 num_global_tokens,
                 max_num_tokens_per_gpu,
-                skip_reduce=self.execution_plan.fused_moe_ar,
+                skip_reduce=self.execution_plan.fused_moe_ar or use_tail,
             )
-            if not self.execution_plan.fused_moe_ar:
+            if not (self.execution_plan.fused_moe_ar or use_tail):
                 if self.routed_expert_norm is not None:
                     routed_out = self.routed_expert_norm(routed_out)
                 routed_out = self.routed_expert_up_proj(routed_out)[0]
+        if use_tail:
+            # Both partials stay pre-reduce; the tail owns all communication.
+            tail_out = self._latent_tail(
+                routed_out,
+                shared_partial,
+                self.routed_expert_norm.weight,
+                self.routed_expert_up_proj.weight,
+            )
+            return prefix_sum + tail_out
         if self.execution_plan.fused_moe_ar:
             # Post-join: one [T, latent+hidden] all-reduce covers both
             # partials, element-wise identical to the two separate reduces.
