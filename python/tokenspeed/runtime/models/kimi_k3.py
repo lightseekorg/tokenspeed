@@ -1232,6 +1232,14 @@ class KimiLinearMoE(nn.Module):
         # Router runs uncontended on main (3us; on aux it starves to 14us
         # under concurrent GEMMs). Topk is a single small CTA, so it overlaps
         # down_proj from the aux stream, followed by the shared chain.
+        #
+        # Split front, not the merged single-read one: at bs1 a merged
+        # [gate|latent] sweep serializes the top-k (it needs the gate logits
+        # the sweep produces), which down_proj can no longer hide -- a measured
+        # loss. The router GEMV instead auto-selects the streaming rowcta path
+        # at m==1 (kimi3_router_projection solution="rowcta"), leaving the fork
+        # that hides top-k intact. See tokenspeed_kernel.ops.moe.front for the
+        # merged primitive + its bs1-off strategy.
         router_logits = self.gate(hidden_states)
         # Graph-phase only: the tail is a decode-graph optimization; eager
         # forwards (prefill, uncaptured sizes) keep the fused-AR path.

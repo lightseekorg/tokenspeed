@@ -29,7 +29,9 @@ from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
+    "kimi3_merged_front",
     "kimi3_native_moe_available",
+    "merged_front_strategy",
     "moe_apply",
     "moe_grouped_routing",
     "moe_plan",
@@ -38,6 +40,10 @@ __all__ = [
     "moe_unfused_apply",
 ]
 
+from tokenspeed_kernel.ops.moe.front import (  # noqa: E402
+    kimi3_merged_front,
+    merged_front_strategy,
+)
 from tokenspeed_kernel.ops.moe.grouped_routing import (  # noqa: E402
     moe_grouped_routing,
 )

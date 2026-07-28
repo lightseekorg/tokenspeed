@@ -168,8 +168,7 @@ def _validate_inputs(
         raise ValueError(f"Kimi K3 projection K mismatch: {k} != {weight_k}")
     if (k, n) not in _KIMI3_SHAPES:
         raise ValueError(
-            "Kimi K3 projection only supports 7168->3584 or 3584->7168, "
-            f"got {k}->{n}"
+            f"Kimi K3 projection only supports 7168->3584 or 3584->7168, got {k}->{n}"
         )
     if hidden_states.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
         raise TypeError("Kimi K3 projection requires BF16 input and weight")
@@ -374,8 +373,7 @@ def kimi3_mla_qkv_gate_projection(
     )
     if not 0 < qkv_width < output_width:
         raise ValueError(
-            f"Kimi K3 MLA qkv_width must be within (0, {output_width}), "
-            f"got {qkv_width}"
+            f"Kimi K3 MLA qkv_width must be within (0, {output_width}), got {qkv_width}"
         )
     if solution not in {"auto", "fused", "split"}:
         raise ValueError(f"unknown Kimi K3 MLA projection solution {solution!r}")
@@ -743,7 +741,7 @@ def kimi3_router_projection(
         name="Kimi K3 router projection",
         out_dtype=torch.float32,
     )
-    if solution not in {"auto", "cuda", "triton_gemv", "torch"}:
+    if solution not in {"auto", "cuda", "rowcta", "triton_gemv", "torch"}:
         raise ValueError(f"unknown Kimi K3 router solution {solution!r}")
     specialized = (
         hidden_states.is_cuda
@@ -758,10 +756,34 @@ def kimi3_router_projection(
         platform = Platform.get()
         if platform.is_cdna4 and specialized and m == 1:
             solution = "triton_gemv"
+        elif platform.is_hopper_plus and specialized and m == 1:
+            # bs1 decode: the row-per-CTA streaming GEMV clears the 896-row
+            # router at bandwidth, where the dense cuBLAS-style router kernel
+            # underfills (measured B300: ~4.0 us vs ~6.2 us). Selection stays
+            # fp32-exact -- same accumulation dtype as the cuda path. Prefill
+            # (m>1) keeps the dense kernel, which amortizes across rows.
+            solution = "rowcta"
         elif platform.is_hopper_plus and specialized:
             solution = "cuda"
         else:
             solution = "torch"
+    if solution == "rowcta":
+        if not specialized or m != 1:
+            raise ValueError(
+                "Kimi K3 router rowcta GEMV requires contiguous BF16 "
+                "[1, 7168] input and [896, 7168] weight"
+            )
+        from tokenspeed_kernel.ops.gemm.triton_gemv import rowcta_gemv
+
+        if out is None:
+            out = torch.empty(
+                (m, output_width),
+                dtype=torch.float32,
+                device=hidden_states.device,
+            )
+        # fp32 out buffer: the kernel casts its fp32 accumulator to out.dtype.
+        rowcta_gemv(hidden_states, weight, out=out, enable_pdl=enable_pdl)
+        return out
     if solution == "triton_gemv":
         if not specialized or m != 1:
             raise ValueError(

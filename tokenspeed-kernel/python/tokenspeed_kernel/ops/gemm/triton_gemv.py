@@ -39,7 +39,7 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
-__all__ = ["decode_gemv", "rowcta_gemv"]
+__all__ = ["decode_gemv", "rowcta_gemv", "rowcta_merged_front"]
 
 
 @triton.jit
@@ -104,6 +104,98 @@ def _rowcta_gemv_kernel(
     tl.store(out_ptr + n, tl.sum(acc).to(out_ptr.dtype.element_ty))
     if ENABLE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
+
+
+@triton.jit
+def _rowcta_merged_front_kernel(
+    x_ptr,
+    w_ptr,
+    gate_ptr,
+    routed_ptr,
+    GATE_ROWS: tl.constexpr,
+    K: tl.constexpr,
+    BK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    """Merged-front sweep: one CTA per row of a stacked ``[gate | routed]``
+    weight. Rows ``< GATE_ROWS`` store their fp32 dot to ``gate_ptr`` (router
+    logits); the rest cast to ``routed_ptr``'s dtype (bf16 latent input). One
+    launch, one L2-resident read of ``x`` for both projections."""
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+    n = tl.program_id(0)
+    acc = tl.zeros([BK], tl.float32)
+    for kb in tl.static_range(0, K, BK):
+        offs = kb + tl.arange(0, BK)
+        mask = offs < K
+        xv = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        wv = tl.load(w_ptr + n * K + offs, mask=mask, other=0.0).to(tl.float32)
+        acc += wv * xv
+    total = tl.sum(acc)
+    if n < GATE_ROWS:
+        tl.store(gate_ptr + n, total.to(gate_ptr.dtype.element_ty))
+    else:
+        tl.store(routed_ptr + (n - GATE_ROWS), total.to(routed_ptr.dtype.element_ty))
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+def rowcta_merged_front(
+    x: torch.Tensor,
+    merged_weight: torch.Tensor,
+    gate_rows: int,
+    gate_out: torch.Tensor | None = None,
+    routed_out: torch.Tensor | None = None,
+    *,
+    enable_pdl: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Single-read merged front GEMV for ``M == 1`` decode.
+
+    Reads ``x`` once and sweeps a vertically stacked
+    ``merged_weight = cat([gate_weight, routed_down_weight])`` in one launch,
+    emitting the router logits (fp32) and the latent routed input (bf16)
+    separately. This is the K3 "fused front" concept -- gate + latent
+    down-projection share their input, so their weights are merged and read
+    together (design source: the SGLang K3 fused-front PR, Apache-2.0).
+
+    Args:
+        x: ``[1, K]`` contiguous bf16 activation row.
+        merged_weight: ``[gate_rows + latent, K]`` contiguous bf16 weight, the
+            router rows stacked on top of the latent down-projection rows.
+        gate_rows: number of leading rows that are router logits.
+        gate_out: optional ``[1, gate_rows]`` fp32 destination.
+        routed_out: optional ``[1, latent]`` bf16 destination.
+        enable_pdl: launch with programmatic dependent launch and fence the
+            activation read (NVIDIA only; ignored elsewhere). Safe only when
+            the predecessor writing ``x`` is chained on the same stream/graph.
+
+    Returns:
+        ``(gate_out [1, gate_rows] fp32, routed_out [1, latent] bf16)``.
+    """
+    assert x.shape[0] == 1 and x.stride(-1) == 1 and merged_weight.stride(-1) == 1
+    n, k = merged_weight.shape
+    latent = n - gate_rows
+    assert latent > 0 and gate_rows > 0
+    if gate_out is None:
+        gate_out = torch.empty(1, gate_rows, dtype=torch.float32, device=x.device)
+    if routed_out is None:
+        routed_out = torch.empty(1, latent, dtype=x.dtype, device=x.device)
+    pdl_kwargs = (
+        {"launch_pdl": True} if enable_pdl and current_platform().is_nvidia else {}
+    )
+    _rowcta_merged_front_kernel[(n,)](
+        x.view(-1),
+        merged_weight,
+        gate_out.view(-1),
+        routed_out.view(-1),
+        GATE_ROWS=gate_rows,
+        K=k,
+        BK=512,
+        ENABLE_PDL=enable_pdl,
+        num_warps=4,
+        **pdl_kwargs,
+    )
+    return gate_out, routed_out
 
 
 def rowcta_gemv(
