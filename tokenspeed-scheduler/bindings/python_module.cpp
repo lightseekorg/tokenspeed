@@ -378,6 +378,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                 return op.flat_block_tables;
             },
             nb::rv_policy::reference_internal)
+        .def_prop_ro(
+            "new_page_ids",
+            [](const tokenspeed::FlatForwardOperation& op)
+                -> const std::map<std::string, std::vector<std::int32_t>>& { return op.new_page_ids; },
+            nb::rv_policy::reference_internal)
         .def("flat_block_tables_arrays",
              [](nb::handle self) {
                  // Zero-copy 2-D int32 views over the contiguous export

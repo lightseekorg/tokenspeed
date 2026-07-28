@@ -127,8 +127,13 @@ struct FlatForwardOperation {
     // vectors above cost one PyLong per page id at every attribute access.
     std::map<std::string, std::vector<std::int32_t>> flat_block_tables_contig;
     std::map<std::string, std::array<std::size_t, 2>> flat_block_tables_dims;
+    // Fresh child pages allocated for this forward, grouped by cache group.
+    std::map<std::string, std::vector<std::int32_t>> new_page_ids;
 
-    explicit FlatForwardOperation(std::vector<ForwardOperation> ops) {
+    explicit FlatForwardOperation(
+        std::vector<ForwardOperation> ops,
+        std::map<std::string, std::vector<std::int32_t>> fresh_page_ids = {})
+        : new_page_ids(std::move(fresh_page_ids)) {
         std::stable_partition(ops.begin(), ops.end(),
                               [](const ForwardOperation& a) { return std::holds_alternative<PrefillOperation>(a); });
         for (auto& op : ops) {

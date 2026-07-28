@@ -208,6 +208,8 @@ private:
     BlockPool flat_host_pool_;
     KvCacheCoordinator coordinator_;
     std::vector<std::string> flat_group_ids_;  // group_id per cache group, index-aligned to coordinator groups
+    // Fresh child pages accumulated while building the current execution plan.
+    std::map<std::string, std::vector<std::int32_t>> new_flat_page_ids_;
     // ExtendResults the executor still owes per request (erased on Finish/Abort/PD-success); non-empty means
     // an in-flight forward can still free pool pages, which flatPoolWedged keys off.
     std::unordered_map<std::string, std::int32_t> pending_forward_results_;

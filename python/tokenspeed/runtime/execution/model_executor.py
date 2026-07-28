@@ -1731,6 +1731,13 @@ class ModelExecutor:
             bs = len(forward_op.request_ids)
             # Outside the graph: in-graph sites only OR into the flag buffer.
             self.nan_guard.reset(bs)
+            new_page_ids = getattr(forward_op, "new_page_ids", None)
+            if new_page_ids:
+                zero_new_history_pages = getattr(
+                    self.token_to_kv_pool, "zero_new_history_pages", None
+                )
+                if zero_new_history_pages is not None:
+                    zero_new_history_pages(new_page_ids)
             # Mirror the full group's flat table into req_to_page (flat+spec).
             flat_block_tables = flat_block_tables_from_forward_op(
                 forward_op,

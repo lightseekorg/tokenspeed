@@ -302,6 +302,7 @@ std::optional<KvCacheCoordinator::AdmissionResult> KvCacheCoordinator::Admit(Pre
         .host_prefix_tokens = acquired_prefix.host.num_common_tokens,
         .promotion_boundary_tokens = promotion_boundary_tokens,
         .access_epoch = access_epoch,
+        .new_page_ids = std::vector<std::vector<std::int32_t>>(groups_.size()),
     };
     if (acquired_prefix.device.num_common_tokens > 0) {
         for (std::size_t i = 0; i < groups_.size(); ++i) {
@@ -340,9 +341,15 @@ std::optional<KvCacheCoordinator::AdmissionResult> KvCacheCoordinator::Admit(Pre
             groups_[i].Manager().AppendHostExtension(
                 pool_, *demand.table, std::move(acquired_prefix.host.per_group[i].blocks), result.load_pairs);
         }
+        const std::int32_t first_new_block = demand.table->NumBlocks();
         const bool acquired =
             groups_[i].Manager().Acquire(pool_, *demand.table, demand.num_tokens, demand.reserve_tokens);
         FatalCheck(acquired, "admission plan no longer fits the block pool");
+        const std::span<const CacheBlockRef> blocks = demand.table->Blocks();
+        for (std::int32_t block = first_new_block; block < demand.table->NumBlocks(); ++block) {
+            result.new_page_ids[i].push_back(
+                groups_[i].Manager().ResolveKernelPageId(blocks[static_cast<std::size_t>(block)]->Location()));
+        }
     }
     return result;
 }

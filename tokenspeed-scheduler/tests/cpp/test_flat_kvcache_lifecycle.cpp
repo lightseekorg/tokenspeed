@@ -99,6 +99,10 @@ TEST_F(FlatKvCacheLifecycleTestSuite, SingleRequest_PrefillDecodeFinish) {
         << "two child slots in one LCM block need distinct kernel page ids";
     EXPECT_EQ(prefill->occupied_pages.at(0), full_prefill_row)
         << "the legacy single-table output must carry resolved kernel page ids, not LCM parent ids";
+    ASSERT_EQ(prefill->new_page_ids.count("full"), 1u);
+    ASSERT_EQ(prefill->new_page_ids.count("swa"), 1u);
+    EXPECT_EQ(prefill->new_page_ids.at("full"), full_prefill_row);
+    EXPECT_EQ(prefill->new_page_ids.at("swa"), prefill->flat_block_tables.at("swa").at(0));
 
     SendForwardDone("r1", {42});
     EXPECT_EQ(scheduler_->PrefillSize(), 1u);

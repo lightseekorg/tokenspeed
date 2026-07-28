@@ -380,7 +380,11 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     }
 
     auto [fwd_ops, cache_ops] = newForwardOperation(candidates);
+#if TOKENSPEED_FLAT_KVCACHE
+    plan.With(FlatForwardOperation{std::move(fwd_ops), std::exchange(new_flat_page_ids_, {})});
+#else
     plan.With(FlatForwardOperation{std::move(fwd_ops)});
+#endif
 #if TOKENSPEED_FLAT_KVCACHE
     plan.flat_oom_request_ids = std::exchange(flat_oom_request_ids_, {});
 #endif

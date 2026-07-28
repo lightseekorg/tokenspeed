@@ -350,6 +350,36 @@ std::vector<GroupDemand> FreshDemands(std::vector<BlockTable>& tables, std::span
     return demands;
 }
 
+TEST(KvCacheCoordinatorAdmissionTest, ReportsOnlyFreshlyAllocatedKernelPageIds) {
+    BlockPool pool(4);
+    const std::vector<KvCacheSpec> specs = {
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 4},
+        {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, /*cache_block_tokens=*/4, pool);
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    const std::array<std::int32_t, 2> first_tokens{5, 1};
+    std::vector<GroupDemand> first_demands = FreshDemands(tables, first_tokens);
+
+    const std::optional<KvCacheCoordinator::AdmissionResult> first =
+        coordinator.Admit(coordinator.ProbePrefix({}), first_demands);
+
+    ASSERT_TRUE(first);
+    ASSERT_EQ(first->new_page_ids.size(), 2u);
+    EXPECT_EQ(first->new_page_ids[0], coordinator.GroupManager(0).BlockTablePageIds(tables[0]));
+    EXPECT_EQ(first->new_page_ids[1], coordinator.GroupManager(1).BlockTablePageIds(tables[1]));
+
+    const std::array<std::int32_t, 2> tail_tokens{1, 1};
+    std::vector<GroupDemand> tail_demands = FreshDemands(tables, tail_tokens);
+    const std::optional<KvCacheCoordinator::AdmissionResult> tail =
+        coordinator.Admit(coordinator.ProbePrefix({}), tail_demands, first->access_epoch);
+
+    ASSERT_TRUE(tail);
+    ASSERT_EQ(tail->new_page_ids.size(), 2u);
+    EXPECT_TRUE(tail->new_page_ids[0].empty());
+    EXPECT_TRUE(tail->new_page_ids[1].empty());
+}
+
 TEST(KvCacheCoordinatorAdmissionTest, AcquireMatchedFullPrefixUsesOneAccessEpoch) {
     BlockPool pool(8);
     const std::vector<KvCacheSpec> specs = {
@@ -402,10 +432,10 @@ TEST(KvCacheCoordinatorAdmissionTest, LaterChunksReuseRequestAccessEpoch) {
     std::vector<GroupDemand> second_demands{
         GroupDemand{
             .table = &tables[0],
+            .num_tokens = 8,
             .page_hashes = std::span<const std::string>(hashes).first(2),
             .first_new_page_slot = 0,
             .completed_end_tokens = 8,
-            .num_tokens = 8,
         },
     };
     const std::optional<KvCacheCoordinator::AdmissionResult> second =

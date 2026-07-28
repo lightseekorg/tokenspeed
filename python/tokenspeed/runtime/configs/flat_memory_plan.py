@@ -169,6 +169,19 @@ class LcmArena:
             + field.field_offset_bytes
         )
 
+    def page_byte_segments(self, group_id: str, page_ids) -> list[tuple[int, int]]:
+        """Return backing byte ranges occupied by the group's selected pages."""
+        self.plan.group(group_id)
+        fields = [field for field in self.plan.fields if field.group_id == group_id]
+        return [
+            (
+                self.field_page_byte_offset(field.field_id, page_id),
+                field.payload_bytes,
+            )
+            for page_id in page_ids
+            for field in fields
+        ]
+
     def field_tensor(self, field_id: str, dtype):
         """Return a stable typed tensor view for one planned field."""
         import torch

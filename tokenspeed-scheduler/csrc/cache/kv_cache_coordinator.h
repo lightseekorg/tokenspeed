@@ -79,6 +79,9 @@ public:
         std::int32_t promotion_boundary_tokens{0};
         std::uint64_t access_epoch{0};
         std::vector<BlockTransfer> load_pairs;
+        // Fresh device child pages appended by ordinary Acquire, aligned by
+        // GroupId. Cache hits and host-loaded destinations are excluded.
+        std::vector<std::vector<std::int32_t>> new_page_ids;
     };
 
     // ProbePrefix is read-only. Flat cache state must not change before its

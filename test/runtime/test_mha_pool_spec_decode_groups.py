@@ -114,6 +114,26 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
         self.assertEqual(pool.paged_cache_group_specs, ())
         self.assertEqual(pool.paged_cache_group_page_counts, {})
 
+    def test_new_page_zeroing_only_covers_history_groups(self):
+        pool = self.MHATokenToKVPool.__new__(self.MHATokenToKVPool)
+        pool._lcm_memory_plan = object()
+        pool.paged_cache_group_specs = (
+            types.SimpleNamespace(group_id="full", family="history"),
+            types.SimpleNamespace(group_id="state", family="state"),
+        )
+        pool._lcm_arena = types.SimpleNamespace(
+            backing=object(),
+            page_byte_segments=mock.Mock(return_value=[(100, 20)]),
+        )
+
+        with mock.patch(
+            "tokenspeed.runtime.layers.attention.kv_cache.mha.zero_byte_segments"
+        ) as zero:
+            pool.zero_new_history_pages({"full": [7], "state": [2]})
+
+        pool._lcm_arena.page_byte_segments.assert_called_once_with("full", [7])
+        zero.assert_called_once_with(pool._lcm_arena.backing, [(100, 20)])
+
 
 class SchedulerExtFlatKvcacheProbeTest(unittest.TestCase):
     """scheduler_ext_flat_kvcache reads the ext's FLAT_KVCACHE build flag with

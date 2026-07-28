@@ -262,6 +262,17 @@ std::optional<KvCacheCoordinator::AdmissionResult> Scheduler::flatAdmit(KvCacheC
         coordinator_.Admit(std::move(prefix), demands, request_access_epoch);
     if (!result) {
         flat_no_lcm_placement_ = true;
+        return result;
+    }
+    _assert(result->new_page_ids.size() == flat_group_ids_.size(),
+            "admission fresh-page groups must match scheduler config");
+    for (std::size_t i = 0; i < result->new_page_ids.size(); ++i) {
+        auto& ids = result->new_page_ids[i];
+        if (ids.empty()) {
+            continue;
+        }
+        auto& pending = new_flat_page_ids_[flat_group_ids_[i]];
+        pending.insert(pending.end(), ids.begin(), ids.end());
     }
     return result;
 }

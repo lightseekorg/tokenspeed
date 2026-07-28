@@ -1028,6 +1028,18 @@ class LcmArenaTest(unittest.TestCase):
             arena.field_page_byte_offset(full_k.field_id, 8) + full_k.payload_bytes,
             state_begin + state_conv.payload_bytes,
         )
+        self.assertEqual(
+            arena.page_byte_segments("full", [1]),
+            [
+                (
+                    arena.field_page_byte_offset(field.field_id, 1),
+                    field.payload_bytes,
+                )
+                for field in plan.fields
+                if field.group_id == "full"
+            ],
+        )
+        self.assertEqual(arena.page_byte_segments("full", []), [])
 
         with self.assertRaisesRegex(ValueError, "backing"):
             LcmArena(plan, self._Backing(plan.arena_bytes - 1))

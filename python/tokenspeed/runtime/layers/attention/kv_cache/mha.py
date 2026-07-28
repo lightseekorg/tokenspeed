@@ -29,6 +29,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     quantize_store_kv_mxfp8,
     store_kv_cache,
     store_sf_interleaved,
+    zero_byte_segments,
 )
 
 from tokenspeed.runtime.configs import paged_cache_spec
@@ -367,6 +368,23 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         if self._state.is_active:
             self._state.bind_lcm_slabs(state_slabs)
         self.supports_hierarchical_kv_cache = False
+
+    def zero_new_history_pages(self, new_page_ids: dict[str, list[int]]) -> None:
+        """Clear newly bound history pages before their first kernel use."""
+        if self._lcm_memory_plan is None or not new_page_ids:
+            return
+        history_group_ids = {
+            str(spec.group_id)
+            for spec in self.paged_cache_group_specs
+            if spec.family == "history"
+        }
+        segments = [
+            segment
+            for group_id, page_ids in new_page_ids.items()
+            if group_id in history_group_ids
+            for segment in self._lcm_arena.page_byte_segments(group_id, page_ids)
+        ]
+        zero_byte_segments(self._lcm_arena.backing, segments)
 
     def inkling_checkpoint_view(self, layer_id: int, stream: str) -> torch.Tensor:
         """Return one layer/stream's ``[page, W-1, channels]`` LCM view."""
