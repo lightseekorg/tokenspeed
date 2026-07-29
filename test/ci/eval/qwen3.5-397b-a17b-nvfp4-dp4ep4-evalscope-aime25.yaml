@@ -27,7 +27,6 @@ server:
     --moe-backend flashinfer_trtllm
     --quantization nvfp4
     --kv-cache-dtype fp8
-    --weight-loader-prefetch-checkpoints
     --speculative-algorithm MTP
     --speculative-num-steps 3
     --drafter-attention-backend trtllm
