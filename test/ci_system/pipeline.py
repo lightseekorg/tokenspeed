@@ -579,7 +579,31 @@ def setup_runner(
             dry_run=dry_run,
             check=False,
         )
-    shell_run("sudo apt-get update -q", env=local_env, cwd=cwd, dry_run=dry_run)
+    if runner.startswith("b200v2-"):
+        # The b200v2 network path intermittently replaces Ubuntu HTTP
+        # InRelease responses with a short non-clearsigned payload, which
+        # apt reports as NOSPLIT. HTTPS bypasses that HTTP interception.
+        shell_run(
+            "for source in /etc/apt/sources.list "
+            "/etc/apt/sources.list.d/*.sources; do "
+            '[ -f "" ] || continue; '
+            "sudo sed -i "
+            "'s|http://archive.ubuntu.com/ubuntu|"
+            "https://archive.ubuntu.com/ubuntu|g; "
+            "s|http://security.ubuntu.com/ubuntu|"
+            "https://security.ubuntu.com/ubuntu|g' "
+            '""; '
+            "done",
+            env=local_env,
+            cwd=cwd,
+            dry_run=dry_run,
+        )
+    shell_run(
+        "sudo apt-get -o Acquire::Retries=5 update -q",
+        env=local_env,
+        cwd=cwd,
+        dry_run=dry_run,
+    )
     shell_run(
         "sudo apt-get install -y ninja-build",
         env=local_env,
