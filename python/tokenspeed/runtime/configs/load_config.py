@@ -67,7 +67,7 @@ class LoadConfig:
     model_loader_extra_config: str | dict | None = field(default_factory=dict)
     ignore_patterns: list[str] | str | None = None
     decryption_key_file: str | None = None
-    weight_loader_prefetch_checkpoints: bool = False
+    weight_loader_prefetch_checkpoints: bool = True
     weight_loader_prefetch_num_threads: int = 4
 
     ext_yaml: str | None = None

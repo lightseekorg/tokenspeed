@@ -81,6 +81,7 @@ class WeightTransferManager:
         # Lifecycle state.
         self._engine_inited = False
         self._update_active = False
+        self._pending_weight_version: str | None = None
 
     # ------------------------------------------------------------------ #
     # Introspection
@@ -144,6 +145,7 @@ class WeightTransferManager:
                 "/finish_weight_update before starting another."
             )
         self._update_active = True
+        self._pending_weight_version = None
         logger.info("Weight update started")
 
     async def update(self, update_info: dict[str, Any]) -> None:
@@ -162,6 +164,12 @@ class WeightTransferManager:
             )
             if not success:
                 raise RuntimeError(f"Failed to update weights: {message}")
+            # Record the weight_version from this chunk for deferred application
+            # at finish_update (not applied mid-update to avoid stamping responses
+            # while the model holds partially-updated weights).
+            version = update_info.get("weight_version")
+            if version is not None:
+                self._pending_weight_version = version
         else:  # ipc
             self._parse_ipc_update(update_info)
             # The CUDA-IPC receive path (rebuild_cuda_tensor + load_weights on the
@@ -178,18 +186,33 @@ class WeightTransferManager:
                 "use backend='nccl' for now."
             )
 
-    async def finish_update(self) -> None:
-        """Finalize the current weight update."""
+    async def finish_update(self, weight_version: str | None = None) -> None:
+        """Finalize the current weight update.
+
+        Args:
+            weight_version: If provided, set the weight version explicitly.
+                The version is only updated when the trainer supplies one —
+                either here or during the update chunks. If no version was
+                provided at any point, the existing version is left unchanged
+                (same semantics as SGLang).
+        """
         if not self._update_active:
             raise WeightTransferStateError(
                 "No active weight update to finish; call /start_weight_update first."
             )
         self._update_active = False
-        # A worker-side layerwise-reload finalize lives on the (deferred) worker
-        # path; the checkpoint-format flag will be threaded through start_update
-        # when that lands. Cache invalidation is handled by the update step's
-        # flush_cache.
-        logger.info("Weight update finished")
+
+        # Apply the explicit finish version first, then any version from a chunk.
+        if weight_version is not None:
+            self._apply_weight_version(weight_version)
+        elif self._pending_weight_version is not None:
+            self._apply_weight_version(self._pending_weight_version)
+        # else: trainer chose not to supply a version (leave as-is).
+
+        logger.info(
+            "Weight update finished (weight_version=%s)",
+            self._async_llm.server_args.weight_version,
+        )
 
     # ------------------------------------------------------------------ #
     # Pause / resume
@@ -231,6 +254,19 @@ class WeightTransferManager:
         """Resume generation after a pause."""
         self._async_llm.weight_transfer_allow_admission()
         logger.info("Generation resumed")
+
+    # ------------------------------------------------------------------ #
+    # Weight version management
+    # ------------------------------------------------------------------ #
+
+    @property
+    def weight_version(self) -> str:
+        """Current weight version string."""
+        return self._async_llm.server_args.weight_version
+
+    def _apply_weight_version(self, version: str) -> None:
+        """Set the weight version on server_args (stamps future responses)."""
+        self._async_llm.server_args.weight_version = version
 
     # ------------------------------------------------------------------ #
     # Backend-specific parsing
@@ -294,6 +330,7 @@ class WeightTransferManager:
             "flush_cache",
             "update_kind",
             "num_updates_list",
+            "weight_version",
         )
         self._require_keys(update_info, required, allowed, "NCCL update_info")
         self._check_dense(update_info, "NCCL update_info")

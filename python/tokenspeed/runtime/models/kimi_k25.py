@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Iterable
 
 import torch
@@ -203,25 +204,45 @@ class KimiK25ForConditionalGeneration(torch.nn.Module):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        """Load weights for the model, separating vision and language weights."""
+        """Load weights for the model, separating vision and language weights.
+
+        Language weights are streamed to the language model while the
+        checkpoint iterator is being consumed, so mmap-backed tensors are
+        materialised one shard at a time and the checkpoint prefetch window
+        (see CheckpointPrefetcher) can pace itself on real consumption. Only
+        the small vision weights are buffered; they are loaded after the
+        language stream is exhausted.
+        """
         vision_weights = []
-        language_weights = []
 
-        for name, loaded_weight in weights:
-            if name.startswith("language_model.layers."):
-                name = name.replace(
-                    "language_model.layers.", "language_model.model.layers.", 1
-                )
+        def language_weights_stream():
+            for name, loaded_weight in weights:
+                # nvidia/Kimi-K2.5-NVFP4 stores decoder layers under
+                # language_model.layers.*, while TokenSpeed's DeepSeek module
+                # expects model.layers.* after stripping language_model.
+                if name.startswith("language_model.layers."):
+                    name = name.replace(
+                        "language_model.layers.", "language_model.model.layers.", 1
+                    )
 
-            if "vision_tower" in name or "mm_projector" in name:
-                name = name.replace("wqkv.", "attn.qkv_proj.")
-                name = name.replace("wo.", "attn.proj.")
-                name = name.replace("mm_projector.proj.0", "mm_projector.linear_1")
-                name = name.replace("mm_projector.proj.2", "mm_projector.linear_2")
-                vision_weights.append((name, loaded_weight))
-            else:
-                name = name.replace("language_model.", "")
-                language_weights.append((name, loaded_weight))
+                if "vision_tower" in name or "mm_projector" in name:
+                    name = name.replace("wqkv.", "attn.qkv_proj.")
+                    name = name.replace("wo.", "attn.proj.")
+                    name = name.replace("mm_projector.proj.0", "mm_projector.linear_1")
+                    name = name.replace("mm_projector.proj.2", "mm_projector.linear_2")
+                    vision_weights.append((name, loaded_weight))
+                else:
+                    yield name.replace("language_model.", ""), loaded_weight
+
+        stream = language_weights_stream()
+        if getattr(self.config, "encoder_only", False):
+            # Drain to collect vision weights; language weights are unused.
+            for _ in stream:
+                pass
+        else:
+            first = next(stream, None)
+            if first is not None:
+                self.language_model.load_weights(itertools.chain([first], stream))
 
         if self.vision is not None and not getattr(self.config, "language_only", False):
             params_dict = dict(self.vision.named_parameters(remove_duplicate=False))
@@ -231,9 +252,6 @@ class KimiK25ForConditionalGeneration(torch.nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-
-        if not getattr(self.config, "encoder_only", False) and language_weights:
-            self.language_model.load_weights(language_weights)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config: KimiK25Config):
