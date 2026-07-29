@@ -12,7 +12,9 @@ from tokenspeed.runtime.configs.paged_cache_spec import (
     FULL_ATTENTION,
     LINEAR_ATTENTION,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
+from tokenspeed.runtime.layers.attention.kv_cache.lcm_mla import (
+    LcmMLATokenToKVPool,
+)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -43,7 +45,7 @@ def test_kimi_k3_pool_binds_mla_and_kda_to_one_lcm_backing() -> None:
         linear["head_dim"],
         linear["head_dim"],
     )
-    pool = MLATokenToKVPool(
+    pool = LcmMLATokenToKVPool(
         size=num_lcm_blocks * 12 * plan.logical_block_tokens,
         model_dtype=torch.bfloat16,
         dtype=torch.float8_e4m3fn,
@@ -58,14 +60,19 @@ def test_kimi_k3_pool_binds_mla_and_kda_to_one_lcm_backing() -> None:
         page_size=plan.logical_block_tokens,
         rank=0,
         layer_types=layer_types,
-        layer_cache_group_ids=group_ids,
+        layer_group_ids=group_ids,
         max_scheduled_tokens=1024,
         pd_disaggregation_enabled=True,
-        conv_state_shape=conv_shape,
-        recurrent_state_shape=recurrent_shape,
-        conv_dtype=torch.bfloat16,
-        recurrent_dtype=torch.float32,
-        lcm_memory_plan=plan,
+        state_field_dtypes={
+            field_id: dtype
+            for layer_id, layer_type in enumerate(layer_types)
+            if layer_type == LINEAR_ATTENTION
+            for field_id, dtype in (
+                (f"layer.{layer_id}.conv_state", torch.bfloat16),
+                (f"layer.{layer_id}.recurrent_state", torch.float32),
+            )
+        },
+        memory_plan=plan,
         token_capacity=1024,
     )
 

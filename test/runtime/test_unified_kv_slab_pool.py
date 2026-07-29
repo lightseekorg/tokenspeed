@@ -415,6 +415,82 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
         )
         self.assertEqual(len({id(t) for t in pool.k_buffer}), 24)
 
+    def test_constructor_uses_overridable_group_publication(self):
+        class PoolWithCustomPublication(self.MHATokenToKVPool):
+            def _publish_paged_cache_groups(self, **kwargs):
+                self.publication_args = kwargs
+                return None
+
+        kwargs = dict(
+            size=32,
+            dtype=self.torch.bfloat16,
+            head_num=1,
+            head_dim=8,
+            layer_num=1,
+            device="cpu",
+            enable_memory_saver=False,
+            max_batch_size=2,
+            max_context_len=64,
+            page_size=16,
+            rank=0,
+            layer_types=("full_attention",),
+            enable_alt_stream=False,
+        )
+        pool = PoolWithCustomPublication(**kwargs)
+
+        self.assertEqual(pool.paged_cache_group_specs, ())
+        self.assertEqual(pool.publication_args["layer_types"], ("full_attention",))
+        self.assertEqual(pool.publication_args["max_total_tokens"], 32)
+
+
+class MLAPoolAllocationHookTest(unittest.TestCase):
+    def setUp(self):
+        try:
+            import torch
+
+            from tokenspeed.runtime.layers.attention.kv_cache.mla import (
+                MLATokenToKVPool,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+        self.torch = torch
+        self.MLATokenToKVPool = MLATokenToKVPool
+
+    def test_constructor_uses_overridable_buffer_allocation(self):
+        torch = self.torch
+
+        class PoolWithCustomAllocation(self.MLATokenToKVPool):
+            def _create_buffers(self):
+                self.allocation_hook_called = True
+                self.kv_buffer = [
+                    torch.zeros(
+                        (self.size + self.page_size, 1, self.kv_cache_dim),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+        pool = PoolWithCustomAllocation(
+            size=8,
+            model_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
+            quant_method=None,
+            kv_lora_rank=4,
+            qk_rope_head_dim=2,
+            layer_num=1,
+            device="cpu",
+            enable_memory_saver=False,
+            max_batch_size=2,
+            max_context_len=32,
+            page_size=4,
+            rank=0,
+            enable_alt_stream=False,
+        )
+
+        self.assertTrue(pool.allocation_hook_called)
+        self.assertEqual(tuple(pool.kv_buffer[0].shape), (12, 1, 6))
+
 
 class StatePagedCacheGroupPageCountTest(unittest.TestCase):
     """compute_paged_cache_group_page_counts: the family="state" branch is
@@ -468,12 +544,16 @@ class LcmPoolFieldBindingTest(unittest.TestCase):
                 qwen_gdn_lcm_fields,
             )
             from tokenspeed.runtime.configs.lcm_memory_plan import plan_lcm_fields
+            from tokenspeed.runtime.layers.attention.kv_cache.lcm_mha import (
+                LcmMHATokenToKVPool,
+            )
             from tokenspeed.runtime.layers.attention.kv_cache.mha import (
                 MHATokenToKVPool,
             )
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
         self.torch = torch
+        self.lcm_pool_cls = LcmMHATokenToKVPool
         self.pool_cls = MHATokenToKVPool
         fields = qwen_gdn_lcm_fields(
             layer_types=("linear_attention", "full_attention"),
@@ -495,7 +575,7 @@ class LcmPoolFieldBindingTest(unittest.TestCase):
 
     def _pool(self):
         with mock.patch(_PKG_FLAT_PROBE, return_value=True):
-            return self.pool_cls(
+            return self.lcm_pool_cls(
                 size=8,
                 dtype=self.torch.bfloat16,
                 head_num=1,
@@ -508,12 +588,12 @@ class LcmPoolFieldBindingTest(unittest.TestCase):
                 page_size=4,
                 rank=0,
                 layer_types=("linear_attention", "full_attention"),
-                conv_state_shape=(2, 2),
-                temporal_state_shape=(1, 2, 2),
-                conv_dtype=self.torch.bfloat16,
-                ssm_dtype=self.torch.bfloat16,
-                lcm_memory_plan=self.plan,
-                layer_cache_group_ids=("linear_attention_0", "full_attention"),
+                state_field_dtypes={
+                    "layer.0.conv": self.torch.bfloat16,
+                    "layer.0.ssm": self.torch.bfloat16,
+                },
+                memory_plan=self.plan,
+                layer_group_ids=("linear_attention_0", "full_attention"),
                 enable_alt_stream=False,
             )
 
@@ -532,18 +612,8 @@ class LcmPoolFieldBindingTest(unittest.TestCase):
                 page_size=4,
                 rank=0,
                 layer_types=("linear_attention", "full_attention"),
-                conv_state_shape=(2, 2),
-                temporal_state_shape=(1, 2, 2),
-                conv_dtype=self.torch.bfloat16,
-                ssm_dtype=self.torch.bfloat16,
                 enable_alt_stream=False,
             )
-
-    def test_flat_state_pool_requires_lcm_plan(self):
-        with self.assertRaisesRegex(
-            RuntimeError, "Flat State cache requires an LCM memory plan"
-        ):
-            self._non_lcm_pool(flat_ext=True)
 
     def test_pool_binds_history_and_state_views_from_one_arena(self):
         pool = self._pool()
@@ -593,7 +663,8 @@ class LcmPoolFieldBindingTest(unittest.TestCase):
 
         self.assertTrue(all(buffer is not None for buffer in pool.k_buffer))
         self.assertTrue(all(buffer is not None for buffer in pool.v_buffer))
-        self.assertEqual(pool.state_slabs, [])
+        self.assertFalse(hasattr(pool, "lcm_pool"))
+        self.assertFalse(hasattr(pool, "state_slabs"))
         self.assertTrue(pool.supports_hierarchical_kv_cache)
 
 

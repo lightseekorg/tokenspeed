@@ -56,8 +56,8 @@ def make_kimi_pool(device, usable_pages: int = 6, *, with_mla_dims: bool = True)
         FULL_ATTENTION,
         LINEAR_ATTENTION,
     )
-    from tokenspeed.runtime.layers.attention.kv_cache.mla import (
-        MLATokenToKVPool,
+    from tokenspeed.runtime.layers.attention.kv_cache.lcm_mla import (
+        LcmMLATokenToKVPool,
     )
 
     del with_mla_dims
@@ -68,18 +68,7 @@ def make_kimi_pool(device, usable_pages: int = 6, *, with_mla_dims: bool = True)
         FULL_ATTENTION if group_id == FULL_ATTENTION else LINEAR_ATTENTION
         for group_id in group_ids
     )
-    linear = text_config.linear_attn_config
-    tp_size = 8
-    conv_shape = (
-        3 * linear["num_heads"] * linear["head_dim"] // tp_size,
-        linear["short_conv_kernel_size"] - 1,
-    )
-    recurrent_shape = (
-        linear["num_heads"] // tp_size,
-        linear["head_dim"],
-        linear["head_dim"],
-    )
-    return MLATokenToKVPool(
+    return LcmMLATokenToKVPool(
         size=usable_pages * 12 * plan.logical_block_tokens,
         model_dtype=torch.bfloat16,
         dtype=torch.float8_e4m3fn,
@@ -94,13 +83,18 @@ def make_kimi_pool(device, usable_pages: int = 6, *, with_mla_dims: bool = True)
         page_size=plan.logical_block_tokens,
         rank=0,
         layer_types=layer_types,
-        layer_cache_group_ids=group_ids,
+        layer_group_ids=group_ids,
         max_scheduled_tokens=8192,
-        conv_state_shape=conv_shape,
-        recurrent_state_shape=recurrent_shape,
-        conv_dtype=torch.bfloat16,
-        recurrent_dtype=torch.float32,
-        lcm_memory_plan=plan,
+        state_field_dtypes={
+            field_id: dtype
+            for layer_id, layer_type in enumerate(layer_types)
+            if layer_type == LINEAR_ATTENTION
+            for field_id, dtype in (
+                (f"layer.{layer_id}.conv_state", torch.bfloat16),
+                (f"layer.{layer_id}.recurrent_state", torch.float32),
+            )
+        },
+        memory_plan=plan,
     )
 
 

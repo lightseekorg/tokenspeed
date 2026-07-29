@@ -29,21 +29,12 @@ from typing import TYPE_CHECKING
 import torch
 from tokenspeed_kernel.platform import current_platform
 
-from tokenspeed.runtime.configs.lcm_layouts import (
-    draft_history_lcm_fields,
-    inkling_lcm_fields,
-    mla_history_lcm_fields,
-    qwen_gdn_lcm_fields,
-)
-from tokenspeed.runtime.configs.lcm_memory_plan import plan_lcm_fields
 from tokenspeed.runtime.configs.model_config import AttentionArch, is_deepseek_v4
 from tokenspeed.runtime.configs.paged_cache_spec import (
-    FULL_ATTENTION,
-    LINEAR_ATTENTION,
+    STATE_LAYER_TYPES,
     PagedCacheGroupSpec,
     hybrid_slab_group_size,
     scheduler_ext_flat_kvcache,
-    split_recurrent_state_groups,
 )
 from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
@@ -53,6 +44,12 @@ from tokenspeed.runtime.layers.attention.configs.msa import (
     MSAConfig,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+from tokenspeed.runtime.layers.attention.lcm_setup import (
+    LcmPoolSpec,
+    create_lcm_pool,
+    inkling_layer_kv_head_counts,
+    prepare_lcm_setup,
+)
 from tokenspeed.runtime.layers.attention.utils import (
     profile_available_cache_memory_bytes,
     profile_cache_budget,
@@ -112,67 +109,6 @@ def _resolve_draft_cache_cell_size_for_profile(
         sliding_window_tokens=draft_attn_config.sliding_window_tokens,
     )
     return draft_attn_config.cache_cell_size() * storage_layers
-
-
-def _lcm_packing(plan) -> dict[str, int]:
-    return {
-        group.group_id: int(group.cache_blocks_per_lcm_block) for group in plan.groups
-    }
-
-
-def _prepare_draft_lcm_fields(
-    *,
-    server_args,
-    target_plan,
-    draft_attn_config,
-    draft_model_config,
-    qwen_gdn: bool,
-    inkling: bool,
-):
-    """Bind a draft's history layers to the target's cache groups."""
-    num_layers = draft_model_config.num_attention_layers
-    if qwen_gdn:
-        group_ids = ("full_attention",) * num_layers
-        draft_attn_config.layer_types = group_ids
-        layer_kv_heads = (
-            max(draft_attn_config.num_kv_heads // draft_attn_config.attn_tp_size, 1),
-        ) * num_layers
-    elif inkling:
-        num_steps = server_args.speculative_num_steps
-        if num_steps > num_layers:
-            raise ValueError(
-                f"Inkling MTP has {num_layers} depth layers; "
-                f"--speculative-num-steps {num_steps} would wrap depths "
-                "with no trained meaning."
-            )
-        draft_attn_config.layer_kv_head_counts = _inkling_layer_kv_head_counts(
-            draft_model_config
-        )
-        group_ids = tuple(draft_attn_config.layer_types)
-        layer_kv_heads = tuple(
-            max(1, heads // draft_attn_config.attn_tp_size)
-            for heads in draft_attn_config.layer_kv_head_counts
-        )
-    else:
-        raise ValueError("LCM draft planning requires a registered model recipe")
-
-    target_group_ids = set(_lcm_packing(target_plan))
-    unknown = set(group_ids) - target_group_ids
-    if unknown:
-        raise ValueError(
-            f"draft cache groups are not present in the target plan: {sorted(unknown)}"
-        )
-    draft_attn_config.layer_cache_group_ids = group_ids
-    return draft_history_lcm_fields(
-        layer_group_ids=group_ids,
-        enabled_layer_ids=range(num_layers),
-        logical_block_tokens=target_plan.logical_block_tokens,
-        layer_kv_heads=layer_kv_heads,
-        head_dim=draft_attn_config.head_dim,
-        kv_element_size=draft_attn_config.kv_cache_dtype.itemsize,
-        kv_scale_block_size=32 if draft_attn_config.kv_cache_mxfp8 else 0,
-        kv_scale_element_size=1 if draft_attn_config.kv_cache_mxfp8 else 0,
-    )
 
 
 def _pool_allocated_bytes(pool) -> int:
@@ -358,8 +294,6 @@ _HYBRID_GDN_ARCHITECTURES = {
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5ForConditionalGenerationNextN",
 }
-_LCM_MAX_PADDING_FRACTION = 1.0
-
 # Hybrid linear-attention models whose full-attention layers are MLA (not MHA)
 # and whose linear layers are KDA (per-channel gated delta rule), not GDN.
 # They share the same HybridLinearAttnBackend wrapper + SimpleMambaPool; the
@@ -525,6 +459,7 @@ def _create_hybrid_linear_attn(
     full_attn_backend_name: str = None,
     mamba_pool_total_chunks: int = 0,
     is_kda: bool = False,
+    lcm_spec: LcmPoolSpec | None = None,
 ) -> tuple[AttentionBackend, BaseTokenToKVPool, object]:
     """Create a hybrid backend + pool for a linear-attention model.
 
@@ -546,7 +481,7 @@ def _create_hybrid_linear_attn(
     hf_config = model_config.hf_config
     text_config = getattr(hf_config, "text_config", hf_config)
     full_attn_layers = text_config.full_attention_layer_ids
-    has_lcm_plan = getattr(config, "lcm_memory_plan", None) is not None
+    has_lcm_plan = lcm_spec is not None
 
     if (
         has_lcm_plan
@@ -592,8 +527,18 @@ def _create_hybrid_linear_attn(
         # and recurrent-state fields separately. The identity mapping keeps
         # the wrapper type identical to the radix path.
         num_total_layers = len(text_config.layers_block_type)
-        inner_pool = config.create_pool(
-            num_total_layers, max_num_tokens, rank, enable_memory_saver
+        inner_pool = (
+            create_lcm_pool(
+                lcm_spec,
+                config,
+                num_layers=num_total_layers,
+                rank=rank,
+                enable_memory_saver=enable_memory_saver,
+            )
+            if lcm_spec is not None
+            else config.create_pool(
+                num_total_layers, max_num_tokens, rank, enable_memory_saver
+            )
         )
         pool = LayerMappedKVPool(inner_pool, list(range(num_total_layers)))
     else:
@@ -744,16 +689,6 @@ def _floor_tokens_to_layout_grid(max_num_tokens: int, config) -> int:
     return floored
 
 
-def _inkling_layer_kv_head_counts(model_config) -> tuple[int, ...]:
-    from tokenspeed.runtime.configs.inkling_config import inkling_kv_heads_for_layer
-
-    text_config = model_config.hf_config.get_text_config()
-    return tuple(
-        inkling_kv_heads_for_layer(text_config, layer_id, True)
-        for layer_id in range(text_config.num_hidden_layers)
-    )
-
-
 def _apply_inkling_hetero_kv(config, model_config) -> None:
     """Publish the byte-uniform slot layout: per-group page sizes and per-layer KV head counts.
 
@@ -776,7 +711,7 @@ def _apply_inkling_hetero_kv(config, model_config) -> None:
         model_config: Model config supplying the Inkling text config.
     """
     tc = model_config.hf_config.get_text_config()
-    counts = _inkling_layer_kv_head_counts(model_config)
+    counts = inkling_layer_kv_head_counts(model_config)
     alloc = config.num_kv_heads
     page_tokens = {
         label: config.page_size * alloc // heads
@@ -789,52 +724,6 @@ def _apply_inkling_hetero_kv(config, model_config) -> None:
         if pages != config.page_size
     }
     config.layer_kv_head_counts = counts
-
-
-def _inkling_checkpoint_group_specs(plan) -> tuple[PagedCacheGroupSpec, ...]:
-    """Publish the two ShortConv checkpoint groups from their LCM geometry."""
-    packing = {
-        group.group_id: group.cache_blocks_per_lcm_block for group in plan.groups
-    }
-    missing = {"kvconv", "hiddenconv"} - packing.keys()
-    if missing:
-        raise ValueError(f"Inkling LCM plan is missing groups: {sorted(missing)}")
-    return tuple(
-        PagedCacheGroupSpec(
-            group_id=group_id,
-            retention="full_history",
-            rows_per_page=plan.logical_block_tokens,
-            entry_stride_tokens=1,
-            sliding_window_tokens=None,
-            family="state",
-            cache_blocks_per_lcm_block=packing[group_id],
-        )
-        for group_id in ("kvconv", "hiddenconv")
-    )
-
-
-def _inkling_lcm_fields(config, text_config, logical_block_tokens):
-    """Map one Inkling config to the model-independent LCM field planner."""
-    per_rank_heads = tuple(
-        max(1, heads // config.attn_tp_size) for heads in config.layer_kv_head_counts
-    )
-    hiddenconv_element_size = (
-        2 if os.environ.get("INKLING_FP8_SCONV", "0") == "0" else 1
-    )
-    return inkling_lcm_fields(
-        layer_group_ids=config.layer_types,
-        logical_block_tokens=logical_block_tokens,
-        layer_kv_heads=per_rank_heads,
-        head_dim=config.head_dim,
-        kv_element_size=config.kv_cache_dtype.itemsize,
-        hidden_size=text_config.hidden_size,
-        checkpoint_rows=text_config.sconv_kernel_size - 1,
-        # K/V ShortConv activations remain BF16 even when KV is MXFP8.
-        kvconv_element_size=2,
-        hiddenconv_element_size=hiddenconv_element_size,
-        kv_scale_block_size=32 if config.kv_cache_mxfp8 else 0,
-        kv_scale_element_size=1 if config.kv_cache_mxfp8 else 0,
-    )
 
 
 def _publish_inkling_conv_groups(config, model_config, server_args) -> tuple[int, int]:
@@ -928,33 +817,6 @@ def _wrap_inkling_backend(inner, text_config, attn_config, *, num_layers, is_dra
         is_draft=is_draft,
     )
     return backend, conv_pool
-
-
-def _inkling_fixed_workspace_bytes(
-    *,
-    text_config,
-    attn_config,
-    num_layers: int,
-    verify_tokens: int = 0,
-    lagged_window: bool = False,
-) -> int:
-    """Price persistent rolling/speculative ShortConv state before LCM sizing."""
-    from tokenspeed.runtime.configs.inkling_config import inkling_conv_total_dim
-
-    rows = int(attn_config.max_bs) + 2
-    state_rows = int(text_config.sconv_kernel_size) - 1
-    conv_dim = inkling_conv_total_dim(text_config, attn_config.attn_tp_size)
-    element_size = torch.empty((), dtype=torch.bfloat16).element_size()
-    rolling = num_layers * rows * state_rows * conv_dim * element_size
-    verify = (
-        num_layers
-        * int(attn_config.max_bs)
-        * int(verify_tokens)
-        * conv_dim
-        * element_size
-    )
-    lag = rolling if lagged_window else 0
-    return rolling + verify + lag
 
 
 def _inkling_conv_columns(pool, text_config, conv_bt=None, hbt=None):
@@ -1128,109 +990,36 @@ def create_attn_components(
         and server_args.disaggregation_mode in ("prefill", "decode")
     ):
         raise NotImplementedError("Inkling FlatKV PD is not supported")
-    has_gdn_state = getattr(config, "conv_state_shape", None) is not None
-    use_lcm_gdn = is_hybrid_gdn and has_gdn_state and flat_kvcache
+    target_text_config = getattr(
+        model_config.hf_config, "text_config", model_config.hf_config
+    )
+    target_mamba_params = getattr(target_text_config, "mamba2_cache_params", None)
+    has_flat_state = bool(
+        target_mamba_params
+        and target_mamba_params[-1]
+        and any(
+            layer_type in STATE_LAYER_TYPES
+            for layer_type in getattr(config, "layer_types", ())
+        )
+    )
+    use_lcm_gdn = is_hybrid_gdn and has_flat_state and flat_kvcache
     use_lcm_k3 = is_hybrid_mla_kda and flat_kvcache
     use_lcm_inkling = is_inkling and flat_kvcache
-    inkling_bf16_checkpoints = (
-        use_lcm_inkling and os.environ.get("INKLING_FP8_SCONV", "0") == "0"
+    lcm_family = (
+        "qwen_gdn"
+        if use_lcm_gdn
+        else "kimi_k3" if use_lcm_k3 else "inkling" if use_lcm_inkling else None
     )
-    lcm_max_padding_fraction = (
-        float("inf") if inkling_bf16_checkpoints else _LCM_MAX_PADDING_FRACTION
-    )
-    flat_lcm_fields = None
-    if use_lcm_k3:
-        from tokenspeed.runtime.configs.kimi_k3_cache_spec import (
-            kimi_k3_layer_group_ids,
-        )
-
-        logical_block_tokens = 128
-        if server_args.block_size != logical_block_tokens:
-            logger.info(
-                "Setting Kimi-K3 LCM logical block size to %d tokens "
-                "(configured block size %d)",
-                logical_block_tokens,
-                server_args.block_size,
-            )
-            server_args.block_size = logical_block_tokens
-            config.page_size = logical_block_tokens
-        text_config = getattr(
-            model_config.hf_config, "text_config", model_config.hf_config
-        )
-        layer_group_ids = kimi_k3_layer_group_ids(text_config)
-        config.layer_cache_group_ids = layer_group_ids
-        config.layer_types = tuple(
-            FULL_ATTENTION if group_id == FULL_ATTENTION else LINEAR_ATTENTION
-            for group_id in layer_group_ids
-        )
-        (
-            config.conv_state_shape,
-            config.recurrent_state_shape,
-            config.conv_dtype,
-            config.recurrent_dtype,
-            _,
-        ) = text_config.mamba2_cache_params
-    elif use_lcm_gdn:
-        if config.kv_cache_mxfp8:
-            raise RuntimeError(
-                "Qwen LCM backing does not yet support the MXFP8 interleaved "
-                "scale layout"
-            )
-        logical_block_tokens = 128
-        if server_args.block_size != logical_block_tokens:
-            logger.info(
-                "Setting Qwen LCM logical block size to %d tokens "
-                "(configured block size %d)",
-                logical_block_tokens,
-                server_args.block_size,
-            )
-            server_args.block_size = logical_block_tokens
-            config.page_size = logical_block_tokens
-        layer_group_ids = tuple(split_recurrent_state_groups(config.layer_types))
-        config.layer_cache_group_ids = layer_group_ids
-        flat_lcm_fields = qwen_gdn_lcm_fields(
-            layer_types=config.layer_types,
-            layer_group_ids=layer_group_ids,
-            logical_block_tokens=logical_block_tokens,
-            kv_shape=(
-                logical_block_tokens,
-                max(config.num_kv_heads // config.attn_tp_size, 1),
-                config.head_dim,
-            ),
-            kv_element_size=config.kv_cache_dtype.itemsize,
-            conv_shape=config.conv_state_shape,
-            conv_element_size=config.conv_dtype.itemsize,
-            ssm_shape=config.temporal_state_shape,
-            ssm_element_size=config.ssm_dtype.itemsize,
-        )
-    elif use_lcm_inkling:
-        logical_block_tokens = 128
-        if server_args.block_size != logical_block_tokens:
-            logger.info(
-                "Setting Inkling LCM logical block size to %d tokens "
-                "(configured block size %d)",
-                logical_block_tokens,
-                server_args.block_size,
-            )
-            server_args.block_size = logical_block_tokens
-            config.page_size = logical_block_tokens
-        config.layer_kv_head_counts = _inkling_layer_kv_head_counts(model_config)
-        config.layer_cache_group_ids = tuple(config.layer_types)
-        flat_lcm_fields = _inkling_lcm_fields(
-            config,
-            model_config.hf_config.get_text_config(),
-            logical_block_tokens,
-        )
-    elif has_gdn_state and flat_kvcache:
+    if has_flat_state and flat_kvcache and lcm_family is None:
         raise RuntimeError(
             "Flat State cache requires an LCM layout recipe; none is "
             f"registered for architectures={architectures!r}"
         )
-    draft_attn_config = None
-    if draft_model_config:
-        draft_attn_config = _create_attn_config(
-            server_args, draft_model_config, is_draft=True
-        )
+    draft_attn_config = (
+        _create_attn_config(server_args, draft_model_config, is_draft=True)
+        if draft_model_config
+        else None
+    )
     num_layers = model_config.num_attention_layers
     deepseek_v4_layout = None
     draft_deepseek_v4_layout = None
@@ -1300,39 +1089,7 @@ def create_attn_components(
     mamba_pool_total_chunks = 0
     mamba_pool = None
     draft_max_num_tokens = None
-    if use_lcm_gdn and draft_attn_config is not None:
-        draft_token_num = int(server_args.speculative_num_draft_tokens)
-        verify_rows = config.max_bs * (draft_token_num + 1)
-        fixed_workspace_bytes = verify_rows * sum(
-            field.payload_bytes
-            for field in flat_lcm_fields
-            if field.field_id.endswith((".conv", ".ssm"))
-        )
-    elif use_lcm_inkling:
-        text_config = model_config.hf_config.get_text_config()
-        draft_token_num = (
-            int(server_args.speculative_num_draft_tokens)
-            if draft_attn_config is not None
-            else 0
-        )
-        fixed_workspace_bytes = _inkling_fixed_workspace_bytes(
-            text_config=text_config,
-            attn_config=config,
-            num_layers=text_config.num_hidden_layers,
-            verify_tokens=draft_token_num,
-        )
-        if draft_attn_config is not None:
-            draft_text_config = draft_model_config.hf_config.get_text_config()
-            lagged_window = (
-                int(server_args.speculative_num_steps) > 1
-                and os.environ.get("INKLING_MTP_DECODE_LOOKBACK", "1") != "0"
-            )
-            fixed_workspace_bytes += _inkling_fixed_workspace_bytes(
-                text_config=draft_text_config,
-                attn_config=draft_attn_config,
-                num_layers=draft_model_config.num_attention_layers,
-                lagged_window=lagged_window,
-            )
+    lcm_setup = None
 
     _profile_kwargs = dict(
         attn_config=config,
@@ -1390,16 +1147,7 @@ def create_attn_components(
             server_args.block_size,
             server_args.max_total_tokens,
         )
-    elif use_lcm_k3:
-        from tokenspeed.runtime.configs.kimi_k3_cache_spec import (
-            kimi_k3_lcm_blocks_needed,
-            kimi_k3_token_capacity_for_lcm_pool,
-            plan_kimi_k3_lcm_cache,
-        )
-
-        text_config = getattr(
-            model_config.hf_config, "text_config", model_config.hf_config
-        )
+    elif lcm_family is not None:
         cache_memory = profile_available_cache_memory_bytes(
             attn_config=config,
             gpu_id=gpu_id,
@@ -1408,219 +1156,40 @@ def create_attn_components(
             total_gpu_memory=gpu_memory,
             world_group=server_args.mapping.world_group,
         )
-        reference_plan = plan_kimi_k3_lcm_cache(
-            text_config,
-            flat_kvcache_enabled=True,
-            tp_size=config.attn_tp_size,
-            mla_cache_dtype=config.kv_cache_dtype,
-            mla_quant_method=config.kv_cache_quant_method or None,
-            num_lcm_blocks=1,
-        )
-        draft_fields = None
-        draft_parent_bytes = 0
-        if draft_attn_config is not None:
-            draft_layers = draft_model_config.num_attention_layers
-            draft_group_ids = (FULL_ATTENTION,) * draft_layers
-            draft_fields = mla_history_lcm_fields(
-                layer_group_ids=draft_group_ids,
-                logical_block_tokens=reference_plan.logical_block_tokens,
-                latent_width=(
-                    draft_attn_config.kv_lora_rank + draft_attn_config.qk_rope_head_dim
-                ),
-                element_size=draft_attn_config.kv_cache_dtype.itemsize,
-            )
-            draft_reference_plan = plan_lcm_fields(
-                draft_fields,
-                logical_block_tokens=reference_plan.logical_block_tokens,
-                num_lcm_blocks=1,
-                cache_blocks_per_lcm_block={FULL_ATTENTION: 12},
-                alignment=256,
-            )
-            draft_parent_bytes = draft_reference_plan.lcm_block_bytes
-            draft_attn_config.layer_types = (FULL_ATTENTION,) * draft_layers
-            draft_attn_config.layer_cache_group_ids = draft_group_ids
-
-        bytes_per_parent = reference_plan.lcm_block_bytes + draft_parent_bytes
-        num_lcm_blocks = cache_memory // bytes_per_parent - 1
-        if num_lcm_blocks < 1:
-            raise ValueError(
-                "Kimi-K3 cache budget must hold a null parent and one "
-                "usable LCM parent"
-            )
-        token_limit = server_args.max_total_tokens
-        if _CI_SMALL_KV_SIZE is not None and int(_CI_SMALL_KV_SIZE) > 0:
-            ci_limit = int(_CI_SMALL_KV_SIZE)
-            token_limit = (
-                ci_limit if token_limit is None else min(token_limit, ci_limit)
-            )
-        sizing = dict(
-            max_scheduled_tokens=server_args.chunked_prefill_size,
-            max_live_requests=config.max_bs,
+        lcm_setup = prepare_lcm_setup(
+            family=lcm_family,
+            server_args=server_args,
+            model_config=model_config,
+            attn_config=config,
+            draft_model_config=draft_model_config,
+            draft_attn_config=draft_attn_config,
+            cache_budget_bytes=cache_memory,
             decode_input_tokens=decode_input_tokens,
             overlap_schedule_depth=overlap_schedule_depth,
         )
-        if token_limit is not None:
-            requested_parents = kimi_k3_lcm_blocks_needed(
-                reference_plan, token_capacity=token_limit, **sizing
-            )
-            num_lcm_blocks = min(num_lcm_blocks, requested_parents)
-        admitted_tokens = kimi_k3_token_capacity_for_lcm_pool(
-            reference_plan,
-            num_lcm_blocks=num_lcm_blocks,
-            upper_bound_tokens=token_limit,
-            **sizing,
+        cache_budget_bytes = lcm_setup.cache_budget_bytes
+        fixed_workspace_bytes = lcm_setup.fixed_workspace_bytes
+        max_num_tokens = lcm_setup.target.pool_size
+        draft_max_num_tokens = (
+            lcm_setup.draft.pool_size if lcm_setup.draft is not None else max_num_tokens
         )
-        config.token_capacity = admitted_tokens
-        flat_plan = plan_kimi_k3_lcm_cache(
-            text_config,
-            flat_kvcache_enabled=True,
-            tp_size=config.attn_tp_size,
-            mla_cache_dtype=config.kv_cache_dtype,
-            mla_quant_method=config.kv_cache_quant_method or None,
-            num_lcm_blocks=num_lcm_blocks,
-        )
-        config.lcm_memory_plan = flat_plan
-        if draft_fields is not None:
-            draft_attn_config.token_capacity = admitted_tokens
-            draft_attn_config.lcm_memory_plan = plan_lcm_fields(
-                draft_fields,
-                logical_block_tokens=flat_plan.logical_block_tokens,
-                num_lcm_blocks=num_lcm_blocks,
-                cache_blocks_per_lcm_block={FULL_ATTENTION: 12},
-                alignment=256,
-            )
-        max_packing = max(
-            group.cache_blocks_per_lcm_block for group in flat_plan.groups
-        )
-        max_num_tokens = num_lcm_blocks * max_packing * flat_plan.logical_block_tokens
-        draft_max_num_tokens = max_num_tokens
-        max_total_num_pages = num_lcm_blocks
-        cache_budget_bytes = cache_memory
-        logger.info(
-            "Kimi-K3 LCM profile: target_parent_bytes=%d, "
-            "draft_parent_bytes=%d, P=%d, parents=%d, admitted_tokens=%d, "
-            "child_capacity=%d, groups=%s",
-            flat_plan.lcm_block_bytes,
-            draft_parent_bytes,
-            flat_plan.logical_block_tokens,
-            num_lcm_blocks,
-            admitted_tokens,
-            max_num_tokens,
-            {
-                group.group_id: group.cache_blocks_per_lcm_block
-                for group in flat_plan.groups
-            },
-        )
-    elif use_lcm_gdn or use_lcm_inkling:
-        cache_memory = profile_available_cache_memory_bytes(
-            attn_config=config,
-            gpu_id=gpu_id,
-            tp_size=server_args.mapping.world_size,
-            gpu_memory_utilization=server_args.gpu_memory_utilization,
-            total_gpu_memory=gpu_memory,
-            world_group=server_args.mapping.world_group,
-        )
-        cache_budget_bytes = cache_memory
-        flat_plan = plan_lcm_fields(
-            flat_lcm_fields,
-            logical_block_tokens=server_args.block_size,
-            budget_bytes=cache_memory,
-            alignment=256,
-            # Separate contiguous K/V planes currently cost up to one raw
-            # CacheBlock of padding per group slot. Explicit BF16 Inkling
-            # checkpoints trade capacity for a dedicated precision plane, so
-            # their measured geometry, rather than this heuristic, is the
-            # relevant acceptance check.
-            max_padding_fraction=lcm_max_padding_fraction,
-        )
-        target_packing = _lcm_packing(flat_plan)
-        max_packing = max(target_packing.values())
-        draft_fields = None
-        draft_group_packing = {}
-        draft_parent_bytes = 0
-        draft_packing = max_packing
-        if draft_attn_config is not None:
-            draft_fields = _prepare_draft_lcm_fields(
-                server_args=server_args,
-                target_plan=flat_plan,
-                draft_attn_config=draft_attn_config,
-                draft_model_config=draft_model_config,
-                qwen_gdn=use_lcm_gdn,
-                inkling=use_lcm_inkling,
-            )
-            draft_group_ids = {field.group_id for field in draft_fields}
-            draft_group_packing = {
-                group_id: target_packing[group_id] for group_id in draft_group_ids
-            }
-            draft_geometry = plan_lcm_fields(
-                draft_fields,
-                logical_block_tokens=server_args.block_size,
-                num_lcm_blocks=1,
-                cache_blocks_per_lcm_block=draft_group_packing,
-                alignment=256,
-                max_padding_fraction=lcm_max_padding_fraction,
-            )
-            draft_parent_bytes = draft_geometry.lcm_block_bytes
-            draft_packing = max(_lcm_packing(draft_geometry).values())
-        parent_bytes = flat_plan.lcm_block_bytes + draft_parent_bytes
-        # Both arenas reserve parent 0 as their kernel-safe null parent.
-        usable_cache_bytes = cache_memory - fixed_workspace_bytes
-        num_lcm_blocks = usable_cache_bytes // parent_bytes - 1
-        if num_lcm_blocks < 1:
-            raise ValueError(
-                "cache budget must hold a null parent and one usable LCM parent"
-            )
-        token_limit = server_args.max_total_tokens
-        if _CI_SMALL_KV_SIZE is not None and int(_CI_SMALL_KV_SIZE) > 0:
-            ci_limit = int(_CI_SMALL_KV_SIZE)
-            token_limit = (
-                ci_limit if token_limit is None else min(token_limit, ci_limit)
-            )
-        if token_limit is not None:
-            requested_lcm_blocks = token_limit // server_args.block_size // max_packing
-            if requested_lcm_blocks < 1:
-                raise ValueError(
-                    "the configured token limit must hold at least one LCM parent "
-                    f"({server_args.block_size * max_packing} child tokens)"
-                )
-            num_lcm_blocks = min(num_lcm_blocks, requested_lcm_blocks)
-        flat_plan = plan_lcm_fields(
-            flat_lcm_fields,
-            logical_block_tokens=server_args.block_size,
-            num_lcm_blocks=num_lcm_blocks,
-            cache_blocks_per_lcm_block=target_packing,
-            alignment=256,
-            max_padding_fraction=lcm_max_padding_fraction,
-        )
-        if draft_fields is not None:
-            draft_lcm_plan = plan_lcm_fields(
-                draft_fields,
-                logical_block_tokens=server_args.block_size,
-                num_lcm_blocks=num_lcm_blocks,
-                cache_blocks_per_lcm_block=draft_group_packing,
-                alignment=256,
-                max_padding_fraction=lcm_max_padding_fraction,
-            )
-            draft_attn_config.lcm_memory_plan = draft_lcm_plan
-        config.lcm_memory_plan = flat_plan
-        if use_lcm_inkling:
-            config.extra_paged_groups = _inkling_checkpoint_group_specs(flat_plan)
-        max_total_num_pages = flat_plan.num_lcm_blocks
+        max_total_num_pages = lcm_setup.target.memory_plan.num_lcm_blocks
         logger.info(
             "Flat LCM profile: target_parent_bytes=%d, draft_parent_bytes=%d, "
-            "P=%d, num_lcm_blocks=%d, groups=%s",
-            flat_plan.lcm_block_bytes,
-            draft_parent_bytes,
-            server_args.block_size,
-            flat_plan.num_lcm_blocks,
+            "P=%d, parents=%d, token_capacity=%d, groups=%s",
+            lcm_setup.target.memory_plan.lcm_block_bytes,
+            (
+                lcm_setup.draft.memory_plan.lcm_block_bytes
+                if lcm_setup.draft is not None
+                else 0
+            ),
+            lcm_setup.target.memory_plan.logical_block_tokens,
+            lcm_setup.target.memory_plan.num_lcm_blocks,
+            lcm_setup.target.token_capacity,
             {
                 group.group_id: group.cache_blocks_per_lcm_block
-                for group in flat_plan.groups
+                for group in lcm_setup.target.memory_plan.groups
             },
-        )
-        max_num_tokens = flat_plan.num_lcm_blocks * max_packing * server_args.block_size
-        draft_max_num_tokens = (
-            flat_plan.num_lcm_blocks * draft_packing * server_args.block_size
         )
     elif has_mamba and server_args.max_mamba_cache_size is not None:
         mamba_pool_total_chunks = server_args.max_mamba_cache_size
@@ -1713,7 +1282,7 @@ def create_attn_components(
         )
 
     if (
-        config.lcm_memory_plan is None
+        lcm_setup is None
         and _CI_SMALL_KV_SIZE is not None
         and int(_CI_SMALL_KV_SIZE) > 0
     ):
@@ -1768,6 +1337,7 @@ def create_attn_components(
             ),
             mamba_pool_total_chunks=mamba_pool_total_chunks,
             is_kda=is_hybrid_mla_kda,
+            lcm_spec=lcm_setup.target if lcm_setup is not None else None,
         )
     else:
         # Hetero KV + paged sconv are unconditional for Inkling (the
@@ -1783,8 +1353,18 @@ def create_attn_components(
                 config, model_config, server_args
             )
         backend = _create_attn_backend(arch, config)
-        pool = _create_attn_pool(
-            config, num_layers, max_num_tokens, rank, enable_memory_saver
+        pool = (
+            create_lcm_pool(
+                lcm_setup.target,
+                config,
+                num_layers=num_layers,
+                rank=rank,
+                enable_memory_saver=enable_memory_saver,
+            )
+            if lcm_setup is not None
+            else _create_attn_pool(
+                config, num_layers, max_num_tokens, rank, enable_memory_saver
+            )
         )
         if is_inkling:
             # Wrapper only adds sconv state keyed on req_pool_indices; attention stays on the dense backend
@@ -1860,6 +1440,7 @@ def create_attn_components(
                     else None
                 ),
                 mamba_pool_total_chunks=mamba_pool_total_chunks,
+                lcm_spec=lcm_setup.draft if lcm_setup is not None else None,
             )
         elif any(a in _INKLING_ARCHITECTURES for a in draft_archs):
             draft_text_config = draft_model_config.hf_config.get_text_config()
@@ -1877,22 +1458,39 @@ def create_attn_components(
                 _apply_inkling_hetero_kv(draft_attn_config, draft_model_config)
             logger.info(
                 "Inkling MTP draft pool: hetero KV layer head counts=%s, "
-                "layer types=%s, group page sizes=%s (%d depths, %d ids)",
-                draft_attn_config.layer_kv_head_counts,
-                draft_attn_config.layer_types,
-                draft_attn_config.group_page_sizes,
+                "layer types=%s (%d depths, %d ids)",
+                (
+                    lcm_setup.draft.layer_kv_head_counts
+                    if lcm_setup is not None and lcm_setup.draft is not None
+                    else draft_attn_config.layer_kv_head_counts
+                ),
+                (
+                    lcm_setup.draft.layer_types
+                    if lcm_setup is not None and lcm_setup.draft is not None
+                    else draft_attn_config.layer_types
+                ),
                 num_depths,
                 draft_max_num_tokens // config.page_size,
             )
             draft_attn_backend = _create_attn_backend(
                 draft_model_config.attention_arch, draft_attn_config
             )
-            draft_pool = _create_attn_pool(
-                draft_attn_config,
-                num_depths,
-                draft_max_num_tokens,
-                rank,
-                enable_memory_saver,
+            draft_pool = (
+                create_lcm_pool(
+                    lcm_setup.draft,
+                    draft_attn_config,
+                    num_layers=num_depths,
+                    rank=rank,
+                    enable_memory_saver=enable_memory_saver,
+                )
+                if lcm_setup is not None and lcm_setup.draft is not None
+                else _create_attn_pool(
+                    draft_attn_config,
+                    num_depths,
+                    draft_max_num_tokens,
+                    rank,
+                    enable_memory_saver,
+                )
             )
             draft_attn_backend, _ = _wrap_inkling_backend(
                 draft_attn_backend,
@@ -1906,12 +1504,22 @@ def create_attn_components(
                 draft_model_config.attention_arch, draft_attn_config
             )
             draft_layers = draft_model_config.num_attention_layers
-            draft_pool = _create_attn_pool(
-                draft_attn_config,
-                draft_layers,
-                draft_max_num_tokens,
-                rank,
-                enable_memory_saver,
+            draft_pool = (
+                create_lcm_pool(
+                    lcm_setup.draft,
+                    draft_attn_config,
+                    num_layers=draft_layers,
+                    rank=rank,
+                    enable_memory_saver=enable_memory_saver,
+                )
+                if lcm_setup is not None and lcm_setup.draft is not None
+                else _create_attn_pool(
+                    draft_attn_config,
+                    draft_layers,
+                    draft_max_num_tokens,
+                    rank,
+                    enable_memory_saver,
+                )
             )
 
     _validate_shared_lcm_geometry(pool, draft_pool)

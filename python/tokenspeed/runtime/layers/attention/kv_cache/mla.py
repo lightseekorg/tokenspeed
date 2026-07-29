@@ -20,8 +20,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
-
 import numpy as np
 import torch
 
@@ -29,13 +27,7 @@ from tokenspeed.runtime.cache.utils import (
     get_mla_kv_buffer_triton,
     set_mla_kv_buffer_triton,
 )
-from tokenspeed.runtime.configs import paged_cache_spec
-from tokenspeed.runtime.configs.flat_cache_runtime import (
-    FlatPagedCacheRuntimeContract,
-)
-from tokenspeed.runtime.configs.lcm_memory_plan import LcmMemoryPlan
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
-from tokenspeed.runtime.layers.attention.kv_cache.lcm import LcmCachePool
 from tokenspeed.runtime.layers.attention.kv_cache.utils import (
     copy_all_layer_kv_cache_tiled,
 )
@@ -73,16 +65,6 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         rank: int,
         enable_kv_cache_copy: bool = False,
         enable_alt_stream: bool = True,
-        layer_types: tuple[str, ...] = (),
-        layer_cache_group_ids: tuple[str, ...] = (),
-        max_scheduled_tokens: int = 0,
-        pd_disaggregation_enabled: bool = False,
-        conv_state_shape: tuple[int, ...] | None = None,
-        recurrent_state_shape: tuple[int, ...] | None = None,
-        conv_dtype: torch.dtype | None = None,
-        recurrent_dtype: torch.dtype | None = None,
-        lcm_memory_plan: LcmMemoryPlan | None = None,
-        token_capacity: int | None = None,
     ):
         super().__init__(
             size, dtype, device, max_batch_size, max_context_len, page_size, rank
@@ -94,64 +76,13 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.layer_num = layer_num
         self.kv_cache_dim = kv_lora_rank + qk_rope_head_dim
-        self._layer_types = tuple(layer_types)
-        self.layer_cache_group_ids = tuple(layer_cache_group_ids)
-        self._group_ids_by_layer = dict(enumerate(self.layer_cache_group_ids))
-        self._lcm_memory_plan = lcm_memory_plan
-        self._token_capacity = token_capacity if token_capacity is not None else size
-        self._pd_disaggregation_enabled = pd_disaggregation_enabled
-        self._conv_state_shape = (
-            tuple(conv_state_shape) if conv_state_shape is not None else None
-        )
-        self._recurrent_state_shape = (
-            tuple(recurrent_state_shape) if recurrent_state_shape is not None else None
-        )
-        self._conv_dtype = conv_dtype
-        self._recurrent_dtype = recurrent_dtype
-        self.lcm_pool: LcmCachePool | None = None
-        self._state_buffers_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-        self.runtime_contract: FlatPagedCacheRuntimeContract | None = None
-        self.flat_kv_requires_page_zeroing = lcm_memory_plan is not None
 
-        self.memory_saver_adapter = memory_saver_adapter = (
-            TorchMemorySaverAdapter.create(enable=enable_memory_saver)
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=enable_memory_saver
         )
         self.page_size_bytes = self._get_page_size_bytes()
 
-        with memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
-            if self._lcm_memory_plan is not None:
-                self._create_lcm_buffers()
-            # The padded page 0 is used for writing dummy outputs from padded tokens.
-            elif self.quant_method == "per_token_head":
-                self.kv_buffer = [
-                    (
-                        torch.zeros(
-                            (self.size + self.page_size, 1, kv_lora_rank),
-                            dtype=self.store_dtype,
-                            device=device,
-                        ),
-                        torch.zeros(
-                            (self.size + self.page_size, 1, 1),
-                            dtype=torch.float32,
-                            device=device,
-                        ),
-                        torch.zeros(
-                            (self.size + self.page_size, 1, qk_rope_head_dim),
-                            dtype=self.model_dtype,
-                            device=device,
-                        ),
-                    )
-                    for _ in range(layer_num)
-                ]
-            else:
-                self.kv_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, 1, self.kv_cache_dim),
-                        dtype=self.store_dtype,
-                        device=device,
-                    )
-                    for _ in range(layer_num)
-                ]
+        self._create_buffers()
 
         # Calculate data pointers and strides for all buffers
         all_buffers = []
@@ -186,178 +117,42 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         else:
             self._kv_copy_config = None
 
-        if self._lcm_memory_plan is None:
-            self.paged_cache_group_specs = ()
-            self.paged_cache_group_page_counts = {}
-        else:
-            published = paged_cache_spec.publish_paged_cache_groups(
-                layer_types=self._layer_types,
-                group_ids=self.layer_cache_group_ids,
-                sliding_window_tokens=None,
-                page_size=page_size,
-                cache_blocks_per_lcm_block={
-                    group.group_id: group.cache_blocks_per_lcm_block
-                    for group in self._lcm_memory_plan.groups
-                },
-                max_live_requests=max_batch_size,
-                max_scheduled_tokens=max_scheduled_tokens,
-                max_total_tokens=size,
-                max_context_len=max_context_len,
-            )
-            if published is None:
-                raise RuntimeError("MLA LCM cache requires a flat scheduler build")
-            specs, counts = published
-            if self._pd_disaggregation_enabled:
-                specs = [
-                    replace(
-                        spec,
-                        transfer_policy=(
-                            "latest_snapshot"
-                            if spec.family == "state"
-                            else "full_suffix"
+        self.paged_cache_group_specs = ()
+        self.paged_cache_group_page_counts = {}
+
+    def _create_buffers(self) -> None:
+        with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
+            # The padded page 0 is used for writing dummy outputs from padded tokens.
+            if self.quant_method == "per_token_head":
+                self.kv_buffer = [
+                    (
+                        torch.zeros(
+                            (self.size + self.page_size, 1, self.kv_lora_rank),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        ),
+                        torch.zeros(
+                            (self.size + self.page_size, 1, 1),
+                            dtype=torch.float32,
+                            device=self.device,
+                        ),
+                        torch.zeros(
+                            (self.size + self.page_size, 1, self.qk_rope_head_dim),
+                            dtype=self.model_dtype,
+                            device=self.device,
                         ),
                     )
-                    for spec in specs
+                    for _ in range(self.layer_num)
                 ]
-            counts.update(
-                {
-                    group.group_id: group.page_count
-                    for group in self._lcm_memory_plan.groups
-                }
-            )
-            self.paged_cache_group_specs = tuple(specs)
-            self.paged_cache_group_page_counts = counts
-            self.runtime_contract = FlatPagedCacheRuntimeContract(
-                block_size=self.page_size,
-                num_lcm_blocks=self._lcm_memory_plan.num_lcm_blocks,
-                token_capacity=self._token_capacity,
-                group_specs=self.paged_cache_group_specs,
-                group_page_counts=self.paged_cache_group_page_counts,
-            )
-
-    def _create_lcm_buffers(self) -> None:
-        plan = self._lcm_memory_plan
-        if self.quant_method == "per_token_head":
-            raise ValueError("MLA LCM cache does not support per-token-head KV")
-        if len(self._layer_types) != self.layer_num:
-            raise ValueError("LCM layer types must cover every model layer")
-        if len(self.layer_cache_group_ids) != self.layer_num:
-            raise ValueError("LCM cache group ids must cover every model layer")
-        if plan.logical_block_tokens != self.page_size:
-            raise ValueError(
-                f"LCM plan P={plan.logical_block_tokens} does not match "
-                f"pool page_size={self.page_size}"
-            )
-        max_packing = max(group.cache_blocks_per_lcm_block for group in plan.groups)
-        expected_size = plan.num_lcm_blocks * max_packing * self.page_size
-        if self.size != expected_size:
-            raise ValueError(
-                f"LCM pool size {self.size} does not match child capacity "
-                f"{expected_size}"
-            )
-        has_state_layers = any(
-            label in paged_cache_spec.STATE_LAYER_TYPES for label in self._layer_types
-        )
-        if has_state_layers and (
-            self._conv_state_shape is None or self._recurrent_state_shape is None
-        ):
-            raise ValueError("MLA LCM cache requires recurrent state shapes")
-        if has_state_layers and (
-            self._conv_dtype is None or self._recurrent_dtype is None
-        ):
-            raise ValueError("MLA LCM cache requires recurrent state dtypes")
-
-        self.lcm_pool = LcmCachePool(plan, self.device)
-        self.kv_buffer = [None] * self.layer_num
-        for layer_id, label in enumerate(self._layer_types):
-            if label in paged_cache_spec.STATE_LAYER_TYPES:
-                conv = self.lcm_pool.field(
-                    f"layer.{layer_id}.conv_state", self._conv_dtype
-                )
-                recurrent = self.lcm_pool.field(
-                    f"layer.{layer_id}.recurrent_state", self._recurrent_dtype
-                )
-                if tuple(conv.shape[1:]) != self._conv_state_shape:
-                    raise ValueError(
-                        f"layer {layer_id} conv field shape "
-                        f"{tuple(conv.shape[1:])} != {self._conv_state_shape}"
+            else:
+                self.kv_buffer = [
+                    torch.zeros(
+                        (self.size + self.page_size, 1, self.kv_cache_dim),
+                        dtype=self.store_dtype,
+                        device=self.device,
                     )
-                if tuple(recurrent.shape[1:]) != self._recurrent_state_shape:
-                    raise ValueError(
-                        f"layer {layer_id} recurrent field shape "
-                        f"{tuple(recurrent.shape[1:])} != "
-                        f"{self._recurrent_state_shape}"
-                    )
-                self._state_buffers_by_layer[layer_id] = (conv, recurrent)
-                continue
-            latent = self.lcm_pool.field(
-                f"layer.{layer_id}.latent_kv", self.store_dtype
-            )
-            page_elements = int(np.prod(latent.shape[1:]))
-            if latent.stride(0) != page_elements:
-                raise ValueError(
-                    f"layer {layer_id} latent pages have padding between pages"
-                )
-            self.kv_buffer[layer_id] = latent.view(-1, 1, self.kv_cache_dim)
-        self.supports_hierarchical_kv_cache = False
-
-    @property
-    def num_lcm_blocks(self) -> int | None:
-        if self._lcm_memory_plan is None:
-            return None
-        return self._lcm_memory_plan.num_lcm_blocks
-
-    @property
-    def state_slabs(self) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        return list(self._state_buffers_by_layer.values())
-
-    @property
-    def supports_disaggregation(self) -> bool:
-        return self._lcm_memory_plan is not None and self._pd_disaggregation_enabled
-
-    def get_flatkv_pd_contract(self):
-        if not self.supports_disaggregation or self.lcm_pool is None:
-            raise RuntimeError("FlatKV PD requires an enabled MLA LCM pool")
-        return self.lcm_pool.pd_contract(self.paged_cache_group_specs)
-
-    def group_id_for_layer(self, layer_id: int) -> str:
-        try:
-            return self._group_ids_by_layer[layer_id]
-        except KeyError as exc:
-            raise ValueError(f"layer {layer_id} has no cache group") from exc
-
-    def get_component(self, layer_id: int, component_name: str) -> torch.Tensor:
-        if component_name == "latent_kv":
-            buffer = self.kv_buffer[layer_id]
-            if buffer is None or self.lcm_pool is None:
-                raise ValueError(f"layer {layer_id} has no MLA latent cache")
-            return self.lcm_pool.field(f"layer.{layer_id}.latent_kv", self.store_dtype)
-        try:
-            conv, recurrent = self._state_buffers_by_layer[layer_id]
-        except KeyError as exc:
-            raise ValueError(f"layer {layer_id} has no KDA state") from exc
-        if component_name == "conv_state":
-            return conv
-        if component_name == "recurrent_state":
-            return recurrent
-        raise ValueError(f"unknown KDA component {component_name!r}")
-
-    def get_state_buffers(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
-        try:
-            return self._state_buffers_by_layer[layer_id]
-        except KeyError as exc:
-            raise ValueError(f"layer {layer_id} has no KDA state") from exc
-
-    def zero_new_pages(self, new_page_ids: dict[str, list[int]]) -> None:
-        if self.lcm_pool is not None and new_page_ids:
-            self.lcm_pool.zero_pages(new_page_ids)
-
-    @torch.no_grad()
-    def clear_kv_buffers(self) -> None:
-        if self.lcm_pool is not None:
-            self.lcm_pool.backing.zero_()
-            return
-        super().clear_kv_buffers()
+                    for _ in range(self.layer_num)
+                ]
 
     def _get_page_size_bytes(self):
         if self.quant_method == "per_token_head":
@@ -452,8 +247,6 @@ class MLATokenToKVPool(BaseTokenToKVPool):
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "kv_buffer")
-        if self.lcm_pool is not None:
-            return self.lcm_pool.backing.nbytes
         kv_size_bytes = 0
         for kv_cache in self.kv_buffer:
             kv_size_bytes += _get_tensor_size_bytes(kv_cache)
@@ -461,8 +254,6 @@ class MLATokenToKVPool(BaseTokenToKVPool):
 
     # for disagg
     def get_contiguous_buf_infos(self):
-        if self.lcm_pool is not None:
-            raise RuntimeError("MLA LCM transfer uses get_flatkv_pd_contract()")
         if self.quant_method == "per_token_head":
             kv_data_ptrs = [
                 sub_tuple[i].data_ptr()
@@ -488,8 +279,6 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     def get_layerwise_buf_info_offsets(self, start_idx=0):
-        if self.lcm_pool is not None:
-            raise RuntimeError("MLA LCM transfer uses get_flatkv_pd_contract()")
         if self.quant_method == "per_token_head":
             return [
                 [start_idx + i * self.layer_num + layer_id for i in range(3)]
@@ -626,8 +415,6 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         return cache_k_nope, cache_k_rope
 
     def get_cpu_copy(self, token_indices: list[int]) -> torch.Tensor:
-        if self.lcm_pool is not None:
-            raise RuntimeError("MLA LCM cache does not use hierarchical copy")
         torch.cuda.synchronize()
         kv_cache_cpu = []
         for layer_id in range(self.layer_num):
@@ -652,8 +439,6 @@ class MLATokenToKVPool(BaseTokenToKVPool):
     def load_cpu_copy(
         self, kv_cache_cpu: torch.Tensor, token_indices: list[int]
     ) -> None:
-        if self.lcm_pool is not None:
-            raise RuntimeError("MLA LCM cache does not use hierarchical copy")
         torch.cuda.synchronize()
         for layer_id in range(self.layer_num):
             for i in range(0, len(token_indices), self.offload_chunk_page_num):
