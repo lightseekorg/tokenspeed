@@ -143,6 +143,11 @@ class ServerArgs:
     # the ``ts serve`` orchestrator (allocated + proxied by the sidecar); None
     # disables the in-engine app.
     rl_control_port: int | None = None
+    # Version identifier for the model weights. Stamped into every generation
+    # response's meta_info so RL trainers know which policy version produced each
+    # sample. Updated atomically after a successful weight push when the trainer
+    # supplies a new version string.
+    weight_version: str = "default"
 
     # Data parallelism
     data_parallel_size: int | None = None
@@ -1943,6 +1948,12 @@ class ServerArgs:
             help="Port for the in-engine RL control-plane HTTP app (weight sync, "
             "pause/resume, memory occupation). Normally allocated automatically "
             "by the `ts serve` orchestrator.",
+        )
+        parser.add_argument(
+            "--weight-version",
+            type=str,
+            default=ServerArgs.weight_version,
+            help="Initial model-weight version stamped into generation metadata.",
         )
 
     @classmethod

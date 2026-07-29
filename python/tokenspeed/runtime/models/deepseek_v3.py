@@ -997,7 +997,9 @@ class DeepseekV3AttentionMLA(nn.Module):
 
         q = q.view(-1, self.num_local_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        kv = self.kv_b_proj(kv_a)[0]
+        # kv_a is a split view of latent_cache (non-contiguous); the fp8 online-quant
+        # GEMM in kv_b_proj asserts contiguous input.
+        kv = self.kv_b_proj(kv_a.contiguous())[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope = kv[..., : self.qk_nope_head_dim]
         v = kv[..., self.qk_nope_head_dim :]
@@ -1230,6 +1232,8 @@ class DeepseekV3DraftAttentionMLA(DeepseekV3AttentionMLA):
             ctx.attn_backend.spec_num_tokens - ctx.accept_lengths[num_extends:]
         ).to(seq_lens_buf.dtype)
         seq_lens_buf[num_extends : ctx.bs].sub_(correction).clamp_(min=1)
+        # Publish: the backend owns its buffer, so in-graph edits need a copy.
+        ctx.attn_backend.advance_draft_forward_metadata(seq_lens_buf[: ctx.bs])
 
 
 class DeepseekV3DecoderLayer(nn.Module):
