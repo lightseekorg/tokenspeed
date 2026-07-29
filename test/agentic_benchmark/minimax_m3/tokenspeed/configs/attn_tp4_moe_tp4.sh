@@ -22,7 +22,6 @@ exec ts serve \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
     --drafter-attention-backend fa4 \
-    --disable-prefill-graph \
     --disable-kvstore \
     --block-size 128 \
     --enable-cache-report \

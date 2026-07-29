@@ -49,6 +49,7 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
+import tqdm
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     BreakableCapture,
@@ -61,7 +62,10 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.common import maybe_inference_mode
+from tokenspeed.runtime.utils.common import (
+    get_available_gpu_memory,
+    maybe_inference_mode,
+)
 
 logger = get_colorful_logger(__name__)
 
@@ -341,7 +345,17 @@ class PrefillGraph:
             self.disable = True
 
     def _capture_all_buckets(self, decode_wrapper: CudaGraphWrapper | None) -> None:
-        for bucket in sorted(self.capture_buckets, reverse=True):
+        rank = self.config.global_rank
+        buckets = sorted(self.capture_buckets, reverse=True)
+        capture_range = tqdm.tqdm(buckets) if rank == 0 else buckets
+        for bucket in capture_range:
+            if rank == 0:
+                avail_mem = get_available_gpu_memory(
+                    self.config.device, self.config.gpu_id, empty_cache=False
+                )
+                capture_range.set_description(
+                    f"Capturing prefill buckets ({bucket=} {avail_mem=:.2f} GB)"
+                )
             self._ctx = self._make_dummy_batch(bucket, decode_wrapper)
             self._land_input_embeds(
                 self._embed_tokens(self.input_buffers.input_ids_buf[:bucket]), bucket
