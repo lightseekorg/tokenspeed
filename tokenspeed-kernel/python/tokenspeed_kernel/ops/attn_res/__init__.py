@@ -87,3 +87,9 @@ def attn_res_fwd(
         eps=eps,
         out_norm_weight=out_norm_weight,
     )
+
+
+# Registration side effects (must run so select_kernel can find the backends).
+import tokenspeed_kernel.ops.attn_res.cuda  # noqa: E402,F401
+import tokenspeed_kernel.ops.attn_res.gluon  # noqa: E402,F401
+import tokenspeed_kernel.ops.attn_res.torch  # noqa: E402,F401
