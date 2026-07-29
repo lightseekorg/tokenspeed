@@ -249,7 +249,9 @@ class InputProcessor:
                     "top_logprobs_num > 0 (output top-k logprobs) is not supported "
                     "yet; use top_logprobs_num=0 (the sampled token's logprob)."
                 )
-            if (getattr(obj, "logprob_start_len", -1) or -1) >= 0:
+            start_len = getattr(obj, "logprob_start_len", None)
+            starts = start_len if isinstance(start_len, list) else [start_len]
+            if any(s is not None and s >= 0 for s in starts):
                 raise ValueError(
                     "logprob_start_len >= 0 (prompt logprobs) is not supported yet."
                 )

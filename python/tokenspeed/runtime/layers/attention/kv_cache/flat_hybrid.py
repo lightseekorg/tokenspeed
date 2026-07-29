@@ -891,10 +891,11 @@ class FlatHybridCachePool:
 
         Note: pages are recycled from the shared BlockPool, so the unwritten
         remainder of a sequence's final 64-token kernel block can hold a
-        previous tenant's bytes (fp8 NaN encodings included). The MLA decode
-        kernel sanitizes those V-tail rows itself (mla_decode_fp8: zero
-        invalid V rows post-TMA-load, pre-PV-MMA) — do not rely on cache
-        content beyond the written range being zero.
+        previous tenant's bytes. The MLA decode kernel masks the K side
+        (assigning -1e6 to invalid positions) but feeds V-tail rows into the
+        PV MMA verbatim, so a non-finite byte pattern there propagates into
+        the output. Keeping that tail finite is this writer's job: ``sanitize``
+        and zeroed pages are load-bearing, not belt-and-braces.
         """
         view = self._require_mla_flat_view(int(layer.layer_id))
         self._check_mla_locations(loc, "set_mla_kv_buffer")
