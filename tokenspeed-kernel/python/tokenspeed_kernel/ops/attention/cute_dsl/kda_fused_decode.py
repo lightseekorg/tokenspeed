@@ -60,14 +60,24 @@ lanes:
   per warp.
 - ``NV`` trades launch-width against per-head redundancy: the conv/GEMV
   front is recomputed per column-split block (like the Triton program's
-  ``NV`` split), so small batches want ``NV = 4`` (4x blocks in flight)
+  ``NV`` split), so small batches want the split (2x blocks in flight)
   while large batches want ``NV = 1`` (front computed once per head). The
   launcher picks ``NV`` from the batch size; every variant is numerically
   identical.
-- phase 0 issues the whole state read stream as ``cp.async`` copies into
-  shared memory, overlapping it with the conv/GEMV front; each thread
-  re-reads exactly the slots it copied, so ``cp.async.wait_all`` alone
-  orders the reads (no extra barrier).
+- phase 0 issues the state read stream asynchronously so it overlaps the
+  whole conv/GEMV front. At ``NV = 1`` the block owns the gmem-contiguous
+  ``[K, V]`` slab, so a single thread issues one 64KB 1D bulk-TMA copy and
+  the recurrence waits on its mbarrier (sync-free DMA; the staging design
+  mirrors the TMA state staging of the NVIDIA x Moonshot K3 fused-decode
+  CUDA kernel). At ``NV > 1`` the slab rows are gmem-strided, so each
+  thread issues per-row ``cp.async`` vectors and re-reads exactly the
+  slots it copied — ``cp.async.wait_all`` alone orders the reads (no
+  extra barrier).
+- at ``NV = 1`` the state also stays smem-resident through both recurrence
+  passes (pass 2 recomputes the decayed row from ``s_h``): a register
+  strip would cost 64 registers per thread at ``CPL = 4`` and spill. At
+  ``NV > 1`` (``CPL <= 2``) the decayed rows are parked in registers
+  across the passes, keeping the pass-2 critical path off shared memory.
 - the front runs barrier-free: raw SiLU q/k go to smem, the L2 normalizers
   distribute over the recurrence dots (``t * k_inv``, ``(v' * k_inv) * k``,
   ``o * q_inv``), the GEMV reads ``f_a`` straight from global, and warp
@@ -103,13 +113,16 @@ _NUM_WARPS = 8
 def _pick_nv(batch: int, num_heads: int) -> int:
     """Column-split factor: enough blocks to spread over the SMs, no more.
 
-    Measured on B300 (148 SMs, HV = 12): NV=2 is the broad optimum (24+
-    blocks at bs1 with 8-byte state vectors and 2x front redundancy); NV=1
-    wins in the band where ``batch * HV`` alone already fills the device
-    (front computed once per head) before per-SM queueing takes over again.
+    Measured on B300 (148 SMs, HV = 12): NV=2 wins while the grid is too
+    small to occupy the device without the split (24+ blocks at bs1, with
+    the register-resident pass 2 keeping the latency chain short). Once
+    ``batch * HV`` alone reaches ~2/3 of the SMs, NV=1 wins everywhere:
+    the front (conv + f_b GEMV) runs once per head and the bulk-TMA
+    staged, smem-resident recurrence needs no cluster machinery
+    (B16: 7.9us vs 8.9us; B32: 10.3 vs 16.0; B64: 19.0 vs 27.9).
     """
     blocks_at_nv1 = batch * num_heads
-    if 96 <= blocks_at_nv1 < 160:
+    if blocks_at_nv1 >= 96:
         return 1
     return 2
 
@@ -171,6 +184,45 @@ def _cp_async_shared_global(
         [smem_addr.ir_value(loc=loc, ip=ip), gmem_addr.ir_value(loc=loc, ip=ip)],
         f"cp.async.ca.shared.global [$0], [$1], {size};",
         "r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _cp_async_bulk_g2s(
+    smem_ptr: cute.Pointer,
+    gmem_ptr: cute.Pointer,
+    mbar_ptr: cute.Pointer,
+    *,
+    size: cutlass.Constexpr[int],
+    loc=None,
+    ip=None,
+) -> None:
+    """One 1D bulk global->shared TMA copy, completion on the mbarrier.
+
+    ``size`` bytes (multiple of 16; both addresses 16B-aligned — the host
+    launcher gates the NV=1 path on the pool's slot pitch) are DMA'd by the
+    single issuing thread; the transaction count must have been posted with
+    ``mbarrier_arrive_and_expect_tx`` on the same barrier beforehand.
+    """
+    assert size % 16 == 0
+    smem_addr = smem_ptr.toint(loc=loc, ip=ip)
+    gmem_addr = gmem_ptr.toint(loc=loc, ip=ip)
+    mbar_addr = mbar_ptr.toint(loc=loc, ip=ip)
+    llvm.inline_asm(
+        None,
+        [
+            smem_addr.ir_value(loc=loc, ip=ip),
+            gmem_addr.ir_value(loc=loc, ip=ip),
+            mbar_addr.ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes"
+        f" [$0], [$1], {size}, [$2];",
+        "r,l,r",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -422,6 +474,14 @@ class KdaFusedDecodeKernel:
         s_h = smem.allocate_tensor(
             Float32, cute.make_layout((K, BV), stride=(BV, 1)), byte_alignment=16
         )
+        # nv == 1 stages the whole [K, V] head slab with one 1D bulk-TMA copy
+        # (the slab is gmem-contiguous only when the block owns every column);
+        # completion is observed on this mbarrier.
+        s_mbar = None
+        if cutlass.const_expr(self.nv == 1):
+            s_mbar = smem.allocate_tensor(
+                Int64, cute.make_layout((1,)), byte_alignment=8
+            )
 
         # PDL note: only qkv_raw / f_a / beta come from the same-stream
         # producer GEMV. Everything else (indices, cu_seqlens, both state
@@ -449,19 +509,42 @@ class KdaFusedDecodeKernel:
             col = i_v * BV + CPL * lane
 
             # ---- phase 0: start the state read stream (async, in smem) ----
-            # Each thread copies its 16 x CPL elements as one vector per row;
-            # the DMA runs behind the conv/GEMV front and each thread re-reads
-            # exactly the slots it copied, so cp.async.wait_all alone orders
-            # the reads.
-            if read_ok:
-                for j in cutlass.range_constexpr(ROWS):
-                    row = warp * ROWS + j
-                    _cp_async_shared_global(
-                        s_h.iterator + (row * BV + CPL * lane),
-                        h_pool.iterator
-                        + cute.crd2idx((r_page, i_hv, row, col), h_pool.layout),
-                        size=4 * CPL,
-                    )
+            # nv == 1: the block owns the whole gmem-contiguous [K, V] slab,
+            # so a single thread issues one 64KB 1D bulk-TMA copy (sync-free
+            # DMA; every other thread proceeds straight into the front). The
+            # mbarrier init is published to the waiting threads by the
+            # phase-1 block barrier, which every thread crosses before the
+            # wait; the issuing thread's arrive/copy are program-ordered
+            # after its own init.
+            # nv > 1: per-thread cp.async vectors — each thread copies its
+            # 16 x CPL elements as one vector per row; the DMA runs behind
+            # the conv/GEMV front and each thread re-reads exactly the slots
+            # it copied, so cp.async.wait_all alone orders the reads.
+            if cutlass.const_expr(self.nv == 1):
+                if tid == 0:
+                    cute.arch.mbarrier_init(s_mbar.iterator, 1)
+                    cute.arch.mbarrier_init_fence()
+                    if read_ok:
+                        cute.arch.mbarrier_arrive_and_expect_tx(
+                            s_mbar.iterator, K * BV * 4
+                        )
+                        _cp_async_bulk_g2s(
+                            s_h.iterator,
+                            h_pool.iterator
+                            + cute.crd2idx((r_page, i_hv, 0, 0), h_pool.layout),
+                            s_mbar.iterator,
+                            size=K * BV * 4,
+                        )
+            else:
+                if read_ok:
+                    for j in cutlass.range_constexpr(ROWS):
+                        row = warp * ROWS + j
+                        _cp_async_shared_global(
+                            s_h.iterator + (row * BV + CPL * lane),
+                            h_pool.iterator
+                            + cute.crd2idx((r_page, i_hv, row, col), h_pool.layout),
+                            size=4 * CPL,
+                        )
 
             # ---- phase 1 (single straight-line front, one barrier) ----
             # Everything before the recurrence — conv(+SiLU), the L2-norm
@@ -550,8 +633,12 @@ class KdaFusedDecodeKernel:
             # needs no barrier and overlaps the conv phase above).
             E = D_FA // 32  # elements per lane per row (multiple of 4)
             fa_frag = cute.make_rmem_tensor(E, Float32)
-            for e in cutlass.range_constexpr(E):
-                fa_frag[e] = Float32(f_a[bos, lane * E + e])
+            for e4 in cutlass.range_constexpr(E // 4):
+                fa4 = _load_bf16x4_as_f32(
+                    f_a.iterator + cute.crd2idx((bos, lane * E + e4 * 4), f_a.layout)
+                )
+                for e in cutlass.range_constexpr(4):
+                    fa_frag[e4 * 4 + e] = fa4[e]
             # Lane j keeps row j's dot so the bias + safe gate + exp run in
             # parallel on 16 lanes after the loop (warp-local rows: warp w's
             # GEMV rows equal its recurrence rows) — no barrier, and no
@@ -624,26 +711,44 @@ class KdaFusedDecodeKernel:
             )
 
             # Warp `w` streams K-rows [16w, 16w+16); lane owns CPL columns.
-            # Pass 1: decay each prefetched row into registers, accumulate
-            # the per-column removal dots t = <h_decayed[:, col], k>.
-            h_reg = cute.make_rmem_tensor((ROWS, CPL), Float32)
+            # Pass 1: decay each prefetched row, accumulate the per-column
+            # removal dots t = <h_decayed[:, col], k>.
+            #
+            # nv == 1 keeps the state smem-resident (pass 2 recomputes the
+            # decayed value from s_h): a (ROWS, CPL=4) register strip would
+            # cost 64 registers per thread and spill. nv > 1 (CPL <= 2)
+            # instead parks the decayed rows in registers across the passes,
+            # which keeps the pass-2 critical path off shared memory.
+            h_reg = None
+            if cutlass.const_expr(self.nv > 1):
+                h_reg = cute.make_rmem_tensor((ROWS, CPL), Float32)
             t_acc = cute.make_rmem_tensor(CPL, Float32)
             for c in cutlass.range_constexpr(CPL):
                 t_acc[c] = Float32(0.0)
             if read_ok:
-                _cp_async_wait_all()
-                for j in cutlass.range_constexpr(ROWS):
-                    row = warp * ROWS + j
-                    dec = s_dec[row]
-                    kv = s_k[row]
-                    for c in cutlass.range_constexpr(CPL):
-                        h_val = s_h[row, CPL * lane + c] * dec
-                        h_reg[j, c] = h_val
-                        t_acc[c] += h_val * kv
+                if cutlass.const_expr(self.nv == 1):
+                    cute.arch.mbarrier_wait(s_mbar.iterator, 0)
+                    for j in cutlass.range_constexpr(ROWS):
+                        row = warp * ROWS + j
+                        dec = s_dec[row]
+                        kv = s_k[row]
+                        for c in cutlass.range_constexpr(CPL):
+                            t_acc[c] += s_h[row, CPL * lane + c] * dec * kv
+                else:
+                    _cp_async_wait_all()
+                    for j in cutlass.range_constexpr(ROWS):
+                        row = warp * ROWS + j
+                        dec = s_dec[row]
+                        kv = s_k[row]
+                        for c in cutlass.range_constexpr(CPL):
+                            h_val = s_h[row, CPL * lane + c] * dec
+                            h_reg[j, c] = h_val
+                            t_acc[c] += h_val * kv
             else:
-                for j in cutlass.range_constexpr(ROWS):
-                    for c in cutlass.range_constexpr(CPL):
-                        h_reg[j, c] = Float32(0.0)
+                if cutlass.const_expr(self.nv > 1):
+                    for j in cutlass.range_constexpr(ROWS):
+                        for c in cutlass.range_constexpr(CPL):
+                            h_reg[j, c] = Float32(0.0)
             for c in cutlass.range_constexpr(CPL):
                 s_red_t[warp, CPL * lane + c] = t_acc[c]
 
@@ -669,27 +774,53 @@ class KdaFusedDecodeKernel:
             for c in cutlass.range_constexpr(CPL):
                 o_acc[c] = Float32(0.0)
             h_out = cute.make_rmem_tensor(CPL, Float32)
-            for j in cutlass.range_constexpr(ROWS):
-                row = warp * ROWS + j
-                kv = s_k[row]
-                qv = s_q[row]
-                for c in cutlass.range_constexpr(CPL):
-                    h_val = h_reg[j, c] + v_new_k[c] * kv
-                    h_out[c] = h_val
-                    o_acc[c] += h_val * qv
-                if cutlass.const_expr(defer_h):
-                    for c in cutlass.range_constexpr(CPL):
-                        h_reg[j, c] = h_out[c]
-                elif write_ok:
-                    dst = h_pool.iterator + cute.crd2idx(
-                        (w_page, i_hv, row, col), h_pool.layout
-                    )
-                    if cutlass.const_expr(CPL == 1):
-                        h_pool[w_page, i_hv, row, col] = h_out[0]
-                    elif cutlass.const_expr(CPL == 2):
-                        _store_global_f32x2(dst, h_out[0], h_out[1])
+            if cutlass.const_expr(self.nv == 1):
+                # Recompute the decayed row from s_h (see the pass-1 note);
+                # nv == 1 always stores immediately (no cluster, no deferral).
+                for j in cutlass.range_constexpr(ROWS):
+                    row = warp * ROWS + j
+                    kv = s_k[row]
+                    qv = s_q[row]
+                    dec = s_dec[row]
+                    if read_ok:
+                        for c in cutlass.range_constexpr(CPL):
+                            h_val = s_h[row, CPL * lane + c] * dec + v_new_k[c] * kv
+                            h_out[c] = h_val
+                            o_acc[c] += h_val * qv
                     else:
+                        for c in cutlass.range_constexpr(CPL):
+                            h_val = v_new_k[c] * kv
+                            h_out[c] = h_val
+                            o_acc[c] += h_val * qv
+                    if write_ok:
+                        dst = h_pool.iterator + cute.crd2idx(
+                            (w_page, i_hv, row, col), h_pool.layout
+                        )
                         _store_global_f32x4(dst, h_out[0], h_out[1], h_out[2], h_out[3])
+            else:
+                for j in cutlass.range_constexpr(ROWS):
+                    row = warp * ROWS + j
+                    kv = s_k[row]
+                    qv = s_q[row]
+                    for c in cutlass.range_constexpr(CPL):
+                        h_val = h_reg[j, c] + v_new_k[c] * kv
+                        h_out[c] = h_val
+                        o_acc[c] += h_val * qv
+                    if cutlass.const_expr(defer_h):
+                        for c in cutlass.range_constexpr(CPL):
+                            h_reg[j, c] = h_out[c]
+                    elif write_ok:
+                        dst = h_pool.iterator + cute.crd2idx(
+                            (w_page, i_hv, row, col), h_pool.layout
+                        )
+                        if cutlass.const_expr(CPL == 1):
+                            h_pool[w_page, i_hv, row, col] = h_out[0]
+                        elif cutlass.const_expr(CPL == 2):
+                            _store_global_f32x2(dst, h_out[0], h_out[1])
+                        else:
+                            _store_global_f32x4(
+                                dst, h_out[0], h_out[1], h_out[2], h_out[3]
+                            )
             for c in cutlass.range_constexpr(CPL):
                 s_red_o[warp, CPL * lane + c] = o_acc[c]
 
@@ -951,8 +1082,15 @@ def cutedsl_fused_recurrent_kda_megafuse(
         raise ValueError("cutedsl KDA fused decode requires dt_bias")
     assert qkv_raw.stride(-1) == 1 and qkv_raw.shape[-1] == 3 * p
     assert f_a.stride(-1) == 1 and beta.stride(-1) == 1
+    # The kernel reads f_a as 8-byte bf16x4 vectors; every token row must
+    # start 8B-aligned (row stride a multiple of 4 bf16 elements).
+    assert t <= 1 or f_a.stride(0) % 4 == 0
     assert w_fb.is_contiguous() and w_fb.shape == (p, d_fa)
     assert h_pool.stride(-1) == 1 and h_pool.shape[1:] == (hv, k, k)
+    # The recurrence reads/writes the state as 8/16-byte vectors; every page
+    # slab must start 8B-aligned (pitch a multiple of 2 fp32 elements — true
+    # for the dense pitch and every envelope pitch in use).
+    assert h_pool.stride(0) % 2 == 0
     assert conv_pool.stride(-1) == 1 and conv_pool.shape[1:] == (3 * p, 3)
     conv_w = conv_w.reshape(3 * p, 4)
     dt_bias = dt_bias.reshape(p)
@@ -968,13 +1106,14 @@ def cutedsl_fused_recurrent_kda_megafuse(
     # what the epilogue supports, and tell the caller through the stash.
     # The decision depends only on shapes/dtypes/strides, so it is stable
     # across CUDA-graph capture and replay.
-    # Fusion wins only while launch overhead dominates: measured crossover on
-    # B300 is between B=16 (+0.02ms/step) and B=32 (-0.08ms/step; -0.19 at
-    # B=64), where the epilogue's per-row reductions serialize inside the
-    # kernel while the standalone norm amortizes its launch cost.
+    # Fusion wins at every batch size: small batches ride the saved launch
+    # (nv=2, DSM-combined partials), large batches run the nv=1 block-local
+    # epilogue, measured faster than the standalone norm up through B=256
+    # on B300 (B=64: 19.0us vs 20.1us; B=256: 91us vs 93us). The old t<=16
+    # gate guarded the nv=2 DSM epilogue's large-batch serialization, which
+    # the nv=1 path does not have.
     fuse_onorm = (
         onorm is not None
-        and t <= 16
         and onorm.weight.numel() == k
         and onorm.weight.dtype in _NORM_W_DTYPES
         and onorm.weight.is_contiguous()
@@ -985,6 +1124,20 @@ def cutedsl_fused_recurrent_kda_megafuse(
         and onorm.gate.stride(-1) == 1
     )
 
+    # The NV=1 band's bulk-TMA staging needs every per-page slab 16B-aligned:
+    # base pointer, page pitch, and dense inner [HV, K, V] strides. A pool
+    # that misses any of these (never the K3 dense or envelope pools, whose
+    # pitches are 16B multiples) falls back to the NV=2 cp.async path, which
+    # is layout-agnostic and correct at every batch size.
+    nv = _pick_nv(n, hv)
+    if nv == 1 and not (
+        h_pool.data_ptr() % 16 == 0
+        and (h_pool.stride(0) * 4) % 16 == 0
+        and h_pool.stride(1) == k * k
+        and h_pool.stride(2) == k
+    ):
+        nv = 2
+
     out = torch.empty(t, hv, k, dtype=qkv_raw.dtype, device=qkv_raw.device)
     kernel = _compile_kda_fused_decode(
         hv,
@@ -994,7 +1147,7 @@ def cutedsl_fused_recurrent_kda_megafuse(
         None if lower_bound is None else float(lower_bound),
         cu_seqlens is not None,
         _IDX_DTYPES[read_indices.dtype],
-        _pick_nv(n, hv),
+        nv,
         float(onorm.eps) if fuse_onorm else None,
         _NORM_W_DTYPES[onorm.weight.dtype] if fuse_onorm else None,
         bool(enable_pdl),

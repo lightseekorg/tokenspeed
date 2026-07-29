@@ -280,19 +280,50 @@ class TestKdaFusedDecodeCutedsl:
         assert not req.consumed
         _assert_step_close(x, o, ref_x, ref_o)
 
-    def test_onorm_large_batch_left_unconsumed(self):
-        # Above the measured B300 crossover (t > 16) the standalone norm is
-        # faster than the fused epilogue, so the wrapper must decline and
-        # leave the stash for the host-side norm.
+    def test_onorm_large_batch_fused(self):
+        # Large batches run the nv=1 band (bulk-TMA staged, block-local
+        # epilogue), where the fused norm is measured faster than the
+        # standalone kernel at every batch size — the wrapper fuses
+        # unconditionally when the operands are eligible.
         bs = 32
         x = _make_inputs(bs, seed=36)
         ref_x = _clone(x)
         req = _onorm_request(x)
         o = _run(x, onorm=req)
-        ref_o = _torch_reference(ref_x, apply_onorm=False)
+        ref_o = _torch_reference(ref_x, apply_onorm=True)
         torch.cuda.synchronize()
-        assert not req.consumed
+        assert req.consumed
         _assert_step_close(x, o, ref_x, ref_o)
+
+    @pytest.mark.parametrize("pad_elems", [0, 640, 642])
+    def test_envelope_strided_pool(self, pad_elems):
+        # Unified / page-major pools pitch a slot across all layers, so the
+        # page stride exceeds the dense HV*K*V. pad 640 keeps the pitch
+        # 16B-aligned (nv=1 stays on the bulk-TMA path); pad 642 makes it
+        # 16B-misaligned (8B-aligned), which must auto-fall back to the
+        # layout-agnostic nv=2 path — same numerics either way.
+        bs = 8  # batch band that picks nv=1 on aligned pools
+        pages = 16
+        x = _make_inputs(bs, pages=pages, seed=37)
+        dense = HV * K * V
+        storage = torch.zeros(
+            pages * (dense + pad_elems) + dense,
+            dtype=torch.float32,
+            device="cuda",
+        )
+        strided = storage.as_strided(
+            (pages, HV, K, V), (dense + pad_elems, K * V, V, 1)
+        )
+        strided.copy_(x["h_pool"])
+        x["h_pool"] = strided
+        ref_x = _clone(x)
+        req = _onorm_request(x)
+        o = _run(x, onorm=req)
+        ref_o = _torch_reference(ref_x, apply_onorm=True)
+        torch.cuda.synchronize()
+        assert req.consumed
+        torch.testing.assert_close(o.float(), ref_o.float(), atol=6e-3, rtol=1e-2)
+        torch.testing.assert_close(x["h_pool"], ref_x["h_pool"], atol=4e-3, rtol=1e-3)
 
     def test_onorm_padded_rows(self):
         bs = 8
