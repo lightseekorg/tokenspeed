@@ -211,12 +211,6 @@ def all_reduce_latent_norm(
         eps=eps,
         max_token_num=max_token_num,
         launch_with_pdl=pdl_enabled(),
-        # One-shot Lamport must complete at the end: with PDL, an early
-        # cudaTriggerProgrammaticLaunchCompletion lets the next kernel read
-        # the lamport buffer before this kernel commits it (vLLM fixed the
-        # same defect in its allreduce_rms_fusion pass; see also
-        # flashinfer-ai/flashinfer#1223). The plain lamport path
-        # (_lamport_allreduce) already passes True.
         trigger_completion_at_end=True,
     )
 
