@@ -701,8 +701,9 @@ class MiniMaxM3Attention(nn.Module):
             self.q_norm.gemma_weight,
             self.k_norm.gemma_weight,
             self.q_norm.variance_epsilon,
+            enable_pdl=pdl_enabled(),
         )
-        q, k = self.rotary_emb(positions, q, k)
+        q, k = self.rotary_emb(positions, q, k, enable_pdl=pdl_enabled())
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
