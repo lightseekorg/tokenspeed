@@ -88,8 +88,7 @@ Scheduler::Scheduler(SchedulerConfig config)
     }
 #if TOKENSPEED_FLAT_KVCACHE
     if (coordinator_.HasMambaStateGroup() && config_.max_scheduled_tokens < coordinator_.CacheBlockTokens()) {
-        throw std::invalid_argument(
-            "Scheduler: flat Mamba max_scheduled_tokens must cover one state CacheBlock");
+        throw std::invalid_argument("Scheduler: flat Mamba max_scheduled_tokens must cover one state CacheBlock");
     }
 #endif
 #if !TOKENSPEED_FLAT_KVCACHE
@@ -312,7 +311,7 @@ std::vector<std::int32_t> Scheduler::GetRequestPagedCachePageIds(const std::stri
 }
 
 std::int32_t Scheduler::GetRequestPagedCacheBaseLogicalPage(const std::string& request_id,
-                                                             const std::string& group_id) const {
+                                                            const std::string& group_id) const {
     if (!hybrid_prefix_cache_) {
         throw std::out_of_range("Scheduler::GetRequestPagedCacheBaseLogicalPage: group_id not configured");
     }
@@ -411,8 +410,8 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
         // corrupts the ledger's key set).
         std::unordered_set<CacheKey, CacheKeyHash> batch_keys;
         for (auto& candidate : coordinator_.TakePendingStores()) {
-            if (coordinator_.ContainsHostCachedBlock(candidate.key) ||
-                flat_store_ops_.InFlight(candidate.key) || !batch_keys.insert(candidate.key).second) {
+            if (coordinator_.ContainsHostCachedBlock(candidate.key) || flat_store_ops_.InFlight(candidate.key) ||
+                !batch_keys.insert(candidate.key).second) {
                 candidate.block_ref.reset();  // duplicate: drop + unpin
                 continue;
             }
@@ -424,11 +423,10 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
                 candidate.block_ref.reset();  // host full: drop + unpin
                 continue;
             }
-            pairs.push_back(TransferPair{CacheKind::kKV,
-                                         manager.ResolveKernelPageId(candidate.block_ref->Location()),
+            pairs.push_back(TransferPair{CacheKind::kKV, manager.ResolveKernelPageId(candidate.block_ref->Location()),
                                          manager.ResolveKernelPageId(host_block_ref->Location())});
-            tickets.push_back(FlatStoreTicket{std::move(candidate.key), std::move(candidate.block_ref),
-                                              std::move(host_block_ref)});
+            tickets.push_back(
+                FlatStoreTicket{std::move(candidate.key), std::move(candidate.block_ref), std::move(host_block_ref)});
         }
         if (!pairs.empty()) {
             const cache_op_id id = kv_prefix_cache_.AllocateCacheOpId();

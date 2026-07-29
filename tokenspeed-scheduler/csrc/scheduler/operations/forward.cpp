@@ -121,8 +121,8 @@ std::vector<GroupDemand> makeGroupDemands(std::vector<BlockTable>& tables, Group
     return demands;
 }
 
-void advancePageHashes(std::vector<std::string>& page_hashes,
-                       const std::vector<std::span<const std::int32_t>>& paged, std::int32_t filled_pages) {
+void advancePageHashes(std::vector<std::string>& page_hashes, const std::vector<std::span<const std::int32_t>>& paged,
+                       std::int32_t filled_pages) {
     const std::int32_t first_new_page = static_cast<std::int32_t>(page_hashes.size());
     _assert(filled_pages > first_new_page, "caller must pre-check page-hash progress");
     const std::string previous_hash = page_hashes.empty() ? std::string{} : page_hashes.back();
@@ -260,10 +260,9 @@ void Scheduler::resolveFlatStarvation(const std::vector<Request*>& candidates, b
     _assert(false, "wedged with no holder and no deferred non-holder");
 }
 
-std::optional<KvCacheCoordinator::AdmissionResult> Scheduler::flatAdmit(KvCacheCoordinator::PrefixProbe&& prefix,
-                                                                        std::span<const GroupDemand> demands,
-                                                                        std::optional<std::uint64_t>
-                                                                            request_access_epoch) {
+std::optional<KvCacheCoordinator::AdmissionResult> Scheduler::flatAdmit(
+    KvCacheCoordinator::PrefixProbe&& prefix, std::span<const GroupDemand> demands,
+    std::optional<std::uint64_t> request_access_epoch) {
     std::optional<KvCacheCoordinator::AdmissionResult> result =
         coordinator_.Admit(std::move(prefix), demands, request_access_epoch);
     if (!result) {
@@ -340,15 +339,14 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
                 flat_match.probe.device.prefix_closed_tokens > flat_match.probe.device.num_common_tokens
             ? flat_match.probe.device.prefix_closed_tokens
             : 0;
-    _assert(promotion_boundary_tokens == 0 ||
-                (promotion_boundary_tokens % coordinator_.CacheBlockTokens() == 0 &&
-                 promotion_boundary_tokens > flat_hit_tokens),
+    _assert(promotion_boundary_tokens == 0 || (promotion_boundary_tokens % coordinator_.CacheBlockTokens() == 0 &&
+                                               promotion_boundary_tokens > flat_hit_tokens),
             "flat promotion boundary must be page-aligned and beyond the common prefix");
     unscheduled = request->PrefillSize() - flat_hit_tokens;
     tokens_this_round = std::min(remaining, unscheduled);
     if (coordinator_.HasMambaStateGroup() || promotion_boundary_tokens > 0) {
         tokens_this_round = AlignFlatPrefillChunk(flat_hit_tokens, unscheduled, remaining,
-                                                 coordinator_.CacheBlockTokens(), promotion_boundary_tokens);
+                                                  coordinator_.CacheBlockTokens(), promotion_boundary_tokens);
         if (tokens_this_round == 0) {
             return {};
         }
@@ -394,11 +392,10 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     }
 
 #if TOKENSPEED_FLAT_KVCACHE
-    std::vector<GroupDemand> flat_demands = makeGroupDemands(
-        flat_tables, GroupDemand{
-                         .num_tokens = tokens_this_round,
-                         .reserve_tokens = flat_decode_reserve,
-                     });
+    std::vector<GroupDemand> flat_demands = makeGroupDemands(flat_tables, GroupDemand{
+                                                                              .num_tokens = tokens_this_round,
+                                                                              .reserve_tokens = flat_decode_reserve,
+                                                                          });
     if (config_.enable_flatkv_pd && config_.role == Role::kD) {
         const std::int32_t final_prompt_block = (request->PrefillSize() - 1) / coordinator_.CacheBlockTokens();
         for (std::size_t i = 0; i < flat_demands.size(); ++i) {
@@ -467,9 +464,8 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     const std::int32_t first_pos = request->PrefillSize() - unscheduled;
     fsm::FlatCacheProgress flat_cache_progress = request->FlatCacheProgress();
     if (coordinator_.HasMambaStateGroup() || flat_cache_progress.promotion_boundary_tokens > 0) {
-        tokens_this_round =
-            AlignFlatPrefillChunk(first_pos, unscheduled, remaining, coordinator_.CacheBlockTokens(),
-                                  flat_cache_progress.promotion_boundary_tokens);
+        tokens_this_round = AlignFlatPrefillChunk(first_pos, unscheduled, remaining, coordinator_.CacheBlockTokens(),
+                                                  flat_cache_progress.promotion_boundary_tokens);
         if (tokens_this_round == 0) {
             return {};
         }
@@ -514,17 +510,16 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
         advancePageHashes(flat_cache_progress.page_hashes, request->GetFullPagedTokens(false), filled_pages);
     }
     std::vector<BlockTable>& flat_tables = request->FlatBlockTablesRef();
-    std::vector<GroupDemand> flat_demands =
-        makeGroupDemands(flat_tables, GroupDemand{
-                                          .num_tokens = tokens_this_round,
-                                          .page_hashes = flat_cache_progress.page_hashes,
-                                          .first_new_page_slot = first_new_page_slot,
-                                          .boundary_kind = completedBoundaryKind(
-                                              flat_num_computed, request->PrefillSize(),
-                                              flat_cache_progress.promotion_boundary_tokens),
-                                          .num_computed_tokens = flat_num_computed,
-                                          .reserve_tokens = flat_decode_reserve,
-                                      });
+    std::vector<GroupDemand> flat_demands = makeGroupDemands(
+        flat_tables, GroupDemand{
+                         .num_tokens = tokens_this_round,
+                         .page_hashes = flat_cache_progress.page_hashes,
+                         .first_new_page_slot = first_new_page_slot,
+                         .boundary_kind = completedBoundaryKind(flat_num_computed, request->PrefillSize(),
+                                                                flat_cache_progress.promotion_boundary_tokens),
+                         .num_computed_tokens = flat_num_computed,
+                         .reserve_tokens = flat_decode_reserve,
+                     });
     if (!flatAdmit(flat_demands, flat_cache_progress.access_epoch)) {
         return {};
     }
@@ -596,16 +591,15 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
         canConsumeAvailable(coordinator_, flat_tables, reserve_tokens, num_computed_tokens)) {
         coordinator_.ConsumeAvailable(flat_tables, reserve_tokens);
     } else {
-        std::vector<GroupDemand> demands =
-            makeGroupDemands(flat_tables, GroupDemand{
-                                              .num_tokens = reserve_tokens,
-                                              .page_hashes = flat_cache_progress.page_hashes,
-                                              .first_new_page_slot = first_new_page_slot,
-                                              .boundary_kind = completedBoundaryKind(
-                                                  num_computed_tokens, request->PrefillSize(),
-                                                  flat_cache_progress.promotion_boundary_tokens),
-                                              .num_computed_tokens = num_computed_tokens,
-                                          });
+        std::vector<GroupDemand> demands = makeGroupDemands(
+            flat_tables, GroupDemand{
+                             .num_tokens = reserve_tokens,
+                             .page_hashes = flat_cache_progress.page_hashes,
+                             .first_new_page_slot = first_new_page_slot,
+                             .boundary_kind = completedBoundaryKind(num_computed_tokens, request->PrefillSize(),
+                                                                    flat_cache_progress.promotion_boundary_tokens),
+                             .num_computed_tokens = num_computed_tokens,
+                         });
         if (!flatAdmit(demands, flat_cache_progress.access_epoch)) {
             return {};
         }

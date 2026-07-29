@@ -112,8 +112,8 @@ private:
     };
 
     static auto evictionKey(const VictimCandidate& candidate) {
-        return std::tuple{candidate.last_access_epoch, candidate.eviction_tier, candidate.position_rank,
-                          candidate.group_id, candidate.location.lcm_block_id, candidate.location.slot_index};
+        return std::tuple{candidate.last_access_epoch, candidate.eviction_tier,         candidate.position_rank,
+                          candidate.group_id,          candidate.location.lcm_block_id, candidate.location.slot_index};
     }
 
     static bool evictedAfter(const VictimCandidate& lhs, const VictimCandidate& rhs) {
@@ -168,12 +168,10 @@ private:
                 manager.CachedBlockMetadataFor(pool_, location);
             const std::uint64_t last_access_epoch = metadata ? metadata->last_access_epoch : 0;
             const std::int32_t logical_block_index = metadata ? metadata->logical_block_index : -1;
-            const CacheBoundaryKind boundary_kind =
-                metadata ? metadata->boundary_kind : CacheBoundaryKind::kChunk;
+            const CacheBoundaryKind boundary_kind = metadata ? metadata->boundary_kind : CacheBoundaryKind::kChunk;
             const bool is_prefix_closed = manager.MatchIsPrefixClosed();
-            const bool is_probationary_boundary =
-                !is_prefix_closed && boundary_kind == CacheBoundaryKind::kChunk &&
-                !(metadata && metadata->was_acquired) && logical_block_index >= 0;
+            const bool is_probationary_boundary = !is_prefix_closed && boundary_kind == CacheBoundaryKind::kChunk &&
+                                                  !(metadata && metadata->was_acquired) && logical_block_index >= 0;
             const EvictionTier eviction_tier = [&] {
                 if (last_access_epoch == 0) {
                     return EvictionTier::kUncached;
@@ -287,10 +285,8 @@ std::optional<AdmissionPlan> planAdmission(const std::vector<CacheGroup>& groups
 
 }  // namespace
 
-std::optional<KvCacheCoordinator::AdmissionResult> KvCacheCoordinator::Admit(PrefixProbe&& prefix,
-                                                                             std::span<const GroupDemand> demands,
-                                                                             std::optional<std::uint64_t>
-                                                                                 request_access_epoch) {
+std::optional<KvCacheCoordinator::AdmissionResult> KvCacheCoordinator::Admit(
+    PrefixProbe&& prefix, std::span<const GroupDemand> demands, std::optional<std::uint64_t> request_access_epoch) {
     std::optional<AdmissionPlan> candidate = planAdmission(groups_, pool_, std::move(prefix), demands);
     if (!candidate) {
         return std::nullopt;
@@ -306,8 +302,7 @@ std::optional<KvCacheCoordinator::AdmissionResult> KvCacheCoordinator::Admit(Pre
         _assert(*request_access_epoch > 0 && *request_access_epoch <= next_access_epoch_,
                 "request access epoch was not issued by this coordinator");
     }
-    const std::uint64_t access_epoch =
-        request_access_epoch.has_value() ? *request_access_epoch : ++next_access_epoch_;
+    const std::uint64_t access_epoch = request_access_epoch.has_value() ? *request_access_epoch : ++next_access_epoch_;
     const std::int32_t promotion_boundary_tokens =
         host_pool_ == nullptr && plan.prefix.device.prefix_closed_tokens > plan.prefix.device.num_common_tokens
             ? plan.prefix.device.prefix_closed_tokens

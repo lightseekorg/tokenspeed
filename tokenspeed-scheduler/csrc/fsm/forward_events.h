@@ -78,10 +78,8 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
                                    // sites (production and tests) compile in flat builds too;
                                    // this flat transition asserts coordinator_ != nullptr.
                                    ,
-                                   KvCacheCoordinator* coordinator = nullptr,
-                                   std::vector<BlockTable> flat_tables = {},
-                                   std::int32_t flat_hit_tokens = 0,
-                                   FlatCacheProgress flat_cache_progress = {},
+                                   KvCacheCoordinator* coordinator = nullptr, std::vector<BlockTable> flat_tables = {},
+                                   std::int32_t flat_hit_tokens = 0, FlatCacheProgress flat_cache_progress = {},
                                    std::vector<BlockTransfer> flat_load_pairs = {}
 #endif
                                    )

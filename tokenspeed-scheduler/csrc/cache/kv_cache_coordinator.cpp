@@ -129,8 +129,8 @@ std::vector<std::vector<CacheKey>> KvCacheCoordinator::buildGroupKeys(
 // TOKENS). num_cache_blocks = content_hashes.size(); every group has one key per
 // logical CacheBlock.
 KvCacheCoordinator::PrefixProbe::Tier KvCacheCoordinator::probeTierWithKeys(
-    const BlockPool& pool, std::span<const std::vector<CacheKey>> group_keys,
-    std::span<const std::size_t> match_order, std::int32_t num_cache_blocks, std::int32_t floor_tokens) const {
+    const BlockPool& pool, std::span<const std::vector<CacheKey>> group_keys, std::span<const std::size_t> match_order,
+    std::int32_t num_cache_blocks, std::int32_t floor_tokens) const {
     PrefixProbe::Tier out;
     out.per_group.resize(groups_.size());
     if (match_order.empty()) {
@@ -233,8 +233,7 @@ KvCacheCoordinator::PrefixProbe KvCacheCoordinator::ProbeDecodeDestinationPrefix
     return out;
 }
 
-KvCacheCoordinator::AcquiredPrefix KvCacheCoordinator::acquirePrefix(PrefixProbe&& probe,
-                                                                      std::uint64_t access_epoch) {
+KvCacheCoordinator::AcquiredPrefix KvCacheCoordinator::acquirePrefix(PrefixProbe&& probe, std::uint64_t access_epoch) {
     AcquiredPrefix out;
     out.device =
         acquireTierWithKeys(pool_, probe.group_keys, /*floor_tokens=*/0, std::move(probe.device), access_epoch);

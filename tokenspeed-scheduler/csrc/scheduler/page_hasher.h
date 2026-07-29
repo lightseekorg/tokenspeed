@@ -134,9 +134,9 @@ inline std::vector<std::string> ComputePagedHashes(
 }
 
 // Continues an existing hash chain and returns only [first_page, past_end_page).
-inline std::vector<std::string> AdvancePagedHashes(
-    std::span<const std::span<const std::int32_t>> paged_tokens, std::int32_t first_page, const std::string& prior,
-    std::int32_t past_end_page) {
+inline std::vector<std::string> AdvancePagedHashes(std::span<const std::span<const std::int32_t>> paged_tokens,
+                                                   std::int32_t first_page, const std::string& prior,
+                                                   std::int32_t past_end_page) {
     _assert(first_page >= 0, "first_page must be >= 0");
     _assert(past_end_page > first_page, "hash range must be non-empty");
     _assert(past_end_page <= static_cast<std::int32_t>(paged_tokens.size()),

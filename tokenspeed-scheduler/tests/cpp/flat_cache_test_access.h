@@ -36,9 +36,7 @@ struct KvCacheCoordinatorTestAccess {
         return coordinator.acquirePrefix(coordinator.ProbePrefix(content_hashes), ++coordinator.next_access_epoch_);
     }
 
-    static std::uint64_t NextAccessEpoch(KvCacheCoordinator& coordinator) {
-        return ++coordinator.next_access_epoch_;
-    }
+    static std::uint64_t NextAccessEpoch(KvCacheCoordinator& coordinator) { return ++coordinator.next_access_epoch_; }
 };
 
 inline auto MatchPrefixForTest(KvCacheCoordinator& coordinator, std::span<const std::string> content_hashes) {
@@ -51,9 +49,10 @@ inline void CacheFullBlocksForTest(KvCacheCoordinator& coordinator, std::span<Bl
                                 first_slot);
 }
 
-inline std::optional<KvCacheCoordinator::AdmissionResult> AdmitForTest(
-    KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables, KvCacheCoordinator::PrefixProbe&& prefix,
-    GroupDemand prototype) {
+inline std::optional<KvCacheCoordinator::AdmissionResult> AdmitForTest(KvCacheCoordinator& coordinator,
+                                                                       std::vector<BlockTable>& tables,
+                                                                       KvCacheCoordinator::PrefixProbe&& prefix,
+                                                                       GroupDemand prototype) {
     std::vector<GroupDemand> demands;
     demands.reserve(tables.size());
     for (BlockTable& table : tables) {
@@ -63,13 +62,15 @@ inline std::optional<KvCacheCoordinator::AdmissionResult> AdmitForTest(
     return coordinator.Admit(std::move(prefix), demands);
 }
 
-inline std::optional<KvCacheCoordinator::AdmissionResult> AdmitForTest(
-    KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables, GroupDemand prototype) {
+inline std::optional<KvCacheCoordinator::AdmissionResult> AdmitForTest(KvCacheCoordinator& coordinator,
+                                                                       std::vector<BlockTable>& tables,
+                                                                       GroupDemand prototype) {
     return AdmitForTest(coordinator, tables, coordinator.ProbePrefix({}), prototype);
 }
 
-inline std::optional<KvCacheCoordinator::AdmissionResult> AdmitForTest(
-    KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables, std::int32_t num_tokens) {
+inline std::optional<KvCacheCoordinator::AdmissionResult> AdmitForTest(KvCacheCoordinator& coordinator,
+                                                                       std::vector<BlockTable>& tables,
+                                                                       std::int32_t num_tokens) {
     return AdmitForTest(coordinator, tables, GroupDemand{.num_tokens = num_tokens});
 }
 

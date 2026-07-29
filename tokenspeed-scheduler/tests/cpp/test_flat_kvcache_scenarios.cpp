@@ -1753,8 +1753,7 @@ TEST(FlatRetractEvent, PrefillDoneVictimReleasesPagesAndRequeues) {
         /*tokens_this_round=*/4, /*decode_input_tokens=*/1, /*device_allocator=*/nullptr, &req_pool, MatchResult{},
         Role::kFused, /*kv_prefix_cache=*/nullptr, /*disable_l2_cache=*/true, /*loadback_diff=*/{},
         /*hybrid_prefix_cache=*/nullptr, /*mamba_allocator=*/nullptr, /*mamba_loadback_nodes=*/{}, &coordinator,
-        std::move(tables), /*flat_hit_tokens=*/0,
-        fsm::FlatCacheProgress{.access_epoch = admission->access_epoch}});
+        std::move(tables), /*flat_hit_tokens=*/0, fsm::FlatCacheProgress{.access_epoch = admission->access_epoch}});
     ASSERT_TRUE(request.Is<fsm::PrefillDone>());
     EXPECT_EQ(request.FlatCacheProgress().access_epoch, admission->access_epoch);
     ASSERT_LT(pool.NumEmptyLcmBlocks(), 8);

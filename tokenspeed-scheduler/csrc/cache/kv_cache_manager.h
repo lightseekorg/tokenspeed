@@ -222,26 +222,24 @@ public:
         }
 
         const std::int32_t num_blocks = BlocksNeededFor(table, demand);
-        std::vector<CacheBlockRef> block_refs =
-            pool.AcquireBlocks(group_id_, cache_blocks_per_lcm_block_, num_blocks);
+        std::vector<CacheBlockRef> block_refs = pool.AcquireBlocks(group_id_, cache_blocks_per_lcm_block_, num_blocks);
         if (static_cast<std::int32_t>(block_refs.size()) != num_blocks) {
             return false;
         }
 
         const std::int64_t extent = static_cast<std::int64_t>(demand.num_tokens) + demand.reserve_tokens;
-        const std::int32_t logical_blocks = static_cast<std::int32_t>(
-            (extent + cache_block_tokens_ - 1) / cache_block_tokens_);
+        const std::int32_t logical_blocks =
+            static_cast<std::int32_t>((extent + cache_block_tokens_ - 1) / cache_block_tokens_);
         table.blocks_.resize(static_cast<std::size_t>(logical_blocks));
         for (std::size_t i = 0; i < block_refs.size(); ++i) {
-            table.blocks_[static_cast<std::size_t>(demand.materialized_suffix_start) + i] =
-                std::move(block_refs[i]);
+            table.blocks_[static_cast<std::size_t>(demand.materialized_suffix_start) + i] = std::move(block_refs[i]);
         }
         table.available_tokens_ = logical_blocks * cache_block_tokens_ - demand.num_tokens;
         return true;
     }
 
-    void RegisterCachedBlock(BlockPool& pool, CacheBlockRef& block_ref, const CacheKey& key,
-                             std::uint64_t access_epoch, std::int32_t logical_block_index = -1,
+    void RegisterCachedBlock(BlockPool& pool, CacheBlockRef& block_ref, const CacheKey& key, std::uint64_t access_epoch,
+                             std::int32_t logical_block_index = -1,
                              CacheBoundaryKind boundary_kind = CacheBoundaryKind::kChunk,
                              std::vector<std::pair<CacheKey, CacheBlockRef>>* newly_cached = nullptr) {
         _assert(block_ref && block_ref.IsOwnedBy(pool), "cache block must belong to the target pool");
@@ -281,9 +279,8 @@ public:
         }
     }
 
-    void CacheFullBlocks(BlockPool& pool, BlockTable& table, std::span<const CacheKey> keys,
-                         std::uint64_t access_epoch, std::int32_t first_slot = 0,
-                         CacheBoundaryKind boundary_kind = CacheBoundaryKind::kChunk,
+    void CacheFullBlocks(BlockPool& pool, BlockTable& table, std::span<const CacheKey> keys, std::uint64_t access_epoch,
+                         std::int32_t first_slot = 0, CacheBoundaryKind boundary_kind = CacheBoundaryKind::kChunk,
                          std::vector<std::pair<CacheKey, CacheBlockRef>>* newly_cached = nullptr) {
         _assert(first_slot >= 0, "first_slot must be >= 0");
         _assert(static_cast<std::int64_t>(first_slot) + static_cast<std::int64_t>(keys.size()) <= table.NumBlocks(),
@@ -293,8 +290,8 @@ public:
             if (!block_ref) {
                 continue;
             }
-            RegisterCachedBlock(pool, block_ref, keys[j], access_epoch,
-                                first_slot + static_cast<std::int32_t>(j), boundary_kind, newly_cached);
+            RegisterCachedBlock(pool, block_ref, keys[j], access_epoch, first_slot + static_cast<std::int32_t>(j),
+                                boundary_kind, newly_cached);
         }
     }
 
@@ -333,8 +330,7 @@ public:
             return 0;
         }
         return static_cast<std::int32_t>(std::ranges::count_if(
-            cache_index->entries,
-            [](const CacheEntry& cache_entry) { return cache_entry.block_ref.use_count() > 1; }));
+            cache_index->entries, [](const CacheEntry& cache_entry) { return cache_entry.block_ref.use_count() > 1; }));
     }
 
     std::vector<CacheBlockLocation> EvictableBlockLocations(const BlockPool& pool) const {

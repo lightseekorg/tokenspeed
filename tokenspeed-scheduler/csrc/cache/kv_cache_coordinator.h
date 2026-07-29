@@ -142,8 +142,7 @@ private:
     void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table,
                                  std::span<const std::string> content_hashes, std::int32_t first_slot,
                                  std::uint64_t access_epoch, CacheBoundaryKind boundary_kind);
-    void cacheCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand,
-                                      std::uint64_t access_epoch);
+    void cacheCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand, std::uint64_t access_epoch);
     std::vector<CacheGroup> groups_;
     // Closed groups first, so non-closed groups match against a settled bound.
     std::vector<std::size_t> match_order_;
