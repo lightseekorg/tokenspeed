@@ -17,6 +17,7 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
+from tokenspeed_kernel.ops.attn_res import attn_res_fwd  # noqa: E402
 from tokenspeed_kernel.ops.attn_res.torch import torch_attn_res_fwd  # noqa: E402
 
 from tokenspeed.runtime.layers.layernorm import RMSNorm  # noqa: E402
@@ -155,26 +156,41 @@ def _manual_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float):
 
 
 class AttnResOutNormTests(unittest.TestCase):
-    def test_torch_fallback_out_norm_matches_separate(self):
+    def test_output_eps_is_ignored_without_output_norm(self):
+        prefix_sum, block_residual, proj, norm = _make_inputs(11, seed=4)
+        kwargs = {
+            "layer_residual": prefix_sum,
+            "block_residual": block_residual,
+            "res_weight": proj.weight.reshape(-1).to(torch.bfloat16),
+            "rms_weight": norm.weight.to(torch.bfloat16),
+            "eps": _EPS,
+        }
+        expected = attn_res_fwd(**kwargs)
+        actual = attn_res_fwd(**kwargs, out_norm_eps=2 * _EPS)
+        torch.testing.assert_close(actual, expected)
+
+    def test_public_fallback_supports_distinct_output_eps(self):
         prefix_sum, block_residual, proj, norm = _make_inputs(11, seed=5)
         out_norm = RMSNorm(_HIDDEN, eps=_EPS)
         out_norm.weight.data.uniform_(0.5, 1.5)
-        fused = torch_attn_res_fwd(
+        output_eps = 2 * _EPS
+        fused = attn_res_fwd(
             layer_residual=prefix_sum,
             block_residual=block_residual,
             res_weight=proj.weight.reshape(-1).to(torch.bfloat16),
             rms_weight=norm.weight.to(torch.bfloat16),
             eps=_EPS,
             out_norm_weight=out_norm.weight.to(torch.bfloat16),
+            out_norm_eps=output_eps,
         )
-        mixed = torch_attn_res_fwd(
+        mixed = attn_res_fwd(
             layer_residual=prefix_sum,
             block_residual=block_residual,
             res_weight=proj.weight.reshape(-1).to(torch.bfloat16),
             rms_weight=norm.weight.to(torch.bfloat16),
             eps=_EPS,
         )
-        ref = _manual_rmsnorm(mixed, out_norm.weight, _EPS)
+        ref = _manual_rmsnorm(mixed, out_norm.weight, output_eps)
         torch.testing.assert_close(fused, ref, atol=2e-2, rtol=2e-2)
 
     def test_model_helper_out_norm_wiring(self):

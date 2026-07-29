@@ -70,6 +70,7 @@ __all__ = [
     "iris_all_reduce",
     "iris_acquire_outputs",
     "iris_all_reduce_symmetric",
+    "iris_all_reduce_residual_attnres",
     "create_iris_rsag_state",
     "create_iris_ar_rmsnorm_state",
     "iris_allreduce_residual_rmsnorm",
@@ -511,6 +512,67 @@ class IrisAllReduce(object):
         )
         return outputs
 
+    def all_reduce_residual_attnres(
+        self,
+        partial: torch.Tensor,
+        residual: torch.Tensor,
+        score_weight: torch.Tensor,
+        output_weight: torch.Tensor,
+        scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        eps: float,
+        op=None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reduce a Kimi-K3 attention partial and finish its AttnRes mix."""
+        if op is None:
+            op = dist.ReduceOp.SUM
+        assert op == dist.ReduceOp.SUM, f"Iris all-reduce only supports SUM, got {op}"
+        assert _platform.is_cdna4 and self.world_size == 8
+        assert partial.shape == residual.shape == (1, 7168)
+        assert partial.dtype == residual.dtype == self.dtype == torch.bfloat16
+        assert partial.device == residual.device == self.device
+        assert partial.is_contiguous() and residual.is_contiguous()
+        assert partial.numel() <= self.max_numel, (
+            f"tensor numel ({partial.numel()}) exceeds iris buffer capacity "
+            f"({self.max_numel})"
+        )
+        assert score_weight.shape == output_weight.shape == (7168,)
+        assert score_weight.dtype == output_weight.dtype == torch.bfloat16
+        assert score_weight.device == output_weight.device == self.device
+        assert score_weight.is_contiguous() and output_weight.is_contiguous()
+        m, s_, acc = scratch
+        assert m.shape == s_.shape == (1,)
+        assert acc.shape == (1, 7168)
+        assert m.dtype == s_.dtype == acc.dtype == torch.float32
+        assert m.device == s_.device == acc.device == self.device
+        assert m.is_contiguous() and s_.is_contiguous() and acc.is_contiguous()
+        assert eps > 0.0
+
+        hidden = torch.empty_like(partial)
+        residual_out = torch.empty_like(residual)
+        iris_stage_one_shot_allreduce_residual_attnres_gluon_kernel[(1,)](
+            partial,
+            residual,
+            self._input_buf,
+            score_weight,
+            output_weight,
+            m,
+            s_,
+            acc,
+            hidden,
+            residual_out,
+            self._ready_flags,
+            *self._heap_base_addresses,
+            RANK=self._iris_rank,
+            WORLD_SIZE=self.world_size,
+            HIDDEN=7168,
+            BLOCK=8192,
+            EPS=eps,
+            ELEMENTS_PER_THREAD=1,
+            NUM_WARPS=4,
+            num_warps=4,
+        )
+        return hidden, residual_out
+
 
 @triton.jit
 def iris_stage_one_shot_allreduce_kernel(
@@ -832,6 +894,201 @@ def iris_reduce_symmetric_gluon_kernel(
         RANK,
         WORLD_SIZE,
         NUM_WARPS,
+    )
+
+
+@gluon.jit
+def iris_stage_one_shot_allreduce_residual_attnres_gluon_kernel(
+    partial_ptr,
+    residual_ptr,
+    input_sym_ptr,
+    score_weight_ptr,
+    output_weight_ptr,
+    scratch_m_ptr,
+    scratch_s_ptr,
+    scratch_acc_ptr,
+    hidden_ptr,
+    residual_out_ptr,
+    ready_flags,
+    heap_base_0,
+    heap_base_1,
+    heap_base_2,
+    heap_base_3,
+    heap_base_4,
+    heap_base_5,
+    heap_base_6,
+    heap_base_7,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    HIDDEN: gl.constexpr,
+    BLOCK: gl.constexpr,
+    EPS: gl.constexpr,
+    ELEMENTS_PER_THREAD: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    """Kimi-K3 attention AR, residual, and split AttnRes combine."""
+    layout: gl.constexpr = gl.BlockedLayout(
+        [ELEMENTS_PER_THREAD], [64], [NUM_WARPS], [0]
+    )
+    offset = gl.arange(0, BLOCK, layout=layout)
+    mask = offset < HIDDEN
+    offset_i32 = offset.to(gl.int32)
+
+    local = gl.amd.cdna4.buffer_load(
+        partial_ptr,
+        offset_i32,
+        mask=mask,
+        other=0.0,
+    ).to(gl.float32)
+    gl.amd.cdna4.buffer_store(
+        local.to(input_sym_ptr.dtype.element_ty),
+        input_sym_ptr,
+        offset_i32,
+        mask=mask,
+        cache=".wt",
+    )
+    gl.barrier()
+
+    local_ready = ready_flags + RANK
+    epoch = gl.load(local_ready).to(gl.int32) + 1
+    gl.atomic_xchg(local_ready, epoch, sem="release", scope="sys")
+
+    local_heap = _iris_heap_base(
+        RANK,
+        heap_base_0,
+        heap_base_1,
+        heap_base_2,
+        heap_base_3,
+        heap_base_4,
+        heap_base_5,
+        heap_base_6,
+        heap_base_7,
+    )
+    _iris_wait_for_rank_epoch(
+        ready_flags,
+        0,
+        epoch,
+        local_heap,
+        heap_base_0,
+        heap_base_1,
+        heap_base_2,
+        heap_base_3,
+        heap_base_4,
+        heap_base_5,
+        heap_base_6,
+        heap_base_7,
+        RANK,
+        WORLD_SIZE,
+        NUM_WARPS,
+    )
+
+    input_heap_offset = tl.cast(input_sym_ptr, gl.uint64) - local_heap
+    reduced = local
+    for peer in gl.static_range(0, WORLD_SIZE):
+        if peer != RANK:
+            peer_heap = _iris_heap_base(
+                peer,
+                heap_base_0,
+                heap_base_1,
+                heap_base_2,
+                heap_base_3,
+                heap_base_4,
+                heap_base_5,
+                heap_base_6,
+                heap_base_7,
+            )
+            peer_input = tl.cast(
+                peer_heap + input_heap_offset,
+                partial_ptr.dtype,
+            )
+            reduced += gl.amd.cdna4.buffer_load(
+                peer_input,
+                offset_i32,
+                mask=mask,
+                other=0.0,
+                cache=".cg",
+            ).to(gl.float32)
+
+    # Wait until every peer has consumed this rank's symmetric staging before
+    # a subsequent collective can reuse it.
+    gl.barrier()
+    read_done = ready_flags + WORLD_SIZE + RANK
+    read_epoch = gl.load(read_done).to(gl.int32) + 1
+    gl.atomic_xchg(read_done, read_epoch, sem="release", scope="sys")
+    _iris_wait_for_rank_epoch(
+        ready_flags,
+        1,
+        read_epoch,
+        local_heap,
+        heap_base_0,
+        heap_base_1,
+        heap_base_2,
+        heap_base_3,
+        heap_base_4,
+        heap_base_5,
+        heap_base_6,
+        heap_base_7,
+        RANK,
+        WORLD_SIZE,
+        NUM_WARPS,
+    )
+
+    reduced = reduced.to(gl.bfloat16).to(gl.float32)
+    residual = gl.amd.cdna4.buffer_load(
+        residual_ptr,
+        offset_i32,
+        mask=mask,
+        other=0.0,
+    ).to(gl.float32)
+    prefix = (reduced + residual).to(gl.bfloat16).to(gl.float32)
+    gl.amd.cdna4.buffer_store(
+        prefix.to(residual_out_ptr.dtype.element_ty),
+        residual_out_ptr,
+        offset_i32,
+        mask=mask,
+    )
+
+    score_weight = gl.amd.cdna4.buffer_load(
+        score_weight_ptr,
+        offset_i32,
+        mask=mask,
+        other=0.0,
+    ).to(gl.float32)
+    square_sum = gl.sum(gl.where(mask, prefix * prefix, 0.0), axis=0)
+    dot = gl.sum(gl.where(mask, prefix * score_weight, 0.0), axis=0)
+    prefix_logit = dot * gl.rsqrt(square_sum / HIDDEN + EPS)
+
+    block_m = gl.load(scratch_m_ptr)
+    block_s = gl.load(scratch_s_ptr)
+    maximum = gl.maximum(block_m, prefix_logit)
+    block_correction = gl.exp(block_m - maximum)
+    prefix_weight = gl.exp(prefix_logit - maximum)
+    inverse_sum = 1.0 / (block_s * block_correction + prefix_weight)
+    block_acc = gl.amd.cdna4.buffer_load(
+        scratch_acc_ptr,
+        offset_i32,
+        mask=mask,
+        other=0.0,
+    ).to(gl.float32)
+    mixed = (
+        ((block_acc * block_correction + prefix_weight * prefix) * inverse_sum)
+        .to(gl.bfloat16)
+        .to(gl.float32)
+    )
+
+    output_square_sum = gl.sum(gl.where(mask, mixed * mixed, 0.0), axis=0)
+    inverse_rms = gl.rsqrt(output_square_sum / HIDDEN + EPS)
+    output_weight = gl.amd.cdna4.buffer_load(
+        output_weight_ptr,
+        offset_i32,
+        mask=mask,
+        other=0.0,
+    ).to(gl.float32)
+    gl.amd.cdna4.buffer_store(
+        (mixed * inverse_rms * output_weight).to(hidden_ptr.dtype.element_ty),
+        hidden_ptr,
+        offset_i32,
+        mask=mask,
     )
 
 
@@ -1165,6 +1422,28 @@ def iris_all_reduce_symmetric(
 ) -> tuple[torch.Tensor, ...]:
     """Reduce consecutive symmetric producer outputs in one launch."""
     return state.all_reduce_symmetric(tensors)
+
+
+def iris_all_reduce_residual_attnres(
+    state: "IrisAllReduce",
+    partial: torch.Tensor,
+    residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    output_weight: torch.Tensor,
+    scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    eps: float,
+    op=None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Finish the exact Kimi-K3 attention reduction and AttnRes mix."""
+    return state.all_reduce_residual_attnres(
+        partial,
+        residual,
+        score_weight,
+        output_weight,
+        scratch,
+        eps,
+        op=op,
+    )
 
 
 def create_iris_rsag_state(

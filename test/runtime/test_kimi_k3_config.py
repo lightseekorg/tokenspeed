@@ -497,6 +497,14 @@ class KimiK3RegistrationTests(unittest.TestCase):
         self.assertIsNone(decode_absorbed)
         self.assertEqual(attention.fused_qkv_a_proj_with_mqa.calls, 0)
 
+    def test_ungated_mla_does_not_select_attnres_projection_fusion(self):
+        from tokenspeed.runtime.models.kimi_k3 import KimiLinearMLAAttention
+
+        attention = KimiLinearMLAAttention.__new__(KimiLinearMLAAttention)
+        torch.nn.Module.__init__(attention)
+
+        self.assertFalse(attention.can_fuse_attnres_partials(torch.empty(1, 4), ()))
+
     def test_config_registry_maps_model_type(self):
         from tokenspeed.runtime.utils.hf_transformers_utils import _CONFIG_REGISTRY
 

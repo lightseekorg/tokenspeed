@@ -36,6 +36,16 @@ if current_platform().is_amd:
         gluon_bmm_a16w16_gfx950 as _bmm_a16w16_impl,
     )
 
+    try:
+        from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.linear_attnres_partials_gfx950 import (
+            gluon_linear_attnres_partials_gfx950 as _linear_attnres_partials_impl,
+        )
+    except ImportError as exc:
+        _IMPORT_ERROR = exc
+        _linear_attnres_partials_impl = None
+    else:
+        _IMPORT_ERROR = None
+
     @register_kernel(
         "gemm",
         "bmm",
@@ -99,3 +109,56 @@ if current_platform().is_amd:
         if alpha is not None:
             output.mul_(alpha.to(device=output.device, dtype=output.dtype))
         return output
+
+    if _linear_attnres_partials_impl is not None:
+
+        @register_kernel(
+            "gemm",
+            "linear_attnres_partials",
+            name="gluon_linear_attnres_partials_gfx950",
+            solution="gluon",
+            capability=CapabilityRequirement(
+                min_arch_version=ArchVersion(9, 5),
+                max_arch_version=ArchVersion(9, 5),
+                vendors=frozenset({"amd"}),
+            ),
+            signatures=frozenset(
+                {
+                    format_signature(
+                        hidden_states=dense_tensor_format(torch.bfloat16),
+                        weight=dense_tensor_format(torch.bfloat16),
+                        blocks=dense_tensor_format(torch.bfloat16),
+                        score_weight_a=dense_tensor_format(torch.bfloat16),
+                        score_weight_b=dense_tensor_format(torch.bfloat16),
+                        out=dense_tensor_format(torch.bfloat16),
+                    )
+                }
+            ),
+            priority=Priority.SPECIALIZED,
+            traits={
+                "tokens": frozenset({1}),
+                "input_size": frozenset({7168}),
+                "output_size": frozenset({3648, 6288}),
+                "num_blocks": frozenset(range(1, 12)),
+                "inputs_contiguous": frozenset({True}),
+            },
+        )
+        def gluon_linear_attnres_partials_gfx950(**kwargs):
+            return _linear_attnres_partials_impl(**kwargs)
+
+    else:
+
+        def gluon_linear_attnres_partials_gfx950(**kwargs):
+            raise ImportError(
+                "gluon_linear_attnres_partials_gfx950 requires tokenspeed-kernel-amd"
+            ) from _IMPORT_ERROR
+
+else:
+
+    def gluon_linear_attnres_partials_gfx950(**kwargs):
+        raise ImportError(
+            "gluon_linear_attnres_partials_gfx950 requires tokenspeed-kernel-amd"
+        )
+
+
+__all__ = ["gluon_linear_attnres_partials_gfx950"]

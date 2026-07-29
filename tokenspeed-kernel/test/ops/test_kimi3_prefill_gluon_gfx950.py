@@ -28,21 +28,24 @@ def _attn_res_reference(
     score_weight: torch.Tensor,
     output_weight: torch.Tensor,
     valid_blocks: int,
+    score_eps: float,
+    output_eps: float,
 ) -> torch.Tensor:
     values = torch.cat((history[:, :valid_blocks], layer.unsqueeze(1)), dim=1).float()
-    inverse_rms = torch.rsqrt(values.square().mean(-1, keepdim=True) + 1e-6)
+    inverse_rms = torch.rsqrt(values.square().mean(-1, keepdim=True) + score_eps)
     logits = values.mul(inverse_rms) @ (score_weight * res_weight.float())
     mixed = torch.matmul(logits.softmax(-1).unsqueeze(1), values).squeeze(1)
     mixed = mixed.to(torch.bfloat16).float()
     return (
         mixed
-        * torch.rsqrt(mixed.square().mean(-1, keepdim=True) + 1e-6)
+        * torch.rsqrt(mixed.square().mean(-1, keepdim=True) + output_eps)
         * output_weight
     ).to(torch.bfloat16)
 
 
 def test_attn_res_public_block_major_dispatch_matches_reference() -> None:
     tokens, valid_blocks = 256, 8
+    score_eps, output_eps = 1e-6, 2e-6
     generator = torch.Generator(device="cuda").manual_seed(91)
     layer = torch.randn(
         tokens, 7168, device="cuda", dtype=torch.bfloat16, generator=generator
@@ -66,8 +69,9 @@ def test_attn_res_public_block_major_dispatch_matches_reference() -> None:
         history,
         res_weight,
         score_weight,
-        eps=1e-6,
+        eps=score_eps,
         out_norm_weight=output_weight,
+        out_norm_eps=output_eps,
     )
     expected = _attn_res_reference(
         layer,
@@ -76,6 +80,8 @@ def test_attn_res_public_block_major_dispatch_matches_reference() -> None:
         score_weight,
         output_weight,
         valid_blocks,
+        score_eps,
+        output_eps,
     )
     torch.testing.assert_close(actual, expected, rtol=5e-3, atol=1.6e-2)
 

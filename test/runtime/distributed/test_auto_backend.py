@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -8,6 +8,7 @@ from tokenspeed.runtime.distributed.comm_backend import (
     triton_allreduce as triton_allreduce_module,
 )
 from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+from tokenspeed.runtime.distributed.comm_backend.base import CommBackend
 from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
 from tokenspeed.runtime.distributed.comm_backend.triton_allreduce import (
     TritonAllReduceBackend,
@@ -350,3 +351,30 @@ def test_non_amd_collections_do_not_probe_symmetric_outputs(backend, monkeypatch
 
     backend._triton_ar.can_reduce_outputs.assert_not_called()
     assert backend._nccl.all_reduce.call_count == 2
+
+
+def test_force_deterministic_rsag_disables_fused_attnres(backend, monkeypatch):
+    monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", True)
+    tensor = torch.empty(1, 4)
+    scratch = (torch.empty(1), torch.empty(1), torch.empty(1, 4))
+    fallback_result = (Mock(), Mock())
+
+    with patch.object(
+        CommBackend,
+        "all_reduce_residual_attnres",
+        return_value=fallback_result,
+    ) as fallback:
+        result = backend.all_reduce_residual_attnres(
+            tensor,
+            tensor,
+            torch.empty(4),
+            torch.empty(4),
+            scratch,
+            1e-5,
+            (0, 1),
+        )
+
+    assert result is fallback_result
+    fallback.assert_called_once()
+    backend._trtllm_ar.has_trtllm_ar.assert_not_called()
+    backend._triton_ar.can_run_residual_attnres.assert_not_called()
