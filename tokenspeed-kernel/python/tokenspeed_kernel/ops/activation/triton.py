@@ -154,8 +154,7 @@ def _sigmoid_mul_kernel(
     ENABLE_PDL: tl.constexpr,
 ):
     if ENABLE_PDL:
-        # Both x and gate are predecessor projection outputs; fence the whole
-        # elementwise op before the first dependent load.
+        # Both x and gate are predecessor outputs; fence before the first dependent load.
         tl.extra.cuda.gdc_wait()
     pid = tl.program_id(0).to(tl.int64)
     block_start = pid * BLOCK_SIZE
@@ -234,10 +233,7 @@ def sigmoid_mul(
     pdl_kwargs = (
         {"launch_pdl": True} if enable_pdl and current_platform().is_nvidia else {}
     )
-    # Small (decode-gate) inputs are launch-latency bound: 512-wide blocks
-    # give 2-4 light CTAs that spread across SMs and shave ~0.2us over one
-    # or two 1024-wide CTAs (graph-replay ranked); large inputs keep the
-    # bandwidth-shaped 1024 config.
+    # Small (decode-gate) inputs are launch-latency bound: 512-wide blocks spread light CTAs across SMs; large inputs keep the bandwidth-shaped 1024 config.
     BLOCK_SIZE = 512 if n <= 8192 else 1024
     grid = ((n + BLOCK_SIZE - 1) // BLOCK_SIZE,)
     _sigmoid_mul_kernel[grid](
@@ -515,10 +511,7 @@ def situ_and_mul(
     if n == 0:
         return out
 
-    # 512 wins or ties 1024 from single-token decode rows (2-3 CTAs spread
-    # across SMs instead of one fat CTA) through prefill-sized inputs on
-    # SM90+/SM100+ parts; ranked via CUDA-graph replay against Inductor's
-    # autotuned pointwise configs for the same shapes.
+    # 512 wins or ties 1024 from decode rows through prefill-sized inputs on SM90+/SM100+ parts.
     pdl_kwargs = (
         {"launch_pdl": True} if enable_pdl and current_platform().is_nvidia else {}
     )
@@ -685,14 +678,10 @@ def _rmsnorm_gated_kernel(
     ENABLE_PDL: tl.constexpr,
 ):
     if ENABLE_PDL:
-        # x and gate are predecessor outputs (weight is a static parameter but
-        # x is read first): fence the whole per-head norm up front.
+        # x and gate are predecessor outputs: fence the whole per-head norm up front.
         tl.extra.cuda.gdc_wait()
     token = tl.program_id(0)
-    # Head-block grid axis: one CTA per (token, BLOCK_H heads). With
-    # BLOCK_H >= num_heads the axis is 1 and this is the classic one-CTA-per
-    # -token layout; decode-sized inputs split the heads across light CTAs
-    # instead (launch-latency bound regime, graph-replay ranked).
+    # One CTA per (token, BLOCK_H heads); decode-sized inputs split the heads across light CTAs (launch-latency bound regime).
     offs_h = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
     offs_d = tl.arange(0, head_dim)
     mask_h = offs_h < num_heads
@@ -738,11 +727,7 @@ def rmsnorm_gated_sigmoid(
     out = torch.empty_like(x)
     num_tokens = x.shape[0]
     if num_tokens <= 64:
-        # Launch-latency bound: split the heads over one-warp CTAs (a
-        # [2, head_dim] tile each) so the per-head norms run in parallel
-        # across SMs; ~0.25us faster than the one-fat-CTA layout at decode
-        # sizes (graph-replay ranked) and occupancy-light next to aux-stream
-        # work.
+        # Launch-latency bound: split the heads over one-warp CTAs so the per-head norms run in parallel across SMs.
         block_h, num_warps = 2, 1
     else:
         block_h, num_warps = triton.next_power_of_2(num_heads), 4

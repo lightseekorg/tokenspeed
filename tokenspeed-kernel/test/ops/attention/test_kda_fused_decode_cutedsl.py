@@ -150,8 +150,7 @@ def _torch_reference(x, *, lower_bound=LOWER_BOUND, apply_onorm=False):
         if w >= 0:
             x["h_pool"][w] = h
     if apply_onorm:
-        # Gated RMSNorm on the fp32 outputs (matching the fused epilogue,
-        # which never rounds o to bf16 before normalizing).
+        # Gated RMSNorm on the fp32 outputs, matching the fused epilogue (no bf16 round-trip).
         var = (out * out).mean(-1, keepdim=True)
         out = (
             out
@@ -185,9 +184,7 @@ class TestKdaFusedDecodeCutedsl:
     def test_cuda_graph_capture(self, bs):
         x = _make_inputs(bs, seed=8)
         stream = torch.cuda.Stream()
-        # Order the side-stream launches after the default-stream input
-        # producers (randn/randperm): without this the kernel can read
-        # garbage page indices under load and fault OOB.
+        # Side-stream launches must order after the default-stream input producers, or the kernel can read garbage page indices and fault OOB.
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             for _ in range(3):
@@ -198,8 +195,7 @@ class TestKdaFusedDecodeCutedsl:
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g, stream=stream):
             o = _run(x)
-        # Replay on restored pools reproduces the step (state-pool-resident
-        # in/out, like the engine's decode graph).
+        # Replay on restored pools reproduces the step, like the engine's decode graph.
         x["h_pool"].copy_(_make_inputs(bs, seed=8)["h_pool"])
         x["conv_pool"].copy_(_make_inputs(bs, seed=8)["conv_pool"])
         g.replay()
@@ -218,9 +214,7 @@ class TestKdaFusedDecodeCutedsl:
         _assert_step_close(x, o, ref_x, ref_o)
 
     def test_onorm_fused_vs_separate_chain(self):
-        # The separate norm kernel reads o back after a bf16 round-trip; the
-        # fused epilogue norms the fp32 values, so the two agree only to
-        # bf16 rounding (~2^-8 relative — a tiny, favorable difference).
+        # The fused epilogue norms fp32 values while the separate kernel sees a bf16 round-trip, so the two agree only to bf16 rounding.
         from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
 
         bs = 4
@@ -248,8 +242,7 @@ class TestKdaFusedDecodeCutedsl:
         )
 
     def test_onorm_strided_gate(self):
-        # Gate as a column slice of a wider projection output (the runtime
-        # passes the merged-projection g section without materializing it).
+        # Gate as a column slice of a wider projection output, as the runtime passes it.
         bs = 3
         x = _make_inputs(bs, seed=31)
         wide = torch.randn(bs, 5 * P, dtype=torch.bfloat16, device="cuda")
@@ -281,10 +274,7 @@ class TestKdaFusedDecodeCutedsl:
         _assert_step_close(x, o, ref_x, ref_o)
 
     def test_onorm_large_batch_fused(self):
-        # Large batches run the nv=1 band (bulk-TMA staged, block-local
-        # epilogue), where the fused norm is measured faster than the
-        # standalone kernel at every batch size — the wrapper fuses
-        # unconditionally when the operands are eligible.
+        # Large batches run the nv=1 band; the wrapper fuses the norm unconditionally when operands are eligible.
         bs = 32
         x = _make_inputs(bs, seed=36)
         ref_x = _clone(x)
@@ -297,11 +287,7 @@ class TestKdaFusedDecodeCutedsl:
 
     @pytest.mark.parametrize("pad_elems", [0, 640, 642])
     def test_envelope_strided_pool(self, pad_elems):
-        # Unified / page-major pools pitch a slot across all layers, so the
-        # page stride exceeds the dense HV*K*V. pad 640 keeps the pitch
-        # 16B-aligned (nv=1 stays on the bulk-TMA path); pad 642 makes it
-        # 16B-misaligned (8B-aligned), which must auto-fall back to the
-        # layout-agnostic nv=2 path — same numerics either way.
+        # Envelope pitch: pad 640 stays 16B-aligned (bulk-TMA nv=1); pad 642 is only 8B-aligned and must auto-fall back to the nv=2 path — same numerics either way.
         bs = 8  # batch band that picks nv=1 on aligned pools
         pages = 16
         x = _make_inputs(bs, pages=pages, seed=37)
@@ -340,9 +326,7 @@ class TestKdaFusedDecodeCutedsl:
     def test_onorm_cuda_graph_capture(self, bs):
         x = _make_inputs(bs, seed=34)
         stream = torch.cuda.Stream()
-        # Order the side-stream launches after the default-stream input
-        # producers (randn/randperm): without this the kernel can read
-        # garbage page indices under load and fault OOB.
+        # Side-stream launches must order after the default-stream input producers, or the kernel can read garbage page indices and fault OOB.
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             for _ in range(3):

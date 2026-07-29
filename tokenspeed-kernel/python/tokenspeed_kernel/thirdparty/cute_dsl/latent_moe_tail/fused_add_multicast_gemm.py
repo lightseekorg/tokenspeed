@@ -215,9 +215,7 @@ def _epilogue_tma_store_add_shared(
         fused_vec = (gemm_vec.to(cutlass.Float32) + shared_vec.to(cutlass.Float32)).to(
             gemm_kernel.c_dtype
         )
-        # The symmetric output is an in-band Lamport mailbox whose empty
-        # marker contains BF16 -0. Normalize either signed zero to +0 so a
-        # legitimate result can never be mistaken for an unwritten fragment.
+        # The Lamport mailbox empty marker is BF16 -0: normalize signed zeros to +0 so a real result is never mistaken for an unwritten fragment.
         fused_vec = cute.where(
             fused_vec == cute.zeros_like(fused_vec),
             cute.zeros_like(fused_vec),
@@ -395,9 +393,7 @@ class FusedAddMulticastGemm:
         stream: cuda.CUstream,
     ):
         """Launch the persistent GEMM."""
-        # Preserve C's logical strided layout but point the TMA descriptor at
-        # this rank's shard inside the LSA multicast mapping.  One TMA store is
-        # therefore replicated into the same shard on all eight ranks.
+        # Point C's TMA descriptor at this rank's shard in the LSA multicast mapping: one TMA store replicates into the same shard on all ranks.
         c = cute.make_tensor(
             cute.make_ptr(
                 c.element_type,
@@ -656,8 +652,7 @@ class FusedAddMulticastGemm:
         gC_mnl = cute.local_tile(
             mC_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
         )
-        # Shared shard is physically [M, shard_dim]. Give it the same logical MNL
-        # view as C so its epilogue partition is coordinate-identical.
+        # Give the [M, shard_dim] shared shard C's logical MNL view so its epilogue partition is coordinate-identical.
         mShared_mnl = cute.make_tensor(
             shared_shard.iterator,
             cute.append(shared_shard.layout, cute.make_layout((1,), stride=(0,))),
@@ -740,9 +735,7 @@ class FusedAddMulticastGemm:
                     (None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])
                 ]
 
-                # Prime a short prefix of the existing combined A+B ring with
-                # B only.  Its barrier still expects A+B bytes, so the MMA
-                # consumer cannot observe a half-filled stage.
+                # Prime a short prefix of the A+B ring with B only; the barrier still expects A+B bytes, so the MMA consumer cannot observe a half-filled stage.
                 ab_producer.reset()
                 peek_ab_empty_status = ab_producer.try_acquire()
 
@@ -761,8 +754,7 @@ class FusedAddMulticastGemm:
 
                 cute.arch.griddepcontrol_wait()
 
-                # Supply A to the very same stages after the producer AR has
-                # programmatically released this dependent kernel.
+                # Supply A to the same stages only after the producer AR released this dependent kernel.
                 a_fill_state = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.num_ab_stage
                 )
@@ -929,9 +921,7 @@ class FusedAddMulticastGemm:
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
 
-        # Allow the Lamport copy to become resident before this grid
-        # fully retires. Its griddepcontrol.wait still enforces complete
-        # producer-grid ordering before mailbox inspection.
+        # Let the Lamport copy become resident early; its griddepcontrol.wait still orders full producer-grid completion before mailbox inspection.
         cute.arch.griddepcontrol_launch_dependents()
 
     @staticmethod
@@ -986,11 +976,7 @@ def launch_kernel(
     stream: cuda.CUstream,
 ):
     """Launch the fused-add multicast GEMM using PyTorch BMM tensor order."""
-    # C is passed as the fixed-capacity [1,max_m,H] symmetric mailbox. Only M
-    # is runtime-variable; construct this rank's logical [1,M,S] view here so
-    # H and S remain compile-time constants and no dynamic strided host view is
-    # needed on every call. __call__ later replaces the local base pointer with
-    # the already rank-offset multicast address.
+    # Build the rank-local [1,M,S] view of the [1,max_m,H] mailbox here so H and S stay compile-time constants; only M is runtime-variable.
     c = cute.make_tensor(
         c.iterator,
         cute.make_layout(
@@ -1062,9 +1048,7 @@ def compile_kernel(
     if any(tensor.element_type is not cutlass.BFloat16 for tensor in (a, b, c)):
         raise ValueError("up-projection tensors must be BF16")
 
-    # The producer writes [M, full_hidden_dim]. GEMM receives a rank-local
-    # [M, shard_dim] view: contiguous within a row, with full_hidden_dim as
-    # its leading dimension.
+    # GEMM receives a rank-local [M, shard_dim] view of the producer's [M, full_hidden_dim] output (leading dim full_hidden_dim).
     shared_shard_compile = make_fake_tensor(
         shared_shard.element_type,
         (mnkl[0], shard_dim),

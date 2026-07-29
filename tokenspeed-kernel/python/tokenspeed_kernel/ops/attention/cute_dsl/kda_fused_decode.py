@@ -384,12 +384,7 @@ class KdaFusedDecodeKernel:
         n_seq = read_indices.shape[0]
         grid = (self.nv, self.num_heads, n_seq)
         block = (2 * self.head_dim, 1, 1)
-        # nv > 1 launches the column-split blocks of one head as a cluster:
-        # with in-place conv paging (read page == write page) the bx == 0
-        # block's q/k conv-window shift must not land before a sibling block
-        # has read the old window, and only a cluster barrier can order that
-        # across blocks (the Triton megafusion relies on same-wave residency
-        # for this, which stops holding once the grid exceeds one wave).
+        # nv > 1 must be a cluster: only a cluster barrier orders the in-place conv-window shift after sibling reads.
         cluster = (self.nv, 1, 1) if self.nv > 1 else None
         self.kernel(
             qkv_raw,
@@ -453,43 +448,28 @@ class KdaFusedDecodeKernel:
         s_k = smem.allocate_tensor(Float32, cute.make_layout((K,)))
         s_dec = smem.allocate_tensor(Float32, cute.make_layout((K,)))
         s_v = smem.allocate_tensor(Float32, cute.make_layout((BV,)))
-        # Under the fused output norm at nv > 1 one extra tail slot receives
-        # the sibling's DSM o^2 partial. It must NOT alias s_norm[0..7]: the
-        # sibling's epilogue store is unordered against this block's phase-2
-        # reads of the L2 partials (q_inv/k_inv) — reusing s_norm[CPL] was a
-        # cross-CTA WAR race (racecheck: WAR at s_norm+CPL*4, DSM store from
-        # the sibling's tid 0 vs the local q_inv reads).
+        # The sibling's DSM o^2 tail slot must NOT alias s_norm[0..7]: its store is unordered vs this block's L2-partial reads.
         norm_slots = _NUM_WARPS + (1 if (self.apply_onorm and self.nv > 1) else 0)
         s_norm = smem.allocate_tensor(Float32, cute.make_layout((norm_slots,)))
-        # Row-major so partial writes and per-lane column reads are shared
-        # memory bank conflict free.
+        # Row-major keeps partial writes and per-lane column reads bank-conflict free.
         s_red_t = smem.allocate_tensor(
             Float32, cute.make_layout((_NUM_WARPS, BV), stride=(BV, 1))
         )
         s_red_o = smem.allocate_tensor(
             Float32, cute.make_layout((_NUM_WARPS, BV), stride=(BV, 1))
         )
-        # This block's [K, BV] state slice, cp.async-prefetched at kernel
-        # entry so the state read stream overlaps the whole conv/GEMV front.
+        # This block's [K, BV] state slice, prefetched to overlap the conv/GEMV front.
         s_h = smem.allocate_tensor(
             Float32, cute.make_layout((K, BV), stride=(BV, 1)), byte_alignment=16
         )
-        # nv == 1 stages the whole [K, V] head slab with one 1D bulk-TMA copy
-        # (the slab is gmem-contiguous only when the block owns every column);
-        # completion is observed on this mbarrier.
+        # nv == 1 stages the whole [K, V] slab via one bulk-TMA copy; completion on this mbarrier.
         s_mbar = None
         if cutlass.const_expr(self.nv == 1):
             s_mbar = smem.allocate_tensor(
                 Int64, cute.make_layout((1,)), byte_alignment=8
             )
 
-        # PDL note: only qkv_raw / f_a / beta come from the same-stream
-        # producer GEMV. Everything else (indices, cu_seqlens, both state
-        # pools, conv/w_fb weights) pre-exists the producer, so under PDL the
-        # kernel front-loads the whole cp.async state stream, the conv taps,
-        # and the conv windows BEFORE griddepcontrol_wait — the state stream
-        # then hides behind the producer's tail. (The Triton megafusion can
-        # only fence the whole kernel.)
+        # Only qkv_raw / f_a / beta are producer-written; all other loads may issue before griddepcontrol_wait.
         if cutlass.const_expr(self.has_cu_seqlens):
             bos = cu_seqlens[i_n]
             t_len = cu_seqlens[i_n + 1] - bos
@@ -497,9 +477,7 @@ class KdaFusedDecodeKernel:
             bos = Int32(i_n)
             t_len = Int32(1)
 
-        # Zero-length sequences (graph padding) do nothing, exactly like the
-        # Triton kernel's early return. The branch is block-uniform, so the
-        # barriers below are safe.
+        # Zero-length sequences skip block-uniformly, so the barriers below are safe.
         if t_len > 0:
             r_page = read_indices[i_n]
             w_page = write_indices[i_n]
@@ -508,18 +486,7 @@ class KdaFusedDecodeKernel:
 
             col = i_v * BV + CPL * lane
 
-            # ---- phase 0: start the state read stream (async, in smem) ----
-            # nv == 1: the block owns the whole gmem-contiguous [K, V] slab,
-            # so a single thread issues one 64KB 1D bulk-TMA copy (sync-free
-            # DMA; every other thread proceeds straight into the front). The
-            # mbarrier init is published to the waiting threads by the
-            # phase-1 block barrier, which every thread crosses before the
-            # wait; the issuing thread's arrive/copy are program-ordered
-            # after its own init.
-            # nv > 1: per-thread cp.async vectors — each thread copies its
-            # 16 x CPL elements as one vector per row; the DMA runs behind
-            # the conv/GEMV front and each thread re-reads exactly the slots
-            # it copied, so cp.async.wait_all alone orders the reads.
+            # Phase 0 state read stream: nv == 1 bulk-TMA (mbarrier init published by the phase-1 block barrier); nv > 1 cp.async, where each thread re-reads exactly the slots it copied so wait_all alone orders the reads.
             if cutlass.const_expr(self.nv == 1):
                 if tid == 0:
                     cute.arch.mbarrier_init(s_mbar.iterator, 1)
@@ -546,21 +513,7 @@ class KdaFusedDecodeKernel:
                             size=4 * CPL,
                         )
 
-            # ---- phase 1 (single straight-line front, one barrier) ----
-            # Everything before the recurrence — conv(+SiLU), the L2-norm
-            # partials, the f_b gate GEMV, and the decay transcendentals —
-            # runs back to back with no intervening barrier, so the conv,
-            # w_fb, and f_a loads are all in flight together and overlap the
-            # GEMV/SiLU arithmetic. s_q/s_k hold the *raw* SiLU outputs; the
-            # L2 normalizers (and the attention scale) distribute over the
-            # recurrence dots and are folded in after the barrier:
-            #   t = <h, k_raw> * k_inv,  h += (v_new * k_inv) * k_raw,
-            #   o = <h, q_raw> * q_inv_scaled
-            # which removes the second front barrier entirely.
-            #
-            # Threads [0, K) own q feature `tid`; threads [K, 2K) own k
-            # feature `tid - K`. The first CPL warps additionally convolve
-            # this block's BV-column v-window.
+            # Phase 1 front is barrier-free: s_q/s_k hold *raw* SiLU outputs and the L2 normalizers (+ scale) distribute over the recurrence dots after the single front barrier.
             is_q = tid < K
             f_local = Int32(tid)
             if not is_q:
@@ -569,10 +522,7 @@ class KdaFusedDecodeKernel:
             if not is_q:
                 feat = P + i_hv * K + f_local
 
-            # Producer-independent work first: conv taps and both conv
-            # windows (prior state), folded straight into partial conv
-            # accumulators so only a few scalars stay live across the PDL
-            # wait (full tap fragments would cost occupancy at large batch).
+            # Producer-independent conv taps/windows fold into partial accumulators so only a few scalars stay live across the PDL wait.
             w_tap = _load_bf16x4_as_f32(conv_w.iterator + feat * 4)
             st0 = Float32(0.0)
             st1 = Float32(0.0)
@@ -583,8 +533,7 @@ class KdaFusedDecodeKernel:
                 st2 = Float32(conv_pool[r_page, feat, 2])
             acc = st0 * w_tap[0] + st1 * w_tap[1] + st2 * w_tap[2]
             w3 = w_tap[3]
-            # warp % CPL keeps the address in range for the warps that do
-            # not own a v-column (their loads are dead duplicates).
+            # warp % CPL keeps the address in range for warps without a v-column (dead loads).
             vfeat = 2 * P + i_hv * V + i_v * BV + (warp % CPL) * 32 + lane
             vw_tap = _load_bf16x4_as_f32(conv_w.iterator + vfeat * 4)
             vs0 = Float32(0.0)
@@ -607,8 +556,6 @@ class KdaFusedDecodeKernel:
             y = _silu(acc)
 
             # L2-norm partials: warps 0..3 hold q features, 4..7 hold k.
-            # Raw SiLU outputs go straight to smem; normalization is folded
-            # into the recurrence dots after the barrier.
             sq_sum = cute.arch.warp_reduction_sum(y * y)
             if lane == 0:
                 s_norm[warp] = sq_sum
@@ -617,20 +564,14 @@ class KdaFusedDecodeKernel:
             else:
                 s_k[f_local] = y
 
-            # v conv for this block's columns (first CPL warps, one column
-            # per lane). The shifted window values are kept in registers for
-            # the deferred tail store.
+            # v conv (first CPL warps); shifted window values stay in registers for the deferred tail store.
             xv_keep = Float32(0.0)
             if warp < CPL:
                 xv_keep = Float32(qkv_raw[bos, vfeat])
                 vacc += xv_keep * vw3
                 s_v[warp * 32 + lane] = _silu(vacc)
 
-            # g[c] = w_fb[c, :] . f_a  for this head's K gate channels. Each
-            # warp reduces 16 rows: one 8-byte vector load per lane per row
-            # (coalesced 256B rows) against a register-cached f_a fragment
-            # read straight from global memory (no smem staging, so the GEMV
-            # needs no barrier and overlaps the conv phase above).
+            # f_b gate GEMV reads f_a straight from global (no smem staging), so it needs no barrier and overlaps the conv phase.
             E = D_FA // 32  # elements per lane per row (multiple of 4)
             fa_frag = cute.make_rmem_tensor(E, Float32)
             for e4 in cutlass.range_constexpr(E // 4):
@@ -639,10 +580,7 @@ class KdaFusedDecodeKernel:
                 )
                 for e in cutlass.range_constexpr(4):
                     fa_frag[e4 * 4 + e] = fa4[e]
-            # Lane j keeps row j's dot so the bias + safe gate + exp run in
-            # parallel on 16 lanes after the loop (warp-local rows: warp w's
-            # GEMV rows equal its recurrence rows) — no barrier, and no
-            # serialized per-row divergent transcendental tails.
+            # Lane j keeps row j's dot so bias + gate + exp run in parallel on 16 lanes (warp-local rows, no barrier).
             g_mine = Float32(0.0)
             for j in cutlass.range_constexpr(ROWS):
                 row = warp * ROWS + j
@@ -678,29 +616,11 @@ class KdaFusedDecodeKernel:
 
             cute.arch.barrier()
 
-            # Under nv > 1, in-place conv paging means the sibling blocks
-            # read the same q/k conv-window slots this cluster shifts in the
-            # tail, so their stores must be held until every sibling has
-            # read. The relaxed arrive is safe *here*, right after bar.sync:
-            # the block barrier is a hard scheduling fence, and by this point
-            # every warp's conv loads were consumed by the SiLU math (in-order
-            # issue), so arrival implies the reads are complete. The matching
-            # wait sits at the kernel tail before the deferred window stores,
-            # hiding the barrier behind the whole recurrence. (A release
-            # arrive would additionally drain the in-flight cp.async state
-            # stream and cost ~0.6us; the Triton megafusion instead relies on
-            # same-wave residency, which stops holding beyond one wave.)
-            # Under the fused output norm this early arrive additionally
-            # anchors phase A of a two-phase cluster handshake: the epilogue
-            # WAITS on it before its DSM store, guaranteeing the sibling has
-            # entered the kernel (a shared::cluster store to a CTA that has
-            # not begun execution is an illegal memory access) and that its
-            # conv-window reads are complete.
+            # The relaxed arrive is only safe right here, after bar.sync (conv-window reads are complete by in-order issue); the matching wait sits at the tail before the deferred window stores, and under the fused norm also anchors phase A of the DSM handshake.
             if cutlass.const_expr(self.nv > 1):
                 cute.arch.cluster_arrive_relaxed()
 
-            # ---- phase 2: delta-rule recurrence over the state slab ----
-            # Folded L2 normalizers (see the phase-1 note).
+            # Phase 2: delta-rule recurrence; folded L2 normalizers (see the phase-1 note).
             q_inv = (
                 1.0
                 / cute.math.sqrt(s_norm[0] + s_norm[1] + s_norm[2] + s_norm[3] + 1e-6)
@@ -710,15 +630,7 @@ class KdaFusedDecodeKernel:
                 s_norm[4] + s_norm[5] + s_norm[6] + s_norm[7] + 1e-6
             )
 
-            # Warp `w` streams K-rows [16w, 16w+16); lane owns CPL columns.
-            # Pass 1: decay each prefetched row, accumulate the per-column
-            # removal dots t = <h_decayed[:, col], k>.
-            #
-            # nv == 1 keeps the state smem-resident (pass 2 recomputes the
-            # decayed value from s_h): a (ROWS, CPL=4) register strip would
-            # cost 64 registers per thread and spill. nv > 1 (CPL <= 2)
-            # instead parks the decayed rows in registers across the passes,
-            # which keeps the pass-2 critical path off shared memory.
+            # Pass 1 accumulates t = <h_decayed[:, col], k>; nv == 1 keeps the state smem-resident (a register strip would spill), nv > 1 parks the decayed rows in registers across the passes.
             h_reg = None
             if cutlass.const_expr(self.nv > 1):
                 h_reg = cute.make_rmem_tensor((ROWS, CPL), Float32)
@@ -762,21 +674,14 @@ class KdaFusedDecodeKernel:
                     t_col += s_red_t[w, CPL * lane + c]
                 v_new_k[c] = (s_v[CPL * lane + c] - t_col * k_inv) * b_sig * k_inv
 
-            # Pass 2: rank-1 update from registers, stream rows back (one
-            # vector store per row), and accumulate the per-column output
-            # dots o = <h_new[:, col], q>. Under the fused norm at nv > 1
-            # the state writeback is deferred past the cluster barrier: the
-            # epilogue's release-arrive would otherwise have to drain the
-            # freshly issued h-store stream (~0.8us measured); deferred, the
-            # release only covers shared memory.
+            # Pass 2: rank-1 update and o dots; under the fused norm at nv > 1 the state writeback defers past the cluster barrier so the release-arrive covers only shared memory.
             defer_h = cutlass.const_expr(self.apply_onorm and self.nv > 1)
             o_acc = cute.make_rmem_tensor(CPL, Float32)
             for c in cutlass.range_constexpr(CPL):
                 o_acc[c] = Float32(0.0)
             h_out = cute.make_rmem_tensor(CPL, Float32)
             if cutlass.const_expr(self.nv == 1):
-                # Recompute the decayed row from s_h (see the pass-1 note);
-                # nv == 1 always stores immediately (no cluster, no deferral).
+                # Recompute the decayed row from s_h; nv == 1 always stores immediately.
                 for j in cutlass.range_constexpr(ROWS):
                     row = warp * ROWS + j
                     kv = s_k[row]
@@ -826,9 +731,7 @@ class KdaFusedDecodeKernel:
 
             cute.arch.barrier()
 
-            # First CPL warps combine this block's BV output columns; the
-            # remaining warps compute duplicates (warp % CPL) so the fused
-            # norm's reductions stay branch-free.
+            # First CPL warps combine the output columns; the rest compute duplicates so the fused norm's reductions stay branch-free.
             oc = (warp % CPL) * 32 + lane
             o_col = Float32(0.0)
             for w in cutlass.range_constexpr(_NUM_WARPS):
@@ -836,32 +739,17 @@ class KdaFusedDecodeKernel:
             o_val = o_col * q_inv
 
             if cutlass.const_expr(self.apply_onorm):
-                # ---- fused output gated RMSNorm ----
-                # rmsnorm(o) * weight * sigmoid(gate), per head over V, on
-                # the fp32 o values (the separate norm kernel reads o back
-                # after a bf16 round-trip; the fused path skips that rounding
-                # — a tiny, favorable difference).
+                # Fused output gated RMSNorm on the fp32 o values (skips the standalone kernel's bf16 round-trip).
                 part = cute.arch.warp_reduction_sum(o_val * o_val)
                 if lane == 0 and warp < CPL:
-                    # Local reuse of s_norm[0..CPL-1] is safe: every thread's
-                    # q_inv/k_inv reads of the L2 partials precede the block
-                    # barriers above (in-block ordering only — the sibling's
-                    # partial lands in the dedicated tail slot, never here).
+                    # Reusing s_norm[0..CPL-1] is safe in-block only: all q_inv/k_inv reads precede the barriers above; the sibling's partial lands in the dedicated tail slot.
                     s_norm[warp] = part
                 cute.arch.barrier()
                 ssq = s_norm[0]
                 for wsl in cutlass.range_constexpr(1, CPL):
                     ssq += s_norm[wsl]
                 if cutlass.const_expr(self.nv > 1):
-                    # Exchange the block-local o^2 partial with the sibling
-                    # through distributed shared memory, in two cluster
-                    # phases. Phase A (arrive: the early relaxed arrive after
-                    # the front barrier; wait: here) proves the sibling has
-                    # entered the kernel before we store into its shared
-                    # memory — a shared::cluster store to a CTA that has not
-                    # begun execution faults — and orders its conv-window
-                    # reads before the tail stores. Phase B (release-arrive /
-                    # acquire-wait around the store) publishes the partial.
+                    # Phase A's wait must precede the DSM store — a shared::cluster store to a CTA that has not begun execution faults; phase B (release-arrive / acquire-wait) publishes the partial.
                     cute.arch.cluster_wait()
                     if tid == 0:
                         peer = map_shared_to_peer(
@@ -904,11 +792,7 @@ class KdaFusedDecodeKernel:
                 if warp < CPL:
                     o[bos, i_hv, i_v * BV + oc] = BFloat16(o_val)
 
-            # ---- tail: deferred conv-window shift stores ----
-            # By now every sibling block has long arrived, so the wait is
-            # free; the q/k window (bx == 0 only) and this block's v window
-            # are stored once per page. (With the fused norm at nv > 1 the
-            # wait already ran in the epilogue above.)
+            # Tail: the cluster wait must precede the deferred conv-window shift stores (under the fused norm it already ran in the epilogue).
             if cutlass.const_expr(self.nv > 1 and not self.apply_onorm):
                 cute.arch.cluster_wait()
             if write_ok:
@@ -961,16 +845,14 @@ def _compile_kda_fused_decode(
     n_seq = cute.sym_int()
     read_indices = make_fake_tensor(idx_dtype, (n_seq,))
     write_indices = make_fake_tensor(idx_dtype, (n_seq,))
-    # Unused optional operands are compiled against the specs of harmless
-    # placeholders the launcher passes in their place (never read).
+    # Unused optional operands compile against never-read placeholder specs.
     if onorm_eps is not None:
         onorm_w = make_fake_tensor(onorm_w_dtype, (head_dim,))
         onorm_gate = make_fake_tensor(BFloat16, (tokens, p))
     else:
         onorm_w = make_fake_tensor(Float32, (num_heads,))  # placeholder: A_log
         onorm_gate = make_fake_tensor(BFloat16, (tokens, num_heads))  # beta
-    # When dense-indexed the launcher passes read_indices as a never-read
-    # placeholder, so the fake dtype must follow the index dtype.
+    # Dense-indexed passes read_indices as placeholder, so the fake dtype must follow the index dtype.
     cu_seqlens = make_fake_tensor(
         Int32 if has_cu_seqlens else idx_dtype, (cute.sym_int(),)
     )
@@ -1082,14 +964,11 @@ def cutedsl_fused_recurrent_kda_megafuse(
         raise ValueError("cutedsl KDA fused decode requires dt_bias")
     assert qkv_raw.stride(-1) == 1 and qkv_raw.shape[-1] == 3 * p
     assert f_a.stride(-1) == 1 and beta.stride(-1) == 1
-    # The kernel reads f_a as 8-byte bf16x4 vectors; every token row must
-    # start 8B-aligned (row stride a multiple of 4 bf16 elements).
+    # f_a is read as 8-byte bf16x4 vectors: every token row must start 8B-aligned.
     assert t <= 1 or f_a.stride(0) % 4 == 0
     assert w_fb.is_contiguous() and w_fb.shape == (p, d_fa)
     assert h_pool.stride(-1) == 1 and h_pool.shape[1:] == (hv, k, k)
-    # The recurrence reads/writes the state as 8/16-byte vectors; every page
-    # slab must start 8B-aligned (pitch a multiple of 2 fp32 elements — true
-    # for the dense pitch and every envelope pitch in use).
+    # State is read/written as 8/16-byte vectors: every page slab must start 8B-aligned.
     assert h_pool.stride(0) % 2 == 0
     assert conv_pool.stride(-1) == 1 and conv_pool.shape[1:] == (3 * p, 3)
     conv_w = conv_w.reshape(3 * p, 4)
@@ -1102,16 +981,7 @@ def cutedsl_fused_recurrent_kda_megafuse(
     n = t if cu_seqlens is None else cu_seqlens.numel() - 1
     assert read_indices.numel() == n and write_indices.numel() == n
 
-    # Attempt-and-verify output-norm handoff: fuse when the operands match
-    # what the epilogue supports, and tell the caller through the stash.
-    # The decision depends only on shapes/dtypes/strides, so it is stable
-    # across CUDA-graph capture and replay.
-    # Fusion wins at every batch size: small batches ride the saved launch
-    # (nv=2, DSM-combined partials), large batches run the nv=1 block-local
-    # epilogue, measured faster than the standalone norm up through B=256
-    # on B300 (B=64: 19.0us vs 20.1us; B=256: 91us vs 93us). The old t<=16
-    # gate guarded the nv=2 DSM epilogue's large-batch serialization, which
-    # the nv=1 path does not have.
+    # Attempt-and-verify onorm handoff: the decision depends only on shapes/dtypes/strides, so it is stable across CUDA-graph capture and replay.
     fuse_onorm = (
         onorm is not None
         and onorm.weight.numel() == k
@@ -1124,11 +994,7 @@ def cutedsl_fused_recurrent_kda_megafuse(
         and onorm.gate.stride(-1) == 1
     )
 
-    # The NV=1 band's bulk-TMA staging needs every per-page slab 16B-aligned:
-    # base pointer, page pitch, and dense inner [HV, K, V] strides. A pool
-    # that misses any of these (never the K3 dense or envelope pools, whose
-    # pitches are 16B multiples) falls back to the NV=2 cp.async path, which
-    # is layout-agnostic and correct at every batch size.
+    # NV=1 bulk-TMA needs every per-page slab 16B-aligned (base, pitch, dense inner strides); otherwise fall back to the layout-agnostic NV=2 cp.async path.
     nv = _pick_nv(n, hv)
     if nv == 1 and not (
         h_pool.data_ptr() % 16 == 0

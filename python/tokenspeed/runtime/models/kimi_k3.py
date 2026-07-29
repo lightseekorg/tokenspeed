@@ -791,15 +791,7 @@ class KimiLinearKDA(nn.Module):
         # Fused [3*proj, k] conv kernel bank, built once in post_load_weights.
         conv_weights = self.conv_weights
 
-        # Attempt-and-verify handoff of the output gated RMSNorm: the fused
-        # decode kernel folds ``rmsnorm(o) * w * sigmoid(gate)`` into its
-        # epilogue when it can (marking the stash consumed); otherwise the
-        # host-side norm below still runs. Eligibility is deterministic per
-        # shape/dtype, so the decision is CUDA-graph capture/replay stable.
-        # Graph-phase only: eager forwards (1-token prefills, uncaptured
-        # sizes) keep the separate norm — the eager T=1-prefill path faults
-        # when the epilogue fusion is armed there (same dark corner as the
-        # latent tail; decode graphs are unaffected).
+        # Attempt-and-verify onorm handoff, graph-phase only: the eager T=1-prefill path faults when the epilogue fusion is armed there.
         onorm_req = (
             KdaGatedNormRequest(
                 weight=self.o_norm.weight,
@@ -840,8 +832,7 @@ class KimiLinearKDA(nn.Module):
         )
 
         if onorm_req is not None and onorm_req.consumed:
-            # The decode kernel already applied the gated norm (on its fp32
-            # outputs — one fewer bf16 round-trip than the separate kernel).
+            # The decode kernel already applied the gated norm on its fp32 outputs.
             core_out = core_out.reshape(num_tokens, hn * hd)
         else:
             # Per-head gated RMSNorm + sigmoid output gate in one kernel.
@@ -1147,11 +1138,7 @@ class KimiLinearMoE(nn.Module):
             else None
         )
 
-        # Multicast latent tail: one kernel for AR(latent)+norm+RS(shared),
-        # a per-rank-sharded up-projection whose epilogue multicast-stores
-        # into every rank's mailbox (NVLS all-gather), and a Lamport gather.
-        # Replaces the fused-AR + replicated up-projection tail on short
-        # decode batches; the replicated weight read drops to 1/tp per rank.
+        # Multicast latent tail (AR+norm+RS, sharded up-proj with NVLS multicast epilogue, Lamport gather) replaces the fused-AR tail on short decode batches.
         self._latent_tail = None
         if (
             not self.execution_plan.use_native
@@ -1258,17 +1245,9 @@ class KimiLinearMoE(nn.Module):
         # Router runs uncontended on main (3us; on aux it starves to 14us
         # under concurrent GEMMs). Topk is a single small CTA, so it overlaps
         # down_proj from the aux stream, followed by the shared chain.
-        #
-        # Split front, not the merged single-read one: at bs1 a merged
-        # [gate|latent] sweep serializes the top-k (it needs the gate logits
-        # the sweep produces), which down_proj can no longer hide -- a measured
-        # loss. The router GEMV instead auto-selects the streaming rowcta path
-        # at m==1 (kimi3_router_projection solution="rowcta"), leaving the fork
-        # that hides top-k intact. See tokenspeed_kernel.ops.moe.front for the
-        # merged primitive + its bs1-off strategy.
+        # Split front, not merged: at bs1 a merged [gate|latent] sweep serializes the top-k, which down_proj can no longer hide.
         router_logits = self.gate(hidden_states)
-        # Graph-phase only: the tail is a decode-graph optimization; eager
-        # forwards (prefill, uncaptured sizes) keep the fused-AR path.
+        # Graph-phase only: eager forwards (prefill, uncaptured sizes) keep the fused-AR path.
         use_tail = (
             self._latent_tail is not None
             and get_is_cuda_graph_phase()
@@ -1309,9 +1288,7 @@ class KimiLinearMoE(nn.Module):
                     routed_out = self.routed_expert_norm(routed_out)
                 routed_out = self.routed_expert_up_proj(routed_out)[0]
         if use_tail:
-            # Both partials stay pre-reduce; the tail owns all communication.
-            # The lamport gather fuses the residual accumulate (identical
-            # rounding to the eager add), removing one elementwise launch.
+            # Both partials stay pre-reduce; the tail owns all communication and fuses the residual accumulate.
             return self._latent_tail(
                 routed_out,
                 shared_partial,

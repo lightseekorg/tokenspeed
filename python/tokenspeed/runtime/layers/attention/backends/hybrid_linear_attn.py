@@ -2057,9 +2057,6 @@ class MambaAttnBackend(AttentionBackend):
                 head_dim=head_v_dim,
                 cu_seqlens=self.forward_metadata.query_start_loc,
                 lower_bound=kda_lower_bound,
-                # Attempt-and-verify output gated-RMSNorm handoff: when the
-                # kernel folds it into its epilogue it marks the stash
-                # consumed and the model layer skips its norm.
                 onorm=kwargs.get("onorm"),
             )
             if core_attn_out is not None:

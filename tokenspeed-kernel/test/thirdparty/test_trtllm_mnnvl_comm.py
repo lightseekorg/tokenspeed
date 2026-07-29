@@ -169,8 +169,7 @@ def test_residual_rmsnorm_matches_ipc_backend(token_num):
         results[label] = (norm_out, res_out)
         dist.barrier()
 
-    # Same deterministic rank-order bf16 reduction + identical FusedOp
-    # epilogue: outputs should agree to bf16 rounding.
+    # Same deterministic rank-order bf16 reduction + identical epilogue: outputs agree to bf16 rounding.
     for a, b in zip(results["ipc"], results["mnnvl"]):
         torch.testing.assert_close(a, b, atol=1e-3, rtol=1e-3)
 

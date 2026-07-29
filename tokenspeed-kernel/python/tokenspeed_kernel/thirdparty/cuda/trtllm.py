@@ -235,14 +235,9 @@ def _destroy_ipc_workspace(
         free_shared_buffer(ipc_handle, group)
 
 
-# ---------------------------------------------------------------------------
 # MNNVL-structured one-shot workspace (NVLS multicast + Lamport rotation)
-# ---------------------------------------------------------------------------
 
-# Mirror of kMnnvlOneShotMaxToken in trtllm_mnnvl_allreduce_fusion.cuh: the
-# mnnvl kernel is a decode-latency one-shot path; larger payloads stay on the
-# IPC lamport/twoshot fallback, so the workspace is sized (and clamped) for
-# this many tokens at most.
+# Mirror of kMnnvlOneShotMaxToken in trtllm_mnnvl_allreduce_fusion.cuh; larger payloads stay on the IPC lamport/twoshot fallback.
 MNNVL_ONESHOT_MAX_TOKEN = 128
 
 _MNNVL_SUPPORTED_PATTERNS = frozenset(
@@ -250,9 +245,7 @@ _MNNVL_SUPPORTED_PATTERNS = frozenset(
         AllReduceFusionPattern.kAllReduce,
         AllReduceFusionPattern.kARResidualRMSNorm,
         AllReduceFusionPattern.kARResidualAttnResCombine,
-        # kAllReduceLatentNorm stays on the IPC lamport path: the mnnvl
-        # cluster geometry loses on the wide [latent|hidden] lane (measured
-        # 8.60us vs 6.64 on 8x B300; every other pattern wins there).
+        # kAllReduceLatentNorm stays on the IPC lamport path: the mnnvl cluster geometry loses on the wide [latent|hidden] lane.
     }
 )
 
@@ -392,17 +385,13 @@ def trtllm_create_mnnvl_workspace_for_all_reduce_fusion(
     if multicast_ptr is None or multicast_ptr == 0:
         raise RuntimeError("mnnvl workspace: NVLS multicast mapping unavailable")
 
-    # The allocation may be larger than requested; partition the actual size
-    # and initialize the WHOLE local allocation (not just the requested
-    # prefix) with the fp32 -0.0 Lamport sentinel.
+    # Partition the actual (possibly larger) allocation and fill the WHOLE of it with the fp32 -0.0 Lamport sentinel.
     buffer_size_bytes = handle.buffer_size // 3 // 16 * 16
     if buffer_size_bytes < bytes_per_buffer:
         raise RuntimeError("mnnvl workspace: symmetric allocation too small")
     handle.get_buffer(tp_rank, (handle.buffer_size // 4,), torch.float32).fill_(-0.0)
 
-    # Rotation state, same layout as flashinfer's buffer_flags:
-    # [cur idx, dirty idx, bytes per buffer, dirty stages, bytes_to_clear[4],
-    #  arrival counter]
+    # Rotation state, same layout as flashinfer's buffer_flags: [cur idx, dirty idx, bytes per buffer, dirty stages, bytes_to_clear[4], arrival counter].
     buffer_flags = torch.tensor(
         [0, 2, buffer_size_bytes, 0, 0, 0, 0, 0, 0],
         dtype=torch.uint32,
@@ -533,8 +522,7 @@ def trtllm_allreduce_fusion(
         )
 
     if isinstance(workspace_ptrs, MnnvlAllReduceFusionWorkspace):
-        # MNNVL-structured one-shot path: single NVLS multicast payload store,
-        # local-buffer Lamport polling, same FusedOp epilogues.
+        # MNNVL-structured one-shot path: NVLS multicast store, local Lamport polling, same FusedOp epilogues.
         assert workspace_ptrs.supports(
             token_num,
             hidden_dim,
