@@ -1944,6 +1944,12 @@ class ServerArgs:
             "pause/resume, memory occupation). Normally allocated automatically "
             "by the `ts serve` orchestrator.",
         )
+        parser.add_argument(
+            "--weight-version",
+            type=str,
+            default=ServerArgs.weight_version,
+            help="Initial model-weight version stamped into generation metadata.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):

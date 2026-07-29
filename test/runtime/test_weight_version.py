@@ -52,7 +52,10 @@ from tokenspeed.runtime.entrypoints.sglang_compat_http import (  # noqa: E402
 from tokenspeed.runtime.entrypoints.vllm_compat_http import (  # noqa: E402
     build_vllm_compat_app,
 )
-from tokenspeed.runtime.utils.server_args import ServerArgs  # noqa: E402
+from tokenspeed.runtime.utils.server_args import (  # noqa: E402
+    ServerArgs,
+    prepare_server_args,
+)
 
 
 class _FakeLLM:
@@ -200,6 +203,7 @@ class TestWeightVersionHTTP(unittest.TestCase):
             for route in control_server.app.routes
         }
         self.assertIn(("/get_weight_version", frozenset({"GET"})), routes)
+        self.assertIn(("/model_info", frozenset({"GET"})), routes)
         self.assertIn(("/update_weight_version", frozenset({"POST"})), routes)
 
 
@@ -246,6 +250,10 @@ class TestGenerationVersionStamp(unittest.TestCase):
 
     def test_server_args_default_version(self):
         self.assertEqual(ServerArgs(model="model-x").weight_version, "default")
+
+    def test_server_args_accepts_initial_version_from_cli(self):
+        server_args = prepare_server_args(["model-x", "--weight-version", "policy-v1"])
+        self.assertEqual(server_args.weight_version, "policy-v1")
 
 
 if __name__ == "__main__":
