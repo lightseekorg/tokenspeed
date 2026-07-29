@@ -34,17 +34,13 @@ platform = current_platform()
 # with a missing/failed build degrades to the torch fallback via select_kernel
 # instead of crashing on the first call.
 _HAS_CUDA_KERNEL = False
-_HAS_CUDA_KERNEL_V2 = False
 if platform.is_nvidia and platform.is_blackwell:
     from tokenspeed_kernel.thirdparty.cuda.attn_res import (
         attn_res_fwd_packed,
-        attn_res_fwd_v2_packed,
         has_attn_res_fwd,
-        has_attn_res_fwd_v2,
     )
 
     _HAS_CUDA_KERNEL = has_attn_res_fwd()
-    _HAS_CUDA_KERNEL_V2 = has_attn_res_fwd_v2()
 
 if _HAS_CUDA_KERNEL:
 
@@ -84,47 +80,3 @@ if _HAS_CUDA_KERNEL:
             ),
         )
         return out.squeeze(1)  # [T, H]
-
-
-if _HAS_CUDA_KERNEL_V2:
-
-    @register_kernel(
-        "attn_res",
-        "fwd_v2",
-        name="cuda_attn_res_fwd_v2",
-        solution="cuda",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(10, 0),
-            vendors=frozenset({"nvidia"}),
-        ),
-        signatures=format_signatures(
-            ("prefix", "block_residual"), "dense", {torch.bfloat16}
-        ),
-        priority=Priority.SPECIALIZED,
-        tags={"latency", "throughput"},
-    )
-    def cuda_attn_res_fwd_v2(
-        *,
-        prefix,
-        delta,
-        block_residual,
-        res_weight,
-        rms_weight,
-        out_norm_weight,
-        eps,
-        out_norm_eps,
-        enable_pdl=False,
-        out=None,
-    ) -> torch.Tensor:
-        return attn_res_fwd_v2_packed(
-            prefix,
-            delta,
-            block_residual,
-            res_weight.contiguous(),
-            rms_weight.contiguous(),
-            out_norm_weight.contiguous(),
-            eps,
-            out_norm_eps,
-            enable_pdl=enable_pdl,
-            out=out,
-        )
