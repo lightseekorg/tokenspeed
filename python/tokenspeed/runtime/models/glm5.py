@@ -988,7 +988,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         attn_output = self.attn_mqa(
             Q,
             K,
-            K[..., : self.kv_lora_rank],
+            K[..., : self.kv_lora_rank] if K is not None else None,
             ctx,
             out_cache_loc,
             save_kv_cache=need_save_kv,
