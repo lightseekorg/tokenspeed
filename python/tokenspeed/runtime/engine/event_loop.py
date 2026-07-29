@@ -1687,7 +1687,7 @@ class EventLoop:
     def _shutdown_complete(self) -> bool:
         return self.shutdown_event.is_set()
 
-    def _flat_pages_to_zero(self, execution_plan):
+    def _flat_page_ids_to_zero(self, execution_plan):
         """Group-aware child pages the scheduler assigned in this step.
 
         The group is part of the address under two-level placement. Older
@@ -1713,9 +1713,9 @@ class EventLoop:
                 ) from None
             return ()
 
-    def _flat_page_ids_to_zero(self, execution_plan):
-        """Compatibility alias for tests and older event-loop integrations."""
-        return self._flat_pages_to_zero(execution_plan)
+    def _flat_pages_to_zero(self, execution_plan):
+        """Descriptive alias for group-aware page-zeroing payloads."""
+        return self._flat_page_ids_to_zero(execution_plan)
 
     def event_loop(self):
         """Non-overlapping scheduler loop."""
