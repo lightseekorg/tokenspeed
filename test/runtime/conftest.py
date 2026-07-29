@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -68,34 +69,40 @@ def make_kimi_pool(device, usable_pages: int = 6, *, with_mla_dims: bool = True)
         FULL_ATTENTION if group_id == FULL_ATTENTION else LINEAR_ATTENTION
         for group_id in group_ids
     )
-    return LcmMLATokenToKVPool(
-        size=usable_pages * 12 * plan.logical_block_tokens,
-        model_dtype=torch.bfloat16,
-        dtype=torch.float8_e4m3fn,
-        quant_method=None,
-        kv_lora_rank=MLA_KV_LORA_RANK,
-        qk_rope_head_dim=MLA_QK_ROPE_DIM,
-        layer_num=text_config.num_hidden_layers,
-        device=device,
-        enable_memory_saver=False,
-        max_batch_size=1,
-        max_context_len=131_072,
-        page_size=plan.logical_block_tokens,
-        rank=0,
-        layer_types=layer_types,
-        layer_group_ids=group_ids,
-        max_scheduled_tokens=8192,
-        state_field_dtypes={
-            field_id: dtype
-            for layer_id, layer_type in enumerate(layer_types)
-            if layer_type == LINEAR_ATTENTION
-            for field_id, dtype in (
-                (f"layer.{layer_id}.conv_state", torch.bfloat16),
-                (f"layer.{layer_id}.recurrent_state", torch.float32),
-            )
-        },
-        memory_plan=plan,
-    )
+    # These helpers test an LCM pool contract independently of whichever
+    # scheduler variant happens to be installed in the test environment.
+    with mock.patch(
+        "tokenspeed.runtime.configs.paged_cache_spec.scheduler_ext_flat_kvcache",
+        return_value=True,
+    ):
+        return LcmMLATokenToKVPool(
+            size=usable_pages * 12 * plan.logical_block_tokens,
+            model_dtype=torch.bfloat16,
+            dtype=torch.float8_e4m3fn,
+            quant_method=None,
+            kv_lora_rank=MLA_KV_LORA_RANK,
+            qk_rope_head_dim=MLA_QK_ROPE_DIM,
+            layer_num=text_config.num_hidden_layers,
+            device=device,
+            enable_memory_saver=False,
+            max_batch_size=1,
+            max_context_len=131_072,
+            page_size=plan.logical_block_tokens,
+            rank=0,
+            layer_types=layer_types,
+            layer_group_ids=group_ids,
+            max_scheduled_tokens=8192,
+            state_field_dtypes={
+                field_id: dtype
+                for layer_id, layer_type in enumerate(layer_types)
+                if layer_type == LINEAR_ATTENTION
+                for field_id, dtype in (
+                    (f"layer.{layer_id}.conv_state", torch.bfloat16),
+                    (f"layer.{layer_id}.recurrent_state", torch.float32),
+                )
+            },
+            memory_plan=plan,
+        )
 
 
 @pytest.fixture(scope="module")

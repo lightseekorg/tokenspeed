@@ -103,8 +103,8 @@ def _resolve_draft_cache_cell_size_for_profile(
         return 0
     storage_layers = _kv_profile_layer_divisor(
         draft_model_config.num_attention_layers,
-        draft_attn_config.layer_types,
-        sliding_window_tokens=draft_attn_config.sliding_window_tokens,
+        getattr(draft_attn_config, "layer_types", None),
+        sliding_window_tokens=getattr(draft_attn_config, "sliding_window_tokens", None),
     )
     return draft_attn_config.cache_cell_size() * storage_layers
 
@@ -1554,7 +1554,7 @@ def create_attn_components(
             )
 
     cache_storage = None
-    if is_hybrid_gdn or use_lcm_k3 or use_lcm_inkling:
+    if lcm_setup is not None:
         if cache_budget_bytes is None:
             raise RuntimeError("LCM cache profile did not record its byte budget")
         cache_storage = _cache_storage_report(
