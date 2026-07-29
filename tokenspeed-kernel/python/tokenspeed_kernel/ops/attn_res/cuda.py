@@ -57,6 +57,7 @@ if _HAS_CUDA_KERNEL:
             ("layer_residual", "block_residual"), "dense", {torch.bfloat16}
         ),
         priority=Priority.SPECIALIZED,
+        traits={"separate_output_eps": frozenset({False})},
         tags={"latency", "throughput"},
     )
     def cuda_attn_res_fwd(
@@ -66,8 +67,15 @@ if _HAS_CUDA_KERNEL:
         res_weight,
         rms_weight,
         eps,
-        out_norm_weight=None
+        out_norm_weight=None,
+        out_norm_eps=None,
     ) -> torch.Tensor:
+        if (
+            out_norm_weight is not None
+            and out_norm_eps is not None
+            and out_norm_eps != eps
+        ):
+            raise ValueError("CUDA AttnRes requires matching RMSNorm epsilons")
         # Kernel contract is [T, 1, H] / [K, T, 1, H] (B=1).
         out = attn_res_fwd_packed(
             layer_residual.unsqueeze(1).contiguous(),

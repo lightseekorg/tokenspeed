@@ -221,6 +221,32 @@ def all_reduce_latent_norm(
     )
 
 
+def all_reduce_residual_attnres(
+    partial: torch.Tensor,
+    residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    output_weight: torch.Tensor,
+    scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    eps: float,
+    group: Group,
+    backend: CommBackend | None = None,
+    op: torch.distributed.ReduceOp = torch.distributed.ReduceOp.SUM,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reduce attention output and finish its residual AttnRes mix."""
+    if backend is None:
+        backend = get_global_backend()
+    return backend.all_reduce_residual_attnres(
+        partial,
+        residual,
+        score_weight,
+        output_weight,
+        scratch,
+        eps,
+        group,
+        op=op,
+    )
+
+
 def all_gather(
     tensor: torch.Tensor,
     group: Group,

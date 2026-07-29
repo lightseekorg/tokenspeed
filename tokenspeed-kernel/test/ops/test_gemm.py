@@ -20,9 +20,16 @@
 
 from __future__ import annotations
 
+import importlib
+from unittest.mock import Mock
+
 import pytest
 import tokenspeed_kernel
 import torch
+from tokenspeed_kernel.ops.gemm import (
+    linear_attnres_partials,
+    linear_attnres_partials_available,
+)
 
 
 def test_mm_rejects_bad_out_layout() -> None:
@@ -75,3 +82,252 @@ def test_bmm_reference_rejects_out_dtype_mismatch() -> None:
 
     with pytest.raises(ValueError, match="torch_bmm out= requires out_dtype"):
         tokenspeed_kernel.bmm(a, b, out=out, override="torch_bmm")
+
+
+def test_linear_attnres_partials_portable_composition() -> None:
+    torch.manual_seed(13)
+    hidden = torch.randn(2, 6, dtype=torch.bfloat16)
+    weight = torch.randn(9, 6, dtype=torch.bfloat16)
+    blocks = torch.randn(4, 2, 6, dtype=torch.bfloat16)
+    scores = (
+        torch.randn(6, dtype=torch.bfloat16),
+        torch.randn(6, dtype=torch.bfloat16),
+    )
+    scratch = tuple(
+        (
+            torch.empty(2, dtype=torch.float32),
+            torch.empty(2, dtype=torch.float32),
+            torch.empty(2, 6, dtype=torch.float32),
+        )
+        for _ in range(2)
+    )
+
+    actual = linear_attnres_partials(
+        hidden,
+        weight,
+        blocks,
+        *scores,
+        *scratch,
+        eps=1e-5,
+    )
+
+    torch.testing.assert_close(actual, torch.nn.functional.linear(hidden, weight))
+    values = blocks.float()
+    inverse_rms = torch.rsqrt(values.square().mean(dim=-1) + 1e-5)
+    for score, outputs in zip(scores, scratch, strict=True):
+        logits = torch.einsum("bth,h->bt", values, score.float()) * inverse_rms
+        maxima = logits.max(dim=0).values
+        unnormalized = torch.exp(logits - maxima)
+        torch.testing.assert_close(outputs[0], maxima)
+        torch.testing.assert_close(outputs[1], unnormalized.sum(dim=0))
+        torch.testing.assert_close(
+            outputs[2],
+            torch.einsum("bt,bth->th", unnormalized, values),
+        )
+
+
+def test_linear_attnres_partials_decode_fallback_uses_gemv(monkeypatch) -> None:
+    from tokenspeed_kernel.ops.gemm import triton_gemv
+
+    hidden = torch.randn(1, 6, dtype=torch.bfloat16)
+    weight = torch.randn(9, 6, dtype=torch.bfloat16)
+    blocks = torch.randn(2, 1, 6, dtype=torch.bfloat16)
+    scores = tuple(torch.randn(6, dtype=torch.bfloat16) for _ in range(2))
+    scratch = tuple(
+        (
+            torch.empty(1, dtype=torch.float32),
+            torch.empty(1, dtype=torch.float32),
+            torch.empty(1, 6, dtype=torch.float32),
+        )
+        for _ in range(2)
+    )
+    expected = torch.empty(1, 9, dtype=torch.bfloat16)
+    gemv = Mock(return_value=expected)
+    monkeypatch.setattr(triton_gemv, "decode_gemv", gemv)
+
+    assert not linear_attnres_partials_available(
+        hidden,
+        weight,
+        blocks,
+        *scores,
+        *scratch,
+        eps=1e-5,
+    )
+
+    actual = linear_attnres_partials(
+        hidden,
+        weight,
+        blocks,
+        *scores,
+        *scratch,
+        eps=1e-5,
+    )
+
+    assert actual is expected
+    gemv.assert_called_once_with(hidden, weight)
+
+
+def test_linear_attnres_partials_cpu_skips_device_kernel_selection(
+    monkeypatch,
+) -> None:
+    module = importlib.import_module(
+        "tokenspeed_kernel.ops.gemm.linear_attnres_partials"
+    )
+    selector = Mock()
+    monkeypatch.setattr(module, "select_kernel", selector)
+    hidden = torch.randn(1, 6, dtype=torch.bfloat16)
+    weight = torch.randn(9, 6, dtype=torch.bfloat16)
+    blocks = torch.randn(2, 1, 6, dtype=torch.bfloat16)
+    scores = tuple(torch.randn(6, dtype=torch.bfloat16) for _ in range(2))
+    scratch = tuple(
+        (
+            torch.empty(1, dtype=torch.float32),
+            torch.empty(1, dtype=torch.float32),
+            torch.empty(1, 6, dtype=torch.float32),
+        )
+        for _ in range(2)
+    )
+
+    assert not linear_attnres_partials_available(
+        hidden,
+        weight,
+        blocks,
+        *scores,
+        *scratch,
+        eps=1e-5,
+    )
+    selector.assert_not_called()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or "gfx950" not in getattr(torch.cuda.get_device_properties(0), "gcnArchName", ""),
+    reason="gfx950 is required",
+)
+def test_linear_attnres_partials_gfx950_matches_composition() -> None:
+    generator = torch.Generator(device="cuda").manual_seed(29)
+    hidden = (torch.randn(1, 7168, device="cuda", generator=generator) * 0.1).to(
+        torch.bfloat16
+    )
+    weight = (torch.randn(3648, 7168, device="cuda", generator=generator) * 0.01).to(
+        torch.bfloat16
+    )
+    blocks = (torch.randn(4, 1, 7168, device="cuda", generator=generator) * 0.1).to(
+        torch.bfloat16
+    )
+    scores = tuple(
+        (torch.randn(7168, device="cuda", generator=generator) * 0.02).to(
+            torch.bfloat16
+        )
+        for _ in range(2)
+    )
+    scratch = tuple(
+        (
+            torch.empty(1, device="cuda", dtype=torch.float32),
+            torch.empty(1, device="cuda", dtype=torch.float32),
+            torch.empty(1, 7168, device="cuda", dtype=torch.float32),
+        )
+        for _ in range(2)
+    )
+
+    assert linear_attnres_partials_available(
+        hidden,
+        weight,
+        blocks,
+        *scores,
+        *scratch,
+        eps=1e-6,
+    )
+
+    actual = linear_attnres_partials(
+        hidden,
+        weight,
+        blocks,
+        *scores,
+        *scratch,
+        eps=1e-6,
+        override="gluon_linear_attnres_partials_gfx950",
+    )
+
+    torch.testing.assert_close(
+        actual,
+        torch.nn.functional.linear(hidden, weight),
+        atol=2e-2,
+        rtol=2e-2,
+    )
+    values = blocks.float()
+    inverse_rms = torch.rsqrt(values.square().mean(dim=-1) + 1e-6)
+    for score, outputs in zip(scores, scratch, strict=True):
+        logits = torch.einsum("bth,h->bt", values, score.float()) * inverse_rms
+        maxima = logits.max(dim=0).values
+        unnormalized = torch.exp(logits - maxima)
+        torch.testing.assert_close(outputs[0], maxima, atol=2e-4, rtol=2e-4)
+        torch.testing.assert_close(
+            outputs[1], unnormalized.sum(dim=0), atol=2e-4, rtol=2e-4
+        )
+        torch.testing.assert_close(
+            outputs[2],
+            torch.einsum("bt,bth->th", unnormalized, values),
+            atol=2e-4,
+            rtol=2e-4,
+        )
+
+    with pytest.raises(ValueError, match="output size must be divisible by 16"):
+        linear_attnres_partials(
+            hidden,
+            weight[:17],
+            blocks,
+            *scores,
+            *scratch,
+            eps=1e-6,
+            override="gluon_linear_attnres_partials_gfx950",
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/ROCm is required")
+def test_linear_attnres_partials_cuda_portable_strided_inputs() -> None:
+    generator = torch.Generator(device="cuda").manual_seed(37)
+    hidden = torch.randn(
+        1, 64, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    weight = torch.randn(
+        32, 65, device="cuda", dtype=torch.bfloat16, generator=generator
+    )[:, :64]
+    blocks = torch.randn(
+        3, 1, 128, device="cuda", dtype=torch.bfloat16, generator=generator
+    )[..., ::2]
+    scores = tuple(
+        torch.randn(128, device="cuda", dtype=torch.bfloat16, generator=generator)[::2]
+        for _ in range(2)
+    )
+    scratch = tuple(
+        (
+            torch.empty(1, device="cuda", dtype=torch.float32),
+            torch.empty(1, device="cuda", dtype=torch.float32),
+            torch.empty(1, 64, device="cuda", dtype=torch.float32),
+        )
+        for _ in range(2)
+    )
+
+    actual = linear_attnres_partials(
+        hidden,
+        weight,
+        blocks,
+        *scores,
+        *scratch,
+        eps=1e-5,
+    )
+
+    torch.testing.assert_close(actual, torch.nn.functional.linear(hidden, weight))
+    values = blocks.float()
+    inverse_rms = torch.rsqrt(values.square().mean(dim=-1) + 1e-5)
+    for score, outputs in zip(scores, scratch, strict=True):
+        logits = torch.einsum("bth,h->bt", values, score.float()) * inverse_rms
+        maxima = logits.max(dim=0).values
+        unnormalized = torch.exp(logits - maxima)
+        torch.testing.assert_close(outputs[0], maxima)
+        torch.testing.assert_close(outputs[1], unnormalized.sum(dim=0))
+        torch.testing.assert_close(
+            outputs[2],
+            torch.einsum("bt,bth->th", unnormalized, values),
+        )
