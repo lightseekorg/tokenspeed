@@ -823,8 +823,9 @@ def _inkling_conv_columns(pool, text_config, conv_bt=None, hbt=None):
     Columns live in the layers' own K/V slots; backend gets only geometry + layer->group map.
     """
     layer_labels = text_config.paged_cache_layer_types
-    if pool._lcm_memory_plan is not None:
-        block_tokens = pool._lcm_memory_plan.logical_block_tokens
+    memory_plan = getattr(pool, "_lcm_memory_plan", None)
+    if memory_plan is not None:
+        block_tokens = memory_plan.logical_block_tokens
         conv_columns = {
             "mode": "checkpoint",
             "block_tokens": block_tokens,
