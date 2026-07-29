@@ -69,6 +69,10 @@ from tokenspeed_kernel.ops.activation.triton import (
     rmsnorm_gated_sigmoid,
     sigmoid_mul,
 )
+from tokenspeed_kernel.ops.attention import (
+    mla_absorb_query,
+    mla_normalize_project_query,
+)
 from tokenspeed_kernel.ops.attn_res import attn_res_fwd
 from tokenspeed_kernel.ops.communication import allreduce_fusion_lane
 from tokenspeed_kernel.ops.gemm import (
@@ -373,6 +377,20 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
                 prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
             )
 
+    def _project_absorbed_query(
+        self,
+        q: torch.Tensor,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        output: torch.Tensor,
+    ) -> bool:
+        """Project and assemble K3's NoPE absorbed query."""
+
+        if self.rotary_emb is None:
+            mla_absorb_query(q_nope, self.w_kc, query_rope=q_pe, out=output)
+            return True
+        return super()._project_absorbed_query(q, q_nope, q_pe, output)
+
     def _project_q_latent_gated(
         self,
         hidden_states: torch.Tensor,
@@ -418,10 +436,14 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
                 )
                 gate = projection.gate
         kv_a = latent_cache[..., : self.kv_lora_rank]
-        q_norm = torch.empty_like(q_a)
-        if q_a.size(0) > 0:
-            self.fused_qk_layernorm(input_q_a=q_a, input_kv_a=kv_a, output_q_a=q_norm)
-        q = decode_gemv(q_norm, self.q_b_proj.weight)
+        q = mla_normalize_project_query(
+            q_a,
+            kv_a,
+            self.fused_qk_layernorm.weight_q_a,
+            self.fused_qk_layernorm.weight_kv_a,
+            self.q_b_proj.weight,
+            eps=self.q_a_layernorm.variance_epsilon,
+        )
         return q, latent_cache, gate
 
     def forward(
@@ -444,8 +466,16 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
                 hidden_states, ctx, comm_manager, block_scale
             )
             gate = None
-        attn_output = self._attn(positions, q, latent_cache, ctx, out_cache_loc)
-        if gate is not None:
+        fuse_value_gate = self._use_projected_value_decode(ctx, gate)
+        attn_output = self._attn(
+            positions,
+            q,
+            latent_cache,
+            ctx,
+            out_cache_loc,
+            output_gate=gate if fuse_value_gate else None,
+        )
+        if gate is not None and not fuse_value_gate:
             # Fused in-place fp32 sigmoid+mul; the gate shard matches the
             # head-sharded attn_output.
             attn_output = sigmoid_mul(attn_output, gate)

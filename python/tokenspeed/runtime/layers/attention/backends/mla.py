@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel import (
+    mla_decode_projected_value,
     mla_decode_with_kvcache,
     mla_extend_with_kvcache,
     mla_prefill,
@@ -100,6 +101,8 @@ class MLADecodeMetadata:
 
 class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
     """Unified MLA backend routed through tokenspeed_kernel MLA APIs."""
+
+    supports_mla_projected_value_decode = True
 
     def __init__(self, config: MLAConfig):
         super().__init__(config)
@@ -612,20 +615,41 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             kv_cache = kv_cache.to(self.data_type)
         kv_cache = kv_cache.view(-1, self.page_size, 1, self.kv_cache_dim)
 
-        result = mla_decode_with_kvcache(
-            q=query,
-            kv_cache=kv_cache,
-            page_table=page_table,
-            cache_seqlens=cache_seqlens,
-            max_seqlen_k=max_seqlen_k,
-            qk_nope_head_dim=self.qk_nope_head_dim,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            softmax_scale=softmax_scale,
-            logit_cap=layer.logit_cap,
-            solution=self.kernel_solution,
-        )
+        value_weight = kwargs.get("value_weight")
+        gate = kwargs.get("output_gate")
+        projected_out = kwargs.get("projected_output")
+        if value_weight is not None:
+            result = mla_decode_projected_value(
+                query,
+                kv_cache,
+                page_table,
+                cache_seqlens,
+                max_seqlen_k,
+                self.qk_nope_head_dim,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+                softmax_scale,
+                value_weight,
+                gate=gate,
+                out=projected_out,
+            )
+        else:
+            result = mla_decode_with_kvcache(
+                q=query,
+                kv_cache=kv_cache,
+                page_table=page_table,
+                cache_seqlens=cache_seqlens,
+                max_seqlen_k=max_seqlen_k,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                softmax_scale=softmax_scale,
+                logit_cap=layer.logit_cap,
+                solution=self.kernel_solution,
+            )
         output = self._unwrap_output(result)
+        if value_weight is not None:
+            return output.reshape(-1, value_weight.shape[0] * value_weight.shape[2])
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_extend(

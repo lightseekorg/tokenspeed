@@ -31,7 +31,11 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.attention import attn_merge_state
+from tokenspeed_kernel.ops.attention import (
+    attn_merge_state,
+    mla_absorb_query,
+    mla_project_value,
+)
 from tokenspeed_kernel.ops.attention.tokenspeed_mla import mla_kv_pack_quantize_fp8
 from tokenspeed_kernel.ops.attention.triton.mla_query_assemble import (
     mla_nope_query_fp8,
@@ -115,7 +119,11 @@ from tokenspeed.runtime.moe.distribution_recorder import (
     get_global_expert_distribution_recorder,
 )
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
-from tokenspeed.runtime.utils import LazyValue, add_prefix, get_colorful_logger
+from tokenspeed.runtime.utils import (
+    LazyValue,
+    add_prefix,
+    get_colorful_logger,
+)
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import envs, global_server_args_dict
 from tokenspeed.runtime.utils.pdl import pdl_enabled
@@ -695,6 +703,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         latent_cache: torch.Tensor,
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
+        output_gate: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The eager break: KV write + varlen prefill / absorb decode attention.
 
@@ -768,6 +777,7 @@ class DeepseekV3AttentionMLA(nn.Module):
                 decode_ctx,
                 out_cache_loc[num_prefill_tokens:real_total],
                 attn_output[num_prefill_tokens:real_total],
+                output_gate=output_gate,
             )
 
         return attn_output
@@ -780,6 +790,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
         output: torch.Tensor,
+        output_gate: torch.Tensor | None = None,
     ) -> torch.Tensor:
         Q, K = self.forward_absorb_qkv_proj(
             q,
@@ -788,7 +799,32 @@ class DeepseekV3AttentionMLA(nn.Module):
             ctx,
             out_cache_loc,
         )
-        return self.forward_absorb_attn_v_proj(Q, K, ctx, out_cache_loc, output)
+        return self.forward_absorb_attn_v_proj(
+            Q,
+            K,
+            ctx,
+            out_cache_loc,
+            output,
+            output_gate=output_gate,
+        )
+
+    def _project_absorbed_query(
+        self,
+        q: torch.Tensor,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        output: torch.Tensor,
+    ) -> bool:
+        """Project the absorbed NoPE query and report whether PE was assembled."""
+
+        del q, q_pe
+        q_nope_out_view = output[..., : self.kv_lora_rank]
+        mla_absorb_query(
+            q_nope,
+            self.w_kc.contiguous() if _is_amd else self.w_kc,
+            out=q_nope_out_view,
+        )
+        return False
 
     def forward_absorb_qkv_proj(
         self,
@@ -816,19 +852,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         )
         # latent_cache contains normalized kv_a and k_pe before rotate.
         K = latent_cache.unsqueeze(1)
-        q_nope_out_view = Q[..., : self.kv_lora_rank]
-        if _is_amd:
-            q_nope_projected = torch.bmm(
-                q_nope.transpose(0, 1).contiguous(),
-                self.w_kc.contiguous(),
-            )
-            q_nope_out_view.copy_(q_nope_projected.transpose(0, 1))
-        else:
-            torch.bmm(
-                q_nope.transpose(0, 1),
-                self.w_kc,
-                out=q_nope_out_view.transpose(0, 1),
-            )
+        query_pe_written = self._project_absorbed_query(q, q_nope, q_pe, Q)
         # Model-owned fused FP8 decode: RoPE + quantize + KV cache write
         # all done here, so backend only needs to do attention.
         k_scale = getattr(self.attn_mqa, "k_scale_float", 1.0)
@@ -912,7 +936,8 @@ class DeepseekV3AttentionMLA(nn.Module):
             # NoPE + fp8: assemble the query straight into fp8; the KV write casts the bf16 latents in-kernel.
             Q = mla_nope_query_fp8(Q[..., : self.kv_lora_rank], q_pe)
         else:
-            Q[..., self.kv_lora_rank :] = q_pe
+            if not query_pe_written:
+                Q[..., self.kv_lora_rank :] = q_pe
 
         # For MLA kernel backends, write KV cache here (model-owned) so the
         # backend never has to. This unifies the FP8 fused path (written above)
@@ -935,6 +960,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         out_cache_loc: torch.Tensor,
         output: torch.Tensor,
         record_kv_cache: bool | None = None,
+        output_gate: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # MLA kernel backends: KV cache already written in forward_absorb_qkv_proj.
         # Other backends write KV in the attention backend.
@@ -947,6 +973,7 @@ class DeepseekV3AttentionMLA(nn.Module):
             k_for_attn = K
             v_for_attn = K[..., : self.kv_lora_rank]
 
+        use_projected_value_decode = self._use_projected_value_decode(ctx, output_gate)
         attn_output = self.attn_mqa(
             Q,
             k_for_attn,
@@ -955,22 +982,39 @@ class DeepseekV3AttentionMLA(nn.Module):
             out_cache_loc,
             save_kv_cache=need_save_kv,
             record_kv_cache=record_kv_cache,
+            value_weight=self.w_vc if use_projected_value_decode else None,
+            output_gate=output_gate if use_projected_value_decode else None,
+            projected_output=output if use_projected_value_decode else None,
         )
+        if use_projected_value_decode:
+            return attn_output
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
-        if _is_amd:
-            projected = torch.bmm(
-                attn_output.transpose(0, 1).contiguous(),
-                self.w_vc.contiguous(),
-            )
-            output.copy_(projected.transpose(0, 1).reshape_as(output))
-        else:
-            output_view = output.view(-1, self.num_local_heads, self.v_head_dim)
-            torch.bmm(
-                attn_output.transpose(0, 1),
-                self.w_vc,
-                out=output_view.transpose(0, 1),
-            )
-        return output
+        return self._project_absorbed_value(attn_output, output, output_gate)
+
+    @staticmethod
+    def _use_projected_value_decode(
+        ctx: ForwardContext, output_gate: torch.Tensor | None
+    ) -> bool:
+        return (
+            output_gate is not None
+            and ctx.num_extends == 0
+            and ctx.attn_backend.supports_mla_projected_value_decode
+        )
+
+    def _project_absorbed_value(
+        self,
+        attention: torch.Tensor,
+        output: torch.Tensor,
+        output_gate: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Project absorbed MLA values, optionally applying an output gate."""
+
+        return mla_project_value(
+            attention,
+            self.w_vc.contiguous() if _is_amd else self.w_vc,
+            gate=output_gate,
+            out=output,
+        )
 
     def forward_normal_chunked(
         self,

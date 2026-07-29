@@ -382,9 +382,14 @@ class KimiK3RegistrationTests(unittest.TestCase):
             def pre_attn_comm(value, ctx):
                 return value
 
-        class CopyNorm(torch.nn.Module):
-            def forward(self, *, input_q_a, input_kv_a, output_q_a):
-                output_q_a.copy_(input_q_a)
+        class FakeFusedNorm(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight_q_a = torch.nn.Parameter(torch.ones(2))
+                self.weight_kv_a = torch.nn.Parameter(torch.ones(3))
+
+        class FakeQueryNorm(torch.nn.Module):
+            variance_epsilon = 1e-6
 
         class IdentityQProjection(torch.nn.Module):
             def __init__(self):
@@ -402,24 +407,60 @@ class KimiK3RegistrationTests(unittest.TestCase):
         attention._qkv_a_width = 6
         attention._gate_width = 4
         attention.fused_qkv_a_proj_with_mqa = FakeProjection()
-        attention.fused_qk_layernorm = CopyNorm()
+        attention.fused_qk_layernorm = FakeFusedNorm()
+        attention.q_a_layernorm = FakeQueryNorm()
         attention.q_b_proj = IdentityQProjection()
         comm = IdentityComm()
 
         prefill = torch.ones(33, 5)
-        q, latent, gate = attention._project_q_latent_gated(prefill, None, comm, None)
+        with torch.no_grad():
+            q, latent, gate = attention._project_q_latent_gated(
+                prefill, None, comm, None
+            )
         expected = torch.nn.functional.linear(
             prefill, attention.fused_qkv_a_proj_with_mqa.weight
         )
-        torch.testing.assert_close(q, expected[:, :2])
-        torch.testing.assert_close(latent, expected[:, 2:6])
+        expected_q = torch.nn.functional.rms_norm(
+            expected[:, :2],
+            (2,),
+            eps=attention.q_a_layernorm.variance_epsilon,
+        )
+        expected_latent = expected[:, 2:6].clone()
+        expected_latent[:, :3] = torch.nn.functional.rms_norm(
+            expected_latent[:, :3],
+            (3,),
+            eps=attention.q_a_layernorm.variance_epsilon,
+        )
+        torch.testing.assert_close(q, expected_q)
+        torch.testing.assert_close(latent, expected_latent)
         torch.testing.assert_close(gate, expected[:, 6:])
         self.assertEqual(attention.fused_qkv_a_proj_with_mqa.calls, 0)
 
-        attention._project_q_latent_gated(prefill[:1], None, comm, None)
+        with torch.no_grad():
+            attention._project_q_latent_gated(prefill[:1], None, comm, None)
         # Decode routes through the registered GEMV using the packed weight
         # directly, so neither branch materializes the projection module.
         self.assertEqual(attention.fused_qkv_a_proj_with_mqa.calls, 0)
+
+    def test_mla_projected_value_decode_requires_backend_support(self):
+        from tokenspeed.runtime.models.kimi_k3 import KimiLinearMLAAttention
+
+        gate = torch.ones(1, 4)
+        for supported, expected in ((False, False), (True, True)):
+            with self.subTest(supported=supported):
+                ctx = SimpleNamespace(
+                    num_extends=0,
+                    attn_backend=SimpleNamespace(
+                        supports_mla_projected_value_decode=supported
+                    ),
+                )
+                self.assertEqual(
+                    KimiLinearMLAAttention._use_projected_value_decode(ctx, gate),
+                    expected,
+                )
+
+        ctx.num_extends = 1
+        self.assertFalse(KimiLinearMLAAttention._use_projected_value_decode(ctx, gate))
 
     def test_config_registry_maps_model_type(self):
         from tokenspeed.runtime.utils.hf_transformers_utils import _CONFIG_REGISTRY

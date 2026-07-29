@@ -75,3 +75,16 @@ def test_bmm_reference_rejects_out_dtype_mismatch() -> None:
 
     with pytest.raises(ValueError, match="torch_bmm out= requires out_dtype"):
         tokenspeed_kernel.bmm(a, b, out=out, override="torch_bmm")
+
+
+def test_decode_gemv_writes_preallocated_output() -> None:
+    from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
+
+    x = torch.randn(2, 8)
+    weight = torch.randn(4, 8)
+    out = torch.empty(2, 4)
+
+    returned = decode_gemv(x, weight, out=out)
+
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out, x @ weight.t())

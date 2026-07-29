@@ -1850,6 +1850,10 @@ class HybridLinearAttnBackend(AttentionBackend):
     def data_type(self):
         return self.full_attn_backend.data_type
 
+    @property
+    def supports_mla_projected_value_decode(self) -> bool:
+        return self.full_attn_backend.supports_mla_projected_value_decode
+
     def override_num_extends(self, num_extends: int):
         return self.full_attn_backend.override_num_extends(num_extends)
 

@@ -150,8 +150,12 @@ _BF16_SIG = frozenset(
     },
     priority=Priority.SPECIALIZED,
 )
-def _rowcta_spec(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    return rowcta_gemv(x, weight)
+def _rowcta_spec(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return rowcta_gemv(x, weight, out)
 
 
 @register_kernel(
@@ -163,8 +167,12 @@ def _rowcta_spec(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     traits={},
     priority=Priority.PORTABLE,
 )
-def _torch_spec(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    return x @ weight.t()
+def _torch_spec(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.mm(x, weight.t(), out=out) if out is not None else x @ weight.t()
 
 
 @functools.lru_cache(maxsize=64)
@@ -186,14 +194,31 @@ def _select(m: int, n: int, k: int, on_cuda: bool):
     return _torch_spec
 
 
-def decode_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+def decode_gemv(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
     """``x @ weight.T`` with registry-selected decode kernels.
 
     Selection is cached per (M, N, K, device kind); the shape traits keep
     the specialized kernels inside their validated envelope and everything
     else routes to the portable fallback.
     """
-    return _select(x.shape[0], weight.shape[0], weight.shape[1], x.is_cuda)(x, weight)
+    expected = (x.shape[0], weight.shape[0])
+    if out is not None:
+        if (
+            tuple(out.shape) != expected
+            or out.dtype != x.dtype
+            or out.device != x.device
+            or out.stride(-1) != 1
+        ):
+            raise ValueError(f"out must match x and have shape {expected}")
+        if not out.is_contiguous():
+            return _torch_spec(x, weight, out)
+    return _select(x.shape[0], weight.shape[0], weight.shape[1], x.is_cuda)(
+        x, weight, out
+    )
 
 
 def rowcta_gemv_add3(

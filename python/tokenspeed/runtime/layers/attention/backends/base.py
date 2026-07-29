@@ -77,6 +77,7 @@ class AttentionBackend(ABC):
     # False for group-aware backends whose spec-verify path is not wired yet.
     cache_group_spec_capable: bool = True
     uses_padded_decode_token_mask: bool = False
+    supports_mla_projected_value_decode: bool = False
     # Backend-owned cuda-graph cache-seqlens buffer the decode metadata views.
     draft_seq_lens_attr: str = "cuda_graph_seq_lens"
 
