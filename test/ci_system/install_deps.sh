@@ -9,6 +9,7 @@ set -e
 # Hand off to the ROCm-specific script when running on an AMD runner.
 # ============================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/package_cache.sh"
 AMD_RUNNER_LABEL_PATTERNS=(*mi350* *mi355* *mi35x*)
 
 for pat in "${AMD_RUNNER_LABEL_PATTERNS[@]}"; do
@@ -31,6 +32,7 @@ export C_INCLUDE_PATH="/usr/local/cuda/include/cccl"
 
 WORKSPACE=${WORKSPACE:-$(pwd)}
 CUDA_REQ="${WORKSPACE}/tokenspeed-kernel/python/requirements/cuda.txt"
+configure_b200v2_package_cache
 
 # Wrap pip install in a retry loop. PyPI's CDN occasionally returns a
 # bad Content-Type for /simple/<pkg>/ pages (most recently observed for
@@ -208,12 +210,13 @@ FLASHINFER_PYTHON_SPEC="$(pin_version flashinfer-python)"
 if [ -n "${FLASHINFER_PYTHON_SPEC}" ]; then
     FLASHINFER_VERSION="${FLASHINFER_PYTHON_SPEC##*==}"
     FLASHINFER_CUBIN_WHEEL_URL="https://github.com/flashinfer-ai/flashinfer/releases/download/v${FLASHINFER_VERSION}/flashinfer_cubin-${FLASHINFER_VERSION}-py3-none-any.whl"
+    FLASHINFER_CUBIN_WHEEL_SOURCE="$(cache_remote_wheel "${FLASHINFER_CUBIN_WHEEL_URL}")"
     echo "Force-reinstalling pinned FlashInfer Python: ${FLASHINFER_PYTHON_SPEC}"
     pip_install_with_retry pip3 install --break-system-packages \
         --force-reinstall --no-deps "${FLASHINFER_PYTHON_SPEC}"
     echo "Installing FlashInfer cubin from GitHub Release: ${FLASHINFER_CUBIN_WHEEL_URL}"
     pip_install_with_retry pip3 install --break-system-packages \
-        --force-reinstall --no-deps "${FLASHINFER_CUBIN_WHEEL_URL}"
+        --force-reinstall --no-deps "${FLASHINFER_CUBIN_WHEEL_SOURCE}"
 else
     echo "No FlashInfer Python pin found in ${CUDA_REQ}; skipping FlashInfer installs."
 fi
