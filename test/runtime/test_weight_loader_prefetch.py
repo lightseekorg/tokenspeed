@@ -39,28 +39,30 @@ def _fake_available_memory(available):
 
 
 class TestWeightLoaderPrefetch(unittest.TestCase):
-    def test_cli_flag_maps_to_server_args(self):
+    def _parse_server_args(self, cli):
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
-        args = parser.parse_args(
-            [
-                "--model",
-                "test/model",
-                "--weight-loader-prefetch-checkpoints",
-                "--weight-loader-prefetch-num-threads",
-                "2",
-            ]
-        )
+        args = parser.parse_args(["--model", "test/model", *cli])
         with mock.patch.object(ServerArgs, "__post_init__"):
-            server_args = ServerArgs.from_cli_args(args)
+            return ServerArgs.from_cli_args(args)
 
+    def test_prefetch_enabled_by_default(self):
+        server_args = self._parse_server_args(
+            ["--weight-loader-prefetch-num-threads", "2"]
+        )
         self.assertTrue(server_args.weight_loader_prefetch_checkpoints)
         self.assertEqual(server_args.weight_loader_prefetch_num_threads, 2)
 
-    def test_load_config_defaults_keep_prefetch_disabled(self):
+    def test_disable_flag_turns_prefetch_off(self):
+        server_args = self._parse_server_args(
+            ["--disable-weight-loader-prefetch-checkpoints"]
+        )
+        self.assertFalse(server_args.weight_loader_prefetch_checkpoints)
+
+    def test_load_config_defaults_enable_prefetch(self):
         load_config = LoadConfig()
 
-        self.assertFalse(load_config.weight_loader_prefetch_checkpoints)
+        self.assertTrue(load_config.weight_loader_prefetch_checkpoints)
         self.assertEqual(load_config.weight_loader_prefetch_num_threads, 4)
 
     def _make_files(self, tmpdir, count, size):

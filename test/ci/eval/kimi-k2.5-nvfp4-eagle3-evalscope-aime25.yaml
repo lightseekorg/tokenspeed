@@ -25,7 +25,6 @@ server:
     --moe-backend flashinfer_trtllm
     --quantization nvfp4
     --kv-cache-dtype fp8
-    --weight-loader-prefetch-checkpoints
     --speculative-algorithm EAGLE3
     --speculative-draft-model-path lightseekorg/kimi-k2.5-eagle3-mla
     --speculative-num-steps 1
