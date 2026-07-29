@@ -202,9 +202,10 @@ def test_msa_prefill_and_decode_after_2048() -> None:
         decode_seq_lens = torch.tensor(
             [prefill_len + 1], dtype=torch.int32, device="cuda"
         )
+        index_key_cache[decode_slot.long()] = decode_index_key
         decode_selected = minimax_indexer(
             decode_index_query,
-            decode_index_key,
+            torch.zeros_like(decode_index_key),
             index_key_cache,
             decode_slot,
             block_table,
@@ -215,6 +216,11 @@ def test_msa_prefill_and_decode_after_2048() -> None:
             local_blocks=1,
             decode_query_len=1,
             max_blocks=num_blocks,
+            index_k_cache_prewritten=True,
+        )
+        torch.testing.assert_close(
+            index_key_cache[decode_slot.long()],
+            decode_index_key,
         )
         all_index_keys = torch.cat([index_key, decode_index_key], dim=0)
         decode_expected = _reference_selected_blocks(

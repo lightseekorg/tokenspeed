@@ -65,8 +65,8 @@ def fused_qknorm_rope_kv_insert(
     (dense layers pass ``[q | k | v]`` with ``num_index_heads == 0``). q/k and,
     on the sparse path, index_q/index_k are rewritten in place; when given,
     contiguous ``q_out`` / ``index_q_out`` receive the de-interleaved outputs.
-    Norm weights are the folded Gemma weights (``1 + w``). ``cos_sin_cache`` is
-    ``[max_pos, rotary_dim]`` ([cos | sin] halves) in the qkv dtype.
+    Norm weights are the raw Gemma parameters; the kernel applies ``1 + w``.
+    ``cos_sin_cache`` is ``[max_pos, rotary_dim]`` ([cos | sin] halves) in FP32.
 
     ``enable_pdl`` requests Programmatic Dependent Launch (SM90+); when False the
     kernel launches without the stream-serialization attribute (its in-body
@@ -79,10 +79,12 @@ def fused_qknorm_rope_kv_insert(
         raise ValueError(f"unsupported kv_cache_dtype {kv_cache_dtype!r}")
     if positions.dtype != torch.int64:
         positions = positions.to(torch.int64)
-    if slot_mapping is not None and slot_mapping.dtype != torch.int64:
-        slot_mapping = slot_mapping.to(torch.int64)
-    if index_slot_mapping is not None and index_slot_mapping.dtype != torch.int64:
-        index_slot_mapping = index_slot_mapping.to(torch.int64)
+    if slot_mapping is not None and slot_mapping.dtype != torch.int32:
+        raise TypeError(f"slot_mapping must be int32, got {slot_mapping.dtype}")
+    if index_slot_mapping is not None and index_slot_mapping.dtype != torch.int32:
+        raise TypeError(
+            f"index_slot_mapping must be int32, got {index_slot_mapping.dtype}"
+        )
 
     _load_module().fused_minimax_m3_qknorm_rope_kv_insert(
         qkv,

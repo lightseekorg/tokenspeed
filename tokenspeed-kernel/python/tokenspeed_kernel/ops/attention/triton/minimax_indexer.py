@@ -327,6 +327,7 @@ def minimax_indexer(
     seq_lens_cpu: Sequence[int] | None = None,
     score_out: torch.Tensor | None = None,
     enable_pdl: bool = False,
+    index_k_cache_prewritten: bool = False,
 ) -> torch.Tensor:
     """Write index keys, score visible 128-token blocks, and select Top-K.
 
@@ -360,6 +361,8 @@ def minimax_indexer(
             fp32 buffer, pre-filled with ``-inf`` and reused across layers in
             place of a fresh per-call allocation. Honored only on the decode
             path when its shape/dtype match; otherwise a buffer is allocated.
+        index_k_cache_prewritten: Skip the current-token index-key store
+            because an earlier producer inserted it on the same stream.
 
     Returns:
         Selected logical block ids shaped ``[tokens, local_index_heads, topk]``.
@@ -401,20 +404,21 @@ def minimax_indexer(
     block_d = triton.next_power_of_2(head_dim)
     use_pdl = bool(enable_pdl and _is_nvidia)
     pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
-    _store_index_k_kernel[(tokens,)](
-        index_k,
-        index_k_cache,
-        slot_mapping,
-        index_k.stride(0),
-        index_k.stride(1),
-        index_k_cache.stride(0),
-        index_k_cache.stride(1),
-        head_dim=head_dim,
-        BLOCK_D=block_d,
-        ENABLE_PDL=use_pdl,
-        num_warps=4,
-        **pdl_kwargs,
-    )
+    if not index_k_cache_prewritten:
+        _store_index_k_kernel[(tokens,)](
+            index_k,
+            index_k_cache,
+            slot_mapping,
+            index_k.stride(0),
+            index_k.stride(1),
+            index_k_cache.stride(0),
+            index_k_cache.stride(1),
+            head_dim=head_dim,
+            BLOCK_D=block_d,
+            ENABLE_PDL=use_pdl,
+            num_warps=4,
+            **pdl_kwargs,
+        )
 
     max_blocks = block_table.shape[1] if max_blocks is None else int(max_blocks)
     if not 0 < max_blocks <= block_table.shape[1]:

@@ -32,6 +32,7 @@ from tokenspeed_kernel import (
     msa_decode_with_kvcache,
     msa_extend_with_kvcache,
 )
+from tokenspeed_kernel.ops.attention import MinimaxSparseCacheInsertArgs
 from tokenspeed_kernel.ops.kvcache.triton import (
     fused_fp8_set_kv_buffer,
     gather_page_table_with_padding,
@@ -534,14 +535,7 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         assert (
             index_q is not None and index_k is not None
         ), "MSA requires index_q and index_k from the model layer."
-        assert save_kv_cache, (
-            "MSA does not support KV-cache prewrite because its "
-            "index-key side cache is backend-owned."
-        )
-        assert k is not None and v is not None, "MSA requires K/V inputs on every call."
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
-        k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
-        v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
 
         out_cache_loc = self._select_out_cache_loc(
             layer,
@@ -551,7 +545,17 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         page_table = self._select_page_table(layer, metadata)
         if page_table is None:
             raise RuntimeError("MSA decode requires a page table.")
-        self._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)
+        if save_kv_cache:
+            assert (
+                k is not None and v is not None
+            ), "MSA requires K/V inputs when the cache is not prewritten."
+            self._save_kv_cache(
+                layer,
+                out_cache_loc,
+                token_to_kv_pool,
+                k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+            )
         k_cache, v_cache, index_k_cache = self._get_sparse_caches(
             layer, token_to_kv_pool
         )
@@ -582,6 +586,7 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             v_scale=layer.v_scale if self.is_fp8 else None,
             score_out=metadata.score_out,
             enable_pdl=pdl_enabled(),
+            index_k_cache_prewritten=not save_kv_cache,
         )
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -835,6 +840,35 @@ class MSAHybridAttnBackend(AttentionBackend):
         # A single model-wide answer must be safe for sparse layers too.
         del forward_mode
         return False
+
+    def create_fused_decode_cache_insert_args(
+        self,
+        layer: PagedAttention,
+        out_cache_loc: torch.Tensor,
+        token_to_kv_pool,
+        forward_mode: ForwardMode,
+    ) -> MinimaxSparseCacheInsertArgs | None:
+        scales = (layer.k_scale, layer.v_scale)
+        if (
+            not forward_mode.is_decode()
+            or layer.layer_id not in self.sparse_layer_ids
+            or any(
+                isinstance(scale, torch.Tensor)
+                or (scale is not None and float(scale) != 1.0)
+                for scale in scales
+            )
+        ):
+            return None
+        return MinimaxSparseCacheInsertArgs(
+            slot_mapping=self.sparse_attn_backend.select_out_cache_loc(
+                layer,
+                out_cache_loc,
+                forward_mode,
+            ),
+            k_cache=token_to_kv_pool.get_key_buffer(layer.layer_id),
+            v_cache=token_to_kv_pool.get_value_buffer(layer.layer_id),
+            index_k_cache=token_to_kv_pool.get_index_k_buffer(layer.layer_id),
+        )
 
     def init_forward_metadata(self, *args, **kwargs):
         self.full_attn_backend.init_forward_metadata(*args, **kwargs)

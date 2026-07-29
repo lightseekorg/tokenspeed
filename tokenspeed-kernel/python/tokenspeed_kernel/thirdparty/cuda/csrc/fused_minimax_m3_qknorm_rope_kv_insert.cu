@@ -218,13 +218,16 @@ __device__ __forceinline__ void storeCacheElems(
     // model dtype directly. FP8 cache dtypes use the conversion path below.
     storeElems<scalar_t>(reinterpret_cast<scalar_t*>(dst), elems);
   } else {
-    // fp8 cache (identity scale 1.0): direct float -> e4m3/e5m2 byte.
+    // Match the unfused path, which materializes K in the model dtype before
+    // the paged-cache store converts it to FP8.
     constexpr __nv_fp8_interpretation_t kInterp =
         (kv_dt == Fp8KVCacheDataType::kFp8E4M3) ? __NV_E4M3 : __NV_E5M2;
 #pragma unroll
     for (int i = 0; i < kElemsPerLane; i++) {
+      float const rounded =
+          elemToFloat<scalar_t>(floatToElem<scalar_t>(elems[i]));
       dst[i] = static_cast<cache_t>(
-          __nv_cvt_float_to_fp8(elems[i], __NV_SATFINITE, kInterp));
+          __nv_cvt_float_to_fp8(rounded, __NV_SATFINITE, kInterp));
     }
   }
 }
@@ -290,8 +293,8 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
     scalar_t const* __restrict__ ik_norm_w,
     float const* __restrict__ cos_sin_cache,  // fp32 [max_pos, rotary_dim]
     int64_t const* __restrict__ positions,       // [N] i64
-    int64_t const* __restrict__ slot_mapping,    // main K/V slots or nullptr
-    int64_t const* __restrict__ index_slot_mapping,  // index K slots/nullptr
+    int32_t const* __restrict__ slot_mapping,    // main K/V slots or nullptr
+    int32_t const* __restrict__ index_slot_mapping,  // index K slots/nullptr
     cache_t* __restrict__ k_cache,        // [num_slots, nkv, 128] or nullptr
     cache_t* __restrict__ v_cache,        // [num_slots, nkv, 128] or nullptr
     out_idx_t* __restrict__ index_cache,  // [nb*bs, 128]; scalar_t or e4m3 byte
@@ -469,8 +472,8 @@ void launchFusedMiniMaxM3(
     scalar_t* qkv, scalar_t* q_out, void* index_q_out, scalar_t const* q_norm_w,
     scalar_t const* k_norm_w, scalar_t const* iq_norm_w,
     scalar_t const* ik_norm_w, float const* cos_sin_cache,
-    int64_t const* positions, int64_t const* slot_mapping,
-    int64_t const* index_slot_mapping, cache_t* k_cache, cache_t* v_cache,
+    int64_t const* positions, int32_t const* slot_mapping,
+    int32_t const* index_slot_mapping, cache_t* k_cache, cache_t* v_cache,
     void* index_cache, float const eps, int const rotary_dim,
     int const num_tokens, int const nq, int const nkv, int const niq,
     int const block_size, int64_t const kv_s_slot, int64_t const kv_s_head,
@@ -635,8 +638,8 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
   int64_t kv_s_slot = 0, kv_s_head = 0, kv_s_dim = 0;
   if (insert_kv) {
     TVM_FFI_ICHECK(slot_mapping.has_value() &&
-                   slot_mapping.value().dtype() == dl_int64)
-        << "insert mode requires int64 slot_mapping";
+                   slot_mapping.value().dtype() == dl_int32)
+        << "insert mode requires int32 slot_mapping";
     TVM_FFI_ICHECK(v_cache.has_value()) << "insert mode requires v_cache";
     TensorView kc = k_cache.value();
     TensorView vc = v_cache.value();
@@ -682,12 +685,12 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
       process_index ? index_k_norm_weight.value().data_ptr() : nullptr;
   void const* csc_ptr = cos_sin_cache.data_ptr();
   int64_t const* pos_ptr = static_cast<int64_t const*>(positions.data_ptr());
-  int64_t const* slot_ptr =
-      insert_kv ? static_cast<int64_t const*>(slot_mapping.value().data_ptr())
+  int32_t const* slot_ptr =
+      insert_kv ? static_cast<int32_t const*>(slot_mapping.value().data_ptr())
                 : nullptr;
-  int64_t const* idx_slot_ptr = nullptr;
+  int32_t const* idx_slot_ptr = nullptr;
   if (insert_kv && process_index)
-    idx_slot_ptr = static_cast<int64_t const*>(
+    idx_slot_ptr = static_cast<int32_t const*>(
         (index_slot_mapping.has_value() ? index_slot_mapping.value()
                                         : slot_mapping.value())
             .data_ptr());

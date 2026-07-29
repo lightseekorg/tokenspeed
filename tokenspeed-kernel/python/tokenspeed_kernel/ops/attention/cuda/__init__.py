@@ -12,6 +12,7 @@ from tokenspeed_kernel.signature import format_signatures
 platform = current_platform()
 
 if platform.is_nvidia and platform.is_hopper_plus:
+    import tokenspeed_kernel.ops.attention.cuda.minimax_sparse  # noqa: F401
     from tokenspeed_kernel.thirdparty.cuda.merge_state import merge_state
 
     @register_kernel(

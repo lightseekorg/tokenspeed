@@ -27,13 +27,14 @@ from collections.abc import Iterable, Sequence
 
 import torch
 from tokenspeed_kernel.ops.activation.triton import swiglu_oai
+from tokenspeed_kernel.ops.attention import (
+    MinimaxSparseCacheInsertArgs,
+    minimax_sparse_qknorm_rope,
+)
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
 from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.thirdparty.cuda.minimax_m3_fused import (
-    fused_qknorm_rope_kv_insert,
-)
 from torch import nn
 from transformers import MiniMaxM3VLTextConfig
 
@@ -47,6 +48,7 @@ from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.utils import divide
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
+from tokenspeed.runtime.layers.attention.backends.msa import MSAHybridAttnBackend
 from tokenspeed.runtime.layers.attention.mm_encoder_attention import VisionAttention
 from tokenspeed.runtime.layers.conv import Conv3dLayer
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
@@ -578,7 +580,7 @@ class MiniMaxM3Attention(nn.Module):
         self.is_sparse = config.layer_types[layer_id] == "minimax_m3_sparse"
         self.use_fused_qknorm_rope = (
             self.is_sparse
-            and current_platform().is_nvidia
+            and current_platform().is_hopper_plus
             and self.head_dim == 128
             and config.index_head_dim == 128
         )
@@ -662,8 +664,23 @@ class MiniMaxM3Attention(nn.Module):
 
         qkv, _ = self.qkv_proj(hidden_states)
 
+        cache_insert = None
+        if self.use_fused_qknorm_rope and isinstance(
+            ctx.attn_backend, MSAHybridAttnBackend
+        ):
+            cache_insert = ctx.attn_backend.create_fused_decode_cache_insert_args(
+                self.attn,
+                out_cache_loc,
+                ctx.token_to_kv_pool,
+                ctx.forward_mode,
+            )
+
         if self.use_fused_qknorm_rope:
-            q, k, v, attn_kwargs = self.fused_qknorm_rope(qkv, positions)
+            q, k, v, attn_kwargs = self.fused_qknorm_rope(
+                qkv,
+                positions,
+                cache_insert,
+            )
         else:
             q, k, v, attn_kwargs = self.qknorm_rope(qkv, positions)
 
@@ -673,6 +690,7 @@ class MiniMaxM3Attention(nn.Module):
             v,
             ctx=ctx,
             out_cache_loc=out_cache_loc,
+            save_kv_cache=cache_insert is None,
             **attn_kwargs,
         )
         output, _ = self.o_proj(attn_output)
@@ -713,25 +731,23 @@ class MiniMaxM3Attention(nn.Module):
         return q, k, v, attn_kwargs
 
     def fused_qknorm_rope(
-        self, qkv: torch.Tensor, positions: torch.Tensor
+        self,
+        qkv: torch.Tensor,
+        positions: torch.Tensor,
+        cache_insert: MinimaxSparseCacheInsertArgs | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
-        q_out = qkv.new_empty(qkv.size(0), self.q_size)
-        index_q_out = qkv.new_empty(qkv.size(0), self.index_q_size)
-        fused_qknorm_rope_kv_insert(
-            qkv,
-            self.q_norm.weight,
-            self.k_norm.weight,
-            self.rotary_emb.cos_sin_cache,
-            positions,
-            self.num_heads,
-            self.num_kv_heads,
-            self.rotary_emb.rotary_dim,
-            self.q_norm.variance_epsilon,
+        q_out, index_q_out = minimax_sparse_qknorm_rope(
+            qkv=qkv,
+            q_norm_weight=self.q_norm.weight,
+            k_norm_weight=self.k_norm.weight,
             index_q_norm_weight=self.indexer.q_norm.weight,
             index_k_norm_weight=self.indexer.k_norm.weight,
-            num_index_heads=self.indexer.num_index_heads,
-            q_out=q_out,
-            index_q_out=index_q_out,
+            cos_sin_cache=self.rotary_emb.cos_sin_cache,
+            positions=positions,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            eps=self.q_norm.variance_epsilon,
+            cache_insert=cache_insert,
             enable_pdl=pdl_enabled(),
         )
         _, k, v, _, index_k = qkv.split(
