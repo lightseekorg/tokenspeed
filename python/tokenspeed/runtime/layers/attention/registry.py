@@ -23,7 +23,6 @@ from __future__ import annotations
 import logging
 import math
 import os
-from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -32,7 +31,6 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed.runtime.configs.model_config import AttentionArch, is_deepseek_v4
 from tokenspeed.runtime.configs.paged_cache_spec import (
     STATE_LAYER_TYPES,
-    PagedCacheGroupSpec,
     hybrid_slab_group_size,
     scheduler_ext_flat_kvcache,
 )
