@@ -173,11 +173,9 @@ class FlashMLABackend(AttentionBackend):
         # fresh object every step; under CUDA graph a fresh object is created at
         # capture time (see init_forward_metadata_capture_cuda_graph) so the
         # schedule build is recorded into the graph and recomputed from the live
-        # cache_seqlens buffer on each replay. This dict (keyed by bs) holds the
-        # captured objects so replay can look them up and so they stay alive.
-        self._decode_tile_metadata: dict[int, object] = {}
-        # Strong refs to every sched captured into a graph, so none is GC'd while
-        # its graph is alive (multiple sampling variants may capture the same bs).
+        # cache_seqlens buffer on each replay. Strong refs to every sched captured
+        # into a graph, so none is GC'd while its graph is alive (multiple sampling
+        # variants may capture the same bs).
         self._decode_tile_metadata_keepalive: list[object] = []
 
     # ------------------------------------------------------------------
@@ -245,28 +243,13 @@ class FlashMLABackend(AttentionBackend):
 
         Must be called *inside* graph capture: a fresh (uninitialized) object is
         created so the schedule build is captured and re-executed from the live
-        cache_seqlens buffer on every replay. The object is stored per-bs (and
-        kept alive) so the replay hook binds the exact same object the graph
-        recorded.
+        cache_seqlens buffer on every replay. The object is kept alive for the
+        lifetime of the graph that recorded it (a graph replays the recorded
+        schedule-build kernel against this object's tensors).
         """
         tile_metadata = get_mla_metadata()[0]
-        self._decode_tile_metadata[bs] = tile_metadata
         self._decode_tile_metadata_keepalive.append(tile_metadata)
         return tile_metadata
-
-    # Best practice: Shared _impl between the eager and cuda-graph decode metadata paths
-    def _init_decode_metadata_impl(
-        self,
-        global_table: torch.Tensor,
-        seq_lens: torch.Tensor,
-    ):
-        """Return this batch's ``(block_table, cache_seqlens)`` for decode.
-
-        Shared by the eager and cuda-graph-replay metadata paths so both derive
-        the page table / cache lengths identically from the gathered global page
-        table.
-        """
-        return global_table, seq_lens
 
     def _init_decode_metadata(
         self,
@@ -276,14 +259,11 @@ class FlashMLABackend(AttentionBackend):
         seq_lens: torch.Tensor,
         req_to_page: torch.Tensor,
     ):
-        block_table, base_seq_lens = self._init_decode_metadata_impl(
-            req_to_page[req_pool_indices], seq_lens
-        )
         self.forward_decode_metadata = FlashMLADecodeMetadata(
             num_extends=num_extends,
             flashmla_metadata=self._new_eager_tile_metadata(),
-            block_table=block_table,
-            seq_lens_k=base_seq_lens,
+            block_table=req_to_page[req_pool_indices],
+            seq_lens_k=seq_lens,
         )
 
     def _init_prefill_metadata(
@@ -417,21 +397,10 @@ class FlashMLABackend(AttentionBackend):
         if forward_mode is None or not forward_mode.is_decode_or_idle():
             raise RuntimeError(f"Not supported forward mode: {forward_mode}")
 
-        block_table, base_seq_lens = self._init_decode_metadata_impl(
-            req_to_page[req_pool_indices[:bs]], seq_lens[:bs]
-        )
+        block_table = req_to_page[req_pool_indices[:bs]]
 
-        # Same (block_table, base_seq_lens) as the eager path, but copied into the
-        # persistent buffers the captured kernel reads from.
         self.cuda_graph_kv_indices[:bs, : block_table.shape[1]].copy_(block_table)
-        self.cuda_graph_seq_lens_k[:bs].copy_(base_seq_lens)
-
-        # Bind the exact sched object the graph recorded at capture; the captured
-        # schedule-build kernel writes into this object's tensors on replay.
-        self.forward_decode_metadata.num_extends = 0
-        self.forward_decode_metadata.flashmla_metadata = self._decode_tile_metadata[bs]
-        self.forward_decode_metadata.block_table = self.cuda_graph_kv_indices[:bs]
-        self.forward_decode_metadata.seq_lens_k = self.cuda_graph_seq_lens_k[:bs]
+        self.cuda_graph_seq_lens_k[:bs].copy_(seq_lens[:bs])
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
