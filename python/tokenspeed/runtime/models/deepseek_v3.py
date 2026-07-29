@@ -684,7 +684,7 @@ class DeepseekV3AttentionMLA(nn.Module):
             q = self.q_proj(hidden_states)[0]
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
             kv_a = latent_cache[..., : self.kv_lora_rank]
-            self.kv_a_layernorm(kv_a, inplace=True)
+            self.kv_a_layernorm(kv_a, out=kv_a)
         return q, latent_cache
 
     @break_point
@@ -2036,6 +2036,16 @@ class Eagle3MlaModel(nn.Module):
             if getattr(config, "fc_norm", False)
             else None
         )
+        self.fused_fc_norms = (
+            nn.ModuleList(
+                [
+                    FusedRMSNorm(self.fc_norm[i], self.fc_norm[i + 1])
+                    for i in range(0, self.num_fc_input_dim - 1, 2)
+                ]
+            )
+            if self.fc_norm is not None
+            else None
+        )
         self.norm_output = getattr(config, "norm_output", False)
 
     def forward(
@@ -2056,15 +2066,23 @@ class Eagle3MlaModel(nn.Module):
 
         hidden_states = captured_hidden_states
         if hidden_states.size(-1) != embeds.size(-1):
-            if self.fc_norm is not None:
+            if self.fc_norm is not None and hidden_states.shape[0] > 0:
                 chunks = hidden_states.chunk(self.num_fc_input_dim, dim=-1)
-                hidden_states = torch.cat(
-                    [
-                        norm(chunk)
-                        for norm, chunk in zip(self.fc_norm, chunks, strict=True)
-                    ],
-                    dim=-1,
-                )
+                normed = torch.empty_like(hidden_states)
+                out_chunks = normed.chunk(self.num_fc_input_dim, dim=-1)
+                i = 0
+                for fused in self.fused_fc_norms:
+                    fused(
+                        input_q_a=chunks[i],
+                        input_kv_a=chunks[i + 1],
+                        output_q_a=out_chunks[i],
+                        output_kv_a=out_chunks[i + 1],
+                    )
+                    i += 2
+                if i < self.num_fc_input_dim:
+                    # Odd count: single norm into the last slice.
+                    self.fc_norm[i](chunks[i], out=out_chunks[i])
+                hidden_states = normed
             hidden_states, _ = self.fc(hidden_states)
 
         residual = None
