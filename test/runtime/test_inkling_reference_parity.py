@@ -16,21 +16,32 @@ sconv placement, per-head QK norms, relative-attention bias + causal/SWA
 masking, scale 1/head_dim, gate/shared-sink MoE, dense MLP, muP divide, and
 the padded-vocab mask.
 
-NOTE: intentionally NOT registered in CI while the Inkling port is
-confidential/local-only. Requires Blackwell (FA4).
+Runs on the released config (layer-truncated, experts shrunk; see
+``inkling_fixtures``) with dummy weights. Requires Blackwell (FA4).
 """
 
 import math
 import os
 import sys
-import tempfile
 import unittest
 
 import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from runtime.models.inkling_fixtures import make_inkling_dummy_checkpoint  # noqa: E402
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+from runtime.models.inkling_fixtures import (  # noqa: E402
+    INKLING_BF16,
+    NUM_TEST_EXPERTS,
+    load_inkling_config,
+    truncation_hf_overrides,
+)
+
+register_cuda_ci(
+    est_time=90,
+    suite="runtime-1gpu",
+    disabled_on_runners=["amd-*", "h100-*"],
+)
 
 PROMPT_IDS = [11, 25, 3, 999, 42, 7, 128, 55, 1023, 64, 2, 300]
 DECODE_STEPS = 6
@@ -43,7 +54,7 @@ def _has_blackwell() -> bool:
     return major >= 10
 
 
-def _build_replica(ckpt: str):
+def _build_replica():
     """Construct the Inkling model in-process and dummy-init it like the engine."""
     from tokenspeed.runtime.distributed.mapping import Mapping
     from tokenspeed.runtime.model_loader.weight_utils import (
@@ -51,12 +62,11 @@ def _build_replica(ckpt: str):
     )
     from tokenspeed.runtime.models.inkling import InklingForConditionalGeneration
     from tokenspeed.runtime.utils.env import global_server_args_dict
-    from tokenspeed.runtime.utils.hf_transformers_utils import get_config
 
     mapping = Mapping(rank=0, world_size=1)
     global_server_args_dict["mapping"] = mapping
     global_server_args_dict["enable_prefix_caching"] = False
-    config = get_config(ckpt, trust_remote_code=False, revision=None)
+    config = load_inkling_config(INKLING_BF16, num_experts=NUM_TEST_EXPERTS)
     with torch.device("cuda"):
         torch.set_default_dtype(torch.bfloat16)
         try:
@@ -113,11 +123,12 @@ def _reference_forward(model, text, input_ids: list[int]) -> torch.Tensor:
 
     head_dim = text.head_dim
     num_heads = text.num_attention_heads
-    num_kv = text.num_key_value_heads
     T = len(input_ids)
 
     for layer in m.layers:
         attn = layer.attn
+        # Per-layer native KV width (hetero serving).
+        num_kv = attn.kv_size // head_dim
         # --- attention sublayer ---
         x = _rms_norm(h, layer.attn_norm.weight, text.rms_norm_eps).to(h.dtype)
         qkvr = x @ attn.qkvr.weight.t()
@@ -189,12 +200,6 @@ class TestInklingReferenceParity(unittest.TestCase):
         # Torch MoE experts in BOTH the engine and the replica so parameter
         # shapes/values coincide (MoELayer stores backend-specific layouts).
         os.environ["INKLING_TORCH_MOE"] = "1"
-        cls._tmpdir = tempfile.TemporaryDirectory()
-        cls.ckpt = str(make_inkling_dummy_checkpoint(cls._tmpdir.name, tiny=True))
-
-    @classmethod
-    def tearDownClass(cls):
-        cls._tmpdir.cleanup()
 
     def test_logprobs_match_reference(self):
         """Compare engine logprob VALUES against the reference at every
@@ -208,7 +213,8 @@ class TestInklingReferenceParity(unittest.TestCase):
         from tokenspeed.runtime.entrypoints.engine import Engine
 
         engine = Engine(
-            model=self.ckpt,
+            model=INKLING_BF16,
+            hf_overrides=truncation_hf_overrides(),
             load_format="dummy",
             attention_backend="fa4",
             enable_prefix_caching=False,
@@ -240,7 +246,7 @@ class TestInklingReferenceParity(unittest.TestCase):
             engine.shutdown()
         self.assertEqual(len(output_lps), DECODE_STEPS)
 
-        model, text = _build_replica(self.ckpt)
+        model, text = _build_replica()
         # One reference forward over prompt + engine trajectory gives
         # next-token logprobs at every position.
         seq = list(PROMPT_IDS) + [int(t) for t in engine_ids]
