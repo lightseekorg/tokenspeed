@@ -590,9 +590,9 @@ def prepare_lcm_setup(
     """Apply one model recipe and size target/draft arenas from one budget."""
     if server_args.block_size != _LOGICAL_BLOCK_TOKENS:
         server_args.block_size = _LOGICAL_BLOCK_TOKENS
-    attn_config.page_size = _LOGICAL_BLOCK_TOKENS
+    attn_config.page_size = 64
     if draft_attn_config is not None:
-        draft_attn_config.page_size = _LOGICAL_BLOCK_TOKENS
+        draft_attn_config.page_size = 64
 
     if family == "kimi_k3":
         return _prepare_kimi_k3(
