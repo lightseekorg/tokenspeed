@@ -48,7 +48,10 @@ from tokenspeed.runtime.layers.linear import (
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
-from tokenspeed.runtime.layers.vocab_parallel_embedding import ParallelLMHead
+from tokenspeed.runtime.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.base import (
     BaseCausalLM,
@@ -724,6 +727,22 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
             and self.config.target_hidden_size != self.config.hidden_size
         ):
             return
+        if embed.shape != self.model.embed_tokens.weight.shape:
+            # Target embedding layout differs (e.g. replicated instead of
+            # vocab-parallel); rebuild the draft embedding to match it.
+            with torch.device("meta"):
+                replicated = VocabParallelEmbedding(
+                    self.config.vocab_size,
+                    self.config.hidden_size,
+                    prefix="model.embed_tokens",
+                )
+            if embed.shape != replicated.weight.shape:
+                raise ValueError(
+                    f"Cannot share target embed of shape {tuple(embed.shape)}: "
+                    f"draft expects {tuple(self.model.embed_tokens.weight.shape)} "
+                    f"(sharded) or {tuple(replicated.weight.shape)} (replicated)."
+                )
+            self.model.embed_tokens = replicated
         del self.model.embed_tokens.weight
         self.model.embed_tokens.weight = embed
         if head is not None and self.load_lm_head_from_target:
