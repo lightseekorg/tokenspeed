@@ -1734,7 +1734,7 @@ class EventLoop:
             self._publish_scheduler_kv_events()
             self._handle_flat_oom_terminals(execution_plan)
             flat_cache_zero_event = self.model_executor.zero_flat_cache_pages(
-                self._flat_pages_to_zero(execution_plan)
+                self._flat_page_ids_to_zero(execution_plan)
             )
             self._submit_cache_ops(execution_plan)
 
@@ -1891,7 +1891,7 @@ class EventLoop:
             self._handle_flat_oom_terminals(execution_plan)
 
             flat_cache_zero_event = self.model_executor.zero_flat_cache_pages(
-                self._flat_pages_to_zero(execution_plan)
+                self._flat_page_ids_to_zero(execution_plan)
             )
             self._submit_cache_ops(execution_plan)
 
@@ -2066,7 +2066,7 @@ def run_event_loop(
                 "max_num_seqs": server_args.max_num_seqs,
                 "chunked_prefill_size": server_args.chunked_prefill_size,
                 "max_model_len": event_loop.model_config.context_len,
-                "cache_storage": event_loop.cache_storage,
+                "cache_storage": getattr(event_loop, "cache_storage", None),
             }
         )
 
