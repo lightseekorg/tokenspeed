@@ -2045,6 +2045,11 @@ class KimiK3ForConditionalGeneration(nn.Module):
             **kwargs,
         )
 
+    def post_load_weights(self) -> None:
+        """Prepare text-model derived weights for loaders that skip checkpoints."""
+        if self.language_model is not None:
+            self.language_model.post_load_weights()
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         """Route checkpoint weights by top-level prefix.
 
