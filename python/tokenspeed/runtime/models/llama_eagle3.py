@@ -469,13 +469,13 @@ class Eagle3LlamaModel(BaseTransformerModel):
     ) -> torch.Tensor:
 
         if input_embeds is None:
-            # When TP > 1 and fused allreduce+norm is available, skip the
-            # NCCL allreduce in the embedding and let the midlayer fuse it
-            # with the input_layernorm.
+            # When the embedding is vocab-parallel (tp_size > 1), skip its
+            # NCCL allreduce and let the midlayer fuse it with input_layernorm.
+            # Non-sharded embeddings (tp_size == 1) need no allreduce at all.
             midlayer = self.midlayer
             num_tokens = input_ids.shape[0]
             fuse_embed_reduce = (
-                self.mapping.attn.tp_size > 1
+                self.embed_tokens.tp_size > 1
                 and midlayer.comm_manager.should_fuse(num_tokens)
             )
             embeds = self.embed_tokens(input_ids, reduce_results=not fuse_embed_reduce)
