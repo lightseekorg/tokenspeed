@@ -1734,10 +1734,13 @@ class ServerArgs:
         parser.add_argument(
             "--weight-loader-prefetch-checkpoints",
             action="store_true",
+            default=ServerArgs.weight_loader_prefetch_checkpoints,
             help=(
-                "Prefetch safetensors checkpoint shards into OS page cache before "
-                "loading. Local ranks split the shard list to reduce repeated reads "
-                "from shared filesystems."
+                "Sequentially read safetensors checkpoint shards into the OS page "
+                "cache a bounded window ahead of weight loading, so weight copies "
+                "hit the cache at streaming bandwidth instead of demand-faulting "
+                "cold pages from shared filesystems. The window is "
+                "min(80 GiB, 25%% of available host memory)."
             ),
         )
         parser.add_argument(
