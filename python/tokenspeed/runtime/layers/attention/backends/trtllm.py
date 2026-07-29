@@ -113,6 +113,7 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
     # Graph-buffer column tails pad with the zero-init dummy page, matching
     # the radix replay contract (gather_page_table_with_padding dummy_slot=0).
     flat_table_tail_pad: int = 0
+    draft_seq_lens_attr: str = "cuda_graph_cache_seqlens"
 
     def support_kv_cache_prewrite(
         self, forward_mode: ForwardMode | None = None
@@ -795,6 +796,8 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             return
 
         if self.spec_num_tokens > 1:
+            # Seed the owned buffer first: it is the clamp source below.
+            self.cuda_graph_cache_seqlens[:bs].copy_(seq_lens[:bs])
             self._init_multi_token_metadata_capture(
                 bs, self.spec_num_tokens, page_tables, out_cache_locs
             )
@@ -849,6 +852,8 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             page_tables=page_tables,
             out_cache_locs=out_cache_locs,
         )
+        # Seed the owned buffer: the capture run reads it before replay.
+        metadata.cache_seqlens_int32.copy_(seq_lens[:bs])
         self.cuda_graph_decode_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
 
@@ -935,8 +940,7 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 dummy_slot=0,
             )
         if flat_block_tables:
-            # cuda_graph_cache_seqlens aliases the controller's seq_lens_buf,
-            # filled by input prep BEFORE this call.
+            # cuda_graph_cache_seqlens was refreshed from live seq_lens above.
             self._flat_replay_fill(
                 bs,
                 flat_block_tables,

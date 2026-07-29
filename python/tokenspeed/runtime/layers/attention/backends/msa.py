@@ -329,7 +329,6 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
     def init_cuda_graph_state(
         self,
         max_bs: int,
-        seq_lens_buf: torch.Tensor,
         paged_cache_group_specs: Sequence = (),
         **kwargs,
     ):
@@ -337,14 +336,6 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         # learn their ids from the pool's specs so every flat table/loc path
         # here (eager, capture, replay) sheds them.
         self._learn_flat_state_groups(paged_cache_group_specs)
-        assert (
-            seq_lens_buf.dtype == torch.int32
-            and seq_lens_buf.dim() == 1
-            and seq_lens_buf.shape[0] >= max_bs
-        ), (
-            f"seq_lens_buf must be int32 with shape[0] >= {max_bs}, "
-            f"got {seq_lens_buf.dtype} {tuple(seq_lens_buf.shape)}"
-        )
 
         self.cuda_graph_decode_metadata = {}
         # Flat per-group persistent buffers, lazily allocated at first
@@ -367,13 +358,10 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         self.cuda_graph_page_table = torch.zeros(
             (max_bs, self.max_num_pages), dtype=torch.int32, device=self.device
         )
-        if self.spec_num_tokens > 1 and not self.is_draft:
-            self.cuda_graph_seq_lens = torch.empty(
-                (max_bs,), dtype=torch.int32, device=self.device
-            )
-        else:
-            # Alias controller's seq_lens_buf — backend never mutates it.
-            self.cuda_graph_seq_lens = seq_lens_buf
+        # Own the cache-seqlens buffer; replay copies the live lengths in.
+        self.cuda_graph_seq_lens = torch.zeros(
+            (max_bs,), dtype=torch.int32, device=self.device
+        )
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -433,6 +421,9 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             )
             if self.spec_num_tokens > 1 and not self.is_draft:
                 metadata.seq_lens.copy_(seq_lens[:bs].clamp_min(self.spec_num_tokens))
+        if not (self.draft_block_decode and self.spec_num_tokens > 1):
+            # Seed the owned buffer: the capture run reads it before replay.
+            metadata.seq_lens.copy_(seq_lens[:bs])
         self.cuda_graph_decode_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
 
@@ -475,8 +466,10 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             self.cuda_graph_page_table[: bs * self.spec_num_tokens, :].view(
                 bs, self.spec_num_tokens, self.max_num_pages
             ).copy_(base_page_table[:, None, :])
+        else:
+            # Plain decode / plain draft: copy live lengths into our buffer.
+            self.cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs])
 
-        # cuda_graph_seq_lens is filled by input prep / the spec copy above.
         if flat_block_tables:
             self._flat_replay_fill(
                 bs,
@@ -843,15 +836,10 @@ class MSAHybridAttnBackend(AttentionBackend):
     def init_cuda_graph_state(
         self,
         max_bs: int,
-        seq_lens_buf: torch.Tensor,
         **kwargs,
     ) -> None:
-        init_backend_cuda_graph_state(
-            self.full_attn_backend, max_bs, seq_lens_buf, **kwargs
-        )
-        init_backend_cuda_graph_state(
-            self.sparse_attn_backend, max_bs, seq_lens_buf, **kwargs
-        )
+        init_backend_cuda_graph_state(self.full_attn_backend, max_bs, **kwargs)
+        init_backend_cuda_graph_state(self.sparse_attn_backend, max_bs, **kwargs)
 
     def init_forward_metadata_capture_cuda_graph(self, *args, **kwargs):
         self.full_attn_backend.init_forward_metadata_capture_cuda_graph(*args, **kwargs)
@@ -864,6 +852,10 @@ class MSAHybridAttnBackend(AttentionBackend):
         self.sparse_attn_backend.init_forward_metadata_replay_cuda_graph(
             *args, **kwargs
         )
+
+    def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
+        self.full_attn_backend.advance_draft_forward_metadata(seq_lens)
+        self.sparse_attn_backend.advance_draft_forward_metadata(seq_lens)
 
     def configure_runtime(self, **kwargs) -> None:
         self.full_attn_backend.configure_runtime(**kwargs)

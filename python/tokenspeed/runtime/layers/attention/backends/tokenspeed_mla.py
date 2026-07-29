@@ -127,6 +127,7 @@ class CuteDSLMLABackend(AttentionBackend):
     # FlatKV contract capability: this backend consumes only history-family
     # (full-attention) tables; state groups belong to the linear sub-backend.
     flat_cache_consumer_families = frozenset({"history"})
+    draft_seq_lens_attr: str = "cuda_graph_seq_lens_buf"
 
     def __init__(self, config: MLAConfig):
         super().__init__(config)
@@ -757,6 +758,8 @@ class CuteDSLMLABackend(AttentionBackend):
                 seq_lens_k=self.cuda_graph_seq_lens_buf[:bs],
                 num_extends=0,
             )
+        # Seed the owned buffer: the capture run reads it before replay.
+        metadata.seq_lens_k.copy_(seq_lens[:bs])
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
 
@@ -784,6 +787,10 @@ class CuteDSLMLABackend(AttentionBackend):
                 "tokenspeed_mla draft worker does not take the FlatKV path"
             )
 
+        # Copy the live cache lengths into our own buffer (metadata.seq_lens_k
+        # views it) on both paths -- the flat helper only refreshes tables.
+        self.cuda_graph_seq_lens_buf[:bs].copy_(seq_lens[:bs])
+
         if flat:
             self._flat_replay_refresh_decode(
                 bs,
@@ -795,11 +802,8 @@ class CuteDSLMLABackend(AttentionBackend):
             self.forward_decode_metadata = metadata
             return
 
-        # Copy the live cache lengths into our own buffer (metadata.seq_lens_k
-        # views it). Block indices are refreshed separately; when the block
-        # table is aliased to a peer backend, that peer's replay already
-        # populated it with identical content.
-        self.cuda_graph_seq_lens_buf[:bs].copy_(seq_lens[:bs])
+        # Block indices are refreshed separately; when the block table is
+        # aliased to a peer backend, that peer's replay already populated it.
         if req_to_page is not None and not self._block_table_aliased:
             self._create_block_kv_indices(
                 bs,

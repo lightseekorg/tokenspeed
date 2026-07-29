@@ -70,6 +70,8 @@ class AttentionBackend(ABC):
     # False for flat-capable backends whose spec-verify path is not wired yet.
     flat_spec_capable: bool = True
     uses_padded_decode_token_mask: bool = False
+    # Backend-owned cuda-graph cache-seqlens buffer the decode metadata views.
+    draft_seq_lens_attr: str = "cuda_graph_seq_lens"
 
     def __init__(self, config: BaseAttnConfig) -> None:
         self.device = config.device
@@ -124,6 +126,18 @@ class AttentionBackend(ABC):
         """Init the global shared states for cuda graph. Backends own their
         cache-seqlens buffer and copy the live lengths in at replay time."""
         raise NotImplementedError()
+
+    def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
+        """Publish the drafter's in-graph seq_lens edits into our own buffer.
+
+        Copies into ``draft_seq_lens_attr``; backends with distinct draft
+        metadata or an inner backend override this.
+        """
+        buf = getattr(self, self.draft_seq_lens_attr, None)
+        if buf is None:
+            return
+        bs = seq_lens.shape[0]
+        buf[:bs].copy_(seq_lens[:bs])
 
     def init_forward_metadata_capture_cuda_graph(
         self,

@@ -1115,6 +1115,9 @@ class InklingAttnBackend(AttentionBackend):
             bs, req_pool_indices, seq_lens, forward_mode, **kwargs
         )
         assert self._graph_cache_indices is not None
+        # Seed the owned buffer: paged conv reads pos = seq_len - 1, so an
+        # unseeded (zero) length would address position -1 during capture.
+        self._graph_seq_lens[:bs].copy_(seq_lens[:bs])
         if self.conv_spec_num_tokens > 1:
             # k-token spec chunk; drafter capture swaps to 1-token steps via advance_draft_forward_metadata.
             self.conv_metadata = self._spec_conv_metadata(bs)

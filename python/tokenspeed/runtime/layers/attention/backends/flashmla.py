@@ -96,6 +96,8 @@ class FlashMLABackend(AttentionBackend):
     prefill wrappers for the EXTEND path.
     """
 
+    draft_seq_lens_attr: str = "cuda_graph_seq_lens_k"
+
     def __init__(self, config: MLAConfig):
         super().__init__(config)
 
@@ -378,6 +380,9 @@ class FlashMLABackend(AttentionBackend):
         if not (decode_no_spec or is_target_verify or is_draft_extend):
             raise RuntimeError(f"Not supported forward mode: {forward_mode}")
 
+        # Seed before building the tile schedule: it is recorded against these
+        # lengths, and the capture run reads them before any replay.
+        self.cuda_graph_seq_lens_k[:bs].copy_(seq_lens[:bs])
         self.forward_decode_metadata = FlashMLADecodeMetadata(
             num_extends=0,
             flashmla_metadata=self._capture_decode_tile_metadata(bs),

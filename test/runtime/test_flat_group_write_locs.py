@@ -432,10 +432,13 @@ class GraphLocBuffersTest(_MHACase):
 
     def _replay(self, bs, flat_block_tables=None, seq_lens=None):
         torch = self.torch
+        # Wrapper contract: the step's lens (dummy tail = 1) are passed in and
+        # the backend copies them into its own buffer.
+        live_seq_lens = torch.ones(
+            MAX_BS, dtype=torch.int32, device=self.backend.device
+        )
         if seq_lens is not None:
-            # Wrapper contract: input prep writes the step's lens (dummy
-            # tail = 1) into seq_lens_buf BEFORE replay runs.
-            self.backend.cuda_graph_seq_lens[: len(seq_lens)] = torch.tensor(
+            live_seq_lens[: len(seq_lens)] = torch.tensor(
                 seq_lens, dtype=torch.int32, device=self.backend.device
             )
         kwargs = {}
@@ -444,7 +447,7 @@ class GraphLocBuffersTest(_MHACase):
         self.backend.init_forward_metadata_replay_cuda_graph(
             bs,
             torch.arange(MAX_BS, dtype=torch.int64, device=self.backend.device),
-            torch.ones(MAX_BS, dtype=torch.int32, device=self.backend.device),
+            live_seq_lens,
             torch.zeros(
                 (MAX_BS, MAX_NUM_PAGES),
                 dtype=torch.int32,

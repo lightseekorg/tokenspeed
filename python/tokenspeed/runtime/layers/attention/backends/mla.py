@@ -537,6 +537,8 @@ class MLAAttnBackend(AttentionBackend):
             seq_lens=self.cuda_graph_seq_lens[:bs],
             flat_out_cache_loc=flat_out_cache_loc,
         )
+        # Seed the owned buffer: the capture run reads it before replay.
+        metadata.seq_lens.copy_(seq_lens[:bs])
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
 

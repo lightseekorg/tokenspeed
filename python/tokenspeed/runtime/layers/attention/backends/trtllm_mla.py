@@ -112,6 +112,8 @@ class TRTLLMMLADecodeMetadata:
 class TRTLLMMLABackend(AttentionBackend):
     """trtllm_mla attention backend using fused kernels."""
 
+    draft_seq_lens_attr: str = "cuda_graph_seq_lens_buf"
+
     def __init__(self, config: MLAConfig):
         super().__init__(config)
 
@@ -348,6 +350,8 @@ class TRTLLMMLABackend(AttentionBackend):
             seq_lens_k=self.cuda_graph_seq_lens_buf[:bs],
         )
 
+        # Seed the owned buffer: the capture run reads it before replay.
+        metadata.seq_lens_k.copy_(seq_lens[:bs])
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
 

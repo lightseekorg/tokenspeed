@@ -104,8 +104,7 @@ class _StubFullAttnMeta:
 
 def test_replay_refreshes_buffers_in_place_and_pads_page_zero() -> None:
     backend = _bare_mla_backend(flat_contract=True)
-    seq_buf = torch.ones(2, dtype=torch.int32)
-    backend.init_cuda_graph_state(max_bs=2, seq_lens_buf=seq_buf)
+    backend.init_cuda_graph_state(max_bs=2)
     backend.init_forward_metadata_capture_cuda_graph(
         bs=2,
         req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
@@ -153,7 +152,7 @@ def test_replay_refreshes_buffers_in_place_and_pads_page_zero() -> None:
 def test_amd_mla_flat_graph_replay_is_pointer_stable_and_null_padded() -> None:
     backend = _bare_amd_mla_backend(flat_contract=True)
     seq_buf = torch.ones(2, dtype=torch.int32)
-    backend.init_cuda_graph_state(max_bs=2, seq_lens_buf=seq_buf)
+    backend.init_cuda_graph_state(max_bs=2)
     backend.init_forward_metadata_capture_cuda_graph(
         bs=2,
         req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),

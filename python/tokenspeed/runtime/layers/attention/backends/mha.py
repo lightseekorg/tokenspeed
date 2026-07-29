@@ -421,6 +421,9 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             )
             if self.spec_num_tokens > 1 and not self.is_draft:
                 metadata.seq_lens.copy_(seq_lens[:bs].clamp_min(self.spec_num_tokens))
+            else:
+                # Seed the owned buffer: the capture run reads it before replay.
+                metadata.seq_lens.copy_(seq_lens[:bs])
         self.cuda_graph_decode_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
 
