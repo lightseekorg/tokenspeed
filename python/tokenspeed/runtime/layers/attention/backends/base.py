@@ -40,7 +40,6 @@ if TYPE_CHECKING:
 def init_backend_cuda_graph_state(
     backend: "AttentionBackend",
     max_bs: int,
-    seq_lens_buf: torch.Tensor,
     **extras,
 ) -> None:
     """Call ``backend.init_cuda_graph_state`` with only the kwargs its
@@ -56,7 +55,7 @@ def init_backend_cuda_graph_state(
     params = inspect.signature(backend.init_cuda_graph_state).parameters
     if not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
         extras = {k: v for k, v in extras.items() if k in params}
-    backend.init_cuda_graph_state(max_bs, seq_lens_buf, **extras)
+    backend.init_cuda_graph_state(max_bs, **extras)
 
 
 class AttentionBackend(ABC):
@@ -121,10 +120,9 @@ class AttentionBackend(ABC):
         """
         raise NotImplementedError()
 
-    def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor):
-        """Init the global shared states for cuda graph. `seq_lens_buf` is
-        the controller-owned per-request seq_lens; backends should reference
-        (alias) it rather than copy, and must not mutate the contents."""
+    def init_cuda_graph_state(self, max_bs: int):
+        """Init the global shared states for cuda graph. Backends own their
+        cache-seqlens buffer and copy the live lengths in at replay time."""
         raise NotImplementedError()
 
     def init_forward_metadata_capture_cuda_graph(

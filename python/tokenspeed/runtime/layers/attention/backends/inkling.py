@@ -1058,11 +1058,14 @@ class InklingAttnBackend(AttentionBackend):
             tables[g] = buf
         return tables
 
-    def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor, **kwargs):
-        init_backend_cuda_graph_state(self.inner, max_bs, seq_lens_buf, **kwargs)
+    def init_cuda_graph_state(self, max_bs: int, **kwargs):
+        init_backend_cuda_graph_state(self.inner, max_bs, **kwargs)
         device = self.conv_pool.conv_state.device
         self._decode_qsl = torch.arange(max_bs + 1, dtype=torch.int32, device=device)
-        self._graph_seq_lens = seq_lens_buf
+        # Own the cache-seqlens buffer instead of aliasing the controller's
+        # seq_lens_buf; replay copies the live lengths in, so graph state does
+        # not depend on the controller mutating a shared tensor in place.
+        self._graph_seq_lens = torch.zeros(max_bs, dtype=torch.int32, device=device)
         if getattr(self, "conv_columns", None) is not None:
             # Adopted stacked views are filled by the mixin's packed unpack; pad rows hit dummy slot 0.
             inner_tabs = getattr(self.inner, "cuda_graph_flat_page_tables", {})
@@ -1137,6 +1140,7 @@ class InklingAttnBackend(AttentionBackend):
             **kwargs,
         )
         assert self._graph_cache_indices is not None
+        self._graph_seq_lens[:bs].copy_(seq_lens[:bs])
         self._graph_cache_indices[:bs].copy_(req_pool_indices[:bs].to(torch.int32))
         if actual_bs is not None and actual_bs < bs:
             # Pad rows may carry stale indices aliasing LIVE slots; PAD_SLOT_ID keeps writes off them.

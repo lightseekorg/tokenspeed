@@ -328,7 +328,6 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
     def init_cuda_graph_state(
         self,
         max_bs: int,
-        seq_lens_buf: torch.Tensor,
         paged_cache_group_specs: Sequence = (),
         **kwargs,
     ):
@@ -336,14 +335,6 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         # learn their ids from the pool's specs so every flat table/loc path
         # here (eager, capture, replay) sheds them.
         self._learn_flat_state_groups(paged_cache_group_specs)
-        assert (
-            seq_lens_buf.dtype == torch.int32
-            and seq_lens_buf.dim() == 1
-            and seq_lens_buf.shape[0] >= max_bs
-        ), (
-            f"seq_lens_buf must be int32 with shape[0] >= {max_bs}, "
-            f"got {seq_lens_buf.dtype} {tuple(seq_lens_buf.shape)}"
-        )
 
         self.cuda_graph_decode_metadata = {}
         # Flat per-group persistent buffers. TODO(radix-removal): parallels
@@ -366,13 +357,12 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         self.cuda_graph_page_table = torch.zeros(
             (max_bs, self.max_num_pages), dtype=torch.int32, device=self.device
         )
-        if self.spec_num_tokens > 1 and not self.is_draft:
-            self.cuda_graph_seq_lens = torch.empty(
-                (max_bs,), dtype=torch.int32, device=self.device
-            )
-        else:
-            # Alias controller's seq_lens_buf — backend never mutates it.
-            self.cuda_graph_seq_lens = seq_lens_buf
+        # Own the cache-seqlens buffer in all non-DFLASH cases; replay copies the
+        # live lengths in (verify clamps, plain decode/draft copies), so graph
+        # state does not depend on the controller mutating a shared tensor.
+        self.cuda_graph_seq_lens = torch.zeros(
+            (max_bs,), dtype=torch.int32, device=self.device
+        )
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -478,8 +468,10 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             self.cuda_graph_page_table[: bs * self.spec_num_tokens, :].view(
                 bs, self.spec_num_tokens, self.max_num_pages
             ).copy_(base_page_table[:, None, :])
-
-        # cuda_graph_seq_lens is filled by input prep / the spec copy above.
+        else:
+            # Plain decode / plain draft: copy the live lengths into our own
+            # buffer (previously aliased the controller's seq_lens_buf).
+            self.cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs])
         if flat_block_tables:
             self._flat_replay_fill(
                 bs,

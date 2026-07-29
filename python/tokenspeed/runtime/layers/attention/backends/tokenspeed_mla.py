@@ -671,17 +671,12 @@ class CuteDSLMLABackend(AttentionBackend):
 
     # ---- CUDA Graph ----
 
-    def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor):
-        assert (
-            seq_lens_buf.dtype == torch.int32
-            and seq_lens_buf.dim() == 1
-            and seq_lens_buf.shape[0] >= max_bs
-        ), (
-            f"seq_lens_buf must be int32 with shape[0] >= {max_bs}, "
-            f"got {seq_lens_buf.dtype} {tuple(seq_lens_buf.shape)}"
+    def init_cuda_graph_state(self, max_bs: int):
+        # Own the cache-seqlens buffer; replay copies the live lengths in, so
+        # graph state does not depend on the controller mutating a shared tensor.
+        self.cuda_graph_seq_lens_buf = torch.zeros(
+            max_bs, dtype=torch.int32, device=self.device
         )
-        # Alias controller's seq_lens_buf — backend never mutates it.
-        self.cuda_graph_seq_lens_buf = seq_lens_buf
         max_blocks = self._calc_padded_blocks(self.max_context_len)
         self.decode_cuda_graph_kv_indices = torch.zeros(
             (max_bs, max_blocks), dtype=torch.int32, device=self.device
@@ -800,10 +795,11 @@ class CuteDSLMLABackend(AttentionBackend):
             self.forward_decode_metadata = metadata
             return
 
-        # seq_lens_k aliases seq_lens_buf; only block indices need refresh.
-        # When the buffer is aliased to a peer backend (e.g. drafter aliasing
-        # the target's kv_indices), the peer's replay has already populated it
-        # with identical content.
+        # Copy the live cache lengths into our own buffer (metadata.seq_lens_k
+        # views it). Block indices are refreshed separately; when the block
+        # table is aliased to a peer backend, that peer's replay already
+        # populated it with identical content.
+        self.cuda_graph_seq_lens_buf[:bs].copy_(seq_lens[:bs])
         if req_to_page is not None and not self._block_table_aliased:
             self._create_block_kv_indices(
                 bs,

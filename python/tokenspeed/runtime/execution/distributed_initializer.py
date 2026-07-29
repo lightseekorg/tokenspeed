@@ -21,7 +21,6 @@
 from dataclasses import dataclass
 
 import torch
-from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -150,12 +149,10 @@ class DistributedInitializer:
         else:
             dist_init_method = f"tcp://127.0.0.1:{config.nccl_port}"
 
-        # Device-scoped NCCL init is only required and tested on AMD.
-        device_id = (
-            torch.device(config.device, config.gpu_id)
-            if current_platform().is_amd
-            else None
-        )
+        # Pass the device so PyTorch binds the process group to it (eager NCCL
+        # init) instead of inferring it later — this also mutes the c10d
+        # "barrier(): using the device under current context" warning.
+        device_id = torch.device(config.device, config.gpu_id)
 
         # Initialize distributed via the mapping-based process group manager
         pg_manager.init_distributed(
