@@ -584,16 +584,14 @@ def setup_runner(
         # InRelease responses with a short non-clearsigned payload, which
         # apt reports as NOSPLIT. HTTPS bypasses that HTTP interception.
         shell_run(
-            "for source in /etc/apt/sources.list "
-            "/etc/apt/sources.list.d/*.sources; do "
-            '[ -f "" ] || continue; '
-            "sudo sed -i "
+            "find /etc/apt -maxdepth 2 -type f "
+            "\\( -path /etc/apt/sources.list -o -name '*.sources' \\) "
+            "-exec sudo sed -i "
             "'s|http://archive.ubuntu.com/ubuntu|"
             "https://archive.ubuntu.com/ubuntu|g; "
             "s|http://security.ubuntu.com/ubuntu|"
             "https://security.ubuntu.com/ubuntu|g' "
-            '""; '
-            "done",
+            "{} +",
             env=local_env,
             cwd=cwd,
             dry_run=dry_run,
