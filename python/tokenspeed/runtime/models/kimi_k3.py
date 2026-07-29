@@ -1112,7 +1112,6 @@ class KimiLinearMoE(nn.Module):
                     alt_stream if self.execution_plan.overlap_shared_experts else None
                 ),
                 expert_parallel_group=mapping.moe.ep_group,
-                return_separate_outputs=True,
             )
             if self.execution_plan.use_native
             else None
@@ -1179,12 +1178,12 @@ class KimiLinearMoE(nn.Module):
         the up-projection's store performs the accumulate in-kernel.
         """
         if self.native_latent_moe is not None:
-            routed_out, shared_out = self.native_latent_moe(
+            return self.native_latent_moe(
                 hidden_states,
                 num_global_tokens=num_global_tokens,
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+                prefix_sum=prefix_sum,
             )
-            return add3(prefix_sum, routed_out, shared_out)
 
         num_tokens, hidden_size = hidden_states.shape
         if num_tokens == 0:

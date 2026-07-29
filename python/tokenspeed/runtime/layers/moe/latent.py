@@ -300,6 +300,7 @@ class LatentMoELayer(nn.Module):
         hidden_states: torch.Tensor,
         num_global_tokens: int | None = None,
         max_num_tokens_per_gpu: int | None = None,
+        prefix_sum: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if hidden_states.ndim != 2:
             raise ValueError(
@@ -406,6 +407,22 @@ class LatentMoELayer(nn.Module):
         if self.routed_norm is not None:
             routed_latent = _module_tensor_output(self.routed_norm, routed_latent)
             _check_shape(routed_latent, latent_shape, "routed_norm")
+
+        if prefix_sum is not None:
+            if shared_output is None:
+                raise ValueError("fused latent MoE output requires shared experts")
+            _check_shape(prefix_sum, output_shape, "prefix_sum")
+            if self.shared_reduce is not None and not shared_reduction_applied:
+                shared_output = self.shared_reduce(shared_output)
+                _check_shape(shared_output, output_shape, "shared_reduce")
+            output = tokenspeed_kernel.kimi3_latent_projection_add3(
+                routed_latent,
+                self.routed_up_proj.weight,
+                prefix_sum,
+                shared_output,
+            )
+            _check_shape(output, output_shape, "fused routed output")
+            return output
 
         routed_output = _module_tensor_output(self.routed_up_proj, routed_latent)
         _check_shape(routed_output, output_shape, "routed_up_proj")

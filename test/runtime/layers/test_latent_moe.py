@@ -38,6 +38,17 @@ class _Trace(nn.Module):
         return _TRACE_FNS[self.name](hidden_states)
 
 
+class _FusedUp(nn.Module):
+    def __init__(self, events: list[str]) -> None:
+        super().__init__()
+        self.events = events
+        self.weight = nn.Parameter(torch.empty(4, 2))
+
+    def forward(self, hidden_states: torch.Tensor):
+        self.events.append("up")
+        return _up(hidden_states)
+
+
 class _TopK(nn.Module):
     def __init__(self, events: list[str]) -> None:
         super().__init__()
@@ -146,6 +157,7 @@ def test_kimi3_reduce_fused_moe_falls_back_for_multiple_tokens(
 def _layer(
     events: list[str],
     experts: nn.Module | None = None,
+    routed_up_proj: nn.Module | None = None,
     **kwargs,
 ) -> LatentMoELayer:
     return LatentMoELayer(
@@ -153,7 +165,7 @@ def _layer(
         topk=_TopK(events),
         routed_down_proj=_Trace(events, "down"),
         experts=experts or _Experts(events),
-        routed_up_proj=_Trace(events, "up"),
+        routed_up_proj=routed_up_proj or _Trace(events, "up"),
         **kwargs,
     )
 
@@ -358,6 +370,45 @@ def test_latent_moe_can_return_separate_residual_components() -> None:
     expected_routed = torch.cat((latent, torch.zeros_like(latent)), dim=-1)
     torch.testing.assert_close(routed, expected_routed)
     torch.testing.assert_close(shared, hidden_states * 4)
+
+
+def test_latent_moe_fuses_projection_with_prefix_and_shared_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    layer = _layer(
+        events,
+        routed_up_proj=_FusedUp(events),
+        shared_experts=_Trace(events, "shared"),
+    )
+    hidden_states = torch.arange(12, dtype=torch.float32).view(3, 4)
+    prefix_sum = torch.full_like(hidden_states, 7)
+    calls = []
+
+    def fake_projection_add3(
+        routed_latent: torch.Tensor,
+        weight: torch.Tensor,
+        actual_prefix_sum: torch.Tensor,
+        shared_output: torch.Tensor,
+    ) -> torch.Tensor:
+        calls.append((routed_latent, weight, actual_prefix_sum, shared_output))
+        return _up(routed_latent)[0] + actual_prefix_sum + shared_output
+
+    monkeypatch.setattr(
+        latent_module.tokenspeed_kernel,
+        "kimi3_latent_projection_add3",
+        fake_projection_add3,
+    )
+
+    actual = layer(hidden_states, prefix_sum=prefix_sum)
+
+    latent = hidden_states[:, :2] + 1
+    routed = torch.cat((latent, torch.zeros_like(latent)), dim=-1)
+    expected = routed + prefix_sum + hidden_states * 4
+    torch.testing.assert_close(actual, expected)
+    assert len(calls) == 1
+    assert calls[0][1] is layer.routed_up_proj.weight
+    assert "up" not in events
 
 
 def test_latent_moe_rejects_joint_and_individual_reducers() -> None:
