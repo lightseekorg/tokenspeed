@@ -158,7 +158,7 @@ jobs:
             [ "$INCLUDE_MMLU" = true ] || args+=(--exclude-match mmlu)
             [ "$TRIGGER" = all ] || args+=(--trigger "$TRIGGER")
           fi
-          test/ci/run_slurm.sh "${args[@]}"
+          exec test/ci/run_slurm.sh "${args[@]}"
 
       - name: Publish job summary
         if: always()
