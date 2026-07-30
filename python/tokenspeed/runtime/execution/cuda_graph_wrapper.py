@@ -1036,22 +1036,18 @@ class CudaGraphWrapper:
         pad = padded_bs - active_req_pool_indices.shape[0]
         if pad <= 0:
             return active_req_pool_indices
-        if self.config.spec_algo == "DFLASH":
-            # Route padding rows to the sentinel req-pool slot
-            # (max_req_pool_size), not slot 0. The DFLASH draft derives each
-            # row's block seq_len from valid_cache_lengths[req_pool], so
-            # padding rows pointing at slot 0 would grow unbounded with
-            # request 0's context and hang the draft block-decode kernel.
-            # The sentinel row stays zero-init (length 0, dummy page 0).
-            sentinel = int(self.config.max_req_pool_size)
-            return torch.cat(
-                [
-                    active_req_pool_indices,
-                    active_req_pool_indices.new_full((pad,), sentinel),
-                ]
-            )
+        # Route padding rows to the sentinel req-pool slot
+        # (max_req_pool_size), not slot 0. The DFLASH draft derives each
+        # row's block seq_len from valid_cache_lengths[req_pool], so
+        # padding rows pointing at slot 0 would grow unbounded with
+        # request 0's context and hang the draft block-decode kernel.
+        # The sentinel row stays zero-init (length 0, dummy page 0).
+        sentinel = int(self.config.max_req_pool_size)
         return torch.cat(
-            [active_req_pool_indices, active_req_pool_indices.new_zeros(pad)]
+            [
+                active_req_pool_indices,
+                active_req_pool_indices.new_full((pad,), sentinel),
+            ]
         )
 
     def _set_graph_state_write_indices(
