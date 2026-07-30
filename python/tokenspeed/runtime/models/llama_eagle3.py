@@ -135,6 +135,8 @@ class LlamaAttention(BaseLlamaAttention):
             ctx.attn_backend.spec_num_tokens - ctx.accept_lengths[num_extends:]
         ).to(seq_lens_buf.dtype)
         seq_lens_buf[num_extends : ctx.bs].sub_(correction).clamp_(min=1)
+        # Publish: the backend owns its buffer, so in-graph edits need a copy.
+        ctx.attn_backend.advance_draft_forward_metadata(seq_lens_buf[: ctx.bs])
 
 
 # ---------------------------------------------------------------------------

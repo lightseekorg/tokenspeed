@@ -1606,12 +1606,10 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     def init_cuda_graph_state(
         self,
         max_bs: int,
-        seq_lens_buf: torch.Tensor | None = None,
         paged_cache_group_specs=(),
         max_tokens_per_req: int = 1,
         overlap_schedule_depth: int = 0,
     ):
-        del seq_lens_buf
         self._decode_tile_metadata = {}
         self._cuda_graph_max_tokens_per_req = max(
             1,
