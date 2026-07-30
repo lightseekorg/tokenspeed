@@ -237,7 +237,6 @@ class CudaGraphWrapper:
         init_backend_cuda_graph_state(
             attn_backend,
             self.max_bs,
-            self.input_buffers.seq_lens_buf,
             paged_cache_group_specs=tuple(token_to_kv_pool.paged_cache_group_specs),
             max_tokens_per_req=self.max_tokens_per_req,
             overlap_schedule_depth=self.overlap_schedule_depth,
@@ -246,7 +245,6 @@ class CudaGraphWrapper:
             init_backend_cuda_graph_state(
                 draft_attn_backend,
                 self.max_bs,
-                self.drafter.draft_seq_lens_buf,
                 paged_cache_group_specs=tuple(
                     draft_token_to_kv_pool.paged_cache_group_specs
                 ),

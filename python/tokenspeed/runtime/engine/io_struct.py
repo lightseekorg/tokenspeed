@@ -719,6 +719,8 @@ class UpdateWeightFromDiskReqInput:
     model_path: str
     # The format to load the weights
     load_format: str | None = None
+    # Optional: update the weight version after a successful load.
+    weight_version: str | None = None
 
 
 @dataclass
@@ -748,6 +750,9 @@ class UpdateWeightsFromDistributedReqInput:
     packed_num_buffers: int = DEFAULT_PACKED_NUM_BUFFERS
     group_name: str = "weight_update_group"
     flush_cache: bool = True
+    # Optional: update the weight version after a successful push. When provided,
+    # subsequent generation responses will carry this version in meta_info.
+    weight_version: str | None = None
 
 
 @dataclass
@@ -763,6 +768,8 @@ class UpdateWeightsFromTensorReqInput:
     serialized_named_tensors: list[bytes]
     load_format: str | None
     flush_cache: bool
+    # Optional: update the weight version after a successful push.
+    weight_version: str | None = None
 
 
 @dataclass

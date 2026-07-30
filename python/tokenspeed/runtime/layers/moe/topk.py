@@ -521,7 +521,10 @@ def select_experts(
                 and num_fused_shared_experts == 0
                 and routed_scaling_factor is not None
                 and num_token_non_padded is None
-                and expert_location_dispatch_info is None
+                and (
+                    expert_location_dispatch_info is None
+                    or logical_to_physical_map is not None
+                )
             )
             if use_sigmoid_bias_topk:
                 topk_weights, topk_ids = moe_sigmoid_bias_topk(
@@ -530,6 +533,8 @@ def select_experts(
                     top_k,
                     routed_scaling_factor=float(routed_scaling_factor),
                     normalize_topk_weights=renormalize,
+                    logical_to_physical_map=logical_to_physical_map,
+                    weights_dtype=topk_config.topk_weights_dtype,
                 )
             else:
                 topk_weights, topk_ids = minimax_biased_grouped_topk(
