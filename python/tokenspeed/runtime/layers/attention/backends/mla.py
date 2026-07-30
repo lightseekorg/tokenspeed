@@ -114,6 +114,7 @@ class MLAAttnBackend(AttentionBackend):
         self.data_type = config.kv_cache_dtype
         self.q_data_type = config.dtype
         self.num_local_heads = config.num_attention_heads // config.attn_tp_size
+
         platform = current_platform()
         self.use_absorbed_extend = (
             platform.is_amd
@@ -365,14 +366,18 @@ class MLAAttnBackend(AttentionBackend):
             dtype=torch.int32,
         )
         torch.cumsum(extend_seq_lens, dim=0, out=cum_extend_seq_lens[1:])
-        cum_seq_lens_kv = None
-        page_table = None
-        if self.use_absorbed_extend:
-            cum_seq_lens_kv = torch.zeros_like(cum_extend_seq_lens)
-            torch.cumsum(seq_lens, dim=0, out=cum_seq_lens_kv[1:])
 
         max_extend_seq_len = max(extend_seq_lens_cpu_list, default=0)
         max_extend_prefix_len = int(extend_prefix_lens_cpu.max().item())
+        use_absorbed_cached_extend = (
+            self.use_absorbed_extend and max_extend_prefix_len > 0
+        )
+
+        cum_seq_lens_kv = None
+        page_table = None
+        if use_absorbed_cached_extend:
+            cum_seq_lens_kv = torch.zeros_like(cum_extend_seq_lens)
+            torch.cumsum(seq_lens, dim=0, out=cum_seq_lens_kv[1:])
 
         if group_table is not None:
             assert logical_page_size is not None
@@ -388,7 +393,7 @@ class MLAAttnBackend(AttentionBackend):
                 seq_lens.shape[0], dtype=torch.int64, device=group_table.device
             )
             chunk_page_size = logical_page_size
-            if self.use_absorbed_extend:
+            if use_absorbed_cached_extend:
                 page_table = self._expand_group_page_table(
                     group_table,
                     batch_size=seq_lens.shape[0],
@@ -399,7 +404,7 @@ class MLAAttnBackend(AttentionBackend):
             chunk_req_to_page = req_to_page
             chunk_req_pool_indices = req_pool_indices
             chunk_page_size = self.page_size
-            if self.use_absorbed_extend:
+            if use_absorbed_cached_extend:
                 page_table = build_page_table(
                     req_pool_indices,
                     req_to_page,
@@ -742,7 +747,7 @@ class MLAAttnBackend(AttentionBackend):
 
         metadata = self.forward_prefill_metadata
         assert metadata is not None
-        if self.use_absorbed_extend:
+        if self.use_absorbed_extend and metadata.max_extend_prefix_len > 0:
             assert metadata.page_table is not None
             assert metadata.cum_seq_lens_kv is not None
             q = q.view(-1, layer.tp_q_head_num, layer.head_dim)

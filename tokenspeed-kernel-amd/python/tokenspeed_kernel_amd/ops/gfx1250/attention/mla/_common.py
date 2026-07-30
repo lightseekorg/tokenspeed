@@ -2157,8 +2157,8 @@ def _mla_prefill_fwd_kernel_non_pipelined(
         1,
     )
 
-    kv_head_idx = gl.program_id(0)
-    q_block_global_idx = gl.program_id(1)
+    q_block_global_idx = gl.program_id(0)
+    kv_head_idx = gl.program_id(1)
 
     # split the flat block index into a token-block part and a head-block part
     token_q_block_global_idx = q_block_global_idx // NUM_HEAD_BLOCKS
@@ -3393,8 +3393,14 @@ def gluon_mla_extend_bf16_gfx1250(
     block_q = max(1, block_m // num_query_heads)
     num_head_blocks = math.ceil(num_query_heads / block_m)
     total_num_q_blocks = (total_q // block_q + batch_size) * num_head_blocks
+    if total_num_q_blocks > 2**31 - 1:
+        raise ValueError(
+            f"query-block grid X exceeds the HIP limit: {total_num_q_blocks}"
+        )
+    if num_kv_heads > 2**16 - 1:
+        raise ValueError(f"KV-head grid Y exceeds the HIP limit: {num_kv_heads}")
 
-    _mla_prefill_fwd_kernel_non_pipelined[(num_kv_heads, total_num_q_blocks)](
+    _mla_prefill_fwd_kernel_non_pipelined[(total_num_q_blocks, num_kv_heads)](
         output_ptr=out,
         query_ptr=q,
         kv_buffer_ptr=kv_cache,

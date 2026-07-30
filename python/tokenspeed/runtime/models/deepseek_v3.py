@@ -731,7 +731,12 @@ class DeepseekV3AttentionMLA(nn.Module):
                 input_num_tokens=num_prefill_tokens,
                 forward_mode=ForwardMode.EXTEND,
             )
-            if getattr(ctx.attn_backend, "use_absorbed_extend", False):
+            # Use absorbed attention for cached-prefix extend when supported by
+            # the backend; otherwise use normal chunked prefill.
+            if (
+                getattr(ctx.attn_backend, "use_absorbed_extend", False)
+                and cmeta.max_extend_prefix_len > 0
+            ):
                 self.forward_absorb(
                     positions[:num_prefill_tokens],
                     q[:num_prefill_tokens],
