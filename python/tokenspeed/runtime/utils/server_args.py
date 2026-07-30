@@ -205,7 +205,6 @@ class ServerArgs:
     # Kernel backend
     attention_backend: str | None = None
     kda_backend: str = "auto"
-    moe_activation_dtype: str = "bf16"
     drafter_attention_backend: str | None = None
     sampling_backend: str | None = None
     dp_sampling: bool = False
@@ -1386,18 +1385,6 @@ class ServerArgs:
             "'fla' forces the portable FLA scan; 'flashkda' the optional "
             "FlashKDA library (source build, SM90+); 'cutedsl_kda' the "
             "CuteDSL KDA AOT kernel (prebuilt, sm_103a). Decode is unaffected.",
-        )
-        parser.add_argument(
-            "--moe-activation-dtype",
-            type=str,
-            choices=["bf16", "mxfp8"],
-            default=ServerArgs.moe_activation_dtype,
-            help="MoE activation precision (Kimi-K3 fused SiTU MoE): 'bf16' "
-            "keeps bf16 activations (w4a16, default); 'mxfp8' block-quantizes "
-            "activations to fp8 (w4a8, mxfp8-act x mxfp4-weight). A run-wide "
-            "deployment choice, stable for the whole process; 'mxfp8' speeds up "
-            "large-batch prefill (~1.5x on the MoE) at a small decode cost and "
-            "requires the sidecar's w4a8 cubins. Weights stay mxfp4 either way.",
         )
         parser.add_argument(
             "--drafter-attention-backend",

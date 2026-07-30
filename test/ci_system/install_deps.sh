@@ -209,7 +209,16 @@ fi
 FLASHINFER_PYTHON_SPEC="$(pin_version flashinfer-python)"
 if [ -n "${FLASHINFER_PYTHON_SPEC}" ]; then
     FLASHINFER_VERSION="${FLASHINFER_PYTHON_SPEC##*==}"
-    FLASHINFER_CUBIN_WHEEL_URL="https://github.com/flashinfer-ai/flashinfer/releases/download/v${FLASHINFER_VERSION}/flashinfer_cubin-${FLASHINFER_VERSION}-py3-none-any.whl"
+    # Nightlies version as X.Y.Z.devYYYYMMDD but tag as nightly-vX.Y.Z-YYYYMMDD,
+    # and never reach PyPI, so their python wheel also comes from the release.
+    FLASHINFER_RELEASE_BASE="https://github.com/flashinfer-ai/flashinfer/releases/download"
+    if [[ "${FLASHINFER_VERSION}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.dev([0-9]{8})$ ]]; then
+        FLASHINFER_RELEASE_TAG="nightly-v${BASH_REMATCH[1]}-${BASH_REMATCH[2]}"
+        FLASHINFER_PYTHON_SPEC="$(cache_remote_wheel "${FLASHINFER_RELEASE_BASE}/${FLASHINFER_RELEASE_TAG}/flashinfer_python-${FLASHINFER_VERSION}-py3-none-any.whl")"
+    else
+        FLASHINFER_RELEASE_TAG="v${FLASHINFER_VERSION}"
+    fi
+    FLASHINFER_CUBIN_WHEEL_URL="${FLASHINFER_RELEASE_BASE}/${FLASHINFER_RELEASE_TAG}/flashinfer_cubin-${FLASHINFER_VERSION}-py3-none-any.whl"
     FLASHINFER_CUBIN_WHEEL_SOURCE="$(cache_remote_wheel "${FLASHINFER_CUBIN_WHEEL_URL}")"
     echo "Force-reinstalling pinned FlashInfer Python: ${FLASHINFER_PYTHON_SPEC}"
     pip_install_with_retry pip3 install --break-system-packages \

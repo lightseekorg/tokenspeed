@@ -31,6 +31,15 @@ def expected_jit_cache_version(flashinfer_version: str, cuda_index: str) -> str:
     return f"{flashinfer_version}+cu{cuda_index}"
 
 
+def release_tag(flashinfer_version: str) -> str:
+    """GitHub release tag: vX.Y.Z[rcN], or nightly-vX.Y.Z-YYYYMMDD for
+    nightly versions of the form X.Y.Z.devYYYYMMDD."""
+    match = re.fullmatch(r"(\d+\.\d+\.\d+)\.dev(\d{8})", flashinfer_version)
+    if match:
+        return f"nightly-v{match.group(1)}-{match.group(2)}"
+    return f"v{flashinfer_version}"
+
+
 def jit_cache_wheel_url(
     flashinfer_version: str,
     cuda_index: str,
@@ -43,7 +52,7 @@ def jit_cache_wheel_url(
     )
     return (
         "https://github.com/flashinfer-ai/flashinfer/releases/download/"
-        f"v{flashinfer_version}/{wheel}"
+        f"{release_tag(flashinfer_version)}/{wheel}"
     )
 
 

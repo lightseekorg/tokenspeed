@@ -209,19 +209,7 @@ Notes:
 
 ### NVIDIA
 
-The standard NVIDIA path uses the fused TensorRT-LLM-Gen MXFP4 + SiTU MoE
-backend.
-On 8x B300 (`sm103a`, CUDA 13) the `tokenspeed-situ` sidecar is pulled in as a
-`tokenspeed-kernel` CUDA dependency; no separate private FlashInfer repository
-or `FLASHINFER_PRIVATE_CUBIN_DIR` is required. To install or verify it directly:
-
-```bash
-python -m pip install "tokenspeed-situ==0.1.0.post20260726"
-python -c \
-  'import tokenspeed_situ as s; print(s.verify_bundle())'
-```
-
-Then serve with expert parallelism (recommended):
+Serve with expert parallelism (recommended) on 8x B300:
 
 ```bash
 tokenspeed serve moonshotai/Kimi-K3 \
@@ -240,15 +228,9 @@ tokenspeed serve moonshotai/Kimi-K3 \
   --port 8000
 ```
 
-Plain TP8 (drop `--ep-size 8`) uses the native-384 expert layout and requires
-sidecar (tokenspeed-situ) >= 0.1.0.post20260726. Memory is identical either way on 8x B300: ~73 GB free
-per rank after load, and `--gpu-memory-utilization 0.94` yields a KV capacity
-of 4,437,504 tokens.
-
-The checked-in sidecar AOT bundle is a Linux x86_64 development artifact for
-B300/CUDA 13 (`sm103a`) only. On other NVIDIA platforms, fall back to the
-unfused Triton grouped-GEMM MoE backend: skip the sidecar install and
-substitute `--moe-backend triton`.
+Plain TP8 (drop `--ep-size 8`) works too. The fused MoE path needs a
+Blackwell GPU (B200/B300); on other NVIDIA platforms use
+`--moe-backend triton`.
 
 ### AMD
 

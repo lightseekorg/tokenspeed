@@ -46,7 +46,7 @@ def create_mxfp4_weight_pair(
     platform = current_platform()
     hidden_size_padded = spec.hidden_size
     if platform.is_blackwell and solution == "flashinfer_trtllm":
-        # trtllm-gen tiles are 128-granular; needs K3 SiTU sidecar (tokenspeed-situ) >= 0.1.0.post20260726.
+        # trtllm-gen tiles are 128-granular (flashinfer TRTLLM-Gen SiTU MoE).
         ispp_padded = round_up(ispp, 128)
         hidden_size_padded = round_up(spec.hidden_size, 256)
     else:
