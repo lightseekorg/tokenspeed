@@ -88,6 +88,7 @@ class LlamaAttention(BaseLlamaAttention):
         out_cache_loc: torch.Tensor,
         accept_lengths: torch.Tensor | None = None,
         seq_lens: torch.Tensor | None = None,
+        gather_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Active draft first step (drafter set up gather_ids + accept_lengths).
         # Covers both decode catch-up and prefill catch-up; multi-step decode
@@ -113,7 +114,7 @@ class LlamaAttention(BaseLlamaAttention):
                 self._apply_correction(ctx, accept_lengths, seq_lens)
                 q_rope = self._fused_rope_kv_write(
                     positions, q, k, fused_kv_arg
-                ).index_select(0, ctx.gather_ids)
+                ).index_select(0, gather_ids)
                 # record_kv_cache (keyed off the real mode) forces the backend's
                 # PD layerwise cache-step record that the DECODE dispatch would
                 # otherwise skip on an EXTEND/MIXED catch-up.
@@ -131,7 +132,7 @@ class LlamaAttention(BaseLlamaAttention):
                 )
         q, k = self.rotary_emb(positions, q, k)
         return self.attn(q, k, v, ctx=ctx, out_cache_loc=out_cache_loc).index_select(
-            0, ctx.gather_ids
+            0, gather_ids
         )
 
     def _apply_correction(
@@ -284,10 +285,11 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
         residual: torch.Tensor,
         ctx: ForwardContext,
         accept_lengths: torch.Tensor | None = None,
+        gather_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Align residual with attn output narrowed to [bs, H]."""
         if accept_lengths is not None and not ctx.forward_mode.is_idle():
-            return residual.index_select(0, ctx.gather_ids)
+            return residual.index_select(0, gather_ids)
         return residual
 
     def forward_low_latency(
@@ -302,6 +304,7 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
         fuse_embed_reduce: bool = False,
         accept_lengths: torch.Tensor | None = None,
         seq_lens: torch.Tensor | None = None,
+        gather_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
 
@@ -328,9 +331,10 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
             out_cache_loc=out_cache_loc,
             accept_lengths=accept_lengths,
             seq_lens=seq_lens,
+            gather_ids=gather_ids,
         )
         residual = self._maybe_narrow_residual(
-            residual, ctx, accept_lengths=accept_lengths
+            residual, ctx, accept_lengths=accept_lengths, gather_ids=gather_ids
         )
 
         # Fused post-attn allreduce + norm (uses attn tp group)
@@ -370,6 +374,7 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
         fuse_embed_reduce: bool = False,
         accept_lengths: torch.Tensor | None = None,
         seq_lens: torch.Tensor | None = None,
+        gather_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
         if self.comm_manager.should_fuse(hidden_states.shape[0]):
@@ -384,6 +389,7 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
                 fuse_embed_reduce=fuse_embed_reduce,
                 accept_lengths=accept_lengths,
                 seq_lens=seq_lens,
+                gather_ids=gather_ids,
             )
 
         # Non-fused path: fuse_embed_reduce is always False here because
@@ -402,9 +408,10 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
             out_cache_loc=out_cache_loc,
             accept_lengths=accept_lengths,
             seq_lens=seq_lens,
+            gather_ids=gather_ids,
         )
         residual = self._maybe_narrow_residual(
-            residual, ctx, accept_lengths=accept_lengths
+            residual, ctx, accept_lengths=accept_lengths, gather_ids=gather_ids
         )
         hidden_states, residual = self.comm_manager.post_attn_comm(
             hidden_states, residual, ctx
@@ -500,6 +507,7 @@ class Eagle3LlamaModel(BaseTransformerModel):
         hidden_states: torch.Tensor = None,
         accept_lengths: torch.Tensor | None = None,
         seq_lens: torch.Tensor | None = None,
+        gather_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
 
         if input_embeds is None:
@@ -547,6 +555,7 @@ class Eagle3LlamaModel(BaseTransformerModel):
             fuse_embed_reduce=fuse_embed_reduce,
             accept_lengths=accept_lengths,
             seq_lens=seq_lens,
+            gather_ids=gather_ids,
         )
 
         # Decide on pre-slice token count so this matches the path midlayer

@@ -120,6 +120,9 @@ class GlmMoeDsaModelNextN(nn.Module):
         out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
+        accept_lengths: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
+        gather_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None]:
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
@@ -159,6 +162,9 @@ class GlmMoeDsaModelNextN(nn.Module):
             ctx,
             out_cache_loc,
             residual,
+            accept_lengths=accept_lengths,
+            seq_lens=seq_lens,
+            gather_ids=gather_ids,
         )
 
         if not ctx.forward_mode.is_idle():
@@ -308,6 +314,8 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
         captured_hidden_states: torch.Tensor | None = None,
         accept_lengths: torch.Tensor | None = None,
         seq_lens: torch.Tensor | None = None,
+        gather_ids: torch.Tensor | None = None,
+        **kwargs,
     ) -> torch.Tensor:
         with report_collective_sizing(ctx, ctx.bs, ctx.global_bs):
             hidden_states, _ = self.model(
@@ -318,9 +326,12 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
                 captured_hidden_states=captured_hidden_states,
                 accept_lengths=accept_lengths,
                 seq_lens=seq_lens,
+                gather_ids=gather_ids,
             )
         self._apply_first_step_correction(ctx, accept_lengths, seq_lens)
-        logits_metadata = LogitsMetadata.from_forward_context(ctx)
+        logits_metadata = LogitsMetadata.from_forward_context(
+            ctx, gather_ids=gather_ids
+        )
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, logits_metadata
         )

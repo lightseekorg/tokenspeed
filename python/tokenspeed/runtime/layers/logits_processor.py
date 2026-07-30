@@ -133,11 +133,15 @@ class LogitsMetadata:
     forward_batch_gathered_buffer: torch.Tensor | None = None
 
     @classmethod
-    def from_forward_context(cls, ctx: ForwardContext):
+    def from_forward_context(
+        cls,
+        ctx: ForwardContext,
+        gather_ids: torch.Tensor | None = None,
+    ):
         return cls(
             forward_mode=ctx.forward_mode,
             capture_hidden_mode=ctx.capture_hidden_mode,
-            gather_ids=ctx.gather_ids,
+            gather_ids=gather_ids,
         )
 
 
@@ -388,7 +392,8 @@ class LogitsProcessor(nn.Module):
             else:
                 if logits_metadata.forward_mode.is_extend_or_mixed():
                     raise RuntimeError(
-                        "EXTEND/MIXED forward must set gather_ids on ForwardContext"
+                        "EXTEND/MIXED forward must pass gather_ids to the "
+                        "logits metadata"
                     )
                 pruned_states = hidden_states
                 if aux_hidden_states is not None:

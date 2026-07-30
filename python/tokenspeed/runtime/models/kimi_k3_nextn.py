@@ -79,6 +79,9 @@ class KimiK3DraftAttentionMLA(KimiLinearMLAAttention, DeepseekV3DraftAttentionML
         out_cache_loc: torch.Tensor,
         comm_manager,
         block_scale: torch.Tensor | None = None,
+        accept_lengths: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
+        gather_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
@@ -91,10 +94,19 @@ class KimiK3DraftAttentionMLA(KimiLinearMLAAttention, DeepseekV3DraftAttentionML
                 hidden_states, ctx, comm_manager, block_scale
             )
             gate = None
-        attn_output = self._attn(positions, q, latent_cache, ctx, out_cache_loc)
+        attn_output = self._attn(
+            positions,
+            q,
+            latent_cache,
+            ctx,
+            out_cache_loc,
+            accept_lengths=accept_lengths,
+            seq_lens=seq_lens,
+            gather_ids=gather_ids,
+        )
         if gate is not None:
             if attn_output.shape[0] != gate.shape[0]:
-                gate = gate.index_select(0, ctx.gather_ids)
+                gate = gate.index_select(0, gather_ids)
             attn_output = sigmoid_mul(attn_output, gate)
         output, _ = self.o_proj(attn_output)
         return output
@@ -182,6 +194,9 @@ class KimiK3DraftDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
+        accept_lengths: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
+        gather_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
             ctx
@@ -194,12 +209,12 @@ class KimiK3DraftDecoderLayer(nn.Module):
                 ctx=ctx,
                 out_cache_loc=out_cache_loc,
                 comm_manager=self.comm_manager,
+                accept_lengths=accept_lengths,
+                seq_lens=seq_lens,
+                gather_ids=gather_ids,
             )
-            if (
-                ctx.accept_lengths is not None
-                and attn_out.shape[0] != residual.shape[0]
-            ):
-                residual = residual.index_select(0, ctx.gather_ids)
+            if accept_lengths is not None and attn_out.shape[0] != residual.shape[0]:
+                residual = residual.index_select(0, gather_ids)
             residual = residual + attn_out
         prefix = self.block_sparse_moe(
             self.post_attention_layernorm(residual),
@@ -260,6 +275,9 @@ class KimiK3ModelNextN(nn.Module):
         out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
+        accept_lengths: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
+        gather_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None]:
         if captured_hidden_states is None:
             raise ValueError("Kimi-K3 NextN requires captured_hidden_states.")
@@ -274,7 +292,15 @@ class KimiK3ModelNextN(nn.Module):
                 dim=-1,
             )
         )
-        hidden_states = self.decoder(positions, hidden_states, ctx, out_cache_loc)
+        hidden_states = self.decoder(
+            positions,
+            hidden_states,
+            ctx,
+            out_cache_loc,
+            accept_lengths=accept_lengths,
+            seq_lens=seq_lens,
+            gather_ids=gather_ids,
+        )
         return self.shared_head.norm(hidden_states), None
 
 
@@ -342,6 +368,9 @@ class KimiK3NextNForCausalLM(nn.Module):
         positions: torch.Tensor,
         out_cache_loc: torch.Tensor,
         captured_hidden_states: torch.Tensor | None = None,
+        accept_lengths: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
+        gather_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         hidden_states, _ = self.model(
             input_ids,
@@ -349,8 +378,13 @@ class KimiK3NextNForCausalLM(nn.Module):
             ctx,
             out_cache_loc,
             captured_hidden_states=captured_hidden_states,
+            accept_lengths=accept_lengths,
+            seq_lens=seq_lens,
+            gather_ids=gather_ids,
         )
-        logits_metadata = LogitsMetadata.from_forward_context(ctx)
+        logits_metadata = LogitsMetadata.from_forward_context(
+            ctx, gather_ids=gather_ids
+        )
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, logits_metadata
         )

@@ -641,8 +641,8 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 f"metadata={int(extend_lens.sum().item())}, "
                 f"tokens={num_prefill_tokens}"
             )
-        if ctx.req_to_page is None:
-            raise RuntimeError("GLM DSA sparse prefill requires req_to_page metadata")
+        if chunk_meta.block_tables is None:
+            raise RuntimeError("GLM DSA sparse prefill requires block-table metadata")
 
         topk = self.index_topk
         page_size = ctx.token_to_kv_pool.page_size
@@ -755,6 +755,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         block_scale: torch.Tensor | None = None,
         accept_lengths: torch.Tensor | None = None,
         seq_lens: torch.Tensor | None = None,
+        gather_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """GLM-5 DSA attention, one COARSE breakable-graph break point.
 
@@ -903,7 +904,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             )
 
         if accept_lengths is not None:
-            attn_output = attn_output.index_select(0, ctx.gather_ids)
+            attn_output = attn_output.index_select(0, gather_ids)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -1103,6 +1104,7 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
         residual: torch.Tensor | None,
         accept_lengths: torch.Tensor | None = None,
         seq_lens: torch.Tensor | None = None,
+        gather_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
             ctx
@@ -1120,9 +1122,10 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
                 comm_manager=self.comm_manager,
                 accept_lengths=accept_lengths,
                 seq_lens=seq_lens,
+                gather_ids=gather_ids,
             )
             if accept_lengths is not None:
-                residual = residual.index_select(0, ctx.gather_ids)
+                residual = residual.index_select(0, gather_ids)
             hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
                 hidden_states, residual, ctx
             )

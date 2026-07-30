@@ -742,6 +742,46 @@ class ModelExecutor:
             rows[:, width:].zero_()
         self.req_to_page.index_copy_(0, idx, rows)
 
+    def _target_gather_ids(self, bs: int, ctx: ForwardContext) -> torch.Tensor | None:
+        """Last-token gather indices for the logits prune on EXTEND/MIXED.
+
+        Derived from ``input_lengths_buf`` (stable within a forward step), so
+        it is computed here right before the model call instead of traveling
+        through ``ForwardContext``. Pure-decode forwards return None.
+        """
+        num_extends = ctx.num_extends
+        if num_extends <= 0:
+            return None
+        total_tokens = ctx.input_num_tokens
+        num_decodes = bs - num_extends
+        if self.drafter is not None and num_decodes > 0:
+            # MIXED + spec: prefill rows pruned to last token,
+            # decode block kept full at verify width.
+            num_decode_tokens = num_decodes * self.config.spec_num_tokens
+            num_prefill_tokens = total_tokens - num_decode_tokens
+            gather_ids = torch.empty(
+                num_extends + num_decode_tokens,
+                dtype=torch.int64,
+                device=self.device,
+            )
+            gather_ids[:num_extends] = (
+                torch.cumsum(
+                    self.input_buffers.input_lengths_buf[:num_extends],
+                    dim=0,
+                )
+                - 1
+            )
+            gather_ids[num_extends:] = torch.arange(
+                num_prefill_tokens,
+                total_tokens,
+                device=self.device,
+                dtype=torch.int64,
+            )
+            return gather_ids
+        # EXTEND, MIXED non-spec, or EXTEND + spec: last token
+        # per request via cumsum.
+        return torch.cumsum(self.input_buffers.input_lengths_buf[:bs], dim=0) - 1
+
     @nvtx_range("target_forward", color="red")
     def _run_target_forward(self, bs: int, ctx: ForwardContext, req_pool_indices):
         positions = self._active_positions_override
@@ -759,6 +799,7 @@ class ModelExecutor:
         # the decode wrapper, whose capture stream it borrows), and decode-mode
         # forwards must short-circuit before touching it.
         mode = ctx.forward_mode
+        gather_ids = self._target_gather_ids(bs, ctx)
         if (
             mode is not None
             and (mode.is_extend() or mode.is_mixed())
@@ -768,6 +809,7 @@ class ModelExecutor:
                 ctx,
                 self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
                 self._active_multimodal_context,
+                gather_ids=gather_ids,
             )
         return self.model_runner.forward(
             ctx,
@@ -780,6 +822,7 @@ class ModelExecutor:
                 : ctx.num_extends
             ],
             multimodal_context=self._active_multimodal_context,
+            gather_ids=gather_ids,
         )
 
     def _apply_force_single_token_verify(
@@ -1392,7 +1435,6 @@ class ModelExecutor:
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
-            req_to_page=self.req_to_page,
             bs=0,
             num_extends=0,
             input_num_tokens=0,
@@ -1463,7 +1505,6 @@ class ModelExecutor:
                 draft_ctx = ForwardContext(
                     attn_backend=self.drafter.attn_backend,
                     token_to_kv_pool=self.drafter.token_to_kv_pool,
-                    req_to_page=self.drafter.req_to_page,
                     bs=0,
                     num_extends=0,
                     input_num_tokens=0,
@@ -1859,46 +1900,9 @@ class ModelExecutor:
                 output_lengths = torch.zeros(bs, dtype=torch.int32, device=self.device)
                 output_logprobs = None
             else:
-                gather_ids = None
-                if num_extends > 0:
-                    num_decodes = bs - num_extends
-                    if self.drafter is not None and num_decodes > 0:
-                        # MIXED + spec: prefill rows pruned to last token,
-                        # decode block kept full at verify width.
-                        num_decode_tokens = num_decodes * self.config.spec_num_tokens
-                        num_prefill_tokens = total_tokens - num_decode_tokens
-                        gather_ids = torch.empty(
-                            num_extends + num_decode_tokens,
-                            dtype=torch.int64,
-                            device=self.device,
-                        )
-                        gather_ids[:num_extends] = (
-                            torch.cumsum(
-                                self.input_buffers.input_lengths_buf[:num_extends],
-                                dim=0,
-                            )
-                            - 1
-                        )
-                        gather_ids[num_extends:] = torch.arange(
-                            num_prefill_tokens,
-                            total_tokens,
-                            device=self.device,
-                            dtype=torch.int64,
-                        )
-                    else:
-                        # EXTEND, MIXED non-spec, or EXTEND + spec: last token
-                        # per request via cumsum.
-                        gather_ids = (
-                            torch.cumsum(
-                                self.input_buffers.input_lengths_buf[:bs], dim=0
-                            )
-                            - 1
-                        )
-
                 ctx = ForwardContext(
                     attn_backend=self.attn_backend,
                     token_to_kv_pool=self.token_to_kv_pool,
-                    req_to_page=self.req_to_page,
                     bs=bs,
                     num_extends=num_extends,
                     input_num_tokens=total_tokens,
@@ -1908,7 +1912,6 @@ class ModelExecutor:
                         if self.drafter is not None
                         else CaptureHiddenMode.NULL
                     ),
-                    gather_ids=gather_ids,
                     decode_input_ids=decode_input_ids,
                 )
                 if self.config.data_parallel_size > 1:

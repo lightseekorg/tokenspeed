@@ -49,7 +49,6 @@ class ForwardContext:
     num_extends: int
     input_num_tokens: int
     forward_mode: ForwardMode | None
-    req_to_page: torch.Tensor | None = None
     capture_hidden_mode: CaptureHiddenMode | None = CaptureHiddenMode.NULL
     # Normalized explicit decode input overrides for this forward, if any.
     decode_input_ids: list[int] | None = None
@@ -65,9 +64,6 @@ class ForwardContext:
     # back to ``input_num_tokens`` / ``global_num_tokens``.
     collective_num_tokens: int | None = None
     collective_global_num_tokens: list[int] | None = None
-
-    # --- logits processor ---
-    gather_ids: torch.Tensor | None = None
 
     # DSA sparse top-k shared across layers and draft steps.
     dsa_prefill_topk: Any | None = None

@@ -467,7 +467,6 @@ class PrefillGraph:
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
-            req_to_page=self.req_to_page,
             bs=1,
             num_extends=1,
             input_num_tokens=num_tokens,
@@ -552,6 +551,7 @@ class PrefillGraph:
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         multimodal_context=None,
+        gather_ids: torch.Tensor | None = None,
     ):
         """Replay the captured graph for ``ctx`` (caller checked :meth:`can_run`).
 
@@ -589,7 +589,9 @@ class PrefillGraph:
             self._captures[bucket].replay(valid_rows=num_tokens)
         hidden_states, aux_hidden_states = self._outputs[bucket].sliced(num_tokens)
         # The eager logits tail of BaseCausalLM.forward, on the replayed hidden states.
-        logits_metadata = LogitsMetadata.from_forward_context(ctx)
+        logits_metadata = LogitsMetadata.from_forward_context(
+            ctx, gather_ids=gather_ids
+        )
         return self.text_model.logits_processor(
             input_ids,
             hidden_states,

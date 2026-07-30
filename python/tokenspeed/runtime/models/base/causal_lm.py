@@ -162,7 +162,9 @@ class BaseCausalLM(nn.Module):
             out_cache_loc,
             **model_kwargs,
         )
-        logits_metadata = LogitsMetadata.from_forward_context(ctx)
+        logits_metadata = LogitsMetadata.from_forward_context(
+            ctx, gather_ids=kwargs.get("gather_ids")
+        )
 
         return self.logits_processor(
             input_ids,
@@ -184,12 +186,14 @@ class BaseCausalLM(nn.Module):
         ):
             if kwargs.get(key) is not None:
                 model_kwargs[key] = kwargs[key]
-        # seq_lens reaches the model only on the spec-decode first step
-        # (accept_lengths present), where it is the drafter's mutable
-        # cache-seqlens view. Target models don't take seq_lens in forward.
+        # seq_lens/gather_ids reach the model only on the spec-decode first
+        # step (accept_lengths present): seq_lens is the drafter's mutable
+        # cache-seqlens view; gather_ids selects the live rows the draft
+        # attention narrows to. Target models take neither in forward.
         if model_kwargs.get("accept_lengths") is not None:
-            if kwargs.get("seq_lens") is not None:
-                model_kwargs["seq_lens"] = kwargs["seq_lens"]
+            for key in ("seq_lens", "gather_ids"):
+                if kwargs.get(key) is not None:
+                    model_kwargs[key] = kwargs[key]
         return model_kwargs
 
     # Weight loading.

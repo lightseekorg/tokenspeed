@@ -75,6 +75,7 @@ class Qwen3_5DraftAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
         out_cache_loc: torch.Tensor,
         accept_lengths: torch.Tensor | None = None,
         seq_lens: torch.Tensor | None = None,
+        gather_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if accept_lengths is None:
             return super()._attn(
@@ -89,9 +90,9 @@ class Qwen3_5DraftAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
             )
 
         self._apply_correction(ctx, accept_lengths, seq_lens)
-        q = q.index_select(0, ctx.gather_ids)
+        q = q.index_select(0, gather_ids)
         if gate is not None:
-            gate = gate.index_select(0, ctx.gather_ids)
+            gate = gate.index_select(0, gather_ids)
         # Dispatch as DECODE over the sliced live rows via self.attn (see the
         # class docstring), which keeps the standard k/v reshape and KV write.
         # A ctx copy overrides only the forward mode; record_kv_cache (keyed off
@@ -134,10 +135,11 @@ class Qwen3_5DraftAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
         residual: torch.Tensor,
         ctx: ForwardContext,
         accept_lengths: torch.Tensor | None = None,
+        gather_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if accept_lengths is None or ctx.forward_mode.is_idle():
             return residual
-        return residual.index_select(0, ctx.gather_ids)
+        return residual.index_select(0, gather_ids)
 
 
 class Qwen3_5DraftForCausalLM(Qwen3_5ForCausalLM):
@@ -257,6 +259,7 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
         captured_hidden_states: torch.Tensor | None = None,
         accept_lengths: torch.Tensor | None = None,
         seq_lens: torch.Tensor | None = None,
+        gather_ids: torch.Tensor | None = None,
         **kwargs,
     ):
         if captured_hidden_states is None and not ctx.forward_mode.is_idle():
@@ -291,9 +294,12 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
                 input_embeds=hidden_states,
                 accept_lengths=accept_lengths,
                 seq_lens=seq_lens,
+                gather_ids=gather_ids,
             )
 
-        logits_metadata = LogitsMetadata.from_forward_context(ctx)
+        logits_metadata = LogitsMetadata.from_forward_context(
+            ctx, gather_ids=gather_ids
+        )
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, logits_metadata
         )

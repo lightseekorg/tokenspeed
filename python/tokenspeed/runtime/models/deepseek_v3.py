@@ -636,6 +636,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         block_scale: torch.Tensor | None = None,
         accept_lengths: torch.Tensor | None = None,
         seq_lens: torch.Tensor | None = None,
+        gather_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """MLA attention with a NARROW prefill-graph break.
 
@@ -664,6 +665,7 @@ class DeepseekV3AttentionMLA(nn.Module):
                 out_cache_loc,
                 accept_lengths=accept_lengths,
                 seq_lens=seq_lens,
+                gather_ids=gather_ids,
             )
         output, _ = self.o_proj(attn_output)
         return output
@@ -1188,7 +1190,7 @@ class DeepseekV3DraftAttentionMLA(DeepseekV3AttentionMLA):
 
     On the active first draft step the full ``latent_cache`` (N rows) is
     projected so every KV cache entry is written, but only the live query rows
-    (``ctx.gather_ids``) run the absorbed decode attention, narrowing the output
+    (``gather_ids``) run the absorbed decode attention, narrowing the output
     to ``[bs, H]``.  Multi-step decode and target paths delegate to the base.
     Single-layer only, so dropping the dead rows has no downstream consumer.
     """
@@ -1202,6 +1204,7 @@ class DeepseekV3DraftAttentionMLA(DeepseekV3AttentionMLA):
         out_cache_loc: torch.Tensor,
         accept_lengths: torch.Tensor | None = None,
         seq_lens: torch.Tensor | None = None,
+        gather_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if accept_lengths is None:
             return super()._attn(
@@ -1217,7 +1220,7 @@ class DeepseekV3DraftAttentionMLA(DeepseekV3AttentionMLA):
         self._apply_correction(ctx, accept_lengths, seq_lens)
 
         # Full q/latent_cache write all KV cache rows; only the live rows
-        # (ctx.gather_ids) run the absorbed decode attention, so the output is
+        # (gather_ids) run the absorbed decode attention, so the output is
         # narrowed to [bs, H] for o_proj / MLP / post-norms.
         decode_ctx = replace(ctx, forward_mode=ForwardMode.DECODE)
         Q, K = self.forward_absorb_qkv_proj(
@@ -1227,7 +1230,7 @@ class DeepseekV3DraftAttentionMLA(DeepseekV3AttentionMLA):
             decode_ctx,
             out_cache_loc,
         )
-        Q = Q.index_select(0, ctx.gather_ids)
+        Q = Q.index_select(0, gather_ids)
         attn_output = q.new_empty(ctx.bs, self.num_local_heads * self.v_head_dim)
         # gather_ids keeps one live row per request, so the decode runs on the
         # full bs -- the page table and seq lens must span the same rows. Drop
@@ -1376,6 +1379,7 @@ class DeepseekV3DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         accept_lengths: torch.Tensor | None = None,
         seq_lens: torch.Tensor | None = None,
+        gather_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
 
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
@@ -1394,6 +1398,7 @@ class DeepseekV3DecoderLayer(nn.Module):
                 comm_manager=self.comm_manager,
                 accept_lengths=accept_lengths,
                 seq_lens=seq_lens,
+                gather_ids=gather_ids,
             )
             hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
                 hidden_states, residual, ctx
@@ -1976,6 +1981,7 @@ class Eagle3MlaDecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         accept_lengths: torch.Tensor | None = None,
         seq_lens: torch.Tensor | None = None,
+        gather_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
 
@@ -2003,12 +2009,13 @@ class Eagle3MlaDecoderLayer(nn.Module):
                 comm_manager=self.comm_manager,
                 accept_lengths=accept_lengths,
                 seq_lens=seq_lens,
+                gather_ids=gather_ids,
             )
 
             # Active first draft step narrows attn output to [bs, H]; align the
             # residual to the same live rows before the post-attn reduce-norm.
             if accept_lengths is not None:
-                residual = residual.index_select(0, ctx.gather_ids)
+                residual = residual.index_select(0, gather_ids)
             hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
                 hidden_states, residual, ctx
             )
@@ -2100,6 +2107,7 @@ class Eagle3MlaModel(nn.Module):
         captured_hidden_states: torch.Tensor | None = None,
         accept_lengths: torch.Tensor | None = None,
         seq_lens: torch.Tensor | None = None,
+        gather_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         if captured_hidden_states is None:
             raise ValueError("Eagle3 MLA forward requires captured_hidden_states.")
@@ -2131,6 +2139,7 @@ class Eagle3MlaModel(nn.Module):
             residual,
             accept_lengths=accept_lengths,
             seq_lens=seq_lens,
+            gather_ids=gather_ids,
         )
 
         comm_manager = self.midlayer.comm_manager

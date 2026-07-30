@@ -340,6 +340,7 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
         input_embeds: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
         spec_step_idx: int = 0,
+        gather_ids: torch.Tensor | None = None,
         **kwargs,
     ):
         del kwargs
@@ -366,7 +367,9 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
             mtp_hidden_states,
             spec_step_idx,
         )
-        logits_metadata = LogitsMetadata.from_forward_context(ctx)
+        logits_metadata = LogitsMetadata.from_forward_context(
+            ctx, gather_ids=gather_ids
+        )
         return self.logits_processor(
             input_ids,
             logits_hidden_states,

@@ -223,7 +223,7 @@ class InklingMultiTokenPredictor(nn.Module):
 
 
 class InklingForConditionalGenerationNextN(nn.Module):
-    # Catch-up runs the full padded window; ctx.gather_ids narrows to one row per request.
+    # Catch-up runs the full padded window; gather_ids narrows to one row per request.
     draft_first_step_reduce_for_catchup = True
     # Full-sequence depths: re-run each depth over the whole verify window
     # (mtp.py window mode); the trained dataflow, not optional.
@@ -315,6 +315,7 @@ class InklingForConditionalGenerationNextN(nn.Module):
         captured_hidden_states: torch.Tensor | None = None,
         spec_step_idx: int = 0,
         accept_lengths: torch.Tensor | None = None,
+        gather_ids: torch.Tensor | None = None,
         **kwargs,
     ):
         del positions, kwargs  # rel attention needs no positions; tau is off
@@ -337,7 +338,9 @@ class InklingForConditionalGenerationNextN(nn.Module):
             accept_lengths=accept_lengths,
         )
         # Base-model muP convention: lm_head consumes hidden/mup; next depth's RMSNorm is invariant to it.
-        return self._compute_logits(input_ids, hidden_states, ctx)
+        return self._compute_logits(
+            input_ids, hidden_states, ctx, gather_ids=gather_ids
+        )
 
     _compute_logits = InklingForConditionalGeneration._compute_logits
 

@@ -1748,11 +1748,20 @@ class InklingForConditionalGeneration(nn.Module):
             input_ids, positions, ctx, out_cache_loc, input_embeds=input_embeds
         )
         return self._compute_logits(
-            input_ids, hidden_states, ctx, aux_hidden_states=aux_hidden_states
+            input_ids,
+            hidden_states,
+            ctx,
+            aux_hidden_states=aux_hidden_states,
+            gather_ids=kwargs.get("gather_ids"),
         )
 
     def _compute_logits(
-        self, input_ids, hidden_states, ctx: ForwardContext, aux_hidden_states=None
+        self,
+        input_ids,
+        hidden_states,
+        ctx: ForwardContext,
+        aux_hidden_states=None,
+        gather_ids: torch.Tensor | None = None,
     ):
         """muP logits epilogue (shared with the NextN drafter).
 
@@ -1763,7 +1772,9 @@ class InklingForConditionalGeneration(nn.Module):
         mup = self.text_config.logits_mup_width_multiplier
         if mup:
             hidden_states = hidden_states / mup
-        logits_metadata = LogitsMetadata.from_forward_context(ctx)
+        logits_metadata = LogitsMetadata.from_forward_context(
+            ctx, gather_ids=gather_ids
+        )
         output = self.logits_processor(
             input_ids,
             hidden_states,

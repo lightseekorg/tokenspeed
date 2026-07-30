@@ -138,6 +138,7 @@ class ModelRunner:
         multimodal_context: MultimodalForwardContext | None = None,
         spec_step_idx: int | None = None,
         accept_lengths: torch.Tensor | None = None,
+        gather_ids: torch.Tensor | None = None,
         kv_sync_event: "torch.cuda.Event | None" = None,
     ) -> LogitsProcessorOutput:
         kwargs = {}
@@ -161,6 +162,8 @@ class ModelRunner:
             kwargs["spec_step_idx"] = spec_step_idx
         if accept_lengths is not None:
             kwargs["accept_lengths"] = accept_lengths
+        if gather_ids is not None:
+            kwargs["gather_ids"] = gather_ids
         if kv_sync_event is not None:
             kwargs["kv_sync_event"] = kv_sync_event
 

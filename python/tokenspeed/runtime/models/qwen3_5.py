@@ -835,6 +835,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         out_cache_loc: torch.Tensor,
         accept_lengths: torch.Tensor | None = None,
         seq_lens: torch.Tensor | None = None,
+        gather_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Backend attention call + optional gate apply. Subclasses override."""
         attn_output = self.attn(q, k, v, ctx, out_cache_loc)
@@ -850,6 +851,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         out_cache_loc: torch.Tensor,
         accept_lengths: torch.Tensor | None = None,
         seq_lens: torch.Tensor | None = None,
+        gather_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Full attention forward pass."""
         q, k, v, gate = self._project_qkv_rope(positions, hidden_states)
@@ -862,6 +864,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             out_cache_loc,
             accept_lengths=accept_lengths,
             seq_lens=seq_lens,
+            gather_ids=gather_ids,
         )
         output, _ = self.o_proj(attn_output)
         return output
@@ -871,6 +874,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         residual: torch.Tensor,
         ctx: ForwardContext,
         accept_lengths: torch.Tensor | None = None,
+        gather_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Hook: subclasses narrow residual to match a sliced attn output."""
         return residual
@@ -886,6 +890,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
     ):
         accept_lengths = kwargs.get("accept_lengths")
         seq_lens = kwargs.get("seq_lens")
+        gather_ids = kwargs.get("gather_ids")
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
             ctx
         )
@@ -902,9 +907,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 out_cache_loc=out_cache_loc,
                 accept_lengths=accept_lengths,
                 seq_lens=seq_lens,
+                gather_ids=gather_ids,
             )
             residual = self._maybe_narrow_residual(
-                residual, ctx, accept_lengths=accept_lengths
+                residual, ctx, accept_lengths=accept_lengths, gather_ids=gather_ids
             )
             hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
                 hidden_states, residual, ctx
@@ -1025,6 +1031,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         input_deepstack_embeds: torch.Tensor | None = None,
         accept_lengths: torch.Tensor | None = None,
         seq_lens: torch.Tensor | None = None,
+        gather_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None]:
         # Initialize hidden states
         if input_embeds is None:
@@ -1073,6 +1080,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                     {
                         "accept_lengths": accept_lengths,
                         "seq_lens": seq_lens,
+                        "gather_ids": gather_ids,
                     }
                     if accept_lengths is not None
                     else {}
@@ -1523,7 +1531,9 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             input_embeds=input_embeds,
             **model_kwargs,
         )
-        logits_metadata = LogitsMetadata.from_forward_context(ctx)
+        logits_metadata = LogitsMetadata.from_forward_context(
+            ctx, gather_ids=kwargs.get("gather_ids")
+        )
         return self.logits_processor(
             input_ids,
             hidden_states,

@@ -293,13 +293,11 @@ class Eagle(BaseDrafter):
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
-            req_to_page=self.req_to_page,
             bs=bs,
             num_extends=draft_input.num_extends,
             input_num_tokens=input_num_tokens,
             forward_mode=forward_mode,
             capture_hidden_mode=CaptureHiddenMode.LAST,
-            gather_ids=gather_ids,
             global_num_tokens=draft_input.global_num_tokens,
             global_bs=draft_input.global_bs,
             all_decode_or_idle=draft_input.all_decode_or_idle,
@@ -329,6 +327,7 @@ class Eagle(BaseDrafter):
             spec_step_idx=0,
             accept_lengths=draft_input.accept_lengths,
             seq_lens=self.draft_seq_lens_buf,
+            gather_ids=gather_ids,
         )
         dsa_topk = self._extract_dsa_topk(ctx, dsa_topk)
         if compute_dsa_topk_first_step and prepare_dsa_topk is not None:
@@ -399,7 +398,6 @@ class Eagle(BaseDrafter):
                 num_extends=0,
                 attn_backend=self.attn_backend,
                 token_to_kv_pool=self.token_to_kv_pool,
-                req_to_page=self.req_to_page,
                 input_num_tokens=bs,
                 forward_mode=ForwardMode.DECODE,
                 capture_hidden_mode=CaptureHiddenMode.LAST,
