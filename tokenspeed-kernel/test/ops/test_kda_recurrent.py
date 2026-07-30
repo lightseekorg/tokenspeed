@@ -7,6 +7,7 @@ import torch
 from kimi3_reference import kda_gate
 from kimi3_reference import kda_recurrent as reference_kda_recurrent
 from tokenspeed_kernel.ops.attention import (
+    _attention_format_signature,
     kda_paged_decode,
     kda_paged_prefill,
     kda_recurrent,
@@ -16,6 +17,7 @@ from tokenspeed_kernel.ops.attention.triton.kda_dispatch import (
     triton_kda_paged_prefill,
 )
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.selection import select_kernel
 
 
 def test_k3_safe_gate_reference_matches_sigmoid_contract() -> None:
@@ -154,8 +156,8 @@ def test_kda_recurrent_zeroes_invalid_and_empty_graph_rows() -> None:
     torch.testing.assert_close(output[1:], torch.zeros_like(output[1:]))
 
 
-def test_kda_paged_decode_defaults_to_portable_kernel_on_amd() -> None:
-    """AMD auto dispatch must preserve the portable indexed-kernel result."""
+def test_kda_paged_decode_defaults_to_specialized_kernel_on_amd() -> None:
+    """AMD single-token dispatch must match the portable kernel numerically."""
     if not current_platform().is_amd:
         pytest.skip("AMD KDA dispatch test")
 
@@ -176,6 +178,14 @@ def test_kda_paged_decode_defaults_to_portable_kernel_on_amd() -> None:
     cu_seqlens = torch.arange(tokens + 1, device=device, dtype=torch.int32)
     read_indices = torch.tensor([0, 1, 1], device=device, dtype=torch.int32)
     write_indices = torch.tensor([2, 3, 4], device=device, dtype=torch.int32)
+
+    selected = select_kernel(
+        "attention",
+        "kda_paged_decode",
+        _attention_format_signature(q=q, k=k, v=v),
+        traits={"indexed_state": True, "single_token": True},
+    )
+    assert selected.name == "gluon_kda_paged_decode_gfx950"
 
     expected_out = triton_kda_paged_decode(
         q,
@@ -205,8 +215,10 @@ def test_kda_paged_decode_defaults_to_portable_kernel_on_amd() -> None:
         cu_seqlens=cu_seqlens,
     )
 
-    torch.testing.assert_close(actual_out, expected_out)
-    torch.testing.assert_close(state_pool, expected_pool)
+    torch.testing.assert_close(
+        actual_out.float(), expected_out.float(), atol=2e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(state_pool, expected_pool, atol=2e-5, rtol=2e-5)
 
 
 def test_kda_paged_decode_uses_fla_kernel_for_compound_decode_on_amd() -> None:
