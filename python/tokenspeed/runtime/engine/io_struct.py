@@ -179,15 +179,13 @@ class GenerateReqInput:
     bootstrap_room: list[int] | int | None = None
 
     def normalize_batch_and_arguments(self):
-        if (
-            self.text is None and self.input_ids is None and self.input_embeds is None
-        ) or (
-            self.text is not None
-            and self.input_ids is not None
-            and self.input_embeds is not None
-        ):
+        provided_sources = sum(
+            source is not None
+            for source in (self.text, self.input_ids, self.input_embeds)
+        )
+        if provided_sources != 1:
             raise ValueError(
-                "Either text, input_ids or input_embeds should be provided."
+                "Exactly one of text, input_ids, or input_embeds should be provided."
             )
 
         # Derive the batch size
