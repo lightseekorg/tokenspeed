@@ -11,9 +11,11 @@
 
 from __future__ import annotations
 
+from importlib.util import find_spec
+
 import torch
 from tokenspeed_kernel.ops.attention.kda_utils import KdaPrefillResult
-from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -167,57 +169,80 @@ def triton_amd_kda_paged_decode(
     return out.unsqueeze(0)
 
 
-@register_kernel(
-    "attention",
-    "kda_fused_paged_decode",
-    name="triton_nvidia_kda_fused_paged_decode",
-    solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
-    signatures=_DENSE_HALF_SIGNATURES,
-    priority=Priority.SPECIALIZED,
-    traits={"flat_state": frozenset({True})},
-    tags={"nvidia", "flat_kv", "cuda_graph", "fusion"},
+_CUTEDSL_FUSED_AVAILABLE = (
+    find_spec("cutlass") is not None and find_spec("quack") is not None
 )
-def triton_nvidia_kda_fused_paged_decode(
-    mixed_qkv: torch.Tensor,
-    conv_weights: torch.Tensor,
-    conv_states: torch.Tensor,
-    f_a_out: torch.Tensor,
-    f_b_weight: torch.Tensor,
-    beta_logits: torch.Tensor,
-    A_log: torch.Tensor,
-    dt_bias: torch.Tensor,
-    *,
-    state_pool: torch.Tensor,
-    read_indices: torch.Tensor,
-    write_indices: torch.Tensor,
-    num_heads: int,
-    head_dim: int,
-    cu_seqlens: torch.Tensor,
-    lower_bound: float | None,
-) -> torch.Tensor:
-    """Adapt dev's NVIDIA conv/GEMV/recurrent megafusion."""
-    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
-        fused_recurrent_kda_megafuse,
-    )
 
-    return fused_recurrent_kda_megafuse(
-        mixed_qkv,
-        conv_weights,
-        conv_states,
-        f_a_out,
-        f_b_weight,
-        beta_logits,
-        A_log,
-        dt_bias,
-        h_pool=state_pool,
-        read_indices=read_indices,
-        write_indices=write_indices,
-        num_heads=num_heads,
-        head_dim=head_dim,
-        cu_seqlens=cu_seqlens,
-        lower_bound=lower_bound,
-    ).view(1, -1, num_heads, head_dim)
+if _CUTEDSL_FUSED_AVAILABLE:
+
+    @register_kernel(
+        "attention",
+        "kda_fused_paged_decode",
+        name="cutedsl_nvidia_kda_fused_paged_decode",
+        solution="cutedsl",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=_DENSE_HALF_SIGNATURES,
+        # Above the portable band: the cluster-synchronized window commit
+        # orders the in-place conv paging correctly at any grid size, and
+        # wins outright from B>=4 while tying the unfused chain at bs1 e2e.
+        priority=Priority.SPECIALIZED + 2,
+        traits={"flat_state": frozenset({True})},
+        tags={"nvidia", "flat_kv", "cuda_graph", "fusion"},
+    )
+    def cutedsl_nvidia_kda_fused_paged_decode(
+        mixed_qkv: torch.Tensor,
+        conv_weights: torch.Tensor,
+        conv_states: torch.Tensor,
+        f_a_out: torch.Tensor,
+        f_b_weight: torch.Tensor,
+        beta_logits: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        *,
+        state_pool: torch.Tensor,
+        read_indices: torch.Tensor,
+        write_indices: torch.Tensor,
+        num_heads: int,
+        head_dim: int,
+        cu_seqlens: torch.Tensor,
+        lower_bound: float | None,
+        onorm=None,
+        enable_pdl: bool = False,
+    ) -> torch.Tensor:
+        """Adapt the CuTe DSL conv/GEMV/recurrent decode fusion.
+
+        ``onorm`` is the attempt-and-verify gated-RMSNorm stash
+        (:class:`~tokenspeed_kernel.ops.attention.kda_utils.
+        KdaGatedNormRequest`); when the wrapper fuses it into the epilogue it
+        sets ``onorm.consumed`` and the caller skips its norm.
+        """
+        from tokenspeed_kernel.ops.attention.cute_dsl.kda_fused_decode import (
+            cutedsl_fused_recurrent_kda_megafuse,
+        )
+
+        return cutedsl_fused_recurrent_kda_megafuse(
+            mixed_qkv,
+            conv_weights,
+            conv_states,
+            f_a_out,
+            f_b_weight,
+            beta_logits,
+            A_log,
+            dt_bias,
+            state_pool,
+            read_indices,
+            write_indices,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            cu_seqlens=cu_seqlens,
+            lower_bound=lower_bound,
+            onorm=onorm,
+            enable_pdl=enable_pdl,
+        ).view(1, -1, num_heads, head_dim)
 
 
 @register_kernel(
