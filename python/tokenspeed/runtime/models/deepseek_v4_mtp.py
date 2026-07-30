@@ -453,6 +453,14 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
             ("compressor.fused_wkv_wgate", "compressor.wgate", 1),
         ]
 
+    def checkpoint_weight_name_filter(self, name: str) -> bool:
+        """Shard preselection for ``load_weights`` (see DefaultModelLoader).
+
+        Accepts exactly the checkpoint names ``load_weights`` consumes:
+        those ``_map_checkpoint_name`` resolves to a draft parameter.
+        """
+        return self._map_checkpoint_name(name) is not None
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = self.get_stacked_params_mapping()
         params_dict = dict(self.named_parameters())

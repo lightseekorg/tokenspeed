@@ -345,6 +345,14 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
             return None
         return f"model.layers.{layer_id}"
 
+    def checkpoint_weight_name_filter(self, name: str) -> bool:
+        """Shard preselection for ``load_weights`` (see DefaultModelLoader).
+
+        Accepts a superset of the checkpoint names ``load_weights`` consumes:
+        everything under the NextN layer prefix.
+        """
+        return self._nextn_layer_prefix(name) is not None
+
     def _map_checkpoint_name(self, raw_name: str) -> str | None:
         nextn_layer_prefix = self._nextn_layer_prefix(raw_name)
         if nextn_layer_prefix is None:
