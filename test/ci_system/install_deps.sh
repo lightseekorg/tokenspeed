@@ -66,8 +66,10 @@ run_as_root() {
     fi
 }
 
-ensure_flashinfer_jit_cache_for_gb200() {
-    if [[ "${CI_RUNNER_LABEL:-}" != gb200* ]]; then
+ensure_flashinfer_jit_cache() {
+    # GB200 and B200 runner images preinstall flashinfer-jit-cache; it must
+    # match the flashinfer-python pin exactly or flashinfer refuses to import.
+    if [[ "${CI_RUNNER_LABEL:-}" != gb200* && "${CI_RUNNER_LABEL:-}" != b200* ]]; then
         return 0
     fi
 
@@ -131,10 +133,10 @@ python3 -m pip install --upgrade --ignore-installed --break-system-packages \
     pip setuptools wheel
 
 # ============================================================
-# Step 3: Sync FlashInfer JIT cache on GB200
+# Step 3: Sync FlashInfer JIT cache on GB200/B200
 # ============================================================
-echo "=== Step 3: Sync FlashInfer JIT cache on GB200 ==="
-ensure_flashinfer_jit_cache_for_gb200
+echo "=== Step 3: Sync FlashInfer JIT cache on GB200/B200 ==="
+ensure_flashinfer_jit_cache
 
 # ============================================================
 # Step 4: Install tokenspeed-kernel
