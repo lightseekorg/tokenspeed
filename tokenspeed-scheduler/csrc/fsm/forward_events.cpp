@@ -31,7 +31,6 @@
 #include "fsm/cache_states.h"
 #include "fsm/forward_events.h"
 #include "fsm/forward_states.h"
-#include "fsm/pd_states.h"
 #include "resource/allocator/kv_allocator.h"
 #include "resource/allocator/owned_pages.h"
 #include "resource/allocator/req_pool_allocator.h"
@@ -43,7 +42,6 @@
 
 #if TOKENSPEED_FLAT_KVCACHE
 #include "cache/forward_cache_ops.h"
-#include "scheduler/page_hasher.h"
 #endif
 
 namespace {
@@ -114,45 +112,6 @@ namespace {
     throw std::logic_error("flat path: retract/writeback/loadback unsupported in C slice");
 }
 
-// Base-page hashes one decode step hands to registration, anchored at begin_page.
-struct HashesToRegister {
-    std::int32_t begin_page{0};
-    std::vector<std::string> hashes;
-};
-
-// Seed from a full-prefix hash list; the tail keeps the suffix from the last fold-grid boundary.
-HashChain MakeHashChain(const std::vector<std::string>& hashes, std::int32_t fold_align_pages) {
-    const std::int32_t n = static_cast<std::int32_t>(hashes.size());
-    const std::int32_t tail_begin = n / fold_align_pages * fold_align_pages;
-    return HashChain{.num_hashed_pages = n,
-                     .last_hash = n > 0 ? hashes.back() : std::string{},
-                     .tail_begin_page = tail_begin,
-                     .tail = {hashes.begin() + tail_begin, hashes.end()}};
-}
-
-// Hash the newly filled pages onto the chain; the returned batch reaches back to the fold grid
-// (fold_align_pages = lcm/base) so coarse groups fold the blocks completed this step. The
-// re-covered overlap is idempotent (m == 1 degenerates to exactly the fresh pages).
-HashesToRegister AdvanceHashChain(HashChain& chain, const std::vector<std::span<const std::int32_t>>& paged,
-                                  std::int32_t filled_pages, std::int32_t fold_align_pages) {
-    _assert(filled_pages > chain.num_hashed_pages, "caller must pre-check hash-chain progress");
-    _assert(filled_pages <= static_cast<std::int32_t>(paged.size()),
-            "flat decode hashing: filled pages exceed the container's full pages");
-    const std::vector<std::span<const std::int32_t>> fresh(paged.begin() + chain.num_hashed_pages,
-                                                           paged.begin() + filled_pages);
-    std::vector<std::string> new_hashes = ComputePagedHashes(fresh, chain.last_hash);
-
-    HashesToRegister batch{.begin_page = chain.tail_begin_page, .hashes = std::move(chain.tail)};
-    batch.hashes.insert(batch.hashes.end(), new_hashes.begin(), new_hashes.end());
-
-    const std::int32_t tail_begin = filled_pages / fold_align_pages * fold_align_pages;
-    chain.num_hashed_pages = filled_pages;
-    chain.last_hash = batch.hashes.back();
-    chain.tail_begin_page = tail_begin;
-    chain.tail.assign(batch.hashes.begin() + (tail_begin - batch.begin_page), batch.hashes.end());
-    return batch;
-}
-
 }  // namespace
 #endif
 
@@ -209,52 +168,26 @@ void InsertHybridCache(HybridPrefixCache* hybrid_cache,
 std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()(Submitted&& state) {
 #if TOKENSPEED_FLAT_KVCACHE
     _assert(coordinator_ != nullptr, "SchedulePrefillFirstChunkEvent: flat path requires a coordinator");
+    _assert(flat_tables_.size() == static_cast<std::size_t>(coordinator_->NumGroups()),
+            "SchedulePrefillFirstChunkEvent requires admitted Flat block tables");
     TokenContainer* token_container = state.GetTokenContainer();
 
     // Slot first: Allocate() throws on exhaustion; order kept for determinism.
     auto req_pool_index = std::make_unique<ReqPoolIndex>(req_pool_allocator_->Allocate());
 
-    std::vector<BlockTable> tables(coordinator_->NumGroups());
-    const std::int32_t device_hit_tokens = flat_hit_.num_common_tokens;
-    const std::int32_t hit_tokens = std::max(device_hit_tokens, flat_host_.num_common_tokens);
-    coordinator_->ClaimCommonPrefix(tables, std::move(flat_hit_));
-    // Extension appends between claim and fresh acquire so slots stay
-    // [device hit | host ext | new pages]; ext pages are FULL, composing with the gate.
-    flat_load_pairs_ = LoadHostExtension(*coordinator_, tables, std::move(flat_host_));
-    // Host boundary is absolute (floor included); default-constructed (no host pool) it is 0.
-    // Loaded pages become device-cached now (SWA holes skipped by the IsNull guard); the sink
-    // re-collects them and the drain dedupes against the host index. The extension ends at the
-    // page-aligned hit boundary, so the state group's final page is exactly the loaded snapshot.
-    coordinator_->CacheFullBlocks(tables, flat_ext_hashes_,
-                                  /*first_slot=*/device_hit_tokens / state.GetPageSize(),
-                                  /*end_tokens=*/hit_tokens);
-    bool acquired = false;
-    if (role_ == Role::kD && enable_flatkv_pd_) {
-        _assert(hit_tokens + tokens_this_round_ == token_container->PrefillSize(),
-                "FlatKV PD decode destination must acquire the complete prompt atomically");
-        acquired = coordinator_->AcquireDecodeDestination(tables, token_container->PrefillSize(), tokens_this_round_,
-                                                          decode_input_tokens_);
-    } else {
-        // Role kD cannot defer its decode reserve until RemotePrefillDone: the
-        // remote transfer may complete after other requests consume the pool.
-        const std::int32_t tokens_to_acquire = tokens_this_round_ + (role_ == Role::kD ? decode_input_tokens_ : 0);
-        acquired = coordinator_->Acquire(tables, tokens_to_acquire);
-    }
-    if (!acquired) {
-        _assert(false, "flat path: allocation failure unsupported in C slice");
-    }
-
-    TokenContainer::Window window{.begin = hit_tokens, .size = tokens_this_round_};
+    TokenContainer::Window window{.begin = flat_hit_tokens_, .size = tokens_this_round_};
     bool is_last_chunk = (window.begin + window.size) == token_container->PrefillSize();
     if (is_last_chunk && role_ != Role::kD) {
         PrefillDone done{token_container, state.GetPageSize(),  nullptr, nullptr, nullptr, std::move(req_pool_index),
                          window,          decode_input_tokens_, nullptr};
-        done.SetBlockTables(std::move(tables));
+        done.SetBlockTables(std::move(flat_tables_));
+        done.SetFlatCacheProgress(std::move(flat_cache_progress_));
         return done;
     }
     Prefilling prefilling{token_container, state.GetPageSize(),       nullptr, nullptr,
                           nullptr,         std::move(req_pool_index), window,  nullptr};
-    prefilling.SetBlockTables(std::move(tables));
+    prefilling.SetBlockTables(std::move(flat_tables_));
+    prefilling.SetFlatCacheProgress(std::move(flat_cache_progress_));
     return prefilling;
 #else
     std::unique_ptr<HostNodeRef> host_node_ref{nullptr};
@@ -321,16 +254,7 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
 // Prefilling -> Prefilling / PrefillDone
 std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefilling&& state) {
 #if TOKENSPEED_FLAT_KVCACHE
-    _assert(coordinator_ != nullptr, "SchedulePrefillEvent: flat path requires a coordinator");
-    const std::vector<std::string> hashes = FlatWindowPageHashes(state.GetFullPagedTokens(false), state.GetPageSize(),
-                                                                 state.window.begin, state.window.size);
-    // Prior chunks 0..k-1 (state.window is the PREVIOUS chunk); the gate credited this same slide value.
-    const std::int32_t num_computed_tokens = state.window.begin + state.window.size;
-
     auto tables = std::move(state).TakeBlockTables();
-    if (!PrefillChunk(*coordinator_, tables, hashes, tokens_this_round_, num_computed_tokens)) {
-        _assert(false, "flat path: allocation failure unsupported in C slice");
-    }
 
     TokenContainer::Window window{.begin = state.window.begin + state.window.size, .size = tokens_this_round_};
     bool is_last_chunk = (window.begin + window.size) == state.GetTokenContainer()->PrefillSize();
@@ -345,6 +269,7 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefillin
                          reserve_num_tokens_in_next_schedule_event_,
                          nullptr};
         done.SetBlockTables(std::move(tables));
+        done.SetFlatCacheProgress(std::move(flat_cache_progress_));
         return done;
     }
     Prefilling prefilling{state.GetTokenContainer(),
@@ -356,6 +281,7 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefillin
                           window,
                           nullptr};
     prefilling.SetBlockTables(std::move(tables));
+    prefilling.SetFlatCacheProgress(std::move(flat_cache_progress_));
     return prefilling;
 #else
     auto local_kv_allocator = std::move(state).TakeLocalKVAllocator();
@@ -408,22 +334,12 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefillin
 // PrefillDone -> Decoding: insert prefill pages into tree, then transition to decode.
 Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
 #if TOKENSPEED_FLAT_KVCACHE
-    _assert(coordinator_ != nullptr, "ScheduleDecodeEvent: flat path requires a coordinator");
-    const std::vector<std::string> hashes = FlatWindowPageHashes(state.GetFullPagedTokens(false), state.GetPageSize(),
-                                                                 state.window.begin, state.window.size);
-    const std::int32_t reserve = state.GetReserveNumTokensInNextScheduleEvent();
-    // Full prefill length (window end == PrefillSize()); the PrefillDone gate credited the same value.
-    const std::int32_t num_computed_tokens = state.window.begin + state.window.size;
-
     auto tables = std::move(state).TakeBlockTables();
-    if (!FinalizePrefillAndReserveDecode(*coordinator_, tables, hashes, reserve, num_computed_tokens)) {
-        _assert(false, "flat path: allocation failure unsupported in C slice");
-    }
 
     Decoding decoding{state.GetTokenContainer(),           state.GetPageSize(),  nullptr, nullptr, nullptr,
                       std::move(state).TakeReqPoolIndex(), decode_input_tokens_, nullptr};
     decoding.SetBlockTables(std::move(tables));
-    decoding.SetHashChain(MakeHashChain(hashes, coordinator_->LcmBlockSize() / coordinator_->BaseBlockSize()));
+    decoding.SetFlatCacheProgress(std::move(flat_cache_progress_));
     return decoding;
 #else
     auto local_kv_allocator = std::move(state).TakeLocalKVAllocator();
@@ -458,30 +374,12 @@ Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
 // Decoding -> Decoding: allocate pages for next decode step.
 Decoding ScheduleDecodeEvent::operator()(Decoding&& state) {
 #if TOKENSPEED_FLAT_KVCACHE
-    _assert(coordinator_ != nullptr, "ScheduleDecodeEvent: flat path requires a coordinator");
-    const std::int32_t reserve = state.GetReserveNumTokensInNextScheduleEvent();
-    // Size() includes this round's pending decode tail; sliding at Size() would free a page its
-    // query still reads. scheduleDecode's gate credited the slide with this same value.
-    const std::int32_t num_computed_tokens = state.GetTokenContainer()->Size() - decode_input_tokens_;
-
-    HashChain chain = std::move(state).TakeHashChain();
-    const std::int32_t filled_pages = num_computed_tokens / state.GetPageSize();
-    // A page fills only once every page_size steps; skip the span walk on the other steps.
-    HashesToRegister to_register{.begin_page = chain.num_hashed_pages};
-    if (filled_pages > chain.num_hashed_pages) {
-        to_register = AdvanceHashChain(chain, state.GetFullPagedTokens(false), filled_pages,
-                                       coordinator_->LcmBlockSize() / coordinator_->BaseBlockSize());
-    }
-
     auto tables = std::move(state).TakeBlockTables();
-    if (!DecodeStep(*coordinator_, tables, to_register.hashes, to_register.begin_page, reserve, num_computed_tokens)) {
-        _assert(false, "flat path: allocation failure unsupported in C slice");
-    }
 
     Decoding decoding{state.GetTokenContainer(),           state.GetPageSize(),  nullptr, nullptr, nullptr,
                       std::move(state).TakeReqPoolIndex(), decode_input_tokens_, nullptr};
     decoding.SetBlockTables(std::move(tables));
-    decoding.SetHashChain(std::move(chain));
+    decoding.SetFlatCacheProgress(std::move(flat_cache_progress_));
     return decoding;
 #else
     auto local_kv_allocator = std::move(state).TakeLocalKVAllocator();

@@ -54,7 +54,6 @@ public:
 
     std::string Id() const { return id_; }
 
-    // Keep Apply the only non-const function in Request
     // The wrapper lambda converts any concrete state type returned by event's operator()
     // into fsm::State, allowing operator() to return specific state types instead of State.
     template <typename Event>
@@ -195,6 +194,34 @@ public:
             },
             state_);
     }
+
+#if TOKENSPEED_FLAT_KVCACHE
+    std::vector<BlockTable>& FlatBlockTablesRef() {
+        return std::visit(Overloaded{
+            []<typename T>(T& s) -> std::vector<BlockTable>&
+                requires(std::derived_from<T, fsm::ForwardState>)
+            { return s.BlockTables(); },
+            [this](auto&) -> std::vector<BlockTable>& {
+                throw std::logic_error("Request::FlatBlockTablesRef: expected a forward state; got state=" +
+                                       StateName());
+            },
+            },
+            state_);
+    }
+
+    fsm::FlatCacheProgress FlatCacheProgress() const {
+        return std::visit(Overloaded{
+            []<typename T>(const T& state) -> fsm::FlatCacheProgress
+                requires(std::derived_from<T, fsm::ForwardState>)
+            { return state.FlatCacheProgressValue(); },
+            [this](const auto&) -> fsm::FlatCacheProgress {
+                throw std::logic_error("Request::FlatCacheProgress: expected a forward state; got state=" +
+                                       StateName());
+            },
+            },
+            state_);
+    }
+#endif
 
     const TreeNode* GetDeviceNode() const {
         return std::visit(Overloaded{

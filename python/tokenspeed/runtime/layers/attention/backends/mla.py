@@ -35,6 +35,7 @@ from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
 )
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+from tokenspeed.runtime.layers.attention.page_table import expand_page_table
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.layers.attention.utils import build_page_table
 from tokenspeed.runtime.utils.common import ceil_div
@@ -171,31 +172,13 @@ class MLAAttnBackend(AttentionBackend):
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Expand FlatKV scheduler pages for this backend's MLA kernel pages."""
-        ratio = flat_page_size // self.page_size
-        if ratio <= 0 or flat_page_size % self.page_size:
-            raise ValueError(
-                "flat_page_size must be a positive multiple of MLA kernel page size"
-            )
-        if out is None:
-            out = torch.zeros(
-                (batch_size, self.max_num_pages),
-                dtype=torch.int32,
-                device=table.device,
-            )
-        flat_columns = min(ceil_div(self.max_num_pages, ratio), table.shape[1])
-        if flat_columns <= 0:
-            out[:batch_size].zero_()
-            return out
-        expanded = (
-            table[:batch_size, :flat_columns].clamp_min(0).to(torch.int32).unsqueeze(-1)
-            * ratio
-            + torch.arange(ratio, dtype=torch.int32, device=table.device)
-        ).reshape(batch_size, flat_columns * ratio)
-        copy_len = min(self.max_num_pages, expanded.shape[1])
-        out[:batch_size, :copy_len].copy_(expanded[:, :copy_len])
-        if copy_len < out.shape[1]:
-            out[:batch_size, copy_len:].zero_()
-        return out
+        return expand_page_table(
+            table[:batch_size],
+            logical_page_size=flat_page_size,
+            kernel_page_size=self.page_size,
+            max_kernel_pages=self.max_num_pages,
+            out=out,
+        )
 
     @staticmethod
     def _flat_decode_out_cache_loc(
@@ -482,19 +465,15 @@ class MLAAttnBackend(AttentionBackend):
             )
         return locs
 
-    def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor):
-        assert (
-            seq_lens_buf.dtype == torch.int32
-            and seq_lens_buf.dim() == 1
-            and seq_lens_buf.shape[0] >= max_bs
-        ), (
-            f"seq_lens_buf must be int32 with shape[0] >= {max_bs}, "
-            f"got {seq_lens_buf.dtype} {tuple(seq_lens_buf.shape)}"
-        )
+    def init_cuda_graph_state(self, max_bs: int):
         self.cuda_graph_page_table = torch.zeros(
             (max_bs, self.max_num_pages), dtype=torch.int32, device=self.device
         )
-        self.cuda_graph_seq_lens = seq_lens_buf
+        # Own the cache-seqlens buffer; replay copies the live lengths in, so
+        # graph state does not depend on the controller mutating a shared tensor.
+        self.cuda_graph_seq_lens = torch.zeros(
+            max_bs, dtype=torch.int32, device=self.device
+        )
         self.decode_cuda_graph_metadata = {}
         if self._flat_contract_bound:
             self.decode_cuda_graph_flat_out_cache_loc = torch.zeros(
@@ -541,6 +520,8 @@ class MLAAttnBackend(AttentionBackend):
             seq_lens=self.cuda_graph_seq_lens[:bs],
             flat_out_cache_loc=flat_out_cache_loc,
         )
+        # Seed the owned buffer: the capture run reads it before replay.
+        metadata.seq_lens.copy_(seq_lens[:bs])
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
 
@@ -559,6 +540,9 @@ class MLAAttnBackend(AttentionBackend):
             )
 
         metadata = self.decode_cuda_graph_metadata[bs]
+        # Copy the live lengths into our own cache-seqlens buffer (metadata.seq_lens
+        # views it); both the flat and legacy paths read it at replay.
+        self.cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs])
         if metadata.flat_out_cache_loc is not None:
             self._flat_replay_refresh_decode(
                 bs,

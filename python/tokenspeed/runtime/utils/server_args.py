@@ -90,6 +90,8 @@ class ServerArgs:
     chunked_prefill_size: int | None = None
     max_prefill_tokens: int = 8192
     enable_mixed_batch: bool = False
+    # Kernel page size. Flat scheduler logical pages come from the LCM
+    # runtime contract and must not overwrite this value.
     block_size: int = 64
     # special kv cache
     mamba_ssm_dtype: str = "float32"
@@ -143,6 +145,11 @@ class ServerArgs:
     # the ``ts serve`` orchestrator (allocated + proxied by the sidecar); None
     # disables the in-engine app.
     rl_control_port: int | None = None
+    # Version identifier for the model weights. Stamped into every generation
+    # response's meta_info so RL trainers know which policy version produced each
+    # sample. Updated atomically after a successful weight push when the trainer
+    # supplies a new version string.
+    weight_version: str = "default"
 
     # Data parallelism
     data_parallel_size: int | None = None
@@ -268,7 +275,7 @@ class ServerArgs:
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
     delete_ckpt_after_loading: bool = False
-    weight_loader_prefetch_checkpoints: bool = False
+    weight_loader_prefetch_checkpoints: bool = True
     weight_loader_prefetch_num_threads: int = 4
     enable_memory_saver: bool = False
     enable_custom_logit_processor: bool = False
@@ -944,6 +951,7 @@ class ServerArgs:
             metavar="BLOCK_SIZE",
             type=int,
             default=ServerArgs.block_size,
+            help="Kernel cache page size in tokens.",
         )
 
         # KVStore
@@ -1732,12 +1740,17 @@ class ServerArgs:
             help="Delete the model checkpoint after loading the model.",
         )
         parser.add_argument(
-            "--weight-loader-prefetch-checkpoints",
-            action="store_true",
+            "--disable-weight-loader-prefetch-checkpoints",
+            dest="weight_loader_prefetch_checkpoints",
+            action="store_false",
+            default=ServerArgs.weight_loader_prefetch_checkpoints,
             help=(
-                "Prefetch safetensors checkpoint shards into OS page cache before "
-                "loading. Local ranks split the shard list to reduce repeated reads "
-                "from shared filesystems."
+                "Disable prefetching safetensors checkpoint shards into the OS "
+                "page cache. Prefetch is enabled by default: shards are read "
+                "sequentially a bounded window ahead of weight loading "
+                "(min(80 GiB, 25%% of available host memory)), so weight copies "
+                "hit the cache at streaming bandwidth instead of demand-faulting "
+                "cold pages from shared filesystems."
             ),
         )
         parser.add_argument(
@@ -1938,6 +1951,12 @@ class ServerArgs:
             help="Port for the in-engine RL control-plane HTTP app (weight sync, "
             "pause/resume, memory occupation). Normally allocated automatically "
             "by the `ts serve` orchestrator.",
+        )
+        parser.add_argument(
+            "--weight-version",
+            type=str,
+            default=ServerArgs.weight_version,
+            help="Initial model-weight version stamped into generation metadata.",
         )
 
     @classmethod

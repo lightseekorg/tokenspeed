@@ -81,6 +81,66 @@ class TRTLLMFlatGroupsTest(unittest.TestCase):
         self.assertIs(b._select_page_table(self._layer("full_attention"), meta), full)
         self.assertIs(b._select_page_table(self._layer("sliding_attention"), meta), swa)
 
+    def test_expands_logical_group_pages_for_kernel_reads(self):
+        b = self._bare_backend(
+            groups={"full_attention": 128},
+            max_num_pages=6,
+        )
+        logical = {
+            "full_attention": self.torch.tensor([[3, 5, -1]], dtype=self.torch.int32)
+        }
+
+        kernel = b._flat_kernel_page_tables(logical)
+
+        self.assertEqual(
+            kernel["full_attention"].tolist(),
+            [[6, 7, 10, 11, 0, 1]],
+        )
+
+    def test_build_page_table_keeps_radix_direct_copy_path(self):
+        b = self._bare_backend(page_size=64, max_num_pages=4)
+        req_to_page = self.torch.tensor(
+            [[0, 0, 0, 0], [3, 5, 7, 9]], dtype=self.torch.int32
+        )
+        out = self.torch.empty((1, 4), dtype=self.torch.int32)
+
+        page_table = b._build_page_table(
+            self.torch.tensor([1], dtype=self.torch.int32),
+            self.torch.tensor([256], dtype=self.torch.int32),
+            1,
+            req_to_page,
+            out,
+        )
+
+        self.assertEqual(page_table.data_ptr(), out.data_ptr())
+        self.assertEqual(page_table.tolist(), [[3, 5, 7, 9]])
+
+    def test_eager_flat_expands_per_group_table(self):
+        b = self._bare_backend(
+            page_size=64,
+            max_num_pages=4,
+            groups={"full_attention": 128},
+        )
+
+        b.init_forward_metadata(
+            bs=1,
+            req_pool_indices=self.torch.tensor([0], dtype=self.torch.int32),
+            seq_lens=self.torch.tensor([129], dtype=self.torch.int32),
+            forward_mode=_DecodeMode(),
+            req_to_page=None,
+            flat_block_tables={
+                "full_attention": self.torch.tensor([[3, 5]], dtype=self.torch.int32)
+            },
+        )
+
+        metadata = b.forward_decode_metadata
+        self.assertIsNone(metadata.page_table)
+        self.assertEqual(
+            metadata.page_tables["full_attention"].tolist(),
+            [[6, 7, 10, 11]],
+        )
+        self.assertEqual(metadata.out_cache_locs["full_attention"].tolist(), [10 * 64])
+
     def test_select_out_cache_loc_routes_by_group(self):
         b = self._bare_backend()
         radix_loc = self.torch.tensor([7], dtype=self.torch.int32)
@@ -198,6 +258,28 @@ class TRTLLMFlatGroupsTest(unittest.TestCase):
         self.assertEqual(
             b.cuda_graph_flat_out_cache_locs["full_attention"][:bs].tolist(),
             [12 * 64 + 0, 0 * 64 + 0],
+        )
+
+    def test_graph_replay_expands_scheduler_pages_before_kernel_reads(self):
+        if not self.torch.cuda.is_available():
+            self.skipTest("replay write locs are triton-only (needs CUDA)")
+        gid = "full_attention"
+        b = self._bare_backend(device="cuda", groups={gid: 128})
+        b._init_flat_graph_buffers(max_bs=2)
+        seq_lens = self.torch.tensor([129, 1], dtype=self.torch.int32).cuda()
+        src = {
+            gid: self.torch.tensor(
+                [[3, 5], [0, -1]], dtype=self.torch.int32, device="cuda"
+            )
+        }
+
+        b._flat_replay_fill(2, src, seq_lens)
+
+        table = b.cuda_graph_flat_page_tables[gid]
+        self.assertEqual(table[0, :4].tolist(), [6, 7, 10, 11])
+        self.assertEqual(
+            b.cuda_graph_flat_out_cache_locs[gid][:2].tolist(),
+            [10 * 64, 0],
         )
 
     def test_verify_metadata_expanded_write_locs(self):

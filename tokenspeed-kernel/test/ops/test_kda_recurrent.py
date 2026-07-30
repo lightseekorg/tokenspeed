@@ -4,12 +4,79 @@ from __future__ import annotations
 
 import pytest
 import torch
+from kimi3_reference import kda_gate
+from kimi3_reference import kda_recurrent as reference_kda_recurrent
 from tokenspeed_kernel.ops.attention import (
     kda_paged_decode,
     kda_recurrent,
     kda_recurrent_decode,
 )
 from tokenspeed_kernel.platform import current_platform
+
+
+def test_k3_safe_gate_reference_matches_sigmoid_contract() -> None:
+    """Distinguish K3's safe sigmoid gate from a clamped softplus gate."""
+    raw_g = torch.tensor([[[-2.0, 0.0, 2.0]]])
+    a_log = torch.tensor([0.25])
+    dt_bias = torch.tensor([[0.5, -0.5, 1.0]])
+    lower_bound = -5.0
+
+    gate_input = raw_g + dt_bias
+    expected = lower_bound * torch.sigmoid(torch.exp(a_log)[None, :, None] * gate_input)
+    actual = kda_gate(raw_g, a_log, dt_bias, lower_bound=lower_bound)
+    torch.testing.assert_close(actual, expected)
+
+    legacy = torch.clamp_min(
+        -torch.exp(a_log)[None, :, None] * torch.nn.functional.softplus(gate_input),
+        lower_bound,
+    )
+    assert not torch.allclose(actual, legacy)
+
+
+def test_kda_recurrent_matches_safe_gate_reference() -> None:
+    """Packed recurrence must use K3's safe sigmoid decay gate."""
+    device = "cuda"
+    torch.manual_seed(5)
+    tokens, heads, dim = 3, 2, 8
+    q = torch.randn(tokens, heads, dim, device=device, dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    raw_g = torch.randn_like(q)
+    beta = torch.randn(tokens, heads, device=device, dtype=torch.bfloat16)
+    state = torch.randn(1, heads, dim, dim, device=device, dtype=torch.float32)
+    a_log = torch.randn(heads, device=device, dtype=torch.float32)
+    dt_bias = torch.randn(heads, dim, device=device, dtype=torch.float32)
+    lower_bound = -5.0
+
+    expected_out, expected_state = reference_kda_recurrent(
+        q,
+        k,
+        v,
+        raw_g,
+        beta,
+        state[0],
+        a_log,
+        dt_bias,
+        lower_bound=lower_bound,
+    )
+    actual_out, actual_state = kda_recurrent(
+        q,
+        k,
+        v,
+        raw_g,
+        beta,
+        state,
+        a_log,
+        dt_bias,
+        lower_bound=lower_bound,
+        cu_seqlens=torch.tensor([0, tokens], device=device, dtype=torch.int32),
+        state_indices=torch.tensor([0], device=device, dtype=torch.int32),
+    )
+
+    torch.testing.assert_close(
+        actual_out.float(), expected_out.float(), atol=5e-2, rtol=5e-2
+    )
+    torch.testing.assert_close(actual_state[0], expected_state, atol=5e-2, rtol=5e-2)
 
 
 def test_kda_recurrent_zeroes_invalid_and_empty_graph_rows() -> None:

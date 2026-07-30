@@ -99,6 +99,7 @@ def allreduce_lane_latent_norm(
     eps: float,
     max_token_num: int,
     launch_with_pdl: bool = False,
+    trigger_completion_at_end: bool = False,
 ) -> torch.Tensor:
     """Reduce a routed/shared lane and normalize its routed prefix."""
 
@@ -111,6 +112,7 @@ def allreduce_lane_latent_norm(
         eps=eps,
         max_token_num=max_token_num,
         launch_with_pdl=launch_with_pdl,
+        trigger_completion_at_end=trigger_completion_at_end,
     )
 
 

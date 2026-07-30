@@ -113,6 +113,7 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
     # Graph-buffer column tails pad with the zero-init dummy page, matching
     # the radix replay contract (gather_page_table_with_padding dummy_slot=0).
     flat_table_tail_pad: int = 0
+    draft_seq_lens_attr: str = "cuda_graph_cache_seqlens"
 
     def support_kv_cache_prewrite(
         self, forward_mode: ForwardMode | None = None
@@ -437,6 +438,7 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             self._maybe_check_flat_write_locs(
                 flat_page_tables, flat_out_cache_locs, self.page_size
             )
+            flat_page_tables = self._flat_kernel_page_tables(flat_page_tables)
 
         if forward_mode.is_extend_or_mixed():
             self._init_extend_metadata(
@@ -730,18 +732,9 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
     def init_cuda_graph_state(
         self,
         max_bs: int,
-        seq_lens_buf: torch.Tensor,
         paged_cache_group_specs: Sequence = (),
         **kwargs,
     ):
-        assert (
-            seq_lens_buf.dtype == torch.int32
-            and seq_lens_buf.dim() == 1
-            and seq_lens_buf.shape[0] >= max_bs
-        ), (
-            f"seq_lens_buf must be int32 with shape[0] >= {max_bs}, "
-            f"got {seq_lens_buf.dtype} {tuple(seq_lens_buf.shape)}"
-        )
         self.cuda_graph_prefill_metadata = {}
         self.cuda_graph_decode_metadata = {}
         # Flat per-group persistent buffers + state-group shed; before the
@@ -764,11 +757,15 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 device=self.device,
             )
             return
-        # Alias controller's seq_lens_buf — backend never mutates it.
+        # Own the cache-seqlens buffer instead of aliasing the controller's
+        # seq_lens_buf; replay copies the live lengths in, so graph state does
+        # not depend on the controller mutating a shared tensor in place.
         self.cuda_graph_page_table = torch.zeros(
             (max_bs, self.max_num_pages), dtype=torch.int32, device=self.device
         )
-        self.cuda_graph_cache_seqlens = seq_lens_buf
+        self.cuda_graph_cache_seqlens = torch.zeros(
+            max_bs, dtype=torch.int32, device=self.device
+        )
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -800,6 +797,8 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             return
 
         if self.spec_num_tokens > 1:
+            # Seed the owned buffer first: it is the clamp source below.
+            self.cuda_graph_cache_seqlens[:bs].copy_(seq_lens[:bs])
             self._init_multi_token_metadata_capture(
                 bs, self.spec_num_tokens, page_tables, out_cache_locs
             )
@@ -838,7 +837,8 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         page_tables: dict[str, torch.Tensor] | None = None,
         out_cache_locs: dict[str, torch.Tensor] | None = None,
     ):
-        # cache_seqlens aliases seq_lens_buf (set in init_cuda_graph_state).
+        # cache_seqlens views the backend-owned cuda_graph_cache_seqlens (set in
+        # init_cuda_graph_state).
         # Flat captures route reads through the per-group buffer views and
         # replay never fills the radix single table, so record page_table=None
         # instead of a slice of the never-filled zero buffer.
@@ -853,6 +853,8 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             page_tables=page_tables,
             out_cache_locs=out_cache_locs,
         )
+        # Seed the owned buffer: the capture run reads it before replay.
+        metadata.cache_seqlens_int32.copy_(seq_lens[:bs])
         self.cuda_graph_decode_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
 
@@ -918,7 +920,12 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 self.forward_decode_metadata = self.cuda_graph_decode_metadata[bs]
             return
 
-        # cache_seqlens aliases seq_lens_buf; only page tables need refresh.
+        # Copy the live cache lengths into our own buffer (the plain-decode and
+        # draft-decode metadata view cuda_graph_cache_seqlens); the spec>1 verify
+        # path instead reads spec_cache_seqlens_buf via _clamped_spec_seqlens.
+        self.cuda_graph_cache_seqlens[:bs].copy_(seq_lens[:bs])
+
+        # Only page tables need refresh beyond that.
         # Flat captures read only the per-group buffers; the radix single
         # table would be dead work there (and req_to_page is unpopulated on
         # a flat scheduler build).
@@ -934,8 +941,7 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 dummy_slot=0,
             )
         if flat_block_tables:
-            # cuda_graph_cache_seqlens aliases the controller's seq_lens_buf,
-            # filled by input prep BEFORE this call.
+            # cuda_graph_cache_seqlens was refreshed from live seq_lens above.
             self._flat_replay_fill(
                 bs,
                 flat_block_tables,

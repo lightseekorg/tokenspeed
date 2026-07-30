@@ -59,12 +59,19 @@ optional:
   amd-mi355-1gpu-bench: true
 ```
 
-`b200-<Ngpu>` labels are the default B200 runners. Set the
-`TOKENSPEED_B200_RUNNER_LABEL` repository variable in GitHub Actions
-(`Settings` -> `Secrets and variables` -> `Actions` -> `Variables`) to a
-non-empty runner family such as `b200v2` to temporarily route them to
-`b200v2-<Ngpu>` without editing task YAML. Leave the variable unset or empty to
-use the default `b200-<Ngpu>` labels.
+The NVIDIA PR workflow routes `b200-<Ngpu>` task labels to
+`b200v2-<Ngpu>` by default. Set the `TOKENSPEED_B200_RUNNER_LABEL` repository
+variable in GitHub Actions (`Settings` -> `Secrets and variables` -> `Actions`
+-> `Variables`) to a non-empty runner family, such as `b200`, to override the
+default without editing task YAML.
+
+Only `b200v2-*` jobs enable a persistent, node-local package cache. They reuse
+pip downloads from `/raid/cache/pip` and explicitly downloaded release wheels
+from `/raid/cache/wheelhouse`; when `FLASHINFER_CACHE_DIR` points elsewhere,
+the two directories are created beside that cache instead. This survives
+runner pod recreation and avoids downloading the same large wheels again on
+that node. Other runner families keep their existing cache behavior because
+their cluster storage layouts may differ.
 
 To enable `push` and `workflow_dispatch` runs of the three PR test workflows
 outside the official repository, set the `TOKENSPEED_CI_REPOSITORY` repository
@@ -76,7 +83,8 @@ repositories. `pull_request` runs keep their existing behavior. The configured
 repository must also provide the matching self-hosted runner labels and any
 required secrets; this variable only controls the repository gate.
 
-To temporarily remove unavailable GPU runners from PR test matrices, set the
+The NVIDIA PR workflow excludes `h100` runners by default. To temporarily
+remove additional unavailable GPU runners from PR test matrices, set the
 `TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS` repository variable to comma-separated,
 case-insensitive substrings such as `b300, mi355`. Matching uses the resolved
 runner label after applying `TOKENSPEED_B200_RUNNER_LABEL`; `b300` therefore
@@ -84,7 +92,7 @@ matches both `b300-*` and `gb300-*`, while `mi355` matches
 `amd-mi355-*`. Empty entries are ignored. If every runner in a workflow group
 is excluded, its matrix job is skipped while the workflow still finishes.
 This variable applies only to the three PR test workflows. Clear or unset it to
-restore all runner labels.
+restore all runner labels except the NVIDIA workflow's `h100` baseline.
 
 The CI system derives `SM` from common runner label prefixes by default:
 `h100`/`h200` use `sm90`, `b200`/`gb200` use `sm100`, and `b300`/`gb300` use

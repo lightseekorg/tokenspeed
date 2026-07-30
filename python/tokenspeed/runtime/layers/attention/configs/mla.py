@@ -20,7 +20,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -41,6 +41,9 @@ class MLAConfig(BaseAttnConfig):
     v_head_dim: int
     scaling: float
     kv_cache_dim: int
+    layer_types: tuple[str, ...] = field(default=(), kw_only=True)
+    max_scheduled_tokens: int = field(default=0, kw_only=True)
+    pd_disaggregation_enabled: bool = field(default=False, kw_only=True)
 
     @classmethod
     def generate(
@@ -52,6 +55,12 @@ class MLAConfig(BaseAttnConfig):
                 speculative_num_steps=server_args.speculative_num_steps,
                 speculative_num_draft_tokens=server_args.speculative_num_draft_tokens,
             )
+        hf_config = getattr(model_config, "hf_config", None)
+        layer_types = tuple(
+            getattr(hf_config, "paged_cache_layer_types", None)
+            or getattr(hf_config, "layer_types", None)
+            or ()
+        )
         return cls(
             device=server_args.device,
             context_len=model_config.context_len,
@@ -78,6 +87,12 @@ class MLAConfig(BaseAttnConfig):
             v_head_dim=model_config.v_head_dim,
             scaling=model_config.scaling,
             kv_cache_dim=model_config.kv_lora_rank + model_config.qk_rope_head_dim,
+            layer_types=layer_types,
+            max_scheduled_tokens=getattr(server_args, "chunked_prefill_size", 8192),
+            pd_disaggregation_enabled=getattr(
+                server_args, "disaggregation_mode", "null"
+            )
+            != "null",
             **kwargs,
         )
 
@@ -101,7 +116,9 @@ class MLAConfig(BaseAttnConfig):
         rank: int,
         enable_memory_saver: bool,
     ) -> BaseTokenToKVPool:
-        from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
+        from tokenspeed.runtime.layers.attention.kv_cache.mla import (
+            MLATokenToKVPool,
+        )
 
         return MLATokenToKVPool(
             size=max_total_num_tokens,

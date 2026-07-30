@@ -27,7 +27,9 @@ from tokenspeed.runtime.pd.flatkv import (
     FlatKVPDPeerLayout,
     FlatKVPDProtocolError,
     FlatKVPDSLabRegistration,
+    FlatKVPDTransferSegment,
     build_flatkv_page_manifest,
+    build_lcm_flatkv_pd_contract,
     flatkv_manifest_page_ids,
     validate_flatkv_manifest_pair,
     validate_flatkv_peer_layout,
@@ -230,7 +232,7 @@ def test_manifest_accepts_reordered_mapping_but_rejects_wrong_keys() -> None:
 
 def test_manifest_rejects_selected_page_aliasing_a_live_unselected_slot() -> None:
     aliased = _op()
-    aliased.flat_block_tables_arrays()["linear-a"][0, 0] = 2
+    aliased.flat_block_tables_arrays()["attention"][0, 0] = 2
     with pytest.raises(FlatKVPDProtocolError, match="aliases live unselected"):
         build_flatkv_page_manifest(
             aliased,
@@ -313,14 +315,65 @@ def test_manifest_pair_rejects_layout_and_logical_mismatch() -> None:
             layout,
             dst_num_pages_with_null=layout.num_pages_with_null,
         )
-    with pytest.raises(FlatKVPDProtocolError, match="globally owned"):
-        replace(
-            source,
-            groups=(
-                source.groups[0],
-                replace(source.groups[1], page_ids=(source.groups[0].page_ids[0],)),
-                source.groups[2],
+    # Kernel page ids are scoped by group in the two-level LCM layout.
+    # Equal integers in different groups do not name the same CacheBlock.
+    replace(
+        source,
+        groups=(
+            source.groups[0],
+            replace(source.groups[1], page_ids=(source.groups[0].page_ids[0],)),
+            source.groups[2],
+        ),
+    )
+
+
+def test_lcm_group_capacity_uses_its_cache_blocks_per_parent() -> None:
+    layout = FlatKVPDLayout(
+        version=1,
+        layout_fingerprint=_FINGERPRINT,
+        block_size=4,
+        # Null parent plus three usable parents.
+        num_pages_with_null=4,
+        physical_buffer_ids=("arena",),
+        physical_page_bytes=1024,
+        groups=(
+            FlatKVPDGroup(
+                "history",
+                "history",
+                "full_suffix",
+                (0,),
+                cache_blocks_per_lcm_block=2,
+                transfer_segments=(
+                    FlatKVPDTransferSegment(
+                        physical_slot=0,
+                        field_id="layer.0.k",
+                        dtype="bfloat16",
+                        page_zero_offset=384,
+                        page_stride_bytes=128,
+                        payload_bytes=128,
+                    ),
+                ),
             ),
+        ),
+    )
+    tables = {"history": np.array([[5, 6]], dtype=np.int32)}
+    operation = SimpleNamespace(flat_block_tables_arrays=lambda: tables)
+
+    build_flatkv_page_manifest(
+        operation,
+        layout=layout,
+        request_row=0,
+        prefix_len=0,
+        prompt_len=8,
+    )
+    tables["history"][0, 1] = 7
+    with pytest.raises(FlatKVPDProtocolError, match="invalid page ID"):
+        build_flatkv_page_manifest(
+            operation,
+            layout=layout,
+            request_row=0,
+            prefix_len=0,
+            prompt_len=8,
         )
 
 
@@ -393,6 +446,86 @@ def test_registration_validation_rejects_bad_extents() -> None:
         )
     with pytest.raises(FlatKVPDProtocolError, match="uint64"):
         FlatKVPDSLabRegistration(0, "slab.0", (1 << 64) - extent + 1, extent)
+
+
+def test_lcm_contract_registers_one_arena_and_preserves_group_geometry() -> None:
+    class _Dtype:
+        def __str__(self):
+            return "torch.uint8"
+
+    class _Backing:
+        dtype = _Dtype()
+        nbytes = 4096
+
+        @staticmethod
+        def is_contiguous():
+            return True
+
+        @staticmethod
+        def storage_offset():
+            return 0
+
+        @staticmethod
+        def data_ptr():
+            return 0x10000
+
+        @staticmethod
+        def untyped_storage():
+            return SimpleNamespace(data_ptr=lambda: 0x10000)
+
+    plan = SimpleNamespace(
+        logical_block_tokens=4,
+        lcm_block_bytes=1024,
+        num_lcm_blocks=3,
+        arena_bytes=4096,
+        groups=(
+            SimpleNamespace(
+                group_id="history",
+                cache_blocks_per_lcm_block=2,
+                page_count=7,
+            ),
+        ),
+        planes=(
+            SimpleNamespace(
+                plane_id="k",
+                bytes_per_lcm_block=512,
+                arena_offset_bytes=0,
+            ),
+        ),
+        fields=(
+            SimpleNamespace(
+                group_id="history",
+                field_id="layer.0.k",
+                plane_id="k",
+                shape=(4, 8),
+                element_size=2,
+                field_offset_bytes=0,
+                page_stride_bytes=256,
+                payload_bytes=64,
+            ),
+        ),
+    )
+    specs = (
+        SimpleNamespace(
+            group_id="history",
+            family="history",
+            transfer_policy="full_suffix",
+            retention="full_history",
+            sliding_window_tokens=None,
+        ),
+    )
+
+    layout, registrations = build_lcm_flatkv_pd_contract(
+        plan=plan,
+        backing=_Backing(),
+        group_specs=specs,
+        field_dtypes={"layer.0.k": "bfloat16"},
+    )
+
+    assert layout.num_pages_with_null == 4
+    assert layout.groups[0].cache_blocks_per_lcm_block == 2
+    assert layout.groups[0].transfer_segments[0].page_zero_offset == 256
+    assert registrations == (FlatKVPDSLabRegistration(0, "lcm_arena", 0x10000, 4096),)
 
 
 if __name__ == "__main__":

@@ -106,7 +106,7 @@ class RMSNorm(torch.nn.Module):
         self,
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
-        inplace: bool = False,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # There might be no tokens here
         if x.shape[0] == 0:
@@ -117,10 +117,8 @@ class RMSNorm(torch.nn.Module):
 
         if _is_amd:
             if residual is not None:
-                if inplace:
-                    raise ValueError(
-                        "fused add rmsnorm does not support inplace operation"
-                    )
+                if out is not None:
+                    raise ValueError("fused add rmsnorm does not support out")
                 return triton_rmsnorm(
                     x,
                     self.weight.data,
@@ -131,14 +129,12 @@ class RMSNorm(torch.nn.Module):
                 x,
                 self.weight.data,
                 self.variance_epsilon,
-                out=x if inplace else None,
+                out=out,
             )
         else:
             if residual is not None:
-                if inplace:
-                    raise ValueError(
-                        "fused_add_rmsnorm does not support inplace operation"
-                    )
+                if out is not None:
+                    raise ValueError("fused_add_rmsnorm does not support out")
                 fused_add_rmsnorm(
                     x,
                     residual,
@@ -151,7 +147,7 @@ class RMSNorm(torch.nn.Module):
                 x,
                 self.weight.data,
                 self.variance_epsilon,
-                out=x if inplace else None,
+                out=out,
                 enable_pdl=pdl_enabled(),
             )
             return out

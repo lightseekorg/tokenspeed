@@ -77,43 +77,12 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         self.layer_num = layer_num
         self.kv_cache_dim = kv_lora_rank + qk_rope_head_dim
 
-        self.memory_saver_adapter = memory_saver_adapter = (
-            TorchMemorySaverAdapter.create(enable=enable_memory_saver)
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=enable_memory_saver
         )
         self.page_size_bytes = self._get_page_size_bytes()
 
-        with memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
-            # The padded page 0 is used for writing dummy outputs from padded tokens.
-            if self.quant_method == "per_token_head":
-                self.kv_buffer = [
-                    (
-                        torch.zeros(
-                            (self.size + self.page_size, 1, kv_lora_rank),
-                            dtype=self.store_dtype,
-                            device=device,
-                        ),
-                        torch.zeros(
-                            (self.size + self.page_size, 1, 1),
-                            dtype=torch.float32,
-                            device=device,
-                        ),
-                        torch.zeros(
-                            (self.size + self.page_size, 1, qk_rope_head_dim),
-                            dtype=self.model_dtype,
-                            device=device,
-                        ),
-                    )
-                    for _ in range(layer_num)
-                ]
-            else:
-                self.kv_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, 1, self.kv_cache_dim),
-                        dtype=self.store_dtype,
-                        device=device,
-                    )
-                    for _ in range(layer_num)
-                ]
+        self._create_buffers()
 
         # Calculate data pointers and strides for all buffers
         all_buffers = []
@@ -124,7 +93,7 @@ class MLATokenToKVPool(BaseTokenToKVPool):
                 all_buffers.extend(layer_buffers)
         else:
             # kv_buffer is a list of single tensors
-            all_buffers = self.kv_buffer
+            all_buffers = [buffer for buffer in self.kv_buffer if buffer is not None]
 
         self.data_ptrs = torch.tensor(
             [buf.data_ptr() for buf in all_buffers],
@@ -147,6 +116,43 @@ class MLATokenToKVPool(BaseTokenToKVPool):
             self._init_kv_copy_and_warmup()
         else:
             self._kv_copy_config = None
+
+        self.paged_cache_group_specs = ()
+        self.paged_cache_group_page_counts = {}
+
+    def _create_buffers(self) -> None:
+        with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
+            # The padded page 0 is used for writing dummy outputs from padded tokens.
+            if self.quant_method == "per_token_head":
+                self.kv_buffer = [
+                    (
+                        torch.zeros(
+                            (self.size + self.page_size, 1, self.kv_lora_rank),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        ),
+                        torch.zeros(
+                            (self.size + self.page_size, 1, 1),
+                            dtype=torch.float32,
+                            device=self.device,
+                        ),
+                        torch.zeros(
+                            (self.size + self.page_size, 1, self.qk_rope_head_dim),
+                            dtype=self.model_dtype,
+                            device=self.device,
+                        ),
+                    )
+                    for _ in range(self.layer_num)
+                ]
+            else:
+                self.kv_buffer = [
+                    torch.zeros(
+                        (self.size + self.page_size, 1, self.kv_cache_dim),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
 
     def _get_page_size_bytes(self):
         if self.quant_method == "per_token_head":
@@ -222,6 +228,8 @@ class MLATokenToKVPool(BaseTokenToKVPool):
             else:
                 # kv_buffer is a list of single tensors
                 for buf in self.kv_buffer:
+                    if buf is None:
+                        continue
                     buf[tgt_loc_flat] = buf[src_loc_flat]
         else:
             grid = (self.data_ptrs.numel(), self._kv_copy_config["byte_tiles"])
@@ -282,22 +290,28 @@ class MLATokenToKVPool(BaseTokenToKVPool):
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id)
+        buffer = self.kv_buffer[layer_id]
+        if buffer is None:
+            raise ValueError(f"layer {layer_id} is a KDA state layer")
         if self.quant_method == "per_token_head":
-            return self.kv_buffer[layer_id]
+            return buffer
         elif self.store_dtype != self.dtype:
-            return self.kv_buffer[layer_id].view(self.dtype)
+            return buffer.view(self.dtype)
         else:
-            return self.kv_buffer[layer_id]
+            return buffer
 
     def get_value_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id)
+        buffer = self.kv_buffer[layer_id]
+        if buffer is None:
+            raise ValueError(f"layer {layer_id} is a KDA state layer")
         if self.quant_method == "per_token_head":
-            return self.kv_buffer[layer_id][:2]
+            return buffer[:2]
         elif self.store_dtype != self.dtype:
-            return self.kv_buffer[layer_id][..., : self.kv_lora_rank].view(self.dtype)
+            return buffer[..., : self.kv_lora_rank].view(self.dtype)
         else:
-            return self.kv_buffer[layer_id][..., : self.kv_lora_rank]
+            return buffer[..., : self.kv_lora_rank]
 
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)

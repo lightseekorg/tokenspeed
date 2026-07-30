@@ -35,7 +35,6 @@ server:
     --speculative-num-steps 3
     --drafter-attention-backend tokenspeed_mla
     --enable-cache-report
-    --weight-loader-prefetch-checkpoints
     --engine-startup-timeout 2400
     --host 127.0.0.1
     --port 8000

@@ -64,11 +64,12 @@ def _kda_prepare_gate_beta_kernel(
         other=0.0,
     ).to(tl.float32)
     x += bias
-    softplus = tl.maximum(x, 0.0) + tl.log(1.0 + tl.exp(-tl.abs(x)))
     a = tl.load(a_log + head_idx).to(tl.float32)
-    g = -tl.exp(a) * softplus
     if HAS_LOWER_BOUND:
-        g = tl.maximum(g, LOWER_BOUND)
+        g = LOWER_BOUND * tl.sigmoid(tl.exp(a) * x)
+    else:
+        softplus = tl.maximum(x, 0.0) + tl.log(1.0 + tl.exp(-tl.abs(x)))
+        g = -tl.exp(a) * softplus
     tl.store(gate + linear, g, mask=mask)
 
     raw_b = tl.load(raw_beta + token_idx * H + head_idx).to(tl.float32)
@@ -411,10 +412,14 @@ def _kda_recurrent_decode_kernel(
     gate_value += tl.load(
         dt_bias + head_idx * K + key_offsets, mask=key_mask, other=0.0
     ).to(tl.float32)
-    softplus = tl.maximum(gate_value, 0.0) + tl.log(1.0 + tl.exp(-tl.abs(gate_value)))
-    log_decay = -tl.exp(tl.load(a_log + head_idx).to(tl.float32)) * softplus
+    a = tl.load(a_log + head_idx).to(tl.float32)
     if HAS_LOWER_BOUND:
-        log_decay = tl.maximum(log_decay, LOWER_BOUND)
+        log_decay = LOWER_BOUND * tl.sigmoid(tl.exp(a) * gate_value)
+    else:
+        softplus = tl.maximum(gate_value, 0.0) + tl.log(
+            1.0 + tl.exp(-tl.abs(gate_value))
+        )
+        log_decay = -tl.exp(a) * softplus
     beta_value = tl.sigmoid(tl.load(raw_beta + token_idx * H + head_idx).to(tl.float32))
 
     scale: tl.constexpr = K**-0.5

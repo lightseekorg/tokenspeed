@@ -31,6 +31,9 @@ from tokenspeed_kernel.ops.sampling.cute_dsl import (
     create_dist_argmax_state,
     distributed_argmax,
 )
+from tokenspeed_kernel.ops.sampling.cute_dsl import (
+    is_available as dist_argmax_available,
+)
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
@@ -326,6 +329,11 @@ class LogitsProcessor(nn.Module):
 
     def _init_dist_argmax_state(self, lm_head: VocabParallelEmbedding):
         if not current_platform().is_nvidia or _force_deterministic_rsag():
+            return None
+
+        # CuTe DSL argmax is unavailable on some SKUs (e.g. H20 lacks TMA
+        # cluster launch). Fall back to the plain all-gather + argmax path.
+        if not dist_argmax_available():
             return None
 
         if (

@@ -195,11 +195,11 @@ def profile_cache_budget(
     world_group=None,
     draft_attn_config: BaseAttnConfig | None = None,
     draft_num_attention_layers: int | None = None,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     """Profile GPU memory and split between KV pages and mamba chunks.
 
     Returns:
-        (kv_max_num_pages, mamba_pool_total_chunks)
+        (kv_max_num_pages, mamba_pool_total_chunks, total_cache_memory_bytes)
     """
     total_cache_memory = profile_available_cache_memory_bytes(
         attn_config,
@@ -220,4 +220,4 @@ def profile_cache_budget(
     kv_max_num_pages = int(kv_memory // kv_cell_size)
     mamba_pool_total_chunks = max(int(mamba_memory // mamba_memory_per_chunk), 2)
 
-    return kv_max_num_pages, mamba_pool_total_chunks
+    return kv_max_num_pages, mamba_pool_total_chunks, total_cache_memory
