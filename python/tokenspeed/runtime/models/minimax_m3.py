@@ -72,6 +72,7 @@ from tokenspeed.runtime.layers.parameter import (
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
+from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.base import BaseCausalLM, BaseTransformerModel
 from tokenspeed.runtime.models.base.comm_ops import FinalNormOp
@@ -701,8 +702,9 @@ class MiniMaxM3Attention(nn.Module):
             self.q_norm.gemma_weight,
             self.k_norm.gemma_weight,
             self.q_norm.variance_epsilon,
+            enable_pdl=pdl_enabled(),
         )
-        q, k = self.rotary_emb(positions, q, k)
+        q, k = self.rotary_emb(positions, q, k, enable_pdl=pdl_enabled())
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
@@ -860,6 +862,13 @@ class MiniMaxM3Model(BaseTransformerModel):
     """MiniMax-M3 decoder-only text backbone."""
 
     layer_cls = MiniMaxM3DecoderLayer
+
+    def resolve_embed(self, config: MiniMaxM3VLTextConfig, prefix: str) -> nn.Module:
+        return VocabParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            prefix=add_prefix("embed_tokens", prefix),
+        )
 
     def resolve_layers(
         self,

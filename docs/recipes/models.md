@@ -89,7 +89,6 @@ tokenspeed serve nvidia/MiniMax-M3-NVFP4 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
     --drafter-attention-backend fa4 \
-    --disable-prefill-graph \
     --disable-kvstore \
     --block-size 128 \
     --trust-remote-code \
