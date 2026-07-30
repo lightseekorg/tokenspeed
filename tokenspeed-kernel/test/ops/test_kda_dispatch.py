@@ -1,4 +1,4 @@
-"""CUDA-graph padding coverage for the KDA recurrent kernel."""
+"""KDA prefill and decode dispatch coverage."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ from tokenspeed_kernel.ops.attention import (
     _attention_format_signature,
     kda_paged_decode,
     kda_paged_prefill,
-    kda_recurrent,
 )
 from tokenspeed_kernel.ops.attention.triton.kda_dispatch import (
     triton_kda_paged_decode,
@@ -39,121 +38,57 @@ def test_k3_safe_gate_reference_matches_sigmoid_contract() -> None:
     assert not torch.allclose(actual, legacy)
 
 
-def test_kda_recurrent_matches_safe_gate_reference() -> None:
-    """Packed recurrence must use K3's safe sigmoid decay gate."""
+def test_portable_kda_decode_matches_safe_gate_reference() -> None:
+    """The retained portable decode must implement K3's safe sigmoid gate."""
     device = "cuda"
     torch.manual_seed(5)
     tokens, heads, dim = 3, 2, 8
-    q = torch.randn(tokens, heads, dim, device=device, dtype=torch.bfloat16)
+    q = torch.randn(1, tokens, heads, dim, device=device, dtype=torch.bfloat16)
     k = torch.randn_like(q)
     v = torch.randn_like(q)
     raw_g = torch.randn_like(q)
-    beta = torch.randn(tokens, heads, device=device, dtype=torch.bfloat16)
-    state = torch.randn(1, heads, dim, dim, device=device, dtype=torch.float32)
+    beta = torch.randn(1, tokens, heads, device=device, dtype=torch.bfloat16)
+    state_pool = torch.randn(2, heads, dim, dim, device=device, dtype=torch.float32)
+    initial_state = state_pool[0].transpose(-1, -2).contiguous()
     a_log = torch.randn(heads, device=device, dtype=torch.float32)
     dt_bias = torch.randn(heads, dim, device=device, dtype=torch.float32)
     lower_bound = -5.0
 
     expected_out, expected_state = reference_kda_recurrent(
-        q,
-        k,
-        v,
-        raw_g,
-        beta,
-        state[0],
+        q[0],
+        k[0],
+        v[0],
+        raw_g[0],
+        beta[0],
+        initial_state,
         a_log,
         dt_bias,
         lower_bound=lower_bound,
     )
-    actual_out, actual_state = kda_recurrent(
+    actual_out = triton_kda_paged_decode(
         q,
         k,
         v,
         raw_g,
         beta,
-        state,
         a_log,
         dt_bias,
-        lower_bound=lower_bound,
+        state_pool=state_pool,
+        read_indices=torch.tensor([0], device=device, dtype=torch.int32),
+        write_indices=torch.tensor([1], device=device, dtype=torch.int32),
         cu_seqlens=torch.tensor([0, tokens], device=device, dtype=torch.int32),
-        state_indices=torch.tensor([0], device=device, dtype=torch.int32),
+        lower_bound=lower_bound,
     )
 
     torch.testing.assert_close(
-        actual_out.float(), expected_out.float(), atol=5e-2, rtol=5e-2
+        actual_out[0].float(), expected_out.float(), atol=5e-2, rtol=5e-2
     )
-    torch.testing.assert_close(actual_state[0], expected_state, atol=5e-2, rtol=5e-2)
-
-
-def test_kda_recurrent_zeroes_invalid_and_empty_graph_rows() -> None:
-    """Invalid capture rows and trailing replay padding must be defined zeros."""
-
-    device = "cuda"
-    torch.manual_seed(7)
-    tokens, heads, key_dim, value_dim = 4, 2, 8, 8
-    q = torch.randn(tokens, heads, key_dim, device=device, dtype=torch.bfloat16)
-    k = torch.randn_like(q)
-    v = torch.randn(tokens, heads, value_dim, device=device, dtype=torch.bfloat16)
-    raw_g = torch.randn_like(q)
-    beta = torch.randn(tokens, heads, device=device, dtype=torch.bfloat16)
-    state = torch.randn(
-        tokens,
-        heads,
-        value_dim,
-        key_dim,
-        device=device,
-        dtype=torch.float32,
+    torch.testing.assert_close(
+        state_pool[1].transpose(-1, -2),
+        expected_state,
+        atol=5e-2,
+        rtol=5e-2,
     )
-    a_log = torch.randn(heads, device=device, dtype=torch.float32)
-    dt_bias = torch.randn(heads, key_dim, device=device, dtype=torch.float32)
-
-    # Capture uses one physical token per row but no live state slots.
-    cu_seqlens = torch.arange(tokens + 1, device=device, dtype=torch.int32)
-    state_indices = torch.full((tokens,), -1, device=device, dtype=torch.int32)
-
-    # Compile before entering capture.
-    kda_recurrent(
-        q,
-        k,
-        v,
-        raw_g,
-        beta,
-        state,
-        a_log,
-        dt_bias,
-        cu_seqlens=cu_seqlens,
-        state_indices=state_indices,
-    )
-    torch.cuda.synchronize()
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        output, _ = kda_recurrent(
-            q,
-            k,
-            v,
-            raw_g,
-            beta,
-            state,
-            a_log,
-            dt_bias,
-            cu_seqlens=cu_seqlens,
-            state_indices=state_indices,
-        )
-    graph.replay()
-    torch.cuda.synchronize()
-    torch.testing.assert_close(output, torch.zeros_like(output))
-
-    # Replay one live row plus multiple trailing empty padded rows. The live row
-    # is computed normally; no physical padded row may retain allocator data.
-    cu_seqlens.copy_(torch.tensor([0, 1, 1, 1, 1], device=device, dtype=torch.int32))
-    state_indices.copy_(torch.tensor([0, -1, -1, -1], device=device, dtype=torch.int32))
-    graph.replay()
-    torch.cuda.synchronize()
-
-    assert torch.isfinite(output[0]).all()
-    assert torch.count_nonzero(output[0]) > 0
-    torch.testing.assert_close(output[1:], torch.zeros_like(output[1:]))
 
 
 def test_kda_paged_decode_defaults_to_specialized_kernel_on_amd() -> None:

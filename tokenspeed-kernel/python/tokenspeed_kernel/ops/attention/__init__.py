@@ -38,13 +38,6 @@ from tokenspeed_kernel.ops.attention.gdn_utils import (
     GdnChunkPrefillResult,
 )
 from tokenspeed_kernel.ops.attention.kda_utils import KdaPrefillResult
-from tokenspeed_kernel.ops.attention.triton.kda import (
-    kda_recurrent,
-    kda_state_scatter,
-)
-from tokenspeed_kernel.ops.attention.triton.kda_chunk import (
-    kda_chunk_prefill,
-)
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry, Priority
@@ -120,10 +113,6 @@ __all__ = [
     "gdn_chunk_prefill",
     "gdn_decode_step",
     "gdn_decode_mtp",
-    "kda_recurrent",
-    "kda_recurrent_decode",
-    "kda_chunk_prefill",
-    "kda_state_scatter",
     "kda_paged_prefill",
     "kda_paged_decode",
     "try_kda_fused_paged_decode",
