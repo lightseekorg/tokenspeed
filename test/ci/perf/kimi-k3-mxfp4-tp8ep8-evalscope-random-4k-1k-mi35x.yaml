@@ -28,6 +28,7 @@ server:
     --max-num-seqs 1
     --max-cudagraph-capture-size 1
     --cudagraph-capture-sizes 1
+    --disable-prefill-graph
     --gpu-memory-utilization 0.92
     --trust-remote-code
     --sampling-backend greedy
