@@ -90,6 +90,8 @@ class ServerArgs:
     chunked_prefill_size: int | None = None
     max_prefill_tokens: int = 8192
     enable_mixed_batch: bool = False
+    # Kernel page size. Flat scheduler logical pages come from the LCM
+    # runtime contract and must not overwrite this value.
     block_size: int = 64
     # special kv cache
     mamba_ssm_dtype: str = "float32"
@@ -949,6 +951,7 @@ class ServerArgs:
             metavar="BLOCK_SIZE",
             type=int,
             default=ServerArgs.block_size,
+            help="Kernel cache page size in tokens.",
         )
 
         # KVStore
