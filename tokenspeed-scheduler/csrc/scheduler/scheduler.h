@@ -85,15 +85,13 @@ public:
                                                           const std::string& group_id) const;
     // Compact-view base logical-page offset; 0 for full-history / unseen.
     std::int32_t GetRequestPagedCacheBaseLogicalPage(const std::string& request_id, const std::string& group_id) const;
-    // True while an external Flat-PD transfer may still read/write this
-    // request's pages. Intended for diagnostics and lifecycle tests.
     bool FlatPdTransferPinned(const std::string& request_id) const;
 #if TOKENSPEED_FLAT_KVCACHE
-    // Free pages in the flat shared BlockPool; int32 twin of AvailableKvPages() for C++ tests.
-    std::int32_t FlatPoolFreeBlocks() const { return block_pool_.NumFreeBlocks(); }
-    std::int32_t FlatHostPoolCachedBlocks() const { return flat_host_pool_.NumCachedBlocks(); }
-    std::int32_t FlatHostPoolFreeBlocks() const { return flat_host_pool_.NumFreeBlocks(); }
-    std::int32_t FlatHostPoolPinnedBlocks() const { return flat_host_pool_.NumPinnedCachedBlocks(); }
+    // Empty or fully evictable LCM parents; capacity metrics remain approximate for K_g > 1.
+    std::int32_t FlatPoolFreeBlocks() const { return coordinator_.NumAvailableLcmBlocks(); }
+    std::int32_t FlatHostPoolCachedBlocks() const { return coordinator_.NumHostCachedBlocks(); }
+    std::int32_t FlatHostPoolFreeBlocks() const { return flat_host_pool_.NumEmptyLcmBlocks(); }
+    std::int32_t FlatHostPoolPinnedBlocks() const { return coordinator_.NumPinnedHostCachedBlocks(); }
 #endif
 
 private:
@@ -132,28 +130,19 @@ private:
     std::optional<fsm::ScheduleRetractEvent> scheduleRetract(Request* request);
 
 #if TOKENSPEED_FLAT_KVCACHE
-    // One hash pass at admission: non-owning device/host probes plus the hashes
-    // retained for acquisition after every admission check succeeds.
+    // One hash pass before scheduling: non-owning device/host probes plus the
+    // hashes retained for Admit after every non-Flat gate succeeds.
     struct FlatAdmissionMatch {
-        KvCacheCoordinator::AdmissionProbe probe;
-        std::vector<std::string> hashes;
+        KvCacheCoordinator::PrefixProbe probe;
         std::vector<std::string> ext_hashes;
+        std::vector<std::string> page_hashes;
     };
     FlatAdmissionMatch matchFlatPrefixAtAdmission(Request* request);
-    std::optional<std::int32_t> flatAdmitFirstChunk(Request* request, std::int32_t device_free_hit_blocks,
-                                                    std::int32_t ext_real_pages, std::int32_t chunk_tokens,
-                                                    std::int32_t decode_reserve_tokens) const;
-    std::optional<std::int32_t> flatAdmitPrefillChunk(Request* request, std::int32_t chunk_tokens,
-                                                      std::int32_t decode_reserve_tokens,
-                                                      std::int32_t num_computed_tokens) const;
-    bool flatAdmitDecode(Request* request) const;
-    std::int32_t flatFirstChunkRequiredCapacity(Request* request, const KvCacheCoordinator::CoordinatorProbe& hit,
-                                                std::int32_t ext_real_pages, std::int32_t chunk_tokens,
-                                                std::int32_t decode_reserve_tokens) const;
-    std::int32_t flatStepRequiredCapacity(Request* request, std::int32_t chunk_tokens,
-                                          std::int32_t decode_reserve_tokens, std::int32_t num_computed_tokens) const;
-    void flatTerminalizeOom(Request* request, FlatTerminalReason reason, std::int32_t required_pages,
-                            const std::string& message);
+    std::optional<KvCacheCoordinator::AdmissionResult> flatAdmit(
+        KvCacheCoordinator::PrefixProbe&& prefix, std::span<const GroupDemand> demands,
+        std::optional<std::uint64_t> request_access_epoch = std::nullopt);
+    std::optional<KvCacheCoordinator::AdmissionResult> flatAdmit(std::span<const GroupDemand> demands,
+                                                                 std::uint64_t request_access_epoch);
     bool flatPoolWedged(const std::vector<Request*>& candidates) const;
     void resolveFlatStarvation(const std::vector<Request*>& candidates, bool made_progress);
 #endif
@@ -212,38 +201,34 @@ private:
 
 #if TOKENSPEED_FLAT_KVCACHE
     // Lifetime anchor: these pools are declared before every member that may
-    // hold BlockRef, so reverse member destruction releases all handles first.
+    // hold CacheBlockRef, so reverse member destruction releases all handles first.
     BlockPool block_pool_;
     // Host tier = a second BlockPool, isomorphic to the device pool (block 0 is the null
     // placeholder there too); the two differ only in which memory the ids index.
     BlockPool flat_host_pool_;
     KvCacheCoordinator coordinator_;
     std::vector<std::string> flat_group_ids_;  // group_id per cache group, index-aligned to coordinator groups
+    // Fresh child pages accumulated while building the current execution plan.
+    std::map<std::string, std::vector<std::int32_t>> new_flat_page_ids_;
     // ExtendResults the executor still owes per request (erased on Finish/Abort/PD-success); non-empty means
     // an in-flight forward can still free pool pages, which flatPoolWedged keys off.
     std::unordered_map<std::string, std::int32_t> pending_forward_results_;
-    // Requests with an active P->D transfer stay out of OOM/retract selection.
-    // The normal success, failure, finish, and abort paths clear the pin.
+    // Requests with an active P->D transfer must retain their cache blocks.
     std::unordered_set<std::string> flat_pd_transfer_pins_;
-    // Reserve ledger: decode pages promised at admission but Acquired only at PrefillDone->Decoding; until
-    // then they sit in the free count, so every flat gate subtracts OTHER requests' entries.
-    std::unordered_map<std::string, std::int32_t> flat_reserved_pages_;
-    // Conservative P-side completion reservation. It prevents multiple
-    // transfer-pinned prefills from collectively consuming a pool in which no
-    // request can finish. Erased once that request reaches PrefillDone.
-    std::unordered_map<std::string, std::int32_t> flat_pd_completion_reserved_pages_;
+    // Set only when exact LCM placement rejects an otherwise schedulable request
+    // in the current round. Starvation recovery must not react to unrelated gates.
+    bool flat_no_lcm_placement_{false};
     // Flat retract requires TWO consecutive starved rounds (an in-flight Finish fakes one)
     // before releasing a victim; see resolveFlatStarvation.
     std::int32_t flat_starved_rounds_{0};
     // Requests terminalized as flat OOM (pool wedged by unretractable mid-prefill holders, no
     // retract victim); drained into the plan being built for the client layer to fail them.
     std::vector<std::string> flat_oom_request_ids_;
-    std::vector<FlatTerminalError> flat_terminal_errors_;
 
     struct FlatStoreTicket {
-        std::string key;
-        BlockRef device_block;  // source page, pinned under the D2H copy
-        BlockRef host_block;    // destination page, unhashed until WriteBackDone publishes it
+        CacheKey key;
+        CacheBlockRef device_block_ref;  // source page, pinned under the D2H copy
+        CacheBlockRef host_block_ref;    // destination page, unhashed until WriteBackDone publishes it
     };
     // In-flight D2H stores. The host pool is transaction-blind like the device pool, so the
     // key-dedupe index lives here, paired with the op ledger: Add/Retire are the only mutation
@@ -251,8 +236,8 @@ private:
     class FlatStoreLedger {
     public:
         void Add(cache_op_id id, std::vector<FlatStoreTicket> tickets) {
-            for (const FlatStoreTicket& t : tickets) {
-                keys_.insert(t.key);
+            for (const FlatStoreTicket& ticket : tickets) {
+                keys_.insert(ticket.key);
             }
             const bool inserted = ops_.emplace(id, std::move(tickets)).second;
             _assert(inserted, "duplicate flat store op id");
@@ -263,50 +248,30 @@ private:
             if (it == ops_.end()) {
                 return {};
             }
-            for (const FlatStoreTicket& t : it->second) {
-                keys_.erase(t.key);
+            for (const FlatStoreTicket& ticket : it->second) {
+                keys_.erase(ticket.key);
             }
             std::vector<FlatStoreTicket> tickets = std::move(it->second);
             ops_.erase(it);
             return tickets;
         }
-        bool InFlight(const std::string& key) const { return keys_.contains(key); }
+        bool InFlight(const CacheKey& key) const { return keys_.contains(key); }
         bool Empty() const { return ops_.empty(); }
 
     private:
         std::unordered_map<cache_op_id, std::vector<FlatStoreTicket>> ops_;
-        std::unordered_set<std::string> keys_;
+        std::unordered_set<CacheKey, CacheKeyHash> keys_;
     };
     FlatStoreLedger flat_store_ops_;
 
     struct FlatLoadTicket {
-        std::vector<BlockRef> host_pins;
-        std::vector<BlockRef> device_blocks;
+        std::vector<CacheBlockRef> host_pins;
+        std::vector<CacheBlockRef> device_blocks;
     };
     // In-flight H2D loads: op_id -> the pinned source host pages plus the pinned destination
     // device pages (a freed destination must not be recycled under the copy); LoadBackDone drops both.
     std::unordered_map<cache_op_id, FlatLoadTicket> flat_load_ops_;
 
-    // Sum excluding request_id: a request consuming its own reservation must not be gated by it.
-    std::int32_t flatReservedPagesExcept(const std::string& request_id) const {
-        std::int32_t total = 0;
-        for (const auto& [id, pages] : flat_reserved_pages_) {
-            if (id != request_id) {
-                total += pages;
-            }
-        }
-        for (const auto& [id, pages] : flat_pd_completion_reserved_pages_) {
-            if (id != request_id) {
-                total += pages;
-            }
-        }
-        return total;
-    }
-
-    // Pool budget the flat gates charge against: free blocks minus other requests' decode reservations.
-    std::int32_t flatFreeBudget(const std::string& request_id) const {
-        return block_pool_.NumFreeBlocks() - flatReservedPagesExcept(request_id);
-    }
 #endif
 
 private:

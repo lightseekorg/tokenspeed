@@ -107,8 +107,7 @@ def _stub_contract(*, block_size: int, usable_pages: int):
     )
     return FlatPagedCacheRuntimeContract(
         block_size=block_size,
-        usable_pages=usable_pages,
-        num_device_pages_with_null=usable_pages + 1,
+        num_lcm_blocks=usable_pages,
         token_capacity=usable_pages * block_size,
         group_specs=specs,
         group_page_counts={spec.group_id: usable_pages + 1 for spec in specs},
@@ -121,7 +120,7 @@ class _StubContractPool:
 
     def __init__(self, contract, device, conv_dim, width, num_heads, head_dim):
         self.runtime_contract = contract
-        num_pages = contract.num_device_pages_with_null
+        num_pages = contract.group_page_counts[_STATE_GROUPS[0]]
         self._groups = {i: _STATE_GROUPS[i] for i in range(3)}
         self._components = {
             layer_id: {
@@ -777,7 +776,7 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
 def test_kda_real_flat_pool_component_views_end_to_end(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The REAL FlatHybridCachePool's page-strided component views flow
+    """The real LCM pool's page-strided component views flow
     through the conv + KDA kernels: prefill + decodes on one KDA layer of
     each of the three groups, vs naive + FLA."""
     pool = _make_kimi_pool("cuda", usable_pages=4)

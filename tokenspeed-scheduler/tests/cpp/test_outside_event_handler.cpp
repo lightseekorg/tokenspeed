@@ -199,4 +199,144 @@ TEST_F(DisaggDecodeAdmissionTestSuite, ReservesWholeDestinationAndSurvivesRemote
 #endif
 }
 
+#if TOKENSPEED_FLAT_KVCACHE
+class FlatPdSparseDecodeAdmissionTestSuite : public DisaggDecodeAdmissionTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = DisaggDecodeAdmissionTestSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 6;  // null parent + five usable LCM parents
+        cfg.max_scheduled_tokens = 8;
+        cfg.enable_flatkv_pd = true;
+        cfg.disable_prefix_cache = false;
+
+        PagedCacheGroupConfig full = cfg.paged_cache_groups.front();
+        full.group_id = "full";
+        full.total_pages = 11;
+        full.cache_blocks_per_lcm_block = 2;
+        full.transfer_policy = PagedCacheTransferPolicy::FullSuffix;
+
+        PagedCacheGroupConfig state = full;
+        state.group_id = "state";
+        state.total_pages = 6;
+        state.cache_blocks_per_lcm_block = 1;
+        state.family = PagedCacheGroupFamily::State;
+        state.transfer_policy = PagedCacheTransferPolicy::LatestSnapshot;
+        cfg.paged_cache_groups = {full, state};
+        return cfg;
+    }
+};
+
+class FlatPdSparseDecodeNoPrefixCacheTestSuite : public FlatPdSparseDecodeAdmissionTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = FlatPdSparseDecodeAdmissionTestSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 8;
+        cfg.paged_cache_groups[0].total_pages = 15;
+        cfg.paged_cache_groups[1].total_pages = 8;
+        cfg.disable_prefix_cache = true;
+        return cfg;
+    }
+};
+
+TEST_F(FlatPdSparseDecodeAdmissionTestSuite, MaterializesHistoryAndLatestStateSnapshotAtomically) {
+    Submit({MakeRequestSpec("r0", /*num_pages=*/4, /*start=*/1)});
+    SendBootstrapped("r0");
+
+    const ExecutionPlan plan = PlanOnce();
+    const FlatForwardOperation* destination = GetForwardOp(plan.Operations());
+    ASSERT_NE(destination, nullptr);
+    const auto& full = destination->flat_block_tables.at("full").at(0);
+    ASSERT_EQ(full.size(), 5u);
+    EXPECT_TRUE(std::ranges::all_of(full, [](std::int32_t page_id) { return page_id > 0; }));
+
+    const auto& state = destination->flat_block_tables.at("state").at(0);
+    ASSERT_EQ(state.size(), 5u);
+    EXPECT_EQ(state[0], 0);
+    EXPECT_EQ(state[1], 0);
+    EXPECT_EQ(state[2], 0);
+    EXPECT_GT(state[3], 0);
+    EXPECT_GT(state[4], 0);
+    ASSERT_EQ(plan.flat_pages_to_zero.size(), 2u);
+    EXPECT_EQ(plan.flat_pages_to_zero.at("full"), full);
+    EXPECT_EQ(plan.flat_pages_to_zero.at("state"), (std::vector<std::int32_t>{state[3], state[4]}));
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), 0);
+    EXPECT_TRUE(scheduler_->FlatPdTransferPinned("r0"));
+
+    SendRemotePrefillDone("r0", /*bootstrap_token=*/42);
+    EXPECT_FALSE(scheduler_->FlatPdTransferPinned("r0"));
+    const ExecutionPlan decode_plan = PlanOnce();
+    const FlatForwardOperation* decode = GetForwardOp(decode_plan.Operations());
+    ASSERT_NE(decode, nullptr);
+    EXPECT_EQ(decode->flat_block_tables, destination->flat_block_tables);
+
+    ExecutionEvent succeeded;
+    succeeded.With(PDEvent{pd::SucceededEvent{"r0"}});
+    scheduler_->Advance(succeeded);
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), 5);
+}
+
+TEST_F(FlatPdSparseDecodeAdmissionTestSuite, ReusesHistoryPrefixAndLeavesStatePrefixSparse) {
+    Submit({MakeRequestSpec("r0", /*num_pages=*/4, /*start=*/1)});
+    SendBootstrapped("r0");
+    PlanOnce();
+    SendRemotePrefillDone("r0", /*bootstrap_token=*/42);
+    PlanOnce();
+
+    ExecutionEvent succeeded;
+    succeeded.With(PDEvent{pd::SucceededEvent{"r0"}});
+    scheduler_->Advance(succeeded);
+
+    Submit({MakeRequestSpec("r1", /*num_pages=*/4, /*start=*/1)});
+    SendBootstrapped("r1");
+    const ExecutionPlan plan = PlanOnce();
+    const FlatForwardOperation* destination = GetForwardOp(plan.Operations());
+    ASSERT_NE(destination, nullptr);
+    EXPECT_EQ(destination->input_lengths, (std::vector<std::int32_t>{2}));
+
+    const auto& full = destination->flat_block_tables.at("full").at(0);
+    ASSERT_EQ(full.size(), 5u);
+    EXPECT_TRUE(std::ranges::all_of(full, [](std::int32_t page_id) { return page_id > 0; }));
+
+    const auto& state = destination->flat_block_tables.at("state").at(0);
+    ASSERT_EQ(state.size(), 5u);
+    EXPECT_EQ(state[0], 0);
+    EXPECT_EQ(state[1], 0);
+    EXPECT_EQ(state[2], 0);
+    EXPECT_GT(state[3], 0);
+    EXPECT_GT(state[4], 0);
+}
+
+TEST_F(FlatPdSparseDecodeNoPrefixCacheTestSuite, RemoteBootstrapConsumesSparseTailBeforeNextDecode) {
+    Submit({MakeRequestSpec("r0", /*num_pages=*/4, /*start=*/1)});
+    SendBootstrapped("r0");
+    PlanOnce();
+    SendRemotePrefillDone("r0", /*bootstrap_token=*/42);
+
+    const ExecutionPlan first_decode = PlanOnce();
+    const FlatForwardOperation* first = GetForwardOp(first_decode.Operations());
+    ASSERT_NE(first, nullptr);
+    ASSERT_EQ(first->request_ids, (std::vector<std::string>{"r0"}));
+    ASSERT_EQ(first->flat_block_tables.count("state"), 1u);
+    EXPECT_EQ(first->flat_block_tables.at("state").at(0).size(), 5u);
+
+    SendForwardDone("r0", {43});
+    const ExecutionPlan second_decode = PlanOnce();
+    const FlatForwardOperation* second = GetForwardOp(second_decode.Operations());
+    ASSERT_NE(second, nullptr);
+    ASSERT_EQ(second->request_ids, (std::vector<std::string>{"r0"}));
+    ASSERT_EQ(second->flat_block_tables.count("state"), 1u);
+    EXPECT_EQ(second->flat_block_tables.at("state").at(0).size(), 5u);
+
+    SendForwardDone("r0", {44});
+    const ExecutionPlan boundary_decode = PlanOnce();
+    const FlatForwardOperation* boundary = GetForwardOp(boundary_decode.Operations());
+    ASSERT_NE(boundary, nullptr);
+    ASSERT_EQ(boundary->request_ids, (std::vector<std::string>{"r0"}));
+    ASSERT_EQ(boundary->flat_block_tables.count("state"), 1u);
+    const auto& state = boundary->flat_block_tables.at("state").at(0);
+    ASSERT_EQ(state.size(), 6u);
+    EXPECT_GT(state.back(), 0);
+}
+#endif
+
 }  // namespace tokenspeed::test

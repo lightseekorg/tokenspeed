@@ -35,7 +35,7 @@ namespace tokenspeed {
 namespace {
 
 // Release explicitly in reverse; vector destruction order is not our eviction policy.
-void FreeAll(std::vector<BlockRef>&& refs) {
+void FreeAll(std::vector<CacheBlockRef>&& refs) {
     for (auto it = refs.rbegin(); it != refs.rend(); ++it) {
         it->reset();
     }
@@ -99,8 +99,6 @@ void Scheduler::handleEvent(const cache::PrefetchDone& event) {
 void Scheduler::handleEvent(const pd::BootstrappedEvent& event) {
     Request* request = find_request(event.request_id);
     if (request == nullptr || !request->Is<fsm::Bootstrapping>()) {
-        // Missing means the request was already reaped; any other state means
-        // this bootstrap acknowledgement is a duplicate/late delivery.
         return;
     }
     request->Apply(fsm::BootstrappedEvent{});
@@ -116,8 +114,6 @@ void Scheduler::handleEvent(const pd::FailedEvent& event) {
     }
 #if TOKENSPEED_FLAT_KVCACHE
     pending_forward_results_.erase(event.request_id);
-    flat_reserved_pages_.erase(event.request_id);
-    flat_pd_completion_reserved_pages_.erase(event.request_id);
     flat_pd_transfer_pins_.erase(event.request_id);
 #endif
     request->Apply(fsm::AbortEvent{
@@ -137,8 +133,6 @@ void Scheduler::handleEvent(const pd::SucceededEvent& event) {
     }
 #if TOKENSPEED_FLAT_KVCACHE
     pending_forward_results_.erase(event.request_id);
-    flat_reserved_pages_.erase(event.request_id);
-    flat_pd_completion_reserved_pages_.erase(event.request_id);
     flat_pd_transfer_pins_.erase(event.request_id);
 #endif
     std::vector<std::string> page_hashes;
@@ -167,14 +161,10 @@ void Scheduler::handleEvent(const pd::RemotePrefillDoneEvent& event) {
         return;
     }
     if (request->Is<fsm::PrefillDone>() || request->Is<fsm::Decoding>() || request->Is<fsm::Finished>()) {
-        // Duplicate completion or a delivery that lost the race with terminal
-        // cleanup. Never re-apply the bootstrap token.
         return;
     }
-    throw std::logic_error(
-        "PD RemotePrefillDoneEvent received before decode "
-        "destination admission; state=" +
-        request->StateName());
+    throw std::logic_error("PD RemotePrefillDoneEvent received before decode destination admission; state=" +
+                           request->StateName());
 }
 
 void Scheduler::handleEvent(const forward::Finish& event) {
@@ -183,8 +173,6 @@ void Scheduler::handleEvent(const forward::Finish& event) {
         throw std::logic_error("FlatKV PD Finish received while transfer pages are pinned");
     }
     pending_forward_results_.erase(event.request_id);
-    flat_reserved_pages_.erase(event.request_id);
-    flat_pd_completion_reserved_pages_.erase(event.request_id);
 #endif
     if (auto req = find_request(event.request_id)) {
         // except_last=true: exclude the tail page, matching FinishEvent's InsertDevice behavior
@@ -238,8 +226,6 @@ void Scheduler::handleEvent(const forward::Abort& event) {
     // prefill-completing admission and the PrefillDone->Decoding transition must
     // not leave a permanent phantom reservation deflating every later gate.
     pending_forward_results_.erase(event.request_id);
-    flat_reserved_pages_.erase(event.request_id);
-    flat_pd_completion_reserved_pages_.erase(event.request_id);
     flat_pd_transfer_pins_.erase(event.request_id);
 #endif
     auto iter = requests_.find(event.request_id);
@@ -261,14 +247,14 @@ void Scheduler::handleEvent(const cache::WriteBackDone& event) {
         // Publish-at-ack: hashing the host block makes it hittable; either way it returns to the
         // host free list (hash-intact = reusable, unhashed = plain recycling). Batched frees in
         // ticket order keep both pools' recycling order deterministic.
-        for (FlatStoreTicket& t : tickets) {
+        for (FlatStoreTicket& ticket : tickets) {
             if (event.success) {
-                flat_host_pool_.CacheFullBlock(t.host_block, t.key);
+                coordinator_.CacheHostBlock(ticket.host_block_ref, ticket.key);
             }
         }
         for (auto it = tickets.rbegin(); it != tickets.rend(); ++it) {
-            it->device_block.reset();
-            it->host_block.reset();
+            it->device_block_ref.reset();
+            it->host_block_ref.reset();
         }
         return;
     }

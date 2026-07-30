@@ -62,9 +62,13 @@ struct PagedCacheGroupConfig {
     std::int32_t rows_per_page{};
     std::int32_t entry_stride_tokens{};
     std::int32_t total_pages{};
-    // Per-group page granularity in tokens; 0 = unset, falls back to the global
-    // SchedulerConfig::block_size.
+    // Legacy serialization field. Flat prefix-cache configurations may leave
+    // it unset or set it equal to SchedulerConfig::block_size, but may not use
+    // it to define a different logical prefix granularity.
     std::int32_t block_size{0};
+    // Fixed-byte placement recipe: how many logical CacheBlocks from this
+    // group fit in one physical LCM block.
+    std::int32_t cache_blocks_per_lcm_block{1};
     Retention retention{Retention::FullHistory};
     std::optional<std::int32_t> sliding_window_tokens{};
     // History groups form a chain; State groups only need the trailing window.

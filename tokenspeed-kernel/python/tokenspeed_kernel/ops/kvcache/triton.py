@@ -52,8 +52,60 @@ __all__ = [
     "transfer_kv_all_layer_mla",
     "transfer_kv_per_layer",
     "transfer_kv_per_layer_mla",
+    "zero_byte_segments",
     "zero_flat_cache_pages",
 ]
+
+
+# -----------------------------------------------------------------------------
+# Cache Page Initialization
+# -----------------------------------------------------------------------------
+
+
+@triton.jit
+def _zero_byte_segments_kernel(
+    backing_ptr,
+    segments_ptr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    segment_id = tl.program_id(0)
+    byte_offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    segment_offset = tl.load(segments_ptr + segment_id * 2)
+    segment_size = tl.load(segments_ptr + segment_id * 2 + 1)
+    tl.store(
+        backing_ptr + segment_offset + byte_offsets,
+        0,
+        mask=byte_offsets < segment_size,
+    )
+
+
+def zero_byte_segments(backing: torch.Tensor, segments: list[tuple[int, int]]) -> None:
+    """Zero selected byte ranges in one contiguous cache allocation.
+
+    Args:
+        backing: Contiguous uint8 cache allocation.
+        segments: ``(byte_offset, byte_count)`` ranges within ``backing``.
+    """
+    if not segments:
+        return
+    if backing.dtype != torch.uint8 or not backing.is_contiguous():
+        raise ValueError("backing must be a contiguous uint8 tensor")
+    if any(
+        offset < 0 or size <= 0 or offset + size > backing.numel()
+        for offset, size in segments
+    ):
+        raise ValueError("segments must be non-empty ranges within backing")
+
+    segment_table = torch.tensor(segments, dtype=torch.int64, device=backing.device)
+    block_size = 1024
+    max_size = max(size for _, size in segments)
+    grid = (len(segments), triton.cdiv(max_size, block_size))
+    _zero_byte_segments_kernel[grid](
+        backing,
+        segment_table,
+        BLOCK_SIZE=block_size,
+        num_warps=4,
+    )
 
 
 # -----------------------------------------------------------------------------

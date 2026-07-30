@@ -164,6 +164,8 @@ class PoollessFlatMetadataTest(unittest.TestCase):
         stub_pool = SimpleNamespace(
             state_slabs=[(object(), object())],
             paged_cache_group_specs=(SimpleNamespace(group_id="linear_attention"),),
+            _layer_types=("linear_attention",),
+            layer_cache_group_ids=("linear_attention",),
             page_size=self.P,
         )
         # set_pool is intentionally never called: flat mode has no
@@ -187,8 +189,8 @@ class PoollessFlatMetadataTest(unittest.TestCase):
         )
         md = backend.forward_metadata
         # before = 8 -> page slot 1 (row 2); after = 9 -> page slot 2 (row 3).
-        self.assertEqual(md.state_in_pages.tolist(), [2])
-        self.assertEqual(md.state_out_pages.tolist(), [3])
+        self.assertEqual(md.state_in_pages["linear_attention"].tolist(), [2])
+        self.assertEqual(md.state_out_pages["linear_attention"].tolist(), [3])
 
     def test_extend_metadata_without_pool(self):
         torch = self.torch
@@ -204,8 +206,8 @@ class PoollessFlatMetadataTest(unittest.TestCase):
             },
         )
         md = backend.forward_metadata
-        self.assertEqual(md.state_in_pages.tolist(), [0])
-        self.assertEqual(md.state_out_pages.tolist(), [2])
+        self.assertEqual(md.state_in_pages["linear_attention"].tolist(), [0])
+        self.assertEqual(md.state_out_pages["linear_attention"].tolist(), [2])
 
     def test_capture_replay_metadata_without_pool(self):
         torch = self.torch
@@ -220,8 +222,8 @@ class PoollessFlatMetadataTest(unittest.TestCase):
         )
         md = backend.forward_metadata
         # Capture binds the persistent pad-filled buffers.
-        self.assertEqual(md.state_in_pages.tolist(), [-1])
-        self.assertEqual(md.state_out_pages.tolist(), [-1])
+        self.assertEqual(md.state_in_pages["linear_attention"].tolist(), [-1])
+        self.assertEqual(md.state_out_pages["linear_attention"].tolist(), [-1])
 
         backend.init_forward_metadata_replay_cuda_graph(
             bs=1,
@@ -233,8 +235,95 @@ class PoollessFlatMetadataTest(unittest.TestCase):
             },
         )
         md = backend.forward_metadata
-        self.assertEqual(md.state_in_pages.tolist(), [2])
-        self.assertEqual(md.state_out_pages.tolist(), [3])
+        self.assertEqual(md.state_in_pages["linear_attention"].tolist(), [2])
+        self.assertEqual(md.state_out_pages["linear_attention"].tolist(), [3])
+
+
+class LegacyLcmVerifyMetadataTest(unittest.TestCase):
+    """Qwen's LCM pool must use the same verify scratch as a contract pool."""
+
+    def setUp(self):
+        try:
+            import torch
+
+            from tokenspeed.runtime.execution.forward_batch_info import (
+                ForwardMode,
+            )
+            from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (  # noqa: E501
+                MambaAttnBackend,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+        self.torch = torch
+        self.ForwardMode = ForwardMode
+        config = SimpleNamespace(
+            device="cpu",
+            num_attention_heads=2,
+            num_kv_heads=2,
+            attn_tp_size=1,
+            dtype=torch.bfloat16,
+            head_dim=2,
+            is_draft=False,
+            speculative_num_draft_tokens=4,
+        )
+        self.backend = MambaAttnBackend(config)
+        self.state_buffers = {
+            layer_id: (
+                torch.zeros((8, 2, 3), dtype=torch.bfloat16),
+                torch.zeros((8, 1, 2, 2), dtype=torch.float32),
+            )
+            for layer_id in range(2)
+        }
+        stub_pool = SimpleNamespace(
+            state_slabs=tuple(self.state_buffers.values()),
+            paged_cache_group_specs=(
+                SimpleNamespace(group_id="linear_attention_0"),
+                SimpleNamespace(group_id="linear_attention_1"),
+            ),
+            _layer_types=("linear_attention", "linear_attention"),
+            layer_cache_group_ids=(
+                "linear_attention_0",
+                "linear_attention_1",
+            ),
+            page_size=4,
+            get_state_buffers=self.state_buffers.__getitem__,
+        )
+        self.backend.set_kv_pool(stub_pool)
+        self.backend.init_cuda_graph_state(max_num_tokens=2)
+
+    def test_target_verify_uses_per_layer_scratch(self):
+        torch = self.torch
+        self.backend.init_forward_metadata(
+            bs=1,
+            req_pool_indices=torch.tensor([1], dtype=torch.int32),
+            seq_lens=torch.tensor([8], dtype=torch.int32),
+            forward_mode=self.ForwardMode.DECODE,
+            tokens_per_req=4,
+            flat_block_tables={
+                "linear_attention_0": torch.tensor([[3, 4]], dtype=torch.int32),
+                "linear_attention_1": torch.tensor([[5, 6]], dtype=torch.int32),
+            },
+        )
+
+        metadata = self.backend.forward_metadata
+        self.assertEqual(metadata.mamba_output_indices.tolist(), [[1, 2, 3, 4]])
+        self.assertEqual(metadata.mamba_output_indices.dtype, torch.int32)
+        self.assertEqual(
+            metadata.state_in_pages_by_group["linear_attention_0"].tolist(),
+            [3],
+        )
+        self.assertEqual(
+            metadata.state_in_pages_by_group["linear_attention_1"].tolist(),
+            [5],
+        )
+        self.assertEqual(set(self.backend._verify_scratch), {0, 1})
+        for conv_scratch, state_scratch in self.backend._verify_scratch.values():
+            self.assertEqual(conv_scratch.shape[0], 10)
+            self.assertEqual(state_scratch.shape[0], 10)
+        self.assertEqual(
+            self.backend.preallocate_flat_verify_workspace(2, 4),
+            560,
+        )
 
 
 class GDNFlatStatePagingGPUTest(unittest.TestCase):
@@ -267,15 +356,14 @@ class GDNFlatStatePagingGPUTest(unittest.TestCase):
             self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
         if not torch.cuda.is_available():
             self.skipTest("needs a CUDA device")
-        if not gdn.is_available():
-            self.skipTest("sm100 GDN kernel unavailable")
         self.torch = torch
+        self.gdn = gdn
         self.ForwardMode = ForwardMode
         self.MambaAttnBackend = MambaAttnBackend
         self.SimpleMambaPool = SimpleMambaPool
         torch.manual_seed(0)
 
-    def _make_backend(self, conv_slab, ssm_slab):
+    def _make_backend(self, conv_slab, ssm_slab, spec_num_tokens=1):
         torch = self.torch
         config = SimpleNamespace(
             device="cuda",
@@ -285,7 +373,7 @@ class GDNFlatStatePagingGPUTest(unittest.TestCase):
             dtype=torch.bfloat16,
             head_dim=self.D,
             is_draft=False,
-            speculative_num_draft_tokens=1,
+            speculative_num_draft_tokens=spec_num_tokens,
         )
         backend = self.MambaAttnBackend(config)
         conv_dim = conv_slab.shape[1]
@@ -306,6 +394,8 @@ class GDNFlatStatePagingGPUTest(unittest.TestCase):
         stub_pool = SimpleNamespace(
             state_slabs=[(conv_slab, ssm_slab)],
             paged_cache_group_specs=(SimpleNamespace(group_id="linear_attention"),),
+            _layer_types=("linear_attention",),
+            layer_cache_group_ids=("linear_attention",),
             page_size=self.P,
             get_state_buffers=lambda layer_id: (conv_slab, ssm_slab),
         )
@@ -313,7 +403,45 @@ class GDNFlatStatePagingGPUTest(unittest.TestCase):
         self.assertTrue(backend.flat_state_active)
         return backend
 
+    def test_verify_scratch_starts_from_committed_conv_and_ssm_state(self):
+        torch = self.torch
+        conv_dim = 8
+        conv_slab = torch.zeros(
+            7, conv_dim, self.WIDTH - 1, device="cuda", dtype=torch.bfloat16
+        )
+        ssm_slab = torch.zeros(
+            7, self.H, self.D, self.D, device="cuda", dtype=torch.float32
+        )
+        conv_slab[3].fill_(3)
+        conv_slab[5].fill_(5)
+        ssm_slab[3].fill_(3)
+        ssm_slab[5].fill_(5)
+        backend = self._make_backend(conv_slab, ssm_slab, spec_num_tokens=4)
+        backend.init_forward_metadata(
+            bs=2,
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+            seq_lens=torch.tensor([8, 8], dtype=torch.int32, device="cuda"),
+            forward_mode=self.ForwardMode.DECODE,
+            tokens_per_req=4,
+            flat_block_tables={
+                "linear_attention": torch.tensor(
+                    [[3, 4], [5, 6]], dtype=torch.int32, device="cuda"
+                )
+            },
+        )
+
+        backend._seed_verify_scratch_batched(2, 4)
+        conv_scratch, ssm_scratch = backend._verify_scratch[0]
+        torch.cuda.synchronize()
+
+        self.assertTrue(torch.equal(conv_scratch[0], conv_slab[3]))
+        self.assertTrue(torch.equal(conv_scratch[5], conv_slab[5]))
+        self.assertTrue(torch.equal(ssm_scratch[0], ssm_slab[3]))
+        self.assertTrue(torch.equal(ssm_scratch[5], ssm_slab[5]))
+
     def test_flat_paged_states_match_fla_oracle(self):
+        if not self.gdn.is_available():
+            self.skipTest("sm100 GDN kernel unavailable")
         torch = self.torch
         ForwardMode = self.ForwardMode
         from tokenspeed_kernel.ops.attention.triton.linear.chunk import (
@@ -414,8 +542,14 @@ class GDNFlatStatePagingGPUTest(unittest.TestCase):
                 )
             },
         )
-        self.assertEqual(backend.forward_metadata.state_in_pages.tolist(), [0])
-        self.assertEqual(backend.forward_metadata.state_out_pages.tolist(), [2])
+        self.assertEqual(
+            backend.forward_metadata.state_in_pages["linear_attention"].tolist(),
+            [0],
+        )
+        self.assertEqual(
+            backend.forward_metadata.state_out_pages["linear_attention"].tolist(),
+            [2],
+        )
         outputs = [
             backend.forward_extend(
                 None,
@@ -450,11 +584,11 @@ class GDNFlatStatePagingGPUTest(unittest.TestCase):
                 flat_block_tables={"linear_attention": rows},
             )
             self.assertEqual(
-                backend.forward_metadata.state_in_pages.tolist(),
+                backend.forward_metadata.state_in_pages["linear_attention"].tolist(),
                 [expected_pages[i][0]],
             )
             self.assertEqual(
-                backend.forward_metadata.state_out_pages.tolist(),
+                backend.forward_metadata.state_out_pages["linear_attention"].tolist(),
                 [expected_pages[i][1]],
             )
             outputs.append(

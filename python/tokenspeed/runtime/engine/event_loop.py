@@ -208,6 +208,7 @@ class EventLoop:
             self.max_total_num_tokens,
             mamba_pool_total_chunks,
             mamba_pool,
+            self.cache_storage,
         ) = create_attn_components(
             server_args,
             self.model_config,
@@ -409,8 +410,6 @@ class EventLoop:
                 unsupported.append("layerwise cache transfer")
             if server_args.enable_memory_saver:
                 unsupported.append("memory saver/release")
-            if server_args.enable_prefix_caching:
-                unsupported.append("prefix caching/reuse")
             if server_args.enable_kvstore:
                 unsupported.append("KVStore/host cache")
             # Prefill is forced onto the non-overlap loop by
@@ -1689,27 +1688,34 @@ class EventLoop:
         return self.shutdown_event.is_set()
 
     def _flat_page_ids_to_zero(self, execution_plan):
-        """Page ids the scheduler retired for reuse this step.
+        """Group-aware child pages the scheduler assigned in this step.
 
-        A flat-cache pool aliases recurrent-state bytes and fp8 KV in one
-        slab, so a plan that cannot report pages to zero means poisoned KV
-        tails. Fail loudly on that contract mismatch (e.g. a scheduler wheel
-        older than the runtime) instead of silently skipping sanitization.
+        The group is part of the address under two-level placement. Older
+        single-level schedulers expose one global page-id vector instead.
         """
         try:
-            return execution_plan.flat_page_ids_to_zero
+            return execution_plan.flat_pages_to_zero
         except AttributeError:
-            zero_pages = getattr(
-                self.model_executor.token_to_kv_pool, "zero_pages", None
-            )
-            if callable(zero_pages):
+            try:
+                return execution_plan.flat_page_ids_to_zero
+            except AttributeError:
+                pass
+            if getattr(
+                self.model_executor.token_to_kv_pool,
+                "flat_kv_requires_page_zeroing",
+                False,
+            ):
                 raise RuntimeError(
                     "flat KV cache is active but the scheduler's ExecutionPlan "
-                    "has no flat_page_ids_to_zero; the installed "
+                    "has no fresh-page sanitization payload; the installed "
                     "tokenspeed-scheduler build predates page-reuse zeroing — "
                     "rebuild it from this checkout"
                 ) from None
             return ()
+
+    def _flat_pages_to_zero(self, execution_plan):
+        """Descriptive alias for group-aware page-zeroing payloads."""
+        return self._flat_page_ids_to_zero(execution_plan)
 
     def event_loop(self):
         """Non-overlapping scheduler loop."""
@@ -2060,6 +2066,7 @@ def run_event_loop(
                 "max_num_seqs": server_args.max_num_seqs,
                 "chunked_prefill_size": server_args.chunked_prefill_size,
                 "max_model_len": event_loop.model_config.context_len,
+                "cache_storage": getattr(event_loop, "cache_storage", None),
             }
         )
 
