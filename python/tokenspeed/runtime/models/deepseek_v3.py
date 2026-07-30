@@ -712,6 +712,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         out_cache_loc: torch.Tensor,
         accept_lengths: torch.Tensor | None = None,
         seq_lens: torch.Tensor | None = None,
+        gather_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The eager break: KV write + varlen prefill / absorb decode attention.
 

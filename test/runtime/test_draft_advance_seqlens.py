@@ -230,17 +230,15 @@ def test_first_step_correction_reaches_backend(name, correction):
 
     accept_lengths = torch.tensor([2, 1, 4, 3], dtype=torch.int32)
     ctx = SimpleNamespace(
-        draft_seq_lens_buf=draft_seq_lens,
-        accept_lengths=accept_lengths,
         num_extends=0,
         bs=bs,
         attn_backend=be,
     )
-    # Bound methods on the class need an explicit (unused) self.
-    try:
-        correction(ctx)
-    except TypeError:
-        correction(None, ctx)
+    if name == "glm5_nextn":
+        correction(ctx, accept_lengths, draft_seq_lens)
+    else:
+        # Unbound instance methods need an explicit (unused) self.
+        correction(None, ctx, accept_lengths, draft_seq_lens)
 
     expected = torch.tensor([102, 101, 104, 103], dtype=torch.int32)  # vc + a
     assert torch.equal(draft_seq_lens, expected), f"{name}: correction wrong"

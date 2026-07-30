@@ -21,6 +21,7 @@
 """Extensible wrappers for injecting custom input and output processors."""
 
 import importlib
+import inspect
 from typing import Any
 
 from torch import Tensor, nn
@@ -33,6 +34,18 @@ from tokenspeed.runtime.layers.logits_processor import (
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
+
+
+def _forward_accepts_kwarg(module: nn.Module, name: str) -> bool:
+    """Return whether a module forward accepts a named keyword argument."""
+    try:
+        parameters = inspect.signature(module.forward).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
 
 
 # Used for Input/Output Processor sharing
@@ -159,6 +172,9 @@ class ExtensibleLM(nn.Module):
             self.ctx,
             output_processor_config,
         ).eval()
+        self._output_processor_accepts_gather_ids = _forward_accepts_kwarg(
+            self.output_processor, "gather_ids"
+        )
         self.step = 0
 
     @property
@@ -194,8 +210,13 @@ class ExtensibleLM(nn.Module):
         )
 
         # output processor: lm hidden states to logits
-        logits_output: LogitsProcessorOutput = self.output_processor(
-            input_ids, positions, ctx, out_hidden_states, gather_ids=gather_ids
-        )
+        output_args = (input_ids, positions, ctx, out_hidden_states)
+        if self._output_processor_accepts_gather_ids:
+            logits_output: LogitsProcessorOutput = self.output_processor(
+                *output_args, gather_ids=gather_ids
+            )
+        else:
+            # Preserve the four-argument contract for existing custom processors.
+            logits_output = self.output_processor(*output_args)
         self.step += 1
         return logits_output
