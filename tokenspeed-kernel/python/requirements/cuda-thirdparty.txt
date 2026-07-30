@@ -10,7 +10,7 @@ nvidia-cutlass-dsl[cu13]==4.6.0
 quack-kernels>=0.6.1
 tokenspeed-triton-kernels==1.0.0.post20260510
 tokenspeed-trtllm-kernel==1.2.1.post20260427
-tokenspeed-flashkda==0.0.1.post20260526
+tokenspeed-flashkda==0.0.1.post20260728
 # cutedsl-kda and situ ship x86_64 wheels only; skip on arm (K3 KDA falls back
 # to the Triton path). flashkda has an aarch64 wheel and stays unconditional.
 tokenspeed-cutedsl-kda==0.1.0.post20260727; platform_machine == "x86_64"
