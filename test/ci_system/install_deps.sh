@@ -149,9 +149,14 @@ FLASHINFER_PIN="$(grep -E '^flashinfer-python==' "${CUDA_REQ}" | head -n1 | tr -
 FLASHINFER_PIN_VERSION="${FLASHINFER_PIN##*==}"
 if [[ "${FLASHINFER_PIN_VERSION}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.dev([0-9]{8})$ ]]; then
     NIGHTLY_TAG="nightly-v${BASH_REMATCH[1]}-${BASH_REMATCH[2]}"
-    NIGHTLY_WHEEL="$(cache_remote_wheel "https://github.com/flashinfer-ai/flashinfer/releases/download/${NIGHTLY_TAG}/flashinfer_python-${FLASHINFER_PIN_VERSION}-py3-none-any.whl")"
-    echo "Pre-installing nightly FlashInfer Python from GitHub release: ${NIGHTLY_TAG}"
-    pip_install_with_retry pip3 install --break-system-packages --no-deps "${NIGHTLY_WHEEL}"
+    NIGHTLY_BASE="https://github.com/flashinfer-ai/flashinfer/releases/download/${NIGHTLY_TAG}"
+    NIGHTLY_WHEEL="$(cache_remote_wheel "${NIGHTLY_BASE}/flashinfer_python-${FLASHINFER_PIN_VERSION}-py3-none-any.whl")"
+    # flashinfer-cubin must match too: runner images preinstall an older one
+    # and flashinfer's import-time version check refuses the mismatch.
+    NIGHTLY_CUBIN_WHEEL="$(cache_remote_wheel "${NIGHTLY_BASE}/flashinfer_cubin-${FLASHINFER_PIN_VERSION}-py3-none-any.whl")"
+    echo "Pre-installing nightly FlashInfer Python + cubin from GitHub release: ${NIGHTLY_TAG}"
+    pip_install_with_retry pip3 install --break-system-packages --no-deps \
+        "${NIGHTLY_WHEEL}" "${NIGHTLY_CUBIN_WHEEL}"
 fi
 cd ${WORKSPACE}
 export PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cu${CUINDEX}"
