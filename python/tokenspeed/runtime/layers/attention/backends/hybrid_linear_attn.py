@@ -3075,9 +3075,11 @@ class HybridLinearAttnBackend(AttentionBackend):
         # Flat contract pool: the per-position verify states live in the
         # scratch; commit the accepted position back to the state slab.
         commit = getattr(self.linear_attn_backend, "flat_commit_verified_state", None)
-        if commit is not None and getattr(
-            self.linear_attn_backend, "_verify_commit_ctx", None
-        ) is not None:
+        if (
+            commit is not None
+            and getattr(self.linear_attn_backend, "_verify_commit_ctx", None)
+            is not None
+        ):
             commit(accepted_length)
             return
         # mamba_cache_indices are input rows during target-verify. The first
