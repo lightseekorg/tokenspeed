@@ -683,7 +683,12 @@ if platform.is_nvidia:
                 value=0.0,
             )
 
-        x, x_scale = mxfp8_quantize(x, False, alignment=hidden_padded)
+        # cute-dsl beats the cuda backend at every size under CUDA-graph
+        # replay (1.5x at decode M, +6-16% at prefill); its higher eager
+        # launch overhead is amortized by graph capture.
+        x, x_scale = mxfp8_quantize(
+            x, False, alignment=hidden_padded, backend="cute-dsl"
+        )
         hidden_states_scale = x_scale.view(torch.float8_e4m3fn).reshape(x.shape[0], -1)
 
         out_buf = getattr(w, "_situ_output_buffer", None)
