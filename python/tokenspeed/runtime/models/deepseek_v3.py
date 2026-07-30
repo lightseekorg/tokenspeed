@@ -731,14 +731,24 @@ class DeepseekV3AttentionMLA(nn.Module):
                 input_num_tokens=num_prefill_tokens,
                 forward_mode=ForwardMode.EXTEND,
             )
-            self.forward_normal_chunked(
-                positions[:num_prefill_tokens],
-                q[:num_prefill_tokens],
-                latent_cache[:num_prefill_tokens],
-                prefill_ctx,
-                out_cache_loc[:num_prefill_tokens],
-                attn_output[:num_prefill_tokens],
-            )
+            if getattr(ctx.attn_backend, "use_absorbed_extend", False):
+                self.forward_absorb(
+                    positions[:num_prefill_tokens],
+                    q[:num_prefill_tokens],
+                    latent_cache[:num_prefill_tokens],
+                    prefill_ctx,
+                    out_cache_loc[:num_prefill_tokens],
+                    attn_output[:num_prefill_tokens],
+                )
+            else:
+                self.forward_normal_chunked(
+                    positions[:num_prefill_tokens],
+                    q[:num_prefill_tokens],
+                    latent_cache[:num_prefill_tokens],
+                    prefill_ctx,
+                    out_cache_loc[:num_prefill_tokens],
+                    attn_output[:num_prefill_tokens],
+                )
 
         if num_decode_tokens > 0:
             decode_ctx = replace(

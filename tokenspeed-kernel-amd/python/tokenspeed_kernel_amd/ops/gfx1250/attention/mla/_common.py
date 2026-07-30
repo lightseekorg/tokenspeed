@@ -2,7 +2,7 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc.
 # Copyright (c) 2026 LightSeek Foundation
 
-"""Absorbed MLA decode Gluon kernels for AMD GFX1250.
+"""Absorbed MLA decode and cached-extend Gluon kernels for AMD GFX1250.
 
 The device implementation is ported from ROCm/AITER's GFX1250 MLA kernel at
 commit 4a1cc773f34cbfc74387259e51262556ee38edd0, which in turn is adapted from
@@ -3297,4 +3297,144 @@ def gluon_mla_decode_bf16_gfx1250(
     return (out, lse) if return_lse else out
 
 
-__all__ = ["gluon_mla_decode_bf16_gfx1250"]
+def gluon_mla_extend_bf16_gfx1250(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    *,
+    is_causal: bool = True,
+    logit_cap: float = 0.0,
+    return_lse: bool = False,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run absorbed BF16 MLA prefill/extend over paged KV on GFX1250.
+
+    Queries are packed as ``[total_q, heads, 576]``. The compressed cache must
+    already include the current query tokens; causal masking derives each
+    request's prefix length from ``cache_seqlens - query_length``.
+    """
+    del max_seqlen_q, max_seqlen_k, qk_nope_head_dim
+    if not is_causal:
+        raise NotImplementedError(
+            "gluon_mla_extend_bf16_gfx1250 requires causal attention"
+        )
+    if logit_cap != 0.0:
+        raise NotImplementedError(
+            "gluon_mla_extend_bf16_gfx1250 does not support logit_cap"
+        )
+    if return_lse:
+        raise NotImplementedError("gluon_mla_extend_bf16_gfx1250 does not return LSE")
+    if q.ndim != 3:
+        raise ValueError(f"q must be [total_q, num_q_heads, head_dim], got {q.shape}")
+    if q.dtype != torch.bfloat16 or kv_cache.dtype != torch.bfloat16:
+        raise TypeError(
+            "gluon_mla_extend_bf16_gfx1250 requires BF16 q and kv_cache, "
+            f"got {q.dtype} and {kv_cache.dtype}"
+        )
+    if kv_lora_rank != 512 or qk_rope_head_dim != 64:
+        raise NotImplementedError(
+            "gluon_mla_extend_bf16_gfx1250 requires kv_lora_rank=512 and "
+            f"qk_rope_head_dim=64, got {kv_lora_rank} and {qk_rope_head_dim}"
+        )
+
+    qk_head_dim = kv_lora_rank + qk_rope_head_dim
+    if q.shape[-1] != qk_head_dim:
+        raise ValueError(f"q head dimension must be {qk_head_dim}, got {q.shape[-1]}")
+    if kv_cache.ndim != 4 or kv_cache.shape[2:] != (1, qk_head_dim):
+        raise ValueError(
+            f"kv_cache must be [num_pages, page_size, 1, {qk_head_dim}], "
+            f"got {tuple(kv_cache.shape)}"
+        )
+    page_size = kv_cache.shape[1]
+    if page_size != 64:
+        raise NotImplementedError(
+            f"GFX1250 Gluon MLA extend supports page size 64, got {page_size}"
+        )
+    if not kv_cache.is_contiguous():
+        raise ValueError("kv_cache must be contiguous")
+    if page_table.ndim != 2 or page_table.dtype != torch.int32:
+        raise ValueError("page_table must be a rank-2 int32 tensor")
+    if cache_seqlens.ndim != 1 or cache_seqlens.dtype != torch.int32:
+        raise ValueError("cache_seqlens must be a rank-1 int32 tensor")
+    if cu_seqlens_q.ndim != 1 or cu_seqlens_q.dtype != torch.int32:
+        raise ValueError("cu_seqlens_q must be a rank-1 int32 tensor")
+    if cu_seqlens_kv.ndim != 1 or cu_seqlens_kv.dtype != torch.int32:
+        raise ValueError("cu_seqlens_kv must be a rank-1 int32 tensor")
+
+    batch_size = cache_seqlens.shape[0]
+    if page_table.shape[0] != batch_size:
+        raise ValueError("page_table and cache_seqlens batch dimensions must match")
+    if cu_seqlens_q.shape[0] != batch_size + 1:
+        raise ValueError("cu_seqlens_q must contain batch_size + 1 entries")
+    if cu_seqlens_kv.shape[0] != batch_size + 1:
+        raise ValueError("cu_seqlens_kv must contain batch_size + 1 entries")
+
+    total_q, num_query_heads, _ = q.shape
+    expected_out_shape = (total_q, num_query_heads, kv_lora_rank)
+    if out is None:
+        out = torch.empty(expected_out_shape, dtype=q.dtype, device=q.device)
+    elif out.shape != expected_out_shape or out.dtype != q.dtype:
+        raise ValueError(
+            f"out must have shape {expected_out_shape} and dtype {q.dtype}, "
+            f"got {tuple(out.shape)} and {out.dtype}"
+        )
+
+    num_kv_heads = 1
+    block_m = 16
+    block_q = max(1, block_m // num_query_heads)
+    num_head_blocks = math.ceil(num_query_heads / block_m)
+    total_num_q_blocks = (total_q // block_q + batch_size) * num_head_blocks
+
+    _mla_prefill_fwd_kernel_non_pipelined[(num_kv_heads, total_num_q_blocks)](
+        output_ptr=out,
+        query_ptr=q,
+        kv_buffer_ptr=kv_cache,
+        block_tables_ptr=page_table,
+        seq_lens_ptr=cache_seqlens,
+        SCALE=softmax_scale,
+        q_scale_ptr=None,
+        kv_scale_ptr=None,
+        out_scale_ptr=None,
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        block_tables_stride=page_table.stride(0),
+        query_stride_0=q.stride(0),
+        query_stride_1=q.stride(1),
+        output_stride_0=out.stride(0),
+        output_stride_1=out.stride(1),
+        KV_LORA_RANK=kv_lora_rank,
+        QK_ROPE_HEAD_DIM=qk_rope_head_dim,
+        stride_kv_buffer_0=kv_cache.stride(0),
+        stride_kv_buffer_1=kv_cache.stride(1),
+        stride_kv_buffer_2=kv_cache.stride(2),
+        stride_kv_buffer_3=kv_cache.stride(3),
+        query_start_len_ptr=cu_seqlens_q,
+        num_seqs=batch_size,
+        TILE_SIZE=page_size,
+        BLOCK_Q=block_q,
+        BLOCK_M=block_m,
+        WARP_SIZE=32,
+        NUM_HEAD_BLOCKS=num_head_blocks,
+        QUERY_DTYPE="bf16",
+        KV_CACHE_DTYPE="bf16",
+        K_WIDTH=8,
+        num_warps=8,
+        waves_per_eu=1,
+        num_stages=1,
+    )
+    return out
+
+
+__all__ = [
+    "gluon_mla_decode_bf16_gfx1250",
+    "gluon_mla_extend_bf16_gfx1250",
+]

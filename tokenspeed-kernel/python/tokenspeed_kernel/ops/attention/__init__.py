@@ -125,6 +125,7 @@ __all__ = [
     "GdnCheckpointLayout",
     "GdnChunkPrefillResult",
     "mla_prefill",
+    "mla_extend_with_kvcache",
     "mla_decode_with_kvcache",
     "dsa_prefill",
     "dsa_decode",
@@ -1844,6 +1845,132 @@ def mla_prefill(
             max_seqlen_kv=max_seqlen_kv,
             softmax_scale=softmax_scale,
             seq_lens_kv=seq_lens_kv,
+            is_causal=is_causal,
+            logit_cap=logit_cap,
+            return_lse=return_lse,
+            out=out,
+        )
+
+
+def mla_extend_with_kvcache(
+    # attention inputs
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    # MLA dimensions
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    # attention options
+    is_causal: bool = True,
+    logit_cap: float = 0.0,
+    return_lse: bool = False,
+    out: torch.Tensor | None = None,
+    # dispatch options
+    override: str | None = None,
+    solution: str | None = None,
+) -> AttentionResult:
+    """MLA multi-token attention over a compressed paged KV cache.
+
+    The model supplies packed absorbed queries and prewrites the current tokens
+    to the compressed cache. A zero-length prefix represents initial prefill;
+    a nonzero prefix represents cached extend.
+
+    Args:
+        q: Packed absorbed query shaped ``[total_q, num_q_heads,
+            kv_lora_rank + qk_rope_head_dim]``.
+        kv_cache: Compressed paged cache shaped ``[num_pages, page_size, 1,
+            kv_lora_rank + qk_rope_head_dim]``.
+        page_table: Page table shaped ``[batch, max_pages_per_seq]``.
+        cache_seqlens: Total visible KV lengths, including the current query
+            tokens, shaped ``[batch]``.
+        cu_seqlens_q: Packed query boundaries shaped ``[batch + 1]``.
+        cu_seqlens_kv: Packed total-KV boundaries shaped ``[batch + 1]``.
+        max_seqlen_q: Maximum query length in the batch.
+        max_seqlen_k: Maximum visible KV length in the batch.
+        qk_nope_head_dim: Original non-RoPE query/key dimension.
+        kv_lora_rank: Compressed MLA latent rank and output head dimension.
+        qk_rope_head_dim: RoPE query/key dimension.
+        softmax_scale: Scale applied to QK logits.
+        is_causal: Whether each query chunk is a causal suffix of its cache.
+        logit_cap: Optional soft cap applied to logits.
+        return_lse: Whether to return natural-log log-sum-exp values.
+        out: Optional output shaped ``[total_q, num_q_heads, kv_lora_rank]``.
+        override: Optional exact kernel name.
+        solution: Optional kernel solution backend.
+
+    Returns:
+        Latent attention output, or ``(output, lse)`` when supported and
+        ``return_lse`` is true. The caller applies the MLA value projection.
+    """
+    batch_size = cache_seqlens.shape[0]
+    traits = {
+        "page_size": kv_cache.shape[1],
+        "num_q_heads": q.shape[1],
+        "qk_nope_head_dim": qk_nope_head_dim,
+        "kv_lora_rank": kv_lora_rank,
+        "qk_rope_head_dim": qk_rope_head_dim,
+        "is_causal": is_causal,
+        "support_logit_cap": logit_cap != 0.0,
+        "return_lse": return_lse,
+    }
+    signature = _attention_format_signature(q=q, kv_cache=kv_cache)
+    kernel = select_kernel(
+        "attention",
+        "mla_extend_with_kvcache",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    shape_params = {
+        "batch_size": batch_size,
+        "total_q": q.shape[0],
+        "num_q_heads": q.shape[1],
+        "num_pages": kv_cache.shape[0],
+        "page_size": kv_cache.shape[1],
+        "max_pages_per_seq": page_table.shape[1],
+        "qk_nope_head_dim": qk_nope_head_dim,
+        "kv_lora_rank": kv_lora_rank,
+        "qk_rope_head_dim": qk_rope_head_dim,
+        "max_seqlen_q": max_seqlen_q,
+        "max_seqlen_k": max_seqlen_k,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "mla_extend_with_kvcache",
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+
+    with kernel_scope(
+        "attention",
+        "mla_extend_with_kvcache",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            kv_cache=kv_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            softmax_scale=softmax_scale,
             is_causal=is_causal,
             logit_cap=logit_cap,
             return_lse=return_lse,
