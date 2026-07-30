@@ -282,11 +282,11 @@ def triton_nvidia_kda_fused_paged_verify(
     "kda_paged_decode",
     name="triton_nvidia_kda_paged_decode",
     solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
     signatures=_DENSE_HALF_SIGNATURES,
-    priority=Priority.PERFORMANT,
+    priority=Priority.PERFORMANT + 1,
     traits={"indexed_state": frozenset({True})},
-    tags={"nvidia", "flat_kv", "cuda_graph"},
+    tags={"amd", "nvidia", "flat_kv", "cuda_graph"},
 )
 def triton_nvidia_kda_paged_decode(
     q: torch.Tensor,
@@ -359,10 +359,10 @@ def _nvidia_kda_prefill(
     "kda_paged_prefill",
     name="triton_nvidia_kda_paged_prefill",
     solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
     signatures=_DENSE_HALF_SIGNATURES,
-    priority=Priority.PERFORMANT,
-    tags={"nvidia", "flat_kv"},
+    priority=Priority.PERFORMANT + 1,
+    tags={"amd", "nvidia", "flat_kv"},
 )
 def triton_nvidia_kda_paged_prefill(**kwargs) -> KdaPrefillResult:
     from tokenspeed_kernel.ops.attention.triton.linear.kda import (

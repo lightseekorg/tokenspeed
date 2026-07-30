@@ -8,8 +8,13 @@ from kimi3_reference import kda_gate
 from kimi3_reference import kda_recurrent as reference_kda_recurrent
 from tokenspeed_kernel.ops.attention import (
     kda_paged_decode,
+    kda_paged_prefill,
     kda_recurrent,
     kda_recurrent_decode,
+)
+from tokenspeed_kernel.ops.attention.triton.kda_dispatch import (
+    triton_nvidia_kda_paged_decode,
+    triton_nvidia_kda_paged_prefill,
 )
 from tokenspeed_kernel.platform import current_platform
 
@@ -234,8 +239,8 @@ def test_kda_recurrent_decode_updates_indexed_state_pool() -> None:
     )
 
 
-def test_kda_paged_decode_dispatches_to_amd_indexed_kernel() -> None:
-    """The public KDA contract must preserve AMD decode math and state writes."""
+def test_kda_paged_decode_dispatches_to_fla_kernel_on_amd() -> None:
+    """AMD dispatch must select the portable FLA-derived indexed kernel."""
     if not current_platform().is_amd:
         pytest.skip("AMD KDA dispatch test")
 
@@ -255,18 +260,19 @@ def test_kda_paged_decode_dispatches_to_amd_indexed_kernel() -> None:
     read_indices = torch.tensor([0, 1, 1], device=device, dtype=torch.int32)
     write_indices = torch.tensor([2, 3, 4], device=device, dtype=torch.int32)
 
-    expected_out = kda_recurrent_decode(
-        q.squeeze(0),
-        k.squeeze(0),
-        v.squeeze(0),
-        raw_g.squeeze(0),
-        beta.squeeze(0),
-        expected_pool,
+    expected_out = triton_nvidia_kda_paged_decode(
+        q,
+        k,
+        v,
+        raw_g,
+        beta,
         a_log,
         dt_bias,
+        state_pool=expected_pool,
         cu_seqlens=cu_seqlens,
         read_indices=read_indices,
         write_indices=write_indices,
+        lower_bound=-5.0,
     )
     actual_out = kda_paged_decode(
         q,
@@ -282,42 +288,44 @@ def test_kda_paged_decode_dispatches_to_amd_indexed_kernel() -> None:
         cu_seqlens=cu_seqlens,
     )
 
-    torch.testing.assert_close(actual_out.squeeze(0), expected_out)
+    torch.testing.assert_close(actual_out, expected_out)
     torch.testing.assert_close(state_pool, expected_pool)
 
 
-def test_kda_paged_decode_preserves_packed_compound_fallback() -> None:
-    """AMD dispatch keeps the packed multi-token state gather/scatter path."""
+def test_kda_paged_decode_uses_fla_kernel_for_compound_decode_on_amd() -> None:
+    """The FLA-derived AMD dispatch must preserve packed compound decode."""
     if not current_platform().is_amd:
         pytest.skip("AMD KDA dispatch test")
 
     device = "cuda"
     torch.manual_seed(19)
-    tokens, sequences, heads, dim = 3, 2, 2, 8
+    tokens, heads, dim = 3, 2, 8
     q = torch.randn(1, tokens, heads, dim, device=device, dtype=torch.bfloat16)
     k = torch.randn_like(q)
     v = torch.randn_like(q)
     raw_g = torch.randn_like(q)
     beta = torch.randn(1, tokens, heads, device=device, dtype=torch.bfloat16)
     state_pool = torch.randn(6, heads, dim, dim, device=device, dtype=torch.float32)
-    initial_pool = state_pool.clone()
+    expected_pool = state_pool.clone()
     a_log = torch.randn(heads, device=device, dtype=torch.float32)
     dt_bias = torch.randn(heads, dim, device=device, dtype=torch.float32)
     cu_seqlens = torch.tensor([0, 2, 3], device=device, dtype=torch.int32)
     read_indices = torch.tensor([0, 1], device=device, dtype=torch.int32)
     write_indices = torch.tensor([4, 5], device=device, dtype=torch.int32)
 
-    expected_out, expected_state = kda_recurrent(
-        q.squeeze(0),
-        k.squeeze(0),
-        v.squeeze(0),
-        raw_g.squeeze(0),
-        beta.squeeze(0),
-        initial_pool[read_indices.to(torch.int64)].contiguous(),
+    expected_out = triton_nvidia_kda_paged_decode(
+        q,
+        k,
+        v,
+        raw_g,
+        beta,
         a_log,
         dt_bias,
+        state_pool=expected_pool,
         cu_seqlens=cu_seqlens,
-        state_indices=torch.arange(sequences, device=device, dtype=torch.int32),
+        read_indices=read_indices,
+        write_indices=write_indices,
+        lower_bound=-5.0,
     )
     actual_out = kda_paged_decode(
         q,
@@ -334,14 +342,60 @@ def test_kda_paged_decode_preserves_packed_compound_fallback() -> None:
     )
 
     torch.testing.assert_close(
-        actual_out.squeeze(0).float(), expected_out.float(), atol=5e-2, rtol=5e-2
+        actual_out.float(), expected_out.float(), atol=5e-2, rtol=5e-2
     )
     torch.testing.assert_close(
-        state_pool[write_indices.to(torch.int64)],
-        expected_state,
+        state_pool,
+        expected_pool,
         atol=5e-2,
         rtol=5e-2,
     )
+
+
+def test_kda_paged_prefill_dispatches_to_fla_kernel_on_amd() -> None:
+    """AMD prefill must select the portable FLA-derived chunk kernel."""
+    if not current_platform().is_amd:
+        pytest.skip("AMD KDA dispatch test")
+
+    device = "cuda"
+    torch.manual_seed(29)
+    tokens, heads, dim = 5, 2, 8
+    q = torch.randn(1, tokens, heads, dim, device=device, dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    raw_g = torch.randn_like(q)
+    beta = torch.randn(1, tokens, heads, device=device, dtype=torch.bfloat16)
+    initial_state = torch.randn(2, heads, dim, dim, device=device, dtype=torch.float32)
+    a_log = torch.randn(heads, device=device, dtype=torch.float32)
+    dt_bias = torch.randn(heads, dim, device=device, dtype=torch.float32)
+    cu_seqlens = torch.tensor([0, 3, 5], device=device, dtype=torch.int32)
+
+    expected = triton_nvidia_kda_paged_prefill(
+        q=q,
+        k=k,
+        v=v,
+        g_raw=raw_g,
+        beta_logits=beta,
+        A_log=a_log,
+        dt_bias=dt_bias,
+        initial_state=initial_state.clone(),
+        cu_seqlens=cu_seqlens,
+        lower_bound=-5.0,
+    )
+    actual = kda_paged_prefill(
+        q,
+        k,
+        v,
+        raw_g,
+        beta,
+        a_log,
+        dt_bias,
+        initial_state=initial_state.clone(),
+        cu_seqlens=cu_seqlens,
+    )
+
+    torch.testing.assert_close(actual.out, expected.out)
+    torch.testing.assert_close(actual.final_state, expected.final_state)
 
 
 def test_kda_recurrent_decode_updates_page_strided_state_pool() -> None:
