@@ -181,23 +181,16 @@ Notes:
   (fp8 KV required). AMD uses the `mla` backend.
 - `tokenspeed serve` auto-selects the `kimi_k3` reasoning and tool-call
   parsers. Explicit parser flags override these defaults.
-- Point `--model` at a **flattened local copy** of the checkpoint: real files
-  for the configs/tokenizer/`*.py` (weights may stay symlinks). An HF hub
-  snapshot directory fails engine startup — `tokenization_kimi.py`'s relative
-  `encoding_k3` import breaks when transformers resolves the module file
-  through the snapshot's `blobs/` symlinks — and the bare repo id fails the
-  smg gateway, which needs an on-disk tokenizer directory.
-- On a shared `HF_HOME`, set `HF_MODULES_CACHE` to a user-writable directory;
-  transformers stages the checkpoint's remote code under
-  `$HF_HOME/modules/transformers_modules/<model>` and a new model name fails
-  with `PermissionError` when that tree belongs to another user.
+- The SMG packages pinned by TokenSpeed resolve `moonshotai/Kimi-K3` directly;
+  a flattened local checkpoint and separately staged remote-code cache are no
+  longer required.
 - The checkpoint carries no fp8 KV scaling factors; the loader defaults them
   to 1.0 (a warning at load). Expect a small accuracy delta vs bf16 KV.
 - The vision encoder has 12 attention heads. For an 8-way text TP deployment,
   use `--mm-encoder-tp-mode data` so each rank runs the vision encoder at TP1
   on a different whole image.
-- Use the current `lightseekorg/smg-private` frontend, which registers Kimi-K3's
-  chat renderer and multimodal processor. Preserve the checkpoint's
+- The pinned SMG frontend registers Kimi-K3's chat renderer and multimodal
+  processor. Preserve the checkpoint's
   `media_proc_cfg.in_patch_limit=65536`; silently falling back to K2.5's
   16384-patch default reduces OCR resolution.
 - KDA recurrent-state pages register for prefix-cache reuse only when a
