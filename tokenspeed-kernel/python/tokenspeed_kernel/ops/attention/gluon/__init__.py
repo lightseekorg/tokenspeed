@@ -90,6 +90,9 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx1250.attention.mha.prefill import (
         gluon_mha_prefill_gfx1250 as _prefill_gfx1250_impl,
     )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.decode import (
+        gluon_mla_decode_bf16_gfx1250 as _mla_decode_bf16_gfx1250_impl,
+    )
 
     @register_kernel(
         "attention",
@@ -402,6 +405,35 @@ if current_platform().is_amd:
     )
     def gluon_mla_decode_bf16xbf16_gfx950_bh64(*args, **kwargs):
         return _mla_decode_bf16xbf16_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "mla_decode_with_kvcache",
+        name="gluon_mla_decode_bf16_gfx1250",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=format_signatures(
+            ("q", "kv_cache"),
+            "dense",
+            {torch.bfloat16},
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "q_len": frozenset({1}),
+            "num_q_heads": frozenset(range(1, 129)),
+            "page_size": frozenset({64}),
+            "kv_lora_rank": frozenset({512}),
+            "qk_rope_head_dim": frozenset({64}),
+            "support_logit_cap": frozenset({False}),
+            "return_lse": frozenset({False, True}),
+        },
+    )
+    def gluon_mla_decode_bf16_gfx1250(*args, **kwargs):
+        return _mla_decode_bf16_gfx1250_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",
