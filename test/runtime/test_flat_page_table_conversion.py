@@ -54,6 +54,23 @@ class FlatPageTableConversionTest(unittest.TestCase):
         )
         self.assertTrue(torch.equal(actual, expected))
 
+    def test_first_and_last_logical_pages_stay_in_flattened_lcm_range(self):
+        # Four logical pages consist of null page 0 and usable pages 1..3.
+        logical = torch.tensor([[0, 1, 3, -1]], dtype=torch.int32)
+
+        actual = self.module.expand_page_table(
+            logical,
+            logical_page_size=128,
+            kernel_page_size=64,
+        )
+
+        expected = torch.tensor(
+            [[0, 1, 2, 3, 6, 7, 0, 1]],
+            dtype=torch.int32,
+        )
+        self.assertTrue(torch.equal(actual, expected))
+        self.assertLessEqual(int(actual.max()), 7)
+
     def test_rejects_incompatible_page_sizes(self):
         with self.assertRaisesRegex(ValueError, "positive multiple"):
             self.module.expand_page_table(
