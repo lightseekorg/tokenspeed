@@ -40,7 +40,6 @@ from tokenspeed_kernel.ops.attention.gdn_utils import (
 from tokenspeed_kernel.ops.attention.kda_utils import KdaPrefillResult
 from tokenspeed_kernel.ops.attention.triton.kda import (
     kda_recurrent,
-    kda_recurrent_decode,
     kda_state_scatter,
 )
 from tokenspeed_kernel.ops.attention.triton.kda_chunk import (
@@ -773,7 +772,8 @@ def kda_paged_prefill(
         v: Values ``[1, total_tokens, heads, value_dim]``.
         beta_logits: Raw beta logits ``[1, total_tokens, heads]``.
         A_log/dt_bias: FP32 gate parameters.
-        initial_state: One backend-owned recurrent state per sequence.
+        initial_state: Recurrent states ``[num_sequences, heads, key_dim,
+            value_dim]`` using the public KDA K-major layout.
         cu_seqlens: Device sequence boundaries ``[num_sequences + 1]``.
         lower_bound: Optional safe lower bound for log decay.
         override: Optional exact kernel name.
@@ -782,8 +782,9 @@ def kda_paged_prefill(
     Returns:
         Packed output and final state.
 
-    The state's internal ``[K,V]`` versus ``[V,K]`` interpretation remains
-    private to the selected implementation.
+    All implementations consume and return the canonical K-major state layout
+    ``[sequence, head, key_dim, value_dim]``. This makes independently selected
+    prefill and decode implementations interoperable.
     """
     if q.ndim != 4 or q.shape[0] != 1:
         raise ValueError("KDA q must be [1, total_tokens, heads, key_dim]")
@@ -794,8 +795,25 @@ def kda_paged_prefill(
     if beta_logits.shape != q.shape[:-1]:
         raise ValueError("KDA beta logits must be [1, total_tokens, heads]")
     num_sequences = cu_seqlens.numel() - 1
-    if initial_state.ndim != 4 or initial_state.shape[0] != num_sequences:
-        raise ValueError("KDA initial_state must contain one row per sequence")
+    expected_state_shape = (
+        num_sequences,
+        q.shape[-2],
+        q.shape[-1],
+        v.shape[-1],
+    )
+    if initial_state.shape != expected_state_shape:
+        raise ValueError(
+            "KDA initial_state must be [num_sequences, heads, key_dim, "
+            f"value_dim]={expected_state_shape}, got {tuple(initial_state.shape)}"
+        )
+    if initial_state.stride()[1:] != (
+        q.shape[-1] * v.shape[-1],
+        v.shape[-1],
+        1,
+    ):
+        raise ValueError(
+            "KDA initial_state inner [heads, key_dim, value_dim] must be contiguous"
+        )
     # AMD historically ignores the NVIDIA prefill policy labels and uses its
     # registered Triton implementation.
     if current_platform().is_amd and solution in {"fla", "flashkda", "cutedsl_kda"}:
@@ -845,7 +863,8 @@ def kda_paged_decode(
         v: Packed values ``[1, batch, heads, value_dim]``.
         beta_logits: Raw beta logits ``[1, batch, heads]``.
         A_log/dt_bias: FP32 gate parameters.
-        state_pool: Backend-owned recurrent-state pool.
+        state_pool: K-major recurrent-state pool
+            ``[num_slots, heads, key_dim, value_dim]``.
         read_indices/write_indices: Independent source/destination rows.
         cu_seqlens: Device boundaries ``[batch + 1]``.
         lower_bound: Optional safe lower bound for log decay.
@@ -868,12 +887,29 @@ def kda_paged_decode(
         raise ValueError("KDA decode requires one read/write index per sequence")
     if cu_seqlens.numel() != num_sequences + 1:
         raise ValueError("KDA decode cu_seqlens must contain one boundary per sequence")
+    expected_state_tail = (q.shape[-2], q.shape[-1], v.shape[-1])
+    if state_pool.ndim != 4 or state_pool.shape[1:] != expected_state_tail:
+        raise ValueError(
+            "KDA state_pool must be [num_slots, heads, key_dim, value_dim] "
+            f"with tail {expected_state_tail}, got {tuple(state_pool.shape)}"
+        )
+    if state_pool.stride()[1:] != (
+        q.shape[-1] * v.shape[-1],
+        v.shape[-1],
+        1,
+    ):
+        raise ValueError(
+            "KDA state_pool inner [heads, key_dim, value_dim] must be contiguous"
+        )
 
     kernel = select_kernel(
         "attention",
         "kda_paged_decode",
         _attention_format_signature(q=q, k=k, v=v),
-        traits={"indexed_state": True},
+        traits={
+            "indexed_state": True,
+            "single_token": q.shape[1] == num_sequences,
+        },
         solution=solution,
         override=override,
     )
