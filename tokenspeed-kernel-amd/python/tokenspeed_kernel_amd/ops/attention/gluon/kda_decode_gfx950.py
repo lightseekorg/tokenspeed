@@ -1,6 +1,24 @@
 # Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
-"""GFX950 Gluon KDA recurrent decode derived from the native Triton kernel."""
+"""GFX950 Gluon KDA recurrent decode kernel."""
 
 from __future__ import annotations
 
@@ -35,11 +53,7 @@ def _kda_recurrent_decode_kernel(
     HAS_LOWER_BOUND: gl.constexpr,
     LOWER_BOUND: gl.constexpr,
 ):
-    """One-token KDA decode with direct indexed state-pool IO.
-
-    This started from the Triton-to-Gluon translator output. The explicit
-    layout keeps values contiguous for the canonical K-major state ABI.
-    """
+    """One-token KDA decode with direct indexed state-pool IO."""
     value_block = gl.program_id(0)
     sequence_head = gl.program_id(1)
     sequence_idx = sequence_head // H
