@@ -45,6 +45,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
 )
 
 from tokenspeed.runtime.configs.flat_cache_runtime import flat_cache_debug_enabled
+from tokenspeed.runtime.layers.attention.page_table import expand_page_table
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.common import ceil_div
 
@@ -190,6 +191,22 @@ class FlatCacheGroupsMixin:
     def _layer_page_size(self, layer) -> int:
         """Page size of the layer's cache group (uniform when unknown)."""
         return self._group_page_size(getattr(layer, "group_id", ""))
+
+    def _flat_kernel_page_tables(self, page_tables):
+        """Convert scheduler page IDs to the page size consumed by the kernel."""
+        if not page_tables:
+            return page_tables
+        if all(self._group_page_size(gid) == self.page_size for gid in page_tables):
+            return page_tables
+        return {
+            gid: expand_page_table(
+                table,
+                logical_page_size=self._group_page_size(gid),
+                kernel_page_size=self.page_size,
+                max_kernel_pages=self.max_num_pages,
+            )
+            for gid, table in page_tables.items()
+        }
 
     # ------------------------------------------------------------------
     # Write locations
@@ -343,7 +360,9 @@ class FlatCacheGroupsMixin:
         self._flat_locs_stack = None
         self._flat_lookback_locs_stack = None
         self._flat_tables_stack = None
+        self._flat_source_group_widths = {}
         self._flat_group_widths = {}
+        self._flat_group_ratios = ()
         self._flat_stack_gids = []
         self._flat_att_group_count = 0
         att_gids = sorted(
@@ -360,17 +379,35 @@ class FlatCacheGroupsMixin:
         gids = att_gids + owned_gids  # attention prefix, wrapper-owned tail
         if not gids:
             return
-        widths = {
+        source_widths = {
             gid: ceil_div(
                 self.max_num_pages * self.page_size, self._group_page_size(gid)
             )
             for gid in gids
         }
+        ratios = {
+            gid: (
+                self._group_page_size(gid) // self.page_size if gid in att_gids else 1
+            )
+            for gid in gids
+        }
+        if any(
+            ratio <= 0 or self._group_page_size(gid) % self.page_size
+            for gid, ratio in ratios.items()
+            if gid in att_gids
+        ):
+            raise ValueError(
+                "flat group page sizes must be positive multiples of the "
+                f"kernel page size {self.page_size}"
+            )
+        widths = {gid: source_widths[gid] * ratios[gid] for gid in gids}
         logger.debug(
-            "flat graph buffers: max_num_pages=%d page_size=%d max_bs=%d widths=%s",
+            "flat graph buffers: max_num_pages=%d page_size=%d max_bs=%d "
+            "source_widths=%s widths=%s",
             self.max_num_pages,
             self.page_size,
             max_bs,
+            source_widths,
             widths,
         )
         wmax = max(widths.values())
@@ -399,14 +436,16 @@ class FlatCacheGroupsMixin:
                 self.cuda_graph_flat_lookback_locs[gid] = (
                     self._flat_lookback_locs_stack[i]
                 )
+        self._flat_source_group_widths = source_widths
         self._flat_group_widths = widths
+        self._flat_group_ratios = tuple(ratios[gid] for gid in gids)
         self._flat_group_ps_tensor = torch.tensor(
-            [self._group_page_size(gid) for gid in att_gids],
+            [self.page_size for _ in att_gids],
             dtype=torch.int32,
             device=self.device,
         )
         self._flat_unpack_meta_dev = torch.zeros(
-            (g, 2), dtype=torch.int32, device=self.device
+            (g, 3), dtype=torch.int32, device=self.device
         )
         for i, gid in enumerate(gids):
             self.cuda_graph_flat_page_tables[gid] = self._flat_tables_stack[
@@ -477,12 +516,12 @@ class FlatCacheGroupsMixin:
             return False
         gids = self._flat_stack_gids
         # Fresh pinned alloc each step: a persistent pinned buffer would race with overlap scheduling
-        meta = torch.empty((len(gids), 2), dtype=torch.int32, pin_memory=True)
+        meta = torch.empty((len(gids), 3), dtype=torch.int32, pin_memory=True)
         base_ptr = None
         actual = None
         for i, gid in enumerate(gids):
             src = flat_block_tables.get(gid)
-            if src is None or src.shape[1] > stack.shape[2]:
+            if src is None or src.shape[1] == 0:
                 return False
             ptr = src.untyped_storage().data_ptr()
             if base_ptr is None:
@@ -492,6 +531,7 @@ class FlatCacheGroupsMixin:
                 return False
             meta[i, 0] = src.storage_offset()
             meta[i, 1] = src.shape[1]
+            meta[i, 2] = self._flat_group_ratios[i]
         if base_ptr is None:
             return False
         self._flat_unpack_meta_dev.copy_(meta, non_blocking=True)
@@ -563,19 +603,37 @@ class FlatCacheGroupsMixin:
             bs, flat_block_tables
         )
         if not self._flat_packed_unpack_ran:
-            for gid, src in flat_block_tables.items():
+            for i, gid in enumerate(self._flat_stack_gids):
+                src = flat_block_tables.get(gid)
+                if src is None:
+                    continue
                 if gid in self.flat_state_group_ids:
                     # State group: the mamba backend consumes it directly.
                     continue
                 if gid in self.flat_engine_owned_group_ids:
-                    # Engine-owned (conv) group: the wrapper fills its own buffers (they alias this stack)
+                    # The wrapper fills its own scheduler-page buffer.
                     continue
                 buf = self.cuda_graph_flat_page_tables[gid]
                 # Clamp: scheduler may send extra reservation columns; kernels never read past cache_seqlens
-                cols = min(src.shape[1], buf.shape[1])
+                source_cols = min(src.shape[1], self._flat_source_group_widths[gid])
                 # cols >= 1: a zero-width table would leave dummy rows' col 0 unwritten
-                assert cols >= 1, f"flat table for group {gid!r}: zero-width table"
+                assert (
+                    source_cols >= 1
+                ), f"flat table for group {gid!r}: zero-width table"
                 rows = min(src.shape[0], bs)
+                ratio = self._flat_group_ratios[i]
+                if ratio != 1:
+                    expand_page_table(
+                        src[:rows, :source_cols],
+                        logical_page_size=self._group_page_size(gid),
+                        kernel_page_size=self.page_size,
+                        max_kernel_pages=buf.shape[1],
+                        out=buf[:rows],
+                    )
+                    if rows < bs:
+                        buf[rows:bs].zero_()
+                    continue
+                cols = min(source_cols, buf.shape[1])
                 buf[:rows, :cols].copy_(src[:rows, :cols])
                 if cols < buf.shape[1]:
                     buf[:rows, cols:].fill_(self.flat_table_tail_pad)

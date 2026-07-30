@@ -355,6 +355,14 @@ class KimiK3NextNForCausalLM(nn.Module):
             input_ids, hidden_states, self.lm_head, logits_metadata
         )
 
+    def checkpoint_weight_name_filter(self, name: str) -> bool:
+        """Shard preselection for ``load_weights`` (see DefaultModelLoader).
+
+        Accepts a superset of the checkpoint names ``load_weights`` consumes:
+        everything under the NextN layer prefix.
+        """
+        return name.startswith(f"model.layers.{self.config.num_hidden_layers}.")
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         config = self.config
         nextn_prefix = f"model.layers.{config.num_hidden_layers}."
@@ -485,6 +493,13 @@ class KimiK3ForConditionalGenerationNextN(nn.Module):
 
     def forward(self, *args, **kwargs):
         return self.language_model.forward(*args, **kwargs)
+
+    def checkpoint_weight_name_filter(self, name: str) -> bool:
+        """Shard preselection for ``load_weights`` (see DefaultModelLoader)."""
+        lm_prefix = "language_model."
+        if not name.startswith(lm_prefix):
+            return False
+        return self.language_model.checkpoint_weight_name_filter(name[len(lm_prefix) :])
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         lm_prefix = "language_model."

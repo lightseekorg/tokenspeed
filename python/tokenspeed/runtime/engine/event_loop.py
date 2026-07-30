@@ -249,6 +249,7 @@ class EventLoop:
             gpu_id=gpu_id,
             global_rank=global_rank,
             num_total_pages=num_total_pages,
+            logical_page_size=geometry.page_size,
             overlap_schedule_depth=self.overlap_schedule_depth,
         )
         self.model_executor = create_model_executor(
@@ -316,7 +317,7 @@ class EventLoop:
 
         mem_cfg = MemoryExecutorConfig(
             layer_num=self.model_config.num_hidden_layers,
-            page_size=server_args.block_size,
+            page_size=geometry.page_size,
             host_ratio=server_args.kvstore_ratio,
             host_size_gb=server_args.kvstore_size,
             host_parallel_count=max(

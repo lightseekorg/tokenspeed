@@ -438,6 +438,7 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             self._maybe_check_flat_write_locs(
                 flat_page_tables, flat_out_cache_locs, self.page_size
             )
+            flat_page_tables = self._flat_kernel_page_tables(flat_page_tables)
 
         if forward_mode.is_extend_or_mixed():
             self._init_extend_metadata(
