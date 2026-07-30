@@ -3075,8 +3075,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         # Flat contract pool: the per-position verify states live in the
         # scratch; commit the accepted position back to the state slab.
         commit = getattr(self.linear_attn_backend, "flat_commit_verified_state", None)
-        if commit is not None and getattr(
-            self.linear_attn_backend, "_verify_commit_ctx", None
+        if (
+            commit is not None
+            and getattr(self.linear_attn_backend, "_verify_commit_ctx", None)
+            is not None
         ):
             commit(accepted_length)
             return
@@ -3091,8 +3093,17 @@ class HybridLinearAttnBackend(AttentionBackend):
         )
         if req_pool_indices is None:
             return
+        pool = getattr(self.linear_attn_backend, "pool", None)
+        if pool is None:
+            if getattr(self.linear_attn_backend, "flat_state_active", False):
+                return
+            raise RuntimeError(
+                "MTP verify produced mamba output indices but the linear "
+                "attention backend has no SimpleMambaPool and flat state "
+                "paging is inactive"
+            )
         request_number = accepted_length.shape[0]
-        self.linear_attn_backend.pool.update_current_inputs_after_verify(
+        pool.update_current_inputs_after_verify(
             req_pool_indices[:request_number],
             output_indices[:request_number],
             accepted_length,
