@@ -3602,16 +3602,11 @@ class DeepseekV4Attention(nn.Module):
         by the existing ``metadata.is_valid_token`` masking, and the
         token-shaped inputs are sliced to the real count DSA kernels assert
         (see ``slice_to_real_tokens`` below). The cross-layer SWA slot mapping
-        and compressor memo are shared via ctx -- replay-safe because ctx is
-        rebound to the live forward (see ``DeepseekV4Model.forward``).
+        and compressor memo are shared via the backend's forward metadata --
+        replay-safe because breaks reach it through the live ``ctx``.
         """
         if hidden_states.shape[0] == 0:
             return hidden_states
-        # Cross-layer compressor memo, created once per forward by the first layer.
-        if compressor_slot_cache is None:
-            compressor_slot_cache = ctx.dsa_compressor_slot_cache
-            if compressor_slot_cache is None:
-                compressor_slot_cache = ctx.dsa_compressor_slot_cache = {}
         profile_prefix = f"attn_{self.attention_kind}"
         cos_sin_cache = self.rotary_emb.cos_sin_cache
         if cos_sin_cache.dtype != torch.float32:
@@ -3620,6 +3615,11 @@ class DeepseekV4Attention(nn.Module):
         metadata = ctx.attn_backend.forward_metadata
         if metadata is None:
             raise RuntimeError("DeepSeek V4 attention requires forward metadata")
+        # Cross-layer compressor memo, created once per forward by the first layer.
+        if compressor_slot_cache is None:
+            compressor_slot_cache = metadata.compressor_slot_cache
+            if compressor_slot_cache is None:
+                compressor_slot_cache = metadata.compressor_slot_cache = {}
 
         # Slice padded inputs to the real count the DSA kernels assert (see
         # docstring). Only under a breakable capture/replay (ambient ctx set):
@@ -3663,14 +3663,14 @@ class DeepseekV4Attention(nn.Module):
 
         if swa_slot_mapping is None:
             # Cross-layer SWA slot mapping (per-token, layer-invariant), first layer computes.
-            swa_slot_mapping = ctx.dsa_swa_slot_mapping
+            swa_slot_mapping = metadata.swa_slot_mapping
             if swa_slot_mapping is None:
                 swa_slot_mapping = _deepseek_v4_swa_slot_mapping(
                     ctx,
                     positions,
                     out_cache_loc,
                 )
-                ctx.dsa_swa_slot_mapping = swa_slot_mapping
+                metadata.swa_slot_mapping = swa_slot_mapping
 
         def insert_swa_cache() -> None:
             with nvtx_range(f"{profile_prefix}_insert_swa_cache"):
@@ -4069,9 +4069,9 @@ class DeepseekV4Model(nn.Module):
         with nvtx_range("hc_repeat"):
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
         # Layer-invariant DSA memos: computing them HERE (graphed scope) would bake
-        # dummy addresses; the first attention break computes them LIVE onto ctx.
-        ctx.dsa_swa_slot_mapping = None
-        ctx.dsa_compressor_slot_cache = None
+        # dummy addresses; the first attention break computes them LIVE onto the
+        # backend's forward metadata. Clear leftovers from reused metadata objects.
+        ctx.attn_backend.reset_cross_layer_memos()
         hc_x_prev = None
         hc_post_prev = None
         hc_comb_prev = None
@@ -4082,8 +4082,8 @@ class DeepseekV4Model(nn.Module):
                 ctx,
                 out_cache_loc,
                 input_ids,
-                None,  # swa_slot_mapping: first break computes + caches on ctx
-                None,  # compressor_slot_cache: shared dict created on ctx
+                None,  # swa_slot_mapping: first break computes + memoizes on metadata
+                None,  # compressor_slot_cache: shared dict created on metadata
                 hc_x_prev,
                 hc_post_prev,
                 hc_comb_prev,

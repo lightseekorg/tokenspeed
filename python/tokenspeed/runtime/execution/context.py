@@ -24,8 +24,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-import torch
-
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -68,10 +66,6 @@ class ForwardContext:
     # DSA sparse top-k shared across layers and draft steps.
     dsa_prefill_topk: Any | None = None
     dsa_decode_topk: Any | None = None
-
-    # DSA SWA slot mapping + compressor memo, computed once per forward, shared across layers.
-    dsa_swa_slot_mapping: torch.Tensor | None = None
-    dsa_compressor_slot_cache: Any | None = None
 
 
 @contextmanager

@@ -176,6 +176,8 @@ class DeepseekV4MultiTokenPredictorLayer(nn.Module):
         e_out, _ = self.e_proj(input_embeds)
         hidden_states = h_out + e_out.unsqueeze(-2)
 
+        # Draft steps reuse metadata objects; drop the previous step's DSA memos.
+        ctx.attn_backend.reset_cross_layer_memos()
         swa_slot_mapping = _deepseek_v4_swa_slot_mapping(
             ctx,
             positions,
