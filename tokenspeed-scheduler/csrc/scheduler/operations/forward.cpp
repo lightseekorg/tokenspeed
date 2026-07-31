@@ -297,8 +297,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     if (req_pool_allocator_.AvailableSlots() == 0) return {};
     auto match_tokens = request->GetFullPagedTokens(true);
     if (request->LogprobStartLen() >= 0) {
-        const std::size_t max_pages =
-            static_cast<std::size_t>(request->LogprobStartLen() / config_.block_size);
+        const std::size_t max_pages = static_cast<std::size_t>(request->LogprobStartLen() / config_.block_size);
         if (max_pages < match_tokens.size()) {
             match_tokens.resize(max_pages);
         }
