@@ -143,7 +143,37 @@ if platform.is_nvidia:
         max_num_tokens_per_gpu: int | None = None,
         do_finalize: bool = True,
         enable_pdl: bool = False,
+        low_latency: bool | None = None,
     ):
+        """Run one nvfp4 MoE layer over DeepEP's low-latency legs.
+
+        Args:
+            plan: Execution plan from ``moe_plan``; owns the low-latency
+                capacity and the lazily built dispatcher.
+            x: ``[tokens, hidden]`` local hidden states.
+            w: Module holding the processed nvfp4 expert weights.
+            router_logits: ``[tokens, num_experts]`` logits, used only when the
+                caller passes no precomputed top-k.
+            topk_weights: ``[tokens, top_k]`` routing weights.
+            topk_ids: ``[tokens, top_k]`` selected (global) expert ids.
+            num_tokens_global: Unused by this path.
+            max_num_tokens_per_gpu: Unused; the low-latency capacity is pinned by
+                the plan so the DeepEP buffer does not depend on batch order.
+            do_finalize: Must be True; this kernel cannot defer finalize.
+            enable_pdl: Unused by this path.
+            low_latency: Must be True or None. The masked grouped GEMMs here only
+                consume the low-latency dispatch layout, so extend-shaped batches
+                need the DeepGEMM FP8 path instead.
+
+        Returns:
+            ``[tokens, hidden]`` bf16 combined MoE output.
+        """
+        if low_latency is False:
+            raise NotImplementedError(
+                "flashinfer cutedsl nvfp4 DeepEP only implements the "
+                "low-latency legs; use --deepep-mode low_latency or the "
+                "deep_gemm MoE backend for normal-mode batches"
+            )
         if topk_weights is None or topk_ids is None:
             scores = torch.softmax(router_logits.float(), dim=-1)
             topk_weights, topk_ids = torch.topk(
@@ -156,10 +186,16 @@ if platform.is_nvidia:
             group = plan.get("deepep_group")
             if group is None:
                 raise ValueError("DeepEP MoE plan is missing deepep_group")
+            capacity = plan.get("deepep_low_latency_max_num_tokens_per_gpu")
+            if not capacity:
+                raise ValueError(
+                    "DeepEP plan is missing "
+                    "deepep_low_latency_max_num_tokens_per_gpu"
+                )
             config = SimpleNamespace(
                 top_k=getattr(w, "top_k"),
                 num_experts=getattr(w, "num_experts"),
-                low_latency_max_num_tokens_per_gpu=max_num_tokens_per_gpu or x.shape[0],
+                low_latency_max_num_tokens_per_gpu=capacity,
                 hidden_size=x.shape[1],
                 world_size=getattr(w, "ep_size", group.size()),
                 group=group,
@@ -174,7 +210,7 @@ if platform.is_nvidia:
             )
             plan["_deepep_dispatcher"] = dispatcher
 
-        dispatcher.dispatch_a(x, topk_ids, topk_weights, None)
+        dispatcher.dispatch_a(x, topk_ids, topk_weights, low_latency=True)
         recv_hidden, _, _, _, _, _, masked_m = dispatcher.dispatch_b()
 
         num_local_experts = getattr(w, "num_local_experts", w.w13_weight.shape[0])
@@ -225,5 +261,7 @@ if platform.is_nvidia:
             alpha_dtype="float32",
         )
 
-        dispatcher.combine_a(output.permute(2, 0, 1), topk_ids, topk_weights, None)
+        dispatcher.combine_a(
+            output.permute(2, 0, 1), topk_ids, topk_weights, low_latency=True
+        )
         return dispatcher.combine_b()

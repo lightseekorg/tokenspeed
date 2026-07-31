@@ -133,7 +133,14 @@ PREFILL_GRAPH_DEFAULT_MAX_TOKENS = 2048
 
 
 def _resolve_prefill_graph_max_tokens(server_args) -> int:
-    """Largest prefill-graph bucket: explicit value, or min(2048, chunk, kv budget)."""
+    """Largest prefill-graph bucket: explicit value, or min(2048, chunk, kv budget).
+
+    Returns 0 (graph off) when the MoE all-to-all backend is DeepEP: an
+    extend-shaped forward takes DeepEP's normal dispatch, whose per-expert
+    receive counts come back to the host, and a host sync cannot be captured.
+    """
+    if server_args.all2all_backend not in (None, "none"):
+        return 0
     if server_args.prefill_graph_max_tokens is not None:
         return int(server_args.prefill_graph_max_tokens)
     cap = PREFILL_GRAPH_DEFAULT_MAX_TOKENS

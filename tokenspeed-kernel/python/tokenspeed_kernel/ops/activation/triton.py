@@ -32,6 +32,7 @@ __all__ = [
     "add3",
     "fused_gate_sigmoid_mul_add",
     "fused_swiglu_fp8_ue8m0",
+    "fused_swiglu_fp8_ue8m0_masked",
     "sigmoid_mul",
     "silu_and_mul",
     "situ_and_mul",
@@ -614,6 +615,127 @@ def fused_swiglu_fp8_ue8m0(
     )
 
     return out, scale
+
+
+@triton.jit
+def _fused_swiglu_fp8_ue8m0_masked_kernel(
+    gate_up_ptr,
+    out_ptr,
+    scale_ptr,
+    masked_m_ptr,
+    N: tl.constexpr,
+    gate_up_stride_e,
+    gate_up_stride_m,
+    out_stride_e,
+    out_stride_m,
+    scale_stride_e,
+    scale_stride_m,
+    scale_stride_g,
+    eps,
+    bit8_min,
+    bit8_max,
+    GROUP_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    expert = tl.program_id(1)
+    groups_per_row = N // GROUP_SIZE
+    row = pid // groups_per_row
+    group_col = pid % groups_per_row
+
+    if row >= tl.load(masked_m_ptr + expert):
+        return
+
+    gate_offset = (
+        expert.to(tl.int64) * gate_up_stride_e
+        + row.to(tl.int64) * gate_up_stride_m
+        + group_col.to(tl.int64) * GROUP_SIZE
+    )
+    up_offset = gate_offset + N
+    out_offset = (
+        expert.to(tl.int64) * out_stride_e
+        + row.to(tl.int64) * out_stride_m
+        + group_col.to(tl.int64) * GROUP_SIZE
+    )
+
+    cols = tl.arange(0, GROUP_SIZE)
+
+    gate = tl.load(gate_up_ptr + gate_offset + cols).to(tl.float32)
+    up = tl.load(gate_up_ptr + up_offset + cols).to(tl.float32)
+
+    y = gate * tl.sigmoid(gate) * up
+
+    _absmax = tl.max(tl.abs(y))
+    scale_raw = tl.maximum(_absmax / bit8_max, eps)
+    y_s = tl.exp2(tl.ceil(tl.log2(scale_raw)))
+    y_q = tl.clamp(y / y_s, bit8_min, bit8_max).to(out_ptr.dtype.element_ty)
+
+    tl.store(out_ptr + out_offset + cols, y_q)
+
+    scale_offset = (
+        expert.to(tl.int64) * scale_stride_e
+        + row.to(tl.int64) * scale_stride_m
+        + group_col.to(tl.int64) * scale_stride_g
+    )
+    tl.store(scale_ptr + scale_offset, y_s)
+
+
+def fused_swiglu_fp8_ue8m0_masked(
+    gate_up: torch.Tensor,
+    masked_m: torch.Tensor,
+    out: torch.Tensor,
+    scales: torch.Tensor,
+) -> None:
+    """Masked fused SwiGLU + FP8 quantize with power-of-two block scales.
+
+    The masked-layout counterpart of :func:`fused_swiglu_fp8_ue8m0`, for the
+    DeepEP low-latency buffers consumed by DeepGEMM's masked grouped GEMM.
+    Rows at or beyond ``masked_m[e]`` are padding and are skipped entirely.
+    Scales are written as FP32 power-of-two values (not the packed-int32 UE8M0
+    layout), which DeepGEMM accepts on every architecture.
+
+    Args:
+        gate_up: ``[experts, capacity, 2*N]`` activations, gate in the first
+            half of the last dim, up in the second. ``N`` must be a multiple
+            of 128.
+        masked_m: ``[experts]`` int32 valid-row counts per expert.
+        out: ``[experts, capacity, N]`` float8_e4m3fn output, written in place.
+        scales: ``[experts, capacity, N / 128]`` float32 scale output, written
+            in place through its strides (so an mn-major permuted view works).
+
+    Returns:
+        None. ``out`` and ``scales`` are mutated.
+    """
+    assert gate_up.ndim == 3, f"Expected 3D input, got {gate_up.ndim}D"
+    num_experts, capacity, two_N = gate_up.shape
+    assert two_N % 2 == 0
+    N = two_N // 2
+    GROUP_SIZE = 128
+    assert N % GROUP_SIZE == 0, f"N={N} must be a multiple of {GROUP_SIZE}"
+    assert out.shape == (num_experts, capacity, N)
+    assert scales.shape == (num_experts, capacity, N // GROUP_SIZE)
+    assert gate_up.stride(2) == 1 and out.stride(2) == 1
+
+    info = torch.finfo(out.dtype)
+    _fused_swiglu_fp8_ue8m0_masked_kernel[(capacity * (N // GROUP_SIZE), num_experts)](
+        gate_up,
+        out,
+        scales,
+        masked_m,
+        N,
+        gate_up.stride(0),
+        gate_up.stride(1),
+        out.stride(0),
+        out.stride(1),
+        scales.stride(0),
+        scales.stride(1),
+        scales.stride(2),
+        1e-10,
+        bit8_min=info.min,
+        bit8_max=info.max,
+        GROUP_SIZE=GROUP_SIZE,
+        num_warps=min(max(GROUP_SIZE // 256, 1), 8),
+        num_stages=1,
+    )
 
 
 @triton.jit

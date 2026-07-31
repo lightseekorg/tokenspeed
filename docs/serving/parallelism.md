@@ -59,6 +59,35 @@ Start with the recipe closest to your model family, then tune:
 - `--all2all-backend`
 - `--deepep-mode`
 
+### DeepEP all-to-all
+
+`--all2all-backend deepep` moves expert routing off all-gather and onto DeepEP
+dispatch/combine. It requires a MoE backend whose kernels own those legs:
+`--moe-backend deep_gemm` (block-scale FP8) or `--moe-backend flashinfer_cutedsl`
+(nvfp4, decode-shaped batches only).
+
+DeepEP has two sets of legs, and `--deepep-mode` picks between them:
+
+| Mode | Legs | Fits |
+| --- | --- | --- |
+| `low_latency` | IBGDA dispatch into a preallocated per-expert buffer | Decode-shaped batches up to `--low-latency-max-num-tokens-per-gpu` |
+| `normal` | High-throughput dispatch, tokens permuted into per-expert row blocks | Extend-shaped batches of any size |
+| `auto` (default) | Both are allocated; each forward picks | Aggregated serving, which mixes both shapes |
+
+Keep `auto` unless the instance only ever sees one shape -- for example a
+decode-only worker in a PD split, which can pin `low_latency` and skip the
+normal-mode buffers. A batch above the low-latency capacity is rejected rather
+than truncated, so raise `--low-latency-max-num-tokens-per-gpu` if decode plus
+speculative draft tokens exceed it.
+
+The mode is chosen per forward from a value every rank agrees on, because the two
+modes are different collectives. With DP attention that value is "every DP rank
+is decoding", so one extending rank moves the whole group to the normal legs.
+
+The prefill CUDA graph is disabled whenever an all-to-all backend is selected:
+normal-mode dispatch reports its per-expert receive counts to the host, and a
+host sync cannot be captured. Decode graphs are unaffected.
+
 ## Multi-Node
 
 Set these explicitly:

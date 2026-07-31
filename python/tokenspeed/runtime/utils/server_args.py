@@ -1341,7 +1341,8 @@ class ServerArgs:
             "--moe-backend",
             type=str,
             default=ServerArgs.moe_backend,
-            help="MoE runner backend: auto, triton, gluon, flashinfer_trtllm",
+            help="MoE runner backend: auto, triton, gluon, flashinfer_trtllm, "
+            "flashinfer_cutlass, flashinfer_cutedsl, deep_gemm, mega_moe",
         )
         parser.add_argument(
             "--draft-moe-backend",
