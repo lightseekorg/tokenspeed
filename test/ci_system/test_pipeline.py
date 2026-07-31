@@ -132,6 +132,16 @@ def test_nvidia_gpu_cleanup_runner_prefixes_cover_gb200_and_b300():
     assert not should_run_nvidia_gpu_cleanup("amd-mi350-1gpu-bench")
 
 
+def test_b200v2_setup_forces_all_apt_invocations_to_ipv4(tmp_path, capsys):
+    setup_runner("b200v2-4gpu", {}, tmp_path, dry_run=True)
+
+    output = capsys.readouterr().out
+    assert (
+        "Acquire::ForceIPv4 \"true\";"
+        "' | sudo tee /etc/apt/apt.conf.d/99tokenspeed-force-ipv4"
+    ) in output
+
+
 def test_execute_cli_defaults_to_ci_setup_mode():
     args = parse_args(
         [
