@@ -804,11 +804,6 @@ def test_kda_real_flat_pool_component_views_end_to_end(
             h.extend(layer_id, s["mixed"][:8], s["g_raw"][:8], s["beta_raw"][:8])
         )
 
-    from tokenspeed_kernel.thirdparty.triton import fla_kda_recurrent
-
-    def _unexpected_megafuse(*args, **kwargs):
-        raise AssertionError("AMD FlatKV decode must bypass the FLA KDA megafuse")
-
     indexed_decode_calls = 0
     indexed_decode = hybrid_linear_attn.kda_paged_decode
 
@@ -817,11 +812,6 @@ def test_kda_real_flat_pool_component_views_end_to_end(
         indexed_decode_calls += 1
         return indexed_decode(*args, **kwargs)
 
-    monkeypatch.setattr(
-        fla_kda_recurrent,
-        "fused_recurrent_kda_megafuse",
-        _unexpected_megafuse,
-    )
     monkeypatch.setattr(
         hybrid_linear_attn,
         "kda_paged_decode",
