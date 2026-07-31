@@ -155,9 +155,13 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             max_total_tokens=size,
             max_context_len=max_context_len,
         )
-        specs, counts = published
-        self.paged_cache_group_specs = tuple(specs)
-        self.paged_cache_group_page_counts = counts
+        if published is None:
+            self.paged_cache_group_specs = ()
+            self.paged_cache_group_page_counts = {}
+        else:
+            specs, counts = published
+            self.paged_cache_group_specs = tuple(specs)
+            self.paged_cache_group_page_counts = counts
         # Slab aliasing is only safe under the single-BlockPool ownership the
         # published groups configure.
         assert self._slab_group_size is None or self.paged_cache_group_specs

@@ -339,7 +339,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
         with self.assertRaisesRegex(
             RuntimeError,
             r"hybrid slab KV layout is incompatible with PD disaggregation"
-            r".*legacy scheduler",
+            r".*disaggregation_mode='null'",
         ):
             self._pool(pd_disaggregation_enabled=True)
 
