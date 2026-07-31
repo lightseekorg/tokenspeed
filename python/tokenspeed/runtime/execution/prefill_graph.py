@@ -46,9 +46,11 @@ from __future__ import annotations
 
 import bisect
 from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
+import tqdm
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     BreakableCapture,
@@ -59,9 +61,15 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.layers.attention.backends.flat_cache_metadata import (
+    FlatCacheBatchMetadata,
+)
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.common import maybe_inference_mode
+from tokenspeed.runtime.utils.common import (
+    get_available_gpu_memory,
+    maybe_inference_mode,
+)
 
 logger = get_colorful_logger(__name__)
 
@@ -243,18 +251,20 @@ class PrefillGraph:
             or self._embed_tokens is None
             or model_runner is None
             or not model_runner.is_generation
-            # The FlatKV decode graph is wired, but its breakable prefill graph
-            # is not: the dummy batch carries no operation-bound
-            # FlatCacheBatchMetadata, so a contract-bound MLA/KDA backend would
-            # refuse capture. Use eager prefill until that metadata can be
-            # represented during capture. TODO(flatkv-prefill-graph).
-            or getattr(token_to_kv_pool, "runtime_contract", None) is not None
             # DP replay decisions must come from replicated state, and a
             # forward's multimodal-ness is rank-local: one rank running its mm
             # prefill eager while text-only peers replay desyncs the EP
             # collectives. Until the DP metadata gather carries a multimodal
             # flag, keep the graph off for multimodal models under DP.
             or (config.data_parallel_size > 1 and model_runner.is_multimodal)
+        )
+
+        # Whether the dummy-forward machinery is usable at all (graph or eager).
+        self._dummy_forward_viable = (
+            self.inner_model is not None
+            and self._embed_tokens is not None
+            and model_runner is not None
+            and model_runner.is_generation
         )
 
         self._ctx: ForwardContext | None = None
@@ -341,7 +351,17 @@ class PrefillGraph:
             self.disable = True
 
     def _capture_all_buckets(self, decode_wrapper: CudaGraphWrapper | None) -> None:
-        for bucket in sorted(self.capture_buckets, reverse=True):
+        rank = self.config.global_rank
+        buckets = sorted(self.capture_buckets, reverse=True)
+        capture_range = tqdm.tqdm(buckets) if rank == 0 else buckets
+        for bucket in capture_range:
+            if rank == 0:
+                avail_mem = get_available_gpu_memory(
+                    self.config.device, self.config.gpu_id, empty_cache=False
+                )
+                capture_range.set_description(
+                    f"Capturing prefill buckets ({bucket=} {avail_mem=:.2f} GB)"
+                )
             self._ctx = self._make_dummy_batch(bucket, decode_wrapper)
             self._land_input_embeds(
                 self._embed_tokens(self.input_buffers.input_ids_buf[:bucket]), bucket
@@ -413,10 +433,18 @@ class PrefillGraph:
             self._input_embeds_buf[num_tokens:bucket].zero_()
 
     def _dummy_flat_tables(self, num_tokens: int) -> dict[str, "torch.Tensor"]:
-        """Dummy batch must carry flat tables (else the non-flat path gets captured); zeros = null block 0."""
+        """Build capture tables: null KV pages and one writable state page."""
         backend = self.attn_backend
         if not getattr(backend, "uses_flat_cache_groups", False):
             return {}
+        specs = tuple(getattr(self.token_to_kv_pool, "paged_cache_group_specs", ()))
+        state_group_ids = {
+            str(spec.group_id)
+            for spec in specs
+            if getattr(spec, "family", "history") == "state"
+        }
+        if not state_group_ids:
+            state_group_ids = set(getattr(backend, "flat_state_group_ids", frozenset()))
         # Composite wrappers (hybrid) hold the flat KV consumer as a child.
         if not hasattr(backend, "page_size") and hasattr(backend, "full_attn_backend"):
             backend = backend.full_attn_backend
@@ -429,10 +457,13 @@ class PrefillGraph:
         # mamba child, which requires its state group; KV children shed state
         # groups themselves (_shed_state_groups).
         return {
-            str(spec.group_id): torch.zeros(
-                (1, width), dtype=torch.int32, device=self.config.device
+            str(spec.group_id): torch.full(
+                (1, width),
+                1 if str(spec.group_id) in state_group_ids else 0,
+                dtype=torch.int32,
+                device=self.config.device,
             )
-            for spec in getattr(self.token_to_kv_pool, "paged_cache_group_specs", ())
+            for spec in specs
         }
 
     def _make_dummy_batch(
@@ -494,6 +525,26 @@ class PrefillGraph:
             extra_metadata_kwargs["positions"] = ib.positions_buf[:num_tokens]
         flat_tables = self._dummy_flat_tables(num_tokens)
         if flat_tables:
+            contract = getattr(self.token_to_kv_pool, "runtime_contract", None)
+            if contract is not None:
+                arrays = {
+                    group_id: table.cpu().numpy()
+                    for group_id, table in flat_tables.items()
+                }
+                dummy_forward_op = SimpleNamespace(
+                    flat_block_tables_arrays=lambda: arrays
+                )
+                flat_cache_metadata = FlatCacheBatchMetadata.from_forward_op(
+                    dummy_forward_op,
+                    device=self.config.device,
+                    contract=contract,
+                    num_requests=1,
+                )
+                flat_tables = dict(
+                    flat_cache_metadata.tables(active_forward_op=dummy_forward_op)
+                )
+                extra_metadata_kwargs["flat_cache_metadata"] = flat_cache_metadata
+                extra_metadata_kwargs["flat_cache_forward_op"] = dummy_forward_op
             extra_metadata_kwargs["flat_block_tables"] = flat_tables
         self.attn_backend.init_forward_metadata(
             bs=1,
@@ -534,6 +585,98 @@ class PrefillGraph:
     # ------------------------------------------------------------------
     # Replay dispatch
     # ------------------------------------------------------------------
+
+    def warmup_eager(self, decode_wrapper: CudaGraphWrapper | None = None) -> None:
+        """One eager max-chunk dummy prefill before serving starts.
+
+        Startup otherwise executes only decode-shaped forwards (decode graph
+        capture; prefill graphs are off by default), so the first REAL prefill
+        chunk is the first execution of every prefill-tile kernel: their CUDA
+        modules lazy-load with driver allocations OUTSIDE the torch pool, which
+        can fail mid-serving on high ``--gpu-memory-utilization`` deployments
+        (the allocator hoards the headroom by then; the failure surfaces as an
+        async OOM at the next graph replay). Running the max chunk once here
+        front-loads those module loads -- and gives per-size lazy autotuners
+        their only look at the max prefill bucket before
+        ``freeze_autotuning()``.
+
+        Best-effort: skipped when the dummy-forward machinery does not cover
+        this model family (same seam as graph capture), or when prefill graph
+        capture already exercised the full bucket ladder.
+        """
+        if not self._dummy_forward_viable:
+            return
+        chunk = int(self.config.chunked_prefill_size or 0)
+        chunk = min(chunk, int(self.input_buffers.max_num_tokens))
+        # Graph capture (default ladder tops out at 2048 tokens) only exercises
+        # its buckets; forwards above the largest bucket run eager -- those are
+        # exactly the shapes serving would otherwise first-execute.
+        if chunk <= max(self._captures, default=0):
+            return
+        weight = self._embed_tokens.weight
+        captured_embeds_buf = self._input_embeds_buf
+        captured_max = max(self._captures, default=0)
+        try:
+            # The transient eager activations of a full chunk may not fit next
+            # to weights + KV + graph pools on tightly budgeted deployments:
+            # halve on OOM (each size still front-loads the large-tile kernel
+            # families) rather than failing a boot that used to come up. OOM
+            # is allocator-symmetric across ranks (identical dummy inputs), so
+            # every rank retries the same ladder in lockstep.
+            tokens = chunk
+            while tokens > captured_max:
+                try:
+                    self._input_embeds_buf = torch.zeros(
+                        tokens,
+                        weight.shape[1],
+                        dtype=weight.dtype,
+                        device=weight.device,
+                    )
+                    with maybe_inference_mode():
+                        self._ctx = self._make_dummy_batch(tokens, decode_wrapper)
+                        self._land_input_embeds(
+                            self._embed_tokens(
+                                self.input_buffers.input_ids_buf[:tokens]
+                            ),
+                            tokens,
+                        )
+                        with active_forward(self._ctx):
+                            self._run_inner(tokens)
+                    torch.cuda.synchronize()
+                    if self.config.global_rank == 0:
+                        logger.info("Eager prefill warmup ran at %d tokens", tokens)
+                        if tokens < chunk:
+                            logger.warning(
+                                "Eager prefill warmup only fit %d of %d chunk "
+                                "tokens: this deployment cannot execute its own "
+                                "--chunked-prefill-size next to weights + KV; "
+                                "lower --gpu-memory-utilization or the chunk "
+                                "size, or serving may OOM on large prefills.",
+                                tokens,
+                                chunk,
+                            )
+                    return
+                except torch.OutOfMemoryError:
+                    self._ctx = None
+                    self._input_embeds_buf = None
+                    torch.cuda.empty_cache()
+                    tokens //= 2
+            logger.warning(
+                "Eager prefill warmup could not fit any bucket above the "
+                "graph-captured %d tokens; the first large prefill will load "
+                "its kernels mid-serving.",
+                captured_max,
+            )
+        except (NotImplementedError, AttributeError, KeyError, RuntimeError) as exc:
+            logger.warning(
+                "Eager prefill warmup failed (%s: %s); the first real prefill "
+                "will load its kernels mid-serving instead.",
+                type(exc).__name__,
+                exc,
+            )
+        finally:
+            self._ctx = None
+            self._input_embeds_buf = captured_embeds_buf
 
     def can_run(self, ctx: ForwardContext, multimodal_context=None) -> bool:
         """Whether this forward replays a captured graph (mirrors decode's can_run).

@@ -26,126 +26,27 @@ from collections.abc import Mapping
 import torch
 
 from tokenspeed.runtime.configs.flat_cache_runtime import require_positive_int
-from tokenspeed.runtime.configs.hybrid_cache_plan import (
-    CacheComponentSpec,
-    FlatHybridCachePlan,
-    LayerCacheSpec,
-    plan_flat_hybrid_cache,
-)
 from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
+from tokenspeed.runtime.configs.lcm_layouts import (
+    kimi_k3_lcm_fields as build_lcm_fields,
+)
+from tokenspeed.runtime.configs.lcm_memory_plan import (
+    LcmMemoryPlan,
+    plan_lcm_fields,
+)
 from tokenspeed.runtime.configs.paged_cache_spec import FULL_ATTENTION, LINEAR_ATTENTION
 
 _KIMI_K3_LAYERS = 93
 _KIMI_K3_KDA_LAYERS = 69
 _KIMI_K3_MLA_LAYERS = 24
+_KIMI_K3_LOGICAL_BLOCK_TOKENS = 128
+_KIMI_K3_STATE_GROUPS = 3
 
 
 def _require_non_negative_int(name: str, value: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
     return value
-
-
-def kimi_k3_shared_pool_pages(
-    plan: FlatHybridCachePlan,
-    *,
-    token_capacity: int,
-    max_scheduled_tokens: int,
-    max_live_requests: int,
-    decode_input_tokens: int = 1,
-    overlap_schedule_depth: int = 0,
-) -> int:
-    """Return usable shared-pool pages needed for a Kimi-K3 token capacity.
-
-    The scheduler allocates globally unique page ids from one physical pool,
-    so every logical group's peak demand must be summed. Full-history groups
-    retain all admitted tokens and include per-request tail fragmentation.
-    State groups retain one recurrent window per live request plus the largest
-    scheduled chunk. Overlap protects the next decode allocation in every
-    group.
-    """
-    require_positive_int("plan.block_size", plan.block_size)
-    require_positive_int("token_capacity", token_capacity)
-    _require_non_negative_int("max_scheduled_tokens", max_scheduled_tokens)
-    require_positive_int("max_live_requests", max_live_requests)
-    _require_non_negative_int("decode_input_tokens", decode_input_tokens)
-    if overlap_schedule_depth not in (0, 1):
-        raise ValueError(
-            f"overlap_schedule_depth must be 0 or 1, got {overlap_schedule_depth}"
-        )
-    if overlap_schedule_depth and decode_input_tokens == 0:
-        raise ValueError("overlapped FlatKV sizing requires decode_input_tokens > 0")
-
-    page_size = plan.block_size
-    protected_pages = max_live_requests * math.ceil(
-        overlap_schedule_depth * decode_input_tokens / page_size
-    )
-    scheduled_pages = math.ceil(min(max_scheduled_tokens, token_capacity) / page_size)
-    total_pages = 0
-    for group in plan.groups:
-        if group.family == "history":
-            total_pages += (
-                math.ceil(token_capacity / page_size)
-                + max_live_requests
-                - 1
-                + protected_pages
-            )
-        elif group.family == "state":
-            # State+FullHistory is the scheduler's recurrent-state kind. It
-            # keeps one live state page/request; explicit sliding groups use
-            # their configured resident window instead.
-            resident_tokens = (
-                1
-                if group.sliding_window_tokens is None
-                else max(group.sliding_window_tokens - 1, 0)
-            )
-            resident_pages = max_live_requests * math.ceil(resident_tokens / page_size)
-            total_pages += resident_pages + scheduled_pages + protected_pages
-        else:
-            raise ValueError(
-                f"Kimi-K3 group {group.group_id!r} has unsupported family "
-                f"{group.family!r}"
-            )
-    return total_pages
-
-
-def kimi_k3_token_capacity_for_shared_pool(
-    plan: FlatHybridCachePlan,
-    *,
-    usable_pages: int,
-    max_scheduled_tokens: int,
-    max_live_requests: int,
-    decode_input_tokens: int = 1,
-    overlap_schedule_depth: int = 0,
-    upper_bound_tokens: int | None = None,
-) -> int:
-    """Invert :func:`kimi_k3_shared_pool_pages` by monotonic binary search."""
-    require_positive_int("usable_pages", usable_pages)
-    if upper_bound_tokens is None:
-        upper_bound_tokens = usable_pages * plan.block_size
-    require_positive_int("upper_bound_tokens", upper_bound_tokens)
-
-    low, high = 0, upper_bound_tokens
-    while low < high:
-        candidate = (low + high + 1) // 2
-        required_pages = kimi_k3_shared_pool_pages(
-            plan,
-            token_capacity=candidate,
-            max_scheduled_tokens=max_scheduled_tokens,
-            max_live_requests=max_live_requests,
-            decode_input_tokens=decode_input_tokens,
-            overlap_schedule_depth=overlap_schedule_depth,
-        )
-        if required_pages <= usable_pages:
-            low = candidate
-        else:
-            high = candidate - 1
-    if low == 0:
-        raise ValueError(
-            f"usable_pages={usable_pages} cannot admit one token with the "
-            "configured Kimi-K3 FlatKV scheduler limits"
-        )
-    return low
 
 
 def _one_based_layers(value: object, name: str, num_layers: int) -> tuple[int, ...]:
@@ -161,46 +62,33 @@ def _one_based_layers(value: object, name: str, num_layers: int) -> tuple[int, .
     return tuple(sorted(layers))
 
 
-def build_kimi_k3_cache_specs(
-    text_config: KimiLinearConfig,
-    *,
-    tp_size: int,
-    mla_cache_dtype: torch.dtype,
-    mla_quant_method: str | None,
-    preferred_block_size: int,
-    kernel_alignment: int,
-) -> tuple[LayerCacheSpec, ...]:
+def kimi_k3_layer_group_ids(text_config: KimiLinearConfig) -> tuple[str, ...]:
+    """Map every Kimi-K3 layer to one Full or KDA cache group."""
     if text_config.num_hidden_layers != _KIMI_K3_LAYERS:
         raise ValueError(
             f"Kimi-K3 FlatKV requires 93 layers, got {text_config.num_hidden_layers}"
         )
-    tp_size = require_positive_int("tp_size", tp_size)
-    preferred_block_size = require_positive_int(
-        "preferred_block_size", preferred_block_size
-    )
-    kernel_alignment = require_positive_int("kernel_alignment", kernel_alignment)
-    if mla_cache_dtype != torch.float8_e4m3fn:
-        raise ValueError(
-            "Kimi-K3 FlatKV initially requires mla_cache_dtype=torch.float8_e4m3fn"
-        )
-    if mla_quant_method == "per_token_head":
-        raise ValueError("Kimi-K3 FlatKV does not support per_token_head MLA cache")
-    if getattr(text_config, "mla_use_nope", None) is not True:
-        raise ValueError("Kimi-K3 FlatKV requires mla_use_nope=True")
-
     linear = text_config.linear_attn_config
     if not isinstance(linear, Mapping):
         raise ValueError("linear_attn_config must be a mapping")
     kda_layers = _one_based_layers(
         linear.get("kda_layers"), "linear_attn_config.kda_layers", _KIMI_K3_LAYERS
     )
-    kda_set = set(kda_layers)
-    complement = tuple(
-        layer for layer in range(1, _KIMI_K3_LAYERS + 1) if layer not in kda_set
+    kda_layer_ids = tuple(layer - 1 for layer in kda_layers)
+    full_layer_ids = tuple(
+        layer_id
+        for layer_id in range(_KIMI_K3_LAYERS)
+        if layer_id not in set(kda_layer_ids)
     )
+    if (
+        len(kda_layer_ids) != _KIMI_K3_KDA_LAYERS
+        or len(full_layer_ids) != _KIMI_K3_MLA_LAYERS
+    ):
+        raise ValueError(
+            f"Kimi-K3 FlatKV requires 69 KDA and 24 MLA layers, got "
+            f"{len(kda_layer_ids)} and {len(full_layer_ids)}"
+        )
     if "full_attn_layers" in linear:
-        # MTP checkpoints also list the NextN draft layer(s) past the base
-        # depth; they belong to the draft worker, not the base cache plan.
         declared = [
             layer
             for layer in linear["full_attn_layers"]
@@ -211,16 +99,37 @@ def build_kimi_k3_cache_specs(
             "linear_attn_config.full_attn_layers",
             _KIMI_K3_LAYERS,
         )
-        if declared_full != complement:
+        if declared_full != tuple(layer_id + 1 for layer_id in full_layer_ids):
             raise ValueError(
                 "linear_attn_config.full_attn_layers must equal the kda_layers complement"
             )
-    if len(kda_layers) != _KIMI_K3_KDA_LAYERS or len(complement) != _KIMI_K3_MLA_LAYERS:
-        raise ValueError(
-            f"Kimi-K3 FlatKV requires 69 KDA and 24 MLA layers, got "
-            f"{len(kda_layers)} and {len(complement)}"
-        )
 
+    group_ids = [FULL_ATTENTION] * _KIMI_K3_LAYERS
+    per_group = _KIMI_K3_KDA_LAYERS // _KIMI_K3_STATE_GROUPS
+    for index, layer_id in enumerate(kda_layer_ids):
+        group_ids[layer_id] = f"{LINEAR_ATTENTION}_{index // per_group}"
+    return tuple(group_ids)
+
+
+def build_kimi_k3_lcm_fields(
+    text_config: KimiLinearConfig,
+    *,
+    tp_size: int,
+    mla_cache_dtype: torch.dtype,
+    mla_quant_method: str | None,
+) -> tuple:
+    """Build the Kimi-K3 fields consumed by the common LCM planner."""
+    tp_size = require_positive_int("tp_size", tp_size)
+    if mla_cache_dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            "Kimi-K3 FlatKV initially requires mla_cache_dtype=torch.float8_e4m3fn"
+        )
+    if mla_quant_method == "per_token_head":
+        raise ValueError("Kimi-K3 FlatKV does not support per_token_head MLA cache")
+    if getattr(text_config, "mla_use_nope", None) is not True:
+        raise ValueError("Kimi-K3 FlatKV requires mla_use_nope=True")
+
+    linear = text_config.linear_attn_config
     num_heads = require_positive_int(
         "linear_attn_config.num_heads", linear.get("num_heads")
     )
@@ -237,121 +146,151 @@ def build_kimi_k3_cache_specs(
         )
     kv_lora_rank = require_positive_int("kv_lora_rank", text_config.kv_lora_rank)
     rope_dim = require_positive_int("qk_rope_head_dim", text_config.qk_rope_head_dim)
-
-    latent_shape = (1, kv_lora_rank + rope_dim)
-    history_components = (
-        CacheComponentSpec(
-            "latent_kv",
-            latent_shape,
-            mla_cache_dtype,
-            math.prod(latent_shape) * mla_cache_dtype.itemsize,
-            0,
-            mla_cache_dtype.itemsize,
-        ),
+    return build_lcm_fields(
+        layer_group_ids=kimi_k3_layer_group_ids(text_config),
+        logical_block_tokens=_KIMI_K3_LOGICAL_BLOCK_TOKENS,
+        latent_width=kv_lora_rank + rope_dim,
+        mla_element_size=mla_cache_dtype.itemsize,
+        conv_shape=(3 * num_heads * head_dim // tp_size, kernel_size - 1),
+        conv_element_size=torch.bfloat16.itemsize,
+        recurrent_shape=(num_heads // tp_size, head_dim, head_dim),
+        recurrent_element_size=torch.float32.itemsize,
     )
-    conv_shape = (3 * num_heads * head_dim // tp_size, kernel_size - 1)
-    recurrent_shape = (num_heads // tp_size, head_dim, head_dim)
-    state_components = (
-        CacheComponentSpec(
-            "conv_state",
-            conv_shape,
-            torch.bfloat16,
-            0,
-            math.prod(conv_shape) * torch.bfloat16.itemsize,
-            torch.bfloat16.itemsize,
-        ),
-        CacheComponentSpec(
-            "recurrent_state",
-            recurrent_shape,
-            torch.float32,
-            0,
-            math.prod(recurrent_shape) * torch.float32.itemsize,
-            torch.float32.itemsize,
-        ),
-    )
-    specs: list[LayerCacheSpec] = []
-    for layer_id in range(_KIMI_K3_LAYERS):
-        is_kda = layer_id + 1 in kda_set
-        specs.append(
-            LayerCacheSpec(
-                layer_id=layer_id,
-                family="state" if is_kda else "history",
-                retention="full_history",
-                transfer_policy="latest_snapshot" if is_kda else "full_suffix",
-                group_id_prefix=LINEAR_ATTENTION if is_kda else FULL_ATTENTION,
-                group_order=1 if is_kda else 0,
-                compatibility_key=(
-                    (
-                        "kda_state",
-                        conv_shape,
-                        recurrent_shape,
-                        torch.bfloat16,
-                        torch.float32,
-                    )
-                    if is_kda
-                    else ("mla_history", latent_shape, mla_cache_dtype)
-                ),
-                preferred_block_size=preferred_block_size,
-                kernel_alignment=kernel_alignment,
-                components=state_components if is_kda else history_components,
-            )
-        )
-    return tuple(specs)
 
 
-def plan_kimi_k3_flat_cache(
+def plan_kimi_k3_lcm_cache(
     text_config: KimiLinearConfig,
     *,
     flat_kvcache_enabled: bool,
     tp_size: int,
     mla_cache_dtype: torch.dtype,
     mla_quant_method: str | None,
-    preferred_block_size: int,
-    kernel_alignment: int,
-    cache_budget_bytes: int,
-    minimum_usable_pages: int = 1,
-) -> FlatHybridCachePlan:
+    cache_budget_bytes: int | None = None,
+    num_lcm_blocks: int | None = None,
+) -> LcmMemoryPlan:
+    """Plan Kimi-K3 on the common P=128 two-level LCM geometry."""
     if not flat_kvcache_enabled:
         raise RuntimeError(
             "Kimi-K3 is FlatKV-only and requires tokenspeed_scheduler.FLAT_KVCACHE=True"
         )
-    specs = build_kimi_k3_cache_specs(
+    fields = build_kimi_k3_lcm_fields(
         text_config,
         tp_size=tp_size,
         mla_cache_dtype=mla_cache_dtype,
         mla_quant_method=mla_quant_method,
-        preferred_block_size=preferred_block_size,
-        kernel_alignment=kernel_alignment,
     )
-    plan = plan_flat_hybrid_cache(
-        specs,
-        cache_budget_bytes=cache_budget_bytes,
-        minimum_usable_pages=minimum_usable_pages,
+    plan = plan_lcm_fields(
+        fields,
+        logical_block_tokens=_KIMI_K3_LOGICAL_BLOCK_TOKENS,
+        budget_bytes=cache_budget_bytes,
+        num_lcm_blocks=num_lcm_blocks,
+        cache_blocks_per_lcm_block={
+            FULL_ATTENTION: 12,
+            f"{LINEAR_ATTENTION}_0": 1,
+            f"{LINEAR_ATTENTION}_1": 1,
+            f"{LINEAR_ATTENTION}_2": 1,
+        },
+        alignment=256,
     )
-    expected_group_ids = (
-        FULL_ATTENTION,
-        f"{LINEAR_ATTENTION}_0",
-        f"{LINEAR_ATTENTION}_1",
-        f"{LINEAR_ATTENTION}_2",
-    )
-    actual_group_ids = tuple(group.group_id for group in plan.groups)
-    if actual_group_ids != expected_group_ids:
+    packing = {
+        group.group_id: group.cache_blocks_per_lcm_block for group in plan.groups
+    }
+    expected_packing = {
+        FULL_ATTENTION: 12,
+        f"{LINEAR_ATTENTION}_0": 1,
+        f"{LINEAR_ATTENTION}_1": 1,
+        f"{LINEAR_ATTENTION}_2": 1,
+    }
+    if packing != expected_packing:
         raise ValueError(
-            f"Kimi-K3 FlatKV expected groups {expected_group_ids}, got {actual_group_ids}"
+            f"Kimi-K3 LCM packing must be {expected_packing}, got {packing}"
         )
-    if len(plan.physical_slots) != 24:
-        raise ValueError(
-            f"Kimi-K3 FlatKV expected 24 physical slots, got {len(plan.physical_slots)}"
-        )
-    if plan.diagnostics.padding_binding_count != 3:
-        raise ValueError(
-            "Kimi-K3 FlatKV expected three padding bindings, got "
-            f"{plan.diagnostics.padding_binding_count}"
-        )
-    if len(plan.layer_bindings) != _KIMI_K3_LAYERS:
-        raise ValueError(
-            f"Kimi-K3 FlatKV expected 93 layer bindings, got {len(plan.layer_bindings)}"
-        )
-    if any(group.block_size != plan.block_size for group in plan.groups):
-        raise ValueError("Kimi-K3 FlatKV requires one common block size for all groups")
+    if len(plan.planes) != _KIMI_K3_MLA_LAYERS:
+        raise ValueError(f"Kimi-K3 LCM requires 24 planes, got {len(plan.planes)}")
     return plan
+
+
+def kimi_k3_lcm_blocks_needed(
+    plan: LcmMemoryPlan,
+    *,
+    token_capacity: int,
+    max_scheduled_tokens: int,
+    max_live_requests: int,
+    decode_input_tokens: int = 1,
+    overlap_schedule_depth: int = 0,
+) -> int:
+    """Return physical LCM parents needed at the configured concurrency."""
+    require_positive_int("plan.logical_block_tokens", plan.logical_block_tokens)
+    require_positive_int("token_capacity", token_capacity)
+    _require_non_negative_int("max_scheduled_tokens", max_scheduled_tokens)
+    require_positive_int("max_live_requests", max_live_requests)
+    _require_non_negative_int("decode_input_tokens", decode_input_tokens)
+    if overlap_schedule_depth not in (0, 1):
+        raise ValueError(
+            f"overlap_schedule_depth must be 0 or 1, got {overlap_schedule_depth}"
+        )
+    if overlap_schedule_depth and decode_input_tokens == 0:
+        raise ValueError("overlapped FlatKV sizing requires decode_input_tokens > 0")
+
+    page_tokens = plan.logical_block_tokens
+    protected_pages = max_live_requests * math.ceil(
+        overlap_schedule_depth * decode_input_tokens / page_tokens
+    )
+    scheduled_pages = math.ceil(min(max_scheduled_tokens, token_capacity) / page_tokens)
+    total_lcm_blocks = 0
+    for group in plan.groups:
+        if group.group_id == FULL_ATTENTION:
+            child_pages = (
+                math.ceil(token_capacity / page_tokens)
+                + max_live_requests
+                - 1
+                + protected_pages
+            )
+        else:
+            child_pages = max_live_requests + scheduled_pages + protected_pages
+        total_lcm_blocks += math.ceil(child_pages / group.cache_blocks_per_lcm_block)
+    return total_lcm_blocks
+
+
+def kimi_k3_token_capacity_for_lcm_pool(
+    plan: LcmMemoryPlan,
+    *,
+    num_lcm_blocks: int,
+    max_scheduled_tokens: int,
+    max_live_requests: int,
+    decode_input_tokens: int = 1,
+    overlap_schedule_depth: int = 0,
+    upper_bound_tokens: int | None = None,
+) -> int:
+    """Invert :func:`kimi_k3_lcm_blocks_needed` by monotonic binary search."""
+    require_positive_int("num_lcm_blocks", num_lcm_blocks)
+    if upper_bound_tokens is None:
+        full_group = plan.group(FULL_ATTENTION)
+        upper_bound_tokens = (
+            num_lcm_blocks
+            * full_group.cache_blocks_per_lcm_block
+            * plan.logical_block_tokens
+        )
+    require_positive_int("upper_bound_tokens", upper_bound_tokens)
+
+    low, high = 0, upper_bound_tokens
+    while low < high:
+        candidate = (low + high + 1) // 2
+        required = kimi_k3_lcm_blocks_needed(
+            plan,
+            token_capacity=candidate,
+            max_scheduled_tokens=max_scheduled_tokens,
+            max_live_requests=max_live_requests,
+            decode_input_tokens=decode_input_tokens,
+            overlap_schedule_depth=overlap_schedule_depth,
+        )
+        if required <= num_lcm_blocks:
+            low = candidate
+        else:
+            high = candidate - 1
+    if low == 0:
+        raise ValueError(
+            f"num_lcm_blocks={num_lcm_blocks} cannot admit one token with "
+            "the configured Kimi-K3 FlatKV scheduler limits"
+        )
+    return low

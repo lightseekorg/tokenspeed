@@ -127,7 +127,6 @@ struct FlatForwardOperation {
     // vectors above cost one PyLong per page id at every attribute access.
     std::map<std::string, std::vector<std::int32_t>> flat_block_tables_contig;
     std::map<std::string, std::array<std::size_t, 2>> flat_block_tables_dims;
-
     explicit FlatForwardOperation(std::vector<ForwardOperation> ops) {
         std::stable_partition(ops.begin(), ops.end(),
                               [](const ForwardOperation& a) { return std::holds_alternative<PrefillOperation>(a); });

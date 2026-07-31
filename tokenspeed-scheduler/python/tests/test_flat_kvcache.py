@@ -128,7 +128,8 @@ def test_k3_four_groups_share_one_global_id_namespace() -> None:
     before = scheduler.available_kv_pages()
     assert before == 32
     scheduler.submit_requests([_make_spec("r1", num_pages=2)])
-    op = _find_flat_op(scheduler.next_execution_plan())
+    plan = scheduler.next_execution_plan()
+    op = _find_flat_op(plan)
     assert op is not None
     tables = dict(op.flat_block_tables)
     assert tuple(tables) == K3_GROUP_IDS
@@ -144,6 +145,13 @@ def test_k3_four_groups_share_one_global_id_namespace() -> None:
     for index, left in enumerate(real_by_group):
         for right in tuple(real_by_group)[index + 1 :]:
             assert real_by_group[left].isdisjoint(real_by_group[right])
+    pages_to_zero = {
+        group_id: list(page_ids)
+        for group_id, page_ids in dict(plan.flat_pages_to_zero).items()
+    }
+    assert set(pages_to_zero) == set(K3_GROUP_IDS)
+    for group_id in K3_GROUP_IDS:
+        assert set(pages_to_zero[group_id]) == real_by_group[group_id]
 
     _abort(scheduler, "r1")
     scheduler.next_execution_plan()

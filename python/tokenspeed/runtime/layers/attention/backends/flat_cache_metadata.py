@@ -43,7 +43,7 @@ class FlatCacheBatchMetadata:
     Attributes:
         group_ids: Cache group IDs in runtime-contract order.
         num_requests: Number of request rows in each group table.
-        max_page_id: Inclusive maximum page ID accepted from the scheduler.
+        max_page_ids: Inclusive maximum page ID accepted for each group.
         block_size: Tokens per flat page (uniform across contract groups).
         full_attention_group_id: The unique ``family="history"`` +
             ``retention="full_history"`` group ID, or ``None`` when the
@@ -53,7 +53,7 @@ class FlatCacheBatchMetadata:
     group_ids: tuple[str, ...]
     _group_tables: Mapping[str, torch.Tensor] = field(repr=False, compare=False)
     num_requests: int
-    max_page_id: int
+    max_page_ids: Mapping[str, int]
     block_size: int
     full_attention_group_id: str | None
     _forward_op: Any = field(repr=False, compare=False)
@@ -74,8 +74,14 @@ class FlatCacheBatchMetadata:
         if forward_op is None:
             raise ValueError("forward_op must not be None")
         require_positive_int("num_reqs", num_requests)
-        max_page_id = require_positive_int("max_page_id", contract.usable_pages)
         group_ids = tuple(spec.group_id for spec in contract.group_specs)
+        max_page_ids = {
+            group_id: require_positive_int(
+                f"max page ID for {group_id!r}",
+                contract.group_page_counts[group_id] - 1,
+            )
+            for group_id in group_ids
+        }
         if (
             not group_ids
             or any(
@@ -98,13 +104,13 @@ class FlatCacheBatchMetadata:
             device,
             num_reqs=num_requests,
             expected_group_ids=group_ids,
-            max_page_id=max_page_id,
+            max_page_ids=max_page_ids,
         )
         return cls._from_validated_tables(
             group_ids=group_ids,
             group_tables=tables,
             num_requests=num_requests,
-            max_page_id=max_page_id,
+            max_page_ids=max_page_ids,
             block_size=block_size,
             full_attention_group_id=(
                 full_attention_ids[0] if len(full_attention_ids) == 1 else None
@@ -119,7 +125,7 @@ class FlatCacheBatchMetadata:
         group_ids: tuple[str, ...],
         group_tables: Mapping[str, torch.Tensor],
         num_requests: int,
-        max_page_id: int,
+        max_page_ids: Mapping[str, int],
         block_size: int,
         full_attention_group_id: str | None,
         forward_op: Any,
@@ -154,7 +160,9 @@ class FlatCacheBatchMetadata:
         object.__setattr__(metadata, "group_ids", group_ids)
         object.__setattr__(metadata, "_group_tables", MappingProxyType(ordered))
         object.__setattr__(metadata, "num_requests", num_requests)
-        object.__setattr__(metadata, "max_page_id", max_page_id)
+        object.__setattr__(
+            metadata, "max_page_ids", MappingProxyType(dict(max_page_ids))
+        )
         object.__setattr__(metadata, "block_size", block_size)
         object.__setattr__(metadata, "full_attention_group_id", full_attention_group_id)
         # A strong reference makes Python/nanobind object identity safe against

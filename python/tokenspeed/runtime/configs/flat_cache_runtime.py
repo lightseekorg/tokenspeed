@@ -54,23 +54,15 @@ def require_positive_int(name: str, value: object) -> int:
 @dataclass(frozen=True)
 class FlatPagedCacheRuntimeContract:
     block_size: int
-    usable_pages: int
-    num_device_pages_with_null: int
+    num_lcm_blocks: int
     token_capacity: int
     group_specs: tuple[PagedCacheGroupSpec, ...]
     group_page_counts: Mapping[str, int]
 
     def __post_init__(self) -> None:
         block_size = require_positive_int("block_size", self.block_size)
-        usable_pages = require_positive_int("usable_pages", self.usable_pages)
-        total_pages = require_positive_int(
-            "num_device_pages_with_null", self.num_device_pages_with_null
-        )
+        num_lcm_blocks = require_positive_int("num_lcm_blocks", self.num_lcm_blocks)
         token_capacity = require_positive_int("token_capacity", self.token_capacity)
-        if total_pages != usable_pages + 1:
-            raise ValueError("num_device_pages_with_null must equal usable_pages + 1")
-        if token_capacity > usable_pages * block_size:
-            raise ValueError("token_capacity must not exceed usable_pages * block_size")
         if not isinstance(self.group_specs, tuple) or not self.group_specs:
             raise ValueError("group_specs must be a non-empty tuple")
         if any(not isinstance(spec, PagedCacheGroupSpec) for spec in self.group_specs):
@@ -93,8 +85,24 @@ class FlatPagedCacheRuntimeContract:
             )
             for group_id in group_ids
         }
-        if any(count != total_pages for count in counts.values()):
+        expected_counts = {
+            spec.group_id: num_lcm_blocks
+            * require_positive_int(
+                f"cache_blocks_per_lcm_block for {spec.group_id!r}",
+                spec.cache_blocks_per_lcm_block,
+            )
+            + 1
+            for spec in self.group_specs
+        }
+        if counts != expected_counts:
             raise ValueError(
-                "every group page count must equal num_device_pages_with_null"
+                "group page counts must equal num_lcm_blocks * "
+                "cache_blocks_per_lcm_block + 1: "
+                f"expected={expected_counts}, got={counts}"
+            )
+        max_child_pages = max(counts.values()) - 1
+        if token_capacity > max_child_pages * block_size:
+            raise ValueError(
+                "token_capacity exceeds the largest group's child-page capacity"
             )
         object.__setattr__(self, "group_page_counts", MappingProxyType(counts))

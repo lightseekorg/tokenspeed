@@ -232,6 +232,54 @@ def compute_state_page_indices(
     return _gather_state_page_indices(rows, plan, validate=validate, group_id=group_id)
 
 
+def compute_state_page_indices_by_group(
+    rows_by_group: dict[str, torch.Tensor],
+    page_size: int,
+    seq_lens_before: torch.Tensor,
+    seq_lens_after: torch.Tensor,
+    *,
+    validate: bool = True,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """Resolve state pages for groups sharing one logical page geometry."""
+    plan = _compute_state_page_index_plan(page_size, seq_lens_before, seq_lens_after)
+    state_in_by_group = {}
+    state_out_by_group = {}
+    for group_id, rows in rows_by_group.items():
+        state_in, state_out = _gather_state_page_indices(
+            rows,
+            plan,
+            validate=validate,
+            group_id=group_id,
+        )
+        state_in_by_group[group_id] = state_in
+        state_out_by_group[group_id] = state_out
+    return state_in_by_group, state_out_by_group
+
+
+def _prepare_flat_prefill_state_inputs(
+    conv_states: torch.Tensor,
+    ssm_states: torch.Tensor,
+    state_in_pages: torch.Tensor,
+    state_out_pages: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Materialize logical-zero fresh state without reading physical page 0."""
+    has_initial_state = state_in_pages > 0
+    safe_input_pages = torch.where(
+        has_initial_state, state_in_pages, state_out_pages
+    ).to(torch.int64)
+    state_out_pages = state_out_pages.to(torch.int64)
+
+    # A fresh row copies its working page to itself. Only a resumed row reads
+    # the checkpoint named by state_in_pages.
+    conv_states[state_out_pages] = conv_states[safe_input_pages]
+    recurrent_state = ssm_states[safe_input_pages]
+    broadcast_mask = has_initial_state.reshape(
+        (-1,) + (1,) * (recurrent_state.ndim - 1)
+    )
+    recurrent_state.masked_fill_(~broadcast_mask, 0)
+    return recurrent_state, has_initial_state
+
+
 def _prepare_gdn_decode_state_path(
     ssm_states: torch.Tensor,
     initial_state_indices: torch.Tensor,
@@ -265,12 +313,10 @@ class MambaForwardMetadata:
     track_ssm_final_src: torch.Tensor | None = None
     track_ssm_final_dst: torch.Tensor | None = None
     # Flat path (state slabs): dual in/out page indices per request.
-    state_in_pages: torch.Tensor | None = None
-    state_out_pages: torch.Tensor | None = None
+    state_in_pages: dict[str, torch.Tensor] | None = None
+    state_out_pages: dict[str, torch.Tensor] | None = None
     # FlatKV per-state-group KDA metadata is gathered once per group and batch;
     # layers select their entry via ``pool.group_id_for_layer(layer_id)``.
-    # Exactly one family is populated per forward (single tensors above are
-    # the legacy state-slab path).
     state_in_pages_by_group: dict[str, torch.Tensor] | None = None
     state_out_pages_by_group: dict[str, torch.Tensor] | None = None
 
@@ -700,9 +746,11 @@ class MambaAttnBackend(AttentionBackend):
         self.kv_pool = None
         self.flat_state_active = False
         self._flat_state_page_size = 1
-        self.flat_state_in_list: list[torch.Tensor] = []
-        self.flat_state_out_list: list[torch.Tensor] = []
-        # FlatKV contract path (FlatHybridCachePool): state group ids in
+        self.flat_state_in_list: list[dict[str, torch.Tensor]] = []
+        self.flat_state_out_list: list[dict[str, torch.Tensor]] = []
+        self._state_group_ids: tuple[str, ...] = ()
+        self._state_group_for_layer: dict[int, str] = {}
+        # FlatKV contract path: state group ids in
         # contract order; empty when not contract-bound.
         self._flat_contract_bound = False
         self._flat_state_group_ids: tuple[str, ...] = ()
@@ -719,7 +767,7 @@ class MambaAttnBackend(AttentionBackend):
         """Bind the (layer-mapped) KV pool. Two structurally gated flat modes:
 
         - FlatKV contract pool: the pool publishes a
-          ``runtime_contract`` (FlatHybridCachePool). Every ``family="state"``
+          ``runtime_contract``. Every ``family="state"``
           group becomes a KDA state group; the pool must resolve layers
           (``group_id_for_layer``) and per-layer component views
           (``get_component``). A contract with no state group is a hard
@@ -760,8 +808,25 @@ class MambaAttnBackend(AttentionBackend):
         self._flat_contract_bound = False
         self._flat_state_group_ids = ()
         specs = getattr(kv_pool, "paged_cache_group_specs", ())
-        self.flat_state_active = bool(getattr(kv_pool, "state_slabs", None)) and any(
-            str(spec.group_id) == _STATE_GROUP_ID for spec in specs
+        layer_types = tuple(getattr(kv_pool, "_layer_types", ()))
+        layer_group_ids = tuple(getattr(kv_pool, "layer_cache_group_ids", ()))
+        if layer_group_ids and len(layer_group_ids) != len(layer_types):
+            raise ValueError("layer cache group ids must align with layer types")
+        if not layer_group_ids:
+            layer_group_ids = layer_types
+        self._state_group_for_layer = {
+            layer_id: layer_group_ids[layer_id]
+            for layer_id, label in enumerate(layer_types)
+            if label == LINEAR_ATTENTION
+        }
+        self._state_group_ids = tuple(
+            dict.fromkeys(self._state_group_for_layer.values())
+        )
+        published_group_ids = {str(spec.group_id) for spec in specs}
+        self.flat_state_active = (
+            bool(getattr(kv_pool, "state_slabs", None))
+            and bool(self._state_group_ids)
+            and set(self._state_group_ids).issubset(published_group_ids)
         )
         self._flat_state_page_size = int(getattr(kv_pool, "page_size", 1))
 
@@ -782,13 +847,19 @@ class MambaAttnBackend(AttentionBackend):
         if forward_mode.is_decode_or_idle():
             before = after - 1
         else:
+            num_extends = int(kwargs.get("num_extends", bs))
+            if not 0 <= num_extends <= bs:
+                raise ValueError("num_extends must be between 0 and bs")
             extend_prefix_lens = kwargs.get("extend_prefix_lens")
             if extend_prefix_lens is not None:
-                before = extend_prefix_lens[:bs].to(
+                extend_before = extend_prefix_lens[:num_extends].to(
                     device=after.device, dtype=after.dtype
                 )
             else:
-                before = torch.zeros_like(after)
+                extend_before = torch.zeros_like(after[:num_extends])
+            before = torch.cat(
+                (extend_before, after[num_extends:] - self.spec_num_tokens)
+            )
         return before, after
 
     def _flat_state_pages(
@@ -826,15 +897,82 @@ class MambaAttnBackend(AttentionBackend):
             validate=validate,
         )
 
+    def _flat_state_pages_by_group(
+        self,
+        bs: int,
+        seq_lens: torch.Tensor,
+        forward_mode: ForwardMode,
+        kwargs: dict,
+        *,
+        validate: bool | None = None,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        """Resolve every legacy LCM state group with one slot calculation."""
+        flat_tables = kwargs.get("flat_block_tables")
+        missing_groups = [
+            group_id
+            for group_id in self._state_group_ids
+            if not flat_tables or group_id not in flat_tables
+        ]
+        if missing_groups:
+            raise RuntimeError(
+                "MambaAttnBackend: flat state paging is active (pool "
+                f"publishes state groups {self._state_group_ids!r}) but "
+                "flat_block_tables is missing groups "
+                f"{missing_groups!r} "
+                f"(got {sorted(flat_tables) if flat_tables else flat_tables!r})"
+            )
+        if validate is None:
+            validate = flat_cache_debug_enabled()
+        before, after = self._state_page_bounds(bs, seq_lens, forward_mode, kwargs)
+        return compute_state_page_indices_by_group(
+            {group_id: flat_tables[group_id] for group_id in self._state_group_ids},
+            self._flat_state_page_size,
+            before,
+            after,
+            validate=validate,
+        )
+
+    def _state_pages_for_layer(
+        self, layer_id: int
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if self.forward_metadata.state_in_pages is None:
+            return None, None
+        group_id = self._state_group_for_layer[layer_id]
+        return (
+            self.forward_metadata.state_in_pages[group_id],
+            self.forward_metadata.state_out_pages[group_id],
+        )
+
     def _flat_mamba_layer_ids(self) -> list[int]:
-        """KDA layer ids under the flat contract (layers bound to a
-        state-family group)."""
+        """Recurrent layer ids backed by the active Flat state pool."""
+        if not self._flat_contract_bound:
+            return sorted(self._state_group_for_layer)
         state_groups = set(self._flat_state_group_ids)
         return sorted(
-            lid
-            for lid, gid in self.kv_pool._group_ids_by_layer.items()
-            if gid in state_groups
+            layer_id
+            for layer_id, group_id in self.kv_pool._group_ids_by_layer.items()
+            if group_id in state_groups
         )
+
+    def _flat_state_groups(self) -> tuple[str, ...]:
+        if self._flat_contract_bound:
+            return self._flat_state_group_ids
+        return self._state_group_ids
+
+    def _flat_state_group_for(self, layer_id: int) -> str:
+        if self._flat_contract_bound:
+            return self.kv_pool.group_id_for_layer(layer_id)
+        return self._state_group_for_layer[layer_id]
+
+    def _flat_state_components(
+        self, layer_id: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._flat_contract_bound:
+            return (
+                self.kv_pool.get_component(layer_id, "conv_state"),
+                self.kv_pool.get_component(layer_id, "recurrent_state"),
+            )
+        return self.kv_pool.get_state_buffers(layer_id)
 
     def _flat_verify_state_pages(
         self,
@@ -852,12 +990,6 @@ class MambaAttnBackend(AttentionBackend):
         pages, the committed lengths, and the per-group flat tables (kept
         for the commit's dynamic page resolve).
         """
-        flat_cache_metadata = kwargs.get("flat_cache_metadata")
-        if flat_cache_metadata is None:
-            raise RuntimeError(
-                "flat target-verify requires flat cache metadata on the " "forward"
-            )
-        flat_cache_forward_op = kwargs.get("flat_cache_forward_op")
         committed = (seq_lens[:bs].to(torch.int64) - draft_token_num).clamp_min(0)
         in_slots = torch.div(
             (committed - 1).clamp_min(0),
@@ -867,10 +999,35 @@ class MambaAttnBackend(AttentionBackend):
         has_history = committed > 0
         state_in_pages: dict[str, torch.Tensor] = {}
         tables: dict[str, torch.Tensor] = {}
-        for group_id in self._flat_state_group_ids:
-            rows = flat_cache_metadata.require_table(
-                group_id, active_forward_op=flat_cache_forward_op
-            )
+        if self._flat_contract_bound:
+            flat_cache_metadata = kwargs.get("flat_cache_metadata")
+            if flat_cache_metadata is None:
+                raise RuntimeError(
+                    "flat target-verify requires flat cache metadata on the forward"
+                )
+            flat_cache_forward_op = kwargs.get("flat_cache_forward_op")
+            rows_by_group = {
+                group_id: flat_cache_metadata.require_table(
+                    group_id, active_forward_op=flat_cache_forward_op
+                )
+                for group_id in self._flat_state_groups()
+            }
+        else:
+            flat_block_tables = kwargs.get("flat_block_tables")
+            missing = [
+                group_id
+                for group_id in self._flat_state_groups()
+                if not flat_block_tables or group_id not in flat_block_tables
+            ]
+            if missing:
+                raise RuntimeError(
+                    f"flat target-verify is missing state tables {missing!r}"
+                )
+            rows_by_group = {
+                group_id: flat_block_tables[group_id]
+                for group_id in self._flat_state_groups()
+            }
+        for group_id, rows in rows_by_group.items():
             slots_safe = in_slots.clamp(min=0, max=rows.shape[1] - 1)
             pages = rows[:bs].gather(1, slots_safe.unsqueeze(1)).squeeze(1)
             pages = torch.where(has_history, pages, torch.full_like(pages, -1)).to(
@@ -896,8 +1053,7 @@ class MambaAttnBackend(AttentionBackend):
         self._verify_scratch = {}
         self._verify_copy_tables = None
         for layer_id in self._flat_mamba_layer_ids():
-            conv = self.kv_pool.get_component(layer_id, "conv_state")
-            ssm = self.kv_pool.get_component(layer_id, "recurrent_state")
+            conv, ssm = self._flat_state_components(layer_id)
             self._verify_scratch[layer_id] = (
                 torch.zeros(
                     (rows_needed, *conv.shape[1:]),
@@ -911,6 +1067,19 @@ class MambaAttnBackend(AttentionBackend):
                 ),
             )
 
+    def preallocate_flat_verify_workspace(
+        self, max_bs: int, draft_token_num: int
+    ) -> int:
+        """Allocate graph-stable Flat verify state and return its byte size."""
+        if not self.flat_state_active or self.is_draft:
+            return 0
+        self._ensure_verify_scratch(max_bs, draft_token_num)
+        return sum(
+            tensor.nbytes
+            for layer_scratch in self._verify_scratch.values()
+            for tensor in layer_scratch
+        )
+
     def _verify_copy_tables_get(self) -> dict:
         """Pointer tables for the batched verify state copies: per-layer base
         addresses of the state slabs and their verify scratches, plus each
@@ -921,7 +1090,8 @@ class MambaAttnBackend(AttentionBackend):
         if tables is not None:
             return tables
         layer_ids = list(self._flat_mamba_layer_ids())
-        group_index = {g: i for i, g in enumerate(self._flat_state_group_ids)}
+        group_ids = self._flat_state_groups()
+        group_index = {group_id: i for i, group_id in enumerate(group_ids)}
         conv_src, conv_dst, ssm_src, ssm_dst, group_sel = [], [], [], [], []
         conv_src_st, conv_dst_st, ssm_src_st, ssm_dst_st = [], [], [], []
         conv_bytes: int | None = None
@@ -940,8 +1110,7 @@ class MambaAttnBackend(AttentionBackend):
             return stride_bytes // 4
 
         for layer_id in layer_ids:
-            conv = self.kv_pool.get_component(layer_id, "conv_state")
-            ssm = self.kv_pool.get_component(layer_id, "recurrent_state")
+            conv, ssm = self._flat_state_components(layer_id)
             conv_scratch, ssm_scratch = self._verify_scratch[layer_id]
             row_c = conv[0].numel() * conv.element_size()
             row_s = ssm[0].numel() * ssm.element_size()
@@ -957,7 +1126,7 @@ class MambaAttnBackend(AttentionBackend):
             conv_dst_st.append(_row_stride_i32(conv_scratch))
             ssm_src_st.append(_row_stride_i32(ssm))
             ssm_dst_st.append(_row_stride_i32(ssm_scratch))
-            group_sel.append(group_index[self.kv_pool.group_id_for_layer(layer_id)])
+            group_sel.append(group_index[self._flat_state_group_for(layer_id)])
 
         def _u64(values: list[int]) -> torch.Tensor:
             return torch.tensor(values, dtype=torch.uint64, device=self.device)
@@ -1001,18 +1170,14 @@ class MambaAttnBackend(AttentionBackend):
         return rows
 
     def _seed_verify_scratch_batched(self, bs: int, draft_token_num: int) -> None:
-        """Seed every KDA layer's verify-scratch init conv row from its
-        group's committed state page in ONE launch (replaces the per-layer
-        gather/where/scatter chain; negative page ids zero-fill)."""
+        """Seed every KDA layer's verify-scratch init conv and recurrent rows
+        from its group's committed state page. Negative page ids zero-fill."""
         from tokenspeed_kernel.ops.kvcache.triton import copy_state_rows
 
         tables = self._verify_copy_tables_get()
         state_in_by_group = self.forward_metadata.state_in_pages_by_group
         sin_stack = torch.stack(
-            [
-                state_in_by_group[group_id][:bs]
-                for group_id in self._flat_state_group_ids
-            ]
+            [state_in_by_group[group_id][:bs] for group_id in self._flat_state_groups()]
         ).to(torch.int64)
         src_rows = sin_stack.index_select(0, tables["group_sel"]).reshape(-1)
         copy_state_rows(
@@ -1023,6 +1188,15 @@ class MambaAttnBackend(AttentionBackend):
             row_bytes=tables["conv_bytes"],
             src_row_strides=tables["conv_comp_stride"],
             dst_row_strides=tables["conv_scratch_stride"],
+        )
+        copy_state_rows(
+            tables["ssm_comp"],
+            tables["ssm_scratch"],
+            src_rows,
+            self._verify_seed_dst_rows(bs, draft_token_num),
+            row_bytes=tables["ssm_bytes"],
+            src_row_strides=tables["ssm_comp_stride"],
+            dst_row_strides=tables["ssm_scratch_stride"],
         )
 
     def _verify_scratch_grid(self, bs: int, draft_token_num: int) -> torch.Tensor:
@@ -1038,10 +1212,10 @@ class MambaAttnBackend(AttentionBackend):
             return grid
         stride = draft_token_num + 1
         base = (
-            torch.arange(bs, dtype=torch.int64, device=self.device) * stride
+            torch.arange(bs, dtype=torch.int32, device=self.device) * stride
         ).unsqueeze(1)
         steps = torch.arange(
-            1, draft_token_num + 1, dtype=torch.int64, device=self.device
+            1, draft_token_num + 1, dtype=torch.int32, device=self.device
         ).unsqueeze(0)
         grid = base + steps
         cache[(bs, draft_token_num)] = grid
@@ -1065,7 +1239,7 @@ class MambaAttnBackend(AttentionBackend):
             + k
         )
         pages_by_group: dict[str, torch.Tensor] = {}
-        for group_id in self._flat_state_group_ids:
+        for group_id in self._flat_state_groups():
             rows_tbl = tables[group_id]
             slot_safe = slot.clamp(min=0, max=rows_tbl.shape[1] - 1)
             pages_by_group[group_id] = (
@@ -1081,7 +1255,7 @@ class MambaAttnBackend(AttentionBackend):
 
         copy_tables = self._verify_copy_tables_get()
         pages_stack = torch.stack(
-            [pages_by_group[group_id] for group_id in self._flat_state_group_ids]
+            [pages_by_group[group_id] for group_id in self._flat_state_groups()]
         )
         dst_rows = pages_stack.index_select(0, copy_tables["group_sel"]).reshape(-1)
         src_tiled = src_rows.repeat(copy_tables["num_layers"])
@@ -1200,8 +1374,18 @@ class MambaAttnBackend(AttentionBackend):
             and self.spec_num_tokens > 1
         )
 
+        num_extends = int(
+            kwargs.get(
+                "num_extends",
+                bs if forward_mode.is_extend_or_mixed() else 0,
+            )
+        )
+        if not 0 <= num_extends <= bs:
+            raise ValueError("num_extends must be between 0 and bs")
         mamba_output_indices = None
-        extend_seq_lens_cpu = None
+        extend_seq_lens_cpu = kwargs.get("extend_seq_lens_cpu")
+        if extend_seq_lens_cpu is not None:
+            extend_seq_lens_cpu = extend_seq_lens_cpu[:num_extends]
         if is_target_verify and not self.flat_state_active:
             draft_token_num = int(
                 kwargs.get("tokens_per_req", self.speculative_num_draft_tokens)
@@ -1237,15 +1421,42 @@ class MambaAttnBackend(AttentionBackend):
             else:
                 extend_start_loc = kwargs.get("extend_start_loc")
                 extend_seq_lens = kwargs.get("extend_seq_lens")
-                if extend_start_loc is not None and extend_seq_lens is not None:
+                if forward_mode.is_mixed():
+                    if extend_seq_lens is None or extend_seq_lens_cpu is None:
+                        raise RuntimeError(
+                            "mixed GDN metadata requires extend sequence lengths"
+                        )
+                    query_lens = torch.full(
+                        (bs,),
+                        self.spec_num_tokens,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    query_lens[:num_extends] = extend_seq_lens[:num_extends]
+                    query_start_loc = torch.zeros(
+                        bs + 1, dtype=torch.int32, device=self.device
+                    )
+                    torch.cumsum(query_lens, dim=0, out=query_start_loc[1:])
+                    extend_seq_lens_cpu = torch.cat(
+                        (
+                            extend_seq_lens_cpu,
+                            torch.full(
+                                (bs - num_extends,),
+                                self.spec_num_tokens,
+                                dtype=torch.int32,
+                            ),
+                        )
+                    )
+                elif extend_start_loc is not None and extend_seq_lens is not None:
                     query_start_loc = torch.empty(
                         (bs + 1,), dtype=torch.int32, device=self.device
                     )
                     query_start_loc[:bs] = extend_start_loc
                     query_start_loc[bs] = extend_start_loc[-1] + extend_seq_lens[-1]
-                    extend_seq_lens_cpu = extend_seq_lens[:bs].to(
-                        device="cpu", dtype=torch.int32
-                    )
+                    if extend_seq_lens_cpu is None:
+                        extend_seq_lens_cpu = extend_seq_lens[:bs].to(
+                            device="cpu", dtype=torch.int32
+                        )
                 else:
                     extend_prefix_lens = kwargs.get("extend_prefix_lens")
                     if extend_prefix_lens is not None:
@@ -1259,7 +1470,8 @@ class MambaAttnBackend(AttentionBackend):
                         bs + 1, dtype=torch.int32, device=self.device
                     )
                     torch.cumsum(extend_lens, dim=0, out=query_start_loc[1:])
-                    extend_seq_lens_cpu = extend_lens.to(device="cpu")
+                    if extend_seq_lens_cpu is None:
+                        extend_seq_lens_cpu = extend_lens.to(device="cpu")
                 set_total_chunks_hint(extend_seq_lens_cpu, query_start_loc)
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
@@ -1277,10 +1489,6 @@ class MambaAttnBackend(AttentionBackend):
                     "MTP draft runs on a classic pool"
                 )
             if is_target_verify:
-                if not self._flat_contract_bound:
-                    raise RuntimeError(
-                        "flat target-verify requires the contract-bound pool"
-                    )
                 draft_token_num = int(
                     kwargs.get("tokens_per_req", self.speculative_num_draft_tokens)
                 )
@@ -1305,7 +1513,7 @@ class MambaAttnBackend(AttentionBackend):
                     state_out_pages_by_group,
                 ) = self._flat_contract_state_pages(bs, seq_lens, forward_mode, kwargs)
             else:
-                state_in_pages, state_out_pages = self._flat_state_pages(
+                state_in_pages, state_out_pages = self._flat_state_pages_by_group(
                     bs, seq_lens, forward_mode, kwargs
                 )
 
@@ -1461,20 +1669,26 @@ class MambaAttnBackend(AttentionBackend):
             )
             if self.flat_state_active and not self._flat_contract_bound:
                 self.flat_state_in_list.append(
-                    torch.full(
-                        (i + 1,),
-                        self.pad_slot_id,
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
+                    {
+                        group_id: torch.full(
+                            (i + 1,),
+                            self.pad_slot_id,
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                        for group_id in self._state_group_ids
+                    }
                 )
                 self.flat_state_out_list.append(
-                    torch.full(
-                        (i + 1,),
-                        self.pad_slot_id,
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
+                    {
+                        group_id: torch.full(
+                            (i + 1,),
+                            self.pad_slot_id,
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                        for group_id in self._state_group_ids
+                    }
                 )
             elif self.flat_state_active and self._flat_contract_bound:
                 # Multi-group KDA state paging keeps one persistent dual-index
@@ -1613,16 +1827,22 @@ class MambaAttnBackend(AttentionBackend):
                     state_out_pages_by_group[gid] = state_out
             else:
                 flat_ids = kwargs.get("flat_cache_group_ids", ())
-                if _STATE_GROUP_ID not in flat_ids:
+                missing = set(self._state_group_ids) - set(flat_ids)
+                if missing:
                     raise RuntimeError(
-                        "flat GDN state paging: capture is missing the "
-                        f"{_STATE_GROUP_ID!r} flat cache group id "
+                        "flat GDN state paging: capture is missing flat cache "
+                        f"group ids {sorted(missing)!r} "
                         f"(got {tuple(flat_ids)!r})"
                     )
                 state_in_pages = self.flat_state_in_list[bs - 1]
                 state_out_pages = self.flat_state_out_list[bs - 1]
-                state_in_pages.fill_(self.pad_slot_id)
-                state_out_pages.fill_(self.pad_slot_id)
+                for pages in state_in_pages.values():
+                    pages.fill_(self.pad_slot_id)
+                for pages in state_out_pages.values():
+                    pages.fill_(self.pad_slot_id)
+                if is_target_verify:
+                    state_in_pages_by_group = state_in_pages
+                    state_out_pages_by_group = state_out_pages
         self._qsl_dirty[bs - 1] = False
         self._qsl_last_mode[bs - 1] = (forward_mode, self.spec_num_tokens > 1)
         self.forward_metadata = MambaForwardMetadata(
@@ -1739,7 +1959,7 @@ class MambaAttnBackend(AttentionBackend):
         state_out_pages = None
         state_in_pages_by_group = None
         state_out_pages_by_group = None
-        if self.flat_state_active and self._flat_contract_bound and is_target_verify:
+        if self.flat_state_active and is_target_verify:
             # Flat target-verify replay: refresh the CAPTURED per-bs state_in
             # buffers with each group's committed-state page (page of
             # ``seq_lens - T - 1``), re-arm the commit context for the
@@ -1765,20 +1985,35 @@ class MambaAttnBackend(AttentionBackend):
                 )
             else:
                 self._verify_commit_ctx = None
+            if self._flat_contract_bound:
+                captured_in = {
+                    group_id: self.flat_state_in_by_group[group_id][bs - 1]
+                    for group_id in self._flat_state_groups()
+                }
+                captured_out = {
+                    group_id: self.flat_state_out_by_group[group_id][bs - 1]
+                    for group_id in self._flat_state_groups()
+                }
+            else:
+                captured_in = self.flat_state_in_list[bs - 1]
+                captured_out = self.flat_state_out_list[bs - 1]
             state_in_pages_by_group = {}
             state_out_pages_by_group = {}
-            for gid in self._flat_state_group_ids:
-                state_in = self.flat_state_in_by_group[gid][bs - 1]
-                state_out = self.flat_state_out_by_group[gid][bs - 1]
+            for group_id in self._flat_state_groups():
+                state_in = captured_in[group_id]
+                state_out = captured_out[group_id]
                 if pages_by_group is not None:
-                    state_in[:real_bs].copy_(pages_by_group[gid][:real_bs])
+                    state_in[:real_bs].copy_(pages_by_group[group_id][:real_bs])
                 if real_bs < bs:
                     state_in[real_bs:].fill_(self.pad_slot_id)
                 # Slab out pages are unused under verify (per-position states
                 # land in the scratch); keep the captured buffer inert.
                 state_out.fill_(self.pad_slot_id)
-                state_in_pages_by_group[gid] = state_in
-                state_out_pages_by_group[gid] = state_out
+                state_in_pages_by_group[group_id] = state_in
+                state_out_pages_by_group[group_id] = state_out
+            if not self._flat_contract_bound:
+                state_in_pages = state_in_pages_by_group
+                state_out_pages = state_out_pages_by_group
         elif self.flat_state_active and self._flat_contract_bound:
             # For multi-group KDA state paging, dual indexing runs once per
             # state group over the real rows. Padded rows get pad_slot_id (-1),
@@ -1799,7 +2034,7 @@ class MambaAttnBackend(AttentionBackend):
             # Decode-only (q_len == 1): before = seq_lens - 1. Padded rows
             # (zero table rows, seq_lens 1) are overwritten with pad_slot_id
             # below, so validation is skipped to avoid a host sync.
-            state_in, state_out = self._flat_state_pages(
+            state_in, state_out = self._flat_state_pages_by_group(
                 bs,
                 seq_lens,
                 forward_mode,
@@ -1808,11 +2043,12 @@ class MambaAttnBackend(AttentionBackend):
             )
             state_in_pages = self.flat_state_in_list[bs - 1]
             state_out_pages = self.flat_state_out_list[bs - 1]
-            state_in_pages[:real_bs].copy_(state_in[:real_bs])
-            state_out_pages[:real_bs].copy_(state_out[:real_bs])
-            if num_padding > 0:
-                state_in_pages[real_bs:].fill_(self.pad_slot_id)
-                state_out_pages[real_bs:].fill_(self.pad_slot_id)
+            for group_id in self._state_group_ids:
+                state_in_pages[group_id][:real_bs].copy_(state_in[group_id][:real_bs])
+                state_out_pages[group_id][:real_bs].copy_(state_out[group_id][:real_bs])
+                if num_padding > 0:
+                    state_in_pages[group_id][real_bs:].fill_(self.pad_slot_id)
+                    state_out_pages[group_id][real_bs:].fill_(self.pad_slot_id)
 
         self.forward_metadata = MambaForwardMetadata(
             query_start_loc=self.query_start_loc_list[bs - 1],
@@ -1945,7 +2181,7 @@ class MambaAttnBackend(AttentionBackend):
         metadata = self.forward_metadata
         state_in_by_group = metadata.state_in_pages_by_group
         if state_in_by_group is not None:
-            group_id = self.kv_pool.group_id_for_layer(layer_id)
+            group_id = self._flat_state_group_for(layer_id)
             state_in = state_in_by_group.get(group_id)
             if state_in is None:
                 # A recurrent layer must resolve to a bound state group.
@@ -1954,17 +2190,19 @@ class MambaAttnBackend(AttentionBackend):
                     f"{group_id!r}, which has no computed state page indices "
                     f"(state groups: {sorted(state_in_by_group)})"
                 )
+            conv_states, ssm_states = self._flat_state_components(layer_id)
             return (
                 state_in,
                 metadata.state_out_pages_by_group[group_id],
-                self.kv_pool.get_component(layer_id, "conv_state"),
-                self.kv_pool.get_component(layer_id, "recurrent_state"),
+                conv_states,
+                ssm_states,
             )
         if metadata.state_in_pages is not None:
+            group_id = self._state_group_for_layer[layer_id]
             conv_states, ssm_states = self.kv_pool.get_state_buffers(layer_id)
             return (
-                metadata.state_in_pages,
-                metadata.state_out_pages,
+                metadata.state_in_pages[group_id],
+                metadata.state_out_pages[group_id],
                 conv_states,
                 ssm_states,
             )
@@ -2251,11 +2489,9 @@ class MambaAttnBackend(AttentionBackend):
                 conv_scratch, ssm_scratch = self._verify_scratch[layer_id]
                 if layer_id == self._flat_mamba_layer_ids()[0]:
                     self._seed_verify_scratch_batched(batch_size, draft_token_num)
-                init_rows = self._verify_seed_dst_rows(batch_size, draft_token_num)[
-                    :batch_size
-                ]
+                init_rows = output_indices[:batch_size, 0] - 1
                 conv_states = conv_scratch
-                conv_read = init_rows.to(torch.int32)
+                conv_read = init_rows
                 conv_out = output_indices[:batch_size]
                 self._verify_flat_layer_state = (
                     state_in_pages,
@@ -2288,16 +2524,15 @@ class MambaAttnBackend(AttentionBackend):
             use_flat = flat_state is not None
             if use_flat:
                 state_in_pages, state_out_pages, conv_states, ssm_states = flat_state
-                state_in_long = state_in_pages.to(torch.int64)
                 state_out_long = state_out_pages.to(torch.int64)
-                # Seed the out page's conv window from the in page (identity
-                # within a page), then run the conv read+write entirely on
-                # the out page so a shared snapshot in-page is never written.
-                # Fresh requests seed from null page 0, whose conv bytes may
-                # hold padded-MLA-row scribble via slab aliasing — harmless:
-                # has_initial_state=False makes the kernel ignore the seeded
-                # window and fully overwrite it.
-                conv_states[state_out_long] = conv_states[state_in_long]
+                recurrent_state, has_initial_states = (
+                    _prepare_flat_prefill_state_inputs(
+                        conv_states,
+                        ssm_states,
+                        state_in_pages,
+                        state_out_long,
+                    )
+                )
                 conv_cache_indices = state_out_pages
             else:
                 conv_states, ssm_states = self.pool.get_mamba_params(layer_id)
@@ -2308,13 +2543,15 @@ class MambaAttnBackend(AttentionBackend):
             extend_seq_lens_cpu = kwargs.get("extend_seq_lens_cpu")
             if extend_seq_lens_cpu is None:
                 extend_seq_lens_cpu = self.forward_metadata.extend_seq_lens_cpu
-            has_initial_states = (
-                extend_prefix_lens > 0 if extend_prefix_lens is not None else None
-            )
-            need_h_track = (
+            if not use_flat:
+                has_initial_states = (
+                    extend_prefix_lens > 0 if extend_prefix_lens is not None else None
+                )
+            need_radix_track = (
                 self.forward_metadata.track_ssm_h_src is not None
                 and self.forward_metadata.track_ssm_h_src.numel() > 0
             )
+            need_h_track = need_radix_track
 
             # Zero padded rows so garbage can't reach recurrent state (see scrub_padding_tail).
             if extend_seq_lens_cpu is not None:
@@ -2322,7 +2559,7 @@ class MambaAttnBackend(AttentionBackend):
                 scrub_padding_tail(ntok, mixed_qkv, a, b)
 
             mixed_qkv_t = mixed_qkv.transpose(0, 1)
-            if need_h_track:
+            if need_radix_track:
                 if self.forward_metadata.track_conv_indices is None:
                     raise RuntimeError(
                         "Missing conv indices for intermediate mamba track"
@@ -2419,6 +2656,10 @@ class MambaAttnBackend(AttentionBackend):
             b_b = b.view(batch_size, draft_token_num, -1)
 
             output_indices = self.forward_metadata.mamba_output_indices
+            flat_verify_state = getattr(self, "_verify_flat_layer_state", None)
+            if flat_verify_state is not None:
+                _, _, ssm_states = flat_verify_state
+                cache_indices = output_indices[:batch_size, 0] - 1
             (
                 mtp_initial_indices,
                 mtp_output_indices,
@@ -2446,19 +2687,8 @@ class MambaAttnBackend(AttentionBackend):
         elif self.is_kda:
             g_kda = _kda_g_raw().view(1, seq_len, num_value_heads, head_k_dim)
             beta_kda = beta_raw.view(1, seq_len, num_value_heads)
-            state_read_indices = state_in_long if use_flat else cache_indices
-            recurrent_state = ssm_states[state_read_indices].contiguous()
-            if use_flat:
-                # Sequences without history must start from the ZERO state:
-                # a fresh request's state_in resolves to its own
-                # just-allocated page (or the null page), whose bytes are
-                # whatever the previous tenant of the aliased slab left
-                # (e.g. fp8 MLA latents read as fp32 -> huge/NaN). Only the
-                # conv kernel has per-sequence has_initial_state gating; the
-                # recurrent initial state must be masked here.
-                recurrent_state = _mask_fresh_initial_state(
-                    recurrent_state, has_initial_states
-                )
+            if not use_flat:
+                recurrent_state = ssm_states[cache_indices].contiguous()
             kda_result = kda_paged_prefill(
                 query,
                 key,
@@ -2502,14 +2732,8 @@ class MambaAttnBackend(AttentionBackend):
             g = g.unsqueeze(0)
             beta = beta.unsqueeze(0)
 
-            recurrent_state = ssm_states[state_in_long if use_flat else cache_indices]
-            if use_flat:
-                # Same content-hygiene mask as the KDA arm above: fresh
-                # sequences must not inherit a recycled page's stale bytes
-                # as their initial recurrent state.
-                recurrent_state = _mask_fresh_initial_state(
-                    recurrent_state, has_initial_states
-                )
+            if not use_flat:
+                recurrent_state = ssm_states[cache_indices]
             need_final_track = (
                 self.forward_metadata.track_ssm_final_src is not None
                 and self.forward_metadata.track_ssm_final_src.numel() > 0
@@ -2594,11 +2818,10 @@ class MambaAttnBackend(AttentionBackend):
 class HybridLinearAttnBackend(AttentionBackend):
     """Hybrid backend that routes between full attention and linear attention by layer ID."""
 
+    flat_spec_capable: bool = True
     # Both sub-backends consume flat per-group tables (MHA: KV pages; mamba:
-    # dual-index state pages). Safety comes from the publication rule
-    # (paged_cache_spec.publish_paged_cache_groups): a radix ext or spec
-    # decode never publishes groups, so no tables (and no flat capture
-    # buffers) exist on those paths.
+    # dual-index state pages). Target verify keeps speculative state in a
+    # fixed scratch and publishes only the accepted position.
     uses_flat_cache_groups: bool = True
 
     def __init__(
@@ -2849,8 +3072,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         # Flat contract pool: the per-position verify states live in the
         # scratch; commit the accepted position back to the state slab.
         commit = getattr(self.linear_attn_backend, "flat_commit_verified_state", None)
-        if commit is not None and getattr(
-            self.linear_attn_backend, "_verify_commit_ctx", None
+        if (
+            commit is not None
+            and getattr(self.linear_attn_backend, "_verify_commit_ctx", None)
+            is not None
         ):
             commit(accepted_length)
             return
@@ -2865,8 +3090,17 @@ class HybridLinearAttnBackend(AttentionBackend):
         )
         if req_pool_indices is None:
             return
+        pool = getattr(self.linear_attn_backend, "pool", None)
+        if pool is None:
+            if getattr(self.linear_attn_backend, "flat_state_active", False):
+                return
+            raise RuntimeError(
+                "MTP verify produced mamba output indices but the linear "
+                "attention backend has no SimpleMambaPool and flat state "
+                "paging is inactive"
+            )
         request_number = accepted_length.shape[0]
-        self.linear_attn_backend.pool.update_current_inputs_after_verify(
+        pool.update_current_inputs_after_verify(
             req_pool_indices[:request_number],
             output_indices[:request_number],
             accepted_length,

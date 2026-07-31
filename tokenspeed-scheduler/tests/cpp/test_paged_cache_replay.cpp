@@ -69,13 +69,6 @@ protected:
         cfg.prefix_cache_adjunct = spec;
         return cfg;
     }
-
-    static const FlatForwardOperation* GetForwardOp(const ExecutionPlan& plan) {
-        for (const auto& op : plan.Operations()) {
-            if (auto* f = std::get_if<FlatForwardOperation>(&op)) return f;
-        }
-        return nullptr;
-    }
 };
 
 class PagedCacheTerminalMixedSchedulerTest : public PagedCacheTerminalSchedulerTest {
@@ -118,13 +111,6 @@ protected:
         cfg.prefix_cache_adjunct = spec;
         return cfg;
     }
-
-    static const FlatForwardOperation* GetForwardOp(const ExecutionPlan& plan) {
-        for (const auto& op : plan.Operations()) {
-            if (auto* f = std::get_if<FlatForwardOperation>(&op)) return f;
-        }
-        return nullptr;
-    }
 };
 
 class PagedCacheOverlapSchedulerTest
@@ -161,13 +147,6 @@ protected:
         state.family = PagedCacheGroupFamily::State;
         cfg.paged_cache_groups.push_back(state);
         return cfg;
-    }
-
-    static const FlatForwardOperation* GetForwardOp(const ExecutionPlan& plan) {
-        for (const auto& op : plan.Operations()) {
-            if (auto* f = std::get_if<FlatForwardOperation>(&op)) return f;
-        }
-        return nullptr;
     }
 };
 
@@ -218,22 +197,6 @@ protected:
             .reserve_num_tokens_in_next_schedule_event = value,
         }});
         scheduler_->Advance(std::move(event));
-    }
-
-    static const FlatForwardOperation* GetForwardOp(const ExecutionPlan& plan) {
-        for (const auto& op : plan.Operations()) {
-            if (auto* f = std::get_if<FlatForwardOperation>(&op)) return f;
-        }
-        return nullptr;
-    }
-
-    static const FlatWriteBackOperation* GetWriteBack(const ExecutionPlan& plan) {
-        for (const auto& op : plan.Operations()) {
-            if (auto* cache_op = std::get_if<CacheOperation>(&op)) {
-                if (auto* writeback = std::get_if<FlatWriteBackOperation>(cache_op)) return writeback;
-            }
-        }
-        return nullptr;
     }
 };
 
@@ -392,6 +355,25 @@ TEST_F(PagedCacheTerminalContinuationTest, ExactTerminalHitUsesContinuationState
     EXPECT_EQ(second_match.paged_cache.per_group_page_ids.at(kRequiredStateGroup).size(), 2u);
 }
 
+TEST_F(PagedCacheTerminalContinuationTest, StateRecoveryDoesNotUseEarlierContinuationCheckpoint) {
+    TreeNode* checkpoint = InsertDeviceTokens(256);
+    ASSERT_NE(checkpoint, nullptr);
+    CommitRequest("seed", /*first_token=*/0, /*target=*/256, checkpoint);
+    hybrid_->ReleaseRequest("seed");
+
+    TreeNode* terminal = InsertDeviceTokens(320);
+    ASSERT_NE(terminal, nullptr);
+    ASSERT_FALSE(terminal->HasPagedCacheSnapshot());
+
+    auto tokens = MakeAlignedTokens(/*num_pages=*/5, kPageSize, /*start=*/1);
+    auto match = hybrid_->Match(tokens, MatchIntent::StateRecovery);
+
+    EXPECT_EQ(match.paged_cache.last_node, nullptr);
+    EXPECT_EQ(match.paged_cache_host.last_node, nullptr);
+    ASSERT_NE(match.device.last_node, nullptr);
+    EXPECT_TRUE(match.device.last_node->IsRoot());
+}
+
 TEST_F(PagedCacheTerminalContinuationTest, SnapshotCursorStopsAtCheckpointBeforeReservedTail) {
     constexpr std::int32_t kCheckpoint = 256;
     constexpr std::int32_t kVerifyWidth = 4;
@@ -530,7 +512,7 @@ TEST_F(PagedCacheTerminalContinuationTest, CurrentBorrowPinsAncestorWhenTerminal
     hybrid_->ReleaseRequest("current");
 }
 
-TEST_F(PagedCacheTerminalContinuationTest, StatePruneDropsContinuationAndFallsBackToColdPrefill) {
+TEST_F(PagedCacheTerminalContinuationTest, StatePruneDropsContinuationAndDisablesPrefixReuse) {
     TreeNode* n256 = InsertDeviceTokens(256);
     ASSERT_NE(n256, nullptr);
     CommitRequest("r1", /*first_token=*/0, /*target=*/256, n256);
@@ -549,9 +531,10 @@ TEST_F(PagedCacheTerminalContinuationTest, StatePruneDropsContinuationAndFallsBa
               n256->GetPagedCacheSnapshot()->groups.end());
 
     auto match = MatchTokens(256);
-    EXPECT_EQ(match.paged_cache.history_hit_tokens, 0);
+    EXPECT_EQ(match.paged_cache.last_node, nullptr);
     EXPECT_EQ(match.paged_cache.prefix_len_tokens, 0);
-    EXPECT_TRUE(match.paged_cache.per_group_page_ids.empty());
+    ASSERT_NE(match.device.last_node, nullptr);
+    EXPECT_TRUE(match.device.last_node->IsRoot());
 }
 
 TEST_F(PagedCacheTerminalContinuationTest, StateOnlyPruneIgnoresHistoryOnlySideTableBorrow) {
@@ -822,6 +805,7 @@ TEST_P(PagedCacheOverlapRetractTest, LateResultRecoveryRebuildsDynamicHorizon) {
     const auto state_pages_before = scheduler_->GetRequestPagedCachePageIds("r", "retract.state");
     SendReserveNumTokens(/*value=*/100);
     auto retract_plan = PlanOnce();
+    EXPECT_TRUE(retract_plan.SchedulerAborts().empty());
     const auto* writeback = GetWriteBack(retract_plan);
     ASSERT_NE(writeback, nullptr);
     ASSERT_FALSE(writeback->op_ids.empty());
@@ -851,6 +835,7 @@ TEST_P(PagedCacheOverlapRetractTest, LateResultRecoveryRebuildsDynamicHorizon) {
     ASSERT_EQ(scheduler_->RetractedSize(), 1u);
 
     auto recovery_plan = PlanOnce();
+    EXPECT_TRUE(recovery_plan.SchedulerAborts().empty());
     const auto* recovery = GetForwardOp(recovery_plan);
     ASSERT_NE(recovery, nullptr);
     ASSERT_EQ(recovery->request_ids.size(), 1u);

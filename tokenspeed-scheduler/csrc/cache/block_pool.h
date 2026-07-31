@@ -21,199 +21,233 @@
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
-#include <iterator>
-#include <string>
-#include <unordered_map>
+#include <optional>
+#include <utility>
 #include <vector>
 
-#include "cache/block_ref.h"
+#include "cache/cache_block_ref.h"
 #include "utils.h"
 
 namespace tokenspeed {
 
+// Physical LCM placement only. It deliberately has no cache key, LRU node,
+// CacheBlock pointer, or ownership count.
 class BlockPool {
 public:
-    explicit BlockPool(std::int32_t total_num_blocks, bool enable_caching = true)
-        : total_num_blocks_{total_num_blocks}, enable_caching_{enable_caching} {
-        _assert(total_num_blocks > 0, "total_num_blocks must be > 0");
-        auto return_to_pool = [](BlockPool& pool, internal_block_ref::BlockControl& control) noexcept {
-            pool.returnToPool(control);
-        };
-        for (std::int32_t block_id = 1; block_id < total_num_blocks; ++block_id) {
-            controls_.emplace_back(block_id, *this, return_to_pool);
-        }
-        for (internal_block_ref::BlockControl& control : controls_) {
-            free_list_.push_back(&control);
-            control.SetPosition(std::prev(free_list_.end()));
-            control.MarkFree();
+    explicit BlockPool(std::int32_t num_lcm_blocks) : lcm_blocks_(checkedLcmBlockCount(num_lcm_blocks)) {
+        for (std::int32_t id = 1; id <= num_lcm_blocks; ++id) {
+            free_parent_ids_.push_back(id);
         }
     }
 
     BlockPool(const BlockPool&) = delete;
     BlockPool& operator=(const BlockPool&) = delete;
-    ~BlockPool() noexcept { FatalCheck(in_use_.empty(), "BlockPool destroyed with live block references"); }
+    ~BlockPool() noexcept { FatalCheck(NumOccupiedSlots() == 0, "BlockPool destroyed with live block references"); }
 
-    std::int32_t TotalBlocks() const noexcept { return total_num_blocks_; }
-    std::int32_t NumFreeBlocks() const noexcept { return static_cast<std::int32_t>(free_list_.size()); }
+    // Number of physical LCM blocks. Kernel page 0 is reserved separately.
+    std::int32_t NumLcmBlocks() const noexcept { return static_cast<std::int32_t>(lcm_blocks_.size()); }
+    std::int32_t NumEmptyLcmBlocks() const noexcept { return static_cast<std::int32_t>(free_parent_ids_.size()); }
 
-    // Device cache memory is byte-blind to the scheduler. Every block handed
-    // to a new owner through AcquireBlock must be sanitized before either a
-    // model forward or a host loadback writes it. Prefix hits use
-    // AcquireCachedBlock instead and deliberately never enter this list.
-    std::vector<std::int32_t> TakePageIdsToZero() {
-        std::ranges::sort(page_ids_to_zero_);
-        auto unique_end = std::ranges::unique(page_ids_to_zero_).begin();
-        page_ids_to_zero_.erase(unique_end, page_ids_to_zero_.end());
-        return std::exchange(page_ids_to_zero_, {});
+    CacheBlockRef AcquireBlock(GroupId group_id, std::int32_t cache_blocks_per_lcm_block) {
+        std::vector<CacheBlockRef> blocks = AcquireBlocks(group_id, cache_blocks_per_lcm_block, 1);
+        if (blocks.empty()) {
+            return {};
+        }
+        return std::move(blocks.front());
     }
 
-    std::vector<BlockRef> AcquireBlocks(std::int32_t num) {
-        std::vector<BlockRef> out;
-        if (num <= 0 || static_cast<std::int32_t>(free_list_.size()) < num) {
-            return out;
+    std::vector<CacheBlockRef> AcquireBlocks(GroupId group_id, std::int32_t cache_blocks_per_lcm_block,
+                                             std::int32_t num) {
+        _assert(cache_blocks_per_lcm_block > 0, "cache_blocks_per_lcm_block must be > 0");
+        if (num <= 0) {
+            return {};
         }
-        out.reserve(static_cast<std::size_t>(num));
-        for (std::int32_t i = 0; i < num; ++i) {
-            out.push_back(AcquireBlock());
+
+        std::vector<CacheBlockLocation> locations;
+        if (cache_blocks_per_lcm_block == 1) {
+            if (NumEmptyLcmBlocks() < num) {
+                return {};
+            }
+            locations.reserve(static_cast<std::size_t>(num));
+            for (std::int32_t i = 0; i < num; ++i) {
+                locations.push_back(
+                    CacheBlockLocation{.lcm_block_id = free_parent_ids_[static_cast<std::size_t>(i)], .slot_index = 0});
+            }
+        } else {
+            locations = planLocations(group_id, cache_blocks_per_lcm_block, static_cast<std::size_t>(num));
+        }
+        if (locations.size() != static_cast<std::size_t>(num)) {
+            return {};
+        }
+
+        std::vector<CacheBlockRef> out;
+        out.reserve(locations.size());
+        for (CacheBlockLocation location : locations) {
+            out.push_back(createBlockRef(group_id, cache_blocks_per_lcm_block, location));
         }
         return out;
     }
 
-    BlockRef AcquireBlock() {
-        if (free_list_.empty()) {
-            return {};
-        }
-        internal_block_ref::BlockControl& control = popFree();
-        if (control.Object().IsCached()) {
-            evictCached(control);
-        }
-        page_ids_to_zero_.push_back(control.Object().BlockId());
-        return BlockRef{control};
+    std::optional<GroupId> BoundGroup(std::int32_t lcm_block_id) const { return lcmBlock(lcm_block_id).bound_group; }
+    std::int32_t OccupiedCount(std::int32_t lcm_block_id) const {
+        return static_cast<std::int32_t>(lcmBlock(lcm_block_id).occupied_count);
     }
-
-    BlockRef AcquireCachedBlock(const std::string& block_hash_with_group) {
-        internal_block_ref::BlockControl* control = lookupCachedControl(block_hash_with_group);
-        if (control == nullptr) {
-            return {};
-        }
-        if (control->UseCount() == 0) {
-            removeFree(*control);
-        }
-        return BlockRef{*control};
+    bool IsOccupied(CacheBlockLocation location) const {
+        const LcmBlock& lcm_block = lcmBlock(location.lcm_block_id);
+        return location.slot_index >= 0 && static_cast<std::size_t>(location.slot_index) < lcm_block.occupancy.size() &&
+               lcm_block.occupancy[static_cast<std::size_t>(location.slot_index)];
     }
-
-    bool ContainsCachedBlock(const std::string& block_hash_with_group) const {
-        return lookupCachedControl(block_hash_with_group) != nullptr;
-    }
-
-    bool IsCachedBlockFree(const std::string& block_hash_with_group) const {
-        const internal_block_ref::BlockControl* control = lookupCachedControl(block_hash_with_group);
-        return control != nullptr && control->UseCount() == 0;
-    }
-
-    void CacheFullBlock(const BlockRef& block_ref, const std::string& block_hash_with_group) {
-        _assert(block_ref && block_ref.IsOwnedBy(*this), "block reference belongs to another pool");
-        internal_block_ref::BlockControl& control = controlAt(block_ref->BlockId());
-        CacheBlock& block = control.Object();
-        if (!enable_caching_) {
-            return;
-        }
-        _assert(!block_hash_with_group.empty(), "block hash must not be empty");
-        block.SetHash(block_hash_with_group);
-        try {
-            cache_index_[block_hash_with_group].push_back(&control);
-        } catch (...) {
-            block.ResetHash();
-            throw;
-        }
-    }
-
-    std::int32_t NumCachedBlocks() const {
+    std::int32_t NumOccupiedSlots() const noexcept {
         std::int32_t count = 0;
-        for (const auto& [_, controls] : cache_index_) {
-            count += static_cast<std::int32_t>(controls.size());
+        for (const LcmBlock& block : lcm_blocks_) {
+            count += static_cast<std::int32_t>(block.occupied_count);
         }
         return count;
     }
-
-    std::int32_t NumCachedFreeBlocks() const {
-        return countCached([](const internal_block_ref::BlockControl& control) { return control.UseCount() == 0; });
+    std::vector<CacheBlockLocation> OccupiedLocations(std::int32_t lcm_block_id) const {
+        const LcmBlock& lcm_block = lcmBlock(lcm_block_id);
+        std::vector<CacheBlockLocation> locations;
+        locations.reserve(lcm_block.occupied_count);
+        for (std::size_t slot = 0; slot < lcm_block.occupancy.size(); ++slot) {
+            if (lcm_block.occupancy[slot]) {
+                locations.push_back(
+                    CacheBlockLocation{.lcm_block_id = lcm_block_id, .slot_index = static_cast<std::int32_t>(slot)});
+            }
+        }
+        return locations;
     }
 
-    std::int32_t NumPinnedCachedBlocks() const {
-        return countCached([](const internal_block_ref::BlockControl& control) { return control.UseCount() > 0; });
+    void Release(CacheBlockLocation location) noexcept {
+        FatalCheck(location.lcm_block_id > 0 && static_cast<std::size_t>(location.lcm_block_id) <= lcm_blocks_.size(),
+                   "CacheBlock location has invalid LCM block id");
+        LcmBlock& parent = lcm_blocks_[static_cast<std::size_t>(location.lcm_block_id - 1)];
+        FatalCheck(location.slot_index >= 0 && static_cast<std::size_t>(location.slot_index) < parent.occupancy.size(),
+                   "CacheBlock location has invalid slot");
+        const std::size_t slot = static_cast<std::size_t>(location.slot_index);
+        FatalCheck(parent.occupancy[slot] && parent.occupied_count > 0, "CacheBlock location is not occupied");
+        parent.occupancy[slot] = false;
+        --parent.occupied_count;
+        if (parent.occupied_count == 0) {
+            parent.bound_group.reset();
+            parent.occupancy.clear();
+            FatalCheck(free_parent_ids_.size() < lcm_blocks_.size(),
+                       "free LCM block queue cannot exceed the pool size");
+            free_parent_ids_.push_back(location.lcm_block_id);
+        }
     }
 
 private:
-    internal_block_ref::BlockControl& controlAt(std::int32_t block_id) {
-        _assert(0 < block_id && block_id < total_num_blocks_, "block id out of range");
-        return controls_[static_cast<std::size_t>(block_id - 1)];
+    struct LcmBlock {
+        std::optional<GroupId> bound_group;
+        std::vector<bool> occupancy;
+        std::uint32_t occupied_count{0};
+    };
+
+    static std::size_t checkedLcmBlockCount(std::int32_t num_lcm_blocks) {
+        _assert(num_lcm_blocks >= 0, "num_lcm_blocks must be >= 0");
+        return static_cast<std::size_t>(num_lcm_blocks);
     }
 
-    void returnToPool(internal_block_ref::BlockControl& control) noexcept {
-        FatalCheck(control.IsOwnedBy(*this) && !control.InFreeList() && control.UseCount() == 0,
-                   "BlockPool can only reclaim its own unowned in-use block");
-        free_list_.splice(free_list_.end(), in_use_, control.Position());
-        control.MarkFree();
+    const LcmBlock& lcmBlock(std::int32_t lcm_block_id) const {
+        _assert(lcm_block_id > 0 && static_cast<std::size_t>(lcm_block_id) <= lcm_blocks_.size(),
+                "LCM block id out of range");
+        return lcm_blocks_[static_cast<std::size_t>(lcm_block_id - 1)];
     }
 
-    internal_block_ref::BlockControl& popFree() noexcept {
-        FatalCheck(!free_list_.empty(), "BlockPool cannot pop an empty free list");
-        internal_block_ref::BlockControl& control = *free_list_.front();
-        in_use_.splice(in_use_.end(), free_list_, free_list_.begin());
-        control.MarkInUse();
-        return control;
+    CacheBlockRef createBlockRef(GroupId group_id, std::int32_t slots_per_parent, CacheBlockLocation location) {
+        auto* control = new internal_cache_block_ref::CacheBlockControl(*this, location);
+        // Allocate the control before mutating the pool, then commit the
+        // location before publishing its RAII owner: CacheBlock destruction
+        // releases this location and therefore requires it to be occupied.
+        occupy(group_id, slots_per_parent, location);
+        return CacheBlockRef{*control};
     }
 
-    void removeFree(internal_block_ref::BlockControl& control) noexcept {
-        FatalCheck(control.InFreeList() && control.UseCount() == 0, "BlockPool can only remove an unowned free block");
-        in_use_.splice(in_use_.end(), free_list_, control.Position());
-        control.MarkInUse();
+    void occupy(GroupId group_id, std::int32_t slots_per_parent, CacheBlockLocation location) noexcept {
+        LcmBlock& parent = lcm_blocks_[static_cast<std::size_t>(location.lcm_block_id - 1)];
+        if (parent.occupied_count == 0) {
+            FatalCheck(!free_parent_ids_.empty() && free_parent_ids_.front() == location.lcm_block_id,
+                       "empty LCM placement must consume the next free parent");
+            FatalCheck(parent.occupancy.empty(), "empty LCM parent must not retain child slots");
+            parent.occupancy.assign(static_cast<std::size_t>(slots_per_parent), false);
+            free_parent_ids_.pop_front();
+            parent.bound_group = group_id;
+        }
+        FatalCheck(
+            parent.bound_group == group_id && parent.occupancy.size() == static_cast<std::size_t>(slots_per_parent),
+            "LCM parent binding changed while occupied");
+        const std::size_t slot = static_cast<std::size_t>(location.slot_index);
+        FatalCheck(slot < parent.occupancy.size(), "LCM child slot is out of range");
+        FatalCheck(!parent.occupancy[slot], "LCM child slot already occupied");
+        parent.occupancy[slot] = true;
+        ++parent.occupied_count;
     }
 
-    void evictCached(internal_block_ref::BlockControl& control) {
-        CacheBlock& block = control.Object();
-        auto it = cache_index_.find(block.BlockHash());
-        if (it != cache_index_.end()) {
-            std::erase(it->second, &control);
-            if (it->second.empty()) {
-                cache_index_.erase(it);
+    std::vector<CacheBlockLocation> planLocations(GroupId group_id, std::int32_t slots_per_parent,
+                                                  std::size_t count) const {
+        std::vector<std::int32_t> partially_filled_parent_ids;
+        partially_filled_parent_ids.reserve(lcm_blocks_.size());
+        for (std::size_t i = 0; i < lcm_blocks_.size(); ++i) {
+            const LcmBlock& parent = lcm_blocks_[i];
+            if (parent.bound_group != group_id) {
+                continue;
+            }
+            _assert(parent.occupancy.size() == static_cast<std::size_t>(slots_per_parent),
+                    "group packing changed while LCM block is occupied");
+            if (static_cast<std::size_t>(parent.occupied_count) < parent.occupancy.size()) {
+                partially_filled_parent_ids.push_back(static_cast<std::int32_t>(i + 1));
             }
         }
-        block.ResetHash();
+
+        // Allocate max occupied lcmBlock in this group at first.
+        std::ranges::sort(partially_filled_parent_ids, [this](std::int32_t lhs_id, std::int32_t rhs_id) {
+            const std::uint32_t lhs_occupied = lcmBlock(lhs_id).occupied_count;
+            const std::uint32_t rhs_occupied = lcmBlock(rhs_id).occupied_count;
+            if (lhs_occupied != rhs_occupied) {
+                return lhs_occupied > rhs_occupied;
+            }
+            return lhs_id < rhs_id;
+        });
+
+        std::vector<CacheBlockLocation> locations;
+        locations.reserve(count);
+        for (std::int32_t lcm_block_id : partially_filled_parent_ids) {
+            const LcmBlock& parent = lcmBlock(lcm_block_id);
+            for (std::size_t slot = 0; slot < parent.occupancy.size() && locations.size() < count; ++slot) {
+                if (!parent.occupancy[slot]) {
+                    locations.push_back(CacheBlockLocation{
+                        .lcm_block_id = lcm_block_id,
+                        .slot_index = static_cast<std::int32_t>(slot),
+                    });
+                }
+            }
+            if (locations.size() == count) {
+                return locations;
+            }
+        }
+
+        // Allocate free lcmBlock if partially-filled block is not enough.
+        for (std::int32_t lcm_block_id : free_parent_ids_) {
+            for (std::int32_t slot = 0; slot < slots_per_parent && locations.size() < count; ++slot) {
+                locations.push_back(CacheBlockLocation{
+                    .lcm_block_id = lcm_block_id,
+                    .slot_index = slot,
+                });
+            }
+            if (locations.size() == count) {
+                return locations;
+            }
+        }
+        return {};
     }
 
-    internal_block_ref::BlockControl* lookupCachedControl(const std::string& block_hash_with_group) const {
-        if (!enable_caching_) {
-            return nullptr;
-        }
-        auto it = cache_index_.find(block_hash_with_group);
-        if (it == cache_index_.end() || it->second.empty()) {
-            return nullptr;
-        }
-        return it->second.front();
-    }
-
-    template <class Predicate>
-    std::int32_t countCached(Predicate predicate) const {
-        std::int32_t count = 0;
-        for (const auto& [_, controls] : cache_index_) {
-            count += static_cast<std::int32_t>(std::ranges::count_if(
-                controls, [&](const internal_block_ref::BlockControl* control) { return predicate(*control); }));
-        }
-        return count;
-    }
-
-    std::int32_t total_num_blocks_{0};
-    bool enable_caching_{true};
-    std::deque<internal_block_ref::BlockControl> controls_{};
-    // Keep every control in an allocated list node so acquire/release can use allocation-free splice().
-    internal_block_ref::BlockControl::ControlList free_list_{};
-    internal_block_ref::BlockControl::ControlList in_use_{};
-    std::unordered_map<std::string, std::vector<internal_block_ref::BlockControl*>> cache_index_{};
-    std::vector<std::int32_t> page_ids_to_zero_{};
+    std::vector<LcmBlock> lcm_blocks_;
+    // Free parents are interchangeable: release appends and allocation consumes
+    // the front. Bound parents are selected separately by planLocations().
+    std::deque<std::int32_t> free_parent_ids_;
 };
 
 }  // namespace tokenspeed

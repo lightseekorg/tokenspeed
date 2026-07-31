@@ -40,6 +40,9 @@ Finished SucceededEvent::operator()(Decoding&& /*state*/) {
 PrefillDone RemotePrefillDoneEvent::operator()(Prefilling&& state) {
     TokenContainer::Window w = state.window;
     auto block_tables = std::move(state).TakeBlockTables();
+#if TOKENSPEED_FLAT_KVCACHE
+    auto flat_cache_progress = std::move(state).TakeFlatCacheProgress();
+#endif
     auto prefill_done = PrefillDone{
         state.GetTokenContainer(),
         state.GetPageSize(),
@@ -53,6 +56,9 @@ PrefillDone RemotePrefillDoneEvent::operator()(Prefilling&& state) {
     };
 
     prefill_done.SetBlockTables(std::move(block_tables));
+#if TOKENSPEED_FLAT_KVCACHE
+    prefill_done.SetFlatCacheProgress(std::move(flat_cache_progress));
+#endif
     prefill_done.ExtendResultTokens({bootstrap_token});
     return prefill_done;
 }

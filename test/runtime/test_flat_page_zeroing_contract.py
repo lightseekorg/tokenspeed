@@ -57,6 +57,16 @@ class ZeroFlatCachePagesContractTest(unittest.TestCase):
         self.assertIsNone(self._call(pool, [4, 5]))
         self.assertEqual(seen, [[4, 5]])
 
+    def test_group_aware_pool_is_invoked(self):
+        seen = []
+        pool = types.SimpleNamespace(
+            flat_kv_requires_page_zeroing=True,
+            zero_new_pages=lambda pages: seen.append(dict(pages)),
+        )
+        pages = {"full": [4, 5], "state": [9]}
+        self.assertIsNone(self._call(pool, pages))
+        self.assertEqual(seen, [pages])
+
 
 if __name__ == "__main__":
     unittest.main()

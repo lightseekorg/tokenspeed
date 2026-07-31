@@ -22,10 +22,7 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <optional>
 #include <span>
-#include <string>
-#include <vector>
 
 #include "cache/block_pool.h"
 #include "cache/cache_types.h"
@@ -40,14 +37,15 @@ public:
     using KvCacheManager::KvCacheManager;
 
     bool MatchIsPrefixClosed() const override { return true; }
+    std::int32_t BoundaryLookbackBlocks() const override { return 0; }
 
-    PrefixProbe Probe(const BlockPool& pool, std::span<const std::string> keys, std::int32_t begin_blocks,
-                      std::int32_t max_blocks) const override {
+    GroupPrefixProbe Probe(const BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_blocks,
+                           std::int32_t max_blocks) const override {
         const std::int32_t end_blocks =
             static_cast<std::int32_t>(std::min(keys.size(), static_cast<std::size_t>(std::max(max_blocks, 0))));
-        PrefixProbe probe;
+        GroupPrefixProbe probe;
         for (std::int32_t j = begin_blocks; j < end_blocks; ++j) {
-            if (!pool.ContainsCachedBlock(keys[static_cast<std::size_t>(j)])) {
+            if (!ContainsCachedBlock(pool, keys[static_cast<std::size_t>(j)])) {
                 break;
             }
             probe.hits.push_back(1);

@@ -41,6 +41,17 @@
 
 namespace tokenspeed::fsm {
 
+#if TOKENSPEED_FLAT_KVCACHE
+struct FlatCacheProgress {
+    // One source of truth for both the next hash-chain seed and the cumulative
+    // history needed to publish a resumable boundary across chunk edges.
+    std::vector<std::string> page_hashes;
+    std::uint64_t access_epoch{0};
+    // Pending closed-prefix boundary; zero once published or when absent.
+    std::int32_t promotion_boundary_tokens{0};
+};
+#endif
+
 inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* token_container,
                                                         TokenContainer::Window window) {
     const std::int32_t shifted_start = window.begin + 1;
@@ -121,7 +132,7 @@ public:
         if (!block_tables_.empty()) {
             // flat: group-0 sample, feeding only the radix-era capacity probe (a flat no-op);
             // real admission gates on the coordinator's per-group BlocksNeededFor.
-            return block_tables_[0].TailAvailableTokens();
+            return block_tables_[0].AvailableTokens();
         }
         return local_kv_allocator_->TailPageAvailableTokens();  // radix
     }
@@ -174,18 +185,25 @@ struct ForwardState : public BaseState {
     std::unique_ptr<ReqPoolIndex> TakeReqPoolIndex() && { return std::move(req_pool_index_); }
     std::int32_t GetReqPoolIndex() const { return req_pool_index_ ? req_pool_index_->slot_ : -1; }
 
-    // Flat: group-0 SAMPLE (ids -- and with per-group block sizes, counts -- differ per group);
-    // feeds one-group stats and the radix-era req_to_page fallback, never cross-group accounting
-    // (that is GetOccupiedPagesAllGroups).
+#if TOKENSPEED_FLAT_KVCACHE
+    FlatCacheProgress TakeFlatCacheProgress() && { return std::move(flat_cache_progress_); }
+    void SetFlatCacheProgress(FlatCacheProgress progress) { flat_cache_progress_ = std::move(progress); }
+    const FlatCacheProgress& FlatCacheProgressValue() const { return flat_cache_progress_; }
+#endif
+
+    // Flat: group-0 sample of LCM parent ids. Operation construction uses this
+    // only for row length/delta calculation, then replaces it with the owning
+    // Manager's resolved kernel page ids. Cross-group accounting uses
+    // GetOccupiedPagesAllGroups().
     std::vector<std::int32_t> GetOccupiedPages() const {
         if (!block_tables_.empty()) {
-            return BlockTablePageIds(block_tables_[0]);  // flat: first-group sample (see above)
+            return BlockTableLcmBlockIds(block_tables_[0]);
         }
         return GetPageContainer().Pages();  // radix
     }
 
     // Flat: real pages of EVERY group's block table (null holes excluded — block 0 is the
-    // never-allocated punch placeholder, not occupancy). Block ids are pool-wide and each id
+    // never-allocated punch placeholder, not occupancy). LCM ids are pool-wide and each id
     // is owned by one group, so concatenation has no cross-group duplicates. This is the
     // pool-wide occupancy counterpart of the group-0 sample above.
     std::vector<std::int32_t> GetOccupiedPagesAllGroups() const {
@@ -194,9 +212,9 @@ struct ForwardState : public BaseState {
         }
         std::vector<std::int32_t> ids;
         for (const BlockTable& table : block_tables_) {
-            for (const BlockRef& block : table.Blocks()) {
+            for (const CacheBlockRef& block : table.Blocks()) {
                 if (block) {
-                    ids.push_back(block->BlockId());
+                    ids.push_back(block->Location().lcm_block_id);
                 }
             }
         }
@@ -205,13 +223,16 @@ struct ForwardState : public BaseState {
 
     std::vector<std::int32_t> GetLocalAllocatorPages() const {
         if (!block_tables_.empty()) {
-            return BlockTablePageIds(block_tables_[0]);  // flat: first-group sample (see GetOccupiedPages)
+            return BlockTableLcmBlockIds(block_tables_[0]);
         }
         return local_kv_allocator_->Pages();  // radix: tail pages only, not tree-owned prefix pages
     }
 
 private:
     std::unique_ptr<ReqPoolIndex> req_pool_index_;
+#if TOKENSPEED_FLAT_KVCACHE
+    FlatCacheProgress flat_cache_progress_{};
+#endif
 };
 
 struct Prefilling : public ForwardState {
@@ -290,18 +311,6 @@ private:
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
 };
 
-#if TOKENSPEED_FLAT_KVCACHE
-// Rolling page-hash chain: pages [0, num_hashed_pages) are registered, last_hash seeds the
-// next increment. tail holds pages [tail_begin_page, num_hashed_pages) back to the fold grid
-// (lcm/base) so coarse groups can fold a block completed mid-decode.
-struct HashChain {
-    std::int32_t num_hashed_pages{0};
-    std::string last_hash;
-    std::int32_t tail_begin_page{0};
-    std::vector<std::string> tail;
-};
-#endif
-
 struct Decoding : public ForwardState {
     Decoding(TokenContainer* token_container, std::int32_t page_size, std::unique_ptr<HostNodeRef>&& host_node_ref,
              std::unique_ptr<DeviceNodeRef>&& node_ref, std::unique_ptr<LocalKVAllocator>&& local_kv_allocator,
@@ -327,17 +336,9 @@ struct Decoding : public ForwardState {
 
     std::unique_ptr<HostNodeRef> TakeHostNodeRef() && { return std::move(host_node_ref_); }
 
-#if TOKENSPEED_FLAT_KVCACHE
-    HashChain TakeHashChain() && { return std::move(hash_chain_); }
-    void SetHashChain(HashChain chain) { hash_chain_ = std::move(chain); }
-#endif
-
 private:
     std::unique_ptr<HostNodeRef> host_node_ref_{};  // pins host pages until the next state takes ownership
     std::int32_t reserve_num_tokens_in_next_schedule_event_{-1};
-#if TOKENSPEED_FLAT_KVCACHE
-    HashChain hash_chain_{};
-#endif
 };
 
 // Generation finished, host pages allocated, writeback op not yet generated.
@@ -346,46 +347,69 @@ struct Draining {
     // newWriteBackOperation split-safe (no re-walk after splitChild redistributes pages).
     using PagePair = TransferPair;
     Draining(std::vector<PagePair> pages_to_transfer, std::unique_ptr<DeviceNodeRef>&& device_node_ref,
-             std::unique_ptr<HostNodeRef>&& host_node_ref, std::vector<TreeNode*> mamba_writeback_nodes = {})
+             std::unique_ptr<HostNodeRef>&& host_node_ref, std::vector<TreeNode*> host_writeback_nodes = {},
+             std::vector<TreeNode*> mamba_writeback_nodes = {},
+             std::vector<PagedCacheTransferPair> paged_cache_writeback_transfers = {},
+             std::vector<TreeNode*> paged_cache_writeback_nodes = {})
         : pages_to_transfer_(std::move(pages_to_transfer)),
           device_node_ref_(std::move(device_node_ref)),
           host_node_ref_(std::move(host_node_ref)),
-          mamba_writeback_nodes_(std::move(mamba_writeback_nodes)) {}
+          host_writeback_nodes_(std::move(host_writeback_nodes)),
+          mamba_writeback_nodes_(std::move(mamba_writeback_nodes)),
+          paged_cache_writeback_transfers_(std::move(paged_cache_writeback_transfers)),
+          paged_cache_writeback_nodes_(std::move(paged_cache_writeback_nodes)) {}
 
 public:
     const std::vector<PagePair>& GetPagesToTransfer() const { return pages_to_transfer_; }
 
     std::unique_ptr<DeviceNodeRef> TakeDeviceNodeRef() && { return std::move(device_node_ref_); }
     std::unique_ptr<HostNodeRef> TakeHostNodeRef() && { return std::move(host_node_ref_); }
+    std::vector<TreeNode*> TakeHostWriteBackNodes() && { return std::move(host_writeback_nodes_); }
     std::vector<TreeNode*> TakeMambaWriteBackNodes() && { return std::move(mamba_writeback_nodes_); }
+    const std::vector<PagedCacheTransferPair>& GetPagedCacheWriteBackTransfers() const {
+        return paged_cache_writeback_transfers_;
+    }
+    const std::vector<TreeNode*>& PagedCacheWriteBackNodes() const { return paged_cache_writeback_nodes_; }
+    std::vector<TreeNode*> TakePagedCacheWriteBackNodes() && { return std::move(paged_cache_writeback_nodes_); }
 
 private:
     std::vector<PagePair> pages_to_transfer_;         // concrete mixed-kind pairs to copy
     std::unique_ptr<DeviceNodeRef> device_node_ref_;  // keeps matched Device node alive until WritingBack
     std::unique_ptr<HostNodeRef> host_node_ref_;      // keeps pre-allocated Host node alive until WritingBack
+    std::vector<TreeNode*> host_writeback_nodes_;     // exact KV host resources newly allocated by this op
     std::vector<TreeNode*> mamba_writeback_nodes_;    // exact Mamba nodes covered by this writeback op
+    std::vector<PagedCacheTransferPair> paged_cache_writeback_transfers_;
+    std::vector<TreeNode*> paged_cache_writeback_nodes_;
 };
 
 // Writeback op executing; both node refs are RAII locks pinning the pages while the transfer is in flight.
 struct WritingBack {
     WritingBack(std::unique_ptr<DeviceNodeRef>&& device_node_ref, std::unique_ptr<HostNodeRef>&& host_node_ref,
-                std::vector<TreeNode*> mamba_writeback_nodes = {})
+                std::vector<TreeNode*> host_writeback_nodes = {}, std::vector<TreeNode*> mamba_writeback_nodes = {},
+                std::vector<TreeNode*> paged_cache_writeback_nodes = {})
         : device_node_ref_(std::move(device_node_ref)),
           host_node_ref_(std::move(host_node_ref)),
-          mamba_writeback_nodes_(std::move(mamba_writeback_nodes)) {}
+          host_writeback_nodes_(std::move(host_writeback_nodes)),
+          mamba_writeback_nodes_(std::move(mamba_writeback_nodes)),
+          paged_cache_writeback_nodes_(std::move(paged_cache_writeback_nodes)) {}
 
     WritingBack(WritingBack&&) noexcept = default;
     WritingBack& operator=(WritingBack&&) noexcept = default;
 
     std::unique_ptr<HostNodeRef> TakeHostNodeRef() && { return std::move(host_node_ref_); }
     TreeNode* DeviceNode() const { return device_node_ref_ ? device_node_ref_->Node() : nullptr; }
+    const std::vector<TreeNode*>& HostWriteBackNodes() const { return host_writeback_nodes_; }
     const std::vector<TreeNode*>& MambaWriteBackNodes() const { return mamba_writeback_nodes_; }
+    const std::vector<TreeNode*>& PagedCacheWriteBackNodes() const { return paged_cache_writeback_nodes_; }
     void DropDeviceNodeRef() { device_node_ref_.reset(); }
+    void DropHostNodeRef() { host_node_ref_.reset(); }
 
 private:
     std::unique_ptr<DeviceNodeRef> device_node_ref_;  // released after WriteBackDone
     std::unique_ptr<HostNodeRef> host_node_ref_;      // released after WriteBackDone
+    std::vector<TreeNode*> host_writeback_nodes_;     // newly attached KV host resources
     std::vector<TreeNode*> mamba_writeback_nodes_;    // pending host Mamba slots published by this op ack
+    std::vector<TreeNode*> paged_cache_writeback_nodes_;
 };
 
 // Keeps the local KV allocator (tail-page info) and token container for recovery.
@@ -395,13 +419,18 @@ struct Retracting : public WritingBack {
     Retracting(TokenContainer* token_container, std::int32_t page_size, std::unique_ptr<HostNodeRef>&& host_node_ref,
                std::unique_ptr<DeviceNodeRef>&& device_node_ref, std::unique_ptr<LocalKVAllocator>&& local_kv_allocator,
                std::vector<PagePair> pages_to_transfer, std::vector<TreeNode*> mamba_writeback_nodes = {},
-               std::unique_ptr<LocalMambaAllocator>&& local_mamba_allocator = nullptr)
-        : WritingBack(std::move(device_node_ref), std::move(host_node_ref), std::move(mamba_writeback_nodes)),
+               std::unique_ptr<LocalMambaAllocator>&& local_mamba_allocator = nullptr,
+               std::vector<PagedCacheTransferPair> paged_cache_writeback_transfers = {},
+               std::vector<TreeNode*> paged_cache_writeback_nodes = {},
+               std::vector<TreeNode*> host_writeback_nodes = {})
+        : WritingBack(std::move(device_node_ref), std::move(host_node_ref), std::move(host_writeback_nodes),
+                      std::move(mamba_writeback_nodes), std::move(paged_cache_writeback_nodes)),
           token_container_{token_container},
           page_size_{page_size},
           local_kv_allocator_(std::move(local_kv_allocator)),
           pages_to_transfer_(std::move(pages_to_transfer)),
-          local_mamba_allocator_(std::move(local_mamba_allocator)) {}
+          local_mamba_allocator_(std::move(local_mamba_allocator)),
+          paged_cache_writeback_transfers_(std::move(paged_cache_writeback_transfers)) {}
 
     Retracting(Retracting&&) noexcept = default;
     Retracting& operator=(Retracting&&) noexcept = default;
@@ -412,6 +441,9 @@ struct Retracting : public WritingBack {
     std::int32_t GetPageSize() const { return page_size_; }
 
     const std::vector<PagePair>& GetPagesToTransfer() const { return pages_to_transfer_; }
+    const std::vector<PagedCacheTransferPair>& GetPagedCacheWriteBackTransfers() const {
+        return paged_cache_writeback_transfers_;
+    }
     void ExtendResultTokens(const std::vector<std::int32_t> result_tokens) { token_container_->Extend(result_tokens); }
 
     std::vector<std::int32_t> GetLocalAllocatorPages() const {
@@ -424,6 +456,7 @@ private:
     std::unique_ptr<LocalKVAllocator> local_kv_allocator_{};
     std::vector<PagePair> pages_to_transfer_{};
     std::unique_ptr<LocalMambaAllocator> local_mamba_allocator_{};
+    std::vector<PagedCacheTransferPair> paged_cache_writeback_transfers_{};
 };
 
 struct Retracted {

@@ -178,7 +178,7 @@ class BaseTransformerModel(nn.Module):
                 )
             elif isinstance(first_layer, BaseDecoderLayer):
                 fuse_embed_reduce = (
-                    self.mapping.attn.tp_size > 1
+                    self.embed_tokens.tp_size > 1
                     and first_layer.comm_manager.should_fuse(input_ids.shape[0])
                 )
             else:

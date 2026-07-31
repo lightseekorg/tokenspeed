@@ -145,9 +145,10 @@ private:
     PagedCacheGroupSnapshot BuildGroupSnap(PagedCacheGroupAllocator* alloc, std::int32_t prefix_len_tokens,
                                            std::int32_t base_logical_page, bool sliding) {
         PagedCacheGroupTable t{alloc};
-        t.Acquire(kLcm);
+        t.Acquire(prefix_len_tokens);
         // Caller chooses absolute base; fresh table commits at 0.
-        auto committed = sliding ? t.CheckpointStateToSnapshot(kLcm) : t.CommitHistoryToSnapshot(kLcm);
+        auto committed =
+            sliding ? t.CheckpointStateToSnapshot(prefix_len_tokens) : t.CommitHistoryToSnapshot(prefix_len_tokens);
         PagedCacheGroupSnapshot g{};
         g.pages = std::move(committed.pages);
         g.base_logical_page = base_logical_page;

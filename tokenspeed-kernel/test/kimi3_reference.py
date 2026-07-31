@@ -37,6 +37,74 @@ def situ_and_mul(
     return (gate * up).to(x.dtype)
 
 
+def kda_gate(
+    raw_g: torch.Tensor,
+    a_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    lower_bound: float | None = -5.0,
+) -> torch.Tensor:
+    """Reference KDA log-decay gate."""
+
+    if raw_g.ndim != 3:
+        raise ValueError("raw_g must be [T, H, D]")
+    heads = raw_g.shape[1]
+    if a_log.shape != (heads,):
+        raise ValueError("a_log must have one value per local head")
+    if dt_bias.shape != raw_g.shape[1:]:
+        raise ValueError("dt_bias must be [H, D]")
+
+    gate_input = raw_g.float() + dt_bias.float()[None, :, :]
+    if lower_bound is not None:
+        return lower_bound * torch.sigmoid(
+            torch.exp(a_log.float())[None, :, None] * gate_input
+        )
+    return -torch.exp(a_log.float())[None, :, None] * F.softplus(gate_input)
+
+
+def kda_recurrent(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    raw_g: torch.Tensor,
+    beta: torch.Tensor,
+    state: torch.Tensor,
+    a_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    lower_bound: float | None = -5.0,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sequential KDA oracle for both prefill and decode."""
+
+    if q.shape != k.shape or q.shape != v.shape or q.shape != raw_g.shape:
+        raise ValueError("q, k, v, and raw_g must have matching shapes")
+    tokens, heads, key_dim = q.shape
+    value_dim = v.shape[-1]
+    if state.shape != (heads, value_dim, key_dim):
+        raise ValueError("invalid KDA state shape")
+    if beta.shape != (tokens, heads):
+        raise ValueError("beta must be [T, H]")
+
+    gates = kda_gate(raw_g, a_log, dt_bias, lower_bound=lower_bound)
+    running = state.float().clone()
+    outputs = []
+    scale = key_dim**-0.5
+    for token_idx in range(tokens):
+        q_t = F.normalize(q[token_idx].float(), dim=-1, eps=eps) * scale
+        k_t = F.normalize(k[token_idx].float(), dim=-1, eps=eps)
+        v_t = v[token_idx].float()
+        beta_t = torch.sigmoid(beta[token_idx].float())
+
+        running = running * torch.exp(gates[token_idx])[:, None, :]
+        prediction = torch.einsum("hvk,hk->hv", running, k_t)
+        delta = beta_t[:, None] * (v_t - prediction)
+        running = running + torch.einsum("hv,hk->hvk", delta, k_t)
+        outputs.append(torch.einsum("hvk,hk->hv", running, q_t))
+
+    return torch.stack(outputs).to(q.dtype), running.to(state.dtype)
+
+
 _E2M1_VALUES = torch.tensor(
     [
         0.0,

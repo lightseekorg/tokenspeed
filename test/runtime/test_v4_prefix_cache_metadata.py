@@ -30,6 +30,7 @@ try:
         ExecutionEvent,
         ForwardEvent,
         PagedCacheGroupConfig,
+        PagedCacheGroupFamily,
         PagedCacheRetention,
         PrefixCacheAdjunctSpec,
         RequestSpec,
@@ -83,7 +84,34 @@ def _make_two_group_config() -> "SchedulerConfig":
     return cfg
 
 
-def _post(sched: "Scheduler", payload) -> None:
+def _make_l2_binding_config() -> "SchedulerConfig":
+    cfg = _make_two_group_config()
+    cfg.disable_l2_cache = False
+    cfg.paged_cache_host_group_pages = {"fh": 32, "swa": 32}
+    groups = list(cfg.paged_cache_groups)
+    for group in groups:
+        group.family = (
+            PagedCacheGroupFamily.History
+            if group.group_id == "fh"
+            else PagedCacheGroupFamily.State
+        )
+    cfg.paged_cache_groups = groups
+    cfg.prefix_cache_adjunct.required_groups = ["fh"]
+    return cfg
+
+
+def _request(request_id: str, tokens) -> "RequestSpec":
+    spec = RequestSpec()
+    spec.request_id = request_id
+    spec.tokens = list(tokens)
+    return spec
+
+
+def _post(sched: "Scheduler", event_type, request_id: str, tokens=None) -> None:
+    payload = event_type()
+    payload.request_id = request_id
+    if tokens is not None:
+        payload.tokens = tokens
     ev = ExecutionEvent()
     ev.add_event(payload)
     sched.advance(ev)
@@ -91,30 +119,19 @@ def _post(sched: "Scheduler", payload) -> None:
 
 def _prime_r1(sched: "Scheduler") -> tuple[list[int], list[int]]:
     """Prime r1 and capture page ids before finish releases its tables."""
-    spec = RequestSpec()
-    spec.request_id = "r1"
-    spec.tokens = list(range(1, 13))
-    sched.submit_requests([spec])
+    sched.submit_requests([_request("r1", range(1, 13))])
     sched.next_execution_plan()
-    er = ForwardEvent.ExtendResult()
-    er.request_id = "r1"
-    er.tokens = [99]
-    _post(sched, er)
+    _post(sched, ForwardEvent.ExtendResult, "r1", [99])
     sched.next_execution_plan()
     r1_fh = list(sched.get_request_paged_cache_page_ids("r1", "fh"))
     r1_swa = list(sched.get_request_paged_cache_page_ids("r1", "swa"))
-    fin = ForwardEvent.Finish()
-    fin.request_id = "r1"
-    _post(sched, fin)
+    _post(sched, ForwardEvent.Finish, "r1")
     sched.next_execution_plan()
     return r1_fh, r1_swa
 
 
 def _submit_r2_same_prefix(sched: "Scheduler") -> int:
-    spec = RequestSpec()
-    spec.request_id = "r2"
-    spec.tokens = list(range(1, 13))
-    sched.submit_requests([spec])
+    sched.submit_requests([_request("r2", range(1, 13))])
     plan = sched.next_execution_plan()
     assert len(plan.forward) == 1
     forward = plan.forward[0]
@@ -123,8 +140,58 @@ def _submit_r2_same_prefix(sched: "Scheduler") -> int:
     return int(forward.extend_prefix_lens[0])
 
 
-class TestV4PrefixCacheMetadata(unittest.TestCase):
+def test_paged_l2_transfer_binding_shape() -> None:
+    sched = Scheduler(_make_l2_binding_config())
+    sched.submit_requests([_request("r1", range(1, 13))])
+    assert len(sched.next_execution_plan().forward) == 1
 
+    _post(sched, ForwardEvent.ExtendResult, "r1", [99])
+    sched.next_execution_plan()
+
+    _post(sched, ForwardEvent.Finish, "r1")
+    writeback_plan = sched.next_execution_plan()
+    writeback = next(
+        (op for op in writeback_plan.cache if hasattr(op, "is_retract")),
+        None,
+    )
+    assert writeback is not None
+    assert len(writeback.op_ids) == len(writeback.paged_cache_transfers) == 1
+    assert writeback.paged_cache_transfers[0]
+
+    writeback_groups = {
+        transfer.group_id for transfer in writeback.paged_cache_transfers[0]
+    }
+    assert writeback_groups == {"fh", "swa"}
+    for transfer in writeback.paged_cache_transfers[0]:
+        assert isinstance(transfer.group_id, str)
+        assert len(transfer.src_pages) == len(transfer.dst_pages) > 0
+
+
+def test_scheduler_abort_binding_shape() -> None:
+    config = _make_l2_binding_config()
+    groups = list(config.paged_cache_groups)
+    for group in groups:
+        group.total_pages = 3 if group.group_id == "fh" else 5
+    config.paged_cache_groups = groups
+    sched = Scheduler(config)
+    specs = [
+        _request(request_id, range(start, start + 4))
+        for request_id, start in (("z-request", 1), ("a-request", 101))
+    ]
+    sched.submit_requests(specs)
+    sched.next_execution_plan()
+
+    for request_id, token in (("z-request", 42), ("a-request", 43)):
+        _post(sched, ForwardEvent.ExtendResult, request_id, [token])
+
+    plan = sched.next_execution_plan()
+
+    ((request_id, message),) = plan.scheduler_aborts
+    assert request_id == "a-request"
+    assert "capacity" in message
+
+
+class TestV4PrefixCacheMetadata(unittest.TestCase):
     def setUp(self) -> None:
         config = _make_two_group_config()
         fh_config = next(

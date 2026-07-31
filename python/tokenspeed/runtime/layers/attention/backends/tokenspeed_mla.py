@@ -54,6 +54,7 @@ from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
 )
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+from tokenspeed.runtime.layers.attention.page_table import expand_page_table
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.pdl import pdl_enabled
@@ -206,7 +207,7 @@ class CuteDSLMLABackend(AttentionBackend):
         """Mark this MLA backend as a Kimi-K3 FlatKV contract sub-backend.
 
         Called by the registry when the backend is constructed for the
-        FlatHybridCachePool contract path. Enables flat CUDA-graph
+        Kimi-K3 LCM contract path. Enables flat CUDA-graph
         capture/replay with stable full-attention block-table and write-location
         buffers; DeepSeek's shared backend is never marked and keeps the
         non-flat graph path unchanged.
@@ -325,22 +326,13 @@ class CuteDSLMLABackend(AttentionBackend):
         formula is preserved. -1 table tails clamp to the null page 0, whose
         kernel expansion stays inside the physical null page.
         """
-        if block_kv_indices is None:
-            block_kv_indices = torch.zeros(
-                (bs, max_blocks), dtype=torch.int32, device=self.device
-            )
-        ratio = flat_page_size // self.page_size
-        flat_cols = min(triton.cdiv(max_blocks, ratio), flat_table.shape[1])
-        if flat_cols <= 0:
-            return block_kv_indices
-        expanded = (
-            flat_table[:bs, :flat_cols].clamp_min(0).to(torch.int32).unsqueeze(-1)
-            * ratio
-            + torch.arange(ratio, dtype=torch.int32, device=flat_table.device)
-        ).reshape(bs, flat_cols * ratio)
-        copy_len = min(max_blocks, flat_cols * ratio)
-        block_kv_indices[:bs, :copy_len] = expanded[:, :copy_len]
-        return block_kv_indices
+        return expand_page_table(
+            flat_table[:bs],
+            logical_page_size=flat_page_size,
+            kernel_page_size=self.page_size,
+            max_kernel_pages=max_blocks,
+            out=block_kv_indices,
+        )
 
     def _flat_decode_out_cache_loc(
         self,

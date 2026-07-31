@@ -49,7 +49,9 @@ def test_unpack_matches_per_group(actual_bs, bs):
         spans[-1] = (sum(len(x) for x in flat), w)
         flat.append(vals.reshape(-1))
     src = torch.cat([v for v in flat]).to(dev)
-    meta = torch.tensor([[off, w] for (off, w) in spans], dtype=torch.int32, device=dev)
+    meta = torch.tensor(
+        [[off, w, 1] for (off, w) in spans], dtype=torch.int32, device=dev
+    )
     dst = torch.full((g, max_bs, wmax), 7, dtype=torch.int32, device=dev)
     flat_tables_unpack(src, meta, dst, bs, actual_bs=actual_bs, tail_pad=-1)
 
@@ -62,6 +64,46 @@ def test_unpack_matches_per_group(actual_bs, bs):
             assert (dst[i, actual_bs:bs] == 0).all(), i
         # rows beyond bs untouched
         assert (dst[i, bs:] == 7).all(), i
+
+
+def test_unpack_expands_logical_pages_per_group():
+    """The packed graph upload may mix scheduler-sized and kernel-sized rows."""
+    dev = "cuda"
+    logical = torch.tensor(
+        [
+            [3, 5, -1],
+            [7, 9, 11],
+        ],
+        dtype=torch.int32,
+    )
+    unchanged = torch.tensor(
+        [
+            [13, 15, -1],
+            [17, 19, 21],
+        ],
+        dtype=torch.int32,
+    )
+    src = torch.cat((logical.flatten(), unchanged.flatten())).to(dev)
+    meta = torch.tensor(
+        [
+            [0, 3, 2],
+            [logical.numel(), 3, 1],
+        ],
+        dtype=torch.int32,
+        device=dev,
+    )
+    dst = torch.full((2, 2, 8), 7, dtype=torch.int32, device=dev)
+
+    flat_tables_unpack(src, meta, dst, bs=2, tail_pad=-1)
+
+    assert dst[0].cpu().tolist() == [
+        [6, 7, 10, 11, 0, 1, -1, -1],
+        [14, 15, 18, 19, 22, 23, -1, -1],
+    ]
+    assert dst[1].cpu().tolist() == [
+        [13, 15, -1, -1, -1, -1, -1, -1],
+        [17, 19, 21, -1, -1, -1, -1, -1],
+    ]
 
 
 @pytest.mark.parametrize("n", [1, 3, 4])

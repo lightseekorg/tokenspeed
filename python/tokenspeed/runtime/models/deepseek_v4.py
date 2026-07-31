@@ -102,6 +102,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     deepseek_v4_csa_indexer_cache_insert,
     deepseek_v4_fused_inv_rope_fp8_quant,
     deepseek_v4_hca_compress_kv_cache_insert,
+    deepseek_v4_hca_direct_compress_kv_cache_insert,
     deepseek_v4_prepare_indexer_q_mxfp4,
     fused_qnorm_rope_kv_insert,
     save_deepseek_v4_compressor_state,
@@ -195,6 +196,77 @@ def _deepseek_v4_forward_metadata(ctx: ForwardContext):
             return prefill_metadata
         return decode_metadata or metadata or prefill_metadata
     return metadata
+
+
+def _deepseek_v4_hca_active_token_offsets(
+    ctx: ForwardContext,
+    metadata: DeepseekV4ForwardMetadata,
+    positions: torch.Tensor,
+    compress_ratio: int,
+) -> list[int] | None:
+    if compress_ratio != 128 or get_is_capture_mode():
+        return None
+    forward_mode = getattr(ctx, "forward_mode", None)
+    if forward_mode is None or not forward_mode.is_extend_or_mixed():
+        return None
+    num_tokens = int(positions.numel())
+    if num_tokens <= 0:
+        return None
+    seq_lens_cpu = getattr(metadata, "seq_lens_cpu", None)
+    query_lens_cpu = getattr(metadata, "query_lens_cpu", None)
+    if seq_lens_cpu is None or query_lens_cpu is None:
+        return None
+    if seq_lens_cpu.device.type != "cpu" or query_lens_cpu.device.type != "cpu":
+        return None
+    num_reqs = min(int(seq_lens_cpu.numel()), int(query_lens_cpu.numel()))
+    if num_reqs <= 0:
+        return None
+
+    active_offsets: list[int] = []
+    token_start = 0
+    seq_lens = seq_lens_cpu[:num_reqs].tolist()
+    query_lens = query_lens_cpu[:num_reqs].tolist()
+    for seq_len_value, query_len_value in zip(seq_lens, query_lens, strict=True):
+        seq_len = int(seq_len_value)
+        query_len = int(query_len_value)
+        if query_len < 0:
+            return None
+        if query_len == 0:
+            continue
+        start_pos = seq_len - query_len
+        if start_pos < 0:
+            return None
+        first_pos = (
+            (start_pos + compress_ratio) // compress_ratio
+        ) * compress_ratio - 1
+        for pos in range(first_pos, seq_len, compress_ratio):
+            token_offset = token_start + pos - start_pos
+            if 0 <= token_offset < num_tokens:
+                active_offsets.append(token_offset)
+        token_start += query_len
+
+    if token_start != num_tokens:
+        return None
+    return active_offsets
+
+
+def _deepseek_v4_hca_active_token_indices(
+    ctx: ForwardContext,
+    metadata: DeepseekV4ForwardMetadata,
+    positions: torch.Tensor,
+    compress_ratio: int,
+) -> torch.Tensor | None:
+    active_offsets = _deepseek_v4_hca_active_token_offsets(
+        ctx,
+        metadata,
+        positions,
+        compress_ratio,
+    )
+    if active_offsets is None:
+        return None
+    if not active_offsets:
+        return torch.empty(0, dtype=torch.int64, device=positions.device)
+    return torch.tensor(active_offsets, dtype=torch.int64, device=positions.device)
 
 
 def _dequant_fp8_weight(layer: nn.Module, shape: tuple[int, ...]) -> torch.Tensor:
@@ -2864,6 +2936,42 @@ class DeepseekV4Compressor(nn.Module):
             return kv, score
 
         kv_cache_block_size = pool.get_compressed_block_size(layer_index)
+        insert_token_to_req_indices = metadata.token_to_req_indices[: positions.numel()]
+        direct_active_token_indices = None
+        if self.compress_ratio == 128:
+            active_hit = (
+                memo.get(("hca_active", self.compress_ratio))
+                if memo is not None
+                else None
+            )
+            if active_hit is not None:
+                direct_active_token_indices = active_hit
+            else:
+                active_metadata = metadata
+                forward_mode = getattr(ctx, "forward_mode", None)
+                if forward_mode is not None and forward_mode.is_mixed():
+                    full_metadata = getattr(ctx.attn_backend, "forward_metadata", None)
+                    if full_metadata is not None:
+                        active_metadata = full_metadata
+                active_indices = _deepseek_v4_hca_active_token_indices(
+                    ctx,
+                    active_metadata,
+                    positions,
+                    self.compress_ratio,
+                )
+                if active_indices is None and active_metadata is not metadata:
+                    active_indices = _deepseek_v4_hca_active_token_indices(
+                        ctx,
+                        metadata,
+                        positions,
+                        self.compress_ratio,
+                    )
+                if active_indices is not None:
+                    direct_active_token_indices = active_indices
+                    if memo is not None:
+                        memo[("hca_active", self.compress_ratio)] = (
+                            direct_active_token_indices
+                        )
         compressed_hit = (
             memo.get(("compressed", self.compress_ratio)) if memo is not None else None
         )
@@ -2874,9 +2982,7 @@ class DeepseekV4Compressor(nn.Module):
                 compressed_slots = cache_metadata.compressed_slot_mapping(
                     positions,
                     self.compress_ratio,
-                    token_to_req_indices=metadata.token_to_req_indices[
-                        : positions.numel()
-                    ],
+                    token_to_req_indices=insert_token_to_req_indices,
                     query_start_loc=metadata.query_start_loc,
                     seq_lens=metadata.seq_lens,
                     kv_cache_block_size=kv_cache_block_size,
@@ -2888,27 +2994,64 @@ class DeepseekV4Compressor(nn.Module):
             if memo is not None:
                 memo[("compressed", self.compress_ratio)] = compressed_slots
         with nvtx_range(f"{profile_prefix}_cache_insert"):
-            insert = (
-                deepseek_v4_csa_compress_kv_cache_insert
-                if self.compress_ratio == 4
-                else deepseek_v4_hca_compress_kv_cache_insert
-            )
-            insert(
-                state_cache=state_cache,
-                token_to_req_indices=metadata.token_to_req_indices[: positions.numel()],
-                positions=positions,
-                compressor_slot_mapping=state_slot_mapping,
-                block_table=state_block_table,
-                block_table_base_offsets=state_base_logical_page,
-                compressor_block_size=state_block_size,
-                rms_norm_weight=self.norm.weight,
-                rms_norm_eps=self.norm.variance_epsilon,
-                cos_sin_cache=cos_sin_cache,
-                kv_cache_2d=pool.get_compressed_kv_buffer_2d(layer_index),
-                kv_slot_mapping=compressed_slots,
-                kv_cache_block_size=kv_cache_block_size,
-                compress_ratio=self.compress_ratio,
-            )
+            if self.compress_ratio == 4:
+                deepseek_v4_csa_compress_kv_cache_insert(
+                    state_cache=state_cache,
+                    token_to_req_indices=insert_token_to_req_indices,
+                    positions=positions,
+                    compressor_slot_mapping=state_slot_mapping,
+                    block_table=state_block_table,
+                    block_table_base_offsets=state_base_logical_page,
+                    compressor_block_size=state_block_size,
+                    rms_norm_weight=self.norm.weight,
+                    rms_norm_eps=self.norm.variance_epsilon,
+                    cos_sin_cache=cos_sin_cache,
+                    kv_cache_2d=pool.get_compressed_kv_buffer_2d(layer_index),
+                    kv_slot_mapping=compressed_slots,
+                    kv_cache_block_size=kv_cache_block_size,
+                    compress_ratio=self.compress_ratio,
+                )
+            else:
+                if (
+                    direct_active_token_indices is not None
+                    and direct_active_token_indices.numel() > 0
+                ):
+                    deepseek_v4_hca_direct_compress_kv_cache_insert(
+                        state_cache=state_cache,
+                        kv=kv,
+                        score=score,
+                        ape=self.ape,
+                        token_to_req_indices=insert_token_to_req_indices,
+                        query_start_loc=metadata.query_start_loc,
+                        positions=positions,
+                        block_table=state_block_table,
+                        compressor_block_size=state_block_size,
+                        rms_norm_weight=self.norm.weight,
+                        rms_norm_eps=self.norm.variance_epsilon,
+                        cos_sin_cache=cos_sin_cache,
+                        kv_cache_2d=pool.get_compressed_kv_buffer_2d(layer_index),
+                        kv_slot_mapping=compressed_slots,
+                        kv_cache_block_size=kv_cache_block_size,
+                        active_token_indices=direct_active_token_indices,
+                        block_table_base_offsets=state_base_logical_page,
+                    )
+                if direct_active_token_indices is None:
+                    deepseek_v4_hca_compress_kv_cache_insert(
+                        state_cache=state_cache,
+                        token_to_req_indices=insert_token_to_req_indices,
+                        positions=positions,
+                        compressor_slot_mapping=state_slot_mapping,
+                        block_table=state_block_table,
+                        block_table_base_offsets=state_base_logical_page,
+                        compressor_block_size=state_block_size,
+                        rms_norm_weight=self.norm.weight,
+                        rms_norm_eps=self.norm.variance_epsilon,
+                        cos_sin_cache=cos_sin_cache,
+                        kv_cache_2d=pool.get_compressed_kv_buffer_2d(layer_index),
+                        kv_slot_mapping=compressed_slots,
+                        kv_cache_block_size=kv_cache_block_size,
+                        compress_ratio=self.compress_ratio,
+                    )
         return kv, score
 
 

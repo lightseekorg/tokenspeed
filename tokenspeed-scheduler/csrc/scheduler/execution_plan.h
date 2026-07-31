@@ -21,7 +21,9 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -42,11 +44,16 @@ struct FlatTerminalError {
     std::string message;
 };
 
+struct SchedulerAbort {
+    std::string request_id;
+    std::string message;
+};
+
 class ExecutionPlan {
 public:
     template <typename OperationType>
     ExecutionPlan& With(OperationType operation) {
-        operations_.emplace_back(operation);
+        operations_.emplace_back(std::move(operation));
         return *this;
     }
 
@@ -58,7 +65,13 @@ public:
         return *this;
     }
 
+    ExecutionPlan& WithSchedulerAborts(std::vector<SchedulerAbort> aborts) {
+        scheduler_aborts_ = std::move(aborts);
+        return *this;
+    }
+
     const std::vector<Operation>& Operations() const { return operations_; }
+    const std::vector<SchedulerAbort>& SchedulerAborts() const { return scheduler_aborts_; }
 
     // Flat KV-cache: requests terminalized this round as OOM -- the pool was wedged by
     // unretractable mid-prefill holders (possibly the request itself, or a mutual wedge)
@@ -69,13 +82,14 @@ public:
     // phase/reason diagnostics.
     std::vector<FlatTerminalError> flat_terminal_errors;
 
-    // Flat KV-cache physical pages newly assigned to an owner in this plan.
-    // The runtime zeros the complete page set before cache transfers/forward.
-    // Cached prefix hits are intentionally absent.
-    std::vector<std::int32_t> flat_page_ids_to_zero;
+    // Flat KV-cache child pages newly assigned in this plan. Group identity is
+    // required because one LCM parent can still contain live sibling children.
+    // The runtime clears these exact byte ranges before transfers/forward.
+    std::map<std::string, std::vector<std::int32_t>> flat_pages_to_zero;
 
 private:
     std::vector<Operation> operations_;
+    std::vector<SchedulerAbort> scheduler_aborts_;
 };
 
 }  // namespace tokenspeed
