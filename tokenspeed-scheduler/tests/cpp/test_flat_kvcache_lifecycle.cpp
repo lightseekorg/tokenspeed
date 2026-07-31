@@ -51,6 +51,7 @@ protected:
         full_grp.rows_per_page = cfg.block_size;
         full_grp.entry_stride_tokens = 1;
         full_grp.total_pages = cfg.device_allocator.total_pages;
+        full_grp.cache_blocks_per_lcm_block = 2;
         full_grp.retention = PagedCacheGroupConfig::Retention::FullHistory;
         full_grp.family = PagedCacheGroupFamily::History;
 
@@ -86,6 +87,17 @@ TEST_F(FlatKvCacheLifecycleTestSuite, SingleRequest_PrefillDecodeFinish) {
     ASSERT_EQ(prefill->flat_block_tables.count("swa"), 1u);
     EXPECT_EQ(prefill->flat_block_tables.at("full").size(), 1u);
     EXPECT_EQ(prefill->flat_block_tables.at("swa").size(), 1u);
+    ASSERT_EQ(prefill->occupied_pages.size(), 1u);
+    const auto& full_prefill_row = prefill->flat_block_tables.at("full").at(0);
+    ASSERT_GE(full_prefill_row.size(), 2u);
+    EXPECT_NE(full_prefill_row[0], full_prefill_row[1])
+        << "two child slots in one LCM block need distinct kernel page ids";
+    EXPECT_EQ(prefill->occupied_pages.at(0), full_prefill_row)
+        << "the legacy single-table output must carry resolved kernel page ids, not LCM parent ids";
+    ASSERT_EQ(prefill_plan.flat_pages_to_zero.count("full"), 1u);
+    ASSERT_EQ(prefill_plan.flat_pages_to_zero.count("swa"), 1u);
+    EXPECT_EQ(prefill_plan.flat_pages_to_zero.at("full"), full_prefill_row);
+    EXPECT_EQ(prefill_plan.flat_pages_to_zero.at("swa"), prefill->flat_block_tables.at("swa").at(0));
 
     SendForwardDone("r1", {42});
     EXPECT_EQ(scheduler_->PrefillSize(), 1u);
@@ -194,14 +206,21 @@ TEST_F(FlatKimiFourGroupSuite, FourTablesUseDisjointGlobalPages) {
     for (const auto& group_id : GroupIds()) {
         ASSERT_EQ(op->flat_block_tables.count(group_id), 1u) << group_id;
         ASSERT_EQ(op->flat_block_tables.at(group_id).size(), 1u) << group_id;
+        std::set<std::int32_t> group_real;
         const std::size_t group_entries =
-            CollectDisjointRealPages(op->flat_block_tables.at(group_id), all_real, group_id);
+            CollectDisjointRealPages(op->flat_block_tables.at(group_id), group_real, group_id);
         EXPECT_GT(group_entries, 0u) << group_id;
         fresh_positive_entries += group_entries;
+        for (std::int32_t page_id : group_real) {
+            EXPECT_TRUE(all_real.insert(page_id).second) << "physical page " << page_id << " reused across groups";
+        }
+        ASSERT_EQ(plan.flat_pages_to_zero.count(group_id), 1u) << group_id;
+        EXPECT_EQ(std::set<std::int32_t>(plan.flat_pages_to_zero.at(group_id).begin(),
+                                         plan.flat_pages_to_zero.at(group_id).end()),
+                  group_real)
+            << "every freshly-owned physical page must be sanitized in its cache group";
     }
     EXPECT_EQ(all_real.size(), fresh_positive_entries);
-    EXPECT_EQ(std::set<std::int32_t>(plan.flat_page_ids_to_zero.begin(), plan.flat_page_ids_to_zero.end()), all_real)
-        << "every freshly-owned physical page must be sanitized before forward";
 
     AbortRequest("r1");
     PlanOnce();
@@ -231,18 +250,24 @@ TEST_F(FlatKimiFourGroupSuite, OomDoesNotPartiallyCommitTables) {
     ASSERT_EQ(before, 32u);
     Submit(MakeRequestSpec("oom", /*num_pages=*/8));
 
-    for (int round = 0; round < 3; ++round) {
-        ExecutionPlan deferred = PlanOnce();
-        const FlatForwardOperation* op = FindFlatOp(deferred);
-        ASSERT_NE(op, nullptr);
-        EXPECT_TRUE(op->request_ids.empty()) << "round " << round;
-        for (const auto& [group_id, table] : op->flat_block_tables) {
-            EXPECT_TRUE(table.empty()) << group_id << " round " << round;
-        }
-        EXPECT_TRUE(deferred.flat_oom_request_ids.empty()) << "round " << round;
-        EXPECT_EQ(scheduler_->AvailableKvPages(), before) << "round " << round;
-    }
+    ExecutionPlan deferred = PlanOnce();
+    const FlatForwardOperation* deferred_op = FindFlatOp(deferred);
+    ASSERT_NE(deferred_op, nullptr);
+    EXPECT_TRUE(deferred_op->request_ids.empty());
+    EXPECT_TRUE(deferred.flat_oom_request_ids.empty());
+    EXPECT_EQ(scheduler_->AvailableKvPages(), before);
     EXPECT_EQ(scheduler_->WaitingSize(), 1u);
+
+    ExecutionPlan rejected = PlanOnce();
+    const FlatForwardOperation* op = FindFlatOp(rejected);
+    ASSERT_NE(op, nullptr);
+    EXPECT_TRUE(op->request_ids.empty());
+    for (const auto& [group_id, table] : op->flat_block_tables) {
+        EXPECT_TRUE(table.empty()) << group_id;
+    }
+    EXPECT_EQ(rejected.flat_oom_request_ids, std::vector<std::string>{"oom"});
+    EXPECT_EQ(scheduler_->AvailableKvPages(), before);
+    EXPECT_EQ(scheduler_->WaitingSize(), 0u);
 }
 
 }  // namespace tokenspeed::test

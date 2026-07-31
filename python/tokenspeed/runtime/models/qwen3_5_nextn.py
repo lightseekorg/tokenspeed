@@ -277,6 +277,15 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
             input_ids, hidden_states, self.lm_head, logits_metadata
         )
 
+    def checkpoint_weight_name_filter(self, name: str) -> bool:
+        """Shard preselection for ``load_weights`` (see DefaultModelLoader).
+
+        Accepts a superset of the checkpoint names ``load_weights`` consumes
+        (it only processes MTP-branch weights), so shards without any MTP
+        tensor are skipped entirely.
+        """
+        return "mtp" in name
+
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False
     ):

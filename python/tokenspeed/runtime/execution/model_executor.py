@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -155,7 +156,7 @@ class ModelExecutorConfig:
     max_req_pool_size: int
     output_length: int
     enforce_eager: bool
-    block_size: int
+    logical_page_size: int
     max_num_seqs: int
     chunked_prefill_size: int
     vocab_size: int
@@ -209,6 +210,7 @@ class ModelExecutorConfig:
         gpu_id: int,
         global_rank: int,
         num_total_pages: int,
+        logical_page_size: int,
         overlap_schedule_depth: int = 0,
     ) -> ModelExecutorConfig:
         output_length = (
@@ -223,7 +225,7 @@ class ModelExecutorConfig:
             max_req_pool_size=max_req_pool_size,
             output_length=output_length,
             enforce_eager=server_args.enforce_eager,
-            block_size=server_args.block_size,
+            logical_page_size=logical_page_size,
             max_num_seqs=server_args.max_num_seqs,
             chunked_prefill_size=server_args.chunked_prefill_size,
             vocab_size=model_config.vocab_size,
@@ -279,7 +281,7 @@ class ModelExecutor:
         self.sampling_backend = sampling_backend
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
-        # FlatKV contract pools (FlatHybridCachePool) publish a runtime
+        # FlatKV contract pools publish a runtime
         # contract; on that path per-step tables travel as
         # FlatCacheBatchMetadata and the legacy req_to_page mirror is
         # forbidden.
@@ -330,13 +332,13 @@ class ModelExecutor:
                 config.context_len
                 + config.spec_num_tokens
                 + draft_block_reservation_slack
-                + config.block_size
+                + config.logical_page_size
                 - 1
-            ) // config.block_size
+            ) // config.logical_page_size
         else:
             max_num_pages_per_req = (
-                config.context_len + config.block_size
-            ) // config.block_size
+                config.context_len + config.logical_page_size
+            ) // config.logical_page_size
 
         max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
 
@@ -354,7 +356,7 @@ class ModelExecutor:
         # the caller locs computed from it are never consumed there (the
         # Inkling rel path asserts loc/row agreement).
         self._draft_page_size = int(
-            getattr(draft_token_to_kv_pool, "page_size", 0) or config.block_size
+            getattr(draft_token_to_kv_pool, "page_size", 0) or config.logical_page_size
         )
         self.input_buffers = InputBuffers(
             max_bs=max_bs,
@@ -584,6 +586,10 @@ class ModelExecutor:
             drafter=self.drafter,
             decode_wrapper=self.forward_step,
         )
+        # Load every prefill-shaped kernel (and give lazy autotuners the max
+        # prefill bucket) before freeze_autotuning() below; serving must never
+        # first-execute a kernel. No-op when graph capture already ran.
+        self.prefill_graph.warmup_eager(self.forward_step)
 
         # Encoder CUDA graph: install model-built wrappers by overriding
         # modality encoder callables (e.g. ``image_encoder``, ``video_encoder``).
@@ -1162,7 +1168,7 @@ class ModelExecutor:
 
         req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
         track_indices = self.input_buffers.mamba_track_pool_indices_buf[:bs]
-        page_size = self.config.block_size
+        page_size = self.config.logical_page_size
         dev = req_pool_indices.device
         sentinel = self._sentinel_neg1
 
@@ -1490,27 +1496,43 @@ class ModelExecutor:
                 req_to_page=self.req_to_page,
             )
 
-    def zero_flat_cache_pages(self, page_ids):
+    def zero_flat_cache_pages(self, pages):
         """Clear newly owned pages and return a CUDA completion event when needed."""
-        if not page_ids:
+        if not pages:
             return None
+        zero_new_pages = getattr(self.token_to_kv_pool, "zero_new_pages", None)
         zero_pages = getattr(self.token_to_kv_pool, "zero_pages", None)
-        if not callable(zero_pages):
+        if isinstance(pages, Mapping) and callable(zero_new_pages):
+            sanitizer = zero_new_pages
+            sanitizer_arg = pages
+        elif callable(zero_pages):
+            if isinstance(pages, Mapping):
+                page_ids = sorted(
+                    {
+                        int(page_id)
+                        for group_pages in pages.values()
+                        for page_id in group_pages
+                    }
+                )
+            else:
+                page_ids = pages
+            sanitizer = zero_pages
+            sanitizer_arg = page_ids
+        else:
             # A pool only needs sanitization if it aliases recurrent-state and
             # KV bytes in one slab (it then declares this and implements
-            # zero_pages). Pure-attention pools do not alias state -- reused
-            # pages are overwritten and their tails are never read past
-            # seq_len -- so the scheduler's page-reuse list is safely ignored.
+            # a sanitizer). Pure-attention pools do not alias state, so reused
+            # pages are overwritten and their tails are never read past seq_len.
             # Still fail loudly if a pool that *declares* it needs zeroing
             # forgot to implement it.
             if getattr(self.token_to_kv_pool, "flat_kv_requires_page_zeroing", False):
                 raise RuntimeError(
-                    "scheduler emitted flat_page_ids_to_zero but the active KV "
+                    "scheduler emitted flat pages to zero but the active KV "
                     "pool does not implement physical-page sanitization"
                 )
             return None
         with nvtx_range("zero_flat_cache_pages", color="purple"):
-            zero_pages(page_ids)
+            sanitizer(sanitizer_arg)
         if torch.device(self.device).type != "cuda":
             return None
         done = torch.cuda.Event()

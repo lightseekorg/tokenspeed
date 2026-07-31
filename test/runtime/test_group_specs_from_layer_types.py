@@ -39,6 +39,12 @@ PagedCacheGroupSpec = _pcs.PagedCacheGroupSpec
 
 
 class GroupSpecsFromLayerTypesTest(unittest.TestCase):
+    def test_group_spec_has_no_producer_boundary_capability(self):
+        self.assertNotIn(
+            "materializes_all_boundaries",
+            PagedCacheGroupSpec.__dataclass_fields__,
+        )
+
     def test_gpt_oss_mixed_shape_yields_two_groups(self):
         layer_types = [
             "full_attention",

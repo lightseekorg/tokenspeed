@@ -53,6 +53,7 @@ class BaseAttnConfig:
     attn_tp_size: int
     dtype: torch.dtype
     kv_cache_dtype: torch.dtype
+    # Tokens covered by one page as seen by the attention kernel.
     page_size: int
     context_len: int
     max_bs: int

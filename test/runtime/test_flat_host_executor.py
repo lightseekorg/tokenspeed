@@ -175,6 +175,11 @@ class FlatMemoryExecutorTest(unittest.TestCase):
                 FlatMemoryExecutor,
             )
             from tokenspeed.runtime.cache.transfer.types import CacheKind
+            from tokenspeed.runtime.configs.lcm_layouts import qwen_gdn_lcm_fields
+            from tokenspeed.runtime.configs.lcm_memory_plan import plan_lcm_fields
+            from tokenspeed.runtime.layers.attention.kv_cache.lcm_mha import (
+                LcmMHATokenToKVPool,
+            )
             from tokenspeed.runtime.layers.attention.kv_cache.mha import (
                 MHATokenToKVPool,
             )
@@ -189,6 +194,9 @@ class FlatMemoryExecutorTest(unittest.TestCase):
         self.CacheKind = CacheKind
         self.FlatMemoryExecutor = FlatMemoryExecutor
         self.MHATokenToKVPool = MHATokenToKVPool
+        self.LcmMHATokenToKVPool = LcmMHATokenToKVPool
+        self.qwen_gdn_lcm_fields = qwen_gdn_lcm_fields
+        self.plan_lcm_fields = plan_lcm_fields
 
     def _pool(self):
         kwargs = dict(
@@ -324,8 +332,32 @@ class FlatMemoryExecutorTest(unittest.TestCase):
         self._drain(executor, 1)
 
     def _state_pool(self):
+        fields = self.qwen_gdn_lcm_fields(
+            layer_types=GDN_LAYER_TYPES,
+            layer_group_ids=(
+                "linear_attention_0",
+                "full_attention",
+                "linear_attention_0",
+                "full_attention",
+            ),
+            logical_block_tokens=4,
+            kv_shape=(4, 1, 8),
+            kv_element_size=2,
+            conv_shape=(2, 4),
+            conv_element_size=2,
+            ssm_shape=(2, 8),
+            ssm_element_size=2,
+        )
+        plan = self.plan_lcm_fields(
+            fields,
+            logical_block_tokens=4,
+            num_lcm_blocks=4,
+            alignment=2,
+            max_padding_fraction=1.0,
+        )
+        max_packing = max(group.cache_blocks_per_lcm_block for group in plan.groups)
         kwargs = dict(
-            size=32,
+            size=plan.num_lcm_blocks * max_packing * plan.logical_block_tokens,
             dtype=self.torch.bfloat16,
             head_num=1,
             head_dim=8,
@@ -339,11 +371,21 @@ class FlatMemoryExecutorTest(unittest.TestCase):
             layer_types=GDN_LAYER_TYPES,
             sliding_window_tokens=None,
             enable_alt_stream=False,
-            conv_state_shape=(2, 4),
-            temporal_state_shape=(2, 8),
+            memory_plan=plan,
+            layer_group_ids=(
+                "linear_attention_0",
+                "full_attention",
+                "linear_attention_0",
+                "full_attention",
+            ),
+            state_field_dtypes={
+                f"layer.{layer_id}.{field}": self.torch.bfloat16
+                for layer_id in (0, 2)
+                for field in ("conv", "ssm")
+            },
         )
         with mock.patch(_PKG_FLAT_PROBE, return_value=True):
-            return self.MHATokenToKVPool(**kwargs)
+            return self.LcmMHATokenToKVPool(**kwargs)
 
     def _fill_spans(self, mirror, device_pages):
         for tensor_idx, ((dev, _), span) in enumerate(

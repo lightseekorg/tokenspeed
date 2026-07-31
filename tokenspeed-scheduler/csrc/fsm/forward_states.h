@@ -41,6 +41,17 @@
 
 namespace tokenspeed::fsm {
 
+#if TOKENSPEED_FLAT_KVCACHE
+struct FlatCacheProgress {
+    // One source of truth for both the next hash-chain seed and the cumulative
+    // history needed to publish a resumable boundary across chunk edges.
+    std::vector<std::string> page_hashes;
+    std::uint64_t access_epoch{0};
+    // Pending closed-prefix boundary; zero once published or when absent.
+    std::int32_t promotion_boundary_tokens{0};
+};
+#endif
+
 inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* token_container,
                                                         TokenContainer::Window window) {
     const std::int32_t shifted_start = window.begin + 1;
@@ -121,7 +132,7 @@ public:
         if (!block_tables_.empty()) {
             // flat: group-0 sample, feeding only the radix-era capacity probe (a flat no-op);
             // real admission gates on the coordinator's per-group BlocksNeededFor.
-            return block_tables_[0].TailAvailableTokens();
+            return block_tables_[0].AvailableTokens();
         }
         return local_kv_allocator_->TailPageAvailableTokens();  // radix
     }
@@ -174,18 +185,25 @@ struct ForwardState : public BaseState {
     std::unique_ptr<ReqPoolIndex> TakeReqPoolIndex() && { return std::move(req_pool_index_); }
     std::int32_t GetReqPoolIndex() const { return req_pool_index_ ? req_pool_index_->slot_ : -1; }
 
-    // Flat: group-0 SAMPLE (ids -- and with per-group block sizes, counts -- differ per group);
-    // feeds one-group stats and the radix-era req_to_page fallback, never cross-group accounting
-    // (that is GetOccupiedPagesAllGroups).
+#if TOKENSPEED_FLAT_KVCACHE
+    FlatCacheProgress TakeFlatCacheProgress() && { return std::move(flat_cache_progress_); }
+    void SetFlatCacheProgress(FlatCacheProgress progress) { flat_cache_progress_ = std::move(progress); }
+    const FlatCacheProgress& FlatCacheProgressValue() const { return flat_cache_progress_; }
+#endif
+
+    // Flat: group-0 sample of LCM parent ids. Operation construction uses this
+    // only for row length/delta calculation, then replaces it with the owning
+    // Manager's resolved kernel page ids. Cross-group accounting uses
+    // GetOccupiedPagesAllGroups().
     std::vector<std::int32_t> GetOccupiedPages() const {
         if (!block_tables_.empty()) {
-            return BlockTablePageIds(block_tables_[0]);  // flat: first-group sample (see above)
+            return BlockTableLcmBlockIds(block_tables_[0]);
         }
         return GetPageContainer().Pages();  // radix
     }
 
     // Flat: real pages of EVERY group's block table (null holes excluded — block 0 is the
-    // never-allocated punch placeholder, not occupancy). Block ids are pool-wide and each id
+    // never-allocated punch placeholder, not occupancy). LCM ids are pool-wide and each id
     // is owned by one group, so concatenation has no cross-group duplicates. This is the
     // pool-wide occupancy counterpart of the group-0 sample above.
     std::vector<std::int32_t> GetOccupiedPagesAllGroups() const {
@@ -194,9 +212,9 @@ struct ForwardState : public BaseState {
         }
         std::vector<std::int32_t> ids;
         for (const BlockTable& table : block_tables_) {
-            for (const BlockRef& block : table.Blocks()) {
+            for (const CacheBlockRef& block : table.Blocks()) {
                 if (block) {
-                    ids.push_back(block->BlockId());
+                    ids.push_back(block->Location().lcm_block_id);
                 }
             }
         }
@@ -205,13 +223,16 @@ struct ForwardState : public BaseState {
 
     std::vector<std::int32_t> GetLocalAllocatorPages() const {
         if (!block_tables_.empty()) {
-            return BlockTablePageIds(block_tables_[0]);  // flat: first-group sample (see GetOccupiedPages)
+            return BlockTableLcmBlockIds(block_tables_[0]);
         }
         return local_kv_allocator_->Pages();  // radix: tail pages only, not tree-owned prefix pages
     }
 
 private:
     std::unique_ptr<ReqPoolIndex> req_pool_index_;
+#if TOKENSPEED_FLAT_KVCACHE
+    FlatCacheProgress flat_cache_progress_{};
+#endif
 };
 
 struct Prefilling : public ForwardState {
@@ -290,18 +311,6 @@ private:
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
 };
 
-#if TOKENSPEED_FLAT_KVCACHE
-// Rolling page-hash chain: pages [0, num_hashed_pages) are registered, last_hash seeds the
-// next increment. tail holds pages [tail_begin_page, num_hashed_pages) back to the fold grid
-// (lcm/base) so coarse groups can fold a block completed mid-decode.
-struct HashChain {
-    std::int32_t num_hashed_pages{0};
-    std::string last_hash;
-    std::int32_t tail_begin_page{0};
-    std::vector<std::string> tail;
-};
-#endif
-
 struct Decoding : public ForwardState {
     Decoding(TokenContainer* token_container, std::int32_t page_size, std::unique_ptr<HostNodeRef>&& host_node_ref,
              std::unique_ptr<DeviceNodeRef>&& node_ref, std::unique_ptr<LocalKVAllocator>&& local_kv_allocator,
@@ -327,17 +336,9 @@ struct Decoding : public ForwardState {
 
     std::unique_ptr<HostNodeRef> TakeHostNodeRef() && { return std::move(host_node_ref_); }
 
-#if TOKENSPEED_FLAT_KVCACHE
-    HashChain TakeHashChain() && { return std::move(hash_chain_); }
-    void SetHashChain(HashChain chain) { hash_chain_ = std::move(chain); }
-#endif
-
 private:
     std::unique_ptr<HostNodeRef> host_node_ref_{};  // pins host pages until the next state takes ownership
     std::int32_t reserve_num_tokens_in_next_schedule_event_{-1};
-#if TOKENSPEED_FLAT_KVCACHE
-    HashChain hash_chain_{};
-#endif
 };
 
 // Generation finished, host pages allocated, writeback op not yet generated.

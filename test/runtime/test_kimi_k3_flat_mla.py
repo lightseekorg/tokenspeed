@@ -114,12 +114,14 @@ def test_pool_mla_views_are_no_copy_and_layer_gated() -> None:
 
     key = pool.get_key_buffer(layer_id)
     component = pool.get_component(layer_id, "latent_kv")
-    slab = pool.raw_slab(pool.physical_slot_for_layer(layer_id))
 
-    assert key.shape == ((2 + 1) * page_size, 1, _LATENT_DIM)
+    assert key.shape == ((2 * 12 + 1) * page_size, 1, _LATENT_DIM)
     assert key.dtype == torch.float8_e4m3fn
-    assert key.data_ptr() == component.data_ptr() == slab.data_ptr()
-    assert key.untyped_storage().data_ptr() == slab.untyped_storage().data_ptr()
+    assert key.data_ptr() == component.data_ptr()
+    assert (
+        key.untyped_storage().data_ptr()
+        == pool.lcm_pool.backing.untyped_storage().data_ptr()
+    )
 
     value = pool.get_value_buffer(layer_id)
     assert value.shape[-1] == _KV_LORA_RANK
@@ -128,19 +130,18 @@ def test_pool_mla_views_are_no_copy_and_layer_gated() -> None:
     assert key2.data_ptr() == key.data_ptr()
     assert value2.shape == value.shape
 
-    with pytest.raises(KeyError, match="latent_kv"):
+    with pytest.raises(ValueError, match="state layer"):
         pool.get_key_buffer(_kda_layer_id(pool))
 
 
 @requires_cuda
 def test_pool_write_location_oracle_page_id_times_p_plus_offset() -> None:
-    """Latent writes land at raw-slab row page_id, byte offset off*576."""
+    """Latent writes land at ``[page_id, token_offset]``."""
     torch.manual_seed(0)
     pool = _make_pool("cuda", usable_pages=3)
     layer_id = _mla_layer_id(pool)
     layer = _fake_layer(layer_id)
     page_size = pool.page_size
-    slab = pool.raw_slab(pool.physical_slot_for_layer(layer_id))
     component = pool.get_component(layer_id, "latent_kv")
 
     # Page-boundary coverage: last slot of page 1, first slot of page 2,
@@ -158,12 +159,11 @@ def test_pool_write_location_oracle_page_id_times_p_plus_offset() -> None:
 
     expected = latent.to(torch.float8_e4m3fn).view(torch.uint8)
     for row, (page, off) in enumerate([(1, page_size - 1), (2, 0), (3, 7)]):
-        got_bytes = slab[page, off * _LATENT_DIM : (off + 1) * _LATENT_DIM]
+        got_bytes = component[page, off, 0]
         assert torch.equal(got_bytes, expected[row, 0]), (page, off)
-        assert torch.equal(component[page, off, 0].view(torch.uint8), expected[row, 0])
 
     # Null page 0 must stay untouched.
-    assert torch.count_nonzero(slab[0]).item() == 0
+    assert torch.count_nonzero(component[0]).item() == 0
 
     # Round-trip through the read adapter.
     nope, rope = pool.get_mla_kv_buffer(layer, locs, torch.bfloat16)
@@ -188,7 +188,7 @@ def cuda_env():
         for key in ("kv_cache_dtype", "chunked_prefill_size", "mla_chunk_multiplier")
     }
     global_server_args_dict["kv_cache_dtype"] = "fp8_e4m3"
-    global_server_args_dict["chunked_prefill_size"] = 1024
+    global_server_args_dict["chunked_prefill_size"] = 256
     global_server_args_dict["mla_chunk_multiplier"] = 1
     yield
     global_server_args_dict.update(saved)
@@ -285,7 +285,7 @@ def test_decode_flat_matches_legacy_and_reference(backend_factory, gpu_pool) -> 
     layer = _fake_layer(_mla_layer_id(pool), scaling=_LATENT_DIM**-0.5)
     # req0 crosses a flat page boundary; req1 ends exactly at one.
     flat_rows = [[2, 4], [1, -1]]
-    seq_lens_cpu = [page_size + 170, page_size]
+    seq_lens_cpu = [page_size + 42, page_size]
     _write_history(pool, layer, flat_rows, seq_lens_cpu, seed=1)
 
     flat_backend = backend_factory()
@@ -294,7 +294,7 @@ def test_decode_flat_matches_legacy_and_reference(backend_factory, gpu_pool) -> 
 
     # Write-location oracle: page_id * P + offset at position seq_len - 1.
     assert flat_md.flat_out_cache_loc.tolist() == [
-        4 * page_size + 170 - 1,
+        4 * page_size + 42 - 1,
         1 * page_size + page_size - 1,
     ]
 
@@ -362,16 +362,16 @@ def test_decode_flat_writes_land_at_flat_locations(backend_factory, gpu_pool) ->
     k = torch.randn(1, 1, _LATENT_DIM, device="cuda", dtype=torch.bfloat16)
     # Caller loc points at a *different* live location: it must be ignored.
     decoy = torch.tensor([2 * page_size + 7], device="cuda", dtype=torch.int64)
-    slab = pool.raw_slab(pool.physical_slot_for_layer(layer.layer_id))
-    slab.zero_()
+    component = pool.get_component(layer.layer_id, "latent_kv")
+    component.zero_()
     backend.forward_decode(q, k, None, layer, decoy, pool, 1, save_kv_cache=True)
     torch.cuda.synchronize()
 
     expected = k.to(torch.float8_e4m3fn).view(torch.uint8)[0, 0]
     # Position seq_len - 1 = page_size + 40 -> flat page 5, offset 40.
-    got = slab[5, 40 * _LATENT_DIM : 41 * _LATENT_DIM]
+    got = component[5, 40, 0]
     assert torch.equal(got, expected)
-    assert torch.count_nonzero(slab[2]).item() == 0, "decoy location was written"
+    assert torch.count_nonzero(component[2]).item() == 0, "decoy location was written"
 
 
 def _init_prefill(backend, pool, flat_rows, prefix, extend, *, flat: bool):
@@ -423,8 +423,8 @@ def test_chunked_prefill_flat_matches_legacy_and_reference(
     layer = _fake_layer(_mla_layer_id(pool), scaling=192**-0.5)
     # req0's prefix crosses a page boundary mid-page; req1's prefix ends
     # exactly on one, and its extend tokens cross into a fresh page.
-    flat_rows = [[2, 4, 6], [1, 3, -1]]
-    prefix = [page_size + 164, page_size]
+    flat_rows = [[2, 4, 6, 8, 10], [1, 3, -1, -1, -1]]
+    prefix = [page_size + 36, page_size]
     extend = [300, 40]
     _write_history(pool, layer, flat_rows, prefix, seed=4)
 
