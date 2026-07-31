@@ -27,11 +27,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.tuning import (
-    autotune,
-    freeze_autotuning,
-    set_autotune_max_num_tokens,
-)
+from tokenspeed_kernel.ops.tuning import autotune, set_autotune_max_num_tokens
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
@@ -591,8 +587,7 @@ class ModelExecutor:
             req_to_page=self.req_to_page,
             drafter=self.drafter,
         )
-        # Load every prefill-shaped kernel (and give lazy autotuners the max
-        # prefill bucket) before freeze_autotuning() below; serving must never
+        # Load every prefill-shaped kernel before serving; serving must never
         # first-execute a kernel. No-op when graph capture already ran.
         self.prefill_graph.warmup_eager(self.forward_step)
 
@@ -663,9 +658,6 @@ class ModelExecutor:
         self.last_decode_stats_tic = time.time()
 
         set_random_seed(48)
-
-        # Startup has tuned every size class it serves; serving must never autotune.
-        freeze_autotuning()
 
         logger.info("ModelExecutor initialized")
 

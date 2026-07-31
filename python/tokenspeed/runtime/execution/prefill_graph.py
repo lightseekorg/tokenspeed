@@ -593,9 +593,7 @@ class PrefillGraph:
         can fail mid-serving on high ``--gpu-memory-utilization`` deployments
         (the allocator hoards the headroom by then; the failure surfaces as an
         async OOM at the next graph replay). Running the max chunk once here
-        front-loads those module loads -- and gives per-size lazy autotuners
-        their only look at the max prefill bucket before
-        ``freeze_autotuning()``.
+        front-loads those module loads.
 
         Best-effort: skipped when the dummy-forward machinery does not cover
         this model family (same seam as graph capture), or when prefill graph
