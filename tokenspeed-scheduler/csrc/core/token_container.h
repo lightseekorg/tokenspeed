@@ -43,7 +43,7 @@ public:
 
     void Extend(const std::vector<std::int32_t>& new_tokens);
 
-    // Flat retract: fold generated tokens into the prefill window so the
+    // Retraction folds generated tokens into the prefill window so the
     // requeued request prefills prompt + generated as one fresh extend.
     void RebasePrefill() { num_prefill_tokens_ = static_cast<std::int32_t>(tokens_.size()); }
 

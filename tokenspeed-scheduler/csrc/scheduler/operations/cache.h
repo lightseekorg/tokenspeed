@@ -26,13 +26,12 @@
 #include <functional>
 #include <map>
 #include <string>
-#include <tuple>
 #include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
 
-#include "resource/types.h"
+#include "core/types.h"
 
 namespace tokenspeed {
 
@@ -71,16 +70,6 @@ struct TransferPair {
     }
 };
 
-inline std::vector<TransferPair> ToTransferPairs(CacheKind kind,
-                                                 const std::vector<std::tuple<std::int32_t, std::int32_t>>& pages) {
-    std::vector<TransferPair> transfers;
-    transfers.reserve(pages.size());
-    for (const auto& page : pages) {
-        transfers.push_back(TransferPair{kind, std::get<0>(page), std::get<1>(page)});
-    }
-    return transfers;
-}
-
 struct TransferPairHash {
     std::size_t operator()(const TransferPair& pair) const {
         std::size_t h0 = std::hash<std::int32_t>{}(static_cast<std::int32_t>(pair.kind));
@@ -96,14 +85,11 @@ struct WriteBackOperation {
     bool is_retract{false};
 
     WriteBackOperation() = default;
-    WriteBackOperation(cache_op_id op_id, std::vector<std::tuple<std::int32_t, std::int32_t>> pages_to_transfer,
-                       bool is_retract = false)
-        : op_id{op_id}, transfers{ToTransferPairs(CacheKind::kKV, pages_to_transfer)}, is_retract{is_retract} {}
     WriteBackOperation(cache_op_id op_id, std::vector<TransferPair> transfers, bool is_retract = false)
         : op_id{op_id}, transfers{std::move(transfers)}, is_retract{is_retract} {}
 };
 
-struct FlatWriteBackOperation {
+struct WriteBackBatch {
     std::vector<cache_op_id> op_ids;
     // Backward-compatible KV-only view.
     std::vector<std::vector<std::int32_t>> src_pages;
@@ -113,7 +99,7 @@ struct FlatWriteBackOperation {
     std::map<std::string, std::vector<std::vector<std::int32_t>>> dst_pages_by_kind;
     std::vector<bool> is_retract;
 
-    explicit FlatWriteBackOperation(const std::vector<WriteBackOperation>& ops) {
+    explicit WriteBackBatch(const std::vector<WriteBackOperation>& ops) {
         std::unordered_set<TransferPair, TransferPairHash> seen;
         for (const auto& op : ops) {
             std::map<std::string, std::vector<std::int32_t>> src_this_op;
@@ -150,13 +136,11 @@ struct LoadBackOperation {
     std::vector<TransferPair> transfers;  // HOST→DEVICE by cache kind.
 
     LoadBackOperation() = default;
-    LoadBackOperation(cache_op_id op_id, std::vector<std::tuple<std::int32_t, std::int32_t>> pages_to_transfer)
-        : op_id{op_id}, transfers{ToTransferPairs(CacheKind::kKV, pages_to_transfer)} {}
     LoadBackOperation(cache_op_id op_id, std::vector<TransferPair> transfers)
         : op_id{op_id}, transfers{std::move(transfers)} {}
 };
 
-struct FlatLoadBackOperation {
+struct LoadBackBatch {
     std::vector<cache_op_id> op_ids;
     // Backward-compatible KV-only view.
     std::vector<std::vector<std::int32_t>> src_pages;
@@ -165,7 +149,7 @@ struct FlatLoadBackOperation {
     std::map<std::string, std::vector<std::vector<std::int32_t>>> src_pages_by_kind;
     std::map<std::string, std::vector<std::vector<std::int32_t>>> dst_pages_by_kind;
 
-    explicit FlatLoadBackOperation(const std::vector<LoadBackOperation>& ops) {
+    explicit LoadBackBatch(const std::vector<LoadBackOperation>& ops) {
         std::unordered_set<TransferPair, TransferPairHash> seen;
         for (const auto& op : ops) {
             std::map<std::string, std::vector<std::int32_t>> src_this_op;
@@ -196,6 +180,6 @@ struct FlatLoadBackOperation {
     }
 };
 
-using CacheOperation = std::variant<PrefetchOperation, FlatLoadBackOperation, BackUpOperation, FlatWriteBackOperation>;
+using CacheOperation = std::variant<PrefetchOperation, LoadBackBatch, BackUpOperation, WriteBackBatch>;
 
 }  // namespace tokenspeed

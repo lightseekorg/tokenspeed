@@ -22,13 +22,12 @@
 
 #include <stdexcept>
 
-#include "resource/allocator/paged_cache_group.h"
 #include "scheduler/types.h"
 
 namespace tokenspeed {
 
-std::int32_t AlignFlatPrefillChunk(std::int32_t first_pos, std::int32_t unscheduled, std::int32_t token_budget,
-                                   std::int32_t page_size, std::int32_t promotion_boundary_tokens) {
+std::int32_t AlignPrefillChunk(std::int32_t first_pos, std::int32_t unscheduled, std::int32_t token_budget,
+                               std::int32_t page_size, std::int32_t promotion_boundary_tokens) {
     _assert(first_pos >= 0 && unscheduled >= 0 && token_budget >= 0, "prefill positions must be non-negative");
     _assert(page_size > 0, "page_size must be > 0");
     std::int32_t chunk_size = std::min(unscheduled, token_budget);
@@ -60,15 +59,15 @@ std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
         // retention is a mamba-style state group.
         const bool final_state_manager = group.family == PagedCacheGroupFamily::State &&
                                          group.retention != PagedCacheGroupConfig::Retention::SlidingWindow;
-        if (config.enable_flatkv_pd) {
+        if (config.enable_pd_cache) {
             const PagedCacheTransferPolicy expected =
                 final_state_manager ? PagedCacheTransferPolicy::LatestSnapshot : PagedCacheTransferPolicy::FullSuffix;
             if (group.transfer_policy == PagedCacheTransferPolicy::Unspecified) {
-                throw std::invalid_argument("FlatKV PD cache group '" + group.group_id +
+                throw std::invalid_argument("PD cache group '" + group.group_id +
                                             "' requires an explicit transfer_policy");
             }
             if (group.transfer_policy != expected) {
-                throw std::invalid_argument("FlatKV PD cache group '" + group.group_id +
+                throw std::invalid_argument("PD cache group '" + group.group_id +
                                             "' transfer_policy does not match its scheduler "
                                             "destination layout");
             }
@@ -83,7 +82,7 @@ std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
         }
         const bool is_swa = group.retention == PagedCacheGroupConfig::Retention::SlidingWindow;
         if (is_swa && (!group.sliding_window_tokens || *group.sliding_window_tokens <= 0)) {
-            throw std::invalid_argument("Flat cache group '" + group.group_id +
+            throw std::invalid_argument("Cache group '" + group.group_id +
                                         "' requires positive sliding_window_tokens");
         }
         specs.push_back(KvCacheSpec{
@@ -102,12 +101,12 @@ void FreeRequest(KvCacheCoordinator& coordinator, std::vector<BlockTable>& table
     coordinator.Free(tables);
 }
 
-std::map<std::string, std::vector<std::int32_t>> BuildFlatBlockTables(const KvCacheCoordinator& coordinator,
-                                                                      const std::vector<BlockTable>& tables,
-                                                                      std::span<const std::string> group_ids) {
-    _assert(tables.size() == group_ids.size(), "BuildFlatBlockTables: tables/group_ids size mismatch");
+std::map<std::string, std::vector<std::int32_t>> BuildBlockTables(const KvCacheCoordinator& coordinator,
+                                                                  const std::vector<BlockTable>& tables,
+                                                                  std::span<const std::string> group_ids) {
+    _assert(tables.size() == group_ids.size(), "BuildBlockTables: tables/group_ids size mismatch");
     _assert(tables.size() == static_cast<std::size_t>(coordinator.NumGroups()),
-            "BuildFlatBlockTables: tables/coordinator size mismatch");
+            "BuildBlockTables: tables/coordinator size mismatch");
     std::map<std::string, std::vector<std::int32_t>> out;
     for (std::size_t i = 0; i < tables.size(); ++i) {
         out.emplace(group_ids[i], coordinator.GroupManager(static_cast<std::int32_t>(i)).BlockTablePageIds(tables[i]));

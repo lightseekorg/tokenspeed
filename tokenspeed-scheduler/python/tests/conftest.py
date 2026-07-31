@@ -1,17 +1,6 @@
-"""Shared helpers for the flat KV-cache binding tests.
-
-Provides the Kimi-K3-shaped 4-group scheduler config, tiny request/event
-drivers, and the flat-build skip probe used by ``test_flat_kvcache.py``.
-
-The nanobind extension is build-identical between the radix and flat
-builds -- ``FlatForwardOp.flat_block_tables`` is always exposed -- but it
-is only *populated* when built with ``TOKENSPEED_FLAT_KVCACHE=ON``.
-``requires_flat_build`` probes that behaviorally and skips otherwise.
-"""
+"""Shared helpers for cache-group scheduler binding tests."""
 
 from __future__ import annotations
-
-import pytest
 
 try:
     import tokenspeed_scheduler as ts
@@ -83,31 +72,12 @@ def _finish(scheduler, request_id: str) -> None:
     scheduler.advance(execution_event)
 
 
-def _find_flat_op(plan):
+def _find_forward_op(plan):
     for op in plan.forward:
-        if dict(op.flat_block_tables):
+        if dict(op.block_tables):
             return op
     return None
 
 
 def _positive(row) -> list[int]:
     return [page for page in row if page > 0]
-
-
-def _flat_build_available() -> bool:
-    """Behavioral probe: the extension is flat-built iff a prefilled request's
-    FlatForwardOp carries a non-empty ``flat_block_tables``. On the radix
-    build the field is exposed but stays empty, so this returns False there
-    *without raising* (an unexpected raise means a real regression and should
-    surface as a collection error, not a silent skip)."""
-    if ts is None:
-        return False
-    scheduler = ts.Scheduler(_make_k3_config())
-    scheduler.submit_requests([_spec("probe", list(range(1, 2 * PAGE + 1)))])
-    return _find_flat_op(scheduler.next_execution_plan()) is not None
-
-
-requires_flat_build = pytest.mark.skipif(
-    not _flat_build_available(),
-    reason="extension not built with TOKENSPEED_FLAT_KVCACHE=ON",
-)

@@ -37,13 +37,12 @@ protected:
         Submit(MakeRequestSpec("r_seed", /*num_pages=*/2, /*start=*/1));
         PlanOnce();
         SendForwardDone("r_seed", {42});
-        PlanOnce();
-        SendFinish("r_seed");
         auto plan_wb = PlanOnce();
-        const FlatWriteBackOperation* wb = nullptr;
+        SendFinish("r_seed");
+        const WriteBackBatch* wb = nullptr;
         for (const auto& op : plan_wb.Operations()) {
             if (auto* cop = std::get_if<CacheOperation>(&op)) {
-                if (auto* w = std::get_if<FlatWriteBackOperation>(cop)) {
+                if (auto* w = std::get_if<WriteBackBatch>(cop)) {
                     wb = w;
                     break;
                 }
@@ -57,12 +56,11 @@ protected:
         Submit(MakeRequestSpec("r_fill", /*num_pages=*/3, /*start=*/100));
         PlanOnce();
         SendForwardDone("r_fill", {200});
-        PlanOnce();
-        SendFinish("r_fill");
         auto plan_wb2 = PlanOnce();
+        SendFinish("r_fill");
         for (const auto& op : plan_wb2.Operations()) {
             if (auto* cop = std::get_if<CacheOperation>(&op)) {
-                if (auto* w = std::get_if<FlatWriteBackOperation>(cop)) {
+                if (auto* w = std::get_if<WriteBackBatch>(cop)) {
                     if (!w->op_ids.empty()) SendWriteBackDone(w->op_ids[0]);
                     break;
                 }
@@ -77,11 +75,11 @@ TEST_F(LoadBackViaCacheTestSuite, LoadBack_TriggeredAfterPrefetchPopulatesHostCa
 
     Submit(MakeRequestSpec("r1", /*num_pages=*/2, /*start=*/1));
     auto plan = PlanOnce();
-    auto lb = ExtractCacheOpsOfKind<FlatLoadBackOperation>(plan);
+    auto lb = ExtractCacheOpsOfKind<LoadBackBatch>(plan);
 
     bool r1_in_forward = false;
     for (const auto& op : plan.Operations()) {
-        if (auto* fwd = std::get_if<FlatForwardOperation>(&op)) {
+        if (auto* fwd = std::get_if<ForwardBatch>(&op)) {
             for (const auto& rid : fwd->request_ids) {
                 if (rid == "r1") r1_in_forward = true;
             }
@@ -94,7 +92,7 @@ TEST_F(LoadBackViaCacheTestSuite, LoadBack_TriggeredAfterPrefetchPopulatesHostCa
 TEST_F(SchedulerTestSuite, LoadBack_NotTriggeredWithoutHostCacheHit) {
     Submit(MakeRequestSpec("r1", 4));
     auto plan = PlanOnce();
-    auto lb = ExtractCacheOpsOfKind<FlatLoadBackOperation>(plan);
+    auto lb = ExtractCacheOpsOfKind<LoadBackBatch>(plan);
     EXPECT_TRUE(lb.empty());
 }
 
@@ -131,13 +129,13 @@ TEST_F(DisablePrefixCacheTestSuite, SamePromptDoesNotReuseDevicePrefix) {
     Submit(MakeRequestSpec("r1", 2));
     auto plan = PlanOnce();
     const auto& op = plan.Operations()[0];
-    auto* fwd = std::get_if<FlatForwardOperation>(&op);
+    auto* fwd = std::get_if<ForwardBatch>(&op);
     ASSERT_NE(fwd, nullptr);
     ASSERT_EQ(fwd->request_ids.size(), 1u);
     EXPECT_EQ(fwd->request_ids[0], "r1");
     EXPECT_EQ(fwd->extend_prefix_lens[0], 0);
     EXPECT_EQ(fwd->input_lengths[0], 4);
-    EXPECT_TRUE(ExtractCacheOpsOfKind<FlatLoadBackOperation>(plan).empty());
+    EXPECT_TRUE(ExtractCacheOpsOfKind<LoadBackBatch>(plan).empty());
 }
 
 TEST_F(DisablePrefixCacheTestSuite, PrefetchNotGeneratedForStorageHit) {
@@ -169,7 +167,7 @@ TEST_F(StableCandidateOrderingSuite, NewForwardOperationTieBreaksOnRequestId) {
     auto plan = PlanOnce();
     std::vector<std::string> ids;
     for (const auto& op : plan.Operations()) {
-        if (auto* fwd = std::get_if<FlatForwardOperation>(&op)) {
+        if (auto* fwd = std::get_if<ForwardBatch>(&op)) {
             ids = fwd->request_ids;
         }
     }
@@ -187,7 +185,7 @@ TEST_F(StableCandidateOrderingSuite, ForwardOpIsInsertionOrderIndependent) {
     auto plan_a = PlanOnce();
     std::vector<std::string> ids_a;
     for (const auto& op : plan_a.Operations()) {
-        if (auto* fwd = std::get_if<FlatForwardOperation>(&op)) {
+        if (auto* fwd = std::get_if<ForwardBatch>(&op)) {
             ids_a = fwd->request_ids;
         }
     }
@@ -199,7 +197,7 @@ TEST_F(StableCandidateOrderingSuite, ForwardOpIsInsertionOrderIndependent) {
     auto plan_b = PlanOnce();
     std::vector<std::string> ids_b;
     for (const auto& op : plan_b.Operations()) {
-        if (auto* fwd = std::get_if<FlatForwardOperation>(&op)) {
+        if (auto* fwd = std::get_if<ForwardBatch>(&op)) {
             ids_b = fwd->request_ids;
         }
     }

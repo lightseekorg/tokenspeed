@@ -78,7 +78,7 @@ class LcmCachePool:
             zero_byte_segments(self.backing, segments)
 
     def pd_contract(self, group_specs):
-        from tokenspeed.runtime.pd.flatkv import build_lcm_flatkv_pd_contract
+        from tokenspeed.runtime.pd.cache_protocol import build_lcm_pd_cache_contract
 
         missing = [
             field.field_id
@@ -91,7 +91,7 @@ class LcmCachePool:
             field_id: str(view.dtype).removeprefix("torch.")
             for field_id, view in self._fields.items()
         }
-        return build_lcm_flatkv_pd_contract(
+        return build_lcm_pd_cache_contract(
             plan=self.plan,
             backing=self.backing,
             group_specs=group_specs,

@@ -20,9 +20,11 @@
 
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <variant>
-#include "resource/types.h"
+
+#include "core/types.h"
 
 namespace tokenspeed {
 namespace cache {

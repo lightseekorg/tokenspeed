@@ -391,7 +391,7 @@ public:
         return {};
     }
 
-    void ConsumeAvailable(BlockTable& table, std::int32_t num_tokens) {
+    void ConsumeReservedTokens(BlockTable& table, std::int32_t num_tokens) {
         _assert(num_tokens >= 0 && num_tokens <= table.available_tokens_,
                 "token demand exceeds the available capacity");
         table.available_tokens_ -= num_tokens;

@@ -606,4 +606,8 @@ def _launch_subprocesses(
     # Assume all schedulers have the same scheduler_info
     scheduler_info = scheduler_infos[0]
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+    tokenizer_manager.max_single_request_tokens = scheduler_info[
+        "max_single_request_tokens"
+    ]
+    tokenizer_manager.context_len = scheduler_info["max_model_len"]
     return tokenizer_manager, None, scheduler_info

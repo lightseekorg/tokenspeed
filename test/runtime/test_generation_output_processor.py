@@ -155,7 +155,7 @@ def test_nan_flag_finishes_request_with_numerical_error():
 
     # Flagged request: aborted with NumericalError, removed from tracking.
     # The scheduler gets an Abort (NOT Finish) event — AbortEvent skips the
-    # radix-tree insert and host-KV writeback, so corrupted KV is not reused.
+    # single-table-tree insert and host-KV writeback, so corrupted KV is not reused.
     assert isinstance(decode_state.finished_reason, FINISH_ABORT)
     assert decode_state.finished_reason.err_type == ABORT_CODE.NumericalError
     assert "decode" not in processor.rid_to_state
@@ -567,7 +567,7 @@ def test_prefill_first_token_checks_spec_candidate_bootstrap():
         )
 
 
-def test_flat_pd_one_token_request_finishes_at_remote_prefill_done():
+def test_pd_one_token_request_finishes_at_remote_prefill_done():
     sender = _Sender()
     processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
     state = _state([1, 2, 3], computed_length=3)
@@ -590,7 +590,7 @@ def test_flat_pd_one_token_request_finishes_at_remote_prefill_done():
     assert output.finished_reasons[0] == {"type": "length", "length": 1}
 
 
-def test_flat_pd_multi_token_request_continues_after_remote_prefill_done():
+def test_pd_multi_token_request_continues_after_remote_prefill_done():
     sender = _Sender()
     processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
     state = _state([1, 2, 3], computed_length=3)

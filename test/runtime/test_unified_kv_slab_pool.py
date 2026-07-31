@@ -1,24 +1,13 @@
-"""hybrid_slab_group_size: the single activation predicate for the unified
-KV slab pool (M12), and its two consumers (registry sizing divisor and
-MHATokenToKVPool buffer layout).
-
-The predicate returns the common layers-per-group count exactly when the
-slab layout may activate (flat ext, >= 2 equal-size known groups) and None
-otherwise (legacy per-layer layout). The installed ext's
-real build flavor must not decide these tests, so the
-scheduler_ext_flat_kvcache probe is patched per case.
-"""
+"""Hybrid slab sizing and buffer-layout tests."""
 
 from __future__ import annotations
 
-import contextlib
 import importlib.util
 import itertools
 import os
 import pathlib
 import sys
 import unittest
-from unittest import mock
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -62,123 +51,96 @@ class HybridSlabGroupSizeTest(unittest.TestCase):
     """Each case pins exactly ONE reason the predicate returns None (or the
     single shape where it activates)."""
 
-    @contextlib.contextmanager
-    def _flat_ext(self, value: bool):
-        # The predicate resolves the probe from its own module globals at
-        # call time, so the patch must target the path-loaded module.
-        with mock.patch.object(_pcs, "scheduler_ext_flat_kvcache", return_value=value):
-            yield
-
     def test_gpt_oss_shape_returns_group_size(self):
         # gpt-oss: 12 sliding + 12 full, alternating -> 12 layers per group.
-        with self._flat_ext(True):
-            self.assertEqual(
-                hybrid_slab_group_size(GPT_OSS_LAYER_TYPES),
-                12,
-            )
-
-    def test_none_when_radix_ext(self):
-        with self._flat_ext(False):
-            self.assertIsNone(hybrid_slab_group_size(GPT_OSS_LAYER_TYPES))
+        self.assertEqual(
+            hybrid_slab_group_size(GPT_OSS_LAYER_TYPES),
+            12,
+        )
 
     def test_none_when_single_group(self):
-        with self._flat_ext(True):
-            self.assertIsNone(hybrid_slab_group_size(("full_attention",) * 24))
+        self.assertIsNone(hybrid_slab_group_size(("full_attention",) * 24))
 
     def test_unequal_groups_return_largest_count(self):
         # Unequal groups (e.g. Inkling: 55 sliding + 11 full): the slab
         # count is the largest group's layer count; slabs past the smaller
         # group's count are single-layer.
         lt = ("sliding_attention",) * 8 + ("full_attention",) * 16
-        with self._flat_ext(True):
-            self.assertEqual(hybrid_slab_group_size(lt), 16)
+        self.assertEqual(hybrid_slab_group_size(lt), 16)
         lt_inkling = ("sliding_attention",) * 55 + ("full_attention",) * 11
-        with self._flat_ext(True):
-            self.assertEqual(hybrid_slab_group_size(lt_inkling), 55)
+        self.assertEqual(hybrid_slab_group_size(lt_inkling), 55)
 
     def test_sliding_subgroups_return_group_size(self):
         # Inkling step 2.5: 5 sliding sub-groups + full, all count 11 ->
         # 11 slabs, every slab bound by one layer of each of the 6 groups.
         lt = SUBGROUP_LAYER_BLOCK * 11
-        with self._flat_ext(True):
-            self.assertEqual(
-                hybrid_slab_group_size(lt, sliding_window_tokens=512),
-                11,
-            )
+        self.assertEqual(
+            hybrid_slab_group_size(lt, sliding_window_tokens=512),
+            11,
+        )
 
     def test_none_when_subgroup_suffix_not_digit(self):
         lt = GPT_OSS_LAYER_TYPES + ("sliding_attention_x",)
-        with self._flat_ext(True):
-            self.assertIsNone(hybrid_slab_group_size(lt))
+        self.assertIsNone(hybrid_slab_group_size(lt))
 
     def test_none_when_unknown_label(self):
         # Unknown input degrades to None (safe legacy layout), never raises;
         # loud rejection is group_specs_from_layer_types' job.
         lt = GPT_OSS_LAYER_TYPES + ("banana_attention",)
-        with self._flat_ext(True):
-            self.assertIsNone(hybrid_slab_group_size(lt))
+        self.assertIsNone(hybrid_slab_group_size(lt))
 
     def test_none_when_empty(self):
         # Plain models pass empty or None layer_types.
-        with self._flat_ext(True):
-            self.assertIsNone(hybrid_slab_group_size(()))
-            self.assertIsNone(hybrid_slab_group_size(None))
+        self.assertIsNone(hybrid_slab_group_size(()))
+        self.assertIsNone(hybrid_slab_group_size(None))
 
     def test_none_when_multi_window_sequence(self):
-        with self._flat_ext(True):
-            it = itertools.cycle((4, 512))
-            windows = [
-                next(it) if t == "sliding_attention" else None
-                for t in GPT_OSS_LAYER_TYPES
-            ]
-            self.assertIsNone(
-                hybrid_slab_group_size(
-                    GPT_OSS_LAYER_TYPES,
-                    sliding_window_tokens=windows,
-                )
+        it = itertools.cycle((4, 512))
+        windows = [
+            next(it) if t == "sliding_attention" else None for t in GPT_OSS_LAYER_TYPES
+        ]
+        self.assertIsNone(
+            hybrid_slab_group_size(
+                GPT_OSS_LAYER_TYPES,
+                sliding_window_tokens=windows,
             )
+        )
 
     def test_uniform_window_sequence_stays_active(self):
-        with self._flat_ext(True):
-            windows = [
-                None if t == "full_attention" else 128 for t in GPT_OSS_LAYER_TYPES
-            ]
-            self.assertEqual(
-                hybrid_slab_group_size(
-                    GPT_OSS_LAYER_TYPES,
-                    sliding_window_tokens=windows,
-                ),
-                12,
-            )
+        windows = [None if t == "full_attention" else 128 for t in GPT_OSS_LAYER_TYPES]
+        self.assertEqual(
+            hybrid_slab_group_size(
+                GPT_OSS_LAYER_TYPES,
+                sliding_window_tokens=windows,
+            ),
+            12,
+        )
 
     def test_scalar_window_stays_active(self):
-        with self._flat_ext(True):
-            self.assertEqual(
-                hybrid_slab_group_size(
-                    GPT_OSS_LAYER_TYPES,
-                    sliding_window_tokens=128,
-                ),
-                12,
-            )
+        self.assertEqual(
+            hybrid_slab_group_size(
+                GPT_OSS_LAYER_TYPES,
+                sliding_window_tokens=128,
+            ),
+            12,
+        )
 
     def test_none_when_window_sequence_length_mismatch(self):
-        with self._flat_ext(True):
-            self.assertIsNone(
-                hybrid_slab_group_size(
-                    GPT_OSS_LAYER_TYPES,
-                    sliding_window_tokens=[128],
-                )
+        self.assertIsNone(
+            hybrid_slab_group_size(
+                GPT_OSS_LAYER_TYPES,
+                sliding_window_tokens=[128],
             )
+        )
 
     def test_garbage_elements_ignored_not_raised(self):
-        with self._flat_ext(True):
-            self.assertEqual(
-                hybrid_slab_group_size(
-                    GPT_OSS_LAYER_TYPES,
-                    sliding_window_tokens=["a"] * len(GPT_OSS_LAYER_TYPES),
-                ),
-                12,
-            )
+        self.assertEqual(
+            hybrid_slab_group_size(
+                GPT_OSS_LAYER_TYPES,
+                sliding_window_tokens=["a"] * len(GPT_OSS_LAYER_TYPES),
+            ),
+            12,
+        )
 
 
 class KvProfileLayerDivisorTest(unittest.TestCase):
@@ -199,76 +161,52 @@ class KvProfileLayerDivisorTest(unittest.TestCase):
         cls._registry = registry
         cls._pkg_pcs = pkg_pcs
 
-    @contextlib.contextmanager
-    def _pkg_flat_ext(self, value: bool):
-        with mock.patch.object(
-            self._pkg_pcs, "scheduler_ext_flat_kvcache", return_value=value
-        ):
-            yield
-
-    def test_gpt_oss_flat_ext_charges_group_size(self):
+    def test_gpt_oss_charges_group_size(self):
         # 24 layers, 12+12 alternating -> charge 12 (per-token bytes halve).
-        with self._pkg_flat_ext(True):
-            self.assertEqual(
-                self._registry._kv_profile_layer_divisor(24, GPT_OSS_LAYER_TYPES),
-                12,
-            )
-
-    def test_all_layers_when_radix_ext(self):
-        with self._pkg_flat_ext(False):
-            self.assertEqual(
-                self._registry._kv_profile_layer_divisor(24, GPT_OSS_LAYER_TYPES),
-                24,
-            )
+        self.assertEqual(
+            self._registry._kv_profile_layer_divisor(24, GPT_OSS_LAYER_TYPES),
+            12,
+        )
 
     def test_all_layers_when_no_layer_types(self):
         # () from MHAConfig's default, None from MLA configs via getattr.
-        with self._pkg_flat_ext(True):
-            self.assertEqual(
-                self._registry._kv_profile_layer_divisor(24, ()),
-                24,
-            )
-            self.assertEqual(
-                self._registry._kv_profile_layer_divisor(24, None),
-                24,
-            )
+        self.assertEqual(
+            self._registry._kv_profile_layer_divisor(24, ()),
+            24,
+        )
+        self.assertEqual(
+            self._registry._kv_profile_layer_divisor(24, None),
+            24,
+        )
 
     def test_all_layers_when_multi_window_sequence(self):
         # M14: the registry must forward sliding_window_tokens so sizing
         # matches the pool's layout decision (divergence is the hazard).
-        with self._pkg_flat_ext(True):
-            it = itertools.cycle((4, 512))
-            windows = [
-                next(it) if t == "sliding_attention" else None
-                for t in GPT_OSS_LAYER_TYPES
-            ]
-            self.assertEqual(
-                self._registry._kv_profile_layer_divisor(
-                    24,
-                    GPT_OSS_LAYER_TYPES,
-                    sliding_window_tokens=windows,
-                ),
+        it = itertools.cycle((4, 512))
+        windows = [
+            next(it) if t == "sliding_attention" else None for t in GPT_OSS_LAYER_TYPES
+        ]
+        self.assertEqual(
+            self._registry._kv_profile_layer_divisor(
                 24,
-            )
+                GPT_OSS_LAYER_TYPES,
+                sliding_window_tokens=windows,
+            ),
+            24,
+        )
 
     def test_group_size_when_uniform_window_sequence(self):
-        with self._pkg_flat_ext(True):
-            windows = [
-                128 if t == "sliding_attention" else None for t in GPT_OSS_LAYER_TYPES
-            ]
-            self.assertEqual(
-                self._registry._kv_profile_layer_divisor(
-                    24,
-                    GPT_OSS_LAYER_TYPES,
-                    sliding_window_tokens=windows,
-                ),
-                12,
-            )
-
-
-_PKG_FLAT_PROBE = (
-    "tokenspeed.runtime.configs.paged_cache_spec.scheduler_ext_flat_kvcache"
-)
+        windows = [
+            128 if t == "sliding_attention" else None for t in GPT_OSS_LAYER_TYPES
+        ]
+        self.assertEqual(
+            self._registry._kv_profile_layer_divisor(
+                24,
+                GPT_OSS_LAYER_TYPES,
+                sliding_window_tokens=windows,
+            ),
+            12,
+        )
 
 
 class MHAPoolSlabLayoutTest(unittest.TestCase):
@@ -291,7 +229,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
         self.torch = torch
         self.MHATokenToKVPool = MHATokenToKVPool
 
-    def _pool(self, *, flat_ext: bool = True, **overrides):
+    def _pool(self, **overrides):
         kwargs = dict(
             size=32,
             dtype=self.torch.bfloat16,
@@ -309,8 +247,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
             enable_alt_stream=False,
         )
         kwargs.update(overrides)
-        with mock.patch(_PKG_FLAT_PROBE, return_value=flat_ext):
-            return self.MHATokenToKVPool(**kwargs)
+        return self.MHATokenToKVPool(**kwargs)
 
     def test_slab_pairing_binds_same_tensor(self):
         pool = self._pool()
@@ -347,11 +284,10 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
 
     def test_fallback_matrix_keeps_24_buffers(self):
         cases = dict(
-            radix_ext=dict(flat_ext=False),
             single_group=dict(
                 layer_types=("full_attention",) * 24,
                 sliding_window_tokens=None,
-            ),
+            )
         )
         for name, overrides in cases.items():
             with self.subTest(name):
@@ -403,17 +339,9 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
         with self.assertRaisesRegex(
             RuntimeError,
             r"hybrid slab KV layout is incompatible with PD disaggregation"
-            r".*radix-built",
+            r".*legacy scheduler",
         ):
             self._pool(pd_disaggregation_enabled=True)
-
-    def test_no_guard_when_fallback(self):
-        # The flag only conflicts with the slab layout, not the legacy one.
-        pool = self._pool(
-            flat_ext=False,
-            pd_disaggregation_enabled=True,
-        )
-        self.assertEqual(len({id(t) for t in pool.k_buffer}), 24)
 
     def test_constructor_uses_overridable_group_publication(self):
         class PoolWithCustomPublication(self.MHATokenToKVPool):
@@ -490,6 +418,14 @@ class MLAPoolAllocationHookTest(unittest.TestCase):
 
         self.assertTrue(pool.allocation_hook_called)
         self.assertEqual(tuple(pool.kv_buffer[0].shape), (12, 1, 6))
+        self.assertEqual(
+            [spec.group_id for spec in pool.paged_cache_group_specs],
+            ["full_attention"],
+        )
+        self.assertGreater(
+            pool.paged_cache_group_page_counts["full_attention"],
+            1,
+        )
 
 
 class StatePagedCacheGroupPageCountTest(unittest.TestCase):
@@ -574,46 +510,44 @@ class LcmPoolFieldBindingTest(unittest.TestCase):
         )
 
     def _pool(self):
-        with mock.patch(_PKG_FLAT_PROBE, return_value=True):
-            return self.lcm_pool_cls(
-                size=8,
-                dtype=self.torch.bfloat16,
-                head_num=1,
-                head_dim=2,
-                layer_num=2,
-                device="cpu",
-                enable_memory_saver=False,
-                max_batch_size=2,
-                max_context_len=32,
-                page_size=4,
-                rank=0,
-                layer_types=("linear_attention", "full_attention"),
-                state_field_dtypes={
-                    "layer.0.conv": self.torch.bfloat16,
-                    "layer.0.ssm": self.torch.bfloat16,
-                },
-                memory_plan=self.plan,
-                layer_group_ids=("linear_attention_0", "full_attention"),
-                enable_alt_stream=False,
-            )
+        return self.lcm_pool_cls(
+            size=8,
+            dtype=self.torch.bfloat16,
+            head_num=1,
+            head_dim=2,
+            layer_num=2,
+            device="cpu",
+            enable_memory_saver=False,
+            max_batch_size=2,
+            max_context_len=32,
+            page_size=4,
+            rank=0,
+            layer_types=("linear_attention", "full_attention"),
+            state_field_dtypes={
+                "layer.0.conv": self.torch.bfloat16,
+                "layer.0.ssm": self.torch.bfloat16,
+            },
+            memory_plan=self.plan,
+            layer_group_ids=("linear_attention_0", "full_attention"),
+            enable_alt_stream=False,
+        )
 
-    def _non_lcm_pool(self, *, flat_ext=False):
-        with mock.patch(_PKG_FLAT_PROBE, return_value=flat_ext):
-            return self.pool_cls(
-                size=8,
-                dtype=self.torch.bfloat16,
-                head_num=1,
-                head_dim=2,
-                layer_num=2,
-                device="cpu",
-                enable_memory_saver=False,
-                max_batch_size=2,
-                max_context_len=32,
-                page_size=4,
-                rank=0,
-                layer_types=("linear_attention", "full_attention"),
-                enable_alt_stream=False,
-            )
+    def _non_lcm_pool(self):
+        return self.pool_cls(
+            size=8,
+            dtype=self.torch.bfloat16,
+            head_num=1,
+            head_dim=2,
+            layer_num=2,
+            device="cpu",
+            enable_memory_saver=False,
+            max_batch_size=2,
+            max_context_len=32,
+            page_size=4,
+            rank=0,
+            layer_types=("linear_attention", "full_attention"),
+            enable_alt_stream=False,
+        )
 
     def test_pool_binds_history_and_state_views_from_one_arena(self):
         pool = self._pool()

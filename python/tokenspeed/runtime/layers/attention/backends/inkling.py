@@ -252,14 +252,12 @@ class InklingAttnBackend(AttentionBackend):
         return self.inner.uses_paged_cache_groups
 
     @property
-    def uses_flat_cache_groups(self):
-        return self.inner.uses_flat_cache_groups
+    def uses_cache_groups(self):
+        return self.inner.uses_cache_groups
 
     @property
-    def flat_cache_consumer_families(self):
-        return frozenset(getattr(self.inner, "flat_cache_consumer_families", ())) | {
-            "state"
-        }
+    def cache_consumer_families(self):
+        return frozenset(getattr(self.inner, "cache_consumer_families", ())) | {"state"}
 
     # ------------------------------------------------------------------
     # Conv metadata
@@ -512,8 +510,8 @@ class InklingAttnBackend(AttentionBackend):
         extend_prefix_lens_cpu: torch.Tensor | None = None,
         **kwargs,
     ):
-        # Paged sconv: conv groups ride flat_block_tables, which the inner backend sheds — grab here.
-        flat_tables = kwargs.get("flat_block_tables") or {}
+        # Paged sconv: conv groups ride block_tables, which the inner backend sheds — grab here.
+        group_tables = kwargs.get("block_tables") or {}
         col_page_table = None
         extend_total = (
             int(sum(extend_seq_lens_cpu[:bs]))
@@ -531,13 +529,13 @@ class InklingAttnBackend(AttentionBackend):
             pfg_total = extend_total
         if getattr(self, "conv_columns", None) is not None:
             groups = set(self.conv_columns["group_block_tokens"])
-            found = {g: flat_tables.get(g) for g in groups}
+            found = {g: group_tables.get(g) for g in groups}
             missing = sorted(g for g, t in found.items() if t is None)
             if pfg_total >= 0:
                 if missing:
                     raise RuntimeError(
                         f"paged sconv: prefill-graph statics are armed but "
-                        f"flat_block_tables is missing conv groups {missing}"
+                        f"block_tables is missing conv groups {missing}"
                     )
                 # The stream-ordered copy into the statics doubles as the plain path's clone() snapshot.
                 col_page_table = self._pfg_refresh_col_tables(found, bs)
@@ -546,7 +544,7 @@ class InklingAttnBackend(AttentionBackend):
                 col_page_table = {g: t.clone() for g, t in found.items()}
             elif len(missing) < len(found):
                 raise RuntimeError(
-                    f"paged sconv: flat_block_tables delivered only part of "
+                    f"paged sconv: block_tables delivered only part of "
                     f"the conv groups (missing {missing}); refusing to mix "
                     "paged and rolling conv state in one step"
                 )
@@ -771,10 +769,10 @@ class InklingAttnBackend(AttentionBackend):
             # Rolling state only: the lag recurrence has no paged variant.
             return False
         self._draft_lookback = int(lookback)
-        # Arm the inner backend's flat lookback loc stack (sized at graph
+        # Arm the inner backend's grouped lookback-location stack (sized at graph
         # init, which runs after this): the lookback pass writes N + D rows
-        # per request, so its flat write locs need their own variant.
-        self.inner.flat_draft_lookback = int(lookback)
+        # per request, so its cache write locations need their own variant.
+        self.inner.draft_lookback = int(lookback)
         if self._draft_lag_conv_state is None:
             self._draft_lag_conv_state = torch.zeros_like(self.conv_pool.conv_state)
         return True
@@ -792,9 +790,9 @@ class InklingAttnBackend(AttentionBackend):
             or md.col_page_table is not None
         ):
             return False
-        # Flat write locs must widen to the lookback rows too; refusal falls
+        # Cache write locations must widen to the lookback rows too; refusal falls
         # back to the plain window pass before any metadata is mutated.
-        inner_enter = getattr(self.inner, "flat_enter_draft_lookback", None)
+        inner_enter = getattr(self.inner, "enter_draft_lookback", None)
         if inner_enter is not None and not inner_enter(bs):
             return False
         tokens = self.conv_spec_num_tokens + lookback
@@ -1163,7 +1161,7 @@ class InklingAttnBackend(AttentionBackend):
 
         Returns:
             ``(idx, rows_old, chunk_rows, use_old)``: the [bs] pool slots,
-            the clamped [bs, w1] old-window gather rows, the flat [bs*w1]
+            the clamped [bs, w1] old-window gather rows, the flattened [bs*w1]
             chunk gather rows, and the [bs, w1, 1] old-vs-chunk blend mask.
         """
         cached = getattr(md, "lag_extend_cache", None)
@@ -1330,13 +1328,13 @@ class InklingAttnBackend(AttentionBackend):
         if save_kv_cache:
             # Decode-side rows and write locs must agree exactly: a shorter
             # loc vector would make _save_kv_cache silently TRIM the rows
-            # (dropping most of a multi-token window's KV — the flat-arm
+            # (dropping most of a multi-token window's KV — the grouped-cache
             # draft accept regression), a longer one would crash the store.
             assert k is None or out_cache_loc.shape[0] == k.shape[0], (
                 f"Inkling decode KV write: {k.shape[0]} rows vs "
                 f"{out_cache_loc.shape[0]} write locs (layer "
                 f"{layer.layer_id}, group {layer.group_id!r}); a chaining "
-                "one-row-per-step draft loop is unsupported on the flat arm."
+                "one-row-per-step draft loop is unsupported with grouped cache."
             )
             inner._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)
         scale_kwargs = {}
@@ -1590,7 +1588,7 @@ class InklingAttnBackend(AttentionBackend):
         self._graph_seq_lens = torch.zeros(max_bs, dtype=torch.int32, device=device)
         if getattr(self, "conv_columns", None) is not None:
             # Adopted stacked views are filled by the mixin's packed unpack; pad rows hit dummy slot 0.
-            inner_tabs = getattr(self.inner, "cuda_graph_flat_page_tables", {})
+            inner_tabs = getattr(self.inner, "cuda_graph_page_tables", {})
             groups = self.conv_columns["group_block_tokens"]
             self._graph_col_tables_adopted = all(g in inner_tabs for g in groups)
             if self._graph_col_tables_adopted:
@@ -1681,15 +1679,15 @@ class InklingAttnBackend(AttentionBackend):
             # Pad rows may carry stale indices aliasing LIVE slots; PAD_SLOT_ID keeps writes off them.
             self._graph_cache_indices[actual_bs:bs].fill_(PAD_SLOT_ID)
         if getattr(self, "conv_columns", None) is not None:
-            flat_tables = kwargs.get("flat_block_tables") or {}
+            group_tables = kwargs.get("block_tables") or {}
             adopted_filled = getattr(
                 self, "_graph_col_tables_adopted", False
-            ) and getattr(self.inner, "_flat_packed_unpack_ran", False)
+            ) and getattr(self.inner, "_packed_group_unpack_ran", False)
             for g, buf in self._graph_col_tables.items():
-                src = flat_tables.get(g)
+                src = group_tables.get(g)
                 if src is None:
                     raise RuntimeError(
-                        f"paged sconv replay: no {g!r} table in " "flat_block_tables"
+                        f"paged sconv replay: no {g!r} table in " "block_tables"
                     )
                 if adopted_filled:
                     # The inner mixin's packed unpack already filled the shared stack rows this step.

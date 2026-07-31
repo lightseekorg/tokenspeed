@@ -29,9 +29,7 @@
 
 #include <gtest/gtest.h>
 
-#include "resource/types.h"
-#include "resource/allocator/page_allocator.h"
-#include "resource/kv_prefix_cache/kv_prefix_cache.h"
+#include "core/types.h"
 
 namespace tokenspeed::test {
 

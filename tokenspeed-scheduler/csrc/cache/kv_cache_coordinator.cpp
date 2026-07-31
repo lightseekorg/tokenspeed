@@ -284,18 +284,11 @@ void KvCacheCoordinator::cacheFullBlocksForGroup(std::size_t group_index, BlockT
 
 void KvCacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand,
                                                       std::uint64_t access_epoch) {
-    _assert(demand.first_new_page_slot >= 0 &&
-                static_cast<std::size_t>(demand.first_new_page_slot) <= demand.page_hashes.size(),
-            "first new page slot is outside the hash history");
-    if (static_cast<std::size_t>(demand.first_new_page_slot) == demand.page_hashes.size()) {
-        return;
-    }
-
     const KvCacheManager& manager = groups_[group_index].Manager();
     if (manager.MatchIsPrefixClosed()) {
         cacheFullBlocksForGroup(group_index, *demand.table,
-                                demand.page_hashes.subspan(static_cast<std::size_t>(demand.first_new_page_slot)),
-                                demand.first_new_page_slot, access_epoch, demand.boundary_kind);
+                                demand.page_hashes.subspan(static_cast<std::size_t>(demand.new_page_hash_begin)),
+                                demand.new_page_hash_begin, access_epoch, *demand.completed_boundary_kind);
         return;
     }
     if (demand.num_computed_tokens < 0 || demand.num_computed_tokens % cache_block_tokens_ != 0) {
@@ -312,7 +305,7 @@ void KvCacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, c
     const std::int32_t first_slot = boundary_slot - lookback;
     cacheFullBlocksForGroup(group_index, *demand.table,
                             demand.page_hashes.subspan(static_cast<std::size_t>(first_slot)), first_slot, access_epoch,
-                            demand.boundary_kind);
+                            *demand.completed_boundary_kind);
 }
 
 void KvCacheCoordinator::ReclaimExpired(std::span<BlockTable> tables, std::int32_t num_computed_tokens) {
@@ -322,10 +315,10 @@ void KvCacheCoordinator::ReclaimExpired(std::span<BlockTable> tables, std::int32
     }
 }
 
-void KvCacheCoordinator::ConsumeAvailable(std::span<BlockTable> tables, std::int32_t num_tokens) {
+void KvCacheCoordinator::ConsumeReservedTokens(std::span<BlockTable> tables, std::int32_t num_tokens) {
     _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
     for (std::size_t i = 0; i < groups_.size(); ++i) {
-        groups_[i].Manager().ConsumeAvailable(tables[i], num_tokens);
+        groups_[i].Manager().ConsumeReservedTokens(tables[i], num_tokens);
     }
 }
 

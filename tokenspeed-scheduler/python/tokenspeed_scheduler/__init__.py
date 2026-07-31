@@ -22,22 +22,16 @@
 
 import tokenspeed_scheduler.tokenspeed_scheduler_ext as _ext
 from tokenspeed_scheduler.tokenspeed_scheduler_ext import (  # Core; Execution plan; Events
-    DisaggregationMode,
     ExecutionEvent,
     ExecutionPlan,
-    FlatTerminalError,
-    FlatTerminalReason,
-    PagedCacheGroupAllocator,
     PagedCacheGroupConfig,
     PagedCacheGroupFamily,
-    PagedCacheGroupTable,
     PagedCacheRetention,
     PagedCacheTransferPolicy,
     PrefixCacheAdjunctSpec,
     RequestSpec,
     Scheduler,
     SchedulerConfig,
-    SchedulerStats,
 )
 
 PD = _ext.PD
@@ -46,22 +40,13 @@ Forward = _ext.Forward
 ForwardEvent = _ext.ForwardEvent
 KVEvent = _ext.KVEvent
 
-# True iff the extension was compiled with TOKENSPEED_FLAT_KVCACHE (flat
-# KvCacheCoordinator scheduler); False for the default radix build. Older
-# extensions predate the attribute — default False, which matches their radix
-# behavior.
-FLAT_KVCACHE: bool = bool(getattr(_ext, "FLAT_KVCACHE", False))
 
-
-def _flat_forward_op_repr(self):
+def _forward_batch_repr(self):
     return (
-        f"FlatForwardOp("
+        f"ForwardBatch("
         f"request_ids={list(self.request_ids)}, "
         f"request_pool_indices={list(self.request_pool_indices)}, "
         f"input_lengths={list(self.input_lengths)}, "
-        f"occupied_pages={[list(p) for p in self.occupied_pages]}, "
-        f"begins={list(self.begins)}, "
-        f"sizes={list(self.sizes)}, "
         f"input_ids={list(self.input_ids)}, "
         f"shifted_input_ids={list(self.shifted_input_ids)}, "
         f"extend_prefix_lens={list(self.extend_prefix_lens)}, "
@@ -70,27 +55,20 @@ def _flat_forward_op_repr(self):
     )
 
 
-Forward.FlatForwardOp.__repr__ = _flat_forward_op_repr
+Forward.Batch.__repr__ = _forward_batch_repr
 
 __all__ = [
     # Core
     "Scheduler",
     "SchedulerConfig",
-    "SchedulerStats",
-    "DisaggregationMode",
     "RequestSpec",
     "PagedCacheRetention",
     "PagedCacheGroupConfig",
-    "PagedCacheGroupAllocator",
     "PagedCacheGroupFamily",
     "PagedCacheTransferPolicy",
-    "PagedCacheGroupTable",
     "PrefixCacheAdjunctSpec",
-    "FLAT_KVCACHE",
     # Execution plan & operations
     "ExecutionPlan",
-    "FlatTerminalError",
-    "FlatTerminalReason",
     "Forward",
     "PD",
     "Cache",

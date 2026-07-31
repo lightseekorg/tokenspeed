@@ -32,19 +32,13 @@ import torch.distributed as dist
 import zmq
 from tokenspeed_scheduler import PD, Cache, ExecutionEvent, ForwardEvent, Scheduler
 
-from tokenspeed.runtime.cache.executor.flat_memory_executor import (
-    FlatMemoryExecutor,
-)
 from tokenspeed.runtime.cache.executor.memory_executor import (
     MemoryExecutor,
-    MemoryExecutorConfig,
 )
 from tokenspeed.runtime.cache.transfer.types import CacheKind
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.configs.paged_cache_spec import (
-    preflight_kimi_k3_flat_consumers,
-    scheduler_ext_flat_kvcache,
-    validate_flat_scheduler_config,
+    validate_scheduler_config,
 )
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -108,10 +102,6 @@ from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = get_colorful_logger(__name__)
-
-
-def calc_l3_query_hashes(scheduler, tokens: list[int]) -> list[str]:
-    return scheduler.calc_rolling_hash(tokens, apply_match=True)
 
 
 # Sleep between iterations while frozen (PAUSED_ALL) so the keep-mode pause does
@@ -182,8 +172,6 @@ class EventLoop:
         else:
             draft_model_config = None
 
-        preflight_kimi_k3_flat_consumers(self.model_config, draft_model_config)
-
         min_per_gpu_mem = self._init_distributed()
 
         target, draft = create_model_runner(
@@ -206,8 +194,6 @@ class EventLoop:
             draft_attn_backend,
             draft_token_to_kv_pool,
             self.max_total_num_tokens,
-            mamba_pool_total_chunks,
-            mamba_pool,
             self.cache_storage,
         ) = create_attn_components(
             server_args,
@@ -229,12 +215,6 @@ class EventLoop:
         geometry = self._scheduler_cache_geometry
         self.max_total_num_tokens = geometry.token_capacity
         num_total_pages = geometry.num_device_pages
-        hf_config = getattr(self.model_config, "hf_config", None)
-        text_config = getattr(hf_config, "text_config", None) if hf_config else None
-        has_mamba = getattr(self.model_config, "mambaish_config", None) is not None or (
-            text_config is not None and hasattr(text_config, "mamba2_cache_params")
-        )
-
         mapping = server_args.mapping
         # The C++ scheduler's req_pool_idx range is rank-local and 1-based:
         # real rows are 1..max_batch_size, row 0 is reserved, and CUDA graph
@@ -260,11 +240,10 @@ class EventLoop:
             token_to_kv_pool=token_to_kv_pool,
             draft_attn_backend=draft_attn_backend,
             draft_token_to_kv_pool=draft_token_to_kv_pool,
-            mamba_pool=mamba_pool,
         )
 
-        # Reserve one token slot because request validation uses a strict
-        # ``< max_req_len`` check against the model context length.
+        self.max_model_len = self.model_config.context_len
+        self.max_single_request_tokens = self.model_config.context_len
         self.max_req_input_len = self.model_config.context_len - 1
         self.attn_tp_size = server_args.attn_tp_size or mapping.attn.tp_size
         self.world_size = server_args.world_size or mapping.world_size
@@ -289,91 +268,28 @@ class EventLoop:
             )
             self._dp_local_info = torch.zeros(1, 3, dtype=torch.int32)
             self._dp_global_info = torch.zeros(mapping.world_size, 3, dtype=torch.int32)
-        if not server_args.enable_kvstore:
-            logger.warning(
-                "KVStore L2 cache will not be used during normal execution, but it will still be used when retraction happens."
-            )
-
-        mamba_l2_host_slots = 0
-        if has_mamba and server_args.enable_mamba_l2:
-            if server_args.mamba_l2_host_slots > 0:
-                mamba_l2_host_slots = server_args.mamba_l2_host_slots
-            elif server_args.mamba_l2_host_gb > 0 and mamba_pool is not None:
-                slot_bytes = int(
-                    mamba_pool.conv_state.shape[0]
-                    * (
-                        mamba_pool.conv_state[0, 0].nbytes
-                        + mamba_pool.ssm_state[0, 0].nbytes
-                    )
-                )
-                mamba_l2_host_slots = int(
-                    server_args.mamba_l2_host_gb * (1024**3) // max(slot_bytes, 1)
-                )
-            else:
-                mamba_l2_host_slots = max(
-                    int(mamba_pool_total_chunks * server_args.mamba_l2_ratio), 1
-                )
-
-        mem_cfg = MemoryExecutorConfig(
-            layer_num=self.model_config.num_hidden_layers,
-            page_size=server_args.block_size,
-            host_ratio=server_args.kvstore_ratio,
-            host_size_gb=server_args.kvstore_size,
-            host_parallel_count=max(
-                int(getattr(server_args.mapping, "nprocs_per_node", 1) or 1), 1
-            ),
-            io_backend=server_args.kvstore_io_backend,
-            host_layout=server_args.kvstore_mem_layout,
-            storage_backend=server_args.kvstore_storage_backend,
-            storage_backend_extra_config=server_args.kvstore_storage_backend_extra_config,
-            model_name=server_args.model,
-            enable_mamba_l2=server_args.enable_mamba_l2,
-            mamba_l2_host_slots=mamba_l2_host_slots,
-            mamba_l2_layout=server_args.mamba_l2_layout,
-            mamba_l2_io_backend=server_args.mamba_l2_io_backend,
-        )
-        if scheduler_ext_flat_kvcache() and server_args.enable_kvstore:
+        if server_args.enable_kvstore:
             if server_args.kvstore_storage_backend is not None:
                 raise NotImplementedError(
-                    "flat scheduler build (TOKENSPEED_FLAT_KVCACHE) has no L3 "
-                    "storage tier yet; unset --kvstore-storage-backend."
+                    "the cache-group scheduler has no L3 storage tier; unset "
+                    "--kvstore-storage-backend"
                 )
             if getattr(token_to_kv_pool, "runtime_contract", None) is not None:
-                # FlatKV contract pools (Kimi-K3) have no host tier yet:
-                # FlatMemoryExecutor mirrors k_buffer/v_buffer layouts the
-                # raw-slab pool does not expose. Reject this unsupported
-                # combination at startup.
                 raise NotImplementedError(
-                    "the flat host tier (kvstore L2) does not support FlatKV "
-                    "contract pools (Kimi-K3) yet; pass --disable-kvstore."
+                    "the host tier does not support contract pools yet; pass "
+                    "--disable-kvstore"
                 )
-            self.memory_executor = FlatMemoryExecutor(
+            self.memory_executor = MemoryExecutor(
                 device_pool=token_to_kv_pool,
                 host_ratio=server_args.kvstore_ratio,
                 host_size_gb=server_args.kvstore_size,
             )
             num_host_pages = self.memory_executor.num_host_pages
-        elif not token_to_kv_pool.supports_hierarchical_kv_cache:
-            if server_args.enable_kvstore:
-                raise NotImplementedError(
-                    "This KV cache pool does not support hierarchical cache "
-                    "(kvstore); pass --disable-kvstore."
-                )
+        else:
             self.memory_executor = None
             num_host_pages = 0
-        else:
-            self.memory_executor = MemoryExecutor(
-                device_pool=token_to_kv_pool,
-                config=mem_cfg,
-                is_dp_attention_enabled=self.has_dp,
-                tp_group=self.attn_tp_cpu_group,
-                draft_device_pool=draft_token_to_kv_pool,
-                mamba_pool=mamba_pool,
-            )
-            num_host_pages = self.memory_executor.host_pool.page_num
 
-        # Flat host tier acks loadbacks (LoadBackDoneEvent), so they join the
-        # inflight accounting in _submit_cache_ops; radix loadbacks never ack.
+        # The host tier acks loadbacks, so they join the in-flight accounting.
         self._loadback_acks_expected = getattr(
             self.memory_executor, "emits_loadback_acks", False
         )
@@ -383,20 +299,13 @@ class EventLoop:
             and attn_tp_rank == 0
         )
 
-        if has_mamba and server_args.max_mamba_cache_size is None:
-            logger.info(
-                f"Mamba radix cache enabled without explicit max_mamba_cache_size. "
-                f"Auto-derived mamba_pool_total_chunks={mamba_pool_total_chunks} "
-                f"(ratio={server_args.mamba_full_memory_ratio})."
-            )
-
         # Adjunct enabled only when pool opts in AND prefix-caching switch is on.
         paged_cache_groups = pool_to_paged_cache_groups(token_to_kv_pool)
-        self._flatkv_pd_enabled = bool(
+        self._pd_cache_enabled = bool(
             server_args.disaggregation_mode in ("prefill", "decode")
             and getattr(token_to_kv_pool, "supports_disaggregation", False) is True
         )
-        if self._flatkv_pd_enabled:
+        if self._pd_cache_enabled:
             unsupported = []
             if self.has_dp:
                 unsupported.append("data-parallel attention")
@@ -414,7 +323,7 @@ class EventLoop:
                 unsupported.append("KVStore/host cache")
             # Prefill is forced onto the non-overlap loop by
             # should_use_overlap_schedule(). Decode uses the ordinary overlap
-            # loop and the scheduler's one-step protected FlatKV reservation.
+            # loop and the scheduler's one-step protected cache reservation.
             if (
                 self.use_overlap_schedule
                 and server_args.disaggregation_mode != "decode"
@@ -425,10 +334,10 @@ class EventLoop:
                 unsupported.append("non-Mooncake transfer backend")
             if unsupported:
                 raise NotImplementedError(
-                    "FlatKV PD currently does not support: " + ", ".join(unsupported)
+                    "Paged-cache PD currently does not support: "
+                    + ", ".join(unsupported)
                 )
-        validate_flat_scheduler_config(
-            flat_kvcache_ext=scheduler_ext_flat_kvcache(),
+        validate_scheduler_config(
             paged_cache_groups=paged_cache_groups,
             attn_backend=attn_backend,
             kv_pool=token_to_kv_pool,
@@ -471,22 +380,16 @@ class EventLoop:
             decode_input_tokens=decode_input_tokens,
             overlap_schedule_depth=self.overlap_schedule_depth,
             disable_prefix_cache=not server_args.enable_prefix_caching,
-            enable_mamba=has_mamba,
-            mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
-            mamba_pool_total_chunks=mamba_pool_total_chunks,
-            enable_mamba_l2=server_args.enable_mamba_l2,
-            mamba_l2_host_slots=mamba_l2_host_slots,
             paged_cache_groups=paged_cache_groups,
             enable_mixed_prefill_decode=server_args.enable_mixed_batch,
             prefix_cache_adjunct=prefix_cache_adjunct,
         )
-        scheduler_cfg.enable_flatkv_pd = self._flatkv_pd_enabled
+        scheduler_cfg.enable_pd_cache = self._pd_cache_enabled
         logger.info(
             "Scheduler config: block_size=%s num_device_pages=%s "
             "max_scheduled_tokens=%s decode_input_tokens=%s "
             "overlap_schedule_depth=%s disable_l2_cache=%s "
             "max_batch_size=%s (global max_num_seqs=%s, dp_size=%s) "
-            "mamba_pool_total_chunks=%s enable_mamba=%s "
             "disable_prefix_cache=%s paged_cache_groups=%s",
             scheduler_cfg.block_size,
             scheduler_cfg.num_device_pages,
@@ -497,12 +400,33 @@ class EventLoop:
             scheduler_cfg.max_batch_size,
             server_args.max_num_seqs,
             self.dp_size,
-            mamba_pool_total_chunks,
-            has_mamba,
             scheduler_cfg.disable_prefix_cache,
             [group.group_id for group in paged_cache_groups],
         )
         self.scheduler = Scheduler(scheduler_cfg)
+        self.max_single_request_tokens = self.scheduler.max_single_request_tokens()
+        self.max_model_len = min(
+            self.model_config.context_len, self.max_single_request_tokens
+        )
+        input_reserve = (
+            1
+            if server_args.disaggregation_mode == "prefill"
+            else max(decode_input_tokens, 1)
+        )
+        self.max_req_input_len = self.max_model_len - input_reserve
+        if self.max_req_input_len < 1:
+            raise RuntimeError(
+                "Paged cache cannot admit one request with the configured "
+                f"decode reserve: max_single_request_tokens="
+                f"{self.max_single_request_tokens}, reserve={input_reserve}"
+            )
+        logger.info(
+            "Single-request token limit: cache=%s model=%s effective=%s max_input=%s",
+            self.max_single_request_tokens,
+            self.model_config.context_len,
+            self.max_model_len,
+            self.max_req_input_len,
+        )
         token_to_kv_pool.bind_paged_cache_scheduler(self.scheduler)
         if attn_tp_rank == 0:
             self.kv_event_publisher = EventPublisherFactory.create(
@@ -556,7 +480,7 @@ class EventLoop:
         self.request_handler = RequestHandler(
             server_args=self.server_args,
             hf_eos_token_id=self.model_config.hf_eos_token_id,
-            max_req_len=self.model_config.context_len - 1,
+            max_req_len=self.max_model_len - 1,
             vocab_size=self.model_config.vocab_size,
             recv_func=self.recv_from_tokenizer,
             send_func=self.send_to_tokenizer,
@@ -580,8 +504,6 @@ class EventLoop:
             enable_log_request_stats=self.server_args.enable_log_request_stats,
             metrics=self.metrics,
         )
-        self.prefetch_threshold = scheduler_cfg.prefetch_threshold
-
         if server_args.disaggregation_mode != "null":
             kv_args = get_kv_args(
                 global_rank,
@@ -589,7 +511,6 @@ class EventLoop:
                 server_args.disaggregation_ib_device,
                 token_to_kv_pool,
                 draft_token_to_kv_pool,
-                mamba_pool,
             )
             pd_manager_args = KVManagerArgs(
                 bootstrap_port=server_args.disaggregation_bootstrap_port,
@@ -890,7 +811,7 @@ class EventLoop:
         dp_metadata=None,
         stats=None,
         grammar_inputs=None,
-        flat_cache_zero_event=None,
+        cache_zero_event=None,
     ):
         """Execute one forward step; return (results, on_first_token).
 
@@ -947,14 +868,13 @@ class EventLoop:
                     self.model_executor.execution_stream,
                     self.model_executor.device,
                 )
-                if self._flatkv_pd_enabled and flat_cache_zero_event is not None:
-                    # zero_flat_cache_pages runs asynchronously on a CUDA stream,
+                if self._pd_cache_enabled and cache_zero_event is not None:
+                    # Page zeroing runs asynchronously on a CUDA stream,
                     # while Mooncake/GPUDirect writes are not ordered by that
                     # stream. Do not publish the destination manifest until the
                     # newly assigned pages are fully sanitized.
-                    flat_cache_zero_event.synchronize()
+                    cache_zero_event.synchronize()
                 self.kv_transfer.execute(forward_op)
-                self.model_executor.reset_remote_prefill_mamba_inputs(forward_op)
                 return None, None
             else:
                 # Path 3b: decode batch — normal forward
@@ -1030,58 +950,14 @@ class EventLoop:
             extend_seq_lens=list(forward_op.input_lengths[:num_extends]),
         )
 
-    def _build_mamba_layerwise_cow(
-        self, execution_plan, forward_op
-    ) -> dict[int, list[int]]:
-        if forward_op is None:
-            return {}
-        loaded_mamba_slots: set[int] = set()
-        for cache_op in execution_plan.cache:
-            if not isinstance(cache_op, Cache.LoadBackOp):
-                continue
-            dst_by_kind = getattr(cache_op, "dst_pages_by_kind", None)
-            if dst_by_kind is None:
-                dst_groups = getattr(cache_op, "dst_pages", [])
-            else:
-                dst_groups = dst_by_kind.get(CacheKind.MAMBA.value, [])
-            for dst_pages in dst_groups:
-                loaded_mamba_slots.update(int(page) for page in dst_pages)
-        if not loaded_mamba_slots:
-            return {}
-
-        cow_src_indices = getattr(forward_op, "mamba_cow_src_indices", None)
-        working_indices = getattr(forward_op, "mamba_pool_indices", None)
-        if cow_src_indices is None or working_indices is None:
-            return {}
-
-        cow_by_src: dict[int, list[int]] = {}
-        for cow_src, working in zip(list(cow_src_indices), list(working_indices)):
-            cow_src = int(cow_src)
-            working = int(working)
-            if cow_src < 0 or working < 0 or cow_src not in loaded_mamba_slots:
-                continue
-            cow_dsts = cow_by_src.setdefault(cow_src, [])
-            if working not in cow_dsts:
-                cow_dsts.append(working)
-        return cow_by_src
-
     def _submit_cache_ops(self, execution_plan) -> None:
         if self.memory_executor is None:
             return
-        forward_op = self._get_forward_op(execution_plan)
-        mamba_layerwise_cow = self._build_mamba_layerwise_cow(
-            execution_plan, forward_op
-        )
-        if mamba_layerwise_cow:
-            self.model_executor.set_layerwise_mamba_cow_done(mamba_layerwise_cow)
-            self.memory_executor.set_mamba_layerwise_cow(mamba_layerwise_cow)
         self.memory_executor.submit_plan(execution_plan)
         for op in execution_plan.cache:
             if isinstance(op, Cache.WriteBackOp):
                 self._num_inflight_cache_ops += len(op.op_ids)
             elif isinstance(op, Cache.LoadBackOp):
-                # Radix loadbacks are fire-and-forget (no ack, nothing in
-                # flight); the flat host tier acks one LoadBackDone per op_id.
                 if self._loadback_acks_expected:
                     self._num_inflight_cache_ops += len(op.op_ids)
             elif isinstance(op, (Cache.PrefetchOp, Cache.BackUpOp)):
@@ -1114,16 +990,6 @@ class EventLoop:
             self.memory_executor.set_consumer(
                 kind, consumer_indices if consumer_indices else -1
             )
-
-    def _flush_mamba_retract_states(self, forward_op) -> None:
-        """Copy draft->working mamba states when retract occurred (no forward scheduled)."""
-        if forward_op is not None:
-            return
-        if self.model_executor.drafter is None:
-            return
-        if self.model_executor.runtime_states.mamba_pool is None:
-            return
-        self.model_executor.flush_mamba_draft_to_working_on_retract()
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1315,10 +1181,10 @@ class EventLoop:
                 )
                 continue
 
-            if self._flatkv_pd_enabled:
+            if self._pd_cache_enabled:
                 if bootstrap is None:
                     raise ValueError(
-                        "FlatKV PD request is missing bootstrap information"
+                        "Paged cache PD request is missing bootstrap information"
                     )
             if isinstance(self.kv_transfer, DisaggDecodeExecutor):
                 state.computed_length = state.input_length
@@ -1334,19 +1200,6 @@ class EventLoop:
             if self.kv_transfer is not None and not is_epd:
                 self.kv_transfer.register(spec.request_id, bootstrap)
 
-            if self.memory_executor is not None:
-                hashes = calc_l3_query_hashes(self.scheduler, spec.tokens)
-                if hashes and len(hashes) > self.prefetch_threshold:
-                    hit_pages = self.memory_executor.query_l3_pages(hashes)
-                    logger.debug(
-                        "[cache_op] L3 query: rid=%s hash_pages=%s hit_pages=%s threshold=%s",
-                        spec.request_id,
-                        len(hashes),
-                        hit_pages,
-                        self.prefetch_threshold,
-                    )
-                    spec.rolling_hashes = hashes
-                    spec.storage_hit_pages = hit_pages
             # EPD prefill: hold a request whose images are encode-routed OUT of the
             # scheduler until its per-image embeddings have been received (started
             # here, polled in EpdPrefillAdmission.drain, which registers the P->D
@@ -1428,42 +1281,6 @@ class EventLoop:
             return None
         return forward_ops[0]
 
-    def _handle_flat_oom_terminals(self, execution_plan) -> None:
-        """Surface flat-KV OOM terminals to their clients as abort finishes.
-
-        The C++ flat scheduler terminalizes a request that can never fit the
-        flat pool (AbortEvent inside the scheduler; the reaper reclaims its
-        resources) and reports its id on ``plan.flat_oom_request_ids``
-        (always empty on radix builds). The scheduler side is already fully
-        torn down — do NOT send a ForwardEvent.Abort back — but the client is
-        still waiting on the response stream, so finish the request with an
-        abort here (mirrors the PD FailedEvent handling above, minus the
-        scheduler abort).
-        """
-        oom_rids = getattr(execution_plan, "flat_oom_request_ids", None)
-        if not oom_rids:
-            return
-        for rid in oom_rids:
-            state = self.output_processor.rid_to_state.get(rid)
-            if state is None:
-                # rid already gone (e.g. a client abort raced ahead).
-                logger.debug(
-                    "flat OOM terminal for rid=%s: state missing; skipping", rid
-                )
-                continue
-            if state.finished:
-                # Already carries a finish (an abort raced ahead of the
-                # terminal). C++ reports this rid exactly once and no future
-                # forward op will reap it, so resolve it here (same orphan
-                # rule as _reap_or_keep_buffered_spec).
-                self.output_processor.reap_finished_orphan(rid, state)
-                continue
-            state.set_finish_with_abort(
-                "flat KV cache cannot fit this request: prompt exceeds pool "
-                "capacity (OOM)"
-            )
-            self.output_processor.publish_finished_at_admission(rid, state)
-
     def _process_kv_transfer_events(self, kv_transfer_events: list) -> list:
         processed = []
         for event in kv_transfer_events:
@@ -1481,7 +1298,7 @@ class EventLoop:
                     self.output_processor.on_remote_prefill_done(
                         req_id, bootstrap_token
                     )
-                if self._flatkv_pd_enabled:
+                if self._pd_cache_enabled:
                     processed.extend(
                         self.output_processor.finish_remote_prefill_only_request(req_id)
                     )
@@ -1499,7 +1316,7 @@ class EventLoop:
                 # prefill aborted on embedding timeout so the KV never arrives), or a
                 # transfer errored. Publish the client-visible failure here. Legacy
                 # PD still needs a following Forward.Abort because its C++ FailedEvent
-                # handler is a no-op; FlatKV FailedEvent atomically terminalizes and
+                # handler is a no-op; Paged cache FailedEvent atomically terminalizes and
                 # fences the leased scheduler resources itself.
                 req_id = event.request_id
                 state = self.output_processor.rid_to_state.get(req_id)
@@ -1513,7 +1330,7 @@ class EventLoop:
                         self.output_processor.publish_finished_at_admission(
                             req_id, state
                         )
-                    if not self._flatkv_pd_enabled:
+                    if not self._pd_cache_enabled:
                         abort = ForwardEvent.Abort()
                         abort.request_id = req_id
                         processed.append(abort)
@@ -1620,7 +1437,7 @@ class EventLoop:
     # ------------------------------------------------------------------
 
     def _reset_caches_for_release(self) -> None:
-        """Invalidate the prefix/radix cache before KV is discarded on release.
+        """Invalidate the prefix/single-table cache before KV is discarded on release.
 
         KV pages are re-mapped + zeroed on wake, so any retained prefix entry
         would be stale. The unsafe case (prefix caching on with no reset) is
@@ -1687,35 +1504,9 @@ class EventLoop:
     def _shutdown_complete(self) -> bool:
         return self.shutdown_event.is_set()
 
-    def _flat_page_ids_to_zero(self, execution_plan):
-        """Group-aware child pages the scheduler assigned in this step.
-
-        The group is part of the address under two-level placement. Older
-        single-level schedulers expose one global page-id vector instead.
-        """
-        try:
-            return execution_plan.flat_pages_to_zero
-        except AttributeError:
-            try:
-                return execution_plan.flat_page_ids_to_zero
-            except AttributeError:
-                pass
-            if getattr(
-                self.model_executor.token_to_kv_pool,
-                "flat_kv_requires_page_zeroing",
-                False,
-            ):
-                raise RuntimeError(
-                    "flat KV cache is active but the scheduler's ExecutionPlan "
-                    "has no fresh-page sanitization payload; the installed "
-                    "tokenspeed-scheduler build predates page-reuse zeroing — "
-                    "rebuild it from this checkout"
-                ) from None
-            return ()
-
-    def _flat_pages_to_zero(self, execution_plan):
-        """Descriptive alias for group-aware page-zeroing payloads."""
-        return self._flat_page_ids_to_zero(execution_plan)
+    def _pages_to_zero(self, execution_plan):
+        """Group-aware child pages assigned by the scheduler in this step."""
+        return execution_plan.pages_to_zero
 
     def event_loop(self):
         """Non-overlapping scheduler loop."""
@@ -1732,15 +1523,12 @@ class EventLoop:
                 continue
             execution_plan = self.scheduler.next_execution_plan()
             self._publish_scheduler_kv_events()
-            self._handle_flat_oom_terminals(execution_plan)
-            flat_cache_zero_event = self.model_executor.zero_flat_cache_pages(
-                self._flat_page_ids_to_zero(execution_plan)
+            cache_zero_event = self.model_executor.zero_cache_pages(
+                self._pages_to_zero(execution_plan)
             )
             self._submit_cache_ops(execution_plan)
 
             forward_op = self._get_forward_op(execution_plan)
-            self._flush_mamba_retract_states(forward_op)
-
             stats = self._get_scheduler_stats()
             num_iter_tokens = (
                 sum(forward_op.input_lengths) if forward_op is not None else 0
@@ -1772,7 +1560,7 @@ class EventLoop:
                     dp_metadata=dp_metadata,
                     stats=stats,
                     grammar_inputs=grammar_inputs,
-                    flat_cache_zero_event=flat_cache_zero_event,
+                    cache_zero_event=cache_zero_event,
                 )
                 if results is not None:
                     request_changes.extend(
@@ -1888,16 +1676,13 @@ class EventLoop:
                 continue
             execution_plan = self.scheduler.next_execution_plan()
             self._publish_scheduler_kv_events()
-            self._handle_flat_oom_terminals(execution_plan)
 
-            flat_cache_zero_event = self.model_executor.zero_flat_cache_pages(
-                self._flat_page_ids_to_zero(execution_plan)
+            cache_zero_event = self.model_executor.zero_cache_pages(
+                self._pages_to_zero(execution_plan)
             )
             self._submit_cache_ops(execution_plan)
 
             forward_op = self._get_forward_op(execution_plan)
-            self._flush_mamba_retract_states(forward_op)
-
             stats = self._get_scheduler_stats()
             num_iter_tokens = (
                 sum(forward_op.input_lengths) if forward_op is not None else 0
@@ -1973,7 +1758,7 @@ class EventLoop:
                     dp_metadata=dp_metadata,
                     stats=stats,
                     grammar_inputs=grammar_inputs,
-                    flat_cache_zero_event=flat_cache_zero_event,
+                    cache_zero_event=cache_zero_event,
                 )
 
             # ---- post-process previous step (overlapped with current forward) ----
@@ -2063,9 +1848,10 @@ def run_event_loop(
                 "status": "ready",
                 "max_total_num_tokens": event_loop.max_total_num_tokens,
                 "max_req_input_len": event_loop.max_req_input_len,
+                "max_single_request_tokens": event_loop.max_single_request_tokens,
                 "max_num_seqs": server_args.max_num_seqs,
                 "chunked_prefill_size": server_args.chunked_prefill_size,
-                "max_model_len": event_loop.model_config.context_len,
+                "max_model_len": event_loop.max_model_len,
                 "cache_storage": getattr(event_loop, "cache_storage", None),
             }
         )

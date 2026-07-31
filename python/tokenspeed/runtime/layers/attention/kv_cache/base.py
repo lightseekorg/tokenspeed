@@ -40,10 +40,10 @@ class BaseTokenToKVPool:
     paged_cache_group_specs: tuple[PagedCacheGroupSpec, ...] = ()
     paged_cache_group_page_counts: dict[str, int] = {}
     supports_hierarchical_kv_cache: bool = True
-    # Flat-cache pools that alias recurrent-state bytes and KV in one slab must
+    # LCM pools that alias recurrent-state bytes and KV in one slab must
     # zero physical pages on reuse to avoid poisoned tails. Pure-attention
     # pools do not alias state, so reused pages need no sanitization.
-    flat_kv_requires_page_zeroing: bool = False
+    paged_cache_requires_page_zeroing: bool = False
 
     def __init__(
         self,

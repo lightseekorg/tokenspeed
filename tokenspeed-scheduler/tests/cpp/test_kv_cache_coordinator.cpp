@@ -38,7 +38,7 @@
 #include "cache/cache_types.h"
 #include "cache/full_attn_manager.h"
 #include "cache/swa_manager.h"
-#include "flat_cache_test_access.h"
+#include "cache_test_access.h"
 #include "scheduler/page_hasher.h"
 
 namespace tokenspeed::test {
@@ -444,7 +444,8 @@ TEST(KvCacheCoordinatorAdmissionTest, LaterChunksReuseRequestAccessEpoch) {
             .table = &tables[0],
             .num_tokens = 8,
             .page_hashes = std::span<const std::string>(hashes).first(2),
-            .first_new_page_slot = 0,
+            .new_page_hash_begin = 0,
+            .completed_boundary_kind = CacheBoundaryKind::kChunk,
             .num_computed_tokens = 8,
         },
     };
@@ -457,7 +458,8 @@ TEST(KvCacheCoordinatorAdmissionTest, LaterChunksReuseRequestAccessEpoch) {
         GroupDemand{
             .table = &tables[0],
             .page_hashes = hashes,
-            .first_new_page_slot = 2,
+            .new_page_hash_begin = 2,
+            .completed_boundary_kind = CacheBoundaryKind::kEndpoint,
             .num_computed_tokens = 16,
         },
     };
@@ -679,7 +681,7 @@ TEST(KvCacheCoordinatorAdmissionTest, ReservedCapacityLivesInBlockTableUntilCons
     EXPECT_EQ(tables[0].NumBlocks(), 3);
     EXPECT_EQ(coordinator.GroupManager(0).BlocksNeededFor(tables[0], /*num_tokens=*/8), 0);
     const std::int32_t free_before_consume = pool.NumEmptyLcmBlocks();
-    coordinator.ConsumeAvailable(tables, /*num_tokens=*/8);
+    coordinator.ConsumeReservedTokens(tables, /*num_tokens=*/8);
     EXPECT_EQ(tables[0].AvailableTokens(), 3);
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), free_before_consume);
 }
@@ -1114,8 +1116,9 @@ TEST(KvCacheCoordinatorAdmissionTest, QwenScaleChunkLifecyclePublishesOneStateSn
                 .table = &tables[group],
                 .num_tokens = kChunkPages * kBlockTokens,
                 .page_hashes = std::span<const std::string>{hashes}.first(first_page),
-                .first_new_page_slot = std::max(first_page - kChunkPages, 0),
-                .boundary_kind = CacheBoundaryKind::kChunk,
+                .new_page_hash_begin = std::max(first_page - kChunkPages, 0),
+                .completed_boundary_kind =
+                    first_page == 0 ? std::nullopt : std::optional{CacheBoundaryKind::kChunk},
                 .num_computed_tokens = first_page * kBlockTokens,
                 .reserve_tokens = chunk == kPromptPages / kChunkPages - 1 ? 1 : 0,
             });
@@ -1133,8 +1136,8 @@ TEST(KvCacheCoordinatorAdmissionTest, QwenScaleChunkLifecyclePublishesOneStateSn
             .table = &tables[group],
             .num_tokens = 1,
             .page_hashes = hashes,
-            .first_new_page_slot = kPromptPages - kChunkPages,
-            .boundary_kind = CacheBoundaryKind::kEndpoint,
+            .new_page_hash_begin = kPromptPages - kChunkPages,
+            .completed_boundary_kind = CacheBoundaryKind::kEndpoint,
             .num_computed_tokens = kPromptPages * kBlockTokens,
         });
     }
@@ -1289,7 +1292,8 @@ TEST(KvCacheCoordinatorAdmissionTest, EvictsProspectiveVictimCachedDuringCommit)
             .table = &tables[0],
             .num_tokens = 4,
             .page_hashes = hashes,
-            .first_new_page_slot = 0,
+            .new_page_hash_begin = 0,
+            .completed_boundary_kind = CacheBoundaryKind::kChunk,
             .num_computed_tokens = 8,
         },
     };
@@ -2225,7 +2229,7 @@ TEST(KvCacheCoordinatorStoreCandidates, DisabledByDefaultCollectsNothing) {
     coordinator.Free(tables);
 }
 
-// Caller-side slide credit (the scheduler's flat gates run this exact per-group loop).
+// Caller-side slide credit (the scheduler's batch gates run this exact per-group loop).
 std::int32_t SlideCredit(const KvCacheCoordinator& coord, std::span<const BlockTable> tables,
                          std::int32_t num_computed_tokens) {
     std::int32_t total_freed = 0;
@@ -2692,6 +2696,47 @@ TEST(MambaStateKindTest, StateGroupRetentionKeepsOnlyLastPage) {
     coord.Free(tables);
 }
 
+TEST(CompletedBoundaryTest, HistoricalHashesWithoutBoundaryAreNotPublished) {
+    BlockPool pool(8);
+    std::vector<KvCacheSpec> specs = {
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1}};
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, /*cache_block_tokens=*/4, pool);
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
+    const std::vector<std::string> hashes = ContentHashes({{0, 0, 0, 0}});
+    const std::vector<GroupDemand> demands{{
+        .table = &tables[0],
+        .page_hashes = hashes,
+        .new_page_hash_begin = 1,
+        .completed_boundary_kind = std::nullopt,
+        .num_computed_tokens = 4,
+    }};
+
+    ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands));
+    EXPECT_EQ(coordinator.GroupManager(0).NumCachedBlocks(pool), 0);
+    coordinator.Free(tables);
+}
+
+TEST(CompletedBoundaryTest, RejectsNewHashesWithoutBoundaryKind) {
+    BlockPool pool(8);
+    std::vector<KvCacheSpec> specs = {
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1}};
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, /*cache_block_tokens=*/4, pool);
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
+    const std::vector<std::string> hashes = ContentHashes({{0, 0, 0, 0}});
+    const std::vector<GroupDemand> demands{{
+        .table = &tables[0],
+        .page_hashes = hashes,
+        .new_page_hash_begin = 0,
+        .completed_boundary_kind = std::nullopt,
+        .num_computed_tokens = 4,
+    }};
+
+    EXPECT_THROW(coordinator.Admit(coordinator.ProbePrefix({}), demands), std::runtime_error);
+    coordinator.Free(tables);
+}
+
 TEST(MambaStateRegistrationTest, MambaPublishesOnlyChunkBoundary) {
     BlockPool pool(32);
     std::vector<KvCacheSpec> specs = {
@@ -2706,8 +2751,8 @@ TEST(MambaStateRegistrationTest, MambaPublishesOnlyChunkBoundary) {
         demands.push_back(GroupDemand{
             .table = &table,
             .page_hashes = ch,
-            .first_new_page_slot = 0,
-            .boundary_kind = CacheBoundaryKind::kChunk,
+            .new_page_hash_begin = 0,
+            .completed_boundary_kind = CacheBoundaryKind::kChunk,
             .num_computed_tokens = 12,
         });
     }
@@ -2731,8 +2776,8 @@ TEST(MambaStateRegistrationTest, MambaPublishesAlignedEndpoint) {
     std::vector<GroupDemand> demands{{
         .table = &tables[0],
         .page_hashes = ch,
-        .first_new_page_slot = 0,
-        .boundary_kind = CacheBoundaryKind::kEndpoint,
+        .new_page_hash_begin = 0,
+        .completed_boundary_kind = CacheBoundaryKind::kEndpoint,
         .num_computed_tokens = 12,
     }};
     ASSERT_TRUE(coord.Admit(coord.ProbePrefix({}), demands));
@@ -2757,8 +2802,8 @@ TEST(MambaStateRegistrationTest, MambaPublishesNoUnalignedBoundary) {
     std::vector<GroupDemand> demands{{
         .table = &tables[0],
         .page_hashes = ch,
-        .first_new_page_slot = 0,
-        .boundary_kind = CacheBoundaryKind::kEndpoint,
+        .new_page_hash_begin = 0,
+        .completed_boundary_kind = CacheBoundaryKind::kEndpoint,
         .num_computed_tokens = 10,
     }};
     ASSERT_TRUE(coord.Admit(coord.ProbePrefix({}), demands));
@@ -2895,8 +2940,8 @@ TEST(SwaRegistrationTest, SwaBoundaryRequiresTrailingWindow) {
         .table = &tables[0],
         .page_hashes = ch,
         // Only page 3 is new; the two-page resume tail crosses the prior chunk.
-        .first_new_page_slot = 3,
-        .boundary_kind = CacheBoundaryKind::kChunk,
+        .new_page_hash_begin = 3,
+        .completed_boundary_kind = CacheBoundaryKind::kChunk,
         .num_computed_tokens = 16,
     }};
     ASSERT_TRUE(coord.Admit(coord.ProbePrefix({}), demands));

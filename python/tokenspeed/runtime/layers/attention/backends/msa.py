@@ -47,8 +47,8 @@ from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
     init_backend_cuda_graph_state,
 )
-from tokenspeed.runtime.layers.attention.backends.flat_groups import (
-    FlatCacheGroupsMixin,
+from tokenspeed.runtime.layers.attention.backends.cache_groups import (
+    CacheGroupsMixin,
 )
 from tokenspeed.runtime.layers.attention.configs.msa import (
     MSAConfig,
@@ -76,7 +76,7 @@ class MSAExtendMetadata:
     #   cu_seqlens_kv: the cumsum version of seq_lens
     # - extend_prefix_lens: length of the cached prefix tokens
     # seq_lens[i] = extend_prefix_lens[i] + extend_seq_lens[i]
-    # page_table is None on the flat path (per-group page_tables route reads).
+    # page_table is None on the cache path (per-group page_tables route reads).
     page_table: torch.Tensor | None
     seq_lens: torch.Tensor
     extend_seq_lens: torch.Tensor
@@ -90,20 +90,20 @@ class MSAExtendMetadata:
     seq_lens_cpu: list[int]
     max_extend_seq_len: int
     max_extend_prefix_len: int = 0
-    # Flat per-group page tables (group_id -> [num_reqs, max_pages]); None on
-    # the single-table path. TODO(radix-removal): drop the single page_table.
+    # Per-group page tables (group_id -> [num_reqs, max_pages]); None on
+    # the single-table path. drop the single page_table.
     page_tables: dict[str, torch.Tensor] | None = None
-    # Flat per-group KV write locations (group_id -> [num_tokens] int32),
+    # Per-group KV write locations (group_id -> [num_tokens] int32),
     # built with page_tables — same groups, same lifecycle.
     out_cache_locs: dict[str, torch.Tensor] | None = None
 
 
 @dataclass(kw_only=True)
 class MSADecodeMetadata:
-    # page_table is None on the flat path (per-group page_tables route reads).
+    # page_table is None on the cache path (per-group page_tables route reads).
     page_table: torch.Tensor | None
     seq_lens: torch.Tensor
-    # Flat per-group tables/write-locs; see MSAExtendMetadata.
+    # Per-group tables/write-locs; see MSAExtendMetadata.
     page_tables: dict[str, torch.Tensor] | None = None
     out_cache_locs: dict[str, torch.Tensor] | None = None
     # Per-forward view of the backend's shared decode score buffer, pre-filled
@@ -112,13 +112,13 @@ class MSADecodeMetadata:
     score_out: torch.Tensor | None = None
 
 
-class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
+class MSAAttnBackend(CacheGroupsMixin, AttentionBackend):
     """MiniMax sparse attention backend that routes through tokenspeed_kernel attention APIs."""
 
     # Unconditional: safety comes from the publication rule
     # (paged_cache_spec.publish_paged_cache_groups) plus the replay
-    # stale-table guard. TODO(radix-removal): drop the flag.
-    uses_flat_cache_groups: bool = True
+    # stale-table guard. drop the flag.
+    uses_cache_groups: bool = True
 
     def support_kv_cache_prewrite(
         self, forward_mode: ForwardMode | None = None
@@ -194,41 +194,41 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         extend_seq_lens_cpu: torch.Tensor | None = None,
         extend_prefix_lens: torch.Tensor | None = None,
         extend_prefix_lens_cpu: torch.Tensor | None = None,
-        flat_block_tables: dict[str, torch.Tensor] | None = None,
+        block_tables: dict[str, torch.Tensor] | None = None,
         **kwargs,
     ):
         assert not forward_mode.is_mixed(), "MSA backend does not support mixed batch"
 
         seq_lens = seq_lens[:bs]
 
-        flat_page_tables = self._shed_state_groups(flat_block_tables)
-        flat_out_cache_locs = None
-        if flat_page_tables:
-            # Verify keeps [bs]-row tables; only DFLASH expands rows. TODO(flat+dflash).
+        group_page_tables = self._shed_state_groups(block_tables)
+        group_out_cache_locs = None
+        if group_page_tables:
+            # Verify keeps [bs]-row tables; only DFLASH expands rows.
             assert not (
                 self.draft_block_decode and self.spec_num_tokens > 1
-            ), "flat cache groups are unsupported with DFLASH block decode"
-            # The flat path routes every read/write through the per-group
-            # tables; the radix single table would be dead work.
+            ), "paged cache groups are unsupported with DFLASH block decode"
+            # The cache path routes every read/write through the per-group
+            # tables; the single-table single table would be dead work.
             page_table = None
             if forward_mode.is_extend_or_mixed():
                 assert extend_prefix_lens_cpu is not None
                 assert extend_seq_lens_cpu is not None
-                flat_out_cache_locs = self._compute_flat_extend_out_cache_locs(
-                    flat_page_tables,
+                group_out_cache_locs = self._compute_extend_group_out_cache_locs(
+                    group_page_tables,
                     extend_prefix_lens_cpu[:bs],
                     extend_seq_lens_cpu[:bs],
                     self.page_size,
                 )
             else:
-                flat_out_cache_locs = self._compute_flat_decode_out_cache_locs(
-                    flat_page_tables,
+                group_out_cache_locs = self._compute_decode_group_out_cache_locs(
+                    group_page_tables,
                     seq_lens,
                     self.page_size,
                     self.tokens_per_req,
                 )
-            self._maybe_check_flat_write_locs(
-                flat_page_tables, flat_out_cache_locs, self.page_size
+            self._maybe_check_group_write_locs(
+                group_page_tables, group_out_cache_locs, self.page_size
             )
         else:
             page_table = build_page_table(
@@ -276,8 +276,8 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 seq_lens_cpu=seq_lens_cpu,
                 max_extend_seq_len=max_extend_seq_len,
                 max_extend_prefix_len=max_extend_prefix_len,
-                page_tables=flat_page_tables,
-                out_cache_locs=flat_out_cache_locs,
+                page_tables=group_page_tables,
+                out_cache_locs=group_out_cache_locs,
             )
 
             # Drafter step 1+ decodes under an EXTEND/MIXED target; seq_lens
@@ -286,8 +286,8 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 self.forward_decode_metadata = MSADecodeMetadata(
                     page_table=page_table,
                     seq_lens=seq_lens,
-                    page_tables=flat_page_tables,
-                    out_cache_locs=flat_out_cache_locs,
+                    page_tables=group_page_tables,
+                    out_cache_locs=group_out_cache_locs,
                 )
         else:
             if self.draft_block_decode and self.spec_num_tokens > 1:
@@ -312,8 +312,8 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 self.forward_decode_metadata = MSADecodeMetadata(
                     page_table=expanded_page_table,
                     seq_lens=expanded_seq_lens,
-                    page_tables=flat_page_tables,
-                    out_cache_locs=flat_out_cache_locs,
+                    page_tables=group_page_tables,
+                    out_cache_locs=group_out_cache_locs,
                 )
             else:
                 score_out = self.decode_score_buffer[: bs * self.tokens_per_req]
@@ -321,8 +321,8 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 self.forward_decode_metadata = MSADecodeMetadata(
                     page_table=page_table,
                     seq_lens=seq_lens,
-                    page_tables=flat_page_tables,
-                    out_cache_locs=flat_out_cache_locs,
+                    page_tables=group_page_tables,
+                    out_cache_locs=group_out_cache_locs,
                     score_out=score_out,
                 )
 
@@ -333,16 +333,16 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         **kwargs,
     ):
         # State-family groups (GDN/mamba pages) belong to the mamba backend;
-        # learn their ids from the pool's specs so every flat table/loc path
+        # learn their ids from the pool's specs so every table/location path
         # here (eager, capture, replay) sheds them.
-        self._learn_flat_state_groups(paged_cache_group_specs)
+        self._learn_cache_groups(paged_cache_group_specs)
 
         self.cuda_graph_decode_metadata = {}
-        # Flat per-group persistent buffers, lazily allocated at first
-        # capture. TODO(radix-removal): parallels cuda_graph_page_table.
+        # Per-group persistent buffers, lazily allocated at first
+        # capture. parallels cuda_graph_page_table.
         # Initialized before the DFLASH early return: replay reads the dict
         # unconditionally for the stale-table guard.
-        self._init_flat_graph_buffers(max_bs)
+        self._init_group_graph_buffers(max_bs)
         if self.draft_block_decode and self.spec_num_tokens > 1:
             # DFLASH draft block: expand to spec_num_tokens decode rows per
             # request (one row per block position), so max_seqlen_q == 1 per row
@@ -369,7 +369,7 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
-        flat_cache_group_ids: tuple[str, ...] = (),
+        cache_group_ids: tuple[str, ...] = (),
         **kwargs,
     ):
         assert not forward_mode.is_extend_or_mixed()
@@ -377,14 +377,14 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         # Real tables only arrive at replay: capture lazily allocates
         # persistent per-group buffers and records metadata views into them,
         # so replay can copy_ fresh data to the graph-recorded addresses.
-        if flat_cache_group_ids:
-            # Verify keeps [bs]-row tables + [bs*N] loc views. TODO(flat+dflash).
+        if cache_group_ids:
+            # Verify keeps [bs]-row tables plus [bs*N] location views.
             assert not (
                 self.draft_block_decode and self.spec_num_tokens > 1
-            ), "flat_cache_group_ids is unsupported with DFLASH block decode"
-        page_tables, out_cache_locs = self._flat_capture_group_views(
+            ), "cache_group_ids is unsupported with DFLASH block decode"
+        page_tables, out_cache_locs = self._capture_group_views(
             bs,
-            flat_cache_group_ids,
+            cache_group_ids,
             tokens_per_req=self.tokens_per_req,
         )
 
@@ -405,9 +405,9 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             score_out = self.decode_score_buffer[: bs * self.tokens_per_req]
             score_out.fill_(-float("inf"))
             metadata = MSADecodeMetadata(
-                # Flat captures route reads through the per-group tables and
-                # replay never fills the radix single table, so mirror the
-                # eager flat path: page_table=None instead of a slice of the
+                # Cache-group captures route reads through the per-group tables and
+                # replay never fills the single-table single table, so mirror the
+                # eager cache path: page_table=None instead of a slice of the
                 # never-filled zero buffer.
                 page_table=(
                     None
@@ -434,17 +434,17 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         seq_lens: torch.Tensor,
         req_to_page: torch.Tensor,
         forward_mode: ForwardMode,
-        flat_block_tables: dict[str, torch.Tensor] | None = None,
+        block_tables: dict[str, torch.Tensor] | None = None,
         **kwargs,
     ):
         assert not forward_mode.is_extend_or_mixed()
 
         # Fail loudly instead of replaying over stale/zero page tables.
-        self._flat_replay_stale_guard(bs, flat_block_tables)
+        self._replay_stale_guard(bs, block_tables)
 
-        # Flat captures read only the per-group buffers; the radix single
+        # Cache-group captures read only the per-group buffers; the single-table single
         # table (cuda_graph_page_table) would be dead work there.
-        if not self.cuda_graph_flat_page_tables:
+        if not self.cuda_graph_page_tables:
             gather_page_table_with_padding(
                 req_to_page=req_to_page,
                 req_pool_indices=req_pool_indices,
@@ -470,10 +470,10 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             # Plain decode / plain draft: copy live lengths into our buffer.
             self.cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs])
 
-        if flat_block_tables:
-            self._flat_replay_fill(
+        if block_tables:
+            self._fill_group_graph_buffers(
                 bs,
-                flat_block_tables,
+                block_tables,
                 self.cuda_graph_seq_lens,
                 tokens_per_req=self.tokens_per_req,
             )
@@ -787,7 +787,7 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
 class MSAHybridAttnBackend(AttentionBackend):
     """Minimax hybrid attention backend that dispatches to either a dense or sparse backend per layer."""
 
-    uses_flat_cache_groups: bool = True
+    uses_cache_groups: bool = True
 
     def __init__(self, config: MSAConfig) -> None:
         from tokenspeed.runtime.layers.attention.registry import (

@@ -134,4 +134,5 @@ class MLAConfig(BaseAttnConfig):
             max_context_len=self.context_len,
             page_size=self.page_size,
             rank=rank,
+            max_scheduled_tokens=self.max_scheduled_tokens,
         )

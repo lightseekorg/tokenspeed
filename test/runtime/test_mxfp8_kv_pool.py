@@ -157,38 +157,29 @@ SLAB_KV_HEADS = (2, 4, 2, 4)
 
 
 def _make_slab_pool(size: int = 512):
-    from unittest import mock
-
-    from tokenspeed.runtime.configs import paged_cache_spec
-    from tokenspeed.runtime.layers.attention.kv_cache import mha as mha_mod
     from tokenspeed.runtime.layers.attention.kv_cache.mha import (
         MHATokenToKVPoolMXFP8,
     )
 
-    with mock.patch.object(
-        paged_cache_spec, "scheduler_ext_flat_kvcache", return_value=True
-    ), mock.patch.object(
-        mha_mod.paged_cache_spec, "scheduler_ext_flat_kvcache", return_value=True
-    ):
-        return MHATokenToKVPoolMXFP8(
-            size=size,
-            dtype=torch.float8_e4m3fn,
-            head_num=HEADS,
-            head_dim=HEAD_DIM,
-            layer_num=len(SLAB_LAYER_TYPES),
-            device="cuda",
-            enable_memory_saver=False,
-            max_batch_size=8,
-            max_context_len=size,
-            page_size=128,
-            rank=0,
-            layer_types=SLAB_LAYER_TYPES,
-            sliding_window_tokens=512,
-            max_scheduled_tokens=size,
-            slot_tokens=256,
-            group_page_sizes={"full_attention": 256},
-            layer_kv_head_counts=SLAB_KV_HEADS,
-        )
+    return MHATokenToKVPoolMXFP8(
+        size=size,
+        dtype=torch.float8_e4m3fn,
+        head_num=HEADS,
+        head_dim=HEAD_DIM,
+        layer_num=len(SLAB_LAYER_TYPES),
+        device="cuda",
+        enable_memory_saver=False,
+        max_batch_size=8,
+        max_context_len=size,
+        page_size=128,
+        rank=0,
+        layer_types=SLAB_LAYER_TYPES,
+        sliding_window_tokens=512,
+        max_scheduled_tokens=size,
+        slot_tokens=256,
+        group_page_sizes={"full_attention": 256},
+        layer_kv_head_counts=SLAB_KV_HEADS,
+    )
 
 
 def test_slab_geometry_and_aliasing():

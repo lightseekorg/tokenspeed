@@ -345,7 +345,7 @@ def test_kda_paged_decode_preserves_packed_compound_fallback() -> None:
 
 
 def test_kda_recurrent_decode_updates_page_strided_state_pool() -> None:
-    """Fused decode supports FlatKV's padded physical-page stride."""
+    """Fused decode supports paged cache's padded physical-page stride."""
 
     device = "cuda"
     torch.manual_seed(17)

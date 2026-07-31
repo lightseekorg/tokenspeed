@@ -8,8 +8,7 @@ env-injected sitecustomize) and asserts the gain twice over: directly, via
 the round-2 prefix-hit-rate contrast (slab keeps the working set cached;
 the legacy arm's halved pool recycles it before reuse).
 
-Requires a flat-built (TOKENSPEED_FLAT_KVCACHE) tokenspeed_scheduler ext;
-skips cleanly on a radix build.
+Requires the grouped-cache tokenspeed_scheduler extension.
 
 Usage:
     cd test/runtime
@@ -225,11 +224,6 @@ class TestSlabCapacityPrefixHits(unittest.TestCase):
             import tokenspeed_scheduler
         except ImportError:
             self.skipTest("tokenspeed_scheduler ext is not installed")
-        if not getattr(tokenspeed_scheduler, "FLAT_KVCACHE", False):
-            self.skipTest(
-                "requires a flat-built (TOKENSPEED_FLAT_KVCACHE) "
-                "tokenspeed_scheduler ext; radix builds have no slab layout"
-            )
         if os.environ.get("TOKENSPEED_CI_SMALL_KV_SIZE"):
             self.skipTest(
                 "TOKENSPEED_CI_SMALL_KV_SIZE pins the token pool for both "

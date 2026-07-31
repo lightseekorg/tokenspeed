@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Model recipes and pool construction for Flat LCM cache arenas."""
+"""Model recipes and pool construction for LCM cache arenas."""
 
 from __future__ import annotations
 
@@ -283,7 +283,6 @@ def _prepare_kimi_k3(
     }
     reference_plan = plan_kimi_k3_lcm_cache(
         text_config,
-        flat_kvcache_enabled=True,
         tp_size=attn_config.attn_tp_size,
         mla_cache_dtype=attn_config.kv_cache_dtype,
         mla_quant_method=attn_config.kv_cache_quant_method or None,
@@ -343,7 +342,6 @@ def _prepare_kimi_k3(
     )
     target_plan = plan_kimi_k3_lcm_cache(
         text_config,
-        flat_kvcache_enabled=True,
         tp_size=attn_config.attn_tp_size,
         mla_cache_dtype=attn_config.kv_cache_dtype,
         mla_quant_method=attn_config.kv_cache_quant_method or None,

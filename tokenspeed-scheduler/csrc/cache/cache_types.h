@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
@@ -94,16 +95,17 @@ private:
 };
 
 // Per-group input for one admission. page_hashes is the request's cumulative
-// completed-page history; first_new_page_slot splits the newly completed
-// suffix used by prefix-closed groups. Non-closed groups select the trailing
-// pages required to resume num_computed_tokens. The request owns table and
-// the storage behind page_hashes.
+// completed-page history; new_page_hash_begin is the start of the hashes
+// appended since the previous admission. completed_boundary_kind is present
+// exactly when that suffix is non-empty. Non-closed groups select the trailing
+// pages required to resume num_computed_tokens. The request owns table and the
+// storage behind page_hashes.
 struct GroupDemand {
     BlockTable* table{nullptr};
     std::int32_t num_tokens{0};
     std::span<const std::string> page_hashes{};
-    std::int32_t first_new_page_slot{0};
-    CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
+    std::int32_t new_page_hash_begin{0};
+    std::optional<CacheBoundaryKind> completed_boundary_kind;
     std::int32_t num_computed_tokens{-1};
     std::int32_t reserve_tokens{0};
     // -1 materializes the ordinary dense suffix. A non-negative value keeps

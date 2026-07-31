@@ -84,7 +84,7 @@ public:
         std::vector<std::vector<std::int32_t>> new_page_ids;
     };
 
-    // ProbePrefix is read-only. Flat cache state must not change before its
+    // ProbePrefix is read-only. Cache state must not change before its
     // result is passed to Admit. Admit consumes the probe even when admission
     // fails. It returns nullopt before committing when capacity is unavailable.
     // A missing epoch starts a new request; a supplied epoch continues that
@@ -106,7 +106,7 @@ public:
                          std::uint64_t access_epoch, std::int32_t first_slot = 0,
                          CacheBoundaryKind boundary_kind = CacheBoundaryKind::kChunk);
     void ReclaimExpired(std::span<BlockTable> tables, std::int32_t num_computed_tokens);
-    void ConsumeAvailable(std::span<BlockTable> tables, std::int32_t num_tokens);
+    void ConsumeReservedTokens(std::span<BlockTable> tables, std::int32_t num_tokens);
     void Free(std::span<BlockTable> tables);
 
     struct StoreCandidate {

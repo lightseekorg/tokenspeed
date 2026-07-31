@@ -287,16 +287,23 @@ std::optional<AdmissionPlan> planAdmission(const std::vector<CacheGroup>& groups
 
 std::optional<KvCacheCoordinator::AdmissionResult> KvCacheCoordinator::Admit(
     PrefixProbe&& prefix, std::span<const GroupDemand> demands, std::optional<std::uint64_t> request_access_epoch) {
+    _assert(demands.size() == groups_.size(), "demands/groups size mismatch");
+    for (const GroupDemand& demand : demands) {
+        _assert(demand.table != nullptr, "group demand requires a block table");
+        _assert(demand.new_page_hash_begin >= 0 &&
+                    static_cast<std::size_t>(demand.new_page_hash_begin) <= demand.page_hashes.size(),
+                "new page hash begin is outside the hash history");
+        const bool has_new_page_hashes =
+            static_cast<std::size_t>(demand.new_page_hash_begin) < demand.page_hashes.size();
+        _assert(demand.completed_boundary_kind.has_value() == has_new_page_hashes,
+                "completed boundary kind must match newly completed page hashes");
+    }
+
     std::optional<AdmissionPlan> candidate = planAdmission(groups_, pool_, std::move(prefix), demands);
     if (!candidate) {
         return std::nullopt;
     }
     AdmissionPlan plan = std::move(*candidate);
-
-    _assert(demands.size() == groups_.size(), "demands/groups size mismatch");
-    for (const GroupDemand& demand : demands) {
-        _assert(demand.table != nullptr, "group demand requires a block table");
-    }
 
     if (request_access_epoch.has_value()) {
         _assert(*request_access_epoch > 0 && *request_access_epoch <= next_access_epoch_,
@@ -333,7 +340,7 @@ std::optional<KvCacheCoordinator::AdmissionResult> KvCacheCoordinator::Admit(
     }
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         const GroupDemand& demand = demands[i];
-        if (!demand.page_hashes.empty()) {
+        if (demand.completed_boundary_kind) {
             cacheCompletedBlocksForGroup(i, demand, access_epoch);
         }
         if (demand.num_computed_tokens >= 0) {
