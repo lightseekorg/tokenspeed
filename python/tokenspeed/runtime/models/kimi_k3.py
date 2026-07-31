@@ -83,6 +83,10 @@ from tokenspeed_kernel.ops.gemm import (
 from tokenspeed_kernel.ops.gemm.triton_gemv import (
     decode_gemv,
 )
+from tokenspeed_kernel.ops.moe import (
+    latent_moe_decode_pipeline_available,
+    latent_moe_expert_shared,
+)
 from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
     situ_moe_unavailable_reason,
 )
@@ -1093,9 +1097,28 @@ class KimiLinearMoE(nn.Module):
                 expert_parallel_group=mapping.moe.ep_group,
                 return_separate_outputs=True,
                 input_projections=self._fused_input_projections,
+                defer_routed_up_projection=True,
             )
             if self.execution_plan.use_native
             else None
+        )
+        self._use_joint_decode = (
+            self.native_latent_moe is not None
+            and bool(
+                getattr(
+                    self.shared_experts,
+                    "_has_unquantized_shared_weights",
+                    False,
+                )
+            )
+            and latent_moe_decode_pipeline_available(
+                self.gate.weight,
+                self.routed_expert_down_proj.weight,
+                self.shared_experts.gate_up_proj.weight,
+                self.shared_experts.down_proj.weight,
+                self.experts.plan,
+                joint_reduce=self.execution_plan.joint_moe_reduce,
+            )
         )
 
     def fuse_input_projection_weights(self) -> None:
@@ -1183,6 +1206,58 @@ class KimiLinearMoE(nn.Module):
             out = all_reduce(out, self.mapping.moe.tp_ep_group)
         return out
 
+    def _forward_native_joint_decode(
+        self,
+        hidden_states: torch.Tensor,
+        prefix_sum: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fuse K3 decode input projections and routed/shared expert execution."""
+
+        router_logits, routed_input, shared_input = moe_input_projections(
+            hidden_states,
+            self.gate.weight,
+            self.routed_expert_down_proj.weight,
+            self.shared_experts.gate_up_proj.weight,
+            gate_clamp=self.shared_experts.act_fn.beta,
+            up_clamp=self.shared_experts.act_fn.linear_beta,
+        )
+        topk_output = self.topk(hidden_states, router_logits)
+        routed_output = hidden_states.new_empty(
+            (hidden_states.shape[0], self.routed_expert_down_proj.weight.shape[0])
+        )
+        shared_output = hidden_states.new_empty(
+            (hidden_states.shape[0], self.shared_experts.down_proj.weight.shape[0])
+        )
+        routed_latent, shared_output = latent_moe_expert_shared(
+            routed_input,
+            self.experts.w13_weight,
+            self.experts.w13_weight_scale,
+            self.experts.w2_weight,
+            self.experts.w2_weight_scale,
+            topk_output.topk_weights,
+            topk_output.topk_ids,
+            shared_input,
+            self.shared_experts.down_proj.weight,
+            activation_clamp=float(self.experts.activation_situ_beta),
+            linear_clamp=self.experts.activation_situ_linear_beta,
+            expert_start=self.experts.ep_rank * self.experts.num_local_experts,
+            w13_interleaved=self.experts.w13_input_layout == "interleaved",
+            routed_out=routed_output,
+            shared_out=shared_output,
+        )
+        shared_output, routed_latent = all_reduce_two(
+            shared_output,
+            routed_latent,
+            group=self.mapping.moe.ep_group,
+        )
+        if self.routed_expert_norm is not None:
+            routed_latent = self.routed_expert_norm(routed_latent)
+        return self.routed_expert_up_proj.forward_add3(
+            routed_latent,
+            prefix_sum,
+            shared_output,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1196,12 +1271,18 @@ class KimiLinearMoE(nn.Module):
         the up-projection's store performs the accumulate in-kernel.
         """
         if self.native_latent_moe is not None:
-            routed_out, shared_out = self.native_latent_moe(
+            if self._use_joint_decode and hidden_states.shape[0] == 1:
+                return self._forward_native_joint_decode(hidden_states, prefix_sum)
+            routed_latent, shared_out = self.native_latent_moe(
                 hidden_states,
                 num_global_tokens=num_global_tokens,
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
             )
-            return add3(prefix_sum, routed_out, shared_out)
+            return self.routed_expert_up_proj.forward_add3(
+                routed_latent,
+                prefix_sum,
+                shared_out,
+            )
 
         num_tokens, hidden_size = hidden_states.shape
         if num_tokens == 0:

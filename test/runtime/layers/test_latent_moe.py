@@ -223,7 +223,7 @@ def test_kimi3_moe_execution_policy_is_selected_outside_model() -> None:
 
     with mock.patch.object(
         latent_module,
-        "kimi3_native_moe_available",
+        "native_latent_moe_available",
         return_value=True,
     ):
         plan = Kimi3MoEExecutionPlan.build(
@@ -256,7 +256,7 @@ def test_kimi3_moe_execution_policy_preserves_nvidia_trtllm() -> None:
 
     with mock.patch.object(
         latent_module,
-        "kimi3_native_moe_available",
+        "native_latent_moe_available",
         return_value=False,
     ):
         plan = Kimi3MoEExecutionPlan.build(
@@ -459,6 +459,36 @@ def test_latent_moe_can_return_separate_residual_components() -> None:
     expected_routed = torch.cat((latent, torch.zeros_like(latent)), dim=-1)
     torch.testing.assert_close(routed, expected_routed)
     torch.testing.assert_close(shared, hidden_states * 4)
+
+
+def test_latent_moe_can_defer_routed_up_projection() -> None:
+    events: list[str] = []
+    layer = _layer(
+        events,
+        routed_norm=_Trace(events, "norm"),
+        shared_experts=_Trace(events, "shared"),
+        return_separate_outputs=True,
+        defer_routed_up_projection=True,
+    )
+    hidden_states = torch.arange(12, dtype=torch.float32).view(3, 4)
+
+    routed_latent, shared = layer(hidden_states)
+
+    torch.testing.assert_close(routed_latent, hidden_states[:, :2] + 4)
+    torch.testing.assert_close(shared, hidden_states * 4)
+    assert "up" not in events
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"return_separate_outputs": False, "shared_experts": _Trace([], "shared")},
+        {"return_separate_outputs": True},
+    ],
+)
+def test_latent_moe_rejects_invalid_deferred_up_projection(kwargs) -> None:
+    with pytest.raises(ValueError, match="defer_routed_up_projection requires"):
+        _layer([], defer_routed_up_projection=True, **kwargs)
 
 
 def test_latent_moe_rejects_joint_and_individual_reducers() -> None:

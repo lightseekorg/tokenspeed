@@ -245,8 +245,11 @@ tokenspeed serve moonshotai/Kimi-K3 \
 
 On gfx950, the replicated 7168↔3584 latent projections automatically select
 among a one-token Triton GEMV, tuned Gluon GEMMs, and the vendor GEMM according
-to the current token count. The fused sigmoid-bias top-k route supports the
-full scheduled token count.
+to the current token count. At TP8/EP8, eligible one-token decode also combines
+the routed MXFP4 experts with the shared-expert down projection, then applies
+their joint reduction before the fused latent up-projection epilogue. Other
+shapes and unsupported layouts retain the ordinary composed path. The fused
+sigmoid-bias top-k route supports the full scheduled token count.
 
 ## GLM5 / GLM5.2
 
