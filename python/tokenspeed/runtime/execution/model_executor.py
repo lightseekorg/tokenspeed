@@ -589,6 +589,10 @@ class ModelExecutor:
             drafter=self.drafter,
             decode_wrapper=self.forward_step,
         )
+        # Load every prefill-shaped kernel (and give lazy autotuners the max
+        # prefill bucket) before freeze_autotuning() below; serving must never
+        # first-execute a kernel. No-op when graph capture already ran.
+        self.prefill_graph.warmup_eager(self.forward_step)
 
         # Encoder CUDA graph: install model-built wrappers by overriding
         # modality encoder callables (e.g. ``image_encoder``, ``video_encoder``).

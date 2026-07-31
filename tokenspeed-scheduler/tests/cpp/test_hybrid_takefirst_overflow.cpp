@@ -140,15 +140,6 @@ protected:
         PlanOnce();
         PlanOnce();
     }
-
-    void SendReserveNumTokens(const std::string& id, std::int32_t n) {
-        ExecutionEvent event;
-        event.With(ForwardEvent{forward::UpdateReserveNumTokens{
-            .request_id = id,
-            .reserve_num_tokens_in_next_schedule_event = n,
-        }});
-        scheduler_->Advance(std::move(event));
-    }
 };
 
 // A device prefix deeper than the tokens drives alloc_count negative; scheduleRetract must skip, not TakeFirst(<0).

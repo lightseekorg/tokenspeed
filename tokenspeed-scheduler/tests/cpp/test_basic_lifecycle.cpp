@@ -29,13 +29,6 @@ protected:
         cfg.enable_l3_storage = false;
         return cfg;
     }
-
-    static const FlatForwardOperation* GetForwardOp(const ExecutionPlan& plan) {
-        for (const auto& op : plan.Operations()) {
-            if (auto* f = std::get_if<FlatForwardOperation>(&op)) return f;
-        }
-        return nullptr;
-    }
 };
 
 TEST_F(BasicLifecycleTestSuite, Submit_CreatesWaitingRequest) {
