@@ -137,7 +137,7 @@ def test_b200v2_setup_forces_all_apt_invocations_to_ipv4(tmp_path, capsys):
 
     output = capsys.readouterr().out
     assert (
-        "Acquire::ForceIPv4 \"true\";"
+        'Acquire::ForceIPv4 "true";'
         "' | sudo tee /etc/apt/apt.conf.d/99tokenspeed-force-ipv4"
     ) in output
 
