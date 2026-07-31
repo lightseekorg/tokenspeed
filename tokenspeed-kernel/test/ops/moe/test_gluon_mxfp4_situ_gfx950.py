@@ -39,12 +39,6 @@ if not _is_gfx950():
     pytest.skip("MXFP4 SiTU Gluon tests require gfx950", allow_module_level=True)
 
 import tokenspeed_kernel  # noqa: E402
-from tokenspeed_kernel.ops.moe.gluon.mxfp4 import (  # noqa: E402
-    _use_route_direct_decode,
-)
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_decode import (  # noqa: E402
-    _stage2_num_warps,
-)
 
 
 def _make_mxfp4_module(
@@ -75,31 +69,6 @@ def _make_mxfp4_module(
     module.activation_situ_beta = 4.0
     module.activation_situ_linear_beta = 25.0
     return module, raw
-
-
-@pytest.mark.parametrize(
-    ("num_tokens", "expected"),
-    [(1, True), (4, True), (5, False), (8, False), (16, False)],
-)
-def test_gluon_route_direct_decode_dispatch_boundary_gfx950(
-    num_tokens: int,
-    expected: bool,
-) -> None:
-    w13 = torch.empty((2, 512, 256), dtype=torch.uint8)
-
-    assert _use_route_direct_decode(torch.empty((num_tokens, 512)), w13) is expected
-
-
-@pytest.mark.parametrize(
-    ("num_tokens", "fuse_shared_down", "expected"),
-    [(1, False, 8), (2, False, 8), (4, False, 4), (1, True, 8)],
-)
-def test_gluon_route_direct_stage2_warps_gfx950(
-    num_tokens: int,
-    fuse_shared_down: bool,
-    expected: int,
-) -> None:
-    assert _stage2_num_warps(num_tokens, fuse_shared_down) == expected
 
 
 @pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 16])

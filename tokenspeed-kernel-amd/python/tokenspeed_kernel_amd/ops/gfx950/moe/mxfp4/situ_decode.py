@@ -59,13 +59,6 @@ _KIMI3_SHARED_K = gl.constexpr(768)
 _KIMI3_SHARED_BLOCK_K = gl.constexpr(512)
 
 
-def _stage2_num_warps(num_tokens: int, fuse_shared_down: bool) -> int:
-    """Select the measured routed W2 wave count for a decode shape."""
-    if num_tokens == 4 and not fuse_shared_down:
-        return WARP_DECODE_STAGE2_M4_NUM_WARPS
-    return WARP_DECODE_STAGE2_NUM_WARPS
-
-
 def _largest_exact_block_kb(packed_k: int, max_block_kb: int) -> int:
     """Select the widest power-of-two K tile that does not need masking."""
 
@@ -649,10 +642,12 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
         packed_intermediate,
         WARP_DECODE_STAGE2_BLOCK_KB,
     )
-    # Four waves reduce launch occupancy at M=4 and improve the routed W2
-    # kernel. M=1 and M=2 retain eight waves, which are faster at those shapes
-    # and are also used by the M=1 joint routed/shared launch.
-    stage2_warps = _stage2_num_warps(num_tokens, fuse_shared_down)
+    # Smaller shapes and the M=1 joint path remain faster with eight waves.
+    stage2_warps = (
+        WARP_DECODE_STAGE2_M4_NUM_WARPS
+        if num_tokens == 4 and not fuse_shared_down
+        else WARP_DECODE_STAGE2_NUM_WARPS
+    )
     if hidden_dim % stage2_block_n or packed_intermediate % stage2_block_kb:
         raise ValueError("unmasked stage2 requires exact N and packed-K tiles")
     stage2_grid = num_tokens * triton.cdiv(hidden_dim, stage2_block_n)

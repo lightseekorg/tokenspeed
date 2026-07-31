@@ -31,28 +31,9 @@ from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
 
-# Captured TP8/EP8 Kimi K3 execution crosses from route-direct warp GEMV to
-# grouped MFMA between M=4 and M=8. A standalone single-rank kernel sweep puts
-# the crossover much later, but extending that result regresses model TPOT at
-# both M=8 and M=16. Keep production selection tied to the model measurement.
+# TP8/EP8 model measurements favor warp GEMV through M=4 and grouped MFMA
+# above it, despite a later crossover in isolated kernel measurements.
 _ROUTE_DIRECT_DECODE_MAX_TOKENS = 4
-
-
-def _use_route_direct_decode(
-    x: torch.Tensor,
-    w13_weight: torch.Tensor,
-) -> bool:
-    """Return whether a K3-shaped activation should use routed warp GEMV."""
-    two_intermediate = int(w13_weight.shape[1])
-    intermediate = two_intermediate // 2
-    return (
-        0 < x.shape[0] <= _ROUTE_DIRECT_DECODE_MAX_TOKENS
-        and x.is_contiguous()
-        and x.shape[1] % 256 == 0
-        and two_intermediate % 2 == 0
-        and intermediate % 256 == 0
-        and int(w13_weight.shape[2]) * 2 == x.shape[1]
-    )
 
 
 if platform.is_amd:
@@ -160,9 +141,18 @@ if platform.is_amd:
             raise ValueError("gfx950 A16W4 Gluon MoE cannot defer finalization")
         if topk_weights is None or topk_ids is None:
             raise ValueError("gfx950 A16W4 Gluon MoE requires precomputed top-k")
+        two_intermediate = int(w.w13_weight.shape[1])
+        intermediate = two_intermediate // 2
         num_local_experts = int(getattr(w, "num_local_experts", w.w13_weight.shape[0]))
         expert_start = int(getattr(w, "ep_rank", 0)) * num_local_experts
-        use_route_direct_decode = _use_route_direct_decode(x, w.w13_weight)
+        use_route_direct_decode = (
+            0 < x.shape[0] <= _ROUTE_DIRECT_DECODE_MAX_TOKENS
+            and x.is_contiguous()
+            and x.shape[1] % 256 == 0
+            and two_intermediate % 2 == 0
+            and intermediate % 256 == 0
+            and int(w.w13_weight.shape[2]) * 2 == x.shape[1]
+        )
         if use_route_direct_decode:
             from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_decode import (
                 gluon_a16w4_situ_warp_decode_ep_gfx950,
@@ -170,8 +160,8 @@ if platform.is_amd:
 
             # Consume the Gluon plan's linear checkpoint layout directly. EP
             # localization stays inside both route-direct stages, avoiding the
-            # four pointwise kernels in ``_local_topk_for_ep``. Batches above
-            # the measured M=4 model crossover retain grouped MFMA below.
+            # four pointwise kernels in ``_local_topk_for_ep``. Larger batches
+            # retain the grouped MFMA path below.
             return gluon_a16w4_situ_warp_decode_ep_gfx950(
                 x,
                 w.w13_weight,
