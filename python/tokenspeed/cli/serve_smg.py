@@ -45,6 +45,7 @@ from tokenspeed.cli._proc import (
     wait_grpc_serving,
     wait_http_ready,
 )
+from tokenspeed.runtime.utils.launcher import detect_topology
 from tokenspeed.runtime.utils.network import get_free_port
 from tokenspeed.runtime.utils.process import kill_process_tree
 
@@ -702,7 +703,13 @@ def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
     user_host = _get_from_args(gateway_args, "--host", DEFAULT_GATEWAY_HOST)
     user_port = int(_get_from_args(gateway_args, "--port", str(DEFAULT_GATEWAY_PORT)))
 
-    node_rank = int(_get_from_args(engine_args, "--node-rank", "0"))
+    node_rank = _get_from_args(engine_args, "--node-rank")
+    if node_rank is None:
+        topology = detect_topology()
+        node_rank = 0 if topology is None else topology.node_rank
+    else:
+        node_rank = int(node_rank)
+
     if node_rank == 0:
         model_id = _get_from_args(gateway_args, "--model")
         if model_id is not None:
