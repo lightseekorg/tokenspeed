@@ -2120,12 +2120,18 @@ class PortArgs:
         dist_init_host, dist_init_port = dist_init_addr
         dist_init_port = int(dist_init_port)
 
-        # Scan forward until we find a port cluster where all derived ports are free.
-        # This handles the case where a previous engine instance left ports in
-        # TIME_WAIT or its child processes haven't fully terminated yet.
-        # Note: the port at offset +1 (formerly detokenizer_port) is intentionally
-        # skipped so the rest of the port layout stays stable for any external
-        # tooling that indexed off the historical port cluster.
+        # Scan forward until we find a port cluster where all derived ports are
+        # free. This handles the case where a previous engine instance left
+        # ports in TIME_WAIT or its child processes haven't fully terminated
+        # yet. Note: the port at offset +1 (formerly detokenizer_port) is
+        # intentionally skipped so the rest of the port layout stays stable for
+        # any external tooling that indexed off the historical port cluster.
+        #
+        # The whole cluster is bound on node 0 alone, so scanning is only
+        # meaningful there: is_port_available binds the local wildcard, and a
+        # follower moving its own base would simply address ports the head
+        # never bound. Multi-node therefore takes the cluster as derived and
+        # reports a conflict instead of relocating it.
         while True:
             port_base = dist_init_port + 1
             rpc_port = port_base + 2
@@ -2136,17 +2142,26 @@ class PortArgs:
             else:
                 scheduler_input_port = port_base + 2 + 1 + dp_rank
             rpc_ipc_port = scheduler_input_port + 1
-            if all(
-                is_port_available(p)
-                for p in [
-                    dist_init_port,
-                    port_base,
-                    rpc_port,
-                    metrics_ipc_port,
-                    scheduler_input_port,
-                    rpc_ipc_port,
-                ]
-            ):
+            cluster = [
+                dist_init_port,
+                port_base,
+                rpc_port,
+                metrics_ipc_port,
+                scheduler_input_port,
+                rpc_ipc_port,
+            ]
+            if server_args.mapping.nnodes > 1:
+                if server_args.node_rank == 0:
+                    busy = [p for p in cluster if not is_port_available(p)]
+                    if busy:
+                        raise ValueError(
+                            f"control-plane ports {busy} are already in use on the "
+                            "head node. Every node derives this cluster from "
+                            "--dist-init-addr, so it cannot be moved on one node "
+                            "alone; restart with a different --dist-init-addr port."
+                        )
+                break
+            if all(is_port_available(p) for p in cluster):
                 break
             dist_init_port += 10
 
