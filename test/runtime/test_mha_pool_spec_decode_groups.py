@@ -6,17 +6,10 @@ paged_cache_group_specs iff the tokenspeed_scheduler ext is flat-built
 decoding does not gate publication (flat+spec is supported); backend
 capability is checked separately by validate_flat_scheduler_config.
 
-Two pool families live here because they share that one rule:
-
-- MHA (gpt-oss style): one group per distinct (retention, window), so
-  hybrid full+sliding models publish two.
-- MLA and its DSA subclass (Kimi-K2.5, GLM-5.2): uniform full-history
-  attention, so always exactly ONE "full_attention" group. That single
-  group is what makes them servable on a flat ext at all -- the flat
-  build's req_to_page fallback is a group-0 sample
-  (csrc/fsm/forward_states.h GetOccupiedPages), exact only when one group
-  exists, which is why the table-blind tokenspeed_mla / DSABackend need no
-  per-group flat tables.
+Two pool families share that rule: MHA publishes one group per distinct
+(retention, window); MLA and its DSA subclass are uniform full-history, so
+always exactly ONE "full_attention" group -- which is what makes them
+servable on a flat ext at all (its req_to_page fallback samples group 0).
 
 The installed ext's real build flavor must not decide these tests, so the
 scheduler_ext_flat_kvcache probe is patched per case; the probe's own
@@ -224,13 +217,10 @@ class MLAPoolGroupPublicationTest(unittest.TestCase):
 class FlatHostTierAutoDisableTest(unittest.TestCase):
     """Default ServerArgs + flat ext + MLA/DSA pool must still be servable.
 
-    KVStore has no --enable flag: _handle_kvstore turns it ON for every role
-    but decode/encode, so the DEFAULT K2.5 / GLM-5.2 command line arrives with
-    enable_kvstore=True. The flat host tier cannot mirror a fused latent
-    kv_buffer, so startup auto-disables L2 rather than refusing to serve. This
-    test pins the real default (not a hand-built ServerArgs) against the real
-    pool, because the regression it guards is exactly "default command line
-    fails".
+    KVStore has no --enable flag, so the DEFAULT K2.5 / GLM-5.2 command line
+    arrives with enable_kvstore=True and startup must downgrade L2 rather than
+    refuse. Uses the real default args, since the regression is exactly
+    "default command line fails".
     """
 
     def setUp(self):
@@ -317,6 +307,153 @@ class FlatHostTierAutoDisableTest(unittest.TestCase):
                 enable_alt_stream=False,
             )
         self.assertIsNone(self.reason(pool))
+
+    def test_l3_verdict_ignores_enable_kvstore(self):
+        # make_config derives enable_l3_storage from --kvstore-storage-backend
+        # ALONE, so the rejection must not be coupled to the L2 flag. These are
+        # the two ways enable_kvstore ends up False while a storage backend is
+        # still configured -- both must still be rejected.
+        from tokenspeed.runtime.configs.paged_cache_spec import (
+            flat_l3_storage_unsupported_reason,
+        )
+
+        for argv in (
+            [
+                "some-model",
+                "--disable-kvstore",
+                "--kvstore-storage-backend",
+                "mooncake",
+            ],
+            [
+                "some-model",
+                "--disaggregation-mode",
+                "decode",
+                "--kvstore-storage-backend",
+                "mooncake",
+            ],
+        ):
+            args = self.prepare_server_args(argv)
+            self.assertFalse(args.enable_kvstore, argv)
+            # The state the scheduler would otherwise be handed: L2 off, L3 on.
+            self.assertTrue(args.kvstore_storage_backend is not None, argv)
+            self.assertIsNotNone(flat_l3_storage_unsupported_reason(args), argv)
+
+    def test_l3_verdict_is_none_without_a_storage_backend(self):
+        # L3 is opt-in, so the default command line (and the plain
+        # --disable-kvstore case) must stay servable.
+        from tokenspeed.runtime.configs.paged_cache_spec import (
+            flat_l3_storage_unsupported_reason,
+        )
+
+        for argv in (["some-model"], ["some-model", "--disable-kvstore"]):
+            args = self.prepare_server_args(argv)
+            self.assertIsNone(args.kvstore_storage_backend, argv)
+            self.assertIsNone(flat_l3_storage_unsupported_reason(args), argv)
+
+    def test_l3_guard_is_not_nested_under_enable_kvstore(self):
+        # The bug this replaces a string-ordering check for: the guard used to
+        # sit inside `if ... and server_args.enable_kvstore:`. Walk the AST and
+        # assert no enclosing test of the L3 raise mentions enable_kvstore.
+        import ast
+        import inspect
+        import textwrap
+
+        from tokenspeed.runtime.engine import event_loop as _el
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(_el.EventLoop.__init__)))
+
+        parents = {
+            child: node
+            for node in ast.walk(tree)
+            for child in ast.iter_child_nodes(node)
+        }
+
+        def enclosing_if_tests(node):
+            """Tests of every `if` this statement sits in the body/orelse of."""
+            tests, prev, cur = [], node, parents.get(node)
+            while cur is not None:
+                if isinstance(cur, ast.If) and (prev in cur.body or prev in cur.orelse):
+                    tests.append(cur.test)
+                prev, cur = cur, parents.get(cur)
+            return tests
+
+        def gated_by_enable_kvstore(node) -> bool:
+            return any(
+                isinstance(n, ast.Attribute) and n.attr == "enable_kvstore"
+                for test in enclosing_if_tests(node)
+                for n in ast.walk(test)
+            )
+
+        # Anchor on the helper CALL, not the message text: matching wording let
+        # a reworded -- or entirely deleted -- guard pass on an empty set.
+        assigns = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Call)
+            and getattr(node.value.func, "id", None)
+            == "flat_l3_storage_unsupported_reason"
+        ]
+        self.assertTrue(
+            assigns, "EventLoop must call flat_l3_storage_unsupported_reason"
+        )
+        verdicts = {
+            t.id for node in assigns for t in node.targets if isinstance(t, ast.Name)
+        }
+        self.assertTrue(verdicts, "the helper's result must be bound to a name")
+
+        def positive_branch(node: ast.If):
+            """Branch taken when the verdict is truthy, or None if the test
+            shape is unrecognized -- fail closed rather than stop checking."""
+            test = node.test
+            if (
+                isinstance(test, ast.Compare)
+                and isinstance(test.left, ast.Name)
+                and test.left.id in verdicts
+                and len(test.ops) == 1
+                and isinstance(test.comparators[0], ast.Constant)
+                and test.comparators[0].value is None
+            ):
+                if isinstance(test.ops[0], ast.IsNot):
+                    return node.body
+                if isinstance(test.ops[0], ast.Is):
+                    return node.orelse
+            elif isinstance(test, ast.Name) and test.id in verdicts:
+                return node.body
+            elif (
+                isinstance(test, ast.UnaryOp)
+                and isinstance(test.op, ast.Not)
+                and isinstance(test.operand, ast.Name)
+                and test.operand.id in verdicts
+            ):
+                return node.orelse
+            return None
+
+        # The raise must sit DIRECTLY in the verdict's truthy branch: "some
+        # Raise somewhere under the if" would also accept an inverted test or
+        # an unrelated nested raise.
+        guards = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.If)
+            and any(isinstance(s, ast.Raise) for s in (positive_branch(node) or []))
+        ]
+        self.assertTrue(
+            guards,
+            "the L3 verdict's truthy branch must raise, not merely be computed",
+        )
+
+        # Both halves matter: gating the ASSIGNMENT on enable_kvstore leaves the
+        # verdict None whenever L2 is off, which is the original bypass wearing
+        # a different shape.
+        offenders = [
+            ast.dump(node) for node in assigns + guards if gated_by_enable_kvstore(node)
+        ]
+        self.assertEqual(
+            offenders,
+            [],
+            "neither the L3 verdict nor its raise may be gated on enable_kvstore",
+        )
 
     def test_contract_pool_is_left_to_its_own_guard(self):
         # Kimi-K3's FlatHybridCachePool has a dedicated message; this helper

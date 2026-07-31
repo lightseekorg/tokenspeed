@@ -119,18 +119,11 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         else:
             self._kv_copy_config = None
 
-        # MLA (and its DSA subclass) is uniform full-history attention: every
-        # layer reads the same latent cache, so the pool publishes exactly ONE
-        # paged-cache group. That single group is what makes the flat
-        # scheduler usable here -- the flat build's req_to_page fallback is a
-        # group-0 sample (fsm/forward_states.h GetOccupiedPages), which is
-        # exact when there is only one group, so the table-blind MLA/DSA
-        # backends keep reading the correct pages without consuming per-group
-        # flat tables. Publishing nothing would instead trip
-        # validate_flat_scheduler_config's "requires at least one paged-cache
-        # group" guard and make every MLA model unservable on a flat ext.
-        # Publication rule lives in paged_cache_spec.publish_paged_cache_groups
-        # (module-attr call so tests can patch the flat-ext probe at call time).
+        # MLA/DSA is uniform full-history attention, so exactly ONE group.
+        # That is what makes the flat scheduler usable here: its req_to_page
+        # fallback is a group-0 sample (fsm/forward_states.h GetOccupiedPages),
+        # exact with one group, so the table-blind MLA/DSA backends read the
+        # right pages without consuming per-group tables.
         published = paged_cache_spec.publish_paged_cache_groups(
             layer_types=(),
             sliding_window_tokens=None,

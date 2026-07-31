@@ -173,7 +173,16 @@ class FlatCacheGroupsMixin:
         """Record the pool's family="state" group ids (see
         flat_state_group_ids) and per-group page sizes (heterogeneous block
         sizes); called from init_cuda_graph_state, the one place the pool's
-        specs reach every backend."""
+        specs reach every backend.
+
+        A backend that opted out on this instance (DFLASH block decode)
+        records nothing, so no capture stack is allocated and the replay
+        stale guard stays quiet.
+        """
+        if not getattr(self, "uses_flat_cache_groups", False):
+            self.flat_state_group_ids = frozenset()
+            self.flat_group_page_sizes = {}
+            return
         self.flat_state_group_ids = frozenset(
             str(spec.group_id)
             for spec in paged_cache_group_specs

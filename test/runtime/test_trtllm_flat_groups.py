@@ -392,6 +392,229 @@ class TRTLLMFlatGroupsTest(unittest.TestCase):
             )
 
 
+class TRTLLMMixedExtendRowsTest(unittest.TestCase):
+    """MIXED packs extend rows first, so the prefill slot covers only those.
+
+    Passing bs straight through made ``seq_lens - extend_prefix_lens`` a shape
+    error once a mixed batch also carried a prefix-cache hit.
+    """
+
+    def setUp(self):
+        try:
+            from tokenspeed.runtime.layers.attention.backends.trtllm import (
+                TRTLLMMHAAttnBackend,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+        import torch
+
+        self.torch = torch
+        self.Backend = TRTLLMMHAAttnBackend
+
+    def _backend(self, *, max_num_pages=8, page_size=64):
+        b = self.Backend.__new__(self.Backend)
+        b.page_size = page_size
+        b.max_num_pages = max_num_pages
+        b.max_context_len = page_size * max_num_pages
+        b.device = "cpu"
+        b.spec_num_tokens = 1
+        b.is_draft = True
+        b.draft_block_decode = False
+        b.uses_flat_cache_groups = False
+        b.flat_group_page_sizes = {}
+        b.flat_state_group_ids = frozenset()
+        b.forward_decode_metadata = None
+        b.forward_prefill_metadata = None
+        b.cuda_graph_prefill_metadata = {}
+        b.cuda_graph_decode_metadata = {}
+        b.page_table_buf = self.torch.zeros((8, max_num_pages), dtype=self.torch.int32)
+        return b
+
+    def test_mixed_batch_prefill_metadata_covers_extend_rows_only(self):
+        t = self.torch
+        b = self._backend()
+        bs, num_extends = 3, 2  # 2 extends + 1 decode
+        # Extends carry a prefix-cache hit (the trigger for the subtraction).
+        b._init_extend_metadata(
+            num_extends,
+            req_pool_indices=t.tensor([0, 1, 2], dtype=t.int32),
+            seq_lens=t.tensor([40, 50, 900], dtype=t.int32),
+            req_to_page=t.zeros((4, 8), dtype=t.int32),
+            extend_with_prefix=True,
+            extend_prefix_lens=t.tensor([10, 20], dtype=t.int32),
+            extend_prefix_lens_cpu=t.tensor([10, 20], dtype=t.int32),
+            extend_seq_lens_cpu=t.tensor([30, 30], dtype=t.int32),
+        )
+        md = b.forward_prefill_metadata
+        # The decode row's length (900) must not leak into the prefill slot.
+        self.assertEqual(md.cache_seqlens_int32.tolist(), [40, 50])
+        # cu_seqlens_q = cumsum(seq_lens - prefix) over extend rows only.
+        self.assertEqual(md.cu_seqlens_q.tolist(), [0, 30, 60])
+        self.assertEqual(md.cu_seqlens_k.tolist(), [0, 40, 90])
+        _ = bs  # documented above; the point is bs is NOT what gets used
+
+    def test_pure_extend_is_unchanged(self):
+        t = self.torch
+        b = self._backend()
+        b._init_extend_metadata(
+            2,
+            req_pool_indices=t.tensor([0, 1], dtype=t.int32),
+            seq_lens=t.tensor([40, 50], dtype=t.int32),
+            req_to_page=t.zeros((4, 8), dtype=t.int32),
+            extend_with_prefix=True,
+            extend_prefix_lens=t.tensor([10, 20], dtype=t.int32),
+            extend_prefix_lens_cpu=t.tensor([10, 20], dtype=t.int32),
+            extend_seq_lens_cpu=t.tensor([30, 30], dtype=t.int32),
+        )
+        md = b.forward_prefill_metadata
+        self.assertEqual(md.cache_seqlens_int32.tolist(), [40, 50])
+        self.assertEqual(md.cu_seqlens_q.tolist(), [0, 30, 60])
+
+
+class DFlashFlatOptOutTest(unittest.TestCase):
+    """DFLASH reads page tables from req_to_page, so its draft backend clears
+    uses_flat_cache_groups and records no flat groups -- otherwise capture
+    hands it group ids and replay's stale guard demands tables it never gets."""
+
+    def setUp(self):
+        try:
+            from tokenspeed.runtime.configs.paged_cache_spec import (
+                PagedCacheGroupSpec,
+            )
+            from tokenspeed.runtime.layers.attention.backends.flat_groups import (
+                FlatCacheGroupsMixin,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs the tokenspeed runtime deps: {exc}")
+        self.Mixin = FlatCacheGroupsMixin
+        self.Spec = PagedCacheGroupSpec
+
+    def _specs(self):
+        return (
+            self.Spec(
+                group_id="full_attention",
+                retention="full_history",
+                rows_per_page=64,
+                entry_stride_tokens=1,
+                sliding_window_tokens=None,
+            ),
+        )
+
+    def test_opted_out_backend_records_no_groups(self):
+        class Host(self.Mixin):
+            uses_flat_cache_groups = False
+
+        h = Host()
+        h._learn_flat_state_groups(self._specs())
+        self.assertEqual(h.flat_group_page_sizes, {})
+        self.assertEqual(h.flat_state_group_ids, frozenset())
+
+    def test_flat_capable_backend_still_records_groups(self):
+        class Host(self.Mixin):
+            uses_flat_cache_groups = True
+
+        h = Host()
+        h._learn_flat_state_groups(self._specs())
+        self.assertEqual(h.flat_group_page_sizes, {"full_attention": 64})
+
+    def _mha_config(self, **overrides):
+        import torch
+
+        from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+
+        kwargs = dict(
+            device="cpu",
+            backend_name="mha",
+            num_attention_heads=4,
+            num_kv_heads=4,
+            head_dim=8,
+            attn_tp_size=1,
+            dtype=torch.bfloat16,
+            kv_cache_dtype=torch.bfloat16,
+            page_size=64,
+            context_len=256,
+            max_bs=2,
+            max_graph_bs=2,
+            kv_cache_quant_method="none",
+            speculative_num_draft_tokens=1,
+            draft_block_decode=False,
+            is_draft=False,
+        )
+        kwargs.update(overrides)
+        return MHAConfig(**kwargs)
+
+    def test_real_backends_clear_the_flag_under_dflash(self):
+        # Instantiate for real: the opt-out lives in __init__, so a class-level
+        # assertion would prove nothing.
+        try:
+            from tokenspeed.runtime.layers.attention.backends.mha import (
+                MHAAttnBackend,
+            )
+            from tokenspeed.runtime.layers.attention.backends.trtllm import (
+                TRTLLMMHAAttnBackend,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+        dflash = self._mha_config(
+            draft_block_decode=True, is_draft=True, speculative_num_draft_tokens=8
+        )
+        plain = self._mha_config()
+        for cls in (MHAAttnBackend, TRTLLMMHAAttnBackend):
+            self.assertFalse(
+                cls(dflash).uses_flat_cache_groups,
+                f"{cls.__name__} must opt out of flat groups under DFLASH",
+            )
+            self.assertTrue(
+                cls(plain).uses_flat_cache_groups,
+                f"{cls.__name__} must stay flat-capable otherwise",
+            )
+
+    def test_msa_wrapper_follows_its_halves(self):
+        # MSAHybridAttnBackend fans the same kwargs (and flat_cache_group_ids)
+        # out to BOTH halves, so it must not advertise flat capability while a
+        # half has opted out -- constructing the real wrapper needs a MiniMax
+        # config, so drive the delegation directly.
+        try:
+            from tokenspeed.runtime.layers.attention.backends.msa import (
+                MSAHybridAttnBackend,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+
+        class _Half:
+            def __init__(self, flat):
+                self.uses_flat_cache_groups = flat
+
+        w = MSAHybridAttnBackend.__new__(MSAHybridAttnBackend)
+        for dense, sparse, expected in (
+            (True, True, True),
+            (False, True, False),  # DFLASH cleared the dense half
+            (True, False, False),  # ... or the sparse half
+            (False, False, False),
+        ):
+            w.full_attn_backend = _Half(dense)
+            w.sparse_attn_backend = _Half(sparse)
+            self.assertEqual(w.uses_flat_cache_groups, expected, (dense, sparse))
+
+    def test_gdn_kda_hybrid_wrapper_keeps_its_union_declaration(self):
+        # Deliberately NOT the same rule: that wrapper's halves cover different
+        # families (full attention -> history, mamba -> state) and its flag is
+        # a union declared on their behalf -- MambaAttnBackend never sets one.
+        # An `and` there would read False and break Kimi-K3 / Qwen3.5 on flat.
+        try:
+            from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (  # noqa: E501
+                HybridLinearAttnBackend,
+                MambaAttnBackend,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+        self.assertTrue(HybridLinearAttnBackend.uses_flat_cache_groups)
+        self.assertFalse(
+            getattr(MambaAttnBackend, "uses_flat_cache_groups", False),
+            "mamba half declares nothing; the union lives on the wrapper",
+        )
+
+
 class _DecodeMode:
     """Minimal ForwardMode stand-in for the decode dispatch path."""
 

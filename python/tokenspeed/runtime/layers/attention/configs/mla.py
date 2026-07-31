@@ -42,10 +42,9 @@ class MLAConfig(BaseAttnConfig):
     scaling: float
     kv_cache_dim: int
     layer_types: tuple[str, ...] = field(default=(), kw_only=True)
-    # Per-step token budget, forwarded to the KV pool for paged-cache group
-    # publication sizing (mirrors MHAConfig). MLA/DSA publish a single
-    # full-history group, whose sizing does not read this value today; it is
-    # plumbed so the canonical publication API is called with real inputs.
+    # Per-step token budget for paged-cache group publication sizing (mirrors
+    # MHAConfig). kw_only: MLAConfig is a positional dataclass, so a defaulted
+    # field here would sit ahead of DSAConfig's required index_* fields.
     max_scheduled_tokens: int = field(default=0, kw_only=True)
     pd_disaggregation_enabled: bool = field(default=False, kw_only=True)
 

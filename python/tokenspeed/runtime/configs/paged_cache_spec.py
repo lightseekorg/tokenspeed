@@ -81,22 +81,15 @@ def preflight_kimi_k3_flat_consumers(*model_configs: object | None) -> None:
 def flat_host_tier_unsupported_reason(kv_pool: object) -> str | None:
     """Why the flat host tier (kvstore L2) cannot mirror ``kv_pool``, or None.
 
-    ``FlatHostMirror`` describes a device pool as one (k, v) tensor pair per
-    layer (``cache/flat_host_mirror.py``), and ``FlatMemoryExecutor`` sizes
-    itself off ``len(device_pool.k_buffer)``. MLA and its DSA subclass keep a
-    single fused latent ``kv_buffer`` (plus DSA's packed index-K) instead, so
-    that mirror cannot describe them.
-
-    Contract pools (Kimi-K3 ``FlatHybridCachePool``) are deliberately NOT
-    reported here: they have their own dedicated startup guard, and their
-    raw-slab layout is a separate gap with its own message.
+    ``FlatHostMirror`` needs one (k, v) tensor pair per layer; MLA/DSA keep a
+    single fused latent ``kv_buffer``. Contract pools (Kimi-K3) return None --
+    they have their own guard with a more specific message.
 
     Args:
         kv_pool: The device KV pool the flat host tier would mirror.
 
     Returns:
-        A human-readable reason string when the host tier is impossible for
-        this pool, else None.
+        A reason string when the host tier is impossible, else None.
     """
     if getattr(kv_pool, "runtime_contract", None) is not None:
         return None
@@ -107,6 +100,27 @@ def flat_host_tier_unsupported_reason(kv_pool: object) -> str | None:
             "describes"
         )
     return None
+
+
+def flat_l3_storage_unsupported_reason(server_args: object) -> str | None:
+    """Why the flat build cannot honor an L3 storage-tier request, or None.
+
+    L3 rides ``--kvstore-storage-backend`` alone, independent of
+    ``enable_kvstore``, so callers must not gate this on the L2 flag.
+
+    Args:
+        server_args: Serving arguments; only ``kvstore_storage_backend`` is read.
+
+    Returns:
+        A reason string when an L3 tier was requested, else None.
+    """
+    backend = getattr(server_args, "kvstore_storage_backend", None)
+    if backend is None:
+        return None
+    return (
+        f"--kvstore-storage-backend={backend} asks for an L3 storage tier, "
+        "which the flat scheduler build does not have"
+    )
 
 
 def scheduler_ext_flat_kvcache() -> bool:
@@ -287,12 +301,6 @@ def validate_flat_scheduler_config(
             "flat scheduler build (TOKENSPEED_FLAT_KVCACHE): attention backend "
             f"{backend_name} does not support flat cache groups with "
             "speculative decoding yet. Use the MHA backend or a radix-built "
-            "tokenspeed_scheduler extension."
-        )
-    if speculative_algorithm == "DFLASH":
-        raise RuntimeError(
-            "flat scheduler build (TOKENSPEED_FLAT_KVCACHE): DFLASH block "
-            "decode is unsupported on the flat path. Use a radix-built "
             "tokenspeed_scheduler extension."
         )
     if len(paged_cache_groups) > 1 and not uses_flat and contract is None:
@@ -805,6 +813,7 @@ __all__ = [
     "compute_max_logical_pages_for_capture",
     "compute_paged_cache_group_page_counts",
     "flat_host_tier_unsupported_reason",
+    "flat_l3_storage_unsupported_reason",
     "group_specs_from_layer_types",
     "hybrid_slab_group_size",
     "layer_group_ids",

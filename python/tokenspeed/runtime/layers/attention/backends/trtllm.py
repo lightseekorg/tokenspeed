@@ -200,6 +200,12 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         # target verify and ordinary trtllm decode are untouched.
         self.draft_block_decode = bool(getattr(config, "draft_block_decode", False))
 
+        if self.draft_block_decode and self.spec_num_tokens > 1:
+            # DFLASH reads page tables from req_to_page (replicated per block
+            # row), not from flat per-group tables. Declaring it once here
+            # switches off the groups, capture buffers and replay guard together.
+            self.uses_flat_cache_groups = False
+
     # ------------------------------------------------------------------
     # Page table helpers
     # ------------------------------------------------------------------
@@ -404,6 +410,7 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
         req_to_page: torch.Tensor,
+        num_extends: int = 0,
         extend_with_prefix: bool = False,
         extend_prefix_lens: torch.Tensor | None = None,
         extend_prefix_lens_cpu: torch.Tensor | None = None,
@@ -441,8 +448,12 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             flat_page_tables = self._flat_kernel_page_tables(flat_page_tables)
 
         if forward_mode.is_extend_or_mixed():
+            # MIXED packs extend rows first: the prefill slot covers those
+            # only, since extend_prefix_lens/_cpu span num_extends while
+            # seq_lens spans bs. Pure EXTEND unchanged (num_extends == bs).
+            extend_rows = num_extends if forward_mode.is_mixed() else bs
             self._init_extend_metadata(
-                bs,
+                extend_rows,
                 req_pool_indices,
                 seq_lens,
                 req_to_page,
@@ -684,7 +695,12 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         assert (
             extend_seq_lens_cpu is not None
         ), "trtllm extend requires extend_seq_lens_cpu (pinned-CPU mirror) to avoid GPU sync"
-        cache_seqlens_int32 = seq_lens[:bs]
+        # Trim to the extend rows up front (mirrors mha.py): on MIXED the
+        # caller's seq_lens covers decode rows the tensors below must not see.
+        seq_lens = seq_lens[:bs]
+        if extend_prefix_lens is not None:
+            extend_prefix_lens = extend_prefix_lens[:bs]
+        cache_seqlens_int32 = seq_lens
         cu_seqlens_k = torch.nn.functional.pad(
             torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
         )
@@ -791,10 +807,11 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         # Real tables only arrive at replay; capture records metadata views
         # into the persistent per-group buffers.
         if flat_cache_group_ids:
-            # Verify keeps [bs]-row tables + [bs*N] loc views. TODO(flat+dflash).
+            # Verify keeps [bs]-row tables + [bs*N] loc views. DFLASH opts out
+            # in __init__, so it should never be handed ids here.
             assert not (
                 self.draft_block_decode and self.spec_num_tokens > 1
-            ), "flat_cache_group_ids is unsupported with DFLASH block decode"
+            ), "DFLASH block decode must opt out of flat groups (reads req_to_page)"
         page_tables, out_cache_locs = self._flat_capture_group_views(
             bs, flat_cache_group_ids, tokens_per_req=self._flat_verify_tokens()
         )

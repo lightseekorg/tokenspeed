@@ -197,13 +197,27 @@ class ValidateFlatSchedulerConfigTest(unittest.TestCase):
             speculative_algorithm="EAGLE3",
         )
 
-    def test_flat_ext_dflash_rejected_even_on_capable_backend(self):
-        # DFLASH block decode stays asserted-out in the backends.
-        with self.assertRaisesRegex(RuntimeError, "DFLASH"):
+    def test_flat_ext_admits_dflash(self):
+        # DFLASH used to be rejected outright here. It is now supported: its
+        # block decode reads page tables from req_to_page (which the flat path
+        # mirrors from the full-attention group whenever a drafter is active),
+        # so the draft backend opts out of flat per-group tables instead --
+        # see DFlashFlatOptOutTest in test_trtllm_flat_groups.
+        _pcs.validate_flat_scheduler_config(
+            flat_kvcache_ext=True,
+            paged_cache_groups=[FakeGroup()],
+            attn_backend=FakeFlatMHABackend(),
+            kv_pool=FakeMHAPool(),
+            speculative_algorithm="DFLASH",
+        )
+
+    def test_flat_ext_dflash_still_honours_backend_spec_capability(self):
+        # Admitting DFLASH must not weaken the generic spec-capability gate.
+        with self.assertRaisesRegex(RuntimeError, "speculative decoding"):
             _pcs.validate_flat_scheduler_config(
                 flat_kvcache_ext=True,
                 paged_cache_groups=[FakeGroup()],
-                attn_backend=FakeFlatMHABackend(),
+                attn_backend=FakeSpecIncapableBackend(),
                 kv_pool=FakeMHAPool(),
                 speculative_algorithm="DFLASH",
             )

@@ -153,6 +153,12 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         # (whole block in one decode forward), with uniform non-causal seq_lens.
         self.draft_block_decode = bool(getattr(config, "draft_block_decode", False))
 
+        if self.draft_block_decode and self.spec_num_tokens > 1:
+            # DFLASH reads page tables from req_to_page (replicated per block
+            # row), not from flat per-group tables. Declaring it once here
+            # switches off the groups, capture buffers and replay guard together.
+            self.uses_flat_cache_groups = False
+
         # Forward metadata is initialized in the runner per forward call
         self.forward_decode_metadata: MSADecodeMetadata | None = None
         self.forward_extend_metadata: MSAExtendMetadata | None = None
@@ -379,10 +385,11 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         # persistent per-group buffers and records metadata views into them,
         # so replay can copy_ fresh data to the graph-recorded addresses.
         if flat_cache_group_ids:
-            # Verify keeps [bs]-row tables + [bs*N] loc views. TODO(flat+dflash).
+            # Verify keeps [bs]-row tables + [bs*N] loc views. DFLASH opts out
+            # in __init__, so it should never be handed ids here.
             assert not (
                 self.draft_block_decode and self.spec_num_tokens > 1
-            ), "flat_cache_group_ids is unsupported with DFLASH block decode"
+            ), "DFLASH block decode must opt out of flat groups (reads req_to_page)"
         page_tables, out_cache_locs = self._flat_capture_group_views(
             bs,
             flat_cache_group_ids,
@@ -788,7 +795,18 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
 class MSAHybridAttnBackend(AttentionBackend):
     """Minimax hybrid attention backend that dispatches to either a dense or sparse backend per layer."""
 
-    uses_flat_cache_groups: bool = True
+    @property
+    def uses_flat_cache_groups(self) -> bool:
+        """True only when BOTH halves consume flat per-group tables.
+
+        Both halves are history consumers fed the SAME kwargs, so a half that
+        opted out (DFLASH) must take the wrapper with it. Unlike the GDN/KDA
+        wrapper, whose flag is a union over two different families.
+        """
+        return bool(
+            self.full_attn_backend.uses_flat_cache_groups
+            and self.sparse_attn_backend.uses_flat_cache_groups
+        )
 
     def __init__(self, config: MSAConfig) -> None:
         from tokenspeed.runtime.layers.attention.registry import (

@@ -134,8 +134,10 @@ radix builds are unaffected by everything below):
   `FlatHostMirror` describes a pool as one `k_buffer`/`v_buffer` pair per layer
   and MLA keeps a single fused latent `kv_buffer`. Serving continues on device
   KV. Pass `--disable-kvstore` to make that explicit.
-- EAGLE3/MTP speculative decoding is supported. **DFlash is not** — the flat
-  build rejects it at startup; use a radix build for the DFlash recipe below.
+- EAGLE3/MTP and DFlash speculative decoding are all supported. DFlash block
+  decode reads its page tables from `req_to_page`, which the flat path mirrors
+  from the full-attention group, so its draft backend opts out of the flat
+  per-group tables rather than consuming them.
 
 To enable a compatible DFlash draft model, keep the target launch shape and add
 the draft model path plus DFlash speculative decoding options:

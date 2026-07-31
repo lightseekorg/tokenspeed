@@ -8,12 +8,8 @@ runner:
   labels:
     - b200-4gpu
 env:
-  # Deliberately NOT a TOKENSPEED_FLAT_KV=ON build, unlike the sibling K2.5
-  # eval tasks: validate_flat_scheduler_config rejects DFLASH on the flat path
-  # ("DFLASH block decode is unsupported on the flat path"), so a flat build
-  # would fail this task at startup. Keep it on radix until the flat scheduler
-  # grows DFLASH block decode.
   CI: "true"
+  TOKENSPEED_FLAT_KV: "ON"
 install:
   - bash test/ci_system/install_deps.sh
 server:

@@ -43,6 +43,7 @@ from tokenspeed.runtime.cache.transfer.types import PAGED_CACHE_KIND, CacheKind
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.configs.paged_cache_spec import (
     flat_host_tier_unsupported_reason,
+    flat_l3_storage_unsupported_reason,
     preflight_kimi_k3_flat_consumers,
     scheduler_ext_flat_kvcache,
     validate_flat_scheduler_config,
@@ -246,14 +247,22 @@ class EventLoop:
             draft_token_to_kv_pool,
         )
 
-        # KVStore has no explicit enable flag -- it is ON by default for every
-        # role but decode/encode (_handle_kvstore), so a pool the flat host
-        # tier cannot mirror would make the DEFAULT command line unservable
-        # (MLA/DSA: Kimi-K2.5, GLM-5.2). L2 is a capacity optimization, never
-        # a correctness requirement, so drop it and say so -- the same
-        # auto-disable _handle_kvstore already applies to the decode/encode
-        # roles. Runs before ModelExecutorConfig/CUDA-graph capture read
-        # enable_kvstore, and only ever turns the flag off.
+        # KVStore is ON by default (no --enable flag), so a pool the flat host
+        # tier cannot mirror would make the DEFAULT command line unservable.
+        # L2 is a capacity optimization, so downgrade instead of refusing --
+        # as _handle_kvstore already does for the decode/encode roles.
+        if scheduler_ext_flat_kvcache():
+            # NOT gated on enable_kvstore: L3 rides --kvstore-storage-backend
+            # alone (make_config below), so --disable-kvstore and the
+            # decode/encode roles would otherwise reach an L2-off/L3-on state.
+            l3_gap = flat_l3_storage_unsupported_reason(server_args)
+            if l3_gap is not None:
+                raise NotImplementedError(
+                    "flat scheduler build (TOKENSPEED_FLAT_KVCACHE) has no L3 "
+                    f"storage tier yet: {l3_gap}; unset "
+                    "--kvstore-storage-backend."
+                )
+
         if scheduler_ext_flat_kvcache() and server_args.enable_kvstore:
             host_tier_gap = flat_host_tier_unsupported_reason(token_to_kv_pool)
             if host_tier_gap is not None:
@@ -377,11 +386,7 @@ class EventLoop:
         )
         paged_cache_host_group_pages = {}
         if scheduler_ext_flat_kvcache() and server_args.enable_kvstore:
-            if server_args.kvstore_storage_backend is not None:
-                raise NotImplementedError(
-                    "flat scheduler build (TOKENSPEED_FLAT_KVCACHE) has no L3 "
-                    "storage tier yet; unset --kvstore-storage-backend."
-                )
+            # L2-only from here: the host tier needs a mirrorable pool.
             if getattr(token_to_kv_pool, "runtime_contract", None) is not None:
                 # FlatKV contract pools (Kimi-K3) have no host tier yet:
                 # FlatMemoryExecutor mirrors k_buffer/v_buffer layouts the
@@ -393,11 +398,9 @@ class EventLoop:
                 )
             host_tier_gap = flat_host_tier_unsupported_reason(token_to_kv_pool)
             if host_tier_gap is not None:
-                # Unreachable in normal startup: the auto-disable above already
-                # cleared enable_kvstore for exactly this predicate. Kept as a
-                # cheap invariant so a future reordering surfaces here with the
-                # cause named, instead of as an AttributeError on
-                # `device_pool.k_buffer` deep inside FlatMemoryExecutor.
+                # Unreachable normally (the downgrade above cleared the flag);
+                # kept so a reorder names the cause instead of an
+                # AttributeError deep inside FlatMemoryExecutor.
                 raise NotImplementedError(
                     f"the flat host tier (kvstore L2) cannot mirror this KV "
                     f"pool: {host_tier_gap}; pass --disable-kvstore."
