@@ -115,15 +115,37 @@ def _get_drafter_impl(spec_algo: str, model: torch.nn.Module):
 
 
 def _eagle_aux_layer_ids(hf_config) -> list[int] | None:
-    """Draft's eagle_aux_hidden_state_layer_ids (nested or top-level), or None."""
-    eagle_config = getattr(hf_config, "eagle_config", None)
-    if isinstance(eagle_config, dict):
-        ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
-    elif eagle_config is not None:
-        ids = getattr(eagle_config, "eagle_aux_hidden_state_layer_ids", None)
-    else:
-        ids = getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None)
-    return list(ids) if ids else None
+    """Return EAGLE3 capture ids from a draft config, including K3 text config.
+
+    K3 wraps the language configuration in ``text_config``.  Draft exports may
+    place ``eagle_config`` either on that text config or on the top-level
+    wrapper, so inspect both without falling back to the target's defaults.
+    """
+    candidates = [hf_config]
+    text_config = (
+        hf_config.get("text_config")
+        if isinstance(hf_config, dict)
+        else getattr(hf_config, "text_config", None)
+    )
+    if text_config is not None:
+        candidates.append(text_config)
+
+    for config in candidates:
+        if isinstance(config, dict):
+            eagle_config = config.get("eagle_config")
+            direct_ids = config.get("eagle_aux_hidden_state_layer_ids")
+        else:
+            eagle_config = getattr(config, "eagle_config", None)
+            direct_ids = getattr(config, "eagle_aux_hidden_state_layer_ids", None)
+        if isinstance(eagle_config, dict):
+            ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
+        elif eagle_config is not None:
+            ids = getattr(eagle_config, "eagle_aux_hidden_state_layer_ids", None)
+        else:
+            ids = direct_ids
+        if ids:
+            return list(ids)
+    return None
 
 
 def _draft_idle_global_num_tokens_for_step(
@@ -198,6 +220,8 @@ class ModelExecutorConfig:
     spec_num_steps: int | None = None
     # spec_num_tokens == spec_num_steps + 1 for now (without Tree Attention)
     spec_num_tokens: int | None = None
+    # Explicit EAGLE3 capture ids; overrides the draft checkpoint's ids.
+    eagle3_layers_to_capture: list[int] | None = None
     overlap_schedule_depth: int = 0
     dp_sampling: bool = False
     dp_sampling_min_bs: int | None = None
@@ -273,6 +297,7 @@ class ModelExecutorConfig:
             spec_algo=server_args.speculative_algorithm,
             spec_num_steps=server_args.speculative_num_steps,
             spec_num_tokens=server_args.speculative_num_draft_tokens,
+            eagle3_layers_to_capture=server_args.eagle3_layers_to_capture,
             overlap_schedule_depth=overlap_schedule_depth,
             dp_sampling=server_args.dp_sampling,
             dp_sampling_min_bs=server_args.dp_sampling_min_bs,
@@ -440,7 +465,7 @@ class ModelExecutor:
                 self.model_runner.model, "set_eagle3_layers_to_capture"
             ):
                 # capture the layers the draft was trained on, not the default
-                aux_layer_ids = _eagle_aux_layer_ids(
+                aux_layer_ids = config.eagle3_layers_to_capture or _eagle_aux_layer_ids(
                     draft_model_runner.model_config.hf_config
                 )
                 self.model_runner.model.set_eagle3_layers_to_capture(aux_layer_ids)
