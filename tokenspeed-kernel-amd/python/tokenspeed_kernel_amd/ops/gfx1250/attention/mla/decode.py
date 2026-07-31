@@ -108,7 +108,7 @@ _mla_decode_fwd_kernel_repr = make_kernel_repr(
         "BLOCK_Q",
         "BLOCK_M",
         "NUM_HEAD_BLOCKS",
-        "NUM_SEGMENTS_PER_SEQ",
+        "NUM_KV_SPLITS",
         "num_warps",
         "num_stages",
     ],
@@ -117,9 +117,9 @@ _mla_decode_fwd_kernel_repr = make_kernel_repr(
 
 @gluon.jit(repr=_mla_decode_fwd_kernel_repr)
 def _mla_decode_fwd_kernel(
-    segm_output_ptr,  # [total_num_tokens, num_query_heads, KV_LORA_RANK + qk_rope_head_dim]
-    segm_max_ptr,  # [total_num_tokens, num_query_heads, num_segments]
-    segm_expsum_ptr,  # [total_num_tokens, num_query_heads, num_segments]
+    split_output_ptr,  # [total_num_tokens, num_query_heads, KV_LORA_RANK + qk_rope_head_dim]
+    split_max_ptr,  # [total_num_tokens, num_query_heads, num_kv_splits]
+    split_expsum_ptr,  # [total_num_tokens, num_query_heads, num_kv_splits]
     query_ptr,  # [total_num_tokens, num_query_heads, head_size]
     query_scales_ptr,  # unused by the BF16 kernel
     kv_buffer_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
@@ -128,7 +128,7 @@ def _mla_decode_fwd_kernel(
     SCALE: gl.constexpr,  # float32
     q_scale_ptr,  # float32
     kv_scale_ptr,  # float32
-    out_scale_ptr,  # float32 (only set when NUM_SEGMENTS_PER_SEQ == 1)
+    out_scale_ptr,  # float32 (only set when NUM_KV_SPLITS == 1)
     num_query_heads: gl.constexpr,  # int
     num_kv_heads: gl.constexpr,  # int
     block_tables_stride: gl.int64,  # int
@@ -148,7 +148,7 @@ def _mla_decode_fwd_kernel(
     TILE_SIZE: gl.constexpr,  # int
     BLOCK_Q: gl.constexpr,  # int
     BLOCK_M: gl.constexpr,  # int
-    NUM_SEGMENTS_PER_SEQ: gl.constexpr,  # int
+    NUM_KV_SPLITS: gl.constexpr,  # int
     WARP_SIZE: gl.constexpr,  # int
     num_warps: gl.constexpr,  # int
     num_stages: gl.constexpr,  # int
@@ -182,7 +182,7 @@ def _mla_decode_fwd_kernel(
     )
     q_block_global_idx = gl.program_id(0)
     kv_head_idx = gl.program_id(1)
-    segm_idx = gl.program_id(2)
+    split_kv_id = gl.program_id(2)
 
     num_token_blocks_per_seq = cdiv_fn(num_tokens_per_seq, BLOCK_Q)
     num_q_blocks_per_seq = num_token_blocks_per_seq * NUM_HEAD_BLOCKS
@@ -202,11 +202,11 @@ def _mla_decode_fwd_kernel(
     # sequence len for this particular sequence
     seq_len = gl.load(seq_lens_ptr + seq_idx)
 
-    # number of segments for this particular sequence
-    num_segments = NUM_SEGMENTS_PER_SEQ
-    tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+    # Number of split-K partitions for this sequence.
+    num_kv_splits = NUM_KV_SPLITS
+    tiles_per_split = cdiv_fn(seq_len, num_kv_splits * TILE_SIZE)
 
-    if segm_idx * tiles_per_segment * TILE_SIZE >= seq_len:
+    if split_kv_id * tiles_per_split * TILE_SIZE >= seq_len:
         return
 
     q_lora_shared = gl.allocate_shared_memory(
@@ -378,12 +378,12 @@ def _mla_decode_fwd_kernel(
     # this prefix can be skipped)
     num_tiles = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
 
-    seq_offset = segm_idx * tiles_per_segment * TILE_SIZE + offs_seq_t
+    seq_offset = split_kv_id * tiles_per_split * TILE_SIZE + offs_seq_t
 
-    # iterate through tiles within current segment
+    # Iterate through tiles within the current KV split.
     for j in range(
-        segm_idx * tiles_per_segment,
-        min((segm_idx + 1) * tiles_per_segment, num_tiles),
+        split_kv_id * tiles_per_split,
+        min((split_kv_id + 1) * tiles_per_split, num_tiles),
     ):
         physical_block_idx = gl.load(block_tables_ptr_shifted + j).to(gl.int64)
 
@@ -486,25 +486,25 @@ def _mla_decode_fwd_kernel(
     query_mask_0_pv = query_pos_pv < num_tokens_per_seq
     query_mask_1_pv = query_offset_1_pv < num_query_heads
 
-    segm_output_offset = (
+    split_output_offset = (
         query_offset_0_pv[:, None].to(gl.int64)
-        * (num_query_heads * NUM_SEGMENTS_PER_SEQ * KV_LORA_RANK)
-        + query_offset_1_pv[:, None] * (NUM_SEGMENTS_PER_SEQ * KV_LORA_RANK)
-        + segm_idx * KV_LORA_RANK
+        * (num_query_heads * NUM_KV_SPLITS * KV_LORA_RANK)
+        + query_offset_1_pv[:, None] * (NUM_KV_SPLITS * KV_LORA_RANK)
+        + split_kv_id * KV_LORA_RANK
         + offs_q_d_lora_pv[None, :]
     )
     gl.store(
-        segm_output_ptr + segm_output_offset,
+        split_output_ptr + split_output_offset,
         acc,
         mask=query_mask_0_pv[:, None] & query_mask_1_pv[:, None],
     )
-    segm_offset = (
-        query_offset_0_qk.to(gl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
-        + query_offset_1_qk * NUM_SEGMENTS_PER_SEQ
-        + segm_idx
+    split_offset = (
+        query_offset_0_qk.to(gl.int64) * (num_query_heads * NUM_KV_SPLITS)
+        + query_offset_1_qk * NUM_KV_SPLITS
+        + split_kv_id
     )
-    gl.store(segm_max_ptr + segm_offset, M, mask=query_mask_0_qk & query_mask_1_qk)
-    gl.store(segm_expsum_ptr + segm_offset, L, mask=query_mask_0_qk & query_mask_1_qk)
+    gl.store(split_max_ptr + split_offset, M, mask=query_mask_0_qk & query_mask_1_qk)
+    gl.store(split_expsum_ptr + split_offset, L, mask=query_mask_0_qk & query_mask_1_qk)
 
 
 _mla_decode_fwd_reduce_kernel_repr = make_kernel_repr(
@@ -513,7 +513,7 @@ _mla_decode_fwd_reduce_kernel_repr = make_kernel_repr(
         "num_query_heads",
         "TILE_SIZE",
         "KV_LORA_RANK",
-        "NUM_SEGMENTS_PER_SEQ",
+        "NUM_KV_SPLITS",
         "ALL_DECODE",
         "HAS_LSE",
         "num_warps",
@@ -525,10 +525,10 @@ _mla_decode_fwd_reduce_kernel_repr = make_kernel_repr(
 def _mla_decode_fwd_reduce_kernel(
     output_ptr,  # [num_tokens, num_query_heads, head_size]
     lse_ptr,  # [num_tokens, num_query_heads] or None
-    segm_output_ptr,
-    # [num_tokens, num_query_heads, max_num_segments, head_size]
-    segm_max_ptr,  # [num_tokens, num_query_heads, max_num_segments]
-    segm_expsum_ptr,  # [num_tokens, num_query_heads, max_num_segments]
+    split_output_ptr,
+    # [num_tokens, num_query_heads, max_num_kv_splits, head_size]
+    split_max_ptr,  # [num_tokens, num_query_heads, max_num_kv_splits]
+    split_expsum_ptr,  # [num_tokens, num_query_heads, max_num_kv_splits]
     seq_lens_ptr,  # [num_seqs]
     out_scale_ptr,  # float32
     num_seqs,  # int
@@ -544,7 +544,7 @@ def _mla_decode_fwd_reduce_kernel(
     KV_LORA_RANK: gl.constexpr,  # int
     query_start_len_ptr,  # [num_seqs+1]
     BLOCK_Q: gl.constexpr,  # int
-    NUM_SEGMENTS_PER_SEQ: gl.constexpr,  # int
+    NUM_KV_SPLITS: gl.constexpr,  # int
     num_warps: gl.constexpr = 2,
     waves_per_eu: gl.constexpr = 2,
     num_stages: gl.constexpr = 1,
@@ -555,7 +555,7 @@ def _mla_decode_fwd_reduce_kernel(
 ):
     WARP_SIZE: gl.constexpr = 32
 
-    # All parallelism along KV_LORA_RANK; segments are per-thread so
+    # All parallelism along KV_LORA_RANK; KV splits are per-thread so
     # gl.max / gl.sum along axis=0 are thread-local reductions.
     tpw_d: gl.constexpr = gl.constexpr(min(WARP_SIZE, KV_LORA_RANK))
     wpc_d: gl.constexpr = gl.constexpr(
@@ -569,15 +569,15 @@ def _mla_decode_fwd_reduce_kernel(
         )
     )
     REDUCE_LAYOUT: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[NUM_SEGMENTS_PER_SEQ, spt_d],
+        size_per_thread=[NUM_KV_SPLITS, spt_d],
         threads_per_warp=[1, tpw_d],
         warps_per_cta=[1, wpc_d],
         order=[1, 0],
     )
-    SEGM_LAYOUT: gl.constexpr = gl.SliceLayout(1, REDUCE_LAYOUT)
+    SPLIT_LAYOUT: gl.constexpr = gl.SliceLayout(1, REDUCE_LAYOUT)
     OUTPUT_LAYOUT: gl.constexpr = gl.SliceLayout(0, REDUCE_LAYOUT)
 
-    SEGM_OUTPUT_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
+    SPLIT_OUTPUT_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
         vec=1,
         per_phase=1,
         max_phase=1,
@@ -587,28 +587,28 @@ def _mla_decode_fwd_reduce_kernel(
     query_token_idx = gl.program_id(0)
     query_head_idx = gl.program_id(1)
 
-    # TDM async load segm_output into shared memory
-    SEGM_OUTPUT_COLS: gl.constexpr = gl.constexpr(NUM_SEGMENTS_PER_SEQ * KV_LORA_RANK)
+    # TDM async load split output into shared memory.
+    SPLIT_OUTPUT_COLS: gl.constexpr = gl.constexpr(NUM_KV_SPLITS * KV_LORA_RANK)
     total_rows = total_num_tokens * num_query_heads
-    segm_output_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=segm_output_ptr,
-        shape=(total_rows, SEGM_OUTPUT_COLS),
-        strides=(SEGM_OUTPUT_COLS, gl.constexpr(1)),
-        block_shape=(gl.constexpr(1), SEGM_OUTPUT_COLS),
-        layout=SEGM_OUTPUT_SHARED_LAYOUT,
+    split_output_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=split_output_ptr,
+        shape=(total_rows, SPLIT_OUTPUT_COLS),
+        strides=(SPLIT_OUTPUT_COLS, gl.constexpr(1)),
+        block_shape=(gl.constexpr(1), SPLIT_OUTPUT_COLS),
+        layout=SPLIT_OUTPUT_SHARED_LAYOUT,
     )
-    segm_output_shared = gl.allocate_shared_memory(
-        segm_output_ptr.type.element_ty,
-        [gl.constexpr(1), SEGM_OUTPUT_COLS],
-        layout=SEGM_OUTPUT_SHARED_LAYOUT,
+    split_output_shared = gl.allocate_shared_memory(
+        split_output_ptr.type.element_ty,
+        [gl.constexpr(1), SPLIT_OUTPUT_COLS],
+        layout=SPLIT_OUTPUT_SHARED_LAYOUT,
     )
 
     # row offset: query_token_idx * num_query_heads + query_head_idx
     row_idx = (query_token_idx * num_query_heads + query_head_idx).to(gl.int32)
     gl.amd.gfx1250.tdm.async_load(
-        segm_output_desc,
+        split_output_desc,
         [row_idx, 0],
-        segm_output_shared,
+        split_output_shared,
     )
 
     if ALL_DECODE:
@@ -622,38 +622,40 @@ def _mla_decode_fwd_reduce_kernel(
     if out_scale_ptr is not None:
         out_scale = 1 / gl.load(out_scale_ptr)
 
-    num_segments = NUM_SEGMENTS_PER_SEQ
-    tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+    num_kv_splits = NUM_KV_SPLITS
+    tiles_per_split = cdiv_fn(seq_len, num_kv_splits * TILE_SIZE)
 
-    act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
-    offs_segm = gl.arange(0, NUM_SEGMENTS_PER_SEQ, layout=SEGM_LAYOUT)
-    segm_mask = offs_segm < gl.full(
-        [NUM_SEGMENTS_PER_SEQ], act_num_segments, dtype=gl.int32, layout=SEGM_LAYOUT
+    active_num_kv_splits = cdiv_fn(seq_len, tiles_per_split * TILE_SIZE)
+    offs_split = gl.arange(0, NUM_KV_SPLITS, layout=SPLIT_LAYOUT)
+    split_mask = offs_split < gl.full(
+        [NUM_KV_SPLITS], active_num_kv_splits, dtype=gl.int32, layout=SPLIT_LAYOUT
     )
 
-    # load segment maxima
-    segm_offset = (
-        query_token_idx.to(gl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
-        + query_head_idx * NUM_SEGMENTS_PER_SEQ
-        + offs_segm
+    # Load per-split maxima.
+    split_offset = (
+        query_token_idx.to(gl.int64) * (num_query_heads * NUM_KV_SPLITS)
+        + query_head_idx * NUM_KV_SPLITS
+        + offs_split
     )
-    segm_max = gl.load(segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf"))
-    overall_max = gl.max(segm_max)
+    split_max = gl.load(
+        split_max_ptr + split_offset, mask=split_mask, other=float("-inf")
+    )
+    overall_max = gl.max(split_max)
 
-    # load and rescale segment exp sums
-    segm_expsum = gl.load(segm_expsum_ptr + segm_offset, mask=segm_mask, other=0.0)
-    segm_expsum = segm_expsum * gl.exp2(segm_max - overall_max)
-    overall_expsum = gl.sum(segm_expsum)
+    # Load and rescale per-split exponent sums.
+    split_expsum = gl.load(split_expsum_ptr + split_offset, mask=split_mask, other=0.0)
+    split_expsum = split_expsum * gl.exp2(split_max - overall_max)
+    overall_expsum = gl.sum(split_expsum)
 
     # Wait for the async load and read from shared memory
     gl.amd.gfx1250.tdm.async_wait(0)
-    segm_output = segm_output_shared.reshape((NUM_SEGMENTS_PER_SEQ, KV_LORA_RANK)).load(
+    split_output = split_output_shared.reshape((NUM_KV_SPLITS, KV_LORA_RANK)).load(
         layout=REDUCE_LAYOUT
     )
 
-    segm_output = gl.where(segm_mask[:, None], segm_output, 0.0)
-    segm_output *= gl.exp2(segm_max - overall_max)[:, None]
-    acc_sum = gl.sum(segm_output, axis=0)
+    split_output = gl.where(split_mask[:, None], split_output, 0.0)
+    split_output *= gl.exp2(split_max - overall_max)[:, None]
+    acc_sum = gl.sum(split_output, axis=0)
     acc = gl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
 
     if out_scale_ptr is not None:
@@ -669,7 +671,7 @@ def _mla_decode_fwd_reduce_kernel(
     gl.store(output_ptr + output_offset, acc.to(output_ptr.type.element_ty))
 
     if HAS_LSE:
-        # Segment maxima are maintained in log2 space. TokenSpeed's attention
+        # Split maxima are maintained in log2 space. TokenSpeed's attention
         # API returns natural-log LSE, so convert after the final merge.
         lse = (overall_max + gl.log2(overall_expsum)) * 0.6931471805599453
         gl.store(
@@ -678,21 +680,21 @@ def _mla_decode_fwd_reduce_kernel(
         )
 
 
-def _select_num_segments(
+def _select_num_kv_splits(
     *,
     num_sms: int,
     num_q_programs: int,
     max_seqlen_k: int,
     tile_size: int,
 ) -> int:
-    """Choose enough split-K segments to occupy the GFX1250 compute units."""
-    max_segments = max(1, math.ceil(max_seqlen_k / tile_size))
-    # The reduction loads [segments, 512] through one TDM descriptor. Keep its
+    """Choose enough split-K partitions to occupy the GFX1250 compute units."""
+    max_kv_splits = max(1, math.ceil(max_seqlen_k / tile_size))
+    # The reduction loads [splits, 512] through one TDM descriptor. Keep its
     # flattened block below the 65,535-element hardware dimension limit.
-    max_segments = min(max_segments, 64)
+    max_kv_splits = min(max_kv_splits, 64)
     # A two-wave attention workgroup permits two resident workgroups per CU.
     target = max(1, (num_sms * 4 // 4) * 2 // max(1, num_q_programs))
-    return triton.next_power_of_2(min(max_segments, target))
+    return triton.next_power_of_2(min(max_kv_splits, target))
 
 
 def gluon_mla_decode_bf16_gfx1250(
@@ -781,32 +783,32 @@ def gluon_mla_decode_bf16_gfx1250(
     num_head_blocks = math.ceil(num_query_heads / block_m)
     total_num_q_blocks = batch_size * num_head_blocks
     num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
-    num_segments = _select_num_segments(
+    num_kv_splits = _select_num_kv_splits(
         num_sms=num_sms,
         num_q_programs=total_num_q_blocks,
         max_seqlen_k=max_seqlen_k,
         tile_size=page_size,
     )
 
-    segm_output = torch.empty(
-        (batch_size, num_query_heads, num_segments, kv_lora_rank),
+    split_output = torch.empty(
+        (batch_size, num_query_heads, num_kv_splits, kv_lora_rank),
         dtype=torch.float32,
         device=q.device,
     )
-    segm_max = torch.empty(
-        (batch_size, num_query_heads, num_segments),
+    split_max = torch.empty(
+        (batch_size, num_query_heads, num_kv_splits),
         dtype=torch.float32,
         device=q.device,
     )
-    segm_expsum = torch.empty_like(segm_max)
+    split_expsum = torch.empty_like(split_max)
     # The device kernel shares its prefill/decode indexing machinery and takes
     # packed query offsets even when q_len == 1.
     query_start_lens = torch.arange(batch_size + 1, dtype=torch.int32, device=q.device)
 
-    _mla_decode_fwd_kernel[(total_num_q_blocks, num_kv_heads, num_segments)](
-        segm_output_ptr=segm_output,
-        segm_max_ptr=segm_max,
-        segm_expsum_ptr=segm_expsum,
+    _mla_decode_fwd_kernel[(total_num_q_blocks, num_kv_heads, num_kv_splits)](
+        split_output_ptr=split_output,
+        split_max_ptr=split_max,
+        split_expsum_ptr=split_expsum,
         query_ptr=q_flat,
         query_scales_ptr=None,
         kv_buffer_ptr=kv_cache,
@@ -835,7 +837,7 @@ def gluon_mla_decode_bf16_gfx1250(
         TILE_SIZE=page_size,
         BLOCK_Q=block_q,
         BLOCK_M=block_m,
-        NUM_SEGMENTS_PER_SEQ=num_segments,
+        NUM_KV_SPLITS=num_kv_splits,
         WARP_SIZE=32,
         NUM_HEAD_BLOCKS=num_head_blocks,
         SHUFFLED_KV_CACHE=False,
@@ -862,9 +864,9 @@ def gluon_mla_decode_bf16_gfx1250(
     _mla_decode_fwd_reduce_kernel[(batch_size, num_query_heads)](
         output_ptr=out_flat,
         lse_ptr=lse_flat,
-        segm_output_ptr=segm_output,
-        segm_max_ptr=segm_max,
-        segm_expsum_ptr=segm_expsum,
+        split_output_ptr=split_output,
+        split_max_ptr=split_max,
+        split_expsum_ptr=split_expsum,
         seq_lens_ptr=cache_seqlens,
         out_scale_ptr=None,
         num_seqs=batch_size,
@@ -880,7 +882,7 @@ def gluon_mla_decode_bf16_gfx1250(
         KV_LORA_RANK=kv_lora_rank,
         query_start_len_ptr=query_start_lens,
         BLOCK_Q=block_q,
-        NUM_SEGMENTS_PER_SEQ=num_segments,
+        NUM_KV_SPLITS=num_kv_splits,
         ALL_DECODE=True,
         HAS_LSE=return_lse,
         num_warps=4,

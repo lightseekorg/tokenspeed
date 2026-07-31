@@ -1971,6 +1971,7 @@ def mla_extend_with_kvcache(
     traits = {
         "page_size": kv_cache.shape[1],
         "num_q_heads": q.shape[1],
+        "max_seqlen_q": max_seqlen_q,
         "qk_nope_head_dim": qk_nope_head_dim,
         "kv_lora_rank": kv_lora_rank,
         "qk_rope_head_dim": qk_rope_head_dim,

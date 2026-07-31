@@ -109,7 +109,6 @@ _mla_extend_fwd_kernel_repr = make_kernel_repr(
         "BLOCK_Q",
         "BLOCK_M",
         "NUM_HEAD_BLOCKS",
-        "NUM_SEGMENTS_PER_SEQ",
         "num_warps",
         "num_stages",
     ],
