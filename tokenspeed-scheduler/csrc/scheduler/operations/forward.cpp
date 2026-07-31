@@ -488,6 +488,13 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
                     pd_transfer_pins_.insert(request->Id());
                 }
                 trackPendingForwardResult(request);
+                if (request->Is<fsm::Prefilling>()) {
+                    // Admission reserves only this chunk, not the request's
+                    // remaining prompt. Keep one incomplete prefill as the
+                    // head of line so another request cannot strand it by
+                    // consuming the capacity it needs to finish.
+                    break;
+                }
             } else if (lcm_admission_failed_) {
                 break;
             }
@@ -503,6 +510,9 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
                     pd_transfer_pins_.insert(request->Id());
                 }
                 trackPendingForwardResult(request);
+                if (request->Is<fsm::Prefilling>()) {
+                    break;
+                }
             }
             continue;
         }

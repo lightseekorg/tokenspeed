@@ -1680,6 +1680,56 @@ TEST(CacheProgressTest, PromotionBoundarySurvivesPrefillRounds) {
     EXPECT_EQ(request.CacheProgress().promotion_boundary_tokens, 8);
 }
 
+class PromotionBoundaryHeadOfLineSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.block_size = 2;
+        cfg.device_allocator.total_pages = 64;
+        cfg.host_allocator.total_pages = 64;
+        cfg.max_scheduled_tokens = 8;
+        cfg.max_batch_size = 8;
+        cfg.enable_l3_storage = false;
+        cfg.disable_l2_cache = true;
+        cfg.disable_prefix_cache = false;
+        cfg.paged_cache_groups = {
+            MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
+                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
+            MakeGroup("state", cfg.block_size, cfg.device_allocator.total_pages,
+                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::State),
+        };
+        return cfg;
+    }
+};
+
+TEST_F(PromotionBoundaryHeadOfLineSuite, DoesNotStartSecondIncompletePrefill) {
+    RequestSpec seed = MakeRequestSpec("seed", /*num_pages=*/6);
+    Submit(seed);
+    PlanOnce();  // chunk boundary at token 8
+    PlanOnce();  // endpoint at token 12
+    SendForwardDone("seed", {42});
+    SendFinish("seed");
+    PlanOnce();
+    ASSERT_EQ(scheduler_->WaitingSize(), 0u);
+    ASSERT_EQ(scheduler_->DecodingSize(), 0u);
+
+    RequestSpec first = seed;
+    first.request_id = "first";
+    for (std::size_t i = 6; i < first.tokens.size(); ++i) {
+        first.tokens[i] += 1000;
+    }
+    RequestSpec second = MakeRequestSpec("second", /*num_pages=*/6, /*start=*/2001);
+    Submit({first, second});
+    ASSERT_EQ(scheduler_->WaitingSize(), 2u);
+
+    ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->request_ids, std::vector<std::string>{"first"});
+    EXPECT_EQ(batch->input_lengths, std::vector<std::int32_t>{6})
+        << "the full-history hit promotes token 6 before the remaining prompt";
+}
+
 TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
     BlockPool pool(/*num_lcm_blocks=*/8);
     std::vector<KvCacheSpec> specs{
