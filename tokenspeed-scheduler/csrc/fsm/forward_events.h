@@ -170,8 +170,7 @@ private:
 struct ExtendResultEvent : InvalidTransitionHandler<ExtendResultEvent> {
     using InvalidTransitionHandler<ExtendResultEvent>::operator();
 
-    explicit ExtendResultEvent(std::vector<std::int32_t> result_tokens)
-        : result_tokens_{std::move(result_tokens)} {}
+    explicit ExtendResultEvent(std::vector<std::int32_t> result_tokens) : result_tokens_{std::move(result_tokens)} {}
 
     template <typename State>
         requires CanExtendTokenContainer<State>

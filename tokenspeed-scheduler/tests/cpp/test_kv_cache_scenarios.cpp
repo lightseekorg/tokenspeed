@@ -482,8 +482,7 @@ TEST_F(PoolAccountingSuite, ThreeRequestsOutOfOrderFinishReclaimExactly) {
     PlanOnce();
 
     EXPECT_EQ(scheduler_->DecodingSize(), 0u);
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start)
-        << "every page returns to the pool once all requests finish";
+    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "every page returns to the pool once all requests finish";
 }
 
 // Chunked prefill slides the SWA window DURING prefill, then decode keeps
@@ -759,8 +758,7 @@ TEST_F(PageSizeOneSuite, TokenGranularPagesSlideAndReclaim) {
     ExecutionPlan prefill = PlanOnce();
     const ForwardBatch* pop = FindForwardBatch(prefill);
     ASSERT_NE(pop, nullptr);
-    EXPECT_EQ(pop->block_tables.at("full").at(0).size(), 4u)
-        << "three prompt pages plus one preallocated decode page";
+    EXPECT_EQ(pop->block_tables.at("full").at(0).size(), 4u) << "three prompt pages plus one preallocated decode page";
 
     SendForwardDone("r1", {42});
 
@@ -1436,8 +1434,7 @@ TEST_F(PrefillHeadOfLineSuite, BlockedLaterChunkDoesNotStartSubmittedRequest) {
         << "a blocked active prefill must prevent lower-priority admission";
     EXPECT_EQ(scheduler_->PoolFreeBlocks(), 10)
         << "the completed holder is retracted so the active prefill can continue";
-    EXPECT_EQ(scheduler_->WaitingSize(), 2u)
-        << "the retracted holder and untouched submitted request remain queued";
+    EXPECT_EQ(scheduler_->WaitingSize(), 2u) << "the retracted holder and untouched submitted request remain queued";
 }
 
 // Exact-fit re-admission after a retract: the whole freed budget (pages AND any
@@ -1662,19 +1659,15 @@ TEST(CacheProgressTest, PromotionBoundarySurvivesPrefillRounds) {
         AdmitForTest(coordinator, tables, /*num_tokens=*/4);
     ASSERT_TRUE(admission);
 
-    request.Apply(fsm::SchedulePrefillFirstChunkEvent{
-        /*tokens_this_round=*/4,
-        /*reserve_num_tokens_in_next_schedule_event=*/0,
-        &req_pool,
-        Role::kFused,
-        &coordinator,
-        std::move(tables),
-        /*hit_tokens=*/0,
-        fsm::CacheProgress{
-            .access_epoch = admission->access_epoch,
-            .promotion_boundary_tokens = 8,
-        },
-        /*load_pairs=*/{}});
+    request.Apply(fsm::SchedulePrefillFirstChunkEvent{/*tokens_this_round=*/4,
+                                                      /*reserve_num_tokens_in_next_schedule_event=*/0, &req_pool,
+                                                      Role::kFused, &coordinator, std::move(tables),
+                                                      /*hit_tokens=*/0,
+                                                      fsm::CacheProgress{
+                                                          .access_epoch = admission->access_epoch,
+                                                          .promotion_boundary_tokens = 8,
+                                                      },
+                                                      /*load_pairs=*/{}});
     ASSERT_TRUE(request.Is<fsm::Prefilling>());
     EXPECT_EQ(request.CacheProgress().promotion_boundary_tokens, 8);
 
@@ -1705,13 +1698,8 @@ TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
 
     request.Apply(fsm::SchedulePrefillFirstChunkEvent{
         /*tokens_this_round=*/4,
-        /*reserve_num_tokens_in_next_schedule_event=*/3,
-        &req_pool,
-        Role::kD,
-        &coordinator,
-        std::move(tables),
-        /*hit_tokens=*/0,
-        fsm::CacheProgress{.access_epoch = admission->access_epoch},
+        /*reserve_num_tokens_in_next_schedule_event=*/3, &req_pool, Role::kD, &coordinator, std::move(tables),
+        /*hit_tokens=*/0, fsm::CacheProgress{.access_epoch = admission->access_epoch},
         /*load_pairs=*/{}});
     ASSERT_TRUE(request.Is<fsm::Prefilling>());
 
@@ -1741,13 +1729,8 @@ TEST(RetractEvent, PrefillDoneVictimReleasesPagesAndRequeues) {
     // Whole 4-token prompt in one chunk -> PrefillDone: holds pages, no decode yet.
     request.Apply(fsm::SchedulePrefillFirstChunkEvent{
         /*tokens_this_round=*/4,
-        /*reserve_num_tokens_in_next_schedule_event=*/1,
-        &req_pool,
-        Role::kFused,
-        &coordinator,
-        std::move(tables),
-        /*hit_tokens=*/0,
-        fsm::CacheProgress{.access_epoch = admission->access_epoch},
+        /*reserve_num_tokens_in_next_schedule_event=*/1, &req_pool, Role::kFused, &coordinator, std::move(tables),
+        /*hit_tokens=*/0, fsm::CacheProgress{.access_epoch = admission->access_epoch},
         /*load_pairs=*/{}});
     ASSERT_TRUE(request.Is<fsm::PrefillDone>());
     EXPECT_EQ(request.CacheProgress().access_epoch, admission->access_epoch);
@@ -1795,8 +1778,7 @@ TEST_F(ChunkedPrefillSuite, AbortDuringDecodeRestoresPoolBaseline) {
 
     SendAbort(*scheduler_, "r1");
     PlanOnce();
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start)
-        << "abort during decode must return every page to the pool";
+    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "abort during decode must return every page to the pool";
 }
 
 // Admission owns the prepared refs before the event. If the independent request
@@ -1818,17 +1800,14 @@ TEST(EventFailurePath, ReqPoolExhaustionAtFirstChunkLeavesPoolBalanced) {
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
     ASSERT_EQ(pool.NumEmptyLcmBlocks(), 27);
 
-    EXPECT_THROW(request.Apply(fsm::SchedulePrefillFirstChunkEvent{
-                     /*tokens_this_round=*/4,
-                     /*reserve_num_tokens_in_next_schedule_event=*/1,
-                     &req_pool,
-                     Role::kFused,
-                     &coordinator,
-                     std::move(tables),
-                     /*hit_tokens=*/0,
-                     /*cache_progress=*/{},
-                     /*load_pairs=*/{}}),
-                 std::runtime_error);
+    EXPECT_THROW(
+        request.Apply(fsm::SchedulePrefillFirstChunkEvent{/*tokens_this_round=*/4,
+                                                          /*reserve_num_tokens_in_next_schedule_event=*/1, &req_pool,
+                                                          Role::kFused, &coordinator, std::move(tables),
+                                                          /*hit_tokens=*/0,
+                                                          /*cache_progress=*/{},
+                                                          /*load_pairs=*/{}}),
+        std::runtime_error);
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 31) << "a failed req-pool Allocate must not leak block-pool pages";
 
     EXPECT_NO_THROW(request.Apply(fsm::AbortEvent{&coordinator}));
@@ -2169,8 +2148,7 @@ TEST_F(PrefixHitDisabledSuite, DisablePrefixCacheSkipsMatch) {
     EXPECT_EQ(op->input_lengths.at(0), 12) << "no hit -> the whole prompt is the input";
     EXPECT_EQ(op->extend_prefix_lens.at(0), 0);
     EXPECT_EQ(op->input_ids, r2_tokens);
-    EXPECT_EQ(op->block_tables.at("full").at(0).size(), 7u)
-        << "six prompt pages plus one preallocated decode page";
+    EXPECT_EQ(op->block_tables.at("full").at(0).size(), 7u) << "six prompt pages plus one preallocated decode page";
     EXPECT_EQ(op->block_tables.at("swa").at(0).size(), 7u);
     // Pool: 6 live pages plus one physically reserved decode page per group.
     EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 14);
@@ -2909,8 +2887,7 @@ TEST_F(HostHitSuite, HostHitLoadsBackAfterDeviceEviction) {
     EXPECT_EQ(op->extend_prefix_lens.at(0), 8);
     EXPECT_EQ(op->prefill_lengths.at(0), 10);
     EXPECT_EQ(op->input_ids, MakeTokens(/*count=*/2, /*start=*/9));
-    EXPECT_EQ(op->block_tables.at("full").at(0).size(), 6u)
-        << "4 extension + 2 fresh pages, all new to the table";
+    EXPECT_EQ(op->block_tables.at("full").at(0).size(), 6u) << "4 extension + 2 fresh pages, all new to the table";
     EXPECT_EQ(op->block_tables.at("swa").at(0).size(), 6u);
 
     // Wire pairs are group-major: full ext slots 0..3, then SWA slots 2..3.
@@ -3015,8 +2992,7 @@ TEST_F(HostHitSuite, AbortDuringLoadKeepsPagesPinned) {
     // the 6 load destinations must stay off the free list until LoadBackDone.
     SendAbort(*scheduler_, "r2");
     PlanOnce();  // reap
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 6)
-        << "in-flight load destinations must not be reusable";
+    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 6) << "in-flight load destinations must not be reusable";
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 6) << "the host sources stay pinned too";
 
     SendLoadBackDone(lb->op_ids.at(0));

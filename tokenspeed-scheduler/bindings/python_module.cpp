@@ -254,8 +254,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                  for (auto& [gid, buf] : op.block_tables_contig) {
                      const std::size_t rows = op.request_ids.size();
                      const std::size_t columns = rows == 0 ? 0 : buf.size() / rows;
-                     out[nb::str(gid.c_str())] = nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>>(
-                         buf.data(), {rows, columns}, self);
+                     out[nb::str(gid.c_str())] =
+                         nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>>(buf.data(), {rows, columns}, self);
                  }
                  return out;
              })

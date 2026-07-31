@@ -65,8 +65,7 @@ void Scheduler::handleEvent(const pd::SucceededEvent& event) {
         return;
     }
     if (!request->Is<fsm::PrefillDone>() && !request->Is<fsm::Decoding>()) {
-        throw std::logic_error("PD SucceededEvent received in state " +
-                               request->StateName());
+        throw std::logic_error("PD SucceededEvent received in state " + request->StateName());
     }
     pending_forward_results_.erase(event.request_id);
     pd_transfer_pins_.erase(event.request_id);
@@ -80,28 +79,22 @@ void Scheduler::handleEvent(const pd::RemotePrefillDoneEvent& event) {
     }
     if (request->Is<fsm::Prefilling>()) {
         if (event.bootstrap_token < 0) {
-            throw std::invalid_argument(
-                "PD RemotePrefillDoneEvent requires a non-negative bootstrap token");
+            throw std::invalid_argument("PD RemotePrefillDoneEvent requires a non-negative bootstrap token");
         }
         pd_transfer_pins_.erase(event.request_id);
         request->Apply(fsm::RemotePrefillDoneEvent{event.bootstrap_token});
         return;
     }
-    if (request->Is<fsm::PrefillDone>() ||
-        request->Is<fsm::Decoding>() ||
-        request->Is<fsm::Finished>()) {
+    if (request->Is<fsm::PrefillDone>() || request->Is<fsm::Decoding>() || request->Is<fsm::Finished>()) {
         return;
     }
-    throw std::logic_error(
-        "PD RemotePrefillDoneEvent received before destination admission; state=" +
-        request->StateName());
+    throw std::logic_error("PD RemotePrefillDoneEvent received before destination admission; state=" +
+                           request->StateName());
 }
 
 void Scheduler::handleEvent(const forward::Finish& event) {
-    if (config_.enable_pd_cache &&
-        pd_transfer_pins_.contains(event.request_id)) {
-        throw std::logic_error(
-            "PD Finish received while transfer pages are pinned");
+    if (config_.enable_pd_cache && pd_transfer_pins_.contains(event.request_id)) {
+        throw std::logic_error("PD Finish received while transfer pages are pinned");
     }
     pending_forward_results_.erase(event.request_id);
     if (Request* request = findRequest(event.request_id)) {
@@ -111,8 +104,7 @@ void Scheduler::handleEvent(const forward::Finish& event) {
 
 void Scheduler::handleEvent(const forward::UpdateReserveNumTokens& event) {
     if (Request* request = findRequest(event.request_id)) {
-        request->Apply(fsm::UpdateReserveNumTokensEvent{
-            event.reserve_num_tokens_in_next_schedule_event});
+        request->Apply(fsm::UpdateReserveNumTokensEvent{event.reserve_num_tokens_in_next_schedule_event});
     }
 }
 

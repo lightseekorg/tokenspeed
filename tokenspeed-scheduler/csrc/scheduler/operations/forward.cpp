@@ -69,8 +69,7 @@ void appendCompletedPageHashes(std::vector<std::string>& page_hashes,
     const std::int32_t first_new_page = static_cast<std::int32_t>(page_hashes.size());
     _assert(filled_pages > first_new_page, "caller must pre-check page-hash progress");
     const std::string previous_hash = page_hashes.empty() ? std::string{} : page_hashes.back();
-    std::vector<std::string> new_hashes =
-        AdvancePagedHashes(paged_tokens, first_new_page, previous_hash, filled_pages);
+    std::vector<std::string> new_hashes = AdvancePagedHashes(paged_tokens, first_new_page, previous_hash, filled_pages);
     page_hashes.insert(page_hashes.end(), std::make_move_iterator(new_hashes.begin()),
                        std::make_move_iterator(new_hashes.end()));
 }
@@ -88,13 +87,11 @@ bool canConsumeReservedTokensInPlace(const KvCacheCoordinator& coordinator, std:
     return true;
 }
 
-CacheBoundaryKind consumeCompletedBoundaryKind(fsm::CacheProgress& cache_progress,
-                                               std::int32_t num_computed_tokens,
+CacheBoundaryKind consumeCompletedBoundaryKind(fsm::CacheProgress& cache_progress, std::int32_t num_computed_tokens,
                                                std::int32_t prefill_size) {
     if (cache_progress.promotion_boundary_tokens > 0 &&
         num_computed_tokens >= cache_progress.promotion_boundary_tokens) {
-        const bool reached_exactly =
-            num_computed_tokens == cache_progress.promotion_boundary_tokens;
+        const bool reached_exactly = num_computed_tokens == cache_progress.promotion_boundary_tokens;
         cache_progress.promotion_boundary_tokens = 0;
         if (reached_exactly) {
             return CacheBoundaryKind::kPromoted;
@@ -104,8 +101,7 @@ CacheBoundaryKind consumeCompletedBoundaryKind(fsm::CacheProgress& cache_progres
 }
 
 template <typename Event>
-    requires(std::same_as<Event, fsm::SchedulePrefillFirstChunkEvent> ||
-             std::same_as<Event, fsm::SchedulePrefillEvent>)
+    requires(std::same_as<Event, fsm::SchedulePrefillFirstChunkEvent> || std::same_as<Event, fsm::SchedulePrefillEvent>)
 PrefillOperation applyPrefillEvent(Request& request, Event& event, const KvCacheCoordinator& coordinator,
                                    std::span<const std::string> group_ids) {
     request.Apply(event);
@@ -124,9 +120,8 @@ PrefillOperation applyPrefillEvent(Request& request, Event& event, const KvCache
     return operation;
 }
 
-DecodeOperation applyDecodeEvent(Request& request, fsm::ScheduleDecodeEvent event,
-                                 std::int32_t decode_input_tokens, const KvCacheCoordinator& coordinator,
-                                 std::span<const std::string> group_ids) {
+DecodeOperation applyDecodeEvent(Request& request, fsm::ScheduleDecodeEvent event, std::int32_t decode_input_tokens,
+                                 const KvCacheCoordinator& coordinator, std::span<const std::string> group_ids) {
     request.Apply(std::move(event));
 
     DecodeOperation operation{{
@@ -173,9 +168,9 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
     return match;
 }
 
-std::optional<KvCacheCoordinator::AdmissionResult> Scheduler::admit(
-    KvCacheCoordinator::PrefixProbe&& prefix, std::span<const GroupDemand> demands,
-    std::optional<std::uint64_t> request_access_epoch) {
+std::optional<KvCacheCoordinator::AdmissionResult> Scheduler::admit(KvCacheCoordinator::PrefixProbe&& prefix,
+                                                                    std::span<const GroupDemand> demands,
+                                                                    std::optional<std::uint64_t> request_access_epoch) {
     std::optional<KvCacheCoordinator::AdmissionResult> result =
         coordinator_.Admit(std::move(prefix), demands, request_access_epoch);
     if (!result) {
@@ -193,8 +188,8 @@ std::optional<KvCacheCoordinator::AdmissionResult> Scheduler::admit(
     return result;
 }
 
-std::optional<KvCacheCoordinator::AdmissionResult> Scheduler::admit(
-    std::span<const GroupDemand> demands, std::uint64_t request_access_epoch) {
+std::optional<KvCacheCoordinator::AdmissionResult> Scheduler::admit(std::span<const GroupDemand> demands,
+                                                                    std::uint64_t request_access_epoch) {
     return admit(coordinator_.ProbePrefix({}), demands, request_access_epoch);
 }
 
@@ -205,23 +200,21 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     }
 
     AdmissionMatch match = matchPrefixAtAdmission(request);
-    const std::int32_t hit_tokens =
-        std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
+    const std::int32_t hit_tokens = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
     const std::int32_t promotion_boundary_tokens =
         !coordinator_.HasHostTier() && match.probe.device.prefix_closed_tokens > match.probe.device.num_common_tokens
             ? match.probe.device.prefix_closed_tokens
             : 0;
     _assert(promotion_boundary_tokens == 0 ||
                 (promotion_boundary_tokens % coordinator_.CacheBlockTokens() == 0 &&
-                 promotion_boundary_tokens > hit_tokens &&
-                 promotion_boundary_tokens < request->PrefillSize()),
+                 promotion_boundary_tokens > hit_tokens && promotion_boundary_tokens < request->PrefillSize()),
             "promotion boundary must be page-aligned and inside the unmatched prompt");
 
     const std::int32_t unscheduled = request->PrefillSize() - hit_tokens;
     std::int32_t tokens_this_round = std::min(remaining, unscheduled);
     if (coordinator_.HasMambaStateGroup() || promotion_boundary_tokens > 0) {
-        tokens_this_round = AlignPrefillChunk(hit_tokens, unscheduled, remaining,
-                                                  coordinator_.CacheBlockTokens(), promotion_boundary_tokens);
+        tokens_this_round = AlignPrefillChunk(hit_tokens, unscheduled, remaining, coordinator_.CacheBlockTokens(),
+                                              promotion_boundary_tokens);
         if (tokens_this_round == 0) {
             return std::nullopt;
         }
@@ -230,12 +223,11 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     const bool completes_prefill = tokens_this_round == unscheduled;
     const std::int32_t decode_reserve = completes_prefill ? decode_input_tokens : 0;
     std::vector<BlockTable> tables(static_cast<std::size_t>(coordinator_.NumGroups()));
-    std::vector<GroupDemand> demands = makeGroupDemands(
-        tables, GroupDemand{.num_tokens = tokens_this_round, .reserve_tokens = decode_reserve});
+    std::vector<GroupDemand> demands =
+        makeGroupDemands(tables, GroupDemand{.num_tokens = tokens_this_round, .reserve_tokens = decode_reserve});
 
     if (config_.enable_pd_cache && config_.role == Role::kD) {
-        const std::int32_t final_prompt_block =
-            (request->PrefillSize() - 1) / coordinator_.CacheBlockTokens();
+        const std::int32_t final_prompt_block = (request->PrefillSize() - 1) / coordinator_.CacheBlockTokens();
         for (std::size_t i = 0; i < demands.size(); ++i) {
             if (config_.paged_cache_groups[i].transfer_policy == PagedCacheTransferPolicy::LatestSnapshot) {
                 demands[i].num_tokens = request->PrefillSize();
@@ -244,8 +236,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         }
     }
 
-    std::optional<KvCacheCoordinator::AdmissionResult> admission =
-        admit(std::move(match.probe), demands);
+    std::optional<KvCacheCoordinator::AdmissionResult> admission = admit(std::move(match.probe), demands);
     if (!admission) {
         return std::nullopt;
     }
@@ -280,21 +271,18 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     fsm::CacheProgress cache_progress = request->CacheProgress();
     std::int32_t tokens_this_round = std::min(remaining, unscheduled);
     if (coordinator_.HasMambaStateGroup() || cache_progress.promotion_boundary_tokens > 0) {
-        tokens_this_round = AlignPrefillChunk(first_pos, unscheduled, remaining,
-                                                  coordinator_.CacheBlockTokens(),
-                                                  cache_progress.promotion_boundary_tokens);
+        tokens_this_round = AlignPrefillChunk(first_pos, unscheduled, remaining, coordinator_.CacheBlockTokens(),
+                                              cache_progress.promotion_boundary_tokens);
         if (tokens_this_round == 0) {
             return std::nullopt;
         }
     }
 
     const bool completes_prefill = tokens_this_round == unscheduled;
-    const std::int32_t decode_reserve =
-        completes_prefill ? reserve_num_tokens_in_next_schedule_event : 0;
+    const std::int32_t decode_reserve = completes_prefill ? reserve_num_tokens_in_next_schedule_event : 0;
     const PrefillInfo previous = request->CurrentPrefillInfo();
     const std::int32_t num_computed_tokens = previous.already_scheduled_len + previous.extend_len;
-    const std::int32_t new_page_hash_begin =
-        static_cast<std::int32_t>(cache_progress.page_hashes.size());
+    const std::int32_t new_page_hash_begin = static_cast<std::int32_t>(cache_progress.page_hashes.size());
     const std::int32_t filled_pages = num_computed_tokens / coordinator_.CacheBlockTokens();
     if (filled_pages > static_cast<std::int32_t>(cache_progress.page_hashes.size())) {
         appendCompletedPageHashes(cache_progress.page_hashes, request->FullPagedTokens(false), filled_pages);
@@ -306,16 +294,14 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     }
 
     std::vector<BlockTable>& tables = request->BlockTablesRef();
-    std::vector<GroupDemand> demands = makeGroupDemands(
-        tables,
-        GroupDemand{
-            .num_tokens = tokens_this_round,
-            .page_hashes = cache_progress.page_hashes,
-            .new_page_hash_begin = new_page_hash_begin,
-            .completed_boundary_kind = completed_boundary_kind,
-            .num_computed_tokens = num_computed_tokens,
-            .reserve_tokens = decode_reserve,
-        });
+    std::vector<GroupDemand> demands = makeGroupDemands(tables, GroupDemand{
+                                                                    .num_tokens = tokens_this_round,
+                                                                    .page_hashes = cache_progress.page_hashes,
+                                                                    .new_page_hash_begin = new_page_hash_begin,
+                                                                    .completed_boundary_kind = completed_boundary_kind,
+                                                                    .num_computed_tokens = num_computed_tokens,
+                                                                    .reserve_tokens = decode_reserve,
+                                                                });
     if (!admit(demands, cache_progress.access_epoch)) {
         return std::nullopt;
     }
@@ -339,8 +325,7 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
         num_computed_tokens = request->TokenSize() - config_.decode_input_tokens;
     }
 
-    const std::int32_t new_page_hash_begin =
-        static_cast<std::int32_t>(cache_progress.page_hashes.size());
+    const std::int32_t new_page_hash_begin = static_cast<std::int32_t>(cache_progress.page_hashes.size());
     const std::int32_t filled_pages = num_computed_tokens / coordinator_.CacheBlockTokens();
     if (filled_pages > static_cast<std::int32_t>(cache_progress.page_hashes.size())) {
         appendCompletedPageHashes(cache_progress.page_hashes, request->FullPagedTokens(false), filled_pages);
@@ -355,15 +340,14 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
         canConsumeReservedTokensInPlace(coordinator_, tables, reserve_tokens, num_computed_tokens)) {
         coordinator_.ConsumeReservedTokens(tables, reserve_tokens);
     } else {
-        std::vector<GroupDemand> demands = makeGroupDemands(
-            tables,
-            GroupDemand{
-                .num_tokens = reserve_tokens,
-                .page_hashes = cache_progress.page_hashes,
-                .new_page_hash_begin = new_page_hash_begin,
-                .completed_boundary_kind = completed_boundary_kind,
-                .num_computed_tokens = num_computed_tokens,
-            });
+        std::vector<GroupDemand> demands =
+            makeGroupDemands(tables, GroupDemand{
+                                         .num_tokens = reserve_tokens,
+                                         .page_hashes = cache_progress.page_hashes,
+                                         .new_page_hash_begin = new_page_hash_begin,
+                                         .completed_boundary_kind = completed_boundary_kind,
+                                         .num_computed_tokens = num_computed_tokens,
+                                     });
         if (!admit(demands, cache_progress.access_epoch)) {
             return std::nullopt;
         }
@@ -388,8 +372,7 @@ PrefillOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::S
     for (BlockTransfer& pair : load_pairs) {
         _assert(coordinator_.IsHostCachedBlock(pair.source->Location()),
                 "pinned host page lost its cache entry before load emission");
-        const KvCacheManager& manager =
-            coordinator_.GroupManager(static_cast<std::int32_t>(pair.group_id));
+        const KvCacheManager& manager = coordinator_.GroupManager(static_cast<std::int32_t>(pair.group_id));
         transfers.push_back(TransferPair{
             manager.ResolveKernelPageId(pair.source->Location()),
             manager.ResolveKernelPageId(pair.destination->Location()),
@@ -409,8 +392,7 @@ PrefillOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::S
 }
 
 DecodeOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::ScheduleDecodeEvent event) {
-    const bool needs_bootstrap_token =
-        request->Is<fsm::PrefillDone>() && config_.role == Role::kD;
+    const bool needs_bootstrap_token = request->Is<fsm::PrefillDone>() && config_.role == Role::kD;
     const std::int32_t bootstrap_token = needs_bootstrap_token ? request->LastToken() : -1;
     DecodeOperation operation =
         applyDecodeEvent(*request, std::move(event), config_.decode_input_tokens, coordinator_, cache_group_ids_);
@@ -421,8 +403,8 @@ DecodeOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::Sc
 }
 
 void Scheduler::retractForCapacity(const std::vector<Request*>& candidates) {
-    if (config_.role != Role::kFused || !lcm_admission_failed_ ||
-        !pending_forward_results_.empty() || !store_ops_.Empty() || !load_ops_.empty()) {
+    if (config_.role != Role::kFused || !lcm_admission_failed_ || !pending_forward_results_.empty() ||
+        !store_ops_.Empty() || !load_ops_.empty()) {
         return;
     }
 
@@ -438,8 +420,8 @@ void Scheduler::retractForCapacity(const std::vector<Request*>& candidates) {
     FatalCheck(request_to_retract != nullptr, "LCM admission failed without a retractable request");
     request_to_retract->Apply(fsm::RetractEvent{&coordinator_});
     ++retract_count_;
-    spdlog::info("[Scheduler] retract: released request {} ({} tokens) for LCM capacity",
-                 request_to_retract->Id(), request_to_retract->TokenSize());
+    spdlog::info("[Scheduler] retract: released request {} ({} tokens) for LCM capacity", request_to_retract->Id(),
+                 request_to_retract->TokenSize());
 }
 
 std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Scheduler::buildForwardOperations(
@@ -460,18 +442,15 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
     std::ranges::sort(candidates, [&](const Request* lhs, const Request* rhs) {
         const int lhs_priority = priority(lhs);
         const int rhs_priority = priority(rhs);
-        return lhs_priority != rhs_priority ? lhs_priority < rhs_priority
-                                            : lhs->Id() < rhs->Id();
+        return lhs_priority != rhs_priority ? lhs_priority < rhs_priority : lhs->Id() < rhs->Id();
     });
 
     const bool has_local_prefill =
-        config_.role != Role::kD &&
-        std::ranges::any_of(candidates, [](const Request* request) {
+        config_.role != Role::kD && std::ranges::any_of(candidates, [](const Request* request) {
             return request->Is<fsm::Prefilling>() || request->Is<fsm::Submitted>();
         });
     const std::int32_t state_prefill_reserve =
-        config_.enable_mixed_prefill_decode && coordinator_.HasMambaStateGroup() &&
-                has_local_prefill
+        config_.enable_mixed_prefill_decode && coordinator_.HasMambaStateGroup() && has_local_prefill
             ? coordinator_.CacheBlockTokens()
             : 0;
 
@@ -497,14 +476,12 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
     };
 
     for (Request* request : candidates) {
-        if (token_budget <= 0 ||
-            operations.size() == static_cast<std::size_t>(config_.max_batch_size)) {
+        if (token_budget <= 0 || operations.size() == static_cast<std::size_t>(config_.max_batch_size)) {
             break;
         }
 
         if (request->Is<fsm::Prefilling>() && config_.role != Role::kD) {
-            const std::int32_t reserve =
-                config_.role == Role::kP ? 0 : config_.decode_input_tokens;
+            const std::int32_t reserve = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
             if (auto event = schedulePrefill(request, token_budget, reserve)) {
                 push_operation(applyEventAndBuildOperation(request, std::move(*event)));
                 if (config_.enable_pd_cache) {
@@ -518,12 +495,9 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
         }
 
         if (request->Is<fsm::Submitted>()) {
-            const std::int32_t decode_input_tokens =
-                config_.role == Role::kP ? 0 : config_.decode_input_tokens;
-            const std::int32_t prefill_budget =
-                config_.role == Role::kD ? request->PrefillSize() : token_budget;
-            if (auto event =
-                    schedulePrefillFirstChunk(request, prefill_budget, decode_input_tokens)) {
+            const std::int32_t decode_input_tokens = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
+            const std::int32_t prefill_budget = config_.role == Role::kD ? request->PrefillSize() : token_budget;
+            if (auto event = schedulePrefillFirstChunk(request, prefill_budget, decode_input_tokens)) {
                 push_operation(applyEventAndBuildOperation(request, std::move(*event), load_back_operations));
                 if (config_.enable_pd_cache) {
                     pd_transfer_pins_.insert(request->Id());
@@ -533,13 +507,11 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
             continue;
         }
 
-        if (request->Is<fsm::PrefillDone>() ||
-            (request->Is<fsm::Decoding>() && config_.role != Role::kP)) {
+        if (request->Is<fsm::PrefillDone>() || (request->Is<fsm::Decoding>() && config_.role != Role::kP)) {
             if (!config_.enable_mixed_prefill_decode && pushed_prefill) {
                 break;
             }
-            if (token_budget <
-                state_prefill_reserve + config_.decode_input_tokens) {
+            if (token_budget < state_prefill_reserve + config_.decode_input_tokens) {
                 continue;
             }
             if (auto event = scheduleDecode(request)) {

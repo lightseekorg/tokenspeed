@@ -71,9 +71,7 @@ public:
     std::int32_t PagedCacheGroupTotalPages(const std::string& group_id) const;
     std::int32_t PagedCacheGroupAvailablePages(const std::string& group_id) const;
 
-    bool PdTransferPinned(const std::string& request_id) const {
-        return pd_transfer_pins_.contains(request_id);
-    }
+    bool PdTransferPinned(const std::string& request_id) const { return pd_transfer_pins_.contains(request_id); }
     std::int32_t PoolFreeBlocks() const { return coordinator_.NumAvailableLcmBlocks(); }
     std::int32_t HostPoolCachedBlocks() const { return coordinator_.NumHostCachedBlocks(); }
     std::int32_t HostPoolFreeBlocks() const { return host_pool_.NumEmptyLcmBlocks(); }
@@ -88,10 +86,11 @@ private:
 
     std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> buildForwardOperations(
         std::vector<Request*> candidates);
-    std::optional<fsm::SchedulePrefillFirstChunkEvent> schedulePrefillFirstChunk(
-        Request* request, std::int32_t remaining, std::int32_t decode_input_tokens);
-    std::optional<fsm::SchedulePrefillEvent> schedulePrefill(
-        Request* request, std::int32_t remaining, std::int32_t reserve_num_tokens_in_next_schedule_event);
+    std::optional<fsm::SchedulePrefillFirstChunkEvent> schedulePrefillFirstChunk(Request* request,
+                                                                                 std::int32_t remaining,
+                                                                                 std::int32_t decode_input_tokens);
+    std::optional<fsm::SchedulePrefillEvent> schedulePrefill(Request* request, std::int32_t remaining,
+                                                             std::int32_t reserve_num_tokens_in_next_schedule_event);
     std::optional<fsm::ScheduleDecodeEvent> scheduleDecode(Request* request);
 
     PrefillOperation applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillFirstChunkEvent event,
@@ -103,8 +102,8 @@ private:
     std::optional<KvCacheCoordinator::AdmissionResult> admit(
         KvCacheCoordinator::PrefixProbe&& prefix, std::span<const GroupDemand> demands,
         std::optional<std::uint64_t> request_access_epoch = std::nullopt);
-    std::optional<KvCacheCoordinator::AdmissionResult> admit(
-        std::span<const GroupDemand> demands, std::uint64_t request_access_epoch);
+    std::optional<KvCacheCoordinator::AdmissionResult> admit(std::span<const GroupDemand> demands,
+                                                             std::uint64_t request_access_epoch);
     void retractForCapacity(const std::vector<Request*>& candidates);
 
     void emitPendingStores(std::vector<WriteBackOperation>& write_back_operations);

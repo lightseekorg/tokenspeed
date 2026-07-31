@@ -53,8 +53,8 @@ public:
                 if constexpr (std::is_convertible_v<Result, fsm::State>) {
                     return fsm::State{std::move(result)};
                 } else {
-                    return std::visit(
-                        [](auto&& inner) -> fsm::State { return fsm::State{std::move(inner)}; }, std::move(result));
+                    return std::visit([](auto&& inner) -> fsm::State { return fsm::State{std::move(inner)}; },
+                                      std::move(result));
                 }
             },
             std::move(state_));
@@ -76,15 +76,14 @@ public:
     PrefillInfo CurrentPrefillInfo() const;
 
     std::int32_t UnscheduledPrefillSize() const {
-        return std::visit(
-            Overloaded{
-                [](const fsm::Submitted&) -> std::int32_t { return -1; },
-                [this](const fsm::Prefilling& state) -> std::int32_t {
-                    return PrefillSize() - (state.window.begin + state.window.size);
-                },
-                [](const auto&) -> std::int32_t { return 0; },
-            },
-            state_);
+        return std::visit(Overloaded{
+                              [](const fsm::Submitted&) -> std::int32_t { return -1; },
+                              [this](const fsm::Prefilling& state) -> std::int32_t {
+                                  return PrefillSize() - (state.window.begin + state.window.size);
+                              },
+                              [](const auto&) -> std::int32_t { return 0; },
+                          },
+                          state_);
     }
 
     std::int32_t RequestPoolIndex() const { return forwardState("RequestPoolIndex").RequestPoolIndex(); }
@@ -93,13 +92,9 @@ public:
         return forwardState("ActiveLcmBlockIds").ActiveLcmBlockIds();
     }
 
-    const std::vector<BlockTable>& BlockTablesRef() const {
-        return forwardState("BlockTablesRef").BlockTables();
-    }
+    const std::vector<BlockTable>& BlockTablesRef() const { return forwardState("BlockTablesRef").BlockTables(); }
 
-    std::vector<BlockTable>& BlockTablesRef() {
-        return forwardState("BlockTablesRef").BlockTables();
-    }
+    std::vector<BlockTable>& BlockTablesRef() { return forwardState("BlockTablesRef").BlockTables(); }
 
     fsm::CacheProgress CacheProgress() const { return forwardState("CacheProgress").CacheProgressRef(); }
 
@@ -118,16 +113,15 @@ public:
     }
 
     std::string StateName() const {
-        return std::visit(
-            Overloaded{
-                [](const fsm::Bootstrapping&) -> std::string { return "Bootstrapping"; },
-                [](const fsm::Submitted&) -> std::string { return "Submitted"; },
-                [](const fsm::Prefilling&) -> std::string { return "Prefilling"; },
-                [](const fsm::PrefillDone&) -> std::string { return "PrefillDone"; },
-                [](const fsm::Decoding&) -> std::string { return "Decoding"; },
-                [](const fsm::Finished&) -> std::string { return "Finished"; },
-            },
-            state_);
+        return std::visit(Overloaded{
+                              [](const fsm::Bootstrapping&) -> std::string { return "Bootstrapping"; },
+                              [](const fsm::Submitted&) -> std::string { return "Submitted"; },
+                              [](const fsm::Prefilling&) -> std::string { return "Prefilling"; },
+                              [](const fsm::PrefillDone&) -> std::string { return "PrefillDone"; },
+                              [](const fsm::Decoding&) -> std::string { return "Decoding"; },
+                              [](const fsm::Finished&) -> std::string { return "Finished"; },
+                          },
+                          state_);
     }
 
 private:

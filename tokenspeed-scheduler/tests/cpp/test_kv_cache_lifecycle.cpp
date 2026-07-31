@@ -200,17 +200,16 @@ TEST_F(KimiFourGroupSuite, FourTablesUseDisjointGlobalPages) {
         ASSERT_EQ(op->block_tables.count(group_id), 1u) << group_id;
         ASSERT_EQ(op->block_tables.at(group_id).size(), 1u) << group_id;
         std::set<std::int32_t> group_real;
-        const std::size_t group_entries =
-            CollectDisjointRealPages(op->block_tables.at(group_id), group_real, group_id);
+        const std::size_t group_entries = CollectDisjointRealPages(op->block_tables.at(group_id), group_real, group_id);
         EXPECT_GT(group_entries, 0u) << group_id;
         fresh_positive_entries += group_entries;
         for (std::int32_t page_id : group_real) {
             EXPECT_TRUE(all_real.insert(page_id).second) << "physical page " << page_id << " reused across groups";
         }
         ASSERT_EQ(plan.pages_to_zero.count(group_id), 1u) << group_id;
-        EXPECT_EQ(std::set<std::int32_t>(plan.pages_to_zero.at(group_id).begin(),
-                                         plan.pages_to_zero.at(group_id).end()),
-                  group_real)
+        EXPECT_EQ(
+            std::set<std::int32_t>(plan.pages_to_zero.at(group_id).begin(), plan.pages_to_zero.at(group_id).end()),
+            group_real)
             << "every freshly-owned physical page must be sanitized in its cache group";
     }
     EXPECT_EQ(all_real.size(), fresh_positive_entries);

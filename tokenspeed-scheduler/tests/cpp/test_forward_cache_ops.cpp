@@ -64,31 +64,31 @@ TEST(ForwardCacheOpsFree, ReturnsAllPagesToPool) {
 
 TEST(AlignPrefillChunkTest, StopsAtPromotionBoundary) {
     EXPECT_EQ(AlignPrefillChunk(/*first_pos=*/16, /*unscheduled=*/24, /*token_budget=*/24,
-                                    /*page_size=*/4, /*promotion_boundary_tokens=*/32),
+                                /*page_size=*/4, /*promotion_boundary_tokens=*/32),
               16);
 }
 
 TEST(AlignPrefillChunkTest, KeepsFuturePromotionWhenBudgetFallsShort) {
     EXPECT_EQ(AlignPrefillChunk(/*first_pos=*/16, /*unscheduled=*/24, /*token_budget=*/8,
-                                    /*page_size=*/4, /*promotion_boundary_tokens=*/32),
+                                /*page_size=*/4, /*promotion_boundary_tokens=*/32),
               8);
 }
 
 TEST(AlignPrefillChunkTest, LaterChunkStopsAtPromotionBoundary) {
     EXPECT_EQ(AlignPrefillChunk(/*first_pos=*/24, /*unscheduled=*/16, /*token_budget=*/16,
-                                    /*page_size=*/4, /*promotion_boundary_tokens=*/32),
+                                /*page_size=*/4, /*promotion_boundary_tokens=*/32),
               8);
 }
 
 TEST(AlignPrefillChunkTest, EndpointBeforePromotionWins) {
     EXPECT_EQ(AlignPrefillChunk(/*first_pos=*/24, /*unscheduled=*/4, /*token_budget=*/16,
-                                    /*page_size=*/4, /*promotion_boundary_tokens=*/32),
+                                /*page_size=*/4, /*promotion_boundary_tokens=*/32),
               4);
 }
 
 TEST(AlignPrefillChunkTest, ReachedPromotionUsesOrdinaryPageAlignment) {
     EXPECT_EQ(AlignPrefillChunk(/*first_pos=*/32, /*unscheduled=*/16, /*token_budget=*/10,
-                                    /*page_size=*/4, /*promotion_boundary_tokens=*/32),
+                                /*page_size=*/4, /*promotion_boundary_tokens=*/32),
               8);
 }
 

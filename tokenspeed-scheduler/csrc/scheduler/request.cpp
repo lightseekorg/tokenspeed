@@ -54,8 +54,7 @@ fsm::ForwardState& Request::forwardState(const char* operation) {
         },
         state_);
     if (result == nullptr) {
-        throw std::logic_error(std::string{"Request::"} + operation + ": expected a forward state; got " +
-                               StateName());
+        throw std::logic_error(std::string{"Request::"} + operation + ": expected a forward state; got " + StateName());
     }
     return *result;
 }
@@ -70,8 +69,7 @@ const fsm::ForwardState& Request::forwardState(const char* operation) const {
         },
         state_);
     if (result == nullptr) {
-        throw std::logic_error(std::string{"Request::"} + operation + ": expected a forward state; got " +
-                               StateName());
+        throw std::logic_error(std::string{"Request::"} + operation + ": expected a forward state; got " + StateName());
     }
     return *result;
 }

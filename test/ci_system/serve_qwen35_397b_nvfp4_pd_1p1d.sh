@@ -122,6 +122,7 @@ COMMON_ARGS=(
   --max-num-seqs "$MAX_NUM_SEQS"
   --quantization "$QUANTIZATION"
   --kv-cache-dtype "$KV_CACHE_DTYPE"
+  --disable-kvstore
   --kvstore-ratio "$KVSTORE_RATIO"
   --enable-cache-report
   --disaggregation-transfer-backend mooncake

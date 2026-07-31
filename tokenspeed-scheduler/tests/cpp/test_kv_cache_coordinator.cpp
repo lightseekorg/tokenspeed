@@ -1117,8 +1117,7 @@ TEST(KvCacheCoordinatorAdmissionTest, QwenScaleChunkLifecyclePublishesOneStateSn
                 .num_tokens = kChunkPages * kBlockTokens,
                 .page_hashes = std::span<const std::string>{hashes}.first(first_page),
                 .new_page_hash_begin = std::max(first_page - kChunkPages, 0),
-                .completed_boundary_kind =
-                    first_page == 0 ? std::nullopt : std::optional{CacheBoundaryKind::kChunk},
+                .completed_boundary_kind = first_page == 0 ? std::nullopt : std::optional{CacheBoundaryKind::kChunk},
                 .num_computed_tokens = first_page * kBlockTokens,
                 .reserve_tokens = chunk == kPromptPages / kChunkPages - 1 ? 1 : 0,
             });
@@ -2698,8 +2697,7 @@ TEST(MambaStateKindTest, StateGroupRetentionKeepsOnlyLastPage) {
 
 TEST(CompletedBoundaryTest, HistoricalHashesWithoutBoundaryAreNotPublished) {
     BlockPool pool(8);
-    std::vector<KvCacheSpec> specs = {
-        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1}};
+    std::vector<KvCacheSpec> specs = {{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1}};
     KvCacheCoordinator coordinator = MakeCoordinator(specs, /*cache_block_tokens=*/4, pool);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
@@ -2719,8 +2717,7 @@ TEST(CompletedBoundaryTest, HistoricalHashesWithoutBoundaryAreNotPublished) {
 
 TEST(CompletedBoundaryTest, RejectsNewHashesWithoutBoundaryKind) {
     BlockPool pool(8);
-    std::vector<KvCacheSpec> specs = {
-        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1}};
+    std::vector<KvCacheSpec> specs = {{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1}};
     KvCacheCoordinator coordinator = MakeCoordinator(specs, /*cache_block_tokens=*/4, pool);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));

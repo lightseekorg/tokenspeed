@@ -149,7 +149,6 @@ protected:
     std::unique_ptr<Scheduler> scheduler_;
 };
 
-
 // Returns the first ForwardBatch in `plan`, or nullptr if none.
 inline const ForwardBatch* FindForwardBatch(const ExecutionPlan& plan) {
     for (const auto& op : plan.Operations()) {
@@ -224,6 +223,5 @@ protected:
         scheduler_->Advance(std::move(event));
     }
 };
-
 
 }  // namespace tokenspeed::test

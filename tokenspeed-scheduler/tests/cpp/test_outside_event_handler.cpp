@@ -85,7 +85,6 @@ protected:
         }
         PlanOnce();
     }
-
 };
 
 // After host cache is populated, a new request with same tokens should see

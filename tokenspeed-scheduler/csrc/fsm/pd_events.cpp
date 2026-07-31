@@ -45,10 +45,13 @@ PrefillDone RemotePrefillDoneEvent::operator()(Prefilling&& state) {
     auto req_pool_index = std::move(state).TakeRequestPoolIndex();
     auto block_tables = std::move(state).TakeBlockTables();
     auto cache_progress = std::move(state).TakeCacheProgress();
-    auto prefill_done =
-        PrefillDone{token_container, page_size, std::move(req_pool_index), window,
-                    reserve_num_tokens_in_next_schedule_event, std::move(block_tables),
-                    std::move(cache_progress)};
+    auto prefill_done = PrefillDone{token_container,
+                                    page_size,
+                                    std::move(req_pool_index),
+                                    window,
+                                    reserve_num_tokens_in_next_schedule_event,
+                                    std::move(block_tables),
+                                    std::move(cache_progress)};
     prefill_done.ExtendResultTokens({bootstrap_token});
     return prefill_done;
 }

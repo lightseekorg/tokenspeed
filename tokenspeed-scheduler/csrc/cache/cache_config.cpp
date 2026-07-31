@@ -40,10 +40,8 @@ void PagedCacheGroupConfig::Validate() const {
     if (cache_blocks_per_lcm_block <= 0) {
         throw std::invalid_argument("PagedCacheGroupConfig: cache_blocks_per_lcm_block must be > 0");
     }
-    if (retention == Retention::SlidingWindow &&
-        (!sliding_window_tokens || *sliding_window_tokens <= 0)) {
-        throw std::invalid_argument(
-            "PagedCacheGroupConfig: sliding_window_tokens must be > 0 for sliding groups");
+    if (retention == Retention::SlidingWindow && (!sliding_window_tokens || *sliding_window_tokens <= 0)) {
+        throw std::invalid_argument("PagedCacheGroupConfig: sliding_window_tokens must be > 0 for sliding groups");
     }
 }
 
