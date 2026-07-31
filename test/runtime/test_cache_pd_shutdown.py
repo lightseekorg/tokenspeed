@@ -41,7 +41,7 @@ class _SchedulerHarness:
 
     def next_execution_plan(self):
         self._trace.append("next_plan")
-        return SimpleNamespace(page_ids_to_zero=())
+        return SimpleNamespace(pages_to_zero=())
 
 
 class _ModelExecutorHarness:
@@ -201,6 +201,8 @@ def test_run_event_loop_sigterm_sets_event_and_finally_closes(
             trace.append("construct")
             self.shutdown_event = shutdown_event
             self.max_total_num_tokens = 1024
+            self.max_single_request_tokens = 768
+            self.max_model_len = 4096
             self.max_req_input_len = 512
             self.model_config = SimpleNamespace(context_len=4096)
             self.has_dp = False

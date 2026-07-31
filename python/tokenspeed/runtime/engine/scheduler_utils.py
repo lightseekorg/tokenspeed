@@ -126,7 +126,9 @@ def scheduler_cache_geometry_from_pool(
     pages = fallback_token_capacity // fallback_page_size
     return SchedulerCacheGeometry(
         page_size=fallback_page_size,
-        num_device_pages=pages,
+        # Ordinary pools allocate page 0 separately from their profiled,
+        # usable token capacity, just like LCM pools reserve parent 0.
+        num_device_pages=pages + 1,
         num_usable_pages=pages,
         token_capacity=fallback_token_capacity,
     )

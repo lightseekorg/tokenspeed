@@ -2949,6 +2949,29 @@ TEST(SwaRegistrationTest, SwaBoundaryRequiresTrailingWindow) {
     coord.Free(tables);
 }
 
+TEST(SwaRegistrationTest, UnalignedEndpointPublishesTrailingFullPages) {
+    BlockPool pool(32);
+    std::vector<KvCacheSpec> specs = {
+        {.kind = AttnKind::kSlidingWindow, .sliding_window = 9, .cache_blocks_per_lcm_block = 1}};
+    KvCacheCoordinator coord = MakeCoordinator(specs, 4, pool);
+    std::vector<BlockTable> tables(coord.NumGroups());
+    ASSERT_TRUE(AdmitForTest(coord, tables, /*num_tokens=*/14));
+    std::vector<std::string> hashes = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}});
+    std::vector<GroupDemand> demands{{
+        .table = &tables[0],
+        .page_hashes = hashes,
+        .new_page_hash_begin = 0,
+        .completed_boundary_kind = CacheBoundaryKind::kEndpoint,
+        .num_computed_tokens = 14,
+    }};
+
+    ASSERT_TRUE(coord.Admit(coord.ProbePrefix({}), demands));
+    EXPECT_FALSE(coord.GroupManager(0).ContainsCachedBlock(pool, Key(hashes[0], 0)));
+    EXPECT_TRUE(coord.GroupManager(0).ContainsCachedBlock(pool, Key(hashes[1], 0)));
+    EXPECT_TRUE(coord.GroupManager(0).ContainsCachedBlock(pool, Key(hashes[2], 0)));
+    coord.Free(tables);
+}
+
 TEST(KvCacheManagerBoundaryTest, BoundaryPromotionIsMonotonic) {
     BlockPool pool(1);
     FullAttnManager manager(/*cache_block_tokens=*/4);

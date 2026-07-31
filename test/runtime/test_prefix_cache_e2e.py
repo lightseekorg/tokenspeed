@@ -187,7 +187,7 @@ class TestPrefixCacheDisabled(unittest.TestCase):
 
 
 class TestPrefixCacheEnabled(unittest.TestCase):
-    """When prefix caching is enabled (default), the shared prefix should be cached."""
+    """When prefix caching is enabled, a promoted shared prefix becomes reusable."""
 
     def test_prefix_cache_enabled_has_cached_tokens(self):
         for case in _ACTIVE_MODELS:
@@ -196,7 +196,10 @@ class TestPrefixCacheEnabled(unittest.TestCase):
                 try:
                     sampling = {"max_new_tokens": 8, "temperature": 0}
 
-                    # First request: primes the system prompt.
+                    # The first request publishes its endpoint. The second
+                    # request discovers the shorter shared Full-KV prefix and
+                    # materializes the matching State/SWA boundary. The third
+                    # request can then reuse that converged cross-group prefix.
                     engine.generate(
                         prompt=_render_prompt(
                             case, "What is 1+1? Reply with just the number."
@@ -204,11 +207,16 @@ class TestPrefixCacheEnabled(unittest.TestCase):
                         sampling_params=sampling,
                         stream=False,
                     )
-
-                    # Second request: shares the same system prefix — should hit cache.
-                    resp = engine.generate(
+                    engine.generate(
                         prompt=_render_prompt(
                             case, "What is 2+2? Reply with just the number."
+                        ),
+                        sampling_params=sampling,
+                        stream=False,
+                    )
+                    resp = engine.generate(
+                        prompt=_render_prompt(
+                            case, "What is 3+3? Reply with just the number."
                         ),
                         sampling_params=sampling,
                         stream=False,

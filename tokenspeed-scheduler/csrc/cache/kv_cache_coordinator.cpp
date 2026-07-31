@@ -291,7 +291,14 @@ void KvCacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, c
                                 demand.new_page_hash_begin, access_epoch, *demand.completed_boundary_kind);
         return;
     }
-    if (demand.num_computed_tokens < 0 || demand.num_computed_tokens % cache_block_tokens_ != 0) {
+    if (demand.num_computed_tokens < 0) {
+        return;
+    }
+    // Mamba can publish only a state checkpoint that the kernel materialized
+    // exactly at this boundary. SWA pages are ordinary KV, so an unaligned
+    // endpoint can still publish its trailing complete-page boundary.
+    if (groups_[group_index].Spec().kind == AttnKind::kMambaState &&
+        demand.num_computed_tokens % cache_block_tokens_ != 0) {
         return;
     }
 
