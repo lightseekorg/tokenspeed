@@ -66,6 +66,12 @@ class ProcessGroupManager:
                 if timeout <= 0:
                     raise ValueError("timeout must be positive")
                 timeout = timedelta(seconds=timeout)
+            # Subgroups created later must inherit this timeout: new_group()
+            # without one falls back to torch's 1800s default, so a slow
+            # startup phase (e.g. a first-boot MoE autotune sweep with no
+            # pre-swept tactic table) blows the subgroup's gloo recv even
+            # when --distributed-timeout-seconds is far larger.
+            self._pg_timeout = timeout
 
             dist.init_process_group(
                 backend=backend,
@@ -105,7 +111,9 @@ class ProcessGroupManager:
             if self.has_process_group(backend, group):
                 continue
             for g in _make_all_groups(group):
-                pg = dist.new_group(g, backend=backend)
+                pg = dist.new_group(
+                    g, backend=backend, timeout=getattr(self, "_pg_timeout", None)
+                )
                 if g == group:
                     self.register_process_group(backend, g, pg)
 
