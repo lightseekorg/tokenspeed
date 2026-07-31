@@ -143,12 +143,6 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
         }
         return coordinator_.ProbePrefix(hashes);
     };
-    if (config_.disable_prefix_cache) {
-        AdmissionMatch match;
-        match.probe = probe({});
-        return match;
-    }
-
     const std::int32_t cache_block_tokens = coordinator_.CacheBlockTokens();
     const std::int32_t cacheable_pages = std::max((request->PrefillSize() - 1) / cache_block_tokens, 0);
     std::vector<std::span<const std::int32_t>> paged_tokens = request->FullPagedTokens(false);
@@ -156,6 +150,11 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
     std::vector<std::string> hashes = ComputePagedHashes(paged_tokens, "");
 
     AdmissionMatch match;
+    match.candidate_page_hashes = hashes;
+    if (config_.disable_prefix_cache) {
+        match.probe = probe({});
+        return match;
+    }
     match.probe = probe(hashes);
     const std::int32_t hit_pages =
         std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens) / cache_block_tokens;
@@ -236,8 +235,10 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         }
     }
 
+    std::vector<CacheKey> event_keys = registerKvEventPages(*request, match.candidate_page_hashes, 0);
     std::optional<KvCacheCoordinator::AdmissionResult> admission = admit(std::move(match.probe), demands);
     if (!admission) {
+        discardUncachedKvEventPages(event_keys);
         return std::nullopt;
     }
     _assert(admission->promotion_boundary_tokens == promotion_boundary_tokens,
@@ -247,6 +248,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         coordinator_.CacheFullBlocks(tables, match.extension_hashes, admission->access_epoch,
                                      admission->device_prefix_tokens / coordinator_.CacheBlockTokens());
     }
+    discardUncachedKvEventPages(event_keys);
     return fsm::SchedulePrefillFirstChunkEvent{
         tokens_this_round,
         decode_reserve,
@@ -302,9 +304,12 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
                                                                     .num_computed_tokens = num_computed_tokens,
                                                                     .reserve_tokens = decode_reserve,
                                                                 });
+    std::vector<CacheKey> event_keys = registerKvEventPages(*request, cache_progress.page_hashes, new_page_hash_begin);
     if (!admit(demands, cache_progress.access_epoch)) {
+        discardUncachedKvEventPages(event_keys);
         return std::nullopt;
     }
+    discardUncachedKvEventPages(event_keys);
 
     return fsm::SchedulePrefillEvent{
         tokens_this_round,
@@ -348,9 +353,13 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
                                          .completed_boundary_kind = completed_boundary_kind,
                                          .num_computed_tokens = num_computed_tokens,
                                      });
+        std::vector<CacheKey> event_keys =
+            registerKvEventPages(*request, cache_progress.page_hashes, new_page_hash_begin);
         if (!admit(demands, cache_progress.access_epoch)) {
+            discardUncachedKvEventPages(event_keys);
             return std::nullopt;
         }
+        discardUncachedKvEventPages(event_keys);
     }
 
     return fsm::ScheduleDecodeEvent{config_.decode_input_tokens, std::move(cache_progress)};

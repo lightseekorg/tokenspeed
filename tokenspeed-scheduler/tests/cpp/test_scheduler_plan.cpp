@@ -200,4 +200,128 @@ TEST_F(StableCandidateOrderingSuite, ForwardBatchIsInsertionOrderIndependent) {
     EXPECT_EQ(ids_a, ids_b);
 }
 
+class SchedulerKvCacheEventTestSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 3;
+        cfg.disable_l2_cache = true;
+        cfg.enable_kv_cache_events = true;
+        return cfg;
+    }
+};
+
+TEST_F(SchedulerKvCacheEventTestSuite, PublishesStoredBlockAndDrainsItOnce) {
+    const RequestSpec spec = MakeRequestSpec("r1", 1);
+    Submit(spec);
+    PlanOnce();
+    SendForwardDone("r1", {42});
+    PlanOnce();
+    SendFinish("r1");
+
+    std::vector<KvCacheEvent> events = scheduler_->DrainKvEvents();
+    ASSERT_EQ(events.size(), 1u);
+    ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(events[0]));
+    EXPECT_EQ(std::get<KvBlockStoredEvent>(events[0]).token_ids, spec.tokens);
+    EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
+}
+
+TEST_F(SchedulerKvCacheEventTestSuite, PublishesRemovalWhenAdmissionEvictsBlock) {
+    Submit(MakeRequestSpec("seed", 1));
+    PlanOnce();
+    SendForwardDone("seed", {42});
+    PlanOnce();
+    SendFinish("seed");
+
+    std::vector<KvCacheEvent> stored = scheduler_->DrainKvEvents();
+    ASSERT_EQ(stored.size(), 1u);
+    const std::uint64_t stored_hash = std::get<KvBlockStoredEvent>(stored[0]).block_hashes.front();
+
+    Submit(MakeRequestSpec("replacement", 1, 100));
+    PlanOnce();
+
+    std::vector<KvCacheEvent> removed = scheduler_->DrainKvEvents();
+    ASSERT_EQ(removed.size(), 1u);
+    ASSERT_TRUE(std::holds_alternative<KvBlockRemovedEvent>(removed[0]));
+    EXPECT_EQ(std::get<KvBlockRemovedEvent>(removed[0]).block_hashes, std::vector<std::uint64_t>{stored_hash});
+}
+
+class MultiGroupKvCacheEventTestSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 8;
+        cfg.disable_l2_cache = true;
+        cfg.enable_kv_cache_events = true;
+        PagedCacheGroupConfig second = cfg.paged_cache_groups.front();
+        second.group_id = "full_attention_1";
+        cfg.paged_cache_groups.push_back(std::move(second));
+        return cfg;
+    }
+};
+
+TEST_F(MultiGroupKvCacheEventTestSuite, PublishesOneEventAfterAllGroupsCacheBoundary) {
+    Submit(MakeRequestSpec("r1", 1));
+    PlanOnce();
+    SendForwardDone("r1", {42});
+    PlanOnce();
+    SendFinish("r1");
+
+    std::vector<KvCacheEvent> events = scheduler_->DrainKvEvents();
+    ASSERT_EQ(events.size(), 1u);
+    EXPECT_TRUE(std::holds_alternative<KvBlockStoredEvent>(events[0]));
+}
+
+class HybridPrefixPromotionTestSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 128;
+        cfg.disable_l2_cache = true;
+        for (std::int32_t i = 0; i < 3; ++i) {
+            PagedCacheGroupConfig state = cfg.paged_cache_groups.front();
+            state.group_id = "linear_attention_" + std::to_string(i);
+            state.family = PagedCacheGroupFamily::State;
+            cfg.paged_cache_groups.push_back(std::move(state));
+        }
+        return cfg;
+    }
+
+    RequestSpec MakeHybridRequest(const std::string& id, std::int32_t suffix_start) {
+        RequestSpec spec = MakeRequestSpec(id, /*num_pages=*/4);
+        spec.tokens.push_back(suffix_start);
+        spec.tokens.push_back(suffix_start + 1);
+        spec.tokens.push_back(suffix_start + 2);
+        return spec;
+    }
+};
+
+TEST_F(HybridPrefixPromotionTestSuite, ThirdRequestReusesPromotedStateBoundary) {
+    Submit(MakeHybridRequest("seed", 100));
+    PlanOnce();
+    SendForwardDone("seed", {900});
+    PlanOnce();
+    SendFinish("seed");
+    PlanOnce();
+
+    Submit(MakeHybridRequest("promote", 200));
+    const ExecutionPlan promotion_plan = PlanOnce();
+    const ForwardBatch* promotion = FindForwardBatch(promotion_plan);
+    ASSERT_NE(promotion, nullptr);
+    ASSERT_EQ(promotion->request_ids, std::vector<std::string>{"promote"});
+    EXPECT_EQ(promotion->input_lengths, std::vector<std::int32_t>{8});
+    PlanOnce();
+    SendForwardDone("promote", {901});
+    PlanOnce();
+    SendFinish("promote");
+    PlanOnce();
+
+    Submit(MakeHybridRequest("reuse", 300));
+    const ExecutionPlan reuse_plan = PlanOnce();
+    const ForwardBatch* reuse = FindForwardBatch(reuse_plan);
+    ASSERT_NE(reuse, nullptr);
+    ASSERT_EQ(reuse->request_ids, std::vector<std::string>{"reuse"});
+    EXPECT_EQ(reuse->extend_prefix_lens, std::vector<std::int32_t>{8});
+}
+
 }  // namespace tokenspeed::test

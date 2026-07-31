@@ -49,6 +49,14 @@ std::int64_t ceilDiv(std::int64_t value, std::int64_t divisor) {
     return (value + divisor - 1) / divisor;
 }
 
+CacheKey eventKey(const CacheKey& key) {
+    return CacheKey{
+        .namespace_id = key.namespace_id,
+        .group_id = 0,
+        .content_hash = key.content_hash,
+    };
+}
+
 }  // namespace
 
 Scheduler::Scheduler(SchedulerConfig config)
@@ -92,6 +100,12 @@ Scheduler::Scheduler(SchedulerConfig config)
         cache_group_ids_.push_back(group.group_id);
     }
     max_single_request_tokens_ = calculateMaxSingleRequestTokens();
+
+    if (config_.enable_kv_cache_events) {
+        coordinator_.SetCacheMutationSink([this](const CacheKey& key, KvCacheCoordinator::CacheMutation mutation) {
+            handleCacheMutation(key, mutation);
+        });
+    }
 
     if (const char* level = std::getenv("SPDLOG_LEVEL")) {
         spdlog::set_level(spdlog::level::from_str(level));
@@ -202,6 +216,79 @@ std::vector<KvCacheEvent> Scheduler::DrainKvEvents() {
     return std::exchange(kv_events_, {});
 }
 
+std::vector<CacheKey> Scheduler::registerKvEventPages(const Request& request, std::span<const std::string> page_hashes,
+                                                      std::int32_t first_page) {
+    if (!config_.enable_kv_cache_events) {
+        return {};
+    }
+    _assert(first_page >= 0 && static_cast<std::size_t>(first_page) <= page_hashes.size(),
+            "KV event page range is invalid");
+    const std::vector<std::span<const std::int32_t>> token_pages = request.FullPagedTokens(false);
+    _assert(page_hashes.size() <= token_pages.size(), "KV event hashes exceed the request's complete pages");
+
+    KvEventHashProgress& progress = kv_event_hash_progress_[request.Id()];
+    for (std::size_t i = progress.block_hashes.size(); i < page_hashes.size(); ++i) {
+        const std::optional<std::uint64_t> parent_hash =
+            i == 0 ? std::nullopt : std::optional<std::uint64_t>{progress.block_hashes[i - 1]};
+        progress.block_hashes.push_back(HashKvBlock(token_pages[i], parent_hash));
+    }
+
+    std::vector<CacheKey> registered_keys;
+    registered_keys.reserve(page_hashes.size() - static_cast<std::size_t>(first_page));
+    for (std::size_t i = static_cast<std::size_t>(first_page); i < page_hashes.size(); ++i) {
+        CacheKey key{.content_hash = page_hashes[i]};
+        const std::optional<std::uint64_t> parent_hash =
+            i == 0 ? std::nullopt : std::optional<std::uint64_t>{progress.block_hashes[i - 1]};
+        KvBlockStoredEvent event{
+            .block_hashes = {progress.block_hashes[i]},
+            .parent_block_hash = parent_hash,
+            .token_ids = std::vector<std::int32_t>(token_pages[i].begin(), token_pages[i].end()),
+            .block_size = config_.block_size,
+        };
+        const auto [it, inserted] = kv_event_pages_.try_emplace(key, std::move(event));
+        FatalCheck(inserted || it->second.block_hashes.front() == progress.block_hashes[i],
+                   "one cache content hash mapped to different KV event blocks");
+        registered_keys.push_back(std::move(key));
+    }
+    return registered_keys;
+}
+
+void Scheduler::discardUncachedKvEventPages(std::span<const CacheKey> keys) {
+    for (const CacheKey& key : keys) {
+        if (!cached_event_group_counts_.contains(key)) {
+            kv_event_pages_.erase(key);
+        }
+    }
+}
+
+void Scheduler::handleCacheMutation(const CacheKey& key, KvCacheCoordinator::CacheMutation mutation) {
+    const CacheKey prefix_key = eventKey(key);
+    if (mutation == KvCacheCoordinator::CacheMutation::kStored) {
+        std::int32_t& group_count = cached_event_group_counts_[prefix_key];
+        FatalCheck(group_count < coordinator_.NumGroups(), "duplicate group entry for one KV event boundary");
+        ++group_count;
+        if (group_count == coordinator_.NumGroups()) {
+            const auto page_it = kv_event_pages_.find(prefix_key);
+            FatalCheck(page_it != kv_event_pages_.end(), "cached KV event boundary has no token descriptor");
+            kv_events_.emplace_back(page_it->second);
+        }
+        return;
+    }
+
+    auto count_it = cached_event_group_counts_.find(prefix_key);
+    FatalCheck(count_it != cached_event_group_counts_.end() && count_it->second > 0,
+               "removed KV event boundary was not registered");
+    if (count_it->second == coordinator_.NumGroups()) {
+        const auto page_it = kv_event_pages_.find(prefix_key);
+        FatalCheck(page_it != kv_event_pages_.end(), "removed KV event boundary has no token descriptor");
+        kv_events_.emplace_back(KvBlockRemovedEvent{.block_hashes = page_it->second.block_hashes});
+    }
+    if (--count_it->second == 0) {
+        cached_event_group_counts_.erase(count_it);
+        kv_event_pages_.erase(prefix_key);
+    }
+}
+
 void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
     for (const RequestSpec& spec : request_specs) {
         auto request = std::make_unique<Request>(spec, config_.block_size, config_.role);
@@ -310,7 +397,13 @@ void Scheduler::emitPendingStores(std::vector<WriteBackOperation>& write_back_op
 }
 
 ExecutionPlan Scheduler::NextExecutionPlan() {
-    std::erase_if(requests_, [](const auto& item) { return item.second->template Is<fsm::Finished>(); });
+    std::erase_if(requests_, [this](const auto& item) {
+        if (!item.second->template Is<fsm::Finished>()) {
+            return false;
+        }
+        kv_event_hash_progress_.erase(item.first);
+        return true;
+    });
 
     std::vector<Request*> candidates;
     candidates.reserve(requests_.size());

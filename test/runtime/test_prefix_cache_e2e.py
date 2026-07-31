@@ -87,7 +87,14 @@ _SYSTEM_PROMPT = (
     "If a question does not make any sense, or is not factually coherent, "
     "explain why instead of answering something incorrect. "
     "If you don't know the answer to a question, please don't share false information. "
-    "Please think step by step and be thorough in your reasoning."
+    "Please think step by step and be thorough in your reasoning. "
+    "Before answering, identify the user's actual intent, check every relevant fact, "
+    "and distinguish facts from assumptions. Prefer clear explanations with concrete "
+    "examples, preserve important constraints from earlier instructions, and avoid "
+    "inventing details that were not provided. When several interpretations are "
+    "possible, choose the most useful reasonable interpretation and state any assumption "
+    "that materially affects the answer. Keep the final response focused, accurate, "
+    "self-contained, and easy to verify."
 )
 
 

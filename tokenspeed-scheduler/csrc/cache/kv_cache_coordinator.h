@@ -21,6 +21,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -47,6 +48,9 @@ struct CoordinatorMatch {
 // state; the request access clock is global, while each request carries its issued epoch.
 class KvCacheCoordinator {
 public:
+    enum class CacheMutation { kStored, kRemoved };
+    using CacheMutationSink = std::function<void(const CacheKey&, CacheMutation)>;
+
     // The host tier is fixed at construction: bound, CacheFullBlocks feeds the sink mailbox.
     KvCacheCoordinator(std::vector<CacheGroup> groups, std::int32_t cache_block_tokens, BlockPool& pool,
                        BlockPool* host_pool = nullptr);
@@ -122,6 +126,10 @@ public:
     std::int32_t NumPinnedHostCachedBlocks() const;
     void CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key);
 
+    // Reports real device-cache entry insertions and removals. The scheduler
+    // folds the per-group mutations into one externally visible prefix event.
+    void SetCacheMutationSink(CacheMutationSink sink) { cache_mutation_sink_ = std::move(sink); }
+
 private:
     friend struct KvCacheCoordinatorTestAccess;
 
@@ -143,6 +151,7 @@ private:
                                  std::span<const std::string> content_hashes, std::int32_t first_slot,
                                  std::uint64_t access_epoch, CacheBoundaryKind boundary_kind);
     void cacheCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand, std::uint64_t access_epoch);
+    bool evictCachedBlock(GroupId group_id, CacheBlockLocation location);
     std::vector<CacheGroup> groups_;
     // Closed groups first, so non-closed groups match against a settled bound.
     std::vector<std::size_t> match_order_;
@@ -151,6 +160,7 @@ private:
     std::int32_t cache_block_tokens_{0};
     std::uint64_t next_access_epoch_{0};
     std::vector<StoreCandidate> pending_stores_;
+    CacheMutationSink cache_mutation_sink_;
 };
 
 // One CacheGroup per spec (group_id = index), all sharing cache_block_tokens.

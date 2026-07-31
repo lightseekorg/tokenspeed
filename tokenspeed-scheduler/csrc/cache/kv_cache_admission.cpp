@@ -334,7 +334,7 @@ std::optional<KvCacheCoordinator::AdmissionResult> KvCacheCoordinator::Admit(
     // retry the blocks whose request reference has just been released.
     for (const auto& victim : plan.victims) {
         const auto& [group_id, location] = victim;
-        if (!groups_[group_id].Manager().EvictCachedBlock(pool_, location)) {
+        if (!evictCachedBlock(group_id, location)) {
             prospective_victims.push_back(victim);
         }
     }
@@ -348,7 +348,7 @@ std::optional<KvCacheCoordinator::AdmissionResult> KvCacheCoordinator::Admit(
         }
     }
     for (const auto& [group_id, location] : prospective_victims) {
-        if (!groups_[group_id].Manager().EvictCachedBlock(pool_, location)) {
+        if (!evictCachedBlock(group_id, location)) {
             FatalCheck(!pool_.IsOccupied(location), "admission victim changed before acquisition");
         }
     }

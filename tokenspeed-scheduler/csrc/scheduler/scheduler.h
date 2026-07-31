@@ -80,8 +80,13 @@ public:
 private:
     struct AdmissionMatch {
         KvCacheCoordinator::PrefixProbe probe;
+        std::vector<std::string> candidate_page_hashes;
         std::vector<std::string> extension_hashes;
         std::vector<std::string> page_hashes;
+    };
+
+    struct KvEventHashProgress {
+        std::vector<std::uint64_t> block_hashes;
     };
 
     std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> buildForwardOperations(
@@ -104,6 +109,10 @@ private:
         std::optional<std::uint64_t> request_access_epoch = std::nullopt);
     std::optional<KvCacheCoordinator::AdmissionResult> admit(std::span<const GroupDemand> demands,
                                                              std::uint64_t request_access_epoch);
+    std::vector<CacheKey> registerKvEventPages(const Request& request, std::span<const std::string> page_hashes,
+                                               std::int32_t first_page);
+    void discardUncachedKvEventPages(std::span<const CacheKey> keys);
+    void handleCacheMutation(const CacheKey& key, KvCacheCoordinator::CacheMutation mutation);
     void retractForCapacity(const std::vector<Request*>& candidates);
 
     void emitPendingStores(std::vector<WriteBackOperation>& write_back_operations);
@@ -169,6 +178,9 @@ private:
 
     std::unordered_map<std::string, std::unique_ptr<Request>> requests_;
     std::vector<KvCacheEvent> kv_events_;
+    std::unordered_map<std::string, KvEventHashProgress> kv_event_hash_progress_;
+    std::unordered_map<CacheKey, KvBlockStoredEvent, CacheKeyHash> kv_event_pages_;
+    std::unordered_map<CacheKey, std::int32_t, CacheKeyHash> cached_event_group_counts_;
     std::int64_t retract_count_{0};
 };
 

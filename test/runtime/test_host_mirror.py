@@ -26,7 +26,7 @@ GDN_LAYER_TYPES = ("linear_attention", "full_attention") * 2
 
 
 class HostMirrorTest(unittest.TestCase):
-    """Real (tiny) MHATokenToKVPool on GPU, slab and legacy layouts."""
+    """Real (tiny) MHATokenToKVPool on GPU."""
 
     def setUp(self):
         try:
@@ -108,33 +108,24 @@ class HostMirrorTest(unittest.TestCase):
                     f"tensor {tensor_idx} device page {d} not byte-exact",
                 )
 
-    def test_slab_roundtrip(self):
-        pool = self._pool(flat_ext=True)
+    def test_roundtrip(self):
+        pool = self._pool()
         mirror = self.HostMirror(pool, num_host_pages=8)
-        # 4 layers dedup to 2 K + 2 V slabs.
-        self.assertEqual(len(mirror.tensor_pairs), 4)
+        self.assertEqual(len(mirror.tensor_pairs), 8)
         self._roundtrip_assert(mirror, [(1, 5), (2, 6), (3, 7)])
-        # 4 mirrors x page_size 4 x row 1*8 bf16 (16 B) = 256 B per page.
-        self.assertEqual(mirror.bytes_per_host_page(), 4 * 4 * 16)
+        # 8 mirrors x page_size 4 x row 1*8 bf16 (16 B) = 512 B per page.
+        self.assertEqual(mirror.bytes_per_host_page(), 8 * 4 * 16)
 
     def test_interleaved_groups_roundtrip(self):
         # Pages owned by different groups: byte-blind copies need no
         # group awareness (id-exclusivity keeps rows disjoint).
-        pool = self._pool(flat_ext=True)
+        pool = self._pool()
         mirror = self.HostMirror(pool, num_host_pages=4)
         self._roundtrip_assert(mirror, [(2, 0), (3, 1)])
 
-    def test_legacy_roundtrip(self):
-        # Legacy layout: all 4+4 per-layer mirrors carry data; copying
-        # rows dead for a page's owner group is harmless (byte-exact).
-        pool = self._pool(flat_ext=False)
-        mirror = self.HostMirror(pool, num_host_pages=8)
-        self.assertEqual(len(mirror.tensor_pairs), 8)
-        self._roundtrip_assert(mirror, [(1, 3), (2, 4)])
-
     def test_events_and_layer_mapping(self):
         torch = self.torch
-        pool = self._pool(flat_ext=True)
+        pool = self._pool()
         mirror = self.HostMirror(pool, num_host_pages=8)
         self._fill_device_pages(mirror, [1])
 
@@ -144,16 +135,9 @@ class HostMirrorTest(unittest.TestCase):
         stream.synchronize()
         self.assertTrue(all(event.query() for event in events))
 
-        # Slab: paired layers map to the same K-tensor index.
-        self.assertEqual(mirror.num_k_tensors, 2)
+        self.assertEqual(mirror.num_k_tensors, 4)
         self.assertEqual(
-            mirror.tensor_index_of_layer(0), mirror.tensor_index_of_layer(1)
-        )
-        self.assertEqual(
-            mirror.tensor_index_of_layer(2), mirror.tensor_index_of_layer(3)
-        )
-        self.assertNotEqual(
-            mirror.tensor_index_of_layer(0), mirror.tensor_index_of_layer(2)
+            {mirror.tensor_index_of_layer(i) for i in range(4)}, {0, 1, 2, 3}
         )
         for layer_id in range(4):
             idx = mirror.tensor_index_of_layer(layer_id)
@@ -162,12 +146,6 @@ class HostMirrorTest(unittest.TestCase):
                 mirror.tensor_pairs[idx + mirror.num_k_tensors][0],
                 pool.v_buffer[layer_id],
             )
-
-        # Legacy: every layer maps to a distinct index.
-        legacy = self.HostMirror(self._pool(flat_ext=False), num_host_pages=2)
-        self.assertEqual(
-            {legacy.tensor_index_of_layer(i) for i in range(4)}, {0, 1, 2, 3}
-        )
 
 
 class HostMirrorStateSlabTest(unittest.TestCase):

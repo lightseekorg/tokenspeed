@@ -272,14 +272,32 @@ void KvCacheCoordinator::cacheFullBlocksForGroup(std::size_t group_index, BlockT
                                                  std::uint64_t access_epoch, CacheBoundaryKind boundary_kind) {
     std::vector<CacheKey> keys = keysForGroup(content_hashes, groups_[group_index].Id());
     std::vector<std::pair<CacheKey, CacheBlockRef>> newly_cached;
-    groups_[group_index].Manager().CacheFullBlocks(pool_, table, keys, access_epoch, first_slot, boundary_kind,
-                                                   host_pool_ != nullptr ? &newly_cached : nullptr);
+    groups_[group_index].Manager().CacheFullBlocks(
+        pool_, table, keys, access_epoch, first_slot, boundary_kind,
+        host_pool_ != nullptr || cache_mutation_sink_ ? &newly_cached : nullptr);
     for (auto& [key, block_ref] : newly_cached) {
+        if (cache_mutation_sink_) {
+            cache_mutation_sink_(key, CacheMutation::kStored);
+        }
+        if (host_pool_ == nullptr) {
+            continue;
+        }
         pending_stores_.push_back(StoreCandidate{
             .key = std::move(key),
             .block_ref = std::move(block_ref),
         });
     }
+}
+
+bool KvCacheCoordinator::evictCachedBlock(GroupId group_id, CacheBlockLocation location) {
+    std::optional<CacheKey> removed = groups_[group_id].Manager().EvictCachedBlock(pool_, location);
+    if (!removed) {
+        return false;
+    }
+    if (cache_mutation_sink_) {
+        cache_mutation_sink_(*removed, CacheMutation::kRemoved);
+    }
+    return true;
 }
 
 void KvCacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand,

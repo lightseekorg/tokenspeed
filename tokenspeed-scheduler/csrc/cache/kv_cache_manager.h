@@ -347,17 +347,18 @@ public:
         return locations;
     }
 
-    bool EvictCachedBlock(const BlockPool& pool, CacheBlockLocation location) {
+    std::optional<CacheKey> EvictCachedBlock(const BlockPool& pool, CacheBlockLocation location) {
         CacheEntries* cache_index = findCacheEntries(pool);
         if (cache_index == nullptr) {
-            return false;
+            return std::nullopt;
         }
         CacheEntryIterator entry_it = findEntry(*cache_index, location);
         if (entry_it == cache_index->entries.end() || !entry_it->block_ref.unique()) {
-            return false;
+            return std::nullopt;
         }
+        CacheKey key = entry_it->key;
         eraseEntry(*cache_index, entry_it);
-        return true;
+        return key;
     }
 
     bool ParentIsFullyEvictable(const BlockPool& pool, std::int32_t lcm_block_id) const {
