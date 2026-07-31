@@ -800,11 +800,6 @@ def kda_paged_prefill(
     # registered Triton implementation.
     if current_platform().is_amd and solution in {"fla", "flashkda", "cutedsl_kda"}:
         solution = "triton"
-    # The runtime policy label for the portable fla-backed scan is "fla", but
-    # the registered NVIDIA solution is named "triton" (it wraps fla's
-    # chunk_kda). B300 CI always has flashkda/cutedsl_kda installed, so the
-    # label was never exercised there; on GB200 neither specialized package
-    # exists and the unmapped label raised NoKernelFoundError.
     elif solution == "fla":
         solution = "triton"
     kernel = select_kernel(
