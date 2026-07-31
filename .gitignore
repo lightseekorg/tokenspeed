@@ -196,3 +196,6 @@ Testing/
 .serena/*
 
 AGENTS.local.md
+
+# Git worktrees (local isolation)
+.worktrees/

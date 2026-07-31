@@ -96,6 +96,8 @@ private:
 
     void recordDeviceBlockStored(TreeNode* node);
     void recordDeviceBlockRemoved(TreeNode* node);
+    void recordHostBlockStored(TreeNode* node);
+    void recordHostBlockRemoved(TreeNode* node);
 
     template <ResourceType RType>
     auto& getResourceManager() {
@@ -113,6 +115,7 @@ private:
     bool enable_l3_storage_{false};
     KvEventSink kv_event_sink_{};
     std::unordered_set<std::uint64_t> published_device_blocks_;
+    std::unordered_set<std::uint64_t> published_host_blocks_;
     bool disable_prefix_cache_{false};
 };
 

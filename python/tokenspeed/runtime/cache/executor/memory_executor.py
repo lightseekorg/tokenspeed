@@ -22,7 +22,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 from tokenspeed_scheduler import Cache
@@ -122,6 +122,8 @@ class MemoryExecutor:
         tp_group=None,
         draft_device_pool=None,
         mamba_pool=None,
+        on_l3_blocks_stored: Callable[[list[str]], None] | None = None,
+        on_l3_all_cleared: Callable[[], None] | None = None,
     ):
         self.page_size = config.page_size
         kv_pool_types = (DSATokenToKVPool, MHATokenToKVPool, MLATokenToKVPool)
@@ -337,6 +339,8 @@ class MemoryExecutor:
             model_name=config.model_name,
             is_dp_attention_enabled=is_dp_attention_enabled,
             tp_group=tp_group,
+            on_l3_blocks_stored=on_l3_blocks_stored,
+            on_l3_all_cleared=on_l3_all_cleared,
         )
         self._pending_mamba_layerwise_cow: dict[int, list[int]] | None = None
 

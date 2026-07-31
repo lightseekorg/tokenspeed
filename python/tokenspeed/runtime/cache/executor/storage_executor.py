@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 from queue import Empty, Queue
@@ -117,10 +118,16 @@ class StorageExecutor:
         is_dp_attention_enabled: bool = False,
         storage_batch_size: int = 128,
         tp_group=None,
+        on_l3_blocks_stored: Callable[[list[str]], None] | None = None,
+        on_l3_all_cleared: Callable[[], None] | None = None,
     ):
         self.page_size = page_size
         self.host_pool = host_pool
         self.storage_batch_size = storage_batch_size
+        self._on_l3_blocks_stored = on_l3_blocks_stored
+        self._on_l3_all_cleared = on_l3_all_cleared
+        # op_id → rolling_page_hashes retained until backup completion callback.
+        self._backup_hashes: dict[int, list[str]] = {}
         (
             extra_config_dict,
             _prefetch_threshold,
@@ -150,6 +157,7 @@ class StorageExecutor:
                 raise ValueError(f"Failed to create storage backend: {exc}") from exc
 
             self.storage_backend.register_mem_pool_host(host_pool)
+            self._wire_l3_clear_callback()
         self.tp_size = (
             torch.distributed.get_world_size(group=tp_group)
             if tp_group is not None
@@ -204,6 +212,14 @@ class StorageExecutor:
     def enabled(self) -> bool:
         return self.storage_backend is not None
 
+    def _wire_l3_clear_callback(self) -> None:
+        """Attach ``on_l3_all_cleared`` to a backend that supports ``on_clear``."""
+        backend = self.storage_backend
+        if backend is None or self._on_l3_all_cleared is None:
+            return
+        if hasattr(backend, "on_clear"):
+            backend.on_clear = self._on_l3_all_cleared
+
     def submit_prefetch(self, op) -> None:
         # Extract request_id from the op and remember mapping
         rid = op.request_id
@@ -230,6 +246,7 @@ class StorageExecutor:
             evt.success = False
             self._results.put(evt)
             return
+        self._backup_hashes[op.op_id] = list(op.rolling_page_hashes)
         future = self._executor.submit(self._run_backup, op)
         future.add_done_callback(partial(self._on_backup_done, op.op_id))
 
@@ -434,6 +451,7 @@ class StorageExecutor:
     def _on_backup_done(self, op_id: int, future) -> None:
         evt = Cache.BackUpDoneEvent()
         evt.op_id = op_id
+        hashes = self._backup_hashes.pop(op_id, [])
         try:
             future.result()
             evt.success = True
@@ -441,6 +459,11 @@ class StorageExecutor:
             evt.success = False
             logger.error("backup op %s failed: %s", op_id, exc)
         self._results.put(evt)
+        if evt.success and self._on_l3_blocks_stored and hashes:
+            try:
+                self._on_l3_blocks_stored(hashes)
+            except Exception:
+                logger.exception("L3 KV event callback failed")
 
     def drain(self) -> list:
         results = []

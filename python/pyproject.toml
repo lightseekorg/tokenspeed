@@ -86,6 +86,7 @@ dependencies = [
     "uvloop",
     "xgrammar==0.2.3",
     "viztracer",
+    "xxhash",
 ]
 
 [project.scripts]

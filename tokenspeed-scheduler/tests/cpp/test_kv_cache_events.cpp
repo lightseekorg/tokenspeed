@@ -123,7 +123,61 @@ BenchMeasurement MeasureLegacyAncestorRehashWork(std::int32_t page_count, std::i
     return measurement;
 }
 
+class ScopedXxh3BlockHashFlag {
+public:
+    explicit ScopedXxh3BlockHashFlag(bool enabled) {
+        previous_ = UseXxh3BlockHash();
+        SetUseXxh3BlockHash(enabled);
+    }
+    ~ScopedXxh3BlockHashFlag() { SetUseXxh3BlockHash(previous_); }
+
+    ScopedXxh3BlockHashFlag(const ScopedXxh3BlockHashFlag&) = delete;
+    ScopedXxh3BlockHashFlag& operator=(const ScopedXxh3BlockHashFlag&) = delete;
+
+private:
+    bool previous_{};
+};
+
 }  // namespace
+
+TEST(KvHashTest, FirstBlockMatchesRfcExample) {
+    // Golden from Dynamo/RFC #1527 XXH3-64 seed 1337 on LE u32 tokens {1,2,3,4}.
+    constexpr std::uint64_t kExpected = 14643705804678351452ull;
+    const std::vector<std::int32_t> tokens = {1, 2, 3, 4};
+    const auto h = HashKvBlockXxh3(tokens, std::nullopt);
+    EXPECT_EQ(h, kExpected);
+}
+
+TEST(KvHashTest, SecondBlockRollsWithParent) {
+    // Block0 local = seq; block1 seq = XXH3(parent_le || local_le, 1337).
+    constexpr std::uint64_t kFirst = 14643705804678351452ull;
+    constexpr std::uint64_t kExpectedSecond = 4945711292740353085ull;
+    const std::vector<std::int32_t> second_tokens = {5, 6, 7, 8};
+    const auto h = HashKvBlockXxh3(second_tokens, kFirst);
+    EXPECT_EQ(h, kExpectedSecond);
+}
+
+TEST(KvHashTest, UseXxh3FlagDefaultsFalseAndIsToggleable) {
+    EXPECT_FALSE(UseXxh3BlockHash());
+    {
+        ScopedXxh3BlockHashFlag guard(true);
+        EXPECT_TRUE(UseXxh3BlockHash());
+    }
+    EXPECT_FALSE(UseXxh3BlockHash());
+}
+
+TEST_F(KVPrefixCacheEventTestSuite, UseXxh3FlagSwitchesPublishedBlockHashes) {
+    ScopedXxh3BlockHashFlag guard(true);
+    const token_vec_t tokens = MakeAlignedTokens(1, kPageSize);
+    InsertDevicePages(tokens, 1);
+
+    ASSERT_EQ(events_.size(), 1u);
+    const auto& stored = AsStored(events_[0]);
+    const std::uint64_t fnv_hash = HashKvBlock(std::span<const std::int32_t>(tokens.data(), kPageSize));
+    const std::uint64_t xxh3_hash = HashKvBlockXxh3(std::span<const std::int32_t>(tokens.data(), kPageSize));
+    EXPECT_NE(fnv_hash, xxh3_hash);
+    EXPECT_EQ(stored.block_hashes, std::vector<std::uint64_t>{xxh3_hash});
+}
 
 TEST_F(KVPrefixCacheEventTestSuite, InsertOnePageEmitsBlockStored) {
     const token_vec_t tokens = MakeAlignedTokens(1, kPageSize);
@@ -136,6 +190,7 @@ TEST_F(KVPrefixCacheEventTestSuite, InsertOnePageEmitsBlockStored) {
     EXPECT_EQ(stored.parent_block_hash, std::nullopt);
     EXPECT_EQ(stored.token_ids, tokens);
     EXPECT_EQ(stored.block_size, kPageSize);
+    EXPECT_EQ(stored.tier, KvEventTier::kDevice);
 }
 
 TEST_F(KVPrefixCacheEventTestSuite, InsertSameTokensDoesNotDuplicateBlockStored) {
@@ -220,10 +275,71 @@ TEST_F(KVPrefixCacheEventTestSuite, AlreadyRemovedBlocksAreNotRemovedTwice) {
     EXPECT_TRUE(events_.empty());
 }
 
+TEST_F(KVPrefixCacheEventTestSuite, HostInsertEmitsBlockStored) {
+    const token_vec_t tokens = MakeAlignedTokens(2, kPageSize);
+    cache_.Insert<ResourceType::Host>(tokens, {}, host_allocator_.Allocate(2));
+
+    const std::uint64_t first_hash = HashKvBlock(std::span<const std::int32_t>(tokens.data(), kPageSize));
+    const std::uint64_t second_hash =
+        HashKvBlock(std::span<const std::int32_t>(tokens.data() + kPageSize, kPageSize), first_hash);
+
+    ASSERT_EQ(events_.size(), 2u);
+    EXPECT_EQ(AsStored(events_[0]).block_hashes, std::vector<std::uint64_t>{first_hash});
+    EXPECT_EQ(AsStored(events_[0]).parent_block_hash, std::nullopt);
+    EXPECT_EQ(AsStored(events_[0]).tier, KvEventTier::kHost);
+    EXPECT_EQ(AsStored(events_[1]).block_hashes, std::vector<std::uint64_t>{second_hash});
+    EXPECT_EQ(AsStored(events_[1]).parent_block_hash, first_hash);
+    EXPECT_EQ(AsStored(events_[1]).tier, KvEventTier::kHost);
+}
+
+TEST_F(KVPrefixCacheEventTestSuite, HostChildInsertUsesCachedParentBlockHash) {
+    PageAllocator device_allocator{kPageSize, 8};
+    PageAllocator host_allocator{kPageSize, 8};
+    KVPrefixCache cache{&device_allocator, &host_allocator};
+
+    // Parent host pages inserted without a sink leave nodes without cached block hashes.
+    const token_vec_t parent_tokens = MakeAlignedTokens(1, kPageSize);
+    cache.Insert<ResourceType::Host>(parent_tokens, {}, host_allocator.Allocate(1));
+
+    std::vector<KvCacheEvent> events;
+    cache.SetKvEventSink([&](KvCacheEvent event) { events.push_back(std::move(event)); });
+    const token_vec_t child_tokens = MakeAlignedTokens(2, kPageSize);
+    cache.Insert<ResourceType::Host>(child_tokens, {}, host_allocator.Allocate(2));
+
+    const std::uint64_t parent_hash = HashKvBlock(std::span<const std::int32_t>(parent_tokens.data(), kPageSize));
+    const std::uint64_t child_hash =
+        HashKvBlock(std::span<const std::int32_t>(child_tokens.data() + kPageSize, kPageSize), parent_hash);
+
+    ASSERT_EQ(events.size(), 1u);
+    const auto& stored = AsStored(events[0]);
+    EXPECT_EQ(stored.block_hashes, std::vector<std::uint64_t>{child_hash});
+    EXPECT_EQ(stored.parent_block_hash, parent_hash);
+    EXPECT_EQ(stored.tier, KvEventTier::kHost);
+}
+
+TEST_F(KVPrefixCacheEventTestSuite, HostEvictEmitsBlockRemoved) {
+    const token_vec_t tokens = MakeAlignedTokens(2, kPageSize);
+    cache_.Insert<ResourceType::Host>(tokens, {}, host_allocator_.Allocate(2));
+    ASSERT_EQ(events_.size(), 2u);
+    const std::uint64_t first_hash = AsStored(events_[0]).block_hashes[0];
+    const std::uint64_t second_hash = AsStored(events_[1]).block_hashes[0];
+    events_.clear();
+
+    ASSERT_TRUE(cache_.EnsureCapacityByEvict<ResourceType::Host>(1));
+
+    ASSERT_EQ(events_.size(), 1u);
+    EXPECT_EQ(AsRemoved(events_[0]).block_hashes, (std::vector<std::uint64_t>{first_hash, second_hash}));
+    EXPECT_EQ(AsRemoved(events_[0]).tier, KvEventTier::kHost);
+}
+
 TEST_F(KVPrefixCacheEventTestSuite, HostRecoveryPublishesDeviceStoredEvents) {
     const token_vec_t tokens = MakeAlignedTokens(2, kPageSize);
     cache_.Insert<ResourceType::Host>(tokens, {}, host_allocator_.Allocate(2));
-    EXPECT_TRUE(events_.empty());
+    ASSERT_FALSE(events_.empty());
+    for (const auto& event : events_) {
+        EXPECT_EQ(AsStored(event).tier, KvEventTier::kHost);
+    }
+    events_.clear();
 
     MatchResult match = cache_.Match(tokens);
     ASSERT_TRUE(cache_.AllocateResourceOfType<ResourceType::Device>(match.NodesWithout<ResourceType::Device>()));
@@ -235,13 +351,16 @@ TEST_F(KVPrefixCacheEventTestSuite, HostRecoveryPublishesDeviceStoredEvents) {
     ASSERT_EQ(events_.size(), 2u);
     EXPECT_EQ(AsStored(events_[0]).block_hashes, std::vector<std::uint64_t>{first_hash});
     EXPECT_EQ(AsStored(events_[0]).parent_block_hash, std::nullopt);
+    EXPECT_EQ(AsStored(events_[0]).tier, KvEventTier::kDevice);
     EXPECT_EQ(AsStored(events_[1]).block_hashes, std::vector<std::uint64_t>{second_hash});
     EXPECT_EQ(AsStored(events_[1]).parent_block_hash, first_hash);
+    EXPECT_EQ(AsStored(events_[1]).tier, KvEventTier::kDevice);
 
     events_.clear();
     ASSERT_TRUE(cache_.EnsureCapacityByEvict<ResourceType::Device>(1));
     ASSERT_EQ(events_.size(), 1u);
     EXPECT_EQ(AsRemoved(events_[0]).block_hashes, (std::vector<std::uint64_t>{first_hash, second_hash}));
+    EXPECT_EQ(AsRemoved(events_[0]).tier, KvEventTier::kDevice);
 }
 
 TEST(KVPrefixCacheEventBenchTest, OptimizedInsertIsFasterThanLegacyAncestorRehashing) {
