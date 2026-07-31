@@ -164,13 +164,6 @@ protected:
         return cfg;
     }
 
-    static const FlatForwardOperation* GetForward(const ExecutionPlan& plan) {
-        for (const auto& op : plan.Operations()) {
-            if (auto* fwd = std::get_if<FlatForwardOperation>(&op)) return fwd;
-        }
-        return nullptr;
-    }
-
     void SendBootstrapped(const std::string& request_id) {
         ExecutionEvent event;
         event.With(PDEvent{pd::BootstrappedEvent{request_id}});
@@ -212,13 +205,6 @@ protected:
         cfg.enable_l3_storage = false;
         return cfg;
     }
-
-    static const FlatForwardOperation* GetForward(const ExecutionPlan& plan) {
-        for (const auto& op : plan.Operations()) {
-            if (auto* fwd = std::get_if<FlatForwardOperation>(&op)) return fwd;
-        }
-        return nullptr;
-    }
 };
 
 TEST_F(MambaUnalignedCheckpointTest, ChunkBoundaryNotAlignedToMambaChunkDoesNotPublishCheckpoint) {
@@ -257,28 +243,6 @@ protected:
         cfg.mamba_l2_host_slots = 16;
         cfg.host_allocator.total_pages = 32;
         return cfg;
-    }
-
-    static const FlatWriteBackOperation* GetWriteBack(const ExecutionPlan& plan) {
-        for (const auto& op : plan.Operations()) {
-            if (auto* cop = std::get_if<CacheOperation>(&op)) {
-                if (auto* wb = std::get_if<FlatWriteBackOperation>(cop)) {
-                    return wb;
-                }
-            }
-        }
-        return nullptr;
-    }
-
-    static const FlatLoadBackOperation* GetLoadBack(const ExecutionPlan& plan) {
-        for (const auto& op : plan.Operations()) {
-            if (auto* cop = std::get_if<CacheOperation>(&op)) {
-                if (auto* lb = std::get_if<FlatLoadBackOperation>(cop)) {
-                    return lb;
-                }
-            }
-        }
-        return nullptr;
     }
 };
 
@@ -370,35 +334,6 @@ protected:
         cfg.host_allocator.total_pages = 16;
         cfg.enable_l3_storage = false;
         return cfg;
-    }
-
-    void SendReserveNumTokens(const std::string& id, std::int32_t n) {
-        ExecutionEvent event;
-        event.With(ForwardEvent{forward::UpdateReserveNumTokens{
-            .request_id = id,
-            .reserve_num_tokens_in_next_schedule_event = n,
-        }});
-        scheduler_->Advance(std::move(event));
-    }
-
-    static const FlatWriteBackOperation* GetWriteBack(const ExecutionPlan& plan) {
-        for (const auto& op : plan.Operations()) {
-            if (auto* cop = std::get_if<CacheOperation>(&op)) {
-                if (auto* wb = std::get_if<FlatWriteBackOperation>(cop)) {
-                    return wb;
-                }
-            }
-        }
-        return nullptr;
-    }
-
-    static const FlatForwardOperation* GetForward(const ExecutionPlan& plan) {
-        for (const auto& op : plan.Operations()) {
-            if (auto* fwd = std::get_if<FlatForwardOperation>(&op)) {
-                return fwd;
-            }
-        }
-        return nullptr;
     }
 };
 

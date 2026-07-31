@@ -457,7 +457,14 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             # metadata under EXTEND/MIXED target. seq_lens is the drafter's
             # live alias buffer (wrapper pre-writes before this call).
             if self.is_draft:
-                self._init_decode_metadata(bs, req_pool_indices, seq_lens, req_to_page)
+                self._init_decode_metadata(
+                    bs,
+                    req_pool_indices,
+                    seq_lens,
+                    req_to_page,
+                    flat_page_tables=flat_page_tables,
+                    flat_out_cache_locs=flat_out_cache_locs,
+                )
             return
 
         if self.draft_block_decode and self.spec_num_tokens > 1:

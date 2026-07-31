@@ -483,6 +483,7 @@ def load_builtin_kernels() -> None:
     import tokenspeed_kernel.ops.attn_res  # noqa: F401
     import tokenspeed_kernel.ops.embedding  # noqa: F401
     import tokenspeed_kernel.ops.gemm  # noqa: F401
+    import tokenspeed_kernel.ops.kvcache  # noqa: F401
     import tokenspeed_kernel.ops.moe  # noqa: F401
     import tokenspeed_kernel.ops.quantization  # noqa: F401
     import tokenspeed_kernel.ops.sampling  # noqa: F401
