@@ -56,22 +56,20 @@ class ProcessGroupManager:
         timeout: int | None = None,
         device_id: "torch.device | None" = None,
     ) -> None:
+
         if not dist.is_initialized():
             if distributed_init_method is None:
                 raise ValueError(
                     "distributed_init_method must be provided when initializing distributed environment"
                 )
+
             if timeout is not None:
                 if not isinstance(timeout, int):
                     raise TypeError("timeout must be a number")
                 if timeout <= 0:
                     raise ValueError("timeout must be positive")
                 timeout = timedelta(seconds=timeout)
-            # Subgroups created later must inherit this timeout: new_group()
-            # without one falls back to torch's 1800s default, so a slow
-            # startup phase (e.g. a first-boot MoE autotune sweep with no
-            # pre-swept tactic table) blows the subgroup's gloo recv even
-            # when --distributed-timeout-seconds is far larger.
+
             self._pg_timeout = timeout
 
             dist.init_process_group(
