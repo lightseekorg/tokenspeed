@@ -1857,6 +1857,10 @@ class Eagle3MlaDecoderLayer(nn.Module):
         self.layer_id = layer_id
         rope_theta = get_rope_theta(config)
         rope_scaling = getattr(config, "rope_scaling", None)
+        if rope_scaling and "factor" not in rope_scaling:
+            # Only a rope_scaling with a factor is real scaling; transformers
+            # may normalize plain rope into a factor-less dict.
+            rope_scaling = None
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
 
         self.self_attn = DeepseekV3DraftAttentionMLA(
@@ -2273,8 +2277,11 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
             and self.config.target_hidden_size != self.config.hidden_size
         ):
             return
-        del self.model.embed_tokens.weight
-        self.model.embed_tokens.weight = embed
+        if self.model.embed_tokens.weight.shape == embed.shape:
+            # Only share when shapes match; a TP-sharded target embedding
+            # would read out of bounds in this replicated module.
+            del self.model.embed_tokens.weight
+            self.model.embed_tokens.weight = embed
         if head is not None and self.load_lm_head_from_target:
             del self.lm_head.weight
             self.lm_head.weight = head
