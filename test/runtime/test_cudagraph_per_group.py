@@ -225,6 +225,53 @@ class WrapperReplayGroupedTest(_TorchCase):
             src["full_attention"],
         )
 
+    def test_single_table_target_still_routes_group_tables_to_draft(self):
+        torch = self.torch
+        from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+            CudaGraphWrapper,
+        )
+
+        draft_call = {}
+
+        def record_draft(bs, req_pool_indices, seq_lens, **kwargs):
+            draft_call.update(kwargs)
+
+        mock = SimpleNamespace(
+            attn_backend=SimpleNamespace(
+                uses_cache_groups=False,
+                uses_paged_cache_groups=False,
+                uses_padded_decode_token_mask=False,
+                init_forward_metadata_replay_cuda_graph=lambda *args, **kwargs: None,
+            ),
+            draft_attn_backend=SimpleNamespace(
+                uses_cache_groups=True,
+                uses_paged_cache_groups=False,
+                uses_padded_decode_token_mask=False,
+                init_forward_metadata_replay_cuda_graph=record_draft,
+            ),
+            drafter=SimpleNamespace(
+                draft_seq_lens_buf=torch.zeros(2, dtype=torch.int32),
+                req_to_page=torch.zeros((2, MAX_NUM_PAGES), dtype=torch.int32),
+            ),
+            _draft_group_tables=lambda tables: tables,
+        )
+        tables = {
+            "full_attention": torch.tensor([[3, 4]], dtype=torch.int32),
+        }
+
+        CudaGraphWrapper._init_replay_metadata(
+            mock,
+            padded_bs=2,
+            actual_bs=1,
+            req_pool_indices=torch.arange(2, dtype=torch.int64),
+            seq_lens=torch.ones(2, dtype=torch.int32),
+            req_to_page=torch.zeros((2, MAX_NUM_PAGES), dtype=torch.int32),
+            forward_mode=_decode_forward_mode(),
+            block_tables=tables,
+        )
+
+        self.assertIs(draft_call["block_tables"], tables)
+
 
 class WrapperCaptureGroupIdsTest(_TorchCase):
     """Call-site wiring: the real _init_capture_metadata must derive

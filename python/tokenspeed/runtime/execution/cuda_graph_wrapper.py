@@ -873,7 +873,7 @@ class CudaGraphWrapper:
                     )
             if getattr(self.draft_attn_backend, "uses_padded_decode_token_mask", False):
                 draft_attn_kwargs["actual_bs"] = actual_bs
-            draft_group_tables = self._draft_group_tables(kwargs.get("block_tables"))
+            draft_group_tables = self._draft_group_tables(block_tables)
             if draft_group_tables is not None:
                 draft_attn_kwargs["block_tables"] = draft_group_tables
             draft_forward_mode = ForwardMode.DECODE
