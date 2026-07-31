@@ -546,9 +546,7 @@ class ServerArgs:
                     "--disaggregation-mode null (aggregate serving) or prefill"
                 )
             if self.mapping.nnodes != 1:
-                raise ValueError(
-                    "--mm-encoder-tp-mode data currently supports a single node only"
-                )
+                logger.warning("--mm-encoder-tp-mode data on nnodes>1 is experimental")
             if self.mapping.has_attn_cp:
                 raise ValueError(
                     "--mm-encoder-tp-mode data does not currently support "

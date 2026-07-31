@@ -53,6 +53,11 @@ class ShmTensorHandle:
     _segment: shared_memory.SharedMemory | None = field(
         default=None, init=False, repr=False, compare=False
     )
+    # Payload received over the CPU group when the producer's POSIX segment
+    # lives on another host.
+    _remote: torch.Tensor | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     @classmethod
     def publish(cls, tensor: torch.Tensor) -> ShmTensorHandle:
@@ -76,10 +81,38 @@ class ShmTensorHandle:
         if self._segment is None:
             self._segment = shared_memory.SharedMemory(name=self.shm_name)
 
+    def try_attach(self) -> bool:
+        """Attach if the segment exists on this host; False when the
+        producer lives on another node."""
+        if self._segment is not None or self._remote is not None:
+            return True
+        try:
+            self._segment = shared_memory.SharedMemory(name=self.shm_name)
+            return True
+        except FileNotFoundError:
+            return False
+
+    def nbytes(self) -> int:
+        n = 1
+        for d in self.shape:
+            n *= d
+        return n * torch.empty((), dtype=self.dtype).element_size()
+
+    def peek_bytes(self) -> torch.Tensor:
+        """Copy the attached segment as flat bytes without consuming it."""
+        assert self._segment is not None
+        return torch.frombuffer(self._segment.buf, dtype=torch.uint8).clone()
+
+    def set_remote(self, flat_bytes: torch.Tensor) -> None:
+        self._remote = flat_bytes
+
     def consume(self) -> torch.Tensor:
         """Copy into a pinned tensor (so downstream non_blocking H2D is real),
         close this rank's FD, and unlink. ``attach()`` must have run.
         """
+        if self._remote is not None:
+            flat, self._remote = self._remote, None
+            return flat.view(self.dtype).reshape(self.shape)
         if self._segment is None:
             raise RuntimeError(
                 f"ShmTensorHandle({self.shm_name!r}) must be attach()'d "
@@ -111,6 +144,9 @@ class ShmTensorHandle:
 
     def release(self) -> None:
         """Close and unlink a SHM segment without materializing the tensor."""
+        if self._remote is not None:
+            self._remote = None
+            return
         started = time.perf_counter() if LOG_MM_TIMING else None
         segment = self._segment
         self._segment = None
@@ -150,9 +186,41 @@ def sync_shm_features(reqs, group, group_size: int) -> None:
     if not pending:
         return
     started = time.perf_counter() if LOG_MM_TIMING else None
-    for mm in pending:
-        mm.attach_shm_features()
+    handles = [
+        item.feature
+        for mm in pending
+        for item in mm.mm_items
+        if isinstance(item.feature, ShmTensorHandle)
+    ]
+    attached = [h.try_attach() for h in handles]
     if group_size > 1:
+        # Ship payloads whose POSIX segment lives on another host once over
+        # the CPU group; same-host ranks keep the zero-copy shm path.
+        flags = torch.zeros((group_size, len(handles)), dtype=torch.uint8)
+        flags[torch.distributed.get_rank(group)] = torch.tensor(
+            attached, dtype=torch.uint8
+        )
+        torch.distributed.all_reduce(flags, group=group)
+        for i, handle in enumerate(handles):
+            owners = flags[:, i].nonzero().flatten()
+            if owners.numel() == 0:
+                raise RuntimeError(
+                    f"multimodal shm segment {handle.shm_name!r} is not "
+                    "reachable from any rank in the group"
+                )
+            if owners.numel() == group_size:
+                continue
+            src = torch.distributed.get_global_rank(group, int(owners[0]))
+            if attached[i]:
+                payload = handle.peek_bytes()
+            else:
+                # Pinned: consume() keeps its non_blocking H2D contract.
+                payload = torch.empty(
+                    handle.nbytes(), dtype=torch.uint8, pin_memory=True
+                )
+            torch.distributed.broadcast(payload, src=src, group=group)
+            if not attached[i]:
+                handle.set_remote(payload)
         torch.distributed.barrier(group)
     if LOG_MM_TIMING and started is not None:
         item_count = sum(len(mm.mm_items) for mm in pending)
