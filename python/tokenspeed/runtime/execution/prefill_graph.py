@@ -616,21 +616,58 @@ class PrefillGraph:
             return
         weight = self._embed_tokens.weight
         captured_embeds_buf = self._input_embeds_buf
-        self._input_embeds_buf = torch.zeros(
-            chunk, weight.shape[1], dtype=weight.dtype, device=weight.device
-        )
+        captured_max = max(self._captures, default=0)
         try:
-            with maybe_inference_mode():
-                self._ctx = self._make_dummy_batch(chunk, decode_wrapper)
-                self._land_input_embeds(
-                    self._embed_tokens(self.input_buffers.input_ids_buf[:chunk]),
-                    chunk,
-                )
-                with active_forward(self._ctx):
-                    self._run_inner(chunk)
-            torch.cuda.synchronize()
-            if self.config.global_rank == 0:
-                logger.info("Eager prefill warmup ran at %d tokens", chunk)
+            # The transient eager activations of a full chunk may not fit next
+            # to weights + KV + graph pools on tightly budgeted deployments:
+            # halve on OOM (each size still front-loads the large-tile kernel
+            # families) rather than failing a boot that used to come up. OOM
+            # is allocator-symmetric across ranks (identical dummy inputs), so
+            # every rank retries the same ladder in lockstep.
+            tokens = chunk
+            while tokens > captured_max:
+                try:
+                    self._input_embeds_buf = torch.zeros(
+                        tokens,
+                        weight.shape[1],
+                        dtype=weight.dtype,
+                        device=weight.device,
+                    )
+                    with maybe_inference_mode():
+                        self._ctx = self._make_dummy_batch(tokens, decode_wrapper)
+                        self._land_input_embeds(
+                            self._embed_tokens(
+                                self.input_buffers.input_ids_buf[:tokens]
+                            ),
+                            tokens,
+                        )
+                        with active_forward(self._ctx):
+                            self._run_inner(tokens)
+                    torch.cuda.synchronize()
+                    if self.config.global_rank == 0:
+                        logger.info("Eager prefill warmup ran at %d tokens", tokens)
+                        if tokens < chunk:
+                            logger.warning(
+                                "Eager prefill warmup only fit %d of %d chunk "
+                                "tokens: this deployment cannot execute its own "
+                                "--chunked-prefill-size next to weights + KV; "
+                                "lower --gpu-memory-utilization or the chunk "
+                                "size, or serving may OOM on large prefills.",
+                                tokens,
+                                chunk,
+                            )
+                    return
+                except torch.OutOfMemoryError:
+                    self._ctx = None
+                    self._input_embeds_buf = None
+                    torch.cuda.empty_cache()
+                    tokens //= 2
+            logger.warning(
+                "Eager prefill warmup could not fit any bucket above the "
+                "graph-captured %d tokens; the first large prefill will load "
+                "its kernels mid-serving.",
+                captured_max,
+            )
         except (NotImplementedError, AttributeError, KeyError, RuntimeError) as exc:
             logger.warning(
                 "Eager prefill warmup failed (%s: %s); the first real prefill "
