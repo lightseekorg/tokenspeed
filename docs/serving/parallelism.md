@@ -75,6 +75,44 @@ tokenspeed serve <model> \
 Each node must use the same model, backend, precision, and scheduler settings.
 Only `--node-rank` should differ between nodes.
 
+Run one `tokenspeed serve` per node. Node rank 0 serves the HTTP API; higher
+ranks run the engine only and expose no endpoint.
+
+### Under a launcher
+
+Inside a multi-node Slurm step, `--nnodes`, `--node-rank` and
+`--dist-init-addr` are all derived from the step environment when they are not
+given, so the same command line runs on every node:
+
+```bash
+srun --nodes=2 --ntasks-per-node=1 tokenspeed serve <model> --attn-tp-size 16
+```
+
+| Argument | Derived from |
+| --- | --- |
+| `--nnodes` | `SLURM_NNODES` |
+| `--node-rank` | `SLURM_NODEID` |
+| `--dist-init-addr` | first host of `SLURM_STEP_NODELIST`, port 23456 |
+
+Rules:
+
+- An explicit `--nnodes` or `--node-rank` that contradicts the environment is
+  an error, not an override. Omit the flag to accept the launcher's value.
+- An explicit `--dist-init-addr` is always used as given.
+- Derivation only engages when `SLURM_NNODES` is greater than 1. Outside a
+  launcher, or in a single-node step, behaviour is unchanged.
+- If a multi-node step is detected but the topology cannot be resolved,
+  startup fails with the reason rather than falling back to a single node.
+- The derived address is the one the head node's hostname resolves to. Where
+  that is not the interface you want carrying NCCL bootstrap traffic, set
+  `--dist-init-addr` explicitly; `NCCL_SOCKET_IFNAME` still has to be set
+  separately.
+- The rendezvous port is a fixed constant, not a function of `--port`. Every
+  node has to arrive at the same port without talking to any other node, and
+  under `tokenspeed serve` the engine's own port is allocated per node. The
+  constant also stays clear of the kernel's ephemeral range, which is checked
+  at startup. Pass `--dist-init-addr` to use a different port.
+
 Apply the same NCCL transport and channel settings on every node as well. In
 particular, do not mix IB and Socket selection or different
 `NCCL_MIN_NCHANNELS` / `NCCL_MAX_NCHANNELS` values across ranks.

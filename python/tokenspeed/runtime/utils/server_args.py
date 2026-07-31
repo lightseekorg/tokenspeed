@@ -25,6 +25,7 @@ import dataclasses
 import json
 import os
 import random
+import socket
 from typing import Literal
 
 from tokenspeed_kernel.ops.attention.triton.linear.chunk_delta_h import (
@@ -41,6 +42,7 @@ from tokenspeed.runtime.utils import (
     maybe_model_redirect,
     nullable_str,
 )
+from tokenspeed.runtime.utils.launcher import detect_topology
 from tokenspeed.runtime.utils.network import is_port_available
 
 logger = get_colorful_logger(__name__)
@@ -195,10 +197,11 @@ class ServerArgs:
     kvstore_storage_backend_extra_config: str | None = None
     enable_mla_l1_5_cache: bool = False
 
-    # Multi-node distributed serving
+    # Multi-node distributed serving. ``None`` means "not given by the user",
+    # which is what lets the launcher environment fill them in.
     dist_init_addr: str | None = None
-    nnodes: int = 1
-    node_rank: int = 0
+    nnodes: int | None = None
+    node_rank: int | None = None
 
     # Hugging Face model config overrides in JSON
     hf_overrides: str = "{}"
@@ -315,6 +318,7 @@ class ServerArgs:
 
     def __post_init__(self):
         self.resolve_basic_defaults()
+        self.resolve_launcher_topology()
         self.resolve_parallelism()
         self.resolve_memory_and_scheduling()
         self.resolve_kernel_backends()
@@ -444,6 +448,41 @@ class ServerArgs:
                 self.sampling_backend = "flashinfer"
             else:
                 self.sampling_backend = "greedy"
+
+    def resolve_launcher_topology(self):
+        """Fill in unset multi-node arguments from the launcher environment."""
+        topology = detect_topology()
+        if topology is None:
+            self.nnodes = 1 if self.nnodes is None else self.nnodes
+            self.node_rank = 0 if self.node_rank is None else self.node_rank
+            return
+
+        for flag, given, found in (
+            ("--nnodes", self.nnodes, topology.nnodes),
+            ("--node-rank", self.node_rank, topology.node_rank),
+        ):
+            if given is not None and given != found:
+                raise ValueError(
+                    f"{flag}={given} contradicts the {topology.source} environment, "
+                    f"which reports {found}. Drop the flag to use the launcher's "
+                    f"value, or correct the launch."
+                )
+
+        derived = []
+        if self.nnodes is None:
+            self.nnodes = topology.nnodes
+            derived.append(f"--nnodes {self.nnodes}")
+        if self.node_rank is None:
+            self.node_rank = topology.node_rank
+            derived.append(f"--node-rank {self.node_rank}")
+        if self.dist_init_addr is None:
+            self.dist_init_addr = topology.dist_init_addr
+            derived.append(f"--dist-init-addr {self.dist_init_addr}")
+        if derived:
+            logger.info(
+                f"node {self.node_rank}/{self.nnodes} on {socket.gethostname()}: "
+                f"derived from {topology.source}: {' '.join(derived)}"
+            )
 
     def resolve_parallelism(self):
         world_size = self.world_size
@@ -1334,13 +1373,20 @@ class ServerArgs:
         parser.add_argument(
             "--dist-init-addr",
             type=str,
-            help="The host address for initializing distributed backend (e.g., `192.168.0.2:25000`).",
+            help="The host address for initializing distributed backend (e.g., `192.168.0.2:25000`). "
+            "Derived from the launcher environment under a multi-node Slurm step.",
         )
         parser.add_argument(
-            "--nnodes", type=int, default=ServerArgs.nnodes, help="The number of nodes."
+            "--nnodes",
+            type=int,
+            default=ServerArgs.nnodes,
+            help="The number of nodes. Derived from SLURM_NNODES when unset.",
         )
         parser.add_argument(
-            "--node-rank", type=int, default=ServerArgs.node_rank, help="The node rank."
+            "--node-rank",
+            type=int,
+            default=ServerArgs.node_rank,
+            help="The node rank. Derived from SLURM_NODEID when unset.",
         )
 
         # Model override args
@@ -2058,6 +2104,12 @@ class PortArgs:
                     f"Example: --dist-init-addr 127.0.0.1:4000"
                 )
             dist_init_addr = ("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
+        elif server_args.dist_init_addr is None:
+            raise ValueError(
+                f"--dist-init-addr is required for nnodes={server_args.mapping.nnodes} "
+                "and could not be derived from the launcher environment. "
+                "Example: --dist-init-addr <head-node-ip>:20000"
+            )
         else:
             dist_init_addr = server_args.dist_init_addr.split(":")
         if len(dist_init_addr) != 2:
