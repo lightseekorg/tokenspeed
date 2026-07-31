@@ -754,6 +754,9 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         try:
             import uvicorn
 
+            from tokenspeed.runtime.entrypoints.native_generate_http import (
+                router as native_generate_router,
+            )
             from tokenspeed.runtime.entrypoints.sglang_compat_http import (
                 router as sglang_router,
             )
@@ -761,10 +764,10 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
                 build_vllm_compat_app,
             )
 
-            # vLLM-compatible endpoints (driven by the manager) + SGLang-compatible
-            # endpoints (driven by AsyncLLM directly), on one app/port.
+            # Serve control and compatibility endpoints on one in-engine port.
             app = build_vllm_compat_app(manager)
             app.state.async_llm = self
+            app.include_router(native_generate_router)
             app.include_router(sglang_router)
 
             server = uvicorn.Server(

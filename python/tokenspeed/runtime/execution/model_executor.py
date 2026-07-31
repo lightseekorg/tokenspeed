@@ -55,12 +55,15 @@ from tokenspeed.runtime.execution.model_runner import ModelRunner
 from tokenspeed.runtime.execution.nan_guard import NanGuard
 from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
-from tokenspeed.runtime.execution.types import ModelExecutionResult
+from tokenspeed.runtime.execution.types import LogprobDetails, ModelExecutionResult
 from tokenspeed.runtime.grammar.capturable_grammar import setup_grammar_step
 from tokenspeed.runtime.layers.attention.backends.flat_cache_metadata import (
     FlatCacheBatchMetadata,
 )
-from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+from tokenspeed.runtime.layers.logits_processor import (
+    LogitsProcessorOutput,
+    compute_output_logprob_details,
+)
 from tokenspeed.runtime.layers.paged_attention import (
     validate_paged_cache_group_ids,
 )
@@ -989,6 +992,23 @@ class ModelExecutor:
 
         logits_output = self._run_target_forward(bs, ctx, req_pool_indices)
 
+        output_top_values = output_top_indices = None
+        output_token_values = output_token_indices = None
+        if ctx.return_logprob_details and (
+            any(ctx.top_logprobs_nums or [])
+            or any(token_ids for token_ids in (ctx.token_ids_logprobs or []))
+        ):
+            (
+                output_top_values,
+                output_top_indices,
+                output_token_values,
+                output_token_indices,
+            ) = compute_output_logprob_details(
+                logits_output.next_token_logits,
+                ctx.top_logprobs_nums or [0] * bs,
+                ctx.token_ids_logprobs or [None] * bs,
+            )
+
         if self.drafter is not None and getattr(
             self.drafter, "_incremental_proj_enabled", False
         ):
@@ -1034,7 +1054,79 @@ class ModelExecutor:
             ] = next_round_input_ids.to(torch.int32)
 
         output_logprobs = logits_output.next_token_logprobs
-        return output_tokens, accept_lengths, output_logprobs
+        logprob_details = None
+        if ctx.return_logprob_details:
+            logprob_details = LogprobDetails(
+                input_token_logprobs=logits_output.input_token_logprobs,
+                input_token_ids=ctx.extend_input_logprob_token_ids_gpu,
+                input_top_logprobs_val=logits_output.input_top_logprobs_val,
+                input_top_logprobs_idx=logits_output.input_top_logprobs_idx,
+                input_token_ids_logprobs_val=(
+                    logits_output.input_token_ids_logprobs_val
+                ),
+                input_token_ids_logprobs_idx=(
+                    logits_output.input_token_ids_logprobs_idx
+                ),
+                output_top_logprobs_val=output_top_values,
+                output_top_logprobs_idx=output_top_indices,
+                output_token_ids_logprobs_val=output_token_values,
+                output_token_ids_logprobs_idx=output_token_indices,
+            )
+        return output_tokens, accept_lengths, output_logprobs, logprob_details
+
+    def _set_logprob_context(
+        self,
+        ctx: ForwardContext,
+        forward_op,
+        sampling_params_list: list[SamplingParams],
+    ) -> None:
+        """Populate per-forward metadata for detailed logprob results."""
+
+        bs = ctx.bs
+        num_extends = ctx.num_extends
+        top_ks = [
+            int(getattr(params, "logprob_top_k", 0) or 0)
+            for params in sampling_params_list
+        ]
+        token_ids = [
+            getattr(params, "logprob_token_ids", None)
+            for params in sampling_params_list
+        ]
+        ctx.top_logprobs_nums = top_ks
+        ctx.token_ids_logprobs = token_ids
+        ctx.return_logprob_details = any(top_ks) or any(ids for ids in token_ids)
+
+        if num_extends <= 0:
+            return
+
+        start_lens = [
+            int(value) for value in forward_op.extend_logprob_start_lens[:num_extends]
+        ]
+        seq_lens = [int(value) for value in forward_op.input_lengths[:num_extends]]
+        pruned_lens = [
+            extend_len - start_len
+            for start_len, extend_len in zip(start_lens, seq_lens)
+        ]
+        if not any(pruned_lens):
+            return
+
+        shifted_ids = self.input_buffers.shifted_prefill_ids_buf
+        target_slices = []
+        offset = 0
+        for start_len, extend_len in zip(start_lens, seq_lens):
+            target_slices.append(shifted_ids[offset + start_len : offset + extend_len])
+            offset += extend_len
+
+        ctx.return_logprob_details = True
+        ctx.extend_return_logprob = True
+        ctx.extend_return_top_logprob = any(top_ks[:num_extends])
+        ctx.extend_token_ids_logprob = any(ids for ids in token_ids[:num_extends])
+        ctx.extend_seq_lens_cpu = seq_lens
+        ctx.extend_logprob_start_lens_cpu = start_lens
+        ctx.extend_logprob_pruned_lens_cpu = pruned_lens
+        ctx.top_logprobs_nums = top_ks
+        ctx.token_ids_logprobs = token_ids
+        ctx.extend_input_logprob_token_ids_gpu = torch.cat(target_slices)
 
     @nvtx_range("update_runtime_state", color="orange")
     def _update_runtime_state(
@@ -1876,6 +1968,7 @@ class ModelExecutor:
                 output_tokens = torch.zeros(0, dtype=torch.int32, device=self.device)
                 output_lengths = torch.zeros(bs, dtype=torch.int32, device=self.device)
                 output_logprobs = None
+                logprob_details = None
             else:
                 gather_ids = None
                 if num_extends > 0:
@@ -1929,6 +2022,7 @@ class ModelExecutor:
                     gather_ids=gather_ids,
                     decode_input_ids=decode_input_ids,
                 )
+                self._set_logprob_context(ctx, forward_op, sampling_params_list)
                 if self.config.data_parallel_size > 1:
                     if dp_global_num_tokens is None:
                         raise RuntimeError(
@@ -2017,7 +2111,12 @@ class ModelExecutor:
                             else bs
                         )
                         forward_step_start = time.perf_counter()
-                    output_tokens, output_lengths, output_logprobs = self.forward_step(
+                    (
+                        output_tokens,
+                        output_lengths,
+                        output_logprobs,
+                        logprob_details,
+                    ) = self.forward_step(
                         bs=bs,
                         ctx=ctx,
                         sampling_info=sampling_info,
@@ -2115,6 +2214,8 @@ class ModelExecutor:
 
                 if output_logprobs is not None:
                     output_logprobs = output_logprobs.to("cpu", non_blocking=True)
+                if logprob_details is not None:
+                    logprob_details.to_cpu()
 
                 output_nan_flags = self.nan_guard.flags_cpu
 
@@ -2163,6 +2264,7 @@ class ModelExecutor:
             output_tokens=output_tokens,
             output_lengths=output_lengths,
             output_logprobs=output_logprobs,
+            logprob_details=logprob_details,
             copy_event=copy_event,
             grammar_completion=grammar_completion,
             next_input_ids=next_input_ids,

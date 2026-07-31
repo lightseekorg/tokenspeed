@@ -271,6 +271,11 @@ class RequestHandler:
         req_spec = make_spec(
             rid=recv_req.rid,
             tokens=recv_req.input_ids,
+            logprob_start_len=(
+                recv_req.logprob_start_len
+                if recv_req.return_logprob and recv_req.logprob_start_len >= 0
+                else -1
+            ),
         )
         req_state = RequestState.from_recv_req(
             recv_req,

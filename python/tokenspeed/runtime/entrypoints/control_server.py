@@ -148,9 +148,11 @@ async def _proxy_request(
     request: Request,
     base_url: str | None = None,
     body_override: bytes | None = None,
+    path_override: str | None = None,
 ) -> StreamingResponse | Response:
     base_url = base_url if base_url is not None else _gateway_url
-    url = f"{base_url.rstrip('/')}{request.url.path}"
+    path = path_override if path_override is not None else request.url.path
+    url = f"{base_url.rstrip('/')}{path}"
     if request.url.query:
         url = f"{url}?{request.url.query}"
     body = body_override if body_override is not None else await request.body()
@@ -267,6 +269,37 @@ def _wants_logprob(body: bytes) -> bool:
     return isinstance(data, dict) and bool(data.get("return_logprob"))
 
 
+def _needs_engine_generate(body: bytes) -> bool:
+    """Whether the request uses detailed fields absent from the gateway request."""
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return False
+    if not isinstance(data, dict):
+        return False
+
+    try:
+        top_k = data.get("top_logprobs_num", 0)
+        if isinstance(top_k, list):
+            if any(int(value or 0) > 0 for value in top_k):
+                return True
+        elif int(top_k or 0) > 0:
+            return True
+
+        start = data.get("logprob_start_len", -1)
+        if isinstance(start, list):
+            if any(int(value) >= 0 for value in start):
+                return True
+        elif int(start if start is not None else -1) >= 0:
+            return True
+    except (TypeError, ValueError):
+        # Let the engine return the field-specific validation error.
+        return True
+
+    token_ids = data.get("token_ids_logprob")
+    return bool(token_ids)
+
+
 _warned_placeholder_logprobs = False
 
 
@@ -304,7 +337,21 @@ def _add_output_token_logprobs(obj: dict) -> bool:
 async def generate(request: Request):
     if request.method != "POST":
         return await _proxy_request(request)
-    body = await _inject_default_model(await request.body())
+    raw_body = await request.body()
+    if _needs_engine_generate(raw_body):
+        if not _rl_control_url:
+            return JSONResponse(
+                {"error": "in-engine generation is unavailable on this server"},
+                status_code=503,
+            )
+        return await _proxy_request(
+            request,
+            base_url=_rl_control_url,
+            body_override=raw_body,
+            path_override="/_engine/generate",
+        )
+
+    body = await _inject_default_model(raw_body)
     resp = await _proxy_request(request, body_override=body)
     if not (isinstance(resp, Response) and resp.body):
         return resp  # streaming or empty: pass through

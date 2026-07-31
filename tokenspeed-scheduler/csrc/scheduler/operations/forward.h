@@ -74,6 +74,9 @@ struct PrefillOperation : public ForwardOperationBase {
     std::vector<std::int32_t> input_ids;
     std::vector<std::int32_t> shifted_input_ids;
     std::int32_t extend_prefix_len;
+    // Start within this prefill chunk for input-logprob computation.
+    // Equal to the chunk length when no input positions are requested.
+    std::int32_t extend_logprob_start_len{0};
 };
 
 struct DecodeOperation : public ForwardOperationBase {
@@ -98,6 +101,7 @@ struct FlatForwardOperation {
     std::vector<std::int32_t> input_ids;
     std::vector<std::int32_t> shifted_input_ids;
     std::vector<std::int32_t> extend_prefix_lens;
+    std::vector<std::int32_t> extend_logprob_start_lens;
     std::vector<std::int32_t> decode_input_ids;
     std::vector<std::int32_t> hist_token_lens;
 
@@ -160,6 +164,7 @@ struct FlatForwardOperation {
                 shifted_input_ids.insert(shifted_input_ids.end(), prefill->shifted_input_ids.begin(),
                                          prefill->shifted_input_ids.end());
                 extend_prefix_lens.push_back(prefill->extend_prefix_len);
+                extend_logprob_start_lens.push_back(prefill->extend_logprob_start_len);
             } else if (auto* decode = std::get_if<DecodeOperation>(&op)) {
                 decode_input_ids.push_back(decode->decode_input_id);
                 hist_token_lens.push_back(decode->hist_token_len);

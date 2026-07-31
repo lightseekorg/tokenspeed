@@ -130,6 +130,22 @@ TEST_F(FlatChunkedPrefillSuite, MultiChunkPrefillGrowsFullTableThenDecodes) {
         << "all pages returned to the pool after a chunked-prefill request finishes";
 }
 
+TEST_F(FlatChunkedPrefillSuite, LogprobStartIsRelativeToEachChunk) {
+    auto spec = MakeRequestSpec("r1", /*num_pages=*/4);
+    spec.logprob_start_len = 2;
+    Submit(spec);
+
+    ExecutionPlan chunk1 = PlanOnce();
+    const FlatForwardOperation* op1 = FindFlatOp(chunk1);
+    ASSERT_NE(op1, nullptr);
+    EXPECT_EQ(op1->extend_logprob_start_lens.at(0), 2);
+
+    ExecutionPlan chunk2 = PlanOnce();
+    const FlatForwardOperation* op2 = FindFlatOp(chunk2);
+    ASSERT_NE(op2, nullptr);
+    EXPECT_EQ(op2->extend_logprob_start_lens.at(0), 0);
+}
+
 class FlatMambaChunkAlignmentSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
@@ -2142,6 +2158,33 @@ TEST_F(FlatPrefixHitSuite, FullHitCapsAtLastToken) {
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 10);
     SendForwardDone("r2", {200});
     SendFinish("r2");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
+}
+
+TEST_F(FlatPrefixHitSuite, PromptLogprobsCapHitAtStartPosition) {
+    const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
+
+    const RequestSpec r1 = MakeRequestSpec("r1", /*num_pages=*/4);
+    RunLifecycle(r1);
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
+
+    auto scored = MakeSpecWithTokens("scored", r1.tokens);
+    scored.logprob_start_len = 2;
+    Submit(scored);
+    ExecutionPlan plan = PlanOnce();
+    const FlatForwardOperation* op = FindFlatOp(plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids.size(), 1u);
+
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 2);
+    EXPECT_EQ(op->extend_logprob_start_lens.at(0), 0);
+    EXPECT_EQ(op->input_lengths.at(0), 6);
+
+    SendForwardDone("scored", {199});
+    PlanOnce();
+    SendForwardDone("scored", {200});
+    SendFinish("scored");
     PlanOnce();
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
 }

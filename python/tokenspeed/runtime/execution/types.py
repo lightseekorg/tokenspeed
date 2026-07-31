@@ -34,6 +34,38 @@ if TYPE_CHECKING:
 
 
 @dataclass
+class LogprobDetails:
+    """Additional prompt and distribution logprobs."""
+
+    input_token_logprobs: torch.Tensor | None = None
+    input_token_ids: torch.Tensor | None = None
+    input_top_logprobs_val: list | None = None
+    input_top_logprobs_idx: list | None = None
+    input_token_ids_logprobs_val: list | None = None
+    input_token_ids_logprobs_idx: list | None = None
+    output_top_logprobs_val: torch.Tensor | None = None
+    output_top_logprobs_idx: torch.Tensor | None = None
+    output_token_ids_logprobs_val: torch.Tensor | None = None
+    output_token_ids_logprobs_idx: torch.Tensor | None = None
+
+    def to_cpu(self) -> LogprobDetails:
+        """Enqueue non-blocking CPU copies for tensor-backed fields."""
+
+        for field_name in (
+            "input_token_logprobs",
+            "input_token_ids",
+            "output_top_logprobs_val",
+            "output_top_logprobs_idx",
+            "output_token_ids_logprobs_val",
+            "output_token_ids_logprobs_idx",
+        ):
+            value = getattr(self, field_name)
+            if value is not None:
+                setattr(self, field_name, value.to("cpu", non_blocking=True))
+        return self
+
+
+@dataclass
 class ModelExecutionResult:
     """
     Result of model execution returned to scheduler.
@@ -55,6 +87,7 @@ class ModelExecutionResult:
     # Populated unconditionally by the sampling backend so it's always
     # available if any request asks for it.
     output_logprobs: torch.Tensor | None = None
+    logprob_details: LogprobDetails | None = None
     # Optional next-round input rows captured for PD prefill data-plane handoff.
     next_input_ids: torch.Tensor | None = None
     # Per-request NaN-guard flags (int32, [bs]); None when the guard is disabled.

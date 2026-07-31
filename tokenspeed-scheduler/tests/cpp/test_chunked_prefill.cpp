@@ -106,4 +106,31 @@ TEST_F(ChunkedPrefillTestSuite, InputIds_CorrectPerChunk) {
     EXPECT_EQ(fwd2->input_ids[1], 6);
 }
 
+TEST_F(ChunkedPrefillTestSuite, LogprobStartIsRelativeToEachChunk) {
+    auto spec = MakeRequestSpec("r1", 4);  // 8 tokens in two 4-token chunks.
+    spec.logprob_start_len = 2;
+    Submit(spec);
+
+    auto plan1 = PlanOnce();
+    auto* fwd1 = GetForwardOp(plan1);
+    ASSERT_NE(fwd1, nullptr);
+    ASSERT_EQ(fwd1->extend_logprob_start_lens.size(), 1u);
+    EXPECT_EQ(fwd1->extend_logprob_start_lens[0], 2);
+
+    auto plan2 = PlanOnce();
+    auto* fwd2 = GetForwardOp(plan2);
+    ASSERT_NE(fwd2, nullptr);
+    ASSERT_EQ(fwd2->extend_logprob_start_lens.size(), 1u);
+    EXPECT_EQ(fwd2->extend_logprob_start_lens[0], 0);
+}
+
+TEST_F(ChunkedPrefillTestSuite, OutputOnlyLogprobsSkipPromptScoring) {
+    Submit(MakeRequestSpec("r1", 2));
+    auto plan = PlanOnce();
+    auto* fwd = GetForwardOp(plan);
+    ASSERT_NE(fwd, nullptr);
+    ASSERT_EQ(fwd->extend_logprob_start_lens.size(), 1u);
+    EXPECT_EQ(fwd->extend_logprob_start_lens[0], fwd->input_lengths[0]);
+}
+
 }  // namespace tokenspeed::test

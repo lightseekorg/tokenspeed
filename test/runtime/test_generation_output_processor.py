@@ -32,6 +32,7 @@ from tokenspeed.runtime.engine.request_stats import (
     RequestStats,
     RequestStatsTracker,
 )
+from tokenspeed.runtime.execution.types import LogprobDetails
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 
@@ -112,6 +113,65 @@ def test_mixed_forward_updates_reserve_for_decode_slots_only():
     assert len(reserve_events) == 1
     assert reserve_events[0].request_id == "decode"
     assert reserve_events[0].reserve_num_tokens_in_next_schedule_event == 1
+
+
+def test_score_only_request_returns_aligned_prompt_logprobs():
+    sender = _Sender()
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
+    state = RequestState(
+        prompt_input_ids=[10, 11, 12],
+        sampling_params=SamplingParams(max_new_tokens=0, stop=[], ignore_eos=True),
+        stream=False,
+        tokenizer=_Tokenizer(),
+        return_logprob=True,
+        logprob_start_len=0,
+        top_logprobs_num=2,
+        token_ids_logprob=[7, 9],
+    )
+    processor.rid_to_state["score"] = state
+
+    class _ScoreForwardOp:
+        request_ids = ["score"]
+        request_pool_indices = [0]
+        input_lengths = [3]
+        extend_prefix_lens = [0]
+        extend_logprob_start_lens = [0]
+        prefill_lengths = [3]
+
+        @staticmethod
+        def num_extends():
+            return 1
+
+    result = _ExecutionResult()
+    result.output_tokens = torch.tensor([99], dtype=torch.int32)
+    result.output_lengths = torch.tensor([1], dtype=torch.int32)
+    result.output_logprobs = torch.tensor([-0.4])
+    result.logprob_details = LogprobDetails(
+        input_token_logprobs=torch.tensor([-0.1, -0.2, -0.3]),
+        input_top_logprobs_val=[[[-0.01, -1.0], [-0.02, -1.1], [-0.03, -1.2]]],
+        input_top_logprobs_idx=[[[1, 2], [3, 4], [5, 6]]],
+        input_token_ids_logprobs_val=[[[-2.0, -3.0], [-2.1, -3.1], [-2.2, -3.2]]],
+        input_token_ids_logprobs_idx=[[[7, 9], [7, 9], [7, 9]]],
+        output_top_logprobs_val=torch.tensor([[-0.04, -1.3]]),
+        output_top_logprobs_idx=torch.tensor([[8, 9]]),
+        output_token_ids_logprobs_val=torch.tensor([[-2.3, -3.3]]),
+        output_token_ids_logprobs_idx=torch.tensor([[7, 9]]),
+    )
+
+    events = processor.post_process_forward_op(_ScoreForwardOp(), result)
+
+    assert any(type(event).__name__ == "Finish" for event in events)
+    assert state.output_ids == []
+    assert len(sender.items) == 1
+    output = sender.items[0]
+    assert output.completion_tokens == [0]
+    assert output.input_token_logprobs_idx == [[10, 11, 12]]
+    assert output.input_token_logprobs_val[0][0] is None
+    assert output.input_token_logprobs_val[0][1:] == pytest.approx([-0.1, -0.2])
+    assert output.input_top_logprobs_idx == [[None, [1, 2], [3, 4]]]
+    assert output.input_token_ids_logprobs_idx == [[None, [7, 9], [7, 9]]]
+    assert output.output_token_logprobs_val == [[]]
+    assert output.output_top_logprobs_val == [[]]
 
 
 def test_mark_abort_notify_client_flag():

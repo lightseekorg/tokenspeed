@@ -222,7 +222,11 @@ class LogprobsProcessor:
             ]
         if self.engine.tokenizer is None:
             raise RuntimeError("Tokenizer is required to decode logprob tokens.")
-        token_texts = self.engine.tokenizer.batch_decode(token_logprobs_idx)
+        # Decode each token independently. Transformers v5 treats a flat list
+        # as one sequence rather than one sequence per token.
+        token_texts = self.engine.tokenizer.batch_decode(
+            [[token_id] for token_id in token_logprobs_idx]
+        )
         return list(zip(token_logprobs_val, token_logprobs_idx, token_texts))
 
     def detokenize_top_logprobs_tokens(
