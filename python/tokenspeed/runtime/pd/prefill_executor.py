@@ -357,8 +357,6 @@ class DisaggPrefillExecutor:
         (embedding receive timed out). Signal the dual-dispatched decode so its KV
         receiver fails instead of waiting forever. No sender was registered, so
         there is nothing to tear down on this side."""
-        if self.uses_cache_contract:
-            raise NotImplementedError("Paged cache PD does not support EPD admission")
         self.kv_manager.abort_room(
             bootstrap_info.bootstrap_room,
             f"EPD: prefill aborted request {request_id} (embedding receive timed out)",

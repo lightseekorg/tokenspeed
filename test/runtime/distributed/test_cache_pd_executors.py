@@ -246,6 +246,24 @@ def test_prefill_submits_manifest_through_legacy_sender() -> None:
     assert executor._request_token == {}
 
 
+def test_cache_contract_epd_abort_notifies_decode() -> None:
+    import tokenspeed.runtime.pd.prefill_executor as prefill_module
+
+    calls = []
+    executor = object.__new__(prefill_module.DisaggPrefillExecutor)
+    executor.uses_cache_contract = True
+    executor.kv_manager = SimpleNamespace(
+        abort_room=lambda room, reason: calls.append((room, reason))
+    )
+    bootstrap = SimpleNamespace(bootstrap_room=9)
+
+    executor.abort("request-0", bootstrap)
+
+    assert calls == [
+        (9, "EPD: prefill aborted request request-0 (embedding receive timed out)")
+    ]
+
+
 def test_shared_manager_validates_manifest_before_dma() -> None:
     from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
 
