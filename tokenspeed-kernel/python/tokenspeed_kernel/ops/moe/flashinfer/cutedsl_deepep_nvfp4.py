@@ -217,7 +217,7 @@ if platform.is_nvidia:
         a_q, a_q_sf = scaled_fp4_grouped_quantize(
             recv_hidden,
             masked_m,
-            w.w13_input_scale_quant.expand(num_local_experts),
+            w.w13_input_scale_quant.expand(num_local_experts).contiguous(),
         )
         sf_vec_size = 16
         gateup_output = torch.empty(
@@ -241,7 +241,7 @@ if platform.is_nvidia:
         diq, diq_sf = silu_and_mul_scaled_nvfp4_experts_quantize(
             gateup_output.permute(2, 0, 1),
             masked_m,
-            w.w2_input_scale_quant.expand(num_local_experts),
+            w.w2_input_scale_quant.expand(num_local_experts).contiguous(),
         )
         output = torch.empty(
             (num_local_experts, recv_hidden.shape[1], x.shape[1]),

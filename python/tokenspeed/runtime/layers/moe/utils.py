@@ -158,6 +158,13 @@ def use_deepep_low_latency(ctx: ForwardContext, attn_dp_size: int) -> bool:
     Returns:
         True for the low-latency legs, False for the normal legs.
     """
+    # A pinned mode leaves no choice: only AUTO allocates both legs, and a
+    # low_latency-only deployment has no normal buffers to fall back to.
+    mode = get_deepep_mode()
+    if mode is DeepEPMode.LOW_LATENCY:
+        return True
+    if mode is DeepEPMode.NORMAL:
+        return False
     if attn_dp_size > 1:
         return ctx.all_decode_or_idle
     return ctx.forward_mode is not None and ctx.forward_mode.is_decode_or_idle()

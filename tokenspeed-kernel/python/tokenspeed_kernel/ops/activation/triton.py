@@ -511,44 +511,57 @@ def _fused_swiglu_fp8_ue8m0_kernel(
     bit8_min,
     bit8_max,
     GROUP_SIZE: tl.constexpr,
+    PACK: tl.constexpr,
 ):
+    # Each program covers PACK=4 adjacent scale groups of one row: the four
+    # UE8M0 exponents that share one packed int32 are produced together, so
+    # the scale write is a plain store instead of four atomic_or's racing on
+    # the same word.
     pid = tl.program_id(0)
-    groups_per_row = N // GROUP_SIZE
-    row = pid // groups_per_row
-    group_col = pid % groups_per_row
+    groups_per_row: tl.constexpr = N // GROUP_SIZE
+    packs_per_row: tl.constexpr = (groups_per_row + PACK - 1) // PACK
+    row = pid // packs_per_row
+    pack_col = pid % packs_per_row
 
-    gate_offset = (
-        row.to(tl.int64) * gate_up_stride_row + group_col.to(tl.int64) * GROUP_SIZE
+    BLOCK: tl.constexpr = GROUP_SIZE * PACK
+    col0 = pack_col * BLOCK
+    cols = col0 + tl.arange(0, BLOCK)
+    col_mask = cols < N
+
+    gate_base = row.to(tl.int64) * gate_up_stride_row
+    gate = tl.load(gate_up_ptr + gate_base + cols, mask=col_mask, other=0.0).to(
+        tl.float32
     )
-    up_offset = gate_offset + N
-    out_offset = row.to(tl.int64) * out_stride_row + group_col.to(tl.int64) * GROUP_SIZE
-
-    cols = tl.arange(0, GROUP_SIZE)
-
-    gate = tl.load(gate_up_ptr + gate_offset + cols).to(tl.float32)
-    up = tl.load(gate_up_ptr + up_offset + cols).to(tl.float32)
+    up = tl.load(gate_up_ptr + gate_base + N + cols, mask=col_mask, other=0.0).to(
+        tl.float32
+    )
 
     if swiglu_limit > 0.0:
         gate = tl.minimum(gate, swiglu_limit)
         up = tl.clamp(up, -swiglu_limit, swiglu_limit)
 
     silu_gate = gate * tl.sigmoid(swiglu_alpha * gate)
-    y = silu_gate * (up + swiglu_beta)
+    y = tl.reshape(silu_gate * (up + swiglu_beta), (PACK, GROUP_SIZE))
 
-    _absmax = tl.max(tl.abs(y))
+    _absmax = tl.max(tl.abs(y), axis=1)
     scale_raw = tl.maximum(_absmax / bit8_max, eps)
     exponent = tl.ceil(tl.log2(scale_raw))
     y_s = tl.exp2(exponent)
-    y_q = tl.clamp(y / y_s, bit8_min, bit8_max).to(out_ptr.dtype.element_ty)
+    y_q = tl.clamp(y / y_s[:, None], bit8_min, bit8_max).to(out_ptr.dtype.element_ty)
 
-    tl.store(out_ptr + out_offset + cols, y_q)
+    out_base = row.to(tl.int64) * out_stride_row
+    tl.store(
+        out_ptr + out_base + cols, tl.reshape(y_q, (BLOCK,)), mask=col_mask
+    )
 
-    scale_pack_col = group_col // 4
-    scale_pack_pos = group_col % 4
-    scale_ptr_offset = scale_pack_col.to(tl.int64) * scale_col_stride + row.to(tl.int64)
-    exponent_biased = tl.clamp(exponent + 127.0, 0.0, 255.0).to(tl.uint32)
-    packed_scale = exponent_biased << (scale_pack_pos * 8)
-    tl.atomic_or(scale_ptr + scale_ptr_offset, packed_scale, sem="relaxed")
+    group_ids = pack_col * PACK + tl.arange(0, PACK)
+    group_mask = group_ids < groups_per_row
+    exponent_biased = tl.where(
+        group_mask, tl.clamp(exponent + 127.0, 0.0, 255.0), 0.0
+    ).to(tl.uint32)
+    packed_scale = tl.sum(exponent_biased << (tl.arange(0, PACK) * 8))
+    scale_ptr_offset = pack_col.to(tl.int64) * scale_col_stride + row.to(tl.int64)
+    tl.store(scale_ptr + scale_ptr_offset, packed_scale)
 
 
 def fused_swiglu_fp8_ue8m0(
@@ -593,8 +606,10 @@ def fused_swiglu_fp8_ue8m0(
         scale_ue8m0=True,
     )
 
-    num_groups = M * (N // GROUP_SIZE)
-    _fused_swiglu_fp8_ue8m0_kernel[(num_groups,)](
+    PACK = 4
+    packs_per_row = (N // GROUP_SIZE + PACK - 1) // PACK
+    num_programs = M * packs_per_row
+    _fused_swiglu_fp8_ue8m0_kernel[(num_programs,)](
         gate_up,
         out,
         scale,
@@ -610,7 +625,8 @@ def fused_swiglu_fp8_ue8m0(
         bit8_min=info.min,
         bit8_max=info.max,
         GROUP_SIZE=GROUP_SIZE,
-        num_warps=min(max(GROUP_SIZE // 256, 1), 8),
+        PACK=PACK,
+        num_warps=2,
         num_stages=1,
     )
 

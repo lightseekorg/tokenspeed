@@ -325,3 +325,64 @@ def test_situ_and_mul_preallocated_out(device: str) -> None:
             beta=4.0,
             linear_beta=25.0,
         )
+
+
+# --- fused_swiglu_fp8_ue8m0 tests ---
+
+
+def _swiglu_ue8m0_reference(
+    gate_up: torch.Tensor, limit: float, alpha: float, beta: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    gate, up = gate_up.float().chunk(2, dim=-1)
+    if limit > 0:
+        gate = gate.clamp(max=limit)
+        up = up.clamp(-limit, limit)
+    y = gate * torch.sigmoid(alpha * gate) * (up + beta)
+    blocks = y.view(y.shape[0], -1, 128)
+    amax = blocks.abs().amax(dim=-1, keepdim=True)
+    scale = torch.exp2(torch.ceil(torch.log2((amax / 448.0).clamp_min(1e-10))))
+    quantized = (blocks / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    return quantized.view(y.shape), scale.squeeze(-1)
+
+
+def _unpack_ue8m0(packed: torch.Tensor, num_groups: int) -> torch.Tensor:
+    bytes_ = torch.stack(
+        [(packed >> (8 * i)) & 0xFF for i in range(4)], dim=-1
+    ).flatten(-2)[..., :num_groups]
+    return torch.exp2(bytes_.float() - 127.0)
+
+
+@pytest.mark.skipif(not platform.is_nvidia, reason="requires float8_e4m3fn CUDA")
+@pytest.mark.parametrize("shape", [(1, 1024), (7, 1024), (128, 3584), (333, 1280)])
+@pytest.mark.parametrize("limit,alpha,beta", [(0.0, 1.0, 0.0), (7.0, 1.702, 1.0)])
+def test_fused_swiglu_fp8_ue8m0_matches_reference(
+    shape: tuple[int, int], limit: float, alpha: float, beta: float, device: str
+) -> None:
+    from tokenspeed_kernel.ops.activation.triton import fused_swiglu_fp8_ue8m0
+
+    gate_up = torch.randn(shape, device=device, dtype=torch.bfloat16) * 3
+    out, packed_scale = fused_swiglu_fp8_ue8m0(
+        gate_up, swiglu_limit=limit, swiglu_alpha=alpha, swiglu_beta=beta
+    )
+
+    ref_q, ref_scale = _swiglu_ue8m0_reference(gate_up, limit, alpha, beta)
+    num_groups = out.shape[1] // 128
+    got_scale = _unpack_ue8m0(packed_scale, num_groups)
+
+    torch.testing.assert_close(got_scale, ref_scale.squeeze(-1), rtol=0, atol=0)
+    dequant = out.float().view(out.shape[0], num_groups, 128) * got_scale[..., None]
+    ref_dequant = ref_q.float().view_as(dequant) * ref_scale[..., None].squeeze(-1)[
+        ..., None
+    ]
+    torch.testing.assert_close(dequant, ref_dequant, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not platform.is_nvidia, reason="requires float8_e4m3fn CUDA")
+def test_fused_swiglu_fp8_ue8m0_partial_pack_keeps_padding_zero(device: str) -> None:
+    """N=640 gives 5 groups: byte 3 of the second packed int32 must stay 0."""
+    from tokenspeed_kernel.ops.activation.triton import fused_swiglu_fp8_ue8m0
+
+    gate_up = torch.randn(16, 1280, device=device, dtype=torch.bfloat16)
+    _, packed_scale = fused_swiglu_fp8_ue8m0(gate_up)
+    tail = packed_scale[:, 1]
+    assert bool(((tail >> 8) == 0).all()), "padding scale bytes must remain zero"
