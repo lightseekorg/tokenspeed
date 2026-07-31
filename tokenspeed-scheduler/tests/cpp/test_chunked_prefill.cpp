@@ -106,6 +106,7 @@ TEST_F(ChunkedPrefillTestSuite, InputIds_CorrectPerChunk) {
     EXPECT_EQ(fwd2->input_ids[1], 6);
 }
 
+#if !TOKENSPEED_FLAT_KVCACHE
 TEST_F(ChunkedPrefillTestSuite, LogprobStartIsRelativeToEachChunk) {
     auto spec = MakeRequestSpec("r1", 4);  // 8 tokens in two 4-token chunks.
     spec.logprob_start_len = 2;
@@ -132,5 +133,6 @@ TEST_F(ChunkedPrefillTestSuite, OutputOnlyLogprobsSkipPromptScoring) {
     ASSERT_EQ(fwd->extend_logprob_start_lens.size(), 1u);
     EXPECT_EQ(fwd->extend_logprob_start_lens[0], fwd->input_lengths[0]);
 }
+#endif
 
 }  // namespace tokenspeed::test

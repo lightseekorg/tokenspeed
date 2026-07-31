@@ -1082,7 +1082,6 @@ class ModelExecutor:
     ) -> None:
         """Populate per-forward metadata for detailed logprob results."""
 
-        bs = ctx.bs
         num_extends = ctx.num_extends
         top_ks = [
             int(getattr(params, "logprob_top_k", 0) or 0)

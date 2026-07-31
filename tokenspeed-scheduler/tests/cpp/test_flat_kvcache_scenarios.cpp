@@ -146,6 +146,16 @@ TEST_F(FlatChunkedPrefillSuite, LogprobStartIsRelativeToEachChunk) {
     EXPECT_EQ(op2->extend_logprob_start_lens.at(0), 0);
 }
 
+TEST_F(FlatChunkedPrefillSuite, OutputOnlyLogprobsSkipPromptScoring) {
+    Submit(MakeRequestSpec("r1", /*num_pages=*/2));
+
+    ExecutionPlan plan = PlanOnce();
+    const FlatForwardOperation* op = FindFlatOp(plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->extend_logprob_start_lens.size(), 1u);
+    EXPECT_EQ(op->extend_logprob_start_lens.at(0), op->input_lengths.at(0));
+}
+
 class FlatMambaChunkAlignmentSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {

@@ -82,6 +82,7 @@ TEST_F(BasicLifecycleTestSuite, FullLifecycle_SubmitThroughFinish) {
     EXPECT_EQ(scheduler_->DecodingSize(), 0u);
 }
 
+#if !TOKENSPEED_FLAT_KVCACHE
 TEST_F(BasicLifecycleTestSuite, PromptLogprobsCapPrefixMatchAtStartPosition) {
     auto source = MakeRequestSpec("source", 4);  // [1..8], block_size=2.
     Submit(source);
@@ -102,6 +103,7 @@ TEST_F(BasicLifecycleTestSuite, PromptLogprobsCapPrefixMatchAtStartPosition) {
     EXPECT_EQ(fwd->extend_prefix_lens[0], 2);
     EXPECT_EQ(fwd->extend_logprob_start_lens[0], 0);
 }
+#endif
 
 TEST_F(BasicLifecycleTestSuite, EmptyPlan_NoRequests) {
     auto plan = PlanOnce();
