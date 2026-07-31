@@ -93,7 +93,49 @@ class FakeGroup:
     group_id = "full_attention"
 
 
+class FakeLcmPlan:
+    logical_block_tokens = 128
+
+
+class FakeLcmPool:
+    """LCM pool shape: carries the memory plan the kernel page must match."""
+
+    _lcm_memory_plan = FakeLcmPlan()
+
+
+class FakePagedMHABackend(FakeFlatMHABackend):
+    """Flat MHA backend that reports the kernel page size it was built with."""
+
+    def __init__(self, page_size):
+        self.page_size = page_size
+
+
 class ValidateFlatSchedulerConfigTest(unittest.TestCase):
+    def test_kernel_page_size_mismatch_names_block_size(self):
+        # page_size follows server_args.block_size while req_to_page follows the
+        # plan; disagreement must fail before a forward hits the opaque copy.
+        with self.assertRaises(RuntimeError) as ctx:
+            _pcs.validate_flat_scheduler_config(
+                flat_kvcache_ext=True,
+                paged_cache_groups=[FakeGroup()],
+                attn_backend=FakePagedMHABackend(page_size=64),
+                kv_pool=FakeLcmPool(),
+                speculative_algorithm=None,
+            )
+        msg = str(ctx.exception)
+        self.assertIn("page_size=64", msg)
+        self.assertIn("P=128", msg)
+        self.assertIn("--block-size 128", msg)
+
+    def test_kernel_page_size_match_passes(self):
+        _pcs.validate_flat_scheduler_config(
+            flat_kvcache_ext=True,
+            paged_cache_groups=[FakeGroup()],
+            attn_backend=FakePagedMHABackend(page_size=128),
+            kv_pool=FakeLcmPool(),
+            speculative_algorithm=None,
+        )
+
     def test_flat_ext_v4_style_backend_raises(self):
         # V4 pool publishes specs unconditionally, so groups are non-empty;
         # the backend flags alone must trip the guard.
