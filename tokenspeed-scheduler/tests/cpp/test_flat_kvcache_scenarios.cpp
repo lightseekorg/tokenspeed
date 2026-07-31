@@ -1486,6 +1486,10 @@ TEST_F(FlatRetractExactFitSuite, ReserveRefundBalances) {
     PlanOnce();
     SendForwardDone("d", {100});
     SendFinish("d");
+    // Flat placement is the only gate that rejects the oversized retracted
+    // request, so wedge escalation counts its two consecutive rounds from
+    // there: this round records the rejection, the next one terminalizes.
+    PlanOnce();
     ExecutionPlan reap = PlanOnce();
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), 8);
     EXPECT_EQ(reap.flat_oom_request_ids, (std::vector<std::string>{"a"}))

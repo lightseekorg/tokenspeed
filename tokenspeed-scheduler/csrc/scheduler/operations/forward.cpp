@@ -376,10 +376,14 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
 
     const std::int32_t first_pos = request->PrefillSize() - unscheduled;
     const std::int32_t target = first_pos + tokens_this_round;
+#if !TOKENSPEED_FLAT_KVCACHE
+    // Every AdmitChunk site is radix-only: on flat builds the adjunct acquires no
+    // pages, so its budget would reject pages the coordinator owns.
     if (hybrid_prefix_cache_ &&
         !hybrid_prefix_cache_->AdmitChunk(request->Id(), first_pos, target, simulated_free, match_result.paged_cache)) {
         return {};
     }
+#endif
     if (needs_mamba_loadback) {
         hybrid_prefix_cache_->PrepareMambaDeviceLoadBack(mamba_loadback_nodes);
         TreeNode* mamba_node = hybrid_prefix_cache_->FindLastMambaNode(match_result.host.last_node);
@@ -492,6 +496,7 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     const std::int32_t first_pos = request->PrefillSize() - unscheduled;
 #endif
     const std::int32_t target = first_pos + tokens_this_round;
+#if !TOKENSPEED_FLAT_KVCACHE
     if (hybrid_prefix_cache_) {
         const std::int32_t commit_target = (first_pos / config_.block_size) * config_.block_size;
         const auto commit_token_pages = request->GetFullPagedTokens(false);
@@ -500,7 +505,7 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
             return {};
         }
     }
-
+#endif
 #if TOKENSPEED_FLAT_KVCACHE
     PrefillInfo previous = request->GetPrefillInfo();
     const std::int32_t flat_num_computed = previous.already_scheduled_len + previous.extend_len;
@@ -558,6 +563,7 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
     const std::int32_t first_pos = request->TokenSize();
     const std::int32_t target =
         DecodePagedCacheReservationEnd(first_pos, config_.decode_input_tokens, config_.overlap_schedule_depth);
+#if !TOKENSPEED_FLAT_KVCACHE
     if (hybrid_prefix_cache_) {
         std::optional<std::int32_t> commit_target;
         std::vector<std::span<const std::int32_t>> commit_token_pages;
@@ -570,6 +576,7 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
             return {};
         }
     }
+#endif
 
 #if TOKENSPEED_FLAT_KVCACHE
     std::vector<BlockTable>& flat_tables = request->FlatBlockTablesRef();
@@ -681,10 +688,12 @@ std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFr
     const std::int32_t target = std::max(
         request->TokenSize(),
         DecodePagedCacheReservationEnd(first_pos, config_.decode_input_tokens, config_.overlap_schedule_depth));
+#if !TOKENSPEED_FLAT_KVCACHE
     if (hybrid_prefix_cache_ &&
         !hybrid_prefix_cache_->AdmitChunk(request->Id(), first_pos, target, simulated_free, match_result.paged_cache)) {
         return {};
     }
+#endif
     if (needs_mamba_loadback) {
         hybrid_prefix_cache_->PrepareMambaDeviceLoadBack(mamba_loadback_nodes);
         if (mamba_recovery_node->HasMamba()) {
