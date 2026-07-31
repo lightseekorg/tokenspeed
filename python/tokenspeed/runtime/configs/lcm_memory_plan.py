@@ -407,7 +407,7 @@ def plan_lcm_fields(
             f"LCM block size {lcm_block_bytes} exceeds limit {_MAX_LCM_BLOCK_BYTES}"
         )
 
-    # Parent 0 backs kernel page 0 and is never schedulable.
+    # Parent 0 backs logical null page 0 and is never schedulable.
     if budget_bytes is not None:
         num_lcm_blocks = budget_bytes // lcm_block_bytes - 1
     if num_lcm_blocks < 1:

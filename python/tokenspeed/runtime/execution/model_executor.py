@@ -153,7 +153,7 @@ class ModelExecutorConfig:
     max_req_pool_size: int
     output_length: int
     enforce_eager: bool
-    block_size: int
+    logical_page_size: int
     max_num_seqs: int
     chunked_prefill_size: int
     vocab_size: int
@@ -207,6 +207,7 @@ class ModelExecutorConfig:
         gpu_id: int,
         global_rank: int,
         num_total_pages: int,
+        logical_page_size: int,
         overlap_schedule_depth: int = 0,
     ) -> ModelExecutorConfig:
         output_length = (
@@ -221,7 +222,7 @@ class ModelExecutorConfig:
             max_req_pool_size=max_req_pool_size,
             output_length=output_length,
             enforce_eager=server_args.enforce_eager,
-            block_size=server_args.block_size,
+            logical_page_size=logical_page_size,
             max_num_seqs=server_args.max_num_seqs,
             chunked_prefill_size=server_args.chunked_prefill_size,
             vocab_size=model_config.vocab_size,
@@ -324,13 +325,13 @@ class ModelExecutor:
                 config.context_len
                 + config.spec_num_tokens
                 + draft_block_reservation_slack
-                + config.block_size
+                + config.logical_page_size
                 - 1
-            ) // config.block_size
+            ) // config.logical_page_size
         else:
             max_num_pages_per_req = (
-                config.context_len + config.block_size
-            ) // config.block_size
+                config.context_len + config.logical_page_size
+            ) // config.logical_page_size
 
         max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
 
@@ -343,7 +344,7 @@ class ModelExecutor:
         # Stride for indexing req_to_page when building drafter caller-side
         # write locations for ordinary attention backends.
         self._draft_page_size = int(
-            getattr(draft_token_to_kv_pool, "page_size", 0) or config.block_size
+            getattr(draft_token_to_kv_pool, "page_size", 0) or config.logical_page_size
         )
         self.input_buffers = InputBuffers(
             max_bs=max_bs,
@@ -571,6 +572,9 @@ class ModelExecutor:
             drafter=self.drafter,
             decode_wrapper=self.forward_step,
         )
+        # Load every prefill-shaped kernel before serving. This is a no-op
+        # when graph capture already performed the warmup.
+        self.prefill_graph.warmup_eager(self.forward_step)
 
         # Encoder CUDA graph: install model-built wrappers by overriding
         # modality encoder callables (e.g. ``image_encoder``, ``video_encoder``).

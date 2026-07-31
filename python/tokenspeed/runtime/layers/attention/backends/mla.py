@@ -35,6 +35,7 @@ from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
 )
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+from tokenspeed.runtime.layers.attention.page_table import expand_page_table
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.layers.attention.utils import build_page_table
 from tokenspeed.runtime.utils.common import ceil_div
@@ -170,35 +171,14 @@ class MLAAttnBackend(AttentionBackend):
         logical_page_size: int,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Expand Paged cache scheduler pages for this backend's MLA kernel pages."""
-        ratio = logical_page_size // self.page_size
-        if ratio <= 0 or logical_page_size % self.page_size:
-            raise ValueError(
-                "logical_page_size must be a positive multiple of MLA kernel page size"
-            )
-        if out is None:
-            out = torch.zeros(
-                (batch_size, self.max_num_pages),
-                dtype=torch.int32,
-                device=table.device,
-            )
-        logical_columns = min(ceil_div(self.max_num_pages, ratio), table.shape[1])
-        if logical_columns <= 0:
-            out[:batch_size].zero_()
-            return out
-        expanded = (
-            table[:batch_size, :logical_columns]
-            .clamp_min(0)
-            .to(torch.int32)
-            .unsqueeze(-1)
-            * ratio
-            + torch.arange(ratio, dtype=torch.int32, device=table.device)
-        ).reshape(batch_size, logical_columns * ratio)
-        copy_len = min(self.max_num_pages, expanded.shape[1])
-        out[:batch_size, :copy_len].copy_(expanded[:, :copy_len])
-        if copy_len < out.shape[1]:
-            out[:batch_size, copy_len:].zero_()
-        return out
+        """Expand scheduler pages for this backend's MLA kernel pages."""
+        return expand_page_table(
+            table[:batch_size],
+            logical_page_size=logical_page_size,
+            kernel_page_size=self.page_size,
+            max_kernel_pages=self.max_num_pages,
+            out=out,
+        )
 
     @staticmethod
     def _cache_decode_out_cache_loc(

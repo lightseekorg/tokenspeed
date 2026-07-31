@@ -338,6 +338,24 @@ def _get_backend_cls(name: str, arch: AttentionArch) -> type[AttentionBackend]:
     return cls
 
 
+def _validate_lcm_page_size(
+    config: BaseAttnConfig,
+    *,
+    logical_page_size: int,
+) -> None:
+    """Require the scheduler page to contain whole configured kernel pages."""
+    kernel_page_size = int(config.page_size)
+    if (
+        logical_page_size <= 0
+        or kernel_page_size <= 0
+        or logical_page_size % kernel_page_size
+    ):
+        raise ValueError(
+            "logical page size must be a positive multiple of kernel page "
+            f"size, got {logical_page_size} and {kernel_page_size}"
+        )
+
+
 # ---------- arch -> config class ----------
 
 _CONFIG_CLS: dict[AttentionArch, type[BaseAttnConfig]] = {
@@ -434,6 +452,23 @@ def _resolve_kda_backend(kda_backend: str) -> str:
     return kda_backend
 
 
+def _resolve_hybrid_full_backend_name(
+    requested_name: str | None,
+    *,
+    is_kda: bool,
+    has_lcm_plan: bool,
+) -> str | None:
+    """Resolve the compute backend that consumes the hybrid history cache."""
+    name = _BACKEND_ALIASES.get(requested_name, requested_name)
+    if name == "hybrid_linear_attn":
+        name = None
+    # NVIDIA K3 defaults to its CuteDSL history consumer. AMD keeps the
+    # generic MLA backend; explicit user choices remain authoritative.
+    if has_lcm_plan and is_kda and name is None and not current_platform().is_amd:
+        return "tokenspeed_mla"
+    return name
+
+
 def _create_hybrid_linear_attn(
     server_args: ServerArgs,
     model_config: ModelConfig,
@@ -462,18 +497,6 @@ def _create_hybrid_linear_attn(
     text_config = getattr(hf_config, "text_config", hf_config)
     full_attn_layers = text_config.full_attention_layer_ids
     has_lcm_plan = lcm_spec is not None
-
-    if (
-        has_lcm_plan
-        and is_kda
-        and full_attn_backend_name is None
-        and not current_platform().is_amd
-    ):
-        # NVIDIA defaults to its CuteDSL Paged cache history consumer. AMD keeps the
-        # default ``mla`` backend, whose Gluon path consumes the same Paged cache
-        # history contract without changing compute kernels. Explicit choices
-        # remain authoritative and are checked by the family guard.
-        full_attn_backend_name = "tokenspeed_mla"
 
     # Create the full attention backend for standard MHA layers.
     # Use user's original choice if provided, otherwise auto-select.
@@ -925,11 +948,48 @@ def create_attn_components(
             "State cache requires an LCM layout recipe; none is "
             f"registered for architectures={architectures!r}"
         )
+    target_full_attn_backend_name = (
+        _resolve_hybrid_full_backend_name(
+            original_attn_backend,
+            is_kda=is_hybrid_mla_kda,
+            has_lcm_plan=lcm_family is not None,
+        )
+        if is_hybrid_linear
+        else config.backend_name
+    )
     draft_attn_config = (
         _create_attn_config(server_args, draft_model_config, is_draft=True)
         if draft_model_config
         else None
     )
+    draft_architectures = (
+        getattr(draft_model_config.hf_config, "architectures", None) or []
+        if draft_model_config is not None
+        else []
+    )
+    draft_is_hybrid_gdn = any(
+        architecture in _HYBRID_GDN_ARCHITECTURES
+        for architecture in draft_architectures
+    )
+    draft_is_hybrid_mla_kda = any(
+        architecture in _HYBRID_MLA_KDA_ARCHITECTURES
+        for architecture in draft_architectures
+    )
+    draft_full_attn_backend_name = None
+    if draft_attn_config is not None:
+        if draft_is_hybrid_gdn or draft_is_hybrid_mla_kda:
+            requested_draft_backend = (
+                draft_attn_config.backend_name
+                if lcm_family is not None
+                else original_attn_backend
+            )
+            draft_full_attn_backend_name = _resolve_hybrid_full_backend_name(
+                requested_draft_backend,
+                is_kda=draft_is_hybrid_mla_kda,
+                has_lcm_plan=lcm_family is not None,
+            )
+        else:
+            draft_full_attn_backend_name = draft_attn_config.backend_name
     num_layers = model_config.num_attention_layers
     deepseek_v4_layout = None
     draft_deepseek_v4_layout = None
@@ -1052,6 +1112,16 @@ def create_attn_components(
             decode_input_tokens=decode_input_tokens,
             overlap_schedule_depth=overlap_schedule_depth,
         )
+        logical_page_size = lcm_setup.target.memory_plan.logical_block_tokens
+        _validate_lcm_page_size(
+            config,
+            logical_page_size=logical_page_size,
+        )
+        if draft_attn_config is not None:
+            _validate_lcm_page_size(
+                draft_attn_config,
+                logical_page_size=logical_page_size,
+            )
         cache_budget_bytes = lcm_setup.cache_budget_bytes
         fixed_workspace_bytes = lcm_setup.fixed_workspace_bytes
         max_num_tokens = lcm_setup.target.pool_size
@@ -1144,9 +1214,6 @@ def create_attn_components(
             overlap_schedule_depth=overlap_schedule_depth,
         )
     elif is_hybrid_linear:
-        resolved_original_backend = _BACKEND_ALIASES.get(
-            original_attn_backend, original_attn_backend
-        )
         backend, pool = _create_hybrid_linear_attn(
             server_args,
             model_config,
@@ -1155,11 +1222,7 @@ def create_attn_components(
             max_num_tokens,
             rank,
             enable_memory_saver,
-            full_attn_backend_name=(
-                resolved_original_backend
-                if resolved_original_backend != "hybrid_linear_attn"
-                else None
-            ),
+            full_attn_backend_name=target_full_attn_backend_name,
             is_kda=is_hybrid_mla_kda,
             lcm_spec=lcm_setup.target if lcm_setup is not None else None,
         )
@@ -1221,7 +1284,6 @@ def create_attn_components(
     draft_pool = None
     if draft_attn_config:
         # Check if draft model is also a hybrid GDN model.
-        draft_archs = getattr(draft_model_config.hf_config, "architectures", None) or []
         if is_deepseek_v4_draft_model:
             from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
                 DeepseekV4TokenToKVPool,
@@ -1246,10 +1308,7 @@ def create_attn_components(
                 decode_input_tokens=decode_input_tokens,
                 overlap_schedule_depth=overlap_schedule_depth,
             )
-        elif any(a in _HYBRID_GDN_ARCHITECTURES for a in draft_archs):
-            resolved_draft_backend = _BACKEND_ALIASES.get(
-                original_attn_backend, original_attn_backend
-            )
+        elif draft_is_hybrid_gdn:
             draft_attn_backend, draft_pool = _create_hybrid_linear_attn(
                 server_args,
                 draft_model_config,
@@ -1258,14 +1317,10 @@ def create_attn_components(
                 draft_max_num_tokens,
                 rank,
                 enable_memory_saver,
-                full_attn_backend_name=(
-                    resolved_draft_backend
-                    if resolved_draft_backend != "hybrid_linear_attn"
-                    else None
-                ),
+                full_attn_backend_name=draft_full_attn_backend_name,
                 lcm_spec=lcm_setup.draft if lcm_setup is not None else None,
             )
-        elif any(a in _INKLING_ARCHITECTURES for a in draft_archs):
+        elif any(a in _INKLING_ARCHITECTURES for a in draft_architectures):
             draft_text_config = draft_model_config.hf_config.get_text_config()
             num_depths = draft_model_config.num_attention_layers
             # Hetero KV, symmetric with the target pool: per-depth head

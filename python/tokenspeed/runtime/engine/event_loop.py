@@ -228,6 +228,7 @@ class EventLoop:
             gpu_id=gpu_id,
             global_rank=global_rank,
             num_total_pages=num_total_pages,
+            logical_page_size=geometry.page_size,
             overlap_schedule_depth=self.overlap_schedule_depth,
         )
         self.model_executor = create_model_executor(

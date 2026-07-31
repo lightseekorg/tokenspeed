@@ -54,6 +54,7 @@ from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
 )
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+from tokenspeed.runtime.layers.attention.page_table import expand_page_table
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.pdl import pdl_enabled
@@ -320,22 +321,13 @@ class CuteDSLMLABackend(AttentionBackend):
         formula is preserved. -1 table tails clamp to the null page 0, whose
         kernel expansion stays inside the physical null page.
         """
-        if block_kv_indices is None:
-            block_kv_indices = torch.zeros(
-                (bs, max_blocks), dtype=torch.int32, device=self.device
-            )
-        ratio = logical_page_size // self.page_size
-        logical_cols = min(triton.cdiv(max_blocks, ratio), group_table.shape[1])
-        if logical_cols <= 0:
-            return block_kv_indices
-        expanded = (
-            group_table[:bs, :logical_cols].clamp_min(0).to(torch.int32).unsqueeze(-1)
-            * ratio
-            + torch.arange(ratio, dtype=torch.int32, device=group_table.device)
-        ).reshape(bs, logical_cols * ratio)
-        copy_len = min(max_blocks, logical_cols * ratio)
-        block_kv_indices[:bs, :copy_len] = expanded[:, :copy_len]
-        return block_kv_indices
+        return expand_page_table(
+            group_table[:bs],
+            logical_page_size=logical_page_size,
+            kernel_page_size=self.page_size,
+            max_kernel_pages=max_blocks,
+            out=block_kv_indices,
+        )
 
     def _cache_decode_out_cache_loc(
         self,

@@ -438,6 +438,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             self._maybe_check_group_write_locs(
                 group_page_tables, group_out_cache_locs, self.page_size
             )
+            group_page_tables = self._kernel_page_tables(group_page_tables)
 
         if forward_mode.is_extend_or_mixed():
             self._init_extend_metadata(
@@ -456,7 +457,14 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             # metadata under EXTEND/MIXED target. seq_lens is the drafter's
             # live alias buffer (wrapper pre-writes before this call).
             if self.is_draft:
-                self._init_decode_metadata(bs, req_pool_indices, seq_lens, req_to_page)
+                self._init_decode_metadata(
+                    bs,
+                    req_pool_indices,
+                    seq_lens,
+                    req_to_page,
+                    group_page_tables=group_page_tables,
+                    group_out_cache_locs=group_out_cache_locs,
+                )
             return
 
         if self.draft_block_decode and self.spec_num_tokens > 1:

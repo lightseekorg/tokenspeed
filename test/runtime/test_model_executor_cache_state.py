@@ -22,6 +22,7 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
+
 from tokenspeed.runtime.execution.model_executor import ModelExecutor
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import platform
 import re
 import sys
 from importlib import metadata
@@ -31,19 +32,34 @@ def expected_jit_cache_version(flashinfer_version: str, cuda_index: str) -> str:
     return f"{flashinfer_version}+cu{cuda_index}"
 
 
+def release_tag(flashinfer_version: str) -> str:
+    """GitHub release tag: vX.Y.Z[rcN], or nightly-vX.Y.Z-YYYYMMDD for
+    nightly versions of the form X.Y.Z.devYYYYMMDD."""
+    match = re.fullmatch(r"(\d+\.\d+\.\d+)\.dev(\d{8})", flashinfer_version)
+    if match:
+        return f"nightly-v{match.group(1)}-{match.group(2)}"
+    return f"v{flashinfer_version}"
+
+
+def default_platform_tag() -> str:
+    return f"manylinux_2_28_{platform.machine()}"
+
+
 def jit_cache_wheel_url(
     flashinfer_version: str,
     cuda_index: str,
     *,
-    platform_tag: str = "manylinux_2_28_aarch64",
+    platform_tag: str | None = None,
 ) -> str:
+    if platform_tag is None:
+        platform_tag = default_platform_tag()
     wheel = (
         f"flashinfer_jit_cache-{flashinfer_version}+cu{cuda_index}"
         f"-cp39-abi3-{platform_tag}.whl"
     )
     return (
         "https://github.com/flashinfer-ai/flashinfer/releases/download/"
-        f"v{flashinfer_version}/{wheel}"
+        f"{release_tag(flashinfer_version)}/{wheel}"
     )
 
 

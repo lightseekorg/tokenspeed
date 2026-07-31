@@ -230,6 +230,7 @@ class MSAAttnBackend(CacheGroupsMixin, AttentionBackend):
             self._maybe_check_group_write_locs(
                 group_page_tables, group_out_cache_locs, self.page_size
             )
+            group_page_tables = self._kernel_page_tables(group_page_tables)
         else:
             page_table = build_page_table(
                 req_pool_indices[:bs],

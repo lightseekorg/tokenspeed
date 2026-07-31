@@ -259,6 +259,14 @@ class PrefillGraph:
             or (config.data_parallel_size > 1 and model_runner.is_multimodal)
         )
 
+        # Whether the dummy-forward machinery is usable at all (graph or eager).
+        self._dummy_forward_viable = (
+            self.inner_model is not None
+            and self._embed_tokens is not None
+            and model_runner is not None
+            and model_runner.is_generation
+        )
+
         self._ctx: ForwardContext | None = None
         self._pool = None
         self._engaged_logged: set[str] = set()
@@ -576,6 +584,98 @@ class PrefillGraph:
     # ------------------------------------------------------------------
     # Replay dispatch
     # ------------------------------------------------------------------
+
+    def warmup_eager(self, decode_wrapper: CudaGraphWrapper | None = None) -> None:
+        """One eager max-chunk dummy prefill before serving starts.
+
+        Startup otherwise executes only decode-shaped forwards (decode graph
+        capture; prefill graphs are off by default), so the first REAL prefill
+        chunk is the first execution of every prefill-tile kernel: their CUDA
+        modules lazy-load with driver allocations OUTSIDE the torch pool, which
+        can fail mid-serving on high ``--gpu-memory-utilization`` deployments
+        (the allocator hoards the headroom by then; the failure surfaces as an
+        async OOM at the next graph replay). Running the max chunk once here
+        front-loads those module loads -- and gives per-size lazy autotuners
+        their only look at the max prefill bucket before
+        ``freeze_autotuning()``.
+
+        Best-effort: skipped when the dummy-forward machinery does not cover
+        this model family (same seam as graph capture), or when prefill graph
+        capture already exercised the full bucket ladder.
+        """
+        if not self._dummy_forward_viable:
+            return
+        chunk = int(self.config.chunked_prefill_size or 0)
+        chunk = min(chunk, int(self.input_buffers.max_num_tokens))
+        # Graph capture (default ladder tops out at 2048 tokens) only exercises
+        # its buckets; forwards above the largest bucket run eager -- those are
+        # exactly the shapes serving would otherwise first-execute.
+        if chunk <= max(self._captures, default=0):
+            return
+        weight = self._embed_tokens.weight
+        captured_embeds_buf = self._input_embeds_buf
+        captured_max = max(self._captures, default=0)
+        try:
+            # The transient eager activations of a full chunk may not fit next
+            # to weights + KV + graph pools on tightly budgeted deployments:
+            # halve on OOM (each size still front-loads the large-tile kernel
+            # families) rather than failing a boot that used to come up. OOM
+            # is allocator-symmetric across ranks (identical dummy inputs), so
+            # every rank retries the same ladder in lockstep.
+            tokens = chunk
+            while tokens > captured_max:
+                try:
+                    self._input_embeds_buf = torch.zeros(
+                        tokens,
+                        weight.shape[1],
+                        dtype=weight.dtype,
+                        device=weight.device,
+                    )
+                    with maybe_inference_mode():
+                        self._ctx = self._make_dummy_batch(tokens, decode_wrapper)
+                        self._land_input_embeds(
+                            self._embed_tokens(
+                                self.input_buffers.input_ids_buf[:tokens]
+                            ),
+                            tokens,
+                        )
+                        with active_forward(self._ctx):
+                            self._run_inner(tokens)
+                    torch.cuda.synchronize()
+                    if self.config.global_rank == 0:
+                        logger.info("Eager prefill warmup ran at %d tokens", tokens)
+                        if tokens < chunk:
+                            logger.warning(
+                                "Eager prefill warmup only fit %d of %d chunk "
+                                "tokens: this deployment cannot execute its own "
+                                "--chunked-prefill-size next to weights + KV; "
+                                "lower --gpu-memory-utilization or the chunk "
+                                "size, or serving may OOM on large prefills.",
+                                tokens,
+                                chunk,
+                            )
+                    return
+                except torch.OutOfMemoryError:
+                    self._ctx = None
+                    self._input_embeds_buf = None
+                    torch.cuda.empty_cache()
+                    tokens //= 2
+            logger.warning(
+                "Eager prefill warmup could not fit any bucket above the "
+                "graph-captured %d tokens; the first large prefill will load "
+                "its kernels mid-serving.",
+                captured_max,
+            )
+        except (NotImplementedError, AttributeError, KeyError, RuntimeError) as exc:
+            logger.warning(
+                "Eager prefill warmup failed (%s: %s); the first real prefill "
+                "will load its kernels mid-serving instead.",
+                type(exc).__name__,
+                exc,
+            )
+        finally:
+            self._ctx = None
+            self._input_embeds_buf = captured_embeds_buf
 
     def can_run(self, ctx: ForwardContext, multimodal_context=None) -> bool:
         """Whether this forward replays a captured graph (mirrors decode's can_run).

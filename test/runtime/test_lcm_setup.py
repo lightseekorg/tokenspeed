@@ -35,7 +35,7 @@ def test_attention_configs_do_not_own_lcm_setup() -> None:
     assert lcm_only_fields.isdisjoint(field.name for field in fields(MLAConfig))
 
 
-def test_qwen_recipe_returns_pool_spec_without_mutating_config() -> None:
+def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
     text_config = SimpleNamespace(
         mamba2_cache_params=(
             (2, 2),
@@ -84,8 +84,9 @@ def test_qwen_recipe_returns_pool_spec_without_mutating_config() -> None:
         overlap_schedule_depth=0,
     )
 
-    assert server_args.block_size == 128
-    assert attn_config.page_size == 128
+    assert server_args.block_size == 64
+    assert attn_config.page_size == 64
+    assert setup.target.memory_plan.logical_block_tokens == 128
     assert setup.draft is None
     assert setup.target.layer_group_ids == (
         f"{LINEAR_ATTENTION}_0",
