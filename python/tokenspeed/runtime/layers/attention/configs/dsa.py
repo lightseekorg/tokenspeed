@@ -105,4 +105,5 @@ class DSAConfig(MLAConfig):
             page_size=self.page_size,
             rank=rank,
             index_head_dim=self.index_head_dim,
+            max_scheduled_tokens=self.max_scheduled_tokens,
         )

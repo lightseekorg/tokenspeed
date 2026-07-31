@@ -371,6 +371,18 @@ class EventLoop:
                     "the flat host tier (kvstore L2) does not support FlatKV "
                     "contract pools (Kimi-K3) yet; pass --disable-kvstore."
                 )
+            if not hasattr(token_to_kv_pool, "k_buffer"):
+                # FlatHostMirror mirrors the MHA k_buffer/v_buffer tensor
+                # pair per layer; MLA/DSA keep one fused latent `kv_buffer`
+                # (plus DSA's packed index-K), which that mirror cannot
+                # describe. Reject at startup instead of dying on an
+                # AttributeError inside FlatMemoryExecutor.__init__.
+                raise NotImplementedError(
+                    "the flat host tier (kvstore L2) mirrors the MHA "
+                    "k_buffer/v_buffer layout, which "
+                    f"{type(token_to_kv_pool).__name__} (fused MLA/DSA latent "
+                    "cache) does not expose; pass --disable-kvstore."
+                )
             self.memory_executor = FlatMemoryExecutor(
                 device_pool=token_to_kv_pool,
                 host_ratio=server_args.kvstore_ratio,

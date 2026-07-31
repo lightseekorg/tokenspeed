@@ -27,6 +27,7 @@ from tokenspeed.runtime.cache.utils import (
     get_mla_kv_buffer_triton,
     set_mla_kv_buffer_triton,
 )
+from tokenspeed.runtime.configs import paged_cache_spec
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.utils import (
     copy_all_layer_kv_cache_tiled,
@@ -65,6 +66,7 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         rank: int,
         enable_kv_cache_copy: bool = False,
         enable_alt_stream: bool = True,
+        max_scheduled_tokens: int = 0,
     ):
         super().__init__(
             size, dtype, device, max_batch_size, max_context_len, page_size, rank
@@ -117,8 +119,34 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         else:
             self._kv_copy_config = None
 
-        self.paged_cache_group_specs = ()
-        self.paged_cache_group_page_counts = {}
+        # MLA (and its DSA subclass) is uniform full-history attention: every
+        # layer reads the same latent cache, so the pool publishes exactly ONE
+        # paged-cache group. That single group is what makes the flat
+        # scheduler usable here -- the flat build's req_to_page fallback is a
+        # group-0 sample (fsm/forward_states.h GetOccupiedPages), which is
+        # exact when there is only one group, so the table-blind MLA/DSA
+        # backends keep reading the correct pages without consuming per-group
+        # flat tables. Publishing nothing would instead trip
+        # validate_flat_scheduler_config's "requires at least one paged-cache
+        # group" guard and make every MLA model unservable on a flat ext.
+        # Publication rule lives in paged_cache_spec.publish_paged_cache_groups
+        # (module-attr call so tests can patch the flat-ext probe at call time).
+        published = paged_cache_spec.publish_paged_cache_groups(
+            layer_types=(),
+            sliding_window_tokens=None,
+            page_size=page_size,
+            max_live_requests=max_batch_size,
+            max_scheduled_tokens=max_scheduled_tokens,
+            max_total_tokens=size,
+            max_context_len=max_context_len,
+        )
+        if published is None:
+            self.paged_cache_group_specs = ()
+            self.paged_cache_group_page_counts = {}
+        else:
+            specs, counts = published
+            self.paged_cache_group_specs = tuple(specs)
+            self.paged_cache_group_page_counts = counts
 
     def _create_buffers(self) -> None:
         with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):

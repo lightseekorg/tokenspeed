@@ -42,6 +42,10 @@ class MLAConfig(BaseAttnConfig):
     scaling: float
     kv_cache_dim: int
     layer_types: tuple[str, ...] = field(default=(), kw_only=True)
+    # Per-step token budget, forwarded to the KV pool for paged-cache group
+    # publication sizing (mirrors MHAConfig). MLA/DSA publish a single
+    # full-history group, whose sizing does not read this value today; it is
+    # plumbed so the canonical publication API is called with real inputs.
     max_scheduled_tokens: int = field(default=0, kw_only=True)
     pd_disaggregation_enabled: bool = field(default=False, kw_only=True)
 
@@ -134,4 +138,5 @@ class MLAConfig(BaseAttnConfig):
             max_context_len=self.context_len,
             page_size=self.page_size,
             rank=rank,
+            max_scheduled_tokens=self.max_scheduled_tokens,
         )
