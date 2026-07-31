@@ -84,7 +84,7 @@ dependencies = [
     "uv",
     "uvicorn",
     "uvloop",
-    "xgrammar==0.2.2",
+    "xgrammar==0.2.3",
     "viztracer",
 ]
 

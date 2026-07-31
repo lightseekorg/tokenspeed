@@ -14,9 +14,9 @@ Blog: https://lightseek.org/blog/tokenspeed-inkling.html
 ## Docker
 
 ### nvidia
-docker pull lightseekorg/tokenspeed:tml
+docker pull lightseekorg/tokenspeed:latest
 ### amd
-docker pull lightseekorg/tokenspeed-amd:tml
+docker pull lightseekorg/tokenspeed-amd:latest
 
 ## Launch command
 
@@ -181,23 +181,16 @@ Notes:
   (fp8 KV required). AMD uses the `mla` backend.
 - `tokenspeed serve` auto-selects the `kimi_k3` reasoning and tool-call
   parsers. Explicit parser flags override these defaults.
-- Point `--model` at a **flattened local copy** of the checkpoint: real files
-  for the configs/tokenizer/`*.py` (weights may stay symlinks). An HF hub
-  snapshot directory fails engine startup — `tokenization_kimi.py`'s relative
-  `encoding_k3` import breaks when transformers resolves the module file
-  through the snapshot's `blobs/` symlinks — and the bare repo id fails the
-  smg gateway, which needs an on-disk tokenizer directory.
-- On a shared `HF_HOME`, set `HF_MODULES_CACHE` to a user-writable directory;
-  transformers stages the checkpoint's remote code under
-  `$HF_HOME/modules/transformers_modules/<model>` and a new model name fails
-  with `PermissionError` when that tree belongs to another user.
+- The SMG packages pinned by TokenSpeed resolve `moonshotai/Kimi-K3` directly;
+  a flattened local checkpoint and separately staged remote-code cache are no
+  longer required.
 - The checkpoint carries no fp8 KV scaling factors; the loader defaults them
   to 1.0 (a warning at load). Expect a small accuracy delta vs bf16 KV.
 - The vision encoder has 12 attention heads. For an 8-way text TP deployment,
   use `--mm-encoder-tp-mode data` so each rank runs the vision encoder at TP1
   on a different whole image.
-- Use the current `lightseekorg/smg-private` frontend, which registers Kimi-K3's
-  chat renderer and multimodal processor. Preserve the checkpoint's
+- The pinned SMG frontend registers Kimi-K3's chat renderer and multimodal
+  processor. Preserve the checkpoint's
   `media_proc_cfg.in_patch_limit=65536`; silently falling back to K2.5's
   16384-patch default reduces OCR resolution.
 - KDA recurrent-state pages register for prefix-cache reuse only when a
@@ -209,19 +202,7 @@ Notes:
 
 ### NVIDIA
 
-The standard NVIDIA path uses the fused TensorRT-LLM-Gen MXFP4 + SiTU MoE
-backend.
-On 8x B300 (`sm103a`, CUDA 13) the `tokenspeed-situ` sidecar is pulled in as a
-`tokenspeed-kernel` CUDA dependency; no separate private FlashInfer repository
-or `FLASHINFER_PRIVATE_CUBIN_DIR` is required. To install or verify it directly:
-
-```bash
-python -m pip install "tokenspeed-situ==0.1.0.post20260726"
-python -c \
-  'import tokenspeed_situ as s; print(s.verify_bundle())'
-```
-
-Then serve with expert parallelism (recommended):
+Serve with expert parallelism (recommended) on 8x B300:
 
 ```bash
 tokenspeed serve moonshotai/Kimi-K3 \
@@ -240,15 +221,9 @@ tokenspeed serve moonshotai/Kimi-K3 \
   --port 8000
 ```
 
-Plain TP8 (drop `--ep-size 8`) uses the native-384 expert layout and requires
-sidecar (tokenspeed-situ) >= 0.1.0.post20260726. Memory is identical either way on 8x B300: ~73 GB free
-per rank after load, and `--gpu-memory-utilization 0.94` yields a KV capacity
-of 4,437,504 tokens.
-
-The checked-in sidecar AOT bundle is a Linux x86_64 development artifact for
-B300/CUDA 13 (`sm103a`) only. On other NVIDIA platforms, fall back to the
-unfused Triton grouped-GEMM MoE backend: skip the sidecar install and
-substitute `--moe-backend triton`.
+Plain TP8 (drop `--ep-size 8`) works too. The fused MoE path needs a
+Blackwell GPU (B200/B300); on other NVIDIA platforms use
+`--moe-backend triton`.
 
 ### AMD
 

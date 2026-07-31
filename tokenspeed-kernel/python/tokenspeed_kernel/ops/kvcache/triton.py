@@ -1791,7 +1791,7 @@ def flat_decode_locs(
 @triton.jit
 def _flat_tables_unpack_kernel(
     src_ptr,  # packed int32 device buffer (bridge upload)
-    meta_ptr,  # [G, 2] int32: (src element offset, cols) per group
+    meta_ptr,  # [G, 3] int32: (src element offset, cols, page ratio) per group
     dst_ptr,  # [G, max_bs, Wmax] int32 stacked graph tables
     stride_g,
     stride_b,
@@ -1808,14 +1808,25 @@ def _flat_tables_unpack_kernel(
     tail fill (+ F.pad row padding) per decode step."""
     g = tl.program_id(0)
     b = tl.program_id(1)  # grid axis 1 is exactly bs, no bounds check needed
-    off = tl.load(meta_ptr + g * 2).to(tl.int64)
-    cols = tl.load(meta_ptr + g * 2 + 1).to(tl.int64)
+    off = tl.load(meta_ptr + g * 3).to(tl.int64)
+    cols = tl.load(meta_ptr + g * 3 + 1).to(tl.int64)
+    ratio = tl.load(meta_ptr + g * 3 + 2).to(tl.int64)
     w_off = tl.arange(0, BLOCK_W)
     real = b < actual_bs
     for w0 in range(0, wmax, BLOCK_W):
         w = w0 + w_off
-        in_row = (w < cols) & real
-        vals = tl.load(src_ptr + off + b * cols + w, mask=in_row & (w < wmax), other=0)
+        src_col = w // ratio
+        in_row = (src_col < cols) & real
+        vals = tl.load(
+            src_ptr + off + b * cols + src_col,
+            mask=in_row & (w < wmax),
+            other=0,
+        )
+        vals = tl.where(
+            ratio == 1,
+            vals,
+            tl.maximum(vals, 0) * ratio + w % ratio,
+        )
         vals = tl.where(in_row, vals, tl.where(real, TAIL_PAD, 0))
         tl.store(
             dst_ptr + g * stride_g + b * stride_b + w,
@@ -1838,7 +1849,10 @@ def flat_tables_unpack(
     Args:
         src: 1-D int32 device buffer holding every group's rows
             back-to-back (rows x cols per group).
-        meta: [G, 2] int32 device tensor of (element offset, cols).
+        meta: [G, 3] int32 device tensor of
+            (element offset, logical columns, kernel pages per logical page).
+            A ratio greater than one expands page ``p`` to
+            ``p * ratio + [0, ratio)`` while unpacking.
         dst: [G, max_bs, Wmax] int32 stacked destination.
         bs: rows to fill per group (padded batch size).
         actual_bs: live batch size; rows [actual_bs, bs) are written all-0

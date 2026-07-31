@@ -230,6 +230,7 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             self._maybe_check_flat_write_locs(
                 flat_page_tables, flat_out_cache_locs, self.page_size
             )
+            flat_page_tables = self._flat_kernel_page_tables(flat_page_tables)
         else:
             page_table = build_page_table(
                 req_pool_indices[:bs],
