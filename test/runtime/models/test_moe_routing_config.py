@@ -61,6 +61,7 @@ def test_config_driven_moe_models_propagate_topk_normalization_flag() -> None:
         "python/tokenspeed/runtime/models/deepseek_v3.py",
         "python/tokenspeed/runtime/models/deepseek_v4.py",
         "python/tokenspeed/runtime/models/longcat_flash.py",
+        "python/tokenspeed/runtime/models/qwen2_5_moe.py",
         "python/tokenspeed/runtime/models/qwen3_5_moe.py",
     ):
         assert _normalize_expr(relpath) == "config.norm_topk_prob"

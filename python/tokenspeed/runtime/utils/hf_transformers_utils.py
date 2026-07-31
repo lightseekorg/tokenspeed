@@ -51,6 +51,7 @@ from tokenspeed.runtime.configs import (
     KimiK25Config,
     MiniMaxM2Config,
     MiniMaxM3Config,
+    Qwen2_5MoeConfig,
     Qwen2Config,
     Qwen3_5Config,
     Qwen3_5MoeConfig,
@@ -62,6 +63,7 @@ from tokenspeed.runtime.utils import lru_cache_frozenset
 
 _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     Qwen2Config.model_type: Qwen2Config,
+    Qwen2_5MoeConfig.model_type: Qwen2_5MoeConfig,
     Qwen3Config.model_type: Qwen3Config,
     Qwen3MoeConfig.model_type: Qwen3MoeConfig,
     Qwen3ASRConfig.model_type: Qwen3ASRConfig,
