@@ -264,7 +264,9 @@ class EventLoop:
                 )
 
         if scheduler_ext_flat_kvcache() and server_args.enable_kvstore:
-            host_tier_gap = flat_host_tier_unsupported_reason(token_to_kv_pool)
+            host_tier_gap = flat_host_tier_unsupported_reason(
+                token_to_kv_pool, draft_token_to_kv_pool
+            )
             if host_tier_gap is not None:
                 logger.warning(
                     "Disabling the KVStore host tier on this flat scheduler "
@@ -389,14 +391,16 @@ class EventLoop:
             # L2-only from here: the host tier needs a mirrorable pool.
             if getattr(token_to_kv_pool, "runtime_contract", None) is not None:
                 # FlatKV contract pools (Kimi-K3) have no host tier yet:
-                # FlatMemoryExecutor mirrors k_buffer/v_buffer layouts the
-                # raw-slab pool does not expose. Reject this unsupported
-                # combination at startup.
+                # FlatMemoryExecutor mirrors the tensor families a pool
+                # declares, which the raw-slab pool does not expose. Reject
+                # this unsupported combination at startup.
                 raise NotImplementedError(
                     "the flat host tier (kvstore L2) does not support FlatKV "
                     "contract pools (Kimi-K3) yet; pass --disable-kvstore."
                 )
-            host_tier_gap = flat_host_tier_unsupported_reason(token_to_kv_pool)
+            host_tier_gap = flat_host_tier_unsupported_reason(
+                token_to_kv_pool, draft_token_to_kv_pool
+            )
             if host_tier_gap is not None:
                 # Unreachable normally (the downgrade above cleared the flag);
                 # kept so a reorder names the cause instead of an
@@ -409,6 +413,9 @@ class EventLoop:
                 device_pool=token_to_kv_pool,
                 host_ratio=server_args.kvstore_ratio,
                 host_size_gb=server_args.kvstore_size,
+                # Speculative decoding writes draft KV at the target's slot
+                # ids, so the draft pool rides the same host pages.
+                draft_device_pool=draft_token_to_kv_pool,
             )
             num_host_pages = self.memory_executor.num_host_pages
         elif not token_to_kv_pool.supports_hierarchical_kv_cache:

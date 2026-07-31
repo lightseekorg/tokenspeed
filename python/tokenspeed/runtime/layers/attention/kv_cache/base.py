@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from tokenspeed.runtime.cache.flat_host_mirror import HostMirrorFamily
 from tokenspeed.runtime.configs.paged_cache_spec import PagedCacheGroupSpec
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -119,6 +120,41 @@ class BaseTokenToKVPool:
 
     def maybe_log_paged_cache_group_pages(self) -> None:
         return None
+
+    def host_mirror_families(self) -> list[HostMirrorFamily]:
+        """Device tensor families the flat host tier (kvstore L2) mirrors.
+
+        ``FlatHostMirror`` copies whole pages byte-blind, so a pool only has
+        to declare which tensors carry a layer's page bytes; the mirror
+        deduplicates aliased slabs and fences a layer on the LAST family
+        listing it. The default describes the K/V pair plus GDN state slabs;
+        pools with another layout override (MLA's fused latent, DSA's packed
+        index-K).
+
+        Returns:
+            Families in fence order, or an empty list when this pool cannot
+            be mirrored -- ``flat_host_tier_unsupported_reason`` then
+            downgrades L2 instead of building a partial mirror.
+        """
+        k_buffer = getattr(self, "k_buffer", None)
+        v_buffer = getattr(self, "v_buffer", None)
+        if k_buffer is None or v_buffer is None:
+            return []
+        families = [
+            HostMirrorFamily.per_layer(k_buffer, self.page_size),
+            HostMirrorFamily.per_layer(v_buffer, self.page_size),
+        ]
+        if getattr(self, "state_slabs", None):
+            # State slabs are page-indexed: one snapshot row per page id,
+            # bound to their layers by the pool's get_state_buffers.
+            layer_states = []
+            for layer_id in range(len(k_buffer)):
+                try:
+                    layer_states.append(tuple(self.get_state_buffers(layer_id)))
+                except ValueError:
+                    layer_states.append(())  # not a state layer
+            families.append(HostMirrorFamily(tuple(layer_states), 1))
+        return families
 
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         raise NotImplementedError()

@@ -3,8 +3,9 @@ transport.
 
 Covers the executor roundtrip against a real (tiny) device pool with
 WriteBackDone AND LoadBackDone acks, the ack payload shape riding the
-TP-synced commit path, the layer -> mirror-tensor fencing mapping, and the
-num_host_pages sizing arithmetic (pure CPU).
+TP-synced commit path, the layer -> mirror-tensor fencing mapping for every
+declared layout (MHA K/V slabs, GDN state slabs, MLA's fused latent, DSA's
+latent + index-K), and the num_host_pages sizing arithmetic (pure CPU).
 """
 
 from __future__ import annotations
@@ -35,7 +36,8 @@ GDN_LAYER_TYPES = ("linear_attention", "full_attention") * 2
 
 class _StubPool:
     """CPU-only device-pool stand-in for sizing arithmetic: 4 layers dedup
-    to 2 K + 2 V slabs (paired layers alias the same tensor)."""
+    to 2 K + 2 V slabs (paired layers alias the same tensor). Borrows the
+    real default family derivation instead of restating it."""
 
     def __init__(self, torch):
         self.page_size = 4
@@ -45,6 +47,13 @@ class _StubPool:
         v_slabs = [torch.zeros((rows, 1, 8), dtype=torch.bfloat16) for _ in range(2)]
         self.k_buffer = [k_slabs[0], k_slabs[0], k_slabs[1], k_slabs[1]]
         self.v_buffer = [v_slabs[0], v_slabs[0], v_slabs[1], v_slabs[1]]
+
+    def host_mirror_families(self):
+        from tokenspeed.runtime.layers.attention.kv_cache.base import (
+            BaseTokenToKVPool,
+        )
+
+        return BaseTokenToKVPool.host_mirror_families(self)
 
 
 class FlatHostPageSizingTest(unittest.TestCase):
@@ -183,6 +192,9 @@ class FlatMemoryExecutorTest(unittest.TestCase):
             from tokenspeed.runtime.layers.attention.kv_cache.mha import (
                 MHATokenToKVPool,
             )
+            from tokenspeed.runtime.layers.attention.kv_cache.mla import (
+                MLATokenToKVPool,
+            )
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs torch + tokenspeed_kernel + scheduler ext: {exc}")
         if not hasattr(Cache, "LoadBackDoneEvent"):
@@ -194,6 +206,7 @@ class FlatMemoryExecutorTest(unittest.TestCase):
         self.CacheKind = CacheKind
         self.FlatMemoryExecutor = FlatMemoryExecutor
         self.MHATokenToKVPool = MHATokenToKVPool
+        self.MLATokenToKVPool = MLATokenToKVPool
         self.LcmMHATokenToKVPool = LcmMHATokenToKVPool
         self.qwen_gdn_lcm_fields = qwen_gdn_lcm_fields
         self.plan_lcm_fields = plan_lcm_fields
@@ -472,6 +485,178 @@ class FlatMemoryExecutorTest(unittest.TestCase):
         self._drain(executor, 1)
 
         after = self._snapshot_spans(mirror, device_pages)
+        for tensor_idx in range(len(mirror.tensor_pairs)):
+            for d in device_pages:
+                self.assertTrue(
+                    torch.equal(
+                        before[tensor_idx][d].view(torch.uint8),
+                        after[tensor_idx][d].view(torch.uint8),
+                    ),
+                    f"tensor {tensor_idx} device page {d} not byte-exact",
+                )
+
+    def _mla_pool(self, cls=None, **overrides):
+        kwargs = dict(
+            size=32,
+            dtype=self.torch.bfloat16,
+            model_dtype=self.torch.bfloat16,
+            quant_method="",
+            kv_lora_rank=16,
+            qk_rope_head_dim=8,
+            layer_num=4,
+            device="cuda",
+            enable_memory_saver=False,
+            max_batch_size=2,
+            max_context_len=64,
+            page_size=4,
+            rank=0,
+            enable_alt_stream=False,
+        )
+        kwargs.update(overrides)
+        with mock.patch(_PKG_FLAT_PROBE, return_value=True):
+            return (cls or self.MLATokenToKVPool)(**kwargs)
+
+    def test_mla_layer_event_mapping(self):
+        # K2.5: one fused latent mirror per layer, so layer L fences on
+        # events[L] -- no K/V pairing to offset through.
+        pool = self._mla_pool()
+        executor = self._executor(pool)
+        mirror = executor.mirror
+        self.assertEqual(executor.layer_num, 4)
+        self.assertEqual(len(mirror.tensor_pairs), 4)
+        self._fill_device_pages(mirror, [3])
+        executor.submit_writeback([1], [[3]], [[0]])
+        executor.flush()
+        self._drain(executor, 1)
+
+        captured = {}
+        orig = mirror.load_pages_with_events
+
+        def spy(pairs, stream):
+            events = orig(pairs, stream)
+            captured["events"] = events
+            return events
+
+        mirror.load_pages_with_events = spy
+        executor.submit_loadback([2], [[0]], [[3]])
+        executor.flush()
+        events = captured["events"]
+        producer_idx = executor.get_producer_index(self.CacheKind.KV, 2)
+        producer_event = executor._counter.events[producer_idx]
+        for layer_id in range(4):
+            self.assertIs(producer_event.load_events[layer_id], events[layer_id])
+        self.torch.cuda.synchronize()
+        self.assertTrue(producer_event.finish_event.query())
+        self._drain(executor, 1)
+
+    def test_dsa_roundtrip_with_fencing(self):
+        # GLM-5.2: latent + packed index-K, so layer L fences on its index-K
+        # mirror (events[layer_num + L]).
+        try:
+            from tokenspeed.runtime.layers.attention.kv_cache.dsa import (
+                DSATokenToKVPool,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs DSA kernels: {exc}")
+        torch = self.torch
+        pool = self._mla_pool(cls=DSATokenToKVPool, index_head_dim=128)
+        executor = self._executor(pool)
+        mirror = executor.mirror
+        self.assertEqual(len(mirror.tensor_pairs), 8)
+
+        device_pages = [1, 2]
+        self._fill_device_pages(mirror, device_pages)
+        before = self._snapshot(mirror, device_pages)
+
+        executor.submit_writeback([31], [[1, 2]], [[5, 6]])
+        executor.flush()
+        self._drain(executor, 1)
+
+        for dev, _ in mirror.tensor_pairs:
+            p = mirror.page_size
+            for d in device_pages:
+                dev[d * p : (d + 1) * p].zero_()
+        torch.cuda.synchronize()
+
+        captured = {}
+        orig = mirror.load_pages_with_events
+
+        def spy(pairs, stream):
+            events = orig(pairs, stream)
+            captured["events"] = events
+            return events
+
+        mirror.load_pages_with_events = spy
+        executor.submit_loadback([33], [[5, 6]], [[1, 2]])
+        executor.flush()
+        producer_idx = executor.get_producer_index(self.CacheKind.KV, 33)
+        producer_event = executor._counter.events[producer_idx]
+        for layer_id in range(4):
+            self.assertIs(
+                producer_event.load_events[layer_id], captured["events"][4 + layer_id]
+            )
+        executor.set_consumer(self.CacheKind.KV, [producer_idx])
+        for layer_id in range(4):
+            pool.layer_transfer_counter.wait_until(layer_id)
+        torch.cuda.synchronize()
+        self._drain(executor, 1)
+
+        after = self._snapshot(mirror, device_pages)
+        for tensor_idx in range(len(mirror.tensor_pairs)):
+            for d in device_pages:
+                self.assertTrue(
+                    torch.equal(
+                        before[tensor_idx][d].view(torch.uint8),
+                        after[tensor_idx][d].view(torch.uint8),
+                    ),
+                    f"tensor {tensor_idx} device page {d} not byte-exact",
+                )
+
+    def test_draft_pool_rides_the_same_host_pages(self):
+        # Speculative decoding writes draft KV at the TARGET's slot ids, so a
+        # loadback must restore both pools: restoring only the target would
+        # leave the drafter reading whichever request last held the page.
+        torch = self.torch
+        pool = self._mla_pool()
+        draft = self._mla_pool(layer_num=1)
+        executor = self.FlatMemoryExecutor(
+            device_pool=pool,
+            host_ratio=2.0,
+            host_size_gb=0,
+            draft_device_pool=draft,
+        )
+        mirror = executor.mirror
+        # 1 draft mirror ahead of the 4 target ones; layer count stays the
+        # target's, and its per-layer fences are unchanged by the draft.
+        self.assertEqual(len(mirror.tensor_pairs), 5)
+        self.assertIs(mirror.tensor_pairs[0][0], draft.kv_buffer[0])
+        self.assertEqual(executor.layer_num, 4)
+
+        device_pages = [1, 2]
+        self._fill_device_pages(mirror, device_pages)
+        before = self._snapshot(mirror, device_pages)
+
+        executor.submit_writeback([41], [[1, 2]], [[5, 6]])
+        executor.flush()
+        self._drain(executor, 1)
+
+        # Wipe BOTH pools' pages, as a device page reuse would.
+        p = mirror.page_size
+        for dev, _ in mirror.tensor_pairs:
+            for d in device_pages:
+                dev[d * p : (d + 1) * p].zero_()
+        torch.cuda.synchronize()
+
+        executor.submit_loadback([43], [[5, 6]], [[1, 2]])
+        executor.flush()
+        producer_idx = executor.get_producer_index(self.CacheKind.KV, 43)
+        executor.set_consumer(self.CacheKind.KV, [producer_idx])
+        for layer_id in range(4):
+            pool.layer_transfer_counter.wait_until(layer_id)
+        torch.cuda.synchronize()
+        self._drain(executor, 1)
+
+        after = self._snapshot(mirror, device_pages)
         for tensor_idx in range(len(mirror.tensor_pairs)):
             for d in device_pages:
                 self.assertTrue(

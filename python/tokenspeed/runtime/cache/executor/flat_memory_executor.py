@@ -104,11 +104,21 @@ class FlatMemoryExecutor:
     # acknowledged with one LoadBackDoneEvent per op.
     emits_loadback_acks = True
 
-    def __init__(self, device_pool, *, host_ratio: float, host_size_gb: float):
+    def __init__(
+        self,
+        device_pool,
+        *,
+        host_ratio: float,
+        host_size_gb: float,
+        draft_device_pool=None,
+    ):
         self.page_size = int(device_pool.page_size)
-        self.layer_num = len(device_pool.k_buffer)
 
-        bytes_per_host_page = flat_bytes_per_host_page(device_pool)
+        # The draft pool shares the target's slot ids, so its bytes ride the
+        # same host page (combined_host_mirror_families); mirroring only the
+        # target would load back pages whose draft KV belongs to whichever
+        # request last held the device page.
+        bytes_per_host_page = flat_bytes_per_host_page(device_pool, draft_device_pool)
         num_host_pages = flat_num_host_pages(
             bytes_per_host_page=bytes_per_host_page,
             device_pool_size=int(device_pool.size),
@@ -128,36 +138,29 @@ class FlatMemoryExecutor:
         logger.info(
             "Allocating %.2f GB pinned host memory for the flat host tier "
             "(num_host_pages=%s bytes_per_host_page=%s host_size_gb=%r "
-            "host_ratio=%r device_pool.size=%r)",
+            "host_ratio=%r device_pool.size=%r draft_pool=%s)",
             requested_bytes / 1e9,
             num_host_pages,
             bytes_per_host_page,
             host_size_gb,
             host_ratio,
             device_pool.size,
+            type(draft_device_pool).__name__ if draft_device_pool is not None else None,
         )
-        self.mirror = FlatHostMirror(device_pool, num_host_pages)
+        self.mirror = FlatHostMirror(device_pool, num_host_pages, draft_device_pool)
         self.num_host_pages = num_host_pages
+        # Layer count comes from the mirrored families: MLA/DSA pools have no
+        # k_buffer to count, and a family covers every layer by construction.
+        self.layer_num = self.mirror.layer_num
 
         # Layerwise loadback fencing: register the counter where the radix
         # KVCachePool would, so pool.get_key_buffer/get_value_buffer gate on
-        # the same wait_until(layer_id) machinery.
+        # the same wait_until(layer_id) machinery. The draft pool needs no
+        # counter of its own (its layer ids index a different space): its
+        # copies lead every target copy on the serial load stream, so the
+        # target fences the drafter waits behind already cover them.
         self._counter = LayerDoneCounter(self.layer_num)
         device_pool.register_layer_transfer_counter(self._counter)
-        # _start_loading maps layer -> mirror V-tensor event and relies on
-        # load_events[-1] (LayerLoadingEvent.finish_event, reuse fence in
-        # update_producer) covering EVERY copy: it pins the last layer to
-        # the op's last per-tensor event, which without state slabs is the
-        # last layer's V event only if that V mirror is the last KV tensor
-        # pair. Holds for both layouts (legacy: identity; slab: last layer
-        # is the last occurrence of its group). A state last layer has no
-        # KV mirror at all -- its copies (state slabs trail every KV
-        # tensor) are covered by the events[-1] pin in _start_loading.
-        assert (
-            self.mirror.state_tensor_indices_of_layer(self.layer_num - 1) is not None
-            or self.mirror.tensor_index_of_layer(self.layer_num - 1)
-            == self.mirror.num_k_tensors - 1
-        ), "flat host tier: last layer's V mirror is not the last KV tensor pair"
 
         write_priority, load_priority = _cache_stream_priorities()
         self.write_stream = _new_cache_stream(write_priority)
@@ -307,28 +310,21 @@ class FlatMemoryExecutor:
         producer_event.start_event.wait(self.load_stream)
 
         events = self.mirror.load_pages_with_events(pairs, self.load_stream)
-        # Layer fence: layer L is readable once its V mirror copy lands; the
-        # load stream is serial (all K copies precede all V copies), so the
-        # V-tensor event also covers L's K copy. Paired slab layers share the
-        # slab event -- correct by design. State layers instead fence on
-        # their ssm event: conv precedes ssm in tensor_pairs order (and both
-        # follow every KV tensor), so on the serial stream the ssm event
-        # covers the conv copy and the layer's KV copies -- the same
-        # K-before-V reasoning as above.
-        num_k = self.mirror.num_k_tensors
+        # Layer fence: layer L is readable once the LAST mirror carrying its
+        # bytes has landed (V for the K/V layout, ssm for a state layer,
+        # index-K for DSA). The load stream is serial and copies run in
+        # tensor_pairs order, so that one event also covers L's earlier
+        # copies -- including every draft-pool copy, which leads the list.
+        # Paired slab layers share an event -- correct by design.
         for layer_id in range(self.layer_num):
-            state_indices = self.mirror.state_tensor_indices_of_layer(layer_id)
-            if state_indices is not None:
-                producer_event.load_events[layer_id] = events[state_indices[1]]
-            else:
-                producer_event.load_events[layer_id] = events[
-                    num_k + self.mirror.tensor_index_of_layer(layer_id)
-                ]
+            producer_event.load_events[layer_id] = events[
+                self.mirror.fence_tensor_index_of_layer(layer_id)
+            ]
         # finish_event (== load_events[-1]) is the producer-slot reuse fence
-        # in update_producer and must cover EVERY copy of the op; state
-        # tensors copy after all KV tensors, so pin the last layer to the
-        # op's last per-tensor event. A no-op without state slabs: events[-1]
-        # is then the last layer's V event (ctor assert).
+        # in update_producer and must cover EVERY copy of the op, so pin the
+        # last layer to the op's last per-tensor event. A no-op whenever the
+        # last layer already fences on the last mirror (every layout without
+        # state slabs); with them it covers the trailing state copies.
         producer_event.load_events[self.layer_num - 1] = events[-1]
         # events[-1] is also the reassigned finish_event, so the ack covers
         # every copy.

@@ -23,6 +23,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+from tokenspeed.runtime.cache.flat_host_mirror import HostMirrorFamily
 from tokenspeed.runtime.cache.utils import (
     get_mla_kv_buffer_triton,
     set_mla_kv_buffer_triton,
@@ -265,6 +266,28 @@ class MLATokenToKVPool(BaseTokenToKVPool):
                 num_warps=self._kv_copy_config["num_warps"],
                 num_stages=2,
             )
+
+    def host_mirror_families(self) -> list[HostMirrorFamily]:
+        """Flat host tier (kvstore L2) description: one fused latent family.
+
+        MLA has no independent V tensor -- ``get_value_buffer`` slices the
+        same ``kv_buffer[i]`` -- so the base pool's (k, v) pair does not
+        apply; under ``per_token_head`` quantization that entry is instead
+        the ``(k_lora, k_scale, k_rope)`` triple. Both are just token-row
+        tensors whose page p occupies rows ``[p*page_size, (p+1)*page_size)``.
+
+        Returns:
+            A single family covering every layer's latent tensor(s).
+        """
+        return [
+            HostMirrorFamily(
+                tuple(
+                    tuple(entry) if isinstance(entry, (tuple, list)) else (entry,)
+                    for entry in self.kv_buffer
+                ),
+                self.page_size,
+            )
+        ]
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "kv_buffer")

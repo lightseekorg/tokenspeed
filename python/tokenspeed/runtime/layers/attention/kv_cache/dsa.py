@@ -24,6 +24,7 @@ import torch
 from tokenspeed_kernel.ops.kvcache.triton import index_k_block_split_scatter
 from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
 
+from tokenspeed.runtime.cache.flat_host_mirror import HostMirrorFamily
 from tokenspeed.runtime.layers.attention.configs.dsa import dsa_index_k_row_bytes
 from tokenspeed.runtime.layers.attention.kv_cache.mla import (
     MLATokenToKVPool,
@@ -89,6 +90,26 @@ class DSATokenToKVPool(MLATokenToKVPool):
             src_slot = src_loc_flat % ps
             fp8_view[tgt_page, tgt_slot] = fp8_view[src_page, src_slot]
             scale_view[tgt_page, tgt_slot] = scale_view[src_page, src_slot]
+
+    def host_mirror_families(self) -> list[HostMirrorFamily]:
+        """MLA's latent family plus the packed index-K family.
+
+        Index-K is block-split WITHIN a page (``page_size * head_dim`` FP8
+        values, then ``page_size * num_groups`` FP32 scales -- see
+        :meth:`_index_k_block_views`), so a single token's bytes are NOT one
+        row. This declaration is byte-exact only because ``page_bytes ==
+        page_size * row_bytes`` makes page p's bytes exactly rows
+        ``[p*page_size, (p+1)*page_size)`` and the mirror copies whole pages
+        only; a sub-page mirror would have to go through the block-split
+        views instead.
+
+        Returns:
+            The latent family followed by the index-K family, so a layer
+            fences on its index-K page landing (the later copy).
+        """
+        return super().host_mirror_families() + [
+            HostMirrorFamily.per_layer(self.index_k_buffer, self.page_size)
+        ]
 
     def has_index_k_buffer(self) -> bool:
         return True

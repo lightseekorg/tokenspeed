@@ -214,13 +214,15 @@ class MLAPoolGroupPublicationTest(unittest.TestCase):
         self.assertEqual(pool.paged_cache_group_specs[0].group_id, "full_attention")
 
 
-class FlatHostTierAutoDisableTest(unittest.TestCase):
-    """Default ServerArgs + flat ext + MLA/DSA pool must still be servable.
+class FlatHostTierCapabilityTest(unittest.TestCase):
+    """Which pools the flat host tier (kvstore L2) claims, and what happens
+    to the ones it does not.
 
     KVStore has no --enable flag, so the DEFAULT K2.5 / GLM-5.2 command line
-    arrives with enable_kvstore=True and startup must downgrade L2 rather than
-    refuse. Uses the real default args, since the regression is exactly
-    "default command line fails".
+    arrives with enable_kvstore=True: those pools now declare host-mirror
+    families and keep L2, while a pool that declares none must downgrade at
+    startup rather than refuse to serve. Uses the real default args, since
+    the regression this guards is exactly "default command line fails".
     """
 
     def setUp(self):
@@ -241,7 +243,7 @@ class FlatHostTierAutoDisableTest(unittest.TestCase):
         self.MLATokenToKVPool = MLATokenToKVPool
         self.prepare_server_args = prepare_server_args
 
-    def _mla_pool(self, **overrides):
+    def _mla_pool(self, cls=None, **overrides):
         kwargs = dict(
             size=64,
             dtype=self.torch.bfloat16,
@@ -260,7 +262,7 @@ class FlatHostTierAutoDisableTest(unittest.TestCase):
         )
         kwargs.update(overrides)
         with mock.patch(_FLAT_PROBE, return_value=True):
-            return self.MLATokenToKVPool(**kwargs)
+            return (cls or self.MLATokenToKVPool)(**kwargs)
 
     def test_default_server_args_enable_kvstore(self):
         # The premise of the auto-disable: nobody has to opt in to L2.
@@ -268,19 +270,79 @@ class FlatHostTierAutoDisableTest(unittest.TestCase):
         self.assertFalse(args.disable_kvstore)
         self.assertTrue(args.enable_kvstore)
 
-    def test_mla_pool_reports_host_tier_gap(self):
-        reason = self.reason(self._mla_pool())
-        self.assertIsNotNone(reason)
-        self.assertIn("MLATokenToKVPool", reason)
+    def test_mla_pool_keeps_the_host_tier(self):
+        # K2.5: the fused latent family is mirrorable, both quantizations.
+        for quant_method in ("", "per_token_head"):
+            pool = self._mla_pool(quant_method=quant_method)
+            self.assertIsNone(self.reason(pool), quant_method)
+            families = pool.host_mirror_families()
+            self.assertEqual(len(families), 1, quant_method)
+            self.assertEqual(len(families[0].layer_tensors), pool.layer_num)
 
-    def test_default_args_plus_mla_pool_downgrades_instead_of_failing(self):
-        # The startup decision EventLoop.__init__ makes, composed here from the
-        # real default args and the real pool: L2 off, serving still possible.
+    def test_dsa_pool_keeps_the_host_tier(self):
+        # GLM-5.2: the latent family plus the packed index-K family.
+        try:
+            from tokenspeed.runtime.layers.attention.kv_cache.dsa import (
+                DSATokenToKVPool,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs DSA kernels: {exc}")
+        pool = self._mla_pool(cls=DSATokenToKVPool, index_head_dim=128)
+        self.assertIsNone(self.reason(pool))
+        self.assertEqual(len(pool.host_mirror_families()), 2)
+
+    def test_unmirrorable_draft_pool_disables_the_host_tier(self):
+        # A speculative draft pool shares the target's page ids, so it must be
+        # mirrorable too: mirroring K2.5's target KV alone would load back
+        # pages whose draft KV belongs to another request.
+        target = self._mla_pool()
+        self.assertIsNone(self.reason(target, self._mla_pool(layer_num=1)))
+        blind = types.SimpleNamespace(host_mirror_families=lambda: [])
+        reason = self.reason(target, blind)
+        self.assertIsNotNone(reason)
+        self.assertIn("draft", reason)
+
+    def test_default_args_plus_unmirrorable_pool_downgrades_instead_of_failing(self):
+        # The startup decision EventLoop.__init__ makes, composed here from
+        # the real default args and a pool that declares no families (MSA's
+        # sparse index side cache, DeepSeek-V4's split buffers): L2 off,
+        # serving still possible.
         args = self.prepare_server_args(["some-model"])
-        pool = self._mla_pool()
-        if self.reason(pool) is not None:
+        pool = types.SimpleNamespace(host_mirror_families=lambda: [])
+        reason = self.reason(pool)
+        self.assertIsNotNone(reason)
+        if reason is not None:
             args.enable_kvstore = False
         self.assertFalse(args.enable_kvstore)
+
+    def test_msa_pool_declares_no_families(self):
+        # The gap this closes: mirroring MSA's K/V alone would load back
+        # pages whose key-only index side cache is stale.
+        try:
+            from tokenspeed.runtime.layers.attention.kv_cache.msa import (
+                MSATokenToKVPool,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+        with mock.patch(_FLAT_PROBE, return_value=True):
+            pool = MSATokenToKVPool(
+                size=32,
+                dtype=self.torch.bfloat16,
+                head_num=1,
+                head_dim=8,
+                layer_num=2,
+                device="cpu",
+                enable_memory_saver=False,
+                max_batch_size=2,
+                max_context_len=64,
+                page_size=16,
+                rank=0,
+                index_head_dim=8,
+                index_dtype=self.torch.bfloat16,
+                indexed_layer_ids=frozenset({1}),
+            )
+        self.assertEqual(pool.host_mirror_families(), [])
+        self.assertIsNotNone(self.reason(pool))
 
     def test_mha_pool_keeps_the_host_tier(self):
         # The downgrade must be narrow: MHA pools do expose k_buffer/v_buffer

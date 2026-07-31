@@ -1,8 +1,13 @@
 """FlatHostMirror (M15 Phase D1): byte-blind pinned-CPU slab mirror.
 
 Pins the transport contract only (no engine wiring): one mirror per
-distinct device KV tensor, whole-page row-range copies both directions,
-per-tensor load events, and the layer -> tensor-index mapping D2 fences on.
+distinct device tensor the pool declares in ``host_mirror_families()``,
+whole-page row-range copies both directions, per-tensor load events, and the
+layer -> fence-tensor mapping D2 fences on.
+
+Covers every declared layout: MHA K/V (slab and legacy), GDN state slabs,
+MLA's fused latent (plus its per-token-head quantized triple) and DSA's
+latent + packed index-K.
 """
 
 from __future__ import annotations
@@ -150,29 +155,29 @@ class FlatHostMirrorTest(unittest.TestCase):
         stream.synchronize()
         self.assertTrue(all(event.query() for event in events))
 
-        # Slab: paired layers map to the same K-tensor index.
-        self.assertEqual(mirror.num_k_tensors, 2)
+        # A layer fences on the LAST mirror carrying its bytes: its V slab
+        # (mirror order K0, K1, V0, V1). Paired slab layers share it.
+        self.assertEqual(mirror.layer_num, 4)
+        for layer_id in range(4):
+            idx = mirror.fence_tensor_index_of_layer(layer_id)
+            self.assertIs(mirror.tensor_pairs[idx][0], pool.v_buffer[layer_id])
         self.assertEqual(
-            mirror.tensor_index_of_layer(0), mirror.tensor_index_of_layer(1)
+            mirror.fence_tensor_index_of_layer(0),
+            mirror.fence_tensor_index_of_layer(1),
         )
         self.assertEqual(
-            mirror.tensor_index_of_layer(2), mirror.tensor_index_of_layer(3)
+            mirror.fence_tensor_index_of_layer(2),
+            mirror.fence_tensor_index_of_layer(3),
         )
         self.assertNotEqual(
-            mirror.tensor_index_of_layer(0), mirror.tensor_index_of_layer(2)
+            mirror.fence_tensor_index_of_layer(0),
+            mirror.fence_tensor_index_of_layer(2),
         )
-        for layer_id in range(4):
-            idx = mirror.tensor_index_of_layer(layer_id)
-            self.assertIs(mirror.tensor_pairs[idx][0], pool.k_buffer[layer_id])
-            self.assertIs(
-                mirror.tensor_pairs[idx + mirror.num_k_tensors][0],
-                pool.v_buffer[layer_id],
-            )
 
-        # Legacy: every layer maps to a distinct index.
+        # Legacy: every layer fences on its own V mirror (K0..K3, V0..V3).
         legacy = self.FlatHostMirror(self._pool(flat_ext=False), num_host_pages=2)
         self.assertEqual(
-            {legacy.tensor_index_of_layer(i) for i in range(4)}, {0, 1, 2, 3}
+            {legacy.fence_tensor_index_of_layer(i) for i in range(4)}, {4, 5, 6, 7}
         )
 
 
@@ -290,9 +295,8 @@ class FlatHostMirrorStateSlabTest(unittest.TestCase):
         mirror = self.FlatHostMirror(pool, num_host_pages=8)
         # Flat GDN: state layers carry no KV (k/v slots are None, M18a T4),
         # so only the 2 attention layers mirror KV (2 K + 2 V), then
-        # conv0, ssm0, conv1, ssm1 -- PINNED order: K*, V*, state tensors
-        # flattened in slab order.
-        self.assertEqual(mirror.num_k_tensors, 2)
+        # conv0, ssm0, conv1, ssm1 -- declared family order: K*, V*, state
+        # tensors flattened in slab order.
         self.assertEqual(len(mirror.tensor_pairs), 8)
         self.assertEqual(len(pool.state_slabs), 2)
         for n, (conv, ssm) in enumerate(pool.state_slabs):
@@ -352,26 +356,28 @@ class FlatHostMirrorStateSlabTest(unittest.TestCase):
                     f"tensor {tensor_idx} device page {d} not byte-exact",
                 )
 
-    def test_state_tensor_indices_of_layer(self):
+    def test_state_layers_fence_on_their_ssm_slab(self):
         pool = self._pool()
         mirror = self.FlatHostMirror(pool, num_host_pages=2)
-        # State layers 0/2 bind slab pairs 0/1 -> flattened indices after
-        # the 4 KV mirrors; conv immediately precedes its ssm.
-        self.assertEqual(mirror.state_tensor_indices_of_layer(0), (4, 5))
-        self.assertEqual(mirror.state_tensor_indices_of_layer(2), (6, 7))
-        self.assertIsNone(mirror.state_tensor_indices_of_layer(1))
-        self.assertIsNone(mirror.state_tensor_indices_of_layer(3))
-        # Pools without state slabs expose no state indices for any layer.
+        # State layers 0/2 bind slab pairs 0/1, flattened after the 4 KV
+        # mirrors as conv0, ssm0, conv1, ssm1; the pair's LAST tensor (ssm)
+        # is the fence. Attention layers 1/3 keep their V mirror.
+        self.assertEqual(mirror.fence_tensor_index_of_layer(0), 5)
+        self.assertEqual(mirror.fence_tensor_index_of_layer(2), 7)
+        self.assertEqual(mirror.fence_tensor_index_of_layer(1), 2)
+        self.assertEqual(mirror.fence_tensor_index_of_layer(3), 3)
+        # Without state slabs every layer keeps KV, so all fence on V.
         kv_only = self.FlatHostMirror(self._pool(with_state=False), num_host_pages=2)
-        for layer_id in range(4):
-            self.assertIsNone(kv_only.state_tensor_indices_of_layer(layer_id))
+        self.assertEqual(
+            [kv_only.fence_tensor_index_of_layer(i) for i in range(4)], [4, 5, 6, 7]
+        )
 
 
 class FlatHostMirrorNoneKVTest(unittest.TestCase):
     """Flat GDN pools carry None k/v slots on state layers (M18a T4): the
-    mirror's identity-dedup walks must skip them and mirror only the real
-    slabs. CPU stub pool, no CUDA, no scheduler ext -- state mirroring via
-    get_state_buffers is a separate surface and unaffected."""
+    base pool's family derivation must skip them and mirror only the real
+    slabs. CPU stub pool, no CUDA, no scheduler ext -- the stub borrows the
+    real default derivation, so nothing here re-implements it."""
 
     def setUp(self):
         try:
@@ -381,39 +387,392 @@ class FlatHostMirrorNoneKVTest(unittest.TestCase):
                 FlatHostMirror,
                 flat_bytes_per_host_page,
             )
+            from tokenspeed.runtime.layers.attention.kv_cache.base import (
+                BaseTokenToKVPool,
+            )
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs torch: {exc}")
         self.torch = torch
         self.FlatHostMirror = FlatHostMirror
         self.flat_bytes_per_host_page = flat_bytes_per_host_page
+        self.BaseTokenToKVPool = BaseTokenToKVPool
 
-    def _stub_pool(self):
-        import types
-
+    def _stub_pool(self, *, with_state: bool):
         torch = self.torch
-        rows = 8
-        kv = [torch.zeros((rows, 1, 8), dtype=torch.bfloat16) for _ in range(4)]
-        return types.SimpleNamespace(
-            page_size=4,
-            k_buffer=[None, kv[0], None, kv[1]],
-            v_buffer=[None, kv[2], None, kv[3]],
-        )
+        kv = [torch.zeros((8, 1, 8), dtype=torch.bfloat16) for _ in range(4)]
+        slabs = [
+            (
+                torch.zeros((2, 2, 4), dtype=torch.bfloat16),  # conv, 16 B/row
+                torch.zeros((2, 2, 8), dtype=torch.bfloat16),  # ssm, 32 B/row
+            )
+            for _ in range(2)
+        ]
+        base = self.BaseTokenToKVPool
+
+        class _StubPool:
+            # The real default derivation, on a pool too small to construct.
+            host_mirror_families = base.host_mirror_families
+            page_size = 4
+            k_buffer = [None, kv[0], None, kv[1]]
+            v_buffer = [None, kv[2], None, kv[3]]
+            state_slabs = slabs if with_state else []
+
+            def get_state_buffers(self, layer_id):
+                if layer_id not in (0, 2):
+                    raise ValueError(f"layer {layer_id} is not a state layer")
+                return slabs[layer_id // 2]
+
+        return _StubPool()
 
     def test_mirror_skips_none_kv_entries(self):
-        stub = self._stub_pool()
-        # 4 real mirrors x page_size 4 x 16 B rows = 256 B per host page.
-        self.assertEqual(self.flat_bytes_per_host_page(stub), 256)
+        stub = self._stub_pool(with_state=True)
+        # 4 real KV mirrors x page_size 4 x 16 B rows (256 B), plus 2 state
+        # pairs x (conv 16 B + ssm 32 B) page rows.
+        self.assertEqual(self.flat_bytes_per_host_page(stub), 256 + 96)
         mirror = self.FlatHostMirror(stub, num_host_pages=2)
-        self.assertEqual(mirror.num_k_tensors, 2)
-        self.assertEqual(len(mirror.tensor_pairs), 4)
+        self.assertEqual(len(mirror.tensor_pairs), 8)
         self.assertIs(mirror.tensor_pairs[0][0], stub.k_buffer[1])
         self.assertIs(mirror.tensor_pairs[1][0], stub.k_buffer[3])
-        # KV layers keep their tensor-index mapping; state layers have no
-        # KV mirror and must fail loud if D2 fencing ever asks for one.
-        self.assertEqual(mirror.tensor_index_of_layer(1), 0)
-        self.assertEqual(mirror.tensor_index_of_layer(3), 1)
-        with self.assertRaisesRegex(ValueError, r"state layer"):
-            mirror.tensor_index_of_layer(0)
+        # KV layers fence on their V mirror, state layers on their ssm slab.
+        self.assertEqual(
+            [mirror.fence_tensor_index_of_layer(i) for i in range(4)], [5, 2, 7, 3]
+        )
+
+    def test_layer_in_no_family_is_refused(self):
+        # The same None slots WITHOUT the state declaration: layers 0/2 would
+        # be mirrored by nothing, so a loadback could not fence them.
+        stub = self._stub_pool(with_state=False)
+        with self.assertRaisesRegex(ValueError, r"in no declared family"):
+            self.FlatHostMirror(stub, num_host_pages=2)
+
+
+class FlatHostMirrorMLATest(unittest.TestCase):
+    """MLA (K2.5) declares ONE fused-latent family: no independent V tensor,
+    so a layer fences on its own latent mirror. The per-token-head quantized
+    variant splits that entry into a (k_lora, k_scale, k_rope) triple, which
+    is the same family with three tensors per layer."""
+
+    LAYER_NUM = 3
+
+    def setUp(self):
+        try:
+            import torch
+
+            from tokenspeed.runtime.cache.flat_host_mirror import (
+                FlatHostMirror,
+                flat_bytes_per_host_page,
+            )
+            from tokenspeed.runtime.layers.attention.kv_cache.mla import (
+                MLATokenToKVPool,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+        if not torch.cuda.is_available():
+            self.skipTest("needs a CUDA device")
+        self.torch = torch
+        self.FlatHostMirror = FlatHostMirror
+        self.flat_bytes_per_host_page = flat_bytes_per_host_page
+        self.MLATokenToKVPool = MLATokenToKVPool
+
+    def _pool(self, **overrides):
+        kwargs = dict(
+            size=32,
+            dtype=self.torch.bfloat16,
+            model_dtype=self.torch.bfloat16,
+            quant_method="",
+            kv_lora_rank=16,
+            qk_rope_head_dim=8,
+            layer_num=self.LAYER_NUM,
+            device="cuda",
+            enable_memory_saver=False,
+            max_batch_size=2,
+            max_context_len=64,
+            page_size=4,
+            rank=0,
+            enable_alt_stream=False,
+        )
+        kwargs.update(overrides)
+        with mock.patch(_PKG_FLAT_PROBE, return_value=True):
+            return self.MLATokenToKVPool(**kwargs)
+
+    def test_fused_latent_layout(self):
+        pool = self._pool()
+        mirror = self.FlatHostMirror(pool, num_host_pages=8)
+        # One mirror per layer, spanning page_size token rows.
+        self.assertEqual(len(mirror.tensor_pairs), self.LAYER_NUM)
+        self.assertEqual(mirror.layer_num, self.LAYER_NUM)
+        self.assertEqual(mirror.row_spans, (4,) * self.LAYER_NUM)
+        for layer_id in range(self.LAYER_NUM):
+            self.assertIs(mirror.tensor_pairs[layer_id][0], pool.kv_buffer[layer_id])
+            self.assertEqual(mirror.fence_tensor_index_of_layer(layer_id), layer_id)
+        # 3 mirrors x page_size 4 x row 1*(16+8) bf16 (48 B) = 576 B.
+        self.assertEqual(mirror.bytes_per_host_page(), 3 * 4 * 48)
+        self.assertEqual(self.flat_bytes_per_host_page(pool), 3 * 4 * 48)
+
+    def test_roundtrip_is_byte_exact(self):
+        mirror = self.FlatHostMirror(self._pool(), num_host_pages=8)
+        assert_page_roundtrip(self, mirror, [(1, 5), (2, 6), (3, 7)])
+
+    def test_per_token_head_quantization_mirrors_the_triple(self):
+        pool = self._pool(quant_method="per_token_head")
+        mirror = self.FlatHostMirror(pool, num_host_pages=8)
+        # (k_lora, k_scale, k_rope) per layer, in that order.
+        self.assertEqual(len(mirror.tensor_pairs), 3 * self.LAYER_NUM)
+        for layer_id in range(self.LAYER_NUM):
+            for n, buf in enumerate(pool.kv_buffer[layer_id]):
+                self.assertIs(mirror.tensor_pairs[3 * layer_id + n][0], buf)
+            # Fence on the layer's LAST tensor (k_rope).
+            self.assertEqual(
+                mirror.fence_tensor_index_of_layer(layer_id), 3 * layer_id + 2
+            )
+        assert_page_roundtrip(self, mirror, [(1, 5), (2, 6)])
+
+
+class FlatHostMirrorDraftPoolTest(unittest.TestCase):
+    """Speculative decoding writes draft KV at the TARGET's slot ids, so the
+    draft pool rides the same host page and must be mirrored with it -- a
+    loadback that restored only the target would hand the drafter whichever
+    request last held that device page.
+
+    Draft families lead the list so every draft copy precedes every target
+    copy on the serial load stream, leaving the target's per-layer fences
+    (which the drafter waits behind) unchanged."""
+
+    LAYER_NUM = 3
+    DRAFT_LAYER_NUM = 1
+
+    def setUp(self):
+        try:
+            import torch
+
+            from tokenspeed.runtime.cache.flat_host_mirror import (
+                FlatHostMirror,
+                flat_bytes_per_host_page,
+            )
+            from tokenspeed.runtime.layers.attention.kv_cache.mla import (
+                MLATokenToKVPool,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+        if not torch.cuda.is_available():
+            self.skipTest("needs a CUDA device")
+        self.torch = torch
+        self.FlatHostMirror = FlatHostMirror
+        self.flat_bytes_per_host_page = flat_bytes_per_host_page
+        self.MLATokenToKVPool = MLATokenToKVPool
+
+    def _pool(self, layer_num, **overrides):
+        kwargs = dict(
+            size=32,
+            dtype=self.torch.bfloat16,
+            model_dtype=self.torch.bfloat16,
+            quant_method="",
+            kv_lora_rank=16,
+            qk_rope_head_dim=8,
+            layer_num=layer_num,
+            device="cuda",
+            enable_memory_saver=False,
+            max_batch_size=2,
+            max_context_len=64,
+            page_size=4,
+            rank=0,
+            enable_alt_stream=False,
+        )
+        kwargs.update(overrides)
+        with mock.patch(_PKG_FLAT_PROBE, return_value=True):
+            return self.MLATokenToKVPool(**kwargs)
+
+    def test_draft_tensors_lead_the_target_and_keep_its_fences(self):
+        target = self._pool(self.LAYER_NUM)
+        draft = self._pool(self.DRAFT_LAYER_NUM)
+        mirror = self.FlatHostMirror(target, num_host_pages=8, draft_kv_pool=draft)
+        self.assertEqual(
+            len(mirror.tensor_pairs), self.LAYER_NUM + self.DRAFT_LAYER_NUM
+        )
+        # Draft first, then the target's layers.
+        self.assertIs(mirror.tensor_pairs[0][0], draft.kv_buffer[0])
+        for layer_id in range(self.LAYER_NUM):
+            self.assertIs(
+                mirror.tensor_pairs[self.DRAFT_LAYER_NUM + layer_id][0],
+                target.kv_buffer[layer_id],
+            )
+        # The layer count stays the TARGET's, and each layer still fences on
+        # its own target mirror -- the draft copies precede them all.
+        self.assertEqual(mirror.layer_num, self.LAYER_NUM)
+        for layer_id in range(self.LAYER_NUM):
+            self.assertEqual(
+                mirror.fence_tensor_index_of_layer(layer_id),
+                self.DRAFT_LAYER_NUM + layer_id,
+            )
+
+    def test_bytes_per_host_page_includes_the_draft_pool(self):
+        target = self._pool(self.LAYER_NUM)
+        draft = self._pool(self.DRAFT_LAYER_NUM)
+        # (3 target + 1 draft) mirrors x page_size 4 x 48 B rows.
+        both = self.flat_bytes_per_host_page(target, draft)
+        self.assertEqual(both, (self.LAYER_NUM + self.DRAFT_LAYER_NUM) * 4 * 48)
+        self.assertEqual(both, self.flat_bytes_per_host_page(target) + 1 * 4 * 48)
+        mirror = self.FlatHostMirror(target, num_host_pages=2, draft_kv_pool=draft)
+        self.assertEqual(mirror.bytes_per_host_page(), both)
+
+    def test_draft_pages_roundtrip_byte_exact(self):
+        mirror = self.FlatHostMirror(
+            self._pool(self.LAYER_NUM),
+            num_host_pages=8,
+            draft_kv_pool=self._pool(self.DRAFT_LAYER_NUM),
+        )
+        assert_page_roundtrip(self, mirror, [(1, 5), (2, 6), (3, 7)])
+
+    def test_unmirrorable_or_mismatched_draft_pool_is_refused(self):
+        import types
+
+        target = self._pool(self.LAYER_NUM)
+        # A draft pool the mirror cannot describe must fail loud rather than
+        # leave draft KV silently unmirrored.
+        blind = types.SimpleNamespace(
+            host_mirror_families=lambda: [], page_size=4, size=32
+        )
+        with self.assertRaisesRegex(ValueError, r"declares no tensor families"):
+            self.FlatHostMirror(target, num_host_pages=2, draft_kv_pool=blind)
+        # Page geometry must line up: page ids index both pools.
+        with self.assertRaisesRegex(ValueError, r"page geometry"):
+            self.FlatHostMirror(
+                target,
+                num_host_pages=2,
+                draft_kv_pool=self._pool(self.DRAFT_LAYER_NUM, page_size=8),
+            )
+        # A draft pool deeper than the target breaks the layer padding.
+        with self.assertRaisesRegex(ValueError, r"more layers than the target"):
+            self.FlatHostMirror(
+                target,
+                num_host_pages=2,
+                draft_kv_pool=self._pool(self.LAYER_NUM + 1),
+            )
+
+
+class FlatHostMirrorDSATest(unittest.TestCase):
+    """DSA (GLM-5.2) adds the packed index-K family after MLA's latent.
+
+    Index-K is block-split WITHIN a page, so the byte-exact roundtrip below
+    is the load-bearing check: it only holds because the mirror copies whole
+    pages (a page's bytes are exactly its page_size rows)."""
+
+    LAYER_NUM = 2
+    INDEX_HEAD_DIM = 128
+
+    def setUp(self):
+        try:
+            import torch
+
+            from tokenspeed.runtime.cache.flat_host_mirror import (
+                FlatHostMirror,
+                flat_bytes_per_host_page,
+            )
+            from tokenspeed.runtime.layers.attention.kv_cache.dsa import (
+                DSATokenToKVPool,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch + DSA kernels: {exc}")
+        if not torch.cuda.is_available():
+            self.skipTest("needs a CUDA device")
+        self.torch = torch
+        self.FlatHostMirror = FlatHostMirror
+        self.flat_bytes_per_host_page = flat_bytes_per_host_page
+        self.DSATokenToKVPool = DSATokenToKVPool
+
+    def _pool(self):
+        kwargs = dict(
+            size=32,
+            dtype=self.torch.bfloat16,
+            model_dtype=self.torch.bfloat16,
+            quant_method="",
+            kv_lora_rank=16,
+            qk_rope_head_dim=8,
+            layer_num=self.LAYER_NUM,
+            device="cuda",
+            enable_memory_saver=False,
+            max_batch_size=2,
+            max_context_len=64,
+            page_size=4,
+            rank=0,
+            enable_alt_stream=False,
+            index_head_dim=self.INDEX_HEAD_DIM,
+        )
+        with mock.patch(_PKG_FLAT_PROBE, return_value=True):
+            return self.DSATokenToKVPool(**kwargs)
+
+    def test_index_k_family_follows_the_latent_family(self):
+        pool = self._pool()
+        mirror = self.FlatHostMirror(pool, num_host_pages=8)
+        self.assertEqual(len(mirror.tensor_pairs), 2 * self.LAYER_NUM)
+        for layer_id in range(self.LAYER_NUM):
+            self.assertIs(mirror.tensor_pairs[layer_id][0], pool.kv_buffer[layer_id])
+            self.assertIs(
+                mirror.tensor_pairs[self.LAYER_NUM + layer_id][0],
+                pool.index_k_buffer[layer_id],
+            )
+            # Index-K lands last, so it is the layer's fence.
+            self.assertEqual(
+                mirror.fence_tensor_index_of_layer(layer_id),
+                self.LAYER_NUM + layer_id,
+            )
+        # Latent rows (48 B) plus index-K rows (128 FP8 + 1 group * 4 B).
+        row_bytes = 48 + (self.INDEX_HEAD_DIM + 4)
+        self.assertEqual(mirror.bytes_per_host_page(), self.LAYER_NUM * 4 * row_bytes)
+        self.assertEqual(
+            self.flat_bytes_per_host_page(pool), mirror.bytes_per_host_page()
+        )
+
+    def test_block_split_index_k_roundtrips_byte_exact(self):
+        mirror = self.FlatHostMirror(self._pool(), num_host_pages=8)
+        assert_page_roundtrip(self, mirror, [(1, 5), (2, 6), (3, 7)])
+
+
+def assert_page_roundtrip(case, mirror, pairs):
+    """store_pages -> zero the device pages -> load_pages is byte-exact.
+
+    Fills every mirrored device tensor with RANDOM bytes first, so an
+    intra-page reordering (e.g. mishandling DSA's block-split index-K)
+    fails here, not just a page mixup.
+
+    Args:
+        case: The TestCase raising the failure.
+        mirror: A built :class:`FlatHostMirror`.
+        pairs: (device_page, host_page) pairs to round-trip.
+    """
+    torch = case.torch
+    device_pages = [d for d, _ in pairs]
+    for dev, _ in mirror.tensor_pairs:
+        dev.view(torch.uint8).random_(0, 256)
+    torch.cuda.synchronize()
+
+    def snapshot():
+        return [
+            {d: dev[d * span : (d + 1) * span].cpu().clone() for d in device_pages}
+            for (dev, _), span in zip(mirror.tensor_pairs, mirror.row_spans)
+        ]
+
+    before = snapshot()
+    stream = torch.cuda.Stream()
+    mirror.store_pages(pairs, stream)
+    stream.synchronize()
+    for (dev, _), span in zip(mirror.tensor_pairs, mirror.row_spans):
+        for d in device_pages:
+            dev[d * span : (d + 1) * span].zero_()
+    torch.cuda.synchronize()
+    mirror.load_pages(pairs, stream)
+    stream.synchronize()
+
+    after = snapshot()
+    for tensor_idx in range(len(mirror.tensor_pairs)):
+        for d in device_pages:
+            case.assertTrue(
+                torch.equal(
+                    before[tensor_idx][d].view(torch.uint8),
+                    after[tensor_idx][d].view(torch.uint8),
+                ),
+                f"tensor {tensor_idx} device page {d} not byte-exact",
+            )
 
 
 if __name__ == "__main__":

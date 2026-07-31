@@ -78,27 +78,40 @@ def preflight_kimi_k3_flat_consumers(*model_configs: object | None) -> None:
                 raise RuntimeError(_KIMI_K3_FLATKV_REQUIRED_DIAGNOSTIC)
 
 
-def flat_host_tier_unsupported_reason(kv_pool: object) -> str | None:
-    """Why the flat host tier (kvstore L2) cannot mirror ``kv_pool``, or None.
+def flat_host_tier_unsupported_reason(
+    kv_pool: object, draft_kv_pool: object | None = None
+) -> str | None:
+    """Why the flat host tier (kvstore L2) cannot mirror these pools, or None.
 
-    ``FlatHostMirror`` needs one (k, v) tensor pair per layer; MLA/DSA keep a
-    single fused latent ``kv_buffer``. Contract pools (Kimi-K3) return None --
-    they have their own guard with a more specific message.
+    ``FlatHostMirror`` mirrors exactly the tensor families a pool declares in
+    ``host_mirror_families()``, so a pool that declares none cannot be
+    mirrored -- it has no KV buffers to describe (DeepSeek-V4) or a side
+    cache a partial mirror would silently skip (MSA). A speculative draft
+    pool shares the target's page ids, so it must be mirrorable too: mirroring
+    only the target would load back pages whose draft KV belongs to another
+    request. Contract pools (Kimi-K3) return None -- they have their own guard
+    with a more specific message.
 
     Args:
         kv_pool: The device KV pool the flat host tier would mirror.
+        draft_kv_pool: The speculative draft KV pool riding the same pages,
+            or None when speculative decoding is off.
 
     Returns:
         A reason string when the host tier is impossible, else None.
     """
     if getattr(kv_pool, "runtime_contract", None) is not None:
         return None
-    if not hasattr(kv_pool, "k_buffer"):
-        return (
-            f"{type(kv_pool).__name__} keeps a fused latent kv_buffer instead "
-            "of the per-layer k_buffer/v_buffer pair the flat host mirror "
-            "describes"
-        )
+    for pool, role in ((kv_pool, "target"), (draft_kv_pool, "draft")):
+        if pool is None:
+            continue
+        families = getattr(pool, "host_mirror_families", None)
+        if families is None or not families():
+            return (
+                f"the {role} pool {type(pool).__name__} declares no "
+                "host-mirror tensor families, so the flat host mirror cannot "
+                "describe its layout"
+            )
     return None
 
 

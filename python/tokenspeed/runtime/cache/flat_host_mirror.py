@@ -25,152 +25,234 @@ tier (M15 Phase D). Transport mechanism only; scheduler/engine wiring is D2.
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 
 import torch
 
 
-def _identity_dedup(
-    tensors: Sequence[torch.Tensor | None],
-) -> list[torch.Tensor]:
-    """Distinct tensors in first-appearance order; None slots (flat GDN
-    state layers carry no KV) are skipped."""
-    seen: dict[int, torch.Tensor] = {}
-    for t in tensors:
-        if t is None:
-            continue
-        seen.setdefault(id(t), t)
-    return list(seen.values())
+@dataclass(frozen=True)
+class HostMirrorFamily:
+    """One mirrorable family of device tensors, described per layer.
+
+    A pool declares its families through ``host_mirror_families()``; the
+    mirror stays byte-blind, so a pool only has to say WHICH tensors carry a
+    layer's page bytes and how many rows a page spans on them.
+
+    Attributes:
+        layer_tensors: For each layer, the family's tensors holding that
+            layer's page bytes, in mirror order -- ``()`` for layers the
+            family does not cover (flat GDN state layers carry no KV).
+            Tensors repeated across layers (slab layouts alias one tensor
+            across paired layers) are mirrored once.
+        rows_per_page: Rows one page spans on every tensor of the family:
+            ``page_size`` for token-indexed buffers, 1 for page-indexed
+            snapshots (state slabs).
+    """
+
+    layer_tensors: tuple[tuple[torch.Tensor, ...], ...]
+    rows_per_page: int
+
+    @classmethod
+    def per_layer(
+        cls, buffers: Sequence[torch.Tensor | None], rows_per_page: int
+    ) -> HostMirrorFamily:
+        """Family from one buffer (or None for an uncovered layer) per layer.
+
+        Args:
+            buffers: Per-layer tensors, ``None`` where the layer has none.
+            rows_per_page: Rows one page spans on each buffer.
+
+        Returns:
+            The equivalent :class:`HostMirrorFamily`.
+        """
+        return cls(tuple(() if b is None else (b,) for b in buffers), rows_per_page)
 
 
-def _state_slabs(device_kv_pool) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    """(conv, ssm) state slab pairs, [] on pools predating state slabs."""
-    return list(getattr(device_kv_pool, "state_slabs", None) or ())
+def _flatten_families(
+    families: Sequence[HostMirrorFamily],
+) -> tuple[list[torch.Tensor], list[int], list[int]]:
+    """Flatten declared families into the mirrored tensor list.
+
+    Walks families in declaration order and, within a family, layers in
+    order, keeping the first occurrence of each distinct tensor (slab
+    layouts alias one tensor across paired layers; legacy layouts keep all
+    per-layer buffers, whose dead-row copies are harmless).
+
+    Args:
+        families: The pool's ``host_mirror_families()``; all must describe
+            the same layer count.
+
+    Returns:
+        ``(tensors, row_spans, layer_fence)``: the distinct device tensors to
+        mirror, the rows one page spans on each, and per layer the index of
+        the LAST mirrored tensor holding that layer's bytes -- the copy whose
+        completion makes the layer readable (copies run in this order on one
+        serial stream, so that event covers the layer's earlier copies).
+
+    Raises:
+        ValueError: No families, families of differing layer counts, or a
+            layer no family covers (it would have nothing to fence on).
+    """
+    if not families:
+        raise ValueError("flat host mirror: the pool declares no tensor families")
+    layer_num = len(families[0].layer_tensors)
+    tensors: list[torch.Tensor] = []
+    row_spans: list[int] = []
+    index_of: dict[int, int] = {}
+    fence = [-1] * layer_num  # -1 until some family claims the layer
+    for family in families:
+        if len(family.layer_tensors) != layer_num:
+            raise ValueError(
+                "flat host mirror: families disagree on layer count "
+                f"({len(family.layer_tensors)} vs {layer_num})"
+            )
+        for layer_id, layer_tensors in enumerate(family.layer_tensors):
+            for tensor in layer_tensors:
+                index = index_of.get(id(tensor))
+                if index is None:
+                    index = len(tensors)
+                    index_of[id(tensor)] = index
+                    tensors.append(tensor)
+                    row_spans.append(family.rows_per_page)
+                fence[layer_id] = max(fence[layer_id], index)
+    if -1 in fence:
+        raise ValueError(
+            "flat host mirror: layers "
+            f"{[i for i, index in enumerate(fence) if index < 0]} are in no "
+            "declared family, so a loadback could not fence them"
+        )
+    return tensors, row_spans, fence
 
 
-def flat_bytes_per_host_page(device_kv_pool) -> int:
+def combined_host_mirror_families(
+    device_kv_pool, draft_kv_pool=None
+) -> list[HostMirrorFamily]:
+    """Families to mirror for a (target, draft) KV pool pair.
+
+    Speculative decoding gives the drafter its own KV pool addressed by the
+    SAME slot ids as the target's -- the drafter writes at the target's
+    ``out_cache_loc`` and attends over the full sequence, so a prefix hit
+    reuses draft KV it never recomputed. One device page therefore carries
+    both pools' bytes, and a loadback restoring only the target would leave
+    the drafter reading whatever request last held that page (correct output
+    still, since the target verifies every draft token, but the acceptance
+    rate collapses). The radix ``KVPoolTransfer`` moves both pools for the
+    same reason.
+
+    Draft families are placed FIRST so every draft copy precedes every target
+    copy on the serial load stream: the target's per-layer fences then cover
+    the draft copies as well, and since the drafter runs after the target
+    forward has waited on them, the draft pool needs no fence of its own
+    (the radix path relies on the same ordering via its per-layer interleave).
+
+    Args:
+        device_kv_pool: The target KV pool.
+        draft_kv_pool: The speculative draft KV pool, or None.
+
+    Returns:
+        Draft families (padded to the target's layer count) followed by the
+        target's, or ``[]`` when the target declares none.
+
+    Raises:
+        ValueError: The draft pool declares no families, disagrees on page
+            geometry, or has more layers than the target.
+    """
+    families = list(device_kv_pool.host_mirror_families())
+    if draft_kv_pool is None or not families:
+        return families
+    layer_num = len(families[0].layer_tensors)
+    draft_families = list(draft_kv_pool.host_mirror_families())
+    if not draft_families:
+        raise ValueError(
+            f"flat host mirror: draft pool {type(draft_kv_pool).__name__} "
+            "declares no tensor families, so its KV cannot be mirrored "
+            "alongside the target's"
+        )
+    if int(draft_kv_pool.page_size) != int(device_kv_pool.page_size) or int(
+        draft_kv_pool.size
+    ) < int(device_kv_pool.size):
+        raise ValueError(
+            "flat host mirror: draft pool does not share the target's page "
+            f"geometry (page_size {draft_kv_pool.page_size} vs "
+            f"{device_kv_pool.page_size}, size {draft_kv_pool.size} vs "
+            f"{device_kv_pool.size}); page ids would not line up"
+        )
+    padded: list[HostMirrorFamily] = []
+    for family in draft_families:
+        if len(family.layer_tensors) > layer_num:
+            raise ValueError(
+                "flat host mirror: draft pool has more layers than the target "
+                f"({len(family.layer_tensors)} vs {layer_num})"
+            )
+        padded.append(
+            HostMirrorFamily(
+                family.layer_tensors + ((),) * (layer_num - len(family.layer_tensors)),
+                family.rows_per_page,
+            )
+        )
+    return padded + families
+
+
+def flat_bytes_per_host_page(device_kv_pool, draft_kv_pool=None) -> int:
     """Bytes one host page occupies across all mirrors, computed from the
-    device pool alone (no mirror allocation) -- the sizing side of
+    device pools alone (no mirror allocation) -- the sizing side of
     ``FlatHostMirror.bytes_per_host_page`` for host-budget arithmetic.
     """
-    tensors = _identity_dedup(device_kv_pool.k_buffer) + _identity_dedup(
-        device_kv_pool.v_buffer
+    tensors, row_spans, _ = _flatten_families(
+        combined_host_mirror_families(device_kv_pool, draft_kv_pool)
     )
-    page_size = int(device_kv_pool.page_size)
-    kv_bytes = sum(t.element_size() * t[0].numel() * page_size for t in tensors)
-    # State slabs are page-indexed: one constant row per page id.
-    state_bytes = sum(
-        t.element_size() * t[0].numel()
-        for pair in _state_slabs(device_kv_pool)
-        for t in pair
+    return sum(
+        t.element_size() * t[0].numel() * span for t, span in zip(tensors, row_spans)
     )
-    return kv_bytes + state_bytes
 
 
 class FlatHostMirror:
-    """One pinned CPU mirror per DISTINCT device KV tensor plus one per
-    state slab tensor; a (device_page, host_page) pair copies that page's
-    row range on every mirror pair.
+    """One pinned CPU mirror per DISTINCT device tensor the pool declares in
+    ``host_mirror_families()``; a (device_page, host_page) pair copies that
+    page's row range on every mirror pair.
 
-    Slab tensors are enumerated once each -- a page's rows are exactly its
-    owner group's layers, so byte copies are group-safe by id-exclusivity.
+    Aliased slab tensors are enumerated once each -- a page's rows are
+    exactly its owner group's layers, so byte copies are group-safe by
+    id-exclusivity.
 
-    ``tensor_pairs`` order (PINNED, D2 fencing indexes into it): K*, V*,
-    then state tensors flattened in slab order (conv0, ssm0, conv1, ...).
-    KV mirrors span ``page_size`` token rows per page; state slabs are
-    page-indexed (one snapshot row per page id), so their mirrors span 1
-    row per page -- ``row_spans[i]`` carries each pair's span.
+    ``tensor_pairs`` follows the declared family order (D2 fencing indexes
+    into it): for the base K/V layout that is K*, V*, then state tensors in
+    slab order (conv0, ssm0, conv1, ...); MLA declares its fused latent
+    instead, DSA appends packed index-K. A speculative draft pool's families
+    lead the whole list (see ``combined_host_mirror_families``).
+    Token-indexed mirrors span ``page_size`` rows per page, page-indexed ones
+    (state slabs) span 1 -- ``row_spans[i]`` carries each pair's span.
     """
 
-    def __init__(self, device_kv_pool, num_host_pages: int):
+    def __init__(self, device_kv_pool, num_host_pages: int, draft_kv_pool=None):
         self.page_size = int(device_kv_pool.page_size)
         self.num_host_pages = int(num_host_pages)
 
-        # Slab layout dedups the per-layer entries to one K + one V slab per
-        # paired layer set (layers-per-group slabs); legacy layout keeps all
-        # per-layer buffers (dead-row copies are harmless).
-        k_tensors = _identity_dedup(device_kv_pool.k_buffer)
-        v_tensors = _identity_dedup(device_kv_pool.v_buffer)
-        self.num_k_tensors = len(k_tensors)
-
-        k_index = {id(t): i for i, t in enumerate(k_tensors)}
-        v_index = {id(t): i for i, t in enumerate(v_tensors)}
-        # None entries (flat GDN state layers, no KV) map to None: those
-        # layers fence on state_tensor_indices_of_layer instead.
-        self._layer_to_k_index = [
-            None if t is None else k_index[id(t)] for t in device_kv_pool.k_buffer
-        ]
-        # Invariant D2 relies on: a layer's V tensor sits at
-        # tensor_index_of_layer(layer) + num_k_tensors.
-        assert self._layer_to_k_index == [
-            None if t is None else v_index[id(t)] for t in device_kv_pool.v_buffer
-        ], "flat host mirror: K/V dedup orders diverge"
-
-        state_slabs = _state_slabs(device_kv_pool)
-        state_tensors = [t for pair in state_slabs for t in pair]
-
-        # layer -> slab pair index for state layers (identity-matched via
-        # the pool's occurrence-indexed get_state_buffers binding).
-        self._layer_to_state_pair: dict[int, int] = {}
-        if state_slabs:
-            pair_of_conv = {id(conv): n for n, (conv, _) in enumerate(state_slabs)}
-            for layer_id in range(len(device_kv_pool.k_buffer)):
-                try:
-                    conv, _ssm = device_kv_pool.get_state_buffers(layer_id)
-                except ValueError:
-                    continue  # not a state layer
-                self._layer_to_state_pair[layer_id] = pair_of_conv[id(conv)]
+        tensors, row_spans, self._layer_fence = _flatten_families(
+            combined_host_mirror_families(device_kv_pool, draft_kv_pool)
+        )
+        self.layer_num = len(self._layer_fence)
 
         pin = torch.cuda.is_available()
-        kv_pairs = [
-            (
-                dev,
-                torch.zeros(
-                    (self.num_host_pages * self.page_size, *dev.shape[1:]),
-                    dtype=dev.dtype,
-                    pin_memory=pin,
-                ),
-            )
-            for dev in k_tensors + v_tensors
-        ]
-        state_pairs = [
-            (
-                dev,
-                torch.zeros(
-                    (self.num_host_pages, *dev.shape[1:]),
-                    dtype=dev.dtype,
-                    pin_memory=pin,
-                ),
-            )
-            for dev in state_tensors
-        ]
         self.tensor_pairs: tuple[tuple[torch.Tensor, torch.Tensor], ...] = tuple(
-            kv_pairs + state_pairs
+            (
+                dev,
+                torch.zeros(
+                    (self.num_host_pages * span, *dev.shape[1:]),
+                    dtype=dev.dtype,
+                    pin_memory=pin,
+                ),
+            )
+            for dev, span in zip(tensors, row_spans)
         )
-        # Rows one page spans on each pair: page_size token rows for KV,
-        # one page-indexed snapshot row for state slabs.
-        self.row_spans: tuple[int, ...] = (self.page_size,) * len(kv_pairs) + (
-            1,
-        ) * len(state_pairs)
+        self.row_spans: tuple[int, ...] = tuple(row_spans)
 
-    def tensor_index_of_layer(self, layer_id: int) -> int:
-        """Index of layer_id's K tensor in tensor_pairs (paired slab layers
-        share the index); its V tensor is at index + num_k_tensors.
-        Raises ValueError for flat GDN state layers (no KV tensor); fence
-        those on state_tensor_indices_of_layer instead."""
-        index = self._layer_to_k_index[layer_id]
-        if index is None:
-            raise ValueError(f"layer {layer_id} is a state layer; it has no KV mirror")
-        return index
-
-    def state_tensor_indices_of_layer(self, layer_id: int) -> tuple[int, int] | None:
-        """(conv_idx, ssm_idx) of layer_id's state slab pair in tensor_pairs
-        (conv immediately precedes its ssm), or None for layers without
-        state."""
-        pair = self._layer_to_state_pair.get(layer_id)
-        if pair is None:
-            return None
-        base = 2 * self.num_k_tensors + 2 * pair
-        return base, base + 1
+    def fence_tensor_index_of_layer(self, layer_id: int) -> int:
+        """Index in ``tensor_pairs`` of the LAST mirror carrying layer_id's
+        bytes: once that tensor's copy lands the layer is fully readable
+        (the load stream is serial, so the event covers its earlier copies).
+        Paired slab layers share an index -- correct by design."""
+        return self._layer_fence[layer_id]
 
     def bytes_per_host_page(self) -> int:
         return sum(

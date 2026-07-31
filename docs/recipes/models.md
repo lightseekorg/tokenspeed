@@ -130,10 +130,13 @@ radix builds are unaffected by everything below):
   `req_to_page` export is a first-group sample, exact for one group, so the
   table-blind MLA backends (`tokenspeed_mla`, `trtllm_mla`, `flashmla`, `mla`)
   keep reading the right pages.
-- KVStore's host tier (L2) is dropped automatically, with a warning at startup:
-  `FlatHostMirror` describes a pool as one `k_buffer`/`v_buffer` pair per layer
-  and MLA keeps a single fused latent `kv_buffer`. Serving continues on device
-  KV. Pass `--disable-kvstore` to make that explicit.
+- KVStore's host tier (L2) is on. The MLA pool declares its fused latent
+  `kv_buffer` (and, under `per_token_head` quantization, the
+  `k_lora`/`k_scale`/`k_rope` triple) as the tensor family `FlatHostMirror`
+  mirrors, so evicted pages are written back to pinned host memory and loaded
+  back on a prefix hit. Sizing follows `--kvstore-ratio` (default 2.0, i.e.
+  roughly 2x the rank's device KV in pinned host memory) or `--kvstore-size`;
+  pass `--disable-kvstore` to serve on device KV only.
 - EAGLE3/MTP and DFlash speculative decoding are all supported. DFlash block
   decode reads its page tables from `req_to_page`, which the flat path mirrors
   from the full-attention group, so its draft backend opts out of the flat
@@ -293,10 +296,12 @@ tokenspeed serve zai-org/GLM-5.2-FP8 \
 
 On a FlatKV build (`TOKENSPEED_FLAT_KVCACHE=ON`) the command is unchanged: the
 DSA pool inherits the MLA pool's single `full_attention` group, and `DSABackend`
-reads the same `req_to_page` table. KVStore's host tier is dropped automatically
-with a startup warning — the fused latent `kv_buffer` plus packed index-K cannot
-be mirrored by `FlatHostMirror` — so serving continues on device KV. See the
-Kimi K2.5 FlatKV notes above; MTP speculative decoding is supported.
+reads the same `req_to_page` table. KVStore's host tier is on: the DSA pool
+declares the fused latent `kv_buffer` plus the packed index-K buffer as the
+families `FlatHostMirror` mirrors. Index-K is block-split within a page, which
+stays byte-exact only because the mirror copies whole pages. See the Kimi K2.5
+FlatKV notes above for the host-memory sizing knobs; MTP speculative decoding is
+supported.
 
 ## Qwen3 Dense / Qwen3 30B-A3B
 
