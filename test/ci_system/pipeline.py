@@ -580,6 +580,16 @@ def setup_runner(
             check=False,
         )
     if runner.startswith("b200v2-"):
+        # b200v2 nodes do not have a usable IPv6 default route. Persist the
+        # setting for every apt invocation in this runner, including the
+        # later install_deps.sh step.
+        shell_run(
+            "echo 'Acquire::ForceIPv4 \"true\";' | "
+            "sudo tee /etc/apt/apt.conf.d/99tokenspeed-force-ipv4 >/dev/null",
+            env=local_env,
+            cwd=cwd,
+            dry_run=dry_run,
+        )
         # The b200v2 network path intermittently replaces Ubuntu HTTP
         # InRelease responses with a short non-clearsigned payload, which
         # apt reports as NOSPLIT. HTTPS bypasses that HTTP interception.
