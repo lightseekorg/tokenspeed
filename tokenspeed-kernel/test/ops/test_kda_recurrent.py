@@ -38,7 +38,7 @@ def test_kda_chunk_prefill_uses_canonical_k_major_state() -> None:
     """Native prefill preserves the public [N,H,K,V] state layout."""
     device = "cuda"
     torch.manual_seed(3)
-    tokens, heads, key_dim, value_dim = 65, 2, 8, 4
+    tokens, heads, key_dim, value_dim = 65, 2, 16, 4
     q = torch.randn(tokens, heads, key_dim, device=device, dtype=torch.bfloat16)
     k = torch.randn_like(q)
     v = torch.randn(
