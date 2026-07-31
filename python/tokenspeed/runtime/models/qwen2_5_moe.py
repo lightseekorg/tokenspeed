@@ -244,18 +244,51 @@ class Qwen2_5MoeSparseMoeBlock(nn.Module):
         max_num_tokens_per_gpu: int,
         ctx: ForwardContext,
     ) -> torch.Tensor:
+        """DeepEP path: routing on local tokens, dispatch/combine handled by executor."""
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         router_logits, _ = self.gate(hidden_states)
 
+        shared_output = None
+        if self.shared_expert is not None:
+            shared_output = self.shared_expert(hidden_states)
+            if self.mapping.dense.has_tp:
+                from tokenspeed.runtime.distributed.comm_ops import all_reduce
+
+                shared_output = all_reduce(
+                    shared_output,
+                    self.mapping.dense.tp_group,
+                )
+
+        if hidden_states.shape[0] > 0:
+            topk_output = self.topk(hidden_states, router_logits)
+        else:
+            topk_output = self.topk.empty_topk_output(
+                hidden_states.device,
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+            )
+
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
-            router_logits=router_logits,
+            topk_output=topk_output,
             num_global_tokens=num_global_tokens,
             max_num_tokens_per_gpu=max_num_tokens_per_gpu,
-            ctx=ctx,
         )
+
+        if shared_output is not None:
+            if self.shared_expert_gate is not None and hidden_states.shape[0] > 0:
+                from tokenspeed_kernel.ops.activation.triton import fused_gate_sigmoid_mul_add
+
+                fused_gate_sigmoid_mul_add(
+                    hidden_states,
+                    self.shared_expert_gate.weight.squeeze(0),
+                    shared_output,
+                    final_hidden_states,
+                )
+            else:
+                final_hidden_states = final_hidden_states + shared_output
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
