@@ -221,6 +221,112 @@ class MLAPoolGroupPublicationTest(unittest.TestCase):
         self.assertEqual(pool.paged_cache_group_specs[0].group_id, "full_attention")
 
 
+class FlatHostTierAutoDisableTest(unittest.TestCase):
+    """Default ServerArgs + flat ext + MLA/DSA pool must still be servable.
+
+    KVStore has no --enable flag: _handle_kvstore turns it ON for every role
+    but decode/encode, so the DEFAULT K2.5 / GLM-5.2 command line arrives with
+    enable_kvstore=True. The flat host tier cannot mirror a fused latent
+    kv_buffer, so startup auto-disables L2 rather than refusing to serve. This
+    test pins the real default (not a hand-built ServerArgs) against the real
+    pool, because the regression it guards is exactly "default command line
+    fails".
+    """
+
+    def setUp(self):
+        try:
+            import torch
+
+            from tokenspeed.runtime.configs.paged_cache_spec import (
+                flat_host_tier_unsupported_reason,
+            )
+            from tokenspeed.runtime.layers.attention.kv_cache.mla import (
+                MLATokenToKVPool,
+            )
+            from tokenspeed.runtime.utils.server_args import prepare_server_args
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs the tokenspeed runtime deps: {exc}")
+        self.torch = torch
+        self.reason = flat_host_tier_unsupported_reason
+        self.MLATokenToKVPool = MLATokenToKVPool
+        self.prepare_server_args = prepare_server_args
+
+    def _mla_pool(self, **overrides):
+        kwargs = dict(
+            size=64,
+            dtype=self.torch.bfloat16,
+            model_dtype=self.torch.bfloat16,
+            quant_method="",
+            kv_lora_rank=32,
+            qk_rope_head_dim=8,
+            layer_num=2,
+            device="cpu",
+            enable_memory_saver=False,
+            max_batch_size=2,
+            max_context_len=128,
+            page_size=16,
+            rank=0,
+            enable_alt_stream=False,
+        )
+        kwargs.update(overrides)
+        with mock.patch(_FLAT_PROBE, return_value=True):
+            return self.MLATokenToKVPool(**kwargs)
+
+    def test_default_server_args_enable_kvstore(self):
+        # The premise of the auto-disable: nobody has to opt in to L2.
+        args = self.prepare_server_args(["some-model"])
+        self.assertFalse(args.disable_kvstore)
+        self.assertTrue(args.enable_kvstore)
+
+    def test_mla_pool_reports_host_tier_gap(self):
+        reason = self.reason(self._mla_pool())
+        self.assertIsNotNone(reason)
+        self.assertIn("MLATokenToKVPool", reason)
+
+    def test_default_args_plus_mla_pool_downgrades_instead_of_failing(self):
+        # The startup decision EventLoop.__init__ makes, composed here from the
+        # real default args and the real pool: L2 off, serving still possible.
+        args = self.prepare_server_args(["some-model"])
+        pool = self._mla_pool()
+        if self.reason(pool) is not None:
+            args.enable_kvstore = False
+        self.assertFalse(args.enable_kvstore)
+
+    def test_mha_pool_keeps_the_host_tier(self):
+        # The downgrade must be narrow: MHA pools do expose k_buffer/v_buffer
+        # and must keep L2 on a flat build.
+        try:
+            from tokenspeed.runtime.layers.attention.kv_cache.mha import (
+                MHATokenToKVPool,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+        with mock.patch(_FLAT_PROBE, return_value=True):
+            pool = MHATokenToKVPool(
+                size=32,
+                dtype=self.torch.bfloat16,
+                head_num=1,
+                head_dim=8,
+                layer_num=2,
+                device="cpu",
+                enable_memory_saver=False,
+                max_batch_size=2,
+                max_context_len=64,
+                page_size=16,
+                rank=0,
+                enable_alt_stream=False,
+            )
+        self.assertIsNone(self.reason(pool))
+
+    def test_contract_pool_is_left_to_its_own_guard(self):
+        # Kimi-K3's FlatHybridCachePool has a dedicated message; this helper
+        # must not shadow it by silently downgrading instead.
+        class FakeContractPool:
+            runtime_contract = object()
+
+        self.assertIsNone(self.reason(FakeContractPool()))
+
+
 class MLAConfigFieldOrderTest(unittest.TestCase):
     """DSAConfig must stay constructible after MLAConfig gained a default.
 

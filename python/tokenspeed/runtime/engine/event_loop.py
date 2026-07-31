@@ -42,6 +42,7 @@ from tokenspeed.runtime.cache.executor.memory_executor import (
 from tokenspeed.runtime.cache.transfer.types import PAGED_CACHE_KIND, CacheKind
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.configs.paged_cache_spec import (
+    flat_host_tier_unsupported_reason,
     preflight_kimi_k3_flat_consumers,
     scheduler_ext_flat_kvcache,
     validate_flat_scheduler_config,
@@ -245,6 +246,25 @@ class EventLoop:
             draft_token_to_kv_pool,
         )
 
+        # KVStore has no explicit enable flag -- it is ON by default for every
+        # role but decode/encode (_handle_kvstore), so a pool the flat host
+        # tier cannot mirror would make the DEFAULT command line unservable
+        # (MLA/DSA: Kimi-K2.5, GLM-5.2). L2 is a capacity optimization, never
+        # a correctness requirement, so drop it and say so -- the same
+        # auto-disable _handle_kvstore already applies to the decode/encode
+        # roles. Runs before ModelExecutorConfig/CUDA-graph capture read
+        # enable_kvstore, and only ever turns the flag off.
+        if scheduler_ext_flat_kvcache() and server_args.enable_kvstore:
+            host_tier_gap = flat_host_tier_unsupported_reason(token_to_kv_pool)
+            if host_tier_gap is not None:
+                logger.warning(
+                    "Disabling the KVStore host tier on this flat scheduler "
+                    "build: %s. Serving continues with device KV only; pass "
+                    "--disable-kvstore to make this explicit.",
+                    host_tier_gap,
+                )
+                server_args.enable_kvstore = False
+
         self._scheduler_cache_geometry = scheduler_cache_geometry_from_pool(
             token_to_kv_pool,
             fallback_token_capacity=self.max_total_num_tokens,
@@ -371,17 +391,16 @@ class EventLoop:
                     "the flat host tier (kvstore L2) does not support FlatKV "
                     "contract pools (Kimi-K3) yet; pass --disable-kvstore."
                 )
-            if not hasattr(token_to_kv_pool, "k_buffer"):
-                # FlatHostMirror mirrors the MHA k_buffer/v_buffer tensor
-                # pair per layer; MLA/DSA keep one fused latent `kv_buffer`
-                # (plus DSA's packed index-K), which that mirror cannot
-                # describe. Reject at startup instead of dying on an
-                # AttributeError inside FlatMemoryExecutor.__init__.
+            host_tier_gap = flat_host_tier_unsupported_reason(token_to_kv_pool)
+            if host_tier_gap is not None:
+                # Unreachable in normal startup: the auto-disable above already
+                # cleared enable_kvstore for exactly this predicate. Kept as a
+                # cheap invariant so a future reordering surfaces here with the
+                # cause named, instead of as an AttributeError on
+                # `device_pool.k_buffer` deep inside FlatMemoryExecutor.
                 raise NotImplementedError(
-                    "the flat host tier (kvstore L2) mirrors the MHA "
-                    "k_buffer/v_buffer layout, which "
-                    f"{type(token_to_kv_pool).__name__} (fused MLA/DSA latent "
-                    "cache) does not expose; pass --disable-kvstore."
+                    f"the flat host tier (kvstore L2) cannot mirror this KV "
+                    f"pool: {host_tier_gap}; pass --disable-kvstore."
                 )
             self.memory_executor = FlatMemoryExecutor(
                 device_pool=token_to_kv_pool,

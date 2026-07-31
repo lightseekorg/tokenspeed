@@ -122,6 +122,21 @@ tokenspeed serve nvidia/Kimi-K2.5-NVFP4 \
 For K2.6, keep the same parameter shape and change the checkpoint and parser
 only if the model card requires a different value.
 
+FlatKV notes (a `tokenspeed_scheduler` built with `TOKENSPEED_FLAT_KVCACHE=ON`;
+radix builds are unaffected by everything below):
+
+- The launch command is unchanged. The MLA pool publishes a single
+  `full_attention` cache group, which is all the flat scheduler needs: its
+  `req_to_page` export is a first-group sample, exact for one group, so the
+  table-blind MLA backends (`tokenspeed_mla`, `trtllm_mla`, `flashmla`, `mla`)
+  keep reading the right pages.
+- KVStore's host tier (L2) is dropped automatically, with a warning at startup:
+  `FlatHostMirror` describes a pool as one `k_buffer`/`v_buffer` pair per layer
+  and MLA keeps a single fused latent `kv_buffer`. Serving continues on device
+  KV. Pass `--disable-kvstore` to make that explicit.
+- EAGLE3/MTP speculative decoding is supported. **DFlash is not** — the flat
+  build rejects it at startup; use a radix build for the DFlash recipe below.
+
 To enable a compatible DFlash draft model, keep the target launch shape and add
 the draft model path plus DFlash speculative decoding options:
 
@@ -273,6 +288,13 @@ tokenspeed serve zai-org/GLM-5.2-FP8 \
   --host 0.0.0.0 \
   --port 8000
 ```
+
+On a FlatKV build (`TOKENSPEED_FLAT_KVCACHE=ON`) the command is unchanged: the
+DSA pool inherits the MLA pool's single `full_attention` group, and `DSABackend`
+reads the same `req_to_page` table. KVStore's host tier is dropped automatically
+with a startup warning — the fused latent `kv_buffer` plus packed index-K cannot
+be mirrored by `FlatHostMirror` — so serving continues on device KV. See the
+Kimi K2.5 FlatKV notes above; MTP speculative decoding is supported.
 
 ## Qwen3 Dense / Qwen3 30B-A3B
 

@@ -78,6 +78,37 @@ def preflight_kimi_k3_flat_consumers(*model_configs: object | None) -> None:
                 raise RuntimeError(_KIMI_K3_FLATKV_REQUIRED_DIAGNOSTIC)
 
 
+def flat_host_tier_unsupported_reason(kv_pool: object) -> str | None:
+    """Why the flat host tier (kvstore L2) cannot mirror ``kv_pool``, or None.
+
+    ``FlatHostMirror`` describes a device pool as one (k, v) tensor pair per
+    layer (``cache/flat_host_mirror.py``), and ``FlatMemoryExecutor`` sizes
+    itself off ``len(device_pool.k_buffer)``. MLA and its DSA subclass keep a
+    single fused latent ``kv_buffer`` (plus DSA's packed index-K) instead, so
+    that mirror cannot describe them.
+
+    Contract pools (Kimi-K3 ``FlatHybridCachePool``) are deliberately NOT
+    reported here: they have their own dedicated startup guard, and their
+    raw-slab layout is a separate gap with its own message.
+
+    Args:
+        kv_pool: The device KV pool the flat host tier would mirror.
+
+    Returns:
+        A human-readable reason string when the host tier is impossible for
+        this pool, else None.
+    """
+    if getattr(kv_pool, "runtime_contract", None) is not None:
+        return None
+    if not hasattr(kv_pool, "k_buffer"):
+        return (
+            f"{type(kv_pool).__name__} keeps a fused latent kv_buffer instead "
+            "of the per-layer k_buffer/v_buffer pair the flat host mirror "
+            "describes"
+        )
+    return None
+
+
 def scheduler_ext_flat_kvcache() -> bool:
     """True iff the installed tokenspeed_scheduler ext was built with
     TOKENSPEED_FLAT_KVCACHE. A missing package or an older / radix-built
@@ -773,6 +804,7 @@ __all__ = [
     "STATE_LAYER_TYPES",
     "compute_max_logical_pages_for_capture",
     "compute_paged_cache_group_page_counts",
+    "flat_host_tier_unsupported_reason",
     "group_specs_from_layer_types",
     "hybrid_slab_group_size",
     "layer_group_ids",
