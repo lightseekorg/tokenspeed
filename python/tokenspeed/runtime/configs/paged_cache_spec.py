@@ -191,26 +191,6 @@ def hybrid_slab_group_size(
     return max(counts.values())
 
 
-def _validate_kernel_page_size(
-    kv_pool: object, attn_backend: object, pool_name: str
-) -> None:
-    """Reject a kernel page size that disagrees with the LCM plan."""
-    plan = getattr(kv_pool, "_lcm_memory_plan", None)
-    if plan is None:
-        return
-    plan_tokens = int(plan.logical_block_tokens)
-    backend = _flat_kv_backend(attn_backend)
-    page_size = getattr(backend, "page_size", None)
-    if page_size is None or int(page_size) == plan_tokens:
-        return
-    raise RuntimeError(
-        f"attention backend {type(backend).__name__} uses page_size="
-        f"{int(page_size)} but KV pool {pool_name} plans P={plan_tokens} tokens "
-        "per logical block; the backend's page table and req_to_page would be "
-        f"sized differently. Pass --block-size {plan_tokens}."
-    )
-
-
 def _flat_kv_backend(attn_backend: object) -> object:
     """The backend whose KV-table consumption matters for flat safety: the
     backend itself, or a composite's full-attention sub-backend (hybrid's
@@ -313,7 +293,6 @@ def validate_flat_scheduler_config(
             "(e.g. mamba/state-only pools). Use a radix-built "
             "tokenspeed_scheduler extension for this model."
         )
-    _validate_kernel_page_size(kv_pool, attn_backend, pool_name)
     if contract is not None:
         required_families = frozenset(spec.family for spec in contract.group_specs)
         supported_families = frozenset(
