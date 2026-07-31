@@ -361,6 +361,60 @@ def test_latent_moe_runtime_preserves_widths_and_reduction_order() -> None:
     assert events[-1] == "shared_reduce"
 
 
+def test_latent_moe_uses_injected_input_projections() -> None:
+    events: list[str] = []
+
+    def input_projections(
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        events.append("projections")
+        return (
+            _TRACE_FNS["router"](hidden_states),
+            _TRACE_FNS["down"](hidden_states),
+            _TRACE_FNS["shared"](hidden_states),
+        )
+
+    layer = _layer(
+        events,
+        routed_norm=_Trace(events, "norm"),
+        shared_experts=_Trace(events, "shared"),
+        input_projections=input_projections,
+    )
+    hidden_states = torch.arange(12, dtype=torch.float32).view(3, 4)
+
+    actual = layer(hidden_states)
+
+    latent = hidden_states[:, :2] + 1 + 3
+    expected = torch.cat((latent, torch.zeros_like(latent)), dim=-1) + hidden_states * 4
+    torch.testing.assert_close(actual, expected)
+    # One fused projection replaces the router, routed-down, and shared modules.
+    assert events.count("projections") == 1
+    assert "router" not in events
+    assert "down" not in events
+    assert "shared" not in events
+
+
+def test_latent_moe_falls_back_when_input_projections_declines() -> None:
+    events: list[str] = []
+
+    layer = _layer(
+        events,
+        routed_norm=_Trace(events, "norm"),
+        shared_experts=_Trace(events, "shared"),
+        input_projections=lambda hidden_states: None,
+    )
+    hidden_states = torch.arange(12, dtype=torch.float32).view(3, 4)
+
+    layer(hidden_states)
+
+    assert {"router", "down", "shared"} <= set(events)
+
+
+def test_latent_moe_rejects_input_projections_without_shared_experts() -> None:
+    with pytest.raises(ValueError, match="input_projections requires shared_experts"):
+        _layer([], input_projections=lambda hidden_states: None)
+
+
 def test_latent_moe_jointly_reduces_shared_and_routed_partials() -> None:
     events: list[str] = []
 

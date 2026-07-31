@@ -9,6 +9,58 @@ from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
+# Column tiles of a fused projection GEMM must not straddle a projection
+# boundary, so every projection width has to be a multiple of the tile width.
+REGION_ALIGNMENT = 128
+
+
+def fused_weight_view(
+    router_weight: torch.Tensor,
+    routed_weight: torch.Tensor,
+    shared_gate_up_weight: torch.Tensor,
+) -> torch.Tensor | None:
+    """Return the single tensor backing three consecutive projection weights.
+
+    Returns ``None`` unless the three weights are contiguous rows of one
+    allocation in router/routed/shared order, which is what lets one GEMM read
+    them as a single operand.
+    """
+    parts = (router_weight, routed_weight, shared_gate_up_weight)
+    if not all(part.ndim == 2 and part.is_contiguous() for part in parts):
+        return None
+    hidden_size = router_weight.shape[1]
+    if any(part.shape[1] != hidden_size for part in parts):
+        return None
+    # Adjacent addresses alone are not enough: separate allocations can land
+    # back to back, and reading across them would run off the end of the first.
+    storage = router_weight.untyped_storage()
+    if any(part.untyped_storage().data_ptr() != storage.data_ptr() for part in parts):
+        return None
+    row_bytes = hidden_size * router_weight.element_size()
+    address = router_weight.data_ptr()
+    for part in parts:
+        if part.data_ptr() != address:
+            return None
+        address += part.shape[0] * row_bytes
+    if address > storage.data_ptr() + storage.nbytes():
+        return None
+    total_rows = sum(part.shape[0] for part in parts)
+    return router_weight.as_strided((total_rows, hidden_size), (hidden_size, 1))
+
+
+def _weights_fused(hidden_size: int, weights: tuple[torch.Tensor, ...]) -> bool:
+    """Return whether one GEMM can read the three weights as a single operand.
+
+    Beyond sharing an allocation, every projection width must be a multiple of
+    the column-tile width so that no tile straddles two projections and the
+    epilogue stays uniform across a program.
+    """
+    if fused_weight_view(*weights) is None:
+        return False
+    return hidden_size % 64 == 0 and all(
+        weight.shape[0] % REGION_ALIGNMENT == 0 for weight in weights
+    )
+
 
 def moe_input_projections(
     hidden_states: torch.Tensor,
@@ -76,6 +128,7 @@ def moe_input_projections(
         "inputs_contiguous": all(
             tensor.is_contiguous() for tensor in (hidden_states, *weights)
         ),
+        "weights_fused": _weights_fused(hidden_size, weights),
     }
     try:
         kernel = select_kernel(
@@ -131,4 +184,4 @@ def moe_input_projections(
     return router_logits, routed_input, shared_input
 
 
-__all__ = ["moe_input_projections"]
+__all__ = ["fused_weight_view", "moe_input_projections"]

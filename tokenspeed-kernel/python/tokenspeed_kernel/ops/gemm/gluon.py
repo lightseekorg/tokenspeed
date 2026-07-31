@@ -27,6 +27,7 @@ dispatch falls back to the portable torch GEMM implementation.
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.gemm.moe_input_projections import fused_weight_view
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -36,6 +37,9 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 if current_platform().is_amd:
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.fused_moe_input_projections_gfx950 import (
+        gluon_fused_moe_input_projections_gfx950 as _fused_moe_input_projections_impl,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.moe_input_projections_gfx950 import (
         gluon_moe_input_projections_gfx950 as _moe_input_projections_impl,
     )
@@ -76,6 +80,50 @@ if current_platform().is_amd:
             kwargs["router_weight"],
             kwargs["routed_weight"],
             kwargs["shared_gate_up_weight"],
+            beta=kwargs["gate_clamp"],
+            linear_beta=kwargs["up_clamp"],
+        )
+
+    @register_kernel(
+        "gemm",
+        "moe_input_projections",
+        name="gluon_fused_moe_input_projections_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    hidden_states=dense_tensor_format(torch.bfloat16),
+                    router_weight=dense_tensor_format(torch.bfloat16),
+                    routed_weight=dense_tensor_format(torch.bfloat16),
+                    shared_gate_up_weight=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        # Below the single-token specialist, which still wins at one token,
+        # and above the portable Triton kernel. Past ~128 tokens the tiling
+        # here loses to that kernel, so the trait stops short of it.
+        priority=Priority.SPECIALIZED - 1,
+        traits={
+            "weights_fused": frozenset({True}),
+            "inputs_contiguous": frozenset({True}),
+            "tokens": frozenset(range(1, 129)),
+        },
+    )
+    def gluon_fused_moe_input_projections_gfx950(**kwargs):
+        weights = (
+            kwargs["router_weight"],
+            kwargs["routed_weight"],
+            kwargs["shared_gate_up_weight"],
+        )
+        return _fused_moe_input_projections_impl(
+            kwargs["hidden_states"],
+            *weights,
+            fused_weight_view(*weights),
             beta=kwargs["gate_clamp"],
             linear_beta=kwargs["up_clamp"],
         )

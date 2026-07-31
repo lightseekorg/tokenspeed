@@ -78,6 +78,7 @@ from tokenspeed_kernel.ops.gemm import (
     kimi3_router_projection,
     kimi3_shared_down_projection,
     kimi3_shared_situ_projection,
+    moe_input_projections,
 )
 from tokenspeed_kernel.ops.gemm.triton_gemv import (
     decode_gemv,
@@ -1066,6 +1067,7 @@ class KimiLinearMoE(nn.Module):
             activation_situ_beta=situ_beta,
             activation_situ_linear_beta=situ_linear_beta,
         )
+        self.input_projection_weight: torch.Tensor | None = None
         self.native_latent_moe = (
             LatentMoELayer(
                 router=self.gate,
@@ -1090,10 +1092,68 @@ class KimiLinearMoE(nn.Module):
                 ),
                 expert_parallel_group=mapping.moe.ep_group,
                 return_separate_outputs=True,
+                input_projections=self._fused_input_projections,
             )
             if self.execution_plan.use_native
             else None
         )
+
+    def fuse_input_projection_weights(self) -> None:
+        """Back the router, routed-down, and shared gate/up weights with one tensor.
+
+        The three projections consume the same activation and reduce over the
+        same width, so one ``[experts + latent + 2 * shared, hidden]`` weight
+        lets a single GEMM replace three. Each module keeps a contiguous row
+        view of that tensor, so the rebinding adds no steady-state memory and
+        leaves every unfused composition working unchanged.
+        """
+        if not bool(
+            getattr(self.shared_experts, "_has_unquantized_shared_weights", False)
+        ):
+            return
+        modules = (
+            self.gate,
+            self.routed_expert_down_proj,
+            self.shared_experts.gate_up_proj,
+        )
+        # Held so the row views stay alive; deliberately not a registered
+        # buffer, which would duplicate every projection in the state dict.
+        # Any layout a fused GEMM cannot read is caught downstream by
+        # ``fused_weight_view``, which leaves the composition in place.
+        self.input_projection_weight = torch.cat(
+            [module.weight for module in modules], dim=0
+        )
+        offset = 0
+        for module in modules:
+            rows = module.weight.shape[0]
+            module.weight.data = self.input_projection_weight.narrow(0, offset, rows)
+            offset += rows
+
+    def _fused_input_projections(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Project the router, routed latent, and shared partial in one pass.
+
+        Returns ``None`` before the projection weights are concatenated, which
+        leaves the caller on the separate per-module projections.
+        """
+        if self.input_projection_weight is None:
+            return None
+        router_logits, routed_input, shared_input = moe_input_projections(
+            hidden_states,
+            self.gate.weight,
+            self.routed_expert_down_proj.weight,
+            self.shared_experts.gate_up_proj.weight,
+            gate_clamp=self.shared_experts.act_fn.beta,
+            up_clamp=self.shared_experts.act_fn.linear_beta,
+        )
+        # The shared experts hold reduce_results=False, so this partial is
+        # reduced by the layer's shared or joint reducer, not here.
+        shared_output = kimi3_shared_down_projection(
+            shared_input,
+            self.shared_experts.down_proj.weight,
+        )
+        return router_logits, routed_input, shared_output
 
     def _routed_experts(
         self,
@@ -1883,6 +1943,10 @@ class KimiLinearForCausalLM(BaseCausalLM):
                 layer.mlp_res_norm.weight.float()
                 * layer.mlp_res_proj.weight.reshape(-1).float()
             ).to(torch.bfloat16)
+
+        for layer in self.model.layers:
+            if getattr(layer, "is_moe_layer", False):
+                layer.block_sparse_moe.fuse_input_projection_weights()
 
 
 # ===----------------------------------------------------------------------=== #
