@@ -90,10 +90,10 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx1250.attention.mha.prefill import (
         gluon_mha_prefill_gfx1250 as _prefill_gfx1250_impl,
     )
-    from tokenspeed_kernel_amd.ops.gfx1250.attention.mla._common import (
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.decode import (
         gluon_mla_decode_bf16_gfx1250 as _mla_decode_bf16_gfx1250_impl,
     )
-    from tokenspeed_kernel_amd.ops.gfx1250.attention.mla._common import (
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.extend import (
         gluon_mla_extend_bf16_gfx1250 as _mla_extend_bf16_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.prefill import (

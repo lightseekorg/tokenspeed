@@ -26,7 +26,7 @@ from typing import NamedTuple
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon
-from tokenspeed_kernel_amd.ops.attention.gluon.utils import (
+from tokenspeed_kernel_amd.ops.gfx1250.attention._common import (
     _INV_LN2_VALUE,
     _LN2,
     InputStrides,
