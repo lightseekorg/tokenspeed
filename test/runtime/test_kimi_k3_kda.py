@@ -2,7 +2,8 @@
 
 Coverage:
 
-- per-group KDA state metadata: ``state_in_pages`` / ``state_out_pages``
+- per-group KDA state metadata: ``state_in_pages_by_group`` /
+  ``state_out_pages_by_group``
   mappings keyed by state group id, dual-index computed ONCE per group per
   batch, with a proof the three groups' indices are independent and selected
   per layer via ``pool.group_id_for_layer``;
@@ -245,7 +246,6 @@ def test_dual_index_reuses_one_slot_plan_and_groups_are_independent(
     assert plan_calls == 1
 
     md = backend.forward_metadata
-    assert md.state_in_pages is None and md.state_out_pages is None
     assert tuple(sorted(md.state_in_pages_by_group)) == _STATE_GROUPS
     assert tuple(sorted(md.state_out_pages_by_group)) == _STATE_GROUPS
     for group_id in _STATE_GROUPS:

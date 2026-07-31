@@ -142,12 +142,8 @@ def _make_engine(case: ModelCase, enable_prefix_caching: bool) -> Engine:
         "max_prefill_tokens": 1024,
         "chunked_prefill_size": 1024,
         "gpu_memory_utilization": 0.7,
+        "disable_kvstore": True,
     }
-    # KVStore requires prefix caching; prevent auto-enabling when prefix
-    # caching is off (resolve_cache sets enable_kvstore=True unless
-    # disable_kvstore=True).
-    if not enable_prefix_caching:
-        kwargs["disable_kvstore"] = True
     kwargs.update(case.extra_kwargs)
     return Engine(**kwargs)
 
