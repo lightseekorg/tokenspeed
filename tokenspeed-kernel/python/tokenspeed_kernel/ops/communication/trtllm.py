@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 import logging
+import os
 
 import torch
 import torch.distributed as dist
@@ -57,24 +58,142 @@ trtllm_create_ipc_workspace_for_minimax = error_fn
 
 if current_platform().is_nvidia:
     from tokenspeed_kernel.thirdparty.cuda.trtllm import (
+        _MNNVL_SUPPORTED_WORLD_SIZES,
+        MNNVL_ONESHOT_MAX_TOKEN,
+        MNNVL_PREFER_IPC_BYTES,
         AllGatherFusionPattern,
         AllReduceFusionPattern,
         ReduceScatterFusionPattern,
+        _ar_should_use_oneshot,
+        _load_trtllm_comm_module,
         minimax_allreduce_rms_qk,
         trtllm_allgather_fusion,
         trtllm_allreduce_fusion,
         trtllm_create_ipc_workspace_for_all_reduce_fusion,
         trtllm_create_ipc_workspace_for_minimax,
+        trtllm_create_mnnvl_workspace_for_all_reduce_fusion,
         trtllm_destroy_ipc_workspace_for_all_reduce_fusion,
         trtllm_reducescatter_fusion,
     )
 
     _workspace_manager = None
 
+    def _mnnvl_locally_available(world_size: int) -> bool:
+        """Non-collective capability probe for the MNNVL one-shot AR path.
+
+        Checks the compiled kernel symbol, torch symmetric-memory support and
+        NVLS multicast availability on this device. Purely local: safe to call
+        before any collective.
+        """
+        # Single source of truth: the kernel's own list. A duplicated literal
+        # here silently gated out world 16 even after the kernel gained it --
+        # the correctness suite passed (it calls the creator directly) while
+        # end-to-end serving found no workspace at all.
+        if world_size not in _MNNVL_SUPPORTED_WORLD_SIZES:
+            return False
+        try:
+            if torch.cuda.get_device_capability()[0] < 9:
+                return False
+            from torch._C._autograd import DeviceType
+            from torch._C._distributed_c10d import _SymmetricMemory
+            from torch.distributed import _symmetric_memory  # noqa: F401
+
+            if not _SymmetricMemory.has_multicast_support(
+                DeviceType.CUDA, torch.cuda.current_device()
+            ):
+                return False
+            return hasattr(_load_trtllm_comm_module(), "trtllm_mnnvl_allreduce_fusion")
+        except Exception as exc:  # noqa: BLE001 - capability probe must not raise
+            logger.debug("mnnvl capability probe failed: %s", exc)
+            return False
+
+    def _try_create_mnnvl_workspace(
+        rank: int,
+        world_size: int,
+        max_token_num: int,
+        hidden_dim: int,
+        group,
+    ):
+        """Collectively arm the mnnvl workspace; returns None on fallback.
+
+        Two-phase agreement so every rank takes the same path: (1) all-reduce
+        the local capability probe before the symm_mem rendezvous, (2)
+        all-reduce the creation result. No environment knobs: capability
+        auto-detection only.
+        """
+        device = torch.device("cuda", torch.cuda.current_device())
+        ok = torch.tensor(
+            [1 if _mnnvl_locally_available(world_size) else 0],
+            dtype=torch.int32,
+            device=device,
+        )
+        dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=group)
+        if ok.item() == 0:
+            return None
+
+        workspace = None
+        try:
+            workspace = trtllm_create_mnnvl_workspace_for_all_reduce_fusion(
+                rank, world_size, max_token_num, hidden_dim, group=group
+            )
+        except Exception as exc:  # noqa: BLE001 - fall back to the IPC path
+            logger.warning("mnnvl workspace creation failed, using IPC: %s", exc)
+
+        ok = torch.tensor(
+            [1 if workspace is not None else 0], dtype=torch.int32, device=device
+        )
+        dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=group)
+        if ok.item() == 0:
+            return None
+        logger.info(
+            "MNNVL one-shot AR workspace armed: rank=%s world_size=%s "
+            "max_token_num=%s hidden_dim=%s buffer=%s bytes",
+            rank,
+            world_size,
+            workspace.max_token_num,
+            hidden_dim,
+            workspace.buffer_size_bytes,
+        )
+        return workspace
+
+    def _group_spans_nodes(group) -> bool:
+        """True when the process group spans hosts.
+
+        CUDA-IPC handles cannot cross a node boundary, and a failed creation
+        attempt does not merely fail -- it leaves a sticky CUDA context error
+        that kills the next allocation. So this must be decided before trying,
+        not caught afterwards.
+        """
+        import socket
+
+        try:
+            world = (
+                dist.get_world_size(group)
+                if group is not None
+                else dist.get_world_size()
+            )
+            names = [None] * world
+            dist.all_gather_object(names, socket.gethostname(), group=group)
+            return len(set(names)) > 1
+        except Exception:  # noqa: BLE001 -- no distributed context: single node
+            return False
+
+    def _skip_ipc_workspace(group) -> bool:
+        """Whether to skip arming the CUDA-IPC workspace for *group*.
+
+        Auto-detected so a cross-node run is safe by default;
+        TOKENSPEED_TRTLLM_AR_SKIP_IPC=0/1 forces the decision.
+        """
+        override = os.getenv("TOKENSPEED_TRTLLM_AR_SKIP_IPC")
+        if override is not None:
+            return override == "1"
+        return _group_spans_nodes(group)
+
     class TrtllmFusionWorkspaceManager:
         def __init__(self):
             self.workspace_tensor = None
             self.ipc_handles = None
+            self.mnnvl_workspace = None
             self.world_size = None
             self.rank = None
             self.max_token_num = None
@@ -105,17 +224,45 @@ if current_platform().is_nvidia:
                 return
 
             self.cleanup()
-            # allreduce_fusion, allgather_fusion, reducescatter_fusion all use the same workspace to create entry
-            self.ipc_handles, self.workspace_tensor = (
-                trtllm_create_ipc_workspace_for_all_reduce_fusion(
-                    rank,
-                    world_size,
-                    max_token_num,
-                    hidden_dim,
-                    group=group,
-                    use_fp32_lamport=use_fp32_lamport,
+            # LOCAL PATCH (cross-node MNNVL test, 2026-07-30): CUDA-IPC handles
+            # cannot span nodes -- attempting creation on a cross-node group
+            # fails AND leaves a sticky CUDA context error (observed as
+            # 'invalid resource handle' on the next allocation). Gate it off
+            # for cross-node runs; the MNNVL fabric workspace below is the
+            # multi-node path.
+            _skip_ipc = _skip_ipc_workspace(group)
+            if _skip_ipc:
+                self.ipc_handles, self.workspace_tensor = None, None
+            else:
+                # allreduce_fusion, allgather_fusion, reducescatter_fusion all use the same workspace to create entry
+                self.ipc_handles, self.workspace_tensor = (
+                    trtllm_create_ipc_workspace_for_all_reduce_fusion(
+                        rank,
+                        world_size,
+                        max_token_num,
+                        hidden_dim,
+                        group=group,
+                        use_fp32_lamport=use_fp32_lamport,
+                    )
                 )
+            # Additionally arm the MNNVL one-shot AR workspace (NVLS multicast
+            # + Lamport rotation). Capability auto-detected; the IPC workspace
+            # above stays as the always-available fallback and continues to
+            # serve allgather/reducescatter and unsupported AR shapes.
+            self.mnnvl_workspace = _try_create_mnnvl_workspace(
+                rank, world_size, max_token_num, hidden_dim, group
             )
+
+            # LOCAL PATCH: with IPC skipped, mnnvl is the only workspace; if it
+            # failed to arm there is nothing to fuse with -- stay uninitialized
+            # so prepare_allreduce_fusion() returns False and the model layer
+            # keeps the plain NCCL path.
+            if self.workspace_tensor is None and self.mnnvl_workspace is None:
+                logger.warning(
+                    "trtllm AR: no workspace available (ipc skipped, mnnvl "
+                    "failed); fusion disabled for this group"
+                )
+                return
 
             self.world_size = world_size
             self.rank = rank
@@ -134,16 +281,28 @@ if current_platform().is_nvidia:
 
         def cleanup(self):
             """Clean up workspace"""
-            if self.initialized and self.ipc_handles is not None:
+            # Keyed on resource presence, not just the initialized flag: a
+            # failed re-arm can leave ipc_handles set with initialized=False,
+            # and skipping the destroy then would orphan them.
+            if self.initialized or self.ipc_handles is not None:
                 try:
-                    trtllm_destroy_ipc_workspace_for_all_reduce_fusion(
-                        self.ipc_handles, group=self.group
-                    )
+                    # Cross-node groups arm mnnvl only; there is no IPC
+                    # workspace to destroy, but the state reset below must
+                    # still run or a re-init leaks the symm_mem allocation and
+                    # a failed re-arm leaves initialized=True with no
+                    # workspace behind it.
+                    if self.ipc_handles is not None:
+                        trtllm_destroy_ipc_workspace_for_all_reduce_fusion(
+                            self.ipc_handles, group=self.group
+                        )
                 except Exception as e:
                     logger.warning(f"Failed to cleanup TRT-LLM fusion workspace: {e}")
                 finally:
                     self.workspace_tensor = None
                     self.ipc_handles = None
+                    # symm_mem allocations are process-lifetime; dropping the
+                    # reference is all we can (and need to) do here.
+                    self.mnnvl_workspace = None
                     self.initialized = False
                     self.world_size = None
                     self.rank = None
@@ -216,6 +375,73 @@ if current_platform().is_nvidia:
 
         return _workspace_manager.initialized
 
+    def _ar_fusion_workspace(
+        token_num: int,
+        hidden_dim: int,
+        dtype: torch.dtype,
+        pattern_code: int,
+        use_oneshot: bool,
+        residual_reduce_scattered: bool = False,
+    ):
+        """Pick the AR workspace for one call: mnnvl when eligible, else IPC.
+
+        Tier 2 of AR dispatch (Tier 1 chose the trtllm backend in auto.py).
+        Decision, first match wins:
+          1. IPC exists (single-node) AND (payload >= MNNVL_PREFER_IPC_BYTES
+             OR pattern == kAllReduceLatentNorm) ....... IPC lamport/twoshot
+          2. mnnvl supports this shape ................. mnnvl (one-shot <=128
+             tokens, two-shot 129..2048; device picks by token count)
+          3. no IPC fallback (cross-node) ............. None (caller degrades:
+             the rmsnorm family runs unfused NCCL + torch epilogue, the rest
+             raise loudly -- never a null workspace into the kernel)
+          4. otherwise ................................ IPC
+        Cross-node, workspace_tensor is None so only 2/3 apply -- mnnvl serves
+        the whole range (it beats NCCL everywhere there).
+        """
+        mnnvl = _workspace_manager.mnnvl_workspace
+        # Byte-based split between the two fused workspaces: multicast (mnnvl)
+        # for small payloads, IPC lamport once bandwidth dominates. Only bites
+        # single-node -- cross-node workspace_tensor is None and mnnvl is the
+        # only option. See MNNVL_PREFER_IPC_BYTES for the measurement.
+        from tokenspeed_kernel.thirdparty.cuda.trtllm import AllReduceFusionPattern
+
+        payload_bytes = token_num * hidden_dim * dtype.itemsize
+        # Prefer IPC when it exists (single node) for large payloads, and for
+        # latent-norm whose wide lane the mnnvl geometry handles slightly worse.
+        # Cross-node workspace_tensor is None, so mnnvl serves both.
+        prefer_ipc = payload_bytes >= MNNVL_PREFER_IPC_BYTES or (
+            pattern_code == AllReduceFusionPattern.kAllReduceLatentNorm
+        )
+        if _workspace_manager.workspace_tensor is not None and prefer_ipc:
+            return _workspace_manager.workspace_tensor
+        if mnnvl is not None and mnnvl.supports(
+            token_num,
+            hidden_dim,
+            dtype,
+            _workspace_manager.world_size,
+            pattern_code,
+            use_oneshot=use_oneshot,
+            residual_reduce_scattered=residual_reduce_scattered,
+        ):
+            return mnnvl
+        # Cross-node there is no IPC workspace, so a shape/pattern mnnvl rejects
+        # has no fused home. Return None and let the caller decide: the rmsnorm
+        # family degrades to the unfused NCCL path, the rest raise loudly. Never
+        # hand the kernel a null workspace.
+        if _workspace_manager.workspace_tensor is None:
+            logger.debug(
+                "trtllm AR fusion: shape (tokens=%s, hidden=%s, dtype=%s, "
+                "pattern=%s, oneshot=%s) not supported by mnnvl and no IPC "
+                "workspace; caller falls back unfused",
+                token_num,
+                hidden_dim,
+                dtype,
+                pattern_code,
+                use_oneshot,
+            )
+            return None
+        return _workspace_manager.workspace_tensor
+
     def get_num_tokens_per_rank(world_size: int, total_tokens_in_group: int) -> list:
         token_list_in_group = []
         for rank in range(0, world_size):
@@ -224,6 +450,56 @@ if current_platform().is_nvidia:
             )
             token_list_in_group.append(num_tokens_per_rank)
         return token_list_in_group
+
+    def _unfused_allreduce_residual_rmsnorm(
+        input_tensor: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        rank: int,
+        group: dist.ProcessGroup,
+        eps: float,
+        block_quant_fp8: bool,
+        has_partial_norm_out: bool,
+    ):
+        """Unfused NCCL + torch epilogue for the rmsnorm fusion family.
+
+        Cross-node groups have no IPC workspace, and the mnnvl kernel does not
+        implement the block-quant / partial-out epilogues, so those calls land
+        here instead of aborting. Mirrors the fused contract exactly:
+        (quant_out, residual_out, scale_out, partial_norm_out) when
+        block_quant_fp8 else (norm_out, residual_out, None, partial_norm_out).
+        The all-reduce runs on NCCL (different reduction order than the fused
+        kernels -- numerically equivalent, not bitwise).
+        """
+        reduced = input_tensor.contiguous().clone()
+        dist.all_reduce(reduced, group=group)
+        res32 = reduced.float() + residual.float()
+        residual_out = res32.to(input_tensor.dtype)
+        # fp32 epilogue matching the fused kernels: variance over the hidden
+        # lane, gamma multiply in fp32, single rounding back to the payload
+        # dtype.
+        norm32 = res32 * torch.rsqrt(res32.pow(2).mean(-1, keepdim=True) + eps)
+        norm_out = (norm32 * weight.float()).to(input_tensor.dtype)
+
+        partial_norm_out = None
+        if has_partial_norm_out:
+            world_size = dist.get_world_size(group)
+            counts = get_num_tokens_per_rank(world_size, input_tensor.shape[0])
+            start = sum(counts[:rank])
+            partial_norm_out = norm_out[start : start + counts[rank]].contiguous()
+
+        if block_quant_fp8:
+            from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
+
+            quant_out, scale_out = per_token_group_quant_fp8(
+                norm_out,
+                group_size=128,
+                column_major_scales=True,
+                scale_tma_aligned=True,
+                scale_ue8m0=False,
+            )
+            return quant_out, residual_out, scale_out, partial_norm_out
+        return norm_out, residual_out, None, partial_norm_out
 
     def allreduce_residual_rmsnorm(
         input_tensor: torch.Tensor,
@@ -307,15 +583,69 @@ if current_platform().is_nvidia:
         if residual_reduce_scattered or has_partial_norm_out:
             use_oneshot = True
 
+        resolved_oneshot = (
+            use_oneshot
+            if use_oneshot is not None
+            else _ar_should_use_oneshot(
+                token_num, hidden_dim, input_tensor.dtype, world_size
+            )
+        )
+        # The size heuristic above encodes the IPC-lamport crossover in BYTES,
+        # while the mnnvl one-shot kernel is capped in TOKENS
+        # (MNNVL_ONESHOT_MAX_TOKEN). They disagree: at world=8 the 42 MB
+        # threshold lands on 192 tokens, which one-shot mnnvl cannot serve, and
+        # cross-node there is no IPC workspace to fall back to. Respect the
+        # kernel's own cap so such shapes take the two-shot path instead.
+        if (
+            resolved_oneshot
+            and token_num > MNNVL_ONESHOT_MAX_TOKEN
+            and _workspace_manager.mnnvl_workspace is not None
+            and _workspace_manager.workspace_tensor is None
+        ):
+            resolved_oneshot = False
+
+        workspace = _ar_fusion_workspace(
+            token_num,
+            hidden_dim,
+            input_tensor.dtype,
+            pattern_code,
+            resolved_oneshot,
+            residual_reduce_scattered,
+        )
+        if workspace is None:
+            # Cross-node group, pattern/shape the mnnvl kernel cannot serve
+            # (block-quant or partial-out epilogue, oversized call). Degrade to
+            # the unfused NCCL path instead of aborting the forward pass.
+            if residual_reduce_scattered:
+                # The input arrives reduce-scattered; a blind all-reduce would
+                # double-count. No unfused equivalent exists here, so fail
+                # loudly rather than corrupt.
+                raise RuntimeError(
+                    "trtllm AR fusion: residual_reduce_scattered has no fused "
+                    f"workspace for this call (tokens={token_num}, "
+                    f"hidden={hidden_dim}, dtype={input_tensor.dtype}, "
+                    f"pattern={pattern_code}) and no unfused fallback"
+                )
+            return _unfused_allreduce_residual_rmsnorm(
+                input_tensor,
+                residual,
+                weight,
+                rank,
+                group,
+                eps,
+                block_quant_fp8,
+                has_partial_norm_out,
+            )
+
         trtllm_allreduce_fusion(
             allreduce_in=input_tensor,
             world_size=world_size,
             world_rank=rank,
             token_num=token_num,
             hidden_dim=hidden_dim,
-            workspace_ptrs=_workspace_manager.workspace_tensor,
+            workspace_ptrs=workspace,
             launch_with_pdl=launch_with_pdl,
-            use_oneshot=use_oneshot,
+            use_oneshot=resolved_oneshot,
             trigger_completion_at_end=trigger_completion_at_end,
             fp32_acc=fp32_acc,
             pattern_code=(pattern_code),
@@ -380,13 +710,29 @@ if current_platform().is_nvidia:
         residual_out = torch.empty_like(residual)
         norm_out = torch.empty_like(input_tensor)
         m, s_, acc = scratch
+        workspace = _ar_fusion_workspace(
+            token_num,
+            hidden_dim,
+            input_tensor.dtype,
+            AllReduceFusionPattern.kARResidualAttnResCombine,
+            use_oneshot=True,
+        )
+        if workspace is None:
+            # mnnvl serves this pattern in-range; only out-of-range shapes land
+            # here cross-node. No unfused equivalent of the combine epilogue --
+            # fail loudly rather than skip the reduce.
+            raise RuntimeError(
+                "trtllm AR fusion: kARResidualAttnResCombine has no fused "
+                f"workspace for this call (tokens={token_num}, "
+                f"hidden={hidden_dim}, dtype={input_tensor.dtype})"
+            )
         trtllm_allreduce_fusion(
             allreduce_in=input_tensor,
             world_size=world_size,
             world_rank=rank,
             token_num=token_num,
             hidden_dim=hidden_dim,
-            workspace_ptrs=_workspace_manager.workspace_tensor,
+            workspace_ptrs=workspace,
             launch_with_pdl=launch_with_pdl,
             use_oneshot=True,
             trigger_completion_at_end=trigger_completion_at_end,
@@ -446,13 +792,28 @@ if current_platform().is_nvidia:
         ):
             raise RuntimeError("TRT-LLM fusion workspace not available")
 
+        workspace = _ar_fusion_workspace(
+            token_num,
+            lane_dim,
+            lane.dtype,
+            AllReduceFusionPattern.kAllReduceLatentNorm,
+            use_oneshot=True,
+        )
+        if workspace is None:
+            # mnnvl serves this pattern in-range; only out-of-range shapes land
+            # here cross-node. Fail loudly rather than skip the reduce.
+            raise RuntimeError(
+                "trtllm AR fusion: kAllReduceLatentNorm has no fused workspace "
+                f"for this call (tokens={token_num}, lane={lane_dim}, "
+                f"dtype={lane.dtype})"
+            )
         trtllm_allreduce_fusion(
             allreduce_in=lane,
             world_size=world_size,
             world_rank=rank,
             token_num=token_num,
             hidden_dim=lane_dim,
-            workspace_ptrs=_workspace_manager.workspace_tensor,
+            workspace_ptrs=workspace,
             launch_with_pdl=launch_with_pdl,
             use_oneshot=True,
             trigger_completion_at_end=trigger_completion_at_end,
@@ -552,6 +913,17 @@ if current_platform().is_nvidia:
         else:
             quant_out = None
             scale_out = None
+        # allgather/reducescatter have no mnnvl implementation -- they run on
+        # the IPC lamport workspace only. Since IPC is skipped on cross-node
+        # groups, `initialized` can be True (mnnvl armed) while this workspace
+        # is None; without this check a null pointer reaches the FFI.
+        if _workspace_manager.workspace_tensor is None:
+            raise RuntimeError(
+                "trtllm reducescatter fusion requires the IPC lamport workspace, which is "
+                "unavailable on this group (cross-node, or IPC explicitly "
+                "skipped). Use the unfused path for this collective."
+            )
+
         trtllm_reducescatter_fusion(
             reducescatter_in=input_tensor,
             world_size=world_size,
@@ -667,6 +1039,17 @@ if current_platform().is_nvidia:
             if block_quant_fp8
             else AllGatherFusionPattern.kAllGatherfusedRMS
         )
+
+        # allgather/reducescatter have no mnnvl implementation -- they run on
+        # the IPC lamport workspace only. Since IPC is skipped on cross-node
+        # groups, `initialized` can be True (mnnvl armed) while this workspace
+        # is None; without this check a null pointer reaches the FFI.
+        if _workspace_manager.workspace_tensor is None:
+            raise RuntimeError(
+                "trtllm allgather fusion requires the IPC lamport workspace, which is "
+                "unavailable on this group (cross-node, or IPC explicitly "
+                "skipped). Use the unfused path for this collective."
+            )
 
         trtllm_allgather_fusion(
             allgather_in=qkv,
