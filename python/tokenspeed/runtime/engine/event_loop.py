@@ -55,6 +55,7 @@ from tokenspeed.runtime.engine.pause import PauseController
 from tokenspeed.runtime.engine.request_handler import RequestHandler
 from tokenspeed.runtime.engine.scheduler_utils import (
     advance_forward,
+    aligned_max_scheduled_tokens,
     cache_event_from_payload,
     cache_event_key,
     cache_event_to_payload,
@@ -207,6 +208,7 @@ class EventLoop:
             self.max_total_num_tokens,
             mamba_pool_total_chunks,
             mamba_pool,
+            self.cache_storage,
         ) = create_attn_components(
             server_args,
             self.model_config,
@@ -247,6 +249,7 @@ class EventLoop:
             gpu_id=gpu_id,
             global_rank=global_rank,
             num_total_pages=num_total_pages,
+            logical_page_size=geometry.page_size,
             overlap_schedule_depth=self.overlap_schedule_depth,
         )
         self.model_executor = create_model_executor(
@@ -314,7 +317,7 @@ class EventLoop:
 
         mem_cfg = MemoryExecutorConfig(
             layer_num=self.model_config.num_hidden_layers,
-            page_size=server_args.block_size,
+            page_size=geometry.page_size,
             host_ratio=server_args.kvstore_ratio,
             host_size_gb=server_args.kvstore_size,
             host_parallel_count=max(
@@ -408,8 +411,6 @@ class EventLoop:
                 unsupported.append("layerwise cache transfer")
             if server_args.enable_memory_saver:
                 unsupported.append("memory saver/release")
-            if server_args.enable_prefix_caching:
-                unsupported.append("prefix caching/reuse")
             if server_args.enable_kvstore:
                 unsupported.append("KVStore/host cache")
             # Prefill is forced onto the non-overlap loop by
@@ -439,9 +440,27 @@ class EventLoop:
         required_groups = token_to_kv_pool.prefix_cache_required_group_ids
         if required_groups is not None and server_args.enable_prefix_caching:
             prefix_cache_adjunct = pool_to_prefix_cache_adjunct_spec(required_groups)
+        # State-snapshot groups only register prefix-cache pages when a chunk
+        # ends page-aligned; floor the chunk size to that grain or reuse is 0.
+        max_scheduled_tokens = server_args.chunked_prefill_size
+        if server_args.enable_prefix_caching:
+            max_scheduled_tokens = aligned_max_scheduled_tokens(
+                server_args.chunked_prefill_size,
+                paged_cache_groups,
+                geometry.page_size,
+            )
+            if max_scheduled_tokens != server_args.chunked_prefill_size:
+                logger.warning(
+                    "chunked_prefill_size=%s is not a multiple of the "
+                    "state-snapshot page grain; using %s so recurrent-state "
+                    "pages can register for prefix-cache reuse.",
+                    server_args.chunked_prefill_size,
+                    max_scheduled_tokens,
+                )
+                server_args.chunked_prefill_size = max_scheduled_tokens
         scheduler_cfg = make_config(
             num_device_pages=geometry.num_device_pages,
-            max_scheduled_tokens=server_args.chunked_prefill_size,
+            max_scheduled_tokens=max_scheduled_tokens,
             max_batch_size=per_rank_max_batch,
             page_size=geometry.page_size,
             num_host_pages=num_host_pages,
@@ -1670,27 +1689,34 @@ class EventLoop:
         return self.shutdown_event.is_set()
 
     def _flat_page_ids_to_zero(self, execution_plan):
-        """Page ids the scheduler retired for reuse this step.
+        """Group-aware child pages the scheduler assigned in this step.
 
-        A flat-cache pool aliases recurrent-state bytes and fp8 KV in one
-        slab, so a plan that cannot report pages to zero means poisoned KV
-        tails. Fail loudly on that contract mismatch (e.g. a scheduler wheel
-        older than the runtime) instead of silently skipping sanitization.
+        The group is part of the address under two-level placement. Older
+        single-level schedulers expose one global page-id vector instead.
         """
         try:
-            return execution_plan.flat_page_ids_to_zero
+            return execution_plan.flat_pages_to_zero
         except AttributeError:
-            zero_pages = getattr(
-                self.model_executor.token_to_kv_pool, "zero_pages", None
-            )
-            if callable(zero_pages):
+            try:
+                return execution_plan.flat_page_ids_to_zero
+            except AttributeError:
+                pass
+            if getattr(
+                self.model_executor.token_to_kv_pool,
+                "flat_kv_requires_page_zeroing",
+                False,
+            ):
                 raise RuntimeError(
                     "flat KV cache is active but the scheduler's ExecutionPlan "
-                    "has no flat_page_ids_to_zero; the installed "
+                    "has no fresh-page sanitization payload; the installed "
                     "tokenspeed-scheduler build predates page-reuse zeroing — "
                     "rebuild it from this checkout"
                 ) from None
             return ()
+
+    def _flat_pages_to_zero(self, execution_plan):
+        """Descriptive alias for group-aware page-zeroing payloads."""
+        return self._flat_page_ids_to_zero(execution_plan)
 
     def event_loop(self):
         """Non-overlapping scheduler loop."""
@@ -2041,6 +2067,7 @@ def run_event_loop(
                 "max_num_seqs": server_args.max_num_seqs,
                 "chunked_prefill_size": server_args.chunked_prefill_size,
                 "max_model_len": event_loop.model_config.context_len,
+                "cache_storage": getattr(event_loop, "cache_storage", None),
             }
         )
 

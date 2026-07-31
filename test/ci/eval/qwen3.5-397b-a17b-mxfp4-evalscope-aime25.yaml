@@ -20,7 +20,6 @@ server:
     --max-num-seqs 16
     --trust-remote-code
     --quantization mxfp4
-    --weight-loader-prefetch-checkpoints
     --sampling-backend greedy
     --disable-kvstore
     --kvstore-ratio 0.0

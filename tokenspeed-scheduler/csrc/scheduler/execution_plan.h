@@ -21,6 +21,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <variant>
 #include <vector>
@@ -69,10 +70,10 @@ public:
     // phase/reason diagnostics.
     std::vector<FlatTerminalError> flat_terminal_errors;
 
-    // Flat KV-cache physical pages newly assigned to an owner in this plan.
-    // The runtime zeros the complete page set before cache transfers/forward.
-    // Cached prefix hits are intentionally absent.
-    std::vector<std::int32_t> flat_page_ids_to_zero;
+    // Flat KV-cache child pages newly assigned in this plan. Group identity is
+    // required because one LCM parent can still contain live sibling children.
+    // The runtime clears these exact byte ranges before transfers/forward.
+    std::map<std::string, std::vector<std::int32_t>> flat_pages_to_zero;
 
 private:
     std::vector<Operation> operations_;

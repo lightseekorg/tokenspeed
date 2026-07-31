@@ -2,10 +2,9 @@
 
 The hybrid backend's full-attention sub-backend is user-selectable and may
 have a narrow ``init_cuda_graph_state`` signature (e.g. TRTLLM MHA takes only
-``(max_bs, seq_lens_buf)``); the shared ``init_backend_cuda_graph_state``
-helper must drop unaccepted extras before forwarding, hand the full extras to
-``**kwargs`` backends, and never swallow TypeErrors raised inside a backend
-body.
+``(max_bs,)``); the shared ``init_backend_cuda_graph_state`` helper must drop
+unaccepted extras before forwarding, hand the full extras to ``**kwargs``
+backends, and never swallow TypeErrors raised inside a backend body.
 """
 
 from __future__ import annotations
@@ -29,8 +28,8 @@ class _NarrowBackend:
     def __init__(self):
         self.calls = []
 
-    def init_cuda_graph_state(self, max_bs, seq_lens_buf):
-        self.calls.append((max_bs, seq_lens_buf))
+    def init_cuda_graph_state(self, max_bs):
+        self.calls.append((max_bs,))
 
 
 class _VarKwBackend:
@@ -41,8 +40,8 @@ class _VarKwBackend:
     def __init__(self):
         self.calls = []
 
-    def init_cuda_graph_state(self, max_bs, seq_lens_buf, **kwargs):
-        self.calls.append((max_bs, seq_lens_buf, kwargs))
+    def init_cuda_graph_state(self, max_bs, **kwargs):
+        self.calls.append((max_bs, kwargs))
 
 
 class _NamedExtraBackend:
@@ -53,8 +52,8 @@ class _NamedExtraBackend:
     def __init__(self):
         self.calls = []
 
-    def init_cuda_graph_state(self, max_bs, seq_lens_buf, paged_cache_group_specs=None):
-        self.calls.append((max_bs, seq_lens_buf, paged_cache_group_specs))
+    def init_cuda_graph_state(self, max_bs, paged_cache_group_specs=None):
+        self.calls.append((max_bs, paged_cache_group_specs))
 
 
 class _RaisingBackend:
@@ -63,7 +62,7 @@ class _RaisingBackend:
 
     device = "cpu"
 
-    def init_cuda_graph_state(self, max_bs, seq_lens_buf, **kwargs):
+    def init_cuda_graph_state(self, max_bs, **kwargs):
         raise TypeError("from inside the backend body")
 
 
@@ -88,28 +87,25 @@ class InitBackendCudaGraphStateHelperTest(unittest.TestCase):
 
     def test_narrow_backend_receives_positional_only(self):
         backend = _NarrowBackend()
-        buf = object()
-        self.helper(backend, 4, buf, **_EXTRAS)
-        self.assertEqual(backend.calls, [(4, buf)])
+        self.helper(backend, 4, **_EXTRAS)
+        self.assertEqual(backend.calls, [(4,)])
 
     def test_var_kw_backend_receives_all_extras(self):
         backend = _VarKwBackend()
-        buf = object()
-        self.helper(backend, 4, buf, **_EXTRAS)
-        self.assertEqual(backend.calls, [(4, buf, _EXTRAS)])
+        self.helper(backend, 4, **_EXTRAS)
+        self.assertEqual(backend.calls, [(4, _EXTRAS)])
 
     def test_named_extra_backend_receives_only_matching_kwarg(self):
         backend = _NamedExtraBackend()
-        buf = object()
-        self.helper(backend, 4, buf, **_EXTRAS)
+        self.helper(backend, 4, **_EXTRAS)
         self.assertEqual(
             backend.calls,
-            [(4, buf, _EXTRAS["paged_cache_group_specs"])],
+            [(4, _EXTRAS["paged_cache_group_specs"])],
         )
 
     def test_type_error_from_backend_body_propagates(self):
         with self.assertRaisesRegex(TypeError, "from inside the backend body"):
-            self.helper(_RaisingBackend(), 4, object(), **_EXTRAS)
+            self.helper(_RaisingBackend(), 4, **_EXTRAS)
 
 
 class HybridInitCudaGraphStateForwardingTest(unittest.TestCase):
@@ -131,27 +127,24 @@ class HybridInitCudaGraphStateForwardingTest(unittest.TestCase):
     def test_narrow_full_backend_with_extras_succeeds(self):
         full = _NarrowBackend()
         mamba = _NarrowBackend()
-        buf = object()
-        self._hybrid(full, mamba).init_cuda_graph_state(4, buf, **_EXTRAS)
-        self.assertEqual(full.calls, [(4, buf)])
-        self.assertEqual(mamba.calls, [(4, buf)])
+        self._hybrid(full, mamba).init_cuda_graph_state(4, **_EXTRAS)
+        self.assertEqual(full.calls, [(4,)])
+        self.assertEqual(mamba.calls, [(4,)])
 
     def test_var_kw_full_backend_receives_extras(self):
         full = _VarKwBackend()
         mamba = _NarrowBackend()
-        buf = object()
-        self._hybrid(full, mamba).init_cuda_graph_state(4, buf, **_EXTRAS)
-        self.assertEqual(full.calls, [(4, buf, _EXTRAS)])
+        self._hybrid(full, mamba).init_cuda_graph_state(4, **_EXTRAS)
+        self.assertEqual(full.calls, [(4, _EXTRAS)])
         # The narrow mamba sub-backend is covered by the same filter.
-        self.assertEqual(mamba.calls, [(4, buf)])
+        self.assertEqual(mamba.calls, [(4,)])
 
     def test_var_kw_mamba_backend_receives_extras(self):
         full = _NarrowBackend()
         mamba = _VarKwBackend()
-        buf = object()
-        self._hybrid(full, mamba).init_cuda_graph_state(4, buf, **_EXTRAS)
-        self.assertEqual(full.calls, [(4, buf)])
-        self.assertEqual(mamba.calls, [(4, buf, _EXTRAS)])
+        self._hybrid(full, mamba).init_cuda_graph_state(4, **_EXTRAS)
+        self.assertEqual(full.calls, [(4,)])
+        self.assertEqual(mamba.calls, [(4, _EXTRAS)])
 
 
 if __name__ == "__main__":

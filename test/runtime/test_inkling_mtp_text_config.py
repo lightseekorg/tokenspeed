@@ -8,31 +8,32 @@ and depths beyond ``--speculative-num-steps`` are pruned (an MTP chain only
 runs depths 0..steps-1).
 """
 
-# CI Registration (parsed via AST, runtime no-op)
 import os
 import sys
 import unittest
 
 from tokenspeed.runtime.configs.inkling_config import (
-    InklingMMConfig,
     inkling_kv_heads_for_layer,
     inkling_mtp_text_config,
 )
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
-from runtime.models.inkling_fixtures import TINY_MM_CONFIG
+from runtime.models.inkling_fixtures import load_inkling_config
 
-register_cuda_ci(est_time=5, suite="runtime-1gpu")
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 
 def _mm_config(mtp_config):
-    cfg_dict = {
-        k: v
-        for k, v in {**TINY_MM_CONFIG, "mtp_config": mtp_config}.items()
-        if k not in ("model_type", "architectures")
-    }
-    return InklingMMConfig(**cfg_dict)
+    """The released config re-parsed with the test's own ``mtp_config`` (the
+    same validation/parse path ``InklingMMConfig.__init__`` runs)."""
+    from tokenspeed.runtime.configs.inkling_config import InklingMMConfig
+
+    base = load_inkling_config().to_dict()
+    base["mtp_config"] = mtp_config
+    return InklingMMConfig(
+        **{k: v for k, v in base.items() if k not in ("model_type", "architectures")}
+    )
 
 
 class TestInklingMTPTextConfig(unittest.TestCase):
@@ -76,7 +77,8 @@ class TestInklingMTPTextConfig(unittest.TestCase):
         )
         # The base config is untouched (deepcopy).
         self.assertEqual(
-            text.num_hidden_layers, TINY_MM_CONFIG["text_config"]["num_hidden_layers"]
+            text.num_hidden_layers,
+            load_inkling_config().get_text_config().num_hidden_layers,
         )
 
     def test_depth_config_idempotent(self):

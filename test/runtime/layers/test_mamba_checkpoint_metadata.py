@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
+    HybridLinearAttnBackend,
     MambaAttnBackend,
     SimpleMambaPool,
     _prepare_gdn_decode_state_path,
@@ -71,6 +74,26 @@ def test_bf16_decode_without_output_indices_falls_back_to_triton():
     assert prepared_initial is initial
     assert prepared_output is None
     assert solution == "triton"
+
+
+def test_flat_verify_without_commit_context_does_not_use_simple_mamba_pool():
+    backend = object.__new__(HybridLinearAttnBackend)
+    backend.linear_attn_backend = SimpleNamespace(
+        flat_state_active=True,
+        _verify_commit_ctx=None,
+        flat_commit_verified_state=lambda _: pytest.fail(
+            "capture without a commit context must not commit"
+        ),
+        forward_metadata=SimpleNamespace(
+            mamba_output_indices=torch.tensor([[1]], dtype=torch.int32),
+            mamba_req_pool_indices=torch.tensor([1], dtype=torch.int32),
+        ),
+        pool=None,
+    )
+
+    backend.update_mamba_state_after_mtp_verify(
+        torch.tensor([1], dtype=torch.int32), None
+    )
 
 
 def test_simple_mamba_pool_preserves_k_last_temporal_shape():

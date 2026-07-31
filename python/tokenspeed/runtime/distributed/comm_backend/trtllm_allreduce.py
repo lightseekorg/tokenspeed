@@ -77,9 +77,20 @@ class TrtllmAllReduceBackend(CommBackend):
 
         try:
 
+            from tokenspeed.runtime.distributed.device_communicators.utils import (
+                in_the_same_node_as,
+            )
             from tokenspeed.runtime.distributed.process_group_manager import (
                 process_group_manager as pg_manager,
             )
+
+            # IPC workspaces only work when every rank of the group lives on
+            # the same node; opening a remote rank's IPC handle poisons the
+            # CUDA context with cudaErrorInvalidResourceHandle. Cross-node
+            # groups (e.g. the EP group when nnodes > 1) must stay on NCCL.
+            gloo_group = pg_manager.get_process_group("gloo", group)
+            if not all(in_the_same_node_as(gloo_group, source_rank=0)):
+                return False
 
             device_group = pg_manager.get_process_group("nccl", group)
 

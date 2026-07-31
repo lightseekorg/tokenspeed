@@ -579,7 +579,39 @@ def setup_runner(
             dry_run=dry_run,
             check=False,
         )
-    shell_run("sudo apt-get update -q", env=local_env, cwd=cwd, dry_run=dry_run)
+    if runner.startswith("b200v2-"):
+        # b200v2 nodes do not have a usable IPv6 default route. Persist the
+        # setting for every apt invocation in this runner, including the
+        # later install_deps.sh step.
+        shell_run(
+            "echo 'Acquire::ForceIPv4 \"true\";' | "
+            "sudo tee /etc/apt/apt.conf.d/99tokenspeed-force-ipv4 >/dev/null",
+            env=local_env,
+            cwd=cwd,
+            dry_run=dry_run,
+        )
+        # The b200v2 network path intermittently replaces Ubuntu HTTP
+        # InRelease responses with a short non-clearsigned payload, which
+        # apt reports as NOSPLIT. HTTPS bypasses that HTTP interception.
+        shell_run(
+            "find /etc/apt -maxdepth 2 -type f "
+            "\\( -path /etc/apt/sources.list -o -name '*.sources' \\) "
+            "-exec sudo sed -i "
+            "'s|http://archive.ubuntu.com/ubuntu|"
+            "https://archive.ubuntu.com/ubuntu|g; "
+            "s|http://security.ubuntu.com/ubuntu|"
+            "https://security.ubuntu.com/ubuntu|g' "
+            "{} +",
+            env=local_env,
+            cwd=cwd,
+            dry_run=dry_run,
+        )
+    shell_run(
+        "sudo apt-get -o Acquire::Retries=5 update -q",
+        env=local_env,
+        cwd=cwd,
+        dry_run=dry_run,
+    )
     shell_run(
         "sudo apt-get install -y ninja-build",
         env=local_env,

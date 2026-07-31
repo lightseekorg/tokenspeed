@@ -519,6 +519,34 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 or tuple(int(page) for page in group_dst_indices) != dst_group.page_ids
             ):
                 raise ValueError("FlatKV manifest and Mooncake page vector disagree")
+            if layout_group.transfer_segments:
+                for segment in layout_group.transfer_segments:
+                    physical_slot = segment.physical_slot
+                    src_ptr = self.kv_args.kv_data_ptrs[physical_slot]
+                    dst_ptr = dst_ptrs[physical_slot]
+                    if (
+                        self.kv_args.kv_item_lens[physical_slot]
+                        != layout.physical_page_bytes
+                    ):
+                        raise ValueError(
+                            "FlatKV Mooncake parent size disagrees with layout"
+                        )
+                    for src_page, dst_page in zip(
+                        group_src_indices, group_dst_indices, strict=True
+                    ):
+                        transfer_blocks.append(
+                            (
+                                src_ptr
+                                + segment.page_zero_offset
+                                + int(src_page) * segment.page_stride_bytes,
+                                dst_ptr
+                                + segment.page_zero_offset
+                                + int(dst_page) * segment.page_stride_bytes,
+                                segment.payload_bytes,
+                            )
+                        )
+                page_offset += page_count
+                continue
             src_blocks, dst_blocks = group_concurrent_contiguous(
                 group_src_indices, group_dst_indices
             )

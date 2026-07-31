@@ -52,8 +52,60 @@ __all__ = [
     "transfer_kv_all_layer_mla",
     "transfer_kv_per_layer",
     "transfer_kv_per_layer_mla",
+    "zero_byte_segments",
     "zero_flat_cache_pages",
 ]
+
+
+# -----------------------------------------------------------------------------
+# Cache Page Initialization
+# -----------------------------------------------------------------------------
+
+
+@triton.jit
+def _zero_byte_segments_kernel(
+    backing_ptr,
+    segments_ptr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    segment_id = tl.program_id(0)
+    byte_offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    segment_offset = tl.load(segments_ptr + segment_id * 2)
+    segment_size = tl.load(segments_ptr + segment_id * 2 + 1)
+    tl.store(
+        backing_ptr + segment_offset + byte_offsets,
+        0,
+        mask=byte_offsets < segment_size,
+    )
+
+
+def zero_byte_segments(backing: torch.Tensor, segments: list[tuple[int, int]]) -> None:
+    """Zero selected byte ranges in one contiguous cache allocation.
+
+    Args:
+        backing: Contiguous uint8 cache allocation.
+        segments: ``(byte_offset, byte_count)`` ranges within ``backing``.
+    """
+    if not segments:
+        return
+    if backing.dtype != torch.uint8 or not backing.is_contiguous():
+        raise ValueError("backing must be a contiguous uint8 tensor")
+    if any(
+        offset < 0 or size <= 0 or offset + size > backing.numel()
+        for offset, size in segments
+    ):
+        raise ValueError("segments must be non-empty ranges within backing")
+
+    segment_table = torch.tensor(segments, dtype=torch.int64, device=backing.device)
+    block_size = 1024
+    max_size = max(size for _, size in segments)
+    grid = (len(segments), triton.cdiv(max_size, block_size))
+    _zero_byte_segments_kernel[grid](
+        backing,
+        segment_table,
+        BLOCK_SIZE=block_size,
+        num_warps=4,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -1739,7 +1791,7 @@ def flat_decode_locs(
 @triton.jit
 def _flat_tables_unpack_kernel(
     src_ptr,  # packed int32 device buffer (bridge upload)
-    meta_ptr,  # [G, 2] int32: (src element offset, cols) per group
+    meta_ptr,  # [G, 3] int32: (src element offset, cols, page ratio) per group
     dst_ptr,  # [G, max_bs, Wmax] int32 stacked graph tables
     stride_g,
     stride_b,
@@ -1756,14 +1808,25 @@ def _flat_tables_unpack_kernel(
     tail fill (+ F.pad row padding) per decode step."""
     g = tl.program_id(0)
     b = tl.program_id(1)  # grid axis 1 is exactly bs, no bounds check needed
-    off = tl.load(meta_ptr + g * 2).to(tl.int64)
-    cols = tl.load(meta_ptr + g * 2 + 1).to(tl.int64)
+    off = tl.load(meta_ptr + g * 3).to(tl.int64)
+    cols = tl.load(meta_ptr + g * 3 + 1).to(tl.int64)
+    ratio = tl.load(meta_ptr + g * 3 + 2).to(tl.int64)
     w_off = tl.arange(0, BLOCK_W)
     real = b < actual_bs
     for w0 in range(0, wmax, BLOCK_W):
         w = w0 + w_off
-        in_row = (w < cols) & real
-        vals = tl.load(src_ptr + off + b * cols + w, mask=in_row & (w < wmax), other=0)
+        src_col = w // ratio
+        in_row = (src_col < cols) & real
+        vals = tl.load(
+            src_ptr + off + b * cols + src_col,
+            mask=in_row & (w < wmax),
+            other=0,
+        )
+        vals = tl.where(
+            ratio == 1,
+            vals,
+            tl.maximum(vals, 0) * ratio + w % ratio,
+        )
         vals = tl.where(in_row, vals, tl.where(real, TAIL_PAD, 0))
         tl.store(
             dst_ptr + g * stride_g + b * stride_b + w,
@@ -1786,7 +1849,10 @@ def flat_tables_unpack(
     Args:
         src: 1-D int32 device buffer holding every group's rows
             back-to-back (rows x cols per group).
-        meta: [G, 2] int32 device tensor of (element offset, cols).
+        meta: [G, 3] int32 device tensor of
+            (element offset, logical columns, kernel pages per logical page).
+            A ratio greater than one expands page ``p`` to
+            ``p * ratio + [0, ratio)`` while unpacking.
         dst: [G, max_bs, Wmax] int32 stacked destination.
         bs: rows to fill per group (padded batch size).
         actual_bs: live batch size; rows [actual_bs, bs) are written all-0

@@ -193,6 +193,11 @@ class FlatHostMirrorStateSlabTest(unittest.TestCase):
                 FlatHostMirror,
                 flat_bytes_per_host_page,
             )
+            from tokenspeed.runtime.configs.lcm_layouts import qwen_gdn_lcm_fields
+            from tokenspeed.runtime.configs.lcm_memory_plan import plan_lcm_fields
+            from tokenspeed.runtime.layers.attention.kv_cache.lcm_mha import (
+                LcmMHATokenToKVPool,
+            )
             from tokenspeed.runtime.layers.attention.kv_cache.mha import (
                 MHATokenToKVPool,
             )
@@ -204,6 +209,30 @@ class FlatHostMirrorStateSlabTest(unittest.TestCase):
         self.FlatHostMirror = FlatHostMirror
         self.flat_bytes_per_host_page = flat_bytes_per_host_page
         self.MHATokenToKVPool = MHATokenToKVPool
+        self.LcmMHATokenToKVPool = LcmMHATokenToKVPool
+        fields = qwen_gdn_lcm_fields(
+            layer_types=GDN_LAYER_TYPES,
+            layer_group_ids=(
+                "linear_attention_0",
+                "full_attention",
+                "linear_attention_0",
+                "full_attention",
+            ),
+            logical_block_tokens=4,
+            kv_shape=(4, 1, 8),
+            kv_element_size=2,
+            conv_shape=self.CONV_SHAPE,
+            conv_element_size=2,
+            ssm_shape=self.SSM_SHAPE,
+            ssm_element_size=2,
+        )
+        self.lcm_plan = plan_lcm_fields(
+            fields,
+            logical_block_tokens=4,
+            budget_bytes=1280,
+            alignment=2,
+            max_padding_fraction=0.5,
+        )
 
     def _pool(self, *, with_state: bool = True):
         kwargs = dict(
@@ -224,11 +253,22 @@ class FlatHostMirrorStateSlabTest(unittest.TestCase):
         )
         if with_state:
             kwargs.update(
-                conv_state_shape=self.CONV_SHAPE,
-                temporal_state_shape=self.SSM_SHAPE,
+                state_field_dtypes={
+                    f"layer.{layer_id}.{field}": self.torch.bfloat16
+                    for layer_id in (0, 2)
+                    for field in ("conv", "ssm")
+                },
+                memory_plan=self.lcm_plan,
+                layer_group_ids=(
+                    "linear_attention_0",
+                    "full_attention",
+                    "linear_attention_0",
+                    "full_attention",
+                ),
             )
         with mock.patch(_PKG_FLAT_PROBE, return_value=True):
-            return self.MHATokenToKVPool(**kwargs)
+            pool_cls = self.LcmMHATokenToKVPool if with_state else self.MHATokenToKVPool
+            return pool_cls(**kwargs)
 
     def _fill_device_pages(self, mirror, device_pages):
         # Sentinels distinct per (tensor, page); bf16-exact small ints.

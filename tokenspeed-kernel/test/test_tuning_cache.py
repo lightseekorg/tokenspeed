@@ -1,0 +1,101 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""load_flashinfer_tuning_cache never fails startup.
+
+Every failure mode -- missing file, corrupt JSON, a table swept on a different
+GPU model -- must come back as ``False`` (with a warning) so the runtime falls
+back to lazy autotuning instead of aborting engine startup over a stale table.
+"""
+
+from __future__ import annotations
+
+import json
+from importlib.util import find_spec
+
+import pytest
+from tokenspeed_kernel.ops.tuning import load_flashinfer_tuning_cache
+
+requires_flashinfer = pytest.mark.skipif(
+    find_spec("flashinfer") is None, reason="requires flashinfer"
+)
+
+
+@requires_flashinfer
+def test_missing_file_returns_false(tmp_path) -> None:
+    assert load_flashinfer_tuning_cache(str(tmp_path / "absent.json")) is False
+
+
+@requires_flashinfer
+def test_corrupt_file_returns_false(tmp_path) -> None:
+    path = tmp_path / "corrupt.json"
+    path.write_text("{ not json")
+    assert load_flashinfer_tuning_cache(str(path)) is False
+
+
+@requires_flashinfer
+def test_failed_loads_never_activate_cache(tmp_path) -> None:
+    # The read-only fast path (ops skip tuning contexts entirely) keys off
+    # flashinfer_tuning_cache_active(); only a *successful* load may set it.
+    from tokenspeed_kernel.ops import tuning
+
+    before = tuning.flashinfer_tuning_cache_active()
+    load_flashinfer_tuning_cache(str(tmp_path / "absent.json"))
+    corrupt = tmp_path / "corrupt.json"
+    corrupt.write_text("{ not json")
+    load_flashinfer_tuning_cache(str(corrupt))
+    assert tuning.flashinfer_tuning_cache_active() == before
+
+
+@requires_flashinfer
+def test_packaged_lookup_miss_returns_false() -> None:
+    import torch
+    from tokenspeed_kernel.ops.tuning import load_packaged_flashinfer_tuning_cache
+
+    if not torch.cuda.is_available():
+        pytest.skip("device-name lookup requires CUDA")
+    # No table ships for this made-up model; the miss must be a quiet False
+    # (INFO log), leaving lazy autotuning in place.
+    assert (
+        load_packaged_flashinfer_tuning_cache("no-such-model-unit-test", 999, 1)
+        is False
+    )
+
+
+@requires_flashinfer
+def test_mismatched_gpu_metadata_returns_false(tmp_path) -> None:
+    # A definite metadata conflict (wrong GPU model) must reject the whole
+    # table -- this is the guard that keeps a B300-swept table off other SKUs.
+    path = tmp_path / "wrong_gpu.json"
+    path.write_text(
+        json.dumps(
+            {
+                "_metadata": {
+                    "flashinfer_version": "0.0.1",
+                    "cuda_version": "0.0",
+                    "cublas_version": "0",
+                    "cudnn_version": "0",
+                    "cudnn_frontend_version": "0",
+                    "gpu": "NVIDIA UnitTest GPU That Does Not Exist",
+                },
+            }
+        )
+    )
+    assert load_flashinfer_tuning_cache(str(path)) is False

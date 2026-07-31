@@ -187,12 +187,12 @@ def test_kimi3_moe_execution_policy_is_selected_outside_model() -> None:
         )
 
     assert plan.use_native
-    assert not plan.use_sidecar
+    assert not plan.use_trtllm
     assert plan.use_precomputed_topk
     assert plan.joint_moe_reduce
 
 
-def test_kimi3_moe_execution_policy_preserves_nvidia_sidecar() -> None:
+def test_kimi3_moe_execution_policy_preserves_nvidia_trtllm() -> None:
     mapping = SimpleNamespace(
         moe=SimpleNamespace(
             tp_size=8,
@@ -220,7 +220,7 @@ def test_kimi3_moe_execution_policy_preserves_nvidia_sidecar() -> None:
         )
 
     assert not plan.use_native
-    assert plan.use_sidecar
+    assert plan.use_trtllm
     assert plan.use_precomputed_topk
     assert not plan.overlap_shared_experts
     assert not plan.joint_moe_reduce
@@ -238,7 +238,7 @@ def test_kimi3_moe_execution_plan_prepares_latent_fusions(
     )
     plan = Kimi3MoEExecutionPlan(
         use_native=False,
-        use_sidecar=True,
+        use_trtllm=True,
         overlap_shared_experts=False,
         joint_moe_reduce=False,
     )

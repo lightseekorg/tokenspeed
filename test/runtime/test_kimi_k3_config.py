@@ -338,7 +338,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 "build",
                 return_value=kimi_k3.Kimi3MoEExecutionPlan(
                     use_native=True,
-                    use_sidecar=False,
+                    use_trtllm=False,
                     overlap_shared_experts=False,
                     joint_moe_reduce=True,
                 ),

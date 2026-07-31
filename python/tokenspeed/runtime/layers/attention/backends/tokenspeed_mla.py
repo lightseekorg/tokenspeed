@@ -54,6 +54,7 @@ from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
 )
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+from tokenspeed.runtime.layers.attention.page_table import expand_page_table
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.pdl import pdl_enabled
@@ -127,6 +128,7 @@ class CuteDSLMLABackend(AttentionBackend):
     # FlatKV contract capability: this backend consumes only history-family
     # (full-attention) tables; state groups belong to the linear sub-backend.
     flat_cache_consumer_families = frozenset({"history"})
+    draft_seq_lens_attr: str = "cuda_graph_seq_lens_buf"
 
     def __init__(self, config: MLAConfig):
         super().__init__(config)
@@ -205,7 +207,7 @@ class CuteDSLMLABackend(AttentionBackend):
         """Mark this MLA backend as a Kimi-K3 FlatKV contract sub-backend.
 
         Called by the registry when the backend is constructed for the
-        FlatHybridCachePool contract path. Enables flat CUDA-graph
+        Kimi-K3 LCM contract path. Enables flat CUDA-graph
         capture/replay with stable full-attention block-table and write-location
         buffers; DeepSeek's shared backend is never marked and keeps the
         non-flat graph path unchanged.
@@ -324,22 +326,13 @@ class CuteDSLMLABackend(AttentionBackend):
         formula is preserved. -1 table tails clamp to the null page 0, whose
         kernel expansion stays inside the physical null page.
         """
-        if block_kv_indices is None:
-            block_kv_indices = torch.zeros(
-                (bs, max_blocks), dtype=torch.int32, device=self.device
-            )
-        ratio = flat_page_size // self.page_size
-        flat_cols = min(triton.cdiv(max_blocks, ratio), flat_table.shape[1])
-        if flat_cols <= 0:
-            return block_kv_indices
-        expanded = (
-            flat_table[:bs, :flat_cols].clamp_min(0).to(torch.int32).unsqueeze(-1)
-            * ratio
-            + torch.arange(ratio, dtype=torch.int32, device=flat_table.device)
-        ).reshape(bs, flat_cols * ratio)
-        copy_len = min(max_blocks, flat_cols * ratio)
-        block_kv_indices[:bs, :copy_len] = expanded[:, :copy_len]
-        return block_kv_indices
+        return expand_page_table(
+            flat_table[:bs],
+            logical_page_size=flat_page_size,
+            kernel_page_size=self.page_size,
+            max_kernel_pages=max_blocks,
+            out=block_kv_indices,
+        )
 
     def _flat_decode_out_cache_loc(
         self,
@@ -671,17 +664,12 @@ class CuteDSLMLABackend(AttentionBackend):
 
     # ---- CUDA Graph ----
 
-    def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor):
-        assert (
-            seq_lens_buf.dtype == torch.int32
-            and seq_lens_buf.dim() == 1
-            and seq_lens_buf.shape[0] >= max_bs
-        ), (
-            f"seq_lens_buf must be int32 with shape[0] >= {max_bs}, "
-            f"got {seq_lens_buf.dtype} {tuple(seq_lens_buf.shape)}"
+    def init_cuda_graph_state(self, max_bs: int):
+        # Own the cache-seqlens buffer; replay copies the live lengths in, so
+        # graph state does not depend on the controller mutating a shared tensor.
+        self.cuda_graph_seq_lens_buf = torch.zeros(
+            max_bs, dtype=torch.int32, device=self.device
         )
-        # Alias controller's seq_lens_buf — backend never mutates it.
-        self.cuda_graph_seq_lens_buf = seq_lens_buf
         max_blocks = self._calc_padded_blocks(self.max_context_len)
         self.decode_cuda_graph_kv_indices = torch.zeros(
             (max_bs, max_blocks), dtype=torch.int32, device=self.device
@@ -762,6 +750,8 @@ class CuteDSLMLABackend(AttentionBackend):
                 seq_lens_k=self.cuda_graph_seq_lens_buf[:bs],
                 num_extends=0,
             )
+        # Seed the owned buffer: the capture run reads it before replay.
+        metadata.seq_lens_k.copy_(seq_lens[:bs])
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
 
@@ -789,6 +779,10 @@ class CuteDSLMLABackend(AttentionBackend):
                 "tokenspeed_mla draft worker does not take the FlatKV path"
             )
 
+        # Copy the live cache lengths into our own buffer (metadata.seq_lens_k
+        # views it) on both paths -- the flat helper only refreshes tables.
+        self.cuda_graph_seq_lens_buf[:bs].copy_(seq_lens[:bs])
+
         if flat:
             self._flat_replay_refresh_decode(
                 bs,
@@ -800,10 +794,8 @@ class CuteDSLMLABackend(AttentionBackend):
             self.forward_decode_metadata = metadata
             return
 
-        # seq_lens_k aliases seq_lens_buf; only block indices need refresh.
-        # When the buffer is aliased to a peer backend (e.g. drafter aliasing
-        # the target's kv_indices), the peer's replay has already populated it
-        # with identical content.
+        # Block indices are refreshed separately; when the block table is
+        # aliased to a peer backend, that peer's replay already populated it.
         if req_to_page is not None and not self._block_table_aliased:
             self._create_block_kv_indices(
                 bs,

@@ -135,31 +135,30 @@ def test_cuda_graph_capture_builder_clamps():
     """CUDA-graph capture builder points cache_seqlens at the clamped buffer."""
     be = _make_backend()
     max_bs = 8
-    seq_lens_buf = torch.ones((max_bs,), dtype=torch.int32)  # all padded -> 1
-    be.init_cuda_graph_state(max_bs, seq_lens_buf)
+    be.init_cuda_graph_state(max_bs)
 
     bs = 4
     be._init_multi_token_metadata_capture(bs, SPEC_NUM_TOKENS)
     cache_seqlens = be.forward_prefill_metadata.cache_seqlens_int32
 
     assert int(cache_seqlens.min()) >= SPEC_NUM_TOKENS
-    # Must be the dedicated clamped buffer, not the shared seq_lens_buf.
+    # Must be the dedicated clamped buffer, not the plain cache-seqlens buffer.
     assert cache_seqlens.data_ptr() == be.spec_cache_seqlens_buf.data_ptr()
-    assert cache_seqlens.data_ptr() != seq_lens_buf.data_ptr()
+    assert cache_seqlens.data_ptr() != be.cuda_graph_cache_seqlens.data_ptr()
 
 
 def test_draft_replay_refreshes_spec_cache_seqlens_buf():
     """Draft replay must refresh spec_cache_seqlens_buf (draft step 1 is multi-token)."""
     be = _make_backend(is_draft=True)
     max_bs = 8
-    # At capture time, seq_lens_buf is all 1s (padded rows).
-    seq_lens_buf = torch.ones((max_bs,), dtype=torch.int32)
-    be.init_cuda_graph_state(max_bs, seq_lens_buf)
+    be.init_cuda_graph_state(max_bs)
 
     bs = 4
+    # At capture time, seq_lens are all 1s (padded rows).
+    capture_seq_lens = torch.ones((max_bs,), dtype=torch.int32)
     # Capture: multi-token metadata (step 1) + decode metadata (steps 2+).
     be._init_multi_token_metadata_capture(bs, SPEC_NUM_TOKENS)
-    be._init_decode_metadata_capture(bs, seq_lens_buf)
+    be._init_decode_metadata_capture(bs, capture_seq_lens)
 
     # At capture, spec_cache_seqlens_buf was seeded from all-ones → clamped to 4.
     capture_vals = be.spec_cache_seqlens_buf[:bs].clone()

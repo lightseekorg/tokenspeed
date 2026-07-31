@@ -118,6 +118,18 @@ class TestAttentionBackendChoices(unittest.TestCase):
     def test_defaults_to_mla_for_mla(self):
         self.assertEqual(registry._get_default_backend_name(AttentionArch.MLA), "mla")
 
+    def test_lcm_kernel_page_size_is_validated_without_rewriting_it(self):
+        config = SimpleNamespace(page_size=64)
+
+        registry._validate_lcm_page_size(config, logical_page_size=128)
+
+        self.assertEqual(config.page_size, 64)
+        with self.assertRaisesRegex(ValueError, "positive multiple"):
+            registry._validate_lcm_page_size(
+                SimpleNamespace(page_size=96),
+                logical_page_size=128,
+            )
+
     def test_mha_config_propagates_speculative_settings(self):
         server_args = SimpleNamespace(
             device="cuda",
