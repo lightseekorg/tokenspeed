@@ -21,20 +21,12 @@
 #pragma once
 
 #include <cstdint>
-#include <optional>
-#include <string>
 #include <vector>
 
 #include "cache/cache_config.h"
 #include "utils.h"
 
 namespace tokenspeed {
-
-// Opt-in spec for the paged-cache prefix-cache adjunct. Unset means paged-cache
-// groups are transport-only (no snapshot chain, no prefix-cache reuse).
-struct PrefixCacheAdjunctSpec {
-    std::vector<std::string> required_groups{};
-};
 
 struct SchedulerConfig {
     std::int32_t block_size{};
@@ -56,9 +48,6 @@ struct SchedulerConfig {
         return !disable_l2_cache && host_allocator.total_pages > 1 && role == Role::kFused;
     }
 
-    // Unset means paged-cache groups are transport-only.
-    std::optional<PrefixCacheAdjunctSpec> prefix_cache_adjunct{};
-
     std::int32_t max_scheduled_tokens{};
     std::int32_t max_batch_size{};
     std::int32_t decode_input_tokens{1};
@@ -68,7 +57,6 @@ struct SchedulerConfig {
     std::int32_t overlap_schedule_depth{0};
     bool disable_l2_cache{false};
     bool enable_l3_storage{false};
-    std::int32_t prefetch_threshold{4};  // num pages
     bool enable_kv_cache_events{false};
     bool enable_mixed_prefill_decode{false};
 

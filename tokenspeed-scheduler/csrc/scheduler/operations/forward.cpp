@@ -109,11 +109,11 @@ template <typename Event>
 PrefillOperation applyPrefillEvent(Request& request, Event& event, const KvCacheCoordinator& coordinator,
                                    std::span<const std::string> group_ids) {
     request.Apply(event);
-    const PrefillInfo info = request.GetPrefillInfo();
+    const PrefillInfo info = request.CurrentPrefillInfo();
 
     PrefillOperation operation{{
         .request_id = request.Id(),
-        .request_pool_index = request.GetReqPoolIndex(),
+        .request_pool_index = request.RequestPoolIndex(),
         .input_length = info.extend_len,
         .prefill_length = request.PrefillSize(),
     }};
@@ -131,7 +131,7 @@ DecodeOperation applyDecodeEvent(Request& request, fsm::ScheduleDecodeEvent even
 
     DecodeOperation operation{{
         .request_id = request.Id(),
-        .request_pool_index = request.GetReqPoolIndex(),
+        .request_pool_index = request.RequestPoolIndex(),
         .input_length = decode_input_tokens,
         .prefill_length = request.PrefillSize(),
     }};
@@ -156,7 +156,7 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
 
     const std::int32_t cache_block_tokens = coordinator_.CacheBlockTokens();
     const std::int32_t cacheable_pages = std::max((request->PrefillSize() - 1) / cache_block_tokens, 0);
-    std::vector<std::span<const std::int32_t>> paged_tokens = request->GetFullPagedTokens(false);
+    std::vector<std::span<const std::int32_t>> paged_tokens = request->FullPagedTokens(false);
     paged_tokens.resize(std::min(paged_tokens.size(), static_cast<std::size_t>(cacheable_pages)));
     std::vector<std::string> hashes = ComputePagedHashes(paged_tokens, "");
 
@@ -169,7 +169,7 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
     const std::int32_t extension_pages =
         std::max(match.probe.host.num_common_tokens - match.probe.device.num_common_tokens, 0) / cache_block_tokens;
     const auto extension_begin = hashes.begin() + match.probe.device.num_common_tokens / cache_block_tokens;
-    match.ext_hashes.assign(extension_begin, extension_begin + extension_pages);
+    match.extension_hashes.assign(extension_begin, extension_begin + extension_pages);
     return match;
 }
 
@@ -252,10 +252,9 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     _assert(admission->promotion_boundary_tokens == promotion_boundary_tokens,
             "promotion boundary changed between probe and admission");
 
-    if (!match.ext_hashes.empty()) {
-        coordinator_.CacheFullBlocks(
-            tables, match.ext_hashes, admission->access_epoch,
-            admission->device_prefix_tokens / coordinator_.CacheBlockTokens());
+    if (!match.extension_hashes.empty()) {
+        coordinator_.CacheFullBlocks(tables, match.extension_hashes, admission->access_epoch,
+                                     admission->device_prefix_tokens / coordinator_.CacheBlockTokens());
     }
     return fsm::SchedulePrefillFirstChunkEvent{
         tokens_this_round,
@@ -276,7 +275,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
 
 std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     Request* request, std::int32_t remaining, std::int32_t reserve_num_tokens_in_next_schedule_event) {
-    const std::int32_t unscheduled = request->UnScheduledPrefillSize();
+    const std::int32_t unscheduled = request->UnscheduledPrefillSize();
     const std::int32_t first_pos = request->PrefillSize() - unscheduled;
     fsm::CacheProgress cache_progress = request->CacheProgress();
     std::int32_t tokens_this_round = std::min(remaining, unscheduled);
@@ -292,13 +291,13 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     const bool completes_prefill = tokens_this_round == unscheduled;
     const std::int32_t decode_reserve =
         completes_prefill ? reserve_num_tokens_in_next_schedule_event : 0;
-    const PrefillInfo previous = request->GetPrefillInfo();
+    const PrefillInfo previous = request->CurrentPrefillInfo();
     const std::int32_t num_computed_tokens = previous.already_scheduled_len + previous.extend_len;
     const std::int32_t new_page_hash_begin =
         static_cast<std::int32_t>(cache_progress.page_hashes.size());
     const std::int32_t filled_pages = num_computed_tokens / coordinator_.CacheBlockTokens();
     if (filled_pages > static_cast<std::int32_t>(cache_progress.page_hashes.size())) {
-        appendCompletedPageHashes(cache_progress.page_hashes, request->GetFullPagedTokens(false), filled_pages);
+        appendCompletedPageHashes(cache_progress.page_hashes, request->FullPagedTokens(false), filled_pages);
     }
     std::optional<CacheBoundaryKind> completed_boundary_kind;
     if (new_page_hash_begin < static_cast<std::int32_t>(cache_progress.page_hashes.size())) {
@@ -330,11 +329,11 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
 
 std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* request) {
     std::vector<BlockTable>& tables = request->BlockTablesRef();
-    const std::int32_t reserve_tokens = request->GetReserveNumTokensInNextScheduleEvent();
+    const std::int32_t reserve_tokens = request->ReserveNumTokensInNextScheduleEvent();
     fsm::CacheProgress cache_progress = request->CacheProgress();
     std::int32_t num_computed_tokens = 0;
     if (request->Is<fsm::PrefillDone>()) {
-        const PrefillInfo previous = request->GetPrefillInfo();
+        const PrefillInfo previous = request->CurrentPrefillInfo();
         num_computed_tokens = previous.already_scheduled_len + previous.extend_len;
     } else {
         num_computed_tokens = request->TokenSize() - config_.decode_input_tokens;
@@ -344,7 +343,7 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
         static_cast<std::int32_t>(cache_progress.page_hashes.size());
     const std::int32_t filled_pages = num_computed_tokens / coordinator_.CacheBlockTokens();
     if (filled_pages > static_cast<std::int32_t>(cache_progress.page_hashes.size())) {
-        appendCompletedPageHashes(cache_progress.page_hashes, request->GetFullPagedTokens(false), filled_pages);
+        appendCompletedPageHashes(cache_progress.page_hashes, request->FullPagedTokens(false), filled_pages);
     }
     std::optional<CacheBoundaryKind> completed_boundary_kind;
     if (new_page_hash_begin < static_cast<std::int32_t>(cache_progress.page_hashes.size())) {
@@ -373,11 +372,9 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
     return fsm::ScheduleDecodeEvent{config_.decode_input_tokens, std::move(cache_progress)};
 }
 
-PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request,
-                                                    fsm::SchedulePrefillFirstChunkEvent event,
-                                                    std::vector<LoadBackOperation>& loadback_ops) {
-    PrefillOperation operation =
-        applyPrefillEvent(*request, event, coordinator_, CacheGroupIds());
+PrefillOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillFirstChunkEvent event,
+                                                        std::vector<LoadBackOperation>& load_back_operations) {
+    PrefillOperation operation = applyPrefillEvent(*request, event, coordinator_, cache_group_ids_);
     std::vector<BlockTransfer> load_pairs = event.TakeLoadPairs();
     if (load_pairs.empty()) {
         return operation;
@@ -394,7 +391,6 @@ PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request,
         const KvCacheManager& manager =
             coordinator_.GroupManager(static_cast<std::int32_t>(pair.group_id));
         transfers.push_back(TransferPair{
-            CacheKind::kKV,
             manager.ResolveKernelPageId(pair.source->Location()),
             manager.ResolveKernelPageId(pair.destination->Location()),
         });
@@ -404,23 +400,20 @@ PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request,
     const cache_op_id op_id = allocateCacheOpId();
     const bool inserted = load_ops_.emplace(op_id, std::move(ticket)).second;
     _assert(inserted, "duplicate loadback op id");
-    loadback_ops.emplace_back(op_id, std::move(transfers));
+    load_back_operations.emplace_back(op_id, std::move(transfers));
     return operation;
 }
 
-PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request,
-                                                    fsm::SchedulePrefillEvent event) {
-    return applyPrefillEvent(*request, event, coordinator_, CacheGroupIds());
+PrefillOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillEvent event) {
+    return applyPrefillEvent(*request, event, coordinator_, cache_group_ids_);
 }
 
-DecodeOperation Scheduler::applyEventAndGenerateOp(Request* request,
-                                                   fsm::ScheduleDecodeEvent event) {
+DecodeOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::ScheduleDecodeEvent event) {
     const bool needs_bootstrap_token =
         request->Is<fsm::PrefillDone>() && config_.role == Role::kD;
-    const std::int32_t bootstrap_token = needs_bootstrap_token ? request->GetLastToken() : -1;
+    const std::int32_t bootstrap_token = needs_bootstrap_token ? request->LastToken() : -1;
     DecodeOperation operation =
-        applyDecodeEvent(*request, std::move(event), config_.decode_input_tokens,
-                         coordinator_, CacheGroupIds());
+        applyDecodeEvent(*request, std::move(event), config_.decode_input_tokens, coordinator_, cache_group_ids_);
     if (needs_bootstrap_token) {
         operation.decode_input_id = bootstrap_token;
     }
@@ -449,8 +442,8 @@ void Scheduler::retractForCapacity(const std::vector<Request*>& candidates) {
                  request_to_retract->Id(), request_to_retract->TokenSize());
 }
 
-std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>>
-Scheduler::newForwardOperation(std::vector<Request*> candidates) {
+std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Scheduler::buildForwardOperations(
+    std::vector<Request*> candidates) {
     lcm_admission_failed_ = false;
     const auto priority = [this](const Request* request) {
         if (request->Is<fsm::Prefilling>()) {
@@ -483,7 +476,7 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
             : 0;
 
     std::vector<ForwardOperation> operations;
-    std::vector<LoadBackOperation> loadback_operations;
+    std::vector<LoadBackOperation> load_back_operations;
     std::int32_t token_budget = config_.max_scheduled_tokens;
     bool pushed_prefill = false;
     auto push_operation = [&](auto operation) {
@@ -513,7 +506,7 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
             const std::int32_t reserve =
                 config_.role == Role::kP ? 0 : config_.decode_input_tokens;
             if (auto event = schedulePrefill(request, token_budget, reserve)) {
-                push_operation(applyEventAndGenerateOp(request, std::move(*event)));
+                push_operation(applyEventAndBuildOperation(request, std::move(*event)));
                 if (config_.enable_pd_cache) {
                     pd_transfer_pins_.insert(request->Id());
                 }
@@ -531,8 +524,7 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
                 config_.role == Role::kD ? request->PrefillSize() : token_budget;
             if (auto event =
                     schedulePrefillFirstChunk(request, prefill_budget, decode_input_tokens)) {
-                push_operation(applyEventAndGenerateOp(
-                    request, std::move(*event), loadback_operations));
+                push_operation(applyEventAndBuildOperation(request, std::move(*event), load_back_operations));
                 if (config_.enable_pd_cache) {
                     pd_transfer_pins_.insert(request->Id());
                 }
@@ -551,7 +543,7 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
                 continue;
             }
             if (auto event = scheduleDecode(request)) {
-                push_operation(applyEventAndGenerateOp(request, std::move(*event)));
+                push_operation(applyEventAndBuildOperation(request, std::move(*event)));
                 trackPendingForwardResult(request);
             }
         }
@@ -560,7 +552,7 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
     if (operations.empty()) {
         retractForCapacity(candidates);
     }
-    return {std::move(operations), std::move(loadback_operations)};
+    return {std::move(operations), std::move(load_back_operations)};
 }
 
 }  // namespace tokenspeed

@@ -49,7 +49,6 @@ protected:
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
         cfg.enable_l3_storage = false;
-        cfg.prefetch_threshold = 2;
         cfg.paged_cache_groups.push_back(PagedCacheGroupConfig{
             .group_id = "full_attention",
             .rows_per_page = cfg.block_size,
@@ -73,17 +72,6 @@ protected:
         return RequestSpec{
             .request_id = id,
             .tokens = tokens,
-        };
-    }
-
-    RequestSpec MakePrefetchableSpec(const std::string& id, std::int32_t num_pages, std::int32_t storage_hit_pages,
-                                     token_t start = 1) {
-        auto tokens = MakeAlignedTokens(num_pages, PageSize(), start);
-        return RequestSpec{
-            .request_id = id,
-            .tokens = tokens,
-            .rolling_hashes = MakePageHashes(storage_hit_pages, "rh"),
-            .storage_hit_pages = storage_hit_pages,
         };
     }
 

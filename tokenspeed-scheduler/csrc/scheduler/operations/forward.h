@@ -50,8 +50,6 @@ struct PrefillOperation : public ForwardOperationBase {
 
 struct DecodeOperation : public ForwardOperationBase {
     std::int32_t decode_input_id = -1;
-    // For retraction recover
-    std::int32_t hist_token_len = -1;
 };
 
 using ForwardOperation = std::variant<PrefillOperation, DecodeOperation>;
@@ -67,7 +65,6 @@ struct ForwardBatch {
     std::vector<std::int32_t> shifted_input_ids;
     std::vector<std::int32_t> extend_prefix_lens;
     std::vector<std::int32_t> decode_input_ids;
-    std::vector<std::int32_t> hist_token_lens;
 
     // Per-group block tables: dict[group_id] =
     // [num_reqs, max_pages_in_batch] padded with -1. Each row is absolute
@@ -99,7 +96,6 @@ struct ForwardBatch {
                 extend_prefix_lens.push_back(prefill->extend_prefix_len);
             } else if (auto* decode = std::get_if<DecodeOperation>(&op)) {
                 decode_input_ids.push_back(decode->decode_input_id);
-                hist_token_lens.push_back(decode->hist_token_len);
             }
         }
         const std::size_t num_reqs = request_ids.size();
@@ -133,7 +129,7 @@ struct ForwardBatch {
     }
 
     bool empty() const { return request_ids.empty(); }
-    std::size_t num_extends() const { return extend_prefix_lens.size(); }
+    std::size_t NumExtends() const { return extend_prefix_lens.size(); }
 };
 
 }  // namespace tokenspeed

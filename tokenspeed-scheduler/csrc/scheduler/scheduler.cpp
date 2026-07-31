@@ -185,7 +185,7 @@ std::vector<Scheduler::StoreTicket> Scheduler::StoreLedger::Retire(cache_op_id i
     return tickets;
 }
 
-Request* Scheduler::find_request(const std::string& request_id) {
+Request* Scheduler::findRequest(const std::string& request_id) {
     const auto it = requests_.find(request_id);
     return it == requests_.end() ? nullptr : it->second.get();
 }
@@ -200,17 +200,6 @@ std::size_t Scheduler::groupIndex(const std::string& group_id) const {
 
 std::vector<KvCacheEvent> Scheduler::DrainKvEvents() {
     return std::exchange(kv_events_, {});
-}
-
-std::vector<std::string> Scheduler::CalcRollingHash(const std::vector<std::int32_t>& input_tokens) {
-    const std::size_t num_pages = input_tokens.size() / static_cast<std::size_t>(config_.block_size);
-    std::vector<std::span<const std::int32_t>> token_pages;
-    token_pages.reserve(num_pages);
-    for (std::size_t i = 0; i < num_pages; ++i) {
-        token_pages.emplace_back(input_tokens.data() + i * static_cast<std::size_t>(config_.block_size),
-                                 static_cast<std::size_t>(config_.block_size));
-    }
-    return ComputePagedHashes(token_pages, "");
 }
 
 void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
@@ -274,37 +263,12 @@ std::int32_t Scheduler::PagedCacheGroupAvailablePages(const std::string& group_i
     return available;
 }
 
-std::int64_t Scheduler::PagedCacheGroupFailedAllocCount(const std::string& group_id) const {
-    (void)groupIndex(group_id);
-    return 0;
-}
-
-std::vector<std::int32_t> Scheduler::GetRequestPagedCachePageIds(const std::string& request_id,
-                                                                 const std::string& group_id) const {
-    const auto request_it = requests_.find(request_id);
-    if (request_it == requests_.end() ||
-        (!request_it->second->Is<fsm::Prefilling>() && !request_it->second->Is<fsm::PrefillDone>() &&
-         !request_it->second->Is<fsm::Decoding>())) {
-        return {};
-    }
-    const std::size_t index = groupIndex(group_id);
-    const auto& tables = request_it->second->BlockTablesRef();
-    return coordinator_.GroupManager(static_cast<std::int32_t>(index)).BlockTablePageIds(tables[index]);
-}
-
-std::int32_t Scheduler::GetRequestPagedCacheBaseLogicalPage(const std::string& request_id,
-                                                            const std::string& group_id) const {
-    (void)request_id;
-    (void)groupIndex(group_id);
-    return 0;
-}
-
-std::int32_t Scheduler::GetRequestTokenSize(const std::string& id) const {
+std::int32_t Scheduler::RequestTokenSize(const std::string& id) const {
     const auto it = requests_.find(id);
     return it == requests_.end() ? -1 : it->second->TokenSize();
 }
 
-void Scheduler::emitPendingStores(std::vector<WriteBackOperation>& write_back_ops) {
+void Scheduler::emitPendingStores(std::vector<WriteBackOperation>& write_back_operations) {
     if (!config_.StreamingSinkEnabled()) {
         return;
     }
@@ -327,7 +291,6 @@ void Scheduler::emitPendingStores(std::vector<WriteBackOperation>& write_back_op
             continue;
         }
         transfers.push_back(TransferPair{
-            CacheKind::kKV,
             manager.ResolveKernelPageId(candidate.block_ref->Location()),
             manager.ResolveKernelPageId(host_block_ref->Location()),
         });
@@ -343,7 +306,7 @@ void Scheduler::emitPendingStores(std::vector<WriteBackOperation>& write_back_op
     }
     const cache_op_id op_id = allocateCacheOpId();
     store_ops_.Add(op_id, std::move(tickets));
-    write_back_ops.emplace_back(op_id, std::move(transfers));
+    write_back_operations.emplace_back(op_id, std::move(transfers));
 }
 
 ExecutionPlan Scheduler::NextExecutionPlan() {
@@ -358,7 +321,7 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
         }
     }
 
-    auto [forward_operations, loadback_operations] = newForwardOperation(std::move(candidates));
+    auto [forward_operations, load_back_operations] = buildForwardOperations(std::move(candidates));
 
     ExecutionPlan plan;
     plan.With(ForwardBatch{std::move(forward_operations)});
@@ -368,8 +331,8 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     if (!write_back_operations.empty()) {
         plan.With(CacheOperation{WriteBackBatch{write_back_operations}});
     }
-    if (!loadback_operations.empty()) {
-        plan.With(CacheOperation{LoadBackBatch{loadback_operations}});
+    if (!load_back_operations.empty()) {
+        plan.With(CacheOperation{LoadBackBatch{load_back_operations}});
     }
     plan.pages_to_zero = std::exchange(new_page_ids_, {});
     return plan;

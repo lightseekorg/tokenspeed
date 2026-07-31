@@ -1344,84 +1344,32 @@ class ModelExecutor:
         done.record(torch.cuda.current_stream(self.device))
         return done
 
-    @staticmethod
-    def _contains_retracted_decode(forward_op) -> bool:
-        # ForwardBatch stores hist_token_lens for decode rows only;
-        # non-recovery rows use -1.
-        return any(
-            hist_token_len != -1
-            for hist_token_len in getattr(forward_op, "hist_token_lens", ())
-        )
-
     @nvtx_range("reset_valid_cache_length", color="orange")
     def reset_valid_cache_length(self, forward_op) -> None:
-
         num_extends = forward_op.num_extends()
-        is_prefill = num_extends > 0
-
-        # Retraction recovery: scheduler pushes -1 per decode op, overriding to
-        # a real length only on ScheduleDecodeFromRetractedEvent. Decode rows
-        # may follow prefill rows in a mixed batch, so this cannot be gated on
-        # pure-decode mode.
-        has_retract = self._contains_retracted_decode(forward_op)
-
-        # Pure decode without retraction has nothing to do — skip the
-        # cross-stream wait + stream-context entry entirely.
-        if not is_prefill and not has_retract:
+        if num_extends == 0:
             return
-
-        if has_retract:
-            hist_token_lens_tensor = torch.tensor(
-                forward_op.hist_token_lens,
-                dtype=torch.int32,
-                device="cpu",
-                pin_memory=True,
-            )
-            decode_pool_indices = torch.tensor(
-                forward_op.request_pool_indices[num_extends:],
-                dtype=torch.int64,
-                device="cpu",
-                pin_memory=True,
-            )
-        else:
-            hist_token_lens_tensor = None
-            decode_pool_indices = None
 
         self.execution_stream.wait_stream(torch.cuda.current_stream())
 
         with torch.cuda.stream(self.execution_stream):
-            if is_prefill:
-                extend_request_pool_indices = torch.tensor(
-                    forward_op.request_pool_indices[:num_extends],
-                    dtype=torch.int64,
-                    device="cpu",
-                    pin_memory=True,
-                ).to(self.device, non_blocking=True)
+            extend_request_pool_indices = torch.tensor(
+                forward_op.request_pool_indices[:num_extends],
+                dtype=torch.int64,
+                device="cpu",
+                pin_memory=True,
+            ).to(self.device, non_blocking=True)
 
-                extend_prefix_lens = torch.tensor(
-                    forward_op.extend_prefix_lens,
-                    dtype=torch.int32,
-                    device="cpu",
-                    pin_memory=True,
-                ).to(self.device, non_blocking=True)
+            extend_prefix_lens = torch.tensor(
+                forward_op.extend_prefix_lens,
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=True,
+            ).to(self.device, non_blocking=True)
 
-                self.runtime_states.reset_states(
-                    extend_request_pool_indices, extend_prefix_lens
-                )
-
-            if hist_token_lens_tensor is not None:
-                # Apply retraction recovery: override valid_cache_lengths with hist_token_lens
-                # where the scheduler has specified a non-(-1) value, so that out_cache_loc
-                # and position IDs are computed against the retracted KV length.
-                pool_idx_dev = decode_pool_indices.to(self.device, non_blocking=True)
-                hist_dev = hist_token_lens_tensor.to(self.device, non_blocking=True)
-
-                mask_1d = hist_dev != -1
-                vcl = self.runtime_states.valid_cache_lengths[pool_idx_dev]
-
-                self.runtime_states.valid_cache_lengths[pool_idx_dev] = torch.where(
-                    mask_1d, hist_dev, vcl
-                )
+            self.runtime_states.reset_states(
+                extend_request_pool_indices, extend_prefix_lens
+            )
 
     def execute_forward_op(
         self,

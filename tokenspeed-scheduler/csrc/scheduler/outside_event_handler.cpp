@@ -42,20 +42,15 @@ void FreeAll(std::vector<CacheBlockRef>&& block_refs) {
 
 }  // namespace
 
-void Scheduler::handleEvent(const cache::PrefetchDone&) {
-    // Legacy storage-prefetch acknowledgements are irrelevant to the
-    // coordinator cache and intentionally have no state transition.
-}
-
 void Scheduler::handleEvent(const pd::BootstrappedEvent& event) {
-    Request* request = find_request(event.request_id);
+    Request* request = findRequest(event.request_id);
     if (request != nullptr && request->Is<fsm::Bootstrapping>()) {
         request->Apply(fsm::BootstrappedEvent{});
     }
 }
 
 void Scheduler::handleEvent(const pd::FailedEvent& event) {
-    Request* request = find_request(event.request_id);
+    Request* request = findRequest(event.request_id);
     if (request == nullptr || request->Is<fsm::Finished>()) {
         return;
     }
@@ -65,7 +60,7 @@ void Scheduler::handleEvent(const pd::FailedEvent& event) {
 }
 
 void Scheduler::handleEvent(const pd::SucceededEvent& event) {
-    Request* request = find_request(event.request_id);
+    Request* request = findRequest(event.request_id);
     if (request == nullptr || request->Is<fsm::Finished>()) {
         return;
     }
@@ -79,7 +74,7 @@ void Scheduler::handleEvent(const pd::SucceededEvent& event) {
 }
 
 void Scheduler::handleEvent(const pd::RemotePrefillDoneEvent& event) {
-    Request* request = find_request(event.request_id);
+    Request* request = findRequest(event.request_id);
     if (request == nullptr) {
         return;
     }
@@ -109,13 +104,13 @@ void Scheduler::handleEvent(const forward::Finish& event) {
             "PD Finish received while transfer pages are pinned");
     }
     pending_forward_results_.erase(event.request_id);
-    if (Request* request = find_request(event.request_id)) {
+    if (Request* request = findRequest(event.request_id)) {
         request->Apply(fsm::FinishEvent{&coordinator_});
     }
 }
 
 void Scheduler::handleEvent(const forward::UpdateReserveNumTokens& event) {
-    if (Request* request = find_request(event.request_id)) {
+    if (Request* request = findRequest(event.request_id)) {
         request->Apply(fsm::UpdateReserveNumTokensEvent{
             event.reserve_num_tokens_in_next_schedule_event});
     }
@@ -126,7 +121,7 @@ void Scheduler::handleEvent(const forward::ExtendResult& event) {
         it != pending_forward_results_.end() && --it->second <= 0) {
         pending_forward_results_.erase(it);
     }
-    if (Request* request = find_request(event.request_id)) {
+    if (Request* request = findRequest(event.request_id)) {
         request->Apply(fsm::ExtendResultEvent{event.tokens});
     }
 }
@@ -134,7 +129,7 @@ void Scheduler::handleEvent(const forward::ExtendResult& event) {
 void Scheduler::handleEvent(const forward::Abort& event) {
     pending_forward_results_.erase(event.request_id);
     pd_transfer_pins_.erase(event.request_id);
-    if (Request* request = find_request(event.request_id)) {
+    if (Request* request = findRequest(event.request_id)) {
         request->Apply(fsm::AbortEvent{&coordinator_});
     }
 }

@@ -53,7 +53,7 @@ inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* to
     std::vector<std::int32_t> shifted;
     shifted.reserve(static_cast<std::size_t>(window.size));
     if (shifted_size > 0) {
-        auto slice = token_container->GetTokenSlice(TokenContainer::Window{shifted_start, shifted_size});
+        auto slice = token_container->TokenSlice(TokenContainer::Window{shifted_start, shifted_size});
         shifted.insert(shifted.end(), slice.begin(), slice.end());
     }
     shifted.resize(static_cast<std::size_t>(window.size), -1);
@@ -64,9 +64,8 @@ struct Submitted {
     Submitted(TokenContainer* token_container, std::int32_t page_size)
         : token_container_{token_container}, page_size_{page_size} {}
 
-    TokenContainer* GetTokenContainer() const { return token_container_; }
-    std::int32_t GetPageSize() const { return page_size_; }
-    std::vector<std::int32_t> GetOccupiedPages() const { return {}; }
+    TokenContainer* TokenContainerPtr() const { return token_container_; }
+    std::int32_t PageSize() const { return page_size_; }
 
 private:
     TokenContainer* token_container_{};
@@ -87,26 +86,18 @@ struct ForwardState {
     ForwardState(ForwardState&&) noexcept = default;
     ForwardState& operator=(ForwardState&&) noexcept = default;
 
-    TokenContainer* GetTokenContainer() const { return token_container_; }
-    std::int32_t GetPageSize() const { return page_size_; }
-    auto GetFullPagedTokens(bool except_last = false) const {
-        return token_container_->GetFullPagedTokens(page_size_, except_last);
-    }
+    TokenContainer* TokenContainerPtr() const { return token_container_; }
+    std::int32_t PageSize() const { return page_size_; }
 
-    std::unique_ptr<ReqPoolIndex> TakeReqPoolIndex() && { return std::move(req_pool_index_); }
-    std::int32_t GetReqPoolIndex() const { return req_pool_index_ ? req_pool_index_->slot_ : -1; }
+    std::unique_ptr<ReqPoolIndex> TakeRequestPoolIndex() && { return std::move(req_pool_index_); }
+    std::int32_t RequestPoolIndex() const { return req_pool_index_ ? req_pool_index_->slot_ : -1; }
 
     std::vector<BlockTable>& BlockTables() { return block_tables_; }
     const std::vector<BlockTable>& BlockTables() const { return block_tables_; }
     std::vector<BlockTable> TakeBlockTables() && { return std::move(block_tables_); }
 
     CacheProgress TakeCacheProgress() && { return std::move(cache_progress_); }
-    const CacheProgress& CacheProgressValue() const { return cache_progress_; }
-
-    std::int32_t TailPageAvailableTokens() const {
-        _assert(!block_tables_.empty(), "forward state requires at least one cache group");
-        return block_tables_.front().AvailableTokens();
-    }
+    const CacheProgress& CacheProgressRef() const { return cache_progress_; }
 
     std::vector<std::int32_t> ActiveLcmBlockIds() const {
         std::vector<std::int32_t> ids;
@@ -139,9 +130,9 @@ struct Prefilling : public ForwardState {
           window{window},
           reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event} {}
 
-    std::span<const std::int32_t> PrefillInputIds() const { return token_container_->GetTokenSlice(window); }
+    std::span<const std::int32_t> PrefillInputIds() const { return token_container_->TokenSlice(window); }
     std::vector<std::int32_t> ShiftedInputIds() const { return ComputeShiftedInputIds(token_container_, window); }
-    PrefillInfo GetPrefillInfo() const {
+    PrefillInfo CurrentPrefillInfo() const {
         return PrefillInfo{
             .input_ids = PrefillInputIds(),
             .shifted_input_ids = ShiftedInputIds(),
@@ -150,9 +141,7 @@ struct Prefilling : public ForwardState {
         };
     }
 
-    std::int32_t GetReserveNumTokensInNextScheduleEvent() const {
-        return reserve_num_tokens_in_next_schedule_event_;
-    }
+    std::int32_t ReserveNumTokensInNextScheduleEvent() const { return reserve_num_tokens_in_next_schedule_event_; }
 
     TokenContainer::Window window{};
 
@@ -169,10 +158,10 @@ struct PrefillDone : public ForwardState {
           window{window},
           reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event} {}
 
-    std::int32_t GetReserveNumTokensInNextScheduleEvent() const { return reserve_num_tokens_in_next_schedule_event_; }
-    std::span<const std::int32_t> PrefillInputIds() const { return token_container_->GetTokenSlice(window); }
+    std::int32_t ReserveNumTokensInNextScheduleEvent() const { return reserve_num_tokens_in_next_schedule_event_; }
+    std::span<const std::int32_t> PrefillInputIds() const { return token_container_->TokenSlice(window); }
     std::vector<std::int32_t> ShiftedInputIds() const { return ComputeShiftedInputIds(token_container_, window); }
-    PrefillInfo GetPrefillInfo() const {
+    PrefillInfo CurrentPrefillInfo() const {
         return PrefillInfo{
             .input_ids = PrefillInputIds(),
             .shifted_input_ids = ShiftedInputIds(),
@@ -196,7 +185,7 @@ struct Decoding : public ForwardState {
                        std::move(cache_progress)),
           reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event} {}
 
-    std::int32_t GetReserveNumTokensInNextScheduleEvent() const {
+    std::int32_t ReserveNumTokensInNextScheduleEvent() const {
         _assert(reserve_num_tokens_in_next_schedule_event_ >= 0);
         return reserve_num_tokens_in_next_schedule_event_;
     }

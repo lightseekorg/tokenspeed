@@ -20,12 +20,9 @@
 
 #pragma once
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <map>
-#include <string>
 #include <unordered_set>
 #include <utility>
 #include <variant>
@@ -35,105 +32,59 @@
 
 namespace tokenspeed {
 
-struct CacheOperationBase {
-    cache_op_id op_id = 0;
-    std::vector<std::int32_t> src_pages;
-    std::vector<std::int32_t> dst_pages;
-};
-
-struct PrefetchOperation : public CacheOperationBase {
-    std::string request_id;
-    std::vector<std::string> rolling_page_hashes;
-};
-struct BackUpOperation : public CacheOperationBase {
-    std::vector<std::string> rolling_page_hashes;
-};
-enum class CacheKind : std::int32_t { kKV = 0, kMamba = 1 };
-
-inline const char* CacheKindName(CacheKind kind) {
-    switch (kind) {
-        case CacheKind::kKV:
-            return "kv";
-        case CacheKind::kMamba:
-            return "mamba";
-    }
-    return "unknown";
-}
-
 struct TransferPair {
-    CacheKind kind{CacheKind::kKV};
-    std::int32_t src{-1};
-    std::int32_t dst{-1};
+    std::int32_t source{-1};
+    std::int32_t destination{-1};
 
     bool operator==(const TransferPair& other) const {
-        return kind == other.kind && src == other.src && dst == other.dst;
+        return source == other.source && destination == other.destination;
     }
 };
 
 struct TransferPairHash {
     std::size_t operator()(const TransferPair& pair) const {
-        std::size_t h0 = std::hash<std::int32_t>{}(static_cast<std::int32_t>(pair.kind));
-        std::size_t h1 = std::hash<std::int32_t>{}(pair.src);
-        std::size_t h2 = std::hash<std::int32_t>{}(pair.dst);
-        return h0 ^ (h1 << 1) ^ (h2 << 32) ^ (h2 >> 32);
+        const std::size_t source_hash = std::hash<std::int32_t>{}(pair.source);
+        const std::size_t destination_hash = std::hash<std::int32_t>{}(pair.destination);
+        return source_hash ^ (destination_hash + 0x9e3779b9 + (source_hash << 6) + (source_hash >> 2));
     }
 };
 
 struct WriteBackOperation {
     cache_op_id op_id{0};
-    std::vector<TransferPair> transfers;  // DEVICE→HOST by cache kind.
-    bool is_retract{false};
+    std::vector<TransferPair> transfers;  // DEVICE→HOST.
 
     WriteBackOperation() = default;
-    WriteBackOperation(cache_op_id op_id, std::vector<TransferPair> transfers, bool is_retract = false)
-        : op_id{op_id}, transfers{std::move(transfers)}, is_retract{is_retract} {}
+    WriteBackOperation(cache_op_id op_id, std::vector<TransferPair> transfers)
+        : op_id{op_id}, transfers{std::move(transfers)} {}
 };
 
 struct WriteBackBatch {
     std::vector<cache_op_id> op_ids;
-    // Backward-compatible KV-only view.
     std::vector<std::vector<std::int32_t>> src_pages;
     std::vector<std::vector<std::int32_t>> dst_pages;
-    // Generic view keyed by CacheKindName(kind), currently "kv" and "mamba".
-    std::map<std::string, std::vector<std::vector<std::int32_t>>> src_pages_by_kind;
-    std::map<std::string, std::vector<std::vector<std::int32_t>>> dst_pages_by_kind;
-    std::vector<bool> is_retract;
 
     explicit WriteBackBatch(const std::vector<WriteBackOperation>& ops) {
         std::unordered_set<TransferPair, TransferPairHash> seen;
         for (const auto& op : ops) {
-            std::map<std::string, std::vector<std::int32_t>> src_this_op;
-            std::map<std::string, std::vector<std::int32_t>> dst_this_op;
-            src_this_op[CacheKindName(CacheKind::kKV)];
-            dst_this_op[CacheKindName(CacheKind::kKV)];
-            src_this_op[CacheKindName(CacheKind::kMamba)];
-            dst_this_op[CacheKindName(CacheKind::kMamba)];
-
+            std::vector<std::int32_t> operation_sources;
+            std::vector<std::int32_t> operation_destinations;
             for (const auto& transfer : op.transfers) {
                 if (seen.insert(transfer).second) {
-                    const std::string kind_name = CacheKindName(transfer.kind);
-                    src_this_op[kind_name].push_back(transfer.src);
-                    dst_this_op[kind_name].push_back(transfer.dst);
+                    operation_sources.push_back(transfer.source);
+                    operation_destinations.push_back(transfer.destination);
                 }
             }
 
             op_ids.push_back(op.op_id);
-            src_pages.push_back(src_this_op[CacheKindName(CacheKind::kKV)]);
-            dst_pages.push_back(dst_this_op[CacheKindName(CacheKind::kKV)]);
-            for (auto& [kind, pages] : src_this_op) {
-                src_pages_by_kind[kind].push_back(std::move(pages));
-            }
-            for (auto& [kind, pages] : dst_this_op) {
-                dst_pages_by_kind[kind].push_back(std::move(pages));
-            }
-            is_retract.push_back(op.is_retract);
+            src_pages.push_back(std::move(operation_sources));
+            dst_pages.push_back(std::move(operation_destinations));
         }
     }
 };
 
 struct LoadBackOperation {
     cache_op_id op_id{0};
-    std::vector<TransferPair> transfers;  // HOST→DEVICE by cache kind.
+    std::vector<TransferPair> transfers;  // HOST→DEVICE.
 
     LoadBackOperation() = default;
     LoadBackOperation(cache_op_id op_id, std::vector<TransferPair> transfers)
@@ -142,44 +93,28 @@ struct LoadBackOperation {
 
 struct LoadBackBatch {
     std::vector<cache_op_id> op_ids;
-    // Backward-compatible KV-only view.
     std::vector<std::vector<std::int32_t>> src_pages;
     std::vector<std::vector<std::int32_t>> dst_pages;
-    // Generic view keyed by CacheKindName(kind), currently "kv" and "mamba".
-    std::map<std::string, std::vector<std::vector<std::int32_t>>> src_pages_by_kind;
-    std::map<std::string, std::vector<std::vector<std::int32_t>>> dst_pages_by_kind;
 
     explicit LoadBackBatch(const std::vector<LoadBackOperation>& ops) {
         std::unordered_set<TransferPair, TransferPairHash> seen;
         for (const auto& op : ops) {
-            std::map<std::string, std::vector<std::int32_t>> src_this_op;
-            std::map<std::string, std::vector<std::int32_t>> dst_this_op;
-            src_this_op[CacheKindName(CacheKind::kKV)];
-            dst_this_op[CacheKindName(CacheKind::kKV)];
-            src_this_op[CacheKindName(CacheKind::kMamba)];
-            dst_this_op[CacheKindName(CacheKind::kMamba)];
-
+            std::vector<std::int32_t> operation_sources;
+            std::vector<std::int32_t> operation_destinations;
             for (const auto& transfer : op.transfers) {
                 if (seen.insert(transfer).second) {
-                    const std::string kind_name = CacheKindName(transfer.kind);
-                    src_this_op[kind_name].push_back(transfer.src);
-                    dst_this_op[kind_name].push_back(transfer.dst);
+                    operation_sources.push_back(transfer.source);
+                    operation_destinations.push_back(transfer.destination);
                 }
             }
 
             op_ids.push_back(op.op_id);
-            src_pages.push_back(src_this_op[CacheKindName(CacheKind::kKV)]);
-            dst_pages.push_back(dst_this_op[CacheKindName(CacheKind::kKV)]);
-            for (auto& [kind, pages] : src_this_op) {
-                src_pages_by_kind[kind].push_back(std::move(pages));
-            }
-            for (auto& [kind, pages] : dst_this_op) {
-                dst_pages_by_kind[kind].push_back(std::move(pages));
-            }
+            src_pages.push_back(std::move(operation_sources));
+            dst_pages.push_back(std::move(operation_destinations));
         }
     }
 };
 
-using CacheOperation = std::variant<PrefetchOperation, LoadBackBatch, BackUpOperation, WriteBackBatch>;
+using CacheOperation = std::variant<LoadBackBatch, WriteBackBatch>;
 
 }  // namespace tokenspeed

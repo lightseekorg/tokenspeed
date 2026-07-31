@@ -56,7 +56,6 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     cache_sync_debug_enabled,
     make_config,
     pool_to_paged_cache_groups,
-    pool_to_prefix_cache_adjunct_spec,
     pop_common_cache_event_payloads,
     scheduler_cache_geometry_from_pool,
     should_use_overlap_schedule,
@@ -344,10 +343,6 @@ class EventLoop:
             speculative_algorithm=server_args.speculative_algorithm,
         )
         self._paged_cache_groups = paged_cache_groups
-        prefix_cache_adjunct = None
-        required_groups = token_to_kv_pool.prefix_cache_required_group_ids
-        if required_groups is not None and server_args.enable_prefix_caching:
-            prefix_cache_adjunct = pool_to_prefix_cache_adjunct_spec(required_groups)
         # State-snapshot groups only register prefix-cache pages when a chunk
         # ends page-aligned; floor the chunk size to that grain or reuse is 0.
         max_scheduled_tokens = server_args.chunked_prefill_size
@@ -374,7 +369,6 @@ class EventLoop:
             num_host_pages=num_host_pages,
             disable_l2_cache=not server_args.enable_kvstore,
             enable_l3_storage=server_args.kvstore_storage_backend is not None,
-            prefetch_threshold=4,  # Keep this hard-coded until it becomes configurable.
             role=server_args.disaggregation_mode,
             enable_kv_cache_events=self._kv_events_enabled,
             decode_input_tokens=decode_input_tokens,
@@ -382,7 +376,6 @@ class EventLoop:
             disable_prefix_cache=not server_args.enable_prefix_caching,
             paged_cache_groups=paged_cache_groups,
             enable_mixed_prefill_decode=server_args.enable_mixed_batch,
-            prefix_cache_adjunct=prefix_cache_adjunct,
         )
         scheduler_cfg.enable_pd_cache = self._pd_cache_enabled
         logger.info(
@@ -960,8 +953,6 @@ class EventLoop:
             elif isinstance(op, Cache.LoadBackOp):
                 if self._loadback_acks_expected:
                     self._num_inflight_cache_ops += len(op.op_ids)
-            elif isinstance(op, (Cache.PrefetchOp, Cache.BackUpOp)):
-                self._num_inflight_cache_ops += 1
             else:
                 raise ValueError(f"unsupported cache op kind: {type(op).__name__}")
         self._setup_layerwise_loadback(execution_plan)

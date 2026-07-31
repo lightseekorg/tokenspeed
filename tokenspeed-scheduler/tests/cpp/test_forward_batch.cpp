@@ -63,7 +63,7 @@ TEST(ForwardBatch, EmptyOpsProducesEmpty) {
     ForwardBatch batch{std::vector<ForwardOperation>{}};
 
     EXPECT_TRUE(batch.empty());
-    EXPECT_EQ(batch.num_extends(), 0u);
+    EXPECT_EQ(batch.NumExtends(), 0u);
     EXPECT_TRUE(batch.request_ids.empty());
     EXPECT_TRUE(batch.block_tables.empty());
 }
@@ -114,7 +114,7 @@ TEST(ForwardBatch, PrefillBeforeDecodeKeepsRowsAlignedWithRequests) {
     EXPECT_EQ(full.at(0), (std::vector<std::int32_t>{10, 11}));
     EXPECT_EQ(full.at(1), (std::vector<std::int32_t>{20, -1}));
 
-    EXPECT_EQ(batch.num_extends(), 1u);
+    EXPECT_EQ(batch.NumExtends(), 1u);
     EXPECT_EQ(batch.input_ids, (std::vector<std::int32_t>{7, 8}));
     EXPECT_EQ(batch.decode_input_ids, (std::vector<std::int32_t>{99}));
 }

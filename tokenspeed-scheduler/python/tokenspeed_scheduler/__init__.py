@@ -28,7 +28,6 @@ from tokenspeed_scheduler.tokenspeed_scheduler_ext import (  # Core; Execution p
     PagedCacheGroupFamily,
     PagedCacheRetention,
     PagedCacheTransferPolicy,
-    PrefixCacheAdjunctSpec,
     RequestSpec,
     Scheduler,
     SchedulerConfig,
@@ -66,7 +65,6 @@ __all__ = [
     "PagedCacheGroupConfig",
     "PagedCacheGroupFamily",
     "PagedCacheTransferPolicy",
-    "PrefixCacheAdjunctSpec",
     # Execution plan & operations
     "ExecutionPlan",
     "Forward",

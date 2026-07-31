@@ -65,17 +65,17 @@ public:
         return std::holds_alternative<State>(state_);
     }
 
-    std::vector<std::span<const std::int32_t>> GetFullPagedTokens(bool except_last) const {
-        return token_container_.GetFullPagedTokens(page_size_, except_last);
+    std::vector<std::span<const std::int32_t>> FullPagedTokens(bool except_last) const {
+        return token_container_.FullPagedTokens(page_size_, except_last);
     }
 
     std::int32_t TokenSize() const { return token_container_.Size(); }
-    std::int32_t GetLastToken() const { return token_container_.LastToken(); }
+    std::int32_t LastToken() const { return token_container_.LastToken(); }
     std::int32_t PrefillSize() const { return token_container_.PrefillSize(); }
 
-    PrefillInfo GetPrefillInfo() const;
+    PrefillInfo CurrentPrefillInfo() const;
 
-    std::int32_t UnScheduledPrefillSize() const {
+    std::int32_t UnscheduledPrefillSize() const {
         return std::visit(
             Overloaded{
                 [](const fsm::Submitted&) -> std::int32_t { return -1; },
@@ -87,9 +87,7 @@ public:
             state_);
     }
 
-    std::int32_t GetReqPoolIndex() const {
-        return forwardState("GetReqPoolIndex").GetReqPoolIndex();
-    }
+    std::int32_t RequestPoolIndex() const { return forwardState("RequestPoolIndex").RequestPoolIndex(); }
 
     std::vector<std::int32_t> ActiveLcmBlockIds() const {
         return forwardState("ActiveLcmBlockIds").ActiveLcmBlockIds();
@@ -103,18 +101,16 @@ public:
         return forwardState("BlockTablesRef").BlockTables();
     }
 
-    fsm::CacheProgress CacheProgress() const {
-        return forwardState("CacheProgress").CacheProgressValue();
-    }
+    fsm::CacheProgress CacheProgress() const { return forwardState("CacheProgress").CacheProgressRef(); }
 
-    std::int32_t GetReserveNumTokensInNextScheduleEvent() const {
+    std::int32_t ReserveNumTokensInNextScheduleEvent() const {
         return std::visit(
             Overloaded{
-                [](const fsm::PrefillDone& state) { return state.GetReserveNumTokensInNextScheduleEvent(); },
-                [](const fsm::Decoding& state) { return state.GetReserveNumTokensInNextScheduleEvent(); },
+                [](const fsm::PrefillDone& state) { return state.ReserveNumTokensInNextScheduleEvent(); },
+                [](const fsm::Decoding& state) { return state.ReserveNumTokensInNextScheduleEvent(); },
                 [this](const auto&) -> std::int32_t {
                     throw std::logic_error(
-                        "Request::GetReserveNumTokensInNextScheduleEvent: expected PrefillDone or Decoding; got " +
+                        "Request::ReserveNumTokensInNextScheduleEvent: expected PrefillDone or Decoding; got " +
                         StateName());
                 },
             },

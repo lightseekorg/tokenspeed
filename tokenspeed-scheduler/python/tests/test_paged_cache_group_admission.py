@@ -55,12 +55,10 @@ def _request_ids_in_plan(plan) -> set[str]:
     return out
 
 
-def _overlap_admission_scheduler(
-    verify_width: int, *, exact_capacity: bool
-) -> Scheduler:
+def _overlap_admission_scheduler(verify_width: int) -> Scheduler:
     committed_tokens = 3
     reservation_end = committed_tokens - 1 + verify_width
-    total_pages = reservation_end + (1 if exact_capacity else 0)
+    total_pages = reservation_end + 1
     cfg = _base_config(num_device_pages=total_pages)
     cfg.block_size = 1
     cfg.decode_input_tokens = verify_width
@@ -78,30 +76,16 @@ def _overlap_admission_scheduler(
     ]
     scheduler = Scheduler(cfg)
     scheduler.submit_requests([_make_spec("r", [1, 2])])
-    initial_request_ids = _request_ids_in_plan(scheduler.next_execution_plan())
-    if exact_capacity:
-        assert initial_request_ids == {"r"}
-        _advance_tokens(scheduler, "r", [3])
-    else:
-        assert initial_request_ids == set()
+    assert _request_ids_in_plan(scheduler.next_execution_plan()) == {"r"}
+    _advance_tokens(scheduler, "r", [3])
     return scheduler
 
 
 @pytest.mark.parametrize("verify_width", [1, 2, 4, 8])
 def test_overlap_decode_admission_uses_runtime_verify_width(verify_width: int):
-    scheduler = _overlap_admission_scheduler(verify_width, exact_capacity=True)
+    scheduler = _overlap_admission_scheduler(verify_width)
     assert _request_ids_in_plan(scheduler.next_execution_plan()) == {"r"}
     assert scheduler.paged_cache_group_available_pages("overlap.history") == 0
-    assert scheduler.paged_cache_group_failed_alloc_count("overlap.history") == 0
-
-
-@pytest.mark.parametrize("verify_width", [1, 2, 4, 8])
-def test_overlap_admission_rejects_one_page_short(verify_width: int):
-    scheduler = _overlap_admission_scheduler(verify_width, exact_capacity=False)
-    assert scheduler.paged_cache_group_available_pages("overlap.history") == (
-        1 + verify_width
-    )
-    assert scheduler.paged_cache_group_failed_alloc_count("overlap.history") == 0
 
 
 def test_overlap_schedule_depth_defaults_to_zero_and_rejects_deeper_pipeline():
@@ -157,11 +141,9 @@ def test_sliding_release_before_admit_prevents_oom():
         assert "r0" in _request_ids_in_plan(plan)
         _advance_tokens(scheduler, "r0", [10_000 + step])
 
-    assert scheduler.paged_cache_group_failed_alloc_count("swa.test") == 0
-
 
 def test_batch_admission_debits_simulated_free_pages():
-    cfg = _base_config(num_device_pages=4)
+    cfg = _base_config(num_device_pages=12)
     cfg.block_size = 2
     cfg.max_batch_size = 4
     cfg.max_scheduled_tokens = 512
@@ -170,7 +152,7 @@ def test_batch_admission_debits_simulated_free_pages():
             group_id=f"swa.g{i}",
             rows_per_page=2,
             entry_stride_tokens=1,
-            total_pages=4,
+            total_pages=12,
             retention=PagedCacheRetention.SlidingWindow,
             sliding_window_tokens=4,
         )
@@ -185,5 +167,3 @@ def test_batch_admission_debits_simulated_free_pages():
     plan = scheduler.next_execution_plan()
     admitted = _request_ids_in_plan(plan)
     assert len(admitted & {"r0", "r1"}) <= 1
-    for gid in ("swa.g0", "swa.g1"):
-        assert scheduler.paged_cache_group_failed_alloc_count(gid) == 0

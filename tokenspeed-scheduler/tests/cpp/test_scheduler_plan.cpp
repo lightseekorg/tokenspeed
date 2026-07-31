@@ -138,12 +138,6 @@ TEST_F(DisablePrefixCacheTestSuite, SamePromptDoesNotReuseDevicePrefix) {
     EXPECT_TRUE(ExtractCacheOpsOfKind<LoadBackBatch>(plan).empty());
 }
 
-TEST_F(DisablePrefixCacheTestSuite, PrefetchNotGeneratedForStorageHit) {
-    Submit(MakePrefetchableSpec("r1", 8, 6));
-    auto plan = PlanOnce();
-    EXPECT_TRUE(ExtractCacheOpsOfKind<PrefetchOperation>(plan).empty());
-}
-
 class StableCandidateOrderingSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
@@ -155,10 +149,10 @@ protected:
     }
 };
 
-TEST_F(StableCandidateOrderingSuite, NewForwardOperationTieBreaksOnRequestId) {
+TEST_F(StableCandidateOrderingSuite, ForwardOperationsTieBreakOnRequestId) {
     // TP-determinism regression: requests_ is unordered_map<string, ...> so
     // candidates are visited in per-process random order. Without an Id()
-    // tiebreaker in newForwardOperation's sort, each rank picks a different
+    // Without the request-id tiebreaker in buildForwardOperations, each rank picks a different
     // request when the loop budget admits only a subset — making forward_op
     // None on some ranks and non-None on others, which deadlocks NCCL.
     Submit(MakeRequestSpec("r_ccc", 2, 300));
@@ -175,7 +169,7 @@ TEST_F(StableCandidateOrderingSuite, NewForwardOperationTieBreaksOnRequestId) {
     EXPECT_EQ(ids[0], "r_aaa");
 }
 
-TEST_F(StableCandidateOrderingSuite, ForwardOpIsInsertionOrderIndependent) {
+TEST_F(StableCandidateOrderingSuite, ForwardBatchIsInsertionOrderIndependent) {
     // Mirror of the above using two scheduler instances fed the same request
     // set in opposite submit orders. The chosen forward request must depend
     // only on the SET of request ids, not the submission sequence.

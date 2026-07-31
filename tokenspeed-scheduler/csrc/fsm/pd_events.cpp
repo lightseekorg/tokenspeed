@@ -39,11 +39,10 @@ Finished SucceededEvent::operator()(Decoding&& /*state*/) {
 
 PrefillDone RemotePrefillDoneEvent::operator()(Prefilling&& state) {
     const TokenContainer::Window window = state.window;
-    TokenContainer* token_container = state.GetTokenContainer();
-    const std::int32_t page_size = state.GetPageSize();
-    const std::int32_t reserve_num_tokens_in_next_schedule_event =
-        state.GetReserveNumTokensInNextScheduleEvent();
-    auto req_pool_index = std::move(state).TakeReqPoolIndex();
+    TokenContainer* token_container = state.TokenContainerPtr();
+    const std::int32_t page_size = state.PageSize();
+    const std::int32_t reserve_num_tokens_in_next_schedule_event = state.ReserveNumTokensInNextScheduleEvent();
+    auto req_pool_index = std::move(state).TakeRequestPoolIndex();
     auto block_tables = std::move(state).TakeBlockTables();
     auto cache_progress = std::move(state).TakeCacheProgress();
     auto prefill_done =

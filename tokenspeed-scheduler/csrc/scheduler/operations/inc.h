@@ -27,6 +27,6 @@
 
 namespace tokenspeed {
 
-using Operation = std::variant<CacheOperation, ForwardOperation, ForwardBatch>;
+using Operation = std::variant<CacheOperation, ForwardBatch>;
 
 }  // namespace tokenspeed

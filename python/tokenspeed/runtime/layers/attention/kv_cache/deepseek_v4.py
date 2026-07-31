@@ -978,14 +978,6 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
             self.compressed_block_sizes,
         )
 
-    @property
-    def prefix_cache_required_group_ids(self) -> tuple[str, ...]:
-        return tuple(
-            str(spec.group_id)
-            for spec in self.paged_cache_group_specs
-            if spec.family == "history"
-        )
-
     def bind_paged_cache_scheduler(self, scheduler: object) -> None:
         self._paged_cache_scheduler = scheduler
 
@@ -1000,10 +992,8 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
         for group_id in self._paged_cache_state_group_ids:
             total = scheduler.paged_cache_group_total_pages(group_id)
             available = scheduler.paged_cache_group_available_pages(group_id)
-            failed = scheduler.paged_cache_group_failed_alloc_count(group_id)
             parts.append(
-                f"{group_id}: used={total - available}/{total}, "
-                f"available={available}, failed_alloc={failed}"
+                f"{group_id}: used={total - available}/{total}, available={available}"
             )
         logger.debug("DeepSeek V4 paged-cache state group pages. %s", "; ".join(parts))
 

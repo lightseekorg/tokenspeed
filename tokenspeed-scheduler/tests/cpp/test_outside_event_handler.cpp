@@ -22,10 +22,10 @@
 
 namespace tokenspeed::test {
 
-inline const ForwardBatch* GetForwardOp(const std::vector<Operation>& ops) {
-    for (const auto& op : ops) {
-        if (auto* f = std::get_if<ForwardBatch>(&op)) {
-            return f;
+inline const ForwardBatch* FindForwardBatch(const std::vector<Operation>& operations) {
+    for (const auto& operation : operations) {
+        if (auto* batch = std::get_if<ForwardBatch>(&operation)) {
+            return batch;
         }
     }
     return nullptr;
@@ -86,14 +86,6 @@ protected:
         PlanOnce();
     }
 
-    static const LoadBackBatch* GetLoadBack(const ExecutionPlan& plan) {
-        for (const auto& op : plan.Operations()) {
-            if (auto* cop = std::get_if<CacheOperation>(&op)) {
-                if (auto* lb = std::get_if<LoadBackBatch>(cop)) return lb;
-            }
-        }
-        return nullptr;
-    }
 };
 
 // After host cache is populated, a new request with same tokens should see
@@ -103,12 +95,12 @@ TEST_F(LoadBackDoneTestSuite, LoadBackDone_Success_PrefixLenChangesInForward) {
 
     Submit(MakeRequestSpec("r2", /*num_pages=*/2, /*start=*/1));
     auto plan = PlanOnce();
-    auto* fwd = GetForwardOp(plan.Operations());
+    auto* fwd = FindForwardBatch(plan.Operations());
     ASSERT_NE(fwd, nullptr);
     auto idx = FindRequestIndex(fwd, "r2");
     ASSERT_GE(idx, 0) << "r2 should be in forward after host cache hit";
 
-    // With block_size=2 and 4 prefill tokens, GetFullPagedTokens(except_last=true)
+    // With block_size=2 and 4 prefill tokens, FullPagedTokens(except_last=true)
     // yields 3 tokens → 1 matchable page. Host has 2 pages but only 1 matches.
     // unscheduled = 4 - 1*2 = 2, so input_length = 2 and extend_prefix_len = 1*block_size = 2.
     EXPECT_EQ(fwd->input_lengths[idx], 2) << "host hit covers 1 page; 2 tokens remain";
@@ -175,7 +167,7 @@ TEST_F(DisaggDecodeAdmissionTestSuite, ReservesWholeDestinationAndSurvivesRemote
     SendBootstrapped("r0");
 
     const ExecutionPlan admission = PlanOnce();
-    const ForwardBatch* prefill = GetForwardOp(admission.Operations());
+    const ForwardBatch* prefill = FindForwardBatch(admission.Operations());
     ASSERT_NE(prefill, nullptr);
     EXPECT_EQ(prefill->request_ids, (std::vector<std::string>{"r0"}));
     EXPECT_EQ(prefill->input_lengths, (std::vector<std::int32_t>{4}));
@@ -185,7 +177,7 @@ TEST_F(DisaggDecodeAdmissionTestSuite, ReservesWholeDestinationAndSurvivesRemote
 
     SendRemotePrefillDone("r0", /*bootstrap_token=*/42);
     const ExecutionPlan decode_plan = PlanOnce();
-    const ForwardBatch* decode = GetForwardOp(decode_plan.Operations());
+    const ForwardBatch* decode = FindForwardBatch(decode_plan.Operations());
     ASSERT_NE(decode, nullptr);
     const std::int32_t r0 = FindRequestIndex(decode, "r0");
     ASSERT_GE(r0, 0);
@@ -237,7 +229,7 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, MaterializesHistoryAndLatestStateSnapsh
     SendBootstrapped("r0");
 
     const ExecutionPlan plan = PlanOnce();
-    const ForwardBatch* destination = GetForwardOp(plan.Operations());
+    const ForwardBatch* destination = FindForwardBatch(plan.Operations());
     ASSERT_NE(destination, nullptr);
     const auto& full = destination->block_tables.at("full").at(0);
     ASSERT_EQ(full.size(), 5u);
@@ -259,7 +251,7 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, MaterializesHistoryAndLatestStateSnapsh
     SendRemotePrefillDone("r0", /*bootstrap_token=*/42);
     EXPECT_FALSE(scheduler_->PdTransferPinned("r0"));
     const ExecutionPlan decode_plan = PlanOnce();
-    const ForwardBatch* decode = GetForwardOp(decode_plan.Operations());
+    const ForwardBatch* decode = FindForwardBatch(decode_plan.Operations());
     ASSERT_NE(decode, nullptr);
     EXPECT_EQ(decode->block_tables, destination->block_tables);
 
@@ -283,7 +275,7 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, ReusesHistoryPrefixAndLeavesStatePrefix
     Submit({MakeRequestSpec("r1", /*num_pages=*/4, /*start=*/1)});
     SendBootstrapped("r1");
     const ExecutionPlan plan = PlanOnce();
-    const ForwardBatch* destination = GetForwardOp(plan.Operations());
+    const ForwardBatch* destination = FindForwardBatch(plan.Operations());
     ASSERT_NE(destination, nullptr);
     EXPECT_EQ(destination->input_lengths, (std::vector<std::int32_t>{2}));
 
@@ -307,7 +299,7 @@ TEST_F(PdSparseDecodeNoPrefixCacheTestSuite, RemoteBootstrapConsumesSparseTailBe
     SendRemotePrefillDone("r0", /*bootstrap_token=*/42);
 
     const ExecutionPlan first_decode = PlanOnce();
-    const ForwardBatch* first = GetForwardOp(first_decode.Operations());
+    const ForwardBatch* first = FindForwardBatch(first_decode.Operations());
     ASSERT_NE(first, nullptr);
     ASSERT_EQ(first->request_ids, (std::vector<std::string>{"r0"}));
     ASSERT_EQ(first->block_tables.count("state"), 1u);
@@ -315,7 +307,7 @@ TEST_F(PdSparseDecodeNoPrefixCacheTestSuite, RemoteBootstrapConsumesSparseTailBe
 
     SendForwardDone("r0", {43});
     const ExecutionPlan second_decode = PlanOnce();
-    const ForwardBatch* second = GetForwardOp(second_decode.Operations());
+    const ForwardBatch* second = FindForwardBatch(second_decode.Operations());
     ASSERT_NE(second, nullptr);
     ASSERT_EQ(second->request_ids, (std::vector<std::string>{"r0"}));
     ASSERT_EQ(second->block_tables.count("state"), 1u);
@@ -323,7 +315,7 @@ TEST_F(PdSparseDecodeNoPrefixCacheTestSuite, RemoteBootstrapConsumesSparseTailBe
 
     SendForwardDone("r0", {44});
     const ExecutionPlan boundary_decode = PlanOnce();
-    const ForwardBatch* boundary = GetForwardOp(boundary_decode.Operations());
+    const ForwardBatch* boundary = FindForwardBatch(boundary_decode.Operations());
     ASSERT_NE(boundary, nullptr);
     ASSERT_EQ(boundary->request_ids, (std::vector<std::string>{"r0"}));
     ASSERT_EQ(boundary->block_tables.count("state"), 1u);

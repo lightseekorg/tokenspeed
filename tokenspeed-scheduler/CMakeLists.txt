@@ -116,7 +116,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_kv_cache_scenarios.cpp
         tests/cpp/test_scheduler_plan.cpp
         tests/cpp/test_outside_event_handler.cpp
-        tests/cpp/test_cache_operation_kinds.cpp
+        tests/cpp/test_cache_operations.cpp
         tests/cpp/test_req_pool_allocator.cpp
     )
 

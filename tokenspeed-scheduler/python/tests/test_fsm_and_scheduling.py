@@ -32,7 +32,6 @@ Covers:
 
 import pytest
 from tokenspeed_scheduler import (
-    Cache,
     ExecutionEvent,
     ExecutionPlan,
     ForwardEvent,
@@ -188,7 +187,7 @@ class TestFSMTransitions:
         s.next_execution_plan()  # r0 erased (FinishEvent was already applied via advance)
 
         assert s.decoding_size() == 0
-        assert s.get_request_token_size("r0") == -1
+        assert s.request_token_size("r0") == -1
 
     def test_output_tokens_appended_via_advance(self):
         """advance with tokens extends the token container."""
@@ -201,7 +200,7 @@ class TestFSMTransitions:
         assert decode_plan.forward[0].num_extends() == 0
 
         advance_forward(s, "r0", tokens=[99])
-        assert s.get_request_token_size("r0") == 5  # 4 input + 1 output
+        assert s.request_token_size("r0") == 5  # 4 input + 1 output
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +252,7 @@ class TestChunkedPrefill:
 
         plan = s.next_execution_plan()
         assert plan.forward[0].num_extends() > 0
-        assert s.get_request_token_size("r0") == 20
+        assert s.request_token_size("r0") == 20
 
 
 # ---------------------------------------------------------------------------
@@ -409,7 +408,7 @@ class TestDecodeBatch:
         send_reserve_num_tokens(s, "r1", 0)
         plan = s.next_execution_plan()
 
-        assert s.get_request_token_size("r0") == -1  # erased
+        assert s.request_token_size("r0") == -1  # erased
         assert s.decoding_size() == 1  # r1 still decoding
         assert plan.forward[0].num_extends() == 0
         assert plan.forward[0].request_ids == ["r1"]
@@ -426,7 +425,7 @@ class TestDecodeBatch:
             plan = s.next_execution_plan()
             assert plan.forward[0].num_extends() == 0
             advance_forward(s, "r0", tokens=[100 + step])
-            assert s.get_request_token_size("r0") == 4 + step + 1
+            assert s.request_token_size("r0") == 4 + step + 1
 
 
 # ---------------------------------------------------------------------------
@@ -681,76 +680,6 @@ class TestUpdateReserveNumTokens:
 # ---------------------------------------------------------------------------
 
 
-def _make_retract_config(
-    page_size: int = 2, num_device_pages: int = 2, num_host_pages: int = 16
-) -> SchedulerConfig:
-    """Config with very limited device pages to force a retract quickly."""
-    cfg = SchedulerConfig()
-    cfg.block_size = page_size
-    cfg.num_device_pages = num_device_pages
-    cfg.num_host_pages = num_host_pages
-    cfg.max_scheduled_tokens = 512
-    cfg.max_batch_size = 8
-    cfg.paged_cache_groups = [
-        PagedCacheGroupConfig(
-            group_id="full_attention",
-            rows_per_page=page_size,
-            entry_stride_tokens=1,
-            total_pages=num_device_pages,
-            retention=PagedCacheRetention.FullHistory,
-            family=PagedCacheGroupFamily.History,
-        )
-    ]
-    return cfg
-
-
-def _send_write_back_done(scheduler: Scheduler, op_id: int) -> None:
-    ev = Cache.WriteBackDoneEvent()
-    ev.op_id = op_id
-    ev.success = True
-    ec = ExecutionEvent()
-    ec.add_event(ev)
-    scheduler.advance(ec)
-
-
-def _writeback_ops(plan: ExecutionPlan):
-    return [
-        cache_op for cache_op in plan.cache if isinstance(cache_op, Cache.WriteBackOp)
-    ]
-
-
-class TestWriteBackPriority:
-    def test_finish_writeback_is_not_retract_writeback(self):
-        s = Scheduler(_make_retract_config(page_size=2, num_device_pages=16))
-        submit(s, "r0", [10, 11])
-
-        s.next_execution_plan()
-        advance_forward(s, "r0", tokens=[42])
-        s.next_execution_plan()
-        advance_forward(s, "r0", finish=True)
-
-        plan = s.next_execution_plan()
-        writebacks = _writeback_ops(plan)
-
-        assert len(writebacks) == 1
-        assert writebacks[0].is_retract == [False]
-
-    def test_retract_writeback_is_marked_as_retract(self):
-        s = Scheduler(_make_retract_config(page_size=2, num_device_pages=3))
-        submit(s, "r0", [10, 11])
-
-        s.next_execution_plan()
-        advance_forward(s, "r0", tokens=[42])
-        s.next_execution_plan()
-        send_reserve_num_tokens(s, "r0", n=4)
-
-        plan = s.next_execution_plan()
-        writebacks = _writeback_ops(plan)
-
-        assert len(writebacks) == 1
-        assert writebacks[0].is_retract == [True]
-
-
 class TestDecodeInputIds:
     """Verify that ForwardBatch.decode_input_ids is populated correctly."""
 
@@ -763,40 +692,6 @@ class TestDecodeInputIds:
         op = decode_plan.forward[0]
         assert len(op.decode_input_ids) == 1
         assert op.decode_input_ids[0] == -1
-
-    def test_retract_recovered_carries_last_prefill_token(self):
-        """Retract-recovered request carries the last prefill token as decode_input_id."""
-        # page_size=2, 4 device pages allow prefill to enter Decoding, then reserve
-        # pressure triggers retract.
-        s = Scheduler(_make_retract_config(page_size=2, num_device_pages=4))
-        last_token = 77
-        submit(s, "r0", [10, last_token])  # exactly 1 page
-
-        s.next_execution_plan()  # Submitted → PrefillDone
-        advance_forward(s, "r0", tokens=[last_token])
-        s.next_execution_plan()  # PrefillDone → Decoding  (device now full)
-
-        # Force retract: reserve=4 needs 2 extra pages, but device is full.
-        send_reserve_num_tokens(s, "r0", n=4)
-        retract_plan = s.next_execution_plan()
-
-        # ACK the WriteBack op so request transitions to Retracted.
-        wb_op_id = None
-        for cache_op in retract_plan.cache:
-            if hasattr(cache_op, "op_ids") and cache_op.op_ids:
-                wb_op_id = cache_op.op_ids[0]
-                break
-        assert wb_op_id is not None, "Expected a WriteBack cache op"
-        _send_write_back_done(s, wb_op_id)
-
-        # Recovery plan: ScheduleDecodeFromRetractedEvent → decode_input_id = last_token.
-        recovery_plan = s.next_execution_plan()
-        assert recovery_plan.forward, "Expected forward op in recovery plan"
-        op = recovery_plan.forward[0]
-        assert len(op.decode_input_ids) > 0
-        assert (
-            op.decode_input_ids[0] == last_token
-        ), f"Expected {last_token}, got {op.decode_input_ids[0]}"
 
     def test_mixed_batch_decode_input_ids_length(self):
         """decode_input_ids has one entry per decode request; all -1 for normal decodes."""

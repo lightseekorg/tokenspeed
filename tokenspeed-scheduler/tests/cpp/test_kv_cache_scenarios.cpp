@@ -651,7 +651,7 @@ TEST_F(MixedBatchSuite, PrefillAndDecodeShareOnePlan) {
     ASSERT_NE(op, nullptr);
 
     ASSERT_EQ(op->request_ids.size(), 2u);
-    EXPECT_EQ(op->num_extends(), 1u) << "exactly one prefill row (r2)";
+    EXPECT_EQ(op->NumExtends(), 1u) << "exactly one prefill row (r2)";
     EXPECT_EQ(op->decode_input_ids.size(), 1u) << "exactly one decode row (r1)";
 
     EXPECT_EQ(op->request_ids.at(0), "r2") << "prefill partitioned first";
@@ -1246,7 +1246,7 @@ TEST_F(RetractSuite, DecodingRequestReleasesPagesAndRequeues) {
 
 TEST_F(RetractSuite, RetractedRequestPrefillCoversOldTokens) {
     DriveToRetractOfA();
-    EXPECT_EQ(scheduler_->GetRequestTokenSize("a"), 9);
+    EXPECT_EQ(scheduler_->RequestTokenSize("a"), 9);
 
     // Free the running request so the retracted request re-admits immediately.
     SendFinish("b");
@@ -1325,7 +1325,7 @@ protected:
         ASSERT_TRUE(FindForwardBatch(retract_round)->request_ids.empty());
         ASSERT_EQ(scheduler_->PoolFreeBlocks(), 8);
         ASSERT_EQ(scheduler_->WaitingSize(), 1u);
-        ASSERT_EQ(scheduler_->GetRequestTokenSize("a"), 9);
+        ASSERT_EQ(scheduler_->RequestTokenSize("a"), 9);
 
         // Free the survivor so a re-admits alone.
         SendFinish("b");
@@ -1718,7 +1718,7 @@ TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
     request.Apply(fsm::RemotePrefillDoneEvent{/*token=*/42});
 
     ASSERT_TRUE(request.Is<fsm::PrefillDone>());
-    EXPECT_EQ(request.GetReserveNumTokensInNextScheduleEvent(), 3);
+    EXPECT_EQ(request.ReserveNumTokensInNextScheduleEvent(), 3);
 }
 
 // Drive the FSM directly to pin the PrefillDone retract overload.

@@ -34,32 +34,36 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
     _assert(block_tables_.size() == static_cast<std::size_t>(coordinator_->NumGroups()),
             "SchedulePrefillFirstChunkEvent requires one admitted table per cache group");
 
-    TokenContainer* token_container = state.GetTokenContainer();
+    TokenContainer* token_container = state.TokenContainerPtr();
     auto req_pool_index = std::make_unique<ReqPoolIndex>(req_pool_allocator_->Allocate());
     TokenContainer::Window window{.begin = hit_tokens_, .size = tokens_this_round_};
     const bool is_last_chunk = window.begin + window.size == token_container->PrefillSize();
     if (is_last_chunk && role_ != Role::kD) {
         return PrefillDone{token_container,
-                           state.GetPageSize(),
+                           state.PageSize(),
                            std::move(req_pool_index),
                            window,
                            reserve_num_tokens_in_next_schedule_event_,
                            std::move(block_tables_),
                            std::move(cache_progress_)};
     }
-    return Prefilling{token_container, state.GetPageSize(), std::move(req_pool_index), window,
-                      reserve_num_tokens_in_next_schedule_event_, std::move(block_tables_),
+    return Prefilling{token_container,
+                      state.PageSize(),
+                      std::move(req_pool_index),
+                      window,
+                      reserve_num_tokens_in_next_schedule_event_,
+                      std::move(block_tables_),
                       std::move(cache_progress_)};
 }
 
 std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefilling&& state) {
-    TokenContainer* token_container = state.GetTokenContainer();
-    const std::int32_t page_size = state.GetPageSize();
+    TokenContainer* token_container = state.TokenContainerPtr();
+    const std::int32_t page_size = state.PageSize();
     TokenContainer::Window window{
         .begin = state.window.begin + state.window.size,
         .size = tokens_this_round_,
     };
-    auto req_pool_index = std::move(state).TakeReqPoolIndex();
+    auto req_pool_index = std::move(state).TakeRequestPoolIndex();
     auto block_tables = std::move(state).TakeBlockTables();
     if (window.begin + window.size == token_container->PrefillSize()) {
         return PrefillDone{token_container,
@@ -76,18 +80,18 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefillin
 }
 
 Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
-    TokenContainer* token_container = state.GetTokenContainer();
-    const std::int32_t page_size = state.GetPageSize();
-    auto req_pool_index = std::move(state).TakeReqPoolIndex();
+    TokenContainer* token_container = state.TokenContainerPtr();
+    const std::int32_t page_size = state.PageSize();
+    auto req_pool_index = std::move(state).TakeRequestPoolIndex();
     auto block_tables = std::move(state).TakeBlockTables();
     return Decoding{token_container, page_size, std::move(req_pool_index), decode_input_tokens_,
                     std::move(block_tables), std::move(cache_progress_)};
 }
 
 Decoding ScheduleDecodeEvent::operator()(Decoding&& state) {
-    TokenContainer* token_container = state.GetTokenContainer();
-    const std::int32_t page_size = state.GetPageSize();
-    auto req_pool_index = std::move(state).TakeReqPoolIndex();
+    TokenContainer* token_container = state.TokenContainerPtr();
+    const std::int32_t page_size = state.PageSize();
+    auto req_pool_index = std::move(state).TakeRequestPoolIndex();
     auto block_tables = std::move(state).TakeBlockTables();
     return Decoding{token_container, page_size, std::move(req_pool_index), decode_input_tokens_,
                     std::move(block_tables), std::move(cache_progress_)};
@@ -140,8 +144,8 @@ Finished AbortEvent::operator()(Decoding&& state) {
 template <typename State>
 Submitted RetractEvent::retract(State&& state) {
     _assert(coordinator_ != nullptr, "RetractEvent requires a cache coordinator");
-    TokenContainer* token_container = state.GetTokenContainer();
-    const std::int32_t page_size = state.GetPageSize();
+    TokenContainer* token_container = state.TokenContainerPtr();
+    const std::int32_t page_size = state.PageSize();
     token_container->RebasePrefill();
     auto block_tables = std::move(state).TakeBlockTables();
     FreeRequest(*coordinator_, block_tables);

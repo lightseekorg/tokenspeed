@@ -271,7 +271,7 @@ def _drive_k3_to_retract(scheduler) -> dict[str, dict[int, int]]:
     assert scheduler.available_kv_pages() == 11
     assert scheduler.waiting_size() == 1
     assert scheduler.decoding_size() == 3
-    assert scheduler.get_request_token_size("a") == 11
+    assert scheduler.request_token_size("a") == 11
     return pre_retract_pages
 
 

@@ -31,13 +31,13 @@ Request::Request(const RequestSpec& spec, std::int32_t page_size, Role role)
       state_{role == Role::kFused ? fsm::State{fsm::Submitted{&token_container_, page_size}}
                                   : fsm::State{fsm::Bootstrapping{&token_container_, page_size}}} {}
 
-PrefillInfo Request::GetPrefillInfo() const {
+PrefillInfo Request::CurrentPrefillInfo() const {
     return std::visit(
         Overloaded{
-            [](const fsm::Prefilling& state) { return state.GetPrefillInfo(); },
-            [](const fsm::PrefillDone& state) { return state.GetPrefillInfo(); },
+            [](const fsm::Prefilling& state) { return state.CurrentPrefillInfo(); },
+            [](const fsm::PrefillDone& state) { return state.CurrentPrefillInfo(); },
             [this](const auto&) -> PrefillInfo {
-                throw std::logic_error("Request::GetPrefillInfo: expected Prefilling or PrefillDone; got " +
+                throw std::logic_error("Request::CurrentPrefillInfo: expected Prefilling or PrefillDone; got " +
                                        StateName());
             },
         },

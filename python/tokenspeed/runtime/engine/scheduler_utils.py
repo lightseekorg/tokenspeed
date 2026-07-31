@@ -36,7 +36,6 @@ from tokenspeed_scheduler import (
     PagedCacheGroupFamily,
     PagedCacheRetention,
     PagedCacheTransferPolicy,
-    PrefixCacheAdjunctSpec,
     RequestSpec,
     SchedulerConfig,
 )
@@ -45,7 +44,6 @@ from tokenspeed.runtime.configs.cache_runtime import require_positive_int
 
 _CACHE_EVENT_TYPES = {
     "WriteBackDoneEvent": Cache.WriteBackDoneEvent,
-    "PrefetchDoneEvent": Cache.PrefetchDoneEvent,
 }
 # Emitted only by the host tier. Keep the lookup guarded so an older extension
 # still imports this module and fails later with a targeted compatibility error.
@@ -203,7 +201,6 @@ def make_config(
     num_host_pages: int,
     disable_l2_cache: bool,
     enable_l3_storage: bool,
-    prefetch_threshold: int,
     role: str,
     enable_kv_cache_events: bool = False,
     decode_input_tokens: int = 1,
@@ -211,7 +208,6 @@ def make_config(
     disable_prefix_cache: bool = False,
     paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
     enable_mixed_prefill_decode: bool = False,
-    prefix_cache_adjunct: "PrefixCacheAdjunctSpec | None" = None,
 ) -> SchedulerConfig:
     cfg = SchedulerConfig()
     cfg.num_device_pages = num_device_pages
@@ -221,7 +217,6 @@ def make_config(
 
     cfg.num_host_pages = num_host_pages
     cfg.enable_l3_storage = enable_l3_storage
-    cfg.prefetch_threshold = prefetch_threshold
     cfg.enable_kv_cache_events = enable_kv_cache_events
 
     if role == "prefill":
@@ -238,9 +233,6 @@ def make_config(
     cfg.enable_mixed_prefill_decode = enable_mixed_prefill_decode
     if paged_cache_groups:
         cfg.paged_cache_groups = list(paged_cache_groups)
-    # Opt-in; unset means paged-cache groups are transport-only.
-    if prefix_cache_adjunct is not None:
-        cfg.prefix_cache_adjunct = prefix_cache_adjunct
     return cfg
 
 
@@ -297,19 +289,6 @@ def pool_to_paged_cache_groups(pool: Any) -> list:
             cfg.block_size = int(spec.block_size)
         out.append(cfg)
     return out
-
-
-def pool_to_prefix_cache_adjunct_spec(
-    required_group_ids: Sequence[str],
-) -> "PrefixCacheAdjunctSpec":
-    """Build a PrefixCacheAdjunctSpec from required group ids."""
-    if not required_group_ids:
-        raise ValueError(
-            "pool_to_prefix_cache_adjunct_spec: required_group_ids must be non-empty"
-        )
-    spec = PrefixCacheAdjunctSpec()
-    spec.required_groups = [str(gid) for gid in required_group_ids]
-    return spec
 
 
 def should_use_overlap_schedule(

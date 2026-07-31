@@ -51,7 +51,6 @@ public:
     explicit Scheduler(SchedulerConfig config);
 
     void SubmitRequests(const std::vector<RequestSpec>& request_specs);
-    std::vector<std::string> CalcRollingHash(const std::vector<std::int32_t>& input_tokens);
 
     ExecutionPlan NextExecutionPlan();
     void Advance(const ExecutionEvent& event);
@@ -63,20 +62,14 @@ public:
     std::size_t AvailableKvPages() const;
     std::size_t ActiveKvPages() const;
     std::size_t PrefillSize() const;
-    std::int32_t GetRequestTokenSize(const std::string& id) const;
+    std::int32_t RequestTokenSize(const std::string& id) const;
     // Maximum logical request extent that one request can reserve in an
     // otherwise reclaimable device pool. The runtime must enforce this limit
     // before submitting requests.
     std::int32_t MaxSingleRequestTokens() const { return max_single_request_tokens_; }
 
-    std::vector<std::string> PagedCacheGroupIds() const { return cache_group_ids_; }
     std::int32_t PagedCacheGroupTotalPages(const std::string& group_id) const;
     std::int32_t PagedCacheGroupAvailablePages(const std::string& group_id) const;
-    std::int64_t PagedCacheGroupFailedAllocCount(const std::string& group_id) const;
-    std::vector<std::int32_t> GetRequestPagedCachePageIds(const std::string& request_id,
-                                                          const std::string& group_id) const;
-    std::int32_t GetRequestPagedCacheBaseLogicalPage(const std::string& request_id,
-                                                     const std::string& group_id) const;
 
     bool PdTransferPinned(const std::string& request_id) const {
         return pd_transfer_pins_.contains(request_id);
@@ -89,11 +82,11 @@ public:
 private:
     struct AdmissionMatch {
         KvCacheCoordinator::PrefixProbe probe;
-        std::vector<std::string> ext_hashes;
+        std::vector<std::string> extension_hashes;
         std::vector<std::string> page_hashes;
     };
 
-    std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> newForwardOperation(
+    std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> buildForwardOperations(
         std::vector<Request*> candidates);
     std::optional<fsm::SchedulePrefillFirstChunkEvent> schedulePrefillFirstChunk(
         Request* request, std::int32_t remaining, std::int32_t decode_input_tokens);
@@ -101,10 +94,10 @@ private:
         Request* request, std::int32_t remaining, std::int32_t reserve_num_tokens_in_next_schedule_event);
     std::optional<fsm::ScheduleDecodeEvent> scheduleDecode(Request* request);
 
-    PrefillOperation applyEventAndGenerateOp(Request* request, fsm::SchedulePrefillFirstChunkEvent event,
-                                             std::vector<LoadBackOperation>& loadback_ops);
-    PrefillOperation applyEventAndGenerateOp(Request* request, fsm::SchedulePrefillEvent event);
-    DecodeOperation applyEventAndGenerateOp(Request* request, fsm::ScheduleDecodeEvent event);
+    PrefillOperation applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillFirstChunkEvent event,
+                                                 std::vector<LoadBackOperation>& load_back_operations);
+    PrefillOperation applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillEvent event);
+    DecodeOperation applyEventAndBuildOperation(Request* request, fsm::ScheduleDecodeEvent event);
 
     AdmissionMatch matchPrefixAtAdmission(Request* request);
     std::optional<KvCacheCoordinator::AdmissionResult> admit(
@@ -114,12 +107,11 @@ private:
         std::span<const GroupDemand> demands, std::uint64_t request_access_epoch);
     void retractForCapacity(const std::vector<Request*>& candidates);
 
-    void emitPendingStores(std::vector<WriteBackOperation>& write_back_ops);
+    void emitPendingStores(std::vector<WriteBackOperation>& write_back_operations);
     cache_op_id allocateCacheOpId() { return next_cache_op_id_++; }
     std::size_t groupIndex(const std::string& group_id) const;
-    Request* find_request(const std::string& request_id);
+    Request* findRequest(const std::string& request_id);
 
-    void handleEvent(const cache::PrefetchDone& event);
     void handleEvent(const cache::WriteBackDone& event);
     void handleEvent(const cache::LoadBackDone& event);
     void handleEvent(const pd::BootstrappedEvent& event);
@@ -131,7 +123,6 @@ private:
     void handleEvent(const forward::Finish& event);
     void handleEvent(const forward::UpdateReserveNumTokens& event);
 
-    std::span<const std::string> CacheGroupIds() const { return cache_group_ids_; }
     std::int32_t calculateMaxSingleRequestTokens() const;
     std::int64_t singleRequestParentsRequired(std::int32_t token_limit) const;
 

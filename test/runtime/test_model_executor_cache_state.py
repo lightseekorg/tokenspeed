@@ -22,7 +22,6 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
-
 from tokenspeed.runtime.execution.model_executor import ModelExecutor
 
 
@@ -39,7 +38,7 @@ class _ExecutionStream:
         return None
 
 
-def test_mixed_batch_resets_prefill_and_retracted_decode_lengths(monkeypatch):
+def test_mixed_batch_resets_only_prefill_lengths(monkeypatch):
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = "cpu"
     executor.execution_stream = _ExecutionStream()
@@ -48,9 +47,6 @@ def test_mixed_batch_resets_prefill_and_retracted_decode_lengths(monkeypatch):
     forward_op = SimpleNamespace(
         request_pool_indices=[2, 3, 4],
         extend_prefix_lens=[10],
-        # hist_token_lens contains decode rows only: one normal decode and one
-        # recovery row following the prefill row.
-        hist_token_lens=[-1, 7],
         num_extends=lambda: 1,
     )
 
@@ -68,4 +64,4 @@ def test_mixed_batch_resets_prefill_and_retracted_decode_lengths(monkeypatch):
 
     assert executor.runtime_states.valid_cache_lengths[2].item() == 10
     assert executor.runtime_states.valid_cache_lengths[3].item() == 3
-    assert executor.runtime_states.valid_cache_lengths[4].item() == 7
+    assert executor.runtime_states.valid_cache_lengths[4].item() == 4
