@@ -46,6 +46,10 @@ def _make_all_groups(group: Group) -> list[Group]:
 class ProcessGroupManager:
     def __init__(self):
         self._process_groups: dict[str, dict[Group, dist.ProcessGroup]] = {}
+        # Timeout inherited by every new_group() call; set by init_distributed.
+        # None means torch's default (subgroups created without a timeout do
+        # NOT inherit the default process group's).
+        self._pg_timeout: timedelta | None = None
 
     def init_distributed(
         self,
@@ -111,9 +115,7 @@ class ProcessGroupManager:
             if self.has_process_group(backend, group):
                 continue
             for g in _make_all_groups(group):
-                pg = dist.new_group(
-                    g, backend=backend, timeout=getattr(self, "_pg_timeout", None)
-                )
+                pg = dist.new_group(g, backend=backend, timeout=self._pg_timeout)
                 if g == group:
                     self.register_process_group(backend, g, pg)
 
