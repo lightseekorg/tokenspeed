@@ -42,8 +42,12 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed.runtime.utils.env import envs
 
 if current_platform().is_nvidia:
-    import nvtx
-    from nvtx.colors import _NVTX_COLORS
+    try:
+        import nvtx
+        from nvtx.colors import _NVTX_COLORS
+    except ImportError:
+        nvtx = None
+        _NVTX_COLORS = ()
 else:
     nvtx = None
     _NVTX_COLORS = ()

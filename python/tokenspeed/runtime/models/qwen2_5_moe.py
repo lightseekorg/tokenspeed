@@ -62,8 +62,8 @@ from tokenspeed.runtime.models.qwen3_5_moe import (
     Qwen3_5MoeMLP,
 )
 from tokenspeed.runtime.utils import add_prefix
-from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
 def _is_moe_layer(layer_id: int, config) -> bool:
@@ -102,8 +102,17 @@ class Qwen2_5MoeSparseMoeBlock(nn.Module):
             mapping=mapping,
             layer_id=layer_index,
             is_moe=True,
-            prev_is_moe=_is_moe_layer(layer_index - 1, config) if layer_index > 0 else False,
+            prev_is_moe=(
+                _is_moe_layer(layer_index - 1, config) if layer_index > 0 else False
+            ),
         )
+
+        if mapping.attn.tp_size != mapping.moe.tp_ep_size:
+            raise ValueError(
+                "Qwen2.5-MoE uses all-reduce layout decoder layers and requires "
+                "attn.tp_size == moe.tp_ep_size, got attn.tp_size="
+                f"{mapping.attn.tp_size} and moe.tp_ep_size={mapping.moe.tp_ep_size}."
+            )
 
         if mapping.moe.tp_size > config.num_experts:
             raise ValueError(
@@ -220,7 +229,9 @@ class Qwen2_5MoeSparseMoeBlock(nn.Module):
 
         if shared_output is not None:
             if self.shared_expert_gate is not None and hidden_states.shape[0] > 0:
-                from tokenspeed_kernel.ops.activation.triton import fused_gate_sigmoid_mul_add
+                from tokenspeed_kernel.ops.activation.triton import (
+                    fused_gate_sigmoid_mul_add,
+                )
 
                 fused_gate_sigmoid_mul_add(
                     hidden_states,
@@ -279,7 +290,9 @@ class Qwen2_5MoeSparseMoeBlock(nn.Module):
 
         if shared_output is not None:
             if self.shared_expert_gate is not None and hidden_states.shape[0] > 0:
-                from tokenspeed_kernel.ops.activation.triton import fused_gate_sigmoid_mul_add
+                from tokenspeed_kernel.ops.activation.triton import (
+                    fused_gate_sigmoid_mul_add,
+                )
 
                 fused_gate_sigmoid_mul_add(
                     hidden_states,
@@ -340,7 +353,9 @@ class Qwen2MoeDecoderLayer(Qwen2DecoderLayer):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
-        elif ctx.input_num_tokens > global_server_args_dict["comm_fusion_max_num_tokens"]:
+        elif (
+            ctx.input_num_tokens > global_server_args_dict["comm_fusion_max_num_tokens"]
+        ):
             hidden_states = all_reduce(hidden_states, self.mapping.dense.tp_group)
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         else:

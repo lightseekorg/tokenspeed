@@ -19,9 +19,9 @@
 # SOFTWARE.
 
 import json
+import tempfile
 import unittest
 from pathlib import Path
-import tempfile
 
 import torch
 
@@ -104,8 +104,8 @@ class TestQwen2_5MoeConfig(unittest.TestCase):
 
     def test_constructs_sparse_moe_layers(self):
         from tokenspeed.runtime.models.qwen2_5_moe import (
-            Qwen2MoeForCausalLM,
             Qwen2_5MoeSparseMoeBlock,
+            Qwen2MoeForCausalLM,
         )
 
         model = Qwen2MoeForCausalLM(
@@ -246,3 +246,16 @@ class TestQwen2_5MoeConfig(unittest.TestCase):
         self.assertEqual(config.shared_expert_intermediate_size, 0)
         self.assertTrue(config.norm_topk_prob)
         self.assertEqual(config.mlp_only_layers, [])
+
+    def test_rejects_mismatched_attn_tp_and_moe_tp_ep_size(self):
+        from tokenspeed.runtime.models.qwen2_5_moe import Qwen2_5MoeSparseMoeBlock
+
+        mismatched_mapping = Mapping(
+            rank=0, world_size=4, attn_tp_size=2, moe_ep_size=4
+        )
+        with self.assertRaises(ValueError) as cm:
+            Qwen2_5MoeSparseMoeBlock(
+                _tiny_qwen2_5_moe_config(),
+                mapping=mismatched_mapping,
+            )
+        self.assertIn("attn.tp_size == moe.tp_ep_size", str(cm.exception))

@@ -36,38 +36,44 @@ from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
-with redirect_triton_to_tokenspeed_triton():
-    import triton_kernels  # noqa: F401
-    import triton_kernels.matmul  # noqa: F401
-    import triton_kernels.matmul_details  # noqa: F401
-    import triton_kernels.matmul_details.opt_flags  # noqa: F401
-    import triton_kernels.numerics  # noqa: F401
-    import triton_kernels.swiglu  # noqa: F401
-    import triton_kernels.tensor  # noqa: F401
-    import triton_kernels.tensor_details  # noqa: F401
-    import triton_kernels.tensor_details.layout  # noqa: F401
-    import triton_kernels.topk  # noqa: F401
+try:
+    with redirect_triton_to_tokenspeed_triton():
+        import triton_kernels  # noqa: F401
+        import triton_kernels.matmul  # noqa: F401
+        import triton_kernels.matmul_details  # noqa: F401
+        import triton_kernels.matmul_details.opt_flags  # noqa: F401
+        import triton_kernels.numerics  # noqa: F401
+        import triton_kernels.swiglu  # noqa: F401
+        import triton_kernels.tensor  # noqa: F401
+        import triton_kernels.tensor_details  # noqa: F401
+        import triton_kernels.tensor_details.layout  # noqa: F401
+        import triton_kernels.topk  # noqa: F401
+except ImportError:
+    pass
 
-import triton_kernels.matmul_details.opt_flags as opt_flags
-from triton_kernels.matmul import (
-    FlexCtx,
-    FnSpecs,
-    FusedActivation,
-    PrecisionConfig,
-    matmul,
-)
-from triton_kernels.matmul_details.opt_flags import scoped_opt_flags_constraints
-from triton_kernels.numerics import InFlexData
-from triton_kernels.swiglu import swiglu_fn
-from triton_kernels.tensor import (
-    FP4,
-    RaggedTensorMetadata,
-    convert_layout,
-    make_ragged_tensor_metadata,
-    wrap_torch_tensor,
-)
-from triton_kernels.tensor_details import layout
-from triton_kernels.topk import topk
+try:
+    import triton_kernels.matmul_details.opt_flags as opt_flags
+    from triton_kernels.matmul import (
+        FlexCtx,
+        FnSpecs,
+        FusedActivation,
+        PrecisionConfig,
+        matmul,
+    )
+    from triton_kernels.matmul_details.opt_flags import scoped_opt_flags_constraints
+    from triton_kernels.numerics import InFlexData
+    from triton_kernels.swiglu import swiglu_fn
+    from triton_kernels.tensor import (
+        FP4,
+        RaggedTensorMetadata,
+        convert_layout,
+        make_ragged_tensor_metadata,
+        wrap_torch_tensor,
+    )
+    from triton_kernels.tensor_details import layout
+    from triton_kernels.topk import topk
+except ImportError:
+    pass
 
 # isort: off
 from tokenspeed_kernel.ops.quantization.triton import fp8_quantize

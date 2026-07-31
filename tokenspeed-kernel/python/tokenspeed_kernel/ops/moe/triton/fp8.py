@@ -26,18 +26,21 @@ from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
-with redirect_triton_to_tokenspeed_triton():
-    import triton_kernels  # noqa: F401
-    import triton_kernels.matmul  # noqa: F401
-    import triton_kernels.matmul_details  # noqa: F401
-    import triton_kernels.matmul_details.opt_flags  # noqa: F401
-    import triton_kernels.numerics  # noqa: F401
-    import triton_kernels.numerics_details.mxfp  # noqa: F401
-    import triton_kernels.swiglu  # noqa: F401
-    import triton_kernels.tensor  # noqa: F401
-    import triton_kernels.tensor_details  # noqa: F401
-    import triton_kernels.tensor_details.layout  # noqa: F401
-    import triton_kernels.topk  # noqa: F401
+try:
+    with redirect_triton_to_tokenspeed_triton():
+        import triton_kernels  # noqa: F401
+        import triton_kernels.matmul  # noqa: F401
+        import triton_kernels.matmul_details  # noqa: F401
+        import triton_kernels.matmul_details.opt_flags  # noqa: F401
+        import triton_kernels.numerics  # noqa: F401
+        import triton_kernels.numerics_details.mxfp  # noqa: F401
+        import triton_kernels.swiglu  # noqa: F401
+        import triton_kernels.tensor  # noqa: F401
+        import triton_kernels.tensor_details  # noqa: F401
+        import triton_kernels.tensor_details.layout  # noqa: F401
+        import triton_kernels.topk  # noqa: F401
+except ImportError:
+    pass
 
 from tokenspeed_kernel.ops.moe.triton.mxfp4 import (
     _local_topk_for_ep,
@@ -45,16 +48,30 @@ from tokenspeed_kernel.ops.moe.triton.mxfp4 import (
     _routing_from_topk,
     _silu_gate_up,
 )
-from triton_kernels.matmul import (
-    FlexCtx,
-    FnSpecs,
-    FusedActivation,
-    PrecisionConfig,
-    matmul,
-)
-from triton_kernels.numerics import InFlexData
-from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
-from triton_kernels.swiglu import swiglu_fn
+
+try:
+    from triton_kernels.matmul import (
+        FlexCtx,
+        FnSpecs,
+        FusedActivation,
+        PrecisionConfig,
+        matmul,
+    )
+    from triton_kernels.numerics import InFlexData
+    from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
+    from triton_kernels.swiglu import swiglu_fn
+    from triton_kernels.tensor import (
+        Bitwidth,
+        BlockShape,
+        DType,
+        FlexData,
+        Layout,
+        ScaleFormat,
+        ScaleShape,
+        Tensor,
+    )
+except ImportError:
+    pass
 
 
 def _scale_attr(w: torch.nn.Module, base: str) -> torch.Tensor:
