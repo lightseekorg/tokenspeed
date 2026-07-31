@@ -29,8 +29,8 @@ from tokenspeed_kernel import (
     mla_decode_with_kvcache,
     mla_extend_with_kvcache,
     mla_prefill,
+    mla_use_absorbed_extend,
 )
-from tokenspeed_kernel.platform import ArchVersion, current_platform
 
 from tokenspeed.runtime.configs.cache_runtime import cache_debug_enabled
 from tokenspeed.runtime.configs.model_config import AttentionArch
@@ -115,20 +115,18 @@ class MLAAttnBackend(AttentionBackend):
         self.q_data_type = config.dtype
         self.num_local_heads = config.num_attention_heads // config.attn_tp_size
 
-        platform = current_platform()
-        self.use_absorbed_extend = (
-            platform.is_amd
-            and platform.arch_version == ArchVersion(12, 5)
-            and self.data_type == torch.bfloat16
-            and self.q_data_type == torch.bfloat16
-            and self.page_size == 64
-            and self.kv_lora_rank == 512
-            and self.qk_nope_head_dim == 128
-            and self.qk_rope_head_dim == 64
-            and 1 <= self.num_local_heads <= 128
+        self.kernel_solution = None
+        self.use_absorbed_extend = mla_use_absorbed_extend(
+            q_dtype=self.q_data_type,
+            kv_dtype=self.data_type,
+            num_q_heads=self.num_local_heads,
+            page_size=self.page_size,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            solution=self.kernel_solution,
         )
 
-        self.kernel_solution = None
         self.forward_decode_metadata: MLADecodeMetadata | None = None
         self.forward_prefill_metadata: MLAPrefillMetadata | None = None
         self.chunked_prefill_metadata: MLAPrefillMetadata | None = None

@@ -125,6 +125,7 @@ __all__ = [
     "GdnCheckpointLayout",
     "GdnChunkPrefillResult",
     "mla_prefill",
+    "mla_use_absorbed_extend",
     "mla_extend_with_kvcache",
     "mla_decode_with_kvcache",
     "dsa_prefill",
@@ -1850,6 +1851,58 @@ def mla_prefill(
             return_lse=return_lse,
             out=out,
         )
+
+
+def mla_use_absorbed_extend(
+    *,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    num_q_heads: int,
+    page_size: int,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    solution: str | None = None,
+) -> bool:
+    """Return whether a registered kernel supports absorbed MLA extend.
+
+    Args:
+        q_dtype: Absorbed query dtype.
+        kv_dtype: Compressed KV-cache dtype.
+        num_q_heads: Number of local query heads.
+        page_size: Number of cache tokens per page.
+        qk_nope_head_dim: Original non-RoPE query/key dimension.
+        kv_lora_rank: Compressed MLA latent rank.
+        qk_rope_head_dim: RoPE query/key dimension.
+        solution: Optional kernel solution to restrict the query.
+
+    Returns:
+        Whether the current platform has a matching causal absorbed-extend
+        implementation. Kernel registrations remain the source of truth for
+        hardware, dtype, and shape support.
+    """
+    signature = format_signature(
+        q=dense_tensor_format(q_dtype),
+        kv_cache=dense_tensor_format(kv_dtype),
+    )
+    traits = {
+        "num_q_heads": num_q_heads,
+        "page_size": page_size,
+        "qk_nope_head_dim": qk_nope_head_dim,
+        "kv_lora_rank": kv_lora_rank,
+        "qk_rope_head_dim": qk_rope_head_dim,
+        "is_causal": True,
+        "support_logit_cap": False,
+        "return_lse": False,
+    }
+    candidates = KernelRegistry.get().get_for_operator(
+        "attention",
+        "mla_extend_with_kvcache",
+        platform=current_platform(),
+        format_signature=signature,
+        solution=solution,
+    )
+    return any(spec_matches_traits(spec, traits) for spec in candidates)
 
 
 def mla_extend_with_kvcache(
