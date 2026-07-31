@@ -63,6 +63,7 @@ class MLAPrefillMetadata:
     extend_seq_lens_cpu: list[int]
     max_extend_seq_len: int
     max_extend_prefix_len: int
+    use_absorbed_cached_extend: bool
     # Per-prefix-chunk arrays consumed by DeepSeek's chunked prefix replay.
     chunked_loop_num: int
     chunk_kv_indices_list: list[torch.Tensor]
@@ -116,16 +117,6 @@ class MLAAttnBackend(AttentionBackend):
         self.num_local_heads = config.num_attention_heads // config.attn_tp_size
 
         self.kernel_solution = None
-        self.use_absorbed_extend = mla_use_absorbed_extend(
-            q_dtype=self.q_data_type,
-            kv_dtype=self.data_type,
-            num_q_heads=self.num_local_heads,
-            page_size=self.page_size,
-            qk_nope_head_dim=self.qk_nope_head_dim,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            solution=self.kernel_solution,
-        )
 
         self.forward_decode_metadata: MLADecodeMetadata | None = None
         self.forward_prefill_metadata: MLAPrefillMetadata | None = None
@@ -138,6 +129,21 @@ class MLAAttnBackend(AttentionBackend):
     def mark_cache_contract(self) -> None:
         """Enable Paged cache graph state before capture buffers are allocated."""
         self._cache_contract_bound = True
+
+    def _should_use_absorbed_cached_extend(
+        self, *, max_extend_seq_len: int, max_extend_prefix_len: int
+    ) -> bool:
+        return max_extend_prefix_len > 0 and mla_use_absorbed_extend(
+            q_dtype=self.q_data_type,
+            kv_dtype=self.data_type,
+            num_q_heads=self.num_local_heads,
+            page_size=self.page_size,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            max_seqlen_q=max_extend_seq_len,
+            solution=self.kernel_solution,
+        )
 
     def _resolve_full_history_table(
         self, cache_metadata, forward_batch, bs: int
@@ -367,8 +373,9 @@ class MLAAttnBackend(AttentionBackend):
 
         max_extend_seq_len = max(extend_seq_lens_cpu_list, default=0)
         max_extend_prefix_len = int(extend_prefix_lens_cpu.max().item())
-        use_absorbed_cached_extend = (
-            self.use_absorbed_extend and max_extend_prefix_len > 0
+        use_absorbed_cached_extend = self._should_use_absorbed_cached_extend(
+            max_extend_seq_len=max_extend_seq_len,
+            max_extend_prefix_len=max_extend_prefix_len,
         )
 
         cum_seq_lens_kv = None
@@ -435,6 +442,7 @@ class MLAAttnBackend(AttentionBackend):
             extend_seq_lens_cpu=extend_seq_lens_cpu_list,
             max_extend_seq_len=max_extend_seq_len,
             max_extend_prefix_len=max_extend_prefix_len,
+            use_absorbed_cached_extend=use_absorbed_cached_extend,
             chunked_loop_num=chunked_loop_num,
             chunk_kv_indices_list=chunk_kv_indices_list,
             chunked_seq_len=chunked_seq_len,
@@ -745,7 +753,7 @@ class MLAAttnBackend(AttentionBackend):
 
         metadata = self.forward_prefill_metadata
         assert metadata is not None
-        if self.use_absorbed_extend and metadata.max_extend_prefix_len > 0:
+        if metadata.use_absorbed_cached_extend:
             assert metadata.page_table is not None
             assert metadata.cum_seq_lens_kv is not None
             q = q.view(-1, layer.tp_q_head_num, layer.head_dim)

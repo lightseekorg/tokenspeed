@@ -459,6 +459,9 @@ if current_platform().is_amd:
         priority=Priority.SPECIALIZED,
         traits={
             "num_q_heads": frozenset(range(1, 129)),
+            # Absorbed attention wins only for short cached extends; longer
+            # queries should use expanded prefix replay.
+            "max_seqlen_q": frozenset(range(1, 257)),
             "page_size": frozenset({64}),
             "qk_nope_head_dim": frozenset({128}),
             "kv_lora_rank": frozenset({512}),

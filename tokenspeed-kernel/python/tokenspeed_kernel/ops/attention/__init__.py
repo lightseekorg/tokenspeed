@@ -1862,6 +1862,7 @@ def mla_use_absorbed_extend(
     qk_nope_head_dim: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
+    max_seqlen_q: int | None = None,
     solution: str | None = None,
 ) -> bool:
     """Return whether a registered kernel supports absorbed MLA extend.
@@ -1874,6 +1875,8 @@ def mla_use_absorbed_extend(
         qk_nope_head_dim: Original non-RoPE query/key dimension.
         kv_lora_rank: Compressed MLA latent rank.
         qk_rope_head_dim: RoPE query/key dimension.
+        max_seqlen_q: Optional maximum query length used to filter kernels whose
+            registered shape domain is narrower than their operator API.
         solution: Optional kernel solution to restrict the query.
 
     Returns:
@@ -1895,6 +1898,8 @@ def mla_use_absorbed_extend(
         "support_logit_cap": False,
         "return_lse": False,
     }
+    if max_seqlen_q is not None:
+        traits["max_seqlen_q"] = max_seqlen_q
     candidates = KernelRegistry.get().get_for_operator(
         "attention",
         "mla_extend_with_kvcache",
