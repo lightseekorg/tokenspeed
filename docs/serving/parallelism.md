@@ -104,9 +104,15 @@ Rules:
 - If a multi-node step is detected but the topology cannot be resolved,
   startup fails with the reason rather than falling back to a single node.
 - The derived address is the one the head node's hostname resolves to. Where
-  that is not the interface you want carrying NCCL bootstrap traffic, set
-  `--dist-init-addr` explicitly; `NCCL_SOCKET_IFNAME` still has to be set
-  separately.
+  that is not the interface you want carrying bootstrap traffic, set
+  `--dist-init-addr` explicitly.
+- `GLOO_SOCKET_IFNAME` and `NCCL_SOCKET_IFNAME` are set from the interface that
+  routes to the head node, unless already present in the environment. Gloo
+  needs this: it has no peer-address heuristic and otherwise binds whatever the
+  local hostname resolves to, which is a loopback entry on many hosts. NCCL
+  normally selects correctly on its own; it is set for consistency.
+- `NCCL_IB_HCA` is not set. NCCL's own device selection prefers the
+  higher-bandwidth InfiniBand devices and skips Ethernet-link ones.
 - The rendezvous port is a fixed constant, not a function of `--port`. Every
   node has to arrive at the same port without talking to any other node, and
   under `tokenspeed serve` the engine's own port is allocated per node. The

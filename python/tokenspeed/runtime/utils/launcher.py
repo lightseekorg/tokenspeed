@@ -27,6 +27,8 @@ import os
 import re
 import socket
 
+import psutil
+
 SLURM_NNODES = "SLURM_NNODES"
 SLURM_NODEID = "SLURM_NODEID"
 SLURM_STEP_NODELIST = "SLURM_STEP_NODELIST"
@@ -89,8 +91,6 @@ def first_host(hostlist: str) -> str:
 
 def local_ipv4_addresses() -> set[str]:
     """Return every IPv4 address bound to a local interface."""
-    import psutil
-
     return {
         addr.address
         for addrs in psutil.net_if_addrs().values()
@@ -100,8 +100,6 @@ def local_ipv4_addresses() -> set[str]:
 
 
 def _interface_ipv4(iface: str) -> str | None:
-    import psutil
-
     for addr in psutil.net_if_addrs().get(iface, ()):
         if addr.family == socket.AF_INET:
             return addr.address
@@ -124,6 +122,32 @@ def _local_routable_ipv4(env: dict[str, str]) -> str | None:
     except OSError:
         return None
     return None if address.startswith("127.") else address
+
+
+def interface_for_host(host: str) -> str | None:
+    """Return the local interface that carries the route to ``host``.
+
+    Args:
+        host: Address or hostname of the peer to be reached.
+
+    Returns:
+        The interface name, or ``None`` if no local interface owns the source
+        address the kernel would use.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            # No packet is sent; this only asks the kernel which source
+            # address it would route from.
+            sock.connect((host, 9))
+            source = sock.getsockname()[0]
+    except OSError:
+        return None
+
+    for name, addrs in psutil.net_if_addrs().items():
+        for addr in addrs:
+            if addr.family == socket.AF_INET and addr.address == source:
+                return name
+    return None
 
 
 def _resolve_head_ipv4(host: str, node_rank: int, env: dict[str, str]) -> str:
