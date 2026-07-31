@@ -22,6 +22,35 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 
+class SliceMhaExtendInputsTest(unittest.TestCase):
+    """MHA kernels see exactly the rows covered by live cu-seqlens."""
+
+    def setUp(self):
+        try:
+            import torch
+
+            from tokenspeed.runtime.layers.attention.backends import mha
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+        self.torch = torch
+        self.slice_inputs = mha._slice_extend_inputs
+
+    def test_padded_tail_is_not_passed_to_kernel(self):
+        metadata = SimpleNamespace(cu_extend_seq_lens_cpu=[0, 3])
+        q = self.torch.zeros(4, 2, 8)
+        k = self.torch.zeros(4, 2, 8)
+        v = self.torch.zeros(4, 2, 8)
+
+        q, k, v = self.slice_inputs(metadata, q, k, v)
+
+        self.assertEqual((q.shape[0], k.shape[0], v.shape[0]), (3, 3, 3))
+
+    def test_unpadded_inputs_are_unchanged(self):
+        metadata = SimpleNamespace(cu_extend_seq_lens_cpu=[0, 4])
+        q = self.torch.zeros(4, 2, 8)
+        self.assertIs(self.slice_inputs(metadata, q, None, None)[0], q)
+
+
 class TrimKvToLocsTest(unittest.TestCase):
     """_trim_kv_to_locs slices padded k/v tails to the write-loc count --
     the shared fix point every flat-capable backend's KV write calls.

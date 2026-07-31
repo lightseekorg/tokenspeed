@@ -169,9 +169,13 @@ def aligned_max_scheduled_tokens(
 
     Returns:
         ``max_scheduled_tokens`` floored to the LCM of the state groups' page
-        sizes, but never below one page (a smaller chunk could not register a
-        snapshot at all). Returned unchanged when no such group exists or the
-        value is already aligned.
+        sizes. Returned unchanged when no such group exists or the value is
+        already aligned.
+
+    Raises:
+        ValueError: If the configured budget is smaller than one state page.
+            Raising is safer than increasing a limit that may already have
+            sized executor buffers.
     """
     require_positive_int("max_scheduled_tokens", max_scheduled_tokens)
     require_positive_int("page_size", page_size)
@@ -185,7 +189,12 @@ def aligned_max_scheduled_tokens(
         grain = math.lcm(grain, group_block)
     if grain == 1:
         return max_scheduled_tokens
-    return max(max_scheduled_tokens - max_scheduled_tokens % grain, grain)
+    if max_scheduled_tokens < grain:
+        raise ValueError(
+            "chunked_prefill_size must be at least one recurrent-state page: "
+            f"got {max_scheduled_tokens}, minimum {grain}"
+        )
+    return max_scheduled_tokens - max_scheduled_tokens % grain
 
 
 def make_spec(rid: str, tokens: list[int]) -> RequestSpec:

@@ -109,14 +109,13 @@ class ValidateSchedulerConfigTest(unittest.TestCase):
                 speculative_algorithm="EAGLE3",
             )
 
-    def test_dflash_rejected(self):
-        with self.assertRaisesRegex(RuntimeError, "DFLASH"):
-            _pcs.validate_scheduler_config(
-                paged_cache_groups=[FakeGroup()],
-                attn_backend=FakeCacheGroupBackend(),
-                kv_pool=FakePool(),
-                speculative_algorithm="DFLASH",
-            )
+    def test_dflash_uses_the_normal_speculative_capability_checks(self):
+        _pcs.validate_scheduler_config(
+            paged_cache_groups=[FakeGroup()],
+            attn_backend=FakeCacheGroupBackend(),
+            kv_pool=FakePool(),
+            speculative_algorithm="DFLASH",
+        )
 
     def test_hybrid_checks_full_attention_backend(self):
         class Wrapper:

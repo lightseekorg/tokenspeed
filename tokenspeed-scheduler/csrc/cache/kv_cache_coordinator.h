@@ -109,6 +109,9 @@ public:
     void CacheFullBlocks(std::span<BlockTable> tables, std::span<const std::string> content_hashes,
                          std::uint64_t access_epoch, std::int32_t first_slot = 0,
                          CacheBoundaryKind boundary_kind = CacheBoundaryKind::kChunk);
+    void CacheCompletedBlocks(std::span<BlockTable> tables, std::span<const std::string> page_hashes,
+                              std::uint64_t access_epoch, std::int32_t first_new_page, std::int32_t num_computed_tokens,
+                              CacheBoundaryKind boundary_kind);
     void ReclaimExpired(std::span<BlockTable> tables, std::int32_t num_computed_tokens);
     void ConsumeReservedTokens(std::span<BlockTable> tables, std::int32_t num_tokens);
     void Free(std::span<BlockTable> tables);

@@ -111,10 +111,12 @@ class HostMirrorTest(unittest.TestCase):
     def test_roundtrip(self):
         pool = self._pool()
         mirror = self.HostMirror(pool, num_host_pages=8)
-        self.assertEqual(len(mirror.tensor_pairs), 8)
+        # The canonical hybrid layout deduplicates paired layers into two K
+        # and two V slabs.
+        self.assertEqual(len(mirror.tensor_pairs), 4)
         self._roundtrip_assert(mirror, [(1, 5), (2, 6), (3, 7)])
-        # 8 mirrors x page_size 4 x row 1*8 bf16 (16 B) = 512 B per page.
-        self.assertEqual(mirror.bytes_per_host_page(), 8 * 4 * 16)
+        # 4 mirrors x page_size 4 x row 1*8 bf16 (16 B) = 256 B per page.
+        self.assertEqual(mirror.bytes_per_host_page(), 4 * 4 * 16)
 
     def test_interleaved_groups_roundtrip(self):
         # Pages owned by different groups: byte-blind copies need no
@@ -135,9 +137,15 @@ class HostMirrorTest(unittest.TestCase):
         stream.synchronize()
         self.assertTrue(all(event.query() for event in events))
 
-        self.assertEqual(mirror.num_k_tensors, 4)
+        self.assertEqual(mirror.num_k_tensors, 2)
         self.assertEqual(
-            {mirror.tensor_index_of_layer(i) for i in range(4)}, {0, 1, 2, 3}
+            mirror.tensor_index_of_layer(0), mirror.tensor_index_of_layer(1)
+        )
+        self.assertEqual(
+            mirror.tensor_index_of_layer(2), mirror.tensor_index_of_layer(3)
+        )
+        self.assertNotEqual(
+            mirror.tensor_index_of_layer(0), mirror.tensor_index_of_layer(2)
         )
         for layer_id in range(4):
             idx = mirror.tensor_index_of_layer(layer_id)

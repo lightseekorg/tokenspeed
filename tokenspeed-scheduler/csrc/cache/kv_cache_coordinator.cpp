@@ -267,6 +267,24 @@ void KvCacheCoordinator::CacheFullBlocks(std::span<BlockTable> tables, std::span
     }
 }
 
+void KvCacheCoordinator::CacheCompletedBlocks(std::span<BlockTable> tables, std::span<const std::string> page_hashes,
+                                              std::uint64_t access_epoch, std::int32_t first_new_page,
+                                              std::int32_t num_computed_tokens, CacheBoundaryKind boundary_kind) {
+    _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
+    _assert(first_new_page >= 0 && static_cast<std::size_t>(first_new_page) < page_hashes.size(),
+            "completed page range must be non-empty");
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        const GroupDemand demand{
+            .table = &tables[i],
+            .page_hashes = page_hashes,
+            .new_page_hash_begin = first_new_page,
+            .completed_boundary_kind = boundary_kind,
+            .num_computed_tokens = num_computed_tokens,
+        };
+        cacheCompletedBlocksForGroup(i, demand, access_epoch);
+    }
+}
+
 void KvCacheCoordinator::cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table,
                                                  std::span<const std::string> content_hashes, std::int32_t first_slot,
                                                  std::uint64_t access_epoch, CacheBoundaryKind boundary_kind) {

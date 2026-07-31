@@ -48,10 +48,11 @@ _APPROX_PROMPT_TOKENS = 2074
 _PROMPT_TOKENS_MIN = 1900
 _PROMPT_TOKENS_MAX = 2270
 
-# Per-round footprint is ~2x prompt tokens: full-history retention plus the
-# sliding group's prefill transient (as many pages again, freed afterwards).
-_APPROX_ALLOC_TOKENS = 2 * _APPROX_PROMPT_TOKENS
-# Round footprint as a fraction of the measured slab pool: under the
+# Persistent prefix footprint is one full-history copy per prompt. Sliding
+# prefill pages are transient and no longer determine whether the repeated
+# working set remains cached.
+_APPROX_CACHED_TOKENS = _APPROX_PROMPT_TOKENS
+# Persistent footprint as a fraction of the measured slab pool: below the
 # recycling cliff on the slab arm, ~1.44x the halved legacy pool.
 _TARGET_POOL_FILL = 0.72
 _NUM_PROMPTS_MIN = 8
@@ -236,7 +237,7 @@ class TestSlabCapacityPrefixHits(unittest.TestCase):
         try:
             slab_capacity = int(engine.scheduler_info["max_total_num_tokens"])
             num_prompts = math.ceil(
-                _TARGET_POOL_FILL * slab_capacity / _APPROX_ALLOC_TOKENS
+                _TARGET_POOL_FILL * slab_capacity / _APPROX_CACHED_TOKENS
             )
             if not _NUM_PROMPTS_MIN <= num_prompts <= _NUM_PROMPTS_MAX:
                 self.skipTest(

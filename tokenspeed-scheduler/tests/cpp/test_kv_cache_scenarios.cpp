@@ -2136,6 +2136,26 @@ TEST_F(PrefixHitSuite, TwoRequestsSharePrefixReusePages) {
     EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "pool back to baseline after r2 finishes";
 }
 
+TEST_F(PrefixHitSuite, FinishPublishesPagesFromLastForward) {
+    const RequestSpec first = MakeRequestSpec("r1", /*num_pages=*/4);
+    Submit(first);
+    const ExecutionPlan first_plan = PlanOnce();
+    ASSERT_NE(FindForwardBatch(first_plan), nullptr);
+
+    // Finish before another scheduling round can publish the prefill pages.
+    SendForwardDone("r1", {9001});
+    SendFinish("r1");
+    PlanOnce();
+
+    Submit(RequestSpec{.request_id = "r2", .tokens = first.tokens});
+    const ExecutionPlan second_plan = PlanOnce();
+    const ForwardBatch* second = FindForwardBatch(second_plan);
+    ASSERT_NE(second, nullptr);
+    ASSERT_EQ(second->request_ids.size(), 1u);
+    EXPECT_EQ(second->input_lengths.at(0), 2);
+    EXPECT_EQ(second->extend_prefix_lens.at(0), 6);
+}
+
 // The hit is capped at (PrefillSize-1)/block_size pages so the last token is
 // always recomputed to produce logits.
 TEST_F(PrefixHitSuite, FullHitCapsAtLastToken) {

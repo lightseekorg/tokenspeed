@@ -96,9 +96,6 @@ class _EventLoopHarness:
         self.trace.append("get_forward")
         return None
 
-    def _flush_mamba_retract_states(self, _forward_op) -> None:
-        self.trace.append("flush_mamba")
-
     def _get_scheduler_stats(self):
         self.trace.append("stats")
         return object()
@@ -131,7 +128,6 @@ def test_event_loop_finishes_current_iteration_then_observes_shutdown() -> None:
         "zero_pages",
         "submit_cache",
         "get_forward",
-        "flush_mamba",
         "stats",
         "pause_finish",
         "metrics",

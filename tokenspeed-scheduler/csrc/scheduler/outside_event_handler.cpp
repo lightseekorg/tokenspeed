@@ -20,7 +20,9 @@
 
 #include "scheduler/scheduler.h"
 
+#include <iterator>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -28,6 +30,7 @@
 #include "fsm/forward_states.h"
 #include "fsm/pd_events.h"
 #include "scheduler/outside_events/inc.h"
+#include "scheduler/page_hasher.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -98,8 +101,33 @@ void Scheduler::handleEvent(const forward::Finish& event) {
     }
     pending_forward_results_.erase(event.request_id);
     if (Request* request = findRequest(event.request_id)) {
+        if (request->Is<fsm::PrefillDone>() || request->Is<fsm::Decoding>()) {
+            publishCompletedPages(*request);
+        }
         request->Apply(fsm::FinishEvent{&coordinator_});
     }
+}
+
+void Scheduler::publishCompletedPages(Request& request) {
+    const std::vector<std::span<const std::int32_t>> stable_pages = request.FullPagedTokens(true);
+    fsm::CacheProgress progress = request.CacheProgress();
+    const std::int32_t first_new_page = static_cast<std::int32_t>(progress.page_hashes.size());
+    const std::int32_t num_stable_pages = static_cast<std::int32_t>(stable_pages.size());
+    _assert(first_new_page <= num_stable_pages, "cache progress exceeds completed request pages");
+    if (first_new_page == num_stable_pages) {
+        return;
+    }
+
+    const std::string previous_hash = progress.page_hashes.empty() ? std::string{} : progress.page_hashes.back();
+    std::vector<std::string> new_hashes =
+        AdvancePagedHashes(stable_pages, first_new_page, previous_hash, num_stable_pages);
+    progress.page_hashes.insert(progress.page_hashes.end(), std::make_move_iterator(new_hashes.begin()),
+                                std::make_move_iterator(new_hashes.end()));
+
+    std::vector<CacheKey> event_keys = registerKvEventPages(request, progress.page_hashes, first_new_page);
+    coordinator_.CacheCompletedBlocks(request.BlockTablesRef(), progress.page_hashes, progress.access_epoch,
+                                      first_new_page, request.TokenSize() - 1, CacheBoundaryKind::kEndpoint);
+    discardUncachedKvEventPages(event_keys);
 }
 
 void Scheduler::handleEvent(const forward::UpdateReserveNumTokens& event) {

@@ -113,6 +113,7 @@ private:
                                                std::int32_t first_page);
     void discardUncachedKvEventPages(std::span<const CacheKey> keys);
     void handleCacheMutation(const CacheKey& key, KvCacheCoordinator::CacheMutation mutation);
+    void publishCompletedPages(Request& request);
     void retractForCapacity(const std::vector<Request*>& candidates);
 
     void emitPendingStores(std::vector<WriteBackOperation>& write_back_operations);

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+from unittest import mock
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -96,6 +97,61 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
             kernel["full_attention"].tolist(),
             [[6, 7, 10, 11, 0, 1]],
         )
+
+    def test_constructor_keeps_group_geometry_for_eager_metadata(self):
+        from tokenspeed.runtime.layers.attention.backends import trtllm
+        from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+
+        config = MHAConfig(
+            device="cpu",
+            backend_name="trtllm",
+            num_attention_heads=4,
+            num_kv_heads=1,
+            head_dim=64,
+            attn_tp_size=1,
+            dtype=self.torch.bfloat16,
+            kv_cache_dtype=self.torch.bfloat16,
+            page_size=64,
+            context_len=256,
+            max_bs=1,
+            max_graph_bs=1,
+            kv_cache_quant_method="none",
+            group_page_sizes={"full_attention": 128},
+        )
+        with (
+            mock.patch.object(trtllm, "TRTLLM_MHA_WORKSPACE", 1),
+            mock.patch.object(trtllm, "_global_workspace_buffer", None),
+        ):
+            backend = self.Backend(config)
+
+        self.assertEqual(backend.group_page_sizes, {"full_attention": 128})
+
+    def test_constructor_accepts_config_without_group_geometry(self):
+        from tokenspeed.runtime.layers.attention.backends import trtllm
+        from tokenspeed.runtime.layers.attention.configs.msa import MSAConfig
+
+        config = MSAConfig(
+            device="cpu",
+            backend_name="msa",
+            num_attention_heads=4,
+            num_kv_heads=1,
+            head_dim=64,
+            attn_tp_size=1,
+            dtype=self.torch.bfloat16,
+            kv_cache_dtype=self.torch.bfloat16,
+            page_size=64,
+            context_len=256,
+            max_bs=1,
+            max_graph_bs=1,
+            kv_cache_quant_method="none",
+        )
+        with (
+            mock.patch.object(trtllm, "TRTLLM_MHA_WORKSPACE", 1),
+            mock.patch.object(trtllm, "_global_workspace_buffer", None),
+        ):
+            backend = self.Backend(config)
+
+        self.assertEqual(backend.group_page_sizes, {})
 
     def test_build_page_table_keeps_single_table_direct_copy_path(self):
         b = self._bare_backend(page_size=64, max_num_pages=4)

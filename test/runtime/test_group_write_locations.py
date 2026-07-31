@@ -66,6 +66,14 @@ class _MHACase(_TorchCase):
 
 
 class ComputeOutCacheLocsTest(_MHACase):
+    def test_mha_keeps_scheduler_pages_when_cache_view_uses_group_size(self):
+        self.backend.group_page_sizes = {"full_attention": 4}
+        table = self.torch.tensor([[3, 5]], dtype=self.torch.int32)
+
+        converted = self.backend._kernel_page_tables({"full_attention": table})
+
+        self.assertIs(converted["full_attention"], table)
+
     def test_decode_locs_formula(self):
         torch = self.torch
         # 2 reqs, page_size=2. r0: seq_len 5 -> pos 4 -> page_idx 2, off 0.

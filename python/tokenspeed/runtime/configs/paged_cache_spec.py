@@ -187,8 +187,6 @@ def validate_scheduler_config(
             f"attention backend {backend_name} does not support cache groups "
             "with speculative decoding"
         )
-    if speculative_algorithm == "DFLASH":
-        raise RuntimeError("DFLASH is not supported by the cache-group scheduler")
     if len(paged_cache_groups) > 1 and not uses_cache_groups and contract is None:
         # A table-blind backend on a multi-group pool would index every
         # layer through the C++ single-table fallback (a first-group

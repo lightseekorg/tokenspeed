@@ -144,6 +144,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         super().__init__(config)
 
         self.page_size = config.page_size
+        self.group_page_sizes = dict(getattr(config, "group_page_sizes", None) or {})
         self.max_context_len = config.context_len
         self.kv_cache_dtype = config.kv_cache_dtype
         max_bs = config.max_bs

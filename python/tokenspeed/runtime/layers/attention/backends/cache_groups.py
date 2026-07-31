@@ -196,17 +196,24 @@ class CacheGroupsMixin:
         """Convert scheduler page IDs to the page size consumed by the kernel."""
         if not page_tables:
             return page_tables
-        if all(self._group_page_size(gid) == self.page_size for gid in page_tables):
+        if all(
+            self._group_page_size(gid) == self._consumer_page_size(gid)
+            for gid in page_tables
+        ):
             return page_tables
         return {
             gid: expand_page_table(
                 table,
                 logical_page_size=self._group_page_size(gid),
-                kernel_page_size=self.page_size,
+                kernel_page_size=self._consumer_page_size(gid),
                 max_kernel_pages=self.max_num_pages,
             )
             for gid, table in page_tables.items()
         }
+
+    def _consumer_page_size(self, group_id: str) -> int:
+        """Page size used to view a group's cache tensor in this backend."""
+        return self.page_size
 
     # ------------------------------------------------------------------
     # Write locations
@@ -382,20 +389,23 @@ class CacheGroupsMixin:
             )
             for gid in gids
         }
+        consumer_page_sizes = {gid: self._consumer_page_size(gid) for gid in att_gids}
         ratios = {
             gid: (
-                self._group_page_size(gid) // self.page_size if gid in att_gids else 1
+                self._group_page_size(gid) // consumer_page_sizes[gid]
+                if gid in att_gids
+                else 1
             )
             for gid in gids
         }
         if any(
-            ratio <= 0 or self._group_page_size(gid) % self.page_size
+            ratio <= 0 or self._group_page_size(gid) % consumer_page_sizes[gid]
             for gid, ratio in ratios.items()
             if gid in att_gids
         ):
             raise ValueError(
-                "cache group page sizes must be positive multiples of the "
-                f"kernel page size {self.page_size}"
+                "cache group page sizes must be positive multiples of their "
+                "consumer page sizes"
             )
         widths = {gid: source_widths[gid] * ratios[gid] for gid in gids}
         logger.debug(
@@ -434,7 +444,7 @@ class CacheGroupsMixin:
         self._group_source_widths = source_widths
         self._group_page_ratios = tuple(ratios[gid] for gid in gids)
         self._group_page_sizes_tensor = torch.tensor(
-            [self.page_size for _ in att_gids],
+            [consumer_page_sizes[gid] for gid in att_gids],
             dtype=torch.int32,
             device=self.device,
         )
@@ -611,7 +621,7 @@ class CacheGroupsMixin:
                     expand_page_table(
                         src[:rows, :source_cols],
                         logical_page_size=self._group_page_size(gid),
-                        kernel_page_size=self.page_size,
+                        kernel_page_size=self._consumer_page_size(gid),
                         max_kernel_pages=buf.shape[1],
                         out=buf[:rows],
                     )

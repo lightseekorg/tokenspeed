@@ -39,7 +39,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
 from tokenspeed_kernel.ops.quantization import quantize_mxfp8
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
-from tokenspeed.runtime.execution.breakable_cuda_graph import scrub_padding_tail
+from tokenspeed.runtime.execution.breakable_cuda_graph import slice_to_real_tokens
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.cache_groups import (
@@ -63,13 +63,15 @@ _KERNEL_SOLUTION_BY_BACKEND = {
 }
 
 
-def _scrub_extend_padding(metadata, q, k, v) -> None:
-    """Zero the q/k/v rows beyond the real (unpadded) token count under a prefill graph.
+def _slice_extend_inputs(metadata, q, k, v):
+    """Remove prefill-graph padding rows before calling an attention kernel.
 
-    Reads the count from the pinned CPU cu-seqlens mirror (sync-free) and delegates the
-    zeroing to the shared prefill-graph padding helper. No-op on normal unpadded forwards.
+    The live cu-seqlens describe only real tokens. Some kernels tolerate extra
+    zero rows, but others still derive work from the tensor shape. Use the
+    pinned CPU mirror (sync-free) so every solution receives the same exact-row
+    contract. No-op on normal unpadded forwards.
     """
-    scrub_padding_tail(metadata.cu_extend_seq_lens_cpu[-1], q, k, v)
+    return slice_to_real_tokens(metadata.cu_extend_seq_lens_cpu[-1], q, k, v)
 
 
 @dataclass(kw_only=True)
@@ -167,8 +169,8 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
 
         # family="state" ids (GDN/mamba) learned in init_cuda_graph_state; this backend sheds them
         self.state_group_ids: frozenset[str] = frozenset()
-        # Per-group page sizes (heterogeneous block sizes), learned with them.
-        self.group_page_sizes: dict[str, int] = {}
+        # Group geometry is available to eager metadata before graph setup.
+        self.group_page_sizes = dict(getattr(config, "group_page_sizes", None) or {})
 
     # ------------------------------------------------------------------
     # Metadata initialization
@@ -621,7 +623,7 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         save_kv_cache: bool,
         sinks: torch.Tensor | None,
     ) -> torch.Tensor:
-        _scrub_extend_padding(metadata, q, k, v)
+        q, k, v = _slice_extend_inputs(metadata, q, k, v)
         # TODO: use a custom kernel to do downcast
         if self.is_fp8:
             q = q.to(self.kv_cache_dtype)
@@ -657,7 +659,7 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         save_kv_cache: bool,
         sinks: torch.Tensor | None,
     ) -> torch.Tensor:
-        _scrub_extend_padding(metadata, q, k, v)
+        q, k, v = _slice_extend_inputs(metadata, q, k, v)
         if save_kv_cache:
             # KV store (incl. the mxfp8 quantize-on-store path) lives solely
             # in _save_kv_cache.
@@ -822,6 +824,9 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             layer.v_head_dim,
         )
         return k_cache, v_cache
+
+    def _consumer_page_size(self, group_id: str) -> int:
+        return self._group_page_size(group_id)
 
     def _make_spec_metadata_buffers(
         self,

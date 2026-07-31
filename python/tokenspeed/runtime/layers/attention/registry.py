@@ -356,6 +356,14 @@ def _validate_lcm_page_size(
         )
 
 
+def _set_lcm_group_page_sizes(config: BaseAttnConfig, spec: LcmPoolSpec) -> None:
+    """Publish scheduler page sizes to group-aware MHA backends."""
+    if not hasattr(config, "group_page_sizes"):
+        return
+    page_size = spec.memory_plan.logical_block_tokens
+    config.group_page_sizes = {group_id: page_size for group_id in spec.layer_group_ids}
+
+
 # ---------- arch -> config class ----------
 
 _CONFIG_CLS: dict[AttentionArch, type[BaseAttnConfig]] = {
@@ -1117,11 +1125,14 @@ def create_attn_components(
             config,
             logical_page_size=logical_page_size,
         )
+        _set_lcm_group_page_sizes(config, lcm_setup.target)
         if draft_attn_config is not None:
             _validate_lcm_page_size(
                 draft_attn_config,
                 logical_page_size=logical_page_size,
             )
+            if lcm_setup.draft is not None:
+                _set_lcm_group_page_sizes(draft_attn_config, lcm_setup.draft)
         cache_budget_bytes = lcm_setup.cache_budget_bytes
         fixed_workspace_bytes = lcm_setup.fixed_workspace_bytes
         max_num_tokens = lcm_setup.target.pool_size

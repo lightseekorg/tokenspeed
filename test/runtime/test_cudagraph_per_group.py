@@ -120,6 +120,44 @@ class CacheGroupIdsTest(_TorchCase):
         self.assertEqual(out, ())
 
 
+class DraftCacheGroupIdsTest(_TorchCase):
+    """DFLASH owns an independent draft page table; EAGLE-style drafts use
+    target cache-group tables at matching page ids."""
+
+    def setUp(self):
+        super().setUp()
+        from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+            CudaGraphWrapper,
+        )
+
+        self.group_ids = CudaGraphWrapper._draft_cache_group_ids
+
+    def _wrapper(self, *, draft_block_decode):
+        return SimpleNamespace(
+            draft_attn_backend=SimpleNamespace(
+                uses_cache_groups=True,
+                draft_block_decode=draft_block_decode,
+            ),
+            draft_token_to_kv_pool=SimpleNamespace(
+                paged_cache_group_specs=(
+                    SimpleNamespace(group_id="full_attention", family="history"),
+                )
+            ),
+        )
+
+    def test_dflash_does_not_capture_target_group_tables(self):
+        self.assertEqual(
+            self.group_ids(self._wrapper(draft_block_decode=True)),
+            (),
+        )
+
+    def test_eagle_draft_uses_published_history_groups(self):
+        self.assertEqual(
+            self.group_ids(self._wrapper(draft_block_decode=False)),
+            ("full_attention",),
+        )
+
+
 class WrapperReplayGroupedTest(_TorchCase):
     """Call-site wiring: the real _init_replay_metadata must row-pad grouped
     tables with 0 (not the -1 default) before handing them to the backend."""

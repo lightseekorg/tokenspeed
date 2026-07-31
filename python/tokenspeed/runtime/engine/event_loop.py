@@ -214,6 +214,27 @@ class EventLoop:
         geometry = self._scheduler_cache_geometry
         self.max_total_num_tokens = geometry.token_capacity
         num_total_pages = geometry.num_device_pages
+        paged_cache_groups = pool_to_paged_cache_groups(token_to_kv_pool)
+        # Resolve the scheduler limit before ModelExecutorConfig sizes input
+        # buffers. Lowering the limit is safe; a configured chunk smaller than
+        # one state page is rejected by aligned_max_scheduled_tokens instead of
+        # silently increasing a frozen buffer limit.
+        max_scheduled_tokens = server_args.chunked_prefill_size
+        if server_args.enable_prefix_caching:
+            max_scheduled_tokens = aligned_max_scheduled_tokens(
+                server_args.chunked_prefill_size,
+                paged_cache_groups,
+                geometry.page_size,
+            )
+            if max_scheduled_tokens != server_args.chunked_prefill_size:
+                logger.warning(
+                    "chunked_prefill_size=%s is not a multiple of the "
+                    "state-snapshot page grain; using %s so recurrent-state "
+                    "pages can register for prefix-cache reuse.",
+                    server_args.chunked_prefill_size,
+                    max_scheduled_tokens,
+                )
+                server_args.chunked_prefill_size = max_scheduled_tokens
         mapping = server_args.mapping
         # The C++ scheduler's req_pool_idx range is rank-local and 1-based:
         # real rows are 1..max_batch_size, row 0 is reserved, and CUDA graph
@@ -300,7 +321,6 @@ class EventLoop:
         )
 
         # Adjunct enabled only when pool opts in AND prefix-caching switch is on.
-        paged_cache_groups = pool_to_paged_cache_groups(token_to_kv_pool)
         self._pd_cache_enabled = bool(
             server_args.disaggregation_mode in ("prefill", "decode")
             and getattr(token_to_kv_pool, "supports_disaggregation", False) is True
@@ -344,24 +364,6 @@ class EventLoop:
             speculative_algorithm=server_args.speculative_algorithm,
         )
         self._paged_cache_groups = paged_cache_groups
-        # State-snapshot groups only register prefix-cache pages when a chunk
-        # ends page-aligned; floor the chunk size to that grain or reuse is 0.
-        max_scheduled_tokens = server_args.chunked_prefill_size
-        if server_args.enable_prefix_caching:
-            max_scheduled_tokens = aligned_max_scheduled_tokens(
-                server_args.chunked_prefill_size,
-                paged_cache_groups,
-                geometry.page_size,
-            )
-            if max_scheduled_tokens != server_args.chunked_prefill_size:
-                logger.warning(
-                    "chunked_prefill_size=%s is not a multiple of the "
-                    "state-snapshot page grain; using %s so recurrent-state "
-                    "pages can register for prefix-cache reuse.",
-                    server_args.chunked_prefill_size,
-                    max_scheduled_tokens,
-                )
-                server_args.chunked_prefill_size = max_scheduled_tokens
         scheduler_cfg = make_config(
             num_device_pages=geometry.num_device_pages,
             max_scheduled_tokens=max_scheduled_tokens,

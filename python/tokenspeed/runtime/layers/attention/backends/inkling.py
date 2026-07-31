@@ -53,13 +53,11 @@ from tokenspeed_kernel import (
 )
 from tokenspeed_kernel.ops.conv import sconv_cache_update, seq_idx_from_cu_seqlens
 
+from tokenspeed.runtime.execution.breakable_cuda_graph import scrub_padding_tail
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
     init_backend_cuda_graph_state,
-)
-from tokenspeed.runtime.layers.attention.backends.mha import (
-    _scrub_extend_padding,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.common import maybe_inference_mode
@@ -1395,9 +1393,11 @@ class InklingAttnBackend(AttentionBackend):
         k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
         v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
         metadata = inner.forward_extend_metadata
-        # Rel path skips base pad hygiene: zero q/k/v + OUTPUT pad rows, else uninit NaNs REAL rows.
-        _scrub_extend_padding(metadata, q, k, v)
         _num_real = metadata.cu_extend_seq_lens_cpu[-1]
+        # Relative attention keeps bucket-shaped inputs because rel_logits and
+        # its handoff are bucket-shaped. Scrub the padded rows instead of using
+        # the plain MHA path's exact-row kernel contract.
+        scrub_padding_tail(_num_real, q, k, v)
         out_cache_loc = inner._select_out_cache_loc(layer, metadata, out_cache_loc)
         plan = rel_mha_plan(
             dtype=torch.float8_e4m3fn if inner.is_fp8 else inner.qkv_dtype,

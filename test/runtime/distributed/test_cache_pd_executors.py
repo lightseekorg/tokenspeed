@@ -313,7 +313,7 @@ def test_shared_manager_transfers_only_group_bound_slabs() -> None:
             None,
             src_page_manifest=source_manifest,
             dst_page_manifest=destination_manifest,
-            dst_flat_num_pages_with_null=layout.num_pages_with_null,
+            dst_num_pages_with_null=layout.num_pages_with_null,
         )
         == 0
     )
@@ -421,7 +421,7 @@ def test_shared_manager_resolves_lcm_group_segments() -> None:
             None,
             src_page_manifest=source_manifest,
             dst_page_manifest=destination_manifest,
-            dst_flat_num_pages_with_null=layout.num_pages_with_null,
+            dst_num_pages_with_null=layout.num_pages_with_null,
         )
         == 0
     )

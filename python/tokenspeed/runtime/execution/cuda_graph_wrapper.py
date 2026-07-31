@@ -625,17 +625,20 @@ class CudaGraphWrapper:
     def _draft_cache_group_ids(self) -> tuple[str, ...]:
         """Per-group page tables consumed by the drafter.
 
-        The draft head shares the TARGET's page-id space (EAGLE writes its
-        own pool tensors at the same indices), so each draft group consumes
-        the target table of the SAME group id. A draft pool that publishes
-        its own specs (Inkling MTP: mixed full/SWA depths) names exactly the
-        groups its layers carry — all of which exist in the target's table
-        set by construction (same label vocabulary, same window). Older
-        draft paths without a separate pool keep the full-history fallback.
+        DFLASH block decode owns an independent draft page table and must stay
+        on that single-table path. Other draft heads share the target's page-id
+        space (EAGLE writes its own pool tensors at the same indices), so each
+        draft group consumes the target table of the same group id.
+
+        A draft pool that publishes its own specs (Inkling MTP: mixed full/SWA
+        depths) names exactly the groups its layers carry. Older draft paths
+        without a separate pool keep the full-history fallback.
         """
         if self.draft_attn_backend is None or not getattr(
             self.draft_attn_backend, "uses_cache_groups", False
         ):
+            return ()
+        if getattr(self.draft_attn_backend, "draft_block_decode", False):
             return ()
         if self.draft_token_to_kv_pool is not None and getattr(
             self.draft_token_to_kv_pool, "paged_cache_group_specs", ()
