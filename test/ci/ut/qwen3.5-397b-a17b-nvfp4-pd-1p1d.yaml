@@ -1,7 +1,7 @@
 api_version: ci.tokenspeed.io/v1
 name: ut-runtime-qwen35-pd-1p1d
 type: ut
-workflow_stage: runtime-test
+workflow_stage: unit-test
 triggers:
   - per-commit
   - manual

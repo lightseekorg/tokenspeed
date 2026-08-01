@@ -62,10 +62,8 @@ jobs:
       github.repository == vars.TOKENSPEED_CI_REPOSITORY
     runs-on: ubuntu-latest
     outputs:
-      kernel_matrix: ${{ steps.scan.outputs.kernel_matrix }}
-      kernel_has_tasks: ${{ steps.scan.outputs.kernel_has_tasks }}
-      runtime_matrix: ${{ steps.scan.outputs.runtime_matrix }}
-      runtime_has_tasks: ${{ steps.scan.outputs.runtime_has_tasks }}
+      unit_matrix: ${{ steps.scan.outputs.unit_matrix }}
+      unit_has_tasks: ${{ steps.scan.outputs.unit_has_tasks }}
       model_matrix: ${{ steps.scan.outputs.model_matrix }}
       model_has_tasks: ${{ steps.scan.outputs.model_has_tasks }}
       install_tokenspeed_mla_from_source: ${{ steps.detect_mla.outputs.changed }}
@@ -90,8 +88,7 @@ jobs:
           TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS: h100,${{ vars.TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS }}
         run: |
           for stage in \
-            kernel:kernel-test \
-            runtime:runtime-test \
+            unit:unit-test \
             model:model-test; do
             output=${stage%%:*}
             workflow_stage=${stage#*:}
@@ -139,10 +136,10 @@ jobs:
             echo "changed=0" >> "$GITHUB_OUTPUT"
           fi
 
-  kernel-test:
+  unit-test:
     needs: scan
     if: |
-      needs.scan.outputs.kernel_has_tasks == 'true' &&
+      needs.scan.outputs.unit_has_tasks == 'true' &&
       (github.event_name != 'pull_request' || github.event.action != 'closed') &&
       (
         github.event_name == 'pull_request' ||
@@ -155,42 +152,20 @@ jobs:
       )
     uses: ./.github/workflows/run-pr-test-stage.yml
     with:
-      matrix: ${{ needs.scan.outputs.kernel_matrix }}
-      install_tokenspeed_mla_from_source: ${{ needs.scan.outputs.install_tokenspeed_mla_from_source }}
-      b200_runner_label: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL || 'b200v2' }}
-    secrets: inherit
-
-  runtime-test:
-    needs: [scan, kernel-test]
-    if: |
-      !cancelled() &&
-      needs.scan.result == 'success' &&
-      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
-      (
-        needs.kernel-test.result == 'success' ||
-        needs.scan.outputs.kernel_has_tasks != 'true'
-      ) &&
-      needs.scan.outputs.runtime_has_tasks == 'true'
-    uses: ./.github/workflows/run-pr-test-stage.yml
-    with:
-      matrix: ${{ needs.scan.outputs.runtime_matrix }}
+      matrix: ${{ needs.scan.outputs.unit_matrix }}
       install_tokenspeed_mla_from_source: ${{ needs.scan.outputs.install_tokenspeed_mla_from_source }}
       b200_runner_label: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL || 'b200v2' }}
     secrets: inherit
 
   model-test:
-    needs: [scan, kernel-test, runtime-test]
+    needs: [scan, unit-test]
     if: |
       !cancelled() &&
       needs.scan.result == 'success' &&
       (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
       (
-        needs.kernel-test.result == 'success' ||
-        needs.scan.outputs.kernel_has_tasks != 'true'
-      ) &&
-      (
-        needs.runtime-test.result == 'success' ||
-        needs.scan.outputs.runtime_has_tasks != 'true'
+        needs.unit-test.result == 'success' ||
+        needs.scan.outputs.unit_has_tasks != 'true'
       ) &&
       needs.scan.outputs.model_has_tasks == 'true'
     uses: ./.github/workflows/run-pr-test-stage.yml
@@ -209,7 +184,7 @@ jobs:
         github.repository == 'lightseekorg/tokenspeed' ||
         github.repository == vars.TOKENSPEED_CI_REPOSITORY
       )
-    needs: [kernel-test, runtime-test, model-test]
+    needs: [unit-test, model-test]
     runs-on: ubuntu-latest
     steps:
       - name: Finish

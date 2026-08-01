@@ -25,8 +25,7 @@ Currently configured task directories:
 
 Every task declares one `workflow_stage`:
 
-- `kernel-test` for kernel unit tests
-- `runtime-test` for runtime tests
+- `unit-test` for kernel and runtime tests
 - `model-test` for model evaluation and performance tests
 
 The PR workflows run these stages in that order. Matrix entries within a stage

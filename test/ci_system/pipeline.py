@@ -33,8 +33,7 @@ except ImportError as exc:  # pragma: no cover
 SUPPORTED_TYPES = {"ut", "server_smoke", "eval", "perf"}
 SUPPORTED_TRIGGERS = {"per-commit", "manual", "nightly", "debug"}
 WORKFLOW_STAGE_TYPES = {
-    "kernel-test": {"ut"},
-    "runtime-test": {"ut", "server_smoke"},
+    "unit-test": {"ut", "server_smoke"},
     "model-test": {"eval", "perf"},
 }
 SUPPORTED_WORKFLOW_STAGES = tuple(WORKFLOW_STAGE_TYPES)
