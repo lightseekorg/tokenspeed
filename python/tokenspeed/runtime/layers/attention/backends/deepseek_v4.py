@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
+
 import torch
 from tokenspeed_kernel.ops.attention.flash_mla import (
     flash_mla_sparse_fwd,
@@ -37,6 +39,7 @@ from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.configs.paged_cache_spec import (
     compute_max_logical_pages_for_capture,
+    scheduler_ext_flat_kvcache,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -239,10 +242,17 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     """Metadata owner for the model-local DeepSeek V4 attention path."""
 
     uses_paged_cache_groups = True
+    uses_flat_cache_groups = True
+    flat_spec_capable = True
+    flat_cache_consumer_families = frozenset({"history", "state"})
     uses_padded_decode_token_mask = True
 
     def __init__(self, config) -> None:
         super().__init__(config)
+        # The class attribute advertises the completed capability to startup
+        # validation. V4 publishes group specs on both scheduler variants, so
+        # per-step routing must be active only for a Flat-built extension.
+        self.uses_flat_cache_groups = scheduler_ext_flat_kvcache()
         self.page_size = config.page_size
         self.context_len = config.context_len
         rope_head_dim = getattr(config, "qk_rope_head_dim", None)
@@ -268,6 +278,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self._decode_tile_metadata = {}
         self._cuda_graph_metadata = {}
         self._cuda_graph_paged_cache_block_tables: dict[str, torch.Tensor] = {}
+        self._expected_flat_cache_group_ids: tuple[str, ...] | None = None
+        self._cuda_graph_flat_group_ids: tuple[str, ...] = ()
         # Per-sliding-group [max_bs] int32 buffers mirroring the block-table
         # buffers; populated by init_cuda_graph_state.
         self._cuda_graph_paged_cache_base_offsets: dict[str, torch.Tensor] = {}
@@ -288,6 +300,110 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self._cuda_graph_draft_decode_metadata = {}
         self._cuda_graph_query_start_by_tokens_per_req: dict[int, torch.Tensor] = {}
         self._cuda_graph_token_to_req_by_tokens_per_req: dict[int, torch.Tensor] = {}
+
+    @staticmethod
+    def _normalized_group_ids(
+        values: Sequence[object],
+        *,
+        source: str,
+    ) -> tuple[str, ...]:
+        group_ids: list[str] = []
+        seen: set[str] = set()
+        duplicates: set[str] = set()
+        for value in values:
+            if not isinstance(value, str) or not value:
+                raise RuntimeError(
+                    f"DeepSeek V4 {source} group ids must be non-empty strings, "
+                    f"got {value!r}"
+                )
+            if value in seen:
+                duplicates.add(value)
+            seen.add(value)
+            group_ids.append(value)
+        if duplicates:
+            raise RuntimeError(
+                f"DeepSeek V4 {source} contains duplicate group ids: "
+                f"{sorted(duplicates)}"
+            )
+        return tuple(group_ids)
+
+    def _require_flat_group_ids(
+        self,
+        group_ids: Sequence[object],
+        *,
+        phase: str,
+    ) -> tuple[str, ...]:
+        delivered = self._normalized_group_ids(group_ids, source=f"Flat KV {phase}")
+        expected = self._expected_flat_cache_group_ids
+        if expected is None:
+            raise RuntimeError(
+                "DeepSeek V4 Flat KV group specs were not initialized before "
+                f"{phase}"
+            )
+        if delivered != expected:
+            delivered_set = set(delivered)
+            expected_set = set(expected)
+            detail = (
+                f"missing={sorted(expected_set - delivered_set)} "
+                f"extra={sorted(delivered_set - expected_set)}"
+            )
+            if delivered_set == expected_set:
+                detail = f"wrong order: got={delivered!r} expected={expected!r}"
+            raise RuntimeError(f"DeepSeek V4 Flat KV {phase} group mismatch: {detail}")
+        return delivered
+
+    def _validated_flat_block_tables(
+        self,
+        flat_block_tables: Mapping[object, object],
+        *,
+        bs: int,
+        device: torch.device,
+        phase: str,
+    ) -> dict[str, torch.Tensor]:
+        if not isinstance(flat_block_tables, Mapping):
+            raise RuntimeError(
+                f"DeepSeek V4 Flat KV {phase} tables must be a mapping, got "
+                f"{type(flat_block_tables).__name__}"
+            )
+        items = list(flat_block_tables.items())
+        group_ids = self._require_flat_group_ids(
+            [group_id for group_id, _ in items],
+            phase=phase,
+        )
+        expected_device = torch.device(device)
+        out: dict[str, torch.Tensor] = {}
+        for group_id, (_, table) in zip(group_ids, items, strict=True):
+            if not isinstance(table, torch.Tensor):
+                raise RuntimeError(
+                    f"DeepSeek V4 Flat KV {phase} table {group_id!r} must be "
+                    f"torch.Tensor, got {type(table).__name__}"
+                )
+            if table.dtype != torch.int32:
+                raise RuntimeError(
+                    f"DeepSeek V4 Flat KV {phase} table {group_id!r} must use "
+                    f"torch.int32, got {table.dtype}"
+                )
+            if table.device != expected_device:
+                raise RuntimeError(
+                    f"DeepSeek V4 Flat KV {phase} table {group_id!r} is on "
+                    f"{table.device}, expected {expected_device}"
+                )
+            if table.ndim != 2:
+                raise RuntimeError(
+                    f"DeepSeek V4 Flat KV {phase} table {group_id!r} must be "
+                    f"rank 2, got shape={tuple(table.shape)}"
+                )
+            if int(table.shape[0]) != int(bs):
+                raise RuntimeError(
+                    f"DeepSeek V4 Flat KV {phase} table {group_id!r} has "
+                    f"{int(table.shape[0])} rows, expected bs={int(bs)}"
+                )
+            if int(table.shape[1]) <= 0:
+                raise RuntimeError(
+                    f"DeepSeek V4 Flat KV {phase} table {group_id!r} has zero width"
+                )
+            out[group_id] = table
+        return out
 
     def _get_prefill_workspace(
         self,
@@ -550,6 +666,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         **kwargs,
     ) -> None:
         paged_cache_block_tables = kwargs.pop("paged_cache_block_tables", None) or {}
+        flat_block_tables = kwargs.pop("flat_block_tables", None) or {}
         paged_cache_block_table_base_offsets = (
             kwargs.pop("paged_cache_block_table_base_offsets", None) or {}
         )
@@ -565,6 +682,38 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             num_tokens = bs
         del kwargs
         device = seq_lens.device
+        if self.uses_flat_cache_groups:
+            if paged_cache_block_tables:
+                raise RuntimeError(
+                    "DeepSeek V4 Flat KV eager forward received radix "
+                    "paged-cache block tables"
+                )
+            if paged_cache_block_table_base_offsets:
+                raise RuntimeError(
+                    "DeepSeek V4 Flat KV eager forward received radix compact-table "
+                    "base offsets"
+                )
+            idle = forward_mode is not None and forward_mode.is_idle()
+            if not flat_block_tables:
+                if bs > 0 and not idle:
+                    raise RuntimeError(
+                        "DeepSeek V4 Flat KV eager forward is missing live "
+                        "flat_block_tables"
+                    )
+                paged_cache_block_tables = {}
+            else:
+                paged_cache_block_tables = self._validated_flat_block_tables(
+                    flat_block_tables,
+                    bs=bs,
+                    device=device,
+                    phase="eager",
+                )
+            paged_cache_block_table_base_offsets = {}
+        elif flat_block_tables:
+            raise RuntimeError(
+                "DeepSeek V4 received Flat KV eager tables while the runtime "
+                "scheduler is not Flat-built"
+            )
         req_pool_indices = req_pool_indices[:bs]
         seq_lens = seq_lens[:bs].to(torch.int32)
         query_lens = self._query_lens(
@@ -635,10 +784,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             )
         else:
             block_table = req_to_page[req_pool_indices, : max(max_pages, 1)]
-        paged_cache_block_tables = {
-            str(gid): table[:bs].to(device=device, dtype=torch.int32)
-            for gid, table in paged_cache_block_tables.items()
-        }
+        if not self.uses_flat_cache_groups:
+            paged_cache_block_tables = {
+                str(gid): table[:bs].to(device=device, dtype=torch.int32)
+                for gid, table in paged_cache_block_tables.items()
+            }
         base_offsets_on_device: dict[str, torch.Tensor] = {}
         for gid, off in paged_cache_block_table_base_offsets.items():
             if not isinstance(off, torch.Tensor):
@@ -1668,22 +1818,53 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             )
         self._cuda_graph_max_bs = max_bs
         self._cuda_graph_paged_cache_block_tables = {}
-        self._cuda_graph_paged_cache_base_offsets = {}
-        for spec in tuple(paged_cache_group_specs or ()):
-            gid = str(spec.group_id)
-            sliding = str(getattr(spec, "retention", "")) == "sliding_window"
-            max_pages = compute_max_logical_pages_for_capture(
-                spec,
-                max_context_len=self.context_len,
-                max_tokens_per_req=max_tokens_per_req,
-                overlap_schedule_depth=overlap_schedule_depth,
+        self._cuda_graph_flat_group_ids = ()
+        specs = tuple(paged_cache_group_specs or ())
+        raw_group_ids = tuple(getattr(spec, "group_id", None) for spec in specs)
+        group_ids = self._normalized_group_ids(
+            raw_group_ids,
+            source="cache group specs",
+        )
+        self._expected_flat_cache_group_ids = group_ids
+        if self.uses_flat_cache_groups and not group_ids:
+            raise RuntimeError(
+                "DeepSeek V4 Flat KV runtime requires at least one cache group spec"
             )
+        self._cuda_graph_paged_cache_base_offsets = {}
+        for spec, gid in zip(specs, group_ids, strict=True):
+            sliding = str(getattr(spec, "retention", "")) == "sliding_window"
+            if self.uses_flat_cache_groups:
+                rows_per_page = int(getattr(spec, "rows_per_page", 0))
+                entry_stride_tokens = int(getattr(spec, "entry_stride_tokens", 0))
+                raw_tokens_per_page = rows_per_page * entry_stride_tokens
+                if raw_tokens_per_page <= 0:
+                    raise RuntimeError(
+                        "DeepSeek V4 Flat KV cache group has invalid geometry: "
+                        f"group={gid!r} rows_per_page={rows_per_page} "
+                        f"entry_stride_tokens={entry_stride_tokens}"
+                    )
+                capture_tokens = (
+                    int(self.context_len)
+                    + (int(overlap_schedule_depth) + 1)
+                    * self._cuda_graph_max_tokens_per_req
+                )
+                max_pages = max(
+                    1,
+                    (capture_tokens + raw_tokens_per_page - 1) // raw_tokens_per_page,
+                )
+            else:
+                max_pages = compute_max_logical_pages_for_capture(
+                    spec,
+                    max_context_len=self.context_len,
+                    max_tokens_per_req=max_tokens_per_req,
+                    overlap_schedule_depth=overlap_schedule_depth,
+                )
             self._cuda_graph_paged_cache_block_tables[gid] = torch.zeros(
                 (max_bs, max_pages),
                 dtype=torch.int32,
                 device=self.device,
             )
-            if sliding:
+            if sliding and not self.uses_flat_cache_groups:
                 self._cuda_graph_paged_cache_base_offsets[gid] = torch.zeros(
                     (max_bs,),
                     dtype=torch.int32,
@@ -1812,6 +1993,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         **kwargs,
     ):
         paged_cache_block_tables = kwargs.pop("paged_cache_block_tables", None) or {}
+        flat_cache_group_ids = tuple(kwargs.pop("flat_cache_group_ids", None) or ())
         paged_cache_block_table_base_offsets = (
             kwargs.pop("paged_cache_block_table_base_offsets", None) or {}
         )
@@ -1846,22 +2028,51 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         is_decode = (
             metadata_forward_mode is not None and metadata_forward_mode.is_decode()
         )
-        offsets_on_device = {
-            str(gid): off.to(device=self.device, dtype=torch.int32)
-            for gid, off in paged_cache_block_table_base_offsets.items()
-        }
-        metadata_paged = self._refresh_cuda_graph_paged_cache_block_tables(
-            bs,
-            {
-                str(group_id): table.to(device=self.device, dtype=torch.int32)
-                for group_id, table in paged_cache_block_tables.items()
-            },
-            pad_value=0,
-        )
-        metadata_base_offsets = self._refresh_cuda_graph_base_offsets(
-            bs,
-            offsets_on_device,
-        )
+        if self.uses_flat_cache_groups:
+            if paged_cache_block_tables:
+                raise RuntimeError(
+                    "DeepSeek V4 Flat KV graph capture received radix "
+                    "paged-cache block tables"
+                )
+            if paged_cache_block_table_base_offsets:
+                raise RuntimeError(
+                    "DeepSeek V4 Flat KV graph capture received radix compact-table "
+                    "base offsets"
+                )
+            self._cuda_graph_flat_group_ids = self._require_flat_group_ids(
+                flat_cache_group_ids,
+                phase="capture",
+            )
+            # Live scheduler tables do not exist during capture. Bind views of
+            # the persistent buffers; replay refreshes every one in-place.
+            metadata_paged = {
+                group_id: self._cuda_graph_paged_cache_block_tables[group_id][:bs]
+                for group_id in self._cuda_graph_flat_group_ids
+            }
+            metadata_base_offsets = {}
+        else:
+            if flat_cache_group_ids:
+                raise RuntimeError(
+                    "DeepSeek V4 received Flat KV graph capture groups while the "
+                    "runtime scheduler is not Flat-built"
+                )
+            self._cuda_graph_flat_group_ids = ()
+            offsets_on_device = {
+                str(gid): off.to(device=self.device, dtype=torch.int32)
+                for gid, off in paged_cache_block_table_base_offsets.items()
+            }
+            metadata_paged = self._refresh_cuda_graph_paged_cache_block_tables(
+                bs,
+                {
+                    str(group_id): table.to(device=self.device, dtype=torch.int32)
+                    for group_id, table in paged_cache_block_tables.items()
+                },
+                pad_value=0,
+            )
+            metadata_base_offsets = self._refresh_cuda_graph_base_offsets(
+                bs,
+                offsets_on_device,
+            )
         (
             swa_block_table,
             compressor_state_block_tables,
@@ -1937,6 +2148,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         **kwargs,
     ):
         paged_cache_block_tables = kwargs.pop("paged_cache_block_tables", None) or {}
+        flat_block_tables = kwargs.pop("flat_block_tables", None) or {}
         paged_cache_block_table_base_offsets = (
             kwargs.pop("paged_cache_block_table_base_offsets", None) or {}
         )
@@ -1967,22 +2179,61 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             self._cuda_graph_block_table[:bs, : self.max_num_pages].copy_(
                 req_to_page[req_pool_indices[:bs], : self.max_num_pages]
             )
-        offsets_on_device = {
-            str(gid): off.to(device=self.device, dtype=torch.int32)
-            for gid, off in paged_cache_block_table_base_offsets.items()
-        }
-        metadata_paged = self._refresh_cuda_graph_paged_cache_block_tables(
-            bs,
-            {
-                str(group_id): table.to(device=self.device, dtype=torch.int32)
-                for group_id, table in paged_cache_block_tables.items()
-            },
-            pad_value=-1,
-        )
-        metadata_base_offsets = self._refresh_cuda_graph_base_offsets(
-            bs,
-            offsets_on_device,
-        )
+        if self._cuda_graph_flat_group_ids:
+            if not self.uses_flat_cache_groups:
+                raise RuntimeError(
+                    "DeepSeek V4 Flat KV graph was captured but Flat runtime "
+                    "routing is inactive"
+                )
+            if paged_cache_block_tables:
+                raise RuntimeError(
+                    "DeepSeek V4 Flat KV graph replay received radix paged-cache "
+                    "block tables"
+                )
+            if paged_cache_block_table_base_offsets:
+                raise RuntimeError(
+                    "DeepSeek V4 Flat KV graph replay received radix compact-table "
+                    "base offsets"
+                )
+            if not flat_block_tables:
+                raise RuntimeError(
+                    "DeepSeek V4 Flat KV graph replay is missing live "
+                    "flat_block_tables; captured placeholders cannot be replayed"
+                )
+            validated_flat = self._validated_flat_block_tables(
+                flat_block_tables,
+                bs=bs,
+                device=seq_lens.device,
+                phase="replay",
+            )
+            metadata_paged = self._refresh_cuda_graph_paged_cache_block_tables(
+                bs,
+                validated_flat,
+                pad_value=-1,
+            )
+            metadata_base_offsets = {}
+        else:
+            if flat_block_tables:
+                raise RuntimeError(
+                    "DeepSeek V4 received Flat KV replay tables without a matching "
+                    "Flat KV graph capture"
+                )
+            offsets_on_device = {
+                str(gid): off.to(device=self.device, dtype=torch.int32)
+                for gid, off in paged_cache_block_table_base_offsets.items()
+            }
+            metadata_paged = self._refresh_cuda_graph_paged_cache_block_tables(
+                bs,
+                {
+                    str(group_id): table.to(device=self.device, dtype=torch.int32)
+                    for group_id, table in paged_cache_block_tables.items()
+                },
+                pad_value=-1,
+            )
+            metadata_base_offsets = self._refresh_cuda_graph_base_offsets(
+                bs,
+                offsets_on_device,
+            )
         (
             swa_block_table,
             compressor_state_block_tables,

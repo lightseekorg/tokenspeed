@@ -441,15 +441,39 @@ class PrefillGraph:
         # ALL groups, state included: hybrid wrappers forward the dict to the
         # mamba child, which requires its state group; KV children shed state
         # groups themselves (_shed_state_groups).
-        return {
-            str(spec.group_id): torch.full(
-                (bs, width),
-                1 if str(spec.group_id) in state_group_ids else 0,
+        out = {}
+        for spec in specs:
+            raw_tokens_per_page = int(
+                getattr(spec, "rows_per_page", backend.page_size)
+            ) * int(getattr(spec, "entry_stride_tokens", 1))
+            if raw_tokens_per_page <= 0:
+                raise RuntimeError(
+                    "PrefillGraph Flat KV group has invalid geometry: "
+                    f"group={str(spec.group_id)!r}"
+                )
+            # V4 state groups can have much finer page geometry than the
+            # backend's legacy page_size. Keep the legacy minimum width for
+            # backends that index the full row, but never under-size a group's
+            # absolute logical columns.
+            group_width = max(
+                width,
+                (num_tokens + raw_tokens_per_page - 1) // raw_tokens_per_page,
+            )
+            group_id = str(spec.group_id)
+            out[group_id] = torch.full(
+                (bs, group_width),
+                1 if group_id in state_group_ids else 0,
                 dtype=torch.int32,
                 device=self.config.device,
             )
-            for spec in specs
-        }
+        return out
+
+    @staticmethod
+    def _capture_uses_radix_group_tables(backend) -> bool:
+        """Whether capture needs compact radix group-table placeholders."""
+        return bool(getattr(backend, "uses_paged_cache_groups", False)) and not bool(
+            getattr(backend, "uses_flat_cache_groups", False)
+        )
 
     def make_dummy_batch(
         self, num_tokens: int, decode_wrapper: CudaGraphWrapper | None
@@ -517,7 +541,7 @@ class PrefillGraph:
             ctx.global_bs = [bs] * self.config.world_size
         extra_metadata_kwargs: dict = {}
         if (
-            getattr(self.attn_backend, "uses_paged_cache_groups", False)
+            self._capture_uses_radix_group_tables(self.attn_backend)
             and decode_wrapper is not None
         ):
             tables = decode_wrapper._capture_paged_cache_block_tables(
@@ -525,6 +549,7 @@ class PrefillGraph:
             )
             if tables is not None:
                 extra_metadata_kwargs["paged_cache_block_tables"] = tables
+        if getattr(self.attn_backend, "uses_paged_cache_groups", False):
             extra_metadata_kwargs["num_tokens"] = num_tokens
             extra_metadata_kwargs["positions"] = ib.positions_buf[:num_tokens]
         flat_tables = self._dummy_flat_tables(max(seq_lens), bs)

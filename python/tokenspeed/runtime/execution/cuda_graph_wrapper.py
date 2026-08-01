@@ -635,18 +635,25 @@ class CudaGraphWrapper:
             self.draft_attn_backend, "uses_flat_cache_groups", False
         ):
             return ()
+        supported_families = frozenset(
+            getattr(
+                self.draft_attn_backend,
+                "flat_cache_consumer_families",
+                frozenset({"history"}),
+            )
+        )
         if self.draft_token_to_kv_pool is not None and getattr(
             self.draft_token_to_kv_pool, "paged_cache_group_specs", ()
         ):
             return tuple(
                 str(spec.group_id)
                 for spec in self.draft_token_to_kv_pool.paged_cache_group_specs
-                if spec.family != "state"
+                if spec.family in supported_families
             )
         return tuple(
             str(spec.group_id)
             for spec in self.token_to_kv_pool.paged_cache_group_specs
-            if spec.family != "state" and spec.retention == "full_history"
+            if spec.family in supported_families and spec.retention == "full_history"
         )
 
     def _draft_flat_tables(self, flat_block_tables):
@@ -654,10 +661,13 @@ class CudaGraphWrapper:
         gids = self._draft_flat_group_ids()
         if not gids or not flat_block_tables:
             return None
-        subset = {
-            gid: flat_block_tables[gid] for gid in gids if gid in flat_block_tables
-        }
-        return subset or None
+        missing = tuple(gid for gid in gids if gid not in flat_block_tables)
+        if missing:
+            raise RuntimeError(
+                "CudaGraphWrapper draft Flat KV tables are incomplete: "
+                f"missing={list(missing)}"
+            )
+        return {gid: flat_block_tables[gid] for gid in gids}
 
     def _init_capture_metadata(self, bs: int):
         capture_kwargs = {}
@@ -665,15 +675,17 @@ class CudaGraphWrapper:
             capture_kwargs["mamba_pool_indices"] = (
                 self.input_buffers.mamba_pool_indices_buf[:bs]
             )
-        if self.attn_backend.uses_paged_cache_groups:
+        if self.attn_backend.uses_paged_cache_groups and not getattr(
+            self.attn_backend, "uses_flat_cache_groups", False
+        ):
             paged_cache_block_tables = self._capture_paged_cache_block_tables(
                 bs,
                 self.token_to_kv_pool,
             )
             if paged_cache_block_tables is not None:
                 capture_kwargs["paged_cache_block_tables"] = paged_cache_block_tables
-                if self.drafter is not None:
-                    capture_kwargs["num_tokens"] = bs * self.max_tokens_per_req
+        if self.attn_backend.uses_paged_cache_groups and self.drafter is not None:
+            capture_kwargs["num_tokens"] = bs * self.max_tokens_per_req
         flat_cache_group_ids = self._flat_cache_group_ids(self.token_to_kv_pool)
         if flat_cache_group_ids:
             capture_kwargs["flat_cache_group_ids"] = flat_cache_group_ids
@@ -689,6 +701,9 @@ class CudaGraphWrapper:
             if (
                 self.draft_token_to_kv_pool is not None
                 and self.draft_attn_backend.uses_paged_cache_groups
+                and not getattr(
+                    self.draft_attn_backend, "uses_flat_cache_groups", False
+                )
             ):
                 draft_paged_cache_block_tables = self._capture_paged_cache_block_tables(
                     bs,
@@ -698,7 +713,8 @@ class CudaGraphWrapper:
                     draft_kwargs["paged_cache_block_tables"] = (
                         draft_paged_cache_block_tables
                     )
-                    draft_kwargs["num_tokens"] = bs * self.max_tokens_per_req
+            if self.draft_attn_backend.uses_paged_cache_groups:
+                draft_kwargs["num_tokens"] = bs * self.max_tokens_per_req
             draft_flat_ids = self._draft_flat_group_ids()
             if draft_flat_ids:
                 draft_kwargs["flat_cache_group_ids"] = draft_flat_ids

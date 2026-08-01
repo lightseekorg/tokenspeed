@@ -299,6 +299,7 @@ class ModelExecutor:
         )
         # Full-attention group mirrored into req_to_page each step (flat+spec).
         _group_specs = getattr(token_to_kv_pool, "paged_cache_group_specs", ()) or ()
+        self._flat_group_ids = tuple(str(spec.group_id) for spec in _group_specs)
         self._flat_full_group_id = next(
             (
                 str(spec.group_id)
@@ -1865,6 +1866,13 @@ class ModelExecutor:
                     forward_op,
                     device=self.device,
                     num_reqs=bs,
+                    expected_group_ids=(
+                        self._flat_group_ids
+                        if bs > 0
+                        and self._flat_group_ids
+                        and getattr(self.attn_backend, "uses_flat_cache_groups", False)
+                        else None
+                    ),
                 )
                 self._mirror_flat_full_table_into_req_to_page(
                     forward_op, flat_block_tables

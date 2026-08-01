@@ -145,6 +145,48 @@ class DummyFlatTablesTest(unittest.TestCase):
         pool = SimpleNamespace(paged_cache_group_specs=())
         self.assertEqual(self._bare(backend, pool)._dummy_flat_tables(64, 1), {})
 
+    def test_v4_state_group_uses_absolute_logical_width(self):
+        backend = SimpleNamespace(
+            uses_flat_cache_groups=True,
+            page_size=64,
+            max_num_pages=64,
+            flat_state_group_ids=frozenset({"v4.c4a.compressor_state"}),
+        )
+        pool = SimpleNamespace(
+            paged_cache_group_specs=(
+                SimpleNamespace(
+                    group_id="v4.swa_kv",
+                    family="state",
+                    rows_per_page=64,
+                    entry_stride_tokens=1,
+                ),
+                SimpleNamespace(
+                    group_id="v4.c4a.compressor_state",
+                    family="state",
+                    rows_per_page=4,
+                    entry_stride_tokens=1,
+                ),
+            )
+        )
+        tables = self._bare(backend, pool)._dummy_flat_tables(4096)
+        self.assertEqual(tables["v4.swa_kv"].shape, (1, 64))
+        self.assertEqual(
+            tables["v4.c4a.compressor_state"].shape,
+            (1, 1024),
+        )
+
+    def test_dual_capable_backend_selects_one_capture_contract(self):
+        flat = SimpleNamespace(
+            uses_paged_cache_groups=True,
+            uses_flat_cache_groups=True,
+        )
+        radix = SimpleNamespace(
+            uses_paged_cache_groups=True,
+            uses_flat_cache_groups=False,
+        )
+        self.assertFalse(self.PrefillGraph._capture_uses_radix_group_tables(flat))
+        self.assertTrue(self.PrefillGraph._capture_uses_radix_group_tables(radix))
+
     def test_runtime_contract_pool_is_eligible_for_capture(self):
         from unittest import mock
 

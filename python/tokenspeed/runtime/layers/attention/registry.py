@@ -192,6 +192,60 @@ def _validate_shared_lcm_geometry(pool, draft_pool) -> None:
         raise RuntimeError("target and draft LCM arenas must not share backing")
 
 
+def _validate_shared_flat_group_geometry(pool, draft_pool) -> None:
+    """Prove that target-owned Flat page ids are valid in the draft pool."""
+    if draft_pool is None:
+        return
+
+    target_specs = tuple(getattr(pool, "paged_cache_group_specs", ()) or ())
+    draft_specs = tuple(getattr(draft_pool, "paged_cache_group_specs", ()) or ())
+    target_ids = tuple(str(spec.group_id) for spec in target_specs)
+    draft_ids = tuple(str(spec.group_id) for spec in draft_specs)
+    if len(set(target_ids)) != len(target_ids):
+        raise RuntimeError("target Flat cache group specs contain duplicate ids")
+    if len(set(draft_ids)) != len(draft_ids):
+        raise RuntimeError("draft Flat cache group specs contain duplicate ids")
+
+    target_by_id = dict(zip(target_ids, target_specs, strict=True))
+    target_counts = dict(getattr(pool, "paged_cache_group_page_counts", {}) or {})
+    draft_counts = dict(getattr(draft_pool, "paged_cache_group_page_counts", {}) or {})
+    shared_policy = (
+        "retention",
+        "rows_per_page",
+        "entry_stride_tokens",
+        "sliding_window_tokens",
+        "family",
+        "block_size",
+        "cache_blocks_per_lcm_block",
+    )
+    for draft_id, draft_spec in zip(draft_ids, draft_specs, strict=True):
+        target_spec = target_by_id.get(draft_id)
+        if target_spec is None:
+            raise RuntimeError(
+                f"draft Flat cache group {draft_id!r} is absent from target"
+            )
+        if any(
+            getattr(draft_spec, field) != getattr(target_spec, field)
+            for field in shared_policy
+        ):
+            raise RuntimeError(
+                f"target and draft Flat cache group {draft_id!r} do not share "
+                "scheduler semantics"
+            )
+        target_pages = target_counts.get(draft_id)
+        draft_pages = draft_counts.get(draft_id)
+        if target_pages is None or draft_pages is None:
+            raise RuntimeError(
+                f"target and draft Flat cache group {draft_id!r} must publish "
+                "page counts"
+            )
+        if int(target_pages) != int(draft_pages):
+            raise RuntimeError(
+                f"target and draft Flat cache group {draft_id!r} do not share "
+                "page-id capacity"
+            )
+
+
 def _cache_storage_report(
     *,
     configured_cache_bytes: int,
@@ -1577,6 +1631,8 @@ def create_attn_components(
             )
 
     _validate_shared_lcm_geometry(pool, draft_pool)
+    if flat_kvcache and is_deepseek_v4_model and is_deepseek_v4_draft_model:
+        _validate_shared_flat_group_geometry(pool, draft_pool)
     if use_lcm_gdn and fixed_workspace_bytes:
         actual_workspace_bytes = (
             backend.linear_attn_backend.preallocate_flat_verify_workspace(
