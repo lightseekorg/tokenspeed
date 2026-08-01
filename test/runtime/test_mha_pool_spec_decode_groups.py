@@ -212,6 +212,41 @@ class MLAPoolGroupPublicationTest(unittest.TestCase):
         self.assertEqual(len(pool.paged_cache_group_specs), 1)
         self.assertEqual(pool.paged_cache_group_specs[0].group_id, "full_attention")
 
+    def test_published_groups_plus_draft_pool_still_start_under_kvstore(self):
+        # Startup order for the speculative MLA/DSA evals (GLM-5.2 MTP,
+        # Kimi-K2.5 EAGLE3): the pool publishes its single group, then
+        # EventLoop feeds those groups to the grouped-kvstore guard. Once
+        # MLA/DSA started publishing, that guard -- written for the radix
+        # MemoryExecutor, whose grouped host pool reserves no bytes for draft
+        # KV -- began refusing the DEFAULT (kvstore-on) command line. A flat
+        # ext runs FlatMemoryExecutor, which is built with draft_device_pool
+        # and sizes host pages for the draft families, so it must be admitted.
+        try:
+            from tokenspeed.runtime.engine.event_loop import (
+                _validate_grouped_kvstore_draft_pool,
+            )
+            from tokenspeed.runtime.engine.scheduler_utils import (
+                pool_to_paged_cache_groups,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs the tokenspeed runtime deps: {exc}")
+
+        target = self._pool(flat_ext=True)
+        draft = self._pool(flat_ext=True, layer_num=1)
+        groups = pool_to_paged_cache_groups(target)
+        self.assertTrue(groups, "MLA must publish a group on a flat ext")
+
+        # Flat ext: supported, so startup proceeds.
+        _validate_grouped_kvstore_draft_pool(True, groups, draft, True)
+
+        # Radix ext with the same groups keeps the legacy refusal. (Only
+        # reachable for a pool that publishes off-flat, e.g. DeepSeek-V4.)
+        with self.assertRaises(NotImplementedError):
+            _validate_grouped_kvstore_draft_pool(True, groups, draft, False)
+
+        # --disable-kvstore remains the documented escape hatch.
+        _validate_grouped_kvstore_draft_pool(False, groups, draft, False)
+
 
 class FlatHostTierCapabilityTest(unittest.TestCase):
     """Which pools the flat host tier (kvstore L2) claims, and what happens

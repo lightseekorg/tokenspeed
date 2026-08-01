@@ -121,9 +121,39 @@ def _paged_cache_host_group_pages_for_scheduler(
 
 
 def _validate_grouped_kvstore_draft_pool(
-    enable_kvstore: bool, paged_cache_groups: list, draft_token_to_kv_pool
+    enable_kvstore: bool,
+    paged_cache_groups: list,
+    draft_token_to_kv_pool,
+    flat_kvcache_ext: bool = False,
 ) -> None:
-    if enable_kvstore and paged_cache_groups and draft_token_to_kv_pool is not None:
+    """Reject speculative draft KV on the LEGACY grouped host-pool path.
+
+    The radix MemoryExecutor sizes its grouped host pool from the TARGET
+    pool's group page counts alone, so draft KV -- which the drafter writes
+    at the target's slot ids -- would have no host bytes reserved behind it.
+    DeepSeek-V4 publishes its groups unconditionally, so it reaches this path
+    on a radix build and must still be refused.
+
+    A flat build takes FlatMemoryExecutor instead, which is built with
+    ``draft_device_pool`` and mirrors the draft families ahead of the
+    target's (flat_host_mirror.host_mirror_families), sizing host pages for
+    both. That combination is supported, so flat builds are exempt -- MLA/DSA
+    only publish groups at all on a flat ext, and refusing there would make
+    every speculative MLA/DSA eval unservable under the default (kvstore-on)
+    command line.
+
+    Args:
+        enable_kvstore: Whether the L2 host tier is on.
+        paged_cache_groups: Scheduler-facing groups the target pool publishes.
+        draft_token_to_kv_pool: The speculative draft KV pool, or None.
+        flat_kvcache_ext: Whether the scheduler ext is a FlatKV build.
+    """
+    if (
+        enable_kvstore
+        and not flat_kvcache_ext
+        and paged_cache_groups
+        and draft_token_to_kv_pool is not None
+    ):
         raise NotImplementedError(
             "KVStore does not support speculative draft KV for grouped paged "
             "caches; pass --disable-kvstore."
@@ -245,6 +275,7 @@ class EventLoop:
             server_args.enable_kvstore,
             paged_cache_groups,
             draft_token_to_kv_pool,
+            scheduler_ext_flat_kvcache(),
         )
 
         # KVStore is ON by default (no --enable flag), so a pool the flat host

@@ -33,6 +33,28 @@ def test_grouped_kvstore_rejects_only_paged_draft_pool(
         )
 
 
+def test_flat_build_admits_grouped_kvstore_draft_pool():
+    """The refusal is a LEGACY-host-pool rule, not a flat one.
+
+    FlatMemoryExecutor takes ``draft_device_pool`` and sizes host pages for
+    the draft families too, so a flat ext supports exactly the combination
+    the radix MemoryExecutor cannot. MLA/DSA publish groups only on a flat
+    ext, so keeping the blanket refusal made every speculative MLA/DSA eval
+    (GLM-5.2 MTP, Kimi-K2.5 EAGLE3) fail to start under the default
+    kvstore-on command line.
+    """
+    from tokenspeed.runtime.engine.event_loop import (
+        _validate_grouped_kvstore_draft_pool,
+    )
+
+    # Same inputs that raise on a radix ext, now admitted on a flat one.
+    _validate_grouped_kvstore_draft_pool(True, [object()], object(), True)
+
+    # The radix path keeps refusing (DeepSeek-V4 publishes groups there).
+    with pytest.raises(NotImplementedError, match="--disable-kvstore"):
+        _validate_grouped_kvstore_draft_pool(True, [object()], object(), False)
+
+
 def test_deepseek_v4_scheduler_host_pages_follow_kvstore_mode():
     from tokenspeed.runtime.engine.event_loop import (
         _paged_cache_host_group_pages_for_scheduler,
