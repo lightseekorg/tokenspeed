@@ -38,6 +38,10 @@ pre-swept tactic table before the window opens. Entries loaded from the
 table win over live profiling, so covered shapes skip their startup tuning
 pass entirely -- and every rank loading the same table picks the same tactics,
 removing the rank-divergence hazard above for covered shapes.
+
+For shapes the table does not cover, :func:`set_autotune_process_group`
+averages per-tactic timings across ranks during the window, so live-tuned
+shapes converge on one tactic as well.
 """
 
 import contextlib
@@ -52,6 +56,7 @@ __all__ = [
     "load_flashinfer_tuning_cache",
     "load_packaged_flashinfer_tuning_cache",
     "set_autotune_max_num_tokens",
+    "set_autotune_process_group",
 ]
 
 logger = logging.getLogger(__name__)
@@ -101,12 +106,35 @@ def autotune() -> Generator[None]:
         error.
     """
     try:
-        from flashinfer.autotuner import autotune as _flashinfer_autotune
+        import flashinfer.autotuner
     except ImportError:
         yield
         return
-    with _flashinfer_autotune():
+    with flashinfer.autotuner.autotune():
         yield
+
+
+def set_autotune_process_group(process_group) -> None:
+    """Average per-tactic profile timings across ``process_group`` ranks.
+
+    While a group is set, every rank entering :func:`autotune` all-reduces each
+    tactic's measured time over the group before picking the winner, so all
+    ranks converge on the same tactic despite per-GPU timing noise. Requires
+    every rank in the group to profile the same tuned ops in the same order
+    with identical caches at entry; set it before the tuning window opens and
+    clear it (pass ``None``) after the window closes. Like :func:`autotune`, a
+    no-op when the tuning backend is unavailable.
+
+    Args:
+        process_group: A ``torch.distributed`` process group covering the
+            ranks that tune together (prefer a CPU/gloo group), or ``None``
+            to restore independent per-rank tuning.
+    """
+    try:
+        import flashinfer.autotuner
+    except ImportError:
+        return
+    flashinfer.autotuner.set_autotune_process_group(process_group)
 
 
 def load_flashinfer_tuning_cache(path: str) -> bool:
