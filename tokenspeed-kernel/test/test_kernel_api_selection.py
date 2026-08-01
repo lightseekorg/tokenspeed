@@ -1179,15 +1179,21 @@ def _assert_moe_plan(plan: dict, *, apply: str, preprocessor: str | None) -> Non
 
 
 @pytest.mark.parametrize(
-    "platform_fixture,weight_dtype,expected_apply",
+    "platform_fixture,weight_dtype,deepep_mode,expected_apply",
     [
-        ("b200_platform", "nvfp4", "flashinfer_cutedsl_deepep_nvfp4_moe_apply"),
-        ("h100_platform", "fp8", "deep_gemm_deepep_fp8_moe_apply"),
+        (
+            "b200_platform",
+            "nvfp4",
+            "low_latency",
+            "flashinfer_cutedsl_deepep_nvfp4_moe_apply",
+        ),
+        ("h100_platform", "fp8", "auto", "deep_gemm_deepep_fp8_moe_apply"),
     ],
 )
 def test_deepep_selects_apply_kernel_by_weight_dtype_without_pinned_solution(
     platform_fixture: str,
     weight_dtype: str,
+    deepep_mode: str,
     expected_apply: str,
     request: pytest.FixtureRequest,
 ) -> None:
@@ -1217,6 +1223,7 @@ def test_deepep_selects_apply_kernel_by_weight_dtype_without_pinned_solution(
             fp8_scale_block_shape=(128, 128) if weight_dtype == "fp8" else None,
             internal_activation_dtype="input",
             deepep_group=object(),
+            deepep_mode=deepep_mode,
         )
     finally:
         Platform.override(real_platform)
@@ -1224,6 +1231,54 @@ def test_deepep_selects_apply_kernel_by_weight_dtype_without_pinned_solution(
 
     assert plan["apply_kernel_name"] == expected_apply
     assert plan["a2a_backend"] == "deepep"
+
+
+@pytest.mark.parametrize("deepep_mode", [None, "auto", "normal"])
+def test_nvfp4_deepep_rejects_modes_without_normal_legs(
+    deepep_mode: str | None,
+    b200_platform,
+) -> None:
+    """The nvfp4 masked GEMMs cannot consume normal dispatch buffers."""
+    registry = KernelRegistry.get()
+    kernel_name = "flashinfer_cutedsl_deepep_nvfp4_moe_apply"
+    if registry.get_by_name(kernel_name) is None:
+        pytest.skip(f"{kernel_name!r} is unavailable (optional backend missing)")
+
+    real_platform = Platform.get()
+    try:
+        Platform.override(b200_platform)
+        registry.clear_cache()
+        with pytest.raises(ValueError, match="does not support deepep_mode"):
+            tokenspeed_kernel.moe_plan(
+                "nvfp4",
+                input_dtype=torch.bfloat16,
+                activation="silu",
+                routing_mode="precomputed_topk",
+                a2a_backend="deepep",
+                ep_size=2,
+                ispp=256,
+                internal_activation_dtype="input",
+                deepep_group=object(),
+                deepep_mode=deepep_mode,
+            )
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+
+@pytest.mark.parametrize(
+    "kernel_name",
+    [
+        "flashinfer_cutedsl_deepep_nvfp4_moe_apply",
+        "deep_gemm_deepep_fp8_moe_apply",
+    ],
+)
+def test_deepep_apply_kernels_only_register_bf16(kernel_name: str) -> None:
+    """DeepEP low-latency dispatch accepts BF16 activations only."""
+    spec = KernelRegistry.get().get_by_name(kernel_name)
+    if spec is None:
+        pytest.skip(f"{kernel_name!r} is unavailable (optional backend missing)")
+    assert spec.storage_dtypes_for_role("x") == frozenset({torch.bfloat16})
 
 
 def test_deepep_plan_carries_mode_and_low_latency_capacity() -> None:
@@ -1783,6 +1838,7 @@ def _moe_apply_nvfp4_deepep_cutedsl() -> object:
         ispp=128,
         internal_activation_dtype="input",
         deepep_group=object(),
+        deepep_mode="low_latency",
         solution="flashinfer_cutedsl",
     )
     _assert_moe_plan(

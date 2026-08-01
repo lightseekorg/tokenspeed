@@ -90,6 +90,41 @@ def _validate_deepep_mode(a2a_backend: str | None, deepep_mode: str | None) -> N
         )
 
 
+def _validate_selected_deepep_mode(
+    a2a_backend: str | None,
+    deepep_mode: str | None,
+    kernel_name: str,
+    kernel_traits: dict[str, frozenset[Any]],
+) -> None:
+    """Reject a selected DeepEP kernel that lacks a requested collective leg."""
+    if a2a_backend != "deepep":
+        return
+    supported_modes = kernel_traits.get("deepep_modes")
+    if supported_modes is None:
+        return
+
+    requested_mode = deepep_mode or "auto"
+    required_modes = (
+        frozenset({"normal", "low_latency"})
+        if requested_mode == "auto"
+        else frozenset({requested_mode})
+    )
+    if required_modes.issubset(supported_modes):
+        return
+
+    supported = ", ".join(sorted(supported_modes))
+    auto_note = (
+        " 'auto' requires both normal and low_latency legs."
+        if requested_mode == "auto"
+        else ""
+    )
+    raise ValueError(
+        f"MoE kernel {kernel_name!r} does not support "
+        f"deepep_mode={requested_mode!r}; supported modes: {supported}."
+        f"{auto_note}"
+    )
+
+
 def _build_traits(
     *,
     weight_dtype: str,
@@ -226,6 +261,12 @@ def moe_plan(
     apply_spec = registry.get_by_name(kernel.name)
     if apply_spec is None:
         raise RuntimeError(f"Kernel spec not found for selected kernel {kernel.name}")
+    _validate_selected_deepep_mode(
+        a2a_backend,
+        deepep_mode,
+        apply_spec.name,
+        apply_spec.traits,
+    )
 
     routing_modes = apply_spec.traits.get("routing_mode", frozenset())
     support_routing = "kernel_routing" in routing_modes

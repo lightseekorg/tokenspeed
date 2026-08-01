@@ -74,11 +74,18 @@ DeepEP has two sets of legs, and `--deepep-mode` picks between them:
 | `normal` | High-throughput dispatch, tokens permuted into per-expert row blocks | Extend-shaped batches of any size |
 | `auto` (default) | Both are allocated; each forward picks | Aggregated serving, which mixes both shapes |
 
-Keep `auto` unless the instance only ever sees one shape -- for example a
-decode-only worker in a PD split, which can pin `low_latency` and skip the
-normal-mode buffers. A batch above the low-latency capacity is rejected rather
-than truncated, so raise `--low-latency-max-num-tokens-per-gpu` if decode plus
-speculative draft tokens exceed it.
+For block-scale FP8 with `deep_gemm`, keep `auto` unless the instance only ever
+sees one shape -- for example a decode-only worker in a PD split, which can pin
+`low_latency` and skip the normal-mode buffers. The nvfp4
+`flashinfer_cutedsl` kernel implements only the low-latency legs, so it requires
+an explicit `--deepep-mode low_latency`; `auto` and `normal` are rejected while
+the execution plan is built. Every forward on such an instance, including any
+prefill, must fit `--low-latency-max-num-tokens-per-gpu`.
+
+A batch above the low-latency capacity is rejected rather than truncated, so
+raise `--low-latency-max-num-tokens-per-gpu` if decode plus speculative draft
+tokens exceed it. Both current DeepEP MoE backends require BF16 activations;
+`--dtype float16` is not supported.
 
 The mode is chosen per forward from a value every rank agrees on, because the two
 modes are different collectives. With DP attention that value is "every DP rank

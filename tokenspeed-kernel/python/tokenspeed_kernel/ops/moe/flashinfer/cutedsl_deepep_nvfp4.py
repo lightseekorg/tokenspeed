@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from types import SimpleNamespace
 
 import torch
@@ -117,7 +118,7 @@ if platform.is_nvidia:
         signatures=format_signatures(
             "x",
             "dense",
-            {torch.float16, torch.bfloat16},
+            {torch.bfloat16},
         ),
         traits={
             "weight_dtype": frozenset({"nvfp4"}),
@@ -126,6 +127,7 @@ if platform.is_nvidia:
             "supports_deferred_finalize": frozenset({False}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({True}),
+            "deepep_modes": frozenset({"low_latency"}),
             "ispp_alignment": frozenset({64}),
             "internal_activation_dtype": frozenset({"input"}),
             "supports_bias": frozenset({False}),
@@ -144,13 +146,14 @@ if platform.is_nvidia:
         do_finalize: bool = True,
         enable_pdl: bool = False,
         low_latency: bool | None = None,
+        overlap_fn: Callable[[], None] | None = None,
     ):
         """Run one nvfp4 MoE layer over DeepEP's low-latency legs.
 
         Args:
             plan: Execution plan from ``moe_plan``; owns the low-latency
                 capacity and the lazily built dispatcher.
-            x: ``[tokens, hidden]`` local hidden states.
+            x: ``[tokens, hidden]`` BF16 local hidden states.
             w: Module holding the processed nvfp4 expert weights.
             router_logits: ``[tokens, num_experts]`` logits, used only when the
                 caller passes no precomputed top-k.
@@ -164,6 +167,8 @@ if platform.is_nvidia:
             low_latency: Must be True or None. The masked grouped GEMMs here only
                 consume the low-latency dispatch layout, so extend-shaped batches
                 need the DeepGEMM FP8 path instead.
+            overlap_fn: Optional work to queue after the send phase and before
+                waiting for the receive phase, overlapping it with DeepEP.
 
         Returns:
             ``[tokens, hidden]`` bf16 combined MoE output.
@@ -211,6 +216,8 @@ if platform.is_nvidia:
             plan["_deepep_dispatcher"] = dispatcher
 
         dispatcher.dispatch_a(x, topk_ids, topk_weights, low_latency=True)
+        if overlap_fn is not None:
+            overlap_fn()
         recv_hidden, _, _, _, _, _, masked_m = dispatcher.dispatch_b()
 
         num_local_experts = getattr(w, "num_local_experts", w.w13_weight.shape[0])

@@ -483,7 +483,7 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
         signatures=format_signatures(
             "x",
             "dense",
-            {torch.float16, torch.bfloat16},
+            {torch.bfloat16},
         ),
         traits={
             "weight_dtype": frozenset({"fp8"}),
@@ -492,6 +492,7 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
             "supports_deferred_finalize": frozenset({False}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({True}),
+            "deepep_modes": frozenset({"normal", "low_latency"}),
             # DeepGEMM tiles both GEMMs on 128-element K/N blocks, so the
             # per-partition intermediate size must be a multiple of the block.
             "ispp_alignment": frozenset({_FP8_BLOCK}),
@@ -520,7 +521,7 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
         Args:
             plan: Execution plan from ``moe_plan``; owns the DeepEP mode, the
                 low-latency capacity, and the lazily built dispatcher.
-            x: ``[tokens, hidden]`` local hidden states.
+            x: ``[tokens, hidden]`` BF16 local hidden states.
             w: Module holding the processed FP8 expert weights.
             router_logits: ``[tokens, num_experts]`` logits, used only when the
                 caller passes no precomputed top-k.
