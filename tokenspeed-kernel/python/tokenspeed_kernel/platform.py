@@ -207,7 +207,6 @@ class PlatformInfo:
             return names.get(arch_version, f"SM{arch_version[0]}.{arch_version[1]}")
         if self.is_amd:
             names = {
-                (9, 4): "CDNA3",  # MI300
                 (9, 5): "CDNA4",  # MI350
                 (12, 5): "CDNA5",
             }
@@ -386,13 +385,19 @@ def _detect_rocm_platform() -> PlatformInfo:
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     arch = _extract_amd_arch(props.gcnArchName)
 
-    # Map AMD architectures
+    # Map supported AMD architectures.
     arch_map = {
-        "gfx942": ArchVersion(9, 4),  # MI300
         "gfx950": ArchVersion(9, 5),  # MI350
         "gfx1250": ArchVersion(12, 5),
     }
-    arch_version = arch_map.get(arch, ArchVersion(9, 0))
+    try:
+        arch_version = arch_map[arch]
+    except KeyError:
+        supported_arches = ", ".join(sorted(arch_map))
+        raise RuntimeError(
+            f"Detected unsupported AMD GPU architecture {arch!r}; "
+            f"current support list: {supported_arches}"
+        ) from None
     sm_features = _get_rocm_sm_features(arch)
     runtime_features = _get_rocm_runtime_features()
 
