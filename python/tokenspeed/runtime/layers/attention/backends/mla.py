@@ -72,8 +72,10 @@ class MLADecodeMetadata:
     num_extends: int
     page_table: torch.Tensor
     seq_lens: torch.Tensor
-    # Paged cache only: one absolute latent write location per batch row.
+    # Paged cache only: absolute latent write locations, request-major, with
+    # ``group_q_len_per_req`` entries per batch row (1 outside target verify).
     group_out_cache_loc: torch.Tensor | None = None
+    group_q_len_per_req: int = 1
 
     @property
     def block_kv_indices(self) -> torch.Tensor:
@@ -197,20 +199,36 @@ class MLAAttnBackend(AttentionBackend):
         logical_page_size: int,
         validate_pages: bool = False,
         out: torch.Tensor | None = None,
+        q_len_per_req: int = 1,
     ) -> torch.Tensor:
-        """Return absolute cache locations for decoded tokens in Paged cache."""
-        positions = (seq_lens[:batch_size].to(torch.int64) - 1).clamp_min(0)
+        """Absolute latent write locations for decoded tokens in FlatKV.
+
+        Plain decode writes one location per request (position ``seq-1``).
+        Speculative target verify decodes ``q_len_per_req`` tokens per request
+        and must write every one of them, at the trailing positions
+        ``seq-q_len .. seq-1``, flattened request-major to match the query
+        layout the verify read path builds.
+        """
+        last = (seq_lens[:batch_size].to(torch.int64) - 1).clamp_min(0)
+        if q_len_per_req == 1:
+            positions = last.unsqueeze(1)
+        else:
+            steps = torch.arange(
+                1 - q_len_per_req, 1, device=seq_lens.device, dtype=torch.int64
+            )
+            positions = (last.unsqueeze(1) + steps).clamp_min(0)
         page_indices = torch.div(positions, logical_page_size, rounding_mode="floor")
-        pages = table[:batch_size].gather(1, page_indices.unsqueeze(1)).squeeze(1)
+        pages = table[:batch_size].gather(1, page_indices)
         if validate_pages and pages.numel() and not bool((pages > 0).all().item()):
             raise RuntimeError(
                 "MLA write location resolves to the null page 0 or a " "-1 table hole"
             )
-        locations = pages.clamp_min(0).to(torch.int64) * logical_page_size + (
-            positions % logical_page_size
-        )
+        locations = (
+            pages.clamp_min(0).to(torch.int64) * logical_page_size
+            + (positions % logical_page_size)
+        ).reshape(-1)
         if out is not None:
-            out[:batch_size].copy_(locations)
+            out[: batch_size * q_len_per_req].copy_(locations)
             return out
         return locations
 
@@ -280,11 +298,13 @@ class MLAAttnBackend(AttentionBackend):
         forward_batch = kwargs.pop("forward_batch", None)
         group_table = None
         logical_page_size = None
+        if cache_metadata is not None and self.is_draft:
+            # The draft runs on its own pool; the target's cache metadata
+            # rides the shared forward kwargs, so ignore it rather than
+            # binding the draft to a contract it does not own.
+            cache_metadata = None
+            forward_batch = None
         if cache_metadata is not None:
-            if self.is_draft or self.spec_num_tokens > 1:
-                raise NotImplementedError(
-                    "MLA Paged cache does not support speculative decoding"
-                )
             self._cache_groups_bound = True
             group_table, logical_page_size = self._resolve_full_history_table(
                 cache_metadata, forward_batch, bs
@@ -315,6 +335,8 @@ class MLAAttnBackend(AttentionBackend):
             or forward_mode.is_mixed()
             or (forward_mode.is_extend() and self.is_draft)
         ):
+            # Target verify decodes q_len tokens per request, so the flat write
+            # locations must cover every one of them, not just the last.
             self._init_decode_metadata(
                 bs=bs,
                 num_extends=num_extends,
@@ -323,6 +345,7 @@ class MLAAttnBackend(AttentionBackend):
                 req_to_page=req_to_page,
                 group_table=group_table,
                 logical_page_size=logical_page_size,
+                q_len_per_req=self._verify_q_len(forward_mode),
             )
 
     @contextmanager
@@ -411,6 +434,28 @@ class MLAAttnBackend(AttentionBackend):
         self.forward_prefill_metadata = metadata
         self.chunked_prefill_metadata = metadata
 
+    def _graph_verify_q_len(self) -> int:
+        """Verify-window width for captured decode graphs.
+
+        Graphs only ever record decode, so unlike ``_verify_q_len`` there is no
+        forward mode to consult. Capture and replay must agree exactly: the
+        recorded buffer view has this width baked into its shape.
+        """
+        if self.spec_num_tokens > 1 and not self.is_draft:
+            return self.spec_num_tokens
+        return 1
+
+    def _verify_q_len(self, forward_mode: ForwardMode) -> int:
+        """KV write locations each request needs this step.
+
+        Only the target's verify decode writes a whole window; a chaining draft
+        owns its own per-step locations, and prefill goes through the extend
+        path.
+        """
+        if self.spec_num_tokens > 1 and not self.is_draft and forward_mode.is_decode():
+            return self.spec_num_tokens
+        return 1
+
     def _init_decode_metadata(
         self,
         bs: int,
@@ -420,6 +465,7 @@ class MLAAttnBackend(AttentionBackend):
         req_to_page: torch.Tensor,
         group_table: torch.Tensor | None = None,
         logical_page_size: int | None = None,
+        q_len_per_req: int = 1,
     ):
         if group_table is not None:
             assert logical_page_size is not None
@@ -434,6 +480,7 @@ class MLAAttnBackend(AttentionBackend):
                 batch_size=bs,
                 logical_page_size=logical_page_size,
                 validate_pages=cache_debug_enabled(),
+                q_len_per_req=q_len_per_req,
             )
         else:
             page_table = build_page_table(
@@ -452,6 +499,7 @@ class MLAAttnBackend(AttentionBackend):
                 page_table=page_table,
                 seq_lens=block_seq_lens,
                 group_out_cache_loc=group_out_cache_loc,
+                group_q_len_per_req=q_len_per_req,
             )
             return
         self.forward_decode_metadata = MLADecodeMetadata(
@@ -459,6 +507,7 @@ class MLAAttnBackend(AttentionBackend):
             page_table=page_table,
             seq_lens=seq_lens[:bs],
             group_out_cache_loc=group_out_cache_loc,
+            group_q_len_per_req=q_len_per_req,
         )
 
     # ------------------------------------------------------------------
@@ -516,8 +565,12 @@ class MLAAttnBackend(AttentionBackend):
         if forward_mode.is_decode():
             metadata = self.forward_decode_metadata
             if metadata is None or metadata.group_out_cache_loc is None:
-                raise RuntimeError("MLA decode write locations are missing")
-            locs = metadata.group_out_cache_loc[metadata.num_extends :]
+                raise RuntimeError("flat MLA decode write locations are missing")
+            # Locations are request-major with group_q_len_per_req entries per
+            # row, so a mixed batch skips whole windows, not single rows.
+            locs = metadata.group_out_cache_loc[
+                metadata.num_extends * metadata.group_q_len_per_req :
+            ]
         else:
             metadata = self.forward_prefill_metadata
             if metadata is None or metadata.group_out_cache_loc is None:
@@ -543,8 +596,11 @@ class MLAAttnBackend(AttentionBackend):
         )
         self.decode_cuda_graph_metadata = {}
         if self._cache_contract_bound:
+            # Target verify records spec_num_tokens write locations per request.
             self.decode_cuda_graph_group_out_cache_loc = torch.zeros(
-                max_bs, dtype=torch.int64, device=self.device
+                max_bs * max(1, self.spec_num_tokens),
+                dtype=torch.int64,
+                device=self.device,
             )
         else:
             self.decode_cuda_graph_group_out_cache_loc = None
@@ -564,14 +620,15 @@ class MLAAttnBackend(AttentionBackend):
             )
 
         uses_cache_groups = bool(cache_group_ids) or self._cache_contract_bound
-        if uses_cache_groups and (self.is_draft or self.spec_num_tokens > 1):
+        if uses_cache_groups and self.is_draft:
             raise NotImplementedError(
-                "MLA Paged cache CUDA graph capture does not support speculative decoding"
+                "MLA draft worker does not take the cache-group path"
             )
         if self._block_decode_active:
             self._capture_block_decode_graph(bs, seq_lens)
             return
         page_table = self.cuda_graph_page_table[:bs, :]
+        capture_q_len = 1
         if uses_cache_groups:
             self._cache_groups_bound = True
             if self.decode_cuda_graph_group_out_cache_loc is None:
@@ -580,7 +637,10 @@ class MLAAttnBackend(AttentionBackend):
                     "mark_cache_contract must run before init_cuda_graph_state"
                 )
             page_table.zero_()
-            group_out_cache_loc = self.decode_cuda_graph_group_out_cache_loc[:bs]
+            capture_q_len = self._graph_verify_q_len()
+            group_out_cache_loc = self.decode_cuda_graph_group_out_cache_loc[
+                : bs * capture_q_len
+            ]
             group_out_cache_loc.zero_()
         else:
             group_out_cache_loc = None
@@ -589,9 +649,15 @@ class MLAAttnBackend(AttentionBackend):
             page_table=page_table,
             seq_lens=self.cuda_graph_seq_lens[:bs],
             group_out_cache_loc=group_out_cache_loc,
+            group_q_len_per_req=capture_q_len,
         )
-        # Seed the owned buffer: the capture run reads it before replay.
-        metadata.seq_lens.copy_(seq_lens[:bs])
+        # Seed the owned buffer: the capture run reads it before replay. Verify
+        # rows span seq-N..seq-1, so a length below N would make the window
+        # start before the sequence.
+        if self.spec_num_tokens > 1 and not self.is_draft:
+            metadata.seq_lens.copy_(seq_lens[:bs].clamp_min(self.spec_num_tokens))
+        else:
+            metadata.seq_lens.copy_(seq_lens[:bs])
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
 
@@ -608,7 +674,7 @@ class MLAAttnBackend(AttentionBackend):
             num_extends=0,
             page_table=self.cuda_graph_page_table[:expanded_bs, :],
             seq_lens=self.cuda_graph_seq_lens[:expanded_bs],
-            flat_out_cache_loc=None,
+            group_out_cache_loc=None,
         )
         metadata.page_table.zero_()
         metadata.seq_lens.fill_(spec)
@@ -642,8 +708,13 @@ class MLAAttnBackend(AttentionBackend):
             self.forward_decode_metadata = metadata
             return
         # Copy the live lengths into our own cache-seqlens buffer (metadata.seq_lens
-        # views it); both metadata paths read it at replay.
-        self.cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs])
+        # views it); both the flat and legacy paths read it at replay.
+        if self.spec_num_tokens > 1 and not self.is_draft:
+            self.cuda_graph_seq_lens[:bs].copy_(
+                seq_lens[:bs].clamp_min(self.spec_num_tokens)
+            )
+        else:
+            self.cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs])
         if metadata.group_out_cache_loc is not None:
             self._replay_refresh_decode(
                 bs,
@@ -667,7 +738,9 @@ class MLAAttnBackend(AttentionBackend):
         forward_batch,
     ) -> None:
         if metadata.group_out_cache_loc is None:
-            raise RuntimeError("MLA graph metadata has no write-location buffer")
+            raise RuntimeError("flat MLA graph metadata has no write-location buffer")
+        # Must match the width baked into the captured buffer view.
+        q_len = metadata.group_q_len_per_req
         real_bs = 0
         if cache_metadata is not None:
             table, logical_page_size = self._resolve_full_history_table(
@@ -683,14 +756,18 @@ class MLAAttnBackend(AttentionBackend):
                 )
                 self._cache_decode_out_cache_loc(
                     table,
-                    seq_lens,
+                    # The clamped copy: a request shorter than the verify
+                    # window would otherwise resolve locations before its start.
+                    self.cuda_graph_seq_lens,
                     batch_size=real_bs,
                     logical_page_size=logical_page_size,
                     validate_pages=cache_debug_enabled(),
                     out=metadata.group_out_cache_loc,
+                    q_len_per_req=q_len,
                 )
+        # Padded rows resolve to the null page 0 so they never touch a live page.
         metadata.page_table[real_bs:bs].zero_()
-        metadata.group_out_cache_loc[real_bs:bs].zero_()
+        metadata.group_out_cache_loc[real_bs * q_len : bs * q_len].zero_()
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1

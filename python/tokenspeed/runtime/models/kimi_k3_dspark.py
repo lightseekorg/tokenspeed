@@ -273,6 +273,45 @@ class K3DSparkModel(nn.Module):
         """Concatenated target taps -> draft hidden space."""
         return self.context_norm(self.context_proj(target_hidden)[0])
 
+    # ------------------------------------------------------------------
+    # Context-injection contract (see DFlashDraftModel for the GQA counterpart)
+    # ------------------------------------------------------------------
+
+    @property
+    def context_in_features(self) -> int:
+        return self.num_context_features * int(self.config.target_hidden_size)
+
+    @property
+    def context_dtype(self) -> torch.dtype:
+        return self.context_proj.weight.dtype
+
+    @torch.no_grad()
+    def write_context_kv(
+        self,
+        ctx_hidden: torch.Tensor,
+        positions: torch.Tensor,
+        cache_locs: torch.Tensor,
+        token_to_kv_pool,
+    ) -> None:
+        """Project target-derived context into each draft layer's latent cache.
+
+        One row per token per layer, laid out ``[c_KV_norm | k_PE_RoPE]``. The
+        Q half of the fused down-projection is dead work here, so
+        ``project_latent_kv`` slices the weight instead of running it.
+        """
+        if ctx_hidden.shape[0] == 0:
+            return
+        for layer in self.layers:
+            attn = layer.self_attn
+            latent = attn.project_latent_kv(ctx_hidden)
+            latent = attn.apply_latent_rope(positions, latent)
+            token_to_kv_pool.set_mla_kv_buffer(
+                attn.attn_mqa,
+                cache_locs,
+                latent[..., : attn.kv_lora_rank],
+                latent[..., attn.kv_lora_rank :],
+            )
+
     @torch.no_grad()
     def forward(
         self,

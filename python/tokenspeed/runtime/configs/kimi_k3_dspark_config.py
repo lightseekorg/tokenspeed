@@ -123,6 +123,16 @@ class KimiK3DSparkConfig(PretrainedConfig):
         """Width of one cached latent row: [c_KV_norm | k_PE_RoPE]."""
         return self.kv_lora_rank + self.qk_rope_head_dim
 
+    @property
+    def rope_scaling(self) -> dict[str, Any] | None:
+        """Alias for the runtime's MLA setup, which reads ``rope_scaling``.
+
+        The checkpoint spells YaRN under ``rope_parameters``. Without this the
+        runtime derives the softmax scale with no mscale correction while the
+        model applies one, and the two disagree.
+        """
+        return self.rope_scaling_dict()
+
     def rope_scaling_dict(self) -> dict[str, Any] | None:
         """YaRN parameters in the shape ``get_rope`` expects, or None."""
         params = self.rope_parameters or {}
