@@ -68,17 +68,19 @@ try:
         get_mn_major_tma_aligned_tensor,
         m_grouped_fp8_gemm_nt_contiguous,
         m_grouped_fp8_gemm_nt_masked,
+        transform_sf_into_required_layout,
     )
 except ImportError:  # pragma: no cover - DeepGEMM is an optional dependency
     get_mn_major_tma_aligned_tensor = None
     m_grouped_fp8_gemm_nt_contiguous = None
     m_grouped_fp8_gemm_nt_masked = None
+    transform_sf_into_required_layout = None
 
 
 if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
     from tokenspeed_kernel.ops.activation.triton import (
         fused_swiglu_fp8_ue8m0,
-        fused_swiglu_fp8_ue8m0_masked,
+        fused_swiglu_fp8_ue8m0_masked_packed,
     )
     from tokenspeed_kernel.ops.moe.deep_gemm.ue8m0 import (
         deep_gemm_requires_ue8m0,
@@ -92,6 +94,19 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
     from tokenspeed_kernel.thirdparty.cuda import silu_and_mul_fuse_block_quant
 
     _FP8_BLOCK = 128
+    _UE8M0_WEIGHT_RECIPE = (1, _FP8_BLOCK, _FP8_BLOCK)
+    _UE8M0_PACKED_RECIPE = (1, 1, _FP8_BLOCK)
+
+    def _prepare_routing_tensors(
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Canonicalize DeepEP routing metadata once for both collective legs."""
+        topk_ids = topk_ids.to(dtype=torch.int64, memory_format=torch.contiguous_format)
+        topk_weights = topk_weights.to(
+            dtype=torch.float32, memory_format=torch.contiguous_format
+        )
+        return topk_weights, topk_ids
 
     def deep_gemm_deepep_fp8_moe_weights(plan: dict, w: torch.nn.Module):
         # DeepGEMM's ``nt`` grouped GEMM consumes B as [E, N, K] with block
@@ -136,6 +151,28 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
                     w.w2_weight_scale_inv.data,
                     (_FP8_BLOCK, _FP8_BLOCK),
                 )
+
+            # FP32 checkpoint scales are block-granular in N. DeepGEMM expands
+            # them to one scale row per N and packs four UE8M0 values per int32
+            # on every GEMM unless the required B layout is prepared up front.
+            # Replace the now-loaded scale parameters so both normal and
+            # low-latency paths reuse the packed tensors for every forward.
+            w.w13_weight_scale_inv.data = transform_sf_into_required_layout(
+                sf=w.w13_weight_scale_inv.data,
+                mn=w.w13_weight.shape[1],
+                k=w.w13_weight.shape[2],
+                recipe=_UE8M0_WEIGHT_RECIPE,
+                num_groups=w.w13_weight.shape[0],
+                is_sfa=False,
+            )
+            w.w2_weight_scale_inv.data = transform_sf_into_required_layout(
+                sf=w.w2_weight_scale_inv.data,
+                mn=w.w2_weight.shape[1],
+                k=w.w2_weight.shape[2],
+                recipe=_UE8M0_WEIGHT_RECIPE,
+                num_groups=w.w2_weight.shape[0],
+                is_sfa=False,
+            )
         return None
 
     def _get_dispatcher(
@@ -236,35 +273,44 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
             dtype=torch.bfloat16,
             device=x.device,
         )
+        requires_ue8m0 = deep_gemm_requires_ue8m0()
+        recv_gemm_scales = (
+            recv_scales
+            if requires_ue8m0
+            else get_mn_major_tma_aligned_tensor(recv_scales)
+        )
         m_grouped_fp8_gemm_nt_masked(
-            (recv_x, get_mn_major_tma_aligned_tensor(recv_scales)),
+            (recv_x, recv_gemm_scales),
             (w.w13_weight, w.w13_weight_scale_inv),
             gateup,
             masked_m,
             expected_m,
+            recipe=_UE8M0_PACKED_RECIPE if requires_ue8m0 else None,
         )
 
         # Fused SiLU(gate)*up followed by a 1x128 block FP8 quantize. The EP
-        # variant honors ``masked_m`` so padded rows are skipped. DeepGEMM wants
-        # mn-major scales, hence the [E, blocks, M] allocation viewed as
-        # [E, M, blocks].
+        # variant honors ``masked_m`` so padded rows are skipped.
         ispp = w.w2_weight.shape[-1]
-        down_in = torch.empty(
-            (num_local_experts, recv_m, ispp),
-            dtype=torch.float8_e4m3fn,
-            device=x.device,
-        )
-        down_scales = torch.zeros(
-            (num_local_experts, ispp // _FP8_BLOCK, recv_m),
-            dtype=torch.float32,
-            device=x.device,
-        ).permute(0, 2, 1)
-        if deep_gemm_requires_ue8m0():
-            # Power-of-two scales; the fused CUDA quantizer below emits
-            # arbitrary FP32 scales, which this device's DeepGEMM would
-            # misread as UE8M0.
-            fused_swiglu_fp8_ue8m0_masked(gateup, masked_m, down_in, down_scales)
+        if requires_ue8m0:
+            # Produce DeepGEMM's packed MN-major scales in the activation
+            # kernel itself. Masked GEMM never reads padded rows, so neither
+            # output needs a separate zero-fill pass.
+            down_in, down_scales = fused_swiglu_fp8_ue8m0_masked_packed(
+                gateup, masked_m
+            )
         else:
+            down_in = torch.empty(
+                (num_local_experts, recv_m, ispp),
+                dtype=torch.float8_e4m3fn,
+                device=x.device,
+            )
+            # The CUDA fallback does not emit packed UE8M0 and retains its
+            # historical zero-padding contract for masked rows.
+            down_scales = torch.zeros(
+                (num_local_experts, ispp // _FP8_BLOCK, recv_m),
+                dtype=torch.float32,
+                device=x.device,
+            ).permute(0, 2, 1)
             silu_and_mul_fuse_block_quant(
                 gateup,
                 down_scales,
@@ -282,11 +328,19 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
             device=x.device,
         )
         m_grouped_fp8_gemm_nt_masked(
-            (down_in, get_mn_major_tma_aligned_tensor(down_scales)),
+            (
+                down_in,
+                (
+                    down_scales
+                    if requires_ue8m0
+                    else get_mn_major_tma_aligned_tensor(down_scales)
+                ),
+            ),
             (w.w2_weight, w.w2_weight_scale_inv),
             out,
             masked_m,
             expected_m,
+            recipe=_UE8M0_PACKED_RECIPE if requires_ue8m0 else None,
         )
 
         # Combine travels in bf16 and applies the routing weights.
@@ -320,12 +374,14 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
         recv_x, recv_scales = recv_hidden
 
         # One row per (received token, surviving top-k slot), grouped by expert.
+        requires_ue8m0 = deep_gemm_requires_ue8m0()
         gemm_x, gemm_scales, m_indices, dest_index = deepep_scatter(
             recv_x,
             recv_scales,
             recv_topk_ids,
             num_recv_tokens_per_expert,
             expert_alignment=_FP8_BLOCK,
+            pack_ue8m0_scales=requires_ue8m0,
         )
         hidden_size = x.shape[1]
         total_rows = gemm_x.shape[0]
@@ -342,18 +398,24 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
                 dtype=torch.bfloat16,
                 device=x.device,
             )
+            gemm1_scales = (
+                gemm_scales
+                if requires_ue8m0
+                else get_mn_major_tma_aligned_tensor(gemm_scales)
+            )
             m_grouped_fp8_gemm_nt_contiguous(
-                (gemm_x, get_mn_major_tma_aligned_tensor(gemm_scales)),
+                (gemm_x, gemm1_scales),
                 (w.w13_weight, w.w13_weight_scale_inv),
                 gateup,
                 m_indices,
+                recipe=_UE8M0_PACKED_RECIPE if requires_ue8m0 else None,
             )
 
             # Fused SiLU(gate)*up + FP8 block quantize. Padding rows of an expert
             # block are quantized like any other row; they are simply never
             # gathered back.
             ispp = w.w2_weight.shape[-1]
-            if deep_gemm_requires_ue8m0():
+            if requires_ue8m0:
                 # Power-of-two scales, packed in the column-major TMA layout the
                 # grouped GEMM consumes directly (no realignment needed).
                 down_in, down_scales = fused_swiglu_fp8_ue8m0(gateup)
@@ -390,6 +452,7 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
                 (w.w2_weight, w.w2_weight_scale_inv),
                 expert_out,
                 m_indices,
+                recipe=_UE8M0_PACKED_RECIPE if requires_ue8m0 else None,
             )
 
             # The normal combine leg reduces without weights, so fold the
@@ -490,7 +553,7 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
         # The router emits int32 ids while DeepEP's C++ API needs int64, and both
         # the dispatch and combine legs convert on entry. Converting once here
         # turns those into no-ops instead of two cast kernels per layer.
-        topk_ids = topk_ids.to(torch.int64)
+        topk_weights, topk_ids = _prepare_routing_tensors(topk_weights, topk_ids)
         if dispatcher.deepep_mode.resolve(low_latency) == DeepEPMode.normal:
             return _apply_normal(
                 dispatcher,

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.activation.triton import fused_swiglu_fp8_ue8m0
 from tokenspeed_kernel.ops.moe.triton.deepep_permute import (
     deepep_gather,
     deepep_scatter,
@@ -67,6 +68,17 @@ def _quantize_weight(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return quantized, scales.view(experts, n // _BLOCK, k // _BLOCK).contiguous()
 
 
+def _pack_weight_scales(scales: torch.Tensor, n: int, k: int) -> torch.Tensor:
+    return deep_gemm.transform_sf_into_required_layout(
+        sf=scales,
+        mn=n,
+        k=k,
+        recipe=(1, _BLOCK, _BLOCK),
+        num_groups=scales.shape[0],
+        is_sfa=False,
+    )
+
+
 def _dequantize(q: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     return q.float() * scales.repeat_interleave(_BLOCK, dim=-1)
 
@@ -74,6 +86,15 @@ def _dequantize(q: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
 def _dequantize_weight(q: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     expanded = scales.repeat_interleave(_BLOCK, dim=1).repeat_interleave(_BLOCK, dim=2)
     return q.float() * expanded
+
+
+def _dequantize_packed(q: torch.Tensor, packed: torch.Tensor) -> torch.Tensor:
+    num_groups = q.shape[1] // _BLOCK
+    bytes_ = torch.stack(
+        [(packed >> (8 * i)) & 0xFF for i in range(4)], dim=-1
+    ).flatten(-2)[:, :num_groups]
+    scales = torch.exp2(bytes_.float() - 127.0)
+    return q.float() * scales.repeat_interleave(_BLOCK, dim=1)
 
 
 def test_fused_silu_block_quant_fills_mn_major_scales():
@@ -136,29 +157,33 @@ def test_normal_mode_expert_compute_matches_dequantized_reference():
     )
 
     gemm_x, gemm_scales, m_indices, dest_index = deepep_scatter(
-        recv_x, recv_scales, topk_ids, counts, expert_alignment=_BLOCK
+        recv_x,
+        recv_scales,
+        topk_ids,
+        counts,
+        expert_alignment=_BLOCK,
+        pack_ue8m0_scales=True,
     )
     total_rows = gemm_x.shape[0]
 
     gateup = torch.empty((total_rows, 2 * ispp), dtype=torch.bfloat16, device=device)
     deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
-        (gemm_x, deep_gemm.get_mn_major_tma_aligned_tensor(gemm_scales)),
-        (w13, w13_scales),
+        (gemm_x, gemm_scales),
+        (w13, _pack_weight_scales(w13_scales, 2 * ispp, hidden)),
         gateup,
         m_indices,
+        recipe=(1, 1, _BLOCK),
     )
 
-    activated = (
-        torch.nn.functional.silu(gateup[:, :ispp].float()) * gateup[:, ispp:].float()
-    )
-    down_in, down_scales = _quantize_blockwise(activated)
+    down_in, down_scales = fused_swiglu_fp8_ue8m0(gateup)
 
     expert_out = torch.empty((total_rows, hidden), dtype=torch.bfloat16, device=device)
     deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
-        (down_in, deep_gemm.get_mn_major_tma_aligned_tensor(down_scales)),
-        (w2, w2_scales),
+        (down_in, down_scales),
+        (w2, _pack_weight_scales(w2_scales, hidden, ispp)),
         expert_out,
         m_indices,
+        recipe=(1, 1, _BLOCK),
     )
 
     got = deepep_gather(expert_out, topk_ids, topk_weights, dest_index)
@@ -190,7 +215,7 @@ def test_normal_mode_expert_compute_matches_dequantized_reference():
 
     down_ref = torch.einsum(
         "rk,rnk->rn",
-        _dequantize(down_in, down_scales)[rows],
+        _dequantize_packed(down_in, down_scales)[rows],
         w2_ref[experts],
     )
     reference = torch.zeros(num_recv, hidden, device=device, dtype=torch.float32)
@@ -244,6 +269,30 @@ def test_requantization_makes_scales_ue8m0_and_preserves_values():
     # bits, so a few percent of the block amax is the expected ceiling.
     drift = (after - before).abs().max() / before.abs().max()
     assert drift < 0.10, f"requantization drifted {drift:.3f} of amax"
+
+
+def test_deepep_weight_preprocessor_packs_scales_once_for_both_modes():
+    """The per-forward GEMMs should receive ready-to-use B scale layouts."""
+    from tokenspeed_kernel.ops.moe.deep_gemm import deepep_fp8
+
+    torch.manual_seed(0)
+    experts, hidden, ispp = 3, 512, 256
+    w = torch.nn.Module()
+    w.w13_weight, w.w13_weight_scale_inv = _quantize_weight(
+        torch.randn(experts, 2 * ispp, hidden, device="cuda") * 0.1
+    )
+    w.w2_weight, w.w2_weight_scale_inv = _quantize_weight(
+        torch.randn(experts, hidden, ispp, device="cuda") * 0.1
+    )
+
+    deepep_fp8.deep_gemm_deepep_fp8_moe_weights({}, w)
+
+    assert w.w13_weight_scale_inv.dtype == torch.int32
+    assert w.w2_weight_scale_inv.dtype == torch.int32
+    assert w.w13_weight_scale_inv.shape[:2] == (experts, 2 * ispp)
+    assert w.w2_weight_scale_inv.shape[:2] == (experts, hidden)
+    assert w.w13_weight_scale_inv.stride(1) == 1
+    assert w.w2_weight_scale_inv.stride(1) == 1
 
 
 def test_ue8m0_quantized_activations_round_trip_through_the_grouped_gemm():

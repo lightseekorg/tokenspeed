@@ -42,8 +42,14 @@ deep_gemm = pytest.importorskip(
 
 from tokenspeed_kernel.ops.activation.triton import (  # noqa: E402
     fused_swiglu_fp8_ue8m0_masked,
+    fused_swiglu_fp8_ue8m0_masked_packed,
 )
-from tokenspeed_kernel.ops.moe.deep_gemm.ue8m0 import is_ue8m0  # noqa: E402
+from tokenspeed_kernel.ops.moe.deep_gemm.ue8m0 import (  # noqa: E402
+    is_ue8m0,
+)
+from tokenspeed_kernel.thirdparty.deep_gemm.utils.layout import (  # noqa: E402
+    get_mn_major_tma_aligned_packed_ue8m0_tensor,
+)
 
 _BLOCK = 128
 
@@ -68,6 +74,18 @@ def _quantize_weight(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return quantized, scales.view(experts, n // _BLOCK, k // _BLOCK).contiguous()
 
 
+def _pack_weight_scales(scales: torch.Tensor, n: int, k: int) -> torch.Tensor:
+    """Expand 128x128 B scales once into DeepGEMM's packed per-N layout."""
+    return deep_gemm.transform_sf_into_required_layout(
+        sf=scales,
+        mn=n,
+        k=k,
+        recipe=(1, _BLOCK, _BLOCK),
+        num_groups=scales.shape[0],
+        is_sfa=False,
+    )
+
+
 def _dequantize(q: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     return q.float() * scales.repeat_interleave(_BLOCK, dim=-1)
 
@@ -75,6 +93,13 @@ def _dequantize(q: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
 def _dequantize_weight(q: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     expanded = scales.repeat_interleave(_BLOCK, dim=1).repeat_interleave(_BLOCK, dim=2)
     return q.float() * expanded
+
+
+def _unpack_ue8m0(packed: torch.Tensor, num_groups: int) -> torch.Tensor:
+    bytes_ = torch.stack(
+        [(packed >> (8 * i)) & 0xFF for i in range(4)], dim=-1
+    ).flatten(-2)[..., :num_groups]
+    return torch.exp2(bytes_.float() - 127.0)
 
 
 def test_masked_swiglu_ue8m0_quantizer_matches_reference_and_skips_padding():
@@ -123,6 +148,49 @@ def test_masked_swiglu_ue8m0_quantizer_matches_reference_and_skips_padding():
         assert (scales[expert, valid:] == 0).all()
 
 
+def test_masked_swiglu_writes_packed_mn_major_scales_for_deep_gemm():
+    """The decode kernel must need no clear or post-quant scale transform."""
+    torch.manual_seed(0)
+    experts, capacity, ispp = 3, 17, 640
+    gateup = torch.randn(
+        experts, capacity, 2 * ispp, device="cuda", dtype=torch.bfloat16
+    )
+    masked_m = torch.tensor([17, 5, 0], dtype=torch.int32, device="cuda")
+
+    out, packed_scales = fused_swiglu_fp8_ue8m0_masked_packed(gateup, masked_m)
+
+    num_groups = ispp // _BLOCK
+    scales = _unpack_ue8m0(packed_scales, num_groups)
+    assert out.shape == (experts, capacity, ispp)
+    assert packed_scales.shape == (experts, capacity, 2)
+    assert packed_scales.dtype == torch.int32
+    # MN-major: adjacent rows are adjacent in memory, while packed scale
+    # columns stride over the aligned row extent.
+    assert packed_scales.stride(1) == 1
+    assert packed_scales.stride(2) % 4 == 0
+    # N=640 has five groups, so bytes 1..3 in the tail word are padding.
+    assert bool(((packed_scales[:2, :5, 1] >> 8) == 0).all())
+
+    reference = (
+        torch.nn.functional.silu(gateup[..., :ispp].float())
+        * gateup[..., ispp:].float()
+    )
+    for expert in range(experts):
+        valid = int(masked_m[expert])
+        if not valid:
+            continue
+        dequantized = (
+            out[expert, :valid].float().view(valid, num_groups, _BLOCK)
+            * scales[expert, :valid, :, None]
+        ).view(valid, ispp)
+        torch.testing.assert_close(
+            dequantized,
+            reference[expert, :valid],
+            rtol=6e-2,
+            atol=6e-2 * reference[expert, :valid].abs().max(),
+        )
+
+
 def test_low_latency_expert_compute_matches_dequantized_reference():
     torch.manual_seed(0)
     experts, capacity, hidden, ispp = 4, 128, 512, 256
@@ -145,28 +213,27 @@ def test_low_latency_expert_compute_matches_dequantized_reference():
         (experts, capacity, 2 * ispp), dtype=torch.bfloat16, device=device
     )
     deep_gemm.m_grouped_fp8_gemm_nt_masked(
-        (recv_x, deep_gemm.get_mn_major_tma_aligned_tensor(recv_scales)),
-        (w13, w13_scales),
+        (
+            recv_x,
+            get_mn_major_tma_aligned_packed_ue8m0_tensor(recv_scales),
+        ),
+        (w13, _pack_weight_scales(w13_scales, 2 * ispp, hidden)),
         gateup,
         masked_m,
         expected_m,
+        recipe=(1, 1, _BLOCK),
     )
 
-    down_in = torch.empty(
-        (experts, capacity, ispp), dtype=torch.float8_e4m3fn, device=device
-    )
-    down_scales = torch.zeros(
-        (experts, ispp // _BLOCK, capacity), dtype=torch.float32, device=device
-    ).permute(0, 2, 1)
-    fused_swiglu_fp8_ue8m0_masked(gateup, masked_m, down_in, down_scales)
+    down_in, down_scales = fused_swiglu_fp8_ue8m0_masked_packed(gateup, masked_m)
 
     out = torch.empty((experts, capacity, hidden), dtype=torch.bfloat16, device=device)
     deep_gemm.m_grouped_fp8_gemm_nt_masked(
-        (down_in, deep_gemm.get_mn_major_tma_aligned_tensor(down_scales)),
-        (w2, w2_scales),
+        (down_in, down_scales),
+        (w2, _pack_weight_scales(w2_scales, hidden, ispp)),
         out,
         masked_m,
         expected_m,
+        recipe=(1, 1, _BLOCK),
     )
 
     # Reference on the kernels' own operands so only the masked layout wiring
@@ -185,7 +252,10 @@ def test_low_latency_expert_compute_matches_dequantized_reference():
             rtol=2e-2,
             atol=2e-2 * gateup_ref.abs().max(),
         )
-        down_ref = _dequantize(down_in, down_scales)[expert, :valid]
+        down_ref = (
+            down_in[expert, :valid].float().view(valid, ispp // _BLOCK, _BLOCK)
+            * _unpack_ue8m0(down_scales[expert, :valid], ispp // _BLOCK)[..., None]
+        ).view(valid, ispp)
         reference = down_ref @ w2_ref[expert].t()
         torch.testing.assert_close(
             out[expert, :valid].float(),

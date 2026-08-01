@@ -28,7 +28,12 @@ hang or a corruption on a real cluster, not a test failure.
 from __future__ import annotations
 
 import pytest
-from tokenspeed_kernel.ops.communication.deep_ep import DeepEPBuffer, DeepEPMode
+import torch
+from tokenspeed_kernel.ops.communication.deep_ep import (
+    DeepEPBuffer,
+    DeepEPMode,
+    _DeepEPDispatcherImplLowLatency,
+)
 
 
 @pytest.mark.parametrize("low_latency", [True, False, None])
@@ -133,3 +138,40 @@ def test_reuse_rejects_a_mode_whose_legs_were_never_allocated(monkeypatch) -> No
             num_max_dispatch_tokens_per_rank=256,
             num_experts=64,
         )
+
+
+@pytest.mark.parametrize("ue8m0_scales", [False, True])
+def test_low_latency_dispatch_requests_deepep_packed_ue8m0(
+    monkeypatch, ue8m0_scales
+) -> None:
+    seen = {}
+
+    class RecordingBuffer:
+        def low_latency_dispatch(self, *args, **kwargs):
+            seen.update(kwargs)
+            return "hidden", "count", "handle", "event", "hook"
+
+    impl = _DeepEPDispatcherImplLowLatency(
+        return_recv_hook=True,
+        use_fp8=True,
+        ue8m0_scales=ue8m0_scales,
+        group=None,
+        router_topk=4,
+        permute_fusion=True,
+        num_experts=64,
+        num_local_experts=16,
+        hidden_size=2048,
+        params_dtype=torch.bfloat16,
+        deepep_mode=DeepEPMode.low_latency,
+        low_latency_max_num_tokens_per_gpu=256,
+    )
+    monkeypatch.setattr(impl, "_get_buffer", RecordingBuffer)
+
+    impl._dispatch_core(
+        torch.empty((1, 2048), dtype=torch.bfloat16),
+        torch.zeros((1, 4), dtype=torch.int64),
+        use_fp8=True,
+    )
+
+    assert seen["round_scale"] is ue8m0_scales
+    assert seen["use_ue8m0"] is ue8m0_scales

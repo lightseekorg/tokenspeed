@@ -170,3 +170,55 @@ def test_scatter_rejects_unaligned_counts():
         deepep_scatter(
             recv_x, recv_scale, topk_ids, counts, expert_alignment=_ALIGNMENT
         )
+
+
+@pytest.mark.parametrize("hidden", [256, 1024, 2048])
+def test_scatter_packs_ue8m0_scales_into_mn_major_layout(hidden):
+    num_recv, top_k, num_local_experts = 37, 4, 3
+    recv_x, _, topk_ids, _, counts = _make_recv(
+        num_recv, hidden, top_k, num_local_experts, seed=hidden
+    )
+    num_groups = hidden // _BLOCK
+    recv_scale = torch.exp2(
+        torch.randint(
+            -20,
+            8,
+            (num_recv, num_groups),
+            device="cuda",
+            dtype=torch.int32,
+        ).float()
+    )
+
+    _, packed, _, dest_index = deepep_scatter(
+        recv_x,
+        recv_scale,
+        topk_ids,
+        counts,
+        expert_alignment=_ALIGNMENT,
+        pack_ue8m0_scales=True,
+    )
+
+    total_rows = sum(counts)
+    num_packed = (num_groups + 3) // 4
+    assert packed.shape == (total_rows, num_packed)
+    assert packed.dtype == torch.int32
+    assert packed.stride() == (1, total_rows)
+
+    ids = topk_ids.cpu()
+    dest = dest_index.cpu()
+    used_rows = set()
+    for token in range(num_recv):
+        for slot in range(top_k):
+            if int(ids[token, slot]) < 0:
+                continue
+            row = int(dest[token, slot])
+            used_rows.add(row)
+            words = packed[row]
+            bytes_ = torch.stack(
+                [(words >> (8 * i)) & 0xFF for i in range(4)], dim=-1
+            ).flatten()[:num_groups]
+            got = torch.exp2(bytes_.float() - 127.0)
+            torch.testing.assert_close(got, recv_scale[token])
+
+    padding_rows = sorted(set(range(total_rows)) - used_rows)
+    assert bool((packed[padding_rows] == 0).all())

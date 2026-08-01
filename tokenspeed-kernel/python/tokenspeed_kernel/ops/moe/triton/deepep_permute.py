@@ -66,7 +66,8 @@ def _deepep_scatter_kernel(
     out_x_ptr,
     out_x_stride,
     out_scale_ptr,
-    out_scale_stride,
+    out_scale_stride_row,
+    out_scale_stride_col,
     dest_index_ptr,
     dest_index_stride,
     num_recv_tokens,
@@ -75,6 +76,7 @@ def _deepep_scatter_kernel(
     HIDDEN_PAD: tl.constexpr,
     NUM_SCALES: tl.constexpr,
     NUM_SCALES_PAD: tl.constexpr,
+    PACK_UE8M0: tl.constexpr,
 ):
     program_id = tl.program_id(0)
     num_programs = tl.num_programs(0)
@@ -104,11 +106,31 @@ def _deepep_scatter_kernel(
                     row,
                     mask=mask_hidden,
                 )
-                tl.store(
-                    out_scale_ptr + dest * out_scale_stride + off_scale,
-                    scales,
-                    mask=mask_scale,
-                )
+                if PACK_UE8M0:
+                    # UE8M0 values arrive as exact powers of two held in FP32.
+                    # Preserve their exponent bits and pack four K groups into
+                    # the int32/MN-major layout DeepGEMM consumes.
+                    scale_bits = scales.to(tl.uint32, bitcast=True)
+                    exponents = (scale_bits >> 23) & 0xFF
+                    exponent_groups = tl.reshape(exponents, (NUM_SCALES_PAD // 4, 4))
+                    shifts = tl.arange(0, 4)[None, :] * 8
+                    packed = tl.sum(exponent_groups << shifts, axis=1)
+                    off_packed = tl.arange(0, NUM_SCALES_PAD // 4)
+                    tl.store(
+                        out_scale_ptr
+                        + dest * out_scale_stride_row
+                        + off_packed * out_scale_stride_col,
+                        packed,
+                        mask=off_packed < (NUM_SCALES + 3) // 4,
+                    )
+                else:
+                    tl.store(
+                        out_scale_ptr
+                        + dest * out_scale_stride_row
+                        + off_scale * out_scale_stride_col,
+                        scales,
+                        mask=mask_scale,
+                    )
 
 
 @triton.jit
@@ -163,6 +185,7 @@ def deepep_scatter(
     recv_topk_ids: torch.Tensor,
     num_recv_tokens_per_expert: list[int],
     expert_alignment: int = 128,
+    pack_ue8m0_scales: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Expand DeepEP normal-mode receive buffers into a grouped-GEMM layout.
 
@@ -179,11 +202,16 @@ def deepep_scatter(
         expert_alignment: Row alignment each expert block was padded to. Must
             match the ``expert_alignment`` dispatch was called with so grouped
             GEMM tiles never straddle two experts.
+        pack_ue8m0_scales: Treat ``recv_x_scale`` as exact power-of-two FP32
+            values and pack four exponents per int32 while scattering. The
+            returned scale tensor then has DeepGEMM's MN-major TMA layout.
 
     Returns:
         ``(x, x_scale, m_indices, dest_index)`` where ``x`` is
         ``[total_rows, hidden]`` FP8, ``x_scale`` is
-        ``[total_rows, hidden // block]`` float32 (padding rows zeroed),
+        ``[total_rows, hidden // block]`` float32 (padding rows zeroed), or
+        packed int32 ``[total_rows, ceil((hidden // block) / 4)]`` when
+        ``pack_ue8m0_scales=True``;
         ``m_indices`` is ``[total_rows]`` int32 mapping each row to its expert,
         and ``dest_index`` is ``[num_recv, top_k]`` int32 recording the row each
         accepted slot was written to (``-1`` for skipped slots), to be handed
@@ -206,7 +234,15 @@ def deepep_scatter(
     x = torch.empty((total_rows, hidden), dtype=recv_x.dtype, device=device)
     # Zeroed so the padding rows inside each expert block dequantize to zero
     # instead of feeding denormal garbage into the GEMM.
-    x_scale = torch.zeros((total_rows, num_scales), dtype=torch.float32, device=device)
+    if pack_ue8m0_scales:
+        num_packed_scales = (num_scales + 3) // 4
+        x_scale = torch.zeros(
+            (num_packed_scales, total_rows), dtype=torch.int32, device=device
+        ).transpose(0, 1)
+    else:
+        x_scale = torch.zeros(
+            (total_rows, num_scales), dtype=torch.float32, device=device
+        )
     dest_index = torch.full((num_recv, top_k), -1, dtype=torch.int32, device=device)
 
     # Block starts double as the write cursors the scatter kernel bumps. The
@@ -240,6 +276,7 @@ def deepep_scatter(
         x.stride(0),
         x_scale,
         x_scale.stride(0),
+        x_scale.stride(1),
         dest_index,
         dest_index.stride(0),
         num_recv,
@@ -247,7 +284,8 @@ def deepep_scatter(
         HIDDEN=hidden,
         HIDDEN_PAD=triton.next_power_of_2(hidden),
         NUM_SCALES=num_scales,
-        NUM_SCALES_PAD=triton.next_power_of_2(num_scales),
+        NUM_SCALES_PAD=triton.next_power_of_2(max(num_scales, 4)),
+        PACK_UE8M0=pack_ue8m0_scales,
         num_warps=4,
     )
     return x, x_scale, m_indices, dest_index

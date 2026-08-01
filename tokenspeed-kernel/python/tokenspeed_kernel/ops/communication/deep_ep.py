@@ -646,9 +646,11 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
                 use_fp8=use_fp8,
-                # Power-of-two scales, so the returned FP32 scale tensor can
-                # feed a GEMM that reads scales as UE8M0 (sm100+ DeepGEMM).
+                # Ask DeepEP to both round and pack the scales in the
+                # column-major TMA layout its low-latency API exposes. On
+                # sm100+ this can feed DeepGEMM's 1d1d recipe directly.
                 round_scale=self.ue8m0_scales,
+                use_ue8m0=self.ue8m0_scales,
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
             )

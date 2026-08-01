@@ -79,8 +79,23 @@ def stub_compute(monkeypatch):
         deepep_fp8, "get_mn_major_tma_aligned_tensor", lambda scales: scales
     )
     monkeypatch.setattr(deepep_fp8, "deep_gemm_requires_ue8m0", lambda: True)
+
+    def fake_packed_activation(gateup, masked_m):
+        del masked_m
+        experts, rows, two_intermediate = gateup.shape
+        intermediate = two_intermediate // 2
+        return (
+            torch.empty((experts, rows, intermediate), dtype=torch.float8_e4m3fn),
+            torch.empty(
+                (experts, rows, (intermediate // 128 + 3) // 4),
+                dtype=torch.int32,
+            ),
+        )
+
     monkeypatch.setattr(
-        deepep_fp8, "fused_swiglu_fp8_ue8m0_masked", lambda *a, **k: None
+        deepep_fp8,
+        "fused_swiglu_fp8_ue8m0_masked_packed",
+        fake_packed_activation,
     )
 
 
@@ -114,6 +129,28 @@ def test_without_overlap_the_legs_are_unchanged(stub_compute) -> None:
     calls: list[str] = []
     _run_low_latency(calls, None)
     assert calls == ["dispatch_a", "dispatch_b", "combine_a", "combine_b"]
+
+
+def test_routing_metadata_is_reused_when_already_canonical() -> None:
+    weights = torch.zeros((4, TOP_K), dtype=torch.float32)
+    ids = torch.zeros((4, TOP_K), dtype=torch.int64)
+
+    got_weights, got_ids = deepep_fp8._prepare_routing_tensors(weights, ids)
+
+    assert got_weights is weights
+    assert got_ids is ids
+
+
+def test_routing_metadata_is_canonicalized_once() -> None:
+    weights = torch.zeros((TOP_K, 4), dtype=torch.bfloat16).t()
+    ids = torch.zeros((TOP_K, 4), dtype=torch.int32).t()
+
+    got_weights, got_ids = deepep_fp8._prepare_routing_tensors(weights, ids)
+
+    assert got_weights.dtype == torch.float32
+    assert got_ids.dtype == torch.int64
+    assert got_weights.is_contiguous()
+    assert got_ids.is_contiguous()
 
 
 def test_overlap_only_reaches_all_to_all_plans(monkeypatch) -> None:

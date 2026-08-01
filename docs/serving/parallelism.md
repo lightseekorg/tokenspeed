@@ -88,6 +88,20 @@ The prefill CUDA graph is disabled whenever an all-to-all backend is selected:
 normal-mode dispatch reports its per-expert receive counts to the host, and a
 host sync cannot be captured. Decode graphs are unaffected.
 
+For block-scale FP8 decode on NVIDIA, the low-latency path keeps routing
+metadata in DeepEP's required contiguous int64/float32 formats across both
+collective legs. Its fused SwiGLU quantizer writes packed UE8M0 scales directly
+in DeepGEMM's MN-major TMA layout, so padded rows need no zero-fill and the
+second expert GEMM needs no separate activation-scale transpose/pack pass.
+Expert weight scales are expanded and packed once when weights are loaded,
+instead of ahead of both expert GEMMs in every layer forward. Shared-expert work
+is queued between the dispatch send and receive legs to overlap the collective
+whenever the model has a shared expert. Low-latency dispatch asks DeepEP to
+produce packed UE8M0 scales directly in its column-major TMA layout. Normal-mode
+dispatch still transports FP32 power-of-two scales, but the existing expert
+scatter packs them while permuting tokens, so neither mode needs a separate
+sequence of elementwise shifts, fills, copies, and a transpose before GEMM1.
+
 ## Multi-Node
 
 Set these explicitly:
