@@ -227,6 +227,7 @@ class PlatformInfo:
             return names.get(arch_version, f"SM{arch_version[0]}.{arch_version[1]}")
         if self.is_amd:
             names = {
+                (9, 4): "CDNA3",  # MI300
                 (9, 5): "CDNA4",  # MI350
                 (12, 5): "CDNA5",
             }
@@ -407,6 +408,7 @@ def _detect_rocm_platform() -> PlatformInfo:
 
     # Map AMD architectures
     arch_map = {
+        "gfx942": ArchVersion(9, 4),  # MI300
         "gfx950": ArchVersion(9, 5),  # MI350
         "gfx1250": ArchVersion(12, 5),
     }
