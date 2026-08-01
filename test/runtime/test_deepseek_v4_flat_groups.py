@@ -27,6 +27,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     pool_to_paged_cache_groups,
     resolve_scheduler_block_size,
     scheduler_cache_geometry_from_pool,
+    validate_scheduler_page_domain_contract,
 )
 from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -94,6 +95,7 @@ def _target_specs():
         build_v4_cache_specs(
             SimpleNamespace(sliding_window=128),
             layer_ratio=(1, 4, 128),
+            flat_scheduler=True,
         )
     )
 
@@ -103,6 +105,7 @@ def _draft_specs():
         build_v4_cache_specs(
             SimpleNamespace(sliding_window=128),
             layer_ratio=(1,),
+            flat_scheduler=True,
         )
     )
 
@@ -167,7 +170,13 @@ class DeepseekV4FlatGroupUnitTest(unittest.TestCase):
             page_size=256,
             use_fp4_indexer_cache=True,
         )
-        specs = tuple(build_v4_cache_specs(hf_config, layer_ratio=layout.layer_ratio))
+        specs = tuple(
+            build_v4_cache_specs(
+                hf_config,
+                layer_ratio=layout.layer_ratio,
+                flat_scheduler=True,
+            )
+        )
         sizing = dict(
             token_capacity=1,
             max_live_requests=1,
@@ -257,6 +266,7 @@ class DeepseekV4FlatGroupUnitTest(unittest.TestCase):
             build_v4_cache_specs(
                 target_hf,
                 layer_ratio=target_layout.layer_ratio,
+                flat_scheduler=True,
             )
         )
         sizing = dict(
@@ -364,17 +374,77 @@ class DeepseekV4FlatGroupUnitTest(unittest.TestCase):
             target_only_under_budget.token_capacity,
         )
 
-    def test_scheduler_block_size_matches_extension_contract(self):
-        groups = pool_to_paged_cache_groups(
-            SimpleNamespace(
-                paged_cache_group_specs=_target_specs(),
-                paged_cache_group_page_counts=_page_counts(_target_specs()),
+    def test_radix_specs_preserve_legacy_scheduler_geometry(self):
+        specs = tuple(
+            build_v4_cache_specs(
+                SimpleNamespace(sliding_window=128),
+                layer_ratio=(1, 4, 128),
             )
         )
-        self.assertEqual(
-            resolve_scheduler_block_size(256, groups),
-            256 if scheduler_ext.FLAT_KVCACHE else 4,
+        self.assertTrue(all(spec.block_size is None for spec in specs))
+        self.assertTrue(all(spec.cache_blocks_per_lcm_block == 1 for spec in specs))
+        groups = pool_to_paged_cache_groups(
+            SimpleNamespace(
+                paged_cache_group_specs=specs,
+                paged_cache_group_page_counts=_page_counts(specs),
+            )
         )
+        self.assertTrue(all(group.block_size == 0 for group in groups))
+        self.assertEqual(resolve_scheduler_block_size(256, groups), 256)
+        cfg = make_config(
+            num_device_pages=32,
+            max_scheduled_tokens=256,
+            max_batch_size=2,
+            page_size=256,
+            num_host_pages=0,
+            disable_l2_cache=True,
+            enable_l3_storage=False,
+            prefetch_threshold=4,
+            role="null",
+            disable_prefix_cache=True,
+            paged_cache_groups=groups,
+        )
+        geometry = SimpleNamespace(
+            page_size=256,
+            num_device_pages=32,
+            num_usable_pages=32,
+            token_capacity=8192,
+        )
+        pool = SimpleNamespace(requires_scheduler_page_domain_match=True)
+        executor = SimpleNamespace(logical_page_size=256)
+        validate_scheduler_page_domain_contract(
+            pool=pool,
+            geometry=geometry,
+            scheduler_config=cfg,
+            model_executor_config=executor,
+        )
+
+        cfg.block_size = 4
+        with self.assertRaisesRegex(ValueError, "scheduler page-domain mismatch"):
+            validate_scheduler_page_domain_contract(
+                pool=pool,
+                geometry=geometry,
+                scheduler_config=cfg,
+                model_executor_config=executor,
+            )
+
+        cfg.block_size = 256
+        geometry.token_capacity = 8193
+        with self.assertRaisesRegex(ValueError, "advertised token capacity"):
+            validate_scheduler_page_domain_contract(
+                pool=pool,
+                geometry=geometry,
+                scheduler_config=cfg,
+                model_executor_config=executor,
+            )
+
+    def test_cache_specs_reject_non_boolean_scheduler_mode(self):
+        with self.assertRaisesRegex(ValueError, "flat_scheduler must be a bool"):
+            build_v4_cache_specs(
+                SimpleNamespace(sliding_window=128),
+                layer_ratio=(1, 4, 128),
+                flat_scheduler=1,
+            )
 
     @unittest.skipUnless(
         scheduler_ext.FLAT_KVCACHE,

@@ -66,6 +66,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     pop_common_cache_event_payloads,
     scheduler_cache_geometry_from_pool,
     should_use_overlap_schedule,
+    validate_scheduler_page_domain_contract,
 )
 from tokenspeed.runtime.execution.distributed_initializer import (
     DistributedConfig,
@@ -514,6 +515,12 @@ class EventLoop:
             paged_cache_host_group_pages=paged_cache_host_group_pages,
             enable_mixed_prefill_decode=server_args.enable_mixed_batch,
             prefix_cache_adjunct=prefix_cache_adjunct,
+        )
+        validate_scheduler_page_domain_contract(
+            pool=token_to_kv_pool,
+            geometry=geometry,
+            scheduler_config=scheduler_cfg,
+            model_executor_config=model_executor_config,
         )
         scheduler_cfg.enable_flatkv_pd = self._flatkv_pd_enabled
         logger.info(

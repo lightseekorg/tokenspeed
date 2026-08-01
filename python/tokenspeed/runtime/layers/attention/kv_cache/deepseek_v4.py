@@ -342,7 +342,11 @@ def profile_deepseek_v4_flat_cache(
 ) -> DeepseekV4FlatCachePlan:
     """Plan V4 FlatKV buffers in the scheduler's absolute page-ID domain."""
     target_specs = tuple(
-        build_v4_cache_specs(hf_config, layer_ratio=layout.layer_ratio)
+        build_v4_cache_specs(
+            hf_config,
+            layer_ratio=layout.layer_ratio,
+            flat_scheduler=True,
+        )
     )
     target_page_bytes = _deepseek_v4_cache_group_page_bytes(
         layout, target_specs, layer_num
@@ -359,6 +363,7 @@ def profile_deepseek_v4_flat_cache(
             build_v4_cache_specs(
                 draft_hf_config,
                 layer_ratio=draft_layout.layer_ratio,
+                flat_scheduler=True,
             )
         )
         target_by_id = {spec.group_id: spec for spec in target_specs}
@@ -975,6 +980,10 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
     """
 
     supports_hierarchical_kv_cache = True
+    # V4 kernels and req_to_page use the pool's logical page domain.  Radix
+    # must not reinterpret Flat-only child-page granularity as its global
+    # allocator block size.
+    requires_scheduler_page_domain_match = True
 
     def __init__(
         self,
@@ -1022,7 +1031,11 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
         self.max_context_len = max_context_len
         self.num_pages = (size + page_size - 1) // page_size + 1
         self.paged_cache_group_specs = tuple(
-            build_v4_cache_specs(hf_config, layer_ratio=layout.layer_ratio)
+            build_v4_cache_specs(
+                hf_config,
+                layer_ratio=layout.layer_ratio,
+                flat_scheduler=flat_num_lcm_blocks is not None,
+            )
         )
         self._paged_cache_group_specs_by_id = {
             spec.group_id: spec for spec in self.paged_cache_group_specs

@@ -107,7 +107,13 @@ def _make_v4_pool(*, flat: bool = False):
     )
     flat_num_lcm_blocks = None
     if flat:
-        specs = tuple(build_v4_cache_specs(hf_config, layer_ratio=layout.layer_ratio))
+        specs = tuple(
+            build_v4_cache_specs(
+                hf_config,
+                layer_ratio=layout.layer_ratio,
+                flat_scheduler=True,
+            )
+        )
         flat_num_lcm_blocks = deepseek_v4_flat_lcm_blocks_needed(
             specs,
             token_capacity=512,

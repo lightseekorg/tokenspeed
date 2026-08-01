@@ -207,6 +207,7 @@ class DummyFlatTablesTest(unittest.TestCase):
             build_v4_cache_specs(
                 SimpleNamespace(sliding_window=128),
                 layer_ratio=(1, 4, 128),
+                flat_scheduler=True,
             )
         )
         with mock.patch.object(

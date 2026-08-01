@@ -170,6 +170,49 @@ def resolve_scheduler_block_size(page_size: int, paged_cache_groups) -> int:
     return page_size if FLAT_KVCACHE else base
 
 
+def validate_scheduler_page_domain_contract(
+    *,
+    pool: Any,
+    geometry: SchedulerCacheGeometry,
+    scheduler_config: Any,
+    model_executor_config: Any,
+) -> None:
+    """Fail closed when a pool requires one shared scheduler page domain."""
+    if not getattr(pool, "requires_scheduler_page_domain_match", False):
+        return
+
+    pool_page_size = require_positive_int("geometry.page_size", geometry.page_size)
+    scheduler_page_size = require_positive_int(
+        "scheduler_config.block_size", scheduler_config.block_size
+    )
+    executor_page_size = require_positive_int(
+        "model_executor_config.logical_page_size",
+        model_executor_config.logical_page_size,
+    )
+    if len({pool_page_size, scheduler_page_size, executor_page_size}) != 1:
+        raise ValueError(
+            "scheduler page-domain mismatch: "
+            f"pool={pool_page_size}, scheduler={scheduler_page_size}, "
+            f"model_executor={executor_page_size}"
+        )
+
+    scheduler_pages = require_positive_int(
+        "scheduler_config.num_device_pages", scheduler_config.num_device_pages
+    )
+    if scheduler_pages != geometry.num_device_pages:
+        raise ValueError(
+            "scheduler page-count mismatch: "
+            f"geometry={geometry.num_device_pages}, scheduler={scheduler_pages}"
+        )
+    physical_token_capacity = geometry.num_usable_pages * scheduler_page_size
+    if physical_token_capacity < geometry.token_capacity:
+        raise ValueError(
+            "scheduler physical page domain cannot cover the advertised token "
+            f"capacity: physical={physical_token_capacity}, "
+            f"advertised={geometry.token_capacity}"
+        )
+
+
 def aligned_max_scheduled_tokens(
     max_scheduled_tokens: int,
     paged_cache_groups,

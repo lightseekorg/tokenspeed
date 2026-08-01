@@ -193,11 +193,22 @@ def build_v4_cache_specs(
     hf_config: Any,
     *,
     layer_ratio: Sequence[int],
+    flat_scheduler: bool = False,
 ) -> list[PagedCacheGroupSpec]:
+    """Build V4 cache groups without changing the legacy Radix geometry.
+
+    A Flat scheduler needs each group's physical child-page geometry to pack
+    pages into its 256-token parent domain.  Radix historically received no
+    per-group block override and must keep using the global page size.
+    """
+    if not isinstance(flat_scheduler, bool):
+        raise ValueError("flat_scheduler must be a bool")
     swa_window = _resolve_sliding_window(hf_config)
     unique_compress_ratios = sorted({int(r) for r in layer_ratio if int(r) > 1})
 
     def _geometry(rows_per_page: int, entry_stride_tokens: int) -> dict[str, int]:
+        if not flat_scheduler:
+            return {}
         block_size = int(rows_per_page) * int(entry_stride_tokens)
         if DEEPSEEK_V4_COMPRESSED_LOGICAL_BLOCK_SIZE % block_size != 0:
             raise ValueError(
