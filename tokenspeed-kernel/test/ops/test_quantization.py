@@ -30,7 +30,9 @@ from tokenspeed_kernel import (
     quantize_nvfp4,
 )
 from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
-from tokenspeed_kernel.platform import current_platform
+
+_FP8_DTYPE = torch.float8_e4m3fn
+_FP8_FINFO = torch.finfo(_FP8_DTYPE)
 
 
 def _bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
@@ -82,14 +84,13 @@ def test_quantize_fp8_pure_cast_bf16(
     require("quantization", "fp8", solution, dtype, "x")
 
     x = torch.randn(shape, device=device, dtype=dtype) * 50
-    fp8 = current_platform().fp8e4m3fn
-    ref = x.to(fp8.dtype)
+    ref = x.to(_FP8_DTYPE)
 
     out = quantize_fp8(x, solution=solution)
     torch.cuda.synchronize()
 
     assert out.shape == ref.shape
-    assert out.dtype == ref.dtype
+    assert out.dtype == _FP8_DTYPE
     assert _bitwise_equal(out, ref)
 
 
@@ -158,8 +159,7 @@ def test_quantize_fp8_strided_slice(
     v = kv[..., qk_nope:]
     assert not v.is_contiguous()
 
-    fp8 = current_platform().fp8e4m3fn
-    ref = v.to(fp8.dtype)
+    ref = v.to(_FP8_DTYPE)
 
     out = quantize_fp8(v, solution=solution)
     torch.cuda.synchronize()
@@ -180,10 +180,11 @@ def test_quantize_fp8_scale_float(
     require("quantization", "fp8", solution, dtype, "x")
 
     x = torch.randn(2048, 512, device=device, dtype=dtype) * 100
-    fp8 = current_platform().fp8e4m3fn
     inv_scale = 1.0 / scale
     ref = (
-        (x.to(torch.float32) * inv_scale).clamp(min=fp8.min, max=fp8.max).to(fp8.dtype)
+        (x.to(torch.float32) * inv_scale)
+        .clamp(min=_FP8_FINFO.min, max=_FP8_FINFO.max)
+        .to(_FP8_DTYPE)
     )
 
     out = quantize_fp8(x, scale=scale, solution=solution)
@@ -204,10 +205,11 @@ def test_quantize_fp8_scale_tensor(
 
     x = torch.randn(8, 2880, device=device, dtype=dtype) * 100
     scale = torch.tensor([0.125], device=device, dtype=torch.float32)
-    fp8 = current_platform().fp8e4m3fn
     inv_scale = (1.0 / scale.to(torch.float32)).reshape(())
     ref = (
-        (x.to(torch.float32) * inv_scale).clamp(min=fp8.min, max=fp8.max).to(fp8.dtype)
+        (x.to(torch.float32) * inv_scale)
+        .clamp(min=_FP8_FINFO.min, max=_FP8_FINFO.max)
+        .to(_FP8_DTYPE)
     )
 
     out = quantize_fp8(x, scale=scale, solution=solution)
@@ -259,8 +261,6 @@ def test_quantize_fp8_with_scale_tensor_and_token(
     require("quantization", "fp8_with_scale", solution, dtype, "x")
 
     x = torch.randn(16, 128, device=device, dtype=dtype) * 10
-    fp8 = current_platform().fp8e4m3fn
-
     out, scale = quantize_fp8_with_scale(
         x,
         granularity=granularity,
@@ -269,7 +269,7 @@ def test_quantize_fp8_with_scale_tensor_and_token(
     torch.cuda.synchronize()
 
     assert out.shape == x.shape
-    assert out.dtype == fp8.dtype
+    assert out.dtype == _FP8_DTYPE
     assert scale.dtype == torch.float32
     if granularity == "tensor":
         assert scale.shape == (1,)
@@ -292,8 +292,6 @@ def test_quantize_fp8_with_scale_token_group(
     require("quantization", "fp8_with_scale", solution, dtype, "x")
 
     x = torch.randn(16, 256, device=device, dtype=dtype) * 10
-    fp8 = current_platform().fp8e4m3fn
-
     out, scale = quantize_fp8_with_scale(
         x,
         granularity="token_group",
@@ -303,7 +301,7 @@ def test_quantize_fp8_with_scale_token_group(
     torch.cuda.synchronize()
 
     assert out.shape == x.shape
-    assert out.dtype == fp8.dtype
+    assert out.dtype == _FP8_DTYPE
     assert scale.dtype == torch.float32
     expected_num_scales = x.shape[0] * (x.shape[1] // group_size)
     assert scale.numel() == expected_num_scales

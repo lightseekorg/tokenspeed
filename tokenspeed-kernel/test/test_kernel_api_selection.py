@@ -266,7 +266,7 @@ def _is_supported_gpu(platform: PlatformInfo) -> bool:
 
 
 def _fp8_dtype() -> torch.dtype:
-    return Platform.get().fp8e4m3fn.dtype
+    return torch.float8_e4m3fn
 
 
 def _quantize_mxfp8() -> tuple[torch.Tensor, torch.Tensor]:

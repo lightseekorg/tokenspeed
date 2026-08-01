@@ -89,16 +89,6 @@ class InterconnectInfo:
 
 
 @dataclass(frozen=True)
-class Fp8E4M3FnDType:
-    dtype: torch.dtype
-    max: float
-    min: float
-
-
-_fp8e4m3_dtype = None
-
-
-@dataclass(frozen=True)
 class PlatformInfo:
     """Complete description of a compute platform."""
 
@@ -184,16 +174,6 @@ class PlatformInfo:
     def arch(self) -> str:
         """Short architecture string for cache keys."""
         return str(self.arch_version)
-
-    @property
-    def fp8e4m3fn(self) -> Fp8E4M3FnDType:
-        global _fp8e4m3_dtype
-        if _fp8e4m3_dtype is None:
-            dtype = torch.float8_e4m3fn
-            fp8_max = torch.finfo(dtype).max
-            fp8_min = -fp8_max
-            _fp8e4m3_dtype = Fp8E4M3FnDType(dtype=dtype, max=fp8_max, min=fp8_min)
-        return _fp8e4m3_dtype
 
     def register_host_tensor_for_gpu_access(self, tensor: torch.Tensor) -> None:
         """Register host memory that GPU kernels will directly dereference."""

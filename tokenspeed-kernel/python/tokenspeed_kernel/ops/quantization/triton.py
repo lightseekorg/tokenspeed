@@ -18,11 +18,9 @@ from typing import Optional
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
+from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
-
-platform = current_platform()
 
 
 @triton.jit
@@ -239,7 +237,7 @@ def _fp8_token_group_quantize(
     if not x.is_contiguous():
         raise ValueError("x must be contiguous")
 
-    out_dtype = platform.fp8e4m3fn.dtype
+    out_dtype = torch.float8_e4m3fn
     out = torch.empty_like(x, device=x.device, dtype=out_dtype)
     scales = torch.empty(
         x.shape[:-1] + (x.shape[-1] // group_size,),
@@ -250,8 +248,7 @@ def _fp8_token_group_quantize(
     groups = x.numel() // group_size
     block = triton.next_power_of_2(group_size)
     num_warps = min(max(block // 256, 1), 8)
-    bit8_max = platform.fp8e4m3fn.max
-    bit8_min = -bit8_max
+    fp8_finfo = torch.finfo(out_dtype)
 
     _fp8_token_group_quantize_kernel[(groups,)](
         x,
@@ -259,8 +256,8 @@ def _fp8_token_group_quantize(
         scales,
         group_size,
         1e-10,
-        bit8_min=bit8_min,
-        bit8_max=bit8_max,
+        bit8_min=fp8_finfo.min,
+        bit8_max=fp8_finfo.max,
         BLOCK=block,
         num_warps=num_warps,
         num_stages=1,
