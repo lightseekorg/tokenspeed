@@ -46,6 +46,7 @@ different collectives.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from types import SimpleNamespace
 
 import torch
@@ -213,9 +214,15 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
         topk_ids: torch.Tensor,
         num_tokens_global: int | None,
         enable_pdl: bool,
+        overlap_fn: Callable[[], None] | None = None,
     ) -> torch.Tensor:
         """Decode-shaped path: padded per-expert buffers + masked grouped GEMMs."""
         dispatcher.dispatch_a(x, topk_ids, topk_weights, low_latency=True)
+        # dispatch_a only launched the send phase, so the RDMA transfer is in
+        # flight on the NIC: any work queued here runs while it lands instead of
+        # leaving the GPU spinning in the recv phase.
+        if overlap_fn is not None:
+            overlap_fn()
         recv_hidden, _, _, _, _, _, masked_m = dispatcher.dispatch_b()
         # ``use_fp8=True`` makes DeepEP return the tokens already quantized.
         recv_x, recv_scales = recv_hidden
@@ -293,9 +300,14 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         enable_pdl: bool,
+        overlap_fn: Callable[[], None] | None = None,
     ) -> torch.Tensor:
         """Extend-shaped path: permuted expert blocks + contiguous grouped GEMMs."""
         dispatcher.dispatch_a(x, topk_ids, topk_weights, low_latency=False)
+        # Normal-mode dispatch finishes asynchronously, so work queued here
+        # overlaps the transfer rather than waiting behind it.
+        if overlap_fn is not None:
+            overlap_fn()
         (
             recv_hidden,
             recv_topk_ids,
@@ -438,6 +450,7 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
         do_finalize: bool = True,
         enable_pdl: bool = False,
         low_latency: bool | None = None,
+        overlap_fn: Callable[[], None] | None = None,
     ):
         """Run one FP8 MoE layer over DeepEP.
 
@@ -458,6 +471,10 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
             enable_pdl: Honor PDL in the fused activation kernel.
             low_latency: Which DeepEP mode to run when the plan mode is ``auto``.
                 Every rank of the EP group must pass the same value.
+            overlap_fn: Optional work to queue inside the dispatch window, i.e.
+                after the tokens are sent but before they are awaited. Must not
+                read the dispatch result or write ``x``; anything else (a shared
+                expert on the same input) runs while the transfer lands.
 
         Returns:
             ``[tokens, hidden]`` bf16 combined MoE output.
@@ -470,6 +487,10 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
         dispatcher = _get_dispatcher(plan, w, x)
+        # The router emits int32 ids while DeepEP's C++ API needs int64, and both
+        # the dispatch and combine legs convert on entry. Converting once here
+        # turns those into no-ops instead of two cast kernels per layer.
+        topk_ids = topk_ids.to(torch.int64)
         if dispatcher.deepep_mode.resolve(low_latency) == DeepEPMode.normal:
             return _apply_normal(
                 dispatcher,
@@ -478,6 +499,7 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
                 topk_weights,
                 topk_ids,
                 enable_pdl,
+                overlap_fn=overlap_fn,
             )
         return _apply_low_latency(
             dispatcher,
@@ -487,4 +509,5 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
             topk_ids,
             num_tokens_global,
             enable_pdl,
+            overlap_fn=overlap_fn,
         )

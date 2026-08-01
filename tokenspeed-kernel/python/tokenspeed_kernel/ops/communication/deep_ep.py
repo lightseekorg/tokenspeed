@@ -549,14 +549,12 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-        # DeepEP requires independent contiguous tensors to prevent issues with
-        # upstream tensor aliasing or non-standard strides. We clone to ensure
-        # complete memory isolation, which is critical for low-latency dispatch.
-        #
-        # Dtype requirements:
-        # - hidden_states: preserve original dtype (bf16/fp16/fp32)
-        # - topk_idx: must be int64 (DeepEP C++ kernel API requirement for expert indices)
-        # - topk_weights: use float32 for routing precision to avoid numerical issues
+        # DeepEP needs contiguous tensors with standard strides, int64 expert
+        # indices (C++ API requirement) and fp32 routing weights (precision).
+        # No private copy is needed: the send-phase kernel stages the tokens into
+        # the symmetric buffer before it returns, and stream order keeps these
+        # tensors alive and unmodified until then. ``.to()`` already allocates a
+        # fresh contiguous tensor whenever the dtype actually changes.
         if hidden_states.shape[0] > self.num_max_dispatch_tokens_per_rank:
             raise ValueError(
                 f"low-latency dispatch got {hidden_states.shape[0]} tokens but "
@@ -564,9 +562,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 "rank; raise --low-latency-max-num-tokens-per-gpu or route "
                 "this batch through normal mode"
             )
-        hidden_states = hidden_states.contiguous().clone()
-        topk_idx = topk_idx.to(torch.int64).contiguous().clone()
-        topk_weights = topk_weights.to(torch.float32).contiguous().clone()
+        hidden_states = hidden_states.contiguous()
+        topk_idx = topk_idx.to(torch.int64).contiguous()
+        topk_weights = topk_weights.to(torch.float32).contiguous()
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_idx,

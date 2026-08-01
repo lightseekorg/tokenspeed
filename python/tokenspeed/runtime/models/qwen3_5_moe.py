@@ -380,10 +380,16 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
 
         # Shared expert on this rank's token shard. Weights are replicated for
         # the DeepEP path (see the constructor), so the result is already
-        # complete -- no tensor-parallel reduction.
+        # complete -- no tensor-parallel reduction. It only reads
+        # ``hidden_states``, so it runs inside DeepEP's dispatch window below,
+        # where its GEMMs cover the in-flight token transfer.
         shared_output = None
+        overlap_fn = None
         if self.shared_expert is not None:
-            shared_output = self.shared_expert(hidden_states)
+
+            def overlap_fn() -> None:
+                nonlocal shared_output
+                shared_output = self.shared_expert(hidden_states)
 
         # TopK on local tokens
         if hidden_states.shape[0] > 0:
@@ -404,6 +410,7 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             num_global_tokens=num_global_tokens,
             max_num_tokens_per_gpu=max_num_tokens_per_gpu,
             low_latency=use_deepep_low_latency(ctx, self.mapping.attn.dp_size),
+            overlap_fn=overlap_fn,
         )
 
         if shared_output is not None:

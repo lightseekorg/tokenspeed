@@ -19,6 +19,8 @@
 # SOFTWARE.
 
 
+from collections.abc import Callable
+
 import tokenspeed_kernel
 import torch
 
@@ -290,6 +292,7 @@ class MoELayer(torch.nn.Module):
         max_num_tokens_per_gpu: int,
         do_finalize: bool = True,
         low_latency: bool | None = None,
+        overlap_fn: Callable[[], None] | None = None,
     ):
         """Run the planned MoE kernel over this layer's weights.
 
@@ -304,6 +307,8 @@ class MoELayer(torch.nn.Module):
                 latency-optimized dispatch/combine legs. Must be identical on
                 every rank of the EP group; see
                 ``moe.utils.use_deepep_low_latency``.
+            overlap_fn: Optional work to run inside an all-to-all EP dispatch
+                window; ignored by plans that own no dispatch legs.
         """
         if not do_finalize and not self.supports_deferred_finalize:
             raise AssertionError("MoELayer does not support do_finalize=False")
@@ -319,6 +324,7 @@ class MoELayer(torch.nn.Module):
                 do_finalize=do_finalize,
                 enable_pdl=pdl_enabled(),
                 low_latency=low_latency,
+                overlap_fn=overlap_fn,
             )
         else:
             return tokenspeed_kernel.moe_apply(
@@ -333,4 +339,5 @@ class MoELayer(torch.nn.Module):
                 do_finalize=do_finalize,
                 enable_pdl=pdl_enabled(),
                 low_latency=low_latency,
+                overlap_fn=overlap_fn,
             )

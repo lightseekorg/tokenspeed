@@ -17,6 +17,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+from collections.abc import Callable
 from typing import Any
 
 # Backend registration (side-effect imports)
@@ -282,6 +283,7 @@ def moe_apply(
     enable_pdl: bool = False,
     # all-to-all EP
     low_latency: bool | None = None,
+    overlap_fn: Callable[[], None] | None = None,
 ):
     """Apply a planned MoE kernel.
 
@@ -304,6 +306,10 @@ def moe_apply(
             throughput-optimized ones (extend-shaped batches). Every rank of the
             EP group must pass the same value, since the two legs are different
             collectives.
+        overlap_fn: Only forwarded to all-to-all EP plans. Work queued here runs
+            inside the dispatch window (tokens sent, not yet awaited), so it
+            overlaps the transfer. It must not read the dispatch result or write
+            ``x``.
 
     Solutions may use precomputed top-k tensors or route from logits directly.
     """
@@ -316,7 +322,7 @@ def moe_apply(
     # Only the all-to-all EP kernels own dispatch/combine legs, so the mode
     # decision stays off the signature every other apply kernel implements.
     a2a_kwargs = (
-        {"low_latency": low_latency}
+        {"low_latency": low_latency, "overlap_fn": overlap_fn}
         if _uses_all_to_all_ep(plan.get("a2a_backend"))
         else {}
     )
