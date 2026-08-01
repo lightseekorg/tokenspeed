@@ -1,0 +1,101 @@
+api_version: ci.tokenspeed.io/v1
+# Kimi-K3 + DSpark speculative decoding. Deliberately a separate job from
+# perf-kimi-k3-mxfp4-tp8ep8-random-4k-1k-mi35x, which tracks pure-target K3
+# performance and must stay speculator-free (Issue #879).
+name: perf-kimi-k3-dspark-mxfp4-tp8ep8-random-4k-1k-mi35x
+type: perf
+triggers:
+  - manual
+runner:
+  labels:
+    - amd-mi35x-8gpu-test
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps_rocm.sh
+server:
+  command: >-
+    ts serve
+    --model moonshotai/Kimi-K3
+    --served-model-name kimi-k3
+    --speculative-algorithm DSPARK
+    --speculative-draft-model-path Inferact/Kimi-K3-DSpark
+    --speculative-num-draft-tokens 8
+    --tp 8
+    --ep-size 8
+    --attention-backend mla
+    --drafter-attention-backend mla
+    --moe-backend auto
+    --kv-cache-dtype fp8
+    --mm-encoder-tp-mode data
+    --max-model-len 8192
+    --max-num-seqs 1
+    --max-cudagraph-capture-size 1
+    --cudagraph-capture-sizes 1
+    --disable-prefill-graph
+    --gpu-memory-utilization 0.92
+    --trust-remote-code
+    --sampling-backend greedy
+    --disable-kvstore
+    --kvstore-ratio 0.0
+    --no-enable-prefix-caching
+    --enable-cache-report
+    --host 127.0.0.1
+    --port 21000
+    --policy round_robin
+    --engine-startup-timeout 3000
+    --gateway-startup-timeout 600
+  ready:
+    url: http://127.0.0.1:21000/readiness
+    timeout: 3600
+    interval: 10
+perf:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
+  command: >-
+    REPO_ROOT=$PWD &&
+    MODEL=kimi-k3 &&
+    URL=http://127.0.0.1:21000/v1/completions &&
+    OUTPUTS_DIR=/tmp/tokenspeed-kimi-k3-dspark-mi35x-perf &&
+    trap 'rm -rf "$OUTPUTS_DIR"' EXIT &&
+    rm -rf "$OUTPUTS_DIR" &&
+    set +e &&
+    echo "==================================================" &&
+    echo ">>> DSpark input=4k output=1k conc=1" &&
+    echo "==================================================" &&
+    /tmp/evalscope-perf/bin/evalscope perf
+    --model "$MODEL"
+    --url "$URL"
+    --api openai
+    --dataset random
+    --tokenizer-path moonshotai/Kimi-K3
+    --min-prompt-length 4096
+    --max-prompt-length 4096
+    --prefix-length 0
+    --min-tokens 1024
+    --max-tokens 1024
+    --parallel 1
+    --number 1
+    --warmup-num 0
+    --rate -1
+    --seed 1
+    --temperature 0
+    --stream
+    --outputs-dir "$OUTPUTS_DIR/input_4k"
+    --no-timestamp
+    --extra-args '{"ignore_eos": true}';
+    PERF_STATUS=$?;
+    python3 "$REPO_ROOT/test/random_benchmark/tokenspeed/collect_outputs.py" "$OUTPUTS_DIR" --num-gpus 8 --emit-csv;
+    PARSE_STATUS=$?;
+    echo "=== DSpark speculative decoding metrics ===";
+    curl -s http://127.0.0.1:21000/metrics | grep -E 'spec_|accept|draft' || true;
+    if [ "$PERF_STATUS" -ne 0 ]; then exit "$PERF_STATUS"; fi;
+    exit "$PARSE_STATUS"
+report:
+  github_step_summary: true
+perf_threshold: 0.9
+# Values are [Latency (tps/user), Throughput (tps/gpu)].
+# Left unset until the first green end-to-end run measures them: a guessed
+# reference would either gate on noise or never fail. The pure-K3 baseline this
+# must beat is 43.05 / 5.26 on the same topology.
+perf_reference: {}

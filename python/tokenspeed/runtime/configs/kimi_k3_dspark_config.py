@@ -152,6 +152,23 @@ class KimiK3DSparkConfig(PretrainedConfig):
         return float(params.get("rope_theta", self.rope_theta))
 
 
+def k3_dspark_inactive_features(config: KimiK3DSparkConfig) -> list[str]:
+    """Optional checkpoint features this build loads but does not act on.
+
+    Issue #879 asks for these to be stated rather than silently dropped: a user
+    who trained a confidence head is entitled to know the scheduler is ignoring
+    it and every request is verifying the full block.
+    """
+    inactive = []
+    if config.enable_confidence_head:
+        inactive.append(
+            "confidence_head: present in the checkpoint but unused. Verify is "
+            "static (the full block is verified every step); confidence-scheduled "
+            "ragged verify is not implemented."
+        )
+    return inactive
+
+
 def validate_k3_dspark_config(config: KimiK3DSparkConfig, target_config=None) -> None:
     """Fail a mis-specified draft at startup rather than at the first token.
 
