@@ -1328,6 +1328,14 @@ class ModelExecutor:
                 )
 
     def update_block_table(self, forward_op) -> ModelExecutionResult:
+        # Group-aware backends consume CacheBatchMetadata directly. Without a
+        # full-history group there is no unambiguous table to mirror into the
+        # legacy single-table req_to_page view.
+        if (
+            self._cache_runtime_contract is not None
+            and self._full_history_group_id is None
+        ):
+            return
         # Update page tables on the default stream before switching to execution stream.
         # HostTodevice segment begins
         with nvtx_range("update_block_table", color="cyan"):
