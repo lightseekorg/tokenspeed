@@ -29,7 +29,7 @@ import dataclasses
 import glob
 import os
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Generator, Iterable, Iterator
+from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager
 from typing import Any, cast
 
@@ -67,7 +67,7 @@ from tokenspeed.runtime.utils import get_colorful_logger, is_pin_memory_availabl
 @contextmanager
 def device_loading_context(
     module: torch.nn.Module, target_device: torch.device
-) -> Iterator[torch.nn.Module]:
+) -> Generator[torch.nn.Module]:
     if target_device.type == "cpu":
         # If target is CPU, no need to move anything
         yield module

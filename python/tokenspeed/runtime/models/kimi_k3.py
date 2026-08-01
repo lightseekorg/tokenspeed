@@ -955,8 +955,9 @@ class KimiLinearMoE(nn.Module):
                     )
                 # Out-of-box tactics: seed the autotuner from the in-tree
                 # swept table for this GPU/flashinfer combo, if one ships
-                # (flashinfer's own tuner mispicks MoE tactics at prefill
-                # batch sizes). A lookup miss leaves lazy autotuning in place.
+                # (flashinfer's own heuristic mispicks MoE tactics at prefill
+                # batch sizes). A lookup miss leaves the startup autotune
+                # window to tune these shapes.
                 load_packaged_flashinfer_tuning_cache(
                     "kimi-k3", mapping.moe.ep_size, mapping.moe.tp_size
                 )

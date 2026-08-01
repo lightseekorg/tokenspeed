@@ -122,7 +122,7 @@ class DummyGroupTablesTest(unittest.TestCase):
                 SimpleNamespace(group_id="linear_attention"),  # state: included
             )
         )
-        tables = self._bare(backend, pool)._dummy_group_tables(100)
+        tables = self._bare(backend, pool)._dummy_group_tables(100, 1)
         self.assertEqual(
             set(tables),
             {"full_attention", "sliding_attention", "linear_attention"},
@@ -148,7 +148,7 @@ class DummyGroupTablesTest(unittest.TestCase):
         pool = SimpleNamespace(
             paged_cache_group_specs=(SimpleNamespace(group_id="full_attention"),)
         )
-        tables = self._bare(backend, pool)._dummy_group_tables(100)
+        tables = self._bare(backend, pool)._dummy_group_tables(100, 1)
         self.assertEqual(tables["full_attention"].shape, (1, 2500))
 
     def test_composite_wrapper_resolves_grouped_cache_child(self):
@@ -165,14 +165,14 @@ class DummyGroupTablesTest(unittest.TestCase):
                 SimpleNamespace(group_id="linear_attention"),
             )
         )
-        tables = self._bare(wrapper, pool)._dummy_group_tables(64)
+        tables = self._bare(wrapper, pool)._dummy_group_tables(64, 1)
         self.assertEqual(set(tables), {"full_attention", "linear_attention"})
         self.assertEqual(tables["full_attention"].shape, (1, 2))
 
     def test_backend_without_cache_groups_is_empty(self):
         backend = SimpleNamespace(uses_cache_groups=False)
         pool = SimpleNamespace(paged_cache_group_specs=())
-        self.assertEqual(self._bare(backend, pool)._dummy_group_tables(64), {})
+        self.assertEqual(self._bare(backend, pool)._dummy_group_tables(64, 1), {})
 
     def test_runtime_contract_pool_is_eligible_for_capture(self):
         from unittest import mock
@@ -206,7 +206,7 @@ class DummyGroupTablesTest(unittest.TestCase):
             )
 
         self.assertFalse(graph.disable)
-        capture.assert_called_once()
+        capture.assert_not_called()
 
 
 class TrtllmPrefillGraphSeamsTest(unittest.TestCase):

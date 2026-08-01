@@ -24,10 +24,7 @@ import logging
 import math
 
 import torch
-from tokenspeed_kernel.ops.tuning import (
-    autotune_frozen,
-    flashinfer_tuning_cache_active,
-)
+from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -39,7 +36,6 @@ from tokenspeed_kernel.signature import format_signatures
 logger = logging.getLogger(__name__)
 
 platform = current_platform()
-next_power_of_2 = lambda value: 1 if value <= 1 else 1 << (value - 1).bit_length()
 
 _permute_indices_cache: dict[tuple[str, torch.Size], torch.Tensor] = {}
 _permute_indices_device_cache: dict[
@@ -115,7 +111,6 @@ if platform.is_nvidia:
         nvfp4_block_scale_interleave,
         trtllm_fp4_block_scale_moe,
     )
-    from flashinfer.autotuner import autotune
     from flashinfer.fused_moe.core import (
         _maybe_get_cached_w3_w1_permute_indices as maybe_get_cached_w3_w1_permute_indices,
     )
@@ -141,16 +136,6 @@ if platform.is_nvidia:
         _fi_fp4_routed_moe = None
         _SITU_ACTIVATION_TYPE = None
         _situ_import_error = exc
-
-    # Fixed, never derived from the live batch: flashinfer's autotuner cache
-    # keys embed the token-bucket ladder generated from tune_max, so one
-    # constant keeps runtime lookups matching entries written by the offline
-    # MoE tactic sweeper (benchmark/moe_tactic_sweep) at every batch size.
-    SITU_TUNE_MAX_NUM_TOKENS = 8192
-
-    # Process-wide "the lazy full-ladder autotune pass has run" flag; see the
-    # use site in flashinfer_trtllm_mxfp4_situ_routed_moe_apply.
-    _situ_ladder_tuned = False
 
     def _get_device_permute_indices(
         x: torch.Tensor,
@@ -442,7 +427,7 @@ if platform.is_nvidia:
             routed_scaling_factor=None,
             routing_method_type=1,
             do_finalize=True,
-            tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
+            tune_max_num_tokens=get_autotune_max_num_tokens(),
             output=output,
         )[0]
 
@@ -505,7 +490,7 @@ if platform.is_nvidia:
             do_finalize=True,
             enable_pdl=enable_pdl,
             activation_type=_SITU_ACTIVATION_TYPE,
-            tune_max_num_tokens=SITU_TUNE_MAX_NUM_TOKENS,
+            tune_max_num_tokens=get_autotune_max_num_tokens(),
             output=output,
         )
         return output
@@ -591,16 +576,6 @@ if platform.is_nvidia:
         output = torch.empty(
             x_quant.shape[0], h_dim, dtype=torch.bfloat16, device=x_quant.device
         )
-
-        # Autotune per pow-2 token class, frozen once serving starts (see ops.tuning).
-        if not hasattr(w, "_flashinfer_trtllm_autotuned_sizes"):
-            w._flashinfer_trtllm_autotuned_sizes = set()
-        tuned_sizes = w._flashinfer_trtllm_autotuned_sizes
-        size_class = next_power_of_2(x_quant.shape[0])
-        if size_class not in tuned_sizes and not autotune_frozen():
-            with autotune():
-                _call_mxfp4_moe(w, router_logits, x_quant, x_scale, output)
-            tuned_sizes.add(size_class)
 
         result = _call_mxfp4_moe(w, router_logits, x_quant, x_scale, output)
         if hidden_original != hidden_padded:
@@ -703,33 +678,10 @@ if platform.is_nvidia:
             output = torch.empty(
                 x.shape[0], hidden_padded, dtype=torch.bfloat16, device=x.device
             )
-        # With a pre-swept table loaded (flashinfer_tuning_cache_active) every
-        # bucket's tactic comes from the cache and no tuning context is ever
-        # entered. Without one, a single lazy pass tunes the whole token-bucket
-        # ladder (the fixed SITU_TUNE_MAX_NUM_TOKENS pins one bucket layout),
-        # frozen once serving starts (see ops.tuning) and never run while a
-        # CUDA graph is capturing. The flag is process-wide, not per-module:
-        # all layers share one op cache, and entering tuning mode costs seconds
-        # even on full cache hits -- per layer that stalls startup for minutes.
-        global _situ_ladder_tuned
-        if (
-            not _situ_ladder_tuned
-            and not flashinfer_tuning_cache_active()
-            and not autotune_frozen()
-            and not torch.cuda.is_current_stream_capturing()
-        ):
-            with autotune():
-                _call_mxfp4_situ_routed_moe(
-                    w,
-                    topk_weights,
-                    topk_ids,
-                    x,
-                    output,
-                    enable_pdl,
-                    hidden_states_scale=hidden_states_scale,
-                )
-            _situ_ladder_tuned = True
-
+        # Tactics come from the autotuner cache, seeded by a pre-swept table
+        # and/or the runtime's startup autotune window (which exercises this
+        # op via the dummy prefill); uncovered shapes take the heuristic
+        # fallback. Serving never enters a tuning context.
         result = _call_mxfp4_situ_routed_moe(
             w,
             topk_weights,
