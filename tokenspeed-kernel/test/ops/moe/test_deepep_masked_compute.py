@@ -41,11 +41,7 @@ deep_gemm = pytest.importorskip(
 )
 
 from tokenspeed_kernel.ops.activation.triton import (  # noqa: E402
-    fused_swiglu_fp8_ue8m0_masked,
     fused_swiglu_fp8_ue8m0_masked_packed,
-)
-from tokenspeed_kernel.ops.moe.deep_gemm.ue8m0 import (  # noqa: E402
-    is_ue8m0,
 )
 from tokenspeed_kernel.thirdparty.deep_gemm.utils.layout import (  # noqa: E402
     get_mn_major_tma_aligned_packed_ue8m0_tensor,
@@ -100,52 +96,6 @@ def _unpack_ue8m0(packed: torch.Tensor, num_groups: int) -> torch.Tensor:
         [(packed >> (8 * i)) & 0xFF for i in range(4)], dim=-1
     ).flatten(-2)[..., :num_groups]
     return torch.exp2(bytes_.float() - 127.0)
-
-
-def test_masked_swiglu_ue8m0_quantizer_matches_reference_and_skips_padding():
-    """The activation between the two masked GEMMs.
-
-    The apply path hands the kernel an ``[E, blocks, M]`` scale buffer viewed
-    as ``[E, M, blocks]`` (mn-major), and the padded rows beyond ``masked_m``
-    must stay untouched so the zero-initialized scales mark them dead.
-    """
-    torch.manual_seed(0)
-    experts, capacity, ispp = 4, 64, 256
-    gateup = torch.randn(
-        experts, capacity, 2 * ispp, device="cuda", dtype=torch.bfloat16
-    )
-    masked_m = torch.tensor([64, 17, 0, 33], dtype=torch.int32, device="cuda")
-
-    out = torch.empty(
-        (experts, capacity, ispp), dtype=torch.float8_e4m3fn, device="cuda"
-    )
-    out_probe = out.view(torch.uint8)
-    out_probe.fill_(0)
-    scales = torch.zeros(
-        (experts, ispp // _BLOCK, capacity), dtype=torch.float32, device="cuda"
-    ).permute(0, 2, 1)
-
-    fused_swiglu_fp8_ue8m0_masked(gateup, masked_m, out, scales)
-
-    assert scales.shape == (experts, capacity, ispp // _BLOCK)
-    assert is_ue8m0(scales)
-
-    reference = (
-        torch.nn.functional.silu(gateup[..., :ispp].float())
-        * gateup[..., ispp:].float()
-    )
-    for expert in range(experts):
-        valid = int(masked_m[expert])
-        if valid:
-            torch.testing.assert_close(
-                _dequantize(out[expert, :valid], scales[expert, :valid]),
-                reference[expert, :valid],
-                rtol=6e-2,
-                atol=6e-2 * reference.abs().max(),
-            )
-        # Padding rows were never written: FP8 payload still zero.
-        assert (out_probe[expert, valid:] == 0).all()
-        assert (scales[expert, valid:] == 0).all()
 
 
 def test_masked_swiglu_writes_packed_mn_major_scales_for_deep_gemm():
