@@ -1037,7 +1037,9 @@ class Qwen3_5ForCausalLM(nn.Module):
         if input_embeds is None:
             # Only skip embedding allreduce when the first layer's fused
             # allreduce+residual+norm will handle it
-            if self.layers[0].comm_manager.should_fuse(input_ids.shape[0]):
+            if self.embed_tokens.tp_size > 1 and self.layers[
+                0
+            ].comm_manager.should_fuse(input_ids.shape[0]):
                 hidden_states = self.embed_tokens(input_ids, reduce_results=False)
                 residual = torch.zeros_like(hidden_states)
             else:

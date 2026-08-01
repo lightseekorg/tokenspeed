@@ -332,6 +332,27 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         # EAGLE3-only optimization (see deepseek_v3.py:2063, llama_eagle3.py).
         return None
 
+    def checkpoint_weight_name_filter(self, name: str) -> bool:
+        """Shard preselection for ``load_weights`` (see DefaultModelLoader).
+
+        Accepts a superset of the checkpoint names ``load_weights`` consumes:
+        the NextN layer(s) stored at/after ``num_hidden_layers``, or the
+        whole checkpoint when it is a standalone draft.
+        """
+        num_nextn_layers = getattr(self.config, "num_nextn_predict_layers", None)
+        if num_nextn_layers == self.config.num_hidden_layers:
+            # Standalone draft checkpoint: every shard holds draft weights.
+            return True
+        if not name.startswith("model.layers."):
+            return False
+        name_list = name.split(".")
+        if len(name_list) < 3:
+            return False
+        try:
+            return int(name_list[2]) >= self.config.num_hidden_layers
+        except ValueError:
+            return False
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)

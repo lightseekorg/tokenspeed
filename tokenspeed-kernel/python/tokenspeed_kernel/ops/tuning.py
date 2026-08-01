@@ -20,27 +20,198 @@
 
 """Kernel autotune lifecycle.
 
-Ops that autotune lazily (e.g. the flashinfer trtllm MoE) consult
-:func:`autotune_frozen` before starting a new tuning run. The runtime calls
-:func:`freeze_autotuning` once engine startup (model load, CUDA-graph capture,
-warmup) completes, because an autotune during serving is a hazard twice over:
-it blocks the launch thread for the whole profiling run, and under tensor
+Tunable kernels (the flashinfer MoE and GEMM families) profile their candidate
+tactics only while the tuning window is open, and take each library's heuristic
+tactic otherwise. The runtime opens exactly one window during engine startup,
+around a dummy forward at the largest token count it will ever serve, and closes
+it before any CUDA-graph capture -- a captured graph records the tactic chosen
+at capture time, so tuning afterwards cannot change a replay.
+
+The window is CLOSED by default. Tuning during serving would be a hazard twice
+over: it blocks the launch thread for the whole profiling run, and under tensor
 parallelism ranks that tune at different times miss their next collective and
-deadlock. Shapes first seen after the freeze run on each library's fallback
+deadlock. Shapes first seen outside the window run on each library's fallback
 tactics instead -- slower, never stalled.
+
+:func:`load_flashinfer_tuning_cache` seeds the flashinfer autotuner from a
+pre-swept tactic table before the window opens. Entries loaded from the
+table win over live profiling, so covered shapes skip their startup tuning
+pass entirely -- and every rank loading the same table picks the same tactics,
+removing the rank-divergence hazard above for covered shapes.
 """
 
-__all__ = ["autotune_frozen", "freeze_autotuning"]
+import contextlib
+import functools
+import logging
+import os
+from collections.abc import Generator
 
-_frozen = False
+__all__ = [
+    "autotune",
+    "get_autotune_max_num_tokens",
+    "load_flashinfer_tuning_cache",
+    "load_packaged_flashinfer_tuning_cache",
+    "set_autotune_max_num_tokens",
+]
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_AUTOTUNE_MAX_NUM_TOKENS = 8192
+
+_autotune_max_num_tokens = _DEFAULT_AUTOTUNE_MAX_NUM_TOKENS
 
 
-def autotune_frozen() -> bool:
-    """Whether lazy autotuning is frozen (engine is serving)."""
-    return _frozen
+def set_autotune_max_num_tokens(num_tokens: int) -> None:
+    """Set the token count MoE tuning buckets are generated up to.
+
+    Call once at startup, before :func:`autotune` is first entered. The value must stay
+    constant for the process lifetime: flashinfer builds the bucket *mapper*
+    from it and consults that mapper on every serving call to compute the
+    tactic cache key, so a value derived from the current batch makes lookups
+    resolve to the wrong bucket.
+
+    Args:
+        num_tokens: Largest token count a single forward can carry (the
+            runtime's ``chunked_prefill_size``). Raised to flashinfer's own
+            default floor when smaller.
+    """
+    global _autotune_max_num_tokens
+    _autotune_max_num_tokens = max(int(num_tokens), _DEFAULT_AUTOTUNE_MAX_NUM_TOKENS)
 
 
-def freeze_autotuning() -> None:
-    """Disallow any further lazy autotune runs (call once startup completes)."""
-    global _frozen
-    _frozen = True
+def get_autotune_max_num_tokens() -> int:
+    """Token count MoE tuning buckets are generated up to.
+
+    Returns:
+        The value set by :func:`set_autotune_max_num_tokens`, or the default floor.
+    """
+    return _autotune_max_num_tokens
+
+
+@contextlib.contextmanager
+def autotune() -> Generator[None]:
+    """Enable kernel autotuning for the enclosed block, process-wide.
+
+    Kernels invoked inside the block profile their candidate tactics and cache
+    the winner per shape bucket; outside it they are a cache lookup with a
+    heuristic fallback. A no-op when the tuning backend is unavailable.
+
+    Yields:
+        ``None``; tuning is disabled again when the block exits, including on
+        error.
+    """
+    try:
+        from flashinfer.autotuner import autotune as _flashinfer_autotune
+    except ImportError:
+        yield
+        return
+    with _flashinfer_autotune():
+        yield
+
+
+def load_flashinfer_tuning_cache(path: str) -> bool:
+    """Seed flashinfer's autotuner from a pre-swept tactic table.
+
+    The table is a flashinfer ``save_configs()`` JSON whose ``_metadata``
+    records the exact environment it was swept on (GPU device name,
+    flashinfer/CUDA/cuBLAS/cuDNN versions); ``load_configs`` refuses the whole
+    file on any mismatch, so a table from a different GPU model can never be
+    applied silently.
+
+    Args:
+        path: Path to the JSON table (produced by the MoE tactic sweeper or
+            ``AutoTuner.save_configs``).
+
+    Returns:
+        True when the table was loaded; False for every failure mode --
+        missing file, unimportable flashinfer, or an environment-metadata
+        mismatch. Failures log a warning and leave the startup autotune
+        window to tune those shapes rather than failing startup.
+    """
+    try:
+        from flashinfer.autotuner import AutoTuner
+    except ImportError as exc:
+        logger.warning(f"flashinfer tuning cache not loaded (no flashinfer): {exc}")
+        return False
+    try:
+        loaded = AutoTuner.get().load_configs(path)
+    except FileNotFoundError:
+        logger.warning(
+            f"flashinfer tuning cache {path} not found; the startup autotune "
+            "window will tune instead"
+        )
+        return False
+    except Exception:
+        logger.warning(
+            f"flashinfer tuning cache {path} failed to load; the startup "
+            "autotune window will tune instead",
+            exc_info=True,
+        )
+        return False
+    if not loaded:
+        # load_configs already logged the mismatch details; restate the
+        # consequence at warning level so it is visible in serving logs.
+        logger.warning(
+            f"flashinfer tuning cache {path} rejected: environment metadata "
+            "(GPU model / flashinfer / CUDA versions) does not match this "
+            "host; the startup autotune window will tune instead. Re-run the "
+            "MoE tactic sweeper on this environment to regenerate it."
+        )
+        return False
+    logger.info(f"flashinfer tuning cache loaded from {path}")
+    return True
+
+
+@functools.cache
+def load_packaged_flashinfer_tuning_cache(
+    model: str, ep_size: int, tp_size: int
+) -> bool:
+    """Load the in-tree tactic table for this model/layout/device, if one ships.
+
+    Tables live as package data under ``ops/moe/flashinfer/tactics/`` named
+    vLLM-configs style::
+
+        <model>,ep=<N>,tp=<N>,device_name=<GPU with spaces as _>,flashinfer=<ver>.json
+
+    EP and MoE-TP together pin the swept workload shape (local expert count
+    and per-partition intermediate size), and the exact GPU device name and
+    installed flashinfer version are part of the name, so a lookup can only
+    ever find a table swept for this precise environment; the table's embedded
+    metadata re-checks the version facts at load. A miss is normal for layouts
+    no table has been swept on and logs at INFO. Cached per layout: call sites
+    run per-layer, the load must not.
+
+    Args:
+        model: Model slug used in the table filename (e.g. ``"kimi-k3"``).
+        ep_size: Expert-parallel world size of the serving layout.
+        tp_size: MoE tensor-parallel size of the serving layout.
+
+    Returns:
+        True when a matching packaged table was found and loaded.
+    """
+    try:
+        import torch
+
+        device_name = torch.cuda.get_device_name().replace(" ", "_")
+        from importlib.metadata import version
+
+        fi_version = version("flashinfer-python")
+    except Exception as exc:
+        logger.info(f"packaged tuning-cache lookup skipped: {exc}")
+        return False
+    from tokenspeed_kernel.ops.moe import flashinfer as _fi_pkg
+
+    name = (
+        f"{model},ep={ep_size},tp={tp_size},"
+        f"device_name={device_name},flashinfer={fi_version}.json"
+    )
+    path = os.path.join(os.path.dirname(_fi_pkg.__file__), "tactics", name)
+    if not os.path.exists(path):
+        logger.info(
+            f"no packaged flashinfer tuning cache for this environment "
+            f"(looked for {name}); the startup autotune window will tune "
+            "instead. Sweep one with benchmark/moe_tactic_sweep to pin "
+            "tactics."
+        )
+        return False
+    return load_flashinfer_tuning_cache(path)

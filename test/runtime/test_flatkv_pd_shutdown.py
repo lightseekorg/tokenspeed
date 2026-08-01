@@ -86,6 +86,9 @@ class _EventLoopHarness:
     def _commit_cache_results(self) -> None:
         self.trace.append("commit_cache")
 
+    def _publish_scheduler_aborts(self, _execution_plan) -> None:
+        self.trace.append("publish_aborts")
+
     def _publish_scheduler_kv_events(self) -> None:
         self.trace.append("publish_kv")
 
@@ -130,6 +133,7 @@ def test_event_loop_finishes_current_iteration_then_observes_shutdown() -> None:
         "drain_epd",
         "commit_cache",
         "next_plan",
+        "publish_aborts",
         "publish_kv",
         "handle_oom",
         "zero_pages",

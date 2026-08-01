@@ -63,9 +63,9 @@ Scheduler::Scheduler(SchedulerConfig config)
       req_pool_allocator_{config_.max_batch_size}
 #if TOKENSPEED_FLAT_KVCACHE
       ,
-      block_pool_{config_.device_allocator.total_pages},
-      flat_host_pool_{config_.FlatStreamingSinkEnabled() ? config_.host_allocator.total_pages : 1},
-      coordinator_{MakeCoordinator(MakeSpecsFromConfig(config_), block_pool_,
+      block_pool_{config_.device_allocator.total_pages - 1},
+      flat_host_pool_{config_.FlatStreamingSinkEnabled() ? config_.host_allocator.total_pages - 1 : 0},
+      coordinator_{MakeCoordinator(MakeSpecsFromConfig(config_), config_.block_size, block_pool_,
                                    config_.FlatStreamingSinkEnabled() ? &flat_host_pool_ : nullptr)},
       flat_group_ids_{[&] {
           std::vector<std::string> ids;
@@ -87,24 +87,11 @@ Scheduler::Scheduler(SchedulerConfig config)
         throw std::invalid_argument("Scheduler: overlapped decode requires decode_input_tokens > 0");
     }
 #if TOKENSPEED_FLAT_KVCACHE
-    if (config_.enable_flatkv_pd) {
-        if (config_.role == Role::kFused) {
-            throw std::invalid_argument("Scheduler: enable_flatkv_pd requires Prefill or Decode role");
-        }
-        if (config_.paged_cache_groups.empty()) {
-            throw std::invalid_argument("Scheduler: enable_flatkv_pd requires paged_cache_groups");
-        }
-        if (config_.decode_input_tokens != 1) {
-            throw std::invalid_argument("Scheduler: FlatKV PD currently requires decode_input_tokens == 1");
-        }
-        if (config_.overlap_schedule_depth != 0 && config_.role != Role::kD) {
-            throw std::invalid_argument("Scheduler: FlatKV PD overlap requires the Decode role");
-        }
+    if (coordinator_.HasMambaStateGroup() && config_.max_scheduled_tokens < coordinator_.CacheBlockTokens()) {
+        throw std::invalid_argument("Scheduler: flat Mamba max_scheduled_tokens must cover one state CacheBlock");
     }
-#else
-    if (config_.enable_flatkv_pd) {
-        throw std::invalid_argument("Scheduler: enable_flatkv_pd requires a TOKENSPEED_FLAT_KVCACHE build");
-    }
+#endif
+#if !TOKENSPEED_FLAT_KVCACHE
     radix_page_table_emissions_.resize(static_cast<std::size_t>(config_.max_batch_size) + 1);
 #endif
     if (auto* env = std::getenv("SPDLOG_LEVEL")) {
@@ -149,6 +136,25 @@ Scheduler::Scheduler(SchedulerConfig config)
             PagedCacheGroupConfig copy = cfg;
             copy.Validate();
             hybrid_prefix_cache_->RegisterPagedCacheGroup(std::make_unique<PagedCacheGroupAllocator>(std::move(copy)));
+        }
+        std::unordered_set<std::string> registered_paged_group_ids;
+        for (const auto& cfg : config_.paged_cache_groups) {
+            registered_paged_group_ids.insert(cfg.group_id);
+            auto host_it = config_.paged_cache_host_group_pages.find(cfg.group_id);
+            if (host_it == config_.paged_cache_host_group_pages.end() || host_it->second <= 0) {
+                continue;
+            }
+            PagedCacheGroupConfig host_copy = cfg;
+            host_copy.total_pages = host_it->second;
+            host_copy.Validate();
+            hybrid_prefix_cache_->RegisterPagedCacheHostGroup(
+                std::make_unique<PagedCacheGroupAllocator>(std::move(host_copy)));
+        }
+        for (const auto& [gid, _] : config_.paged_cache_host_group_pages) {
+            if (registered_paged_group_ids.find(gid) == registered_paged_group_ids.end()) {
+                throw std::invalid_argument("Scheduler: paged_cache_host_group_pages references unknown group_id '" +
+                                            gid + "'");
+            }
         }
 
         if (has_prefix_cache_adjunct) {
@@ -214,20 +220,7 @@ std::vector<std::string> Scheduler::CalcRollingHash(const std::vector<std::int32
 }
 
 void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
-#if TOKENSPEED_FLAT_KVCACHE
-    // The content-hash chain and base-slot indexing run at base (GCD) granularity; the
-    // coordinator folds base pages up to each group's block_size. Uniform block_size =>
-    // base == block_size.
-    const std::int32_t page_size = config_.BaseBlockSize();
-#else
     const std::int32_t page_size = config_.block_size;
-#endif
-    std::unordered_set<std::string> batch_ids;
-    for (const auto& spec : request_specs) {
-        if (!batch_ids.insert(spec.request_id).second || requests_.contains(spec.request_id)) {
-            throw std::invalid_argument("Scheduler: duplicate active request_id '" + spec.request_id + "'");
-        }
-    }
     for (const auto& spec : request_specs) {
         auto req = std::make_unique<Request>(spec, page_size, config_.role);
         requests_.emplace(spec.request_id, std::move(req));
@@ -237,7 +230,7 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
 std::size_t Scheduler::WaitingSize() const {
     std::size_t count = 0;
     for (const auto& [id, req] : requests_) {
-        if (req->Is<fsm::Submitted>() || (config_.enable_flatkv_pd && req->Is<fsm::Bootstrapping>())) {
+        if (req->Is<fsm::Submitted>()) {
             count++;
         }
     }
@@ -277,13 +270,17 @@ std::size_t Scheduler::RetractedSize() const {
 std::size_t Scheduler::AvailableKvPages() const {
 #if TOKENSPEED_FLAT_KVCACHE
     // The flat path never draws from the radix device_allocator_, so reporting it would show a
-    // permanently-full pool to Python monitoring. Report the flat BlockPool instead: one flat
-    // block is one pool row, interpreted at each group's own block_size. Block 0 is the
-    // never-allocated null placeholder, so an idle pool reports total_pages - 1.
-    return static_cast<std::size_t>(block_pool_.NumFreeBlocks());
+    // permanently-full pool to Python monitoring. Report available LCM parents from the flat
+    // BlockPool instead. Parent 0 is the never-allocated null placeholder, so an idle pool
+    // reports total parents minus one.
+    return static_cast<std::size_t>(coordinator_.NumAvailableLcmBlocks());
 #else
     return device_allocator_.AvailablePages();
 #endif
+}
+
+std::size_t Scheduler::AvailableHostKvPages() const {
+    return host_allocator_.AvailablePages();
 }
 
 std::size_t Scheduler::ActiveKvPages() const {
@@ -328,6 +325,27 @@ std::int64_t Scheduler::PagedCacheGroupFailedAllocCount(const std::string& group
     return hybrid_prefix_cache_->PagedCacheGroupFailedAllocCount(group_id);
 }
 
+std::int32_t Scheduler::PagedCacheHostGroupTotalPages(const std::string& group_id) const {
+    if (!hybrid_prefix_cache_) {
+        throw std::out_of_range("Scheduler::PagedCacheHostGroupTotalPages: group_id not configured");
+    }
+    return hybrid_prefix_cache_->PagedCacheHostGroupTotalPages(group_id);
+}
+
+std::int32_t Scheduler::PagedCacheHostGroupAvailablePages(const std::string& group_id) const {
+    if (!hybrid_prefix_cache_) {
+        throw std::out_of_range("Scheduler::PagedCacheHostGroupAvailablePages: group_id not configured");
+    }
+    return hybrid_prefix_cache_->PagedCacheHostGroupAvailablePages(group_id);
+}
+
+std::int64_t Scheduler::PagedCacheHostGroupFailedAllocCount(const std::string& group_id) const {
+    if (!hybrid_prefix_cache_) {
+        throw std::out_of_range("Scheduler::PagedCacheHostGroupFailedAllocCount: group_id not configured");
+    }
+    return hybrid_prefix_cache_->PagedCacheHostGroupFailedAllocCount(group_id);
+}
+
 std::vector<std::int32_t> Scheduler::GetRequestPagedCachePageIds(const std::string& request_id,
                                                                  const std::string& group_id) const {
     if (!hybrid_prefix_cache_) {
@@ -368,21 +386,25 @@ std::vector<WriteBackOperation> Scheduler::newWriteBackOperation(
         return ops;
     }
     for (auto& [id, req] : requests) {
-        if (!req->Is<fsm::Draining>()) continue;
+        if (!req->Is<fsm::Draining>() || (!deferred_aborts_.empty() && deferred_aborts_.contains(id))) continue;
         const auto& pages_to_transfer = req->GetPagesToTransfer<fsm::Draining>();
+        const auto& paged_cache_transfers = req->GetPagedCacheWriteBackTransfers<fsm::Draining>();
 
-        if (!pages_to_transfer.empty()) {
+        if (!pages_to_transfer.empty() || !paged_cache_transfers.empty()) {
             cache_op_id op_id = kv_prefix_cache_.AllocateCacheOpId();
             CacheOpSpec spec;
             spec.request_id = id;
+            spec.paged_cache_nodes = req->GetPagedCacheWriteBackNodes<fsm::Draining>();
             cache_op_tracker_[op_id] = std::move(spec);
             ops.push_back(WriteBackOperation{
-                op_id, std::vector<TransferPair>(pages_to_transfer.begin(), pages_to_transfer.end())});
+                op_id, std::vector<TransferPair>(pages_to_transfer.begin(), pages_to_transfer.end()),
+                std::vector<PagedCacheTransferPair>(paged_cache_transfers.begin(), paged_cache_transfers.end())});
             req->Apply(fsm::CommitDrainingEvent{});
         } else {
-            req->Apply(fsm::AbortEvent{
+            req->Apply(fsm::AbortEvent{&kv_prefix_cache_, hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr
 #if TOKENSPEED_FLAT_KVCACHE
-                &coordinator_
+                                       ,
+                                       &coordinator_
 #endif
             });
         }
@@ -396,9 +418,10 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     std::vector<WriteBackOperation> write_back_ops;
     write_back_ops = std::move(newWriteBackOperation(requests_));
 
+    const bool has_deferred_aborts = !deferred_aborts_.empty();
     if (hybrid_prefix_cache_) {
         for (const auto& [id, req] : requests_) {
-            if (req->Is<fsm::Finished>()) {
+            if (req->Is<fsm::Finished>() && (!has_deferred_aborts || !deferred_aborts_.contains(id))) {
                 hybrid_prefix_cache_->ReleaseRequest(id);
             }
         }
@@ -410,12 +433,15 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
         }
     }
 #endif
-    std::erase_if(requests_, [](const auto& req) { return req.second->template Is<fsm::Finished>(); });
+    std::erase_if(requests_, [this, has_deferred_aborts](const auto& req) {
+        return req.second->template Is<fsm::Finished>() &&
+               (!has_deferred_aborts || !deferred_aborts_.contains(req.first));
+    });
 
     std::vector<Request*> candidates;
     for (auto& [id, req] : requests_) {
-        if (!req->Is<fsm::Draining>() && !req->Is<fsm::Prefetching>() && !req->Is<fsm::Retracting>() &&
-            !req->Is<fsm::WritingBack>()) {
+        if ((!has_deferred_aborts || !deferred_aborts_.contains(id)) && !req->Is<fsm::Draining>() &&
+            !req->Is<fsm::Prefetching>() && !req->Is<fsm::Retracting>() && !req->Is<fsm::WritingBack>()) {
             candidates.push_back(req.get());
         }
     }
@@ -424,7 +450,6 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     plan.With(FlatForwardOperation{std::move(fwd_ops)});
 #if TOKENSPEED_FLAT_KVCACHE
     plan.flat_oom_request_ids = std::exchange(flat_oom_request_ids_, {});
-    plan.flat_terminal_errors = std::exchange(flat_terminal_errors_, {});
 #endif
 
     // Merge retract write-backs (if any) into the Draining write-back list, then emit once.
@@ -442,20 +467,25 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
         // earlier chain / SWA-neighbor ops retire, and the request re-registers a key whose store is
         // in flight. InFlight() drops it (load-bearing: else a key sits in two ops and Retire
         // corrupts the ledger's key set).
-        std::unordered_set<std::string> batch_keys;
-        for (auto& cand : coordinator_.TakePendingStores()) {
-            if (flat_host_pool_.ContainsCachedBlock(cand.key) || flat_store_ops_.InFlight(cand.key) ||
-                !batch_keys.insert(cand.key).second) {
-                cand.block.reset();  // duplicate: drop + unpin
+        std::unordered_set<CacheKey, CacheKeyHash> batch_keys;
+        for (auto& candidate : coordinator_.TakePendingStores()) {
+            if (coordinator_.ContainsHostCachedBlock(candidate.key) || flat_store_ops_.InFlight(candidate.key) ||
+                !batch_keys.insert(candidate.key).second) {
+                candidate.block_ref.reset();  // duplicate: drop + unpin
                 continue;
             }
-            BlockRef host_block = flat_host_pool_.AcquireBlock();
-            if (!host_block) {
-                cand.block.reset();  // host full: drop + unpin
+            const KvCacheManager& manager =
+                coordinator_.GroupManager(static_cast<std::int32_t>(candidate.key.group_id));
+            CacheBlockRef host_block_ref =
+                flat_host_pool_.AcquireBlock(candidate.key.group_id, manager.CacheBlocksPerLcmBlock());
+            if (!host_block_ref) {
+                candidate.block_ref.reset();  // host full: drop + unpin
                 continue;
             }
-            pairs.push_back(TransferPair{CacheKind::kKV, cand.block->BlockId(), host_block->BlockId()});
-            tickets.push_back(FlatStoreTicket{std::move(cand.key), std::move(cand.block), std::move(host_block)});
+            pairs.push_back(TransferPair{CacheKind::kKV, manager.ResolveKernelPageId(candidate.block_ref->Location()),
+                                         manager.ResolveKernelPageId(host_block_ref->Location())});
+            tickets.push_back(
+                FlatStoreTicket{std::move(candidate.key), std::move(candidate.block_ref), std::move(host_block_ref)});
         }
         if (!pairs.empty()) {
             const cache_op_id id = kv_prefix_cache_.AllocateCacheOpId();
@@ -465,22 +495,23 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     }
 #endif
     if (!write_back_ops.empty()) {
-        plan.With(CacheOperation{FlatWriteBackOperation{write_back_ops}});
+        plan.With(CacheOperation{FlatWriteBackOperation{std::move(write_back_ops)}});
     }
     if (auto* lb = std::get_if<std::vector<LoadBackOperation>>(&cache_ops)) {
         if (!lb->empty()) {
-            plan.With(CacheOperation{FlatLoadBackOperation{*lb}});
+            plan.With(CacheOperation{FlatLoadBackOperation{std::move(*lb)}});
         }
     }
 #if TOKENSPEED_FLAT_KVCACHE
-    // Drain only after every operation has been built: host-extension
-    // destinations are allocated while constructing loadback ops and need the
-    // same pre-transfer sanitization as model-written pages.
-    plan.flat_page_ids_to_zero = block_pool_.TakePageIdsToZero();
+    // Drain after every operation has been constructed. This payload belongs
+    // to the whole plan: a PD decode bootstrap may submit RDMA without running
+    // a model forward, but its fresh destination pages still need sanitizing.
+    plan.flat_pages_to_zero = std::exchange(new_flat_page_ids_, {});
 #endif
     if (std::getenv("DEBUG_MEM")) {
         check_device_mem();
     }
+    plan.WithSchedulerAborts(std::exchange(scheduler_aborts_, {}));
     return plan;
 }
 

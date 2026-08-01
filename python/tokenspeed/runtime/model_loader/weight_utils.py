@@ -270,6 +270,62 @@ def filter_duplicate_safetensors_files(
     return hf_weights_files
 
 
+def filter_safetensors_files_by_weight_names(
+    hf_weights_files: list[str],
+    hf_folder: str,
+    index_file: str,
+    weight_name_filter: Callable[[str], bool],
+) -> list[str]:
+    """Keep only the safetensors shards holding weights the consumer wants.
+
+    Used for draft (NextN/MTP) models whose weights are embedded in the
+    target checkpoint: their loaders consume a small name subset, so most
+    shards need not be read (or prefetched) at all.
+
+    Args:
+        hf_weights_files: Candidate shard paths.
+        hf_folder: Checkpoint directory containing ``index_file``.
+        index_file: Safetensors index file name mapping weight names to
+            shard file names.
+        weight_name_filter: Predicate on checkpoint weight names; a shard is
+            kept if it holds at least one accepted name.
+
+    Returns:
+        The filtered shard list, input order preserved. Shards absent from
+        the index are kept, and the full list is returned when the index is
+        missing or nothing matches, so a wrong predicate degrades to reading
+        extra shards instead of breaking the load.
+    """
+    index_file_name = os.path.join(hf_folder, index_file)
+    if not os.path.isfile(index_file_name):
+        return hf_weights_files
+
+    with open(index_file_name) as f:
+        weight_map = json.load(f)["weight_map"]
+    needed_files = set()
+    for weight_name, shard_name in weight_map.items():
+        if weight_name_filter(weight_name):
+            needed_files.add(os.path.join(hf_folder, shard_name))
+    indexed_files = {
+        os.path.join(hf_folder, shard_name) for shard_name in weight_map.values()
+    }
+    filtered = [
+        f for f in hf_weights_files if f in needed_files or f not in indexed_files
+    ]
+    if not filtered:
+        logger.warning(
+            f"Weight-name shard filter matched nothing in {index_file_name}; "
+            f"falling back to loading all {len(hf_weights_files)} shards."
+        )
+        return hf_weights_files
+    if len(filtered) < len(hf_weights_files):
+        logger.info(
+            f"Loading {len(filtered)} of {len(hf_weights_files)} checkpoint "
+            "shards; the others hold no weights needed by this model."
+        )
+    return filtered
+
+
 def filter_files_not_needed_for_inference(hf_weights_files: list[str]) -> list[str]:
     """
     Exclude files that are not needed for inference.

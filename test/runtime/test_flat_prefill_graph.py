@@ -4,8 +4,8 @@ Prefill-graph replay pads q/k/v rows to the bucket while flat per-group
 write locs cover only the real (leading) tokens; the mha KV write must trim
 the padded tail or the store kernel walks past the loc array (IAE on the
 first padded replay -- reproduced on gpt-oss + flat + default prefill graph).
-Capture must also exercise the flat metadata branch via all-zero dummy
-tables so capture and replay take the same code path.
+Capture must also exercise the flat metadata branch via dummy block tables
+so capture and replay take the same code path.
 """
 
 from __future__ import annotations
@@ -61,7 +61,7 @@ class TrimKvToLocsTest(unittest.TestCase):
 
 
 class DummyFlatTablesTest(unittest.TestCase):
-    """Capture-time dummy tables: one all-zero row per non-state flat group."""
+    """Capture-time dummy tables: null KV pages and writable state pages."""
 
     def setUp(self):
         try:
@@ -79,7 +79,7 @@ class DummyFlatTablesTest(unittest.TestCase):
         pg.config = SimpleNamespace(device="cpu")
         return pg
 
-    def test_flat_backend_gets_zero_tables_per_group(self):
+    def test_flat_backend_gets_writable_state_tables(self):
         backend = SimpleNamespace(
             uses_flat_cache_groups=True,
             page_size=32,
@@ -93,14 +93,19 @@ class DummyFlatTablesTest(unittest.TestCase):
                 SimpleNamespace(group_id="linear_attention"),  # state: included
             )
         )
-        tables = self._bare(backend, pool)._dummy_flat_tables(100)
+        tables = self._bare(backend, pool)._dummy_flat_tables(100, 1)
         self.assertEqual(
             set(tables),
             {"full_attention", "sliding_attention", "linear_attention"},
         )
         for t in tables.values():
             self.assertEqual(t.shape, (1, 4))  # ceil(100/32)
-            self.assertEqual(int(t.abs().sum()), 0)  # null block 0 only
+        self.assertEqual(int(tables["full_attention"].abs().sum()), 0)
+        self.assertEqual(int(tables["sliding_attention"].abs().sum()), 0)
+        self.assertTrue(
+            bool((tables["linear_attention"] == 1).all()),
+            "state checkpoints need a writable dummy page during graph capture",
+        )
 
     def test_full_width_for_stride_deriving_backends(self):
         # trtllm-style: row stride comes from max_kv_len, so dummy tables
@@ -114,7 +119,7 @@ class DummyFlatTablesTest(unittest.TestCase):
         pool = SimpleNamespace(
             paged_cache_group_specs=(SimpleNamespace(group_id="full_attention"),)
         )
-        tables = self._bare(backend, pool)._dummy_flat_tables(100)
+        tables = self._bare(backend, pool)._dummy_flat_tables(100, 1)
         self.assertEqual(tables["full_attention"].shape, (1, 2500))
 
     def test_composite_wrapper_resolves_flat_child(self):
@@ -131,14 +136,48 @@ class DummyFlatTablesTest(unittest.TestCase):
                 SimpleNamespace(group_id="linear_attention"),
             )
         )
-        tables = self._bare(wrapper, pool)._dummy_flat_tables(64)
+        tables = self._bare(wrapper, pool)._dummy_flat_tables(64, 1)
         self.assertEqual(set(tables), {"full_attention", "linear_attention"})
         self.assertEqual(tables["full_attention"].shape, (1, 2))
 
     def test_non_flat_backend_empty(self):
         backend = SimpleNamespace(uses_flat_cache_groups=False)
         pool = SimpleNamespace(paged_cache_group_specs=())
-        self.assertEqual(self._bare(backend, pool)._dummy_flat_tables(64), {})
+        self.assertEqual(self._bare(backend, pool)._dummy_flat_tables(64, 1), {})
+
+    def test_runtime_contract_pool_is_eligible_for_capture(self):
+        from unittest import mock
+
+        inner_model = SimpleNamespace(embed_tokens=object())
+        model_runner = SimpleNamespace(
+            model=SimpleNamespace(model=inner_model),
+            is_generation=True,
+            is_multimodal=False,
+        )
+        config = SimpleNamespace(
+            enforce_eager=False,
+            disable_prefill_graph=False,
+            data_parallel_size=1,
+        )
+        pool = SimpleNamespace(runtime_contract=object())
+        with (
+            mock.patch(
+                "tokenspeed.runtime.execution.prefill_graph.get_prefill_token_buckets",
+                return_value=[64],
+            ),
+            mock.patch.object(self.PrefillGraph, "capture") as capture,
+        ):
+            graph = self.PrefillGraph(
+                model_runner=model_runner,
+                attn_backend=object(),
+                token_to_kv_pool=pool,
+                input_buffers=object(),
+                config=config,
+                req_to_page=object(),
+            )
+
+        self.assertFalse(graph.disable)
+        capture.assert_not_called()
 
 
 class TrtllmPrefillGraphSeamsTest(unittest.TestCase):
@@ -170,6 +209,12 @@ class TrtllmPrefillGraphSeamsTest(unittest.TestCase):
             self.mod, "is_breakable_capture_active", return_value=True
         ):
             self.assertFalse(b.support_kv_cache_prewrite(None))
+
+    def test_declares_history_contract_family(self):
+        self.assertEqual(
+            self.mod.TRTLLMMHAAttnBackend.flat_cache_consumer_families,
+            frozenset({"history"}),
+        )
 
 
 if __name__ == "__main__":

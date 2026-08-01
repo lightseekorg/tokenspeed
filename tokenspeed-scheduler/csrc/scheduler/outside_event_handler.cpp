@@ -35,7 +35,7 @@ namespace tokenspeed {
 namespace {
 
 // Release explicitly in reverse; vector destruction order is not our eviction policy.
-void FreeAll(std::vector<BlockRef>&& refs) {
+void FreeAll(std::vector<CacheBlockRef>&& refs) {
     for (auto it = refs.rbegin(); it != refs.rend(); ++it) {
         it->reset();
     }
@@ -99,8 +99,6 @@ void Scheduler::handleEvent(const cache::PrefetchDone& event) {
 void Scheduler::handleEvent(const pd::BootstrappedEvent& event) {
     Request* request = find_request(event.request_id);
     if (request == nullptr || !request->Is<fsm::Bootstrapping>()) {
-        // Missing means the request was already reaped; any other state means
-        // this bootstrap acknowledgement is a duplicate/late delivery.
         return;
     }
     request->Apply(fsm::BootstrappedEvent{});
@@ -114,10 +112,8 @@ void Scheduler::handleEvent(const pd::FailedEvent& event) {
     if (request->Is<fsm::WritingBack>()) {
         throw std::logic_error("PD FailedEvent cannot terminalize an in-flight scheduler writeback");
     }
-#if TOKENSPEED_FLAT_KVCACHE
     pending_forward_results_.erase(event.request_id);
-    flat_reserved_pages_.erase(event.request_id);
-    flat_pd_completion_reserved_pages_.erase(event.request_id);
+#if TOKENSPEED_FLAT_KVCACHE
     flat_pd_transfer_pins_.erase(event.request_id);
 #endif
     request->Apply(fsm::AbortEvent{
@@ -135,10 +131,8 @@ void Scheduler::handleEvent(const pd::SucceededEvent& event) {
     if (!request->Is<fsm::PrefillDone>() && !request->Is<fsm::Decoding>()) {
         throw std::logic_error("PD SucceededEvent received in state " + request->StateName());
     }
-#if TOKENSPEED_FLAT_KVCACHE
     pending_forward_results_.erase(event.request_id);
-    flat_reserved_pages_.erase(event.request_id);
-    flat_pd_completion_reserved_pages_.erase(event.request_id);
+#if TOKENSPEED_FLAT_KVCACHE
     flat_pd_transfer_pins_.erase(event.request_id);
 #endif
     std::vector<std::string> page_hashes;
@@ -149,6 +143,7 @@ void Scheduler::handleEvent(const pd::SucceededEvent& event) {
                                     &coordinator_
 #endif
     });
+    tryFinalizeDeferredAbort(event.request_id);
 }
 
 void Scheduler::handleEvent(const pd::RemotePrefillDoneEvent& event) {
@@ -167,14 +162,10 @@ void Scheduler::handleEvent(const pd::RemotePrefillDoneEvent& event) {
         return;
     }
     if (request->Is<fsm::PrefillDone>() || request->Is<fsm::Decoding>() || request->Is<fsm::Finished>()) {
-        // Duplicate completion or a delivery that lost the race with terminal
-        // cleanup. Never re-apply the bootstrap token.
         return;
     }
-    throw std::logic_error(
-        "PD RemotePrefillDoneEvent received before decode "
-        "destination admission; state=" +
-        request->StateName());
+    throw std::logic_error("PD RemotePrefillDoneEvent received before decode destination admission; state=" +
+                           request->StateName());
 }
 
 void Scheduler::handleEvent(const forward::Finish& event) {
@@ -182,10 +173,8 @@ void Scheduler::handleEvent(const forward::Finish& event) {
     if (config_.enable_flatkv_pd && flat_pd_transfer_pins_.contains(event.request_id)) {
         throw std::logic_error("FlatKV PD Finish received while transfer pages are pinned");
     }
-    pending_forward_results_.erase(event.request_id);
-    flat_reserved_pages_.erase(event.request_id);
-    flat_pd_completion_reserved_pages_.erase(event.request_id);
 #endif
+    pending_forward_results_.erase(event.request_id);
     if (auto req = find_request(event.request_id)) {
         // except_last=true: exclude the tail page, matching FinishEvent's InsertDevice behavior
         auto token_pages = req->GetFullPagedTokens(true);
@@ -207,6 +196,7 @@ void Scheduler::handleEvent(const forward::Finish& event) {
 #endif
         });
     }
+    tryFinalizeDeferredAbort(event.request_id);
 }
 
 void Scheduler::handleEvent(const forward::UpdateReserveNumTokens& event) {
@@ -215,44 +205,45 @@ void Scheduler::handleEvent(const forward::UpdateReserveNumTokens& event) {
     }
 }
 void Scheduler::handleEvent(const forward::ExtendResult& event) {
-#if TOKENSPEED_FLAT_KVCACHE
     // One owed forward result delivered (see pending_forward_results_).
     if (auto it = pending_forward_results_.find(event.request_id); it != pending_forward_results_.end()) {
         if (--it->second <= 0) {
             pending_forward_results_.erase(it);
         }
     }
-#endif
     if (auto req = find_request(event.request_id)) {
         const std::int32_t protected_tail_tokens = config_.overlap_schedule_depth * config_.decode_input_tokens;
         req->Apply(fsm::ExtendResultEvent{event.request_id, event.tokens,
                                           hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr,
                                           protected_tail_tokens});
     }
+    tryFinalizeDeferredAbort(event.request_id);
 }
 
 void Scheduler::handleEvent(const forward::Abort& event) {
-#if TOKENSPEED_FLAT_KVCACHE
-    // Terminal for this request's forward stream: drop any remaining result debt
-    // and any decode reservation it never consumed -- an abort between the
-    // prefill-completing admission and the PrefillDone->Decoding transition must
-    // not leave a permanent phantom reservation deflating every later gate.
+    // Terminal for this request's forward stream: late results are ignored.
     pending_forward_results_.erase(event.request_id);
-    flat_reserved_pages_.erase(event.request_id);
-    flat_pd_completion_reserved_pages_.erase(event.request_id);
+#if TOKENSPEED_FLAT_KVCACHE
     flat_pd_transfer_pins_.erase(event.request_id);
 #endif
-    auto iter = requests_.find(event.request_id);
-    if (iter == requests_.end()) {
+    Request* req = find_request(event.request_id);
+    if (req == nullptr) {
         return;
     }
 
-    Request* req = iter->second.get();
-    req->Apply(fsm::AbortEvent{
+    // L3 prefetch owns a separate abort handoff: the request remains Aborting
+    // until PrefetchDone releases its host-page transfer.
+    if (req->Is<fsm::Prefetching>() || req->Is<fsm::Aborting>()) {
+        req->Apply(fsm::AbortEvent{
 #if TOKENSPEED_FLAT_KVCACHE
-        &coordinator_
+            &coordinator_
 #endif
-    });
+        });
+        return;
+    }
+
+    deferAbort(event.request_id, /*discard_writeback=*/true);
+    tryFinalizeDeferredAbort(event.request_id);
 }
 
 void Scheduler::handleEvent(const cache::WriteBackDone& event) {
@@ -261,14 +252,14 @@ void Scheduler::handleEvent(const cache::WriteBackDone& event) {
         // Publish-at-ack: hashing the host block makes it hittable; either way it returns to the
         // host free list (hash-intact = reusable, unhashed = plain recycling). Batched frees in
         // ticket order keep both pools' recycling order deterministic.
-        for (FlatStoreTicket& t : tickets) {
+        for (FlatStoreTicket& ticket : tickets) {
             if (event.success) {
-                flat_host_pool_.CacheFullBlock(t.host_block, t.key);
+                coordinator_.CacheHostBlock(ticket.host_block_ref, ticket.key);
             }
         }
         for (auto it = tickets.rbegin(); it != tickets.rend(); ++it) {
-            it->device_block.reset();
-            it->host_block.reset();
+            it->device_block_ref.reset();
+            it->host_block_ref.reset();
         }
         return;
     }
@@ -281,14 +272,37 @@ void Scheduler::handleEvent(const cache::WriteBackDone& event) {
     auto spec = std::move(it->second);
     cache_op_tracker_.erase(it);
 
+    const auto deferred_it = deferred_aborts_.find(spec.request_id);
+    const bool discard_writeback = deferred_it != deferred_aborts_.end() && deferred_it->second.discard_writeback;
+    const bool effective_success = event.success && !discard_writeback;
+
     auto now = std::chrono::steady_clock::now();
     for (TreeNode* n : spec.nodes) n->Touch(now);
 
     if (!spec.request_id.empty()) {
         if (auto* req = find_request(spec.request_id)) {
-            req->Apply(
-                fsm::WriteBackDoneEvent{&kv_prefix_cache_, hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr});
+            const bool was_writing_back = req->Is<fsm::WritingBack>();
+            const bool was_retracting = req->Is<fsm::Retracting>();
+            // A finishing request no longer needs its paged-cache table once D2H completes.
+            // A successful retract keeps its table for recovery; the deferred-abort finalizer
+            // releases failed or explicitly aborted retracts.
+            if (hybrid_prefix_cache_ && was_writing_back) {
+                hybrid_prefix_cache_->ReleaseRequest(spec.request_id);
+            }
+            req->Apply(fsm::WriteBackDoneEvent{
+                &kv_prefix_cache_, hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr, effective_success});
+            if (was_retracting && !event.success && !discard_writeback) {
+                deferAbort(spec.request_id, /*discard_writeback=*/false, "L2 retract write-back failed");
+            }
+            tryFinalizeDeferredAbort(spec.request_id);
+            return;
         }
+    }
+    if (hybrid_prefix_cache_ && !spec.paged_cache_nodes.empty()) {
+        hybrid_prefix_cache_->OnPagedCacheHostWriteBackDone(spec.paged_cache_nodes, effective_success);
+    }
+    if (!spec.request_id.empty()) {
+        tryFinalizeDeferredAbort(spec.request_id);
     }
 }
 
@@ -304,7 +318,14 @@ void Scheduler::handleEvent(const cache::LoadBackDone& event) {
         return;
     }
 #endif
-    // Radix loadbacks emit no LoadBackDone today: unknown op_ids are silently ignored.
+    auto it = cache_op_tracker_.find(event.op_id);
+    if (it == cache_op_tracker_.end() || !it->second.paged_loadback_host_pin) {
+        return;
+    }
+    _assert(event.success, "radix paged-cache host loadback failed");
+    const std::string request_id = it->second.request_id;
+    cache_op_tracker_.erase(it);
+    tryFinalizeDeferredAbort(request_id);
 }
 
 }  // namespace tokenspeed

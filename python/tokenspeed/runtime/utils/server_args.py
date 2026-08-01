@@ -25,6 +25,7 @@ import dataclasses
 import json
 import os
 import random
+import socket
 from typing import Literal
 
 from tokenspeed_kernel.ops.attention.triton.linear.chunk_delta_h import (
@@ -41,6 +42,7 @@ from tokenspeed.runtime.utils import (
     maybe_model_redirect,
     nullable_str,
 )
+from tokenspeed.runtime.utils.launcher import check_dist_init_port, detect_topology
 from tokenspeed.runtime.utils.network import is_port_available
 
 logger = get_colorful_logger(__name__)
@@ -90,6 +92,8 @@ class ServerArgs:
     chunked_prefill_size: int | None = None
     max_prefill_tokens: int = 8192
     enable_mixed_batch: bool = False
+    # Kernel page size. Flat scheduler logical pages come from the LCM
+    # runtime contract and must not overwrite this value.
     block_size: int = 64
     # special kv cache
     mamba_ssm_dtype: str = "float32"
@@ -193,10 +197,11 @@ class ServerArgs:
     kvstore_storage_backend_extra_config: str | None = None
     enable_mla_l1_5_cache: bool = False
 
-    # Multi-node distributed serving
+    # Multi-node distributed serving. ``None`` means "not given by the user",
+    # which is what lets the launcher environment fill them in.
     dist_init_addr: str | None = None
-    nnodes: int = 1
-    node_rank: int = 0
+    nnodes: int | None = None
+    node_rank: int | None = None
 
     # Hugging Face model config overrides in JSON
     hf_overrides: str = "{}"
@@ -205,7 +210,6 @@ class ServerArgs:
     # Kernel backend
     attention_backend: str | None = None
     kda_backend: str = "auto"
-    moe_activation_dtype: str = "bf16"
     drafter_attention_backend: str | None = None
     sampling_backend: str | None = None
     dp_sampling: bool = False
@@ -314,6 +318,7 @@ class ServerArgs:
 
     def __post_init__(self):
         self.resolve_basic_defaults()
+        self.resolve_launcher_topology()
         self.resolve_parallelism()
         self.resolve_memory_and_scheduling()
         self.resolve_kernel_backends()
@@ -443,6 +448,42 @@ class ServerArgs:
                 self.sampling_backend = "flashinfer"
             else:
                 self.sampling_backend = "greedy"
+
+    def resolve_launcher_topology(self):
+        """Fill in unset multi-node arguments from the launcher environment."""
+        topology = detect_topology()
+        if topology is None:
+            self.nnodes = 1 if self.nnodes is None else self.nnodes
+            self.node_rank = 0 if self.node_rank is None else self.node_rank
+            return
+
+        for flag, given, found in (
+            ("--nnodes", self.nnodes, topology.nnodes),
+            ("--node-rank", self.node_rank, topology.node_rank),
+        ):
+            if given is not None and given != found:
+                raise ValueError(
+                    f"{flag}={given} contradicts the {topology.source} environment, "
+                    f"which reports {found}. Drop the flag to use the launcher's "
+                    f"value, or correct the launch."
+                )
+
+        derived = []
+        if self.nnodes is None:
+            self.nnodes = topology.nnodes
+            derived.append(f"--nnodes {self.nnodes}")
+        if self.node_rank is None:
+            self.node_rank = topology.node_rank
+            derived.append(f"--node-rank {self.node_rank}")
+        if self.dist_init_addr is None:
+            check_dist_init_port(topology.dist_init_port)
+            self.dist_init_addr = topology.dist_init_addr
+            derived.append(f"--dist-init-addr {self.dist_init_addr}")
+        if derived:
+            logger.info(
+                f"node {self.node_rank}/{self.nnodes} on {socket.gethostname()}: "
+                f"derived from {topology.source}: {' '.join(derived)}"
+            )
 
     def resolve_parallelism(self):
         world_size = self.world_size
@@ -949,6 +990,7 @@ class ServerArgs:
             metavar="BLOCK_SIZE",
             type=int,
             default=ServerArgs.block_size,
+            help="Kernel cache page size in tokens.",
         )
 
         # KVStore
@@ -1332,13 +1374,20 @@ class ServerArgs:
         parser.add_argument(
             "--dist-init-addr",
             type=str,
-            help="The host address for initializing distributed backend (e.g., `192.168.0.2:25000`).",
+            help="The host address for initializing distributed backend (e.g., `192.168.0.2:25000`). "
+            "Derived from the launcher environment under a multi-node Slurm step.",
         )
         parser.add_argument(
-            "--nnodes", type=int, default=ServerArgs.nnodes, help="The number of nodes."
+            "--nnodes",
+            type=int,
+            default=ServerArgs.nnodes,
+            help="The number of nodes. Derived from SLURM_STEP_NUM_NODES when unset.",
         )
         parser.add_argument(
-            "--node-rank", type=int, default=ServerArgs.node_rank, help="The node rank."
+            "--node-rank",
+            type=int,
+            default=ServerArgs.node_rank,
+            help="The node rank. Derived from SLURM_NODEID when unset.",
         )
 
         # Model override args
@@ -1386,18 +1435,6 @@ class ServerArgs:
             "'fla' forces the portable FLA scan; 'flashkda' the optional "
             "FlashKDA library (source build, SM90+); 'cutedsl_kda' the "
             "CuteDSL KDA AOT kernel (prebuilt, sm_103a). Decode is unaffected.",
-        )
-        parser.add_argument(
-            "--moe-activation-dtype",
-            type=str,
-            choices=["bf16", "mxfp8"],
-            default=ServerArgs.moe_activation_dtype,
-            help="MoE activation precision (Kimi-K3 fused SiTU MoE): 'bf16' "
-            "keeps bf16 activations (w4a16, default); 'mxfp8' block-quantizes "
-            "activations to fp8 (w4a8, mxfp8-act x mxfp4-weight). A run-wide "
-            "deployment choice, stable for the whole process; 'mxfp8' speeds up "
-            "large-batch prefill (~1.5x on the MoE) at a small decode cost and "
-            "requires the sidecar's w4a8 cubins. Weights stay mxfp4 either way.",
         )
         parser.add_argument(
             "--drafter-attention-backend",
@@ -2068,6 +2105,12 @@ class PortArgs:
                     f"Example: --dist-init-addr 127.0.0.1:4000"
                 )
             dist_init_addr = ("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
+        elif server_args.dist_init_addr is None:
+            raise ValueError(
+                f"--dist-init-addr is required for nnodes={server_args.mapping.nnodes} "
+                "and could not be derived from the launcher environment. "
+                "Example: --dist-init-addr <head-node-ip>:20000"
+            )
         else:
             dist_init_addr = server_args.dist_init_addr.split(":")
         if len(dist_init_addr) != 2:
@@ -2078,12 +2121,18 @@ class PortArgs:
         dist_init_host, dist_init_port = dist_init_addr
         dist_init_port = int(dist_init_port)
 
-        # Scan forward until we find a port cluster where all derived ports are free.
-        # This handles the case where a previous engine instance left ports in
-        # TIME_WAIT or its child processes haven't fully terminated yet.
-        # Note: the port at offset +1 (formerly detokenizer_port) is intentionally
-        # skipped so the rest of the port layout stays stable for any external
-        # tooling that indexed off the historical port cluster.
+        # Scan forward until we find a port cluster where all derived ports are
+        # free. This handles the case where a previous engine instance left
+        # ports in TIME_WAIT or its child processes haven't fully terminated
+        # yet. Note: the port at offset +1 (formerly detokenizer_port) is
+        # intentionally skipped so the rest of the port layout stays stable for
+        # any external tooling that indexed off the historical port cluster.
+        #
+        # The whole cluster is bound on node 0 alone, so scanning is only
+        # meaningful there: is_port_available binds the local wildcard, and a
+        # follower moving its own base would simply address ports the head
+        # never bound. Multi-node therefore takes the cluster as derived and
+        # reports a conflict instead of relocating it.
         while True:
             port_base = dist_init_port + 1
             rpc_port = port_base + 2
@@ -2094,17 +2143,26 @@ class PortArgs:
             else:
                 scheduler_input_port = port_base + 2 + 1 + dp_rank
             rpc_ipc_port = scheduler_input_port + 1
-            if all(
-                is_port_available(p)
-                for p in [
-                    dist_init_port,
-                    port_base,
-                    rpc_port,
-                    metrics_ipc_port,
-                    scheduler_input_port,
-                    rpc_ipc_port,
-                ]
-            ):
+            cluster = [
+                dist_init_port,
+                port_base,
+                rpc_port,
+                metrics_ipc_port,
+                scheduler_input_port,
+                rpc_ipc_port,
+            ]
+            if server_args.mapping.nnodes > 1:
+                if server_args.node_rank == 0:
+                    busy = [p for p in cluster if not is_port_available(p)]
+                    if busy:
+                        raise ValueError(
+                            f"control-plane ports {busy} are already in use on the "
+                            "head node. Every node derives this cluster from "
+                            "--dist-init-addr, so it cannot be moved on one node "
+                            "alone; restart with a different --dist-init-addr port."
+                        )
+                break
+            if all(is_port_available(p) for p in cluster):
                 break
             dist_init_port += 10
 

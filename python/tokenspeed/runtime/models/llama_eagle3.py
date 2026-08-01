@@ -40,7 +40,7 @@ from tokenspeed.runtime.execution.context import (
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.common import concat
-from tokenspeed.runtime.layers.layernorm import RMSNorm
+from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -48,7 +48,10 @@ from tokenspeed.runtime.layers.linear import (
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
-from tokenspeed.runtime.layers.vocab_parallel_embedding import ParallelLMHead
+from tokenspeed.runtime.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.base import (
     BaseCausalLM,
@@ -246,6 +249,10 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
         )
 
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.fused_input_hidden_norm = FusedRMSNorm(
+            self.input_layernorm,
+            self.hidden_norm,
+        )
 
     def resolve_attn(self, prefix: str) -> nn.Module:
 
@@ -316,11 +323,27 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
                 embeds,
                 torch.zeros_like(embeds),
             )
+            hidden_states = self.hidden_norm(hidden_states)
+            hidden_states = concat(embeds, hidden_states)
         else:
-            embeds = self.input_layernorm(embeds)
-
-        hidden_states = self.hidden_norm(hidden_states)
-        hidden_states = concat(embeds, hidden_states)
+            h = embeds.size(-1)
+            fused_norm_out = torch.empty(
+                embeds.size(0),
+                h + hidden_states.size(-1),
+                dtype=embeds.dtype,
+                device=embeds.device,
+            )
+            # FusedRMSNorm's q_a/kv_a kwargs are MLA-specific names. Here
+            # embeds and hidden_states correspond to q_a and kv_a, separately.
+            # Skip the launch on zero-token (idle) forwards.
+            if embeds.shape[0] > 0:
+                self.fused_input_hidden_norm(
+                    input_q_a=embeds,
+                    input_kv_a=hidden_states,
+                    output_q_a=fused_norm_out[..., :h],
+                    output_kv_a=fused_norm_out[..., h:],
+                )
+            hidden_states = fused_norm_out
 
         # Attention
         hidden_states = self.comm_manager.pre_attn_comm(hidden_states, ctx)
@@ -395,9 +418,24 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
         # Non-fused path: fuse_embed_reduce is always False here because
         # the model only sets it when should_fuse() is True.
         residual = hidden_states
-        embeds = self.input_layernorm(embeds)
-        hidden_states = self.hidden_norm(hidden_states)
-        hidden_states = torch.cat([embeds, hidden_states], dim=-1)
+        h = embeds.size(-1)
+        fused_norm_out = torch.empty(
+            embeds.size(0),
+            h + hidden_states.size(-1),
+            dtype=embeds.dtype,
+            device=embeds.device,
+        )
+        # FusedRMSNorm's q_a/kv_a kwargs are MLA-specific names. Here
+        # embeds and hidden_states correspond to q_a and kv_a, separately.
+        # Skip the launch on zero-token (idle) forwards.
+        if embeds.shape[0] > 0:
+            self.fused_input_hidden_norm(
+                input_q_a=embeds,
+                input_kv_a=hidden_states,
+                output_q_a=fused_norm_out[..., :h],
+                output_kv_a=fused_norm_out[..., h:],
+            )
+        hidden_states = fused_norm_out
 
         # Attention
         hidden_states = self.comm_manager.pre_attn_comm(hidden_states, ctx)
@@ -495,6 +533,16 @@ class Eagle3LlamaModel(BaseTransformerModel):
             if getattr(config, "fc_norm", False)
             else None
         )
+        self.fused_fc_norms = (
+            nn.ModuleList(
+                [
+                    FusedRMSNorm(self.fc_norm[i], self.fc_norm[i + 1])
+                    for i in range(0, self.num_fc_input_dim - 1, 2)
+                ]
+            )
+            if self.fc_norm is not None
+            else None
+        )
         self.norm_output = getattr(config, "norm_output", False)
 
     def forward(
@@ -511,13 +559,13 @@ class Eagle3LlamaModel(BaseTransformerModel):
     ) -> torch.Tensor:
 
         if input_embeds is None:
-            # When TP > 1 and fused allreduce+norm is available, skip the
-            # NCCL allreduce in the embedding and let the midlayer fuse it
-            # with the input_layernorm.
+            # When the embedding is vocab-parallel (tp_size > 1), skip its
+            # NCCL allreduce and let the midlayer fuse it with input_layernorm.
+            # Non-sharded embeddings (tp_size == 1) need no allreduce at all.
             midlayer = self.midlayer
             num_tokens = input_ids.shape[0]
             fuse_embed_reduce = (
-                self.mapping.attn.tp_size > 1
+                self.embed_tokens.tp_size > 1
                 and midlayer.comm_manager.should_fuse(num_tokens)
             )
             embeds = self.embed_tokens(input_ids, reduce_results=not fuse_embed_reduce)
@@ -531,15 +579,23 @@ class Eagle3LlamaModel(BaseTransformerModel):
         if hidden_states.size(-1) != embeds.size(-1):
             if self.input_norm is not None:
                 hidden_states = self.input_norm(hidden_states)
-            if self.fc_norm is not None:
+            if self.fc_norm is not None and hidden_states.shape[0] > 0:
                 chunks = hidden_states.chunk(self.num_fc_input_dim, dim=-1)
-                hidden_states = torch.cat(
-                    [
-                        norm(chunk)
-                        for norm, chunk in zip(self.fc_norm, chunks, strict=True)
-                    ],
-                    dim=-1,
-                )
+                normed = torch.empty_like(hidden_states)
+                out_chunks = normed.chunk(self.num_fc_input_dim, dim=-1)
+                i = 0
+                for fused in self.fused_fc_norms:
+                    fused(
+                        input_q_a=chunks[i],
+                        input_kv_a=chunks[i + 1],
+                        output_q_a=out_chunks[i],
+                        output_kv_a=out_chunks[i + 1],
+                    )
+                    i += 2
+                if i < self.num_fc_input_dim:
+                    # Odd count: single norm into the last slice.
+                    self.fc_norm[i](chunks[i], out=out_chunks[i])
+                hidden_states = normed
             hidden_states, _ = self.fc(hidden_states)
 
         residual = None
@@ -716,6 +772,22 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
             and self.config.target_hidden_size != self.config.hidden_size
         ):
             return
+        if embed.shape != self.model.embed_tokens.weight.shape:
+            # Target embedding layout differs (e.g. replicated instead of
+            # vocab-parallel); rebuild the draft embedding to match it.
+            with torch.device("meta"):
+                replicated = VocabParallelEmbedding(
+                    self.config.vocab_size,
+                    self.config.hidden_size,
+                    prefix="model.embed_tokens",
+                )
+            if embed.shape != replicated.weight.shape:
+                raise ValueError(
+                    f"Cannot share target embed of shape {tuple(embed.shape)}: "
+                    f"draft expects {tuple(self.model.embed_tokens.weight.shape)} "
+                    f"(sharded) or {tuple(replicated.weight.shape)} (replicated)."
+                )
+            self.model.embed_tokens = replicated
         del self.model.embed_tokens.weight
         self.model.embed_tokens.weight = embed
         if head is not None and self.load_lm_head_from_target:

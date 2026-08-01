@@ -28,12 +28,13 @@ then transfers each group's selected pages across its bound raw slabs.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
-FLATKV_PD_PROTOCOL_VERSION = 1
+FLATKV_PD_PROTOCOL_VERSION = 2
 MAX_FLATKV_LAYOUT_WIRE_BYTES = 256 << 10
 MAX_FLATKV_MANIFEST_WIRE_BYTES = 2 << 20
 MAX_FLATKV_GROUPS = 64
@@ -43,7 +44,10 @@ MAX_FLATKV_MANIFEST_PAGES = 1 << 15
 _UINT64_LIMIT = 1 << 64
 _FAMILIES = frozenset(("history", "state"))
 _TRANSFER_POLICIES = frozenset(("full_suffix", "latest_snapshot"))
-_PEER_LAYOUT_KEYS = frozenset(("version", "layout_fingerprint", "num_pages_with_null"))
+_PEER_LAYOUT_KEYS = frozenset(
+    ("version", "layout_fingerprint", "num_pages_with_null", "page_zero_offsets")
+)
+_PEER_OFFSET_KEYS = frozenset(("group_id", "field_id", "page_zero_offset"))
 _MANIFEST_KEYS = frozenset(("version", "prefix_len", "prompt_len", "groups"))
 _MANIFEST_GROUP_KEYS = frozenset(("group_id", "page_ids"))
 
@@ -196,11 +200,37 @@ def _canonical_round_trip(
 
 
 @dataclass(frozen=True, slots=True)
+class FlatKVPDTransferSegment:
+    """One strided field copied for every selected page in a cache group."""
+
+    physical_slot: int
+    field_id: str
+    dtype: str
+    page_zero_offset: int
+    page_stride_bytes: int
+    payload_bytes: int
+
+    def __post_init__(self) -> None:
+        _integer("segment physical_slot", self.physical_slot)
+        _string("segment field_id", self.field_id)
+        _string("segment dtype", self.dtype)
+        _integer("segment page_zero_offset", self.page_zero_offset)
+        _integer("segment page_stride_bytes", self.page_stride_bytes, 1)
+        _integer("segment payload_bytes", self.payload_bytes, 1)
+        _require(
+            self.payload_bytes <= self.page_stride_bytes,
+            f"segment {self.field_id!r} payload exceeds its page stride",
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class FlatKVPDGroup:
     group_id: str
     family: Family
     transfer_policy: TransferPolicy
     physical_slots: tuple[int, ...]
+    cache_blocks_per_lcm_block: int = 1
+    transfer_segments: tuple[FlatKVPDTransferSegment, ...] = ()
 
     def __post_init__(self) -> None:
         _string("group_id", self.group_id)
@@ -215,6 +245,29 @@ class FlatKVPDGroup:
             name=f"group {self.group_id!r} physical_slots",
             maximum=MAX_FLATKV_PHYSICAL_SLOTS,
             ordered_unique=True,
+        )
+        _integer(
+            f"group {self.group_id!r} cache_blocks_per_lcm_block",
+            self.cache_blocks_per_lcm_block,
+            1,
+        )
+        segments = _sequence(
+            self.transfer_segments,
+            name=f"group {self.group_id!r} transfer_segments",
+            maximum=MAX_FLATKV_PHYSICAL_SLOTS,
+            nonempty=False,
+        )
+        if not all(
+            isinstance(segment, FlatKVPDTransferSegment) for segment in segments
+        ):
+            raise FlatKVPDProtocolError(
+                f"group {self.group_id!r} transfer_segments must contain "
+                "FlatKVPDTransferSegment values"
+            )
+        field_ids = tuple(segment.field_id for segment in segments)
+        _require(
+            len(field_ids) == len(set(field_ids)),
+            f"group {self.group_id!r} repeats a transfer field",
         )
 
 
@@ -250,12 +303,31 @@ def _layout_fingerprint(value: object) -> str:
 
 
 @dataclass(frozen=True, slots=True)
+class FlatKVPDPeerOffset:
+    """One peer-local field base offset inside the peer's arena."""
+
+    group_id: str
+    field_id: str
+    page_zero_offset: int
+
+    def __post_init__(self) -> None:
+        _string("peer offset group_id", self.group_id)
+        _string("peer offset field_id", self.field_id)
+        _integer("peer offset page_zero_offset", self.page_zero_offset)
+
+
+@dataclass(frozen=True, slots=True)
 class FlatKVPDPeerLayout:
-    """Peer-local fields that are not committed by the semantic fingerprint."""
+    """Peer-local fields that are not committed by the semantic fingerprint.
+
+    Capacity and per-field ``page_zero_offset`` values may differ across PD
+    peers when arena plane packing scales with ``num_lcm_blocks``.
+    """
 
     version: int
     layout_fingerprint: str
     num_pages_with_null: int
+    page_zero_offsets: tuple[FlatKVPDPeerOffset, ...] = ()
 
     def __post_init__(self) -> None:
         if _integer("layout version", self.version, 1) != FLATKV_PD_PROTOCOL_VERSION:
@@ -264,6 +336,27 @@ class FlatKVPDPeerLayout:
             )
         _layout_fingerprint(self.layout_fingerprint)
         _integer("num_pages_with_null", self.num_pages_with_null, 2)
+        offsets = _sequence(
+            self.page_zero_offsets,
+            name="page_zero_offsets",
+            maximum=MAX_FLATKV_GROUPS * MAX_FLATKV_PHYSICAL_SLOTS,
+            nonempty=False,
+        )
+        if not all(isinstance(offset, FlatKVPDPeerOffset) for offset in offsets):
+            raise FlatKVPDProtocolError(
+                "page_zero_offsets must contain FlatKVPDPeerOffset values"
+            )
+        keys = tuple((offset.group_id, offset.field_id) for offset in offsets)
+        _require(
+            len(keys) == len(set(keys)),
+            "page_zero_offsets repeats a (group_id, field_id) pair",
+        )
+
+    def page_zero_offset_map(self) -> dict[tuple[str, str], int]:
+        return {
+            (offset.group_id, offset.field_id): offset.page_zero_offset
+            for offset in self.page_zero_offsets
+        }
 
     def to_wire_bytes(self) -> bytes:
         return _encode(
@@ -278,10 +371,37 @@ class FlatKVPDPeerLayout:
             raw, name="FlatKV peer layout", maximum=MAX_FLATKV_LAYOUT_WIRE_BYTES
         )
         _exact_keys(payload, _PEER_LAYOUT_KEYS, "FlatKV peer layout")
+        offsets = []
+        for position, entry in enumerate(
+            _sequence(
+                payload["page_zero_offsets"],
+                name="FlatKV peer layout page_zero_offsets",
+                maximum=MAX_FLATKV_GROUPS * MAX_FLATKV_PHYSICAL_SLOTS,
+                nonempty=False,
+            )
+        ):
+            if not isinstance(entry, dict):
+                raise FlatKVPDProtocolError(
+                    f"FlatKV peer layout page_zero_offsets[{position}] "
+                    "must be an object"
+                )
+            _exact_keys(
+                entry,
+                _PEER_OFFSET_KEYS,
+                f"FlatKV peer layout page_zero_offsets[{position}]",
+            )
+            offsets.append(
+                FlatKVPDPeerOffset(
+                    group_id=entry["group_id"],
+                    field_id=entry["field_id"],
+                    page_zero_offset=entry["page_zero_offset"],
+                )
+            )
         layout = cls(
             version=payload["version"],
             layout_fingerprint=payload["layout_fingerprint"],
             num_pages_with_null=payload["num_pages_with_null"],
+            page_zero_offsets=tuple(offsets),
         )
         _canonical_round_trip(
             raw,
@@ -343,6 +463,29 @@ class FlatKVPDLayout:
                         f"physical_slot_count={self.physical_slot_count}"
                     )
                 covered.add(slot)
+            for segment in group.transfer_segments:
+                if segment.physical_slot >= self.physical_slot_count:
+                    raise FlatKVPDProtocolError(
+                        f"group {group.group_id!r} segment "
+                        f"{segment.field_id!r} slot {segment.physical_slot} "
+                        f"exceeds physical_slot_count={self.physical_slot_count}"
+                    )
+                registered_extent = self.num_pages_with_null * self.physical_page_bytes
+                group_page_count = (
+                    1
+                    + (self.num_pages_with_null - 1) * group.cache_blocks_per_lcm_block
+                )
+                segment_extent = (
+                    segment.page_zero_offset
+                    + (group_page_count - 1) * segment.page_stride_bytes
+                    + segment.payload_bytes
+                )
+                if segment_extent > registered_extent:
+                    raise FlatKVPDProtocolError(
+                        f"group {group.group_id!r} segment "
+                        f"{segment.field_id!r} exceeds its registered buffer"
+                    )
+                covered.add(segment.physical_slot)
         missing = set(range(self.physical_slot_count)) - covered
         if missing:
             raise FlatKVPDProtocolError(
@@ -355,10 +498,20 @@ class FlatKVPDLayout:
 
     @property
     def peer(self) -> FlatKVPDPeerLayout:
+        offsets = tuple(
+            FlatKVPDPeerOffset(
+                group_id=group.group_id,
+                field_id=segment.field_id,
+                page_zero_offset=segment.page_zero_offset,
+            )
+            for group in self.groups
+            for segment in group.transfer_segments
+        )
         return FlatKVPDPeerLayout(
             version=self.version,
             layout_fingerprint=self.layout_fingerprint,
             num_pages_with_null=self.num_pages_with_null,
+            page_zero_offsets=offsets,
         )
 
 
@@ -407,11 +560,9 @@ class FlatKVPDPageManifest:
         group_ids = tuple(group.group_id for group in groups)
         if len(group_ids) != len(set(group_ids)):
             raise FlatKVPDProtocolError("manifest contains duplicate group IDs")
-        pages = [page for group in groups for page in group.page_ids]
-        if len(pages) > MAX_FLATKV_MANIFEST_PAGES:
+        page_count = sum(len(group.page_ids) for group in groups)
+        if page_count > MAX_FLATKV_MANIFEST_PAGES:
             raise FlatKVPDProtocolError("manifest contains too many pages")
-        if len(pages) != len(set(pages)):
-            raise FlatKVPDProtocolError("manifest repeats a globally owned page ID")
 
     def to_wire_bytes(self) -> bytes:
         return _encode(
@@ -488,6 +639,11 @@ def _logical_slots(
     raise FlatKVPDProtocolError(f"unsupported transfer policy {policy!r}")
 
 
+def _group_page_count(group: FlatKVPDGroup, num_pages_with_null: int) -> int:
+    """Resolve one group's child-page capacity from the registered parents."""
+    return 1 + (num_pages_with_null - 1) * group.cache_blocks_per_lcm_block
+
+
 def validate_flatkv_peer_layout(
     layout: FlatKVPDLayout, peer_layout: FlatKVPDPeerLayout
 ) -> None:
@@ -502,6 +658,20 @@ def validate_flatkv_peer_layout(
     if layout.layout_fingerprint != peer_layout.layout_fingerprint:
         raise FlatKVPDProtocolError(
             "FlatKV P/D layout ABI mismatch: layout_fingerprint"
+        )
+    local_keys = {
+        (group.group_id, segment.field_id)
+        for group in layout.groups
+        for segment in group.transfer_segments
+    }
+    peer_keys = {
+        (offset.group_id, offset.field_id) for offset in peer_layout.page_zero_offsets
+    }
+    if local_keys != peer_keys:
+        raise FlatKVPDProtocolError(
+            "FlatKV P/D layout ABI mismatch: page_zero_offsets "
+            f"missing={sorted(local_keys - peer_keys)} "
+            f"extra={sorted(peer_keys - local_keys)}"
         )
 
 
@@ -535,7 +705,8 @@ def validate_flatkv_manifest(
                 f"{peer} manifest group {group.group_id!r} page count disagrees "
                 "with its transfer policy"
             )
-        if any(page >= capacity for page in group.page_ids):
+        group_capacity = _group_page_count(layout_group, capacity)
+        if any(page >= group_capacity for page in group.page_ids):
             raise FlatKVPDProtocolError(
                 f"{peer} manifest group {group.group_id!r} has an out-of-bounds page"
             )
@@ -623,6 +794,7 @@ def build_flatkv_page_manifest(
         "scheduler returned duplicate group IDs",
     )
     expected_ids = tuple(group.group_id for group in layout.groups)
+    layout_groups_by_id = {group.group_id: group for group in layout.groups}
     if set(actual_ids) != set(expected_ids):
         raise FlatKVPDProtocolError(
             "scheduler group IDs disagree with the FlatKV layout: "
@@ -661,7 +833,8 @@ def build_flatkv_page_manifest(
             int(table[request_row, logical_slot]) for logical_slot in logical_slots
         )
         for logical_slot, page_id in zip(logical_slots, page_ids, strict=True):
-            if page_id <= 0 or page_id >= layout.num_pages_with_null:
+            group_capacity = _group_page_count(layout_group, layout.num_pages_with_null)
+            if page_id <= 0 or page_id >= group_capacity:
                 raise FlatKVPDProtocolError(
                     f"table {layout_group.group_id!r} logical slot {logical_slot} "
                     f"has invalid page ID {page_id}"
@@ -678,7 +851,7 @@ def build_flatkv_page_manifest(
     )
 
     selected = {
-        page_id: (group.group_id, logical_slot)
+        (group.group_id, page_id): logical_slot
         for group, layout_group in zip(manifest.groups, layout.groups, strict=True)
         for page_id, logical_slot in zip(
             group.page_ids,
@@ -694,15 +867,16 @@ def build_flatkv_page_manifest(
     for group_id, table, selected_slots in inspected:
         for logical_slot, raw_page in enumerate(table[request_row]):
             page_id = int(raw_page)
+            layout_group = layout_groups_by_id[group_id]
+            group_capacity = _group_page_count(layout_group, layout.num_pages_with_null)
             if (
                 logical_slot not in selected_slots
-                and 0 < page_id < layout.num_pages_with_null
-                and page_id in selected
+                and 0 < page_id < group_capacity
+                and (group_id, page_id) in selected
             ):
-                owner_group, owner_slot = selected[page_id]
                 raise FlatKVPDProtocolError(
-                    f"selected page {page_id} for {owner_group!r} slot "
-                    f"{owner_slot} aliases live unselected {group_id!r} slot "
+                    f"selected page {page_id} for {group_id!r} slot "
+                    f"{selected[(group_id, page_id)]} aliases live unselected slot "
                     f"{logical_slot}"
                 )
     return manifest
@@ -759,3 +933,158 @@ def validate_flatkv_slab_registrations(
     ):
         raise FlatKVPDProtocolError(f"{peer} registered slab extents overlap")
     return result
+
+
+def build_lcm_flatkv_pd_contract(
+    *,
+    plan: object,
+    backing: object,
+    group_specs: object,
+    field_dtypes: Mapping[str, str],
+) -> tuple[FlatKVPDLayout, tuple[FlatKVPDSLabRegistration, ...]]:
+    """Describe one LCM arena without copying or flattening its backing."""
+    groups = tuple(getattr(plan, "groups", ()))
+    fields = tuple(getattr(plan, "fields", ()))
+    planes = tuple(getattr(plan, "planes", ()))
+    specs = tuple(group_specs)
+    plan_group_ids = tuple(group.group_id for group in groups)
+    spec_group_ids = tuple(spec.group_id for spec in specs)
+    if set(plan_group_ids) != set(spec_group_ids):
+        raise FlatKVPDProtocolError(
+            "LCM plan and scheduler group IDs disagree: "
+            f"missing={sorted(set(plan_group_ids) - set(spec_group_ids))}, "
+            f"extra={sorted(set(spec_group_ids) - set(plan_group_ids))}"
+        )
+    if set(field_dtypes) != {field.field_id for field in fields}:
+        raise FlatKVPDProtocolError(
+            "LCM field dtype map must contain exactly the planned fields"
+        )
+
+    plan_groups = {group.group_id: group for group in groups}
+    plan_planes = {plane.plane_id: plane for plane in planes}
+    transfer_groups = []
+    for spec in specs:
+        group = plan_groups[spec.group_id]
+        transfer_policy = getattr(spec, "transfer_policy", None)
+        if transfer_policy is None:
+            raise FlatKVPDProtocolError(
+                f"LCM PD group {spec.group_id!r} requires a transfer policy"
+            )
+        group_fields = tuple(
+            field for field in fields if field.group_id == spec.group_id
+        )
+        if not group_fields:
+            raise FlatKVPDProtocolError(
+                f"LCM PD group {spec.group_id!r} has no planned fields"
+            )
+        segments = []
+        for field in group_fields:
+            plane = plan_planes[field.plane_id]
+            segments.append(
+                FlatKVPDTransferSegment(
+                    physical_slot=0,
+                    field_id=field.field_id,
+                    dtype=field_dtypes[field.field_id],
+                    page_zero_offset=(
+                        plane.arena_offset_bytes
+                        + plane.bytes_per_lcm_block
+                        - field.page_stride_bytes
+                        + field.field_offset_bytes
+                    ),
+                    page_stride_bytes=field.page_stride_bytes,
+                    payload_bytes=field.payload_bytes,
+                )
+            )
+        transfer_groups.append(
+            FlatKVPDGroup(
+                group_id=spec.group_id,
+                family=spec.family,
+                transfer_policy=transfer_policy,
+                physical_slots=(0,),
+                cache_blocks_per_lcm_block=group.cache_blocks_per_lcm_block,
+                transfer_segments=tuple(segments),
+            )
+        )
+
+    fingerprint_payload = {
+        "schema_version": FLATKV_PD_PROTOCOL_VERSION,
+        "logical_block_tokens": int(plan.logical_block_tokens),
+        "lcm_block_bytes": int(plan.lcm_block_bytes),
+        "groups": [
+            {
+                "order": order,
+                "group_id": spec.group_id,
+                "family": spec.family,
+                "transfer_policy": spec.transfer_policy,
+                "retention": spec.retention,
+                "sliding_window_tokens": spec.sliding_window_tokens,
+                "cache_blocks_per_lcm_block": plan_groups[
+                    spec.group_id
+                ].cache_blocks_per_lcm_block,
+            }
+            for order, spec in enumerate(specs)
+        ],
+        # Omit arena_offset_bytes: plane-major packing scales those offsets with
+        # num_lcm_blocks, which is peer-local capacity rather than shared ABI.
+        "planes": [
+            {
+                "plane_id": plane.plane_id,
+                "bytes_per_lcm_block": plane.bytes_per_lcm_block,
+            }
+            for plane in planes
+        ],
+        "fields": [
+            {
+                "group_id": field.group_id,
+                "field_id": field.field_id,
+                "plane_id": field.plane_id,
+                "shape": field.shape,
+                "dtype": field_dtypes[field.field_id],
+                "element_size": field.element_size,
+                "field_offset_bytes": field.field_offset_bytes,
+                "page_stride_bytes": field.page_stride_bytes,
+            }
+            for field in fields
+        ],
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            fingerprint_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("ascii")
+    ).hexdigest()
+    layout = FlatKVPDLayout(
+        version=FLATKV_PD_PROTOCOL_VERSION,
+        layout_fingerprint=fingerprint,
+        block_size=int(plan.logical_block_tokens),
+        num_pages_with_null=int(plan.num_lcm_blocks) + 1,
+        physical_buffer_ids=("lcm_arena",),
+        physical_page_bytes=int(plan.lcm_block_bytes),
+        groups=tuple(transfer_groups),
+    )
+
+    if (
+        getattr(backing, "dtype", None) is None
+        or str(backing.dtype) != "torch.uint8"
+        or not backing.is_contiguous()
+        or backing.storage_offset() != 0
+        or backing.data_ptr() != backing.untyped_storage().data_ptr()
+        or int(backing.nbytes) != int(plan.arena_bytes)
+    ):
+        raise FlatKVPDProtocolError(
+            "LCM PD backing must be the contiguous uint8 arena owner"
+        )
+    registrations = (
+        FlatKVPDSLabRegistration(
+            physical_slot=0,
+            buffer_id="lcm_arena",
+            base_addr=backing.data_ptr(),
+            length=backing.nbytes,
+        ),
+    )
+    return layout, validate_flatkv_slab_registrations(
+        registrations, layout=layout, peer="local"
+    )

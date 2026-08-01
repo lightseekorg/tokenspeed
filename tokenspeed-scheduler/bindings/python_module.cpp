@@ -180,21 +180,29 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                std::int32_t entry_stride_tokens, std::int32_t total_pages,
                tokenspeed::PagedCacheGroupConfig::Retention retention,
                std::optional<std::int32_t> sliding_window_tokens, tokenspeed::PagedCacheGroupFamily family,
-               tokenspeed::PagedCacheTransferPolicy transfer_policy) {
-                new (self) tokenspeed::PagedCacheGroupConfig{
-                    std::move(group_id), rows_per_page, entry_stride_tokens,   total_pages,
-                    /*block_size=*/0,    retention,     sliding_window_tokens, family,      transfer_policy};
+               std::int32_t cache_blocks_per_lcm_block, tokenspeed::PagedCacheTransferPolicy transfer_policy) {
+                new (self) tokenspeed::PagedCacheGroupConfig{std::move(group_id),
+                                                             rows_per_page,
+                                                             entry_stride_tokens,
+                                                             total_pages,
+                                                             /*block_size=*/0,
+                                                             cache_blocks_per_lcm_block,
+                                                             retention,
+                                                             sliding_window_tokens,
+                                                             family,
+                                                             transfer_policy};
             },
             nb::arg("group_id"), nb::arg("rows_per_page"), nb::arg("entry_stride_tokens"), nb::arg("total_pages"),
             nb::arg("retention") = tokenspeed::PagedCacheGroupConfig::Retention::FullHistory,
             nb::arg("sliding_window_tokens") = std::nullopt,
-            nb::arg("family") = tokenspeed::PagedCacheGroupFamily::History,
+            nb::arg("family") = tokenspeed::PagedCacheGroupFamily::History, nb::arg("cache_blocks_per_lcm_block") = 1,
             nb::arg("transfer_policy") = tokenspeed::PagedCacheTransferPolicy::Unspecified)
         .def_rw("group_id", &tokenspeed::PagedCacheGroupConfig::group_id)
         .def_rw("rows_per_page", &tokenspeed::PagedCacheGroupConfig::rows_per_page)
         .def_rw("entry_stride_tokens", &tokenspeed::PagedCacheGroupConfig::entry_stride_tokens)
         .def_rw("total_pages", &tokenspeed::PagedCacheGroupConfig::total_pages)
         .def_rw("block_size", &tokenspeed::PagedCacheGroupConfig::block_size)
+        .def_rw("cache_blocks_per_lcm_block", &tokenspeed::PagedCacheGroupConfig::cache_blocks_per_lcm_block)
         .def_rw("retention", &tokenspeed::PagedCacheGroupConfig::retention)
         .def_rw("sliding_window_tokens", &tokenspeed::PagedCacheGroupConfig::sliding_window_tokens)
         .def_rw("family", &tokenspeed::PagedCacheGroupConfig::family)
@@ -253,6 +261,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             "num_host_pages", [](const tokenspeed::SchedulerConfig& c) { return c.host_allocator.total_pages; },
             [](tokenspeed::SchedulerConfig& c, std::int32_t v) { c.host_allocator.total_pages = v; })
         .def_rw("paged_cache_groups", &tokenspeed::SchedulerConfig::paged_cache_groups)
+        .def_rw("paged_cache_host_group_pages", &tokenspeed::SchedulerConfig::paged_cache_host_group_pages)
         .def_rw("prefix_cache_adjunct", &tokenspeed::SchedulerConfig::prefix_cache_adjunct)
         .def_rw("disable_l2_cache", &tokenspeed::SchedulerConfig::disable_l2_cache)
         .def_rw("enable_l3_storage", &tokenspeed::SchedulerConfig::enable_l3_storage)
@@ -402,6 +411,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .value("KV", tokenspeed::CacheKind::kKV)
         .value("MAMBA", tokenspeed::CacheKind::kMamba);
 
+    nb::class_<tokenspeed::PagedCacheTransferPair>(cache, "PagedCacheTransferPair")
+        .def_ro("group_id", &tokenspeed::PagedCacheTransferPair::group_id)
+        .def_ro("src_pages", &tokenspeed::PagedCacheTransferPair::src_pages)
+        .def_ro("dst_pages", &tokenspeed::PagedCacheTransferPair::dst_pages);
+
     auto prefetch_op = nb::class_<tokenspeed::PrefetchOperation>(cache, "PrefetchOp");
     BindCacheCommonFields<tokenspeed::PrefetchOperation>(prefetch_op);
     prefetch_op.def(nb::init<>())
@@ -417,7 +431,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("src_pages", &tokenspeed::FlatLoadBackOperation::src_pages)
         .def_ro("dst_pages", &tokenspeed::FlatLoadBackOperation::dst_pages)
         .def_ro("src_pages_by_kind", &tokenspeed::FlatLoadBackOperation::src_pages_by_kind)
-        .def_ro("dst_pages_by_kind", &tokenspeed::FlatLoadBackOperation::dst_pages_by_kind);
+        .def_ro("dst_pages_by_kind", &tokenspeed::FlatLoadBackOperation::dst_pages_by_kind)
+        .def_ro("paged_cache_transfers", &tokenspeed::FlatLoadBackOperation::paged_cache_transfers);
 
     nb::class_<tokenspeed::FlatWriteBackOperation>(cache, "WriteBackOp")
         .def_ro("op_ids", &tokenspeed::FlatWriteBackOperation::op_ids)
@@ -425,6 +440,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("dst_pages", &tokenspeed::FlatWriteBackOperation::dst_pages)
         .def_ro("src_pages_by_kind", &tokenspeed::FlatWriteBackOperation::src_pages_by_kind)
         .def_ro("dst_pages_by_kind", &tokenspeed::FlatWriteBackOperation::dst_pages_by_kind)
+        .def_ro("paged_cache_transfers", &tokenspeed::FlatWriteBackOperation::paged_cache_transfers)
         .def_ro("is_retract", &tokenspeed::FlatWriteBackOperation::is_retract);
 
     auto collect_forward = [](const tokenspeed::ExecutionPlan& plan) -> nb::list {
@@ -458,13 +474,22 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("capacity_pages", &tokenspeed::FlatTerminalError::capacity_pages)
         .def_ro("message", &tokenspeed::FlatTerminalError::message);
 
+    auto collect_scheduler_aborts = [](const tokenspeed::ExecutionPlan& plan) -> nb::list {
+        nb::list result;
+        for (const auto& abort : plan.SchedulerAborts()) {
+            result.append(nb::make_tuple(abort.request_id, abort.message));
+        }
+        return result;
+    };
+
     nb::class_<tokenspeed::ExecutionPlan>(m, "ExecutionPlan")
         .def(nb::init<>())
         .def_prop_ro("forward", collect_forward)
         .def_prop_ro("cache", collect_cache)
         .def_ro("flat_oom_request_ids", &tokenspeed::ExecutionPlan::flat_oom_request_ids)
-        .def_ro("flat_page_ids_to_zero", &tokenspeed::ExecutionPlan::flat_page_ids_to_zero)
-        .def_ro("flat_terminal_errors", &tokenspeed::ExecutionPlan::flat_terminal_errors);
+        .def_ro("flat_pages_to_zero", &tokenspeed::ExecutionPlan::flat_pages_to_zero)
+        .def_ro("flat_terminal_errors", &tokenspeed::ExecutionPlan::flat_terminal_errors)
+        .def_prop_ro("scheduler_aborts", collect_scheduler_aborts);
 
     nb::class_<tokenspeed::Scheduler>(m, "Scheduler")
         .def(nb::init<tokenspeed::SchedulerConfig>(), nb::arg("config") = tokenspeed::SchedulerConfig{})
@@ -498,6 +523,12 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("paged_cache_group_available_pages", &tokenspeed::Scheduler::PagedCacheGroupAvailablePages,
              nb::arg("group_id"))
         .def("paged_cache_group_failed_alloc_count", &tokenspeed::Scheduler::PagedCacheGroupFailedAllocCount,
+             nb::arg("group_id"))
+        .def("paged_cache_host_group_total_pages", &tokenspeed::Scheduler::PagedCacheHostGroupTotalPages,
+             nb::arg("group_id"))
+        .def("paged_cache_host_group_available_pages", &tokenspeed::Scheduler::PagedCacheHostGroupAvailablePages,
+             nb::arg("group_id"))
+        .def("paged_cache_host_group_failed_alloc_count", &tokenspeed::Scheduler::PagedCacheHostGroupFailedAllocCount,
              nb::arg("group_id"))
         .def("get_request_paged_cache_page_ids", &tokenspeed::Scheduler::GetRequestPagedCachePageIds,
              nb::arg("request_id"), nb::arg("group_id"))

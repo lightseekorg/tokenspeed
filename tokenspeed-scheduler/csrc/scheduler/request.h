@@ -54,7 +54,6 @@ public:
 
     std::string Id() const { return id_; }
 
-    // Keep Apply the only non-const function in Request
     // The wrapper lambda converts any concrete state type returned by event's operator()
     // into fsm::State, allowing operator() to return specific state types instead of State.
     template <typename Event>
@@ -196,6 +195,34 @@ public:
             state_);
     }
 
+#if TOKENSPEED_FLAT_KVCACHE
+    std::vector<BlockTable>& FlatBlockTablesRef() {
+        return std::visit(Overloaded{
+            []<typename T>(T& s) -> std::vector<BlockTable>&
+                requires(std::derived_from<T, fsm::ForwardState>)
+            { return s.BlockTables(); },
+            [this](auto&) -> std::vector<BlockTable>& {
+                throw std::logic_error("Request::FlatBlockTablesRef: expected a forward state; got state=" +
+                                       StateName());
+            },
+            },
+            state_);
+    }
+
+    fsm::FlatCacheProgress FlatCacheProgress() const {
+        return std::visit(Overloaded{
+            []<typename T>(const T& state) -> fsm::FlatCacheProgress
+                requires(std::derived_from<T, fsm::ForwardState>)
+            { return state.FlatCacheProgressValue(); },
+            [this](const auto&) -> fsm::FlatCacheProgress {
+                throw std::logic_error("Request::FlatCacheProgress: expected a forward state; got state=" +
+                                       StateName());
+            },
+            },
+            state_);
+    }
+#endif
+
     const TreeNode* GetDeviceNode() const {
         return std::visit(Overloaded{
             []<typename T>(const T& s) -> const TreeNode*
@@ -309,6 +336,36 @@ public:
             { return s.GetPagesToTransfer(); },
             [this](const auto&) -> const std::vector<typename S::PagePair>& {
                 throw std::logic_error("Request::GetPagesToTransfer: expected state=" +
+                                       std::string(detail::TypeName<S>()) + "; got state=" + StateName());
+            },
+            },
+            state_);
+    }
+
+    template <typename S>
+        requires(std::same_as<S, fsm::Draining> || std::same_as<S, fsm::Retracting>)
+    const std::vector<PagedCacheTransferPair>& GetPagedCacheWriteBackTransfers() const {
+        return std::visit(Overloaded{
+            []<typename T>(const T& s) -> const std::vector<PagedCacheTransferPair>&
+                requires(std::same_as<T, S>)
+            { return s.GetPagedCacheWriteBackTransfers(); },
+            [this](const auto&) -> const std::vector<PagedCacheTransferPair>& {
+                throw std::logic_error("Request::GetPagedCacheWriteBackTransfers: expected state=" +
+                                       std::string(detail::TypeName<S>()) + "; got state=" + StateName());
+            },
+            },
+            state_);
+    }
+
+    template <typename S>
+        requires(std::same_as<S, fsm::Draining> || std::same_as<S, fsm::Retracting>)
+    const std::vector<TreeNode*>& GetPagedCacheWriteBackNodes() const {
+        return std::visit(Overloaded{
+            []<typename T>(const T& s) -> const std::vector<TreeNode*>&
+                requires(std::same_as<T, S>)
+            { return s.PagedCacheWriteBackNodes(); },
+            [this](const auto&) -> const std::vector<TreeNode*>& {
+                throw std::logic_error("Request::GetPagedCacheWriteBackNodes: expected state=" +
                                        std::string(detail::TypeName<S>()) + "; got state=" + StateName());
             },
             },

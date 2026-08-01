@@ -348,6 +348,15 @@ class InklingForConditionalGenerationNextN(nn.Module):
     # local_layer_ids resolve each depth's ckpt/served head counts.
     _replicate_kv_heads = InklingForConditionalGeneration._replicate_kv_heads
 
+    def checkpoint_weight_name_filter(self, name: str) -> bool:
+        """Shard preselection for ``load_weights`` (see DefaultModelLoader).
+
+        Accepts a superset of the checkpoint names ``load_weights`` consumes:
+        the ``model.mtp.*`` tensors plus the base embedding norm.
+        """
+        name = name.removeprefix("model.")
+        return name.startswith("mtp.") or name == "llm.embed_norm.weight"
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load the ``model.mtp.*`` tensors (all BF16).
 

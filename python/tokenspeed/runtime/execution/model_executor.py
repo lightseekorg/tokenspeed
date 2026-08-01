@@ -21,11 +21,13 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.tuning import freeze_autotuning
+import torch.distributed as dist
+from tokenspeed_kernel.ops.tuning import autotune, set_autotune_max_num_tokens
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
@@ -39,6 +41,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     paged_cache_block_table_base_offsets_from_forward_op,
     paged_cache_block_tables_from_forward_op,
 )
+from tokenspeed.runtime.execution.breakable_cuda_graph import active_forward
 from tokenspeed.runtime.execution.cache_loc_kernel import update_block_table
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
@@ -155,7 +158,7 @@ class ModelExecutorConfig:
     max_req_pool_size: int
     output_length: int
     enforce_eager: bool
-    block_size: int
+    logical_page_size: int
     max_num_seqs: int
     chunked_prefill_size: int
     vocab_size: int
@@ -209,6 +212,7 @@ class ModelExecutorConfig:
         gpu_id: int,
         global_rank: int,
         num_total_pages: int,
+        logical_page_size: int,
         overlap_schedule_depth: int = 0,
     ) -> ModelExecutorConfig:
         output_length = (
@@ -223,7 +227,7 @@ class ModelExecutorConfig:
             max_req_pool_size=max_req_pool_size,
             output_length=output_length,
             enforce_eager=server_args.enforce_eager,
-            block_size=server_args.block_size,
+            logical_page_size=logical_page_size,
             max_num_seqs=server_args.max_num_seqs,
             chunked_prefill_size=server_args.chunked_prefill_size,
             vocab_size=model_config.vocab_size,
@@ -279,7 +283,7 @@ class ModelExecutor:
         self.sampling_backend = sampling_backend
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
-        # FlatKV contract pools (FlatHybridCachePool) publish a runtime
+        # FlatKV contract pools publish a runtime
         # contract; on that path per-step tables travel as
         # FlatCacheBatchMetadata and the legacy req_to_page mirror is
         # forbidden.
@@ -330,13 +334,13 @@ class ModelExecutor:
                 config.context_len
                 + config.spec_num_tokens
                 + draft_block_reservation_slack
-                + config.block_size
+                + config.logical_page_size
                 - 1
-            ) // config.block_size
+            ) // config.logical_page_size
         else:
             max_num_pages_per_req = (
-                config.context_len + config.block_size
-            ) // config.block_size
+                config.context_len + config.logical_page_size
+            ) // config.logical_page_size
 
         max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
 
@@ -354,7 +358,7 @@ class ModelExecutor:
         # the caller locs computed from it are never consumed there (the
         # Inkling rel path asserts loc/row agreement).
         self._draft_page_size = int(
-            getattr(draft_token_to_kv_pool, "page_size", 0) or config.block_size
+            getattr(draft_token_to_kv_pool, "page_size", 0) or config.logical_page_size
         )
         self.input_buffers = InputBuffers(
             max_bs=max_bs,
@@ -572,8 +576,8 @@ class ModelExecutor:
             logger.info("Finished prewarming Triton RSAG communication states")
 
         # Breakable prefill (extend) CUDA graphs, the extend-mode analogue of
-        # the decode wrapper above; captures in __init__, borrowing the decode
-        # capture stream so all graphs share one mempool-reuse domain.
+        # the decode wrapper above; borrows the decode capture stream so all
+        # graphs share one mempool-reuse domain.
         self.prefill_graph = PrefillGraph(
             model_runner=self.model_runner,
             attn_backend=attn_backend,
@@ -582,8 +586,17 @@ class ModelExecutor:
             config=config,
             req_to_page=self.req_to_page,
             drafter=self.drafter,
-            decode_wrapper=self.forward_step,
         )
+        # Load every prefill-shaped kernel before serving; serving must never
+        # first-execute a kernel. No-op when graph capture already ran.
+        self.prefill_graph.warmup_eager(self.forward_step)
+
+        self._autotune()
+
+        if not self.forward_step.disable:
+            self.forward_step.capture()
+        if not self.prefill_graph.disable:
+            self.prefill_graph.capture(self.forward_step)
 
         # Encoder CUDA graph: install model-built wrappers by overriding
         # modality encoder callables (e.g. ``image_encoder``, ``video_encoder``).
@@ -646,10 +659,41 @@ class ModelExecutor:
 
         set_random_seed(48)
 
-        # Startup has tuned every size class it serves; serving must never autotune.
-        freeze_autotuning()
-
         logger.info("ModelExecutor initialized")
+
+    def _autotune(self) -> None:
+        """Profile tunable kernels over one dummy prefill, before graph capture.
+
+        Runs a single extend forward at the largest token count a forward can
+        carry; the tuner enumerates every smaller shape bucket from it, so no
+        decode-sized pass is needed. Must precede capture: a captured graph
+        records the tactic chosen while it was recorded, so tuning afterwards
+        cannot change a replay.
+        """
+        num_tokens = int(self.config.chunked_prefill_size)
+        if num_tokens <= 0 or self.model_runner is None:
+            return
+        set_autotune_max_num_tokens(num_tokens)
+        logger.info(f"Kernel tuning with a dummy prefill of {num_tokens} tokens")
+        ib = self.input_buffers
+        tic = time.time()
+        with autotune(), maybe_inference_mode():
+            ctx = self.prefill_graph.make_dummy_batch(num_tokens, self.forward_step)
+            positions = (
+                ib.mrope_positions_buf[:, :num_tokens]
+                if self.config.model_is_mrope
+                else ib.positions_buf[:num_tokens]
+            )
+            with active_forward(ctx):
+                self.model_runner.forward(
+                    ctx=ctx,
+                    input_ids=ib.input_ids_buf[:num_tokens],
+                    positions=positions,
+                    out_cache_loc=ib.out_cache_loc_buf[:num_tokens],
+                )
+        torch.cuda.synchronize()
+        dist.barrier()
+        logger.info(f"Kernel tuning finished in {time.time() - tic:.1f}s")
 
     @staticmethod
     def _make_mrope_decode_deltas_cpu(size: int) -> torch.Tensor:
@@ -793,11 +837,7 @@ class ModelExecutor:
             else:
                 positions = self.input_buffers.positions_buf[: ctx.input_num_tokens]
         # Prefill-graph replay when captured for this forward (the decode graph
-        # replays one level up: it captures the whole _forward_step). The mode
-        # check is LOAD-BEARING, not an optimization: the decode capture runs
-        # this dispatch before prefill_graph exists (it is constructed after
-        # the decode wrapper, whose capture stream it borrows), and decode-mode
-        # forwards must short-circuit before touching it.
+        # replays one level up: it captures the whole _forward_step).
         mode = ctx.forward_mode
         gather_ids = self._target_gather_ids(bs, ctx)
         if (
@@ -1205,7 +1245,7 @@ class ModelExecutor:
 
         req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
         track_indices = self.input_buffers.mamba_track_pool_indices_buf[:bs]
-        page_size = self.config.block_size
+        page_size = self.config.logical_page_size
         dev = req_pool_indices.device
         sentinel = self._sentinel_neg1
 
@@ -1531,27 +1571,43 @@ class ModelExecutor:
                 req_to_page=self.req_to_page,
             )
 
-    def zero_flat_cache_pages(self, page_ids):
+    def zero_flat_cache_pages(self, pages):
         """Clear newly owned pages and return a CUDA completion event when needed."""
-        if not page_ids:
+        if not pages:
             return None
+        zero_new_pages = getattr(self.token_to_kv_pool, "zero_new_pages", None)
         zero_pages = getattr(self.token_to_kv_pool, "zero_pages", None)
-        if not callable(zero_pages):
+        if isinstance(pages, Mapping) and callable(zero_new_pages):
+            sanitizer = zero_new_pages
+            sanitizer_arg = pages
+        elif callable(zero_pages):
+            if isinstance(pages, Mapping):
+                page_ids = sorted(
+                    {
+                        int(page_id)
+                        for group_pages in pages.values()
+                        for page_id in group_pages
+                    }
+                )
+            else:
+                page_ids = pages
+            sanitizer = zero_pages
+            sanitizer_arg = page_ids
+        else:
             # A pool only needs sanitization if it aliases recurrent-state and
             # KV bytes in one slab (it then declares this and implements
-            # zero_pages). Pure-attention pools do not alias state -- reused
-            # pages are overwritten and their tails are never read past
-            # seq_len -- so the scheduler's page-reuse list is safely ignored.
+            # a sanitizer). Pure-attention pools do not alias state, so reused
+            # pages are overwritten and their tails are never read past seq_len.
             # Still fail loudly if a pool that *declares* it needs zeroing
             # forgot to implement it.
             if getattr(self.token_to_kv_pool, "flat_kv_requires_page_zeroing", False):
                 raise RuntimeError(
-                    "scheduler emitted flat_page_ids_to_zero but the active KV "
+                    "scheduler emitted flat pages to zero but the active KV "
                     "pool does not implement physical-page sanitization"
                 )
             return None
         with nvtx_range("zero_flat_cache_pages", color="purple"):
-            zero_pages(page_ids)
+            sanitizer(sanitizer_arg)
         if torch.device(self.device).type != "cuda":
             return None
         done = torch.cuda.Event()

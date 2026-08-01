@@ -31,7 +31,6 @@
 #include "fsm/cache_states.h"
 #include "fsm/forward_events.h"
 #include "fsm/forward_states.h"
-#include "fsm/pd_states.h"
 #include "resource/allocator/kv_allocator.h"
 #include "resource/allocator/owned_pages.h"
 #include "resource/allocator/req_pool_allocator.h"
@@ -43,7 +42,6 @@
 
 #if TOKENSPEED_FLAT_KVCACHE
 #include "cache/forward_cache_ops.h"
-#include "scheduler/page_hasher.h"
 #endif
 
 namespace {
@@ -59,6 +57,54 @@ std::vector<tokenspeed::TransferPair> BuildWriteBackPairs(const std::vector<toke
         }
     }
     return pages_to_transfer;
+}
+
+template <tokenspeed::ResourceType RType>
+tokenspeed::TreeNode* LastNodeWithResourceOrRoot(tokenspeed::TreeNode* node) {
+    for (tokenspeed::TreeNode* candidate = node; candidate != nullptr; candidate = candidate->Parent()) {
+        if (candidate->IsRoot()) return candidate;
+        if constexpr (RType == tokenspeed::ResourceType::Device) {
+            if (candidate->OnDevice()) {
+                return candidate;
+            }
+        } else {
+            if (candidate->OnHost()) {
+                return candidate;
+            }
+        }
+    }
+    return nullptr;
+}
+
+struct KVResourceNodes {
+    tokenspeed::TreeNode* device_node{nullptr};
+    tokenspeed::TreeNode* host_node{nullptr};
+    std::int32_t device_page_size{0};
+    std::int32_t host_page_size{0};
+
+    std::int32_t DeviceDepthInPage() const {
+        return device_node == nullptr ? 0 : device_node->DepthInPage(device_page_size);
+    }
+
+    std::int32_t HostDepthInPage() const { return host_node == nullptr ? 0 : host_node->DepthInPage(host_page_size); }
+
+    std::vector<tokenspeed::TreeNode*> NodesWithoutDevice() const {
+        std::vector<tokenspeed::TreeNode*> result;
+        for (tokenspeed::TreeNode* node : tokenspeed::LeafToRoot(host_node)) {
+            if (node->OnDevice()) break;
+            result.push_back(node);
+        }
+        return result;
+    }
+};
+
+KVResourceNodes GetKVResourceNodes(const tokenspeed::MatchResult& match) {
+    return KVResourceNodes{
+        LastNodeWithResourceOrRoot<tokenspeed::ResourceType::Device>(match.device.last_node),
+        LastNodeWithResourceOrRoot<tokenspeed::ResourceType::Host>(match.host.last_node),
+        match.device.page_size,
+        match.host.page_size,
+    };
 }
 
 std::vector<tokenspeed::TreeNode*> MambaNodesForTransferPairs(const std::vector<tokenspeed::TreeNode*>& candidates,
@@ -79,6 +125,18 @@ std::vector<tokenspeed::TreeNode*> MambaNodesForTransferPairs(const std::vector<
     return nodes;
 }
 
+std::vector<tokenspeed::TreeNode*> PagedCacheSnapshotNodesForWriteBack(tokenspeed::TreeNode* last_node) {
+    std::vector<tokenspeed::TreeNode*> nodes;
+    for (tokenspeed::TreeNode* node : tokenspeed::LeafToRoot(last_node)) {
+        if (node == nullptr) continue;
+        if (node->HasPagedCacheSnapshot() && !node->HasPagedCacheHostSnapshot() &&
+            !node->HasPagedCachePendingHostSnapshot()) {
+            nodes.push_back(node);
+        }
+    }
+    return nodes;
+}
+
 void DemoteWrittenBackDevice(tokenspeed::KVPrefixCache* kv_prefix_cache,
                              tokenspeed::HybridPrefixCache* hybrid_prefix_cache, tokenspeed::TreeNode* device_node) {
     if (kv_prefix_cache == nullptr || device_node == nullptr) return;
@@ -87,6 +145,28 @@ void DemoteWrittenBackDevice(tokenspeed::KVPrefixCache* kv_prefix_cache,
             hybrid_prefix_cache->OnKVDeviceDemote(n);
         }
     });
+}
+
+void ReleaseFailedHostWriteBack(tokenspeed::KVPrefixCache* kv_prefix_cache,
+                                tokenspeed::HybridPrefixCache* hybrid_prefix_cache,
+                                const std::vector<tokenspeed::TreeNode*>& host_writeback_nodes) {
+    if (kv_prefix_cache == nullptr || host_writeback_nodes.empty()) return;
+    kv_prefix_cache->ReleaseHostResources(host_writeback_nodes, [hybrid_prefix_cache](tokenspeed::TreeNode* n) {
+        if (hybrid_prefix_cache != nullptr) {
+            hybrid_prefix_cache->OnKVHostEvict(n);
+        }
+    });
+}
+
+void RollbackHostWriteBack(tokenspeed::KVPrefixCache* kv_prefix_cache,
+                           tokenspeed::HybridPrefixCache* hybrid_prefix_cache, tokenspeed::fsm::WritingBack& state) {
+    if (hybrid_prefix_cache != nullptr) {
+        hybrid_prefix_cache->OnMambaHostWriteBackDone(state.MambaWriteBackNodes(), false);
+        hybrid_prefix_cache->OnPagedCacheHostWriteBackDone(state.PagedCacheWriteBackNodes(), false);
+    }
+    state.DropHostNodeRef();
+    ReleaseFailedHostWriteBack(kv_prefix_cache, hybrid_prefix_cache, state.HostWriteBackNodes());
+    state.DropDeviceNodeRef();
 }
 
 bool ShouldPublishMambaCheckpoint(tokenspeed::HybridPrefixCache* hybrid_cache, std::int32_t chunk_begin,
@@ -112,45 +192,6 @@ namespace {
 [[noreturn]] void FlatRetractUnsupported() {
     _assert(false, "flat path: retract/writeback/loadback unsupported in C slice");
     throw std::logic_error("flat path: retract/writeback/loadback unsupported in C slice");
-}
-
-// Base-page hashes one decode step hands to registration, anchored at begin_page.
-struct HashesToRegister {
-    std::int32_t begin_page{0};
-    std::vector<std::string> hashes;
-};
-
-// Seed from a full-prefix hash list; the tail keeps the suffix from the last fold-grid boundary.
-HashChain MakeHashChain(const std::vector<std::string>& hashes, std::int32_t fold_align_pages) {
-    const std::int32_t n = static_cast<std::int32_t>(hashes.size());
-    const std::int32_t tail_begin = n / fold_align_pages * fold_align_pages;
-    return HashChain{.num_hashed_pages = n,
-                     .last_hash = n > 0 ? hashes.back() : std::string{},
-                     .tail_begin_page = tail_begin,
-                     .tail = {hashes.begin() + tail_begin, hashes.end()}};
-}
-
-// Hash the newly filled pages onto the chain; the returned batch reaches back to the fold grid
-// (fold_align_pages = lcm/base) so coarse groups fold the blocks completed this step. The
-// re-covered overlap is idempotent (m == 1 degenerates to exactly the fresh pages).
-HashesToRegister AdvanceHashChain(HashChain& chain, const std::vector<std::span<const std::int32_t>>& paged,
-                                  std::int32_t filled_pages, std::int32_t fold_align_pages) {
-    _assert(filled_pages > chain.num_hashed_pages, "caller must pre-check hash-chain progress");
-    _assert(filled_pages <= static_cast<std::int32_t>(paged.size()),
-            "flat decode hashing: filled pages exceed the container's full pages");
-    const std::vector<std::span<const std::int32_t>> fresh(paged.begin() + chain.num_hashed_pages,
-                                                           paged.begin() + filled_pages);
-    std::vector<std::string> new_hashes = ComputePagedHashes(fresh, chain.last_hash);
-
-    HashesToRegister batch{.begin_page = chain.tail_begin_page, .hashes = std::move(chain.tail)};
-    batch.hashes.insert(batch.hashes.end(), new_hashes.begin(), new_hashes.end());
-
-    const std::int32_t tail_begin = filled_pages / fold_align_pages * fold_align_pages;
-    chain.num_hashed_pages = filled_pages;
-    chain.last_hash = batch.hashes.back();
-    chain.tail_begin_page = tail_begin;
-    chain.tail.assign(batch.hashes.begin() + (tail_begin - batch.begin_page), batch.hashes.end());
-    return batch;
 }
 
 }  // namespace
@@ -209,63 +250,37 @@ void InsertHybridCache(HybridPrefixCache* hybrid_cache,
 std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()(Submitted&& state) {
 #if TOKENSPEED_FLAT_KVCACHE
     _assert(coordinator_ != nullptr, "SchedulePrefillFirstChunkEvent: flat path requires a coordinator");
+    _assert(flat_tables_.size() == static_cast<std::size_t>(coordinator_->NumGroups()),
+            "SchedulePrefillFirstChunkEvent requires admitted Flat block tables");
     TokenContainer* token_container = state.GetTokenContainer();
 
     // Slot first: Allocate() throws on exhaustion; order kept for determinism.
     auto req_pool_index = std::make_unique<ReqPoolIndex>(req_pool_allocator_->Allocate());
 
-    std::vector<BlockTable> tables(coordinator_->NumGroups());
-    const std::int32_t device_hit_tokens = flat_hit_.num_common_tokens;
-    const std::int32_t hit_tokens = std::max(device_hit_tokens, flat_host_.num_common_tokens);
-    coordinator_->ClaimCommonPrefix(tables, std::move(flat_hit_));
-    // Extension appends between claim and fresh acquire so slots stay
-    // [device hit | host ext | new pages]; ext pages are FULL, composing with the gate.
-    flat_load_pairs_ = LoadHostExtension(*coordinator_, tables, std::move(flat_host_));
-    // Host boundary is absolute (floor included); default-constructed (no host pool) it is 0.
-    // Loaded pages become device-cached now (SWA holes skipped by the IsNull guard); the sink
-    // re-collects them and the drain dedupes against the host index. The extension ends at the
-    // page-aligned hit boundary, so the state group's final page is exactly the loaded snapshot.
-    coordinator_->CacheFullBlocks(tables, flat_ext_hashes_,
-                                  /*first_slot=*/device_hit_tokens / state.GetPageSize(),
-                                  /*end_tokens=*/hit_tokens);
-    bool acquired = false;
-    if (role_ == Role::kD && enable_flatkv_pd_) {
-        _assert(hit_tokens + tokens_this_round_ == token_container->PrefillSize(),
-                "FlatKV PD decode destination must acquire the complete prompt atomically");
-        acquired = coordinator_->AcquireDecodeDestination(tables, token_container->PrefillSize(), tokens_this_round_,
-                                                          decode_input_tokens_);
-    } else {
-        // Role kD cannot defer its decode reserve until RemotePrefillDone: the
-        // remote transfer may complete after other requests consume the pool.
-        const std::int32_t tokens_to_acquire = tokens_this_round_ + (role_ == Role::kD ? decode_input_tokens_ : 0);
-        acquired = coordinator_->Acquire(tables, tokens_to_acquire);
-    }
-    if (!acquired) {
-        _assert(false, "flat path: allocation failure unsupported in C slice");
-    }
-
-    TokenContainer::Window window{.begin = hit_tokens, .size = tokens_this_round_};
+    TokenContainer::Window window{.begin = flat_hit_tokens_, .size = tokens_this_round_};
     bool is_last_chunk = (window.begin + window.size) == token_container->PrefillSize();
     if (is_last_chunk && role_ != Role::kD) {
         PrefillDone done{token_container, state.GetPageSize(),  nullptr, nullptr, nullptr, std::move(req_pool_index),
                          window,          decode_input_tokens_, nullptr};
-        done.SetBlockTables(std::move(tables));
+        done.SetBlockTables(std::move(flat_tables_));
+        done.SetFlatCacheProgress(std::move(flat_cache_progress_));
         return done;
     }
     Prefilling prefilling{token_container, state.GetPageSize(),       nullptr, nullptr,
                           nullptr,         std::move(req_pool_index), window,  nullptr};
-    prefilling.SetBlockTables(std::move(tables));
+    prefilling.SetBlockTables(std::move(flat_tables_));
+    prefilling.SetFlatCacheProgress(std::move(flat_cache_progress_));
     return prefilling;
 #else
     std::unique_ptr<HostNodeRef> host_node_ref{nullptr};
     std::unique_ptr<DeviceNodeRef> device_node_ref{nullptr};
-    if (!disable_l2_cache_ && (match_result_.host.DepthInPage() > match_result_.device.DepthInPage())) {
-        host_node_ref = std::make_unique<HostNodeRef>(match_result_.host.last_node);
-        kv_prefix_cache_->AllocateResourceOfType<ResourceType::Device>(
-            match_result_.NodesWithout<ResourceType::Device>());
-        device_node_ref = std::make_unique<DeviceNodeRef>(match_result_.host.last_node);
+    const KVResourceNodes kv_nodes = GetKVResourceNodes(match_result_);
+    if (!disable_l2_cache_ && (kv_nodes.HostDepthInPage() > kv_nodes.DeviceDepthInPage())) {
+        host_node_ref = std::make_unique<HostNodeRef>(kv_nodes.host_node);
+        kv_prefix_cache_->AllocateResourceOfType<ResourceType::Device>(kv_nodes.NodesWithoutDevice());
+        device_node_ref = std::make_unique<DeviceNodeRef>(kv_nodes.host_node);
     } else {
-        device_node_ref = std::make_unique<DeviceNodeRef>(match_result_.device.last_node);
+        device_node_ref = std::make_unique<DeviceNodeRef>(kv_nodes.device_node);
     }
 
     auto local_kv_allocator = std::make_unique<LocalKVAllocator>(device_allocator_, tokens_this_round_);
@@ -287,10 +302,13 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
 
     TokenContainer* token_container = state.GetTokenContainer();
 
-    std::int32_t max_matched_pages =
-        disable_l2_cache_ ? match_result_.device.DepthInPage()
-                          : std::max(match_result_.device.DepthInPage(), match_result_.host.DepthInPage());
-    std::int32_t window_begin = max_matched_pages * state.GetPageSize();
+    std::int32_t window_begin = matched_prefix_len_tokens_;
+    if (window_begin < 0) {
+        const std::int32_t max_matched_pages =
+            disable_l2_cache_ ? match_result_.device.DepthInPage()
+                              : std::max(match_result_.device.DepthInPage(), match_result_.host.DepthInPage());
+        window_begin = max_matched_pages * state.GetPageSize();
+    }
     TokenContainer::Window window{.begin = window_begin, .size = tokens_this_round_};
 
     bool is_last_chunk = (window.begin + window.size) == token_container->PrefillSize();
@@ -321,16 +339,7 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
 // Prefilling -> Prefilling / PrefillDone
 std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefilling&& state) {
 #if TOKENSPEED_FLAT_KVCACHE
-    _assert(coordinator_ != nullptr, "SchedulePrefillEvent: flat path requires a coordinator");
-    const std::vector<std::string> hashes = FlatWindowPageHashes(state.GetFullPagedTokens(false), state.GetPageSize(),
-                                                                 state.window.begin, state.window.size);
-    // Prior chunks 0..k-1 (state.window is the PREVIOUS chunk); the gate credited this same slide value.
-    const std::int32_t num_computed_tokens = state.window.begin + state.window.size;
-
     auto tables = std::move(state).TakeBlockTables();
-    if (!PrefillChunk(*coordinator_, tables, hashes, tokens_this_round_, num_computed_tokens)) {
-        _assert(false, "flat path: allocation failure unsupported in C slice");
-    }
 
     TokenContainer::Window window{.begin = state.window.begin + state.window.size, .size = tokens_this_round_};
     bool is_last_chunk = (window.begin + window.size) == state.GetTokenContainer()->PrefillSize();
@@ -345,6 +354,7 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefillin
                          reserve_num_tokens_in_next_schedule_event_,
                          nullptr};
         done.SetBlockTables(std::move(tables));
+        done.SetFlatCacheProgress(std::move(flat_cache_progress_));
         return done;
     }
     Prefilling prefilling{state.GetTokenContainer(),
@@ -356,6 +366,7 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefillin
                           window,
                           nullptr};
     prefilling.SetBlockTables(std::move(tables));
+    prefilling.SetFlatCacheProgress(std::move(flat_cache_progress_));
     return prefilling;
 #else
     auto local_kv_allocator = std::move(state).TakeLocalKVAllocator();
@@ -408,22 +419,12 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefillin
 // PrefillDone -> Decoding: insert prefill pages into tree, then transition to decode.
 Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
 #if TOKENSPEED_FLAT_KVCACHE
-    _assert(coordinator_ != nullptr, "ScheduleDecodeEvent: flat path requires a coordinator");
-    const std::vector<std::string> hashes = FlatWindowPageHashes(state.GetFullPagedTokens(false), state.GetPageSize(),
-                                                                 state.window.begin, state.window.size);
-    const std::int32_t reserve = state.GetReserveNumTokensInNextScheduleEvent();
-    // Full prefill length (window end == PrefillSize()); the PrefillDone gate credited the same value.
-    const std::int32_t num_computed_tokens = state.window.begin + state.window.size;
-
     auto tables = std::move(state).TakeBlockTables();
-    if (!FinalizePrefillAndReserveDecode(*coordinator_, tables, hashes, reserve, num_computed_tokens)) {
-        _assert(false, "flat path: allocation failure unsupported in C slice");
-    }
 
     Decoding decoding{state.GetTokenContainer(),           state.GetPageSize(),  nullptr, nullptr, nullptr,
                       std::move(state).TakeReqPoolIndex(), decode_input_tokens_, nullptr};
     decoding.SetBlockTables(std::move(tables));
-    decoding.SetHashChain(MakeHashChain(hashes, coordinator_->LcmBlockSize() / coordinator_->BaseBlockSize()));
+    decoding.SetFlatCacheProgress(std::move(flat_cache_progress_));
     return decoding;
 #else
     auto local_kv_allocator = std::move(state).TakeLocalKVAllocator();
@@ -458,30 +459,12 @@ Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
 // Decoding -> Decoding: allocate pages for next decode step.
 Decoding ScheduleDecodeEvent::operator()(Decoding&& state) {
 #if TOKENSPEED_FLAT_KVCACHE
-    _assert(coordinator_ != nullptr, "ScheduleDecodeEvent: flat path requires a coordinator");
-    const std::int32_t reserve = state.GetReserveNumTokensInNextScheduleEvent();
-    // Size() includes this round's pending decode tail; sliding at Size() would free a page its
-    // query still reads. scheduleDecode's gate credited the slide with this same value.
-    const std::int32_t num_computed_tokens = state.GetTokenContainer()->Size() - decode_input_tokens_;
-
-    HashChain chain = std::move(state).TakeHashChain();
-    const std::int32_t filled_pages = num_computed_tokens / state.GetPageSize();
-    // A page fills only once every page_size steps; skip the span walk on the other steps.
-    HashesToRegister to_register{.begin_page = chain.num_hashed_pages};
-    if (filled_pages > chain.num_hashed_pages) {
-        to_register = AdvanceHashChain(chain, state.GetFullPagedTokens(false), filled_pages,
-                                       coordinator_->LcmBlockSize() / coordinator_->BaseBlockSize());
-    }
-
     auto tables = std::move(state).TakeBlockTables();
-    if (!DecodeStep(*coordinator_, tables, to_register.hashes, to_register.begin_page, reserve, num_computed_tokens)) {
-        _assert(false, "flat path: allocation failure unsupported in C slice");
-    }
 
     Decoding decoding{state.GetTokenContainer(),           state.GetPageSize(),  nullptr, nullptr, nullptr,
                       std::move(state).TakeReqPoolIndex(), decode_input_tokens_, nullptr};
     decoding.SetBlockTables(std::move(tables));
-    decoding.SetHashChain(std::move(chain));
+    decoding.SetFlatCacheProgress(std::move(flat_cache_progress_));
     return decoding;
 #else
     auto local_kv_allocator = std::move(state).TakeLocalKVAllocator();
@@ -506,17 +489,18 @@ Decoding ScheduleDecodeFromRetractedEvent::operator()(Retracted&& state) {
 #else
     std::unique_ptr<HostNodeRef> host_node_ref{nullptr};
     std::unique_ptr<DeviceNodeRef> device_node_ref{nullptr};
-    if (match_result_.host.DepthInPage() > match_result_.device.DepthInPage()) {
-        host_node_ref = std::make_unique<HostNodeRef>(match_result_.host.last_node);
-        if (!kv_prefix_cache_->AllocateResourceOfType<ResourceType::Device>(
-                match_result_.NodesWithout<ResourceType::Device>())) {
+    const KVResourceNodes kv_nodes = GetKVResourceNodes(match_result_);
+    if (kv_nodes.HostDepthInPage() > kv_nodes.DeviceDepthInPage()) {
+        host_node_ref = std::make_unique<HostNodeRef>(kv_nodes.host_node);
+        if (!kv_prefix_cache_->AllocateResourceOfType<ResourceType::Device>(kv_nodes.NodesWithoutDevice())) {
+            // Device allocation failed (race between capacity check and actual alloc).
             throw std::logic_error(
                 "ScheduleDecodeFromRetractedEvent: failed to allocate device pages for host cache recovery");
         }
-        // Device pages were just attached along the host-matched chain: pinning the HOST last node is not a typo.
-        device_node_ref = std::make_unique<DeviceNodeRef>(match_result_.host.last_node);
+        // This is not a typo
+        device_node_ref = std::make_unique<DeviceNodeRef>(kv_nodes.host_node);
     } else {
-        device_node_ref = std::make_unique<DeviceNodeRef>(match_result_.device.last_node);
+        device_node_ref = std::make_unique<DeviceNodeRef>(kv_nodes.device_node);
     }
     TokenContainer* token_container = state.GetTokenContainer();
     std::int32_t page_size = state.GetPageSize();
@@ -616,14 +600,24 @@ std::variant<Draining, Finished> FinishEvent::apply(ForwardStateT&& state) {
 
         auto pages_to_transfer = BuildWriteBackPairs(write_diff);
         std::vector<TreeNode*> mamba_writeback_nodes;
+        std::vector<PagedCacheTransferPair> paged_cache_writeback_transfers;
+        std::vector<TreeNode*> paged_cache_writeback_nodes;
         if (hybrid_prefix_cache_ != nullptr) {
             auto mamba_pairs = hybrid_prefix_cache_->PrepareMambaHostWriteBack(write_diff);
             mamba_writeback_nodes = MambaNodesForTransferPairs(write_diff, mamba_pairs);
             pages_to_transfer.insert(pages_to_transfer.end(), std::make_move_iterator(mamba_pairs.begin()),
                                      std::make_move_iterator(mamba_pairs.end()));
+            paged_cache_writeback_nodes = PagedCacheSnapshotNodesForWriteBack(match.device.last_node);
+            paged_cache_writeback_transfers =
+                hybrid_prefix_cache_->PreparePagedCacheHostWriteBack(paged_cache_writeback_nodes);
         }
-        return Draining{std::move(pages_to_transfer), std::move(device_node_ref), std::move(host_node_ref),
-                        std::move(mamba_writeback_nodes)};
+        return Draining{std::move(pages_to_transfer),
+                        std::move(device_node_ref),
+                        std::move(host_node_ref),
+                        std::move(write_diff),
+                        std::move(mamba_writeback_nodes),
+                        std::move(paged_cache_writeback_transfers),
+                        std::move(paged_cache_writeback_nodes)};
     }
     return Finished{};
 #endif
@@ -646,15 +640,23 @@ WritingBack FinishEvent::operator()(Retracting&& state) {
 WritingBack CommitDrainingEvent::operator()(Draining&& state) {
     auto device_node_ref = std::move(state).TakeDeviceNodeRef();
     auto host_node_ref = std::move(state).TakeHostNodeRef();
+    auto host_writeback_nodes = std::move(state).TakeHostWriteBackNodes();
     auto mamba_writeback_nodes = std::move(state).TakeMambaWriteBackNodes();
-    return WritingBack{std::move(device_node_ref), std::move(host_node_ref), std::move(mamba_writeback_nodes)};
+    auto paged_cache_writeback_nodes = std::move(state).TakePagedCacheWriteBackNodes();
+    return WritingBack{std::move(device_node_ref), std::move(host_node_ref), std::move(host_writeback_nodes),
+                       std::move(mamba_writeback_nodes), std::move(paged_cache_writeback_nodes)};
 }
 
 // WritingBack -> Finished: written-back cache demotes to host-only, so the next hit must load back.
 Finished WriteBackDoneEvent::operator()(WritingBack&& state) {
     TreeNode* device_node = state.DeviceNode();
+    if (!success_) {
+        RollbackHostWriteBack(kv_prefix_cache_, hybrid_prefix_cache_, state);
+        return Finished{};
+    }
     if (hybrid_prefix_cache_ != nullptr) {
-        hybrid_prefix_cache_->OnMambaHostWriteBackDone(state.MambaWriteBackNodes());
+        hybrid_prefix_cache_->OnMambaHostWriteBackDone(state.MambaWriteBackNodes(), true);
+        hybrid_prefix_cache_->OnPagedCacheHostWriteBackDone(state.PagedCacheWriteBackNodes(), true);
     }
     state.DropDeviceNodeRef();
     DemoteWrittenBackDevice(kv_prefix_cache_, hybrid_prefix_cache_, device_node);
@@ -664,15 +666,20 @@ Finished WriteBackDoneEvent::operator()(WritingBack&& state) {
     return Finished{};
 }
 
-Retracted WriteBackDoneEvent::operator()(Retracting&& state) {
+std::variant<Retracted, Finished> WriteBackDoneEvent::operator()(Retracting&& state) {
 #if TOKENSPEED_FLAT_KVCACHE
     FlatRetractUnsupported();
 #else
+    if (!success_) {
+        RollbackHostWriteBack(kv_prefix_cache_, hybrid_prefix_cache_, state);
+        return Finished{};
+    }
     TokenContainer* token_container = state.GetTokenContainer();
     std::int32_t page_size = state.GetPageSize();
     TreeNode* device_node = state.DeviceNode();
     if (hybrid_prefix_cache_ != nullptr) {
-        hybrid_prefix_cache_->OnMambaHostWriteBackDone(state.MambaWriteBackNodes());
+        hybrid_prefix_cache_->OnMambaHostWriteBackDone(state.MambaWriteBackNodes(), true);
+        hybrid_prefix_cache_->OnPagedCacheHostWriteBackDone(state.PagedCacheWriteBackNodes(), true);
     }
     state.DropDeviceNodeRef();
     DemoteWrittenBackDevice(kv_prefix_cache_, hybrid_prefix_cache_, device_node);
@@ -700,7 +707,15 @@ Aborting AbortEvent::operator()(Prefetching&& state) {
     return Aborting{std::move(state).TakeHostPages()};
 }
 
-Finished AbortEvent::operator()(Draining&&) {
+Finished AbortEvent::operator()(Draining&& state) {
+    auto device_node_ref = std::move(state).TakeDeviceNodeRef();
+    auto host_node_ref = std::move(state).TakeHostNodeRef();
+    auto host_writeback_nodes = std::move(state).TakeHostWriteBackNodes();
+    auto mamba_writeback_nodes = std::move(state).TakeMambaWriteBackNodes();
+    auto paged_cache_writeback_nodes = std::move(state).TakePagedCacheWriteBackNodes();
+    auto writeback = WritingBack{std::move(device_node_ref), std::move(host_node_ref), std::move(host_writeback_nodes),
+                                 std::move(mamba_writeback_nodes), std::move(paged_cache_writeback_nodes)};
+    RollbackHostWriteBack(kv_prefix_cache_, hybrid_prefix_cache_, writeback);
     return Finished{};
 }
 
@@ -745,10 +760,6 @@ Finished AbortEvent::operator()(Decoding&& state) {
     return Finished{};
 }
 
-Finished AbortEvent::operator()(Retracting&&) {
-    return Finished{};
-}
-
 Finished AbortEvent::operator()(Retracted&&) {
     return Finished{};
 }
@@ -783,7 +794,10 @@ Retracting ScheduleRetractEvent::applyRetract(ForwardStateT&& state) {
     std::unique_ptr<DeviceNodeRef> device_node_ref = nullptr;
     std::unique_ptr<HostNodeRef> host_node_ref = nullptr;
     std::vector<Retracting::PagePair> pages_to_transfer;
+    std::vector<TreeNode*> host_writeback_nodes;
     std::vector<TreeNode*> mamba_writeback_nodes;
+    std::vector<PagedCacheTransferPair> paged_cache_writeback_transfers;
+    std::vector<TreeNode*> paged_cache_writeback_nodes;
 
     if (match_result_.device.DepthInPage() > match_result_.host.DepthInPage()) {
         std::vector<TreeNode*> write_diff = match_result_.NodesWithout<ResourceType::Host>();
@@ -791,12 +805,16 @@ Retracting ScheduleRetractEvent::applyRetract(ForwardStateT&& state) {
         if (!kv_prefix_cache_->AllocateResourceOfType<ResourceType::Host>(write_diff)) {
             throw std::logic_error("ScheduleRetractEvent: failed to allocate host pages for device cache writeback");
         }
+        host_writeback_nodes = write_diff;
         pages_to_transfer = BuildWriteBackPairs(write_diff);
         if (hybrid_prefix_cache_ != nullptr) {
             auto mamba_pairs = hybrid_prefix_cache_->PrepareMambaHostWriteBack(write_diff);
             mamba_writeback_nodes = MambaNodesForTransferPairs(write_diff, mamba_pairs);
             pages_to_transfer.insert(pages_to_transfer.end(), std::make_move_iterator(mamba_pairs.begin()),
                                      std::make_move_iterator(mamba_pairs.end()));
+            paged_cache_writeback_nodes = PagedCacheSnapshotNodesForWriteBack(match_result_.device.last_node);
+            paged_cache_writeback_transfers =
+                hybrid_prefix_cache_->PreparePagedCacheHostWriteBack(paged_cache_writeback_nodes);
         }
         host_node_ref = std::make_unique<HostNodeRef>(match_result_.device.last_node);
     } else {
@@ -830,7 +848,10 @@ Retracting ScheduleRetractEvent::applyRetract(ForwardStateT&& state) {
                       std::move(local_allocator),
                       std::move(pages_to_transfer),
                       std::move(mamba_writeback_nodes),
-                      std::move(local_mamba_allocator)};
+                      std::move(local_mamba_allocator),
+                      std::move(paged_cache_writeback_transfers),
+                      std::move(paged_cache_writeback_nodes),
+                      std::move(host_writeback_nodes)};
 #endif
 }
 
