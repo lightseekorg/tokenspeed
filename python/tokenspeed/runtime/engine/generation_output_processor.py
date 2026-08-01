@@ -422,11 +422,10 @@ class OutputProcesser:
             state.set_finish_with_abort("AbortReq from client")
 
     def publish_finished_at_admission(self, rid: str, state: RequestState) -> None:
-        """Stream a finish for a request that was finished before admission.
+        """Stream and release a request finished outside normal forward output.
 
-        Used for grammar-aborted requests (invalid/timed-out compile, missing
-        backend) so the client gets a finish_reason without us wasting a
-        scheduler slot or a forward step on them.
+        Used for grammar admission failures and scheduler-internal aborts so
+        the client receives a finish reason without another forward step.
         """
         self.rid_to_state[rid] = state
         try:
@@ -435,9 +434,8 @@ class OutputProcesser:
         finally:
             state.release_pending_multimodal_features()
             self.rid_to_state.pop(rid, None)
-            # This path replaces register() for grammar-aborted rids —
-            # drop any queued abort marker so pending_aborts doesn't leak
-            # and a reused rid isn't instantly re-aborted on next register.
+            # Drop any queued abort marker so pending_aborts does not leak and
+            # a reused rid is not immediately re-aborted on the next register.
             self.pending_aborts.pop(rid, None)
 
     def reap_finished_orphan(self, rid: str, state: RequestState) -> None:
@@ -452,6 +450,15 @@ class OutputProcesser:
             self.publish_finished_at_admission(rid, state)
         else:
             self.rid_to_state.pop(rid, None)
+
+    def publish_scheduler_abort(self, rid: str, message: str) -> None:
+        """Publish a terminal error decided internally by the scheduler."""
+        state = self.rid_to_state.get(rid)
+        if state is None:
+            return
+        state.set_finish_with_abort(message, notify_client=True)
+        self._log_request_stats(rid, state, time.time())
+        self.publish_finished_at_admission(rid, state)
 
     def _host_advance_matcher(self, completion, model_execution_results):
         """Host-side fallback for the grammar matcher advance.

@@ -21,6 +21,7 @@
 #pragma once
 
 #include <optional>
+#include <map>
 #include <unordered_map>
 #include <variant>
 #include <cstdint>
@@ -86,6 +87,7 @@ struct SchedulerConfig {
     } device_allocator;
 
     std::vector<PagedCacheGroupConfig> paged_cache_groups{};
+    std::map<std::string, std::int32_t> paged_cache_host_group_pages{};
 
     // Streaming-sink (flat L2) enablement: an L2 host tier exists (> 1: page 0 is the null
     // placeholder) and this role writes to it. Orthogonal to disable_prefix_cache by design:
