@@ -17,7 +17,10 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=20, suite="runtime-1gpu")
 
 from tokenspeed.runtime.configs.deepseek_v4_cache_spec import build_v4_cache_specs
-from tokenspeed.runtime.configs.paged_cache_spec import validate_flat_scheduler_config
+from tokenspeed.runtime.configs.paged_cache_spec import (
+    PagedCacheGroupSpec,
+    validate_flat_scheduler_config,
+)
 from tokenspeed.runtime.engine.scheduler_utils import (
     make_config,
     pool_to_paged_cache_groups,
@@ -149,6 +152,50 @@ class DeepseekV4FlatGroupUnitTest(unittest.TestCase):
         groups[0].cache_blocks_per_lcm_block = 3
         with self.assertRaisesRegex(ValueError, "does not cover Flat scheduler domain"):
             resolve_scheduler_block_size(256, groups)
+
+    @unittest.skipUnless(
+        scheduler_ext.FLAT_KVCACHE,
+        "requires a Flat KV scheduler extension",
+    )
+    def test_flat_same_granularity_allows_physical_packing(self):
+        spec = PagedCacheGroupSpec(
+            group_id="same-granularity-history",
+            retention="full_history",
+            rows_per_page=128,
+            entry_stride_tokens=1,
+            sliding_window_tokens=None,
+            block_size=128,
+            cache_blocks_per_lcm_block=12,
+        )
+        usable_domain_pages = 8
+        groups = pool_to_paged_cache_groups(
+            SimpleNamespace(
+                paged_cache_group_specs=(spec,),
+                paged_cache_group_page_counts={
+                    spec.group_id: (
+                        usable_domain_pages * spec.cache_blocks_per_lcm_block + 1
+                    )
+                },
+            )
+        )
+        cfg = make_config(
+            num_device_pages=usable_domain_pages + 1,
+            max_scheduled_tokens=256,
+            max_batch_size=2,
+            page_size=128,
+            num_host_pages=0,
+            disable_l2_cache=True,
+            enable_l3_storage=False,
+            prefetch_threshold=4,
+            role="null",
+            disable_prefix_cache=True,
+            paged_cache_groups=groups,
+        )
+
+        self.assertEqual(cfg.block_size, 128)
+        self.assertEqual(cfg.paged_cache_groups[0].block_size, 128)
+        self.assertEqual(cfg.paged_cache_groups[0].cache_blocks_per_lcm_block, 12)
+        scheduler_ext.Scheduler(cfg)
 
     @unittest.skipUnless(
         scheduler_ext.FLAT_KVCACHE,

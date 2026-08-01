@@ -157,7 +157,11 @@ def resolve_scheduler_block_size(page_size: int, paged_cache_groups) -> int:
                 )
             packing = int(group.cache_blocks_per_lcm_block)
             expected_packing = page_size // gb
-            if packing != expected_packing:
+            # Match MakeSpecsFromConfig in the scheduler extension: packing
+            # is fixed by logical granularity only for a finer-grained group.
+            # A same-granularity group may pack multiple physical cache blocks
+            # into one scheduler-domain parent because of its byte layout.
+            if gb != page_size and packing != expected_packing:
                 raise ValueError(
                     f"paged cache group {group.group_id!r} packing {packing} "
                     f"does not cover Flat scheduler domain {page_size}; "
