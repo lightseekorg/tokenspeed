@@ -17,6 +17,7 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 from tokenspeed.runtime.pd.flatkv import (  # noqa: E402
+    FLATKV_PD_PROTOCOL_VERSION,
     FlatKVPDGroup,
     FlatKVPDGroupPages,
     FlatKVPDLayout,
@@ -32,7 +33,7 @@ from tokenspeed.runtime.pd.mooncake.entities import (  # noqa: E402
 
 def _layout(*, capacity: int = 16) -> FlatKVPDLayout:
     return FlatKVPDLayout(
-        version=1,
+        version=FLATKV_PD_PROTOCOL_VERSION,
         layout_fingerprint="a" * 64,
         block_size=2,
         num_pages_with_null=capacity,
@@ -327,15 +328,18 @@ def test_shared_manager_transfers_only_group_bound_slabs() -> None:
     ]
 
 
-def test_shared_manager_resolves_lcm_group_segments() -> None:
-    from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
-
-    layout = FlatKVPDLayout(
-        version=1,
+def _segmented_layout(
+    *,
+    capacity: int,
+    history_k_offset: int,
+    history_v_offset: int,
+    state_offset: int,
+) -> FlatKVPDLayout:
+    return FlatKVPDLayout(
+        version=FLATKV_PD_PROTOCOL_VERSION,
         layout_fingerprint="b" * 64,
         block_size=2,
-        # Null parent plus four usable parents.
-        num_pages_with_null=5,
+        num_pages_with_null=capacity,
         physical_buffer_ids=("lcm_arena",),
         physical_page_bytes=1024,
         groups=(
@@ -350,7 +354,7 @@ def test_shared_manager_resolves_lcm_group_segments() -> None:
                         physical_slot=0,
                         field_id="layer.0.k",
                         dtype="bfloat16",
-                        page_zero_offset=768,
+                        page_zero_offset=history_k_offset,
                         page_stride_bytes=256,
                         payload_bytes=256,
                     ),
@@ -358,7 +362,7 @@ def test_shared_manager_resolves_lcm_group_segments() -> None:
                         physical_slot=0,
                         field_id="layer.0.v",
                         dtype="bfloat16",
-                        page_zero_offset=2816,
+                        page_zero_offset=history_v_offset,
                         page_stride_bytes=256,
                         payload_bytes=256,
                     ),
@@ -375,13 +379,24 @@ def test_shared_manager_resolves_lcm_group_segments() -> None:
                         physical_slot=0,
                         field_id="layer.1.ssm",
                         dtype="float32",
-                        page_zero_offset=512,
+                        page_zero_offset=state_offset,
                         page_stride_bytes=512,
                         payload_bytes=384,
                     ),
                 ),
             ),
         ),
+    )
+
+
+def test_shared_manager_resolves_lcm_group_segments() -> None:
+    from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
+
+    layout = _segmented_layout(
+        capacity=5,
+        history_k_offset=768,
+        history_v_offset=2816,
+        state_offset=512,
     )
     source_manifest = FlatKVPDPageManifest(
         groups=(
@@ -422,6 +437,7 @@ def test_shared_manager_resolves_lcm_group_segments() -> None:
             src_flat_manifest=source_manifest,
             dst_flat_manifest=destination_manifest,
             dst_flat_num_pages_with_null=layout.num_pages_with_null,
+            dst_page_zero_offsets=layout.peer.page_zero_offset_map(),
         )
         == 0
     )
@@ -444,6 +460,80 @@ def test_shared_manager_resolves_lcm_group_segments() -> None:
             ],
             [256, 256, 256, 256, 384],
         )
+    ]
+
+
+def test_shared_manager_uses_destination_page_zero_offsets() -> None:
+    from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
+
+    source_layout = _segmented_layout(
+        capacity=5,
+        history_k_offset=768,
+        history_v_offset=2816,
+        state_offset=512,
+    )
+    destination_layout = _segmented_layout(
+        capacity=7,
+        history_k_offset=768,
+        history_v_offset=3840,
+        state_offset=512,
+    )
+    source_manifest = FlatKVPDPageManifest(
+        groups=(
+            FlatKVPDGroupPages("history", (1, 2)),
+            FlatKVPDGroupPages("state", (4,)),
+        ),
+        prefix_len=0,
+        prompt_len=4,
+    )
+    destination_manifest = FlatKVPDPageManifest(
+        groups=(
+            FlatKVPDGroupPages("history", (5, 6)),
+            FlatKVPDGroupPages("state", (3,)),
+        ),
+        prefix_len=0,
+        prompt_len=4,
+    )
+    calls = []
+    manager = object.__new__(MooncakeKVManagerPrefill)
+    manager.kv_args = SimpleNamespace(
+        flat_layout=source_layout,
+        kv_data_ptrs=[0x10000],
+        kv_item_lens=[1024],
+    )
+    manager.engine = SimpleNamespace(
+        batch_transfer_sync=lambda session, src, dst, lengths: (
+            calls.append((session, src, dst, lengths)) or 0
+        )
+    )
+
+    assert (
+        manager.send_kvcache(
+            "session",
+            np.asarray([1, 2, 4], dtype=np.int64),
+            [0x20000],
+            np.asarray([5, 6, 3], dtype=np.int64),
+            None,
+            src_flat_manifest=source_manifest,
+            dst_flat_manifest=destination_manifest,
+            dst_flat_num_pages_with_null=destination_layout.num_pages_with_null,
+            dst_page_zero_offsets=destination_layout.peer.page_zero_offset_map(),
+        )
+        == 0
+    )
+    assert calls[0][1] == [
+        0x10000 + 768 + 1 * 256,
+        0x10000 + 768 + 2 * 256,
+        0x10000 + 2816 + 1 * 256,
+        0x10000 + 2816 + 2 * 256,
+        0x10000 + 512 + 4 * 512,
+    ]
+    assert calls[0][2] == [
+        0x20000 + 768 + 5 * 256,
+        0x20000 + 768 + 6 * 256,
+        0x20000 + 3840 + 5 * 256,
+        0x20000 + 3840 + 6 * 256,
+        0x20000 + 512 + 3 * 512,
     ]
 
 

@@ -257,6 +257,7 @@ def test_layout_and_manifest_wire_encoding_is_canonical_and_strict() -> None:
     assert json.loads(layout_wire) == {
         "layout_fingerprint": layout.layout_fingerprint,
         "num_pages_with_null": layout.num_pages_with_null,
+        "page_zero_offsets": [],
         "version": FLATKV_PD_PROTOCOL_VERSION,
     }
     assert FlatKVPDPeerLayout.from_wire_bytes(layout_wire) == layout.peer
@@ -329,7 +330,7 @@ def test_manifest_pair_rejects_layout_and_logical_mismatch() -> None:
 
 def test_lcm_group_capacity_uses_its_cache_blocks_per_parent() -> None:
     layout = FlatKVPDLayout(
-        version=1,
+        version=FLATKV_PD_PROTOCOL_VERSION,
         layout_fingerprint=_FINGERPRINT,
         block_size=4,
         # Null parent plus three usable parents.
@@ -448,14 +449,16 @@ def test_registration_validation_rejects_bad_extents() -> None:
         FlatKVPDSLabRegistration(0, "slab.0", (1 << 64) - extent + 1, extent)
 
 
-def test_lcm_contract_registers_one_arena_and_preserves_group_geometry() -> None:
+def _lcm_backing(nbytes: int, data_ptr: int = 0x10000):
     class _Dtype:
         def __str__(self):
             return "torch.uint8"
 
     class _Backing:
         dtype = _Dtype()
-        nbytes = 4096
+
+        def __init__(self):
+            self.nbytes = nbytes
 
         @staticmethod
         def is_contiguous():
@@ -465,14 +468,79 @@ def test_lcm_contract_registers_one_arena_and_preserves_group_geometry() -> None
         def storage_offset():
             return 0
 
-        @staticmethod
-        def data_ptr():
-            return 0x10000
+        def data_ptr(self):
+            return data_ptr
 
-        @staticmethod
-        def untyped_storage():
-            return SimpleNamespace(data_ptr=lambda: 0x10000)
+        def untyped_storage(self):
+            return SimpleNamespace(data_ptr=lambda: data_ptr)
 
+    return _Backing()
+
+
+def _two_plane_lcm_plan(num_lcm_blocks: int):
+    plane_bytes = 512
+    lcm_block_bytes = 1024
+    return SimpleNamespace(
+        logical_block_tokens=4,
+        lcm_block_bytes=lcm_block_bytes,
+        num_lcm_blocks=num_lcm_blocks,
+        arena_bytes=(num_lcm_blocks + 1) * lcm_block_bytes,
+        groups=(
+            SimpleNamespace(
+                group_id="history",
+                cache_blocks_per_lcm_block=2,
+                page_count=1 + num_lcm_blocks * 2,
+            ),
+        ),
+        planes=(
+            SimpleNamespace(
+                plane_id="k",
+                bytes_per_lcm_block=plane_bytes,
+                arena_offset_bytes=0,
+            ),
+            SimpleNamespace(
+                plane_id="v",
+                bytes_per_lcm_block=plane_bytes,
+                arena_offset_bytes=(num_lcm_blocks + 1) * plane_bytes,
+            ),
+        ),
+        fields=(
+            SimpleNamespace(
+                group_id="history",
+                field_id="layer.0.k",
+                plane_id="k",
+                shape=(4, 8),
+                element_size=2,
+                field_offset_bytes=0,
+                page_stride_bytes=256,
+                payload_bytes=64,
+            ),
+            SimpleNamespace(
+                group_id="history",
+                field_id="layer.0.v",
+                plane_id="v",
+                shape=(4, 8),
+                element_size=2,
+                field_offset_bytes=0,
+                page_stride_bytes=256,
+                payload_bytes=64,
+            ),
+        ),
+    )
+
+
+_LCM_SPECS = (
+    SimpleNamespace(
+        group_id="history",
+        family="history",
+        transfer_policy="full_suffix",
+        retention="full_history",
+        sliding_window_tokens=None,
+    ),
+)
+
+
+def test_lcm_contract_registers_one_arena_and_preserves_group_geometry() -> None:
     plan = SimpleNamespace(
         logical_block_tokens=4,
         lcm_block_bytes=1024,
@@ -505,20 +573,11 @@ def test_lcm_contract_registers_one_arena_and_preserves_group_geometry() -> None
             ),
         ),
     )
-    specs = (
-        SimpleNamespace(
-            group_id="history",
-            family="history",
-            transfer_policy="full_suffix",
-            retention="full_history",
-            sliding_window_tokens=None,
-        ),
-    )
 
     layout, registrations = build_lcm_flatkv_pd_contract(
         plan=plan,
-        backing=_Backing(),
-        group_specs=specs,
+        backing=_lcm_backing(4096),
+        group_specs=_LCM_SPECS,
         field_dtypes={"layer.0.k": "bfloat16"},
     )
 
@@ -526,6 +585,44 @@ def test_lcm_contract_registers_one_arena_and_preserves_group_geometry() -> None
     assert layout.groups[0].cache_blocks_per_lcm_block == 2
     assert layout.groups[0].transfer_segments[0].page_zero_offset == 256
     assert registrations == (FlatKVPDSLabRegistration(0, "lcm_arena", 0x10000, 4096),)
+    assert layout.peer.page_zero_offsets[0].page_zero_offset == 256
+
+
+def test_fingerprint_ignores_num_lcm_blocks_but_peer_offsets_differ() -> None:
+    small, _ = build_lcm_flatkv_pd_contract(
+        plan=_two_plane_lcm_plan(3),
+        backing=_lcm_backing(4096),
+        group_specs=_LCM_SPECS,
+        field_dtypes={"layer.0.k": "bfloat16", "layer.0.v": "bfloat16"},
+    )
+    large, _ = build_lcm_flatkv_pd_contract(
+        plan=_two_plane_lcm_plan(5),
+        backing=_lcm_backing(6144, data_ptr=0x20000),
+        group_specs=_LCM_SPECS,
+        field_dtypes={"layer.0.k": "bfloat16", "layer.0.v": "bfloat16"},
+    )
+
+    assert small.layout_fingerprint == large.layout_fingerprint
+    assert small.num_pages_with_null != large.num_pages_with_null
+    assert (
+        small.groups[0].transfer_segments[1].page_zero_offset
+        != large.groups[0].transfer_segments[1].page_zero_offset
+    )
+    validate_flatkv_peer_layout(small, large.peer)
+    assert [offset.field_id for offset in large.peer.page_zero_offsets] == [
+        "layer.0.k",
+        "layer.0.v",
+    ]
+    wire = large.peer.to_wire_bytes()
+    assert FlatKVPDPeerLayout.from_wire_bytes(wire) == large.peer
+
+
+def test_peer_layout_rejects_unsupported_version() -> None:
+    peer = _layout().peer
+    with pytest.raises(
+        FlatKVPDProtocolError, match="unsupported FlatKV layout version"
+    ):
+        replace(peer, version=1)
 
 
 if __name__ == "__main__":
