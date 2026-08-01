@@ -51,6 +51,16 @@ logger = get_colorful_logger(__name__)
 
 
 @dataclass(frozen=True)
+class DeepseekV4FlatCachePlan:
+    """Physical FlatKV parent geometry shared by target and MTP pools."""
+
+    num_lcm_blocks: int
+    token_capacity: int
+    bytes_per_lcm_block: int
+    dummy_page_bytes: int
+
+
+@dataclass(frozen=True)
 class DeepseekV4CacheLayout:
     layer_ratio: tuple[int, ...]
     head_dim: int
@@ -224,6 +234,188 @@ def _estimate_deepseek_v4_cache_bytes(
             int(counts[gid]) * bytes_per_page
             for gid, bytes_per_page in page_bytes.items()
         )
+    )
+
+
+def deepseek_v4_flat_group_page_counts(
+    specs: Sequence[PagedCacheGroupSpec],
+    *,
+    num_lcm_blocks: int,
+) -> dict[str, int]:
+    """Return each group's complete absolute child-page ID namespace."""
+    if isinstance(num_lcm_blocks, bool) or not isinstance(num_lcm_blocks, int):
+        raise ValueError("num_lcm_blocks must be a positive integer")
+    if num_lcm_blocks <= 0:
+        raise ValueError("num_lcm_blocks must be a positive integer")
+    group_ids = tuple(str(spec.group_id) for spec in specs)
+    if not group_ids or len(group_ids) != len(set(group_ids)):
+        raise ValueError("Flat V4 cache specs must have unique nonempty group IDs")
+    counts: dict[str, int] = {}
+    for spec in specs:
+        packing = int(spec.cache_blocks_per_lcm_block)
+        if packing <= 0:
+            raise ValueError(
+                f"Flat V4 cache group {spec.group_id!r} has invalid packing {packing}"
+            )
+        counts[str(spec.group_id)] = num_lcm_blocks * packing + 1
+    return counts
+
+
+def deepseek_v4_flat_lcm_blocks_needed(
+    specs: Sequence[PagedCacheGroupSpec],
+    *,
+    token_capacity: int,
+    max_live_requests: int,
+    max_scheduled_tokens: int,
+    max_context_len: int,
+    decode_input_tokens: int = 1,
+    overlap_schedule_depth: int = 0,
+) -> int:
+    """Return global physical parents needed for the V4 group demands.
+
+    A FlatKV parent is bound to exactly one cache group while occupied.  The
+    compact per-group page counts therefore have to be converted to parent
+    counts per group and summed, not maximized.
+    """
+    if isinstance(token_capacity, bool) or not isinstance(token_capacity, int):
+        raise ValueError("token_capacity must be a positive integer")
+    if token_capacity <= 0:
+        raise ValueError("token_capacity must be a positive integer")
+    compact_counts = compute_paged_cache_group_page_counts(
+        specs,
+        max_live_requests=max_live_requests,
+        max_scheduled_tokens=max_scheduled_tokens,
+        max_total_tokens=token_capacity,
+        max_context_len=max_context_len,
+        decode_input_tokens=decode_input_tokens,
+        overlap_schedule_depth=overlap_schedule_depth,
+    )
+    parents = 0
+    for spec in specs:
+        packing = int(spec.cache_blocks_per_lcm_block)
+        if packing <= 0:
+            raise ValueError(
+                f"Flat V4 cache group {spec.group_id!r} has invalid packing {packing}"
+            )
+        # Page zero is a per-group null page and does not occupy a scheduler
+        # parent.  Every remaining child page consumes one packed slot.
+        child_pages = int(compact_counts[spec.group_id]) - 1
+        parents += ceil_div(child_pages, packing)
+    return int(parents)
+
+
+def profile_deepseek_v4_flat_cache(
+    *,
+    layout: DeepseekV4CacheLayout,
+    hf_config: Any,
+    layer_num: int,
+    max_live_requests: int,
+    max_scheduled_tokens: int,
+    max_context_len: int,
+    available_cache_memory_bytes: int,
+    token_limit: int | None,
+    draft_layout: DeepseekV4CacheLayout | None = None,
+    draft_hf_config: Any | None = None,
+    draft_layer_num: int = 0,
+    decode_input_tokens: int = 1,
+    overlap_schedule_depth: int = 0,
+) -> DeepseekV4FlatCachePlan:
+    """Plan V4 FlatKV buffers in the scheduler's absolute page-ID domain."""
+    target_specs = tuple(
+        build_v4_cache_specs(hf_config, layer_ratio=layout.layer_ratio)
+    )
+    target_page_bytes = _deepseek_v4_cache_group_page_bytes(
+        layout, target_specs, layer_num
+    )
+
+    draft_specs: tuple[PagedCacheGroupSpec, ...] = ()
+    draft_page_bytes: dict[str, int] = {}
+    if draft_layout is not None:
+        if draft_hf_config is None or draft_layer_num <= 0:
+            raise ValueError(
+                "draft_hf_config and draft_layer_num are required with draft_layout"
+            )
+        draft_specs = tuple(
+            build_v4_cache_specs(
+                draft_hf_config,
+                layer_ratio=draft_layout.layer_ratio,
+            )
+        )
+        target_by_id = {spec.group_id: spec for spec in target_specs}
+        for spec in draft_specs:
+            target_spec = target_by_id.get(spec.group_id)
+            if target_spec is None or spec != target_spec:
+                raise ValueError(
+                    f"draft Flat V4 cache group {spec.group_id!r} does not share "
+                    "the target scheduler geometry"
+                )
+        draft_page_bytes = _deepseek_v4_cache_group_page_bytes(
+            draft_layout, draft_specs, draft_layer_num
+        )
+    elif draft_hf_config is not None or draft_layer_num:
+        raise ValueError("draft layout/config/layer count must be provided together")
+
+    dummy_page_bytes = sum(target_page_bytes.values()) + sum(draft_page_bytes.values())
+    bytes_per_lcm_block = sum(
+        target_page_bytes[spec.group_id] * int(spec.cache_blocks_per_lcm_block)
+        for spec in target_specs
+    ) + sum(
+        draft_page_bytes[spec.group_id] * int(spec.cache_blocks_per_lcm_block)
+        for spec in draft_specs
+    )
+    if bytes_per_lcm_block <= 0:
+        raise ValueError("Flat V4 cache plan has no physical payload")
+    available_cache_memory_bytes = int(available_cache_memory_bytes)
+    max_memory_parents = (available_cache_memory_bytes - int(dummy_page_bytes)) // int(
+        bytes_per_lcm_block
+    )
+    if max_memory_parents < 1:
+        raise ValueError(
+            "DeepSeek V4 FlatKV cache budget cannot hold null pages and one "
+            "physical parent"
+        )
+
+    if token_limit is None:
+        upper_bound_tokens = (
+            max_memory_parents * DEEPSEEK_V4_COMPRESSED_LOGICAL_BLOCK_SIZE
+        )
+    else:
+        if isinstance(token_limit, bool) or not isinstance(token_limit, int):
+            raise ValueError("token_limit must be a positive integer or None")
+        if token_limit <= 0:
+            raise ValueError("token_limit must be a positive integer or None")
+        upper_bound_tokens = token_limit
+
+    def _parents_needed(tokens: int) -> int:
+        return deepseek_v4_flat_lcm_blocks_needed(
+            target_specs,
+            token_capacity=tokens,
+            max_live_requests=max_live_requests,
+            max_scheduled_tokens=max_scheduled_tokens,
+            max_context_len=max_context_len,
+            decode_input_tokens=decode_input_tokens,
+            overlap_schedule_depth=overlap_schedule_depth,
+        )
+
+    low, high = 0, int(upper_bound_tokens)
+    while low < high:
+        candidate = (low + high + 1) // 2
+        if _parents_needed(candidate) <= max_memory_parents:
+            low = candidate
+        else:
+            high = candidate - 1
+    if low <= 0:
+        raise ValueError(
+            "DeepSeek V4 FlatKV cache budget cannot admit one token with the "
+            "configured request and scheduling limits"
+        )
+    token_capacity = int(low)
+    num_lcm_blocks = _parents_needed(token_capacity)
+    return DeepseekV4FlatCachePlan(
+        num_lcm_blocks=num_lcm_blocks,
+        token_capacity=token_capacity,
+        bytes_per_lcm_block=int(bytes_per_lcm_block),
+        dummy_page_bytes=int(dummy_page_bytes),
     )
 
 
@@ -780,6 +972,7 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
         max_scheduled_tokens: int,
         decode_input_tokens: int = 1,
         overlap_schedule_depth: int = 0,
+        flat_num_lcm_blocks: int | None = None,
     ) -> None:
         if size <= 0:
             raise ValueError(f"DeepSeek V4 KV pool size must be positive, got {size}")
@@ -814,15 +1007,49 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
         self._paged_cache_group_specs_by_id = {
             spec.group_id: spec for spec in self.paged_cache_group_specs
         }
-        self.paged_cache_group_page_counts = compute_paged_cache_group_page_counts(
-            self.paged_cache_group_specs,
-            max_live_requests=max_batch_size,
-            max_scheduled_tokens=max(0, int(max_scheduled_tokens)),
-            max_total_tokens=size,
-            max_context_len=max_context_len,
-            decode_input_tokens=decode_input_tokens,
-            overlap_schedule_depth=overlap_schedule_depth,
-        )
+        if flat_num_lcm_blocks is None:
+            # Radix tables use independently allocated, compact per-group page
+            # IDs.  Keep their historical sizing and buffers byte-for-byte.
+            self.paged_cache_group_page_counts = compute_paged_cache_group_page_counts(
+                self.paged_cache_group_specs,
+                max_live_requests=max_batch_size,
+                max_scheduled_tokens=max(0, int(max_scheduled_tokens)),
+                max_total_tokens=size,
+                max_context_len=max_context_len,
+                decode_input_tokens=decode_input_tokens,
+                overlap_schedule_depth=overlap_schedule_depth,
+            )
+        else:
+            required_parents = deepseek_v4_flat_lcm_blocks_needed(
+                self.paged_cache_group_specs,
+                token_capacity=size,
+                max_live_requests=max_batch_size,
+                max_scheduled_tokens=max(0, int(max_scheduled_tokens)),
+                max_context_len=max_context_len,
+                decode_input_tokens=decode_input_tokens,
+                overlap_schedule_depth=overlap_schedule_depth,
+            )
+            if flat_num_lcm_blocks < required_parents:
+                raise ValueError(
+                    "DeepSeek V4 FlatKV parent capacity is smaller than the "
+                    "published token/scheduler capacity: "
+                    f"available={flat_num_lcm_blocks}, required={required_parents}"
+                )
+            # Scheduler child IDs are absolute:
+            #   1 + (parent_id - 1) * packing + slot.
+            # Allocate every group's complete namespace, including page zero,
+            # even though only a subset of parents can be bound to that group
+            # at one time.
+            self.num_lcm_blocks = int(flat_num_lcm_blocks)
+            self.paged_cache_group_page_counts = deepseek_v4_flat_group_page_counts(
+                self.paged_cache_group_specs,
+                num_lcm_blocks=self.num_lcm_blocks,
+            )
+            # The FlatMemoryExecutor branch is selected explicitly when L2 is
+            # enabled.  When it is disabled, do not fall through to the legacy
+            # host mirror: duplicating every sparse absolute page-ID namespace
+            # in host RAM is unnecessary and can exhaust the node.
+            self.supports_hierarchical_kv_cache = False
 
         def _group_rows(group_id: str, default: int) -> int:
             spec = self._paged_cache_group_specs_by_id.get(group_id)
@@ -964,11 +1191,13 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
                 )
 
         logger.info(
-            "Initialized DeepSeek V4 KV pool: %d pages, %d layers, fp4 indexer=%s, compressed block sizes=%s",
+            "Initialized DeepSeek V4 KV pool: %d pages, %d layers, fp4 indexer=%s, "
+            "compressed block sizes=%s, flat parents=%s",
             self.num_pages,
             layer_num,
             layout.use_fp4_indexer_cache,
             self.compressed_block_sizes,
+            flat_num_lcm_blocks,
         )
 
     @property

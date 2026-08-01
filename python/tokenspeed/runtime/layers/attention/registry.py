@@ -1203,6 +1203,7 @@ def create_attn_components(
     mamba_pool = None
     draft_max_num_tokens = None
     lcm_setup = None
+    deepseek_v4_flat_plan = None
 
     _profile_kwargs = dict(
         attn_config=config,
@@ -1220,46 +1221,98 @@ def create_attn_components(
 
     if is_deepseek_v4_model:
         from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
+            profile_deepseek_v4_flat_cache,
             profile_deepseek_v4_max_num_pages,
         )
 
-        draft_cache_cell_size = _resolve_draft_cache_cell_size_for_profile(
-            draft_attn_config,
-            draft_model_config,
-            draft_profile_cache_cell_size,
+        available_cache_memory_bytes = profile_available_cache_memory_bytes(
+            attn_config=config,
+            gpu_id=gpu_id,
+            tp_size=server_args.mapping.world_size,
+            gpu_memory_utilization=server_args.gpu_memory_utilization,
+            total_gpu_memory=gpu_memory,
+            world_group=server_args.mapping.world_group,
         )
-        max_total_num_pages = profile_deepseek_v4_max_num_pages(
-            layout=deepseek_v4_layout,
-            hf_config=model_config.hf_config,
-            layer_num=num_layers,
-            max_live_requests=config.max_bs,
-            max_scheduled_tokens=server_args.chunked_prefill_size,
-            max_context_len=config.context_len,
-            available_cache_memory_bytes=profile_available_cache_memory_bytes(
-                attn_config=config,
-                gpu_id=gpu_id,
-                tp_size=server_args.mapping.world_size,
-                gpu_memory_utilization=server_args.gpu_memory_utilization,
-                total_gpu_memory=gpu_memory,
-                world_group=server_args.mapping.world_group,
-            ),
-            draft_cache_cell_size=draft_cache_cell_size,
-            decode_input_tokens=decode_input_tokens,
-            overlap_schedule_depth=overlap_schedule_depth,
-        )
-        logger.info(
-            "DeepSeek V4 grouped KV profile: max_live_requests=%s "
-            "(attn config max_bs=%s, attn_dp_size=%s), max_total_num_pages=%s",
-            config.max_bs,
-            config.max_bs,
-            server_args.mapping.attn.dp_size,
-            max_total_num_pages,
-        )
-        max_num_tokens = _resolve_max_num_tokens(
-            max_total_num_pages,
-            server_args.block_size,
-            server_args.max_total_tokens,
-        )
+        if flat_kvcache:
+            if draft_attn_config is not None and not is_deepseek_v4_draft_model:
+                raise NotImplementedError(
+                    "DeepSeek V4 FlatKV requires a DeepSeek V4 MTP draft pool"
+                )
+            token_limit = server_args.max_total_tokens
+            if _CI_SMALL_KV_SIZE is not None and int(_CI_SMALL_KV_SIZE) > 0:
+                ci_limit = int(_CI_SMALL_KV_SIZE)
+                token_limit = (
+                    ci_limit if token_limit is None else min(token_limit, ci_limit)
+                )
+            deepseek_v4_flat_plan = profile_deepseek_v4_flat_cache(
+                layout=deepseek_v4_layout,
+                hf_config=model_config.hf_config,
+                layer_num=num_layers,
+                max_live_requests=config.max_bs,
+                max_scheduled_tokens=server_args.chunked_prefill_size,
+                max_context_len=config.context_len,
+                available_cache_memory_bytes=available_cache_memory_bytes,
+                token_limit=token_limit,
+                draft_layout=(
+                    draft_deepseek_v4_layout if is_deepseek_v4_draft_model else None
+                ),
+                draft_hf_config=(
+                    draft_model_config.hf_config if is_deepseek_v4_draft_model else None
+                ),
+                draft_layer_num=(
+                    draft_model_config.num_attention_layers
+                    if is_deepseek_v4_draft_model
+                    else 0
+                ),
+                decode_input_tokens=decode_input_tokens,
+                overlap_schedule_depth=overlap_schedule_depth,
+            )
+            max_total_num_pages = deepseek_v4_flat_plan.num_lcm_blocks
+            max_num_tokens = deepseek_v4_flat_plan.token_capacity
+            draft_max_num_tokens = max_num_tokens
+            logger.info(
+                "DeepSeek V4 FlatKV profile: max_live_requests=%s "
+                "(attn config max_bs=%s, attn_dp_size=%s), parents=%s, "
+                "token_capacity=%s, bytes_per_parent=%s",
+                config.max_bs,
+                config.max_bs,
+                server_args.mapping.attn.dp_size,
+                deepseek_v4_flat_plan.num_lcm_blocks,
+                deepseek_v4_flat_plan.token_capacity,
+                deepseek_v4_flat_plan.bytes_per_lcm_block,
+            )
+        else:
+            draft_cache_cell_size = _resolve_draft_cache_cell_size_for_profile(
+                draft_attn_config,
+                draft_model_config,
+                draft_profile_cache_cell_size,
+            )
+            max_total_num_pages = profile_deepseek_v4_max_num_pages(
+                layout=deepseek_v4_layout,
+                hf_config=model_config.hf_config,
+                layer_num=num_layers,
+                max_live_requests=config.max_bs,
+                max_scheduled_tokens=server_args.chunked_prefill_size,
+                max_context_len=config.context_len,
+                available_cache_memory_bytes=available_cache_memory_bytes,
+                draft_cache_cell_size=draft_cache_cell_size,
+                decode_input_tokens=decode_input_tokens,
+                overlap_schedule_depth=overlap_schedule_depth,
+            )
+            logger.info(
+                "DeepSeek V4 grouped KV profile: max_live_requests=%s "
+                "(attn config max_bs=%s, attn_dp_size=%s), "
+                "max_total_num_pages=%s",
+                config.max_bs,
+                config.max_bs,
+                server_args.mapping.attn.dp_size,
+                max_total_num_pages,
+            )
+            max_num_tokens = _resolve_max_num_tokens(
+                max_total_num_pages,
+                server_args.block_size,
+                server_args.max_total_tokens,
+            )
     elif lcm_family is not None:
         cache_memory = profile_available_cache_memory_bytes(
             attn_config=config,
@@ -1406,6 +1459,7 @@ def create_attn_components(
 
     if (
         lcm_setup is None
+        and deepseek_v4_flat_plan is None
         and _CI_SMALL_KV_SIZE is not None
         and int(_CI_SMALL_KV_SIZE) > 0
     ):
@@ -1440,6 +1494,11 @@ def create_attn_components(
             max_scheduled_tokens=server_args.chunked_prefill_size,
             decode_input_tokens=decode_input_tokens,
             overlap_schedule_depth=overlap_schedule_depth,
+            flat_num_lcm_blocks=(
+                deepseek_v4_flat_plan.num_lcm_blocks
+                if deepseek_v4_flat_plan is not None
+                else None
+            ),
         )
     elif is_hybrid_linear:
         backend, pool, mamba_pool = _create_hybrid_linear_attn(
@@ -1536,6 +1595,11 @@ def create_attn_components(
                 max_scheduled_tokens=server_args.chunked_prefill_size,
                 decode_input_tokens=decode_input_tokens,
                 overlap_schedule_depth=overlap_schedule_depth,
+                flat_num_lcm_blocks=(
+                    deepseek_v4_flat_plan.num_lcm_blocks
+                    if deepseek_v4_flat_plan is not None
+                    else None
+                ),
             )
         elif draft_is_hybrid_gdn:
             draft_attn_backend, draft_pool, _ = _create_hybrid_linear_attn(

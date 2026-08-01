@@ -25,6 +25,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     make_config,
     pool_to_paged_cache_groups,
     resolve_scheduler_block_size,
+    scheduler_cache_geometry_from_pool,
 )
 from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -33,7 +34,12 @@ from tokenspeed.runtime.layers.attention.backends.deepseek_v4 import (
     DeepseekV4AttentionBackend,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
+    DeepseekV4TokenToKVPool,
     _group_slot_mapping_from_raw,
+    deepseek_v4_cache_layout_from_config,
+    deepseek_v4_flat_group_page_counts,
+    deepseek_v4_flat_lcm_blocks_needed,
+    profile_deepseek_v4_flat_cache,
 )
 from tokenspeed.runtime.layers.attention.registry import (
     _validate_shared_flat_group_geometry,
@@ -120,6 +126,145 @@ def _page_counts(specs, count: int = 4096):
 
 
 class DeepseekV4FlatGroupUnitTest(unittest.TestCase):
+    def test_flat_pool_allocates_complete_absolute_page_id_namespaces(self):
+        hf_config = SimpleNamespace(
+            compress_ratios=(1, 4, 128),
+            head_dim=512,
+            qk_rope_head_dim=64,
+            index_head_dim=128,
+            sliding_window=128,
+        )
+        layout = deepseek_v4_cache_layout_from_config(
+            hf_config,
+            page_size=256,
+            use_fp4_indexer_cache=True,
+        )
+        specs = tuple(build_v4_cache_specs(hf_config, layer_ratio=layout.layer_ratio))
+        sizing = dict(
+            token_capacity=1,
+            max_live_requests=1,
+            max_scheduled_tokens=1,
+            max_context_len=1,
+        )
+        parents = deepseek_v4_flat_lcm_blocks_needed(specs, **sizing)
+        pool = DeepseekV4TokenToKVPool(
+            size=1,
+            model_dtype=torch.bfloat16,
+            layout=layout,
+            layer_num=3,
+            device="cpu",
+            enable_memory_saver=False,
+            max_batch_size=1,
+            max_context_len=1,
+            page_size=256,
+            rank=0,
+            hf_config=hf_config,
+            max_scheduled_tokens=1,
+            flat_num_lcm_blocks=parents,
+        )
+
+        expected_counts = deepseek_v4_flat_group_page_counts(
+            specs,
+            num_lcm_blocks=parents,
+        )
+        self.assertEqual(pool.num_lcm_blocks, parents)
+        self.assertEqual(pool.paged_cache_group_page_counts, expected_counts)
+        self.assertFalse(pool.supports_hierarchical_kv_cache)
+        self.assertEqual(
+            pool.get_indexer_state_buffer(1).shape[0],
+            parents * 64 + 1,
+        )
+        geometry = scheduler_cache_geometry_from_pool(
+            pool,
+            fallback_token_capacity=pool.size,
+            fallback_page_size=pool.page_size,
+        )
+        self.assertEqual(geometry.num_device_pages, parents + 1)
+        self.assertEqual(geometry.num_usable_pages, parents)
+        self.assertEqual(geometry.token_capacity, 1)
+
+        with self.assertRaisesRegex(ValueError, "parent capacity"):
+            DeepseekV4TokenToKVPool(
+                size=1,
+                model_dtype=torch.bfloat16,
+                layout=layout,
+                layer_num=3,
+                device="cpu",
+                enable_memory_saver=False,
+                max_batch_size=1,
+                max_context_len=1,
+                page_size=256,
+                rank=0,
+                hf_config=hf_config,
+                max_scheduled_tokens=1,
+                flat_num_lcm_blocks=parents - 1,
+            )
+
+    def test_flat_profile_charges_target_and_mtp_absolute_geometry(self):
+        target_hf = SimpleNamespace(
+            compress_ratios=(1, 4, 128),
+            head_dim=512,
+            qk_rope_head_dim=64,
+            index_head_dim=128,
+            sliding_window=128,
+        )
+        draft_hf = SimpleNamespace(
+            compress_ratios=(1,),
+            head_dim=512,
+            qk_rope_head_dim=64,
+            index_head_dim=128,
+            sliding_window=128,
+        )
+        target_layout = deepseek_v4_cache_layout_from_config(
+            target_hf,
+            page_size=256,
+            use_fp4_indexer_cache=True,
+        )
+        draft_layout = deepseek_v4_cache_layout_from_config(
+            draft_hf,
+            page_size=256,
+            use_fp4_indexer_cache=True,
+        )
+        target_specs = tuple(
+            build_v4_cache_specs(
+                target_hf,
+                layer_ratio=target_layout.layer_ratio,
+            )
+        )
+        sizing = dict(
+            token_capacity=128,
+            max_live_requests=2,
+            max_scheduled_tokens=128,
+            max_context_len=128,
+            decode_input_tokens=4,
+            overlap_schedule_depth=1,
+        )
+        required = deepseek_v4_flat_lcm_blocks_needed(target_specs, **sizing)
+        plan = profile_deepseek_v4_flat_cache(
+            layout=target_layout,
+            hf_config=target_hf,
+            layer_num=3,
+            max_live_requests=2,
+            max_scheduled_tokens=128,
+            max_context_len=128,
+            available_cache_memory_bytes=100 * (1 << 30),
+            token_limit=128,
+            draft_layout=draft_layout,
+            draft_hf_config=draft_hf,
+            draft_layer_num=1,
+            decode_input_tokens=4,
+            overlap_schedule_depth=1,
+        )
+
+        self.assertEqual(plan.token_capacity, 128)
+        self.assertEqual(plan.num_lcm_blocks, required)
+        self.assertGreater(plan.bytes_per_lcm_block, 0)
+        self.assertGreater(plan.dummy_page_bytes, 0)
+        self.assertLessEqual(
+            plan.dummy_page_bytes + plan.num_lcm_blocks * plan.bytes_per_lcm_block,
+            100 * (1 << 30),
+        )
+
     def test_scheduler_block_size_matches_extension_contract(self):
         groups = pool_to_paged_cache_groups(
             SimpleNamespace(
