@@ -487,11 +487,9 @@ class DFlash(BaseDrafter):
         target_cache_locs: torch.Tensor,
         decode_only: bool = False,
     ) -> None:
-        target_hidden = target_hidden.to(
-            device=self.device,
-            dtype=self.draft_model_runner.model.fc.weight.dtype,
-        )
-        expected_width = int(self.draft_model_runner.model.fc.in_features)
+        model = self.draft_model_runner.model
+        target_hidden = target_hidden.to(device=self.device, dtype=model.context_dtype)
+        expected_width = model.context_in_features
         actual_width = int(target_hidden.shape[-1])
         if actual_width != expected_width:
             raise RuntimeError(
@@ -500,30 +498,19 @@ class DFlash(BaseDrafter):
                 "Check dflash_config.target_layer_ids against the target model."
             )
         with torch.inference_mode():
-            ctx_hidden = self.draft_model_runner.model.project_target_hidden(
-                target_hidden
-            )
-            if decode_only:
+            ctx_hidden = model.project_target_hidden(target_hidden)
+            if decode_only and self._fused_kv_enabled:
                 self._write_native_cache_fused(
                     ctx_hidden, target_positions, target_cache_locs
                 )
                 return
-
-            for layer in self.draft_model_runner.model.layers:
-                attn = layer.self_attn
-                k, v = attn.kv_proj_only(ctx_hidden)
-                k = attn.apply_k_norm(k)
-                k = attn.apply_k_rope(target_positions, k)
-                k = k.view(-1, attn.num_kv_heads, attn.head_dim)
-                v = v.view(-1, attn.num_kv_heads, attn.head_dim)
-                self.token_to_kv_pool.set_kv_buffer(
-                    attn.attn,
-                    target_cache_locs,
-                    k,
-                    v,
-                    attn.attn.k_scale,
-                    attn.attn.v_scale,
-                )
+            # The draft model owns its KV layout (GQA k/v vs MLA latent).
+            model.write_context_kv(
+                ctx_hidden,
+                target_positions,
+                target_cache_locs,
+                self.token_to_kv_pool,
+            )
 
     def _init_fused_kv_helper(self) -> None:
         """Pre-stack KV weights, k_norm, eps, and cos_sin_cache at construction."""
