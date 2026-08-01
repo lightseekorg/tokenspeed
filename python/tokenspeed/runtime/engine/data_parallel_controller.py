@@ -224,6 +224,7 @@ class DataParallelController:
                 tokenizer_ipc_name=port_args.tokenizer_ipc_name,
                 scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
                 nccl_port=port_args.nccl_port,
+                dist_init_addr=port_args.dist_init_addr,
                 rpc_ipc_name=port_args.rpc_ipc_name,
                 metrics_ipc_name=port_args.metrics_ipc_name,
                 tokenizer_worker_ipc_name=port_args.tokenizer_worker_ipc_name,

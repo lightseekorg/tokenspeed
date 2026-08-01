@@ -2010,6 +2010,9 @@ class PortArgs:
     # The port for nccl initialization (torch.dist)
     nccl_port: int
 
+    # The resolved rendezvous address after moving past busy local ports.
+    dist_init_addr: str
+
     # The ipc filename for rpc call between Engine and Scheduler
     rpc_ipc_name: str
 
@@ -2105,6 +2108,7 @@ class PortArgs:
             tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
             scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
             nccl_port=port,
+            dist_init_addr=f"{dist_init_host}:{dist_init_port}",
             rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
             metrics_ipc_name=f"tcp://{dist_init_host}:{metrics_ipc_port}",
             tokenizer_worker_ipc_name=None,
