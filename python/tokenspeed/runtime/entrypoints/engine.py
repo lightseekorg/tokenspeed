@@ -84,6 +84,7 @@ from tokenspeed.runtime.utils import (
     set_ulimit,
 )
 from tokenspeed.runtime.utils.env import envs
+from tokenspeed.runtime.utils.launcher import interface_for_host
 from tokenspeed.runtime.utils.process import kill_process_tree
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -454,6 +455,30 @@ class Engine(EngineBase):
         self.collective_rpc("save_sharded_model", **kwargs)
 
 
+def _set_socket_interface(server_args: ServerArgs):
+    """Point gloo and NCCL at the interface that reaches the head node.
+
+    Gloo has no peer-address heuristic: left alone it binds whatever the local
+    hostname resolves to, which is a loopback entry on many hosts, and every
+    cross-node gloo collective then fails to connect.
+    """
+    if server_args.mapping.nnodes <= 1 or not server_args.dist_init_addr:
+        return
+
+    head = server_args.dist_init_addr.rsplit(":", 1)[0]
+    interface = interface_for_host(head)
+    if interface is None:
+        logger.warning(
+            f"cannot tell which interface reaches the head node {head}; set "
+            "GLOO_SOCKET_IFNAME and NCCL_SOCKET_IFNAME explicitly if cross-node setup fails"
+        )
+        return
+
+    for name in ("GLOO_SOCKET_IFNAME", "NCCL_SOCKET_IFNAME"):
+        os.environ.setdefault(name, interface)
+    logger.info(f"socket interface reaching {head}: {interface}")
+
+
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -467,6 +492,8 @@ def _set_envs_and_config(server_args: ServerArgs):
         # explicit env wins; --disable-tf32 is the documented opt-out.
         os.environ.setdefault("NVIDIA_TF32_OVERRIDE", "1")
         os.environ.setdefault("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "1")
+
+    _set_socket_interface(server_args)
 
     # Set prometheus env vars
     if server_args.enable_metrics:

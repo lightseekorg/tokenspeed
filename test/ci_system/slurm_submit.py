@@ -378,8 +378,8 @@ def submit(
     result = subprocess.run(command, check=True, capture_output=True, text=True)
     job_id = result.stdout.strip().split(";", 1)[0]
     log = Path(str(log_pattern).replace("%j", job_id))
-    print(f"Submitted {job_id}: {task.config}")
-    print(f"Log: {log}")
+    print(f"Submitted {job_id}: {task.config}", flush=True)
+    print(f"Log: {log}", flush=True)
     return Submission(task, job_id, log)
 
 
@@ -425,6 +425,60 @@ def slurm_states(job_ids: list[str]) -> dict[str, dict[str, str]]:
                 "exit_code": fields[3],
             }
     return states
+
+
+def queued_states(job_ids: list[str]) -> dict[str, dict[str, str]]:
+    """Return live state for only the explicitly submitted Slurm jobs."""
+    requested = set(job_ids)
+    result = subprocess.run(
+        [
+            "squeue",
+            "--noheader",
+            f"--jobs={','.join(job_ids)}",
+            "--format=%i|%T|%M|%R",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    states = {}
+    for line in result.stdout.splitlines():
+        fields = line.split("|", 3)
+        if len(fields) != 4 or fields[0] not in requested:
+            continue
+        job_id, state, elapsed, reason = fields
+        states[job_id] = {
+            "state": state.upper(),
+            "elapsed": elapsed,
+            "exit_code": "",
+            "reason": reason if state.upper() == "PENDING" else "",
+        }
+    return states
+
+
+def print_progress(
+    submissions: list[Submission],
+    states: dict[str, dict[str, str]],
+) -> None:
+    print(f"\nSlurm progress ({time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())})")
+    for submission in submissions:
+        state = states.get(
+            submission.job_id,
+            {"state": "UNKNOWN", "elapsed": "", "reason": ""},
+        )
+        status = {
+            "COMPLETED": "PASS",
+            "FAILED": "FAIL",
+            "RUNNING": "RUN ",
+            "PENDING": "WAIT",
+        }.get(state["state"], state["state"])
+        suffix = f" ({state['reason']})" if state.get("reason") else ""
+        print(
+            f"[{status:4}] {submission.job_id:>8} "
+            f"{submission.task.runner:<12} {submission.task.name} "
+            f"{state.get('elapsed', '')}{suffix}",
+        )
+    print(flush=True)
 
 
 def result_detail(path: Path) -> str:
@@ -573,14 +627,29 @@ def wait_all(
     for signum in (signal.SIGINT, signal.SIGTERM):
         previous_handlers[signum] = signal.signal(signum, cancel_jobs)
     try:
+        previous_snapshot = None
+        last_update = 0.0
         while True:
-            queued = subprocess.run(
-                ["squeue", "-h", "-j", ",".join(job_ids)],
-                check=True,
-                capture_output=True,
-                text=True,
+            active = queued_states(job_ids)
+            accounting = slurm_states(job_ids)
+            states = {
+                job_id: active.get(job_id, accounting.get(job_id, {}))
+                for job_id in job_ids
+            }
+            snapshot = tuple(
+                (
+                    job_id,
+                    state.get("state", "UNKNOWN"),
+                    state.get("reason", ""),
+                )
+                for job_id, state in states.items()
             )
-            if not queued.stdout.strip():
+            now = time.monotonic()
+            if snapshot != previous_snapshot or now - last_update >= 60:
+                print_progress(submissions, states)
+                previous_snapshot = snapshot
+                last_update = now
+            if not active:
                 break
             time.sleep(10)
         states = {}
@@ -661,6 +730,14 @@ def run(args: argparse.Namespace, repo: Path, artifact_root: Path, cache: Path) 
         print_tasks(tasks)
         return 0
     commit = git(repo, "rev-parse", "HEAD")
+    print(f"Target: PR {args.pr}" if args.pr else "Target: latest main", flush=True)
+    print(f"Target commit: {commit}", flush=True)
+    print(f"Selected tasks: {len(tasks)}", flush=True)
+    for task in tasks:
+        print(
+            f"- {task.runner:<12} {task.task_type:<12} {task.name} " f"({task.config})",
+            flush=True,
+        )
     source = artifact_root / "snapshots" / f"{commit}.tar"
     if not args.render:
         source = snapshot(repo, artifact_root, commit)
@@ -688,7 +765,7 @@ def run(args: argparse.Namespace, repo: Path, artifact_root: Path, cache: Path) 
         completed = wait_all(
             submitted, artifact_root / "runs", report_dir, source_pr=args.pr
         )
-        print(f"Report: {report_dir}")
+        print(f"Report: {report_dir}", flush=True)
         return 0 if completed else 1
     if args.follow:
         for submission in submitted:
