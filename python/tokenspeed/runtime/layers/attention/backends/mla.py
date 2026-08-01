@@ -118,6 +118,14 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         self.q_data_type = config.dtype
         self.num_local_heads = config.num_attention_heads // config.attn_tp_size
 
+        # DFLASH/DSpark draft: the drafter proposes a whole block in one decode
+        # forward and needs the block to be non-causal. Rather than a mask, each
+        # request expands into spec_num_tokens single-query rows sharing the
+        # block-end seq_len, so every block query sees the whole block including
+        # its own future. Mirrors the MHA/MSA/TRTLLM draft_block_decode path;
+        # target verify and ordinary decode are untouched.
+        self.draft_block_decode = bool(getattr(config, "draft_block_decode", False))
+
         self.kernel_solution = None
 
         self.forward_decode_metadata: MLADecodeMetadata | None = None
@@ -357,12 +365,68 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
                 self.max_context_len,
             )
             group_out_cache_loc = None
+        if self._block_decode_active:
+            page_table, block_seq_lens = self._expand_block_decode_metadata(
+                page_table, seq_lens[:bs], bs
+            )
+            self.forward_decode_metadata = MLADecodeMetadata(
+                num_extends=num_extends,
+                page_table=page_table,
+                seq_lens=block_seq_lens,
+                group_out_cache_loc=group_out_cache_loc,
+            )
+            return
         self.forward_decode_metadata = MLADecodeMetadata(
             num_extends=num_extends,
             page_table=page_table,
             seq_lens=seq_lens[:bs],
             group_out_cache_loc=group_out_cache_loc,
             group_q_len_per_req=q_len_per_req,
+        )
+
+    # ------------------------------------------------------------------
+    # Non-causal block decode (DFLASH / DSpark draft)
+    # ------------------------------------------------------------------
+
+    @property
+    def _block_decode_active(self) -> bool:
+        return self.draft_block_decode and self.spec_num_tokens > 1
+
+    def _expand_block_decode_metadata(
+        self,
+        page_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        bs: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One decode row per block position, all sharing the block-end length.
+
+        The MLA decode kernel derives its mask from each row's ``cache_seqlens``.
+        Giving all ``spec_num_tokens`` rows of a request the same length makes
+        every block query attend over the whole block -- including positions
+        after it -- which is exactly the block-diffusion draft's semantics.
+        """
+        spec = self.spec_num_tokens
+        expanded_page_table = page_table.repeat_interleave(spec, dim=0)
+        # Clamp so a request near the context limit cannot ask the kernel for
+        # more page-table columns than exist (mirrors the MHA path, where the
+        # unclamped block-end length caused out-of-bounds page reads).
+        expanded_seq_lens = (
+            seq_lens.clamp(spec, self.max_context_len)
+            .repeat_interleave(spec)
+            .contiguous()
+        )
+        return expanded_page_table, expanded_seq_lens
+
+    def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
+        """Broadcast each request's block-end length to its block rows.
+
+        Called by the drafter inside the captured graph, so every replay
+        re-derives the expanded seq_lens from the live draft length (which is
+        itself recomputed in-graph from the target's accept lengths).
+        """
+        spec = self.spec_num_tokens
+        self.cuda_graph_seq_lens[: bs * spec].view(bs, spec).copy_(
+            block_seq_lens[:bs].clamp(spec, self.max_context_len).unsqueeze(1)
         )
 
     def select_out_cache_loc(self, layer, out_cache_loc, forward_mode=None):
@@ -392,13 +456,15 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         return locs
 
     def init_cuda_graph_state(self, max_bs: int):
+        # Block decode records spec_num_tokens rows per request.
+        graph_rows = max_bs * (self.spec_num_tokens if self._block_decode_active else 1)
         self.cuda_graph_page_table = torch.zeros(
-            (max_bs, self.max_num_pages), dtype=torch.int32, device=self.device
+            (graph_rows, self.max_num_pages), dtype=torch.int32, device=self.device
         )
         # Own the cache-seqlens buffer; replay copies the live lengths in, so
         # graph state does not depend on the controller mutating a shared tensor.
         self.cuda_graph_seq_lens = torch.zeros(
-            max_bs, dtype=torch.int32, device=self.device
+            graph_rows, dtype=torch.int32, device=self.device
         )
         self.decode_cuda_graph_metadata = {}
         if self._cache_contract_bound:
@@ -429,6 +495,9 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             raise NotImplementedError(
                 "MLA draft worker does not take the Paged cache path"
             )
+        if self._block_decode_active:
+            self._capture_block_decode_graph(bs, seq_lens)
+            return
         page_table = self.cuda_graph_page_table[:bs, :]
         capture_q_len = self._graph_verify_q_len()
         if uses_cache_groups:
@@ -461,6 +530,26 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
 
+    def _capture_block_decode_graph(self, bs: int, seq_lens: torch.Tensor) -> None:
+        """Record graph metadata over the expanded block rows.
+
+        The block-end seq_lens are written by the drafter *inside* the captured
+        graph (see ``fill_block_decode_seq_lens``), so they are only seeded here
+        with a value the capture run can safely read.
+        """
+        spec = self.spec_num_tokens
+        expanded_bs = bs * spec
+        metadata = MLADecodeMetadata(
+            num_extends=0,
+            page_table=self.cuda_graph_page_table[:expanded_bs, :],
+            seq_lens=self.cuda_graph_seq_lens[:expanded_bs],
+            flat_out_cache_loc=None,
+        )
+        metadata.page_table.zero_()
+        metadata.seq_lens.fill_(spec)
+        self.decode_cuda_graph_metadata[bs] = metadata
+        self.forward_decode_metadata = metadata
+
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
@@ -476,6 +565,17 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             )
 
         metadata = self.decode_cuda_graph_metadata[bs]
+        if self._block_decode_active:
+            # Replicate each request's page table across its block rows. The
+            # seq_lens are re-derived in-graph from the live draft length, so
+            # they are deliberately not touched here.
+            spec = self.spec_num_tokens
+            base = req_to_page[req_pool_indices[:bs], : self.max_num_pages]
+            self.cuda_graph_page_table[: bs * spec, : self.max_num_pages].view(
+                bs, spec, self.max_num_pages
+            ).copy_(base[:, None, :])
+            self.forward_decode_metadata = metadata
+            return
         # Copy the live lengths into our own cache-seqlens buffer (metadata.seq_lens
         # views it); both metadata paths read it at replay.
         q_len = metadata.group_q_len_per_req
@@ -571,7 +671,17 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         num_extends = metadata.num_extends
         q_len_per_req = q.shape[0] // bs if bs > 0 else 1
 
-        if q_len_per_req > 1:
+        if self._block_decode_active:
+            # Metadata already carries one row per block position, each with the
+            # block-end length, so the block is non-causal. Adding the causal
+            # offsets below would re-impose exactly the ordering the draft must
+            # not have, and re-expanding the rows would square the batch.
+            query = q.view(-1, layer.tp_q_head_num, layer.head_dim).unsqueeze(1)
+            rows = num_extends * q_len_per_req
+            page_table = metadata.page_table[rows:]
+            cache_seqlens = metadata.seq_lens[rows:]
+            max_seqlen_k = self.max_context_len
+        elif q_len_per_req > 1:
             query = q.view(-1, layer.tp_q_head_num, layer.head_dim).unsqueeze(1)
             page_table = metadata.page_table[num_extends:].repeat_interleave(
                 q_len_per_req, dim=0

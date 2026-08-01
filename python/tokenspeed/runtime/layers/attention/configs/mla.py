@@ -60,6 +60,9 @@ class MLAConfig(BaseAttnConfig):
             or getattr(hf_config, "layer_types", None)
             or ()
         )
+        draft_block_decode = bool(
+            is_draft and server_args.speculative_algorithm in ("DFLASH", "DSPARK")
+        )
         return cls(
             device=server_args.device,
             context_len=model_config.context_len,
@@ -80,6 +83,7 @@ class MLAConfig(BaseAttnConfig):
             // (server_args.data_parallel_size or server_args.mapping.attn.dp_size),
             kv_cache_quant_method=server_args.kv_cache_quant_method,
             is_draft=is_draft,
+            draft_block_decode=draft_block_decode,
             kv_lora_rank=model_config.kv_lora_rank,
             qk_nope_head_dim=model_config.qk_nope_head_dim,
             qk_rope_head_dim=model_config.qk_rope_head_dim,
