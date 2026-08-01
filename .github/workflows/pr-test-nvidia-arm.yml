@@ -18,7 +18,7 @@ on:
       - ".github/workflows/pr-test-nvidia-arm.yml"
       - ".github/workflows/run-pr-test-stage.yml"
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
     branches: [main]
     paths:
       - "python/pyproject.toml"
@@ -57,15 +57,19 @@ jobs:
     # Run jobs for pull requests, or for push/manual events in the official
     # repository or a repository whose full name matches TOKENSPEED_CI_REPOSITORY.
     if: |
-      github.event_name == 'pull_request' ||
-      github.repository == 'lightseekorg/tokenspeed' ||
-      github.repository == vars.TOKENSPEED_CI_REPOSITORY
+      (github.event.action != 'labeled' || github.event.label.name == 'high priority') &&
+      (
+        github.event_name == 'pull_request' ||
+        github.repository == 'lightseekorg/tokenspeed' ||
+        github.repository == vars.TOKENSPEED_CI_REPOSITORY
+      )
     runs-on: ubuntu-latest
     outputs:
       unit_matrix: ${{ steps.scan.outputs.unit_matrix }}
       unit_has_tasks: ${{ steps.scan.outputs.unit_has_tasks }}
       model_matrix: ${{ steps.scan.outputs.model_matrix }}
       model_has_tasks: ${{ steps.scan.outputs.model_has_tasks }}
+      eager_model: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'high priority') }}
       install_tokenspeed_mla_from_source: ${{ steps.detect_mla.outputs.changed }}
     steps:
       - name: Checkout code
@@ -163,10 +167,24 @@ jobs:
       !cancelled() &&
       needs.scan.result == 'success' &&
       (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.scan.outputs.eager_model != 'true' &&
       (
         needs.unit-test.result == 'success' ||
         needs.scan.outputs.unit_has_tasks != 'true'
       ) &&
+      needs.scan.outputs.model_has_tasks == 'true'
+    uses: ./.github/workflows/run-pr-test-stage.yml
+    with:
+      matrix: ${{ needs.scan.outputs.model_matrix }}
+      install_tokenspeed_mla_from_source: ${{ needs.scan.outputs.install_tokenspeed_mla_from_source }}
+      b200_runner_label: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL }}
+    secrets: inherit
+
+  model-test-eager:
+    needs: scan
+    if: |
+      needs.scan.outputs.eager_model == 'true' &&
+      github.event.pull_request.draft == false &&
       needs.scan.outputs.model_has_tasks == 'true'
     uses: ./.github/workflows/run-pr-test-stage.yml
     with:
@@ -183,8 +201,9 @@ jobs:
         github.event_name == 'pull_request' ||
         github.repository == 'lightseekorg/tokenspeed' ||
         github.repository == vars.TOKENSPEED_CI_REPOSITORY
-      )
-    needs: [unit-test, model-test]
+      ) &&
+      (github.event.action != 'labeled' || github.event.label.name == 'high priority')
+    needs: [unit-test, model-test, model-test-eager]
     runs-on: ubuntu-latest
     steps:
       - name: Finish

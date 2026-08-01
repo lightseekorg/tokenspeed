@@ -33,6 +33,11 @@ run in parallel, but a later stage starts only after every required job in the
 previous stage succeeds. A stage with no matching tasks is treated as
 successfully satisfied.
 
+PRs labeled `high priority` start `unit-test` and `model-test` concurrently.
+Applying the label starts a new CI run immediately and cancels the older run
+through the workflow's concurrency policy. A unit-test failure does not cancel
+model tests that are already running in this mode.
+
 Each task expands into one matrix entry per runner label. Add a top-level
 `priority` to a task YAML to bias dispatch order. GitHub Actions starts matrix
 jobs in include-list order, so `high` entries reach a contended runner pool
