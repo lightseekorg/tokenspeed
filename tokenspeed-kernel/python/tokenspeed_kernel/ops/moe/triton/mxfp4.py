@@ -607,7 +607,7 @@ def triton_mxfp4_moe_apply(
             and w13_weight.shape[-1] % 512 == 0
         )
         if use_gfx950_warp_decode:
-            from tokenspeed_kernel_amd.ops.moe.gluon_a16w4_situ_decode import (
+            from tokenspeed_kernel_amd.ops.gfx950.moe.a16w4.decode import (
                 gluon_a16w4_situ_warp_decode_ep_gfx950,
             )
 

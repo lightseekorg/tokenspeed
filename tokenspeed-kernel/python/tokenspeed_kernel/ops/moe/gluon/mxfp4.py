@@ -33,19 +33,19 @@ platform = current_platform()
 
 
 if platform.is_amd:
-    from tokenspeed_kernel_amd.ops.moe import fused_mxfp_gfx1250
-    from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import (
+    from tokenspeed_kernel_amd.ops.gfx950.moe.a4w4.fused import (
         gluon_mxfp_dynamic_mxfp4_fused_moe,
         gluon_mxfp_fused_moe,
         gluon_mxfp_precomputed_mxfp4_fused_moe,
     )
-    from tokenspeed_kernel_amd.ops.moe.gluon_a16w4_situ_grouped import (
-        gluon_a16w4_situ_grouped_ep_gfx950,
-    )
-    from tokenspeed_kernel_amd.ops.moe.mxfp4_gfx950_preprocess import (
+    from tokenspeed_kernel_amd.ops.gfx950.moe.a4w4.weight_preprocess import (
         preprocess_gluon_mxfp4_gfx950_moe_weights,
     )
-    from tokenspeed_kernel_amd.ops.moe.mxfp4_gfx1250_preprocess import (
+    from tokenspeed_kernel_amd.ops.gfx950.moe.a16w4.grouped import (
+        gluon_a16w4_situ_grouped_ep_gfx950,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.moe.a8w4 import fused as fused_mxfp_gfx1250
+    from tokenspeed_kernel_amd.ops.gfx1250.moe.a8w4.weight_preprocess import (
         preprocess_gluon_mxfp4_gfx1250_moe_weights,
     )
 
@@ -150,7 +150,7 @@ if platform.is_amd:
             and int(w.w13_weight.shape[2]) * 2 == x.shape[1]
         )
         if use_route_direct_decode:
-            from tokenspeed_kernel_amd.ops.moe.gluon_a16w4_situ_decode import (
+            from tokenspeed_kernel_amd.ops.gfx950.moe.a16w4.decode import (
                 gluon_a16w4_situ_warp_decode_ep_gfx950,
             )
 
