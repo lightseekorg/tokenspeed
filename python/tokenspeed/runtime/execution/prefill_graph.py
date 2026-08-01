@@ -425,7 +425,7 @@ class PrefillGraph:
         if num_tokens < bucket:
             self._input_embeds_buf[num_tokens:bucket].zero_()
 
-    def _dummy_flat_tables(self, num_tokens: int) -> dict[str, "torch.Tensor"]:
+    def _dummy_flat_tables(self, req_tokens: int, bs: int) -> dict[str, "torch.Tensor"]:
         """Build capture tables: null KV pages and one writable state page."""
         backend = self.attn_backend
         if not getattr(backend, "uses_flat_cache_groups", False):
@@ -444,14 +444,14 @@ class PrefillGraph:
         # Full width: backends that derive the row stride from max_kv_len
         # (trtllm) index the whole row even when the bucket is small.
         width = getattr(backend, "max_num_pages", 0) or -(
-            -num_tokens // backend.page_size
+            -req_tokens // backend.page_size
         )
         # ALL groups, state included: hybrid wrappers forward the dict to the
         # mamba child, which requires its state group; KV children shed state
         # groups themselves (_shed_state_groups).
         return {
             str(spec.group_id): torch.full(
-                (1, width),
+                (bs, width),
                 1 if str(spec.group_id) in state_group_ids else 0,
                 dtype=torch.int32,
                 device=self.config.device,
@@ -462,8 +462,15 @@ class PrefillGraph:
     def make_dummy_batch(
         self, num_tokens: int, decode_wrapper: CudaGraphWrapper | None
     ) -> ForwardContext:
-        """Populate the static buffers + attention metadata for a dummy bs=1 extend
+        """Populate the static buffers + attention metadata for a dummy extend
         forward of ``num_tokens`` tokens, and return its ForwardContext.
+
+        The tokens are split across ``ceil(num_tokens / context_len)`` dummy
+        requests so no single request exceeds the model context length: every
+        per-request structure (page-table rows, DSA indexer tables) is sized
+        for ``context_len``, and a longer fabricated request indexes past
+        them. A real forward carries more than ``context_len`` tokens only as
+        a multi-request batch, never as one sequence.
 
         The prefill analogue of decode's ``_init_capture_metadata``. KV writes
         go to the reserved dummy slot and the page table points at page 0, so
@@ -475,25 +482,35 @@ class PrefillGraph:
         (all zeros, the safe page 0) for those.
         """
         ib = self.input_buffers
+        max_req_tokens = max(1, int(self.config.context_len))
+        bs = max(1, -(-num_tokens // max_req_tokens))
+        seq_lens = [max_req_tokens] * (bs - 1) + [
+            num_tokens - max_req_tokens * (bs - 1)
+        ]
+        seq_lens_cpu = torch.tensor(seq_lens, dtype=ib.seq_lens_buf.dtype)
+        seq_lens_gpu = seq_lens_cpu.to(self.config.device)
         ib.input_ids_buf[:num_tokens].fill_(1)
         ib.out_cache_loc_buf[:num_tokens].fill_(ib.dummy_kv_slot)
         ib.positions_buf[:num_tokens].copy_(
-            torch.arange(num_tokens, device=self.config.device)
+            torch.cat([torch.arange(l, device=self.config.device) for l in seq_lens])
         )
-        ib.req_pool_indices_buf[:1].zero_()
-        ib.seq_lens_buf[:1].fill_(num_tokens)
-        ib.extend_seq_lens_buf[:1].fill_(num_tokens)
-        ib.extend_seq_lens_cpu[:1].fill_(num_tokens)
-        ib.extend_prefix_lens_buf[:1].zero_()
-        ib.extend_prefix_lens_cpu[:1].zero_()
-        self.req_to_page[0].zero_()  # dummy request's pages -> page 0 (valid memory)
+        ib.req_pool_indices_buf[:bs].copy_(
+            torch.arange(bs, dtype=ib.req_pool_indices_buf.dtype)
+        )
+        ib.seq_lens_buf[:bs].copy_(seq_lens_gpu)
+        ib.extend_seq_lens_buf[:bs].copy_(seq_lens_gpu)
+        ib.extend_seq_lens_cpu[:bs].copy_(seq_lens_cpu)
+        ib.extend_prefix_lens_buf[:bs].zero_()
+        ib.extend_prefix_lens_cpu[:bs].zero_()
+        # Dummy requests' pages -> page 0 (valid memory).
+        self.req_to_page[:bs].zero_()
 
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_page=self.req_to_page,
-            bs=1,
-            num_extends=1,
+            bs=bs,
+            num_extends=bs,
             input_num_tokens=num_tokens,
             forward_mode=ForwardMode.EXTEND,
             capture_hidden_mode=(
@@ -501,26 +518,24 @@ class PrefillGraph:
                 if self.drafter is not None
                 else CaptureHiddenMode.NULL
             ),
-            gather_ids=torch.tensor(
-                [num_tokens - 1], dtype=torch.int64, device=self.config.device
-            ),
+            gather_ids=torch.cumsum(seq_lens_gpu.to(torch.int64), dim=0) - 1,
         )
         if self.dp_size > 1:
             ctx.global_num_tokens = [num_tokens] * self.config.world_size
-            ctx.global_bs = [1] * self.config.world_size
+            ctx.global_bs = [bs] * self.config.world_size
         extra_metadata_kwargs: dict = {}
         if (
             getattr(self.attn_backend, "uses_paged_cache_groups", False)
             and decode_wrapper is not None
         ):
             tables = decode_wrapper._capture_paged_cache_block_tables(
-                1, self.token_to_kv_pool
+                bs, self.token_to_kv_pool
             )
             if tables is not None:
                 extra_metadata_kwargs["paged_cache_block_tables"] = tables
             extra_metadata_kwargs["num_tokens"] = num_tokens
             extra_metadata_kwargs["positions"] = ib.positions_buf[:num_tokens]
-        flat_tables = self._dummy_flat_tables(num_tokens)
+        flat_tables = self._dummy_flat_tables(max(seq_lens), bs)
         if flat_tables:
             contract = getattr(self.token_to_kv_pool, "runtime_contract", None)
             if contract is not None:
@@ -535,7 +550,7 @@ class PrefillGraph:
                     dummy_forward_op,
                     device=self.config.device,
                     contract=contract,
-                    num_requests=1,
+                    num_requests=bs,
                 )
                 flat_tables = dict(
                     flat_cache_metadata.tables(active_forward_op=dummy_forward_op)
@@ -544,16 +559,16 @@ class PrefillGraph:
                 extra_metadata_kwargs["flat_cache_forward_op"] = dummy_forward_op
             extra_metadata_kwargs["flat_block_tables"] = flat_tables
         self.attn_backend.init_forward_metadata(
-            bs=1,
-            num_extends=1,
-            req_pool_indices=ib.req_pool_indices_buf[:1],
-            seq_lens=ib.seq_lens_buf[:1],
+            bs=bs,
+            num_extends=bs,
+            req_pool_indices=ib.req_pool_indices_buf[:bs],
+            seq_lens=ib.seq_lens_buf[:bs],
             req_to_page=self.req_to_page,
             forward_mode=ForwardMode.EXTEND,
-            extend_seq_lens=ib.extend_seq_lens_buf[:1],
-            extend_seq_lens_cpu=ib.extend_seq_lens_cpu[:1],
-            extend_prefix_lens=ib.extend_prefix_lens_buf[:1],
-            extend_prefix_lens_cpu=ib.extend_prefix_lens_cpu[:1],
+            extend_seq_lens=ib.extend_seq_lens_buf[:bs],
+            extend_seq_lens_cpu=ib.extend_seq_lens_cpu[:bs],
+            extend_prefix_lens=ib.extend_prefix_lens_buf[:bs],
+            extend_prefix_lens_cpu=ib.extend_prefix_lens_cpu[:bs],
             **extra_metadata_kwargs,
         )
         return ctx
@@ -662,6 +677,10 @@ class PrefillGraph:
                 "its kernels mid-serving.",
                 captured_max,
             )
+        except torch.AcceleratorError:
+            # A CUDA fault is a dead context, not a warmup-didn't-fit
+            # condition; swallowing it would re-surface at an unrelated site.
+            raise
         except (NotImplementedError, AttributeError, KeyError, RuntimeError) as exc:
             logger.warning(
                 "Eager prefill warmup failed (%s: %s); the first real prefill "
