@@ -1,6 +1,7 @@
 api_version: ci.tokenspeed.io/v1
 name: eval-qwen3.5-122b-a10b-nvfp4-ocr-bench
 type: eval
+workflow_stage: model-test
 triggers:
   - per-commit
   - manual

@@ -1,6 +1,7 @@
 api_version: ci.tokenspeed.io/v1
 name: ut-runtime-prefix-cache-e2e
 type: ut
+workflow_stage: unit-test
 triggers:
   - per-commit
   - manual

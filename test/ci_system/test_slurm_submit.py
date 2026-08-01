@@ -26,6 +26,7 @@ def write_task(
     task_type: str = "eval",
     model: str = "example/model",
 ) -> str:
+    workflow_stage = "unit-test" if task_type == "ut" else "model-test"
     relative = Path(f"test/ci/{task_type}/example.yaml")
     path = repo / relative
     path.parent.mkdir(parents=True)
@@ -33,6 +34,7 @@ def write_task(
             api_version: ci.tokenspeed.io/v1
             name: example
             type: {task_type}
+            workflow_stage: {workflow_stage}
             triggers: [manual]
             runner:
               labels: [{runner}]

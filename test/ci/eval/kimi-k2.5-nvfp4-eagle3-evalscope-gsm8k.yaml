@@ -1,6 +1,7 @@
 api_version: ci.tokenspeed.io/v1
 name: eval-kimi-k2.5-nvfp4-eagle3-gsm8k
 type: eval
+workflow_stage: model-test
 triggers:
   - manual
   - nightly
