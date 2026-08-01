@@ -70,9 +70,9 @@ dependencies = [
     "tokenspeed-kernel>=0.1.3.dev0",
     "tokenspeed-mooncake>=0.3.12.post20260725",
     "tokenspeed-scheduler>=0.1.3",
-    "tokenspeed-smg==1.8.0.post20260730",
-    "tokenspeed-smg-grpc-proto==0.4.14.post20260730",
-    "tokenspeed-smg-grpc-servicer==0.7.0.post20260730",
+    "tokenspeed-smg==1.9.0.post20260731",
+    "tokenspeed-smg-grpc-proto==0.4.14.post20260731",
+    "tokenspeed-smg-grpc-servicer==0.8.0.post20260731",
     "torch==2.11.0",
     # Tag-capable sleep/wake allocator (region(tag, enable_cpu_backup)/pause/
     # resume). Bundles cu12/cu13 binaries; import-guarded so it's a no-op unless

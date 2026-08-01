@@ -36,15 +36,19 @@ _ENGINE_MODULE_DEFAULT = "smg_grpc_servicer.tokenspeed"
 _PIPE_LINE_LIMIT = 64 * 1024 * 1024
 
 
-async def spawn_engine(
-    args: list[str],
-    *,
-    host: str,
-    port: int,
-) -> asyncio.subprocess.Process:
-    """Spawn the engine subprocess with PIPE stdio."""
+def engine_argv(args: list[str], *, host: str, port: int) -> list[str]:
+    """Build the command line that runs the engine module.
+
+    Args:
+        args: Engine-side arguments to forward verbatim.
+        host: Address the engine binds.
+        port: Port the engine binds.
+
+    Returns:
+        An ``argv`` list whose first element is the Python interpreter.
+    """
     module = os.environ.get("TS_SERVE_ENGINE_MODULE", _ENGINE_MODULE_DEFAULT)
-    cmd = [
+    return [
         sys.executable,
         "-m",
         module,
@@ -54,7 +58,17 @@ async def spawn_engine(
         str(port),
         *args,
     ]
-    logger.info("spawn engine: %s", " ".join(cmd))
+
+
+async def spawn_engine(
+    args: list[str],
+    *,
+    host: str,
+    port: int,
+) -> asyncio.subprocess.Process:
+    """Spawn the engine subprocess with PIPE stdio."""
+    cmd = engine_argv(args, host=host, port=port)
+    logger.info(f"spawn engine: {' '.join(cmd)}")
     return await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -81,7 +95,7 @@ async def spawn_gateway(
         "--disable-circuit-breaker",
         *args,
     ]
-    logger.info("spawn gateway: %s", " ".join(cmd))
+    logger.info(f"spawn gateway: {' '.join(cmd)}")
     return await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,

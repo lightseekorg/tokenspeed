@@ -22,8 +22,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any
 
 import torch
+
+PAGED_CACHE_KIND = "paged_cache"
 
 
 class CacheKind(str, Enum):
@@ -58,3 +61,10 @@ class TransferUnit:
 class TransferBatch:
     units: list[TransferUnit]
     op_ids: list[int]
+
+
+@dataclass(slots=True)
+class PagedCacheTransferUnit:
+    op_id: int
+    transfers: list[Any]
+    is_retract: bool = False
