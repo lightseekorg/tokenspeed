@@ -77,9 +77,11 @@ def kda_recurrent(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Sequential KDA oracle for both prefill and decode."""
 
-    if q.shape != k.shape or q.shape != v.shape or q.shape != raw_g.shape:
-        raise ValueError("q, k, v, and raw_g must have matching shapes")
+    if q.shape != k.shape or q.shape != raw_g.shape:
+        raise ValueError("q, k, and raw_g must have matching shapes")
     tokens, heads, key_dim = q.shape
+    if v.shape[:2] != (tokens, heads):
+        raise ValueError("v must have the same token and head dimensions as q")
     value_dim = v.shape[-1]
     if state.shape != (heads, value_dim, key_dim):
         raise ValueError("invalid KDA state shape")
