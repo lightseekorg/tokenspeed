@@ -49,7 +49,7 @@ env:
   TOKENSPEED_B200_RUNNER_LABEL: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL || 'b200v2' }}
 
 concurrency:
-  group: pr-test-nvidia-${{ github.event.pull_request.number || github.ref }}
+  group: pr-test-nvidia-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'high priority' && format('-ignored-label-{0}', github.run_id) || '' }}
   cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
