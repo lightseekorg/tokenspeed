@@ -21,7 +21,7 @@ DRAFTER_ATTENTION_BACKEND=${DRAFTER_ATTENTION_BACKEND:-$ATTENTION_BACKEND}
 MOE_BACKEND=${MOE_BACKEND:-flashinfer_trtllm}
 QUANTIZATION=${QUANTIZATION:-nvfp4}
 KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-fp8_e4m3}
-ENABLE_MTP=${ENABLE_MTP:-1}
+ENABLE_MTP=${ENABLE_MTP:-0}
 MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS:-16}
 QUEUE_SIZE=${QUEUE_SIZE:-128}
 LOG_DIR=${PD_CI_LOG_DIR:-.ci-artifacts/pd-qwen35-397b-1p1d}
@@ -126,7 +126,7 @@ COMMON_ARGS=(
   --kvstore-ratio "$KVSTORE_RATIO"
   --enable-cache-report
   --disaggregation-transfer-backend mooncake
-  --disaggregation-layerwise-interval 1
+  --disaggregation-layerwise-interval 0
   --skip-server-warmup
 )
 

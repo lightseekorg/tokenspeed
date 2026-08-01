@@ -156,7 +156,7 @@ COMMON_ARGS=(
   --kvstore-ratio "$KVSTORE_RATIO"
   --enable-cache-report
   --disaggregation-transfer-backend mooncake
-  --disaggregation-layerwise-interval 1
+  --disaggregation-layerwise-interval 0
   --skip-server-warmup
 )
 
