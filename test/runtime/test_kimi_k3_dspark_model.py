@@ -16,6 +16,7 @@ import pytest
 from tokenspeed.runtime.configs.kimi_k3_dspark_config import (
     K3_DSPARK_SKIPPED_WEIGHT_PREFIXES,
     KimiK3DSparkConfig,
+    k3_dspark_inactive_features,
     validate_k3_dspark_config,
 )
 
@@ -248,6 +249,20 @@ def test_skipped_prefixes_cover_exactly_the_shared_and_training_only_weights() -
     ]
     # No lm_head ships at all; the draft borrows the target's.
     assert not any(k.startswith("lm_head") for k in CHECKPOINT_KEYS)
+
+
+def test_confidence_head_is_reported_inactive_rather_than_dropped() -> None:
+    """Issue #879: unsupported optional scheduling must be stated, not silent."""
+    notes = k3_dspark_inactive_features(make_config())
+    assert len(notes) == 1
+    note = notes[0]
+    assert "confidence_head" in note
+    # It names both what is ignored and what runs instead.
+    assert "static" in note
+
+
+def test_no_inactive_features_reported_without_a_confidence_head() -> None:
+    assert k3_dspark_inactive_features(make_config(enable_confidence_head=False)) == []
 
 
 def test_every_remaining_checkpoint_key_has_a_destination() -> None:

@@ -43,6 +43,7 @@ from torch import nn
 
 from tokenspeed.runtime.configs.kimi_k3_dspark_config import (
     K3_DSPARK_SKIPPED_WEIGHT_PREFIXES,
+    k3_dspark_inactive_features,
     validate_k3_dspark_config,
 )
 from tokenspeed.runtime.distributed.comm_manager import CommManager
@@ -230,6 +231,8 @@ class K3DSparkModel(nn.Module):
     ) -> None:
         super().__init__()
         validate_k3_dspark_config(config)
+        for note in k3_dspark_inactive_features(config):
+            logger.warning("K3 DSpark: %s", note)
         self.config = config
         self.mapping = mapping
         hidden_size = int(config.hidden_size)
