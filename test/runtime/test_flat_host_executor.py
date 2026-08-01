@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 # CI Registration (parsed via AST, runtime no-op)
@@ -107,6 +108,18 @@ class FlatHostPageSizingTest(unittest.TestCase):
                 page_size=4,
                 host_ratio=2.0,
                 host_size_gb=0.5,
+            )
+
+    def test_executor_rejects_pool_without_flat_host_mirror_capability(self):
+        from tokenspeed.runtime.cache.executor.flat_memory_executor import (
+            FlatMemoryExecutor,
+        )
+
+        with self.assertRaisesRegex(NotImplementedError, "--disable-kvstore"):
+            FlatMemoryExecutor(
+                device_pool=SimpleNamespace(supports_flat_host_mirror=False),
+                host_ratio=2.0,
+                host_size_gb=0,
             )
 
 
@@ -219,6 +232,7 @@ class FlatMemoryExecutorTest(unittest.TestCase):
             return self.MHATokenToKVPool(**kwargs)
 
     def _executor(self, pool):
+        self.assertTrue(pool.supports_flat_host_mirror)
         return self.FlatMemoryExecutor(device_pool=pool, host_ratio=2.0, host_size_gb=0)
 
     def _fill_device_pages(self, mirror, device_pages):

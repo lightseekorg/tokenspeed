@@ -33,6 +33,15 @@ def test_grouped_kvstore_rejects_only_paged_draft_pool(
         )
 
 
+def test_flat_v4_target_only_kvstore_fails_closed():
+    from tokenspeed.runtime.engine.event_loop import _validate_flat_host_tier_pool
+
+    pool = _make_v4_pool(flat=True)
+    assert not pool.supports_flat_host_mirror
+    with pytest.raises(NotImplementedError, match="--disable-kvstore"):
+        _validate_flat_host_tier_pool(pool)
+
+
 def test_deepseek_v4_scheduler_host_pages_follow_kvstore_mode():
     from tokenspeed.runtime.engine.event_loop import (
         _paged_cache_host_group_pages_for_scheduler,
@@ -74,10 +83,14 @@ def test_deepseek_v4_scheduler_host_pages_follow_kvstore_mode():
     assert enabled_config.paged_cache_host_group_pages == {"v4.swa_kv": 1}
 
 
-def _make_v4_pool():
+def _make_v4_pool(*, flat: bool = False):
+    from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
+        build_v4_cache_specs,
+    )
     from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
         DeepseekV4TokenToKVPool,
         deepseek_v4_cache_layout_from_config,
+        deepseek_v4_flat_lcm_blocks_needed,
     )
 
     hf_config = SimpleNamespace(
@@ -92,6 +105,16 @@ def _make_v4_pool():
         page_size=64,
         use_fp4_indexer_cache=True,
     )
+    flat_num_lcm_blocks = None
+    if flat:
+        specs = tuple(build_v4_cache_specs(hf_config, layer_ratio=layout.layer_ratio))
+        flat_num_lcm_blocks = deepseek_v4_flat_lcm_blocks_needed(
+            specs,
+            token_capacity=512,
+            max_live_requests=2,
+            max_scheduled_tokens=64,
+            max_context_len=512,
+        )
     return DeepseekV4TokenToKVPool(
         size=512,
         model_dtype=torch.bfloat16,
@@ -105,6 +128,7 @@ def _make_v4_pool():
         rank=0,
         hf_config=hf_config,
         max_scheduled_tokens=64,
+        flat_num_lcm_blocks=flat_num_lcm_blocks,
     )
 
 

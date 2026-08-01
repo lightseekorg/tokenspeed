@@ -49,6 +49,8 @@ from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaver
 
 logger = get_colorful_logger(__name__)
 
+_MAX_FLAT_KERNEL_PAGE_ID = (1 << 31) - 1
+
 
 @dataclass(frozen=True)
 class DeepseekV4FlatCachePlan:
@@ -247,18 +249,40 @@ def deepseek_v4_flat_group_page_counts(
         raise ValueError("num_lcm_blocks must be a positive integer")
     if num_lcm_blocks <= 0:
         raise ValueError("num_lcm_blocks must be a positive integer")
-    group_ids = tuple(str(spec.group_id) for spec in specs)
-    if not group_ids or len(group_ids) != len(set(group_ids)):
-        raise ValueError("Flat V4 cache specs must have unique nonempty group IDs")
+    geometry = _validate_deepseek_v4_flat_group_geometry(specs)
     counts: dict[str, int] = {}
-    for spec in specs:
-        packing = int(spec.cache_blocks_per_lcm_block)
-        if packing <= 0:
+    for group_id, packing in geometry:
+        max_page_id = num_lcm_blocks * packing
+        if max_page_id > _MAX_FLAT_KERNEL_PAGE_ID:
             raise ValueError(
-                f"Flat V4 cache group {spec.group_id!r} has invalid packing {packing}"
+                f"Flat V4 cache group {group_id!r} page ID exceeds "
+                f"{_MAX_FLAT_KERNEL_PAGE_ID}"
             )
-        counts[str(spec.group_id)] = num_lcm_blocks * packing + 1
+        counts[group_id] = max_page_id + 1
     return counts
+
+
+def _validate_deepseek_v4_flat_group_geometry(
+    specs: Sequence[PagedCacheGroupSpec],
+) -> tuple[tuple[str, int], ...]:
+    geometry: list[tuple[str, int]] = []
+    seen: set[str] = set()
+    for spec in specs:
+        group_id = spec.group_id
+        if not isinstance(group_id, str) or not group_id:
+            raise ValueError("Flat V4 cache specs must have nonempty string group IDs")
+        if group_id in seen:
+            raise ValueError("Flat V4 cache specs must have unique group IDs")
+        seen.add(group_id)
+        packing = spec.cache_blocks_per_lcm_block
+        if isinstance(packing, bool) or not isinstance(packing, int) or packing <= 0:
+            raise ValueError(
+                f"Flat V4 cache group {group_id!r} has invalid packing {packing!r}"
+            )
+        geometry.append((group_id, packing))
+    if not geometry:
+        raise ValueError("Flat V4 cache specs must not be empty")
+    return tuple(geometry)
 
 
 def deepseek_v4_flat_lcm_blocks_needed(
@@ -281,6 +305,7 @@ def deepseek_v4_flat_lcm_blocks_needed(
         raise ValueError("token_capacity must be a positive integer")
     if token_capacity <= 0:
         raise ValueError("token_capacity must be a positive integer")
+    geometry = _validate_deepseek_v4_flat_group_geometry(specs)
     compact_counts = compute_paged_cache_group_page_counts(
         specs,
         max_live_requests=max_live_requests,
@@ -291,15 +316,10 @@ def deepseek_v4_flat_lcm_blocks_needed(
         overlap_schedule_depth=overlap_schedule_depth,
     )
     parents = 0
-    for spec in specs:
-        packing = int(spec.cache_blocks_per_lcm_block)
-        if packing <= 0:
-            raise ValueError(
-                f"Flat V4 cache group {spec.group_id!r} has invalid packing {packing}"
-            )
+    for group_id, packing in geometry:
         # Page zero is a per-group null page and does not occupy a scheduler
         # parent.  Every remaining child page consumes one packed slot.
-        child_pages = int(compact_counts[spec.group_id]) - 1
+        child_pages = int(compact_counts[group_id]) - 1
         parents += ceil_div(child_pages, packing)
     return int(parents)
 

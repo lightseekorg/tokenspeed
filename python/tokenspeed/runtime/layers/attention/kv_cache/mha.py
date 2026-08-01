@@ -51,6 +51,8 @@ GB = 1024 * 1024 * 1024
 
 
 class MHATokenToKVPool(BaseTokenToKVPool):
+    supports_flat_host_mirror = True
+
     def __init__(
         self,
         size: int,
@@ -661,6 +663,8 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
     """
 
     MXFP8_SCALE_BLOCK_SIZE = 32
+    # FlatHostMirror does not mirror the MXFP8 scale tensors.
+    supports_flat_host_mirror = False
 
     def _create_buffers(self):
         assert self.head_dim % self.MXFP8_SCALE_BLOCK_SIZE == 0

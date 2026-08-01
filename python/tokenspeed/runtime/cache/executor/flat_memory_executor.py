@@ -105,6 +105,16 @@ class FlatMemoryExecutor:
     emits_loadback_acks = True
 
     def __init__(self, device_pool, *, host_ratio: float, host_size_gb: float):
+        if not getattr(device_pool, "supports_flat_host_mirror", False):
+            raise NotImplementedError(
+                "the flat host tier (kvstore L2) does not support this KV "
+                "cache pool; pass --disable-kvstore."
+            )
+        if not hasattr(device_pool, "k_buffer") or not hasattr(device_pool, "v_buffer"):
+            raise TypeError(
+                "a flat-host-mirror-capable KV pool must expose k_buffer and "
+                "v_buffer"
+            )
         self.page_size = int(device_pool.page_size)
         self.layer_num = len(device_pool.k_buffer)
 

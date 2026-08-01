@@ -14,6 +14,8 @@ class MSATokenToKVPool(MHATokenToKVPool):
     """MHA K/V cache plus a key-only sparse-index side cache."""
 
     supports_hierarchical_kv_cache = False
+    # FlatHostMirror does not mirror the sparse index side cache.
+    supports_flat_host_mirror = False
 
     def __init__(
         self,

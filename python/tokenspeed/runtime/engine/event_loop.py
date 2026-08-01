@@ -128,6 +128,21 @@ def _validate_grouped_kvstore_draft_pool(
         )
 
 
+def _validate_flat_host_tier_pool(token_to_kv_pool) -> None:
+    if getattr(token_to_kv_pool, "runtime_contract", None) is not None:
+        # FlatKV contract pools have no host tier yet: FlatMemoryExecutor
+        # mirrors ordinary k_buffer/v_buffer layouts, not raw LCM arenas.
+        raise NotImplementedError(
+            "the flat host tier (kvstore L2) does not support FlatKV "
+            "contract pools yet; pass --disable-kvstore."
+        )
+    if not getattr(token_to_kv_pool, "supports_flat_host_mirror", False):
+        raise NotImplementedError(
+            "the flat host tier (kvstore L2) does not support this KV cache "
+            "pool; pass --disable-kvstore."
+        )
+
+
 def calc_l3_query_hashes(scheduler, tokens: list[int]) -> list[str]:
     return scheduler.calc_rolling_hash(tokens, apply_match=True)
 
@@ -362,15 +377,7 @@ class EventLoop:
                     "flat scheduler build (TOKENSPEED_FLAT_KVCACHE) has no L3 "
                     "storage tier yet; unset --kvstore-storage-backend."
                 )
-            if getattr(token_to_kv_pool, "runtime_contract", None) is not None:
-                # FlatKV contract pools (Kimi-K3) have no host tier yet:
-                # FlatMemoryExecutor mirrors k_buffer/v_buffer layouts the
-                # raw-slab pool does not expose. Reject this unsupported
-                # combination at startup.
-                raise NotImplementedError(
-                    "the flat host tier (kvstore L2) does not support FlatKV "
-                    "contract pools (Kimi-K3) yet; pass --disable-kvstore."
-                )
+            _validate_flat_host_tier_pool(token_to_kv_pool)
             self.memory_executor = FlatMemoryExecutor(
                 device_pool=token_to_kv_pool,
                 host_ratio=server_args.kvstore_ratio,

@@ -448,12 +448,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         """
         if actual_bs == 0:
             return
+        # V4 MTP receives the target's post-verify seq_lens.  Every draft
+        # depth replays that same verify window (positions and cache slots are
+        # deliberately reused), so the delivered value already names the
+        # exclusive logical end for target and draft alike.
         live_seq_lens = seq_lens[:actual_bs].to(dtype=torch.int64)
-        if self.is_draft:
-            # MTP advances this metadata in-place without another scheduler
-            # table delivery. Prove the delivered absolute table also covers
-            # every possible draft step, including a page-boundary crossing.
-            live_seq_lens = live_seq_lens + int(self.speculative_num_draft_tokens)
         for group_id, table in tables.items():
             raw_tokens_per_page = self._flat_group_raw_tokens_per_page.get(group_id)
             max_page_id = self._flat_group_max_page_ids.get(group_id)

@@ -40,6 +40,10 @@ class BaseTokenToKVPool:
     paged_cache_group_specs: tuple[PagedCacheGroupSpec, ...] = ()
     paged_cache_group_page_counts: dict[str, int] = {}
     supports_hierarchical_kv_cache: bool = True
+    # The flat host mirror has a narrower storage ABI than the generic
+    # hierarchical cache: it can only mirror ordinary per-layer K/V tensors
+    # (plus the explicitly supported state-slab surface). Pools must opt in.
+    supports_flat_host_mirror: bool = False
     # Flat-cache pools that alias recurrent-state bytes and KV in one slab must
     # zero physical pages on reuse to avoid poisoned tails. Pure-attention
     # pools do not alias state, so reused pages need no sanitization.

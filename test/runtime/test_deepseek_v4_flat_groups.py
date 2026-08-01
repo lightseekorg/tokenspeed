@@ -4,6 +4,7 @@ import os
 import sys
 import unittest
 from collections import OrderedDict
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -126,6 +127,33 @@ def _page_counts(specs, count: int = 4096):
 
 
 class DeepseekV4FlatGroupUnitTest(unittest.TestCase):
+    def test_flat_page_namespace_rejects_ambiguous_or_unrepresentable_geometry(
+        self,
+    ):
+        spec = _target_specs()[0]
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            deepseek_v4_flat_group_page_counts((), num_lcm_blocks=1)
+        with self.assertRaisesRegex(ValueError, "nonempty string"):
+            deepseek_v4_flat_group_page_counts(
+                (replace(spec, group_id=""),), num_lcm_blocks=1
+            )
+        with self.assertRaisesRegex(ValueError, "nonempty string"):
+            deepseek_v4_flat_group_page_counts(
+                (replace(spec, group_id=7),), num_lcm_blocks=1
+            )
+        with self.assertRaisesRegex(ValueError, "unique group IDs"):
+            deepseek_v4_flat_group_page_counts((spec, spec), num_lcm_blocks=1)
+        with self.assertRaisesRegex(ValueError, "invalid packing"):
+            deepseek_v4_flat_group_page_counts(
+                (replace(spec, cache_blocks_per_lcm_block=True),),
+                num_lcm_blocks=1,
+            )
+        with self.assertRaisesRegex(ValueError, "page ID exceeds"):
+            deepseek_v4_flat_group_page_counts(
+                (replace(spec, cache_blocks_per_lcm_block=64),),
+                num_lcm_blocks=((1 << 31) - 1) // 64 + 1,
+            )
+
     def test_flat_pool_allocates_complete_absolute_page_id_namespaces(self):
         hf_config = SimpleNamespace(
             compress_ratios=(1, 4, 128),
@@ -263,6 +291,77 @@ class DeepseekV4FlatGroupUnitTest(unittest.TestCase):
         self.assertLessEqual(
             plan.dummy_page_bytes + plan.num_lcm_blocks * plan.bytes_per_lcm_block,
             100 * (1 << 30),
+        )
+
+        target_pool = DeepseekV4TokenToKVPool(
+            size=plan.token_capacity,
+            model_dtype=torch.bfloat16,
+            layout=target_layout,
+            layer_num=3,
+            device="cpu",
+            enable_memory_saver=False,
+            max_batch_size=2,
+            max_context_len=128,
+            page_size=256,
+            rank=0,
+            hf_config=target_hf,
+            max_scheduled_tokens=128,
+            decode_input_tokens=4,
+            overlap_schedule_depth=1,
+            flat_num_lcm_blocks=plan.num_lcm_blocks,
+        )
+        draft_pool = DeepseekV4TokenToKVPool(
+            size=plan.token_capacity,
+            model_dtype=torch.bfloat16,
+            layout=draft_layout,
+            layer_num=1,
+            device="cpu",
+            enable_memory_saver=False,
+            max_batch_size=2,
+            max_context_len=128,
+            page_size=256,
+            rank=0,
+            hf_config=draft_hf,
+            max_scheduled_tokens=128,
+            decode_input_tokens=4,
+            overlap_schedule_depth=1,
+            flat_num_lcm_blocks=plan.num_lcm_blocks,
+        )
+        self.assertEqual(
+            target_pool.get_kv_size_bytes() + draft_pool.get_kv_size_bytes(),
+            plan.dummy_page_bytes + plan.num_lcm_blocks * plan.bytes_per_lcm_block,
+        )
+
+        target_only_under_budget = profile_deepseek_v4_flat_cache(
+            layout=target_layout,
+            hf_config=target_hf,
+            layer_num=3,
+            max_live_requests=2,
+            max_scheduled_tokens=0,
+            max_context_len=4096,
+            available_cache_memory_bytes=1 << 30,
+            token_limit=None,
+            decode_input_tokens=4,
+            overlap_schedule_depth=1,
+        )
+        target_and_mtp_under_budget = profile_deepseek_v4_flat_cache(
+            layout=target_layout,
+            hf_config=target_hf,
+            layer_num=3,
+            max_live_requests=2,
+            max_scheduled_tokens=0,
+            max_context_len=4096,
+            available_cache_memory_bytes=1 << 30,
+            token_limit=None,
+            draft_layout=draft_layout,
+            draft_hf_config=draft_hf,
+            draft_layer_num=1,
+            decode_input_tokens=4,
+            overlap_schedule_depth=1,
+        )
+        self.assertLess(
+            target_and_mtp_under_budget.token_capacity,
+            target_only_under_budget.token_capacity,
         )
 
     def test_scheduler_block_size_matches_extension_contract(self):
@@ -636,6 +735,40 @@ class DeepseekV4FlatGroupUnitTest(unittest.TestCase):
                 seq_lens=torch.ones(2, dtype=torch.int32),
                 forward_mode=ForwardMode.DECODE,
                 flat_cache_group_ids=(spec.group_id, spec.group_id),
+            )
+
+    def test_draft_flat_coverage_does_not_double_count_verify_window(self):
+        spec = _draft_specs()[0]
+        backend = _backend(flat=True, is_draft=True, speculative_tokens=4)
+        backend.init_cuda_graph_state(
+            1,
+            paged_cache_group_specs=(spec,),
+            paged_cache_group_page_counts=_page_counts((spec,)),
+        )
+        one_page = OrderedDict(
+            ((spec.group_id, torch.tensor([[1]], dtype=torch.int32)),)
+        )
+        common = dict(
+            bs=1,
+            req_pool_indices=torch.tensor([0], dtype=torch.int32),
+            forward_mode=ForwardMode.DECODE,
+            req_to_page=torch.zeros((1, 2), dtype=torch.int32),
+            flat_block_tables=one_page,
+        )
+
+        # seq_lens is already the exclusive end of the four-token target
+        # verify window.  Position 60 therefore fits in logical page 0.
+        backend.init_forward_metadata(
+            **common,
+            seq_lens=torch.tensor([61], dtype=torch.int32),
+        )
+        self.assertIsNotNone(backend.forward_metadata)
+
+        # Crossing the real 64-token boundary still fails closed.
+        with self.assertRaisesRegex(RuntimeError, "missing a real page"):
+            backend.init_forward_metadata(
+                **common,
+                seq_lens=torch.tensor([65], dtype=torch.int32),
             )
 
     def test_idle_zero_batch_and_padded_replay_are_safe(self):
