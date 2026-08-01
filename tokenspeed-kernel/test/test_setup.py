@@ -6,7 +6,9 @@ import tarfile
 from collections import Counter
 from pathlib import Path
 
+import pytest
 import setuptools
+from packaging.markers import default_environment
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from setuptools import build_meta
@@ -44,9 +46,17 @@ def _expected_install_requires(backend: str) -> list[str]:
     return list(dict.fromkeys(requirements))
 
 
-def _requirements_by_name(requirements: list[str]) -> dict[str, Requirement]:
+def _requirements_by_name(
+    requirements: list[str], *, environment: dict[str, str] | None = None
+) -> dict[str, Requirement]:
     assert all(not requirement.startswith("-") for requirement in requirements)
     parsed = [Requirement(requirement) for requirement in requirements]
+    if environment is not None:
+        parsed = [
+            requirement
+            for requirement in parsed
+            if requirement.marker is None or requirement.marker.evaluate(environment)
+        ]
     names = [canonicalize_name(requirement.name) for requirement in parsed]
     duplicates = sorted(name for name, count in Counter(names).items() if count > 1)
     assert not duplicates, f"duplicate dependency names: {duplicates}"
@@ -57,7 +67,9 @@ def test_cuda_install_requires_include_runtime_dependencies(monkeypatch) -> None
     install_requires = _capture_install_requires(monkeypatch, "cuda")
 
     assert install_requires == _expected_install_requires("cuda")
-    requirements = _requirements_by_name(install_requires)
+    requirements = _requirements_by_name(
+        install_requires, environment=default_environment()
+    )
     assert {
         "tokenspeed-proton",
         "tokenspeed-triton",
@@ -69,6 +81,35 @@ def test_cuda_install_requires_include_runtime_dependencies(monkeypatch) -> None
     } <= requirements.keys()
     assert {"tokenspeed-kernel-amd", "tokenspeed-iris"}.isdisjoint(requirements)
     assert requirements["nvidia-cutlass-dsl"].extras == {"cu13"}
+
+
+def test_cuda_trtllm_kernel_requirement_matches_python_version(monkeypatch) -> None:
+    install_requires = _capture_install_requires(monkeypatch, "cuda")
+    expected_versions = {
+        "3.10": "1.2.1.post20260427",
+        "3.11": "1.2.1.post20260427",
+        "3.12": "1.3.0rc22.post20260731",
+        "3.13": "1.2.1.post20260427",
+    }
+
+    for python_version, expected_version in expected_versions.items():
+        environment = default_environment()
+        environment["python_version"] = python_version
+        environment["python_full_version"] = f"{python_version}.0"
+        requirements = _requirements_by_name(install_requires, environment=environment)
+
+        assert (
+            str(requirements["tokenspeed-trtllm-kernel"].specifier)
+            == f"=={expected_version}"
+        )
+
+
+def test_requirements_by_name_rejects_active_duplicates() -> None:
+    with pytest.raises(AssertionError, match="duplicate dependency names"):
+        _requirements_by_name(
+            ["example-package==1", "example-package==2"],
+            environment=default_environment(),
+        )
 
 
 def test_rocm_install_requires_exclude_cuda_dependencies(monkeypatch) -> None:
