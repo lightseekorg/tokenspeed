@@ -684,11 +684,7 @@ class ModelExecutor:
                 if self.config.model_is_mrope
                 else ib.positions_buf[:num_tokens]
             )
-            # The dummy batch is EXTEND, so the logits prune needs the
-            # last-token row per request. ForwardContext no longer carries
-            # gather_ids, so pass it explicitly like the real forward does;
-            # make_dummy_batch has stamped the per-request lengths into
-            # seq_lens_buf (prefill prefix is zero, so seq_len == extend_len).
+            # EXTEND dummy: pass explicit last-token gather_ids (prefix is zero here, so seq_len == extend_len).
             gather_ids = (
                 torch.cumsum(ib.seq_lens_buf[: ctx.bs].to(torch.int64), dim=0) - 1
             )
