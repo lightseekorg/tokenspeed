@@ -28,7 +28,7 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 try:
-    from tokenspeed_kernel_amd.ops.sampling.gluon.argmax_gfx950 import (
+    from tokenspeed_kernel_amd.ops.gfx950.sampling.argmax import (
         gluon_argmax_gfx950 as _argmax_impl,
     )
 except ImportError as exc:
