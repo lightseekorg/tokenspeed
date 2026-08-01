@@ -32,7 +32,10 @@ jobs:
       matrix: ${{ fromJson(inputs.matrix) }}
     name: ${{ matrix.name }} (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    # Cold GPU runners can spend more than 50 minutes building dependencies
+    # before a large-model evaluation starts. Leave enough time for the task
+    # itself to finish instead of cancelling a healthy server mid-evaluation.
+    timeout-minutes: 90
     continue-on-error: ${{ matrix.optional }}
     env:
       INSTALL_TOKENSPEED_MLA_FROM_SOURCE: ${{ inputs.install_tokenspeed_mla_from_source }}
