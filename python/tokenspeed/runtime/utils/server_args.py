@@ -42,7 +42,7 @@ from tokenspeed.runtime.utils import (
     maybe_model_redirect,
     nullable_str,
 )
-from tokenspeed.runtime.utils.launcher import detect_topology
+from tokenspeed.runtime.utils.launcher import check_dist_init_port, detect_topology
 from tokenspeed.runtime.utils.network import is_port_available
 
 logger = get_colorful_logger(__name__)
@@ -476,6 +476,7 @@ class ServerArgs:
             self.node_rank = topology.node_rank
             derived.append(f"--node-rank {self.node_rank}")
         if self.dist_init_addr is None:
+            check_dist_init_port(topology.dist_init_port)
             self.dist_init_addr = topology.dist_init_addr
             derived.append(f"--dist-init-addr {self.dist_init_addr}")
         if derived:
@@ -1380,7 +1381,7 @@ class ServerArgs:
             "--nnodes",
             type=int,
             default=ServerArgs.nnodes,
-            help="The number of nodes. Derived from SLURM_NNODES when unset.",
+            help="The number of nodes. Derived from SLURM_STEP_NUM_NODES when unset.",
         )
         parser.add_argument(
             "--node-rank",

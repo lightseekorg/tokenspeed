@@ -53,7 +53,7 @@ def test_first_host_rejects_empty():
 
 def _multi_node_env(**overrides):
     env = {
-        launcher.SLURM_NNODES: "2",
+        launcher.SLURM_STEP_NUM_NODES: "2",
         launcher.SLURM_NODEID: "1",
         launcher.SLURM_STEP_NODELIST: "inkwell-iron-cn[15-16]",
     }
@@ -72,7 +72,21 @@ def test_no_launcher_environment_returns_none():
 
 
 def test_single_node_step_returns_none():
-    assert launcher.detect_topology(_multi_node_env(SLURM_NNODES="1")) is None
+    assert launcher.detect_topology(_multi_node_env(SLURM_STEP_NUM_NODES="1")) is None
+
+
+def test_batch_script_environment_is_not_a_multi_node_step():
+    """A bare `ts serve` in a multi-node sbatch is a deliberate single-node run."""
+    assert (
+        launcher.detect_topology(
+            {
+                "SLURM_NNODES": "2",
+                launcher.SLURM_NODEID: "0",
+                "SLURM_JOB_NODELIST": "inkwell-iron-cn[02-03]",
+            }
+        )
+        is None
+    )
 
 
 def test_detects_multi_node_step(resolvable_head):
@@ -108,29 +122,11 @@ def test_port_check_is_skipped_without_a_known_range(monkeypatch):
     launcher.check_dist_init_port(60486)
 
 
-def test_step_nodelist_wins_over_job_nodelist(monkeypatch):
-    seen = []
-
-    def fake_gethostbyname(host):
-        seen.append(host)
-        return HEAD_IP
-
-    monkeypatch.setattr(launcher.socket, "gethostbyname", fake_gethostbyname)
-    monkeypatch.setattr(launcher, "local_ipv4_addresses", lambda: {HEAD_IP})
-    launcher.detect_topology(
-        _multi_node_env(
-            SLURM_STEP_NODELIST="cn15,cn16",
-            SLURM_JOB_NODELIST="cn01,cn02",
-        )
-    )
-    assert seen == ["cn15"]
-
-
-def test_falls_back_to_job_nodelist(resolvable_head):
-    env = _multi_node_env()
-    del env[launcher.SLURM_STEP_NODELIST]
-    env[launcher.SLURM_JOB_NODELIST] = "inkwell-iron-cn[15-16]"
-    assert launcher.detect_topology(env).head_host == HEAD_IP
+def test_detection_does_not_check_the_rendezvous_port(monkeypatch, resolvable_head):
+    """The port only has to be usable where the derived address is adopted."""
+    monkeypatch.setattr(launcher, "_ephemeral_port_range", lambda: (1024, 60999))
+    topology = launcher.detect_topology(_multi_node_env())
+    assert topology.dist_init_port == launcher.DIST_INIT_DEFAULT_PORT
 
 
 def test_missing_node_id_is_an_error():
@@ -149,7 +145,7 @@ def test_missing_nodelist_is_an_error():
 
 def test_non_integer_nnodes_is_an_error():
     with pytest.raises(ValueError, match="not an integer"):
-        launcher.detect_topology(_multi_node_env(SLURM_NNODES="two"))
+        launcher.detect_topology(_multi_node_env(SLURM_STEP_NUM_NODES="two"))
 
 
 def test_node_id_out_of_range_is_an_error():

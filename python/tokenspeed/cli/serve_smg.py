@@ -126,10 +126,12 @@ def _get_from_args(
         default: Returned when the flag is absent or is the final token.
 
     Returns:
-        The value following the first occurrence of ``flag``, else ``default``.
+        The value following the last occurrence of ``flag``, else ``default``.
+        Last-wins matches argparse, so a wrapper can append a flag to override
+        one already in the argv.
     """
     try:
-        index = args.index(flag)
+        index = len(args) - 1 - args[::-1].index(flag)
     except ValueError:
         return default
     if index + 1 >= len(args):

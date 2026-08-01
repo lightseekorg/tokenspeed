@@ -90,7 +90,7 @@ srun --nodes=2 --ntasks-per-node=1 tokenspeed serve <model> --attn-tp-size 16
 
 | Argument | Derived from |
 | --- | --- |
-| `--nnodes` | `SLURM_NNODES` |
+| `--nnodes` | `SLURM_STEP_NUM_NODES` |
 | `--node-rank` | `SLURM_NODEID` |
 | `--dist-init-addr` | first host of `SLURM_STEP_NODELIST`, port 23456 |
 
@@ -99,8 +99,10 @@ Rules:
 - An explicit `--nnodes` or `--node-rank` that contradicts the environment is
   an error, not an override. Omit the flag to accept the launcher's value.
 - An explicit `--dist-init-addr` is always used as given.
-- Derivation only engages when `SLURM_NNODES` is greater than 1. Outside a
-  launcher, or in a single-node step, behaviour is unchanged.
+- Derivation only engages inside an `srun` step of more than one node. Outside
+  a step — including the batch script of a multi-node `sbatch` — or in a
+  single-node step, behaviour is unchanged: launch the ranks yourself and pass
+  `--nnodes`/`--node-rank`/`--dist-init-addr`.
 - If a multi-node step is detected but the topology cannot be resolved,
   startup fails with the reason rather than falling back to a single node.
 - The derived address is the one the head node's hostname resolves to. Where

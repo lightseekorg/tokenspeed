@@ -260,6 +260,11 @@ def test_get_from_args_returns_none_when_flag_lacks_value():
     assert _get_from_args(["--model"], "--model") is None
 
 
+def test_get_from_args_takes_the_last_occurrence():
+    """Last-wins matches argparse, so appending a flag overrides an earlier one."""
+    assert _get_from_args(["--port", "8000", "--port", "8413"], "--port") == "8413"
+
+
 def test_deepseek_v4_model_id_gets_default_parsers():
     model = "deepseek-ai/DeepSeek-V4-Flash"
 

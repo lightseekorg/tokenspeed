@@ -29,10 +29,9 @@ import socket
 
 import psutil
 
-SLURM_NNODES = "SLURM_NNODES"
+SLURM_STEP_NUM_NODES = "SLURM_STEP_NUM_NODES"
 SLURM_NODEID = "SLURM_NODEID"
 SLURM_STEP_NODELIST = "SLURM_STEP_NODELIST"
-SLURM_JOB_NODELIST = "SLURM_JOB_NODELIST"
 
 # Every node must compute the same rendezvous port without talking to any other
 # node, so it is a constant rather than a function of any per-node value.
@@ -257,26 +256,25 @@ def detect_topology(env: dict[str, str] | None = None) -> LauncherTopology | Non
     """
     env = os.environ if env is None else env
 
-    if env.get(SLURM_NNODES) is None:
+    if env.get(SLURM_STEP_NUM_NODES) is None:
         return None
-    nnodes = _require_int(env, SLURM_NNODES)
+    nnodes = _require_int(env, SLURM_STEP_NUM_NODES)
     if nnodes <= 1:
         return None
 
     node_rank = _require_int(env, SLURM_NODEID)
     if not 0 <= node_rank < nnodes:
         raise ValueError(
-            f"{SLURM_NODEID}={node_rank} is out of range for {SLURM_NNODES}={nnodes}"
+            f"{SLURM_NODEID}={node_rank} is out of range for {SLURM_STEP_NUM_NODES}={nnodes}"
         )
 
-    nodelist = env.get(SLURM_STEP_NODELIST) or env.get(SLURM_JOB_NODELIST)
+    nodelist = env.get(SLURM_STEP_NODELIST)
     if not nodelist:
         raise ValueError(
             f"{SLURM_STEP_NODELIST} is unset but a multi-node step was detected; "
             "pass --dist-init-addr <host>:<port> explicitly"
         )
 
-    check_dist_init_port(DIST_INIT_DEFAULT_PORT)
     return LauncherTopology(
         nnodes=nnodes,
         node_rank=node_rank,
