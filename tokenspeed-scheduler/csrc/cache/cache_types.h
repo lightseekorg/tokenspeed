@@ -70,6 +70,9 @@ struct KvCacheSpec {
     // Number of this group's logical cache blocks packed into one physical
     // LCM block. It affects placement only, never prefix-match granularity.
     std::int32_t cache_blocks_per_lcm_block;
+    // Tokens represented by one logical block in this group. Zero inherits
+    // the coordinator's domain block size for legacy/uniform configurations.
+    std::int32_t block_size{0};
 };
 
 // Per-request logical-page -> physical-page mapping.
@@ -94,10 +97,10 @@ private:
 };
 
 // Per-group input for one admission. page_hashes is the request's cumulative
-// completed-page history; first_new_page_slot splits the newly completed
-// suffix used by prefix-closed groups. Non-closed groups select the trailing
-// pages required to resume num_computed_tokens. The request owns table and
-// the storage behind page_hashes.
+// completed base-page history; first_new_page_slot is in that same base-page
+// unit. Managers fold those hashes to their own logical block size before
+// registration. Non-closed groups select the trailing logical pages required
+// to resume num_computed_tokens. The request owns table and page_hashes.
 struct GroupDemand {
     BlockTable* table{nullptr};
     std::int32_t num_tokens{0};

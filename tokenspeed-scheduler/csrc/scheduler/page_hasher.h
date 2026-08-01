@@ -20,10 +20,12 @@
 
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <openssl/sha.h>
@@ -144,6 +146,32 @@ inline std::vector<std::string> AdvancePagedHashes(std::span<const std::span<con
     return ComputePagedHashes(paged_tokens.subspan(static_cast<std::size_t>(first_page),
                                                    static_cast<std::size_t>(past_end_page - first_page)),
                               prior);
+}
+
+// Fold m consecutive base-page hashes into a stable coarse-page key. The
+// caller supplies the global index of base_hashes[0], so a range beginning in
+// the middle of a coarse page skips that incomplete prefix. m == 1 preserves
+// the original hash byte-for-byte.
+inline std::vector<std::string> FoldBaseHashes(std::span<const std::string> base_hashes, std::int32_t first_base,
+                                               std::int32_t m) {
+    _assert(first_base >= 0, "first base-page index must be non-negative");
+    _assert(m >= 1, "fold factor must be >= 1");
+    if (m == 1) {
+        return {base_hashes.begin(), base_hashes.end()};
+    }
+    std::vector<std::string> out;
+    out.reserve(base_hashes.size() / static_cast<std::size_t>(m) + 1);
+    std::int32_t index = (m - first_base % m) % m;
+    for (; index + m <= static_cast<std::int32_t>(base_hashes.size()); index += m) {
+        std::string running;
+        for (std::int32_t offset = 0; offset < m; ++offset) {
+            const std::string& base_hash = base_hashes[static_cast<std::size_t>(index + offset)];
+            const std::array<std::string, 1> extra{base_hash};
+            running = HashPage(std::span<const std::int32_t>{}, running, extra);
+        }
+        out.push_back(std::move(running));
+    }
+    return out;
 }
 
 }  // namespace tokenspeed

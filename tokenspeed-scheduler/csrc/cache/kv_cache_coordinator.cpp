@@ -23,11 +23,13 @@
 #include <algorithm>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <optional>
 
 #include "cache/full_attn_manager.h"
 #include "cache/mamba_state_manager.h"
 #include "cache/swa_manager.h"
+#include "scheduler/page_hasher.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -36,12 +38,23 @@ KvCacheCoordinator::KvCacheCoordinator(std::vector<CacheGroup> groups, std::int3
                                        BlockPool* host_pool)
     : groups_{std::move(groups)}, pool_{pool}, host_pool_{host_pool}, cache_block_tokens_{cache_block_tokens} {
     _assert(cache_block_tokens_ > 0, "coordinator needs positive cache_block_tokens");
+    base_block_tokens_ = cache_block_tokens_;
     for (std::size_t i = 0; i < groups_.size(); ++i) {
+        const std::int32_t group_block_tokens = groups_[i].Manager().CacheBlockTokens();
         _assert(groups_[i].Id() == static_cast<GroupId>(i), "cache manager group id must equal its group index");
-        _assert(groups_[i].Manager().CacheBlockTokens() == cache_block_tokens_,
-                "every cache manager must use the domain cache_block_tokens");
+        _assert(group_block_tokens > 0 && cache_block_tokens_ % group_block_tokens == 0,
+                "every cache manager block size must divide the domain cache_block_tokens");
+        const std::int32_t expected_group_block_tokens =
+            groups_[i].Spec().block_size > 0 ? groups_[i].Spec().block_size : cache_block_tokens_;
+        _assert(group_block_tokens == expected_group_block_tokens,
+                "cache manager block size must match its group spec");
         _assert(groups_[i].Manager().CacheBlocksPerLcmBlock() == groups_[i].Spec().cache_blocks_per_lcm_block,
                 "cache manager packing must match its group spec");
+        if (group_block_tokens != cache_block_tokens_) {
+            _assert(groups_[i].Manager().CacheBlocksPerLcmBlock() == cache_block_tokens_ / group_block_tokens,
+                    "fine-grained cache manager packing must cover one domain block");
+        }
+        base_block_tokens_ = std::gcd(base_block_tokens_, group_block_tokens);
         if (groups_[i].Manager().MatchIsPrefixClosed()) {
             match_order_.push_back(i);
         }
@@ -58,12 +71,18 @@ bool KvCacheCoordinator::HasMambaStateGroup() const {
                                [](const CacheGroup& group) { return group.Spec().kind == AttnKind::kMambaState; });
 }
 
-std::vector<CacheKey> KvCacheCoordinator::keysForGroup(std::span<const std::string> content_hashes,
-                                                       GroupId group_id) const {
+std::vector<CacheKey> KvCacheCoordinator::keysForGroup(std::span<const std::string> content_hashes, GroupId group_id,
+                                                       std::int32_t first_base) const {
+    _assert(group_id < groups_.size(), "cache key group id out of range");
+    const std::int32_t group_block_tokens = groups_[group_id].Manager().CacheBlockTokens();
+    _assert(group_block_tokens % base_block_tokens_ == 0,
+            "group block size must be a multiple of the base block size");
+    std::vector<std::string> folded =
+        FoldBaseHashes(content_hashes, first_base, group_block_tokens / base_block_tokens_);
     std::vector<CacheKey> keys;
-    keys.reserve(content_hashes.size());
-    for (const std::string& content_hash : content_hashes) {
-        keys.push_back(CacheKey{.group_id = group_id, .content_hash = content_hash});
+    keys.reserve(folded.size());
+    for (std::string& content_hash : folded) {
+        keys.push_back(CacheKey{.group_id = group_id, .content_hash = std::move(content_hash)});
     }
     return keys;
 }
@@ -127,7 +146,7 @@ std::vector<std::vector<CacheKey>> KvCacheCoordinator::buildGroupKeys(
 // The one tier matcher: slots below floor_tokens are assumed valid in a lower tier; per_group
 // blocks are relative to the floor, num_common_tokens is the absolute converged boundary (in
 // TOKENS). num_cache_blocks = content_hashes.size(); every group has one key per
-// logical CacheBlock.
+// base logical page. group_keys[i] is folded to group i's block size.
 KvCacheCoordinator::PrefixProbe::Tier KvCacheCoordinator::probeTierWithKeys(
     const BlockPool& pool, std::span<const std::vector<CacheKey>> group_keys, std::span<const std::size_t> match_order,
     std::int32_t num_cache_blocks, std::int32_t floor_tokens) const {
@@ -137,25 +156,28 @@ KvCacheCoordinator::PrefixProbe::Tier KvCacheCoordinator::probeTierWithKeys(
         return out;
     }
     const ConvergedBoundary boundary = SweepThenConverge(
-        match_order, groups_, num_cache_blocks * cache_block_tokens_, cache_block_tokens_,
+        match_order, groups_, num_cache_blocks * base_block_tokens_, cache_block_tokens_,
         [&](std::size_t i, std::int32_t bound_tokens) {
-            out.per_group[i] = groups_[i].Manager().Probe(pool, group_keys[i], floor_tokens / cache_block_tokens_,
-                                                          bound_tokens / cache_block_tokens_);
+            const std::int32_t group_block_tokens = groups_[i].Manager().CacheBlockTokens();
+            out.per_group[i] = groups_[i].Manager().Probe(pool, group_keys[i], floor_tokens / group_block_tokens,
+                                                          bound_tokens / group_block_tokens);
         },
         [&](std::size_t i) {
-            return (floor_tokens / cache_block_tokens_ + static_cast<std::int32_t>(out.per_group[i].hits.size())) *
-                   cache_block_tokens_;
+            const std::int32_t group_block_tokens = groups_[i].Manager().CacheBlockTokens();
+            return (floor_tokens / group_block_tokens + static_cast<std::int32_t>(out.per_group[i].hits.size())) *
+                   group_block_tokens;
         });
 
     // Truncate closed probes to the converged boundary.
     // Non-closed groups were re-probed against the settled bound and are already at or below it.
-    const std::int32_t floor_blocks = floor_tokens / cache_block_tokens_;
     for (std::size_t i = 0; i < groups_.size(); ++i) {
+        const std::int32_t group_block_tokens = groups_[i].Manager().CacheBlockTokens();
+        const std::int32_t floor_blocks = floor_tokens / group_block_tokens;
         GroupPrefixProbe& probe = out.per_group[i];
-        if ((floor_blocks + static_cast<std::int32_t>(probe.hits.size())) * cache_block_tokens_ >
+        if ((floor_blocks + static_cast<std::int32_t>(probe.hits.size())) * group_block_tokens >
             boundary.common_tokens) {
             _assert(groups_[i].Manager().MatchIsPrefixClosed(), "window group left above the converged boundary");
-            probe.hits.resize(static_cast<std::size_t>(boundary.common_tokens / cache_block_tokens_ - floor_blocks));
+            probe.hits.resize(static_cast<std::size_t>(boundary.common_tokens / group_block_tokens - floor_blocks));
         }
     }
     out.num_common_tokens = boundary.common_tokens;
@@ -170,8 +192,8 @@ CoordinatorMatch KvCacheCoordinator::acquireTierWithKeys(BlockPool& pool,
     CoordinatorMatch out;
     out.num_common_tokens = probe.num_common_tokens;
     out.per_group.resize(groups_.size());
-    const std::int32_t floor_blocks = floor_tokens / cache_block_tokens_;
     for (std::size_t i = 0; i < groups_.size(); ++i) {
+        const std::int32_t floor_blocks = floor_tokens / groups_[i].Manager().CacheBlockTokens();
         out.per_group[i] = groups_[i].Manager().AcquireMatchedBlocks(pool, group_keys[i], floor_blocks,
                                                                      probe.per_group[i], access_epoch);
     }
@@ -180,7 +202,7 @@ CoordinatorMatch KvCacheCoordinator::acquireTierWithKeys(BlockPool& pool,
 
 KvCacheCoordinator::PrefixProbe KvCacheCoordinator::ProbePrefix(std::span<const std::string> content_hashes) const {
     _assert(content_hashes.size() <=
-                static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max() / cache_block_tokens_),
+                static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max() / base_block_tokens_),
             "prefix length exceeds int32 token range");
     const std::int32_t num_cache_blocks = static_cast<std::int32_t>(content_hashes.size());
     PrefixProbe out;
@@ -196,7 +218,7 @@ KvCacheCoordinator::PrefixProbe KvCacheCoordinator::ProbePrefix(std::span<const 
 KvCacheCoordinator::PrefixProbe KvCacheCoordinator::ProbeDecodeDestinationPrefix(
     std::span<const std::string> content_hashes) const {
     _assert(content_hashes.size() <=
-                static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max() / cache_block_tokens_),
+                static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max() / base_block_tokens_),
             "prefix length exceeds int32 token range");
     const std::int32_t num_cache_blocks = static_cast<std::int32_t>(content_hashes.size());
     std::vector<std::size_t> history_match_order;
@@ -214,13 +236,16 @@ KvCacheCoordinator::PrefixProbe KvCacheCoordinator::ProbeDecodeDestinationPrefix
             probeTierWithKeys(pool, out.group_keys, history_match_order, num_cache_blocks, floor_tokens);
         const std::int64_t covered_tokens =
             static_cast<std::int64_t>(tier.num_common_tokens) - static_cast<std::int64_t>(floor_tokens);
-        const std::int64_t num_holes = covered_tokens / cache_block_tokens_;
-        _assert(covered_tokens >= 0 && num_holes <= num_cache_blocks,
-                "decode destination state hole count is outside the probed range");
-        const std::size_t hole_count =
-            static_cast<std::size_t>(std::clamp<std::int64_t>(num_holes, 0, num_cache_blocks));
+        _assert(covered_tokens >= 0, "decode destination state hole count underflow");
         for (std::size_t i = 0; i < groups_.size(); ++i) {
             if (groups_[i].Spec().kind == AttnKind::kMambaState) {
+                const std::int32_t group_block_tokens = groups_[i].Manager().CacheBlockTokens();
+                _assert(covered_tokens % group_block_tokens == 0,
+                        "decode destination boundary must align to every state group");
+                const std::int64_t num_holes = covered_tokens / group_block_tokens;
+                _assert(num_holes <= static_cast<std::int64_t>(out.group_keys[i].size()),
+                        "decode destination state hole count exceeds group key range");
+                const std::size_t hole_count = static_cast<std::size_t>(num_holes);
                 tier.per_group[i].hits.resize(hole_count);
             }
         }
@@ -270,7 +295,17 @@ void KvCacheCoordinator::CacheFullBlocks(std::span<BlockTable> tables, std::span
 void KvCacheCoordinator::cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table,
                                                  std::span<const std::string> content_hashes, std::int32_t first_slot,
                                                  std::uint64_t access_epoch, CacheBoundaryKind boundary_kind) {
-    std::vector<CacheKey> keys = keysForGroup(content_hashes, groups_[group_index].Id());
+    const std::int32_t group_block_tokens = groups_[group_index].Manager().CacheBlockTokens();
+    const std::int32_t fold = group_block_tokens / base_block_tokens_;
+    std::vector<CacheKey> keys = keysForGroup(content_hashes, groups_[group_index].Id(), first_slot);
+    const std::int32_t group_first_slot = (first_slot + fold - 1) / fold;
+    cacheLogicalBlocksForGroup(group_index, table, keys, group_first_slot, access_epoch, boundary_kind);
+}
+
+void KvCacheCoordinator::cacheLogicalBlocksForGroup(std::size_t group_index, BlockTable& table,
+                                                    std::span<const CacheKey> keys, std::int32_t first_slot,
+                                                    std::uint64_t access_epoch,
+                                                    CacheBoundaryKind boundary_kind) {
     std::vector<std::pair<CacheKey, CacheBlockRef>> newly_cached;
     groups_[group_index].Manager().CacheFullBlocks(pool_, table, keys, access_epoch, first_slot, boundary_kind,
                                                    host_pool_ != nullptr ? &newly_cached : nullptr);
@@ -293,26 +328,32 @@ void KvCacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, c
 
     const KvCacheManager& manager = groups_[group_index].Manager();
     if (manager.MatchIsPrefixClosed()) {
+        const std::int32_t fold = manager.CacheBlockTokens() / base_block_tokens_;
+        const std::int32_t first_fold_base = demand.first_new_page_slot - demand.first_new_page_slot % fold;
         cacheFullBlocksForGroup(group_index, *demand.table,
-                                demand.page_hashes.subspan(static_cast<std::size_t>(demand.first_new_page_slot)),
-                                demand.first_new_page_slot, access_epoch, demand.boundary_kind);
+                                demand.page_hashes.subspan(static_cast<std::size_t>(first_fold_base)), first_fold_base,
+                                access_epoch, demand.boundary_kind);
         return;
     }
     if (demand.num_computed_tokens < 0 || demand.num_computed_tokens % cache_block_tokens_ != 0) {
         return;
     }
 
-    const std::int32_t boundary_slot = demand.num_computed_tokens / cache_block_tokens_;
-    _assert(boundary_slot == static_cast<std::int32_t>(demand.page_hashes.size()),
+    const std::int32_t boundary_base_slot = demand.num_computed_tokens / base_block_tokens_;
+    _assert(boundary_base_slot == static_cast<std::int32_t>(demand.page_hashes.size()),
             "non-closed boundary must end at the hash history tail");
-    const std::int32_t lookback = std::min(manager.BoundaryLookbackBlocks(), boundary_slot);
+    std::vector<CacheKey> keys = keysForGroup(demand.page_hashes, groups_[group_index].Id());
+    const std::int32_t boundary_group_slot = demand.num_computed_tokens / manager.CacheBlockTokens();
+    _assert(boundary_group_slot == static_cast<std::int32_t>(keys.size()),
+            "non-closed folded hash history must end at the group boundary");
+    const std::int32_t lookback = std::min(manager.BoundaryLookbackBlocks(), boundary_group_slot);
     if (lookback == 0) {
         return;
     }
-    const std::int32_t first_slot = boundary_slot - lookback;
-    cacheFullBlocksForGroup(group_index, *demand.table,
-                            demand.page_hashes.subspan(static_cast<std::size_t>(first_slot)), first_slot, access_epoch,
-                            demand.boundary_kind);
+    const std::int32_t first_slot = boundary_group_slot - lookback;
+    cacheLogicalBlocksForGroup(group_index, *demand.table,
+                               std::span<const CacheKey>{keys}.subspan(static_cast<std::size_t>(first_slot)),
+                               first_slot, access_epoch, demand.boundary_kind);
 }
 
 void KvCacheCoordinator::ReclaimExpired(std::span<BlockTable> tables, std::int32_t num_computed_tokens) {
@@ -391,15 +432,23 @@ KvCacheCoordinator MakeCoordinator(std::span<const KvCacheSpec> specs, std::int3
     for (std::size_t i = 0; i < specs.size(); ++i) {
         const KvCacheSpec& spec = specs[i];
         const GroupId group_id = static_cast<GroupId>(i);
+        const std::int32_t group_block_tokens = spec.block_size > 0 ? spec.block_size : cache_block_tokens;
+        _assert(group_block_tokens > 0 && cache_block_tokens % group_block_tokens == 0,
+                "group block size must be a positive divisor of cache_block_tokens");
         _assert(spec.cache_blocks_per_lcm_block > 0, "cache_blocks_per_lcm_block must be > 0");
+        if (group_block_tokens != cache_block_tokens) {
+            _assert(spec.cache_blocks_per_lcm_block == cache_block_tokens / group_block_tokens,
+                    "fine-grained group packing must cover one cache_block_tokens domain");
+        }
         std::unique_ptr<KvCacheManager> manager;
         if (spec.kind == AttnKind::kFull) {
-            manager = std::make_unique<FullAttnManager>(cache_block_tokens, spec.cache_blocks_per_lcm_block, group_id);
+            manager =
+                std::make_unique<FullAttnManager>(group_block_tokens, spec.cache_blocks_per_lcm_block, group_id);
         } else if (spec.kind == AttnKind::kMambaState) {
             manager =
-                std::make_unique<MambaStateManager>(cache_block_tokens, spec.cache_blocks_per_lcm_block, group_id);
+                std::make_unique<MambaStateManager>(group_block_tokens, spec.cache_blocks_per_lcm_block, group_id);
         } else {
-            manager = std::make_unique<SwaManager>(cache_block_tokens, spec.cache_blocks_per_lcm_block,
+            manager = std::make_unique<SwaManager>(group_block_tokens, spec.cache_blocks_per_lcm_block,
                                                    spec.sliding_window, group_id);
         }
         groups.emplace_back(spec, std::move(manager));

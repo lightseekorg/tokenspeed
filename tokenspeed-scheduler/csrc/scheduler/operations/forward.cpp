@@ -198,9 +198,10 @@ Scheduler::FlatAdmissionMatch Scheduler::matchFlatPrefixAtAdmission(Request* req
     }
     // Hash input must be byte-identical to the REGISTRATION form (GetFullPagedTokens(false)); radix's
     // except_last rule (last prompt token recomputed for logits) becomes the page cap, also bounding SWA.
-    const std::int32_t cache_block_tokens = coordinator_.CacheBlockTokens();
-    const std::int32_t cap_pages = std::max((request->PrefillSize() - 1) / cache_block_tokens, 0);
-    std::vector<std::span<const std::int32_t>> paged_tokens = request->GetFullPagedTokens(/*except_last=*/false);
+    const std::int32_t base_block_tokens = coordinator_.BaseBlockTokens();
+    const std::int32_t cap_pages = std::max((request->PrefillSize() - 1) / base_block_tokens, 0);
+    std::vector<std::span<const std::int32_t>> paged_tokens =
+        request->GetFullPagedTokens(base_block_tokens, /*except_last=*/false);
     if (static_cast<std::size_t>(cap_pages) < paged_tokens.size()) {
         paged_tokens.resize(cap_pages);
     }
@@ -208,12 +209,12 @@ Scheduler::FlatAdmissionMatch Scheduler::matchFlatPrefixAtAdmission(Request* req
     FlatAdmissionMatch match;
     match.probe = probe_prefix(flat_hashes);
     const std::int32_t hit_pages =
-        std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens) / cache_block_tokens;
+        std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens) / base_block_tokens;
     match.page_hashes.assign(flat_hashes.begin(), flat_hashes.begin() + hit_pages);
     // Boundaries are in tokens; extension offsets are in logical CacheBlocks.
     const std::int32_t ext_pages =
-        std::max(match.probe.host.num_common_tokens - match.probe.device.num_common_tokens, 0) / cache_block_tokens;
-    const auto ext_begin = flat_hashes.begin() + match.probe.device.num_common_tokens / cache_block_tokens;
+        std::max(match.probe.host.num_common_tokens - match.probe.device.num_common_tokens, 0) / base_block_tokens;
+    const auto ext_begin = flat_hashes.begin() + match.probe.device.num_common_tokens / base_block_tokens;
     match.ext_hashes.assign(ext_begin, ext_begin + ext_pages);
     return match;
 }
@@ -441,13 +442,14 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
                                                                               .reserve_tokens = flat_decode_reserve,
                                                                           });
     if (config_.enable_flatkv_pd && config_.role == Role::kD) {
-        const std::int32_t final_prompt_block = (request->PrefillSize() - 1) / coordinator_.CacheBlockTokens();
         for (std::size_t i = 0; i < flat_demands.size(); ++i) {
             if (config_.paged_cache_groups[i].transfer_policy == PagedCacheTransferPolicy::LatestSnapshot) {
                 // State prefix slots are null alignment holes. The only live
                 // state suffix is the prompt endpoint plus decode reserve.
                 flat_demands[i].num_tokens = request->PrefillSize();
-                flat_demands[i].materialized_suffix_start = final_prompt_block;
+                flat_demands[i].materialized_suffix_start =
+                    (request->PrefillSize() - 1) /
+                    coordinator_.GroupManager(static_cast<std::int32_t>(i)).CacheBlockTokens();
             }
         }
     }
@@ -461,7 +463,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     if (!flat_match.ext_hashes.empty()) {
         coordinator_.CacheFullBlocks(
             flat_tables, flat_match.ext_hashes, flat_admission.access_epoch,
-            /*first_slot=*/flat_admission.device_prefix_tokens / coordinator_.CacheBlockTokens());
+            /*first_slot=*/flat_admission.device_prefix_tokens / coordinator_.BaseBlockTokens());
     }
     if (config_.enable_flatkv_pd && config_.role == Role::kD && flat_decode_reserve > 0) {
         // The destination admission reserves the bootstrap decode token, while
@@ -552,9 +554,10 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     PrefillInfo previous = request->GetPrefillInfo();
     const std::int32_t flat_num_computed = previous.already_scheduled_len + previous.extend_len;
     const std::int32_t first_new_page_slot = static_cast<std::int32_t>(flat_cache_progress.page_hashes.size());
-    const std::int32_t filled_pages = flat_num_computed / coordinator_.CacheBlockTokens();
+    const std::int32_t filled_pages = flat_num_computed / coordinator_.BaseBlockTokens();
     if (filled_pages > static_cast<std::int32_t>(flat_cache_progress.page_hashes.size())) {
-        advancePageHashes(flat_cache_progress.page_hashes, request->GetFullPagedTokens(false), filled_pages);
+        advancePageHashes(flat_cache_progress.page_hashes,
+                          request->GetFullPagedTokens(coordinator_.BaseBlockTokens(), false), filled_pages);
     }
     std::vector<BlockTable>& flat_tables = request->FlatBlockTablesRef();
     std::vector<GroupDemand> flat_demands = makeGroupDemands(
@@ -632,9 +635,10 @@ Scheduler::ScheduleAttempt<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(
         num_computed_tokens = request->TokenSize() - config_.decode_input_tokens;
     }
     const std::int32_t first_new_page_slot = static_cast<std::int32_t>(flat_cache_progress.page_hashes.size());
-    const std::int32_t filled_pages = num_computed_tokens / coordinator_.CacheBlockTokens();
+    const std::int32_t filled_pages = num_computed_tokens / coordinator_.BaseBlockTokens();
     if (filled_pages > static_cast<std::int32_t>(flat_cache_progress.page_hashes.size())) {
-        advancePageHashes(flat_cache_progress.page_hashes, request->GetFullPagedTokens(false), filled_pages);
+        advancePageHashes(flat_cache_progress.page_hashes,
+                          request->GetFullPagedTokens(coordinator_.BaseBlockTokens(), false), filled_pages);
     }
     if (first_new_page_slot == static_cast<std::int32_t>(flat_cache_progress.page_hashes.size()) &&
         canConsumeAvailable(coordinator_, flat_tables, reserve_tokens, num_computed_tokens)) {

@@ -91,6 +91,12 @@ public:
         return token_container_.GetFullPagedTokens(page_size_, except_last);
     }
 
+#if TOKENSPEED_FLAT_KVCACHE
+    std::vector<std::span<const std::int32_t>> GetFullPagedTokens(std::int32_t page_size, bool except_last) const {
+        return token_container_.GetFullPagedTokens(page_size, except_last);
+    }
+#endif
+
     std::int32_t TokenSize() const { return token_container_.Size(); }
     std::int32_t GetLastToken() const { return token_container_.LastToken(); }
 

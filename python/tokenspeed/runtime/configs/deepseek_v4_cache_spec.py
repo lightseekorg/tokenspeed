@@ -197,6 +197,20 @@ def build_v4_cache_specs(
     swa_window = _resolve_sliding_window(hf_config)
     unique_compress_ratios = sorted({int(r) for r in layer_ratio if int(r) > 1})
 
+    def _geometry(rows_per_page: int, entry_stride_tokens: int) -> dict[str, int]:
+        block_size = int(rows_per_page) * int(entry_stride_tokens)
+        if DEEPSEEK_V4_COMPRESSED_LOGICAL_BLOCK_SIZE % block_size != 0:
+            raise ValueError(
+                "DeepSeek V4 cache group page tokens must divide "
+                f"{DEEPSEEK_V4_COMPRESSED_LOGICAL_BLOCK_SIZE}, got {block_size}"
+            )
+        return {
+            "block_size": block_size,
+            "cache_blocks_per_lcm_block": (
+                DEEPSEEK_V4_COMPRESSED_LOGICAL_BLOCK_SIZE // block_size
+            ),
+        }
+
     specs: list[PagedCacheGroupSpec] = [
         # SWA kv: trailing window only -> State family.
         PagedCacheGroupSpec(
@@ -206,6 +220,7 @@ def build_v4_cache_specs(
             entry_stride_tokens=1,
             sliding_window_tokens=swa_window,
             family="state",
+            **_geometry(V4_KERNEL_BLOCK_ROWS, 1),
         ),
     ]
     for ratio in unique_compress_ratios:
@@ -220,6 +235,7 @@ def build_v4_cache_specs(
                 entry_stride_tokens=1,
                 sliding_window_tokens=_COMPRESSOR_STATE_WINDOW_TOKENS[ratio],
                 family="state",
+                **_geometry(_COMPRESSOR_STATE_ROWS_PER_PAGE[ratio], 1),
             )
         )
         # Compressed kv: full-history chain (indexer K shares this group).
@@ -231,6 +247,7 @@ def build_v4_cache_specs(
                 entry_stride_tokens=ratio,
                 sliding_window_tokens=None,
                 family="history",
+                **_geometry(_compressed_kernel_block_size(ratio), ratio),
             )
         )
     if 4 in unique_compress_ratios:
@@ -243,6 +260,7 @@ def build_v4_cache_specs(
                 entry_stride_tokens=1,
                 sliding_window_tokens=_COMPRESSOR_STATE_WINDOW_TOKENS[4],
                 family="state",
+                **_geometry(_COMPRESSOR_STATE_ROWS_PER_PAGE[4], 1),
             )
         )
     return specs

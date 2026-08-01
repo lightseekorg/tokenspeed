@@ -80,6 +80,67 @@ def _make_spec(
     return _spec(request_id, list(range(start, start + num_pages * page_size)))
 
 
+def _make_v4_geometry_config() -> ts.SchedulerConfig:
+    cfg = ts.SchedulerConfig()
+    cfg.block_size = 256
+    cfg.num_device_pages = 65
+    cfg.num_host_pages = 0
+    cfg.max_scheduled_tokens = 512
+    cfg.max_batch_size = 4
+    cfg.disable_l2_cache = True
+    cfg.disable_prefix_cache = True
+
+    geometries = (
+        ("v4.swa_kv", 64, 1, 4, ts.PagedCacheRetention.SlidingWindow, 128),
+        (
+            "v4.c4a.compressor_state",
+            4,
+            1,
+            64,
+            ts.PagedCacheRetention.SlidingWindow,
+            8,
+        ),
+        ("v4.c4a.compressed_kv", 64, 4, 1, ts.PagedCacheRetention.FullHistory, None),
+        (
+            "v4.c128a.compressor_state",
+            8,
+            1,
+            32,
+            ts.PagedCacheRetention.SlidingWindow,
+            128,
+        ),
+        ("v4.c128a.compressed_kv", 2, 128, 1, ts.PagedCacheRetention.FullHistory, None),
+        (
+            "v4.c4a.indexer_compressor_state",
+            4,
+            1,
+            64,
+            ts.PagedCacheRetention.SlidingWindow,
+            8,
+        ),
+    )
+    groups = []
+    for group_id, rows, stride, packing, retention, window in geometries:
+        group = ts.PagedCacheGroupConfig(
+            group_id=group_id,
+            rows_per_page=rows,
+            entry_stride_tokens=stride,
+            total_pages=1 + (cfg.num_device_pages - 1) * packing,
+            retention=retention,
+            sliding_window_tokens=window,
+            family=(
+                ts.PagedCacheGroupFamily.History
+                if retention == ts.PagedCacheRetention.FullHistory
+                else ts.PagedCacheGroupFamily.State
+            ),
+            cache_blocks_per_lcm_block=packing,
+        )
+        group.block_size = rows * stride
+        groups.append(group)
+    cfg.paged_cache_groups = groups
+    return cfg
+
+
 def _abort(scheduler, request_id: str) -> None:
     event = ts.ForwardEvent.Abort()
     event.request_id = request_id
@@ -121,6 +182,28 @@ def test_decode_slides_swa_window_to_null_hole():
     assert (
         0 in swa_row
     ), "swa row should contain a null hole after the sliding window slides"
+
+
+def test_v4_143_token_prefill_exports_every_group_at_its_logical_page_width():
+    scheduler = ts.Scheduler(_make_v4_geometry_config())
+    scheduler.submit_requests([_spec("v4", list(range(143)))])
+
+    op = _find_flat_op(scheduler.next_execution_plan())
+    assert op is not None
+    tables = dict(op.flat_block_tables)
+    expected_widths = {
+        "v4.swa_kv": 3,
+        "v4.c4a.compressor_state": 36,
+        "v4.c4a.compressed_kv": 1,
+        "v4.c128a.compressor_state": 18,
+        "v4.c128a.compressed_kv": 1,
+        "v4.c4a.indexer_compressor_state": 36,
+    }
+    assert set(tables) == set(expected_widths)
+    for group_id, width in expected_widths.items():
+        row = list(tables[group_id][0])
+        assert len(row) == width, (group_id, row)
+        assert all(page_id > 0 for page_id in row), (group_id, row)
 
 
 def test_k3_four_groups_share_one_global_id_namespace() -> None:

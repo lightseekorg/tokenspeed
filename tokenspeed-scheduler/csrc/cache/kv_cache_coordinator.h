@@ -36,7 +36,7 @@ namespace tokenspeed {
 
 struct KvCacheCoordinatorTestAccess;
 
-// num_common_tokens is in tokens at the one shared CacheBlock granularity P.
+// num_common_tokens is in tokens at a boundary shared by every group.
 // per_group[i] is group i's PrefixMatch at exactly that length.
 struct CoordinatorMatch {
     std::int32_t num_common_tokens{0};
@@ -53,7 +53,11 @@ public:
 
     std::int32_t NumGroups() const { return static_cast<std::int32_t>(groups_.size()); }
 
+    // The scheduler domain is the common prefix/reclamation boundary. Base is
+    // the GCD used for request page hashes; each manager owns its declared
+    // logical block size between those two bounds.
     std::int32_t CacheBlockTokens() const noexcept { return cache_block_tokens_; }
+    std::int32_t BaseBlockTokens() const noexcept { return base_block_tokens_; }
     bool HasMambaStateGroup() const;
 
     KvCacheManager& GroupManager(std::int32_t i) { return groups_[static_cast<std::size_t>(i)].Manager(); }
@@ -130,7 +134,8 @@ private:
         CoordinatorMatch host;
     };
 
-    std::vector<CacheKey> keysForGroup(std::span<const std::string> content_hashes, GroupId group_id) const;
+    std::vector<CacheKey> keysForGroup(std::span<const std::string> content_hashes, GroupId group_id,
+                                       std::int32_t first_base = 0) const;
     std::vector<std::vector<CacheKey>> buildGroupKeys(std::span<const std::string> content_hashes) const;
     PrefixProbe::Tier probeTierWithKeys(const BlockPool& pool, std::span<const std::vector<CacheKey>> group_keys,
                                         std::span<const std::size_t> match_order, std::int32_t num_cache_blocks,
@@ -142,6 +147,9 @@ private:
     void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table,
                                  std::span<const std::string> content_hashes, std::int32_t first_slot,
                                  std::uint64_t access_epoch, CacheBoundaryKind boundary_kind);
+    void cacheLogicalBlocksForGroup(std::size_t group_index, BlockTable& table, std::span<const CacheKey> keys,
+                                    std::int32_t first_slot, std::uint64_t access_epoch,
+                                    CacheBoundaryKind boundary_kind);
     void cacheCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand, std::uint64_t access_epoch);
     std::vector<CacheGroup> groups_;
     // Closed groups first, so non-closed groups match against a settled bound.
@@ -149,11 +157,13 @@ private:
     BlockPool& pool_;
     BlockPool* host_pool_{nullptr};
     std::int32_t cache_block_tokens_{0};
+    std::int32_t base_block_tokens_{0};
     std::uint64_t next_access_epoch_{0};
     std::vector<StoreCandidate> pending_stores_;
 };
 
-// One CacheGroup per spec (group_id = index), all sharing cache_block_tokens.
+// One CacheGroup per spec (group_id = index). A zero spec.block_size inherits
+// cache_block_tokens; explicit sizes must divide the shared domain.
 KvCacheCoordinator MakeCoordinator(std::span<const KvCacheSpec> specs, std::int32_t cache_block_tokens, BlockPool& pool,
                                    BlockPool* host_pool = nullptr);
 

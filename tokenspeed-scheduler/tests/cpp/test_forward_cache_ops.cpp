@@ -40,7 +40,7 @@ namespace {
 template <class T>
 concept HasLogicalBlockSize = requires(T value) { value.block_size; };
 
-static_assert(!HasLogicalBlockSize<KvCacheSpec>);
+static_assert(HasLogicalBlockSize<KvCacheSpec>);
 
 KvCacheCoordinator MakeTwoGroup(BlockPool& pool) {
     std::vector<KvCacheSpec> specs{
@@ -419,6 +419,38 @@ TEST(MakeSpecsFromConfigTest, Qwen35Fp8UsesOneLogicalPAndPerGroupPacking) {
     EXPECT_EQ(specs[1].cache_blocks_per_lcm_block, 1);
     EXPECT_EQ(specs[2].cache_blocks_per_lcm_block, 1);
     EXPECT_EQ(specs[3].cache_blocks_per_lcm_block, 1);
+}
+
+TEST(MakeSpecsFromConfigTest, AcceptsFineGrainedGroupWithMatchingDomainPacking) {
+    SchedulerConfig config;
+    config.block_size = 256;
+    PagedCacheGroupConfig group;
+    group.group_id = "fine_state";
+    group.block_size = 4;
+    group.cache_blocks_per_lcm_block = 64;
+    group.retention = PagedCacheGroupConfig::Retention::SlidingWindow;
+    group.sliding_window_tokens = 8;
+    config.paged_cache_groups = {group};
+
+    const std::vector<KvCacheSpec> specs = MakeSpecsFromConfig(config);
+
+    ASSERT_EQ(specs.size(), 1u);
+    EXPECT_EQ(specs[0].block_size, 4);
+    EXPECT_EQ(specs[0].cache_blocks_per_lcm_block, 64);
+}
+
+TEST(MakeSpecsFromConfigTest, RejectsFineGrainedGroupWithMismatchedDomainPacking) {
+    SchedulerConfig config;
+    config.block_size = 256;
+    PagedCacheGroupConfig group;
+    group.group_id = "fine_state";
+    group.block_size = 4;
+    group.cache_blocks_per_lcm_block = 1;
+    group.retention = PagedCacheGroupConfig::Retention::SlidingWindow;
+    group.sliding_window_tokens = 8;
+    config.paged_cache_groups = {group};
+
+    EXPECT_THROW(MakeSpecsFromConfig(config), std::runtime_error);
 }
 
 TEST(MakeSpecsFromConfigTest, RejectsNonPositiveGlobalP) {

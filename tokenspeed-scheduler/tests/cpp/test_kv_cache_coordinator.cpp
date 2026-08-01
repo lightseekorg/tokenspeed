@@ -162,6 +162,54 @@ TEST(MakeCoordinatorTest, Qwen35UsesUniformLogicalPWithDifferentPacking) {
     }
 }
 
+TEST(MakeCoordinatorTest, FineGrainedGroupsAllocateAndMatchAtTheirOwnLogicalPageSizes) {
+    BlockPool pool(32);
+    const std::vector<KvCacheSpec> specs = {
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_size = 256},
+        {.kind = AttnKind::kSlidingWindow,
+         .sliding_window = 128,
+         .cache_blocks_per_lcm_block = 4,
+         .block_size = 64},
+        {.kind = AttnKind::kMambaState,
+         .sliding_window = 0,
+         .cache_blocks_per_lcm_block = 64,
+         .block_size = 4},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, /*cache_block_tokens=*/256, pool);
+
+    EXPECT_EQ(coordinator.CacheBlockTokens(), 256);
+    EXPECT_EQ(coordinator.BaseBlockTokens(), 4);
+    EXPECT_EQ(coordinator.GroupManager(0).CacheBlockTokens(), 256);
+    EXPECT_EQ(coordinator.GroupManager(1).CacheBlockTokens(), 64);
+    EXPECT_EQ(coordinator.GroupManager(2).CacheBlockTokens(), 4);
+
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/143));
+    EXPECT_EQ(tables[0].NumBlocks(), 1);
+    EXPECT_EQ(tables[1].NumBlocks(), 3);
+    EXPECT_EQ(tables[2].NumBlocks(), 36);
+
+    coordinator.Free(tables);
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/256));
+    const std::vector<std::string> hashes = ContentHashes(
+        std::vector<std::vector<std::int32_t>>(64, std::vector<std::int32_t>(4, 7)));
+    ASSERT_TRUE(AdmitForTest(coordinator, tables,
+                             GroupDemand{
+                                 .num_tokens = 0,
+                                 .page_hashes = hashes,
+                                 .first_new_page_slot = 35,
+                                 .num_computed_tokens = 256,
+                             }));
+    coordinator.Free(tables);
+
+    CoordinatorMatch match = MatchPrefixForTest(coordinator, hashes).device;
+    EXPECT_EQ(match.num_common_tokens, 256);
+    ASSERT_EQ(match.per_group.size(), specs.size());
+    EXPECT_EQ(match.per_group[0].blocks.size(), 1u);
+    EXPECT_EQ(match.per_group[1].blocks.size(), 4u);
+    EXPECT_EQ(match.per_group[2].blocks.size(), 64u);
+}
+
 TEST(MakeCoordinatorTest, RejectsNonPositiveLogicalPOrPacking) {
     BlockPool pool(8);
     const std::vector<KvCacheSpec> valid = {

@@ -34,7 +34,9 @@ class PagedCacheGroupSpec:
     sliding_window_tokens: int | None
     # History groups form a chain; State groups only need the trailing window.
     family: Family = "history"
-    # Per-group page tokens; None -> scheduler global block_size, else a multiple of it.
+    # Per-group logical page tokens; None -> scheduler global block_size. A
+    # finer group must divide the global block and pack the corresponding
+    # number of logical pages into one LCM block.
     block_size: int | None = None
     # Physical child CacheBlocks packed into one shared LCM parent.
     cache_blocks_per_lcm_block: int = 1

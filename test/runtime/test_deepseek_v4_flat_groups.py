@@ -124,6 +124,10 @@ class DeepseekV4FlatGroupUnitTest(unittest.TestCase):
         )
         self.assertEqual(tuple(spec.group_id for spec in first), expected)
         self.assertEqual(first, second)
+        self.assertEqual(
+            tuple((spec.block_size, spec.cache_blocks_per_lcm_block) for spec in first),
+            ((64, 4), (4, 64), (256, 1), (8, 32), (256, 1), (4, 64)),
+        )
 
     def test_eager_flat_maps_all_target_groups_in_decode_extend_and_mixed(self):
         specs = _target_specs()
