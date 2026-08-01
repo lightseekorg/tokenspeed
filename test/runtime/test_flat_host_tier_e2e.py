@@ -1,4 +1,4 @@
-"""E2E: the M15 flat L2 host tier turns device-pool evictions into host hits.
+"""E2E: the flat L2 host tier turns device-pool evictions into host hits.
 
 Boots the SAME commit twice with a deliberately small device KV budget and a
 working set sized to oversubscribe it (~1.44x, the proven recycling cliff
@@ -106,7 +106,7 @@ def _make_engine(*, host_tier: bool) -> Engine:
         enable_prefix_caching=True,
         # host_tier=True routes _handle_kvstore to enable_kvstore=True, which
         # under a flat ext + slab layout selects FlatMemoryExecutor (the
-        # byte-blind slab-mirror host pool; spec 6 revision lifted the guard).
+        # byte-blind slab-mirror host pool).
         disable_kvstore=not host_tier,
         kvstore_size=_KVSTORE_SIZE_GB,
         kvstore_ratio=_KVSTORE_RATIO,

@@ -481,7 +481,7 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             ).copy_(base_page_table[:, None, :])
         else:
             # Plain decode / plain draft: copy the live lengths into our own
-            # buffer (previously aliased the controller's seq_lens_buf).
+            # buffer rather than aliasing the controller's seq_lens_buf.
             self.cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs])
         if flat_block_tables:
             self._flat_replay_fill(

@@ -1,5 +1,4 @@
-"""FlatMemoryExecutor (M15 Phase D2): flat host tier through the kvstore
-transport.
+"""FlatMemoryExecutor: flat host tier through the kvstore transport.
 
 Covers the executor roundtrip against a real (tiny) device pool with
 WriteBackDone AND LoadBackDone acks, the ack payload shape riding the
@@ -29,8 +28,8 @@ LAYER_TYPES = ("sliding_attention", "full_attention") * 2
 
 # GDN hybrid: layers 0/2 are state layers (slab pairs 0/1); the KV side
 # stays per-layer (linear_attention disables slab pairing) but state layers
-# carry no KV tensors under the flat predicate (M18a T4), and the LAST
-# layer is an attention layer -- exercising the finish-event pin.
+# carry no KV tensors under the flat predicate, and the LAST layer is an
+# attention layer -- exercising the finish-event pin.
 GDN_LAYER_TYPES = ("linear_attention", "full_attention") * 2
 
 
@@ -418,7 +417,7 @@ class FlatMemoryExecutorTest(unittest.TestCase):
         pool = self._state_pool()
         executor = self._executor(pool)
         mirror = executor.mirror
-        # Flat GDN KV (2 K + 2 V; state layers carry no KV, M18a T4) +
+        # Flat GDN KV (2 K + 2 V; state layers carry no KV) +
         # conv0, ssm0, conv1, ssm1.
         self.assertEqual(len(mirror.tensor_pairs), 8)
         self._fill_spans(mirror, [3])

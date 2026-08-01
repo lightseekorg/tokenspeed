@@ -18,8 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Flat host-tier executor (M15 Phase D2): drives FlatWriteBack/FlatLoadBack
-page-id pairs against the byte-blind :class:`FlatHostMirror`, replacing the
+"""Flat host-tier executor: drives FlatWriteBack/FlatLoadBack page-id pairs
+against the byte-blind :class:`FlatHostMirror`, replacing the
 radix ``MemoryExecutor`` when serving with a flat-built scheduler ext and the
 kvstore enabled. Unlike the radix host executor it ACKS loadbacks: the flat
 C++ scheduler pins source host pages and destination device blocks until a

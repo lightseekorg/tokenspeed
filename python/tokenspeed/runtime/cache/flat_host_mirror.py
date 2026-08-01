@@ -19,7 +19,7 @@
 # SOFTWARE.
 
 """Byte-blind pinned-CPU mirror of a device KV pool for the flat L2 host
-tier (M15 Phase D). Transport mechanism only; scheduler/engine wiring is D2.
+tier. Transport mechanism only; the executor owns scheduler/engine wiring.
 """
 
 from __future__ import annotations
@@ -194,7 +194,7 @@ class FlatHostMirror:
     exactly its owner group's layers, so byte copies are group-safe by
     id-exclusivity.
 
-    ``tensor_pairs`` follows the declared family order (D2 fencing indexes
+    ``tensor_pairs`` follows the declared family order (the executor's fencing indexes
     into it): for the base K/V layout that is K*, V*, then state tensors in
     slab order (conv0, ssm0, conv1, ...); MLA declares its fused latent
     instead, DSA appends packed index-K. A speculative draft pool's families
@@ -275,5 +275,5 @@ class FlatHostMirror:
         self, pairs: Iterable[tuple[int, int]], stream
     ) -> list[torch.cuda.Event]:
         """load_pages, recording one event per device tensor (tensor_pairs
-        order) after that tensor's copies -- D2's per-slab fencing hook."""
+        order) after that tensor's copies -- the executor's per-slab fencing hook."""
         return self._copy_pages(pairs, stream, to_host=False, record_events=True)

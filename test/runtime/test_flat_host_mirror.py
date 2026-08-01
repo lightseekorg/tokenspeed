@@ -1,9 +1,9 @@
-"""FlatHostMirror (M15 Phase D1): byte-blind pinned-CPU slab mirror.
+"""FlatHostMirror: byte-blind pinned-CPU slab mirror.
 
 Pins the transport contract only (no engine wiring): one mirror per
 distinct device tensor the pool declares in ``host_mirror_families()``,
 whole-page row-range copies both directions, per-tensor load events, and the
-layer -> fence-tensor mapping D2 fences on.
+layer -> fence-tensor mapping the executor fences on.
 
 Covers every declared layout: MHA K/V (slab and legacy), GDN state slabs,
 MLA's fused latent (plus its per-token-head quantized triple) and DSA's
@@ -31,7 +31,7 @@ LAYER_TYPES = ("sliding_attention", "full_attention") * 2
 
 # GDN hybrid: layers 0/2 are state layers (pairs 0/1); linear_attention
 # disables slab pairing, so the KV side stays per-layer -- and under the
-# flat GDN predicate the state layers' k/v slots are None (M18a T4).
+# flat GDN predicate the state layers' k/v slots are None.
 GDN_LAYER_TYPES = ("linear_attention", "full_attention") * 2
 
 
@@ -234,7 +234,7 @@ class FlatHostMirrorStateSlabTest(unittest.TestCase):
     def test_state_tensors_follow_kv_in_slab_order(self):
         pool = self._pool()
         mirror = self.FlatHostMirror(pool, num_host_pages=8)
-        # Flat GDN: state layers carry no KV (k/v slots are None, M18a T4),
+        # Flat GDN: state layers carry no KV (k/v slots are None),
         # so only the 2 attention layers mirror KV (2 K + 2 V), then
         # conv0, ssm0, conv1, ssm1 -- declared family order: K*, V*, state
         # tensors flattened in slab order.
@@ -289,7 +289,7 @@ class FlatHostMirrorStateSlabTest(unittest.TestCase):
 
 
 class FlatHostMirrorNoneKVTest(unittest.TestCase):
-    """Flat GDN pools carry None k/v slots on state layers (M18a T4): the
+    """Flat GDN pools carry None k/v slots on state layers: the
     base pool's family derivation must skip them and mirror only the real
     slabs. CPU stub pool, no CUDA, no scheduler ext -- the stub borrows the
     real default derivation, so nothing here re-implements it."""

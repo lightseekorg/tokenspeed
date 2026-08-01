@@ -87,7 +87,7 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
         self.assertIn("full_attention", pool.paged_cache_group_page_counts)
 
     def test_hybrid_no_spec_publishes_two_groups(self):
-        # layer_num must match len(layer_types): the M12 slab layout's
+        # layer_num must match len(layer_types): the slab layout's
         # pairing-completeness assert cross-checks them.
         pool = self._pool(
             layer_types=GPT_OSS_LAYER_TYPES,
@@ -177,10 +177,9 @@ class MLAPoolGroupPublicationTest(unittest.TestCase):
         self.assertEqual(pool.paged_cache_group_page_counts, {})
 
     def test_single_group_admits_table_blind_backend(self):
-        # The exact guard that rejected every MLA model before the pool
-        # started publishing. test_flat_scheduler_config_guard covers this
-        # rule with fakes; here it runs against the REAL pool's real specs,
-        # which is the integration point that was broken.
+        # The zero-group guard is what makes publication load-bearing.
+        # test_flat_scheduler_config_guard covers the rule with fakes; here it
+        # runs against the REAL pool's real specs -- the integration point.
         from tokenspeed.runtime.configs.paged_cache_spec import (
             validate_flat_scheduler_config,
         )
@@ -527,7 +526,7 @@ class FlatHostTierCapabilityTest(unittest.TestCase):
 
 
 class MLAConfigFieldOrderTest(unittest.TestCase):
-    """DSAConfig must stay constructible after MLAConfig gained a default.
+    """DSAConfig must stay constructible alongside MLAConfig's defaulted field.
 
     MLAConfig is a positional dataclass (only BaseAttnConfig is kw_only), so
     max_scheduled_tokens must be keyword-only -- otherwise DSAConfig's

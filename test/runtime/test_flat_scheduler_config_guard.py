@@ -112,7 +112,7 @@ class ValidateFlatSchedulerConfigTest(unittest.TestCase):
         self.assertIn("radix-built", msg)
 
     def test_flat_ext_zero_groups_rejected_regardless_of_spec(self):
-        # Spec decode no longer gates publication (flat+spec is supported);
+        # Spec decode does not gate publication (flat+spec is supported);
         # a zero-group pool is rejected with the generic pool-shaped cause.
         with self.assertRaises(RuntimeError) as ctx:
             _pcs.validate_flat_scheduler_config(
@@ -198,11 +198,11 @@ class ValidateFlatSchedulerConfigTest(unittest.TestCase):
         )
 
     def test_flat_ext_admits_dflash(self):
-        # DFLASH used to be rejected outright here. It is now supported: its
-        # block decode reads page tables from req_to_page (which the flat path
-        # mirrors from the full-attention group whenever a drafter is active),
-        # so the draft backend opts out of flat per-group tables instead --
-        # see DFlashFlatOptOutTest in test_trtllm_flat_groups.
+        # DFLASH block decode reads page tables from req_to_page (which the
+        # flat path mirrors from the full-attention group whenever a drafter
+        # is active), so its draft backend opts out of flat per-group tables
+        # rather than being rejected -- see DFlashFlatOptOutTest in
+        # test_trtllm_flat_groups.
         _pcs.validate_flat_scheduler_config(
             flat_kvcache_ext=True,
             paged_cache_groups=[FakeGroup()],
