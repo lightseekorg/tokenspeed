@@ -950,6 +950,10 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         with (
             patch(
+                "tokenspeed.runtime.utils.hf_transformers_utils.snapshot_download",
+                return_value="/nonexistent/tokenizer-snapshot",
+            ),
+            patch(
                 "tokenspeed.runtime.utils.hf_transformers_utils.AutoTokenizer.from_pretrained",
                 return_value=DummyTokenizer(),
             ),
