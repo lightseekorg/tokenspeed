@@ -14,7 +14,7 @@ install:
   - bash test/ci_system/install_deps.sh
 server:
   command: >-
-    ENABLE_MTP=1
+    ENABLE_MTP=0
     LB_HOST=127.0.0.1
     LB_PORT=8000
     bash test/ci_system/serve_qwen35_122b_nvfp4_epd_1e1p2d.sh
