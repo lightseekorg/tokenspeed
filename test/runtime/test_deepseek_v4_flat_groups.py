@@ -287,10 +287,20 @@ class DeepseekV4FlatGroupUnitTest(unittest.TestCase):
 
         too_short = OrderedDict(valid)
         too_short[next(iter(too_short))] = torch.ones((2, 1), dtype=torch.int32)
-        with self.assertRaisesRegex(RuntimeError, "too short"):
+        with self.assertRaisesRegex(RuntimeError, "missing a real page"):
             backend.init_forward_metadata(
                 **{**common, "seq_lens": torch.tensor([65, 2], dtype=torch.int32)},
                 flat_block_tables=too_short,
+            )
+
+        null_current_page = OrderedDict(valid)
+        null_current_page[next(iter(null_current_page))] = torch.tensor(
+            [[1, 0], [2, 3]], dtype=torch.int32
+        )
+        with self.assertRaisesRegex(RuntimeError, "missing a real page"):
+            backend.init_forward_metadata(
+                **{**common, "seq_lens": torch.tensor([65, 2], dtype=torch.int32)},
+                flat_block_tables=null_current_page,
             )
 
         with self.assertRaisesRegex(RuntimeError, "radix paged-cache"):
@@ -364,7 +374,7 @@ class DeepseekV4FlatGroupUnitTest(unittest.TestCase):
             flat_cache_group_ids=group_ids,
         )
         idle_tables = OrderedDict(
-            ((group_ids[0], torch.zeros((2, 1), dtype=torch.int32)),)
+            ((group_ids[0], torch.tensor([[1], [0]], dtype=torch.int32)),)
         )
         backend.init_forward_metadata_replay_cuda_graph(
             **common,

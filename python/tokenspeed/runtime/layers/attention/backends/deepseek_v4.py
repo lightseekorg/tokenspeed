@@ -245,6 +245,10 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     uses_flat_cache_groups = True
     flat_spec_capable = True
     flat_cache_consumer_families = frozenset({"history", "state"})
+    # Active V4 metadata must never resolve its current logical page to the
+    # scheduler's null page. PrefillGraph uses this contract to choose a real,
+    # writable dummy page for warmup/capture without weakening live checks.
+    flat_active_pages_must_be_real = True
     uses_padded_decode_token_mask = True
 
     def __init__(self, config) -> None:
@@ -473,8 +477,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 dtype=torch.int64,
                 device=table.device,
             )
+            # Page 0 is the scheduler's reserved null page.  It is valid in
+            # fully-slid-out SWA columns, but never for the logical page that
+            # contains an active sequence's current token.
             required_entries_present = (
-                in_bounds & live[row_indices, safe_page].ne(-1)
+                in_bounds & live[row_indices, safe_page].gt(0)
             ).all()
             if table.device.type == "cpu":
                 if not bool(page_ids_valid.item()):
@@ -484,8 +491,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                     )
                 if not bool(required_entries_present.item()):
                     raise RuntimeError(
-                        f"DeepSeek V4 Flat KV {phase} table {group_id!r} is too "
-                        "short for an active sequence"
+                        f"DeepSeek V4 Flat KV {phase} table {group_id!r} is "
+                        "missing a real page for an active sequence"
                     )
             else:
                 torch._assert_async(
@@ -494,8 +501,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 )
                 torch._assert_async(
                     required_entries_present,
-                    f"DeepSeek V4 Flat KV {phase} table is too short for an "
-                    "active sequence",
+                    f"DeepSeek V4 Flat KV {phase} table is missing a real page "
+                    "for an active sequence",
                 )
 
     def _get_prefill_workspace(

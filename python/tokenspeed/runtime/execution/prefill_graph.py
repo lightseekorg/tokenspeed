@@ -418,7 +418,7 @@ class PrefillGraph:
             self._input_embeds_buf[num_tokens:bucket].zero_()
 
     def _dummy_flat_tables(self, req_tokens: int, bs: int) -> dict[str, "torch.Tensor"]:
-        """Build capture tables: null KV pages and one writable state page."""
+        """Build capture tables using each backend's active-page contract."""
         backend = self.attn_backend
         if not getattr(backend, "uses_flat_cache_groups", False):
             return {}
@@ -433,6 +433,9 @@ class PrefillGraph:
         # Composite wrappers (hybrid) hold the flat KV consumer as a child.
         if not hasattr(backend, "page_size") and hasattr(backend, "full_attn_backend"):
             backend = backend.full_attn_backend
+        require_real_active_pages = bool(
+            getattr(backend, "flat_active_pages_must_be_real", False)
+        )
         # Full width: backends that derive the row stride from max_kv_len
         # (trtllm) index the whole row even when the bucket is small.
         width = getattr(backend, "max_num_pages", 0) or -(
@@ -462,7 +465,7 @@ class PrefillGraph:
             group_id = str(spec.group_id)
             out[group_id] = torch.full(
                 (bs, group_width),
-                1 if group_id in state_group_ids else 0,
+                1 if require_real_active_pages or group_id in state_group_ids else 0,
                 dtype=torch.int32,
                 device=self.config.device,
             )
@@ -489,13 +492,12 @@ class PrefillGraph:
         a multi-request batch, never as one sequence.
 
         The prefill analogue of decode's ``_init_capture_metadata``. KV writes
-        go to the reserved dummy slot and the page table points at page 0, so
-        the forward runs (producing discarded garbage) without touching real
-        cache state. Backends with extra paged caches (DeepSeek-V4 DSA: SWA +
-        compressor + indexer state) also need per-cache block tables, or their
-        extend metadata comes up incomplete and the eager attention break
-        aborts the capture -- reuse the decode wrapper's dummy-table builder
-        (all zeros, the safe page 0) for those.
+        go to the reserved dummy slot. Per-group Flat tables use page 0 when a
+        backend permits the null page for capture and page 1 when its active
+        metadata requires a real writable page. Backends with extra paged
+        caches (DeepSeek-V4 DSA: SWA + compressor + indexer state) need every
+        table, or their extend metadata comes up incomplete and the eager
+        attention break aborts capture.
         """
         ib = self.input_buffers
         max_req_tokens = max(1, int(self.config.context_len))

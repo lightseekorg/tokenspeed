@@ -14,6 +14,7 @@ import os
 import sys
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -175,6 +176,86 @@ class DummyFlatTablesTest(unittest.TestCase):
             (2, 1024),
         )
 
+    def test_v4_dummy_batch_satisfies_active_real_page_contract(self):
+        import torch
+
+        from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
+            build_v4_cache_specs,
+        )
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+        from tokenspeed.runtime.layers.attention.backends import deepseek_v4
+        from tokenspeed.runtime.layers.attention.backends.deepseek_v4 import (
+            DeepseekV4AttentionBackend,
+        )
+
+        config = SimpleNamespace(
+            page_size=64,
+            device="cpu",
+            num_attention_heads=64,
+            num_kv_heads=1,
+            attn_tp_size=1,
+            dtype=torch.bfloat16,
+            is_draft=False,
+            speculative_num_draft_tokens=4,
+            speculative_num_steps=1,
+            head_dim=512,
+            qk_rope_head_dim=64,
+            context_len=4096,
+            world_size=1,
+        )
+        specs = tuple(
+            build_v4_cache_specs(
+                SimpleNamespace(sliding_window=128),
+                layer_ratio=(1, 4, 128),
+            )
+        )
+        with mock.patch.object(
+            deepseek_v4, "scheduler_ext_flat_kvcache", return_value=True
+        ):
+            backend = DeepseekV4AttentionBackend(config)
+        backend.init_cuda_graph_state(
+            2,
+            paged_cache_group_specs=specs,
+            paged_cache_group_page_counts={spec.group_id: 4096 for spec in specs},
+        )
+        pool = SimpleNamespace(
+            paged_cache_group_specs=specs,
+            runtime_contract=None,
+        )
+        input_buffers = SimpleNamespace(
+            seq_lens_buf=torch.zeros(2, dtype=torch.int32),
+            input_ids_buf=torch.zeros(256, dtype=torch.int32),
+            out_cache_loc_buf=torch.zeros(256, dtype=torch.int32),
+            positions_buf=torch.zeros(256, dtype=torch.int64),
+            req_pool_indices_buf=torch.zeros(2, dtype=torch.int32),
+            extend_seq_lens_buf=torch.zeros(2, dtype=torch.int32),
+            extend_seq_lens_cpu=torch.zeros(2, dtype=torch.int32),
+            extend_prefix_lens_buf=torch.zeros(2, dtype=torch.int32),
+            extend_prefix_lens_cpu=torch.zeros(2, dtype=torch.int32),
+            dummy_kv_slot=0,
+        )
+        graph = self.PrefillGraph.__new__(self.PrefillGraph)
+        graph.attn_backend = backend
+        graph.token_to_kv_pool = pool
+        graph.config = config
+        graph.input_buffers = input_buffers
+        graph.req_to_page = torch.zeros((2, 64), dtype=torch.int32)
+        graph.dp_size = 1
+        graph.drafter = None
+
+        context = graph.make_dummy_batch(130, decode_wrapper=None)
+
+        self.assertEqual(context.forward_mode, ForwardMode.EXTEND)
+        metadata = backend.forward_metadata
+        self.assertIsNotNone(metadata)
+        assert metadata is not None
+        self.assertEqual(
+            tuple(metadata.cache.paged_cache_block_tables),
+            tuple(spec.group_id for spec in specs),
+        )
+        for table in metadata.cache.paged_cache_block_tables.values():
+            self.assertTrue(bool((table > 0).all()))
+
     def test_dual_capable_backend_selects_one_capture_contract(self):
         flat = SimpleNamespace(
             uses_paged_cache_groups=True,
@@ -188,8 +269,6 @@ class DummyFlatTablesTest(unittest.TestCase):
         self.assertTrue(self.PrefillGraph._capture_uses_radix_group_tables(radix))
 
     def test_runtime_contract_pool_is_eligible_for_capture(self):
-        from unittest import mock
-
         inner_model = SimpleNamespace(embed_tokens=object())
         model_runner = SimpleNamespace(
             model=SimpleNamespace(model=inner_model),
@@ -243,8 +322,6 @@ class TrtllmPrefillGraphSeamsTest(unittest.TestCase):
         return b
 
     def test_prewrite_disabled_during_breakable_capture(self):
-        from unittest import mock
-
         b = self._bare_backend()
         self.assertTrue(b.support_kv_cache_prewrite(None))
         with mock.patch.object(
