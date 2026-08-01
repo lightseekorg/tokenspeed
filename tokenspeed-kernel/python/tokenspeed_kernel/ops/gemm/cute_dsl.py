@@ -69,8 +69,8 @@ if platform.is_nvidia:
         """Autotuner adapter over the fused NVFP4 FC1 kernel.
 
         A tactic is a ``(mma_tiler_mn, cluster_shape_mn)`` pair drawn from
-        :attr:`TACTICS`; ``-1`` is the mandatory fallback and reproduces
-        :meth:`_heuristic_tactic`. Instances are
+        :attr:`TACTICS`; ``-1`` is the mandatory always-safe fallback, a
+        ``(128, 128)`` tile on a 1x1 cluster. Instances are
         stateless with respect to the problem shape -- M, N and K are read back
         from ``inputs`` -- so one instance per compile-option set is enough,
         which is what keeps the autotuner's per-runner caches stable.
@@ -161,13 +161,6 @@ if platform.is_nvidia:
 
         def get_cache_key_extras(self, inputs) -> tuple:
             return self._key()
-
-        @staticmethod
-        def _heuristic_tactic(m: int) -> Tuple[Tuple[int, int], Tuple[int, int]]:
-            """Tile/cluster pick used when no tuned entry is available."""
-            if m <= 128:
-                return (128, 128), (1, 2)
-            return (256, 128), (2, 1)
 
         @staticmethod
         def _mnk(inputs) -> Tuple[int, int, int]:
@@ -265,7 +258,7 @@ if platform.is_nvidia:
             if tactic is not None and tactic != -1:
                 mma_tiler_mn, cluster_shape_mn = tactic
             else:
-                mma_tiler_mn, cluster_shape_mn = self._heuristic_tactic(m)
+                mma_tiler_mn, cluster_shape_mn = (128, 128), (1, 1)
                 if not self._can_implement(mma_tiler_mn, cluster_shape_mn, m, n, k):
                     raise ValueError(
                         "Unsupported nvfp4_gemm_swiglu_nvfp4_quant configuration: "

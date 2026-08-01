@@ -305,6 +305,7 @@ def _autotune_operands(m: int, k: int, i: int):
     [
         pytest.param(1, 7168, 512, id="shared_decode"),
         pytest.param(1024, 7168, 4608, id="dense_prefill"),
+        pytest.param(32, 2048, 256, id="qwen3_5_a3b_tp2_dense"),
     ],
 )
 def test_nvfp4_gemm_swiglu_tactics_agree_with_heuristic(m: int, k: int, i: int) -> None:
@@ -326,6 +327,15 @@ def test_nvfp4_gemm_swiglu_tactics_agree_with_heuristic(m: int, k: int, i: int) 
 
     tactics = runner.get_valid_tactics(inputs, None)
     assert tactics, "no valid tactic for a production shape"
+    n = 2 * i
+    for tactic in tactics:
+        # The persistent scheduler rounds the cluster grid up and never
+        # bounds-checks per-CTA tile coords; a non-dividing cluster_n makes
+        # trailing CTAs overwrite real output (garbage Qwen3.5 generations).
+        (_, tile_n), (_, cluster_n) = tactic
+        assert (
+            n // tile_n
+        ) % cluster_n == 0, f"tactic {tactic} must be filtered for n={n}"
 
     out.zero_()
     out_scale.zero_()
