@@ -139,13 +139,12 @@ def parse_pr_number(value: str) -> int:
     return int(match.group("number"))
 
 
-def source_pr_summary(value: str) -> str:
+def source_pr_url(value: str) -> str | None:
     match = PR_RE.fullmatch(value)
     if not match:
         raise ValueError(
             "--pr must be a pull request number or GitHub pull request URL"
         )
-    number = int(match.group("number"))
     owner = match.group("owner")
     repo = match.group("repo")
     if owner is None or repo is None:
@@ -156,9 +155,32 @@ def source_pr_summary(value: str) -> str:
             owner = repository_match.group("owner")
             repo = repository_match.group("repo")
     if owner is not None and repo is not None:
-        url = f"https://github.com/{owner}/{repo}/pull/{number}"
+        return f"https://github.com/{owner}/{repo}/pull/{match.group('number')}"
+    return None
+
+
+def source_pr_summary(value: str) -> str:
+    number = parse_pr_number(value)
+    url = source_pr_url(value)
+    if url is not None:
         return f"**Target PR:** [#{number}]({url})"
     return f"**Target PR:** #{number}"
+
+
+def print_target(repo: Path, source_pr: str | None, test_commit: str) -> None:
+    if source_pr is None:
+        print("Target: latest main", flush=True)
+        print(f"Target commit: {test_commit}", flush=True)
+        return
+
+    number = parse_pr_number(source_pr)
+    print(f"Target: PR #{number}", flush=True)
+    url = source_pr_url(source_pr)
+    if url is not None:
+        print(f"Link: {url}", flush=True)
+    print(f"Target commit: {git(repo, 'rev-parse', 'HEAD^2')}", flush=True)
+    print(f"Merged test commit: {test_commit}", flush=True)
+    print(f"Base commit: {git(repo, 'rev-parse', 'HEAD^1')}", flush=True)
 
 
 @contextlib.contextmanager
@@ -730,8 +752,7 @@ def run(args: argparse.Namespace, repo: Path, artifact_root: Path, cache: Path) 
         print_tasks(tasks)
         return 0
     commit = git(repo, "rev-parse", "HEAD")
-    print(f"Target: PR {args.pr}" if args.pr else "Target: latest main", flush=True)
-    print(f"Target commit: {commit}", flush=True)
+    print_target(repo, args.pr, commit)
     print(f"Selected tasks: {len(tasks)}", flush=True)
     for task in tasks:
         print(

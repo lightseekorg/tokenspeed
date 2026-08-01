@@ -20,10 +20,8 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
-
 import torch
-from tokenspeed_kernel.ops.tuning import autotune_frozen
+from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -33,12 +31,10 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
-next_power_of_2 = lambda value: 1 if value <= 1 else 1 << (value - 1).bit_length()
 
 
 if platform.is_nvidia:
     from flashinfer import ActivationType, cutlass_fused_moe
-    from flashinfer.autotuner import autotune as flashinfer_autotune
 
     def flashinfer_cutlass_unquant_moe_weights(plan: dict, w: torch.nn.Module):
         half_w = w.w13_weight.shape[1] // 2
@@ -94,20 +90,18 @@ if platform.is_nvidia:
             )
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
             topk_weights = topk_weights.to(x.dtype)
-        # Tune new shapes during startup only, frozen once serving (see ops.tuning).
-        with nullcontext() if autotune_frozen() else flashinfer_autotune():
-            return cutlass_fused_moe(
-                input=x,
-                token_selected_experts=topk_ids.to(torch.int),
-                token_final_scales=topk_weights,
-                fc1_expert_weights=w.w13_weight,
-                fc2_expert_weights=w.w2_weight,
-                output_dtype=x.dtype,
-                quant_scales=None,
-                ep_size=getattr(w, "ep_size", 1),
-                ep_rank=getattr(w, "ep_rank", 0),
-                tp_size=getattr(w, "tp_size", 1),
-                tp_rank=getattr(w, "tp_rank", 0),
-                tune_max_num_tokens=max(8192, next_power_of_2(x.shape[0])),
-                activation_type=ActivationType.Swiglu,
-            )[0]
+        return cutlass_fused_moe(
+            input=x,
+            token_selected_experts=topk_ids.to(torch.int),
+            token_final_scales=topk_weights,
+            fc1_expert_weights=w.w13_weight,
+            fc2_expert_weights=w.w2_weight,
+            output_dtype=x.dtype,
+            quant_scales=None,
+            ep_size=getattr(w, "ep_size", 1),
+            ep_rank=getattr(w, "ep_rank", 0),
+            tp_size=getattr(w, "tp_size", 1),
+            tp_rank=getattr(w, "tp_rank", 0),
+            tune_max_num_tokens=get_autotune_max_num_tokens(),
+            activation_type=ActivationType.Swiglu,
+        )[0]
