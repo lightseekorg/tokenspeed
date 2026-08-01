@@ -24,24 +24,24 @@ For each routed slot::
 
     out_partial[token, slot, :] = moe_weight[slot] * (inter_slot @ w2_e.T)
 
-then a second kernel reduces over the `topk` slot dim::
+then a second kernel reduces over the ``topk`` slot dim::
 
     out[token, :] = sum_slot out_partial[token, slot, :]
 
 Unquantized bf16 stage-2 (down GEMM + routed-weight scale). The
-`[num_tokens, topk, D]` scratch + fp32-accumulate reduce (rather than
-atomics) avoids the `topk`-way atomic contention on overlapping output
+``[num_tokens, topk, D]`` scratch + fp32-accumulate reduce (rather than
+atomics) avoids the ``topk``-way atomic contention on overlapping output
 rows -- same reduce-mode design as the mxfp4 sibling package.
 
-GEMM idiom is the same a16w16 MFMA setup as stage 1 (`AMDMFMALayout(
-version=4, instr_shape=[16,16,32], k_width=8)` + `gl.amd.cdna3.mfma`),
+GEMM idiom is the same a16w16 MFMA setup as stage 1 (``AMDMFMALayout(
+version=4, instr_shape=[16,16,32], k_width=8)`` + ``gl.amd.cdna3.mfma``),
 but the hot loop is deliberately **single-buffered** here: stage 2's K-loop
-is short (`K = I = 256` -> 4 tiles at `BLOCK_K=64`) and the kernel is
-bound by the wide `[num_tokens, topk, D]` partials write, so the v4/v9
-double-buffered prefetch pipeline (which wins on stage 1's long `K = D`
+is short (``K = I = 256`` -> 4 tiles at ``BLOCK_K=64``) and the kernel is
+bound by the wide ``[num_tokens, topk, D]`` partials write, so the v4/v9
+double-buffered prefetch pipeline (which wins on stage 1's long ``K = D``
 loop) measured *slower* here -- the prologue/epilogue and extra LDS don't
 amortize over 4 iterations. XCD PID remap likewise gave no stage-2 benefit,
-so stage 2 uses the plain `pid` mapping. See `perf_report.md`.
+so stage 2 uses the plain ``pid`` mapping. See ``perf_report.md``.
 
 Layout contract:
   inter (A)   (num_tokens * topk, I)   bf16   inter_row = token*topk + slot
@@ -257,10 +257,10 @@ def invoke_stage2(
 ):
     """Launch bf16 MoE stage 2 (down GEMM + routed weight) then reduce over topk.
 
-    `atomic` selects the decode atomic-accumulate path (`stage2_decode_kernel`),
-    which drops the partials scratch + reduce by `buffer_atomic_add`-ing each
-    slot straight into the output. `None` (default) -> auto: on at
-    `num_tokens <= 1` (a ~1.22x stage-2 win at M=1; beyond M=1 the topk-way
+    ``atomic`` selects the decode atomic-accumulate path (``stage2_decode_kernel``),
+    which drops the partials scratch + reduce by ``buffer_atomic_add``-ing each
+    slot straight into the output. ``None`` (default) -> auto: on at
+    ``num_tokens <= 1`` (a ~1.22x stage-2 win at M=1; beyond M=1 the topk-way
     atomic contention on shared output rows makes it slower).
     """
     assert inter_states.dtype == torch.bfloat16

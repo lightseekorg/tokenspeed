@@ -21,47 +21,47 @@
 
 """Gluon MXFP4 MoE stage 2: down-projection GEMM with reduce-mode epilogue.
 
-For each expert `e`::
+For each expert ``e``::
 
     out_e += topk_w_e * (inter_e @ w2_e.T)
 
-where `inter_e` is stage 1's post-SwiGLU output for the rows routed
-to expert `e`, and `topk_w_e` is the routing weight for that
-`(token, slot)` pair.
+where ``inter_e`` is stage 1's post-SwiGLU output for the rows routed
+to expert ``e``, and ``topk_w_e`` is the routing weight for that
+``(token, slot)`` pair.
 
-Kernel shape ("1x4"): 4 wave64/CTA with `warps_per_cta = [1, 4]`
-(four waves split the N axis), `BLOCK_M` selected by the caller from
-`{32, 64, 128}`, `BLOCK_N = 256`, and `BLOCK_K = 128`. At
+Kernel shape ("1x4"): 4 wave64/CTA with ``warps_per_cta = [1, 4]``
+(four waves split the N axis), ``BLOCK_M`` selected by the caller from
+``{32, 64, 128}``, ``BLOCK_N = 256``, and ``BLOCK_K = 128``. At
 production K = 256 that is 2 K-iters with a 2-buffer LDS ping-pong and
-`v_mfma_scale_f32_16x16x128_f8f6f4`.
+``v_mfma_scale_f32_16x16x128_f8f6f4``.
 A data goes HBM -> LDS via the async copy + ping-pong; A scale, B,
 B scale are direct-to-VGPR. B is consumed in the (16, 16) MFMA-tile
 layout produced by :func:`_b_preshuffle_3d`.
 
 Epilogue:
-  acc (fp32) * routed weight -> bf16 -> `convert_layout` through
-  LDS to `BlockedLayout([128, 2], [1, 64])` -> scatter. All 64 lanes
+  acc (fp32) * routed weight -> bf16 -> ``convert_layout`` through
+  LDS to ``BlockedLayout([128, 2], [1, 64])`` -> scatter. All 64 lanes
   hit the same output row, so each store is 2 cache-line writes
   instead of 64 scattered ones. The N axis is split into 4 chunks of
-  `BLOCK_N // 4` columns; each chunk runs the convert_layout +
+  ``BLOCK_N // 4`` columns; each chunk runs the convert_layout +
   store independently so the scheduler can hide a chunk's LDS
   shuffle behind the prior chunk's VMEM in flight.
 
-Reduce mode (`USE_REDUCE=True`):
-  the scatter target becomes `scratch[token, topk_id, n]` and the
-  per-chunk `atomic_add` is replaced with a plain `gl.store`.
-  Each `(token, slot)` cell is written by exactly one CTA --
-  `sorted_token_ids` packs `(topk_id << 24 | token_id)` and the
-  block-M math sends each entry to a single `pid_m` -- so the
+Reduce mode (``USE_REDUCE=True``):
+  the scatter target becomes ``scratch[token, topk_id, n]`` and the
+  per-chunk ``atomic_add`` is replaced with a plain ``gl.store``.
+  Each ``(token, slot)`` cell is written by exactly one CTA --
+  ``sorted_token_ids`` packs ``(topk_id << 24 | token_id)`` and the
+  block-M math sends each entry to a single ``pid_m`` -- so the
   no-atomic store is race-free. The host wrapper then launches a
-  small reduce kernel (`gluon_mxfp4_moe_stage2_reduce_kernel`)
-  that sums `scratch` over the topk dim with fp32 accumulation
+  small reduce kernel (``gluon_mxfp4_moe_stage2_reduce_kernel``)
+  that sums ``scratch`` over the topk dim with fp32 accumulation
   into the user-visible bf16 output. This removes the
-  `M * topk`-way contended global `atomic_add` on overlapping
+  ``M * topk``-way contended global ``atomic_add`` on overlapping
   output rows, which dominates large-M cost when the epilogue does
   the cross-slot reduction inline.
 
-Persistent grid (`PERSISTENT=True`): launch one CTA per N tile per
+Persistent grid (``PERSISTENT=True``): launch one CTA per N tile per
 CU and walk a contiguous-M slice of the tile space inside the kernel.
 The launcher always selects the non-persistent grid; the persistent
 branch is retained only as a kernel-level config.
@@ -80,7 +80,7 @@ _USES_FP32_ATOMIC: Optional[bool] = None
 def _b_preshuffle_3d(b: torch.Tensor) -> torch.Tensor:
     """Permute a 3-D MoE weight into the (16, 16) MFMA-tile layout.
 
-    Identical to `stage1_kernel._b_preshuffle_3d` but kept local so
+    Identical to ``stage1_kernel._b_preshuffle_3d`` but kept local so
     this file doesn't import across stage modules. The MFMA
     instruction wants a tile's 16 rows and 16 K-columns contiguous in
     HBM; this permutation arranges them that way. Numerically a no-op.
@@ -165,23 +165,23 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
 ):
     """Stage 2 1x2 kernel: 2 waves/CTA, BLOCK_N=256, 2-stage v3 pipeline.
 
-    When `USE_REDUCE` is True, the epilogue writes per-(token, slot)
+    When ``USE_REDUCE`` is True, the epilogue writes per-(token, slot)
     partials with plain stores instead of contending atomic_adds; the
-    user must separately invoke `gluon_mxfp4_moe_stage2_reduce_kernel`
-    to sum across the topk dim. `c_ptr` is then expected to point at
-    a `[token_num * topk, N]` bf16 scratch buffer; `stride_cm` /
-    `stride_cn` describe that shape (`stride_cm = N`).
+    user must separately invoke ``gluon_mxfp4_moe_stage2_reduce_kernel``
+    to sum across the topk dim. ``c_ptr`` is then expected to point at
+    a ``[token_num * topk, N]`` bf16 scratch buffer; ``stride_cm`` /
+    ``stride_cn`` describe that shape (``stride_cm = N``).
 
-    When `PERSISTENT` is True, the kernel is launched with
-    `grid = (CU_NUM,)` and each CTA walks a contiguous-M slice of the
-    `num_pid_m * num_pid_n` tile space. `flat_tile = cta_id *
-    tiles_per_block + tile_iter`; `pid_m = flat_tile % num_pid_m`,
-    `pid_n = flat_tile // num_pid_m`. Iterating M-fast within a
+    When ``PERSISTENT`` is True, the kernel is launched with
+    ``grid = (CU_NUM,)`` and each CTA walks a contiguous-M slice of the
+    ``num_pid_m * num_pid_n`` tile space. ``flat_tile = cta_id *
+    tiles_per_block + tile_iter``; ``pid_m = flat_tile % num_pid_m``,
+    ``pid_n = flat_tile // num_pid_m``. Iterating M-fast within a
     fixed N means consecutive iters share the same expert
-    (`sorted_expert_ids` is monotone in M), so that expert's B
-    weight stays L2-resident across iters. `PERSISTENT=False`
+    (``sorted_expert_ids`` is monotone in M), so that expert's B
+    weight stays L2-resident across iters. ``PERSISTENT=False``
     (the default for this wrapper) launches the per-tile grid
-    `(num_pid_m * num_pid_n,)`.
+    ``(num_pid_m * num_pid_n,)``.
     """
 
     gl.static_assert(
@@ -363,8 +363,8 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
             m_layout: gl.constexpr = gl.SliceLayout(1, gload_a_layout)
             k_layout: gl.constexpr = gl.SliceLayout(0, gload_a_layout)
             offs_sorted_slot = pid_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=m_layout)
-            # `buffer_load` (SRD-relative addressing) instead of
-            # `gl.load(ptr + offs)` (absolute 64-bit `global_load`):
+            # ``buffer_load`` (SRD-relative addressing) instead of
+            # ``gl.load(ptr + offs)`` (absolute 64-bit ``global_load``):
             # the latter cost ~1 M cycles of global_load stall on this
             # gather alone in the previous ATT run.
             # No runtime mask: EM is BLOCK_M-aligned (SORT_BLOCK_M % BLOCK_M == 0,
@@ -918,15 +918,15 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                 )
 
                 # Set up the epilogue layout + per-chunk pointer arithmetic
-                # BEFORE the K-iter 1 MFMAs so the `sorted_token_ids` reload
+                # BEFORE the K-iter 1 MFMAs so the ``sorted_token_ids`` reload
                 # and column-offset compute land in flight while the second
                 # MFMA tile runs. Per-chunk epilogue work is then emitted
                 # IMMEDIATELY after each chunk's final MFMA below, so the
                 # convert + LDS-shuffle + store of chunk i hides behind the
                 # MFMA of chunk i+1.
                 #
-                # `store_layout` shape per chunk = [128, 64] across
-                # the 4-wave CTA. We choose `warps_per_cta=[4, 1]`
+                # ``store_layout`` shape per chunk = [128, 64] across
+                # the 4-wave CTA. We choose ``warps_per_cta=[4, 1]``
                 # (waves split M, not N like the MFMA layout) so the
                 # convert_layout LDS shuffle redistributes data such
                 # that within one wave the N axis is contiguous and
@@ -1249,7 +1249,7 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                     c2_co = gl.convert_layout(c2 * routed_weight, store_layout)
                     c3_co = gl.convert_layout(c3 * routed_weight, store_layout)
                     if USE_REDUCE:
-                        # `.cs` (cache-streaming) on the partials write: the
+                        # ``.cs`` (cache-streaming) on the partials write: the
                         # reduce kernel reads each cell exactly once.
                         gl.store(p0, c0_co, mask=m0, cache_modifier=".cs")
                         gl.store(p1, c1_co, mask=m1, cache_modifier=".cs")
@@ -1262,7 +1262,7 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                         gl.atomic_add(p3, c3_co, mask=m3, sem="relaxed")
                 else:
                     # K-iter 1 MFMAs and the chunked epilogue interleaved per
-                    # chunk: `mfma(chunk_i)` -> `cvt + store(chunk_i)` -> ...
+                    # chunk: ``mfma(chunk_i)`` -> ``cvt + store(chunk_i)`` -> ...
                     acc0 = gl.amd.cdna4.mfma_scaled(
                         a=a1,
                         a_scale=a_scale1,
@@ -1356,10 +1356,10 @@ def gluon_mxfp4_moe_stage2_reduce_kernel(
 ):
     """Sum per-(token, slot) partials over the topk dim.
 
-    Grid: `(cdiv(token_num, BLOCK_M) * cdiv(N, BLOCK_N),)`. Each CTA
-    owns a `[BLOCK_M, BLOCK_N]` tile of the output and reads
-    `TOP_K` slices from the partial buffer, accumulating in fp32 and
-    casting back to bf16 at the end. `TOP_K` is a constexpr so the
+    Grid: ``(cdiv(token_num, BLOCK_M) * cdiv(N, BLOCK_N),)``. Each CTA
+    owns a ``[BLOCK_M, BLOCK_N]`` tile of the output and reads
+    ``TOP_K`` slices from the partial buffer, accumulating in fp32 and
+    casting back to bf16 at the end. ``TOP_K`` is a constexpr so the
     accumulation loop unrolls (TOP_K is small: 4-10 across the models
     we serve).
     """
@@ -1419,8 +1419,8 @@ def _record_atomic_lowering() -> None:
                 if "pk_add_bf16" in amdgcn:
                     _USES_FP32_ATOMIC = False
                     return
-                # `pk_add_bf16` was ruled out above, so any remaining
-                # `atomic_add_f32` is a true fp32 atomic lowering.
+                # ``pk_add_bf16`` was ruled out above, so any remaining
+                # ``atomic_add_f32`` is a true fp32 atomic lowering.
                 if "atomic_add_f32" in amdgcn:
                     _USES_FP32_ATOMIC = True
                     return
@@ -1454,30 +1454,30 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
 ):
     """Host-side launcher for Gluon MXFP4 MoE stage 2.
 
-    Computes, for each expert `e`::
+    Computes, for each expert ``e``::
 
         out_e += topk_w_e * (inter_e @ w2_e.T)
 
     by launching the GEMM kernel followed, in reduce mode, by a small
-    reduce that sums each token's `topk` partial contributions into
-    `out`. The wrapper can instead use the direct-atomic path for
+    reduce that sums each token's ``topk`` partial contributions into
+    ``out``. The wrapper can instead use the direct-atomic path for
     small M, but the standalone Kimi comparison currently forces reduce
     mode at M512 because this Gluon atomic epilogue is still slower.
 
-    Steps below correspond to the `# Step N:` comments in the body:
+    Steps below correspond to the ``# Step N:`` comments in the body:
       1. Validate inputs; reject unsupported modes.
-      2. Permute `w2` to the (16, 16) MFMA-tile layout (see
+      2. Permute ``w2`` to the (16, 16) MFMA-tile layout (see
          :func:`_b_preshuffle_3d`), or skip if the caller already did.
-      3. Flatten `inter_states` `(token_num, topk, K_packed)` to
-         `(token_num * topk, K_packed)` -- one row per (token, slot).
-      4. Allocate a `(token_num, topk, N)` bf16 `partials` scratch
+      3. Flatten ``inter_states`` ``(token_num, topk, K_packed)`` to
+         ``(token_num * topk, K_packed)`` -- one row per (token, slot).
+      4. Allocate a ``(token_num, topk, N)`` bf16 ``partials`` scratch
          only when reduce mode is selected.
       5. Launch the GEMM. The per-CTA epilogue either writes
-         `partials[token, slot]` with plain stores or atomically adds
-         into `out[token]`.
+         ``partials[token, slot]`` with plain stores or atomically adds
+         into ``out[token]``.
       6. In reduce mode, launch the reduce kernel: sum over the
-         `topk` dim with fp32 accumulation, cast back to bf16 into
-         `out`.
+         ``topk`` dim with fp32 accumulation, cast back to bf16 into
+         ``out``.
 
     Layout contract:
         inter_states : (token_num, topk, K_packed) uint8
@@ -1486,13 +1486,13 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
         a2_scale     : (M_padded_aligned, K // 32) uint8 e8m0
         w2_scale     : (E, D, K // 32) uint8 e8m0
         out          : (token_num, D) bf16 -- final per-token output
-        sorted_*     : generated with `sort_block_m` when it differs
-                       from compute `block_m`; use 32/64/128 to mirror
+        sorted_*     : generated with ``sort_block_m`` when it differs
+                       from compute ``block_m``; use 32/64/128 to mirror
                        FlyDSL sort_block_m
 
-    Unsupported: `quant_type` and `activation` are signature
+    Unsupported: ``quant_type`` and ``activation`` are signature
     stubs (kernel does the down-projection with no activation);
-    `splitk not in {0, 1, None}`; `sorted_weights=None`.
+    ``splitk not in {0, 1, None}``; ``sorted_weights=None``.
     """
     global _USES_FP32_ATOMIC
 
@@ -1549,9 +1549,9 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
     assert w2_scale.shape == (E_w, N, K_scale)
     assert sorted_weights.shape[0] == EM
 
-    # The kernel reads the valid extent from `num_valid_ids_ptr` on-device
-    # (`num_tokens_post_padded = gl.load(...)`), so the `num_valid_tokens`
-    # scalar arg is vestigial. Avoid a device-to-host `.item()` sync here and
+    # The kernel reads the valid extent from ``num_valid_ids_ptr`` on-device
+    # (``num_tokens_post_padded = gl.load(...)``), so the ``num_valid_tokens``
+    # scalar arg is vestigial. Avoid a device-to-host ``.item()`` sync here and
     # pass a placeholder; the device pointer is the single source of truth.
     if torch.is_tensor(num_valid_ids):
         num_valid_tokens = 0
@@ -1620,7 +1620,7 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
     # starting at M512: direct atomic avoids the reduce launch, but this
     # Gluon epilogue still loses to topk-way output-row contention.
     # Keep tiny/decode shapes on atomic and switch to scratch+reduce for
-    # M>=512. The `force_reduce` caller argument overrides the tuned default.
+    # M>=512. The ``force_reduce`` caller argument overrides the tuned default.
     if force_reduce is not None:
         _use_reduce = bool(force_reduce)
     else:
@@ -1664,7 +1664,7 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
         c_stride_n = out.stride(1)
 
     # Step 5: GEMM. Writes either to `partials` (reduce mode) or directly
-    # to `out` (atomic mode), selected by `USE_REDUCE`.
+    # to `out` (atomic mode), selected by ``USE_REDUCE``.
     gluon_mxfp4_moe_stage2_1x2_kernel[grid](
         inter_2d,
         w2,
@@ -1709,7 +1709,7 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
         COALESCE_SCALES=COALESCE_SCALES,
         DIRECT_SCALE_LAYOUT=DIRECT_SCALE_LAYOUT,
         DEFER_EPILOGUE=DEFER_EPILOGUE,
-        # `CU_NUM` is the divisor for `tiles_per_block` in the
+        # ``CU_NUM`` is the divisor for ``tiles_per_block`` in the
         # persistent path. When PERSISTENT=False it is unused inside
         # the kernel (branch is constexpr-pruned), so we keep it at the
         # historical 256 in that case to avoid invalidating the cached

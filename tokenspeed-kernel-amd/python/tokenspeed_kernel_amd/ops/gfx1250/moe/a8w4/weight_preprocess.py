@@ -47,7 +47,7 @@ def _interleave_gate_up_rows(tensor: torch.Tensor, dim: int) -> torch.Tensor:
 
 
 def _make_k_packed_mxfp4_weight(quant_tensor: torch.Tensor) -> torch.Tensor:
-    """Return packed MXFP4 W storage in `(..., K_packed, N)` layout."""
+    """Return packed MXFP4 W storage in ``(..., K_packed, N)`` layout."""
     if quant_tensor.ndim < 2:
         raise ValueError("MXFP4 weight tensor must have at least 2 dimensions")
     *leading_shape, n, k_packed = quant_tensor.shape
@@ -117,7 +117,7 @@ def preprocess_gluon_mxfp4_gfx1250_moe_weights(
     Args:
         plan: MoE execution plan. Currently unused; accepted for the common
             tokenspeed-kernel weight preprocessor signature.
-        w: Module containing `w13`/`w2` packed MXFP4 weights, e8m0 scales,
+        w: Module containing ``w13``/``w2`` packed MXFP4 weights, e8m0 scales,
             optional biases, and optional static FP8 activation scales. The
             module is mutated in-place with gfx1250-ready weight tensors and
             precision configs.

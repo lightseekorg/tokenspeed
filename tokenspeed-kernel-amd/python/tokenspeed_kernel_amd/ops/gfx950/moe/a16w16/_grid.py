@@ -26,7 +26,7 @@ workgroups land on different XCDs, destroying cache reuse of the shared
 operand (in a MoE the reused operand is the per-expert weight tile, which
 is shared across the consecutive sorted M-blocks of one expert). Remapping
 so adjacent tiles share an XCD, plus GROUP_SIZE_M grouping, recovers that
-reuse. See `v9_beyond_hotloop` in ROCm/gfx950-gluon-tutorials.
+reuse. See ``v9_beyond_hotloop`` in ROCm/gfx950-gluon-tutorials.
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ def get_pids(
     NUM_XCDS: gl.constexpr,
     GROUP_SIZE_M: gl.constexpr,
 ):
-    """Map `program_id(0)` to `(pid_m, pid_n)` with XCD remap + M-grouping."""
+    """Map ``program_id(0)`` to ``(pid_m, pid_n)`` with XCD remap + M-grouping."""
     pid = gl.program_id(axis=0)
 
     if NUM_XCDS != 1:

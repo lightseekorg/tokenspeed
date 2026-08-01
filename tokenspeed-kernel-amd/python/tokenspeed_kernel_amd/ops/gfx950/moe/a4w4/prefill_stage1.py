@@ -21,28 +21,28 @@
 
 """Gluon MXFP4 MoE stage 1: gate + up GEMM with fused SwiGLU.
 
-For each MoE expert `e`::
+For each MoE expert ``e``::
 
     inter_e = silu(hidden_states_e @ w1_e[:I_r, :].T)        # gate
               * (hidden_states_e @ w1_e[I_r:, :].T)          # up
 
-where `hidden_states_e` is the subset of input rows routed to
-expert `e`. The kernel computes that for all experts in one launch
-by walking the `sorted_token_ids` / `sorted_expert_ids` arrays
+where ``hidden_states_e`` is the subset of input rows routed to
+expert ``e``. The kernel computes that for all experts in one launch
+by walking the ``sorted_token_ids`` / ``sorted_expert_ids`` arrays
 produced by the upstream routing kernel.
 
 Kernel shape:
   BLOCK_M = BLOCK_N = 128, BLOCK_K = 256, num_warps = 4,
-  warps_per_cta = [1, 4]. `BLOCK_M` rows split into 4 quarters of
-  `GROUP_MFMA_M = 32` so each K-tile fires 4 (quarter) x 2 (gate/up)
-  = 8 `mfma_scaled` instructions on the production K = 7168 shape.
+  warps_per_cta = [1, 4]. ``BLOCK_M`` rows split into 4 quarters of
+  ``GROUP_MFMA_M = 32`` so each K-tile fires 4 (quarter) x 2 (gate/up)
+  = 8 ``mfma_scaled`` instructions on the production K = 7168 shape.
   K-loop pipelining: 2-slot LDS ping-pong for A data and A scale, and
   2-slot VGPR ping-pong for B data and B scale; B[k+1] is issued at
   the top of tile k so its VMEM latency hides behind tile k's MFMAs.
 
 B-data is consumed in a (16, 16)-tile layout so each MFMA fetches its
-tile with a single 128-bit `buffer_load`. The byte at logical
-`(e, n, k_pk)` lives at::
+tile with a single 128-bit ``buffer_load``. The byte at logical
+``(e, n, k_pk)`` lives at::
 
     e * (N * K_pk)
       + (n // 16) * (16 * K_PACKED_TOTAL)
@@ -51,10 +51,10 @@ tile with a single 128-bit `buffer_load`. The byte at logical
       + (n % 16) * 16
       + (k_pk % 16)
 
-The per-expert term is folded into `b_base_ptr`; `K_PACKED_TOTAL`
+The per-expert term is folded into ``b_base_ptr``; ``K_PACKED_TOTAL``
 is the full B tensor's packed-K dim (= K // 2). The host wrapper
-applies this permutation via `_b_preshuffle_3d` when callers pass
-plain B, or skips it when `b_preshuffled=True`.
+applies this permutation via ``_b_preshuffle_3d`` when callers pass
+plain B, or skips it when ``b_preshuffled=True``.
 
 Layout contract:
   hidden_states  (M_padded, K_packed)        uint8, fp4x2 packed
@@ -67,9 +67,9 @@ Layout contract:
   sorted_weights      (EM,)             fp32  (REQUIRED to be empty here;
                                                stage 1 doesn't fold weights)
 
-Stage 1 output is post-SwiGLU at `I_r` columns (half of the un-fused
-gate||up width). `N = 2 * I_r` is the B-operand column count and is
-passed in for indexing only; the C-side is `I_r`.
+Stage 1 output is post-SwiGLU at ``I_r`` columns (half of the un-fused
+gate||up width). ``N = 2 * I_r`` is the B-operand column count and is
+passed in for indexing only; the C-side is ``I_r``.
 """
 
 from __future__ import annotations
@@ -85,15 +85,15 @@ def _b_preshuffle_3d(b: torch.Tensor) -> torch.Tensor:
 
     The kernel's MFMA instruction wants a tile's 16 rows and 16
     K-columns to be contiguous in HBM so each lane can issue a single
-    128-bit `buffer_load` for its share. Naively-laid-out `w1`
+    128-bit ``buffer_load`` for its share. Naively-laid-out ``w1``
     forces strided gathers; this permutation does it once on the host.
 
-    `(E, N, K_pk)` is viewed as `(E, N // 16, 16, K_pk // 32, 2, 16)`
-    then permuted `(0, 1, 3, 4, 2, 5)` and made contiguous. The
+    ``(E, N, K_pk)`` is viewed as ``(E, N // 16, 16, K_pk // 32, 2, 16)``
+    then permuted ``(0, 1, 3, 4, 2, 5)`` and made contiguous. The
     operation is a pure data rearrangement -- numerically a no-op.
 
-    Callers that already hold a permuted `w1` pass
-    `b_preshuffled=True` to skip this pass.
+    Callers that already hold a permuted ``w1`` pass
+    ``b_preshuffled=True`` to skip this pass.
     """
     assert b.dtype == torch.uint8, "B must be packed fp4 in uint8"
     assert b.ndim == 3, f"B must be 3-D (E, N, K/2), got {tuple(b.shape)}"
@@ -106,8 +106,8 @@ def _b_preshuffle_3d(b: torch.Tensor) -> torch.Tensor:
 
 # ---------------------------------------------------------------------------
 # Module-private @gluon.jit helpers used by the K-loop pipeline.
-# `_prefetch_a_data_lds` accepts a `mask` kwarg so the per-token
-# A gather can plumb `token_mask[:, None]` through the prologue,
+# ``_prefetch_a_data_lds`` accepts a ``mask`` kwarg so the per-token
+# A gather can plumb ``token_mask[:, None]`` through the prologue,
 # steady-state, peel, and drain prefetch sites.
 # ---------------------------------------------------------------------------
 
@@ -122,7 +122,7 @@ def _load_a_scale_vgpr(
     A_SCALE_K_STEP: gl.constexpr,
 ):
     # Direct-to-VGPR A-scale load in the same CDNA4-swizzled scale contract
-    # used by decode. `a_scale_base_offsets` is group-0, current pid_m,
+    # used by decode. ``a_scale_base_offsets`` is group-0, current pid_m,
     # [GROUP_MFMA_M, BLOCK_K_SCALE] in the native MFMA scale layout. Each
     # successive 32-row group advances the row block by stride_npad * 32.
     return gl.amd.cdna4.buffer_load(
@@ -143,7 +143,7 @@ def _prefetch_a_data_lds(
 ):
     # A_scale path is sorted-padded so the wave-uniform K-step
     # is enough; the A data path is per-token-gathered, so callers plumb
-    # `mask=token_mask[:, None]` here to zero-fill padded sorted slots.
+    # ``mask=token_mask[:, None]`` here to zero-fill padded sorted slots.
     cdna4_async_copy.buffer_load_to_shared(
         smem_a_tile,
         a_base_ptr,
@@ -179,7 +179,7 @@ def _load_b_scale_vgpr(
     # k-variant term is (k_iter//8)*1024 = k*1024; both (k_iter%4) and
     # ((k_iter%8)//4) reduce to lane-only expressions. The caller has
     # therefore precomputed the lane- and N-only piece into
-    # `b_scale_static_offs` (a 128x8 tensor in the b_scale layout) so
+    # ``b_scale_static_offs`` (a 128x8 tensor in the b_scale layout) so
     # the per-iteration arithmetic collapses to a single scalar mul +
     # tensor add. This removes ~10 tensor ops (div/mod/mul chains)
     # from each K-loop iteration and gives the AMD instruction
@@ -307,29 +307,29 @@ def gluon_mxfp4_moe_stage1_kernel(
     """Stage 1 kernel: per-token A gather + 4-deep A LDS ring + 4-deep
     A_scale LDS ring + per-quarter MFMA K-loop with fused SwiGLU.
 
-    Tile config (fixed): `128 x 128 x 256` (M x N x K), `num_warps=4`,
-    `warps_per_cta=[1, 4]`. MFMA target:
-    `v_mfma_scale_f32_16x16x128_f8f6f4` (gfx950, AMDMFMALayout
-    version=4). The launch grid covers `num_pid_m * (I_r / BLOCK_N)`
-    programs (i.e. `num_pid_n = I_r / BLOCK_N`, NOT `N / BLOCK_N`);
-    each CTA owns one `BLOCK_N` slab of the `[EM, I_r]` SwiGLU
+    Tile config (fixed): ``128 x 128 x 256`` (M x N x K), ``num_warps=4``,
+    ``warps_per_cta=[1, 4]``. MFMA target:
+    ``v_mfma_scale_f32_16x16x128_f8f6f4`` (gfx950, AMDMFMALayout
+    version=4). The launch grid covers ``num_pid_m * (I_r / BLOCK_N)``
+    programs (i.e. ``num_pid_n = I_r / BLOCK_N``, NOT ``N / BLOCK_N``);
+    each CTA owns one ``BLOCK_N`` slab of the ``[EM, I_r]`` SwiGLU
     output and computes the corresponding gate and up contributions
     itself.
 
-    Each K tile fires EIGHT `mfma_scaled` calls (4 quarters x 2 accs);
-    the four quarter-pairs share `cur_b_gate` / `cur_b_up` /
-    `b_scale_gate` / `b_scale_up` loaded inline at the tile head
+    Each K tile fires EIGHT ``mfma_scaled`` calls (4 quarters x 2 accs);
+    the four quarter-pairs share ``cur_b_gate`` / ``cur_b_up`` /
+    ``b_scale_gate`` / ``b_scale_up`` loaded inline at the tile head
     (4 buffer_loads per tile). The 4x unroll matches the 4-deep A LDS
     ring depth, so each Python iter of the steady-state body cycles the
     ring back to its starting state. The K-loop opens with a 3-tile
-    prologue (3 `buffer_load_to_shared` for A data + 3 for A_scale,
-    each followed by `commit_group`) and closes with a 3-tile drain
-    epilogue (`wait_group(2)`, `wait_group(1)`, `wait_group(0)`).
+    prologue (3 ``buffer_load_to_shared`` for A data + 3 for A_scale,
+    each followed by ``commit_group``) and closes with a 3-tile drain
+    epilogue (``wait_group(2)``, ``wait_group(1)``, ``wait_group(0)``).
     Mirrors dense reference lines 376 to 1305.
 
-    Epilogue: `silu(gate_acc_groupX) * up_acc_groupX` for X in 0..3,
-    cast to bf16, stored at sorted-row positions over `BLOCK_N` cols
-    starting at `pid_n * BLOCK_N` of the `[EM, I_r]` output buffer.
+    Epilogue: ``silu(gate_acc_groupX) * up_acc_groupX`` for X in 0..3,
+    cast to bf16, stored at sorted-row positions over ``BLOCK_N`` cols
+    starting at ``pid_n * BLOCK_N`` of the ``[EM, I_r]`` output buffer.
     """
 
     gl.static_assert(BLOCK_M == 128, "stage1 kernel requires BLOCK_M=128")
@@ -346,11 +346,11 @@ def gluon_mxfp4_moe_stage1_kernel(
 
     pid = gl.program_id(axis=0)
     num_pid_m = gl.cdiv(EM, BLOCK_M)
-    # Grid covers the SwiGLU output columns `I_r`, not the un-fused
-    # gate||up GEMM columns `N = 2 * I_r`. Each CTA owns one
-    # `BLOCK_N` slab of the `I_r`-wide output and internally issues
-    # both the gate MFMAs (B columns `pid_n * BLOCK_N`) and the up
-    # MFMAs (B columns `(pid_n + num_pid_n) * BLOCK_N`) against the
+    # Grid covers the SwiGLU output columns ``I_r``, not the un-fused
+    # gate||up GEMM columns ``N = 2 * I_r``. Each CTA owns one
+    # ``BLOCK_N`` slab of the ``I_r``-wide output and internally issues
+    # both the gate MFMAs (B columns ``pid_n * BLOCK_N``) and the up
+    # MFMAs (B columns ``(pid_n + num_pid_n) * BLOCK_N``) against the
     # same A operand.
     num_pid_n = gl.cdiv(I_r, BLOCK_N)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
@@ -383,9 +383,9 @@ def gluon_mxfp4_moe_stage1_kernel(
         dot_b_layout, [BLOCK_N, BLOCK_K_SCALE]
     )
 
-    # A HBM->LDS gather and LDS storage layouts. The `shared_a` padding
-    # rule `[[4096, 128]]` (insert padding every 32 rows, at M-quarter
-    # boundaries) lets each per-quarter `ds_read` share a base VGPR with
+    # A HBM->LDS gather and LDS storage layouts. The ``shared_a`` padding
+    # rule ``[[4096, 128]]`` (insert padding every 32 rows, at M-quarter
+    # boundaries) lets each per-quarter ``ds_read`` share a base VGPR with
     # immediate offsets. A-scale bypasses LDS and is loaded direct-to-VGPR
     # in the native MFMA scale layout below.
     gload_a_layout: gl.constexpr = gl.BlockedLayout(
@@ -417,14 +417,14 @@ def gluon_mxfp4_moe_stage1_kernel(
     )
 
     # ---- per-token A row gather -----------------------------------------
-    # `sorted_token_ids` packs `(topk_id << 24) | token_id` per
-    # entry, so `offs_token & 0xFFFFFF` is already the source row
-    # index into `hidden_states`. Do NOT divide by `top_k`.
+    # ``sorted_token_ids`` packs ``(topk_id << 24) | token_id`` per
+    # entry, so ``offs_token & 0xFFFFFF`` is already the source row
+    # index into ``hidden_states``. Do NOT divide by ``top_k``.
     #
-    # Validity bound is `token_id < num_tokens` (NOT
-    # `< num_valid_ids[0]`): `num_valid_ids` counts routed slots
+    # Validity bound is ``token_id < num_tokens`` (NOT
+    # ``< num_valid_ids[0]``): ``num_valid_ids`` counts routed slots
     # over all experts and over-shoots the per-token row range, which
-    # would let the gather walk off the end of `hidden_states` at
+    # would let the gather walk off the end of ``hidden_states`` at
     # production scale.
     m_layout: gl.constexpr = gl.SliceLayout(1, gload_a_layout)
     k_layout: gl.constexpr = gl.SliceLayout(0, gload_a_layout)
@@ -439,7 +439,7 @@ def gluon_mxfp4_moe_stage1_kernel(
 
     # ---- expert id (per-pid_m scalar; sentinel-checked) ----------------
     # Stage 1 writes zeros and returns when this block has no expert
-    # assigned (`off_experts == -1`).
+    # assigned (``off_experts == -1``).
     off_experts = gl.load(sorted_expert_ids_ptr + pid_m)
     if off_experts == -1:
         cm_layout_zero: gl.constexpr = gl.SliceLayout(1, mfma_layout)
@@ -480,17 +480,17 @@ def gluon_mxfp4_moe_stage1_kernel(
     #          + ((y%8)/4) * 2          (y-half bit  -> +2)
     #          + ((x%32)/16) * 1        (x-half bit  -> +1)
     #
-    # `x` is the sorted-padded row index and `y` is the K-group
+    # ``x`` is the sorted-padded row index and ``y`` is the K-group
     # lane. Note the half-bit ordering: m at +1, y at +2 -- the
     # opposite convention from some dense-GEMM scale layouts.
     #
     # Row index: scales are written at the SORTED-PADDED slot, NOT at
-    # the source `token_id`, so we index directly by
-    # `pid_m * BLOCK_M + arange` (no `gl.load(sorted_token_ids)` /
-    # `& 0xFFFFFF` here).
+    # the source ``token_id``, so we index directly by
+    # ``pid_m * BLOCK_M + arange`` (no ``gl.load(sorted_token_ids)`` /
+    # ``& 0xFFFFFF`` here).
     # Direct-to-VGPR A-scale: build group-0 offsets in the same native MFMA
     # scale layout decode uses for direct scale loads. Other 32-row groups are
-    # reached by adding `stride_se_n_pad * 32` per group.
+    # reached by adding ``stride_se_n_pad * 32`` per group.
     m_scale_layout: gl.constexpr = gl.SliceLayout(1, a_scale_group_layout)
     k_scale_layout: gl.constexpr = gl.SliceLayout(0, a_scale_group_layout)
     a_scale_rows = (
@@ -508,14 +508,14 @@ def gluon_mxfp4_moe_stage1_kernel(
 
     # ---- B data offsets (gate + up halves; preshuffle-B closed form) ---
     # B is in the (16, 16) MFMA-tile layout described in the module
-    # docstring, so the byte for logical `(n, k_pk)` is the closed
+    # docstring, so the byte for logical ``(n, k_pk)`` is the closed
     # form computed below (the per-expert term is folded into
-    # `b_base_ptr`). GU-fusion builds two N-offset tensors -- one
-    # for the gate half starting at column `pid_n * BLOCK_N`, one
-    # for the up half starting at `(pid_n + num_pid_n) * BLOCK_N` --
-    # against the same K offsets. The `% N` wrap defends a
-    # degenerate `I_r < BLOCK_N` test path where the up rows would
-    # otherwise exceed `N`.
+    # ``b_base_ptr``). GU-fusion builds two N-offset tensors -- one
+    # for the gate half starting at column ``pid_n * BLOCK_N``, one
+    # for the up half starting at ``(pid_n + num_pid_n) * BLOCK_N`` --
+    # against the same K offsets. The ``% N`` wrap defends a
+    # degenerate ``I_r < BLOCK_N`` test path where the up rows would
+    # otherwise exceed ``N``.
     offs_bk = gl.arange(0, BLOCK_K_PACKED, layout=gl.SliceLayout(1, dot_b_layout))
     offs_bn_gate = (
         pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, dot_b_layout))
@@ -571,9 +571,9 @@ def gluon_mxfp4_moe_stage1_kernel(
 
     # ---- B_scale offsets (gate + up halves; e8m0_shuffle_opsel_b) -----
     # Same row-part decomposition as the prior preshuffle-B port; the
-    # cross-tile step is the constexpr `B_SCALE_K_STEP = 1024` because
-    # `BLOCK_K_SCALE = 8` covers a full `y/8` block per K iter. The
-    # per-expert offset folds into `b_scale_offsets_e_*` here so the
+    # cross-tile step is the constexpr ``B_SCALE_K_STEP = 1024`` because
+    # ``BLOCK_K_SCALE = 8`` covers a full ``y/8`` block per K iter. The
+    # per-expert offset folds into ``b_scale_offsets_e_*`` here so the
     # K-loop only carries the K-step.
     b_n_layout_scale: gl.constexpr = gl.SliceLayout(1, b_scale_layout)
     b_k_layout_scale: gl.constexpr = gl.SliceLayout(0, b_scale_layout)
@@ -1327,15 +1327,15 @@ def gluon_mxfp4_moe_stage1_kernel(
 
     # ---- SwiGLU epilogue ------------------------------------------------
     # Per-quarter SwiGLU.  The historical path is plain
-    # `silu(gate) * up` and is represented by
-    # `alpha=1, limit=0, beta=0`.  Kimi uses the parameterized
-    # form `gate * sigmoid(alpha * gate) * (clamp(up) + beta)` with
+    # ``silu(gate) * up`` and is represented by
+    # ``alpha=1, limit=0, beta=0``.  Kimi uses the parameterized
+    # form ``gate * sigmoid(alpha * gate) * (clamp(up) + beta)`` with
     # optional gate/up clamping.
-    # `gl.sigmoid` is not in the Gluon language module today, so we
-    # build sigmoid from `gl.exp`. Each quarter's fp32 result casts to
-    # bf16 inside `_store_swiglu_tile_group` and lands at
-    # `dst_row = token_id * top_k + topk_id` decoded from the
-    # bit-packed `sorted_token_ids[m]`; padding rows are mask-rejected.
+    # ``gl.sigmoid`` is not in the Gluon language module today, so we
+    # build sigmoid from ``gl.exp``. Each quarter's fp32 result casts to
+    # bf16 inside ``_store_swiglu_tile_group`` and lands at
+    # ``dst_row = token_id * top_k + topk_id`` decoded from the
+    # bit-packed ``sorted_token_ids[m]``; padding rows are mask-rejected.
     if SWIGLU_LIMIT > 0.0:
         gate_acc_group0 = gl.minimum(gate_acc_group0, SWIGLU_LIMIT)
         gate_acc_group1 = gl.minimum(gate_acc_group1, SWIGLU_LIMIT)
@@ -1354,7 +1354,7 @@ def gluon_mxfp4_moe_stage1_kernel(
             gl.maximum(up_acc_group3, -SWIGLU_LIMIT), SWIGLU_LIMIT
         )
     # Match the reference exact floating-point grouping.  Computing a reciprocal
-    # first and then multiplying by `gate` is algebraically equivalent but
+    # first and then multiplying by ``gate`` is algebraically equivalent but
     # changes sparse near-zero BF16 results by one ULP after the final cast.
     silu_g0 = gate_acc_group0 / (1.0 + gl.exp(-(SWIGLU_ALPHA * gate_acc_group0)))
     acc_swiglu_group0 = gl.fma(silu_g0, up_acc_group0, silu_g0 * SWIGLU_BETA)
@@ -1466,33 +1466,33 @@ def invoke_gluon_mxfp4_moe_stage1(
 ):
     """Host-side launcher for Gluon MXFP4 MoE stage 1.
 
-    Computes, for each expert `e`::
+    Computes, for each expert ``e``::
 
         inter_e = silu(hidden_states_e @ w1_e[:I_r, :].T)
                   * (hidden_states_e @ w1_e[I_r:, :].T)
 
     in one kernel launch over all experts. The grid is one CTA per
-    (M-tile, N-tile); each CTA owns one `BLOCK_M` x `BLOCK_N`
-    output region for the expert `sorted_expert_ids[pid_m]`.
+    (M-tile, N-tile); each CTA owns one ``BLOCK_M`` x ``BLOCK_N``
+    output region for the expert ``sorted_expert_ids[pid_m]``.
 
-    Steps below correspond to the `# Step N:` comments in the body:
+    Steps below correspond to the ``# Step N:`` comments in the body:
       1. Validate dtypes / shapes; reject unsupported options.
-      2. Permute `w1` to the (16, 16) MFMA-tile layout (see
+      2. Permute ``w1`` to the (16, 16) MFMA-tile layout (see
          :func:`_b_preshuffle_3d`), or skip if the caller already did.
-      3. Materialise `num_valid_ids` / `sorted_weights` as device
-         tensors when the caller passed a Python scalar / `None`.
+      3. Materialise ``num_valid_ids`` / ``sorted_weights`` as device
+         tensors when the caller passed a Python scalar / ``None``.
       4. Launch the GEMM kernel.
 
     Layout contract: see the module docstring.
 
-    Unsupported (raises `NotImplementedError`):
-      `quant_type != per_1x32`, `activation != Silu`,
-      `splitk not in {0, 1, None}`, non-empty `sorted_weights`,
-      `dst_type != bfloat16`.
+    Unsupported (raises ``NotImplementedError``):
+      ``quant_type != per_1x32``, ``activation != Silu``,
+      ``splitk not in {0, 1, None}``, non-empty ``sorted_weights``,
+      ``dst_type != bfloat16``.
 
     Accepted-but-ignored, kept for signature compatibility with
-    upstream dispatchers: `kernelName`, `block_m` (kernel hardcodes
-    128), `w2`, `use_non_temporal_load`.
+    upstream dispatchers: ``kernelName``, ``block_m`` (kernel hardcodes
+    128), ``w2``, ``use_non_temporal_load``.
     """
     # Step 1: validate inputs and reject unsupported modes.
     del quant_type, activation  # only per-1x32 MXFP4 + SwiGLU is implemented
@@ -1627,7 +1627,7 @@ def invoke_gluon_mxfp4_moe_stage1(
     K_packed_total = K // 2
 
     # Step 4: launch the GEMM. One CTA per (M-tile, N-tile); the per-CTA
-    # expert id is `sorted_expert_ids[pid_m]`. Each CTA produces
+    # expert id is ``sorted_expert_ids[pid_m]``. Each CTA produces
     # BLOCK_M rows x BLOCK_N cols of the gate-up fused intermediate.
     gluon_mxfp4_moe_stage1_kernel[grid](
         hidden_states,

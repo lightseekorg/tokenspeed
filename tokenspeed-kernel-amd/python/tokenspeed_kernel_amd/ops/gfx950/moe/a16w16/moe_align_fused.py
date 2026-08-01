@@ -23,20 +23,20 @@
 A single workgroup doing O(num_experts) work, in Gluon (which has no LDS int
 atomics). One kernel:
 
-  * in-kernel sentinel/zero init of the output + `gl.barrier` (folds away the
+  * in-kernel sentinel/zero init of the output + ``gl.barrier`` (folds away the
     separate init-kernel launch),
-  * EP localization from global expert IDs plus `gl.histogram` -> per-expert
+  * EP localization from global expert IDs plus ``gl.histogram`` -> per-expert
     counts (remote routes are masked; EP = num_experts, no dump bin),
   * **single-block collapse**: top-k contains each expert at most once per
     token, so at M <= block_m, count[e] <= M <= block_m and every hit expert is
     exactly one block. So blocks_pe = (count>0), row_off = block_off*block_m, and
-    `sorted_expert_ids` is a cheap O(E) scatter (no [NB, E] tile),
+    ``sorted_expert_ids`` is a cheap O(E) scatter (no [NB, E] tile),
   * a [G, G] compare-tile stable rank (no atomics),
-  * `gl.gather` of the per-expert block offset + scatter each slot to
-    `block_off[e]*block_m + rank`.
+  * ``gl.gather`` of the per-expert block offset + scatter each slot to
+    ``block_off[e]*block_m + rank``.
 
-Sync-free: outputs sized at the compile-time bound `EM_MAX = (M*topk)*block_m`;
-`num_valid` (real EM) is on-device and the GEMM stages early-out on the padded
+Sync-free: outputs sized at the compile-time bound ``EM_MAX = (M*topk)*block_m``;
+``num_valid`` (real EM) is on-device and the GEMM stages early-out on the padded
 tail. Decode-only (EM_MAX + the O(G^2) rank tile grow with M*topk).
 """
 
@@ -156,9 +156,9 @@ def moe_align_block_size_fused(
     expert_start: int = 0,
 ):
     """Single-kernel sync-free decode block-align (pure Gluon). Same return
-    contract as `moe_align_block_size`.
+    contract as ``moe_align_block_size``.
 
-    `topk_ids` may use global expert IDs. `expert_start` identifies the
+    ``topk_ids`` may use global expert IDs. ``expert_start`` identifies the
     first expert owned by this rank; routes outside the contiguous local range
     are ignored without a separate localization kernel.
     """

@@ -702,7 +702,7 @@ def gluon_a16w4_situ_grouped_ep_gfx950(
 ) -> torch.Tensor:
     """Run one rank's grouped A16W4 SiTU contribution without host sync.
 
-    `local_topk_ids` may contain global expert IDs. `expert_start` marks
+    ``local_topk_ids`` may contain global expert IDs. ``expert_start`` marks
     the first expert represented by the local weight tensors; non-local routes
     are discarded by alignment and reduction kernels.
     """

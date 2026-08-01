@@ -21,7 +21,7 @@
 
 """Large-M dense16 Gluon GEMM for gfx950.
 
-This is adapted from the a16w16-8wave `v1_sliceMN_BK64_nS2` tutorial kernel
+This is adapted from the a16w16-8wave ``v1_sliceMN_BK64_nS2`` tutorial kernel
 from https://github.com/ROCm/gfx950-gluon-tutorials developed by Lixun Zhang.
 It's an 8-wave, 256x256x64, two-buffer warp-pipelined MFMA/LDS GEMM for large,
 aligned dense16 projection shapes.
@@ -430,7 +430,7 @@ def gluon_mm_a16w16_largem_gfx950(
     alpha: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
-    """Compute large, aligned dense16 `A @ B.T` with an 8-wave MFMA/LDS tile."""
+    """Compute large, aligned dense16 ``A @ B.T`` with an 8-wave MFMA/LDS tile."""
     if A.ndim != 2 or B.ndim != 2:
         return None
     if A.dtype not in _SUPPORTED_DTYPES or B.dtype not in _SUPPORTED_DTYPES:

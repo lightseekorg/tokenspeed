@@ -20,32 +20,32 @@
 
 """Device-side MoE routing + block alignment (pure Gluon).
 
-Drop-in replacement for the pure-torch `moe_align_block_size` that produces
-the identical contract (`sorted_token_ids` / `sorted_expert_ids` /
-`sorted_weights` / `num_valid_ids`) but runs entirely on the GPU. Used by
+Drop-in replacement for the pure-torch ``moe_align_block_size`` that produces
+the identical contract (``sorted_token_ids`` / ``sorted_expert_ids`` /
+``sorted_weights`` / ``num_valid_ids``) but runs entirely on the GPU. Used by
 the prefill path (large M), where the fused single-CTA align does not scale
 (O(G^2) rank tile). Written in **Gluon** so the whole MoE compiles through one
 Gluon backend.
 
 Kernels:
-  1. `_init_kernel`   -- parallel fill of the padding sentinel / zero weights
+  1. ``_init_kernel``   -- parallel fill of the padding sentinel / zero weights
                            and zero of the per-expert count buffer.
-  2. `_count_kernel`  -- **parallel** per-CTA `gl.histogram` of an N-chunk,
-                           atomic-added into a global `counts` buffer. This
+  2. ``_count_kernel``  -- **parallel** per-CTA ``gl.histogram`` of an N-chunk,
+                           atomic-added into a global ``counts`` buffer. This
                            replaces the old single-CTA histogram-over-N, which
                            was the align bottleneck (20->122us as M grows).
-  3. `_offsets_kernel`-- single CTA but only O(E) work: prefix-sum counts ->
-                           per-expert start rows, write `sorted_expert_ids` +
-                           `num_valid` (EM) / `num_blocks`.
-  4. `_scatter_kernel`-- parallel: each routed slot atomically claims a rank
-                           within its expert (`buffer_atomic_add` old value)
+  3. ``_offsets_kernel``-- single CTA but only O(E) work: prefix-sum counts ->
+                           per-expert start rows, write ``sorted_expert_ids`` +
+                           ``num_valid`` (EM) / ``num_blocks``.
+  4. ``_scatter_kernel``-- parallel: each routed slot atomically claims a rank
+                           within its expert (``buffer_atomic_add`` old value)
                            and writes its packed id + weight to that row.
 
 Order within an expert is arbitrary (atomics), unlike the stable reference, but
 MoE is order-independent. Outputs stay padded to their compile-time upper bound
 so this path is safe under CUDA/HIP graph capture; downstream stages read the
 device-side valid-count tensor and early-out on padding. CDNA3/4
-`buffer_atomic_add` is float-only, so counts / rank counters are fp32 (values
+``buffer_atomic_add`` is float-only, so counts / rank counters are fp32 (values
 are small ints, exact in fp32).
 """
 
@@ -222,9 +222,9 @@ def moe_align_block_size_device(
     expert_start: int = 0,
 ):
     """Fully-device MoE block alignment (pure Gluon). Same return contract as
-    the torch `moe_align_block_size`.
+    the torch ``moe_align_block_size``.
 
-    `topk_ids` may use global expert IDs. `expert_start` identifies the
+    ``topk_ids`` may use global expert IDs. ``expert_start`` identifies the
     first expert owned by this rank; routes outside the contiguous local range
     are discarded in the count and scatter kernels.
     """

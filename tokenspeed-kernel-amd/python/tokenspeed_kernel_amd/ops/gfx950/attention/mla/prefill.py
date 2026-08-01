@@ -938,9 +938,9 @@ def gluon_mla_prefill_bf16_gfx950(
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Dense non-absorbed MLA prefill on AMD gfx950 (bf16).
 
-    `q`/`k` are `[total_tokens, num_heads, 192]` (128 NoPE + 64 RoPE),
-    `v` is `[total_tokens, num_kv_heads, 128]`. Output is
-    `[total_tokens, num_heads, 128]`.
+    ``q``/``k`` are ``[total_tokens, num_heads, 192]`` (128 NoPE + 64 RoPE),
+    ``v`` is ``[total_tokens, num_kv_heads, 128]``. Output is
+    ``[total_tokens, num_heads, 128]``.
     """
     if logit_cap != 0.0:
         raise NotImplementedError(

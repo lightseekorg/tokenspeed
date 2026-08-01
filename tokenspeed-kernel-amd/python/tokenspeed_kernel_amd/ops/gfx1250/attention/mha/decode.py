@@ -1137,9 +1137,9 @@ def gluon_mha_decode_gfx1250(
 ) -> torch.Tensor:
     """Run paged GQA decode with one query token per request.
 
-    `q` has shape `[batch, num_q_heads, head_dim]`. K/V caches use the
-    production paged layout `[num_pages, page_size, num_kv_heads, head_dim]`
-    and `page_table` has shape `[batch, pages_per_sequence]`.
+    ``q`` has shape ``[batch, num_q_heads, head_dim]``. K/V caches use the
+    production paged layout ``[num_pages, page_size, num_kv_heads, head_dim]``
+    and ``page_table`` has shape ``[batch, pages_per_sequence]``.
     """
     if max_seqlen_q != 1:
         raise ValueError("GFX1250 paged GQA decode requires max_seqlen_q == 1")

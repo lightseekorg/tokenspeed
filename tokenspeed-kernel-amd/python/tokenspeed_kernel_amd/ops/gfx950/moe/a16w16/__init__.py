@@ -22,15 +22,15 @@
 
 Two-stage unquantized (bf16 activation / bf16 weight) fused MoE in Gluon:
 
-  Stage 1 (`stage1_kernel.py`): gate + up GEMM with fused SwiGLU.
-  Stage 2 (`stage2_kernel.py`): down GEMM + routed-weight scale, written
-     to a `[num_tokens, topk, D]` scratch, then reduced over topk.
+  Stage 1 (``stage1_kernel.py``): gate + up GEMM with fused SwiGLU.
+  Stage 2 (``stage2_kernel.py``): down GEMM + routed-weight scale, written
+     to a ``[num_tokens, topk, D]`` scratch, then reduced over topk.
 
-  Block-align: `moe_align_fused.py` (decode, single-workgroup) and
-     `moe_align_device.py` (prefill) produce the `sorted_token_ids` /
-     `sorted_expert_ids` / `sorted_weights` contract the kernels consume.
+  Block-align: ``moe_align_fused.py`` (decode, single-workgroup) and
+     ``moe_align_device.py`` (prefill) produce the ``sorted_token_ids`` /
+     ``sorted_expert_ids`` / ``sorted_weights`` contract the kernels consume.
 
-  End-to-end (`moe.py`): `gluon_bf16_moe(...)` (decode split-K path for
+  End-to-end (``moe.py``): ``gluon_bf16_moe(...)`` (decode split-K path for
      small M, XCD-remap prefill path otherwise).
 
 Reference shape: DeepSeek-V3 (E=256, D=7168, I=256, topk=8).

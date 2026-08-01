@@ -21,21 +21,21 @@
 """Decode-oriented stage 2 for the bf16 Gluon MoE: atomic-accumulate path.
 
 The default stage 2 writes each routed slot's down-projection to a
-`[num_tokens, topk, D]` scratch and then runs a separate reduce kernel over
+``[num_tokens, topk, D]`` scratch and then runs a separate reduce kernel over
 the topk dim. At large M that reduce is amortized, but at **decode** (small M)
 the reduce kernel is ~30% of stage-2 GPU time (pure launch/overhead), and the
-GEMM itself is already weight-bandwidth-bound (each touched expert's `w2`
+GEMM itself is already weight-bandwidth-bound (each touched expert's ``w2``
 must be read once regardless of tiling, so padding/tiling changes don't help).
 
-This path removes the reduce entirely: every routed slot `buffer_atomic_add`s
+This path removes the reduce entirely: every routed slot ``buffer_atomic_add``s
 its weighted down-projection **directly** into an fp32 output accumulator
-`out_fp32[token, :]`. All topk slots of a token target the same row, so the
+``out_fp32[token, :]``. All topk slots of a token target the same row, so the
 atomic sum is the MoE reduction. Contention is low at decode (token_num small).
-A final cast writes bf16 `out`. The GEMM is double-buffered (a small decode
+A final cast writes bf16 ``out``. The GEMM is double-buffered (a small decode
 win at M<=4). Selects the atomic vs reduce stage-2 path by token_num.
 
 fp32 accumulator (not bf16 atomics) keeps the topk sum accurate and lowers to
-plain `global_atomic_add_f32`.
+plain ``global_atomic_add_f32``.
 """
 
 from __future__ import annotations

@@ -23,25 +23,25 @@
 At decode (small M) the normal stage 1 is occupancy-starved: with E=256
 experts and topk=8, M=1 routes only ~8 experts, so the grid is ~16 CTAs on a
 256-CU GPU (~6% occupancy). Each CTA then serially walks the full
-`K = D = 7168` contraction, so per-CTA memory latency is fully exposed.
+``K = D = 7168`` contraction, so per-CTA memory latency is fully exposed.
 
-Split-K fixes this by partitioning the K contraction across `SPLIT_K` CTAs
-per output tile, multiplying the grid by `SPLIT_K` (M=1, SPLIT_K=16 -> 256
+Split-K fixes this by partitioning the K contraction across ``SPLIT_K`` CTAs
+per output tile, multiplying the grid by ``SPLIT_K`` (M=1, SPLIT_K=16 -> 256
 CTAs -> full occupancy). Because stage 1's SwiGLU epilogue is **nonlinear**
-(`silu(gate) * up`), the split partials must be the *raw* gate/up GEMM
+(``silu(gate) * up``), the split partials must be the *raw* gate/up GEMM
 sums; SwiGLU is deferred to the reduce kernel which runs after the K-sum.
 
 Two kernels:
-  1. `gluon_bf16_moe_stage1_splitk_gemm_kernel`: each (tile, split) writes
-     its fp32 gate/up partial into `partial[inter_row, split, 2*I]`
-     (gate in `[0:I]`, up in `[I:2*I]`). No SwiGLU. Atomic-free: every
-     `(inter_row, split, col)` is written by exactly one CTA.
-  2. `gluon_bf16_moe_stage1_reduce_swiglu_kernel`: sums the partial over the
-     `SPLIT_K` dim (fp32), applies `silu(gate) * up`, writes `inter`.
+  1. ``gluon_bf16_moe_stage1_splitk_gemm_kernel``: each (tile, split) writes
+     its fp32 gate/up partial into ``partial[inter_row, split, 2*I]``
+     (gate in ``[0:I]``, up in ``[I:2*I]``). No SwiGLU. Atomic-free: every
+     ``(inter_row, split, col)`` is written by exactly one CTA.
+  2. ``gluon_bf16_moe_stage1_reduce_swiglu_kernel``: sums the partial over the
+     ``SPLIT_K`` dim (fp32), applies ``silu(gate) * up``, writes ``inter``.
 
-The partial buffer is `[num_tokens*topk, SPLIT_K, 2*I]` fp32, which is tiny
+The partial buffer is ``[num_tokens*topk, SPLIT_K, 2*I]`` fp32, which is tiny
 at decode (M=1, SPLIT_K=16 -> 256 KB) but would be huge at large M -- hence
-split-K is auto-selected only for small M (see `auto_split_k`).
+split-K is auto-selected only for small M (see ``auto_split_k``).
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ def auto_split_k(num_tokens: int, num_k_tiles: int) -> int:
 
     Targets enough CTAs to fill the machine at small M while disabling
     split-K (and its per-M partial buffer) once M is large enough to fill
-    the GPU on its own. Clamped to a divisor of `num_k_tiles`.
+    the GPU on its own. Clamped to a divisor of ``num_k_tiles``.
     """
     # Tuned on MI355X, DSv3 TP=8 (see perf_report.md): the split-K win is
     # real only for M <= 16; at M >= 32 it is flat-to-negative (reduce +

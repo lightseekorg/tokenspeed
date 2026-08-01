@@ -21,12 +21,12 @@
 """MHA extend (prefix-cache / chunked-prefill) Gluon kernel for AMD GFX950.
 
 Ragged, multi-token queries against a paged KV cache. Each program owns one
-kv-head and packs the GQA query-head group with `BLOCK_Q` query positions into
-the MFMA `M` dimension (`BLOCK_M = BLOCK_Q * GROUP_SIZE`), so each KV tile is
+kv-head and packs the GQA query-head group with ``BLOCK_Q`` query positions into
+the MFMA ``M`` dimension (``BLOCK_M = BLOCK_Q * GROUP_SIZE``), so each KV tile is
 loaded once and reused across the group. The grid is ragged and token-based,
-`(total_num_q_blocks, n_kv_heads)`: each program binary-searches
-`cu_seqlens_q` to self-locate its request/q-block, keeping the launch
-CUDA-graph static while a `q=1` request costs a single block.
+``(total_num_q_blocks, n_kv_heads)``: each program binary-searches
+``cu_seqlens_q`` to self-locate its request/q-block, keeping the launch
+CUDA-graph static while a ``q=1`` request costs a single block.
 """
 
 from __future__ import annotations
@@ -76,10 +76,10 @@ def _resolve_grid(
     pid_batch,
 ):
     # Resolve (batch, q_pos_base) from the launch grid:
-    #   * rectangular `(blocks_per_req, batch, n_kv_heads)`: `pid_qblock` is
-    #     the block within the request and `pid_batch` the request.
-    #   * ragged `(total_num_q_blocks, ...)`: `pid_qblock` is a global q-block
-    #     that binary-searches `cu_seqlens_q` to find its request.
+    #   * rectangular ``(blocks_per_req, batch, n_kv_heads)``: ``pid_qblock`` is
+    #     the block within the request and ``pid_batch`` the request.
+    #   * ragged ``(total_num_q_blocks, ...)``: ``pid_qblock`` is a global q-block
+    #     that binary-searches ``cu_seqlens_q`` to find its request.
     if RAGGED:
         batch = _find_seq_idx(cu_seqlens_q_ptr, pid_qblock, num_seqs, BLOCK_Q)
         seq_base = gl.load(cu_seqlens_q_ptr + batch)

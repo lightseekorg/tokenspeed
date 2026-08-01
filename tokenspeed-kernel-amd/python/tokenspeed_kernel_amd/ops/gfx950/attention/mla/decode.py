@@ -21,19 +21,19 @@
 
 """MLA decode Gluon kernels for AMD GFX950.
 
-The FP8 layout and `bh16bn128` regime are adapted from ROCm/AITER's
-MIT-licensed `aiter/ops/triton/gluon/mla_gluon.py` at commit
-`ae0bae8954110b12655e3232f68262dd63cd694e`. The implementation here retains
+The FP8 layout and ``bh16bn128`` regime are adapted from ROCm/AITER's
+MIT-licensed ``aiter/ops/triton/gluon/mla_gluon.py`` at commit
+``ae0bae8954110b12655e3232f68262dd63cd694e``. The implementation here retains
 TokenSpeed's paged-cache interface (page IDs plus an arbitrary page size).
 
 The shared kernel supports three regimes:
 
-* `bh16bn128` -- BF16/FP8 Q + FP8 KV, BLOCK_H=16, BLOCK_N=128 and
-  `num_q_heads <= 16` and arbitrary batch sizes.
-* `bh16bn64` -- BF16 Q + BF16 KV, BLOCK_H=16, BLOCK_N=64,
-  `num_q_heads <= 16`.
-* `bh64` -- BLOCK_H=64, BLOCK_N=64, `num_q_heads in {64, 128}`, 3-D
-  XCD-aware grid, `batch_size` divisible by 64.
+* ``bh16bn128`` -- BF16/FP8 Q + FP8 KV, BLOCK_H=16, BLOCK_N=128 and
+  ``num_q_heads <= 16`` and arbitrary batch sizes.
+* ``bh16bn64`` -- BF16 Q + BF16 KV, BLOCK_H=16, BLOCK_N=64,
+  ``num_q_heads <= 16``.
+* ``bh64`` -- BLOCK_H=64, BLOCK_N=64, ``num_q_heads in {64, 128}``, 3-D
+  XCD-aware grid, ``batch_size`` divisible by 64.
 """
 
 from __future__ import annotations
@@ -1527,14 +1527,14 @@ def _gluon_mla_decode_gfx950(
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Absorbed MLA decode over a paged compressed KV cache on gfx950.
 
-    `q` is `[batch, 1, num_q_heads, kv_lora_rank + qk_rope_head_dim]` and
-    `kv_cache` is `[num_pages, page_size, 1, kv_lora_rank + qk_rope_head_dim]`
-    (first `kv_lora_rank` latent, last `qk_rope_head_dim` RoPE). Output is
-    BF16 with shape `[batch, 1, num_q_heads, kv_lora_rank]`.
+    ``q`` is ``[batch, 1, num_q_heads, kv_lora_rank + qk_rope_head_dim]`` and
+    ``kv_cache`` is ``[num_pages, page_size, 1, kv_lora_rank + qk_rope_head_dim]``
+    (first ``kv_lora_rank`` latent, last ``qk_rope_head_dim`` RoPE). Output is
+    BF16 with shape ``[batch, 1, num_q_heads, kv_lora_rank]``.
 
-    BF16 Q/KV selects `bh16bn64` (`num_q_heads <= 16`) or `bh64`
-    (`num_q_heads in {64, 128}`). BF16 Q with FP8 KV selects AITER's
-    `bh16bn128` regime (`num_q_heads <= 16`). E4M3 Q with E4M3 KV selects
+    BF16 Q/KV selects ``bh16bn64`` (``num_q_heads <= 16``) or ``bh64``
+    (``num_q_heads in {64, 128}``). BF16 Q with FP8 KV selects AITER's
+    ``bh16bn128`` regime (``num_q_heads <= 16``). E4M3 Q with E4M3 KV selects
     the native FP8 variant. Both FP8-KV variants support arbitrary batch sizes.
     """
     if logit_cap != 0.0:
@@ -1842,7 +1842,7 @@ def gluon_mla_decode_bf16xfp8_gfx950(
     return_lse: bool = False,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Run BF16-Q/FP8-KV MLA decode with the GFX950 `bh16bn128` regime."""
+    """Run BF16-Q/FP8-KV MLA decode with the GFX950 ``bh16bn128`` regime."""
     if q.dtype != torch.bfloat16 or kv_cache.dtype not in (
         torch.float8_e4m3fn,
         torch.float8_e5m2,

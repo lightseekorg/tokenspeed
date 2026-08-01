@@ -22,8 +22,8 @@
 """Gluon A4W4 MoE kernels for AMD CDNA4/gfx950.
 
 The package keeps the four production stages behind stage-specific modules:
-prefill stage 1/2 and decode stage 1/2.  `moe.py` provides the small-M
-end-to-end decode entry point, while `routing.py` exposes the fused decode
+prefill stage 1/2 and decode stage 1/2.  ``moe.py`` provides the small-M
+end-to-end decode entry point, while ``routing.py`` exposes the fused decode
 top-k helpers.
 """
 

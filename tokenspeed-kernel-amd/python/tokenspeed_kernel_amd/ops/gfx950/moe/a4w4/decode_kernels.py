@@ -25,10 +25,10 @@ The production entry points in this module consume packed E2M1 activations,
 E8M0 activation scales, and gdot128-shuffled MXFP4 weights/scales,
 then execute direct CDNA4 MFMA for both MoE stages.
 
-The older `invoke_stage*_warp_decode_gluon` helpers consume BF16
+The older ``invoke_stage*_warp_decode_gluon`` helpers consume BF16
 activations and scalar-dequantize only the MXFP4 weights.  They are retained
-solely for historical microbenchmarks through `mxfp4_warp_decode_gfx950`;
-the public `gluon_a4w4_gfx950` package and production dispatch do not export
+solely for historical microbenchmarks through ``mxfp4_warp_decode_gfx950``;
+the public ``gluon_a4w4_gfx950`` package and production dispatch do not export
 or call them.
 """
 
@@ -103,8 +103,8 @@ def _cdna4_swizzled_mxfp4_scale_offset(
 ):
     """Return byte offset for CDNA4-swizzled e8m0 scales.
 
-    The preprocessor stores scales as `(E, K_scale_padded * 32, N_padded / 32)`
-    with `stride(-2) == 1`.  This is the scalar form of the unswizzle used by
+    The preprocessor stores scales as ``(E, K_scale_padded * 32, N_padded / 32)``
+    with ``stride(-2) == 1``.  This is the scalar form of the unswizzle used by
     the reference MFMA path.
     """
     n_block = n_col // 32
@@ -123,7 +123,7 @@ def _cdna4_swizzled_mxfp4_scale_offset(
 #
 # The dynamic MXFP4 route-owned path must not bounce through torch.softmax /
 # torch.topk before entering warp-decode.  These kernels produce the same
-# `topk_ids` / `topk_weights` contract consumed by stage1/stage2.
+# ``topk_ids`` / ``topk_weights`` contract consumed by stage1/stage2.
 # ---------------------------------------------------------------------------
 @gluon.jit
 def _softmax_topk_route_gluon_kernel(
@@ -317,7 +317,7 @@ def invoke_softmax_topk_route_gluon(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Route with full-row softmax semantics.
 
-    Selection is by `softmax(logits) + correction_bias` when a bias is
+    Selection is by ``softmax(logits) + correction_bias`` when a bias is
     supplied; stored weights are the unbiased selected full-row softmax scores,
     optionally renormalized across the selected experts and always scaled.
     """
@@ -375,9 +375,9 @@ def invoke_sigmoid_bias_topk_route_gluon(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Route with DeepSeekV3/Kimi noaux_tc semantics for a single group.
 
-    Selection is by `sigmoid(logits) + correction_bias`; stored weights are
-    the unbiased selected sigmoid scores.  With Kimi's `n_group=1` and
-    `topk_group=1` the grouped route degenerates to this global top-k.
+    Selection is by ``sigmoid(logits) + correction_bias``; stored weights are
+    the unbiased selected sigmoid scores.  With Kimi's ``n_group=1`` and
+    ``topk_group=1`` the grouped route degenerates to this global top-k.
     """
     if not _route_supported(router_logits, topk):
         raise ValueError("unsupported MXFP4 warp-decode sigmoid route shape")
@@ -986,7 +986,7 @@ def _stage1_mxfp4_direct_mfma_gluon(
     x_row_off = token.to(gl.int64) * stride_xm
     w_expert_off = expert.to(gl.int64) * stride_we
     s_expert_off = expert.to(gl.int64) * stride_se
-    # Keep the trip count compile-time.  With runtime `D` Gluon emitted one
+    # Keep the trip count compile-time.  With runtime ``D`` Gluon emitted one
     # load/wait/MFMA group per K tile; the constexpr bound lets the backend
     # overlap adjacent groups and cuts the 56-tile Kimi stage1 wait chain.
     TOTAL_KT: gl.constexpr = gl.cdiv(K_PACKED, BLOCK_K_PACKED)
@@ -1313,7 +1313,7 @@ def _stage2_mxfp4_direct_mfma_gluon(
             # Match the reference combine epilogue ordering.  Its GEMM kernel first
             # rounds each expert partial to the output dtype, multiplies by a
             # routed weight in that same dtype, stores BF16 partial rows, and
-            # only then reduces top-k.  Keeping `gate * acc` in FP32 until
+            # only then reduces top-k.  Keeping ``gate * acc`` in FP32 until
             # the final store changes thousands of Kimi decode elements by a
             # BF16 ULP even when routing, quantization, and stage 1 are exact.
             partial = acc.to(out_ptr.dtype.element_ty)
@@ -1424,10 +1424,10 @@ def _legacy_a16w4_moe_decode(
     """Legacy BF16-activation x MXFP4-weight scalar decode benchmark.
 
     Args:
-        hidden_states: `(M, D)` bf16 activations.
-        w1: gdot128 runtime `(E, D//2 padded, 2*I)` shuffled uint8 weights.
+        hidden_states: ``(M, D)`` bf16 activations.
+        w1: gdot128 runtime ``(E, D//2 padded, 2*I)`` shuffled uint8 weights.
         w1_scale: CDNA4-swizzled uint8 e8m0 scales.
-        w2: gdot128 runtime `(E, I//2 padded, D padded)` shuffled uint8 weights.
+        w2: gdot128 runtime ``(E, I//2 padded, D padded)`` shuffled uint8 weights.
         w2_scale: CDNA4-swizzled uint8 e8m0 scales.
         topk_ids/topk_weights: precomputed routing output.
     """

@@ -20,15 +20,15 @@
 
 """Route-direct gfx950 A16W4 SiTU MoE kernels for small-batch decode.
 
-The Triton MXFP4 weight preprocessor stores values as `(E, K / 2, N)` and
-CDNA4-swizzles their `(E, K / 32, N)` scales.  Decode can consume those
+The Triton MXFP4 weight preprocessor stores values as ``(E, K / 2, N)`` and
+CDNA4-swizzles their ``(E, K / 32, N)`` scales.  Decode can consume those
 existing buffers directly: one wave reduces K for a small output-column block,
 without sorting routes or padding each one to a 64-row grouped GEMM. gfx950's
 native scaled upcast expands each E2M1/UE8M0 tile directly to exact BF16 weight
 values, avoiding scalar nibble and exponent decoding in both GEMVs.
 
 Stage 1 writes one BF16 SiTU row per local route.  Stage 2 visits the original
-top-k slots, skips remote EP ids (`-1`), preserves the per-route BF16 W2
+top-k slots, skips remote EP ids (``-1``), preserves the per-route BF16 W2
 boundary, and combines all local routes directly into the rank's output.
 """
 
@@ -376,9 +376,9 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
 ) -> torch.Tensor:
     """Compute a tiny-M EP contribution from packed MXFP4 weights.
 
-    `linear_weights=False` consumes Triton's K-packed values and
-    CDNA4-swizzled scales. `linear_weights=True` consumes the Gluon EP8
-    plan's original contiguous `[E, N, K / 2]` values and linear scales.
+    ``linear_weights=False`` consumes Triton's K-packed values and
+    CDNA4-swizzled scales. ``linear_weights=True`` consumes the Gluon EP8
+    plan's original contiguous ``[E, N, K / 2]`` values and linear scales.
     Kimi K3's exact packed-K sizes use the widest tuned tiles; other supported
     widths retain unmasked execution by stepping down to an exact tile.
     """

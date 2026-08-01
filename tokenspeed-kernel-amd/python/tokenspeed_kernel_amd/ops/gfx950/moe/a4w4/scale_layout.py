@@ -24,14 +24,14 @@ Both scale producers and consumers must agree on the CDNA4 MXFP4 scale-swizzle
 parameters and byte permutation:
 
 * B-scales (weights): swizzled at load time by the weight preprocessor
-  (`mxfp4_gfx950_preprocess._swizzle_mxfp4` via
+  (``mxfp4_gfx950_preprocess._swizzle_mxfp4`` via
   :func:`swizzle_cdna4_mxfp4_scale`).
 * A-scales (activations): emitted in token order by the MXFP4 activation
   quantizer and re-gathered into sorted-route order by
-  `gluon_a4w4_gfx950.scale.gather_package_cdna4_scale`.
-* Consumers: the package stage kernels (`prefill_stage1/2`,
-  `decode_stage1/2`) address the scales with the matching CDNA4 MFMA scale
-  layout (`gl.amd.cdna4.get_mfma_scale_layout`).
+  ``gluon_a4w4_gfx950.scale.gather_package_cdna4_scale``.
+* Consumers: the package stage kernels (``prefill_stage1/2``,
+  ``decode_stage1/2``) address the scales with the matching CDNA4 MFMA scale
+  layout (``gl.amd.cdna4.get_mfma_scale_layout``).
 
 Historically these constants were duplicated (under different names) across the
 preprocessor and the activation-scale gather. Centralizing them here makes a
@@ -39,26 +39,26 @@ scale-layout change a single-file edit: update the constants / permutation
 below, keep the stage-kernel scale addressing in sync, and the bit-exact
 package tests gate correctness.
 
-This module is intentionally a leaf (only depends on `torch`) so every
+This module is intentionally a leaf (only depends on ``torch``) so every
 producer/consumer can import it without pulling in the Triton stage kernels.
 
 
 Why swizzle at all
 --------------------
 An MXFP4 tensor carries one e8m0 block scale per 32 elements along K. The
-gfx950 `v_mfma_scale_f32_*` instructions consume those block scales from a
+gfx950 ``v_mfma_scale_f32_*`` instructions consume those block scales from a
 *fixed distribution across the 64 lanes and their VGPRs* -- each lane must
 already hold the scale bytes for the (row, K-block) coordinates it is
-responsible for. A plain row-major `(N, K//32)` scale array does not land in
+responsible for. A plain row-major ``(N, K//32)`` scale array does not land in
 those positions under a coalesced load, so we permute the bytes at load time
 (the "swizzle") such that a single direct global->VGPR gather drops every byte
 where the MFMA expects it, with no in-kernel shuffle.
 
 The permutation is dictated entirely by the MFMA instruction shape the stage
-kernels issue. We support exactly one shape, `mfma16` (16x16x128), so there
+kernels issue. We support exactly one shape, ``mfma16`` (16x16x128), so there
 is a single scale swizzle (:func:`swizzle_cdna4_mxfp4_scale`). Producer and
 consumer are hard-coupled: the byte order this swizzle bakes into memory must
-match the `get_mfma_scale_layout` the stage kernels address with, so any
+match the ``get_mfma_scale_layout`` the stage kernels address with, so any
 change here must be mirrored in the kernels' scale addressing.
 
 The swizzled scales feed a direct global->VGPR gather in the stage kernels, so
@@ -82,7 +82,7 @@ CDNA4_SCALE_N_BLOCK = 32
 CDNA4_SCALE_K_BLOCK = 8
 
 # MFMA non-K dimension used by the a4w4 stage kernels
-# (`v_mfma_scale_f32_16x16x128_f8f6f4`). The scale swizzle below is fixed to
+# (``v_mfma_scale_f32_16x16x128_f8f6f4``). The scale swizzle below is fixed to
 # this shape.
 MFMA_NONK_DIM = 16
 
@@ -102,15 +102,15 @@ def swizzle_cdna4_mxfp4_scale(scale: torch.Tensor) -> torch.Tensor:
     the A-scale) CDNA4 swizzle used by the runtime. Any change here must be
     mirrored in the stage kernels' scale addressing.
 
-    Input:  MXFP4 block scales with the logical `(..., N, K // 32)` layout
+    Input:  MXFP4 block scales with the logical ``(..., N, K // 32)`` layout
             (last two dims are rows and per-block scale columns).
-    Output: CDNA4-swizzled scales with `stride(-2) == 1` (the byte order the
+    Output: CDNA4-swizzled scales with ``stride(-2) == 1`` (the byte order the
             CDNA4 16x16x128 MFMA scaled-dot path expects for the B operand).
 
     Lane 0 access block (what one lane reads)
     -----------------------------------------
     For a 32-row x 8-K-block tile, the swizzle interleaves rows in 16-apart
-    pairs `(n, n + 16)` and K-blocks in 4-apart pairs `(kb, kb + 4)` so the
+    pairs ``(n, n + 16)`` and K-blocks in 4-apart pairs ``(kb, kb + 4)`` so the
     first eight bytes a coalesced load anchored at lane 0 sees are::
 
         mem[0] = (n=0,  kb=0)     mem[4] = (n=1,  kb=0)
@@ -119,10 +119,10 @@ def swizzle_cdna4_mxfp4_scale(scale: torch.Tensor) -> torch.Tensor:
         mem[3] = (n=16, kb=4)     mem[7] = (n=17, kb=4)
 
     i.e. lane 0 ends up holding the scale bytes for the row/K-block quarters the
-    16x16x128 `mfma_scaled` op reduces over -- two 16-row halves and two
+    16x16x128 ``mfma_scaled`` op reduces over -- two 16-row halves and two
     K-quarters spaced 4 blocks apart -- with no in-kernel shuffle. That
     (row-pair, K-quarter-pair) grouping is exactly the permutation encoded by
-    `view(N//32, 2, 16, K//8, 2, 4, 1).permute(N//32, K//8, 4, 16, 2, 2, 1)`
+    ``view(N//32, 2, 16, K//8, 2, 4, 1).permute(N//32, K//8, 4, 16, 2, 2, 1)``
     below.
     """
     if scale.ndim < 2:

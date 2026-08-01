@@ -20,7 +20,7 @@
 
 """End-to-end bf16 Gluon MoE (gfx950): routing-sort -> stage1 -> stage2.
 
-Public entry point `gluon_bf16_moe` computes an unquantized bf16 fused MoE
+Public entry point ``gluon_bf16_moe`` computes an unquantized bf16 fused MoE
 FFN: bf16 activations, bf16 weights, SwiGLU (g1u1), silu activation,
 routed-weight fold in stage 2.
 """
@@ -85,17 +85,17 @@ def gluon_bf16_moe(
     decode: bool | None = None,
     warp_decode: bool | None = None,
 ) -> torch.Tensor:
-    """Compute the fused bf16 MoE FFN and return `(num_tokens, D)` bf16.
+    """Compute the fused bf16 MoE FFN and return ``(num_tokens, D)`` bf16.
 
         y[t] = sum_{s in topk} w[t,s] * down_e( silu(gate_e(h)) * up_e(h) )
         where e = topk_ids[t, s], w = topk_weights[t, s].
 
-    `decode` selects the decode-specialised path (`None` = auto: on at
-    `num_tokens <= DECODE_MAX_M`). The decode path uses a smaller sort/tile
-    `BLOCK_M`, the fused single-workgroup align, and a decode-specialised stage 1
+    ``decode`` selects the decode-specialised path (``None`` = auto: on at
+    ``num_tokens <= DECODE_MAX_M``). The decode path uses a smaller sort/tile
+    ``BLOCK_M``, the fused single-workgroup align, and a decode-specialised stage 1
     (small M, K=128, single LDS buffer) with split-K; the prefill path uses the
-    device align + the pipelined XCD-remap stage 1. `split_k` overrides the
-    stage-1 split factor (`None` = auto by M).
+    device align + the pipelined XCD-remap stage 1. ``split_k`` overrides the
+    stage-1 split factor (``None`` = auto by M).
     """
     assert hidden_states.dtype == torch.bfloat16
     assert w1.dtype == torch.bfloat16 and w2.dtype == torch.bfloat16

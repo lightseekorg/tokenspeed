@@ -67,7 +67,7 @@ def _gather_package_cdna4_scale_kernel(
     """Gather a CDNA4-swizzled activation scale by sorted-route rows.
 
     Copies directly between the token-order and sorted-route CDNA4 layouts;
-    `sorted_ids` packs `(topk_id << 24) | token_id` per slot.
+    ``sorted_ids`` packs ``(topk_id << 24) | token_id`` per slot.
     """
     linear = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     dst_row = linear // K_SCALE
@@ -115,14 +115,14 @@ def gather_package_cdna4_scale(
 
     Args:
         scale: rank-2 uint8 CDNA4-swizzled activation scale.
-        sorted_ids: sorted-route slots (`(topk_id << 24) | token_id`).
+        sorted_ids: sorted-route slots (``(topk_id << 24) | token_id``).
         source_rows: number of valid source rows (token or token*topk extent).
         cols: activation column count (K), must divide 32.
         top_k: experts per token.
-        flatten_topk: if True, source rows are flattened `token * TOPK + slot`.
+        flatten_topk: if True, source rows are flattened ``token * TOPK + slot``.
 
     Returns:
-        `(rows_pad, K // 32)` uint8 scale in sorted-route order.
+        ``(rows_pad, K // 32)`` uint8 scale in sorted-route order.
     """
     if scale.dtype != torch.uint8 or scale.ndim != 2:
         raise ValueError(

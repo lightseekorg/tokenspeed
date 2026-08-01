@@ -308,12 +308,12 @@ def _load_elements_per_thread(dtype: torch.dtype) -> int:
 
 
 def _select_config(M: int, N: int) -> tuple[int, int, bool, int | None]:
-    """Return Gluon launch config for `M x N` logits.
+    """Return Gluon launch config for ``M x N`` logits.
 
-    Returns `(block_size, num_warps, use_split_atomic, fixed_split_count)`:
+    Returns ``(block_size, num_warps, use_split_atomic, fixed_split_count)``:
     the physical tile width, wave grouping, whether to use a split-atomic
-    path, and an optional fixed split count. When `fixed_split_count` is
-    set, `block` is the power-of-two tile width for each derived chunk.
+    path, and an optional fixed split count. When ``fixed_split_count`` is
+    set, ``block`` is the power-of-two tile width for each derived chunk.
     """
     if M <= 4 and N >= 65536:
         num_splits = 32 if M == 1 else 16

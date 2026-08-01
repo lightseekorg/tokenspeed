@@ -2136,10 +2136,10 @@ def matmul(
 
     Args:
         a: Dense or expert-routed activation tensor. FP8 tensors should use a
-            torch float8 dtype; MXFP4 tensors should use packed `torch.uint8`.
-        b: Expert weight tensor in `(E, K_packed, N)` or dense `(K_packed, N)`
-            layout. Packed MXFP4 weights use `torch.uint8` storage.
-        bias: Optional expert bias tensor with shape `(E, N)` or `(N,)`.
+            torch float8 dtype; MXFP4 tensors should use packed ``torch.uint8``.
+        b: Expert weight tensor in ``(E, K_packed, N)`` or dense ``(K_packed, N)``
+            layout. Packed MXFP4 weights use ``torch.uint8`` storage.
+        bias: Optional expert bias tensor with shape ``(E, N)`` or ``(N,)``.
         a_ragged_metadata: Expert-row metadata for routed dispatch/combine.
         b_ragged_metadata: Reserved for K-ragged weights; currently unsupported.
         gather_indx: Optional source row indices for dispatch.
@@ -2148,7 +2148,7 @@ def matmul(
         fused_activation: Optional SwiGLU activation descriptor.
 
     Returns:
-        `(output, kernel)` where `kernel` is the Triton/Gluon launch object.
+        ``(output, kernel)`` where ``kernel`` is the Triton/Gluon launch object.
     """
     if b_ragged_metadata is not None:
         raise NotImplementedError(
@@ -2590,22 +2590,22 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
 
     Args:
         hidden_states: Token activations in bf16/fp16/fp8, shaped
-            `(n_tokens, hidden_size)`.
-        topk_weights: Route weights, shaped `(n_tokens, top_k)`.
-        topk_ids: Expert ids, shaped `(n_tokens, top_k)`.
+            ``(n_tokens, hidden_size)``.
+        topk_weights: Route weights, shaped ``(n_tokens, top_k)``.
+        topk_ids: Expert ids, shaped ``(n_tokens, top_k)``.
         w13_weight: gfx1250-preprocessed interleaved gate/up expert weight.
         w2_weight: gfx1250-preprocessed down-projection expert weight.
-        w13_mx_scale: gfx1250-swizzled MXFP4 scale for `w13_weight`.
-        w2_mx_scale: gfx1250-swizzled MXFP4 scale for `w2_weight`.
+        w13_mx_scale: gfx1250-swizzled MXFP4 scale for ``w13_weight``.
+        w2_mx_scale: gfx1250-swizzled MXFP4 scale for ``w2_weight``.
         w13_bias: Optional expert bias for the gate/up projection.
         w2_bias: Optional expert bias for the down projection.
         out_dtype: Final output dtype.
         swiglu_alpha: SwiGLU gate scale.
-        swiglu_limit: Optional SwiGLU clamp limit; `0` disables clamping.
+        swiglu_limit: Optional SwiGLU clamp limit; ``0`` disables clamping.
         swiglu_beta: SwiGLU linear branch offset.
 
     Returns:
-        Tensor shaped `(n_tokens, hidden_size)`.
+        Tensor shaped ``(n_tokens, hidden_size)``.
     """
     if topk_ids.ndim != 2:
         raise ValueError(f"topk_ids must be rank-2, got {tuple(topk_ids.shape)}")
@@ -2706,7 +2706,7 @@ def gluon_mxfp_ragged_matmul(
     n_expts_act=None,
     **extra_kwargs,
 ) -> torch.Tensor:
-    """Tokenspeed-style wrapper around `matmul` for routed MoE calls."""
+    """Tokenspeed-style wrapper around ``matmul`` for routed MoE calls."""
     del x_global_scale
     if out_dtype is None:
         out_dtype = x.dtype if x.dtype.is_floating_point else torch.bfloat16

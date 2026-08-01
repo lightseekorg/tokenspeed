@@ -20,7 +20,7 @@
 
 """Gluon bf16 MoE stage 1: gate + up GEMM with fused SwiGLU (gfx950).
 
-For each MoE expert `e` and every token routed to it::
+For each MoE expert ``e`` and every token routed to it::
 
     inter = silu(hidden @ w1_e[:I, :].T) * (hidden @ w1_e[I:, :].T)
 
@@ -29,11 +29,11 @@ accumulate, SwiGLU epilogue.
 
 GEMM hot loop follows the ROCm/gfx950-gluon-tutorials **a16w16 v4/v9**
 design: a 2-stage double-buffered async prefetch pipeline
-(`buffer_load_to_shared` into a ping-pong LDS buffer, consume the
-previous buffer while the next fills, `wait_group(1)`), plus v9's
-XCD-aware PID remapping + `GROUP_SIZE_M` swizzling for L2 locality
-(`_grid.get_pids`). MFMA idiom: `AMDMFMALayout(version=4,
-instr_shape=[16,16,32], k_width=8)` + `gl.amd.cdna3.mfma`.
+(``buffer_load_to_shared`` into a ping-pong LDS buffer, consume the
+previous buffer while the next fills, ``wait_group(1)``), plus v9's
+XCD-aware PID remapping + ``GROUP_SIZE_M`` swizzling for L2 locality
+(``_grid.get_pids``). MFMA idiom: ``AMDMFMALayout(version=4,
+instr_shape=[16,16,32], k_width=8)`` + ``gl.amd.cdna3.mfma``.
 
 Layout contract:
   hidden_states  (num_tokens, D)            bf16      (A operand, gathered)
@@ -80,8 +80,8 @@ def gluon_bf16_moe_stage1_kernel(
     GROUP_SIZE_M: gl.constexpr,
 ):
     num_pid_m = gl.cdiv(EM, BLOCK_M)
-    # Grid covers the SwiGLU output columns `I_r` (not the un-fused
-    # gate||up width `N`); each CTA emits both gate and up for its slab.
+    # Grid covers the SwiGLU output columns ``I_r`` (not the un-fused
+    # gate||up width ``N``); each CTA emits both gate and up for its slab.
     num_pid_n = gl.cdiv(I_r, BLOCK_N)
     pid_m, pid_n = get_pids(num_pid_m, num_pid_n, GRID_MN, NUM_XCDS, GROUP_SIZE_M)
 
@@ -243,11 +243,11 @@ def invoke_stage1(
 ):
     """Launch bf16 MoE stage 1 (gate + up + SwiGLU).
 
-    `split_k` controls the decode split-K path (see `stage1_splitk_kernel`):
-      * `None` (default) -> auto-pick from the batch size (`auto_split_k`);
-        big split at small M, `1` (this single-launch path) at large M.
-      * `1`            -> force this single-launch pipelined kernel.
-      * `> 1`          -> force split-K with that factor.
+    ``split_k`` controls the decode split-K path (see ``stage1_splitk_kernel``):
+      * ``None`` (default) -> auto-pick from the batch size (``auto_split_k``);
+        big split at small M, ``1`` (this single-launch path) at large M.
+      * ``1``            -> force this single-launch pipelined kernel.
+      * ``> 1``          -> force split-K with that factor.
     """
     assert hidden_states.dtype == torch.bfloat16
     assert w1.dtype == torch.bfloat16

@@ -27,18 +27,18 @@ performs **no** device-to-host synchronization, so the whole prefill path is
 CUDA-graph capturable.
 
 The routing buffers are sized to the worst case and padding is marked with
-sentinels: `sorted_expert_ids` padding blocks are `-1` and
-`sorted_token_ids` padding slots are `(topk << 24) | M`. The stage kernels
-self-skip padding on-device (expert `-1` early-exits; token field `>= M` is
+sentinels: ``sorted_expert_ids`` padding blocks are ``-1`` and
+``sorted_token_ids`` padding slots are ``(topk << 24) | M``. The stage kernels
+self-skip padding on-device (expert ``-1`` early-exits; token field ``>= M`` is
 masked), so the launcher sizes its grid from the deterministic worst-case shape
 with no host readback.
 
-Implemented in Triton Gluon (`@gluon.jit`) to match the AMD-kernel convention
+Implemented in Triton Gluon (``@gluon.jit``) to match the AMD-kernel convention
 for this package and to leave room for manual layout/scheduling optimization
 later. The algorithm is a four-stage block-aligned sort: a per-program expert
 histogram, a column prefix sum, block-padded per-expert offsets, and a
 race-free scatter -- scalar/scan control code with no MFMA. The vectorized
-prefix sums use `gl.associative_scan`; the histogram and scatter use scalar
+prefix sums use ``gl.associative_scan``; the histogram and scatter use scalar
 dynamic-index loops.
 
 Output contract::
@@ -50,7 +50,7 @@ Output contract::
     sorted_weights        (max_num_tokens_padded,) float32; padding = 0.0
     sorted_expert_ids     (max_num_m_blocks,)       int32; padding block = -1
     num_valid_ids         (2,) int32; [0] = total padded slots, [1] = M
-    out                   (M, model_dim) uninitialized `out_dtype` buffer
+    out                   (M, model_dim) uninitialized ``out_dtype`` buffer
                           (stage2 overwrites/zeros it; see wrapper note)
 """
 
@@ -60,7 +60,7 @@ import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 
 # Warp count for the vectorized (prefix-sum) stages. Must match the hardcoded
-# `warps_per_cta` (the `4` in `gl.BlockedLayout([1], [64], [4], [0])`)
+# ``warps_per_cta`` (the ``4`` in ``gl.BlockedLayout([1], [64], [4], [0])``)
 # inside stage2/stage3 -- Gluon kernels cannot read plain Python globals, so the
 # layout literal and this launch constant are kept in sync by hand.
 _SCAN_NUM_WARPS = 4
@@ -81,9 +81,9 @@ def _moe_sorting_stage1_kernel(
 ):
     """Per-program expert histogram.
 
-    Program `pid` counts the experts appearing in flat token slice
-    `[pid * tokens_per_thread, (pid + 1) * tokens_per_thread)` and writes them
-    to row `pid + 1` of `tokens_cnts` (row 0 is reserved as the zero base
+    Program ``pid`` counts the experts appearing in flat token slice
+    ``[pid * tokens_per_thread, (pid + 1) * tokens_per_thread)`` and writes them
+    to row ``pid + 1`` of ``tokens_cnts`` (row 0 is reserved as the zero base
     for the stage-2 column scan). Scalar uniform loads/stores -- no tile math.
     """
     pid = gl.program_id(0)
@@ -106,10 +106,10 @@ def _moe_sorting_stage2_kernel(
 ):
     """Column-wise inclusive prefix sum over programs (vectorized).
 
-    Program `pid` owns expert column `pid` and turns per-program counts into
+    Program ``pid`` owns expert column ``pid`` and turns per-program counts into
     the running start offset of each program's tokens *within* that expert:
-    after this pass `tokens_cnts[p][pid]` == number of expert-`pid` tokens
-    contributed by programs `0..p-1`. Row 0 stays the zero base.
+    after this pass ``tokens_cnts[p][pid]`` == number of expert-``pid`` tokens
+    contributed by programs ``0..p-1``. Row 0 stays the zero base.
     """
     pid = gl.program_id(0)
     layout: gl.constexpr = gl.BlockedLayout([1], [64], [4], [0])
@@ -133,11 +133,11 @@ def _moe_sorting_stage3_kernel(
 ):
     """Block-aligned per-expert slot offsets (single program, vectorized).
 
-    `cumsum[e + 1]` becomes the first sorted slot owned by expert `e + 1`
-    (`cumsum[0] == 0`); each expert's token run is padded up to a multiple of
-    `block_size` so the next expert starts on a block boundary.
-    `num_valid_ids[0]` is the total padded extent; `num_valid_ids[1]`
-    carries `M` (the token count) in the second slot.
+    ``cumsum[e + 1]`` becomes the first sorted slot owned by expert ``e + 1``
+    (``cumsum[0] == 0``); each expert's token run is padded up to a multiple of
+    ``block_size`` so the next expert starts on a block boundary.
+    ``num_valid_ids[0]`` is the total padded extent; ``num_valid_ids[1]``
+    carries ``M`` (the token count) in the second slot.
     """
     layout: gl.constexpr = gl.BlockedLayout([1], [64], [4], [0])
     e = gl.arange(0, E_PAD, layout=layout)
@@ -166,16 +166,16 @@ def _moe_sorting_stage4_kernel(
     tokens_per_thread: gl.constexpr,
     TOPK: gl.constexpr,
 ):
-    """Fill `expert_ids` block map and scatter routed rows + weights.
+    """Fill ``expert_ids`` block map and scatter routed rows + weights.
 
-    Program `pid` writes `expert_ids` for expert `pid`'s block range and
+    Program ``pid`` writes ``expert_ids`` for expert ``pid``'s block range and
     scatters the routed rows in its own token slice. Because each program owns a
     disjoint token slice *and* a disjoint sub-range of every expert's slots
     (via the stage-2 offsets), the scatter is race-free with no atomics.
     """
     pid = gl.program_id(0)
 
-    # Block map: mark every block owned by expert `pid`.
+    # Block map: mark every block owned by expert ``pid``.
     start_slot = gl.load(cumsum_ptr + pid)
     end_slot = gl.load(cumsum_ptr + pid + 1)
     for slot in range(start_slot, end_slot, block_size):
@@ -215,17 +215,17 @@ def gluon_moe_sorting(
     contract).
 
     Args:
-        topk_ids: `(M, TOPK)` int32 expert assignments. `-1` entries are
+        topk_ids: ``(M, TOPK)`` int32 expert assignments. ``-1`` entries are
             treated as unrouted and skipped.
-        topk_weights: `(M, TOPK)` float32 routing weights, same layout.
-        num_experts: total number of experts `E`.
-        model_dim: hidden dim of the `out` buffer.
-        out_dtype: dtype of the `out` buffer (bf16 in production).
-        block_size: per-expert padding granularity `B` (the stage BLOCK_M).
+        topk_weights: ``(M, TOPK)`` float32 routing weights, same layout.
+        num_experts: total number of experts ``E``.
+        model_dim: hidden dim of the ``out`` buffer.
+        out_dtype: dtype of the ``out`` buffer (bf16 in production).
+        block_size: per-expert padding granularity ``B`` (the stage BLOCK_M).
 
     Returns:
-        `(sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, out)`
-        with shapes/semantics matching `moe_sorting(..., accumulate=True)`.
+        ``(sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, out)``
+        with shapes/semantics matching ``moe_sorting(..., accumulate=True)``.
     """
     assert topk_ids.dim() == 2, "topk_ids must be (M, TOPK)"
     assert topk_weights.shape == topk_ids.shape, "topk_weights must match topk_ids"
@@ -257,8 +257,8 @@ def gluon_moe_sorting(
         (max_num_m_blocks,), -1, dtype=torch.int32, device=device
     )
     num_valid_ids = torch.empty((2,), dtype=torch.int32, device=device)
-    # `out` does not need zeroing: stage2's reduce epilogue overwrites every
-    # token row, and its small-M atomic epilogue zeroes `out` itself. Zeroing
+    # ``out`` does not need zeroing: stage2's reduce epilogue overwrites every
+    # token row, and its small-M atomic epilogue zeroes ``out`` itself. Zeroing
     # here would redundantly clear up to tens of MB at large M.
     out = torch.empty((M, model_dim), dtype=out_dtype, device=device)
 

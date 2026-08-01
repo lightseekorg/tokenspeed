@@ -20,8 +20,8 @@
 
 """Dense16 Gluon GEMM kernels for gfx950.
 
-The public entry point computes `A @ B.T` for supported 16-bit floating-point
-dense inputs and returns `None` when the generic caller should use its torch
+The public entry point computes ``A @ B.T`` for supported 16-bit floating-point
+dense inputs and returns ``None`` when the generic caller should use its torch
 fallback.
 """
 
@@ -1171,10 +1171,10 @@ def gluon_mm_a16w16_warp_reduce_smallm_gfx950(
     alpha: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Compute small-M dense `A @ B.T` with one warp per output.
+    """Compute small-M dense ``A @ B.T`` with one warp per output.
 
-    Intended for very small decode tiles: `M` in `{1, 2}` with `K <= 2048`
-    or `M == 4` with `K <= 1024`.
+    Intended for very small decode tiles: ``M`` in ``{1, 2}`` with ``K <= 2048``
+    or ``M == 4`` with ``K <= 1024``.
     """
     if A.ndim != 2 or B.ndim != 2:
         raise ValueError(
@@ -1242,13 +1242,13 @@ def gluon_mm_a16w16_mfma_lds_smallm_gfx950(
     alpha: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Compute high-K small-M dense `A @ B.T` with MFMA and partial-sum reduction.
+    """Compute high-K small-M dense ``A @ B.T`` with MFMA and partial-sum reduction.
 
-    Intended for `M` in `{1, 2, 4}`, large `K`, and `N` aligned to the
+    Intended for ``M`` in ``{1, 2, 4}``, large ``K``, and ``N`` aligned to the
     split-K MFMA/LDS tile.
 
     This decode path maps the wide N dimension onto the MFMA rows, streams the
-    `[N, K]` weight tile through double-buffered LDS async copies, splits K
+    ``[N, K]`` weight tile through double-buffered LDS async copies, splits K
     into eight partial tiles, and sums those partial results in a second Gluon kernel.
     """
     if A.ndim != 2 or B.ndim != 2:
@@ -1358,7 +1358,7 @@ def gluon_mm_a16w16_mfma_lds_mediumm_gfx950(
     alpha: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Compute tuned medium-M dense `A @ B.T` with MFMA/LDS tiling.
+    """Compute tuned medium-M dense ``A @ B.T`` with MFMA/LDS tiling.
 
     Intended for selected dense16 decode/prefill tiles where the Gluon route is
     competitive with torch.mm, including K3's middle-M latent projections.
@@ -1440,21 +1440,21 @@ def gluon_mm_a16w16_gfx950(
     alpha: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
-    """Compute dense16 GEMM `A @ B.T` on gfx950 when supported.
+    """Compute dense16 GEMM ``A @ B.T`` on gfx950 when supported.
 
     Dispatches among warp-reduce small-M, tuned medium-M, and large-M paths.
-    Returns `None` for unsupported or disabled dense16 shapes so the generic
+    Returns ``None`` for unsupported or disabled dense16 shapes so the generic
     GEMM caller can use its torch fallback.
 
     Args:
-        A: Activation matrix with shape `[M, K]`.
-        B: Weight matrix with shape `[N, K]`.
+        A: Activation matrix with shape ``[M, K]``.
+        B: Weight matrix with shape ``[N, K]``.
         out_dtype: Output dtype, either fp16 or bf16.
         alpha: Optional post-GEMM scale.
 
     Returns:
-        Tensor with shape `[M, N]` when a Gluon path is selected; otherwise
-        `None`.
+        Tensor with shape ``[M, N]`` when a Gluon path is selected; otherwise
+        ``None``.
     """
     if A.ndim != 2 or B.ndim != 2:
         return None

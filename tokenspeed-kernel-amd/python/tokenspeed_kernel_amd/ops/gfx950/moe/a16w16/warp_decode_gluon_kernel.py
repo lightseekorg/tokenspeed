@@ -22,8 +22,8 @@
 
 At decode the activation is a vector, so both GEMMs are GEMVs and MFMA would
 waste 15/16 of its tile. Instead each warp owns a few output elements and its
-64 lanes stride the reduction dim, so `gl.sum(axis=1)` becomes a warp reduce.
-No sort (the expert is read straight from `topk_ids`), no MFMA, no LDS.
+64 lanes stride the reduction dim, so ``gl.sum(axis=1)`` becomes a warp reduce.
+No sort (the expert is read straight from ``topk_ids``), no MFMA, no LDS.
 
   Stage 1: gate/up GEMV + fused SwiGLU, one program per (routed slot, neuron block).
   Stage 2: down GEMV with the topk combine fused in, one program per (token, D block).
