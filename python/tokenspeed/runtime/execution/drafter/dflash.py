@@ -71,9 +71,7 @@ def _resolve_block_geometry(cfg, spec_num_tokens: int) -> tuple[int, int]:
 
     dflash_cfg = getattr(cfg, "dflash_config", {}) or {}
     ckpt_block_size = (
-        dflash_cfg.get("block_size")
-        if isinstance(dflash_cfg, dict)
-        else None
+        dflash_cfg.get("block_size") if isinstance(dflash_cfg, dict) else None
     )
     if ckpt_block_size is None:
         ckpt_block_size = getattr(cfg, "block_size", None)
@@ -288,8 +286,7 @@ class DFlash(BaseDrafter):
         out: torch.Tensor | None = None,
         bias_fn: "Callable[[int, int], torch.Tensor] | None" = None,
     ) -> torch.Tensor:
-        """Shared vocab-parallel greedy argmax primitive.
-        """
+        """Shared vocab-parallel greedy argmax primitive."""
         if not hasattr(self.lm_head, "weight") or not hasattr(
             self.lm_head, "shard_indices"
         ):
@@ -319,9 +316,9 @@ class DFlash(BaseDrafter):
         if num_org > 0:
             base_logits = torch.matmul(hidden_states, weight[:num_org].T)
             if bias_fn is not None:
-                base_logits = base_logits + bias_fn(
-                    org_vocab_start, num_org
-                ).to(base_logits.dtype)
+                base_logits = base_logits + bias_fn(org_vocab_start, num_org).to(
+                    base_logits.dtype
+                )
             local_max, local_arg = torch.max(base_logits, dim=-1)
         else:
             local_max = torch.full(
@@ -340,9 +337,9 @@ class DFlash(BaseDrafter):
             added_weight = weight[added_start:added_end]
             added_logits = torch.matmul(hidden_states, added_weight.T)
             if bias_fn is not None:
-                added_logits = added_logits + bias_fn(
-                    added_vocab_start, num_added
-                ).to(added_logits.dtype)
+                added_logits = added_logits + bias_fn(added_vocab_start, num_added).to(
+                    added_logits.dtype
+                )
             added_max, added_arg = torch.max(added_logits, dim=-1)
             use_added = added_max > local_max
             local_max = torch.where(use_added, added_max, local_max)
