@@ -553,7 +553,8 @@ def group_specs_from_layer_types(
         sliding_window_tokens: One window for all sliding layers (today's HF
             scalar), or a per-layer sequence (multi-window models; full-layer
             positions must be None).
-        page_size: Tokens per page (the scheduler's base block size).
+        page_size: Pool page size. Flat treats this as the shared scheduler
+            domain; radix retains its legacy GCD resolution.
         page_sizes: Per-group page sizes keyed by group id (heterogeneous
             block sizes); values must be positive multiples of page_size.
             Groups not listed use page_size.
@@ -613,7 +614,8 @@ def group_specs_from_layer_types(
                 entry_stride_tokens=1,
                 sliding_window_tokens=window,
                 family=family,
-                # Always explicit: unset groups inherit the C++ gcd base, which a finer extra group silently lowers.
+                # Always explicit so this group's geometry does not silently
+                # inherit a value changed by another group.
                 block_size=ps,
                 cache_blocks_per_lcm_block=group_packing,
             )
@@ -685,7 +687,8 @@ def publish_paged_cache_groups(
     for spec in extra_groups:
         if any(sp.group_id == spec.group_id for sp in specs):
             raise ValueError(f"extra_groups: duplicate group id {spec.group_id!r}")
-        # Smaller extra-group blocks lower the gcd base by design; MakeCoordinator asserts divisibility.
+        # Flat derives a GCD hash grain and validates domain divisibility;
+        # radix retains its legacy group handling.
         if spec.block_size is not None and spec.block_size <= 0:
             raise ValueError(f"extra_groups[{spec.group_id!r}]: block_size must be > 0")
         if spec.cache_blocks_per_lcm_block <= 0:

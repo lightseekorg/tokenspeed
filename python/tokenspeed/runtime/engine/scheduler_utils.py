@@ -29,6 +29,7 @@ from typing import Any
 import numpy as np
 import torch
 from tokenspeed_scheduler import (
+    FLAT_KVCACHE,
     Cache,
     ExecutionEvent,
     ForwardEvent,
@@ -137,12 +138,32 @@ def scheduler_cache_geometry_from_pool(
 
 
 def resolve_scheduler_block_size(page_size: int, paged_cache_groups) -> int:
-    """Scheduler block_size = hash-grain BASE: gcd of group block sizes, not the KV page geometry."""
+    """Resolve the scheduler's request/FSM block domain.
+
+    Radix keeps its legacy GCD block size.  Flat uses the pool's page domain;
+    the C++ coordinator derives a separate GCD hash grain from the group specs.
+    """
+    require_positive_int("page_size", page_size)
     base = page_size
     for group in paged_cache_groups or ():
         gb = int(getattr(group, "block_size", 0) or 0) or page_size
+        require_positive_int(f"paged cache group {group.group_id!r} block_size", gb)
         base = math.gcd(base, gb)
-    return base
+        if FLAT_KVCACHE:
+            if page_size % gb:
+                raise ValueError(
+                    f"paged cache group {group.group_id!r} block_size {gb} "
+                    f"must divide Flat scheduler domain {page_size}"
+                )
+            packing = int(group.cache_blocks_per_lcm_block)
+            expected_packing = page_size // gb
+            if packing != expected_packing:
+                raise ValueError(
+                    f"paged cache group {group.group_id!r} packing {packing} "
+                    f"does not cover Flat scheduler domain {page_size}; "
+                    f"expected {expected_packing}"
+                )
+    return page_size if FLAT_KVCACHE else base
 
 
 def aligned_max_scheduled_tokens(

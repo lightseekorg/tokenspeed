@@ -7,6 +7,7 @@ from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import tokenspeed_scheduler as scheduler_ext
 import torch
 
 # CI Registration (parsed via AST, runtime no-op)
@@ -17,6 +18,11 @@ register_cuda_ci(est_time=20, suite="runtime-1gpu")
 
 from tokenspeed.runtime.configs.deepseek_v4_cache_spec import build_v4_cache_specs
 from tokenspeed.runtime.configs.paged_cache_spec import validate_flat_scheduler_config
+from tokenspeed.runtime.engine.scheduler_utils import (
+    make_config,
+    pool_to_paged_cache_groups,
+    resolve_scheduler_block_size,
+)
 from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends import deepseek_v4 as v4_backend
@@ -111,6 +117,99 @@ def _page_counts(specs, count: int = 4096):
 
 
 class DeepseekV4FlatGroupUnitTest(unittest.TestCase):
+    def test_scheduler_block_size_matches_extension_contract(self):
+        groups = pool_to_paged_cache_groups(
+            SimpleNamespace(
+                paged_cache_group_specs=_target_specs(),
+                paged_cache_group_page_counts=_page_counts(_target_specs()),
+            )
+        )
+        self.assertEqual(
+            resolve_scheduler_block_size(256, groups),
+            256 if scheduler_ext.FLAT_KVCACHE else 4,
+        )
+
+    @unittest.skipUnless(
+        scheduler_ext.FLAT_KVCACHE,
+        "requires a Flat KV scheduler extension",
+    )
+    def test_flat_scheduler_domain_rejects_invalid_group_geometry(self):
+        specs = _target_specs()
+        pool = SimpleNamespace(
+            paged_cache_group_specs=specs,
+            paged_cache_group_page_counts=_page_counts(specs),
+        )
+
+        groups = pool_to_paged_cache_groups(pool)
+        groups[0].block_size = 63
+        with self.assertRaisesRegex(ValueError, "must divide Flat scheduler domain"):
+            resolve_scheduler_block_size(256, groups)
+
+        groups = pool_to_paged_cache_groups(pool)
+        groups[0].cache_blocks_per_lcm_block = 3
+        with self.assertRaisesRegex(ValueError, "does not cover Flat scheduler domain"):
+            resolve_scheduler_block_size(256, groups)
+
+    @unittest.skipUnless(
+        scheduler_ext.FLAT_KVCACHE,
+        "requires a Flat KV scheduler extension",
+    )
+    def test_production_group_pipeline_constructs_scheduler(self):
+        specs = _target_specs()
+        usable_domain_pages = 64
+        pool = SimpleNamespace(
+            paged_cache_group_specs=specs,
+            paged_cache_group_page_counts={
+                spec.group_id: (
+                    usable_domain_pages * spec.cache_blocks_per_lcm_block + 1
+                )
+                for spec in specs
+            },
+        )
+        groups = pool_to_paged_cache_groups(pool)
+        cfg = make_config(
+            num_device_pages=usable_domain_pages + 1,
+            max_scheduled_tokens=512,
+            max_batch_size=4,
+            page_size=256,
+            num_host_pages=0,
+            disable_l2_cache=True,
+            enable_l3_storage=False,
+            prefetch_threshold=4,
+            role="null",
+            disable_prefix_cache=True,
+            paged_cache_groups=groups,
+        )
+
+        self.assertEqual(cfg.block_size, 256)
+        self.assertEqual(
+            tuple(group.block_size for group in cfg.paged_cache_groups),
+            (64, 4, 256, 8, 256, 4),
+        )
+        scheduler = scheduler_ext.Scheduler(cfg)
+        request = scheduler_ext.RequestSpec()
+        request.request_id = "v4-production-pipeline"
+        request.tokens = list(range(143))
+        scheduler.submit_requests([request])
+        op = next(
+            operation
+            for operation in scheduler.next_execution_plan().forward
+            if dict(operation.flat_block_tables)
+        )
+        tables = dict(op.flat_block_tables)
+        self.assertEqual(set(tables), {spec.group_id for spec in specs})
+        self.assertEqual(
+            {group_id: len(rows[0]) for group_id, rows in tables.items()},
+            {
+                "v4.swa_kv": 3,
+                "v4.c4a.compressor_state": 36,
+                "v4.c4a.compressed_kv": 1,
+                "v4.c128a.compressor_state": 18,
+                "v4.c128a.compressed_kv": 1,
+                "v4.c4a.indexer_compressor_state": 36,
+            },
+        )
+
     def test_cache_spec_identity_and_order_are_deterministic(self):
         first = _target_specs()
         second = _target_specs()
