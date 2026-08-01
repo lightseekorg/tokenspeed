@@ -8,6 +8,8 @@ DECODE_GPUS=${DECODE_GPUS:-2,3}
 PREFILL_PORT=${PREFILL_PORT:-12346}
 PREFILL_BOOTSTRAP_PORT=${PREFILL_BOOTSTRAP_PORT:-8998}
 DECODE_PORT=${DECODE_PORT:-12347}
+PREFILL_DIST_INIT_ADDR=${PREFILL_DIST_INIT_ADDR:-127.0.0.1:12579}
+DECODE_DIST_INIT_ADDR=${DECODE_DIST_INIT_ADDR:-127.0.0.1:13580}
 LB_HOST=${LB_HOST:-0.0.0.0}
 LB_PORT=${LB_PORT:-12345}
 PROMETHEUS_PORT=${PROMETHEUS_PORT:-18422}
@@ -75,7 +77,7 @@ PYSNAPSHOT
 
 MODEL_PATH=${MODEL_PATH:-$(resolve_model_snapshot)}
 echo "[pd-1p1d] model=$MODEL served_model_name=$SERVED_MODEL_NAME model_path=$MODEL_PATH"
-echo "[pd-1p1d] prefill=${PREFILL_GPUS}/${PREFILL_PORT}/${PREFILL_BOOTSTRAP_PORT} decode=${DECODE_GPUS}/${DECODE_PORT} lb=${LB_HOST}:${LB_PORT}"
+echo "[pd-1p1d] prefill=${PREFILL_GPUS}/${PREFILL_PORT}/${PREFILL_BOOTSTRAP_PORT}/${PREFILL_DIST_INIT_ADDR} decode=${DECODE_GPUS}/${DECODE_PORT}/${DECODE_DIST_INIT_ADDR} lb=${LB_HOST}:${LB_PORT}"
 echo "[pd-1p1d] world_size=$WORLD_SIZE enable_mtp=$ENABLE_MTP moe_backend=$MOE_BACKEND attention_backend=$ATTENTION_BACKEND"
 
 pids=()
@@ -149,6 +151,7 @@ start_worker() {
   local gpus=$2
   local port=$3
   local bootstrap_port=$4
+  local dist_init_addr=$5
   local log="$LOG_DIR/${role}.log"
   echo "[pd-1p1d] starting ${role}: gpus=$gpus port=$port bootstrap=$bootstrap_port log=$log"
   (
@@ -156,14 +159,17 @@ start_worker() {
     exec python3 test/ci_system/pd_http_worker.py \
       "${COMMON_ARGS[@]}" \
       --port "$port" \
+      --dist-init-addr "$dist_init_addr" \
       --disaggregation-bootstrap-port "$bootstrap_port" \
       --disaggregation-mode "$role"
   ) >"$log" 2>&1 &
   pids+=("$!")
 }
 
-start_worker prefill "$PREFILL_GPUS" "$PREFILL_PORT" "$PREFILL_BOOTSTRAP_PORT"
-start_worker decode "$DECODE_GPUS" "$DECODE_PORT" "$PREFILL_BOOTSTRAP_PORT"
+# Each engine reserves a small control-plane port cluster around its
+# rendezvous address. Keep the P/D clusters disjoint while loading in parallel.
+start_worker prefill "$PREFILL_GPUS" "$PREFILL_PORT" "$PREFILL_BOOTSTRAP_PORT" "$PREFILL_DIST_INIT_ADDR"
+start_worker decode "$DECODE_GPUS" "$DECODE_PORT" "$PREFILL_BOOTSTRAP_PORT" "$DECODE_DIST_INIT_ADDR"
 
 wait_http prefill "http://127.0.0.1:${PREFILL_PORT}/v1/models" 2400
 wait_http decode "http://127.0.0.1:${DECODE_PORT}/v1/models" 2400
