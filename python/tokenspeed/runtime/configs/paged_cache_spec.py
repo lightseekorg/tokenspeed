@@ -83,19 +83,15 @@ def flat_host_tier_unsupported_reason(
 ) -> str | None:
     """Why the flat host tier (kvstore L2) cannot mirror these pools, or None.
 
-    ``FlatHostMirror`` mirrors exactly the tensor families a pool declares in
-    ``host_mirror_families()``, so a pool that declares none cannot be
-    mirrored -- it has no KV buffers to describe (DeepSeek-V4) or a side
-    cache a partial mirror would silently skip (MSA). A speculative draft
-    pool shares the target's page ids, so it must be mirrorable too: mirroring
-    only the target would load back pages whose draft KV belongs to another
-    request. Contract pools (Kimi-K3) return None -- they have their own guard
-    with a more specific message.
+    The mirror covers exactly the families a pool declares, so a pool that
+    declares none cannot be mirrored -- no KV buffers to describe
+    (DeepSeek-V4), or a side cache a partial mirror would skip (MSA). A draft
+    pool shares the target's page ids, so it must be mirrorable too. Contract
+    pools (Kimi-K3) return None; they have their own, more specific guard.
 
     Args:
         kv_pool: The device KV pool the flat host tier would mirror.
-        draft_kv_pool: The speculative draft KV pool riding the same pages,
-            or None when speculative decoding is off.
+        draft_kv_pool: The draft KV pool riding the same pages, or None.
 
     Returns:
         A reason string when the host tier is impossible, else None.

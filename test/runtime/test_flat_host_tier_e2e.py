@@ -55,10 +55,14 @@ _TARGET_POOL_FILL = 1.44
 _NUM_PROMPTS_MIN = 8
 _NUM_PROMPTS_MAX = 120
 
-# Host budget: the working set is K * ~2074 tokens * ~24 KiB/token (~51 MB
-# per prompt at K<=120 -> <= ~6.2 GB); 8 GB holds it with margin while the
-# ~1.44x-oversubscribed device pool cannot.
-_KVSTORE_SIZE_GB = 8
+# Host budget must scale with the measured device pool, like K does: the host
+# absorbs ~1.44x the pool's PAGES, and pages are per cache group, so gpt-oss's
+# two groups double the demand (_APPROX_ALLOC_TOKENS = 2 * prompt). A fixed
+# byte budget budgets from prompt tokens and undercounts by that 2x -- on a
+# 189 GB card K lands at 83 and 8 GB covers only 0.95x, so the host tier
+# thrashes to 0.000 round-2 hits, which reads like "loadback is broken".
+_KVSTORE_RATIO = 2.0
+_KVSTORE_SIZE_GB = 0
 
 _SAMPLING = {"max_new_tokens": 4, "temperature": 0}
 
@@ -104,7 +108,8 @@ def _make_engine(*, host_tier: bool) -> Engine:
         # under a flat ext + slab layout selects FlatMemoryExecutor (the
         # byte-blind slab-mirror host pool; spec 6 revision lifted the guard).
         disable_kvstore=not host_tier,
-        kvstore_size=_KVSTORE_SIZE_GB if host_tier else 0,
+        kvstore_size=_KVSTORE_SIZE_GB,
+        kvstore_ratio=_KVSTORE_RATIO,
         max_model_len=8192,
         max_num_seqs=2,
         # Small device budget: the profiled pool also depends on free GPU

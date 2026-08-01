@@ -73,14 +73,13 @@ class MSATokenToKVPool(MHATokenToKVPool):
             }
 
     def host_mirror_families(self) -> list[HostMirrorFamily]:
-        """No flat host tier (kvstore L2) for MSA, matching
+        """No flat host tier (kvstore L2), matching
         ``supports_hierarchical_kv_cache``.
 
-        Inheriting the base K/V families would mirror K/V only and load back
-        pages whose key-only sparse index side cache is stale. Declaring the
-        ``index_k_buffer`` layers as a third family would be the fix, but
-        that path is unvalidated, so downgrade L2 with a startup warning
-        instead of building a partial mirror.
+        The base K/V families would mirror K/V only and load back pages whose
+        key-only sparse index side cache is stale. Declaring ``index_k_buffer``
+        as a third family would fix that, but is unvalidated -- so downgrade
+        L2 rather than build a partial mirror.
 
         Returns:
             An empty list: nothing to mirror.

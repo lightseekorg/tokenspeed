@@ -94,18 +94,14 @@ class DSATokenToKVPool(MLATokenToKVPool):
     def host_mirror_families(self) -> list[HostMirrorFamily]:
         """MLA's latent family plus the packed index-K family.
 
-        Index-K is block-split WITHIN a page (``page_size * head_dim`` FP8
-        values, then ``page_size * num_groups`` FP32 scales -- see
-        :meth:`_index_k_block_views`), so a single token's bytes are NOT one
-        row. This declaration is byte-exact only because ``page_bytes ==
-        page_size * row_bytes`` makes page p's bytes exactly rows
-        ``[p*page_size, (p+1)*page_size)`` and the mirror copies whole pages
-        only; a sub-page mirror would have to go through the block-split
-        views instead.
+        Index-K is block-split WITHIN a page (see
+        :meth:`_index_k_block_views`), so a token's bytes are NOT one row.
+        This is byte-exact ONLY because ``page_bytes == page_size *
+        row_bytes`` makes page p exactly rows ``[p*ps, (p+1)*ps)`` and the
+        mirror copies whole pages; a sub-page mirror would need those views.
 
         Returns:
-            The latent family followed by the index-K family, so a layer
-            fences on its index-K page landing (the later copy).
+            Latent family then index-K, so a layer fences on index-K landing.
         """
         return super().host_mirror_families() + [
             HostMirrorFamily.per_layer(self.index_k_buffer, self.page_size)

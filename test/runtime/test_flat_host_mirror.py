@@ -76,55 +76,12 @@ class FlatHostMirrorTest(unittest.TestCase):
         with mock.patch(_PKG_FLAT_PROBE, return_value=flat_ext):
             return self.MHATokenToKVPool(**kwargs)
 
-    def _fill_device_pages(self, mirror, device_pages):
-        # Sentinels distinct per (tensor, page); bf16-exact small ints.
-        p = mirror.page_size
-        for tensor_idx, (dev, _) in enumerate(mirror.tensor_pairs):
-            for d in device_pages:
-                dev[d * p : (d + 1) * p].fill_(tensor_idx * 16 + d + 1)
-        self.torch.cuda.synchronize()
-
-    def _snapshot(self, mirror, device_pages):
-        p = mirror.page_size
-        return [
-            {d: dev[d * p : (d + 1) * p].cpu().clone() for d in device_pages}
-            for dev, _ in mirror.tensor_pairs
-        ]
-
-    def _roundtrip_assert(self, mirror, pairs):
-        torch = self.torch
-        p = mirror.page_size
-        device_pages = [d for d, _ in pairs]
-        self._fill_device_pages(mirror, device_pages)
-        before = self._snapshot(mirror, device_pages)
-
-        stream = torch.cuda.Stream()
-        mirror.store_pages(pairs, stream)
-        stream.synchronize()
-        for dev, _ in mirror.tensor_pairs:
-            for d in device_pages:
-                dev[d * p : (d + 1) * p].zero_()
-        torch.cuda.synchronize()
-        mirror.load_pages(pairs, stream)
-        stream.synchronize()
-
-        after = self._snapshot(mirror, device_pages)
-        for tensor_idx in range(len(mirror.tensor_pairs)):
-            for d in device_pages:
-                self.assertTrue(
-                    torch.equal(
-                        before[tensor_idx][d].view(torch.uint8),
-                        after[tensor_idx][d].view(torch.uint8),
-                    ),
-                    f"tensor {tensor_idx} device page {d} not byte-exact",
-                )
-
     def test_slab_roundtrip(self):
         pool = self._pool(flat_ext=True)
         mirror = self.FlatHostMirror(pool, num_host_pages=8)
         # 4 layers dedup to 2 K + 2 V slabs.
         self.assertEqual(len(mirror.tensor_pairs), 4)
-        self._roundtrip_assert(mirror, [(1, 5), (2, 6), (3, 7)])
+        assert_page_roundtrip(self, mirror, [(1, 5), (2, 6), (3, 7)])
         # 4 mirrors x page_size 4 x row 1*8 bf16 (16 B) = 256 B per page.
         self.assertEqual(mirror.bytes_per_host_page(), 4 * 4 * 16)
 
@@ -133,7 +90,7 @@ class FlatHostMirrorTest(unittest.TestCase):
         # group awareness (id-exclusivity keeps rows disjoint).
         pool = self._pool(flat_ext=True)
         mirror = self.FlatHostMirror(pool, num_host_pages=4)
-        self._roundtrip_assert(mirror, [(2, 0), (3, 1)])
+        assert_page_roundtrip(self, mirror, [(2, 0), (3, 1)])
 
     def test_legacy_roundtrip(self):
         # Legacy layout: all 4+4 per-layer mirrors carry data; copying
@@ -141,13 +98,12 @@ class FlatHostMirrorTest(unittest.TestCase):
         pool = self._pool(flat_ext=False)
         mirror = self.FlatHostMirror(pool, num_host_pages=8)
         self.assertEqual(len(mirror.tensor_pairs), 8)
-        self._roundtrip_assert(mirror, [(1, 3), (2, 4)])
+        assert_page_roundtrip(self, mirror, [(1, 3), (2, 4)])
 
     def test_events_and_layer_mapping(self):
         torch = self.torch
         pool = self._pool(flat_ext=True)
         mirror = self.FlatHostMirror(pool, num_host_pages=8)
-        self._fill_device_pages(mirror, [1])
 
         stream = torch.cuda.Stream()
         events = mirror.load_pages_with_events([(1, 5)], stream)
@@ -275,21 +231,6 @@ class FlatHostMirrorStateSlabTest(unittest.TestCase):
             pool_cls = self.LcmMHATokenToKVPool if with_state else self.MHATokenToKVPool
             return pool_cls(**kwargs)
 
-    def _fill_device_pages(self, mirror, device_pages):
-        # Sentinels distinct per (tensor, page); bf16-exact small ints.
-        for tensor_idx, ((dev, _), span) in enumerate(
-            zip(mirror.tensor_pairs, mirror.row_spans)
-        ):
-            for d in device_pages:
-                dev[d * span : (d + 1) * span].fill_(tensor_idx * 16 + d + 1)
-        self.torch.cuda.synchronize()
-
-    def _snapshot(self, mirror, device_pages):
-        return [
-            {d: dev[d * span : (d + 1) * span].cpu().clone() for d in device_pages}
-            for (dev, _), span in zip(mirror.tensor_pairs, mirror.row_spans)
-        ]
-
     def test_state_tensors_follow_kv_in_slab_order(self):
         pool = self._pool()
         mirror = self.FlatHostMirror(pool, num_host_pages=8)
@@ -325,36 +266,10 @@ class FlatHostMirrorStateSlabTest(unittest.TestCase):
         self.assertEqual(mirror.bytes_per_host_page(), with_state)
 
     def test_state_roundtrip(self):
-        torch = self.torch
-        pool = self._pool()
-        mirror = self.FlatHostMirror(pool, num_host_pages=8)
-        pairs = [(1, 5), (2, 6), (3, 7)]
-        device_pages = [d for d, _ in pairs]
-        self._fill_device_pages(mirror, device_pages)
-        before = self._snapshot(mirror, device_pages)
-
-        stream = torch.cuda.Stream()
-        mirror.store_pages(pairs, stream)
-        stream.synchronize()
-        for (dev, _), span in zip(mirror.tensor_pairs, mirror.row_spans):
-            for d in device_pages:
-                dev[d * span : (d + 1) * span].zero_()
-        torch.cuda.synchronize()
-        events = mirror.load_pages_with_events(pairs, stream)
-        self.assertEqual(len(events), len(mirror.tensor_pairs))
-        stream.synchronize()
-        self.assertTrue(all(event.query() for event in events))
-
-        after = self._snapshot(mirror, device_pages)
-        for tensor_idx in range(len(mirror.tensor_pairs)):
-            for d in device_pages:
-                self.assertTrue(
-                    torch.equal(
-                        before[tensor_idx][d].view(torch.uint8),
-                        after[tensor_idx][d].view(torch.uint8),
-                    ),
-                    f"tensor {tensor_idx} device page {d} not byte-exact",
-                )
+        # State slabs ride 1-row page spans while KV rides page_size rows;
+        # the shared helper is span-aware, so one call covers both.
+        mirror = self.FlatHostMirror(self._pool(), num_host_pages=8)
+        assert_page_roundtrip(self, mirror, [(1, 5), (2, 6), (3, 7)])
 
     def test_state_layers_fence_on_their_ssm_slab(self):
         pool = self._pool()
@@ -450,7 +365,10 @@ class FlatHostMirrorMLATest(unittest.TestCase):
     """MLA (K2.5) declares ONE fused-latent family: no independent V tensor,
     so a layer fences on its own latent mirror. The per-token-head quantized
     variant splits that entry into a (k_lora, k_scale, k_rope) triple, which
-    is the same family with three tensors per layer."""
+    is the same family with three tensors per layer.
+
+    Also covers the speculative draft pool, which is built from this same
+    pool constructor (a second MLA pool with fewer layers)."""
 
     LAYER_NUM = 3
 
@@ -509,10 +427,6 @@ class FlatHostMirrorMLATest(unittest.TestCase):
         self.assertEqual(mirror.bytes_per_host_page(), 3 * 4 * 48)
         self.assertEqual(self.flat_bytes_per_host_page(pool), 3 * 4 * 48)
 
-    def test_roundtrip_is_byte_exact(self):
-        mirror = self.FlatHostMirror(self._pool(), num_host_pages=8)
-        assert_page_roundtrip(self, mirror, [(1, 5), (2, 6), (3, 7)])
-
     def test_per_token_head_quantization_mirrors_the_triple(self):
         pool = self._pool(quant_method="per_token_head")
         mirror = self.FlatHostMirror(pool, num_host_pages=8)
@@ -527,64 +441,13 @@ class FlatHostMirrorMLATest(unittest.TestCase):
             )
         assert_page_roundtrip(self, mirror, [(1, 5), (2, 6)])
 
-
-class FlatHostMirrorDraftPoolTest(unittest.TestCase):
-    """Speculative decoding writes draft KV at the TARGET's slot ids, so the
-    draft pool rides the same host page and must be mirrored with it -- a
-    loadback that restored only the target would hand the drafter whichever
-    request last held that device page.
-
-    Draft families lead the list so every draft copy precedes every target
-    copy on the serial load stream, leaving the target's per-layer fences
-    (which the drafter waits behind) unchanged."""
-
-    LAYER_NUM = 3
+    # Draft pool: the drafter writes at the TARGET's slot ids, so both pools
+    # ride one host page. Draft families lead, keeping the target's fences.
     DRAFT_LAYER_NUM = 1
 
-    def setUp(self):
-        try:
-            import torch
-
-            from tokenspeed.runtime.cache.flat_host_mirror import (
-                FlatHostMirror,
-                flat_bytes_per_host_page,
-            )
-            from tokenspeed.runtime.layers.attention.kv_cache.mla import (
-                MLATokenToKVPool,
-            )
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
-        if not torch.cuda.is_available():
-            self.skipTest("needs a CUDA device")
-        self.torch = torch
-        self.FlatHostMirror = FlatHostMirror
-        self.flat_bytes_per_host_page = flat_bytes_per_host_page
-        self.MLATokenToKVPool = MLATokenToKVPool
-
-    def _pool(self, layer_num, **overrides):
-        kwargs = dict(
-            size=32,
-            dtype=self.torch.bfloat16,
-            model_dtype=self.torch.bfloat16,
-            quant_method="",
-            kv_lora_rank=16,
-            qk_rope_head_dim=8,
-            layer_num=layer_num,
-            device="cuda",
-            enable_memory_saver=False,
-            max_batch_size=2,
-            max_context_len=64,
-            page_size=4,
-            rank=0,
-            enable_alt_stream=False,
-        )
-        kwargs.update(overrides)
-        with mock.patch(_PKG_FLAT_PROBE, return_value=True):
-            return self.MLATokenToKVPool(**kwargs)
-
     def test_draft_tensors_lead_the_target_and_keep_its_fences(self):
-        target = self._pool(self.LAYER_NUM)
-        draft = self._pool(self.DRAFT_LAYER_NUM)
+        target = self._pool()
+        draft = self._pool(layer_num=self.DRAFT_LAYER_NUM)
         mirror = self.FlatHostMirror(target, num_host_pages=8, draft_kv_pool=draft)
         self.assertEqual(
             len(mirror.tensor_pairs), self.LAYER_NUM + self.DRAFT_LAYER_NUM
@@ -596,37 +459,25 @@ class FlatHostMirrorDraftPoolTest(unittest.TestCase):
                 mirror.tensor_pairs[self.DRAFT_LAYER_NUM + layer_id][0],
                 target.kv_buffer[layer_id],
             )
-        # The layer count stays the TARGET's, and each layer still fences on
-        # its own target mirror -- the draft copies precede them all.
+        # Layer count stays the TARGET's, and every layer still fences on its
+        # own target mirror -- the draft copies precede them all.
         self.assertEqual(mirror.layer_num, self.LAYER_NUM)
         for layer_id in range(self.LAYER_NUM):
             self.assertEqual(
                 mirror.fence_tensor_index_of_layer(layer_id),
                 self.DRAFT_LAYER_NUM + layer_id,
             )
-
-    def test_bytes_per_host_page_includes_the_draft_pool(self):
-        target = self._pool(self.LAYER_NUM)
-        draft = self._pool(self.DRAFT_LAYER_NUM)
-        # (3 target + 1 draft) mirrors x page_size 4 x 48 B rows.
+        # Sizing counts the draft pool too (byte-exact roundtrip with a draft
+        # pool is covered end-to-end in test_flat_host_executor).
         both = self.flat_bytes_per_host_page(target, draft)
         self.assertEqual(both, (self.LAYER_NUM + self.DRAFT_LAYER_NUM) * 4 * 48)
-        self.assertEqual(both, self.flat_bytes_per_host_page(target) + 1 * 4 * 48)
-        mirror = self.FlatHostMirror(target, num_host_pages=2, draft_kv_pool=draft)
+        self.assertEqual(both, self.flat_bytes_per_host_page(target) + 4 * 48)
         self.assertEqual(mirror.bytes_per_host_page(), both)
-
-    def test_draft_pages_roundtrip_byte_exact(self):
-        mirror = self.FlatHostMirror(
-            self._pool(self.LAYER_NUM),
-            num_host_pages=8,
-            draft_kv_pool=self._pool(self.DRAFT_LAYER_NUM),
-        )
-        assert_page_roundtrip(self, mirror, [(1, 5), (2, 6), (3, 7)])
 
     def test_unmirrorable_or_mismatched_draft_pool_is_refused(self):
         import types
 
-        target = self._pool(self.LAYER_NUM)
+        target = self._pool()
         # A draft pool the mirror cannot describe must fail loud rather than
         # leave draft KV silently unmirrored.
         blind = types.SimpleNamespace(
@@ -639,14 +490,14 @@ class FlatHostMirrorDraftPoolTest(unittest.TestCase):
             self.FlatHostMirror(
                 target,
                 num_host_pages=2,
-                draft_kv_pool=self._pool(self.DRAFT_LAYER_NUM, page_size=8),
+                draft_kv_pool=self._pool(layer_num=self.DRAFT_LAYER_NUM, page_size=8),
             )
         # A draft pool deeper than the target breaks the layer padding.
         with self.assertRaisesRegex(ValueError, r"more layers than the target"):
             self.FlatHostMirror(
                 target,
                 num_host_pages=2,
-                draft_kv_pool=self._pool(self.LAYER_NUM + 1),
+                draft_kv_pool=self._pool(layer_num=self.LAYER_NUM + 1),
             )
 
 

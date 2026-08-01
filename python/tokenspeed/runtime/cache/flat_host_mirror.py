@@ -32,21 +32,17 @@ import torch
 
 @dataclass(frozen=True)
 class HostMirrorFamily:
-    """One mirrorable family of device tensors, described per layer.
+    """One mirrorable family of device tensors, declared per layer.
 
-    A pool declares its families through ``host_mirror_families()``; the
-    mirror stays byte-blind, so a pool only has to say WHICH tensors carry a
+    The mirror stays byte-blind: a pool only says WHICH tensors carry a
     layer's page bytes and how many rows a page spans on them.
 
     Attributes:
-        layer_tensors: For each layer, the family's tensors holding that
-            layer's page bytes, in mirror order -- ``()`` for layers the
-            family does not cover (flat GDN state layers carry no KV).
-            Tensors repeated across layers (slab layouts alias one tensor
-            across paired layers) are mirrored once.
-        rows_per_page: Rows one page spans on every tensor of the family:
-            ``page_size`` for token-indexed buffers, 1 for page-indexed
-            snapshots (state slabs).
+        layer_tensors: Per layer, the family's tensors in mirror order;
+            ``()`` for layers it does not cover (GDN state layers carry no
+            KV). Tensors aliased across layers are mirrored once.
+        rows_per_page: ``page_size`` for token-indexed buffers, 1 for
+            page-indexed snapshots (state slabs).
     """
 
     layer_tensors: tuple[tuple[torch.Tensor, ...], ...]
@@ -56,15 +52,7 @@ class HostMirrorFamily:
     def per_layer(
         cls, buffers: Sequence[torch.Tensor | None], rows_per_page: int
     ) -> HostMirrorFamily:
-        """Family from one buffer (or None for an uncovered layer) per layer.
-
-        Args:
-            buffers: Per-layer tensors, ``None`` where the layer has none.
-            rows_per_page: Rows one page spans on each buffer.
-
-        Returns:
-            The equivalent :class:`HostMirrorFamily`.
-        """
+        """Family from one buffer (``None`` for an uncovered layer) per layer."""
         return cls(tuple(() if b is None else (b,) for b in buffers), rows_per_page)
 
 
@@ -73,25 +61,21 @@ def _flatten_families(
 ) -> tuple[list[torch.Tensor], list[int], list[int]]:
     """Flatten declared families into the mirrored tensor list.
 
-    Walks families in declaration order and, within a family, layers in
-    order, keeping the first occurrence of each distinct tensor (slab
-    layouts alias one tensor across paired layers; legacy layouts keep all
-    per-layer buffers, whose dead-row copies are harmless).
+    Walks families in declaration order, then layers, keeping the first
+    occurrence of each distinct tensor (slab layouts alias one across paired
+    layers).
 
     Args:
-        families: The pool's ``host_mirror_families()``; all must describe
-            the same layer count.
+        families: The pool's ``host_mirror_families()``, all of one layer count.
 
     Returns:
-        ``(tensors, row_spans, layer_fence)``: the distinct device tensors to
-        mirror, the rows one page spans on each, and per layer the index of
-        the LAST mirrored tensor holding that layer's bytes -- the copy whose
-        completion makes the layer readable (copies run in this order on one
-        serial stream, so that event covers the layer's earlier copies).
+        ``(tensors, row_spans, layer_fence)`` -- per layer, the fence is the
+        index of the LAST mirrored tensor holding its bytes. Copies run in
+        this order on one serial stream, so that event covers the earlier ones.
 
     Raises:
-        ValueError: No families, families of differing layer counts, or a
-            layer no family covers (it would have nothing to fence on).
+        ValueError: No families, differing layer counts, or a layer no family
+            covers (nothing to fence it on).
     """
     if not families:
         raise ValueError("flat host mirror: the pool declares no tensor families")
@@ -129,29 +113,24 @@ def combined_host_mirror_families(
 ) -> list[HostMirrorFamily]:
     """Families to mirror for a (target, draft) KV pool pair.
 
-    Speculative decoding gives the drafter its own KV pool addressed by the
-    SAME slot ids as the target's -- the drafter writes at the target's
-    ``out_cache_loc`` and attends over the full sequence, so a prefix hit
-    reuses draft KV it never recomputed. One device page therefore carries
-    both pools' bytes, and a loadback restoring only the target would leave
-    the drafter reading whatever request last held that page (correct output
-    still, since the target verifies every draft token, but the acceptance
-    rate collapses). The radix ``KVPoolTransfer`` moves both pools for the
-    same reason.
+    The drafter writes at the target's ``out_cache_loc`` and attends over the
+    full sequence, so both pools share slot ids and one device page carries
+    both. Restoring only the target would hand the drafter another request's
+    KV -- output stays correct (the target verifies every draft token) but the
+    acceptance rate collapses. Radix's ``KVPoolTransfer`` moves both for this.
 
-    Draft families are placed FIRST so every draft copy precedes every target
-    copy on the serial load stream: the target's per-layer fences then cover
-    the draft copies as well, and since the drafter runs after the target
-    forward has waited on them, the draft pool needs no fence of its own
-    (the radix path relies on the same ordering via its per-layer interleave).
+    Draft families lead so every draft copy precedes every target copy on the
+    serial load stream: the target's per-layer fences then cover them, and the
+    drafter runs after the target forward has waited on those fences, so the
+    draft pool needs no fence of its own.
 
     Args:
         device_kv_pool: The target KV pool.
         draft_kv_pool: The speculative draft KV pool, or None.
 
     Returns:
-        Draft families (padded to the target's layer count) followed by the
-        target's, or ``[]`` when the target declares none.
+        Draft families (padded to the target's layer count) then the target's,
+        or ``[]`` when the target declares none.
 
     Raises:
         ValueError: The draft pool declares no families, disagrees on page

@@ -115,9 +115,7 @@ class FlatMemoryExecutor:
         self.page_size = int(device_pool.page_size)
 
         # The draft pool shares the target's slot ids, so its bytes ride the
-        # same host page (combined_host_mirror_families); mirroring only the
-        # target would load back pages whose draft KV belongs to whichever
-        # request last held the device page.
+        # same host page (see combined_host_mirror_families).
         bytes_per_host_page = flat_bytes_per_host_page(device_pool, draft_device_pool)
         num_host_pages = flat_num_host_pages(
             bytes_per_host_page=bytes_per_host_page,
@@ -154,11 +152,10 @@ class FlatMemoryExecutor:
         self.layer_num = self.mirror.layer_num
 
         # Layerwise loadback fencing: register the counter where the radix
-        # KVCachePool would, so pool.get_key_buffer/get_value_buffer gate on
-        # the same wait_until(layer_id) machinery. The draft pool needs no
-        # counter of its own (its layer ids index a different space): its
-        # copies lead every target copy on the serial load stream, so the
-        # target fences the drafter waits behind already cover them.
+        # KVCachePool would, so the pool getters gate on the same
+        # wait_until(layer_id). The draft pool needs none of its own -- its
+        # layer ids index a different space, and its copies lead every target
+        # copy, so the target fences the drafter waits behind cover them.
         self._counter = LayerDoneCounter(self.layer_num)
         device_pool.register_layer_transfer_counter(self._counter)
 
@@ -311,20 +308,16 @@ class FlatMemoryExecutor:
 
         events = self.mirror.load_pages_with_events(pairs, self.load_stream)
         # Layer fence: layer L is readable once the LAST mirror carrying its
-        # bytes has landed (V for the K/V layout, ssm for a state layer,
-        # index-K for DSA). The load stream is serial and copies run in
-        # tensor_pairs order, so that one event also covers L's earlier
-        # copies -- including every draft-pool copy, which leads the list.
-        # Paired slab layers share an event -- correct by design.
+        # bytes has landed. The load stream is serial and copies run in
+        # tensor_pairs order, so that event also covers L's earlier copies --
+        # including the draft-pool copies, which lead the list.
         for layer_id in range(self.layer_num):
             producer_event.load_events[layer_id] = events[
                 self.mirror.fence_tensor_index_of_layer(layer_id)
             ]
-        # finish_event (== load_events[-1]) is the producer-slot reuse fence
-        # in update_producer and must cover EVERY copy of the op, so pin the
-        # last layer to the op's last per-tensor event. A no-op whenever the
-        # last layer already fences on the last mirror (every layout without
-        # state slabs); with them it covers the trailing state copies.
+        # finish_event (== load_events[-1]) is the producer-slot reuse fence in
+        # update_producer and must cover EVERY copy, so pin the last layer to
+        # the op's last event. A no-op unless state slabs trail the KV tensors.
         producer_event.load_events[self.layer_num - 1] = events[-1]
         # events[-1] is also the reassigned finish_event, so the ack covers
         # every copy.

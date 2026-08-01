@@ -268,16 +268,15 @@ class MLATokenToKVPool(BaseTokenToKVPool):
             )
 
     def host_mirror_families(self) -> list[HostMirrorFamily]:
-        """Flat host tier (kvstore L2) description: one fused latent family.
+        """One fused-latent family: MLA has no independent V tensor.
 
-        MLA has no independent V tensor -- ``get_value_buffer`` slices the
-        same ``kv_buffer[i]`` -- so the base pool's (k, v) pair does not
-        apply; under ``per_token_head`` quantization that entry is instead
-        the ``(k_lora, k_scale, k_rope)`` triple. Both are just token-row
-        tensors whose page p occupies rows ``[p*page_size, (p+1)*page_size)``.
+        ``get_value_buffer`` slices the same ``kv_buffer[i]``, so the base
+        (k, v) pair does not apply; ``per_token_head`` quantization makes that
+        entry the ``(k_lora, k_scale, k_rope)`` triple instead. Both are
+        token-row tensors, page p spanning rows ``[p*ps, (p+1)*ps)``.
 
         Returns:
-            A single family covering every layer's latent tensor(s).
+            One family covering every layer's latent tensor(s).
         """
         return [
             HostMirrorFamily(

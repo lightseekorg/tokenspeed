@@ -124,17 +124,15 @@ class BaseTokenToKVPool:
     def host_mirror_families(self) -> list[HostMirrorFamily]:
         """Device tensor families the flat host tier (kvstore L2) mirrors.
 
-        ``FlatHostMirror`` copies whole pages byte-blind, so a pool only has
-        to declare which tensors carry a layer's page bytes; the mirror
-        deduplicates aliased slabs and fences a layer on the LAST family
-        listing it. The default describes the K/V pair plus GDN state slabs;
-        pools with another layout override (MLA's fused latent, DSA's packed
-        index-K).
+        The mirror copies whole pages byte-blind and fences a layer on the
+        LAST family listing it, so a pool only declares which tensors carry a
+        layer's page bytes. This default covers the K/V pair plus GDN state
+        slabs; other layouts override (MLA's latent, DSA's index-K).
 
         Returns:
-            Families in fence order, or an empty list when this pool cannot
-            be mirrored -- ``flat_host_tier_unsupported_reason`` then
-            downgrades L2 instead of building a partial mirror.
+            Families in fence order, or ``[]`` when this pool cannot be
+            mirrored -- ``flat_host_tier_unsupported_reason`` then downgrades
+            L2 rather than building a partial mirror.
         """
         k_buffer = getattr(self, "k_buffer", None)
         v_buffer = getattr(self, "v_buffer", None)
