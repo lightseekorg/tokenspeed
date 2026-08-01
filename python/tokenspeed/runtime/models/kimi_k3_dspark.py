@@ -134,10 +134,20 @@ class K3DSparkAttention(DeepseekV3AttentionMLA):
     def apply_latent_rope(
         self, positions: torch.Tensor, latent: torch.Tensor
     ) -> torch.Tensor:
-        """Rotate the k_PE tail of already-normalized latent rows in place."""
+        """Rotate the k_PE tail of already-normalized latent rows in place.
+
+        The rope tail is contiguous within each row, so the slice reshapes to a
+        *view* of ``latent`` and the rope kernel rotates it in place. Copy it
+        out first: writing the result back onto its own storage is a
+        self-assignment torch refuses.
+        """
         if self.rotary_emb is None or latent.size(0) == 0:
             return latent
-        k_pe = latent[..., self.kv_lora_rank :].reshape(-1, 1, self.qk_rope_head_dim)
+        k_pe = (
+            latent[..., self.kv_lora_rank :]
+            .reshape(-1, 1, self.qk_rope_head_dim)
+            .clone()
+        )
         dummy_q = k_pe.new_empty(k_pe.shape)
         _, k_pe_rot = self.rotary_emb(positions, dummy_q, k_pe)
         latent[..., self.kv_lora_rank :] = k_pe_rot.reshape(
