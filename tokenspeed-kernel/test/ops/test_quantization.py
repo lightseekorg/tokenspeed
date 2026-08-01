@@ -32,8 +32,6 @@ from tokenspeed_kernel import (
 from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
 from tokenspeed_kernel.platform import current_platform
 
-FP8_E4M3_FNUZ_MAX = 240.0
-
 
 def _bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
     return torch.equal(a.view(torch.uint8), b.view(torch.uint8))
@@ -242,39 +240,10 @@ def test_pure_cast_non_pow2_n(device: str, n: int) -> None:
     assert _bitwise_equal(out, ref)
 
 
-@pytest.mark.skipif(
-    not current_platform().is_cdna3,
-    reason="float8_e4m3fnuz (tl.float8e4b8) is only supported on AMD CDNA3",
-)
-def test_pure_cast_e4m3fnuz(device: str) -> None:
-    """CDNA3-specific fp8 dtype (bias=8). The Triton cast must saturate to
-    ``±240`` to match ``x.to(torch.float8_e4m3fnuz)``."""
-    torch.manual_seed(0)
-    x = torch.randn(2048, 512, device=device, dtype=torch.bfloat16) * 50
-    ref = x.to(torch.float8_e4m3fnuz)
-    out = fp8_quantize(x, fp8_dtype=torch.float8_e4m3fnuz)
-    torch.cuda.synchronize()
-    assert out.dtype == torch.float8_e4m3fnuz
-    assert _bitwise_equal(out, ref)
-
-
-@pytest.mark.skipif(
-    not current_platform().is_cdna3,
-    reason="float8_e4m3fnuz (tl.float8e4b8) is only supported on AMD CDNA3",
-)
-@pytest.mark.parametrize("scale", [2.0, 0.5, 7.5])
-def test_scaled_cast_e4m3fnuz_matches_reference(device: str, scale: float) -> None:
-    torch.manual_seed(0)
-    x = torch.randn(2048, 512, device=device, dtype=torch.bfloat16) * 100
-    inv_scale = 1.0 / scale
-    ref = (
-        (x.to(torch.float32) * inv_scale)
-        .clamp(-FP8_E4M3_FNUZ_MAX, FP8_E4M3_FNUZ_MAX)
-        .to(torch.float8_e4m3fnuz)
-    )
-    out = fp8_quantize(x, scale=scale, fp8_dtype=torch.float8_e4m3fnuz)
-    torch.cuda.synchronize()
-    assert _bitwise_equal(out, ref)
+def test_fp8_quantize_rejects_e4m3fnuz(device: str) -> None:
+    x = torch.empty(1, device=device, dtype=torch.bfloat16)
+    with pytest.raises(AssertionError, match="unsupported fp8 dtype"):
+        fp8_quantize(x, fp8_dtype=torch.float8_e4m3fnuz)
 
 
 @pytest.mark.parametrize("solution", ["trtllm"])

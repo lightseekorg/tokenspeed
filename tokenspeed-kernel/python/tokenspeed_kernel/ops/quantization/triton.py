@@ -122,8 +122,7 @@ def fp8_quantize(
            are passed as plain kernel args; scalar tensors are loaded on device.
         out: optional pre-allocated FP8 output. Same shape as ``x``. If not
            provided, allocated as contiguous.
-        fp8_dtype: ``torch.float8_e4m3fn`` (default), ``torch.float8_e5m2`` or
-           ``torch.float8_e4m3fnuz`` (the bias-8 e4m3 used on AMD CDNA3).
+        fp8_dtype: ``torch.float8_e4m3fn`` (default) or ``torch.float8_e5m2``.
         enable_pdl: opt into Programmatic Dependent Launch (Hopper+). Caller
            must also pass ``launch_pdl=True`` upstream / downstream as needed.
 
@@ -137,7 +136,6 @@ def fp8_quantize(
     assert fp8_dtype in (
         torch.float8_e4m3fn,
         torch.float8_e5m2,
-        torch.float8_e4m3fnuz,
     ), f"fp8_quantize unsupported fp8 dtype: {fp8_dtype}"
     has_scale = scale is not None
     has_scale_tensor = isinstance(scale, torch.Tensor)
@@ -156,10 +154,8 @@ def fp8_quantize(
 
     if fp8_dtype is torch.float8_e4m3fn:
         fp8_dtype_const = tl.float8e4nv
-    elif fp8_dtype is torch.float8_e5m2:
-        fp8_dtype_const = tl.float8e5
     else:
-        fp8_dtype_const = tl.float8e4b8
+        fp8_dtype_const = tl.float8e5
 
     # Block-size heuristic — picked from per-shape best configs in an
     # nsys-driven sweep on B200 (kv_a [s,512] and v [s,h,128] for K2.5).

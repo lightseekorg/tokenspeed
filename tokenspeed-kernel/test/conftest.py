@@ -123,29 +123,6 @@ def a100_platform() -> PlatformInfo:
 
 
 @pytest.fixture
-def mi300_platform() -> PlatformInfo:
-    return PlatformInfo(
-        vendor="amd",
-        arch_version=ArchVersion(9, 4),
-        device_name="AMD Instinct MI300X",
-        device_count=8,
-        total_memory=192 * (1024**3),
-        memory_bandwidth=5300.0,
-        sm_count=304,
-        max_threads_per_sm=2048,
-        max_shared_memory_per_sm=65536,
-        sm_features=frozenset(
-            {
-                "tensor_core:f16",
-                "tensor_core:f8",
-            }
-        ),
-        runtime_features=frozenset(),
-        interconnect=InterconnectInfo(topology="pcie"),
-    )
-
-
-@pytest.fixture
 def mi350_platform() -> PlatformInfo:
     return PlatformInfo(
         vendor="amd",
