@@ -207,4 +207,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Finish
-        run: echo "PR Test finished."
+        env:
+          UNIT_TEST_RESULT: ${{ needs.unit-test.result }}
+          MODEL_TEST_RESULT: ${{ needs.model-test.result }}
+          MODEL_TEST_EAGER_RESULT: ${{ needs.model-test-eager.result }}
+        run: |
+          for result in "$UNIT_TEST_RESULT" "$MODEL_TEST_RESULT" "$MODEL_TEST_EAGER_RESULT"; do
+            if [[ "$result" != "success" && "$result" != "skipped" ]]; then
+              echo "PR Test did not finish successfully: dependency result=$result"
+              exit 1
+            fi
+          done
+          echo "PR Test finished."
