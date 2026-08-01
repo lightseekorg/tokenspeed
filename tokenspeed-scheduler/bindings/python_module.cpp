@@ -319,7 +319,6 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("decoding_size", &tokenspeed::Scheduler::DecodingSize)
         .def("prefilling_size", &tokenspeed::Scheduler::PrefillSize)
         .def("pd_transfer_pinned", &tokenspeed::Scheduler::PdTransferPinned, nb::arg("request_id"))
-        .def("retract_count", &tokenspeed::Scheduler::RetractedSize)
         .def("available_kv_pages", &tokenspeed::Scheduler::AvailableKvPages)
         .def("active_kv_pages", &tokenspeed::Scheduler::ActiveKvPages)
         .def("request_token_size", &tokenspeed::Scheduler::RequestTokenSize, nb::arg("id"))

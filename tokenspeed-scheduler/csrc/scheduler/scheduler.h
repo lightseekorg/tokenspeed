@@ -58,7 +58,6 @@ public:
 
     std::size_t WaitingSize() const;
     std::size_t DecodingSize() const;
-    std::size_t RetractedSize() const { return static_cast<std::size_t>(retract_count_); }
     std::size_t AvailableKvPages() const;
     std::size_t ActiveKvPages() const;
     std::size_t PrefillSize() const;
@@ -182,7 +181,6 @@ private:
     std::unordered_map<std::string, KvEventHashProgress> kv_event_hash_progress_;
     std::unordered_map<CacheKey, KvBlockStoredEvent, CacheKeyHash> kv_event_pages_;
     std::unordered_map<CacheKey, std::int32_t, CacheKeyHash> cached_event_group_counts_;
-    std::int64_t retract_count_{0};
 };
 
 }  // namespace tokenspeed

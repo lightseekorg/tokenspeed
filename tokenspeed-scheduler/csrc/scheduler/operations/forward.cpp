@@ -428,7 +428,6 @@ void Scheduler::retractForCapacity(const std::vector<Request*>& candidates) {
 
     FatalCheck(request_to_retract != nullptr, "LCM admission failed without a retractable request");
     request_to_retract->Apply(fsm::RetractEvent{&coordinator_});
-    ++retract_count_;
     spdlog::info("[Scheduler] retract: released request {} ({} tokens) for LCM capacity", request_to_retract->Id(),
                  request_to_retract->TokenSize());
 }
