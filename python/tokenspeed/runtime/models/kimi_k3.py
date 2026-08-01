@@ -1680,8 +1680,48 @@ class KimiLinearModel(nn.Module):
             prefix=add_prefix("output_attn_res_proj", prefix),
         )
 
+        # DFLASH/DSpark speculative decoding: layer indices whose *output*
+        # stream is captured for the draft. Populated by
+        # ``set_dflash_layers_to_capture``; empty means no capture.
+        self.layers_to_capture: list[int] = []
+        self._dflash_incremental_callback = None
+        self._dflash_slot_bufs = None
+        self._dflash_capture_idx_map: dict[int, int] = {}
+
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
+
+    def _dspark_capture_stream(
+        self,
+        layer_idx: int,
+        prefix_sum: torch.Tensor,
+        block_residual: torch.Tensor,
+    ) -> torch.Tensor:
+        """The stream value after ``layer_idx``, as its next consumer sees it.
+
+        K3 does not carry a plain residual: ``prefix_sum`` is only one candidate
+        in the AttnRes mix, and the block snapshots carry the rest. Capturing
+        ``prefix_sum`` alone would hand the draft a tensor no layer ever reads.
+        So reproduce the pre-norm mixture the next layer's attention side would
+        compute (or the model's output mixing, for the last layer), leaving off
+        the consumer's own norm.
+        """
+        num_layers = len(self.layers)
+        if layer_idx + 1 < num_layers:
+            consumer = self.layers[layer_idx + 1]
+            proj = consumer.self_attention_res_proj
+            norm = consumer.self_attention_res_norm
+            num_valid_blocks = consumer.prev_valid_blocks
+        else:
+            proj = self.output_attn_res_proj
+            norm = self.output_attn_res_norm
+            num_valid_blocks = ceil_div(num_layers, self.config.attn_res_block_size)
+        mixed = _apply_attn_res(
+            prefix_sum, block_residual, proj, norm, num_valid_blocks
+        )
+        # num_valid_blocks == 0 returns prefix_sum itself; the caller stores the
+        # capture past further in-place layer writes, so hand back a copy.
+        return mixed.clone() if mixed is prefix_sum else mixed
 
     @torch.no_grad()
     def forward(
@@ -1708,11 +1748,25 @@ class KimiLinearModel(nn.Module):
             num_blocks, hidden_states.size(0), hidden_states.size(1)
         )
 
+        capture_layers = self.layers_to_capture
+        aux_hidden_states: list[torch.Tensor] | None = [] if capture_layers else None
+
         prefix_sum = hidden_states
-        for layer in self.layers:
+        for layer_idx, layer in enumerate(self.layers):
             prefix_sum, block_residual = layer(
                 positions, prefix_sum, ctx, out_cache_loc, block_residual
             )
+            if aux_hidden_states is not None and layer_idx in capture_layers:
+                captured = self._dspark_capture_stream(
+                    layer_idx, prefix_sum, block_residual
+                )
+                capture_idx = self._dflash_capture_idx_map.get(layer_idx)
+                if self._dflash_slot_bufs is not None and capture_idx is not None:
+                    num_tokens = captured.shape[0]
+                    self._dflash_slot_bufs[capture_idx][:num_tokens].copy_(captured)
+                    if self._dflash_incremental_callback is not None:
+                        self._dflash_incremental_callback(capture_idx, num_tokens)
+                aux_hidden_states.append(captured)
 
         hidden_states = _apply_attn_res(
             prefix_sum,
@@ -1722,7 +1776,7 @@ class KimiLinearModel(nn.Module):
             num_blocks,
             out_norm=self.norm,
         )
-        return hidden_states, None
+        return hidden_states, aux_hidden_states
 
 
 class KimiLinearForCausalLM(BaseCausalLM):
@@ -1737,6 +1791,38 @@ class KimiLinearForCausalLM(BaseCausalLM):
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_dflash_layers_to_capture(
+        self,
+        layer_ids: list[int],
+        incremental_callback=None,
+        slot_bufs: list | None = None,
+    ) -> None:
+        """Capture the K3 residual stream after each named target layer.
+
+        DFLASH/DSpark checkpoints name 0-indexed target layer *outputs*. Layer
+        ``i``'s output is only well defined as a stream once the next layer's
+        AttnRes mixing is applied to it, so ``i`` must have a successor.
+        """
+        num_layers = len(self.model.layers)
+        if len(set(layer_ids)) != len(layer_ids):
+            raise ValueError("DFLASH target_layer_ids must be unique.")
+        invalid = [val for val in layer_ids if val < 0 or val + 1 >= num_layers]
+        if invalid:
+            raise ValueError(
+                "DFLASH target_layer_ids must map to capturable target layer "
+                f"outputs. Got invalid ids {invalid}; valid range is "
+                f"[0, {num_layers - 2}] for {num_layers} target layers."
+            )
+        self.capture_aux_hidden_states = True
+        # Ascending: the draft concatenates the taps positionally, so the
+        # capture order is part of the weight contract.
+        self.model.layers_to_capture = sorted(layer_ids)
+        self.model._dflash_capture_idx_map = {
+            layer_idx: i for i, layer_idx in enumerate(self.model.layers_to_capture)
+        }
+        self.model._dflash_incremental_callback = incremental_callback
+        self.model._dflash_slot_bufs = slot_bufs
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         """Load the ``model.*`` / ``lm_head.*`` text weights.
@@ -1957,6 +2043,22 @@ class KimiK3ForConditionalGeneration(nn.Module):
 
     def get_embed_and_head(self):
         return self.language_model.get_embed_and_head()
+
+    def set_dflash_layers_to_capture(
+        self,
+        layer_ids: list[int],
+        incremental_callback=None,
+        slot_bufs: list | None = None,
+    ) -> None:
+        if self.language_model is None:
+            raise AttributeError(
+                "Kimi-K3 encoder-only mode cannot capture target hidden states."
+            )
+        self.language_model.set_dflash_layers_to_capture(
+            layer_ids,
+            incremental_callback=incremental_callback,
+            slot_bufs=slot_bufs,
+        )
 
     @property
     def logits_processor(self):
