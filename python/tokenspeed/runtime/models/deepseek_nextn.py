@@ -66,9 +66,8 @@ logger = logging.getLogger(__name__)
 class DeepseekV3DraftDecoderLayer(DeepseekV3DecoderLayer):
     """Decoder layer that injects the draft attention and narrows residuals.
 
-    Restricted to single-layer drafts: ``_apply_correction`` mutates the
-    explicit ``seq_lens`` input in place and is not idempotent across
-    layers.
+    Restricted to single-layer drafts: ``_apply_correction`` mutates
+    ``ctx.draft_seq_lens_buf`` in place and is not idempotent across layers.
     """
 
     @property
@@ -79,13 +78,11 @@ class DeepseekV3DraftDecoderLayer(DeepseekV3DecoderLayer):
         self,
         residual: torch.Tensor,
         ctx: ForwardContext,
-        accept_lengths: torch.Tensor | None = None,
-        gather_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Narrow residual to the draft attention's [bs, H] live rows."""
-        if accept_lengths is None or ctx.forward_mode.is_idle():
+        if ctx.accept_lengths is None or ctx.forward_mode.is_idle():
             return residual
-        return residual.index_select(0, gather_ids)
+        return residual.index_select(0, ctx.gather_ids)
 
     def forward(
         self,
@@ -94,9 +91,6 @@ class DeepseekV3DraftDecoderLayer(DeepseekV3DecoderLayer):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
-        accept_lengths: torch.Tensor | None = None,
-        seq_lens: torch.Tensor | None = None,
-        gather_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
             ctx
@@ -112,13 +106,8 @@ class DeepseekV3DraftDecoderLayer(DeepseekV3DecoderLayer):
                 ctx=ctx,
                 out_cache_loc=out_cache_loc,
                 comm_manager=self.comm_manager,
-                accept_lengths=accept_lengths,
-                seq_lens=seq_lens,
-                gather_ids=gather_ids,
             )
-            residual = self._maybe_narrow_residual(
-                residual, ctx, accept_lengths=accept_lengths, gather_ids=gather_ids
-            )
+            residual = self._maybe_narrow_residual(residual, ctx)
             hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
                 hidden_states, residual, ctx
             )
@@ -185,9 +174,6 @@ class DeepseekModelNextN(nn.Module):
         out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
-        accept_lengths: torch.Tensor | None = None,
-        seq_lens: torch.Tensor | None = None,
-        gather_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None]:
         if captured_hidden_states is None:
             raise ValueError("DeepSeek NextN requires captured_hidden_states.")
@@ -222,9 +208,6 @@ class DeepseekModelNextN(nn.Module):
             ctx,
             out_cache_loc,
             residual,
-            accept_lengths=accept_lengths,
-            seq_lens=seq_lens,
-            gather_ids=gather_ids,
         )
 
         if not ctx.forward_mode.is_idle():
@@ -304,10 +287,6 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         positions: torch.Tensor,
         out_cache_loc: torch.Tensor,
         captured_hidden_states: torch.Tensor | None = None,
-        accept_lengths: torch.Tensor | None = None,
-        seq_lens: torch.Tensor | None = None,
-        gather_ids: torch.Tensor | None = None,
-        **kwargs,
     ) -> torch.Tensor:
         with report_collective_sizing(ctx, ctx.bs, ctx.global_bs):
             hidden_states, _ = self.model(
@@ -316,13 +295,8 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 ctx,
                 out_cache_loc,
                 captured_hidden_states=captured_hidden_states,
-                accept_lengths=accept_lengths,
-                seq_lens=seq_lens,
-                gather_ids=gather_ids,
             )
-        logits_metadata = LogitsMetadata.from_forward_context(
-            ctx, gather_ids=gather_ids
-        )
+        logits_metadata = LogitsMetadata.from_forward_context(ctx)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, logits_metadata
         )

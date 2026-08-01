@@ -2086,18 +2086,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self.forward_metadata = metadata
         self._decode_tile_metadata = {}
 
-    def reset_cross_layer_memos(self) -> None:
-        """Clear per-forward DSA memos on all tracked (possibly reused) metadata."""
-        for metadata in (
-            self.forward_metadata,
-            self.forward_prefill_metadata,
-            self.forward_decode_metadata,
-            self._draft_decode_metadata,
-        ):
-            if metadata is not None:
-                metadata.swa_slot_mapping = None
-                metadata.compressor_slot_cache = None
-
     def forward_decode(self, *args, **kwargs):
         raise NotImplementedError("DeepSeek V4 uses the model-local attention forward")
 

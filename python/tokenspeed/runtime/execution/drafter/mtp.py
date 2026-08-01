@@ -541,14 +541,18 @@ class Mtp(BaseDrafter):
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
+            req_to_page=self.req_to_page,
             bs=bs,
             num_extends=draft_input.num_extends,
             input_num_tokens=input_num_tokens,
             forward_mode=forward_mode,
             capture_hidden_mode=capture_mode,
+            gather_ids=gather_ids,
             global_num_tokens=draft_input.global_num_tokens,
             global_bs=draft_input.global_bs,
             all_decode_or_idle=draft_input.all_decode_or_idle,
+            draft_seq_lens_buf=self.draft_seq_lens_buf,
+            accept_lengths=draft_input.accept_lengths,
         )
 
         logits_output = self.draft_model_runner.forward(
@@ -558,9 +562,6 @@ class Mtp(BaseDrafter):
             out_cache_loc=buffers.out_cache_loc_buf[:input_num_tokens],
             captured_hidden_states=draft_input.base_out_hidden_states,
             spec_step_idx=0,
-            accept_lengths=draft_input.accept_lengths,
-            seq_lens=self.draft_seq_lens_buf,
-            gather_ids=gather_ids,
         )
         return logits_output
 
@@ -618,12 +619,16 @@ class Mtp(BaseDrafter):
                 num_extends=0,
                 attn_backend=self.attn_backend,
                 token_to_kv_pool=self.token_to_kv_pool,
+                req_to_page=self.req_to_page,
                 input_num_tokens=bs * k,
                 forward_mode=ForwardMode.DECODE,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
+                gather_ids=gather_ids,
                 global_num_tokens=draft_input.global_num_tokens,
                 global_bs=draft_input.global_bs,
                 all_decode_or_idle=draft_input.all_decode_or_idle,
+                draft_seq_lens_buf=self.draft_seq_lens_buf,
+                accept_lengths=draft_input.accept_lengths,
             )
 
             with nvtx_range("draft_step_forward", color="red"):
@@ -634,9 +639,6 @@ class Mtp(BaseDrafter):
                     out_cache_loc=out_cache_loc,
                     captured_hidden_states=prev_hidden,
                     spec_step_idx=d,
-                    accept_lengths=draft_input.accept_lengths,
-                    seq_lens=self.draft_seq_lens_buf,
-                    gather_ids=gather_ids,
                 )
             prev_hidden = logits_output.hidden_states
 
@@ -741,12 +743,16 @@ class Mtp(BaseDrafter):
                 num_extends=0,
                 attn_backend=self.attn_backend,
                 token_to_kv_pool=self.token_to_kv_pool,
+                req_to_page=self.req_to_page,
                 input_num_tokens=bs * total,
                 forward_mode=ForwardMode.DECODE,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
+                gather_ids=gather_ids,
                 global_num_tokens=draft_input.global_num_tokens,
                 global_bs=draft_input.global_bs,
                 all_decode_or_idle=draft_input.all_decode_or_idle,
+                draft_seq_lens_buf=self.draft_seq_lens_buf,
+                accept_lengths=draft_input.accept_lengths,
             )
 
             with nvtx_range("draft_lookback_forward", color="red"):
@@ -757,9 +763,6 @@ class Mtp(BaseDrafter):
                     out_cache_loc=out_cache_loc,
                     captured_hidden_states=prev_hidden,
                     spec_step_idx=d,
-                    accept_lengths=draft_input.accept_lengths,
-                    seq_lens=self.draft_seq_lens_buf,
-                    gather_ids=gather_ids,
                 )
             prev_hidden = logits_output.hidden_states
 
@@ -923,12 +926,16 @@ class Mtp(BaseDrafter):
                 num_extends=ne,
                 attn_backend=self.attn_backend,
                 token_to_kv_pool=self.token_to_kv_pool,
+                req_to_page=self.req_to_page,
                 input_num_tokens=input_num_tokens,
                 forward_mode=draft_input.forward_mode,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
+                gather_ids=gather_ids,
                 global_num_tokens=draft_input.global_num_tokens,
                 global_bs=draft_input.global_bs,
                 all_decode_or_idle=draft_input.all_decode_or_idle,
+                draft_seq_lens_buf=self.draft_seq_lens_buf,
+                accept_lengths=draft_input.accept_lengths,
             )
 
             with nvtx_range("draft_extend_catchup_forward", color="red"):
@@ -939,9 +946,6 @@ class Mtp(BaseDrafter):
                     out_cache_loc=out_cache_loc,
                     captured_hidden_states=prev_hidden,
                     spec_step_idx=d,
-                    accept_lengths=draft_input.accept_lengths,
-                    seq_lens=self.draft_seq_lens_buf,
-                    gather_ids=gather_ids,
                 )
             prev_hidden = logits_output.hidden_states
 

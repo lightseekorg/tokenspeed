@@ -1702,9 +1702,7 @@ class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForCausalLM):
             input_embeds=input_embeds,
             **model_kwargs,
         )
-        logits_metadata = LogitsMetadata.from_forward_context(
-            ctx, gather_ids=kwargs.get("gather_ids")
-        )
+        logits_metadata = LogitsMetadata.from_forward_context(ctx)
         return self.logits_processor(
             input_ids,
             hidden_states,

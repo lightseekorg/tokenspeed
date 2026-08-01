@@ -865,6 +865,7 @@ class DFlash(BaseDrafter):
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
+            req_to_page=self.req_to_page,
             bs=bs,
             num_extends=bs,
             input_num_tokens=bs * self.spec_num_tokens,

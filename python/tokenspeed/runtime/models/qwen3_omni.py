@@ -355,9 +355,7 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3MoeForCausalLM):
             input_ids,
             hidden_states,
             self.lm_head,
-            LogitsMetadata.from_forward_context(
-                ctx, gather_ids=kwargs.get("gather_ids")
-            ),
+            LogitsMetadata.from_forward_context(ctx),
             aux_hidden_states,
         )
 

@@ -89,24 +89,12 @@ class LlamaAttention(BaseLlamaAttention):
         v: torch.Tensor,
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
-        accept_lengths: torch.Tensor | None = None,
-        seq_lens: torch.Tensor | None = None,
-        gather_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Active draft first step (drafter set up gather_ids + accept_lengths).
         # Covers both decode catch-up and prefill catch-up; multi-step decode
         # delegates to base.
-        if accept_lengths is None:
-            return super()._attn(
-                positions,
-                q,
-                k,
-                v,
-                ctx,
-                out_cache_loc,
-                accept_lengths=accept_lengths,
-                seq_lens=seq_lens,
-            )
+        if ctx.accept_lengths is None:
+            return super()._attn(positions, q, k, v, ctx, out_cache_loc)
 
         if ctx.attn_backend.support_kv_cache_prewrite(ctx.forward_mode):
             fused_kv_arg = self._build_fused_kv_arg(v, ctx, out_cache_loc)
@@ -114,10 +102,10 @@ class LlamaAttention(BaseLlamaAttention):
                 # Trim only on the sliced single-token decode path; the
                 # post-slice fallback below still runs full N-row attn and
                 # needs the original seq_lens.
-                self._apply_correction(ctx, accept_lengths, seq_lens)
+                self._apply_correction(ctx)
                 q_rope = self._fused_rope_kv_write(
                     positions, q, k, fused_kv_arg
-                ).index_select(0, gather_ids)
+                ).index_select(0, ctx.gather_ids)
                 # record_kv_cache (keyed off the real mode) forces the backend's
                 # PD layerwise cache-step record that the DECODE dispatch would
                 # otherwise skip on an EXTEND/MIXED catch-up.
@@ -135,27 +123,23 @@ class LlamaAttention(BaseLlamaAttention):
                 )
         q, k = self.rotary_emb(positions, q, k)
         return self.attn(q, k, v, ctx=ctx, out_cache_loc=out_cache_loc).index_select(
-            0, gather_ids
+            0, ctx.gather_ids
         )
 
-    def _apply_correction(
-        self,
-        ctx: ForwardContext,
-        accept_lengths: torch.Tensor,
-        seq_lens: torch.Tensor | None,
-    ) -> None:
+    def _apply_correction(self, ctx: ForwardContext) -> None:
         """Trim decode rows' cache_seqlens by ``spec_num_tokens - accept_lengths``."""
-        if seq_lens is None:
+        seq_lens_buf = ctx.draft_seq_lens_buf
+        if seq_lens_buf is None or ctx.accept_lengths is None:
             return
         num_extends = ctx.num_extends
         if num_extends >= ctx.bs:
             return
         correction = (
-            ctx.attn_backend.spec_num_tokens - accept_lengths[num_extends:]
-        ).to(seq_lens.dtype)
-        seq_lens[num_extends : ctx.bs].sub_(correction).clamp_(min=1)
+            ctx.attn_backend.spec_num_tokens - ctx.accept_lengths[num_extends:]
+        ).to(seq_lens_buf.dtype)
+        seq_lens_buf[num_extends : ctx.bs].sub_(correction).clamp_(min=1)
         # Publish: the backend owns its buffer, so in-graph edits need a copy.
-        ctx.attn_backend.advance_draft_forward_metadata(seq_lens[: ctx.bs])
+        ctx.attn_backend.advance_draft_forward_metadata(seq_lens_buf[: ctx.bs])
 
 
 # ---------------------------------------------------------------------------
@@ -291,12 +275,10 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
         self,
         residual: torch.Tensor,
         ctx: ForwardContext,
-        accept_lengths: torch.Tensor | None = None,
-        gather_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Align residual with attn output narrowed to [bs, H]."""
-        if accept_lengths is not None and not ctx.forward_mode.is_idle():
-            return residual.index_select(0, gather_ids)
+        if ctx.accept_lengths is not None and not ctx.forward_mode.is_idle():
+            return residual.index_select(0, ctx.gather_ids)
         return residual
 
     def forward_low_latency(
@@ -309,9 +291,6 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
         residual: torch.Tensor | None,
         final_norm: RMSNorm = None,
         fuse_embed_reduce: bool = False,
-        accept_lengths: torch.Tensor | None = None,
-        seq_lens: torch.Tensor | None = None,
-        gather_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
 
@@ -352,13 +331,8 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
             hidden_states=hidden_states,
             ctx=ctx,
             out_cache_loc=out_cache_loc,
-            accept_lengths=accept_lengths,
-            seq_lens=seq_lens,
-            gather_ids=gather_ids,
         )
-        residual = self._maybe_narrow_residual(
-            residual, ctx, accept_lengths=accept_lengths, gather_ids=gather_ids
-        )
+        residual = self._maybe_narrow_residual(residual, ctx)
 
         # Fused post-attn allreduce + norm (uses attn tp group)
         block_scale = None
@@ -395,9 +369,6 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
         residual: torch.Tensor | None,
         final_norm: RMSNorm = None,
         fuse_embed_reduce: bool = False,
-        accept_lengths: torch.Tensor | None = None,
-        seq_lens: torch.Tensor | None = None,
-        gather_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
         if self.comm_manager.should_fuse(hidden_states.shape[0]):
@@ -410,9 +381,6 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
                 residual,
                 final_norm,
                 fuse_embed_reduce=fuse_embed_reduce,
-                accept_lengths=accept_lengths,
-                seq_lens=seq_lens,
-                gather_ids=gather_ids,
             )
 
         # Non-fused path: fuse_embed_reduce is always False here because
@@ -444,13 +412,8 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
             hidden_states=hidden_states,
             ctx=ctx,
             out_cache_loc=out_cache_loc,
-            accept_lengths=accept_lengths,
-            seq_lens=seq_lens,
-            gather_ids=gather_ids,
         )
-        residual = self._maybe_narrow_residual(
-            residual, ctx, accept_lengths=accept_lengths, gather_ids=gather_ids
-        )
+        residual = self._maybe_narrow_residual(residual, ctx)
         hidden_states, residual = self.comm_manager.post_attn_comm(
             hidden_states, residual, ctx
         )
@@ -553,9 +516,6 @@ class Eagle3LlamaModel(BaseTransformerModel):
         out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor = None,
         hidden_states: torch.Tensor = None,
-        accept_lengths: torch.Tensor | None = None,
-        seq_lens: torch.Tensor | None = None,
-        gather_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
 
         if input_embeds is None:
@@ -609,9 +569,6 @@ class Eagle3LlamaModel(BaseTransformerModel):
             residual,
             self.norm,
             fuse_embed_reduce=fuse_embed_reduce,
-            accept_lengths=accept_lengths,
-            seq_lens=seq_lens,
-            gather_ids=gather_ids,
         )
 
         # Decide on pre-slice token count so this matches the path midlayer

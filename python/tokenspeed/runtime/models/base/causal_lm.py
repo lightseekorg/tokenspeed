@@ -162,9 +162,7 @@ class BaseCausalLM(nn.Module):
             out_cache_loc,
             **model_kwargs,
         )
-        logits_metadata = LogitsMetadata.from_forward_context(
-            ctx, gather_ids=kwargs.get("gather_ids")
-        )
+        logits_metadata = LogitsMetadata.from_forward_context(ctx)
 
         return self.logits_processor(
             input_ids,
@@ -179,21 +177,9 @@ class BaseCausalLM(nn.Module):
     ) -> dict:
         """Hook for subclasses to pass model-specific tensors."""
         model_kwargs = {}
-        for key in (
-            "input_embeds",
-            "inputs_embeds",
-            "accept_lengths",
-        ):
+        for key in ("input_embeds", "inputs_embeds"):
             if kwargs.get(key) is not None:
                 model_kwargs[key] = kwargs[key]
-        # seq_lens/gather_ids reach the model only on the spec-decode first
-        # step (accept_lengths present): seq_lens is the drafter's mutable
-        # cache-seqlens view; gather_ids selects the live rows the draft
-        # attention narrows to. Target models take neither in forward.
-        if model_kwargs.get("accept_lengths") is not None:
-            for key in ("seq_lens", "gather_ids"):
-                if kwargs.get(key) is not None:
-                    model_kwargs[key] = kwargs[key]
         return model_kwargs
 
     # Weight loading.

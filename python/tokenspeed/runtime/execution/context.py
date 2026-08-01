@@ -24,6 +24,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import torch
+
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -47,6 +49,7 @@ class ForwardContext:
     num_extends: int
     input_num_tokens: int
     forward_mode: ForwardMode | None
+    req_to_page: torch.Tensor | None = None
     capture_hidden_mode: CaptureHiddenMode | None = CaptureHiddenMode.NULL
     # Normalized explicit decode input overrides for this forward, if any.
     decode_input_ids: list[int] | None = None
@@ -63,9 +66,22 @@ class ForwardContext:
     collective_num_tokens: int | None = None
     collective_global_num_tokens: list[int] | None = None
 
+    # --- logits processor ---
+    gather_ids: torch.Tensor | None = None
+
+    # --- spec-decode draft (drafter-owned buffers plumbed per forward) ---
+    # draft_seq_lens_buf: mutable per-request seq_lens alias the draft backend reads.
+    draft_seq_lens_buf: torch.Tensor | None = None
+    # accept_lengths: per-request accepted verify width for cache_seqlens correction.
+    accept_lengths: torch.Tensor | None = None
+
     # DSA sparse top-k shared across layers and draft steps.
     dsa_prefill_topk: Any | None = None
     dsa_decode_topk: Any | None = None
+
+    # DSA SWA slot mapping + compressor memo, computed once per forward, shared across layers.
+    dsa_swa_slot_mapping: torch.Tensor | None = None
+    dsa_compressor_slot_cache: Any | None = None
 
 
 @contextmanager

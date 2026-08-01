@@ -148,10 +148,6 @@ class DeepseekV4ForwardMetadata:
     # Cached split boundary derived from scheduler num_extends/query_lens.
     num_prefill_reqs: int = 0
     num_prefill_tokens: int = 0
-    # Cross-layer DSA memos, valid for one forward; cleared at every model
-    # forward entry via DeepseekV4AttentionBackend.reset_cross_layer_memos().
-    swa_slot_mapping: torch.Tensor | None = None
-    compressor_slot_cache: dict | None = None
 
     def decode_req_count(self) -> int:
         return max(0, int(self.req_pool_indices.shape[0]) - int(self.num_prefill_reqs))

@@ -508,6 +508,7 @@ class PrefillGraph:
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
+            req_to_page=self.req_to_page,
             bs=bs,
             num_extends=bs,
             input_num_tokens=num_tokens,
@@ -517,6 +518,7 @@ class PrefillGraph:
                 if self.drafter is not None
                 else CaptureHiddenMode.NULL
             ),
+            gather_ids=torch.cumsum(seq_lens_gpu.to(torch.int64), dim=0) - 1,
         )
         if self.dp_size > 1:
             ctx.global_num_tokens = [num_tokens] * self.config.world_size
@@ -706,7 +708,6 @@ class PrefillGraph:
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         multimodal_context=None,
-        gather_ids: torch.Tensor | None = None,
     ):
         """Replay the captured graph for ``ctx`` (caller checked :meth:`can_run`).
 
@@ -744,9 +745,7 @@ class PrefillGraph:
             self._captures[bucket].replay(valid_rows=num_tokens)
         hidden_states, aux_hidden_states = self._outputs[bucket].sliced(num_tokens)
         # The eager logits tail of BaseCausalLM.forward, on the replayed hidden states.
-        logits_metadata = LogitsMetadata.from_forward_context(
-            ctx, gather_ids=gather_ids
-        )
+        logits_metadata = LogitsMetadata.from_forward_context(ctx)
         return self.text_model.logits_processor(
             input_ids,
             hidden_states,
@@ -763,20 +762,22 @@ class PrefillGraph:
         split itself, while the captured token-shaped compute is uniform over
         all rows (pure decode is the decode graph's job). Two ctx fields are
         baked into the captured segments rather than rebound at replay -- the
-        ``capture_hidden_mode`` aux-hidden capture is baked into the captured
-        segments rather than rebound at replay, so a live forward carrying a
-        different value falls back to eager rather than mismatching aux.
-        Prefix caching (cache hits and chunked-prefill chunks 2+) IS eligible:
-        the prefix affects only the ragged attention, which runs entirely
-        inside the eager break, and it adds zero new tokens, so the padded
-        bucket -- hence the baked EP all-to-all shape under DP -- is identical
-        on prefix and non-prefix ranks.
+        draft first-step row narrowing (keyed on ``accept_lengths``) and the
+        ``capture_hidden_mode`` aux-hidden capture -- so a live forward carrying
+        different values falls back to eager rather than silently dropping the
+        reduce / mismatching aux. Prefix caching (cache hits and chunked-prefill
+        chunks 2+) IS eligible: the prefix affects only the ragged attention,
+        which runs entirely inside the eager break, and it adds zero new tokens,
+        so the padded bucket -- hence the baked EP all-to-all shape under DP --
+        is identical on prefix and non-prefix ranks.
         """
         if self.disable or ctx.forward_mode is None:
             return None
         if ctx.num_extends <= 0:
             return None
         if not (ctx.forward_mode.is_extend() or ctx.forward_mode.is_mixed()):
+            return None
+        if ctx.accept_lengths is not None:
             return None
         if ctx.capture_hidden_mode != self._captured_hidden_mode:
             return None

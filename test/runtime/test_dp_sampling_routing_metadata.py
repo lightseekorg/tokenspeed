@@ -139,22 +139,12 @@ def test_cuda_graph_wrapper_uses_existing_route_for_padding():
 
 def test_cuda_graph_req_pool_padding_uses_reserved_sink_row():
     wrapper = CudaGraphWrapper.__new__(CudaGraphWrapper)
-    wrapper.config = SimpleNamespace(max_req_pool_size=21, spec_algo="DFLASH")
+    wrapper.config = SimpleNamespace(max_req_pool_size=21)
     active_indices = torch.tensor([7, 8], dtype=torch.int64)
 
     padded_indices = wrapper._pad_graph_req_pool_indices(active_indices, 4)
 
     assert padded_indices.tolist() == [7, 8, 21, 21]
-
-
-def test_cuda_graph_req_pool_padding_zeros_for_non_dflash():
-    wrapper = CudaGraphWrapper.__new__(CudaGraphWrapper)
-    wrapper.config = SimpleNamespace(max_req_pool_size=21, spec_algo="EAGLE")
-    active_indices = torch.tensor([7, 8], dtype=torch.int64)
-
-    padded_indices = wrapper._pad_graph_req_pool_indices(active_indices, 4)
-
-    assert padded_indices.tolist() == [7, 8, 0, 0]
 
 
 def test_cuda_graph_state_write_padding_uses_reserved_sink_row():

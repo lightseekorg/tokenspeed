@@ -176,8 +176,6 @@ class DeepseekV4MultiTokenPredictorLayer(nn.Module):
         e_out, _ = self.e_proj(input_embeds)
         hidden_states = h_out + e_out.unsqueeze(-2)
 
-        # Draft steps reuse metadata objects; drop the previous step's DSA memos.
-        ctx.attn_backend.reset_cross_layer_memos()
         swa_slot_mapping = _deepseek_v4_swa_slot_mapping(
             ctx,
             positions,
@@ -342,7 +340,6 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
         input_embeds: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
         spec_step_idx: int = 0,
-        gather_ids: torch.Tensor | None = None,
         **kwargs,
     ):
         del kwargs
@@ -369,9 +366,7 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
             mtp_hidden_states,
             spec_step_idx,
         )
-        logits_metadata = LogitsMetadata.from_forward_context(
-            ctx, gather_ids=gather_ids
-        )
+        logits_metadata = LogitsMetadata.from_forward_context(ctx)
         return self.logits_processor(
             input_ids,
             logits_hidden_states,
