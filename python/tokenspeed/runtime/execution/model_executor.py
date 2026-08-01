@@ -587,9 +587,6 @@ class ModelExecutor:
             req_to_page=self.req_to_page,
             drafter=self.drafter,
         )
-        # Load every prefill-shaped kernel before serving; serving must never
-        # first-execute a kernel. No-op when graph capture already ran.
-        self.prefill_graph.warmup_eager(self.forward_step)
 
         self._autotune()
 
