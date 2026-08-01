@@ -34,7 +34,7 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
-FLATKV_PD_PROTOCOL_VERSION = 1
+FLATKV_PD_PROTOCOL_VERSION = 2
 MAX_FLATKV_LAYOUT_WIRE_BYTES = 256 << 10
 MAX_FLATKV_MANIFEST_WIRE_BYTES = 2 << 20
 MAX_FLATKV_GROUPS = 64
@@ -44,7 +44,10 @@ MAX_FLATKV_MANIFEST_PAGES = 1 << 15
 _UINT64_LIMIT = 1 << 64
 _FAMILIES = frozenset(("history", "state"))
 _TRANSFER_POLICIES = frozenset(("full_suffix", "latest_snapshot"))
-_PEER_LAYOUT_KEYS = frozenset(("version", "layout_fingerprint", "num_pages_with_null"))
+_PEER_LAYOUT_KEYS = frozenset(
+    ("version", "layout_fingerprint", "num_pages_with_null", "page_zero_offsets")
+)
+_PEER_OFFSET_KEYS = frozenset(("group_id", "field_id", "page_zero_offset"))
 _MANIFEST_KEYS = frozenset(("version", "prefix_len", "prompt_len", "groups"))
 _MANIFEST_GROUP_KEYS = frozenset(("group_id", "page_ids"))
 
@@ -300,12 +303,31 @@ def _layout_fingerprint(value: object) -> str:
 
 
 @dataclass(frozen=True, slots=True)
+class FlatKVPDPeerOffset:
+    """One peer-local field base offset inside the peer's arena."""
+
+    group_id: str
+    field_id: str
+    page_zero_offset: int
+
+    def __post_init__(self) -> None:
+        _string("peer offset group_id", self.group_id)
+        _string("peer offset field_id", self.field_id)
+        _integer("peer offset page_zero_offset", self.page_zero_offset)
+
+
+@dataclass(frozen=True, slots=True)
 class FlatKVPDPeerLayout:
-    """Peer-local fields that are not committed by the semantic fingerprint."""
+    """Peer-local fields that are not committed by the semantic fingerprint.
+
+    Capacity and per-field ``page_zero_offset`` values may differ across PD
+    peers when arena plane packing scales with ``num_lcm_blocks``.
+    """
 
     version: int
     layout_fingerprint: str
     num_pages_with_null: int
+    page_zero_offsets: tuple[FlatKVPDPeerOffset, ...] = ()
 
     def __post_init__(self) -> None:
         if _integer("layout version", self.version, 1) != FLATKV_PD_PROTOCOL_VERSION:
@@ -314,6 +336,27 @@ class FlatKVPDPeerLayout:
             )
         _layout_fingerprint(self.layout_fingerprint)
         _integer("num_pages_with_null", self.num_pages_with_null, 2)
+        offsets = _sequence(
+            self.page_zero_offsets,
+            name="page_zero_offsets",
+            maximum=MAX_FLATKV_GROUPS * MAX_FLATKV_PHYSICAL_SLOTS,
+            nonempty=False,
+        )
+        if not all(isinstance(offset, FlatKVPDPeerOffset) for offset in offsets):
+            raise FlatKVPDProtocolError(
+                "page_zero_offsets must contain FlatKVPDPeerOffset values"
+            )
+        keys = tuple((offset.group_id, offset.field_id) for offset in offsets)
+        _require(
+            len(keys) == len(set(keys)),
+            "page_zero_offsets repeats a (group_id, field_id) pair",
+        )
+
+    def page_zero_offset_map(self) -> dict[tuple[str, str], int]:
+        return {
+            (offset.group_id, offset.field_id): offset.page_zero_offset
+            for offset in self.page_zero_offsets
+        }
 
     def to_wire_bytes(self) -> bytes:
         return _encode(
@@ -328,10 +371,37 @@ class FlatKVPDPeerLayout:
             raw, name="FlatKV peer layout", maximum=MAX_FLATKV_LAYOUT_WIRE_BYTES
         )
         _exact_keys(payload, _PEER_LAYOUT_KEYS, "FlatKV peer layout")
+        offsets = []
+        for position, entry in enumerate(
+            _sequence(
+                payload["page_zero_offsets"],
+                name="FlatKV peer layout page_zero_offsets",
+                maximum=MAX_FLATKV_GROUPS * MAX_FLATKV_PHYSICAL_SLOTS,
+                nonempty=False,
+            )
+        ):
+            if not isinstance(entry, dict):
+                raise FlatKVPDProtocolError(
+                    f"FlatKV peer layout page_zero_offsets[{position}] "
+                    "must be an object"
+                )
+            _exact_keys(
+                entry,
+                _PEER_OFFSET_KEYS,
+                f"FlatKV peer layout page_zero_offsets[{position}]",
+            )
+            offsets.append(
+                FlatKVPDPeerOffset(
+                    group_id=entry["group_id"],
+                    field_id=entry["field_id"],
+                    page_zero_offset=entry["page_zero_offset"],
+                )
+            )
         layout = cls(
             version=payload["version"],
             layout_fingerprint=payload["layout_fingerprint"],
             num_pages_with_null=payload["num_pages_with_null"],
+            page_zero_offsets=tuple(offsets),
         )
         _canonical_round_trip(
             raw,
@@ -428,10 +498,20 @@ class FlatKVPDLayout:
 
     @property
     def peer(self) -> FlatKVPDPeerLayout:
+        offsets = tuple(
+            FlatKVPDPeerOffset(
+                group_id=group.group_id,
+                field_id=segment.field_id,
+                page_zero_offset=segment.page_zero_offset,
+            )
+            for group in self.groups
+            for segment in group.transfer_segments
+        )
         return FlatKVPDPeerLayout(
             version=self.version,
             layout_fingerprint=self.layout_fingerprint,
             num_pages_with_null=self.num_pages_with_null,
+            page_zero_offsets=offsets,
         )
 
 
@@ -578,6 +658,20 @@ def validate_flatkv_peer_layout(
     if layout.layout_fingerprint != peer_layout.layout_fingerprint:
         raise FlatKVPDProtocolError(
             "FlatKV P/D layout ABI mismatch: layout_fingerprint"
+        )
+    local_keys = {
+        (group.group_id, segment.field_id)
+        for group in layout.groups
+        for segment in group.transfer_segments
+    }
+    peer_keys = {
+        (offset.group_id, offset.field_id) for offset in peer_layout.page_zero_offsets
+    }
+    if local_keys != peer_keys:
+        raise FlatKVPDProtocolError(
+            "FlatKV P/D layout ABI mismatch: page_zero_offsets "
+            f"missing={sorted(local_keys - peer_keys)} "
+            f"extra={sorted(peer_keys - local_keys)}"
         )
 
 
@@ -930,11 +1024,12 @@ def build_lcm_flatkv_pd_contract(
             }
             for order, spec in enumerate(specs)
         ],
+        # Omit arena_offset_bytes: plane-major packing scales those offsets with
+        # num_lcm_blocks, which is peer-local capacity rather than shared ABI.
         "planes": [
             {
                 "plane_id": plane.plane_id,
                 "bytes_per_lcm_block": plane.bytes_per_lcm_block,
-                "arena_offset_bytes": plane.arena_offset_bytes,
             }
             for plane in planes
         ],
