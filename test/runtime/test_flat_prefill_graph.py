@@ -168,11 +168,11 @@ class DummyFlatTablesTest(unittest.TestCase):
                 ),
             )
         )
-        tables = self._bare(backend, pool)._dummy_flat_tables(4096)
-        self.assertEqual(tables["v4.swa_kv"].shape, (1, 64))
+        tables = self._bare(backend, pool)._dummy_flat_tables(4096, 2)
+        self.assertEqual(tables["v4.swa_kv"].shape, (2, 64))
         self.assertEqual(
             tables["v4.c4a.compressor_state"].shape,
-            (1, 1024),
+            (2, 1024),
         )
 
     def test_dual_capable_backend_selects_one_capture_contract(self):

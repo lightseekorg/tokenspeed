@@ -238,6 +238,9 @@ class CudaGraphWrapper:
             attn_backend,
             self.max_bs,
             paged_cache_group_specs=tuple(token_to_kv_pool.paged_cache_group_specs),
+            paged_cache_group_page_counts=dict(
+                getattr(token_to_kv_pool, "paged_cache_group_page_counts", {}) or {}
+            ),
             max_tokens_per_req=self.max_tokens_per_req,
             overlap_schedule_depth=self.overlap_schedule_depth,
         )
@@ -247,6 +250,14 @@ class CudaGraphWrapper:
                 self.max_bs,
                 paged_cache_group_specs=tuple(
                     draft_token_to_kv_pool.paged_cache_group_specs
+                ),
+                paged_cache_group_page_counts=dict(
+                    getattr(
+                        draft_token_to_kv_pool,
+                        "paged_cache_group_page_counts",
+                        {},
+                    )
+                    or {}
                 ),
                 max_tokens_per_req=self.max_tokens_per_req,
                 overlap_schedule_depth=self.overlap_schedule_depth,

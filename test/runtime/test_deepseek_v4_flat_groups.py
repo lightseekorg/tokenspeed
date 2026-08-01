@@ -106,6 +106,10 @@ def _tables(specs, *, rows: int = 2, cols: int = 2, device: str = "cpu"):
     )
 
 
+def _page_counts(specs, count: int = 4096):
+    return {str(spec.group_id): count for spec in specs}
+
+
 class DeepseekV4FlatGroupUnitTest(unittest.TestCase):
     def test_cache_spec_identity_and_order_are_deterministic(self):
         first = _target_specs()
@@ -148,7 +152,11 @@ class DeepseekV4FlatGroupUnitTest(unittest.TestCase):
         for mode, extras in cases:
             with self.subTest(mode=mode):
                 backend = _backend(flat=True, speculative_tokens=1)
-                backend.init_cuda_graph_state(2, paged_cache_group_specs=specs)
+                backend.init_cuda_graph_state(
+                    2,
+                    paged_cache_group_specs=specs,
+                    paged_cache_group_page_counts=_page_counts(specs),
+                )
                 backend.init_forward_metadata(
                     bs=2,
                     req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
@@ -218,7 +226,11 @@ class DeepseekV4FlatGroupUnitTest(unittest.TestCase):
     def test_flat_payload_validation_fails_closed(self):
         specs = _target_specs()
         backend = _backend(flat=True)
-        backend.init_cuda_graph_state(2, paged_cache_group_specs=specs)
+        backend.init_cuda_graph_state(
+            2,
+            paged_cache_group_specs=specs,
+            paged_cache_group_page_counts=_page_counts(specs),
+        )
         valid = _tables(specs)
         common = dict(
             bs=2,
@@ -263,6 +275,24 @@ class DeepseekV4FlatGroupUnitTest(unittest.TestCase):
                         flat_block_tables=tables,
                     )
 
+        out_of_capacity = OrderedDict(valid)
+        out_of_capacity[next(iter(out_of_capacity))] = torch.tensor(
+            [[4096, -1], [1, -1]], dtype=torch.int32
+        )
+        with self.assertRaisesRegex(RuntimeError, "outside -1..4095"):
+            backend.init_forward_metadata(
+                **common,
+                flat_block_tables=out_of_capacity,
+            )
+
+        too_short = OrderedDict(valid)
+        too_short[next(iter(too_short))] = torch.ones((2, 1), dtype=torch.int32)
+        with self.assertRaisesRegex(RuntimeError, "too short"):
+            backend.init_forward_metadata(
+                **{**common, "seq_lens": torch.tensor([65, 2], dtype=torch.int32)},
+                flat_block_tables=too_short,
+            )
+
         with self.assertRaisesRegex(RuntimeError, "radix paged-cache"):
             backend.init_forward_metadata(
                 **common,
@@ -285,10 +315,15 @@ class DeepseekV4FlatGroupUnitTest(unittest.TestCase):
             backend.init_cuda_graph_state(
                 2,
                 paged_cache_group_specs=(spec, spec),
+                paged_cache_group_page_counts=_page_counts((spec,)),
             )
 
         backend = _backend(flat=True, is_draft=True)
-        backend.init_cuda_graph_state(2, paged_cache_group_specs=(spec,))
+        backend.init_cuda_graph_state(
+            2,
+            paged_cache_group_specs=(spec,),
+            paged_cache_group_page_counts=_page_counts((spec,)),
+        )
         with self.assertRaisesRegex(RuntimeError, "duplicate"):
             backend.init_forward_metadata_capture_cuda_graph(
                 bs=2,
@@ -305,6 +340,7 @@ class DeepseekV4FlatGroupUnitTest(unittest.TestCase):
         backend.init_cuda_graph_state(
             2,
             paged_cache_group_specs=specs,
+            paged_cache_group_page_counts=_page_counts(specs),
             max_tokens_per_req=1,
         )
         backend.init_forward_metadata(
@@ -349,6 +385,15 @@ class DeepseekV4FlatGroupUnitTest(unittest.TestCase):
             backend.forward_metadata.is_valid_token.tolist(),
             [True, False],
         )
+        for invalid_actual_bs in (-1, 3):
+            with self.subTest(actual_bs=invalid_actual_bs):
+                with self.assertRaisesRegex(RuntimeError, "within 0..2"):
+                    backend.init_forward_metadata_replay_cuda_graph(
+                        **common,
+                        actual_bs=invalid_actual_bs,
+                        req_to_page=torch.zeros((1, 64), dtype=torch.int32),
+                        flat_block_tables=idle_tables,
+                    )
 
     def test_target_and_mtp_route_same_identity_including_state(self):
         wrapper = object.__new__(CudaGraphWrapper)
@@ -402,6 +447,7 @@ class DeepseekV4FlatGroupUnitTest(unittest.TestCase):
         backend.init_cuda_graph_state(
             2,
             paged_cache_group_specs=specs,
+            paged_cache_group_page_counts=_page_counts(specs),
             max_tokens_per_req=4,
         )
         common = dict(
@@ -419,7 +465,16 @@ class DeepseekV4FlatGroupUnitTest(unittest.TestCase):
             live = OrderedDict(
                 (
                     group_id,
-                    torch.full((2, 2), step + index + 1, dtype=torch.int32),
+                    torch.full(
+                        (
+                            2,
+                            backend._cuda_graph_paged_cache_block_tables[
+                                group_id
+                            ].shape[1],
+                        ),
+                        step + index + 1,
+                        dtype=torch.int32,
+                    ),
                 )
                 for index, group_id in enumerate(group_ids)
             )
@@ -434,7 +489,9 @@ class DeepseekV4FlatGroupUnitTest(unittest.TestCase):
             for group_id, table in live.items():
                 self.assertTrue(
                     torch.equal(
-                        metadata.cache.paged_cache_block_tables[group_id][:, :2],
+                        metadata.cache.paged_cache_block_tables[group_id][
+                            :, : table.shape[1]
+                        ],
                         table,
                     )
                 )
@@ -450,6 +507,7 @@ class DeepseekV4FlatGroupUnitTest(unittest.TestCase):
         flat.init_cuda_graph_state(
             1,
             paged_cache_group_specs=(spec,),
+            paged_cache_group_page_counts=_page_counts((spec,)),
             max_tokens_per_req=4,
         )
         self.assertEqual(
@@ -479,6 +537,7 @@ class DeepseekV4FlatGroupUnitTest(unittest.TestCase):
         backend.init_cuda_graph_state(
             2,
             paged_cache_group_specs=(spec,),
+            paged_cache_group_page_counts=_page_counts((spec,)),
             max_tokens_per_req=1,
         )
         table = {spec.group_id: torch.tensor([[10, 11], [20, -1]], dtype=torch.int32)}
@@ -545,11 +604,13 @@ class DeepseekV4FlatCudaGraphTest(unittest.TestCase):
         target.init_cuda_graph_state(
             2,
             paged_cache_group_specs=target_specs,
+            paged_cache_group_page_counts=_page_counts(target_specs),
             max_tokens_per_req=4,
         )
         draft.init_cuda_graph_state(
             2,
             paged_cache_group_specs=draft_specs,
+            paged_cache_group_page_counts=_page_counts(draft_specs),
             max_tokens_per_req=4,
         )
         common = dict(

@@ -457,7 +457,7 @@ class PrefillGraph:
             # absolute logical columns.
             group_width = max(
                 width,
-                (num_tokens + raw_tokens_per_page - 1) // raw_tokens_per_page,
+                (req_tokens + raw_tokens_per_page - 1) // raw_tokens_per_page,
             )
             group_id = str(spec.group_id)
             out[group_id] = torch.full(

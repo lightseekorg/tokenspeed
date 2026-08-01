@@ -279,6 +279,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self._cuda_graph_metadata = {}
         self._cuda_graph_paged_cache_block_tables: dict[str, torch.Tensor] = {}
         self._expected_flat_cache_group_ids: tuple[str, ...] | None = None
+        self._flat_group_raw_tokens_per_page: dict[str, int] = {}
+        self._flat_group_max_page_ids: dict[str, int] = {}
         self._cuda_graph_flat_group_ids: tuple[str, ...] = ()
         # Per-sliding-group [max_bs] int32 buffers mirroring the block-table
         # buffers; populated by init_cuda_graph_state.
@@ -357,9 +359,21 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         flat_block_tables: Mapping[object, object],
         *,
         bs: int,
+        actual_bs: int,
+        seq_lens: torch.Tensor,
         device: torch.device,
         phase: str,
     ) -> dict[str, torch.Tensor]:
+        if actual_bs < 0 or actual_bs > bs:
+            raise RuntimeError(
+                f"DeepSeek V4 Flat KV {phase} actual_bs={actual_bs} must be "
+                f"within 0..{bs}"
+            )
+        if seq_lens.ndim != 1 or int(seq_lens.shape[0]) < actual_bs:
+            raise RuntimeError(
+                f"DeepSeek V4 Flat KV {phase} seq_lens has shape "
+                f"{tuple(seq_lens.shape)}, expected at least {actual_bs} entries"
+            )
         if not isinstance(flat_block_tables, Mapping):
             raise RuntimeError(
                 f"DeepSeek V4 Flat KV {phase} tables must be a mapping, got "
@@ -403,7 +417,86 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                     f"DeepSeek V4 Flat KV {phase} table {group_id!r} has zero width"
                 )
             out[group_id] = table
+        self._assert_flat_table_contract(
+            out,
+            seq_lens=seq_lens,
+            actual_bs=actual_bs,
+            phase=phase,
+        )
         return out
+
+    def _assert_flat_table_contract(
+        self,
+        tables: Mapping[str, torch.Tensor],
+        *,
+        seq_lens: torch.Tensor,
+        actual_bs: int,
+        phase: str,
+    ) -> None:
+        """Fail closed on page capacity and active-sequence table coverage.
+
+        The scheduler export is already on CPU when ModelExecutor checks page
+        IDs before H2D. This second check protects direct backend callers and,
+        critically, proves that each active row still contains the absolute
+        logical page selected by its live sequence length. CUDA assertions are
+        stream ordered and capture-safe, so replay cannot silently consume the
+        ``-1`` ragged padding from a short or stale source table.
+        """
+        if actual_bs == 0:
+            return
+        live_seq_lens = seq_lens[:actual_bs].to(dtype=torch.int64)
+        if self.is_draft:
+            # MTP advances this metadata in-place without another scheduler
+            # table delivery. Prove the delivered absolute table also covers
+            # every possible draft step, including a page-boundary crossing.
+            live_seq_lens = live_seq_lens + int(self.speculative_num_draft_tokens)
+        for group_id, table in tables.items():
+            raw_tokens_per_page = self._flat_group_raw_tokens_per_page.get(group_id)
+            max_page_id = self._flat_group_max_page_ids.get(group_id)
+            if raw_tokens_per_page is None or max_page_id is None:
+                raise RuntimeError(
+                    "DeepSeek V4 Flat KV cache group contract is incomplete for "
+                    f"{group_id!r}"
+                )
+            live = table[:actual_bs]
+            page_ids_valid = ((live >= -1) & (live <= max_page_id)).all()
+            required_page = torch.div(
+                live_seq_lens.clamp_min(1) - 1,
+                raw_tokens_per_page,
+                rounding_mode="floor",
+            )
+            width = int(table.shape[1])
+            in_bounds = required_page < width
+            safe_page = required_page.clamp(min=0, max=width - 1)
+            row_indices = torch.arange(
+                actual_bs,
+                dtype=torch.int64,
+                device=table.device,
+            )
+            required_entries_present = (
+                in_bounds & live[row_indices, safe_page].ne(-1)
+            ).all()
+            if table.device.type == "cpu":
+                if not bool(page_ids_valid.item()):
+                    raise RuntimeError(
+                        f"DeepSeek V4 Flat KV {phase} table {group_id!r} contains "
+                        f"a page ID outside -1..{max_page_id}"
+                    )
+                if not bool(required_entries_present.item()):
+                    raise RuntimeError(
+                        f"DeepSeek V4 Flat KV {phase} table {group_id!r} is too "
+                        "short for an active sequence"
+                    )
+            else:
+                torch._assert_async(
+                    page_ids_valid,
+                    f"DeepSeek V4 Flat KV {phase} page ID exceeds group capacity",
+                )
+                torch._assert_async(
+                    required_entries_present,
+                    f"DeepSeek V4 Flat KV {phase} table is too short for an "
+                    "active sequence",
+                )
 
     def _get_prefill_workspace(
         self,
@@ -705,6 +798,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 paged_cache_block_tables = self._validated_flat_block_tables(
                     flat_block_tables,
                     bs=bs,
+                    actual_bs=bs,
+                    seq_lens=seq_lens,
                     device=device,
                     phase="eager",
                 )
@@ -1757,6 +1852,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self,
         max_bs: int,
         paged_cache_group_specs=(),
+        paged_cache_group_page_counts=None,
         max_tokens_per_req: int = 1,
         overlap_schedule_depth: int = 0,
     ):
@@ -1830,6 +1926,32 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             raise RuntimeError(
                 "DeepSeek V4 Flat KV runtime requires at least one cache group spec"
             )
+        page_counts = dict(paged_cache_group_page_counts or {})
+        if self.uses_flat_cache_groups:
+            if set(page_counts) != set(group_ids):
+                raise RuntimeError(
+                    "DeepSeek V4 Flat KV page-count contract disagrees with cache "
+                    f"group specs: missing={sorted(set(group_ids) - set(page_counts))} "
+                    f"extra={sorted(set(page_counts) - set(group_ids))}"
+                )
+            invalid_counts = {
+                group_id: page_counts[group_id]
+                for group_id in group_ids
+                if not isinstance(page_counts[group_id], int)
+                or isinstance(page_counts[group_id], bool)
+                or page_counts[group_id] <= 1
+            }
+            if invalid_counts:
+                raise RuntimeError(
+                    "DeepSeek V4 Flat KV page counts must reserve page 0 and at "
+                    f"least one live page: {invalid_counts!r}"
+                )
+        self._flat_group_raw_tokens_per_page = {}
+        self._flat_group_max_page_ids = (
+            {group_id: int(page_counts[group_id]) - 1 for group_id in group_ids}
+            if self.uses_flat_cache_groups
+            else {}
+        )
         self._cuda_graph_paged_cache_base_offsets = {}
         for spec, gid in zip(specs, group_ids, strict=True):
             sliding = str(getattr(spec, "retention", "")) == "sliding_window"
@@ -1843,6 +1965,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                         f"group={gid!r} rows_per_page={rows_per_page} "
                         f"entry_stride_tokens={entry_stride_tokens}"
                     )
+                self._flat_group_raw_tokens_per_page[gid] = raw_tokens_per_page
                 capture_tokens = (
                     int(self.context_len)
                     + (int(overlap_schedule_depth) + 1)
@@ -2152,7 +2275,12 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         paged_cache_block_table_base_offsets = (
             kwargs.pop("paged_cache_block_table_base_offsets", None) or {}
         )
-        actual_bs = max(0, min(int(kwargs.pop("actual_bs", bs)), bs))
+        actual_bs = int(kwargs.pop("actual_bs", bs))
+        if actual_bs < 0 or actual_bs > bs:
+            raise RuntimeError(
+                f"DeepSeek V4 CUDA graph replay actual_bs={actual_bs} must be "
+                f"within 0..{bs}"
+            )
         num_tokens_arg = kwargs.pop("num_tokens", None)
         del kwargs
         if forward_mode is not None and not forward_mode.is_decode_or_idle():
@@ -2203,6 +2331,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             validated_flat = self._validated_flat_block_tables(
                 flat_block_tables,
                 bs=bs,
+                actual_bs=actual_bs,
+                seq_lens=seq_lens,
                 device=seq_lens.device,
                 phase="replay",
             )
