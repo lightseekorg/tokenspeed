@@ -11,6 +11,8 @@ from slurm_submit import (
     load_task,
     parse_pr_number,
     pr_worktree,
+    print_progress,
+    queued_states,
     render_script,
     result_detail,
     select_tasks,
@@ -236,3 +238,62 @@ def test_write_report_collects_logs_and_results(tmp_path):
         "| 123 | eval | gb200-1gpu | example | ✅ |"
         in (report / "summary.md").read_text()
     )
+
+
+def test_queued_states_queries_only_requested_jobs(monkeypatch):
+    def fake_run(command, **kwargs):
+        assert command == [
+            "squeue",
+            "--noheader",
+            "--jobs=123,456",
+            "--format=%i|%T|%M|%R",
+        ]
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=(
+                "123|RUNNING|00:01|node-a\n"
+                "456|PENDING|00:00|Resources\n"
+                "999|RUNNING|12:00|node-private\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("slurm_submit.subprocess.run", fake_run)
+    assert queued_states(["123", "456"]) == {
+        "123": {
+            "state": "RUNNING",
+            "elapsed": "00:01",
+            "exit_code": "",
+            "reason": "",
+        },
+        "456": {
+            "state": "PENDING",
+            "elapsed": "00:00",
+            "exit_code": "",
+            "reason": "Resources",
+        },
+    }
+
+
+def test_print_progress_omits_running_node(capsys, tmp_path):
+    submission = Submission(
+        Task("test/ci/eval/example.yaml", "example", "eval", "gb200-1gpu", 1),
+        "123",
+        tmp_path / "job.log",
+    )
+    print_progress(
+        [submission],
+        {
+            "123": {
+                "state": "RUNNING",
+                "elapsed": "00:01",
+                "exit_code": "",
+                "reason": "",
+            }
+        },
+    )
+    output = capsys.readouterr().out
+    assert "123" in output
+    assert "example" in output
+    assert "node" not in output
