@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon
-from tokenspeed_kernel_amd.ops.gfx950.moe.a4w4.decode_kernels import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_kernels import (
     invoke_sigmoid_bias_topk_route_gluon,
     invoke_softmax_topk_route_gluon,
 )

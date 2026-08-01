@@ -7897,10 +7897,10 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
         else precomputed_topk_weights.to(torch.float32)
     )
 
-    from tokenspeed_kernel_amd.ops.gfx950.moe.a4w4.decode_stage1 import (
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_stage1 import (
         invoke_stage1_mxfp4_mfma_decode_gluon,
     )
-    from tokenspeed_kernel_amd.ops.gfx950.moe.a4w4.decode_stage2 import (
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_stage2 import (
         invoke_stage2_mxfp4_mfma_decode_gluon,
     )
 
@@ -8144,7 +8144,7 @@ def _maybe_route_owned_mxfp4_mfma_decode(
         return None
 
     method = int(routing_method_type)
-    from tokenspeed_kernel_amd.ops.gfx950.moe.a4w4.routing import (
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.routing import (
         invoke_sigmoid_bias_topk_route_gluon,
         invoke_softmax_topk_route_gluon,
     )
@@ -8353,16 +8353,16 @@ def _maybe_gluon_package_mxfp4_prefill(
     ):
         return None
 
-    from tokenspeed_kernel_amd.ops.gfx950.moe.a4w4.moe_sorting import (
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_sorting import (
         gluon_moe_sorting,
     )
-    from tokenspeed_kernel_amd.ops.gfx950.moe.a4w4.prefill_stage1 import (
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage1 import (
         invoke_gluon_mxfp4_moe_stage1,
     )
-    from tokenspeed_kernel_amd.ops.gfx950.moe.a4w4.prefill_stage2 import (
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage2 import (
         invoke_gluon_mxfp4_moe_stage2_1x2,
     )
-    from tokenspeed_kernel_amd.ops.gfx950.moe.a4w4.scale import (
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale import (
         gather_package_cdna4_scale,
     )
 

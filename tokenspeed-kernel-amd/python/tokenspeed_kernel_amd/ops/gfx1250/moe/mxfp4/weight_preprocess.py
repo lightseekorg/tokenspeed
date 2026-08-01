@@ -23,7 +23,7 @@ from __future__ import annotations
 import math
 
 import torch
-from tokenspeed_kernel_amd.ops.gfx1250.moe.a8w4.fused import (
+from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.fused import (
     PrecisionConfig,
 )
 

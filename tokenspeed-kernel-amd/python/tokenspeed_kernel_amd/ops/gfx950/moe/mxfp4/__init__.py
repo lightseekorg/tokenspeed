@@ -19,35 +19,35 @@
 # SOFTWARE.
 
 
-"""Gluon A4W4 MoE kernels for AMD CDNA4/gfx950.
+"""Gluon MXFP4-weight MoE kernels for AMD CDNA4/gfx950.
 
-The package keeps the four production stages behind stage-specific modules:
-prefill stage 1/2 and decode stage 1/2.  ``moe.py`` provides the small-M
-end-to-end decode entry point, while ``routing.py`` exposes the fused decode
-top-k helpers.
+The package contains BF16, FP8, and dynamically quantized MXFP4 activation
+paths. It keeps the production stages behind stage-specific modules: prefill
+stage 1/2 and decode stage 1/2. ``moe.py`` provides the small-M end-to-end
+decode entry point, while ``routing.py`` exposes the fused decode top-k helpers.
 """
 
-from tokenspeed_kernel_amd.ops.gfx950.moe.a4w4.decode_stage1 import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_stage1 import (
     invoke_stage1_mxfp4_mfma_decode_gluon,
 )
-from tokenspeed_kernel_amd.ops.gfx950.moe.a4w4.decode_stage2 import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_stage2 import (
     invoke_stage2_mxfp4_mfma_decode_gluon,
 )
-from tokenspeed_kernel_amd.ops.gfx950.moe.a4w4.moe import gluon_mxfp4_moe_decode
-from tokenspeed_kernel_amd.ops.gfx950.moe.a4w4.prefill_stage1 import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe import gluon_mxfp4_moe_decode
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage1 import (
     invoke_gluon_mxfp4_moe_stage1,
 )
-from tokenspeed_kernel_amd.ops.gfx950.moe.a4w4.prefill_stage2 import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage2 import (
     invoke_gluon_mxfp4_moe_stage2_1x2,
 )
-from tokenspeed_kernel_amd.ops.gfx950.moe.a4w4.preprocess import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.preprocess import (
     attach_prefill_aliases,
 )
-from tokenspeed_kernel_amd.ops.gfx950.moe.a4w4.routing import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.routing import (
     invoke_sigmoid_bias_topk_route_gluon,
     invoke_softmax_topk_route_gluon,
 )
-from tokenspeed_kernel_amd.ops.gfx950.moe.a4w4.scale import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale import (
     gather_package_cdna4_scale,
 )
 

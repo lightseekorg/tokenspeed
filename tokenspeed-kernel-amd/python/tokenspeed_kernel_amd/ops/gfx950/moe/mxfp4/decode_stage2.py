@@ -21,7 +21,7 @@
 
 """Stage-2 exports for gfx950 A4W4 decode."""
 
-from tokenspeed_kernel_amd.ops.gfx950.moe.a4w4.decode_kernels import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_kernels import (
     invoke_stage2_mxfp4_mfma_decode_gluon,
 )
 

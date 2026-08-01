@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel_amd._triton import cdna4_async_copy, gl, gluon, triton
-from tokenspeed_kernel_amd.ops.gfx950.moe.a16w16._grid import get_pids
+from tokenspeed_kernel_amd.ops.gfx950.moe.bf16._grid import get_pids
 
 
 @gluon.jit
@@ -269,7 +269,7 @@ def invoke_stage1(
     assert I_r % BLOCK_N == 0, f"I ({I_r}) must be a multiple of BLOCK_N ({BLOCK_N})"
 
     # Decode split-K dispatch.
-    from tokenspeed_kernel_amd.ops.gfx950.moe.a16w16.stage1_splitk_kernel import (
+    from tokenspeed_kernel_amd.ops.gfx950.moe.bf16.stage1_splitk_kernel import (
         auto_split_k,
         invoke_stage1_splitk,
     )

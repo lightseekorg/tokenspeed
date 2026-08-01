@@ -23,21 +23,15 @@ from __future__ import annotations
 import pytest
 import torch
 
-
-def _is_gfx950() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
-    return "gfx950" in arch
-
-
-if not _is_gfx950():
+if not torch.cuda.is_available() or "gfx950" not in getattr(
+    torch.cuda.get_device_properties(0), "gcnArchName", ""
+):
     pytest.skip(
-        "Gluon bf16 MoE kernels are gfx950 (CDNA4) only",
+        "BF16-weight Gluon MoE is unavailable on this GPU",
         allow_module_level=True,
     )
 
-from tokenspeed_kernel_amd.ops.gfx950.moe.a16w16 import gluon_bf16_moe  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.moe.bf16 import gluon_bf16_moe  # noqa: E402
 
 # DeepSeek-V3 TP=8 MoE reference shape.
 E = 256

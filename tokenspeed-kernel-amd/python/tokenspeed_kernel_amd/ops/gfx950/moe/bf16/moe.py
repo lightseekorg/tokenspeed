@@ -28,23 +28,23 @@ routed-weight fold in stage 2.
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel_amd.ops.gfx950.moe.a16w16.moe_align_device import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.bf16.moe_align_device import (
     moe_align_block_size_device,
 )
-from tokenspeed_kernel_amd.ops.gfx950.moe.a16w16.moe_align_fused import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.bf16.moe_align_fused import (
     moe_align_block_size_fused,
 )
-from tokenspeed_kernel_amd.ops.gfx950.moe.a16w16.stage1_kernel import invoke_stage1
-from tokenspeed_kernel_amd.ops.gfx950.moe.a16w16.stage1_splitk_kernel import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.bf16.stage1_kernel import invoke_stage1
+from tokenspeed_kernel_amd.ops.gfx950.moe.bf16.stage1_splitk_kernel import (
     invoke_stage1_splitk,
 )
-from tokenspeed_kernel_amd.ops.gfx950.moe.a16w16.stage2_kernel import invoke_stage2
+from tokenspeed_kernel_amd.ops.gfx950.moe.bf16.stage2_kernel import invoke_stage2
 
 # Pure-Gluon warp-reduce GEMV decode path (equivalent to the Triton reference).
-from tokenspeed_kernel_amd.ops.gfx950.moe.a16w16.warp_decode_gluon_kernel import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.bf16.warp_decode_gluon_kernel import (
     invoke_stage1_warp_decode_gluon as invoke_stage1_warp_decode,
 )
-from tokenspeed_kernel_amd.ops.gfx950.moe.a16w16.warp_decode_gluon_kernel import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.bf16.warp_decode_gluon_kernel import (
     invoke_stage2_warp_decode_gluon as invoke_stage2_warp_decode,
 )
 

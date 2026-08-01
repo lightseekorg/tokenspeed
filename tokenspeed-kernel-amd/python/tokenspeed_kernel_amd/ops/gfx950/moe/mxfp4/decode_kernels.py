@@ -28,7 +28,7 @@ then execute direct CDNA4 MFMA for both MoE stages.
 The older ``invoke_stage*_warp_decode_gluon`` helpers consume BF16
 activations and scalar-dequantize only the MXFP4 weights.  They are retained
 solely for historical microbenchmarks through ``mxfp4_warp_decode_gfx950``;
-the public ``gluon_a4w4_gfx950`` package and production dispatch do not export
+the public ``mxfp4`` package and production dispatch do not export
 or call them.
 """
 

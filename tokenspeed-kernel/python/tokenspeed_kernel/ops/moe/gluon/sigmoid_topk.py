@@ -10,7 +10,7 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 try:
-    from tokenspeed_kernel_amd.ops.gfx950.moe.a4w4.routing import (
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.routing import (
         invoke_sigmoid_bias_topk_route_gluon,
         invoke_sigmoid_bias_topk_route_prefill_gluon,
     )

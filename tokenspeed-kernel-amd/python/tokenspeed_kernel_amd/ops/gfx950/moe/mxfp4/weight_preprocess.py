@@ -27,18 +27,18 @@ import torch
 
 # CDNA4 MXFP4 scale layout is defined once in mxfp4_cdna4_scale_layout so the
 # weight-scale (B) preshuffle here and the activation-scale (A) gather in
-# gluon_a4w4_gfx950.scale stay in lock-step. Local aliases preserve the
+# mxfp4.scale stays in lock-step. Local aliases preserve the
 # historical private names used throughout this module.
-from tokenspeed_kernel_amd.ops.gfx950.moe.a4w4.scale_layout import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
     CDNA4_SCALE_K_BLOCK as _CDNA4_SCALE_K_BLOCK,
 )
-from tokenspeed_kernel_amd.ops.gfx950.moe.a4w4.scale_layout import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
     CDNA4_SCALE_N_BLOCK as _CDNA4_SCALE_N_BLOCK,
 )
-from tokenspeed_kernel_amd.ops.gfx950.moe.a4w4.scale_layout import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
     MXFP4_BLOCK as _MXFP_BLOCK_SIZE,
 )
-from tokenspeed_kernel_amd.ops.gfx950.moe.a4w4.scale_layout import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
     swizzle_cdna4_mxfp4_scale as _swizzle_cdna4_mxfp4_scale,
 )
 
@@ -154,7 +154,7 @@ def _pad_w2_to_block_n(w: torch.nn.Module, block_n: int) -> None:
 
 
 def _attach_gluon_preshuffle(w: torch.nn.Module) -> None:
-    from tokenspeed_kernel_amd.ops.gfx950.moe.a4w4 import fused as fused_mxfp_gfx950
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4 import fused as fused_mxfp_gfx950
 
     targets = (
         ("w13_weight_triton_tensor", None),
@@ -177,7 +177,7 @@ def _attach_gluon_preshuffle(w: torch.nn.Module) -> None:
 
 
 def _attach_w2_logical_n(w: torch.nn.Module) -> None:
-    from tokenspeed_kernel_amd.ops.gfx950.moe.a4w4 import fused as fused_mxfp_gfx950
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4 import fused as fused_mxfp_gfx950
 
     logical_n = getattr(w, "_w2_logical_n", None)
     wrapped = getattr(w, "w2_weight_triton_tensor", None)
@@ -296,14 +296,14 @@ def preprocess_gluon_mxfp4_gfx950_moe_weights(
     if preshuffle:
         _attach_gluon_preshuffle(w)
 
-    # Attach the gluon_a4w4_gfx950 package-prefill aliases whenever preshuffle
+    # Attach the MXFP4 package-prefill aliases whenever preshuffle
     # produced the gdot128 layout. They are metadata-only views over that storage
     # (no second model-sized copy), so attaching them is free. When preshuffle is
     # disabled the package path cannot run anyway (the dynamic entry returns None
     # without these aliases and falls back to the reference path).
     if preshuffle:
-        from tokenspeed_kernel_amd.ops.gfx950.moe import a4w4 as gluon_a4w4_gfx950
+        from tokenspeed_kernel_amd.ops.gfx950.moe import mxfp4
 
-        gluon_a4w4_gfx950.attach_prefill_aliases(w, w13_scale, w2_scale)
+        mxfp4.attach_prefill_aliases(w, w13_scale, w2_scale)
 
     torch.cuda.empty_cache()

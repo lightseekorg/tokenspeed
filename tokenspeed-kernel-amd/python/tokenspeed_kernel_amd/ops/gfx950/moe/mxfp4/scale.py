@@ -39,13 +39,13 @@ from tokenspeed_kernel_amd._triton import tl, triton
 # MXFP4 microblock size and the CDNA4 scale-swizzle alignment are defined once in
 # mxfp4_cdna4_scale_layout, shared with the weight-scale (B) preshuffle in the
 # preprocessor. Local aliases preserve the names used throughout this module.
-from tokenspeed_kernel_amd.ops.gfx950.moe.a4w4.scale_layout import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
     CDNA4_SCALE_K_BLOCK as _ALIGN_K_SCALE_SWIZZLE,
 )
-from tokenspeed_kernel_amd.ops.gfx950.moe.a4w4.scale_layout import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
     CDNA4_SCALE_N_BLOCK as _NON_K_PRESHUFFLE_BLOCK_SIZE,
 )
-from tokenspeed_kernel_amd.ops.gfx950.moe.a4w4.scale_layout import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
     MXFP4_BLOCK as _MXFP4_BLOCK,
 )
 

@@ -24,10 +24,10 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel_amd.ops.gfx950.moe.a4w4.decode_stage1 import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_stage1 import (
     invoke_stage1_mxfp4_mfma_decode_gluon,
 )
-from tokenspeed_kernel_amd.ops.gfx950.moe.a4w4.decode_stage2 import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_stage2 import (
     invoke_stage2_mxfp4_mfma_decode_gluon,
 )
 
@@ -53,7 +53,7 @@ def gluon_mxfp4_moe_decode(
     inputs are dynamically quantized to packed E2M1 plus E8M0 block scales
     before the direct CDNA4 MFMA kernels are launched.
     """
-    from tokenspeed_kernel_amd.ops.gfx950.moe.a4w4.fused import (
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
         _extract_gluon_raw_s,
         _extract_gluon_raw_w,
         _quantize_mxfp4_activation,

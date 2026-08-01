@@ -33,7 +33,7 @@ platform = current_platform()
 
 
 if platform.is_amd:
-    from tokenspeed_kernel_amd.ops.gfx950.moe.a16w16 import gluon_bf16_moe
+    from tokenspeed_kernel_amd.ops.gfx950.moe.bf16 import gluon_bf16_moe
 
     @register_kernel(
         "moe",
