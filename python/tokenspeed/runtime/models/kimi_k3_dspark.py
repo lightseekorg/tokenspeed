@@ -87,6 +87,14 @@ class K3DSparkAttention(DeepseekV3AttentionMLA):
     ) -> torch.Tensor:
         if q.size(0) == 0:
             return q.new_empty((0, self.num_local_heads * self.v_head_dim))
+        if self.w_kc is None or self.w_vc is None:
+            # The absorbed decode kernel takes these as raw pointers, so a
+            # missing post_load_weights surfaces as a null-address GPU fault
+            # rather than anything that names the cause.
+            raise RuntimeError(
+                "K3 DSpark absorbed MLA factors are missing; "
+                "post_load_weights did not run after loading the draft."
+            )
 
         decode_ctx = ctx
         if not ctx.forward_mode.is_decode():
@@ -126,10 +134,13 @@ class K3DSparkAttention(DeepseekV3AttentionMLA):
                 ]
         else:
             latent = self.kv_a_proj_with_mqa(hidden_states)[0]
-        latent = latent[..., :kv_width].contiguous()
-        kv_a = latent[..., : self.kv_lora_rank]
-        self.kv_a_layernorm(kv_a, out=kv_a)
-        return latent
+        latent = latent[..., :kv_width]
+        # Both halves must be contiguous in their own right: the norm kernel
+        # rejects a strided output, and a column slice of a [T, 576] row is
+        # strided even though each row's bytes are adjacent.
+        kv_a = self.kv_a_layernorm(latent[..., : self.kv_lora_rank].contiguous())
+        k_pe = latent[..., self.kv_lora_rank :].contiguous()
+        return torch.cat((kv_a, k_pe), dim=-1)
 
     def apply_latent_rope(
         self, positions: torch.Tensor, latent: torch.Tensor
@@ -318,8 +329,8 @@ class K3DSparkModel(nn.Module):
             token_to_kv_pool.set_mla_kv_buffer(
                 attn.attn_mqa,
                 cache_locs,
-                latent[..., : attn.kv_lora_rank],
-                latent[..., attn.kv_lora_rank :],
+                latent[..., : attn.kv_lora_rank].contiguous(),
+                latent[..., attn.kv_lora_rank :].contiguous(),
             )
 
     @torch.no_grad()
