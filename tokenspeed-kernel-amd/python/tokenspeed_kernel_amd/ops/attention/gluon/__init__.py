@@ -30,6 +30,9 @@ from tokenspeed_kernel_amd.ops.attention.gluon.dsa_topk_gfx950 import (  # noqa:
     gluon_dsa_decode_topk_fp8_gfx950,
     gluon_dsa_prefill_topk_fp8_gfx950,
 )
+from tokenspeed_kernel_amd.ops.attention.gluon.kda_decode_gfx950 import (  # noqa: F401
+    gluon_kda_recurrent_decode_gfx950,
+)
 from tokenspeed_kernel_amd.ops.attention.gluon.mha_decode_gfx950 import (  # noqa: F401
     gluon_mha_decode_gfx950,
 )
