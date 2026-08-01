@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "scheduler/operations/inc.h"
@@ -33,7 +34,7 @@ class ExecutionPlan {
 public:
     template <typename OperationType>
     ExecutionPlan& With(OperationType operation) {
-        operations_.emplace_back(operation);
+        operations_.emplace_back(std::move(operation));
         return *this;
     }
 
