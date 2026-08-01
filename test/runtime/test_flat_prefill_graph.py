@@ -177,7 +177,7 @@ class DummyFlatTablesTest(unittest.TestCase):
             )
 
         self.assertFalse(graph.disable)
-        capture.assert_called_once()
+        capture.assert_not_called()
 
 
 class TrtllmPrefillGraphSeamsTest(unittest.TestCase):
