@@ -31,7 +31,7 @@ if not torch.cuda.is_available() or "gfx950" not in getattr(
         allow_module_level=True,
     )
 
-from tokenspeed_kernel_amd.ops.gfx950.moe.bf16 import gluon_bf16_moe  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.moe.fp16 import gluon_bf16_moe  # noqa: E402
 
 # DeepSeek-V3 TP=8 MoE reference shape.
 E = 256
@@ -80,7 +80,7 @@ def _build(num_tokens: int, seed: int = 0):
 
 
 @pytest.mark.parametrize("num_tokens", [1, 8, 64, 256])
-def test_bf16_moe_matches_fp32_reference(num_tokens):
+def test_fp16_weight_moe_matches_fp32_reference(num_tokens):
     """End-to-end output matches the fp32 oracle (auto decode/prefill path)."""
     hidden, w1, w2, topk_ids, topk_weights = _build(num_tokens)
     out = gluon_bf16_moe(hidden, w1, w2, topk_ids, topk_weights)
@@ -92,7 +92,7 @@ def test_bf16_moe_matches_fp32_reference(num_tokens):
 
 
 @pytest.mark.parametrize("num_tokens", [1, 4, 16])
-def test_bf16_moe_splitk_consistency(num_tokens):
+def test_fp16_weight_moe_splitk_consistency(num_tokens):
     """The decode split-K stage-1 path matches the single-launch path."""
     hidden, w1, w2, topk_ids, topk_weights = _build(num_tokens)
     a = gluon_bf16_moe(
@@ -108,7 +108,7 @@ def test_bf16_moe_splitk_consistency(num_tokens):
 
 
 @pytest.mark.parametrize("num_tokens", [1, 8])
-def test_bf16_moe_warp_decode_matches_default(num_tokens):
+def test_fp16_weight_moe_warp_decode_matches_default(num_tokens):
     """The warp-reduce GEMV decode path matches the split-K/reduce path."""
     hidden, w1, w2, topk_ids, topk_weights = _build(num_tokens)
     warp = gluon_bf16_moe(hidden, w1, w2, topk_ids, topk_weights, warp_decode=True)

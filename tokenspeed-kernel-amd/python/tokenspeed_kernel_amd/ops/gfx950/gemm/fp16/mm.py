@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
-from tokenspeed_kernel_amd.ops.gfx950.gemm.a16w16.largem import (
+from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
     _supports_largem_shape,
     gluon_mm_a16w16_largem_gfx950,
 )

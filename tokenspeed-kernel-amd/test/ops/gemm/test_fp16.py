@@ -38,11 +38,11 @@ if not _is_gfx950():
     )
 
 
-from tokenspeed_kernel_amd.ops.gfx950.gemm.a16w16.largem import (  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (  # noqa: E402
     _supports_largem_shape,
     gluon_mm_a16w16_largem_gfx950,
 )
-from tokenspeed_kernel_amd.ops.gfx950.gemm.a16w16.mm import (  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (  # noqa: E402
     _choose_mfma_lds_mediumm_config,
     _get_partial_scratch,
     _supports_mfma_lds_smallm,

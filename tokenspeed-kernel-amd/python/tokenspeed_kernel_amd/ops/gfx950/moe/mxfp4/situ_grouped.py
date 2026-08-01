@@ -33,10 +33,10 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel_amd._triton import cdna4_async_copy, gl, gluon, triton
-from tokenspeed_kernel_amd.ops.gfx950.moe.bf16.moe_align_device import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.moe_align_device import (
     moe_align_block_size_device,
 )
-from tokenspeed_kernel_amd.ops.gfx950.moe.bf16.moe_align_fused import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.moe_align_fused import (
     moe_align_block_size_fused,
 )
 

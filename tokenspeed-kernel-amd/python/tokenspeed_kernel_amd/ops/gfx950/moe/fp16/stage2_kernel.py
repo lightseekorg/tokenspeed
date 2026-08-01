@@ -275,7 +275,7 @@ def invoke_stage2(
     if atomic is None:
         atomic = num_tokens <= 1
     if atomic:
-        from tokenspeed_kernel_amd.ops.gfx950.moe.bf16.stage2_decode_kernel import (
+        from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.stage2_decode_kernel import (
             invoke_stage2_decode,
         )
 
