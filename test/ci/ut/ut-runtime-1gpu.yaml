@@ -1,6 +1,7 @@
 api_version: ci.tokenspeed.io/v1
 name: ut-runtime-1gpu
 type: ut
+workflow_stage: runtime-test
 triggers:
   - per-commit
   - manual

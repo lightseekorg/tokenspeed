@@ -8,6 +8,7 @@ Current trigger values:
 - `per-commit`
 - `manual`
 - `nightly`
+- `debug`
 
 Supported task types:
 
@@ -19,7 +20,19 @@ Supported task types:
 Currently configured task directories:
 
 - `eval`
+- `perf`
 - `ut`
+
+Every task declares one `workflow_stage`:
+
+- `kernel-test` for kernel unit tests
+- `runtime-test` for runtime tests
+- `model-test` for model evaluation and performance tests
+
+The PR workflows run these stages in that order. Matrix entries within a stage
+run in parallel, but a later stage starts only after every required job in the
+previous stage succeeds. A stage with no matching tasks is treated as
+successfully satisfied.
 
 Each task expands into one matrix entry per runner label. Add a top-level
 `priority` to a task YAML to bias dispatch order. GitHub Actions starts matrix
@@ -41,9 +54,9 @@ priority:
   b300-1gpu: low
 ```
 
-Typical use: lower a 1gpu kernel unit-test on `b300-1gpu` so the heavier
-b300-4gpu evals that share the same box claim the runner first, without
-disturbing the same task's ordering on the other GPU families.
+Typical use: adjust one runner instance without disturbing the same task's
+dispatch order on other GPU families. Priority only affects jobs within the
+same workflow stage; later stages cannot contend with earlier ones.
 
 `optional` marks a task or per-label matrix entry as non-blocking.
 Optional entries are emitted with `matrix.optional: true`, and the PR workflows

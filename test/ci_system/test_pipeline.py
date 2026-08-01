@@ -600,6 +600,7 @@ _DEFAULT_BODY_TEMPLATE = """\
 api_version: ci.tokenspeed.io/v1
 name: {name}
 type: ut
+workflow_stage: runtime-test
 triggers:
   - per-commit
 runner:
