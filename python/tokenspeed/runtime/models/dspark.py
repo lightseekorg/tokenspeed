@@ -20,10 +20,11 @@
 
 """Static DSpark draft model.
 
-The backbone, target-hidden projection, KV injection and block forward are 
-all inherited unchanged from ``DFlashDraftModel``; the only addition is a 
-per-position Markov head that turns the parallel mask-forward proposal into 
-a semi-autoregressive one by adding a bigram-style bias to the base logits before sampling.
+The backbone, target-hidden projection, KV injection and block forward are
+all inherited unchanged from ``DFlashDraftModel``; the only addition is a
+per-position Markov head that turns the parallel mask-forward proposal into a
+semi-autoregressive one by adding a bigram-style bias to the base logits
+before sampling.
 
 This module implements the minimal static configuration: the ``vanilla``
 Markov head only (no confidence head, no gated/rnn heads, no

@@ -49,6 +49,48 @@ if TYPE_CHECKING:
 logger = get_colorful_logger(__name__)
 
 
+def _resolve_block_geometry(cfg, spec_num_tokens: int) -> tuple[int, int]:
+    """Resolve (verify_width, draft_block_size) for a block drafter.
+
+    ``spec_num_tokens`` is the verify width: one anchor row plus one row per
+    drafted token, so ``draft_block_size = spec_num_tokens - 1``.
+
+    A checkpoint's ``block_size`` is ambiguous across the two lineages that
+    write it. TorchSpec/DSpark checkpoints store the *draft* count (7), while
+    older DFlash checkpoints store the *verify* width (8). Accept either and
+    reject anything that matches neither, rather than warning and continuing
+    with a silently wrong block.
+    """
+    verify_width = int(spec_num_tokens)
+    if verify_width < 2:
+        raise ValueError(
+            "Block drafting requires speculative_num_draft_tokens >= 2 "
+            f"(one anchor plus at least one draft); got {verify_width}."
+        )
+    draft_block_size = verify_width - 1
+
+    dflash_cfg = getattr(cfg, "dflash_config", {}) or {}
+    ckpt_block_size = (
+        dflash_cfg.get("block_size")
+        if isinstance(dflash_cfg, dict)
+        else None
+    )
+    if ckpt_block_size is None:
+        ckpt_block_size = getattr(cfg, "block_size", None)
+    if ckpt_block_size is not None and int(ckpt_block_size) not in (
+        draft_block_size,
+        verify_width,
+    ):
+        raise ValueError(
+            f"Block size mismatch: checkpoint block_size={int(ckpt_block_size)} "
+            f"is neither the draft block size ({draft_block_size}) nor the "
+            f"verify width ({verify_width}) implied by "
+            f"--speculative-num-draft-tokens {verify_width}. Launch with "
+            f"--speculative-num-draft-tokens {int(ckpt_block_size) + 1}."
+        )
+    return verify_width, draft_block_size
+
+
 class DFlash(BaseDrafter):
     """DFlash block drafter backed by a native TokenSpeed draft model."""
 
@@ -104,14 +146,11 @@ class DFlash(BaseDrafter):
                 "DFLASH draft config must define dflash_config.mask_token_id."
             )
         self.mask_token_id = int(mask_token_id)
-        self.block_size = int(getattr(cfg, "block_size", spec_num_tokens))
-        if self.block_size != int(spec_num_tokens):
-            logger.warning(
-                "DFLASH block size mismatch: checkpoint block_size=%s, "
-                "runtime speculative_num_draft_tokens=%s.",
-                self.block_size,
-                spec_num_tokens,
-            )
+        self.verify_width, self.draft_block_size = _resolve_block_geometry(
+            cfg, int(spec_num_tokens)
+        )
+        # Legacy alias: callers that predate the verify/draft split.
+        self.block_size = self.verify_width
         self.hidden_size = int(getattr(cfg, "hidden_size"))
         self.idle_forward_steps = 1
         self._init_native_buffers()
