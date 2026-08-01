@@ -72,9 +72,7 @@ def _resolve_block_geometry(cfg, spec_num_tokens: int) -> tuple[int, int]:
 
     dflash_cfg = getattr(cfg, "dflash_config", {}) or {}
     ckpt_block_size = (
-        dflash_cfg.get("block_size")
-        if isinstance(dflash_cfg, dict)
-        else None
+        dflash_cfg.get("block_size") if isinstance(dflash_cfg, dict) else None
     )
     if ckpt_block_size is None:
         ckpt_block_size = getattr(cfg, "block_size", None)

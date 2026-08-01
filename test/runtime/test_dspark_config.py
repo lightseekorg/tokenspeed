@@ -21,7 +21,6 @@ from tokenspeed.runtime.execution.model_executor import _get_drafter_impl
 from tokenspeed.runtime.models.dspark import _get_markov_params
 from tokenspeed.runtime.utils.hf_transformers_utils import get_config
 
-
 # --------------------------------------------------------------------------
 # Block geometry: verify width vs draft block size
 # --------------------------------------------------------------------------

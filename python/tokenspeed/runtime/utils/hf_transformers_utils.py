@@ -48,6 +48,7 @@ from tokenspeed.runtime.configs import (
     InklingModelConfig,
     KimiK2Config,
     KimiK3Config,
+    KimiK3DSparkConfig,
     KimiK25Config,
     MiniMaxM2Config,
     MiniMaxM3Config,
@@ -75,6 +76,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     KimiK2Config.model_type: KimiK2Config,
     KimiK25Config.model_type: KimiK25Config,
     KimiK3Config.model_type: KimiK3Config,
+    KimiK3DSparkConfig.model_type: KimiK3DSparkConfig,
     InklingModelConfig.model_type: InklingModelConfig,
     InklingMMConfig.model_type: InklingMMConfig,
 }
