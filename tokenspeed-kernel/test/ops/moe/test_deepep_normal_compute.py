@@ -116,9 +116,7 @@ def test_normal_mode_expert_compute_matches_dequantized_reference():
     recv_x, recv_scales = _quantize_blockwise(
         torch.randn(num_recv, hidden, device=device)
     )
-    topk_ids = torch.full(
-        (num_recv, top_k), -1, dtype=torch.int32, device=device
-    )
+    topk_ids = torch.full((num_recv, top_k), -1, dtype=torch.int32, device=device)
     # Give every token two local experts and leave the other slots remote, the
     # shape dispatch produces when a rank owns a slice of the expert set.
     for token in range(num_recv):
@@ -142,9 +140,7 @@ def test_normal_mode_expert_compute_matches_dequantized_reference():
     )
     total_rows = gemm_x.shape[0]
 
-    gateup = torch.empty(
-        (total_rows, 2 * ispp), dtype=torch.bfloat16, device=device
-    )
+    gateup = torch.empty((total_rows, 2 * ispp), dtype=torch.bfloat16, device=device)
     deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
         (gemm_x, deep_gemm.get_mn_major_tma_aligned_tensor(gemm_scales)),
         (w13, w13_scales),
@@ -152,14 +148,12 @@ def test_normal_mode_expert_compute_matches_dequantized_reference():
         m_indices,
     )
 
-    activated = torch.nn.functional.silu(gateup[:, :ispp].float()) * gateup[
-        :, ispp:
-    ].float()
+    activated = (
+        torch.nn.functional.silu(gateup[:, :ispp].float()) * gateup[:, ispp:].float()
+    )
     down_in, down_scales = _quantize_blockwise(activated)
 
-    expert_out = torch.empty(
-        (total_rows, hidden), dtype=torch.bfloat16, device=device
-    )
+    expert_out = torch.empty((total_rows, hidden), dtype=torch.bfloat16, device=device)
     deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
         (down_in, deep_gemm.get_mn_major_tma_aligned_tensor(down_scales)),
         (w2, w2_scales),
@@ -184,9 +178,9 @@ def test_normal_mode_expert_compute_matches_dequantized_reference():
     rows = sorted(row_to_token)
     tokens = [row_to_token[row] for row in rows]
     experts = m_indices[rows].long()
-    gateup_ref = torch.einsum(
-        "rk,rnk->rn", x_ref[tokens], w13_ref[experts]
-    ).to(torch.bfloat16)
+    gateup_ref = torch.einsum("rk,rnk->rn", x_ref[tokens], w13_ref[experts]).to(
+        torch.bfloat16
+    )
     torch.testing.assert_close(
         gateup[rows].float(),
         gateup_ref.float(),
@@ -202,9 +196,7 @@ def test_normal_mode_expert_compute_matches_dequantized_reference():
     reference = torch.zeros(num_recv, hidden, device=device, dtype=torch.float32)
     for row, token in row_to_token.items():
         slot = int((dest_index[token] == row).nonzero()[0])
-        reference[token] += (
-            down_ref[rows.index(row)] * topk_weights[token, slot]
-        )
+        reference[token] += down_ref[rows.index(row)] * topk_weights[token, slot]
 
     torch.testing.assert_close(
         got.float(),

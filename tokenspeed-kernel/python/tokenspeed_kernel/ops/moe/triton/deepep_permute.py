@@ -207,9 +207,7 @@ def deepep_scatter(
     # Zeroed so the padding rows inside each expert block dequantize to zero
     # instead of feeding denormal garbage into the GEMM.
     x_scale = torch.zeros((total_rows, num_scales), dtype=torch.float32, device=device)
-    dest_index = torch.full(
-        (num_recv, top_k), -1, dtype=torch.int32, device=device
-    )
+    dest_index = torch.full((num_recv, top_k), -1, dtype=torch.int32, device=device)
 
     # Block starts double as the write cursors the scatter kernel bumps. The
     # counts are host-side already, so the prefix sum costs one small H2D copy

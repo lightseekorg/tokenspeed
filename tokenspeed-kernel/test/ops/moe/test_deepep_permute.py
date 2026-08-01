@@ -143,9 +143,7 @@ def test_gather_matches_weighted_reference(num_recv, hidden, top_k, num_local_ex
     _, _, _, dest_index = deepep_scatter(
         recv_x, recv_scale, topk_ids, counts, expert_alignment=_ALIGNMENT
     )
-    gemm_out = torch.randn(
-        (sum(counts), hidden), device="cuda", dtype=torch.bfloat16
-    )
+    gemm_out = torch.randn((sum(counts), hidden), device="cuda", dtype=torch.bfloat16)
 
     got = deepep_gather(gemm_out, topk_ids, topk_weights, dest_index)
 
@@ -166,9 +164,7 @@ def test_gather_matches_weighted_reference(num_recv, hidden, top_k, num_local_ex
 
 
 def test_scatter_rejects_unaligned_counts():
-    recv_x, recv_scale, topk_ids, _, counts = _make_recv(
-        8, 256, 4, 2, seed=0
-    )
+    recv_x, recv_scale, topk_ids, _, counts = _make_recv(8, 256, 4, 2, seed=0)
     counts[0] += 1
     with pytest.raises(ValueError, match="aligned"):
         deepep_scatter(

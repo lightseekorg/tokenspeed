@@ -371,9 +371,9 @@ def test_fused_swiglu_fp8_ue8m0_matches_reference(
 
     torch.testing.assert_close(got_scale, ref_scale.squeeze(-1), rtol=0, atol=0)
     dequant = out.float().view(out.shape[0], num_groups, 128) * got_scale[..., None]
-    ref_dequant = ref_q.float().view_as(dequant) * ref_scale[..., None].squeeze(-1)[
-        ..., None
-    ]
+    ref_dequant = (
+        ref_q.float().view_as(dequant) * ref_scale[..., None].squeeze(-1)[..., None]
+    )
     torch.testing.assert_close(dequant, ref_dequant, rtol=0, atol=0)
 
 

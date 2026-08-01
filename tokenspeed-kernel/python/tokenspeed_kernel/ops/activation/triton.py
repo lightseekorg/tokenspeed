@@ -550,9 +550,7 @@ def _fused_swiglu_fp8_ue8m0_kernel(
     y_q = tl.clamp(y / y_s[:, None], bit8_min, bit8_max).to(out_ptr.dtype.element_ty)
 
     out_base = row.to(tl.int64) * out_stride_row
-    tl.store(
-        out_ptr + out_base + cols, tl.reshape(y_q, (BLOCK,)), mask=col_mask
-    )
+    tl.store(out_ptr + out_base + cols, tl.reshape(y_q, (BLOCK,)), mask=col_mask)
 
     group_ids = pack_col * PACK + tl.arange(0, PACK)
     group_mask = group_ids < groups_per_row

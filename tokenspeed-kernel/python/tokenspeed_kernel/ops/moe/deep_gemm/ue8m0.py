@@ -161,9 +161,7 @@ def requantize_to_ue8m0_(
     for expert in range(weights.shape[0]):
         w = weights[expert]
         s = scales[expert, :blocks_n, :blocks_k].float()
-        expanded = s.repeat_interleave(block_n, dim=0).repeat_interleave(
-            block_k, dim=1
-        )
+        expanded = s.repeat_interleave(block_n, dim=0).repeat_interleave(block_k, dim=1)
         dequantized = w.float() * expanded
 
         tiled = dequantized.view(blocks_n, block_n, blocks_k, block_k)
@@ -171,8 +169,6 @@ def requantize_to_ue8m0_(
         new_scale = _ceil_to_pow2(amax / _FP8_MAX)
         requantized = tiled / new_scale[:, None, :, None]
         w.copy_(
-            requantized.clamp(-_FP8_MAX, _FP8_MAX)
-            .view(n, k)
-            .to(torch.float8_e4m3fn)
+            requantized.clamp(-_FP8_MAX, _FP8_MAX).view(n, k).to(torch.float8_e4m3fn)
         )
         scales[expert, :blocks_n, :blocks_k] = new_scale
