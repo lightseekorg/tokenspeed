@@ -28,7 +28,7 @@ from collections.abc import Mapping
 from enum import Enum, auto
 from typing import Any
 
-import numpy as np
+import msgspec
 import torch
 
 from tokenspeed.runtime.multimodal.hash import hash_feature
@@ -145,21 +145,30 @@ def resolve_mm_pad_substitute_ids(config: Any) -> dict[Modality, int]:
     }
 
 
-# ``eq=False`` on every dataclass below: tensor-valued fields crash the
+# ``eq=False`` on every IPC struct below: tensor-valued fields crash the
 # default element-wise ``__eq__`` and force ``__hash__`` to None.
-@dataclasses.dataclass(eq=False)
-class MultimodalDataItem:
+#
+# ``msgspec.Struct``: these types cross engine IPC nested inside the tokenized
+# request, so they encode as typed msgpack (tensors ride as ext-typed raw
+# buffers via the io_struct codec hooks). Field ORDER is the wire contract —
+# append, never reorder.
+class MultimodalDataItem(msgspec.Struct, eq=False, kw_only=True, array_like=True):
     modality: Modality
     hash: int | None = None
     pad_value: int | None = None
-    offsets: list | None = None
-    feature: torch.Tensor | np.ndarray | ShmTensorHandle | None = None
-    model_specific_data: dict[str, Any] = dataclasses.field(default_factory=dict)
+    offsets: list[tuple[int, int]] | None = None
+    # Inline feature tensor (pixels / mel features / ...). Exactly one of
+    # ``feature`` / ``feature_shm`` is set while the payload is in flight;
+    # msgpack cannot union two hook-decoded types in one field, so the SHM
+    # handle gets its own slot instead of overloading ``feature``.
+    feature: torch.Tensor | None = None
+    feature_shm: ShmTensorHandle | None = None
+    model_specific_data: dict[str, torch.Tensor] = {}
     # Encoder output for this item, populated on first encoder pass and reused
     # across chunked-prefill iterations of the owning request. Lifetime is
     # tied to the request: when the request finishes the item is GC'd and
     # these tensors are released. ``encoded_deepstack`` is set only for
-    # deepstack-enabled modalities.
+    # deepstack-enabled modalities. Scheduler-local: always None on the wire.
     encoded: torch.Tensor | None = None
     encoded_deepstack: torch.Tensor | None = None
     # EPD (encode-prefill-decode): when set, this item's embedding is received
@@ -171,12 +180,26 @@ class MultimodalDataItem:
     # non-EPD items (left to the vision tower).
     encode_handshake: dict | None = None
 
+    def __post_init__(self) -> None:
+        # Compatibility shim for callers that predate the feature/feature_shm
+        # split and pass a SHM handle via ``feature``: re-slot it so the
+        # transport fields stay single-typed.
+        if isinstance(self.feature, ShmTensorHandle):
+            self.feature_shm = self.feature
+            self.feature = None
+
     def __getattr__(self, name: str):
-        if (
-            "model_specific_data" in self.__dict__
-            and name in self.__dict__["model_specific_data"]
-        ):
-            return self.__dict__["model_specific_data"][name]
+        # msgspec structs have no __dict__; read the declared field directly.
+        # Guard underscored names so pickle/copy protocol probes fall through.
+        if not name.startswith("_"):
+            try:
+                model_specific_data = object.__getattribute__(
+                    self, "model_specific_data"
+                )
+            except AttributeError:
+                model_specific_data = None
+            if model_specific_data is not None and name in model_specific_data:
+                return model_specific_data[name]
         raise AttributeError(f"'{self.__class__.__name__}' has no attribute '{name}'")
 
     def ensure_hash(self):
@@ -199,7 +222,7 @@ class MultimodalDataItem:
         if envs.TOKENSPEED_MM_SKIP_COMPUTE_HASH.get():
             self.hash = uuid.uuid4().int
         elif self.hash is None:
-            if isinstance(self.feature, ShmTensorHandle):
+            if self.feature_shm is not None:
                 raise ValueError(
                     "SHM-backed multimodal items must carry content hash or "
                     "pad_value before TokenSpeed consumes them"
@@ -221,14 +244,14 @@ class MultimodalDataItem:
         return self.modality == modality
 
 
-@dataclasses.dataclass(eq=False)
-class MultimodalInputs:
+class MultimodalInputs(msgspec.Struct, eq=False, kw_only=True, array_like=True):
     mm_items: list[MultimodalDataItem]
     im_token_id: int | None = None
     video_token_id: int | None = None
     mrope_positions: torch.Tensor | None = None
     mrope_position_delta: torch.Tensor | None = None
     mrope_position_delta_scalar: int | None = None
+    # Scheduler-local expansion cache; always None on the wire.
     mrope_position_delta_repeated_cache: torch.Tensor | None = None
 
     def ensure_pad_values(self) -> None:
@@ -238,24 +261,25 @@ class MultimodalInputs:
     def publish_shm_features(self) -> None:
         for item in self.mm_items:
             if isinstance(item.feature, torch.Tensor):
-                item.feature = ShmTensorHandle.publish(item.feature)
+                item.feature_shm = ShmTensorHandle.publish(item.feature)
+                item.feature = None
 
     def attach_shm_features(self) -> None:
         """Open every pending handle on this rank. Must run before the
         cross-rank barrier in ``request_handler.recv_reqs``.
         """
         for item in self.mm_items:
-            if isinstance(item.feature, ShmTensorHandle):
-                item.feature.attach()
+            if item.feature_shm is not None:
+                item.feature_shm.attach()
 
     def release_shm_features(self) -> None:
         for item in self.mm_items:
-            if isinstance(item.feature, ShmTensorHandle):
-                item.feature.release()
-                item.feature = None
+            if item.feature_shm is not None:
+                item.feature_shm.release()
+                item.feature_shm = None
 
     def has_pending_shm_features(self) -> bool:
-        return any(isinstance(item.feature, ShmTensorHandle) for item in self.mm_items)
+        return any(item.feature_shm is not None for item in self.mm_items)
 
 
 @dataclasses.dataclass(eq=False)

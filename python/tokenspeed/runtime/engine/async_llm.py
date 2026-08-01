@@ -526,7 +526,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         if rid not in self.rid_to_state:
             return
         del self.rid_to_state[rid]
-        req = AbortReq(rid)
+        req = AbortReq(rid=rid)
         self.engine_core_client.send_to_scheduler.send_pyobj(req)
 
     # ---- RL weight-transfer admission gate ------------------------------

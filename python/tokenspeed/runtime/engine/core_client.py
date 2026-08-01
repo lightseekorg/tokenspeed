@@ -42,6 +42,7 @@ change.
 import zmq
 import zmq.asyncio
 
+from tokenspeed.runtime.engine.io_struct import AsyncIpcReceiver, IpcSender
 from tokenspeed.runtime.utils import get_zmq_socket
 from tokenspeed.runtime.utils.server_args import PortArgs
 
@@ -49,16 +50,19 @@ from tokenspeed.runtime.utils.server_args import PortArgs
 class EngineCoreClient:
     """Owns the scheduler-facing ZMQ sockets for ``AsyncLLM``.
 
-    Instantiated once per ``AsyncLLM`` in the front-end process. Socket
-    attributes are exposed directly so call sites can keep the existing
-    ``send_pyobj`` / ``recv_pyobj`` ergonomics without a wrapper layer.
+    Instantiated once per ``AsyncLLM`` in the front-end process. The sockets
+    are wrapped in the msgpack IPC adapters from ``io_struct``, which keep
+    the existing ``send_pyobj`` / ``recv_pyobj`` call-site ergonomics while
+    switching the serialization off pickle.
     """
 
     def __init__(self, port_args: PortArgs):
         self.context = zmq.asyncio.Context(2)
-        self.recv_from_detokenizer = get_zmq_socket(
-            self.context, zmq.PULL, port_args.tokenizer_ipc_name, True
+        self.recv_from_detokenizer = AsyncIpcReceiver(
+            get_zmq_socket(self.context, zmq.PULL, port_args.tokenizer_ipc_name, True)
         )
-        self.send_to_scheduler = get_zmq_socket(
-            self.context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
+        self.send_to_scheduler = IpcSender(
+            get_zmq_socket(
+                self.context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
+            )
         )

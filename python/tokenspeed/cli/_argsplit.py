@@ -24,6 +24,10 @@ A leading positional argument is treated as the model (vllm-style
 ``ts serve <model> [flags...]``) and rewritten to ``--model <model>``
 before routing.
 
+``--headless`` short-circuits the split entirely (see
+``split_headless_argv``): the engine is the only process, so every
+remaining flag is a ServerArgs flag and no engine/gateway routing applies.
+
 Routing precedence is top-down. The first matching rule wins:
 
 1. Orchestrator-only flags (consumed, never forwarded)
@@ -70,6 +74,8 @@ _GATEWAY_OVERRIDE = {
 _ENGINE_EXPLICIT = {"--tensor-parallel-size"}
 
 _MODEL_FLAG_TOKENS = ("--model", "--model-path")
+
+_HEADLESS_FLAG = "--headless"
 
 _ENGINE_MULTI_VALUE_FLAGS = {
     "--cudagraph-capture-sizes",
@@ -146,6 +152,33 @@ def _append_arg(args: list[str], name: str, value: list[str] | str | None) -> No
         args.extend([name, *value])
     else:
         args.extend([name, value])
+
+
+def split_headless_argv(argv: list[str]) -> list[str] | None:
+    """Extract the ServerArgs argv for ``ts serve --headless``.
+
+    Returns ``None`` when ``--headless`` is absent (default orchestrator
+    mode). Otherwise returns the argv with the flag removed, for
+    ``prepare_server_args`` verbatim: the engine is the only process, so
+    positional-model and alias handling belong to ServerArgs' own parser
+    and no engine/gateway routing applies.
+
+    Raises:
+        ValueError: if an orchestrator-only flag is present. Headless mode
+            has no gateway lifecycle to configure, so rejecting loudly beats
+            silently ignoring the flag.
+    """
+    if _HEADLESS_FLAG not in argv:
+        return None
+    tokens = [token for token in argv if token != _HEADLESS_FLAG]
+    for token in tokens:
+        name = token.partition("=")[0]
+        if name in _ORCH_FLAGS:
+            raise ValueError(
+                f"{name} configures the gateway orchestrator and is not "
+                "valid with --headless (no gateway is spawned)"
+            )
+    return tokens
 
 
 @functools.lru_cache(maxsize=1)

@@ -74,7 +74,6 @@ from tokenspeed.runtime.multimodal.inputs import (
     MultimodalForwardContext,
     MultimodalInputs,
 )
-from tokenspeed.runtime.multimodal.shm_transport import ShmTensorHandle
 from tokenspeed.runtime.utils.env import envs
 
 EncoderFn = Callable[[list[MultimodalDataItem]], torch.Tensor]
@@ -654,15 +653,16 @@ class MultimodalEmbedder:
         pending = [
             it
             for it in items
-            if isinstance(it.feature, (torch.Tensor, ShmTensorHandle))
-            and (isinstance(it.feature, ShmTensorHandle) or it.feature.device != device)
+            if it.feature_shm is not None
+            or (isinstance(it.feature, torch.Tensor) and it.feature.device != device)
         ]
         if not pending:
             return
 
         for it in pending:
-            if isinstance(it.feature, ShmTensorHandle):
-                it.feature = it.feature.consume()
+            if it.feature_shm is not None:
+                it.feature = it.feature_shm.consume()
+                it.feature_shm = None
 
         if device.type != "cuda":
             for it in pending:
@@ -683,10 +683,11 @@ class MultimodalEmbedder:
 
     @staticmethod
     def _drop_raw_feature(item: MultimodalDataItem) -> bool:
-        if item.feature is None:
+        if item.feature is None and item.feature_shm is None:
             return False
-        if isinstance(item.feature, ShmTensorHandle):
-            item.feature.release()
+        if item.feature_shm is not None:
+            item.feature_shm.release()
+            item.feature_shm = None
         item.feature = None
         return True
 
