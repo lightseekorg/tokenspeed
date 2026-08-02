@@ -43,7 +43,7 @@ class _StubTokenizer:
         return [0] * len(text)
 
 
-def _make_processor() -> InputProcessor:
+def _make_processor(*, enable_output_logprobs: bool = False) -> InputProcessor:
     engine = SimpleNamespace(
         context_len=CONTEXT_LEN,
         is_generation=True,
@@ -52,6 +52,10 @@ def _make_processor() -> InputProcessor:
         server_args=SimpleNamespace(
             reasoning_parser=None,
             enable_prefix_caching=False,
+            enable_output_logprobs=enable_output_logprobs,
+            disaggregation_mode="null",
+            enable_mixed_batch=False,
+            speculative_algorithm=None,
         ),
         model_config=SimpleNamespace(
             vocab_size=32000,
@@ -122,6 +126,65 @@ def test_batch_each_item_gets_own_dict():
     assert results[0].sampling_params.max_new_tokens == CONTEXT_LEN - 90
     assert results[1].sampling_params.max_new_tokens == CONTEXT_LEN - 10
     assert results[2].sampling_params.max_new_tokens == CONTEXT_LEN - 5
+
+
+def test_native_logprob_fields_are_preserved_for_execution():
+    obj = GenerateReqInput(
+        input_ids=[10, 11, 12],
+        sampling_params={"max_new_tokens": 0},
+        return_logprob=True,
+        logprob_start_len=0,
+        top_logprobs_num=2,
+        token_ids_logprob=[7, 9],
+    )
+    obj.normalize_batch_and_arguments()
+
+    out = asyncio.run(
+        _make_processor(enable_output_logprobs=True).tokenize_one_request(obj)
+    )
+
+    assert out.logprob_start_len == 0
+    assert out.top_logprobs_num == 2
+    assert out.token_ids_logprob == [7, 9]
+    assert out.sampling_params.logprob_start_len == 0
+    assert out.sampling_params.logprob_top_k == 2
+    assert out.sampling_params.logprob_token_ids == [7, 9]
+
+
+def test_logprobs_require_server_opt_in():
+    obj = GenerateReqInput(
+        input_ids=[10, 11],
+        sampling_params={"max_new_tokens": 1},
+        return_logprob=True,
+    )
+    obj.normalize_batch_and_arguments()
+
+    with pytest.raises(ValueError, match="enable_output_logprobs"):
+        asyncio.run(_make_processor().tokenize_one_request(obj))
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("logprob_start_len", 4, "logprob_start_len"),
+        ("top_logprobs_num", 129, "top_logprobs_num"),
+        ("token_ids_logprob", [32000], "outside the model vocabulary"),
+    ],
+)
+def test_native_logprob_fields_are_bounded(field, value, match):
+    kwargs = {
+        "input_ids": [10, 11, 12],
+        "sampling_params": {"max_new_tokens": 1},
+        "return_logprob": True,
+        field: value,
+    }
+    obj = GenerateReqInput(**kwargs)
+    obj.normalize_batch_and_arguments()
+
+    with pytest.raises(ValueError, match=match):
+        asyncio.run(
+            _make_processor(enable_output_logprobs=True).tokenize_one_request(obj)
+        )
 
 
 if __name__ == "__main__":

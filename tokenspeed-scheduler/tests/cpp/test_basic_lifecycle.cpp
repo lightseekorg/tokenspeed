@@ -75,6 +75,29 @@ TEST_F(BasicLifecycleTestSuite, FullLifecycle_SubmitThroughFinish) {
     EXPECT_EQ(scheduler_->DecodingSize(), 0u);
 }
 
+#if !TOKENSPEED_FLAT_KVCACHE
+TEST_F(BasicLifecycleTestSuite, PromptLogprobsCapPrefixMatchAtStartPosition) {
+    auto source = MakeRequestSpec("source", 4);  // [1..8], block_size=2.
+    Submit(source);
+    ASSERT_NE(GetForwardOp(PlanOnce()), nullptr);
+    SendForwardDone("source", {42});
+    ASSERT_NE(GetForwardOp(PlanOnce()), nullptr);
+    SendFinish("source");
+    PlanOnce();
+    PlanOnce();
+
+    auto scored = MakeRequestSpec("scored", 4);
+    scored.logprob_start_len = 2;
+    Submit(scored);
+    auto plan = PlanOnce();
+    auto* fwd = GetForwardOp(plan);
+    ASSERT_NE(fwd, nullptr);
+    ASSERT_EQ(fwd->request_ids.size(), 1u);
+    EXPECT_EQ(fwd->extend_prefix_lens[0], 2);
+    EXPECT_EQ(fwd->extend_logprob_start_lens[0], 0);
+}
+#endif
+
 TEST_F(BasicLifecycleTestSuite, EmptyPlan_NoRequests) {
     auto plan = PlanOnce();
     auto* fwd = GetForwardOp(plan);

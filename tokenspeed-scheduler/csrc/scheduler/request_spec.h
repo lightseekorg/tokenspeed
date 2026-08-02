@@ -32,6 +32,9 @@ struct RequestSpec {
     std::vector<std::int32_t> tokens;
     std::vector<std::string> rolling_hashes;
     std::int32_t storage_hit_pages{0};
+    // Absolute prompt position where returned input logprobs begin.
+    // -1 means output-token logprobs only.
+    std::int32_t logprob_start_len{-1};
 };
 
 struct PrefillInfo {

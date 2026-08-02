@@ -597,6 +597,8 @@ class PrefillGraph:
         exposes the embeds-only ``multimodal_input_embeds`` seam; models with
         extra per-layer inputs (deepstack) run eager.
         """
+        if ctx.return_logprob_details or ctx.extend_return_logprob:
+            return False
         if multimodal_context is not None and self._multimodal_input_embeds is None:
             return False
         return self._replay_bucket(ctx) is not None

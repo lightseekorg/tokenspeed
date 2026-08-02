@@ -34,6 +34,7 @@ TokenSpeed-specific behavior explicitly.
 | `--block-size` | KV cache block size. |
 | `--enable-prefix-caching` | Enable prefix cache reuse. |
 | `--no-enable-prefix-caching` | Disable prefix cache reuse. |
+| `--enable-output-logprobs` | Enable sampled, top-k, prompt, and requested-token logprob responses. |
 | `--enforce-eager` | Disable CUDA graph execution. |
 | `--max-cudagraph-capture-size` | Largest CUDA graph capture size. |
 | `--tensor-parallel-size`, `--tp` | Set attention tensor parallel size. |

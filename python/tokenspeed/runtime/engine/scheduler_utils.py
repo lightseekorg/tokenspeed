@@ -190,10 +190,24 @@ def aligned_max_scheduled_tokens(
     return max(max_scheduled_tokens - max_scheduled_tokens % grain, grain)
 
 
-def make_spec(rid: str, tokens: list[int]) -> RequestSpec:
+def make_spec(
+    rid: str, tokens: list[int], *, logprob_start_len: int = -1
+) -> RequestSpec:
+    """Build a scheduler request.
+
+    Args:
+        rid: Request identifier.
+        tokens: Full prompt token IDs.
+        logprob_start_len: Absolute prompt position where input logprobs begin,
+            or ``-1`` for output-only logprobs.
+
+    Returns:
+        The scheduler request specification.
+    """
     spec = RequestSpec()
     spec.request_id = rid
     spec.tokens = tokens
+    spec.logprob_start_len = logprob_start_len
     return spec
 
 

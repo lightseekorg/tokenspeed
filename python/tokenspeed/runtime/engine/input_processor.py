@@ -224,40 +224,100 @@ class InputProcessor:
         sampling_params.normalize(self.engine.tokenizer)
         sampling_params.verify(self.engine.model_config.vocab_size)
 
-        # Output logprobs: two request dialects, one compute path. vLLM uses
-        # sampling_params.logprobs; SGLang uses GenerateReqInput.return_logprob
-        # (+ top_logprobs_num / logprob_start_len / token_ids_logprob). Either way
-        # the scheduler computes only the sampled token's logprob; the response
-        # dialect is chosen at render time. Gate unsupported CAPABILITIES loudly
-        # here rather than silently clamping the request shape.
-        sglang_req = bool(getattr(obj, "return_logprob", False))
-        return_logprob = sampling_params.logprobs is not None or sglang_req
-        # Output logprobs are gated by the static server arg enable_output_logprobs
-        # (the sampler only gathers them when on). Reject loudly instead of
-        # silently returning empty logprobs when the server cannot honor it.
+        # The native detailed-logprob fields share the sampled-logprob compute
+        # path used by sampling_params.logprobs.
+        native_logprob_request = bool(getattr(obj, "return_logprob", False))
+        return_logprob = sampling_params.logprobs is not None or native_logprob_request
         if return_logprob and not self.engine.server_args.enable_output_logprobs:
             raise ValueError(
                 "logprobs were requested but the server was started without "
                 "enable_output_logprobs; restart with enable_output_logprobs=True "
-                "to return output logprobs."
+                "to return logprobs."
             )
-        if sglang_req:
-            # vLLM top-k / full-vocab are gated in SamplingParams.verify(); gate
-            # the SGLang capability knobs here for parity.
-            if getattr(obj, "top_logprobs_num", 0):
+        logprob_start_len = (
+            int(getattr(obj, "logprob_start_len", -1)) if native_logprob_request else -1
+        )
+        top_logprobs_num = (
+            int(getattr(obj, "top_logprobs_num", 0) or 0)
+            if native_logprob_request
+            else 0
+        )
+        token_ids_logprob = (
+            getattr(obj, "token_ids_logprob", None) if native_logprob_request else None
+        )
+        if not native_logprob_request and (
+            getattr(obj, "top_logprobs_num", 0)
+            or getattr(obj, "token_ids_logprob", None)
+            or int(getattr(obj, "logprob_start_len", -1)) >= 0
+        ):
+            raise ValueError(
+                "return_logprob=True is required when using native detailed-logprob "
+                "fields."
+            )
+        if logprob_start_len < -1 or logprob_start_len > input_token_num:
+            raise ValueError(
+                "logprob_start_len must be -1 or a prompt position in "
+                f"[0, {input_token_num}], got {logprob_start_len}."
+            )
+        if top_logprobs_num < 0 or top_logprobs_num > 128:
+            raise ValueError(
+                "top_logprobs_num must be between 0 and 128, got "
+                f"{top_logprobs_num}."
+            )
+        if top_logprobs_num > self.engine.model_config.vocab_size:
+            raise ValueError(
+                "top_logprobs_num cannot exceed the model vocabulary size "
+                f"({self.engine.model_config.vocab_size})."
+            )
+        if token_ids_logprob is not None:
+            token_ids_logprob = [int(token_id) for token_id in token_ids_logprob]
+            invalid_ids = [
+                token_id
+                for token_id in token_ids_logprob
+                if not 0 <= token_id < self.engine.model_config.vocab_size
+            ]
+            if invalid_ids:
                 raise ValueError(
-                    "top_logprobs_num > 0 (output top-k logprobs) is not supported "
-                    "yet; use top_logprobs_num=0 (the sampled token's logprob)."
+                    "token_ids_logprob contains IDs outside the model vocabulary: "
+                    f"{invalid_ids}."
                 )
-            if (getattr(obj, "logprob_start_len", -1) or -1) >= 0:
+
+        advanced_logprobs = (
+            logprob_start_len >= 0
+            or top_logprobs_num > 0
+            or token_ids_logprob is not None
+        )
+        if advanced_logprobs:
+            if (
+                input_embeds is not None
+                or getattr(obj, "precomputed_multimodal_inputs", None) is not None
+            ):
                 raise ValueError(
-                    "logprob_start_len >= 0 (prompt logprobs) is not supported yet."
+                    "prompt, top-k, and token-ID logprobs are currently "
+                    "supported only for text-token inputs."
                 )
-            if getattr(obj, "token_ids_logprob", None):
-                raise ValueError("token_ids_logprob is not supported yet.")
-        logprob_start_len = -1
-        top_logprobs_num = 0
-        token_ids_logprob = None
+            if self.engine.server_args.disaggregation_mode != "null":
+                raise ValueError(
+                    "prompt, top-k, and token-ID logprobs are currently supported "
+                    "only in fused serving mode."
+                )
+            if self.engine.server_args.enable_mixed_batch:
+                raise ValueError(
+                    "prompt, top-k, and token-ID logprobs require mixed prefill/"
+                    "decode batching to be disabled."
+                )
+            if self.engine.server_args.speculative_algorithm is not None:
+                raise ValueError(
+                    "prompt, top-k, and token-ID logprobs are not yet supported "
+                    "with speculative decoding."
+                )
+
+        # Keep request-only details next to the already-aligned sampling params
+        # so the executor can retrieve them without expanding the C++ scheduler
+        # operation surface further.
+        sampling_params.logprob_top_k = top_logprobs_num
+        sampling_params.logprob_token_ids = token_ids_logprob
+        sampling_params.logprob_start_len = logprob_start_len
 
         if isinstance(obj, GenerateReqInput):
             return TokenizedGenerateReqInput(

@@ -199,7 +199,10 @@ Scheduler::FlatAdmissionMatch Scheduler::matchFlatPrefixAtAdmission(Request* req
     // Hash input must be byte-identical to the REGISTRATION form (GetFullPagedTokens(false)); radix's
     // except_last rule (last prompt token recomputed for logits) becomes the page cap, also bounding SWA.
     const std::int32_t cache_block_tokens = coordinator_.CacheBlockTokens();
-    const std::int32_t cap_pages = std::max((request->PrefillSize() - 1) / cache_block_tokens, 0);
+    std::int32_t cap_pages = std::max((request->PrefillSize() - 1) / cache_block_tokens, 0);
+    if (request->LogprobStartLen() >= 0) {
+        cap_pages = std::min(cap_pages, request->LogprobStartLen() / cache_block_tokens);
+    }
     std::vector<std::span<const std::int32_t>> paged_tokens = request->GetFullPagedTokens(/*except_last=*/false);
     if (static_cast<std::size_t>(cap_pages) < paged_tokens.size()) {
         paged_tokens.resize(cap_pages);
@@ -309,8 +312,15 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     Request* request, std::int32_t remaining, std::int32_t decode_input_tokens, bool disable_l2_cache,
     std::map<std::string, std::int32_t>& simulated_free) {
     if (req_pool_allocator_.AvailableSlots() == 0) return {};
-    MatchResult match_result = hybrid_prefix_cache_ ? hybrid_prefix_cache_->Match(request->GetFullPagedTokens(true))
-                                                    : kv_prefix_cache_.Match(request->GetFullPagedTokens(true));
+    auto match_tokens = request->GetFullPagedTokens(true);
+    if (request->LogprobStartLen() >= 0) {
+        const std::size_t max_pages = static_cast<std::size_t>(request->LogprobStartLen() / config_.block_size);
+        if (max_pages < match_tokens.size()) {
+            match_tokens.resize(max_pages);
+        }
+    }
+    MatchResult match_result =
+        hybrid_prefix_cache_ ? hybrid_prefix_cache_->Match(match_tokens) : kv_prefix_cache_.Match(match_tokens);
     std::int32_t loadback_tokens = 0;
     std::int32_t unscheduled = 0;
     std::vector<TreeNode*> loadback_diff;
@@ -1008,6 +1018,13 @@ static PrefillOperation applyPrefillEvent(Request* request, Event& event, const 
     op.input_ids = std::vector<std::int32_t>(info.input_ids.begin(), info.input_ids.end());
     op.shifted_input_ids = std::move(info.shifted_input_ids);
     op.extend_prefix_len = info.already_scheduled_len;
+    const std::int32_t logprob_start_len = request->LogprobStartLen();
+    if (logprob_start_len < 0) {
+        op.extend_logprob_start_len = info.extend_len;
+    } else {
+        const std::int32_t relative_start = logprob_start_len - info.already_scheduled_len;
+        op.extend_logprob_start_len = std::clamp(relative_start, 0, info.extend_len);
+    }
 
     auto* mamba = request->GetLocalMambaAllocator();
     if (mamba != nullptr && mamba->HasWorking()) {

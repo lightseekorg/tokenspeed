@@ -48,7 +48,7 @@ from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.engine.io_struct import TokenizedGenerateReqInput
-    from tokenspeed.runtime.execution.types import ModelExecutionResult
+    from tokenspeed.runtime.execution.types import LogprobDetails, ModelExecutionResult
     from tokenspeed.runtime.metrics.collector import EngineMetrics
     from tokenspeed.runtime.grammar.base_grammar_backend import (
         BaseGrammarObject,
@@ -77,6 +77,7 @@ class RequestState:
         tokenizer,
         eos_token_ids: list[int] = None,
         return_logprob: bool = False,
+        logprob_start_len: int = -1,
         top_logprobs_num: int = 0,
         token_ids_logprob: list[int] | None = None,
         multimodal_inputs=None,
@@ -97,6 +98,7 @@ class RequestState:
         self.tokenizer = tokenizer
         self.computed_length = 0
         self.return_logprob = return_logprob
+        self.logprob_start_len = logprob_start_len
         self.top_logprobs_num = top_logprobs_num
         self.token_ids_logprob = token_ids_logprob
 
@@ -119,6 +121,43 @@ class RequestState:
         self.output_token_logprobs_idx: list[int] | None = (
             [] if return_logprob else None
         )
+        self.input_token_logprobs_val: list[float | None] | None = (
+            [] if return_logprob else None
+        )
+        self.input_token_logprobs_idx: list[int | None] | None = (
+            [] if return_logprob else None
+        )
+        self.input_top_logprobs_val: list[list[float] | None] | None = (
+            [] if return_logprob else None
+        )
+        self.input_top_logprobs_idx: list[list[int] | None] | None = (
+            [] if return_logprob else None
+        )
+        self.input_token_ids_logprobs_val: list[list[float] | None] | None = (
+            [] if return_logprob else None
+        )
+        self.input_token_ids_logprobs_idx: list[list[int] | None] | None = (
+            [] if return_logprob else None
+        )
+        self.output_top_logprobs_val: list[list[float]] | None = (
+            [] if return_logprob else None
+        )
+        self.output_top_logprobs_idx: list[list[int]] | None = (
+            [] if return_logprob else None
+        )
+        self.output_token_ids_logprobs_val: list[list[float]] | None = (
+            [] if return_logprob else None
+        )
+        self.output_token_ids_logprobs_idx: list[list[int]] | None = (
+            [] if return_logprob else None
+        )
+        self.input_logprobs_finalized = False
+        self.input_logprobs_sent = False
+        self._input_token_logprobs_by_pos: dict[int, float] = {}
+        self._input_top_logprobs_by_pos: dict[int, tuple[list[float], list[int]]] = {}
+        self._input_token_ids_logprobs_by_pos: dict[
+            int, tuple[list[float], list[int]]
+        ] = {}
 
         # --- Streaming bookkeeping (internal) ---
         self._surr_offset: int | None = None
@@ -171,6 +210,7 @@ class RequestState:
             tokenizer=tokenizer,
             eos_token_ids=eos_token_ids,
             return_logprob=getattr(recv_req, "return_logprob", False),
+            logprob_start_len=getattr(recv_req, "logprob_start_len", -1),
             top_logprobs_num=getattr(recv_req, "top_logprobs_num", 0),
             token_ids_logprob=getattr(recv_req, "token_ids_logprob", None),
             multimodal_inputs=getattr(recv_req, "multimodal_inputs", None),
@@ -300,11 +340,251 @@ class RequestState:
         )
 
 
-class OutputProcesser:
-    """Streams generation output to the detokenizer.
+# ---------------------------------------------------------------------------
+# Detailed logprob helpers
+# ---------------------------------------------------------------------------
 
-    Logprob support is intentionally omitted.
-    """
+
+def _tolist(value):
+    return value.tolist() if value is not None else None
+
+
+def _record_input_logprob_chunk(
+    request_state: RequestState,
+    values: list[float],
+    details: LogprobDetails,
+    request_index: int,
+    absolute_start: int,
+) -> None:
+    for offset, value in enumerate(values):
+        request_state._input_token_logprobs_by_pos[absolute_start + offset] = value
+
+    if (
+        details.input_top_logprobs_val is not None
+        and details.input_top_logprobs_idx is not None
+        and request_index < len(details.input_top_logprobs_val)
+    ):
+        for offset, (top_values, top_indices) in enumerate(
+            zip(
+                details.input_top_logprobs_val[request_index],
+                details.input_top_logprobs_idx[request_index],
+                strict=True,
+            )
+        ):
+            request_state._input_top_logprobs_by_pos[absolute_start + offset] = (
+                top_values,
+                top_indices,
+            )
+
+    if (
+        details.input_token_ids_logprobs_val is not None
+        and details.input_token_ids_logprobs_idx is not None
+        and request_index < len(details.input_token_ids_logprobs_val)
+    ):
+        for offset, (token_values, token_indices) in enumerate(
+            zip(
+                details.input_token_ids_logprobs_val[request_index],
+                details.input_token_ids_logprobs_idx[request_index],
+                strict=True,
+            )
+        ):
+            request_state._input_token_ids_logprobs_by_pos[absolute_start + offset] = (
+                token_values,
+                token_indices,
+            )
+
+
+def _causal_prompt_alignment(values: list) -> list:
+    return [None, *values[:-1]] if values else []
+
+
+def _finalize_input_logprobs(request_state: RequestState) -> None:
+    if request_state.logprob_start_len < 0 or request_state.input_logprobs_finalized:
+        return
+
+    start = request_state.logprob_start_len
+    prompt_ids = request_state.prompt_input_ids[start:]
+    positions = range(start, request_state.input_length)
+    if prompt_ids:
+        token_values = [
+            request_state._input_token_logprobs_by_pos[position]
+            for position in positions
+        ]
+        request_state.input_token_logprobs_val = _causal_prompt_alignment(token_values)
+        request_state.input_token_logprobs_idx = prompt_ids
+
+        if request_state.top_logprobs_num > 0:
+            top_values_and_indices = [
+                request_state._input_top_logprobs_by_pos[position]
+                for position in positions
+            ]
+            request_state.input_top_logprobs_val = _causal_prompt_alignment(
+                [values for values, _ in top_values_and_indices]
+            )
+            request_state.input_top_logprobs_idx = _causal_prompt_alignment(
+                [indices for _, indices in top_values_and_indices]
+            )
+
+        if request_state.token_ids_logprob is not None:
+            token_values_and_indices = [
+                request_state._input_token_ids_logprobs_by_pos[position]
+                for position in positions
+            ]
+            request_state.input_token_ids_logprobs_val = _causal_prompt_alignment(
+                [values for values, _ in token_values_and_indices]
+            )
+            request_state.input_token_ids_logprobs_idx = _causal_prompt_alignment(
+                [indices for _, indices in token_values_and_indices]
+            )
+
+    request_state._input_token_logprobs_by_pos.clear()
+    request_state._input_top_logprobs_by_pos.clear()
+    request_state._input_token_ids_logprobs_by_pos.clear()
+    request_state.input_logprobs_finalized = True
+
+
+def _append_output_logprobs(
+    request_state: RequestState,
+    token_id: int,
+    sampled_logprob: float | None,
+    request_index: int,
+    top_values: list[list[float]] | None,
+    top_indices: list[list[int]] | None,
+    token_values: list[list[float]] | None,
+    token_indices: list[list[int]] | None,
+) -> None:
+    if (
+        request_state.return_logprob
+        and request_state.output_token_logprobs_val is not None
+        and sampled_logprob is not None
+    ):
+        request_state.output_token_logprobs_val.append(sampled_logprob)
+        request_state.output_token_logprobs_idx.append(token_id)
+
+    if (
+        request_state.top_logprobs_num > 0
+        and top_values is not None
+        and top_indices is not None
+    ):
+        k = request_state.top_logprobs_num
+        request_state.output_top_logprobs_val.append(top_values[request_index][:k])
+        request_state.output_top_logprobs_idx.append(top_indices[request_index][:k])
+
+    if (
+        request_state.token_ids_logprob is not None
+        and token_values is not None
+        and token_indices is not None
+    ):
+        n = len(request_state.token_ids_logprob)
+        request_state.output_token_ids_logprobs_val.append(
+            token_values[request_index][:n]
+        )
+        request_state.output_token_ids_logprobs_idx.append(
+            token_indices[request_index][:n]
+        )
+
+
+_LOGPROB_BATCH_FIELDS = (
+    "input_token_logprobs_val",
+    "input_token_logprobs_idx",
+    "output_token_logprobs_val",
+    "output_token_logprobs_idx",
+    "input_top_logprobs_val",
+    "input_top_logprobs_idx",
+    "output_top_logprobs_val",
+    "output_top_logprobs_idx",
+    "input_token_ids_logprobs_val",
+    "input_token_ids_logprobs_idx",
+    "output_token_ids_logprobs_val",
+    "output_token_ids_logprobs_idx",
+)
+
+
+def _new_logprob_output_batch() -> dict[str, list]:
+    return {field: [] for field in _LOGPROB_BATCH_FIELDS}
+
+
+def _append_logprob_output(
+    batch: dict[str, list],
+    request_state: RequestState,
+    send_token_offset: int,
+) -> None:
+    n_new = request_state.output_length - send_token_offset
+
+    if (
+        request_state.return_logprob
+        and request_state.output_token_logprobs_val is not None
+    ):
+        batch["output_token_logprobs_val"].append(
+            request_state.output_token_logprobs_val[-n_new:] if n_new > 0 else []
+        )
+        batch["output_token_logprobs_idx"].append(
+            request_state.output_token_logprobs_idx[-n_new:] if n_new > 0 else []
+        )
+    else:
+        batch["output_token_logprobs_val"].append([])
+        batch["output_token_logprobs_idx"].append([])
+
+    if (
+        request_state.return_logprob
+        and not request_state.input_logprobs_sent
+        and request_state.input_logprobs_finalized
+    ):
+        batch["input_token_logprobs_val"].append(request_state.input_token_logprobs_val)
+        batch["input_token_logprobs_idx"].append(request_state.input_token_logprobs_idx)
+        batch["input_top_logprobs_val"].append(request_state.input_top_logprobs_val)
+        batch["input_top_logprobs_idx"].append(request_state.input_top_logprobs_idx)
+        batch["input_token_ids_logprobs_val"].append(
+            request_state.input_token_ids_logprobs_val
+        )
+        batch["input_token_ids_logprobs_idx"].append(
+            request_state.input_token_ids_logprobs_idx
+        )
+        request_state.input_logprobs_sent = True
+    else:
+        for field in (
+            "input_token_logprobs_val",
+            "input_token_logprobs_idx",
+            "input_top_logprobs_val",
+            "input_top_logprobs_idx",
+            "input_token_ids_logprobs_val",
+            "input_token_ids_logprobs_idx",
+        ):
+            batch[field].append([])
+
+    if (
+        n_new > 0
+        and request_state.top_logprobs_num > 0
+        and request_state.output_top_logprobs_val is not None
+    ):
+        batch["output_top_logprobs_val"].append(
+            request_state.output_top_logprobs_val[-n_new:]
+        )
+        batch["output_top_logprobs_idx"].append(
+            request_state.output_top_logprobs_idx[-n_new:]
+        )
+    else:
+        batch["output_top_logprobs_val"].append([])
+        batch["output_top_logprobs_idx"].append([])
+
+    if (
+        n_new > 0
+        and request_state.token_ids_logprob is not None
+        and request_state.output_token_ids_logprobs_val is not None
+    ):
+        batch["output_token_ids_logprobs_val"].append(
+            request_state.output_token_ids_logprobs_val[-n_new:]
+        )
+        batch["output_token_ids_logprobs_idx"].append(
+            request_state.output_token_ids_logprobs_idx[-n_new:]
+        )
+    else:
+        batch["output_token_ids_logprobs_val"].append([])
+        batch["output_token_ids_logprobs_idx"].append([])
+
+
+class OutputProcesser:
+    """Streams generation output to the detokenizer."""
 
     # Upper bound on how long a pending abort stays buffered waiting for
     # its matching register(). Generous — a client reorder of more than
@@ -609,6 +889,32 @@ class OutputProcesser:
             if model_execution_results.output_logprobs is not None
             else None
         )
+        logprob_details = getattr(model_execution_results, "logprob_details", None)
+        input_logprobs_list = (
+            _tolist(logprob_details.input_token_logprobs)
+            if logprob_details is not None
+            else None
+        )
+        output_top_values = (
+            _tolist(logprob_details.output_top_logprobs_val)
+            if logprob_details is not None
+            else None
+        )
+        output_top_indices = (
+            _tolist(logprob_details.output_top_logprobs_idx)
+            if logprob_details is not None
+            else None
+        )
+        output_token_values = (
+            _tolist(logprob_details.output_token_ids_logprobs_val)
+            if logprob_details is not None
+            else None
+        )
+        output_token_indices = (
+            _tolist(logprob_details.output_token_ids_logprobs_idx)
+            if logprob_details is not None
+            else None
+        )
         # NaN-guard flags, aligned with forward_op.request_ids (None when disabled).
         nan_flags_list = (
             model_execution_results.output_nan_flags.tolist()
@@ -621,6 +927,7 @@ class OutputProcesser:
         # length that RequestState.prefill_finished compares against.
         prefill_lengths = getattr(forward_op, "prefill_lengths", None)
         pt = 0
+        input_logprob_pt = 0
         for i, rid in enumerate(forward_op.request_ids):
             output_length = model_execution_results.output_lengths[i].item()
             model_output_ids = model_execution_results.output_tokens.tolist()[
@@ -637,6 +944,15 @@ class OutputProcesser:
             else:
                 pt += output_length
 
+            request_input_logprobs = None
+            if i < num_extends and input_logprobs_list is not None:
+                start_len = int(forward_op.extend_logprob_start_lens[i])
+                pruned_len = max(0, int(forward_op.input_lengths[i]) - start_len)
+                request_input_logprobs = input_logprobs_list[
+                    input_logprob_pt : input_logprob_pt + pruned_len
+                ]
+                input_logprob_pt += pruned_len
+
             if rid not in self.rid_to_state:
                 # means it's delayed token, do not process
                 continue
@@ -644,6 +960,17 @@ class OutputProcesser:
             request_state: RequestState = self.rid_to_state[rid]
             # scheduled_time is stamped pre-forward in the event loop (queue end)
 
+            if request_input_logprobs is not None and logprob_details is not None:
+                absolute_start = int(forward_op.extend_prefix_lens[i]) + int(
+                    forward_op.extend_logprob_start_lens[i]
+                )
+                _record_input_logprob_chunk(
+                    request_state,
+                    request_input_logprobs,
+                    logprob_details,
+                    i,
+                    absolute_start,
+                )
             # Mid-chunk extend slot by the op's own prefill_lengths (rebased after
             # flat retract; C++ owes no result and the sampled token is garbage).
             # Fresh requests: prefill_length == prompt length, same as the gate below.
@@ -658,6 +985,13 @@ class OutputProcesser:
             # Do not output chunking result
             if not request_state.prefill_finished:
                 continue
+
+            _finalize_input_logprobs(request_state)
+
+            if request_state.sampling_params.max_new_tokens == 0:
+                model_output_ids = []
+                model_output_logprobs = []
+                request_state.finished_reason = FINISH_LENGTH(length=0)
 
             request_state.stats.mark_prefill_done(stats_now)
             if i >= num_extends:
@@ -732,15 +1066,20 @@ class OutputProcesser:
                 request_state.output_ids.append(model_output_id)
                 if advance_grammar:
                     request_state.grammar.accept_token(model_output_id)
-                if (
-                    request_state.return_logprob
-                    and request_state.output_token_logprobs_val is not None
-                    and model_output_logprobs is not None
-                ):
-                    request_state.output_token_logprobs_val.append(
+                _append_output_logprobs(
+                    request_state,
+                    model_output_id,
+                    (
                         model_output_logprobs[j]
-                    )
-                    request_state.output_token_logprobs_idx.append(model_output_id)
+                        if model_output_logprobs is not None
+                        else None
+                    ),
+                    i,
+                    output_top_values,
+                    output_top_indices,
+                    output_token_values,
+                    output_token_indices,
+                )
                 if term_idx == j:
                     # Grammar termination takes precedence over
                     # length/EOS/stop_str at the same step (matching
@@ -910,8 +1249,7 @@ class OutputProcesser:
         spec_verify_ct: list[int] = []
         batch_accept_draft_tokens: list[float] = []
         output_extra_infos: list[dict] = []
-        output_token_logprobs_val: list[list[float]] = []
-        output_token_logprobs_idx: list[list[int]] = []
+        logprob_output_batch = _new_logprob_output_batch()
 
         for i, rs in enumerate(output_states):
             # For finished requests, always output (unless already output)
@@ -976,20 +1314,7 @@ class OutputProcesser:
                 batch_accept_draft_tokens.append(rs.accept_draft_tokens)
 
             output_extra_infos.append({"decode_prefix_len": rs.prefix_len})
-
-            if rs.return_logprob and rs.output_token_logprobs_val is not None:
-                # Send only the slice not yet shipped; send_token_offset was
-                # just advanced above, so use the logprob list tail.
-                n_new = rs.output_length - send_token_offset
-                output_token_logprobs_val.append(
-                    rs.output_token_logprobs_val[-n_new:] if n_new > 0 else []
-                )
-                output_token_logprobs_idx.append(
-                    rs.output_token_logprobs_idx[-n_new:] if n_new > 0 else []
-                )
-            else:
-                output_token_logprobs_val.append([])
-                output_token_logprobs_idx.append([])
+            _append_logprob_output(logprob_output_batch, rs, send_token_offset)
 
         # Don't send empty batch to detokenizer
         if len(rids_to_send) == 0:
@@ -1010,22 +1335,11 @@ class OutputProcesser:
             completion_tokens=completion_tokens,
             cached_tokens=cached_tokens,
             spec_verify_ct=spec_verify_ct,
-            input_token_logprobs_val=[],
-            input_token_logprobs_idx=[],
-            output_token_logprobs_val=output_token_logprobs_val,
-            output_token_logprobs_idx=output_token_logprobs_idx,
-            input_top_logprobs_val=[],
-            input_top_logprobs_idx=[],
-            output_top_logprobs_val=[],
-            output_top_logprobs_idx=[],
-            input_token_ids_logprobs_val=[],
-            input_token_ids_logprobs_idx=[],
-            output_token_ids_logprobs_val=[],
-            output_token_ids_logprobs_idx=[],
             output_hidden_states=[],
             batch_accept_draft_tokens=batch_accept_draft_tokens,
             output_extra_infos=output_extra_infos,
             generated_time=time.time(),
+            **logprob_output_batch,
         )
 
         # Push BatchTokenIDOut directly to AsyncLLM via the shared

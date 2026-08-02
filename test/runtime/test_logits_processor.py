@@ -20,9 +20,33 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode  # noqa:
 from tokenspeed.runtime.layers.logits_processor import (  # noqa: E402
     LogitsMetadata,
     LogitsProcessor,
+    compute_output_logprob_details,
     fused_softcap,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict  # noqa: E402
+
+
+def test_compute_output_logprob_details_supports_ragged_requests():
+    logits = torch.tensor(
+        [[1.0, 3.0, 2.0, 0.0], [4.0, 1.0, 2.0, 3.0]],
+        dtype=torch.float32,
+    )
+
+    top_values, top_ids, requested_values, requested_ids = (
+        compute_output_logprob_details(
+            logits,
+            top_ks=[2, 1],
+            token_ids=[[0, 3], [2]],
+        )
+    )
+    expected = torch.log_softmax(logits, dim=-1)
+
+    assert top_ids.tolist() == [[1, 2], [0, 3]]
+    torch.testing.assert_close(top_values[0, :2], expected[0, [1, 2]])
+    torch.testing.assert_close(top_values[1, :1], expected[1, [0]])
+    assert requested_ids.tolist() == [[0, 3], [2, 0]]
+    torch.testing.assert_close(requested_values[0, :2], expected[0, [0, 3]])
+    torch.testing.assert_close(requested_values[1, :1], expected[1, [2]])
 
 
 def test_logits_processor_only_uses_fused_lm_head_for_kimi(monkeypatch):

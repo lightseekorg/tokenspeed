@@ -413,14 +413,11 @@ class TokenizedGenerateReqInput:
     sampling_params: SamplingParams
     # Whether to return the sampled token's logprob for this request.
     return_logprob: bool
-    # Internal carry-over fields kept for pipeline/PD compatibility. The vLLM
-    # output-logprob API only drives ``return_logprob``; InputProcessor sets
-    # these to neutral values (logprob_start_len=-1, top_logprobs_num=0,
-    # token_ids_logprob=None) since prompt logprobs, output top-k, and token-id
-    # logprobs are not supported.
+    # Native prompt-logprob controls. Other request formats leave these at
+    # their neutral values.
     logprob_start_len: int
     top_logprobs_num: int
-    token_ids_logprob: list[int]
+    token_ids_logprob: list[int] | None
     # Whether to stream output
     stream: bool
 

@@ -178,7 +178,7 @@ class CudaGraphWrapper:
 
     Callers always use the same interface::
 
-        output_tokens, output_lengths, output_logprobs = runner(
+        output_tokens, output_lengths, output_logprobs, logprob_details = runner(
             bs, ctx, sampling_info, req_to_page,
             extend_with_prefix=..., extend_prefix_lens=...,
         )
@@ -1011,6 +1011,8 @@ class CudaGraphWrapper:
     def _can_use_graph(self, bs: int, ctx: ForwardContext) -> bool:
         if self.disable:
             return False
+        if ctx.return_logprob_details or ctx.extend_return_logprob:
+            return False
         if not ctx.forward_mode.is_decode():
             return False
         if self.dp_size > 1:
@@ -1213,6 +1215,7 @@ class CudaGraphWrapper:
                 output_tokens,
                 output_lengths,
                 output_logprobs,
+                logprob_details,
             ) = self.output_buffers[graph_key]
 
             result = (
@@ -1223,6 +1226,7 @@ class CudaGraphWrapper:
                     if output_logprobs is not None
                     else None
                 ),
+                logprob_details,
             )
 
         else:

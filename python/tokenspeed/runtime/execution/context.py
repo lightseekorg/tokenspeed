@@ -68,6 +68,16 @@ class ForwardContext:
 
     # --- logits processor ---
     gather_ids: torch.Tensor | None = None
+    return_logprob_details: bool = False
+    extend_return_logprob: bool = False
+    extend_return_top_logprob: bool = False
+    extend_token_ids_logprob: bool = False
+    extend_seq_lens_cpu: list[int] | None = None
+    extend_logprob_start_lens_cpu: list[int] | None = None
+    extend_logprob_pruned_lens_cpu: list[int] | None = None
+    top_logprobs_nums: list[int] | None = None
+    extend_input_logprob_token_ids_gpu: torch.Tensor | None = None
+    token_ids_logprobs: list[list[int] | None] | None = None
 
     # --- spec-decode draft (drafter-owned buffers plumbed per forward) ---
     # draft_seq_lens_buf: mutable per-request seq_lens alias the draft backend reads.

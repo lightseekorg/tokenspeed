@@ -61,6 +61,51 @@ from tokenspeed.runtime.utils import get_colorful_logger
 logger = get_colorful_logger(__name__)
 
 
+def compute_output_logprob_details(
+    logits: torch.Tensor,
+    top_ks: list[int],
+    token_ids: list[list[int] | None],
+) -> tuple[
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
+    """Compute raw top-k and requested-token logprobs for output positions.
+
+    Args:
+        logits: Unnormalized logits with one row per request.
+        top_ks: Number of highest-probability tokens requested per row.
+        token_ids: Token IDs whose logprobs are requested per row.
+
+    Returns:
+        Top-k values and IDs followed by requested-token values and IDs.
+        Each tensor is padded to the largest requested width in the batch;
+        consumers slice rows using the original request widths.
+    """
+
+    logprobs = torch.log_softmax(logits.float(), dim=-1)
+    max_k = max(top_ks, default=0)
+    top_values = top_indices = None
+    if max_k > 0:
+        top_values, top_indices = logprobs.topk(max_k, dim=-1)
+
+    max_ids = max((len(ids) if ids is not None else 0 for ids in token_ids), default=0)
+    requested_values = requested_indices = None
+    if max_ids > 0:
+        requested_indices = torch.zeros(
+            (logits.shape[0], max_ids), dtype=torch.long, device=logits.device
+        )
+        for row, ids in enumerate(token_ids):
+            if ids:
+                requested_indices[row, : len(ids)] = torch.tensor(
+                    ids, dtype=torch.long, device=logits.device
+                )
+        requested_values = logprobs.gather(1, requested_indices)
+
+    return top_values, top_indices, requested_values, requested_indices
+
+
 def _force_deterministic_rsag() -> bool:
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -114,7 +159,7 @@ class LogitsMetadata:
     extend_logprob_pruned_lens_cpu: list[int] | None = None
     top_logprobs_nums: list[int] | None = None
     extend_input_logprob_token_ids_gpu: torch.Tensor | None = None
-    token_ids_logprobs: list[list[int]] | None = None
+    token_ids_logprobs: list[list[int] | None] | None = None
 
     # logits and logprobs post processing
     temp_scaled_logprobs: bool = False
@@ -138,6 +183,15 @@ class LogitsMetadata:
             forward_mode=ctx.forward_mode,
             capture_hidden_mode=ctx.capture_hidden_mode,
             gather_ids=ctx.gather_ids,
+            extend_return_logprob=ctx.extend_return_logprob,
+            extend_return_top_logprob=ctx.extend_return_top_logprob,
+            extend_token_ids_logprob=ctx.extend_token_ids_logprob,
+            extend_seq_lens_cpu=ctx.extend_seq_lens_cpu,
+            extend_logprob_start_lens_cpu=ctx.extend_logprob_start_lens_cpu,
+            extend_logprob_pruned_lens_cpu=ctx.extend_logprob_pruned_lens_cpu,
+            top_logprobs_nums=ctx.top_logprobs_nums,
+            extend_input_logprob_token_ids_gpu=(ctx.extend_input_logprob_token_ids_gpu),
+            token_ids_logprobs=ctx.token_ids_logprobs,
         )
 
 
@@ -708,13 +762,14 @@ class LogitsProcessor(nn.Module):
             logits_metadata.token_ids_logprobs,
             logits_metadata.extend_logprob_pruned_lens_cpu,
         ):
-            if pruned_len <= 0:
+            if pruned_len <= 0 or token_ids is None:
                 input_token_ids_logprobs_val.append([])
                 input_token_ids_logprobs_idx.append([])
+                pt += max(pruned_len, 0)
                 continue
 
             input_token_ids_logprobs_val.append(
-                [all_logprobs[pt + j, token_ids].tolist() for j in range(pruned_len)]
+                all_logprobs[pt : pt + pruned_len, token_ids].tolist()
             )
             input_token_ids_logprobs_idx.append([token_ids for _ in range(pruned_len)])
             pt += pruned_len

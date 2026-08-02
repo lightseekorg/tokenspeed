@@ -65,6 +65,7 @@ def _flat_forward_op_repr(self):
         f"input_ids={list(self.input_ids)}, "
         f"shifted_input_ids={list(self.shifted_input_ids)}, "
         f"extend_prefix_lens={list(self.extend_prefix_lens)}, "
+        f"extend_logprob_start_lens={list(self.extend_logprob_start_lens)}, "
         f"num_extends={self.num_extends()}"
         f")"
     )
