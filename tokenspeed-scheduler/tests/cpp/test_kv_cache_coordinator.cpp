@@ -166,14 +166,8 @@ TEST(MakeCoordinatorTest, FineGrainedGroupsAllocateAndMatchAtTheirOwnLogicalPage
     BlockPool pool(32);
     const std::vector<KvCacheSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_size = 256},
-        {.kind = AttnKind::kSlidingWindow,
-         .sliding_window = 128,
-         .cache_blocks_per_lcm_block = 4,
-         .block_size = 64},
-        {.kind = AttnKind::kMambaState,
-         .sliding_window = 0,
-         .cache_blocks_per_lcm_block = 64,
-         .block_size = 4},
+        {.kind = AttnKind::kSlidingWindow, .sliding_window = 128, .cache_blocks_per_lcm_block = 4, .block_size = 64},
+        {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 64, .block_size = 4},
     };
     KvCacheCoordinator coordinator = MakeCoordinator(specs, /*cache_block_tokens=*/256, pool);
 
@@ -191,8 +185,8 @@ TEST(MakeCoordinatorTest, FineGrainedGroupsAllocateAndMatchAtTheirOwnLogicalPage
 
     coordinator.Free(tables);
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/256));
-    const std::vector<std::string> hashes = ContentHashes(
-        std::vector<std::vector<std::int32_t>>(64, std::vector<std::int32_t>(4, 7)));
+    const std::vector<std::string> hashes =
+        ContentHashes(std::vector<std::vector<std::int32_t>>(64, std::vector<std::int32_t>(4, 7)));
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
                                  .num_tokens = 0,

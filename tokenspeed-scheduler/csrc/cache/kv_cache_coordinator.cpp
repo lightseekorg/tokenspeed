@@ -75,8 +75,7 @@ std::vector<CacheKey> KvCacheCoordinator::keysForGroup(std::span<const std::stri
                                                        std::int32_t first_base) const {
     _assert(group_id < groups_.size(), "cache key group id out of range");
     const std::int32_t group_block_tokens = groups_[group_id].Manager().CacheBlockTokens();
-    _assert(group_block_tokens % base_block_tokens_ == 0,
-            "group block size must be a multiple of the base block size");
+    _assert(group_block_tokens % base_block_tokens_ == 0, "group block size must be a multiple of the base block size");
     std::vector<std::string> folded =
         FoldBaseHashes(content_hashes, first_base, group_block_tokens / base_block_tokens_);
     std::vector<CacheKey> keys;
@@ -304,8 +303,7 @@ void KvCacheCoordinator::cacheFullBlocksForGroup(std::size_t group_index, BlockT
 
 void KvCacheCoordinator::cacheLogicalBlocksForGroup(std::size_t group_index, BlockTable& table,
                                                     std::span<const CacheKey> keys, std::int32_t first_slot,
-                                                    std::uint64_t access_epoch,
-                                                    CacheBoundaryKind boundary_kind) {
+                                                    std::uint64_t access_epoch, CacheBoundaryKind boundary_kind) {
     std::vector<std::pair<CacheKey, CacheBlockRef>> newly_cached;
     groups_[group_index].Manager().CacheFullBlocks(pool_, table, keys, access_epoch, first_slot, boundary_kind,
                                                    host_pool_ != nullptr ? &newly_cached : nullptr);
@@ -442,8 +440,7 @@ KvCacheCoordinator MakeCoordinator(std::span<const KvCacheSpec> specs, std::int3
         }
         std::unique_ptr<KvCacheManager> manager;
         if (spec.kind == AttnKind::kFull) {
-            manager =
-                std::make_unique<FullAttnManager>(group_block_tokens, spec.cache_blocks_per_lcm_block, group_id);
+            manager = std::make_unique<FullAttnManager>(group_block_tokens, spec.cache_blocks_per_lcm_block, group_id);
         } else if (spec.kind == AttnKind::kMambaState) {
             manager =
                 std::make_unique<MambaStateManager>(group_block_tokens, spec.cache_blocks_per_lcm_block, group_id);
