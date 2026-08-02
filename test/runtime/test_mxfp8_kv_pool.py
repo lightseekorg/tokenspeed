@@ -18,16 +18,24 @@
 """MXFP8 KV pool: quantize -> store -> verify layout and roundtrip error.
 
 Covers both scale layouts (interleaved for page 128, flat otherwise), the
-size accounting, and an end-to-end quantize_mxfp8 -> set_kv_buffer ->
-manual dequant roundtrip against the original bf16 K/V.
+size accounting, the Flat LCM heterogeneous-group layout, and an end-to-end
+quantize_mxfp8 -> set_kv_buffer -> manual dequant roundtrip against the
+original bf16 K/V.
 """
 
 from __future__ import annotations
 
+import os
+import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=120, suite="runtime-1gpu")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="needs a CUDA device"
@@ -142,86 +150,117 @@ def test_size_accounting_includes_scales():
 
 
 # -----------------------------------------------------------------------------
-# Hybrid-slab mode (flat ext): fp8 data slabs + parallel SF slabs
+# LCM arena mode (flat ext): heterogeneous groups share byte-uniform planes
 # -----------------------------------------------------------------------------
 
-SLAB_LAYER_TYPES = (
+LCM_LAYER_TYPES = (
     "full_attention",
     "sliding_attention_0",
     "full_attention",
     "sliding_attention_0",
 )
-# Byte-uniform hetero slots: full layers serve half the heads at twice the
-# tokens per page (slot bytes equal).
-SLAB_KV_HEADS = (2, 4, 2, 4)
+# A byte-uniform LCM parent: full layers serve half the heads, so the parent
+# packs twice as many 128-token child pages for that group.
+LCM_KV_HEADS = (2, 4, 2, 4)
 
 
-def _make_slab_pool(size: int = 512):
+def _make_lcm_pool(num_lcm_blocks: int = 4):
     from unittest import mock
 
     from tokenspeed.runtime.configs import paged_cache_spec
-    from tokenspeed.runtime.layers.attention.kv_cache import mha as mha_mod
-    from tokenspeed.runtime.layers.attention.kv_cache.mha import (
-        MHATokenToKVPoolMXFP8,
+    from tokenspeed.runtime.configs.lcm_layouts import draft_history_lcm_fields
+    from tokenspeed.runtime.configs.lcm_memory_plan import plan_lcm_fields
+    from tokenspeed.runtime.layers.attention.kv_cache.lcm_mha import (
+        LcmMHATokenToKVPoolMXFP8,
     )
 
+    fields = draft_history_lcm_fields(
+        layer_group_ids=LCM_LAYER_TYPES,
+        enabled_layer_ids=range(len(LCM_LAYER_TYPES)),
+        logical_block_tokens=128,
+        layer_kv_heads=LCM_KV_HEADS,
+        head_dim=HEAD_DIM,
+        kv_element_size=1,
+        kv_scale_block_size=32,
+        kv_scale_element_size=1,
+    )
+    plan = plan_lcm_fields(
+        fields,
+        logical_block_tokens=128,
+        num_lcm_blocks=num_lcm_blocks,
+        alignment=256,
+        max_padding_fraction=1.0,
+    )
+    max_packing = max(group.cache_blocks_per_lcm_block for group in plan.groups)
+    size = num_lcm_blocks * max_packing * plan.logical_block_tokens
     with mock.patch.object(
         paged_cache_spec, "scheduler_ext_flat_kvcache", return_value=True
-    ), mock.patch.object(
-        mha_mod.paged_cache_spec, "scheduler_ext_flat_kvcache", return_value=True
     ):
-        return MHATokenToKVPoolMXFP8(
+        return LcmMHATokenToKVPoolMXFP8(
             size=size,
             dtype=torch.float8_e4m3fn,
             head_num=HEADS,
             head_dim=HEAD_DIM,
-            layer_num=len(SLAB_LAYER_TYPES),
+            layer_num=len(LCM_LAYER_TYPES),
             device="cuda",
             enable_memory_saver=False,
-            max_batch_size=8,
+            max_batch_size=1,
             max_context_len=size,
             page_size=128,
             rank=0,
-            layer_types=SLAB_LAYER_TYPES,
+            layer_types=LCM_LAYER_TYPES,
             sliding_window_tokens=512,
-            max_scheduled_tokens=size,
-            slot_tokens=256,
-            group_page_sizes={"full_attention": 256},
-            layer_kv_head_counts=SLAB_KV_HEADS,
+            max_scheduled_tokens=128,
+            layer_kv_head_counts=LCM_KV_HEADS,
+            kv_alloc_head_count=HEADS,
+            memory_plan=plan,
+            layer_group_ids=LCM_LAYER_TYPES,
+            state_field_dtypes={},
         )
 
 
-def test_slab_geometry_and_aliasing():
-    pool = _make_slab_pool()
-    num_ids = (pool.size + pool._slot_tokens) // pool.page_size
+def test_lcm_geometry_and_aliasing():
+    pool = _make_lcm_pool()
+    by_group = {group.group_id: group for group in pool._lcm_memory_plan.groups}
 
-    # Paired layers alias data AND scale slabs.
-    assert pool.k_buffer[0] is pool.k_buffer[1]
-    assert pool.k_scale_buffer[0] is pool.k_scale_buffer[1]
-    assert pool.k_buffer[0] is not pool.k_buffer[2]
-    assert pool.k_scale_buffer[0] is not pool.k_scale_buffer[2]
+    # Both groups use the scheduler's 128-token logical page domain. Their
+    # byte ratio is expressed by child-page packing, not a coarser group page.
+    assert by_group["full_attention"].cache_blocks_per_lcm_block == 2
+    assert by_group["sliding_attention_0"].cache_blocks_per_lcm_block == 1
+    assert all(spec.block_size == 128 for spec in pool.paged_cache_group_specs)
+    assert pool.paged_cache_group_page_counts == {
+        "full_attention": 9,
+        "sliding_attention_0": 5,
+    }
+
     assert pool.k_buffer[0].dtype == torch.float8_e4m3fn
 
-    # One byte-uniform SF slot per id: slot_bytes / 32 e8m0 each.
-    slot_sf = 128 * HEADS * HEAD_DIM // 32
-    assert pool.k_scale_buffer[0].shape == (num_ids, slot_sf)
-
-    # Layer views factorize the same bytes: full (h/2, k=2), swa (h, k=1).
+    # Every child page represents 128 tokens; the narrow full-attention group
+    # gets twice as many child page IDs from each LCM parent.
     k_full, _ = pool.get_kv_scale_buffer(0)
     k_swa, _ = pool.get_kv_scale_buffer(1)
-    assert k_full.shape == (num_ids, 2, 2, 32, SF_DIM, SF_DIM)
-    assert k_swa.shape == (num_ids, 4, 1, 32, SF_DIM, SF_DIM)
+    full_rows = pool.get_key_buffer(0)
+    swa_rows = pool.get_key_buffer(1)
+    assert k_full.shape == (9, 2, 1, 32, SF_DIM, SF_DIM)
+    assert k_swa.shape == (5, 4, 1, 32, SF_DIM, SF_DIM)
+    assert full_rows.shape == (9 * 128, 2, HEAD_DIM)
+    assert swa_rows.shape == (5 * 128, 4, HEAD_DIM)
+
+    # Paired group fields overlay the same LCM parent at page 1 while the
+    # second occurrence of the group is assigned a separate plane.
+    assert full_rows[128].data_ptr() == swa_rows[128].data_ptr()
+    assert k_full[1].data_ptr() == k_swa[1].data_ptr()
+    assert full_rows[128].data_ptr() != pool.get_key_buffer(2)[128].data_ptr()
+    assert k_full[1].data_ptr() != pool.get_kv_scale_buffer(2)[0][1].data_ptr()
 
 
 @pytest.mark.parametrize("layer_id, heads_l", [(0, 2), (1, 4)])
-def test_slab_store_matches_standalone_scatter(layer_id: int, heads_l: int):
-    """set_kv_buffer on a slab layer must land data in the layer's hetero
-    row view and scales exactly where a standalone store_sf_interleaved at
-    the layer's page size puts them."""
+def test_lcm_store_matches_standalone_scatter(layer_id: int, heads_l: int):
+    """LCM child-page writes match an independent interleaved SF scatter."""
     from tokenspeed_kernel.ops.kvcache.triton import store_sf_interleaved
 
     torch.manual_seed(2)
-    pool = _make_slab_pool()
+    pool = _make_lcm_pool()
     layer = SimpleNamespace(layer_id=layer_id)
     page_tokens = pool._layer_page_tokens(layer_id)
     num_ids = pool.k_scale_buffer[layer_id].shape[0]
@@ -253,31 +292,6 @@ def test_slab_store_matches_standalone_scatter(layer_id: int, heads_l: int):
     store_sf_interleaved(k_sf, ref, loc, page_size=page_tokens)
     k_view, _ = pool.get_kv_scale_buffer(layer_id)
     assert torch.equal(k_view.view(torch.uint8), ref.view(torch.uint8))
-
-
-def test_slab_conv_views_are_bf16_over_fp8_slots():
-    """bf16 conv columns over fp8 slots: half the token capacity, zero-copy,
-    and writes through the view land in the slab's leading slot bytes."""
-    pool = _make_slab_pool()
-    swa_layer = 1
-
-    # 64-token kvconv block fills the 64 KB fp8 slot byte-exactly at the
-    # swa width; 128 no longer fits.
-    ch = HEADS * HEAD_DIM
-    k_cols, v_cols = pool.kvconv_slot_views_for_layer(swa_layer, 64)
-    assert k_cols.dtype == torch.bfloat16 and k_cols.shape[1:] == (64, ch)
-    with pytest.raises(AssertionError):
-        pool.kvconv_slot_views_for_layer(swa_layer, 128)
-
-    # Zero-copy: writing via the view mutates the slab's slot bytes.
-    k_cols[3].fill_(1.0)
-    slot_bytes = 128 * HEADS * HEAD_DIM  # fp8: 1 byte/elem
-    slab_bytes = pool.k_buffer[swa_layer].view(torch.uint8).reshape(-1, slot_bytes)
-    assert slab_bytes[3, : 64 * ch * 2].view(torch.bfloat16).eq(1.0).all()
-
-    # Hetero full layer: half-width columns, leading half of the slot.
-    k_full, _ = pool.kvconv_slot_views_for_layer(0, 64)
-    assert k_full.shape[1:] == (64, ch // 2)
 
 
 def _make_config(page_size: int):

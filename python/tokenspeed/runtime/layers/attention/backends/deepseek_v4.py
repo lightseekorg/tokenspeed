@@ -454,7 +454,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         # depth replays that same verify window (positions and cache slots are
         # deliberately reused), so the delivered value already names the
         # exclusive logical end for target and draft alike.
-        live_seq_lens = seq_lens[:actual_bs].to(dtype=torch.int64)
+        live_last_token = seq_lens[:actual_bs].to(dtype=torch.int64).clamp_min(1) - 1
         for group_id, table in tables.items():
             raw_tokens_per_page = self._flat_group_raw_tokens_per_page.get(group_id)
             max_page_id = self._flat_group_max_page_ids.get(group_id)
@@ -465,22 +465,17 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 )
             live = table[:actual_bs]
             required_page = torch.div(
-                live_seq_lens.clamp_min(1) - 1,
+                live_last_token,
                 raw_tokens_per_page,
                 rounding_mode="floor",
             )
             width = int(table.shape[1])
             in_bounds = required_page < width
             safe_page = required_page.clamp(min=0, max=width - 1)
-            row_indices = torch.arange(
-                actual_bs,
-                dtype=torch.int64,
-                device=table.device,
-            )
             # Page 0 is the scheduler's reserved null page.  It is valid in
             # fully-slid-out SWA columns, but never for the logical page that
             # contains an active sequence's current token.
-            required_entries = live[row_indices, safe_page]
+            required_entries = live.gather(1, safe_page.unsqueeze(1)).squeeze(1)
             required_entries_present = (
                 in_bounds & required_entries.gt(0) & required_entries.le(max_page_id)
             ).all()

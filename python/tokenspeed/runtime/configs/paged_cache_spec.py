@@ -560,9 +560,12 @@ def group_specs_from_layer_types(
             values must be positive multiples of page_size. Groups not listed
             use page_size. This helper is scheduler-agnostic: Flat publication
             rejects coarser groups because its shared domain must be divisible
-            by every group size. Model-specific finer Flat groups must be
-            declared as explicit ``PagedCacheGroupSpec`` values and supplied
-            through ``publish_paged_cache_groups(extra_groups=...)``.
+            by every group size. Byte-heterogeneous Flat arenas keep their
+            logical block sizes at the shared domain and express byte ratios
+            through LCM child-page packing instead. Model-specific finer Flat
+            groups must be declared as explicit ``PagedCacheGroupSpec`` values
+            and supplied through
+            ``publish_paged_cache_groups(extra_groups=...)``.
         cache_blocks_per_lcm_block: Per-group physical packing. Omitted groups
             use one CacheBlock per physical parent.
 
