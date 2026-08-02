@@ -154,11 +154,12 @@ jobs:
           python3 - <<'PY'
           import json
           import os
+          import sys
           from pathlib import Path
 
-          from test.ci_system.pipeline import build_matrix
-
           repo = Path.cwd()
+          sys.path.insert(0, str(repo / "test/ci_system"))
+          from pipeline import build_matrix
 
           def terms(name):
               return [item.strip() for item in os.environ[name].split(",") if item.strip()]
