@@ -62,6 +62,29 @@ def test_bias_slices_match_the_full_bias() -> None:
         )
 
 
+def test_out_of_range_previous_tokens_do_not_index_past_the_embedding() -> None:
+    """The anchor is the target's last output and each step's input is a
+    vocab-parallel argmax; both can be out of range before the loop's own
+    clamp runs, and the Markov head embeds them.
+    """
+    drafter = _drafter()
+    for prev in (
+        torch.tensor([-1, 0]),
+        torch.tensor([VOCAB, VOCAB + 500]),
+        torch.tensor([-7, VOCAB * 3]),
+    ):
+        bias = drafter._make_step_bias_fn(prev)(0, VOCAB)
+        assert bias.shape == (2, VOCAB)
+        assert torch.isfinite(bias).all()
+
+
+def test_clamping_maps_to_the_boundary_rows() -> None:
+    drafter = _drafter()
+    clamped = drafter._make_step_bias_fn(torch.tensor([-4, VOCAB + 9]))(0, VOCAB)
+    expected = drafter._make_step_bias_fn(torch.tensor([0, VOCAB - 1]))(0, VOCAB)
+    torch.testing.assert_close(clamped, expected)
+
+
 def test_bias_is_zero_beyond_the_markov_vocabulary() -> None:
     """The target lm_head's added-vocab shard has no Markov row to read.
 
