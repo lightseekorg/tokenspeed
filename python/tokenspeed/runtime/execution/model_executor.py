@@ -27,7 +27,11 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.tuning import autotune, set_autotune_max_num_tokens
+from tokenspeed_kernel.ops.tuning import (
+    autotune,
+    set_autotune_max_num_tokens,
+    set_autotune_process_group,
+)
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
@@ -36,6 +40,9 @@ from tokenspeed.runtime.configs.paged_cache_spec import (
     validate_flat_scheduler_config,
 )
 from tokenspeed.runtime.configs.utils import get_rope_parameters
+from tokenspeed.runtime.distributed.process_group_manager import (
+    process_group_manager as pg_manager,
+)
 from tokenspeed.runtime.engine.scheduler_utils import (
     flat_block_tables_from_forward_op,
     paged_cache_block_table_base_offsets_from_forward_op,
@@ -587,9 +594,6 @@ class ModelExecutor:
             req_to_page=self.req_to_page,
             drafter=self.drafter,
         )
-        # Load every prefill-shaped kernel before serving; serving must never
-        # first-execute a kernel. No-op when graph capture already ran.
-        self.prefill_graph.warmup_eager(self.forward_step)
 
         self._autotune()
 
@@ -668,15 +672,22 @@ class ModelExecutor:
         carry; the tuner enumerates every smaller shape bucket from it, so no
         decode-sized pass is needed. Must precede capture: a captured graph
         records the tactic chosen while it was recorded, so tuning afterwards
-        cannot change a replay.
+        cannot change a replay. On distributed boots, per-tactic timings are
+        averaged over the world so every rank picks the same tactic.
         """
         num_tokens = int(self.config.chunked_prefill_size)
         if num_tokens <= 0 or self.model_runner is None:
             return
-        set_autotune_max_num_tokens(num_tokens)
+
+        cpu_group = None
+        if self.config.world_size > 1:
+            cpu_group = pg_manager.get_process_group("gloo", self.config.world_group)
+
         logger.info(f"Kernel tuning with a dummy prefill of {num_tokens} tokens")
         ib = self.input_buffers
         tic = time.time()
+        set_autotune_max_num_tokens(num_tokens)
+        set_autotune_process_group(cpu_group)
         with autotune(), maybe_inference_mode():
             ctx = self.prefill_graph.make_dummy_batch(num_tokens, self.forward_step)
             positions = (
@@ -696,6 +707,7 @@ class ModelExecutor:
                     out_cache_loc=ib.out_cache_loc_buf[:num_tokens],
                     gather_ids=gather_ids,
                 )
+        set_autotune_process_group(None)
         torch.cuda.synchronize()
         dist.barrier()
         logger.info(f"Kernel tuning finished in {time.time() - tic:.1f}s")

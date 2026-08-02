@@ -8,9 +8,7 @@ from tokenspeed_kernel import (
     mla_decode_with_kvcache,
     mla_prefill,
 )
-from tokenspeed_kernel.platform import current_platform
 
-platform = current_platform()
 torch.manual_seed(42)
 
 _FP8_DTYPES = frozenset({torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz})
@@ -20,7 +18,7 @@ _FP8_DTYPES = frozenset({torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4
     "dtype,num_heads,qk_head_dim,v_head_dim",
     [
         pytest.param(torch.bfloat16, 128, 192, 128, id="bf16"),
-        pytest.param(platform.fp8e4m3fn.dtype, 128, 192, 128, id="fp8"),
+        pytest.param(torch.float8_e4m3fn, 128, 192, 128, id="fp8"),
     ],
 )
 @pytest.mark.parametrize("solution", ["triton", "gluon"])
@@ -116,8 +114,8 @@ def test_mla_prefill(
         ),
         pytest.param(
             "triton",
-            platform.fp8e4m3fn.dtype,
-            platform.fp8e4m3fn.dtype,
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fn,
             128,
             512,
             64,
@@ -139,7 +137,7 @@ def test_mla_prefill(
         pytest.param(
             "gluon",
             torch.bfloat16,
-            platform.fp8e4m3fn.dtype,
+            torch.float8_e4m3fn,
             12,
             512,
             64,
@@ -150,7 +148,7 @@ def test_mla_prefill(
         pytest.param(
             "gluon",
             torch.bfloat16,
-            platform.fp8e4m3fn.dtype,
+            torch.float8_e4m3fn,
             12,
             512,
             64,
@@ -161,7 +159,7 @@ def test_mla_prefill(
         pytest.param(
             "gluon",
             torch.bfloat16,
-            platform.fp8e4m3fn.dtype,
+            torch.float8_e4m3fn,
             12,
             512,
             64,
@@ -172,7 +170,7 @@ def test_mla_prefill(
         pytest.param(
             "gluon",
             torch.bfloat16,
-            platform.fp8e4m3fn.dtype,
+            torch.float8_e4m3fn,
             12,
             512,
             64,
@@ -182,8 +180,8 @@ def test_mla_prefill(
         ),
         pytest.param(
             "gluon",
-            platform.fp8e4m3fn.dtype,
-            platform.fp8e4m3fn.dtype,
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fn,
             12,
             512,
             64,
@@ -193,8 +191,8 @@ def test_mla_prefill(
         ),
         pytest.param(
             "gluon",
-            platform.fp8e4m3fn.dtype,
-            platform.fp8e4m3fn.dtype,
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fn,
             12,
             512,
             64,
@@ -204,8 +202,8 @@ def test_mla_prefill(
         ),
         pytest.param(
             "gluon",
-            platform.fp8e4m3fn.dtype,
-            platform.fp8e4m3fn.dtype,
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fn,
             12,
             512,
             64,
@@ -215,8 +213,8 @@ def test_mla_prefill(
         ),
         pytest.param(
             "gluon",
-            platform.fp8e4m3fn.dtype,
-            platform.fp8e4m3fn.dtype,
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fn,
             12,
             512,
             64,

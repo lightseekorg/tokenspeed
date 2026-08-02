@@ -13,6 +13,9 @@
 # requests across them (--decode-policy round_robin).
 set -euo pipefail
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+source "$SCRIPT_DIR/worker_cleanup.sh"
+
 MODEL=${MODEL:-nvidia/Qwen3.5-122B-A10B-NVFP4}
 SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-$MODEL}
 ENCODE_GPUS=${ENCODE_GPUS:-0}
@@ -97,9 +100,8 @@ cleanup() {
   local code=$?
   trap - EXIT INT TERM
   if ((${#pids[@]})); then
-    echo "[epd-1e1p2d] stopping ${#pids[@]} processes"
-    kill "${pids[@]}" 2>/dev/null || true
-    wait "${pids[@]}" 2>/dev/null || true
+    stop_worker_pids \
+      "epd-1e1p2d" "${WORKER_SHUTDOWN_TIMEOUT:-30}" "${pids[@]}"
   fi
   exit "$code"
 }
