@@ -199,6 +199,7 @@ class K3DSparkDecoderLayer(nn.Module):
             layer_id=layer_id,
             prefix=add_prefix("self_attn", prefix),
         )
+        self.layer_id = layer_id
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=eps)
         self.mlp = DFlashMLP(
             config=config,

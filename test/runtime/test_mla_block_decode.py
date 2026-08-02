@@ -48,6 +48,31 @@ def _backend(
 # --------------------------------------------------------------------------
 
 
+def test_block_metadata_keeps_every_block_row() -> None:
+    """The drafter calls in with num_extends == bs by its own convention.
+
+    Carrying that into the block metadata slices away exactly the rows the
+    kernel needs, which it sees as an empty page table and a null pointer.
+    """
+    backend = _backend(spec_num_tokens=8)
+    backend.page_size = 64
+    backend.max_context_len = 512
+    req_to_page = torch.arange(2 * 4, dtype=torch.int32).view(2, 4) + 1
+
+    backend._init_decode_metadata(
+        bs=2,
+        num_extends=2,
+        req_pool_indices=torch.tensor([0, 1]),
+        seq_lens=torch.tensor([100, 200], dtype=torch.int32),
+        req_to_page=req_to_page,
+    )
+
+    metadata = backend.forward_decode_metadata
+    assert metadata.num_extends == 0
+    assert metadata.page_table.shape[0] == 2 * 8
+    assert metadata.seq_lens.shape[0] == 2 * 8
+
+
 def test_block_decode_is_off_without_the_flag() -> None:
     assert not _backend(draft_block_decode=False)._block_decode_active
 
