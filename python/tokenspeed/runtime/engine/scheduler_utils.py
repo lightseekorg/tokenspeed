@@ -620,8 +620,8 @@ def flat_block_tables_from_forward_op(
         device: Destination device for the packed tensor.
         num_reqs: Optional expected row count for every group.
         expected_group_ids: Optional contract order and exact key set.
-        max_page_id: Optional common inclusive upper bound for page IDs.
-        max_page_ids: Optional per-group inclusive upper bounds.
+        max_page_id: Optional authoritative common inclusive upper bound for page IDs.
+        max_page_ids: Optional authoritative per-group inclusive upper bounds.
 
     Returns:
         Per-group tensor views in ``expected_group_ids`` order when supplied,
@@ -711,13 +711,16 @@ def flat_block_tables_from_forward_op(
             )
             if max_page_ids is not None and group_max_page_id is None:
                 raise ValueError(f"max_page_ids is missing flat group {group_id!r}")
+            invalid_below = arr < -1
             if group_max_page_id is not None:
-                invalid = (arr < -1) | (arr > group_max_page_id)
+                invalid = invalid_below | (arr > group_max_page_id)
                 if bool(invalid.any()):
                     raise ValueError(
                         f"flat group {group_id!r} contains a page ID outside "
                         f"-1..{group_max_page_id}"
                     )
+            elif bool(invalid_below.any()):
+                raise ValueError(f"flat group {group_id!r} contains a page ID below -1")
     device = torch.device(device) if isinstance(device, str) else device
     out: dict[str, torch.Tensor] = {}
     packable: list[tuple[str, Any, int]] = []

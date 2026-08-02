@@ -115,6 +115,28 @@ class FlatBlockTablesBridgeTest(unittest.TestCase):
                 max_page_ids={"full": 8},
             )
 
+    def test_strict_legacy_bridge_accepts_absolute_ids_without_upper_bound(self):
+        # Legacy MHA group counts size admission, not the shared scheduler's
+        # absolute page-ID domain. They must not be supplied as upper bounds.
+        op = self._make_op({"full": [[1, 609, 142822, -1]]})
+        out = self.bridge(
+            op,
+            device="cpu",
+            num_reqs=1,
+            expected_group_ids=("full",),
+        )
+        self.assertEqual(out["full"].tolist(), [[1, 609, 142822, -1]])
+
+    def test_strict_legacy_bridge_rejects_id_below_minus_one(self):
+        op = self._make_op({"full": [[1, -2]]})
+        with self.assertRaisesRegex(ValueError, "page ID below -1"):
+            self.bridge(
+                op,
+                device="cpu",
+                num_reqs=1,
+                expected_group_ids=("full",),
+            )
+
 
 class FlatFlagGatingTest(unittest.TestCase):
     """uses_flat_cache_groups must default to False so every existing
