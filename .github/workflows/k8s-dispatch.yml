@@ -9,15 +9,50 @@ on:
         default: ""
         type: string
       yaml:
-        description: "Comma-separated CI YAML paths, or all"
+        description: "CI YAML to run"
         required: true
         default: "all"
-        type: string
+        type: choice
+        options:
+          - all
+          - test/ci/eval/deepseek-v4-flash-evalscope-gsm8k.yaml
+          - test/ci/eval/deepseek-v4-flash-mtp-evalscope-gsm8k.yaml
+          - test/ci/eval/glm-5.2-nvfp4-mtp-evalscope-aime26.yaml
+          - test/ci/eval/gpt-oss-120b-mxfp4-evalscope-gpqa-diamond.yaml
+          - test/ci/eval/inkling-nvfp4-mtp-evalscope-gsm8k.yaml
+          - test/ci/eval/kimi-k2.5-nvfp4-dflash-evalscope-aime25.yaml
+          - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-aime25.yaml
+          - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-gpqa-diamond.yaml
+          - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-gsm8k.yaml
+          - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-mmlu.yaml
+          - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-ocr-bench.yaml
+          - test/ci/eval/minimax-m3-nvfp4-evalscope-aime25.yaml
+          - test/ci/eval/qwen3.5-122b-a10b-nvfp4-epd-1e1p2d-evalscope-ocr-bench.yaml
+          - test/ci/eval/qwen3.5-122b-a10b-nvfp4-evalscope-ocr-bench.yaml
+          - test/ci/eval/qwen3.5-397b-a17b-nvfp4-dp4ep4-evalscope-aime25.yaml
+          - test/ci/eval/qwen3.5-397b-a17b-nvfp4-evalscope-aime25.yaml
+          - test/ci/eval/qwen3.5-397b-a17b-nvfp4-pd-1p1d-evalscope-aime25.yaml
+          - test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-agentic-b200-8gpu.yaml
+          - test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-longctx.yaml
+          - test/ci/ut/qwen3.5-122b-a10b-nvfp4-epd-1e1p2d.yaml
+          - test/ci/ut/qwen3.5-397b-a17b-nvfp4-pd-1p1d.yaml
+          - test/ci/ut/ut-runtime-1gpu.yaml
+          - test/ci/ut/ut-runtime-2gpu.yaml
+          - test/ci/ut/ut-runtime-prefix-cache-e2e.yaml
+          - test/ci/ut/ut-tokenspeed-kernel.yaml
       runners:
-        description: "Comma-separated exact ARC runner labels"
+        description: "ARC runner label"
         required: true
         default: "b200v2-4gpu"
-        type: string
+        type: choice
+        options:
+          - b200v2-4gpu
+          - b200v2-1gpu
+          - b200v2-2gpu
+          - b200v2-8gpu
+          - gb200-1gpu
+          - gb200-2gpu
+          - gb200-4gpu
       task_types:
         description: "Comma-separated task types"
         required: true
