@@ -49,10 +49,9 @@ on:
       runner_pool:
         description: "Runner pool selected from the YAML labels"
         required: true
-        default: "default"
+        default: "b200v2"
         type: choice
         options:
-          - default
           - b200v2
           - amd
           - gb200
@@ -203,12 +202,7 @@ jobs:
                   "gb200": runner.startswith("gb200-"),
                   "b300": runner.startswith("b300-"),
               }
-              default_runner = runner_families["b200v2"] or (
-                  runner.startswith("amd-mi35") and runner.endswith("-test")
-              )
-              if pool == "default" and not default_runner:
-                  continue
-              if pool not in ("default", "all") and not runner_families[pool]:
+              if pool != "all" and not runner_families[pool]:
                   continue
               if selected_paths is not None and task["config"] not in selected_paths:
                   continue
