@@ -443,7 +443,7 @@ def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
         w.w13_act_scale = w13_in_scale
         w.w2_act_scale = w2_in_scale
 
-        fp8_dtype = current_platform().fp8e4m3fn.dtype
+        fp8_dtype = torch.float8_e4m3fn
         w13_lhs = InFlexData(dtype=fp8_dtype, scale=w13_in_scale)
         w2_lhs = InFlexData(dtype=fp8_dtype, scale=w2_in_scale)
         # Force bf16 output so the swiglu / down-proj results stay in a

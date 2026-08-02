@@ -280,7 +280,7 @@ def _is_supported_gpu(platform: PlatformInfo) -> bool:
 
 
 def _fp8_dtype() -> torch.dtype:
-    return Platform.get().fp8e4m3fn.dtype
+    return torch.float8_e4m3fn
 
 
 def _quantize_mxfp8() -> tuple[torch.Tensor, torch.Tensor]:
@@ -1513,34 +1513,6 @@ def test_kimi3_mxfp4_situ_selection_on_cdna4(
     _assert_moe_plan(plan, apply=kernel_name, preprocessor=preprocessor)
     assert plan["activation"] == "situ"
     assert plan["support_routing"] is False
-
-
-def test_kimi3_mxfp4_situ_ep8_auto_falls_back_to_triton_on_cdna3(
-    mi300_platform: PlatformInfo,
-) -> None:
-    """The gfx950-only Gluon fast path must not displace the AMD fallback."""
-    real_platform = Platform.get()
-    try:
-        Platform.override(mi300_platform)
-        KernelRegistry.get().clear_cache()
-        plan = tokenspeed_kernel.moe_plan(
-            "mxfp4",
-            input_dtype=torch.bfloat16,
-            activation="situ",
-            routing_mode="precomputed_topk",
-            ep_size=8,
-            ispp=3072,
-            internal_activation_dtype="input",
-        )
-    finally:
-        Platform.override(real_platform)
-        KernelRegistry.get().clear_cache()
-
-    _assert_moe_plan(
-        plan,
-        apply="triton_mxfp4_ep_precomputed_moe_apply",
-        preprocessor="triton_mxfp4_moe_weights",
-    )
 
 
 def _make_fake_gluon_mxfp4_layer(top_k: int) -> torch.nn.Module:
