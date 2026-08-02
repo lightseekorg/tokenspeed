@@ -54,6 +54,11 @@ class DSpark(DFlash):
         """Semi-autoregressive greedy proposal over the block positions."""
         next_tokens[:, 0] = block_ids[:, 0]
         for k in range(1, self.spec_num_tokens):
+            # The Markov head embeds the previous token, so it must be in range
+            # before this step, not after the loop: the anchor comes from the
+            # target's last output (garbage during warmup) and each proposal
+            # from a vocab-parallel argmax that can lose every shard. An
+            # out-of-range id here indexes past the embedding table.
             bias_fn = self._make_step_bias_fn(next_tokens[:, k - 1])
             self._greedy_argmax_vocab_parallel(
                 draft_hidden[:, k - 1, :],
@@ -75,9 +80,9 @@ class DSpark(DFlash):
         zero bias, so added tokens keep their plain base logit and only compete
         unbiased.
         """
-        latent = self.markov_head.get_prev_latent(prev_tokens)
         w2_weight = self.markov_head.markov_w2.weight
         vocab_size = int(w2_weight.shape[0])
+        latent = self.markov_head.get_prev_latent(prev_tokens.clamp(0, vocab_size - 1))
         rows = int(latent.shape[0])
 
         def bias_fn(vocab_start: int, count: int) -> torch.Tensor:
