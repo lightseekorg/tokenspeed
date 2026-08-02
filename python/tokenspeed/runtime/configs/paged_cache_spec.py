@@ -34,12 +34,11 @@ class PagedCacheGroupSpec:
     sliding_window_tokens: int | None
     # History groups form a chain; State groups only need the trailing window.
     family: Family = "history"
-    # Per-group logical page tokens; None -> scheduler global block_size. A
-    # model-declared finer group must divide the global block and pack the
-    # corresponding number of logical pages into one LCM block. The generic
-    # layer-type helper below only derives equal/coarser groups; finer groups
-    # travel through a model-specific spec or publish_paged_cache_groups'
-    # extra_groups path.
+    # Per-group logical page tokens; None -> scheduler global block_size. Flat
+    # requires the effective size to divide its shared scheduler domain; a
+    # finer group must pack the corresponding number of logical pages into one
+    # LCM block. The generic layer-type helper below is scheduler-agnostic, but
+    # Flat publication validates this stricter contract before returning specs.
     block_size: int | None = None
     # Physical child CacheBlocks packed into one shared LCM parent.
     cache_blocks_per_lcm_block: int = 1
@@ -556,13 +555,14 @@ def group_specs_from_layer_types(
         sliding_window_tokens: One window for all sliding layers (today's HF
             scalar), or a per-layer sequence (multi-window models; full-layer
             positions must be None).
-        page_size: Pool page size. Flat treats this as the shared scheduler
-            domain; radix retains its legacy GCD resolution.
+        page_size: Reference pool page size for this structural helper.
         page_sizes: Equal or coarser per-group page sizes keyed by group id;
             values must be positive multiples of page_size. Groups not listed
-            use page_size. Model-specific finer groups must be declared as
-            explicit ``PagedCacheGroupSpec`` values and supplied through
-            ``publish_paged_cache_groups(extra_groups=...)``.
+            use page_size. This helper is scheduler-agnostic: Flat publication
+            rejects coarser groups because its shared domain must be divisible
+            by every group size. Model-specific finer Flat groups must be
+            declared as explicit ``PagedCacheGroupSpec`` values and supplied
+            through ``publish_paged_cache_groups(extra_groups=...)``.
         cache_blocks_per_lcm_block: Per-group physical packing. Omitted groups
             use one CacheBlock per physical parent.
 
@@ -663,7 +663,8 @@ def publish_paged_cache_groups(
         layer_types: Per-layer paged-cache labels (empty -> single
             full-history group).
         sliding_window_tokens / page_size: Forwarded to
-            group_specs_from_layer_types.
+            group_specs_from_layer_types. For Flat publication, layer-derived
+            page sizes must equal page_size.
         extra_groups: Explicit model-declared groups outside the layer-type
             vocabulary. This is also the supported route for finer Flat page
             sizes that divide the shared scheduler domain.
@@ -707,6 +708,23 @@ def publish_paged_cache_groups(
                 "cache_blocks_per_lcm_block must be > 0"
             )
         specs.append(spec)
+    for spec in specs:
+        group_block_size = int(spec.block_size or page_size)
+        if page_size % group_block_size:
+            raise ValueError(
+                f"paged cache group {spec.group_id!r} block_size "
+                f"{group_block_size} must divide Flat scheduler domain "
+                f"{page_size}"
+            )
+        if group_block_size != page_size:
+            expected_packing = page_size // group_block_size
+            if spec.cache_blocks_per_lcm_block != expected_packing:
+                raise ValueError(
+                    f"paged cache group {spec.group_id!r} packing "
+                    f"{spec.cache_blocks_per_lcm_block} does not cover Flat "
+                    f"scheduler domain {page_size}; expected "
+                    f"{expected_packing}"
+                )
     counts = compute_paged_cache_group_page_counts(
         specs,
         max_live_requests=max_live_requests,

@@ -5,6 +5,7 @@ import os
 import pathlib
 import sys
 import unittest
+from unittest import mock
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -191,6 +192,67 @@ class GroupSpecsFromLayerTypesTest(unittest.TestCase):
                 page_sizes={"full_attention": 64},
                 cache_blocks_per_lcm_block={"full_attention": 4},
             )
+
+    def test_structural_helper_allows_coarser_page_sizes(self):
+        specs = group_specs_from_layer_types(
+            layer_types=["full_attention"],
+            sliding_window_tokens=None,
+            page_size=128,
+            page_sizes={"full_attention": 256},
+        )
+        self.assertEqual(specs[0].block_size, 256)
+
+    def test_flat_publication_rejects_coarser_page_size_early(self):
+        with mock.patch.object(
+            _pcs,
+            "scheduler_ext_flat_kvcache",
+            return_value=True,
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "must divide Flat scheduler domain 128",
+            ):
+                _pcs.publish_paged_cache_groups(
+                    layer_types=["full_attention"],
+                    sliding_window_tokens=None,
+                    page_size=128,
+                    page_sizes={"full_attention": 256},
+                    max_live_requests=2,
+                    max_scheduled_tokens=128,
+                    max_total_tokens=1024,
+                    max_context_len=1024,
+                )
+
+    def test_flat_publication_rejects_incomplete_finer_group_packing(self):
+        finer = PagedCacheGroupSpec(
+            group_id="fine_state",
+            retention="full_history",
+            rows_per_page=64,
+            entry_stride_tokens=1,
+            sliding_window_tokens=None,
+            family="state",
+            block_size=64,
+            cache_blocks_per_lcm_block=3,
+        )
+        with mock.patch.object(
+            _pcs,
+            "scheduler_ext_flat_kvcache",
+            return_value=True,
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "does not cover Flat scheduler domain 256; expected 4",
+            ):
+                _pcs.publish_paged_cache_groups(
+                    layer_types=["full_attention"],
+                    sliding_window_tokens=None,
+                    page_size=256,
+                    extra_groups=[finer],
+                    max_live_requests=2,
+                    max_scheduled_tokens=256,
+                    max_total_tokens=2048,
+                    max_context_len=2048,
+                )
 
 
 class LayerGroupIdsTest(unittest.TestCase):
