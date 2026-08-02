@@ -27,6 +27,7 @@ torch.ops.tensorrt_llm.
 import torch
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import error_fn
+from tokenspeed_kernel.thirdparty.deep_ep import load_deep_ep
 
 platform = current_platform()
 
@@ -46,22 +47,18 @@ fast_topk_v2 = error_fn
 # the global libcudart.so.13, and all 820+ kernel registrations from
 # DeepEP silently fail (cudaFuncGetAttributes returns rc=400).
 if platform.is_nvidia:
-    deep_ep_loaded = False
     try:
-        import deep_ep._C  # noqa: F401 — triggers .init_array CUDA registration
+        load_deep_ep()
+    except ImportError:
+        pass
+
+    trtllm_kernel_loaded = False
+    try:
+        import trtllm_kernel  # noqa: F401  — loads .so and registers torch.ops.trtllm.*
     except ImportError:
         pass
     else:
-        deep_ep_loaded = True
-
-    trtllm_kernel_loaded = False
-    if deep_ep_loaded:
-        try:
-            import trtllm_kernel  # noqa: F401  — loads .so and registers torch.ops.trtllm.*
-        except ImportError:
-            pass
-        else:
-            trtllm_kernel_loaded = True
+        trtllm_kernel_loaded = True
 
     if trtllm_kernel_loaded:
 
