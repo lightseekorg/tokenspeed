@@ -46,15 +46,18 @@ on:
           - test/ci/ut/ut-runtime-2gpu.yaml
           - test/ci/ut/ut-runtime-prefix-cache-e2e.yaml
           - test/ci/ut/ut-tokenspeed-kernel.yaml
-      vendor:
-        description: "Optional runner vendor filter"
+      runner_pool:
+        description: "Runner pool selected from the YAML labels"
         required: true
-        default: "all"
+        default: "default"
         type: choice
         options:
-          - all
-          - nvidia
+          - default
+          - b200v2
           - amd
+          - gb200
+          - b300
+          - all
       task_types:
         description: "Comma-separated task types"
         required: true
@@ -83,7 +86,7 @@ on:
           - per-commit
 
 concurrency:
-  group: k8s-dispatch-${{ inputs.pr || 'main' }}-${{ inputs.yaml }}-${{ inputs.vendor }}-${{ inputs.match }}
+  group: k8s-dispatch-${{ inputs.pr || 'main' }}-${{ inputs.yaml }}-${{ inputs.runner_pool }}-${{ inputs.match }}
   cancel-in-progress: false
 
 jobs:
@@ -146,7 +149,7 @@ jobs:
         id: matrix
         env:
           YAML_SELECTION: ${{ inputs.yaml }}
-          VENDOR: ${{ inputs.vendor }}
+          RUNNER_POOL: ${{ inputs.runner_pool }}
           TASK_TYPES: ${{ inputs.task_types }}
           MATCH: ${{ inputs.match }}
           INCLUDE_MMLU: ${{ inputs.include_mmlu }}
@@ -175,7 +178,7 @@ jobs:
               repo / "test/ci",
               repo,
               None if trigger == "all" else trigger,
-              runner_group=os.environ["VENDOR"],
+              runner_group="all",
           )
 
           if selected_yaml != ["all"]:
@@ -192,6 +195,21 @@ jobs:
           include = []
           for task in matrix["include"]:
               searchable = f"{task['name']} {task['config']}".lower()
+              runner = task["runner"]
+              pool = os.environ["RUNNER_POOL"]
+              runner_families = {
+                  "b200v2": runner.startswith("b200v2-"),
+                  "amd": runner.startswith("amd-"),
+                  "gb200": runner.startswith("gb200-"),
+                  "b300": runner.startswith("b300-"),
+              }
+              default_runner = runner_families["b200v2"] or (
+                  runner.startswith("amd-mi35") and runner.endswith("-test")
+              )
+              if pool == "default" and not default_runner:
+                  continue
+              if pool not in ("default", "all") and not runner_families[pool]:
+                  continue
               if selected_paths is not None and task["config"] not in selected_paths:
                   continue
               if task["type"] not in selected_types:
