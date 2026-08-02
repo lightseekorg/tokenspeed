@@ -46,24 +46,15 @@ on:
           - test/ci/ut/ut-runtime-2gpu.yaml
           - test/ci/ut/ut-runtime-prefix-cache-e2e.yaml
           - test/ci/ut/ut-tokenspeed-kernel.yaml
-      runners:
-        description: "ARC runner label"
+      vendor:
+        description: "Optional runner vendor filter"
         required: true
-        default: "b200v2-4gpu"
+        default: "all"
         type: choice
         options:
-          - b200v2-4gpu
-          - b200v2-1gpu
-          - b200v2-2gpu
-          - b200v2-8gpu
-          - gb200-1gpu
-          - gb200-2gpu
-          - gb200-4gpu
-          - amd-mi35x-1gpu-test
-          - amd-mi35x-2gpu-test
-          - amd-mi35x-4gpu-test
-          - amd-mi35x-8gpu-test
-          - amd-mi355-1gpu-bench
+          - all
+          - nvidia
+          - amd
       task_types:
         description: "Comma-separated task types"
         required: true
@@ -92,7 +83,7 @@ on:
           - per-commit
 
 concurrency:
-  group: k8s-dispatch-${{ inputs.pr || 'main' }}-${{ inputs.yaml }}-${{ inputs.runners }}-${{ inputs.match }}
+  group: k8s-dispatch-${{ inputs.pr || 'main' }}-${{ inputs.yaml }}-${{ inputs.vendor }}-${{ inputs.match }}
   cancel-in-progress: false
 
 jobs:
@@ -155,12 +146,13 @@ jobs:
         id: matrix
         env:
           YAML_SELECTION: ${{ inputs.yaml }}
-          RUNNERS: ${{ inputs.runners }}
+          VENDOR: ${{ inputs.vendor }}
           TASK_TYPES: ${{ inputs.task_types }}
           MATCH: ${{ inputs.match }}
           INCLUDE_MMLU: ${{ inputs.include_mmlu }}
           TRIGGER: ${{ inputs.trigger }}
           TOKENSPEED_B200_RUNNER_LABEL: b200v2
+          TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS: h100,b300,gb300
         run: |
           python3 - <<'PY'
           import json
@@ -176,7 +168,6 @@ jobs:
               return [item.strip() for item in os.environ[name].split(",") if item.strip()]
 
           selected_yaml = terms("YAML_SELECTION")
-          selected_runners = set(terms("RUNNERS"))
           selected_types = set(terms("TASK_TYPES"))
           matches = [item.lower() for item in terms("MATCH")]
           trigger = os.environ["TRIGGER"]
@@ -184,7 +175,7 @@ jobs:
               repo / "test/ci",
               repo,
               None if trigger == "all" else trigger,
-              runner_group="all",
+              runner_group=os.environ["VENDOR"],
           )
 
           if selected_yaml != ["all"]:
@@ -202,8 +193,6 @@ jobs:
           for task in matrix["include"]:
               searchable = f"{task['name']} {task['config']}".lower()
               if selected_paths is not None and task["config"] not in selected_paths:
-                  continue
-              if task["runner"] not in selected_runners:
                   continue
               if task["type"] not in selected_types:
                   continue
