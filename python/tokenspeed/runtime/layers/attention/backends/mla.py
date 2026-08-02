@@ -96,6 +96,8 @@ class MLAAttnBackend(AttentionBackend):
 
         self._cache_groups_bound = False
         self._cache_contract_bound = False
+        # Set by mark_cache_contract for a draft driven without cache metadata.
+        self._cache_logical_page_size: int | None = None
         self.max_context_len = config.context_len
         self.page_size = config.page_size
         self.max_num_pages = ceil_div(self.max_context_len, self.page_size)
@@ -127,9 +129,28 @@ class MLAAttnBackend(AttentionBackend):
         self.cuda_graph_seq_lens: torch.Tensor | None = None
         self.decode_cuda_graph_group_out_cache_loc: torch.Tensor | None = None
 
-    def mark_cache_contract(self) -> None:
-        """Enable Paged cache graph state before capture buffers are allocated."""
+    def mark_cache_contract(self, logical_page_size: int | None = None) -> None:
+        """Enable Paged cache graph state before capture buffers are allocated.
+
+        ``logical_page_size`` is the pool's scheduler page size. The target
+        learns it per step from ``cache_metadata``, but a draft is driven
+        directly by the drafter, which passes no metadata -- it hands over the
+        mirrored ``req_to_page`` instead. Recording the size here is what lets
+        the draft translate those scheduler pages into kernel pages.
+        """
         self._cache_contract_bound = True
+        if logical_page_size is not None:
+            self._cache_logical_page_size = int(logical_page_size)
+
+    def _draft_reads_mirrored_pages(self, bs: int, forward_mode: ForwardMode) -> bool:
+        """True when this draft must read scheduler pages from req_to_page."""
+        return (
+            self.is_draft
+            and self._cache_contract_bound
+            and self._cache_logical_page_size is not None
+            and bs > 0
+            and not forward_mode.is_idle()
+        )
 
     def _resolve_full_history_table(
         self, cache_metadata, forward_batch, bs: int
@@ -201,7 +222,7 @@ class MLAAttnBackend(AttentionBackend):
         out: torch.Tensor | None = None,
         q_len_per_req: int = 1,
     ) -> torch.Tensor:
-        """Absolute latent write locations for decoded tokens in FlatKV.
+        """Absolute latent write locations for decoded tokens in Paged cache.
 
         Plain decode writes one location per request (position ``seq-1``).
         Speculative target verify decodes ``q_len_per_req`` tokens per request
@@ -298,10 +319,16 @@ class MLAAttnBackend(AttentionBackend):
         forward_batch = kwargs.pop("forward_batch", None)
         group_table = None
         logical_page_size = None
-        if cache_metadata is not None and self.is_draft:
-            # The draft runs on its own pool; the target's cache metadata
-            # rides the shared forward kwargs, so ignore it rather than
-            # binding the draft to a contract it does not own.
+        if (
+            cache_metadata is not None
+            and self.is_draft
+            and not self._cache_contract_bound
+        ):
+            # A draft on a classic paged pool (DeepSeek MTP) owns no contract;
+            # the target's cache metadata merely rides the shared forward kwargs,
+            # so ignore it. A draft whose pool shares the target's LCM page-id
+            # geometry is marked as a contract sub-backend and does consume it:
+            # the page ids are valid against its own arena.
             cache_metadata = None
             forward_batch = None
         if cache_metadata is not None:
@@ -310,7 +337,17 @@ class MLAAttnBackend(AttentionBackend):
                 cache_metadata, forward_batch, bs
             )
             if cache_debug_enabled():
-                self._validate_live_pages(group_table, seq_lens[:bs], logical_page_size)
+                self._validate_live_pages(
+                    group_table, seq_lens[:bs], logical_page_size
+                )
+        elif self._draft_reads_mirrored_pages(bs, forward_mode):
+            # The drafter drives the draft backend directly and passes no cache
+            # metadata; it hands over req_to_page, which the executor mirrors
+            # from the target's group table for exactly this reason. The ids are
+            # scheduler pages, so record the size the expansion needs.
+            self._cache_groups_bound = True
+            group_table = req_to_page[req_pool_indices[:bs]]
+            logical_page_size = self._cache_logical_page_size
         elif self._cache_groups_bound and bs > 0 and not forward_mode.is_idle():
             raise RuntimeError(
                 "MLAAttnBackend is bound to Paged cache but received no paged cache "
@@ -335,7 +372,7 @@ class MLAAttnBackend(AttentionBackend):
             or forward_mode.is_mixed()
             or (forward_mode.is_extend() and self.is_draft)
         ):
-            # Target verify decodes q_len tokens per request, so the flat write
+            # Target verify decodes q_len tokens per request, so the write
             # locations must cover every one of them, not just the last.
             self._init_decode_metadata(
                 bs=bs,
@@ -448,11 +485,15 @@ class MLAAttnBackend(AttentionBackend):
     def _verify_q_len(self, forward_mode: ForwardMode) -> int:
         """KV write locations each request needs this step.
 
-        Only the target's verify decode writes a whole window; a chaining draft
-        owns its own per-step locations, and prefill goes through the extend
-        path.
+        The target's verify decode writes a whole window, and so does a
+        block-decode draft: it proposes the entire block in one forward, and its
+        seq_lens already run to the block end, so the trailing-window positions
+        are the block's own. A chaining draft owns its per-step locations, and
+        prefill goes through the extend path.
         """
-        if self.spec_num_tokens > 1 and not self.is_draft and forward_mode.is_decode():
+        if self.spec_num_tokens <= 1 or self._block_decode_active:
+            return 1
+        if not self.is_draft and forward_mode.is_decode():
             return self.spec_num_tokens
         return 1
 
@@ -498,8 +539,11 @@ class MLAAttnBackend(AttentionBackend):
                 num_extends=num_extends,
                 page_table=page_table,
                 seq_lens=block_seq_lens,
-                group_out_cache_loc=group_out_cache_loc,
-                group_q_len_per_req=q_len_per_req,
+                # The drafter owns block write locations: it recomputes them
+                # in-graph from the live draft length, which is not knowable
+                # here. Only the read path takes the group page table.
+                group_out_cache_loc=None,
+                group_q_len_per_req=1,
             )
             return
         self.forward_decode_metadata = MLADecodeMetadata(
@@ -562,10 +606,15 @@ class MLAAttnBackend(AttentionBackend):
             or forward_mode.is_idle()
         ):
             return out_cache_loc
+        if self._block_decode_active:
+            # The drafter computes the block's locations from req_to_page and
+            # rewrites them in-graph each replay; overriding them here would
+            # pin every replay to the capture-time draft length.
+            return out_cache_loc
         if forward_mode.is_decode():
             metadata = self.forward_decode_metadata
             if metadata is None or metadata.group_out_cache_loc is None:
-                raise RuntimeError("flat MLA decode write locations are missing")
+                raise RuntimeError("MLA decode write locations are missing")
             # Locations are request-major with group_q_len_per_req entries per
             # row, so a mixed batch skips whole windows, not single rows.
             locs = metadata.group_out_cache_loc[
@@ -620,13 +669,15 @@ class MLAAttnBackend(AttentionBackend):
             )
 
         uses_cache_groups = bool(cache_group_ids) or self._cache_contract_bound
-        if uses_cache_groups and self.is_draft:
+        if self._block_decode_active:
+            if uses_cache_groups:
+                self._cache_groups_bound = True
+            self._capture_block_decode_graph(bs, seq_lens)
+            return
+        if uses_cache_groups and self.is_draft and not self._cache_contract_bound:
             raise NotImplementedError(
                 "MLA draft worker does not take the cache-group path"
             )
-        if self._block_decode_active:
-            self._capture_block_decode_graph(bs, seq_lens)
-            return
         page_table = self.cuda_graph_page_table[:bs, :]
         capture_q_len = 1
         if uses_cache_groups:
@@ -681,6 +732,55 @@ class MLAAttnBackend(AttentionBackend):
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
 
+    def _replay_block_decode_page_table(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        req_to_page: torch.Tensor | None,
+        cache_metadata,
+        forward_batch,
+    ) -> None:
+        """Refresh the block rows' page table, broadcast from one row/request.
+
+        Reads the page ids the same way the eager path does -- through the
+        bridge when bound, otherwise from ``req_to_page`` -- so a replay can
+        never disagree with an eager step about where a request's pages are.
+        """
+        spec = self.spec_num_tokens
+        width = self.max_num_pages
+        rows = self.cuda_graph_page_table[: bs * spec, :width].view(bs, spec, width)
+        table = None
+        logical_page_size = None
+        if self._cache_groups_bound and cache_metadata is not None:
+            table, logical_page_size = self._resolve_full_history_table(
+                cache_metadata, forward_batch, 0
+            )
+        elif (
+            self._cache_groups_bound
+            and self._cache_logical_page_size is not None
+            and req_to_page is not None
+        ):
+            # Draft replay: scheduler pages arrive through the mirrored table.
+            table = req_to_page[req_pool_indices[:bs]]
+            logical_page_size = self._cache_logical_page_size
+        if table is not None:
+            real_bs = min(int(table.shape[0]), bs)
+            if real_bs > 0:
+                expanded = self._expand_group_page_table(
+                    table, batch_size=real_bs, logical_page_size=logical_page_size
+                )
+                rows[:real_bs].copy_(expanded[:, None, :width])
+            # Padded rows resolve to the null page 0.
+            if real_bs < bs:
+                rows[real_bs:].zero_()
+            return
+        if req_to_page is None:
+            raise RuntimeError(
+                "MLA block-decode replay has neither cache metadata nor a "
+                "req_to_page mirror to read page ids from"
+            )
+        rows.copy_(req_to_page[req_pool_indices[:bs], :width][:, None, :])
+
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
@@ -700,15 +800,17 @@ class MLAAttnBackend(AttentionBackend):
             # Replicate each request's page table across its block rows. The
             # seq_lens are re-derived in-graph from the live draft length, so
             # they are deliberately not touched here.
-            spec = self.spec_num_tokens
-            base = req_to_page[req_pool_indices[:bs], : self.max_num_pages]
-            self.cuda_graph_page_table[: bs * spec, : self.max_num_pages].view(
-                bs, spec, self.max_num_pages
-            ).copy_(base[:, None, :])
+            self._replay_block_decode_page_table(
+                bs,
+                req_pool_indices,
+                req_to_page,
+                kwargs.get("cache_metadata"),
+                kwargs.get("forward_batch"),
+            )
             self.forward_decode_metadata = metadata
             return
         # Copy the live lengths into our own cache-seqlens buffer (metadata.seq_lens
-        # views it); both the flat and legacy paths read it at replay.
+        # views it); both metadata paths read it at replay.
         if self.spec_num_tokens > 1 and not self.is_draft:
             self.cuda_graph_seq_lens[:bs].copy_(
                 seq_lens[:bs].clamp_min(self.spec_num_tokens)
@@ -738,7 +840,7 @@ class MLAAttnBackend(AttentionBackend):
         forward_batch,
     ) -> None:
         if metadata.group_out_cache_loc is None:
-            raise RuntimeError("flat MLA graph metadata has no write-location buffer")
+            raise RuntimeError("MLA graph metadata has no write-location buffer")
         # Must match the width baked into the captured buffer view.
         q_len = metadata.group_q_len_per_req
         real_bs = 0

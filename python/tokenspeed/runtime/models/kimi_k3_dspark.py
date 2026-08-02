@@ -47,6 +47,7 @@ from tokenspeed.runtime.configs.kimi_k3_dspark_config import (
     validate_k3_dspark_config,
 )
 from tokenspeed.runtime.distributed.comm_manager import CommManager
+from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -205,6 +206,9 @@ class K3DSparkDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
         )
+        # o_proj and down_proj both leave their row-parallel output un-reduced;
+        # the next norm reduces it, fused where the token count allows.
+        self.self_attn.o_proj.reduce_results = False
         self.comm_manager = CommManager(
             mapping=mapping,
             layer_id=layer_id,
@@ -226,7 +230,13 @@ class K3DSparkDecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            hidden_states, residual = self._norm_with_allreduce(
+                self.input_layernorm,
+                hidden_states,
+                residual,
+                ctx,
+                self.mapping.dense,
+            )
 
         hidden_states = self.self_attn(
             positions=positions,
@@ -235,9 +245,35 @@ class K3DSparkDecoderLayer(nn.Module):
             out_cache_loc=out_cache_loc,
             comm_manager=self.comm_manager,
         )
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states, residual = self._norm_with_allreduce(
+            self.post_attention_layernorm,
+            hidden_states,
+            residual,
+            ctx,
+            self.mapping.attn,
+        )
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
+
+    @staticmethod
+    def _norm_with_allreduce(
+        norm: RMSNorm,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        ctx: ForwardContext,
+        group,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reduce the preceding row-parallel output, then norm.
+
+        Deliberately the unfused path. The fused variant reduces through Iris
+        symmetric-heap buffers sized from the target's shapes, and the draft's
+        block forward is a different width; until that is verified the plain
+        all-reduce is the correct default. It costs one extra pass over an
+        8-row tensor.
+        """
+        del ctx
+        hidden_states = all_reduce(hidden_states, group.tp_group)
+        return norm(hidden_states, residual)
 
 
 class K3DSparkModel(nn.Module):
@@ -353,7 +389,9 @@ class K3DSparkModel(nn.Module):
             )
         else:
             hidden_states = input_embeds
-        residual = None
+        # A zero residual rather than None: the drafter hands over an un-reduced
+        # embedding, so the first layer must take the all-reduce path too.
+        residual = torch.zeros_like(hidden_states)
 
         if kv_sync_event is not None:
             torch.cuda.current_stream().wait_event(kv_sync_event)

@@ -101,7 +101,12 @@ def _get_drafter_impl(spec_algo: str, model: torch.nn.Module):
         InklingForConditionalGenerationNextN,
     )
 
-    DRAFTER_MAPPING = {"EAGLE3": Eagle, "MTP": Eagle, "DFLASH": DFlash, "DSPARK": DSpark}
+    DRAFTER_MAPPING = {
+        "EAGLE3": Eagle,
+        "MTP": Eagle,
+        "DFLASH": DFlash,
+        "DSPARK": DSpark,
+    }
 
     # "MTP" covers two algorithms:
     # (1) Eagle-like MTP (e.g. DeepSeek) stays on Eagle in eagle.py;
@@ -314,6 +319,9 @@ class ModelExecutor:
         self._mirror_idx_cpu: torch.Tensor | None = None
         self._mirror_idx_dev: torch.Tensor | None = None
         self._mirror_row_buf: torch.Tensor | None = None
+        # Block-decode drafters need req_to_page mirrored even under the flat
+        # contract; see _mirror_flat_full_table_into_req_to_page.
+        self._mirror_for_block_draft = config.spec_algo in ("DFLASH", "DSPARK")
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
 
@@ -744,12 +752,26 @@ class ModelExecutor:
     def _mirror_full_history_table_into_req_to_page(
         self, forward_op, block_tables
     ) -> None:
-        """Expose the full-history table to ordinary speculative consumers."""
+        """Expose the full-history table to ordinary speculative consumers.
+
+        On the cache-contract path this normally stays off: mirroring into
+        req_to_page would resurrect the legacy path for the target. A
+        block-decode drafter is the exception. It derives its own KV write
+        locations from req_to_page (the scheduler never allocates draft
+        pages, so nothing else can), and its draft pool shares the target's
+        page-id geometry by construction. Leaving the table zeroed there
+        does not fall back to anything -- it silently addresses page 0 for
+        every request.
+        """
         if (
-            self._cache_runtime_contract is not None
-            or self.drafter is None
+            self.drafter is None
             or not block_tables
             or self._full_history_group_id is None
+        ):
+            return
+        if (
+            self._cache_runtime_contract is not None
+            and not self._mirror_for_block_draft
         ):
             return
         table = block_tables.get(self._full_history_group_id)
@@ -1502,6 +1524,11 @@ class ModelExecutor:
                     num_requests=bs,
                 )
                 block_tables = dict(cache_metadata.tables(active_forward_op=forward_op))
+                # A block-decode drafter reads its draft KV write locations
+                # out of req_to_page, which the scheduler leaves empty.
+                self._mirror_full_history_table_into_req_to_page(
+                    forward_op, block_tables
+                )
             else:
                 block_tables = block_tables_from_forward_op(
                     forward_op,

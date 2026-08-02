@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 from typing import TYPE_CHECKING
@@ -1386,6 +1387,25 @@ def create_attn_components(
             )
 
     _validate_shared_lcm_geometry(pool, draft_pool)
+    # An LCM draft pool reuses the target's page ids in its own arena (that is
+    # exactly what _validate_shared_lcm_geometry just asserted), so the draft
+    # backend must read page ids through the cache-group bridge like the target
+    # does. Without this it falls back to req_to_page with the wrong page size
+    # and over-reads the table.
+    if (
+        draft_attn_backend is not None
+        and getattr(draft_pool, "_lcm_memory_plan", None) is not None
+    ):
+        draft_mark_contract = getattr(draft_attn_backend, "mark_cache_contract", None)
+        if draft_mark_contract is not None:
+            # CuteDSL's MLA backend takes no page size -- it resolves draft pages
+            # from its own metadata -- so probe the signature rather than passing
+            # a kwarg it would reject.
+            params = inspect.signature(draft_mark_contract).parameters
+            if "logical_page_size" in params:
+                draft_mark_contract(logical_page_size=int(draft_pool.page_size))
+            else:
+                draft_mark_contract()
     if use_lcm_gdn and fixed_workspace_bytes:
         actual_workspace_bytes = (
             backend.linear_attn_backend.preallocate_verify_workspace(

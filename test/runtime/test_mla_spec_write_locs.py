@@ -27,8 +27,8 @@ def _backend(*, spec_num_tokens: int = 1, is_draft: bool = False) -> MLAAttnBack
     backend.is_draft = is_draft
     backend.draft_block_decode = False
     backend.device = torch.device("cpu")
-    backend._flat_bound = True
-    backend._flat_contract_bound = True
+    backend._cache_groups_bound = True
+    backend._cache_contract_bound = True
     backend.max_context_len = 4096
     backend.max_num_pages = 8
     backend.decode_cuda_graph_metadata = {}
@@ -49,8 +49,8 @@ def test_plain_decode_writes_one_location_per_request() -> None:
     table = _table()
     seq_lens = torch.tensor([70, 130], dtype=torch.int32)
 
-    locs = MLAAttnBackend._flat_decode_out_cache_loc(
-        table, seq_lens, batch_size=2, flat_page_size=PAGE
+    locs = MLAAttnBackend._cache_decode_out_cache_loc(
+        table, seq_lens, batch_size=2, logical_page_size=PAGE
     )
 
     assert locs.shape == (2,)
@@ -62,8 +62,8 @@ def test_verify_writes_the_whole_window_request_major() -> None:
     table = _table()
     seq_lens = torch.tensor([70, 130], dtype=torch.int32)
 
-    locs = MLAAttnBackend._flat_decode_out_cache_loc(
-        table, seq_lens, batch_size=2, flat_page_size=PAGE, q_len_per_req=4
+    locs = MLAAttnBackend._cache_decode_out_cache_loc(
+        table, seq_lens, batch_size=2, logical_page_size=PAGE, q_len_per_req=4
     )
 
     assert locs.shape == (8,)
@@ -81,11 +81,11 @@ def test_verify_window_ends_at_the_last_token() -> None:
     table = _table()
     seq_lens = torch.tensor([70, 130], dtype=torch.int32)
 
-    single = MLAAttnBackend._flat_decode_out_cache_loc(
-        table, seq_lens, batch_size=2, flat_page_size=PAGE
+    single = MLAAttnBackend._cache_decode_out_cache_loc(
+        table, seq_lens, batch_size=2, logical_page_size=PAGE
     )
-    window = MLAAttnBackend._flat_decode_out_cache_loc(
-        table, seq_lens, batch_size=2, flat_page_size=PAGE, q_len_per_req=4
+    window = MLAAttnBackend._cache_decode_out_cache_loc(
+        table, seq_lens, batch_size=2, logical_page_size=PAGE, q_len_per_req=4
     )
     assert window.view(2, 4)[:, -1].tolist() == single.tolist()
 
@@ -93,11 +93,11 @@ def test_verify_window_ends_at_the_last_token() -> None:
 def test_window_locations_are_distinct() -> None:
     """Folding the window into one slot is the failure this guards."""
     table = _table(rows=1)
-    locs = MLAAttnBackend._flat_decode_out_cache_loc(
+    locs = MLAAttnBackend._cache_decode_out_cache_loc(
         table,
         torch.tensor([100], dtype=torch.int32),
         batch_size=1,
-        flat_page_size=PAGE,
+        logical_page_size=PAGE,
         q_len_per_req=8,
     )
     assert len(set(locs.tolist())) == 8
@@ -107,11 +107,11 @@ def test_window_spanning_a_page_boundary_follows_the_table() -> None:
     """Positions either side of a page edge must resolve to different pages."""
     table = _table(rows=1)
     # seq 66 with a window of 4 covers 62,63 (page col 0) and 64,65 (col 1).
-    locs = MLAAttnBackend._flat_decode_out_cache_loc(
+    locs = MLAAttnBackend._cache_decode_out_cache_loc(
         table,
         torch.tensor([66], dtype=torch.int32),
         batch_size=1,
-        flat_page_size=PAGE,
+        logical_page_size=PAGE,
         q_len_per_req=4,
     )
     page0, page1 = int(table[0, 0]), int(table[0, 1])
@@ -125,11 +125,11 @@ def test_window_spanning_a_page_boundary_follows_the_table() -> None:
 
 def test_short_sequences_clamp_instead_of_going_negative() -> None:
     table = _table(rows=1)
-    locs = MLAAttnBackend._flat_decode_out_cache_loc(
+    locs = MLAAttnBackend._cache_decode_out_cache_loc(
         table,
         torch.tensor([2], dtype=torch.int32),
         batch_size=1,
-        flat_page_size=PAGE,
+        logical_page_size=PAGE,
         q_len_per_req=4,
     )
     assert all(loc >= 0 for loc in locs.tolist())
@@ -141,17 +141,17 @@ def test_out_buffer_is_filled_in_place() -> None:
     seq_lens = torch.tensor([70, 130], dtype=torch.int32)
     buf = torch.zeros(2 * 4, dtype=torch.int64)
 
-    returned = MLAAttnBackend._flat_decode_out_cache_loc(
+    returned = MLAAttnBackend._cache_decode_out_cache_loc(
         table,
         seq_lens,
         batch_size=2,
-        flat_page_size=PAGE,
+        logical_page_size=PAGE,
         out=buf,
         q_len_per_req=4,
     )
     assert returned.data_ptr() == buf.data_ptr()
-    expected = MLAAttnBackend._flat_decode_out_cache_loc(
-        table, seq_lens, batch_size=2, flat_page_size=PAGE, q_len_per_req=4
+    expected = MLAAttnBackend._cache_decode_out_cache_loc(
+        table, seq_lens, batch_size=2, logical_page_size=PAGE, q_len_per_req=4
     )
     assert buf.tolist() == expected.tolist()
 
@@ -164,7 +164,7 @@ def test_out_buffer_is_filled_in_place() -> None:
 def test_target_verify_decode_uses_the_full_window() -> None:
     backend = _backend(spec_num_tokens=8)
     assert backend._verify_q_len(ForwardMode.DECODE) == 8
-    assert backend._graph_flat_q_len() == 8
+    assert backend._graph_verify_q_len() == 8
 
 
 def test_prefill_uses_a_single_location() -> None:
@@ -173,17 +173,41 @@ def test_prefill_uses_a_single_location() -> None:
     assert backend._verify_q_len(ForwardMode.EXTEND) == 1
 
 
-def test_draft_never_takes_the_verify_window() -> None:
+def test_a_chaining_draft_never_takes_the_verify_window() -> None:
     """A chaining draft owns its own per-step write locations."""
     backend = _backend(spec_num_tokens=8, is_draft=True)
     assert backend._verify_q_len(ForwardMode.DECODE) == 1
-    assert backend._graph_flat_q_len() == 1
+    assert backend._graph_verify_q_len() == 1
+
+
+def test_a_block_decode_draft_keeps_its_own_write_locations() -> None:
+    """Block locations depend on the live draft length, computed in-graph.
+
+    Resolving them here would pin every replay to the capture-time length, so
+    the drafter owns them and the backend only supplies the read path.
+    """
+    backend = _backend(spec_num_tokens=8, is_draft=True)
+    backend.draft_block_decode = True
+    assert backend._verify_q_len(ForwardMode.DECODE) == 1
+
+    caller_locs = torch.arange(16, dtype=torch.int64)
+    backend.forward_decode_metadata = MLADecodeMetadata(
+        num_extends=0,
+        page_table=torch.zeros((16, 8), dtype=torch.int32),
+        seq_lens=torch.zeros(16, dtype=torch.int32),
+        group_out_cache_loc=None,
+        group_q_len_per_req=1,
+    )
+    selected = backend.select_out_cache_loc(
+        layer=None, out_cache_loc=caller_locs, forward_mode=ForwardMode.DECODE
+    )
+    assert selected is caller_locs
 
 
 def test_non_speculative_decode_is_unchanged() -> None:
     backend = _backend(spec_num_tokens=1)
     assert backend._verify_q_len(ForwardMode.DECODE) == 1
-    assert backend._graph_flat_q_len() == 1
+    assert backend._graph_verify_q_len() == 1
 
 
 # --------------------------------------------------------------------------
@@ -199,8 +223,8 @@ def test_mixed_batch_skips_whole_windows_not_rows() -> None:
         num_extends=1,
         page_table=torch.zeros((3, 8), dtype=torch.int32),
         seq_lens=torch.zeros(3, dtype=torch.int32),
-        flat_out_cache_loc=locs,
-        flat_q_len_per_req=4,
+        group_out_cache_loc=locs,
+        group_q_len_per_req=4,
     )
 
     selected = backend.select_out_cache_loc(
@@ -217,8 +241,8 @@ def test_non_spec_mixed_batch_still_skips_single_rows() -> None:
         num_extends=1,
         page_table=torch.zeros((3, 8), dtype=torch.int32),
         seq_lens=torch.zeros(3, dtype=torch.int32),
-        flat_out_cache_loc=locs,
-        flat_q_len_per_req=1,
+        group_out_cache_loc=locs,
+        group_q_len_per_req=1,
     )
     selected = backend.select_out_cache_loc(
         layer=None, out_cache_loc=torch.zeros(2), forward_mode=ForwardMode.DECODE
@@ -232,8 +256,8 @@ def test_count_mismatch_is_still_caught() -> None:
         num_extends=0,
         page_table=torch.zeros((2, 8), dtype=torch.int32),
         seq_lens=torch.zeros(2, dtype=torch.int32),
-        flat_out_cache_loc=torch.arange(8, dtype=torch.int64),
-        flat_q_len_per_req=4,
+        group_out_cache_loc=torch.arange(8, dtype=torch.int64),
+        group_q_len_per_req=4,
     )
     with pytest.raises(RuntimeError, match="write locations cover"):
         backend.select_out_cache_loc(
@@ -251,13 +275,13 @@ def test_count_mismatch_is_still_caught() -> None:
 def test_graph_loc_buffer_is_sized_for_the_window() -> None:
     backend = _backend(spec_num_tokens=8)
     backend.init_cuda_graph_state(max_bs=4)
-    assert backend.decode_cuda_graph_flat_out_cache_loc.shape == (32,)
+    assert backend.decode_cuda_graph_group_out_cache_loc.shape == (32,)
 
 
 def test_graph_loc_buffer_is_unexpanded_without_spec() -> None:
     backend = _backend(spec_num_tokens=1)
     backend.init_cuda_graph_state(max_bs=4)
-    assert backend.decode_cuda_graph_flat_out_cache_loc.shape == (4,)
+    assert backend.decode_cuda_graph_group_out_cache_loc.shape == (4,)
 
 
 def test_capture_records_the_window_width_on_the_metadata() -> None:
@@ -270,8 +294,8 @@ def test_capture_records_the_window_width_on_the_metadata() -> None:
         forward_mode=ForwardMode.DECODE,
     )
     metadata = backend.decode_cuda_graph_metadata[2]
-    assert metadata.flat_q_len_per_req == 8
-    assert metadata.flat_out_cache_loc.shape == (16,)
+    assert metadata.group_q_len_per_req == 8
+    assert metadata.group_out_cache_loc.shape == (16,)
 
 
 def test_capture_clamps_seq_lens_to_the_window() -> None:
@@ -287,8 +311,10 @@ def test_capture_clamps_seq_lens_to_the_window() -> None:
     assert backend.decode_cuda_graph_metadata[2].seq_lens.tolist() == [8, 200]
 
 
-def test_draft_is_refused_on_the_flat_graph_path() -> None:
+def test_an_unmarked_draft_is_refused_on_the_group_graph_path() -> None:
+    """A draft on a classic pool has no business reading the group tables."""
     backend = _backend(spec_num_tokens=8, is_draft=True)
+    backend._cache_contract_bound = False
     backend.init_cuda_graph_state(max_bs=2)
     with pytest.raises(NotImplementedError, match="draft worker"):
         backend.init_forward_metadata_capture_cuda_graph(
@@ -296,9 +322,18 @@ def test_draft_is_refused_on_the_flat_graph_path() -> None:
             req_pool_indices=torch.tensor([0, 1]),
             seq_lens=torch.tensor([100, 200], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
+            cache_group_ids=("full_attention",),
         )
 
 
-def test_backend_declares_block_decode_capability() -> None:
-    """The flat startup gate reads this off the class."""
-    assert MLAAttnBackend.flat_block_decode_capable is True
+def test_a_contract_bound_draft_is_admitted_on_the_group_graph_path() -> None:
+    """A draft sharing the target's LCM page ids reads them through the bridge."""
+    backend = _backend(spec_num_tokens=8, is_draft=True)
+    backend.init_cuda_graph_state(max_bs=2)
+    backend.init_forward_metadata_capture_cuda_graph(
+        bs=2,
+        req_pool_indices=torch.tensor([0, 1]),
+        seq_lens=torch.tensor([100, 200], dtype=torch.int32),
+        forward_mode=ForwardMode.DECODE,
+    )
+    assert 2 in backend.decode_cuda_graph_metadata
