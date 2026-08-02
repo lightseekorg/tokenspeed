@@ -337,9 +337,7 @@ class MLAAttnBackend(AttentionBackend):
                 cache_metadata, forward_batch, bs
             )
             if cache_debug_enabled():
-                self._validate_live_pages(
-                    group_table, seq_lens[:bs], logical_page_size
-                )
+                self._validate_live_pages(group_table, seq_lens[:bs], logical_page_size)
         elif self._draft_reads_mirrored_pages(bs, forward_mode):
             # The drafter drives the draft backend directly and passes no cache
             # metadata; it hands over req_to_page, which the executor mirrors
@@ -536,7 +534,11 @@ class MLAAttnBackend(AttentionBackend):
                 page_table, seq_lens[:bs], bs
             )
             self.forward_decode_metadata = MLADecodeMetadata(
-                num_extends=num_extends,
+                # The drafter calls in with num_extends == bs (its rows are
+                # "extend" by its own convention) but every one of them is a
+                # block row this metadata describes, so nothing is skipped.
+                # Carrying its value here would slice the whole block away.
+                num_extends=0,
                 page_table=page_table,
                 seq_lens=block_seq_lens,
                 # The drafter owns block write locations: it recomputes them
