@@ -1,0 +1,189 @@
+name: K8s Dispatch
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Optional pull request number or URL; blank runs latest main"
+        required: false
+        default: ""
+        type: string
+      yaml:
+        description: "Comma-separated CI YAML paths, or all"
+        required: true
+        default: "all"
+        type: string
+      runners:
+        description: "Comma-separated exact ARC runner labels"
+        required: true
+        default: "b200v2-4gpu"
+        type: string
+      task_types:
+        description: "Comma-separated task types"
+        required: true
+        default: "eval,perf"
+        type: string
+      match:
+        description: "Optional comma-separated task/model substrings"
+        required: false
+        default: ""
+        type: string
+      include_mmlu:
+        description: "Include long-running MMLU tasks"
+        required: true
+        default: false
+        type: boolean
+      trigger:
+        description: "Optional task trigger filter"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - manual
+          - nightly
+          - debug
+          - per-commit
+
+concurrency:
+  group: k8s-dispatch-${{ inputs.pr || 'main' }}-${{ inputs.yaml }}-${{ inputs.runners }}-${{ inputs.match }}
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      has_tasks: ${{ steps.matrix.outputs.has_tasks }}
+      source_sha: ${{ steps.source.outputs.sha }}
+      install_tokenspeed_mla_from_source: ${{ steps.source.outputs.install_mla }}
+    steps:
+      - name: Resolve source
+        id: source
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ inputs.pr }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PR" ]; then
+            sha=$(gh api "repos/${{ github.repository }}/commits/main" --jq .sha)
+            link="https://github.com/${{ github.repository }}/commit/$sha"
+            install_mla=0
+          else
+            number=${PR##*/}
+            [[ "$number" =~ ^[0-9]+$ ]] || {
+              echo "Invalid pull request: $PR" >&2
+              exit 2
+            }
+            data=$(gh api "repos/${{ github.repository }}/pulls/$number")
+            sha=$(jq -r .head.sha <<< "$data")
+            link=$(jq -r .html_url <<< "$data")
+            if gh api "repos/${{ github.repository }}/pulls/$number/files" \
+              --paginate --jq '.[].filename' | grep -q '^tokenspeed-mla/'; then
+              install_mla=1
+            else
+              install_mla=0
+            fi
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "install_mla=$install_mla" >> "$GITHUB_OUTPUT"
+          {
+            echo "### K8s Dispatch"
+            echo
+            echo "- Source: [$link]($link)"
+            echo "- Commit: \`$sha\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.source.outputs.sha }}
+
+      - name: Install scan dependency
+        run: python3 -m pip install pyyaml
+
+      - name: Build task matrix
+        id: matrix
+        env:
+          YAML_SELECTION: ${{ inputs.yaml }}
+          RUNNERS: ${{ inputs.runners }}
+          TASK_TYPES: ${{ inputs.task_types }}
+          MATCH: ${{ inputs.match }}
+          INCLUDE_MMLU: ${{ inputs.include_mmlu }}
+          TRIGGER: ${{ inputs.trigger }}
+          TOKENSPEED_B200_RUNNER_LABEL: b200v2
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          from test.ci_system.pipeline import build_matrix
+
+          repo = Path.cwd()
+
+          def terms(name):
+              return [item.strip() for item in os.environ[name].split(",") if item.strip()]
+
+          selected_yaml = terms("YAML_SELECTION")
+          selected_runners = set(terms("RUNNERS"))
+          selected_types = set(terms("TASK_TYPES"))
+          matches = [item.lower() for item in terms("MATCH")]
+          trigger = os.environ["TRIGGER"]
+          matrix = build_matrix(
+              repo / "test/ci",
+              repo,
+              None if trigger == "all" else trigger,
+              runner_group="nvidia-x86",
+          )
+
+          if selected_yaml != ["all"]:
+              invalid = [
+                  item for item in selected_yaml
+                  if not item.startswith("test/ci/") or not (repo / item).is_file()
+              ]
+              if invalid:
+                  raise SystemExit(f"Invalid CI YAML: {', '.join(invalid)}")
+              selected_paths = set(selected_yaml)
+          else:
+              selected_paths = None
+
+          include = []
+          for task in matrix["include"]:
+              searchable = f"{task['name']} {task['config']}".lower()
+              if selected_paths is not None and task["config"] not in selected_paths:
+                  continue
+              if task["runner"] not in selected_runners:
+                  continue
+              if task["type"] not in selected_types:
+                  continue
+              if matches and not any(term in searchable for term in matches):
+                  continue
+              if os.environ["INCLUDE_MMLU"] != "true" and "mmlu" in searchable:
+                  continue
+              include.append(task)
+
+          result = {"include": include}
+          output = os.environ["GITHUB_OUTPUT"]
+          with open(output, "a", encoding="utf-8") as stream:
+              stream.write(f"matrix={json.dumps(result, separators=(',', ':'))}\n")
+              stream.write(f"has_tasks={'true' if include else 'false'}\n")
+          if not include:
+              raise SystemExit("No CI tasks matched the requested filters")
+          print(json.dumps(result, indent=2))
+          PY
+
+  run:
+    needs: scan
+    if: needs.scan.outputs.has_tasks == 'true'
+    uses: ./.github/workflows/run-pr-test-stage.yml
+    with:
+      matrix: ${{ needs.scan.outputs.matrix }}
+      install_tokenspeed_mla_from_source: ${{ needs.scan.outputs.install_tokenspeed_mla_from_source }}
+      b200_runner_label: b200v2
+      checkout_ref: ${{ needs.scan.outputs.source_sha }}
+      timeout_minutes: 720
+    secrets: inherit
