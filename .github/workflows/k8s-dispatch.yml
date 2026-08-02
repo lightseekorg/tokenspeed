@@ -152,7 +152,7 @@ jobs:
           INCLUDE_MMLU: ${{ inputs.include_mmlu }}
           TRIGGER: ${{ inputs.trigger }}
           TOKENSPEED_B200_RUNNER_LABEL: b200v2
-          TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS: h100,b300,gb300
+          TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS: h100,gb300
         run: |
           python3 - <<'PY'
           import json
