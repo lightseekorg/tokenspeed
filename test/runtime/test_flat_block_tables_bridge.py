@@ -102,6 +102,19 @@ class FlatBlockTablesBridgeTest(unittest.TestCase):
         self.assertEqual(self.bridge(op, device="cpu", num_reqs=0), {})
         self.assertEqual(self.bridge(op, device="cpu"), {})
 
+    def test_strict_bridge_rejects_invalid_id_outside_active_page(self):
+        # The scheduler-export bridge owns the complete range scan before H2D;
+        # backend replay only needs to gather each active row's current page.
+        op = self._make_op({"full": [[1, 99]]})
+        with self.assertRaisesRegex(ValueError, "outside -1..8"):
+            self.bridge(
+                op,
+                device="cpu",
+                num_reqs=1,
+                expected_group_ids=("full",),
+                max_page_ids={"full": 8},
+            )
+
 
 class FlatFlagGatingTest(unittest.TestCase):
     """uses_flat_cache_groups must default to False so every existing

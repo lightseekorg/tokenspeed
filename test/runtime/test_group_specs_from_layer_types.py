@@ -182,6 +182,16 @@ class GroupSpecsFromLayerTypesTest(unittest.TestCase):
         self.assertEqual(by_id["linear_attention"].family, "state")
         self.assertIsNone(by_id["linear_attention"].sliding_window_tokens)
 
+    def test_layer_helper_rejects_finer_page_sizes_with_explicit_route(self):
+        with self.assertRaisesRegex(ValueError, "explicit PagedCacheGroupSpec"):
+            group_specs_from_layer_types(
+                layer_types=["full_attention"],
+                sliding_window_tokens=None,
+                page_size=256,
+                page_sizes={"full_attention": 64},
+                cache_blocks_per_lcm_block={"full_attention": 4},
+            )
+
 
 class LayerGroupIdsTest(unittest.TestCase):
     def test_single_window_ids_equal_layer_types(self):

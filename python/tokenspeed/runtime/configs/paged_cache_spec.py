@@ -35,8 +35,11 @@ class PagedCacheGroupSpec:
     # History groups form a chain; State groups only need the trailing window.
     family: Family = "history"
     # Per-group logical page tokens; None -> scheduler global block_size. A
-    # finer group must divide the global block and pack the corresponding
-    # number of logical pages into one LCM block.
+    # model-declared finer group must divide the global block and pack the
+    # corresponding number of logical pages into one LCM block. The generic
+    # layer-type helper below only derives equal/coarser groups; finer groups
+    # travel through a model-specific spec or publish_paged_cache_groups'
+    # extra_groups path.
     block_size: int | None = None
     # Physical child CacheBlocks packed into one shared LCM parent.
     cache_blocks_per_lcm_block: int = 1
@@ -555,9 +558,11 @@ def group_specs_from_layer_types(
             positions must be None).
         page_size: Pool page size. Flat treats this as the shared scheduler
             domain; radix retains its legacy GCD resolution.
-        page_sizes: Per-group page sizes keyed by group id (heterogeneous
-            block sizes); values must be positive multiples of page_size.
-            Groups not listed use page_size.
+        page_sizes: Equal or coarser per-group page sizes keyed by group id;
+            values must be positive multiples of page_size. Groups not listed
+            use page_size. Model-specific finer groups must be declared as
+            explicit ``PagedCacheGroupSpec`` values and supplied through
+            ``publish_paged_cache_groups(extra_groups=...)``.
         cache_blocks_per_lcm_block: Per-group physical packing. Omitted groups
             use one CacheBlock per physical parent.
 
@@ -570,7 +575,9 @@ def group_specs_from_layer_types(
         if ps <= 0 or ps % page_size:
             raise ValueError(
                 f"page_sizes[{gid!r}] = {ps} must be a positive "
-                f"multiple of page_size {page_size}"
+                f"multiple of page_size {page_size}; layer-derived groups "
+                "do not accept finer page sizes (use an explicit "
+                "PagedCacheGroupSpec via extra_groups)"
             )
     packing = dict(cache_blocks_per_lcm_block or {})
     for gid, count in packing.items():
@@ -657,6 +664,9 @@ def publish_paged_cache_groups(
             full-history group).
         sliding_window_tokens / page_size: Forwarded to
             group_specs_from_layer_types.
+        extra_groups: Explicit model-declared groups outside the layer-type
+            vocabulary. This is also the supported route for finer Flat page
+            sizes that divide the shared scheduler domain.
         max_live_requests / max_scheduled_tokens / max_total_tokens /
             max_context_len: Sizing inputs for
             compute_paged_cache_group_page_counts.

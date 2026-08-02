@@ -437,14 +437,16 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         actual_bs: int,
         phase: str,
     ) -> None:
-        """Fail closed on page capacity and active-sequence table coverage.
+        """Fail closed on active-sequence table coverage.
 
         The scheduler export is already on CPU when ModelExecutor checks page
-        IDs before H2D. This second check protects direct backend callers and,
-        critically, proves that each active row still contains the absolute
-        logical page selected by its live sequence length. CUDA assertions are
-        stream ordered and capture-safe, so replay cannot silently consume the
-        ``-1`` ragged padding from a short or stale source table.
+        IDs before H2D. Keep the complete range scan for CPU/direct backend
+        callers, but do not repeat it over every GPU table on each eager step
+        or graph replay. The GPU check gathers only the logical page selected
+        by each active sequence and verifies both presence and capacity. CUDA
+        assertions are stream ordered and capture-safe, so replay cannot
+        silently consume ``-1`` ragged padding from a short or stale source
+        table.
         """
         if actual_bs == 0:
             return
@@ -462,7 +464,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                     f"{group_id!r}"
                 )
             live = table[:actual_bs]
-            page_ids_valid = ((live >= -1) & (live <= max_page_id)).all()
             required_page = torch.div(
                 live_seq_lens.clamp_min(1) - 1,
                 raw_tokens_per_page,
@@ -479,10 +480,14 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             # Page 0 is the scheduler's reserved null page.  It is valid in
             # fully-slid-out SWA columns, but never for the logical page that
             # contains an active sequence's current token.
+            required_entries = live[row_indices, safe_page]
             required_entries_present = (
-                in_bounds & live[row_indices, safe_page].gt(0)
+                in_bounds & required_entries.gt(0) & required_entries.le(max_page_id)
             ).all()
             if table.device.type == "cpu":
+                # Direct CPU callers do not necessarily travel through the
+                # scheduler-export bridge, so preserve its full range check.
+                page_ids_valid = ((live >= -1) & (live <= max_page_id)).all()
                 if not bool(page_ids_valid.item()):
                     raise RuntimeError(
                         f"DeepSeek V4 Flat KV {phase} table {group_id!r} contains "
@@ -495,13 +500,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                     )
             else:
                 torch._assert_async(
-                    page_ids_valid,
-                    f"DeepSeek V4 Flat KV {phase} page ID exceeds group capacity",
-                )
-                torch._assert_async(
                     required_entries_present,
                     f"DeepSeek V4 Flat KV {phase} table is missing a real page "
-                    "for an active sequence",
+                    "for an active sequence or its page ID exceeds group capacity",
                 )
 
     def _get_prefill_workspace(
