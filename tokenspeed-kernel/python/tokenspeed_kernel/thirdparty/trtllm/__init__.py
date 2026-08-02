@@ -37,25 +37,25 @@ per_tensor_quant_fp8 = error_fn
 per_token_quant_fp8 = error_fn
 fast_topk_v2 = error_fn
 
-# deep_ep_cpp MUST be loaded before trtllm_kernel.  libtensorrt_llm.so
+# The DeepEP extension MUST be loaded before trtllm_kernel.  libtensorrt_llm.so
 # statically links libcudart_static.a, creating a second CUDA runtime in
-# the process.  deep_ep_cpp uses CUDA separate compilation (device-linked
+# the process.  DeepEP uses CUDA separate compilation (device-linked
 # binaries) whose deferred __cudaRegisterLinkedBinary registration relies
 # on internal libcudart function-pointer tables.  If the static-linked
 # cudart in libtensorrt_llm initializes first, it corrupts this state in
 # the global libcudart.so.13, and all 820+ kernel registrations from
-# deep_ep_cpp silently fail (cudaFuncGetAttributes returns rc=400).
+# DeepEP silently fail (cudaFuncGetAttributes returns rc=400).
 if platform.is_nvidia:
-    deep_ep_cpp_loaded = False
+    deep_ep_loaded = False
     try:
-        import deep_ep_cpp  # noqa: F401 — triggers .init_array CUDA registration
+        import deep_ep._C  # noqa: F401 — triggers .init_array CUDA registration
     except ImportError:
         pass
     else:
-        deep_ep_cpp_loaded = True
+        deep_ep_loaded = True
 
     trtllm_kernel_loaded = False
-    if deep_ep_cpp_loaded:
+    if deep_ep_loaded:
         try:
             import trtllm_kernel  # noqa: F401  — loads .so and registers torch.ops.trtllm.*
         except ImportError:

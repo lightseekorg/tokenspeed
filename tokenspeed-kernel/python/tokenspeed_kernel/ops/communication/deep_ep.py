@@ -58,7 +58,7 @@ class _MissingBuffer(metaclass=_MissingBufferMeta):
 
 
 try:
-    from deep_ep.buffer import Buffer
+    from deep_ep import Buffer
 except ImportError:
     Buffer = _MissingBuffer
 
