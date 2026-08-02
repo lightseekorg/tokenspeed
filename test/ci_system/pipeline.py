@@ -32,11 +32,15 @@ except ImportError as exc:  # pragma: no cover
 
 SUPPORTED_TYPES = {"ut", "server_smoke", "eval", "perf"}
 SUPPORTED_TRIGGERS = {"per-commit", "manual", "nightly", "debug"}
+WORKFLOW_STAGE_TYPES = {
+    "unit-test": {"ut", "server_smoke"},
+    "model-test": {"eval", "perf"},
+}
+SUPPORTED_WORKFLOW_STAGES = tuple(WORKFLOW_STAGE_TYPES)
 SUPPORTED_SETUP_MODES = ("ci", "slurm")
 # Lower sort key = dispatched earlier. GitHub Actions starts matrix jobs in
 # include-list order, so `high` entries reach runner pools first when several
-# jobs contend for the same label (typical case: heavy 4gpu evals beating a
-# 1gpu unit-test for the same b300 box).
+# jobs in the same workflow stage contend for the same hardware.
 SUPPORTED_PRIORITIES = ("high", "normal", "low")
 DEFAULT_PRIORITY = "normal"
 SUPPORTED_RUNNER_GROUPS = ("all", "amd", "nvidia", "nvidia-arm", "nvidia-x86")
@@ -117,6 +121,15 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
         raise ValueError(f"{path}: unsupported api_version {data['api_version']!r}")
     if data["type"] not in SUPPORTED_TYPES:
         raise ValueError(f"{path}: unsupported type {data['type']!r}")
+    workflow_stage = data.get("workflow_stage")
+    if workflow_stage is not None:
+        if workflow_stage not in WORKFLOW_STAGE_TYPES:
+            raise ValueError(f"{path}: unsupported workflow_stage {workflow_stage!r}")
+        if data["type"] not in WORKFLOW_STAGE_TYPES[workflow_stage]:
+            raise ValueError(
+                f"{path}: type {data['type']!r} is incompatible with "
+                f"workflow_stage {workflow_stage!r}"
+            )
     triggers = data["triggers"]
     if not isinstance(triggers, list) or not triggers:
         raise ValueError(f"{path}: triggers must be a non-empty list")
@@ -287,6 +300,7 @@ def build_matrix(
     repo_root: Path,
     trigger: str | None,
     runner_group: str = "all",
+    workflow_stage: str | None = None,
 ) -> Dict[str, Any]:
     include = []
     excluded_runner_labels = get_excluded_runner_labels()
@@ -294,6 +308,14 @@ def build_matrix(
         task = normalize_task(path, repo_root)
         if trigger and trigger not in task["triggers"]:
             continue
+        task_workflow_stage = task.get("workflow_stage")
+        if workflow_stage:
+            if task_workflow_stage is None:
+                raise ValueError(
+                    f"{path}: workflow_stage is required when filtering by stage"
+                )
+            if workflow_stage != task_workflow_stage:
+                continue
         priority = task.get("priority")
         optional = task.get("optional")
         for label in task["runner"]["labels"]:
@@ -307,16 +329,17 @@ def build_matrix(
                 continue
             if not runner_matches_group(runner, runner_group):
                 continue
-            include.append(
-                {
-                    "name": task["name"],
-                    "type": task["type"],
-                    "config": task["_source_path"],
-                    "runner": runner,
-                    "priority": effective,
-                    "optional": is_optional,
-                }
-            )
+            entry = {
+                "name": task["name"],
+                "type": task["type"],
+                "config": task["_source_path"],
+                "runner": runner,
+                "priority": effective,
+                "optional": is_optional,
+            }
+            if task_workflow_stage is not None:
+                entry["workflow_stage"] = task_workflow_stage
+            include.append(entry)
     # Stable sort: tasks at the same priority keep their file-path / label
     # order, so tasks that omit `priority` see no change from the previous
     # behaviour.
@@ -1740,6 +1763,12 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         default="all",
         help="Optional runner group filter",
     )
+    scan_parser.add_argument(
+        "--workflow-stage",
+        choices=SUPPORTED_WORKFLOW_STAGES,
+        default=None,
+        help="Optional workflow stage filter",
+    )
 
     execute_parser = subparsers.add_parser("execute", help="Execute one CI task")
     execute_parser.add_argument(
@@ -1795,7 +1824,13 @@ def main(argv: Iterable[str] | None = None) -> int:
     if args.command == "scan":
         repo_root = Path(args.repo_root).resolve()
         root = (repo_root / args.root).resolve()
-        matrix = build_matrix(root, repo_root, args.trigger, args.runner_group)
+        matrix = build_matrix(
+            root,
+            repo_root,
+            args.trigger,
+            args.runner_group,
+            args.workflow_stage,
+        )
         print(json.dumps(matrix, separators=(",", ":")))
         return 0
 

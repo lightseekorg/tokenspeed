@@ -34,6 +34,7 @@ permuted/interleaved scales. Weight preprocessing repacks them once.
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -43,7 +44,6 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
-next_power_of_2 = lambda value: 1 if value <= 1 else 1 << (value - 1).bit_length()
 
 # FlashInfer's block-scale MoE kernel is tiled with a fixed 128-row epilogue and
 # a 128-element K block; the weight/scale permutations are computed against
@@ -277,6 +277,6 @@ if platform.is_nvidia:
             local_num_experts=local_experts,
             routed_scaling_factor=w._routed_scaling_factor,
             routing_method_type=w._routing_method_type,
-            tune_max_num_tokens=next_power_of_2(x.shape[0]),
+            tune_max_num_tokens=get_autotune_max_num_tokens(),
         )
         return result[0]

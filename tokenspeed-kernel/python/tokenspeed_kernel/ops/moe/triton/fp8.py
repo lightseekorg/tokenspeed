@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
-from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
+from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -139,17 +139,13 @@ def triton_fp8_moe_weights(plan: dict, w: torch.nn.Module):
         w.w13_weight_triton_tensor = w13_weight.transpose(-2, -1)
         w.w2_weight_triton_tensor = w.w2_weight.transpose(-2, -1)
         w.w13_precision_config = PrecisionConfig(
-            flex_ctx=FlexCtx(
-                rhs_data=InFlexData(dtype=current_platform().fp8e4m3fn.dtype)
-            ),
+            flex_ctx=FlexCtx(rhs_data=InFlexData(dtype=torch.float8_e4m3fn)),
             b_mx_scale=w13_scale.transpose(-2, -1),
             b_microblock_size=32,
             out_dtype=torch.bfloat16,
         )
         w.w2_precision_config = PrecisionConfig(
-            flex_ctx=FlexCtx(
-                rhs_data=InFlexData(dtype=current_platform().fp8e4m3fn.dtype)
-            ),
+            flex_ctx=FlexCtx(rhs_data=InFlexData(dtype=torch.float8_e4m3fn)),
             b_mx_scale=w2_scale.transpose(-2, -1),
             b_microblock_size=32,
             out_dtype=torch.bfloat16,
@@ -173,13 +169,13 @@ def triton_fp8_moe_weights(plan: dict, w: torch.nn.Module):
     w.w13_weight_triton_tensor = w13_weight
     w.w2_weight_triton_tensor = w2_weight
     w.w13_precision_config = PrecisionConfig(
-        flex_ctx=FlexCtx(rhs_data=InFlexData(dtype=current_platform().fp8e4m3fn.dtype)),
+        flex_ctx=FlexCtx(rhs_data=InFlexData(dtype=torch.float8_e4m3fn)),
         b_mx_scale=w13_mx_scale,
         b_microblock_size=32,
         out_dtype=torch.bfloat16,
     )
     w.w2_precision_config = PrecisionConfig(
-        flex_ctx=FlexCtx(rhs_data=InFlexData(dtype=current_platform().fp8e4m3fn.dtype)),
+        flex_ctx=FlexCtx(rhs_data=InFlexData(dtype=torch.float8_e4m3fn)),
         b_mx_scale=w2_mx_scale,
         b_microblock_size=32,
         out_dtype=torch.bfloat16,

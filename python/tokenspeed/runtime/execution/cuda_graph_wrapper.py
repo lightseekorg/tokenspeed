@@ -291,8 +291,6 @@ class CudaGraphWrapper:
 
         self._forward_func: Callable | None = forward_func
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
-        if not self.disable:
-            self.capture()
 
     # ------------------------------------------------------------------
     # Graph capture

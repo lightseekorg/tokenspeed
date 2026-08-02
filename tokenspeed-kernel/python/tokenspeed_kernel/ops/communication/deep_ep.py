@@ -26,6 +26,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.thirdparty.deep_ep import load_deep_ep
 
 __all__ = [
     "Buffer",
@@ -58,7 +59,7 @@ class _MissingBuffer(metaclass=_MissingBufferMeta):
 
 
 try:
-    from deep_ep.buffer import Buffer
+    Buffer = load_deep_ep().Buffer
 except ImportError:
     Buffer = _MissingBuffer
 
