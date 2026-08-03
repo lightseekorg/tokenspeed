@@ -34,8 +34,10 @@ The shared kernel supports five fixed regimes:
   ``num_q_heads <= 16``.
 * ``bh64`` -- BLOCK_H=64, BLOCK_N=64, ``num_q_heads in {64, 128}``, 3-D
   XCD-aware grid, ``batch_size`` divisible by 64.
-* ``bh16-multiblock`` -- BF16 Q/KV, BLOCK_H=16, 64 heads, small-batch 3-D grid.
-* ``bh64-small`` -- BF16 Q/KV, BLOCK_H=64, 64 heads, small-batch 3-D grid.
+* ``bh16-multiblock`` -- BF16 Q/KV, BLOCK_H=16,
+  ``num_q_heads == 64``, ``batch_size == 1``, 3-D grid.
+* ``bh64-small`` -- BF16 Q/KV, BLOCK_H=64,
+  ``num_q_heads == 64``, ``batch_size in {2, 4}``, 3-D grid.
 """
 
 from __future__ import annotations
