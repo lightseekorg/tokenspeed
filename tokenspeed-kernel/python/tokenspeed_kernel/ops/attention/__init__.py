@@ -793,6 +793,8 @@ def kda_paged_prefill(
     # registered Triton implementation.
     if current_platform().is_amd and solution in {"fla", "flashkda", "cutedsl_kda"}:
         solution = "triton"
+    elif solution == "fla":
+        solution = "triton"
     kernel = select_kernel(
         "attention",
         "kda_paged_prefill",

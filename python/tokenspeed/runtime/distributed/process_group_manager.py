@@ -46,6 +46,7 @@ def _make_all_groups(group: Group) -> list[Group]:
 class ProcessGroupManager:
     def __init__(self):
         self._process_groups: dict[str, dict[Group, dist.ProcessGroup]] = {}
+        self._pg_timeout: timedelta | None = None
 
     def init_distributed(
         self,
@@ -55,17 +56,21 @@ class ProcessGroupManager:
         timeout: int | None = None,
         device_id: "torch.device | None" = None,
     ) -> None:
+
         if not dist.is_initialized():
             if distributed_init_method is None:
                 raise ValueError(
                     "distributed_init_method must be provided when initializing distributed environment"
                 )
+
             if timeout is not None:
                 if not isinstance(timeout, int):
                     raise TypeError("timeout must be a number")
                 if timeout <= 0:
                     raise ValueError("timeout must be positive")
                 timeout = timedelta(seconds=timeout)
+
+            self._pg_timeout = timeout
 
             dist.init_process_group(
                 backend=backend,
@@ -105,7 +110,7 @@ class ProcessGroupManager:
             if self.has_process_group(backend, group):
                 continue
             for g in _make_all_groups(group):
-                pg = dist.new_group(g, backend=backend)
+                pg = dist.new_group(g, backend=backend, timeout=self._pg_timeout)
                 if g == group:
                     self.register_process_group(backend, g, pg)
 
