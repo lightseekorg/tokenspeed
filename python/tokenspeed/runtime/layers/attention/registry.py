@@ -21,7 +21,6 @@
 from __future__ import annotations
 
 import logging
-import math
 import os
 from typing import TYPE_CHECKING
 
@@ -32,7 +31,6 @@ from tokenspeed.runtime.configs.model_config import AttentionArch, is_deepseek_v
 from tokenspeed.runtime.configs.paged_cache_spec import (
     STATE_LAYER_TYPES,
     hybrid_slab_group_size,
-    scheduler_ext_flat_kvcache,
 )
 from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
@@ -50,7 +48,6 @@ from tokenspeed.runtime.layers.attention.lcm_setup import (
 )
 from tokenspeed.runtime.layers.attention.utils import (
     profile_available_cache_memory_bytes,
-    profile_cache_budget,
     profile_max_num_pages,
 )
 from tokenspeed.runtime.utils.env import envs
@@ -197,7 +194,6 @@ def _cache_storage_report(
     configured_cache_bytes: int,
     pool,
     draft_pool,
-    mamba_pool,
     fixed_workspace_bytes: int = 0,
 ) -> dict:
     """Describe cache storage from allocated tensors, not scheduler counts."""
@@ -244,14 +240,7 @@ def _cache_storage_report(
 
     target_bytes = _pool_allocated_bytes(pool)
     draft_bytes = _pool_allocated_bytes(draft_pool)
-    mamba_bytes = (
-        int(mamba_pool.conv_state.nbytes) + int(mamba_pool.ssm_state.nbytes)
-        if mamba_pool is not None
-        else 0
-    )
-    allocated_cache_bytes = (
-        target_bytes + draft_bytes + mamba_bytes + fixed_workspace_bytes
-    )
+    allocated_cache_bytes = target_bytes + draft_bytes + fixed_workspace_bytes
     if allocated_cache_bytes > configured_cache_bytes:
         raise RuntimeError(
             "allocated cache storage exceeds its profiled budget: "
@@ -266,7 +255,6 @@ def _cache_storage_report(
         | {
             "target_bytes": target_bytes,
             "draft_bytes": draft_bytes,
-            "mamba_bytes": mamba_bytes,
             "fixed_workspace_bytes": fixed_workspace_bytes,
         },
     }
@@ -294,8 +282,8 @@ _HYBRID_GDN_ARCHITECTURES = {
 }
 # Hybrid linear-attention models whose full-attention layers are MLA (not MHA)
 # and whose linear layers are KDA (per-channel gated delta rule), not GDN.
-# They share the same HybridLinearAttnBackend wrapper + SimpleMambaPool; the
-# base sub-backend auto-resolves to MLA from the arch, and the linear
+# They share the same HybridLinearAttnBackend wrapper and cache-group pool;
+# the base sub-backend auto-resolves to MLA from the arch, and the linear
 # sub-backend runs the KDA kernels (MambaAttnBackend.is_kda branch).
 _HYBRID_MLA_KDA_ARCHITECTURES = {
     "KimiK3ForConditionalGeneration",
@@ -366,6 +354,14 @@ def _validate_lcm_page_size(
             "logical page size must be a positive multiple of kernel page "
             f"size, got {logical_page_size} and {kernel_page_size}"
         )
+
+
+def _set_lcm_group_page_sizes(config: BaseAttnConfig, spec: LcmPoolSpec) -> None:
+    """Publish scheduler page sizes to group-aware MHA backends."""
+    if not hasattr(config, "group_page_sizes"):
+        return
+    page_size = spec.memory_plan.logical_block_tokens
+    config.group_page_sizes = {group_id: page_size for group_id in spec.layer_group_ids}
 
 
 # ---------- arch -> config class ----------
@@ -474,7 +470,7 @@ def _resolve_hybrid_full_backend_name(
     name = _BACKEND_ALIASES.get(requested_name, requested_name)
     if name == "hybrid_linear_attn":
         name = None
-    # NVIDIA K3 FlatKV defaults to its CuteDSL history consumer. AMD keeps the
+    # NVIDIA K3 defaults to its CuteDSL history consumer. AMD keeps the
     # generic MLA backend; explicit user choices remain authoritative.
     if has_lcm_plan and is_kda and name is None and not current_platform().is_amd:
         return "tokenspeed_mla"
@@ -490,25 +486,19 @@ def _create_hybrid_linear_attn(
     rank: int,
     enable_memory_saver: bool = False,
     full_attn_backend_name: str = None,
-    mamba_pool_total_chunks: int = 0,
     is_kda: bool = False,
     lcm_spec: LcmPoolSpec | None = None,
-) -> tuple[AttentionBackend, BaseTokenToKVPool, object]:
+) -> tuple[AttentionBackend, BaseTokenToKVPool]:
     """Create a hybrid backend + pool for a linear-attention model.
 
-    GDN (Qwen3.5, MHA base) or, when ``is_kda`` is set, KDA (Kimi-K3, MLA base):
-    the ``MambaAttnBackend`` + ``SimpleMambaPool`` run the KDA per-channel kernels
-    instead of GDN. The base full-attention backend is arch-driven (MHA vs MLA).
-
-    On the Flat path the ordinary MHA/MLA pool owns one ``LcmCachePool`` and
-    publishes the per-group tables consumed by both sub-backends. Radix keeps
-    the separate ``SimpleMambaPool`` path unchanged.
+    GDN (Qwen3.5, MHA base) or, when ``is_kda`` is set, KDA (Kimi-K3,
+    MLA base). The ordinary MHA/MLA pool owns one ``LcmCachePool`` and
+    publishes the per-group tables consumed by both sub-backends.
     """
     from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
         HybridLinearAttnBackend,
         LayerMappedKVPool,
         MambaAttnBackend,
-        SimpleMambaPool,
     )
 
     hf_config = model_config.hf_config
@@ -525,10 +515,10 @@ def _create_hybrid_linear_attn(
     )
 
     if has_lcm_plan and is_kda:
-        # FlatKV contract: see CuteDSLMLABackend.mark_flat_contract.
-        mark_flat_contract = getattr(full_attn_backend, "mark_flat_contract", None)
-        if mark_flat_contract is not None:
-            mark_flat_contract()
+        # Paged cache contract: see CuteDSLMLABackend.mark_cache_contract.
+        mark_cache_contract = getattr(full_attn_backend, "mark_cache_contract", None)
+        if mark_cache_contract is not None:
+            mark_cache_contract()
 
     # Create mamba/linear attention backend. Only propagate the configured
     # verify width when spec-dec is actually enabled — matches MLAConfig /
@@ -538,38 +528,24 @@ def _create_hybrid_linear_attn(
     if server_args.speculative_algorithm is not None:
         config.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
 
-    flat_kvcache = scheduler_ext_flat_kvcache()
-    if flat_kvcache:
-        # Flat path: the pool covers ALL layers, so pool indices == global
-        # layer ids, its layer_types line up with the planned state fields, and the
-        # group specs publish both the "full_attention" and
-        # "linear_attention" groups. State layers carry NO k/v tensors
-        # (None slots) -- matching the LCM plan, which contains history KV
-        # and recurrent-state fields separately. The identity mapping keeps
-        # the wrapper type identical to the radix path.
-        num_total_layers = len(text_config.layers_block_type)
-        inner_pool = (
-            create_lcm_pool(
-                lcm_spec,
-                config,
-                num_layers=num_total_layers,
-                rank=rank,
-                enable_memory_saver=enable_memory_saver,
-            )
-            if lcm_spec is not None
-            else config.create_pool(
-                num_total_layers, max_num_tokens, rank, enable_memory_saver
-            )
+    # The pool covers all layers, so pool indices equal global layer ids and
+    # its layer_types line up with the planned state fields. State layers
+    # carry no K/V tensors, matching the LCM plan's separate state fields.
+    num_total_layers = len(text_config.layers_block_type)
+    inner_pool = (
+        create_lcm_pool(
+            lcm_spec,
+            config,
+            num_layers=num_total_layers,
+            rank=rank,
+            enable_memory_saver=enable_memory_saver,
         )
-        pool = LayerMappedKVPool(inner_pool, list(range(num_total_layers)))
-    else:
-        # Create KV cache pool (only for full attention layers)
-        num_full_attn_layers = len(full_attn_layers)
-        inner_pool = config.create_pool(
-            num_full_attn_layers, max_num_tokens, rank, enable_memory_saver
+        if lcm_spec is not None
+        else config.create_pool(
+            num_total_layers, max_num_tokens, rank, enable_memory_saver
         )
-        # Wrap with layer ID mapping (global layer IDs -> pool indices)
-        pool = LayerMappedKVPool(inner_pool, full_attn_layers)
+    )
+    pool = LayerMappedKVPool(inner_pool, list(range(num_total_layers)))
 
     # Read mamba2_cache_params to decide whether this model actually has
     # any linear / mamba layers. A draft model on a hybrid-GDN target
@@ -579,13 +555,7 @@ def _create_hybrid_linear_attn(
     # ``init_forward_metadata_*`` hooks do not run (they would otherwise
     # touch a zero-sized pool on the same persistent state_indices_list
     # as the target, which breaks the captured CUDA graph).
-    (
-        conv_state_shape,
-        temporal_state_shape,
-        conv_dtype,
-        ssm_dtype,
-        mamba_layer_ids,
-    ) = text_config.mamba2_cache_params
+    mamba_layer_ids = text_config.mamba2_cache_params[-1]
 
     if len(mamba_layer_ids) == 0:
         logger.info(
@@ -593,7 +563,7 @@ def _create_hybrid_linear_attn(
             "attn layers (skipping mamba backend / pool)",
             len(full_attn_layers),
         )
-        return full_attn_backend, pool, None
+        return full_attn_backend, pool
 
     kda_backend = (getattr(server_args, "kda_backend", None) or "auto").strip().lower()
     if is_kda:
@@ -602,49 +572,8 @@ def _create_hybrid_linear_attn(
         config, is_kda=is_kda, kda_backend=kda_backend
     )
 
-    if flat_kvcache:
-        # Flat mode never touches a SimpleMambaPool: the recurrent state
-        # lives in the KV pool's LCM arena, addressed by the flat block
-        # tables (set_kv_pool below activates the dual-index state paging),
-        # so skip the pool and its set_pool binding entirely.
-        mamba_pool = None
-    else:
-        # Mamba radix cache uses C++ chunk indices. Without radix cache, the
-        # backend uses 1-based req_pool_indices directly, so keep slot 0 as
-        # padding.
-        per_rank_max_batch = server_args.max_num_seqs // max(
-            server_args.data_parallel_size or server_args.mapping.attn.dp_size, 1
-        )
-        req_pool_padding_index = per_rank_max_batch + 1
-        mamba_pool_size = (
-            mamba_pool_total_chunks + 1
-            if mamba_pool_total_chunks > 0
-            else per_rank_max_batch + 1
-        )
-        mamba_pool = SimpleMambaPool(
-            size=mamba_pool_size,
-            num_mamba_layers=len(mamba_layer_ids),
-            conv_state_shape=conv_state_shape,
-            temporal_state_shape=temporal_state_shape,
-            conv_dtype=conv_dtype,
-            ssm_dtype=ssm_dtype,
-            mamba_layer_ids=mamba_layer_ids,
-            device=config.device,
-            page_size=server_args.block_size,
-            speculative_num_draft_tokens=(
-                server_args.speculative_num_draft_tokens
-                if server_args.speculative_algorithm is not None
-                else 0
-            ),
-            # ``current_input_indices`` is keyed by the scheduler's rank-local,
-            # 1-based req_pool_idx; the row after that range is the CUDA graph
-            # padding sentinel.
-            max_req_pool_size=req_pool_padding_index,
-        )
-        mamba_pool.is_kda_cache = is_kda
-        linear_attn_backend.set_pool(mamba_pool)
-    # Flat state paging (dual-index) keys off the KV pool's state field views +
-    # published "linear_attention" group; no-op on the radix path.
+    # Recurrent state lives in the LCM arena and is addressed by the
+    # per-group block tables, so no separate request-indexed Mamba pool exists.
     linear_attn_backend.set_kv_pool(pool)
 
     backend = HybridLinearAttnBackend(
@@ -654,13 +583,9 @@ def _create_hybrid_linear_attn(
         "Created hybrid_linear_attn backend: %d full attn layers, %d linear attn layers, %s",
         len(full_attn_layers),
         len(mamba_layer_ids),
-        (
-            "flat LCM state fields (no mamba slot pool)"
-            if mamba_pool is None
-            else f"mamba pool size {mamba_pool.size}"
-        ),
+        "LCM state fields",
     )
-    return backend, pool, mamba_pool
+    return backend, pool
 
 
 def _floor_tokens_to_layout_grid(max_num_tokens: int, config) -> int:
@@ -787,7 +712,8 @@ def _publish_inkling_conv_groups(config, model_config, server_args) -> tuple[int
     if (
         True
     ):  # paged hiddenconv is unconditional (INKLING_PAGED_HIDDENCONV gate retired 2026-07-15)
-        # ATTN cols ride the K slot, MLP the V slot; each new base needs a FlatInklingShapeSuite pass
+        # ATTN columns ride the K slot and MLP columns ride the V slot; validate
+        # each new base geometry against the Inkling shape suite.
         config.extra_paged_groups = config.extra_paged_groups + tuple(
             PagedCacheGroupSpec(
                 group_id=f"hiddenconv_{label}",
@@ -968,8 +894,6 @@ def create_attn_components(
     AttentionBackend | None,
     BaseTokenToKVPool | None,
     int,
-    int,
-    object | None,
     dict | None,
 ]:
     arch = model_config.attention_arch
@@ -1005,18 +929,15 @@ def create_attn_components(
             server_args.drafter_attention_backend = None
 
     config = _create_attn_config(server_args, model_config)
-    flat_kvcache = scheduler_ext_flat_kvcache()
-    if (
-        is_inkling
-        and flat_kvcache
-        and server_args.disaggregation_mode in ("prefill", "decode")
-    ):
-        raise NotImplementedError("Inkling FlatKV PD is not supported")
+    if is_deepseek_v4_model:
+        config.sliding_window_tokens = int(model_config.hf_config.sliding_window)
+    if is_inkling and server_args.disaggregation_mode in ("prefill", "decode"):
+        raise NotImplementedError("Inkling PD is not supported")
     target_text_config = getattr(
         model_config.hf_config, "text_config", model_config.hf_config
     )
     target_mamba_params = getattr(target_text_config, "mamba2_cache_params", None)
-    has_flat_state = bool(
+    has_state = bool(
         target_mamba_params
         and target_mamba_params[-1]
         and any(
@@ -1024,17 +945,21 @@ def create_attn_components(
             for layer_type in getattr(config, "layer_types", ())
         )
     )
-    use_lcm_gdn = is_hybrid_gdn and has_flat_state and flat_kvcache
-    use_lcm_k3 = is_hybrid_mla_kda and flat_kvcache
-    use_lcm_inkling = is_inkling and flat_kvcache
+    use_lcm_gdn = is_hybrid_gdn and has_state
+    use_lcm_k3 = is_hybrid_mla_kda
+    use_lcm_inkling = is_inkling
     lcm_family = (
-        "qwen_gdn"
-        if use_lcm_gdn
-        else "kimi_k3" if use_lcm_k3 else "inkling" if use_lcm_inkling else None
+        "deepseek_v4"
+        if is_deepseek_v4_model
+        else (
+            "qwen_gdn"
+            if use_lcm_gdn
+            else "kimi_k3" if use_lcm_k3 else "inkling" if use_lcm_inkling else None
+        )
     )
-    if has_flat_state and flat_kvcache and lcm_family is None:
+    if has_state and lcm_family is None:
         raise RuntimeError(
-            "Flat State cache requires an LCM layout recipe; none is "
+            "State cache requires an LCM layout recipe; none is "
             f"registered for architectures={architectures!r}"
         )
     target_full_attn_backend_name = (
@@ -1051,6 +976,10 @@ def create_attn_components(
         if draft_model_config
         else None
     )
+    if is_deepseek_v4_draft_model:
+        draft_attn_config.sliding_window_tokens = int(
+            draft_model_config.hf_config.sliding_window
+        )
     draft_architectures = (
         getattr(draft_model_config.hf_config, "architectures", None) or []
         if draft_model_config is not None
@@ -1120,33 +1049,8 @@ def create_attn_components(
             draft_model_config.num_attention_layers
         )
 
-    hf_config = getattr(model_config, "hf_config", None)
-    text_config = getattr(hf_config, "text_config", hf_config) if hf_config else None
-    mamba_cache_params = (
-        getattr(text_config, "mamba2_cache_params", None) if text_config else None
-    )
-    # Unpack once with names; every consumer below reads these instead of
-    # indexing into the raw tuple.
-    if mamba_cache_params:
-        (
-            mamba_conv_state_shape,
-            mamba_temporal_state_shape,
-            mamba_conv_dtype,
-            mamba_ssm_dtype,
-            mamba_layer_ids,
-        ) = mamba_cache_params
-    else:
-        mamba_conv_state_shape = mamba_temporal_state_shape = None
-        mamba_conv_dtype = mamba_ssm_dtype = None
-        mamba_layer_ids = ()
-    has_mamba_layers = len(mamba_layer_ids) > 0
-    has_mamba = getattr(model_config, "mambaish_config", None) is not None or (
-        has_mamba_layers
-    )
     cache_budget_bytes = None
     fixed_workspace_bytes = 0
-    mamba_pool_total_chunks = 0
-    mamba_pool = None
     draft_max_num_tokens = None
     lcm_setup = None
 
@@ -1164,49 +1068,7 @@ def create_attn_components(
         ),
     )
 
-    if is_deepseek_v4_model:
-        from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
-            profile_deepseek_v4_max_num_pages,
-        )
-
-        draft_cache_cell_size = _resolve_draft_cache_cell_size_for_profile(
-            draft_attn_config,
-            draft_model_config,
-            draft_profile_cache_cell_size,
-        )
-        max_total_num_pages = profile_deepseek_v4_max_num_pages(
-            layout=deepseek_v4_layout,
-            hf_config=model_config.hf_config,
-            layer_num=num_layers,
-            max_live_requests=config.max_bs,
-            max_scheduled_tokens=server_args.chunked_prefill_size,
-            max_context_len=config.context_len,
-            available_cache_memory_bytes=profile_available_cache_memory_bytes(
-                attn_config=config,
-                gpu_id=gpu_id,
-                tp_size=server_args.mapping.world_size,
-                gpu_memory_utilization=server_args.gpu_memory_utilization,
-                total_gpu_memory=gpu_memory,
-                world_group=server_args.mapping.world_group,
-            ),
-            draft_cache_cell_size=draft_cache_cell_size,
-            decode_input_tokens=decode_input_tokens,
-            overlap_schedule_depth=overlap_schedule_depth,
-        )
-        logger.info(
-            "DeepSeek V4 grouped KV profile: max_live_requests=%s "
-            "(attn config max_bs=%s, attn_dp_size=%s), max_total_num_pages=%s",
-            config.max_bs,
-            config.max_bs,
-            server_args.mapping.attn.dp_size,
-            max_total_num_pages,
-        )
-        max_num_tokens = _resolve_max_num_tokens(
-            max_total_num_pages,
-            server_args.block_size,
-            server_args.max_total_tokens,
-        )
-    elif lcm_family is not None:
+    if lcm_family is not None:
         cache_memory = profile_available_cache_memory_bytes(
             attn_config=config,
             gpu_id=gpu_id,
@@ -1231,11 +1093,14 @@ def create_attn_components(
             config,
             logical_page_size=logical_page_size,
         )
+        _set_lcm_group_page_sizes(config, lcm_setup.target)
         if draft_attn_config is not None:
             _validate_lcm_page_size(
                 draft_attn_config,
                 logical_page_size=logical_page_size,
             )
+            if lcm_setup.draft is not None:
+                _set_lcm_group_page_sizes(draft_attn_config, lcm_setup.draft)
         cache_budget_bytes = lcm_setup.cache_budget_bytes
         fixed_workspace_bytes = lcm_setup.fixed_workspace_bytes
         max_num_tokens = lcm_setup.target.pool_size
@@ -1244,7 +1109,7 @@ def create_attn_components(
         )
         max_total_num_pages = lcm_setup.target.memory_plan.num_lcm_blocks
         logger.info(
-            "Flat LCM profile: target_parent_bytes=%d, draft_parent_bytes=%d, "
+            "LCM profile: target_parent_bytes=%d, draft_parent_bytes=%d, "
             "P=%d, parents=%d, token_capacity=%d, groups=%s",
             lcm_setup.target.memory_plan.lcm_block_bytes,
             (
@@ -1259,66 +1124,6 @@ def create_attn_components(
                 group.group_id: group.cache_blocks_per_lcm_block
                 for group in lcm_setup.target.memory_plan.groups
             },
-        )
-    elif has_mamba and server_args.max_mamba_cache_size is not None:
-        mamba_pool_total_chunks = server_args.max_mamba_cache_size
-        cache_budget_bytes = profile_available_cache_memory_bytes(
-            attn_config=config,
-            gpu_id=gpu_id,
-            tp_size=server_args.mapping.world_size,
-            gpu_memory_utilization=server_args.gpu_memory_utilization,
-            total_gpu_memory=gpu_memory,
-            world_group=server_args.mapping.world_group,
-        )
-        full_attn_layer_ids = getattr(text_config, "full_attention_layer_ids", None)
-        num_kv_layers = (
-            len(full_attn_layer_ids)
-            if full_attn_layer_ids is not None
-            else num_layers - len(mamba_layer_ids)
-        )
-        max_total_num_pages = profile_max_num_pages(
-            **{**_profile_kwargs, "num_attention_layers": num_kv_layers},
-            gpu_memory_utilization=server_args.gpu_memory_utilization,
-            cache_cell_size=profile_cache_cell_size,
-            draft_cache_cell_size=draft_profile_cache_cell_size,
-        )
-        max_num_tokens = _resolve_max_num_tokens(
-            max_total_num_pages,
-            server_args.block_size,
-            server_args.max_total_tokens,
-        )
-    elif has_mamba and server_args.max_mamba_cache_size is None:
-        num_mamba_layers = len(mamba_layer_ids)
-        speculative_num_draft_tokens = (
-            server_args.speculative_num_draft_tokens
-            if server_args.speculative_algorithm is not None
-            else 0
-        )
-        per_layer_mamba_chunk_memory = (
-            math.prod(mamba_conv_state_shape) * mamba_conv_dtype.itemsize
-            + math.prod(mamba_temporal_state_shape) * mamba_ssm_dtype.itemsize
-        ) * (1 + speculative_num_draft_tokens)
-        memory_per_mamba_chunk = num_mamba_layers * per_layer_mamba_chunk_memory
-        full_attn_layer_ids = getattr(text_config, "full_attention_layer_ids", None)
-        num_kv_layers = (
-            len(full_attn_layer_ids)
-            if full_attn_layer_ids is not None
-            else num_layers - num_mamba_layers
-        )
-        (
-            kv_max_num_pages,
-            mamba_pool_total_chunks,
-            cache_budget_bytes,
-        ) = profile_cache_budget(
-            **{**_profile_kwargs, "num_attention_layers": num_kv_layers},
-            mem_fraction_static=server_args.gpu_memory_utilization,
-            mamba_memory_per_chunk=memory_per_mamba_chunk,
-            mamba_ratio=server_args.mamba_full_memory_ratio,
-        )
-        max_num_tokens = _resolve_max_num_tokens(
-            kv_max_num_pages,
-            server_args.block_size,
-            server_args.max_total_tokens,
         )
     else:
         # config.layer_types / config.sliding_window_tokens are the exact
@@ -1355,7 +1160,7 @@ def create_attn_components(
         and _CI_SMALL_KV_SIZE is not None
         and int(_CI_SMALL_KV_SIZE) > 0
     ):
-        # Flat plans already folded the CI cap into their physical geometry;
+        # LCM plans already folded the CI cap into their physical geometry;
         # clobbering here would desynchronize tokens from that plan.
         max_num_tokens = int(_CI_SMALL_KV_SIZE)
     if draft_max_num_tokens is None:
@@ -1386,9 +1191,11 @@ def create_attn_components(
             max_scheduled_tokens=server_args.chunked_prefill_size,
             decode_input_tokens=decode_input_tokens,
             overlap_schedule_depth=overlap_schedule_depth,
+            memory_plan=lcm_setup.target.memory_plan,
+            token_capacity=lcm_setup.target.token_capacity,
         )
     elif is_hybrid_linear:
-        backend, pool, mamba_pool = _create_hybrid_linear_attn(
+        backend, pool = _create_hybrid_linear_attn(
             server_args,
             model_config,
             config,
@@ -1397,7 +1204,6 @@ def create_attn_components(
             rank,
             enable_memory_saver,
             full_attn_backend_name=target_full_attn_backend_name,
-            mamba_pool_total_chunks=mamba_pool_total_chunks,
             is_kda=is_hybrid_mla_kda,
             lcm_spec=lcm_setup.target if lcm_setup is not None else None,
         )
@@ -1452,7 +1258,7 @@ def create_attn_components(
             backend.conv_columns = conv_columns
             if conv_columns is not None:
                 # Wrapper-owned conv groups: the attention mixin skips their write-loc math and capture fills
-                backend.inner.flat_engine_owned_group_ids = frozenset(
+                backend.inner.engine_owned_group_ids = frozenset(
                     conv_columns["group_block_tokens"]
                 )
     draft_attn_backend = None
@@ -1467,6 +1273,8 @@ def create_attn_components(
             draft_attn_backend = _create_attn_backend(
                 draft_model_config.attention_arch, draft_attn_config
             )
+            if lcm_setup.draft is None:
+                raise RuntimeError("DeepSeek V4 MTP requires a draft LCM plan")
             draft_pool = DeepseekV4TokenToKVPool(
                 size=draft_max_num_tokens,
                 model_dtype=draft_model_config.dtype,
@@ -1482,9 +1290,11 @@ def create_attn_components(
                 max_scheduled_tokens=server_args.chunked_prefill_size,
                 decode_input_tokens=decode_input_tokens,
                 overlap_schedule_depth=overlap_schedule_depth,
+                memory_plan=lcm_setup.draft.memory_plan,
+                token_capacity=lcm_setup.draft.token_capacity,
             )
         elif draft_is_hybrid_gdn:
-            draft_attn_backend, draft_pool, _ = _create_hybrid_linear_attn(
+            draft_attn_backend, draft_pool = _create_hybrid_linear_attn(
                 server_args,
                 draft_model_config,
                 draft_attn_config,
@@ -1493,7 +1303,6 @@ def create_attn_components(
                 rank,
                 enable_memory_saver,
                 full_attn_backend_name=draft_full_attn_backend_name,
-                mamba_pool_total_chunks=mamba_pool_total_chunks,
                 lcm_spec=lcm_setup.draft if lcm_setup is not None else None,
             )
         elif any(a in _INKLING_ARCHITECTURES for a in draft_architectures):
@@ -1504,7 +1313,7 @@ def create_attn_components(
             # (ModelConfig swapped it in for the draft worker), giving the
             # draft the same byte-uniform slot layout as the target. The pool
             # shares the TARGET's page-id space (the drafter consumes the
-            # target's per-group flat tables), so it is sized at the same
+            # target's per-group group tables), so it is sized at the same
             # max_num_tokens; per-layer views turn the max-head allocation
             # into the group geometry, and the profile's max-head draft charge
             # prices exactly that allocation.
@@ -1579,7 +1388,7 @@ def create_attn_components(
     _validate_shared_lcm_geometry(pool, draft_pool)
     if use_lcm_gdn and fixed_workspace_bytes:
         actual_workspace_bytes = (
-            backend.linear_attn_backend.preallocate_flat_verify_workspace(
+            backend.linear_attn_backend.preallocate_verify_workspace(
                 config.max_bs,
                 int(server_args.speculative_num_draft_tokens),
             )
@@ -1617,7 +1426,6 @@ def create_attn_components(
             configured_cache_bytes=cache_budget_bytes,
             pool=pool,
             draft_pool=draft_pool,
-            mamba_pool=mamba_pool,
             fixed_workspace_bytes=fixed_workspace_bytes,
         )
 
@@ -1627,7 +1435,5 @@ def create_attn_components(
         draft_attn_backend,
         draft_pool,
         max_num_tokens,
-        mamba_pool_total_chunks,
-        mamba_pool,
         cache_storage,
     )

@@ -75,6 +75,58 @@ class LcmMemoryPlanTest(unittest.TestCase):
         self.assertEqual(by_id["layer.1.k"].shape[0], 128)
         self.assertEqual(by_id["layer.0.ssm"].shape, (8, 128, 128))
 
+    def test_deepseek_v4_recipe_uses_one_p256_scheduler_domain(self):
+        fields = self.layouts_module.deepseek_v4_lcm_fields(
+            layer_ratios=(1, 4, 128),
+            logical_block_tokens=256,
+            swa_shape=(128,),
+            compressed_shapes={4: (64,), 128: (2,)},
+            compressor_state_shapes={4: (8, 16), 128: (128, 8)},
+            indexer_kv_shape=(64, 4),
+            indexer_state_shape=(8, 32),
+            kv_page_stride_alignment_bytes=576,
+        )
+
+        by_id = {field.field_id: field for field in fields}
+        self.assertEqual(by_id["layer.0.swa"].shape, (128,))
+        self.assertEqual(by_id["layer.1.compressed_kv"].shape, (64,))
+        self.assertEqual(by_id["layer.2.compressor_state"].shape, (128, 8))
+        self.assertEqual(
+            by_id["layer.0.swa"].plane_id,
+            by_id["layer.1.compressed_kv"].plane_id,
+        )
+        self.assertEqual(by_id["layer.1.indexer_kv"].plane_id, "unit.1")
+        self.assertFalse(by_id["layer.0.swa"].exact_page_stride)
+        self.assertFalse(by_id["layer.1.compressor_state"].exact_page_stride)
+        self.assertEqual(
+            by_id["layer.0.swa"].page_stride_alignment_bytes,
+            576,
+        )
+        self.assertEqual(
+            by_id["layer.1.compressed_kv"].page_stride_alignment_bytes,
+            576,
+        )
+
+        plan = self.plan_module.plan_lcm_fields(
+            fields,
+            logical_block_tokens=256,
+            num_lcm_blocks=4,
+            max_padding_fraction=float("inf"),
+        )
+
+        self.assertEqual(plan.logical_block_tokens, 256)
+        self.assertEqual(
+            {group.group_id for group in plan.groups},
+            {
+                "v4.swa_kv",
+                "v4.c4a.compressed_kv",
+                "v4.c4a.compressor_state",
+                "v4.c128a.compressed_kv",
+                "v4.c128a.compressor_state",
+                "v4.c4a.indexer_compressor_state",
+            },
+        )
+
     def test_planner_expresses_byte_ratio_as_per_group_packing(self):
         field = self.plan_module.LcmFieldSpec
         fields = (
@@ -107,6 +159,39 @@ class LcmMemoryPlanTest(unittest.TestCase):
             plan.group("state").cache_blocks_per_lcm_block,
             8,
         )
+
+    def test_flexible_field_preserves_required_page_stride_alignment(self):
+        field = self.plan_module.LcmFieldSpec
+        plan = self.plan_module.plan_lcm_fields(
+            (
+                field(
+                    "compressed",
+                    "compressed.kv",
+                    "unit.0",
+                    (64, 9),
+                    1,
+                    exact_page_stride=False,
+                    page_stride_alignment_bytes=576,
+                ),
+                field(
+                    "wide",
+                    "wide.state",
+                    "unit.0",
+                    (6000,),
+                    1,
+                    exact_page_stride=False,
+                ),
+            ),
+            logical_block_tokens=256,
+            num_lcm_blocks=2,
+            cache_blocks_per_lcm_block={"compressed": 8, "wide": 1},
+            alignment=256,
+            max_padding_fraction=float("inf"),
+        )
+
+        compressed = plan.field("compressed.kv")
+        self.assertGreater(compressed.page_stride_bytes, compressed.payload_bytes)
+        self.assertEqual(compressed.page_stride_bytes % 576, 0)
 
     def test_layout_constructors_derive_sizes_from_geometry(self):
         group = self.plan_module.LcmGroupLayout(

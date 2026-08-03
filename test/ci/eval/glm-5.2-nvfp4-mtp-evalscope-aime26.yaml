@@ -15,6 +15,7 @@ install:
 server:
   command: >-
     ts serve
+    --disable-kvstore
     --model nvidia/GLM-5.2-NVFP4
     --attn-tp-size 4
     --ep-size 4

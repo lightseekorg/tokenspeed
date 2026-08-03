@@ -32,20 +32,26 @@ while the excluded narrow tiles measure fastest end to end.
 This tool sweeps candidate tactics with real end-to-end CUDA-event timing on
 representative random weights, writes the winners into flashinfer's autotuner,
 and saves the result via ``AutoTuner.save_configs`` -- a JSON table whose
-embedded metadata pins the GPU device name and flashinfer/CUDA versions, so a
-table can never be applied on a mismatched host. Name it vLLM-configs style
+embedded metadata pins the GPU device name and FlashInfer/CUDA/cuDNN versions,
+so a table can never be applied on a mismatched host. Name it vLLM-configs style
 and ship it under ``ops/moe/flashinfer/tactics/`` to have it auto-load at
-startup (see ops.tuning).
+startup (see ops.tuning). By default the output filename is generated from the
+model/layout and current GPU, FlashInfer, and cuDNN versions. Pass ``--output``
+to choose the path explicitly.
 
 Cost is bounded by a two-stage search: measured spreads within one tile_N
 family are <3%, so stage one samples a few configs per family to pick the
 family and stage two refines within it. A full run at Kimi-K3 shapes is a few
-minutes on one idle GPU. Re-run whenever the flashinfer version, GPU model, or
-MoE shape changes (the metadata guard turns a stale table into a logged
-fallback, never silent misuse).
+minutes on one idle GPU. Re-run whenever the FlashInfer or cuDNN version, GPU
+model, or MoE shape changes (the metadata guard turns a stale table into a
+logged fallback, never silent misuse).
 
-Example (Kimi-K3 on EP8, defaults):
+Examples (Kimi-K3 on EP8, defaults):
 
+    # Generate the environment-specific filename in the current directory.
+    python -m tokenspeed_kernel.benchmark.moe_tactic_sweep
+
+    # Or select the output path explicitly.
     python -m tokenspeed_kernel.benchmark.moe_tactic_sweep \\
         --output moe-tactics-kimi-k3-ep8.json
 """
@@ -54,9 +60,13 @@ from __future__ import annotations
 
 import argparse
 import sys
+from importlib.metadata import version
 
 import torch
-from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
+from tokenspeed_kernel.ops.tuning import (
+    flashinfer_tuning_cache_filename,
+    get_autotune_max_num_tokens,
+)
 
 # Must match the tune_max the runtime keys its bucket ladder with: the
 # runtime floors chunked_prefill_size at the ops.tuning default (8192), so
@@ -229,7 +239,30 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__.split("\n\n")[0],
     )
-    parser.add_argument("--output", required=True, help="Output JSON table path")
+    parser.add_argument(
+        "--output",
+        help=(
+            "Output JSON table path; defaults to an environment-specific "
+            "filename in the current directory"
+        ),
+    )
+    parser.add_argument(
+        "--model",
+        default="kimi-k3",
+        help="Model slug used in an automatically generated output filename",
+    )
+    parser.add_argument(
+        "--ep-size",
+        type=int,
+        default=8,
+        help="Expert-parallel size used in an automatically generated filename",
+    )
+    parser.add_argument(
+        "--tp-size",
+        type=int,
+        default=1,
+        help="MoE tensor-parallel size used in an automatically generated filename",
+    )
     parser.add_argument("--num-experts", type=int, default=896)
     parser.add_argument("--local-experts", type=int, default=112)
     parser.add_argument("--top-k", type=int, default=16)
@@ -255,6 +288,20 @@ def main(argv: list[str] | None = None) -> int:
     from flashinfer.autotuner import AutoTuner, autotune
 
     device = torch.device("cuda")
+    output = args.output
+    if output is None:
+        cudnn_version = torch.backends.cudnn.version()
+        if cudnn_version is None:
+            parser.error("cannot generate an output filename without a cuDNN version")
+        output = flashinfer_tuning_cache_filename(
+            args.model,
+            args.ep_size,
+            args.tp_size,
+            torch.cuda.get_device_name(),
+            version("flashinfer-python"),
+            cudnn_version,
+        )
+        print(f"generated output path: {output}")
     W = _make_weights(
         args.local_experts, args.hidden_size, args.intermediate_size, device, seed=1
     )
@@ -335,15 +382,15 @@ def main(argv: list[str] | None = None) -> int:
             f"(native {tuple(native_tactic)} {native_time:7.1f}us)"
         )
 
-    tuner.save_configs(args.output)
+    tuner.save_configs(output)
     # Round-trip guard: a table this process cannot re-load would be useless
     # at serving time; fail loudly here rather than at the first deploy.
     tuner.profiling_cache.clear()
     tuner._file_configs.clear()
-    if not tuner.load_configs(args.output):
+    if not tuner.load_configs(output):
         print("ERROR: saved table failed to reload in-process", file=sys.stderr)
         return 1
-    print(f"saved + reload-verified: {args.output}")
+    print(f"saved + reload-verified: {output}")
     return 0
 
 

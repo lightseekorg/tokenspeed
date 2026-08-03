@@ -152,7 +152,7 @@ class InputProcessor:
             # We still need to run pad_input_tokens so the engine's
             # MultimodalEmbedder can plan encoder-token scatter ranges from each
             # item's offsets — the bare placeholder token alone would not
-            # encode per-item uniqueness needed by the radix prefix layer.
+            # encode per-item uniqueness needed by the single-table prefix layer.
             if not self.engine.model_config.is_multimodal_active:
                 raise ValueError(
                     "precomputed_multimodal_inputs is provided for a text-only model."
@@ -192,10 +192,13 @@ class InputProcessor:
             )
 
         input_token_num = len(input_ids) if input_ids is not None else 0
-        if input_token_num >= self.engine.context_len:
+        max_req_input_len = self.engine.max_req_input_len
+        if max_req_input_len is None:
+            max_req_input_len = self.engine.context_len - 1
+        if input_token_num > max_req_input_len:
             raise ValueError(
-                f"The input ({input_token_num} tokens) is longer than the "
-                f"model's context length ({self.engine.context_len} tokens)."
+                f"The input ({input_token_num} tokens) exceeds the engine's "
+                f"maximum input length ({max_req_input_len} tokens)."
             )
 
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
@@ -261,15 +264,15 @@ class InputProcessor:
 
         if isinstance(obj, GenerateReqInput):
             return TokenizedGenerateReqInput(
-                obj.rid,
-                input_text,
-                input_ids,
-                sampling_params,
-                return_logprob,
-                logprob_start_len,
-                top_logprobs_num,
-                token_ids_logprob,
-                obj.stream,
+                rid=obj.rid,
+                input_text=input_text,
+                input_ids=input_ids,
+                sampling_params=sampling_params,
+                return_logprob=return_logprob,
+                logprob_start_len=logprob_start_len,
+                top_logprobs_num=top_logprobs_num,
+                token_ids_logprob=token_ids_logprob,
+                stream=obj.stream,
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=obj.bootstrap_room,
@@ -285,9 +288,9 @@ class InputProcessor:
             )
 
         return TokenizedEmbeddingReqInput(
-            obj.rid,
-            input_text,
-            input_ids,
-            sampling_params,
+            rid=obj.rid,
+            input_text=input_text,
+            input_ids=input_ids,
+            sampling_params=sampling_params,
             created_time=time.time(),
         )

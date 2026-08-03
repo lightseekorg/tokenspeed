@@ -45,3 +45,14 @@ Start here:
 - [Server Parameters](https://lightseek.org/tokenspeed/configuration/server)
 - [Compatible Parameters](https://lightseek.org/tokenspeed/configuration/compatible-parameters)
 - [Parallelism](https://lightseek.org/tokenspeed/serving/parallelism)
+
+## Citation
+
+```bibtex
+@misc{tokenspeed2026,
+  author       = {{TokenSpeed Team}},
+  title        = {{TokenSpeed}: A Speed-of-Light {LLM} Inference Engine},
+  year         = {2026},
+  howpublished = {\url{https://github.com/lightseekorg/tokenspeed}}
+}
+```

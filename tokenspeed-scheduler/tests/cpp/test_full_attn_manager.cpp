@@ -205,7 +205,7 @@ TEST(FullAttnManagerTest, AcquireCanReserveFutureTokens) {
     EXPECT_EQ(table.NumBlocks(), 3);
     EXPECT_EQ(table.AvailableTokens(), 11);
 
-    mgr.ConsumeAvailable(table, /*num_tokens=*/8);
+    mgr.ConsumeReservedTokens(table, /*num_tokens=*/8);
     EXPECT_EQ(table.AvailableTokens(), 3);
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 5);
 }

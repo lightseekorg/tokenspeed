@@ -85,15 +85,14 @@ class PauseState(enum.IntEnum):
 def scheduler_drained(scheduler) -> bool:
     """True when the scheduler holds no requests that need a forward pass.
 
-    Covers every active lifecycle state (waiting/submitted, prefilling,
-    decoding, retracted). Post-finish writeback states are async teardown and
-    do not run forward work, so they do not block a drain.
+    Covers every state that still needs a forward pass. Retraction returns a
+    request directly to Submitted, so it is already included in waiting_size.
+    Post-finish writeback states are async teardown and do not block a drain.
     """
     return (
         scheduler.waiting_size() == 0
         and scheduler.decoding_size() == 0
         and scheduler.prefilling_size() == 0
-        and scheduler.retract_count() == 0
     )
 
 

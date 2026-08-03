@@ -1,6 +1,5 @@
 from dataclasses import fields
 from types import SimpleNamespace
-from unittest import mock
 
 import torch
 
@@ -17,8 +16,6 @@ from tokenspeed.runtime.layers.attention.lcm_setup import (
     create_lcm_pool,
     prepare_lcm_setup,
 )
-
-_FLAT_PROBE = "tokenspeed.runtime.configs.paged_cache_spec.scheduler_ext_flat_kvcache"
 
 
 def test_attention_configs_do_not_own_lcm_setup() -> None:
@@ -100,12 +97,11 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
         "layer.0.ssm": torch.float32,
     }
     assert not hasattr(attn_config, "lcm_memory_plan")
-    with mock.patch(_FLAT_PROBE, return_value=True):
-        pool = create_lcm_pool(
-            setup.target,
-            attn_config,
-            num_layers=2,
-            rank=0,
-            enable_memory_saver=False,
-        )
+    pool = create_lcm_pool(
+        setup.target,
+        attn_config,
+        num_layers=2,
+        rank=0,
+        enable_memory_saver=False,
+    )
     assert isinstance(pool, LcmMHATokenToKVPool)

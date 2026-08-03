@@ -27,6 +27,7 @@ from tokenspeed.runtime.cache.utils import (
     get_mla_kv_buffer_triton,
     set_mla_kv_buffer_triton,
 )
+from tokenspeed.runtime.configs import paged_cache_spec
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.utils import (
     copy_all_layer_kv_cache_tiled,
@@ -65,6 +66,7 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         rank: int,
         enable_kv_cache_copy: bool = False,
         enable_alt_stream: bool = True,
+        max_scheduled_tokens: int = 0,
     ):
         super().__init__(
             size, dtype, device, max_batch_size, max_context_len, page_size, rank
@@ -117,8 +119,17 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         else:
             self._kv_copy_config = None
 
-        self.paged_cache_group_specs = ()
-        self.paged_cache_group_page_counts = {}
+        specs, counts = paged_cache_spec.publish_paged_cache_groups(
+            layer_types=(),
+            sliding_window_tokens=None,
+            page_size=page_size,
+            max_live_requests=max_batch_size,
+            max_scheduled_tokens=max_scheduled_tokens,
+            max_total_tokens=size,
+            max_context_len=max_context_len,
+        )
+        self.paged_cache_group_specs = tuple(specs)
+        self.paged_cache_group_page_counts = counts
 
     def _create_buffers(self) -> None:
         with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
