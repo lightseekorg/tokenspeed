@@ -89,6 +89,16 @@ def kimi_k3_layer_group_ids(text_config: KimiLinearConfig) -> tuple[str, ...]:
             f"Kimi-K3 FlatKV requires both KDA and full-attention layers, got "
             f"{len(kda_layer_ids)} and {len(full_layer_ids)}"
         )
+    if num_layers == _KIMI_K3_LAYERS and (
+        len(kda_layer_ids) != _KIMI_K3_KDA_LAYERS
+        or len(full_layer_ids) != _KIMI_K3_MLA_LAYERS
+    ):
+        # Reduced-layer variants relax the split, but the released 93-layer
+        # checkpoint must keep exactly 69 KDA + 24 MLA.
+        raise ValueError(
+            f"93-layer Kimi-K3 requires 69 KDA and 24 MLA layers, got "
+            f"{len(kda_layer_ids)} and {len(full_layer_ids)}"
+        )
     if len(kda_layer_ids) % _KIMI_K3_STATE_GROUPS:
         raise ValueError(
             f"Kimi-K3 FlatKV requires the KDA layer count to divide into "

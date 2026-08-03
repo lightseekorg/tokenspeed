@@ -491,28 +491,25 @@ class KimiK3LcmPlanTests(unittest.TestCase):
 
         return plan_kimi_k3_lcm_cache(
             cfg,
-            flat_kvcache_enabled=True,
             tp_size=tp,
             mla_cache_dtype=torch.float8_e4m3fn,
             mla_quant_method=None,
             num_lcm_blocks=64,
         )
 
-    def test_full_packing_scales_with_attn_tp(self):
-        """The MLA-side packing halves with tp so the block/KDA-page ratio --
-        and therefore the padding fraction -- stays at the tp=8 value. tp=16
-        used to fail outright (padding 1.268089 > 0.25): the KDA state page
-        scales as 1/tp while the MLA latent page is tp-invariant."""
+    def test_linear_packing_scales_with_attn_tp(self):
+        """KDA pages pack into an MLA-sized plane, so tp=16 -- where the KDA
+        state page halves while the MLA latent page is tp-invariant -- packs
+        twice as many KDA pages per plane instead of failing the planner's
+        padding bound (1.268089 > 0.25 before the fix)."""
         cfg = KimiLinearConfig()
         plan8 = self._plan(cfg, 8)
         plan16 = self._plan(cfg, 16)
         packs8 = {g.group_id: g.cache_blocks_per_lcm_block for g in plan8.groups}
         packs16 = {g.group_id: g.cache_blocks_per_lcm_block for g in plan16.groups}
-        self.assertEqual(packs8[FULL_ATTENTION], 12)
-        self.assertEqual(packs16[FULL_ATTENTION], 6)
-        # The MLA stride (bytes per latent page) is identical either way; only
-        # the number of pages per block changes.
-        self.assertEqual(plan8.lcm_block_bytes // 12, plan16.lcm_block_bytes // 6)
+        self.assertEqual(packs8[FULL_ATTENTION], packs16[FULL_ATTENTION])
+        for gid in (f"{LINEAR_ATTENTION}_0", f"{LINEAR_ATTENTION}_1"):
+            self.assertEqual(packs16[gid], 2 * packs8[gid])
         self.assertEqual(len(plan8.planes), _NUM_MLA)
         self.assertEqual(len(plan16.planes), _NUM_MLA)
 
@@ -531,6 +528,23 @@ class KimiK3LcmPlanTests(unittest.TestCase):
         cfg = KimiLinearConfig(num_hidden_layers=num_layers, linear_attn_config=linear)
         plan = self._plan(cfg, 8)
         self.assertEqual(len(plan.planes), len(linear["full_attn_layers"]))
+
+    def test_full_size_split_is_enforced(self):
+        """A 93-layer config must keep exactly 69 KDA + 24 MLA; the relaxed
+        reduced-layer path must not weaken the released-checkpoint check."""
+        base = KimiLinearConfig()
+        linear = dict(base.linear_attn_config)
+        kda = list(linear["kda_layers"])
+        moved = kda.pop()  # 66 KDA (still /3) + 25 full: wrong split, 93 layers
+        # also drop two more to keep divisibility by the 3 state groups
+        kda.pop(); kda.pop()
+        linear["kda_layers"] = kda
+        linear["full_attn_layers"] = sorted(
+            set(range(1, _NUM_LAYERS + 1)) - set(kda)
+        )
+        cfg = KimiLinearConfig(linear_attn_config=linear)
+        with self.assertRaisesRegex(ValueError, "69 KDA and 24 MLA"):
+            self._plan(cfg, 8)
 
     def test_kda_group_split_must_divide(self):
         """A KDA layer count that does not split into the fixed state groups
