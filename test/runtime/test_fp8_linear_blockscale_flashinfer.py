@@ -73,5 +73,6 @@ def test_process_weights_prepares_and_uses_native_scales(m: int) -> None:
         quant="mxfp8",
         block_size=[128, 128],
         override="flashinfer_mm_fp8_blockscale",
+        prepacked_scales=True,
     )
     torch.testing.assert_close(prepared, reference, atol=5e-4, rtol=2e-3)

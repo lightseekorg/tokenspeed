@@ -123,9 +123,10 @@ scale layout through the decode hot path. Weight scales are transposed once
 after loading, while online activation quantization writes MN-major scales and
 the at-most-three padded rows directly. This removes the per-projection scale
 transposes plus the zero/one fills and device-to-device padding copies that
-would otherwise run between activation quantization and GEMM. The FlashInfer
-wrapper accepts only this prepared layout; generic calls with canonical block
-scales remain on kernels whose contracts use the canonical layout.
+would otherwise run between activation quantization and GEMM. The runtime sets
+``prepacked_scales=True`` only for this prepared path. Generic callers keep the
+default canonical-scale contract, for which the FlashInfer wrapper performs the
+compatibility conversion.
 
 ## Multi-Node
 

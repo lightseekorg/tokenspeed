@@ -407,6 +407,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 block_size=self.quant_config.weight_block_size,
                 override=override,
                 enable_pdl=pdl_enabled(),
+                prepacked_scales=use_flashinfer_fp8_blockscale,
             )
             return output.to(dtype=output_dtype).view(*output_shape)
         else:
