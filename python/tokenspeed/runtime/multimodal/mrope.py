@@ -246,30 +246,35 @@ def compute_mrope_positions(hf_config, input_ids, mm_items):
     if any(arch in _QWEN3_OMNI_ARCHITECTURES for arch in architectures):
         return _compute_qwen3_omni_mrope_positions(hf_config, input_ids, mm_items)
 
-    image_grids = [
-        item.model_specific_data["image_grid_thw"]
-        for item in mm_items
-        if "image_grid_thw" in item.model_specific_data
-    ]
-    video_grids = [
-        item.model_specific_data["video_grid_thw"]
-        for item in mm_items
-        if "video_grid_thw" in item.model_specific_data
-    ]
-    image_grid_thw = torch.cat(image_grids, dim=0) if image_grids else None
-    video_grid_thw = torch.cat(video_grids, dim=0) if video_grids else None
+    model_type = getattr(hf_config, "model_type", None)
+    if model_type in ("qwen3_5", "qwen3_5_moe"):
+        fast = _compute_qwen35_mrope_positions_from_offsets(
+            hf_config,
+            input_ids,
+            mm_items,
+        )
+        if fast is not None:
+            return fast
+
+    image_grids = []
+    video_grids = []
+    for item in mm_items:
+        model_specific = item.model_specific_data
+        if "image_grid_thw" in model_specific:
+            image_grids.append(model_specific["image_grid_thw"])
+        if "video_grid_thw" in model_specific:
+            video_grids.append(model_specific["video_grid_thw"])
+    image_grid_thw = _cat_grids_or_single(image_grids)
+    video_grid_thw = _cat_grids_or_single(video_grids)
 
     # Qwen3.5 models compute M-RoPE with one video segment per temporal grid.
     # The vision encoder still consumes the original grid [T, H, W], but the
     # text prompt contains T separate <|video_pad|> runs. Split only the RoPE
     # grid to match HuggingFace's Qwen3.5 get_rope_index behavior.
-    if video_grid_thw is not None and getattr(hf_config, "model_type", None) in (
-        "qwen3_5",
-        "qwen3_5_moe",
-    ):
+    if video_grid_thw is not None and model_type in ("qwen3_5", "qwen3_5_moe"):
         video_grid_thw = torch.repeat_interleave(
             video_grid_thw, video_grid_thw[:, 0].to(torch.long), dim=0
-        ).clone()
+        )
         video_grid_thw[:, 0] = 1
 
     input_ids_tensor = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0)
@@ -285,6 +290,190 @@ def compute_mrope_positions(hf_config, input_ids, mm_items):
         video_grid_thw=video_grid_thw,
     )
     return mrope_positions.squeeze(1), mrope_position_delta
+
+
+def _compute_qwen35_mrope_positions_from_offsets(hf_config, input_ids, mm_items):
+    """Qwen3.5 M-RoPE fast path using SMG placeholder offsets.
+
+    SMG precomputed requests already carry patch-only placeholder offsets per
+    item. For Qwen3.5 those offsets are exactly the image/video token spans the
+    HF ``get_rope_index`` implementation rediscovers by scanning ``input_ids``.
+    Build the same position tensor from offsets, and fall back to HF-style
+    scanning whenever the metadata is incomplete or inconsistent.
+    """
+    try:
+        seq_len = len(input_ids)
+        spatial_merge_size = int(hf_config.vision_config.spatial_merge_size)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if seq_len <= 0:
+        return None
+
+    segments: list[tuple[int, int, tuple[int, int, int]]] = []
+    segments_sorted = True
+    last_segment_start = -1
+    for item in mm_items:
+        model_specific = getattr(item, "model_specific_data", None) or {}
+        offsets = getattr(item, "offsets", None)
+        if not offsets:
+            if "image_grid_thw" in model_specific or "video_grid_thw" in model_specific:
+                return None
+            continue
+
+        if "image_grid_thw" in model_specific:
+            grid_rows = _item_grid_rows(item, "image_grid_thw")
+            placeholder_token_id = int(hf_config.image_token_id)
+        elif "video_grid_thw" in model_specific:
+            grid_rows = _qwen35_video_grid_rows(
+                _item_grid_rows(item, "video_grid_thw"),
+            )
+            placeholder_token_id = int(hf_config.video_token_id)
+        else:
+            continue
+
+        if len(grid_rows) != len(offsets):
+            return None
+
+        for (start, end), (t, h, w) in zip(offsets, grid_rows):
+            start = int(start)
+            end = int(end)
+            if start < 0 or end < start or end >= seq_len:
+                return None
+            placeholder_tokens = input_ids[start : end + 1]
+            if placeholder_tokens.count(placeholder_token_id) != len(
+                placeholder_tokens
+            ):
+                return None
+            llm_grid_t = int(t)
+            llm_grid_h = int(h) // spatial_merge_size
+            llm_grid_w = int(w) // spatial_merge_size
+            if llm_grid_t <= 0 or llm_grid_h <= 0 or llm_grid_w <= 0:
+                return None
+            if end - start + 1 != llm_grid_t * llm_grid_h * llm_grid_w:
+                return None
+            if start < last_segment_start:
+                segments_sorted = False
+            last_segment_start = start
+            segments.append((start, end, (llm_grid_t, llm_grid_h, llm_grid_w)))
+
+    if not segments:
+        return None
+
+    if not segments_sorted:
+        segments.sort(key=lambda segment: segment[0])
+    prev_end = -1
+    for start, end, _ in segments:
+        if start <= prev_end:
+            return None
+        prev_end = end
+
+    normalized_segments = tuple(
+        (start, end, grid[0], grid[1], grid[2]) for start, end, grid in segments
+    )
+    return _build_qwen35_mrope_positions(seq_len, normalized_segments)
+
+
+def _grid_rows_list(grid) -> list[tuple[int, int, int]]:
+    if isinstance(grid, torch.Tensor):
+        rows = grid.detach().cpu().tolist()
+    elif hasattr(grid, "tolist"):
+        rows = grid.tolist()
+    else:
+        rows = grid
+
+    if not rows:
+        return []
+    if not isinstance(rows[0], (list, tuple)):
+        rows = [rows]
+    return [(int(t), int(h), int(w)) for t, h, w in rows]
+
+
+def _item_grid_rows(item, key: str) -> list[tuple[int, int, int]]:
+    return _grid_rows_list(item.model_specific_data[key])
+
+
+def _qwen35_video_grid_rows(grid) -> list[tuple[int, int, int]]:
+    rows: list[tuple[int, int, int]] = []
+    for t, h, w in _grid_rows_list(grid):
+        rows.extend((1, h, w) for _ in range(int(t)))
+    return rows
+
+
+def _fill_qwen35_text_positions(out: torch.Tensor, start_pos: int) -> int:
+    length = out.shape[1]
+    if length <= 0:
+        return start_pos
+    torch.arange(start_pos, start_pos + length, out=out[0])
+    out[1].copy_(out[0])
+    out[2].copy_(out[0])
+    return start_pos + length
+
+
+def _qwen35_grid_position_indices(
+    llm_grid_t: int,
+    llm_grid_h: int,
+    llm_grid_w: int,
+) -> torch.Tensor:
+    t_index = (
+        torch.arange(llm_grid_t, dtype=torch.long)
+        .view(-1, 1)
+        .expand(-1, llm_grid_h * llm_grid_w)
+        .flatten()
+    )
+    h_index = (
+        torch.arange(llm_grid_h, dtype=torch.long)
+        .view(1, -1, 1)
+        .expand(llm_grid_t, -1, llm_grid_w)
+        .flatten()
+    )
+    w_index = (
+        torch.arange(llm_grid_w, dtype=torch.long)
+        .view(1, 1, -1)
+        .expand(llm_grid_t, llm_grid_h, -1)
+        .flatten()
+    )
+    return torch.stack([t_index, h_index, w_index])
+
+
+def _build_qwen35_mrope_positions(
+    seq_len: int,
+    segments: tuple[tuple[int, int, int, int, int], ...],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build positions after the caller validates normalized segments."""
+    positions = torch.empty((3, seq_len), dtype=torch.long)
+    grid_positions = {}
+    next_pos = 0
+    cursor = 0
+    for start, end, llm_grid_t, llm_grid_h, llm_grid_w in segments:
+        if cursor < start:
+            next_pos = _fill_qwen35_text_positions(
+                positions[:, cursor:start],
+                next_pos,
+            )
+
+        grid_shape = (llm_grid_t, llm_grid_h, llm_grid_w)
+        grid_position = grid_positions.get(grid_shape)
+        if grid_position is None:
+            grid_position = _qwen35_grid_position_indices(*grid_shape)
+            grid_positions[grid_shape] = grid_position
+        torch.add(grid_position, next_pos, out=positions[:, start : end + 1])
+        next_pos += max(llm_grid_t, llm_grid_h, llm_grid_w)
+        cursor = end + 1
+
+    if cursor < seq_len:
+        next_pos = _fill_qwen35_text_positions(
+            positions[:, cursor:seq_len],
+            next_pos,
+        )
+    return positions, torch.tensor([[next_pos - seq_len]], dtype=torch.long)
+
+
+def _cat_grids_or_single(grids):
+    if not grids:
+        return None
+    if len(grids) == 1:
+        return grids[0]
+    return torch.cat(grids, dim=0)
 
 
 def extend_mrope_positions_for_retracted_request(
