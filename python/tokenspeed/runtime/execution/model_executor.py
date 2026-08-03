@@ -199,6 +199,8 @@ class ModelExecutorConfig:
     dp_sampling: bool = False
     dp_sampling_min_bs: int | None = None
     use_v4_mtp_paged_metadata: bool = False
+    enable_spec_training_mooncake: bool = False
+    spec_training_aux_layer_ids: list[int] | None = None
 
     # ====== GRAMMAR =========
     # "none" disables all grammar handling; otherwise the backend name
@@ -266,6 +268,8 @@ class ModelExecutorConfig:
             dp_sampling_min_bs=server_args.dp_sampling_min_bs,
             enable_nan_detection=server_args.enable_nan_detection,
             use_v4_mtp_paged_metadata=model_config.use_v4_mtp_paged_metadata,
+            enable_spec_training_mooncake=server_args.enable_spec_training_mooncake,
+            spec_training_aux_layer_ids=server_args.eagle3_layers_to_capture,
             grammar_backend=server_args.grammar_backend,
             disable_capturable_grammar=server_args.disable_capturable_grammar,
         )
@@ -438,6 +442,26 @@ class ModelExecutor:
                 )
         else:
             self.drafter = None
+
+        self.spec_training_exporter = None
+        if config.enable_spec_training_mooncake:
+            if self.drafter is not None:
+                raise ValueError(
+                    "Offline spec-training Mooncake capture cannot run with a drafter"
+                )
+            if not hasattr(self.model_runner.model, "set_eagle3_layers_to_capture"):
+                raise ValueError(
+                    "The target model does not support auxiliary hidden-state capture"
+                )
+            self.model_runner.model.set_eagle3_layers_to_capture(
+                config.spec_training_aux_layer_ids
+            )
+            if config.global_rank == 0:
+                from tokenspeed.runtime.execution.spec_training_mooncake import (
+                    SpecTrainingMooncakeExporter,
+                )
+
+                self.spec_training_exporter = SpecTrainingMooncakeExporter()
 
         # Single grammar handle: CapturableGrammarExecutor on CUDA (uses
         # cudaLaunchHostFunc on a side stream so the xgrammar fill +
@@ -1022,6 +1046,8 @@ class ModelExecutor:
             )
 
         logits_output = self._run_target_forward(bs, ctx, req_pool_indices)
+        if self.spec_training_exporter is not None and ctx.forward_mode.is_extend():
+            self.spec_training_exporter.export(ctx, logits_output)
 
         if self.drafter is not None and getattr(
             self.drafter, "_incremental_proj_enabled", False
@@ -1575,6 +1601,24 @@ class ModelExecutor:
                             - 1
                         )
 
+                if self.config.enable_spec_training_mooncake:
+                    capture_hidden_mode = CaptureHiddenMode.FULL
+                    request_ids = list(forward_op.request_ids)
+                    input_ids_cpu = list(forward_op.input_ids)
+                    input_lengths_cpu = list(forward_op.input_lengths)
+                    extend_prefix_lens_cpu = list(forward_op.extend_prefix_lens)
+                else:
+                    capture_hidden_mode = (
+                        CaptureHiddenMode.FULL
+                        if self.drafter is not None
+                        else CaptureHiddenMode.NULL
+                    )
+                    # Unused if hidden state is not captured
+                    request_ids = None
+                    input_ids_cpu = None
+                    input_lengths_cpu = None
+                    extend_prefix_lens_cpu = None
+
                 ctx = ForwardContext(
                     attn_backend=self.attn_backend,
                     token_to_kv_pool=self.token_to_kv_pool,
@@ -1583,13 +1627,13 @@ class ModelExecutor:
                     num_extends=num_extends,
                     input_num_tokens=total_tokens,
                     forward_mode=forward_mode,
-                    capture_hidden_mode=(
-                        CaptureHiddenMode.FULL
-                        if self.drafter is not None
-                        else CaptureHiddenMode.NULL
-                    ),
+                    capture_hidden_mode=capture_hidden_mode,
                     gather_ids=gather_ids,
                     decode_input_ids=decode_input_ids,
+                    request_ids=request_ids,
+                    input_ids_cpu=input_ids_cpu,
+                    input_lengths_cpu=input_lengths_cpu,
+                    extend_prefix_lens_cpu=extend_prefix_lens_cpu,
                 )
                 if self.config.data_parallel_size > 1:
                     if dp_global_num_tokens is None:

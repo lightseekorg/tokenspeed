@@ -236,6 +236,8 @@ class ServerArgs:
     speculative_eagle_topk: int = 1
     speculative_num_draft_tokens: int | None = None
     eagle3_layers_to_capture: str | None = None
+    # Capture target-model hidden states and publish them to Mooncake.
+    enable_spec_training_mooncake: bool = False
     # Logprob support flags — all OFF by default. Enabling extends the
     # captured CUDA-graph footprint; requests asking for logprobs on a
     # server started without the matching flag will receive empty logprobs.
@@ -313,6 +315,7 @@ class ServerArgs:
         self.resolve_parallelism()
         self.resolve_memory_and_scheduling()
         self.resolve_kernel_backends()
+        self.resolve_spec_training()
         self.resolve_cache()
         self.resolve_speculative_decoding()
         self.resolve_communication()
@@ -592,6 +595,25 @@ class ServerArgs:
         # Handle KVStore settings.
         self._handle_kvstore()
         self.validate_cache_options()
+
+    def resolve_spec_training(self):
+        if not self.enable_spec_training_mooncake:
+            return
+
+        self.enforce_eager = True
+        self.disable_prefill_graph = True
+        self.disable_overlap_schedule = True
+        self.enable_prefix_caching = False
+        self.disable_kvstore = True
+        self.enable_mixed_batch = False
+        if self.kvstore_size == 0:
+            self.kvstore_size = 1
+        self.chunked_prefill_size = self.max_prefill_tokens
+        self.skip_server_warmup = True
+        logger.info(
+            "Enabled offline spec-training Mooncake capture: eager whole-prompt "
+            "prefill, prefix/KV caching, overlap scheduling, and warmup disabled"
+        )
 
     def resolve_speculative_decoding(self):
         # Keep drafter backend consistent with the main model unless explicitly set.
@@ -1577,6 +1599,13 @@ class ServerArgs:
             type=str,
             help="The layers of Eagle3 to capture.",
             default=ServerArgs.eagle3_layers_to_capture,
+        )
+        parser.add_argument(
+            "--enable-spec-training-mooncake",
+            action="store_true",
+            default=ServerArgs.enable_spec_training_mooncake,
+            help="Capture full-sequence auxiliary and final hidden states during "
+            "offline prefill and publish them to Mooncake for TorchSpec.",
         )
 
         # Runtime options

@@ -168,6 +168,13 @@ class OutputProcessor:
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
 
+            if (
+                self.engine.server_args.enable_spec_training_mooncake
+                and getattr(state.obj, "return_hidden_states", False)
+                and recv_obj.finished_reasons[i] is not None
+            ):
+                meta_info["spec_training_mooncake_store_keys"] = [rid]
+
             if isinstance(recv_obj, BatchStrOut):
                 if len(recv_obj.batch_accept_draft_tokens) > 0:
                     meta_info.update(

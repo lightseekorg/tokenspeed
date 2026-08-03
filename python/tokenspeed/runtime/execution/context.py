@@ -53,6 +53,11 @@ class ForwardContext:
     capture_hidden_mode: CaptureHiddenMode | None = CaptureHiddenMode.NULL
     # Normalized explicit decode input overrides for this forward, if any.
     decode_input_ids: list[int] | None = None
+    # CPU request metadata used only by hidden state capture.
+    request_ids: list[str] | None = None
+    input_ids_cpu: list[int] | None = None
+    input_lengths_cpu: list[int] | None = None
+    extend_prefix_lens_cpu: list[int] | None = None
 
     # --- dp attention ---
     global_num_tokens: list[int] | None = None

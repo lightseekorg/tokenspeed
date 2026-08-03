@@ -77,6 +77,8 @@ class LogitsProcessorOutput:
     # Used by speculative decoding.
     # The last hidden layers
     hidden_states: torch.Tensor | None = None
+    # Full, post-final-norm target hidden states.
+    last_hidden_states: torch.Tensor | None = None
     logits_layout_plan: LogitsLayoutPlan | None = None
 
     ## Part 2: Populated by the active SamplingBackend during sample()/verify().
@@ -454,8 +456,10 @@ class LogitsProcessor(nn.Module):
         )
 
         hidden_states_to_store: torch.Tensor | None = None
+        last_hidden_states_to_store: torch.Tensor | None = None
         if logits_metadata.capture_hidden_mode.need_capture():
             if logits_metadata.capture_hidden_mode.is_full():
+                last_hidden_states_to_store = hidden_states
                 if aux_hidden_states is not None:
                     aux_hidden_states = (
                         aux_hidden_states[0]
@@ -497,6 +501,7 @@ class LogitsProcessor(nn.Module):
                 next_token_logits=sampled_logits,
                 next_token_ids=next_token_ids,
                 hidden_states=hidden_states_to_store,
+                last_hidden_states=last_hidden_states_to_store,
                 logits_layout_plan=logits_layout_plan,
             )
         else:
@@ -551,6 +556,7 @@ class LogitsProcessor(nn.Module):
                 input_top_logprobs_val=input_top_logprobs_val,
                 input_top_logprobs_idx=input_top_logprobs_idx,
                 hidden_states=hidden_states_to_store,
+                last_hidden_states=last_hidden_states_to_store,
                 input_token_ids_logprobs_val=input_token_ids_logprobs_val,
                 input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
             )
