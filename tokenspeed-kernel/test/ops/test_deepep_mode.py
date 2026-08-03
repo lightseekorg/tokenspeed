@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.communication import deep_ep as deep_ep_module
 from tokenspeed_kernel.ops.communication.deep_ep import (
     DeepEPBuffer,
     DeepEPMode,
@@ -64,54 +63,6 @@ def test_auto_mode_requires_a_decision() -> None:
 def test_enabled_legs_per_mode(mode, normal, low_latency) -> None:
     assert mode.enable_normal() is normal
     assert mode.enable_low_latency() is low_latency
-
-
-def test_new_buffer_disables_mnnvl_fabric_handles(monkeypatch) -> None:
-    seen = {}
-
-    class Config:
-        def get_nvl_buffer_size_hint(self, _hidden_bytes, _group_size):
-            return 1024
-
-        def get_rdma_buffer_size_hint(self, _hidden_bytes, _group_size):
-            return 2048
-
-    class RecordingBuffer:
-        num_sms = 20
-
-        @staticmethod
-        def get_dispatch_config(_group_size):
-            return Config()
-
-        @staticmethod
-        def get_combine_config(_group_size):
-            return Config()
-
-        def __init__(self, *_args, **kwargs):
-            seen.update(kwargs)
-            self.low_latency_mode = kwargs["low_latency_mode"]
-
-    class Group:
-        @staticmethod
-        def size():
-            return 4
-
-    monkeypatch.setattr(deep_ep_module, "Buffer", RecordingBuffer)
-    monkeypatch.setattr(
-        deep_ep_module, "_get_available_gpu_memory", lambda *_args, **_kwargs: 1.0
-    )
-    monkeypatch.setattr(DeepEPBuffer, "_buffer", None)
-
-    DeepEPBuffer.get_deepep_buffer(
-        group=Group(),
-        hidden_size=2048,
-        param_bytes=2,
-        deepep_mode=DeepEPMode.normal,
-        num_max_dispatch_tokens_per_rank=256,
-        num_experts=64,
-    )
-
-    assert seen["allow_mnnvl"] is False
 
 
 class _StubBuffer:

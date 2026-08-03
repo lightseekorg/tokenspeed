@@ -95,11 +95,6 @@ The prefill CUDA graph is disabled whenever an all-to-all backend is selected:
 normal-mode dispatch reports its per-expert receive counts to the host, and a
 host sync cannot be captured. Decode graphs are unaffected.
 
-TokenSpeed initializes DeepEP with `allow_mnnvl=False`. This keeps intra-node
-sharing on CUDA IPC and avoids requiring an NVIDIA IMEX channel for Fabric
-handles. The current integration does not enable MNNVL Fabric-handle sharing;
-multi-node deployments continue to use the RDMA path described above.
-
 For block-scale FP8 decode on NVIDIA, the low-latency path keeps routing
 metadata in DeepEP's required contiguous int64/float32 formats across both
 collective legs. Its fused SwiGLU quantizer writes packed UE8M0 scales directly
