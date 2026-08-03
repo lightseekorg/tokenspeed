@@ -64,49 +64,64 @@ def _one_based_layers(value: object, name: str, num_layers: int) -> tuple[int, .
 
 
 def kimi_k3_layer_group_ids(text_config: KimiLinearConfig) -> tuple[str, ...]:
-    """Map every Kimi-K3 layer to one Full or KDA cache group."""
-    if text_config.num_hidden_layers != _KIMI_K3_LAYERS:
-        raise ValueError(
-            f"Kimi-K3 Paged cache requires 93 layers, got {text_config.num_hidden_layers}"
-        )
+    """Map every Kimi-K3 layer to one Full or KDA cache group.
+
+    Counts derive from the config (the released checkpoint is 93 layers =
+    69 KDA + 24 MLA) rather than being hardcoded, so structurally-identical
+    reduced-layer variants plan the same way. The KDA layer count must split
+    evenly into the fixed number of state groups.
+    """
+    num_layers = require_positive_int(
+        "num_hidden_layers", text_config.num_hidden_layers
+    )
     linear = text_config.linear_attn_config
     if not isinstance(linear, Mapping):
         raise ValueError("linear_attn_config must be a mapping")
     kda_layers = _one_based_layers(
-        linear.get("kda_layers"), "linear_attn_config.kda_layers", _KIMI_K3_LAYERS
+        linear.get("kda_layers"), "linear_attn_config.kda_layers", num_layers
     )
     kda_layer_ids = tuple(layer - 1 for layer in kda_layers)
     full_layer_ids = tuple(
-        layer_id
-        for layer_id in range(_KIMI_K3_LAYERS)
-        if layer_id not in set(kda_layer_ids)
+        layer_id for layer_id in range(num_layers) if layer_id not in set(kda_layer_ids)
     )
-    if (
+    if not kda_layer_ids or not full_layer_ids:
+        raise ValueError(
+            f"Kimi-K3 FlatKV requires both KDA and full-attention layers, got "
+            f"{len(kda_layer_ids)} and {len(full_layer_ids)}"
+        )
+    if num_layers == _KIMI_K3_LAYERS and (
         len(kda_layer_ids) != _KIMI_K3_KDA_LAYERS
         or len(full_layer_ids) != _KIMI_K3_MLA_LAYERS
     ):
+        # Reduced-layer variants relax the split, but the released 93-layer
+        # checkpoint must keep exactly 69 KDA + 24 MLA.
         raise ValueError(
-            f"Kimi-K3 Paged cache requires 69 KDA and 24 MLA layers, got "
+            f"93-layer Kimi-K3 requires 69 KDA and 24 MLA layers, got "
             f"{len(kda_layer_ids)} and {len(full_layer_ids)}"
+        )
+    if len(kda_layer_ids) % _KIMI_K3_STATE_GROUPS:
+        raise ValueError(
+            f"Kimi-K3 FlatKV requires the KDA layer count to divide into "
+            f"{_KIMI_K3_STATE_GROUPS} state groups, got {len(kda_layer_ids)}"
         )
     if "full_attn_layers" in linear:
         declared = [
             layer
             for layer in linear["full_attn_layers"]
-            if not (isinstance(layer, int) and layer > _KIMI_K3_LAYERS)
+            if not (isinstance(layer, int) and layer > num_layers)
         ]
         declared_full = _one_based_layers(
             declared,
             "linear_attn_config.full_attn_layers",
-            _KIMI_K3_LAYERS,
+            num_layers,
         )
         if declared_full != tuple(layer_id + 1 for layer_id in full_layer_ids):
             raise ValueError(
                 "linear_attn_config.full_attn_layers must equal the kda_layers complement"
             )
 
-    group_ids = [FULL_ATTENTION] * _KIMI_K3_LAYERS
-    per_group = _KIMI_K3_KDA_LAYERS // _KIMI_K3_STATE_GROUPS
+    group_ids = [FULL_ATTENTION] * num_layers
+    per_group = len(kda_layer_ids) // _KIMI_K3_STATE_GROUPS
     for index, layer_id in enumerate(kda_layer_ids):
         group_ids[layer_id] = f"{LINEAR_ATTENTION}_{index // per_group}"
     return tuple(group_ids)
@@ -215,8 +230,14 @@ def plan_kimi_k3_lcm_cache(
         raise ValueError(
             f"Kimi-K3 LCM packing must be {expected_packing}, got {packing}"
         )
-    if len(plan.planes) != _KIMI_K3_MLA_LAYERS:
-        raise ValueError(f"Kimi-K3 LCM requires 24 planes, got {len(plan.planes)}")
+    num_mla_layers = sum(
+        1 for gid in kimi_k3_layer_group_ids(text_config) if gid == FULL_ATTENTION
+    )
+    if len(plan.planes) != num_mla_layers:
+        raise ValueError(
+            f"Kimi-K3 LCM requires {num_mla_layers} planes (one per MLA "
+            f"layer), got {len(plan.planes)}"
+        )
     return plan
 
 

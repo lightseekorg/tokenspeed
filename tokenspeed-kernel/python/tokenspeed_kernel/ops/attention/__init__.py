@@ -789,6 +789,8 @@ def kda_paged_prefill(
     # registered Gluon implementation.
     if current_platform().is_amd and solution in {"fla", "flashkda", "cutedsl_kda"}:
         solution = "gluon"
+    elif solution == "fla":
+        solution = "triton"
     kernel = select_kernel(
         "attention",
         "kda_paged_prefill",
