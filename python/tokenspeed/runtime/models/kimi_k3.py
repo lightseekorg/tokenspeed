@@ -1650,6 +1650,7 @@ class KimiLinearModel(nn.Module):
         self._dflash_incremental_callback = None
         self._dflash_slot_bufs = None
         self._dflash_capture_idx_map: dict[int, int] = {}
+        self._dflash_incr_active = False
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
@@ -1724,11 +1725,15 @@ class KimiLinearModel(nn.Module):
                     layer_idx, prefix_sum, block_residual
                 )
                 capture_idx = self._dflash_capture_idx_map.get(layer_idx)
-                if self._dflash_slot_bufs is not None and capture_idx is not None:
+                if (
+                    self._dflash_incr_active
+                    and self._dflash_incremental_callback is not None
+                    and self._dflash_slot_bufs is not None
+                    and capture_idx is not None
+                ):
                     num_tokens = captured.shape[0]
                     self._dflash_slot_bufs[capture_idx][:num_tokens].copy_(captured)
-                    if self._dflash_incremental_callback is not None:
-                        self._dflash_incremental_callback(capture_idx, num_tokens)
+                    self._dflash_incremental_callback(capture_idx, num_tokens)
                 aux_hidden_states.append(captured)
 
         hidden_states = _apply_attn_res(

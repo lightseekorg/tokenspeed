@@ -13,6 +13,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from tokenspeed.runtime.models import kimi_k3
 from tokenspeed.runtime.models.kimi_k3 import KimiLinearModel, _apply_attn_res
 
 # The AttnRes kernel is bf16-only, which is also the dtype K3's stream runs in.
@@ -60,6 +61,7 @@ def _make_model(num_layers: int = 8, hidden: int = 16, block: int = 3):
     model._dflash_capture_idx_map = {}
     model._dflash_incremental_callback = None
     model._dflash_slot_bufs = None
+    model._dflash_incr_active = False
     return model
 
 
@@ -203,6 +205,61 @@ def test_negative_taps_are_rejected() -> None:
     holder = _CausalLM(_make_model(num_layers=93, block=12))
     with pytest.raises(ValueError, match="invalid ids"):
         holder.set_dflash_layers_to_capture([-1, 23])
+
+
+class _ForwardLayer:
+    def __call__(self, positions, hidden_states, ctx, out_cache_loc, block_residual):
+        return hidden_states, block_residual
+
+
+def test_incremental_callback_only_runs_during_a_prepared_decode(
+    monkeypatch,
+) -> None:
+    """Prefill/mixed capture must not consume stale incremental positions."""
+
+    def fake_apply(
+        prefix_sum,
+        block_residual,
+        proj,
+        norm,
+        num_valid_blocks,
+        out_norm=None,
+    ):
+        return prefix_sum if out_norm is not None else prefix_sum + 1
+
+    monkeypatch.setattr(kimi_k3, "_apply_attn_res", fake_apply)
+    model = KimiLinearModel.__new__(KimiLinearModel)
+    model.config = _Config(num_hidden_layers=1, attn_res_block_size=1)
+    model.layers = [_ForwardLayer()]
+    model.output_attn_res_proj = object()
+    model.output_attn_res_norm = object()
+    model.norm = object()
+    model.layers_to_capture = [0]
+    model._dflash_capture_idx_map = {0: 0}
+    model._dflash_slot_bufs = [torch.full((2, 4), -1, dtype=DTYPE)]
+    calls: list[tuple[int, int]] = []
+    model._dflash_incremental_callback = lambda idx, n: calls.append((idx, n))
+
+    input_embeds = torch.zeros((2, 4), dtype=DTYPE)
+    args = {
+        "input_ids": torch.empty(0, dtype=torch.int64),
+        "positions": torch.arange(2),
+        "ctx": None,
+        "out_cache_loc": torch.arange(2),
+        "input_embeds": input_embeds,
+    }
+
+    model._dflash_incr_active = False
+    _, aux = model.forward(**args)
+    assert aux is not None
+    assert calls == []
+    assert torch.all(model._dflash_slot_bufs[0] == -1)
+
+    model._dflash_incr_active = True
+    _, aux = model.forward(**args)
+    assert aux is not None
+    assert calls == [(0, 2)]
+    torch.testing.assert_close(model._dflash_slot_bufs[0], input_embeds + 1)
 
 
 # --------------------------------------------------------------------------
