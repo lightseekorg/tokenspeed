@@ -391,14 +391,14 @@ class Fp8LinearMethod(LinearMethodBase):
                 override = "flashinfer_mm_fp8_blockscale"
             else:
                 override = None
-            prepacked_scales = override == "flashinfer_mm_fp8_blockscale"
+            use_flashinfer_fp8_blockscale = override == "flashinfer_mm_fp8_blockscale"
             output = tokenspeed_kernel.mm(
                 input_2d,
                 layer.weight,
                 A_scales=block_scale,
                 B_scales=(
                     layer._flashinfer_fp8_weight_scales_mn
-                    if prepacked_scales
+                    if use_flashinfer_fp8_blockscale
                     else layer.weight_scale_inv
                 ),
                 bias=bias,
@@ -407,7 +407,6 @@ class Fp8LinearMethod(LinearMethodBase):
                 block_size=self.quant_config.weight_block_size,
                 override=override,
                 enable_pdl=pdl_enabled(),
-                prepacked_scales=prepacked_scales,
             )
             return output.to(dtype=output_dtype).view(*output_shape)
         else:

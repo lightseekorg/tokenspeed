@@ -2381,7 +2381,7 @@ _CASES = [
         "blackwell-sm100",
         "gemm",
         "mm",
-        "flashinfer_mm_fp8_blockscale",
+        "triton_mm_fp8_blockscale",
         _mm_mxfp8,
     ),
     _case(

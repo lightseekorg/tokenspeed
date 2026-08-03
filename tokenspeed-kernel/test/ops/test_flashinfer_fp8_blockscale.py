@@ -6,6 +6,7 @@ import pytest
 import torch
 from tokenspeed_kernel import mm
 from tokenspeed_kernel.ops.gemm.flashinfer import (
+    gemm_fp8_nt_groupwise,
     has_flashinfer_fp8_blockscale,
     prepare_flashinfer_fp8_blockscale_weight_scales,
 )
@@ -47,7 +48,7 @@ def test_quantize_prepacked_writes_native_scales_and_padding(
 
 
 @pytest.mark.parametrize("m", [1, 2, 3, 4, 5, 8])
-def test_prepacked_gemm_matches_legacy_path(device: str, m: int) -> None:
+def test_prepared_gemm_matches_raw_flashinfer(device: str, m: int) -> None:
     torch.manual_seed(1)
     n, k = 256, 512
     x = torch.randn(m, k, device=device, dtype=torch.bfloat16)
@@ -57,27 +58,50 @@ def test_prepacked_gemm_matches_legacy_path(device: str, m: int) -> None:
         + 0.001
     )
 
-    legacy = mm(
-        x,
-        weight,
-        B_scales=weight_scales,
-        out_dtype=torch.bfloat16,
-        quant="mxfp8",
-        block_size=[128, 128],
-        override="flashinfer_mm_fp8_blockscale",
+    quantized_x, activation_scales = flashinfer_fp8_blockscale_quantize_prepacked(x)
+    prepared_weight_scales = prepare_flashinfer_fp8_blockscale_weight_scales(
+        weight_scales
     )
-    prepared = mm(
+    expected = gemm_fp8_nt_groupwise(
+        quantized_x,
+        weight,
+        activation_scales,
+        prepared_weight_scales,
+        scale_major_mode="MN",
+        out_dtype=torch.bfloat16,
+    )[:m]
+    actual = mm(
         x,
         weight,
-        B_scales=prepare_flashinfer_fp8_blockscale_weight_scales(weight_scales),
+        B_scales=prepared_weight_scales,
         out_dtype=torch.bfloat16,
         quant="mxfp8",
         block_size=[128, 128],
         override="flashinfer_mm_fp8_blockscale",
-        prepacked_scales=True,
     )
 
-    torch.testing.assert_close(prepared, legacy, atol=5e-4, rtol=2e-3)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def test_flashinfer_gemm_rejects_canonical_weight_scales(device: str) -> None:
+    torch.manual_seed(2)
+    m, n, k = 4, 256, 512
+    x = torch.randn(m, k, device=device, dtype=torch.bfloat16)
+    weight = (torch.randn(n, k, device=device) * 0.02).to(torch.float8_e4m3fn)
+    canonical_scales = torch.rand(
+        n // 128, k // 128, device=device, dtype=torch.float32
+    )
+
+    with pytest.raises(ValueError, match="prepared weight scales"):
+        mm(
+            x,
+            weight,
+            B_scales=canonical_scales,
+            out_dtype=torch.bfloat16,
+            quant="mxfp8",
+            block_size=[128, 128],
+            override="flashinfer_mm_fp8_blockscale",
+        )
 
 
 def test_prepacked_gemm_is_cuda_graph_safe(device: str) -> None:
@@ -98,7 +122,6 @@ def test_prepacked_gemm_is_cuda_graph_safe(device: str) -> None:
             quant="mxfp8",
             block_size=[128, 128],
             override="flashinfer_mm_fp8_blockscale",
-            prepacked_scales=True,
         )
 
     run()

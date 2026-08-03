@@ -68,7 +68,7 @@ def test_process_weights_prepares_and_uses_native_scales(m: int) -> None:
     reference = tokenspeed_kernel.mm(
         x,
         layer.weight,
-        B_scales=canonical_scales,
+        B_scales=layer._flashinfer_fp8_weight_scales_mn,
         out_dtype=torch.bfloat16,
         quant="mxfp8",
         block_size=[128, 128],

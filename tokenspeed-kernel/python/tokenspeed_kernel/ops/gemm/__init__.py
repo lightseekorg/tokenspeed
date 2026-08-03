@@ -184,7 +184,6 @@ def _online_quantize_mxfp8(
     block_size: list[int],
     kernel_name: str,
     enable_pdl: bool = False,
-    prepacked_scales: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Perform online activation quantization for mxfp8 block-scaled GEMM.
 
@@ -197,12 +196,10 @@ def _online_quantize_mxfp8(
         kernel_name: Name of the selected GEMM implementation.
         enable_pdl: Request Programmatic Dependent Launch for the quantize
             kernel. Only the flashinfer path honors it; other backends ignore it.
-        prepacked_scales: Produce the selected kernel's prepared activation
-            scale layout without a follow-up transpose.
     """
     block_k = block_size[1]
 
-    if kernel_name == "flashinfer_mm_fp8_blockscale" and prepacked_scales:
+    if kernel_name == "flashinfer_mm_fp8_blockscale":
         from tokenspeed_kernel.ops.gemm.fp8_utils import (
             flashinfer_fp8_blockscale_quantize_prepacked,
         )
@@ -228,7 +225,7 @@ def _online_quantize_mxfp8(
         )
 
     if (
-        kernel_name in {"flashinfer_mm_fp8_blockscale", "triton_mm_fp8_blockscale"}
+        kernel_name == "triton_mm_fp8_blockscale"
         and _platform.is_nvidia
         and _platform.arch_version == ArchVersion(12, 0)
     ):
@@ -279,19 +276,6 @@ def _online_quantize_mxfp8(
             column_major_scales=True,
             scale_tma_aligned=True,
             scale_ue8m0=_platform.is_blackwell_plus,
-        )
-    elif kernel_name == "flashinfer_mm_fp8_blockscale":
-        from tokenspeed_kernel.ops.gemm.fp8_utils import (
-            per_token_group_quant_fp8,
-        )
-
-        return ensure_row_major_scales(
-            *per_token_group_quant_fp8(
-                A,
-                block_k,
-                column_major_scales=False,
-            ),
-            group_major_scales=_platform.is_nvidia,
         )
     elif kernel_name == "triton_mm_fp8_blockscale":
         from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
@@ -346,7 +330,6 @@ def mm(
     quant: str | None = None,
     enable_pdl: bool = False,
     override: str | None = None,
-    prepacked_scales: bool = False,
 ) -> torch.Tensor:
     """Dense matrix multiply with automatic kernel selection.
 
@@ -377,10 +360,6 @@ def mm(
             from kernels that accept it.
         override: Force selection of a specific kernel by name (e.g.
             ``"cublaslt_mm_nvfp4"``). Bypasses heuristic scoring.
-        prepacked_scales: Whether activation and weight scales use the selected
-            kernel's native prepared layout. Currently supported only by the
-            FlashInfer FP8 block-scale GEMM. Online activation quantization
-            produces its prepared layout automatically.
     """
     out_dtype = out_dtype or (out.dtype if out is not None else A.dtype)
 
@@ -411,6 +390,11 @@ def mm(
         "k_align_128": K % 128 == 0,
         "n_min_128": N >= 128,
         "k_min_128": K >= 128,
+        # Generic mm callers provide canonical block-scale layouts. Kernels
+        # with a private prepared-layout contract must be selected explicitly.
+        "block_scale_layout": (
+            "canonical_blackwell" if Platform.get().is_blackwell_plus else "canonical"
+        ),
     }
 
     signature = _gemm_format_signature(
@@ -425,12 +409,6 @@ def mm(
         traits=traits,
         override=override,
     )
-    if prepacked_scales and kernel.name != "flashinfer_mm_fp8_blockscale":
-        raise ValueError(
-            "prepacked_scales is only supported by "
-            f"flashinfer_mm_fp8_blockscale, selected {kernel.name!r}"
-        )
-
     # Online activation quantization
     if (
         quant == "mxfp8"
@@ -445,7 +423,6 @@ def mm(
             block_size,
             kernel.name,
             enable_pdl=enable_pdl,
-            prepacked_scales=prepacked_scales,
         )
 
     kernel_args = (A, B, A_scales, B_scales, out_dtype)
@@ -455,8 +432,7 @@ def mm(
     }
     if out is not None:
         kernel_kwargs["out"] = out
-    if prepacked_scales:
-        kernel_kwargs["prepacked_scales"] = True
+    if kernel.name == "flashinfer_mm_fp8_blockscale":
         kernel_kwargs["original_m"] = M
 
     fused_bias = bias is not None and kernel.name in _KERNELS_WITH_FUSED_BIAS
