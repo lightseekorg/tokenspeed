@@ -18,585 +18,384 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Top-level memory executor that coordinates host and storage executors."""
+"""Host-tier executor for the paged cache.
+
+Drives batched writeback/loadback page pairs against the byte-blind
+:class:`HostMirror`. Loadbacks are acknowledged because the scheduler pins
+source host pages and destination device blocks until
+``Cache.LoadBackDoneEvent`` retires the operation.
+"""
 
 from __future__ import annotations
 
-import logging
-from collections.abc import Iterable
-from dataclasses import dataclass
+from collections import OrderedDict
+from collections.abc import Iterable, Sequence
+from typing import NamedTuple
 
+import psutil
+import torch
 from tokenspeed_scheduler import Cache
 
-from tokenspeed.runtime.cache.deepseek_v4_cache_host import (
-    DeepseekV4TokenToKVPoolHost,
+from tokenspeed.runtime.cache.host_mirror import (
+    HostMirror,
+    bytes_per_host_page,
 )
-from tokenspeed.runtime.cache.executor.host_executor import HostExecutor
-from tokenspeed.runtime.cache.executor.storage_executor import StorageExecutor
-from tokenspeed.runtime.cache.kv_cache_host import (
-    DSATokenToKVPoolHost,
-    MHATokenToKVPoolHost,
-    MLATokenToKVPoolHost,
-    get_available_host_memory_bytes,
-)
-from tokenspeed.runtime.cache.mamba_cache_host import MambaPoolHost
-from tokenspeed.runtime.cache.transfer.deepseek_v4_pool import DeepseekV4CachePool
-from tokenspeed.runtime.cache.transfer.kv_pool import KVCachePool
-from tokenspeed.runtime.cache.transfer.mamba_pool import MambaCachePool
+from tokenspeed.runtime.cache.kvstore_controller import LayerDoneCounter
 from tokenspeed.runtime.cache.transfer.types import CacheKind
-from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
-    DeepseekV4TokenToKVPool,
-)
-from tokenspeed.runtime.layers.attention.kv_cache.dsa import DSATokenToKVPool
-from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPool
-from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
-from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
+from tokenspeed.runtime.utils import get_colorful_logger, get_device_module
 
 logger = get_colorful_logger(__name__)
-_DEBUG = logging.DEBUG
+device_module = get_device_module()
+
+_HOST_MEM_HEADROOM_BYTES = 10 * (1024**3)
 
 
-def _count_page_pair_spans(src_pages, dst_pages) -> tuple[int, int]:
-    pairs = sorted({(int(src), int(dst)) for src, dst in zip(src_pages, dst_pages)})
-    if not pairs:
-        return 0, 0
-    spans = 1
-    prev_src, prev_dst = pairs[0]
-    for src, dst in pairs[1:]:
-        if src != prev_src + 1 or dst != prev_dst + 1:
-            spans += 1
-        prev_src, prev_dst = src, dst
-    return len(pairs), spans
+def _cache_stream_priorities() -> tuple[int | None, int | None]:
+    priority_range = getattr(device_module.Stream, "priority_range", None)
+    if priority_range is None:
+        return None, None
+    try:
+        return priority_range()
+    except (RuntimeError, TypeError):
+        return None, None
 
 
-def _paged_transfer_debug_summary(paged_transfers) -> tuple[int, int, dict[str, int]]:
-    pages = 0
-    spans = 0
-    groups: dict[str, int] = {}
-    for transfer in paged_transfers or []:
-        group_id = str(getattr(transfer, "group_id", "unknown"))
-        transfer_pages, transfer_spans = _count_page_pair_spans(
-            getattr(transfer, "src_pages", []),
-            getattr(transfer, "dst_pages", []),
-        )
-        pages += transfer_pages
-        spans += transfer_spans
-        groups[group_id] = groups.get(group_id, 0) + transfer_pages
-    return pages, spans, groups
+def _new_cache_stream(priority: int | None = None):
+    if priority is None:
+        return device_module.Stream()
+    try:
+        return device_module.Stream(priority=priority)
+    except (RuntimeError, TypeError):
+        return device_module.Stream()
 
 
-@dataclass(slots=True)
-class MemoryExecutorConfig:
-    layer_num: int
-    page_size: int = 64
-    host_ratio: float = 2.0
-    host_size_gb: int = 0
-    host_parallel_count: int = 1
-    host_reserve_gb: float = 10.0
-    io_backend: str = "kernel"
-    host_layout: str = "layer_first"
-    storage_backend: str | None = "mooncake"
-    storage_backend_extra_config: str | None = None
-    model_name: str | None = None
-    enable_mamba_l2: bool = False
-    mamba_l2_host_slots: int = 0
-    mamba_l2_layout: str = "layer_first"
-    mamba_l2_io_backend: str = "kernel"
+def _ordered_unique(values: Iterable[int]) -> list[int]:
+    seen = set()
+    result = []
+    for value in values:
+        value = int(value)
+        if value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
 
 
-def _aligned_token_count(size: int, page_size: int) -> int:
-    return (size // page_size + 1) * page_size
+class _Ack(NamedTuple):
+    finish_event: object
+    op_ids: list[int]
 
 
-def _pool_size_per_token(pool) -> int:
-    dtype_size = pool.store_dtype.itemsize
-    if isinstance(pool, DSATokenToKVPool):
-        latent_size = (
-            (pool.kv_lora_rank + pool.qk_rope_head_dim) * dtype_size * pool.layer_num
-        )
-        return latent_size + pool.index_k_row_bytes * pool.layer_num
-    if isinstance(pool, MHATokenToKVPool):
-        return pool.head_dim * pool.head_num * pool.layer_num * dtype_size * 2
-    if isinstance(pool, MLATokenToKVPool):
-        return (pool.kv_lora_rank + pool.qk_rope_head_dim) * dtype_size * pool.layer_num
-    raise ValueError(f"Unsupported KV pool type for host budget: {type(pool)}")
-
-
-def _auto_capped_host_size_tokens(
+def num_host_pages(
     *,
-    requested_tokens: int,
+    bytes_per_host_page: int,
+    device_pool_size: int,
     page_size: int,
-    size_per_token: int,
-    available_host_memory_bytes: int,
-    host_parallel_count: int,
+    host_ratio: float,
+    host_size_gb: float,
 ) -> int:
-    """Return a HostKVCache host_size_tokens override, or 0 when no cap is needed."""
+    """Host page budget from the kvstore sizing knobs (same knobs the single-table
+    ``HostKVCache`` resolves, kv_cache_host.py:91-102, budget arithmetic only):
 
-    aligned_requested_tokens = _aligned_token_count(requested_tokens, page_size)
-    requested_bytes = aligned_requested_tokens * size_per_token
-    per_rank_budget = available_host_memory_bytes // max(host_parallel_count, 1)
-    if requested_bytes <= per_rank_budget:
-        return 0
-
-    budget_tokens = per_rank_budget // max(size_per_token, 1)
-    max_aligned_tokens = (budget_tokens // page_size) * page_size
-    if max_aligned_tokens <= page_size:
+    - ``host_size_gb > 0``: explicit byte budget, floor to whole mirror pages
+      (never exceeds the requested bytes):
+      ``host_size_gb * 1e9 // bytes_per_host_page``.
+    - otherwise ratio sizing, mirroring the single-table token->page align-up:
+      ``int(device_pool_size * host_ratio) // page_size + 1``.
+    """
+    if bytes_per_host_page <= 0:
+        raise ValueError(f"bytes_per_host_page must be > 0, got {bytes_per_host_page}")
+    if page_size <= 0:
+        raise ValueError(f"page_size must be > 0, got {page_size}")
+    if host_size_gb > 0:
+        num_pages = int(host_size_gb * 1e9 // bytes_per_host_page)
+    else:
+        num_pages = int(device_pool_size * host_ratio) // page_size + 1
+    if num_pages <= 0:
         raise ValueError(
-            "Not enough host memory available for KVStore after cgroup-aware "
-            f"budgeting: per-rank budget={per_rank_budget / 1e9:.2f} GB, "
-            f"size_per_token={size_per_token}."
+            "host tier resolved to zero host pages "
+            f"(host_size_gb={host_size_gb}, host_ratio={host_ratio}, "
+            f"bytes_per_host_page={bytes_per_host_page}); increase the "
+            "kvstore size."
         )
-    return max_aligned_tokens - page_size
+    return num_pages
 
 
 class MemoryExecutor:
-    """Coordinate host-memory and storage-backed cache operations."""
+    """Execute host-tier transfers for the paged cache.
 
-    def __init__(
-        self,
-        device_pool,
-        config: MemoryExecutorConfig,
-        is_dp_attention_enabled: bool,
-        tp_group=None,
-        draft_device_pool=None,
-        mamba_pool=None,
-    ):
-        self.page_size = config.page_size
-        kv_pool_types = (
-            DSATokenToKVPool,
-            DeepseekV4TokenToKVPool,
-            MHATokenToKVPool,
-            MLATokenToKVPool,
+    Exposes the exact surface ``EventLoop`` drives: ``submit_plan`` /
+    ``poll_results`` / ``get_producer_index`` / ``set_consumer`` (plus the
+    ``host_exec.pools`` attribute walk in ``_setup_layerwise_loadback``).
+    """
+
+    # EventLoop keys per-op inflight accounting off this: loadbacks are
+    # acknowledged by LoadBackDoneEvent.
+    emits_loadback_acks = True
+
+    def __init__(self, device_pool, *, host_ratio: float, host_size_gb: float):
+        self.page_size = int(device_pool.page_size)
+        self.layer_num = len(device_pool.k_buffer)
+
+        host_page_bytes = bytes_per_host_page(device_pool)
+        host_page_count = num_host_pages(
+            bytes_per_host_page=host_page_bytes,
+            device_pool_size=int(device_pool.size),
+            page_size=self.page_size,
+            host_ratio=host_ratio,
+            host_size_gb=host_size_gb,
         )
-
-        # Unwrap LayerMappedKVPool (hybrid GDN models) to get the inner MHA pool.
-        actual_pool = device_pool
-        if hasattr(device_pool, "inner") and not isinstance(device_pool, kv_pool_types):
-            actual_pool = device_pool.inner
-
-        self.paged_cache_pool = None
-        actual_draft_pool = None
-        if isinstance(actual_pool, DeepseekV4TokenToKVPool):
-            if config.storage_backend is not None:
-                raise NotImplementedError(
-                    "DeepSeek V4 KVStore currently supports L2 host memory only; "
-                    "L3 storage backends are out of scope."
-                )
-            reserve_bytes = int(config.host_reserve_gb * (1024**3))
-            available_bytes, _, _ = get_available_host_memory_bytes(reserve_bytes)
-            host_budget_bytes = available_bytes // max(config.host_parallel_count, 1)
-            self.host_pool = DeepseekV4TokenToKVPoolHost(
-                actual_pool,
-                config.host_ratio,
-                config.host_size_gb,
-                config.host_layout,
-                host_budget_bytes=host_budget_bytes,
+        requested_bytes = host_page_count * host_page_bytes
+        available_bytes = psutil.virtual_memory().available - _HOST_MEM_HEADROOM_BYTES
+        if requested_bytes > available_bytes:
+            raise ValueError(
+                f"Not enough host memory for the host tier. Requesting "
+                f"{requested_bytes / 1e9:.2f} GB but only have "
+                f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
+                f"size of the KVStore."
             )
-            self.paged_cache_pool = DeepseekV4CachePool(
-                device_pool=actual_pool,
-                host_pool=self.host_pool,
-                io_backend=config.io_backend,
-            )
-        else:
-            if draft_device_pool is not None:
-                actual_draft_pool = draft_device_pool
-                if hasattr(draft_device_pool, "inner") and not isinstance(
-                    draft_device_pool, kv_pool_types
-                ):
-                    actual_draft_pool = draft_device_pool.inner
-                if not isinstance(
-                    actual_draft_pool,
-                    (DSATokenToKVPool, MHATokenToKVPool, MLATokenToKVPool),
-                ):
-                    raise ValueError(
-                        f"draft_device_pool only supports DSA, MHA and MLA, "
-                        f"got {type(actual_draft_pool)}"
-                    )
-
-            host_size_tokens = 0
-            if config.host_size_gb == 0:
-                target_size_per_token = _pool_size_per_token(actual_pool)
-                draft_size_per_token = (
-                    _pool_size_per_token(actual_draft_pool)
-                    if actual_draft_pool is not None
-                    else 0
-                )
-                combined_size_per_token = target_size_per_token + draft_size_per_token
-                reserve_bytes = int(config.host_reserve_gb * (1024**3))
-                available_bytes, _, cgroup_available = get_available_host_memory_bytes(
-                    reserve_bytes
-                )
-                requested_tokens = int(actual_pool.size * config.host_ratio)
-                host_size_tokens = _auto_capped_host_size_tokens(
-                    requested_tokens=requested_tokens,
-                    page_size=config.page_size,
-                    size_per_token=combined_size_per_token,
-                    available_host_memory_bytes=available_bytes,
-                    host_parallel_count=config.host_parallel_count,
-                )
-                if host_size_tokens > 0:
-                    capped_tokens = _aligned_token_count(
-                        host_size_tokens, config.page_size
-                    )
-                    requested_tokens_aligned = _aligned_token_count(
-                        requested_tokens, config.page_size
-                    )
-                    logger.warning(
-                        "Capping KVStore host pool for cgroup budget: "
-                        "tokens %s -> %s, total bytes %.2f GB -> %.2f GB "
-                        "(parallel_count=%s, available=%.2f GB, cgroup_available=%s)",
-                        requested_tokens_aligned,
-                        capped_tokens,
-                        requested_tokens_aligned * combined_size_per_token / 1e9,
-                        capped_tokens * combined_size_per_token / 1e9,
-                        config.host_parallel_count,
-                        available_bytes / 1e9,
-                        (
-                            f"{cgroup_available / 1e9:.2f} GB"
-                            if cgroup_available is not None
-                            else "unlimited"
-                        ),
-                    )
-
-            # DSA subclasses MLA, so it must be matched before the MLA branch.
-            if isinstance(actual_pool, DSATokenToKVPool):
-                self.host_pool = DSATokenToKVPoolHost(
-                    actual_pool,
-                    config.host_ratio,
-                    config.host_size_gb,
-                    config.page_size,
-                    config.host_layout,
-                    host_size_tokens=host_size_tokens,
-                )
-            elif isinstance(actual_pool, MHATokenToKVPool):
-                self.host_pool = MHATokenToKVPoolHost(
-                    actual_pool,
-                    config.host_ratio,
-                    config.host_size_gb,
-                    config.page_size,
-                    config.host_layout,
-                    host_size_tokens=host_size_tokens,
-                )
-            elif isinstance(actual_pool, MLATokenToKVPool):
-                self.host_pool = MLATokenToKVPoolHost(
-                    actual_pool,
-                    config.host_ratio,
-                    config.host_size_gb,
-                    config.page_size,
-                    config.host_layout,
-                    host_size_tokens=host_size_tokens,
-                )
-            else:
-                raise ValueError(
-                    "host_pool only supports DSA, MHA, MLA, and DeepSeek V4, "
-                    f"got {type(actual_pool)} from module {type(actual_pool).__module__}"
-                )
-
-        # Draft model L2 cache: draft shares the same page mapping as the base
-        # model, so its host pool must hold exactly the same number of tokens.
-        # Pass host_size_tokens directly to bypass ratio/GB recalculation.
-        if actual_draft_pool is not None and self.paged_cache_pool is None:
-            if isinstance(actual_draft_pool, DSATokenToKVPool):
-                self.draft_host_pool = DSATokenToKVPoolHost(
-                    actual_draft_pool,
-                    config.host_ratio,
-                    config.host_size_gb,
-                    config.page_size,
-                    config.host_layout,
-                    host_size_tokens=self.host_pool.size,
-                )
-            elif isinstance(actual_draft_pool, MHATokenToKVPool):
-                self.draft_host_pool = MHATokenToKVPoolHost(
-                    actual_draft_pool,
-                    config.host_ratio,
-                    config.host_size_gb,
-                    config.page_size,
-                    config.host_layout,
-                    host_size_tokens=self.host_pool.size,
-                )
-            elif isinstance(actual_draft_pool, MLATokenToKVPool):
-                self.draft_host_pool = MLATokenToKVPoolHost(
-                    actual_draft_pool,
-                    config.host_ratio,
-                    config.host_size_gb,
-                    config.page_size,
-                    config.host_layout,
-                    host_size_tokens=self.host_pool.size,
-                )
-            else:
-                raise ValueError(
-                    f"draft_device_pool only supports DSA, MHA and MLA, "
-                    f"got {type(actual_draft_pool)}"
-                )
-            draft_host_bytes = (
-                self.draft_host_pool.size * self.draft_host_pool.size_per_token
-            )
-            logger.info(
-                "Allocating %.2f GB host memory for draft model L2 cache (pool_type=%s size_tokens=%s size_per_token=%s layer_num=%s)",
-                draft_host_bytes / 1e9,
-                type(self.draft_host_pool).__name__,
-                self.draft_host_pool.size,
-                self.draft_host_pool.size_per_token,
-                actual_draft_pool.layer_num,
-            )
-            draft_layer_num = actual_draft_pool.layer_num
-        else:
-            self.draft_host_pool = None
-            draft_layer_num = 0
-
-        pools = None
-        self.mamba_host_pool = None
-        if (
-            self.paged_cache_pool is None
-            and config.enable_mamba_l2
-            and mamba_pool is not None
-            and config.mamba_l2_host_slots > 0
-        ):
-            self.mamba_host_pool = MambaPoolHost(
-                mamba_pool,
-                host_size_slots=config.mamba_l2_host_slots,
-                layout=config.mamba_l2_layout,
-            )
-            pools = [
-                KVCachePool(
-                    device_pool=device_pool,
-                    host_pool=self.host_pool,
-                    io_backend=config.io_backend,
-                    layer_num=actual_pool.layer_num,
-                    draft_device_pool=(
-                        actual_draft_pool if draft_device_pool is not None else None
-                    ),
-                    draft_host_pool=self.draft_host_pool,
-                    draft_layer_num=draft_layer_num,
-                ),
-                MambaCachePool(
-                    device_pool=mamba_pool,
-                    host_pool=self.mamba_host_pool,
-                    io_backend=config.mamba_l2_io_backend,
-                ),
-            ]
-            logger.debug(
-                "[cache_op] MemoryExecutor init pools=%s host_pools=%s draft=%s mamba=%s io_backend=%s host_layout=%s",
-                [pool.kind.value for pool in pools],
-                [type(self.host_pool).__name__, type(self.mamba_host_pool).__name__],
-                self.draft_host_pool is not None,
-                True,
-                config.io_backend,
-                config.host_layout,
-            )
-
-        if self.paged_cache_pool is not None:
-            self.host_exec = HostExecutor(
-                pools=pools or [],
-                paged_pool=self.paged_cache_pool,
-                io_backend=config.io_backend,
-            )
-        elif pools is not None:
-            self.host_exec = HostExecutor(pools=pools, io_backend=config.io_backend)
-        else:
-            self.host_exec = HostExecutor(
-                page_size=config.page_size,
-                device_pool=device_pool,
-                host_pool=self.host_pool,
-                io_backend=config.io_backend,
-                layer_num=actual_pool.layer_num,
-                draft_device_pool=(
-                    actual_draft_pool if draft_device_pool is not None else None
-                ),
-                draft_host_pool=self.draft_host_pool,
-                draft_layer_num=draft_layer_num,
-            )
-        self.emits_loadback_acks = self.host_exec.emits_loadback_acks
-        self.storage_exec = StorageExecutor(
-            page_size=config.page_size,
-            device_pool=device_pool,
-            host_pool=self.host_pool,
-            storage_backend_type=config.storage_backend,
-            storage_backend_extra_config=config.storage_backend_extra_config,
-            model_name=config.model_name,
-            is_dp_attention_enabled=is_dp_attention_enabled,
-            tp_group=tp_group,
+        logger.info(
+            "Allocating %.2f GB pinned host memory for the host tier "
+            "(num_host_pages=%s bytes_per_host_page=%s host_size_gb=%r "
+            "host_ratio=%r device_pool.size=%r)",
+            requested_bytes / 1e9,
+            host_page_count,
+            host_page_bytes,
+            host_size_gb,
+            host_ratio,
+            device_pool.size,
         )
-        self._pending_mamba_layerwise_cow: dict[int, list[int]] | None = None
+        self.mirror = HostMirror(device_pool, host_page_count)
+        self.num_host_pages = host_page_count
 
-    @staticmethod
-    def _page_groups_by_kind(op) -> dict[CacheKind, tuple[list, list]]:
-        src_by_kind = getattr(op, "src_pages_by_kind", None)
-        dst_by_kind = getattr(op, "dst_pages_by_kind", None)
-        if src_by_kind is None or dst_by_kind is None:
-            return {CacheKind.KV: (op.src_pages, op.dst_pages)}
-        groups: dict[CacheKind, tuple[list, list]] = {}
-        for kind in CacheKind:
-            src_pages = src_by_kind.get(kind.value, [])
-            dst_pages = dst_by_kind.get(kind.value, [])
-            groups[kind] = (src_pages, dst_pages)
-        return groups
+        # Layerwise loadback fencing: register the counter where the single-table
+        # KVCachePool would, so pool.get_key_buffer/get_value_buffer gate on
+        # the same wait_until(layer_id) machinery.
+        self._counter = LayerDoneCounter(self.layer_num)
+        device_pool.register_layer_transfer_counter(self._counter)
+        # _start_loading maps layer -> mirror V-tensor event and relies on
+        # load_events[-1] (LayerLoadingEvent.finish_event, reuse fence in
+        # update_producer) covering EVERY copy: it pins the last layer to
+        # the op's last per-tensor event, which without state slabs is the
+        # last layer's V event only if that V mirror is the last KV tensor
+        # pair. Holds for both layouts (legacy: identity; slab: last layer
+        # is the last occurrence of its group). A state last layer has no
+        # KV mirror at all -- its copies (state slabs trail every KV
+        # tensor) are covered by the events[-1] pin in _start_loading.
+        assert (
+            self.mirror.state_tensor_indices_of_layer(self.layer_num - 1) is not None
+            or self.mirror.tensor_index_of_layer(self.layer_num - 1)
+            == self.mirror.num_k_tensors - 1
+        ), "host tier: last layer's V mirror is not the last KV tensor pair"
 
-    def set_mamba_layerwise_cow(
-        self, cow_dst_pages_by_src: dict[int, list[int]] | None
-    ) -> None:
-        self._pending_mamba_layerwise_cow = cow_dst_pages_by_src or None
+        write_priority, load_priority = _cache_stream_priorities()
+        self.write_stream = _new_cache_stream(write_priority)
+        self.load_stream = _new_cache_stream(load_priority)
+
+        # (device_page, host_page) pairs staged between submit() and flush().
+        self._pending_write_pairs: list[tuple[int, int]] = []
+        self._pending_write_op_ids: list[int] = []
+        self._pending_load_pairs: list[tuple[int, int]] = []
+        self._pending_load_op_ids: list[int] = []
+        self.ack_write_queue: list[_Ack] = []
+        self.ack_load_queue: list[_Ack] = []
+        # Ops whose page lists were empty on the wire (C++ dedups transfers
+        # across ops of one batched operation) and no batch event covers them.
+        self._immediate_write_op_ids: list[int] = []
+        self._immediate_load_op_ids: list[int] = []
+
+        self._producer_map: OrderedDict[int, int] = OrderedDict()
+        self._producer_map_limit = 1024
+
+        # Surface for EventLoop._setup_layerwise_loadback, which walks
+        # memory_executor.host_exec.pools to enumerate fencing kinds.
+        self.host_exec = self
+        self.pools = {CacheKind.KV: self.mirror}
+
+    # ------------------------------------------------------------------
+    # Submission
+    # ------------------------------------------------------------------
 
     def submit_plan(self, plan) -> None:
         if plan.cache:
             logger.debug("[cache_op] submit_plan: %s cache ops", len(plan.cache))
-        try:
-            for op in plan.cache:
-                self.submit(op)
-            self.host_exec.flush()
-        finally:
-            self._pending_mamba_layerwise_cow = None
+        for op in plan.cache:
+            self.submit(op)
+        self.flush()
 
     def submit(self, op) -> None:
         if isinstance(op, Cache.WriteBackOp):
-            logger.debug(
-                "[cache_op] writeback op_id=%s src_pages=%s dst_pages=%s",
-                op.op_ids,
-                len(op.src_pages),
-                len(op.dst_pages),
-            )
-            groups = self._page_groups_by_kind(op)
-            paged_transfers_by_op = getattr(op, "paged_cache_transfers", [])
-            is_retract_flags = getattr(op, "is_retract", [])
-            for i in range(len(op.op_ids)):
-                op_id = op.op_ids[i]
-                is_retract = (
-                    bool(is_retract_flags[i]) if i < len(is_retract_flags) else False
-                )
-                submitted = False
-                for kind, (src_groups, dst_groups) in groups.items():
-                    if kind not in self.host_exec.pools:
-                        continue
-                    src_pages = src_groups[i] if i < len(src_groups) else []
-                    dst_pages = dst_groups[i] if i < len(dst_groups) else []
-                    if not src_pages:
-                        continue
-                    if kind == CacheKind.MAMBA:
-                        logger.debug(
-                            "[cache_op][mamba_l2] writeback schedule "
-                            "op_id=%s slots=%s device_slots=%s host_slots=%s "
-                            "is_retract=%s",
-                            op_id,
-                            len(src_pages),
-                            src_pages[:8],
-                            dst_pages[:8],
-                            is_retract,
-                        )
-                    self.host_exec.enqueue_writeback(
-                        op_id,
-                        src_pages,
-                        dst_pages,
-                        is_retract=is_retract,
-                        kind=kind,
-                    )
-                    submitted = True
-                paged_transfers = (
-                    paged_transfers_by_op[i] if i < len(paged_transfers_by_op) else []
-                )
-                if paged_transfers:
-                    if logger.isEnabledFor(_DEBUG):
-                        pages, spans, debug_groups = _paged_transfer_debug_summary(
-                            paged_transfers
-                        )
-                        logger.debug(
-                            "[cache_op][paged_l2] writeback schedule op_id=%s "
-                            "pages=%s spans=%s groups=%s transfers=%s is_retract=%s",
-                            op_id,
-                            pages,
-                            spans,
-                            debug_groups,
-                            len(paged_transfers),
-                            is_retract,
-                        )
-                    self.host_exec.enqueue_paged_cache_writeback(
-                        op_id,
-                        paged_transfers,
-                        is_retract=is_retract,
-                    )
-                    submitted = True
-                if not submitted and all(
-                    i >= len(src_groups) or not src_groups[i]
-                    for kind, (src_groups, _) in groups.items()
-                    if kind in self.host_exec.pools
-                ):
-                    self.host_exec.completed_writebacks.append(op_id)
+            self.submit_writeback(op.op_ids, op.src_pages, op.dst_pages)
         elif isinstance(op, Cache.LoadBackOp):
-            logger.debug(
-                "[cache_op] loadback op_id=%s src_pages=%s dst_pages=%s",
-                op.op_ids,
-                len(op.src_pages),
-                len(op.dst_pages),
-            )
-            groups = self._page_groups_by_kind(op)
-            paged_transfers_by_op = getattr(op, "paged_cache_transfers", [])
-            for i in range(len(op.op_ids)):
-                op_id = op.op_ids[i]
-                for kind, (src_groups, dst_groups) in groups.items():
-                    if kind not in self.host_exec.pools:
-                        continue
-                    src_pages = src_groups[i] if i < len(src_groups) else []
-                    dst_pages = dst_groups[i] if i < len(dst_groups) else []
-                    if not src_pages:
-                        continue
-                    if kind == CacheKind.MAMBA:
-                        logger.debug(
-                            "[cache_op][mamba_l2] loadback schedule "
-                            "op_id=%s slots=%s host_slots=%s device_slots=%s",
-                            op_id,
-                            len(src_pages),
-                            src_pages[:8],
-                            dst_pages[:8],
-                        )
-                    loadback_kwargs = {}
-                    mamba_layerwise_cow = getattr(
-                        self, "_pending_mamba_layerwise_cow", None
-                    )
-                    if kind == CacheKind.MAMBA and mamba_layerwise_cow:
-                        loadback_kwargs["layerwise_cow_dst_pages_by_src"] = (
-                            mamba_layerwise_cow
-                        )
-                    self.host_exec.enqueue_loadback(
-                        op_id, src_pages, dst_pages, kind=kind, **loadback_kwargs
-                    )
-                paged_transfers = (
-                    paged_transfers_by_op[i] if i < len(paged_transfers_by_op) else []
-                )
-                if paged_transfers:
-                    if logger.isEnabledFor(_DEBUG):
-                        pages, spans, debug_groups = _paged_transfer_debug_summary(
-                            paged_transfers
-                        )
-                        logger.debug(
-                            "[cache_op][paged_l2] loadback schedule op_id=%s "
-                            "pages=%s spans=%s groups=%s transfers=%s",
-                            op_id,
-                            pages,
-                            spans,
-                            debug_groups,
-                            len(paged_transfers),
-                        )
-                    self.host_exec.enqueue_paged_cache_loadback(
-                        op_id,
-                        paged_transfers,
-                    )
-
-        elif isinstance(op, Cache.PrefetchOp):
-            logger.debug(
-                "[cache_op] prefetch op_id=%s dst_pages=%s", op.op_id, len(op.dst_pages)
-            )
-            self.storage_exec.submit_prefetch(op)
-        elif isinstance(op, Cache.BackUpOp):
-            logger.debug(
-                "[cache_op] backup op_id=%s src_pages=%s", op.op_id, len(op.src_pages)
-            )
-            self.storage_exec.submit_backup(op)
+            self.submit_loadback(op.op_ids, op.src_pages, op.dst_pages)
         else:
-            raise ValueError("unsupported cache op kind")
+            raise ValueError(
+                f"host tier: unsupported cache op kind {type(op).__name__}"
+            )
+
+    def _submit(
+        self,
+        op_ids: Sequence[int],
+        src_pages: Sequence[Sequence[int]],
+        dst_pages: Sequence[Sequence[int]],
+        *,
+        pending_op_ids: list[int],
+        pending_pairs: list[tuple[int, int]],
+        src_is_device: bool,
+    ) -> None:
+        """Stage copies as (device_page, host_page) pairs; fail loud on a
+        ragged wire payload instead of silently dropping trailing ops."""
+        assert len(op_ids) == len(src_pages) == len(dst_pages), (
+            f"host tier: ragged cache-op payload (op_ids={len(op_ids)}, "
+            f"src_pages={len(src_pages)}, dst_pages={len(dst_pages)})"
+        )
+        for op_id, src, dst in zip(op_ids, src_pages, dst_pages):
+            assert len(src) == len(dst), (
+                f"host tier: op {op_id} src/dst page lists differ "
+                f"({len(src)} vs {len(dst)})"
+            )
+            pending_op_ids.append(int(op_id))
+            device_pages, host_pages = (src, dst) if src_is_device else (dst, src)
+            pending_pairs.extend(
+                (int(d), int(h)) for d, h in zip(device_pages, host_pages)
+            )
+
+    def submit_writeback(
+        self,
+        op_ids: Sequence[int],
+        src_pages: Sequence[Sequence[int]],
+        dst_pages: Sequence[Sequence[int]],
+    ) -> None:
+        """Stage device->host copies: src=device pages, dst=host pages."""
+        self._submit(
+            op_ids,
+            src_pages,
+            dst_pages,
+            pending_op_ids=self._pending_write_op_ids,
+            pending_pairs=self._pending_write_pairs,
+            src_is_device=True,
+        )
+
+    def submit_loadback(
+        self,
+        op_ids: Sequence[int],
+        src_pages: Sequence[Sequence[int]],
+        dst_pages: Sequence[Sequence[int]],
+    ) -> None:
+        """Stage host->device copies: src=host pages, dst=device pages."""
+        self._submit(
+            op_ids,
+            src_pages,
+            dst_pages,
+            pending_op_ids=self._pending_load_op_ids,
+            pending_pairs=self._pending_load_pairs,
+            src_is_device=False,
+        )
+
+    def flush(self) -> None:
+        self._start_loading()
+        self._start_writing()
+
+    def _start_writing(self) -> None:
+        if not self._pending_write_op_ids:
+            return
+        op_ids = _ordered_unique(self._pending_write_op_ids)
+        pairs = self._pending_write_pairs
+        self._pending_write_op_ids = []
+        self._pending_write_pairs = []
+        if not pairs:
+            self._immediate_write_op_ids.extend(op_ids)
+            return
+        # Order the D2H copies after already-enqueued default-stream work
+        # (same fence the single-table _start_writing places).
+        start_event = torch.cuda.Event()
+        start_event.record()
+        start_event.wait(self.write_stream)
+        self.mirror.store_pages(pairs, self.write_stream)
+        finish_event = torch.cuda.Event()
+        finish_event.record(self.write_stream)
+        self.ack_write_queue.append(_Ack(finish_event, op_ids))
+
+    def _start_loading(self) -> None:
+        if not self._pending_load_op_ids:
+            return
+        assert (
+            not get_is_capture_mode()
+        ), "cache loadback must run in eager admission iter"
+        op_ids = _ordered_unique(self._pending_load_op_ids)
+        pairs = self._pending_load_pairs
+        self._pending_load_op_ids = []
+        self._pending_load_pairs = []
+        if not pairs:
+            self._immediate_load_op_ids.extend(op_ids)
+            return
+
+        producer_id = self._counter.update_producer()
+        producer_event = self._counter.events[producer_id]
+        producer_event.start_event.record()
+        producer_event.start_event.wait(self.load_stream)
+
+        events = self.mirror.load_pages_with_events(pairs, self.load_stream)
+        # Layer fence: layer L is readable once its V mirror copy lands; the
+        # load stream is serial (all K copies precede all V copies), so the
+        # V-tensor event also covers L's K copy. Paired slab layers share the
+        # slab event -- correct by design. State layers instead fence on
+        # their ssm event: conv precedes ssm in tensor_pairs order (and both
+        # follow every KV tensor), so on the serial stream the ssm event
+        # covers the conv copy and the layer's KV copies -- the same
+        # K-before-V reasoning as above.
+        num_k = self.mirror.num_k_tensors
+        for layer_id in range(self.layer_num):
+            state_indices = self.mirror.state_tensor_indices_of_layer(layer_id)
+            if state_indices is not None:
+                producer_event.load_events[layer_id] = events[state_indices[1]]
+            else:
+                producer_event.load_events[layer_id] = events[
+                    num_k + self.mirror.tensor_index_of_layer(layer_id)
+                ]
+        # finish_event (== load_events[-1]) is the producer-slot reuse fence
+        # in update_producer and must cover EVERY copy of the op; state
+        # tensors copy after all KV tensors, so pin the last layer to the
+        # op's last per-tensor event. A no-op without state slabs: events[-1]
+        # is then the last layer's V event (ctor assert).
+        producer_event.load_events[self.layer_num - 1] = events[-1]
+        # events[-1] is also the reassigned finish_event, so the ack covers
+        # every copy.
+        self.ack_load_queue.append(_Ack(events[-1], op_ids))
+        for op_id in op_ids:
+            self._producer_map[op_id] = producer_id
+        while len(self._producer_map) > self._producer_map_limit:
+            self._producer_map.popitem(last=False)
+
+    # ------------------------------------------------------------------
+    # Ack draining
+    # ------------------------------------------------------------------
 
     def poll_results(self) -> list:
         results: list = []
-        results.extend(self.host_exec.drain())
-        results.extend(self.storage_exec.drain())
+        for op_id in self._immediate_write_op_ids:
+            results.append(self._write_done(op_id))
+        self._immediate_write_op_ids.clear()
+        for op_id in self._immediate_load_op_ids:
+            results.append(self._load_done(op_id))
+        self._immediate_load_op_ids.clear()
+
+        remaining_writes = []
+        for ack in self.ack_write_queue:
+            if ack.finish_event.query():
+                results.extend(self._write_done(op_id) for op_id in ack.op_ids)
+            else:
+                remaining_writes.append(ack)
+        self.ack_write_queue[:] = remaining_writes
+
+        remaining_loads = []
+        for ack in self.ack_load_queue:
+            if ack.finish_event.query():
+                results.extend(self._load_done(op_id) for op_id in ack.op_ids)
+            else:
+                remaining_loads.append(ack)
+        self.ack_load_queue[:] = remaining_loads
+
         if results:
             for r in results:
                 logger.debug(
@@ -607,25 +406,63 @@ class MemoryExecutor:
                 )
         return results
 
+    @staticmethod
+    def _write_done(op_id: int):
+        evt = Cache.WriteBackDoneEvent()
+        evt.op_id = op_id
+        evt.success = True
+        return evt
+
+    @staticmethod
+    def _load_done(op_id: int):
+        evt = Cache.LoadBackDoneEvent()
+        evt.op_id = op_id
+        evt.success = True
+        return evt
+
+    # ------------------------------------------------------------------
+    # Layerwise loadback fencing (EventLoop._setup_layerwise_loadback)
+    # ------------------------------------------------------------------
+
     def get_producer_index(
         self, kind_or_op_id: CacheKind | str | int, op_id: int | None = None
     ) -> int | None:
-        return self.host_exec.get_producer_index(kind_or_op_id, op_id)
+        if op_id is None:
+            op_id = int(kind_or_op_id)
+        return self._producer_map.pop(int(op_id), None)
 
     def set_consumer(
         self,
         kind_or_producer_index: CacheKind | str | int | Iterable[int],
         producer_index: int | Iterable[int] | None = None,
     ) -> None:
-        self.host_exec.set_consumer(kind_or_producer_index, producer_index)
+        if producer_index is None:
+            producer_index = kind_or_producer_index
+        self._counter.set_consumer(producer_index)
+
+    # ------------------------------------------------------------------
+    # MemoryExecutor surface
+    # ------------------------------------------------------------------
 
     def query_l3_pages(self, hashes: list[str]) -> int:
-        return self.storage_exec.query_exists(hashes)
+        # No L3 storage tier is implemented for this executor (EventLoop refuses a
+        # storage backend up front); report zero hits.
+        return 0
 
     def shutdown(self) -> None:
-        self.host_exec.shutdown()
-        self.storage_exec.shutdown()
+        self.write_stream.synchronize()
+        self.load_stream.synchronize()
 
     def reset(self) -> None:
-        self.host_exec.reset()
-        self.storage_exec.drain()
+        self.write_stream.synchronize()
+        self.load_stream.synchronize()
+        self._pending_write_pairs.clear()
+        self._pending_write_op_ids.clear()
+        self._pending_load_pairs.clear()
+        self._pending_load_op_ids.clear()
+        self.ack_write_queue.clear()
+        self.ack_load_queue.clear()
+        self._immediate_write_op_ids.clear()
+        self._immediate_load_op_ids.clear()
+        self._producer_map.clear()
+        self._counter.reset()

@@ -38,6 +38,12 @@ Applying the label starts a new CI run immediately and cancels the older run
 through the workflow's concurrency policy. A unit-test failure does not cancel
 model tests that are already running in this mode.
 
+The Qwen3.5 FP8 DeepEP correctness task runs GSM8K on four B200 GPUs with
+attention TP2, attention DP2, and MoE EP4. DeepEP `auto` mode exercises its
+normal path during prefill and low-latency path during decode, and the task
+uses the bounded non-thinking chat template for CI stability. The task requires
+a score of at least 0.90.
+
 Each task expands into one matrix entry per runner label. Add a top-level
 `priority` to a task YAML to bias dispatch order. GitHub Actions starts matrix
 jobs in include-list order, so `high` entries reach a contended runner pool

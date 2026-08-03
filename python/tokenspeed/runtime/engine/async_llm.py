@@ -206,6 +206,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
 
         # Set after scheduler is initialized
         self.max_req_input_len = None
+        self.max_single_request_tokens = None
 
         self.metrics = RequestMetrics(
             labels={

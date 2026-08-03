@@ -44,6 +44,8 @@ averages per-tactic timings across ranks during the window, so live-tuned
 shapes converge on one tactic as well.
 """
 
+from __future__ import annotations
+
 import contextlib
 import functools
 import logging
@@ -52,6 +54,7 @@ from collections.abc import Generator
 
 __all__ = [
     "autotune",
+    "flashinfer_tuning_cache_filename",
     "get_autotune_max_num_tokens",
     "load_flashinfer_tuning_cache",
     "load_packaged_flashinfer_tuning_cache",
@@ -64,6 +67,35 @@ logger = logging.getLogger(__name__)
 _DEFAULT_AUTOTUNE_MAX_NUM_TOKENS = 8192
 
 _autotune_max_num_tokens = _DEFAULT_AUTOTUNE_MAX_NUM_TOKENS
+
+
+def flashinfer_tuning_cache_filename(
+    model: str,
+    ep_size: int,
+    tp_size: int,
+    device_name: str,
+    flashinfer_version: str,
+    cudnn_version: int | str,
+) -> str:
+    """Build the packaged FlashInfer tactic-table filename.
+
+    Args:
+        model: Model slug represented by the table.
+        ep_size: Expert-parallel world size of the swept layout.
+        tp_size: MoE tensor-parallel size of the swept layout.
+        device_name: CUDA device name used for the sweep.
+        flashinfer_version: Installed ``flashinfer-python`` version.
+        cudnn_version: cuDNN version used for the sweep.
+
+    Returns:
+        The environment-specific JSON filename used by the sweeper and loader.
+    """
+    normalized_device_name = device_name.replace(" ", "_")
+    return (
+        f"{model},ep={ep_size},tp={tp_size},"
+        f"device_name={normalized_device_name},flashinfer={flashinfer_version},"
+        f"cudnn={cudnn_version}.json"
+    )
 
 
 def set_autotune_max_num_tokens(num_tokens: int) -> None:
@@ -199,15 +231,16 @@ def load_packaged_flashinfer_tuning_cache(
     Tables live as package data under ``ops/moe/flashinfer/tactics/`` named
     vLLM-configs style::
 
-        <model>,ep=<N>,tp=<N>,device_name=<GPU with spaces as _>,flashinfer=<ver>.json
+        <model>,ep=<N>,tp=<N>,device_name=<GPU>,
+        flashinfer=<ver>,cudnn=<ver>.json
 
     EP and MoE-TP together pin the swept workload shape (local expert count
     and per-partition intermediate size), and the exact GPU device name and
-    installed flashinfer version are part of the name, so a lookup can only
-    ever find a table swept for this precise environment; the table's embedded
-    metadata re-checks the version facts at load. A miss is normal for layouts
-    no table has been swept on and logs at INFO. Cached per layout: call sites
-    run per-layer, the load must not.
+    installed flashinfer and cuDNN versions are part of the name, so a lookup
+    can only ever find a table swept for this precise environment; the table's
+    embedded metadata re-checks the version facts at load. A miss is normal for
+    layouts no table has been swept on and logs at INFO. Cached per layout: call
+    sites run per-layer, the load must not.
 
     Args:
         model: Model slug used in the table filename (e.g. ``"kimi-k3"``).
@@ -220,7 +253,10 @@ def load_packaged_flashinfer_tuning_cache(
     try:
         import torch
 
-        device_name = torch.cuda.get_device_name().replace(" ", "_")
+        device_name = torch.cuda.get_device_name()
+        cudnn_version = torch.backends.cudnn.version()
+        if cudnn_version is None:
+            raise RuntimeError("cuDNN version is unavailable")
         from importlib.metadata import version
 
         fi_version = version("flashinfer-python")
@@ -229,17 +265,45 @@ def load_packaged_flashinfer_tuning_cache(
         return False
     from tokenspeed_kernel.ops.moe import flashinfer as _fi_pkg
 
-    name = (
-        f"{model},ep={ep_size},tp={tp_size},"
-        f"device_name={device_name},flashinfer={fi_version}.json"
+    name = flashinfer_tuning_cache_filename(
+        model,
+        ep_size,
+        tp_size,
+        device_name,
+        fi_version,
+        cudnn_version,
     )
-    path = os.path.join(os.path.dirname(_fi_pkg.__file__), "tactics", name)
+    tactics_dir = os.path.join(os.path.dirname(_fi_pkg.__file__), "tactics")
+    path = os.path.join(tactics_dir, name)
     if not os.path.exists(path):
-        logger.info(
-            f"no packaged flashinfer tuning cache for this environment "
-            f"(looked for {name}); the startup autotune window will tune "
-            "instead. Sweep one with benchmark/moe_tactic_sweep to pin "
-            "tactics."
+        # A table swept for this exact model/layout/device but a different
+        # library version cannot be loaded. Keep that visible: otherwise the
+        # fallback is a silent perf regression hidden in an INFO line.
+        normalized_device_name = device_name.replace(" ", "_")
+        stale_prefix = (
+            f"{model},ep={ep_size},tp={tp_size},"
+            f"device_name={normalized_device_name},"
         )
+        stale = sorted(
+            f
+            for f in (os.listdir(tactics_dir) if os.path.isdir(tactics_dir) else [])
+            if f.startswith(stale_prefix) and f != name
+        )
+        if stale:
+            logger.warning(
+                f"stale flashinfer tuning cache: {stale[0]} was swept on a "
+                "different FlashInfer or cuDNN version "
+                f"(installed: flashinfer={fi_version}, cudnn={cudnn_version}) "
+                "and will not be loaded. Re-sweep with "
+                "benchmark/moe_tactic_sweep to restore pinned tactics; until "
+                "then the startup autotune window tunes these shapes."
+            )
+        else:
+            logger.info(
+                f"no packaged flashinfer tuning cache for this environment "
+                f"(looked for {name}); the startup autotune window will tune "
+                "instead. Sweep one with benchmark/moe_tactic_sweep to pin "
+                "tactics."
+            )
         return False
     return load_flashinfer_tuning_cache(path)

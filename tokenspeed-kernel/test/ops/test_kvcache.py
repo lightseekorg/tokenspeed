@@ -22,77 +22,13 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops import kvcache as kvcache_ops
 from tokenspeed_kernel.ops.kvcache.triton import (
     index_k_block_split_scatter,
     transfer_kv_all_layer,
     transfer_kv_all_layer_mla,
     transfer_kv_per_layer,
     transfer_kv_per_layer_mla,
-    zero_flat_cache_pages,
 )
-from tokenspeed_kernel.registry import KernelRegistry
-
-
-def test_h2d_scatter_registry_binds_backend_plan(monkeypatch) -> None:
-    specs = KernelRegistry.get().list_kernels("kvcache", "h2d_scatter")
-    assert any(spec.name == "cuda_kvcache_h2d_scatter" for spec in specs)
-
-    calls = []
-    launch_result = object()
-
-    def plan(src_indices, dst_indices, entry_begin, entry_end):
-        calls.append(("launch", src_indices, dst_indices, entry_begin, entry_end))
-        return launch_result
-
-    def fake_select(family, mode, signature):
-        calls.append(("select", family, mode, signature))
-        return lambda **_kwargs: (plan, "")
-
-    monkeypatch.setattr(kvcache_ops, "select_kernel", fake_select)
-    src = [torch.empty(1)]
-    dst = [torch.empty(1)]
-    selected, reason = kvcache_ops.prepare_kv_direct_h2d_scatter_plan(src, dst, [0])
-    assert selected is plan
-    assert reason == ""
-
-    src_indices = torch.tensor([0])
-    dst_indices = torch.tensor([1])
-    result = selected(src_indices, dst_indices, 0, 1)
-
-    assert result is launch_result
-    assert calls[0][0:3] == ("select", "kvcache", "h2d_scatter")
-    assert calls[1] == ("launch", src_indices, dst_indices, 0, 1)
-
-
-def test_zero_flat_cache_pages_clears_only_selected_pages(device: str) -> None:
-    num_pages, page_size_bytes, num_slabs = 7, 4_100, 3
-    slabs = [
-        torch.full(
-            (num_pages, page_size_bytes),
-            0xA0 + index,
-            dtype=torch.uint8,
-            device=device,
-        )
-        for index in range(num_slabs)
-    ]
-    expected = [slab.clone() for slab in slabs]
-    for slab in expected:
-        slab[[2, 5]] = 0
-
-    slab_addresses = torch.tensor(
-        [slab.data_ptr() for slab in slabs], dtype=torch.uint64, device=device
-    )
-    page_ids = torch.tensor([5, 2], dtype=torch.int32, device=device)
-    zero_flat_cache_pages(
-        slab_addresses,
-        page_ids,
-        page_size_bytes=page_size_bytes,
-    )
-    torch.cuda.synchronize()
-
-    for actual, reference in zip(slabs, expected):
-        assert torch.equal(actual, reference)
 
 
 def test_transfer_kv_per_layer(device: str) -> None:

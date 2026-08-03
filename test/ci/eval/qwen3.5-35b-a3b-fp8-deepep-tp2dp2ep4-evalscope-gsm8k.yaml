@@ -1,0 +1,58 @@
+api_version: ci.tokenspeed.io/v1
+name: eval-qwen3.5-35b-a3b-fp8-deepep-tp2dp2ep4-gsm8k
+type: eval
+workflow_stage: model-test
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - b200-4gpu
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps.sh
+server:
+  command: >-
+    ts serve
+    --model Qwen/Qwen3.5-35B-A3B-FP8
+    --attn-tp-size 2
+    --data-parallel-size 2
+    --dense-tp-size 4
+    --moe-tp-size 1
+    --ep-size 4
+    --dist-init-addr 127.0.0.1:4000
+    --quantization fp8
+    --moe-backend deep_gemm
+    --all2all-backend deepep
+    --deepep-mode auto
+    --max-model-len 8192
+    --max-num-seqs 16
+    --max-prefill-tokens 8192
+    --chunked-prefill-size 8192
+    --max-cudagraph-capture-size 16
+    --gpu-memory-utilization 0.20
+    --sampling-backend greedy
+    --disable-kvstore
+    --trust-remote-code
+    --host 127.0.0.1
+    --port 8000
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 1800
+    interval: 10
+eval:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
+  command: >-
+    /tmp/evalscope-perf/bin/evalscope eval
+    --model Qwen/Qwen3.5-35B-A3B-FP8
+    --api-url http://127.0.0.1:8000/v1
+    --api-key EMPTY_TOKEN
+    --datasets gsm8k
+    --eval-batch-size 16
+    --stream
+    --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":1024,"extra_body":{"chat_template_kwargs":{"enable_thinking":false}}}'
+report:
+  github_step_summary: true
+score_threshold: 0.90

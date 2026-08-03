@@ -24,30 +24,11 @@
 #include <map>
 #include <string>
 #include <utility>
-#include <variant>
 #include <vector>
 
 #include "scheduler/operations/inc.h"
 
 namespace tokenspeed {
-
-enum class FlatTerminalReason {
-    kPromptExceedsPoolCapacity,
-    kDecodeExceedsPoolCapacity,
-};
-
-struct FlatTerminalError {
-    std::string request_id;
-    FlatTerminalReason reason{FlatTerminalReason::kPromptExceedsPoolCapacity};
-    std::int32_t required_pages{0};
-    std::int32_t capacity_pages{0};
-    std::string message;
-};
-
-struct SchedulerAbort {
-    std::string request_id;
-    std::string message;
-};
 
 class ExecutionPlan {
 public:
@@ -57,39 +38,15 @@ public:
         return *this;
     }
 
-    template <typename OperationType>
-    ExecutionPlan& With(std::vector<OperationType> ops) {
-        for (auto& op : ops) {
-            operations_.emplace_back(std::move(op));
-        }
-        return *this;
-    }
-
-    ExecutionPlan& WithSchedulerAborts(std::vector<SchedulerAbort> aborts) {
-        scheduler_aborts_ = std::move(aborts);
-        return *this;
-    }
-
     const std::vector<Operation>& Operations() const { return operations_; }
-    const std::vector<SchedulerAbort>& SchedulerAborts() const { return scheduler_aborts_; }
 
-    // Flat KV-cache: requests terminalized this round as OOM -- the pool was wedged by
-    // unretractable mid-prefill holders (possibly the request itself, or a mutual wedge)
-    // with no Decoding/PrefillDone victim to retract. Always empty on the radix path.
-    std::vector<std::string> flat_oom_request_ids;
-    // Structured companion to flat_oom_request_ids. The legacy ID vector is
-    // retained for runtime compatibility while callers migrate to precise
-    // phase/reason diagnostics.
-    std::vector<FlatTerminalError> flat_terminal_errors;
-
-    // Flat KV-cache child pages newly assigned in this plan. Group identity is
+    // Cache child pages newly assigned in this plan. Group identity is
     // required because one LCM parent can still contain live sibling children.
     // The runtime clears these exact byte ranges before transfers/forward.
-    std::map<std::string, std::vector<std::int32_t>> flat_pages_to_zero;
+    std::map<std::string, std::vector<std::int32_t>> pages_to_zero;
 
 private:
     std::vector<Operation> operations_;
-    std::vector<SchedulerAbort> scheduler_aborts_;
 };
 
 }  // namespace tokenspeed

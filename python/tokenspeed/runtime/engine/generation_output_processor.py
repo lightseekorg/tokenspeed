@@ -422,10 +422,11 @@ class OutputProcesser:
             state.set_finish_with_abort("AbortReq from client")
 
     def publish_finished_at_admission(self, rid: str, state: RequestState) -> None:
-        """Stream and release a request finished outside normal forward output.
+        """Stream a finish for a request that was finished before admission.
 
-        Used for grammar admission failures and scheduler-internal aborts so
-        the client receives a finish reason without another forward step.
+        Used for grammar-aborted requests (invalid/timed-out compile, missing
+        backend) so the client gets a finish_reason without us wasting a
+        scheduler slot or a forward step on them.
         """
         self.rid_to_state[rid] = state
         try:
@@ -434,8 +435,9 @@ class OutputProcesser:
         finally:
             state.release_pending_multimodal_features()
             self.rid_to_state.pop(rid, None)
-            # Drop any queued abort marker so pending_aborts does not leak and
-            # a reused rid is not immediately re-aborted on the next register.
+            # This path replaces register() for grammar-aborted rids —
+            # drop any queued abort marker so pending_aborts doesn't leak
+            # and a reused rid isn't instantly re-aborted on next register.
             self.pending_aborts.pop(rid, None)
 
     def reap_finished_orphan(self, rid: str, state: RequestState) -> None:
@@ -450,15 +452,6 @@ class OutputProcesser:
             self.publish_finished_at_admission(rid, state)
         else:
             self.rid_to_state.pop(rid, None)
-
-    def publish_scheduler_abort(self, rid: str, message: str) -> None:
-        """Publish a terminal error decided internally by the scheduler."""
-        state = self.rid_to_state.get(rid)
-        if state is None:
-            return
-        state.set_finish_with_abort(message, notify_client=True)
-        self._log_request_stats(rid, state, time.time())
-        self.publish_finished_at_admission(rid, state)
 
     def _host_advance_matcher(self, completion, model_execution_results):
         """Host-side fallback for the grammar matcher advance.
@@ -616,10 +609,10 @@ class OutputProcesser:
             else None
         )
         # Per-slot total prefill length as the OP sees it (C++ Request::PrefillSize()).
-        # After a flat retract the victim's generated tokens are rebased into the
+        # After a retract the victim's generated tokens are rebased into the
         # prefill window (RebasePrefill), so this can exceed the original prompt
         # length that RequestState.prefill_finished compares against.
-        prefill_lengths = getattr(forward_op, "prefill_lengths", None)
+        prefill_lengths = forward_op.prefill_lengths
         pt = 0
         for i, rid in enumerate(forward_op.request_ids):
             output_length = model_execution_results.output_lengths[i].item()
@@ -645,11 +638,10 @@ class OutputProcesser:
             # scheduled_time is stamped pre-forward in the event loop (queue end)
 
             # Mid-chunk extend slot by the op's own prefill_lengths (rebased after
-            # flat retract; C++ owes no result and the sampled token is garbage).
+            # retract; C++ owes no result and the sampled token is garbage).
             # Fresh requests: prefill_length == prompt length, same as the gate below.
             if (
                 not is_decode_slot
-                and prefill_lengths is not None
                 and forward_op.extend_prefix_lens[i] + forward_op.input_lengths[i]
                 < prefill_lengths[i]
             ):
@@ -835,7 +827,7 @@ class OutputProcesser:
     def finish_remote_prefill_only_request(self, req_id: str) -> list:
         """Finish after remote prefill when no decode step is needed.
 
-        FlatKV Prefill computes the first real output token.  A one-token
+        Paged cache Prefill computes the first real output token.  A one-token
         request is therefore already complete when Decode receives
         ``RemotePrefillDoneEvent`` and must not be scheduled for an additional
         decode forward. An aborted request follows the same transport fence

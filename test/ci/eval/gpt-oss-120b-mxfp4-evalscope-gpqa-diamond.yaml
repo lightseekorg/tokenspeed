@@ -13,11 +13,9 @@ runner:
     b200-2gpu:
       GPT_OSS_EVAL_MODEL: openai/gpt-oss-120b
     amd-mi35x-2gpu-test:
-      GPT_OSS_EVAL_DISABLE_KVSTORE: "1"
       GPT_OSS_EVAL_MODEL: amd/gpt-oss-120b-w-mxfp4-a-fp8
 env:
   CI: "true"
-  TOKENSPEED_FLAT_KV: "ON"
 install:
   - bash test/ci_system/install_deps.sh
 server:
@@ -29,7 +27,7 @@ server:
     --max-model-len 80000
     --trust-remote-code
     --reasoning-parser base
-    ${GPT_OSS_EVAL_DISABLE_KVSTORE:+--disable-kvstore}
+    --disable-kvstore
     --enable-cache-report
     --host 127.0.0.1
     --port 8000

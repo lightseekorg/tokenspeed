@@ -32,10 +32,12 @@ Covers:
 
 import pytest
 from tokenspeed_scheduler import (
-    Cache,
     ExecutionEvent,
     ExecutionPlan,
     ForwardEvent,
+    PagedCacheGroupConfig,
+    PagedCacheGroupFamily,
+    PagedCacheRetention,
     RequestSpec,
     Scheduler,
     SchedulerConfig,
@@ -57,6 +59,16 @@ def make_config(
     cfg.max_scheduled_tokens = max_scheduled_tokens
     cfg.max_batch_size = max_batch_size
     cfg.num_device_pages = num_device_pages
+    cfg.paged_cache_groups = [
+        PagedCacheGroupConfig(
+            group_id="full_attention",
+            rows_per_page=page_size,
+            entry_stride_tokens=1,
+            total_pages=num_device_pages,
+            retention=PagedCacheRetention.FullHistory,
+            family=PagedCacheGroupFamily.History,
+        )
+    ]
     return cfg
 
 
@@ -88,9 +100,16 @@ def advance_forward(
 
 
 def get_forward_op(plan: ExecutionPlan):
-    """Return the single FlatForwardOp from a plan, or None."""
+    """Return the single Batch from a plan, or None."""
     ops = plan.forward
     return ops[0] if ops else None
+
+
+def first_group_page_count(op, request_id: str) -> int:
+    """Return the authoritative page count for one request's first cache group."""
+    row = op.request_ids.index(request_id)
+    table = next(iter(dict(op.block_tables).values()))
+    return len([page for page in table[row] if page >= 0])
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +187,7 @@ class TestFSMTransitions:
         s.next_execution_plan()  # r0 erased (FinishEvent was already applied via advance)
 
         assert s.decoding_size() == 0
-        assert s.get_request_token_size("r0") == -1
+        assert s.request_token_size("r0") == -1
 
     def test_output_tokens_appended_via_advance(self):
         """advance with tokens extends the token container."""
@@ -181,7 +200,7 @@ class TestFSMTransitions:
         assert decode_plan.forward[0].num_extends() == 0
 
         advance_forward(s, "r0", tokens=[99])
-        assert s.get_request_token_size("r0") == 5  # 4 input + 1 output
+        assert s.request_token_size("r0") == 5  # 4 input + 1 output
 
 
 # ---------------------------------------------------------------------------
@@ -233,7 +252,7 @@ class TestChunkedPrefill:
 
         plan = s.next_execution_plan()
         assert plan.forward[0].num_extends() > 0
-        assert s.get_request_token_size("r0") == 20
+        assert s.request_token_size("r0") == 20
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +317,9 @@ class TestPrefillFirst:
         assert op.num_extends() == 1
         assert len(op.input_ids) == sum(op.input_lengths[: op.num_extends()])
         assert len(op.input_ids) + len(op.decode_input_ids) == sum(op.input_lengths)
-        assert op.sizes == [1, 0]
+        assert [
+            first_group_page_count(op, request_id) for request_id in op.request_ids
+        ] == [1, 1]
 
     def test_mixed_prefill_decode_decode_not_starved_by_long_prefill(self):
         """Decode-first priority: active decode is scheduled even when a long prefill would consume the full budget."""
@@ -315,7 +336,7 @@ class TestPrefillFirst:
         plan = s.next_execution_plan()
         op = plan.forward[0]
 
-        # Layout is prefill-first/decode-second (FlatForwardOperation::stable_partition).
+        # Layout is prefill-first/decode-second (ForwardBatch::stable_partition).
         assert op.request_ids == ["r1", "r0"]
         assert op.num_extends() == 1
         # r0 decode = 1 token; r1 prefill chunk takes the remaining 15.
@@ -387,7 +408,7 @@ class TestDecodeBatch:
         send_reserve_num_tokens(s, "r1", 0)
         plan = s.next_execution_plan()
 
-        assert s.get_request_token_size("r0") == -1  # erased
+        assert s.request_token_size("r0") == -1  # erased
         assert s.decoding_size() == 1  # r1 still decoding
         assert plan.forward[0].num_extends() == 0
         assert plan.forward[0].request_ids == ["r1"]
@@ -404,7 +425,7 @@ class TestDecodeBatch:
             plan = s.next_execution_plan()
             assert plan.forward[0].num_extends() == 0
             advance_forward(s, "r0", tokens=[100 + step])
-            assert s.get_request_token_size("r0") == 4 + step + 1
+            assert s.request_token_size("r0") == 4 + step + 1
 
 
 # ---------------------------------------------------------------------------
@@ -548,7 +569,7 @@ class TestUpdateReserveNumTokens:
         )  # Decoding: allocates 1 extra page for reserve=16
         op = decode_plan.forward[0]
         assert op.num_extends() == 0
-        assert op.sizes[0] == 1
+        assert first_group_page_count(op, "r0") == 2
 
     def test_reserve_update_overrides_previous_value(self):
         """The last UpdateReserveNumTokens wins; earlier values are discarded."""
@@ -561,7 +582,7 @@ class TestUpdateReserveNumTokens:
         s.advance(make_update_reserve_event("r0", 1))  # fits in tail, no extra page
 
         decode_plan = s.next_execution_plan()
-        assert decode_plan.forward[0].sizes[0] == 0
+        assert first_group_page_count(decode_plan.forward[0], "r0") == 1
 
     def test_reserve_larger_than_one_page_allocates_multiple_pages(self):
         """A reserve requiring more than one extra page allocates all of them."""
@@ -577,7 +598,7 @@ class TestUpdateReserveNumTokens:
         decode_plan = s.next_execution_plan()  # allocates pages for reserve=20
         op = decode_plan.forward[0]
         assert op.num_extends() == 0
-        assert op.sizes[0] > 1  # multiple extra pages allocated
+        assert first_group_page_count(op, "r0") > 2
 
     def test_reserve_auto_resets_after_allocation(self):
         """After decode allocates for reserve, subsequent steps need no extra pages if reserve is small."""
@@ -593,7 +614,7 @@ class TestUpdateReserveNumTokens:
         # Next decode: set reserve=0 (small), tail has capacity → no extra page
         s.advance(make_update_reserve_event("r0", 0))
         next_plan = s.next_execution_plan()
-        assert next_plan.forward[0].sizes[0] == 0
+        assert first_group_page_count(next_plan.forward[0], "r0") == 2
 
     def test_reserve_updated_during_decoding(self):
         """UpdateReserveNumTokens applied while already Decoding takes effect next decode step."""
@@ -605,7 +626,7 @@ class TestUpdateReserveNumTokens:
         s.advance(make_update_reserve_event("r0", 16))
 
         next_plan = s.next_execution_plan()  # allocates 1 extra page for reserve=16
-        assert next_plan.forward[0].sizes[0] == 1
+        assert first_group_page_count(next_plan.forward[0], "r0") == 2
 
     def test_reserve_on_prefill_done_state(self):
         """UpdateReserveNumTokens can only be applied in Decoding state (not PrefillDone).
@@ -621,16 +642,14 @@ class TestUpdateReserveNumTokens:
         # PrefillDone uses its built-in reserve (decode_input_tokens=1): tail has capacity → sizes[0]==0.
         first_decode = s.next_execution_plan()  # PrefillDone → Decoding
         assert first_decode.forward[0].num_extends() == 0
-        assert (
-            first_decode.forward[0].sizes[0] == 0
-        )  # no extra page: reserve=1 fits in tail
+        assert first_group_page_count(first_decode.forward[0], "r0") == 1
 
         # Now r0 is Decoding. Set reserve=16 which needs 1 extra page.
         s.advance(make_update_reserve_event("r0", 16))
         decode_plan = s.next_execution_plan()
         op = decode_plan.forward[0]
         assert op.num_extends() == 0
-        assert op.sizes[0] == 1
+        assert first_group_page_count(op, "r0") == 2
 
     def test_reserve_independent_per_request(self):
         """Reserve settings on one request do not affect another in the same batch."""
@@ -651,8 +670,9 @@ class TestUpdateReserveNumTokens:
         op = decode_plan.forward[0]
         r0_idx = op.request_ids.index("r0")
         r1_idx = op.request_ids.index("r1")
-        assert op.sizes[r0_idx] == 1  # r0: extra page needed for reserve=16
-        assert op.sizes[r1_idx] == 0  # r1: unaffected
+        first_table = next(iter(dict(op.block_tables).values()))
+        assert len([page for page in first_table[r0_idx] if page >= 0]) == 2
+        assert len([page for page in first_table[r1_idx] if page >= 0]) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -660,68 +680,8 @@ class TestUpdateReserveNumTokens:
 # ---------------------------------------------------------------------------
 
 
-def _make_retract_config(
-    page_size: int = 2, num_device_pages: int = 2, num_host_pages: int = 16
-) -> SchedulerConfig:
-    """Config with very limited device pages to force a retract quickly."""
-    cfg = SchedulerConfig()
-    cfg.block_size = page_size
-    cfg.num_device_pages = num_device_pages
-    cfg.num_host_pages = num_host_pages
-    cfg.max_scheduled_tokens = 512
-    cfg.max_batch_size = 8
-    return cfg
-
-
-def _send_write_back_done(scheduler: Scheduler, op_id: int) -> None:
-    ev = Cache.WriteBackDoneEvent()
-    ev.op_id = op_id
-    ev.success = True
-    ec = ExecutionEvent()
-    ec.add_event(ev)
-    scheduler.advance(ec)
-
-
-def _writeback_ops(plan: ExecutionPlan):
-    return [
-        cache_op for cache_op in plan.cache if isinstance(cache_op, Cache.WriteBackOp)
-    ]
-
-
-class TestWriteBackPriority:
-    def test_finish_writeback_is_not_retract_writeback(self):
-        s = Scheduler(_make_retract_config(page_size=2, num_device_pages=16))
-        submit(s, "r0", [10, 11])
-
-        s.next_execution_plan()
-        advance_forward(s, "r0", tokens=[42])
-        s.next_execution_plan()
-        advance_forward(s, "r0", finish=True)
-
-        plan = s.next_execution_plan()
-        writebacks = _writeback_ops(plan)
-
-        assert len(writebacks) == 1
-        assert writebacks[0].is_retract == [False]
-
-    def test_retract_writeback_is_marked_as_retract(self):
-        s = Scheduler(_make_retract_config(page_size=2, num_device_pages=3))
-        submit(s, "r0", [10, 11])
-
-        s.next_execution_plan()
-        advance_forward(s, "r0", tokens=[42])
-        s.next_execution_plan()
-        send_reserve_num_tokens(s, "r0", n=4)
-
-        plan = s.next_execution_plan()
-        writebacks = _writeback_ops(plan)
-
-        assert len(writebacks) == 1
-        assert writebacks[0].is_retract == [True]
-
-
 class TestDecodeInputIds:
-    """Verify that FlatForwardOperation.decode_input_ids is populated correctly."""
+    """Verify that ForwardBatch.decode_input_ids is populated correctly."""
 
     def test_normal_decode_has_minus_one(self):
         """Normal decode (not recovered from Retract) yields decode_input_ids == [-1]."""
@@ -732,40 +692,6 @@ class TestDecodeInputIds:
         op = decode_plan.forward[0]
         assert len(op.decode_input_ids) == 1
         assert op.decode_input_ids[0] == -1
-
-    def test_retract_recovered_carries_last_prefill_token(self):
-        """Retract-recovered request carries the last prefill token as decode_input_id."""
-        # page_size=2, 4 device pages allow prefill to enter Decoding, then reserve
-        # pressure triggers retract.
-        s = Scheduler(_make_retract_config(page_size=2, num_device_pages=4))
-        last_token = 77
-        submit(s, "r0", [10, last_token])  # exactly 1 page
-
-        s.next_execution_plan()  # Submitted → PrefillDone
-        advance_forward(s, "r0", tokens=[last_token])
-        s.next_execution_plan()  # PrefillDone → Decoding  (device now full)
-
-        # Force retract: reserve=4 needs 2 extra pages, but device is full.
-        send_reserve_num_tokens(s, "r0", n=4)
-        retract_plan = s.next_execution_plan()
-
-        # ACK the WriteBack op so request transitions to Retracted.
-        wb_op_id = None
-        for cache_op in retract_plan.cache:
-            if hasattr(cache_op, "op_ids") and cache_op.op_ids:
-                wb_op_id = cache_op.op_ids[0]
-                break
-        assert wb_op_id is not None, "Expected a WriteBack cache op"
-        _send_write_back_done(s, wb_op_id)
-
-        # Recovery plan: ScheduleDecodeFromRetractedEvent → decode_input_id = last_token.
-        recovery_plan = s.next_execution_plan()
-        assert recovery_plan.forward, "Expected forward op in recovery plan"
-        op = recovery_plan.forward[0]
-        assert len(op.decode_input_ids) > 0
-        assert (
-            op.decode_input_ids[0] == last_token
-        ), f"Expected {last_token}, got {op.decode_input_ids[0]}"
 
     def test_mixed_batch_decode_input_ids_length(self):
         """decode_input_ids has one entry per decode request; all -1 for normal decodes."""
