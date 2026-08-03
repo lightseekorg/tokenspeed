@@ -167,3 +167,38 @@ def test_batch_admission_debits_simulated_free_pages():
     plan = scheduler.next_execution_plan()
     admitted = _request_ids_in_plan(plan)
     assert len(admitted & {"r0", "r1"}) <= 1
+
+
+def test_group_tables_use_each_groups_cache_block_tokens():
+    cfg = _base_config(num_device_pages=17)
+    cfg.block_size = 8
+    cfg.paged_cache_groups = [
+        PagedCacheGroupConfig(
+            group_id="history",
+            rows_per_page=8,
+            entry_stride_tokens=1,
+            total_pages=17,
+            retention=PagedCacheRetention.FullHistory,
+            family=PagedCacheGroupFamily.History,
+        ),
+        PagedCacheGroupConfig(
+            group_id="state",
+            rows_per_page=2,
+            entry_stride_tokens=1,
+            total_pages=65,
+            cache_blocks_per_lcm_block=4,
+            retention=PagedCacheRetention.SlidingWindow,
+            sliding_window_tokens=4,
+            family=PagedCacheGroupFamily.State,
+        ),
+    ]
+    scheduler = Scheduler(cfg)
+    scheduler.submit_requests([_make_spec("r", list(range(8)))])
+
+    plan = scheduler.next_execution_plan()
+    operation = next(op for op in plan.forward if "r" in op.request_ids)
+    tables = dict(operation.block_tables)
+
+    # The first round covers eight prompt tokens plus one decode-reserve token.
+    assert len(tables["history"][0]) == 2
+    assert len(tables["state"][0]) == 5

@@ -223,6 +223,18 @@ protected:
     }
 };
 
+class PdSmallStatePagesTestSuite : public PdSparseDecodeAdmissionTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = PdSparseDecodeAdmissionTestSuite::MakeConfig();
+        auto& state = cfg.paged_cache_groups[1];
+        state.rows_per_page = 1;
+        state.total_pages = 11;
+        state.cache_blocks_per_lcm_block = 2;
+        return cfg;
+    }
+};
+
 TEST_F(PdSparseDecodeAdmissionTestSuite, MaterializesHistoryAndLatestStateSnapshotAtomically) {
     Submit({MakeRequestSpec("r0", /*num_pages=*/4, /*start=*/1)});
     SendBootstrapped("r0");
@@ -258,6 +270,21 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, MaterializesHistoryAndLatestStateSnapsh
     succeeded.With(PDEvent{pd::SucceededEvent{"r0"}});
     scheduler_->Advance(succeeded);
     EXPECT_EQ(scheduler_->PoolFreeBlocks(), 5);
+}
+
+TEST_F(PdSmallStatePagesTestSuite, LatestSnapshotUsesTheStateGroupsPageSize) {
+    Submit({MakeRequestSpec("r0", /*num_pages=*/4, /*start=*/1)});
+    SendBootstrapped("r0");
+
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* destination = FindForwardBatch(plan.Operations());
+    ASSERT_NE(destination, nullptr);
+
+    const auto& state = destination->block_tables.at("state").at(0);
+    ASSERT_EQ(state.size(), 9u);
+    EXPECT_TRUE(std::ranges::all_of(state.begin(), state.end() - 2, [](std::int32_t page_id) { return page_id == 0; }));
+    EXPECT_GT(state[state.size() - 2], 0);
+    EXPECT_GT(state.back(), 0);
 }
 
 TEST_F(PdSparseDecodeAdmissionTestSuite, ReusesHistoryPrefixAndLeavesStatePrefixSparse) {

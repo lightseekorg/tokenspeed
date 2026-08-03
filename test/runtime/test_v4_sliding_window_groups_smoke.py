@@ -346,7 +346,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             self.assertTrue(math.isfinite(n), spec.group_id)
             self.assertLess(n, bound, spec.group_id)
 
-    def test_lcm_specs_keep_uniform_scheduler_page_size_and_publish_packing(self):
+    def test_lcm_specs_preserve_group_page_sizes_and_publish_packing(self):
         packing = {
             "v4.swa_kv": 1,
             "v4.c4a.compressor_state": 16,
@@ -368,9 +368,9 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
         )
         self.assertTrue(all(spec.block_size is None for spec in specs))
         rows = {spec.group_id: spec.rows_per_page for spec in specs}
-        self.assertEqual(rows["v4.swa_kv"], 128)
-        self.assertEqual(rows["v4.c4a.compressor_state"], 8)
-        self.assertEqual(rows["v4.c128a.compressor_state"], 128)
+        self.assertEqual(rows["v4.swa_kv"], 64)
+        self.assertEqual(rows["v4.c4a.compressor_state"], 4)
+        self.assertEqual(rows["v4.c128a.compressor_state"], 8)
 
     def test_lcm_capacity_is_the_inverse_of_parent_demand(self):
         packing = {

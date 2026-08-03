@@ -114,7 +114,6 @@ Scheduler::Scheduler(SchedulerConfig config)
 
 std::int64_t Scheduler::singleRequestParentsRequired(std::int32_t token_limit) const {
     _assert(token_limit >= 0, "single-request token limit must be non-negative");
-    const std::int64_t page_tokens = coordinator_.CacheBlockTokens();
     const std::int64_t decode_width = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
     // An overlapped forward protects one additional decode reservation that
     // cannot yet be reclaimed from the request table.
@@ -128,6 +127,7 @@ std::int64_t Scheduler::singleRequestParentsRequired(std::int32_t token_limit) c
     std::int64_t required_parents = 0;
     for (std::int32_t i = 0; i < coordinator_.NumGroups(); ++i) {
         const KvCacheManager& manager = coordinator_.GroupManager(i);
+        const std::int64_t page_tokens = manager.CacheBlockTokens();
         std::int64_t child_pages = 0;
         if (manager.MatchIsPrefixClosed()) {
             child_pages = ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, page_tokens);

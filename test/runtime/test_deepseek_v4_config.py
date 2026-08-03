@@ -1648,14 +1648,37 @@ class TestDeepseekV4Config(unittest.TestCase):
             for spec in specs
         }
 
-        # ceil((4096 + 2 * 4) / 256) == 17 scheduler columns. State
-        # rings repeat inside each scheduler column; history remains 1:1.
-        self.assertEqual(widths[V4_SWA_KV_GROUP_ID], 17 * 2)
-        self.assertEqual(widths[v4_compressor_state_group_id(4)], 17 * 32)
-        self.assertEqual(widths[v4_compressor_state_group_id(128)], 17 * 2)
-        self.assertEqual(widths[V4_INDEXER_COMPRESSOR_STATE_GROUP_ID], 17 * 32)
+        # Scheduler tables retain absolute CacheBlock positions and represent
+        # expired sliding entries as holes. Graph buffers must therefore cover
+        # the full request extent at each group's own CacheBlock granularity.
+        self.assertEqual(widths[V4_SWA_KV_GROUP_ID], 65)
+        self.assertEqual(widths[v4_compressor_state_group_id(4)], 1026)
+        self.assertEqual(widths[v4_compressor_state_group_id(128)], 513)
+        self.assertEqual(widths[V4_INDEXER_COMPRESSOR_STATE_GROUP_ID], 1026)
         self.assertEqual(widths[v4_compressed_kv_group_id(4)], 17)
         self.assertEqual(widths[v4_compressed_kv_group_id(128)], 17)
+
+    def test_deepseek_v4_lcm_tables_are_already_kernel_ready(self):
+        backend = DeepseekV4AttentionBackend(
+            SimpleNamespace(
+                page_size=64,
+                device="cpu",
+                num_attention_heads=64,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                is_draft=False,
+                speculative_num_draft_tokens=1,
+                head_dim=512,
+                context_len=4096,
+                sliding_window_tokens=128,
+            )
+        )
+        table = torch.tensor([[11, 12, 13, 14]], dtype=torch.int32)
+
+        materialized = backend._prepare_cache_group_tables({V4_SWA_KV_GROUP_ID: table})
+
+        self.assertEqual(materialized[V4_SWA_KV_GROUP_ID].tolist(), table.tolist())
 
     def test_deepseek_v4_mixed_metadata_keeps_decode_rows_single_token(self):
         backend = DeepseekV4AttentionBackend(

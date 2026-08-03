@@ -226,11 +226,11 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         makeGroupDemands(tables, GroupDemand{.num_tokens = tokens_this_round, .reserve_tokens = decode_reserve});
 
     if (config_.enable_pd_cache && config_.role == Role::kD) {
-        const std::int32_t final_prompt_block = (request->PrefillSize() - 1) / coordinator_.CacheBlockTokens();
         for (std::size_t i = 0; i < demands.size(); ++i) {
             if (config_.paged_cache_groups[i].transfer_policy == PagedCacheTransferPolicy::LatestSnapshot) {
                 demands[i].num_tokens = request->PrefillSize();
-                demands[i].materialized_suffix_start = final_prompt_block;
+                demands[i].materialized_suffix_start =
+                    (request->PrefillSize() - 1) / coordinator_.GroupManager(i).CacheBlockTokens();
             }
         }
     }

@@ -49,6 +49,8 @@ struct CacheKey {
     CacheNamespaceId namespace_id{kDefaultCacheNamespaceId};
     GroupId group_id{0};
     ContentHash content_hash{};
+    // CacheBlock position within the scheduler's enclosing P-token hash page.
+    std::int32_t cache_block_offset{0};
 
     bool operator==(const CacheKey&) const noexcept = default;
 };
@@ -59,7 +61,9 @@ struct CacheKeyHash {
         const std::size_t group_hash = std::hash<GroupId>{}(key.group_id);
         hash ^= group_hash + 0x9e3779b9U + (hash << 6U) + (hash >> 2U);
         const std::size_t content_hash = std::hash<ContentHash>{}(key.content_hash);
-        return hash ^ (content_hash + 0x9e3779b9U + (hash << 6U) + (hash >> 2U));
+        hash ^= content_hash + 0x9e3779b9U + (hash << 6U) + (hash >> 2U);
+        const std::size_t offset_hash = std::hash<std::int32_t>{}(key.cache_block_offset);
+        return hash ^ (offset_hash + 0x9e3779b9U + (hash << 6U) + (hash >> 2U));
     }
 };
 
@@ -68,9 +72,12 @@ struct KvCacheSpec {
     // Only kSlidingWindow uses this value. Mamba's one-checkpoint lookback is
     // an internal Manager policy rather than a model window.
     std::int32_t sliding_window;
-    // Number of this group's logical cache blocks packed into one physical
-    // LCM block. It affects placement only, never prefix-match granularity.
+    // Number of this group's CacheBlocks packed into one physical LCM block.
+    // It affects placement only, not the scheduler-wide prefix boundary P.
     std::int32_t cache_blocks_per_lcm_block;
+    // Tokens represented by one CacheBlock in this group. Zero keeps the
+    // legacy meaning: use the coordinator-wide logical granularity P.
+    std::int32_t cache_block_tokens{0};
 };
 
 // Per-request logical-page -> physical-page mapping.

@@ -150,9 +150,9 @@ private:
                                          std::int32_t floor_tokens, PrefixProbe::Tier&& probe,
                                          std::uint64_t access_epoch);
     AcquiredPrefix acquirePrefix(PrefixProbe&& probe, std::uint64_t access_epoch);
-    void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table,
-                                 std::span<const std::string> content_hashes, std::int32_t first_slot,
-                                 std::uint64_t access_epoch, CacheBoundaryKind boundary_kind);
+    void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table, std::span<const CacheKey> keys,
+                                 std::int32_t first_cache_block, std::uint64_t access_epoch,
+                                 CacheBoundaryKind boundary_kind);
     void cacheCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand, std::uint64_t access_epoch);
     bool evictCachedBlock(GroupId group_id, CacheBlockLocation location);
     std::vector<CacheGroup> groups_;
@@ -166,7 +166,8 @@ private:
     CacheMutationSink cache_mutation_sink_;
 };
 
-// One CacheGroup per spec (group_id = index), all sharing cache_block_tokens.
+// One CacheGroup per spec (group_id = index), sharing one scheduler prefix
+// domain P while each manager may use a smaller cache-page token count.
 KvCacheCoordinator MakeCoordinator(std::span<const KvCacheSpec> specs, std::int32_t cache_block_tokens, BlockPool& pool,
                                    BlockPool* host_pool = nullptr);
 

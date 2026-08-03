@@ -364,9 +364,13 @@ TEST(MakeSpecsFromConfigTest, TranslatesPagedCacheGroups) {
     config.block_size = 16;
     PagedCacheGroupConfig full_grp;
     full_grp.group_id = "full";
+    full_grp.rows_per_page = 16;
+    full_grp.entry_stride_tokens = 1;
     full_grp.retention = PagedCacheGroupConfig::Retention::FullHistory;
     PagedCacheGroupConfig swa_grp;
     swa_grp.group_id = "swa";
+    swa_grp.rows_per_page = 16;
+    swa_grp.entry_stride_tokens = 1;
     swa_grp.retention = PagedCacheGroupConfig::Retention::SlidingWindow;
     swa_grp.sliding_window_tokens = 128;
     config.paged_cache_groups = {full_grp, swa_grp};
@@ -386,9 +390,13 @@ TEST(MakeSpecsFromConfigTest, StateFamilyMapsToMambaStateKind) {
     config.block_size = 4;
     PagedCacheGroupConfig full_grp;
     full_grp.group_id = "full_attention";
+    full_grp.rows_per_page = 4;
+    full_grp.entry_stride_tokens = 1;
     full_grp.retention = PagedCacheGroupConfig::Retention::FullHistory;
     PagedCacheGroupConfig state_grp;
     state_grp.group_id = "linear_attention";
+    state_grp.rows_per_page = 4;
+    state_grp.entry_stride_tokens = 1;
     state_grp.family = PagedCacheGroupFamily::State;
     config.paged_cache_groups = {full_grp, state_grp};
 
@@ -405,9 +413,13 @@ TEST(MakeSpecsFromConfigTest, Qwen35Fp8UsesOneLogicalPAndPerGroupPacking) {
     config.block_size = 128;
     PagedCacheGroupConfig full;
     full.group_id = "full";
+    full.rows_per_page = 128;
+    full.entry_stride_tokens = 1;
     full.cache_blocks_per_lcm_block = 16;
     PagedCacheGroupConfig state0;
     state0.group_id = "state0";
+    state0.rows_per_page = 128;
+    state0.entry_stride_tokens = 1;
     state0.family = PagedCacheGroupFamily::State;
     PagedCacheGroupConfig state1 = state0;
     state1.group_id = "state1";
@@ -422,6 +434,27 @@ TEST(MakeSpecsFromConfigTest, Qwen35Fp8UsesOneLogicalPAndPerGroupPacking) {
     EXPECT_EQ(specs[1].cache_blocks_per_lcm_block, 1);
     EXPECT_EQ(specs[2].cache_blocks_per_lcm_block, 1);
     EXPECT_EQ(specs[3].cache_blocks_per_lcm_block, 1);
+}
+
+TEST(MakeSpecsFromConfigTest, PreservesPerGroupCachePageTokens) {
+    SchedulerConfig config;
+    config.block_size = 256;
+    PagedCacheGroupConfig history;
+    history.group_id = "history";
+    history.rows_per_page = 64;
+    history.entry_stride_tokens = 4;
+    PagedCacheGroupConfig state;
+    state.group_id = "compressor_state";
+    state.family = PagedCacheGroupFamily::State;
+    state.rows_per_page = 4;
+    state.entry_stride_tokens = 1;
+    config.paged_cache_groups = {history, state};
+
+    const std::vector<KvCacheSpec> specs = MakeSpecsFromConfig(config);
+
+    ASSERT_EQ(specs.size(), 2u);
+    EXPECT_EQ(specs[0].cache_block_tokens, 256);
+    EXPECT_EQ(specs[1].cache_block_tokens, 4);
 }
 
 TEST(MakeSpecsFromConfigTest, RejectsNonPositiveGlobalP) {
@@ -450,6 +483,8 @@ TEST(MakeSpecsFromConfigTest, RejectsMissingSlidingWindowWithGroupId) {
     config.block_size = 128;
     PagedCacheGroupConfig group;
     group.group_id = "missing_window";
+    group.rows_per_page = 128;
+    group.entry_stride_tokens = 1;
     group.retention = PagedCacheGroupConfig::Retention::SlidingWindow;
     config.paged_cache_groups = {group};
 
@@ -466,6 +501,8 @@ TEST(MakeSpecsFromConfigTest, RejectsNonPositiveSlidingWindowWithGroupId) {
     config.block_size = 128;
     PagedCacheGroupConfig group;
     group.group_id = "nonpositive_window";
+    group.rows_per_page = 128;
+    group.entry_stride_tokens = 1;
     group.retention = PagedCacheGroupConfig::Retention::SlidingWindow;
     config.paged_cache_groups = {group};
 

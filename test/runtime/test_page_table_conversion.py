@@ -91,53 +91,6 @@ class PageTableConversionTest(unittest.TestCase):
         self.assertEqual(actual.data_ptr(), table.data_ptr())
         self.assertEqual(actual.tolist(), [[3, 5, -1]])
 
-    def test_repeats_sliding_ring_page_across_logical_block(self):
-        logical = torch.tensor([[0, 3, -1]], dtype=torch.int32)
-
-        actual = self.module.repeat_page_table(
-            logical,
-            logical_page_tokens=256,
-            retained_span_tokens=128,
-        )
-
-        self.assertEqual(
-            actual.tolist(),
-            [[0, 0, 3, 3, 0, 0]],
-        )
-
-    def test_repeats_one_state_checkpoint_across_a_logical_block(self):
-        logical = torch.tensor([[2, 5]], dtype=torch.int32)
-
-        actual = self.module.repeat_page_table(
-            logical,
-            logical_page_tokens=256,
-            retained_span_tokens=8,
-        )
-
-        self.assertEqual(tuple(actual.shape), (1, 64))
-        self.assertEqual(actual[0, :32].tolist(), [2] * 32)
-        self.assertEqual(actual[0, 32:].tolist(), [5] * 32)
-
-    def test_compressed_history_keeps_one_kernel_page_per_logical_block(self):
-        logical = torch.tensor([[2, 5]], dtype=torch.int32)
-
-        actual = self.module.repeat_page_table(
-            logical,
-            logical_page_tokens=256,
-            retained_span_tokens=256,
-        )
-
-        self.assertEqual(actual.data_ptr(), logical.data_ptr())
-        self.assertEqual(actual.tolist(), [[2, 5]])
-
-    def test_rejects_ring_geometry_that_does_not_tile_the_logical_page(self):
-        with self.assertRaisesRegex(ValueError, "must divide"):
-            self.module.repeat_page_table(
-                torch.tensor([[1]], dtype=torch.int32),
-                logical_page_tokens=256,
-                retained_span_tokens=96,
-            )
-
 
 if __name__ == "__main__":
     unittest.main()

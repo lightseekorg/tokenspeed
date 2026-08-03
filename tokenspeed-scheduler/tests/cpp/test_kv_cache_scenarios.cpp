@@ -1459,6 +1459,16 @@ TEST_F(RetractExactFitSuite, ReportsSingleRequestTokenCapacity) {
     EXPECT_EQ(scheduler_->MaxSingleRequestTokens(), 8);
 }
 
+TEST_F(RetractExactFitSuite, ReportsCapacityUsingEachGroupsCachePageSize) {
+    SchedulerConfig config = MakeConfig();
+    config.paged_cache_groups[1].rows_per_page = 1;
+    Scheduler scheduler{std::move(config)};
+
+    // Eight parents fit ceil(tokens / 2) pages for the first group and one
+    // page per token for the second group. Five tokens use 3 + 5 parents.
+    EXPECT_EQ(scheduler.MaxSingleRequestTokens(), 5);
+}
+
 TEST_F(RetractExactFitSuite, IncludesOverlapDecodeReserveInTokenCapacity) {
     SchedulerConfig config = MakeConfig();
     config.overlap_schedule_depth = 1;

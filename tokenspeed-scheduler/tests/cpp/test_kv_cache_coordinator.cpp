@@ -69,8 +69,12 @@ std::uint64_t NextTestAccessEpoch() {
     return ++next_access_epoch;
 }
 
-CacheKey Key(const std::string& content_hash, GroupId group_id) {
-    return CacheKey{.group_id = group_id, .content_hash = content_hash};
+CacheKey Key(const std::string& content_hash, GroupId group_id, std::int32_t cache_block_offset = 0) {
+    return CacheKey{
+        .group_id = group_id,
+        .content_hash = content_hash,
+        .cache_block_offset = cache_block_offset,
+    };
 }
 
 // Cache then free, so the block is prefix-hittable via MatchPrefix.
@@ -162,6 +166,55 @@ TEST(MakeCoordinatorTest, Qwen35UsesUniformLogicalPWithDifferentPacking) {
     }
 }
 
+TEST(MakeCoordinatorTest, ManagersMayUseSmallerPagesThanTheCoordinatorDomain) {
+    BlockPool pool(32);
+    const std::vector<KvCacheSpec> specs = {
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .cache_block_tokens = 8},
+        {.kind = AttnKind::kSlidingWindow,
+         .sliding_window = 8,
+         .cache_blocks_per_lcm_block = 3,
+         .cache_block_tokens = 2},
+    };
+
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, /*cache_block_tokens=*/8, pool);
+
+    EXPECT_EQ(coordinator.CacheBlockTokens(), 8);
+    EXPECT_EQ(coordinator.GroupManager(0).CacheBlockTokens(), 8);
+    EXPECT_EQ(coordinator.GroupManager(1).CacheBlockTokens(), 2);
+}
+
+TEST(KvCacheCoordinatorTest, ExpandsOneLogicalHashIntoPerGroupCacheBlocks) {
+    BlockPool pool(32);
+    const std::vector<KvCacheSpec> specs = {
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .cache_block_tokens = 8},
+        {.kind = AttnKind::kSlidingWindow,
+         .sliding_window = 5,
+         .cache_blocks_per_lcm_block = 3,
+         .cache_block_tokens = 2},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, /*cache_block_tokens=*/8, pool);
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/8));
+    ASSERT_EQ(tables[0].NumBlocks(), 1);
+    ASSERT_EQ(tables[1].NumBlocks(), 4);
+
+    const std::vector<std::string> hashes = ContentHashes({std::vector<std::int32_t>(8, 7)});
+    coordinator.CacheCompletedBlocks(tables, hashes, NextTestAccessEpoch(), /*first_new_page=*/0,
+                                     /*num_computed_tokens=*/8, CacheBoundaryKind::kChunk);
+    EXPECT_TRUE(coordinator.GroupManager(0).ContainsCachedBlock(pool, Key(hashes[0], 0)));
+    EXPECT_FALSE(coordinator.GroupManager(1).ContainsCachedBlock(pool, Key(hashes[0], 1, 0)));
+    EXPECT_FALSE(coordinator.GroupManager(1).ContainsCachedBlock(pool, Key(hashes[0], 1, 1)));
+    EXPECT_TRUE(coordinator.GroupManager(1).ContainsCachedBlock(pool, Key(hashes[0], 1, 2)));
+    EXPECT_TRUE(coordinator.GroupManager(1).ContainsCachedBlock(pool, Key(hashes[0], 1, 3)));
+    coordinator.Free(tables);
+
+    const KvCacheCoordinator::PrefixProbe probe = coordinator.ProbePrefix(hashes);
+    EXPECT_EQ(probe.device.num_common_tokens, 8);
+    ASSERT_EQ(probe.device.per_group[0].hits.size(), 1u);
+    ASSERT_EQ(probe.device.per_group[1].hits.size(), 4u);
+    EXPECT_EQ(probe.device.per_group[1].hits, (std::vector<std::uint8_t>{0, 0, 1, 1}));
+}
+
 TEST(MakeCoordinatorTest, RejectsNonPositiveLogicalPOrPacking) {
     BlockPool pool(8);
     const std::vector<KvCacheSpec> valid = {
@@ -217,7 +270,7 @@ TEST(KvCacheManagerTest, ResolvesAffineKernelPageIdsAndRejectsInvalidLocations) 
                  std::runtime_error);
 }
 
-TEST(CacheKeyTest, NamespaceAndGroupArePartOfIdentity) {
+TEST(CacheKeyTest, NamespaceGroupAndOffsetArePartOfIdentity) {
     const CacheKey base{
         .namespace_id = kDefaultCacheNamespaceId,
         .group_id = 0,
@@ -227,9 +280,12 @@ TEST(CacheKeyTest, NamespaceAndGroupArePartOfIdentity) {
     other_group.group_id = 1;
     CacheKey other_namespace = base;
     other_namespace.namespace_id = 7;
+    CacheKey other_offset = base;
+    other_offset.cache_block_offset = 1;
 
     EXPECT_NE(base, other_group);
     EXPECT_NE(base, other_namespace);
+    EXPECT_NE(base, other_offset);
 }
 
 TEST(CacheKeyTest, HashPreservesNamespaceGroupAndContentIdentity) {
@@ -244,11 +300,13 @@ TEST(CacheKeyTest, HashPreservesNamespaceGroupAndContentIdentity) {
     other_group.group_id = 1;
     CacheKey other_content = base;
     other_content.content_hash = "other";
+    CacheKey other_offset = base;
+    other_offset.cache_block_offset = 1;
 
     std::unordered_set<CacheKey, CacheKeyHash> keys{
-        base, base, other_namespace, other_group, other_content,
+        base, base, other_namespace, other_group, other_content, other_offset,
     };
-    EXPECT_EQ(keys.size(), 4u);
+    EXPECT_EQ(keys.size(), 5u);
 }
 
 TEST(MakeCoordinatorTest, UsesOneLogicalGranularityAcrossGroups) {

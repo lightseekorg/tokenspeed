@@ -267,13 +267,6 @@ def build_v4_cache_specs(
     return [
         replace(
             spec,
-            # One LCM CacheBlock owns the complete live ring. The backend
-            # repeats that block in its kernel table across the P=256 span.
-            rows_per_page=(
-                spec.sliding_window_tokens // spec.entry_stride_tokens
-                if spec.retention == "sliding_window"
-                else spec.rows_per_page
-            ),
             cache_blocks_per_lcm_block=packing[spec.group_id],
         )
         for spec in specs
@@ -291,21 +284,20 @@ def deepseek_v4_lcm_blocks_needed(
     decode_input_tokens: int = 1,
     overlap_schedule_depth: int = 0,
 ) -> int:
-    """Return physical parents needed by P-granular scheduler tables."""
+    """Return physical parents needed by per-group CacheBlock tables."""
     if logical_block_tokens <= 0:
         raise ValueError("logical_block_tokens must be positive")
     if token_capacity <= 0:
         raise ValueError("token_capacity must be positive")
-    scheduler_specs = tuple(
-        replace(
-            spec,
-            rows_per_page=logical_block_tokens,
-            entry_stride_tokens=1,
-        )
-        for spec in specs
-    )
+    for spec in specs:
+        cache_block_tokens = int(spec.rows_per_page) * int(spec.entry_stride_tokens)
+        if cache_block_tokens <= 0 or logical_block_tokens % cache_block_tokens:
+            raise ValueError(
+                f"group {spec.group_id!r} cache block tokens must divide "
+                f"logical_block_tokens={logical_block_tokens}"
+            )
     counts = compute_paged_cache_group_page_counts(
-        scheduler_specs,
+        specs,
         max_live_requests=max_live_requests,
         max_scheduled_tokens=max_scheduled_tokens,
         max_total_tokens=token_capacity,
@@ -314,7 +306,7 @@ def deepseek_v4_lcm_blocks_needed(
         overlap_schedule_depth=overlap_schedule_depth,
     )
     parents = 0
-    for spec in scheduler_specs:
+    for spec in specs:
         child_pages = counts[spec.group_id] - 1  # page 0 is the null page
         packing = spec.cache_blocks_per_lcm_block
         parents += (child_pages + packing - 1) // packing

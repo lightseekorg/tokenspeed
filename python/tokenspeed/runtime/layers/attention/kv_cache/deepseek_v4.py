@@ -779,7 +779,7 @@ def build_deepseek_v4_lcm_fields(
     }
     compressor_state_shapes = {
         ratio: (
-            8 if ratio == 4 else 128,
+            layout.compressor_state_block_size(ratio),
             layout.head_dim * (2 if ratio == 4 else 1) * 2,
         )
         for ratio in set(layout.layer_ratio)
@@ -788,11 +788,14 @@ def build_deepseek_v4_lcm_fields(
     return deepseek_v4_lcm_fields(
         layer_ratios=layout.layer_ratio,
         logical_block_tokens=logical_block_tokens,
-        swa_shape=(layout.swa_block_bytes(sliding_window),),
+        swa_shape=(layout.swa_block_bytes(V4_KERNEL_BLOCK_ROWS),),
         compressed_shapes=compressed_shapes,
         compressor_state_shapes=compressor_state_shapes,
         indexer_kv_shape=(V4_KERNEL_BLOCK_ROWS, layout.indexer_row_bytes),
-        indexer_state_shape=(8, layout.index_head_dim * 2 * 2),
+        indexer_state_shape=(
+            layout.compressor_state_block_size(4),
+            layout.index_head_dim * 2 * 2,
+        ),
         kv_page_stride_alignment_bytes=layout.swa_token_stride,
     )
 
