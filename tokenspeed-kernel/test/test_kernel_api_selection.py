@@ -89,14 +89,11 @@ from tokenspeed_kernel.ops.attention.triton import (
     mla_prefill as _attention_triton_mla_prefill,
 )
 from tokenspeed_kernel.ops.attention.triton import rel_mha as _attention_triton_rel_mha
-from tokenspeed_kernel.ops.moe.deep_gemm import deepep_fp8 as _moe_deep_gemm_deepep_fp8
 from tokenspeed_kernel.ops.moe.flashinfer import (
     cutedsl_deepep_nvfp4 as _moe_cutedsl_deepep_nvfp4,
 )
-from tokenspeed_kernel.ops.moe.flashinfer import cutlass_fp8 as _moe_cutlass_fp8
 from tokenspeed_kernel.ops.moe.flashinfer import cutlass_nvfp4 as _moe_cutlass_nvfp4
 from tokenspeed_kernel.ops.moe.flashinfer import cutlass_unquant as _moe_cutlass_unquant
-from tokenspeed_kernel.ops.moe.flashinfer import trtllm_fp8 as _moe_trtllm_fp8
 from tokenspeed_kernel.ops.moe.flashinfer import trtllm_mxfp4 as _moe_trtllm_mxfp4
 from tokenspeed_kernel.ops.moe.flashinfer import trtllm_mxint4 as _moe_trtllm_mxint4
 from tokenspeed_kernel.ops.moe.flashinfer import trtllm_nvfp4 as _moe_trtllm_nvfp4
@@ -136,13 +133,10 @@ _RELOAD_MODULES = [
     _gemm_trtllm,
     _gemm_pkg,
     # MoE registration modules.
-    _moe_deep_gemm_deepep_fp8,
     _moe_deep_gemm,
     _moe_cutedsl_deepep_nvfp4,
-    _moe_cutlass_fp8,
     _moe_cutlass_nvfp4,
     _moe_cutlass_unquant,
-    _moe_trtllm_fp8,
     _moe_trtllm_mxfp4,
     _moe_trtllm_mxint4,
     _moe_trtllm_nvfp4,
@@ -249,26 +243,12 @@ def _is_blackwell_plus(platform: PlatformInfo) -> bool:
     return platform.is_blackwell_plus
 
 
-def _is_hopper_plus(platform: PlatformInfo) -> bool:
-    return platform.is_nvidia and platform.arch_version >= ArchVersion(9, 0)
-
-
 def _is_nvidia(platform: PlatformInfo) -> bool:
     return platform.is_nvidia
 
 
 def _is_nvidia_with_cute_dsl(platform: PlatformInfo) -> bool:
     return platform.is_nvidia and _sampling_cute_dsl.is_available()
-
-
-def _is_hopper_plus_with_deep_gemm(platform: PlatformInfo) -> bool:
-    # The FP8 DeepEP apply kernel only registers when the optional DeepGEMM
-    # package exposes the masked grouped GEMM, so gate on that too.
-    return (
-        platform.is_nvidia
-        and platform.arch_version >= ArchVersion(9, 0)
-        and _moe_deep_gemm_deepep_fp8.m_grouped_fp8_gemm_nt_masked is not None
-    )
 
 
 def _is_cdna4(platform: PlatformInfo) -> bool:
@@ -1187,7 +1167,6 @@ def _assert_moe_plan(plan: dict, *, apply: str, preprocessor: str | None) -> Non
             "low_latency",
             "flashinfer_cutedsl_deepep_nvfp4_moe_apply",
         ),
-        ("b200_platform", "fp8", "auto", "deep_gemm_deepep_fp8_moe_apply"),
     ],
 )
 def test_deepep_selects_apply_kernel_by_weight_dtype_without_pinned_solution(
@@ -1270,7 +1249,6 @@ def test_nvfp4_deepep_rejects_modes_without_normal_legs(
     "kernel_name",
     [
         "flashinfer_cutedsl_deepep_nvfp4_moe_apply",
-        "deep_gemm_deepep_fp8_moe_apply",
     ],
 )
 def test_deepep_apply_kernels_only_register_bf16(kernel_name: str) -> None:
@@ -1279,42 +1257,6 @@ def test_deepep_apply_kernels_only_register_bf16(kernel_name: str) -> None:
     if spec is None:
         pytest.skip(f"{kernel_name!r} is unavailable (optional backend missing)")
     assert spec.storage_dtypes_for_role("x") == frozenset({torch.bfloat16})
-
-
-def test_deepep_plan_carries_mode_and_low_latency_capacity(b200_platform) -> None:
-    """Mode and capacity live on the plan, not on the first forward's shapes.
-
-    The DeepEP buffer is allocated once, when a layer first dispatches. Sizing
-    the low-latency legs from that batch would make decode depend on whichever
-    batch arrived first, so the plan pins both up front.
-    """
-    registry = KernelRegistry.get()
-    kernel_name = "deep_gemm_deepep_fp8_moe_apply"
-    if registry.get_by_name(kernel_name) is None:
-        pytest.skip(f"{kernel_name!r} is unavailable (optional backend missing)")
-
-    real_platform = Platform.get()
-    try:
-        Platform.override(b200_platform)
-        registry.clear_cache()
-        plan = tokenspeed_kernel.moe_plan(
-            "fp8",
-            input_dtype=torch.bfloat16,
-            activation="silu",
-            a2a_backend="deepep",
-            ep_size=2,
-            ispp=256,
-            fp8_scale_block_shape=(128, 128),
-            deepep_group=object(),
-            deepep_mode="auto",
-            deepep_low_latency_max_num_tokens_per_gpu=256,
-        )
-    finally:
-        Platform.override(real_platform)
-        registry.clear_cache()
-
-    assert plan["deepep_mode"] == "auto"
-    assert plan["deepep_low_latency_max_num_tokens_per_gpu"] == 256
 
 
 def test_moe_plan_defaults_deepep_mode_to_auto() -> None:
@@ -1639,46 +1581,6 @@ def _moe_apply_unquant_cutlass() -> object:
     return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
 
 
-def _moe_apply_fp8_cutlass() -> object:
-    plan = tokenspeed_kernel.moe_plan(
-        "fp8",
-        input_dtype=torch.bfloat16,
-        activation="silu",
-        ep_size=2,
-        ispp=128,
-        fp8_scale_block_shape=(128, 128),
-        internal_activation_dtype="input",
-    )
-    _assert_moe_plan(
-        plan,
-        apply="flashinfer_cutlass_fp8_moe_apply",
-        preprocessor="flashinfer_cutlass_fp8_moe_weights",
-    )
-    x = torch.empty((4, 16), dtype=torch.bfloat16)
-    router_logits = torch.empty((4, 8), dtype=torch.float32)
-    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
-
-
-def _moe_apply_fp8_trtllm() -> object:
-    plan = tokenspeed_kernel.moe_plan(
-        "fp8",
-        input_dtype=torch.bfloat16,
-        activation="silu",
-        ep_size=2,
-        ispp=128,
-        fp8_scale_block_shape=(128, 128),
-        internal_activation_dtype="input",
-    )
-    _assert_moe_plan(
-        plan,
-        apply="flashinfer_trtllm_fp8_moe_apply",
-        preprocessor="flashinfer_trtllm_fp8_moe_process_weights",
-    )
-    x = torch.empty((4, 16), dtype=torch.bfloat16)
-    router_logits = torch.empty((4, 8), dtype=torch.float32)
-    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
-
-
 def _moe_apply_nvfp4_trtllm() -> object:
     plan = tokenspeed_kernel.moe_plan(
         "nvfp4",
@@ -1832,40 +1734,6 @@ def _moe_apply_nvfp4_deepep_cutedsl() -> object:
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
     return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
-
-
-def _moe_apply_fp8_deepep_deep_gemm() -> object:
-    plan = tokenspeed_kernel.moe_plan(
-        "fp8",
-        input_dtype=torch.bfloat16,
-        activation="silu",
-        routing_mode="precomputed_topk",
-        a2a_backend="deepep",
-        ep_size=2,
-        ispp=256,
-        fp8_scale_block_shape=(128, 128),
-        internal_activation_dtype="input",
-        deepep_group=object(),
-        solution="deep_gemm",
-    )
-    _assert_moe_plan(
-        plan,
-        apply="deep_gemm_deepep_fp8_moe_apply",
-        preprocessor="deep_gemm_deepep_fp8_moe_weights",
-    )
-    assert plan["support_routing"] is False
-    x = torch.empty((4, 16), dtype=torch.bfloat16)
-    router_logits = torch.empty((4, 8), dtype=torch.float32)
-    topk_weights = torch.empty((4, 2), dtype=torch.float32)
-    topk_ids = torch.empty((4, 2), dtype=torch.int32)
-    return tokenspeed_kernel.moe_apply(
-        plan,
-        x,
-        torch.nn.Module(),
-        router_logits,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-    )
 
 
 def _moe_apply_mxfp4_trtllm() -> object:
@@ -2389,22 +2257,6 @@ _CASES = [
         _moe_apply_unquant_cutlass,
     ),
     _case(
-        _is_hopper,
-        "hopper",
-        "moe",
-        "apply",
-        "flashinfer_cutlass_fp8_moe_apply",
-        _moe_apply_fp8_cutlass,
-    ),
-    _case(
-        _is_blackwell_sm100,
-        "blackwell-sm100",
-        "moe",
-        "apply",
-        "flashinfer_trtllm_fp8_moe_apply",
-        _moe_apply_fp8_trtllm,
-    ),
-    _case(
         _is_blackwell_sm100,
         "blackwell-sm100",
         "moe",
@@ -2459,14 +2311,6 @@ _CASES = [
         "apply",
         "flashinfer_cutedsl_deepep_nvfp4_moe_apply",
         _moe_apply_nvfp4_deepep_cutedsl,
-    ),
-    _case(
-        _is_hopper_plus_with_deep_gemm,
-        "hopper-plus",
-        "moe",
-        "apply",
-        "deep_gemm_deepep_fp8_moe_apply",
-        _moe_apply_fp8_deepep_deep_gemm,
     ),
     _case(
         _is_blackwell_sm100,
@@ -2585,7 +2429,6 @@ def _find_case(*, arch: str, family: str, mode: str) -> KernelApiSelectionCase:
 # Fixture platforms (see conftest.py) each case's arch tag runs under.
 _ARCH_FIXTURES: dict[str, tuple[str, ...]] = {
     "hopper": ("h100_platform",),
-    "hopper-plus": ("h100_platform", "b200_platform", "b300_platform"),
     "blackwell-sm100": ("b200_platform",),
     "blackwell-sm103": ("b300_platform",),
     "blackwell-plus": ("b200_platform", "b300_platform"),
