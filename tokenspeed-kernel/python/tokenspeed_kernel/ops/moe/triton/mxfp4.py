@@ -293,7 +293,6 @@ def _stage1_kernel(
     x_scale_ptr,
     w13_desc,
     w13_scale_ptr,
-    inter_ptr,
     inter_packed_ptr,
     inter_scale_ptr,
     expert_route_ids_ptr,
@@ -303,6 +302,7 @@ def _stage1_kernel(
     intermediate_size: tl.constexpr,
     num_experts: tl.constexpr,
     top_k: tl.constexpr,
+    OUTPUT_DTYPE: tl.constexpr,
     NUM_PROGRAMS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -391,7 +391,9 @@ def _stage1_kernel(
                     rhs_k_pack=True,
                 )
 
-            output_dtype: tl.constexpr = inter_ptr.dtype.element_ty
+            output_dtype: tl.constexpr = (
+                tl.bfloat16 if OUTPUT_DTYPE == "bf16" else tl.float16
+            )
             gate = gate_acc.to(output_dtype)
             up = up_acc.to(output_dtype)
             silu = (gate.to(tl.float32) * tl.sigmoid(gate.to(tl.float32))).to(
@@ -401,11 +403,6 @@ def _stage1_kernel(
             valid_mask = row_mask[:, None] & (tl.arange(0, BLOCK_N)[None, :] < BLOCK_N)
             activated_packed, activated_scales = _quantize_mxfp4_routine(
                 activated, valid_mask
-            )
-            inter_offsets = (
-                route_ids[:, None] * intermediate_size
-                + n_offset
-                + tl.arange(0, BLOCK_N)[None, :]
             )
             inter_packed_offsets = (
                 route_ids[:, None] * (intermediate_size // 2)
@@ -417,7 +414,6 @@ def _stage1_kernel(
                 + n_offset // 32
                 + tl.arange(0, BLOCK_N // 32)[None, :]
             )
-            tl.store(inter_ptr + inter_offsets, activated, mask=row_mask[:, None])
             tl.store(
                 inter_packed_ptr + inter_packed_offsets,
                 activated_packed,
@@ -560,9 +556,6 @@ def _moe(
     intermediate_packed = torch.empty(
         (route_count, intermediate_size // 2), device=x.device, dtype=torch.uint8
     )
-    intermediate = torch.empty(
-        (route_count, intermediate_size), device=x.device, dtype=x.dtype
-    )
     intermediate_scale = torch.empty(
         (route_count, intermediate_size // 32), device=x.device, dtype=torch.uint8
     )
@@ -606,7 +599,6 @@ def _moe(
         x_scale,
         w13_desc,
         w13_scale,
-        intermediate,
         intermediate_packed,
         intermediate_scale,
         expert_route_ids,
@@ -616,6 +608,7 @@ def _moe(
         intermediate_size=intermediate_size,
         num_experts=num_experts,
         top_k=top_k,
+        OUTPUT_DTYPE="bf16" if x.dtype == torch.bfloat16 else "fp16",
         NUM_PROGRAMS=stage1_programs,
         BLOCK_M=block_m,
         BLOCK_N=stage1_block_n,
