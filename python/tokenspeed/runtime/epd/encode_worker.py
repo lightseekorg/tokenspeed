@@ -34,30 +34,31 @@ orchestrates them, so it is unit-testable with fakes.
 
 from __future__ import annotations
 
-import dataclasses
-
 from tokenspeed.runtime.cache.embedding_cache import (
     EmbeddingCache,
     TieredEmbeddingCache,
 )
+from tokenspeed.runtime.engine.io_struct import BaseReq
 from tokenspeed.runtime.epd.encode_scheduler import (
     EncodeScheduler,
     PendingEncodeItem,
 )
 from tokenspeed.runtime.multimodal.embedder import _item_token_count
 from tokenspeed.runtime.multimodal.inputs import MultimodalDataItem
-from tokenspeed.runtime.multimodal.shm_transport import ShmTensorHandle
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
 
 
-@dataclasses.dataclass(frozen=True)
-class EncodeRequest:
+class EncodeRequest(BaseReq, kw_only=True):
     """One encode request: a transfer peer plus its vision items.
 
     ``bootstrap_host``/``port``/``room`` identify the prefill peer this
     request's embeddings are shipped to (assigned upstream, per request).
+
+    A tagged IPC struct (``BaseReq``) because it rides the shared
+    scheduler-input ZMQ channel as msgpack; the multimodal items carry their
+    pixels as ext-encoded tensor buffers or SHM handles.
     """
 
     request_id: str
@@ -101,13 +102,13 @@ class EncodeWorker:
         )
         for idx, item in enumerate(request.items):
             cached = self.cache.get(item.hash)
-            if isinstance(item.feature, ShmTensorHandle):
+            if item.feature_shm is not None:
                 # EPD pixel-SHM: the servicer published pixels to POSIX SHM and
                 # the ZMQ hop carried only this handle (hash/pad_value were set on
                 # the real tensor before publish). consume() unlinks, so segments
                 # never outlive the item: materialize on a miss, and on a hit still
                 # consume-and-drop to unlink the unused segment.
-                handle, item.feature = item.feature, None
+                handle, item.feature_shm = item.feature_shm, None
                 handle.attach()
                 if cached is None:
                     item.feature = handle.consume()

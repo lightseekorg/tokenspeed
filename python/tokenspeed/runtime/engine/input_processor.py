@@ -264,15 +264,15 @@ class InputProcessor:
 
         if isinstance(obj, GenerateReqInput):
             return TokenizedGenerateReqInput(
-                obj.rid,
-                input_text,
-                input_ids,
-                sampling_params,
-                return_logprob,
-                logprob_start_len,
-                top_logprobs_num,
-                token_ids_logprob,
-                obj.stream,
+                rid=obj.rid,
+                input_text=input_text,
+                input_ids=input_ids,
+                sampling_params=sampling_params,
+                return_logprob=return_logprob,
+                logprob_start_len=logprob_start_len,
+                top_logprobs_num=top_logprobs_num,
+                token_ids_logprob=token_ids_logprob,
+                stream=obj.stream,
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=obj.bootstrap_room,
@@ -288,9 +288,9 @@ class InputProcessor:
             )
 
         return TokenizedEmbeddingReqInput(
-            obj.rid,
-            input_text,
-            input_ids,
-            sampling_params,
+            rid=obj.rid,
+            input_text=input_text,
+            input_ids=input_ids,
+            sampling_params=sampling_params,
             created_time=time.time(),
         )

@@ -36,6 +36,7 @@ import dataclasses
 import multiprocessing as mp
 import os
 import signal
+import sys
 import threading
 from collections.abc import AsyncIterator, Iterator
 
@@ -638,3 +639,158 @@ def _launch_subprocesses(
     ]
     tokenizer_manager.context_len = scheduler_info["max_model_len"]
     return tokenizer_manager, None, scheduler_info
+
+
+def launch_scheduler_headless(server_args: ServerArgs) -> None:
+    """Launch scheduler process(es) driven directly by SMG over msgpack ZMQ.
+
+    Headless: no in-process tokenizer_manager and no AsyncLLM detokenizer (SMG
+    owns both). This process only spawns and
+    supervises the scheduler workers, which connect out to the SMG-bound
+    handshake/input/output sockets (see engine.event_loop._init_msgpack_transport),
+    then blocks until they exit.
+
+    Forces ``--zmq-msgpack`` + ``--skip-tokenizer-init`` since SMG passes
+    token ids. The workers dial ``tcp://{--data-parallel-address}:
+    {--data-parallel-rpc-port}`` (defaults ``127.0.0.1:30500``; the frontend
+    binds it). Both flags always carry values — non-emptiness and the u16
+    range are enforced at parse time.
+    """
+    server_args.zmq_msgpack = True
+    server_args.skip_tokenizer_init = True
+    # DP > 1 is rejected in event_loop._init_msgpack_transport, the choke point
+    # shared with the non-headless --zmq-msgpack launch path.
+
+    configure_logger(server_args)
+    _set_envs_and_config(server_args)
+
+    # PortArgs is still derived (nccl_port drives torch.distributed); the pickle
+    # scheduler_input/tokenizer IPC names it carries are unused in msgpack mode.
+    port_args = PortArgs.init_new(server_args)
+    logger.info("headless server_args=%r", server_args)
+
+    server_args.model, server_args.tokenizer = prepare_model_and_tokenizer(
+        server_args.model, server_args.tokenizer
+    )
+
+    scheduler_procs: list[mp.Process] = []
+    scheduler_pipe_readers = []
+
+    # SIGUSR1 is what a scheduler sends its parent on an internal exception
+    # (see run_event_loop) — the child itself then exits 0, so record the
+    # failure here or the supervisor would report success.
+    child_failed = threading.Event()
+
+    def _terminate_schedulers(signum=None, _frame=None):
+        """Forward a shutdown (or child-failure SIGUSR1) to every scheduler."""
+        if signum is not None:
+            logger.info("received signal %s; terminating scheduler(s)", signum)
+        if signum == signal.SIGUSR1:
+            child_failed.set()
+        for proc in scheduler_procs:
+            if proc.is_alive():
+                proc.terminate()
+
+    # Install before spawning so a signal in the launch window is not lost;
+    # an unhandled SIGUSR1 would kill this supervisor without cleanup.
+    signal.signal(signal.SIGTERM, _terminate_schedulers)
+    signal.signal(signal.SIGINT, _terminate_schedulers)
+    signal.signal(signal.SIGUSR1, _terminate_schedulers)
+
+    if not server_args.mapping.attn.has_dp:
+        memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=server_args.enable_memory_saver
+        )
+        rank_start = server_args.mapping.nprocs_per_node * server_args.node_rank
+        rank_end = rank_start + server_args.mapping.nprocs_per_node
+        for rank in range(rank_start, rank_end):
+            rank_server_args = copy.copy(server_args)
+            rank_server_args.mapping = copy.deepcopy(server_args.mapping)
+            rank_server_args.mapping.rank = rank
+
+            reader, writer = mp.Pipe(duplex=False)
+            proc = mp.Process(
+                target=run_event_loop,
+                args=(rank_server_args, port_args, writer),
+            )
+            with memory_saver_adapter.configure_subprocess():
+                proc.start()
+            scheduler_procs.append(proc)
+            scheduler_pipe_readers.append(reader)
+    else:
+        reader, writer = mp.Pipe(duplex=False)
+        scheduler_pipe_readers.append(reader)
+        proc = mp.Process(
+            target=run_data_parallel_controller_process,
+            args=(server_args, port_args, writer),
+        )
+        proc.start()
+        scheduler_procs.append(proc)
+
+    try:
+        for i, reader in enumerate(scheduler_pipe_readers):
+            try:
+                data = reader.recv()
+            except EOFError:
+                logger.error(
+                    "Rank %s scheduler is dead. Please check if there are "
+                    "relevant logs.",
+                    i,
+                )
+                scheduler_procs[i].join()
+                logger.error("Exit code: %s", scheduler_procs[i].exitcode)
+                raise
+            if data.get("status") != "ready":
+                raise RuntimeError(
+                    "Scheduler initialization failed. See the error messages above."
+                )
+        logger.info(
+            "headless scheduler(s) ready; SMG handshake endpoint=%s",
+            server_args.zmq_handshake_endpoint(),
+        )
+
+        # Supervise until every scheduler exits. If any rank dies (e.g. OOM
+        # SIGKILL) take the survivors down and exit nonzero instead of
+        # reporting success.
+        failed = False
+        alive = list(scheduler_procs)
+        while alive:
+            for proc in list(alive):
+                proc.join(timeout=1)
+                if proc.exitcode is None:
+                    continue
+                alive.remove(proc)
+                if proc.exitcode == 0:
+                    logger.info(
+                        "scheduler %s exited with code %s", proc.pid, proc.exitcode
+                    )
+                else:
+                    logger.error(
+                        "scheduler %s exited with code %s; terminating the "
+                        "remaining scheduler(s)",
+                        proc.pid,
+                        proc.exitcode,
+                    )
+                    failed = True
+                    _terminate_schedulers()
+        if failed or child_failed.is_set():
+            sys.exit(1)
+    finally:
+        # Backstop: never leak GPU-holding scheduler trees, whichever path
+        # (signal, dead rank, readiness failure) unwound this launcher.
+        _terminate_schedulers()
+        for proc in scheduler_procs:
+            proc.join(timeout=5)
+        kill_process_tree(os.getpid(), include_parent=False)
+
+
+def run_scheduler_headless_from_cli(argv: list[str] | None = None) -> None:
+    """CLI shim: ``python -m tokenspeed.runtime.entrypoints.engine <ServerArgs>``."""
+    from tokenspeed.runtime.utils.server_args import prepare_server_args
+
+    server_args = prepare_server_args(sys.argv[1:] if argv is None else argv)
+    launch_scheduler_headless(server_args)
+
+
+if __name__ == "__main__":
+    run_scheduler_headless_from_cli()

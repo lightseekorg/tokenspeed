@@ -67,6 +67,19 @@ def main() -> None:
     serve_parser = subparsers.add_parser(
         "serve",
         help="Launch the TokenSpeed inference server.",
+        description="Launch the TokenSpeed inference server: the full serving "
+        "stack by default (currently an smg gateway fronting a gRPC engine), "
+        "or the engine alone with --headless.",
+    )
+    serve_parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run the engine only, without a frontend. An external frontend "
+        "— e.g. `smg serve --backend tokenspeed --connection-mode zmq` — "
+        "binds the msgpack ZMQ sockets and this engine dials in at "
+        "--data-parallel-address/--data-parallel-rpc-port (default "
+        "tcp://127.0.0.1:30500). Implies --zmq-msgpack and "
+        "--skip-tokenizer-init.",
     )
     serve_parser.set_defaults(func=_serve)
 
