@@ -1,10 +1,9 @@
 """Contract for physical cache-page sanitization.
 
-``ModelExecutor.zero_cache_pages`` runs the scheduler's page-reuse list
-through the KV pool's ``zero_pages``. Only pools that alias recurrent-state and
-KV bytes in one slab need this; pure-attention pools (MHA, and Inkling whose
-conv state lives in a separate pool) do not, so the page list is safely
-ignored for them instead of crashing the engine at startup.
+``ModelExecutor.zero_cache_pages`` runs the scheduler's page-reuse list through
+the target pool and any stateful draft pool. Only pools that alias recurrent
+state and KV bytes need this; pure-attention pools do not, so the page list is
+safely ignored for them instead of crashing the engine at startup.
 """
 
 from __future__ import annotations
@@ -22,10 +21,14 @@ register_cuda_ci(est_time=15, suite="runtime-1gpu")
 
 class ZeroCachePagesContractTest(unittest.TestCase):
     @staticmethod
-    def _call(pool, page_ids):
+    def _call(pool, page_ids, draft_pool=None):
         from tokenspeed.runtime.execution.model_executor import ModelExecutor
 
-        fake = types.SimpleNamespace(token_to_kv_pool=pool, device="cpu")
+        fake = types.SimpleNamespace(
+            token_to_kv_pool=pool,
+            draft_token_to_kv_pool=draft_pool,
+            device="cpu",
+        )
         return ModelExecutor.zero_cache_pages(fake, page_ids)
 
     def test_empty_page_list_is_a_noop(self):
@@ -66,6 +69,27 @@ class ZeroCachePagesContractTest(unittest.TestCase):
         pages = {"full": [4, 5], "state": [9]}
         self.assertIsNone(self._call(pool, pages))
         self.assertEqual(seen, [pages])
+
+    def test_stateful_draft_pool_zeros_its_group_subset(self):
+        target_seen = []
+        draft_seen = []
+        target = types.SimpleNamespace(
+            paged_cache_requires_page_zeroing=True,
+            zero_new_pages=lambda pages: target_seen.append(dict(pages)),
+        )
+        draft = types.SimpleNamespace(
+            paged_cache_requires_page_zeroing=True,
+            paged_cache_group_specs=(
+                types.SimpleNamespace(group_id="history"),
+                types.SimpleNamespace(group_id="state"),
+            ),
+            zero_new_pages=lambda pages: draft_seen.append(dict(pages)),
+        )
+        pages = {"history": [4], "state": [9], "target_only": [12]}
+
+        self.assertIsNone(self._call(target, pages, draft))
+        self.assertEqual(target_seen, [pages])
+        self.assertEqual(draft_seen, [{"history": [4], "state": [9]}])
 
 
 if __name__ == "__main__":

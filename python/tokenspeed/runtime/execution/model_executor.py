@@ -1369,41 +1369,57 @@ class ModelExecutor:
         """Clear newly owned pages and return a CUDA completion event when needed."""
         if not pages:
             return None
-        zero_new_pages = getattr(self.token_to_kv_pool, "zero_new_pages", None)
-        zero_pages = getattr(self.token_to_kv_pool, "zero_pages", None)
-        if isinstance(pages, Mapping) and callable(zero_new_pages):
-            sanitizer = zero_new_pages
-            sanitizer_arg = pages
-        elif callable(zero_pages):
-            if isinstance(pages, Mapping):
-                page_ids = sorted(
-                    {
-                        int(page_id)
-                        for group_pages in pages.values()
-                        for page_id in group_pages
-                    }
+
+        def sanitize(pool, pool_pages) -> bool:
+            zero_new_pages = getattr(pool, "zero_new_pages", None)
+            zero_pages = getattr(pool, "zero_pages", None)
+            if isinstance(pool_pages, Mapping) and callable(zero_new_pages):
+                zero_new_pages(pool_pages)
+                return True
+            if callable(zero_pages):
+                page_ids = (
+                    sorted(
+                        {
+                            int(page_id)
+                            for group_pages in pool_pages.values()
+                            for page_id in group_pages
+                        }
+                    )
+                    if isinstance(pool_pages, Mapping)
+                    else pool_pages
                 )
-            else:
-                page_ids = pages
-            sanitizer = zero_pages
-            sanitizer_arg = page_ids
-        else:
-            # A pool only needs sanitization if it aliases recurrent-state and
-            # KV bytes in one slab (it then declares this and implements
-            # a sanitizer). Pure-attention pools do not alias state, so reused
-            # pages are overwritten and their tails are never read past seq_len.
-            # Still fail loudly if a pool that *declares* it needs zeroing
-            # forgot to implement it.
-            if getattr(
-                self.token_to_kv_pool, "paged_cache_requires_page_zeroing", False
-            ):
+                zero_pages(page_ids)
+                return True
+            if getattr(pool, "paged_cache_requires_page_zeroing", False):
                 raise RuntimeError(
-                    "scheduler emitted pages to zero but the active KV "
+                    "scheduler emitted pages to zero but an active KV "
                     "pool does not implement physical-page sanitization"
                 )
-            return None
+            return False
+
         with nvtx_range("zero_cache_pages", color="purple"):
-            sanitizer(sanitizer_arg)
+            sanitized = sanitize(self.token_to_kv_pool, pages)
+            draft_pool = getattr(self, "draft_token_to_kv_pool", None)
+            if draft_pool is not None and getattr(
+                draft_pool,
+                "paged_cache_requires_page_zeroing",
+                False,
+            ):
+                draft_pages = pages
+                if isinstance(pages, Mapping):
+                    draft_group_ids = {
+                        str(spec.group_id)
+                        for spec in draft_pool.paged_cache_group_specs
+                    }
+                    draft_pages = {
+                        group_id: page_ids
+                        for group_id, page_ids in pages.items()
+                        if group_id in draft_group_ids
+                    }
+                if draft_pages:
+                    sanitized = sanitize(draft_pool, draft_pages) or sanitized
+        if not sanitized:
+            return None
         if torch.device(self.device).type != "cuda":
             return None
         done = torch.cuda.Event()

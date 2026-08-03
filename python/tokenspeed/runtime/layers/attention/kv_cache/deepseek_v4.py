@@ -22,6 +22,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from tokenspeed.runtime.configs.cache_runtime import PagedCacheRuntimeContract
 from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
     DEEPSEEK_V4_COMPRESSED_LOGICAL_BLOCK_SIZE,
     V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
@@ -36,6 +37,8 @@ from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
     v4_compressed_kv_group_id,
     v4_compressor_state_group_id,
 )
+from tokenspeed.runtime.configs.lcm_layouts import deepseek_v4_lcm_fields
+from tokenspeed.runtime.configs.lcm_memory_plan import LcmMemoryPlan
 from tokenspeed.runtime.configs.paged_cache_spec import (
     PagedCacheGroupSpec,
     compute_paged_cache_group_page_counts,
@@ -44,6 +47,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     deepseek_v4_compressed_slot_mapping,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+from tokenspeed.runtime.layers.attention.kv_cache.lcm import LcmCachePool
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.common import ceil_div
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -752,6 +756,47 @@ def deepseek_v4_cache_layout_from_config(
     )
 
 
+def build_deepseek_v4_lcm_fields(
+    layout: DeepseekV4CacheLayout,
+    *,
+    sliding_window: int,
+    logical_block_tokens: int = DEEPSEEK_V4_COMPRESSED_LOGICAL_BLOCK_SIZE,
+):
+    """Build DSV4 fields for one scheduler-wide logical page size."""
+    if sliding_window <= 0 or logical_block_tokens % sliding_window:
+        raise ValueError(
+            "DeepSeek V4 sliding_window must divide the logical block size"
+        )
+    if sliding_window % V4_KERNEL_BLOCK_ROWS:
+        raise ValueError(
+            "DeepSeek V4 sliding_window must be divisible by the SWA kernel page"
+        )
+
+    compressed_shapes = {
+        ratio: (layout.swa_block_bytes(layout.storage_block_size(ratio)),)
+        for ratio in set(layout.layer_ratio)
+        if ratio > 1
+    }
+    compressor_state_shapes = {
+        ratio: (
+            8 if ratio == 4 else 128,
+            layout.head_dim * (2 if ratio == 4 else 1) * 2,
+        )
+        for ratio in set(layout.layer_ratio)
+        if ratio > 1
+    }
+    return deepseek_v4_lcm_fields(
+        layer_ratios=layout.layer_ratio,
+        logical_block_tokens=logical_block_tokens,
+        swa_shape=(layout.swa_block_bytes(sliding_window),),
+        compressed_shapes=compressed_shapes,
+        compressor_state_shapes=compressor_state_shapes,
+        indexer_kv_shape=(V4_KERNEL_BLOCK_ROWS, layout.indexer_row_bytes),
+        indexer_state_shape=(8, layout.index_head_dim * 2 * 2),
+        kv_page_stride_alignment_bytes=layout.swa_token_stride,
+    )
+
+
 class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
     """DeepSeek V4 fp8_ds_mla cache pool.
 
@@ -781,6 +826,8 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
         max_scheduled_tokens: int,
         decode_input_tokens: int = 1,
         overlap_schedule_depth: int = 0,
+        memory_plan: LcmMemoryPlan | None = None,
+        token_capacity: int | None = None,
     ) -> None:
         if size <= 0:
             raise ValueError(f"DeepSeek V4 KV pool size must be positive, got {size}")
@@ -789,13 +836,16 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
                 "DeepSeek V4 KV pool layer_num must match cache layout ratios: "
                 f"layer_num={layer_num}, ratios={len(layout.layer_ratio)}"
             )
+        scheduler_page_size = (
+            memory_plan.logical_block_tokens if memory_plan is not None else page_size
+        )
         super().__init__(
             size=size,
             dtype=torch.uint8,
             device=device,
             max_batch_size=max_batch_size,
             max_context_len=max_context_len,
-            page_size=page_size,
+            page_size=scheduler_page_size,
             rank=rank,
         )
         # Tag KV allocations as "kv_cache" (no CPU backup: discarded on sleep)
@@ -808,9 +858,23 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
         self.layer_num = layer_num
         self.max_batch_size = max_batch_size
         self.max_context_len = max_context_len
-        self.num_pages = (size + page_size - 1) // page_size + 1
+        self._lcm_memory_plan = memory_plan
+        self.lcm_pool: LcmCachePool | None = None
+        self.num_pages = (size + scheduler_page_size - 1) // scheduler_page_size + 1
+        packing = (
+            {
+                group.group_id: group.cache_blocks_per_lcm_block
+                for group in memory_plan.groups
+            }
+            if memory_plan is not None
+            else None
+        )
         self.paged_cache_group_specs = tuple(
-            build_v4_cache_specs(hf_config, layer_ratio=layout.layer_ratio)
+            build_v4_cache_specs(
+                hf_config,
+                layer_ratio=layout.layer_ratio,
+                cache_blocks_per_lcm_block=packing,
+            )
         )
         self._paged_cache_group_specs_by_id = {
             spec.group_id: spec for spec in self.paged_cache_group_specs
@@ -821,22 +885,39 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
             for spec in self.paged_cache_group_specs
             if spec.family == "state"
         )
-        self.paged_cache_group_page_counts = compute_paged_cache_group_page_counts(
-            self.paged_cache_group_specs,
-            max_live_requests=max_batch_size,
-            max_scheduled_tokens=max(0, int(max_scheduled_tokens)),
-            max_total_tokens=size,
-            max_context_len=max_context_len,
-            decode_input_tokens=decode_input_tokens,
-            overlap_schedule_depth=overlap_schedule_depth,
-        )
+        if memory_plan is None:
+            self.paged_cache_group_page_counts = compute_paged_cache_group_page_counts(
+                self.paged_cache_group_specs,
+                max_live_requests=max_batch_size,
+                max_scheduled_tokens=max(0, int(max_scheduled_tokens)),
+                max_total_tokens=size,
+                max_context_len=max_context_len,
+                decode_input_tokens=decode_input_tokens,
+                overlap_schedule_depth=overlap_schedule_depth,
+            )
+            self.runtime_contract = None
+        else:
+            self.paged_cache_group_page_counts = {
+                group.group_id: group.page_count for group in memory_plan.groups
+            }
+            self.runtime_contract = PagedCacheRuntimeContract(
+                block_size=memory_plan.logical_block_tokens,
+                num_lcm_blocks=memory_plan.num_lcm_blocks,
+                token_capacity=(token_capacity if token_capacity is not None else size),
+                group_specs=self.paged_cache_group_specs,
+                group_page_counts=self.paged_cache_group_page_counts,
+            )
+            self.paged_cache_requires_page_zeroing = True
 
         def _group_rows(group_id: str, default: int) -> int:
             spec = self._paged_cache_group_specs_by_id.get(group_id)
             return int(spec.rows_per_page) if spec is not None else int(default)
 
-        self.swa_block_size = _group_rows(V4_SWA_KV_GROUP_ID, V4_KERNEL_BLOCK_ROWS)
-        self.state_block_size = page_size
+        self.swa_block_size = _group_rows(
+            V4_SWA_KV_GROUP_ID,
+            V4_KERNEL_BLOCK_ROWS,
+        )
+        self.state_block_size = scheduler_page_size
         self.swa_block_bytes = layout.swa_block_bytes(self.swa_block_size)
         self.compressed_block_sizes = tuple(
             layout.storage_block_size(ratio) if ratio > 1 else page_size
@@ -854,7 +935,7 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
             (
                 _group_rows(v4_compressor_state_group_id(ratio), page_size)
                 if ratio > 1
-                else page_size
+                else scheduler_page_size
             )
             for ratio in layout.layer_ratio
         )
@@ -870,8 +951,32 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
             for ratio in layout.layer_ratio
         )
         self.compressed_block_size = (
-            self.compressed_block_sizes[0] if self.compressed_block_sizes else page_size
+            self.compressed_block_sizes[0]
+            if self.compressed_block_sizes
+            else scheduler_page_size
         )
+
+        if memory_plan is not None:
+            expected_size = (
+                memory_plan.num_lcm_blocks
+                * max(group.cache_blocks_per_lcm_block for group in memory_plan.groups)
+                * memory_plan.logical_block_tokens
+            )
+            if size != expected_size:
+                raise ValueError(
+                    f"DeepSeek V4 LCM pool size {size} does not match {expected_size}"
+                )
+            with self.memory_saver_adapter.region(
+                tag="kv_cache", enable_cpu_backup=False
+            ):
+                self._create_lcm_buffers(memory_plan, device)
+            logger.info(
+                "Initialized DeepSeek V4 LCM pool: %d parents, P=%d, %d layers",
+                memory_plan.num_lcm_blocks,
+                memory_plan.logical_block_tokens,
+                layer_num,
+            )
+            return
 
         swa_pages = self.paged_cache_group_page_counts.get(
             V4_SWA_KV_GROUP_ID,
@@ -977,6 +1082,43 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
             layout.use_fp4_indexer_cache,
             self.compressed_block_sizes,
         )
+
+    def _create_lcm_buffers(self, plan: LcmMemoryPlan, device: str) -> None:
+        self.lcm_pool = LcmCachePool(plan, device)
+        self.swa_kv_buffer = []
+        self.compressed_kv_buffer = []
+        self.compressor_state_buffer = []
+        self.indexer_kv_buffer = []
+        self.indexer_state_buffer = []
+        for layer_id, ratio in enumerate(self.layout.layer_ratio):
+            self.swa_kv_buffer.append(
+                self.lcm_pool.field(f"layer.{layer_id}.swa", torch.uint8)
+            )
+            if ratio <= 1:
+                self.compressed_kv_buffer.append(None)
+                self.compressor_state_buffer.append(None)
+                self.indexer_kv_buffer.append(None)
+                self.indexer_state_buffer.append(None)
+                continue
+            self.compressed_kv_buffer.append(
+                self.lcm_pool.field(f"layer.{layer_id}.compressed_kv", torch.uint8)
+            )
+            self.compressor_state_buffer.append(
+                self.lcm_pool.field(f"layer.{layer_id}.compressor_state", torch.float32)
+            )
+            if ratio == 4:
+                indexer_kv = self.lcm_pool.field(
+                    f"layer.{layer_id}.indexer_kv", torch.uint8
+                )
+                self.indexer_kv_buffer.append(indexer_kv.view(indexer_kv.shape[0], -1))
+                self.indexer_state_buffer.append(
+                    self.lcm_pool.field(
+                        f"layer.{layer_id}.indexer_state", torch.float32
+                    )
+                )
+            else:
+                self.indexer_kv_buffer.append(None)
+                self.indexer_state_buffer.append(None)
 
     def bind_paged_cache_scheduler(self, scheduler: object) -> None:
         self._paged_cache_scheduler = scheduler
@@ -1163,6 +1305,8 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
         return page * block_size + torch.div(pos, ratio, rounding_mode="floor")
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
+        if self.lcm_pool is not None:
+            raise RuntimeError("DeepSeek V4 LCM cache does not support row relocation")
         if tgt_loc.numel() == 0:
             return
         for layer_id in range(self.layer_num):
@@ -1226,11 +1370,20 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
         return out
 
     def get_kv_size_bytes(self) -> int:
+        if self.lcm_pool is not None:
+            return int(self.lcm_pool.backing.nbytes)
         return int(
             sum(np.prod(buf.shape) * buf.dtype.itemsize for buf in self._all_buffers())
         )
 
+    def zero_new_pages(self, new_page_ids: dict[str, list[int]]) -> None:
+        if self.lcm_pool is None:
+            return
+        self.lcm_pool.zero_pages(new_page_ids)
+
     def get_contiguous_buf_infos(self):
+        if self.lcm_pool is not None:
+            raise RuntimeError("DeepSeek V4 LCM transfer uses the cache contract")
         buffers = self._all_buffers()
         return (
             [buf.data_ptr() for buf in buffers],

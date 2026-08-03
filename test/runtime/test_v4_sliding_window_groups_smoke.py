@@ -48,6 +48,8 @@ _v4 = _load(
 )
 
 build_v4_cache_specs = _v4.build_v4_cache_specs
+deepseek_v4_lcm_blocks_needed = _v4.deepseek_v4_lcm_blocks_needed
+deepseek_v4_token_capacity_for_lcm_pool = _v4.deepseek_v4_token_capacity_for_lcm_pool
 compute_max_logical_pages_for_capture = _generic.compute_max_logical_pages_for_capture
 compute_paged_cache_group_page_counts = _generic.compute_paged_cache_group_page_counts
 PagedCacheGroupSpec = _generic.PagedCacheGroupSpec
@@ -343,6 +345,76 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             self.assertGreater(n, 0, spec.group_id)
             self.assertTrue(math.isfinite(n), spec.group_id)
             self.assertLess(n, bound, spec.group_id)
+
+    def test_lcm_specs_keep_uniform_scheduler_page_size_and_publish_packing(self):
+        packing = {
+            "v4.swa_kv": 1,
+            "v4.c4a.compressor_state": 16,
+            "v4.c4a.compressed_kv": 2,
+            "v4.c128a.compressor_state": 32,
+            "v4.c128a.compressed_kv": 8,
+            "v4.c4a.indexer_compressor_state": 16,
+        }
+
+        specs = build_v4_cache_specs(
+            SimpleNamespace(sliding_window=128),
+            layer_ratio=(1, 4, 128),
+            cache_blocks_per_lcm_block=packing,
+        )
+
+        self.assertEqual(
+            {spec.group_id: spec.cache_blocks_per_lcm_block for spec in specs},
+            packing,
+        )
+        self.assertTrue(all(spec.block_size is None for spec in specs))
+        rows = {spec.group_id: spec.rows_per_page for spec in specs}
+        self.assertEqual(rows["v4.swa_kv"], 128)
+        self.assertEqual(rows["v4.c4a.compressor_state"], 8)
+        self.assertEqual(rows["v4.c128a.compressor_state"], 128)
+
+    def test_lcm_capacity_is_the_inverse_of_parent_demand(self):
+        packing = {
+            "v4.swa_kv": 1,
+            "v4.c4a.compressor_state": 4,
+            "v4.c4a.compressed_kv": 2,
+            "v4.c128a.compressor_state": 1,
+            "v4.c128a.compressed_kv": 8,
+            "v4.c4a.indexer_compressor_state": 4,
+        }
+        specs = build_v4_cache_specs(
+            SimpleNamespace(sliding_window=128),
+            layer_ratio=(1, 4, 128),
+            cache_blocks_per_lcm_block=packing,
+        )
+        sizing = {
+            "logical_block_tokens": 256,
+            "max_live_requests": 1,
+            "max_scheduled_tokens": 256,
+            "max_context_len": 4096,
+        }
+        capacity = deepseek_v4_token_capacity_for_lcm_pool(
+            specs,
+            num_lcm_blocks=12,
+            upper_bound_tokens=4096,
+            **sizing,
+        )
+
+        self.assertLessEqual(
+            deepseek_v4_lcm_blocks_needed(
+                specs,
+                token_capacity=capacity,
+                **sizing,
+            ),
+            12,
+        )
+        self.assertGreater(
+            deepseek_v4_lcm_blocks_needed(
+                specs,
+                token_capacity=capacity + 1,
+                **sizing,
+            ),
+            12,
+        )
 
     def test_deepseek_v4_pool_exposes_scheduler_cache_groups(self):
         from tokenspeed.runtime.layers.attention.kv_cache import (

@@ -49,6 +49,10 @@ class LcmFieldSpec:
     # True when the field's kernel walks pages by an implicit payload-sized
     # stride. False when the kernel consumes the tensor's runtime stride.
     exact_page_stride: bool = True
+    # Some kernels accept padded pages but still require the runtime page
+    # stride to satisfy an alignment constraint (for example, a TMA row
+    # stride). The planner applies this in bytes after group packing.
+    page_stride_alignment_bytes: int = 1
 
     @property
     def payload_bytes(self) -> int:
@@ -272,6 +276,9 @@ def plan_lcm_fields(
             field.element_size <= 0
             or not field.shape
             or any(extent <= 0 for extent in field.shape)
+            or isinstance(field.page_stride_alignment_bytes, bool)
+            or not isinstance(field.page_stride_alignment_bytes, int)
+            or field.page_stride_alignment_bytes <= 0
         ):
             raise ValueError(f"cache field {field.field_id!r} has invalid geometry")
         raw_by_group[field.group_id] = (
@@ -388,6 +395,12 @@ def plan_lcm_fields(
                 required = packing[group_id] * field.element_size
                 plane_alignment = (
                     plane_alignment // math.gcd(plane_alignment, required) * required
+                )
+                stride_required = packing[group_id] * field.page_stride_alignment_bytes
+                plane_alignment = (
+                    plane_alignment
+                    // math.gcd(plane_alignment, stride_required)
+                    * stride_required
                 )
                 if plane_alignment > _MAX_LCM_BLOCK_BYTES:
                     raise ValueError(

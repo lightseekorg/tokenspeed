@@ -26,11 +26,16 @@ from tokenspeed_kernel.thirdparty.cuda import (
 )
 
 from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
+    V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
+    V4_SWA_KV_GROUP_ID,
+    build_v4_cache_specs,
     deepseek_v4_indexer_fp8_row_bytes,
     deepseek_v4_indexer_mxfp4_row_bytes,
     deepseek_v4_nope_dim,
     deepseek_v4_swa_row_bytes,
     deepseek_v4_swa_token_stride,
+    v4_compressed_kv_group_id,
+    v4_compressor_state_group_id,
 )
 from tokenspeed.runtime.configs.deepseek_v4_config import DeepseekV4Config
 from tokenspeed.runtime.configs.model_config import (
@@ -1603,6 +1608,54 @@ class TestDeepseekV4Config(unittest.TestCase):
         assert metadata is not None
         self.assertTrue(torch.equal(metadata.cache.swa_block_table, compact))
         self.assertTrue(torch.equal(metadata.cache.swa_base_logical_page, base))
+
+    def test_deepseek_v4_lcm_graph_tables_keep_absolute_logical_positions(self):
+        backend = DeepseekV4AttentionBackend(
+            SimpleNamespace(
+                page_size=64,
+                device="cpu",
+                num_attention_heads=64,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                is_draft=False,
+                speculative_num_draft_tokens=4,
+                head_dim=512,
+                context_len=4096,
+                sliding_window_tokens=128,
+            )
+        )
+        backend.logical_page_size = 256
+        group_ids = {
+            V4_SWA_KV_GROUP_ID,
+            v4_compressor_state_group_id(4),
+            v4_compressed_kv_group_id(4),
+            v4_compressor_state_group_id(128),
+            v4_compressed_kv_group_id(128),
+            V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
+        }
+        specs = build_v4_cache_specs(
+            SimpleNamespace(sliding_window=128),
+            layer_ratio=(4, 128),
+            cache_blocks_per_lcm_block={group_id: 1 for group_id in group_ids},
+        )
+        widths = {
+            spec.group_id: backend._cuda_graph_group_table_width(
+                spec,
+                max_tokens_per_req=4,
+                overlap_schedule_depth=1,
+            )
+            for spec in specs
+        }
+
+        # ceil((4096 + 2 * 4) / 256) == 17 scheduler columns. State
+        # rings repeat inside each scheduler column; history remains 1:1.
+        self.assertEqual(widths[V4_SWA_KV_GROUP_ID], 17 * 2)
+        self.assertEqual(widths[v4_compressor_state_group_id(4)], 17 * 32)
+        self.assertEqual(widths[v4_compressor_state_group_id(128)], 17 * 2)
+        self.assertEqual(widths[V4_INDEXER_COMPRESSOR_STATE_GROUP_ID], 17 * 32)
+        self.assertEqual(widths[v4_compressed_kv_group_id(4)], 17)
+        self.assertEqual(widths[v4_compressed_kv_group_id(128)], 17)
 
     def test_deepseek_v4_mixed_metadata_keeps_decode_rows_single_token(self):
         backend = DeepseekV4AttentionBackend(

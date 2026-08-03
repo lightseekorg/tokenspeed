@@ -132,15 +132,17 @@ class DraftCacheGroupIdsTest(_TorchCase):
 
         self.group_ids = CudaGraphWrapper._draft_cache_group_ids
 
-    def _wrapper(self, *, draft_block_decode):
+    def _wrapper(self, *, draft_block_decode, families=("history",)):
         return SimpleNamespace(
             draft_attn_backend=SimpleNamespace(
                 uses_cache_groups=True,
                 draft_block_decode=draft_block_decode,
+                cache_consumer_families=frozenset(families),
             ),
             draft_token_to_kv_pool=SimpleNamespace(
                 paged_cache_group_specs=(
                     SimpleNamespace(group_id="full_attention", family="history"),
+                    SimpleNamespace(group_id="state", family="state"),
                 )
             ),
         )
@@ -155,6 +157,17 @@ class DraftCacheGroupIdsTest(_TorchCase):
         self.assertEqual(
             self.group_ids(self._wrapper(draft_block_decode=False)),
             ("full_attention",),
+        )
+
+    def test_stateful_draft_uses_published_state_groups(self):
+        self.assertEqual(
+            self.group_ids(
+                self._wrapper(
+                    draft_block_decode=False,
+                    families=("history", "state"),
+                )
+            ),
+            ("full_attention", "state"),
         )
 
 

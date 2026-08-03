@@ -929,6 +929,8 @@ def create_attn_components(
             server_args.drafter_attention_backend = None
 
     config = _create_attn_config(server_args, model_config)
+    if is_deepseek_v4_model:
+        config.sliding_window_tokens = int(model_config.hf_config.sliding_window)
     if is_inkling and server_args.disaggregation_mode in ("prefill", "decode"):
         raise NotImplementedError("Inkling PD is not supported")
     target_text_config = getattr(
@@ -947,9 +949,13 @@ def create_attn_components(
     use_lcm_k3 = is_hybrid_mla_kda
     use_lcm_inkling = is_inkling
     lcm_family = (
-        "qwen_gdn"
-        if use_lcm_gdn
-        else "kimi_k3" if use_lcm_k3 else "inkling" if use_lcm_inkling else None
+        "deepseek_v4"
+        if is_deepseek_v4_model
+        else (
+            "qwen_gdn"
+            if use_lcm_gdn
+            else "kimi_k3" if use_lcm_k3 else "inkling" if use_lcm_inkling else None
+        )
     )
     if has_state and lcm_family is None:
         raise RuntimeError(
@@ -970,6 +976,10 @@ def create_attn_components(
         if draft_model_config
         else None
     )
+    if is_deepseek_v4_draft_model:
+        draft_attn_config.sliding_window_tokens = int(
+            draft_model_config.hf_config.sliding_window
+        )
     draft_architectures = (
         getattr(draft_model_config.hf_config, "architectures", None) or []
         if draft_model_config is not None
@@ -1058,49 +1068,7 @@ def create_attn_components(
         ),
     )
 
-    if is_deepseek_v4_model:
-        from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
-            profile_deepseek_v4_max_num_pages,
-        )
-
-        draft_cache_cell_size = _resolve_draft_cache_cell_size_for_profile(
-            draft_attn_config,
-            draft_model_config,
-            draft_profile_cache_cell_size,
-        )
-        max_total_num_pages = profile_deepseek_v4_max_num_pages(
-            layout=deepseek_v4_layout,
-            hf_config=model_config.hf_config,
-            layer_num=num_layers,
-            max_live_requests=config.max_bs,
-            max_scheduled_tokens=server_args.chunked_prefill_size,
-            max_context_len=config.context_len,
-            available_cache_memory_bytes=profile_available_cache_memory_bytes(
-                attn_config=config,
-                gpu_id=gpu_id,
-                tp_size=server_args.mapping.world_size,
-                gpu_memory_utilization=server_args.gpu_memory_utilization,
-                total_gpu_memory=gpu_memory,
-                world_group=server_args.mapping.world_group,
-            ),
-            draft_cache_cell_size=draft_cache_cell_size,
-            decode_input_tokens=decode_input_tokens,
-            overlap_schedule_depth=overlap_schedule_depth,
-        )
-        logger.info(
-            "DeepSeek V4 grouped KV profile: max_live_requests=%s "
-            "(attn config max_bs=%s, attn_dp_size=%s), max_total_num_pages=%s",
-            config.max_bs,
-            config.max_bs,
-            server_args.mapping.attn.dp_size,
-            max_total_num_pages,
-        )
-        max_num_tokens = _resolve_max_num_tokens(
-            max_total_num_pages,
-            server_args.block_size,
-            server_args.max_total_tokens,
-        )
-    elif lcm_family is not None:
+    if lcm_family is not None:
         cache_memory = profile_available_cache_memory_bytes(
             attn_config=config,
             gpu_id=gpu_id,
@@ -1223,6 +1191,8 @@ def create_attn_components(
             max_scheduled_tokens=server_args.chunked_prefill_size,
             decode_input_tokens=decode_input_tokens,
             overlap_schedule_depth=overlap_schedule_depth,
+            memory_plan=lcm_setup.target.memory_plan,
+            token_capacity=lcm_setup.target.token_capacity,
         )
     elif is_hybrid_linear:
         backend, pool = _create_hybrid_linear_attn(
@@ -1303,6 +1273,8 @@ def create_attn_components(
             draft_attn_backend = _create_attn_backend(
                 draft_model_config.attention_arch, draft_attn_config
             )
+            if lcm_setup.draft is None:
+                raise RuntimeError("DeepSeek V4 MTP requires a draft LCM plan")
             draft_pool = DeepseekV4TokenToKVPool(
                 size=draft_max_num_tokens,
                 model_dtype=draft_model_config.dtype,
@@ -1318,6 +1290,8 @@ def create_attn_components(
                 max_scheduled_tokens=server_args.chunked_prefill_size,
                 decode_input_tokens=decode_input_tokens,
                 overlap_schedule_depth=overlap_schedule_depth,
+                memory_plan=lcm_setup.draft.memory_plan,
+                token_capacity=lcm_setup.draft.token_capacity,
             )
         elif draft_is_hybrid_gdn:
             draft_attn_backend, draft_pool = _create_hybrid_linear_attn(

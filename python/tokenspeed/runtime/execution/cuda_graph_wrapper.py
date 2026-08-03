@@ -238,6 +238,11 @@ class CudaGraphWrapper:
             attn_backend,
             self.max_bs,
             paged_cache_group_specs=tuple(token_to_kv_pool.paged_cache_group_specs),
+            logical_page_size=getattr(
+                getattr(token_to_kv_pool, "runtime_contract", None),
+                "block_size",
+                None,
+            ),
             max_tokens_per_req=self.max_tokens_per_req,
             overlap_schedule_depth=self.overlap_schedule_depth,
         )
@@ -247,6 +252,11 @@ class CudaGraphWrapper:
                 self.max_bs,
                 paged_cache_group_specs=tuple(
                     draft_token_to_kv_pool.paged_cache_group_specs
+                ),
+                logical_page_size=getattr(
+                    getattr(draft_token_to_kv_pool, "runtime_contract", None),
+                    "block_size",
+                    None,
                 ),
                 max_tokens_per_req=self.max_tokens_per_req,
                 overlap_schedule_depth=self.overlap_schedule_depth,
@@ -636,11 +646,12 @@ class CudaGraphWrapper:
         DFLASH block decode owns an independent draft page table and must stay
         on that single-table path. Other draft heads share the target's page-id
         space (EAGLE writes its own pool tensors at the same indices), so each
-        draft group consumes the target table of the same group id.
+        draft group consumes the target tables for the cache families declared
+        by its backend.
 
         A draft pool that publishes its own specs (Inkling MTP: mixed full/SWA
         depths) names exactly the groups its layers carry. Older draft paths
-        without a separate pool keep the full-history fallback.
+        without a separate pool select the same families from the target pool.
         """
         if self.draft_attn_backend is None or not getattr(
             self.draft_attn_backend, "uses_cache_groups", False
@@ -648,18 +659,25 @@ class CudaGraphWrapper:
             return ()
         if getattr(self.draft_attn_backend, "draft_block_decode", False):
             return ()
+        families = frozenset(
+            getattr(
+                self.draft_attn_backend,
+                "cache_consumer_families",
+                ("history",),
+            )
+        )
         if self.draft_token_to_kv_pool is not None and getattr(
             self.draft_token_to_kv_pool, "paged_cache_group_specs", ()
         ):
             return tuple(
                 str(spec.group_id)
                 for spec in self.draft_token_to_kv_pool.paged_cache_group_specs
-                if spec.family != "state"
+                if spec.family in families
             )
         return tuple(
             str(spec.group_id)
             for spec in self.token_to_kv_pool.paged_cache_group_specs
-            if spec.family != "state" and spec.retention == "full_history"
+            if spec.family in families
         )
 
     def _draft_group_tables(self, block_tables):
