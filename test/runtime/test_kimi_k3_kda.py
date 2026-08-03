@@ -516,9 +516,9 @@ class _KDAHarness:
         )
         return (
             naive_out.flatten(0, 1),
-            naive_state.transpose(-1, -2),
+            naive_state,
             fla_out[0].flatten(0, 1),
-            fla_state[0].float().transpose(-1, -2),
+            fla_state[0].float(),
         )
 
 
