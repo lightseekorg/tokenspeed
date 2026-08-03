@@ -48,6 +48,10 @@ class All2AllBackend(Enum):
     NONE = "none"
     DEEPEP = "deepep"
     FLASHINFER_NVLINK_ONE_SIDED = "flashinfer_nvlink_one_sided"
+    # AMD-native EP dispatch/combine via MORI (github.com/ROCm/mori). IntraNode
+    # (XGMI) + InterNode (RDMA) kernels; real all-to-all, unlike the masked-replicate
+    # `none` fallback.
+    MORI = "mori"
 
     @classmethod
     def _missing_(cls, value):
@@ -66,6 +70,16 @@ class All2AllBackend(Enum):
 
     def is_flashinfer_nvlink_one_sided(self):
         return self == All2AllBackend.FLASHINFER_NVLINK_ONE_SIDED
+
+    def is_mori(self):
+        return self == All2AllBackend.MORI
+
+    def is_all_to_all(self):
+        """True for backends that perform a real dispatch/combine all-to-all inside the
+        MoE kernel (as opposed to the masked-replicate ``none`` fallback). Such backends
+        return the COMPLETE per-token result and must run through the model's all-to-all
+        MoE forward (local/dp-sharded tokens, no framework MoE collective)."""
+        return self in (All2AllBackend.DEEPEP, All2AllBackend.MORI)
 
 
 class MoeBackend(Enum):

@@ -1,0 +1,77 @@
+api_version: ci.tokenspeed.io/v1
+name: eval-kimi-k2.5-mxfp4-aime25-mori-ep-amd
+type: eval
+workflow_stage: model-test
+# End-to-end accuracy for the MORI all-to-all expert-parallel MoE path (the AMD-native
+# EP dispatch/combine backend + native MXFP4 grouped-GEMM). Runs dp=4 DP-attention
+# (--data-parallel-size 4, RSAG comm mode) -- the performant use case -- so it exercises
+# forward_alltoall (real dispatch/combine + shared-expert all-gather/reduce-scatter), not
+# just the kernel. GRAPH mode (no --enforce-eager) also gates the graph-capturable mxfp4 EP
+# kernel. Kept `optional` (continue-on-error) and manual/per-commit until the ROCm CI image
+# ships MORI + flydsl by default; promote to a required gate once the runner provides them.
+triggers:
+  - manual
+  - per-commit
+optional: true
+runner:
+  labels:
+    - amd-mi35x-4gpu-test
+env:
+  CI: "true"
+  # MORI symmetric-buffer VMM per rank, and disable the flydsl disk cache: all EP ranks
+  # (world-size 4) compile the v2 device kernels concurrently and share ~/.flydsl/cache,
+  # which races into a corrupt binary on first use -- compile in-memory instead.
+  MORI_PER_RANK_VMM: "8589934592"
+  FLYDSL_RUNTIME_ENABLE_CACHE: "0"
+  # Per-rank MORI dispatch capacity (tokens/rank). Must upper-bound tokens/rank per step;
+  # --chunked-prefill-size below is set to the same value so prefill (and the autotune
+  # dummy prefill, which is chunked_prefill_size tokens) never exceeds the cap. Larger
+  # prefills need a bigger cap + VMM; a decode-cap-independent gather is a follow-on.
+  MORI_EP_MAX_TOKENS_PER_RANK: "2048"
+install:
+  - bash test/ci_system/install_deps_rocm.sh
+  # MORI EP deps from the pre-built PyPI wheel (amd-mori) -- no source build. The wheel's
+  # .so links libgrpc++.so.1.51 (Ubuntu: libgrpc++1.51t64) at runtime; provide it in the
+  # runner image if absent. This job is `optional`, so a missing grpc/ROCm dep is soft-fail.
+  - python3 -m pip install "amd-mori[flydsl]==1.2.2"
+server:
+  command: >-
+    ts serve
+    --model amd/Kimi-K2.5-MXFP4
+    --host 127.0.0.1
+    --port 8000
+    --world-size 4
+    --max-model-len 32768
+    --max-num-seqs 16
+    --trust-remote-code
+    --quantization mxfp4
+    --enable-expert-parallel
+    --all2all-backend mori
+    --data-parallel-size 4
+    --dist-init-addr 127.0.0.1:4100
+    --dense-tp-size 1
+    --chunked-prefill-size 2048
+    --sampling-backend greedy
+    --disable-kvstore
+    --kvstore-ratio 0.0
+    --enable-cache-report
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 1800
+    interval: 10
+eval:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
+  command: >-
+    /tmp/evalscope-perf/bin/evalscope eval
+    --model amd/Kimi-K2.5-MXFP4
+    --api-url http://127.0.0.1:8000/v1
+    --api-key EMPTY_TOKEN
+    --datasets aime25
+    --limit 4
+    --eval-batch-size 4
+    --stream
+    --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":8192}'
+report:
+  github_step_summary: true
+score_threshold: 0.75

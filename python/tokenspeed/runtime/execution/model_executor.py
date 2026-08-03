@@ -1137,6 +1137,15 @@ class ModelExecutor:
 
         return result
 
+    # Must run in the same inference-mode context as the real forward (_forward_step).
+    # In any DP configuration this idle forward still joins the MLP/MoE collectives --
+    # RSAG reduce-scatter for the dense / masked-replicate-EP path, or an all-to-all
+    # backend's dispatch/combine -- and those update accumulation / symmetric buffers
+    # in place. The buffers are allocated as inference tensors by the real forward, so
+    # touching them outside inference_mode raises ("Inplace update to inference tensor
+    # ...") and crashes this rank mid-collective, hanging every other rank waiting on
+    # it -> a deadlock. Applies to both the AMD Triton RSAG path and MORI.
+    @maybe_inference_mode()
     def execute_idle_forward(
         self,
         global_num_tokens: list[int],

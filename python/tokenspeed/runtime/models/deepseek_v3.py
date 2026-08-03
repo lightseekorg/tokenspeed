@@ -92,7 +92,7 @@ from tokenspeed.runtime.layers.linear import (
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import TopK
-from tokenspeed.runtime.layers.moe.utils import RoutingMethodType
+from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, get_all2all_backend
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
@@ -387,12 +387,86 @@ class DeepseekV3MoE(nn.Module):
                 enable_pdl=pdl_enabled(),
             )
         else:
+            # all_reduce comm-mode compensation for real all-to-all backends. When
+            # attn.tp_size == moe.tp_ep_size (dp=1 full-EP) the decoder's post_mlp_fused
+            # all_reduces the MoE output over the tp_ep group, expecting a PARTIAL
+            # (masked-replicate) contribution. MORI/DeepEP return the COMPLETE routed result
+            # on every rank, so pre-divide by tp_ep_size and let all_reduce reconstruct it.
+            # The shared expert is tp_ep-sharded (partial) and is completed by the same
+            # all_reduce, so it is NOT divided. (dp>1 uses forward_alltoall, which has no
+            # framework MoE reduce.)
+            if (
+                get_all2all_backend().is_all_to_all()
+                and self.mapping.attn.tp_size == self.mapping.moe.tp_ep_size
+                and self.mapping.moe.tp_ep_size > 1
+            ):
+                routed_expert_output = (
+                    routed_expert_output / self.mapping.moe.tp_ep_size
+                )
             final_hidden_states = (
                 routed_expert_output + shared_output
                 if shared_output is not None
                 else routed_expert_output
             )
         return final_hidden_states
+
+    def forward_alltoall(
+        self,
+        hidden_states: torch.Tensor,
+        num_global_tokens: int,
+        max_num_tokens_per_gpu: int,
+        comm_manager,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        """All-to-all EP forward for real dispatch/combine backends (e.g. MORI), dp>1 only.
+
+        Used for dp>1 DP-attention, where attn.tp_size != moe.tp_ep_size selects the RSAG
+        comm mode; dp=1 full-EP instead takes the standard DeepseekV3MoE.forward path (see
+        forward_mlp). The routed experts return the COMPLETE result from the backend's
+        combine (no framework MoE reduce); only the tp_ep-sharded shared expert is reduced,
+        via pre/post_moe_comm (all-gather + reduce-scatter under RSAG).
+
+        Tokens are local per rank (distinct dp shards). Routing + routed experts run on the
+        LOCAL tokens; the MORI/DeepEP kernel does dispatch -> expert GEMM -> combine
+        internally and returns the COMPLETE per-local-token result, so NO framework MoE
+        collective is used for the routed path (unlike the masked-replicate ``none`` path).
+
+        The shared expert is tp_ep-sharded (RowParallel, reduce_results=False), so it needs
+        the full batch: all-gather the local shards over the moe.tp_ep group (``pre_moe_comm``),
+        compute the partial shared output, then reduce-scatter back to local shards
+        (``post_moe_comm``) — which both sums the partials and returns this rank's shard.
+        Mirrors qwen3_5_moe._forward_deepep, adapted to DeepSeek's decoder-owned comm.
+        """
+        num_tokens = hidden_states.size(0)
+        router_logits = self.gate(hidden_states)
+        if num_tokens > 0:
+            topk_output = self.topk(hidden_states, router_logits)
+        else:
+            topk_output = self.topk.empty_topk_output(
+                hidden_states.device,
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+            )
+
+        # routed experts: MORI all-to-all on local tokens -> complete, no framework reduce
+        routed = self.experts(
+            hidden_states=hidden_states,
+            topk_output=topk_output,
+            num_global_tokens=num_global_tokens,
+            max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+            do_finalize=True,
+        )
+
+        if self.n_shared_experts is not None:
+            full = comm_manager.pre_moe_comm(
+                hidden_states, ctx
+            )  # all-gather -> full batch
+            shared_full = self.shared_experts(full)  # tp_ep-sharded partial
+            shared_local, _ = comm_manager.post_moe_comm(
+                shared_full, None, ctx
+            )  # reduce-scatter
+            routed = routed + shared_local
+        return routed
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
@@ -1421,6 +1495,26 @@ class DeepseekV3DecoderLayer(nn.Module):
         num_global_tokens,
         max_num_tokens_per_gpu,
     ):
+        # All-to-all EP path (real dispatch/combine backend, e.g. MORI) in RSAG mode only
+        # (dp>1 DP-attention): the MoE keeps tokens LOCAL and does its own dispatch/combine,
+        # returning the COMPLETE routed result, so we bypass the framework's pre/post-MoE
+        # collectives for the routed path (forward_alltoall reduces only the shared expert
+        # via pre/post_moe_comm). dp=1 full-EP (use_all_reduce) instead falls through to the
+        # standard path below, whose post_mlp_fused all_reduce reconstructs the routed result
+        # from the /tp_ep_size-compensated per-rank output (see DeepseekV3MoE.forward).
+        if (
+            self.is_moe_layer
+            and get_all2all_backend().is_all_to_all()
+            and not self.comm_manager.use_all_reduce(is_moe=True)
+        ):
+            return self.mlp.forward_alltoall(
+                hidden_states,
+                num_global_tokens,
+                max_num_tokens_per_gpu,
+                self.comm_manager,
+                ctx,
+            )
+
         hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
         if self.is_moe_layer:
             hidden_states = self.mlp(
