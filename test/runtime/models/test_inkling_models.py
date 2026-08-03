@@ -115,7 +115,7 @@ class TestInklingConfigRegistry(unittest.TestCase):
         self.assertEqual(inkling_conv_total_dim(text, 1), 2 * kv_dim + 2 * h)
 
     def test_paged_cache_layer_types_sliding_subgroups(self):
-        """Flat-KV group labels: sliding layers split round-robin into
+        """Cache-group labels: sliding layers split round-robin into
         equal-count sub-groups sized by the full-layer count, so every
         hybrid slab is bound by one layer of each group (5+1 truncated,
         5x11+11 at full depth; see paged_cache_spec.hybrid_slab_group_size).

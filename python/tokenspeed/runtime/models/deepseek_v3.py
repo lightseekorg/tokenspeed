@@ -787,7 +787,7 @@ class DeepseekV3AttentionMLA(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Model-owned KV writes route their locations through the backend:
         # identity on the legacy path (base AttentionBackend hook), the
-        # group-derived locations on the FlatKV path.
+        # group-derived locations on the Paged cache path.
         out_cache_loc = ctx.attn_backend.select_out_cache_loc(
             self.attn_mqa, out_cache_loc, ctx.forward_mode
         )
@@ -986,7 +986,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         out_cache_loc: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # See forward_absorb_qkv_proj: backend-selected write locations
-        # (identity off the FlatKV path).
+        # (identity off the Paged cache path).
         out_cache_loc = ctx.attn_backend.select_out_cache_loc(
             self.attn_mha, out_cache_loc, ctx.forward_mode
         )

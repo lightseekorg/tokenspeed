@@ -62,7 +62,6 @@ global_server_args_dict: dict = {
     "cudagraph_capture_sizes": ServerArgs.cudagraph_capture_sizes,
     "disable_prefill_graph": ServerArgs.disable_prefill_graph,
     "prefill_graph_max_tokens": ServerArgs.prefill_graph_max_tokens,
-    "mamba_track_interval": ServerArgs.mamba_track_interval,
     "all2all_backend": ServerArgs.all2all_backend,
     "deepep_mode": ServerArgs.deepep_mode,
 }

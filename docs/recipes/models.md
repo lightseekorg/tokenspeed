@@ -167,16 +167,12 @@ pip install flash-linear-attention
 
 Notes:
 
-- K3 is FlatKV-only. Build the `tokenspeed_scheduler` extension with
-  `-DTOKENSPEED_FLAT_KVCACHE=ON`
-  (`SKBUILD_CMAKE_DEFINE="TOKENSPEED_FLAT_KVCACHE=ON" pip install -e
-  tokenspeed-scheduler/`); startup preflight rejects radix builds with a
-  clear error.
+- K3 uses the grouped paged-cache scheduler and KDA state groups.
 - KDA dispatch is vendor-neutral at the runtime boundary. The kernel registry
   selects the existing FLA-derived NVIDIA implementation or the native AMD
   implementation, including each backend's preferred recurrent-state layout.
   The runtime does not transpose or reinterpret that state.
-- NVIDIA auto-selects `--attention-backend tokenspeed_mla` for K3 FlatKV
+- NVIDIA auto-selects `--attention-backend tokenspeed_mla` for K3
   (fp8 KV required). AMD uses the `mla` backend.
 - `tokenspeed serve` auto-selects the `kimi_k3` reasoning and tool-call
   parsers. Explicit parser flags override these defaults.
@@ -193,7 +189,7 @@ Notes:
   `media_proc_cfg.in_patch_limit=65536`; silently falling back to K2.5's
   16384-patch default reduces OCR resolution.
 - KDA recurrent-state pages register for prefix-cache reuse only when a
-  prefill chunk ends exactly on a FlatKV page boundary. The engine floors
+  prefill chunk ends exactly on a logical cache-page boundary. The engine floors
   `--chunked-prefill-size` to the plan's page grain automatically (logged as
   a warning when it adjusts); the page grain is budget-dependent (e.g. 1472
   at 32k context, 1536 at 1M), so do not hand-tune the chunk size against a
@@ -389,9 +385,6 @@ scheduler — the runtime disables overlap scheduling automatically when
 speculative decoding and paged-cache groups are both active — and prefix caching
 stays on by default. Add `--enable-metrics` to read `Decoded Tok/Iter` and the
 speculative accept rate from the run summary.
-
-DeepSeek V4 MTP currently requires `--disable-kvstore`; grouped paged-cache
-loadback does not yet restore the independent draft KV pool.
 
 ## Tuning Order
 

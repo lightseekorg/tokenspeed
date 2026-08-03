@@ -20,15 +20,13 @@
 
 #pragma once
 
-#include <cstdint>
-#include <variant>
 #include <string>
+#include <variant>
 #include <vector>
 
-#include "scheduler/outside_events/pd.h"
 #include "scheduler/outside_events/cache.h"
 #include "scheduler/outside_events/forward.h"
-#include "resource/types.h"
+#include "scheduler/outside_events/pd.h"
 
 namespace tokenspeed {
 

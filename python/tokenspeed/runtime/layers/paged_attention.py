@@ -56,8 +56,8 @@ class PagedAttention(nn.Module):
         self.layer_id = layer_id
         self.logit_cap = logit_cap
         self.sliding_window_size = sliding_window_size or -1
-        # Flat KV-cache group ("" -> single-table fallback in the backend).
-        # TODO(radix-removal): make group_id mandatory once flat is the only path.
+        # paged cache group ("" -> single-table fallback in the backend).
+        # make group_id mandatory once flat is the only path.
         self.group_id = group_id
         self.k_scale = None
         self.v_scale = None

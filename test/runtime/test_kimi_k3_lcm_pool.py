@@ -23,7 +23,6 @@ def test_kimi_k3_pool_binds_mla_and_kda_to_one_lcm_backing() -> None:
     num_lcm_blocks = 2
     plan = plan_kimi_k3_lcm_cache(
         text_config,
-        flat_kvcache_enabled=True,
         tp_size=8,
         mla_cache_dtype=torch.float8_e4m3fn,
         mla_quant_method=None,
