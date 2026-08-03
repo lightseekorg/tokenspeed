@@ -296,7 +296,7 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
             # kernel itself. Masked GEMM never reads padded rows, so neither
             # output needs a separate zero-fill pass.
             down_in, down_scales = fused_swiglu_fp8_ue8m0_masked_packed(
-                gateup, masked_m
+                gateup, masked_m, expected_m=expected_m
             )
         else:
             down_in = torch.empty(

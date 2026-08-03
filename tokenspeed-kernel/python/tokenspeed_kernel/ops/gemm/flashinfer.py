@@ -85,6 +85,37 @@ if platform.is_hopper_plus:
     except ImportError:
         pass
 
+
+def has_flashinfer_fp8_blockscale() -> bool:
+    """Return whether the native FlashInfer FP8 block-scale GEMM is usable."""
+    return (
+        gemm_fp8_nt_groupwise is not error_fn
+        and platform.arch_version == ArchVersion(10, 0)
+    )
+
+
+def prepare_flashinfer_fp8_blockscale_weight_scales(
+    scales: torch.Tensor,
+) -> torch.Tensor:
+    """Pack canonical weight scales into FlashInfer's MN-major layout.
+
+    Args:
+        scales: Contiguous canonical scales shaped ``[N / 128, K / 128]``.
+
+    Returns:
+        A contiguous tensor shaped ``[K / 128, N / 128]``. This conversion is
+        intended to run once after weight loading rather than in every GEMM.
+    """
+    if scales.ndim != 2:
+        raise ValueError(f"weight scales must be 2-D, got shape {tuple(scales.shape)}")
+    if scales.dtype != torch.float32:
+        raise ValueError(
+            "FlashInfer FP8 block-scale weight scales must use float32, "
+            f"got {scales.dtype}"
+        )
+    return scales.transpose(0, 1).contiguous()
+
+
 if gemm_fp8_nt_groupwise is not error_fn:
 
     @register_kernel(
@@ -114,29 +145,71 @@ if gemm_fp8_nt_groupwise is not error_fn:
         alpha: torch.Tensor | None = None,
         block_size: list[int] | None = None,
         out: torch.Tensor | None = None,
+        prepacked_scales: bool = False,
+        original_m: int | None = None,
     ) -> torch.Tensor:
         assert (
             A_scales is not None
         ), "A_scales is required; online quantization should be done by the caller"
         assert B_scales is not None, "B_scales is required for FP8 blockscale GEMM"
-        orig_m = A.shape[0]
-        scale_m = A_scales.shape[0]
-        if orig_m % 4 != 0 or scale_m != orig_m:
-            padded_m = max(((orig_m + 3) // 4) * 4, scale_m)
-            A_padded = A.new_zeros((padded_m, A.shape[1]))
-            A_padded[:orig_m] = A
+        orig_m = A.shape[0] if original_m is None else int(original_m)
+        if prepacked_scales:
+            if block_size is not None and tuple(block_size) != (128, 128):
+                raise ValueError(
+                    "prepacked FlashInfer scales require block_size=[128, 128], "
+                    f"got {block_size}"
+                )
+            if not 0 < orig_m <= A.shape[0]:
+                raise ValueError(
+                    f"original_m must be in [1, {A.shape[0]}], got {orig_m}"
+                )
+            if A.shape[0] % 4:
+                raise ValueError(
+                    "prepacked FlashInfer activations must have an M dimension "
+                    f"divisible by four, got {A.shape[0]}"
+                )
+            expected_a_scales = (A.shape[1] // 128, A.shape[0])
+            expected_b_scales = (B.shape[1] // 128, B.shape[0] // 128)
+            if (
+                tuple(A_scales.shape) != expected_a_scales
+                or not A_scales.is_contiguous()
+            ):
+                raise ValueError(
+                    "prepacked activation scales must be contiguous with shape "
+                    f"{expected_a_scales}, got shape={tuple(A_scales.shape)} "
+                    f"stride={tuple(A_scales.stride())}"
+                )
+            if (
+                tuple(B_scales.shape) != expected_b_scales
+                or not B_scales.is_contiguous()
+            ):
+                raise ValueError(
+                    "prepacked weight scales must be contiguous with shape "
+                    f"{expected_b_scales}, got shape={tuple(B_scales.shape)} "
+                    f"stride={tuple(B_scales.stride())}"
+                )
+            gemm_a_scales = A_scales
+            gemm_b_scales = B_scales
+        else:
+            scale_m = A_scales.shape[0]
+            if orig_m % 4 != 0 or scale_m != orig_m:
+                padded_m = max(((orig_m + 3) // 4) * 4, scale_m)
+                A_padded = A.new_zeros((padded_m, A.shape[1]))
+                A_padded[:orig_m] = A
 
-            if scale_m != padded_m:
-                A_scales_padded = A_scales.new_ones((padded_m, A_scales.shape[1]))
-                A_scales_padded[:scale_m] = A_scales
-                A_scales = A_scales_padded
-            A = A_padded
+                if scale_m != padded_m:
+                    A_scales_padded = A_scales.new_ones((padded_m, A_scales.shape[1]))
+                    A_scales_padded[:scale_m] = A_scales
+                    A_scales = A_scales_padded
+                A = A_padded
+            gemm_a_scales = A_scales.t().contiguous()
+            gemm_b_scales = B_scales.t().contiguous()
 
         output = gemm_fp8_nt_groupwise(
             A,
             B,
-            A_scales.t().contiguous(),
-            B_scales.t().contiguous(),
+            gemm_a_scales,
+            gemm_b_scales,
             scale_major_mode="MN",
             out_dtype=out_dtype,
         )

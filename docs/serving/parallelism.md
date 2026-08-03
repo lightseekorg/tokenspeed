@@ -95,11 +95,20 @@ The prefill CUDA graph is disabled whenever an all-to-all backend is selected:
 normal-mode dispatch reports its per-expert receive counts to the host, and a
 host sync cannot be captured. Decode graphs are unaffected.
 
+TokenSpeed initializes DeepEP with `allow_mnnvl=False`. This keeps intra-node
+sharing on CUDA IPC and avoids requiring an NVIDIA IMEX channel for Fabric
+handles. The current integration does not enable MNNVL Fabric-handle sharing;
+multi-node deployments continue to use the RDMA path described above.
+
 For block-scale FP8 decode on NVIDIA, the low-latency path keeps routing
 metadata in DeepEP's required contiguous int64/float32 formats across both
 collective legs. Its fused SwiGLU quantizer writes packed UE8M0 scales directly
 in DeepGEMM's MN-major TMA layout, so padded rows need no zero-fill and the
 second expert GEMM needs no separate activation-scale transpose/pack pass.
+For sparse decode it launches a bounded number of row splits per expert and
+walks only rows below the device-side expert count; full-capacity workloads
+retain one-CTA-per-row parallelism. The host-side expected-row estimate selects
+between these mappings without synchronizing the expert counts to the CPU.
 Expert weight scales are expanded and packed once when weights are loaded,
 instead of ahead of both expert GEMMs in every layer forward. Shared-expert work
 is queued between the dispatch send and receive legs to overlap the collective
@@ -108,6 +117,13 @@ produce packed UE8M0 scales directly in its column-major TMA layout. Normal-mode
 dispatch still transports FP32 power-of-two scales, but the existing expert
 scatter packs them while permuting tokens, so neither mode needs a separate
 sequence of elementwise shifts, fills, copies, and a transpose before GEMM1.
+
+On SM100, dense `(128, 128)` FP8 projections also keep FlashInfer's MN-major
+scale layout through the decode hot path. Weight scales are transposed once
+after loading, while online activation quantization writes MN-major scales and
+the at-most-three padded rows directly. This removes the per-projection scale
+transposes plus the zero/one fills and device-to-device padding copies that
+would otherwise run between activation quantization and GEMM.
 
 ## Multi-Node
 

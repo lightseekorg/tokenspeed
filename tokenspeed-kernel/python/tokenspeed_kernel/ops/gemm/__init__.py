@@ -184,6 +184,7 @@ def _online_quantize_mxfp8(
     block_size: list[int],
     kernel_name: str,
     enable_pdl: bool = False,
+    prepacked_scales: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Perform online activation quantization for mxfp8 block-scaled GEMM.
 
@@ -191,10 +192,22 @@ def _online_quantize_mxfp8(
     name because different backends require different scale layouts.
 
     Args:
+        A: Activation matrix to quantize.
+        block_size: Block-scale dimensions used by the selected GEMM.
+        kernel_name: Name of the selected GEMM implementation.
         enable_pdl: Request Programmatic Dependent Launch for the quantize
             kernel. Only the flashinfer path honors it; other backends ignore it.
+        prepacked_scales: Produce the selected kernel's prepared activation
+            scale layout without a follow-up transpose.
     """
     block_k = block_size[1]
+
+    if kernel_name == "flashinfer_mm_fp8_blockscale" and prepacked_scales:
+        from tokenspeed_kernel.ops.gemm.fp8_utils import (
+            flashinfer_fp8_blockscale_quantize_prepacked,
+        )
+
+        return flashinfer_fp8_blockscale_quantize_prepacked(A, block_k)
 
     if kernel_name == "flashinfer_mm_mxfp8":
         from flashinfer import mxfp8_quantize
@@ -333,6 +346,7 @@ def mm(
     quant: str | None = None,
     enable_pdl: bool = False,
     override: str | None = None,
+    prepacked_scales: bool = False,
 ) -> torch.Tensor:
     """Dense matrix multiply with automatic kernel selection.
 
@@ -363,6 +377,10 @@ def mm(
             from kernels that accept it.
         override: Force selection of a specific kernel by name (e.g.
             ``"cublaslt_mm_nvfp4"``). Bypasses heuristic scoring.
+        prepacked_scales: Whether activation and weight scales use the selected
+            kernel's native prepared layout. Currently supported only by the
+            FlashInfer FP8 block-scale GEMM. Online activation quantization
+            produces its prepared layout automatically.
     """
     out_dtype = out_dtype or (out.dtype if out is not None else A.dtype)
 
@@ -407,6 +425,11 @@ def mm(
         traits=traits,
         override=override,
     )
+    if prepacked_scales and kernel.name != "flashinfer_mm_fp8_blockscale":
+        raise ValueError(
+            "prepacked_scales is only supported by "
+            f"flashinfer_mm_fp8_blockscale, selected {kernel.name!r}"
+        )
 
     # Online activation quantization
     if (
@@ -418,7 +441,11 @@ def mm(
             block_size is not None
         ), "block_size is required for online activation quantization"
         A, A_scales = _online_quantize_mxfp8(
-            A, block_size, kernel.name, enable_pdl=enable_pdl
+            A,
+            block_size,
+            kernel.name,
+            enable_pdl=enable_pdl,
+            prepacked_scales=prepacked_scales,
         )
 
     kernel_args = (A, B, A_scales, B_scales, out_dtype)
@@ -428,6 +455,9 @@ def mm(
     }
     if out is not None:
         kernel_kwargs["out"] = out
+    if prepacked_scales:
+        kernel_kwargs["prepacked_scales"] = True
+        kernel_kwargs["original_m"] = M
 
     fused_bias = bias is not None and kernel.name in _KERNELS_WITH_FUSED_BIAS
     if fused_bias:

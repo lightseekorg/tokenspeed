@@ -632,11 +632,13 @@ def fused_swiglu_fp8_ue8m0(
 
 
 @triton.jit
-def _fused_swiglu_fp8_ue8m0_masked_packed_kernel(
+def _fused_swiglu_fp8_ue8m0_masked_packed_row(
     gate_up_ptr,
     out_ptr,
     scale_ptr,
-    masked_m_ptr,
+    expert,
+    row,
+    pack_col,
     N: tl.constexpr,
     gate_up_stride_e,
     gate_up_stride_m,
@@ -651,17 +653,8 @@ def _fused_swiglu_fp8_ue8m0_masked_packed_kernel(
     GROUP_SIZE: tl.constexpr,
     PACK: tl.constexpr,
 ):
-    """Masked SwiGLU quantization writing DeepGEMM's packed scale layout."""
-    pid = tl.program_id(0)
-    expert = tl.program_id(1)
+    """Process one expert row and one four-scale pack."""
     groups_per_row: tl.constexpr = N // GROUP_SIZE
-    packs_per_row: tl.constexpr = (groups_per_row + PACK - 1) // PACK
-    row = pid // packs_per_row
-    pack_col = pid % packs_per_row
-
-    if row >= tl.load(masked_m_ptr + expert):
-        return
-
     BLOCK: tl.constexpr = GROUP_SIZE * PACK
     col0 = pack_col * BLOCK
     cols = col0 + tl.arange(0, BLOCK)
@@ -704,9 +697,114 @@ def _fused_swiglu_fp8_ue8m0_masked_packed_kernel(
     tl.store(scale_ptr + scale_offset, packed_scale)
 
 
+@triton.jit
+def _fused_swiglu_fp8_ue8m0_masked_packed_kernel(
+    gate_up_ptr,
+    out_ptr,
+    scale_ptr,
+    masked_m_ptr,
+    N: tl.constexpr,
+    gate_up_stride_e,
+    gate_up_stride_m,
+    out_stride_e,
+    out_stride_m,
+    scale_stride_e,
+    scale_stride_m,
+    scale_stride_p,
+    eps,
+    bit8_min,
+    bit8_max,
+    GROUP_SIZE: tl.constexpr,
+    PACK: tl.constexpr,
+    ROW_SPLITS: tl.constexpr,
+    USE_ROW_LOOP: tl.constexpr,
+):
+    """Masked SwiGLU quantization writing DeepGEMM's packed scale layout."""
+    pid = tl.program_id(0)
+    expert = tl.program_id(1)
+    groups_per_row: tl.constexpr = N // GROUP_SIZE
+    packs_per_row: tl.constexpr = (groups_per_row + PACK - 1) // PACK
+    valid_rows = tl.load(masked_m_ptr + expert)
+
+    if USE_ROW_LOOP:
+        # Sparse decode: launch a bounded number of row splits per expert and
+        # let each CTA walk only valid rows. This avoids scheduling one CTA for
+        # every row in DeepEP's heavily over-provisioned capacity buffer.
+        pack_col = pid // ROW_SPLITS
+        row = pid % ROW_SPLITS
+        while row < valid_rows:
+            _fused_swiglu_fp8_ue8m0_masked_packed_row(
+                gate_up_ptr,
+                out_ptr,
+                scale_ptr,
+                expert,
+                row,
+                pack_col,
+                N,
+                gate_up_stride_e,
+                gate_up_stride_m,
+                out_stride_e,
+                out_stride_m,
+                scale_stride_e,
+                scale_stride_m,
+                scale_stride_p,
+                eps,
+                bit8_min,
+                bit8_max,
+                GROUP_SIZE,
+                PACK,
+            )
+            row += ROW_SPLITS
+    else:
+        # Dense/full-capacity fallback: retain one CTA per row and pack so full
+        # loads keep the original parallelism and do not serialize row work.
+        row = pid // packs_per_row
+        pack_col = pid % packs_per_row
+        if row >= valid_rows:
+            return
+        _fused_swiglu_fp8_ue8m0_masked_packed_row(
+            gate_up_ptr,
+            out_ptr,
+            scale_ptr,
+            expert,
+            row,
+            pack_col,
+            N,
+            gate_up_stride_e,
+            gate_up_stride_m,
+            out_stride_e,
+            out_stride_m,
+            scale_stride_e,
+            scale_stride_m,
+            scale_stride_p,
+            eps,
+            bit8_min,
+            bit8_max,
+            GROUP_SIZE,
+            PACK,
+        )
+
+
+def _masked_swiglu_row_splits(capacity: int, expected_m: int | None) -> int:
+    """Choose bounded row parallelism without reading device-side masks."""
+    if expected_m is None:
+        return capacity
+    expected_m = int(expected_m)
+    if expected_m <= 0:
+        raise ValueError(f"expected_m must be positive, got {expected_m}")
+
+    # Two-way over-provisioning absorbs ordinary router imbalance. A minimum of
+    # 16 splits protects a hot expert while still shrinking Qwen3.5 EP4's
+    # sparse grid from 65,536 CTAs to 1,024 CTAs.
+    target = max(16, min(expected_m, capacity) * 2)
+    power_of_two = 1 << (target - 1).bit_length()
+    return min(capacity, power_of_two)
+
+
 def fused_swiglu_fp8_ue8m0_masked_packed(
     gate_up: torch.Tensor,
     masked_m: torch.Tensor,
+    expected_m: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused masked SwiGLU and FP8 quantization with packed UE8M0 scales.
 
@@ -720,6 +818,9 @@ def fused_swiglu_fp8_ue8m0_masked_packed(
     Args:
         gate_up: ``[experts, capacity, 2*N]`` BF16 gate/up activations.
         masked_m: ``[experts]`` int32 valid-row counts.
+        expected_m: Host-side estimate of valid rows per expert. Sparse launches
+            use it only to choose row parallelism; ``masked_m`` remains the
+            correctness bound. ``None`` retains one CTA per capacity row.
 
     Returns:
         A pair ``(out, scales)``. ``out`` has shape
@@ -752,9 +853,12 @@ def fused_swiglu_fp8_ue8m0_masked_packed(
     )
     scales = scale_base.transpose(1, 2)[:, :capacity, :]
 
+    row_splits = _masked_swiglu_row_splits(capacity, expected_m)
+    use_row_loop = row_splits < capacity
+    grid_rows = row_splits if use_row_loop else capacity
     info = torch.finfo(out.dtype)
     _fused_swiglu_fp8_ue8m0_masked_packed_kernel[
-        (capacity * packs_per_row, num_experts)
+        (grid_rows * packs_per_row, num_experts)
     ](
         gate_up,
         out,
@@ -773,6 +877,8 @@ def fused_swiglu_fp8_ue8m0_masked_packed(
         bit8_max=info.max,
         GROUP_SIZE=GROUP_SIZE,
         PACK=PACK,
+        ROW_SPLITS=row_splits,
+        USE_ROW_LOOP=use_row_loop,
         num_warps=2,
         num_stages=1,
     )

@@ -199,7 +199,10 @@ class DeepEPBuffer:
             num_rdma_bytes,
             low_latency_mode=deepep_mode.enable_low_latency(),
             num_qps_per_rank=num_qps_per_rank,
-            allow_mnnvl=True,
+            # Fabric handles require every process to have access to an NVIDIA
+            # IMEX channel. Keep the standard CUDA IPC path for the currently
+            # supported single-node and RDMA deployments.
+            allow_mnnvl=False,
         )
         free_gpu_memory_end = _get_available_gpu_memory(torch.cuda.current_device())
         logger.info(
