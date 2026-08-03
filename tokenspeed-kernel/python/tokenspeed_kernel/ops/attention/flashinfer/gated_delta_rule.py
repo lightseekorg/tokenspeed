@@ -60,20 +60,16 @@ platform = current_platform()
 SUPPORTED_HEAD_DIM = 128
 
 _chunk_gated_delta_rule = error_fn
-_has_blackwell_prefill = False
 
-if platform.is_blackwell:
+if platform.is_hopper_plus:
     try:
-        from flashinfer.gdn_kernels import (
-            _has_blackwell_prefill,
-        )
         from flashinfer.gdn_prefill import chunk_gated_delta_rule as _fi_chunk
 
         _chunk_gated_delta_rule = _fi_chunk
     except ImportError:
         pass
 
-# Decode / MTP (K-last, SM90+): independent of the sm100 prefill import above.
+# Decode / MTP (K-last, SM90+).
 _gated_delta_rule_decode_pretranspose = error_fn
 _gated_delta_rule_mtp = error_fn
 _has_gdn_decode = False
@@ -108,7 +104,7 @@ if platform.is_hopper_plus:
 
 
 def is_available() -> bool:
-    """Whether the sm100 GDN kernel can run on this platform."""
+    """Whether the flashinfer GDN chunk-prefill kernel can run on this platform."""
     cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
     # flashinfer's gdn_prefill treats compute-capability major 10 as the
     # Blackwell path (sm100 B200/GB200, sm103 B300), gated on CUDA>=13 and the
@@ -116,9 +112,8 @@ def is_available() -> bool:
     # Mirror that here so the caller does not commit to a crashing fast-path.
     return (
         _chunk_gated_delta_rule is not error_fn
-        and platform.is_blackwell
+        and platform.is_hopper_plus
         and cuda_major >= 13
-        and _has_blackwell_prefill
     )
 
 
@@ -168,7 +163,7 @@ if is_available():
         name="flashinfer_gdn_chunk_prefill",
         solution="flashinfer",
         capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(10, 0),
+            min_arch_version=ArchVersion(9, 0),
             max_arch_version=ArchVersion(10, 3),
             vendors=frozenset({"nvidia"}),
         ),
@@ -182,7 +177,7 @@ if is_available():
             "qk_l2norm": frozenset({False, True}),
             "output_h": frozenset({False, True}),
         },
-        tags={"blackwell", "latency"},
+        tags={"hopper", "blackwell", "latency"},
     )
     def gdn_chunk_prefill(
         q: torch.Tensor,
