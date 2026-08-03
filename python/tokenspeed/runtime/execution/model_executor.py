@@ -423,6 +423,15 @@ class ModelExecutor:
             )
             if hasattr(self.drafter, "bind_target_model"):
                 self.drafter.bind_target_model(self.model_runner.model)
+            # MLA kernel backends expand logical pages to kernel pages.
+            if (
+                draft_attn_backend is not None
+                and hasattr(draft_attn_backend, "req_to_page_token_unit")
+                and self._draft_page_size
+                % getattr(draft_attn_backend, "page_size", self._draft_page_size)
+                == 0
+            ):
+                draft_attn_backend.req_to_page_token_unit = self._draft_page_size
             # EAGLE3/MTP share the target's embed + lm_head; DFLASH ships its
             # own draft weights, so it must NOT inherit the target's.
             if config.spec_algo in ("EAGLE3", "MTP"):

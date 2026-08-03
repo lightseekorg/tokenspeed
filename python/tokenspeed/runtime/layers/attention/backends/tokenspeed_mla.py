@@ -181,6 +181,9 @@ class CuteDSLMLABackend(AttentionBackend):
                 f"tokenspeed_mla backend requires page_size 32 or 64, got {self.page_size}"
             )
 
+        # Token span of one req_to_page id; the model executor overrides it.
+        self.req_to_page_token_unit = self.page_size
+
         # tokenspeed_mla's CuTe DSL kernel only supports fp8_e4m3 KV cache; check
         # at startup so misconfiguration surfaces here, not in the first forward.
         kv_cache_dtype = global_server_args_dict.get("kv_cache_dtype", "auto")
@@ -236,6 +239,17 @@ class CuteDSLMLABackend(AttentionBackend):
             block_kv_indices = torch.zeros(
                 (batch_size, max_blocks), dtype=torch.int32, device=self.device
             )
+
+        if self.req_to_page_token_unit != self.page_size:
+            # Expand logical scheduler page ids into kernel-page ids.
+            expand_page_table(
+                req_to_page[req_pool_indices[:batch_size]],
+                logical_page_size=self.req_to_page_token_unit,
+                kernel_page_size=self.page_size,
+                max_kernel_pages=max_blocks,
+                out=block_kv_indices[:batch_size],
+            )
+            return block_kv_indices
 
         copy_len = min(max_blocks, req_to_page.shape[1])
 

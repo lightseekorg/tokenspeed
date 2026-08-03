@@ -45,6 +45,7 @@ from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
 )
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+from tokenspeed.runtime.layers.attention.page_table import expand_page_table
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
@@ -141,6 +142,9 @@ class TRTLLMMLABackend(AttentionBackend):
 
         self.num_local_heads = config.num_attention_heads // config.attn_tp_size
 
+        # Token span of one req_to_page id; the model executor overrides it.
+        self.req_to_page_token_unit = self.page_size
+
         # Metadata
         self.forward_decode_metadata: TRTLLMMLADecodeMetadata | None = None
         self.forward_prefill_metadata: TRTLLMMLAPrefillMetadata | None = None
@@ -170,6 +174,17 @@ class TRTLLMMLABackend(AttentionBackend):
             block_kv_indices = torch.zeros(
                 (batch_size, max_blocks), dtype=torch.int32, device=self.device
             )
+
+        if self.req_to_page_token_unit != self.page_size:
+            # Expand logical scheduler page ids into kernel-page ids.
+            expand_page_table(
+                req_to_page[req_pool_indices[:batch_size]],
+                logical_page_size=self.req_to_page_token_unit,
+                kernel_page_size=self.page_size,
+                max_kernel_pages=max_blocks,
+                out=block_kv_indices[:batch_size],
+            )
+            return block_kv_indices
 
         copy_len = min(max_blocks, req_to_page.shape[1])
 

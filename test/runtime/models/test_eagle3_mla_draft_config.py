@@ -70,6 +70,6 @@ def test_embed_sharing_requires_matching_shapes():
     )
     full = torch.nn.Parameter(torch.ones(64, 8))
     draft.set_embed_and_head(full, None)
-    assert draft.model.embed_tokens.weight is full, (
-        "a shape-matched target embedding should be shared"
-    )
+    assert (
+        draft.model.embed_tokens.weight is full
+    ), "a shape-matched target embedding should be shared"

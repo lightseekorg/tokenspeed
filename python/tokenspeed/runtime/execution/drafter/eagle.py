@@ -216,6 +216,28 @@ class Eagle(BaseDrafter):
         """Map token ids through hot_token_ids if available, otherwise return as-is."""
         return self.hot_token_ids[ids] if self.hot_token_ids is not None else ids
 
+    def _first_step_out_cache_loc(
+        self,
+        bs: int,
+        draft_input: EagleDraftInput,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Map first-step window rows to the draft pool's own cache slots."""
+        num_extends = draft_input.num_extends
+        rpi = self.input_buffers.req_pool_indices_buf[:bs].to(torch.int64)
+        if num_extends > 0:
+            lengths = self.input_buffers.input_lengths_buf[:bs].to(torch.int64)
+            if bs > num_extends:
+                lengths = lengths.clone()
+                lengths[num_extends:] = self.spec_num_tokens
+            row_rpi = torch.repeat_interleave(rpi, lengths)
+        else:
+            row_rpi = rpi.repeat_interleave(self.spec_num_tokens)
+        pos = positions.to(torch.int64)
+        page_ids = self.req_to_page[row_rpi, pos // self.page_size].to(torch.int64)
+        loc = page_ids * self.page_size + pos % self.page_size
+        return loc.to(self.input_buffers.out_cache_loc_buf.dtype)
+
     def _get_first_step_input(
         self,
         draft_input: EagleDraftInput,
@@ -322,11 +344,13 @@ class Eagle(BaseDrafter):
             dsa_topk = (None, None)
         self._attach_dsa_topk(ctx, dsa_topk)
 
+        positions = buffers.positions_buf[:input_num_tokens]
+        out_cache_loc = self._first_step_out_cache_loc(bs, draft_input, positions)
         logits_output = self.draft_model_runner.forward(
             ctx=ctx,
             input_ids=input_ids,
-            positions=buffers.positions_buf[:input_num_tokens],
-            out_cache_loc=buffers.out_cache_loc_buf[:input_num_tokens],
+            positions=positions,
+            out_cache_loc=out_cache_loc,
             captured_hidden_states=draft_input.base_out_hidden_states,
             spec_step_idx=0,
         )
