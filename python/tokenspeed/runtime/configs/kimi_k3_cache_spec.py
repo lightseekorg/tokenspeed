@@ -41,6 +41,7 @@ _KIMI_K3_KDA_LAYERS = 69
 _KIMI_K3_MLA_LAYERS = 24
 _KIMI_K3_LOGICAL_BLOCK_TOKENS = 128
 _KIMI_K3_STATE_GROUPS = 3
+_KIMI_K3_MLA_PACKING = 12
 
 
 def _require_non_negative_int(name: str, value: int) -> int:
@@ -176,16 +177,28 @@ def plan_kimi_k3_lcm_cache(
         mla_cache_dtype=mla_cache_dtype,
         mla_quant_method=mla_quant_method,
     )
+    # The MLA latent history is TP-invariant while the KDA state shards by
+    # TP, so pack as many KDA pages per MLA-sized plane as fit to keep the
+    # planner's padding fraction bounded at any TP.
+    mla_plane_bytes = _KIMI_K3_MLA_PACKING * next(
+        field.payload_bytes for field in fields if field.group_id == FULL_ATTENTION
+    )
+    linear_plane_bytes = sum(
+        field.payload_bytes
+        for field in fields
+        if field.group_id == f"{LINEAR_ATTENTION}_0" and field.plane_id == "slot.0"
+    )
+    linear_packing = max(1, mla_plane_bytes // linear_plane_bytes)
     plan = plan_lcm_fields(
         fields,
         logical_block_tokens=_KIMI_K3_LOGICAL_BLOCK_TOKENS,
         budget_bytes=cache_budget_bytes,
         num_lcm_blocks=num_lcm_blocks,
         cache_blocks_per_lcm_block={
-            FULL_ATTENTION: 12,
-            f"{LINEAR_ATTENTION}_0": 1,
-            f"{LINEAR_ATTENTION}_1": 1,
-            f"{LINEAR_ATTENTION}_2": 1,
+            FULL_ATTENTION: _KIMI_K3_MLA_PACKING,
+            f"{LINEAR_ATTENTION}_0": linear_packing,
+            f"{LINEAR_ATTENTION}_1": linear_packing,
+            f"{LINEAR_ATTENTION}_2": linear_packing,
         },
         alignment=256,
     )
@@ -193,10 +206,10 @@ def plan_kimi_k3_lcm_cache(
         group.group_id: group.cache_blocks_per_lcm_block for group in plan.groups
     }
     expected_packing = {
-        FULL_ATTENTION: 12,
-        f"{LINEAR_ATTENTION}_0": 1,
-        f"{LINEAR_ATTENTION}_1": 1,
-        f"{LINEAR_ATTENTION}_2": 1,
+        FULL_ATTENTION: _KIMI_K3_MLA_PACKING,
+        f"{LINEAR_ATTENTION}_0": linear_packing,
+        f"{LINEAR_ATTENTION}_1": linear_packing,
+        f"{LINEAR_ATTENTION}_2": linear_packing,
     }
     if packing != expected_packing:
         raise ValueError(
