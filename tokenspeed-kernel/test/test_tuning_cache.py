@@ -33,6 +33,7 @@ from importlib.util import find_spec
 
 import pytest
 from tokenspeed_kernel.ops.tuning import (
+    flashinfer_tuning_cache_filename,
     load_flashinfer_tuning_cache,
     set_autotune_process_group,
 )
@@ -40,6 +41,20 @@ from tokenspeed_kernel.ops.tuning import (
 requires_flashinfer = pytest.mark.skipif(
     find_spec("flashinfer") is None, reason="requires flashinfer"
 )
+
+
+def test_flashinfer_tuning_cache_filename_includes_cudnn() -> None:
+    assert flashinfer_tuning_cache_filename(
+        "kimi-k3",
+        8,
+        1,
+        "NVIDIA B300 SXM6 AC",
+        "0.6.16",
+        92400,
+    ) == (
+        "kimi-k3,ep=8,tp=1,device_name=NVIDIA_B300_SXM6_AC,"
+        "flashinfer=0.6.16,cudnn=92400.json"
+    )
 
 
 @requires_flashinfer
