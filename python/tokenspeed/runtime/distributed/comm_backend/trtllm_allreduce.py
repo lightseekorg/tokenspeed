@@ -30,7 +30,6 @@ reused for every subsequent ``all_reduce`` on that group.
 
 import torch
 from tokenspeed_kernel.ops.communication.trtllm import (
-    MNNVL_PREFER_IPC_BYTES,
     AllReduceFusionPattern,
     trtllm_allreduce_fusion,
     trtllm_create_ipc_workspace_for_all_reduce_fusion,
@@ -235,6 +234,10 @@ class TrtllmAllReduceBackend(CommBackend):
             return None
         if token_num == 0:
             return tensor
+
+        from tokenspeed_kernel.ops.communication.trtllm import (
+            MNNVL_PREFER_IPC_BYTES,
+        )
 
         from tokenspeed.runtime.utils.pdl import pdl_enabled
 
