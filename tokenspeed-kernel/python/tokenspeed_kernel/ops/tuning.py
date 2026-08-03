@@ -233,13 +233,35 @@ def load_packaged_flashinfer_tuning_cache(
         f"{model},ep={ep_size},tp={tp_size},"
         f"device_name={device_name},flashinfer={fi_version}.json"
     )
-    path = os.path.join(os.path.dirname(_fi_pkg.__file__), "tactics", name)
+    tactics_dir = os.path.join(os.path.dirname(_fi_pkg.__file__), "tactics")
+    path = os.path.join(tactics_dir, name)
     if not os.path.exists(path):
-        logger.info(
-            f"no packaged flashinfer tuning cache for this environment "
-            f"(looked for {name}); the startup autotune window will tune "
-            "instead. Sweep one with benchmark/moe_tactic_sweep to pin "
-            "tactics."
+        # A table swept for this exact model/layout/device but a different
+        # flashinfer version means a pin bump orphaned it: tactic indices
+        # don't survive version changes, so it must be re-swept, and the
+        # fallback is a silent perf regression nobody sees in an INFO line.
+        stale_prefix = (
+            f"{model},ep={ep_size},tp={tp_size},device_name={device_name},flashinfer="
         )
+        stale = [
+            f
+            for f in (os.listdir(tactics_dir) if os.path.isdir(tactics_dir) else [])
+            if f.startswith(stale_prefix) and f != name
+        ]
+        if stale:
+            logger.warning(
+                f"stale flashinfer tuning cache: {stale[0]} was swept on a "
+                f"different flashinfer version (installed: {fi_version}) and "
+                f"will not be loaded. Re-sweep with benchmark/moe_tactic_sweep "
+                "to restore pinned tactics; until then the startup autotune "
+                "window tunes these shapes."
+            )
+        else:
+            logger.info(
+                f"no packaged flashinfer tuning cache for this environment "
+                f"(looked for {name}); the startup autotune window will tune "
+                "instead. Sweep one with benchmark/moe_tactic_sweep to pin "
+                "tactics."
+            )
         return False
     return load_flashinfer_tuning_cache(path)
