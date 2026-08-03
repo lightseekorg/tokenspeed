@@ -36,6 +36,7 @@ from tokenspeed.runtime.configs.kimi_k3_config import (
 from tokenspeed.runtime.configs.kimi_k25_config import KimiK25Config
 from tokenspeed.runtime.configs.minimax_m2_config import MiniMaxM2Config
 from tokenspeed.runtime.configs.minimax_m3_config import MiniMaxM3Config
+from tokenspeed.runtime.configs.qwen2_5_moe_config import Qwen2_5MoeConfig
 from tokenspeed.runtime.configs.qwen2_config import Qwen2Config
 from tokenspeed.runtime.configs.qwen3_5_config import Qwen3_5Config, Qwen3_5MoeConfig
 from tokenspeed.runtime.configs.qwen3_asr_config import (
@@ -49,6 +50,7 @@ from tokenspeed.runtime.configs.qwen3_moe_config import Qwen3MoeConfig
 __all__ = [
     "DeepseekV4Config",
     "Qwen2Config",
+    "Qwen2_5MoeConfig",
     "Qwen3Config",
     "Qwen3MoeConfig",
     "Qwen3_5Config",

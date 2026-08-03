@@ -49,10 +49,13 @@ platform = current_platform()
 
 
 if platform.is_blackwell_plus:
-    from flash_attn.cute import (
-        flash_attn_func,
-        flash_attn_varlen_func,
-    )
+    try:
+        from flash_attn.cute import (
+            flash_attn_func,
+            flash_attn_varlen_func,
+        )
+    except ImportError:
+        pass
 
 if platform.is_nvidia and platform.is_blackwell:
     # FA4 on Blackwell supports prefill head_dim in [8, 256] divisible by 8,

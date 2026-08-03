@@ -29,7 +29,10 @@ platform = current_platform()
 
 
 if platform.is_nvidia:
-    from fast_hadamard_transform import hadamard_transform
+    try:
+        from fast_hadamard_transform import hadamard_transform
+    except ImportError:
+        pass
 
     @register_kernel(
         "transform",
