@@ -26,6 +26,7 @@ import os
 import signal
 import threading
 from collections import deque
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from enum import Enum, auto
 
 import psutil
@@ -40,6 +41,7 @@ from tokenspeed.runtime.engine.io_struct import (
     WatchLoadUpdateReq,
 )
 from tokenspeed.runtime.engine.request import Req
+from tokenspeed.runtime.process_startup import wait_for_process_startup
 from tokenspeed.runtime.utils import (
     configure_logger,
     get_colorful_logger,
@@ -47,7 +49,7 @@ from tokenspeed.runtime.utils import (
 )
 from tokenspeed.runtime.utils.dispatch import TypeBasedDispatcher
 from tokenspeed.runtime.utils.exceptions import get_exception_traceback
-from tokenspeed.runtime.utils.process import register_usr_signal
+from tokenspeed.runtime.utils.process import kill_process_tree, register_usr_signal
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 
 logger = get_colorful_logger(__name__)
@@ -194,7 +196,6 @@ class DataParallelController:
         self._request_dispatcher.add_fallback_fn(self.send_control_message)
 
     def launch_dp_schedulers(self, server_args, port_args):
-        threads = []
         dp_port_args = []
 
         # Parse dist_init_addr from port_args to create per-dp-rank ports
@@ -249,29 +250,55 @@ class DataParallelController:
                 dp_ranks_per_node * server_args.node_rank,
                 dp_ranks_per_node * (server_args.node_rank + 1),
             )
-        for dp_rank in dp_rank_range:
-            # Create a thread for each worker
-            thread = threading.Thread(
-                target=self.launch_tensor_parallel_group,
-                args=(server_args, dp_port_args[dp_rank], dp_rank),
+        dp_rank_range = list(dp_rank_range)
+        startup_barrier = threading.Barrier(len(dp_rank_range))
+        executor = ThreadPoolExecutor(max_workers=len(dp_rank_range))
+        futures = [
+            executor.submit(
+                self.launch_tensor_parallel_group,
+                server_args,
+                dp_port_args[dp_rank],
+                dp_rank,
+                startup_barrier,
             )
-            threads.append(thread)
-
-        # Start all threads
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
+            for dp_rank in dp_rank_range
+        ]
+        try:
+            # Surface the first failed DP group instead of joining threads in
+            # rank order and losing exceptions raised inside them.
+            done, _ = wait(futures, return_when=FIRST_EXCEPTION)
+            for future in done:
+                future.result()
+            for future in futures:
+                future.result()
+        except BaseException:
+            startup_barrier.abort()
+            self._kill_scheduler_processes(self.scheduler_procs)
+            raise
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
 
         return dp_port_args
+
+    @staticmethod
+    def _kill_scheduler_processes(processes: list[mp.Process]) -> None:
+        for process in processes:
+            if process.pid is None or not process.is_alive():
+                continue
+            kill_process_tree(process.pid)
+        for process in processes:
+            if process.pid is not None:
+                process.join(timeout=5)
 
     def launch_tensor_parallel_group(
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
         dp_rank: int,
+        startup_barrier: threading.Barrier | None = None,
     ):
         scheduler_pipe_readers = []
+        scheduler_procs = []
         mapping_template = server_args.mapping
         attn_tp_size = mapping_template.attn.tp_size
 
@@ -301,10 +328,28 @@ class DataParallelController:
                 ),
             )
             proc.start()
+            writer.close()
             self.scheduler_procs.append(proc)
+            scheduler_procs.append(proc)
             scheduler_pipe_readers.append(reader)
-        # Wait for model to finish loading
-        scheduler_info = [reader.recv() for reader in scheduler_pipe_readers]
+        try:
+            # Do not let one DP group enter its wait before every peer group has
+            # finished spawning; this makes cross-group failure cleanup complete.
+            if startup_barrier is not None:
+                startup_barrier.wait()
+            scheduler_info = wait_for_process_startup(
+                scheduler_pipe_readers,
+                scheduler_procs,
+                description=f"DP {dp_rank} scheduler rank",
+            )
+        except BaseException:
+            if startup_barrier is not None:
+                startup_barrier.abort()
+            self._kill_scheduler_processes(scheduler_procs)
+            raise
+        finally:
+            for reader in scheduler_pipe_readers:
+                reader.close()
 
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
@@ -354,6 +399,7 @@ def run_data_parallel_controller_process(
     configure_logger(server_args)
     parent_process = psutil.Process().parent()
     register_usr_signal()
+    startup_complete = False
 
     try:
         controller = DataParallelController(server_args, port_args)
@@ -368,6 +414,7 @@ def run_data_parallel_controller_process(
                 "cache_storage": controller.cache_storage,
             }
         )
+        startup_complete = True
         if server_args.node_rank == 0:
             controller.event_loop()
         for proc in controller.scheduler_procs:
@@ -380,4 +427,11 @@ def run_data_parallel_controller_process(
     except Exception:
         traceback = get_exception_traceback()
         logger.error("DataParallelController hit an exception: %s", traceback)
-        parent_process.send_signal(signal.SIGUSR1)
+        if startup_complete:
+            parent_process.send_signal(signal.SIGUSR1)
+        else:
+            try:
+                pipe_writer.send({"status": "error", "error": traceback})
+            except (BrokenPipeError, EOFError, OSError):
+                parent_process.send_signal(signal.SIGUSR1)
+        raise

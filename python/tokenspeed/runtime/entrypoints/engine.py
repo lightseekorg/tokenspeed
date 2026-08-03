@@ -74,6 +74,7 @@ from tokenspeed.runtime.engine.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from tokenspeed.runtime.entrypoints.engine_base import EngineBase
+from tokenspeed.runtime.process_startup import wait_for_process_startup
 from tokenspeed.runtime.utils import (
     MultiprocessingSerializer,
     configure_logger,
@@ -518,6 +519,17 @@ def _set_envs_and_config(server_args: ServerArgs):
     mp.set_start_method("spawn", force=True)
 
 
+def _kill_scheduler_processes(processes: list[mp.Process]) -> None:
+    """Force-stop and reap scheduler trees after a startup failure."""
+    for process in processes:
+        if process.pid is None or not process.is_alive():
+            continue
+        kill_process_tree(process.pid)
+    for process in processes:
+        if process.pid is not None:
+            process.join(timeout=5)
+
+
 def _launch_subprocesses(
     server_args: ServerArgs, port_args: PortArgs | None = None
 ) -> tuple[AsyncLLM, None, dict]:
@@ -566,6 +578,10 @@ def _launch_subprocesses(
             )
             with memory_saver_adapter.configure_subprocess():
                 proc.start()
+            # Only the child writes startup status. Keeping the parent's copy
+            # open prevents reader.recv() from ever seeing EOF if that child
+            # dies before sending a payload.
+            writer.close()
             scheduler_procs.append(proc)
             scheduler_pipe_readers.append(reader)
     else:
@@ -577,18 +593,38 @@ def _launch_subprocesses(
             args=(server_args, port_args, writer),
         )
         proc.start()
+        writer.close()
         scheduler_procs.append(proc)
+
+    # The rank-zero frontend must exist while schedulers initialize because it
+    # owns IPC endpoints that scheduler startup connects to.
+    tokenizer_manager = None
+    if server_args.node_rank == 0:
+        tokenizer_manager = AsyncLLM(server_args, port_args)
+
+    # Wait on every readiness pipe and process sentinel concurrently. A fixed
+    # rank-order recv can otherwise hide rank N's immediate failure behind rank
+    # 0 waiting in a distributed rendezvous.
+    try:
+        scheduler_infos = wait_for_process_startup(
+            scheduler_pipe_readers,
+            scheduler_procs,
+            description=(
+                "DataParallelController"
+                if server_args.mapping.attn.has_dp
+                else "scheduler rank"
+            ),
+        )
+    except BaseException:
+        _kill_scheduler_processes(scheduler_procs)
+        raise
+    finally:
+        for reader in scheduler_pipe_readers:
+            reader.close()
 
     if server_args.node_rank >= 1:
         # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
         # so they can just wait here.
-
-        for reader in scheduler_pipe_readers:
-            data = reader.recv()
-            if data.get("status") != "ready":
-                raise RuntimeError(
-                    "Initialization failed. Please see the error messages above."
-                )
 
         if not envs.TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN.get():
             # When using `Engine` as a Python API, we don't want to block here.
@@ -607,29 +643,7 @@ def _launch_subprocesses(
             )
         return None, None, None
 
-    # Launch the main-process async frontend. The detokenizer runs
-    # inline inside AsyncLLM — no separate subprocess.
-    tokenizer_manager = AsyncLLM(server_args, port_args)
-
-    # Wait for the model to finish loading
-    scheduler_infos = []
-    for i in range(len(scheduler_pipe_readers)):
-        try:
-            data = scheduler_pipe_readers[i].recv()
-        except EOFError:
-            logger.error(
-                "Rank %s scheduler is dead. Please check if there are relevant logs.", i
-            )
-            scheduler_procs[i].join()
-            logger.error("Exit code: %s", scheduler_procs[i].exitcode)
-            raise
-
-        if data["status"] != "ready":
-            raise RuntimeError(
-                "Initialization failed. Please see the error messages above."
-            )
-        scheduler_infos.append(data)
-
+    assert tokenizer_manager is not None
     # Assume all schedulers have the same scheduler_info
     scheduler_info = scheduler_infos[0]
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
