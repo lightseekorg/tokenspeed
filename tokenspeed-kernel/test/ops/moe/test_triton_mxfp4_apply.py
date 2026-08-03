@@ -8,7 +8,8 @@ from tokenspeed_kernel.platform import current_platform
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
-def test_triton_mxfp4_moe_matches_torch() -> None:
+@pytest.mark.parametrize("activation", ["silu", "situ"])
+def test_triton_mxfp4_moe_matches_torch(activation: str) -> None:
     if not current_platform().is_amd:
         pytest.skip("Triton MXFP4 MoE is registered for AMD GPUs")
 
@@ -38,10 +39,12 @@ def test_triton_mxfp4_moe_matches_torch() -> None:
     weights.w2_weight_scale = w2_scale
     weights.top_k = 2
     weights.w13_input_layout = "concatenated"
+    weights.activation_situ_beta = 4.0
+    weights.activation_situ_linear_beta = 25.0
     plan = tokenspeed_kernel.moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
-        activation="silu",
+        activation=activation,
         routing_mode="precomputed_topk",
         ispp=128,
         internal_activation_dtype="input",
@@ -88,7 +91,14 @@ def test_triton_mxfp4_moe_matches_torch() -> None:
         token_ids, slots = torch.where(topk_ids == expert_id)
         gate_up = F.linear(x_dequant[token_ids], w13_dequant[expert_id])
         gate, up = gate_up.chunk(2, dim=-1)
-        intermediate = (F.silu(gate) * up).to(torch.bfloat16)
+        if activation == "situ":
+            gate = gate.float()
+            up = up.float()
+            gate = 4.0 * torch.tanh(gate / 4.0) * torch.sigmoid(gate)
+            up = 25.0 * torch.tanh(up / 25.0)
+            intermediate = (gate * up).to(torch.bfloat16)
+        else:
+            intermediate = (F.silu(gate) * up).to(torch.bfloat16)
         intermediate_packed, intermediate_scale = tokenspeed_kernel.quantize_mxfp4(
             intermediate, scale_layout="linear", solution="triton"
         )

@@ -7,7 +7,8 @@ import torch.nn.functional as F
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
-def test_triton_bf16_moe_matches_torch() -> None:
+@pytest.mark.parametrize("activation", ["silu", "situ"])
+def test_triton_bf16_moe_matches_torch(activation: str) -> None:
     generator = torch.Generator(device="cuda").manual_seed(0)
     x = torch.randn(4, 128, device="cuda", dtype=torch.bfloat16, generator=generator)
     w13 = (
@@ -35,10 +36,12 @@ def test_triton_bf16_moe_matches_torch() -> None:
     weights.w13_weight = w13
     weights.w2_weight = w2
     weights.top_k = 2
+    weights.activation_situ_beta = 4.0
+    weights.activation_situ_linear_beta = 25.0
     plan = tokenspeed_kernel.moe_plan(
         "unquant",
         input_dtype=torch.bfloat16,
-        activation="silu",
+        activation=activation,
         routing_mode="precomputed_topk",
         ispp=32,
         solution="triton",
@@ -57,7 +60,14 @@ def test_triton_bf16_moe_matches_torch() -> None:
         token_ids, slots = torch.where(topk_ids == expert_id)
         gate_up = F.linear(x[token_ids].float(), w13[expert_id].float())
         gate, up = gate_up.chunk(2, dim=-1)
-        intermediate = (F.silu(gate) * up).to(torch.bfloat16)
+        if activation == "situ":
+            gate = gate.to(torch.bfloat16).float()
+            up = up.to(torch.bfloat16).float()
+            gate = 4.0 * torch.tanh(gate / 4.0) * torch.sigmoid(gate)
+            up = 25.0 * torch.tanh(up / 25.0)
+            intermediate = (gate * up).to(torch.bfloat16)
+        else:
+            intermediate = (F.silu(gate) * up).to(torch.bfloat16)
         expert_output = F.linear(intermediate.float(), w2[expert_id].float()).to(
             torch.bfloat16
         )

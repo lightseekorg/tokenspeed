@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel._triton import TensorDescriptor, tl, triton
+from tokenspeed_kernel._triton import TensorDescriptor, libdevice, tl, triton
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -55,7 +55,7 @@ def _routing_kernel(
 
 def _routing(
     topk_ids: torch.Tensor, num_experts: int
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, str]:
     topk_ids = topk_ids.to(torch.int32).contiguous()
     num_routes = topk_ids.numel()
     expert_route_ids = torch.empty(
@@ -149,7 +149,7 @@ def _validate(
         raise ValueError("Triton MoE requires precomputed topk weights and ids")
 
     activation = plan.get("activation") or getattr(w, "activation", "silu")
-    if activation not in {"silu", "swiglu"}:
+    if activation not in {"silu", "situ", "swiglu"}:
         raise ValueError(f"Triton MoE does not support activation {activation!r}")
     swiglu_arg = getattr(w, "swiglu_arg", None)
     if swiglu_arg is not None and (
@@ -161,6 +161,13 @@ def _validate(
         raise ValueError("Triton MoE supports only standard SwiGLU")
     if getattr(w, "w13_input_layout", "concatenated") != "concatenated":
         raise ValueError("Triton MoE requires concatenated gate/up weights")
+    if activation == "situ":
+        situ_beta = getattr(w, "activation_situ_beta", None)
+        situ_linear_beta = getattr(w, "activation_situ_linear_beta", None)
+        if situ_beta is None or situ_beta <= 0:
+            raise ValueError("SiTU beta must be positive")
+        if situ_linear_beta is not None and situ_linear_beta <= 0:
+            raise ValueError("SiTU linear beta must be positive")
 
     w13 = w.w13_weight
     w13_scale = w.w13_weight_scale
@@ -205,7 +212,7 @@ def _validate(
         raise ValueError("w2_weight_scale must have shape [E, H, I/32]")
     if hidden_size % 128 or intermediate_size % 128:
         raise ValueError("hidden and intermediate sizes must be multiples of 128")
-    return topk_weights, topk_ids
+    return topk_weights, topk_ids, activation
 
 
 @triton.jit
@@ -302,7 +309,11 @@ def _stage1_kernel(
     intermediate_size: tl.constexpr,
     num_experts: tl.constexpr,
     top_k: tl.constexpr,
+    situ_beta,
+    situ_linear_beta,
     OUTPUT_DTYPE: tl.constexpr,
+    ACTIVATION: tl.constexpr,
+    HAS_LINEAR_BETA: tl.constexpr,
     NUM_PROGRAMS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -396,10 +407,18 @@ def _stage1_kernel(
             )
             gate = gate_acc.to(output_dtype)
             up = up_acc.to(output_dtype)
-            silu = (gate.to(tl.float32) * tl.sigmoid(gate.to(tl.float32))).to(
-                output_dtype
-            )
-            activated = (silu * up).to(output_dtype)
+            if ACTIVATION == "situ":
+                gate = gate.to(tl.float32)
+                up = up.to(tl.float32)
+                gate = situ_beta * libdevice.tanh(gate / situ_beta) * tl.sigmoid(gate)
+                if HAS_LINEAR_BETA:
+                    up = situ_linear_beta * libdevice.tanh(up / situ_linear_beta)
+                activated = (gate * up).to(output_dtype)
+            else:
+                silu = (gate.to(tl.float32) * tl.sigmoid(gate.to(tl.float32))).to(
+                    output_dtype
+                )
+                activated = (silu * up).to(output_dtype)
             valid_mask = row_mask[:, None] & (tl.arange(0, BLOCK_N)[None, :] < BLOCK_N)
             activated_packed, activated_scales = _quantize_mxfp4_routine(
                 activated, valid_mask
@@ -537,6 +556,9 @@ def _moe(
     w2_scale: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
+    activation: str,
+    situ_beta: float,
+    situ_linear_beta: float | None,
 ) -> torch.Tensor:
     num_tokens, hidden_size = x.shape
     num_experts, twice_intermediate_size, _ = w13.shape
@@ -608,7 +630,11 @@ def _moe(
         intermediate_size=intermediate_size,
         num_experts=num_experts,
         top_k=top_k,
+        situ_beta=situ_beta,
+        situ_linear_beta=(1.0 if situ_linear_beta is None else situ_linear_beta),
         OUTPUT_DTYPE="bf16" if x.dtype == torch.bfloat16 else "fp16",
+        ACTIVATION=activation,
+        HAS_LINEAR_BETA=situ_linear_beta is not None,
         NUM_PROGRAMS=stage1_programs,
         BLOCK_M=block_m,
         BLOCK_N=stage1_block_n,
@@ -664,7 +690,7 @@ def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module) -> None:
     if getattr(w, "w13_input_layout", "concatenated") != "concatenated":
         raise ValueError("Triton MXFP4 MoE requires concatenated gate/up weights")
     activation = plan.get("activation") or getattr(w, "activation", "silu")
-    if activation not in {"silu", "swiglu"}:
+    if activation not in {"silu", "situ", "swiglu"}:
         raise ValueError(f"Triton MXFP4 MoE does not support {activation!r}")
 
 
@@ -678,7 +704,7 @@ def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module) -> None:
     signatures=format_signatures("x", "dense", {torch.float16, torch.bfloat16}),
     traits={
         "weight_dtype": frozenset({"mxfp4"}),
-        "activation": frozenset({"silu", "swiglu"}),
+        "activation": frozenset({"silu", "situ", "swiglu"}),
         "routing_mode": frozenset({"precomputed_topk"}),
         "supports_deferred_finalize": frozenset({False}),
         "supports_ep": frozenset({False}),
@@ -704,7 +730,7 @@ def triton_mxfp4_precomputed_moe_apply(
     """Apply a dynamic A4W4 MXFP4 Triton MoE with precomputed routing.
 
     Args:
-        plan: MoE plan selecting standard SiLU/SwiGLU activation.
+        plan: MoE plan selecting standard SiLU/SwiGLU or SiTU activation.
         x: Contiguous FP16/BF16 hidden states `[tokens, hidden]`.
         w: Module holding linear packed E2M1 `w13_weight`/`w2_weight` and
             E8M0 `w13_weight_scale`/`w2_weight_scale` tensors.
@@ -719,7 +745,9 @@ def triton_mxfp4_precomputed_moe_apply(
     Returns:
         Finalized hidden states `[tokens, hidden]` with dtype matching `x`.
     """
-    topk_weights, topk_ids = _validate(plan, x, w, topk_weights, topk_ids, do_finalize)
+    topk_weights, topk_ids, activation = _validate(
+        plan, x, w, topk_weights, topk_ids, do_finalize
+    )
     return _moe(
         x,
         w.w13_weight,
@@ -728,4 +756,7 @@ def triton_mxfp4_precomputed_moe_apply(
         w.w2_weight_scale,
         topk_weights,
         topk_ids,
+        activation,
+        float(getattr(w, "activation_situ_beta", 1.0) or 1.0),
+        getattr(w, "activation_situ_linear_beta", None),
     )

@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel._triton import TensorDescriptor, tl, triton
+from tokenspeed_kernel._triton import TensorDescriptor, libdevice, tl, triton
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -54,7 +54,7 @@ def _routing_kernel(
 
 def _routing(
     topk_ids: torch.Tensor, num_experts: int
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, str]:
     topk_ids = topk_ids.to(torch.int32).contiguous()
     num_routes = topk_ids.numel()
     expert_route_ids = torch.empty(
@@ -148,7 +148,7 @@ def _validate(
         raise ValueError("Triton MoE requires precomputed topk weights and ids")
 
     activation = plan.get("activation") or getattr(w, "activation", "silu")
-    if activation not in {"silu", "swiglu"}:
+    if activation not in {"silu", "situ", "swiglu"}:
         raise ValueError(f"Triton MoE does not support activation {activation!r}")
     swiglu_arg = getattr(w, "swiglu_arg", None)
     if swiglu_arg is not None and (
@@ -160,6 +160,13 @@ def _validate(
         raise ValueError("Triton MoE supports only standard SwiGLU")
     if getattr(w, "w13_input_layout", "concatenated") != "concatenated":
         raise ValueError("Triton MoE requires concatenated gate/up weights")
+    if activation == "situ":
+        situ_beta = getattr(w, "activation_situ_beta", None)
+        situ_linear_beta = getattr(w, "activation_situ_linear_beta", None)
+        if situ_beta is None or situ_beta <= 0:
+            raise ValueError("SiTU beta must be positive")
+        if situ_linear_beta is not None and situ_linear_beta <= 0:
+            raise ValueError("SiTU linear beta must be positive")
 
     w13 = w.w13_weight
     w2 = w.w2_weight
@@ -198,7 +205,7 @@ def _validate(
         raise ValueError(
             "hidden size must be a multiple of 128 and intermediate size of 32"
         )
-    return topk_weights, topk_ids
+    return topk_weights, topk_ids, activation
 
 
 @triton.jit
@@ -213,6 +220,10 @@ def _stage1_kernel(
     intermediate_size: tl.constexpr,
     num_experts: tl.constexpr,
     top_k: tl.constexpr,
+    situ_beta,
+    situ_linear_beta,
+    ACTIVATION: tl.constexpr,
+    HAS_LINEAR_BETA: tl.constexpr,
     NUM_PROGRAMS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -255,7 +266,15 @@ def _stage1_kernel(
                 gate_acc += tl.dot(x, gate.T)
                 up_acc += tl.dot(x, up.T)
 
-            activated = (gate_acc * tl.sigmoid(gate_acc) * up_acc).to(x_desc.dtype)
+            if ACTIVATION == "situ":
+                gate = gate_acc.to(x_desc.dtype).to(tl.float32)
+                up = up_acc.to(x_desc.dtype).to(tl.float32)
+                gate = situ_beta * libdevice.tanh(gate / situ_beta) * tl.sigmoid(gate)
+                if HAS_LINEAR_BETA:
+                    up = situ_linear_beta * libdevice.tanh(up / situ_linear_beta)
+                activated = (gate * up).to(x_desc.dtype)
+            else:
+                activated = (gate_acc * tl.sigmoid(gate_acc) * up_acc).to(x_desc.dtype)
             inter_offsets = (
                 route_ids[:, None] * intermediate_size
                 + n_offset
@@ -342,6 +361,9 @@ def _moe(
     w2: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
+    activation: str,
+    situ_beta: float,
+    situ_linear_beta: float | None,
 ) -> torch.Tensor:
     num_tokens, hidden_size = x.shape
     num_experts, twice_intermediate_size, _ = w13.shape
@@ -386,6 +408,10 @@ def _moe(
         intermediate_size=intermediate_size,
         num_experts=num_experts,
         top_k=top_k,
+        situ_beta=situ_beta,
+        situ_linear_beta=(1.0 if situ_linear_beta is None else situ_linear_beta),
+        ACTIVATION=activation,
+        HAS_LINEAR_BETA=situ_linear_beta is not None,
         NUM_PROGRAMS=stage1_programs,
         BLOCK_M=block_m,
         BLOCK_N=stage1_block_n,
@@ -428,7 +454,7 @@ def _moe(
     signatures=format_signatures("x", "dense", {torch.float16, torch.bfloat16}),
     traits={
         "weight_dtype": frozenset({"unquant"}),
-        "activation": frozenset({"silu", "swiglu"}),
+        "activation": frozenset({"silu", "situ", "swiglu"}),
         "routing_mode": frozenset({"precomputed_topk"}),
         "supports_deferred_finalize": frozenset({False}),
         "supports_ep": frozenset({False}),
@@ -454,7 +480,7 @@ def triton_bf16_precomputed_moe_apply(
     """Apply an FP16/BF16 Triton MoE using precomputed top-k routing.
 
     Args:
-        plan: MoE plan selecting standard SiLU/SwiGLU activation.
+        plan: MoE plan selecting standard SiLU/SwiGLU or SiTU activation.
         x: Contiguous hidden states `[tokens, hidden]` in FP16 or BF16.
         w: Module with contiguous `w13_weight` `[E, 2I, H]` and
             `w2_weight` `[E, H, I]` tensors matching `x.dtype`.
@@ -469,5 +495,16 @@ def triton_bf16_precomputed_moe_apply(
     Returns:
         Finalized hidden states `[tokens, hidden]` with dtype matching `x`.
     """
-    topk_weights, topk_ids = _validate(plan, x, w, topk_weights, topk_ids, do_finalize)
-    return _moe(x, w.w13_weight, w.w2_weight, topk_weights, topk_ids)
+    topk_weights, topk_ids, activation = _validate(
+        plan, x, w, topk_weights, topk_ids, do_finalize
+    )
+    return _moe(
+        x,
+        w.w13_weight,
+        w.w2_weight,
+        topk_weights,
+        topk_ids,
+        activation,
+        float(getattr(w, "activation_situ_beta", 1.0) or 1.0),
+        getattr(w, "activation_situ_linear_beta", None),
+    )
