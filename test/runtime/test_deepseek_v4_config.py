@@ -875,6 +875,66 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         self.assertEqual(wrapper.drafter.draft_seq_lens_buf.tolist(), [21, 22])
 
+    def test_cuda_graph_eager_v4_draft_uses_only_its_cache_group_subset(self):
+        captured = {"target": [], "draft": []}
+
+        class FakeBackend:
+            uses_paged_cache_groups = True
+            uses_cache_groups = True
+
+            def __init__(self, key):
+                self.key = key
+
+            def init_forward_metadata(self, *args, **kwargs):
+                captured[self.key].append((args, kwargs))
+
+        target_cache_metadata = object()
+        forward_batch = object()
+        swa_table = torch.ones((1, 1), dtype=torch.int32)
+        state_table = torch.full((1, 1), 2, dtype=torch.int32)
+
+        wrapper = object.__new__(CudaGraphWrapper)
+        wrapper.attn_backend = FakeBackend("target")
+        wrapper.draft_attn_backend = FakeBackend("draft")
+        wrapper.max_tokens_per_req = 4
+        wrapper.drafter = SimpleNamespace(
+            req_to_page=torch.zeros((1, 1), dtype=torch.int32),
+            draft_seq_lens_buf=torch.zeros(1, dtype=torch.int32),
+        )
+        wrapper.use_v4_mtp_paged_metadata = True
+        wrapper.token_to_kv_pool = SimpleNamespace(
+            paged_cache_group_specs=(
+                SimpleNamespace(group_id="v4.swa_kv", family="history"),
+                SimpleNamespace(group_id="v4.state", family="state"),
+            )
+        )
+        wrapper.draft_token_to_kv_pool = SimpleNamespace(
+            paged_cache_group_specs=(
+                SimpleNamespace(group_id="v4.swa_kv", family="history"),
+            )
+        )
+
+        wrapper._init_forward_metadata(
+            padded_bs=1,
+            num_extends=1,
+            req_pool_indices=torch.zeros(1, dtype=torch.int32),
+            seq_lens=torch.ones(1, dtype=torch.int32),
+            req_to_page=torch.zeros((1, 1), dtype=torch.int32),
+            forward_mode=ForwardMode.EXTEND,
+            block_tables={"v4.swa_kv": swa_table, "v4.state": state_table},
+            cache_metadata=target_cache_metadata,
+            forward_batch=forward_batch,
+        )
+
+        self.assertIs(captured["target"][0][1]["cache_metadata"], target_cache_metadata)
+        self.assertIs(captured["target"][0][1]["forward_batch"], forward_batch)
+        self.assertEqual(len(captured["draft"]), 2)
+        draft_prefill_kwargs = captured["draft"][0][1]
+        self.assertNotIn("cache_metadata", draft_prefill_kwargs)
+        self.assertNotIn("forward_batch", draft_prefill_kwargs)
+        self.assertEqual(tuple(draft_prefill_kwargs["block_tables"]), ("v4.swa_kv",))
+        self.assertIs(draft_prefill_kwargs["block_tables"]["v4.swa_kv"], swa_table)
+
     def test_cuda_graph_eager_draft_decode_preserves_non_v4_seq_lens_alias(self):
         captured = {"target": [], "draft": []}
 
@@ -1683,10 +1743,384 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
         )
         table = torch.tensor([[11, 12, 13, 14]], dtype=torch.int32)
+        backend._expected_cache_group_ids = (V4_SWA_KV_GROUP_ID,)
+        backend._cache_group_raw_tokens_per_page = {V4_SWA_KV_GROUP_ID: 64}
+        backend._cache_group_max_page_ids = {V4_SWA_KV_GROUP_ID: 100}
 
-        materialized = backend._prepare_cache_group_tables({V4_SWA_KV_GROUP_ID: table})
+        materialized = backend._prepare_cache_group_tables(
+            {V4_SWA_KV_GROUP_ID: table},
+            bs=1,
+            actual_bs=1,
+            seq_lens=torch.tensor([1], dtype=torch.int32),
+            device=torch.device("cpu"),
+            phase="test",
+        )
 
         self.assertEqual(materialized[V4_SWA_KV_GROUP_ID].tolist(), table.tolist())
+
+    def _make_deepseek_v4_cache_group_contract_backend(self):
+        backend = DeepseekV4AttentionBackend.__new__(DeepseekV4AttentionBackend)
+        backend._expected_cache_group_ids = ("fine", "coarse")
+        backend._cache_group_raw_tokens_per_page = {"fine": 4, "coarse": 256}
+        backend._cache_group_max_page_ids = {"fine": 20000, "coarse": 1024}
+        return backend
+
+    def test_deepseek_v4_runtime_configures_eager_cache_group_contract(self):
+        backend = DeepseekV4AttentionBackend(
+            SimpleNamespace(
+                page_size=64,
+                device="cpu",
+                num_attention_heads=64,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                is_draft=False,
+                speculative_num_draft_tokens=1,
+                head_dim=512,
+                context_len=4096,
+            )
+        )
+        specs = (
+            SimpleNamespace(
+                group_id="fine",
+                retention="full_history",
+                rows_per_page=4,
+                entry_stride_tokens=1,
+            ),
+            SimpleNamespace(
+                group_id="coarse",
+                retention="full_history",
+                rows_per_page=256,
+                entry_stride_tokens=1,
+            ),
+        )
+        counts = {"fine": 20001, "coarse": 1025}
+
+        backend.configure_runtime(
+            paged_cache_group_specs=specs,
+            paged_cache_group_page_counts=counts,
+            req_to_page=torch.empty(0, dtype=torch.int32),
+        )
+        tables = {
+            "fine": torch.ones((1, 1), dtype=torch.int32),
+            "coarse": torch.ones((1, 1), dtype=torch.int32),
+        }
+        materialized = backend._prepare_cache_group_tables(
+            tables,
+            bs=1,
+            actual_bs=1,
+            seq_lens=torch.ones(1, dtype=torch.int32),
+            device=torch.device("cpu"),
+            phase="eager",
+        )
+        self.assertEqual(tuple(materialized), ("fine", "coarse"))
+
+        # Graph setup may repeat the same contract but must not replace it.
+        backend.init_cuda_graph_state(
+            max_bs=1,
+            paged_cache_group_specs=specs,
+            paged_cache_group_page_counts=counts,
+        )
+        changed = {"fine": 20002, "coarse": 1025}
+        with self.assertRaisesRegex(RuntimeError, "changed after initialization"):
+            backend._configure_cache_group_contract(specs, changed)
+
+    def test_deepseek_v4_cache_group_contract_covers_64k_boundary(self):
+        backend = self._make_deepseek_v4_cache_group_contract_backend()
+        tables = {
+            "fine": torch.ones((1, 16384), dtype=torch.int32),
+            "coarse": torch.ones((1, 256), dtype=torch.int32),
+        }
+
+        materialized = backend._prepare_cache_group_tables(
+            tables,
+            bs=1,
+            actual_bs=1,
+            seq_lens=torch.tensor([65536], dtype=torch.int32),
+            device=torch.device("cpu"),
+            phase="test",
+        )
+        self.assertEqual(tuple(materialized), ("fine", "coarse"))
+
+        with self.assertRaisesRegex(RuntimeError, "missing a real page"):
+            backend._prepare_cache_group_tables(
+                tables,
+                bs=1,
+                actual_bs=1,
+                seq_lens=torch.tensor([65537], dtype=torch.int32),
+                device=torch.device("cpu"),
+                phase="test",
+            )
+
+    def test_deepseek_v4_cache_group_contract_fails_closed(self):
+        backend = self._make_deepseek_v4_cache_group_contract_backend()
+        valid = {
+            "fine": torch.ones((2, 2), dtype=torch.int32),
+            "coarse": torch.ones((2, 2), dtype=torch.int32),
+        }
+        malformed = []
+        malformed.append(({"fine": valid["fine"]}, "group mismatch"))
+        malformed.append(
+            (
+                {
+                    "fine": valid["fine"],
+                    "coarse": valid["coarse"],
+                    "extra": valid["fine"],
+                },
+                "group mismatch",
+            )
+        )
+        malformed.append(
+            (
+                {"coarse": valid["coarse"], "fine": valid["fine"]},
+                "wrong order",
+            )
+        )
+        malformed.append(
+            (
+                {**valid, "fine": valid["fine"].to(torch.int64)},
+                "torch.int32",
+            )
+        )
+        malformed.append(({**valid, "fine": valid["fine"][0]}, "rank 2"))
+        malformed.append(({**valid, "fine": valid["fine"][:1]}, "rows"))
+        malformed.append(
+            (
+                {**valid, "fine": torch.empty((2, 0), dtype=torch.int32)},
+                "zero width",
+            )
+        )
+
+        for tables, error in malformed:
+            with self.subTest(error=error), self.assertRaisesRegex(RuntimeError, error):
+                backend._prepare_cache_group_tables(
+                    tables,
+                    bs=2,
+                    actual_bs=2,
+                    seq_lens=torch.ones(2, dtype=torch.int32),
+                    device=torch.device("cpu"),
+                    phase="test",
+                )
+
+        null_active = {**valid, "fine": valid["fine"].clone()}
+        null_active["fine"][0, 0] = 0
+        with self.assertRaisesRegex(RuntimeError, "missing a real page"):
+            backend._prepare_cache_group_tables(
+                null_active,
+                bs=2,
+                actual_bs=2,
+                seq_lens=torch.ones(2, dtype=torch.int32),
+                device=torch.device("cpu"),
+                phase="test",
+            )
+
+        # A zero-token idle row has no active logical page and may keep the
+        # reserved null entry. Negative lengths are always malformed.
+        idle = {key: torch.zeros_like(table) for key, table in valid.items()}
+        backend._prepare_cache_group_tables(
+            idle,
+            bs=2,
+            actual_bs=2,
+            seq_lens=torch.zeros(2, dtype=torch.int32),
+            device=torch.device("cpu"),
+            phase="idle",
+        )
+        with self.assertRaisesRegex(RuntimeError, "nonnegative"):
+            backend._prepare_cache_group_tables(
+                idle,
+                bs=2,
+                actual_bs=1,
+                seq_lens=torch.tensor([-1, 0], dtype=torch.int32),
+                device=torch.device("cpu"),
+                phase="test",
+            )
+
+    def test_deepseek_v4_cache_group_replay_refreshes_only_live_rows(self):
+        backend = self._make_deepseek_v4_cache_group_contract_backend()
+        output_buffers = {
+            "fine": torch.zeros((2, 4), dtype=torch.int32),
+            "coarse": torch.zeros((2, 4), dtype=torch.int32),
+        }
+
+        for step in range(1, 11):
+            tables = {
+                "fine": torch.tensor([[step], [0]], dtype=torch.int32),
+                "coarse": torch.tensor([[step], [0]], dtype=torch.int32),
+            }
+            materialized = backend._prepare_cache_group_tables(
+                tables,
+                bs=2,
+                actual_bs=1,
+                seq_lens=torch.ones(2, dtype=torch.int32),
+                device=torch.device("cpu"),
+                phase="replay",
+                output_buffers=output_buffers,
+            )
+            for table in materialized.values():
+                self.assertEqual(int(table[0, 0]), step)
+                self.assertTrue(bool((table[:, 1:] == -1).all()))
+
+        zero_tables = {
+            "fine": torch.zeros((2, 1), dtype=torch.int32),
+            "coarse": torch.zeros((2, 1), dtype=torch.int32),
+        }
+        backend._prepare_cache_group_tables(
+            zero_tables,
+            bs=2,
+            actual_bs=0,
+            seq_lens=torch.ones(2, dtype=torch.int32),
+            device=torch.device("cpu"),
+            phase="idle",
+            output_buffers=output_buffers,
+        )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_deepseek_v4_target_mtp_graph_replay_refreshes_flat_tables(self):
+        device = torch.device("cuda")
+        target_specs = tuple(
+            build_v4_cache_specs(
+                SimpleNamespace(sliding_window=128),
+                layer_ratio=(1, 4, 128),
+            )
+        )
+        draft_specs = tuple(
+            build_v4_cache_specs(
+                SimpleNamespace(sliding_window=128),
+                layer_ratio=(1,),
+            )
+        )
+        target_counts = {str(spec.group_id): 4096 for spec in target_specs}
+        draft_counts = {str(spec.group_id): 4096 for spec in draft_specs}
+
+        def make_backend(*, is_draft: bool) -> DeepseekV4AttentionBackend:
+            return DeepseekV4AttentionBackend(
+                SimpleNamespace(
+                    page_size=64,
+                    device="cuda",
+                    num_attention_heads=64,
+                    num_kv_heads=1,
+                    attn_tp_size=1,
+                    dtype=torch.bfloat16,
+                    is_draft=is_draft,
+                    speculative_num_draft_tokens=4,
+                    speculative_num_steps=1,
+                    head_dim=512,
+                    qk_rope_head_dim=64,
+                    context_len=65536,
+                )
+            )
+
+        target = make_backend(is_draft=False)
+        draft = make_backend(is_draft=True)
+        target.init_cuda_graph_state(
+            max_bs=2,
+            paged_cache_group_specs=target_specs,
+            paged_cache_group_page_counts=target_counts,
+            max_tokens_per_req=4,
+        )
+        draft.init_cuda_graph_state(
+            max_bs=2,
+            paged_cache_group_specs=draft_specs,
+            paged_cache_group_page_counts=draft_counts,
+            max_tokens_per_req=4,
+        )
+
+        common = {
+            "bs": 2,
+            "req_pool_indices": torch.tensor([0, 1], dtype=torch.int32, device=device),
+            "seq_lens": torch.tensor([65536, 0], dtype=torch.int32, device=device),
+            "forward_mode": ForwardMode.DECODE,
+            "num_tokens": 8,
+        }
+        target_capture = {
+            group_id: torch.zeros_like(table)
+            for group_id, table in target._cuda_graph_paged_cache_block_tables.items()
+        }
+        draft_capture = {
+            group_id: torch.zeros_like(table)
+            for group_id, table in draft._cuda_graph_paged_cache_block_tables.items()
+        }
+        target.init_forward_metadata_capture_cuda_graph(
+            **common,
+            paged_cache_block_tables=target_capture,
+        )
+        draft.init_forward_metadata_capture_cuda_graph(
+            **common,
+            paged_cache_block_tables=draft_capture,
+        )
+        target_metadata = target.forward_metadata
+        draft_metadata = draft.forward_metadata
+        assert target_metadata is not None
+        assert draft_metadata is not None
+
+        target_ids = tuple(target._expected_cache_group_ids or ())
+        draft_ids = tuple(draft._expected_cache_group_ids or ())
+        observed = torch.empty(
+            len(target_ids) + len(draft_ids), dtype=torch.int32, device=device
+        )
+        graph = torch.cuda.CUDAGraph()
+        torch.cuda.synchronize()
+        with torch.cuda.graph(graph):
+            for index, group_id in enumerate(target_ids):
+                observed[index].copy_(
+                    target_metadata.cache.paged_cache_block_tables[group_id][0, 0]
+                )
+            for index, group_id in enumerate(draft_ids, start=len(target_ids)):
+                observed[index].copy_(
+                    draft_metadata.cache.paged_cache_block_tables[group_id][0, 0]
+                )
+
+        target_live = {
+            group_id: torch.zeros_like(table)
+            for group_id, table in target_capture.items()
+        }
+        draft_live = {group_id: target_live[group_id] for group_id in draft_ids}
+        req_to_page = torch.full((2, 8), 4095, dtype=torch.int32, device=device)
+
+        def replay(step: int) -> None:
+            for index, table in enumerate(target_live.values()):
+                table[0].fill_(step + index + 1)
+                table[1].zero_()
+            target.init_forward_metadata_replay_cuda_graph(
+                **common,
+                actual_bs=1,
+                req_to_page=req_to_page,
+                block_tables=target_live,
+            )
+            draft.init_forward_metadata_replay_cuda_graph(
+                **common,
+                actual_bs=1,
+                req_to_page=req_to_page,
+                block_tables=draft_live,
+            )
+            graph.replay()
+
+        for step in range(10):
+            replay(step)
+            torch.cuda.synchronize()
+            target_expected = [step + index + 1 for index in range(len(target_ids))]
+            draft_expected = [
+                step + target_ids.index(group_id) + 1 for group_id in draft_ids
+            ]
+            self.assertEqual(observed.cpu().tolist(), target_expected + draft_expected)
+
+        self.assertEqual(
+            target.forward_metadata.is_valid_token.tolist(),
+            [True, True, True, True, False, False, False, False],
+        )
+        self.assertEqual(
+            draft.forward_metadata.is_valid_token.tolist(),
+            [True, True, True, True, False, False, False, False],
+        )
+        self.assertTrue(bool((target.forward_metadata.cache.block_table == 0).all()))
+        self.assertTrue(bool((draft.forward_metadata.cache.block_table == 0).all()))
+
+        torch.cuda.synchronize()
+        reserved_before = torch.cuda.memory_reserved()
+        for step in range(50):
+            replay(step + 100)
+        torch.cuda.synchronize()
+        self.assertLessEqual(torch.cuda.memory_reserved(), reserved_before)
 
     def test_deepseek_v4_mixed_metadata_keeps_decode_rows_single_token(self):
         backend = DeepseekV4AttentionBackend(
@@ -1903,6 +2337,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                     sliding_window_tokens=128,
                 ),
             ),
+            paged_cache_group_page_counts={"v4.swa_kv": 1024},
             max_tokens_per_req=1,
         )
         compact = torch.tensor([[10, 11], [20, -1]], dtype=torch.int32)
@@ -2286,18 +2721,24 @@ class TestDeepseekV4Config(unittest.TestCase):
                 context_len=256,
             )
         )
+        backend.configure_runtime(
+            paged_cache_group_specs=(
+                SimpleNamespace(
+                    group_id=V4_SWA_KV_GROUP_ID,
+                    retention="sliding_window",
+                    rows_per_page=64,
+                    entry_stride_tokens=1,
+                ),
+            ),
+            paged_cache_group_page_counts={V4_SWA_KV_GROUP_ID: 128},
+        )
         backend.init_forward_metadata(
             bs=3,
             req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
             seq_lens=torch.tensor([5, 9, 12], dtype=torch.int32),
             forward_mode=ForwardMode.MIXED,
             block_tables={
-                # Batch-ordered compressed-KV table (row i == batch position i);
-                # the base block_table for ratio<=1 indexer layers resolves from
-                # the smallest-ratio compressed-KV group.
-                "v4.c4a.compressed_kv": torch.tensor(
-                    [[10], [20], [30]], dtype=torch.int32
-                ),
+                V4_SWA_KV_GROUP_ID: torch.tensor([[10], [20], [30]], dtype=torch.int32)
             },
             extend_seq_lens_cpu=torch.tensor([3, 1, 1], dtype=torch.int32),
             extend_prefix_lens_cpu=torch.tensor([2, 8, 11], dtype=torch.int32),
@@ -2357,8 +2798,9 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
         )
         self.assertTrue(
-            torch.equal(decode.cache.block_table[:, 0], torch.tensor([20, 30]))
+            torch.equal(decode.cache.swa_block_table[:, 0], torch.tensor([20, 30]))
         )
+        self.assertTrue(bool((decode.cache.block_table == 0).all()))
         self.assertTrue(
             torch.equal(prefill.seq_lens_cpu, torch.tensor([5], dtype=torch.int32))
         )

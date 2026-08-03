@@ -475,10 +475,24 @@ class ModelExecutor:
 
         attn_backend.configure_runtime(
             sliding_window_size=model_runner.sliding_window_size,
+            paged_cache_group_specs=tuple(token_to_kv_pool.paged_cache_group_specs),
+            paged_cache_group_page_counts=getattr(
+                token_to_kv_pool,
+                "paged_cache_group_page_counts",
+                None,
+            ),
         )
         if draft_attn_backend is not None:
             draft_attn_backend.configure_runtime(
                 sliding_window_size=model_runner.sliding_window_size,
+                paged_cache_group_specs=tuple(
+                    getattr(draft_token_to_kv_pool, "paged_cache_group_specs", ())
+                ),
+                paged_cache_group_page_counts=getattr(
+                    draft_token_to_kv_pool,
+                    "paged_cache_group_page_counts",
+                    None,
+                ),
             )
 
         validate_paged_cache_group_ids(
@@ -659,7 +673,12 @@ class ModelExecutor:
         draft indexes it directly by batch row, no page_table round-trip.
         """
         if (
-            self.drafter is None
+            getattr(
+                getattr(self, "attn_backend", None),
+                "cache_group_tables_replace_draft_page_table",
+                False,
+            )
+            or self.drafter is None
             or not block_tables
             or self._full_history_group_id is None
         ):
