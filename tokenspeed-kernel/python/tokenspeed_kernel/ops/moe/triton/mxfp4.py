@@ -710,7 +710,7 @@ def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module) -> None:
         "supports_ep": frozenset({False}),
         "supports_all_to_all_ep": frozenset({False}),
         "ispp_alignment": frozenset({128}),
-        "internal_activation_dtype": frozenset({"input"}),
+        "internal_activation_dtype": frozenset({"mxfp4"}),
         "supports_bias": frozenset({False}),
     },
     priority=Priority.PORTABLE,

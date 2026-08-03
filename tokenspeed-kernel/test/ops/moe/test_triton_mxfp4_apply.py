@@ -47,7 +47,7 @@ def test_triton_mxfp4_moe_matches_torch(activation: str) -> None:
         activation=activation,
         routing_mode="precomputed_topk",
         ispp=128,
-        internal_activation_dtype="input",
+        internal_activation_dtype="mxfp4",
         solution="triton",
     )
     tokenspeed_kernel.moe_process_weights(plan, weights)

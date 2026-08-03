@@ -203,7 +203,8 @@ def moe_plan(
         fp8_scale_block_shape: Optional FP8 block-scale shape requirement.
         internal_activation_dtype: Optional internal activation dtype requirement.
             "input" is a special value that uses the whatever dtype the input
-            activations have. Defaults to "input" if not set.
+            activations have. "mxfp4" requests dynamic MXFP4 activation
+            quantization. Defaults to "input" if not set.
         with_bias: Whether the selected kernel must support expert bias tensors.
         deepep_group: Runtime-created process group used by DeepEP plans.
         deepep_mode: Optional DeepEP mode for all-to-all plans: "low_latency"

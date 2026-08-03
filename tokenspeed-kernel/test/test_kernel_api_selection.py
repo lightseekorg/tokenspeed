@@ -1463,6 +1463,29 @@ def test_gluon_mxfp4_plan_selects_dynamic_apply_on_cdna4(
     assert plan["support_routing"] is True
 
 
+def test_triton_mxfp4_requires_dynamic_activation_quantization(
+    mi350_platform: PlatformInfo,
+) -> None:
+    registry = KernelRegistry.get()
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi350_platform)
+        registry.clear_cache()
+        with pytest.raises(tokenspeed_kernel.NoKernelFoundError, match="traits"):
+            tokenspeed_kernel.moe_plan(
+                "mxfp4",
+                input_dtype=torch.bfloat16,
+                activation="swiglu",
+                routing_mode="precomputed_topk",
+                ispp=128,
+                internal_activation_dtype="input",
+                solution="triton",
+            )
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+
 @pytest.mark.parametrize(
     "ep_size,solution,kernel_name,preprocessor",
     [
@@ -1895,7 +1918,7 @@ def _moe_apply_mxfp4_triton() -> object:
         activation="swiglu",
         routing_mode="precomputed_topk",
         ispp=128,
-        internal_activation_dtype="input",
+        internal_activation_dtype="mxfp4",
         with_bias=False,
         solution="triton",
     )
