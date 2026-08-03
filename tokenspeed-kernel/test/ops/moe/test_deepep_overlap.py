@@ -80,8 +80,8 @@ def stub_compute(monkeypatch):
     )
     monkeypatch.setattr(deepep_fp8, "deep_gemm_requires_ue8m0", lambda: True)
 
-    def fake_packed_activation(gateup, masked_m):
-        del masked_m
+    def fake_packed_activation(gateup, masked_m, *, expected_m):
+        del masked_m, expected_m
         experts, rows, two_intermediate = gateup.shape
         intermediate = two_intermediate // 2
         return (
