@@ -224,10 +224,9 @@ if current_platform().is_nvidia:
                 return
 
             self.cleanup()
-            # LOCAL PATCH (cross-node MNNVL test, 2026-07-30): CUDA-IPC handles
-            # cannot span nodes -- attempting creation on a cross-node group
-            # fails AND leaves a sticky CUDA context error (observed as
-            # 'invalid resource handle' on the next allocation). Gate it off
+            # CUDA-IPC handles cannot span nodes -- attempting creation on a
+            # cross-node group fails AND leaves a sticky CUDA context error
+            # ('invalid resource handle' on the next allocation). Gate it off
             # for cross-node runs; the MNNVL fabric workspace below is the
             # multi-node path.
             _skip_ipc = _skip_ipc_workspace(group)
@@ -253,9 +252,9 @@ if current_platform().is_nvidia:
                 rank, world_size, max_token_num, hidden_dim, group
             )
 
-            # LOCAL PATCH: with IPC skipped, mnnvl is the only workspace; if it
-            # failed to arm there is nothing to fuse with -- stay uninitialized
-            # so prepare_allreduce_fusion() returns False and the model layer
+            # With IPC skipped, mnnvl is the only workspace; if it failed to
+            # arm there is nothing to fuse with -- stay uninitialized so
+            # prepare_allreduce_fusion() returns False and the model layer
             # keeps the plain NCCL path.
             if self.workspace_tensor is None and self.mnnvl_workspace is None:
                 logger.warning(

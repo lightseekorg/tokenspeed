@@ -30,6 +30,7 @@ reused for every subsequent ``all_reduce`` on that group.
 
 import torch
 from tokenspeed_kernel.ops.communication.trtllm import (
+    MNNVL_PREFER_IPC_BYTES,
     AllReduceFusionPattern,
     trtllm_allreduce_fusion,
     trtllm_create_ipc_workspace_for_all_reduce_fusion,
@@ -89,10 +90,6 @@ class TrtllmAllReduceBackend(CommBackend):
             # exists to serve.
             device_group = pg_manager.get_process_group("nccl", group)
 
-            # LOCAL PATCH (cross-node MNNVL test): see kernel-side note --
-            # CUDA-IPC cannot span nodes and a failed attempt poisons the
-            # CUDA context. Skip under the env gate; mnnvl below is the
-            # cross-node workspace.
             from tokenspeed_kernel.ops.communication.trtllm import (
                 _skip_ipc_workspace,
             )
@@ -127,8 +124,8 @@ class TrtllmAllReduceBackend(CommBackend):
                 device_group,
             )
 
-            # LOCAL PATCH: nothing usable -> report failure so the backend
-            # keeps routing this group through NCCL.
+            # Nothing usable -> report failure so the backend keeps routing
+            # this group through NCCL.
             if workspace_tensor is None and mnnvl_workspace is None:
                 return False
 
@@ -245,18 +242,29 @@ class TrtllmAllReduceBackend(CommBackend):
 
         workspace = res["workspace"]
         mnnvl = res.get("mnnvl")
-        if mnnvl is not None and mnnvl.supports(
-            token_num,
-            hidden_dim,
-            tensor_2d.dtype,
-            res["world_size"],
-            AllReduceFusionPattern.kAllReduce,
-            use_oneshot=True,
+        # Same Tier-2 split as _ar_fusion_workspace: prefer the IPC lamport
+        # workspace (single-node only; cross-node it is None) once the payload
+        # reaches MNNVL_PREFER_IPC_BYTES, mnnvl below it. Unreachable while
+        # _MAX_ONESHOT_BYTES stays under the threshold, but keeps this path
+        # consistent with the kernel-side dispatch if either bound moves.
+        payload_bytes = token_num * hidden_dim * tensor_2d.dtype.itemsize
+        prefer_ipc = workspace is not None and payload_bytes >= MNNVL_PREFER_IPC_BYTES
+        if (
+            not prefer_ipc
+            and mnnvl is not None
+            and mnnvl.supports(
+                token_num,
+                hidden_dim,
+                tensor_2d.dtype,
+                res["world_size"],
+                AllReduceFusionPattern.kAllReduce,
+                use_oneshot=True,
+            )
         ):
             workspace = mnnvl
 
-        # LOCAL PATCH: shape not covered by mnnvl and no IPC fallback -> let
-        # the caller fall back to NCCL (this function's None contract).
+        # Shape not covered by mnnvl and no IPC fallback -> let the caller
+        # fall back to NCCL (this function's None contract).
         if workspace is None:
             return None
 
