@@ -11,6 +11,7 @@ runner:
 env:
   CI: "true"
   TOKENSPEED_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN: "1"
+  TOKENSPEED_FLAT_KV: "ON"
 install:
   - bash test/ci_system/install_deps.sh
 server:
