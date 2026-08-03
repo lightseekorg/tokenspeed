@@ -389,6 +389,13 @@ class CudaGraphWrapper:
             num_extends=0,
             input_num_tokens=bs * self.max_tokens_per_req,
             forward_mode=capture_forward_mode,
+            # A decode graph is only ever replayed when every DP rank is
+            # decoding or idle (see _can_use_graph), so capture must record that
+            # same answer. Leaving the default False would let capture-time code
+            # take a different path than replay -- for DeepEP MoE that means
+            # recording the normal-mode legs, whose host-side receive counts
+            # cannot be captured at all.
+            all_decode_or_idle=True,
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL
                 if self.drafter is not None
@@ -535,6 +542,9 @@ class CudaGraphWrapper:
                     num_extends=0,
                     input_num_tokens=bs * self.max_tokens_per_req,
                     forward_mode=ForwardMode.DECODE,
+                    # Match _capture_one: the lazy state this warms up (DeepEP
+                    # buffers among it) must be the state capture will record.
+                    all_decode_or_idle=True,
                     capture_hidden_mode=(
                         CaptureHiddenMode.FULL
                         if self.drafter is not None

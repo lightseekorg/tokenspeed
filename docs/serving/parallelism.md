@@ -59,6 +59,56 @@ Start with the recipe closest to your model family, then tune:
 - `--all2all-backend`
 - `--deepep-mode`
 
+### DeepEP all-to-all
+
+`--all2all-backend deepep` moves expert routing off all-gather and onto DeepEP
+dispatch/combine. It requires a MoE backend whose kernels own those legs:
+`--moe-backend deep_gemm` (block-scale FP8) or `--moe-backend flashinfer_cutedsl`
+(nvfp4, decode-shaped batches only).
+
+DeepEP has two sets of legs, and `--deepep-mode` picks between them:
+
+| Mode | Legs | Fits |
+| --- | --- | --- |
+| `low_latency` | IBGDA dispatch into a preallocated per-expert buffer | Decode-shaped batches up to `--low-latency-max-num-tokens-per-gpu` |
+| `normal` | High-throughput dispatch, tokens permuted into per-expert row blocks | Extend-shaped batches of any size |
+| `auto` (default) | Both are allocated; each forward picks | Aggregated serving, which mixes both shapes |
+
+For block-scale FP8 with `deep_gemm`, keep `auto` unless the instance only ever
+sees one shape -- for example a decode-only worker in a PD split, which can pin
+`low_latency` and skip the normal-mode buffers. The nvfp4
+`flashinfer_cutedsl` kernel implements only the low-latency legs, so it requires
+an explicit `--deepep-mode low_latency`; `auto` and `normal` are rejected while
+the execution plan is built. Every forward on such an instance, including any
+prefill, must fit `--low-latency-max-num-tokens-per-gpu`.
+
+A batch above the low-latency capacity is rejected rather than truncated, so
+raise `--low-latency-max-num-tokens-per-gpu` if decode plus speculative draft
+tokens exceed it. Both current DeepEP MoE backends require BF16 activations;
+`--dtype float16` is not supported.
+
+The mode is chosen per forward from a value every rank agrees on, because the two
+modes are different collectives. With DP attention that value is "every DP rank
+is decoding", so one extending rank moves the whole group to the normal legs.
+
+The prefill CUDA graph is disabled whenever an all-to-all backend is selected:
+normal-mode dispatch reports its per-expert receive counts to the host, and a
+host sync cannot be captured. Decode graphs are unaffected.
+
+For block-scale FP8 decode on NVIDIA, the low-latency path keeps routing
+metadata in DeepEP's required contiguous int64/float32 formats across both
+collective legs. Its fused SwiGLU quantizer writes packed UE8M0 scales directly
+in DeepGEMM's MN-major TMA layout, so padded rows need no zero-fill and the
+second expert GEMM needs no separate activation-scale transpose/pack pass.
+Expert weight scales are expanded and packed once when weights are loaded,
+instead of ahead of both expert GEMMs in every layer forward. Shared-expert work
+is queued between the dispatch send and receive legs to overlap the collective
+whenever the model has a shared expert. Low-latency dispatch asks DeepEP to
+produce packed UE8M0 scales directly in its column-major TMA layout. Normal-mode
+dispatch still transports FP32 power-of-two scales, but the existing expert
+scatter packs them while permuting tokens, so neither mode needs a separate
+sequence of elementwise shifts, fills, copies, and a transpose before GEMM1.
+
 ## Multi-Node
 
 Set these explicitly:

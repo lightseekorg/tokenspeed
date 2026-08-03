@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+source "$SCRIPT_DIR/worker_cleanup.sh"
+
 MODEL=${MODEL:-nvidia/Qwen3.5-397B-A17B-NVFP4}
 SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-$MODEL}
 PREFILL_GPUS=${PREFILL_GPUS:-0,1}
@@ -85,9 +88,8 @@ cleanup() {
   local code=$?
   trap - EXIT INT TERM
   if ((${#pids[@]})); then
-    echo "[pd-1p1d] stopping ${#pids[@]} processes"
-    kill "${pids[@]}" 2>/dev/null || true
-    wait "${pids[@]}" 2>/dev/null || true
+    stop_worker_pids \
+      "pd-1p1d" "${WORKER_SHUTDOWN_TIMEOUT:-30}" "${pids[@]}"
   fi
   exit "$code"
 }

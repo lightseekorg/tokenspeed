@@ -12,10 +12,12 @@ from slurm_submit import (
     parse_pr_number,
     pr_worktree,
     print_progress,
+    print_target,
     queued_states,
     render_script,
     result_detail,
     select_tasks,
+    source_pr_url,
     write_report,
 )
 
@@ -156,6 +158,27 @@ def test_parse_pr_number(value, expected):
 def test_parse_pr_number_rejects_other_urls():
     with pytest.raises(ValueError, match="pull request"):
         parse_pr_number("https://example.com/pull/795")
+
+
+def test_source_pr_url_uses_repository_environment(monkeypatch):
+    monkeypatch.setenv("GITHUB_REPOSITORY", "lightseekorg/tokenspeed")
+    assert source_pr_url("884") == "https://github.com/lightseekorg/tokenspeed/pull/884"
+
+
+def test_print_target_distinguishes_pr_head_from_merge(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("GITHUB_REPOSITORY", "lightseekorg/tokenspeed")
+    commits = {"HEAD^2": "pr-head", "HEAD^1": "base-head"}
+    monkeypatch.setattr("slurm_submit.git", lambda _repo, *_args: commits[_args[-1]])
+
+    print_target(tmp_path, "884", "merged-test")
+
+    assert capsys.readouterr().out.splitlines() == [
+        "Target: PR #884",
+        "Link: https://github.com/lightseekorg/tokenspeed/pull/884",
+        "Target commit: pr-head",
+        "Merged test commit: merged-test",
+        "Base commit: base-head",
+    ]
 
 
 def test_pr_worktree_rejects_shallow_checkout(tmp_path):

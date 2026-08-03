@@ -16,6 +16,16 @@ on:
         required: false
         default: ""
         type: string
+      checkout_ref:
+        description: "Optional commit to check out"
+        required: false
+        default: ""
+        type: string
+      timeout_minutes:
+        description: "Maximum task runtime"
+        required: false
+        default: 60
+        type: number
     secrets:
       HF_TOKEN:
         required: false
@@ -32,10 +42,7 @@ jobs:
       matrix: ${{ fromJson(inputs.matrix) }}
     name: ${{ matrix.name }} (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
-    # Cold GPU runners can spend more than 50 minutes building dependencies
-    # before a large-model evaluation starts. Leave enough time for the task
-    # itself to finish instead of cancelling a healthy server mid-evaluation.
-    timeout-minutes: 90
+    timeout-minutes: ${{ inputs.timeout_minutes }}
     continue-on-error: ${{ matrix.optional }}
     env:
       INSTALL_TOKENSPEED_MLA_FROM_SOURCE: ${{ inputs.install_tokenspeed_mla_from_source }}
@@ -46,6 +53,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
           path: run-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.name }}-${{ matrix.runner }}
 
       - name: Set work directory

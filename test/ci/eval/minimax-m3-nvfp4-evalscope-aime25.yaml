@@ -19,8 +19,7 @@ server:
     --attn-tp-size 4
     --moe-tp-size 4
     --max-model-len 262144
-    --gpu-memory-utilization 0.92
-    --disable-cuda-graph-padding
+    --gpu-memory-utilization 0.95
     --attention-backend trtllm
     --kv-cache-dtype fp8
     --moe-backend flashinfer_trtllm
