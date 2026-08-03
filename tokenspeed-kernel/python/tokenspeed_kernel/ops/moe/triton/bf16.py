@@ -127,8 +127,9 @@ def _combine(
     )
 
 
-def _validate_apply_contract(
+def _validate(
     plan: dict,
+    x: torch.Tensor,
     w: torch.nn.Module,
     topk_weights: torch.Tensor | None,
     topk_ids: torch.Tensor | None,
@@ -145,6 +146,7 @@ def _validate_apply_contract(
         raise ValueError("Triton MoE does not support expert bias")
     if topk_weights is None or topk_ids is None:
         raise ValueError("Triton MoE requires precomputed topk weights and ids")
+
     activation = plan.get("activation") or getattr(w, "activation", "silu")
     if activation not in {"silu", "swiglu"}:
         raise ValueError(f"Triton MoE does not support activation {activation!r}")
@@ -158,6 +160,44 @@ def _validate_apply_contract(
         raise ValueError("Triton MoE supports only standard SwiGLU")
     if getattr(w, "w13_input_layout", "concatenated") != "concatenated":
         raise ValueError("Triton MoE requires concatenated gate/up weights")
+
+    w13 = w.w13_weight
+    w2 = w.w2_weight
+    if x.ndim != 2 or w13.ndim != 3 or w2.ndim != 3:
+        raise ValueError("x and unquantized MoE weights must be rank-2/rank-3")
+    if x.dtype not in (torch.float16, torch.bfloat16):
+        raise TypeError("x must use torch.float16 or torch.bfloat16")
+    if w13.dtype != x.dtype or w2.dtype != x.dtype:
+        raise TypeError("x, w13_weight, and w2_weight must have the same dtype")
+    if not all(t.is_cuda and t.is_contiguous() for t in (x, w13, w2)):
+        raise ValueError("x and weights must be contiguous GPU tensors")
+    if topk_ids.ndim != 2 or topk_weights.shape != topk_ids.shape:
+        raise ValueError("top-k tensors must have shape [num_tokens, top_k]")
+    if topk_ids.dtype not in (torch.int32, torch.int64):
+        raise TypeError("topk_ids must use torch.int32 or torch.int64")
+    if not topk_weights.is_floating_point():
+        raise TypeError("topk_weights must use a floating-point dtype")
+    if topk_ids.device != x.device or topk_weights.device != x.device:
+        raise ValueError("top-k tensors and x must be on the same device")
+    if w13.device != x.device or w2.device != x.device:
+        raise ValueError("x and weights must be on the same device")
+
+    num_tokens, hidden_size = x.shape
+    num_experts, twice_intermediate_size, weight_hidden_size = w13.shape
+    intermediate_size = twice_intermediate_size // 2
+    top_k = topk_ids.shape[1]
+    if num_experts == 0:
+        raise ValueError("unquantized MoE requires at least one expert")
+    if topk_ids.shape[0] != num_tokens or top_k == 0:
+        raise ValueError("top-k tensors must have shape [num_tokens, top_k > 0]")
+    if twice_intermediate_size % 2 or weight_hidden_size != hidden_size:
+        raise ValueError("w13_weight has an incompatible shape")
+    if w2.shape != (num_experts, hidden_size, intermediate_size):
+        raise ValueError("w2_weight has an incompatible shape")
+    if hidden_size % 128 or intermediate_size % 32:
+        raise ValueError(
+            "hidden size must be a multiple of 128 and intermediate size of 32"
+        )
     return topk_weights, topk_ids
 
 
@@ -303,41 +343,10 @@ def _moe(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
 ) -> torch.Tensor:
-    if x.ndim != 2 or w13.ndim != 3 or w2.ndim != 3:
-        raise ValueError("x and unquantized MoE weights must be rank-2/rank-3")
-    if x.dtype not in (torch.float16, torch.bfloat16):
-        raise TypeError("x must use torch.float16 or torch.bfloat16")
-    if w13.dtype != x.dtype or w2.dtype != x.dtype:
-        raise TypeError("x, w13_weight, and w2_weight must have the same dtype")
-    if not all(t.is_cuda and t.is_contiguous() for t in (x, w13, w2)):
-        raise ValueError("x and weights must be contiguous GPU tensors")
-    if topk_ids.ndim != 2 or topk_weights.shape != topk_ids.shape:
-        raise ValueError("top-k tensors must have shape [num_tokens, top_k]")
-    if topk_ids.dtype not in (torch.int32, torch.int64):
-        raise TypeError("topk_ids must use torch.int32 or torch.int64")
-    if not topk_weights.is_floating_point():
-        raise TypeError("topk_weights must use a floating-point dtype")
-    if topk_ids.device != x.device or topk_weights.device != x.device:
-        raise ValueError("top-k tensors and x must be on the same device")
-    if w13.device != x.device or w2.device != x.device:
-        raise ValueError("x and weights must be on the same device")
-
     num_tokens, hidden_size = x.shape
-    num_experts, twice_intermediate_size, weight_hidden_size = w13.shape
+    num_experts, twice_intermediate_size, _ = w13.shape
     intermediate_size = twice_intermediate_size // 2
     top_k = topk_ids.shape[1]
-    if num_experts == 0:
-        raise ValueError("unquantized MoE requires at least one expert")
-    if topk_ids.shape[0] != num_tokens or top_k == 0:
-        raise ValueError("top-k tensors must have shape [num_tokens, top_k > 0]")
-    if twice_intermediate_size % 2 or weight_hidden_size != hidden_size:
-        raise ValueError("w13_weight has an incompatible shape")
-    if w2.shape != (num_experts, hidden_size, intermediate_size):
-        raise ValueError("w2_weight has an incompatible shape")
-    if hidden_size % 128 or intermediate_size % 32:
-        raise ValueError(
-            "hidden size must be a multiple of 128 and intermediate size of 32"
-        )
     if num_tokens == 0:
         return torch.empty_like(x)
 
@@ -406,6 +415,11 @@ def _moe(
     return output
 
 
+# ===-----------------------------------------------------------------------===#
+# Kernel Registry
+# ===-----------------------------------------------------------------------===#
+
+
 @register_kernel(
     "moe",
     "apply",
@@ -455,7 +469,5 @@ def triton_bf16_precomputed_moe_apply(
     Returns:
         Finalized hidden states `[tokens, hidden]` with dtype matching `x`.
     """
-    topk_weights, topk_ids = _validate_apply_contract(
-        plan, w, topk_weights, topk_ids, do_finalize
-    )
+    topk_weights, topk_ids = _validate(plan, x, w, topk_weights, topk_ids, do_finalize)
     return _moe(x, w.w13_weight, w.w2_weight, topk_weights, topk_ids)

@@ -128,8 +128,9 @@ def _combine(
     )
 
 
-def _validate_apply_contract(
+def _validate(
     plan: dict,
+    x: torch.Tensor,
     w: torch.nn.Module,
     topk_weights: torch.Tensor | None,
     topk_ids: torch.Tensor | None,
@@ -146,6 +147,7 @@ def _validate_apply_contract(
         raise ValueError("Triton MoE does not support expert bias")
     if topk_weights is None or topk_ids is None:
         raise ValueError("Triton MoE requires precomputed topk weights and ids")
+
     activation = plan.get("activation") or getattr(w, "activation", "silu")
     if activation not in {"silu", "swiglu"}:
         raise ValueError(f"Triton MoE does not support activation {activation!r}")
@@ -159,11 +161,55 @@ def _validate_apply_contract(
         raise ValueError("Triton MoE supports only standard SwiGLU")
     if getattr(w, "w13_input_layout", "concatenated") != "concatenated":
         raise ValueError("Triton MoE requires concatenated gate/up weights")
+
+    w13 = w.w13_weight
+    w13_scale = w.w13_weight_scale
+    w2 = w.w2_weight
+    w2_scale = w.w2_weight_scale
+    if x.ndim != 2:
+        raise ValueError("x must have shape [num_tokens, hidden_size]")
+    if x.dtype not in (torch.float16, torch.bfloat16):
+        raise TypeError("x must use torch.float16 or torch.bfloat16")
+    if any(t.dtype != torch.uint8 for t in (w13, w13_scale, w2, w2_scale)):
+        raise TypeError("MXFP4 packed values and scales must use torch.uint8")
+    if not all(
+        t.is_cuda and t.is_contiguous() for t in (x, w13, w13_scale, w2, w2_scale)
+    ):
+        raise ValueError("x and weights must be contiguous GPU tensors")
+    if topk_ids.ndim != 2 or topk_weights.shape != topk_ids.shape:
+        raise ValueError("top-k tensors must have shape [num_tokens, top_k]")
+    if topk_ids.dtype not in (torch.int32, torch.int64):
+        raise TypeError("topk_ids must use torch.int32 or torch.int64")
+    if not topk_weights.is_floating_point():
+        raise TypeError("topk_weights must use a floating-point dtype")
+    if topk_ids.device != x.device or topk_weights.device != x.device:
+        raise ValueError("top-k tensors and x must be on the same device")
+    if any(t.device != x.device for t in (w13, w13_scale, w2, w2_scale)):
+        raise ValueError("x and weights must be on the same device")
+
+    num_tokens, hidden_size = x.shape
+    num_experts, twice_intermediate_size, packed_hidden_size = w13.shape
+    intermediate_size = twice_intermediate_size // 2
+    top_k = topk_ids.shape[1]
+    if num_experts == 0:
+        raise ValueError("MXFP4 MoE requires at least one expert")
+    if topk_ids.shape[0] != num_tokens or top_k == 0:
+        raise ValueError("top-k tensors must have shape [num_tokens, top_k > 0]")
+    if twice_intermediate_size % 2 or packed_hidden_size * 2 != hidden_size:
+        raise ValueError("w13_weight has an incompatible packed shape")
+    if w13_scale.shape != (num_experts, 2 * intermediate_size, hidden_size // 32):
+        raise ValueError("w13_weight_scale must have shape [E, 2I, H/32]")
+    if w2.shape != (num_experts, hidden_size, intermediate_size // 2):
+        raise ValueError("w2_weight must have shape [E, H, I/2]")
+    if w2_scale.shape != (num_experts, hidden_size, intermediate_size // 32):
+        raise ValueError("w2_weight_scale must have shape [E, H, I/32]")
+    if hidden_size % 128 or intermediate_size % 128:
+        raise ValueError("hidden and intermediate sizes must be multiples of 128")
     return topk_weights, topk_ids
 
 
 @triton.jit
-def _quantize_mxfp4_block(values, valid_mask):
+def _quantize_mxfp4_routine(values, valid_mask):
     block_m: tl.constexpr = values.shape[0]
     block_k: tl.constexpr = values.shape[1]
     num_scale_blocks: tl.constexpr = block_k // 32
@@ -207,7 +253,7 @@ def _quantize_mxfp4_block(values, valid_mask):
 
 
 @triton.jit
-def _quantize_activation_kernel(
+def _quantize_mxfp4_kernel(
     x_ptr,
     packed_ptr,
     scale_ptr,
@@ -225,7 +271,7 @@ def _quantize_activation_kernel(
         mask=valid_mask,
         other=0.0,
     )
-    packed, scales = _quantize_mxfp4_block(values, valid_mask)
+    packed, scales = _quantize_mxfp4_routine(values, valid_mask)
     packed_offsets = (
         row_offsets[:, None] * (K // 2)
         + k_start // 2
@@ -353,7 +399,7 @@ def _stage1_kernel(
             )
             activated = (silu * up).to(output_dtype)
             valid_mask = row_mask[:, None] & (tl.arange(0, BLOCK_N)[None, :] < BLOCK_N)
-            activated_packed, activated_scales = _quantize_mxfp4_block(
+            activated_packed, activated_scales = _quantize_mxfp4_routine(
                 activated, valid_mask
             )
             inter_offsets = (
@@ -487,27 +533,6 @@ def _stage2_kernel(
         problem_start += problem_tiles
 
 
-def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module) -> None:
-    """Validate that the module retains the linear OCP MXFP4 weight layout."""
-    names = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
-    if any(not hasattr(w, name) for name in names):
-        raise ValueError("linear MXFP4 MoE weights are incomplete")
-    tensors = tuple(getattr(w, name) for name in names)
-    if any(t.dtype != torch.uint8 for t in tensors):
-        raise TypeError("MXFP4 packed values and scales must use torch.uint8")
-    if any(not t.is_cuda or not t.is_contiguous() for t in tensors):
-        raise ValueError("linear MXFP4 weights must be contiguous GPU tensors")
-    if any(t.ndim != 3 for t in tensors):
-        raise ValueError("linear MXFP4 weights must be rank-3")
-    if len({t.shape[0] for t in tensors}) != 1:
-        raise ValueError("linear MXFP4 weights must share an expert axis")
-    if getattr(w, "w13_input_layout", "concatenated") != "concatenated":
-        raise ValueError("Triton MXFP4 MoE requires concatenated gate/up weights")
-    activation = plan.get("activation") or getattr(w, "activation", "silu")
-    if activation not in {"silu", "swiglu"}:
-        raise ValueError(f"Triton MXFP4 MoE does not support {activation!r}")
-
-
 def _moe(
     x: torch.Tensor,
     w13: torch.Tensor,
@@ -517,45 +542,10 @@ def _moe(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
 ) -> torch.Tensor:
-    if x.ndim != 2:
-        raise ValueError("x must have shape [num_tokens, hidden_size]")
-    if x.dtype not in (torch.float16, torch.bfloat16):
-        raise TypeError("x must use torch.float16 or torch.bfloat16")
-    if any(t.dtype != torch.uint8 for t in (w13, w13_scale, w2, w2_scale)):
-        raise TypeError("MXFP4 packed values and scales must use torch.uint8")
-    if not all(
-        t.is_cuda and t.is_contiguous() for t in (x, w13, w13_scale, w2, w2_scale)
-    ):
-        raise ValueError("x and weights must be contiguous GPU tensors")
-    if topk_ids.ndim != 2 or topk_weights.shape != topk_ids.shape:
-        raise ValueError("top-k tensors must have shape [num_tokens, top_k]")
-    if topk_ids.dtype not in (torch.int32, torch.int64):
-        raise TypeError("topk_ids must use torch.int32 or torch.int64")
-    if not topk_weights.is_floating_point():
-        raise TypeError("topk_weights must use a floating-point dtype")
-    if topk_ids.device != x.device or topk_weights.device != x.device:
-        raise ValueError("top-k tensors and x must be on the same device")
-    if any(t.device != x.device for t in (w13, w13_scale, w2, w2_scale)):
-        raise ValueError("x and weights must be on the same device")
-
     num_tokens, hidden_size = x.shape
-    num_experts, twice_intermediate_size, packed_hidden_size = w13.shape
+    num_experts, twice_intermediate_size, _ = w13.shape
     intermediate_size = twice_intermediate_size // 2
     top_k = topk_ids.shape[1]
-    if num_experts == 0:
-        raise ValueError("MXFP4 MoE requires at least one expert")
-    if topk_ids.shape[0] != num_tokens or top_k == 0:
-        raise ValueError("top-k tensors must have shape [num_tokens, top_k > 0]")
-    if twice_intermediate_size % 2 or packed_hidden_size * 2 != hidden_size:
-        raise ValueError("w13_weight has an incompatible packed shape")
-    if w13_scale.shape != (num_experts, 2 * intermediate_size, hidden_size // 32):
-        raise ValueError("w13_weight_scale must have shape [E, 2I, H/32]")
-    if w2.shape != (num_experts, hidden_size, intermediate_size // 2):
-        raise ValueError("w2_weight must have shape [E, H, I/2]")
-    if w2_scale.shape != (num_experts, hidden_size, intermediate_size // 32):
-        raise ValueError("w2_weight_scale must have shape [E, H, I/32]")
-    if hidden_size % 128 or intermediate_size % 128:
-        raise ValueError("hidden and intermediate sizes must be multiples of 128")
     if num_tokens == 0:
         return torch.empty_like(x)
 
@@ -595,7 +585,7 @@ def _moe(
     backend = triton.runtime.driver.active.get_current_target().backend
     amd_options = {"matrix_instr_nonkdim": 32, "kpack": 1} if backend == "hip" else {}
     quant_block_k = 256 if hidden_size % 256 == 0 else 128
-    _quantize_activation_kernel[
+    _quantize_mxfp4_kernel[
         (triton.cdiv(num_tokens, block_m), triton.cdiv(hidden_size, quant_block_k))
     ](
         x,
@@ -659,6 +649,32 @@ def _moe(
     return output
 
 
+# ===-----------------------------------------------------------------------===#
+# Kernel Registry
+# ===-----------------------------------------------------------------------===#
+
+
+def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module) -> None:
+    """Validate that the module retains the linear OCP MXFP4 weight layout."""
+    names = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
+    if any(not hasattr(w, name) for name in names):
+        raise ValueError("linear MXFP4 MoE weights are incomplete")
+    tensors = tuple(getattr(w, name) for name in names)
+    if any(t.dtype != torch.uint8 for t in tensors):
+        raise TypeError("MXFP4 packed values and scales must use torch.uint8")
+    if any(not t.is_cuda or not t.is_contiguous() for t in tensors):
+        raise ValueError("linear MXFP4 weights must be contiguous GPU tensors")
+    if any(t.ndim != 3 for t in tensors):
+        raise ValueError("linear MXFP4 weights must be rank-3")
+    if len({t.shape[0] for t in tensors}) != 1:
+        raise ValueError("linear MXFP4 weights must share an expert axis")
+    if getattr(w, "w13_input_layout", "concatenated") != "concatenated":
+        raise ValueError("Triton MXFP4 MoE requires concatenated gate/up weights")
+    activation = plan.get("activation") or getattr(w, "activation", "silu")
+    if activation not in {"silu", "swiglu"}:
+        raise ValueError(f"Triton MXFP4 MoE does not support {activation!r}")
+
+
 @register_kernel(
     "moe",
     "apply",
@@ -710,9 +726,7 @@ def triton_mxfp4_precomputed_moe_apply(
     Returns:
         Finalized hidden states `[tokens, hidden]` with dtype matching `x`.
     """
-    topk_weights, topk_ids = _validate_apply_contract(
-        plan, w, topk_weights, topk_ids, do_finalize
-    )
+    topk_weights, topk_ids = _validate(plan, x, w, topk_weights, topk_ids, do_finalize)
     return _moe(
         x,
         w.w13_weight,
