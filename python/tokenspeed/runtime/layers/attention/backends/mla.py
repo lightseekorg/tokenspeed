@@ -99,6 +99,10 @@ class MLADecodeMetadata:
 class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
     """Unified MLA backend routed through tokenspeed_kernel MLA APIs."""
 
+    # Class default so _block_decode_active answers on instances built without
+    # __init__; the CUDA-graph tests construct backend shells that way.
+    draft_block_decode: bool = False
+
     def __init__(self, config: MLAConfig):
         super().__init__(config)
 
