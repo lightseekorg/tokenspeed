@@ -245,6 +245,39 @@ def test_mla_prefill(
             64,
             id="gluon-bh64",
         ),
+        pytest.param(
+            "gluon",
+            torch.bfloat16,
+            torch.bfloat16,
+            64,
+            512,
+            64,
+            1,
+            64,
+            id="gluon-h64-small-b1",
+        ),
+        pytest.param(
+            "gluon",
+            torch.bfloat16,
+            torch.bfloat16,
+            64,
+            512,
+            64,
+            2,
+            64,
+            id="gluon-h64-small-b2",
+        ),
+        pytest.param(
+            "gluon",
+            torch.bfloat16,
+            torch.bfloat16,
+            64,
+            512,
+            64,
+            4,
+            64,
+            id="gluon-h64-small-b4",
+        ),
     ],
 )
 def test_mla_decode_with_kvcache(
@@ -278,6 +311,14 @@ def test_mla_decode_with_kvcache(
         # selects 256 split-K workgroups and exercises the empty-split
         # sanitization used by production long-context decode.
         max_seqlen_k = 300_000
+    elif (
+        solution == "gluon"
+        and q_dtype == torch.bfloat16
+        and kv_dtype == torch.bfloat16
+        and num_heads == 64
+        and batch_size in (1, 2, 4)
+    ):
+        max_seqlen_k = 80_000
     max_pages = (visible_max_seqlen_k + page_size - 1) // page_size
     num_pages = batch_size * max_pages
 
@@ -428,3 +469,259 @@ def test_mla_extend_with_kvcache_bf16(device: str, require) -> None:
         q_start += q_len
 
     torch.testing.assert_close(out.float(), torch.stack(refs), rtol=8e-2, atol=8e-2)
+
+
+def _run_fixed_bf16_mla_decode_case(
+    *,
+    device: str,
+    override: str,
+    cache_seqlens_list: list[int],
+    return_lse: bool,
+    comparison_override: str | None = None,
+    use_out: bool = False,
+) -> None:
+    batch_size = len(cache_seqlens_list)
+    num_heads = 64
+    page_size = 64
+    max_seqlen_k = 80_000
+    kv_lora_rank = 512
+    qk_rope_head_dim = 64
+    qk_nope_head_dim = 128
+    qk_head_dim = kv_lora_rank + qk_rope_head_dim
+    live_max_seqlen_k = max(cache_seqlens_list)
+    live_max_pages = (live_max_seqlen_k + page_size - 1) // page_size
+
+    q = torch.randn(
+        batch_size,
+        1,
+        num_heads,
+        qk_head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    kv_cache = torch.randn(
+        batch_size * live_max_pages,
+        page_size,
+        1,
+        qk_head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    cache_seqlens = torch.tensor(
+        cache_seqlens_list,
+        device=device,
+        dtype=torch.int32,
+    )
+    page_table = torch.zeros(
+        batch_size,
+        (max_seqlen_k + page_size - 1) // page_size,
+        device=device,
+        dtype=torch.int32,
+    )
+    for batch_idx, seqlen in enumerate(cache_seqlens_list):
+        page_count = (seqlen + page_size - 1) // page_size
+        page_start = batch_idx * live_max_pages
+        page_table[batch_idx, :page_count] = torch.arange(
+            page_start,
+            page_start + page_count,
+            device=device,
+            dtype=torch.int32,
+        )
+    softmax_scale = 1.0 / math.sqrt(qk_nope_head_dim + qk_rope_head_dim)
+    out_buffer = None
+    if use_out:
+        out_buffer = torch.full(
+            (batch_size, 1, num_heads, kv_lora_rank),
+            float("nan"),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+
+    result = mla_decode_with_kvcache(
+        q=q,
+        kv_cache=kv_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_k=max_seqlen_k,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        softmax_scale=softmax_scale,
+        return_lse=return_lse,
+        out=out_buffer,
+        override=override,
+    )
+    if return_lse:
+        out, lse = result
+    else:
+        assert isinstance(result, torch.Tensor)
+        out = result
+        lse = None
+    if out_buffer is not None:
+        assert out is out_buffer
+
+    if comparison_override is not None:
+        comparison = mla_decode_with_kvcache(
+            q=q,
+            kv_cache=kv_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            max_seqlen_k=max_seqlen_k,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            softmax_scale=softmax_scale,
+            return_lse=return_lse,
+            override=comparison_override,
+        )
+        if return_lse:
+            comparison_out, comparison_lse = comparison
+        else:
+            assert isinstance(comparison, torch.Tensor)
+            comparison_out = comparison
+            comparison_lse = None
+        torch.testing.assert_close(
+            comparison_out.float(),
+            out.float(),
+            rtol=2e-2,
+            atol=2e-2,
+        )
+        if return_lse:
+            assert lse is not None
+            assert comparison_lse is not None
+            torch.testing.assert_close(
+                comparison_lse,
+                lse,
+                rtol=2e-2,
+                atol=2e-2,
+            )
+
+    refs = []
+    ref_lses = []
+    for batch_idx in range(batch_size):
+        kv_rows = []
+        for pos in range(int(cache_seqlens[batch_idx].item())):
+            page = page_table[batch_idx, pos // page_size]
+            kv_rows.append(kv_cache[page, pos % page_size, 0])
+        kv = torch.stack(kv_rows).float()
+        scores = torch.einsum("hd,kd->hk", q[batch_idx, 0].float(), kv)
+        scores = scores * softmax_scale
+        probs = torch.softmax(scores, dim=-1)
+        refs.append(torch.matmul(probs, kv[:, :kv_lora_rank]).unsqueeze(0))
+        ref_lses.append(torch.logsumexp(scores, dim=-1).unsqueeze(0))
+    out_ref = torch.stack(refs, dim=0)
+
+    assert out.shape == (batch_size, 1, num_heads, kv_lora_rank)
+    torch.testing.assert_close(out.float(), out_ref, rtol=8e-2, atol=8e-2)
+    if return_lse:
+        assert lse is not None
+        lse_ref = torch.stack(ref_lses, dim=0)
+        assert lse.shape == (batch_size, 1, num_heads)
+        torch.testing.assert_close(lse, lse_ref, rtol=8e-2, atol=8e-2)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        pytest.param(
+            "gluon_mla_decode_bf16xbf16_gfx950_bh16_multiblock",
+            id="bh16-multiblock",
+        ),
+        pytest.param(
+            "gluon_mla_decode_bf16xbf16_gfx950_bh64_small",
+            id="bh64-small",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "cache_seqlens_list",
+    [
+        pytest.param([64], id="b1"),
+        pytest.param([63, 65], id="b2"),
+        pytest.param([1, 64, 65, 129], id="b4"),
+    ],
+)
+@pytest.mark.parametrize("return_lse", [False, True], ids=["output", "lse"])
+def test_mla_decode_small_batch_fixed_entrypoints_match_reference(
+    device: str,
+    override: str,
+    cache_seqlens_list: list[int],
+    return_lse: bool,
+    require,
+) -> None:
+    require(
+        "attention",
+        "mla_decode_with_kvcache",
+        "gluon",
+        torch.bfloat16,
+        "q",
+    )
+    _run_fixed_bf16_mla_decode_case(
+        device=device,
+        override=override,
+        cache_seqlens_list=cache_seqlens_list,
+        return_lse=return_lse,
+    )
+
+
+@pytest.mark.parametrize(
+    "cache_seqlens_list",
+    [
+        pytest.param([64], id="b1"),
+        pytest.param([63, 65], id="b2"),
+        pytest.param([1, 64, 65, 129], id="b4"),
+    ],
+)
+def test_mla_decode_small_batch_fixed_entrypoints_match_each_other(
+    device: str,
+    cache_seqlens_list: list[int],
+    require,
+) -> None:
+    require(
+        "attention",
+        "mla_decode_with_kvcache",
+        "gluon",
+        torch.bfloat16,
+        "q",
+    )
+    _run_fixed_bf16_mla_decode_case(
+        device=device,
+        override="gluon_mla_decode_bf16xbf16_gfx950_bh16_multiblock",
+        comparison_override="gluon_mla_decode_bf16xbf16_gfx950_bh64_small",
+        cache_seqlens_list=cache_seqlens_list,
+        return_lse=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        pytest.param(
+            "gluon_mla_decode_bf16xbf16_gfx950_bh16_multiblock",
+            id="bh16-multiblock",
+        ),
+        pytest.param(
+            "gluon_mla_decode_bf16xbf16_gfx950_bh64_small",
+            id="bh64-small",
+        ),
+    ],
+)
+def test_mla_decode_small_batch_fixed_entrypoints_use_out(
+    device: str,
+    override: str,
+    require,
+) -> None:
+    require(
+        "attention",
+        "mla_decode_with_kvcache",
+        "gluon",
+        torch.bfloat16,
+        "q",
+    )
+    _run_fixed_bf16_mla_decode_case(
+        device=device,
+        override=override,
+        cache_seqlens_list=[63, 65],
+        return_lse=True,
+        use_out=True,
+    )

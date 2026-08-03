@@ -26,7 +26,7 @@ MIT-licensed ``aiter/ops/triton/gluon/mla_gluon.py`` at commit
 ``ae0bae8954110b12655e3232f68262dd63cd694e``. The implementation here retains
 TokenSpeed's paged-cache interface (page IDs plus an arbitrary page size).
 
-The shared kernel supports three regimes:
+The shared kernel supports five fixed regimes:
 
 * ``bh16bn128`` -- BF16/FP8 Q + FP8 KV, BLOCK_H=16, BLOCK_N=128 and
   ``num_q_heads <= 16`` and arbitrary batch sizes.
@@ -34,6 +34,10 @@ The shared kernel supports three regimes:
   ``num_q_heads <= 16``.
 * ``bh64`` -- BLOCK_H=64, BLOCK_N=64, ``num_q_heads in {64, 128}``, 3-D
   XCD-aware grid, ``batch_size`` divisible by 64.
+* ``bh16-multiblock`` -- BF16 Q/KV, BLOCK_H=16,
+  ``num_q_heads == 64``, ``batch_size == 1``, 3-D grid.
+* ``bh64-small`` -- BF16 Q/KV, BLOCK_H=64,
+  ``num_q_heads == 64``, ``batch_size in {2, 4}``, 3-D grid.
 """
 
 from __future__ import annotations
@@ -516,7 +520,7 @@ class AttentionConfig:
         # V is the latent slice of K, read back transposed for the PV dot.
         # bh64 tiles M across warps (degenerate warp_bases + extra reg bases);
         # bh16bn64 tiles the 64-wide K across warps.
-        if REGIME == "bh64":
+        if BLOCK_H == 64:
             linear_v = gl.DistributedLinearLayout(
                 reg_bases=(
                     (0, 1),
@@ -713,9 +717,6 @@ class AttentionProgram:
         sm_scale,
         kv_scale,
     ):
-        # Grid mapping: bh64 uses a 3-D XCD-aware multi-batch grid
-        # (NUM_XCDS, head_block, (batch // NUM_XCDS) * NUM_KV_SPLITS); bh16bn64 uses
-        # a 2-D (batch, split) grid (for batch_size=1 this is (1, NUM_KV_SPLITS)).
         if cfg.REGIME == "bh64":
             cur_batch = (
                 gl.program_id(0)
@@ -723,11 +724,17 @@ class AttentionProgram:
             )
             cur_head_id = gl.program_id(1)
             split_kv_id = gl.program_id(2) % cfg.NUM_KV_SPLITS
-        else:
+        elif cfg.REGIME == "bh16bn64" or cfg.REGIME == "bh16bn128":
             cur_batch = gl.program_id(0)
             split_kv_id = gl.program_id(1)
             # Head-block 0; use a runtime zero (aggregate fields hold tensors).
             cur_head_id = split_kv_id - split_kv_id
+        elif cfg.REGIME == "bh16-multiblock" or cfg.REGIME == "bh64-small":
+            cur_batch = gl.program_id(0)
+            cur_head_id = gl.program_id(1)
+            split_kv_id = gl.program_id(2)
+        else:
+            gl.static_assert(False, "unsupported MLA decode regime")
 
         # Paged 2-D view: Req_to_tokens = block_table[batch, max_pages],
         # B_seq_len = cache_seqlens[batch].
@@ -1027,7 +1034,7 @@ def _mla_decode_gluon(
     K_pe_cache,
     Req_to_tokens,
     B_seq_len,
-    O,  # noqa: E741
+    O,
     sm_scale,
     kv_scale,
     stride_q_nope_bs: gl.constexpr,
@@ -1399,7 +1406,7 @@ def _mla_decode_gluon(
 def _mla_softmax_reducev_kernel(
     Logits,
     Mid_lse,
-    O,  # noqa: E741
+    O,
     Final_lse,
     B_seq_len,
     stride_l_b: tl.constexpr,
@@ -1432,7 +1439,7 @@ def _mla_softmax_reducev_kernel(
     e_max = -float("inf")
     acc = tl.zeros([HEAD_DIM_CKV], dtype=tl.float32)
 
-    for split_kv_id in range(0, NUM_KV_SPLITS):
+    for split_kv_id in range(NUM_KV_SPLITS):
         split_valid = split_kv_id * pages_per_split < num_pages
         logits = tl.load(
             Logits + offs_l + split_kv_id * stride_l_s,
@@ -1468,6 +1475,18 @@ def _mla_softmax_reducev_kernel(
 _WAVE_WORKGROUPS = 256
 
 _NUM_XCDS = 8
+
+_DEFAULT_SMALL_BATCH_TARGET_WORKGROUPS = {
+    1: 256,
+    2: 128,
+    4: 256,
+}
+
+_SMALL_BATCH_REGIMES = frozenset({"bh16-multiblock", "bh64-small"})
+
+_MLA_DECODE_REGIMES = frozenset(
+    {"bh16bn128", "bh16bn64", "bh64", "bh16-multiblock", "bh64-small"}
+)
 
 
 def _select_num_kv_splits_bh16bn64(
@@ -1510,6 +1529,22 @@ def _select_num_kv_splits_bh64(
     return max(1, triton.next_power_of_2(triton.cdiv(_WAVE_WORKGROUPS, base_grid)))
 
 
+def _select_num_kv_splits_small_batch(
+    *,
+    batch: int,
+    nhead: int,
+    block_h: int,
+    max_seqlen_k: int,
+    block_n: int,
+    target_workgroups: int,
+) -> int:
+    head_blocks = (nhead + block_h - 1) // block_h
+    base_grid = batch * head_blocks
+    occupancy_splits = (target_workgroups + base_grid - 1) // base_grid
+    blocks = (max_seqlen_k + block_n - 1) // block_n
+    return max(1, min(occupancy_splits, blocks))
+
+
 def _gluon_mla_decode_gfx950(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -1521,22 +1556,17 @@ def _gluon_mla_decode_gfx950(
     qk_rope_head_dim: int,
     softmax_scale: float,
     *,
+    regime: str,
     logit_cap: float = 0.0,
     return_lse: bool = False,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Absorbed MLA decode over a paged compressed KV cache on gfx950.
-
-    ``q`` is ``[batch, 1, num_q_heads, kv_lora_rank + qk_rope_head_dim]`` and
-    ``kv_cache`` is ``[num_pages, page_size, 1, kv_lora_rank + qk_rope_head_dim]``
-    (first ``kv_lora_rank`` latent, last ``qk_rope_head_dim`` RoPE). Output is
-    BF16 with shape ``[batch, 1, num_q_heads, kv_lora_rank]``.
-
-    BF16 Q/KV selects ``bh16bn64`` (``num_q_heads <= 16``) or ``bh64``
-    (``num_q_heads in {64, 128}``). BF16 Q with FP8 KV selects AITER's
-    ``bh16bn128`` regime (``num_q_heads <= 16``). E4M3 Q with E4M3 KV selects
-    the native FP8 variant. Both FP8-KV variants support arbitrary batch sizes.
-    """
+    """Launch one fixed absorbed MLA decode regime."""
+    if regime not in _MLA_DECODE_REGIMES:
+        raise ValueError(
+            f"unsupported MLA decode regime {regime!r}; "
+            f"expected one of {sorted(_MLA_DECODE_REGIMES)}"
+        )
     if logit_cap != 0.0:
         raise NotImplementedError("gluon_mla_decode_gfx950 does not support logit_cap")
     if q.dim() != 4 or q.shape[1] != 1:
@@ -1567,10 +1597,41 @@ def _gluon_mla_decode_gfx950(
     is_fp8_kv = kv_cache.dtype != torch.bfloat16
 
     batch_size, _, nhead, _ = q.shape
-    if nhead in (64, 128):
-        if kv_cache.dtype != torch.bfloat16:
+    small_batch_h64 = regime in _SMALL_BATCH_REGIMES
+    if regime == "bh16bn128":
+        if not is_fp8_kv:
+            raise NotImplementedError(
+                "gluon MLA decode (bh16bn128) requires an FP8 kv_cache"
+            )
+        if not 1 <= nhead <= 16:
+            raise NotImplementedError(
+                "gluon MLA decode (bh16bn128) requires num_q_heads in [1, 16], "
+                f"got {nhead}"
+            )
+        block_h = 16
+        block_n = 128
+        num_xcds = 1
+    elif regime == "bh16bn64":
+        if q.dtype != torch.bfloat16 or kv_cache.dtype != torch.bfloat16:
+            raise NotImplementedError(
+                "gluon MLA decode (bh16bn64) requires bf16 q and kv_cache"
+            )
+        if not 1 <= nhead <= 16:
+            raise NotImplementedError(
+                "gluon MLA decode (bh16bn64) requires num_q_heads in [1, 16], "
+                f"got {nhead}"
+            )
+        block_h = 16
+        block_n = 64
+        num_xcds = 1
+    elif regime == "bh64":
+        if q.dtype != torch.bfloat16 or kv_cache.dtype != torch.bfloat16:
             raise NotImplementedError("gluon MLA bh64 requires bf16 q and kv_cache")
-        regime = "bh64"
+        if nhead not in (64, 128):
+            raise NotImplementedError(
+                "gluon MLA decode (bh64) requires num_q_heads in {64, 128}, "
+                f"got {nhead}"
+            )
         block_h = 64
         block_n = 64
         num_xcds = _NUM_XCDS
@@ -1579,20 +1640,20 @@ def _gluon_mla_decode_gfx950(
                 "gluon MLA decode (bh64) is large-batch only and requires "
                 f"batch_size divisible by 64, got {batch_size}"
             )
-    elif 1 <= nhead <= 16:
-        if is_fp8_kv:
-            regime = "bh16bn128"
-            block_n = 128
-        else:
-            regime = "bh16bn64"
-            block_n = 64
-        block_h = 16
-        num_xcds = 1  # unused by the 2-D (batch, split) grid
     else:
-        raise NotImplementedError(
-            "gluon MLA decode supports num_q_heads in [1, 16] (bh16bn64) or "
-            f"{{64, 128}} (bh64), got {nhead}"
-        )
+        if q.dtype != torch.bfloat16 or kv_cache.dtype != torch.bfloat16:
+            raise NotImplementedError(
+                f"gluon MLA decode ({regime}) requires bf16 q and kv_cache"
+            )
+        if nhead != 64 or batch_size not in _DEFAULT_SMALL_BATCH_TARGET_WORKGROUPS:
+            raise NotImplementedError(
+                f"gluon MLA decode ({regime}) requires num_q_heads=64 and "
+                f"batch_size in {sorted(_DEFAULT_SMALL_BATCH_TARGET_WORKGROUPS)}, "
+                f"got H={nhead}, B={batch_size}"
+            )
+        block_h = 16 if regime == "bh16-multiblock" else 64
+        block_n = 64
+        num_xcds = 1
     if kv_cache.dim() == 4:
         if kv_cache.shape[2] != 1 or kv_cache.shape[3] != qk_dim:
             raise ValueError(
@@ -1637,7 +1698,16 @@ def _gluon_mla_decode_gfx950(
     max_kv_bytes = kv_c.shape[0] * kv_c.stride(0) * kv_c.element_size()
     within_2gb = max_kv_bytes <= 0x80000000
 
-    if regime == "bh64":
+    if small_batch_h64:
+        num_kv_splits = _select_num_kv_splits_small_batch(
+            batch=batch_size,
+            nhead=nhead,
+            block_h=block_h,
+            max_seqlen_k=max_seqlen_k,
+            block_n=64,
+            target_workgroups=_DEFAULT_SMALL_BATCH_TARGET_WORKGROUPS[batch_size],
+        )
+    elif regime == "bh64":
         num_kv_splits = _select_num_kv_splits_bh64(
             batch=batch_size, nhead=nhead, num_xcds=num_xcds, block_h=block_h
         )
@@ -1665,24 +1735,26 @@ def _gluon_mla_decode_gfx950(
                 (nhead + block_h - 1) // block_h,
                 (batch_size // num_xcds) * splits,
             )
-        return (batch_size, splits)
+        if regime == "bh16bn64" or regime == "bh16bn128":
+            return (batch_size, splits)
+        return (batch_size, (nhead + block_h - 1) // block_h, splits)
 
-    common_kwargs = dict(
-        BLOCK_H=block_h,
-        BLOCK_N=block_n,
-        NUM_KV_SPLITS=num_kv_splits,
-        PAGE_SIZE=page_size,
-        HEAD_DIM_CKV=kv_lora_rank,
-        HEAD_DIM_KPE=qk_rope_head_dim,
-        KV_PE_OFFSET=kv_lora_rank,
-        WITHIN_2GB=within_2gb,
-        NUM_XCDS=num_xcds,
-        NHEAD=nhead,
-        REGIME=regime,
-        IS_FP8_Q=is_fp8_q,
-        RETURN_LSE=return_lse,
-        num_warps=4,
-    )
+    common_kwargs = {
+        "BLOCK_H": block_h,
+        "BLOCK_N": block_n,
+        "NUM_KV_SPLITS": num_kv_splits,
+        "PAGE_SIZE": page_size,
+        "HEAD_DIM_CKV": kv_lora_rank,
+        "HEAD_DIM_KPE": qk_rope_head_dim,
+        "KV_PE_OFFSET": kv_lora_rank,
+        "WITHIN_2GB": within_2gb,
+        "NUM_XCDS": num_xcds,
+        "NHEAD": nhead,
+        "REGIME": regime,
+        "IS_FP8_Q": is_fp8_q,
+        "RETURN_LSE": return_lse,
+        "num_warps": 4,
+    }
 
     if num_kv_splits == 1:
         # Fast path: the single split spans the whole sequence, so stage-1
@@ -1791,6 +1863,42 @@ def _gluon_mla_decode_gfx950(
     return out
 
 
+def gluon_mla_decode_bf16xbf16_gfx950_bh16bn64(*args, **kwargs):
+    """Run the fixed BLOCK_H=16, (batch, split) BF16 MLA decode regime."""
+    return _gluon_mla_decode_gfx950(
+        *args,
+        regime="bh16bn64",
+        **kwargs,
+    )
+
+
+def gluon_mla_decode_bf16xbf16_gfx950_bh64(*args, **kwargs):
+    """Run the fixed BLOCK_H=64, XCD-aware BF16 MLA decode regime."""
+    return _gluon_mla_decode_gfx950(
+        *args,
+        regime="bh64",
+        **kwargs,
+    )
+
+
+def gluon_mla_decode_bf16xbf16_gfx950_bh16_multiblock(*args, **kwargs):
+    """Run the fixed BLOCK_H=16 small-batch BF16 MLA decode regime."""
+    return _gluon_mla_decode_gfx950(
+        *args,
+        regime="bh16-multiblock",
+        **kwargs,
+    )
+
+
+def gluon_mla_decode_bf16xbf16_gfx950_bh64_small(*args, **kwargs):
+    """Run the fixed BLOCK_H=64 small-batch BF16 MLA decode regime."""
+    return _gluon_mla_decode_gfx950(
+        *args,
+        regime="bh64-small",
+        **kwargs,
+    )
+
+
 def gluon_mla_decode_bf16xbf16_gfx950(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -1806,21 +1914,40 @@ def gluon_mla_decode_bf16xbf16_gfx950(
     return_lse: bool = False,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Run the BF16-Q/BF16-KV GFX950 MLA decode regimes."""
+    """Dispatch BF16-Q/BF16-KV MLA decode to a fixed GFX950 regime."""
     if q.dtype != torch.bfloat16 or kv_cache.dtype != torch.bfloat16:
         raise NotImplementedError(
             "gluon_mla_decode_bf16xbf16_gfx950 requires bf16 q and kv_cache"
         )
-    return _gluon_mla_decode_gfx950(
-        q=q,
-        kv_cache=kv_cache,
-        page_table=page_table,
-        cache_seqlens=cache_seqlens,
-        max_seqlen_k=max_seqlen_k,
-        qk_nope_head_dim=qk_nope_head_dim,
-        kv_lora_rank=kv_lora_rank,
-        qk_rope_head_dim=qk_rope_head_dim,
-        softmax_scale=softmax_scale,
+    if q.dim() != 4 or q.shape[1] != 1:
+        raise ValueError(
+            f"q must be [batch, 1, num_q_heads, R + rope], got {tuple(q.shape)}"
+        )
+    batch_size, _, nhead, _ = q.shape
+    if 1 <= nhead <= 16:
+        impl = gluon_mla_decode_bf16xbf16_gfx950_bh16bn64
+    elif nhead == 64 and batch_size == 1:
+        impl = gluon_mla_decode_bf16xbf16_gfx950_bh16_multiblock
+    elif nhead == 64 and batch_size in (2, 4):
+        impl = gluon_mla_decode_bf16xbf16_gfx950_bh64_small
+    elif nhead in (64, 128) and batch_size % 64 == 0:
+        impl = gluon_mla_decode_bf16xbf16_gfx950_bh64
+    else:
+        raise NotImplementedError(
+            "gluon MLA decode supports H in [1, 16], H=64 with B in {1, 2, 4}, "
+            "or H in {64, 128} with B divisible by 64; "
+            f"got H={nhead}, B={batch_size}"
+        )
+    return impl(
+        q,
+        kv_cache,
+        page_table,
+        cache_seqlens,
+        max_seqlen_k,
+        qk_nope_head_dim,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        softmax_scale,
         logit_cap=logit_cap,
         return_lse=return_lse,
         out=out,
@@ -1860,6 +1987,7 @@ def gluon_mla_decode_bf16xfp8_gfx950(
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
         softmax_scale=softmax_scale,
+        regime="bh16bn128",
         logit_cap=logit_cap,
         return_lse=return_lse,
         out=out,
@@ -1901,6 +2029,7 @@ def gluon_mla_decode_fp8xfp8_gfx950(
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
         softmax_scale=softmax_scale,
+        regime="bh16bn128",
         logit_cap=logit_cap,
         return_lse=return_lse,
         out=out,
