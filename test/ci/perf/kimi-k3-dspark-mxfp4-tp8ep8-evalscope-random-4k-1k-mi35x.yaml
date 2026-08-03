@@ -13,6 +13,9 @@ env:
   CI: "true"
 install:
   - bash test/ci_system/install_deps_rocm.sh
+# --disable-prefill-graph: prefill graphs want 40 buckets on top of the decode
+# ones and OOM at this memory fraction. Decode graphs are what speculative
+# decoding rides on, and all four batch buckets capture cleanly.
 server:
   command: >-
     ts serve
