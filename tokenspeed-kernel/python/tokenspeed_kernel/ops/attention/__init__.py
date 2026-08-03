@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 # Backend registration (side-effect imports)
 import tokenspeed_kernel.ops.attention.cuda  # noqa: F401
@@ -29,11 +30,16 @@ import tokenspeed_kernel.ops.attention.flash_attn  # noqa: F401
 import tokenspeed_kernel.ops.attention.flash_mla  # noqa: F401
 import tokenspeed_kernel.ops.attention.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.attention.gluon  # noqa: F401
+import tokenspeed_kernel.ops.attention.msa  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton  # noqa: F401
 import torch
 from tokenspeed_kernel.ops.attention.gdn_utils import (
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
+)
+from tokenspeed_kernel.ops.attention.kda_utils import KdaPrefillResult
+from tokenspeed_kernel.ops.attention.triton.kda_chunk import (
+    kda_chunk_prefill,
 )
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
@@ -43,9 +49,18 @@ from tokenspeed_kernel.selection import (
     select_kernel,
     spec_matches_traits,
 )
-from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.signature import (
+    MXFP8_BLOCK_SCALE,
+    ScaleFormat,
+    dense_tensor_format,
+    format_signature,
+    tensor_format,
+)
 
 AttentionResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]
+
+# One UE8M0 scale per 32 consecutive head_dim elements (MXFP8).
+MXFP8_ATTENTION_BLOCK_SCALE = MXFP8_BLOCK_SCALE
 
 
 def _attention_format_signature(**roles: torch.Tensor):
@@ -54,11 +69,59 @@ def _attention_format_signature(**roles: torch.Tensor):
     )
 
 
+def _mxfp8_attention_format_signature(**roles: torch.Tensor):
+    return format_signature(
+        **{
+            role: tensor_format(
+                "mxfp8", tensor.dtype, scale=MXFP8_ATTENTION_BLOCK_SCALE
+            )
+            for role, tensor in roles.items()
+        }
+    )
+
+
+def _blockscaled_signature_and_scales(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    k_scale: torch.Tensor | None,
+    v_scale: torch.Tensor | None,
+):
+    """Pick dense vs MXFP8 signature and build the scale kwargs splat.
+
+    q_scale selects the block-scaled path; k_scale/v_scale must accompany it.
+    Returns (signature, scale_kwargs) for the paged-KV-cache entry points.
+    """
+    if q_scale is not None:
+        assert (
+            k_scale is not None and v_scale is not None
+        ), "MXFP8 attention requires q_scale, k_scale, and v_scale together"
+        signature = _mxfp8_attention_format_signature(
+            q=q, k_cache=k_cache, v_cache=v_cache
+        )
+    else:
+        signature = _attention_format_signature(q=q, k_cache=k_cache, v_cache=v_cache)
+    return signature, dict(q_scale=q_scale, k_scale=k_scale, v_scale=v_scale)
+
+
 __all__ = [
     "mha_prefill",
     "mha_extend_with_kvcache",
     "mha_decode_with_kvcache",
+    "rel_mha_prefill",
+    "rel_mha_extend_with_kvcache",
+    "rel_mha_decode_with_kvcache",
+    "rel_mha_plan",
     "gdn_chunk_prefill",
+    "gdn_decode_step",
+    "gdn_decode_mtp",
+    "kda_chunk_prefill",
+    "kda_paged_prefill",
+    "kda_paged_decode",
+    "try_kda_fused_paged_decode",
+    "try_kda_fused_paged_verify",
+    "KdaPrefillResult",
     "GdnCheckpointLayout",
     "GdnChunkPrefillResult",
     "mla_prefill",
@@ -68,11 +131,306 @@ __all__ = [
     "dsa_prefill_topk",
     "dsa_decode_topk",
     "dsa_plan",
+    "msa_decode_with_kvcache",
+    "msa_extend_with_kvcache",
     "attn_merge_state",
     "mha_plan",
 ]
 
 LSE_LN = math.log2(math.e)
+
+
+def msa_decode_with_kvcache(
+    q: torch.Tensor,
+    index_q: torch.Tensor,
+    index_k: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    *,
+    topk: int,
+    page_size: int,
+    index_scale: float,
+    attention_scale: float,
+    init_blocks: int,
+    local_blocks: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    k_scale: float | torch.Tensor | None = None,
+    v_scale: float | torch.Tensor | None = None,
+    score_out: torch.Tensor | None = None,
+    enable_pdl: bool = False,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """Run MSA decode against paged K/V and index-key caches.
+
+    Args:
+        q: Main queries shaped ``[tokens, local_heads, head_dim]``.
+        index_q: Index queries shaped ``[tokens, local_groups, index_dim]``.
+        index_k: Index keys for the current tokens shaped
+            ``[tokens, index_dim]``.
+        k_cache: Paged key cache shaped
+            ``[pages, local_kv_heads, page_size, head_dim]``.
+        v_cache: Paged value cache with the same shape as ``k_cache``.
+        index_k_cache: Per-layer index-key cache shaped
+            ``[slots, index_dim]``.
+        slot_mapping: Cache slot for each current token.
+        page_table: Logical-to-physical page table.
+        cache_seqlens: Visible sequence lengths after the current tokens.
+        topk: Number of sparse blocks selected for each index query.
+        page_size: Number of cache tokens in each indexed block.
+        index_scale: Scale applied to index scores.
+        attention_scale: Scale applied to main attention scores.
+        init_blocks: Leading blocks forced into the selected set.
+        local_blocks: Recent blocks forced into the selected set.
+        max_seqlen_q: Uniform query-token count per request.
+        max_seqlen_k: Maximum KV length addressable through ``page_table``.
+        k_scale: Optional scalar descale for an FP8 ``k_cache``; keys were
+            divided by this scale before quantization. None means 1.0.
+        v_scale: Optional scalar descale for an FP8 ``v_cache``, with the
+            same convention as ``k_scale``.
+        score_out: Optional caller-owned index-score buffer, pre-filled with
+            ``-inf`` and reused across layers; forwarded to the kernel to avoid
+            a per-layer allocation + fill. Ignored by kernels that do not
+            accept it or when its shape does not match.
+        enable_pdl: Request Programmatic Dependent Launch (SM90+) for the
+            indexer's index-key store; forwarded to the kernel.
+        override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Returns:
+        Attention output with the same shape and dtype as ``q``. The indexer
+        stage also writes ``index_k`` into ``index_k_cache`` at
+        ``slot_mapping``.
+    """
+    traits = {
+        "head_dim": q.shape[-1],
+        "index_head_dim": index_q.shape[-1],
+        "page_size": page_size,
+        "topk": topk,
+    }
+    signature = _attention_format_signature(
+        q=q,
+        index_q=index_q,
+        index_k=index_k,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        index_k_cache=index_k_cache,
+    )
+    kernel = select_kernel(
+        "attention",
+        "msa_decode_with_kvcache",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    shape_params = {
+        "batch_size": cache_seqlens.shape[0],
+        "total_q": q.shape[0],
+        "num_pages": k_cache.shape[0],
+        "page_size": page_size,
+        "max_pages_per_seq": page_table.shape[1],
+        "num_q_heads": q.shape[1],
+        "num_kv_heads": k_cache.shape[1],
+        "head_dim": q.shape[-1],
+        "index_head_dim": index_q.shape[-1],
+        "topk": topk,
+        "max_seqlen_q": max_seqlen_q,
+        "max_seqlen_k": max_seqlen_k,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "msa_decode_with_kvcache",
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+
+    with kernel_scope(
+        "attention",
+        "msa_decode_with_kvcache",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            index_q=index_q,
+            index_k=index_k,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            index_k_cache=index_k_cache,
+            slot_mapping=slot_mapping,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            topk=topk,
+            page_size=page_size,
+            index_scale=index_scale,
+            attention_scale=attention_scale,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            score_out=score_out,
+            enable_pdl=enable_pdl,
+        )
+
+
+def msa_extend_with_kvcache(
+    q: torch.Tensor,
+    index_q: torch.Tensor,
+    index_k: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    *,
+    topk: int,
+    page_size: int,
+    index_scale: float,
+    attention_scale: float,
+    init_blocks: int,
+    local_blocks: int,
+    seq_lens_cpu: Sequence[int],
+    k_scale: float | torch.Tensor | None = None,
+    v_scale: float | torch.Tensor | None = None,
+    query_lens_cpu: Sequence[int] | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """Run MSA extend against paged K/V and index-key caches.
+
+    Args:
+        q: Main queries shaped ``[total_q, local_heads, head_dim]``.
+        index_q: Index queries shaped
+            ``[total_q, local_groups, index_dim]``.
+        index_k: Index keys for the current tokens shaped
+            ``[total_q, index_dim]``.
+        k_cache: Paged key cache shaped
+            ``[pages, local_kv_heads, page_size, head_dim]``.
+        v_cache: Paged value cache with the same shape as ``k_cache``.
+        index_k_cache: Per-layer index-key cache shaped
+            ``[slots, index_dim]``.
+        slot_mapping: Cache slot for each current token.
+        page_table: Logical-to-physical page table.
+        cache_seqlens: Visible sequence lengths after the current tokens.
+        cu_seqlens_q: Cumulative query lengths shaped ``[batch + 1]``.
+        prefix_lens: Cached prefix length for each request.
+        max_seqlen_q: Maximum query length in the batch.
+        max_seqlen_k: Maximum visible KV length in the batch.
+        topk: Number of sparse blocks selected for each index query.
+        page_size: Number of cache tokens in each indexed block.
+        index_scale: Scale applied to index scores.
+        attention_scale: Scale applied to main attention scores.
+        init_blocks: Leading blocks forced into the selected set.
+        local_blocks: Recent blocks forced into the selected set.
+        k_scale: Optional scalar descale for an FP8 ``k_cache``; keys were
+            divided by this scale before quantization. None means 1.0.
+        v_scale: Optional scalar descale for an FP8 ``v_cache``, with the
+            same convention as ``k_scale``.
+        query_lens_cpu: Optional host-side per-request new-token counts;
+            with ``seq_lens_cpu`` this lets the indexer plan its fmha
+            OnlyScore path without a device sync.
+        seq_lens_cpu: Host-side per-request total sequence lengths.
+        override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Returns:
+        Attention output with the same shape and dtype as ``q``. The indexer
+        stage also writes ``index_k`` into ``index_k_cache`` at
+        ``slot_mapping``.
+    """
+    traits = {
+        "head_dim": q.shape[-1],
+        "index_head_dim": index_q.shape[-1],
+        "page_size": page_size,
+        "topk": topk,
+    }
+    signature = _attention_format_signature(
+        q=q,
+        index_q=index_q,
+        index_k=index_k,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        index_k_cache=index_k_cache,
+    )
+    kernel = select_kernel(
+        "attention",
+        "msa_extend_with_kvcache",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    shape_params = {
+        "batch_size": cache_seqlens.shape[0],
+        "total_q": q.shape[0],
+        "num_pages": k_cache.shape[0],
+        "page_size": page_size,
+        "max_pages_per_seq": page_table.shape[1],
+        "num_q_heads": q.shape[1],
+        "num_kv_heads": k_cache.shape[1],
+        "head_dim": q.shape[-1],
+        "index_head_dim": index_q.shape[-1],
+        "topk": topk,
+        "max_seqlen_q": max_seqlen_q,
+        "max_seqlen_k": max_seqlen_k,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "msa_extend_with_kvcache",
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+
+    with kernel_scope(
+        "attention",
+        "msa_extend_with_kvcache",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            index_q=index_q,
+            index_k=index_k,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            index_k_cache=index_k_cache,
+            slot_mapping=slot_mapping,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            prefix_lens=prefix_lens,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            topk=topk,
+            page_size=page_size,
+            index_scale=index_scale,
+            attention_scale=attention_scale,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            query_lens_cpu=query_lens_cpu,
+            seq_lens_cpu=seq_lens_cpu,
+        )
 
 
 # ===-----------------------------------------------------------------------===#
@@ -105,7 +463,10 @@ def gdn_chunk_prefill(
         g: Log-space forget gate shaped ``[1, total_tokens, num_v_heads]``.
         beta: Beta gate shaped ``[1, total_tokens, num_v_heads]``.
         scale: Attention scale. ``None`` lets the implementation use its default.
-        initial_state: Recurrent state shaped ``[batch, num_v_heads, head_dim, head_v_dim]``.
+        initial_state: Recurrent state, K-last: ``[batch, num_v_heads,
+            head_v_dim, head_dim]``. This matches flashinfer's native GDN
+            decode/MTP layout (and the runtime's SSM state pool); backends
+            whose own math is FLA-native (e.g. Triton) transpose internally.
         cu_seqlens: Cumulative sequence lengths for variable-length prefill.
         qk_l2norm: Whether the selected kernel should L2-normalize Q/K.
         output_final_state: Whether to return the final recurrent state.
@@ -115,8 +476,9 @@ def gdn_chunk_prefill(
         solution: Optional kernel solution to force through normal selection.
 
     Returns:
-        ``GdnChunkPrefillResult`` with output, final state, and optional
-        backend-native recurrent checkpoints.
+        ``GdnChunkPrefillResult`` with output, final state (K-last, same
+        layout as ``initial_state``), and optional backend-native recurrent
+        checkpoints (also K-last).
     """
     head_dim = q.shape[-1]
     head_v_dim = v.shape[-1]
@@ -178,6 +540,479 @@ def gdn_chunk_prefill(
         )
 
 
+def gdn_decode_step(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    b: torch.Tensor,
+    initial_state: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    scale: float | None = None,
+    output_state_indices: torch.Tensor | None = None,
+    use_qk_l2norm: bool = True,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """Run one single-token (T=1) GDN decode step through kernel selection.
+
+    Args:
+        q: Query tensor shaped ``[B, 1, num_q_heads, head_dim]``.
+        k: Key tensor shaped ``[B, 1, num_q_heads, head_dim]``.
+        v: Value tensor shaped ``[B, 1, num_v_heads, head_v_dim]``.
+        A_log: Floating-point log decay parameter shaped ``[num_v_heads]``.
+            Backends that require FP32 normalize it internally.
+        a: Input-dependent decay shaped ``[B, 1, num_v_heads]``.
+        dt_bias: Floating-point decay bias shaped ``[num_v_heads]``. Backends
+            that require FP32 normalize it internally.
+        b: Update-gate (beta) input shaped ``[B, 1, num_v_heads]``.
+        initial_state: SSM state pool, K-last ``[pool_size, num_v_heads,
+            head_v_dim, head_dim]`` (matches the runtime's SSM state pool).
+        initial_state_indices: Per-batch read row, shaped ``[B]``. ``-1``
+            marks CUDA-graph padding; handled internally, no caller clamp
+            needed.
+        scale: Attention scale. ``None`` lets the implementation use its default.
+        output_state_indices: Per-batch write row, shaped ``[B]``. ``None``
+            writes back to ``initial_state_indices`` (the common, non-flat
+            pool case); pass distinct rows for flat dual-index state paging.
+        use_qk_l2norm: Whether the selected kernel should L2-normalize Q/K.
+        override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Returns:
+        Decode output shaped ``[B, 1, num_v_heads, head_v_dim]`` (q.dtype).
+    """
+    head_dim = q.shape[-1]
+    signature = _attention_format_signature(q=q, k=k, v=v)
+    kernel = select_kernel(
+        "attention",
+        "gdn_decode_step",
+        signature,
+        traits={"head_dim": head_dim},
+        solution=solution,
+        override=override,
+    )
+    with kernel_scope(
+        "attention",
+        "gdn_decode_step",
+        q.dtype,
+        kernel_name=kernel.name,
+        batch_size=q.shape[0],
+        num_v_heads=v.shape[-2],
+        head_dim=head_dim,
+        head_v_dim=v.shape[-1],
+    ):
+        return kernel(
+            q=q,
+            k=k,
+            v=v,
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            b=b,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            scale=scale,
+            output_state_indices=output_state_indices,
+            use_qk_l2norm=use_qk_l2norm,
+        )
+
+
+def gdn_decode_mtp(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    b: torch.Tensor,
+    initial_state: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    scale: float | None = None,
+    disable_state_update: bool = True,
+    use_qk_l2norm: bool = True,
+    intermediate_states_buffer: torch.Tensor | None = None,
+    output_state_indices: torch.Tensor | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """Run one multi-token (T>1) GDN MTP verify step through kernel selection.
+
+    Args:
+        q: Query tensor shaped ``[B, T, num_q_heads, head_dim]``.
+        k: Key tensor shaped ``[B, T, num_q_heads, head_dim]``.
+        v: Value tensor shaped ``[B, T, num_v_heads, head_v_dim]``.
+        A_log: Floating-point log decay parameter shaped ``[num_v_heads]``.
+            Backends that require FP32 normalize it internally.
+        a: Input-dependent decay shaped ``[B, T, num_v_heads]``.
+        dt_bias: Floating-point decay bias shaped ``[num_v_heads]``. Backends
+            that require FP32 normalize it internally.
+        b: Update-gate (beta) input shaped ``[B, T, num_v_heads]``.
+        initial_state: SSM state pool, K-last ``[pool_size, num_v_heads,
+            head_v_dim, head_dim]`` (matches the runtime's SSM state pool).
+        initial_state_indices: Per-batch read row, shaped ``[B]``. When
+            ``output_state_indices`` is not provided and
+            ``disable_state_update=False``, the final state is written back to
+            that same row. Padding handling is solution and state-dtype
+            specific: the portable Triton and FlashInfer FP32 paths suppress
+            state reads and writes for negative rows, while FlashInfer's BF16
+            fast path redirects them to row 0 and requires the caller to
+            reserve that row.
+        scale: Attention scale. ``None`` lets the implementation use its default.
+        disable_state_update: When True (default), never write back to
+            ``initial_state_indices``.
+        use_qk_l2norm: Whether the selected kernel should L2-normalize Q/K.
+        intermediate_states_buffer: Optional batch-scoped ``[B, T,
+            num_v_heads, head_v_dim, head_dim]`` (K-last, same dtype as
+            ``initial_state``) buffer that receives every step's post-update
+            state at ``buffer[i_n, step]``.
+        output_state_indices: Optional per-token state-pool destinations shaped
+            ``[B, T]`` with dtype ``torch.int32``. When provided, each
+            post-update state ``h_{t+1}`` is written directly to
+            ``initial_state[output_state_indices[i, t]]``. Negative entries
+            are safe only when the selected solution skips the corresponding
+            negative initial-state row; otherwise entries must be
+            non-negative. This is mutually exclusive with
+            ``intermediate_states_buffer`` and requires
+            ``disable_state_update=False``.
+        override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Returns:
+        Decode output shaped ``[B, T, num_v_heads, head_v_dim]`` (q.dtype).
+    """
+    if output_state_indices is not None:
+        if output_state_indices.shape != q.shape[:2]:
+            raise ValueError(
+                "output_state_indices must have shape "
+                f"{tuple(q.shape[:2])}, got {tuple(output_state_indices.shape)}"
+            )
+        if output_state_indices.dtype != torch.int32:
+            raise ValueError(
+                "output_state_indices must have dtype torch.int32, got "
+                f"{output_state_indices.dtype}"
+            )
+        if intermediate_states_buffer is not None:
+            raise ValueError(
+                "output_state_indices and intermediate_states_buffer are "
+                "mutually exclusive"
+            )
+        if disable_state_update:
+            raise ValueError("output_state_indices requires disable_state_update=False")
+
+    head_dim = q.shape[-1]
+    signature = _attention_format_signature(q=q, k=k, v=v)
+    kernel = select_kernel(
+        "attention",
+        "gdn_decode_mtp",
+        signature,
+        traits={"head_dim": head_dim},
+        solution=solution,
+        override=override,
+    )
+    with kernel_scope(
+        "attention",
+        "gdn_decode_mtp",
+        q.dtype,
+        kernel_name=kernel.name,
+        batch_size=q.shape[0],
+        seq_len=q.shape[1],
+        num_v_heads=v.shape[-2],
+        head_dim=head_dim,
+        head_v_dim=v.shape[-1],
+    ):
+        return kernel(
+            q=q,
+            k=k,
+            v=v,
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            b=b,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            scale=scale,
+            disable_state_update=disable_state_update,
+            use_qk_l2norm=use_qk_l2norm,
+            intermediate_states_buffer=intermediate_states_buffer,
+            output_state_indices=output_state_indices,
+        )
+
+
+def kda_paged_prefill(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g_raw: torch.Tensor,
+    beta_logits: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    lower_bound: float | None = -5.0,
+    override: str | None = None,
+    solution: str | None = None,
+) -> KdaPrefillResult:
+    """Run packed KDA prefill through capability-based kernel selection.
+
+    Args:
+        q/k/g_raw: Packed tensors ``[1, total_tokens, heads, key_dim]``.
+        v: Values ``[1, total_tokens, heads, value_dim]``.
+        beta_logits: Raw beta logits ``[1, total_tokens, heads]``.
+        A_log/dt_bias: FP32 gate parameters.
+        initial_state: One backend-owned recurrent state per sequence.
+        cu_seqlens: Device sequence boundaries ``[num_sequences + 1]``.
+        lower_bound: Optional safe lower bound for log decay.
+        override: Optional exact kernel name.
+        solution: Optional registered solution name.
+
+    Returns:
+        Packed output and final state.
+
+    Recurrent states use the canonical ``[N,H,K,V]`` layout across backends.
+    """
+    if q.ndim != 4 or q.shape[0] != 1:
+        raise ValueError("KDA q must be [1, total_tokens, heads, key_dim]")
+    if k.shape != q.shape or g_raw.shape != q.shape:
+        raise ValueError("KDA q, k, and g_raw must have identical shapes")
+    if v.ndim != 4 or v.shape[:3] != q.shape[:3]:
+        raise ValueError("KDA v must match q through the head dimension")
+    if beta_logits.shape != q.shape[:-1]:
+        raise ValueError("KDA beta logits must be [1, total_tokens, heads]")
+    num_sequences = cu_seqlens.numel() - 1
+    if initial_state.ndim != 4 or initial_state.shape[0] != num_sequences:
+        raise ValueError("KDA initial_state must contain one row per sequence")
+    # AMD historically ignores the NVIDIA prefill policy labels and uses its
+    # registered Triton implementation.
+    if current_platform().is_amd and solution in {"fla", "flashkda", "cutedsl_kda"}:
+        solution = "triton"
+    kernel = select_kernel(
+        "attention",
+        "kda_paged_prefill",
+        _attention_format_signature(q=q, k=k, v=v),
+        solution=solution,
+        override=override,
+    )
+    return kernel(
+        q=q,
+        k=k,
+        v=v,
+        g_raw=g_raw,
+        beta_logits=beta_logits,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        initial_state=initial_state,
+        cu_seqlens=cu_seqlens,
+        lower_bound=lower_bound,
+    )
+
+
+def kda_paged_decode(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g_raw: torch.Tensor,
+    beta_logits: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    state_pool: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    lower_bound: float | None = -5.0,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """Run post-convolution KDA decode against an indexed state pool.
+
+    Args:
+        q/k/g_raw: Packed tensors ``[1, batch, heads, key_dim]``.
+        v: Packed values ``[1, batch, heads, value_dim]``.
+        beta_logits: Raw beta logits ``[1, batch, heads]``.
+        A_log/dt_bias: FP32 gate parameters.
+        state_pool: Backend-owned recurrent-state pool.
+        read_indices/write_indices: Independent source/destination rows.
+        cu_seqlens: Device boundaries ``[batch + 1]``.
+        lower_bound: Optional safe lower bound for log decay.
+        override: Optional exact kernel name.
+        solution: Optional registered solution name.
+
+    Returns:
+        KDA output with the same shape as ``v``.
+    """
+    if q.ndim != 4 or q.shape[0] != 1:
+        raise ValueError("KDA decode q must be [1, batch, heads, key_dim]")
+    if k.shape != q.shape or g_raw.shape != q.shape:
+        raise ValueError("KDA decode q, k, and g_raw must have identical shapes")
+    if v.ndim != 4 or v.shape[:3] != q.shape[:3]:
+        raise ValueError("KDA decode v must match q through the head dimension")
+    if beta_logits.shape != q.shape[:-1]:
+        raise ValueError("KDA beta logits must be [1, total_tokens, heads]")
+    num_sequences = read_indices.numel()
+    if read_indices.ndim != 1 or write_indices.shape != (num_sequences,):
+        raise ValueError("KDA decode requires one read/write index per sequence")
+    if cu_seqlens.numel() != num_sequences + 1:
+        raise ValueError("KDA decode cu_seqlens must contain one boundary per sequence")
+
+    kernel = select_kernel(
+        "attention",
+        "kda_paged_decode",
+        _attention_format_signature(q=q, k=k, v=v),
+        traits={
+            "indexed_state": True,
+            "single_token": q.shape[1] == num_sequences,
+        },
+        solution=solution,
+        override=override,
+    )
+    return kernel(
+        q=q,
+        k=k,
+        v=v,
+        g_raw=g_raw,
+        beta_logits=beta_logits,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        state_pool=state_pool,
+        read_indices=read_indices,
+        write_indices=write_indices,
+        cu_seqlens=cu_seqlens,
+        lower_bound=lower_bound,
+    )
+
+
+def try_kda_fused_paged_decode(
+    mixed_qkv: torch.Tensor,
+    conv_weights: torch.Tensor,
+    conv_states: torch.Tensor,
+    f_a_out: torch.Tensor,
+    f_b_weight: torch.Tensor,
+    beta_logits: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    state_pool: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    cu_seqlens: torch.Tensor,
+    lower_bound: float | None = -5.0,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor | None:
+    """Try a registered pre-convolution KDA decode fusion.
+
+    Returns ``None`` only when no implementation supports the current
+    platform. Invalid inputs and execution failures remain visible.
+    """
+    signature = _attention_format_signature(
+        q=mixed_qkv,
+        k=mixed_qkv,
+        v=mixed_qkv,
+    )
+    try:
+        kernel = select_kernel(
+            "attention",
+            "kda_fused_paged_decode",
+            signature,
+            traits={"paged_state": True},
+            solution=solution,
+            override=override,
+        )
+    except NoKernelFoundError:
+        return None
+    return kernel(
+        mixed_qkv=mixed_qkv,
+        conv_weights=conv_weights,
+        conv_states=conv_states,
+        f_a_out=f_a_out,
+        f_b_weight=f_b_weight,
+        beta_logits=beta_logits,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        state_pool=state_pool,
+        read_indices=read_indices,
+        write_indices=write_indices,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        cu_seqlens=cu_seqlens,
+        lower_bound=lower_bound,
+    )
+
+
+def try_kda_fused_paged_verify(
+    mixed_qkv: torch.Tensor,
+    conv_weights: torch.Tensor,
+    conv_states: torch.Tensor,
+    conv_scratch: torch.Tensor,
+    f_a_out: torch.Tensor,
+    f_b_weight: torch.Tensor,
+    beta_logits: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    state_pool: torch.Tensor,
+    state_scratch: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    draft_token_num: int,
+    lower_bound: float | None = -5.0,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor | None:
+    """Try a registered pre-convolution KDA target-verify fusion.
+
+    Mirrors ``try_kda_fused_paged_decode`` for the speculative verify batch:
+    per-position conv windows and recurrent states land in the verify
+    scratches for partial-accept commit. Returns ``None`` only when no
+    implementation supports the current platform.
+    """
+    signature = _attention_format_signature(
+        q=mixed_qkv,
+        k=mixed_qkv,
+        v=mixed_qkv,
+    )
+    try:
+        kernel = select_kernel(
+            "attention",
+            "kda_fused_paged_verify",
+            signature,
+            traits={"paged_state": True},
+            solution=solution,
+            override=override,
+        )
+    except NoKernelFoundError:
+        return None
+    return kernel(
+        mixed_qkv=mixed_qkv,
+        conv_weights=conv_weights,
+        conv_states=conv_states,
+        conv_scratch=conv_scratch,
+        f_a_out=f_a_out,
+        f_b_weight=f_b_weight,
+        beta_logits=beta_logits,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        state_pool=state_pool,
+        state_scratch=state_scratch,
+        read_indices=read_indices,
+        write_indices=write_indices,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        draft_token_num=draft_token_num,
+        lower_bound=lower_bound,
+    )
+
+
 # ===-----------------------------------------------------------------------===#
 # MHA Kernels
 # ===-----------------------------------------------------------------------===#
@@ -196,6 +1031,7 @@ def mha_prefill(
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
+    softmax_scale: float | None = None,
     # dispatch options
     override: str | None = None,
     solution: str | None = None,
@@ -216,6 +1052,8 @@ def mha_prefill(
         sinks: Optional attention sink tensor.
         return_lse: Whether to also return natural-log log-sum-exp values with
             shape [total_q, num_q_heads].
+        softmax_scale: Scale applied to QK logits before softmax. None uses the
+            backend default 1/sqrt(head_dim).
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -278,6 +1116,7 @@ def mha_prefill(
             logit_cap=logit_cap,
             sinks=sinks,
             return_lse=return_lse,
+            softmax_scale=softmax_scale,
         )
 
 
@@ -298,6 +1137,10 @@ def mha_extend_with_kvcache(
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
+    softmax_scale: float | None = None,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
     # dispatch options
     override: str | None = None,
     solution: str | None = None,
@@ -321,11 +1164,25 @@ def mha_extend_with_kvcache(
         sinks: Optional attention sink tensor.
         return_lse: Whether to also return natural-log log-sum-exp values with
             shape [total_q, num_q_heads].
+        softmax_scale: Scale applied to QK logits before softmax. None uses the
+            backend default 1/sqrt(head_dim).
+        q_scale: MXFP8 block scales for q (UE8M0, one per 32 head_dim
+            elements), shape [total_q, num_q_heads, head_dim // 32]. Providing
+            it selects the block-scaled path; q/k_cache/v_cache must then be
+            float8_e4m3fn.
+        k_scale: MXFP8 block scales for k_cache in the kernel's paged layout
+            (interleaved [num_pages, num_kv_heads, 32, 4, 4] atom at
+            page_size 128).
+        v_scale: MXFP8 block scales for v_cache, same layout as k_scale.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
     Each request's query tokens attend all visible cached KV tokens.
     """
+    signature, scale_kwargs = _blockscaled_signature_and_scales(
+        q, k_cache, v_cache, q_scale, k_scale, v_scale
+    )
+
     # Select kernel
     traits = {
         "head_dim": q.shape[-1],
@@ -336,7 +1193,6 @@ def mha_extend_with_kvcache(
         "support_sinks": sinks is not None,
         "return_lse": return_lse,
     }
-    signature = _attention_format_signature(q=q, k_cache=k_cache, v_cache=v_cache)
     kernel = select_kernel(
         "attention",
         "mha_extend_with_kvcache",
@@ -388,8 +1244,10 @@ def mha_extend_with_kvcache(
             logit_cap=logit_cap,
             sinks=sinks,
             return_lse=return_lse,
+            softmax_scale=softmax_scale,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
+            **scale_kwargs,
         )
 
 
@@ -407,6 +1265,10 @@ def mha_decode_with_kvcache(
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
+    softmax_scale: float | None = None,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
     # dispatch options
     override: str | None = None,
     solution: str | None = None,
@@ -427,11 +1289,26 @@ def mha_decode_with_kvcache(
         logit_cap: Optional soft cap applied to attention logits.
         sinks: Optional attention sink tensor.
         return_lse: Whether to also return log-sum-exp values.
+        softmax_scale: Scale applied to QK logits before softmax. None uses the
+            backend default 1/sqrt(head_dim).
+        q_scale: MXFP8 block scales for q (UE8M0, one per 32 head_dim
+            elements), shape [batch * max_seqlen_q, num_q_heads, head_dim // 32].
+            Providing it selects the block-scaled path; q/k_cache/v_cache must
+            then be float8_e4m3fn.
+        k_scale: MXFP8 block scales for k_cache in the kernel's paged layout
+            (interleaved [num_pages, num_kv_heads, 32, 4, 4] atom at
+            page_size 128).
+        v_scale: MXFP8 block scales for v_cache, same layout as k_scale.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
     """
+    signature, scale_kwargs = _blockscaled_signature_and_scales(
+        q, k_cache, v_cache, q_scale, k_scale, v_scale
+    )
+
     # Select kernel
     traits = {
+        "q_len": max_seqlen_q,
         "head_dim": q.shape[-1],
         "page_size": k_cache.shape[1],
         "sliding_window": window_left >= 0,
@@ -439,7 +1316,6 @@ def mha_decode_with_kvcache(
         "support_sinks": sinks is not None,
         "return_lse": return_lse,
     }
-    signature = _attention_format_signature(q=q, k_cache=k_cache, v_cache=v_cache)
     kernel = select_kernel(
         "attention",
         "mha_decode_with_kvcache",
@@ -488,8 +1364,365 @@ def mha_decode_with_kvcache(
             logit_cap=logit_cap,
             sinks=sinks,
             return_lse=return_lse,
+            softmax_scale=softmax_scale,
             max_seqlen_k=max_seqlen_k,
             max_seqlen_q=max_seqlen_q,
+            **scale_kwargs,
+        )
+
+
+# rel_mha: relative-distance-bias MHA; own family keeps model-specific args out of plain mha.
+
+
+def rel_mha_prefill(
+    # attention inputs
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    rel_logits: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_cpu: list[int],
+    max_seqlen: int,
+    # attention options
+    window_left: int = -1,
+    return_lse: bool = False,
+    softmax_scale: float | None = None,
+    enable_pdl: bool = False,
+    # dispatch options
+    override: str | None = None,
+    solution: str | None = None,
+) -> AttentionResult:
+    """Relative-attention MHA prefill from uncached KV.
+
+    Args:
+        q: Query tensor with shape [total_q, num_q_heads, head_dim].
+        k: Key tensor with shape [total_kv, num_kv_heads, head_dim].
+        v: Value tensor with shape [total_kv, num_kv_heads, head_dim].
+        rel_logits: Learned relative bias logits with shape
+            [total_q, num_q_heads, rel_extent]. rel_logits[t, h, d] is added
+            to the pre-softmax logit of query row t against the key d
+            positions behind it, for 0 <= d < rel_extent; other distances
+            contribute zero bias.
+        cu_seqlens: Cumulative sequence lengths with shape [batch + 1].
+            KV cumulative sequence lengths are assumed to be identical.
+        cu_seqlens_cpu: Host-side cumulative sequence lengths as a strict
+            list[int]. Used for host-side launch metadata; must match cu_seqlens.
+        max_seqlen: Maximum sequence length.
+        window_left: Exclusive left sliding-window size. -1 means full attention.
+        return_lse: Whether to also return natural-log log-sum-exp values with
+            shape [total_q, num_q_heads].
+        softmax_scale: Scale applied to QK logits before softmax. None uses the
+            backend default 1/sqrt(head_dim).
+        enable_pdl: Launch eligible kernels with Programmatic Dependent
+            Launch (Hopper+).
+        override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Attention is always causal within each sequence.
+    """
+    batch_size = cu_seqlens.shape[0] - 1
+
+    traits = {
+        "head_dim": q.shape[-1],
+        "sliding_window": window_left >= 0,
+        "return_lse": return_lse,
+    }
+    signature = _attention_format_signature(q=q, k=k, v=v)
+    kernel = select_kernel(
+        "attention",
+        "rel_mha_prefill",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    shape_params = {
+        "batch_size": batch_size,
+        "total_q": q.shape[0],
+        "total_kv": k.shape[0],
+        "num_q_heads": q.shape[1],
+        "num_kv_heads": k.shape[1],
+        "head_dim": q.shape[-1],
+        "rel_extent": rel_logits.shape[-1],
+        "max_seqlen": max_seqlen,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "rel_mha_prefill",
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+
+    with kernel_scope(
+        "attention",
+        "rel_mha_prefill",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            k=k,
+            v=v,
+            rel_logits=rel_logits,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+            max_seqlen=max_seqlen,
+            window_left=window_left,
+            return_lse=return_lse,
+            softmax_scale=softmax_scale,
+            enable_pdl=enable_pdl,
+        )
+
+
+def rel_mha_extend_with_kvcache(
+    # attention inputs
+    q: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    rel_logits: torch.Tensor,
+    # attention options
+    window_left: int = -1,
+    return_lse: bool = False,
+    softmax_scale: float | None = None,
+    enable_pdl: bool = False,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+    # dispatch options
+    override: str | None = None,
+    solution: str | None = None,
+) -> AttentionResult:
+    """Relative-attention MHA extend with paged KV cache.
+
+    Args:
+        q: Query tensor with shape [total_q, num_q_heads, head_dim].
+        cu_seqlens_q: Query cumulative sequence lengths with shape [batch + 1].
+        cu_seqlens_kv: KV cumulative sequence lengths with shape [batch + 1].
+        k_cache: Paged key cache with shape [num_pages, page_size, num_kv_heads, head_dim].
+        v_cache: Paged value cache with shape [num_pages, page_size, num_kv_heads, head_dim].
+        page_table: Page table with shape [batch, max_pages_per_seq].
+        cache_seqlens: Visible KV lengths in the cache, shape [batch]. Query
+            lengths are independent and may be smaller than KV lengths.
+        max_seqlen_q: Maximum query length.
+        max_seqlen_k: Maximum KV length.
+        rel_logits: Learned relative bias logits with shape
+            [total_q, num_q_heads, rel_extent]; rows are addressed by each
+            request's batch-flattened query positions (cu_seqlens_q). The
+            relative distance is computed against the query's absolute
+            position in the cached sequence.
+        window_left: Exclusive left sliding-window size. -1 means full attention.
+        return_lse: Whether to also return natural-log log-sum-exp values with
+            shape [total_q, num_q_heads].
+        softmax_scale: Scale applied to QK logits before softmax. None uses the
+            backend default 1/sqrt(head_dim).
+        enable_pdl: Launch eligible kernels with Programmatic Dependent
+            Launch (Hopper+).
+        override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Each request's query tokens attend all visible cached KV tokens causally.
+
+    ``q_scale``/``k_scale``/``v_scale`` select the MXFP8 block-scaled path:
+    q/k_cache/v_cache must then be float8_e4m3fn; q_scale is flat per-token
+    UE8M0 [total_q, num_q_heads, head_dim // 32], k_scale/v_scale use the
+    paged interleaved layout [num_pages, num_kv_heads, page_size // 128,
+    32, 4, 4].
+    """
+    signature, scale_kwargs = _blockscaled_signature_and_scales(
+        q, k_cache, v_cache, q_scale, k_scale, v_scale
+    )
+    traits = {
+        "head_dim": q.shape[-1],
+        "page_size": k_cache.shape[1],
+        "sliding_window": window_left >= 0,
+        "return_lse": return_lse,
+    }
+    kernel = select_kernel(
+        "attention",
+        "rel_mha_extend_with_kvcache",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    shape_params = {
+        "batch_size": cache_seqlens.shape[0],
+        "total_q": q.shape[0],
+        "num_pages": k_cache.shape[0],
+        "page_size": k_cache.shape[1],
+        "max_pages_per_seq": page_table.shape[1],
+        "num_q_heads": q.shape[1],
+        "num_kv_heads": k_cache.shape[2],
+        "head_dim": q.shape[-1],
+        "rel_extent": rel_logits.shape[-1],
+        "max_seqlen_q": max_seqlen_q,
+        "max_seqlen_k": max_seqlen_k,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "rel_mha_extend_with_kvcache",
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+
+    with kernel_scope(
+        "attention",
+        "rel_mha_extend_with_kvcache",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            rel_logits=rel_logits,
+            window_left=window_left,
+            return_lse=return_lse,
+            softmax_scale=softmax_scale,
+            enable_pdl=enable_pdl,
+            **scale_kwargs,
+        )
+
+
+def rel_mha_decode_with_kvcache(
+    # attention inputs
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    max_seqlen_k: int,
+    rel_logits: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    max_seqlen_q: int = 1,
+    # attention options
+    window_left: int = -1,
+    softmax_scale: float | None = None,
+    enable_pdl: bool = False,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+    # dispatch options
+    override: str | None = None,
+    solution: str | None = None,
+) -> AttentionResult:
+    """Relative-attention MHA decode with paged KV cache.
+
+    Args:
+        q: Query tensor with shape [batch * max_seqlen_q, num_q_heads, head_dim].
+        k_cache: Paged key cache with shape [num_pages, page_size, num_kv_heads, head_dim].
+        v_cache: Paged value cache with shape [num_pages, page_size, num_kv_heads, head_dim].
+        page_table: Page table with shape [batch, max_pages_per_seq].
+        cache_seqlens: Total visible KV lengths after appending current decode
+            tokens, shape [batch].
+        max_seqlen_k: Maximum KV length.
+        rel_logits: Learned relative bias logits with shape
+            [batch * max_seqlen_q, num_q_heads, rel_extent], one row per
+            decode token.
+        cu_seqlens_q: Query cumulative sequence lengths with shape [batch + 1]
+            (arange(batch + 1) * max_seqlen_q). Required: decode runs the
+            varlen path so each request's query rows map into rel_logits at
+            their batch-flattened positions.
+        max_seqlen_q: Number of uniformly packed query tokens per request. This
+            is 1 for normal decode and `spec_num_tokens` for compact
+            speculative decode.
+        window_left: Exclusive left sliding-window size. -1 means full attention.
+        softmax_scale: Scale applied to QK logits before softmax. None uses the
+            backend default 1/sqrt(head_dim).
+        enable_pdl: Launch eligible kernels with Programmatic Dependent
+            Launch (Hopper+).
+        override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    ``q_scale``/``k_scale``/``v_scale`` select the MXFP8 block-scaled path:
+    q/k_cache/v_cache must then be float8_e4m3fn; q_scale is flat per-token
+    UE8M0 [batch, num_q_heads, head_dim // 32], k_scale/v_scale use the
+    paged interleaved layout [num_pages, num_kv_heads, page_size // 128,
+    32, 4, 4].
+
+    Uniform ``max_seqlen_q > 1`` (spec verify) rides v2's native prediction
+    dimension — unexpanded ``[batch]`` seqlens and ``[batch, W]`` table, one
+    KV load per request. Non-uniform multi-query takes the fork varlen path.
+    """
+    blockscaled = q_scale is not None
+    signature, scale_kwargs = _blockscaled_signature_and_scales(
+        q, k_cache, v_cache, q_scale, k_scale, v_scale
+    )
+    traits = {
+        "head_dim": q.shape[-1],
+        "page_size": k_cache.shape[1],
+        "sliding_window": window_left >= 0,
+        "return_lse": False,
+    }
+    kernel = select_kernel(
+        "attention",
+        "rel_mha_decode_with_kvcache",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    shape_params = {
+        "batch_size": cache_seqlens.shape[0],
+        "total_q": q.shape[0],
+        "num_pages": k_cache.shape[0],
+        "page_size": k_cache.shape[1],
+        "max_pages_per_seq": page_table.shape[1],
+        "num_q_heads": q.shape[1],
+        "num_kv_heads": k_cache.shape[2],
+        "head_dim": q.shape[-1],
+        "rel_extent": rel_logits.shape[-1],
+        "max_seqlen_q": max_seqlen_q,
+        "max_seqlen_k": max_seqlen_k,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "rel_mha_decode_with_kvcache",
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+
+    with kernel_scope(
+        "attention",
+        "rel_mha_decode_with_kvcache",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            max_seqlen_k=max_seqlen_k,
+            rel_logits=rel_logits,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            window_left=window_left,
+            softmax_scale=softmax_scale,
+            enable_pdl=enable_pdl,
+            **scale_kwargs,
         )
 
 
@@ -678,8 +1911,11 @@ def mla_decode_with_kvcache(
         v_head_dim.
     """
     traits = {
+        "batch_size": q.shape[0],
         "page_size": kv_cache.shape[1],
         "q_len": q.shape[1],
+        "num_q_heads": q.shape[2],
+        "batch_size_div_64": q.shape[0] % 64 == 0,
         "qk_nope_head_dim": qk_nope_head_dim,
         "kv_lora_rank": kv_lora_rank,
         "qk_rope_head_dim": qk_rope_head_dim,
@@ -687,14 +1923,28 @@ def mla_decode_with_kvcache(
         "return_lse": return_lse,
     }
     signature = _attention_format_signature(q=q, kv_cache=kv_cache)
-    kernel = select_kernel(
-        "attention",
-        "mla_decode_with_kvcache",
-        signature,
-        traits=traits,
-        solution=solution,
-        override=override,
-    )
+    try:
+        kernel = select_kernel(
+            "attention",
+            "mla_decode_with_kvcache",
+            signature,
+            traits=traits,
+            solution=solution,
+            override=override,
+        )
+    except NoKernelFoundError:
+        if q.dtype == kv_cache.dtype:
+            raise
+        q = q.to(kv_cache.dtype)
+        signature = _attention_format_signature(q=q, kv_cache=kv_cache)
+        kernel = select_kernel(
+            "attention",
+            "mla_decode_with_kvcache",
+            signature,
+            traits=traits,
+            solution=solution,
+            override=override,
+        )
 
     shape_params = {
         "batch_size": q.shape[0],
@@ -968,7 +2218,8 @@ def dsa_prefill_topk(
 
     Args:
         q: BF16 indexer query with shape [tokens, index_heads, head_dim].
-        weights: FP32 per-token/head weights with shape [tokens, index_heads].
+        weights: Per-token/head weights with shape [tokens, index_heads],
+            FP32 or raw BF16 (implementations upcast on the fly).
         kv_workspace_slots: Global KV slot for each workspace row, shape
             [workspace_rows].
         row_starts: Inclusive workspace-row start per query token, shape [tokens].
@@ -982,10 +2233,16 @@ def dsa_prefill_topk(
         index_k_fp8: FP8 index-K rows in workspace-row order. Used by DeepGEMM.
         index_k_scale: FP8 index-K scales in workspace-row order. Used by DeepGEMM.
         max_logits_bytes: Optional temporary logits memory cap.
-        out: Optional int32 output buffer with shape [tokens, topk].
-        lens_out: Optional int32 output buffer with shape [tokens].
+        out: Optional contiguous int32 output buffer on q's device with shape
+            [tokens, topk].
+        lens_out: Optional contiguous int32 output buffer on q's device with
+            shape [tokens].
         override: Optional exact kernel override name.
         solution: Optional kernel solution to force through normal selection.
+
+    Gluon requires q, weights, index_k_cache, kv_workspace_slots, row_starts,
+    and row_ends to be contiguous on q's device. kv_workspace_slots must be
+    int64; row_starts and row_ends must be int32.
 
     Returns:
         Tuple of workspace row ids and valid counts. Returned indices are
@@ -1002,6 +2259,7 @@ def dsa_prefill_topk(
     traits = {
         "head_dim": q.shape[-1],
         "topk": int(topk),
+        "page_size": None if page_size is None else int(page_size),
     }
     has_fp8 = index_k_cache is not None or (
         index_k_fp8 is not None and index_k_scale is not None
@@ -1074,7 +2332,8 @@ def dsa_decode_topk(
 
     Args:
         q: BF16 indexer query with shape [tokens, index_heads, head_dim].
-        weights: FP32 per-token/head weights with shape [tokens, index_heads].
+        weights: Per-token/head weights with shape [tokens, index_heads],
+            FP32 or raw BF16 (implementations upcast on the fly).
         seq_lens: Per-request full KV length, shape [num_reqs] (= tokens /
             q_len_per_req). Each query token's causal bound
             seq_lens[req] - (q_len_per_req - 1) + j is derived in-kernel.
@@ -1088,10 +2347,15 @@ def dsa_decode_topk(
         index_k_cache: Packed FP8 index-K cache with scales (uint8). Used by
             both Triton and DeepGEMM.
         plan: Optional opaque backend-specific plan.
-        out: Optional int32 output buffer with shape [tokens, topk].
-        lens_out: Optional int32 output buffer with shape [tokens].
+        out: Optional contiguous int32 output buffer on q's device with shape
+            [tokens, topk].
+        lens_out: Optional contiguous int32 output buffer on q's device with
+            shape [tokens].
         override: Optional exact kernel override name.
         solution: Optional kernel solution to force through normal selection.
+
+    Gluon requires q, weights, index_k_cache, seq_lens, and block_table to be
+    contiguous on q's device. seq_lens and block_table must be int32.
 
     Returns:
         Tuple of global KV slots and valid counts; invalid entries are -1.
@@ -1296,6 +2560,43 @@ def attn_merge_state(
         )
 
 
+def _prefill_plan(
+    operator: str,
+    dtype: torch.dtype,
+    traits: dict,
+    solution: str | None,
+) -> dict:
+    """Shared extend-mode planning over a prefill operator's registry entries.
+
+    FP8 currently prefers "prewrite" because the cache write and downcast
+    path is easier to fuse. Other dtypes use "postwrite" only when a
+    matching prefill kernel with at least performant priority exists;
+    otherwise they use "prewrite".
+    """
+    if dtype == torch.float8_e4m3fn:
+        return {"extend_mode": "prewrite"}
+
+    signature = format_signature(
+        q=dense_tensor_format(dtype),
+        k=dense_tensor_format(dtype),
+        v=dense_tensor_format(dtype),
+    )
+    candidates = KernelRegistry.get().get_for_operator(
+        "attention",
+        operator,
+        platform=current_platform(),
+        format_signature=signature,
+        solution=solution,
+    )
+    candidates = [spec for spec in candidates if spec_matches_traits(spec, traits)]
+    extend_mode = (
+        "postwrite"
+        if any(spec.priority >= Priority.PERFORMANT for spec in candidates)
+        else "prewrite"
+    )
+    return {"extend_mode": extend_mode}
+
+
 def mha_plan(
     dtype: torch.dtype,
     head_dim: int,
@@ -1322,15 +2623,7 @@ def mha_plan(
         - "extend_mode":
           "postwrite" means run prefill before writing KV cache;
           "prewrite" means write KV cache first and run cached extend.
-
-    FP8 currently prefers "prewrite" because the cache write and downcast
-    path is easier to fuse. Other dtypes use "postwrite" only when a
-    matching prefill kernel with at least performant priority exists;
-    otherwise they use "prewrite".
     """
-    if dtype == torch.float8_e4m3fn:
-        return {"extend_mode": "prewrite"}
-
     traits = {
         "head_dim": head_dim,
         "sliding_window": window_left >= 0,
@@ -1338,22 +2631,33 @@ def mha_plan(
         "support_sinks": sinks is not None,
         "return_lse": return_lse,
     }
-    signature = format_signature(
-        q=dense_tensor_format(dtype),
-        k=dense_tensor_format(dtype),
-        v=dense_tensor_format(dtype),
-    )
-    candidates = KernelRegistry.get().get_for_operator(
-        "attention",
-        "mha_prefill",
-        platform=current_platform(),
-        format_signature=signature,
-        solution=solution,
-    )
-    candidates = [spec for spec in candidates if spec_matches_traits(spec, traits)]
-    extend_mode = (
-        "postwrite"
-        if any(spec.priority >= Priority.PERFORMANT for spec in candidates)
-        else "prewrite"
-    )
-    return {"extend_mode": extend_mode}
+    return _prefill_plan("mha_prefill", dtype, traits, solution)
+
+
+def rel_mha_plan(
+    dtype: torch.dtype,
+    head_dim: int,
+    window_left: int = -1,
+    return_lse: bool = False,
+    solution: str | None = None,
+) -> dict:
+    """Build a relative-attention MHA execution plan.
+
+    Args:
+        dtype: Query/K/V dtype for prefill planning.
+        head_dim: Attention head dimension.
+        window_left: Exclusive left sliding-window size, or -1 for full-context
+            attention.
+        return_lse: Whether the selected path must return LSE values.
+        solution: Optional kernel solution to restrict planning.
+
+    Returns:
+        Same "extend_mode" dict as mha_plan, planned over the rel_mha_prefill
+        operator.
+    """
+    traits = {
+        "head_dim": head_dim,
+        "sliding_window": window_left >= 0,
+        "return_lse": return_lse,
+    }
+    return _prefill_plan("rel_mha_prefill", dtype, traits, solution)

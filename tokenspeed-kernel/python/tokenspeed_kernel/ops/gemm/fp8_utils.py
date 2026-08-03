@@ -28,9 +28,9 @@ from tokenspeed_kernel.registry import error_fn
 _is_amd = Platform.get().is_amd
 _is_nvidia = Platform.get().is_nvidia
 platform = Platform.get()
-fp8_dtype = platform.fp8e4m3fn.dtype
-fp8_max = platform.fp8e4m3fn.max
-fp8_min = platform.fp8e4m3fn.min
+fp8_dtype = torch.float8_e4m3fn
+fp8_max = torch.finfo(fp8_dtype).max
+fp8_min = torch.finfo(fp8_dtype).min
 
 if _is_nvidia:
     from tokenspeed_kernel.ops.quantization.flashinfer import (
@@ -50,6 +50,32 @@ def align(x: int, y: int) -> int:
 
 def ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
+
+
+def swizzle_mxfp8_scale(sf: torch.Tensor, M: int, K: int) -> torch.Tensor:
+    """Re-layout row-major MXFP8 (1,32) block scales into the F8_128x4
+    swizzled layout consumed by flashinfer's block-scaled GEMMs.
+
+    Args:
+        sf: ``[M, K // 32]`` uint8 e8m0 scales, row-major.
+        M: Number of rows of the scaled tensor.
+        K: Number of columns of the scaled tensor (multiple of 32).
+
+    Returns:
+        1D uint8 tensor of ``round_up(M, 128) * round_up(K // 32, 4)``
+        elements in the 128x4 tile layout (rows padded with zeros).
+    """
+    num_m_tiles = ceil_div(M, 128)
+    num_k_tiles = ceil_div(K, 128)
+
+    scale_cols = K // 32
+    sf_padded = torch.zeros(
+        (num_m_tiles * 128, num_k_tiles * 4), dtype=sf.dtype, device=sf.device
+    )
+    sf_padded[:M, :scale_cols] = sf
+
+    sf_tiled = sf_padded.view(num_m_tiles, 4, 32, num_k_tiles, 4)
+    return sf_tiled.transpose(1, 3).contiguous().view(-1)
 
 
 @triton.jit
@@ -247,7 +273,7 @@ def _per_token_group_quant_8bit_raw(
     x: torch.Tensor,
     group_size: int,
     eps: float = 1e-10,
-    dtype: torch.dtype = platform.fp8e4m3fn.dtype,
+    dtype: torch.dtype = torch.float8_e4m3fn,
     column_major_scales: bool = False,
     scale_tma_aligned: bool = False,
     scale_ue8m0: bool = False,
@@ -276,7 +302,7 @@ def _per_token_group_quant_8bit_raw(
             bit8_max = 127.0
             bit8_min = -128.0
         else:
-            bit8_max = platform.fp8e4m3fn.max
+            bit8_max = fp8_max
             bit8_min = -bit8_max
     else:
         if dtype == torch.int8:

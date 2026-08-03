@@ -16,6 +16,19 @@ Copyright (c) 2026 AMD ROCm(TM) Software
 
 Licensed under the MIT License, whose full license text is available below.
 
+Notice for ROCm/aiter
+---------------------
+MIT License
+
+Copyright (c) 2024-2026 Advanced Micro Devices, Inc. All rights reserved.
+
+The GFX950 FP8 MLA decode layout and pipeline are adapted from ROCm/AITER
+commit ae0bae8954110b12655e3232f68262dd63cd694e.
+Source:
+https://github.com/ROCm/aiter/blob/ae0bae8954110b12655e3232f68262dd63cd694e/aiter/ops/triton/gluon/mla_gluon.py
+
+Licensed under the MIT License, whose full license text is available below.
+
 ================================================================================
                               MIT LICENSE
 ================================================================================

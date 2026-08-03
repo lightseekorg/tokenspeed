@@ -18,11 +18,9 @@ from typing import Optional
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
+from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
-
-platform = current_platform()
 
 
 @triton.jit
@@ -122,8 +120,7 @@ def fp8_quantize(
            are passed as plain kernel args; scalar tensors are loaded on device.
         out: optional pre-allocated FP8 output. Same shape as ``x``. If not
            provided, allocated as contiguous.
-        fp8_dtype: ``torch.float8_e4m3fn`` (default), ``torch.float8_e5m2`` or
-           ``torch.float8_e4m3fnuz`` (the bias-8 e4m3 used on AMD CDNA3).
+        fp8_dtype: ``torch.float8_e4m3fn`` (default) or ``torch.float8_e5m2``.
         enable_pdl: opt into Programmatic Dependent Launch (Hopper+). Caller
            must also pass ``launch_pdl=True`` upstream / downstream as needed.
 
@@ -137,7 +134,6 @@ def fp8_quantize(
     assert fp8_dtype in (
         torch.float8_e4m3fn,
         torch.float8_e5m2,
-        torch.float8_e4m3fnuz,
     ), f"fp8_quantize unsupported fp8 dtype: {fp8_dtype}"
     has_scale = scale is not None
     has_scale_tensor = isinstance(scale, torch.Tensor)
@@ -156,10 +152,8 @@ def fp8_quantize(
 
     if fp8_dtype is torch.float8_e4m3fn:
         fp8_dtype_const = tl.float8e4nv
-    elif fp8_dtype is torch.float8_e5m2:
-        fp8_dtype_const = tl.float8e5
     else:
-        fp8_dtype_const = tl.float8e4b8
+        fp8_dtype_const = tl.float8e5
 
     # Block-size heuristic — picked from per-shape best configs in an
     # nsys-driven sweep on B200 (kv_a [s,512] and v [s,h,128] for K2.5).
@@ -243,7 +237,7 @@ def _fp8_token_group_quantize(
     if not x.is_contiguous():
         raise ValueError("x must be contiguous")
 
-    out_dtype = platform.fp8e4m3fn.dtype
+    out_dtype = torch.float8_e4m3fn
     out = torch.empty_like(x, device=x.device, dtype=out_dtype)
     scales = torch.empty(
         x.shape[:-1] + (x.shape[-1] // group_size,),
@@ -254,8 +248,7 @@ def _fp8_token_group_quantize(
     groups = x.numel() // group_size
     block = triton.next_power_of_2(group_size)
     num_warps = min(max(block // 256, 1), 8)
-    bit8_max = platform.fp8e4m3fn.max
-    bit8_min = -bit8_max
+    fp8_finfo = torch.finfo(out_dtype)
 
     _fp8_token_group_quantize_kernel[(groups,)](
         x,
@@ -263,8 +256,8 @@ def _fp8_token_group_quantize(
         scales,
         group_size,
         1e-10,
-        bit8_min=bit8_min,
-        bit8_max=bit8_max,
+        bit8_min=fp8_finfo.min,
+        bit8_max=fp8_finfo.max,
         BLOCK=block,
         num_warps=num_warps,
         num_stages=1,
@@ -297,7 +290,7 @@ def triton_quantize_fp8(
     capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
     signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
     traits={
-        "granularity": frozenset({"token_group_128"}),
+        "granularity": frozenset({"token_group_32", "token_group_128"}),
         "scale_encoding": frozenset({"float32"}),
     },
     priority=Priority.PORTABLE,
@@ -309,10 +302,10 @@ def triton_quantize_fp8_with_scale(
     scale_encoding: str = "float32",
     enable_pdl: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if granularity != "token_group" or group_size != 128:
+    if granularity != "token_group" or group_size not in {32, 128}:
         raise ValueError(
-            "triton FP8 dynamic quantization currently supports only "
-            f"granularity='token_group' with group_size=128, got "
+            "triton FP8 dynamic quantization supports only "
+            f"granularity='token_group' with group_size 32 or 128, got "
             f"granularity={granularity!r}, group_size={group_size}."
         )
     if scale_encoding != "float32":
@@ -320,7 +313,81 @@ def triton_quantize_fp8_with_scale(
             "triton FP8 dynamic quantization currently requires "
             f"scale_encoding='float32', got {scale_encoding!r}."
         )
-    return _fp8_token_group_quantize(x.contiguous(), 128)
+    return _fp8_token_group_quantize(x.contiguous(), group_size)
+
+
+@triton.jit
+def _mxfp8_quantize_kernel(
+    x_ptr,
+    out_ptr,
+    scale_ptr,
+    x_row_stride,
+    out_row_stride,
+    scale_row_stride,
+):
+    row = tl.program_id(0)
+    group = tl.program_id(1)
+    offs = group * 32 + tl.arange(0, 32)
+
+    x = tl.load(x_ptr + row * x_row_stride + offs).to(tl.float32)
+    amax = tl.max(tl.abs(x), axis=0)
+    exp = tl.ceil(tl.log2(amax / 448.0))
+    exp = tl.clamp(exp, -127.0, 127.0)
+    exp = tl.where(amax > 0, exp, -127.0)
+    q = x * tl.exp2(-exp)
+    q8 = q.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+
+    tl.store(out_ptr + row * out_row_stride + offs, q8)
+    tl.store(scale_ptr + row * scale_row_stride + group, (exp + 127.0).to(tl.uint8))
+
+
+@register_kernel(
+    "quantization",
+    "mxfp8",
+    name="triton_quantize_mxfp8",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
+    signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
+    traits={},
+    priority=Priority.PORTABLE,
+)
+def mxfp8_quantize(
+    x: torch.Tensor,
+    enable_pdl: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a BF16/FP16 tensor to MXFP8.
+
+    The last dimension is quantized in groups of 32 values. The returned data
+    has the same shape as ``x`` and FP8-E4M3 storage; the returned scales have
+    shape ``x.shape[:-1] + (x.shape[-1] // 32,)`` and E8M0 byte encoding.
+    """
+    assert x.dtype in (
+        torch.bfloat16,
+        torch.float16,
+    ), f"mxfp8_quantize input must be bf16/fp16, got {x.dtype}"
+    M, N, x_row_stride = _flatten_to_2d(x)
+    if N % 32 != 0:
+        raise ValueError("mxfp8_quantize requires the last dimension divisible by 32")
+
+    out = torch.empty(x.shape, dtype=torch.float8_e4m3fn, device=x.device)
+    scale_dtype = getattr(torch, "float8_e8m0fnu", torch.uint8)
+    scales = torch.empty((*x.shape[:-1], N // 32), dtype=scale_dtype, device=x.device)
+
+    out_M, _, out_row_stride = _flatten_to_2d(out)
+    scales_M, _, scale_row_stride = _flatten_to_2d(scales)
+    assert out_M == M and scales_M == M
+    # enable_pdl is accepted for launch-site parity with other backends and unused here.
+
+    _mxfp8_quantize_kernel[(M, N // 32)](
+        x,
+        out.view(torch.uint8),
+        scales.view(torch.uint8),
+        x_row_stride,
+        out_row_stride,
+        scale_row_stride,
+        num_warps=1,
+    )
+    return out, scales
 
 
 @triton.jit

@@ -21,11 +21,11 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, Platform
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import ScaleFormat, format_signatures
 
-_fp8_dtype = Platform.get().fp8e4m3fn.dtype
+_fp8_dtype = torch.float8_e4m3fn
 _MXFP8_SCALE = ScaleFormat(
     storage_dtype=torch.float32,
     granularity="block",
@@ -80,6 +80,7 @@ if fp8_gemm_nt is not None:
         *,
         alpha: torch.Tensor | None = None,
         block_size: list[int] | None = None,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert (
             A_scales is not None
@@ -89,4 +90,8 @@ if fp8_gemm_nt is not None:
         N = B.shape[0]
         C = A.new_empty(A.shape[0], N, dtype=torch.bfloat16)
         fp8_gemm_nt((A, A_scales), (B, B_scales), C)
-        return C.to(out_dtype)
+        output = C.to(out_dtype)
+        if out is not None:
+            out.copy_(output)
+            return out
+        return output

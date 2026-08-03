@@ -26,6 +26,7 @@ from tokenspeed.runtime.pd.base.manager import DisaggManagerBase
 from tokenspeed.runtime.pd.base.mooncake_engine import (
     MooncakeTransferEngine,
 )
+from tokenspeed.runtime.pd.cache_protocol import CachePDPeerLayout
 from tokenspeed.runtime.pd.mooncake.entities import KVArgs, KVManagerArgs
 from tokenspeed.runtime.pd.utils import DisaggregationMode
 from tokenspeed.runtime.utils.network import get_local_ip_by_remote
@@ -101,9 +102,46 @@ class MooncakeKVBootstrapServer(DisaggBootstrapServerBase):
         self.prefill_kv_unit_lens = []
         self.prefill_state_item_lens = []
         self.prefill_state_unit_lens = []
+        self.prefill_cache_layout_wire: str | None = None
+        self._registration_mode: str | None = None
         super().__init__(port)
 
     def _ingest_put_extra(self, data: dict) -> None:
+        cache_layout_wire = data.get("cache_layout")
+        mode = "paged" if cache_layout_wire is not None else "legacy"
+        if self._registration_mode is not None and mode != self._registration_mode:
+            raise ValueError(
+                "Mooncake bootstrap cannot mix Paged cache and legacy registrations"
+            )
+        if mode == "paged":
+            if not isinstance(cache_layout_wire, str):
+                raise ValueError("Paged cache bootstrap layout must be a string")
+            try:
+                cache_layout = CachePDPeerLayout.from_wire_bytes(
+                    cache_layout_wire.encode("ascii")
+                )
+            except (UnicodeEncodeError, ValueError) as exc:
+                raise ValueError("Paged cache bootstrap layout is invalid") from exc
+            canonical_wire = cache_layout.to_wire_bytes().decode("ascii")
+            if self.prefill_cache_layout_wire not in (None, canonical_wire):
+                raise ValueError(
+                    "Paged cache prefill ranks registered incompatible layouts"
+                )
+            if bool(data["enable_mla_l1_5_cache"]) or any(
+                data.get(field) for field in ("state_item_lens", "state_unit_lens")
+            ):
+                raise ValueError(
+                    "Paged cache bootstrap cannot advertise MLA L1.5 or a state plane"
+                )
+            kv_item_lens = data.get("kv_item_lens", [])
+            kv_unit_lens = data.get("kv_unit_lens", [])
+            if not kv_item_lens or kv_unit_lens != kv_item_lens:
+                raise ValueError(
+                    "Paged cache bootstrap requires one complete-page Mooncake unit "
+                    "per raw slab"
+                )
+            self.prefill_cache_layout_wire = canonical_wire
+        self._registration_mode = mode
         self.enable_mla_l1_5_cache = bool(data["enable_mla_l1_5_cache"])
         self.prefill_kv_item_lens = data.get("kv_item_lens", self.prefill_kv_item_lens)
         self.prefill_kv_unit_lens = data.get("kv_unit_lens", self.prefill_kv_unit_lens)
@@ -115,10 +153,13 @@ class MooncakeKVBootstrapServer(DisaggBootstrapServerBase):
         )
 
     def _extra_parallel_info(self) -> dict:
-        return {
+        extra = {
             "enable_mla_l1_5_cache": self.enable_mla_l1_5_cache,
             "kv_item_lens": self.prefill_kv_item_lens,
             "kv_unit_lens": self.prefill_kv_unit_lens,
             "state_item_lens": self.prefill_state_item_lens,
             "state_unit_lens": self.prefill_state_unit_lens,
         }
+        if self.prefill_cache_layout_wire is not None:
+            extra["cache_layout"] = self.prefill_cache_layout_wire
+        return extra

@@ -22,6 +22,10 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.embedding import (
+    FusedMLASetKVBufferArg,
+    apply_rope,
+)
 
 from tokenspeed.runtime.cache.utils import (
     get_mla_kv_buffer_triton,
@@ -91,6 +95,29 @@ def _torch_get_reference(kv: torch.Tensor, loc) -> tuple[torch.Tensor, torch.Ten
     )
 
 
+def _rotate_rope_reference(
+    x: torch.Tensor,
+    cos_sin: torch.Tensor,
+    positions: torch.Tensor,
+    is_neox: bool,
+) -> torch.Tensor:
+    cos, sin = cos_sin[positions].chunk(2, dim=-1)
+    half = x.shape[-1] // 2
+    x_float = x.float()
+    cos = cos.float().unsqueeze(-2)
+    sin = sin.float().unsqueeze(-2)
+    if is_neox:
+        x1 = x_float[..., :half]
+        x2 = x_float[..., half:]
+        out = torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
+    else:
+        x1 = x_float[..., 0::2]
+        x2 = x_float[..., 1::2]
+        out = torch.stack((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
+        out = out.flatten(-2)
+    return out.to(x.dtype)
+
+
 # ─── set ─────────────────────────────────────────────────────────────
 
 
@@ -109,6 +136,50 @@ def test_set_matches_torch_reference(n_loc, dtype, pattern):
     torch.cuda.synchronize()
 
     assert _bitwise_equal(kv, ref)
+
+
+@pytest.mark.parametrize("n_loc", [4, 600])
+@pytest.mark.parametrize("pattern", ["seq", "rand"])
+def test_set_casts_bf16_sources_into_fp8_buffer(n_loc, pattern):
+    """The write kernel casts to the buffer dtype on store, so bf16 sources
+    land in an fp8 buffer byte-for-byte as if pre-cast with torch. Spans both
+    dispatch branches via the n_loc parametrization."""
+    loc, k_nope, k_rope = _make_inputs(n_loc, torch.bfloat16, pattern)
+    kv = _empty_kv(torch.float8_e4m3fn)
+    ref = _torch_set_reference(
+        kv, loc, k_nope.to(torch.float8_e4m3fn), k_rope.to(torch.float8_e4m3fn)
+    )
+
+    set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope)
+    torch.cuda.synchronize()
+
+    assert _bitwise_equal(kv, ref)
+
+
+@pytest.mark.parametrize("n_loc", [4, 600])
+def test_set_squashes_nan_and_inf(n_loc):
+    """Sanitized mixed-dtype writes stay finite in the fp8 destination."""
+    loc, k_nope, k_rope = _make_inputs(n_loc, torch.bfloat16, "rand")
+    k_nope[0, 0, 0] = float("nan")
+    k_nope[0, 0, 1] = float("inf")
+    k_rope[0, 0, 0] = float("-inf")
+    kv = _empty_kv(torch.float8_e4m3fn)
+    ref = _torch_set_reference(
+        kv,
+        loc,
+        torch.nan_to_num(k_nope.float(), nan=0.0, posinf=448.0, neginf=-448.0).to(
+            torch.float8_e4m3fn
+        ),
+        torch.nan_to_num(k_rope.float(), nan=0.0, posinf=448.0, neginf=-448.0).to(
+            torch.float8_e4m3fn
+        ),
+    )
+
+    set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope, sanitize=True)
+    torch.cuda.synchronize()
+
+    assert _bitwise_equal(kv, ref)
+    assert not torch.isnan(kv[loc.cpu()].float()).any()
 
 
 @pytest.mark.parametrize("n_loc", [4, 511, 512, 4096])
@@ -202,3 +273,55 @@ def test_set_then_get_round_trip(n_loc, dtype):
 
     assert _bitwise_equal(k_nope_out, k_nope_in)
     assert _bitwise_equal(k_rope_out, k_rope_in)
+
+
+@pytest.mark.parametrize("is_neox", [False, True])
+@pytest.mark.parametrize("loc_dtype", [torch.int32, torch.int64])
+def test_mla_rope_set_kv_buffer_matches_reference(is_neox, loc_dtype):
+    torch.manual_seed(0)
+    n_loc = 17
+    num_heads = 3
+    max_position = 128
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    q_rope = torch.randn(n_loc, num_heads, ROPE_DIM, device=device, dtype=dtype)
+    k_nope = torch.randn(n_loc, 1, NOPE_DIM, device=device, dtype=dtype)
+    k_rope = torch.randn(n_loc, 1, ROPE_DIM, device=device, dtype=dtype)
+    q_out_rope = torch.empty_like(q_rope)
+    kv = _empty_kv(dtype)
+    loc = torch.randperm(NUM_PAGES, device=device, dtype=loc_dtype)[:n_loc]
+    positions = torch.randint(
+        0, max_position, (n_loc,), device=device, dtype=torch.int64
+    )
+
+    angles = torch.randn(max_position, ROPE_DIM, device=device, dtype=torch.float32)
+    cos_sin = torch.cat(
+        (torch.cos(angles[:, : ROPE_DIM // 2]), torch.sin(angles[:, : ROPE_DIM // 2])),
+        dim=-1,
+    )
+
+    q_ref = _rotate_rope_reference(q_rope, cos_sin, positions, is_neox)
+    k_rope_ref = _rotate_rope_reference(k_rope, cos_sin, positions, is_neox)
+    kv_ref = kv.clone()
+    kv_ref[loc.long(), :NOPE_DIM] = k_nope[:, 0, :]
+    kv_ref[loc.long(), NOPE_DIM:] = k_rope_ref[:, 0, :]
+
+    apply_rope(
+        cos_sin_cache=cos_sin,
+        fused_mla_set_kv_buffer_arg=FusedMLASetKVBufferArg(
+            k_nope=k_nope,
+            kv_buffer=kv,
+            cache_loc=loc,
+        ),
+        head_size=ROPE_DIM,
+        positions=positions,
+        q=q_rope,
+        k=k_rope,
+        q_rope_out=q_out_rope,
+        is_neox=is_neox,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(q_out_rope, q_ref, atol=0.01, rtol=0.01)
+    torch.testing.assert_close(kv[loc.long()], kv_ref[loc.long()], atol=0.01, rtol=0.01)

@@ -22,23 +22,28 @@
 Triton kernels for computing cache locations and updating page tables.
 """
 
+from __future__ import annotations
+
 import torch
 import triton
 import triton.language as tl
 
+from tokenspeed.runtime.execution.block_table import (
+    select_block_table,
+    unpadded_block_table_row,
+)
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
 
 
 @triton.jit
-def update_req_to_page_kernel(
+def write_req_to_page_rows_kernel(
     # Input pointers
     req_pool_indices_ptr,  # [batch_size]
-    new_occupied_pages_ptr,  # [total_pages] - flattened
-    new_occupied_pages_num_ptr,  # [batch_size]
-    pages_copy_starts_ptr,  # [batch_size]
-    cumsum_pages_ptr,  # [batch_size] - cumulative sum of new_occupied_pages_num
+    page_ids_ptr,  # [total_entries] - flattened full page-table rows
+    page_counts_ptr,  # [batch_size] - entries per request
+    cumsum_page_counts_ptr,  # [batch_size]
     # Output pointer
     req_to_page_ptr,  # [req_pool_size+1, context_len]
     # Scalars
@@ -46,19 +51,18 @@ def update_req_to_page_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     """
-    Update req_to_page table with new occupied pages.
+    Write complete scheduler page-table rows to req_to_page.
     Each program handles one request in the batch.
     """
     req_idx = tl.program_id(0)
 
     # Load request metadata
     req_pool_idx = tl.load(req_pool_indices_ptr + req_idx)
-    num_pages = tl.load(new_occupied_pages_num_ptr + req_idx)
-    copy_start = tl.load(pages_copy_starts_ptr + req_idx)
+    num_pages = tl.load(page_counts_ptr + req_idx)
 
-    # Get offset into flattened new_occupied_pages
+    # Get the request's offset into the flattened rows.
     offset_idx = tl.where(req_idx > 0, req_idx - 1, 0)
-    pages_offset = tl.load(cumsum_pages_ptr + offset_idx)
+    pages_offset = tl.load(cumsum_page_counts_ptr + offset_idx)
     pages_offset = tl.where(req_idx > 0, pages_offset, 0)
 
     # Process pages in blocks
@@ -70,54 +74,48 @@ def update_req_to_page_kernel(
         page_offsets = block_start + tl.arange(0, BLOCK_SIZE)
         mask = page_offsets < num_pages
 
-        # Load new page IDs
-        page_ptrs = new_occupied_pages_ptr + pages_offset + page_offsets
+        # Load the page IDs to refresh.
+        page_ptrs = page_ids_ptr + pages_offset + page_offsets
         new_page_ids = tl.load(page_ptrs, mask=mask, other=0)
 
         # Compute target positions in req_to_page
-        target_positions = copy_start + page_offsets
-
-        # Store to req_to_page[req_pool_idx, target_positions]
-        output_ptrs = req_to_page_ptr + req_pool_idx * context_len + target_positions
+        output_ptrs = req_to_page_ptr + req_pool_idx * context_len + page_offsets
         tl.store(output_ptrs, new_page_ids, mask=mask)
 
 
-def update_req_to_page(
+def write_req_to_page_rows(
     req_to_page: torch.Tensor,
     req_pool_indices: torch.Tensor,
-    new_occupied_pages: torch.Tensor,
-    new_occupied_pages_num: torch.Tensor,
-    pages_copy_starts: torch.Tensor,
+    page_ids: torch.Tensor,
+    page_counts: torch.Tensor,
 ) -> None:
     """
-    Update req_to_page table with new occupied pages using Triton kernel.
+    Write complete scheduler page-table rows to req_to_page using Triton.
 
     Args:
         req_to_page: Request to page table [req_pool_size+1, context_len]
         req_pool_indices: Request pool indices [batch_size]
-        new_occupied_pages: New page IDs [total_pages] - flattened
-        new_occupied_pages_num: Number of new pages per request [batch_size]
-        pages_copy_starts: Start position in req_to_page for each request [batch_size]
+        page_ids: Full page-table rows [total_entries] - flattened
+        page_counts: Number of entries per request [batch_size]
     """
     batch_size = req_pool_indices.shape[0]
     context_len = req_to_page.shape[1]
 
-    if new_occupied_pages.shape[0] == 0:
+    if page_ids.shape[0] == 0:
         return
 
     # Compute cumulative sum for offset calculation.
-    cumsum_pages = torch.cumsum(new_occupied_pages_num, dim=0)
+    cumsum_page_counts = torch.cumsum(page_counts, dim=0)
 
     # Launch kernel - one program per request
     BLOCK_SIZE = 128
     grid = (batch_size,)
 
-    update_req_to_page_kernel[grid](
+    write_req_to_page_rows_kernel[grid](
         req_pool_indices,
-        new_occupied_pages,
-        new_occupied_pages_num,
-        pages_copy_starts,
-        cumsum_pages,
+        page_ids,
+        page_counts,
+        cumsum_page_counts,
         req_to_page,
         context_len=context_len,
         BLOCK_SIZE=BLOCK_SIZE,
@@ -344,6 +342,95 @@ def fused_decode_input_prep(
     )
 
 
+@triton.jit
+def dflash_prepare_decode_kernel(
+    output_tokens_ptr,
+    accept_lengths_ptr,
+    req_pool_indices_ptr,
+    valid_cache_lengths_ptr,
+    req_to_pages_ptr,
+    draft_seq_lens_ptr,
+    block_ids_ptr,
+    block_positions_ptr,
+    out_cache_loc_ptr,
+    spec_num_tokens: tl.constexpr,
+    page_size: tl.constexpr,
+    max_pages: tl.constexpr,
+    max_draft_prefix,
+    block_ids_stride: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    req_idx = tl.program_id(0)
+    pool_idx = tl.load(req_pool_indices_ptr + req_idx)
+    accept_len = tl.load(accept_lengths_ptr + req_idx)
+    old_len = tl.load(valid_cache_lengths_ptr + pool_idx)
+    prefix_len = old_len + accept_len
+    prefix_len = tl.minimum(prefix_len, max_draft_prefix)
+    tl.store(draft_seq_lens_ptr + req_idx, prefix_len)
+
+    safe_accept = tl.minimum(tl.maximum(accept_len, 1), spec_num_tokens)
+    current_token = tl.load(
+        output_tokens_ptr + req_idx * spec_num_tokens + safe_accept - 1
+    )
+    tl.store(block_ids_ptr + req_idx * block_ids_stride, current_token)
+
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < spec_num_tokens
+    positions = prefix_len + offsets
+    tl.store(
+        block_positions_ptr + req_idx * spec_num_tokens + offsets, positions, mask=mask
+    )
+
+    page_indices = positions // page_size
+    overflow = page_indices >= max_pages
+    page_indices = tl.minimum(page_indices, max_pages - 1)
+    offsets_in_page = positions % page_size
+    page_ptrs = req_to_pages_ptr + pool_idx * max_pages + page_indices
+    page_ids = tl.load(page_ptrs, mask=mask, other=0)
+    cache_locs = page_ids * page_size + offsets_in_page
+    cache_locs = tl.where(overflow, 0, cache_locs)
+    tl.store(
+        out_cache_loc_ptr + req_idx * spec_num_tokens + offsets, cache_locs, mask=mask
+    )
+
+
+def dflash_prepare_decode(
+    output_tokens: torch.Tensor,
+    accept_lengths: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    valid_cache_lengths: torch.Tensor,
+    req_to_pages: torch.Tensor,
+    draft_seq_lens: torch.Tensor,
+    block_ids: torch.Tensor,
+    block_positions: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    spec_num_tokens: int,
+    page_size: int,
+    max_draft_prefix: int,
+) -> None:
+    batch_size = req_pool_indices.shape[0]
+    max_pages = req_to_pages.shape[1]
+    BLOCK_SIZE = triton.next_power_of_2(spec_num_tokens)
+    grid = (batch_size,)
+    dflash_prepare_decode_kernel[grid](
+        output_tokens,
+        accept_lengths,
+        req_pool_indices,
+        valid_cache_lengths,
+        req_to_pages,
+        draft_seq_lens,
+        block_ids,
+        block_positions,
+        out_cache_loc,
+        spec_num_tokens=spec_num_tokens,
+        page_size=page_size,
+        max_pages=max_pages,
+        max_draft_prefix=max_draft_prefix,
+        block_ids_stride=block_ids.stride(0),
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+
 def compute_out_cache_loc_uniform(
     out_cache_loc_ptr,
     req_pool_indices: torch.Tensor,  # [batch_size]
@@ -378,7 +465,11 @@ def compute_out_cache_loc_uniform(
     )
 
 
-def update_block_table(forward_op, device, req_to_page):
+def update_block_table(
+    forward_op, device, req_to_page, history_group_id: str | None = None
+):
+    device = torch.device(device)
+
     def flatten_and_to_device(data, dtype=torch.int32):
         if not data:
             return torch.tensor([], dtype=dtype, device=device)
@@ -392,54 +483,51 @@ def update_block_table(forward_op, device, req_to_page):
         if not flat:
             return torch.tensor([], dtype=dtype, device=device)
 
-        tensor = torch.tensor(flat, dtype=dtype, device="cpu", pin_memory=True)
+        tensor = torch.tensor(
+            flat,
+            dtype=dtype,
+            device="cpu",
+            pin_memory=device.type == "cuda",
+        )
         return tensor.to(device, non_blocking=True)
 
-    # sizes[i] is the number of newly allocated pages for request i.
-    if all(n == 0 for n in forward_op.sizes):
+    table = select_block_table(forward_op, history_group_id)
+    page_rows = [
+        unpadded_block_table_row(table, row_index) for row_index in range(len(table))
+    ]
+    if all(not row for row in page_rows):
         return
 
     max_pages = req_to_page.shape[1]
     # Clamp a request that would overflow req_to_page instead of crashing the
     # engine. Happens when MTP accept-rate collapse keeps a request alive past
     # context_len; its KV drops but it will be finished shortly.
-    sizes = list(forward_op.sizes)
-    begins = list(forward_op.begins)
-    # new_occupied_pages is a list-of-lists [batch, size_i] of page ids;
-    # take a shallow copy so we can trim the offending request's row.
-    new_occupied_pages = [list(row) for row in forward_op.new_occupied_pages]
+    sizes = [len(row) for row in page_rows]
     request_ids = list(forward_op.request_ids)
-    for i, (begin, size) in enumerate(zip(begins, sizes)):
-        if begin + size > max_pages:
-            clamped = max(0, max_pages - begin)
+    for i, size in enumerate(sizes):
+        if size > max_pages:
             logger.warning(
                 "page copy would exceed req_to_page capacity for req %s: "
-                "begin=%s + size=%s = %s > req_to_page.shape[1]=%s; "
+                "size=%s > req_to_page.shape[1]=%s; "
                 "clamping size to %s to avoid engine crash. The request is past "
                 "its context-length bound and will be finished by the length "
                 "check; KV writes after this point are dropped.",
                 request_ids[i] if i < len(request_ids) else "?",
-                begin,
                 size,
-                begin + size,
                 max_pages,
-                clamped,
+                max_pages,
             )
-            sizes[i] = clamped
-            # Keep new_occupied_pages[i] consistent with the clamped size so
-            # the kernel's cumsum-based offsets stay aligned across the batch.
-            new_occupied_pages[i] = new_occupied_pages[i][:clamped]
+            sizes[i] = max_pages
+            page_rows[i] = page_rows[i][:max_pages]
 
-    new_occupied_pages_num = flatten_and_to_device(sizes, dtype=torch.int32)
-    pages_copy_starts = flatten_and_to_device(begins, dtype=torch.int32)
-    new_occupied_pages_t = flatten_and_to_device(new_occupied_pages, dtype=torch.int32)
+    page_counts = flatten_and_to_device(sizes, dtype=torch.int32)
+    page_ids = flatten_and_to_device(page_rows, dtype=torch.int32)
     request_pool_indices = flatten_and_to_device(
         forward_op.request_pool_indices, dtype=torch.int64
     )
-    update_req_to_page(
+    write_req_to_page_rows(
         req_to_page=req_to_page,
         req_pool_indices=request_pool_indices,
-        new_occupied_pages=new_occupied_pages_t,
-        new_occupied_pages_num=new_occupied_pages_num,
-        pages_copy_starts=pages_copy_starts,
+        page_ids=page_ids,
+        page_counts=page_counts,
     )

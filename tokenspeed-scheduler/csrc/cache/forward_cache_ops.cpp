@@ -20,70 +20,80 @@
 
 #include "cache/forward_cache_ops.h"
 
-#include "resource/allocator/paged_cache_group.h"
+#include <stdexcept>
+
 #include "scheduler/types.h"
 
 namespace tokenspeed {
 
-bool PrefillFirstChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables, const CoordinatorMatch& hit,
-                       std::int32_t num_new_tokens) {
-    coordinator.ClaimCommonPrefix(tables, hit);
-    return coordinator.Acquire(tables, num_new_tokens);
-}
+std::int32_t AlignPrefillChunk(std::int32_t first_pos, std::int32_t unscheduled, std::int32_t token_budget,
+                               std::int32_t page_size, std::int32_t promotion_boundary_tokens) {
+    _assert(first_pos >= 0 && unscheduled >= 0 && token_budget >= 0, "prefill positions must be non-negative");
+    _assert(page_size > 0, "page_size must be > 0");
+    std::int32_t chunk_size = std::min(unscheduled, token_budget);
+    if (promotion_boundary_tokens > first_pos) {
+        chunk_size = std::min(chunk_size, promotion_boundary_tokens - first_pos);
+    }
+    if (chunk_size == unscheduled) {
+        return chunk_size;
+    }
 
-std::vector<std::pair<CacheBlock*, CacheBlock*>> LoadHostExtension(KvCacheCoordinator& coordinator,
-                                                                   std::vector<BlockTable>& tables,
-                                                                   const CoordinatorMatch& host) {
-    return coordinator.LoadHostExtension(tables, host);
-}
-
-bool PrefillChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
-                  std::span<const std::string> content_hashes, std::int32_t num_tokens,
-                  std::int32_t num_computed_tokens) {
-    return DecodeStep(coordinator, tables, content_hashes, /*first_page_slot=*/0, num_tokens, num_computed_tokens);
-}
-
-bool DecodeStep(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
-                std::span<const std::string> content_hashes, std::int32_t first_page_slot, std::int32_t num_tokens,
-                std::int32_t num_computed_tokens) {
-    // CacheFullBlocks before ReclaimExpired: registration skips null holes, so
-    // the reverse order would lose the punched pages' hashes forever.
-    // ReclaimExpired before Acquire: the slide's freed pages fund this chunk
-    // (admission gates credit them via BlocksReclaimableAt in lockstep).
-    // num_computed_tokens is the chunk end: state groups register only its aligned final page.
-    coordinator.CacheFullBlocks(tables, content_hashes, first_page_slot, num_computed_tokens);
-    coordinator.ReclaimExpired(tables, num_computed_tokens);
-    return coordinator.Acquire(tables, num_tokens);
-}
-
-bool FinalizePrefillAndReserveDecode(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
-                                     std::span<const std::string> content_hashes, std::int32_t reserve_tokens,
-                                     std::int32_t num_computed_tokens) {
-    return PrefillChunk(coordinator, tables, content_hashes, reserve_tokens, num_computed_tokens);
+    const std::int32_t page_offset = first_pos % page_size;
+    if (page_offset != 0) {
+        const std::int32_t tokens_to_boundary = page_size - page_offset;
+        return token_budget >= tokens_to_boundary ? tokens_to_boundary : 0;
+    }
+    return chunk_size - chunk_size % page_size;
 }
 
 std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
+    _assert(config.block_size > 0, "cache_block_tokens must be > 0");
     std::vector<KvCacheSpec> specs;
     specs.reserve(config.paged_cache_groups.size());
     for (const PagedCacheGroupConfig& group : config.paged_cache_groups) {
-        const std::int32_t block_size = group.block_size > 0 ? group.block_size : config.block_size;
+        _assert(group.cache_blocks_per_lcm_block > 0, "cache_blocks_per_lcm_block must be > 0");
+        _assert(group.block_size == 0 || group.block_size == config.block_size,
+                "per-group block_size cannot override the shared cache_block_tokens");
+        const std::int32_t cache_block_tokens = group.RawTokensPerPage();
+        _assert(cache_block_tokens > 0, "cache group must have positive tokens per cache block");
+        _assert(config.block_size % cache_block_tokens == 0,
+                "cache group block tokens must divide the scheduler cache block tokens");
         // family=State marks trailing-window prefix reuse and covers both SWA and
         // linear-attention groups; only a State group WITHOUT SlidingWindow
         // retention is a mamba-style state group.
-        if (group.family == PagedCacheGroupFamily::State &&
-            group.retention != PagedCacheGroupConfig::Retention::SlidingWindow) {
+        const bool final_state_manager = group.family == PagedCacheGroupFamily::State &&
+                                         group.retention != PagedCacheGroupConfig::Retention::SlidingWindow;
+        if (config.enable_pd_cache) {
+            const PagedCacheTransferPolicy expected =
+                final_state_manager ? PagedCacheTransferPolicy::LatestSnapshot : PagedCacheTransferPolicy::FullSuffix;
+            if (group.transfer_policy == PagedCacheTransferPolicy::Unspecified) {
+                throw std::invalid_argument("PD cache group '" + group.group_id +
+                                            "' requires an explicit transfer_policy");
+            }
+            if (group.transfer_policy != expected) {
+                throw std::invalid_argument("PD cache group '" + group.group_id +
+                                            "' transfer_policy does not match its scheduler "
+                                            "destination layout");
+            }
+        }
+        if (final_state_manager) {
             specs.push_back(KvCacheSpec{
                 .kind = AttnKind::kMambaState,
-                .block_size = block_size,
                 .sliding_window = 0,
+                .cache_blocks_per_lcm_block = group.cache_blocks_per_lcm_block,
+                .cache_block_tokens = cache_block_tokens,
             });
             continue;
         }
         const bool is_swa = group.retention == PagedCacheGroupConfig::Retention::SlidingWindow;
+        if (is_swa && (!group.sliding_window_tokens || *group.sliding_window_tokens <= 0)) {
+            throw std::invalid_argument("Cache group '" + group.group_id + "' requires positive sliding_window_tokens");
+        }
         specs.push_back(KvCacheSpec{
             .kind = is_swa ? AttnKind::kSlidingWindow : AttnKind::kFull,
-            .block_size = block_size,
-            .sliding_window = is_swa ? group.sliding_window_tokens.value_or(0) : 0,
+            .sliding_window = is_swa ? *group.sliding_window_tokens : 0,
+            .cache_blocks_per_lcm_block = group.cache_blocks_per_lcm_block,
+            .cache_block_tokens = cache_block_tokens,
         });
     }
     return specs;
@@ -96,12 +106,15 @@ void FreeRequest(KvCacheCoordinator& coordinator, std::vector<BlockTable>& table
     coordinator.Free(tables);
 }
 
-std::map<std::string, std::vector<std::int32_t>> BuildFlatBlockTables(const std::vector<BlockTable>& tables,
-                                                                      std::span<const std::string> group_ids) {
-    _assert(tables.size() == group_ids.size(), "BuildFlatBlockTables: tables/group_ids size mismatch");
+std::map<std::string, std::vector<std::int32_t>> BuildBlockTables(const KvCacheCoordinator& coordinator,
+                                                                  const std::vector<BlockTable>& tables,
+                                                                  std::span<const std::string> group_ids) {
+    _assert(tables.size() == group_ids.size(), "BuildBlockTables: tables/group_ids size mismatch");
+    _assert(tables.size() == static_cast<std::size_t>(coordinator.NumGroups()),
+            "BuildBlockTables: tables/coordinator size mismatch");
     std::map<std::string, std::vector<std::int32_t>> out;
     for (std::size_t i = 0; i < tables.size(); ++i) {
-        out.emplace(group_ids[i], BlockTablePageIds(tables[i]));
+        out.emplace(group_ids[i], coordinator.GroupManager(static_cast<std::int32_t>(i)).BlockTablePageIds(tables[i]));
     }
     return out;
 }

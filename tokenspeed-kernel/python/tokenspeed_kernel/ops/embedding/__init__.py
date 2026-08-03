@@ -18,7 +18,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
@@ -31,8 +30,15 @@ class FusedSetKVBufferArg:
     value: torch.Tensor
     k_buffer: torch.Tensor
     v_buffer: torch.Tensor
-    k_scale: Optional[float]
-    v_scale: Optional[float]
+    k_scale: float | None
+    v_scale: float | None
+    cache_loc: torch.Tensor
+
+
+@dataclass
+class FusedMLASetKVBufferArg:
+    k_nope: torch.Tensor
+    kv_buffer: torch.Tensor
     cache_loc: torch.Tensor
 
 
@@ -46,6 +52,7 @@ def apply_rope(
     # embedding options
     is_neox: bool = True,
     fused_set_kv_buffer_arg: FusedSetKVBufferArg | None = None,
+    fused_mla_set_kv_buffer_arg: FusedMLASetKVBufferArg | None = None,
     q_rope_out: torch.Tensor | None = None,
     k_rope_out: torch.Tensor | None = None,
     # dispatch options
@@ -67,6 +74,10 @@ def apply_rope(
         fused_set_kv_buffer_arg: Optional fused KV-cache write arguments. Both
             CUDA and Triton implementations currently require k_scale and
             v_scale to be None.
+        fused_mla_set_kv_buffer_arg: Optional fused MLA KV-cache write
+            arguments. When provided, rotated K is written to the MLA cache
+            instead of k/k_rope_out because MLA stores [k_nope | k_rope] in a
+            single cache row with different component widths.
         q_rope_out: Optional output buffer for the rotated query. If omitted,
             q is updated in place.
         k_rope_out: Optional output buffer for the rotated key. If omitted,
@@ -82,6 +93,10 @@ def apply_rope(
     rotary_dim = cos_sin_cache.shape[-1]
     assert rotary_dim % 2 == 0, "embedding.rope requires even rotary_dim"
     assert rotary_dim <= head_size, "embedding.rope requires rotary_dim <= head_size"
+    if fused_set_kv_buffer_arg is not None and fused_mla_set_kv_buffer_arg is not None:
+        raise ValueError("standard and MLA fused KV writes are mutually exclusive")
+    if fused_mla_set_kv_buffer_arg is not None and k_rope_out is not None:
+        raise ValueError("MLA fused KV write stores rotated K directly in the cache")
 
     positions = positions.flatten()
     num_tokens = positions.shape[0]
@@ -90,14 +105,15 @@ def apply_rope(
             q_rope_out if q_rope_out is not None else q,
             k_rope_out if k_rope_out is not None else k,
         )
-    num_q_heads = q.shape[-1] // head_size
-    num_kv_heads = k.shape[-1] // head_size
+    num_q_heads = q.numel() // (num_tokens * head_size)
+    num_kv_heads = k.numel() // (num_tokens * head_size)
 
     traits = {
         "head_size": head_size,
         "partial_rotary": rotary_dim != head_size,
         "is_neox": is_neox,
         "has_fused_kv": fused_set_kv_buffer_arg is not None,
+        "has_fused_mla_kv": fused_mla_set_kv_buffer_arg is not None,
         "has_q_out": q_rope_out is not None,
         "has_k_out": k_rope_out is not None,
     }
@@ -121,6 +137,7 @@ def apply_rope(
         "head_size": head_size,
         "rotary_dim": rotary_dim,
         "has_fused_kv": fused_set_kv_buffer_arg is not None,
+        "has_fused_mla_kv": fused_mla_set_kv_buffer_arg is not None,
         "has_q_out": q_rope_out is not None,
         "has_k_out": k_rope_out is not None,
     }
@@ -147,6 +164,7 @@ def apply_rope(
             cos_sin_cache=cos_sin_cache,
             is_neox=is_neox,
             fused_set_kv_buffer_arg=fused_set_kv_buffer_arg,
+            fused_mla_set_kv_buffer_arg=fused_mla_set_kv_buffer_arg,
             q_rope_out=q_rope_out,
             k_rope_out=k_rope_out,
             enable_pdl=enable_pdl,
@@ -345,7 +363,12 @@ def apply_rope_mla(
     return query_fp8, key_fp8
 
 
-__all__ = ["FusedSetKVBufferArg", "apply_rope", "apply_rope_mla"]
+__all__ = [
+    "FusedMLASetKVBufferArg",
+    "FusedSetKVBufferArg",
+    "apply_rope",
+    "apply_rope_mla",
+]
 
 
 # Backend registration (side-effect imports).

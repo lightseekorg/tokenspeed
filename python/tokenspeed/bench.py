@@ -1406,6 +1406,7 @@ async def benchmark(
     num_warmups: int,
     profile: bool,
     profile_num_steps: int | None,
+    profile_activities: list[str] | None,
     selected_percentile_metrics: list[str],
     selected_percentiles: list[float],
     ignore_eos: bool,
@@ -1485,9 +1486,13 @@ async def benchmark(
             print("Starting profiler...")
         else:
             print(f"Starting profiler for {profile_num_steps} steps...")
-        extra_body = dict(extra_body or {})
+        # Use a dedicated body for the /start_profile request so profiler
+        # fields don't leak into the generation request payloads below.
+        profile_body = dict(extra_body or {})
         if profile_num_steps is not None:
-            extra_body["num_steps"] = profile_num_steps
+            profile_body["num_steps"] = profile_num_steps
+        if profile_activities is not None:
+            profile_body["activities"] = profile_activities
         profile_input = RequestFuncInput(
             model=model_id,
             model_name=model_name,
@@ -1498,7 +1503,7 @@ async def benchmark(
             logprobs=logprobs,
             ignore_eos=ignore_eos,
             extra_headers=extra_headers,
-            extra_body=extra_body,
+            extra_body=profile_body,
         )
         profile_output = await request_func(profile_input, session=session)
         if profile_output.success:
@@ -1796,6 +1801,17 @@ def add_serving_cli_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--disable-tqdm", action="store_true")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-num-steps", type=int, default=None)
+    parser.add_argument(
+        "--profile-activities",
+        nargs="+",
+        choices=["CPU", "GPU", "MEM", "CUDA_PROFILER", "VIZTRACER", "PROTON"],
+        default=None,
+        help="Profiler activities for /start_profile (default: server-side "
+        "default, CPU and GPU via the torch profiler). PROTON drives the "
+        "Triton Proton profiler inside each scheduler process; it cannot be "
+        "combined with GPU or CUDA_PROFILER, which need the same "
+        "CUPTI/roctracer interface.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--ignore-eos", action="store_true")
     parser.add_argument("--disable-ignore-eos", action="store_true")
@@ -1835,6 +1851,8 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
             raise ValueError("--profile-num-steps must be positive.")
         if not args.profile:
             raise ValueError("--profile-num-steps requires --profile.")
+    if args.profile_activities is not None and not args.profile:
+        raise ValueError("--profile-activities requires --profile.")
     if args.input_len is not None:
         args.random_input_len = args.input_len
     if args.output_len is not None:
@@ -1920,6 +1938,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         num_warmups=args.num_warmups,
         profile=args.profile,
         profile_num_steps=args.profile_num_steps,
+        profile_activities=args.profile_activities,
         selected_percentile_metrics=percentile_metrics.split(","),
         selected_percentiles=[float(p) for p in args.metric_percentiles.split(",")],
         ignore_eos=args.ignore_eos,

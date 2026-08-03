@@ -8,8 +8,7 @@ env-injected sitecustomize) and asserts the gain twice over: directly, via
 the round-2 prefix-hit-rate contrast (slab keeps the working set cached;
 the legacy arm's halved pool recycles it before reuse).
 
-Requires a flat-built (TOKENSPEED_FLAT_KVCACHE) tokenspeed_scheduler ext;
-skips cleanly on a radix build.
+Requires the grouped-cache tokenspeed_scheduler extension.
 
 Usage:
     cd test/runtime
@@ -49,10 +48,11 @@ _APPROX_PROMPT_TOKENS = 2074
 _PROMPT_TOKENS_MIN = 1900
 _PROMPT_TOKENS_MAX = 2270
 
-# Per-round footprint is ~2x prompt tokens: full-history retention plus the
-# sliding group's prefill transient (as many pages again, freed afterwards).
-_APPROX_ALLOC_TOKENS = 2 * _APPROX_PROMPT_TOKENS
-# Round footprint as a fraction of the measured slab pool: under the
+# Persistent prefix footprint is one full-history copy per prompt. Sliding
+# prefill pages are transient and no longer determine whether the repeated
+# working set remains cached.
+_APPROX_CACHED_TOKENS = _APPROX_PROMPT_TOKENS
+# Persistent footprint as a fraction of the measured slab pool: below the
 # recycling cliff on the slab arm, ~1.44x the halved legacy pool.
 _TARGET_POOL_FILL = 0.72
 _NUM_PROMPTS_MIN = 8
@@ -173,7 +173,7 @@ def _make_engine() -> Engine:
         # Shared byte budget; the profiled pool also depends on free GPU
         # memory at boot, hence K is sized from the measured capacity.
         gpu_memory_utilization=0.165,
-        moe_backend="flashinfer_mxfp4",
+        moe_backend="auto",  # our tree lacks upstream flashinfer_mxfp4
         disable_prefill_graph=True,
     )
 
@@ -225,11 +225,6 @@ class TestSlabCapacityPrefixHits(unittest.TestCase):
             import tokenspeed_scheduler
         except ImportError:
             self.skipTest("tokenspeed_scheduler ext is not installed")
-        if not getattr(tokenspeed_scheduler, "FLAT_KVCACHE", False):
-            self.skipTest(
-                "requires a flat-built (TOKENSPEED_FLAT_KVCACHE) "
-                "tokenspeed_scheduler ext; radix builds have no slab layout"
-            )
         if os.environ.get("TOKENSPEED_CI_SMALL_KV_SIZE"):
             self.skipTest(
                 "TOKENSPEED_CI_SMALL_KV_SIZE pins the token pool for both "
@@ -242,7 +237,7 @@ class TestSlabCapacityPrefixHits(unittest.TestCase):
         try:
             slab_capacity = int(engine.scheduler_info["max_total_num_tokens"])
             num_prompts = math.ceil(
-                _TARGET_POOL_FILL * slab_capacity / _APPROX_ALLOC_TOKENS
+                _TARGET_POOL_FILL * slab_capacity / _APPROX_CACHED_TOKENS
             )
             if not _NUM_PROMPTS_MIN <= num_prompts <= _NUM_PROMPTS_MAX:
                 self.skipTest(

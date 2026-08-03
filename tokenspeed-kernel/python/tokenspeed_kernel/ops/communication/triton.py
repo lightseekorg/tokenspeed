@@ -38,6 +38,8 @@ __all__ = [
     "all_gather_inner",
     "all_reduce_can_run",
     "all_reduce",
+    "all_reduce_two_can_run",
+    "all_reduce_two",
     "allreduce_residual_rmsnorm",
     "create_dp_sampling_state",
     "dp_sampling_gather",
@@ -1235,10 +1237,12 @@ def amd_create_rsag_state(
     symm_mem.set_signal_pad_size(max(symm_mem.get_signal_pad_size(), pad_bytes))
 
     free_gpu_memory_begin = _get_available_gpu_memory(torch.cuda.current_device())
-    comm_buff = symm_mem.empty(
-        (max_tokens, hidden_size), dtype=torch.bfloat16, device=device
+    # Allocate outside inference_mode so the persistent comm buffer is not
+    # an inference tensor; this class is often lazily constructed during
+    # forward (which runs under @maybe_inference_mode).
+    comm_buff, symm_mem_hdl = _alloc_symm(
+        (max_tokens, hidden_size), torch.bfloat16, device, group
     )
-    symm_mem_hdl = symm_mem.rendezvous(comm_buff, group=group)
     free_gpu_memory_after = _get_available_gpu_memory(torch.cuda.current_device())
     logger.info(
         f"Custom Triton RSAG AMD symmetric-memory buffer allocated: {free_gpu_memory_begin - free_gpu_memory_after} GB"
@@ -1636,23 +1640,7 @@ def create_state(
 
         platform = current_platform()
         if platform.is_amd:
-            max_blocks = max(1, triton.cdiv(max_numel, 1024))
-            pad_bytes = max_blocks * world_size * 4
-            symm_mem.set_signal_pad_size(max(symm_mem.get_signal_pad_size(), pad_bytes))
-            free_gpu_memory_begin = _get_available_gpu_memory(
-                torch.cuda.current_device()
-            )
-            comm_buff = symm_mem.empty(
-                (max_numel,), dtype=torch.bfloat16, device=device
-            )
-            symm_mem_hdl = symm_mem.rendezvous(comm_buff, group=group)
-            free_gpu_memory_after = _get_available_gpu_memory(
-                torch.cuda.current_device()
-            )
-            logger.info(
-                f"Triton all-reduce AMD symmetric-memory buffer allocated: {free_gpu_memory_begin - free_gpu_memory_after} GB"
-            )
-            assert rank_in_group == symm_mem_hdl.rank, "Mismatched rank id"
+            logger.info("Triton all-reduce AMD path will use Iris")
         else:
             assert platform.is_nvidia, f"Unsupported platform: {platform}"
 
@@ -1694,7 +1682,6 @@ def all_reduce_can_run(state: TritonCommState, tensor: torch.Tensor, op=None) ->
     platform = current_platform()
     return (
         platform.is_amd
-        and state.symm_mem_hdl is not None
         and op == torch.distributed.ReduceOp.SUM
         and tensor.is_cuda
         and tensor.is_contiguous()
@@ -1706,20 +1693,84 @@ def all_reduce_can_run(state: TritonCommState, tensor: torch.Tensor, op=None) ->
 
 def all_reduce(state: TritonCommState, tensor: torch.Tensor, op=None) -> torch.Tensor:
     assert all_reduce_can_run(state, tensor, op=op)
-    numel = tensor.numel()
-    state.comm_buff[:numel].copy_(tensor.reshape(-1))
-    grid = (triton.cdiv(numel, 1024),)
-    amd_all_reduce_kernel[grid](
-        state.symm_mem_hdl.buffer_ptrs_dev,
-        state.symm_mem_hdl.signal_pad_ptrs_dev,
-        tensor,
-        numel,
-        RANK=state.symm_mem_hdl.rank,
-        WORLD_SIZE=state.symm_mem_hdl.world_size,
-        BLOCK_SIZE=1024,
-        num_warps=4,
+    platform = current_platform()
+    if platform.is_amd:
+        from . import iris as _iris_mod
+
+        key = (id(state.group), state.max_numel, tensor.dtype)
+        iris_state = _iris_mod.IRIS_AR_STATES.get(key)
+        if iris_state is None:
+            iris_state = _iris_mod.create_iris_state(
+                group=state.group,
+                rank_in_group=state.rank_in_group,
+                max_numel=state.max_numel,
+                dtype=tensor.dtype,
+                device=state.device,
+            )
+            _iris_mod.IRIS_AR_STATES[key] = iris_state
+        return _iris_mod.iris_all_reduce(iris_state, tensor, op=op, safe=False)
+
+    raise AssertionError(f"Unsupported platform: {platform}")
+
+
+def all_reduce_two_can_run(
+    state: TritonCommState,
+    first: torch.Tensor,
+    second: torch.Tensor,
+    op=None,
+) -> bool:
+    """Return whether one Iris launch can reduce both tensors."""
+    if op is None:
+        op = torch.distributed.ReduceOp.SUM
+    platform = current_platform()
+    return (
+        platform.is_amd
+        and op == torch.distributed.ReduceOp.SUM
+        and first.is_cuda
+        and second.is_cuda
+        and first.device == second.device == state.device
+        and first.is_contiguous()
+        and second.is_contiguous()
+        and first.dtype == second.dtype == torch.bfloat16
+        and first.numel() > 0
+        and second.numel() > 0
+        and first.numel() + second.numel() <= state.max_numel
+        and state.world_size > 1
     )
-    return tensor
+
+
+def all_reduce_two(
+    state: TritonCommState,
+    first: torch.Tensor,
+    second: torch.Tensor,
+    op=None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reduce two tensors with a single Iris launch on AMD."""
+    assert all_reduce_two_can_run(state, first, second, op=op)
+    platform = current_platform()
+    if platform.is_amd:
+        from . import iris as _iris_mod
+
+        key = (id(state.group), state.max_numel, first.dtype)
+        iris_state = _iris_mod.IRIS_AR_STATES.get(key)
+        if iris_state is None:
+            iris_state = _iris_mod.create_iris_state(
+                group=state.group,
+                rank_in_group=state.rank_in_group,
+                max_numel=state.max_numel,
+                dtype=first.dtype,
+                device=state.device,
+            )
+            _iris_mod.IRIS_AR_STATES[key] = iris_state
+        return _iris_mod.iris_all_reduce_two(
+            iris_state,
+            first,
+            second,
+            op=op,
+            safe=False,
+        )
+
+    raise AssertionError(f"Unsupported platform: {platform}")
 
 
 def get_token_dist(state: TritonCommState, total_tokens_in_group: int) -> list:

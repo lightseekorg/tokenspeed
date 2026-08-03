@@ -27,6 +27,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from tokenspeed_kernel.platform import current_platform
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -44,7 +45,7 @@ def _skip_if_unsupported(world_size: int, reason_prefix: str) -> None:
         pytest.skip(f"CUDA/ROCm is required for {reason_prefix}")
     if world_size > torch.cuda.device_count():
         pytest.skip(f"Need {world_size} GPUs, have {torch.cuda.device_count()}")
-    if not torch.version.hip:
+    if not current_platform().is_amd:
         pytest.skip(f"{reason_prefix} only targets AMD ROCm")
     try:
         import iris  # noqa: F401
@@ -79,6 +80,11 @@ def _ar_shape_cases() -> List[Tuple[int, ...]]:
     ]
 
 
+def _ar_two_shape_case() -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+    """Production Kimi K3 shared-output and routed-latent decode widths."""
+    return (1, 7168), (1, 3584)
+
+
 def _ar_worker_fn(rank, world_size, port, error_dict):
     try:
         _ar_worker_main(rank, world_size, port)
@@ -104,7 +110,12 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
         # process (which has no distributed context).
         from tokenspeed_kernel.ops.communication.iris import create_iris_state
 
-        max_numel = max(int(torch.tensor(s).prod()) for s in _ar_shape_cases())
+        first_shape, second_shape = _ar_two_shape_case()
+        max_numel = max(
+            max(int(torch.tensor(s).prod()) for s in _ar_shape_cases()),
+            int(torch.tensor(first_shape).prod())
+            + int(torch.tensor(second_shape).prod()),
+        )
         state = create_iris_state(
             group=dist.group.WORLD,
             rank_in_group=rank,
@@ -113,6 +124,14 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
         )
         for shape in _ar_shape_cases():
             _check_all_reduce(state, rank, world_size, shape, device)
+        _check_all_reduce_two(
+            state,
+            rank,
+            world_size,
+            first_shape,
+            second_shape,
+            device,
+        )
     finally:
         dist.destroy_process_group()
 
@@ -133,6 +152,46 @@ def _check_all_reduce(state, rank: int, world_size: int, shape, device) -> None:
         result.shape == expected.shape
     ), f"shape mismatch: {result.shape} vs {expected.shape}"
     torch.testing.assert_close(result, expected, atol=0, rtol=0)
+
+
+def _check_all_reduce_two(
+    state,
+    rank: int,
+    world_size: int,
+    first_shape,
+    second_shape,
+    device,
+) -> None:
+    from tokenspeed_kernel.ops.communication.iris import iris_all_reduce_two
+
+    first = torch.full(
+        first_shape,
+        rank + 1,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    second = torch.full(
+        second_shape,
+        2 * (rank + 1),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+
+    first_result, second_result = iris_all_reduce_two(state, first, second)
+
+    expected_value = world_size * (world_size + 1) // 2
+    torch.testing.assert_close(
+        first_result,
+        torch.full_like(first, expected_value),
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        second_result,
+        torch.full_like(second, 2 * expected_value),
+        atol=0,
+        rtol=0,
+    )
 
 
 def _run_ar_test(world_size: int) -> None:

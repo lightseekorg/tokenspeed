@@ -28,11 +28,13 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from tokenspeed_kernel.ops.embedding import FusedSetKVBufferArg, apply_rope
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.ops.embedding import (
+    FusedMLASetKVBufferArg,
+    FusedSetKVBufferArg,
+    apply_rope,
+)
 from tokenspeed_kernel.torch_compile import get_compiler_backend
 
-_is_nvidia = current_platform().is_nvidia
 logger = logging.getLogger(__name__)
 
 
@@ -173,6 +175,7 @@ class RotaryEmbedding(torch.nn.Module):
         key: torch.Tensor,
         offsets: torch.Tensor | None = None,
         fused_set_kv_buffer_arg: FusedSetKVBufferArg | None = None,
+        fused_mla_set_kv_buffer_arg: FusedMLASetKVBufferArg | None = None,
         output_q_rope: torch.Tensor | None = None,
         output_k_rope: torch.Tensor | None = None,
         enable_pdl: bool = False,
@@ -187,6 +190,7 @@ class RotaryEmbedding(torch.nn.Module):
             cos_sin_cache=self.cos_sin_cache,
             is_neox=self.is_neox_style,
             fused_set_kv_buffer_arg=fused_set_kv_buffer_arg,
+            fused_mla_set_kv_buffer_arg=fused_mla_set_kv_buffer_arg,
             q_rope_out=output_q_rope,
             k_rope_out=output_k_rope,
             enable_pdl=enable_pdl,
@@ -672,17 +676,30 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         query: torch.Tensor,
         key: torch.Tensor,
         fused_set_kv_buffer_arg=None,
+        fused_mla_set_kv_buffer_arg=None,
         output_q_rope=None,
         offsets: torch.Tensor | None = None,
+        enable_pdl: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if _is_nvidia:
+        if offsets is None:
             return super().forward(
                 positions=positions,
                 query=query,
                 key=key,
                 fused_set_kv_buffer_arg=fused_set_kv_buffer_arg,
+                fused_mla_set_kv_buffer_arg=fused_mla_set_kv_buffer_arg,
                 output_q_rope=output_q_rope,
                 offsets=offsets,
+                enable_pdl=enable_pdl,
+            )
+        if (
+            fused_set_kv_buffer_arg is not None
+            or fused_mla_set_kv_buffer_arg is not None
+            or output_q_rope is not None
+        ):
+            raise ValueError(
+                "DeepseekScalingRotaryEmbedding offset path does not support "
+                "fused KV writes or output_q_rope"
             )
 
         dtype = query.dtype

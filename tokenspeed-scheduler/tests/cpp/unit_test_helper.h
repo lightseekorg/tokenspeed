@@ -20,18 +20,13 @@
 
 #pragma once
 
-#include <cstddef>
 #include <cstdint>
 #include <numeric>
-#include <string>
-#include <string_view>
 #include <vector>
 
 #include <gtest/gtest.h>
 
-#include "resource/types.h"
-#include "resource/allocator/page_allocator.h"
-#include "resource/kv_prefix_cache/kv_prefix_cache.h"
+#include "core/types.h"
 
 namespace tokenspeed::test {
 
@@ -45,17 +40,6 @@ inline token_vec_t MakeTokens(int32_t count, token_t start = 1) {
 // Generate a token sequence aligned to page_size.
 inline token_vec_t MakeAlignedTokens(int32_t num_pages, int32_t page_size, token_t start = 1) {
     return MakeTokens(num_pages * page_size, start);
-}
-
-// Generate page hashes of the requested length.
-inline std::vector<std::string> MakePageHashes(std::size_t num_pages, std::string_view prefix = "h") {
-    std::vector<std::string> page_hashes;
-    page_hashes.reserve(num_pages);
-    const std::string prefix_string(prefix);
-    for (std::size_t i = 0; i < num_pages; ++i) {
-        page_hashes.emplace_back(prefix_string + std::to_string(i + 1));
-    }
-    return page_hashes;
 }
 
 }  // namespace tokenspeed::test

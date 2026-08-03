@@ -25,7 +25,13 @@ from typing import List, Tuple
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton, tl, triton
+from tokenspeed_kernel._triton import (
+    gl,
+    gluon,
+    redirect_triton_to_tokenspeed_triton,
+    tl,
+    triton,
+)
 
 # iris does plain ``import triton`` at module load time; route those bindings
 # to the vendored ``tokenspeed_triton`` so iris and tokenspeed-kernel share a
@@ -40,7 +46,6 @@ with redirect_triton_to_tokenspeed_triton():
     import iris.ccl.triton  # noqa: E402
     from iris.ccl import Config as _IrisConfig  # noqa: E402
     from iris.ccl.all_gather import all_gather as _iris_all_gather  # noqa: E402
-    from iris.ccl.all_reduce import all_reduce as _iris_all_reduce  # noqa: E402
     from iris.ccl.reduce_scatter import (  # noqa: E402
         reduce_scatter as _iris_reduce_scatter,
     )
@@ -62,13 +67,16 @@ __all__ = [
     "IrisAllReduceResidualRMSNorm",
     "create_iris_state",
     "iris_all_reduce",
+    "iris_all_reduce_two",
     "create_iris_rsag_state",
     "create_iris_ar_rmsnorm_state",
     "iris_allreduce_residual_rmsnorm",
+    "IRIS_AR_STATES",
     "IRIS_AR_RMSNORM_STATES",
 ]
 
 
+IRIS_AR_STATES: dict = {}
 IRIS_AR_RMSNORM_STATES: dict = {}
 
 
@@ -185,7 +193,7 @@ class IrisRSAG(object):
         # Pick the largest power-of-two block that divides hidden_size, capped
         # at 256. This keeps the iris kernel on its no-mask fast path and
         # still produces enough tiles (world_size * hidden/block_n) to fill
-        # ``comm_sms`` SMs on MI300-class chips.
+        # ``comm_sms`` SMs on supported AMD chips.
         for cand in (256, 128, 64, 32, 16):
             if hidden_size % cand == 0:
                 return cand
@@ -243,6 +251,7 @@ class IrisRSAG(object):
         out_view = self._out_buff[:total_num_tokens, : self.hidden_size]
         in_view.copy_(hidden_states)
 
+        # Ensure every rank's shared input copy is visible before peer loads begin.
         self._ctx.device_barrier()
 
         config = self._make_config(local_num_tokens, self.hidden_size)
@@ -325,7 +334,12 @@ class IrisAllReduce(object):
         self.dtype = dtype
         self.device = device or torch.device(f"cuda:{torch.cuda.current_device()}")
         self._config = config or _IrisConfig(
-            block_size_m=32, block_size_n=64, all_reduce_distribution=1
+            block_size_m=1,
+            block_size_n=256,
+            swizzle_size=4,
+            comm_sms=64,
+            all_reduce_variant="one_shot",
+            all_reduce_distribution=1,
         )
 
         # Heap holds two flat buffers of ``max_numel * itemsize`` plus iris
@@ -337,15 +351,26 @@ class IrisAllReduce(object):
 
         free_gpu_memory_begin = _get_available_gpu_memory(torch.cuda.current_device())
         self._ctx = _get_or_create_iris_context(heap_size)
+        self.world_size = group.size()
         self._input_buf = self._ctx.zeros((max_numel,), dtype=dtype)
-        self._output_buf = self._ctx.zeros((max_numel,), dtype=dtype)
+        self._block_size = 2048
+        self._max_blocks = triton.cdiv(max_numel, self._block_size)
+        self._ready_flags = self._ctx.zeros(
+            (self._max_blocks, self.world_size), dtype=torch.int32
+        )
+        self._heap_base_addresses = tuple(
+            int(address) for address in self._ctx.get_heap_bases().tolist()
+        )
         free_gpu_memory_after = _get_available_gpu_memory(torch.cuda.current_device())
         logger.info(
             "Iris all-reduce symmetric-heap buffers allocated: %s GB",
             free_gpu_memory_begin - free_gpu_memory_after,
         )
 
-        self.world_size = group.size()
+        self._rank_start = 0
+        self._rank_stride = 1
+        self._iris_rank = dist.get_rank()
+        self._workspace = None
 
     def all_reduce(
         self,
@@ -354,6 +379,10 @@ class IrisAllReduce(object):
         safe: bool = True,
         async_op: bool = False,
     ) -> torch.Tensor:
+        if op is None:
+            op = dist.ReduceOp.SUM
+        assert op == dist.ReduceOp.SUM, f"Iris all-reduce only supports SUM, got {op}"
+        assert not async_op, "Iris all-reduce does not support async_op"
         assert tensor.dtype == self.dtype, (
             f"Iris all-reduce dtype mismatch: tensor={tensor.dtype}, "
             f"backend={self.dtype}"
@@ -369,24 +398,514 @@ class IrisAllReduce(object):
         else:
             m_dim, n_dim = 1, numel
         in_view = self._input_buf.narrow(0, 0, numel).view(m_dim, n_dim)
-        out_view = self._output_buf.narrow(0, 0, numel).view(m_dim, n_dim)
-        in_view.view(-1).copy_(tensor.view(-1))
-
-        self._ctx.device_barrier()
-
-        ar_group = None if self.group == dist.group.WORLD else self.group
-        _iris_all_reduce(
-            out_view,
-            in_view,
-            self._ctx,
-            op=op,
-            group=ar_group,
-            async_op=async_op,
-            config=self._config,
+        iris_stage_one_shot_allreduce_kernel[(triton.cdiv(numel, self._block_size),)](
+            tensor.view(-1),
+            in_view.view(-1),
+            tensor.view(-1),
+            self._ready_flags,
+            self._ctx.get_heap_bases(),
+            numel,
+            RANK=self._iris_rank,
+            WORLD_SIZE=self.world_size,
+            BLOCK_SIZE=self._block_size,
+            num_warps=4,
         )
 
-        result = out_view.view(tensor.shape)
-        return result.clone() if safe else result
+        return tensor.clone() if safe else tensor
+
+    def all_reduce_two(
+        self,
+        first: torch.Tensor,
+        second: torch.Tensor,
+        op=None,
+        safe: bool = True,
+        async_op: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reduce two BF16 tensors with one launch and synchronization epoch.
+
+        The tensors remain separate at the API and output boundaries. The
+        kernel lays them out consecutively only in Iris's symmetric input
+        buffer, avoiding an explicit concatenation or staging copy.
+
+        Args:
+            first: First contiguous tensor to reduce in place.
+            second: Second contiguous tensor to reduce in place.
+            op: Reduction operation. Only ``SUM`` is supported.
+            safe: Return cloned outputs when true; otherwise return the input
+                tensors after their in-place reductions.
+            async_op: Must be false; asynchronous execution is unsupported.
+
+        Returns:
+            The two reduced tensors, in the same order as the inputs.
+        """
+        if op is None:
+            op = dist.ReduceOp.SUM
+        assert op == dist.ReduceOp.SUM, f"Iris all-reduce only supports SUM, got {op}"
+        assert not async_op, "Iris all-reduce does not support async_op"
+        assert first.dtype == self.dtype and second.dtype == self.dtype, (
+            "Iris all-reduce dtype mismatch: "
+            f"first={first.dtype}, second={second.dtype}, backend={self.dtype}"
+        )
+        assert (
+            first.is_contiguous() and second.is_contiguous()
+        ), "Iris two-tensor all-reduce requires contiguous inputs"
+        assert first.device == second.device == self.device, (
+            "Iris two-tensor all-reduce inputs must be on the state device: "
+            f"first={first.device}, second={second.device}, state={self.device}"
+        )
+        first_numel = first.numel()
+        second_numel = second.numel()
+        total_numel = first_numel + second_numel
+        assert (
+            first_numel > 0 and second_numel > 0
+        ), "Iris two-tensor all-reduce requires non-empty inputs"
+        assert total_numel <= self.max_numel, (
+            f"combined tensor numel ({total_numel}) exceeds iris buffer capacity "
+            f"({self.max_numel})"
+        )
+
+        grid = (triton.cdiv(total_numel, self._block_size),)
+        if (
+            _platform.is_cdna4
+            and self.world_size == 8
+            and first_numel == 7168
+            and second_numel == 3584
+        ):
+            iris_stage_one_shot_allreduce_two_gluon_kernel[grid](
+                first.view(-1),
+                second.view(-1),
+                self._input_buf,
+                first.view(-1),
+                second.view(-1),
+                self._ready_flags,
+                *self._heap_base_addresses,
+                first_numel,
+                total_numel,
+                RANK=self._iris_rank,
+                WORLD_SIZE=self.world_size,
+                BLOCK_SIZE=self._block_size,
+                num_warps=4,
+            )
+        else:
+            iris_stage_one_shot_allreduce_two_kernel[grid](
+                first.view(-1),
+                second.view(-1),
+                self._input_buf,
+                first.view(-1),
+                second.view(-1),
+                self._ready_flags,
+                self._ctx.get_heap_bases(),
+                first_numel,
+                total_numel,
+                RANK=self._iris_rank,
+                WORLD_SIZE=self.world_size,
+                BLOCK_SIZE=self._block_size,
+                num_warps=4,
+            )
+
+        if safe:
+            return first.clone(), second.clone()
+        return first, second
+
+
+@triton.jit
+def iris_stage_one_shot_allreduce_kernel(
+    input_ptr,
+    input_sym_ptr,
+    output_ptr,
+    ready_flags,
+    heap_bases,
+    NUMEL,
+    RANK: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    block_id = tl.program_id(0)
+    offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < NUMEL
+
+    local = tl.load(input_ptr + offsets, mask=mask, other=0.0)
+    tl.store(input_sym_ptr + offsets, local, mask=mask, cache_modifier=".wt")
+    tl.debug_barrier()
+
+    flag_offset = block_id * WORLD_SIZE
+    local_ready = ready_flags + flag_offset + RANK
+    epoch = tl.load(local_ready).to(tl.int32) + 1
+    tl.atomic_xchg(local_ready, epoch, sem="release", scope="sys")
+
+    for peer in tl.static_range(0, WORLD_SIZE):
+        if peer != RANK:
+            seen = tl.full((), 0, dtype=tl.int32)
+            while seen < epoch:
+                seen = iris.load(
+                    ready_flags + flag_offset + peer,
+                    RANK,
+                    peer,
+                    heap_bases,
+                    cache_modifier=".cv",
+                    volatile=True,
+                )
+
+    acc = local.to(tl.float32)
+    for peer in tl.static_range(0, WORLD_SIZE):
+        if peer != RANK:
+            acc += iris.load(
+                input_sym_ptr + offsets,
+                RANK,
+                peer,
+                heap_bases,
+                mask=mask,
+                other=0.0,
+                cache_modifier=".cg",
+                hint=BLOCK_SIZE,
+            ).to(tl.float32)
+    tl.store(output_ptr + offsets, acc.to(output_ptr.type.element_ty), mask=mask)
+
+
+@gluon.jit
+def _iris_heap_base(
+    rank: gl.constexpr,
+    heap_base_0,
+    heap_base_1,
+    heap_base_2,
+    heap_base_3,
+    heap_base_4,
+    heap_base_5,
+    heap_base_6,
+    heap_base_7,
+):
+    if rank == 0:
+        return heap_base_0
+    if rank == 1:
+        return heap_base_1
+    if rank == 2:
+        return heap_base_2
+    if rank == 3:
+        return heap_base_3
+    if rank == 4:
+        return heap_base_4
+    if rank == 5:
+        return heap_base_5
+    if rank == 6:
+        return heap_base_6
+    return heap_base_7
+
+
+@gluon.jit
+def _iris_wait_for_peers(
+    ready_flags,
+    block_id,
+    epoch,
+    local_heap,
+    heap_base_0,
+    heap_base_1,
+    heap_base_2,
+    heap_base_3,
+    heap_base_4,
+    heap_base_5,
+    heap_base_6,
+    heap_base_7,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+):
+    """Poll all remote ready flags together with coherent global loads."""
+    ready_layout: gl.constexpr = gl.BlockedLayout([1], [64], [4], [0])
+    peer_ids = gl.arange(0, WORLD_SIZE, layout=ready_layout)
+    peer_heaps = gl.where(peer_ids == 0, heap_base_0, heap_base_7)
+    peer_heaps = gl.where(peer_ids == 1, heap_base_1, peer_heaps)
+    peer_heaps = gl.where(peer_ids == 2, heap_base_2, peer_heaps)
+    peer_heaps = gl.where(peer_ids == 3, heap_base_3, peer_heaps)
+    peer_heaps = gl.where(peer_ids == 4, heap_base_4, peer_heaps)
+    peer_heaps = gl.where(peer_ids == 5, heap_base_5, peer_heaps)
+    peer_heaps = gl.where(peer_ids == 6, heap_base_6, peer_heaps)
+
+    flags_heap_offset = tl.cast(ready_flags, gl.uint64) - local_heap
+    peer_flags = tl.cast(
+        peer_heaps + flags_heap_offset,
+        gl.pointer_type(gl.int32),
+    )
+    peer_flags += block_id * WORLD_SIZE + peer_ids
+    peer_mask = peer_ids != RANK
+    seen = gl.full([WORLD_SIZE], 0, gl.int32, layout=ready_layout)
+    while gl.min(gl.where(peer_mask, seen, epoch), axis=0) < epoch:
+        seen = gl.load(
+            peer_flags,
+            mask=peer_mask,
+            other=epoch,
+            cache_modifier=".cv",
+            volatile=True,
+        )
+
+
+@gluon.jit
+def _unpack_bf16x4(packed):
+    value_0 = ((packed & 0xFFFF).to(gl.uint32) << 16).to(gl.float32, bitcast=True)
+    value_1 = (((packed >> 16) & 0xFFFF).to(gl.uint32) << 16).to(
+        gl.float32, bitcast=True
+    )
+    value_2 = (((packed >> 32) & 0xFFFF).to(gl.uint32) << 16).to(
+        gl.float32, bitcast=True
+    )
+    value_3 = (((packed >> 48) & 0xFFFF).to(gl.uint32) << 16).to(
+        gl.float32, bitcast=True
+    )
+    return value_0, value_1, value_2, value_3
+
+
+@gluon.jit
+def _pack_bf16x4(value_0, value_1, value_2, value_3):
+    bits_0 = value_0.to(gl.bfloat16).to(gl.uint16, bitcast=True).to(gl.uint64)
+    bits_1 = value_1.to(gl.bfloat16).to(gl.uint16, bitcast=True).to(gl.uint64)
+    bits_2 = value_2.to(gl.bfloat16).to(gl.uint16, bitcast=True).to(gl.uint64)
+    bits_3 = value_3.to(gl.bfloat16).to(gl.uint16, bitcast=True).to(gl.uint64)
+    return bits_0 | (bits_1 << 16) | (bits_2 << 32) | (bits_3 << 48)
+
+
+@gluon.jit
+def iris_stage_one_shot_allreduce_two_gluon_kernel(
+    first_input_ptr,
+    second_input_ptr,
+    input_sym_ptr,
+    first_output_ptr,
+    second_output_ptr,
+    ready_flags,
+    heap_base_0,
+    heap_base_1,
+    heap_base_2,
+    heap_base_3,
+    heap_base_4,
+    heap_base_5,
+    heap_base_6,
+    heap_base_7,
+    FIRST_NUMEL,
+    TOTAL_NUMEL,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    BLOCK_SIZE: gl.constexpr,
+):
+    """Stage and reduce K3's shared and routed BF16 segments with buffer ops."""
+    block_id = gl.program_id(0)
+    layout: gl.constexpr = gl.BlockedLayout([2], [64], [4], [0])
+    packed_offset = block_id * (BLOCK_SIZE // 4) + gl.arange(
+        0, BLOCK_SIZE // 4, layout=layout
+    )
+    first_packed = FIRST_NUMEL // 4
+    total_packed = TOTAL_NUMEL // 4
+    first_mask = packed_offset < first_packed
+    second_offset = packed_offset - first_packed
+    second_mask = (packed_offset >= first_packed) & (packed_offset < total_packed)
+
+    first_input = gl.amd.cdna4.buffer_load(
+        tl.cast(first_input_ptr, gl.pointer_type(gl.uint64)),
+        packed_offset.to(gl.int32),
+        mask=first_mask,
+        other=0,
+    )
+    second_input = gl.amd.cdna4.buffer_load(
+        tl.cast(second_input_ptr, gl.pointer_type(gl.uint64)),
+        second_offset.to(gl.int32),
+        mask=second_mask,
+        other=0,
+    )
+    local_packed = first_input | second_input
+    gl.amd.cdna4.buffer_store(
+        local_packed,
+        tl.cast(input_sym_ptr, gl.pointer_type(gl.uint64)),
+        packed_offset.to(gl.int32),
+        mask=packed_offset < total_packed,
+        cache=".wt",
+    )
+    gl.barrier()
+
+    flag_offset = block_id * WORLD_SIZE
+    local_ready = ready_flags + flag_offset + RANK
+    epoch = gl.load(local_ready).to(gl.int32) + 1
+    gl.atomic_xchg(local_ready, epoch, sem="release", scope="sys")
+
+    local_heap = _iris_heap_base(
+        RANK,
+        heap_base_0,
+        heap_base_1,
+        heap_base_2,
+        heap_base_3,
+        heap_base_4,
+        heap_base_5,
+        heap_base_6,
+        heap_base_7,
+    )
+    _iris_wait_for_peers(
+        ready_flags,
+        block_id,
+        epoch,
+        local_heap,
+        heap_base_0,
+        heap_base_1,
+        heap_base_2,
+        heap_base_3,
+        heap_base_4,
+        heap_base_5,
+        heap_base_6,
+        heap_base_7,
+        RANK,
+        WORLD_SIZE,
+    )
+
+    acc_0, acc_1, acc_2, acc_3 = _unpack_bf16x4(local_packed)
+    input_heap_offset = tl.cast(input_sym_ptr, gl.uint64) - local_heap
+    for peer in gl.static_range(0, WORLD_SIZE):
+        if peer != RANK:
+            peer_heap = _iris_heap_base(
+                peer,
+                heap_base_0,
+                heap_base_1,
+                heap_base_2,
+                heap_base_3,
+                heap_base_4,
+                heap_base_5,
+                heap_base_6,
+                heap_base_7,
+            )
+            peer_input = tl.cast(
+                peer_heap + input_heap_offset,
+                gl.pointer_type(gl.uint64),
+            )
+            peer_packed = gl.amd.cdna4.buffer_load(
+                peer_input,
+                packed_offset.to(gl.int32),
+                mask=packed_offset < total_packed,
+                other=0,
+                cache=".cg",
+            )
+            peer_0, peer_1, peer_2, peer_3 = _unpack_bf16x4(peer_packed)
+            acc_0 += peer_0
+            acc_1 += peer_1
+            acc_2 += peer_2
+            acc_3 += peer_3
+
+    packed_output = _pack_bf16x4(acc_0, acc_1, acc_2, acc_3)
+    gl.amd.cdna4.buffer_store(
+        packed_output,
+        tl.cast(first_output_ptr, gl.pointer_type(gl.uint64)),
+        packed_offset.to(gl.int32),
+        mask=first_mask,
+    )
+    gl.amd.cdna4.buffer_store(
+        packed_output,
+        tl.cast(second_output_ptr, gl.pointer_type(gl.uint64)),
+        second_offset.to(gl.int32),
+        mask=second_mask,
+    )
+
+
+@triton.jit
+def iris_stage_one_shot_allreduce_two_kernel(
+    first_input_ptr,
+    second_input_ptr,
+    input_sym_ptr,
+    first_output_ptr,
+    second_output_ptr,
+    ready_flags,
+    heap_bases,
+    FIRST_NUMEL,
+    TOTAL_NUMEL,
+    RANK: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    block_id = tl.program_id(0)
+    combined_offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    combined_mask = combined_offsets < TOTAL_NUMEL
+    first_mask = combined_offsets < FIRST_NUMEL
+    second_offsets = combined_offsets - FIRST_NUMEL
+    second_mask = (combined_offsets >= FIRST_NUMEL) & combined_mask
+
+    # The masks are disjoint, so their sum forms the logical concatenation in
+    # symmetric memory without allocating or copying a temporary torch.Tensor.
+    local = tl.load(
+        first_input_ptr + combined_offsets,
+        mask=first_mask,
+        other=0.0,
+    )
+    local += tl.load(
+        second_input_ptr + second_offsets,
+        mask=second_mask,
+        other=0.0,
+    )
+    tl.store(
+        input_sym_ptr + combined_offsets,
+        local,
+        mask=combined_mask,
+        cache_modifier=".wt",
+    )
+    tl.debug_barrier()
+
+    flag_offset = block_id * WORLD_SIZE
+    local_ready = ready_flags + flag_offset + RANK
+    epoch = tl.load(local_ready).to(tl.int32) + 1
+    tl.atomic_xchg(local_ready, epoch, sem="release", scope="sys")
+
+    for peer in tl.static_range(0, WORLD_SIZE):
+        if peer != RANK:
+            seen = tl.full((), 0, dtype=tl.int32)
+            while seen < epoch:
+                seen = iris.load(
+                    ready_flags + flag_offset + peer,
+                    RANK,
+                    peer,
+                    heap_bases,
+                    cache_modifier=".cv",
+                    volatile=True,
+                )
+
+    acc = local.to(tl.float32)
+    for peer in tl.static_range(0, WORLD_SIZE):
+        if peer != RANK:
+            acc += iris.load(
+                input_sym_ptr + combined_offsets,
+                RANK,
+                peer,
+                heap_bases,
+                mask=combined_mask,
+                other=0.0,
+                cache_modifier=".cg",
+                hint=BLOCK_SIZE,
+            ).to(tl.float32)
+
+    acc = acc.to(first_output_ptr.type.element_ty)
+    tl.store(first_output_ptr + combined_offsets, acc, mask=first_mask)
+    tl.store(second_output_ptr + second_offsets, acc, mask=second_mask)
+
+
+@triton.jit
+def iris_allreduce_kernel(
+    input_sym_ptr,
+    output_ptr,
+    NUMEL,
+    heap_bases,
+    iris_rank: tl.constexpr,
+    world_size: tl.constexpr,
+    rank_start: tl.constexpr,
+    rank_stride: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    block_id = tl.program_id(0)
+    offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < NUMEL
+
+    acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    for i in tl.static_range(0, world_size):
+        remote_rank = rank_start + i * rank_stride
+        acc += iris.load(
+            input_sym_ptr + offsets,
+            iris_rank,
+            remote_rank,
+            heap_bases,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+
+    out_dtype = output_ptr.type.element_ty
+    tl.store(output_ptr + offsets, acc.to(out_dtype), mask=mask)
 
 
 @triton.jit
@@ -640,6 +1159,8 @@ class IrisAllReduceResidualRMSNorm(object):
             EPS=eps,
             num_warps=8,
         )
+        # Ensure all peer loads finish before the next call reuses _input_buf.
+        self._ctx.device_barrier()
         return norm_out, residual_out
 
 
@@ -669,6 +1190,24 @@ def iris_all_reduce(
     async_op: bool = False,
 ) -> torch.Tensor:
     return state.all_reduce(tensor, op=op, safe=safe, async_op=async_op)
+
+
+def iris_all_reduce_two(
+    state: "IrisAllReduce",
+    first: torch.Tensor,
+    second: torch.Tensor,
+    op=None,
+    safe: bool = True,
+    async_op: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reduce two tensors through one Iris kernel launch."""
+    return state.all_reduce_two(
+        first,
+        second,
+        op=op,
+        safe=safe,
+        async_op=async_op,
+    )
 
 
 def create_iris_rsag_state(

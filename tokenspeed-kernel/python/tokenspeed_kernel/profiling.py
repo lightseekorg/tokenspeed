@@ -28,6 +28,7 @@ import time
 import warnings
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
+from numbers import Real
 from pathlib import Path
 from typing import Any
 
@@ -42,7 +43,9 @@ __all__ = [
     "ShapeCapture",
     "bootstrap_profiling_from_env",
     "kernel_scope",
+    "profile_config_from_env",
     "profiling",
+    "proton_available",
     "shape_capture",
     "start_shape_capture",
     "start_profiling",
@@ -185,6 +188,60 @@ class _NoopScope:
 
 _NOOP_SCOPE = _NoopScope()
 _BOOTSTRAPPED = False
+_VIZTRACER_PROTON_FLOW_NAME = "viztracer->proton"
+_VIZTRACER_PROTON_FLOW_CATEGORY = "tokenspeed.proton"
+
+
+def _active_viztracer():
+    """Return the active process-local VizTracer instance, if any."""
+    try:
+        from viztracer import get_tracer
+    except ImportError:
+        return None
+
+    tracer = get_tracer()
+    return tracer if tracer is not None and tracer.enable else None
+
+
+class _VizTracerProtonScope:
+    """Emit a VizTracer flow start immediately before a Proton CPU scope."""
+
+    def __init__(self, scope: Any) -> None:
+        self._scope = scope
+
+    def __enter__(self) -> Any:
+        tracer = _active_viztracer()
+        timestamp = tracer.getts() if tracer is not None else None
+        entered_scope = self._scope.__enter__()
+        scope_id = getattr(self._scope, "id", None)
+        if tracer is not None and scope_id is not None:
+            tracer.add_raw(
+                {
+                    "name": _VIZTRACER_PROTON_FLOW_NAME,
+                    "cat": _VIZTRACER_PROTON_FLOW_CATEGORY,
+                    "ph": "s",
+                    "ts": timestamp,
+                    "id": scope_id,
+                    "bp": "e",
+                }
+            )
+        return entered_scope
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> Any:
+        return self._scope.__exit__(exc_type, exc_value, traceback)
+
+
+def _proton_metrics(metrics: dict[str, object]) -> dict[str, object]:
+    """Keep only the metric types accepted by Proton's Python API."""
+    supported: dict[str, object] = {}
+    for name, value in metrics.items():
+        if hasattr(value, "data_ptr") or isinstance(value, Real):
+            supported[name] = value
+        elif isinstance(value, (list, tuple)) and all(
+            isinstance(element, Real) for element in value
+        ):
+            supported[name] = list(value)
+    return supported
 
 
 def _is_truthy(value: str | None) -> bool:
@@ -193,9 +250,32 @@ def _is_truthy(value: str | None) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _profile_config_from_env() -> ProfilingConfig:
+def proton_available() -> bool:
+    """Report whether the Proton profiler can be used in this process.
+
+    Returns:
+        True if the vendored Triton distribution provides
+        ``tokenspeed_triton.profiler``; False otherwise (profiling calls
+        become no-ops with a warning).
+    """
+    return _HAS_PROTON
+
+
+def profile_config_from_env(output: str | None = None) -> ProfilingConfig:
+    """Build a :class:`ProfilingConfig` from ``TOKENSPEED_KERNEL_PROFILE_*``.
+
+    Args:
+        output: Optional Proton output prefix/path. When provided it takes
+            precedence over ``TOKENSPEED_KERNEL_PROFILE_OUTPUT``; callers that
+            profile multiple processes (e.g. one scheduler per rank) use this
+            to give each process a distinct output file.
+
+    Returns:
+        A :class:`ProfilingConfig` with ``data``/``backend``/``mode``/``hook``/
+        ``output_format`` sourced from the environment.
+    """
     return ProfilingConfig(
-        output=os.environ.get(_ENV_PROFILE_OUTPUT, "profile"),
+        output=output or os.environ.get(_ENV_PROFILE_OUTPUT, "profile"),
         data=os.environ.get(_ENV_PROFILE_DATA, "tree"),
         backend=os.environ.get(_ENV_PROFILE_BACKEND),
         mode=os.environ.get(_ENV_PROFILE_MODE),
@@ -236,10 +316,13 @@ def stop_profiling() -> None:
         return
 
     output_format = state._config.output_format if state._config is not None else ""
-    proton.finalize(state._session, output_format)
-    state._session = None
-    state._config = None
-    state.enabled = False
+    try:
+        proton.finalize(state._session, output_format)
+    finally:
+        # Keep wrapper state recoverable even when report serialization fails.
+        state._session = None
+        state._config = None
+        state.enabled = False
 
 
 def start_shape_capture() -> None:
@@ -281,14 +364,28 @@ def kernel_scope(
     kernel_name: str = "",
     **metrics: object,
 ):
+    """Return a Proton scope for one kernel launch.
+
+    Proton accepts numeric or tensor metrics only, so ``dtype`` is retained by
+    :class:`ShapeCapture` but is not emitted as a Proton scope metric.
+
+    Args:
+        family: Kernel family name.
+        mode: Kernel operation name.
+        dtype: Kernel data type recorded by shape capture.
+        kernel_name: Selected kernel implementation name.
+        **metrics: Numeric kernel-shape metrics for Proton.
+
+    Returns:
+        A Proton scope when profiling is active, otherwise a no-op scope.
+    """
     state = ProfilingState.get()
     if not state.active:
         return _NOOP_SCOPE
 
     name = f"{family}.{mode}[{kernel_name}]" if kernel_name else f"{family}.{mode}"
-    scope_metrics = {"dtype": str(dtype)}
-    scope_metrics.update(metrics)
-    return proton.scope(name, metrics=scope_metrics)
+    scope_metrics = _proton_metrics(metrics)
+    return _VizTracerProtonScope(proton.scope(name, metrics=scope_metrics))
 
 
 def _atexit_stop_profiling() -> None:
@@ -316,7 +413,7 @@ def bootstrap_profiling_from_env() -> None:
     _BOOTSTRAPPED = True
 
     if _is_truthy(os.environ.get(_ENV_PROFILE)):
-        start_profiling(_profile_config_from_env())
+        start_profiling(profile_config_from_env())
     if _is_truthy(os.environ.get(_ENV_CAPTURE_SHAPES)):
         start_shape_capture()
 

@@ -9,6 +9,7 @@ set -e
 # Hand off to the ROCm-specific script when running on an AMD runner.
 # ============================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/package_cache.sh"
 AMD_RUNNER_LABEL_PATTERNS=(*mi350* *mi355* *mi35x*)
 
 for pat in "${AMD_RUNNER_LABEL_PATTERNS[@]}"; do
@@ -31,6 +32,7 @@ export C_INCLUDE_PATH="/usr/local/cuda/include/cccl"
 
 WORKSPACE=${WORKSPACE:-$(pwd)}
 CUDA_REQ="${WORKSPACE}/tokenspeed-kernel/python/requirements/cuda.txt"
+configure_b200v2_package_cache
 
 # Wrap pip install in a retry loop. PyPI's CDN occasionally returns a
 # bad Content-Type for /simple/<pkg>/ pages (most recently observed for
@@ -56,8 +58,18 @@ pip_install_with_retry() {
     done
 }
 
-ensure_flashinfer_jit_cache_for_gb200() {
-    if [[ "${CI_RUNNER_LABEL:-}" != gb200* ]]; then
+run_as_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+ensure_flashinfer_jit_cache() {
+    # GB200 and B200 runner images preinstall flashinfer-jit-cache; it must
+    # match the flashinfer-python pin exactly or flashinfer refuses to import.
+    if [[ "${CI_RUNNER_LABEL:-}" != gb200* && "${CI_RUNNER_LABEL:-}" != b200* ]]; then
         return 0
     fi
 
@@ -82,12 +94,21 @@ echo "=========================================="
 # Step 1: Determine CUDA index and FlashInfer architecture
 # ============================================================
 echo "=== Step 1: Determine CUDA index and architecture ==="
-case "${CUDA_VERSION}" in
-    12.9.1) CUINDEX=129 ;;
-    13.0.1) CUINDEX=130 ;;
-    *)      CUINDEX=130 ;;
+TORCH_CUDA_VERSION="$(python3 -c \
+    'import torch; print(torch.version.cuda or "")' 2>/dev/null || true)"
+case "${TORCH_CUDA_VERSION}" in
+    12.9*) CUINDEX=129 ;;
+    13.0*) CUINDEX=130 ;;
+    *)
+        case "${CUDA_VERSION}" in
+            12.9*) CUINDEX=129 ;;
+            13.0*) CUINDEX=130 ;;
+            *)     CUINDEX=130 ;;
+        esac
+        ;;
 esac
-echo "PyTorch CUDA index: cu${CUINDEX}"
+echo "PyTorch CUDA version: ${TORCH_CUDA_VERSION:-unknown}"
+echo "PyTorch wheel index: cu${CUINDEX}"
 
 case "${SM}" in
     sm103) FI_ARCH="10.3a" ;;
@@ -100,20 +121,43 @@ echo "FlashInfer architecture: ${FI_ARCH}"
 # ============================================================
 # Step 2: Upgrade base tools
 # ============================================================
-sudo apt install -y openmpi-bin libopenmpi-dev libssl-dev pkg-config -y
+if ! dpkg -s openmpi-bin libopenmpi-dev libssl-dev pkg-config > /dev/null 2>&1; then
+    run_as_root apt-get -o DPkg::Lock::Timeout=600 update
+    run_as_root apt-get -o DPkg::Lock::Timeout=600 install -y \
+        openmpi-bin libopenmpi-dev libssl-dev pkg-config
+else
+    echo "apt packages already installed, skipping apt"
+fi
 echo "=== Step 2: Upgrade pip/setuptools/wheel ==="
-python3 -m pip install --upgrade pip setuptools wheel
+python3 -m pip install --upgrade --ignore-installed --break-system-packages \
+    pip setuptools wheel
 
 # ============================================================
-# Step 3: Sync FlashInfer JIT cache on GB200
+# Step 3: Sync FlashInfer JIT cache on GB200/B200
 # ============================================================
-echo "=== Step 3: Sync FlashInfer JIT cache on GB200 ==="
-ensure_flashinfer_jit_cache_for_gb200
+echo "=== Step 3: Sync FlashInfer JIT cache on GB200/B200 ==="
+ensure_flashinfer_jit_cache
 
 # ============================================================
 # Step 4: Install tokenspeed-kernel
 # ============================================================
 echo "=== Step 4: Install tokenspeed-kernel ==="
+# Nightly flashinfer pins (X.Y.Z.devYYYYMMDD) never reach PyPI: pre-install
+# the python wheel from the GitHub nightly release so tokenspeed-kernel's ==
+# pin resolves against the already-installed version instead of PyPI.
+FLASHINFER_PIN="$(grep -E '^flashinfer-python==' "${CUDA_REQ}" | head -n1 | tr -d '[:space:]')"
+FLASHINFER_PIN_VERSION="${FLASHINFER_PIN##*==}"
+if [[ "${FLASHINFER_PIN_VERSION}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.dev([0-9]{8})$ ]]; then
+    NIGHTLY_TAG="nightly-v${BASH_REMATCH[1]}-${BASH_REMATCH[2]}"
+    NIGHTLY_BASE="https://github.com/flashinfer-ai/flashinfer/releases/download/${NIGHTLY_TAG}"
+    NIGHTLY_WHEEL="$(cache_remote_wheel "${NIGHTLY_BASE}/flashinfer_python-${FLASHINFER_PIN_VERSION}-py3-none-any.whl")"
+    # flashinfer-cubin must match too: runner images preinstall an older one
+    # and flashinfer's import-time version check refuses the mismatch.
+    NIGHTLY_CUBIN_WHEEL="$(cache_remote_wheel "${NIGHTLY_BASE}/flashinfer_cubin-${FLASHINFER_PIN_VERSION}-py3-none-any.whl")"
+    echo "Pre-installing nightly FlashInfer Python + cubin from GitHub release: ${NIGHTLY_TAG}"
+    pip_install_with_retry pip3 install --break-system-packages --no-deps \
+        "${NIGHTLY_WHEEL}" "${NIGHTLY_CUBIN_WHEEL}"
+fi
 cd ${WORKSPACE}
 export PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cu${CUINDEX}"
 TOKENSPEED_KERNEL_BACKEND=cuda FLASHINFER_CUDA_ARCH_LIST="${FI_ARCH}" \
@@ -175,19 +219,38 @@ if [ -n "${CUTLASS_DSL_SPEC}" ]; then
         --force-reinstall --no-deps "${CUTLASS_DSL_DEPS[@]}"
 fi
 
-PINNED_KERNEL_DEPS=()
-for pkg in flashinfer-python flashinfer-cubin; do
-    spec="$(pin_version "${pkg}")"
-    if [ -n "${spec}" ]; then
-        PINNED_KERNEL_DEPS+=("${spec}")
+FLASHINFER_PYTHON_SPEC="$(pin_version flashinfer-python)"
+if [ -n "${FLASHINFER_PYTHON_SPEC}" ]; then
+    FLASHINFER_VERSION="${FLASHINFER_PYTHON_SPEC##*==}"
+    # Nightlies version as X.Y.Z.devYYYYMMDD but tag as nightly-vX.Y.Z-YYYYMMDD,
+    # and never reach PyPI, so their python wheel also comes from the release.
+    FLASHINFER_RELEASE_BASE="https://github.com/flashinfer-ai/flashinfer/releases/download"
+    if [[ "${FLASHINFER_VERSION}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.dev([0-9]{8})$ ]]; then
+        FLASHINFER_RELEASE_TAG="nightly-v${BASH_REMATCH[1]}-${BASH_REMATCH[2]}"
+        FLASHINFER_PYTHON_SPEC="$(cache_remote_wheel "${FLASHINFER_RELEASE_BASE}/${FLASHINFER_RELEASE_TAG}/flashinfer_python-${FLASHINFER_VERSION}-py3-none-any.whl")"
+    else
+        FLASHINFER_RELEASE_TAG="v${FLASHINFER_VERSION}"
     fi
-done
-if [ "${#PINNED_KERNEL_DEPS[@]}" -gt 0 ]; then
-    echo "Force-reinstalling pinned kernel deps: ${PINNED_KERNEL_DEPS[*]}"
+    FLASHINFER_CUBIN_WHEEL_URL="${FLASHINFER_RELEASE_BASE}/${FLASHINFER_RELEASE_TAG}/flashinfer_cubin-${FLASHINFER_VERSION}-py3-none-any.whl"
+    FLASHINFER_CUBIN_WHEEL_SOURCE="$(cache_remote_wheel "${FLASHINFER_CUBIN_WHEEL_URL}")"
+    echo "Force-reinstalling pinned FlashInfer Python: ${FLASHINFER_PYTHON_SPEC}"
     pip_install_with_retry pip3 install --break-system-packages \
-        --force-reinstall --no-deps "${PINNED_KERNEL_DEPS[@]}"
+        --force-reinstall --no-deps "${FLASHINFER_PYTHON_SPEC}"
+    echo "Installing FlashInfer cubin from GitHub Release: ${FLASHINFER_CUBIN_WHEEL_URL}"
+    pip_install_with_retry pip3 install --break-system-packages \
+        --force-reinstall --no-deps "${FLASHINFER_CUBIN_WHEEL_SOURCE}"
 else
-    echo "No pinned kernel deps found in ${CUDA_REQ}; skipping."
+    echo "No FlashInfer Python pin found in ${CUDA_REQ}; skipping FlashInfer installs."
+fi
+
+THIRDPARTY_REQ="${WORKSPACE}/tokenspeed-kernel/python/requirements/cuda-thirdparty.txt"
+FA4_SPEC="$(grep -E '^tokenspeed-fa4(\[[^]]+\])?==' "${THIRDPARTY_REQ}" | head -n1 | tr -d '[:space:]')"
+if [ -n "${FA4_SPEC}" ]; then
+    echo "Force-reinstalling pinned FA4: ${FA4_SPEC}"
+    pip_install_with_retry pip3 install --break-system-packages \
+        --force-reinstall --no-deps "${FA4_SPEC}"
+else
+    echo "No tokenspeed-fa4 pin found in ${THIRDPARTY_REQ}; skipping FA4 reinstall."
 fi
 
 # ============================================================
@@ -197,8 +260,8 @@ echo "=== Step 9: Fix Triton ptxas ==="
 if [ "${CUDA_VERSION%%.*}" = "13" ]; then
     TRITON_BIN="/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin"
     if [ -d "${TRITON_BIN}" ]; then
-        rm -f "${TRITON_BIN}/ptxas" 2>/dev/null || sudo rm -f "${TRITON_BIN}/ptxas" 2>/dev/null || true
-        ln -sf /usr/local/cuda/bin/ptxas "${TRITON_BIN}/ptxas" 2>/dev/null || sudo ln -sf /usr/local/cuda/bin/ptxas "${TRITON_BIN}/ptxas" 2>/dev/null || true
+        rm -f "${TRITON_BIN}/ptxas" 2>/dev/null || run_as_root rm -f "${TRITON_BIN}/ptxas" 2>/dev/null || true
+        ln -sf /usr/local/cuda/bin/ptxas "${TRITON_BIN}/ptxas" 2>/dev/null || run_as_root ln -sf /usr/local/cuda/bin/ptxas "${TRITON_BIN}/ptxas" 2>/dev/null || true
     fi
 fi
 

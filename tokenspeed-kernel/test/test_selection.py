@@ -793,19 +793,7 @@ class TestSelectKernel:
         )
         assert impl() == "reference_decode"
 
-    def test_amd_platform_selects_aiter(self, sample_specs, mi300_platform):
-        reg = KernelRegistry.get()
-        register_all_samples(reg, sample_specs)
-
-        impl = select_kernel(
-            "attention",
-            "decode",
-            ATTN_DECODE_BF16,
-            platform=mi300_platform,
-        )
-        assert impl() == "aiter_decode"
-
-    def test_amd_mi350_platform_selects_aiter(self, sample_specs, mi350_platform):
+    def test_amd_platform_selects_aiter(self, sample_specs, mi350_platform):
         reg = KernelRegistry.get()
         register_all_samples(reg, sample_specs)
 
@@ -1354,6 +1342,7 @@ class TestGemmDispatchProfiling:
             *,
             alpha: torch.Tensor | None = None,
             block_size: list[int] | None = None,
+            out: torch.Tensor | None = None,
         ) -> torch.Tensor:
             _ = A_scales, B_scales, alpha, block_size
             call_log.append(name)
@@ -1428,6 +1417,7 @@ class TestGemmDispatchProfiling:
                     "M": 4,
                     "N": 6,
                     "K": 8,
+                    "has_out": False,
                 },
             )
         ]
@@ -1465,6 +1455,7 @@ class TestGemmDispatchProfiling:
                     "M": 4,
                     "N": 6,
                     "K": 8,
+                    "has_out": False,
                 },
             )
         ]

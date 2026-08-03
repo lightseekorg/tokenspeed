@@ -1,0 +1,480 @@
+"""Kimi-K3 config + registration wiring tests (cheap, no GPU).
+
+Covers the parts landed in the Kimi-K3 model-registration change: the
+``KimiLinearConfig`` mixed-layer protocol (consumed by the hybrid KV-cache
+layer) and the architecture-registration touchpoints (``_CONFIG_REGISTRY``,
+``_MLA_ARCHITECTURES``, ``is_multimodal_model``, ``EntryClass``).
+"""
+
+import os
+import sys
+import unittest
+from types import SimpleNamespace
+from unittest import mock
+
+import torch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=5, suite="runtime-1gpu")
+
+from tokenspeed.runtime.configs.kimi_k3_config import (  # noqa: E402
+    KimiK3Config,
+    KimiK3VisionConfig,
+    KimiLinearConfig,
+)
+from tokenspeed.runtime.configs.paged_cache_spec import (  # noqa: E402
+    FULL_ATTENTION,
+    LINEAR_ATTENTION,
+)
+
+# Checkpoint-derived reference values (moonshotai/kimi-k3).
+_NUM_LAYERS = 93
+_NUM_KDA = 69
+_NUM_MLA = 24
+_KDA_HEADS = 96
+_KDA_HEAD_DIM = 128
+_KDA_CONV = 4
+
+
+class KimiK3ConfigTests(unittest.TestCase):
+    def test_top_level_wraps_text_and_vision(self):
+        cfg = KimiK3Config()
+        self.assertEqual(cfg.model_type, "kimi_k3")
+        self.assertIsInstance(cfg.text_config, KimiLinearConfig)
+        self.assertIsInstance(cfg.vision_config, KimiK3VisionConfig)
+        # hidden_size / vocab_size forward to the text config.
+        self.assertEqual(cfg.hidden_size, cfg.text_config.hidden_size)
+        self.assertEqual(cfg.vocab_size, cfg.text_config.vocab_size)
+
+    def test_dict_subconfigs_are_materialized(self):
+        cfg = KimiK3Config(
+            text_config={"hidden_size": 4096},
+            vision_config={"vt_hidden_size": 512},
+        )
+        self.assertIsInstance(cfg.text_config, KimiLinearConfig)
+        self.assertIsInstance(cfg.vision_config, KimiK3VisionConfig)
+        self.assertEqual(cfg.text_config.hidden_size, 4096)
+        self.assertEqual(cfg.vision_config.vt_hidden_size, 512)
+
+    def test_vision_text_hidden_forced_to_text_hidden(self):
+        # The projector must emit the text hidden size, overriding any value
+        # supplied in vision_config.
+        cfg = KimiK3Config(
+            text_config={"hidden_size": 4096},
+            vision_config={"text_hidden_size": 1234},
+        )
+        self.assertEqual(cfg.vision_config.text_hidden_size, 4096)
+
+    def test_layer_partition_is_exact(self):
+        la = KimiLinearConfig().linear_attn_config
+        kda = set(la["kda_layers"])
+        full = set(la["full_attn_layers"])
+        self.assertEqual(len(kda), _NUM_KDA)
+        self.assertEqual(len(full), _NUM_MLA)
+        # 1-based, no overlap, exact cover of 1..N.
+        self.assertEqual(kda & full, set())
+        self.assertEqual(kda | full, set(range(1, _NUM_LAYERS + 1)))
+
+    def test_is_kda_layer_matches_config(self):
+        c = KimiLinearConfig()
+        kda = set(c.linear_attn_config["kda_layers"])
+        for i in range(c.num_hidden_layers):
+            self.assertEqual(c.is_kda_layer(i), (i + 1) in kda)
+
+    def test_layers_block_type_and_ids(self):
+        c = KimiLinearConfig()
+        lbt = c.layers_block_type
+        self.assertEqual(len(lbt), _NUM_LAYERS)
+        self.assertEqual(set(lbt), {"attention", "linear_attention"})
+        self.assertEqual(len(c.linear_layer_ids), _NUM_KDA)
+        self.assertEqual(len(c.full_attention_layer_ids), _NUM_MLA)
+        # 0-based full-attention ids == (1-based full_attn_layers - 1).
+        self.assertEqual(
+            c.full_attention_layer_ids,
+            sorted(x - 1 for x in c.linear_attn_config["full_attn_layers"]),
+        )
+
+    def test_layer_types_translate_full_attention(self):
+        c = KimiLinearConfig()
+        self.assertEqual(set(c.layer_types), {FULL_ATTENTION, LINEAR_ATTENTION})
+        for block_type, cache_label in zip(c.layers_block_type, c.layer_types):
+            if block_type == "attention":
+                self.assertEqual(cache_label, FULL_ATTENTION)
+            else:
+                self.assertEqual(cache_label, block_type)
+
+    def test_mamba2_cache_params_shapes(self):
+        c = KimiLinearConfig()
+        fake_mapping = SimpleNamespace(attn=SimpleNamespace(tp_size=1))
+        import tokenspeed.runtime.utils.env as env_mod
+
+        with mock.patch.dict(
+            env_mod.global_server_args_dict, {"mapping": fake_mapping}
+        ):
+            (
+                conv_shape,
+                temporal_shape,
+                conv_dtype,
+                ssm_dtype,
+                mamba_layers,
+            ) = c.mamba2_cache_params
+
+        # conv over q/k/v (3 * num_heads * head_dim) wide, kernel_size - 1 deep.
+        self.assertEqual(conv_shape, (3 * _KDA_HEADS * _KDA_HEAD_DIM, _KDA_CONV - 1))
+        # per-head (head_dim x head_dim) recurrent state.
+        self.assertEqual(temporal_shape, (_KDA_HEADS, _KDA_HEAD_DIM, _KDA_HEAD_DIM))
+        self.assertEqual(conv_dtype, torch.bfloat16)
+        self.assertEqual(ssm_dtype, torch.float32)
+        self.assertEqual(mamba_layers, c.linear_layer_ids)
+
+    def test_mamba2_cache_params_respects_tp(self):
+        c = KimiLinearConfig()
+        fake_mapping = SimpleNamespace(attn=SimpleNamespace(tp_size=4))
+        import tokenspeed.runtime.utils.env as env_mod
+
+        with mock.patch.dict(
+            env_mod.global_server_args_dict, {"mapping": fake_mapping}
+        ):
+            conv_shape, temporal_shape, *_ = c.mamba2_cache_params
+
+        self.assertEqual(
+            conv_shape, (3 * _KDA_HEADS * _KDA_HEAD_DIM // 4, _KDA_CONV - 1)
+        )
+        self.assertEqual(
+            temporal_shape, (_KDA_HEADS // 4, _KDA_HEAD_DIM, _KDA_HEAD_DIM)
+        )
+
+
+class KimiK3RegistrationTests(unittest.TestCase):
+    def test_shared_projection_preserves_direct_write_output(self):
+        import tokenspeed.runtime.models.kimi_k3 as kimi_k3
+
+        class FakeMergedLinear(torch.nn.Module):
+            def __init__(self, *args, **kwargs):
+                super().__init__()
+                self.weight = torch.empty(
+                    1536, 7168, dtype=torch.bfloat16, device="meta"
+                )
+
+        class FakeRowLinear(torch.nn.Module):
+            def __init__(self, *args, **kwargs):
+                super().__init__()
+                self.weight = torch.empty(
+                    7168, 768, dtype=torch.bfloat16, device="meta"
+                )
+                self.reduce_results = kwargs["reduce_results"]
+                self.tp_size = kwargs["tp_size"]
+                self.tp_group = kwargs["tp_group"]
+
+        mapping = SimpleNamespace(
+            moe=SimpleNamespace(
+                tp_ep_rank=0,
+                tp_ep_size=8,
+                tp_ep_group=tuple(range(8)),
+            )
+        )
+        activated = torch.empty(2, 768, dtype=torch.bfloat16)
+        down_out = torch.empty(2, 7168, dtype=torch.bfloat16)
+        with (
+            mock.patch.object(kimi_k3, "MergedColumnParallelLinear", FakeMergedLinear),
+            mock.patch.object(kimi_k3, "RowParallelLinear", FakeRowLinear),
+            mock.patch.object(
+                kimi_k3,
+                "kimi3_shared_situ_projection",
+                return_value=activated,
+            ),
+            mock.patch.object(
+                kimi_k3,
+                "kimi3_shared_down_projection",
+                return_value=down_out,
+            ) as shared_down,
+        ):
+            layer = kimi_k3.KimiLinearMLP(
+                hidden_size=7168,
+                intermediate_size=6144,
+                mapping=mapping,
+                quant_config=None,
+                prefix="shared_experts",
+                reduce_results=False,
+                is_shared_expert=True,
+            )
+            actual = layer(
+                torch.empty(2, 7168, dtype=torch.bfloat16),
+                down_out=down_out,
+            )
+
+        self.assertIs(actual, down_out)
+        shared_down.assert_called_once_with(
+            activated,
+            layer.down_proj.weight,
+            out=down_out,
+        )
+
+    def test_kda_stacks_qkvfab_projection_weights(self):
+        from tokenspeed.runtime.models.kimi_k3 import KimiLinearKDA
+
+        config = KimiLinearConfig(
+            hidden_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            linear_attn_config={
+                "kda_layers": [1],
+                "full_attn_layers": [],
+                "num_heads": 4,
+                "head_dim": 16,
+                "short_conv_kernel_size": 4,
+                "gate_lower_bound": -5.0,
+                "use_full_rank_gate": True,
+            },
+        )
+        mapping = SimpleNamespace(
+            attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,))
+        )
+        layer = KimiLinearKDA(config, mapping, layer_id=0)
+
+        self.assertEqual(tuple(layer.qkvgb_proj.weight.shape), (288, 64))
+        for value, shard_id in enumerate(("q", "k", "v", "g"), start=1):
+            loaded = torch.full((64, 64), float(value), dtype=torch.bfloat16)
+            layer.qkvgb_proj.weight.weight_loader(
+                layer.qkvgb_proj.weight,
+                loaded,
+                shard_id,
+            )
+        f_a_weight = torch.full((16, 64), 5.0, dtype=torch.bfloat16)
+        beta_weight = torch.full((4, 64), 6.0, dtype=torch.bfloat16)
+        layer.qkvgb_proj.weight.weight_loader(
+            layer.qkvgb_proj.weight,
+            f_a_weight,
+            "f_a",
+        )
+        layer.qkvgb_proj.weight.weight_loader(
+            layer.qkvgb_proj.weight,
+            beta_weight,
+            "b",
+        )
+
+        hidden_states = torch.randn(4, 64, dtype=torch.bfloat16)
+        expected_qkvg = [
+            torch.nn.functional.linear(
+                hidden_states,
+                layer.qkvgb_proj.weight[index * 64 : (index + 1) * 64],
+            )
+            for index in range(4)
+        ]
+        mixed_qkv, gate, f_a, beta = layer._project_qkvfab(hidden_states)
+        self.assertTrue(torch.equal(mixed_qkv, torch.cat(expected_qkvg[:3], dim=-1)))
+        self.assertTrue(torch.equal(gate, expected_qkvg[3]))
+        self.assertTrue(
+            torch.equal(f_a, torch.nn.functional.linear(hidden_states, f_a_weight))
+        )
+        torch.testing.assert_close(
+            beta,
+            torch.nn.functional.linear(hidden_states, beta_weight),
+        )
+        self.assertTrue(mixed_qkv.is_contiguous())
+
+    def test_ep_kimi_moe_combines_shared_and_routed_reductions(self):
+        import tokenspeed.runtime.models.kimi_k3 as kimi_k3
+
+        shared_calls = []
+
+        class FakeLinear(torch.nn.Module):
+            def __init__(self, *args, **kwargs):
+                super().__init__()
+
+        class FakeExperts(torch.nn.Module):
+            def __init__(self, *args, **kwargs):
+                super().__init__()
+                self.support_routing = False
+
+        class FakeSharedExperts(torch.nn.Module):
+            def __init__(self, *args, **kwargs):
+                super().__init__()
+                shared_calls.append(kwargs)
+
+        class FakeLatentMoE(torch.nn.Module):
+            def __init__(self, **kwargs):
+                super().__init__()
+                self.components = kwargs
+
+        ep_group = tuple(range(8))
+        mapping = SimpleNamespace(
+            moe=SimpleNamespace(
+                tp_rank=0,
+                tp_size=1,
+                tp_group=(0,),
+                ep_rank=0,
+                ep_size=8,
+                ep_group=ep_group,
+                tp_ep_size=8,
+                tp_ep_rank=0,
+                tp_ep_group=ep_group,
+            )
+        )
+        config = KimiLinearConfig(
+            hidden_size=64,
+            routed_expert_hidden_size=32,
+            moe_intermediate_size=32,
+            num_experts=8,
+            num_experts_per_token=2,
+            num_shared_experts=1,
+        )
+
+        with (
+            mock.patch.object(kimi_k3, "ReplicatedLinear", FakeLinear),
+            mock.patch.object(
+                kimi_k3,
+                "Kimi3LatentProjection",
+                side_effect=lambda *args, **kwargs: FakeLinear(),
+            ),
+            mock.patch.object(kimi_k3, "MoELayer", FakeExperts),
+            mock.patch.object(kimi_k3, "KimiLinearMLP", FakeSharedExperts),
+            mock.patch.object(kimi_k3, "LatentMoELayer", FakeLatentMoE),
+            mock.patch.object(
+                kimi_k3.Kimi3MoEExecutionPlan,
+                "build",
+                return_value=kimi_k3.Kimi3MoEExecutionPlan(
+                    use_native=True,
+                    use_trtllm=False,
+                    overlap_shared_experts=False,
+                    joint_moe_reduce=True,
+                ),
+            ),
+            mock.patch.dict(
+                kimi_k3.global_server_args_dict,
+                {"enforce_eager": False},
+            ),
+        ):
+            layer = kimi_k3.KimiLinearMoE(
+                config,
+                mapping,
+                quant_config=None,
+                layer_index=1,
+                prefix="model.layers.1.block_sparse_moe",
+            )
+
+        self.assertFalse(shared_calls[0]["reduce_results"])
+        joint_reduce = layer.native_latent_moe.components["joint_reduce"]
+        self.assertIs(joint_reduce.func, kimi_k3.all_reduce_two)
+        self.assertEqual(joint_reduce.keywords, {"group": ep_group})
+
+    def test_mla_gate_projection_splits_prefill_and_fuses_decode(self):
+        from tokenspeed.runtime.models.kimi_k3 import KimiLinearMLAAttention
+
+        class FakeProjection(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.arange(50.0).reshape(10, 5))
+                self.calls = 0
+
+            def forward(self, hidden, block_scale, output_dtype):
+                self.calls += 1
+                return torch.nn.functional.linear(hidden, self.weight)
+
+        class IdentityComm:
+            @staticmethod
+            def pre_attn_comm(value, ctx):
+                return value
+
+        class CopyNorm(torch.nn.Module):
+            def forward(self, *, input_q_a, input_kv_a, output_q_a):
+                output_q_a.copy_(input_q_a)
+
+        class IdentityQProjection(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.eye(2))
+
+            def forward(self, value):
+                return torch.nn.functional.linear(value, self.weight), None
+
+        attention = KimiLinearMLAAttention.__new__(KimiLinearMLAAttention)
+        torch.nn.Module.__init__(attention)
+        attention.q_lora_rank = 2
+        attention.kv_lora_rank = 3
+        attention.qk_rope_head_dim = 1
+        attention._qkv_a_width = 6
+        attention._gate_width = 4
+        attention.fused_qkv_a_proj_with_mqa = FakeProjection()
+        attention.fused_qk_layernorm = CopyNorm()
+        attention.q_b_proj = IdentityQProjection()
+        comm = IdentityComm()
+
+        prefill = torch.ones(33, 5)
+        q, latent, gate = attention._project_q_latent_gated(prefill, None, comm, None)
+        expected = torch.nn.functional.linear(
+            prefill, attention.fused_qkv_a_proj_with_mqa.weight
+        )
+        torch.testing.assert_close(q, expected[:, :2])
+        torch.testing.assert_close(latent, expected[:, 2:6])
+        torch.testing.assert_close(gate, expected[:, 6:])
+        self.assertEqual(attention.fused_qkv_a_proj_with_mqa.calls, 0)
+
+        attention._project_q_latent_gated(prefill[:1], None, comm, None)
+        # Decode routes through the registered GEMV using the packed weight
+        # directly, so neither branch materializes the projection module.
+        self.assertEqual(attention.fused_qkv_a_proj_with_mqa.calls, 0)
+
+    def test_config_registry_maps_model_type(self):
+        from tokenspeed.runtime.utils.hf_transformers_utils import _CONFIG_REGISTRY
+
+        self.assertIs(_CONFIG_REGISTRY.get("kimi_k3"), KimiK3Config)
+
+    def test_resolve_architecture_returns_registered_name(self):
+        from tokenspeed.runtime.utils.hf_transformers_utils import resolve_architecture
+
+        cfg = KimiK3Config(architectures=["KimiK3ForConditionalGeneration"])
+        self.assertEqual(resolve_architecture(cfg), "KimiK3ForConditionalGeneration")
+
+    def test_mla_and_multimodal_metadata_registered(self):
+        from tokenspeed.runtime.configs import model_config
+
+        self.assertIn("KimiK3ForConditionalGeneration", model_config._MLA_ARCHITECTURES)
+        self.assertTrue(
+            model_config.is_multimodal_model(["KimiK3ForConditionalGeneration"])
+        )
+
+    def test_entryclass_resolves_in_model_registry(self):
+        from tokenspeed.runtime.models.kimi_k3 import (
+            KimiK3ForConditionalGeneration,
+        )
+        from tokenspeed.runtime.models.registry import ModelRegistry
+
+        cls, arch = ModelRegistry.resolve_model_cls(["KimiK3ForConditionalGeneration"])
+        self.assertIs(cls, KimiK3ForConditionalGeneration)
+        self.assertEqual(arch, "KimiK3ForConditionalGeneration")
+
+    def test_text_only_wrapper_streams_and_discards_vision_weights(self):
+        from tokenspeed.runtime.models.kimi_k3 import KimiK3ForConditionalGeneration
+
+        class _Recorder:
+            def __init__(self):
+                self.weights = None
+
+            def load_weights(self, weights):
+                self.weights = list(weights)
+
+        language_model = _Recorder()
+        wrapper = SimpleNamespace(language_model=language_model, vision=None)
+        weights = iter(
+            (
+                ("language_model.model.embed_tokens.weight", torch.ones(1)),
+                ("vision_tower.blocks.0.weight", torch.ones(1)),
+                ("mm_projector.weight", torch.ones(1)),
+                ("language_model.lm_head.weight", torch.ones(1)),
+            )
+        )
+
+        KimiK3ForConditionalGeneration.load_weights(wrapper, weights)
+
+        self.assertEqual(
+            [name for name, _ in language_model.weights],
+            ["model.embed_tokens.weight", "lm_head.weight"],
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

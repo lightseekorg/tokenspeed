@@ -35,6 +35,8 @@ from typing import (
 import zmq
 
 from tokenspeed.runtime.engine.io_struct import (
+    DestroyWeightsUpdateGroupReqInput,
+    DestroyWeightsUpdateGroupReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     FlushCacheReqInput,
@@ -153,6 +155,9 @@ class SchedulerControlClient:
         self.init_weights_update_group_communicator = _Communicator(
             self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
         )
+        self.destroy_weights_update_group_communicator = _Communicator(
+            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
+        )
         self.update_weights_from_distributed_communicator = _Communicator(
             self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
         )
@@ -210,6 +215,10 @@ class SchedulerControlClient:
                 (
                     InitWeightsUpdateGroupReqOutput,
                     self.init_weights_update_group_communicator.handle_recv,
+                ),
+                (
+                    DestroyWeightsUpdateGroupReqOutput,
+                    self.destroy_weights_update_group_communicator.handle_recv,
                 ),
                 (
                     UpdateWeightsFromDistributedReqOutput,
@@ -370,6 +379,17 @@ class SchedulerControlClient:
         if self.server_args.mapping.attn.has_dp:
             raise RuntimeError("dp_size must be 1 for init parameter update group")
         result = (await self.init_weights_update_group_communicator(obj))[0]
+        return result.success, result.message
+
+    async def destroy_weights_update_group(
+        self: AsyncLLM,
+        obj: DestroyWeightsUpdateGroupReqInput,
+    ) -> tuple[bool, str]:
+        self.auto_create_handle_loop()
+        assert (
+            not self.server_args.mapping.attn.has_dp
+        ), "dp_size must be 1 for destroy parameter update group"
+        result = (await self.destroy_weights_update_group_communicator(obj))[0]
         return result.success, result.message
 
     async def update_weights_from_distributed(

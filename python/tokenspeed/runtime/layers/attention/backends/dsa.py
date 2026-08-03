@@ -120,8 +120,8 @@ class DSABackend(AttentionBackend):
     def override_num_extends(self, num_extends: int):
         return self._dense_backend.override_num_extends(num_extends)
 
-    def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor):
-        self._dense_backend.init_cuda_graph_state(max_bs, seq_lens_buf)
+    def init_cuda_graph_state(self, max_bs: int):
+        self._dense_backend.init_cuda_graph_state(max_bs)
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -199,7 +199,6 @@ class DSABackend(AttentionBackend):
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
         req_to_page: torch.Tensor,
-        spec_info=None,
         **kwargs,
     ):
         self._dense_backend.init_forward_metadata(
@@ -209,7 +208,6 @@ class DSABackend(AttentionBackend):
             seq_lens=seq_lens,
             forward_mode=forward_mode,
             req_to_page=req_to_page,
-            spec_info=spec_info,
             **kwargs,
         )
         if (

@@ -38,14 +38,347 @@ _ALL_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_ALL_LAYER_GRID_CAP", "32
 _is_nvidia = current_platform().is_nvidia
 
 __all__ = [
+    "copy_state_rows",
     "fused_fp8_set_kv_buffer",
+    "compute_group_decode_locs",
+    "unpack_group_tables",
     "gather_page_table_with_padding",
+    "index_k_block_split_scatter",
+    "quantize_mxfp8_rows",
+    "quantize_store_kv_mxfp8",
     "store_kv_cache",
+    "store_sf_interleaved",
     "transfer_kv_all_layer",
     "transfer_kv_all_layer_mla",
     "transfer_kv_per_layer",
     "transfer_kv_per_layer_mla",
+    "zero_byte_segments",
 ]
+
+
+# -----------------------------------------------------------------------------
+# Cache Page Initialization
+# -----------------------------------------------------------------------------
+
+
+@triton.jit
+def _zero_byte_segments_kernel(
+    backing_ptr,
+    segments_ptr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    segment_id = tl.program_id(0)
+    byte_offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    segment_offset = tl.load(segments_ptr + segment_id * 2)
+    segment_size = tl.load(segments_ptr + segment_id * 2 + 1)
+    tl.store(
+        backing_ptr + segment_offset + byte_offsets,
+        0,
+        mask=byte_offsets < segment_size,
+    )
+
+
+def zero_byte_segments(backing: torch.Tensor, segments: list[tuple[int, int]]) -> None:
+    """Zero selected byte ranges in one contiguous cache allocation.
+
+    Args:
+        backing: Contiguous uint8 cache allocation.
+        segments: ``(byte_offset, byte_count)`` ranges within ``backing``.
+    """
+    if not segments:
+        return
+    if backing.dtype != torch.uint8 or not backing.is_contiguous():
+        raise ValueError("backing must be a contiguous uint8 tensor")
+    if any(
+        offset < 0 or size <= 0 or offset + size > backing.numel()
+        for offset, size in segments
+    ):
+        raise ValueError("segments must be non-empty ranges within backing")
+
+    segment_table = torch.tensor(segments, dtype=torch.int64, device=backing.device)
+    block_size = 1024
+    max_size = max(size for _, size in segments)
+    grid = (len(segments), triton.cdiv(max_size, block_size))
+    _zero_byte_segments_kernel[grid](
+        backing,
+        segment_table,
+        BLOCK_SIZE=block_size,
+        num_warps=4,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Batched state-row copies across per-layer slabs (pointer table)
+# -----------------------------------------------------------------------------
+
+
+@triton.jit
+def _copy_state_rows_kernel(
+    src_addresses_ptr,
+    dst_addresses_ptr,
+    src_strides_ptr,
+    dst_strides_ptr,
+    src_rows_ptr,
+    dst_rows_ptr,
+    rows_per_layer,
+    ROW_I32: tl.constexpr,
+    BLOCK_I32: tl.constexpr,
+):
+    """Copy one state row between two slabs of one layer.
+
+    Row strides are per-layer (int32 units) so page-interleaved ``as_strided``
+    slab views and dense scratch tensors mix freely. A negative source row id
+    stores zeros instead (seed-invalid fill).
+    """
+    work_index = tl.program_id(0)
+    chunk_index = tl.program_id(1)
+    layer_index = work_index // rows_per_layer
+
+    src_address = tl.load(src_addresses_ptr + layer_index)
+    dst_address = tl.load(dst_addresses_ptr + layer_index)
+    src_ptr = tl.cast(src_address, tl.pointer_type(tl.int32))
+    dst_ptr = tl.cast(dst_address, tl.pointer_type(tl.int32))
+    src_stride = tl.load(src_strides_ptr + layer_index)
+    dst_stride = tl.load(dst_strides_ptr + layer_index)
+
+    src_row = tl.load(src_rows_ptr + work_index).to(tl.int64)
+    dst_row = tl.load(dst_rows_ptr + work_index).to(tl.int64)
+
+    offsets = chunk_index * BLOCK_I32 + tl.arange(0, BLOCK_I32)
+    mask = offsets < ROW_I32
+    values = tl.load(
+        src_ptr + src_row * src_stride + offsets.to(tl.int64),
+        mask=mask & (src_row >= 0),
+        other=0,
+    )
+    tl.store(dst_ptr + dst_row * dst_stride + offsets.to(tl.int64), values, mask=mask)
+
+
+def copy_state_rows(
+    src_addresses: torch.Tensor,
+    dst_addresses: torch.Tensor,
+    src_rows: torch.Tensor,
+    dst_rows: torch.Tensor,
+    *,
+    row_bytes: int,
+    src_row_strides: torch.Tensor,
+    dst_row_strides: torch.Tensor,
+) -> None:
+    """Copy state rows between per-layer slab pairs in one Triton launch.
+
+    Replaces per-layer ``dst[dst_rows] = src[src_rows]`` gather/scatter chains
+    (e.g. MTP verify-scratch seeding and post-verify state commit) with a
+    single kernel across all layers of one uniform row size. Per-layer row
+    strides let page-interleaved ``as_strided`` slab views and dense scratch
+    tensors participate on either side.
+
+    Args:
+        src_addresses: CUDA uint64 ``[num_layers]`` base addresses of the
+            source slabs (address of row 0).
+        dst_addresses: CUDA uint64 ``[num_layers]`` destination base addresses.
+        src_rows: CUDA int64 ``[num_layers * rows_per_layer]`` source row ids,
+            layer-major. A negative id zero-fills its destination row.
+        dst_rows: CUDA int64 tensor, same layout, destination row ids.
+        row_bytes: Byte width of the copied row payload (divisible by 4).
+        src_row_strides: CUDA int64 ``[num_layers]`` row-to-row strides of the
+            source slabs in int32 units (``stride_bytes // 4``).
+        dst_row_strides: CUDA int64 ``[num_layers]`` destination row strides in
+            int32 units.
+
+    Returns:
+        None. Rows are copied in place in one launch.
+    """
+    total = src_rows.numel()
+    if total == 0:
+        return
+    num_layers = src_addresses.numel()
+    if num_layers == 0 or total % num_layers:
+        raise ValueError("src_rows must hold rows_per_layer ids per layer")
+    if src_addresses.dtype != torch.uint64 or dst_addresses.dtype != torch.uint64:
+        raise ValueError("slab address tables must have dtype torch.uint64")
+    if src_rows.dtype != torch.int64 or dst_rows.dtype != torch.int64:
+        raise ValueError("row id tensors must have dtype torch.int64")
+    if (
+        src_row_strides.dtype != torch.int64
+        or dst_row_strides.dtype != torch.int64
+        or src_row_strides.numel() != num_layers
+        or dst_row_strides.numel() != num_layers
+    ):
+        raise ValueError("row stride tables must be int64 with one entry per layer")
+    if dst_rows.numel() != total or dst_addresses.numel() != num_layers:
+        raise ValueError("source/destination table sizes must match")
+    if row_bytes <= 0 or row_bytes % 4:
+        raise ValueError("row_bytes must be positive and divisible by 4")
+
+    row_i32 = row_bytes // 4
+    block_i32 = 1024
+    chunks = triton.cdiv(row_i32, block_i32)
+    _copy_state_rows_kernel[(total, chunks)](
+        src_addresses,
+        dst_addresses,
+        src_row_strides,
+        dst_row_strides,
+        src_rows,
+        dst_rows,
+        total // num_layers,
+        ROW_I32=row_i32,
+        BLOCK_I32=block_i32,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Flat hybrid cache page sanitization
+# -----------------------------------------------------------------------------
+
+
+# -----------------------------------------------------------------------------
+# MXFP8 Scale-Factor Scatter (interleaved FA4 atom layout)
+# -----------------------------------------------------------------------------
+
+
+@triton.jit
+def _sf_interleaved_offset(slot, page_tokens, sf_page_stride):
+    """Head-0 offset (u32 words) of ``slot``'s packed-SF word.
+
+    Page-major: page ``slot // page_tokens`` at ``sf_page_stride`` words
+    apart; within the page, the slot's 128-row chunk, then the
+    BlockScaledBasicChunk position ``(row % 32) * 4 + row // 32``.
+    Callers add ``h * chunks_per_page * 128`` for head ``h``.
+    """
+    page_idx = slot // page_tokens
+    page_off = slot % page_tokens
+    chunk_idx = page_off // 128
+    row = page_off % 128
+    interleaved = chunk_idx * 128 + (row % 32) * 4 + (row // 32)
+    return page_idx * sf_page_stride + interleaved
+
+
+@triton.jit
+def _mxfp8_quantize_row(x, HEAD_DIM: tl.constexpr):
+    """Quantize one [HEAD_DIM] row to MXFP8 (flashinfer bit-parity).
+
+    Per 32-element group: amax -> ``e8m0 = clamp(ceil(log2(amax / 448)),
+    -127, 127) + 127`` and ``fp8 = rn(x * 2^-exp)`` (zero groups quantize
+    to exponent -127, data 0). Returns ``(q8, packed_sf)``: the fp8-e4m3
+    bits as u8 and the HEAD_DIM // 32 e8m0 bytes packed little-endian in
+    one u32.
+    """
+    xf = x.to(tl.float32)
+    # Per-32 groups: amax -> e8m0 exponent (flashinfer rounding).
+    g = tl.reshape(tl.abs(xf), (HEAD_DIM // 32, 32))
+    amax = tl.max(g, axis=1)
+    exp = tl.ceil(tl.log2(amax / 448.0))
+    exp = tl.clamp(exp, -127.0, 127.0)
+    exp = tl.where(amax > 0, exp, -127.0)
+    sf_bytes = (exp + 127.0).to(tl.uint32)  # [HEAD_DIM // 32]
+    # Quantize: x * 2^-exp, RN to e4m3.
+    scale = tl.exp2(-exp)  # [HEAD_DIM // 32]
+    q = tl.reshape(tl.reshape(xf, (HEAD_DIM // 32, 32)) * scale[:, None], (HEAD_DIM,))
+    q8 = q.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+    # Pack the e8m0 bytes little-endian into one u32.
+    idx = tl.arange(0, HEAD_DIM // 32)
+    packed = tl.sum(sf_bytes << (8 * idx))
+    return q8, packed
+
+
+@triton.jit
+def _store_sf_interleaved_kernel(
+    sf_in_ptr,
+    sf_out_ptr,
+    loc_ptr,
+    num_tokens,
+    nheads: tl.constexpr,
+    page_size: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    """Scatter per-token MXFP8 scale rows into the FA4 interleaved layout.
+
+    Input is viewed as [num_tokens, nheads] of u32 (4 packed e8m0 scales,
+    i.e. head_dim 128 at one scale per 32 elements). Output is
+    [num_pages, nheads, page_size // 128, 128] of u32: pages hold
+    ``page_size // 128`` consecutive 128-row chunks per head (the
+    tile_to_shape order the blockscaled kernel derives for k*128-token
+    paged TMA), and within a chunk row ``r`` lands at
+    ``(r % 32) * 4 + (r // 32)`` — the BlockScaledBasicChunk (32, 4, 4)
+    atom loaded directly under ``kv_sf_interleaved``.
+    """
+    pid = tl.program_id(0)
+    tok_offsets = pid * BLOCK_T + tl.arange(0, BLOCK_T)
+    mask = tok_offsets < num_tokens
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+
+    slots = tl.load(loc_ptr + tok_offsets, mask=mask, other=0).to(tl.int64)
+    chunks_per_page: tl.constexpr = page_size // 128
+    page_stride: tl.constexpr = nheads * chunks_per_page * 128
+    sf_base = _sf_interleaved_offset(slots, page_size, page_stride)
+
+    for h in tl.static_range(nheads):
+        vals = tl.load(sf_in_ptr + tok_offsets * nheads + h, mask=mask, other=0)
+        tl.store(sf_out_ptr + sf_base + h * chunks_per_page * 128, vals, mask=mask)
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+def store_sf_interleaved(
+    sf_in: torch.Tensor,
+    sf_out: torch.Tensor,
+    loc: torch.Tensor,
+    page_size: int = 128,
+    enable_pdl: bool = False,
+) -> None:
+    """Scatter per-token MXFP8 scale factors into the interleaved page layout.
+
+    Args:
+        sf_in: Per-token scales with shape [num_tokens, num_kv_heads, 4]
+            in float8_e8m0fnu (head_dim 128, one scale per 32 elements).
+        sf_out: Paged scale buffer in float8_e8m0fnu with shape
+            [num_pages, num_kv_heads, 32, 4, 4] (page_size 128) or
+            [num_pages, num_kv_heads, page_size // 128, 32, 4, 4]
+            (page_size = k*128), laid out as consecutive
+            BlockScaledBasicChunk atoms per head — what the blockscaled
+            kernel's paged TMA consumes under ``kv_sf_interleaved``.
+        loc: Destination slot index per token, shape [num_tokens], integer.
+        page_size: Tokens per page; must be a multiple of 128.
+        enable_pdl: Launch with Programmatic Dependent Launch (Hopper+).
+    """
+    assert (
+        page_size % 128 == 0
+    ), f"interleaved SF layout requires page_size % 128 == 0, got {page_size}"
+    num_tokens, nheads, sf_dim = sf_in.shape
+    assert sf_dim == 4, f"expected sf_dim=4 (head_dim 128 / 32), got {sf_dim}"
+    if num_tokens == 0:
+        return
+
+    sf_in_u32 = (
+        sf_in.view(torch.uint8)
+        .reshape(num_tokens, nheads, 4)
+        .contiguous()
+        .view(torch.int32)
+        .reshape(num_tokens, nheads)
+    )
+    sf_out_u32 = sf_out.view(torch.uint8).reshape(-1, 4).view(torch.int32).reshape(-1)
+
+    BLOCK_T = 128
+    grid = ((num_tokens + BLOCK_T - 1) // BLOCK_T,)
+    use_pdl = bool(enable_pdl and _is_nvidia)
+    kwargs = {}
+    if use_pdl:
+        kwargs["launch_pdl"] = True
+    _store_sf_interleaved_kernel[grid](
+        sf_in_u32,
+        sf_out_u32,
+        loc,
+        num_tokens,
+        nheads=nheads,
+        page_size=page_size,
+        BLOCK_T=BLOCK_T,
+        ENABLE_PDL=use_pdl,
+        **kwargs,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -66,6 +399,7 @@ def _store_kv_cache_kernel(
     v_dst_row_stride,
     n_kv_per_token: tl.constexpr,
     BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     """Scatter rows of k_src/v_src into k_dst/v_dst at indices loc_ptr.
 
@@ -75,10 +409,13 @@ def _store_kv_cache_kernel(
     """
     is_v = tl.program_id(0)
     row = tl.program_id(1)
-
-    dst_row = tl.load(loc_ptr + row).to(tl.int64)
     offsets = tl.arange(0, BLOCK)
     mask = offsets < n_kv_per_token
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+
+    dst_row = tl.load(loc_ptr + row).to(tl.int64)
 
     if is_v == 1:
         src = tl.load(
@@ -91,6 +428,9 @@ def _store_kv_cache_kernel(
         )
         tl.store(k_dst_ptr + dst_row * k_dst_row_stride + offsets, src, mask=mask)
 
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
 
 def store_kv_cache(
     k_src: torch.Tensor,
@@ -98,6 +438,7 @@ def store_kv_cache(
     k_dst: torch.Tensor,
     v_dst: torch.Tensor,
     loc: torch.Tensor,
+    enable_pdl: bool = False,
 ) -> None:
     """Fused per-token KV cache scatter for one layer.
 
@@ -106,6 +447,10 @@ def store_kv_cache(
     be contiguous (stride == 1); the leading axis may have any stride — this
     lets src tensors come from a qkv-split view directly (no contiguous copy
     required).
+
+    ``enable_pdl`` launches with Programmatic Dependent Launch (Hopper+):
+    the kernel waits for its producer before the first load and signals
+    dependents after its last store.
     """
     n_tokens = k_src.shape[0]
     if n_tokens == 0:
@@ -124,6 +469,10 @@ def store_kv_cache(
     v_dst_stride = v_dst.stride(0) if v_dst.dim() > 1 else v_dst.shape[-1]
 
     block = triton.next_power_of_2(n_kv_k)
+    use_pdl = bool(enable_pdl and _is_nvidia)
+    kwargs = {}
+    if use_pdl:
+        kwargs["launch_pdl"] = True
     _store_kv_cache_kernel[(2, n_tokens)](
         k_src,
         v_src,
@@ -136,6 +485,8 @@ def store_kv_cache(
         v_dst_stride,
         n_kv_k,
         BLOCK=block,
+        ENABLE_PDL=use_pdl,
+        **kwargs,
     )
 
 
@@ -229,10 +580,14 @@ def _fused_fp8_set_kv_buffer_kernel(
     v_cache_stride_dim: tl.constexpr,
     BLOCK_HEAD: tl.constexpr,
     BLOCK_DIM: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     token_id = tl.program_id(0)
     head_block_id = tl.program_id(1)
     kv_idx = tl.program_id(2)
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
 
     cache_loc = tl.load(cache_loc_ptr + token_id).to(tl.int64)
     page_id = cache_loc // page_size
@@ -291,6 +646,9 @@ def _fused_fp8_set_kv_buffer_kernel(
             BLOCK_DIM,
         )
 
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
 
 def fused_fp8_set_kv_buffer(
     k: torch.Tensor,
@@ -301,6 +659,7 @@ def fused_fp8_set_kv_buffer(
     k_scale: float | torch.Tensor | None = None,
     v_scale: float | torch.Tensor | None = None,
     page_size: int = 16,
+    enable_pdl: bool = False,
 ) -> None:
     """Quantize K/V tensors to FP8 and scatter them into a paged KV cache.
 
@@ -319,6 +678,8 @@ def fused_fp8_set_kv_buffer(
         v_scale: Optional scalar V scale. When provided with ``k_scale``, V is
             divided by this scale before FP8 conversion.
         page_size: Number of tokens per cache page.
+        enable_pdl: Request Programmatic Dependent Launch (SM90+); no-op on
+            non-NVIDIA platforms.
     """
     num_tokens = k.shape[0]
     if num_tokens == 0:
@@ -402,6 +763,11 @@ def fused_fp8_set_kv_buffer(
         inv_k_scale_ptr = k_3d
         inv_v_scale_ptr = k_3d
 
+    use_pdl = bool(enable_pdl and _is_nvidia)
+    kwargs = {}
+    if use_pdl:
+        kwargs["launch_pdl"] = True
+
     _fused_fp8_set_kv_buffer_kernel[grid](
         k_3d,
         v_3d,
@@ -430,6 +796,8 @@ def fused_fp8_set_kv_buffer(
         v_cache_stride_dim,
         BLOCK_HEAD=block_head,
         BLOCK_DIM=block_dim,
+        ENABLE_PDL=use_pdl,
+        **kwargs,
     )
 
 
@@ -1074,4 +1442,475 @@ def transfer_kv_all_layer(
         NUM_CHUNKS=num_chunks,
         num_warps=1,
         num_stages=1,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Fused MXFP8 quantize + KV store + SF scatter (one launch per decode store)
+# -----------------------------------------------------------------------------
+
+
+@triton.jit
+def _quantize_store_kv_mxfp8_kernel(
+    k_src_ptr,  # [T, H*D] bf16
+    v_src_ptr,
+    k_dst_ptr,  # fp8 slab rows as u8, row = loc
+    v_dst_ptr,
+    k_sf_ptr,  # SF slabs as u32 (4 packed e8m0), interleaved atom layout
+    v_sf_ptr,
+    loc_ptr,
+    k_src_token_stride,
+    v_src_token_stride,
+    k_dst_row_stride,
+    v_dst_row_stride,
+    sf_page_stride,  # nheads * chunks_per_page * 128 (u32 units)
+    page_tokens,  # tokens per page of this layer's group
+    nheads: tl.constexpr,
+    HEAD_DIM: tl.constexpr,  # 128
+    ENABLE_PDL: tl.constexpr,
+):
+    """Quantize one token's K or V row to MXFP8 and store data + scales.
+
+    Replaces the five-launch sequence (k/v quantize_mxfp8, store_kv_cache,
+    2x store_sf_interleaved) with one launch. Bit-parity contract with
+    flashinfer's mxfp8_quantize: per 32-element group,
+    ``e8m0 = clamp(ceil(log2(amax / 448)), -127, 127) + 127`` and
+    ``fp8 = rn(x * 2^-exp)`` (zero rows quantize to exponent -127, data 0).
+    SF layout matches _store_sf_interleaved_kernel: page-major, per-head
+    chunks_per_page consecutive 128-row BlockScaledBasicChunk atoms,
+    row -> (row % 32) * 4 + row // 32, 4 head_dim-group bytes packed
+    little-endian in one u32.
+    """
+    is_v = tl.program_id(0)
+    tok = tl.program_id(1)
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+
+    slot = tl.load(loc_ptr + tok).to(tl.int64)
+    d_off = tl.arange(0, HEAD_DIM)  # one head row at a time
+
+    chunks_per_page = page_tokens // 128
+    sf_base = _sf_interleaved_offset(slot, page_tokens, sf_page_stride)
+
+    for h in tl.static_range(nheads):
+        if is_v == 1:
+            x = tl.load(v_src_ptr + tok * v_src_token_stride + h * HEAD_DIM + d_off)
+        else:
+            x = tl.load(k_src_ptr + tok * k_src_token_stride + h * HEAD_DIM + d_off)
+        q8, packed = _mxfp8_quantize_row(x, HEAD_DIM)
+        if is_v == 1:
+            tl.store(v_dst_ptr + slot * v_dst_row_stride + h * HEAD_DIM + d_off, q8)
+        else:
+            tl.store(k_dst_ptr + slot * k_dst_row_stride + h * HEAD_DIM + d_off, q8)
+        # Scatter the packed-SF u32 into the interleaved slab.
+        sf_out_off = sf_base + h * chunks_per_page * 128
+        if is_v == 1:
+            tl.store(v_sf_ptr + sf_out_off, packed)
+        else:
+            tl.store(k_sf_ptr + sf_out_off, packed)
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+def quantize_store_kv_mxfp8(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_dst: torch.Tensor,
+    v_dst: torch.Tensor,
+    k_sf: torch.Tensor,
+    v_sf: torch.Tensor,
+    loc: torch.Tensor,
+    page_tokens: int = 128,
+    enable_pdl: bool = False,
+) -> None:
+    """Fused per-token MXFP8 quantize + KV data store + interleaved SF store.
+
+    Args:
+        k, v: Per-token bf16 rows, [T, H, 128] or [T, H * 128]; the leading
+            axis may be strided, the trailing element stride must be 1.
+        k_dst, v_dst: fp8-e4m3 slab row views (the same per-layer views
+            ``set_kv_buffer`` targets); rows are addressed by ``loc``.
+        k_sf, v_sf: e8m0 scale slabs in the interleaved atom layout of
+            ``store_sf_interleaved`` for this layer's ``page_tokens``.
+        loc: [T] destination row per token (layer-view row units).
+        page_tokens: Tokens per page of the layer's group (multiple of 128).
+        enable_pdl: Launch with Programmatic Dependent Launch (Hopper+).
+    """
+    assert page_tokens % 128 == 0
+    t = k.shape[0]
+    if t == 0:
+        return
+    head_dim = 128
+    nheads = k.numel() // (t * head_dim)
+    assert k.stride(-1) == 1 and v.stride(-1) == 1
+    k2 = k.reshape(t, nheads * head_dim)
+    v2 = v.reshape(t, nheads * head_dim)
+    k_dst_u8 = k_dst.reshape(k_dst.shape[0], -1).view(torch.uint8)
+    v_dst_u8 = v_dst.reshape(v_dst.shape[0], -1).view(torch.uint8)
+    k_sf_u32 = k_sf.view(torch.uint8).reshape(-1, 4).view(torch.int32).reshape(-1)
+    v_sf_u32 = v_sf.view(torch.uint8).reshape(-1, 4).view(torch.int32).reshape(-1)
+    chunks_per_page = page_tokens // 128
+    sf_page_stride = nheads * chunks_per_page * 128
+
+    grid = (2, t)
+    use_pdl = bool(enable_pdl and _is_nvidia)
+    kwargs = {}
+    if use_pdl:
+        kwargs["launch_pdl"] = True
+    _quantize_store_kv_mxfp8_kernel[grid](
+        k2,
+        v2,
+        k_dst_u8,
+        v_dst_u8,
+        k_sf_u32,
+        v_sf_u32,
+        loc,
+        k2.stride(0),
+        v2.stride(0),
+        k_dst_u8.stride(0),
+        v_dst_u8.stride(0),
+        sf_page_stride,
+        page_tokens,
+        nheads=nheads,
+        HEAD_DIM=head_dim,
+        ENABLE_PDL=use_pdl,
+        **kwargs,
+    )
+
+
+@triton.jit
+def _quantize_mxfp8_rows_kernel(
+    x_ptr,  # [R, 128] bf16 rows (R = tokens * heads)
+    data_ptr,  # [R, 128] u8 (fp8-e4m3 storage)
+    sf_ptr,  # [R] u32 (4 packed e8m0 bytes)
+    x_row_stride,
+    HEAD_DIM: tl.constexpr,
+    ROWS_PER_PROG: tl.constexpr,
+    R,
+    ENABLE_PDL: tl.constexpr,
+):
+    """Per-row MXFP8 quantize (bit-parity with flashinfer mxfp8_quantize),
+    PDL-capable so it keeps the qk_rmsnorm -> shear -> fwd chain intact."""
+    pid = tl.program_id(0)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+    d_off = tl.arange(0, HEAD_DIM)
+    for i in tl.static_range(ROWS_PER_PROG):
+        row = pid * ROWS_PER_PROG + i
+        if row < R:
+            x = tl.load(x_ptr + row * x_row_stride + d_off)
+            q8, packed = _mxfp8_quantize_row(x, HEAD_DIM)
+            tl.store(data_ptr + row * HEAD_DIM + d_off, q8)
+            tl.store(sf_ptr + row, packed)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+def quantize_mxfp8_rows(
+    x: torch.Tensor,
+    enable_pdl: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """MXFP8-quantize [R, 128] rows: (fp8-e4m3 [R, 128], e8m0 [R, 4]).
+
+    PDL-capable row quantizer intended for the decode-Q fusion follow-up
+    (inkling_mxfp8_attn.md); parity-tested against flashinfer's
+    mxfp8_quantize, no runtime caller yet.
+    """
+    r, d = x.shape
+    assert d == 128 and x.stride(-1) == 1
+    data = torch.empty(r, d, dtype=torch.float8_e4m3fn, device=x.device)
+    sf = torch.empty(r, 4, dtype=torch.uint8, device=x.device)
+    if r == 0:
+        return data, sf
+    rows_per_prog = 4
+    grid = ((r + rows_per_prog - 1) // rows_per_prog,)
+    use_pdl = bool(enable_pdl and _is_nvidia)
+    kwargs = {}
+    if use_pdl:
+        kwargs["launch_pdl"] = True
+    _quantize_mxfp8_rows_kernel[grid](
+        x,
+        data.view(torch.uint8),
+        sf.view(torch.int32).reshape(-1),
+        x.stride(0),
+        HEAD_DIM=d,
+        ROWS_PER_PROG=rows_per_prog,
+        R=r,
+        ENABLE_PDL=use_pdl,
+        **kwargs,
+    )
+    return data, sf
+
+
+@triton.jit
+def _compute_group_decode_locs_kernel(
+    tab_ptr,  # [G, max_bs, Wmax] int32 stacked group tables
+    ps_ptr,  # [G] int32 page size per group
+    seq_ptr,  # [bs] int32 current lengths (incl. the newest token)
+    out_ptr,  # [G, >= bs*N] int32 write locs (token-major per request)
+    stride_g,
+    stride_b,
+    out_stride_g,
+    num_rows,  # bs * N live output rows per group
+    N,  # tokens per request
+    BLOCK_B: tl.constexpr,
+):
+    """All groups' decode write locs in one launch. Row i = b*N + t maps to
+    position seq[b] - N + t (clamped at 0 for graph-padded rows, which
+    dereference the dummy page harmlessly): loc = table[g, b, pos//ps] * ps
+    + pos % ps. N = 1 is plain decode (pos = seq-1); N > 1 is the spec
+    verify layout. Replaces the per-group python gather/mul/mod chains
+    between graph replays."""
+    g = tl.program_id(0)
+    i = tl.program_id(1) * BLOCK_B + tl.arange(0, BLOCK_B)
+    mask = i < num_rows
+    b = i // N
+    t = i - b * N
+    ps = tl.load(ps_ptr + g).to(tl.int64)
+    seq = tl.load(seq_ptr + b, mask=mask, other=1).to(tl.int64)
+    pos = tl.maximum(seq - N + t, 0)
+    col = pos // ps
+    page = tl.load(tab_ptr + g * stride_g + b * stride_b + col, mask=mask, other=0).to(
+        tl.int64
+    )
+    # Negative pages (-1 column-tail pad / holes) route to dummy page 0, never a negative slot.
+    loc = tl.maximum(page, 0) * ps + pos % ps
+    tl.store(out_ptr + g * out_stride_g + i, loc.to(tl.int32), mask=mask)
+
+
+def compute_group_decode_locs(
+    tables: torch.Tensor,
+    page_sizes: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out: torch.Tensor,
+    bs: int,
+    tokens_per_req: int = 1,
+) -> None:
+    """Fused per-group decode write-loc computation over stacked tables.
+
+    Args:
+        tables: [G, max_bs, Wmax] int32 stacked per-group page tables.
+        page_sizes: [G] int32 tokens-per-page per group.
+        seq_lens: [bs] int32 lengths including the newest token.
+        out: [G, cap] int32 destination, cap >= bs * tokens_per_req; rows
+            [:, : bs * tokens_per_req] written token-major per request
+            (request b's tokens at b*N .. b*N + N - 1, the spec verify
+            layout).
+        bs: live batch size.
+        tokens_per_req: write locs per request; token t of request b lands
+            at position seq_lens[b] - tokens_per_req + t (clamped at 0).
+    """
+    g = tables.shape[0]
+    num_rows = bs * tokens_per_req
+    assert out.shape[0] >= g and out.shape[1] >= num_rows
+    BLOCK_B = 128
+    grid = (g, (num_rows + BLOCK_B - 1) // BLOCK_B)
+    _compute_group_decode_locs_kernel[grid](
+        tables,
+        page_sizes,
+        seq_lens,
+        out,
+        tables.stride(0),
+        tables.stride(1),
+        out.stride(0),
+        num_rows,
+        tokens_per_req,
+        BLOCK_B=BLOCK_B,
+    )
+
+
+@triton.jit
+def _unpack_group_tables_kernel(
+    src_ptr,  # packed int32 device buffer (bridge upload)
+    meta_ptr,  # [G, 3] int32: (src element offset, cols, page ratio) per group
+    dst_ptr,  # [G, max_bs, Wmax] int32 stacked graph tables
+    stride_g,
+    stride_b,
+    wmax,
+    actual_bs,
+    TAIL_PAD: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+):
+    """Fill every group's graph-table rows from the packed upload in one
+    launch: row (g, b < actual_bs) gets src[off_g + b*cols_g : +cols_g]
+    followed by a TAIL_PAD tail up to Wmax; padded rows b >= actual_bs
+    (grid axis 1 covers the padded batch size) are written all-0 (the
+    flat dummy-page row contract). Replaces the per-group D2D copy +
+    tail fill (+ F.pad row padding) per decode step."""
+    g = tl.program_id(0)
+    b = tl.program_id(1)  # grid axis 1 is exactly bs, no bounds check needed
+    off = tl.load(meta_ptr + g * 3).to(tl.int64)
+    cols = tl.load(meta_ptr + g * 3 + 1).to(tl.int64)
+    ratio = tl.load(meta_ptr + g * 3 + 2).to(tl.int64)
+    w_off = tl.arange(0, BLOCK_W)
+    real = b < actual_bs
+    for w0 in range(0, wmax, BLOCK_W):
+        w = w0 + w_off
+        src_col = w // ratio
+        in_row = (src_col < cols) & real
+        vals = tl.load(
+            src_ptr + off + b * cols + src_col,
+            mask=in_row & (w < wmax),
+            other=0,
+        )
+        vals = tl.where(
+            ratio == 1,
+            vals,
+            tl.maximum(vals, 0) * ratio + w % ratio,
+        )
+        vals = tl.where(in_row, vals, tl.where(real, TAIL_PAD, 0))
+        tl.store(
+            dst_ptr + g * stride_g + b * stride_b + w,
+            vals,
+            mask=w < wmax,
+        )
+
+
+def unpack_group_tables(
+    src: torch.Tensor,
+    meta: torch.Tensor,
+    dst: torch.Tensor,
+    bs: int,
+    actual_bs: int | None = None,
+    tail_pad: int = -1,
+) -> None:
+    """Unpack the bridge's packed table upload into the stacked graph
+    buffers (all groups, one launch).
+
+    Args:
+        src: 1-D int32 device buffer holding every group's rows
+            back-to-back (rows x cols per group).
+        meta: [G, 3] int32 device tensor of
+            (element offset, logical columns, kernel pages per logical page).
+            A ratio greater than one expands page ``p`` to
+            ``p * ratio + [0, ratio)`` while unpacking.
+        dst: [G, max_bs, Wmax] int32 stacked destination.
+        bs: rows to fill per group (padded batch size).
+        actual_bs: live batch size; rows [actual_bs, bs) are written all-0
+            (the flat dummy-page row contract). Defaults to bs (no padded
+            rows).
+        tail_pad: value for columns past the group's width.
+    """
+    g, _, wmax = dst.shape
+    if bs == 0 or g == 0:
+        return
+    if actual_bs is None:
+        actual_bs = bs
+    BLOCK_W = 128 if wmax >= 128 else 64
+    grid = (g, bs)
+    _unpack_group_tables_kernel[grid](
+        src,
+        meta,
+        dst,
+        dst.stride(0),
+        dst.stride(1),
+        wmax,
+        actual_bs,
+        TAIL_PAD=tail_pad,
+        BLOCK_W=BLOCK_W,
+    )
+
+
+# GLM-5 DSA block-split index-K scatter
+
+
+@triton.jit
+def _index_k_scatter_kernel(
+    fp8_buf_ptr,  # uint8 flat view of buf
+    scale_buf_ptr,  # float32 flat view of buf (aliases fp8_buf_ptr)
+    k_fp8_ptr,  # uint8 [tokens, HD]
+    k_scale_ptr,  # float32 [tokens, NG]
+    loc_ptr,  # int [tokens] global slot index (non-negative)
+    page_bytes,  # fp8 elements per page
+    scale_page_off,  # float32 elements per page (page_bytes // 4)
+    scale_base_off,  # float32 offset of the scale region ((ps*hd)//4)
+    PAGE_SIZE: tl.constexpr,
+    HD: tl.constexpr,
+    NG: tl.constexpr,
+    BLOCK_HD: tl.constexpr,  # next_pow2(HD); masked so HD need not be pow2
+    BLOCK_NG: tl.constexpr,  # next_pow2(NG)
+):
+    t = tl.program_id(0)
+    # loc >= 0 makes // and % exact.
+    loc = tl.load(loc_ptr + t).to(tl.int64)
+    page = loc // PAGE_SIZE
+    slot = loc % PAGE_SIZE
+
+    d = tl.arange(0, BLOCK_HD)
+    hd_mask = d < HD
+    fp8_dst = page * page_bytes + slot * HD + d
+    tl.store(
+        fp8_buf_ptr + fp8_dst,
+        tl.load(k_fp8_ptr + t * HD + d, mask=hd_mask),
+        mask=hd_mask,
+    )
+
+    g = tl.arange(0, BLOCK_NG)
+    ng_mask = g < NG
+    sc_dst = scale_base_off + page * scale_page_off + slot * NG + g
+    tl.store(
+        scale_buf_ptr + sc_dst,
+        tl.load(k_scale_ptr + t * NG + g, mask=ng_mask),
+        mask=ng_mask,
+    )
+
+
+def index_k_block_split_scatter(
+    buf: torch.Tensor,
+    index_k_fp8: torch.Tensor,
+    index_k_scale: torch.Tensor,
+    loc: torch.Tensor,
+    *,
+    page_size: int,
+    head_dim: int,
+    group_size: int,
+) -> None:
+    """Scatter FP8 index-K rows + scales into the block-split paged buffer.
+
+    Byte-exact single-launch equivalent of two ``index_put`` writes through
+    the block-split ``as_strided`` views (see
+    ``DSATokenToKVPool._index_k_block_views``). The ``(page, slot_in_page) =
+    (loc // page_size, loc % page_size)`` mapping is derived per token inside
+    the kernel, so callers pass raw cache locations.
+
+    Args:
+        buf: uint8 ``[num_slots, head_dim + num_groups*4]`` packed buffer.
+        index_k_fp8: ``[tokens, head_dim]`` FP8 values.
+        index_k_scale: ``[tokens, num_groups]`` float32 scales.
+        loc: ``[tokens]`` non-negative int global slot indices (any integer
+            dtype).
+        page_size, head_dim, group_size: layout; ``num_groups = head_dim //
+            group_size``.
+
+    Returns:
+        None; ``buf`` is written in place.
+    """
+    tokens = index_k_fp8.shape[0]
+    if tokens == 0:
+        return
+    ng = head_dim // group_size
+    row_bytes = head_dim + ng * 4
+    page_bytes = page_size * row_bytes
+
+    fp8_buf = buf.reshape(-1)  # uint8
+    scale_buf = fp8_buf.view(torch.float32)  # aliases the same storage
+    k_fp8 = index_k_fp8.reshape(-1, head_dim).contiguous().view(torch.uint8)
+    k_scale = index_k_scale.reshape(-1, ng).contiguous()
+
+    _index_k_scatter_kernel[(tokens,)](
+        fp8_buf,
+        scale_buf,
+        k_fp8,
+        k_scale,
+        loc.reshape(-1),
+        page_bytes,
+        page_bytes // 4,
+        (page_size * head_dim) // 4,
+        PAGE_SIZE=page_size,
+        HD=head_dim,
+        NG=ng,
+        BLOCK_HD=_next_power_of_two(head_dim),
+        BLOCK_NG=_next_power_of_two(ng),
     )

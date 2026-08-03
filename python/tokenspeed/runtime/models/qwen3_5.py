@@ -74,6 +74,7 @@ from tokenspeed.runtime.layers.parameter import (
     PerTensorScaleParameter,
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.utils import check_equal_or_regex_match
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import (
@@ -114,6 +115,38 @@ from tokenspeed.runtime.utils import (
 from tokenspeed.runtime.utils.env import envs
 
 logger = logging.getLogger(__name__)
+
+
+def _gdn_group_unquantized(prefix, shard_names, ignored_layers) -> bool:
+    if not ignored_layers:
+        return False
+    targets = list(ignored_layers)
+    norm_targets = [t.replace("language_model.", "") for t in targets]
+    for shard in shard_names:
+        full = f"{prefix}.{shard}"
+        norm = full.replace("language_model.", "")
+        if not (
+            check_equal_or_regex_match(full, targets)
+            or check_equal_or_regex_match(norm, norm_targets)
+        ):
+            return False
+    return True
+
+
+def _gdn_in_proj_stacked_mapping(param_names) -> list:
+    if any(name.endswith(".in_proj_qkvz.weight") for name in param_names):
+        return [
+            ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
+            ("in_proj_qkvz.", "in_proj_z.", 3),
+            ("in_proj_ba.", "in_proj_b.", 0),
+            ("in_proj_ba.", "in_proj_a.", 1),
+        ]
+    return [
+        ("in_proj_qkvzba.", "in_proj_qkv.", (0, 1, 2)),
+        ("in_proj_qkvzba.", "in_proj_z.", 3),
+        ("in_proj_qkvzba.", "in_proj_b.", 4),
+        ("in_proj_qkvzba.", "in_proj_a.", 5),
+    ]
 
 
 class Qwen3_5GatedDeltaNet(nn.Module):
@@ -158,30 +191,70 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
 
-        self.in_proj_qkvzba = MergedColumnParallelLinear(
-            input_size=self.hidden_size,
-            output_sizes=[
-                self.key_dim,
-                self.key_dim,
-                self.value_dim,
-                self.value_dim,
-                self.num_v_heads,
-                self.num_v_heads,
-            ],
-            bias=False,
-            quant_config=quant_config,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
-            tp_group=self.attn_tp_group,
-            prefix=add_prefix("in_proj_qkvzba", prefix),
+        ignored_layers = getattr(quant_config, "ignored_layers", None) or []
+        qkvz_unquant = _gdn_group_unquantized(
+            prefix, ("in_proj_qkv", "in_proj_z"), ignored_layers
         )
-        self._qkvz_dim = (self.key_dim * 2 + self.value_dim * 2) // self.attn_tp_size
-        self._ba_dim = (self.num_v_heads * 2) // self.attn_tp_size
-
-        # Override weight loaders for packed checkpoint format.
-        # Important: for FP8, this must cover not only `.weight` but also
-        # `weight_scale_inv` / `weight_scale` / `input_scale` if present.
-        self._bind_packed_weight_loaders(self.in_proj_qkvzba)
+        ba_unquant = _gdn_group_unquantized(
+            prefix, ("in_proj_b", "in_proj_a"), ignored_layers
+        )
+        self._split_in_proj = quant_config is not None and (qkvz_unquant != ba_unquant)
+        if self._split_in_proj:
+            self.in_proj_qkvz = MergedColumnParallelLinear(
+                input_size=self.hidden_size,
+                output_sizes=[
+                    self.key_dim,
+                    self.key_dim,
+                    self.value_dim,
+                    self.value_dim,
+                ],
+                bias=False,
+                quant_config=None if qkvz_unquant else quant_config,
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
+                tp_group=self.attn_tp_group,
+                prefix=add_prefix("in_proj_qkvz", prefix),
+            )
+            self.in_proj_ba = MergedColumnParallelLinear(
+                input_size=self.hidden_size,
+                output_sizes=[
+                    self.num_v_heads,
+                    self.num_v_heads,
+                ],
+                bias=False,
+                quant_config=None if ba_unquant else quant_config,
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
+                tp_group=self.attn_tp_group,
+                prefix=add_prefix("in_proj_ba", prefix),
+            )
+            self._bind_packed_weight_loaders(self.in_proj_qkvz)
+            self._bind_packed_weight_loaders(self.in_proj_ba)
+        else:
+            # Both groups share the same quantization; a single fused linear is
+            # safe. qkvz_unquant == ba_unquant here.
+            self.in_proj_qkvzba = MergedColumnParallelLinear(
+                input_size=self.hidden_size,
+                output_sizes=[
+                    self.key_dim,
+                    self.key_dim,
+                    self.value_dim,
+                    self.value_dim,
+                    self.num_v_heads,
+                    self.num_v_heads,
+                ],
+                bias=False,
+                quant_config=None if qkvz_unquant else quant_config,
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
+                tp_group=self.attn_tp_group,
+                prefix=add_prefix("in_proj_qkvzba", prefix),
+            )
+            self._qkvz_dim = (
+                self.key_dim * 2 + self.value_dim * 2
+            ) // self.attn_tp_size
+            self._ba_dim = (self.num_v_heads * 2) // self.attn_tp_size
+            self._bind_packed_weight_loaders(self.in_proj_qkvzba)
 
         # Conv1d weight loader setup
         query_key_settings = (self.key_dim, 0, False)
@@ -203,12 +276,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             },
         )
 
-        # State parameters
+        # FlashInfer GDN decay inputs must stay in FP32.
         self.dt_bias = nn.Parameter(
-            torch.ones(self.num_v_heads // self.attn_tp_size),
+            torch.ones(
+                self.num_v_heads // self.attn_tp_size,
+                dtype=torch.float32,
+            ),
         )
         self.A_log = nn.Parameter(
-            torch.empty(self.num_v_heads // self.attn_tp_size),
+            torch.empty(
+                self.num_v_heads // self.attn_tp_size,
+                dtype=torch.float32,
+            ),
         )
 
         set_weight_attrs(
@@ -304,7 +383,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     @classmethod
     def _make_packed_weight_loader(cls, module, original_weight_loader):
         """Wrap the param's original loader so split checkpoints:
-          - in_proj_qkv + in_proj_z + in_proj_b + in_proj_a -> merged in_proj_qkvzba
+          - in_proj_qkv + in_proj_z -> merged in_proj_qkvz
+          - in_proj_b   + in_proj_a -> merged in_proj_ba
         can load correctly for both normal and FP8 params.
         """
 
@@ -366,6 +446,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         return query, key, value, z, b, a
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
+        if self._split_in_proj:
+            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            projected_states_ba, _ = self.in_proj_ba(hidden_states)
+            return projected_states_qkvz, projected_states_ba
         projected_all, _ = self.in_proj_qkvzba(hidden_states)
         projected_states_qkvz, projected_states_ba = projected_all.split(
             [self._qkvz_dim, self._ba_dim], dim=-1
@@ -459,13 +543,8 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         self.mapping = mapping
         self.layer_id = layer_id
 
-        linear_attn_quant_config = (
-            None
-            if quant_config and quant_config.get_name() in ("fp8", "nvfp4")
-            else quant_config
-        )
         self.linear_attn = Qwen3_5GatedDeltaNet(
-            config, mapping, layer_id, linear_attn_quant_config, prefix=prefix
+            config, mapping, layer_id, quant_config, prefix=prefix
         )
 
         #  Determine the MLP type based on the model type
@@ -902,6 +981,15 @@ class Qwen3_5ForCausalLM(nn.Module):
         # Final normalization
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # For DFLASH speculative decoding: set of layer indices whose
+        # *input* hidden states are captured. Populated by
+        # set_eagle3_layers_to_capture() / set_dflash_layers_to_capture().
+        self.layers_to_capture: set = set()
+        self._dflash_incremental_callback = None
+        self._dflash_slot_bufs = None
+        self._dflash_capture_idx_map = {}
+        self._dflash_incr_active = False
+
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
@@ -920,7 +1008,9 @@ class Qwen3_5ForCausalLM(nn.Module):
         if input_embeds is None:
             # Only skip embedding allreduce when the first layer's fused
             # allreduce+residual+norm will handle it
-            if self.layers[0].comm_manager.should_fuse(input_ids.shape[0]):
+            if self.embed_tokens.tp_size > 1 and self.layers[
+                0
+            ].comm_manager.should_fuse(input_ids.shape[0]):
                 hidden_states = self.embed_tokens(input_ids, reduce_results=False)
                 residual = torch.zeros_like(hidden_states)
             else:
@@ -930,9 +1020,32 @@ class Qwen3_5ForCausalLM(nn.Module):
             hidden_states = input_embeds
             residual = None
 
+        aux_hidden_states = [] if self.layers_to_capture else None
+
         # Pass through decoder layers
         for layer_idx in range(len(self.layers)):
             layer = self.layers[layer_idx]
+            if aux_hidden_states is not None and layer_idx in self.layers_to_capture:
+                # Under RSAG the inter-layer hidden/residual are reduce-scattered
+                # across the attn TP group; aux consumers (e.g. the DFLASH
+                # drafter) expect full rows, so gather before capturing.
+                aux = (
+                    hidden_states + residual if residual is not None else hidden_states
+                )
+                gathered = layer.comm_manager.gather_residual(aux, ctx)
+                capture_idx = self._dflash_capture_idx_map.get(layer_idx)
+                if (
+                    self._dflash_incr_active
+                    and self._dflash_incremental_callback is not None
+                    and self._dflash_slot_bufs is not None
+                    and capture_idx is not None
+                ):
+                    num_tokens = gathered.shape[0]
+                    self._dflash_slot_bufs[capture_idx][:num_tokens].copy_(gathered)
+                    self._dflash_incremental_callback(capture_idx, num_tokens)
+                aux_hidden_states.append(
+                    gathered if gathered is aux else gathered.clone()
+                )
             with get_global_expert_distribution_recorder().with_current_layer(
                 layer_idx
             ):
@@ -960,7 +1073,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             hidden_states, residual, ctx, self.norm
         )
 
-        return hidden_states, None
+        return hidden_states, aux_hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -970,16 +1083,10 @@ class Qwen3_5ForCausalLM(nn.Module):
             ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
-            # GDN (GatedDeltaNet) linear attention projections
-            # Split checkpoint format (separate qkv/z/b/a files)
-            ("in_proj_qkvzba.", "in_proj_qkv.", (0, 1, 2)),
-            ("in_proj_qkvzba.", "in_proj_z.", 3),
-            ("in_proj_qkvzba.", "in_proj_b.", 4),
-            ("in_proj_qkvzba.", "in_proj_a.", 5),
-            # Pre-packed checkpoint format (already merged qkvz and ba)
-            ("in_proj_qkvzba.", "in_proj_qkvz.", (0, 1, 2, 3)),
-            ("in_proj_qkvzba.", "in_proj_ba.", (4, 5)),
         ]
+        stacked_params_mapping += _gdn_in_proj_stacked_mapping(
+            name for name, _ in self.named_parameters(remove_duplicate=False)
+        )
 
         loaded_params: set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
@@ -1047,16 +1154,10 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
-            # GDN (GatedDeltaNet) linear attention projections
-            # Split checkpoint format (separate qkv/z/b/a files)
-            ("in_proj_qkvzba.", "in_proj_qkv.", (0, 1, 2)),
-            ("in_proj_qkvzba.", "in_proj_z.", 3),
-            ("in_proj_qkvzba.", "in_proj_b.", 4),
-            ("in_proj_qkvzba.", "in_proj_a.", 5),
-            # Pre-packed checkpoint format (already merged qkvz and ba)
-            ("in_proj_qkvzba.", "in_proj_qkvz.", (0, 1, 2, 3)),
-            ("in_proj_qkvzba.", "in_proj_ba.", (4, 5)),
         ]
+        stacked_params_mapping += _gdn_in_proj_stacked_mapping(
+            name for name, _ in self.named_parameters(remove_duplicate=False)
+        )
 
         # Skip loading extra parameters for GPTQ/nvfp4 models.
         ignore_suffixes = (
@@ -1193,7 +1294,7 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
             # Encoder callables may be swapped to cudagraph wrappers by
             # ModelExecutor.
-            self.vision_embedder = VisionEmbedder(mapping.vision.tp_group)
+            self.vision_embedder = VisionEmbedder(encoder_mapping=mapping.vision)
             self.image_encoder = self.get_image_feature
             self.video_encoder = self.get_video_feature
 
@@ -1326,6 +1427,32 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
+    def set_dflash_layers_to_capture(
+        self,
+        layer_ids: list[int],
+        incremental_callback=None,
+        slot_bufs: list | None = None,
+    ) -> None:
+        # DFLASH checkpoints name 0-indexed target layer outputs. The capture
+        # check runs before layer i, so capture at i + 1 for layer i's output.
+        num_layers = len(self.model.layers)
+        if len(set(layer_ids)) != len(layer_ids):
+            raise ValueError("DFLASH target_layer_ids must be unique.")
+        invalid = [val for val in layer_ids if val < 0 or val + 1 >= num_layers]
+        if invalid:
+            raise ValueError(
+                "DFLASH target_layer_ids must map to capturable target layer "
+                f"outputs. Got invalid ids {invalid}; valid range is "
+                f"[0, {num_layers - 2}] for {num_layers} target layers."
+            )
+        self.model.layers_to_capture = {val + 1 for val in layer_ids}
+        sorted_capture_layers = sorted(self.model.layers_to_capture)
+        self.model._dflash_capture_idx_map = {
+            layer_idx: i for i, layer_idx in enumerate(sorted_capture_layers)
+        }
+        self.model._dflash_incremental_callback = incremental_callback
+        self.model._dflash_slot_bufs = slot_bufs
+
     @torch.no_grad()
     def forward(
         self,
@@ -1358,7 +1485,6 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
                 Modality.VIDEO: EncoderSpec(self.video_encoder, deepstack=True),
             },
             multimodal_model=self,
-            is_decode_or_idle=ctx.forward_mode.is_decode_or_idle(),
         )
         hidden_states, aux_hidden_states = self.model(
             input_ids,
@@ -1398,16 +1524,10 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
-            # GDN (GatedDeltaNet) linear attention projections
-            # Split checkpoint format (separate qkv/z/b/a files)
-            ("in_proj_qkvzba.", "in_proj_qkv.", (0, 1, 2)),
-            ("in_proj_qkvzba.", "in_proj_z.", 3),
-            ("in_proj_qkvzba.", "in_proj_b.", 4),
-            ("in_proj_qkvzba.", "in_proj_a.", 5),
-            # Pre-packed checkpoint format (already merged qkvz and ba)
-            ("in_proj_qkvzba.", "in_proj_qkvz.", (0, 1, 2, 3)),
-            ("in_proj_qkvzba.", "in_proj_ba.", (4, 5)),
         ]
+        stacked_params_mapping += _gdn_in_proj_stacked_mapping(
+            name for name, _ in self.named_parameters(remove_duplicate=False)
+        )
 
         loaded_params: set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
@@ -1494,16 +1614,10 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
-            # GDN (GatedDeltaNet) linear attention projections
-            # Split checkpoint format (separate qkv/z/b/a files)
-            ("in_proj_qkvzba.", "in_proj_qkv.", (0, 1, 2)),
-            ("in_proj_qkvzba.", "in_proj_z.", 3),
-            ("in_proj_qkvzba.", "in_proj_b.", 4),
-            ("in_proj_qkvzba.", "in_proj_a.", 5),
-            # Pre-packed checkpoint format (already merged qkvz and ba)
-            ("in_proj_qkvzba.", "in_proj_qkvz.", (0, 1, 2, 3)),
-            ("in_proj_qkvzba.", "in_proj_ba.", (4, 5)),
         ]
+        stacked_params_mapping += _gdn_in_proj_stacked_mapping(
+            name for name, _ in self.named_parameters(remove_duplicate=False)
+        )
 
         ignore_suffixes = (
             ".bias",

@@ -207,7 +207,6 @@ def test_nvfp4_gemm_swiglu_nvfp4_quant_matches_unfused_model_shapes(
         alpha=fc1_alpha,
         quant="nvfp4",
         enable_pdl=True,
-        expected_kernel_name="flashinfer_mm_nvfp4",
     ).view(m, 2 * i)
 
     silu_out = (
@@ -247,7 +246,6 @@ def test_nvfp4_gemm_swiglu_nvfp4_quant_matches_unfused_model_shapes(
         alpha=fc2_alpha,
         quant="nvfp4",
         enable_pdl=True,
-        expected_kernel_name="flashinfer_mm_nvfp4",
     ).view(m, k)
     actual = tokenspeed_kernel.mm(
         fused_fp4,
@@ -258,7 +256,6 @@ def test_nvfp4_gemm_swiglu_nvfp4_quant_matches_unfused_model_shapes(
         alpha=fc2_alpha,
         quant="nvfp4",
         enable_pdl=True,
-        expected_kernel_name="flashinfer_mm_nvfp4",
     ).view(m, k)
     torch.cuda.synchronize()
 
@@ -266,3 +263,123 @@ def test_nvfp4_gemm_swiglu_nvfp4_quant_matches_unfused_model_shapes(
     assert diff.mean().item() < 0.03
     assert torch.quantile(diff, 0.99).item() < 0.12
     assert diff.max().item() < 0.25
+
+
+def _autotune_operands(m: int, k: int, i: int):
+    from tokenspeed_kernel.ops.gemm.cute_dsl import _round_up
+
+    n = 2 * i
+    dev = torch.device("cuda")
+    g = torch.Generator(device=dev).manual_seed(515)
+
+    def packed(rows: int, cols: int):
+        return torch.randint(
+            0, 256, (rows, cols), dtype=torch.uint8, device=dev, generator=g
+        )
+
+    def scales(rows: int, cols: int):
+        # 0x7F / 0xFF are e4m3 NaN; keep them out so results stay comparable.
+        return torch.randint(
+            1, 127, (rows, cols), dtype=torch.uint8, device=dev, generator=g
+        ).view(torch.float8_e4m3fn)
+
+    return [
+        packed(m, k // 2),
+        scales(_round_up(m, 128), _round_up(k // 16, 4)),
+        packed(n, k // 2),
+        scales(_round_up(n, 128), _round_up(k // 16, 4)),
+        torch.ones(1, 1, dtype=torch.float32, device=dev),
+        torch.ones(1, dtype=torch.float32, device=dev),
+        torch.empty((m, i // 2), dtype=torch.uint8, device=dev),
+        torch.empty(
+            (_round_up(m, 128), _round_up(i // 16, 4)),
+            dtype=torch.float8_e4m3fn,
+            device=dev,
+        ),
+    ]
+
+
+@pytest.mark.skipif(not _has_sm100(), reason="Blackwell SM100 CUDA GPU required")
+@pytest.mark.parametrize(
+    ("m", "k", "i"),
+    [
+        pytest.param(1, 7168, 512, id="shared_decode"),
+        pytest.param(1024, 7168, 4608, id="dense_prefill"),
+        pytest.param(32, 2048, 256, id="qwen3_5_a3b_tp2_dense"),
+    ],
+)
+def test_nvfp4_gemm_swiglu_tactics_agree_with_heuristic(m: int, k: int, i: int) -> None:
+    """Every tunable tactic must compute what the untuned fallback computes.
+
+    Guards against tile shapes that ``can_implement()`` accepts but the kernel
+    silently mis-computes -- the autotuner would otherwise pick one for being
+    fast at doing less work.
+    """
+    from tokenspeed_kernel.ops.gemm.cute_dsl import (
+        _Nvfp4GemmSwigluNvfp4QuantRunner,
+    )
+
+    runner = _Nvfp4GemmSwigluNvfp4QuantRunner.get(
+        "float4_e2m1fn", "float8_e4m3fn", "float4_e2m1fn", 16, False, 3, True, False
+    )
+    inputs = _autotune_operands(m, k, i)
+    out, out_scale = inputs[6], inputs[7]
+
+    tactics = runner.get_valid_tactics(inputs, None)
+    assert tactics, "no valid tactic for a production shape"
+    n = 2 * i
+    for tactic in tactics:
+        # The persistent scheduler rounds the cluster grid up and never
+        # bounds-checks per-CTA tile coords; a non-dividing cluster_n makes
+        # trailing CTAs overwrite real output (garbage Qwen3.5 generations).
+        (_, tile_n), (_, cluster_n) = tactic
+        assert (
+            n // tile_n
+        ) % cluster_n == 0, f"tactic {tactic} must be filtered for n={n}"
+
+    out.zero_()
+    out_scale.zero_()
+    runner.forward(inputs, tactic=-1)
+    torch.cuda.synchronize()
+    ref, ref_scale = out.clone(), out_scale.view(torch.uint8).clone()
+
+    for tactic in tactics:
+        out.zero_()
+        out_scale.zero_()
+        runner.forward(inputs, tactic=tactic)
+        torch.cuda.synchronize()
+        assert torch.equal(out, ref) and torch.equal(
+            out_scale.view(torch.uint8), ref_scale
+        ), f"tactic {tactic} disagrees with the heuristic fallback"
+
+
+@pytest.mark.skipif(not _has_sm100(), reason="Blackwell SM100 CUDA GPU required")
+def test_nvfp4_gemm_swiglu_autotune_populates_cache() -> None:
+    """One call inside a tuning window fills every smaller shape bucket."""
+    from flashinfer.autotuner import AutoTuner, autotune
+    from tokenspeed_kernel.ops.gemm.cute_dsl import nvfp4_gemm_swiglu_nvfp4_quant
+
+    m, k, i = 256, 7168, 512
+    a, a_scale, b, b_scale, alpha, global_scale, _, _ = _autotune_operands(m, k, i)
+
+    tuner = AutoTuner.get()
+    before = sum(
+        1 for key in tuner.profiling_cache if "nvfp4_gemm_swiglu" in key.custom_op
+    )
+    with autotune():
+        tuned, tuned_scale = nvfp4_gemm_swiglu_nvfp4_quant(
+            a, a_scale, b, b_scale, alpha, global_scale
+        )
+    torch.cuda.synchronize()
+    after = sum(
+        1 for key in tuner.profiling_cache if "nvfp4_gemm_swiglu" in key.custom_op
+    )
+    assert after > before + 1, "a tuning window must fill more than the observed bucket"
+
+    untuned, untuned_scale = nvfp4_gemm_swiglu_nvfp4_quant(
+        a, a_scale, b, b_scale, alpha, global_scale
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(tuned, untuned) and torch.equal(
+        tuned_scale.view(torch.uint8), untuned_scale.view(torch.uint8)
+    )

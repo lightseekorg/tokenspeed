@@ -329,7 +329,11 @@ size_t getWorkspaceSize(SizeType32 batchSize, SizeType32 vocabSize) {
 //
 // outProbs is pre-zeroed by an asynchronous memset on a side stream — both
 // branches write only the kept positions.
-template <int BLOCK_SIZE, int ITEMS_PER_THREAD>
+// ROWS_ALIGNED: the caller guarantees every row base of `probs`/`out_probs` is
+// 16B-aligned (both bases 16B-aligned and vocab_size % 4 == 0), so the top-p
+// V-scan can use float4 loads/stores with no peel. Decided host-side in
+// invokeFusedTopKTopP; see the mode 3.2 branch.
+template <int BLOCK_SIZE, int ITEMS_PER_THREAD, bool ROWS_ALIGNED>
 __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
     float const* __restrict__ probs,
     float const* __restrict__ top_k_vals,
@@ -462,63 +466,146 @@ __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
         }
     } else {
         // ── Mode 3.2: top-P only (radix top-p threshold) ────────────────────
-        // Vectorized V-scan with float4: each thread reads/writes 16B per
-        // iteration, 4× fewer transactions than scalar. Row base is always
-        // 16B-aligned (PyTorch tensors are 256B-aligned). The tail (vocab_size
-        // not divisible by 4) is handled by a scalar epilogue.
+        // Vectorized V-scan with float4: each thread reads 16B per iteration,
+        // 4x fewer transactions than scalar. A float4 access must be naturally
+        // aligned, and a 16B-aligned row base is NOT guaranteed:
+        //   1. `probs`/`out_probs` may be views whose data_ptr is only 4B-aligned
+        //      (any slice or offset gather off a larger buffer), and
+        //   2. vocab_size % 4 != 0 pushes every row b >= 1 off a 16B boundary
+        //      even when the base allocation is 256B-aligned.
+        // Either one used to fault with "misaligned address".
+        //
+        // Whether any row can be unaligned is a property of the launch (base
+        // pointers + vocab_size), so the host picks the instantiation and
+        // ROWS_ALIGNED is a compile-time constant here. Keeping it compile-time
+        // matters: a runtime branch leaves the unaligned code in the aligned
+        // path's register footprint and costs ~2.5% occupancy even on rows that
+        // never execute it.
         const float threshold =
             air_top_p::twiddleOut<float>(topp_counters[b].kthValueBits, false);
 
         float const* in_row = probs + b * vocab_size;
         float* out_row = out_probs + b * vocab_size;
-        const int vec_count = vocab_size / 4;            // # of float4 lanes
-        const int vec_tail_start = vec_count * 4;        // start of scalar tail
 
-        float4 const* in_row_v = reinterpret_cast<float4 const*>(in_row);
+        if constexpr (ROWS_ALIGNED) {
+            // Every row base is 16B-aligned and in phase: no peel, no tail.
+            const int vec_count = vocab_size >> 2;
+            float4 const* in_row_v = reinterpret_cast<float4 const*>(in_row);
+            float4* out_row_v = reinterpret_cast<float4*>(out_row);
 
-        // Pass 1: sum of kept values.
-        float thread_sum = 0.0f;
-        for (int i = threadIdx.x; i < vec_count; i += BLOCK_SIZE) {
-            float4 v4 = in_row_v[i];
-            if (v4.x >= threshold) thread_sum += v4.x;
-            if (v4.y >= threshold) thread_sum += v4.y;
-            if (v4.z >= threshold) thread_sum += v4.z;
-            if (v4.w >= threshold) thread_sum += v4.w;
-        }
-        for (int i = vec_tail_start + threadIdx.x; i < vocab_size; i += BLOCK_SIZE) {
-            float v = in_row[i];
-            if (v >= threshold) thread_sum += v;
-        }
-        float row_sum = BlockReduce(temp_storage.reduce).Sum(thread_sum);
-
-        __shared__ float s_inv;
-        if (threadIdx.x == 0) {
-            s_inv = (row_sum > 1e-30f) ? (1.0f / row_sum) : 0.0f;
-        }
-        __syncthreads();
-        const float inv = s_inv;
-
-        // Pass 2: mask + renorm. Non-kept positions stay 0 (set by memset
-        // on the side stream and joined into this stream before this kernel).
-        float4* out_row_v = reinterpret_cast<float4*>(out_row);
-        for (int i = threadIdx.x; i < vec_count; i += BLOCK_SIZE) {
-            float4 v4 = in_row_v[i];
-            float4 o4;
-            o4.x = (v4.x >= threshold) ? v4.x * inv : 0.0f;
-            o4.y = (v4.y >= threshold) ? v4.y * inv : 0.0f;
-            o4.z = (v4.z >= threshold) ? v4.z * inv : 0.0f;
-            o4.w = (v4.w >= threshold) ? v4.w * inv : 0.0f;
-            // Only write the float4 if at least one lane is non-zero — keeps
-            // the write traffic ≈ kept positions × 4B in the common sharp-
-            // distribution case (most float4s have all 4 lanes below
-            // threshold and stay at their memset-0 value).
-            if (o4.x != 0.0f || o4.y != 0.0f || o4.z != 0.0f || o4.w != 0.0f) {
-                out_row_v[i] = o4;
+            float thread_sum = 0.0f;
+            for (int i = threadIdx.x; i < vec_count; i += BLOCK_SIZE) {
+                float4 v4 = in_row_v[i];
+                if (v4.x >= threshold) thread_sum += v4.x;
+                if (v4.y >= threshold) thread_sum += v4.y;
+                if (v4.z >= threshold) thread_sum += v4.z;
+                if (v4.w >= threshold) thread_sum += v4.w;
             }
-        }
-        for (int i = vec_tail_start + threadIdx.x; i < vocab_size; i += BLOCK_SIZE) {
-            float v = in_row[i];
-            if (v >= threshold) out_row[i] = v * inv;
+            float row_sum = BlockReduce(temp_storage.reduce).Sum(thread_sum);
+
+            __shared__ float s_inv;
+            if (threadIdx.x == 0) {
+                s_inv = (row_sum > 1e-30f) ? (1.0f / row_sum) : 0.0f;
+            }
+            __syncthreads();
+            const float inv = s_inv;
+
+            // Only write the float4 if at least one lane is non-zero -- keeps the
+            // write traffic ~ kept positions x 4B in the common sharp-distribution
+            // case (most float4s have all 4 lanes below threshold and stay at
+            // their memset-0 value, set on the side stream before this kernel).
+            for (int i = threadIdx.x; i < vec_count; i += BLOCK_SIZE) {
+                float4 v4 = in_row_v[i];
+                float4 o4;
+                o4.x = (v4.x >= threshold) ? v4.x * inv : 0.0f;
+                o4.y = (v4.y >= threshold) ? v4.y * inv : 0.0f;
+                o4.z = (v4.z >= threshold) ? v4.z * inv : 0.0f;
+                o4.w = (v4.w >= threshold) ? v4.w * inv : 0.0f;
+                if (o4.x != 0.0f || o4.y != 0.0f || o4.z != 0.0f || o4.w != 0.0f) {
+                    out_row_v[i] = o4;
+                }
+            }
+        } else {
+            // Some row may be unaligned. Rather than drop the whole row to a
+            // scalar loop (measured ~2x slower on this kernel -- the two V x 4B
+            // read passes dominate it, and with one block per row the slowest row
+            // gates the launch), peel it: a scalar prologue of 0-3 floats walks
+            // `in_row` up to a 16B boundary, the bulk stays vectorized, and a
+            // scalar tail finishes. Unaligned rows keep full read bandwidth.
+            const uintptr_t in_addr = reinterpret_cast<uintptr_t>(in_row);
+            const uintptr_t out_addr = reinterpret_cast<uintptr_t>(out_row);
+
+            // A float tensor is always 4B-aligned; if that ever fails, the row
+            // cannot be vectorized at all -- peel all of it.
+            const bool elem_aligned = ((in_addr | out_addr) & 0x3u) == 0;
+            const int head_want =
+                elem_aligned ? static_cast<int>(((16u - (in_addr & 15u)) & 15u) >> 2)
+                             : vocab_size;
+            const int head_end = min(head_want, vocab_size);       // end of prologue
+            const int vec_count = (vocab_size - head_end) >> 2;    // # of float4 lanes
+            const int tail_start = head_end + vec_count * 4;       // start of tail
+
+            // Stores can only ride along when `out_row` shares `in_row`'s 16B
+            // phase; otherwise no single peel aligns both. Then keep the
+            // vectorized loads and write kept lanes scalar (writes are sparse).
+            const bool store_vec = elem_aligned && ((in_addr ^ out_addr) & 15u) == 0;
+
+            float4 const* in_row_v =
+                reinterpret_cast<float4 const*>(in_row + head_end);
+            float4* out_row_v = reinterpret_cast<float4*>(out_row + head_end);
+
+            float thread_sum = 0.0f;
+            for (int i = threadIdx.x; i < head_end; i += BLOCK_SIZE) {
+                float v = in_row[i];
+                if (v >= threshold) thread_sum += v;
+            }
+            for (int i = threadIdx.x; i < vec_count; i += BLOCK_SIZE) {
+                float4 v4 = in_row_v[i];
+                if (v4.x >= threshold) thread_sum += v4.x;
+                if (v4.y >= threshold) thread_sum += v4.y;
+                if (v4.z >= threshold) thread_sum += v4.z;
+                if (v4.w >= threshold) thread_sum += v4.w;
+            }
+            for (int i = tail_start + threadIdx.x; i < vocab_size; i += BLOCK_SIZE) {
+                float v = in_row[i];
+                if (v >= threshold) thread_sum += v;
+            }
+            float row_sum = BlockReduce(temp_storage.reduce).Sum(thread_sum);
+
+            __shared__ float s_inv;
+            if (threadIdx.x == 0) {
+                s_inv = (row_sum > 1e-30f) ? (1.0f / row_sum) : 0.0f;
+            }
+            __syncthreads();
+            const float inv = s_inv;
+
+            for (int i = threadIdx.x; i < head_end; i += BLOCK_SIZE) {
+                float v = in_row[i];
+                if (v >= threshold) out_row[i] = v * inv;
+            }
+            for (int i = threadIdx.x; i < vec_count; i += BLOCK_SIZE) {
+                float4 v4 = in_row_v[i];
+                float4 o4;
+                o4.x = (v4.x >= threshold) ? v4.x * inv : 0.0f;
+                o4.y = (v4.y >= threshold) ? v4.y * inv : 0.0f;
+                o4.z = (v4.z >= threshold) ? v4.z * inv : 0.0f;
+                o4.w = (v4.w >= threshold) ? v4.w * inv : 0.0f;
+                if (o4.x != 0.0f || o4.y != 0.0f || o4.z != 0.0f || o4.w != 0.0f) {
+                    if (store_vec) {
+                        out_row_v[i] = o4;
+                    } else {
+                        float* o = out_row + head_end + i * 4;
+                        if (o4.x != 0.0f) o[0] = o4.x;
+                        if (o4.y != 0.0f) o[1] = o4.y;
+                        if (o4.z != 0.0f) o[2] = o4.z;
+                        if (o4.w != 0.0f) o[3] = o4.w;
+                    }
+                }
+            }
+            for (int i = tail_start + threadIdx.x; i < vocab_size; i += BLOCK_SIZE) {
+                float v = in_row[i];
+                if (v >= threshold) out_row[i] = v * inv;
+            }
         }
         (void)p;  // unused in this branch
     }
@@ -635,7 +722,16 @@ void invokeFusedTopKTopP(float const* probs, SizeType32 const* topKs, float cons
     // ── Stage 3: per-row apply. BLOCK=128, ITEMS=1 → MAX_K=128 sort window,
     //            and 128 threads handle V=160k via stride loops in the top-p
     //            branch (block reduce sized for 128).
-    launchKernel(enable_pdl, applyKernel<128, 1>, dim3(batchSize), dim3(128), 0, mainStream,
+    // Every row base is 16B-aligned iff both tensor bases are and vocab_size is a
+    // multiple of 4 (row b starts at base + b*vocab_size floats). Otherwise some
+    // row needs the peeled path — see the mode 3.2 branch in applyKernel. This is
+    // a launch property, so pick the instantiation here and keep the aligned
+    // kernel free of the peel code (and of its register cost).
+    const bool rowsAligned = (reinterpret_cast<uintptr_t>(probs) & 0xFu) == 0 &&
+                             (reinterpret_cast<uintptr_t>(outProbs) & 0xFu) == 0 &&
+                             (vocabSize % 4 == 0);
+    auto applyFn = rowsAligned ? applyKernel<128, 1, true> : applyKernel<128, 1, false>;
+    launchKernel(enable_pdl, applyFn, dim3(batchSize), dim3(128), 0, mainStream,
                  probs, topKVals, topKIdx, topKs, topPs, toppCounters, outProbs, vocabSize,
                  K_TOPK_MAX, enable_pdl);
 }

@@ -257,6 +257,81 @@ def test_fused_topk_topp_matches_pipeline(
     torch.testing.assert_close(ours, ref, atol=1e-5, rtol=1e-4)
 
 
+def _offset_view(t: torch.Tensor, off: int) -> torch.Tensor:
+    """Return a [shape]-view of ``t``'s data whose ``data_ptr`` sits ``off``
+    floats past a fresh allocation, so the row base is 4B- but not 16B-aligned.
+
+    The copy MUST be in-place: any out-of-place op would silently reallocate a
+    fresh (256B-aligned) tensor and destroy the offset under test.
+    """
+    flat = torch.empty(t.numel() + off, dtype=t.dtype, device=t.device)
+    view = flat[off : off + t.numel()].view(t.shape)
+    view.copy_(t)
+    return view
+
+
+@requires_nvidia
+@pytest.mark.parametrize(
+    "probs_off,out_off,V,tag",
+    [
+        (0, 0, 8192, "aligned-control"),
+        # (1) probs/out are views whose data_ptr is not 16B-aligned. Any slice or
+        # gather off a larger pooled buffer can produce this.
+        (1, 0, 8192, "probs-view-off-4B"),
+        (2, 0, 8192, "probs-view-off-8B"),
+        (0, 1, 8192, "out-view-off-4B"),
+        (1, 1, 8192, "both-views-off-4B"),
+        # probs and out land in *different* 16B phases, so no single peel can
+        # align both: the kernel keeps vectorized loads and writes kept lanes
+        # scalar. Exercises that store path specifically.
+        (1, 2, 8192, "views-out-of-phase"),
+        # (2) vocab_size % 4 != 0 pushes every row b >= 1 off a 16B boundary even
+        # when the base allocation is 256B-aligned.
+        (0, 0, 8191, "odd-vocab"),
+        (0, 0, 8190, "odd-vocab-2mod4"),
+    ],
+)
+def test_fused_topk_topp_unaligned_rows(
+    device: str, probs_off: int, out_off: int, V: int, tag: str
+) -> None:
+    """Rows that are not 16B-aligned must not fault.
+
+    Mode 3.2 (top-p only, reached via the top-k sentinel) scans the row with
+    float4 vector loads. A float4 access must be naturally aligned, so an
+    unaligned row base used to abort the process with CUDA "misaligned address".
+    The kernel now gates the vector path on the actual row alignment and falls
+    back to the scalar loop, which must stay numerically identical.
+    """
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA GPU is required for fused_topk_topp_renorm test")
+    torch.manual_seed(0)
+    bs = 4  # > 1, so the odd-V cases exercise a misaligned row b >= 1
+    probs = torch.softmax(
+        torch.randn(bs, V, device=device, dtype=torch.float32) * 3.0, dim=-1
+    )
+    # Sentinel top_k routes every row through the radix top-p path (mode 3.2).
+    top_ks = torch.full((bs,), _TOP_K_DISABLED, dtype=torch.int32, device=device)
+    top_ps = torch.full((bs,), 0.8, dtype=torch.float32, device=device)
+
+    ref = _ref_topk_topp(probs, top_ks, top_ps)
+
+    probs_in = _offset_view(probs, probs_off) if probs_off else probs
+    out = _offset_view(torch.empty_like(probs), out_off) if out_off else None
+    if probs_off:
+        assert probs_in.data_ptr() % 16 != 0, "offset lost; probs got re-aligned"
+
+    ours = fused_topk_topp_renorm(probs_in, top_ks, top_ps, out=out)
+    torch.cuda.synchronize()  # surface an async misaligned-address fault here
+
+    torch.testing.assert_close(
+        ours.sum(dim=-1), torch.ones(bs, device=device), atol=1e-5, rtol=1e-5
+    )
+    pos_diff = ((ref > 0) != (ours > 0)).sum(dim=-1).max().item()
+    assert pos_diff <= 1, f"[{tag}] kept-position mismatch up to {pos_diff} per row"
+    torch.testing.assert_close(ours, ref, atol=1e-5, rtol=1e-4)
+
+
 @requires_nvidia
 def test_fused_topk_topp_workspace_size_grows_with_batch(device: str) -> None:
     """Workspace size must grow monotonically with batch and vocab so callers

@@ -1,6 +1,7 @@
 api_version: ci.tokenspeed.io/v1
 name: eval-gpt-oss-120b-mxfp4-gpqa-diamond
 type: eval
+workflow_stage: model-test
 triggers:
   - per-commit
   - manual
@@ -12,7 +13,6 @@ runner:
     b200-2gpu:
       GPT_OSS_EVAL_MODEL: openai/gpt-oss-120b
     amd-mi35x-2gpu-test:
-      GPT_OSS_EVAL_DISABLE_KVSTORE: "1"
       GPT_OSS_EVAL_MODEL: amd/gpt-oss-120b-w-mxfp4-a-fp8
 env:
   CI: "true"
@@ -27,7 +27,7 @@ server:
     --max-model-len 80000
     --trust-remote-code
     --reasoning-parser base
-    ${GPT_OSS_EVAL_DISABLE_KVSTORE:+--disable-kvstore}
+    --disable-kvstore
     --enable-cache-report
     --host 127.0.0.1
     --port 8000

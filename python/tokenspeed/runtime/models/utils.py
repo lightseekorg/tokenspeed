@@ -21,7 +21,7 @@
 """Helpers shared across runtime model implementations."""
 
 import torch
-from tokenspeed_kernel.ops.embedding import FusedSetKVBufferArg
+from tokenspeed_kernel.ops.embedding import FusedMLASetKVBufferArg, FusedSetKVBufferArg
 
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.utils import print_warning_once
@@ -96,5 +96,36 @@ def create_fused_set_kv_buffer_arg(
         v_buffer=v_buffer,
         k_scale=None,
         v_scale=None,
+        cache_loc=out_cache_loc,
+    )
+
+
+def create_fused_mla_set_kv_buffer_arg(
+    k_nope: torch.Tensor,
+    rope_dim: int,
+    out_cache_loc: torch.Tensor,
+    token_to_kv_pool,
+    layer_id: int,
+):
+    """Build fused MLA RoPE+KV write arguments when the cache layout matches."""
+
+    from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
+
+    if not isinstance(token_to_kv_pool, MLATokenToKVPool):
+        return None
+
+    kv_buffer = token_to_kv_pool.get_key_buffer(layer_id)
+    if not isinstance(kv_buffer, torch.Tensor):
+        return None
+    if kv_buffer.dtype != k_nope.dtype:
+        return None
+    if kv_buffer.ndim != 3 or kv_buffer.shape[1] != 1:
+        return None
+    if kv_buffer.shape[2] != k_nope.shape[-1] + rope_dim:
+        return None
+
+    return FusedMLASetKVBufferArg(
+        k_nope=k_nope,
+        kv_buffer=kv_buffer.view(kv_buffer.shape[0], -1),
         cache_loc=out_cache_loc,
     )

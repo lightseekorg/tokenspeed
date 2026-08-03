@@ -865,7 +865,13 @@ def triton_mha_decode_with_kvcache(
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
+    softmax_scale: float | None = None,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(q.shape[-1])
     out = torch.empty_like(q)
     max_kv_splits = 4
     attn_logits = torch.empty(
@@ -901,7 +907,7 @@ def triton_mha_decode_with_kvcache(
         page_table.stride(0),
         k_cache.shape[1],
         window_left,
-        sm_scale=1.0 / math.sqrt(q.shape[-1]),
+        sm_scale=softmax_scale,
         logit_cap=logit_cap,
         sinks=sinks,
     )

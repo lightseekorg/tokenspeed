@@ -142,16 +142,12 @@ class BaseTransformerModel(nn.Module):
         quant_config: QuantizationConfig | None,
         prefix: str,
     ) -> nn.ModuleList:
-
-        layer_cls = self.layer_cls
-        mapping = self.mapping
-
         return make_layers(
             config.num_hidden_layers,
-            lambda idx, prefix: layer_cls(
+            lambda idx, prefix: self.layer_cls(
                 config=config,
                 layer_id=idx,
-                mapping=mapping,
+                mapping=self.mapping,
                 quant_config=quant_config,
                 prefix=prefix,
             ),
@@ -182,7 +178,7 @@ class BaseTransformerModel(nn.Module):
                 )
             elif isinstance(first_layer, BaseDecoderLayer):
                 fuse_embed_reduce = (
-                    self.mapping.attn.tp_size > 1
+                    self.embed_tokens.tp_size > 1
                     and first_layer.comm_manager.should_fuse(input_ids.shape[0])
                 )
             else:

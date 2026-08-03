@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT AND Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -84,6 +88,59 @@ class SiluAndMul(torch.nn.Module):
         d = x.shape[-1] // 2
         out = torch.empty(x.shape[:-1] + (d,), dtype=x.dtype, device=x.device)
         return silu_and_mul(x, out, enable_pdl=pdl_enabled())
+
+
+class SituAndMul(torch.nn.Module):
+    """SiTU / SituGLU gated activation used by Kimi models (e.g. Kimi-K3).
+
+    Over the fused ``[..., gate | up]`` input, computes::
+
+        gate = beta * tanh(gate / beta) * sigmoid(gate)
+        up   = linear_beta * tanh(up / linear_beta)   # only if linear_beta set
+        out  = gate * up
+
+    Args:
+        beta: Softplus-like temperature applied to the gate branch.
+        linear_beta: If set, softly clips the up branch; disabled when ``None``.
+
+    CUDA inputs run the fused Triton kernel (one launch instead of the ~10
+    sliced elementwise kernels of the native path, ULP-identical fp32 math);
+    other devices keep the native reference implementation.
+    """
+
+    def __init__(self, beta: float = 1.0, linear_beta: float | None = None) -> None:
+        super().__init__()
+        if beta <= 0.0:
+            raise ValueError(f"SiTU beta must be positive, got {beta}")
+        if linear_beta is not None and linear_beta <= 0.0:
+            raise ValueError(f"SiTU linear_beta must be positive, got {linear_beta}")
+        self.beta = float(beta)
+        self.linear_beta = None if linear_beta is None else float(linear_beta)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[-1] % 2 != 0:
+            raise ValueError(
+                f"SiTU expects an even [gate, up] width, got {x.shape[-1]}"
+            )
+        if x.is_cuda:
+            from tokenspeed_kernel import situ_and_mul
+
+            return situ_and_mul(
+                x,
+                beta=self.beta,
+                linear_beta=self.linear_beta,
+                enable_pdl=pdl_enabled(),
+            )
+        return self.forward_native(x)
+
+    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+        d = x.shape[-1] // 2
+        gate = x[..., :d].float()
+        up = x[..., d:].float()
+        gate = self.beta * torch.tanh(gate / self.beta) * torch.sigmoid(gate)
+        if self.linear_beta is not None:
+            up = self.linear_beta * torch.tanh(up / self.linear_beta)
+        return (gate * up).to(x.dtype)
 
 
 @triton.jit

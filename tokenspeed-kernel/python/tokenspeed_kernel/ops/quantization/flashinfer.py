@@ -42,11 +42,18 @@ if platform.is_nvidia:
             get_fp8_blockscale_gemm_runner_sm90 as fp8_blockscale_quantize_runner_sm90,
         )
 
+    # FlashInfer's MXFP8 quantizer supports SM100 and newer architectures.
+    # Hopper uses the portable Triton implementation registered alongside
+    # this kernel.
     @register_kernel(
         "quantization",
         "mxfp8",
         name="flashinfer_quantize_mxfp8",
         solution="flashinfer",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
         signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
         traits={},
         priority=Priority.PERFORMANT,

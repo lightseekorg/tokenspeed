@@ -20,8 +20,9 @@
 
 #pragma once
 
-#include <variant>
+#include <cstdint>
 #include <string>
+#include <variant>
 #include <vector>
 
 namespace tokenspeed {

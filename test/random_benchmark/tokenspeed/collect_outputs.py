@@ -2,6 +2,7 @@
 """Collect random perf sweeps into one CI summary table."""
 
 import argparse
+import csv
 import json
 import sys
 from pathlib import Path
@@ -14,6 +15,18 @@ COLUMNS = [
     "Approx Cache Hit",
     "Decoded Tok/Iter",
 ]
+
+# `pipeline.py` gates a perf task's `perf_reference` on this exact CSV header,
+# so the throughput column drops the "Output " prefix used by the human table.
+CSV_COLUMNS = [
+    "config",
+    "Conc.",
+    "Latency (tps/user)",
+    "Throughput (tps/gpu)",
+    "Approx Cache Hit",
+    "Decoded Tok/Iter",
+]
+CSV_SOURCE_COLUMNS = {"Throughput (tps/gpu)": "Output Throughput (tps/gpu)"}
 
 INPUT_ORDER = {
     "input_1k": 1024,
@@ -99,10 +112,27 @@ def print_table(rows):
         print("  ".join(str(row[column]).rjust(widths[column]) for column in COLUMNS))
 
 
+def print_csv(rows):
+    writer = csv.DictWriter(sys.stdout, fieldnames=CSV_COLUMNS)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(
+            {
+                column: row[CSV_SOURCE_COLUMNS.get(column, column)]
+                for column in CSV_COLUMNS
+            }
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("sweep_dir", type=Path)
     parser.add_argument("--num-gpus", type=int, default=1)
+    parser.add_argument(
+        "--emit-csv",
+        action="store_true",
+        help="Also print the CSV block that a task's perf_reference gate reads.",
+    )
     args = parser.parse_args()
 
     if not args.sweep_dir.is_dir():
@@ -112,6 +142,9 @@ def main():
 
     rows = collect(args.sweep_dir, args.num_gpus)
     print_table(rows)
+    if args.emit_csv:
+        print()
+        print_csv(rows)
     if not rows:
         sys.exit(1)
 

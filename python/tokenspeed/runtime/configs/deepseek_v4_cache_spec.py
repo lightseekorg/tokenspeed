@@ -16,10 +16,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from typing import Any
 
-from tokenspeed.runtime.configs.paged_cache_spec import PagedCacheGroupSpec
+from tokenspeed.runtime.configs.paged_cache_spec import (
+    PagedCacheGroupSpec,
+    compute_paged_cache_group_page_counts,
+)
 
 V4_KERNEL_BLOCK_ROWS: int = 64
 V4_SWA_KV_GROUP_ID = "v4.swa_kv"
@@ -193,6 +197,7 @@ def build_v4_cache_specs(
     hf_config: Any,
     *,
     layer_ratio: Sequence[int],
+    cache_blocks_per_lcm_block: Mapping[str, int] | None = None,
 ) -> list[PagedCacheGroupSpec]:
     swa_window = _resolve_sliding_window(hf_config)
     unique_compress_ratios = sorted({int(r) for r in layer_ratio if int(r) > 1})
@@ -245,14 +250,121 @@ def build_v4_cache_specs(
                 family="state",
             )
         )
-    return specs
+    if cache_blocks_per_lcm_block is None:
+        return specs
+
+    packing = dict(cache_blocks_per_lcm_block)
+    group_ids = {spec.group_id for spec in specs}
+    if set(packing) != group_ids:
+        raise ValueError(
+            "DeepSeek V4 LCM packing must contain exactly the cache groups"
+        )
+    if any(
+        isinstance(count, bool) or not isinstance(count, int) or count <= 0
+        for count in packing.values()
+    ):
+        raise ValueError("DeepSeek V4 LCM packing values must be positive integers")
+    return [
+        replace(
+            spec,
+            cache_blocks_per_lcm_block=packing[spec.group_id],
+        )
+        for spec in specs
+    ]
+
+
+def deepseek_v4_lcm_blocks_needed(
+    specs: Sequence[PagedCacheGroupSpec],
+    *,
+    logical_block_tokens: int,
+    token_capacity: int,
+    max_live_requests: int,
+    max_scheduled_tokens: int,
+    max_context_len: int,
+    decode_input_tokens: int = 1,
+    overlap_schedule_depth: int = 0,
+) -> int:
+    """Return physical parents needed by per-group CacheBlock tables."""
+    if logical_block_tokens <= 0:
+        raise ValueError("logical_block_tokens must be positive")
+    if token_capacity <= 0:
+        raise ValueError("token_capacity must be positive")
+    for spec in specs:
+        cache_block_tokens = int(spec.rows_per_page) * int(spec.entry_stride_tokens)
+        if cache_block_tokens <= 0 or logical_block_tokens % cache_block_tokens:
+            raise ValueError(
+                f"group {spec.group_id!r} cache block tokens must divide "
+                f"logical_block_tokens={logical_block_tokens}"
+            )
+    counts = compute_paged_cache_group_page_counts(
+        specs,
+        max_live_requests=max_live_requests,
+        max_scheduled_tokens=max_scheduled_tokens,
+        max_total_tokens=token_capacity,
+        max_context_len=max_context_len,
+        decode_input_tokens=decode_input_tokens,
+        overlap_schedule_depth=overlap_schedule_depth,
+    )
+    parents = 0
+    for spec in specs:
+        child_pages = counts[spec.group_id] - 1  # page 0 is the null page
+        packing = spec.cache_blocks_per_lcm_block
+        parents += (child_pages + packing - 1) // packing
+    return parents
+
+
+def deepseek_v4_token_capacity_for_lcm_pool(
+    specs: Sequence[PagedCacheGroupSpec],
+    *,
+    logical_block_tokens: int,
+    num_lcm_blocks: int,
+    max_live_requests: int,
+    max_scheduled_tokens: int,
+    max_context_len: int,
+    decode_input_tokens: int = 1,
+    overlap_schedule_depth: int = 0,
+    upper_bound_tokens: int,
+) -> int:
+    """Invert :func:`deepseek_v4_lcm_blocks_needed` monotonically."""
+    if num_lcm_blocks <= 0:
+        raise ValueError("num_lcm_blocks must be positive")
+    if upper_bound_tokens <= 0:
+        raise ValueError("upper_bound_tokens must be positive")
+    sizing = {
+        "logical_block_tokens": logical_block_tokens,
+        "max_live_requests": max_live_requests,
+        "max_scheduled_tokens": max_scheduled_tokens,
+        "max_context_len": max_context_len,
+        "decode_input_tokens": decode_input_tokens,
+        "overlap_schedule_depth": overlap_schedule_depth,
+    }
+    low, high = 0, upper_bound_tokens
+    while low < high:
+        candidate = (low + high + 1) // 2
+        if (
+            deepseek_v4_lcm_blocks_needed(
+                specs,
+                token_capacity=candidate,
+                **sizing,
+            )
+            <= num_lcm_blocks
+        ):
+            low = candidate
+        else:
+            high = candidate - 1
+    if low == 0:
+        raise ValueError(
+            f"num_lcm_blocks={num_lcm_blocks} cannot admit one token with "
+            "the configured DeepSeek V4 scheduler limits"
+        )
+    return low
 
 
 __all__ = [
-    "DEEPSEEK_V4_FP8_BLOCK_SIZE",
     "DEEPSEEK_V4_COMPRESSED_LOGICAL_BLOCK_SIZE",
-    "DEEPSEEK_V4_FP8_MAX",
+    "DEEPSEEK_V4_FP8_BLOCK_SIZE",
     "DEEPSEEK_V4_FP8_INDEXER_BLOCK_SIZE",
+    "DEEPSEEK_V4_FP8_MAX",
     "DEEPSEEK_V4_FP8_QUANT_BLOCK",
     "DEEPSEEK_V4_FP8_SCALE_BYTES",
     "DEEPSEEK_V4_MXFP4_BLOCK_SIZE",
@@ -269,10 +381,12 @@ __all__ = [
     "deepseek_v4_indexer_mxfp4_row_bytes",
     "deepseek_v4_indexer_mxfp4_scale_dim",
     "deepseek_v4_indexer_mxfp4_value_bytes",
+    "deepseek_v4_lcm_blocks_needed",
     "deepseek_v4_nope_dim",
     "deepseek_v4_swa_row_bytes",
     "deepseek_v4_swa_scale_dim",
     "deepseek_v4_swa_token_stride",
+    "deepseek_v4_token_capacity_for_lcm_pool",
     "parse_v4_compressor_state_group_id",
     "v4_compressed_kv_group_id",
     "v4_compressor_state_group_id",

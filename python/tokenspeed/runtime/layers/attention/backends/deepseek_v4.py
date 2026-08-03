@@ -31,13 +31,12 @@ except Exception:
 
 from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
     DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT,
+    V4_KERNEL_BLOCK_ROWS,
     deepseek_v4_swa_row_bytes,
     v4_compressed_kv_group_id,
 )
 from tokenspeed.runtime.configs.model_config import AttentionArch
-from tokenspeed.runtime.configs.paged_cache_spec import (
-    compute_max_logical_pages_for_capture,
-)
+from tokenspeed.runtime.configs.paged_cache_spec import PagedCacheGroupSpec
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.deepseek_v4.metadata import (
@@ -239,11 +238,17 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     """Metadata owner for the model-local DeepSeek V4 attention path."""
 
     uses_paged_cache_groups = True
+    uses_cache_groups = True
+    cache_consumer_families = frozenset({"history", "state"})
     uses_padded_decode_token_mask = True
 
     def __init__(self, config) -> None:
         super().__init__(config)
         self.page_size = config.page_size
+        self.logical_page_size: int | None = None
+        self.swa_storage_rows = int(
+            getattr(config, "sliding_window_tokens", V4_KERNEL_BLOCK_ROWS * 2)
+        )
         self.context_len = config.context_len
         rope_head_dim = getattr(config, "qk_rope_head_dim", None)
         self._fp8_ds_mla_row_bytes = (
@@ -288,6 +293,51 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self._cuda_graph_draft_decode_metadata = {}
         self._cuda_graph_query_start_by_tokens_per_req: dict[int, torch.Tensor] = {}
         self._cuda_graph_token_to_req_by_tokens_per_req: dict[int, torch.Tensor] = {}
+
+    def _prepare_cache_group_tables(
+        self,
+        block_tables: dict[str, torch.Tensor],
+        *,
+        output_buffers: dict[str, torch.Tensor] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        materialized = {}
+        for group_id, table in block_tables.items():
+            if output_buffers is None:
+                materialized[group_id] = table
+                continue
+            out = output_buffers[group_id]
+            rows, columns = table.shape
+            if out.ndim != 2 or out.shape[0] < rows or out.shape[1] < columns:
+                raise ValueError(
+                    f"output table for {group_id!r} cannot hold {tuple(table.shape)}"
+                )
+            if out.dtype != table.dtype or out.device != table.device:
+                raise ValueError(
+                    f"output table for {group_id!r} must match input dtype and device"
+                )
+            out[:rows].fill_(-1)
+            out[:rows, :columns].copy_(table)
+            materialized[group_id] = out[:rows]
+        return materialized
+
+    def _cuda_graph_group_table_width(
+        self,
+        spec: PagedCacheGroupSpec,
+        *,
+        max_tokens_per_req: int,
+        overlap_schedule_depth: int,
+    ) -> int:
+        cache_block_tokens = int(spec.rows_per_page) * int(spec.entry_stride_tokens)
+        if cache_block_tokens <= 0:
+            raise ValueError(
+                f"DeepSeek V4 cache group {spec.group_id!r} has invalid page size"
+            )
+        # Scheduler tables keep their absolute cache-block index and punch
+        # expired sliding pages into holes. They are sparse, not compact, so a
+        # graph buffer must cover the complete request extent for every group.
+        reservation_tokens = (overlap_schedule_depth + 1) * max_tokens_per_req
+        extent = self.context_len + reservation_tokens
+        return (extent + cache_block_tokens - 1) // cache_block_tokens
 
     def _get_prefill_workspace(
         self,
@@ -549,6 +599,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         extend_prefix_lens: torch.Tensor | None = None,
         **kwargs,
     ) -> None:
+        cache_metadata = kwargs.pop("cache_metadata", None)
+        forward_batch = kwargs.pop("forward_batch", None)
+        block_tables = kwargs.pop("block_tables", None) or {}
         paged_cache_block_tables = kwargs.pop("paged_cache_block_tables", None) or {}
         paged_cache_block_table_base_offsets = (
             kwargs.pop("paged_cache_block_table_base_offsets", None) or {}
@@ -564,6 +617,18 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         else:
             num_tokens = bs
         del kwargs
+        if cache_metadata is not None:
+            logical_page_size = int(cache_metadata.block_size)
+            self.logical_page_size = logical_page_size
+            scheduler_tables = dict(
+                cache_metadata.tables(active_forward_op=forward_batch)
+            )
+            paged_cache_block_tables = self._prepare_cache_group_tables(
+                scheduler_tables
+            )
+            paged_cache_block_table_base_offsets = {}
+        elif block_tables:
+            paged_cache_block_tables = self._prepare_cache_group_tables(block_tables)
         device = seq_lens.device
         req_pool_indices = req_pool_indices[:bs]
         seq_lens = seq_lens[:bs].to(torch.int32)
@@ -1606,12 +1671,13 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     def init_cuda_graph_state(
         self,
         max_bs: int,
-        seq_lens_buf: torch.Tensor | None = None,
         paged_cache_group_specs=(),
+        logical_page_size: int | None = None,
         max_tokens_per_req: int = 1,
         overlap_schedule_depth: int = 0,
     ):
-        del seq_lens_buf
+        if logical_page_size is not None:
+            self.logical_page_size = int(logical_page_size)
         self._decode_tile_metadata = {}
         self._cuda_graph_max_tokens_per_req = max(
             1,
@@ -1674,9 +1740,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         for spec in tuple(paged_cache_group_specs or ()):
             gid = str(spec.group_id)
             sliding = str(getattr(spec, "retention", "")) == "sliding_window"
-            max_pages = compute_max_logical_pages_for_capture(
+            max_pages = self._cuda_graph_group_table_width(
                 spec,
-                max_context_len=self.context_len,
                 max_tokens_per_req=max_tokens_per_req,
                 overlap_schedule_depth=overlap_schedule_depth,
             )
@@ -1938,6 +2003,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         req_to_page: torch.Tensor = None,
         **kwargs,
     ):
+        cache_metadata = kwargs.pop("cache_metadata", None)
+        forward_batch = kwargs.pop("forward_batch", None)
+        block_tables = kwargs.pop("block_tables", None) or {}
         paged_cache_block_tables = kwargs.pop("paged_cache_block_tables", None) or {}
         paged_cache_block_table_base_offsets = (
             kwargs.pop("paged_cache_block_table_base_offsets", None) or {}
@@ -1973,18 +2041,34 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             str(gid): off.to(device=self.device, dtype=torch.int32)
             for gid, off in paged_cache_block_table_base_offsets.items()
         }
-        metadata_paged = self._refresh_cuda_graph_paged_cache_block_tables(
-            bs,
-            {
-                str(group_id): table.to(device=self.device, dtype=torch.int32)
-                for group_id, table in paged_cache_block_tables.items()
-            },
-            pad_value=-1,
-        )
-        metadata_base_offsets = self._refresh_cuda_graph_base_offsets(
-            bs,
-            offsets_on_device,
-        )
+        if block_tables:
+            metadata_paged = self._prepare_cache_group_tables(
+                block_tables,
+                output_buffers=self._cuda_graph_paged_cache_block_tables,
+            )
+            metadata_base_offsets = {}
+        elif cache_metadata is not None:
+            scheduler_tables = dict(
+                cache_metadata.tables(active_forward_op=forward_batch)
+            )
+            metadata_paged = self._prepare_cache_group_tables(
+                scheduler_tables,
+                output_buffers=self._cuda_graph_paged_cache_block_tables,
+            )
+            metadata_base_offsets = {}
+        else:
+            metadata_paged = self._refresh_cuda_graph_paged_cache_block_tables(
+                bs,
+                {
+                    str(group_id): table.to(device=self.device, dtype=torch.int32)
+                    for group_id, table in paged_cache_block_tables.items()
+                },
+                pad_value=-1,
+            )
+            metadata_base_offsets = self._refresh_cuda_graph_base_offsets(
+                bs,
+                offsets_on_device,
+            )
         (
             swa_block_table,
             compressor_state_block_tables,

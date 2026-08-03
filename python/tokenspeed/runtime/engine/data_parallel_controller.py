@@ -122,6 +122,7 @@ class DataParallelController:
         # Parse args
         self.max_total_num_tokens = None
         self.max_req_input_len = None
+        self.max_single_request_tokens = None
         self.max_num_seqs = None
         self.chunked_prefill_size = None
         self.max_model_len = None
@@ -223,6 +224,7 @@ class DataParallelController:
                 tokenizer_ipc_name=port_args.tokenizer_ipc_name,
                 scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
                 nccl_port=port_args.nccl_port,
+                dist_init_addr=port_args.dist_init_addr,
                 rpc_ipc_name=port_args.rpc_ipc_name,
                 metrics_ipc_name=port_args.metrics_ipc_name,
                 tokenizer_worker_ipc_name=port_args.tokenizer_worker_ipc_name,
@@ -308,12 +310,14 @@ class DataParallelController:
 
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
+        self.max_single_request_tokens = scheduler_info[0]["max_single_request_tokens"]
         self.max_num_seqs = scheduler_info[0]["max_num_seqs"]
         self.chunked_prefill_size = scheduler_info[0]["chunked_prefill_size"]
         self.max_model_len = scheduler_info[0]["max_model_len"]
         self.multimodal_encoder_dtype = scheduler_info[0].get(
             "multimodal_encoder_dtype"
         )
+        self.cache_storage = scheduler_info[0]["cache_storage"]
 
     def round_robin_scheduler(self, req: Req):
         if self.server_args.disaggregation_mode == "null":
@@ -364,10 +368,12 @@ def run_data_parallel_controller_process(
                 "status": "ready",
                 "max_total_num_tokens": controller.max_total_num_tokens,
                 "max_req_input_len": controller.max_req_input_len,
+                "max_single_request_tokens": controller.max_single_request_tokens,
                 "max_num_seqs": controller.max_num_seqs,
                 "chunked_prefill_size": controller.chunked_prefill_size,
                 "max_model_len": controller.max_model_len,
                 "multimodal_encoder_dtype": controller.multimodal_encoder_dtype,
+                "cache_storage": controller.cache_storage,
             }
         )
         if server_args.node_rank == 0:

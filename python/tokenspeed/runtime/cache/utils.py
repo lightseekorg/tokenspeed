@@ -38,6 +38,8 @@ def set_mla_kv_buffer_kernel(
     rope_dim: tl.constexpr,
     BLOCK: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
+    SANITIZE: tl.constexpr,
+    MAX_FINITE: tl.constexpr,
 ):
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
@@ -65,6 +67,12 @@ def set_mla_kv_buffer_kernel(
             mask=mask,
         )
 
+    if SANITIZE:
+        src = src.to(tl.float32)
+        src = tl.where(src != src, 0.0, src)
+        src = tl.where(src == float("inf"), MAX_FINITE, src)
+        src = tl.where(src == -float("inf"), -MAX_FINITE, src)
+
     tl.store(dst_ptr, src, mask=mask)
 
     if ENABLE_PDL:
@@ -85,6 +93,8 @@ def set_mla_kv_buffer_per_loc_kernel(
     rope_dim: tl.constexpr,
     BLOCK_LOC: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
+    SANITIZE: tl.constexpr,
+    MAX_FINITE: tl.constexpr,
 ):
     """Each CTA writes BLOCK_LOC locs (the full nope+rope span for each).
     Grid is ceil(n_loc / BLOCK_LOC). With BLOCK_LOC > 1 each CTA processes
@@ -107,6 +117,11 @@ def set_mla_kv_buffer_per_loc_kernel(
         cache_k_nope_ptr + loc_indices[:, None] * nope_stride + nope_offs[None, :],
         mask=loc_mask[:, None],
     )
+    if SANITIZE:
+        src_nope = src_nope.to(tl.float32)
+        src_nope = tl.where(src_nope != src_nope, 0.0, src_nope)
+        src_nope = tl.where(src_nope == float("inf"), MAX_FINITE, src_nope)
+        src_nope = tl.where(src_nope == -float("inf"), -MAX_FINITE, src_nope)
     tl.store(
         kv_buffer_ptr + locs[:, None] * buffer_stride + nope_offs[None, :],
         src_nope,
@@ -119,6 +134,11 @@ def set_mla_kv_buffer_per_loc_kernel(
         cache_k_rope_ptr + loc_indices[:, None] * rope_stride + rope_offs[None, :],
         mask=loc_mask[:, None],
     )
+    if SANITIZE:
+        src_rope = src_rope.to(tl.float32)
+        src_rope = tl.where(src_rope != src_rope, 0.0, src_rope)
+        src_rope = tl.where(src_rope == float("inf"), MAX_FINITE, src_rope)
+        src_rope = tl.where(src_rope == -float("inf"), -MAX_FINITE, src_rope)
     tl.store(
         kv_buffer_ptr + locs[:, None] * buffer_stride + nope_dim + rope_offs[None, :],
         src_rope,
@@ -135,6 +155,7 @@ def set_mla_kv_buffer_triton(
     cache_k_nope: torch.Tensor,
     cache_k_rope: torch.Tensor,
     enable_pdl: bool = False,
+    sanitize: bool = False,
 ):
     # Dispatch buckets from experiments on B200 GPUs.
     #   n_loc <  512  : block-split kernel — more CTAs/loc fills SMs at decode
@@ -146,6 +167,17 @@ def set_mla_kv_buffer_triton(
     n_loc = loc.numel()
     nope_dim = cache_k_nope.size(-1)
     rope_dim = cache_k_rope.size(-1)
+    # Clamp to a value representable by both source and destination. K3's
+    # latent source can be bf16 while the Paged cache cache is fp8; using only the
+    # source bound would overflow back to a non-finite fp8 encoding on store.
+    float_maxes = [
+        torch.finfo(t.dtype).max
+        for t in (cache_k_nope, kv_buffer)
+        if t.dtype.is_floating_point
+    ]
+    # Bitwise-viewed pools (store_dtype != dtype, e.g. fp8 stored as uint8)
+    # copy raw words: no cast happens on store, so no clamp applies.
+    max_finite = min(float_maxes) if float_maxes else float("inf")
 
     extra_kwargs = {"launch_pdl": True} if enable_pdl else {}
     if n_loc >= 512:
@@ -169,6 +201,8 @@ def set_mla_kv_buffer_triton(
             rope_dim,
             BLOCK_LOC=block_loc,
             ENABLE_PDL=enable_pdl,
+            SANITIZE=sanitize,
+            MAX_FINITE=max_finite,
             num_warps=num_warps,
             num_stages=num_stages,
             **extra_kwargs,
@@ -192,6 +226,8 @@ def set_mla_kv_buffer_triton(
             rope_dim,
             BLOCK=BLOCK,
             ENABLE_PDL=enable_pdl,
+            SANITIZE=sanitize,
+            MAX_FINITE=max_finite,
             **extra_kwargs,
         )
 

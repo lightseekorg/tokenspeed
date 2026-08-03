@@ -44,9 +44,13 @@ from transformers.utils import cached_file
 
 from tokenspeed.runtime.configs import (
     DeepseekV4Config,
+    InklingMMConfig,
+    InklingModelConfig,
     KimiK2Config,
+    KimiK3Config,
     KimiK25Config,
     MiniMaxM2Config,
+    MiniMaxM3Config,
     Qwen2Config,
     Qwen3_5Config,
     Qwen3_5MoeConfig,
@@ -65,8 +69,12 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     Qwen3_5Config.model_type: Qwen3_5Config,
     Qwen3_5MoeConfig.model_type: Qwen3_5MoeConfig,
     MiniMaxM2Config.model_type: MiniMaxM2Config,
+    MiniMaxM3Config.model_type: MiniMaxM3Config,
     KimiK2Config.model_type: KimiK2Config,
     KimiK25Config.model_type: KimiK25Config,
+    KimiK3Config.model_type: KimiK3Config,
+    InklingModelConfig.model_type: InklingModelConfig,
+    InklingMMConfig.model_type: InklingMMConfig,
 }
 
 _DEEPSEEK_V4_ENCODING_MODULE_NAME = "_tokenspeed_deepseek_v4_encoding"
@@ -211,9 +219,12 @@ def get_config(
     if os.path.isdir(model):
         model_path = model
     else:
-        model_path = snapshot_download(
-            model, ignore_patterns=["*.pt", "*.safetensors", "*.bin"]
-        )
+        from tokenspeed.runtime.model_loader.weight_utils import get_lock
+
+        with get_lock(model):
+            model_path = snapshot_download(
+                model, ignore_patterns=["*.pt", "*.safetensors", "*.bin"]
+            )
 
     try:
         with open(os.path.join(model_path, "config.json")) as file:
@@ -279,15 +290,22 @@ def get_config(
     if resolve_architecture(config) in [
         "KimiK25ForConditionalGeneration",
         "KimiK25Config",
+        "KimiK3ForConditionalGeneration",
+        "KimiK3ForConditionalGenerationNextN",
+        "KimiK3Config",
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3_5MoeForConditionalGenerationNextN",
         "Qwen3_5MoeConfig",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5ForConditionalGenerationNextN",
+        "InklingForConditionalGeneration",
+        "InklingForConditionalGenerationNextN",
+        "InklingMMConfig",
         "Qwen3OmniMoeForConditionalGeneration",
         "Qwen3OmniMoeConfig",
         "Qwen3ASRForConditionalGeneration",
         "Qwen3ASRConfig",
+        "MiniMaxM3SparseForConditionalGeneration",
     ]:
         config.text_config = text_config
         return config
@@ -531,6 +549,16 @@ def get_tokenizer(
         if kwargs.get("use_fast", False):
             raise ValueError("Cannot use the fast tokenizer in slow tokenizer mode.")
         kwargs["use_fast"] = False
+
+    if not os.path.isdir(tokenizer_name):
+        from tokenspeed.runtime.model_loader.weight_utils import get_lock
+
+        with get_lock(tokenizer_name):
+            snapshot_download(
+                tokenizer_name,
+                revision=tokenizer_revision,
+                ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
+            )
 
     fast_tokenizer = None
     if (

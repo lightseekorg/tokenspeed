@@ -209,7 +209,6 @@ class Nvfp4LinearMethod(QuantizeMethodBase):
             quant="nvfp4",
             enable_pdl=_pdl_enabled(),
             override=kernel_override,
-            expected_kernel_name=kernel_override or "cublaslt_mm_nvfp4",
         )
         return out.view(x_fp4.size(0), w_n)
 

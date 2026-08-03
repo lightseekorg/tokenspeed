@@ -53,7 +53,9 @@ def _model_id() -> str:
 
 
 def _messages_to_text(
-    messages: list[dict[str, Any]], continue_final_message: bool = False
+    messages: list[dict[str, Any]],
+    continue_final_message: bool = False,
+    chat_template_kwargs: dict[str, Any] | None = None,
 ) -> str:
     tokenizer = getattr(async_llm, "tokenizer", None)
     if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
@@ -62,6 +64,7 @@ def _messages_to_text(
                 messages,
                 tokenize=False,
                 add_generation_prompt=not continue_final_message,
+                **(chat_template_kwargs or {}),
             )
         except TypeError:
             try:
@@ -140,6 +143,7 @@ def _request_to_generate_input(data: dict[str, Any], *, rid: str) -> GenerateReq
         text = _messages_to_text(
             data["messages"],
             continue_final_message=bool(data.get("continue_final_message", False)),
+            chat_template_kwargs=data.get("chat_template_kwargs"),
         )
         input_ids = None
     else:
