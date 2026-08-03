@@ -437,6 +437,8 @@ class K3DSparkModel(nn.Module):
         }
         params_dict = dict(self.named_parameters())
         loaded: set[str] = set()
+        packed_loaded: dict[str, set[str]] = {}
+        packed_expected: dict[str, set[str]] = {}
         unexpected: list[str] = []
 
         for name, loaded_weight in weights:
@@ -454,7 +456,19 @@ class K3DSparkModel(nn.Module):
                 if param is None:
                     continue
                 param.weight_loader(param, loaded_weight, shard_id)
-                loaded.add(target)
+                # Only the sources that feed *this* destination: a second
+                # packed parameter would otherwise make every one of them
+                # look permanently short of shards.
+                expected = {
+                    source
+                    for packed, source, _ in stacked_params_mapping
+                    if packed == param_name
+                }
+                packed_expected[target] = expected
+                seen = packed_loaded.setdefault(target, set())
+                seen.add(weight_name)
+                if seen == expected:
+                    loaded.add(target)
                 break
             else:
                 fused_key = next(
@@ -469,7 +483,12 @@ class K3DSparkModel(nn.Module):
                     param.weight_loader(
                         param, loaded_weight, begin_size=fused_qkv_a_offsets[fused_key]
                     )
-                    loaded.add(target)
+                    expected = set(fused_qkv_a_offsets)
+                    packed_expected[target] = expected
+                    seen = packed_loaded.setdefault(target, set())
+                    seen.add(fused_key)
+                    if seen == expected:
+                        loaded.add(target)
                     continue
 
                 param = params_dict.get(name)
@@ -484,6 +503,19 @@ class K3DSparkModel(nn.Module):
             raise ValueError(
                 f"K3 DSpark checkpoint has {len(unexpected)} unexpected weights "
                 f"with no destination: {sorted(unexpected)[:8]}"
+            )
+        incomplete = {
+            target: sorted(expected - packed_loaded.get(target, set()))
+            for target, expected in packed_expected.items()
+            if packed_loaded.get(target, set()) != expected
+        }
+        if incomplete:
+            examples = [
+                f"{target}: {missing}" for target, missing in incomplete.items()
+            ]
+            raise ValueError(
+                "K3 DSpark checkpoint has incomplete packed weights; missing "
+                f"source shards for {len(incomplete)} parameters: {examples[:8]}"
             )
         missing = sorted(set(params_dict) - loaded)
         if missing:

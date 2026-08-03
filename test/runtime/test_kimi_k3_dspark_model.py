@@ -10,8 +10,10 @@ the exact set of checkpoint keys the loader must route, skip, or reject.
 from __future__ import annotations
 
 import copy
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 from tokenspeed.runtime.configs.kimi_k3_dspark_config import (
     K3_DSPARK_SKIPPED_WEIGHT_PREFIXES,
@@ -19,6 +21,7 @@ from tokenspeed.runtime.configs.kimi_k3_dspark_config import (
     k3_dspark_inactive_features,
     validate_k3_dspark_config,
 )
+from tokenspeed.runtime.models.kimi_k3_dspark import K3DSparkModel
 
 # The published Inferact/Kimi-K3-DSpark config.json.
 INFERACT_CONFIG = dict(
@@ -313,3 +316,79 @@ def test_every_remaining_checkpoint_key_has_a_destination() -> None:
         routed.add(target)
 
     assert routed == expected_params
+
+
+class _FakePackedParameter:
+    def __init__(self) -> None:
+        self.loads: list[tuple[tuple, dict]] = []
+
+    def weight_loader(self, param, loaded_weight, *args, **kwargs) -> None:
+        assert param is self
+        self.loads.append((args, kwargs))
+
+
+class _FakeLoaderModel:
+    def __init__(self, target: str) -> None:
+        self.config = SimpleNamespace(q_lora_rank=1536)
+        self.param = _FakePackedParameter()
+        self.target = target
+        self.post_load_called = False
+
+    def named_parameters(self):
+        return [(self.target, self.param)]
+
+    def post_load_weights(self) -> None:
+        self.post_load_called = True
+
+
+@pytest.mark.parametrize(
+    ("target", "present_source", "missing_source"),
+    [
+        (
+            "layers.0.mlp.gate_up_proj.weight",
+            "layers.0.mlp.gate_proj.weight",
+            "up_proj",
+        ),
+        (
+            "layers.0.self_attn.fused_qkv_a_proj_with_mqa.weight",
+            "layers.0.self_attn.q_a_proj.weight",
+            "kv_a_proj_with_mqa",
+        ),
+    ],
+)
+def test_packed_parameter_rejects_a_missing_source_shard(
+    target: str, present_source: str, missing_source: str
+) -> None:
+    model = _FakeLoaderModel(target)
+    with pytest.raises(ValueError, match=missing_source):
+        K3DSparkModel.load_weights(
+            model, [(present_source, torch.zeros(1, dtype=torch.bfloat16))]
+        )
+    assert not model.post_load_called
+
+
+@pytest.mark.parametrize(
+    ("target", "sources"),
+    [
+        (
+            "layers.0.mlp.gate_up_proj.weight",
+            ("layers.0.mlp.gate_proj.weight", "layers.0.mlp.up_proj.weight"),
+        ),
+        (
+            "layers.0.self_attn.fused_qkv_a_proj_with_mqa.weight",
+            (
+                "layers.0.self_attn.q_a_proj.weight",
+                "layers.0.self_attn.kv_a_proj_with_mqa.weight",
+            ),
+        ),
+    ],
+)
+def test_packed_parameter_accepts_all_source_shards(
+    target: str, sources: tuple[str, str]
+) -> None:
+    model = _FakeLoaderModel(target)
+    K3DSparkModel.load_weights(
+        model, [(source, torch.zeros(1, dtype=torch.bfloat16)) for source in sources]
+    )
+    assert len(model.param.loads) == 2
+    assert model.post_load_called
