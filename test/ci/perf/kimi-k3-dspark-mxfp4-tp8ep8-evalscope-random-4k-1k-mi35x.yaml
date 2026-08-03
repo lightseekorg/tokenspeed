@@ -98,14 +98,26 @@ report:
   github_step_summary: true
 perf_threshold: 0.9
 # Values are [Latency (tps/user), Throughput (tps/gpu)].
-# Left unset until this 4k/1k job itself runs green: a guessed reference would
-# either gate on noise or never fail. The pure-K3 baseline it must beat is
-# 43.05 / 5.26 on the same topology.
 #
-# What has been measured on 8x MI355X so far, with decode graphs captured at
-# every bucket: accept length ~2.6 with the published 7-token block, and on the
-# AIME26 gate (16 concurrent, 64k context, both arms identically configured)
-# TPOT fell from 103.22 ms to 45.56 ms and throughput rose from 9.94 to 17.35
-# tok/s, with accuracy unchanged within noise. See
-# test/ci/eval/kimi-k3-dspark-mxfp4-tp8ep8-evalscope-aime26-amd.yaml.
-perf_reference: {}
+# Measured on 8x MI355X with bf16 weights and decode graphs, alongside a
+# speculator-free control in the identical configuration:
+#   DSpark   TPOT 39.28 ms -> 25.46 tps/user, 3.13 tps/gpu
+#   no spec  TPOT 21.51 ms -> 46.49 tps/user, 5.66 tps/gpu
+#
+# At concurrency 1 speculation is a NET LOSS here, by about 1.8x, and that is
+# expected rather than a defect: an accept length of ~2.6 cuts target forwards
+# by 2.6x, but each forward costs roughly 4.7x more because Kimi-K3 routes 16 of
+# 896 experts per token. One token activates 16 experts; verifying eight
+# activates far more than 8x16, so the grouped MoE GEMM grows superlinearly.
+# The same speculator is 2.27x FASTER on the AIME26 gate at concurrency 16,
+# where the expert set is already saturated and the extra verify tokens are
+# nearly free (see the sibling eval config).
+#
+# The reference below is therefore DSpark's own concurrency-1 number, so this
+# job tracks regressions in the speculative path. Do NOT read it against the
+# pure-target tracker's 43.05 / 5.26: that is MXFP4 on MI350X, and comparing
+# across quantization and hardware is how a non-existent regression gets
+# reported. Concurrency 1 is also the wrong operating point to judge DSpark by;
+# a higher-concurrency job is the one worth adding next.
+perf_reference:
+  1: [25.4, 3.1]
