@@ -88,7 +88,6 @@ tokenspeed serve nvidia/MiniMax-M3-NVFP4 \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
-    --drafter-attention-backend fa4 \
     --disable-kvstore \
     --block-size 128 \
     --trust-remote-code \
@@ -390,6 +389,9 @@ scheduler — the runtime disables overlap scheduling automatically when
 speculative decoding and paged-cache groups are both active — and prefix caching
 stays on by default. Add `--enable-metrics` to read `Decoded Tok/Iter` and the
 speculative accept rate from the run summary.
+
+DeepSeek V4 MTP currently requires `--disable-kvstore`; grouped paged-cache
+loadback does not yet restore the independent draft KV pool.
 
 ## Tuning Order
 

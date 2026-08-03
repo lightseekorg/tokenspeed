@@ -59,6 +59,56 @@ Start with the recipe closest to your model family, then tune:
 - `--all2all-backend`
 - `--deepep-mode`
 
+### DeepEP all-to-all
+
+`--all2all-backend deepep` moves expert routing off all-gather and onto DeepEP
+dispatch/combine. It requires a MoE backend whose kernels own those legs:
+`--moe-backend deep_gemm` (block-scale FP8) or `--moe-backend flashinfer_cutedsl`
+(nvfp4, decode-shaped batches only).
+
+DeepEP has two sets of legs, and `--deepep-mode` picks between them:
+
+| Mode | Legs | Fits |
+| --- | --- | --- |
+| `low_latency` | IBGDA dispatch into a preallocated per-expert buffer | Decode-shaped batches up to `--low-latency-max-num-tokens-per-gpu` |
+| `normal` | High-throughput dispatch, tokens permuted into per-expert row blocks | Extend-shaped batches of any size |
+| `auto` (default) | Both are allocated; each forward picks | Aggregated serving, which mixes both shapes |
+
+For block-scale FP8 with `deep_gemm`, keep `auto` unless the instance only ever
+sees one shape -- for example a decode-only worker in a PD split, which can pin
+`low_latency` and skip the normal-mode buffers. The nvfp4
+`flashinfer_cutedsl` kernel implements only the low-latency legs, so it requires
+an explicit `--deepep-mode low_latency`; `auto` and `normal` are rejected while
+the execution plan is built. Every forward on such an instance, including any
+prefill, must fit `--low-latency-max-num-tokens-per-gpu`.
+
+A batch above the low-latency capacity is rejected rather than truncated, so
+raise `--low-latency-max-num-tokens-per-gpu` if decode plus speculative draft
+tokens exceed it. Both current DeepEP MoE backends require BF16 activations;
+`--dtype float16` is not supported.
+
+The mode is chosen per forward from a value every rank agrees on, because the two
+modes are different collectives. With DP attention that value is "every DP rank
+is decoding", so one extending rank moves the whole group to the normal legs.
+
+The prefill CUDA graph is disabled whenever an all-to-all backend is selected:
+normal-mode dispatch reports its per-expert receive counts to the host, and a
+host sync cannot be captured. Decode graphs are unaffected.
+
+For block-scale FP8 decode on NVIDIA, the low-latency path keeps routing
+metadata in DeepEP's required contiguous int64/float32 formats across both
+collective legs. Its fused SwiGLU quantizer writes packed UE8M0 scales directly
+in DeepGEMM's MN-major TMA layout, so padded rows need no zero-fill and the
+second expert GEMM needs no separate activation-scale transpose/pack pass.
+Expert weight scales are expanded and packed once when weights are loaded,
+instead of ahead of both expert GEMMs in every layer forward. Shared-expert work
+is queued between the dispatch send and receive legs to overlap the collective
+whenever the model has a shared expert. Low-latency dispatch asks DeepEP to
+produce packed UE8M0 scales directly in its column-major TMA layout. Normal-mode
+dispatch still transports FP32 power-of-two scales, but the existing expert
+scatter packs them while permuting tokens, so neither mode needs a separate
+sequence of elementwise shifts, fills, copies, and a transpose before GEMM1.
+
 ## Multi-Node
 
 Set these explicitly:
@@ -74,6 +124,52 @@ tokenspeed serve <model> \
 
 Each node must use the same model, backend, precision, and scheduler settings.
 Only `--node-rank` should differ between nodes.
+
+Run one `tokenspeed serve` per node. Node rank 0 serves the HTTP API; higher
+ranks run the engine only and expose no endpoint.
+
+### Under a launcher
+
+Inside a multi-node Slurm step, `--nnodes`, `--node-rank` and
+`--dist-init-addr` are all derived from the step environment when they are not
+given, so the same command line runs on every node:
+
+```bash
+srun --nodes=2 --ntasks-per-node=1 tokenspeed serve <model> --attn-tp-size 16
+```
+
+| Argument | Derived from |
+| --- | --- |
+| `--nnodes` | `SLURM_STEP_NUM_NODES` |
+| `--node-rank` | `SLURM_NODEID` |
+| `--dist-init-addr` | first host of `SLURM_STEP_NODELIST`, port 23456 |
+
+Rules:
+
+- An explicit `--nnodes` or `--node-rank` that contradicts the environment is
+  an error, not an override. Omit the flag to accept the launcher's value.
+- An explicit `--dist-init-addr` is always used as given.
+- Derivation only engages inside an `srun` step of more than one node. Outside
+  a step — including the batch script of a multi-node `sbatch` — or in a
+  single-node step, behaviour is unchanged: launch the ranks yourself and pass
+  `--nnodes`/`--node-rank`/`--dist-init-addr`.
+- If a multi-node step is detected but the topology cannot be resolved,
+  startup fails with the reason rather than falling back to a single node.
+- The derived address is the one the head node's hostname resolves to. Where
+  that is not the interface you want carrying bootstrap traffic, set
+  `--dist-init-addr` explicitly.
+- `GLOO_SOCKET_IFNAME` and `NCCL_SOCKET_IFNAME` are set from the interface that
+  routes to the head node, unless already present in the environment. Gloo
+  needs this: it has no peer-address heuristic and otherwise binds whatever the
+  local hostname resolves to, which is a loopback entry on many hosts. NCCL
+  normally selects correctly on its own; it is set for consistency.
+- `NCCL_IB_HCA` is not set. NCCL's own device selection prefers the
+  higher-bandwidth InfiniBand devices and skips Ethernet-link ones.
+- The rendezvous port is a fixed constant, not a function of `--port`. Every
+  node has to arrive at the same port without talking to any other node, and
+  under `tokenspeed serve` the engine's own port is allocated per node. The
+  constant also stays clear of the kernel's ephemeral range, which is checked
+  at startup. Pass `--dist-init-addr` to use a different port.
 
 Apply the same NCCL transport and channel settings on every node as well. In
 particular, do not mix IB and Socket selection or different

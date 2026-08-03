@@ -26,6 +26,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 #include "tvm_ffi_utils.h"
@@ -80,6 +81,14 @@ inline std::vector<int64_t> indices_to_host(TensorView indices) {
   return host;
 }
 
+inline void check_cpu_uint64_vector(TensorView values, const char* name) {
+  TVM_FFI_ICHECK_EQ(values.ndim(), 1) << name << " must be a 1D tensor";
+  TVM_FFI_ICHECK_EQ(values.dtype(), dl_uint64)
+      << name << " must be a uint64 tensor";
+  TVM_FFI_ICHECK_EQ(values.device().device_type, kDLCPU)
+      << name << " must be a CPU tensor";
+}
+
 inline void copy_async_bytes(void* dst, const void* src, size_t num_bytes, cudaStream_t stream) {
   if (num_bytes == 0) {
     return;
@@ -87,25 +96,52 @@ inline void copy_async_bytes(void* dst, const void* src, size_t num_bytes, cudaS
   check_cuda(cudaMemcpyAsync(dst, src, num_bytes, cudaMemcpyDefault, stream), "cudaMemcpyAsync failed");
 }
 
-inline void copy_token_span(
-    TensorView src,
-    TensorView dst,
-    int64_t src_index,
-    int64_t dst_index,
-    int64_t num_tokens,
-    cudaStream_t stream) {
-  TVM_FFI_ICHECK_GE(src.dim(), 1);
-  TVM_FFI_ICHECK_GE(dst.dim(), 1);
+inline void check_cuda_uint64_vector(TensorView values, const char* name) {
+  CHECK_CUDA(values);
+  CHECK_DIM(1, values);
+  CHECK_INPUT_TYPE(values, dl_uint64);
+}
 
-  const int64_t src_stride_bytes = src.stride(0) * get_element_size(src);
-  const int64_t dst_stride_bytes = dst.stride(0) * get_element_size(dst);
-  TVM_FFI_ICHECK_EQ(src_stride_bytes, dst_stride_bytes)
-      << "Source and destination token stride bytes must match for direct copy";
+__global__ void scatter_h2d_pages_kernel(
+    const uint64_t* __restrict__ src_layer_ptrs,
+    const uint64_t* __restrict__ dst_layer_ptrs,
+    const int64_t* __restrict__ src_indices,
+    const int64_t* __restrict__ dst_indices,
+    int64_t num_layers,
+    int64_t num_pages,
+    int64_t item_size) {
+  const int64_t task_id = static_cast<int64_t>(blockIdx.x);
+  if (task_id >= num_layers * num_pages) {
+    return;
+  }
 
-  const size_t copy_bytes = static_cast<size_t>(num_tokens * src_stride_bytes);
-  const char* src_ptr = static_cast<const char*>(src.data_ptr()) + src_index * src_stride_bytes;
-  char* dst_ptr = static_cast<char*>(dst.data_ptr()) + dst_index * dst_stride_bytes;
-  copy_async_bytes(dst_ptr, src_ptr, copy_bytes, stream);
+  const int64_t page_id = task_id % num_pages;
+  const int64_t layer_id = task_id / num_pages;
+  const int64_t src_index = src_indices[page_id];
+  const int64_t dst_index = dst_indices[page_id];
+
+  const uintptr_t src_addr = static_cast<uintptr_t>(src_layer_ptrs[layer_id]) +
+                             static_cast<uintptr_t>(src_index * item_size);
+  const uintptr_t dst_addr = static_cast<uintptr_t>(dst_layer_ptrs[layer_id]) +
+                             static_cast<uintptr_t>(dst_index * item_size);
+  const char* src = reinterpret_cast<const char*>(src_addr);
+  char* dst = reinterpret_cast<char*>(dst_addr);
+
+  const bool aligned16 =
+      ((src_addr | dst_addr | static_cast<uintptr_t>(item_size)) & 0xF) == 0;
+  if (aligned16) {
+    const int64_t vec_count = item_size / static_cast<int64_t>(sizeof(uint4));
+    const uint4* src_vec = reinterpret_cast<const uint4*>(src);
+    uint4* dst_vec = reinterpret_cast<uint4*>(dst);
+    for (int64_t i = threadIdx.x; i < vec_count; i += blockDim.x) {
+      dst_vec[i] = src_vec[i];
+    }
+    return;
+  }
+
+  for (int64_t i = threadIdx.x; i < item_size; i += blockDim.x) {
+    dst[i] = src[i];
+  }
 }
 
 template <typename PackType>
@@ -756,23 +792,29 @@ void transfer_kv_all_layer_mla_lf_pf(
 }
 
 void transfer_kv_direct(
-    const std::vector<TensorView>& src_layers,
-    std::vector<TensorView> dst_layers,
+    TensorView src_layer_ptrs,
+    TensorView dst_layer_ptrs,
     TensorView src_indices,
     TensorView dst_indices,
+    int64_t item_size,
     int64_t page_size) {
-  TVM_FFI_ICHECK_EQ(src_layers.size(), dst_layers.size())
-      << "Source and destination layers must have the same number of layers";
+  check_cpu_uint64_vector(src_layer_ptrs, "src_layer_ptrs");
+  check_cpu_uint64_vector(dst_layer_ptrs, "dst_layer_ptrs");
+  TVM_FFI_ICHECK_EQ(src_layer_ptrs.numel(), dst_layer_ptrs.numel())
+      << "Source and destination pointer tables must have the same length";
   TVM_FFI_ICHECK_EQ(src_indices.numel(), dst_indices.numel())
       << "Source and destination indices must have the same length";
+  TVM_FFI_ICHECK_GT(item_size, 0) << "Item size must be positive";
   TVM_FFI_ICHECK_GT(page_size, 0) << "Page size must be positive";
   TVM_FFI_ICHECK_EQ(src_indices.numel() % page_size, 0)
       << "Source indices size must be divisible by page size";
 
+  const auto* src_ptrs = static_cast<const uint64_t*>(src_layer_ptrs.data_ptr());
+  const auto* dst_ptrs = static_cast<const uint64_t*>(dst_layer_ptrs.data_ptr());
   const auto src_indices_host = indices_to_host(src_indices);
   const auto dst_indices_host = indices_to_host(dst_indices);
   const int64_t num_indices = static_cast<int64_t>(src_indices_host.size());
-  const int64_t num_layers = static_cast<int64_t>(src_layers.size());
+  const int64_t num_layers = static_cast<int64_t>(src_layer_ptrs.numel());
   const cudaStream_t stream = get_current_stream();
 
   int64_t start_index = 0;
@@ -791,11 +833,54 @@ void transfer_kv_direct(
 
     const int64_t src_index = src_indices_host[start_index];
     const int64_t dst_index = dst_indices_host[start_index];
-    const int64_t num_tokens = end_index - start_index;
+    const int64_t num_items = end_index - start_index;
+    const size_t copy_bytes = static_cast<size_t>(num_items * item_size);
 
     for (int64_t j = 0; j < num_layers; ++j) {
-      copy_token_span(src_layers[j], dst_layers[j], src_index, dst_index, num_tokens, stream);
+      const char* src_ptr =
+          reinterpret_cast<const char*>(static_cast<uintptr_t>(src_ptrs[j])) +
+          src_index * item_size;
+      char* dst_ptr =
+          reinterpret_cast<char*>(static_cast<uintptr_t>(dst_ptrs[j])) +
+          dst_index * item_size;
+      copy_async_bytes(dst_ptr, src_ptr, copy_bytes, stream);
     }
     start_index = end_index;
   }
+}
+
+void transfer_kv_direct_ptr_table_scatter_h2d(
+    TensorView src_layer_ptrs,
+    TensorView dst_layer_ptrs,
+    TensorView src_indices,
+    TensorView dst_indices,
+    int64_t item_size) {
+  check_cuda_uint64_vector(src_layer_ptrs, "src_layer_ptrs");
+  check_cuda_uint64_vector(dst_layer_ptrs, "dst_layer_ptrs");
+  check_indices(src_indices, dst_indices);
+  TVM_FFI_ICHECK_EQ(src_layer_ptrs.numel(), dst_layer_ptrs.numel())
+      << "Source and destination pointer tables must have the same length";
+  TVM_FFI_ICHECK_GT(item_size, 0) << "Item size must be positive";
+
+  const int64_t num_layers = static_cast<int64_t>(src_layer_ptrs.numel());
+  const int64_t num_pages = static_cast<int64_t>(src_indices.numel());
+  if (num_layers == 0 || num_pages == 0) {
+    return;
+  }
+  const int64_t num_tasks = num_layers * num_pages;
+  TVM_FFI_ICHECK_LE(num_tasks,
+                    static_cast<int64_t>(std::numeric_limits<int>::max()))
+      << "Too many scatter H2D copy tasks for one launch";
+
+  const cudaStream_t stream = get_current_stream();
+  scatter_h2d_pages_kernel<<<static_cast<unsigned int>(num_tasks), 256, 0, stream>>>(
+      static_cast<const uint64_t*>(src_layer_ptrs.data_ptr()),
+      static_cast<const uint64_t*>(dst_layer_ptrs.data_ptr()),
+      static_cast<const int64_t*>(src_indices.data_ptr()),
+      static_cast<const int64_t*>(dst_indices.data_ptr()),
+      num_layers,
+      num_pages,
+      item_size);
+  check_cuda(cudaGetLastError(),
+             "transfer_kv_direct_ptr_table_scatter_h2d launch failed");
 }

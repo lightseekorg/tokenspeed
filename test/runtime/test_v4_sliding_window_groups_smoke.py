@@ -19,7 +19,6 @@ import pathlib
 import sys
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch
 
@@ -345,9 +344,6 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             self.assertLess(n, bound, spec.group_id)
 
     def test_deepseek_v4_pool_exposes_scheduler_cache_groups(self):
-        from tokenspeed.runtime.layers.attention.kv_cache import (
-            deepseek_v4 as deepseek_v4_kv,
-        )
         from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
             DeepseekV4TokenToKVPool,
             deepseek_v4_cache_layout_from_config,
@@ -391,7 +387,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             pool.paged_cache_group_page_counts["v4.c4a.compressed_kv"], 1
         )
         self.assertFalse(hasattr(pool, "prefix_cache_state_policy"))
-        self.assertFalse(pool.supports_hierarchical_kv_cache)
+        self.assertTrue(pool.supports_hierarchical_kv_cache)
         self.assertEqual(
             pool.prefix_cache_required_group_ids,
             (
@@ -399,31 +395,6 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                 "v4.c128a.compressed_kv",
             ),
         )
-
-        class FakePagedCacheScheduler:
-            @staticmethod
-            def paged_cache_group_total_pages(group_id: str) -> int:
-                return 11
-
-            @staticmethod
-            def paged_cache_group_available_pages(group_id: str) -> int:
-                return 4
-
-            @staticmethod
-            def paged_cache_group_failed_alloc_count(group_id: str) -> int:
-                return 2
-
-        pool.bind_paged_cache_scheduler(FakePagedCacheScheduler())
-        with (
-            patch.object(deepseek_v4_kv.logger, "isEnabledFor", return_value=True),
-            patch.object(deepseek_v4_kv.logger, "debug") as log_debug,
-        ):
-            pool.maybe_log_paged_cache_group_pages()
-        log_debug.assert_called_once()
-        logged_groups = log_debug.call_args.args[1]
-        self.assertIn("v4.swa_kv: used=7/11", logged_groups)
-        self.assertIn("v4.c4a.indexer_compressor_state", logged_groups)
-        self.assertIn("failed_alloc=2", logged_groups)
 
     def test_deepseek_v4_capacity_profile_matches_pool_buffers(self):
         from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (

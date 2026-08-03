@@ -56,9 +56,13 @@ import argparse
 import sys
 
 import torch
-from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
-    SITU_TUNE_MAX_NUM_TOKENS,
-)
+from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
+
+# Must match the tune_max the runtime keys its bucket ladder with: the
+# runtime floors chunked_prefill_size at the ops.tuning default (8192), so
+# the default sweep matches every deployment with chunked prefill <= 8192.
+# Resweep with a matching value for larger prefill configurations.
+SITU_TUNE_MAX_NUM_TOKENS = get_autotune_max_num_tokens()
 
 SF_BLOCK = 32
 # Buckets below this are left on the autotuner's own choice: the enumeration

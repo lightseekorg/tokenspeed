@@ -26,7 +26,12 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.tuning import freeze_autotuning
+import torch.distributed as dist
+from tokenspeed_kernel.ops.tuning import (
+    autotune,
+    set_autotune_max_num_tokens,
+    set_autotune_process_group,
+)
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
@@ -35,11 +40,15 @@ from tokenspeed.runtime.configs.paged_cache_spec import (
     validate_flat_scheduler_config,
 )
 from tokenspeed.runtime.configs.utils import get_rope_parameters
+from tokenspeed.runtime.distributed.process_group_manager import (
+    process_group_manager as pg_manager,
+)
 from tokenspeed.runtime.engine.scheduler_utils import (
     flat_block_tables_from_forward_op,
     paged_cache_block_table_base_offsets_from_forward_op,
     paged_cache_block_tables_from_forward_op,
 )
+from tokenspeed.runtime.execution.breakable_cuda_graph import active_forward
 from tokenspeed.runtime.execution.cache_loc_kernel import update_block_table
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
@@ -131,7 +140,14 @@ PREFILL_GRAPH_DEFAULT_MAX_TOKENS = 2048
 
 
 def _resolve_prefill_graph_max_tokens(server_args) -> int:
-    """Largest prefill-graph bucket: explicit value, or min(2048, chunk, kv budget)."""
+    """Largest prefill-graph bucket: explicit value, or min(2048, chunk, kv budget).
+
+    Returns 0 (graph off) when the MoE all-to-all backend is DeepEP: an
+    extend-shaped forward takes DeepEP's normal dispatch, whose per-expert
+    receive counts come back to the host, and a host sync cannot be captured.
+    """
+    if server_args.all2all_backend not in (None, "none"):
+        return 0
     if server_args.prefill_graph_max_tokens is not None:
         return int(server_args.prefill_graph_max_tokens)
     cap = PREFILL_GRAPH_DEFAULT_MAX_TOKENS
@@ -574,8 +590,8 @@ class ModelExecutor:
             logger.info("Finished prewarming Triton RSAG communication states")
 
         # Breakable prefill (extend) CUDA graphs, the extend-mode analogue of
-        # the decode wrapper above; captures in __init__, borrowing the decode
-        # capture stream so all graphs share one mempool-reuse domain.
+        # the decode wrapper above; borrows the decode capture stream so all
+        # graphs share one mempool-reuse domain.
         self.prefill_graph = PrefillGraph(
             model_runner=self.model_runner,
             attn_backend=attn_backend,
@@ -584,8 +600,14 @@ class ModelExecutor:
             config=config,
             req_to_page=self.req_to_page,
             drafter=self.drafter,
-            decode_wrapper=self.forward_step,
         )
+
+        self._autotune()
+
+        if not self.forward_step.disable:
+            self.forward_step.capture()
+        if not self.prefill_graph.disable:
+            self.prefill_graph.capture(self.forward_step)
 
         # Encoder CUDA graph: install model-built wrappers by overriding
         # modality encoder callables (e.g. ``image_encoder``, ``video_encoder``).
@@ -648,10 +670,49 @@ class ModelExecutor:
 
         set_random_seed(48)
 
-        # Startup has tuned every size class it serves; serving must never autotune.
-        freeze_autotuning()
-
         logger.info("ModelExecutor initialized")
+
+    def _autotune(self) -> None:
+        """Profile tunable kernels over one dummy prefill, before graph capture.
+
+        Runs a single extend forward at the largest token count a forward can
+        carry; the tuner enumerates every smaller shape bucket from it, so no
+        decode-sized pass is needed. Must precede capture: a captured graph
+        records the tactic chosen while it was recorded, so tuning afterwards
+        cannot change a replay. On distributed boots, per-tactic timings are
+        averaged over the world so every rank picks the same tactic.
+        """
+        num_tokens = int(self.config.chunked_prefill_size)
+        if num_tokens <= 0 or self.model_runner is None:
+            return
+
+        cpu_group = None
+        if self.config.world_size > 1:
+            cpu_group = pg_manager.get_process_group("gloo", self.config.world_group)
+
+        logger.info(f"Kernel tuning with a dummy prefill of {num_tokens} tokens")
+        ib = self.input_buffers
+        tic = time.time()
+        set_autotune_max_num_tokens(num_tokens)
+        set_autotune_process_group(cpu_group)
+        with autotune(), maybe_inference_mode():
+            ctx = self.prefill_graph.make_dummy_batch(num_tokens, self.forward_step)
+            positions = (
+                ib.mrope_positions_buf[:, :num_tokens]
+                if self.config.model_is_mrope
+                else ib.positions_buf[:num_tokens]
+            )
+            with active_forward(ctx):
+                self.model_runner.forward(
+                    ctx=ctx,
+                    input_ids=ib.input_ids_buf[:num_tokens],
+                    positions=positions,
+                    out_cache_loc=ib.out_cache_loc_buf[:num_tokens],
+                )
+        set_autotune_process_group(None)
+        torch.cuda.synchronize()
+        dist.barrier()
+        logger.info(f"Kernel tuning finished in {time.time() - tic:.1f}s")
 
     @staticmethod
     def _make_mrope_decode_deltas_cpu(size: int) -> torch.Tensor:
@@ -755,11 +816,7 @@ class ModelExecutor:
             else:
                 positions = self.input_buffers.positions_buf[: ctx.input_num_tokens]
         # Prefill-graph replay when captured for this forward (the decode graph
-        # replays one level up: it captures the whole _forward_step). The mode
-        # check is LOAD-BEARING, not an optimization: the decode capture runs
-        # this dispatch before prefill_graph exists (it is constructed after
-        # the decode wrapper, whose capture stream it borrows), and decode-mode
-        # forwards must short-circuit before touching it.
+        # replays one level up: it captures the whole _forward_step).
         mode = ctx.forward_mode
         if (
             mode is not None

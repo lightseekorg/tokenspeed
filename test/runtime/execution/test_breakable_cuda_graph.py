@@ -554,6 +554,49 @@ class TestPrefillTokenBuckets(unittest.TestCase):
         self.assertEqual(buckets, [256, 1024, 2048])
 
 
+class TestPrefillGraphMaxTokensResolution(unittest.TestCase):
+    """Which server args switch the prefill graph off entirely."""
+
+    @staticmethod
+    def _args(**overrides):
+        base = dict(
+            prefill_graph_max_tokens=None,
+            chunked_prefill_size=8192,
+            max_total_tokens=None,
+            all2all_backend="none",
+        )
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    def test_default_ceiling(self):
+        from tokenspeed.runtime.execution.model_executor import (
+            PREFILL_GRAPH_DEFAULT_MAX_TOKENS,
+            _resolve_prefill_graph_max_tokens,
+        )
+
+        self.assertEqual(
+            _resolve_prefill_graph_max_tokens(self._args()),
+            PREFILL_GRAPH_DEFAULT_MAX_TOKENS,
+        )
+
+    def test_all_to_all_backend_disables_the_graph(self):
+        from tokenspeed.runtime.execution.model_executor import (
+            _resolve_prefill_graph_max_tokens,
+        )
+
+        # DeepEP's normal dispatch reports per-expert receive counts to the host,
+        # and a host sync cannot be captured -- even when asked for explicitly.
+        self.assertEqual(
+            _resolve_prefill_graph_max_tokens(self._args(all2all_backend="deepep")), 0
+        )
+        self.assertEqual(
+            _resolve_prefill_graph_max_tokens(
+                self._args(all2all_backend="deepep", prefill_graph_max_tokens=2048)
+            ),
+            0,
+        )
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
 class TestWeakRefTensor(unittest.TestCase):
     """The non-owning-view op behind break-closure weak refs."""

@@ -22,7 +22,7 @@
 """Utilities for selecting and loading models."""
 
 import contextlib
-from collections.abc import Iterator
+from collections.abc import Generator
 
 import torch
 from torch import nn
@@ -34,7 +34,7 @@ logger = get_colorful_logger(__name__)
 
 
 @contextlib.contextmanager
-def set_default_torch_dtype(dtype: torch.dtype) -> Iterator[None]:
+def set_default_torch_dtype(dtype: torch.dtype) -> Generator[None]:
     """Sets the default torch dtype to the given dtype."""
     old_dtype = torch.get_default_dtype()
     torch.set_default_dtype(dtype)

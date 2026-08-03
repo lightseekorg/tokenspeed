@@ -33,7 +33,6 @@ from tokenspeed_kernel.ops.gemm.fp8_utils import (
     static_quant_fp8,
     swizzle_mxfp8_scale,
 )
-from tokenspeed_kernel.platform import Platform
 from torch.nn.parameter import Parameter
 
 logger = logging.getLogger(__name__)
@@ -52,7 +51,6 @@ try:
 except ImportError:
     has_flashinfer_mxfp8 = None
 
-from tokenspeed.runtime.layers.dense.utils import normalize_e4m3fn_to_e4m3fnuz
 from tokenspeed.runtime.layers.parameter import (
     BlockQuantScaleParameter,
     ModelWeightParameter,
@@ -62,8 +60,6 @@ from tokenspeed.runtime.layers.quantization.base_config import LinearMethodBase
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 from tokenspeed.runtime.layers.quantization.utils import convert_to_channelwise
 from tokenspeed.runtime.utils.pdl import pdl_enabled
-
-platform = Platform.get()
 
 
 class Fp8LinearMethod(LinearMethodBase):
@@ -208,19 +204,6 @@ class Fp8LinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if self.block_quant:
-            # If ROCm, normalize the weights and scales to e4m3fnuz
-            if platform.is_fp8e4m3fnuz:
-                # activation_scheme: dynamic
-                weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-                    weight=layer.weight,
-                    weight_scale=layer.weight_scale_inv,
-                    input_scale=None,
-                )
-                layer.input_scale = None
-            else:
-                weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
-            layer.weight.data = weight.data
-            layer.weight_scale_inv.data = weight_scale.data
             layer._use_deep_gemm_fp8 = False
             is_bmm = getattr(layer, "is_bmm", False)
             is_ue8m0 = getattr(self.quant_config, "scale_fmt", None) == "ue8m0"

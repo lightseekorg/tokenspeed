@@ -28,7 +28,6 @@ from tokenspeed_kernel.benchmark.config import BenchmarkConfig
 from tokenspeed_kernel.benchmark.report import format_report
 from tokenspeed_kernel.benchmark.result import export_results
 from tokenspeed_kernel.benchmark.runner import BenchmarkRunner
-from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.profiling import ProfilingConfig
 from tokenspeed_kernel.registry import load_builtin_kernels
 
@@ -36,7 +35,7 @@ _DTYPE_SELECTIONS: dict[str, torch.dtype] = {
     "fp32": torch.float32,
     "fp16": torch.float16,
     "bf16": torch.bfloat16,
-    "fp8": Platform.get().fp8e4m3fn.dtype,
+    "fp8": torch.float8_e4m3fn,
 }
 
 

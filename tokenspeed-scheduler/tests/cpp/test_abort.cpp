@@ -30,12 +30,6 @@ protected:
         return cfg;
     }
 
-    void SendAbort(const std::string& id) {
-        ExecutionEvent event;
-        event.With(ForwardEvent{forward::Abort{.request_id = id}});
-        scheduler_->Advance(std::move(event));
-    }
-
     void SendUpdateReserveNumTokens(const std::string& id, std::int32_t n) {
         ExecutionEvent event;
         event.With(ForwardEvent{forward::UpdateReserveNumTokens{
@@ -51,42 +45,31 @@ protected:
         SendForwardDone(id, {42});
         PlanOnce();
     }
-
-    static bool RequestInFwd(const ExecutionPlan& plan, const std::string& id) {
-        for (const auto& op : plan.Operations()) {
-            if (auto* fwd = std::get_if<FlatForwardOperation>(&op)) {
-                for (const auto& rid : fwd->request_ids) {
-                    if (rid == id) return true;
-                }
-            }
-        }
-        return false;
-    }
 };
 
 TEST_F(AbortTestSuite, Abort_FromSubmitted) {
     Submit(MakeRequestSpec("r1", 2));
-    SendAbort("r1");
+    SendAbortEvent("r1");
     auto plan = PlanOnce();
     EXPECT_FALSE(RequestInFwd(plan, "r1"));
 }
 
 TEST_F(AbortTestSuite, Abort_FromDecoding) {
     BringToDecoding("r1");
-    SendAbort("r1");
+    SendAbortEvent("r1");
     EXPECT_EQ(scheduler_->DecodingSize(), 0u);
     auto plan = PlanOnce();
     EXPECT_FALSE(RequestInFwd(plan, "r1"));
 }
 
 TEST_F(AbortTestSuite, Abort_UnknownRequestDoesNotThrow) {
-    EXPECT_NO_THROW(SendAbort("nonexistent"));
+    EXPECT_NO_THROW(SendAbortEvent("nonexistent"));
 }
 
 TEST_F(AbortTestSuite, Abort_DoesNotAffectOtherRequests) {
     BringToDecoding("r1");
     BringToDecoding("r2", 2, 50);
-    SendAbort("r1");
+    SendAbortEvent("r1");
     EXPECT_EQ(scheduler_->DecodingSize(), 1u);
 }
 
@@ -104,19 +87,19 @@ TEST_F(AbortTestSuite, Abort_DoesNotAffectOtherRequests) {
 // same async-race semantics.
 TEST_F(AbortTestSuite, ExtendResult_AfterAbort_DroppedNotThrown) {
     BringToDecoding("r1");
-    SendAbort("r1");
+    SendAbortEvent("r1");
     EXPECT_NO_THROW(SendForwardDone("r1", {99}));
 }
 
 TEST_F(AbortTestSuite, UpdateReserveNumTokens_AfterAbort_DroppedNotThrown) {
     BringToDecoding("r1");
-    SendAbort("r1");
+    SendAbortEvent("r1");
     EXPECT_NO_THROW(SendUpdateReserveNumTokens("r1", 1));
 }
 
 TEST_F(AbortTestSuite, Finish_AfterAbort_DroppedNotThrown) {
     BringToDecoding("r1");
-    SendAbort("r1");
+    SendAbortEvent("r1");
     EXPECT_NO_THROW(SendFinish("r1"));
 }
 

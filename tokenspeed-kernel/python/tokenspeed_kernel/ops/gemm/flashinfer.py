@@ -24,7 +24,6 @@ import torch
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
-    Platform,
     current_platform,
 )
 from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
@@ -36,7 +35,7 @@ from tokenspeed_kernel.signature import (
 )
 
 platform = current_platform()
-_fp8_dtype = Platform.get().fp8e4m3fn.dtype
+_fp8_dtype = torch.float8_e4m3fn
 
 _fp4_dtypes: frozenset[torch.dtype] = frozenset({torch.uint8, torch.float4_e2m1fn_x2})
 _MXFP8_SCALE = ScaleFormat(

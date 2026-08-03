@@ -54,7 +54,7 @@ from __future__ import annotations
 import functools
 import gc
 from collections import deque
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from typing import Any
 
@@ -79,7 +79,7 @@ _ambient_ctx: Any = None
 
 
 @contextmanager
-def active_forward(ctx: Any) -> Iterator[None]:
+def active_forward(ctx: Any) -> Generator[None]:
     """Publish ``ctx`` as the ambient forward context for the enclosed block.
 
     An eager break runs once at capture and again on every replay, and the args
