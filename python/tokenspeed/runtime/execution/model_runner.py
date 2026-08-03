@@ -58,6 +58,11 @@ def infer_multimodal_encoder_dtype(model: torch.nn.Module) -> str | None:
             dtype = getattr(component, "dtype", None)
             if isinstance(dtype, torch.dtype):
                 return str(dtype).removeprefix("torch.")
+            if isinstance(component, torch.nn.Module):
+                for tensors in (component.parameters(), component.buffers()):
+                    for tensor in tensors:
+                        if tensor.is_floating_point():
+                            return str(tensor.dtype).removeprefix("torch.")
     return None
 
 
