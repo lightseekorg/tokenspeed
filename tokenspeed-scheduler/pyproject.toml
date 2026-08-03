@@ -13,6 +13,9 @@ name = "tokenspeed-scheduler"
 version = "0.1.3"
 description = "TokenSpeed C++ scheduler with Python bindings"
 requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+]
 
 [project.optional-dependencies]
 test = [

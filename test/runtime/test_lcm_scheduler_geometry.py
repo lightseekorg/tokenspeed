@@ -34,3 +34,15 @@ def test_lcm_scheduler_geometry_uses_contract_token_capacity():
 
     assert geometry.num_usable_pages == 37
     assert geometry.token_capacity == 10_000
+
+
+def test_ordinary_scheduler_geometry_adds_the_null_page():
+    geometry = scheduler_cache_geometry_from_pool(
+        SimpleNamespace(runtime_contract=None),
+        fallback_token_capacity=4 * 64,
+        fallback_page_size=64,
+    )
+
+    assert geometry.num_device_pages == 5
+    assert geometry.num_usable_pages == 4
+    assert geometry.token_capacity == 4 * 64

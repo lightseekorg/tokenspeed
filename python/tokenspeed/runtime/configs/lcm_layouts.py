@@ -22,7 +22,114 @@
 
 from __future__ import annotations
 
+from collections import Counter
+from collections.abc import Mapping, Sequence
+
 from tokenspeed.runtime.configs.lcm_memory_plan import LcmFieldSpec
+
+
+def deepseek_v4_lcm_fields(
+    *,
+    layer_ratios: Sequence[int],
+    logical_block_tokens: int,
+    swa_shape: Sequence[int],
+    compressed_shapes: Mapping[int, tuple[int, ...]],
+    compressor_state_shapes: Mapping[int, tuple[int, ...]],
+    indexer_kv_shape: Sequence[int],
+    indexer_state_shape: Sequence[int],
+    kv_page_stride_alignment_bytes: int,
+) -> tuple[LcmFieldSpec, ...]:
+    """Describe DSV4 history pages and bounded live-tail state."""
+    if logical_block_tokens != 256:
+        raise ValueError("DeepSeek V4 LCM scheduling requires P=256")
+    ratios = tuple(int(ratio) for ratio in layer_ratios)
+    if any(ratio not in (1, 4, 128) for ratio in ratios):
+        raise ValueError("DeepSeek V4 layer ratios must be 1, 4, or 128")
+
+    fields: list[LcmFieldSpec] = []
+    ratio_counts = Counter(ratios)
+    occurrences: dict[str, int] = {}
+    for layer_id, ratio in enumerate(ratios):
+        swa_group = "v4.swa_kv"
+        swa_slot = occurrences.get(swa_group, 0)
+        occurrences[swa_group] = swa_slot + 1
+        fields.append(
+            LcmFieldSpec(
+                swa_group,
+                f"layer.{layer_id}.swa",
+                # Occurrence-aligned planes are shared by every group. A
+                # parent is bound to one group at a time, so the same bytes
+                # can hold this SWA ring, compressed history, or state.
+                f"unit.{swa_slot}",
+                tuple(swa_shape),
+                1,
+                exact_page_stride=False,
+                page_stride_alignment_bytes=kv_page_stride_alignment_bytes,
+            )
+        )
+        if ratio == 1:
+            continue
+
+        compressed_group = f"v4.c{ratio}a.compressed_kv"
+        state_group = f"v4.c{ratio}a.compressor_state"
+        try:
+            compressed_shape = tuple(compressed_shapes[ratio])
+            state_shape = tuple(compressor_state_shapes[ratio])
+        except KeyError as exc:
+            raise ValueError(f"missing DeepSeek V4 ratio-{ratio} geometry") from exc
+        compressed_slot = occurrences.get(compressed_group, 0)
+        occurrences[compressed_group] = compressed_slot + 1
+        state_slot = occurrences.get(state_group, 0)
+        occurrences[state_group] = state_slot + 1
+        fields.extend(
+            (
+                LcmFieldSpec(
+                    compressed_group,
+                    f"layer.{layer_id}.compressed_kv",
+                    f"unit.{compressed_slot}",
+                    compressed_shape,
+                    1,
+                    exact_page_stride=False,
+                    page_stride_alignment_bytes=kv_page_stride_alignment_bytes,
+                ),
+                LcmFieldSpec(
+                    state_group,
+                    f"layer.{layer_id}.compressor_state",
+                    f"unit.{state_slot}",
+                    state_shape,
+                    4,
+                    exact_page_stride=False,
+                ),
+            )
+        )
+        if ratio != 4:
+            continue
+        indexer_state_group = "v4.c4a.indexer_compressor_state"
+        indexer_state_slot = occurrences.get(indexer_state_group, 0)
+        occurrences[indexer_state_group] = indexer_state_slot + 1
+        fields.extend(
+            (
+                LcmFieldSpec(
+                    compressed_group,
+                    f"layer.{layer_id}.indexer_kv",
+                    # Keep the larger compressed-KV fields first, then place
+                    # indexer fields in the remaining shared unit planes.
+                    f"unit.{ratio_counts[4] + compressed_slot}",
+                    tuple(indexer_kv_shape),
+                    1,
+                    exact_page_stride=False,
+                ),
+                LcmFieldSpec(
+                    indexer_state_group,
+                    f"layer.{layer_id}.indexer_state",
+                    f"unit.{indexer_state_slot}",
+                    tuple(indexer_state_shape),
+                    4,
+                    exact_page_stride=False,
+                ),
+            )
+        )
+    return tuple(fields)
 
 
 def mla_history_lcm_fields(

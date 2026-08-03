@@ -125,6 +125,7 @@ def _run_rt_generate(
         model=_MODEL,
         dtype=get_dtype_str(torch_dtype),
         seed=42,
+        disable_kvstore=True,
     )
     try:
         output_strs: List[str] = []

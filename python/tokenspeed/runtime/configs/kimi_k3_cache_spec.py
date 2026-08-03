@@ -25,7 +25,7 @@ from collections.abc import Mapping
 
 import torch
 
-from tokenspeed.runtime.configs.flat_cache_runtime import require_positive_int
+from tokenspeed.runtime.configs.cache_runtime import require_positive_int
 from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
 from tokenspeed.runtime.configs.lcm_layouts import (
     kimi_k3_lcm_fields as build_lcm_fields,
@@ -66,7 +66,7 @@ def kimi_k3_layer_group_ids(text_config: KimiLinearConfig) -> tuple[str, ...]:
     """Map every Kimi-K3 layer to one Full or KDA cache group."""
     if text_config.num_hidden_layers != _KIMI_K3_LAYERS:
         raise ValueError(
-            f"Kimi-K3 FlatKV requires 93 layers, got {text_config.num_hidden_layers}"
+            f"Kimi-K3 Paged cache requires 93 layers, got {text_config.num_hidden_layers}"
         )
     linear = text_config.linear_attn_config
     if not isinstance(linear, Mapping):
@@ -85,7 +85,7 @@ def kimi_k3_layer_group_ids(text_config: KimiLinearConfig) -> tuple[str, ...]:
         or len(full_layer_ids) != _KIMI_K3_MLA_LAYERS
     ):
         raise ValueError(
-            f"Kimi-K3 FlatKV requires 69 KDA and 24 MLA layers, got "
+            f"Kimi-K3 Paged cache requires 69 KDA and 24 MLA layers, got "
             f"{len(kda_layer_ids)} and {len(full_layer_ids)}"
         )
     if "full_attn_layers" in linear:
@@ -122,12 +122,14 @@ def build_kimi_k3_lcm_fields(
     tp_size = require_positive_int("tp_size", tp_size)
     if mla_cache_dtype != torch.float8_e4m3fn:
         raise ValueError(
-            "Kimi-K3 FlatKV initially requires mla_cache_dtype=torch.float8_e4m3fn"
+            "Kimi-K3 Paged cache initially requires mla_cache_dtype=torch.float8_e4m3fn"
         )
     if mla_quant_method == "per_token_head":
-        raise ValueError("Kimi-K3 FlatKV does not support per_token_head MLA cache")
+        raise ValueError(
+            "Kimi-K3 Paged cache does not support per_token_head MLA cache"
+        )
     if getattr(text_config, "mla_use_nope", None) is not True:
-        raise ValueError("Kimi-K3 FlatKV requires mla_use_nope=True")
+        raise ValueError("Kimi-K3 Paged cache requires mla_use_nope=True")
 
     linear = text_config.linear_attn_config
     num_heads = require_positive_int(
@@ -161,7 +163,6 @@ def build_kimi_k3_lcm_fields(
 def plan_kimi_k3_lcm_cache(
     text_config: KimiLinearConfig,
     *,
-    flat_kvcache_enabled: bool,
     tp_size: int,
     mla_cache_dtype: torch.dtype,
     mla_quant_method: str | None,
@@ -169,10 +170,6 @@ def plan_kimi_k3_lcm_cache(
     num_lcm_blocks: int | None = None,
 ) -> LcmMemoryPlan:
     """Plan Kimi-K3 on the common P=128 two-level LCM geometry."""
-    if not flat_kvcache_enabled:
-        raise RuntimeError(
-            "Kimi-K3 is FlatKV-only and requires tokenspeed_scheduler.FLAT_KVCACHE=True"
-        )
     fields = build_kimi_k3_lcm_fields(
         text_config,
         tp_size=tp_size,
@@ -230,7 +227,9 @@ def kimi_k3_lcm_blocks_needed(
             f"overlap_schedule_depth must be 0 or 1, got {overlap_schedule_depth}"
         )
     if overlap_schedule_depth and decode_input_tokens == 0:
-        raise ValueError("overlapped FlatKV sizing requires decode_input_tokens > 0")
+        raise ValueError(
+            "overlapped Paged cache sizing requires decode_input_tokens > 0"
+        )
 
     page_tokens = plan.logical_block_tokens
     protected_pages = max_live_requests * math.ceil(
@@ -247,7 +246,10 @@ def kimi_k3_lcm_blocks_needed(
                 + protected_pages
             )
         else:
-            child_pages = max_live_requests + scheduled_pages + protected_pages
+            # MambaStateManager keeps the current and next writable state page
+            # per live request in addition to the pages materialized by the
+            # scheduled chunk.
+            child_pages = 2 * max_live_requests + scheduled_pages + protected_pages
         total_lcm_blocks += math.ceil(child_pages / group.cache_blocks_per_lcm_block)
     return total_lcm_blocks
 
@@ -291,6 +293,6 @@ def kimi_k3_token_capacity_for_lcm_pool(
     if low == 0:
         raise ValueError(
             f"num_lcm_blocks={num_lcm_blocks} cannot admit one token with "
-            "the configured Kimi-K3 FlatKV scheduler limits"
+            "the configured Kimi-K3 Paged cache scheduler limits"
         )
     return low

@@ -25,6 +25,7 @@ import dataclasses
 import json
 import os
 import random
+import socket
 from typing import Literal
 
 from tokenspeed_kernel.ops.attention.triton.linear.chunk_delta_h import (
@@ -41,6 +42,7 @@ from tokenspeed.runtime.utils import (
     maybe_model_redirect,
     nullable_str,
 )
+from tokenspeed.runtime.utils.launcher import check_dist_init_port, detect_topology
 from tokenspeed.runtime.utils.network import is_port_available
 
 logger = get_colorful_logger(__name__)
@@ -95,15 +97,6 @@ class ServerArgs:
     block_size: int = 64
     # special kv cache
     mamba_ssm_dtype: str = "float32"
-    mamba_track_interval: int = 256
-    max_mamba_cache_size: int | None = None
-    mamba_full_memory_ratio: float = 0.9
-    enable_mamba_l2: bool = False
-    mamba_l2_host_slots: int = 0
-    mamba_l2_ratio: float = 2.0
-    mamba_l2_layout: str = "layer_first"
-    mamba_l2_io_backend: str = "kernel"
-    mamba_l2_host_gb: int = 0
 
     # Other runtime options
     stream_interval: int = 1
@@ -195,10 +188,11 @@ class ServerArgs:
     kvstore_storage_backend_extra_config: str | None = None
     enable_mla_l1_5_cache: bool = False
 
-    # Multi-node distributed serving
+    # Multi-node distributed serving. ``None`` means "not given by the user",
+    # which is what lets the launcher environment fill them in.
     dist_init_addr: str | None = None
-    nnodes: int = 1
-    node_rank: int = 0
+    nnodes: int | None = None
+    node_rank: int | None = None
 
     # Hugging Face model config overrides in JSON
     hf_overrides: str = "{}"
@@ -315,6 +309,7 @@ class ServerArgs:
 
     def __post_init__(self):
         self.resolve_basic_defaults()
+        self.resolve_launcher_topology()
         self.resolve_parallelism()
         self.resolve_memory_and_scheduling()
         self.resolve_kernel_backends()
@@ -444,6 +439,42 @@ class ServerArgs:
                 self.sampling_backend = "flashinfer"
             else:
                 self.sampling_backend = "greedy"
+
+    def resolve_launcher_topology(self):
+        """Fill in unset multi-node arguments from the launcher environment."""
+        topology = detect_topology()
+        if topology is None:
+            self.nnodes = 1 if self.nnodes is None else self.nnodes
+            self.node_rank = 0 if self.node_rank is None else self.node_rank
+            return
+
+        for flag, given, found in (
+            ("--nnodes", self.nnodes, topology.nnodes),
+            ("--node-rank", self.node_rank, topology.node_rank),
+        ):
+            if given is not None and given != found:
+                raise ValueError(
+                    f"{flag}={given} contradicts the {topology.source} environment, "
+                    f"which reports {found}. Drop the flag to use the launcher's "
+                    f"value, or correct the launch."
+                )
+
+        derived = []
+        if self.nnodes is None:
+            self.nnodes = topology.nnodes
+            derived.append(f"--nnodes {self.nnodes}")
+        if self.node_rank is None:
+            self.node_rank = topology.node_rank
+            derived.append(f"--node-rank {self.node_rank}")
+        if self.dist_init_addr is None:
+            check_dist_init_port(topology.dist_init_port)
+            self.dist_init_addr = topology.dist_init_addr
+            derived.append(f"--dist-init-addr {self.dist_init_addr}")
+        if derived:
+            logger.info(
+                f"node {self.node_rank}/{self.nnodes} on {socket.gethostname()}: "
+                f"derived from {topology.source}: {' '.join(derived)}"
+            )
 
     def resolve_parallelism(self):
         world_size = self.world_size
@@ -1019,62 +1050,6 @@ class ServerArgs:
             help="It is used to tune mamba ssm dtype",
         )
         parser.add_argument(
-            "--mamba-track-interval",
-            type=int,
-            default=ServerArgs.mamba_track_interval,
-            help="The interval to track the mamba state during decode.",
-        )
-        parser.add_argument(
-            "--max-mamba-cache-size",
-            type=int,
-            default=ServerArgs.max_mamba_cache_size,
-            help="The maximum number of Mamba cache chunks. If unset, the pool size is profiled from available memory.",
-        )
-        parser.add_argument(
-            "--mamba-full-memory-ratio",
-            type=float,
-            default=ServerArgs.mamba_full_memory_ratio,
-            help="Memory ratio used to split cache budget between Mamba state chunks and full-attention KV cache.",
-        )
-        parser.add_argument(
-            "--enable-mamba-l2",
-            action="store_true",
-            help="Enable host-memory L2 cache for Mamba state slots.",
-        )
-        parser.add_argument(
-            "--mamba-l2-host-slots",
-            type=int,
-            default=ServerArgs.mamba_l2_host_slots,
-            help="Number of host Mamba L2 slots. If 0, derive from --mamba-l2-host-gb or --mamba-l2-ratio.",
-        )
-        parser.add_argument(
-            "--mamba-l2-ratio",
-            type=float,
-            default=ServerArgs.mamba_l2_ratio,
-            help="Mamba host L2 slot ratio relative to device Mamba slots when host slots are not explicit.",
-        )
-        parser.add_argument(
-            "--mamba-l2-layout",
-            type=str,
-            choices=["layer_first"],
-            default=ServerArgs.mamba_l2_layout,
-            help="Mamba host L2 memory layout.",
-        )
-        parser.add_argument(
-            "--mamba-l2-io-backend",
-            type=str,
-            choices=["direct", "kernel"],
-            default=ServerArgs.mamba_l2_io_backend,
-            help="IO backend for Mamba L2 host/device transfers.",
-        )
-        parser.add_argument(
-            "--mamba-l2-host-gb",
-            type=int,
-            default=ServerArgs.mamba_l2_host_gb,
-            help="Mamba L2 host memory budget in GiB. Overrides --mamba-l2-ratio when host slots are not explicit.",
-        )
-
-        parser.add_argument(
             "--max-prefill-tokens",
             metavar="MAX_PREFILL_TOKENS",
             type=int,
@@ -1301,7 +1276,8 @@ class ServerArgs:
             "--moe-backend",
             type=str,
             default=ServerArgs.moe_backend,
-            help="MoE runner backend: auto, triton, gluon, flashinfer_trtllm",
+            help="MoE runner backend: auto, triton, gluon, flashinfer_trtllm, "
+            "flashinfer_cutlass, flashinfer_cutedsl, deep_gemm, mega_moe",
         )
         parser.add_argument(
             "--draft-moe-backend",
@@ -1334,13 +1310,20 @@ class ServerArgs:
         parser.add_argument(
             "--dist-init-addr",
             type=str,
-            help="The host address for initializing distributed backend (e.g., `192.168.0.2:25000`).",
+            help="The host address for initializing distributed backend (e.g., `192.168.0.2:25000`). "
+            "Derived from the launcher environment under a multi-node Slurm step.",
         )
         parser.add_argument(
-            "--nnodes", type=int, default=ServerArgs.nnodes, help="The number of nodes."
+            "--nnodes",
+            type=int,
+            default=ServerArgs.nnodes,
+            help="The number of nodes. Derived from SLURM_STEP_NUM_NODES when unset.",
         )
         parser.add_argument(
-            "--node-rank", type=int, default=ServerArgs.node_rank, help="The node rank."
+            "--node-rank",
+            type=int,
+            default=ServerArgs.node_rank,
+            help="The node rank. Derived from SLURM_NODEID when unset.",
         )
 
         # Model override args
@@ -2028,6 +2011,9 @@ class PortArgs:
     # The port for nccl initialization (torch.dist)
     nccl_port: int
 
+    # The resolved rendezvous address after moving past busy local ports.
+    dist_init_addr: str
+
     # The ipc filename for rpc call between Engine and Scheduler
     rpc_ipc_name: str
 
@@ -2058,6 +2044,12 @@ class PortArgs:
                     f"Example: --dist-init-addr 127.0.0.1:4000"
                 )
             dist_init_addr = ("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
+        elif server_args.dist_init_addr is None:
+            raise ValueError(
+                f"--dist-init-addr is required for nnodes={server_args.mapping.nnodes} "
+                "and could not be derived from the launcher environment. "
+                "Example: --dist-init-addr <head-node-ip>:20000"
+            )
         else:
             dist_init_addr = server_args.dist_init_addr.split(":")
         if len(dist_init_addr) != 2:
@@ -2068,12 +2060,18 @@ class PortArgs:
         dist_init_host, dist_init_port = dist_init_addr
         dist_init_port = int(dist_init_port)
 
-        # Scan forward until we find a port cluster where all derived ports are free.
-        # This handles the case where a previous engine instance left ports in
-        # TIME_WAIT or its child processes haven't fully terminated yet.
-        # Note: the port at offset +1 (formerly detokenizer_port) is intentionally
-        # skipped so the rest of the port layout stays stable for any external
-        # tooling that indexed off the historical port cluster.
+        # Scan forward until we find a port cluster where all derived ports are
+        # free. This handles the case where a previous engine instance left
+        # ports in TIME_WAIT or its child processes haven't fully terminated
+        # yet. Note: the port at offset +1 (formerly detokenizer_port) is
+        # intentionally skipped so the rest of the port layout stays stable for
+        # any external tooling that indexed off the historical port cluster.
+        #
+        # The whole cluster is bound on node 0 alone, so scanning is only
+        # meaningful there: is_port_available binds the local wildcard, and a
+        # follower moving its own base would simply address ports the head
+        # never bound. Multi-node therefore takes the cluster as derived and
+        # reports a conflict instead of relocating it.
         while True:
             port_base = dist_init_port + 1
             rpc_port = port_base + 2
@@ -2084,17 +2082,26 @@ class PortArgs:
             else:
                 scheduler_input_port = port_base + 2 + 1 + dp_rank
             rpc_ipc_port = scheduler_input_port + 1
-            if all(
-                is_port_available(p)
-                for p in [
-                    dist_init_port,
-                    port_base,
-                    rpc_port,
-                    metrics_ipc_port,
-                    scheduler_input_port,
-                    rpc_ipc_port,
-                ]
-            ):
+            cluster = [
+                dist_init_port,
+                port_base,
+                rpc_port,
+                metrics_ipc_port,
+                scheduler_input_port,
+                rpc_ipc_port,
+            ]
+            if server_args.mapping.nnodes > 1:
+                if server_args.node_rank == 0:
+                    busy = [p for p in cluster if not is_port_available(p)]
+                    if busy:
+                        raise ValueError(
+                            f"control-plane ports {busy} are already in use on the "
+                            "head node. Every node derives this cluster from "
+                            "--dist-init-addr, so it cannot be moved on one node "
+                            "alone; restart with a different --dist-init-addr port."
+                        )
+                break
+            if all(is_port_available(p) for p in cluster):
                 break
             dist_init_port += 10
 
@@ -2102,6 +2109,7 @@ class PortArgs:
             tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
             scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
             nccl_port=port,
+            dist_init_addr=f"{dist_init_host}:{dist_init_port}",
             rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
             metrics_ipc_name=f"tcp://{dist_init_host}:{metrics_ipc_port}",
             tokenizer_worker_ipc_name=None,

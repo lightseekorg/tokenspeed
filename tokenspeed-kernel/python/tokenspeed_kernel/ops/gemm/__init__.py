@@ -65,7 +65,7 @@ __all__ = [
 ]
 
 _platform = Platform.get()
-_fp8_dtype = _platform.fp8e4m3fn.dtype
+_fp8_dtype = torch.float8_e4m3fn
 
 # Kernels that accept and own bias application inside their GEMM wrapper.
 # For any kernel not listed here, dispatch applies the bias with a post-GEMM

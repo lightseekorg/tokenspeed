@@ -117,11 +117,11 @@ class AlignedMaxScheduledTokensTest(unittest.TestCase):
         ]
         self.assertEqual(aligned_max_scheduled_tokens(8192, groups, 1536), 8192)
 
-    def test_chunk_below_one_page_clamps_to_one_page(self):
-        # A chunk smaller than one page could never register a snapshot.
-        self.assertEqual(
-            aligned_max_scheduled_tokens(512, _kimi_k3_groups(), 1536), 1536
-        )
+    def test_chunk_below_one_page_is_rejected(self):
+        # Increasing the scheduler limit after executor buffers were sized
+        # would make the first aligned chunk overflow those buffers.
+        with self.assertRaisesRegex(ValueError, "minimum 1536"):
+            aligned_max_scheduled_tokens(512, _kimi_k3_groups(), 1536)
 
     def test_zero_block_size_falls_back_to_page_size(self):
         groups = [

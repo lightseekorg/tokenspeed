@@ -346,7 +346,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             alt_stream=alt_stream,
             skip_rope=True,  # K3 MLA is NoPE (mla_use_nope=True)
         )
-        # The MLA layers belong to the FlatKV full_attention cache group. The
+        # The MLA layers belong to the Paged cache full_attention cache group. The
         # inherited attn_mqa/attn_mha PagedAttention modules are
         # built without a group_id; tag them so validate_paged_cache_group_ids
         # binds them to the published full_attention table. (KDA layers have no
@@ -955,8 +955,9 @@ class KimiLinearMoE(nn.Module):
                     )
                 # Out-of-box tactics: seed the autotuner from the in-tree
                 # swept table for this GPU/flashinfer combo, if one ships
-                # (flashinfer's own tuner mispicks MoE tactics at prefill
-                # batch sizes). A lookup miss leaves lazy autotuning in place.
+                # (flashinfer's own heuristic mispicks MoE tactics at prefill
+                # batch sizes). A lookup miss leaves the startup autotune
+                # window to tune these shapes.
                 load_packaged_flashinfer_tuning_cache(
                     "kimi-k3", mapping.moe.ep_size, mapping.moe.tp_size
                 )
@@ -2044,6 +2045,11 @@ class KimiK3ForConditionalGeneration(nn.Module):
             out_cache_loc,
             **kwargs,
         )
+
+    def post_load_weights(self) -> None:
+        """Prepare text-model derived weights for loaders that skip checkpoints."""
+        if self.language_model is not None:
+            self.language_model.post_load_weights()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         """Route checkpoint weights by top-level prefix.

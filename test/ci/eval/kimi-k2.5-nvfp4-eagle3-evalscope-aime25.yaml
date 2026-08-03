@@ -1,6 +1,7 @@
 api_version: ci.tokenspeed.io/v1
 name: eval-kimi-k2.5-nvfp4-eagle3-aime25
 type: eval
+workflow_stage: model-test
 triggers:
   - per-commit
   - manual
@@ -16,6 +17,7 @@ server:
   # Temporary NFS cold-load headroom; revert after the startup bottleneck is fixed.
   command: >-
     ts serve
+    --disable-kvstore
     --model nvidia/Kimi-K2.5-NVFP4
     --tp 4
     --max-model-len 80000

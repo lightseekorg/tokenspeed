@@ -1,6 +1,7 @@
 api_version: ci.tokenspeed.io/v1
 name: eval-minimax-m3-nvfp4-aime25
 type: eval
+workflow_stage: model-test
 triggers:
   - per-commit
   - manual
@@ -9,7 +10,6 @@ runner:
     - b200-4gpu
 env:
   CI: "true"
-  TOKENSPEED_FLAT_KV: "ON"
 install:
   - bash test/ci_system/install_deps.sh
 server:
@@ -19,8 +19,7 @@ server:
     --attn-tp-size 4
     --moe-tp-size 4
     --max-model-len 262144
-    --gpu-memory-utilization 0.92
-    --disable-cuda-graph-padding
+    --gpu-memory-utilization 0.95
     --attention-backend trtllm
     --kv-cache-dtype fp8
     --moe-backend flashinfer_trtllm

@@ -72,6 +72,44 @@ from tokenspeed_kernel.ops.attention.triton.linear.solve_tril import solve_tril
 __all__ = ["kda_chunk_prefill"]
 
 
+@triton.jit
+def _kda_prepare_gate_beta_kernel(
+    raw_g,
+    raw_beta,
+    a_log,
+    dt_bias,
+    gate,
+    beta,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    HAS_LOWER_BOUND: tl.constexpr,
+    LOWER_BOUND: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    offsets = tl.arange(0, BLOCK_D)
+    mask = offsets < D
+    linear = (token_idx * H + head_idx) * D + offsets
+    x = tl.load(raw_g + linear, mask=mask, other=0.0).to(tl.float32)
+    bias = tl.load(
+        dt_bias + head_idx * D + offsets,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    x += bias
+    a = tl.load(a_log + head_idx).to(tl.float32)
+    if HAS_LOWER_BOUND:
+        g = LOWER_BOUND * tl.sigmoid(tl.exp(a) * x)
+    else:
+        softplus = tl.maximum(x, 0.0) + tl.log(1.0 + tl.exp(-tl.abs(x)))
+        g = -tl.exp(a) * softplus
+    tl.store(gate + linear, g, mask=mask)
+
+    raw_b = tl.load(raw_beta + token_idx * H + head_idx).to(tl.float32)
+    tl.store(beta + token_idx * H + head_idx, tl.sigmoid(raw_b))
+
+
 @triton.jit(do_not_specialize=["T"])
 def _kkt_vector_fwd_kernel(
     kn,
@@ -503,8 +541,8 @@ def kda_chunk_prefill(
     single_state = state.ndim == 3
     if single_state:
         state = state.unsqueeze(0)
-    if state.ndim != 4 or state.shape[1:] != (heads, value_dim, key_dim):
-        raise ValueError("state must be [slots, heads, value_dim, key_dim]")
+    if state.ndim != 4 or state.shape[1:] != (heads, key_dim, value_dim):
+        raise ValueError("state must be [slots, heads, key_dim, value_dim]")
 
     q = q.contiguous()
     k = k.contiguous()
@@ -540,11 +578,6 @@ def kda_chunk_prefill(
     chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     chunk_offsets = prepare_chunk_offsets(cu_seqlens, BT)
     num_chunks = chunk_indices.shape[0]
-
-    # gate + beta via the shared production preparation kernel
-    from tokenspeed_kernel.ops.attention.triton.kda import (
-        _kda_prepare_gate_beta_kernel,
-    )
 
     gate = torch.empty_like(raw_g, dtype=torch.float32)
     beta_sig = torch.empty_like(beta, dtype=torch.float32)
@@ -657,7 +690,7 @@ def kda_chunk_prefill(
     )
 
     final_state = state if inplace else state.clone()
-    h0 = state[state_idx].transpose(-1, -2).contiguous()  # [N,H,K,V]
+    h0 = state[state_idx].contiguous()
 
     # o is accumulated in fp32 registers and written once (never read back), then
     # returned as q.dtype; store it directly in q.dtype (matches reference chunk_o).
@@ -724,7 +757,7 @@ def kda_chunk_prefill(
         num_warps=4,
         num_stages=2,
     )
-    final_state[state_idx] = hT.transpose(-1, -2).to(final_state.dtype)
+    final_state[state_idx] = hT.to(final_state.dtype)
 
     output = o.to(q.dtype)
     if single_state:

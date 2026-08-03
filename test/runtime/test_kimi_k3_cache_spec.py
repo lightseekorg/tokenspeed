@@ -15,7 +15,6 @@ from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
 def test_lcm_reference_geometry_is_exact() -> None:
     plan = plan_kimi_k3_lcm_cache(
         KimiLinearConfig(),
-        flat_kvcache_enabled=True,
         tp_size=8,
         mla_cache_dtype=torch.float8_e4m3fn,
         mla_quant_method=None,
@@ -61,7 +60,6 @@ def test_lcm_reference_geometry_is_exact() -> None:
 def test_lcm_parent_demand_uses_per_group_packing() -> None:
     plan = plan_kimi_k3_lcm_cache(
         KimiLinearConfig(),
-        flat_kvcache_enabled=True,
         tp_size=8,
         mla_cache_dtype=torch.float8_e4m3fn,
         mla_quant_method=None,
@@ -74,11 +72,11 @@ def test_lcm_parent_demand_uses_per_group_packing() -> None:
         overlap_schedule_depth=0,
     )
 
-    assert kimi_k3_lcm_blocks_needed(plan, token_capacity=131_072, **sizing) == 281
+    assert kimi_k3_lcm_blocks_needed(plan, token_capacity=131_072, **sizing) == 284
     assert (
         kimi_k3_token_capacity_for_lcm_pool(
             plan,
-            num_lcm_blocks=281,
+            num_lcm_blocks=284,
             upper_bound_tokens=131_072,
             **sizing,
         )
@@ -87,7 +85,7 @@ def test_lcm_parent_demand_uses_per_group_packing() -> None:
     assert (
         kimi_k3_token_capacity_for_lcm_pool(
             plan,
-            num_lcm_blocks=280,
+            num_lcm_blocks=283,
             upper_bound_tokens=131_072,
             **sizing,
         )

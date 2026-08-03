@@ -193,7 +193,7 @@ class IrisRSAG(object):
         # Pick the largest power-of-two block that divides hidden_size, capped
         # at 256. This keeps the iris kernel on its no-mask fast path and
         # still produces enough tiles (world_size * hidden/block_n) to fill
-        # ``comm_sms`` SMs on MI300-class chips.
+        # ``comm_sms`` SMs on supported AMD chips.
         for cand in (256, 128, 64, 32, 16):
             if hidden_size % cand == 0:
                 return cand

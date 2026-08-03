@@ -1,6 +1,7 @@
 api_version: ci.tokenspeed.io/v1
 name: perf-kimi-k2.5-nvfp4-agentic
 type: perf
+workflow_stage: model-test
 triggers:
   - per-commit
   - manual
@@ -18,6 +19,7 @@ server:
   # Temporary NFS cold-load headroom; revert after the startup bottleneck is fixed.
   command: >-
     ts serve
+    --disable-kvstore
     --model nvidia/Kimi-K2.5-NVFP4
     --attn-tp-size 4
     --moe-tp-size 4

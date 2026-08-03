@@ -23,11 +23,15 @@ import numpy as np
 import torch
 from tokenspeed_scheduler import PD, Forward
 
+from tokenspeed.runtime.execution.block_table import (
+    select_block_table,
+    unpadded_block_table_row,
+)
 from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo
 from tokenspeed.runtime.pd.base.status import TransferPoll
-from tokenspeed.runtime.pd.flatkv import (
-    build_flatkv_page_manifest,
-    flatkv_manifest_page_ids,
+from tokenspeed.runtime.pd.cache_protocol import (
+    build_cache_page_manifest,
+    cache_manifest_page_ids,
 )
 from tokenspeed.runtime.pd.mooncake.decode import MooncakeKVManagerDecode
 from tokenspeed.runtime.pd.mooncake.receiver import MooncakeKVReceiver
@@ -50,11 +54,11 @@ class DisaggDecodeExecutor:
         self.page_size = page_size
         self._dispatcher = TypeBasedDispatcher(
             [
-                (Forward.FlatForwardOp, self._prefill),
+                (Forward.Batch, self._prefill),
             ]
         )
-        self.is_flatkv = kv_args.flat_layout is not None
-        self.flat_layout = kv_args.flat_layout
+        self.uses_cache_contract = kv_args.cache_layout is not None
+        self.cache_layout = kv_args.cache_layout
         self.receivers: dict[str, MooncakeKVReceiver] = {}
         self.kv_manager = MooncakeKVManagerDecode(args, kv_args)
         self.gloo_group = gloo_group
@@ -69,65 +73,29 @@ class DisaggDecodeExecutor:
             bootstrap_room=info.bootstrap_room,
         )
 
-    @staticmethod
-    def _mamba_indices(op, index: int):
-        indices = getattr(op, "mamba_pool_indices", None)
-        if indices is None or index >= len(indices):
-            return None
-        slot = int(indices[index])
-        if slot < 0:
-            return None
-        return np.array([slot], dtype=np.int64)
-
-    @staticmethod
-    def _mamba_checkpoint_indices(op, index: int):
-        indices = getattr(op, "mamba_checkpoint_dst_indices", None)
-        if indices is None or index >= len(indices):
-            return None
-        slot = int(indices[index])
-        if slot < 0:
-            return None
-        return np.array([slot], dtype=np.int64)
-
-    @classmethod
-    def _mamba_transfer_indices(cls, op, index: int):
-        working = cls._mamba_indices(op, index)
-        if working is None:
-            return None
-        checkpoint = cls._mamba_checkpoint_indices(op, index)
-        if checkpoint is None:
-            return working
-
-        slots = [int(x) for x in working.tolist()]
-        for slot in checkpoint.tolist():
-            slot = int(slot)
-            if slot >= 0 and slot not in slots:
-                slots.append(slot)
-        return np.array(slots, dtype=np.int64)
-
-    def _flat_prefill(self, op) -> None:
+    def _cache_prefill(self, op) -> None:
         pending = []
         num_extends = op.num_extends()
         if num_extends != len(op.request_ids):
             raise RuntimeError(
-                "FlatKV decode destination admission does not support mixed batches"
+                "Paged cache decode destination admission does not support mixed batches"
             )
         for index, request_id in enumerate(op.request_ids):
             receiver = self.receivers.get(request_id)
             if receiver is None:
                 continue
             prefix_len = int(op.extend_prefix_lens[index])
-            manifest = build_flatkv_page_manifest(
+            manifest = build_cache_page_manifest(
                 op,
-                layout=self.flat_layout,
+                layout=self.cache_layout,
                 request_row=index,
                 prefix_len=prefix_len,
                 prompt_len=int(op.prefill_lengths[index]),
             )
             page_ids = np.asarray(
-                flatkv_manifest_page_ids(
+                cache_manifest_page_ids(
                     manifest,
-                    layout=self.flat_layout,
+                    layout=self.cache_layout,
                     peer="destination",
                 ),
                 dtype=np.int64,
@@ -153,20 +121,23 @@ class DisaggDecodeExecutor:
                 prefix_len,
                 None,
                 None,
-                flat_manifest=manifest,
+                page_manifest=manifest,
             )
 
     def _prefill(self, op):
-        if self.is_flatkv:
-            self._flat_prefill(op)
+        if self.uses_cache_contract:
+            self._cache_prefill(op)
             return
+        table = select_block_table(op)
+        page_rows = [
+            unpadded_block_table_row(table, row_index)
+            for row_index in range(len(table))
+        ]
         logger.debug(
-            "[decode][_prefill] op: request_ids=%s occupied_pages=%s "
-            "begins=%s sizes=%s request_pool_indices=%s extend_prefix_lens=%s",
+            "[decode][_prefill] op: request_ids=%s page_rows=%s "
+            "request_pool_indices=%s extend_prefix_lens=%s",
             list(op.request_ids),
-            [list(p) for p in op.occupied_pages],
-            list(op.begins),
-            list(op.sizes),
+            page_rows,
             list(op.request_pool_indices),
             list(op.extend_prefix_lens),
         )
@@ -183,20 +154,17 @@ class DisaggDecodeExecutor:
                 op.prefill_lengths[i] + self.page_size - 1
             ) // self.page_size
             kv_indices = np.array(
-                op.occupied_pages[i][
-                    extend_prefix_len // self.page_size : prompt_end_page
-                ],
+                page_rows[i][extend_prefix_len // self.page_size : prompt_end_page],
                 dtype=np.int64,
             )
             aux_index = op.request_pool_indices[i]
-            mamba_indices = self._mamba_transfer_indices(op, i)
             self._request_pool_indices[request_id] = aux_index
             self.receivers[request_id].prefill(
                 kv_indices,
                 aux_index,
                 extend_prefix_len,
                 None,  # mla_l1_5_args
-                mamba_indices,
+                None,
             )
 
     def register(
@@ -208,8 +176,8 @@ class DisaggDecodeExecutor:
         self._bootstrap(request_id, bootstrap_info)
 
     def execute(self, op):
-        if not isinstance(op, Forward.FlatForwardOp):
-            raise TypeError(f"Expected FlatForwardOp, got {type(op).__name__}.")
+        if not isinstance(op, Forward.Batch):
+            raise TypeError(f"Expected Batch, got {type(op).__name__}.")
         self._dispatcher(op)
 
     def generate_events(self):
@@ -312,7 +280,7 @@ class DisaggDecodeExecutor:
         # model executor cannot infer this state from a forward pass.  Seed
         # the runtime row with the complete remotely-computed prompt length
         # before the first local decode.  This is required for both cache
-        # layouts: FlatKV additionally uses the resulting sequence length to
+        # layouts: Paged cache additionally uses the resulting sequence length to
         # select the transferred recurrent-state snapshot page.
         extend_request_pool_indices = torch.tensor(
             forward_op.request_pool_indices[:num_extends],

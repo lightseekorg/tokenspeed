@@ -351,8 +351,8 @@ if is_decode_available():
         internally by flashinfer (skipped on the float32 path, redirected to a
         sacrificial pool row 0 on the bf16 fast path) -- no caller-side clamp
         needed. The post-step state is written to output_state_indices
-        (defaults to initial_state_indices when None, e.g. the non-flat pool
-        path; pass the flat path's distinct out-page ids to write elsewhere).
+        (defaults to initial_state_indices when None; pass distinct output-page
+        ids when the grouped cache writes the next state to another page).
 
         Returns the [B, 1, HV, V] decode output (q.dtype).
         """
