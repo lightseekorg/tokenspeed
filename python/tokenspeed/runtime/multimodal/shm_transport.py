@@ -191,10 +191,10 @@ def sync_shm_features(reqs, group, group_size: int) -> None:
         return
     started = time.perf_counter() if LOG_MM_TIMING else None
     handles = [
-        item.feature
+        item.feature_shm
         for mm in pending
         for item in mm.mm_items
-        if isinstance(item.feature, ShmTensorHandle)
+        if item.feature_shm is not None
     ]
     attached = [h.try_attach() for h in handles]
     if group_size > 1:
