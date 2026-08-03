@@ -95,7 +95,11 @@ report:
   github_step_summary: true
 perf_threshold: 0.9
 # Values are [Latency (tps/user), Throughput (tps/gpu)].
-# Left unset until the first green end-to-end run measures them: a guessed
-# reference would either gate on noise or never fail. The pure-K3 baseline this
-# must beat is 43.05 / 5.26 on the same topology.
+# Left unset until a green end-to-end run under CUDA graphs measures them: a
+# guessed reference would either gate on noise or never fail. The pure-K3
+# baseline this must beat is 43.05 / 5.26 on the same topology.
+#
+# First eager bs=1 bring-up on 8x MI355X reached an accept length of ~2.6 with
+# the published 7-token block, and reproduced the speculator-free greedy output
+# exactly for the first 4 tokens across a fixed 24-prompt set at temperature 0.
 perf_reference: {}
