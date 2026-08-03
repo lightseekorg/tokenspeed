@@ -32,9 +32,9 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
 from multiprocessing import shared_memory
 
+import msgspec
 import torch
 
 from tokenspeed.runtime.utils.env import envs
@@ -43,21 +43,25 @@ logger = logging.getLogger(__name__)
 LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
 
 
-@dataclass
-class ShmTensorHandle:
-    """Pickle-safe handle to a CPU tensor in a POSIX SHM segment."""
+class ShmTensorHandle(msgspec.Struct, eq=False, dict=True):
+    """msgpack/pickle-safe handle to a CPU tensor in a POSIX SHM segment.
+
+    A ``msgspec.Struct`` so the handle rides engine msgpack IPC natively
+    (``dtype`` uses the shared torch.dtype enc/dec hooks in io_struct).
+    ``dict=True`` allows the non-wire ``_segment`` instance attribute that
+    caches this rank's open SHM mapping between ``attach`` and ``consume``.
+    """
 
     shm_name: str
     shape: tuple[int, ...]
     dtype: torch.dtype
-    _segment: shared_memory.SharedMemory | None = field(
-        default=None, init=False, repr=False, compare=False
-    )
+
+    # Per-process open segment; never serialized (class-level default, the
+    # instance attribute is only created by attach()).
+    _segment = None
     # Payload received over the CPU group when the producer's POSIX segment
-    # lives on another host.
-    _remote: torch.Tensor | None = field(
-        default=None, init=False, repr=False, compare=False
-    )
+    # lives on another host; also non-wire.
+    _remote = None
 
     @classmethod
     def publish(cls, tensor: torch.Tensor) -> ShmTensorHandle:
