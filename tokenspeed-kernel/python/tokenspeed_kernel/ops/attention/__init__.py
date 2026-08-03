@@ -38,11 +38,6 @@ from tokenspeed_kernel.ops.attention.gdn_utils import (
     GdnChunkPrefillResult,
 )
 from tokenspeed_kernel.ops.attention.kda_utils import KdaPrefillResult
-from tokenspeed_kernel.ops.attention.triton.kda import (
-    kda_recurrent,
-    kda_recurrent_decode,
-    kda_state_scatter,
-)
 from tokenspeed_kernel.ops.attention.triton.kda_chunk import (
     kda_chunk_prefill,
 )
@@ -121,10 +116,7 @@ __all__ = [
     "gdn_chunk_prefill",
     "gdn_decode_step",
     "gdn_decode_mtp",
-    "kda_recurrent",
-    "kda_recurrent_decode",
     "kda_chunk_prefill",
-    "kda_state_scatter",
     "kda_paged_prefill",
     "kda_paged_decode",
     "try_kda_fused_paged_decode",
@@ -782,8 +774,7 @@ def kda_paged_prefill(
     Returns:
         Packed output and final state.
 
-    The state's internal ``[K,V]`` versus ``[V,K]`` interpretation remains
-    private to the selected implementation.
+    Recurrent states use the canonical ``[N,H,K,V]`` layout across backends.
     """
     if q.ndim != 4 or q.shape[0] != 1:
         raise ValueError("KDA q must be [1, total_tokens, heads, key_dim]")
@@ -875,7 +866,10 @@ def kda_paged_decode(
         "attention",
         "kda_paged_decode",
         _attention_format_signature(q=q, k=k, v=v),
-        traits={"indexed_state": True},
+        traits={
+            "indexed_state": True,
+            "single_token": q.shape[1] == num_sequences,
+        },
         solution=solution,
         override=override,
     )
@@ -930,7 +924,7 @@ def try_kda_fused_paged_decode(
             "attention",
             "kda_fused_paged_decode",
             signature,
-            traits={"flat_state": True},
+            traits={"paged_state": True},
             solution=solution,
             override=override,
         )
@@ -994,7 +988,7 @@ def try_kda_fused_paged_verify(
             "attention",
             "kda_fused_paged_verify",
             signature,
-            traits={"flat_state": True},
+            traits={"paged_state": True},
             solution=solution,
             override=override,
         )

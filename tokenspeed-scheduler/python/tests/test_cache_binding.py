@@ -18,9 +18,32 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Tests for CacheEvent Python bindings."""
+"""Tests for cache-related Python bindings."""
 
+import tokenspeed_scheduler as ts
 from tokenspeed_scheduler import Cache, ExecutionEvent
+
+
+def test_removed_storage_cache_api_is_not_exported():
+    assert not hasattr(ts, "PrefixCacheAdjunctSpec")
+
+    config = ts.SchedulerConfig()
+    assert not hasattr(config, "prefix_cache_adjunct")
+    assert not hasattr(config, "prefetch_threshold")
+
+    request = ts.RequestSpec()
+    assert not hasattr(request, "rolling_hashes")
+    assert not hasattr(request, "storage_hit_pages")
+
+    assert not hasattr(Cache, "PrefetchDoneEvent")
+    assert not hasattr(Cache, "PrefetchOp")
+    assert not hasattr(Cache, "BackUpOp")
+    assert not hasattr(Cache, "CacheKind")
+    assert not hasattr(Cache.WriteBackOp, "is_retract")
+    assert not hasattr(Cache.WriteBackOp, "src_pages_by_kind")
+    assert not hasattr(Cache.LoadBackOp, "src_pages_by_kind")
+    assert not hasattr(ts.Forward.Batch, "hist_token_lens")
+    assert not hasattr(ts.Scheduler, "get_request_paged_cache_page_ids")
 
 
 def test_cache_event_fields_are_bound():
@@ -28,9 +51,9 @@ def test_cache_event_fields_are_bound():
     write_back.success = True
     assert write_back.success is True
 
-    prefetch_done = Cache.PrefetchDoneEvent()
-    prefetch_done.request_id = "req-1"
-    assert prefetch_done.request_id == "req-1"
+    load_back = Cache.LoadBackDoneEvent()
+    load_back.success = True
+    assert load_back.success is True
 
 
 def test_execution_event_accepts_cache_events():
@@ -40,6 +63,5 @@ def test_execution_event_accepts_cache_events():
     write_back.success = True
     assert execution_event.add_event(write_back) is execution_event
 
-    prefetch_done = Cache.PrefetchDoneEvent()
-    prefetch_done.request_id = "req-0"
-    assert execution_event.add_event(prefetch_done) is execution_event
+    load_back = Cache.LoadBackDoneEvent()
+    assert execution_event.add_event(load_back) is execution_event

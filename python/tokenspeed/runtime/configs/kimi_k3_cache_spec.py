@@ -25,7 +25,7 @@ from collections.abc import Mapping
 
 import torch
 
-from tokenspeed.runtime.configs.flat_cache_runtime import require_positive_int
+from tokenspeed.runtime.configs.cache_runtime import require_positive_int
 from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
 from tokenspeed.runtime.configs.lcm_layouts import (
     kimi_k3_lcm_fields as build_lcm_fields,
@@ -41,6 +41,7 @@ _KIMI_K3_KDA_LAYERS = 69
 _KIMI_K3_MLA_LAYERS = 24
 _KIMI_K3_LOGICAL_BLOCK_TOKENS = 128
 _KIMI_K3_STATE_GROUPS = 3
+_KIMI_K3_MLA_PACKING = 12
 
 
 def _require_non_negative_int(name: str, value: int) -> int:
@@ -127,12 +128,14 @@ def build_kimi_k3_lcm_fields(
     tp_size = require_positive_int("tp_size", tp_size)
     if mla_cache_dtype != torch.float8_e4m3fn:
         raise ValueError(
-            "Kimi-K3 FlatKV initially requires mla_cache_dtype=torch.float8_e4m3fn"
+            "Kimi-K3 Paged cache initially requires mla_cache_dtype=torch.float8_e4m3fn"
         )
     if mla_quant_method == "per_token_head":
-        raise ValueError("Kimi-K3 FlatKV does not support per_token_head MLA cache")
+        raise ValueError(
+            "Kimi-K3 Paged cache does not support per_token_head MLA cache"
+        )
     if getattr(text_config, "mla_use_nope", None) is not True:
-        raise ValueError("Kimi-K3 FlatKV requires mla_use_nope=True")
+        raise ValueError("Kimi-K3 Paged cache requires mla_use_nope=True")
 
     linear = text_config.linear_attn_config
     num_heads = require_positive_int(
@@ -166,7 +169,6 @@ def build_kimi_k3_lcm_fields(
 def plan_kimi_k3_lcm_cache(
     text_config: KimiLinearConfig,
     *,
-    flat_kvcache_enabled: bool,
     tp_size: int,
     mla_cache_dtype: torch.dtype,
     mla_quant_method: str | None,
@@ -174,35 +176,34 @@ def plan_kimi_k3_lcm_cache(
     num_lcm_blocks: int | None = None,
 ) -> LcmMemoryPlan:
     """Plan Kimi-K3 on the common P=128 two-level LCM geometry."""
-    if not flat_kvcache_enabled:
-        raise RuntimeError(
-            "Kimi-K3 is FlatKV-only and requires tokenspeed_scheduler.FLAT_KVCACHE=True"
-        )
     fields = build_kimi_k3_lcm_fields(
         text_config,
         tp_size=tp_size,
         mla_cache_dtype=mla_cache_dtype,
         mla_quant_method=mla_quant_method,
     )
-    # The LCM block is anchored by one KDA state-group page (packing 1), and
-    # that page scales as 1/tp (heads per rank) while the MLA latent page is
-    # tp-invariant. Keeping FULL_ATTENTION packing fixed at 12 therefore only
-    # lines up at tp=8 (padding 13.4%); at tp=16 the KDA page halves and pads
-    # 126.8% against the same block. Scale the MLA-side packing with tp so the
-    # block/KDA ratio -- and the padding -- stay at the tp=8 value.
-    if (12 * 8) % tp_size:
-        raise ValueError(f"Kimi-K3 LCM packing cannot scale to tp_size={tp_size}")
-    full_packing = max(1, 12 * 8 // tp_size)
+    # The MLA latent history is TP-invariant while the KDA state shards by
+    # TP, so pack as many KDA pages per MLA-sized plane as fit to keep the
+    # planner's padding fraction bounded at any TP.
+    mla_plane_bytes = _KIMI_K3_MLA_PACKING * next(
+        field.payload_bytes for field in fields if field.group_id == FULL_ATTENTION
+    )
+    linear_plane_bytes = sum(
+        field.payload_bytes
+        for field in fields
+        if field.group_id == f"{LINEAR_ATTENTION}_0" and field.plane_id == "slot.0"
+    )
+    linear_packing = max(1, mla_plane_bytes // linear_plane_bytes)
     plan = plan_lcm_fields(
         fields,
         logical_block_tokens=_KIMI_K3_LOGICAL_BLOCK_TOKENS,
         budget_bytes=cache_budget_bytes,
         num_lcm_blocks=num_lcm_blocks,
         cache_blocks_per_lcm_block={
-            FULL_ATTENTION: full_packing,
-            f"{LINEAR_ATTENTION}_0": 1,
-            f"{LINEAR_ATTENTION}_1": 1,
-            f"{LINEAR_ATTENTION}_2": 1,
+            FULL_ATTENTION: _KIMI_K3_MLA_PACKING,
+            f"{LINEAR_ATTENTION}_0": linear_packing,
+            f"{LINEAR_ATTENTION}_1": linear_packing,
+            f"{LINEAR_ATTENTION}_2": linear_packing,
         },
         alignment=256,
     )
@@ -210,10 +211,10 @@ def plan_kimi_k3_lcm_cache(
         group.group_id: group.cache_blocks_per_lcm_block for group in plan.groups
     }
     expected_packing = {
-        FULL_ATTENTION: full_packing,
-        f"{LINEAR_ATTENTION}_0": 1,
-        f"{LINEAR_ATTENTION}_1": 1,
-        f"{LINEAR_ATTENTION}_2": 1,
+        FULL_ATTENTION: _KIMI_K3_MLA_PACKING,
+        f"{LINEAR_ATTENTION}_0": linear_packing,
+        f"{LINEAR_ATTENTION}_1": linear_packing,
+        f"{LINEAR_ATTENTION}_2": linear_packing,
     }
     if packing != expected_packing:
         raise ValueError(
@@ -250,7 +251,9 @@ def kimi_k3_lcm_blocks_needed(
             f"overlap_schedule_depth must be 0 or 1, got {overlap_schedule_depth}"
         )
     if overlap_schedule_depth and decode_input_tokens == 0:
-        raise ValueError("overlapped FlatKV sizing requires decode_input_tokens > 0")
+        raise ValueError(
+            "overlapped Paged cache sizing requires decode_input_tokens > 0"
+        )
 
     page_tokens = plan.logical_block_tokens
     protected_pages = max_live_requests * math.ceil(
@@ -267,7 +270,10 @@ def kimi_k3_lcm_blocks_needed(
                 + protected_pages
             )
         else:
-            child_pages = max_live_requests + scheduled_pages + protected_pages
+            # MambaStateManager keeps the current and next writable state page
+            # per live request in addition to the pages materialized by the
+            # scheduled chunk.
+            child_pages = 2 * max_live_requests + scheduled_pages + protected_pages
         total_lcm_blocks += math.ceil(child_pages / group.cache_blocks_per_lcm_block)
     return total_lcm_blocks
 
@@ -311,6 +317,6 @@ def kimi_k3_token_capacity_for_lcm_pool(
     if low == 0:
         raise ValueError(
             f"num_lcm_blocks={num_lcm_blocks} cannot admit one token with "
-            "the configured Kimi-K3 FlatKV scheduler limits"
+            "the configured Kimi-K3 Paged cache scheduler limits"
         )
     return low

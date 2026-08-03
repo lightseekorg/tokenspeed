@@ -793,19 +793,7 @@ class TestSelectKernel:
         )
         assert impl() == "reference_decode"
 
-    def test_amd_platform_selects_aiter(self, sample_specs, mi300_platform):
-        reg = KernelRegistry.get()
-        register_all_samples(reg, sample_specs)
-
-        impl = select_kernel(
-            "attention",
-            "decode",
-            ATTN_DECODE_BF16,
-            platform=mi300_platform,
-        )
-        assert impl() == "aiter_decode"
-
-    def test_amd_mi350_platform_selects_aiter(self, sample_specs, mi350_platform):
+    def test_amd_platform_selects_aiter(self, sample_specs, mi350_platform):
         reg = KernelRegistry.get()
         register_all_samples(reg, sample_specs)
 

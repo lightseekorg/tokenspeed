@@ -25,11 +25,11 @@
 the captured region: graphs start from a static input-embeds buffer, filled at
 replay by an eager ``embed_tokens`` gather (text) or by precomputed merged
 embeddings (multimodal, via the model's ``multimodal_input_embeds`` seam).
-Constructed after the decode
-:class:`~tokenspeed.runtime.execution.cuda_graph_wrapper.CudaGraphWrapper`,
-borrowing its capture stream; buckets share one private mempool, deliberately
-not the decode graphs' pool (see :meth:`capture`). At serving time
-the executor's target-forward dispatch is a flat
+Capture borrows the decode
+:class:`~tokenspeed.runtime.execution.cuda_graph_wrapper.CudaGraphWrapper`'s
+stream; buckets share one private mempool, deliberately not the decode graphs'
+pool (see :meth:`capture`). At serving time
+the executor's target-forward dispatch is a simple
 three-way -- decode & captured replays the decode graph (one level up, since
 it captures the whole step), prefill & captured replays here (:meth:`can_run`
 / :meth:`replay`), everything else runs the eager model forward.
@@ -61,8 +61,8 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
-from tokenspeed.runtime.layers.attention.backends.flat_cache_metadata import (
-    FlatCacheBatchMetadata,
+from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
+    CacheBatchMetadata,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -185,15 +185,12 @@ class PrefillGraph:
     """The breakable prefill (extend) CUDA graphs.
 
     A pure graph object -- :meth:`can_run` / :meth:`replay` -- holding no
-    reference to any other component. Constructed AFTER the decode
-    ``CudaGraphWrapper`` and captures in ``__init__`` like it: the decode
-    wrapper is used transiently for its capture stream and dummy paged-cache
-    tables, not kept. (The executor's target-forward dispatch therefore mode-
-    checks before touching this object -- decode capture runs that dispatch
-    while this object does not exist yet.) The dispatch checks :meth:`can_run`
-    and calls :meth:`replay`; the eager path stays a direct
-    ``model_runner.forward`` call at that call site. Capture failure degrades
-    to eager -- world-agreed, so DP/TP ranks stay in lockstep.
+    reference to any other component. The executor calls :meth:`capture` once
+    kernel tuning has run, passing the decode wrapper transiently for its
+    capture stream and dummy paged-cache tables; it is not kept. The dispatch
+    checks :meth:`can_run` and calls :meth:`replay`; the eager path stays a
+    direct ``model_runner.forward`` call at that call site. Capture failure
+    degrades to eager -- world-agreed, so DP/TP ranks stay in lockstep.
 
     Args:
         model_runner: The target ModelRunner. Supplies the loaded model
@@ -218,7 +215,6 @@ class PrefillGraph:
         config: ModelExecutorConfig,
         req_to_page: torch.Tensor | None,
         drafter=None,
-        decode_wrapper: CudaGraphWrapper | None = None,
         num_warmup: int = 3,
     ) -> None:
         model = model_runner.model if model_runner is not None else None
@@ -268,9 +264,6 @@ class PrefillGraph:
         self._captures: dict[int, BreakableCapture] = {}
         self._outputs: dict[int, CapturedForward] = {}
 
-        if not self.disable:
-            self.capture(decode_wrapper)
-
     # ------------------------------------------------------------------
     # Graph capture
     # ------------------------------------------------------------------
@@ -278,9 +271,9 @@ class PrefillGraph:
     def capture(self, decode_wrapper: CudaGraphWrapper | None = None) -> None:
         """Capture one breakable graph per token bucket (no-op when disabled).
 
-        Called from ``__init__``; ``decode_wrapper`` supplies the shared
-        capture stream and dummy paged-cache block tables (used here only,
-        not stored). Buckets share one PRIVATE mempool (first capture
+        ``decode_wrapper`` supplies the shared capture stream and dummy
+        paged-cache block tables (used here only, not stored). Buckets share
+        one PRIVATE mempool (first capture
         allocates it), so graph memory stays ~the largest bucket's peak --
         but never the decode graphs' pool: eager ops cache raw pointers to
         buffers they lazily allocated inside a decode capture (flashinfer's
@@ -354,7 +347,7 @@ class PrefillGraph:
                 capture_range.set_description(
                     f"Capturing prefill buckets ({bucket=} {avail_mem=:.2f} GB)"
                 )
-            self._ctx = self._make_dummy_batch(bucket, decode_wrapper)
+            self._ctx = self.make_dummy_batch(bucket, decode_wrapper)
             self._land_input_embeds(
                 self._embed_tokens(self.input_buffers.input_ids_buf[:bucket]), bucket
             )
@@ -424,10 +417,12 @@ class PrefillGraph:
         if num_tokens < bucket:
             self._input_embeds_buf[num_tokens:bucket].zero_()
 
-    def _dummy_flat_tables(self, num_tokens: int) -> dict[str, "torch.Tensor"]:
+    def _dummy_group_tables(
+        self, req_tokens: int, bs: int
+    ) -> dict[str, "torch.Tensor"]:
         """Build capture tables: null KV pages and one writable state page."""
         backend = self.attn_backend
-        if not getattr(backend, "uses_flat_cache_groups", False):
+        if not getattr(backend, "uses_cache_groups", False):
             return {}
         specs = tuple(getattr(self.token_to_kv_pool, "paged_cache_group_specs", ()))
         state_group_ids = {
@@ -436,21 +431,21 @@ class PrefillGraph:
             if getattr(spec, "family", "history") == "state"
         }
         if not state_group_ids:
-            state_group_ids = set(getattr(backend, "flat_state_group_ids", frozenset()))
-        # Composite wrappers (hybrid) hold the flat KV consumer as a child.
+            state_group_ids = set(getattr(backend, "state_group_ids", frozenset()))
+        # Composite wrappers hold the cache-group consumer as a child.
         if not hasattr(backend, "page_size") and hasattr(backend, "full_attn_backend"):
             backend = backend.full_attn_backend
         # Full width: backends that derive the row stride from max_kv_len
         # (trtllm) index the whole row even when the bucket is small.
         width = getattr(backend, "max_num_pages", 0) or -(
-            -num_tokens // backend.page_size
+            -req_tokens // backend.page_size
         )
         # ALL groups, state included: hybrid wrappers forward the dict to the
         # mamba child, which requires its state group; KV children shed state
         # groups themselves (_shed_state_groups).
         return {
             str(spec.group_id): torch.full(
-                (1, width),
+                (bs, width),
                 1 if str(spec.group_id) in state_group_ids else 0,
                 dtype=torch.int32,
                 device=self.config.device,
@@ -458,11 +453,18 @@ class PrefillGraph:
             for spec in specs
         }
 
-    def _make_dummy_batch(
+    def make_dummy_batch(
         self, num_tokens: int, decode_wrapper: CudaGraphWrapper | None
     ) -> ForwardContext:
-        """Populate the static buffers + attention metadata for a dummy bs=1 extend
+        """Populate the static buffers + attention metadata for a dummy extend
         forward of ``num_tokens`` tokens, and return its ForwardContext.
+
+        The tokens are split across ``ceil(num_tokens / context_len)`` dummy
+        requests so no single request exceeds the model context length: every
+        per-request structure (page-table rows, DSA indexer tables) is sized
+        for ``context_len``, and a longer fabricated request indexes past
+        them. A real forward carries more than ``context_len`` tokens only as
+        a multi-request batch, never as one sequence.
 
         The prefill analogue of decode's ``_init_capture_metadata``. KV writes
         go to the reserved dummy slot and the page table points at page 0, so
@@ -474,25 +476,35 @@ class PrefillGraph:
         (all zeros, the safe page 0) for those.
         """
         ib = self.input_buffers
+        max_req_tokens = max(1, int(self.config.context_len))
+        bs = max(1, -(-num_tokens // max_req_tokens))
+        seq_lens = [max_req_tokens] * (bs - 1) + [
+            num_tokens - max_req_tokens * (bs - 1)
+        ]
+        seq_lens_cpu = torch.tensor(seq_lens, dtype=ib.seq_lens_buf.dtype)
+        seq_lens_gpu = seq_lens_cpu.to(self.config.device)
         ib.input_ids_buf[:num_tokens].fill_(1)
         ib.out_cache_loc_buf[:num_tokens].fill_(ib.dummy_kv_slot)
         ib.positions_buf[:num_tokens].copy_(
-            torch.arange(num_tokens, device=self.config.device)
+            torch.cat([torch.arange(l, device=self.config.device) for l in seq_lens])
         )
-        ib.req_pool_indices_buf[:1].zero_()
-        ib.seq_lens_buf[:1].fill_(num_tokens)
-        ib.extend_seq_lens_buf[:1].fill_(num_tokens)
-        ib.extend_seq_lens_cpu[:1].fill_(num_tokens)
-        ib.extend_prefix_lens_buf[:1].zero_()
-        ib.extend_prefix_lens_cpu[:1].zero_()
-        self.req_to_page[0].zero_()  # dummy request's pages -> page 0 (valid memory)
+        ib.req_pool_indices_buf[:bs].copy_(
+            torch.arange(bs, dtype=ib.req_pool_indices_buf.dtype)
+        )
+        ib.seq_lens_buf[:bs].copy_(seq_lens_gpu)
+        ib.extend_seq_lens_buf[:bs].copy_(seq_lens_gpu)
+        ib.extend_seq_lens_cpu[:bs].copy_(seq_lens_cpu)
+        ib.extend_prefix_lens_buf[:bs].zero_()
+        ib.extend_prefix_lens_cpu[:bs].zero_()
+        # Dummy requests' pages -> page 0 (valid memory).
+        self.req_to_page[:bs].zero_()
 
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_page=self.req_to_page,
-            bs=1,
-            num_extends=1,
+            bs=bs,
+            num_extends=bs,
             input_num_tokens=num_tokens,
             forward_mode=ForwardMode.EXTEND,
             capture_hidden_mode=(
@@ -500,56 +512,55 @@ class PrefillGraph:
                 if self.drafter is not None
                 else CaptureHiddenMode.NULL
             ),
+            gather_ids=torch.cumsum(seq_lens_gpu.to(torch.int64), dim=0) - 1,
         )
         if self.dp_size > 1:
             ctx.global_num_tokens = [num_tokens] * self.config.world_size
-            ctx.global_bs = [1] * self.config.world_size
+            ctx.global_bs = [bs] * self.config.world_size
         extra_metadata_kwargs: dict = {}
         if (
             getattr(self.attn_backend, "uses_paged_cache_groups", False)
             and decode_wrapper is not None
         ):
             tables = decode_wrapper._capture_paged_cache_block_tables(
-                1, self.token_to_kv_pool
+                bs, self.token_to_kv_pool
             )
             if tables is not None:
                 extra_metadata_kwargs["paged_cache_block_tables"] = tables
             extra_metadata_kwargs["num_tokens"] = num_tokens
             extra_metadata_kwargs["positions"] = ib.positions_buf[:num_tokens]
-        flat_tables = self._dummy_flat_tables(num_tokens)
-        if flat_tables:
+        group_tables = self._dummy_group_tables(max(seq_lens), bs)
+        if group_tables:
             contract = getattr(self.token_to_kv_pool, "runtime_contract", None)
             if contract is not None:
                 arrays = {
                     group_id: table.cpu().numpy()
-                    for group_id, table in flat_tables.items()
+                    for group_id, table in group_tables.items()
                 }
-                dummy_forward_op = SimpleNamespace(
-                    flat_block_tables_arrays=lambda: arrays
-                )
-                flat_cache_metadata = FlatCacheBatchMetadata.from_forward_op(
+                dummy_forward_op = SimpleNamespace(block_tables_arrays=lambda: arrays)
+                cache_metadata = CacheBatchMetadata.from_forward_op(
                     dummy_forward_op,
                     device=self.config.device,
                     contract=contract,
-                    num_requests=1,
+                    num_requests=bs,
                 )
-                flat_tables = dict(
-                    flat_cache_metadata.tables(active_forward_op=dummy_forward_op)
+                group_tables = dict(
+                    cache_metadata.tables(active_forward_op=dummy_forward_op)
                 )
-                extra_metadata_kwargs["flat_cache_metadata"] = flat_cache_metadata
-                extra_metadata_kwargs["flat_cache_forward_op"] = dummy_forward_op
-            extra_metadata_kwargs["flat_block_tables"] = flat_tables
+                extra_metadata_kwargs["cache_metadata"] = cache_metadata
+                extra_metadata_kwargs["forward_batch"] = dummy_forward_op
+            extra_metadata_kwargs["block_tables"] = group_tables
         self.attn_backend.init_forward_metadata(
-            bs=1,
-            num_extends=1,
-            req_pool_indices=ib.req_pool_indices_buf[:1],
-            seq_lens=ib.seq_lens_buf[:1],
+            bs=bs,
+            num_extends=bs,
+            req_pool_indices=ib.req_pool_indices_buf[:bs],
+            seq_lens=ib.seq_lens_buf[:bs],
             req_to_page=self.req_to_page,
             forward_mode=ForwardMode.EXTEND,
-            extend_seq_lens=ib.extend_seq_lens_buf[:1],
-            extend_seq_lens_cpu=ib.extend_seq_lens_cpu[:1],
-            extend_prefix_lens=ib.extend_prefix_lens_buf[:1],
-            extend_prefix_lens_cpu=ib.extend_prefix_lens_cpu[:1],
+            extend_seq_lens=ib.extend_seq_lens_buf[:bs],
+            extend_seq_lens_cpu=ib.extend_seq_lens_cpu[:bs],
+            extend_prefix_lens=ib.extend_prefix_lens_buf[:bs],
+            extend_prefix_lens_cpu=ib.extend_prefix_lens_cpu[:bs],
             **extra_metadata_kwargs,
         )
         return ctx

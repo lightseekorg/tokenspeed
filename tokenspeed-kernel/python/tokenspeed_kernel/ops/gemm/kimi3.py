@@ -321,7 +321,7 @@ def kimi3_latent_projection(
             validate=False,
         )
     if solution == "gluon_mediumm":
-        from tokenspeed_kernel_amd.ops.gemm.mm_a16w16_gfx950 import (
+        from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
             gluon_mm_a16w16_mfma_lds_mediumm_gfx950,
         )
 
@@ -332,7 +332,7 @@ def kimi3_latent_projection(
             out=out,
         )
     if solution == "gluon_largem":
-        from tokenspeed_kernel_amd.ops.gemm.mm_a16w16_largem_gfx950 import (
+        from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
             gluon_mm_a16w16_largem_gfx950,
         )
 

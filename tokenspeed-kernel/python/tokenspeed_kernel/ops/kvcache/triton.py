@@ -40,8 +40,8 @@ _is_nvidia = current_platform().is_nvidia
 __all__ = [
     "copy_state_rows",
     "fused_fp8_set_kv_buffer",
-    "flat_decode_locs",
-    "flat_tables_unpack",
+    "compute_group_decode_locs",
+    "unpack_group_tables",
     "gather_page_table_with_padding",
     "index_k_block_split_scatter",
     "quantize_mxfp8_rows",
@@ -53,7 +53,6 @@ __all__ = [
     "transfer_kv_per_layer",
     "transfer_kv_per_layer_mla",
     "zero_byte_segments",
-    "zero_flat_cache_pages",
 ]
 
 
@@ -230,72 +229,6 @@ def copy_state_rows(
 # -----------------------------------------------------------------------------
 # Flat hybrid cache page sanitization
 # -----------------------------------------------------------------------------
-
-
-@triton.jit
-def _zero_flat_cache_pages_kernel(
-    slab_addresses_ptr,
-    page_ids_ptr,
-    PAGE_SIZE_I32: tl.constexpr,
-    CHUNKS_PER_PAGE: tl.constexpr,
-    BLOCK_I32: tl.constexpr,
-):
-    """Zero one physical page across separately allocated cache slabs."""
-    page_index = tl.program_id(0)
-    work_index = tl.program_id(1)
-    slab_index = work_index // CHUNKS_PER_PAGE
-    chunk_index = work_index % CHUNKS_PER_PAGE
-
-    slab_address = tl.load(slab_addresses_ptr + slab_index)
-    slab_ptr = tl.cast(slab_address, tl.pointer_type(tl.int32))
-    page_id = tl.load(page_ids_ptr + page_index).to(tl.int64)
-    offsets = chunk_index * BLOCK_I32 + tl.arange(0, BLOCK_I32)
-    mask = offsets < PAGE_SIZE_I32
-    slab_offsets = page_id * PAGE_SIZE_I32 + offsets.to(tl.int64)
-    tl.store(slab_ptr + slab_offsets, 0, mask=mask)
-
-
-def zero_flat_cache_pages(
-    slab_addresses: torch.Tensor,
-    page_ids: torch.Tensor,
-    *,
-    page_size_bytes: int,
-) -> None:
-    """Zero physical pages across every slab of a flat hybrid cache.
-
-    Args:
-        slab_addresses: CUDA uint64 tensor containing one base address per
-            contiguous raw slab.
-        page_ids: CUDA integer tensor of physical page IDs to clear.
-        page_size_bytes: Uniform byte stride of one page in every slab.
-
-    Returns:
-        None. The selected pages are zeroed in place in one Triton launch.
-    """
-    if page_ids.numel() == 0:
-        return
-    if not slab_addresses.is_cuda or not page_ids.is_cuda:
-        raise ValueError("flat cache page zeroing requires CUDA tensors")
-    if slab_addresses.dtype != torch.uint64:
-        raise ValueError("slab_addresses must have dtype torch.uint64")
-    if page_ids.dtype not in (torch.int32, torch.int64):
-        raise ValueError("page_ids must have dtype torch.int32 or torch.int64")
-    if page_size_bytes <= 0 or page_size_bytes % 4:
-        raise ValueError("page_size_bytes must be positive and divisible by 4")
-    if slab_addresses.numel() == 0:
-        raise ValueError("slab_addresses must be non-empty")
-
-    page_size_i32 = page_size_bytes // 4
-    block_i32 = 1024
-    chunks_per_page = triton.cdiv(page_size_i32, block_i32)
-    grid = (page_ids.numel(), slab_addresses.numel() * chunks_per_page)
-    _zero_flat_cache_pages_kernel[grid](
-        slab_addresses,
-        page_ids,
-        PAGE_SIZE_I32=page_size_i32,
-        CHUNKS_PER_PAGE=chunks_per_page,
-        BLOCK_I32=block_i32,
-    )
 
 
 # -----------------------------------------------------------------------------
@@ -1712,7 +1645,7 @@ def quantize_mxfp8_rows(
 
 
 @triton.jit
-def _flat_decode_locs_kernel(
+def _compute_group_decode_locs_kernel(
     tab_ptr,  # [G, max_bs, Wmax] int32 stacked group tables
     ps_ptr,  # [G] int32 page size per group
     seq_ptr,  # [bs] int32 current lengths (incl. the newest token)
@@ -1747,7 +1680,7 @@ def _flat_decode_locs_kernel(
     tl.store(out_ptr + g * out_stride_g + i, loc.to(tl.int32), mask=mask)
 
 
-def flat_decode_locs(
+def compute_group_decode_locs(
     tables: torch.Tensor,
     page_sizes: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -1774,7 +1707,7 @@ def flat_decode_locs(
     assert out.shape[0] >= g and out.shape[1] >= num_rows
     BLOCK_B = 128
     grid = (g, (num_rows + BLOCK_B - 1) // BLOCK_B)
-    _flat_decode_locs_kernel[grid](
+    _compute_group_decode_locs_kernel[grid](
         tables,
         page_sizes,
         seq_lens,
@@ -1789,7 +1722,7 @@ def flat_decode_locs(
 
 
 @triton.jit
-def _flat_tables_unpack_kernel(
+def _unpack_group_tables_kernel(
     src_ptr,  # packed int32 device buffer (bridge upload)
     meta_ptr,  # [G, 3] int32: (src element offset, cols, page ratio) per group
     dst_ptr,  # [G, max_bs, Wmax] int32 stacked graph tables
@@ -1835,7 +1768,7 @@ def _flat_tables_unpack_kernel(
         )
 
 
-def flat_tables_unpack(
+def unpack_group_tables(
     src: torch.Tensor,
     meta: torch.Tensor,
     dst: torch.Tensor,
@@ -1867,7 +1800,7 @@ def flat_tables_unpack(
         actual_bs = bs
     BLOCK_W = 128 if wmax >= 128 else 64
     grid = (g, bs)
-    _flat_tables_unpack_kernel[grid](
+    _unpack_group_tables_kernel[grid](
         src,
         meta,
         dst,

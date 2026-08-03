@@ -273,6 +273,7 @@ def run_encode_loop(server_args, port_args, pipe_writer, gpu_id, global_rank):
             "status": "ready",
             "max_total_num_tokens": 0,
             "max_req_input_len": model_config.context_len,
+            "max_single_request_tokens": model_config.context_len,
             "max_num_seqs": server_args.max_num_seqs,
             "chunked_prefill_size": server_args.chunked_prefill_size,
             "max_model_len": model_config.context_len,

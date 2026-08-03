@@ -609,10 +609,10 @@ class OutputProcesser:
             else None
         )
         # Per-slot total prefill length as the OP sees it (C++ Request::PrefillSize()).
-        # After a flat retract the victim's generated tokens are rebased into the
+        # After a retract the victim's generated tokens are rebased into the
         # prefill window (RebasePrefill), so this can exceed the original prompt
         # length that RequestState.prefill_finished compares against.
-        prefill_lengths = getattr(forward_op, "prefill_lengths", None)
+        prefill_lengths = forward_op.prefill_lengths
         pt = 0
         for i, rid in enumerate(forward_op.request_ids):
             output_length = model_execution_results.output_lengths[i].item()
@@ -638,11 +638,10 @@ class OutputProcesser:
             # scheduled_time is stamped pre-forward in the event loop (queue end)
 
             # Mid-chunk extend slot by the op's own prefill_lengths (rebased after
-            # flat retract; C++ owes no result and the sampled token is garbage).
+            # retract; C++ owes no result and the sampled token is garbage).
             # Fresh requests: prefill_length == prompt length, same as the gate below.
             if (
                 not is_decode_slot
-                and prefill_lengths is not None
                 and forward_op.extend_prefix_lens[i] + forward_op.input_lengths[i]
                 < prefill_lengths[i]
             ):
@@ -828,7 +827,7 @@ class OutputProcesser:
     def finish_remote_prefill_only_request(self, req_id: str) -> list:
         """Finish after remote prefill when no decode step is needed.
 
-        FlatKV Prefill computes the first real output token.  A one-token
+        Paged cache Prefill computes the first real output token.  A one-token
         request is therefore already complete when Decode receives
         ``RemotePrefillDoneEvent`` and must not be scheduled for an additional
         decode forward. An aborted request follows the same transport fence

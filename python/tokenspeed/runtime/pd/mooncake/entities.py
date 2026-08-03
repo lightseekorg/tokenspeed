@@ -24,10 +24,10 @@ import struct
 import numpy as np
 import numpy.typing as npt
 
-from tokenspeed.runtime.pd.flatkv import (
-    FlatKVPDLayout,
-    FlatKVPDPageManifest,
-    FlatKVPDPeerLayout,
+from tokenspeed.runtime.pd.cache_protocol import (
+    CachePDLayout,
+    CachePDPageManifest,
+    CachePDPeerLayout,
 )
 from tokenspeed.runtime.pd.transfer_plan import (
     TransferFragment,
@@ -59,9 +59,9 @@ class KVArgs:
     state_type: str = "none"
     state_layer_ids: list[int] = dataclasses.field(default_factory=list)
     mamba_offsets: list[int] | None = None
-    # FlatKV keeps the typed layout beside the normal Mooncake buffer
+    # Paged cache keeps the typed layout beside the normal Mooncake buffer
     # descriptor. The buffers themselves still use the shared transfer path.
-    flat_layout: FlatKVPDLayout | None = None
+    cache_layout: CachePDLayout | None = None
 
 
 class KVTransferError(Exception):
@@ -96,7 +96,7 @@ class TransferKVChunk:
     layerwise_interval: int = 1
     wait_for_bootstrap_token: bool = False
     spec_candidate_ids: list[int] | None = None
-    flat_manifest: FlatKVPDPageManifest | None = None
+    page_manifest: CachePDPageManifest | None = None
 
 
 @dataclasses.dataclass
@@ -123,14 +123,14 @@ class TransferInfo:
     dst_mamba_indices: npt.NDArray[np.int64] | None
     is_dummy: bool
     transfer_fragments: tuple[TransferFragment, ...] = ()
-    flat_manifest: FlatKVPDPageManifest | None = None
-    flat_peer_layout: FlatKVPDPeerLayout | None = None
+    page_manifest: CachePDPageManifest | None = None
+    peer_cache_layout: CachePDPeerLayout | None = None
 
     @classmethod
     def from_zmq(cls, msg: list[bytes]):
         transfer_fragments = ()
-        flat_manifest = None
-        flat_peer_layout = None
+        page_manifest = None
+        peer_cache_layout = None
         if msg[4] == b"" and msg[5] == b"":
             dst_kv_indices = np.array([], dtype=np.int64)
             dst_aux_index = None
@@ -172,11 +172,11 @@ class TransferInfo:
             layout_frame = msg[15] if len(msg) > 15 else b""
             if bool(manifest_frame) != bool(layout_frame):
                 raise ValueError(
-                    "FlatKV pre-allocation requires both manifest and peer layout"
+                    "Paged cache pre-allocation requires both manifest and peer layout"
                 )
             if manifest_frame:
-                flat_manifest = FlatKVPDPageManifest.from_wire_bytes(manifest_frame)
-                flat_peer_layout = FlatKVPDPeerLayout.from_wire_bytes(layout_frame)
+                page_manifest = CachePDPageManifest.from_wire_bytes(manifest_frame)
+                peer_cache_layout = CachePDPeerLayout.from_wire_bytes(layout_frame)
             is_dummy = False
         return cls(
             room=int(msg[0].decode("ascii")),
@@ -194,8 +194,8 @@ class TransferInfo:
             dst_mamba_indices=dst_mamba_indices,
             is_dummy=is_dummy,
             transfer_fragments=transfer_fragments,
-            flat_manifest=flat_manifest,
-            flat_peer_layout=flat_peer_layout,
+            page_manifest=page_manifest,
+            peer_cache_layout=peer_cache_layout,
         )
 
 

@@ -382,8 +382,8 @@ class InklingModelConfig(PretrainedConfig):
         group (Inkling: 55 sliding + 11 full -> 5 sub-groups of 11 -> 11
         six-way-bound slabs). All sub-groups share the one window, so
         eviction semantics per layer are unchanged vs a single sliding
-        group. Consumed by the flat KV-cache path (paged-cache group
-        publication and the hybrid slab layout); inert on a radix-built
+        group. Consumed by the paged-cache path (cache-group
+        publication and the hybrid slab layout); inert on a single-table-built
         scheduler ext, so the scheduler-blind contract above still holds
         there.
         """

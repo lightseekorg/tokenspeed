@@ -62,13 +62,13 @@ class AttentionBackend(ABC):
     """The base class of attention backends"""
 
     uses_paged_cache_groups: bool = False
-    # Flat KV-cache per-group block tables (absolute index, null hole = 0). A
+    # paged cache per-group block tables (absolute index, null hole = 0). A
     # separate flag from uses_paged_cache_groups because the two mechanisms have
-    # different hole/index semantics; a group-aware flat backend (Phase 4) sets
+    # different hole/index semantics; a group-aware backend sets
     # this True. Default False keeps every existing backend on today's path.
-    uses_flat_cache_groups: bool = False
-    # False for flat-capable backends whose spec-verify path is not wired yet.
-    flat_spec_capable: bool = True
+    uses_cache_groups: bool = False
+    # False for group-aware backends whose spec-verify path is not wired yet.
+    cache_group_spec_capable: bool = True
     uses_padded_decode_token_mask: bool = False
     # Backend-owned cuda-graph cache-seqlens buffer the decode metadata views.
     draft_seq_lens_attr: str = "cuda_graph_seq_lens"
@@ -103,9 +103,9 @@ class AttentionBackend(ABC):
         return False
 
     def select_out_cache_loc(self, layer, out_cache_loc, forward_mode=None):
-        """Flat per-group write-location hook for out-of-backend KV writers
-        (fused RoPE prewrite); identity for backends without flat cache
-        groups (see uses_flat_cache_groups). ``forward_mode`` picks the
+        """Per-group write-location hook for out-of-backend KV writers
+        (fused RoPE prewrite); identity for backends without paged cache
+        groups (see uses_cache_groups). ``forward_mode`` picks the
         metadata slot for backends that prewrite on extend as well."""
         return out_cache_loc
 
@@ -145,15 +145,15 @@ class AttentionBackend(ABC):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
-        flat_cache_group_ids: tuple[str, ...] = (),
+        cache_group_ids: tuple[str, ...] = (),
         **kwargs,
     ):
         """Init the metadata for a forward pass for capturing a cuda graph.
 
-        ``flat_cache_group_ids`` names the flat KV-cache groups whose page
-        tables arrive at replay; a flat-capable backend (uses_flat_cache_groups)
+        ``cache_group_ids`` names the cache groups whose page tables arrive at
+        replay; a group-aware backend (``uses_cache_groups``)
         allocates its persistent per-group buffers from these ids — no table
-        data exists at capture time. Empty tuple for non-flat backends.
+        data exists at capture time. Empty for single-table backends.
         """
         raise NotImplementedError()
 
@@ -164,7 +164,7 @@ class AttentionBackend(ABC):
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
         req_to_page: torch.Tensor = None,
-        flat_block_tables: dict[str, torch.Tensor] | None = None,
+        block_tables: dict[str, torch.Tensor] | None = None,
         **kwargs,
     ):
         """Update pre-allocated CUDA-graph metadata buffers in-place before replay.
@@ -172,9 +172,9 @@ class AttentionBackend(ABC):
         Called instead of init_forward_metadata when use_cuda_graph=True, so
         that the captured kernels (which hold pointers into the pre-allocated
         buffers) see the current batch's data without any new allocations.
-        ``flat_block_tables`` carries the per-group flat page tables
-        (group_id -> [>=bs, cols]) for flat-capable backends; a backend that
-        captured flat buffers must be handed non-empty tables whenever bs > 0.
+        ``block_tables`` carries per-group page tables
+        (group_id -> [>=bs, cols]) for group-aware backends; a backend that
+        captured group buffers must receive non-empty tables whenever bs > 0.
         Default: fall back to init_forward_metadata (correct but may not work
         for all backends that use separate cuda-graph buffer pools).
         """

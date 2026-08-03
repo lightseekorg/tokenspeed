@@ -636,9 +636,8 @@ def test_gdn_decode_step_padding_index_is_isolated(device: str, solution: str, r
         atol=3e-2,
     )
     # Rows unrelated to any (valid or padding) index stay untouched. Row 0 is
-    # excluded because FlashInfer's bf16 path redirects -1 padding there. The
-    # radix runtime cannot use that convention because its row 0 may be live;
-    # it routes bf16 state to the Triton solution instead.
+    # the reserved null page and is excluded because FlashInfer's bf16 path
+    # redirects -1 padding there.
     referenced = {int(x) for x in valid_rows.tolist()} | {0}
     untouched = torch.tensor(
         [i for i in range(pool.shape[0]) if i not in referenced], device=device

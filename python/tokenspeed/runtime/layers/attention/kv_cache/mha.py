@@ -143,7 +143,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         )
 
         # Publication rule lives in paged_cache_spec.publish_paged_cache_groups
-        # (module-attr call so tests can patch the flat-ext probe at call time).
+        # (module-attr call so tests can patch the scheduler probe at call time).
         published = self._publish_paged_cache_groups(
             layer_types=self._layer_types,
             sliding_window_tokens=sliding_window_tokens,
@@ -217,7 +217,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
     def _check_slab_guards(self):
         """Refuse features whose per-layer buffer assumptions break when
         paired layers alias the same slab tensor."""
-        # kvstore is allowed (spec §6 revision): the flat L2 tier mirrors
+        # kvstore is allowed: the L2 tier mirrors
         # whole slabs byte-blind, so per-slab copies are group-safe.
         if self._pd_disaggregation_enabled:
             raise RuntimeError(
@@ -226,7 +226,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                 "pointers (get_contiguous_buf_infos), and paired layers "
                 "alias the same slab, so per-layer transfers would send "
                 "the same bytes twice and clobber the peer's pairing. Set "
-                "disaggregation_mode='null' or use a radix-built "
+                "disaggregation_mode='null' or use a single-table-built "
                 "tokenspeed_scheduler extension, which keeps the legacy "
                 "per-layer layout."
             )
@@ -369,7 +369,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         # Slab layout: data_ptrs holds duplicated slab entries, so this
         # broadcast re-copies rows. No callers today; re-check before wiring.
         if self._kv_copy_config is None:
-            # Real tensors only: flat GDN state layers carry None slots.
+            # Real tensors only: GDN state layers carry None slots.
             move_kv_cache_native(
                 [x for x in self.k_buffer if x is not None],
                 [x for x in self.v_buffer if x is not None],
@@ -395,7 +395,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         assert hasattr(self, "v_buffer")
         # Dedup by tensor identity: the slab layout aliases layers to shared
         # slabs, and allocated bytes must not be double-counted. None slots
-        # (flat GDN state layers carry no KV) are skipped.
+        # (GDN state layers carry no KV) are skipped.
         k_size_bytes = 0
         for k_cache in {id(t): t for t in self.k_buffer if t is not None}.values():
             k_size_bytes += np.prod(k_cache.shape) * k_cache.dtype.itemsize
@@ -650,7 +650,7 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
     ``store_sf_interleaved``); any other page size stores them flat
     ([slots, heads, head_dim // 32]).
 
-    Hybrid-slab mode (flat ext, Inkling): fp8 data rides the base class's
+    Hybrid-slab mode (Inkling): fp8 data rides the base class's
     byte-uniform slabs unchanged, and every block id additionally owns one
     SF slot per K/V in parallel scale slabs with the same slab pairing
     (slot_bytes / 32 e8m0 each — byte-uniform like the data slots). A

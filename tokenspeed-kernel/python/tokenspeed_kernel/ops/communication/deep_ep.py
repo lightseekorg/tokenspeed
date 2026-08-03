@@ -26,6 +26,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.thirdparty.deep_ep import load_deep_ep
 
 __all__ = [
     "Buffer",
@@ -36,6 +37,10 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__file__)
+
+# FP8 block-scale granularity shared by the dispatch quantization and the
+# per-local-expert receive alignment DeepGEMM's contiguous layout requires.
+_FP8_BLOCK = 128
 
 
 def _raise_deepep_unavailable() -> None:
@@ -58,7 +63,7 @@ class _MissingBuffer(metaclass=_MissingBufferMeta):
 
 
 try:
-    from deep_ep.buffer import Buffer
+    Buffer = load_deep_ep().Buffer
 except ImportError:
     Buffer = _MissingBuffer
 
@@ -87,13 +92,26 @@ class DeepEPMode(Enum):
     def enable_low_latency(self):
         return self in [DeepEPMode.low_latency, DeepEPMode.auto]
 
-    def resolve(self, forward_mode):
+    def resolve(self, low_latency: bool | None):
+        """Pick the concrete mode for one dispatch/combine round.
+
+        Args:
+            low_latency: Whether the caller wants the low-latency legs for this
+                round. Only consulted by ``auto``; the caller must derive it
+                from a value all ranks in the group agree on (e.g. "every rank
+                is decoding") because the two modes are separate collectives.
+
+        Returns:
+            ``DeepEPMode.normal`` or ``DeepEPMode.low_latency``.
+        """
         if self != DeepEPMode.auto:
             return self
-
-        if forward_mode.is_decode():
-            return DeepEPMode.low_latency
-        return DeepEPMode.normal
+        if low_latency is None:
+            raise ValueError(
+                "DeepEPMode.auto requires an explicit low_latency decision per "
+                "dispatch/combine round"
+            )
+        return DeepEPMode.low_latency if low_latency else DeepEPMode.normal
 
 
 class DeepEPDispatchMode(IntEnum):
@@ -107,6 +125,7 @@ class DeepEPBuffer:
     _hidden_size: int | None = None
     _num_max_dispatch_tokens_per_rank: int | None = None
     _num_experts: int | None = None
+    _deepep_mode: DeepEPMode | None = None
 
     @classmethod
     def get_deepep_buffer(
@@ -119,11 +138,18 @@ class DeepEPBuffer:
         num_experts: int = None,
     ):
         if cls._buffer is not None:
+            cls._check_reuse(
+                hidden_size,
+                deepep_mode,
+                num_max_dispatch_tokens_per_rank,
+                num_experts,
+            )
             return cls._buffer
 
         cls._hidden_size = hidden_size
         cls._num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         cls._num_experts = num_experts
+        cls._deepep_mode = deepep_mode
 
         num_nvl_bytes, num_rdma_bytes = 0, 0
         if deepep_mode.enable_normal():
@@ -180,6 +206,46 @@ class DeepEPBuffer:
             "DeepEPBuffer use memory %s GB", free_gpu_memory_begin - free_gpu_memory_end
         )
         return cls._buffer
+
+    @classmethod
+    def _check_reuse(
+        cls,
+        hidden_size: int,
+        deepep_mode: DeepEPMode,
+        num_max_dispatch_tokens_per_rank: int | None,
+        num_experts: int | None,
+    ) -> None:
+        """Reject reuse requests the one process-wide buffer cannot serve.
+
+        The buffer is sized once, from the first requesting layer. Silently
+        handing it to a layer that needs more room (a larger hidden size, more
+        experts, a bigger low-latency capacity, or a mode whose leg was never
+        allocated) would corrupt dispatch instead of failing.
+        """
+        if hidden_size != cls._hidden_size or num_experts != cls._num_experts:
+            raise ValueError(
+                "DeepEP buffer was allocated for hidden_size="
+                f"{cls._hidden_size}, num_experts={cls._num_experts}; cannot "
+                f"reuse it for hidden_size={hidden_size}, "
+                f"num_experts={num_experts}"
+            )
+        if deepep_mode.enable_normal() and not cls._deepep_mode.enable_normal():
+            raise ValueError(
+                "DeepEP buffer was allocated without the normal-mode legs; "
+                f"cannot serve deepep_mode={deepep_mode.value}"
+            )
+        if deepep_mode.enable_low_latency():
+            if not cls._deepep_mode.enable_low_latency():
+                raise ValueError(
+                    "DeepEP buffer was allocated without the low-latency legs; "
+                    f"cannot serve deepep_mode={deepep_mode.value}"
+                )
+            if num_max_dispatch_tokens_per_rank > cls._num_max_dispatch_tokens_per_rank:
+                raise ValueError(
+                    "DeepEP low-latency buffer holds "
+                    f"{cls._num_max_dispatch_tokens_per_rank} tokens per rank; "
+                    f"cannot serve {num_max_dispatch_tokens_per_rank}"
+                )
 
     @classmethod
     def clean_buffer(cls):
@@ -259,10 +325,18 @@ class _DeepEPDispatcherImplBase:
 
 
 class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
-    def __init__(self, async_finish: bool, **kwargs):
+    def __init__(
+        self,
+        async_finish: bool,
+        use_fp8: bool = False,
+        ue8m0_scales: bool = False,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
 
         self.async_finish = async_finish
+        self.use_fp8 = use_fp8
+        self.ue8m0_scales = ue8m0_scales
         self.src2dst = None
 
     def dispatch_a(
@@ -271,9 +345,29 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-        from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
+        if self.use_fp8:
+            # FP8 on the wire, mirroring the low-latency leg: dispatch carries
+            # (fp8 tokens, 1x128 block scales) instead of a single bf16 tensor.
+            if self.ue8m0_scales:
+                from tokenspeed_kernel.ops.moe.deep_gemm.ue8m0 import (
+                    per_token_group_quant_fp8_ue8m0,
+                )
 
-        hidden_states = per_token_group_quant_fp8(hidden_states, 128)
+                # Power-of-two scales, in the token-major FP32 layout DeepEP
+                # transmits (the repo's packed UE8M0 layout cannot be sent).
+                hidden_states = per_token_group_quant_fp8_ue8m0(
+                    hidden_states, _FP8_BLOCK
+                )
+            else:
+                from tokenspeed_kernel.ops.gemm.fp8_utils import (
+                    per_token_group_quant_fp8,
+                )
+
+                quantized, scales = per_token_group_quant_fp8(hidden_states, _FP8_BLOCK)
+                # The quantizer hands back scales as [hidden / block, tokens]
+                # (block major, what the GEMMs want); DeepEP requires the
+                # token-major [tokens, hidden / block] and asserts on size(0).
+                hidden_states = (quantized, scales.t().contiguous())
         topk_idx = topk_idx.to(torch.int64)
         topk_weights = topk_weights.to(torch.float32)
         previous_event = Buffer.capture() if self.async_finish else None
@@ -347,7 +441,10 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             previous_event=previous_event,
             async_finish=self.async_finish,
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
-            expert_alignment=128,
+            # Per-local-expert receive counts come back rounded up to this, so
+            # the permuted buffer the grouped GEMM consumes is already tiled on
+            # DeepGEMM's contiguous-layout block size.
+            expert_alignment=_FP8_BLOCK,
         )
 
         return (
@@ -430,7 +527,13 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
 
 
 class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
-    def __init__(self, return_recv_hook: bool, use_fp8: bool = False, **kwargs):
+    def __init__(
+        self,
+        return_recv_hook: bool,
+        use_fp8: bool = False,
+        ue8m0_scales: bool = False,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
 
         """
@@ -439,6 +542,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         """
         self.return_recv_hook = return_recv_hook
         self.use_fp8 = use_fp8
+        self.ue8m0_scales = ue8m0_scales
 
     def dispatch_a(
         self,
@@ -446,17 +550,22 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-        # DeepEP requires independent contiguous tensors to prevent issues with
-        # upstream tensor aliasing or non-standard strides. We clone to ensure
-        # complete memory isolation, which is critical for low-latency dispatch.
-        #
-        # Dtype requirements:
-        # - hidden_states: preserve original dtype (bf16/fp16/fp32)
-        # - topk_idx: must be int64 (DeepEP C++ kernel API requirement for expert indices)
-        # - topk_weights: use float32 for routing precision to avoid numerical issues
-        hidden_states = hidden_states.contiguous().clone()
-        topk_idx = topk_idx.to(torch.int64).contiguous().clone()
-        topk_weights = topk_weights.to(torch.float32).contiguous().clone()
+        # DeepEP needs contiguous tensors with standard strides, int64 expert
+        # indices (C++ API requirement) and fp32 routing weights (precision).
+        # No private copy is needed: the send-phase kernel stages the tokens into
+        # the symmetric buffer before it returns, and stream order keeps these
+        # tensors alive and unmodified until then. ``.to()`` already allocates a
+        # fresh contiguous tensor whenever the dtype actually changes.
+        if hidden_states.shape[0] > self.num_max_dispatch_tokens_per_rank:
+            raise ValueError(
+                f"low-latency dispatch got {hidden_states.shape[0]} tokens but "
+                f"the buffer holds {self.num_max_dispatch_tokens_per_rank} per "
+                "rank; raise --low-latency-max-num-tokens-per-gpu or route "
+                "this batch through normal mode"
+            )
+        hidden_states = hidden_states.contiguous()
+        topk_idx = topk_idx.to(torch.int64).contiguous()
+        topk_weights = topk_weights.to(torch.float32).contiguous()
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_idx,
@@ -538,6 +647,11 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
                 use_fp8=use_fp8,
+                # Ask DeepEP to both round and pack the scales in the
+                # column-major TMA layout its low-latency API exposes. On
+                # sm100+ this can feed DeepGEMM's 1d1d recipe directly.
+                round_scale=self.ue8m0_scales,
+                use_ue8m0=self.ue8m0_scales,
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
             )
@@ -599,7 +713,22 @@ class DeepEPDispatcher:
         async_finish: bool = True,
         return_recv_hook: bool = True,
         use_fp8: bool = False,
+        ue8m0_scales: bool = False,
     ):
+        """Own one MoE layer's DeepEP dispatch/combine legs.
+
+        Args:
+            config: Layer geometry (top_k, num_experts, hidden_size, world_size,
+                group, params_dtype, low_latency_max_num_tokens_per_gpu).
+            deepep_mode: Which legs to allocate; ``auto`` allocates both and lets
+                each round choose.
+            async_finish: Normal-mode legs overlap with the current stream.
+            return_recv_hook: Low-latency legs return a receive hook instead of
+                waiting inline.
+            use_fp8: Cast tokens to FP8 on the wire and return block scales.
+            ue8m0_scales: Quantize with power-of-two scales, required when the
+                consuming GEMM reads scales as UE8M0 (sm100+ DeepGEMM).
+        """
         self.deepep_mode = deepep_mode
 
         common_kwargs = dict(
@@ -618,11 +747,14 @@ class DeepEPDispatcher:
             self._low_latency_dispatcher = _DeepEPDispatcherImplLowLatency(
                 return_recv_hook=return_recv_hook,
                 use_fp8=use_fp8,
+                ue8m0_scales=ue8m0_scales,
                 **common_kwargs,
             )
         if self.deepep_mode.enable_normal():
             self._normal_dispatcher = _DeepEPDispatcherImplNormal(
                 async_finish=async_finish,
+                use_fp8=use_fp8,
+                ue8m0_scales=ue8m0_scales,
                 **common_kwargs,
             )
 
@@ -635,20 +767,20 @@ class DeepEPDispatcher:
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        forward_mode,
+        low_latency: bool | None = None,
     ):
         topk_idx = topk_idx.to(torch.int64)
-        inner_state = self._get_impl(forward_mode).dispatch_a(
+        inner_state = self._get_impl(low_latency).dispatch_a(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
         )
-        self._dispatch_intermediate_state = forward_mode, inner_state
+        self._dispatch_intermediate_state = low_latency, inner_state
 
     def dispatch_b(self):
-        forward_mode, inner_state = self._dispatch_intermediate_state
+        low_latency, inner_state = self._dispatch_intermediate_state
         del self._dispatch_intermediate_state
-        return self._get_impl(forward_mode).dispatch_b(*inner_state)
+        return self._get_impl(low_latency).dispatch_b(*inner_state)
 
     def combine(self, *args, **kwargs) -> tuple:
         self.combine_a(*args, **kwargs)
@@ -659,18 +791,18 @@ class DeepEPDispatcher:
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-        forward_mode,
+        low_latency: bool | None = None,
         moe_origin_input: torch.Tensor = None,
     ):
         topk_idx = topk_idx.to(torch.int64)
-        inner_state = self._get_impl(forward_mode).combine_a(
+        inner_state = self._get_impl(low_latency).combine_a(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
             moe_origin_input=moe_origin_input,
         )
         self._combine_intermediate_state = (
-            forward_mode,
+            low_latency,
             inner_state,
             topk_idx,
             topk_weights,
@@ -678,16 +810,16 @@ class DeepEPDispatcher:
         )
 
     def combine_b(self):
-        forward_mode, inner_state, topk_idx, topk_weights, moe_origin_input = (
+        low_latency, inner_state, topk_idx, topk_weights, moe_origin_input = (
             self._combine_intermediate_state
         )
-        if self.deepep_mode.resolve(forward_mode) == DeepEPMode.normal:
+        if self.deepep_mode.resolve(low_latency) == DeepEPMode.normal:
             inner_state = inner_state + (topk_idx, topk_weights, moe_origin_input)
         del self._combine_intermediate_state
-        return self._get_impl(forward_mode).combine_b(*inner_state)
+        return self._get_impl(low_latency).combine_b(*inner_state)
 
-    def _get_impl(self, forward_mode) -> _DeepEPDispatcherImplBase:
-        resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
+    def _get_impl(self, low_latency: bool | None) -> _DeepEPDispatcherImplBase:
+        resolved_deepep_mode = self.deepep_mode.resolve(low_latency)
         if resolved_deepep_mode == DeepEPMode.normal:
             return self._normal_dispatcher
         if resolved_deepep_mode == DeepEPMode.low_latency:

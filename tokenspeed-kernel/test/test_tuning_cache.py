@@ -21,8 +21,9 @@
 """load_flashinfer_tuning_cache never fails startup.
 
 Every failure mode -- missing file, corrupt JSON, a table swept on a different
-GPU model -- must come back as ``False`` (with a warning) so the runtime falls
-back to lazy autotuning instead of aborting engine startup over a stale table.
+GPU model -- must come back as ``False`` (with a warning) so the startup
+autotune window tunes those shapes instead of engine startup aborting over a
+stale table.
 """
 
 from __future__ import annotations
@@ -31,11 +32,29 @@ import json
 from importlib.util import find_spec
 
 import pytest
-from tokenspeed_kernel.ops.tuning import load_flashinfer_tuning_cache
+from tokenspeed_kernel.ops.tuning import (
+    flashinfer_tuning_cache_filename,
+    load_flashinfer_tuning_cache,
+    set_autotune_process_group,
+)
 
 requires_flashinfer = pytest.mark.skipif(
     find_spec("flashinfer") is None, reason="requires flashinfer"
 )
+
+
+def test_flashinfer_tuning_cache_filename_includes_cudnn() -> None:
+    assert flashinfer_tuning_cache_filename(
+        "kimi-k3",
+        8,
+        1,
+        "NVIDIA B300 SXM6 AC",
+        "0.6.16",
+        92400,
+    ) == (
+        "kimi-k3,ep=8,tp=1,device_name=NVIDIA_B300_SXM6_AC,"
+        "flashinfer=0.6.16,cudnn=92400.json"
+    )
 
 
 @requires_flashinfer
@@ -51,20 +70,6 @@ def test_corrupt_file_returns_false(tmp_path) -> None:
 
 
 @requires_flashinfer
-def test_failed_loads_never_activate_cache(tmp_path) -> None:
-    # The read-only fast path (ops skip tuning contexts entirely) keys off
-    # flashinfer_tuning_cache_active(); only a *successful* load may set it.
-    from tokenspeed_kernel.ops import tuning
-
-    before = tuning.flashinfer_tuning_cache_active()
-    load_flashinfer_tuning_cache(str(tmp_path / "absent.json"))
-    corrupt = tmp_path / "corrupt.json"
-    corrupt.write_text("{ not json")
-    load_flashinfer_tuning_cache(str(corrupt))
-    assert tuning.flashinfer_tuning_cache_active() == before
-
-
-@requires_flashinfer
 def test_packaged_lookup_miss_returns_false() -> None:
     import torch
     from tokenspeed_kernel.ops.tuning import load_packaged_flashinfer_tuning_cache
@@ -72,11 +77,29 @@ def test_packaged_lookup_miss_returns_false() -> None:
     if not torch.cuda.is_available():
         pytest.skip("device-name lookup requires CUDA")
     # No table ships for this made-up model; the miss must be a quiet False
-    # (INFO log), leaving lazy autotuning in place.
+    # (INFO log), leaving the startup autotune window to tune these shapes.
     assert (
         load_packaged_flashinfer_tuning_cache("no-such-model-unit-test", 999, 1)
         is False
     )
+
+
+@requires_flashinfer
+def test_set_autotune_process_group_sets_and_clears() -> None:
+    import flashinfer.autotuner as fi
+
+    sentinel = object()
+    set_autotune_process_group(sentinel)
+    try:
+        assert fi.get_autotune_process_group() is sentinel
+    finally:
+        set_autotune_process_group(None)
+    assert fi.get_autotune_process_group() is None
+
+
+def test_set_autotune_process_group_tolerates_missing_backend() -> None:
+    # Like autotune(), a no-op without flashinfer installed.
+    set_autotune_process_group(None)
 
 
 @requires_flashinfer

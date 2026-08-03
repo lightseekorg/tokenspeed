@@ -17,9 +17,11 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+from collections.abc import Callable
 from typing import Any
 
 # Backend registration (side-effect imports)
+import tokenspeed_kernel.ops.moe.deep_gemm  # noqa: F401
 import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.moe.gluon  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton  # noqa: F401
@@ -70,6 +72,56 @@ def _validate_routing_mode(routing_mode: str | None) -> None:
     raise ValueError(
         f"routing_mode must be 'kernel_routing' or 'precomputed_topk', "
         f"got {routing_mode!r}"
+    )
+
+
+def _validate_deepep_mode(a2a_backend: str | None, deepep_mode: str | None) -> None:
+    if deepep_mode is None:
+        return
+    if deepep_mode not in {"auto", "normal", "low_latency"}:
+        raise ValueError(
+            "deepep_mode must be 'auto', 'normal' or 'low_latency', got "
+            f"{deepep_mode!r}"
+        )
+    if not _uses_all_to_all_ep(a2a_backend):
+        raise ValueError(
+            f"deepep_mode={deepep_mode!r} requires an all-to-all backend, got "
+            f"a2a_backend={a2a_backend!r}"
+        )
+
+
+def _validate_selected_deepep_mode(
+    a2a_backend: str | None,
+    deepep_mode: str | None,
+    kernel_name: str,
+    kernel_traits: dict[str, frozenset[Any]],
+) -> None:
+    """Reject a selected DeepEP kernel that lacks a requested collective leg."""
+    if a2a_backend != "deepep":
+        return
+    supported_modes = kernel_traits.get("deepep_modes")
+    if supported_modes is None:
+        return
+
+    requested_mode = deepep_mode or "auto"
+    required_modes = (
+        frozenset({"normal", "low_latency"})
+        if requested_mode == "auto"
+        else frozenset({requested_mode})
+    )
+    if required_modes.issubset(supported_modes):
+        return
+
+    supported = ", ".join(sorted(supported_modes))
+    auto_note = (
+        " 'auto' requires both normal and low_latency legs."
+        if requested_mode == "auto"
+        else ""
+    )
+    raise ValueError(
+        f"MoE kernel {kernel_name!r} does not support "
+        f"deepep_mode={requested_mode!r}; supported modes: {supported}."
+        f"{auto_note}"
     )
 
 
@@ -131,6 +183,8 @@ def moe_plan(
     internal_activation_dtype: str | None = None,
     with_bias: bool = False,
     deepep_group: object | None = None,
+    deepep_mode: str | None = None,
+    deepep_low_latency_max_num_tokens_per_gpu: int | None = None,
     solution: str | None = None,
 ) -> dict:
     """Create a MoE execution plan.
@@ -158,6 +212,13 @@ def moe_plan(
             activations have. Defaults to "input" if not set.
         with_bias: Whether the selected kernel must support expert bias tensors.
         deepep_group: Runtime-created process group used by DeepEP plans.
+        deepep_mode: Optional DeepEP mode for all-to-all plans: "low_latency"
+            (decode-shaped batches only), "normal" (extend-shaped batches only),
+            or "auto" to let each ``moe_apply`` pick through its ``low_latency``
+            argument. Defaults to "auto".
+        deepep_low_latency_max_num_tokens_per_gpu: Per-GPU token capacity the
+            DeepEP low-latency buffer is sized for. Required whenever the mode
+            can run the low-latency legs; batches above it must use normal mode.
         solution: Optional kernel solution to force through normal selection.
             None leaves the concrete kernel choice to the registry.
 
@@ -170,8 +231,11 @@ def moe_plan(
     weight_dtype = _normalize_weight_dtype(weight_dtype)
     _validate_a2a_backend(a2a_backend)
     _validate_routing_mode(routing_mode)
-    if solution is None and a2a_backend == "deepep":
-        solution = "flashinfer_cutedsl_deepep"
+    _validate_deepep_mode(a2a_backend, deepep_mode)
+    # DeepEP does not pin a solution: the ``supports_all_to_all_ep`` trait plus
+    # ``weight_dtype`` already narrow the candidates to the apply kernels that
+    # own the dispatch/combine legs (nvfp4 cutedsl, block-scale fp8 DeepGEMM).
+    # Callers may still force one explicitly through ``solution``.
 
     traits = _build_traits(
         weight_dtype=weight_dtype,
@@ -197,6 +261,12 @@ def moe_plan(
     apply_spec = registry.get_by_name(kernel.name)
     if apply_spec is None:
         raise RuntimeError(f"Kernel spec not found for selected kernel {kernel.name}")
+    _validate_selected_deepep_mode(
+        a2a_backend,
+        deepep_mode,
+        apply_spec.name,
+        apply_spec.traits,
+    )
 
     routing_modes = apply_spec.traits.get("routing_mode", frozenset())
     support_routing = "kernel_routing" in routing_modes
@@ -210,6 +280,10 @@ def moe_plan(
         "weight_preprocessor": apply_spec.weight_preprocessor,
         "a2a_backend": a2a_backend,
         "deepep_group": deepep_group,
+        "deepep_mode": deepep_mode or "auto",
+        "deepep_low_latency_max_num_tokens_per_gpu": (
+            deepep_low_latency_max_num_tokens_per_gpu
+        ),
         "support_routing": support_routing,
         "supports_deferred_finalize": supports_deferred_finalize,
         "solution": apply_spec.solution,
@@ -248,6 +322,9 @@ def moe_apply(
     do_finalize: bool = True,
     # launch config
     enable_pdl: bool = False,
+    # all-to-all EP
+    low_latency: bool | None = None,
+    overlap_fn: Callable[[], None] | None = None,
 ):
     """Apply a planned MoE kernel.
 
@@ -262,6 +339,18 @@ def moe_apply(
             Required when plan support_routing is false.
         num_tokens_global: Optional global token count for distributed MoE.
         max_num_tokens_per_gpu: Optional per-GPU token capacity hint.
+        do_finalize: Whether the kernel must produce the finalized output.
+        enable_pdl: Whether kernels may honor programmatic dependent launch.
+        low_latency: Only forwarded to all-to-all EP plans, and only meaningful
+            when the plan mode is "auto": True selects the latency-optimized
+            dispatch/combine legs (decode-shaped batches), False the
+            throughput-optimized ones (extend-shaped batches). Every rank of the
+            EP group must pass the same value, since the two legs are different
+            collectives.
+        overlap_fn: Only forwarded to all-to-all EP plans. Work queued here runs
+            inside the dispatch window (tokens sent, not yet awaited), so it
+            overlaps the transfer. It must not read the dispatch result or write
+            ``x``.
 
     Solutions may use precomputed top-k tensors or route from logits directly.
     """
@@ -270,6 +359,13 @@ def moe_apply(
         "apply",
         format_signature(x=dense_tensor_format(x.dtype)),
         override=plan["apply_kernel_name"],
+    )
+    # Only the all-to-all EP kernels own dispatch/combine legs, so the mode
+    # decision stays off the signature every other apply kernel implements.
+    a2a_kwargs = (
+        {"low_latency": low_latency, "overlap_fn": overlap_fn}
+        if _uses_all_to_all_ep(plan.get("a2a_backend"))
+        else {}
     )
     return kernel(
         plan=plan,
@@ -282,4 +378,5 @@ def moe_apply(
         max_num_tokens_per_gpu=max_num_tokens_per_gpu,
         do_finalize=do_finalize,
         enable_pdl=enable_pdl,
+        **a2a_kwargs,
     )

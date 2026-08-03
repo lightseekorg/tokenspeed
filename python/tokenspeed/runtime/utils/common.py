@@ -423,10 +423,14 @@ def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
         if not os.path.exists(model_path):
             from modelscope import snapshot_download
 
-            model_path = snapshot_download(model_path)
-            tokenizer_path = snapshot_download(
-                tokenizer_path, ignore_patterns=["*.bin", "*.safetensors"]
-            )
+            from tokenspeed.runtime.model_loader.weight_utils import get_lock
+
+            with get_lock(model_path):
+                model_path = snapshot_download(model_path)
+            with get_lock(tokenizer_path):
+                tokenizer_path = snapshot_download(
+                    tokenizer_path, ignore_patterns=["*.bin", "*.safetensors"]
+                )
     return model_path, tokenizer_path
 
 

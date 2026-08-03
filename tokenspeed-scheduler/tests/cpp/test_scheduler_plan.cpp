@@ -37,13 +37,12 @@ protected:
         Submit(MakeRequestSpec("r_seed", /*num_pages=*/2, /*start=*/1));
         PlanOnce();
         SendForwardDone("r_seed", {42});
-        PlanOnce();
-        SendFinish("r_seed");
         auto plan_wb = PlanOnce();
-        const FlatWriteBackOperation* wb = nullptr;
+        SendFinish("r_seed");
+        const WriteBackBatch* wb = nullptr;
         for (const auto& op : plan_wb.Operations()) {
             if (auto* cop = std::get_if<CacheOperation>(&op)) {
-                if (auto* w = std::get_if<FlatWriteBackOperation>(cop)) {
+                if (auto* w = std::get_if<WriteBackBatch>(cop)) {
                     wb = w;
                     break;
                 }
@@ -57,12 +56,11 @@ protected:
         Submit(MakeRequestSpec("r_fill", /*num_pages=*/3, /*start=*/100));
         PlanOnce();
         SendForwardDone("r_fill", {200});
-        PlanOnce();
-        SendFinish("r_fill");
         auto plan_wb2 = PlanOnce();
+        SendFinish("r_fill");
         for (const auto& op : plan_wb2.Operations()) {
             if (auto* cop = std::get_if<CacheOperation>(&op)) {
-                if (auto* w = std::get_if<FlatWriteBackOperation>(cop)) {
+                if (auto* w = std::get_if<WriteBackBatch>(cop)) {
                     if (!w->op_ids.empty()) SendWriteBackDone(w->op_ids[0]);
                     break;
                 }
@@ -77,11 +75,11 @@ TEST_F(LoadBackViaCacheTestSuite, LoadBack_TriggeredAfterPrefetchPopulatesHostCa
 
     Submit(MakeRequestSpec("r1", /*num_pages=*/2, /*start=*/1));
     auto plan = PlanOnce();
-    auto lb = ExtractCacheOpsOfKind<FlatLoadBackOperation>(plan);
+    auto lb = ExtractCacheOpsOfKind<LoadBackBatch>(plan);
 
     bool r1_in_forward = false;
     for (const auto& op : plan.Operations()) {
-        if (auto* fwd = std::get_if<FlatForwardOperation>(&op)) {
+        if (auto* fwd = std::get_if<ForwardBatch>(&op)) {
             for (const auto& rid : fwd->request_ids) {
                 if (rid == "r1") r1_in_forward = true;
             }
@@ -94,7 +92,7 @@ TEST_F(LoadBackViaCacheTestSuite, LoadBack_TriggeredAfterPrefetchPopulatesHostCa
 TEST_F(SchedulerTestSuite, LoadBack_NotTriggeredWithoutHostCacheHit) {
     Submit(MakeRequestSpec("r1", 4));
     auto plan = PlanOnce();
-    auto lb = ExtractCacheOpsOfKind<FlatLoadBackOperation>(plan);
+    auto lb = ExtractCacheOpsOfKind<LoadBackBatch>(plan);
     EXPECT_TRUE(lb.empty());
 }
 
@@ -131,19 +129,13 @@ TEST_F(DisablePrefixCacheTestSuite, SamePromptDoesNotReuseDevicePrefix) {
     Submit(MakeRequestSpec("r1", 2));
     auto plan = PlanOnce();
     const auto& op = plan.Operations()[0];
-    auto* fwd = std::get_if<FlatForwardOperation>(&op);
+    auto* fwd = std::get_if<ForwardBatch>(&op);
     ASSERT_NE(fwd, nullptr);
     ASSERT_EQ(fwd->request_ids.size(), 1u);
     EXPECT_EQ(fwd->request_ids[0], "r1");
     EXPECT_EQ(fwd->extend_prefix_lens[0], 0);
     EXPECT_EQ(fwd->input_lengths[0], 4);
-    EXPECT_TRUE(ExtractCacheOpsOfKind<FlatLoadBackOperation>(plan).empty());
-}
-
-TEST_F(DisablePrefixCacheTestSuite, PrefetchNotGeneratedForStorageHit) {
-    Submit(MakePrefetchableSpec("r1", 8, 6));
-    auto plan = PlanOnce();
-    EXPECT_TRUE(ExtractCacheOpsOfKind<PrefetchOperation>(plan).empty());
+    EXPECT_TRUE(ExtractCacheOpsOfKind<LoadBackBatch>(plan).empty());
 }
 
 class StableCandidateOrderingSuite : public SchedulerTestSuite {
@@ -157,10 +149,10 @@ protected:
     }
 };
 
-TEST_F(StableCandidateOrderingSuite, NewForwardOperationTieBreaksOnRequestId) {
+TEST_F(StableCandidateOrderingSuite, ForwardOperationsTieBreakOnRequestId) {
     // TP-determinism regression: requests_ is unordered_map<string, ...> so
     // candidates are visited in per-process random order. Without an Id()
-    // tiebreaker in newForwardOperation's sort, each rank picks a different
+    // Without the request-id tiebreaker in buildForwardOperations, each rank picks a different
     // request when the loop budget admits only a subset — making forward_op
     // None on some ranks and non-None on others, which deadlocks NCCL.
     Submit(MakeRequestSpec("r_ccc", 2, 300));
@@ -169,7 +161,7 @@ TEST_F(StableCandidateOrderingSuite, NewForwardOperationTieBreaksOnRequestId) {
     auto plan = PlanOnce();
     std::vector<std::string> ids;
     for (const auto& op : plan.Operations()) {
-        if (auto* fwd = std::get_if<FlatForwardOperation>(&op)) {
+        if (auto* fwd = std::get_if<ForwardBatch>(&op)) {
             ids = fwd->request_ids;
         }
     }
@@ -177,7 +169,7 @@ TEST_F(StableCandidateOrderingSuite, NewForwardOperationTieBreaksOnRequestId) {
     EXPECT_EQ(ids[0], "r_aaa");
 }
 
-TEST_F(StableCandidateOrderingSuite, ForwardOpIsInsertionOrderIndependent) {
+TEST_F(StableCandidateOrderingSuite, ForwardBatchIsInsertionOrderIndependent) {
     // Mirror of the above using two scheduler instances fed the same request
     // set in opposite submit orders. The chosen forward request must depend
     // only on the SET of request ids, not the submission sequence.
@@ -187,7 +179,7 @@ TEST_F(StableCandidateOrderingSuite, ForwardOpIsInsertionOrderIndependent) {
     auto plan_a = PlanOnce();
     std::vector<std::string> ids_a;
     for (const auto& op : plan_a.Operations()) {
-        if (auto* fwd = std::get_if<FlatForwardOperation>(&op)) {
+        if (auto* fwd = std::get_if<ForwardBatch>(&op)) {
             ids_a = fwd->request_ids;
         }
     }
@@ -199,13 +191,137 @@ TEST_F(StableCandidateOrderingSuite, ForwardOpIsInsertionOrderIndependent) {
     auto plan_b = PlanOnce();
     std::vector<std::string> ids_b;
     for (const auto& op : plan_b.Operations()) {
-        if (auto* fwd = std::get_if<FlatForwardOperation>(&op)) {
+        if (auto* fwd = std::get_if<ForwardBatch>(&op)) {
             ids_b = fwd->request_ids;
         }
     }
 
     ASSERT_FALSE(ids_a.empty());
     EXPECT_EQ(ids_a, ids_b);
+}
+
+class SchedulerKvCacheEventTestSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 3;
+        cfg.disable_l2_cache = true;
+        cfg.enable_kv_cache_events = true;
+        return cfg;
+    }
+};
+
+TEST_F(SchedulerKvCacheEventTestSuite, PublishesStoredBlockAndDrainsItOnce) {
+    const RequestSpec spec = MakeRequestSpec("r1", 1);
+    Submit(spec);
+    PlanOnce();
+    SendForwardDone("r1", {42});
+    PlanOnce();
+    SendFinish("r1");
+
+    std::vector<KvCacheEvent> events = scheduler_->DrainKvEvents();
+    ASSERT_EQ(events.size(), 1u);
+    ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(events[0]));
+    EXPECT_EQ(std::get<KvBlockStoredEvent>(events[0]).token_ids, spec.tokens);
+    EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
+}
+
+TEST_F(SchedulerKvCacheEventTestSuite, PublishesRemovalWhenAdmissionEvictsBlock) {
+    Submit(MakeRequestSpec("seed", 1));
+    PlanOnce();
+    SendForwardDone("seed", {42});
+    PlanOnce();
+    SendFinish("seed");
+
+    std::vector<KvCacheEvent> stored = scheduler_->DrainKvEvents();
+    ASSERT_EQ(stored.size(), 1u);
+    const std::uint64_t stored_hash = std::get<KvBlockStoredEvent>(stored[0]).block_hashes.front();
+
+    Submit(MakeRequestSpec("replacement", 1, 100));
+    PlanOnce();
+
+    std::vector<KvCacheEvent> removed = scheduler_->DrainKvEvents();
+    ASSERT_EQ(removed.size(), 1u);
+    ASSERT_TRUE(std::holds_alternative<KvBlockRemovedEvent>(removed[0]));
+    EXPECT_EQ(std::get<KvBlockRemovedEvent>(removed[0]).block_hashes, std::vector<std::uint64_t>{stored_hash});
+}
+
+class MultiGroupKvCacheEventTestSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 8;
+        cfg.disable_l2_cache = true;
+        cfg.enable_kv_cache_events = true;
+        PagedCacheGroupConfig second = cfg.paged_cache_groups.front();
+        second.group_id = "full_attention_1";
+        cfg.paged_cache_groups.push_back(std::move(second));
+        return cfg;
+    }
+};
+
+TEST_F(MultiGroupKvCacheEventTestSuite, PublishesOneEventAfterAllGroupsCacheBoundary) {
+    Submit(MakeRequestSpec("r1", 1));
+    PlanOnce();
+    SendForwardDone("r1", {42});
+    PlanOnce();
+    SendFinish("r1");
+
+    std::vector<KvCacheEvent> events = scheduler_->DrainKvEvents();
+    ASSERT_EQ(events.size(), 1u);
+    EXPECT_TRUE(std::holds_alternative<KvBlockStoredEvent>(events[0]));
+}
+
+class HybridPrefixPromotionTestSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 128;
+        cfg.disable_l2_cache = true;
+        for (std::int32_t i = 0; i < 3; ++i) {
+            PagedCacheGroupConfig state = cfg.paged_cache_groups.front();
+            state.group_id = "linear_attention_" + std::to_string(i);
+            state.family = PagedCacheGroupFamily::State;
+            cfg.paged_cache_groups.push_back(std::move(state));
+        }
+        return cfg;
+    }
+
+    RequestSpec MakeHybridRequest(const std::string& id, std::int32_t suffix_start) {
+        RequestSpec spec = MakeRequestSpec(id, /*num_pages=*/4);
+        spec.tokens.push_back(suffix_start);
+        spec.tokens.push_back(suffix_start + 1);
+        spec.tokens.push_back(suffix_start + 2);
+        return spec;
+    }
+};
+
+TEST_F(HybridPrefixPromotionTestSuite, ThirdRequestReusesPromotedStateBoundary) {
+    Submit(MakeHybridRequest("seed", 100));
+    PlanOnce();
+    SendForwardDone("seed", {900});
+    PlanOnce();
+    SendFinish("seed");
+    PlanOnce();
+
+    Submit(MakeHybridRequest("promote", 200));
+    const ExecutionPlan promotion_plan = PlanOnce();
+    const ForwardBatch* promotion = FindForwardBatch(promotion_plan);
+    ASSERT_NE(promotion, nullptr);
+    ASSERT_EQ(promotion->request_ids, std::vector<std::string>{"promote"});
+    EXPECT_EQ(promotion->input_lengths, std::vector<std::int32_t>{8});
+    PlanOnce();
+    SendForwardDone("promote", {901});
+    PlanOnce();
+    SendFinish("promote");
+    PlanOnce();
+
+    Submit(MakeHybridRequest("reuse", 300));
+    const ExecutionPlan reuse_plan = PlanOnce();
+    const ForwardBatch* reuse = FindForwardBatch(reuse_plan);
+    ASSERT_NE(reuse, nullptr);
+    ASSERT_EQ(reuse->request_ids, std::vector<std::string>{"reuse"});
+    EXPECT_EQ(reuse->extend_prefix_lens, std::vector<std::int32_t>{8});
 }
 
 }  // namespace tokenspeed::test

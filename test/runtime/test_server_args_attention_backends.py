@@ -130,6 +130,20 @@ class TestAttentionBackendChoices(unittest.TestCase):
                 logical_page_size=128,
             )
 
+    def test_lcm_group_page_sizes_are_published_before_backend_construction(self):
+        config = SimpleNamespace(group_page_sizes={"stale": 64})
+        spec = SimpleNamespace(
+            memory_plan=SimpleNamespace(logical_block_tokens=128),
+            layer_group_ids=("full_attention", "linear_attention_0"),
+        )
+
+        registry._set_lcm_group_page_sizes(config, spec)
+
+        self.assertEqual(
+            config.group_page_sizes,
+            {"full_attention": 128, "linear_attention_0": 128},
+        )
+
     def test_mha_config_propagates_speculative_settings(self):
         server_args = SimpleNamespace(
             device="cuda",

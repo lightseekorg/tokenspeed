@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
@@ -48,6 +49,8 @@ struct CacheKey {
     CacheNamespaceId namespace_id{kDefaultCacheNamespaceId};
     GroupId group_id{0};
     ContentHash content_hash{};
+    // CacheBlock position within the scheduler's enclosing P-token hash page.
+    std::int32_t cache_block_offset{0};
 
     bool operator==(const CacheKey&) const noexcept = default;
 };
@@ -58,7 +61,9 @@ struct CacheKeyHash {
         const std::size_t group_hash = std::hash<GroupId>{}(key.group_id);
         hash ^= group_hash + 0x9e3779b9U + (hash << 6U) + (hash >> 2U);
         const std::size_t content_hash = std::hash<ContentHash>{}(key.content_hash);
-        return hash ^ (content_hash + 0x9e3779b9U + (hash << 6U) + (hash >> 2U));
+        hash ^= content_hash + 0x9e3779b9U + (hash << 6U) + (hash >> 2U);
+        const std::size_t offset_hash = std::hash<std::int32_t>{}(key.cache_block_offset);
+        return hash ^ (offset_hash + 0x9e3779b9U + (hash << 6U) + (hash >> 2U));
     }
 };
 
@@ -67,9 +72,12 @@ struct KvCacheSpec {
     // Only kSlidingWindow uses this value. Mamba's one-checkpoint lookback is
     // an internal Manager policy rather than a model window.
     std::int32_t sliding_window;
-    // Number of this group's logical cache blocks packed into one physical
-    // LCM block. It affects placement only, never prefix-match granularity.
+    // Number of this group's CacheBlocks packed into one physical LCM block.
+    // It affects placement only, not the scheduler-wide prefix boundary P.
     std::int32_t cache_blocks_per_lcm_block;
+    // Tokens represented by one CacheBlock in this group. Zero keeps the
+    // legacy meaning: use the coordinator-wide logical granularity P.
+    std::int32_t cache_block_tokens{0};
 };
 
 // Per-request logical-page -> physical-page mapping.
@@ -94,16 +102,17 @@ private:
 };
 
 // Per-group input for one admission. page_hashes is the request's cumulative
-// completed-page history; first_new_page_slot splits the newly completed
-// suffix used by prefix-closed groups. Non-closed groups select the trailing
-// pages required to resume num_computed_tokens. The request owns table and
-// the storage behind page_hashes.
+// completed-page history; new_page_hash_begin is the start of the hashes
+// appended since the previous admission. completed_boundary_kind is present
+// exactly when that suffix is non-empty. Non-closed groups select the trailing
+// pages required to resume num_computed_tokens. The request owns table and the
+// storage behind page_hashes.
 struct GroupDemand {
     BlockTable* table{nullptr};
     std::int32_t num_tokens{0};
     std::span<const std::string> page_hashes{};
-    std::int32_t first_new_page_slot{0};
-    CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
+    std::int32_t new_page_hash_begin{0};
+    std::optional<CacheBoundaryKind> completed_boundary_kind;
     std::int32_t num_computed_tokens{-1};
     std::int32_t reserve_tokens{0};
     // -1 materializes the ordinary dense suffix. A non-negative value keeps

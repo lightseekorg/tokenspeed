@@ -28,9 +28,9 @@ from tokenspeed_kernel.registry import error_fn
 _is_amd = Platform.get().is_amd
 _is_nvidia = Platform.get().is_nvidia
 platform = Platform.get()
-fp8_dtype = platform.fp8e4m3fn.dtype
-fp8_max = platform.fp8e4m3fn.max
-fp8_min = platform.fp8e4m3fn.min
+fp8_dtype = torch.float8_e4m3fn
+fp8_max = torch.finfo(fp8_dtype).max
+fp8_min = torch.finfo(fp8_dtype).min
 
 if _is_nvidia:
     from tokenspeed_kernel.ops.quantization.flashinfer import (
@@ -273,7 +273,7 @@ def _per_token_group_quant_8bit_raw(
     x: torch.Tensor,
     group_size: int,
     eps: float = 1e-10,
-    dtype: torch.dtype = platform.fp8e4m3fn.dtype,
+    dtype: torch.dtype = torch.float8_e4m3fn,
     column_major_scales: bool = False,
     scale_tma_aligned: bool = False,
     scale_ue8m0: bool = False,
@@ -302,7 +302,7 @@ def _per_token_group_quant_8bit_raw(
             bit8_max = 127.0
             bit8_min = -128.0
         else:
-            bit8_max = platform.fp8e4m3fn.max
+            bit8_max = fp8_max
             bit8_min = -bit8_max
     else:
         if dtype == torch.int8:

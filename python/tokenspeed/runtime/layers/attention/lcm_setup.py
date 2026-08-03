@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Model recipes and pool construction for Flat LCM cache arenas."""
+"""Model recipes and pool construction for LCM cache arenas."""
 
 from __future__ import annotations
 
@@ -50,10 +50,12 @@ from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 
-LcmModelFamily = Literal["qwen_gdn", "inkling", "kimi_k3"]
+LcmModelFamily = Literal["qwen_gdn", "inkling", "kimi_k3", "deepseek_v4"]
 
 _LOGICAL_BLOCK_TOKENS = 128
 _MAX_PADDING_FRACTION = 1.0
+_DEEPSEEK_V4_LOGICAL_BLOCK_TOKENS = 256
+_DEEPSEEK_V4_MAX_PADDING_FRACTION = 2.0
 
 
 @dataclass(frozen=True)
@@ -283,7 +285,6 @@ def _prepare_kimi_k3(
     }
     reference_plan = plan_kimi_k3_lcm_cache(
         text_config,
-        flat_kvcache_enabled=True,
         tp_size=attn_config.attn_tp_size,
         mla_cache_dtype=attn_config.kv_cache_dtype,
         mla_quant_method=attn_config.kv_cache_quant_method or None,
@@ -343,7 +344,6 @@ def _prepare_kimi_k3(
     )
     target_plan = plan_kimi_k3_lcm_cache(
         text_config,
-        flat_kvcache_enabled=True,
         tp_size=attn_config.attn_tp_size,
         mla_cache_dtype=attn_config.kv_cache_dtype,
         mla_quant_method=attn_config.kv_cache_quant_method or None,
@@ -372,6 +372,196 @@ def _prepare_kimi_k3(
             state_field_dtypes=state_dtypes,
             token_capacity=admitted_tokens,
         ),
+        draft=draft_spec,
+        cache_budget_bytes=cache_budget_bytes,
+        fixed_workspace_bytes=0,
+    )
+
+
+def _prepare_deepseek_v4(
+    *,
+    server_args,
+    model_config,
+    attn_config,
+    draft_model_config,
+    draft_attn_config,
+    cache_budget_bytes: int,
+    decode_input_tokens: int,
+    overlap_schedule_depth: int,
+) -> LcmSetup:
+    from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
+        build_v4_cache_specs,
+        deepseek_v4_lcm_blocks_needed,
+        deepseek_v4_token_capacity_for_lcm_pool,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
+        build_deepseek_v4_lcm_fields,
+        deepseek_v4_cache_layout_from_config,
+    )
+
+    def use_fp4_indexer(hf_config) -> bool:
+        override = getattr(server_args, "attention_use_fp4_indexer_cache", None)
+        if override is not None:
+            return bool(override)
+        attention_config = getattr(hf_config, "attention_config", None)
+        if isinstance(attention_config, dict):
+            return bool(attention_config.get("use_fp4_indexer_cache", False))
+        return bool(getattr(attention_config, "use_fp4_indexer_cache", False))
+
+    def layout_and_fields(config, runtime_config, *, layer_indices=None):
+        layout = deepseek_v4_cache_layout_from_config(
+            config,
+            page_size=runtime_config.page_size,
+            use_fp4_indexer_cache=use_fp4_indexer(config),
+            layer_indices=layer_indices,
+        )
+        fields = build_deepseek_v4_lcm_fields(
+            layout,
+            sliding_window=int(config.sliding_window),
+            logical_block_tokens=_DEEPSEEK_V4_LOGICAL_BLOCK_TOKENS,
+        )
+        return layout, fields
+
+    target_layout, target_fields = layout_and_fields(
+        model_config.hf_config,
+        attn_config,
+        layer_indices=range(model_config.num_attention_layers),
+    )
+    # The c4 ring keeps eight rows: four prior rows plus the four verify rows.
+    if 4 in target_layout.layer_ratio and decode_input_tokens > 4:
+        raise ValueError(
+            "DeepSeek V4 c4 LCM cache supports at most four verify tokens; "
+            f"got {decode_input_tokens}"
+        )
+    raw_bytes: dict[str, int] = {}
+    for field in target_fields:
+        raw_bytes[field.group_id] = (
+            raw_bytes.get(field.group_id, 0) + field.payload_bytes
+        )
+    largest_group = max(raw_bytes.values())
+    # Power-of-two packing keeps every field stride naturally aligned. Using
+    # the exact byte ratios would make the plane alignment their large LCM and
+    # inflate one parent by orders of magnitude.
+    packing = {
+        group_id: 1 << max(0, (largest_group // group_bytes).bit_length() - 1)
+        for group_id, group_bytes in raw_bytes.items()
+    }
+    target_reference = plan_lcm_fields(
+        target_fields,
+        logical_block_tokens=_DEEPSEEK_V4_LOGICAL_BLOCK_TOKENS,
+        num_lcm_blocks=1,
+        cache_blocks_per_lcm_block=packing,
+        alignment=256,
+        max_padding_fraction=_DEEPSEEK_V4_MAX_PADDING_FRACTION,
+    )
+
+    draft_layout = None
+    draft_fields = None
+    draft_packing = None
+    draft_parent_bytes = 0
+    if draft_attn_config is not None:
+        draft_layer_start = draft_model_config.num_hidden_layers
+        draft_num_layers = draft_model_config.num_attention_layers
+        draft_layout, draft_fields = layout_and_fields(
+            draft_model_config.hf_config,
+            draft_attn_config,
+            layer_indices=range(
+                draft_layer_start,
+                draft_layer_start + draft_num_layers,
+            ),
+        )
+        draft_group_ids = {field.group_id for field in draft_fields}
+        draft_packing = {group_id: packing[group_id] for group_id in draft_group_ids}
+        draft_parent_bytes = plan_lcm_fields(
+            draft_fields,
+            logical_block_tokens=_DEEPSEEK_V4_LOGICAL_BLOCK_TOKENS,
+            num_lcm_blocks=1,
+            cache_blocks_per_lcm_block=draft_packing,
+            alignment=256,
+            max_padding_fraction=float("inf"),
+        ).lcm_block_bytes
+
+    parent_bytes = target_reference.lcm_block_bytes + draft_parent_bytes
+    num_lcm_blocks = cache_budget_bytes // parent_bytes - 1
+    if num_lcm_blocks < 1:
+        raise ValueError(
+            "DeepSeek V4 cache budget must hold a null parent and one usable parent"
+        )
+
+    specs = tuple(
+        build_v4_cache_specs(
+            model_config.hf_config,
+            layer_ratio=target_layout.layer_ratio,
+            cache_blocks_per_lcm_block=packing,
+        )
+    )
+    max_packing = max(packing.values())
+    token_limit = _token_limit(server_args)
+    upper_bound = (
+        token_limit
+        if token_limit is not None
+        else num_lcm_blocks * max_packing * _DEEPSEEK_V4_LOGICAL_BLOCK_TOKENS
+    )
+    sizing = {
+        "logical_block_tokens": _DEEPSEEK_V4_LOGICAL_BLOCK_TOKENS,
+        "max_live_requests": attn_config.max_bs,
+        "max_scheduled_tokens": max(0, int(server_args.chunked_prefill_size)),
+        "max_context_len": attn_config.context_len,
+        "decode_input_tokens": decode_input_tokens,
+        "overlap_schedule_depth": overlap_schedule_depth,
+    }
+    token_capacity = deepseek_v4_token_capacity_for_lcm_pool(
+        specs,
+        num_lcm_blocks=num_lcm_blocks,
+        upper_bound_tokens=upper_bound,
+        **sizing,
+    )
+    num_lcm_blocks = deepseek_v4_lcm_blocks_needed(
+        specs,
+        token_capacity=token_capacity,
+        **sizing,
+    )
+
+    target_plan = plan_lcm_fields(
+        target_fields,
+        logical_block_tokens=_DEEPSEEK_V4_LOGICAL_BLOCK_TOKENS,
+        num_lcm_blocks=num_lcm_blocks,
+        cache_blocks_per_lcm_block=packing,
+        alignment=256,
+        max_padding_fraction=_DEEPSEEK_V4_MAX_PADDING_FRACTION,
+    )
+    target_spec = LcmPoolSpec(
+        memory_plan=target_plan,
+        layer_types=tuple(str(ratio) for ratio in target_layout.layer_ratio),
+        layer_group_ids=tuple(
+            (f"v4.c{ratio}a.compressed_kv" if ratio > 1 else "v4.swa_kv")
+            for ratio in target_layout.layer_ratio
+        ),
+        state_field_dtypes={},
+        token_capacity=token_capacity,
+    )
+    draft_spec = None
+    if draft_fields is not None and draft_packing is not None:
+        draft_plan = plan_lcm_fields(
+            draft_fields,
+            logical_block_tokens=_DEEPSEEK_V4_LOGICAL_BLOCK_TOKENS,
+            num_lcm_blocks=num_lcm_blocks,
+            cache_blocks_per_lcm_block=draft_packing,
+            alignment=256,
+            max_padding_fraction=float("inf"),
+        )
+        draft_spec = LcmPoolSpec(
+            memory_plan=draft_plan,
+            layer_types=tuple(str(ratio) for ratio in draft_layout.layer_ratio),
+            layer_group_ids=tuple(
+                (f"v4.c{ratio}a.compressed_kv" if ratio > 1 else "v4.swa_kv")
+                for ratio in draft_layout.layer_ratio
+            ),
+            state_field_dtypes={},
+            token_capacity=token_capacity,
+        )
+    return LcmSetup(
+        target=target_spec,
         draft=draft_spec,
         cache_budget_bytes=cache_budget_bytes,
         fixed_workspace_bytes=0,
@@ -590,6 +780,17 @@ def prepare_lcm_setup(
     """Apply one model recipe and size target/draft arenas from one budget."""
     if family == "kimi_k3":
         return _prepare_kimi_k3(
+            server_args=server_args,
+            model_config=model_config,
+            attn_config=attn_config,
+            draft_model_config=draft_model_config,
+            draft_attn_config=draft_attn_config,
+            cache_budget_bytes=cache_budget_bytes,
+            decode_input_tokens=decode_input_tokens,
+            overlap_schedule_depth=overlap_schedule_depth,
+        )
+    if family == "deepseek_v4":
+        return _prepare_deepseek_v4(
             server_args=server_args,
             model_config=model_config,
             attn_config=attn_config,

@@ -40,7 +40,7 @@ from tokenspeed_kernel.signature import (
 
 logger = logging.getLogger(__name__)
 
-_fp8_dtype = Platform.get().fp8e4m3fn.dtype
+_fp8_dtype = torch.float8_e4m3fn
 _MXFP8_BLOCK_SCALE = ScaleFormat(
     storage_dtype=torch.float32,
     granularity="block",

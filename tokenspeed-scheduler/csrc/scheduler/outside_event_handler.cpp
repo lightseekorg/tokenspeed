@@ -18,135 +18,65 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#include <stdexcept>
-
-#include "resource/allocator/owned_pages.h"
-#include "fsm/states.h"
-#include "scheduler/outside_events/inc.h"
-#include "scheduler/page_hasher.h"
 #include "scheduler/scheduler.h"
 
+#include <iterator>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
 #include "fsm/forward_events.h"
+#include "fsm/forward_states.h"
 #include "fsm/pd_events.h"
+#include "scheduler/outside_events/inc.h"
+#include "scheduler/page_hasher.h"
+#include "utils.h"
 
 namespace tokenspeed {
 
-#if TOKENSPEED_FLAT_KVCACHE
 namespace {
 
-// Release explicitly in reverse; vector destruction order is not our eviction policy.
-void FreeAll(std::vector<CacheBlockRef>&& refs) {
-    for (auto it = refs.rbegin(); it != refs.rend(); ++it) {
+void FreeAll(std::vector<CacheBlockRef>&& block_refs) {
+    for (auto it = block_refs.rbegin(); it != block_refs.rend(); ++it) {
         it->reset();
     }
 }
 
 }  // namespace
-#endif
-
-void Scheduler::handleEvent(const cache::PrefetchDone& event) {
-    // Remove from op tracker (regardless of success).
-    cache_op_tracker_.erase(event.op_id);
-
-    auto req_iter = requests_.find(event.request_id);
-    if (req_iter == requests_.end()) {
-        return;
-    }
-
-    Request* req = req_iter->second.get();
-    if (!req->Is<fsm::Prefetching>() && !req->Is<fsm::Aborting>()) {
-        return;
-    }
-
-    std::int32_t completed = 0;
-    std::int32_t inserted = 0;
-
-    if (req->Is<fsm::Prefetching>() && event.success && event.completed_pages > 0) {
-        // Insert completed host pages into the KVPrefixCache so that future Match() calls
-        // see them in the host side and can generate LoadBack ops.
-        auto token_pages = req->GetFullPagedTokens(false);
-        auto all_host_pages = req->GetHostPageIds();
-
-        std::int32_t n = std::min(event.completed_pages, static_cast<std::int32_t>(all_host_pages.size()));
-        std::int32_t n_tokens = std::min(n, static_cast<std::int32_t>(token_pages.size()));
-
-        if (n_tokens > 0) {
-            std::vector<std::span<const std::int32_t>> insert_token_pages(token_pages.begin(),
-                                                                          token_pages.begin() + n_tokens);
-            std::vector<std::int32_t> insert_pages(all_host_pages.begin(), all_host_pages.begin() + n);
-
-            // Storage hashes for L3 backup (optional).
-            const auto& storage = req->GetStorageInfo();
-            std::vector<std::string> page_hashes;
-            if (!storage.rolling_hashes.empty()) {
-                std::int32_t nh = std::min(n_tokens, static_cast<std::int32_t>(storage.rolling_hashes.size()));
-                page_hashes.assign(storage.rolling_hashes.begin(), storage.rolling_hashes.begin() + nh);
-            }
-
-            // Insert into host side; InsertHost returns how many were actually inserted
-            // (0 for pages that already existed — "overlapping").
-            auto insert_result = kv_prefix_cache_.Insert<ResourceType::Host>(insert_token_pages, insert_pages,
-                                                                             OwnedPages{}, page_hashes);
-            completed = n;
-            inserted = insert_result.inserted_num_pages;
-        }
-    }
-
-    fsm::PrefetchDoneEvent fsm_event{completed, inserted};
-    req->Apply(fsm_event);
-}
 
 void Scheduler::handleEvent(const pd::BootstrappedEvent& event) {
-    Request* request = find_request(event.request_id);
-    if (request == nullptr || !request->Is<fsm::Bootstrapping>()) {
-        return;
+    Request* request = findRequest(event.request_id);
+    if (request != nullptr && request->Is<fsm::Bootstrapping>()) {
+        request->Apply(fsm::BootstrappedEvent{});
     }
-    request->Apply(fsm::BootstrappedEvent{});
 }
 
 void Scheduler::handleEvent(const pd::FailedEvent& event) {
-    Request* request = find_request(event.request_id);
+    Request* request = findRequest(event.request_id);
     if (request == nullptr || request->Is<fsm::Finished>()) {
         return;
     }
-    if (request->Is<fsm::WritingBack>()) {
-        throw std::logic_error("PD FailedEvent cannot terminalize an in-flight scheduler writeback");
-    }
-#if TOKENSPEED_FLAT_KVCACHE
     pending_forward_results_.erase(event.request_id);
-    flat_pd_transfer_pins_.erase(event.request_id);
-#endif
-    request->Apply(fsm::AbortEvent{
-#if TOKENSPEED_FLAT_KVCACHE
-        &coordinator_
-#endif
-    });
+    pd_transfer_pins_.erase(event.request_id);
+    request->Apply(fsm::AbortEvent{&coordinator_});
 }
 
 void Scheduler::handleEvent(const pd::SucceededEvent& event) {
-    Request* request = find_request(event.request_id);
+    Request* request = findRequest(event.request_id);
     if (request == nullptr || request->Is<fsm::Finished>()) {
         return;
     }
     if (!request->Is<fsm::PrefillDone>() && !request->Is<fsm::Decoding>()) {
         throw std::logic_error("PD SucceededEvent received in state " + request->StateName());
     }
-#if TOKENSPEED_FLAT_KVCACHE
     pending_forward_results_.erase(event.request_id);
-    flat_pd_transfer_pins_.erase(event.request_id);
-#endif
-    std::vector<std::string> page_hashes;
-    request->Apply(fsm::FinishEvent{&kv_prefix_cache_, &host_allocator_, std::move(page_hashes),
-                                    config_.disable_l2_cache, hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr
-#if TOKENSPEED_FLAT_KVCACHE
-                                    ,
-                                    &coordinator_
-#endif
-    });
+    pd_transfer_pins_.erase(event.request_id);
+    request->Apply(fsm::FinishEvent{&coordinator_});
 }
 
 void Scheduler::handleEvent(const pd::RemotePrefillDoneEvent& event) {
-    Request* request = find_request(event.request_id);
+    Request* request = findRequest(event.request_id);
     if (request == nullptr) {
         return;
     }
@@ -154,143 +84,98 @@ void Scheduler::handleEvent(const pd::RemotePrefillDoneEvent& event) {
         if (event.bootstrap_token < 0) {
             throw std::invalid_argument("PD RemotePrefillDoneEvent requires a non-negative bootstrap token");
         }
-#if TOKENSPEED_FLAT_KVCACHE
-        flat_pd_transfer_pins_.erase(event.request_id);
-#endif
+        pd_transfer_pins_.erase(event.request_id);
         request->Apply(fsm::RemotePrefillDoneEvent{event.bootstrap_token});
         return;
     }
     if (request->Is<fsm::PrefillDone>() || request->Is<fsm::Decoding>() || request->Is<fsm::Finished>()) {
         return;
     }
-    throw std::logic_error("PD RemotePrefillDoneEvent received before decode destination admission; state=" +
+    throw std::logic_error("PD RemotePrefillDoneEvent received before destination admission; state=" +
                            request->StateName());
 }
 
 void Scheduler::handleEvent(const forward::Finish& event) {
-#if TOKENSPEED_FLAT_KVCACHE
-    if (config_.enable_flatkv_pd && flat_pd_transfer_pins_.contains(event.request_id)) {
-        throw std::logic_error("FlatKV PD Finish received while transfer pages are pinned");
+    if (config_.enable_pd_cache && pd_transfer_pins_.contains(event.request_id)) {
+        throw std::logic_error("PD Finish received while transfer pages are pinned");
     }
     pending_forward_results_.erase(event.request_id);
-#endif
-    if (auto req = find_request(event.request_id)) {
-        // except_last=true: exclude the tail page, matching FinishEvent's InsertDevice behavior
-        auto token_pages = req->GetFullPagedTokens(true);
-
-        // page_hashes are only needed for L3 storage (BackUp ops).
-        // Without L3, pass empty to avoid any size-mismatch bugs.
-        std::vector<std::string> page_hashes;
-        if (config_.enable_l3_storage) {
-            page_hashes = req->GetStorageInfo().rolling_hashes;
-            if (page_hashes.size() != token_pages.size()) {
-                page_hashes = ComputePagedHashes(token_pages, "");
-            }
+    if (Request* request = findRequest(event.request_id)) {
+        if (request->Is<fsm::PrefillDone>() || request->Is<fsm::Decoding>()) {
+            publishCompletedPages(*request);
         }
-        req->Apply(fsm::FinishEvent{&kv_prefix_cache_, &host_allocator_, std::move(page_hashes),
-                                    config_.disable_l2_cache, hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr
-#if TOKENSPEED_FLAT_KVCACHE
-                                    ,
-                                    &coordinator_
-#endif
-        });
+        request->Apply(fsm::FinishEvent{&coordinator_});
     }
+}
+
+void Scheduler::publishCompletedPages(Request& request) {
+    const std::vector<std::span<const std::int32_t>> stable_pages = request.FullPagedTokens(true);
+    fsm::CacheProgress progress = request.CacheProgress();
+    const std::int32_t first_new_page = static_cast<std::int32_t>(progress.page_hashes.size());
+    const std::int32_t num_stable_pages = static_cast<std::int32_t>(stable_pages.size());
+    _assert(first_new_page <= num_stable_pages, "cache progress exceeds completed request pages");
+    if (first_new_page == num_stable_pages) {
+        return;
+    }
+
+    const std::string previous_hash = progress.page_hashes.empty() ? std::string{} : progress.page_hashes.back();
+    std::vector<std::string> new_hashes =
+        AdvancePagedHashes(stable_pages, first_new_page, previous_hash, num_stable_pages);
+    progress.page_hashes.insert(progress.page_hashes.end(), std::make_move_iterator(new_hashes.begin()),
+                                std::make_move_iterator(new_hashes.end()));
+
+    std::vector<CacheKey> event_keys = registerKvEventPages(request, progress.page_hashes, first_new_page);
+    coordinator_.CacheCompletedBlocks(request.BlockTablesRef(), progress.page_hashes, progress.access_epoch,
+                                      first_new_page, request.TokenSize() - 1, CacheBoundaryKind::kEndpoint);
+    discardUncachedKvEventPages(event_keys);
 }
 
 void Scheduler::handleEvent(const forward::UpdateReserveNumTokens& event) {
-    if (auto req = find_request(event.request_id)) {
-        req->Apply(fsm::UpdateReserveNumTokensEvent{event.reserve_num_tokens_in_next_schedule_event});
+    if (Request* request = findRequest(event.request_id)) {
+        request->Apply(fsm::UpdateReserveNumTokensEvent{event.reserve_num_tokens_in_next_schedule_event});
     }
 }
+
 void Scheduler::handleEvent(const forward::ExtendResult& event) {
-#if TOKENSPEED_FLAT_KVCACHE
-    // One owed forward result delivered (see pending_forward_results_).
-    if (auto it = pending_forward_results_.find(event.request_id); it != pending_forward_results_.end()) {
-        if (--it->second <= 0) {
-            pending_forward_results_.erase(it);
-        }
+    if (auto it = pending_forward_results_.find(event.request_id);
+        it != pending_forward_results_.end() && --it->second <= 0) {
+        pending_forward_results_.erase(it);
     }
-#endif
-    if (auto req = find_request(event.request_id)) {
-        const std::int32_t protected_tail_tokens = config_.overlap_schedule_depth * config_.decode_input_tokens;
-        req->Apply(fsm::ExtendResultEvent{event.request_id, event.tokens,
-                                          hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr,
-                                          protected_tail_tokens});
+    if (Request* request = findRequest(event.request_id)) {
+        request->Apply(fsm::ExtendResultEvent{event.tokens});
     }
 }
 
 void Scheduler::handleEvent(const forward::Abort& event) {
-#if TOKENSPEED_FLAT_KVCACHE
-    // Terminal for this request's forward stream: drop any remaining result debt
-    // and any decode reservation it never consumed -- an abort between the
-    // prefill-completing admission and the PrefillDone->Decoding transition must
-    // not leave a permanent phantom reservation deflating every later gate.
     pending_forward_results_.erase(event.request_id);
-    flat_pd_transfer_pins_.erase(event.request_id);
-#endif
-    auto iter = requests_.find(event.request_id);
-    if (iter == requests_.end()) {
-        return;
+    pd_transfer_pins_.erase(event.request_id);
+    if (Request* request = findRequest(event.request_id)) {
+        request->Apply(fsm::AbortEvent{&coordinator_});
     }
-
-    Request* req = iter->second.get();
-    req->Apply(fsm::AbortEvent{
-#if TOKENSPEED_FLAT_KVCACHE
-        &coordinator_
-#endif
-    });
 }
 
 void Scheduler::handleEvent(const cache::WriteBackDone& event) {
-#if TOKENSPEED_FLAT_KVCACHE
-    if (std::vector<FlatStoreTicket> tickets = flat_store_ops_.Retire(event.op_id); !tickets.empty()) {
-        // Publish-at-ack: hashing the host block makes it hittable; either way it returns to the
-        // host free list (hash-intact = reusable, unhashed = plain recycling). Batched frees in
-        // ticket order keep both pools' recycling order deterministic.
-        for (FlatStoreTicket& ticket : tickets) {
-            if (event.success) {
-                coordinator_.CacheHostBlock(ticket.host_block_ref, ticket.key);
-            }
+    std::vector<StoreTicket> tickets = store_ops_.Retire(event.op_id);
+    for (StoreTicket& ticket : tickets) {
+        if (event.success) {
+            coordinator_.CacheHostBlock(ticket.host_block_ref, ticket.key);
         }
-        for (auto it = tickets.rbegin(); it != tickets.rend(); ++it) {
-            it->device_block_ref.reset();
-            it->host_block_ref.reset();
-        }
-        return;
     }
-#endif
-    auto it = cache_op_tracker_.find(event.op_id);
-    if (it == cache_op_tracker_.end()) {
-        return;
-    }
-
-    auto spec = std::move(it->second);
-    cache_op_tracker_.erase(it);
-
-    auto now = std::chrono::steady_clock::now();
-    for (TreeNode* n : spec.nodes) n->Touch(now);
-
-    if (!spec.request_id.empty()) {
-        if (auto* req = find_request(spec.request_id)) {
-            req->Apply(
-                fsm::WriteBackDoneEvent{&kv_prefix_cache_, hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr});
-        }
+    for (auto it = tickets.rbegin(); it != tickets.rend(); ++it) {
+        it->device_block_ref.reset();
+        it->host_block_ref.reset();
     }
 }
 
 void Scheduler::handleEvent(const cache::LoadBackDone& event) {
-#if TOKENSPEED_FLAT_KVCACHE
-    if (auto flat_it = flat_load_ops_.find(event.op_id); flat_it != flat_load_ops_.end()) {
-        // The loaded device pages are already claimed as computed KV: a failed copy
-        // means the request would decode over garbage bytes -- fail loud.
-        _assert(event.success, "flat host loadback failed: host bytes integrity");
-        FreeAll(std::move(flat_it->second.host_pins));
-        FreeAll(std::move(flat_it->second.device_blocks));
-        flat_load_ops_.erase(flat_it);
+    auto it = load_ops_.find(event.op_id);
+    if (it == load_ops_.end()) {
         return;
     }
-#endif
-    // Radix loadbacks emit no LoadBackDone today: unknown op_ids are silently ignored.
+    _assert(event.success, "host loadback failed: host bytes integrity");
+    FreeAll(std::move(it->second.host_pins));
+    FreeAll(std::move(it->second.device_blocks));
+    load_ops_.erase(it);
 }
 
 }  // namespace tokenspeed

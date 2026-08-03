@@ -87,7 +87,14 @@ _SYSTEM_PROMPT = (
     "If a question does not make any sense, or is not factually coherent, "
     "explain why instead of answering something incorrect. "
     "If you don't know the answer to a question, please don't share false information. "
-    "Please think step by step and be thorough in your reasoning."
+    "Please think step by step and be thorough in your reasoning. "
+    "Before answering, identify the user's actual intent, check every relevant fact, "
+    "and distinguish facts from assumptions. Prefer clear explanations with concrete "
+    "examples, preserve important constraints from earlier instructions, and avoid "
+    "inventing details that were not provided. When several interpretations are "
+    "possible, choose the most useful reasonable interpretation and state any assumption "
+    "that materially affects the answer. Keep the final response focused, accurate, "
+    "self-contained, and easy to verify."
 )
 
 
@@ -142,12 +149,8 @@ def _make_engine(case: ModelCase, enable_prefix_caching: bool) -> Engine:
         "max_prefill_tokens": 1024,
         "chunked_prefill_size": 1024,
         "gpu_memory_utilization": 0.7,
+        "disable_kvstore": True,
     }
-    # KVStore requires prefix caching; prevent auto-enabling when prefix
-    # caching is off (resolve_cache sets enable_kvstore=True unless
-    # disable_kvstore=True).
-    if not enable_prefix_caching:
-        kwargs["disable_kvstore"] = True
     kwargs.update(case.extra_kwargs)
     return Engine(**kwargs)
 
@@ -191,7 +194,7 @@ class TestPrefixCacheDisabled(unittest.TestCase):
 
 
 class TestPrefixCacheEnabled(unittest.TestCase):
-    """When prefix caching is enabled (default), the shared prefix should be cached."""
+    """When prefix caching is enabled, a promoted shared prefix becomes reusable."""
 
     def test_prefix_cache_enabled_has_cached_tokens(self):
         for case in _ACTIVE_MODELS:
@@ -200,7 +203,10 @@ class TestPrefixCacheEnabled(unittest.TestCase):
                 try:
                     sampling = {"max_new_tokens": 8, "temperature": 0}
 
-                    # First request: primes the system prompt.
+                    # The first request publishes its endpoint. The second
+                    # request discovers the shorter shared Full-KV prefix and
+                    # materializes the matching State/SWA boundary. The third
+                    # request can then reuse that converged cross-group prefix.
                     engine.generate(
                         prompt=_render_prompt(
                             case, "What is 1+1? Reply with just the number."
@@ -208,11 +214,16 @@ class TestPrefixCacheEnabled(unittest.TestCase):
                         sampling_params=sampling,
                         stream=False,
                     )
-
-                    # Second request: shares the same system prefix — should hit cache.
-                    resp = engine.generate(
+                    engine.generate(
                         prompt=_render_prompt(
                             case, "What is 2+2? Reply with just the number."
+                        ),
+                        sampling_params=sampling,
+                        stream=False,
+                    )
+                    resp = engine.generate(
+                        prompt=_render_prompt(
+                            case, "What is 3+3? Reply with just the number."
                         ),
                         sampling_params=sampling,
                         stream=False,
