@@ -22,8 +22,14 @@ def _mla_normalize_project_query_kernel(
     kv_norm_weight_ptr,
     projection_weight_ptr,
     output_ptr,
+    tail_output_ptr,
+    output_head_stride,
+    tail_output_head_stride,
     eps,
     OUTPUT_WIDTH: gl.constexpr,
+    HEAD_WIDTH: gl.constexpr,
+    PREFIX_WIDTH: gl.constexpr,
+    SPLIT_OUTPUT: gl.constexpr,
     BLOCK_N: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
@@ -73,7 +79,25 @@ def _mla_normalize_project_query_kernel(
             normalized = gl.convert_layout(normalized[None, :], layout)
             acc += weight * normalized.to(gl.float32)
         result = gl.sum(acc, axis=1)
-        gl.store(output_ptr + offs_n, result.to(output_ptr.dtype.element_ty))
+        result = result.to(output_ptr.dtype.element_ty)
+        if SPLIT_OUTPUT:
+            head = offs_n // HEAD_WIDTH
+            head_offset = offs_n % HEAD_WIDTH
+            if pid % (HEAD_WIDTH // BLOCK_N) < PREFIX_WIDTH // BLOCK_N:
+                gl.store(
+                    output_ptr + head * output_head_stride + head_offset,
+                    result,
+                )
+            else:
+                gl.store(
+                    tail_output_ptr
+                    + head * tail_output_head_stride
+                    + head_offset
+                    - PREFIX_WIDTH,
+                    result,
+                )
+        else:
+            gl.store(output_ptr + offs_n, result)
         return
 
     kv_layout: gl.constexpr = gl.BlockedLayout(
@@ -104,21 +128,21 @@ def gluon_mla_normalize_project_query_gfx950(
     *,
     eps: float,
     out: torch.Tensor,
+    tail_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Normalize MLA query/KV latents and project the normalized query."""
 
     output_width = projection_weight.shape[0]
-    expected = (
+    expected_inputs = (
         (query, (1, 1536), "query latent"),
         (kv, (1, 512), "KV latent"),
         (query_norm_weight, (1536,), "query norm weight"),
         (kv_norm_weight, (512,), "KV norm weight"),
         (projection_weight, (output_width, 1536), "query projection weight"),
-        (out, (1, output_width), "query output"),
     )
     if output_width not in (2304, 3072):
         raise ValueError("MLA query output width must be 2304 or 3072")
-    for tensor, shape, name in expected:
+    for tensor, shape, name in expected_inputs:
         if tuple(tensor.shape) != shape or tensor.dtype != torch.bfloat16:
             raise ValueError(f"MLA {name} must be contiguous BF16 {shape}")
         if (
@@ -127,11 +151,29 @@ def gluon_mla_normalize_project_query_gfx950(
             or tensor.device != query.device
         ):
             raise ValueError(f"MLA {name} must be contiguous and colocated")
+    split_output = tail_out is not None
+    if split_output:
+        heads = output_width // (128 + 64)
+        if tuple(out.shape) != (1, heads, 128):
+            raise ValueError("MLA query prefix output must be BF16 [1, heads, 128]")
+        if tuple(tail_out.shape) != (1, heads, 64):
+            raise ValueError("MLA query tail output must be BF16 [1, heads, 64]")
+    elif tuple(out.shape) != (1, output_width):
+        raise ValueError(f"MLA query output must be BF16 [1, {output_width}]")
+    for tensor, name in ((out, "query output"), (tail_out, "query tail output")):
+        if tensor is not None and (
+            tensor.dtype != torch.bfloat16
+            or not tensor.is_cuda
+            or tensor.device != query.device
+            or tensor.stride(-1) != 1
+        ):
+            raise ValueError(f"MLA {name} must be unit-inner-stride BF16")
     if eps <= 0.0:
         raise ValueError("MLA norm epsilon must be positive")
 
     block_n = 16
     num_warps = 4
+    tail_output = out if tail_out is None else tail_out
     _mla_normalize_project_query_kernel[(output_width // block_n + 1,)](
         query,
         kv,
@@ -139,8 +181,14 @@ def gluon_mla_normalize_project_query_gfx950(
         kv_norm_weight,
         projection_weight,
         out,
+        tail_output,
+        out.stride(1) if split_output else 0,
+        tail_output.stride(1) if split_output else 0,
         float(eps),
         OUTPUT_WIDTH=output_width,
+        HEAD_WIDTH=192 if split_output else output_width,
+        PREFIX_WIDTH=128 if split_output else output_width,
+        SPLIT_OUTPUT=split_output,
         BLOCK_N=block_n,
         NUM_WARPS=num_warps,
         num_warps=num_warps,

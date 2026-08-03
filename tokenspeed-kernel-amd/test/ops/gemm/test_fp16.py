@@ -50,6 +50,7 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (  # noqa: E402
     _use_mfma_lds_mediumm,
     _use_mfma_lds_smallm,
     _use_warp_reduce_smallm,
+    gluon_bmm_a16w16_gfx950,
     gluon_mm_a16w16_gfx950,
     gluon_mm_a16w16_mfma_lds_mediumm_gfx950,
     gluon_mm_a16w16_mfma_lds_smallm_gfx950,
@@ -112,6 +113,31 @@ def test_dense16_kernel_variant_writes_strided_out(
 
     assert actual is out
     torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("batch", [12, 16])
+def test_dense16_bmm_writes_strided_out(batch: int) -> None:
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    m, n, k = 1, 512, 128
+    a_backing = torch.randn((m, batch, k), device="cuda", dtype=dtype) * 0.25
+    a = a_backing.transpose(0, 1)
+    weight = torch.randn((batch, k, n), device="cuda", dtype=dtype) * 0.25
+    b = weight.transpose(1, 2)
+    backing = torch.empty((m, batch, n + 17), device="cuda", dtype=dtype)
+    out = backing[..., :n].transpose(0, 1)
+
+    actual = gluon_bmm_a16w16_gfx950(a, b, dtype, out=out)
+
+    assert actual is out
+    torch.testing.assert_close(out, torch.bmm(a, weight), atol=1e-2, rtol=1e-2)
+
+
+def test_dense16_bmm_rejects_unsupported_shape() -> None:
+    a = torch.empty((12, 2, 128), device="cuda", dtype=torch.bfloat16)
+    b = torch.empty((12, 512, 128), device="cuda", dtype=torch.bfloat16)
+
+    assert gluon_bmm_a16w16_gfx950(a, b, torch.bfloat16) is None
 
 
 def test_splitk_smallm_out_handles_padded_reducer_rows() -> None:

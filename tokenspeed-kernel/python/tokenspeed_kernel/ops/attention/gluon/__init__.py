@@ -73,9 +73,6 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
         gluon_mla_decode_bf16xbf16_gfx950_bh16bn64 as _mla_decode_bf16xbf16_bh16bn64_impl,
     )
-    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.absorb_query import (
-        gluon_mla_absorb_query_gfx950 as _mla_absorb_query_impl,
-    )
     from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
         gluon_mla_decode_bf16xbf16_gfx950_bh64 as _mla_decode_bf16xbf16_bh64_impl,
     )
@@ -547,7 +544,7 @@ if current_platform().is_amd:
     def gluon_mla_decode_fp8xfp8_gfx950_bh16bn128(*args, **kwargs):
         return _mla_decode_fp8xfp8_impl(*args, **kwargs)
 
-    @register_kernel(
+    register_kernel(
         "attention",
         "mla_decode_projected_value",
         name="gluon_mla_decode_projected_value_gfx950",
@@ -578,45 +575,9 @@ if current_platform().is_amd:
             "value_head_dim": frozenset({128}),
             "gate_kind": frozenset({"none", "sigmoid"}),
         },
-    )
-    def gluon_mla_decode_projected_value_gfx950(*args, **kwargs):
-        return _mla_decode_projected_value_impl(*args, **kwargs)
+    )(_mla_decode_projected_value_impl)
 
-    @register_kernel(
-        "attention",
-        "mla_absorb_query",
-        name="gluon_mla_absorb_query_gfx950",
-        solution="gluon",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 5),
-            max_arch_version=ArchVersion(9, 5),
-            vendors=frozenset({"amd"}),
-        ),
-        signatures=frozenset(
-            {
-                format_signature(
-                    query_nope=dense_tensor_format(torch.bfloat16),
-                    weight=dense_tensor_format(torch.bfloat16),
-                    out=dense_tensor_format(torch.bfloat16),
-                )
-            }
-        ),
-        priority=Priority.SPECIALIZED,
-        traits={
-            "num_tokens": frozenset({1}),
-            "num_heads": frozenset({12, 16}),
-            "nope_dim": frozenset({128}),
-            "rope_dim": frozenset({0, 64}),
-            "latent_dim": frozenset({512}),
-            "query_inner_stride_one": frozenset({True}),
-            "weight_contiguous": frozenset({True}),
-            "out_inner_stride_one": frozenset({True}),
-        },
-    )
-    def gluon_mla_absorb_query_gfx950(*args, **kwargs):
-        return _mla_absorb_query_impl(*args, **kwargs)
-
-    @register_kernel(
+    register_kernel(
         "attention",
         "mla_project_value",
         name="gluon_mla_project_value_gfx950",
@@ -644,11 +605,9 @@ if current_platform().is_amd:
             "gate_kind": frozenset({"none", "sigmoid"}),
             "inputs_contiguous": frozenset({True}),
         },
-    )
-    def gluon_mla_project_value_gfx950(*args, **kwargs):
-        return _mla_project_value_impl(*args, **kwargs)
+    )(_mla_project_value_impl)
 
-    @register_kernel(
+    register_kernel(
         "attention",
         "mla_normalize_project_query",
         name="gluon_mla_normalize_project_query_gfx950",
@@ -665,7 +624,14 @@ if current_platform().is_amd:
                     kv=dense_tensor_format(torch.bfloat16),
                     projection_weight=dense_tensor_format(torch.bfloat16),
                     out=dense_tensor_format(torch.bfloat16),
-                )
+                ),
+                format_signature(
+                    query=dense_tensor_format(torch.bfloat16),
+                    kv=dense_tensor_format(torch.bfloat16),
+                    projection_weight=dense_tensor_format(torch.bfloat16),
+                    out=dense_tensor_format(torch.bfloat16),
+                    tail_out=dense_tensor_format(torch.bfloat16),
+                ),
             }
         ),
         priority=Priority.SPECIALIZED,
@@ -674,11 +640,13 @@ if current_platform().is_amd:
             "query_width": frozenset({1536}),
             "kv_width": frozenset({512}),
             "output_width": frozenset({2304, 3072}),
+            "output_prefix_width": frozenset({128, 2304, 3072}),
+            "output_tail_width": frozenset({0, 64}),
+            "split_output": frozenset({False, True}),
             "inputs_contiguous": frozenset({True}),
+            "outputs_inner_contiguous": frozenset({True}),
         },
-    )
-    def gluon_mla_normalize_project_query_gfx950(*args, **kwargs):
-        return _mla_normalize_project_query_impl(*args, **kwargs)
+    )(_mla_normalize_project_query_impl)
 
     @register_kernel(
         "attention",

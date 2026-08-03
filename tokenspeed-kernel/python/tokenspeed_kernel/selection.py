@@ -478,7 +478,19 @@ def ref_compatible_with_spec(ref: KernelSpec, spec: KernelSpec) -> bool:
 
 
 def spec_matches_shape_traits(spec: KernelSpec, shape: dict[str, Any]) -> bool:
-    """Return whether a spec's alignment traits match a concrete shape."""
+    """Return whether a spec's dimension traits match a concrete shape."""
+    exact_traits: dict[str, tuple[str, ...]] = {
+        "batch": ("B", "batch"),
+        "m": ("M",),
+        "n": ("N",),
+        "k": ("K",),
+    }
+    for trait_name, dim_names in exact_traits.items():
+        values = spec.traits.get(trait_name)
+        dim = next((shape[name] for name in dim_names if name in shape), None)
+        if values is not None and dim is not None and dim not in values:
+            return False
+
     alignment_traits: dict[str, tuple[str, int]] = {
         "n_align_16": ("N", 16),
         "n_align_64": ("N", 64),

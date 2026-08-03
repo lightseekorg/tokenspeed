@@ -33,7 +33,6 @@ import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.attention import (
     attn_merge_state,
-    mla_absorb_query,
     mla_project_value,
 )
 from tokenspeed_kernel.ops.attention.tokenspeed_mla import mla_kv_pack_quantize_fp8
@@ -41,6 +40,7 @@ from tokenspeed_kernel.ops.attention.triton.mla_query_assemble import (
     mla_nope_query_fp8,
 )
 from tokenspeed_kernel.ops.embedding import apply_rope_mla
+from tokenspeed_kernel.ops.gemm import bmm
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.gemm.cute_dsl import (
     nvfp4_gemm_swiglu_nvfp4_quant,
@@ -704,6 +704,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
         output_gate: torch.Tensor | None = None,
+        absorbed_query: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The eager break: KV write + varlen prefill / absorb decode attention.
 
@@ -778,6 +779,11 @@ class DeepseekV3AttentionMLA(nn.Module):
                 out_cache_loc[num_prefill_tokens:real_total],
                 attn_output[num_prefill_tokens:real_total],
                 output_gate=output_gate,
+                absorbed_query=(
+                    None
+                    if absorbed_query is None
+                    else absorbed_query[num_prefill_tokens:real_total]
+                ),
             )
 
         return attn_output
@@ -791,6 +797,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         out_cache_loc: torch.Tensor,
         output: torch.Tensor,
         output_gate: torch.Tensor | None = None,
+        absorbed_query: torch.Tensor | None = None,
     ) -> torch.Tensor:
         Q, K = self.forward_absorb_qkv_proj(
             q,
@@ -798,6 +805,7 @@ class DeepseekV3AttentionMLA(nn.Module):
             positions,
             ctx,
             out_cache_loc,
+            absorbed_query=absorbed_query,
         )
         return self.forward_absorb_attn_v_proj(
             Q,
@@ -808,24 +816,6 @@ class DeepseekV3AttentionMLA(nn.Module):
             output_gate=output_gate,
         )
 
-    def _project_absorbed_query(
-        self,
-        q: torch.Tensor,
-        q_nope: torch.Tensor,
-        q_pe: torch.Tensor,
-        output: torch.Tensor,
-    ) -> bool:
-        """Project the absorbed NoPE query and report whether PE was assembled."""
-
-        del q, q_pe
-        q_nope_out_view = output[..., : self.kv_lora_rank]
-        mla_absorb_query(
-            q_nope,
-            self.w_kc.contiguous() if _is_amd else self.w_kc,
-            out=q_nope_out_view,
-        )
-        return False
-
     def forward_absorb_qkv_proj(
         self,
         q: torch.Tensor,
@@ -833,6 +823,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         positions,
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
+        absorbed_query: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Model-owned KV writes route their locations through the backend:
         # identity on the legacy path (base AttentionBackend hook), the
@@ -840,19 +831,31 @@ class DeepseekV3AttentionMLA(nn.Module):
         out_cache_loc = ctx.attn_backend.select_out_cache_loc(
             self.attn_mqa, out_cache_loc, ctx.forward_mode
         )
-        q = q.view(-1, self.num_local_heads, self.qk_head_dim)
-        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-
-        Q = torch.empty(
-            q_nope.size(0),
-            self.num_local_heads,
-            self.kv_lora_rank + self.qk_rope_head_dim,
-            dtype=q_nope.dtype,
-            device=q_nope.device,
-        )
+        if absorbed_query is None:
+            q = q.view(-1, self.num_local_heads, self.qk_head_dim)
+            q_nope, q_pe = q.split(
+                [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+            )
+            Q = torch.empty(
+                q_nope.size(0),
+                self.num_local_heads,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+                dtype=q_nope.dtype,
+                device=q_nope.device,
+            )
+            query_pe_written = False
+        else:
+            q_nope = q
+            Q = absorbed_query
+            q_pe = Q[..., self.kv_lora_rank :]
+            query_pe_written = True
         # latent_cache contains normalized kv_a and k_pe before rotate.
         K = latent_cache.unsqueeze(1)
-        query_pe_written = self._project_absorbed_query(q, q_nope, q_pe, Q)
+        bmm(
+            q_nope.transpose(0, 1),
+            self.w_kc.transpose(1, 2),
+            out=Q[..., : self.kv_lora_rank].transpose(0, 1),
+        )
         # Model-owned fused FP8 decode: RoPE + quantize + KV cache write
         # all done here, so backend only needs to do attention.
         k_scale = getattr(self.attn_mqa, "k_scale_float", 1.0)
@@ -973,7 +976,11 @@ class DeepseekV3AttentionMLA(nn.Module):
             k_for_attn = K
             v_for_attn = K[..., : self.kv_lora_rank]
 
-        use_projected_value_decode = self._use_projected_value_decode(ctx, output_gate)
+        use_projected_value_decode = (
+            output_gate is not None
+            and ctx.num_extends == 0
+            and ctx.attn_backend.supports_mla_projected_value_decode
+        )
         attn_output = self.attn_mqa(
             Q,
             k_for_attn,
@@ -989,28 +996,8 @@ class DeepseekV3AttentionMLA(nn.Module):
         if use_projected_value_decode:
             return attn_output
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
-        return self._project_absorbed_value(attn_output, output, output_gate)
-
-    @staticmethod
-    def _use_projected_value_decode(
-        ctx: ForwardContext, output_gate: torch.Tensor | None
-    ) -> bool:
-        return (
-            output_gate is not None
-            and ctx.num_extends == 0
-            and ctx.attn_backend.supports_mla_projected_value_decode
-        )
-
-    def _project_absorbed_value(
-        self,
-        attention: torch.Tensor,
-        output: torch.Tensor,
-        output_gate: torch.Tensor | None,
-    ) -> torch.Tensor:
-        """Project absorbed MLA values, optionally applying an output gate."""
-
         return mla_project_value(
-            attention,
+            attn_output,
             self.w_vc.contiguous() if _is_amd else self.w_vc,
             gate=output_gate,
             out=output,
@@ -1252,9 +1239,17 @@ class DeepseekV3DraftAttentionMLA(DeepseekV3AttentionMLA):
         latent_cache: torch.Tensor,
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
+        absorbed_query: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if ctx.accept_lengths is None:
-            return super()._attn(positions, q, latent_cache, ctx, out_cache_loc)
+            return super()._attn(
+                positions,
+                q,
+                latent_cache,
+                ctx,
+                out_cache_loc,
+                absorbed_query=absorbed_query,
+            )
 
         self._apply_correction(ctx)
 
@@ -1268,6 +1263,7 @@ class DeepseekV3DraftAttentionMLA(DeepseekV3AttentionMLA):
             positions,
             decode_ctx,
             out_cache_loc,
+            absorbed_query=absorbed_query,
         )
         Q = Q.index_select(0, ctx.gather_ids)
         attn_output = q.new_empty(ctx.bs, self.num_local_heads * self.v_head_dim)

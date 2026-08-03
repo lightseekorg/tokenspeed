@@ -122,6 +122,35 @@ def test_gemm_input_generator_requires_mxfp8_block_shape() -> None:
         generator.generate(M=4, N=256, K=128)
 
 
+def test_gemm_input_generator_preserves_kn_weight_layout() -> None:
+    generator = get_input_generator(
+        "gemm",
+        "mm",
+        dtype=torch.bfloat16,
+        traits={"b_layout": frozenset({"KN"})},
+        device="cpu",
+    )
+
+    inputs = generator.generate(M=4, N=256, K=128)
+
+    assert inputs["B"].shape == (128, 256)
+
+
+def test_bmm_input_generator_honors_n_contiguous_weight_trait() -> None:
+    generator = get_input_generator(
+        "gemm",
+        "bmm",
+        dtype=torch.bfloat16,
+        traits={"b_n_stride_one": frozenset({True})},
+        device="cpu",
+    )
+
+    inputs = generator.generate(batch=12, M=1, N=512, K=128)
+
+    assert inputs["B"].shape == (12, 512, 128)
+    assert inputs["B"].stride(1) == 1
+
+
 def test_quantized_reference_gemm_supports_out() -> None:
     A = torch.empty((2, 128), dtype=_fp8_dtype)
     B = torch.empty((256, 128), dtype=_fp8_dtype)

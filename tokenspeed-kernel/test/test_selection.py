@@ -381,6 +381,26 @@ class TestSpecMatchesTraits:
 
 
 class TestSpecMatchesShapeTraits:
+    def test_exact_dimension_traits_match(self):
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={
+                "batch": frozenset({12, 16}),
+                "m": frozenset({1}),
+                "n": frozenset({512}),
+                "k": frozenset({128}),
+            },
+        )
+
+        assert spec_matches_shape_traits(
+            spec, {"batch": 12, "M": 1, "N": 512, "K": 128}
+        )
+        assert not spec_matches_shape_traits(
+            spec, {"batch": 8, "M": 1, "N": 512, "K": 128}
+        )
+
     def test_required_alignment_trait_matches(self):
         spec = KernelSpec(
             name="k",

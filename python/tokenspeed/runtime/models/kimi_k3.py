@@ -69,10 +69,7 @@ from tokenspeed_kernel.ops.activation.triton import (
     rmsnorm_gated_sigmoid,
     sigmoid_mul,
 )
-from tokenspeed_kernel.ops.attention import (
-    mla_absorb_query,
-    mla_normalize_project_query,
-)
+from tokenspeed_kernel.ops.attention import mla_normalize_project_query
 from tokenspeed_kernel.ops.attn_res import attn_res_fwd
 from tokenspeed_kernel.ops.communication import allreduce_fusion_lane
 from tokenspeed_kernel.ops.gemm import (
@@ -377,27 +374,13 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
                 prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
             )
 
-    def _project_absorbed_query(
-        self,
-        q: torch.Tensor,
-        q_nope: torch.Tensor,
-        q_pe: torch.Tensor,
-        output: torch.Tensor,
-    ) -> bool:
-        """Project and assemble K3's NoPE absorbed query."""
-
-        if self.rotary_emb is None:
-            mla_absorb_query(q_nope, self.w_kc, query_rope=q_pe, out=output)
-            return True
-        return super()._project_absorbed_query(q, q_nope, q_pe, output)
-
     def _project_q_latent_gated(
         self,
         hidden_states: torch.Tensor,
         ctx: "ForwardContext",
         comm_manager: CommManager,
         block_scale: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Project MLA Q, latent KV, and the local output gate in one GEMM."""
         if block_scale is not None:
             qkv_gate = self.fused_qkv_a_proj_with_mqa(
@@ -436,15 +419,18 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
                 )
                 gate = projection.gate
         kv_a = latent_cache[..., : self.kv_lora_rank]
-        q = mla_normalize_project_query(
+        projection = mla_normalize_project_query(
             q_a,
             kv_a,
             self.fused_qk_layernorm.weight_q_a,
             self.fused_qk_layernorm.weight_kv_a,
             self.q_b_proj.weight,
             eps=self.q_a_layernorm.variance_epsilon,
+            prepare_absorbed_query=ctx is not None and ctx.num_extends == 0,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            qk_rope_head_dim=self.qk_rope_head_dim,
         )
-        return q, latent_cache, gate
+        return projection.query, latent_cache, gate, projection.absorbed_query
 
     def forward(
         self,
@@ -458,7 +444,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         if hidden_states.shape[0] == 0:
             return hidden_states
         if self.use_output_gate:
-            q, latent_cache, gate = self._project_q_latent_gated(
+            q, latent_cache, gate, absorbed_query = self._project_q_latent_gated(
                 hidden_states, ctx, comm_manager, block_scale
             )
         else:
@@ -466,7 +452,12 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
                 hidden_states, ctx, comm_manager, block_scale
             )
             gate = None
-        fuse_value_gate = self._use_projected_value_decode(ctx, gate)
+            absorbed_query = None
+        fuse_value_gate = (
+            gate is not None
+            and ctx.num_extends == 0
+            and ctx.attn_backend.supports_mla_projected_value_decode
+        )
         attn_output = self._attn(
             positions,
             q,
@@ -474,6 +465,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             ctx,
             out_cache_loc,
             output_gate=gate if fuse_value_gate else None,
+            absorbed_query=absorbed_query,
         )
         if gate is not None and not fuse_value_gate:
             # Fused in-place fp32 sigmoid+mul; the gate shard matches the

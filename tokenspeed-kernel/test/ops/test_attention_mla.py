@@ -914,47 +914,6 @@ def test_mla_project_value_fallback_preserves_fp32_gate_math(
     assert not torch.equal(output, attention.reshape(1, 1) * gate.sigmoid())
 
 
-def test_mla_absorb_query_nvidia_fallback_writes_projection_directly(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import tokenspeed_kernel.ops.attention as attention_ops
-    from tokenspeed_kernel.selection import NoKernelFoundError
-
-    def no_kernel(*args, **kwargs):
-        raise NoKernelFoundError
-
-    original_bmm = torch.bmm
-    bmm_out = None
-
-    def record_bmm(
-        input: torch.Tensor,
-        mat2: torch.Tensor,
-        *,
-        out: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        nonlocal bmm_out
-        bmm_out = out
-        return original_bmm(input, mat2, out=out)
-
-    monkeypatch.setattr(attention_ops, "select_kernel", no_kernel)
-    monkeypatch.setattr(
-        attention_ops,
-        "current_platform",
-        lambda: SimpleNamespace(is_nvidia=True),
-    )
-    monkeypatch.setattr(torch, "bmm", record_bmm)
-    query = torch.randn(2, 3, 4)
-    weight = torch.randn(3, 4, 5)
-    rope = torch.randn(2, 3, 2)
-    expected_projection = torch.einsum("thk,hkl->thl", query, weight)
-
-    output = attention_ops.mla_absorb_query(query, weight, query_rope=rope)
-
-    assert bmm_out is not None
-    torch.testing.assert_close(output[..., :5], expected_projection)
-    torch.testing.assert_close(output[..., 5:], rope)
-
-
 def test_mla_project_value_nvidia_fallback_writes_projection_directly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1010,7 +969,6 @@ def test_mla_normalize_project_query_cuda_fallback(
     query_weight = torch.randn(64, device=device, dtype=torch.bfloat16)
     kv_weight = torch.randn(32, device=device, dtype=torch.bfloat16)
     projection_weight = torch.randn(48, 64, device=device, dtype=torch.bfloat16)
-    output = torch.empty(2, 48, device=device, dtype=torch.bfloat16)
     eps = 1e-6
     query_fp32 = query.float()
     expected_query = (
@@ -1033,12 +991,81 @@ def test_mla_normalize_project_query_cuda_fallback(
         kv_weight,
         projection_weight,
         eps=eps,
-        out=output,
+        prepare_absorbed_query=True,
+        qk_nope_head_dim=8,
+        qk_rope_head_dim=4,
     )
 
-    assert returned.data_ptr() == output.data_ptr()
+    assert returned.absorbed_query is None
     torch.testing.assert_close(kv, expected_kv, atol=0, rtol=0)
-    torch.testing.assert_close(output, expected_output, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(returned.query, expected_output, atol=2e-2, rtol=2e-2)
+
+
+def test_mla_normalize_project_query_split_output(
+    device: str,
+    require,
+) -> None:
+    import tokenspeed_kernel.ops.attention as attention_ops
+
+    require(
+        "attention",
+        "mla_normalize_project_query",
+        "gluon",
+        torch.bfloat16,
+        "query",
+    )
+    heads = 12
+    query = torch.randn(1, 1536, device=device, dtype=torch.bfloat16)
+    kv = torch.randn(1, 512, device=device, dtype=torch.bfloat16)
+    query_weight = torch.randn(1536, device=device, dtype=torch.bfloat16)
+    kv_weight = torch.randn(512, device=device, dtype=torch.bfloat16)
+    projection_weight = torch.randn(
+        heads * 192, 1536, device=device, dtype=torch.bfloat16
+    )
+    expected_kv = kv.clone()
+    eps = 1e-6
+
+    returned = attention_ops.mla_normalize_project_query(
+        query,
+        kv,
+        query_weight,
+        kv_weight,
+        projection_weight,
+        eps=eps,
+        prepare_absorbed_query=True,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        solution="gluon",
+    )
+
+    query_fp32 = query.float()
+    normalized_query = (
+        query_fp32
+        * torch.rsqrt(query_fp32.square().mean(dim=-1, keepdim=True) + eps)
+        * query_weight.float()
+    ).to(torch.bfloat16)
+    projected = (normalized_query.float() @ projection_weight.float().t()).to(
+        torch.bfloat16
+    )
+    projected = projected.view(1, heads, 192)
+    kv_fp32 = expected_kv.float()
+    expected_kv = (
+        kv_fp32
+        * torch.rsqrt(kv_fp32.square().mean(dim=-1, keepdim=True) + eps)
+        * kv_weight.float()
+    ).to(torch.bfloat16)
+
+    assert returned.absorbed_query is not None
+    torch.testing.assert_close(
+        returned.query, projected[..., :128], atol=2e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(
+        returned.absorbed_query[..., 512:],
+        projected[..., 128:],
+        atol=2e-2,
+        rtol=2e-2,
+    )
+    torch.testing.assert_close(kv, expected_kv, atol=0, rtol=0)
 
 
 def test_gfx950_k3_decode_split_policy() -> None:

@@ -77,6 +77,68 @@ def test_bmm_reference_rejects_out_dtype_mismatch() -> None:
         tokenspeed_kernel.bmm(a, b, out=out, override="torch_bmm")
 
 
+def test_bmm_writes_head_major_strided_output(device: str) -> None:
+    heads, tokens, k, n = 3, 1, 8, 16
+    a = torch.randn(heads, tokens, k, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(heads, k, n, device=device, dtype=torch.bfloat16)
+    backing = torch.empty(tokens, heads, n + 4, device=device, dtype=torch.bfloat16)
+    out = backing[..., :n].transpose(0, 1)
+
+    returned = tokenspeed_kernel.bmm(
+        a,
+        weight.transpose(1, 2),
+        out=out,
+        override="torch_bmm",
+    )
+
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out, torch.bmm(a, weight), atol=0, rtol=0)
+
+
+def test_gluon_bmm_writes_head_major_strided_output(device: str, require) -> None:
+    require("gemm", "bmm", "gluon", torch.bfloat16, "a")
+    heads, tokens, k, n = 12, 1, 128, 512
+    a_backing = torch.randn(tokens, heads, k, device=device, dtype=torch.bfloat16)
+    a = a_backing.transpose(0, 1)
+    weight = torch.randn(heads, k, n, device=device, dtype=torch.bfloat16)
+    backing = torch.empty(tokens, heads, n + 64, device=device, dtype=torch.bfloat16)
+    out = backing[..., :n].transpose(0, 1)
+
+    returned = tokenspeed_kernel.bmm(
+        a,
+        weight.transpose(1, 2),
+        out=out,
+        override="gluon_bmm_a16w16_gfx950",
+    )
+
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out, torch.bmm(a, weight), atol=0.25, rtol=0.01)
+
+
+def test_gluon_bmm_allocates_output(device: str, require) -> None:
+    require("gemm", "bmm", "gluon", torch.bfloat16, "a")
+    a = torch.randn(12, 1, 128, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(12, 128, 512, device=device, dtype=torch.bfloat16)
+
+    output = tokenspeed_kernel.bmm(
+        a,
+        weight.transpose(1, 2),
+        override="gluon_bmm_a16w16_gfx950",
+    )
+
+    torch.testing.assert_close(output, torch.bmm(a, weight), atol=0.25, rtol=0.01)
+
+
+def test_gluon_bmm_falls_back_for_fp32_output(device: str, require) -> None:
+    require("gemm", "bmm", "gluon", torch.bfloat16, "a")
+    a = torch.randn(12, 1, 128, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(12, 128, 512, device=device, dtype=torch.bfloat16)
+
+    output = tokenspeed_kernel.bmm(a, weight.transpose(1, 2), out_dtype=torch.float32)
+
+    assert output.dtype == torch.float32
+
+
 def test_decode_gemv_writes_preallocated_output() -> None:
     from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
 

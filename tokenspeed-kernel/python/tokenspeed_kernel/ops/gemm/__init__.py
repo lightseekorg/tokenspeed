@@ -563,6 +563,14 @@ def bmm(
         )
 
     traits: dict[str, object] = {
+        "batch": batch,
+        "m": M,
+        "n": N,
+        "k": K,
+        "a_inner_stride_one": A.stride(-1) == 1,
+        "b_n_stride_one": B.stride(1) == 1,
+        "out_inner_stride_one": out is None or out.stride(-1) == 1,
+        "out_dtype": out_dtype,
         "n_align_16": N % 16 == 0,
         "k_align_16": K % 16 == 0,
         "k_align_32": K % 32 == 0,

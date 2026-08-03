@@ -364,7 +364,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
         self.assertIs(joint_reduce.func, kimi_k3.all_reduce_two)
         self.assertEqual(joint_reduce.keywords, {"group": ep_group})
 
-    def test_mla_gate_projection_splits_prefill_and_fuses_decode(self):
+    def test_mla_gate_projection_uses_api_selected_layout(self):
         from tokenspeed.runtime.models.kimi_k3 import KimiLinearMLAAttention
 
         class FakeProjection(torch.nn.Module):
@@ -403,6 +403,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
         torch.nn.Module.__init__(attention)
         attention.q_lora_rank = 2
         attention.kv_lora_rank = 3
+        attention.qk_nope_head_dim = 1
         attention.qk_rope_head_dim = 1
         attention._qkv_a_width = 6
         attention._gate_width = 4
@@ -414,7 +415,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
 
         prefill = torch.ones(33, 5)
         with torch.no_grad():
-            q, latent, gate = attention._project_q_latent_gated(
+            q, latent, gate, absorbed_query = attention._project_q_latent_gated(
                 prefill, None, comm, None
             )
         expected = torch.nn.functional.linear(
@@ -434,33 +435,15 @@ class KimiK3RegistrationTests(unittest.TestCase):
         torch.testing.assert_close(q, expected_q)
         torch.testing.assert_close(latent, expected_latent)
         torch.testing.assert_close(gate, expected[:, 6:])
+        self.assertIsNone(absorbed_query)
         self.assertEqual(attention.fused_qkv_a_proj_with_mqa.calls, 0)
 
         with torch.no_grad():
-            attention._project_q_latent_gated(prefill[:1], None, comm, None)
-        # Decode routes through the registered GEMV using the packed weight
-        # directly, so neither branch materializes the projection module.
+            _, _, _, decode_absorbed = attention._project_q_latent_gated(
+                prefill[:4], SimpleNamespace(num_extends=0), comm, None
+            )
+        self.assertIsNone(decode_absorbed)
         self.assertEqual(attention.fused_qkv_a_proj_with_mqa.calls, 0)
-
-    def test_mla_projected_value_decode_requires_backend_support(self):
-        from tokenspeed.runtime.models.kimi_k3 import KimiLinearMLAAttention
-
-        gate = torch.ones(1, 4)
-        for supported, expected in ((False, False), (True, True)):
-            with self.subTest(supported=supported):
-                ctx = SimpleNamespace(
-                    num_extends=0,
-                    attn_backend=SimpleNamespace(
-                        supports_mla_projected_value_decode=supported
-                    ),
-                )
-                self.assertEqual(
-                    KimiLinearMLAAttention._use_projected_value_decode(ctx, gate),
-                    expected,
-                )
-
-        ctx.num_extends = 1
-        self.assertFalse(KimiLinearMLAAttention._use_projected_value_decode(ctx, gate))
 
     def test_config_registry_maps_model_type(self):
         from tokenspeed.runtime.utils.hf_transformers_utils import _CONFIG_REGISTRY
