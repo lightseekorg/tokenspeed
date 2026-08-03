@@ -167,6 +167,40 @@ def test_target_verify_decode_uses_the_full_window() -> None:
     assert backend._graph_verify_q_len() == 8
 
 
+def test_target_verify_mixed_batch_uses_the_full_window() -> None:
+    """Decode rows keep their verify width when a prefill joins the batch."""
+    backend = _backend(spec_num_tokens=8)
+    assert backend._verify_q_len(ForwardMode.MIXED) == 8
+
+
+def test_mixed_batch_metadata_covers_the_decode_suffix() -> None:
+    """The two modes must agree across the split, not just individually.
+
+    Metadata is built once under MIXED, but the model re-wraps the decode
+    suffix as DECODE and hands it a whole window per decode request. Asserting
+    the widths separately would still pass if the skip arithmetic in
+    select_out_cache_loc stopped matching the layout it skips over.
+    """
+    backend = _backend(spec_num_tokens=8)
+    q_len = backend._verify_q_len(ForwardMode.MIXED)
+    bs, num_extends = 3, 1
+    backend.forward_decode_metadata = MLADecodeMetadata(
+        num_extends=num_extends,
+        page_table=torch.zeros(bs, 8, dtype=torch.int32),
+        seq_lens=torch.tensor([100, 200, 300], dtype=torch.int32),
+        group_out_cache_loc=torch.arange(bs * q_len, dtype=torch.int64),
+        group_q_len_per_req=q_len,
+    )
+    num_decodes = bs - num_extends
+    out_cache_loc = torch.arange(
+        num_decodes * backend.spec_num_tokens, dtype=torch.int64
+    )
+    locs = backend.select_out_cache_loc(object(), out_cache_loc, ForwardMode.DECODE)
+    assert locs.numel() == out_cache_loc.numel()
+    # The prefill request's window is skipped whole, not one row of it.
+    assert locs[0].item() == num_extends * q_len
+
+
 def test_prefill_uses_a_single_location() -> None:
     """Extend tokens go through the extend path, not the verify window."""
     backend = _backend(spec_num_tokens=8)

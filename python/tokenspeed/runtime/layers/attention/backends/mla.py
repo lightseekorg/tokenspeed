@@ -362,7 +362,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         """
         if self.spec_num_tokens <= 1 or self._block_decode_active:
             return 1
-        if not self.is_draft and forward_mode.is_decode():
+        if not self.is_draft and (forward_mode.is_decode() or forward_mode.is_mixed()):
             return self.spec_num_tokens
         return 1
 
