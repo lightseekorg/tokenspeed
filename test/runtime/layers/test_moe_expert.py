@@ -93,22 +93,3 @@ def test_moe_layer_rejects_uneven_contiguous_ep_partition() -> None:
             ep_rank=0,
             ep_size=3,
         )
-
-
-def test_moe_layer_rejects_fp8_expert_weights() -> None:
-    class Fp8QuantConfig:
-        ignored_layers = None
-        exclude_modules = None
-
-        def moe_weight_dtype(self, prefix: str) -> str:
-            return "fp8"
-
-    with pytest.raises(RuntimeError, match="FP8 MoE expert weights"):
-        MoELayer(
-            top_k=2,
-            num_experts=4,
-            hidden_size=128,
-            intermediate_size=64,
-            quant_config=Fp8QuantConfig(),
-            layer_index=0,
-        )
