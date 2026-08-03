@@ -21,6 +21,7 @@ from collections.abc import Callable
 from typing import Any
 
 # Backend registration (side-effect imports)
+import tokenspeed_kernel.ops.moe.deep_gemm  # noqa: F401
 import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.moe.gluon  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton  # noqa: F401
