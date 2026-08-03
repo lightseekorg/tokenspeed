@@ -16,6 +16,7 @@ install:
 server:
   command: >-
     ts serve
+    --disable-kvstore
     --model nvidia/Qwen3.5-397B-A17B-NVFP4
     --data-parallel-size 4
     --ep-size 4

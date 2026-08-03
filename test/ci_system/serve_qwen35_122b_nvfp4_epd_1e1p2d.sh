@@ -125,13 +125,20 @@ wait_http() {
 
 wait_serving() {
   local label=$1
-  local timeout=${2:-2400}
+  local pid=$2
+  local timeout=${3:-2400}
   local log="$LOG_DIR/${label}.log"
   local start
   start=$(date +%s)
   until grep -q "health status -> SERVING" "$log" 2>/dev/null; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "[epd-1e1p2d] $label exited before reaching SERVING (log=$log)" >&2
+      tail -n 200 "$log" >&2 || true
+      return 1
+    fi
     if (( $(date +%s) - start > timeout )); then
       echo "[epd-1e1p2d] timed out waiting for $label to reach SERVING (log=$log)" >&2
+      tail -n 200 "$log" >&2 || true
       return 1
     fi
     sleep 5
@@ -154,10 +161,11 @@ COMMON_ARGS=(
   --max-num-seqs "$MAX_NUM_SEQS"
   --quantization "$QUANTIZATION"
   --kv-cache-dtype "$KV_CACHE_DTYPE"
+  --disable-kvstore
   --kvstore-ratio "$KVSTORE_RATIO"
   --enable-cache-report
   --disaggregation-transfer-backend mooncake
-  --disaggregation-layerwise-interval 1
+  --disaggregation-layerwise-interval 0
   --skip-server-warmup
 )
 
@@ -213,10 +221,10 @@ start_worker decode0 decode "$DECODE0_GPUS" "$DECODE0_WS" "$DECODE0_PORT" "$DECO
 start_worker decode1 decode "$DECODE1_GPUS" "$DECODE1_WS" "$DECODE1_PORT" "$DECODE1_DIST_PORT" ""
 
 # Gate on each worker's model-loaded "SERVING" health (registration != loaded).
-wait_serving encode 2400
-wait_serving prefill 2400
-wait_serving decode0 2400
-wait_serving decode1 2400
+wait_serving encode "${pids[0]}" 2400
+wait_serving prefill "${pids[1]}" 2400
+wait_serving decode0 "${pids[2]}" 2400
+wait_serving decode1 "${pids[3]}" 2400
 wait_http encode-bootstrap "http://127.0.0.1:${ENCODE_BOOTSTRAP_PORT}/health" 2400
 
 echo "[epd-1e1p2d] starting smg gateway log=$LOG_DIR/gateway.log"

@@ -111,7 +111,7 @@ if current_platform().is_amd:
             "indexed_state": frozenset({True}),
             "single_token": frozenset({True}),
         },
-        tags={"amd", "gfx950", "flat_kv", "cuda_graph"},
+        tags={"amd", "gfx950", "paged_cache", "cuda_graph"},
     )
     def gluon_kda_paged_decode_gfx950(**kwargs):
         """Run specialized gfx950 KDA decode against the canonical K-major pool."""

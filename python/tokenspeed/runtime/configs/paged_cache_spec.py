@@ -38,57 +38,11 @@ class PagedCacheGroupSpec:
     block_size: int | None = None
     # Physical child CacheBlocks packed into one shared LCM parent.
     cache_blocks_per_lcm_block: int = 1
-    # None preserves standalone/non-PD behavior; Flat PD plans set this explicitly.
+    # None preserves standalone/non-PD behavior; PD plans set this explicitly.
     transfer_policy: TransferPolicy | None = None
 
 
 _PAGED_CACHE_GROUP_DUMMY_PAGES = 1
-
-
-_KIMI_K3_ARCHITECTURES = frozenset({"KimiK3ForConditionalGeneration"})
-_KIMI_K3_FLATKV_REQUIRED_DIAGNOSTIC = (
-    "Kimi-K3 is FlatKV-only: the installed tokenspeed_scheduler extension "
-    "is not a TOKENSPEED_FLAT_KVCACHE build, and legacy/radix scheduler "
-    "fallbacks are forbidden. Rebuild with "
-    'SKBUILD_CMAKE_DEFINE="TOKENSPEED_FLAT_KVCACHE=ON" pip install -e '
-    "tokenspeed-scheduler/ to serve KimiK3ForConditionalGeneration."
-)
-
-
-def preflight_kimi_k3_flat_consumers(*model_configs: object | None) -> None:
-    """Admit Kimi-K3 configs onto the FlatKV path, and only that path.
-
-    Kimi-K3 requires a flat-built ``tokenspeed_scheduler`` extension: a
-    radix/legacy ext never delivers the per-group flat tables its MLA and
-    KDA consumers run on. A silent radix fallback is forbidden, so a
-    non-FlatKV build is a startup error here.
-
-    Both target and draft configs pass through this shared architecture-only
-    check.  Keeping it torch-free lets EventLoop invoke it immediately after
-    loading configs, while the attention registry reuses it as defense in
-    depth for direct callers.  Non-Kimi architectures are never affected.
-    """
-    for model_config in model_configs:
-        if model_config is None:
-            continue
-        hf_config = getattr(model_config, "hf_config", None)
-        architectures = getattr(hf_config, "architectures", None) or ()
-        if any(arch in _KIMI_K3_ARCHITECTURES for arch in architectures):
-            if not scheduler_ext_flat_kvcache():
-                raise RuntimeError(_KIMI_K3_FLATKV_REQUIRED_DIAGNOSTIC)
-
-
-def scheduler_ext_flat_kvcache() -> bool:
-    """True iff the installed tokenspeed_scheduler ext was built with
-    TOKENSPEED_FLAT_KVCACHE. A missing package or an older / radix-built
-    ext reports False — the radix-safe default (never delivers flat tables).
-    """
-    try:
-        # Local import: module must stay importable without the compiled ext.
-        import tokenspeed_scheduler
-    except ImportError:
-        return False
-    return bool(getattr(tokenspeed_scheduler, "FLAT_KVCACHE", False))
 
 
 # Paged-cache label vocabulary (NOT the HF checkpoint's serialized enum:
@@ -141,14 +95,14 @@ def hybrid_slab_group_size(
     sliding_window_tokens: int | Sequence[int | None] | None = None,
 ) -> int | None:
     """Slab count for the hybrid slab KV layout (the i-th layer of EACH
-    group shares slab i), or None to keep the legacy per-layer layout.
+    group shares slab i), or None when the model cannot share slabs.
 
     Single source (canonical) for both the sizing divisor (registry KV
     profile) and the buffer layout (_create_buffers) -- the two must never
-    disagree. Safe only with the flat ext (its single BlockPool owns each
-    page id by at most one group, so paired layers' live rows never
-    overlap). Unknown labels degrade to None -- the predicate gates an
-    optimization, so it must not raise.
+    disagree. The scheduler's single BlockPool owns each page id by at most
+    one group, so paired layers' live rows never overlap. Unknown labels
+    degrade to None -- the predicate gates an optimization, so it must not
+    raise.
 
     Groups may be unequal in size (e.g. Inkling's 55 sliding + 11 full):
     the slab count is the LARGEST group's layer count; slabs beyond a
@@ -161,8 +115,6 @@ def hybrid_slab_group_size(
     window) degrade to None: the slab pairing is per raw label, not per
     (retention, window) group.
     """
-    if not scheduler_ext_flat_kvcache():
-        return None
     if not layer_types:
         return None
     counts: dict[str, int] = {}
@@ -191,117 +143,83 @@ def hybrid_slab_group_size(
     return max(counts.values())
 
 
-def _flat_kv_backend(attn_backend: object) -> object:
-    """The backend whose KV-table consumption matters for flat safety: the
+def _kv_backend(attn_backend: object) -> object:
+    """The backend whose KV-table consumption matters for scheduler safety: the
     backend itself, or a composite's full-attention sub-backend (hybrid's
     per-layer KV routing lives there and is user-selectable). The linear
     side consumes only the state group's table through its own explicit
-    flat path and is out of scope here.
+    path and is out of scope here.
     """
     sub = getattr(attn_backend, "full_attn_backend", None)
     if sub is not None:
-        return _flat_kv_backend(sub)
+        return _kv_backend(sub)
     return attn_backend
 
 
-def validate_flat_scheduler_config(
+def validate_scheduler_config(
     *,
-    flat_kvcache_ext: bool,
     paged_cache_groups: Sequence[object],
     attn_backend: object,
     kv_pool: object,
     speculative_algorithm: str | None = None,
 ) -> None:
-    """Fail fast, before the C++ ``Scheduler`` ctor, when a flat-built ext
-    cannot drive this setup: a backend (or hybrid sub-backend) that would not
-    consume the per-group flat tables, or zero published groups. No-op on a
-    radix build.
+    """Validate the cache-group contract before constructing the scheduler.
+
+    A single-group backend may consume the scheduler's compatibility table.
+    Multi-group pools must consume the explicit per-group tables.
     """
     contract = getattr(kv_pool, "runtime_contract", None)
-    if contract is not None and not flat_kvcache_ext:
-        raise RuntimeError(
-            "KV pool publishes a runtime contract and requires a flat scheduler "
-            "build; legacy and radix scheduler fallbacks are forbidden"
-        )
-    if not flat_kvcache_ext:
-        return
     pool_name = type(kv_pool).__name__
     if speculative_algorithm is not None and not getattr(
-        attn_backend, "flat_spec_capable", True
+        attn_backend, "cache_group_spec_capable", True
     ):
         raise RuntimeError(
-            "flat scheduler build (TOKENSPEED_FLAT_KVCACHE): attention backend "
-            f"{type(attn_backend).__name__} does not support flat cache groups "
-            "with speculative decoding yet. Use a non-speculative run or a "
-            "radix-built tokenspeed_scheduler extension."
+            f"attention backend {type(attn_backend).__name__} does not support "
+            "cache groups with speculative decoding"
         )
-    backend = _flat_kv_backend(attn_backend)
+    backend = _kv_backend(attn_backend)
     backend_name = type(backend).__name__
-    uses_paged = bool(getattr(backend, "uses_paged_cache_groups", False))
-    uses_flat = bool(getattr(backend, "uses_flat_cache_groups", False))
-    if uses_paged and not uses_flat:
-        raise RuntimeError(
-            "flat scheduler build (TOKENSPEED_FLAT_KVCACHE) does not support "
-            f"this model's cache layout yet: attention backend {backend_name} "
-            f"(KV pool {pool_name}) consumes paged-cache groups through the "
-            "radix scheduler's populate path, which the flat build compiles "
-            "out — CUDA graphs would silently replay against stale capture "
-            "placeholders. Use a radix-built tokenspeed_scheduler extension "
-            "for this model."
-        )
+    uses_cache_groups = bool(getattr(backend, "uses_cache_groups", False))
     if speculative_algorithm is not None and not getattr(
-        backend, "flat_spec_capable", True
+        backend, "cache_group_spec_capable", True
     ):
         raise RuntimeError(
-            "flat scheduler build (TOKENSPEED_FLAT_KVCACHE): attention backend "
-            f"{backend_name} does not support flat cache groups with "
-            "speculative decoding yet. Use the MHA backend or a radix-built "
-            "tokenspeed_scheduler extension."
+            f"attention backend {backend_name} does not support cache groups "
+            "with speculative decoding"
         )
-    if speculative_algorithm == "DFLASH":
-        raise RuntimeError(
-            "flat scheduler build (TOKENSPEED_FLAT_KVCACHE): DFLASH block "
-            "decode is unsupported on the flat path. Use a radix-built "
-            "tokenspeed_scheduler extension."
-        )
-    if len(paged_cache_groups) > 1 and not uses_flat and contract is None:
+    if len(paged_cache_groups) > 1 and not uses_cache_groups and contract is None:
         # A table-blind backend on a multi-group pool would index every
         # layer through the C++ single-table fallback (a first-group
         # sample) — with slab-aliased layouts that silently corrupts KV
         # past the sliding window. Refuse at startup instead.
         #
-        # Contract pools (the Kimi-K3 LCM MLA pool) are exempt from
-        # this flag check: their consumers travel FlatCacheBatchMetadata
-        # (never the C++ single-table fallback or req_to_page) and are
-        # validated by the family-coverage check below.
-        # The MLA sub-backend's uses_flat_cache_groups flag deliberately
-        # stays False so DeepSeek flat builds keep the non-flat CUDA-graph
+        # Contract pools are exempt from this flag check: their consumers
+        # travel contract-specific batch metadata and are validated by the
+        # family-coverage check below.
+        # The MLA sub-backend's uses_cache_groups flag deliberately
+        # stays False so DeepSeek keeps the single-table CUDA-graph
         # capture path that flag routes.
         raise RuntimeError(
-            "flat scheduler build (TOKENSPEED_FLAT_KVCACHE): KV pool "
-            f"{pool_name} publishes {len(paged_cache_groups)} cache groups "
-            f"but attention backend {backend_name} does not consume flat "
-            "per-group tables (uses_flat_cache_groups=False); the single-"
+            f"KV pool {pool_name} publishes {len(paged_cache_groups)} cache "
+            f"groups but attention backend {backend_name} does not consume "
+            "per-group tables (uses_cache_groups=False); the single-"
             "table fallback would serve one group's pages to every layer, "
-            "silently corrupting KV. Pick a flat-capable attention backend "
-            "or use a radix-built tokenspeed_scheduler extension."
+            "silently corrupting KV"
         )
     if not paged_cache_groups:
         raise RuntimeError(
-            "flat scheduler build (TOKENSPEED_FLAT_KVCACHE) requires at least "
-            f"one paged-cache group, but KV pool {pool_name} publishes none "
-            "(e.g. mamba/state-only pools). Use a radix-built "
-            "tokenspeed_scheduler extension for this model."
+            "the cache-group scheduler requires at least one paged-cache "
+            f"group, but KV pool {pool_name} publishes none"
         )
     if contract is not None:
         required_families = frozenset(spec.family for spec in contract.group_specs)
         supported_families = frozenset(
-            getattr(attn_backend, "flat_cache_consumer_families", ())
+            getattr(attn_backend, "cache_consumer_families", ())
         )
         missing_families = required_families - supported_families
         if missing_families:
             raise RuntimeError(
-                "flat cache pool requires consumer families "
+                "paged cache pool requires consumer families "
                 f"{sorted(required_families)}, but backend "
                 f"{type(attn_backend).__name__} is missing "
                 f"{sorted(missing_families)}"
@@ -505,7 +423,7 @@ def layer_group_ids(
     """Per-layer paged-cache group id — the single source multi-window models
     will assign ``PagedAttention(group_id=...)`` from (today gpt_oss.py
     assigns group_id=layer_type, identical in the single-window case), so
-    ``flat_block_tables`` keys line up with the published group specs."""
+    ``block_tables`` keys line up with the published group specs."""
     return [gid for gid, _, _ in _layer_specs(layer_types, sliding_window_tokens)]
 
 
@@ -638,15 +556,13 @@ def publish_paged_cache_groups(
     max_scheduled_tokens: int,
     max_total_tokens: int,
     max_context_len: int,
-) -> tuple[list[PagedCacheGroupSpec], dict[str, int]] | None:
+) -> tuple[list[PagedCacheGroupSpec], dict[str, int]]:
     """Publication rule (canonical) for a KV pool's paged-cache groups.
 
-    Publish groups iff the scheduler ext is flat-built (a radix ext never
-    delivers flat tables — capture would bind dead buffers). Speculative
-    decoding is supported: verify writes per-group [bs*N] locations and the
-    drafter consumes the full-attention group's table (mirrored into
-    req_to_page each step). Publication is THE upstream signal every flat
-    consumer keys off.
+    Every cache pool publishes its scheduler groups. Speculative decoding is
+    supported: verify writes per-group [bs*N] locations and the drafter
+    consumes the full-attention group's table (mirrored into req_to_page each
+    step).
 
     Args:
         layer_types: Per-layer paged-cache labels (empty -> single
@@ -658,10 +574,8 @@ def publish_paged_cache_groups(
             compute_paged_cache_group_page_counts.
 
     Returns:
-        (specs, page_counts) when publishing, None on a radix ext.
+        The group specs and their page counts.
     """
-    if not scheduler_ext_flat_kvcache():
-        return None
     packing = dict(cache_blocks_per_lcm_block or {})
     for spec in extra_groups:
         planned = packing.pop(spec.group_id, None)
@@ -777,8 +691,6 @@ __all__ = [
     "hybrid_slab_group_size",
     "layer_group_ids",
     "publish_paged_cache_groups",
-    "preflight_kimi_k3_flat_consumers",
-    "scheduler_ext_flat_kvcache",
     "split_recurrent_state_groups",
-    "validate_flat_scheduler_config",
+    "validate_scheduler_config",
 ]

@@ -10,8 +10,6 @@ runner:
     - amd-mi35x-8gpu-test
 env:
   CI: "true"
-  # Kimi-K3 is FlatKV-only; startup preflight rejects a radix scheduler build.
-  TOKENSPEED_FLAT_KV: "ON"
 install:
   - bash test/ci_system/install_deps_rocm.sh
 server:

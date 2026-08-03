@@ -77,7 +77,6 @@ def create_model_executor(
     draft_model_runner: ModelRunner | None = None,
     draft_attn_backend: AttentionBackend | None = None,
     draft_token_to_kv_pool: BaseTokenToKVPool | None = None,
-    mamba_pool: object | None = None,
 ) -> ModelExecutor:
     """Create the model executor with its sampler configuration."""
     if server_args.enable_nvtx:
@@ -109,5 +108,4 @@ def create_model_executor(
         draft_model_runner=draft_model_runner,
         draft_attn_backend=draft_attn_backend,
         draft_token_to_kv_pool=draft_token_to_kv_pool,
-        mamba_pool=mamba_pool,
     )

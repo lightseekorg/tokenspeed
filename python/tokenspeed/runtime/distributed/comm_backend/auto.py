@@ -107,12 +107,30 @@ class AutoBackend(CommBackend):
     # ---- Public CommBackend interface ----
 
     def all_reduce(self, tensor: torch.Tensor, group: Group, op=None) -> torch.Tensor:
-        if self._force_deterministic_rsag() or self._group_spans_nodes(group):
+        # AR backend dispatch -- first match wins. This is Tier 1 (which
+        # backend); the trtllm backend then runs Tier 2 (mnnvl vs IPC, by
+        # payload bytes) inside _ar_fusion_workspace.
+        #   1. force_deterministic_rsag ............ NCCL
+        #   2. same-node & custom_ar armed ......... custom_ar   (IPC-only)
+        #   3. trtllm_ar armed for this group ...... trtllm_ar   (mnnvl / IPC fusion)
+        #   4. group spans nodes ................... NCCL
+        #   5. triton_ar can run ................... triton_ar
+        #   6. otherwise ........................... NCCL
+        if self._force_deterministic_rsag():
             return self._nccl.all_reduce(tensor, group, op=op)
-        if self._custom_ar.has_custom_ar(group):
+        spans_nodes = self._group_spans_nodes(group)
+        # trtllm_ar carries an mnnvl workspace that spans nodes; it is only
+        # armed for a group when that succeeded, so has_trtllm_ar() is itself
+        # the "usable here" test. Checking it before the cross-node NCCL
+        # fallback is what lets a cross-node group use mnnvl at all -- otherwise
+        # the workspace is armed and never called. custom_ar is IPC-only and
+        # stays gated to same-node groups.
+        if not spans_nodes and self._custom_ar.has_custom_ar(group):
             return self._custom_ar.all_reduce(tensor, group, op=op)
         if self._trtllm_ar.has_trtllm_ar(group):
             return self._trtllm_ar.all_reduce(tensor, group, op=op)
+        if spans_nodes:
+            return self._nccl.all_reduce(tensor, group, op=op)
         if self._triton_ar.can_run(tensor, group, op=op):
             return self._triton_ar.all_reduce(tensor, group, op=op)
         return self._nccl.all_reduce(tensor, group, op=op)

@@ -22,9 +22,6 @@
 
 #include <stdexcept>
 
-#include "fsm/cache_states.h"
-#include "fsm/pd_states.h"
-
 namespace tokenspeed {
 
 Request::Request(const RequestSpec& spec, std::int32_t page_size, Role role)
@@ -32,36 +29,49 @@ Request::Request(const RequestSpec& spec, std::int32_t page_size, Role role)
       token_container_{spec.tokens},
       page_size_{page_size},
       state_{role == Role::kFused ? fsm::State{fsm::Submitted{&token_container_, page_size}}
-                                  : fsm::State{fsm::Bootstrapping{&token_container_, page_size}}},
-      storage_info_{spec.rolling_hashes, spec.storage_hit_pages} {}
+                                  : fsm::State{fsm::Bootstrapping{&token_container_, page_size}}} {}
 
-PrefillInfo Request::GetPrefillInfo() const {
-    return std::visit(Overloaded{
-        []<typename T>(const T& s) -> PrefillInfo
-            requires(std::same_as<T, fsm::Prefilling> || std::same_as<T, fsm::PrefillDone>)
-        { return s.GetPrefillInfo(); },
-        [this](const auto&) -> PrefillInfo {
-            throw std::logic_error("Request::GetPrefillInfo: expected state=Prefilling or PrefillDone; got state=" +
-                                   StateName());
-        },
+PrefillInfo Request::CurrentPrefillInfo() const {
+    return std::visit(
+        Overloaded{
+            [](const fsm::Prefilling& state) { return state.CurrentPrefillInfo(); },
+            [](const fsm::PrefillDone& state) { return state.CurrentPrefillInfo(); },
+            [this](const auto&) -> PrefillInfo {
+                throw std::logic_error("Request::CurrentPrefillInfo: expected Prefilling or PrefillDone; got " +
+                                       StateName());
+            },
         },
         state_);
 }
 
-TreeNode* Request::GetHostLockNode() const {
-    auto* s = std::get_if<fsm::Prefetching>(&state_);
-    if (s == nullptr) {
-        throw std::logic_error("Request::GetHostLockNode: expected state=Prefetching; got state=" + StateName());
+fsm::ForwardState& Request::forwardState(const char* operation) {
+    fsm::ForwardState* result = std::visit(
+        []<typename State>(State& state) -> fsm::ForwardState* {
+            if constexpr (std::derived_from<State, fsm::ForwardState>) {
+                return &state;
+            }
+            return nullptr;
+        },
+        state_);
+    if (result == nullptr) {
+        throw std::logic_error(std::string{"Request::"} + operation + ": expected a forward state; got " + StateName());
     }
-    return s->GetHostLockNode();
+    return *result;
 }
 
-std::vector<std::int32_t> Request::GetHostPageIds() const {
-    auto* s = std::get_if<fsm::Prefetching>(&state_);
-    if (s == nullptr) {
-        throw std::logic_error("Request::GetHostPageIds: expected state=Prefetching; got state=" + StateName());
+const fsm::ForwardState& Request::forwardState(const char* operation) const {
+    const fsm::ForwardState* result = std::visit(
+        []<typename State>(const State& state) -> const fsm::ForwardState* {
+            if constexpr (std::derived_from<State, fsm::ForwardState>) {
+                return &state;
+            }
+            return nullptr;
+        },
+        state_);
+    if (result == nullptr) {
+        throw std::logic_error(std::string{"Request::"} + operation + ": expected a forward state; got " + StateName());
     }
-    return s->GetHostPageIds();
+    return *result;
 }
 
 }  // namespace tokenspeed

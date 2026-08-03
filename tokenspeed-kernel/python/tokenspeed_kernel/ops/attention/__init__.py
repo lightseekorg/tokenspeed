@@ -922,7 +922,7 @@ def try_kda_fused_paged_decode(
             "attention",
             "kda_fused_paged_decode",
             signature,
-            traits={"flat_state": True},
+            traits={"paged_state": True},
             solution=solution,
             override=override,
         )
@@ -986,7 +986,7 @@ def try_kda_fused_paged_verify(
             "attention",
             "kda_fused_paged_verify",
             signature,
-            traits={"flat_state": True},
+            traits={"paged_state": True},
             solution=solution,
             override=override,
         )

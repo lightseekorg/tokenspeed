@@ -29,7 +29,7 @@ Capture borrows the decode
 :class:`~tokenspeed.runtime.execution.cuda_graph_wrapper.CudaGraphWrapper`'s
 stream; buckets share one private mempool, deliberately not the decode graphs'
 pool (see :meth:`capture`). At serving time
-the executor's target-forward dispatch is a flat
+the executor's target-forward dispatch is a simple
 three-way -- decode & captured replays the decode graph (one level up, since
 it captures the whole step), prefill & captured replays here (:meth:`can_run`
 / :meth:`replay`), everything else runs the eager model forward.
@@ -61,8 +61,8 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
-from tokenspeed.runtime.layers.attention.backends.flat_cache_metadata import (
-    FlatCacheBatchMetadata,
+from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
+    CacheBatchMetadata,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -417,10 +417,12 @@ class PrefillGraph:
         if num_tokens < bucket:
             self._input_embeds_buf[num_tokens:bucket].zero_()
 
-    def _dummy_flat_tables(self, req_tokens: int, bs: int) -> dict[str, "torch.Tensor"]:
+    def _dummy_group_tables(
+        self, req_tokens: int, bs: int
+    ) -> dict[str, "torch.Tensor"]:
         """Build capture tables: null KV pages and one writable state page."""
         backend = self.attn_backend
-        if not getattr(backend, "uses_flat_cache_groups", False):
+        if not getattr(backend, "uses_cache_groups", False):
             return {}
         specs = tuple(getattr(self.token_to_kv_pool, "paged_cache_group_specs", ()))
         state_group_ids = {
@@ -429,8 +431,8 @@ class PrefillGraph:
             if getattr(spec, "family", "history") == "state"
         }
         if not state_group_ids:
-            state_group_ids = set(getattr(backend, "flat_state_group_ids", frozenset()))
-        # Composite wrappers (hybrid) hold the flat KV consumer as a child.
+            state_group_ids = set(getattr(backend, "state_group_ids", frozenset()))
+        # Composite wrappers hold the cache-group consumer as a child.
         if not hasattr(backend, "page_size") and hasattr(backend, "full_attn_backend"):
             backend = backend.full_attn_backend
         # Full width: backends that derive the row stride from max_kv_len
@@ -527,29 +529,27 @@ class PrefillGraph:
                 extra_metadata_kwargs["paged_cache_block_tables"] = tables
             extra_metadata_kwargs["num_tokens"] = num_tokens
             extra_metadata_kwargs["positions"] = ib.positions_buf[:num_tokens]
-        flat_tables = self._dummy_flat_tables(max(seq_lens), bs)
-        if flat_tables:
+        group_tables = self._dummy_group_tables(max(seq_lens), bs)
+        if group_tables:
             contract = getattr(self.token_to_kv_pool, "runtime_contract", None)
             if contract is not None:
                 arrays = {
                     group_id: table.cpu().numpy()
-                    for group_id, table in flat_tables.items()
+                    for group_id, table in group_tables.items()
                 }
-                dummy_forward_op = SimpleNamespace(
-                    flat_block_tables_arrays=lambda: arrays
-                )
-                flat_cache_metadata = FlatCacheBatchMetadata.from_forward_op(
+                dummy_forward_op = SimpleNamespace(block_tables_arrays=lambda: arrays)
+                cache_metadata = CacheBatchMetadata.from_forward_op(
                     dummy_forward_op,
                     device=self.config.device,
                     contract=contract,
                     num_requests=bs,
                 )
-                flat_tables = dict(
-                    flat_cache_metadata.tables(active_forward_op=dummy_forward_op)
+                group_tables = dict(
+                    cache_metadata.tables(active_forward_op=dummy_forward_op)
                 )
-                extra_metadata_kwargs["flat_cache_metadata"] = flat_cache_metadata
-                extra_metadata_kwargs["flat_cache_forward_op"] = dummy_forward_op
-            extra_metadata_kwargs["flat_block_tables"] = flat_tables
+                extra_metadata_kwargs["cache_metadata"] = cache_metadata
+                extra_metadata_kwargs["forward_batch"] = dummy_forward_op
+            extra_metadata_kwargs["block_tables"] = group_tables
         self.attn_backend.init_forward_metadata(
             bs=bs,
             num_extends=bs,

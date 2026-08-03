@@ -36,17 +36,14 @@ from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.configs.paged_cache_spec import (
-    scheduler_ext_flat_kvcache,
-    validate_flat_scheduler_config,
+    validate_scheduler_config,
 )
 from tokenspeed.runtime.configs.utils import get_rope_parameters
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
 from tokenspeed.runtime.engine.scheduler_utils import (
-    flat_block_tables_from_forward_op,
-    paged_cache_block_table_base_offsets_from_forward_op,
-    paged_cache_block_tables_from_forward_op,
+    block_tables_from_forward_op,
 )
 from tokenspeed.runtime.execution.breakable_cuda_graph import active_forward
 from tokenspeed.runtime.execution.cache_loc_kernel import update_block_table
@@ -66,8 +63,8 @@ from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import ModelExecutionResult
 from tokenspeed.runtime.grammar.capturable_grammar import setup_grammar_step
-from tokenspeed.runtime.layers.attention.backends.flat_cache_metadata import (
-    FlatCacheBatchMetadata,
+from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
+    CacheBatchMetadata,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.layers.paged_attention import (
@@ -140,7 +137,14 @@ PREFILL_GRAPH_DEFAULT_MAX_TOKENS = 2048
 
 
 def _resolve_prefill_graph_max_tokens(server_args) -> int:
-    """Largest prefill-graph bucket: explicit value, or min(2048, chunk, kv budget)."""
+    """Largest prefill-graph bucket: explicit value, or min(2048, chunk, kv budget).
+
+    Returns 0 (graph off) when the MoE all-to-all backend is DeepEP: an
+    extend-shaped forward takes DeepEP's normal dispatch, whose per-expert
+    receive counts come back to the host, and a host sync cannot be captured.
+    """
+    if server_args.all2all_backend not in (None, "none"):
+        return 0
     if server_args.prefill_graph_max_tokens is not None:
         return int(server_args.prefill_graph_max_tokens)
     cap = PREFILL_GRAPH_DEFAULT_MAX_TOKENS
@@ -282,7 +286,6 @@ class ModelExecutor:
         draft_model_runner: ModelRunner | None = None,
         draft_attn_backend: AttentionBackend | None = None,
         draft_token_to_kv_pool: BaseTokenToKVPool | None = None,
-        mamba_pool: object | None = None,
     ):
         self.device = config.device
         self.config = config
@@ -290,16 +293,15 @@ class ModelExecutor:
         self.sampling_backend = sampling_backend
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
-        # FlatKV contract pools publish a runtime
-        # contract; on that path per-step tables travel as
-        # FlatCacheBatchMetadata and the legacy req_to_page mirror is
-        # forbidden.
-        self._flat_runtime_contract = getattr(
+        # Hybrid pools publish a runtime contract. Their per-group tables
+        # travel as CacheBatchMetadata rather than through req_to_page.
+        self._cache_runtime_contract = getattr(
             token_to_kv_pool, "runtime_contract", None
         )
-        # Full-attention group mirrored into req_to_page each step (flat+spec).
+        # Full-attention group mirrored into req_to_page for ordinary
+        # speculative consumers that still use the single-table interface.
         _group_specs = getattr(token_to_kv_pool, "paged_cache_group_specs", ()) or ()
-        self._flat_full_group_id = next(
+        self._full_history_group_id = next(
             (
                 str(spec.group_id)
                 for spec in _group_specs
@@ -313,13 +315,11 @@ class ModelExecutor:
         self._mirror_row_buf: torch.Tensor | None = None
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
-        self._layerwise_mamba_cow_done = None
 
-        # Must precede CUDA-graph capture: unsupported flat combinations
-        # (e.g. spec on a backend without flat_spec_capable) would otherwise
+        # Must precede CUDA-graph capture: unsupported cache combinations
+        # (e.g. spec on a backend without cache_group_spec_capable) would otherwise
         # die on a capture-path assert instead of this actionable error.
-        validate_flat_scheduler_config(
-            flat_kvcache_ext=scheduler_ext_flat_kvcache(),
+        validate_scheduler_config(
             paged_cache_groups=_group_specs,
             attn_backend=attn_backend,
             kv_pool=token_to_kv_pool,
@@ -358,12 +358,7 @@ class ModelExecutor:
         )
         spec_num_tokens = config.spec_num_tokens if config.spec_algo is not None else 1
         # Stride for indexing req_to_page when building drafter caller-side
-        # write locs. These locs are live on the radix arm only: on flat,
-        # every KV write (target and draft) takes the backend metadata's
-        # per-group out_cache_locs, and req_to_page is a verbatim mirror of
-        # the full-attention group's table kept for the non-flat fallbacks —
-        # the caller locs computed from it are never consumed there (the
-        # Inkling rel path asserts loc/row agreement).
+        # write locations for ordinary attention backends.
         self._draft_page_size = int(
             getattr(draft_token_to_kv_pool, "page_size", 0) or config.logical_page_size
         )
@@ -376,7 +371,6 @@ class ModelExecutor:
             dummy_kv_slot=0,
             state_write_padding_pool_index=config.max_req_pool_size,
             device=self.device,
-            has_mamba=(mamba_pool is not None),
         )
         self.runtime_states = RuntimeStates(
             req_pool_size=config.max_req_pool_size,
@@ -384,7 +378,6 @@ class ModelExecutor:
             vocab_size=config.vocab_size,
             device=self.device,
             output_length=config.output_length,
-            mamba_pool=mamba_pool,
         )
         # Sized like InputBuffers.max_bs so the padded graph-bucket bs fits.
         self.nan_guard = NanGuard.create(
@@ -745,27 +738,18 @@ class ModelExecutor:
             else None
         )
 
-    def _mirror_flat_full_table_into_req_to_page(
-        self, forward_op, flat_block_tables
+    def _mirror_full_history_table_into_req_to_page(
+        self, forward_op, block_tables
     ) -> None:
-        """Flat + spec: scatter the full-attention group's per-batch table
-        into req_to_page rows, restoring the radix contract for every
-        legacy consumer (input prep's out_cache_loc kernels, the drafter's
-        per-step location chains). The flat scheduler never populates
-        req_to_page itself; column tails zero-fill to the dummy page so
-        stale longer rows can't leak.
-
-        Never called on the FlatKV contract path: mirroring into
-        req_to_page would resurrect the forbidden legacy path.
-        """
+        """Expose the full-history table to ordinary speculative consumers."""
         if (
-            self._flat_runtime_contract is not None
+            self._cache_runtime_contract is not None
             or self.drafter is None
-            or not flat_block_tables
-            or self._flat_full_group_id is None
+            or not block_tables
+            or self._full_history_group_id is None
         ):
             return
-        table = flat_block_tables.get(self._flat_full_group_id)
+        table = block_tables.get(self._full_history_group_id)
         if table is None:
             return
         bs = len(forward_op.request_pool_indices)
@@ -1142,176 +1126,6 @@ class ModelExecutor:
         self.num_generated_tokens += int(results.output_lengths.sum().item())
         self.num_decode_steps += bs
 
-    @staticmethod
-    @torch.compile(dynamic=True)
-    def _compute_mtp_snapshot_indices(
-        valid_cache_lengths: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-        accept_lengths: torch.Tensor,
-        output_indices: torch.Tensor,
-        track_indices: torch.Tensor,
-        sentinel: torch.Tensor,
-        page_size: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Fused elementwise pipeline computing snapshot src/dst for MTP.
-
-        All operations are batched and fused by torch.compile into a single
-        Triton kernel (plus the two gathers), eliminating the ~14 individual
-        elementwise kernel launches of the eager implementation.
-        """
-        new_cl = valid_cache_lengths[req_pool_indices]
-        old_cl = new_cl - accept_lengths.to(new_cl.dtype)
-        first_boundary = ((old_cl // page_size) + 1) * page_size
-
-        step_raw = first_boundary - old_cl - 1
-        max_col = output_indices.shape[1] - 1
-        step = step_raw.clamp(min=0, max=max_col).to(torch.int64)
-
-        bs = req_pool_indices.shape[0]
-        req_range = torch.arange(bs, device=req_pool_indices.device)
-        src_raw = output_indices[req_range, step].to(torch.int64)
-        dst_raw = track_indices.to(torch.int64)
-
-        invalid = (
-            (first_boundary > new_cl)
-            | (dst_raw < 0)
-            | (src_raw < 0)
-            | (src_raw == dst_raw)
-            | (step_raw < 0)
-        )
-        src = torch.where(invalid, sentinel, src_raw)
-        dst = torch.where(invalid, sentinel, dst_raw)
-        return src, dst
-
-    def _snapshot_mamba_checkpoints(
-        self,
-        accept_lengths: torch.Tensor,
-        bs: int,
-        num_extends: int,
-    ) -> None:
-        """Snapshot mamba states to checkpoint slots at page boundaries.
-
-        Called after ``_update_runtime_state`` on the execution stream so
-        ``valid_cache_lengths`` already reflects the accepted tokens.
-
-        Non-MTP (accept_length == 1):
-            The working slot holds the up-to-date state for the new
-            cache_length.  Pass the kernel page_size so it copies only
-            when the new length is page-aligned.
-
-        MTP (accept_length > 1):
-            cache_length may jump over a page boundary.  The intermediate
-            state lives in ``mamba_output_indices[req, step]``.  Boundary
-            detection and source-slot selection are done entirely on GPU
-            with -1 sentinels so the snapshot kernel skips invalid entries
-            via its bounds check — no GPU-to-CPU sync, preserving
-            overlap-schedule pipelining.
-        """
-        if self.runtime_states.mamba_pool is None or num_extends > 0:
-            return
-        if not self.input_buffers.has_mamba:
-            return
-
-        req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
-        track_indices = self.input_buffers.mamba_track_pool_indices_buf[:bs]
-        page_size = self.config.logical_page_size
-        dev = req_pool_indices.device
-        sentinel = self._sentinel_neg1
-
-        if self.drafter is not None:
-            # -- MTP path: find the output slot at the crossed boundary --
-            backend = getattr(
-                self.attn_backend, "linear_attn_backend", self.attn_backend
-            )
-            fm = getattr(backend, "forward_metadata", None)
-            if fm is None:
-                return
-            output_indices = fm.mamba_output_indices
-            if output_indices is None:
-                return
-
-            src, dst = self._compute_mtp_snapshot_indices(
-                self.runtime_states.valid_cache_lengths,
-                req_pool_indices,
-                accept_lengths[:bs].to(device=dev),
-                output_indices,
-                track_indices,
-                sentinel,
-                page_size,
-            )
-
-            self.runtime_states.snapshot_mamba_checkpoints(
-                src,
-                dst,
-                cache_lengths=None,
-                page_size=0,
-                num_valid=bs,
-            )
-        else:
-            # -- Non-MTP path: working slot IS the up-to-date state --
-            src_raw = self.input_buffers.mamba_pool_indices_buf[:bs].to(
-                device=dev, dtype=torch.int64
-            )
-            dst_raw = track_indices.to(device=dev, dtype=torch.int64)
-
-            invalid = (src_raw < 0) | (dst_raw < 0) | (src_raw == dst_raw)
-            src = torch.where(invalid, sentinel, src_raw)
-            dst = torch.where(invalid, sentinel, dst_raw)
-
-            cache_lengths = self.runtime_states.valid_cache_lengths[req_pool_indices]
-            self.runtime_states.snapshot_mamba_checkpoints(
-                src,
-                dst,
-                cache_lengths=cache_lengths,
-                page_size=page_size,
-                num_valid=bs,
-            )
-
-    def flush_mamba_draft_to_working_on_retract(self) -> None:
-        """Copy accepted draft mamba state -> working slot for all previous-batch requests.
-
-        Called from event_loop when retract WriteBackOps are detected.
-        Uses the previous decode iteration's input_buffers (still valid since
-        no new forward has overwritten them).
-        Runs on execution_stream to respect ordering with previous forward writes.
-        """
-        bs = self._prev_decode_bs
-        if bs <= 0:
-            return
-
-        backend = getattr(self.attn_backend, "linear_attn_backend", self.attn_backend)
-        pool = getattr(backend, "pool", None)
-        if pool is None:
-            return
-
-        sentinel = self._sentinel_neg1
-
-        with torch.cuda.stream(self.execution_stream):
-            req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
-            working = self.input_buffers.mamba_pool_indices_buf[:bs]
-
-            req = req_pool_indices.to(dtype=torch.int64)
-            current_input_size = int(pool.current_input_indices.shape[0])
-            in_bounds = (req >= 0) & (req < current_input_size)
-            safe_req = req.clamp(0, current_input_size - 1)
-            src_raw = pool.current_input_indices[safe_req].to(dtype=torch.int64)
-            src_raw = torch.where(in_bounds, src_raw, sentinel)
-            dst_raw = working.to(dtype=torch.int64)
-
-            invalid = (
-                (~in_bounds) | (src_raw < 0) | (dst_raw < 0) | (src_raw == dst_raw)
-            )
-            src = torch.where(invalid, sentinel, src_raw)
-            dst = torch.where(invalid, sentinel, dst_raw)
-
-            self.runtime_states.snapshot_mamba_checkpoints(
-                src,
-                dst,
-                cache_lengths=None,
-                page_size=0,
-                num_valid=bs,
-            )
-
     def execute_forward_op_with_log(
         self,
         forward_op,
@@ -1533,6 +1347,14 @@ class ModelExecutor:
                 )
 
     def update_block_table(self, forward_op) -> ModelExecutionResult:
+        # Group-aware backends consume CacheBatchMetadata directly. Without a
+        # full-history group there is no unambiguous table to mirror into the
+        # legacy single-table req_to_page view.
+        if (
+            self._cache_runtime_contract is not None
+            and self._full_history_group_id is None
+        ):
+            return
         # Update page tables on the default stream before switching to execution stream.
         # HostTodevice segment begins
         with nvtx_range("update_block_table", color="cyan"):
@@ -1540,270 +1362,96 @@ class ModelExecutor:
                 forward_op=forward_op,
                 device=self.device,
                 req_to_page=self.req_to_page,
+                history_group_id=self._full_history_group_id,
             )
 
-    def zero_flat_cache_pages(self, pages):
+    def zero_cache_pages(self, pages):
         """Clear newly owned pages and return a CUDA completion event when needed."""
         if not pages:
             return None
-        zero_new_pages = getattr(self.token_to_kv_pool, "zero_new_pages", None)
-        zero_pages = getattr(self.token_to_kv_pool, "zero_pages", None)
-        if isinstance(pages, Mapping) and callable(zero_new_pages):
-            sanitizer = zero_new_pages
-            sanitizer_arg = pages
-        elif callable(zero_pages):
-            if isinstance(pages, Mapping):
-                page_ids = sorted(
-                    {
-                        int(page_id)
-                        for group_pages in pages.values()
-                        for page_id in group_pages
-                    }
+
+        def sanitize(pool, pool_pages) -> bool:
+            zero_new_pages = getattr(pool, "zero_new_pages", None)
+            zero_pages = getattr(pool, "zero_pages", None)
+            if isinstance(pool_pages, Mapping) and callable(zero_new_pages):
+                zero_new_pages(pool_pages)
+                return True
+            if callable(zero_pages):
+                page_ids = (
+                    sorted(
+                        {
+                            int(page_id)
+                            for group_pages in pool_pages.values()
+                            for page_id in group_pages
+                        }
+                    )
+                    if isinstance(pool_pages, Mapping)
+                    else pool_pages
                 )
-            else:
-                page_ids = pages
-            sanitizer = zero_pages
-            sanitizer_arg = page_ids
-        else:
-            # A pool only needs sanitization if it aliases recurrent-state and
-            # KV bytes in one slab (it then declares this and implements
-            # a sanitizer). Pure-attention pools do not alias state, so reused
-            # pages are overwritten and their tails are never read past seq_len.
-            # Still fail loudly if a pool that *declares* it needs zeroing
-            # forgot to implement it.
-            if getattr(self.token_to_kv_pool, "flat_kv_requires_page_zeroing", False):
+                zero_pages(page_ids)
+                return True
+            if getattr(pool, "paged_cache_requires_page_zeroing", False):
                 raise RuntimeError(
-                    "scheduler emitted flat pages to zero but the active KV "
+                    "scheduler emitted pages to zero but an active KV "
                     "pool does not implement physical-page sanitization"
                 )
+            return False
+
+        with nvtx_range("zero_cache_pages", color="purple"):
+            sanitized = sanitize(self.token_to_kv_pool, pages)
+            draft_pool = getattr(self, "draft_token_to_kv_pool", None)
+            if draft_pool is not None and getattr(
+                draft_pool,
+                "paged_cache_requires_page_zeroing",
+                False,
+            ):
+                draft_pages = pages
+                if isinstance(pages, Mapping):
+                    draft_group_ids = {
+                        str(spec.group_id)
+                        for spec in draft_pool.paged_cache_group_specs
+                    }
+                    draft_pages = {
+                        group_id: page_ids
+                        for group_id, page_ids in pages.items()
+                        if group_id in draft_group_ids
+                    }
+                if draft_pages:
+                    sanitized = sanitize(draft_pool, draft_pages) or sanitized
+        if not sanitized:
             return None
-        with nvtx_range("zero_flat_cache_pages", color="purple"):
-            sanitizer(sanitizer_arg)
         if torch.device(self.device).type != "cuda":
             return None
         done = torch.cuda.Event()
         done.record(torch.cuda.current_stream(self.device))
         return done
 
-    def reset_remote_prefill_mamba_inputs(self, forward_op) -> None:
-        if self.runtime_states.mamba_pool is None:
-            return
-        if not hasattr(self.attn_backend, "reset_current_inputs"):
-            return
-
-        num_extends = forward_op.num_extends()
-        if num_extends <= 0:
-            return
-
-        mamba_indices = list(getattr(forward_op, "mamba_pool_indices", []))
-        if not mamba_indices:
-            return
-
-        req_pool_indices = list(forward_op.request_pool_indices[:num_extends])
-        pairs = [
-            (int(req_pool_idx), int(mamba_idx))
-            for req_pool_idx, mamba_idx in zip(
-                req_pool_indices, mamba_indices[:num_extends]
-            )
-            if int(mamba_idx) >= 0
-        ]
-        if not pairs:
-            return
-
-        req_pool_tensor = torch.tensor(
-            [req_pool_idx for req_pool_idx, _ in pairs],
-            dtype=torch.int64,
-            device="cpu",
-            pin_memory=True,
-        ).to(self.device, non_blocking=True)
-        mamba_tensor = torch.tensor(
-            [mamba_idx for _, mamba_idx in pairs],
-            dtype=torch.int64,
-            device="cpu",
-            pin_memory=True,
-        ).to(self.device, non_blocking=True)
-        self.attn_backend.reset_current_inputs(req_pool_tensor, mamba_tensor)
-
-    @staticmethod
-    def _contains_retracted_decode(forward_op) -> bool:
-        # FlatForwardOperation stores hist_token_lens for decode rows only;
-        # non-recovery rows use -1.
-        return any(
-            hist_token_len != -1
-            for hist_token_len in getattr(forward_op, "hist_token_lens", ())
-        )
-
     @nvtx_range("reset_valid_cache_length", color="orange")
     def reset_valid_cache_length(self, forward_op) -> None:
-
         num_extends = forward_op.num_extends()
-        is_prefill = num_extends > 0
-
-        # Retraction recovery: scheduler pushes -1 per decode op, overriding to
-        # a real length only on ScheduleDecodeFromRetractedEvent. Decode rows
-        # may follow prefill rows in a mixed batch, so this cannot be gated on
-        # pure-decode mode.
-        has_retract = self._contains_retracted_decode(forward_op)
-
-        # Pure decode without retraction has nothing to do — skip the
-        # cross-stream wait + stream-context entry entirely.
-        if not is_prefill and not has_retract:
+        if num_extends == 0:
             return
-
-        if has_retract:
-            hist_token_lens_tensor = torch.tensor(
-                forward_op.hist_token_lens,
-                dtype=torch.int32,
-                device="cpu",
-                pin_memory=True,
-            )
-            decode_pool_indices = torch.tensor(
-                forward_op.request_pool_indices[num_extends:],
-                dtype=torch.int64,
-                device="cpu",
-                pin_memory=True,
-            )
-        else:
-            hist_token_lens_tensor = None
-            decode_pool_indices = None
 
         self.execution_stream.wait_stream(torch.cuda.current_stream())
 
         with torch.cuda.stream(self.execution_stream):
-            if is_prefill:
-                extend_request_pool_indices = torch.tensor(
-                    forward_op.request_pool_indices[:num_extends],
-                    dtype=torch.int64,
-                    device="cpu",
-                    pin_memory=True,
-                ).to(self.device, non_blocking=True)
+            extend_request_pool_indices = torch.tensor(
+                forward_op.request_pool_indices[:num_extends],
+                dtype=torch.int64,
+                device="cpu",
+                pin_memory=True,
+            ).to(self.device, non_blocking=True)
 
-                extend_prefix_lens = torch.tensor(
-                    forward_op.extend_prefix_lens,
-                    dtype=torch.int32,
-                    device="cpu",
-                    pin_memory=True,
-                ).to(self.device, non_blocking=True)
+            extend_prefix_lens = torch.tensor(
+                forward_op.extend_prefix_lens,
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=True,
+            ).to(self.device, non_blocking=True)
 
-                self.runtime_states.reset_states(
-                    extend_request_pool_indices, extend_prefix_lens
-                )
-
-            if hist_token_lens_tensor is not None:
-                # Apply retraction recovery: override valid_cache_lengths with hist_token_lens
-                # where the scheduler has specified a non-(-1) value, so that out_cache_loc
-                # and position IDs are computed against the retracted KV length.
-                pool_idx_dev = decode_pool_indices.to(self.device, non_blocking=True)
-                hist_dev = hist_token_lens_tensor.to(self.device, non_blocking=True)
-
-                mask_1d = hist_dev != -1
-                vcl = self.runtime_states.valid_cache_lengths[pool_idx_dev]
-
-                self.runtime_states.valid_cache_lengths[pool_idx_dev] = torch.where(
-                    mask_1d, hist_dev, vcl
-                )
-
-    def set_layerwise_mamba_cow_done(
-        self, cow_by_src: dict[int, list[int]] | None
-    ) -> None:
-        self._layerwise_mamba_cow_done = (
-            {
-                int(src): {int(dst) for dst in dsts}
-                for src, dsts in cow_by_src.items()
-                if dsts
-            }
-            if cow_by_src
-            else None
-        )
-
-    def _skip_completed_layerwise_mamba_cow(
-        self, forward_op, bs: int
-    ) -> torch.Tensor | None:
-        cow_done = self._layerwise_mamba_cow_done
-        self._layerwise_mamba_cow_done = None
-        if not cow_done or not getattr(self.input_buffers, "has_mamba", False):
-            return None
-        cow_src_indices = getattr(forward_op, "mamba_cow_src_indices", None)
-        working_indices = getattr(forward_op, "mamba_pool_indices", None)
-        if cow_src_indices is None or working_indices is None:
-            return None
-
-        cow_src_indices = list(cow_src_indices)[:bs]
-        working_indices = list(working_indices)[:bs]
-        skipped_mask = [False] * bs
-        changed = False
-        for i, (cow_src, working) in enumerate(zip(cow_src_indices, working_indices)):
-            cow_src = int(cow_src)
-            working = int(working)
-            if working in cow_done.get(cow_src, set()):
-                cow_src_indices[i] = -1
-                skipped_mask[i] = True
-                changed = True
-        if not changed:
-            return None
-
-        (cow_src_indices_cpu,) = self.input_buffers._bulk_pinned((bs, torch.int32))
-        cow_src_indices_cpu.copy_(torch.as_tensor(cow_src_indices, dtype=torch.int32))
-        cow_src_buf = self.input_buffers.mamba_cow_src_indices_buf
-        cow_src_buf[:bs].copy_(cow_src_indices_cpu, non_blocking=True)
-        return torch.tensor(skipped_mask, dtype=torch.bool, device=cow_src_buf.device)
-
-    @staticmethod
-    def _mamba_retract_reset_mask(
-        mamba_cow_src: torch.Tensor,
-        bs: int,
-        skipped_layerwise_cow_mask: torch.Tensor | None,
-    ) -> torch.Tensor:
-        reset_mask = mamba_cow_src[:bs] >= 0
-        if skipped_layerwise_cow_mask is not None:
-            reset_mask = reset_mask | skipped_layerwise_cow_mask[:bs].to(
-                device=reset_mask.device, dtype=torch.bool
+            self.runtime_states.reset_states(
+                extend_request_pool_indices, extend_prefix_lens
             )
-        return reset_mask
-
-    def _reset_mamba_current_inputs(
-        self,
-        *,
-        num_extends: int,
-        bs: int,
-        has_retract: bool,
-        mamba_pool_indices: torch.Tensor,
-        mamba_cow_src: torch.Tensor,
-        skipped_layerwise_cow_mask: torch.Tensor | None,
-    ) -> None:
-        if not hasattr(self.attn_backend, "reset_current_inputs"):
-            return
-
-        if num_extends > 0:
-            self.attn_backend.reset_current_inputs(
-                self.input_buffers.req_pool_indices_buf[:num_extends],
-                mamba_pool_indices[:num_extends],
-            )
-
-        if not has_retract:
-            return
-
-        # FlatForwardOperation places prefill rows first. Restrict recovery to
-        # the decode suffix so a prefix-cache COW on a prefill row cannot be
-        # mistaken for a retracted decode.
-        decode_begin = num_extends
-        decode_count = bs - decode_begin
-        if decode_count <= 0:
-            return
-        skipped_decode_mask = (
-            skipped_layerwise_cow_mask[decode_begin:bs]
-            if skipped_layerwise_cow_mask is not None
-            else None
-        )
-        retract_mask = self._mamba_retract_reset_mask(
-            mamba_cow_src[decode_begin:bs],
-            decode_count,
-            skipped_decode_mask,
-        )
-        self.attn_backend.reset_current_inputs(
-            self.input_buffers.req_pool_indices_buf[decode_begin:bs][retract_mask],
-            mamba_pool_indices[decode_begin:bs][retract_mask],
-        )
 
     def execute_forward_op(
         self,
@@ -1832,8 +1480,6 @@ class ModelExecutor:
         graph_padded_bs = 0
 
         with nvtx_range("pre_fill_setup", color="orange"):
-            has_retract = self._contains_retracted_decode(forward_op)
-
             # Wait for previous iteration's runtime state updates
             # (future_input_map, valid_cache_lengths) on execution_stream to
             # complete before reading them.
@@ -1843,31 +1489,24 @@ class ModelExecutor:
             bs = len(forward_op.request_ids)
             # Outside the graph: in-graph sites only OR into the flag buffer.
             self.nan_guard.reset(bs)
-            flat_cache_metadata = None
-            if self._flat_runtime_contract is not None and bs > 0:
-                # FlatKV contract path: validate + pack the per-group tables
-                # once, bound to this forward operation. The MLA backend
-                # consumes the full-attention table through this bridge;
-                # req_to_page is never populated.
-                flat_cache_metadata = FlatCacheBatchMetadata.from_forward_op(
+            cache_metadata = None
+            if self._cache_runtime_contract is not None and bs > 0:
+                # Validate and pack the per-group tables once for this batch.
+                cache_metadata = CacheBatchMetadata.from_forward_op(
                     forward_op,
                     device=self.device,
-                    contract=self._flat_runtime_contract,
+                    contract=self._cache_runtime_contract,
                     num_requests=bs,
                 )
-                flat_block_tables = dict(
-                    flat_cache_metadata.tables(active_forward_op=forward_op)
-                )
+                block_tables = dict(cache_metadata.tables(active_forward_op=forward_op))
             else:
-                # Mirror the full group's flat table into req_to_page
-                # (flat+spec legacy consumers only).
-                flat_block_tables = flat_block_tables_from_forward_op(
+                block_tables = block_tables_from_forward_op(
                     forward_op,
                     device=self.device,
                     num_reqs=bs,
                 )
-                self._mirror_flat_full_table_into_req_to_page(
-                    forward_op, flat_block_tables
+                self._mirror_full_history_table_into_req_to_page(
+                    forward_op, block_tables
                 )
             decode_input_ids = self.input_buffers.fill_input_buffers(
                 forward_op=forward_op,
@@ -1878,9 +1517,6 @@ class ModelExecutor:
             if timing_enabled:
                 input_fill_done = time.perf_counter()
                 input_fill_ms = (input_fill_done - timing_start) * 1000.0
-            skipped_layerwise_cow_mask = self._skip_completed_layerwise_mamba_cow(
-                forward_op, bs
-            )
             mrope_start = time.perf_counter() if timing_enabled else 0.0
             self._active_positions_override = self._build_mrope_positions_override(
                 forward_op=forward_op,
@@ -1894,30 +1530,6 @@ class ModelExecutor:
 
             if num_extends <= 0:
                 self._prev_decode_bs = bs
-
-            if self.runtime_states.mamba_pool is not None and (
-                num_extends > 0 or has_retract
-            ):
-                mamba_pool_indices = self.input_buffers.mamba_pool_indices_buf[:bs]
-                mamba_cow_src = self.input_buffers.mamba_cow_src_indices_buf[:bs]
-                self.runtime_states.copy_mamba_states(
-                    mamba_pool_indices, mamba_cow_src, bs
-                )
-                if num_extends > 0:
-                    self.runtime_states.zero_mamba_states(
-                        mamba_pool_indices,
-                        mamba_cow_src,
-                        self.input_buffers.extend_prefix_lens_buf[:num_extends],
-                        num_extends,
-                    )
-                self._reset_mamba_current_inputs(
-                    num_extends=num_extends,
-                    bs=bs,
-                    has_retract=has_retract,
-                    mamba_pool_indices=mamba_pool_indices,
-                    mamba_cow_src=mamba_cow_src,
-                    skipped_layerwise_cow_mask=skipped_layerwise_cow_mask,
-                )
 
             grammar_completion = None
 
@@ -2025,38 +1637,6 @@ class ModelExecutor:
                     f"forward_step ext={num_extends} dec={bs - num_extends}",
                     color="blue",
                 ):
-                    mamba_kwargs = (
-                        {
-                            "mamba_pool_indices": self.input_buffers.mamba_pool_indices_buf[
-                                :bs
-                            ],
-                            "mamba_cow_src_indices": self.input_buffers.mamba_cow_src_indices_buf[
-                                :bs
-                            ],
-                            "mamba_branching_seqlens": self.input_buffers.mamba_branching_seqlens_buf[
-                                :bs
-                            ],
-                            "mamba_track_pool_indices": self.input_buffers.mamba_track_pool_indices_buf[
-                                :bs
-                            ],
-                        }
-                        if self.input_buffers.has_mamba
-                        else {}
-                    )
-                    paged_cache_block_tables = paged_cache_block_tables_from_forward_op(
-                        forward_op,
-                        device=self.device,
-                        num_reqs=bs,
-                    )
-                    # flat_block_tables computed once in pre_fill above.
-                    (
-                        paged_cache_block_table_base_offsets,
-                        _paged_cache_block_table_base_offset_max,
-                    ) = paged_cache_block_table_base_offsets_from_forward_op(
-                        forward_op,
-                        device=self.device,
-                        num_reqs=bs,
-                    )
                     self._log_dp_sampling_route(bs, ctx)
                     forward_step_start = 0.0
                     if timing_enabled:
@@ -2085,16 +1665,11 @@ class ModelExecutor:
                         extend_seq_lens_cpu=self.input_buffers.extend_seq_lens_cpu[
                             :num_extends
                         ],
-                        paged_cache_block_tables=paged_cache_block_tables,
-                        paged_cache_block_table_base_offsets=(
-                            paged_cache_block_table_base_offsets
+                        block_tables=block_tables,
+                        cache_metadata=cache_metadata,
+                        forward_batch=(
+                            forward_op if cache_metadata is not None else None
                         ),
-                        flat_block_tables=flat_block_tables,
-                        flat_cache_metadata=flat_cache_metadata,
-                        flat_cache_forward_op=(
-                            forward_op if flat_cache_metadata is not None else None
-                        ),
-                        **mamba_kwargs,
                     )
                     if timing_enabled:
                         forward_step_ms = (
@@ -2118,12 +1693,6 @@ class ModelExecutor:
                     input_lengths=self.input_buffers.input_lengths_buf[:bs],
                     num_extends=num_extends,
                 )
-                self._snapshot_mamba_checkpoints(
-                    output_lengths,
-                    bs,
-                    num_extends,
-                )
-
             with nvtx_range("output_d2h", color="green"):
                 output_d2h_start = time.perf_counter() if timing_enabled else 0.0
                 next_input_ids = None

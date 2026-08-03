@@ -30,8 +30,8 @@ import numpy as np
 import torch
 
 from tokenspeed.runtime.configs import paged_cache_spec
-from tokenspeed.runtime.configs.flat_cache_runtime import (
-    FlatPagedCacheRuntimeContract,
+from tokenspeed.runtime.configs.cache_runtime import (
+    PagedCacheRuntimeContract,
 )
 from tokenspeed.runtime.configs.lcm_memory_plan import LcmMemoryPlan
 from tokenspeed.runtime.layers.attention.kv_cache.lcm import LcmCachePool
@@ -64,7 +64,7 @@ class LcmMHATokenToKVPool(MHATokenToKVPool):
         )
         self._state_buffers_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self.lcm_pool: LcmCachePool | None = None
-        self.flat_kv_requires_page_zeroing = True
+        self.paged_cache_requires_page_zeroing = True
 
         if len(self.layer_cache_group_ids) != kwargs["layer_num"]:
             raise ValueError("LCM cache group ids must cover every model layer")
@@ -78,7 +78,7 @@ class LcmMHATokenToKVPool(MHATokenToKVPool):
             if os.environ.get("INKLING_FP8_SCONV", "0") == "0"
             else torch.float8_e5m2
         )
-        self.runtime_contract = FlatPagedCacheRuntimeContract(
+        self.runtime_contract = PagedCacheRuntimeContract(
             block_size=self.page_size,
             num_lcm_blocks=memory_plan.num_lcm_blocks,
             token_capacity=self.size,
@@ -116,7 +116,7 @@ class LcmMHATokenToKVPool(MHATokenToKVPool):
             max_context_len=max_context_len,
         )
         if published is None:
-            raise RuntimeError("MHA LCM cache requires a flat scheduler build")
+            raise RuntimeError("MHA LCM cache requires cache-group scheduling")
         specs, counts = published
         if self._pd_disaggregation_enabled:
             specs = [
@@ -209,9 +209,9 @@ class LcmMHATokenToKVPool(MHATokenToKVPool):
     def supports_disaggregation(self) -> bool:
         return self._pd_disaggregation_enabled
 
-    def get_flatkv_pd_contract(self):
+    def get_pd_cache_contract(self):
         if not self.supports_disaggregation or self.lcm_pool is None:
-            raise RuntimeError("FlatKV PD requires an enabled MHA LCM pool")
+            raise RuntimeError("Paged cache PD requires an enabled MHA LCM pool")
         return self.lcm_pool.pd_contract(self.paged_cache_group_specs)
 
     def get_lcm_field(self, field_id: str, dtype: torch.dtype) -> torch.Tensor:
@@ -252,7 +252,7 @@ class LcmMHATokenToKVPool(MHATokenToKVPool):
         self.lcm_pool.backing.zero_()
 
     def get_contiguous_buf_infos(self):
-        raise RuntimeError("MHA LCM transfer uses get_flatkv_pd_contract()")
+        raise RuntimeError("MHA LCM transfer uses get_pd_cache_contract()")
 
 
 class LcmMHATokenToKVPoolMXFP8(
