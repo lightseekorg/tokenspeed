@@ -36,10 +36,9 @@ def _is_gfx950() -> bool:
 
 
 if not _is_gfx950():
-    pytest.skip("MXFP4 SiTU Triton tests require gfx950", allow_module_level=True)
+    pytest.skip("MXFP4 SiTU Gluon tests require gfx950", allow_module_level=True)
 
 import tokenspeed_kernel  # noqa: E402
-from tokenspeed_kernel.ops.moe.triton.mxfp4 import _routing_from_topk  # noqa: E402
 
 
 def _make_mxfp4_module(
@@ -72,91 +71,9 @@ def _make_mxfp4_module(
     return module, raw
 
 
-@pytest.mark.parametrize(
-    "num_tokens,num_experts,top_k,latent_size,intermediate_size",
-    [
-        pytest.param(4, 4, 2, 256, 256, id="tiny-top2"),
-        pytest.param(1, 16, 16, 3584, 3072, id="latent-moe-decode-top16"),
-        pytest.param(17, 2, 1, 3584, 3072, id="latent-moe-prefill-shape"),
-    ],
-)
-def test_triton_a16w4_situ_matches_reference_gfx950(
-    num_tokens: int,
-    num_experts: int,
-    top_k: int,
-    latent_size: int,
-    intermediate_size: int,
-) -> None:
-    generator = torch.Generator(device="cuda").manual_seed(123)
-    module, raw = _make_mxfp4_module(
-        num_experts=num_experts,
-        latent_size=latent_size,
-        intermediate_size=intermediate_size,
-        top_k=top_k,
-        generator=generator,
-    )
-    hidden_states = (
-        torch.randn(
-            num_tokens,
-            latent_size,
-            device="cuda",
-            dtype=torch.bfloat16,
-            generator=generator,
-        )
-        * 0.1
-    )
-    topk_weights, topk_ids = make_round_robin_topk(num_tokens, num_experts, top_k)
-    router_logits = torch.zeros(
-        num_tokens, num_experts, device="cuda", dtype=torch.float32
-    )
-
-    plan = tokenspeed_kernel.moe_plan(
-        "mxfp4",
-        input_dtype=torch.bfloat16,
-        activation="situ",
-        routing_mode="precomputed_topk",
-        internal_activation_dtype="input",
-        solution="triton",
-    )
-    assert plan["apply_kernel_name"] == "triton_mxfp4_precomputed_moe_apply"
-    assert plan["activation"] == "situ"
-    assert plan["internal_activation_dtype"] == "input"
-    assert not hasattr(module, "quant_config")
-    tokenspeed_kernel.moe_process_weights(plan, module)
-    assert not hasattr(module, "w13_act_scale")
-    assert not hasattr(module, "w2_act_scale")
-    actual = tokenspeed_kernel.moe_apply(
-        plan,
-        hidden_states,
-        module,
-        router_logits,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-    )
-    torch.cuda.synchronize()
-
-    expected = a16w4_mxfp4_moe_reference(
-        hidden_states,
-        raw["w13_weight"],
-        raw["w13_scale"],
-        raw["w2_weight"],
-        raw["w2_scale"],
-        topk_ids,
-        topk_weights,
-        situ_beta=4.0,
-        situ_linear_beta=25.0,
-    )
-
-    assert actual.shape == (num_tokens, latent_size)
-    assert actual.dtype == torch.bfloat16
-    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
-
-
 @pytest.mark.parametrize("num_tokens", [1, 2, 4, 8])
-@pytest.mark.parametrize("solution", ["triton", "gluon"])
 def test_ep_decode_matches_kimi_k3_shape_gfx950(
     num_tokens: int,
-    solution: str,
 ) -> None:
     generator = torch.Generator(device="cuda").manual_seed(20260720 + num_tokens)
     num_local_experts = 2
@@ -210,14 +127,11 @@ def test_ep_decode_matches_kimi_k3_shape_gfx950(
         ep_size=ep_size,
         ispp=intermediate_size,
         internal_activation_dtype="input",
-        solution=solution,
+        solution="gluon",
     )
-    expected_kernel = (
-        "triton_mxfp4_ep_precomputed_moe_apply"
-        if solution == "triton"
-        else "gluon_mxfp4_a16w4_situ_ep_precomputed_moe_apply"
+    assert (
+        plan["apply_kernel_name"] == "gluon_mxfp4_a16w4_situ_ep_precomputed_moe_apply"
     )
-    assert plan["apply_kernel_name"] == expected_kernel
     tokenspeed_kernel.moe_process_weights(plan, module)
     actual = tokenspeed_kernel.moe_apply(
         plan,
@@ -253,10 +167,8 @@ def test_ep_decode_matches_kimi_k3_shape_gfx950(
 
 
 @pytest.mark.parametrize("num_tokens", [1, 2, 4, 8])
-@pytest.mark.parametrize("solution", ["triton", "gluon"])
 def test_ep_decode_all_remote_routes_return_zero_gfx950(
     num_tokens: int,
-    solution: str,
 ) -> None:
     generator = torch.Generator(device="cuda").manual_seed(20260722)
     module, _ = _make_mxfp4_module(
@@ -288,7 +200,7 @@ def test_ep_decode_all_remote_routes_return_zero_gfx950(
         ep_size=8,
         ispp=512,
         internal_activation_dtype="input",
-        solution=solution,
+        solution="gluon",
     )
     tokenspeed_kernel.moe_process_weights(plan, module)
     actual = tokenspeed_kernel.moe_apply(
@@ -481,19 +393,14 @@ def test_gluon_grouped_device_align_localizes_global_ep_routes_gfx950() -> None:
     torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
 
 
-@pytest.mark.parametrize(
-    ("ep_size", "solution"),
-    [(2, "triton"), (8, "triton"), (8, "gluon")],
-)
 @pytest.mark.parametrize("top_k", [1, 4])
 def test_mxfp4_situ_virtual_ep_sum_matches_global_reference_gfx950(
-    ep_size: int,
-    solution: str,
     top_k: int,
 ) -> None:
     generator = torch.Generator(device="cuda").manual_seed(321)
     num_experts = 8
     num_tokens = 8
+    ep_size = 8
     _, raw = _make_mxfp4_module(
         num_experts=num_experts,
         latent_size=512,
@@ -523,7 +430,7 @@ def test_mxfp4_situ_virtual_ep_sum_matches_global_reference_gfx950(
         ep_size=ep_size,
         ispp=512,
         internal_activation_dtype="input",
-        solution=solution,
+        solution="gluon",
     )
 
     partials = []
@@ -562,34 +469,8 @@ def test_mxfp4_situ_virtual_ep_sum_matches_global_reference_gfx950(
     torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
 
 
-def test_triton_ep_route_compacts_remote_slots_behind_local_prefix_gfx950() -> None:
-    topk_ids = torch.tensor(
-        [[-1, 1, -1, 0], [1, -1, 0, -1]],
-        dtype=torch.int32,
-        device="cuda",
-    )
-    topk_weights = torch.arange(1, 9, dtype=torch.float32, device="cuda").reshape_as(
-        topk_ids
-    )
-    metadata, gather, scatter, gates = _routing_from_topk(
-        topk_weights,
-        topk_ids,
-        num_experts=2,
-        compact_invalid=True,
-    )
-    torch.cuda.synchronize()
-
-    assert metadata.slice_sizes.cpu().tolist() == [2, 2]
-    assert scatter[:4].cpu().tolist() == [3, 6, 1, 4]
-    assert gather[:4].cpu().tolist() == [0, 1, 0, 1]
-    assert gates[:4].cpu().tolist() == [4.0, 7.0, 2.0, 5.0]
-    assert torch.count_nonzero(gates[4:]).item() == 0
-
-
-@pytest.mark.parametrize("solution", ["triton", "gluon"])
 @pytest.mark.parametrize("num_tokens", [1, 2, 4, 8])
 def test_mxfp4_situ_ep_paths_are_cuda_graph_capturable_gfx950(
-    solution: str,
     num_tokens: int,
 ) -> None:
     generator = torch.Generator(device="cuda").manual_seed(20260718)
@@ -601,7 +482,7 @@ def test_mxfp4_situ_ep_paths_are_cuda_graph_capturable_gfx950(
         top_k=top_k,
         generator=generator,
     )
-    ep_size = 8 if solution == "gluon" else 2
+    ep_size = 8
     module = _make_local_ep_module(
         raw,
         ep_rank=1,
@@ -624,7 +505,7 @@ def test_mxfp4_situ_ep_paths_are_cuda_graph_capturable_gfx950(
         ep_size=ep_size,
         ispp=512,
         internal_activation_dtype="input",
-        solution=solution,
+        solution="gluon",
     )
     tokenspeed_kernel.moe_process_weights(plan, module)
 

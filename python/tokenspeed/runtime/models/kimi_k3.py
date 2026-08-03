@@ -32,7 +32,7 @@ Implemented (full text path):
   ``MambaAttnBackend`` KDA branch.
 * ``KimiLinearMLP`` — dense / shared-expert MLP with the SiTU activation.
 * ``KimiLinearMoE`` — sigmoid/noaux_tc router + Latent MoE + flashinfer's
-  TRT-LLM fused SiTU (or an explicit Triton unfused fallback) + shared experts.
+  TRT-LLM fused SiTU + shared experts.
 * ``KimiLinearDecoderLayer`` + ``KimiLinearModel`` — the AttnRes block-residual data
   flow.
 * ``KimiLinearForCausalLM.load_weights`` — stacked / fused-qkv-a / expert
@@ -891,8 +891,7 @@ class KimiLinearMoE(nn.Module):
       ``routed_expert_up_proj``/``routed_expert_norm`` project back (7168).
     * **Routed experts** (MXFP4): AMD uses the native ``MoELayer`` plan wrapped
       by ``LatentMoELayer`` so Triton/Gluon owns EP8 dispatch and SiTU. Non-AMD
-      platforms use flashinfer's TRTLLM-Gen SiTU MoE, with an explicit
-      two-GEMM Triton fallback.
+      platforms use flashinfer's TRTLLM-Gen SiTU MoE.
     * **Shared experts**: a plain ``KimiLinearMLP`` (SiTU).
     """
 
@@ -932,47 +931,38 @@ class KimiLinearMoE(nn.Module):
             enforce_eager=bool(global_server_args_dict["enforce_eager"]),
         )
         # AUTO intentionally requests the flashinfer-backed SiTU plan when it was
-        # registered at import time. Without that runtime, users must select the
-        # explicit Triton fallback; AUTO cannot override MoELayer per model.
+        # registered at import time; AUTO cannot override MoELayer per model.
         self.use_trtllm_situ_moe = self.execution_plan.use_trtllm
         if not self.execution_plan.use_native:
-            if not self.use_trtllm_situ_moe and not moe_backend.is_triton():
-                raise ValueError(
-                    "Kimi-K3 MXFP4 SiTU MoE supports only the flashinfer-backed "
-                    "flashinfer_trtllm backend or the Triton unfused fallback, "
-                    f"got {moe_backend.value!r}"
+            if not self.use_trtllm_situ_moe:
+                raise RuntimeError(
+                    "Kimi-K3 MXFP4 SiTU MoE requires the native backend or the "
+                    "FlashInfer TRT-LLM backend; no portable SiTU Triton fallback "
+                    f"exists (selected MoE backend: {moe_backend.value!r})."
                 )
-            if self.use_trtllm_situ_moe:
-                # Fail here with the actual reason instead of letting MoELayer's
-                # kernel selection miss the (never-registered) SiTU kernel.
-                reason = situ_moe_unavailable_reason()
-                if reason is not None:
-                    raise ValueError(
-                        "Kimi-K3's fused SiTU MoE requires flashinfer > "
-                        f"0.6.15 with native SiTU, unavailable: {reason}. "
-                        "Upgrade flashinfer or select the unfused fallback "
-                        "with --moe-backend triton."
-                    )
-                # Out-of-box tactics: seed the autotuner from the in-tree
-                # swept table for this GPU/flashinfer combo, if one ships
-                # (flashinfer's own heuristic mispicks MoE tactics at prefill
-                # batch sizes). A lookup miss leaves the startup autotune
-                # window to tune these shapes.
-                load_packaged_flashinfer_tuning_cache(
-                    "kimi-k3", mapping.moe.ep_size, mapping.moe.tp_size
+            # Fail here with the actual reason instead of letting MoELayer's
+            # kernel selection miss the (never-registered) SiTU kernel.
+            reason = situ_moe_unavailable_reason()
+            if reason is not None:
+                raise RuntimeError(
+                    "Kimi-K3's fused SiTU MoE requires flashinfer > 0.6.15 "
+                    f"with native SiTU, unavailable: {reason}. Upgrade "
+                    "flashinfer; no portable SiTU Triton fallback exists."
                 )
+            # Out-of-box tactics: seed the autotuner from the in-tree
+            # swept table for this GPU/flashinfer combo, if one ships
+            # (flashinfer's own heuristic mispicks MoE tactics at prefill
+            # batch sizes). A lookup miss leaves the startup autotune
+            # window to tune these shapes.
+            load_packaged_flashinfer_tuning_cache(
+                "kimi-k3", mapping.moe.ep_size, mapping.moe.tp_size
+            )
             if mapping.moe.has_tp_ep and mapping.attn.tp_size != mapping.moe.tp_ep_size:
                 raise ValueError(
                     "Kimi-K3's SiTU MoE currently requires a "
                     "replicated-token all-reduce topology: attn TP size must equal "
                     "MoE TP*EP size. Attn-DP/MoE-EP RSAG is not supported."
                 )
-            if not self.use_trtllm_situ_moe and mapping.moe.ep_size > 1:
-                raise ValueError(
-                    "Kimi-K3's Triton SiTU fallback does not support expert "
-                    "parallelism; use MoE TP or the flashinfer TRT-LLM backend"
-                )
-
         self.gate = KimiLinearMoEGate(config.hidden_size, config.num_experts)
 
         self.topk = TopK(
@@ -992,9 +982,7 @@ class KimiLinearMoE(nn.Module):
         )
 
         # AMD native and flashinfer's TRT-LLM SiTU MoE both consume K3's
-        # precomputed sigmoid/noaux_tc TopK. Explicit Triton keeps the original
-        # two-GEMM fallback, where this layer stores/processes MXFP4 weights.
-        use_precomputed_topk = self.execution_plan.use_precomputed_topk
+        # precomputed sigmoid/noaux_tc TopK.
         self.experts = MoELayer(
             top_k=self.top_k,
             num_experts=self.num_experts,
@@ -1007,11 +995,9 @@ class KimiLinearMoE(nn.Module):
             tp_size=mapping.moe.tp_size,
             ep_rank=mapping.moe.ep_rank,
             ep_size=mapping.moe.ep_size,
-            activation="situ" if use_precomputed_topk else "silu",
-            activation_situ_beta=(situ_beta if use_precomputed_topk else None),
-            activation_situ_linear_beta=(
-                situ_linear_beta if use_precomputed_topk else None
-            ),
+            activation="situ",
+            activation_situ_beta=situ_beta,
+            activation_situ_linear_beta=situ_linear_beta,
             routing_config={
                 "n_group": config.num_expert_group,
                 "topk_group": config.topk_group,
@@ -1022,19 +1008,16 @@ class KimiLinearMoE(nn.Module):
                 "activation_situ_beta": situ_beta,
                 "activation_situ_linear_beta": situ_linear_beta,
             },
-            routing_mode=("precomputed_topk" if use_precomputed_topk else None),
-            # The fused SiTU path always runs w4a8 (flashinfer's SiTU cubins
-            # are MxFP4 x MxFP8 only); the Triton fallback stays bf16.
-            internal_activation_dtype_override=(
-                "fp8" if use_precomputed_topk else None
-            ),
+            routing_mode="precomputed_topk",
+            # The SiTU paths run w4a8; flashinfer's SiTU cubins are MxFP4 x
+            # MxFP8 only.
+            internal_activation_dtype_override="fp8",
         )
-        if use_precomputed_topk and self.experts.support_routing:
+        if self.experts.support_routing:
             raise RuntimeError(
                 "Kimi-K3 requires a precomputed-TopK SiTU MoE kernel; the "
                 "selected backend unexpectedly performs internal routing"
             )
-        self.act_fn = SituAndMul(beta=situ_beta, linear_beta=situ_linear_beta)
 
         self.routed_expert_down_proj = Kimi3LatentProjection(
             config.hidden_size,
@@ -1114,44 +1097,24 @@ class KimiLinearMoE(nn.Module):
         max_num_tokens_per_gpu: int,
         skip_reduce: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run flashinfer's fused TRT-LLM SiTU or the Triton fallback."""
-        if self.use_trtllm_situ_moe:
-            out = self.experts(
-                hidden_states=routed_in,
-                topk_output=topk_output,
-                num_global_tokens=num_global_tokens,
-                max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+        """Run flashinfer's fused TRT-LLM SiTU MoE."""
+        if not self.use_trtllm_situ_moe:
+            raise RuntimeError(
+                "Kimi-K3 has no portable SiTU Triton fallback; use the native "
+                "or FlashInfer TRT-LLM SiTU MoE path."
             )
-            # Each TP rank owns an intermediate shard; each EP rank owns a
-            # contiguous expert shard. The routed kernel returns that rank's
-            # partial contribution, which must be combined before the replicated
-            # norm/up projection (skip_reduce: caller's fused AR covers it).
-            if self.mapping.moe.has_tp_ep and not skip_reduce:
-                out = all_reduce(out, self.mapping.moe.tp_ep_group)
-        else:
-            from tokenspeed_kernel.ops.moe import moe_unfused_apply
-
-            if not hasattr(self.experts, "w13_weight_triton_tensor"):
-                raise RuntimeError(
-                    "Kimi-K3's Triton SiTU fallback needs the matmul_ogs "
-                    "weight representation. Run with `--moe-backend triton`."
-                )
-
-            out = moe_unfused_apply(
-                routed_in,
-                self.experts.w13_weight_triton_tensor,
-                self.experts.w13_precision_config,
-                self.experts.w2_weight_triton_tensor,
-                self.experts.w2_precision_config,
-                topk_output.topk_weights,
-                topk_output.topk_ids,
-                self.num_experts,
-                self.top_k,
-                self.act_fn,
-            )
-            # The Triton grouped GEMM returns a partial TP sum.
-            if self.mapping.moe.tp_size > 1:
-                out = all_reduce(out, self.mapping.moe.tp_group)
+        out = self.experts(
+            hidden_states=routed_in,
+            topk_output=topk_output,
+            num_global_tokens=num_global_tokens,
+            max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+        )
+        # Each TP rank owns an intermediate shard; each EP rank owns a
+        # contiguous expert shard. The routed kernel returns that rank's
+        # partial contribution, which must be combined before the replicated
+        # norm/up projection (skip_reduce: caller's fused AR covers it).
+        if self.mapping.moe.has_tp_ep and not skip_reduce:
+            out = all_reduce(out, self.mapping.moe.tp_ep_group)
         return out
 
     def forward(

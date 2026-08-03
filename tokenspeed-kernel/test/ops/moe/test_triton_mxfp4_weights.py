@@ -69,16 +69,18 @@ def _make_moe_module(
     return w
 
 
-def test_process_weights_releases_originals_and_scales() -> None:
-    """Originals (weights AND scales) must be freed on every platform once
-    the swizzled copies live in the triton tensors / precision configs."""
+def test_process_weights_preserves_linear_values_and_scales() -> None:
     w = _make_moe_module()
+    originals = {
+        name: getattr(w, name)
+        for name in (
+            "w13_weight",
+            "w13_weight_scale",
+            "w2_weight",
+            "w2_weight_scale",
+        )
+    }
     triton_mxfp4_moe_weights({}, w)
 
-    assert w.w13_weight_triton_tensor is not None
-    assert w.w2_weight_triton_tensor is not None
-    assert w.w13_precision_config.b_mx_scale is not None
-    assert w.w2_precision_config.b_mx_scale is not None
-
-    for name in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"):
-        assert getattr(w, name, None) is None, f"{name} still resident"
+    for name, original in originals.items():
+        assert getattr(w, name) is original

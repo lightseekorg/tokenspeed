@@ -215,31 +215,8 @@ def test_msa_config_kv_cache_dtype_guards() -> None:
 
 
 def test_minimax_m3_tp4_meta_layout_and_loader(monkeypatch: pytest.MonkeyPatch) -> None:
-    model = _build_model(monkeypatch, quant_config=_mxfp8_config())
-
-    assert isinstance(model.model.layers[0].mlp, MiniMaxM3MLP)
-    assert isinstance(model.model.layers[3].mlp, MiniMaxM3SparseMoeBlock)
-    experts = model.model.layers[3].mlp.experts
-    assert experts.w13_weight.shape == (8, 64, 128)
-    assert experts.w13_weight_scale_inv.dtype == torch.uint8
-
-    loaded = model.load_weights(
-        [
-            (
-                "language_model.model.layers.3.block_sparse_moe."
-                "experts.0.w1.weight_scale_inv",
-                torch.empty(128, 4, dtype=torch.uint8, device="meta"),
-            ),
-            (
-                "language_model.model.layers.3.self_attn.index_q_norm.weight",
-                torch.empty(128, dtype=torch.bfloat16, device="meta"),
-            ),
-        ]
-    )
-    assert loaded == {
-        "model.layers.3.mlp.experts.w13_weight_scale_inv",
-        "model.layers.3.self_attn.indexer.q_norm.weight",
-    }
+    with pytest.raises(RuntimeError, match="FP8 MoE expert weights"):
+        _build_model(monkeypatch, quant_config=_mxfp8_config())
 
 
 def _mixed_precision_config() -> "ModelOptMixedConfig":

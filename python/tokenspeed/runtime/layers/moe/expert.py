@@ -183,11 +183,10 @@ class MoELayer(torch.nn.Module):
             )
         ):
             self._quant_kind = quant_config.moe_weight_dtype(self.prefix)
-
-        fp8_scale_block_shape = None
-        internal_activation_dtype = "input"
         if self._quant_kind == "fp8":
-            fp8_scale_block_shape = tuple(self.quant_config.weight_block_size)
+            raise RuntimeError("FP8 MoE expert weights are no longer supported")
+
+        internal_activation_dtype = "input"
         if self._quant_kind == "mxfp4":
             if self.quant_config.is_w4a8_fp8:
                 internal_activation_dtype = "fp8"
@@ -230,7 +229,6 @@ class MoELayer(torch.nn.Module):
             a2a_backend=self._spec.a2a_backend,
             ep_size=self.ep_size,
             ispp=self.intermediate_size // self.tp_size,
-            fp8_scale_block_shape=fp8_scale_block_shape,
             internal_activation_dtype=internal_activation_dtype,
             with_bias=with_bias,
             deepep_group=deepep_group,
