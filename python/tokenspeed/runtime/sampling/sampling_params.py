@@ -23,6 +23,8 @@
 import zlib
 from typing import Any
 
+import msgspec
+
 _SAMPLING_EPS = 1e-6
 
 # Sentinel for "top_k is disabled" (sample from whole vocab). We rewrite
@@ -37,79 +39,75 @@ _TOP_K_DISABLED = 1 << 30
 _TOP_K_FUSED_MAX = 128
 
 
-class SamplingParams:
+class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     """
     The sampling parameters.
+
+    A ``msgspec.Struct`` so it rides engine IPC as a compact positional
+    msgpack array nested inside the tokenized request. Field ORDER is the
+    wire contract — append new fields at the end, never reorder.
+
+    ``__post_init__`` (run on both construction and msgpack decode) applies
+    the API-input normalization the old ``__init__`` performed; the
+    ``is_normalized`` guard keeps a decode from re-deriving fields that
+    ``normalize()`` already resolved on the sending process.
 
     See docs/backend/sampling_params.md or
     https://docs.tokenspeed.ai/backend/sampling_params.html
     for the documentation.
     """
 
-    def __init__(
-        self,
-        max_new_tokens: int | None = None,
-        stop: str | list[str] | None = None,
-        stop_token_ids: list[int] | None = None,
-        temperature: float = 1.0,
-        top_p: float = 1.0,
-        top_k: int = -1,
-        min_p: float = 0.0,
-        frequency_penalty: float = 0.0,
-        presence_penalty: float = 0.0,
-        repetition_penalty: float = 1.0,
-        min_new_tokens: int = 0,
-        json_schema: str | None = None,
-        regex: str | None = None,
-        ebnf: str | None = None,
-        structural_tag: str | None = None,
-        ignore_eos: bool = False,
-        skip_special_tokens: bool = True,
-        spaces_between_special_tokens: bool = True,
-        no_stop_trim: bool = False,
-        thinking_budget: int | None = None,
-        custom_params: dict[str, Any] | None = None,
-        stream_interval: int | None = None,
-        logit_bias: dict[str, float] | None = None,
-        seed: int | None = None,
-        # vLLM-style output logprobs. None = off; 0 = the sampled (generated)
-        # token's logprob at each output position. Other values are rejected by
-        # verify().
-        logprobs: int | None = None,
-        # OpenAI-compat: `n` is a request-level fanout (number of choices)
-        # that the serving layer forwards on every sampling_params dict.
-        # TokenSpeed does not multiplex a single request into n completions,
-        # so accept and ignore.
-        n: int = 1,
-    ) -> None:
-        self.max_new_tokens = max_new_tokens
-        self.stop_strs = stop
-        if stop_token_ids:
-            self.stop_token_ids = set(stop_token_ids)
+    # --- API parameters (set by callers) ---
+    max_new_tokens: int | None = None
+    # API input alias: copied to ``stop_strs`` by ``__post_init__``.
+    stop: str | list[str] | None = None
+    stop_token_ids: set[int] | None = None
+    temperature: float = 1.0
+    top_p: float = 1.0
+    top_k: int = -1
+    min_p: float = 0.0
+    frequency_penalty: float = 0.0
+    presence_penalty: float = 0.0
+    repetition_penalty: float = 1.0
+    min_new_tokens: int = 0
+    json_schema: str | None = None
+    regex: str | None = None
+    ebnf: str | None = None
+    structural_tag: str | None = None
+    ignore_eos: bool = False
+    skip_special_tokens: bool = True
+    spaces_between_special_tokens: bool = True
+    no_stop_trim: bool = False
+    thinking_budget: int | None = None
+    custom_params: dict[str, Any] | None = None
+    stream_interval: int | None = None
+    logit_bias: dict[str, float] | None = None
+    seed: int | None = None
+    # Output logprobs. None = off; 0 = the sampled (generated) token's
+    # logprob at each output position. Other values are rejected by verify().
+    logprobs: int | None = None
+    # OpenAI-compat: `n` is a request-level fanout (number of choices)
+    # that the serving layer forwards on every sampling_params dict.
+    # TokenSpeed does not multiplex a single request into n completions;
+    # the value is stored (transports validate n == 1) but never acted on.
+    n: int = 1
+
+    # --- Internal fields (populated by __post_init__ / normalize()) ---
+    stop_strs: str | list[str] | None = None  # from ``stop``
+    stop_str_max_len: int = 0  # set by normalize()
+    is_normalized: bool = False  # set by normalize()
+
+    def __post_init__(self) -> None:
+        # Runs after msgpack decode too; once normalize() resolved the
+        # derived fields on the sender, do not re-derive them here.
+        if self.is_normalized:
+            return
+
+        self.stop_strs = self.stop
+        if self.stop_token_ids:
+            self.stop_token_ids = set(self.stop_token_ids)
         else:
             self.stop_token_ids = None
-        self.temperature = temperature
-        self.top_p = top_p
-        self.top_k = top_k
-        self.min_p = min_p
-        self.frequency_penalty = frequency_penalty
-        self.presence_penalty = presence_penalty
-        self.repetition_penalty = repetition_penalty
-        self.min_new_tokens = min_new_tokens
-        self.regex = regex
-        self.json_schema = json_schema
-        self.ebnf = ebnf
-        self.structural_tag = structural_tag
-        self.ignore_eos = ignore_eos
-        self.skip_special_tokens = skip_special_tokens
-        self.spaces_between_special_tokens = spaces_between_special_tokens
-        self.no_stop_trim = no_stop_trim
-        self.custom_params = custom_params
-        self.thinking_budget = thinking_budget
-        self.stream_interval = stream_interval
-        self.logit_bias = logit_bias
-        self.seed = seed
-        self.logprobs = logprobs
 
         # Process some special cases
         if self.temperature < _SAMPLING_EPS:
@@ -200,7 +198,7 @@ class SamplingParams:
         out: set[str] = set()
         if abs(self.temperature - 1.0) > _SAMPLING_EPS:
             out.add("temperature")
-        # top_k=_TOP_K_DISABLED and top_k=1 (greedy short-circuit from __init__) are neutral.
+        # top_k=_TOP_K_DISABLED and top_k=1 (greedy short-circuit from __post_init__) are neutral.
         if self.top_k != _TOP_K_DISABLED and self.top_k != 1:
             out.add("top_k")
         if self.top_p < 1.0:
@@ -241,3 +239,4 @@ class SamplingParams:
                 else:
                     stop_str_max_len = max(stop_str_max_len, len(stop_str))
             self.stop_str_max_len = stop_str_max_len
+        self.is_normalized = True

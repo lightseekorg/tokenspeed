@@ -67,6 +67,9 @@ if fp8_gemm_nt is not None:
         traits={
             "n_align_64": frozenset({True}),
             "k_align_128": frozenset({True}),
+            # On Blackwell, the installed 1d1d kernel consumes transformed
+            # UE8M0 scales and is reached through an explicit runtime override.
+            "block_scale_layout": frozenset({"canonical"}),
         },
         priority=Priority.SPECIALIZED + 2,
         tags={"throughput"},

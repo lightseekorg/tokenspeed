@@ -107,7 +107,9 @@ def test_masked_swiglu_writes_packed_mn_major_scales_for_deep_gemm():
     )
     masked_m = torch.tensor([17, 5, 0], dtype=torch.int32, device="cuda")
 
-    out, packed_scales = fused_swiglu_fp8_ue8m0_masked_packed(gateup, masked_m)
+    out, packed_scales = fused_swiglu_fp8_ue8m0_masked_packed(
+        gateup, masked_m, expected_m=1
+    )
 
     num_groups = ispp // _BLOCK
     scales = _unpack_ue8m0(packed_scales, num_groups)
@@ -139,6 +141,27 @@ def test_masked_swiglu_writes_packed_mn_major_scales_for_deep_gemm():
             rtol=6e-2,
             atol=6e-2 * reference[expert, :valid].abs().max(),
         )
+
+
+def test_sparse_and_full_launch_mappings_match_exactly():
+    torch.manual_seed(1)
+    experts, capacity, ispp = 3, 33, 640
+    gateup = torch.randn(
+        experts, capacity, 2 * ispp, device="cuda", dtype=torch.bfloat16
+    )
+    masked_m = torch.tensor([33, 7, 0], dtype=torch.int32, device="cuda")
+
+    sparse_out, sparse_scales = fused_swiglu_fp8_ue8m0_masked_packed(
+        gateup, masked_m, expected_m=1
+    )
+    full_out, full_scales = fused_swiglu_fp8_ue8m0_masked_packed(
+        gateup, masked_m, expected_m=capacity
+    )
+
+    for expert in range(experts):
+        valid = int(masked_m[expert])
+        assert torch.equal(sparse_out[expert, :valid], full_out[expert, :valid])
+        assert torch.equal(sparse_scales[expert, :valid], full_scales[expert, :valid])
 
 
 def test_low_latency_expert_compute_matches_dequantized_reference():
@@ -174,7 +197,9 @@ def test_low_latency_expert_compute_matches_dequantized_reference():
         recipe=(1, 1, _BLOCK),
     )
 
-    down_in, down_scales = fused_swiglu_fp8_ue8m0_masked_packed(gateup, masked_m)
+    down_in, down_scales = fused_swiglu_fp8_ue8m0_masked_packed(
+        gateup, masked_m, expected_m=expected_m
+    )
 
     out = torch.empty((experts, capacity, hidden), dtype=torch.bfloat16, device=device)
     deep_gemm.m_grouped_fp8_gemm_nt_masked(

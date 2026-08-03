@@ -6,6 +6,7 @@ import pytest
 import torch
 from tokenspeed_kernel import (
     mla_decode_with_kvcache,
+    mla_extend_with_kvcache,
     mla_prefill,
 )
 
@@ -346,3 +347,84 @@ def test_mla_decode_with_kvcache(
     out_tol = 1e-1 if q_dtype in _FP8_DTYPES or kv_dtype in _FP8_DTYPES else 8e-2
     torch.testing.assert_close(out.float(), out_ref, rtol=out_tol, atol=out_tol)
     torch.testing.assert_close(lse, lse_ref, rtol=8e-2, atol=8e-2)
+
+
+def test_mla_extend_with_kvcache_bf16(device: str, require) -> None:
+    require(
+        "attention",
+        "mla_extend_with_kvcache",
+        "gluon",
+        torch.bfloat16,
+        "q",
+    )
+
+    torch.manual_seed(1)
+    num_heads = 24
+    kv_lora_rank = 512
+    rope_dim = 64
+    qk_dim = kv_lora_rank + rope_dim
+    page_size = 64
+    query_lens = [3, 2]
+    prefix_lens = [0, 5]
+    cache_lens = [
+        q_len + prefix for q_len, prefix in zip(query_lens, prefix_lens, strict=True)
+    ]
+    total_q = sum(query_lens)
+
+    q = torch.randn(
+        total_q,
+        num_heads,
+        qk_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    kv_cache = torch.randn(
+        len(query_lens),
+        page_size,
+        1,
+        qk_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    page_table = torch.arange(
+        len(query_lens), device=device, dtype=torch.int32
+    ).unsqueeze(1)
+    cache_seqlens = torch.tensor(cache_lens, device=device, dtype=torch.int32)
+    cu_seqlens_q = torch.tensor([0, 3, 5], device=device, dtype=torch.int32)
+    cu_seqlens_kv = torch.tensor([0, 3, 10], device=device, dtype=torch.int32)
+    softmax_scale = 1.0 / math.sqrt(128 + rope_dim)
+
+    out = mla_extend_with_kvcache(
+        q=q,
+        kv_cache=kv_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_kv=cu_seqlens_kv,
+        max_seqlen_q=max(query_lens),
+        max_seqlen_k=max(cache_lens),
+        qk_nope_head_dim=128,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=rope_dim,
+        softmax_scale=softmax_scale,
+        is_causal=True,
+        solution="gluon",
+    )
+
+    refs = []
+    q_start = 0
+    for batch_idx, (q_len, prefix_len) in enumerate(
+        zip(query_lens, prefix_lens, strict=True)
+    ):
+        kv = kv_cache[batch_idx, : cache_lens[batch_idx], 0].float()
+        for query_idx in range(q_len):
+            visible_kv = kv[: prefix_len + query_idx + 1]
+            scores = torch.einsum(
+                "hd,kd->hk", q[q_start + query_idx].float(), visible_kv
+            )
+            scores *= softmax_scale
+            probs = torch.softmax(scores, dim=-1)
+            refs.append(torch.matmul(probs, visible_kv[:, :kv_lora_rank]))
+        q_start += q_len
+
+    torch.testing.assert_close(out.float(), torch.stack(refs), rtol=8e-2, atol=8e-2)

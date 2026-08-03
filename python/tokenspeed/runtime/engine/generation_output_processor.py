@@ -763,6 +763,11 @@ class OutputProcesser:
             # passive client that still needs a terminating finish streamed.
             if request_state.to_abort and request_state.finished:
                 request_changes.append(make_extend_result_event(rid, new_ids))
+                if is_prefill_instance:
+                    # PD owns these pages until SucceededEvent or FailedEvent
+                    # fences the transfer. Keep the request state alive so the
+                    # prefill handoff can finish before the scheduler releases it.
+                    continue
                 request_changes.append(make_finish_event(rid))
                 if request_state.abort_notify_client:
                     stream_out_rids.append(rid)
@@ -875,7 +880,8 @@ class OutputProcesser:
         # PD prefill node's terminal path (the other finish/abort logging lives in
         # post_process_forward_op). Self-guarded, so a no-op when the flag is off.
         self._log_request_stats(req_id, rs, time.time())
-        self.stream_output([req_id], [rs])
+        if not rs.to_abort or rs.abort_notify_client:
+            self.stream_output([req_id], [rs])
         # SucceededEvent already finishes the C++ FSM; no extra FinishEvent needed
         return []
 
