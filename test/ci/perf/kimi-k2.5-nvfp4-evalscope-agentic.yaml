@@ -1,6 +1,7 @@
 api_version: ci.tokenspeed.io/v1
 name: perf-kimi-k2.5-nvfp4-agentic
 type: perf
+workflow_stage: model-test
 triggers:
   - per-commit
   - manual
@@ -15,8 +16,10 @@ env:
 install:
   - bash test/ci_system/install_deps.sh
 server:
+  # Temporary NFS cold-load headroom; revert after the startup bottleneck is fixed.
   command: >-
     ts serve
+    --disable-kvstore
     --model nvidia/Kimi-K2.5-NVFP4
     --attn-tp-size 4
     --moe-tp-size 4
@@ -34,7 +37,7 @@ server:
     --speculative-num-steps 3
     --drafter-attention-backend tokenspeed_mla
     --enable-cache-report
-    --weight-loader-prefetch-checkpoints
+    --engine-startup-timeout 2400
     --host 127.0.0.1
     --port 8000
   ready:

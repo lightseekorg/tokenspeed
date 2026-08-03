@@ -19,6 +19,8 @@
 # SOFTWARE.
 
 
+from collections.abc import Callable
+
 import tokenspeed_kernel
 import torch
 
@@ -31,6 +33,7 @@ from tokenspeed.runtime.layers.moe.types import MoELayerSpec
 from tokenspeed.runtime.layers.moe.utils import (
     RoutingMethodType,
     get_all2all_backend,
+    get_deepep_mode,
     get_moe_backend,
 )
 from tokenspeed.runtime.layers.moe.weights import create_layer_weights
@@ -59,15 +62,22 @@ class MoELayer(torch.nn.Module):
         ep_size: int | None = None,
         zero_expert_type: str = "",
         activation: str = "silu",
+        activation_situ_beta: float | None = None,
+        activation_situ_linear_beta: float | None = None,
         activation_alpha=None,
         swiglu_limit=None,
         swiglu_beta: float | None = None,
         w13_input_layout: str = "concatenated",
         with_bias=False,
         routing_config: dict = {},
+        routing_mode: str | None = None,
+        internal_activation_dtype_override: str | None = None,
     ):
         super().__init__()
         self.layer_index = layer_index
+        # Deployment-level override for the activation precision (e.g. a K3
+        # w4a8 flag), forcing the value the quant_config would otherwise derive.
+        self._internal_activation_dtype_override = internal_activation_dtype_override
         self.prefix = prefix
         self.top_k = top_k
         self.num_experts = num_experts
@@ -79,6 +89,17 @@ class MoELayer(torch.nn.Module):
         ]
         self.zero_expert_type = zero_expert_type
         self.activation = activation
+        self.activation_situ_beta = activation_situ_beta
+        self.activation_situ_linear_beta = activation_situ_linear_beta
+        if self.activation == "situ" and (
+            activation_situ_beta is None
+            or activation_situ_beta <= 0
+            or (
+                activation_situ_linear_beta is not None
+                and activation_situ_linear_beta <= 0
+            )
+        ):
+            raise ValueError("SiTU beta values must be positive")
         self.swiglu_arg = None
         if self.activation == "swiglu":
             self.swiglu_arg = SwigluArg(alpha=activation_alpha, limit=swiglu_limit)
@@ -109,6 +130,11 @@ class MoELayer(torch.nn.Module):
         if tp_size > 1 and ep_size > 1:
             raise ValueError("Mixed TP and EP is not supported yet.")
 
+        if num_experts % self.ep_size:
+            raise ValueError(
+                f"num_experts ({num_experts}) must be divisible by ep_size "
+                f"({self.ep_size}) for contiguous expert ownership"
+            )
         num_local_experts = num_experts // self.ep_size
 
         self.num_local_experts = num_local_experts
@@ -156,7 +182,7 @@ class MoELayer(torch.nn.Module):
                 f"{self.prefix}.experts", quant_config.exclude_modules
             )
         ):
-            self._quant_kind = quant_config.moe_weight_dtype()
+            self._quant_kind = quant_config.moe_weight_dtype(self.prefix)
 
         fp8_scale_block_shape = None
         internal_activation_dtype = "input"
@@ -167,18 +193,30 @@ class MoELayer(torch.nn.Module):
                 internal_activation_dtype = "fp8"
             elif getattr(self.quant_config, "use_dynamic_mxfp4_activations", False):
                 internal_activation_dtype = "input"
+        if self._internal_activation_dtype_override is not None:
+            internal_activation_dtype = self._internal_activation_dtype_override
 
         input_dtype = torch.get_default_dtype()
         if input_dtype not in {torch.float16, torch.bfloat16}:
             input_dtype = torch.float16
 
         deepep_group = None
+        deepep_mode = None
+        deepep_low_latency_max_num_tokens_per_gpu = None
         if self._spec.use_deepep:
             mapping = global_server_args_dict["mapping"]
             deepep_group = pg_manager.get_process_group(
                 "nccl",
                 mapping.moe.tp_ep_group,
             )
+            deepep_mode = get_deepep_mode().value
+            # Pin the low-latency capacity from the server arg: the DeepEP
+            # buffer is allocated once, on the first forward that dispatches,
+            # so sizing it from that batch would make decode depend on
+            # whichever batch happened to arrive first.
+            deepep_low_latency_max_num_tokens_per_gpu = global_server_args_dict[
+                "low_latency_max_num_tokens_per_gpu"
+            ]
 
         # Moe Backend plan
         moe_backend = get_moe_backend().value
@@ -187,6 +225,8 @@ class MoELayer(torch.nn.Module):
             self._quant_kind,
             input_dtype=input_dtype,
             activation=self.activation,
+            # e.g. "precomputed_topk" when fused kernels cannot reproduce the routing; None = unconstrained.
+            routing_mode=routing_mode,
             a2a_backend=self._spec.a2a_backend,
             ep_size=self.ep_size,
             ispp=self.intermediate_size // self.tp_size,
@@ -194,6 +234,10 @@ class MoELayer(torch.nn.Module):
             internal_activation_dtype=internal_activation_dtype,
             with_bias=with_bias,
             deepep_group=deepep_group,
+            deepep_mode=deepep_mode,
+            deepep_low_latency_max_num_tokens_per_gpu=(
+                deepep_low_latency_max_num_tokens_per_gpu
+            ),
             solution=moe_backend,
         )
 
@@ -247,7 +291,25 @@ class MoELayer(torch.nn.Module):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
         do_finalize: bool = True,
+        low_latency: bool | None = None,
+        overlap_fn: Callable[[], None] | None = None,
     ):
+        """Run the planned MoE kernel over this layer's weights.
+
+        Args:
+            hidden_states: ``[tokens, hidden]`` local hidden states.
+            topk_output: Routing result, or the raw logits when the kernel
+                routes itself.
+            num_global_tokens: Token count summed over the attention DP ranks.
+            max_num_tokens_per_gpu: Largest per-GPU token count this forward.
+            do_finalize: Whether the kernel must produce the finalized output.
+            low_latency: For all-to-all EP plans, whether to take the
+                latency-optimized dispatch/combine legs. Must be identical on
+                every rank of the EP group; see
+                ``moe.utils.use_deepep_low_latency``.
+            overlap_fn: Optional work to run inside an all-to-all EP dispatch
+                window; ignored by plans that own no dispatch legs.
+        """
         if not do_finalize and not self.supports_deferred_finalize:
             raise AssertionError("MoELayer does not support do_finalize=False")
 
@@ -261,6 +323,8 @@ class MoELayer(torch.nn.Module):
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
                 do_finalize=do_finalize,
                 enable_pdl=pdl_enabled(),
+                low_latency=low_latency,
+                overlap_fn=overlap_fn,
             )
         else:
             return tokenspeed_kernel.moe_apply(
@@ -274,4 +338,6 @@ class MoELayer(torch.nn.Module):
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
                 do_finalize=do_finalize,
                 enable_pdl=pdl_enabled(),
+                low_latency=low_latency,
+                overlap_fn=overlap_fn,
             )

@@ -109,6 +109,11 @@ class CompressedTensorsConfig(QuantizationConfig):
         self.config = config
         _packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
         self.packed_modules_mapping = packed_modules_mapping or _packed_modules_mapping
+        # MoE-kernel-selection knobs (mirror Mxfp4Config): Kimi-K3's
+        # compressed-tensors MXFP4 routed experts are weight-only, so neither the
+        # w4a8-fp8 nor the dynamic-mxfp4-activation path applies.
+        self.is_w4a8_fp8 = False
+        self.use_dynamic_mxfp4_activations = False
 
     def get_linear_method(self) -> CompressedTensorsLinearMethod:
         return CompressedTensorsLinearMethod(self)
@@ -123,22 +128,26 @@ class CompressedTensorsConfig(QuantizationConfig):
     def get_name(self) -> str:
         return "compressed_tensors"
 
-    def moe_weight_dtype(self) -> str:
+    def moe_weight_dtype(self, prefix: str = "") -> str:
         # Container format: resolve the routed-expert scheme to a concrete MoE
-        # kernel dtype. Only INT4 group-32 symmetric pack-quantized weights
-        # (Kimi-K2.5 / K2.6 / K2.7, weight-only + bf16 group scales) are wired.
+        # kernel dtype. 4-bit group-32 weight-only: INT -> mxint4
+        # (Kimi-K2.5 / K2.6 / K2.7), FLOAT -> mxfp4 (K3).
         weight_quant = self.target_scheme_map["Linear"].get("weights")
         input_quant = self.target_scheme_map["Linear"].get("input_activations")
-        if (
+        is_4bit_group32 = (
             weight_quant is not None
-            and self._is_wNa16_group_channel(weight_quant, input_quant)
-            and weight_quant.type == QuantizationType.INT
             and weight_quant.num_bits == 4
             and weight_quant.strategy == QuantizationStrategy.GROUP.value
             and weight_quant.group_size == 32
             and not weight_quant.actorder
-        ):
-            return "mxint4"
+        )
+        if is_4bit_group32:
+            if weight_quant.type == QuantizationType.INT and (
+                self._is_wNa16_group_channel(weight_quant, input_quant)
+            ):
+                return "mxint4"
+            if weight_quant.type == QuantizationType.FLOAT:
+                return "mxfp4"
         raise ValueError(
             f"unsupported compressed-tensors MoE scheme for kernel selection: "
             f"{weight_quant}"

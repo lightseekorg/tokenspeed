@@ -24,6 +24,11 @@ import struct
 import numpy as np
 import numpy.typing as npt
 
+from tokenspeed.runtime.pd.cache_protocol import (
+    CachePDLayout,
+    CachePDPageManifest,
+    CachePDPeerLayout,
+)
 from tokenspeed.runtime.pd.transfer_plan import (
     TransferFragment,
     decode_transfer_fragments,
@@ -54,6 +59,9 @@ class KVArgs:
     state_type: str = "none"
     state_layer_ids: list[int] = dataclasses.field(default_factory=list)
     mamba_offsets: list[int] | None = None
+    # Paged cache keeps the typed layout beside the normal Mooncake buffer
+    # descriptor. The buffers themselves still use the shared transfer path.
+    cache_layout: CachePDLayout | None = None
 
 
 class KVTransferError(Exception):
@@ -88,6 +96,7 @@ class TransferKVChunk:
     layerwise_interval: int = 1
     wait_for_bootstrap_token: bool = False
     spec_candidate_ids: list[int] | None = None
+    page_manifest: CachePDPageManifest | None = None
 
 
 @dataclasses.dataclass
@@ -114,10 +123,14 @@ class TransferInfo:
     dst_mamba_indices: npt.NDArray[np.int64] | None
     is_dummy: bool
     transfer_fragments: tuple[TransferFragment, ...] = ()
+    page_manifest: CachePDPageManifest | None = None
+    peer_cache_layout: CachePDPeerLayout | None = None
 
     @classmethod
     def from_zmq(cls, msg: list[bytes]):
         transfer_fragments = ()
+        page_manifest = None
+        peer_cache_layout = None
         if msg[4] == b"" and msg[5] == b"":
             dst_kv_indices = np.array([], dtype=np.int64)
             dst_aux_index = None
@@ -155,6 +168,15 @@ class TransferInfo:
             transfer_fragments = (
                 decode_transfer_fragments(msg[12], msg[13]) if len(msg) > 13 else ()
             )
+            manifest_frame = msg[14] if len(msg) > 14 else b""
+            layout_frame = msg[15] if len(msg) > 15 else b""
+            if bool(manifest_frame) != bool(layout_frame):
+                raise ValueError(
+                    "Paged cache pre-allocation requires both manifest and peer layout"
+                )
+            if manifest_frame:
+                page_manifest = CachePDPageManifest.from_wire_bytes(manifest_frame)
+                peer_cache_layout = CachePDPeerLayout.from_wire_bytes(layout_frame)
             is_dummy = False
         return cls(
             room=int(msg[0].decode("ascii")),
@@ -172,6 +194,8 @@ class TransferInfo:
             dst_mamba_indices=dst_mamba_indices,
             is_dummy=is_dummy,
             transfer_fragments=transfer_fragments,
+            page_manifest=page_manifest,
+            peer_cache_layout=peer_cache_layout,
         )
 
 

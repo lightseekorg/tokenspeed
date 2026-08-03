@@ -29,6 +29,12 @@ import requests
 import zmq
 
 from tokenspeed.runtime.pd.base.status import TransferPoll
+from tokenspeed.runtime.pd.cache_protocol import (
+    CachePDPageManifest,
+    CachePDPeerLayout,
+    validate_cache_manifest,
+    validate_cache_peer_layout,
+)
 from tokenspeed.runtime.pd.mooncake.entities import KVTransferError
 from tokenspeed.runtime.pd.transfer_plan import (
     BufferKind,
@@ -63,6 +69,12 @@ def _get_prefill_parallel_info_from_server(
         response = requests.get(url)
         if response.status_code == 200:
             prefill_parallel_info = response.json()
+            cache_layout_wire = prefill_parallel_info.get("cache_layout")
+            cache_layout = (
+                CachePDPeerLayout.from_wire_bytes(cache_layout_wire.encode("ascii"))
+                if cache_layout_wire is not None
+                else None
+            )
             return PrefillParallelInfo(
                 tp_size=int(prefill_parallel_info["prefill_tp_size"]),
                 dp_size=int(prefill_parallel_info["prefill_dp_size"]),
@@ -81,6 +93,7 @@ def _get_prefill_parallel_info_from_server(
                 state_unit_lens=tuple(
                     int(x) for x in prefill_parallel_info.get("state_unit_lens", [])
                 ),
+                cache_layout=cache_layout,
             )
         else:
             logger.error(
@@ -365,6 +378,43 @@ def _legacy_mla_route_plan(
 def _calc(kv_mgr, prefill_parallel_info: PrefillParallelInfo) -> ReceiverRoutePlan:
     prefill_tp_size_per_dp_rank = prefill_parallel_info.prefill_tp_size_per_dp_rank
     local_tp_size_per_dp_rank = kv_mgr.world_size // kv_mgr.dp_size
+    local_cache_layout = getattr(kv_mgr.kv_args, "cache_layout", None)
+    prefill_cache_layout = prefill_parallel_info.cache_layout
+
+    if local_cache_layout is not None:
+        if prefill_cache_layout is None:
+            raise RuntimeError(
+                "Paged cache decode connected to a non-Paged cache prefill"
+            )
+        validate_cache_peer_layout(local_cache_layout, prefill_cache_layout)
+        expected_item_lens = tuple(
+            local_cache_layout.physical_page_bytes
+            for _ in range(local_cache_layout.physical_slot_count)
+        )
+        if (
+            tuple(kv_mgr.kv_args.kv_item_lens) != expected_item_lens
+            or tuple(kv_mgr.kv_args.kv_unit_lens) != expected_item_lens
+            or tuple(prefill_parallel_info.kv_item_lens) != expected_item_lens
+            or tuple(prefill_parallel_info.kv_unit_lens) != expected_item_lens
+            or prefill_parallel_info.state_item_lens
+            or prefill_parallel_info.state_unit_lens
+        ):
+            raise RuntimeError(
+                "Paged cache P/D raw-slab Mooncake descriptors are incompatible"
+            )
+        if prefill_tp_size_per_dp_rank != local_tp_size_per_dp_rank:
+            raise NotImplementedError(
+                "Paged cache PD currently requires equal Prefill and Decode TP sizes"
+            )
+        target_tp_rank = kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank
+        return _legacy_mla_route_plan(
+            target_tp_rank=target_tp_rank,
+            target_tp_ranks=(target_tp_rank,),
+            required_dst_info_num=1,
+            required_prefill_response_num=1,
+        )
+    if prefill_cache_layout is not None:
+        raise RuntimeError("non-Paged cache decode connected to a Paged cache prefill")
 
     if prefill_parallel_info.enable_mla_l1_5_cache:
         if not kv_mgr.is_mla_backend:
@@ -601,6 +651,7 @@ class MooncakeKVReceiver:
         decode_prefix_len: int | None = 0,
         mla_l1_5_args: PageTransferMetadata | None = None,
         mamba_indices: npt.NDArray[np.int64] | None = None,
+        page_manifest: CachePDPageManifest | None = None,
     ):
         logger.info(
             "[MooncakeKVReceiver.init] bootstrap_room=%s kv_indices_len=%d aux_index=%s decode_prefix_len=%s",
@@ -611,6 +662,23 @@ class MooncakeKVReceiver:
         )
         # Store decode_prefix_len to be sent back to prefill
         self.decode_prefix_len = decode_prefix_len
+        cache_layout = getattr(self.kv_mgr.kv_args, "cache_layout", None)
+        if cache_layout is None:
+            if page_manifest is not None:
+                raise ValueError(
+                    "legacy Mooncake transfer cannot carry a Paged cache manifest"
+                )
+        else:
+            if page_manifest is None:
+                raise ValueError(
+                    "Paged cache Mooncake transfer requires a page manifest"
+                )
+            validate_cache_manifest(
+                page_manifest,
+                layout=cache_layout,
+                num_pages_with_null=cache_layout.num_pages_with_null,
+                peer="destination",
+            )
         dst_page_transfer_mask = None
         dst_page_local_indices = None
         if mla_l1_5_args is not None:
@@ -671,8 +739,15 @@ class MooncakeKVReceiver:
                     ),
                 ]
                 transfer_fragments = bootstrap_info.get("transfer_fragments", ())
-                if not is_dummy and transfer_fragments:
+                if not is_dummy and (transfer_fragments or page_manifest is not None):
                     message_parts.extend(encode_transfer_fragments(transfer_fragments))
+                if not is_dummy and page_manifest is not None:
+                    message_parts.extend(
+                        (
+                            page_manifest.to_wire_bytes(),
+                            cache_layout.peer.to_wire_bytes(),
+                        )
+                    )
                 sock.send_multipart(message_parts)
             self.init_time = time.time()
 

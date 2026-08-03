@@ -20,6 +20,7 @@
 
 """Factories for PD KV transfer helpers."""
 
+from tokenspeed.runtime.pd.cache_protocol import validate_cache_slab_registrations
 from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
 from tokenspeed.runtime.pd.mooncake.entities import KVArgs, KVManagerArgs
 from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
@@ -38,14 +39,68 @@ def _get_contiguous_buf_unit_lens(pool, item_lens):
     return unit_lens
 
 
+def _get_cache_contract(pool):
+    if getattr(pool, "supports_disaggregation", False) is not True:
+        return None
+
+    contract_getter = getattr(pool, "get_pd_cache_contract", None)
+    if not callable(contract_getter):
+        raise RuntimeError(
+            "cache pool advertises cache-contract disaggregation but is missing the "
+            "required get_pd_cache_contract() ABI"
+        )
+    return contract_getter()
+
+
 def get_kv_args(
     engine_rank: int,
     gpu_id,
     ib_device,
     token_to_kv_pool,
     draft_token_to_kv_pool,
-    mamba_pool=None,
 ):
+    cache_contract = _get_cache_contract(token_to_kv_pool)
+    if cache_contract is not None:
+        if draft_token_to_kv_pool is not None:
+            raise NotImplementedError(
+                "Paged-cache PD does not support speculative/draft/MTP caches"
+            )
+        layout, registrations = cache_contract
+        registrations = validate_cache_slab_registrations(
+            registrations,
+            layout=layout,
+            peer="local",
+        )
+        physical_slot_count = layout.physical_slot_count
+        item_lens = [layout.physical_page_bytes] * physical_slot_count
+        return KVArgs(
+            engine_rank=engine_rank,
+            kv_data_ptrs=[registration.base_addr for registration in registrations],
+            kv_data_lens=[registration.length for registration in registrations],
+            kv_item_lens=item_lens,
+            target_layer_num=physical_slot_count,
+            draft_layer_num=0,
+            kv_layer_ids=list(range(physical_slot_count)),
+            # One logical Mooncake unit is one complete raw-slab page. This
+            # makes equal-TP cache-contract routes identity routes and prevents the
+            # generic heterogeneous-TP planner from splitting a raw page.
+            kv_unit_lens=item_lens,
+            state_data_ptrs=[],
+            state_data_lens=[],
+            state_item_lens=[],
+            state_unit_lens=[],
+            state_type="none",
+            state_layer_ids=[],
+            mamba_offsets=[],
+            offsets=[(physical_slot,) for physical_slot in range(physical_slot_count)],
+            aux_data_ptrs=[],
+            aux_data_lens=[],
+            aux_item_lens=[],
+            ib_device=ib_device,
+            gpu_id=gpu_id,
+            cache_layout=layout,
+        )
+
     kv_data_ptrs, kv_data_lens, kv_item_lens = (
         token_to_kv_pool.get_contiguous_buf_infos()
     )
@@ -89,14 +144,6 @@ def get_kv_args(
     state_unit_lens = []
     state_type = "none"
     state_layer_ids = []
-    if mamba_pool is not None:
-        state_data_ptrs, state_data_lens, state_item_lens = (
-            mamba_pool.get_contiguous_buf_infos()
-        )
-        state_unit_lens = _get_contiguous_buf_unit_lens(mamba_pool, state_item_lens)
-        state_layer_ids = mamba_pool.get_contiguous_buf_layer_ids()
-        state_type = "mamba"
-
     kv_args = KVArgs(
         engine_rank=engine_rank,
         kv_data_ptrs=kv_data_ptrs,
@@ -132,6 +179,15 @@ def create_kv_transfer(
     gloo_group,
     page_size,
 ):
+    if kv_args.cache_layout is not None:
+        if backend not in (TransferBackend.MOONCAKE, TransferBackend.MOONCAKE.value):
+            raise NotImplementedError(
+                "Paged-cache PD currently supports only the Mooncake backend"
+            )
+        if args.enable_mla_l1_5_cache:
+            raise NotImplementedError(
+                "Paged-cache PD does not support MLA L1.5 or layerwise cache transfer"
+            )
     if mode == "prefill":
         return DisaggPrefillExecutor(backend, args, kv_args, gloo_group, page_size)
     elif mode == "decode":

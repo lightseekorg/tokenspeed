@@ -155,7 +155,7 @@ def test_nan_flag_finishes_request_with_numerical_error():
 
     # Flagged request: aborted with NumericalError, removed from tracking.
     # The scheduler gets an Abort (NOT Finish) event — AbortEvent skips the
-    # radix-tree insert and host-KV writeback, so corrupted KV is not reused.
+    # single-table-tree insert and host-KV writeback, so corrupted KV is not reused.
     assert isinstance(decode_state.finished_reason, FINISH_ABORT)
     assert decode_state.finished_reason.err_type == ABORT_CODE.NumericalError
     assert "decode" not in processor.rid_to_state
@@ -565,3 +565,43 @@ def test_prefill_first_token_checks_spec_candidate_bootstrap():
             is_prefill_instance=True,
             on_first_token=lambda *args: None,
         )
+
+
+def test_pd_one_token_request_finishes_at_remote_prefill_done():
+    sender = _Sender()
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
+    state = _state([1, 2, 3], computed_length=3)
+    state.sampling_params.max_new_tokens = 1
+    processor.rid_to_state["decode"] = state
+
+    processor.on_remote_prefill_done("decode", 101)
+    events = processor.finish_remote_prefill_only_request("decode")
+
+    assert state.output_ids == [101]
+    assert state.finished
+    assert "decode" not in processor.rid_to_state
+    assert [type(event).__name__ for event in events] == ["Finish"]
+    assert events[0].request_id == "decode"
+    assert len(sender.items) == 1
+    output = sender.items[0]
+    assert output.rids == ["decode"]
+    assert output.output_ids == [[101]]
+    assert output.completion_tokens == [1]
+    assert output.finished_reasons[0] == {"type": "length", "length": 1}
+
+
+def test_pd_multi_token_request_continues_after_remote_prefill_done():
+    sender = _Sender()
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
+    state = _state([1, 2, 3], computed_length=3)
+    state.sampling_params.max_new_tokens = 2
+    processor.rid_to_state["decode"] = state
+
+    processor.on_remote_prefill_done("decode", 101)
+    events = processor.finish_remote_prefill_only_request("decode")
+
+    assert state.output_ids == [101]
+    assert not state.finished
+    assert processor.rid_to_state["decode"] is state
+    assert events == []
+    assert sender.items == []

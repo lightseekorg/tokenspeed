@@ -20,15 +20,20 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
+from typing import Any
 
 import torch
+import torch.nn.functional as F
+from tokenspeed_kernel.ops.kvcache.triton import fused_fp8_set_kv_buffer
+from tokenspeed_kernel.ops.layernorm.triton import fused_qk_rmsnorm_rope
 from torch import nn
 
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.activation import SiluAndMul
+from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import (
     MergedColumnParallelLinear,
@@ -103,18 +108,23 @@ class DFlashAttention(nn.Module):
         eps = float(getattr(config, "rms_norm_eps", 1e-6))
         self.q_norm = RMSNorm(self.head_dim, eps=eps)
         self.k_norm = RMSNorm(self.head_dim, eps=eps)
+        self._qk_norm_eps = eps
+        rope_parameters = getattr(config, "rope_parameters", None)
+        if rope_parameters is not None:
+            rope_theta = float(rope_parameters["rope_theta"])
+            rope_scaling = rope_parameters
+        else:
+            rope_theta = float(getattr(config, "rope_theta", 1000000))
+            rope_scaling = getattr(config, "rope_scaling", None)
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=int(getattr(config, "max_position_embeddings", 32768)),
-            base=float(getattr(config, "rope_theta", 1000000)),
-            rope_scaling=getattr(config, "rope_scaling", None),
+            base=rope_theta,
+            rope_scaling=rope_scaling,
         )
 
-        # The FA4 MHA extend selector currently has no sliding-window kernel
-        # for this draft shape. Use full attention for draft proposals; target
-        # verification remains authoritative for accepted tokens.
-        sliding_window = -1
+        sliding_window = _get_dflash_layer_sliding_window(config, layer_id)
         self.attn = PagedAttention(
             self.num_heads,
             self.head_dim,
@@ -123,7 +133,6 @@ class DFlashAttention(nn.Module):
             layer_id=layer_id,
             sliding_window_size=sliding_window,
         )
-        self.attn.non_causal = True
 
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
@@ -143,18 +152,41 @@ class DFlashAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
+        q, k = fused_qk_rmsnorm_rope(
+            q,
+            k,
+            self.q_norm.weight.data,
+            self.k_norm.weight.data,
+            self.rotary_emb.cos_sin_cache,
+            positions,
+            self._qk_norm_eps,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+        )
         k_cache = k.view(-1, self.num_kv_heads, self.head_dim)
         v_cache = v.view(-1, self.num_kv_heads, self.head_dim)
-        ctx.token_to_kv_pool.set_kv_buffer(
-            self.attn,
-            out_cache_loc,
-            k_cache,
-            v_cache,
-            self.attn.k_scale,
-            self.attn.v_scale,
-        )
+        if ctx.token_to_kv_pool.dtype == torch.float8_e4m3fn:
+            k_buf, v_buf = ctx.token_to_kv_pool.get_kv_buffer(self.attn.layer_id)
+            fused_fp8_set_kv_buffer(
+                k=k_cache,
+                v=v_cache,
+                k_cache=k_buf,
+                v_cache=v_buf,
+                cache_loc=out_cache_loc,
+                k_scale=self.attn.k_scale,
+                v_scale=self.attn.v_scale,
+                page_size=ctx.token_to_kv_pool.page_size,
+            )
+        else:
+            ctx.token_to_kv_pool.set_kv_buffer(
+                self.attn,
+                out_cache_loc,
+                k_cache,
+                v_cache,
+                self.attn.k_scale,
+                self.attn.v_scale,
+            )
         attn_output = self.attn(
             q,
             None,
@@ -171,7 +203,17 @@ class DFlashAttention(nn.Module):
     def kv_proj_only(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv_proj = self.qkv_proj
+        if isinstance(
+            getattr(qkv_proj, "quant_method", None), UnquantizedLinearMethod
+        ) and hasattr(qkv_proj, "weight"):
+            kv_slice = slice(self.q_size, self.q_size + 2 * self.kv_size)
+            weight = qkv_proj.weight[kv_slice]
+            bias = qkv_proj.bias[kv_slice] if qkv_proj.bias is not None else None
+            kv = F.linear(hidden_states, weight, bias)
+            k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
+            return k, v
+        qkv, _ = qkv_proj(hidden_states)
         _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         return k, v
 
@@ -361,15 +403,20 @@ class DFlashDraftModel(nn.Module):
         out_cache_loc: torch.Tensor,
         input_lengths: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
+        kv_sync_event=None,
         **kwargs,
     ) -> LogitsProcessorOutput:
         if input_embeds is None:
             if not ctx.forward_mode.is_idle():
                 raise ValueError("DFlashDraftModel requires input_embeds.")
             hidden_states = self.fc.weight.new_empty((0, int(self.config.hidden_size)))
+            residual = None
         else:
             hidden_states = input_embeds
-        residual = None
+            residual = torch.zeros_like(input_embeds)
+
+        if kv_sync_event is not None:
+            torch.cuda.current_stream().wait_event(kv_sync_event)
 
         for layer in self.layers:
             hidden_states, residual = layer(
@@ -425,6 +472,84 @@ class DFlashDraftModel(nn.Module):
                 param = params_dict[resolved]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+
+def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
+    if isinstance(config, dict):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
+def _get_text_config(config: Any) -> Any:
+    if config is None:
+        return None
+    if isinstance(config, dict):
+        return config.get("text_config", config)
+    text_config = getattr(config, "text_config", None)
+    if text_config is not None:
+        return text_config
+    get_text_config = getattr(config, "get_text_config", None)
+    if callable(get_text_config):
+        try:
+            resolved = get_text_config()
+            if resolved is not None:
+                return resolved
+        except TypeError:
+            pass
+    return config
+
+
+def get_dflash_layer_types(config: Any) -> Sequence[str] | None:
+    text_config = _get_text_config(config)
+    layer_types = _cfg_get(text_config, "layer_types", _cfg_get(config, "layer_types"))
+    if layer_types is None:
+        return None
+    if isinstance(layer_types, str) or not isinstance(layer_types, Sequence):
+        raise ValueError(
+            "DFLASH config.layer_types must be a sequence of attention type strings."
+        )
+    return layer_types
+
+
+def get_dflash_attention_sliding_window_size(config: Any) -> int | None:
+    layer_types = get_dflash_layer_types(config)
+    if layer_types is None or "sliding_attention" not in layer_types:
+        return None
+
+    text_config = _get_text_config(config)
+    sliding_window = _cfg_get(
+        text_config, "sliding_window", _cfg_get(config, "sliding_window")
+    )
+    if sliding_window is None:
+        raise ValueError(
+            "DFLASH sliding_attention layers require config.sliding_window."
+        )
+
+    # HF sliding windows include the current token; TokenSpeed stores window_left.
+    return int(sliding_window) - 1
+
+
+def _get_dflash_layer_sliding_window(config, layer_id: int) -> int:
+    layer_types = get_dflash_layer_types(config)
+    if layer_types is None:
+        return -1
+    if layer_id >= len(layer_types):
+        raise ValueError(
+            "DFLASH config.layer_types must contain one entry per draft layer. "
+            f"Got {len(layer_types)} entries, layer_id={layer_id}."
+        )
+
+    layer_type = layer_types[layer_id]
+    if layer_type == "full_attention":
+        return -1
+    if layer_type == "sliding_attention":
+        sliding_window_size = get_dflash_attention_sliding_window_size(config)
+        assert sliding_window_size is not None
+        return sliding_window_size
+    raise ValueError(
+        "Unsupported DFLASH draft layer type. "
+        f"layer_types[{layer_id}]={layer_type!r}."
+    )
 
 
 EntryClass = [DFlashDraftModel]

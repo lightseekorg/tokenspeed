@@ -30,6 +30,15 @@
  *     out[t] = Σ_k expert_weights[t, k] * gemm2_out[permuted_idx(t, k)]
  *            + shared_output[t]                      // if non-null
  *
+ * Shared-expert-sink extension (Inkling): when ``expert_weights`` is
+ * ``[numTokens, topK + numShared]`` (numShared > 0), ``shared_output`` is
+ * the un-weighted per-shared-expert output ``[numShared, numTokens,
+ * hiddenDim]`` and the tail weight columns are applied here:
+ *     out[t] = Σ_k w[t, k] * gemm2_out[permuted_idx(t, k)]
+ *            + Σ_s w[t, topK + s] * shared_output[s, t]
+ * The routed and shared weights come from one joint normalization, so
+ * fusing both applications keeps the whole combine in a single epilogue.
+ *
  * Eliminates the native PyTorch ``routed + shared_output`` add (and the
  * separate ``*= routed_scaling_factor`` kernel when applicable) from
  * ``DeepseekV3MoE.forward``, and gives the downstream allreduce+rmsnorm
@@ -61,6 +70,7 @@ using BF16 = cutlass::bfloat16_t;
 
 constexpr int FINALIZE_THREADS_PER_BLOCK = 256;
 constexpr int MAX_TOPK = 64;
+constexpr int MAX_SHARED = 8;
 
 // ---------------------------------------------------------------------------
 // General kernel — one CTA per (hidden_chunk, token). Picks up small-to-mid
@@ -68,7 +78,7 @@ constexpr int MAX_TOPK = 64;
 // ---------------------------------------------------------------------------
 template <typename TypeExpW>
 __global__ void moeFinalizeKernel(int numTokens, int hiddenDim, int hiddenDimPadded, int topK,
-                                  BF16 const* __restrict__ inPtr,
+                                  int numShared, BF16 const* __restrict__ inPtr,
                                   int const* __restrict__ expandedIdxToPermutedIdx,
                                   TypeExpW const* __restrict__ expertWeightsPtr,
                                   BF16 const* __restrict__ sharedBiasPtr,
@@ -77,23 +87,38 @@ __global__ void moeFinalizeKernel(int numTokens, int hiddenDim, int hiddenDimPad
   cudaGridDependencySynchronize();
 #endif
 
+  // Row stride: [topK] weights, or [topK | shared] from a joint normalization when numShared > 0.
+  int const weightStride = topK + numShared;
+
   for (int64_t tokenIdx = blockIdx.y; tokenIdx < numTokens; tokenIdx += gridDim.y) {
     for (int64_t hiddenIdx = threadIdx.x + blockDim.x * blockIdx.x;
          hiddenIdx < hiddenDim; hiddenIdx += blockDim.x * gridDim.x) {
       float acc = 0.0f;
       for (int k = 0; k < topK; k++) {
-        int64_t const expandedIdx = tokenIdx * topK + k;
-        int64_t const permutedIdx = expandedIdxToPermutedIdx[expandedIdx];
+        int64_t const permutedIdx = expandedIdxToPermutedIdx[tokenIdx * topK + k];
         if (permutedIdx == -1) {
           continue;
         }
-        float const scale = static_cast<float>(expertWeightsPtr[expandedIdx]);
+        float const scale =
+            static_cast<float>(expertWeightsPtr[tokenIdx * weightStride + k]);
         float const val =
             static_cast<float>(inPtr[permutedIdx * hiddenDimPadded + hiddenIdx]);
         acc += scale * val;
       }
       if (sharedBiasPtr != nullptr) {
-        acc += static_cast<float>(sharedBiasPtr[tokenIdx * hiddenDim + hiddenIdx]);
+        if (numShared == 0) {
+          // Pre-combined [numTokens, hiddenDim] residual, added verbatim.
+          acc += static_cast<float>(sharedBiasPtr[tokenIdx * hiddenDim + hiddenIdx]);
+        } else {
+          // Un-weighted [numShared, numTokens, hiddenDim] shared outputs; apply tail weight columns here.
+          for (int s = 0; s < numShared; s++) {
+            float const scale = static_cast<float>(
+                expertWeightsPtr[tokenIdx * weightStride + topK + s]);
+            float const val = static_cast<float>(
+                sharedBiasPtr[(s * int64_t(numTokens) + tokenIdx) * hiddenDim + hiddenIdx]);
+            acc += scale * val;
+          }
+        }
       }
       outPtr[tokenIdx * hiddenDim + hiddenIdx] = static_cast<BF16>(acc);
     }
@@ -135,7 +160,7 @@ struct IdxPackedTraits<4> {
 
 template <typename TypeExpW, int TopKUnrollFactor>
 __global__ void moeFinalizeKernelVecLoad(int numTokens, int hiddenDim, int hiddenDimPadded,
-                                         int topK, BF16 const* __restrict__ inPtr,
+                                         int topK, int numShared, BF16 const* __restrict__ inPtr,
                                          int const* __restrict__ expandedIdxToPermutedIdx,
                                          TypeExpW const* __restrict__ expertWeightsPtr,
                                          BF16 const* __restrict__ sharedBiasPtr,
@@ -158,9 +183,12 @@ __global__ void moeFinalizeKernelVecLoad(int numTokens, int hiddenDim, int hidde
   int64_t const numElemsInPaddedCol = hiddenDimPadded / FINALIZE_ELEM_PER_THREAD;
   int64_t const numElemsInCol = hiddenDim / FINALIZE_ELEM_PER_THREAD;
 
+  int const weightStride = topK + numShared;
+
   // Stage the per-token (topK/unroll) indices + scales into smem.
   __shared__ ScaleArrayType scaleArrSmem[MAX_TOPK / TopKUnrollFactor];
   __shared__ IdxArrayType permutedIdxArrSmem[MAX_TOPK / TopKUnrollFactor];
+  __shared__ float sharedScaleSmem[MAX_SHARED];
 
   for (int kChunkIdx = threadIdx.x; kChunkIdx < topK / TopKUnrollFactor; kChunkIdx += blockDim.x) {
     int64_t const expandedIdx = tokenIdx * topK + kChunkIdx * TopKUnrollFactor;
@@ -170,17 +198,24 @@ __global__ void moeFinalizeKernelVecLoad(int numTokens, int hiddenDim, int hidde
         *reinterpret_cast<IdxArrayType const*>(&permutedIdxPacked);
 #pragma unroll
     for (int ki = 0; ki < TopKUnrollFactor; ++ki) {
-      scaleArrSmem[kChunkIdx][ki] = expertWeightsPtr[expandedIdx + ki];
+      scaleArrSmem[kChunkIdx][ki] =
+          expertWeightsPtr[tokenIdx * weightStride + kChunkIdx * TopKUnrollFactor + ki];
     }
+  }
+  for (int s = threadIdx.x; s < numShared; s += blockDim.x) {
+    sharedScaleSmem[s] =
+        static_cast<float>(expertWeightsPtr[tokenIdx * weightStride + topK + s]);
   }
 
   BF16* outputPtr = outPtr + tokenIdx * hiddenDim;
   auto* outElemPtr = reinterpret_cast<OutputElem*>(outputPtr);
   auto const* inElemPtr = reinterpret_cast<InputElem const*>(inPtr);
+  // numShared==0: pre-combined residual; else shared expert s, token t is row (s*numTokens + t).
   auto const* sharedElemPtr =
       sharedBiasPtr != nullptr
           ? reinterpret_cast<InputElem const*>(sharedBiasPtr + tokenIdx * hiddenDim)
           : nullptr;
+  int64_t const sharedExpertElemStride = int64_t(numTokens) * numElemsInCol;
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
   cudaGridDependencySynchronize();
@@ -223,14 +258,28 @@ __global__ void moeFinalizeKernelVecLoad(int numTokens, int hiddenDim, int hidde
     }
 
     if (sharedElemPtr != nullptr) {
-      float4 shared =
-          vectorizedLoadPtx(reinterpret_cast<float4 const*>(&sharedElemPtr[elemIndex]));
-      InputElem sharedElem = *reinterpret_cast<InputElem const*>(&shared);
       cutlass::NumericArrayConverter<float, BF16, FINALIZE_ELEM_PER_THREAD> toFloat;
-      ComputeElem sharedFloat = toFloat(sharedElem);
+      if (numShared == 0) {
+        float4 shared =
+            vectorizedLoadPtx(reinterpret_cast<float4 const*>(&sharedElemPtr[elemIndex]));
+        InputElem sharedElem = *reinterpret_cast<InputElem const*>(&shared);
+        ComputeElem sharedFloat = toFloat(sharedElem);
 #pragma unroll
-      for (int e = 0; e < FINALIZE_ELEM_PER_THREAD; ++e) {
-        threadOutput[e] += sharedFloat[e];
+        for (int e = 0; e < FINALIZE_ELEM_PER_THREAD; ++e) {
+          threadOutput[e] += sharedFloat[e];
+        }
+      } else {
+        for (int s = 0; s < numShared; ++s) {
+          float4 shared = vectorizedLoadPtx(reinterpret_cast<float4 const*>(
+              &sharedElemPtr[s * sharedExpertElemStride + elemIndex]));
+          InputElem sharedElem = *reinterpret_cast<InputElem const*>(&shared);
+          ComputeElem sharedFloat = toFloat(sharedElem);
+          float const scale = sharedScaleSmem[s];
+#pragma unroll
+          for (int e = 0; e < FINALIZE_ELEM_PER_THREAD; ++e) {
+            threadOutput[e] += scale * sharedFloat[e];
+          }
+        }
       }
     }
 
@@ -247,7 +296,7 @@ __global__ void moeFinalizeKernelVecLoad(int numTokens, int hiddenDim, int hidde
 // Typed dispatch
 // ---------------------------------------------------------------------------
 template <typename TypeExpW>
-void dispatchFinalize(int numTokens, int hiddenDim, int hiddenDimPadded, int topK,
+void dispatchFinalize(int numTokens, int hiddenDim, int hiddenDimPadded, int topK, int numShared,
                       BF16 const* inPtr, int const* expandedIdxPtr, void const* weightsPtrVoid,
                       BF16 const* sharedPtr, BF16* outPtr, bool useVecLoad, cudaStream_t stream,
                       cudaLaunchAttribute const* attrs, int numAttrs) {
@@ -266,7 +315,7 @@ void dispatchFinalize(int numTokens, int hiddenDim, int hiddenDimPadded, int top
     config.attrs = const_cast<cudaLaunchAttribute*>(attrs);
 
     cudaLaunchKernelEx(&config, moeFinalizeKernel<TypeExpW>, numTokens, hiddenDim, hiddenDimPadded,
-                       topK, inPtr, expandedIdxPtr, weightsPtr, sharedPtr, outPtr);
+                       topK, numShared, inPtr, expandedIdxPtr, weightsPtr, sharedPtr, outPtr);
     return;
   }
 
@@ -280,7 +329,8 @@ void dispatchFinalize(int numTokens, int hiddenDim, int hiddenDimPadded, int top
     config.numAttrs = numAttrs;
     config.attrs = const_cast<cudaLaunchAttribute*>(attrs);
     cudaLaunchKernelEx(&config, moeFinalizeKernelVecLoad<TypeExpW, UNROLL>, numTokens, hiddenDim,
-                       hiddenDimPadded, topK, inPtr, expandedIdxPtr, weightsPtr, sharedPtr, outPtr);
+                       hiddenDimPadded, topK, numShared, inPtr, expandedIdxPtr, weightsPtr,
+                       sharedPtr, outPtr);
   };
   // Match flashinfer's LAUNCH_TOPK_EXPW dispatch order.
   if (topK % 4 == 0) {
@@ -305,7 +355,8 @@ void moe_finalize_fuse_shared(TensorView out, TensorView gemm2_out,
   TVM_FFI_ICHECK_EQ(gemm2_out.ndim(), 2)
       << "gemm2_out must be 2-D [totalNumPaddedTokens, hiddenDimPadded]";
   TVM_FFI_ICHECK_EQ(expanded_idx_to_permuted_idx.ndim(), 1);
-  TVM_FFI_ICHECK_EQ(expert_weights.ndim(), 2) << "expert_weights must be 2-D [numTokens, topK]";
+  TVM_FFI_ICHECK_EQ(expert_weights.ndim(), 2)
+      << "expert_weights must be 2-D [numTokens, topK] or [numTokens, topK + numShared]";
 
   int const numTokens = int(out.size(0));
   int const hiddenDim = int(out.size(1));
@@ -313,13 +364,27 @@ void moe_finalize_fuse_shared(TensorView out, TensorView gemm2_out,
   TVM_FFI_ICHECK_LE(top_k, tokenspeed::MAX_TOPK);
   TVM_FFI_ICHECK_EQ(expanded_idx_to_permuted_idx.size(0), numTokens * top_k);
   TVM_FFI_ICHECK_EQ(expert_weights.size(0), numTokens);
-  TVM_FFI_ICHECK_EQ(expert_weights.size(1), top_k);
+  TVM_FFI_ICHECK_GE(expert_weights.size(1), top_k);
+  // Weight columns beyond topK are shared-expert-sink weights for the 3-D shared_output rows.
+  int const numShared = int(expert_weights.size(1) - top_k);
+  TVM_FFI_ICHECK_LE(numShared, tokenspeed::MAX_SHARED);
 
   bool const hasShared = shared_output.numel() > 0;
+  TVM_FFI_ICHECK(numShared == 0 || hasShared)
+      << "expert_weights has shared columns but shared_output is empty";
   if (hasShared) {
-    TVM_FFI_ICHECK_EQ(shared_output.ndim(), 2);
-    TVM_FFI_ICHECK_EQ(shared_output.size(0), numTokens);
-    TVM_FFI_ICHECK_EQ(shared_output.size(1), hiddenDim);
+    if (numShared == 0) {
+      TVM_FFI_ICHECK_EQ(shared_output.ndim(), 2);
+      TVM_FFI_ICHECK_EQ(shared_output.size(0), numTokens);
+      TVM_FFI_ICHECK_EQ(shared_output.size(1), hiddenDim);
+    } else {
+      TVM_FFI_ICHECK_EQ(shared_output.ndim(), 3)
+          << "with shared weight columns, shared_output must be "
+             "[numShared, numTokens, hiddenDim]";
+      TVM_FFI_ICHECK_EQ(shared_output.size(0), numShared);
+      TVM_FFI_ICHECK_EQ(shared_output.size(1), numTokens);
+      TVM_FFI_ICHECK_EQ(shared_output.size(2), hiddenDim);
+    }
   }
 
   auto const* inPtr = static_cast<tokenspeed::BF16 const*>(gemm2_out.data_ptr());
@@ -347,12 +412,13 @@ void moe_finalize_fuse_shared(TensorView out, TensorView gemm2_out,
 
   auto ew_dtype = expert_weights.dtype();
   if (ew_dtype == DLDataType{kDLFloat, 32, 1}) {
-    tokenspeed::dispatchFinalize<float>(numTokens, hiddenDim, hiddenDimPadded, int(top_k), inPtr,
-                                        expandedIdxPtr, expert_weights.data_ptr(), sharedPtr,
-                                        outPtr, useVecLoad, stream, attrs, 1);
+    tokenspeed::dispatchFinalize<float>(numTokens, hiddenDim, hiddenDimPadded, int(top_k),
+                                        numShared, inPtr, expandedIdxPtr,
+                                        expert_weights.data_ptr(), sharedPtr, outPtr, useVecLoad,
+                                        stream, attrs, 1);
   } else if (ew_dtype == DLDataType{kDLBfloat, 16, 1}) {
     tokenspeed::dispatchFinalize<tokenspeed::BF16>(
-        numTokens, hiddenDim, hiddenDimPadded, int(top_k), inPtr, expandedIdxPtr,
+        numTokens, hiddenDim, hiddenDimPadded, int(top_k), numShared, inPtr, expandedIdxPtr,
         expert_weights.data_ptr(), sharedPtr, outPtr, useVecLoad, stream, attrs, 1);
   } else {
     TVM_FFI_ICHECK(false) << "expert_weights dtype must be float32 or bfloat16";

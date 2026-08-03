@@ -46,10 +46,10 @@ class _Sender:
 
 
 class _FakeScheduler:
-    """Implements just the four size accessors the drain check reads."""
+    """Implements just the live-state size accessors the drain check reads."""
 
-    def __init__(self, waiting=0, decoding=0, prefilling=0, retract=0):
-        self._w, self._d, self._p, self._r = waiting, decoding, prefilling, retract
+    def __init__(self, waiting=0, decoding=0, prefilling=0):
+        self._w, self._d, self._p = waiting, decoding, prefilling
 
     def waiting_size(self):
         return self._w
@@ -59,9 +59,6 @@ class _FakeScheduler:
 
     def prefilling_size(self):
         return self._p
-
-    def retract_count(self):
-        return self._r
 
 
 def _controller():
@@ -77,7 +74,6 @@ def test_scheduler_drained_predicate():
     assert not scheduler_drained(_FakeScheduler(waiting=1))
     assert not scheduler_drained(_FakeScheduler(decoding=1))
     assert not scheduler_drained(_FakeScheduler(prefilling=1))
-    assert not scheduler_drained(_FakeScheduler(retract=1))
 
 
 # --- keep mode ---------------------------------------------------------------

@@ -31,8 +31,8 @@ from tokenspeed_kernel.ops.gemm.fp8_utils import (
     per_token_group_quant_fp8,
     per_token_quant_fp8,
     static_quant_fp8,
+    swizzle_mxfp8_scale,
 )
-from tokenspeed_kernel.platform import Platform
 from torch.nn.parameter import Parameter
 
 logger = logging.getLogger(__name__)
@@ -46,7 +46,11 @@ except ImportError:
     _ceil_to_ue8m0 = None
     _transform_sf = None
 
-from tokenspeed.runtime.layers.dense.utils import normalize_e4m3fn_to_e4m3fnuz
+try:
+    from tokenspeed_kernel.ops.gemm.flashinfer import has_flashinfer_mxfp8
+except ImportError:
+    has_flashinfer_mxfp8 = None
+
 from tokenspeed.runtime.layers.parameter import (
     BlockQuantScaleParameter,
     ModelWeightParameter,
@@ -55,8 +59,7 @@ from tokenspeed.runtime.layers.parameter import (
 from tokenspeed.runtime.layers.quantization.base_config import LinearMethodBase
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 from tokenspeed.runtime.layers.quantization.utils import convert_to_channelwise
-
-platform = Platform.get()
+from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 
 class Fp8LinearMethod(LinearMethodBase):
@@ -157,17 +160,21 @@ class Fp8LinearMethod(LinearMethodBase):
                         raise ValueError(
                             "Block FP8 requires dynamic linear activation quantization."
                         )
+                scale_dtype = self.quant_config.weight_scale_dtype
                 scale = BlockQuantScaleParameter(
                     data=torch.empty(
                         (output_size_per_partition + block_n - 1) // block_n,
                         (input_size_per_partition + block_k - 1) // block_k,
-                        dtype=torch.float32,
+                        dtype=scale_dtype,
                     ),
                     input_dim=1,
                     output_dim=0,
                     weight_loader=weight_loader,
                 )
-                scale[:] = torch.finfo(torch.float32).min
+                if scale_dtype == torch.uint8:
+                    scale.zero_()
+                else:
+                    scale[:] = torch.finfo(torch.float32).min
                 layer.register_parameter("weight_scale_inv", scale)
             else:
                 scale = PerTensorScaleParameter(
@@ -197,23 +204,17 @@ class Fp8LinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if self.block_quant:
-            # If ROCm, normalize the weights and scales to e4m3fnuz
-            if platform.is_fp8e4m3fnuz:
-                # activation_scheme: dynamic
-                weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-                    weight=layer.weight,
-                    weight_scale=layer.weight_scale_inv,
-                    input_scale=None,
-                )
-                layer.input_scale = None
-            else:
-                weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
-            layer.weight.data = weight.data
-            layer.weight_scale_inv.data = weight_scale.data
             layer._use_deep_gemm_fp8 = False
             is_bmm = getattr(layer, "is_bmm", False)
             is_ue8m0 = getattr(self.quant_config, "scale_fmt", None) == "ue8m0"
-            if _transform_sf is not None and _ceil_to_ue8m0 is not None and is_ue8m0:
+            scale_requires_transform = (
+                is_ue8m0 and layer.weight_scale_inv.dtype.is_floating_point
+            )
+            if (
+                _transform_sf is not None
+                and _ceil_to_ue8m0 is not None
+                and scale_requires_transform
+            ):
                 N, K = layer.weight.shape
                 block_n, block_k = self.quant_config.weight_block_size
                 if is_bmm:
@@ -261,6 +262,25 @@ class Fp8LinearMethod(LinearMethodBase):
                     f"weight={tuple(layer.weight.shape)}); ensure FP8 block-quant "
                     "ue8m0 weights with block-aligned dims and deep_gemm installed."
                 )
+            layer._use_flashinfer_mxfp8 = False
+            if (
+                not layer._use_deep_gemm_fp8
+                and not is_bmm
+                and has_flashinfer_mxfp8 is not None
+                and has_flashinfer_mxfp8()
+                and tuple(self.quant_config.weight_block_size) == (1, 32)
+                and layer.weight_scale_inv.dtype == torch.uint8
+                and layer.weight_scale_inv.dim() == 2
+            ):
+                N, K = layer.weight.shape
+                if N >= 128 and K >= 128 and K % 32 == 0:
+                    # Swizzle the e8m0 scales once into the F8_128x4 layout the
+                    # flashinfer cute-dsl GEMM consumes; the Triton fallback
+                    # cannot read this layout, so apply() pins the kernel.
+                    layer.weight_scale_inv.data = swizzle_mxfp8_scale(
+                        layer.weight_scale_inv.data, N, K
+                    )
+                    layer._use_flashinfer_mxfp8 = True
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
 
@@ -327,11 +347,12 @@ class Fp8LinearMethod(LinearMethodBase):
             output_shape = [*x.shape[:-1], layer.weight.shape[0]]
             output_dtype = output_dtype or x.dtype
 
-            override = (
-                "deep_gemm_mm_fp8_blockscale"
-                if getattr(layer, "_use_deep_gemm_fp8", False)
-                else None
-            )
+            if getattr(layer, "_use_deep_gemm_fp8", False):
+                override = "deep_gemm_mm_fp8_blockscale"
+            elif getattr(layer, "_use_flashinfer_mxfp8", False):
+                override = "flashinfer_mm_mxfp8"
+            else:
+                override = None
             output = tokenspeed_kernel.mm(
                 input_2d,
                 layer.weight,
@@ -342,6 +363,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 quant="mxfp8",
                 block_size=self.quant_config.weight_block_size,
                 override=override,
+                enable_pdl=pdl_enabled(),
             )
             return output.to(dtype=output_dtype).view(*output_shape)
         else:

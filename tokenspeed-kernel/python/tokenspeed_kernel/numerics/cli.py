@@ -27,14 +27,13 @@ from typing import Iterable
 import torch
 from tokenspeed_kernel.numerics.comparison import format_comparison
 from tokenspeed_kernel.numerics.verify import verify_kernel
-from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, load_builtin_kernels
 
 _DTYPE_SELECTIONS: dict[str, torch.dtype] = {
     "fp32": torch.float32,
     "fp16": torch.float16,
     "bf16": torch.bfloat16,
-    "fp8": Platform.get().fp8e4m3fn.dtype,
+    "fp8": torch.float8_e4m3fn,
 }
 
 

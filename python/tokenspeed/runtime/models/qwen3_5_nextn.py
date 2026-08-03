@@ -111,6 +111,8 @@ class Qwen3_5DraftAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
             ctx.attn_backend.spec_num_tokens - ctx.accept_lengths[num_extends:]
         ).to(seq_lens_buf.dtype)
         seq_lens_buf[num_extends : ctx.bs].sub_(correction).clamp_(min=1)
+        # Publish: the backend owns its buffer, so in-graph edits need a copy.
+        ctx.attn_backend.advance_draft_forward_metadata(seq_lens_buf[: ctx.bs])
 
     def _maybe_narrow_residual(
         self,
@@ -162,10 +164,6 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
         self.is_multimodal = hasattr(config, "text_config")
         if self.is_multimodal:
             config = config.text_config
-
-        # The MTP model is unquantized in the nvfp4 checkpoint.
-        if quant_config and quant_config.get_name() == "nvfp4":
-            quant_config = None
 
         self.config = config
         self.mapping = mapping
@@ -278,6 +276,15 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, logits_metadata
         )
+
+    def checkpoint_weight_name_filter(self, name: str) -> bool:
+        """Shard preselection for ``load_weights`` (see DefaultModelLoader).
+
+        Accepts a superset of the checkpoint names ``load_weights`` consumes
+        (it only processes MTP-branch weights), so shards without any MTP
+        tensor are skipped entirely.
+        """
+        return "mtp" in name
 
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False

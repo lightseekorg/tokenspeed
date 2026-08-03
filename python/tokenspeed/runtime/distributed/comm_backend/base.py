@@ -41,6 +41,24 @@ class CommBackend(ABC):
         self, tensor: torch.Tensor, group: Group, op=None
     ) -> torch.Tensor: ...
 
+    def all_reduce_two(
+        self,
+        first: torch.Tensor,
+        second: torch.Tensor,
+        group: Group,
+        op=None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reduce two tensors, falling back to two ordinary collectives."""
+        return (
+            self.all_reduce(first, group, op=op),
+            self.all_reduce(second, group, op=op),
+        )
+
+    def prepare_all_reduce_lane(self, group: Group, hidden_dim: int) -> bool:
+        """Prepare an implementation-specific one-shot lane when supported."""
+
+        return False
+
     @abstractmethod
     def all_gather(
         self, tensor: torch.Tensor, group: Group, dim: int = 0

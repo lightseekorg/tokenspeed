@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 import torch
 from tokenspeed_kernel import mla_decode_with_kvcache, mla_prefill
 
+from tokenspeed.runtime.configs.cache_runtime import cache_debug_enabled
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -34,6 +35,7 @@ from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
 )
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+from tokenspeed.runtime.layers.attention.page_table import expand_page_table
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.layers.attention.utils import build_page_table
 from tokenspeed.runtime.utils.common import ceil_div
@@ -60,6 +62,8 @@ class MLAPrefillMetadata:
     chunked_seq_len: torch.Tensor
     cu_chunked_seq_len: torch.Tensor
     max_chunk_len_per_loop: list[int]
+    # Paged cache only: absolute latent locations for model-owned extend writes.
+    group_out_cache_loc: torch.Tensor | None = None
 
 
 @dataclass(kw_only=True)
@@ -68,6 +72,8 @@ class MLADecodeMetadata:
     num_extends: int
     page_table: torch.Tensor
     seq_lens: torch.Tensor
+    # Paged cache only: one absolute latent write location per batch row.
+    group_out_cache_loc: torch.Tensor | None = None
 
     @property
     def block_kv_indices(self) -> torch.Tensor:
@@ -81,9 +87,13 @@ class MLADecodeMetadata:
 class MLAAttnBackend(AttentionBackend):
     """Unified MLA backend routed through tokenspeed_kernel MLA APIs."""
 
+    cache_consumer_families = frozenset({"history"})
+
     def __init__(self, config: MLAConfig):
         super().__init__(config)
 
+        self._cache_groups_bound = False
+        self._cache_contract_bound = False
         self.max_context_len = config.context_len
         self.page_size = config.page_size
         self.max_num_pages = ceil_div(self.max_context_len, self.page_size)
@@ -105,6 +115,144 @@ class MLAAttnBackend(AttentionBackend):
         self.decode_cuda_graph_metadata: dict[int, MLADecodeMetadata] = {}
         self.cuda_graph_page_table: torch.Tensor | None = None
         self.cuda_graph_seq_lens: torch.Tensor | None = None
+        self.decode_cuda_graph_group_out_cache_loc: torch.Tensor | None = None
+
+    def mark_cache_contract(self) -> None:
+        """Enable Paged cache graph state before capture buffers are allocated."""
+        self._cache_contract_bound = True
+
+    def _resolve_full_history_table(
+        self, cache_metadata, forward_batch, bs: int
+    ) -> tuple[torch.Tensor, int]:
+        table = cache_metadata.require_full_attention_table(
+            active_forward_op=forward_batch
+        )
+        if table.shape[0] < bs:
+            raise RuntimeError(
+                f"full-attention table has {table.shape[0]} rows but the "
+                f"batch has {bs} requests"
+            )
+        logical_page_size = int(cache_metadata.block_size)
+        if logical_page_size <= 0 or logical_page_size % self.page_size:
+            raise RuntimeError(
+                f"logical page size {logical_page_size} is not a positive multiple "
+                f"of the MLA kernel page size {self.page_size}"
+            )
+        if table.stride(0) != table.shape[1] and table.shape[0] > 1:
+            table = table.contiguous()
+        return table, logical_page_size
+
+    @staticmethod
+    def _validate_live_pages(
+        table: torch.Tensor, seq_lens: torch.Tensor, logical_page_size: int
+    ) -> None:
+        """Reject null or missing Paged cache pages inside each request's live range."""
+        if table.numel() == 0 or seq_lens.numel() == 0:
+            return
+        batch_size = seq_lens.shape[0]
+        live_pages = (
+            (seq_lens.to(torch.int64) + logical_page_size - 1) // logical_page_size
+        ).clamp_max_(table.shape[1])
+        columns = torch.arange(table.shape[1], device=table.device)
+        live_entries = table[:batch_size][
+            columns.unsqueeze(0) < live_pages.unsqueeze(1)
+        ]
+        if not bool((live_entries > 0).all().item()):
+            raise RuntimeError(
+                "full-attention table contains -1 or the null page 0 "
+                "inside a live range"
+            )
+
+    def _expand_group_page_table(
+        self,
+        table: torch.Tensor,
+        *,
+        batch_size: int,
+        logical_page_size: int,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Expand scheduler pages for this backend's MLA kernel pages."""
+        return expand_page_table(
+            table[:batch_size],
+            logical_page_size=logical_page_size,
+            kernel_page_size=self.page_size,
+            max_kernel_pages=self.max_num_pages,
+            out=out,
+        )
+
+    @staticmethod
+    def _cache_decode_out_cache_loc(
+        table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        *,
+        batch_size: int,
+        logical_page_size: int,
+        validate_pages: bool = False,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return absolute cache locations for decoded tokens in Paged cache."""
+        positions = (seq_lens[:batch_size].to(torch.int64) - 1).clamp_min(0)
+        page_indices = torch.div(positions, logical_page_size, rounding_mode="floor")
+        pages = table[:batch_size].gather(1, page_indices.unsqueeze(1)).squeeze(1)
+        if validate_pages and pages.numel() and not bool((pages > 0).all().item()):
+            raise RuntimeError(
+                "MLA write location resolves to the null page 0 or a " "-1 table hole"
+            )
+        locations = pages.clamp_min(0).to(torch.int64) * logical_page_size + (
+            positions % logical_page_size
+        )
+        if out is not None:
+            out[:batch_size].copy_(locations)
+            return out
+        return locations
+
+    @staticmethod
+    def _extend_out_cache_loc(
+        table: torch.Tensor,
+        extend_prefix_lens_cpu: torch.Tensor,
+        extend_seq_lens_cpu: torch.Tensor,
+        *,
+        logical_page_size: int,
+        validate_pages: bool = False,
+    ) -> torch.Tensor:
+        """Return packed Paged cache extend-write locations in query order."""
+        chunks: list[torch.Tensor] = []
+        pages_for_validation: list[torch.Tensor] = []
+        for row, (start, num_new) in enumerate(
+            zip(
+                extend_prefix_lens_cpu.tolist(),
+                extend_seq_lens_cpu.tolist(),
+                strict=True,
+            )
+        ):
+            start, num_new = int(start), int(num_new)
+            if num_new <= 0:
+                continue
+            max_column = (start + num_new - 1) // logical_page_size
+            if max_column >= table.shape[1]:
+                raise RuntimeError(
+                    "extend write locations exceed the full-attention "
+                    f"table: row={row}, prefix={start}, new={num_new}, "
+                    f"logical_page_size={logical_page_size}, columns={table.shape[1]}"
+                )
+            positions = torch.arange(
+                start, start + num_new, dtype=torch.int64, device=table.device
+            )
+            pages = table[row].gather(0, positions // logical_page_size)
+            pages_for_validation.append(pages)
+            chunks.append(
+                pages.to(torch.int64) * logical_page_size
+                + positions % logical_page_size
+            )
+        if not chunks:
+            return torch.empty(0, dtype=torch.int64, device=table.device)
+        if validate_pages and not bool(
+            (torch.cat(pages_for_validation) > 0).all().item()
+        ):
+            raise RuntimeError(
+                "MLA write location resolves to the null page 0 or a " "-1 table hole"
+            )
+        return torch.cat(chunks)
 
     def init_forward_metadata(
         self,
@@ -120,6 +268,27 @@ class MLAAttnBackend(AttentionBackend):
         extend_prefix_lens_cpu: torch.Tensor | None = None,
         **kwargs,
     ):
+        cache_metadata = kwargs.pop("cache_metadata", None)
+        forward_batch = kwargs.pop("forward_batch", None)
+        group_table = None
+        logical_page_size = None
+        if cache_metadata is not None:
+            if self.is_draft or self.spec_num_tokens > 1:
+                raise NotImplementedError(
+                    "MLA Paged cache does not support speculative decoding"
+                )
+            self._cache_groups_bound = True
+            group_table, logical_page_size = self._resolve_full_history_table(
+                cache_metadata, forward_batch, bs
+            )
+            if cache_debug_enabled():
+                self._validate_live_pages(group_table, seq_lens[:bs], logical_page_size)
+        elif self._cache_groups_bound and bs > 0 and not forward_mode.is_idle():
+            raise RuntimeError(
+                "MLAAttnBackend is bound to Paged cache but received no paged cache "
+                "metadata; refusing the legacy req_to_page path"
+            )
+
         if forward_mode.is_extend_or_mixed():
             self._init_prefill_metadata(
                 seq_lens=seq_lens[:num_extends],
@@ -129,6 +298,8 @@ class MLAAttnBackend(AttentionBackend):
                 extend_prefix_lens_cpu=extend_prefix_lens_cpu[:num_extends],
                 extend_seq_lens=extend_seq_lens[:num_extends],
                 extend_seq_lens_cpu=extend_seq_lens_cpu[:num_extends],
+                group_table=group_table,
+                logical_page_size=logical_page_size,
             )
 
         if (
@@ -142,6 +313,8 @@ class MLAAttnBackend(AttentionBackend):
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 req_to_page=req_to_page,
+                group_table=group_table,
+                logical_page_size=logical_page_size,
             )
 
     @contextmanager
@@ -163,6 +336,8 @@ class MLAAttnBackend(AttentionBackend):
         extend_prefix_lens_cpu: torch.Tensor,
         extend_seq_lens: torch.Tensor,
         extend_seq_lens_cpu: torch.Tensor,
+        group_table: torch.Tensor | None = None,
+        logical_page_size: int | None = None,
     ):
         extend_seq_lens_cpu_list = [int(x) for x in extend_seq_lens_cpu.tolist()]
         cum_extend_seq_lens = torch.zeros(
@@ -175,6 +350,26 @@ class MLAAttnBackend(AttentionBackend):
         max_extend_seq_len = max(extend_seq_lens_cpu_list, default=0)
         max_extend_prefix_len = int(extend_prefix_lens_cpu.max().item())
 
+        if group_table is not None:
+            assert logical_page_size is not None
+            group_out_cache_loc = self._extend_out_cache_loc(
+                group_table[: seq_lens.shape[0]],
+                extend_prefix_lens_cpu,
+                extend_seq_lens_cpu,
+                logical_page_size=logical_page_size,
+                validate_pages=cache_debug_enabled(),
+            )
+            chunk_req_to_page = group_table[: seq_lens.shape[0]]
+            chunk_req_pool_indices = torch.arange(
+                seq_lens.shape[0], dtype=torch.int64, device=group_table.device
+            )
+            chunk_page_size = logical_page_size
+        else:
+            group_out_cache_loc = None
+            chunk_req_to_page = req_to_page
+            chunk_req_pool_indices = req_pool_indices
+            chunk_page_size = self.page_size
+
         (
             chunked_loop_num,
             chunk_kv_indices_list,
@@ -184,9 +379,9 @@ class MLAAttnBackend(AttentionBackend):
         ) = build_chunked_prefill_metadata_arrays(
             extend_prefix_lens,
             extend_prefix_lens_cpu,
-            req_to_page,
-            req_pool_indices,
-            self.page_size,
+            chunk_req_to_page,
+            chunk_req_pool_indices,
+            chunk_page_size,
         )
 
         metadata = MLAPrefillMetadata(
@@ -203,6 +398,7 @@ class MLAAttnBackend(AttentionBackend):
             chunked_seq_len=chunked_seq_len,
             cu_chunked_seq_len=cu_chunked_seq_len,
             max_chunk_len_per_loop=max_chunk_len_per_loop,
+            group_out_cache_loc=group_out_cache_loc,
         )
         self.forward_prefill_metadata = metadata
         self.chunked_prefill_metadata = metadata
@@ -214,33 +410,78 @@ class MLAAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         req_to_page: torch.Tensor,
+        group_table: torch.Tensor | None = None,
+        logical_page_size: int | None = None,
     ):
-        page_table = build_page_table(
-            req_pool_indices[:bs],
-            req_to_page,
-            self.page_size,
-            self.max_context_len,
-        )
+        if group_table is not None:
+            assert logical_page_size is not None
+            page_table = self._expand_group_page_table(
+                group_table,
+                batch_size=bs,
+                logical_page_size=logical_page_size,
+            )
+            group_out_cache_loc = self._cache_decode_out_cache_loc(
+                group_table,
+                seq_lens,
+                batch_size=bs,
+                logical_page_size=logical_page_size,
+                validate_pages=cache_debug_enabled(),
+            )
+        else:
+            page_table = build_page_table(
+                req_pool_indices[:bs],
+                req_to_page,
+                self.page_size,
+                self.max_context_len,
+            )
+            group_out_cache_loc = None
         self.forward_decode_metadata = MLADecodeMetadata(
             num_extends=num_extends,
             page_table=page_table,
             seq_lens=seq_lens[:bs],
+            group_out_cache_loc=group_out_cache_loc,
         )
 
-    def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor):
-        assert (
-            seq_lens_buf.dtype == torch.int32
-            and seq_lens_buf.dim() == 1
-            and seq_lens_buf.shape[0] >= max_bs
-        ), (
-            f"seq_lens_buf must be int32 with shape[0] >= {max_bs}, "
-            f"got {seq_lens_buf.dtype} {tuple(seq_lens_buf.shape)}"
-        )
+    def select_out_cache_loc(self, layer, out_cache_loc, forward_mode=None):
+        if (
+            not self._cache_groups_bound
+            or forward_mode is None
+            or forward_mode.is_idle()
+        ):
+            return out_cache_loc
+        if forward_mode.is_decode():
+            metadata = self.forward_decode_metadata
+            if metadata is None or metadata.group_out_cache_loc is None:
+                raise RuntimeError("MLA decode write locations are missing")
+            locs = metadata.group_out_cache_loc[metadata.num_extends :]
+        else:
+            metadata = self.forward_prefill_metadata
+            if metadata is None or metadata.group_out_cache_loc is None:
+                raise RuntimeError("MLA prefill write locations are missing")
+            locs = metadata.group_out_cache_loc
+        if out_cache_loc is not None and locs.shape[0] != out_cache_loc.shape[0]:
+            raise RuntimeError(
+                f"MLA write locations cover {locs.shape[0]} tokens but "
+                f"the caller provided {out_cache_loc.shape[0]}"
+            )
+        return locs
+
+    def init_cuda_graph_state(self, max_bs: int):
         self.cuda_graph_page_table = torch.zeros(
             (max_bs, self.max_num_pages), dtype=torch.int32, device=self.device
         )
-        self.cuda_graph_seq_lens = seq_lens_buf
+        # Own the cache-seqlens buffer; replay copies the live lengths in, so
+        # graph state does not depend on the controller mutating a shared tensor.
+        self.cuda_graph_seq_lens = torch.zeros(
+            max_bs, dtype=torch.int32, device=self.device
+        )
         self.decode_cuda_graph_metadata = {}
+        if self._cache_contract_bound:
+            self.decode_cuda_graph_group_out_cache_loc = torch.zeros(
+                max_bs, dtype=torch.int64, device=self.device
+            )
+        else:
+            self.decode_cuda_graph_group_out_cache_loc = None
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -248,17 +489,40 @@ class MLAAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
+        cache_group_ids: tuple[str, ...] = (),
+        **kwargs,
     ):
         if forward_mode.is_extend_or_mixed():
             raise NotImplementedError(
                 f"mla CUDA graph capture not supported for {forward_mode}"
             )
 
+        uses_cache_groups = bool(cache_group_ids) or self._cache_contract_bound
+        if uses_cache_groups and (self.is_draft or self.spec_num_tokens > 1):
+            raise NotImplementedError(
+                "MLA Paged cache CUDA graph capture does not support speculative decoding"
+            )
+        page_table = self.cuda_graph_page_table[:bs, :]
+        if uses_cache_groups:
+            self._cache_groups_bound = True
+            if self.decode_cuda_graph_group_out_cache_loc is None:
+                raise RuntimeError(
+                    "MLA Paged cache graph capture buffer was not allocated; "
+                    "mark_cache_contract must run before init_cuda_graph_state"
+                )
+            page_table.zero_()
+            group_out_cache_loc = self.decode_cuda_graph_group_out_cache_loc[:bs]
+            group_out_cache_loc.zero_()
+        else:
+            group_out_cache_loc = None
         metadata = MLADecodeMetadata(
             num_extends=0,
-            page_table=self.cuda_graph_page_table[:bs, :],
+            page_table=page_table,
             seq_lens=self.cuda_graph_seq_lens[:bs],
+            group_out_cache_loc=group_out_cache_loc,
         )
+        # Seed the owned buffer: the capture run reads it before replay.
+        metadata.seq_lens.copy_(seq_lens[:bs])
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
 
@@ -276,10 +540,57 @@ class MLAAttnBackend(AttentionBackend):
                 f"mla CUDA graph replay not supported for {forward_mode}"
             )
 
-        self.cuda_graph_page_table[:bs, : self.max_num_pages].copy_(
-            req_to_page[req_pool_indices[:bs], : self.max_num_pages]
-        )
-        self.forward_decode_metadata = self.decode_cuda_graph_metadata[bs]
+        metadata = self.decode_cuda_graph_metadata[bs]
+        # Copy the live lengths into our own cache-seqlens buffer (metadata.seq_lens
+        # views it); both metadata paths read it at replay.
+        self.cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs])
+        if metadata.group_out_cache_loc is not None:
+            self._replay_refresh_decode(
+                bs,
+                seq_lens,
+                metadata,
+                kwargs.get("cache_metadata"),
+                kwargs.get("forward_batch"),
+            )
+        else:
+            self.cuda_graph_page_table[:bs, : self.max_num_pages].copy_(
+                req_to_page[req_pool_indices[:bs], : self.max_num_pages]
+            )
+        self.forward_decode_metadata = metadata
+
+    def _replay_refresh_decode(
+        self,
+        bs: int,
+        seq_lens: torch.Tensor,
+        metadata: MLADecodeMetadata,
+        cache_metadata,
+        forward_batch,
+    ) -> None:
+        if metadata.group_out_cache_loc is None:
+            raise RuntimeError("MLA graph metadata has no write-location buffer")
+        real_bs = 0
+        if cache_metadata is not None:
+            table, logical_page_size = self._resolve_full_history_table(
+                cache_metadata, forward_batch, 0
+            )
+            real_bs = min(int(table.shape[0]), bs)
+            if real_bs > 0:
+                self._expand_group_page_table(
+                    table,
+                    batch_size=real_bs,
+                    logical_page_size=logical_page_size,
+                    out=metadata.page_table,
+                )
+                self._cache_decode_out_cache_loc(
+                    table,
+                    seq_lens,
+                    batch_size=real_bs,
+                    logical_page_size=logical_page_size,
+                    validate_pages=cache_debug_enabled(),
+                    out=metadata.group_out_cache_loc,
+                )
+        metadata.page_table[real_bs:bs].zero_()
+        metadata.group_out_cache_loc[real_bs:bs].zero_()
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
@@ -300,6 +611,11 @@ class MLAAttnBackend(AttentionBackend):
         # [T, 1, R + D_rope]. DeepSeek normally writes cache before this call.
         if save_kv_cache:
             assert k is not None
+            out_cache_loc = self.select_out_cache_loc(
+                layer,
+                out_cache_loc,
+                kwargs.get("forward_mode", ForwardMode.DECODE),
+            )
             token_to_kv_pool.set_mla_kv_buffer(
                 layer,
                 out_cache_loc,
@@ -338,8 +654,7 @@ class MLAAttnBackend(AttentionBackend):
             max_seqlen_k = self.max_context_len
 
         softmax_scale = layer.scaling
-        if self.data_type == torch.float8_e4m3fn:
-            query = query.to(self.data_type)
+        if self.data_type in (torch.float8_e4m3fn, torch.float8_e5m2):
             k_scale = (
                 layer.k_scale_float
                 if getattr(layer, "k_scale_float", None) is not None

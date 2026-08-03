@@ -138,6 +138,50 @@ def test_set_matches_torch_reference(n_loc, dtype, pattern):
     assert _bitwise_equal(kv, ref)
 
 
+@pytest.mark.parametrize("n_loc", [4, 600])
+@pytest.mark.parametrize("pattern", ["seq", "rand"])
+def test_set_casts_bf16_sources_into_fp8_buffer(n_loc, pattern):
+    """The write kernel casts to the buffer dtype on store, so bf16 sources
+    land in an fp8 buffer byte-for-byte as if pre-cast with torch. Spans both
+    dispatch branches via the n_loc parametrization."""
+    loc, k_nope, k_rope = _make_inputs(n_loc, torch.bfloat16, pattern)
+    kv = _empty_kv(torch.float8_e4m3fn)
+    ref = _torch_set_reference(
+        kv, loc, k_nope.to(torch.float8_e4m3fn), k_rope.to(torch.float8_e4m3fn)
+    )
+
+    set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope)
+    torch.cuda.synchronize()
+
+    assert _bitwise_equal(kv, ref)
+
+
+@pytest.mark.parametrize("n_loc", [4, 600])
+def test_set_squashes_nan_and_inf(n_loc):
+    """Sanitized mixed-dtype writes stay finite in the fp8 destination."""
+    loc, k_nope, k_rope = _make_inputs(n_loc, torch.bfloat16, "rand")
+    k_nope[0, 0, 0] = float("nan")
+    k_nope[0, 0, 1] = float("inf")
+    k_rope[0, 0, 0] = float("-inf")
+    kv = _empty_kv(torch.float8_e4m3fn)
+    ref = _torch_set_reference(
+        kv,
+        loc,
+        torch.nan_to_num(k_nope.float(), nan=0.0, posinf=448.0, neginf=-448.0).to(
+            torch.float8_e4m3fn
+        ),
+        torch.nan_to_num(k_rope.float(), nan=0.0, posinf=448.0, neginf=-448.0).to(
+            torch.float8_e4m3fn
+        ),
+    )
+
+    set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope, sanitize=True)
+    torch.cuda.synchronize()
+
+    assert _bitwise_equal(kv, ref)
+    assert not torch.isnan(kv[loc.cpu()].float()).any()
+
+
 @pytest.mark.parametrize("n_loc", [4, 511, 512, 4096])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_set_pdl_invariant(n_loc, dtype):

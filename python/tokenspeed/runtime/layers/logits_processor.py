@@ -31,6 +31,9 @@ from tokenspeed_kernel.ops.sampling.cute_dsl import (
     create_dist_argmax_state,
     distributed_argmax,
 )
+from tokenspeed_kernel.ops.sampling.cute_dsl import (
+    is_available as dist_argmax_available,
+)
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
@@ -56,6 +59,12 @@ from tokenspeed.runtime.sampling.logits_layout import (
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
+
+
+def _force_deterministic_rsag() -> bool:
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    return bool(global_server_args_dict.get("force_deterministic_rsag", False))
 
 
 @dataclasses.dataclass
@@ -285,11 +294,23 @@ class LogitsProcessor(nn.Module):
             num_tokens_per_req=n,
         )
 
+    def _tp_group_spans_nodes(self) -> bool:
+        if self.tp_group is None:
+            return False
+
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        mapping = global_server_args_dict.get("mapping")
+        nprocs_per_node = getattr(mapping, "nprocs_per_node", None)
+        if not nprocs_per_node:
+            return False
+        return len({rank // nprocs_per_node for rank in self.tp_group}) > 1
+
     def _init_all_gather_state(self, lm_head: VocabParallelEmbedding):
-        if not current_platform().is_nvidia:
+        if not current_platform().is_nvidia or _force_deterministic_rsag():
             return None
 
-        if self.tp_size == 1 or self.skip_all_gather:
+        if self.tp_size == 1 or self.skip_all_gather or self._tp_group_spans_nodes():
             return None
 
         vocab_padded = lm_head.weight.size(0) * self.tp_size
@@ -307,10 +328,20 @@ class LogitsProcessor(nn.Module):
         return self._LOGITS_AG_STATES[key]
 
     def _init_dist_argmax_state(self, lm_head: VocabParallelEmbedding):
-        if not current_platform().is_nvidia:
+        if not current_platform().is_nvidia or _force_deterministic_rsag():
             return None
 
-        if self.tp_size == 1 or self.skip_all_gather or self.dp_sampling_enabled:
+        # CuTe DSL argmax is unavailable on some SKUs (e.g. H20 lacks TMA
+        # cluster launch). Fall back to the plain all-gather + argmax path.
+        if not dist_argmax_available():
+            return None
+
+        if (
+            self.tp_size == 1
+            or self.skip_all_gather
+            or self.dp_sampling_enabled
+            or self._tp_group_spans_nodes()
+        ):
             return None
 
         vocab_per_rank = lm_head.weight.size(0)

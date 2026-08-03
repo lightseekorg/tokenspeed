@@ -20,6 +20,13 @@
 
 #pragma once
 
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <set>
+#include <string>
+#include <vector>
+
 #include "scheduler/scheduler.h"
 #include "scheduler/execution_plan.h"
 #include "scheduler/execution_event.h"
@@ -41,8 +48,15 @@ protected:
         cfg.host_allocator.total_pages = 32;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
-        cfg.enable_l3_storage = true;
-        cfg.prefetch_threshold = 2;
+        cfg.enable_l3_storage = false;
+        cfg.paged_cache_groups.push_back(PagedCacheGroupConfig{
+            .group_id = "full_attention",
+            .rows_per_page = cfg.block_size,
+            .entry_stride_tokens = 1,
+            .total_pages = cfg.device_allocator.total_pages,
+            .retention = PagedCacheGroupConfig::Retention::FullHistory,
+            .family = PagedCacheGroupFamily::History,
+        });
         return cfg;
     }
 
@@ -58,17 +72,6 @@ protected:
         return RequestSpec{
             .request_id = id,
             .tokens = tokens,
-        };
-    }
-
-    RequestSpec MakePrefetchableSpec(const std::string& id, std::int32_t num_pages, std::int32_t storage_hit_pages,
-                                     token_t start = 1) {
-        auto tokens = MakeAlignedTokens(num_pages, PageSize(), start);
-        return RequestSpec{
-            .request_id = id,
-            .tokens = tokens,
-            .rolling_hashes = MakePageHashes(storage_hit_pages, "rh"),
-            .storage_hit_pages = storage_hit_pages,
         };
     }
 
@@ -145,4 +148,80 @@ protected:
     SchedulerConfig config_{};
     std::unique_ptr<Scheduler> scheduler_;
 };
+
+// Returns the first ForwardBatch in `plan`, or nullptr if none.
+inline const ForwardBatch* FindForwardBatch(const ExecutionPlan& plan) {
+    for (const auto& op : plan.Operations()) {
+        if (const auto* batch = std::get_if<ForwardBatch>(&op)) return batch;
+    }
+    return nullptr;
+}
+
+// Inserts every real (>0) page id found in `rows` into `seen`, expecting each
+// id to be new — i.e. not repeated within `rows` and disjoint from any id
+// already in `seen` (callers can chain groups through one set to assert
+// cross-group disjointness, or use a fresh set per group).
+//
+// Arguments:
+//   rows: block-table rows to scan (one vector<int32> per request row).
+//   seen: accumulator of page ids; grows with the ids found here.
+//   context: label prepended to failure messages (e.g. the group id).
+// Returns the number of real (>0) entries visited, so callers can check
+// `seen.size()` growth against it.
+inline std::size_t CollectDisjointRealPages(const std::vector<std::vector<std::int32_t>>& rows,
+                                            std::set<std::int32_t>& seen, const std::string& context) {
+    std::size_t real_entries = 0;
+    for (const auto& row : rows) {
+        for (std::int32_t id : row) {
+            if (id > 0) {
+                ++real_entries;
+                EXPECT_TRUE(seen.insert(id).second) << context << ": page " << id << " handed out more than once";
+            }
+        }
+    }
+    return real_entries;
+}
+
+// Kimi-K3-shaped KV-cache fixture: one full-attention (history) group
+// plus three linear-attention (state) groups drawing from one global pool.
+// Shared by test_kv_cache_lifecycle.cpp and test_kv_cache_scenarios.cpp.
+class KimiFourGroupSuite : public SchedulerTestSuite {
+protected:
+    static const std::array<std::string, 4>& GroupIds() {
+        static const std::array<std::string, 4> ids{"full_attention", "linear_attention_0", "linear_attention_1",
+                                                    "linear_attention_2"};
+        return ids;
+    }
+
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.block_size = 2;
+        cfg.device_allocator.total_pages = 33;
+        cfg.host_allocator.total_pages = 0;
+        cfg.max_scheduled_tokens = 64;
+        cfg.max_batch_size = 8;
+        cfg.enable_l3_storage = false;
+        cfg.disable_l2_cache = true;
+        cfg.disable_prefix_cache = false;
+
+        for (std::size_t i = 0; i < GroupIds().size(); ++i) {
+            PagedCacheGroupConfig group;
+            group.group_id = GroupIds()[i];
+            group.rows_per_page = cfg.block_size;
+            group.entry_stride_tokens = 1;
+            group.total_pages = cfg.device_allocator.total_pages;
+            group.retention = PagedCacheGroupConfig::Retention::FullHistory;
+            group.family = i == 0 ? PagedCacheGroupFamily::History : PagedCacheGroupFamily::State;
+            cfg.paged_cache_groups.push_back(std::move(group));
+        }
+        return cfg;
+    }
+
+    void AbortRequest(const std::string& id) {
+        ExecutionEvent event;
+        event.With(ForwardEvent{forward::Abort{.request_id = id}});
+        scheduler_->Advance(std::move(event));
+    }
+};
+
 }  // namespace tokenspeed::test

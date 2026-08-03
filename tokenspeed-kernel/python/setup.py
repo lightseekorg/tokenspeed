@@ -46,7 +46,7 @@ from setuptools.command.editable_wheel import editable_wheel
 ROOT = Path(__file__).resolve().parent
 REQUIREMENTS_DIR = ROOT / "requirements"
 THIRDPARTY_DIR = ROOT / "tokenspeed_kernel" / "thirdparty"
-BASE_VERSION = "0.1.0"
+BASE_VERSION = "0.1.3"
 BACKEND_ENV = "TOKENSPEED_KERNEL_BACKEND"
 VALID_BACKENDS = {"cuda", "rocm"}
 DEFAULT_CUDA_ARCHS = ("100a", "103a")
@@ -208,9 +208,19 @@ def _read_requirements(path: Path, seen=None) -> list[str]:
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
+        include = None
         if line.startswith("-r ") or line.startswith("--requirement "):
             include = line.split(maxsplit=1)[1]
+        elif line.startswith("-r") and len(line) > 2:
+            include = line[2:].strip()
+        elif line.startswith("--requirement="):
+            include = line.split("=", maxsplit=1)[1].strip()
+        if include:
             requirements.extend(_read_requirements(path.parent / include, seen))
+            continue
+        if line.startswith("-"):
+            # Installer options such as --extra-index-url are not valid
+            # project dependency metadata.
             continue
         requirements.append(line)
     return requirements
@@ -218,7 +228,7 @@ def _read_requirements(path: Path, seen=None) -> list[str]:
 
 def _selected_install_requires() -> list[str]:
     backend = _selected_backend()
-    requirements = []
+    requirements = _read_requirements(REQUIREMENTS_DIR / f"{backend}.txt")
     requirements.extend(
         _read_requirements(REQUIREMENTS_DIR / f"{backend}-thirdparty.txt")
     )
@@ -307,20 +317,18 @@ KERNEL_GROUPS = [
         [],
     ),
     (
+        "minimax_m3_fused",
+        [
+            CUDA_CSRC_DIR / "fused_minimax_m3_qknorm_rope_kv_insert.cu",
+        ],
+        [],
+    ),
+    (
         "dsv3_gemm",
         [
             CUDA_CSRC_DIR / "dsv3_router_gemm_float_out.cu",
             CUDA_CSRC_DIR / "dsv3_router_gemm.cu",
             CUDA_CSRC_DIR / "dsv3_router_gemm_binding.cu",
-        ],
-        ["-lcublas", "-lcublasLt"],
-    ),
-    (
-        "fp32_router_gemm",
-        [
-            CUDA_CSRC_DIR / "fp32_router_gemm.cu",
-            CUDA_CSRC_DIR / "fp32_router_gemm_entry.cu",
-            CUDA_CSRC_DIR / "fp32_router_gemm_binding.cu",
         ],
         ["-lcublas", "-lcublasLt"],
     ),
@@ -422,9 +430,18 @@ KERNEL_GROUPS = [
         [
             CUDA_CSRC_DIR / "trtllm_allreduce.cu",
             CUDA_CSRC_DIR / "trtllm_allreduce_fusion.cu",
+            CUDA_CSRC_DIR / "trtllm_mnnvl_allreduce_fusion.cu",
             CUDA_CSRC_DIR / "trtllm_reducescatter_fusion.cu",
             CUDA_CSRC_DIR / "trtllm_allgather_fusion.cu",
             CUDA_CSRC_DIR / "minimax_reduce_rms.cu",
+        ],
+        [],
+    ),
+    (
+        "attn_res",
+        [
+            CUDA_CSRC_DIR / "attn_res" / "attn_res_fwd_tma.cu",
+            CUDA_CSRC_DIR / "attn_res_binding.cu",
         ],
         [],
     ),
@@ -488,6 +505,48 @@ class CudaKernelBuilder:
                 seen.add(path_str)
                 yield path
 
+    def _read_cuda_header_version(self, include_dir: Path):
+        header = include_dir / "cuda_runtime_api.h"
+        if not header.exists():
+            return None
+
+        try:
+            for line in header.read_text(
+                encoding="utf-8", errors="ignore"
+            ).splitlines():
+                if line.startswith("#define CUDART_VERSION"):
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        version = int(parts[2])
+                        return version // 1000, (version % 1000) // 10
+        except (OSError, ValueError):
+            return None
+
+        return None
+
+    def _nvcc_toolkit_version(self):
+        try:
+            output = subprocess.check_output(
+                [NVCC, "--version"],
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            return None
+
+        marker = "release "
+        for line in output.splitlines():
+            if marker not in line:
+                continue
+            version_text = line.split(marker, 1)[1].split(",", 1)[0].strip()
+            parts = version_text.split(".")
+            if len(parts) >= 2:
+                try:
+                    return int(parts[0]), int(parts[1])
+                except ValueError:
+                    return None
+        return None
+
     def _cuda_toolkit_roots(self):
         roots = [Path(CUDA_HOME)]
 
@@ -526,12 +585,30 @@ class CudaKernelBuilder:
 
         # Do not mix wheel CUDA headers with an available toolkit.
         if not found_toolkit_headers:
+            nvcc_version = self._nvcc_toolkit_version()
             found_wheel_headers = False
             for base_path in self._site_paths():
                 for candidate in sorted(
                     base_path.glob("nvidia/cu*/include"), reverse=True
                 ):
                     if not _is_complete_cuda_include(candidate):
+                        continue
+                    # The nvidia-cuda-runtime wheels may lag the nvcc minor
+                    # version. Mixing them trips CCCL's toolkit compatibility
+                    # check, so only use matching fallback headers.
+                    header_version = self._read_cuda_header_version(candidate)
+                    if (
+                        nvcc_version
+                        and header_version
+                        and header_version != nvcc_version
+                    ):
+                        if self.verbose:
+                            print(
+                                "Skipping CUDA include with mismatched toolkit "
+                                f"version: {candidate} "
+                                f"({header_version[0]}.{header_version[1]} != nvcc "
+                                f"{nvcc_version[0]}.{nvcc_version[1]})"
+                            )
                         continue
                     _add_dir(candidate)
                     if (candidate / "cccl").exists():
@@ -820,7 +897,24 @@ setup(
     install_requires=_selected_install_requires(),
     packages=find_packages(),
     package_data={
+        # Pre-swept flashinfer MoE tactic tables (see ops/tuning.py).
+        "tokenspeed_kernel.ops.moe.flashinfer": ["tactics/*.json"],
         "tokenspeed_kernel.thirdparty.cuda": ["objs/**/*.so"],
+        # Vendored MiniMax MSA CuTe sources: cute/ has no __init__.py (it is
+        # loaded via the upstream sys.path bootstrap), so ship it as data.
+        "tokenspeed_kernel.thirdparty.msa": [
+            "README.md",
+            "cute/**/*.py",
+            "cute/**/*.cu",
+            "cute/README.md",
+            "cute/requirements.txt",
+            # nvcc-JIT FMHA sources: compiled at runtime by jit.py, so the
+            # kernel sources and headers must ship with the wheel.
+            "csrc/*.cu",
+            "csrc/*.h",
+            "csrc/*.jinja",
+            "csrc/include/*",
+        ],
     },
     cmdclass={
         "build_native": BuildNative,

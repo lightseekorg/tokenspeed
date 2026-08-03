@@ -15,6 +15,7 @@ from tokenspeed_kernel.ops.attention.flashinfer.dsa_topk import (
     deterministic_decode_topk,
 )
 from tokenspeed_kernel.ops.attention.triton.dsa_topk import (
+    combine_topk_weights,
     local_topk_to_global_slots,
 )
 from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
@@ -37,6 +38,33 @@ _CUTE_DSL_DECODE_TOPK_ENABLED = os.environ.get("TS_DSA_DECODE_TOPK_CUTEDSL", "1"
 def _use_cute_dsl_decode_topk() -> bool:
     """Whether the DSA decode top-k should use the CuTe DSL cluster kernel."""
     return _CUTE_DSL_DECODE_TOPK_ENABLED and has_cute_dsl_decode_topk()
+
+
+def _prepare_logits_for_topk(logits: torch.Tensor) -> torch.Tensor:
+    """Return a top-k-ready view of DeepGEMM logits: compact rows, no NaN/inf.
+
+    DeepGEMM's ``fp8_mqa_logits`` family allocates ``[rows, aligned_cols]``
+    and returns the slice ``[:, :cols]``, which is non-contiguous whenever
+    ``cols < aligned_cols`` and would force a copy inside kernels that
+    require compact rows (e.g. the CuTe DSL top-k). When the input is such a
+    row slice of one owned allocation, widen it back to the full
+    ``[rows, aligned_cols]`` view — safe for length-aware consumers that
+    never read a row past its seq_len bound, since the extra columns are
+    allocation padding. Any other tensor is used as is.
+
+    Non-finite scores (NaN/±inf) are then scrubbed to ``-inf`` in place. The
+    returned view aliases the input's storage, so narrow slices held by
+    fallback top-k paths observe the same cleaned values.
+    """
+    full = logits
+    if logits.dim() == 2 and logits.stride(-1) == 1:
+        rows, cols = logits.shape
+        stride0 = logits.stride(0)
+        storage_elems = logits.untyped_storage().nbytes() // logits.element_size()
+        if stride0 > cols and logits.storage_offset() + rows * stride0 <= storage_elems:
+            full = logits.as_strided((rows, stride0), (stride0, 1))
+    full.nan_to_num_(nan=float("-inf"), posinf=float("-inf"), neginf=float("-inf"))
+    return full
 
 
 def _check_out(
@@ -138,7 +166,12 @@ if platform.is_nvidia:
                 format_signature(
                     q=dense_tensor_format(torch.bfloat16),
                     weights=dense_tensor_format(torch.float32),
-                )
+                ),
+                # Raw indexer weights: the fused combine kernel upcasts.
+                format_signature(
+                    q=dense_tensor_format(torch.bfloat16),
+                    weights=dense_tensor_format(torch.bfloat16),
+                ),
             }
         ),
         traits={
@@ -166,8 +199,10 @@ if platform.is_nvidia:
         out: torch.Tensor | None = None,
         lens_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        assert weights.dtype == torch.float32
-        assert weights.is_contiguous()
+        assert weights.dtype in (torch.float32, torch.bfloat16)
+        # Raw weights may be a column-split view of the fused wk_weights_proj
+        # output; the fused combine only needs unit-stride rows.
+        assert weights.stride(-1) == 1
         assert seq_lens.dtype == torch.int32
         assert seq_lens.is_contiguous()
         assert block_table.dtype == torch.int32
@@ -189,10 +224,7 @@ if platform.is_nvidia:
             scale_encoding="float32",
         )
         q_fp8 = q_fp8.view_as(q)
-        q_scale = q_scale.view(q.shape[0], q.shape[1], 1)
-        scaled_weights = (
-            weights.unsqueeze(-1) * q_scale * float(softmax_scale)
-        ).squeeze(-1)
+        scaled_weights = combine_topk_weights(weights, q_scale, softmax_scale)
 
         if seq_lens_2d is None or plan is None:
             raise RuntimeError(
@@ -216,22 +248,23 @@ if platform.is_nvidia:
         logits = deep_gemm.fp8_paged_mqa_logits(
             q_fp8.view(-1, q_len_per_req, q.shape[1], q.shape[-1]),
             kv_cache,
-            scaled_weights.contiguous(),
+            scaled_weights,
             seq_lens_2d,
             block_table,
             plan,
             max_seq_len,
             clean_logits=False,
         )
-        logits.nan_to_num_(
-            nan=float("-inf"), posinf=float("-inf"), neginf=float("-inf")
-        )
+        # Compact widened view with non-finite scores scrubbed; the
+        # length-aware CuTe DSL top-k below consumes it without a copy.
+        logits_full = _prepare_logits_for_topk(logits)
         local_topk_offsets = torch.empty_like(out)
         if _use_cute_dsl_decode_topk():
             # CuTe DSL cluster radix top-k: length-aware via seq_lens/q_len_per_req,
             # so no pre-masking needed; same local offsets as the ragged path.
+            # The widened view is safe: rows never read past their seq_len bound.
             cute_dsl_decode_topk(
-                logits,
+                logits_full,
                 seq_lens,
                 topk,
                 next_n=q_len_per_req,
@@ -290,7 +323,12 @@ if platform.is_nvidia:
                 format_signature(
                     q=dense_tensor_format(torch.bfloat16),
                     weights=dense_tensor_format(torch.float32),
-                )
+                ),
+                # Raw indexer weights: the fused combine kernel upcasts.
+                format_signature(
+                    q=dense_tensor_format(torch.bfloat16),
+                    weights=dense_tensor_format(torch.bfloat16),
+                ),
             }
         ),
         traits={
@@ -319,7 +357,6 @@ if platform.is_nvidia:
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
         q = q.contiguous()
-        weights = weights.float().contiguous()
         row_starts = row_starts.to(device=q.device, dtype=torch.int32).contiguous()
         row_ends = row_ends.to(device=q.device, dtype=torch.int32).contiguous()
         tokens = q.shape[0]
@@ -340,10 +377,7 @@ if platform.is_nvidia:
             scale_encoding="float32",
         )
         q_fp8 = q_fp8.view_as(q)
-        q_scale = q_scale.view(tokens, q.shape[1], 1)
-        scaled_weights = (
-            weights.unsqueeze(-1) * q_scale * float(softmax_scale)
-        ).squeeze(-1)
+        scaled_weights = combine_topk_weights(weights, q_scale, softmax_scale)
         if index_k_fp8 is None or index_k_scale is None:
             hd = q.shape[-1]
             num_groups = hd // 128

@@ -84,6 +84,7 @@ def _chat(port: int, messages, max_tokens=64, temperature=0):
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
+            "chat_template_kwargs": {"enable_thinking": False},
         },
         timeout=300,
     )

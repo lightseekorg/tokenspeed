@@ -25,6 +25,11 @@ from typing import TYPE_CHECKING
 import torch
 from tokenspeed_kernel.ops.sampling.cuda import (
     chain_speculative_sampling_target_only,
+)
+from tokenspeed_kernel.ops.sampling.cuda import (
+    fused_topk_topp_available as _FUSED_TOPK_TOPP_AVAILABLE,
+)
+from tokenspeed_kernel.ops.sampling.cuda import (
     fused_topk_topp_renorm,
 )
 from tokenspeed_kernel.ops.sampling.flashinfer import (
@@ -45,7 +50,6 @@ from tokenspeed.runtime.sampling.backends.base import (
     SamplingBackendConfig,
 )
 from tokenspeed.runtime.sampling.backends.flashinfer import (
-    _FUSED_TOPK_TOPP_AVAILABLE,
     FlashInferSamplingBackend,
 )
 from tokenspeed.runtime.sampling.registry import register_backend

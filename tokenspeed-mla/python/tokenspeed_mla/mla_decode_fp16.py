@@ -62,7 +62,7 @@ import cutlass.torch as cutlass_torch
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.base_dsl.arch import Arch
-from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
+from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import BaseDSL
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
@@ -491,15 +491,15 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             c_latent.iterator, c_latent_tranpose_layout
         )
 
-        self.q_major_mode = tcgen05.OperandMajorMode.K
-        self.k_major_mode = tcgen05.OperandMajorMode.K
-        self.v_major_mode = tcgen05.OperandMajorMode.MN
+        self.q_major_mode = OperandMajorMode.K
+        self.k_major_mode = OperandMajorMode.K
+        self.v_major_mode = OperandMajorMode.MN
 
         self._setup_attributes()
 
         cta_group = tcgen05.CtaGroup.TWO
         # the intermediate tensor p is from smem & k-major
-        p_major_mode = tcgen05.OperandMajorMode.K
+        p_major_mode = OperandMajorMode.K
         qk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.q_dtype,
             self.q_major_mode,

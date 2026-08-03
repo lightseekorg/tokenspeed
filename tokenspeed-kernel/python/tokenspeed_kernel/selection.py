@@ -484,6 +484,7 @@ def spec_matches_shape_traits(spec: KernelSpec, shape: dict[str, Any]) -> bool:
         "n_align_64": ("N", 64),
         "n_align_128": ("N", 128),
         "k_align_16": ("K", 16),
+        "k_align_32": ("K", 32),
         "k_align_64": ("K", 64),
         "k_align_128": ("K", 128),
     }
@@ -494,6 +495,19 @@ def spec_matches_shape_traits(spec: KernelSpec, shape: dict[str, Any]) -> bool:
 
         dim = shape.get(dim_name)
         if isinstance(dim, int) and dim % alignment != 0:
+            return False
+
+    minimum_traits: dict[str, tuple[str, int]] = {
+        "n_min_128": ("N", 128),
+        "k_min_128": ("K", 128),
+    }
+    for trait_name, (dim_name, minimum) in minimum_traits.items():
+        values = spec.traits.get(trait_name)
+        if values is None or True not in values:
+            continue
+
+        dim = shape.get(dim_name)
+        if isinstance(dim, int) and dim < minimum:
             return False
 
     return True
@@ -577,7 +591,6 @@ def select_kernel(
     traits: dict[str, Any] | None = None,
     solution: str | None = None,
     override: str | None = None,
-    expected_kernel_name: str | None = None,
 ) -> SelectedKernel:
     """Select the best kernel for an operation.
 
@@ -597,9 +610,6 @@ def select_kernel(
         solution: Restrict selection to a registered solution while preserving
             normal platform, format signature, and trait filtering.
         override: Force a specific kernel name or solution string
-        expected_kernel_name: Debug-only hint. When set, a warning is
-            logged if the selected kernel differs from this name. The
-            selected kernel is still used regardless of the mismatch.
 
     Returns:
         A :class:`SelectedKernel` that is directly callable and also
@@ -705,18 +715,6 @@ def select_kernel(
         winner = scored[0][0]
 
     _log_selection(family, mode, format_signature, winner, scored, platform, objective)
-
-    if expected_kernel_name and winner.name != expected_kernel_name:
-        logger.warning(
-            "[tokenspeed_kernel] select_kernel(%s.%s, %s) chose '%s' but "
-            "expected '%s'. Score breakdown — selected: %s",
-            family,
-            mode,
-            format_signature,
-            winner.name,
-            expected_kernel_name,
-            next((s for sp, s in scored if sp.name == winner.name), "N/A"),
-        )
 
     impl = registry.get_impl(winner.name)
     result = SelectedKernel(name=winner.name, impl=impl)

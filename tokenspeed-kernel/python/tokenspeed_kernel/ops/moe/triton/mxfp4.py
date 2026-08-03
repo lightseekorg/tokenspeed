@@ -26,7 +26,12 @@ from contextlib import contextmanager
 import tokenspeed_kernel
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
+from tokenspeed_kernel._triton import (
+    libdevice,
+    redirect_triton_to_tokenspeed_triton,
+    tl,
+    triton,
+)
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -71,6 +76,97 @@ platform = current_platform()
 
 MXFP4_BLOCK = 32
 MXFP4_ACTIVATION_SCALE_LAYOUT = "linear"
+MXFP4_SITU_WARP_DECODE_MAX_TOKENS = 4
+
+
+@triton.jit
+def _situ_fused_fn(input, beta, linear_beta, HAS_LINEAR_BETA: tl.constexpr):
+    """SiTU epilogue for gate/up rows interleaved at weight-process time."""
+    paired = tl.reshape(input, (input.shape[0], input.shape[1] // 2, 2))
+    gate, up = tl.split(paired)
+    # Kimi's reference writes W13 to BF16 before evaluating SiTU in FP32.
+    gate = gate.to(tl.bfloat16).to(tl.float32)
+    up = up.to(tl.bfloat16).to(tl.float32)
+    gate = beta * libdevice.tanh(gate / beta) * tl.sigmoid(gate)
+    if HAS_LINEAR_BETA:
+        up = linear_beta * libdevice.tanh(up / linear_beta)
+    return gate * up
+
+
+@triton.jit
+def _reduce_local_topk_kernel(
+    routed_ptr,
+    local_ids_ptr,
+    out_ptr,
+    num_tokens,
+    hidden_dim,
+    routed_stride_m,
+    routed_stride_n,
+    ids_stride_m,
+    ids_stride_k,
+    out_stride_m,
+    out_stride_n,
+    TOP_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Reduce only locally-owned route slots from a fixed-size EP buffer."""
+    token = tl.program_id(0)
+    block_n = tl.program_id(1)
+    offs_n = block_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = offs_n < hidden_dim
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    for slot in tl.static_range(0, TOP_K):
+        local_id = tl.load(
+            local_ids_ptr + token * ids_stride_m + slot * ids_stride_k,
+            mask=token < num_tokens,
+            other=-1,
+        )
+        valid = (token < num_tokens) & (local_id >= 0)
+        route_row = token * TOP_K + slot
+        value = tl.load(
+            routed_ptr + route_row * routed_stride_m + offs_n * routed_stride_n,
+            mask=valid & n_mask,
+            other=0.0,
+        )
+        acc += value.to(tl.float32)
+    tl.store(
+        out_ptr + token * out_stride_m + offs_n * out_stride_n,
+        acc,
+        mask=(token < num_tokens) & n_mask,
+    )
+
+
+def _reduce_local_topk(
+    routed: torch.Tensor,
+    local_ids: torch.Tensor,
+    num_tokens: int,
+) -> torch.Tensor:
+    """Mask remote EP slots while reducing grouped-matmul route outputs."""
+    top_k = int(local_ids.shape[1])
+    hidden_dim = int(routed.shape[-1])
+    out = torch.empty(
+        (num_tokens, hidden_dim),
+        dtype=routed.dtype,
+        device=routed.device,
+    )
+    block_n = 256
+    _reduce_local_topk_kernel[(num_tokens, triton.cdiv(hidden_dim, block_n))](
+        routed,
+        local_ids,
+        out,
+        num_tokens,
+        hidden_dim,
+        routed.stride(0),
+        routed.stride(1),
+        local_ids.stride(0),
+        local_ids.stride(1),
+        out.stride(0),
+        out.stride(1),
+        TOP_K=top_k,
+        BLOCK_N=block_n,
+        num_warps=4,
+    )
+    return out
 
 
 def _uses_dynamic_mxfp4_activations(w: torch.nn.Module) -> bool:
@@ -109,6 +205,14 @@ def _release_parameter(module: torch.nn.Module, name: str) -> None:
         module.register_parameter(name, None)
     elif hasattr(module, name):
         delattr(module, name)
+
+
+def _interleave_gate_up(tensor: torch.Tensor, dim: int) -> torch.Tensor:
+    dim %= tensor.ndim
+    if tensor.shape[dim] % 2:
+        raise ValueError("SiTU W13 gate/up dimension must be even")
+    gate, up = tensor.chunk(2, dim=dim)
+    return torch.stack((gate, up), dim=dim + 1).flatten(dim, dim + 1).contiguous()
 
 
 def _silu_gate_up(
@@ -219,6 +323,7 @@ def _routing_from_topk(
     topk_ids: torch.Tensor,
     num_experts: int,
     dtype: torch.dtype | None = None,
+    compact_invalid: bool = False,
 ) -> tuple[RaggedTensorMetadata, torch.Tensor, torch.Tensor, torch.Tensor]:
     if topk_ids.ndim != 2:
         raise ValueError(f"topk_ids must be rank-2, got {tuple(topk_ids.shape)}")
@@ -232,8 +337,10 @@ def _routing_from_topk(
 
     flat_ids = topk_ids.reshape(-1).to(torch.long)
     valid = flat_ids >= 0
-    safe_ids = torch.where(valid, flat_ids, flat_ids.new_zeros(()))
-    sort_order = torch.argsort(safe_ids, stable=True)
+    sort_keys = torch.where(valid, flat_ids, flat_ids.new_zeros(()))
+    if compact_invalid:
+        sort_keys = torch.where(valid, flat_ids, flat_ids.new_full((), num_experts))
+    sort_order = torch.argsort(sort_keys, stable=True)
 
     top_k = topk_ids.shape[1]
     gather_indx = (sort_order // top_k).to(torch.int32)
@@ -243,11 +350,15 @@ def _routing_from_topk(
     if dtype is not None and gate_scal.dtype != dtype:
         gate_scal = gate_scal.to(dtype)
 
-    col_sum = torch.zeros((num_experts,), dtype=torch.int32, device=safe_ids.device)
+    col_sum = torch.zeros((num_experts,), dtype=torch.int32, device=flat_ids.device)
     col_sum.scatter_add_(
         0,
-        safe_ids,
-        torch.ones_like(safe_ids, dtype=torch.int32),
+        torch.where(valid, flat_ids, flat_ids.new_zeros(())),
+        (
+            valid.to(torch.int32)
+            if compact_invalid
+            else torch.ones_like(flat_ids, dtype=torch.int32)
+        ),
     )
     n_total_rows = int(sort_order.numel())
     ragged_metadata = make_ragged_tensor_metadata(col_sum, n_total_rows)
@@ -264,23 +375,33 @@ def _local_topk_for_ep(
     if ep_size <= 1:
         return topk_weights, topk_ids, int(getattr(w, "num_experts"))
 
+    num_experts = int(getattr(w, "num_experts"))
     num_local_experts = int(getattr(w, "num_local_experts"))
-    expert_offset = int(getattr(w, "ep_rank", 0)) * num_local_experts
-    local_ids = topk_ids - expert_offset
+    if num_experts != num_local_experts * ep_size:
+        raise ValueError("inconsistent contiguous EP metadata")
+    ep_rank = int(getattr(w, "ep_rank", 0))
+    if not 0 <= ep_rank < ep_size:
+        raise ValueError(f"ep_rank must be in [0, {ep_size}), got {ep_rank}")
+    local_ids = topk_ids - ep_rank * num_local_experts
     local_mask = (local_ids >= 0) & (local_ids < num_local_experts)
-    local_weights = torch.where(
-        local_mask, topk_weights, torch.zeros_like(topk_weights)
+    return (
+        torch.where(local_mask, topk_weights, torch.zeros_like(topk_weights)),
+        torch.where(local_mask, local_ids, topk_ids.new_full((), -1)),
+        num_local_experts,
     )
-    local_ids = torch.where(local_mask, local_ids, topk_ids.new_full((), -1))
-    return local_weights, local_ids, num_local_experts
 
 
 def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
     MXFP_BLOCK_SIZE = 32
 
+    uses_situ = plan.get("activation") == "situ"
+
     if hasattr(w, "w13_weight_bias"):
+        w13_bias = w.w13_weight_bias
+        if uses_situ:
+            w13_bias = _interleave_gate_up(w13_bias, -1)
         w.w13_weight_bias = torch.nn.Parameter(
-            w.w13_weight_bias.to(torch.float32), requires_grad=False
+            w13_bias.to(torch.float32), requires_grad=False
         )
     if hasattr(w, "w2_weight_bias"):
         w.w2_weight_bias = torch.nn.Parameter(
@@ -288,8 +409,13 @@ def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
         )
 
     num_warps = 8
+    w13_linear = w.w13_weight
+    w13_scale_linear = w.w13_weight_scale
+    if uses_situ:
+        w13_linear = _interleave_gate_up(w13_linear, -2)
+        w13_scale_linear = _interleave_gate_up(w13_scale_linear, -2)
     w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
-        w.w13_weight, w.w13_weight_scale, num_warps
+        w13_linear, w13_scale_linear, num_warps
     )
     w2_weight, w2_flex, w2_scale = _swizzle_mxfp4(
         w.w2_weight, w.w2_weight_scale, num_warps
@@ -317,7 +443,7 @@ def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
         w.w13_act_scale = w13_in_scale
         w.w2_act_scale = w2_in_scale
 
-        fp8_dtype = current_platform().fp8e4m3fn.dtype
+        fp8_dtype = torch.float8_e4m3fn
         w13_lhs = InFlexData(dtype=fp8_dtype, scale=w13_in_scale)
         w2_lhs = InFlexData(dtype=fp8_dtype, scale=w2_in_scale)
         # Force bf16 output so the swiglu / down-proj results stay in a
@@ -345,12 +471,12 @@ def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
 
     w.w13_weight_triton_tensor = w13_weight
     w.w2_weight_triton_tensor = w2_weight
-    # Free original weights (replaced by shuffled versions)
+    # Free original weights and scales (replaced by shuffled copies held in
+    # the triton tensors / precision configs above).
     _release_parameter(w, "w13_weight")
     _release_parameter(w, "w2_weight")
-    if current_platform().is_amd:
-        _release_parameter(w, "w13_weight_scale")
-        _release_parameter(w, "w2_weight_scale")
+    _release_parameter(w, "w13_weight_scale")
+    _release_parameter(w, "w2_weight_scale")
     torch.cuda.empty_cache()
 
 
@@ -368,7 +494,7 @@ def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
     ),
     traits={
         "weight_dtype": frozenset({"mxfp4"}),
-        "activation": frozenset({"silu"}),
+        "activation": frozenset({"silu", "situ"}),
         "routing_mode": frozenset({"precomputed_topk"}),
         "supports_deferred_finalize": frozenset({False}),
         "supports_ep": frozenset({False}),
@@ -393,7 +519,7 @@ def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
     ),
     traits={
         "weight_dtype": frozenset({"mxfp4"}),
-        "activation": frozenset({"silu"}),
+        "activation": frozenset({"silu", "situ"}),
         "routing_mode": frozenset({"precomputed_topk"}),
         "supports_deferred_finalize": frozenset({False}),
         "supports_ep": frozenset({True}),
@@ -402,7 +528,9 @@ def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
         "internal_activation_dtype": frozenset({"fp8", "input"}),
         "supports_bias": frozenset({True}),
     },
-    priority=Priority.SPECIALIZED + 1,
+    # Broad AMD EP fallback. Gfx950 K3 EP8 selects the narrower Gluon path;
+    # Triton remains the default for other supported AMD EP layouts.
+    priority=Priority.PERFORMANT + 1,
 )
 @register_kernel(
     "moe",
@@ -445,10 +573,58 @@ def triton_mxfp4_moe_apply(
 
     top_k = getattr(w, "top_k")
     n_tokens = router_logits.shape[0]
+    uses_ep = int(getattr(w, "ep_size", 1)) > 1
+    activation = plan.get("activation") or getattr(w, "activation", "silu")
+    w13_weight = w.w13_weight_triton_tensor
+    w2_weight = w.w2_weight_triton_tensor
+    w13_bias = getattr(w, "w13_weight_bias", None)
+    w2_bias = getattr(w, "w2_weight_bias", None)
+    w13_pc = getattr(w, "w13_precision_config", None)
+    w2_pc = getattr(w, "w2_precision_config", None)
 
     if topk_weights is not None or topk_ids is not None:
         if topk_weights is None or topk_ids is None:
             raise ValueError("topk_weights and topk_ids must be provided together")
+        # Decode reuses Triton's K-packed value tensors and CDNA4-swizzled
+        # scales directly.  It skips route sorting and the 64-row grouped-MFMA
+        # padding that dominates sparse EP8 M=1 execution. The kernels localize
+        # global expert ids while loading them, avoiding a separate subtract,
+        # two masks, and two ``where`` kernels before every MoE layer. Prefill
+        # remains on the regular Triton matmuls below.
+        use_gfx950_warp_decode = (
+            current_platform().is_cdna4
+            and uses_ep
+            and n_tokens <= MXFP4_SITU_WARP_DECODE_MAX_TOKENS
+            and x.dtype == torch.bfloat16
+            and activation == "situ"
+            and do_finalize
+            and w13_bias is None
+            and w2_bias is None
+            and not hasattr(w, "w13_act_scale")
+            and not hasattr(w, "w2_act_scale")
+            and not _uses_dynamic_mxfp4_activations(w)
+            and x.shape[1] % 256 == 0
+            and w13_weight.shape[-1] % 512 == 0
+        )
+        if use_gfx950_warp_decode:
+            from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_decode import (
+                gluon_a16w4_situ_warp_decode_ep_gfx950,
+            )
+
+            return gluon_a16w4_situ_warp_decode_ep_gfx950(
+                x,
+                w13_weight.storage.data,
+                w13_pc.b_mx_scale.storage.data,
+                w2_weight.storage.data,
+                w2_pc.b_mx_scale.storage.data,
+                topk_weights,
+                topk_ids,
+                situ_beta=float(getattr(w, "activation_situ_beta", 1.0)),
+                situ_linear_beta=getattr(w, "activation_situ_linear_beta", None),
+                expert_start=(
+                    int(getattr(w, "ep_rank", 0)) * int(getattr(w, "num_local_experts"))
+                ),
+            )
         topk_weights, topk_ids, num_experts = _local_topk_for_ep(
             topk_weights,
             topk_ids,
@@ -459,6 +635,7 @@ def triton_mxfp4_moe_apply(
             topk_ids,
             num_experts=num_experts,
             dtype=router_logits.dtype,
+            compact_invalid=uses_ep,
         )
     else:
         ragged_metadata, gather_indx, scatter_indx, gate_scal = _routing(
@@ -468,15 +645,23 @@ def triton_mxfp4_moe_apply(
             dtype=router_logits.dtype,
         )
 
-    w13_weight = w.w13_weight_triton_tensor
-    w2_weight = w.w2_weight_triton_tensor
-    w13_bias = getattr(w, "w13_weight_bias", None)
-    w2_bias = getattr(w, "w2_weight_bias", None)
-    w13_pc = getattr(w, "w13_precision_config", None)
-    w2_pc = getattr(w, "w2_precision_config", None)
-
     act = None
-    if swiglu_arg is not None:
+    if activation == "situ":
+        linear_beta = getattr(w, "activation_situ_linear_beta", None)
+        act = FusedActivation(
+            FnSpecs(
+                "situ",
+                _situ_fused_fn,
+                ("beta", "linear_beta", "HAS_LINEAR_BETA"),
+                reduction_n=2,
+            ),
+            (
+                float(getattr(w, "activation_situ_beta", 1.0)),
+                1.0 if linear_beta is None else float(linear_beta),
+                linear_beta is not None,
+            ),
+        )
+    elif swiglu_arg is not None:
         act = FusedActivation(
             FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), reduction_n=2),
             (swiglu_arg.alpha, swiglu_arg.limit),
@@ -531,6 +716,8 @@ def triton_mxfp4_moe_apply(
             scatter_indx=scatter_indx,
             gammas=gate_scal,
         )
+    if uses_ep:
+        return _reduce_local_topk(output, topk_ids, n_tokens)
     if top_k > 1:
         return output.view(n_tokens, top_k, output.shape[-1]).sum(dim=1)
     return output

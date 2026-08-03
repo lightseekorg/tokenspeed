@@ -28,6 +28,7 @@ Usage:
 
 import functools
 import logging
+import os
 from ctypes import c_void_p, cast
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
@@ -117,6 +118,8 @@ class AllReduceFusionPattern:
     kARResidualRMSNormFP8BlockWiseQuant = 6
     kARResidualRMSNormPartialOutFP8BlockWiseQuant = 7
     kARResidualRMSNormPartialOut = 8
+    kARResidualAttnResCombine = 9
+    kAllReduceLatentNorm = 10
 
 
 class AllGatherFusionPattern:
@@ -234,10 +237,277 @@ def _destroy_ipc_workspace(
 
 
 # ---------------------------------------------------------------------------
+# MNNVL-structured one-shot workspace (NVLS multicast + Lamport rotation)
+# ---------------------------------------------------------------------------
+
+# Mirror of kMnnvlOneShotMaxToken in trtllm_mnnvl_allreduce_fusion.cuh: the
+# mnnvl kernel is a decode-latency one-shot path; larger payloads stay on the
+# IPC lamport/twoshot fallback, so the workspace is sized (and clamped) for
+# this many tokens at most.
+MNNVL_ONESHOT_MAX_TOKEN = 128
+# Two-shot serves 129..2048-token calls; mirrors kMnnvlTwoShotMaxToken in the
+# kernel header. Workspace slot layout: [A: token][rank][hidden] + [B: token][hidden].
+MNNVL_TWOSHOT_MAX_TOKEN = 2048
+
+# Above this payload the IPC lamport workspace beats the mnnvl one on a single
+# node: multicast/scatter wins while cost tracks the number of stores, but past
+# ~10 MiB bandwidth dominates and IPC's direct peer writes come out ahead.
+# Measured at world 4, hidden 7168, bf16, with the scatter phase A: mnnvl leads
+# through 768 tokens (10.5 MiB, 60.0 vs 63.4 us) and trails from 1024 (14 MiB,
+# 86.1 vs 75.4). Expressed in input-tensor bytes so it holds across hidden sizes
+# and dtypes. Only reachable single-node -- cross-node there is no IPC
+# workspace, and there mnnvl beats NCCL across the whole supported range.
+MNNVL_PREFER_IPC_BYTES = int(
+    os.environ.get("TOKENSPEED_MNNVL_PREFER_IPC_BYTES", 12 * 1024 * 1024)
+)
+
+_MNNVL_SUPPORTED_PATTERNS = frozenset(
+    {
+        AllReduceFusionPattern.kAllReduce,
+        AllReduceFusionPattern.kARResidualRMSNorm,
+        AllReduceFusionPattern.kARResidualAttnResCombine,
+        # kAllReduceLatentNorm: the mnnvl kernel handles it, but the wide
+        # [latent|hidden] lane makes it a hair slower than IPC lamport on a
+        # single node (8.60us vs 6.64 on 8x B300), so _ar_fusion_workspace
+        # prefers IPC for it when an IPC workspace exists. Cross-node there is
+        # no IPC and the alternative is NCCL, which mnnvl beats ~3.3x --
+        # excluding it there crashed K3's latent-MoE tail with no fallback.
+        AllReduceFusionPattern.kAllReduceLatentNorm,
+    }
+)
+
+# 16 covers 4-node TP16 (Kimi-K3); the NVLink domain spans the rack, so the
+# limit was template instantiation, not fabric reach.
+_MNNVL_SUPPORTED_WORLD_SIZES = (2, 4, 8, 16)
+
+
+def _mnnvl_grid_config_ok(hidden_dim: int, elem_size: int) -> bool:
+    """Mirror of mnnvl_oneshot_grid_config's feasibility check (exact,
+    warp-aligned partition of the hidden dim across one cluster)."""
+    vec = 16 // elem_size
+    if hidden_dim % vec != 0:
+        return False
+    threads = hidden_dim // vec
+    cluster = 1
+    while threads // cluster > 1024:
+        cluster *= 2
+    return cluster <= 8 and threads % cluster == 0 and (threads // cluster) % 32 == 0
+
+
+class MnnvlAllReduceFusionWorkspace:
+    """Symmetric-memory workspace for the MNNVL-structured one-shot AR.
+
+    Layout: one symm_mem allocation = 3 lamport buffers of
+    ``buffer_size_bytes`` each, pre-filled with the fp32 -0.0 sentinel, plus a
+    9-word uint32 ``buffer_flags`` rotation-state array (see the protocol notes
+    in trtllm_mnnvl_allreduce_fusion.cuh). Passing an instance of this class as
+    ``workspace_ptrs`` to :func:`trtllm_allreduce_fusion` routes the call onto
+    the mnnvl kernel; a plain int64 tensor keeps the IPC lamport path.
+    """
+
+    backend = "mnnvl"
+
+    def __init__(
+        self,
+        tp_rank: int,
+        tp_size: int,
+        max_token_num: int,
+        hidden_dim: int,
+        buffer_size_bytes: int,
+        multicast_ptr: int,
+        peer_ptrs: torch.Tensor,
+        local_ptr: int,
+        buffer_flags: torch.Tensor,
+        refs: tuple,
+    ):
+        self.tp_rank = tp_rank
+        self.tp_size = tp_size
+        self.max_token_num = max_token_num
+        self.hidden_dim = hidden_dim
+        self.buffer_size_bytes = buffer_size_bytes
+        self.multicast_ptr = multicast_ptr
+        self.peer_ptrs = peer_ptrs
+        self.local_ptr = local_ptr
+        self.buffer_flags = buffer_flags
+        self._refs = refs  # keep the symm_mem tensor + handle alive
+
+    def supports(
+        self,
+        token_num: int,
+        hidden_dim: int,
+        dtype: torch.dtype,
+        world_size: int,
+        pattern_code: int,
+        use_oneshot: bool = True,
+        residual_reduce_scattered: bool = False,
+    ) -> bool:
+        """Whether this call shape can run on the mnnvl kernel.
+
+        Args:
+            token_num: number of tokens in this call.
+            hidden_dim: hidden (lane) width of this call.
+            dtype: payload dtype (fp16/bf16 only).
+            world_size: TP world size of this call.
+            pattern_code: AllReduceFusionPattern value.
+            use_oneshot: advisory only; the device picks the kernel from the token count.
+            residual_reduce_scattered: RS-residual mode (unsupported).
+
+        Returns:
+            True when the mnnvl path can serve the call; callers must fall
+            back to the IPC lamport workspace otherwise.
+        """
+        if residual_reduce_scattered:
+            return False
+        # two-shot (use_oneshot=False) is served by the twoshot kernel up to
+        # MNNVL_TWOSHOT_MAX_TOKEN, provided the workspace was sized for it.
+        if world_size != self.tp_size or world_size not in _MNNVL_SUPPORTED_WORLD_SIZES:
+            return False
+        if dtype not in (torch.bfloat16, torch.float16):
+            return False
+        if pattern_code not in _MNNVL_SUPPORTED_PATTERNS:
+            return False
+        # The device ignores use_oneshot entirely: the launcher branches on
+        # token_num > MNNVL_ONESHOT_MAX_TOKEN. Capping on the caller's flag
+        # rejected prefill-sized calls the kernel handles fine whenever the
+        # host heuristic happened to resolve one-shot (129..585 tokens at
+        # world 4, for instance), pushing them off the mnnvl path for no
+        # reason. Cap on what actually runs.
+        # token_num <= 0 would reach cudaLaunchKernelEx with gridDim.x = 0:
+        # the launch fails with a STICKY invalid-argument error that poisons
+        # the CUDA context, unlike every other rejected shape which raises a
+        # recoverable RuntimeError before any launch.
+        if token_num <= 0 or token_num > MNNVL_TWOSHOT_MAX_TOKEN:
+            return False
+        # Charge the lane count this workspace was actually allocated with: the
+        # creator only adds the region-B lane when it is sized past the one-shot
+        # cap. Charging world+1 unconditionally made a workspace built for
+        # max_token_num<=128 reject calls it had the memory for -- everything
+        # above world/(world+1) of its declared range, e.g. 113 tokens at world 8.
+        # Charge the layout THIS call will run, which the device picks from the
+        # token count alone -- not from self.max_token_num and not from the
+        # caller's use_oneshot, neither of which the kernel consults.
+        if token_num > MNNVL_ONESHOT_MAX_TOKEN:
+            stage_tokens = -(-token_num // world_size) * world_size
+            lane_tokens = 2 * stage_tokens
+        else:
+            lane_tokens = token_num * world_size
+        payload = lane_tokens * hidden_dim * dtype.itemsize
+        if payload > self.buffer_size_bytes:
+            return False
+        return _mnnvl_grid_config_ok(hidden_dim, dtype.itemsize)
+
+
+def trtllm_create_mnnvl_workspace_for_all_reduce_fusion(
+    tp_rank: int,
+    tp_size: int,
+    max_token_num: int,
+    hidden_dim: int,
+    group: Optional[ProcessGroup] = None,
+    dtype_elem_size: int = 2,
+) -> MnnvlAllReduceFusionWorkspace:
+    """Create the symmetric-memory workspace for the mnnvl one-shot AR.
+
+    Collective: every rank of ``group`` must call this in lockstep (symm_mem
+    rendezvous). Raises when NVLS multicast is unavailable; callers should
+    probe capabilities first (see ops/communication/trtllm.py).
+
+    Args:
+        tp_rank: this rank within the group.
+        tp_size: group world size (2, 4, 8 or 16).
+        max_token_num: maximum tokens per call; clamped to
+            ``MNNVL_TWOSHOT_MAX_TOKEN``. Calls above ``MNNVL_ONESHOT_MAX_TOKEN``
+            run the two-shot kernel.
+        hidden_dim: maximum hidden (lane) width the workspace must hold.
+        group: the process group to rendezvous over.
+        dtype_elem_size: payload element size in bytes (2 for bf16/fp16).
+
+    Returns:
+        MnnvlAllReduceFusionWorkspace bound to this group.
+    """
+    import torch.distributed._symmetric_memory as symm_mem
+
+    if tp_size not in _MNNVL_SUPPORTED_WORLD_SIZES:
+        raise RuntimeError(f"mnnvl workspace: unsupported tp_size {tp_size}")
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    # Size for the largest path the caller may use: one-shot needs
+    # token*rank*hidden; two-shot appends a [token][hidden] B region, i.e.
+    # (rank+1) lanes. Callers asking for <=128 tokens get the old footprint.
+    ws_max_token = min(max_token_num, MNNVL_TWOSHOT_MAX_TOKEN)
+    # ONE buffer serves BOTH kernels, so it must fit whichever layout is larger:
+    #   two-shot: 2 stages of ceil(T/tp)*tp vectors (SCATTER is shard-local);
+    #   one-shot: T*tp vectors, capped at the one-shot token limit.
+    # Sizing for two-shot alone is what let a 128-token one-shot call write 6.4x
+    # past the buffer at tp=16 -- the previous (tp+1)-lane layout only survived
+    # that by accident.
+    stage_tokens = -(-ws_max_token // tp_size) * tp_size
+    lane_tokens = max(
+        2 * stage_tokens, min(ws_max_token, MNNVL_ONESHOT_MAX_TOKEN) * tp_size
+    )
+    bytes_per_buffer = _round_up(lane_tokens * hidden_dim * dtype_elem_size, 32)
+    total_bytes = 3 * bytes_per_buffer
+
+    buf = symm_mem.empty(total_bytes // 4, dtype=torch.float32, device=device)
+    handle = symm_mem.rendezvous(buf, group)
+    multicast_ptr = handle.multicast_ptr
+    if multicast_ptr is None or multicast_ptr == 0:
+        raise RuntimeError("mnnvl workspace: NVLS multicast mapping unavailable")
+
+    # The allocation may be larger than requested; partition the actual size
+    # and initialize the WHOLE local allocation (not just the requested
+    # prefix) with the fp32 -0.0 Lamport sentinel.
+    # Round to 32, not 16: the kernel's two-stage layout puts stage 1 at
+    # bytes_per_buffer // 2, and that base must stay 16-byte aligned for the
+    # 128-bit lamport accesses. 16-aligned bpb only guarantees 8-aligned bpb/2.
+    buffer_size_bytes = handle.buffer_size // 3 // 32 * 32
+    if buffer_size_bytes < bytes_per_buffer:
+        raise RuntimeError("mnnvl workspace: symmetric allocation too small")
+    handle.get_buffer(tp_rank, (handle.buffer_size // 4,), torch.float32).fill_(-0.0)
+
+    # Rotation state, same layout as flashinfer's buffer_flags:
+    # [cur idx, dirty idx, bytes per buffer, dirty stages, bytes_to_clear[4],
+    #  arrival counter]
+    buffer_flags = torch.tensor(
+        [0, 2, buffer_size_bytes, 0, 0, 0, 0, 0, 0],
+        dtype=torch.uint32,
+        device=device,
+    )
+    local_ptr = int(handle.buffer_ptrs[tp_rank])
+    # Two-shot phase A scatters each rank's shard to its OWNER only, so the
+    # kernel needs every peer's unicast base, not just the local one and the
+    # multicast VA. Broadcasting there (as one-shot does) would make two-shot
+    # move MORE bytes than one-shot, defeating its purpose.
+    peer_ptrs = torch.tensor(
+        [int(pt) for pt in handle.buffer_ptrs], dtype=torch.int64, device=device
+    )
+
+    torch.cuda.synchronize()
+    if dist.is_initialized():
+        dist.barrier(group=group)
+
+    return MnnvlAllReduceFusionWorkspace(
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+        max_token_num=ws_max_token,
+        hidden_dim=hidden_dim,
+        buffer_size_bytes=buffer_size_bytes,
+        multicast_ptr=int(multicast_ptr),
+        peer_ptrs=peer_ptrs,
+        local_ptr=local_ptr,
+        buffer_flags=buffer_flags,
+        refs=(buf, handle),
+    )
+
+
+# ---------------------------------------------------------------------------
 # AllReduce fusion
 # ---------------------------------------------------------------------------
 
-_ar_oneshot_heuristics: dict = {2: 512, 4: 64, 8: 42}
+# One-shot payload ceiling in MiB per world size, for the IPC lamport path.
+# 16 extrapolates the 4->8 halving (64 -> 42 -> ~21): without an entry
+# `.get(world, 0)` returns 0, which silently forced every TP16 call onto the
+# two-shot path regardless of size.
+_ar_oneshot_heuristics: dict = {2: 512, 4: 64, 8: 42, 16: 21}
 
 
 def _ar_should_use_oneshot(
@@ -326,11 +596,69 @@ def trtllm_allreduce_fusion(
     metadata: Optional[dict] = None,
     residual_reduce_scattered: bool = False,
     max_sm_to_use: Optional[int] = None,
+    attnres_m: Optional[torch.Tensor] = None,
+    attnres_s: Optional[torch.Tensor] = None,
+    attnres_acc: Optional[torch.Tensor] = None,
+    attnres_res_w: Optional[torch.Tensor] = None,
+    attnres_out_norm_w: Optional[torch.Tensor] = None,
+    latent_width: Optional[int] = None,
 ) -> None:
     if use_oneshot is None:
         use_oneshot = _ar_should_use_oneshot(
             token_num, hidden_dim, allreduce_in.dtype, world_size
         )
+
+    if isinstance(workspace_ptrs, MnnvlAllReduceFusionWorkspace):
+        # MNNVL-structured one-shot path: single NVLS multicast payload store,
+        # local-buffer Lamport polling, same FusedOp epilogues.
+        # RuntimeError, not assert: callers such as PrefillGraph catch
+        # RuntimeError to degrade to eager prefill, while an AssertionError
+        # escapes and kills every scheduler at startup. An assert would also
+        # vanish under `python -O`, letting an unsupported call reach the
+        # kernel.
+        if not workspace_ptrs.supports(
+            token_num,
+            hidden_dim,
+            allreduce_in.dtype,
+            world_size,
+            pattern_code,
+            use_oneshot=use_oneshot,
+            residual_reduce_scattered=residual_reduce_scattered,
+        ):
+            raise RuntimeError(
+                "mnnvl workspace does not support this call "
+                f"(token_num={token_num}, hidden_dim={hidden_dim}, "
+                f"dtype={allreduce_in.dtype}, pattern={pattern_code}, "
+                f"use_oneshot={use_oneshot})"
+            )
+        _load_trtllm_comm_module().trtllm_mnnvl_allreduce_fusion(
+            allreduce_in,
+            world_size,
+            world_rank,
+            token_num,
+            hidden_dim,
+            workspace_ptrs.multicast_ptr,
+            workspace_ptrs.local_ptr,
+            workspace_ptrs.peer_ptrs,
+            workspace_ptrs.buffer_flags,
+            launch_with_pdl,
+            trigger_completion_at_end,
+            fp32_acc,
+            pattern_code,
+            allreduce_out,
+            residual_in,
+            residual_out,
+            norm_out,
+            rms_gamma,
+            rms_eps,
+            attnres_m,
+            attnres_s,
+            attnres_acc,
+            attnres_res_w,
+            attnres_out_norm_w,
+            latent_width,
+        )
+        return
 
     if not use_oneshot:
         assert not residual_reduce_scattered, "Currently not supported!"
@@ -380,6 +708,12 @@ def trtllm_allreduce_fusion(
         scale_factor,
         layout_code,
         max_sm_to_use,
+        attnres_m,
+        attnres_s,
+        attnres_acc,
+        attnres_res_w,
+        attnres_out_norm_w,
+        latent_width,
     )
 
 

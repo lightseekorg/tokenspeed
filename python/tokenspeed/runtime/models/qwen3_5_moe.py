@@ -50,6 +50,7 @@ from tokenspeed.runtime.layers.moe.utils import (
     RoutingMethodType,
     get_all2all_backend,
     get_moe_backend,
+    use_deepep_low_latency,
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.utils import add_prefix
@@ -80,10 +81,29 @@ class Qwen3_5MoeMLP(nn.Module):
         quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
         prefix: str = "",
+        replicate_weights: bool = False,
     ) -> None:
+        """Gated MLP used for the dense and shared-expert paths.
+
+        Args:
+            hidden_size: Model hidden dimension.
+            intermediate_size: Per-expert intermediate dimension (unsharded).
+            hidden_act: Activation name; only "silu" is supported.
+            mapping: Parallelism mapping; the dense TP group shards the weights.
+            quant_config: Optional quantization config.
+            reduce_results: Whether the row-parallel projection reduces across
+                the dense TP group. Ignored when weights are replicated.
+            prefix: Weight-name prefix.
+            replicate_weights: Keep the full weights on every rank and skip TP
+                sharding, making this MLP data parallel over whatever token rows
+                the caller passes. Required when the caller already holds a
+                distinct token shard per rank (the DeepEP layout), where a
+                tensor-parallel reduction would sum partial products computed
+                from different tokens.
+        """
         super().__init__()
         self.mapping = mapping
-        if mapping.dense.has_tp:
+        if mapping.dense.has_tp and not replicate_weights:
             tp_size = mapping.dense.tp_size
             tp_rank = mapping.dense.tp_rank
             tp_group = mapping.dense.tp_group
@@ -182,12 +202,14 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         self.layer_index = layer_index
         self.tp_size = mapping.world_size
         self.stream_fork = StreamFork(alt_stream)
-        # DeepEP is only supported with the nvfp4 cutedsl MoE backend.
+        # DeepEP needs a MoE backend whose apply kernel drives the
+        # dispatch/combine legs itself: nvfp4 via flashinfer cutedsl, or
+        # block-scale fp8 via DeepGEMM masked grouped GEMMs.
         # Draft models (non-quantized) must fall back to the TP path even
         # when the target model has deep_ep configured globally.
-        self.use_deepep = (
-            get_all2all_backend().is_deepep()
-            and get_moe_backend().is_flashinfer_cutedsl()
+        moe_backend = get_moe_backend()
+        self.use_deepep = get_all2all_backend().is_deepep() and (
+            moe_backend.is_flashinfer_cutedsl() or moe_backend.is_deep_gemm()
         )
         self.comm_manager = CommManager(
             mapping=mapping,
@@ -242,6 +264,14 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=add_prefix("shared_expert", prefix),
+                # The DeepEP path runs the whole block on this rank's token
+                # shard, so the shared expert is data parallel over those rows:
+                # replicated weights, no cross-rank reduction. Sharding it
+                # instead would reduce partial products belonging to different
+                # tokens. It also lifts the dense-TP ceiling that a small
+                # shared_expert_intermediate_size imposes under block-quantized
+                # FP8 (a shard must stay >= the quantization block).
+                replicate_weights=self.use_deepep,
             )
             self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
         else:
@@ -348,17 +378,18 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         # Gate on local tokens (no all-gather needed)
         router_logits, _ = self.gate(hidden_states)
 
-        # Shared expert on local tokens (TP-parallel, needs explicit reduce)
+        # Shared expert on this rank's token shard. Weights are replicated for
+        # the DeepEP path (see the constructor), so the result is already
+        # complete -- no tensor-parallel reduction. It only reads
+        # ``hidden_states``, so it runs inside DeepEP's dispatch window below,
+        # where its GEMMs cover the in-flight token transfer.
         shared_output = None
+        overlap_fn = None
         if self.shared_expert is not None:
-            shared_output = self.shared_expert(hidden_states)
-            if self.mapping.dense.has_tp:
-                from tokenspeed.runtime.distributed.comm_ops import all_reduce
 
-                shared_output = all_reduce(
-                    shared_output,
-                    self.mapping.dense.tp_group,
-                )
+            def overlap_fn() -> None:
+                nonlocal shared_output
+                shared_output = self.shared_expert(hidden_states)
 
         # TopK on local tokens
         if hidden_states.shape[0] > 0:
@@ -370,12 +401,16 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
                 router_logits=router_logits,
             )
 
-        # DeepEP executor handles dispatch -> MoE GEMM -> combine internally
+        # DeepEP executor handles dispatch -> MoE GEMM -> combine internally.
+        # Decode-shaped forwards take the low-latency legs; extend-shaped ones
+        # exceed their fixed capacity and must take the normal legs.
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             topk_output=topk_output,
             num_global_tokens=num_global_tokens,
             max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+            low_latency=use_deepep_low_latency(ctx, self.mapping.attn.dp_size),
+            overlap_fn=overlap_fn,
         )
 
         if shared_output is not None:

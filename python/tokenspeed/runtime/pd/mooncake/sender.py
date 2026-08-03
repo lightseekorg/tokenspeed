@@ -24,6 +24,7 @@ import numpy as np
 import numpy.typing as npt
 
 from tokenspeed.runtime.pd.base.status import TransferPoll
+from tokenspeed.runtime.pd.cache_protocol import CachePDPageManifest
 from tokenspeed.runtime.pd.mooncake.entities import KVTransferError
 from tokenspeed.runtime.pd.utils import PageTransferMetadata
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -66,6 +67,7 @@ class MooncakeKVSender:
         bootstrap_token: int = -1,
         spec_candidate_ids: list[int] | None = None,
         mamba_indices: npt.NDArray[np.int64] | None = None,
+        page_manifest: CachePDPageManifest | None = None,
     ):
         """
         Send the kv cache at the given kv indices to the decoder server
@@ -94,6 +96,7 @@ class MooncakeKVSender:
                 False,
                 mla_l1_5_args=mla_l1_5_args,
                 mamba_indices=mamba_indices,
+                page_manifest=page_manifest,
             )
         else:
             self.kv_mgr.add_transfer_request(
@@ -106,6 +109,7 @@ class MooncakeKVSender:
                 bootstrap_token=bootstrap_token,
                 spec_candidate_ids=spec_candidate_ids,
                 mamba_indices=mamba_indices,
+                page_manifest=page_manifest,
             )
 
     def send_layerwise(

@@ -6,6 +6,95 @@ set only the parameters that change runtime behavior.
 The commands below are templates. Validate exact model IDs, checkpoint formats,
 and backend choices against the build you deploy.
 
+## Inkling
+
+Blog: https://lightseek.org/blog/tokenspeed-inkling.html
+
+```bash
+## Docker
+
+### nvidia
+docker pull lightseekorg/tokenspeed:latest
+### amd
+docker pull lightseekorg/tokenspeed-amd:latest
+
+## Launch command
+
+# nvidia
+ts serve \
+    --model thinkingmachines/Inkling-NVFP4 \
+    --attn-tp-size 4 \
+    --moe-tp-size 4 \
+    --max-model-len 81920 \
+    --max-num-seqs 16 \
+    --max-prefill-tokens 8192 \
+    --chunked-prefill-size 8192 \
+    --gpu-memory-utilization 0.95 \
+    --disable-cuda-graph-padding \
+    --trust-remote-code \
+    --attention-backend fa4 \
+    --moe-backend flashinfer_trtllm \
+    --enable-prefix-caching \
+    --disable-kvstore \
+    --block-size 128 \
+    --enable-cache-report \
+    --speculative-algorithm MTP \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4
+
+# amd
+ts serve \
+    --model lightseekorg/Inkling-MXFP4 \
+    --attn-tp-size 4 \
+    --moe-tp-size 4 \
+    --max-model-len 81920 \
+    --max-num-seqs 16 \
+    --max-prefill-tokens 8192 \
+    --chunked-prefill-size 8192 \
+    --gpu-memory-utilization 0.95 \
+    --disable-cuda-graph-padding \
+    --trust-remote-code \
+    --enable-prefix-caching \
+    --disable-kvstore \
+    --block-size 128 \
+    --enable-cache-report \
+    --speculative-algorithm MTP \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4
+```
+
+## MiniMax M3
+
+MiniMax M3 uses 128-token MSA blocks. TokenSpeed configures its dense and sparse
+attention layers automatically; select the dense backend with
+`--attention-backend` and run with `--disable-kvstore`.
+
+```bash
+tokenspeed serve nvidia/MiniMax-M3-NVFP4 \
+    --tensor-parallel-size 4 \
+    --max-model-len 81920 \
+    --max-num-seqs 16 \
+    --max-prefill-tokens 8192 \
+    --chunked-prefill-size 8192 \
+    --gpu-memory-utilization 0.95 \
+    --disable-cuda-graph-padding \
+    --attention-backend trtllm \
+    --kv-cache-dtype fp8 \
+    --moe-backend flashinfer_trtllm \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path Inferact/MiniMax-M3-EAGLE3 \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --disable-kvstore \
+    --block-size 128 \
+    --trust-remote-code \
+    --host 0.0.0.0 \
+    --port 8000
+```
+
 ## Kimi K2.5 / K2.6
 
 Kimi-style MoE launches usually need remote code, long context, reasoning and
@@ -64,6 +153,100 @@ Known limitation: native TokenSpeed DFlash currently uses full-history draft
 attention. It does not yet expose an equivalent of SGLang's
 `--speculative-dflash-draft-window-size`; add such a flag before relying on
 bounded draft attention for long-context deployments.
+
+## Kimi K3
+
+Kimi-K3 combines a MoonViT vision encoder with a hybrid KDA
+(linear-attention) / NoPE-MLA (full-attention) decoder and a
+DeepSeek-V3-style latent MoE. The KDA layers currently use
+flash-linear-attention kernels on NVIDIA, so install it first:
+
+```bash
+pip install flash-linear-attention
+```
+
+Notes:
+
+- K3 uses the grouped paged-cache scheduler and KDA state groups.
+- KDA dispatch is vendor-neutral at the runtime boundary. The kernel registry
+  selects the existing FLA-derived NVIDIA implementation or the native AMD
+  implementation, including each backend's preferred recurrent-state layout.
+  The runtime does not transpose or reinterpret that state.
+- NVIDIA auto-selects `--attention-backend tokenspeed_mla` for K3
+  (fp8 KV required). AMD uses the `mla` backend.
+- `tokenspeed serve` auto-selects the `kimi_k3` reasoning and tool-call
+  parsers. Explicit parser flags override these defaults.
+- The SMG packages pinned by TokenSpeed resolve `moonshotai/Kimi-K3` directly;
+  a flattened local checkpoint and separately staged remote-code cache are no
+  longer required.
+- The checkpoint carries no fp8 KV scaling factors; the loader defaults them
+  to 1.0 (a warning at load). Expect a small accuracy delta vs bf16 KV.
+- The vision encoder has 12 attention heads. For an 8-way text TP deployment,
+  use `--mm-encoder-tp-mode data` so each rank runs the vision encoder at TP1
+  on a different whole image.
+- The pinned SMG frontend registers Kimi-K3's chat renderer and multimodal
+  processor. Preserve the checkpoint's
+  `media_proc_cfg.in_patch_limit=65536`; silently falling back to K2.5's
+  16384-patch default reduces OCR resolution.
+- KDA recurrent-state pages register for prefix-cache reuse only when a
+  prefill chunk ends exactly on a logical cache-page boundary. The engine floors
+  `--chunked-prefill-size` to the plan's page grain automatically (logged as
+  a warning when it adjusts); the page grain is budget-dependent (e.g. 1472
+  at 32k context, 1536 at 1M), so do not hand-tune the chunk size against a
+  hard-coded page value. Prefix hits are page-granular.
+
+### NVIDIA
+
+Serve with expert parallelism (recommended) on 8x B300:
+
+```bash
+tokenspeed serve moonshotai/Kimi-K3 \
+  --served-model-name kimi-k3 \
+  --trust-remote-code \
+  --max-model-len 32768 \
+  --kv-cache-dtype fp8 \
+  --tensor-parallel-size 8 \
+  --mm-encoder-tp-mode data \
+  --ep-size 8 \
+  --moe-backend flashinfer_trtllm \
+  --gpu-memory-utilization 0.94 \
+  --max-num-seqs 32 \
+  --disable-kvstore \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+Plain TP8 (drop `--ep-size 8`) works too. The fused MoE path needs a
+Blackwell GPU (B200/B300); on other NVIDIA platforms use
+`--moe-backend triton`.
+
+### AMD
+
+The standard AMD path on 8x gfx950 uses the `mla` backend. For TP8/EP8,
+automatic MoE selection uses the specialized Gluon SiTU kernels:
+
+```bash
+tokenspeed serve moonshotai/Kimi-K3 \
+  --served-model-name kimi-k3 \
+  --trust-remote-code \
+  --max-model-len 8192 \
+  --kv-cache-dtype fp8 \
+  --tensor-parallel-size 8 \
+  --mm-encoder-tp-mode data \
+  --enable-expert-parallel \
+  --attention-backend mla \
+  --moe-backend auto \
+  --gpu-memory-utilization 0.92 \
+  --max-num-seqs 32 \
+  --disable-kvstore \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+On gfx950, the replicated 7168↔3584 latent projections automatically select
+among a one-token Triton GEMV, tuned Gluon GEMMs, and the vendor GEMM according
+to the current token count. The fused sigmoid-bias top-k route supports the
+full scheduled token count.
 
 ## GLM5 / GLM5.2
 

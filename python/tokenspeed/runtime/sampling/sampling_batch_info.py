@@ -23,7 +23,6 @@ from __future__ import annotations
 import dataclasses
 import threading
 from collections.abc import Callable
-from typing import TYPE_CHECKING
 
 import torch
 
@@ -32,15 +31,10 @@ from tokenspeed.runtime.utils import get_colorful_logger
 logger = get_colorful_logger(__name__)
 
 
-if TYPE_CHECKING:
-    from tokenspeed.runtime.engine.schedule_batch import ScheduleBatch
-
-
 @dataclasses.dataclass
 class SamplingBatchInfo:
-    # Basic batched sampling params. Disaggregated decode populates these via
-    # from_schedule_batch. The standard hot path leaves them None; sampling
-    # backends gather params from their own pool-indexed buffers.
+    # Basic batched sampling params. The standard hot path leaves them None;
+    # sampling backends gather params from their own pool-indexed buffers.
     temperatures: torch.Tensor | None = None
     top_ps: torch.Tensor | None = None
     top_ks: torch.Tensor | None = None
@@ -108,33 +102,3 @@ class SamplingBatchInfo:
             vocab_mask=_slice(self.vocab_mask),
             grammars=_slice(self.grammars),
         )
-
-    @classmethod
-    def from_schedule_batch(
-        cls, batch: ScheduleBatch, vocab_size: int
-    ) -> SamplingBatchInfo:
-        reqs = batch.reqs
-        device = batch.device
-        temperatures = torch.tensor(
-            [r.sampling_params.temperature for r in reqs], dtype=torch.float
-        ).to(device, non_blocking=True)
-        top_ps = torch.tensor(
-            [r.sampling_params.top_p for r in reqs], dtype=torch.float
-        ).to(device, non_blocking=True)
-        top_ks = torch.tensor(
-            [r.sampling_params.top_k for r in reqs], dtype=torch.int32
-        ).to(device, non_blocking=True)
-        min_ps = torch.tensor(
-            [r.sampling_params.min_p for r in reqs], dtype=torch.float
-        ).to(device, non_blocking=True)
-
-        ret = cls(
-            temperatures=temperatures,
-            top_ps=top_ps,
-            top_ks=top_ks,
-            min_ps=min_ps,
-            is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
-            vocab_size=vocab_size,
-            device=device,
-        )
-        return ret

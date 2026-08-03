@@ -97,9 +97,10 @@ def cublaslt_mm_nvfp4(
     *,
     alpha: torch.Tensor,
     block_size: list[int] | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     runner = _get_runner(out_dtype)
-    return runner.run_gemm(
+    output = runner.run_gemm(
         A,
         B.T,
         A_scales,
@@ -108,3 +109,7 @@ def cublaslt_mm_nvfp4(
         False,
         _CUBLASLT_HEURISTIC_ALGO,
     )
+    if out is not None:
+        out.copy_(output)
+        return out
+    return output

@@ -96,6 +96,41 @@ class TestBreakableCudaGraph(unittest.TestCase):
                 captured_out, self._eager(new_x), msg=f"trial {trial}"
             )
 
+    def test_replay_clears_unwritten_padding_at_break_handoff(self):
+        """A padded replay must not pass an eager break's undefined tail onward."""
+        state = {"valid_rows": self.n}
+
+        class VarlenOp:
+            @break_point
+            def forward(self, x):
+                out = torch.full_like(x, torch.nan)
+                rows = state["valid_rows"]
+                out[:rows].copy_(x[:rows])
+                return out
+
+        op = VarlenOp()
+
+        def forward():
+            h = self.x_static @ self.w1
+            return op.forward(h) @ self.w2
+
+        for _ in range(3):
+            forward()
+        torch.cuda.synchronize()
+        cap = BreakableCapture()
+        with cap:
+            captured_out = forward()
+
+        state["valid_rows"] = 1
+        new_x = torch.randn(self.n, self.d, device=self.dev, dtype=self.dtype)
+        self.x_static.copy_(new_x)
+        cap.replay(valid_rows=1)
+        torch.cuda.synchronize()
+
+        expected = torch.zeros_like(captured_out)
+        expected[:1] = (new_x @ self.w1)[:1] @ self.w2
+        torch.testing.assert_close(captured_out, expected, rtol=1e-4, atol=1e-4)
+
     def test_multiple_breaks_chain(self):
         """Many breaks (like a deep transformer) must chain correctly."""
         depth = 6
@@ -517,6 +552,49 @@ class TestPrefillTokenBuckets(unittest.TestCase):
             self._cfg(prefill_graph_capture_sizes=[256, 1024, 4096])
         )
         self.assertEqual(buckets, [256, 1024, 2048])
+
+
+class TestPrefillGraphMaxTokensResolution(unittest.TestCase):
+    """Which server args switch the prefill graph off entirely."""
+
+    @staticmethod
+    def _args(**overrides):
+        base = dict(
+            prefill_graph_max_tokens=None,
+            chunked_prefill_size=8192,
+            max_total_tokens=None,
+            all2all_backend="none",
+        )
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    def test_default_ceiling(self):
+        from tokenspeed.runtime.execution.model_executor import (
+            PREFILL_GRAPH_DEFAULT_MAX_TOKENS,
+            _resolve_prefill_graph_max_tokens,
+        )
+
+        self.assertEqual(
+            _resolve_prefill_graph_max_tokens(self._args()),
+            PREFILL_GRAPH_DEFAULT_MAX_TOKENS,
+        )
+
+    def test_all_to_all_backend_disables_the_graph(self):
+        from tokenspeed.runtime.execution.model_executor import (
+            _resolve_prefill_graph_max_tokens,
+        )
+
+        # DeepEP's normal dispatch reports per-expert receive counts to the host,
+        # and a host sync cannot be captured -- even when asked for explicitly.
+        self.assertEqual(
+            _resolve_prefill_graph_max_tokens(self._args(all2all_backend="deepep")), 0
+        )
+        self.assertEqual(
+            _resolve_prefill_graph_max_tokens(
+                self._args(all2all_backend="deepep", prefill_graph_max_tokens=2048)
+            ),
+            0,
+        )
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")

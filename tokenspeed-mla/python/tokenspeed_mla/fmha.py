@@ -37,8 +37,7 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
 from cutlass.base_dsl.arch import Arch
-from cutlass.cute.nvgpu import tcgen05
-from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
+from cutlass.cute.nvgpu import OperandMajorMode, tcgen05
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Float32, Int8, Int32, Int64
 from cutlass.cutlass_dsl import BaseDSL

@@ -22,8 +22,17 @@ from __future__ import annotations
 
 import numpy as np
 
+from tokenspeed.runtime.execution.block_table import (
+    select_block_table,
+    unpadded_block_table_row,
+)
 from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo
 from tokenspeed.runtime.pd.base.status import TransferPoll
+from tokenspeed.runtime.pd.cache_protocol import (
+    build_cache_page_manifest,
+    cache_manifest_page_ids,
+    validate_cache_manifest_pair,
+)
 from tokenspeed.runtime.pd.mooncake.prefill import (
     MooncakeKVManagerPrefill,
     MooncakeKVSender,
@@ -49,10 +58,12 @@ class DisaggPrefillExecutor:
         self.page_size = page_size
         self._dispatcher = TypeBasedDispatcher(
             [
-                (Forward.FlatForwardOp, self._decode),
+                (Forward.Batch, self._decode),
             ]
         )
-        self.senders: dict[int, MooncakeKVSender] = {}
+        self.uses_cache_contract = kv_args.cache_layout is not None
+        self.cache_layout = kv_args.cache_layout
+        self.senders: dict[str, MooncakeKVSender] = {}
         self.kv_manager = MooncakeKVManagerPrefill(args, kv_args)
         self.gloo_group = gloo_group
         self._local_states = {}
@@ -72,6 +83,14 @@ class DisaggPrefillExecutor:
         spec_candidate_ids: list[int] | None = None,
     ) -> None:
         """Called by event_loop after prefill forward to record the first output token."""
+        if self.uses_cache_contract and spec_candidate_ids is not None:
+            raise NotImplementedError(
+                "Paged cache PD does not support speculative/MTP bootstrap candidates"
+            )
+        if self.uses_cache_contract and (
+            isinstance(token, bool) or not isinstance(token, int) or token < 0
+        ):
+            raise ValueError("Paged cache PD requires a non-negative bootstrap token")
         self._request_token[request_id] = token
         if spec_candidate_ids is not None:
             self._request_spec_candidate_ids[request_id] = spec_candidate_ids
@@ -91,6 +110,10 @@ class DisaggPrefillExecutor:
             self._layerwise_token_published.add(request_id)
 
     def register_layerwise_step_counter(self, step_counter, interval: int) -> None:
+        if self.uses_cache_contract:
+            raise NotImplementedError(
+                "Paged cache PD does not support layerwise cache transfer"
+            )
         self._layerwise_enabled = True
         self._layerwise_interval = max(int(interval), 1)
         self.kv_manager.register_layerwise_step_counter(
@@ -117,40 +140,6 @@ class DisaggPrefillExecutor:
         self._request_spec_candidate_ids.pop(req_id, None)
         self._layerwise_token_published.discard(req_id)
 
-    @staticmethod
-    def _mamba_indices(op, index: int):
-        indices = getattr(op, "mamba_pool_indices", None)
-        if indices is None or index >= len(indices):
-            return None
-        slot = int(indices[index])
-        if slot < 0:
-            return None
-        return np.array([slot], dtype=np.int64)
-
-    @staticmethod
-    def _mamba_optional_index(op, attr: str, index: int):
-        indices = getattr(op, attr, None)
-        if indices is None or index >= len(indices):
-            return None
-        slot = int(indices[index])
-        if slot < 0:
-            return None
-        return slot
-
-    @classmethod
-    def _mamba_transfer_indices(cls, op, index: int):
-        working = cls._mamba_indices(op, index)
-        if working is None:
-            return None
-
-        slots = [int(x) for x in working.tolist()]
-        checkpoint_src = cls._mamba_optional_index(
-            op, "mamba_checkpoint_dst_indices", index
-        )
-        if checkpoint_src is not None and checkpoint_src not in slots:
-            slots.append(checkpoint_src)
-        return np.array(slots, dtype=np.int64)
-
     def _decode_prefix_len(self, bootstrap_room: int) -> int:
         transfer_info = next(
             t
@@ -159,7 +148,10 @@ class DisaggPrefillExecutor:
         )
         return transfer_info.decode_prefix_len
 
-    def _prefill_page_window(self, op, index: int, sender):
+    def _prefill_page_window(self, op, index: int, sender, table=None):
+        if table is None:
+            table = select_block_table(op)
+        pages = unpadded_block_table_row(table, index)
         decode_prefix_len = self._decode_prefix_len(sender.bootstrap_room)
         if decode_prefix_len % self.page_size != 0:
             raise ValueError(
@@ -172,15 +164,14 @@ class DisaggPrefillExecutor:
         is_last = chunk_end >= op.prefill_lengths[index]
 
         decode_prefix_pages = decode_prefix_len // self.page_size
-        start_page = max(
-            decode_prefix_pages + sender.curr_idx,
-            chunk_begin // self.page_size,
-        )
+        # Transfer progress is relative to D's missing-page window. P's local
+        # prefix may be deeper and must not hide pages that D still needs.
+        start_page = decode_prefix_pages + sender.curr_idx
         if is_last:
             end_page = (chunk_end + self.page_size - 1) // self.page_size
         else:
             end_page = chunk_end // self.page_size
-        end_page = min(end_page, len(op.occupied_pages[index]))
+        end_page = min(end_page, len(pages))
         start_page = min(start_page, end_page)
 
         index_slice = slice(
@@ -188,14 +179,17 @@ class DisaggPrefillExecutor:
             end_page - decode_prefix_pages,
         )
         return (
-            np.array(op.occupied_pages[index][start_page:end_page], dtype=np.int64),
+            np.array(pages[start_page:end_page], dtype=np.int64),
             index_slice,
             is_last,
         )
 
     def prepare_prefill(self, op) -> None:
+        if self.uses_cache_contract:
+            return
         if not self._layerwise_enabled or op.num_extends() == 0:
             return
+        table = select_block_table(op)
         begin_cache_step = self.kv_manager.reserve_layerwise_cache_steps()
         for i, request_id in enumerate(op.request_ids[: op.num_extends()]):
             sender = self.senders.get(request_id)
@@ -206,10 +200,11 @@ class DisaggPrefillExecutor:
                 )
                 self._drop_request_state(request_id)
                 continue
-            kv_indices, index_slice, is_last = self._prefill_page_window(op, i, sender)
+            kv_indices, index_slice, is_last = self._prefill_page_window(
+                op, i, sender, table
+            )
             if len(kv_indices) == 0 and not is_last:
                 continue
-            mamba_indices = self._mamba_transfer_indices(op, i) if is_last else None
             sender.send_layerwise(
                 kv_indices,
                 index_slice,
@@ -218,11 +213,15 @@ class DisaggPrefillExecutor:
                 begin_cache_step=begin_cache_step,
                 layerwise_interval=self._layerwise_interval,
                 wait_for_bootstrap_token=is_last,
-                mamba_indices=mamba_indices,
+                mamba_indices=None,
             )
 
     def _decode(self, op):
+        if self.uses_cache_contract:
+            self._cache_decode(op)
+            return
         is_last = True
+        table = select_block_table(op)
 
         for i, request_id in enumerate(op.request_ids):
             sender = self.senders.get(request_id)
@@ -254,10 +253,11 @@ class DisaggPrefillExecutor:
                     f"{decode_prefix_len=} {self.page_size=}"
                 )
             kv_indices = np.array(
-                op.occupied_pages[i][decode_prefix_len // self.page_size :],
+                unpadded_block_table_row(table, i)[
+                    decode_prefix_len // self.page_size :
+                ],
                 dtype=np.int64,
             )
-            mamba_indices = self._mamba_transfer_indices(op, i)
             logger.debug(
                 "[prefill][_decode] rid=%s aux_index=%d kv_indices(len=%d)=%s bootstrap_token=%d",
                 request_id,
@@ -272,10 +272,83 @@ class DisaggPrefillExecutor:
                 is_last,
                 bootstrap_token=bootstrap_token,
                 spec_candidate_ids=spec_candidate_ids,
-                mamba_indices=mamba_indices,
+                mamba_indices=None,
             )
 
-    def register(self, request_id: str, bootstrap_info: BootstrapInfo):
+    def _cache_decode(self, op) -> None:
+        pending = []
+        for index, request_id in enumerate(op.request_ids):
+            sender = self.senders.get(request_id)
+            if sender is None:
+                continue
+            transfer_infos = self.kv_manager.transfer_infos.get(
+                sender.bootstrap_room, {}
+            )
+            destinations = [
+                info for info in transfer_infos.values() if not info.is_dummy
+            ]
+            if len(destinations) != 1:
+                raise RuntimeError(
+                    "Paged cache PD requires exactly one identity-routed destination"
+                )
+            destination = destinations[0]
+            if (
+                destination.page_manifest is None
+                or destination.peer_cache_layout is None
+            ):
+                raise RuntimeError("Paged cache destination metadata is unavailable")
+            manifest = build_cache_page_manifest(
+                op,
+                layout=self.cache_layout,
+                request_row=index,
+                prefix_len=destination.page_manifest.prefix_len,
+                prompt_len=destination.page_manifest.prompt_len,
+            )
+            validate_cache_manifest_pair(
+                manifest,
+                destination.page_manifest,
+                self.cache_layout,
+                dst_num_pages_with_null=(
+                    destination.peer_cache_layout.num_pages_with_null
+                ),
+            )
+            token = self._request_token.get(request_id)
+            if isinstance(token, bool) or not isinstance(token, int) or token < 0:
+                raise RuntimeError("Paged cache bootstrap token is unavailable")
+            page_ids = np.asarray(
+                cache_manifest_page_ids(
+                    manifest,
+                    layout=self.cache_layout,
+                    peer="source",
+                ),
+                dtype=np.int64,
+            )
+            pending.append(
+                (
+                    request_id,
+                    sender,
+                    op.request_pool_indices[index],
+                    token,
+                    manifest,
+                    page_ids,
+                )
+            )
+
+        for request_id, sender, aux_index, token, manifest, page_ids in pending:
+            sender.send(
+                page_ids,
+                aux_index,
+                True,
+                bootstrap_token=token,
+                page_manifest=manifest,
+            )
+            self._request_token.pop(request_id, None)
+
+    def register(
+        self,
+        request_id: str,
+        bootstrap_info: BootstrapInfo,
+    ):
         self._local_states[request_id] = TransferPoll.Bootstrapping
         self._bootstrap(request_id, bootstrap_info)
 

@@ -21,7 +21,6 @@
 from dataclasses import dataclass
 
 import torch
-from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -111,7 +110,7 @@ class DistributedConfig:
             moe_ep_size=mapping.moe.ep_size,
             moe_ep_rank=mapping.moe.ep_rank,
             nccl_port=port_args.nccl_port,
-            dist_init_addr=server_args.dist_init_addr,
+            dist_init_addr=port_args.dist_init_addr,
             distributed_timeout_seconds=(
                 server_args.distributed_timeout_seconds
                 if server_args.distributed_timeout_seconds is not None
@@ -150,12 +149,10 @@ class DistributedInitializer:
         else:
             dist_init_method = f"tcp://127.0.0.1:{config.nccl_port}"
 
-        # Device-scoped NCCL init is only required and tested on AMD.
-        device_id = (
-            torch.device(config.device, config.gpu_id)
-            if current_platform().is_amd
-            else None
-        )
+        # Pass the device so PyTorch binds the process group to it (eager NCCL
+        # init) instead of inferring it later — this also mutes the c10d
+        # "barrier(): using the device under current context" warning.
+        device_id = torch.device(config.device, config.gpu_id)
 
         # Initialize distributed via the mapping-based process group manager
         pg_manager.init_distributed(
@@ -169,6 +166,41 @@ class DistributedInitializer:
         pg_manager.init_process_group(config.mapping.attn.tp_group)
         pg_manager.init_process_group(config.mapping.dense.tp_group)
         pg_manager.init_process_group(config.mapping.moe.tp_ep_group)
+
+        # Register Lamport one-shot all-reduce workspaces for the TP groups.
+        # AutoBackend routes small SUM all-reduces (<= 2 MB payload, i.e. the
+        # per-step decode reductions) through them; larger payloads and every
+        # other op keep using NCCL. Without this the one-shot backend is
+        # never armed and raw all_reduce callers (e.g. models whose comm
+        # cannot fuse into a norm) pay ring latency per layer.
+        if not config.disable_custom_all_reduce and config.hidden_size > 0:
+            from tokenspeed.runtime.distributed.comm_backend import (
+                get_global_backend,
+            )
+
+            backend = get_global_backend()
+            trtllm_ar = getattr(backend, "trtllm_ar", None)
+            if trtllm_ar is not None:
+                # One-shot serves <= 2 MB only; a small token window bounds the IPC workspace (else NCCL).
+                max_oneshot_tokens = max(
+                    1, (2 * 1024 * 1024) // max(config.hidden_size * 2, 1)
+                )
+                for group in {
+                    config.mapping.attn.tp_group,
+                    config.mapping.moe.tp_ep_group,
+                }:
+                    if len(group) > 1:
+                        ok = trtllm_ar.configure_group(
+                            rank=group.index(config.mapping.rank),
+                            group=group,
+                            max_token_num=max_oneshot_tokens,
+                            hidden_dim=config.hidden_size,
+                        )
+                        logger.info(
+                            "trtllm one-shot all-reduce for group %s: %s",
+                            group,
+                            "enabled" if ok else "unavailable (NCCL fallback)",
+                        )
 
         logger.info(
             "Init comm buff end. Avail mem=%.4f GB",

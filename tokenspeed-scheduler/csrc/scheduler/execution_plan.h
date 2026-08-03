@@ -20,7 +20,10 @@
 
 #pragma once
 
-#include <variant>
+#include <cstdint>
+#include <map>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "scheduler/operations/inc.h"
@@ -31,24 +34,16 @@ class ExecutionPlan {
 public:
     template <typename OperationType>
     ExecutionPlan& With(OperationType operation) {
-        operations_.emplace_back(operation);
-        return *this;
-    }
-
-    template <typename OperationType>
-    ExecutionPlan& With(std::vector<OperationType> ops) {
-        for (auto& op : ops) {
-            operations_.emplace_back(std::move(op));
-        }
+        operations_.emplace_back(std::move(operation));
         return *this;
     }
 
     const std::vector<Operation>& Operations() const { return operations_; }
 
-    // Flat KV-cache: requests terminalized this round as OOM -- the pool was wedged by
-    // unretractable mid-prefill holders (possibly the request itself, or a mutual wedge)
-    // with no Decoding/PrefillDone victim to retract. Always empty on the radix path.
-    std::vector<std::string> flat_oom_request_ids;
+    // Cache child pages newly assigned in this plan. Group identity is
+    // required because one LCM parent can still contain live sibling children.
+    // The runtime clears these exact byte ranges before transfers/forward.
+    std::map<std::string, std::vector<std::int32_t>> pages_to_zero;
 
 private:
     std::vector<Operation> operations_;

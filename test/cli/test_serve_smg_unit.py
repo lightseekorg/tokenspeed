@@ -27,6 +27,7 @@ import json
 import os
 import signal
 import sys
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -39,6 +40,13 @@ from tokenspeed.cli.serve_smg import (
     _DEFAULT_SMG_DISABLE_FLAGS,
     DEEPSEEK_V4_REASONING_PARSER,
     DEEPSEEK_V4_TOOL_CALL_PARSER,
+    DEFAULT_GRPC_MAX_MESSAGE_BYTES,
+    GRPC_MAX_MESSAGE_BYTES_ENV,
+    INKLING_ATTENTION_BACKEND,
+    INKLING_REASONING_PARSER,
+    INKLING_TOOL_CALL_PARSER,
+    KIMI_K3_REASONING_PARSER,
+    KIMI_K3_TOOL_CALL_PARSER,
     _args_with_default_model_parsers,
     _gateway_args_with_default_log_level,
     _gateway_args_with_default_policy,
@@ -47,10 +55,12 @@ from tokenspeed.cli.serve_smg import (
     _gateway_args_with_default_reasoning_parser,
     _gateway_args_with_defaults,
     _gateway_args_with_smg_disable_defaults,
+    _get_from_args,
     _is_deepseek_v4_model,
+    _is_inkling_model,
+    _is_kimi_k3_model,
     _prewarm_hf_tokenizer,
-    _user_host_port_from_gateway_args,
-    _user_model_id,
+    _set_default_grpc_max_message_bytes,
     run_smg,
 )
 
@@ -68,18 +78,34 @@ def _make_proc(returncode: int | None = None) -> MagicMock:
     return proc
 
 
+def test_grpc_max_message_bytes_default_is_set_when_absent(monkeypatch):
+    monkeypatch.delenv(GRPC_MAX_MESSAGE_BYTES_ENV, raising=False)
+
+    _set_default_grpc_max_message_bytes()
+
+    assert os.environ[GRPC_MAX_MESSAGE_BYTES_ENV] == DEFAULT_GRPC_MAX_MESSAGE_BYTES
+
+
+def test_grpc_max_message_bytes_preserves_explicit_user_value(monkeypatch):
+    monkeypatch.setenv(GRPC_MAX_MESSAGE_BYTES_ENV, "1048576")
+
+    _set_default_grpc_max_message_bytes()
+
+    assert os.environ[GRPC_MAX_MESSAGE_BYTES_ENV] == "1048576"
+
+
 def test_gateway_args_default_port_is_8000():
     gateway_args = _gateway_args_with_default_port(["--model", "/tmp/x"])
 
     assert gateway_args == ["--model", "/tmp/x", "--port", "8000"]
-    assert _user_host_port_from_gateway_args(gateway_args) == ("0.0.0.0", 8000)
+    assert _get_from_args(gateway_args, "--port") == "8000"
 
 
 def test_gateway_args_preserve_user_port():
     gateway_args = _gateway_args_with_default_port(["--port", "8413"])
 
     assert gateway_args == ["--port", "8413"]
-    assert _user_host_port_from_gateway_args(gateway_args) == ("0.0.0.0", 8413)
+    assert _get_from_args(gateway_args, "--port") == "8413"
 
 
 def test_gateway_args_default_reasoning_parser_is_passthrough():
@@ -217,19 +243,26 @@ def test_smg_disable_flag_set_covers_both():
     )
 
 
-def test_user_model_id_extracts_value():
+def test_get_from_args_extracts_value():
     assert (
-        _user_model_id(["--model", "nvidia/Qwen3.5-397B-A17B-NVFP4", "--port", "8000"])
+        _get_from_args(
+            ["--model", "nvidia/Qwen3.5-397B-A17B-NVFP4", "--port", "8000"], "--model"
+        )
         == "nvidia/Qwen3.5-397B-A17B-NVFP4"
     )
 
 
-def test_user_model_id_returns_none_when_absent():
-    assert _user_model_id(["--port", "8000"]) is None
+def test_get_from_args_returns_none_when_absent():
+    assert _get_from_args(["--port", "8000"], "--model") is None
 
 
-def test_user_model_id_returns_none_when_model_lacks_value():
-    assert _user_model_id(["--model"]) is None
+def test_get_from_args_returns_none_when_flag_lacks_value():
+    assert _get_from_args(["--model"], "--model") is None
+
+
+def test_get_from_args_takes_the_last_occurrence():
+    """Last-wins matches argparse, so appending a flag overrides an earlier one."""
+    assert _get_from_args(["--port", "8000", "--port", "8413"], "--port") == "8413"
 
 
 def test_deepseek_v4_model_id_gets_default_parsers():
@@ -344,6 +377,218 @@ def test_local_deepseek_v4_config_is_detected(tmp_path):
     assert _is_deepseek_v4_model(str(tmp_path))
 
 
+def _make_kimi_k3_model_dir(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "kimi_k3",
+                "architectures": ["KimiK3ForConditionalGeneration"],
+            }
+        )
+    )
+    return str(tmp_path)
+
+
+def test_kimi_k3_model_is_detected_from_id_or_local_config(tmp_path):
+    assert _is_kimi_k3_model("moonshotai/Kimi-K3")
+    assert _is_kimi_k3_model(_make_kimi_k3_model_dir(tmp_path))
+    assert not _is_kimi_k3_model("deepseek-ai/DeepSeek-V4-Flash")
+    assert not _is_kimi_k3_model(None)
+
+
+def test_kimi_k3_model_gets_default_parsers(tmp_path):
+    model = _make_kimi_k3_model_dir(tmp_path)
+
+    engine_args, gateway_args = _args_with_default_model_parsers(
+        ["--model", model],
+        ["--model", model],
+    )
+
+    assert engine_args == [
+        "--model",
+        model,
+        "--reasoning-parser",
+        KIMI_K3_REASONING_PARSER,
+    ]
+    assert gateway_args == [
+        "--model",
+        model,
+        "--reasoning-parser",
+        KIMI_K3_REASONING_PARSER,
+        "--tool-call-parser",
+        KIMI_K3_TOOL_CALL_PARSER,
+    ]
+
+
+def test_kimi_k3_parser_defaults_preserve_explicit_values(tmp_path):
+    model = _make_kimi_k3_model_dir(tmp_path)
+    engine_args = ["--model", model, "--reasoning-parser", "custom_reasoning"]
+    gateway_args = [
+        "--model",
+        model,
+        "--reasoning-parser",
+        "custom_reasoning",
+        "--tool-call-parser",
+        "custom_tools",
+    ]
+
+    assert _args_with_default_model_parsers(engine_args, gateway_args) == (
+        engine_args,
+        gateway_args,
+    )
+
+
+def _make_inkling_model_dir(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "inkling_mm_model",
+                "architectures": ["InklingForConditionalGeneration"],
+            }
+        )
+    )
+    return str(tmp_path)
+
+
+def test_local_inkling_config_is_detected(tmp_path):
+    assert _is_inkling_model(_make_inkling_model_dir(tmp_path))
+    assert not _is_inkling_model("deepseek-ai/DeepSeek-V4-Flash")
+    assert not _is_inkling_model(None)
+
+
+@patch(
+    "tokenspeed.cli.serve_smg.current_platform",
+    new=lambda: SimpleNamespace(is_nvidia=True),
+)
+def test_remote_inkling_model_ids_get_defaults():
+    for model in ("org/Inkling-Chat",):
+        engine_args, gateway_args = _args_with_default_model_parsers(
+            ["--model", model],
+            ["--model", model],
+        )
+        assert engine_args[engine_args.index("--reasoning-parser") + 1] == (
+            INKLING_REASONING_PARSER
+        )
+        assert engine_args[engine_args.index("--attention-backend") + 1] == (
+            INKLING_ATTENTION_BACKEND
+        )
+        assert (
+            gateway_args[gateway_args.index("--reasoning-parser") + 1]
+            == INKLING_REASONING_PARSER
+        )
+        assert (
+            gateway_args[gateway_args.index("--tool-call-parser") + 1]
+            == INKLING_TOOL_CALL_PARSER
+        )
+        assert "--chat-template" not in gateway_args
+
+
+@patch(
+    "tokenspeed.cli.serve_smg.current_platform",
+    new=lambda: SimpleNamespace(is_nvidia=True),
+)
+def test_inkling_model_gets_default_parsers_without_overriding_checkpoint_template(
+    tmp_path,
+):
+    model = _make_inkling_model_dir(tmp_path)
+
+    engine_args, gateway_args = _args_with_default_model_parsers(
+        ["--model", model],
+        ["--model", model],
+    )
+
+    assert engine_args == [
+        "--model",
+        model,
+        "--reasoning-parser",
+        INKLING_REASONING_PARSER,
+        "--attention-backend",
+        INKLING_ATTENTION_BACKEND,
+    ]
+    assert gateway_args[:2] == ["--model", model]
+    assert "--chat-template" not in gateway_args
+    reasoning_idx = gateway_args.index("--reasoning-parser")
+    assert gateway_args[reasoning_idx + 1] == INKLING_REASONING_PARSER
+    tool_idx = gateway_args.index("--tool-call-parser")
+    assert gateway_args[tool_idx + 1] == INKLING_TOOL_CALL_PARSER
+
+
+@patch(
+    "tokenspeed.cli.serve_smg.current_platform",
+    new=lambda: SimpleNamespace(is_nvidia=True),
+)
+def test_inkling_defaults_preserve_explicit_user_values(tmp_path):
+    model = _make_inkling_model_dir(tmp_path)
+
+    engine_args, gateway_args = _args_with_default_model_parsers(
+        [
+            "--model",
+            model,
+            "--reasoning-parser",
+            "custom_reasoning",
+            "--attention-backend",
+            INKLING_ATTENTION_BACKEND,
+            "--enable-prefix-caching",
+        ],
+        [
+            "--model",
+            model,
+            "--reasoning-parser",
+            "custom_reasoning",
+            "--tool-call-parser",
+            "custom_tools",
+            "--chat-template",
+            "/tmp/custom.jinja",
+        ],
+    )
+
+    assert engine_args == [
+        "--model",
+        model,
+        "--reasoning-parser",
+        "custom_reasoning",
+        "--attention-backend",
+        INKLING_ATTENTION_BACKEND,
+        "--enable-prefix-caching",
+    ]
+    assert gateway_args == [
+        "--model",
+        model,
+        "--reasoning-parser",
+        "custom_reasoning",
+        "--tool-call-parser",
+        "custom_tools",
+        "--chat-template",
+        "/tmp/custom.jinja",
+    ]
+
+
+@patch(
+    "tokenspeed.cli.serve_smg.current_platform",
+    new=lambda: SimpleNamespace(is_nvidia=True),
+)
+def test_inkling_rejects_incompatible_attention_backend(tmp_path):
+    model = _make_inkling_model_dir(tmp_path)
+
+    with pytest.raises(ValueError, match="requires --attention-backend fa4"):
+        _args_with_default_model_parsers(
+            ["--model", model, "--attention-backend", "fa3"],
+            ["--model", model],
+        )
+
+
+def test_inkling_preserves_enabled_prefix_caching(tmp_path):
+    model = _make_inkling_model_dir(tmp_path)
+
+    engine_args, _ = _args_with_default_model_parsers(
+        ["--model", model, "--enable-prefix-caching"],
+        ["--model", model],
+    )
+
+    assert "--enable-prefix-caching" in engine_args
+    assert "--no-enable-prefix-caching" not in engine_args
+
+
 def test_prewarm_skips_local_path(tmp_path):
     with patch(
         "huggingface_hub.snapshot_download", side_effect=AssertionError("must not call")
@@ -368,6 +613,7 @@ def test_prewarm_fetches_tokenizer_artifacts_for_hf_id():
     # avoid pulling weight files (no `*.safetensors` etc.).
     patterns = set(kwargs["allow_patterns"])
     assert "tokenizer*" in patterns
+    assert "chat_template*" in patterns
     assert "*.json" in patterns
 
 
@@ -652,6 +898,7 @@ async def test_gateway_exit_during_probe_fails_fast():
 def test_run_smg_from_args_sets_process_title(monkeypatch):
     """Orchestrator sets proc title to 'ts-serve' so pgrep -f ts-serve finds it."""
     captured = {}
+    monkeypatch.delenv(GRPC_MAX_MESSAGE_BYTES_ENV, raising=False)
 
     def fake_run(*a, **kw):
         return 0
@@ -674,6 +921,7 @@ def test_run_smg_from_args_sets_process_title(monkeypatch):
     except SystemExit:
         pass
     assert captured.get("title") == "ts-serve"
+    assert os.environ[GRPC_MAX_MESSAGE_BYTES_ENV] == DEFAULT_GRPC_MAX_MESSAGE_BYTES
 
 
 def test_run_smg_from_args_applies_deepseek_v4_parser_defaults(monkeypatch):

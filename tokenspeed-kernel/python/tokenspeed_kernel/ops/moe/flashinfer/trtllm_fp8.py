@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -32,7 +33,6 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
-next_power_of_2 = lambda value: 1 if value <= 1 else 1 << (value - 1).bit_length()
 
 
 if platform.is_nvidia:
@@ -148,6 +148,8 @@ if platform.is_nvidia:
         routed_scaling_factor = _routing_value(w, "routed_scaling_factor", None)
         routing_method_type = _routing_value(w, "routing_method_type", 1)
 
+        intermediate_size = w.w2_weight.shape[-1]
+
         result = trtllm_fp8_block_scale_moe(
             routing_logits=router_logits.to(torch.float32),
             routing_bias=routing_bias,
@@ -161,13 +163,13 @@ if platform.is_nvidia:
             top_k=getattr(w, "top_k"),
             n_group=n_group,
             topk_group=topk_group,
-            intermediate_size=getattr(w, "intermediate_size"),
+            intermediate_size=intermediate_size,
             local_expert_offset=getattr(w, "ep_rank", 0) * local_experts,
             local_num_experts=local_experts,
             routed_scaling_factor=routed_scaling_factor,
             routing_method_type=int(routing_method_type),
             do_finalize=True,
-            tune_max_num_tokens=next_power_of_2(x_fp8.shape[0]),
+            tune_max_num_tokens=get_autotune_max_num_tokens(),
         )
         if isinstance(result, (list, tuple)):
             result = result[0]

@@ -387,6 +387,7 @@ class RTRunner:
         max_cudagraph_capture_size: int = 4,
         hf_overrides: Optional[dict[str, Any]] = None,
         disable_prefill_graph: bool = False,
+        disable_kvstore: bool = True,
         **kwargs,
     ):
         # Auto-assign port if not specified
@@ -433,6 +434,7 @@ class RTRunner:
             disable_custom_all_reduce=disable_custom_all_reduce,
             hf_overrides=(json.dumps(hf_overrides) if hf_overrides else "{}"),
             disable_prefill_graph=disable_prefill_graph,
+            disable_kvstore=disable_kvstore,
             **spec_kwargs,
             **kwargs,
         )
