@@ -446,6 +446,25 @@ class TestCLIConfigCompat(unittest.TestCase):
         self.assertEqual(sa.speculative_num_steps, 3)
         self.assertEqual(sa.speculative_num_draft_tokens, 4)
 
+    def test_vllm_dspark_config_counts_drafted_tokens_not_verify_rows(self):
+        args = self._parse_args(
+            [
+                "--model",
+                "test/model",
+                "--speculative-config",
+                (
+                    '{"method":"dspark","model":"draft/model",'
+                    '"num_speculative_tokens":7}'
+                ),
+            ]
+        )
+        sa = self._from_cli_args_no_init(args)
+        sa.resolve_basic_defaults()
+        self.assertEqual(sa.speculative_algorithm, "DSPARK")
+        self.assertEqual(sa.speculative_num_steps, 7)
+        # Seven proposals are verified together with one anchor row.
+        self.assertEqual(sa.speculative_num_draft_tokens, 8)
+
     def test_speculative_config_matches_explicit_eagle3_args(self):
         draft_model = "lightseekorg/kimi-k2.5-eagle3-mla"
 

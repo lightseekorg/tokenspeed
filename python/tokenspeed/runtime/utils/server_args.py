@@ -392,8 +392,10 @@ class ServerArgs:
                 num_speculative_tokens = int(num_speculative_tokens)
                 if self.speculative_algorithm in ("DFLASH", "DSPARK"):
                     if self.speculative_num_draft_tokens is None:
-                        self.speculative_num_draft_tokens = num_speculative_tokens
-                    self.speculative_num_steps = max(num_speculative_tokens - 1, 0)
+                        # vLLM names the drafted-token count here. Block
+                        # drafters verify those proposals plus one anchor row.
+                        self.speculative_num_draft_tokens = num_speculative_tokens + 1
+                    self.speculative_num_steps = num_speculative_tokens
                 else:
                     self.speculative_num_steps = num_speculative_tokens
 
