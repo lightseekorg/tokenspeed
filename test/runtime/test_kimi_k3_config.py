@@ -535,13 +535,12 @@ class KimiK3LcmPlanTests(unittest.TestCase):
         base = KimiLinearConfig()
         linear = dict(base.linear_attn_config)
         kda = list(linear["kda_layers"])
-        moved = kda.pop()  # 66 KDA (still /3) + 25 full: wrong split, 93 layers
-        # also drop two more to keep divisibility by the 3 state groups
-        kda.pop(); kda.pop()
+        # 66 KDA (still /3 for the state groups) + 27 full: wrong split.
+        kda.pop()
+        kda.pop()
+        kda.pop()
         linear["kda_layers"] = kda
-        linear["full_attn_layers"] = sorted(
-            set(range(1, _NUM_LAYERS + 1)) - set(kda)
-        )
+        linear["full_attn_layers"] = sorted(set(range(1, _NUM_LAYERS + 1)) - set(kda))
         cfg = KimiLinearConfig(linear_attn_config=linear)
         with self.assertRaisesRegex(ValueError, "69 KDA and 24 MLA"):
             self._plan(cfg, 8)
