@@ -201,6 +201,8 @@ def triton_minimax_sigmoid_bias_topk(
         routed_scaling_factor=routed_scaling_factor,
         weights_dtype=torch.float32,
     )
+    if not normalize_topk_weights:
+        topk_weights.mul_(routed_scaling_factor)
     return topk_weights, topk_ids.to(torch.int32)
 
 
