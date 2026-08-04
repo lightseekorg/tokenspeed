@@ -261,13 +261,6 @@ class MoEGate(nn.Module):
 
 
 class DeepseekV3MoE(nn.Module):
-    # Declares this MoE block correctly consumes MORI's COMPLETE routed output -- either
-    # directly via forward_alltoall (dp>1 RSAG) or by pre-dividing by tp_ep_size so the
-    # decoder's post_mlp_fused all_reduce reconstructs it (dp=1 full-EP). The executor
-    # whitelists MORI EP on this flag; a block without it would mis-scale MORI's complete
-    # result as a partial contribution. Set it on any MoE block that adds MORI handling.
-    supports_mori_ep = True
-
     def __init__(
         self,
         config: PretrainedConfig,
