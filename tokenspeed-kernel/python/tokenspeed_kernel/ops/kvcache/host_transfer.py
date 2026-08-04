@@ -27,70 +27,76 @@ from collections.abc import Sequence
 from typing import Literal
 
 import torch
-
-from tokenspeed_kernel.ops.kvcache.cuda import (
-    transfer_cache_segments as _transfer_cache_segments_kernel,
+from tokenspeed_kernel.ops.kvcache.triton import (
+    transfer_cache_ranges as _transfer_cache_ranges_triton,
 )
 
+_mapped_host_triton_available: bool | None = None
 
-_mapped_host_kernel_available: bool | None = None
 
-
-def _kernel_is_unavailable(error: Exception) -> bool:
+def _triton_is_unavailable(error: Exception) -> bool:
     message = str(error).lower()
     return isinstance(error, AttributeError) or any(
         marker in message
         for marker in (
-            "kvcacheio library not found",
-            "kernel implementation not found",
-            "pinned but not device-mapped",
+            "triton is not available",
+            "hostgetdevicepointer",
+            "mapped host access is not available",
             "is not available",
-            "has no attribute 'transfer_cache_segments'",
+            "has no attribute 'transfer_cache_ranges'",
         )
     )
 
 
-def _validate_segments(
+def _validate_ranges(
     device_buffers: Sequence[torch.Tensor],
-    host_backing: torch.Tensor,
-    segments: Sequence[tuple[int, int, int, int]],
+    host_buffer: torch.Tensor,
+    ranges: Sequence[tuple[int, int, int, int]],
 ) -> None:
     if (
-        host_backing.device.type != "cpu"
-        or host_backing.dtype != torch.uint8
-        or not host_backing.is_contiguous()
-        or not host_backing.is_pinned()
+        host_buffer.device.type != "cpu"
+        or host_buffer.dtype != torch.uint8
+        or not host_buffer.is_contiguous()
+        or not host_buffer.is_pinned()
     ):
-        raise ValueError("host_backing must be contiguous pinned CPU uint8")
+        raise ValueError("host_buffer must be contiguous pinned CPU uint8")
     for buffer in device_buffers:
         if buffer.device.type == "cpu" or not buffer.is_contiguous():
             raise ValueError("device cache buffers must be contiguous device tensors")
-    for buffer_index, device_offset, host_offset, num_bytes in segments:
-        if not 0 <= buffer_index < len(device_buffers):
-            raise IndexError(f"unknown device buffer {buffer_index}")
+    devices = {buffer.device for buffer in device_buffers}
+    if len(devices) > 1:
+        raise ValueError("device cache buffers must be on one device")
+    for device_buffer_index, device_offset, host_offset, num_bytes in ranges:
+        if not 0 <= device_buffer_index < len(device_buffers):
+            raise IndexError(f"unknown device buffer {device_buffer_index}")
         if device_offset < 0 or host_offset < 0 or num_bytes <= 0:
-            raise ValueError("cache transfer offsets must be non-negative and non-empty")
-        device_bytes = device_buffers[buffer_index].numel() * device_buffers[
-            buffer_index
-        ].element_size()
+            raise ValueError(
+                "cache transfer offsets must be non-negative and non-empty"
+            )
+        device_bytes = (
+            device_buffers[device_buffer_index].numel()
+            * device_buffers[device_buffer_index].element_size()
+        )
         if device_offset + num_bytes > device_bytes:
-            raise IndexError("cache transfer segment lies outside its device buffer")
-        if host_offset + num_bytes > host_backing.numel():
-            raise IndexError("cache transfer segment lies outside Host backing")
+            raise IndexError("cache transfer range lies outside its device buffer")
+        if host_offset + num_bytes > host_buffer.numel():
+            raise IndexError("cache transfer range lies outside Host buffer")
 
 
 def _transfer_dma(
     direction: Literal["d2h", "h2d"],
     device_buffers: Sequence[torch.Tensor],
-    host_backing: torch.Tensor,
-    segments: Sequence[tuple[int, int, int, int]],
+    host_buffer: torch.Tensor,
+    ranges: Sequence[tuple[int, int, int, int]],
 ) -> None:
-    byte_buffers = tuple(buffer.view(torch.uint8).reshape(-1) for buffer in device_buffers)
-    for buffer_index, device_offset, host_offset, num_bytes in segments:
-        device_slice = byte_buffers[buffer_index][
+    byte_buffers = tuple(
+        buffer.view(torch.uint8).reshape(-1) for buffer in device_buffers
+    )
+    for device_buffer_index, device_offset, host_offset, num_bytes in ranges:
+        device_slice = byte_buffers[device_buffer_index][
             device_offset : device_offset + num_bytes
         ]
-        host_slice = host_backing[host_offset : host_offset + num_bytes]
+        host_slice = host_buffer[host_offset : host_offset + num_bytes]
         destination, source = (
             (host_slice, device_slice)
             if direction == "d2h"
@@ -99,24 +105,24 @@ def _transfer_dma(
         destination.copy_(source, non_blocking=True)
 
 
-def transfer_cache_segments(
+def transfer_cache_ranges(
     direction: Literal["d2h", "h2d"],
     device_buffers: Sequence[torch.Tensor],
-    host_backing: torch.Tensor,
-    segments: Sequence[tuple[int, int, int, int]],
+    host_buffer: torch.Tensor,
+    ranges: Sequence[tuple[int, int, int, int]],
     stream,
     *,
-    backend: Literal["auto", "kernel", "dma"] = "auto",
+    backend: Literal["auto", "triton", "dma"] = "auto",
 ) -> None:
-    """Copy byte segments between cache buffers and compact pinned Host memory.
+    """Copy byte ranges between cache buffers and compact pinned Host memory.
 
     Args:
         direction: ``"d2h"`` for snapshot/store or ``"h2d"`` for load/recover.
-        device_buffers: Device tensors referenced by segment buffer indices.
-        host_backing: Contiguous pinned uint8 Host allocation.
-        segments: ``(buffer_index, device_offset, host_offset, num_bytes)`` rows.
+        device_buffers: Device tensors referenced by range buffer indices.
+        host_buffer: Contiguous pinned uint8 Host allocation.
+        ranges: ``(device_buffer_index, device_offset, host_offset, num_bytes)`` rows.
         stream: Device stream that orders the asynchronous copies.
-        backend: Prefer one mapped-Host kernel launch or use asynchronous DMA.
+        backend: Prefer one mapped-Host Triton launch or use asynchronous DMA.
 
     Returns:
         None. Completion is observed by recording an event on ``stream``.
@@ -124,39 +130,38 @@ def transfer_cache_segments(
 
     if direction not in ("d2h", "h2d"):
         raise ValueError(f"unknown cache transfer direction {direction!r}")
-    if backend not in ("auto", "kernel", "dma"):
+    if backend not in ("auto", "triton", "dma"):
         raise ValueError(f"unknown cache transfer backend {backend!r}")
-    _validate_segments(device_buffers, host_backing, segments)
-    if not segments:
+    _validate_ranges(device_buffers, host_buffer, ranges)
+    if not ranges:
         return
 
-    global _mapped_host_kernel_available
+    global _mapped_host_triton_available
     with torch.cuda.stream(stream):
-        if backend != "dma" and _mapped_host_kernel_available is not False:
-            descriptors = torch.tensor(segments, dtype=torch.int64, device="cpu")
+        if backend != "dma" and _mapped_host_triton_available is not False:
             try:
-                _transfer_cache_segments_kernel(
+                _transfer_cache_ranges_triton(
                     list(device_buffers),
-                    host_backing,
-                    descriptors,
+                    host_buffer,
+                    list(ranges),
                     0 if direction == "d2h" else 1,
                 )
-                _mapped_host_kernel_available = True
+                _mapped_host_triton_available = True
                 return
             except (AttributeError, RuntimeError) as error:
-                if backend == "kernel" or not _kernel_is_unavailable(error):
+                if backend == "triton" or not _triton_is_unavailable(error):
                     raise
-                _mapped_host_kernel_available = False
+                _mapped_host_triton_available = False
                 warnings.warn(
-                    "Mapped Host cache transfer is unavailable; falling back to DMA",
+                    "Mapped Host Triton transfer is unavailable; falling back to DMA",
                     RuntimeWarning,
                     stacklevel=2,
                 )
-        if backend == "kernel":
-            raise RuntimeError("mapped Host cache transfer kernel is unavailable")
+        if backend == "triton":
+            raise RuntimeError("mapped Host Triton transfer is unavailable")
         _transfer_dma(
             direction,
             device_buffers,
-            host_backing,
-            segments,
+            host_buffer,
+            ranges,
         )

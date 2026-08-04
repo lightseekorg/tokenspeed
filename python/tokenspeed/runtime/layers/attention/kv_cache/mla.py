@@ -132,46 +132,44 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         self.paged_cache_group_page_counts = counts
 
     def cache_transfer_layout(self):
-        from tokenspeed.runtime.cache.layout import (
+        from tokenspeed.runtime.cache.transfer.layout import (
+            CacheField,
             CacheGroupLayout,
-            CacheSegment,
             CacheTransferLayout,
         )
 
         spec = self.paged_cache_group_specs[0]
         buffers = []
-        segments = []
+        fields = []
         consumers = []
         for layer_id, entry in enumerate(self.kv_buffer):
             tensors = entry if isinstance(entry, tuple) else (entry,)
             consumer = []
             for field_index, tensor in enumerate(tensors):
                 row_bytes = int(tensor[0].numel() * tensor.element_size())
-                segment_id = f"layer.{layer_id}.field.{field_index}"
+                field_id = f"layer.{layer_id}.field.{field_index}"
                 buffers.append(tensor)
-                segments.append(
-                    CacheSegment(
-                        segment_id=segment_id,
-                        buffer_index=len(buffers) - 1,
-                        page_zero_offset=0,
-                        page_stride_bytes=self.page_size * row_bytes,
+                fields.append(
+                    CacheField(
+                        field_id=field_id,
+                        device_buffer_index=len(buffers) - 1,
+                        device_block_zero_offset_bytes=0,
+                        block_stride_bytes=self.page_size * row_bytes,
                         payload_bytes=self.page_size * row_bytes,
                     )
                 )
-                consumer.append(segment_id)
+                consumer.append(field_id)
             consumers.append(tuple(consumer))
         group = CacheGroupLayout(
             group_id=spec.group_id,
             cache_blocks_per_lcm_block=1,
-            page_count=self.size // self.page_size + 1,
-            segments=tuple(segments),
+            fields=tuple(fields),
         )
         return CacheTransferLayout(
-            logical_block_tokens=self.page_size,
+            num_lcm_blocks=self.size // self.page_size,
             groups=(group,),
             buffers=tuple(buffers),
             consumers=tuple(consumers),
-            lcm_block_count=self.size // self.page_size,
         )
 
     def _create_buffers(self) -> None:
@@ -342,8 +340,8 @@ class MLATokenToKVPool(BaseTokenToKVPool):
             return [[start_idx + layer_id] for layer_id in range(self.layer_num)]
 
     def get_key_buffer(self, layer_id: int):
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id)
+        if self.layerwise_load_tracker is not None:
+            self.layerwise_load_tracker.wait_for_layer(layer_id)
         buffer = self.kv_buffer[layer_id]
         if buffer is None:
             raise ValueError(f"layer {layer_id} is a KDA state layer")
@@ -355,8 +353,8 @@ class MLATokenToKVPool(BaseTokenToKVPool):
             return buffer
 
     def get_value_buffer(self, layer_id: int):
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id)
+        if self.layerwise_load_tracker is not None:
+            self.layerwise_load_tracker.wait_for_layer(layer_id)
         buffer = self.kv_buffer[layer_id]
         if buffer is None:
             raise ValueError(f"layer {layer_id} is a KDA state layer")

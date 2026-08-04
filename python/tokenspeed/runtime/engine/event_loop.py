@@ -32,9 +32,7 @@ import torch.distributed as dist
 import zmq
 from tokenspeed_scheduler import PD, Cache, ExecutionEvent, ForwardEvent, Scheduler
 
-from tokenspeed.runtime.cache.executor.memory_executor import (
-    MemoryExecutor,
-)
+from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.configs.paged_cache_spec import (
     validate_scheduler_config,
@@ -330,20 +328,20 @@ class EventLoop:
                     "the cache-group scheduler has no L3 storage tier; unset "
                     "--kvstore-storage-backend"
                 )
-            self.memory_executor = MemoryExecutor(
+            self.l2_cache_executor = L2CacheExecutor(
                 device_pool=token_to_kv_pool,
                 draft_pool=draft_token_to_kv_pool,
                 host_ratio=server_args.kvstore_ratio,
                 host_size_gb=server_args.kvstore_size,
             )
-            num_host_pages = self.memory_executor.num_host_pages
+            num_host_pages = self.l2_cache_executor.num_host_pages
         else:
-            self.memory_executor = None
+            self.l2_cache_executor = None
             num_host_pages = 0
 
         # The host tier acks loadbacks, so they join the in-flight accounting.
         self._loadback_acks_expected = getattr(
-            self.memory_executor, "emits_loadback_acks", False
+            self.l2_cache_executor, "emits_loadback_acks", False
         )
 
         self._kv_events_enabled = (
@@ -722,9 +720,9 @@ class EventLoop:
             time.sleep(0.0005)
 
     def _commit_cache_results(self) -> None:
-        if self.memory_executor is None:
+        if self.l2_cache_executor is None:
             return
-        cache_results = self.memory_executor.poll_results()
+        cache_results = self.l2_cache_executor.poll_results()
         self._num_inflight_cache_ops -= len(cache_results)
         for event in cache_results:
             payload = cache_event_to_payload(event)
@@ -985,9 +983,9 @@ class EventLoop:
         )
 
     def _submit_cache_ops(self, execution_plan) -> None:
-        if self.memory_executor is None:
+        if self.l2_cache_executor is None:
             return
-        self.memory_executor.submit_plan(execution_plan)
+        self.l2_cache_executor.submit_plan(execution_plan)
         for op in execution_plan.cache:
             if isinstance(op, Cache.WriteBackOp):
                 self._num_inflight_cache_ops += len(op.op_ids)
@@ -999,17 +997,14 @@ class EventLoop:
         self._setup_layerwise_loadback(execution_plan)
 
     def _setup_layerwise_loadback(self, execution_plan) -> None:
-        consumer_indices = []
+        load_indices = []
         for cache_op in execution_plan.cache:
             if isinstance(cache_op, Cache.LoadBackOp):
                 for op_id in cache_op.op_ids:
-                    producer_index = self.memory_executor.get_producer_index(op_id)
-                    if (
-                        producer_index is not None
-                        and producer_index not in consumer_indices
-                    ):
-                        consumer_indices.append(producer_index)
-        self.memory_executor.set_consumer(consumer_indices or -1)
+                    load_index = self.l2_cache_executor.take_load_index(op_id)
+                    if load_index is not None and load_index not in load_indices:
+                        load_indices.append(load_index)
+        self.l2_cache_executor.set_consumers(load_indices or -1)
 
     # ------------------------------------------------------------------
     # Helpers

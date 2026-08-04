@@ -22,49 +22,45 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from tokenspeed.runtime.utils import get_colorful_logger, get_device_module
-
-logger = get_colorful_logger(__name__)
+from tokenspeed.runtime.utils import get_device_module
 
 device_module = get_device_module()
 
+_NUM_LOAD_EVENT_SETS = 3
 
-class LayerLoadingEvent:
+
+class _LayerwiseLoadEvents:
     def __init__(self, num_layers: int):
-        self._num_layers = num_layers
-        self.load_events = [device_module.Event() for _ in range(num_layers)]
-        self.start_event = device_module.Event()  # start event on controller stream
+        self.layer_done_events = [device_module.Event() for _ in range(num_layers)]
+        self.start_event = device_module.Event()
 
-    def complete(self, layer_index: int) -> None:
-        if not 0 <= layer_index < self._num_layers:
-            raise IndexError(f"layer_index out of range: {layer_index}")
-        self.load_events[layer_index].record()
-
-    def wait(self, layer_index: int) -> None:
-        device_module.current_stream().wait_event(self.load_events[layer_index])
+    def wait_for_layer(self, layer_index: int) -> None:
+        device_module.current_stream().wait_event(self.layer_done_events[layer_index])
 
     @property
-    def finish_event(self):
-        return self.load_events[-1]
+    def last_layer_done_event(self):
+        return self.layer_done_events[-1]
 
 
-class LayerDoneCounter:
+class LayerwiseLoadTracker:
     def __init__(self, num_layers: int):
-        self.num_layers = num_layers
-        # extra producer and consumer counters for overlap mode
-        self.num_counters = 3
-        self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
-        self.producer_index = -1
+        # Keep separate events for the H2D load being produced, the load used
+        # by the current forward, and the next one-step-overlap load.
+        self.event_sets = [
+            _LayerwiseLoadEvents(num_layers) for _ in range(_NUM_LOAD_EVENT_SETS)
+        ]
+        self.current_load_index = -1
         self.consumer_indices: tuple[int, ...] = ()
 
-    def update_producer(self):
-        next_index = (self.producer_index + 1) % self.num_counters
-        if not self.events[next_index].finish_event.query():
-            self.events[next_index].finish_event.synchronize()
-        self.producer_index = next_index
-        return self.producer_index
+    def begin_load(self) -> int:
+        next_index = (self.current_load_index + 1) % len(self.event_sets)
+        last_layer_done = self.event_sets[next_index].last_layer_done_event
+        if not last_layer_done.query():
+            last_layer_done.synchronize()
+        self.current_load_index = next_index
+        return next_index
 
-    def set_consumer(self, indices: int | Iterable[int]):
+    def set_consumers(self, indices: int | Iterable[int]) -> None:
         if isinstance(indices, int):
             self.consumer_indices = () if indices < 0 else (indices,)
             return
@@ -74,12 +70,12 @@ class LayerDoneCounter:
                 deduped.append(index)
         self.consumer_indices = tuple(deduped)
 
-    def wait_until(self, threshold: int):
+    def wait_for_layer(self, layer_index: int) -> None:
         if not self.consumer_indices:
             return
         for consumer_index in self.consumer_indices:
-            self.events[consumer_index].wait(threshold)
+            self.event_sets[consumer_index].wait_for_layer(layer_index)
 
-    def reset(self):
-        self.producer_index = -1
+    def reset(self) -> None:
+        self.current_load_index = -1
         self.consumer_indices = ()

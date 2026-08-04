@@ -99,8 +99,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
         return True
 
     def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id)
+        if self.layerwise_load_tracker is not None:
+            self.layerwise_load_tracker.wait_for_layer(layer_id)
         return self.index_k_buffer[layer_id]
 
     def set_index_k_buffer(

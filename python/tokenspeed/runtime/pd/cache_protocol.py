@@ -935,7 +935,7 @@ def build_lcm_pd_cache_contract(
     field_dtypes: Mapping[str, str],
 ) -> tuple[CachePDLayout, tuple[CachePDSlabRegistration, ...]]:
     """Describe one LCM arena without copying or flattening its backing."""
-    from tokenspeed.runtime.cache.layout import layout_from_lcm_plan
+    from tokenspeed.runtime.cache.transfer.layout import layout_from_lcm_plan
 
     groups = tuple(getattr(plan, "groups", ()))
     fields = tuple(getattr(plan, "fields", ()))
@@ -970,20 +970,20 @@ def build_lcm_pd_cache_contract(
                 f"LCM PD group {spec.group_id!r} requires a transfer policy"
             )
         transfer_group = transfer_groups.get(spec.group_id)
-        if transfer_group is None or not transfer_group.segments:
+        if transfer_group is None or not transfer_group.fields:
             raise CachePDProtocolError(
                 f"LCM PD group {spec.group_id!r} has no planned fields"
             )
-        segments = tuple(
+        transfer_segments = tuple(
             CachePDTransferSegment(
-                physical_slot=segment.buffer_index,
-                field_id=segment.segment_id,
-                dtype=field_dtypes[segment.segment_id],
-                page_zero_offset=segment.page_zero_offset,
-                page_stride_bytes=segment.page_stride_bytes,
-                payload_bytes=segment.payload_bytes,
+                physical_slot=field.device_buffer_index,
+                field_id=field.field_id,
+                dtype=field_dtypes[field.field_id],
+                page_zero_offset=field.device_block_zero_offset_bytes,
+                page_stride_bytes=field.block_stride_bytes,
+                payload_bytes=field.payload_bytes,
             )
-            for segment in transfer_group.segments
+            for field in transfer_group.fields
         )
         pd_groups.append(
             CachePDGroup(
@@ -992,7 +992,7 @@ def build_lcm_pd_cache_contract(
                 transfer_policy=transfer_policy,
                 physical_slots=(0,),
                 cache_blocks_per_lcm_block=group.cache_blocks_per_lcm_block,
-                transfer_segments=segments,
+                transfer_segments=transfer_segments,
             )
         )
 

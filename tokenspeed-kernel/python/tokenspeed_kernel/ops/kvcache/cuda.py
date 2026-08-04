@@ -24,7 +24,6 @@ from tokenspeed_kernel.registry import error_fn
 
 try:
     from tokenspeed_kernel.thirdparty.cuda.kvcacheio import (
-        transfer_cache_segments,
         transfer_kv_all_layer_lf_pf,
         transfer_kv_all_layer_lf_ph,
         transfer_kv_all_layer_mla,
@@ -40,7 +39,6 @@ except ImportError:
     transfer_kv_all_layer_lf_ph = error_fn
     transfer_kv_all_layer_mla = error_fn
     transfer_kv_all_layer_mla_lf_pf = error_fn
-    transfer_cache_segments = error_fn
     transfer_kv_direct = error_fn
     transfer_kv_per_layer_mla = error_fn
     transfer_kv_per_layer_mla_pf_lf = error_fn
@@ -52,7 +50,6 @@ __all__ = [
     "transfer_kv_all_layer_lf_ph",
     "transfer_kv_all_layer_mla",
     "transfer_kv_all_layer_mla_lf_pf",
-    "transfer_cache_segments",
     "transfer_kv_direct",
     "transfer_kv_per_layer_mla",
     "transfer_kv_per_layer_mla_pf_lf",

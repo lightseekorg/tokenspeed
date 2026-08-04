@@ -179,15 +179,15 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             ) * self.layer_num
 
     def cache_transfer_layout(self):
-        from tokenspeed.runtime.cache.layout import (
+        from tokenspeed.runtime.cache.transfer.layout import (
+            CacheField,
             CacheGroupLayout,
-            CacheSegment,
             CacheTransferLayout,
         )
 
         specs = {spec.group_id: spec for spec in self.paged_cache_group_specs}
         buffers = []
-        segments_by_group = {group_id: [] for group_id in specs}
+        fields_by_group = {group_id: [] for group_id in specs}
         consumers = []
         for layer_id, group_id in enumerate(self.layer_cache_group_ids):
             spec = specs[group_id]
@@ -200,35 +200,33 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                     continue
                 view = self._layer_row_view(tensor, layer_id)
                 row_bytes = int(view[0].numel() * view.element_size())
-                segment_id = f"layer.{layer_id}.{kind}"
+                field_id = f"layer.{layer_id}.{kind}"
                 buffers.append(view)
-                segments_by_group[group_id].append(
-                    CacheSegment(
-                        segment_id=segment_id,
-                        buffer_index=len(buffers) - 1,
-                        page_zero_offset=0,
-                        page_stride_bytes=spec.rows_per_page * row_bytes,
+                fields_by_group[group_id].append(
+                    CacheField(
+                        field_id=field_id,
+                        device_buffer_index=len(buffers) - 1,
+                        device_block_zero_offset_bytes=0,
+                        block_stride_bytes=spec.rows_per_page * row_bytes,
                         payload_bytes=spec.rows_per_page * row_bytes,
                     )
                 )
-                consumer.append(segment_id)
+                consumer.append(field_id)
             consumers.append(tuple(consumer))
         parent_count = self.size // self.page_size
         groups = tuple(
             CacheGroupLayout(
                 group_id=spec.group_id,
                 cache_blocks_per_lcm_block=spec.cache_blocks_per_lcm_block,
-                page_count=parent_count * spec.cache_blocks_per_lcm_block + 1,
-                segments=tuple(segments_by_group[spec.group_id]),
+                fields=tuple(fields_by_group[spec.group_id]),
             )
             for spec in self.paged_cache_group_specs
         )
         return CacheTransferLayout(
-            logical_block_tokens=self.page_size,
+            num_lcm_blocks=parent_count,
             groups=groups,
             buffers=tuple(buffers),
             consumers=tuple(consumers),
-            lcm_block_count=parent_count,
         )
 
     def _publish_paged_cache_groups(
@@ -649,8 +647,8 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         # note: get_key_buffer is hooked with synchronization for layer-wise KV cache loading
         # it is supposed to be used only by attention backend not for information purpose
         # same applies to get_value_buffer and get_kv_buffer
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id)
+        if self.layerwise_load_tracker is not None:
+            self.layerwise_load_tracker.wait_for_layer(layer_id)
         return self._get_key_buffer(layer_id)
 
     def _get_value_buffer(self, layer_id: int):
@@ -663,8 +661,8 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         return self._layer_row_view(buf, layer_id)
 
     def get_value_buffer(self, layer_id: int):
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id)
+        if self.layerwise_load_tracker is not None:
+            self.layerwise_load_tracker.wait_for_layer(layer_id)
         return self._get_value_buffer(layer_id)
 
     def get_kv_buffer(self, layer_id: int):

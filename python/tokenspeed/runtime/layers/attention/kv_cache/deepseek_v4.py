@@ -1140,34 +1140,34 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
                 )
             return self.lcm_pool.transfer_layout(consumers)
 
-        from tokenspeed.runtime.cache.layout import (
+        from tokenspeed.runtime.cache.transfer.layout import (
+            CacheField,
             CacheGroupLayout,
-            CacheSegment,
             CacheTransferLayout,
         )
 
         specs = {spec.group_id: spec for spec in self.paged_cache_group_specs}
         buffers = []
-        segments_by_group = {group_id: [] for group_id in specs}
+        fields_by_group = {group_id: [] for group_id in specs}
         consumers = []
 
-        def add_segment(group_id: str, segment_id: str, tensor: torch.Tensor):
+        def add_field(group_id: str, field_id: str, tensor: torch.Tensor):
             payload_bytes = int(tensor[0].numel() * tensor.element_size())
             buffers.append(tensor)
-            segments_by_group[group_id].append(
-                CacheSegment(
-                    segment_id=segment_id,
-                    buffer_index=len(buffers) - 1,
-                    page_zero_offset=0,
-                    page_stride_bytes=payload_bytes,
+            fields_by_group[group_id].append(
+                CacheField(
+                    field_id=field_id,
+                    device_buffer_index=len(buffers) - 1,
+                    device_block_zero_offset_bytes=0,
+                    block_stride_bytes=payload_bytes,
                     payload_bytes=payload_bytes,
                 )
             )
-            return segment_id
+            return field_id
 
         for layer_id, ratio in enumerate(self.layout.layer_ratio):
             consumer = [
-                add_segment(
+                add_field(
                     V4_SWA_KV_GROUP_ID,
                     f"layer.{layer_id}.swa",
                     self.swa_kv_buffer[layer_id],
@@ -1176,14 +1176,14 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
             if ratio > 1:
                 compressed_group = v4_compressed_kv_group_id(ratio)
                 consumer.append(
-                    add_segment(
+                    add_field(
                         compressed_group,
                         f"layer.{layer_id}.compressed_kv",
                         self.compressed_kv_buffer[layer_id],
                     )
                 )
                 consumer.append(
-                    add_segment(
+                    add_field(
                         v4_compressor_state_group_id(ratio),
                         f"layer.{layer_id}.compressor_state",
                         self.compressor_state_buffer[layer_id],
@@ -1191,14 +1191,14 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
                 )
                 if ratio == 4:
                     consumer.append(
-                        add_segment(
+                        add_field(
                             compressed_group,
                             f"layer.{layer_id}.indexer_kv",
                             self.indexer_kv_buffer[layer_id],
                         )
                     )
                     consumer.append(
-                        add_segment(
+                        add_field(
                             V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
                             f"layer.{layer_id}.indexer_state",
                             self.indexer_state_buffer[layer_id],
@@ -1209,17 +1209,15 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
             CacheGroupLayout(
                 group_id=spec.group_id,
                 cache_blocks_per_lcm_block=spec.cache_blocks_per_lcm_block,
-                page_count=self.paged_cache_group_page_counts[spec.group_id],
-                segments=tuple(segments_by_group[spec.group_id]),
+                fields=tuple(fields_by_group[spec.group_id]),
             )
             for spec in self.paged_cache_group_specs
         )
         return CacheTransferLayout(
-            logical_block_tokens=self.page_size,
+            num_lcm_blocks=self.num_pages - 1,
             groups=groups,
             buffers=tuple(buffers),
             consumers=tuple(consumers),
-            lcm_block_count=self.num_pages - 1,
         )
 
     def maybe_log_paged_cache_group_pages(self) -> None:

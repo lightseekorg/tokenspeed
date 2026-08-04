@@ -20,60 +20,96 @@
 
 from __future__ import annotations
 
+import sys
+from types import SimpleNamespace
+
 import pytest
 
-from tokenspeed.runtime.cache.host_storage import HostCacheStorage
-from tokenspeed.runtime.cache.layout import (
+from tokenspeed.runtime.cache.l2.storage import HostCacheStorage
+from tokenspeed.runtime.cache.transfer.layout import (
+    CacheField,
     CacheGroupLayout,
-    CacheSegment,
     CacheTransferLayout,
 )
 
 
+@pytest.fixture(autouse=True)
+def _fake_torch(monkeypatch):
+    uint8 = object()
+
+    def empty(num_bytes, *, dtype, pin_memory):
+        assert dtype is uint8
+        assert pin_memory is True
+        return bytearray(num_bytes)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(empty=empty, uint8=uint8),
+    )
+
+
 def _layout():
-    segment = lambda name, size: CacheSegment(name, 0, 0, size, size)
+    field = lambda name, size: CacheField(name, 0, 0, size, size)
     return CacheTransferLayout(
-        logical_block_tokens=128,
+        num_lcm_blocks=2,
         groups=(
-            CacheGroupLayout("full", 4, 9, (segment("k", 32),)),
-            CacheGroupLayout("state", 1, 3, (segment("state", 80),)),
+            CacheGroupLayout("full", 4, (field("k", 32),)),
+            CacheGroupLayout("state", 1, (field("state", 80),)),
         ),
         buffers=(object(),),
         consumers=(("k",), ("state",)),
     )
 
 
-def test_child_offsets_follow_group_packing_without_overlap():
+def test_block_offsets_follow_group_packing_without_overlap():
     layout = _layout()
-    packed = layout.pack()
-    storage = HostCacheStorage(
-        layout,
-        num_lcm_blocks=2,
-        backing=bytearray(2 * packed.parent_bytes),
-    )
+    storage = HostCacheStorage(layout, num_host_lcm_blocks=2)
 
-    assert storage.child_offset(0, 1) == 0
-    assert storage.child_offset(0, 4) == 3 * packed.child_bytes[0]
-    assert storage.child_offset(0, 5) == packed.parent_bytes
-    assert storage.child_offset(1, 1) == 0
-    assert storage.child_offset(1, 2) == packed.parent_bytes
+    assert storage.host_block_offset(0, 1) == 0
+    assert storage.host_block_offset(0, 4) == 3 * storage.host_cache_block_bytes[0]
+    assert storage.host_block_offset(0, 5) == storage.host_lcm_block_bytes
+    assert storage.host_block_offset(1, 1) == 0
+    assert storage.host_block_offset(1, 2) == storage.host_lcm_block_bytes
 
 
-@pytest.mark.parametrize("group_index,page_id", [(0, 0), (0, 9), (1, 3)])
-def test_null_and_out_of_range_pages_are_rejected(group_index, page_id):
+@pytest.mark.parametrize("group_index,block_id", [(0, 0), (0, 9), (1, 3)])
+def test_null_and_out_of_range_blocks_are_rejected(group_index, block_id):
     layout = _layout()
-    packed = layout.pack()
-    storage = HostCacheStorage(
-        layout,
-        num_lcm_blocks=2,
-        backing=bytearray(2 * packed.parent_bytes),
-    )
+    storage = HostCacheStorage(layout, num_host_lcm_blocks=2)
 
     with pytest.raises(IndexError):
-        storage.child_offset(group_index, page_id)
+        storage.host_block_offset(group_index, block_id)
 
 
-def test_backing_size_must_match_exact_parent_budget():
-    layout = _layout()
-    with pytest.raises(ValueError, match="backing"):
-        HostCacheStorage(layout, num_lcm_blocks=2, backing=bytearray(1))
+def test_host_fields_are_packed_without_padding():
+    field = lambda name, stride, payload: CacheField(name, 0, 0, stride, payload)
+    layout = CacheTransferLayout(
+        num_lcm_blocks=10,
+        groups=(
+            CacheGroupLayout(
+                "full",
+                16,
+                (
+                    field("full.k", 96, 40),
+                    field("full.v", 96, 40),
+                ),
+            ),
+            CacheGroupLayout(
+                "state",
+                1,
+                (
+                    field("state.ssm", 2048, 1000),
+                    field("state.conv", 1024, 200),
+                ),
+            ),
+        ),
+        buffers=(object(),),
+        consumers=(("full.k", "full.v"), ("state.ssm", "state.conv")),
+    )
+
+    storage = HostCacheStorage(layout, num_host_lcm_blocks=1)
+
+    assert storage.host_cache_block_bytes == (80, 1200)
+    assert storage.host_field_offsets == ((0, 40), (0, 1000))
+    assert storage.host_lcm_block_bytes == 1280

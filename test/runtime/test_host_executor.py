@@ -17,15 +17,13 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 class GroupAwareWireTest(unittest.TestCase):
     def test_submit_preserves_group_identity(self):
         try:
-            from tokenspeed.runtime.cache.executor.memory_executor import (
-                MemoryExecutor,
-            )
+            from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs runtime dependencies: {exc}")
 
         op_ids = []
         transfers = []
-        MemoryExecutor._submit(
+        L2CacheExecutor._submit(
             [7],
             [[0, 1]],
             [[5, 5]],
@@ -39,22 +37,22 @@ class GroupAwareWireTest(unittest.TestCase):
 
     def test_writeback_calls_transfer_with_compact_layout(self):
         try:
-            import tokenspeed.runtime.cache.executor.memory_executor as executor_module
+            import tokenspeed.runtime.cache.l2.executor as executor_module
 
-            MemoryExecutor = executor_module.MemoryExecutor
+            L2CacheExecutor = executor_module.L2CacheExecutor
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs runtime dependencies: {exc}")
 
-        executor = MemoryExecutor.__new__(MemoryExecutor)
+        executor = L2CacheExecutor.__new__(L2CacheExecutor)
         executor._pending_write_op_ids = [7]
         executor._pending_write_transfers = [(0, 5, 9)]
         executor._immediate_write_op_ids = []
         executor.layout = SimpleNamespace(buffers=("device",))
-        executor.storage = SimpleNamespace(backing="host")
+        executor.host_storage = SimpleNamespace(host_buffer="host")
         executor.write_stream = object()
         executor.ack_write_queue = []
-        descriptors = [(0, 64, 128, 32)]
-        executor._descriptors = Mock(return_value=descriptors)
+        ranges = [(0, 64, 128, 32)]
+        executor._transfer_ranges = Mock(return_value=ranges)
         start = Mock()
         finish = Mock()
 
@@ -62,15 +60,15 @@ class GroupAwareWireTest(unittest.TestCase):
             patch.object(
                 executor_module.torch.cuda, "Event", side_effect=(start, finish)
             ),
-            patch.object(executor_module, "transfer_cache_segments") as transfer,
+            patch.object(executor_module, "transfer_cache_ranges") as transfer,
         ):
             executor._start_writing()
 
         transfer.assert_called_once_with(
             "d2h",
             executor.layout.buffers,
-            executor.storage.backing,
-            descriptors,
+            executor.host_storage.host_buffer,
+            ranges,
             executor.write_stream,
         )
         start.record.assert_called_once_with()

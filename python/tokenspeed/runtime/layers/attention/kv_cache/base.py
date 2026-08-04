@@ -29,7 +29,7 @@ from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.utils import get_colorful_logger
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.cache.kvstore_controller import LayerDoneCounter
+    from tokenspeed.runtime.cache.l2.layerwise_load import LayerwiseLoadTracker
 
 logger = get_colorful_logger(__name__)
 
@@ -69,7 +69,7 @@ class BaseTokenToKVPool:
         self.token_slot_refs = None
 
         # default state for optional layer-wise transfer control
-        self.layer_transfer_counter = None
+        self.layerwise_load_tracker = None
         logger.info(
             f"Initialized token to kv pool with size {size}, dtype {dtype}, device {device}, page size {page_size}, rank {rank}"
         )
@@ -78,8 +78,10 @@ class BaseTokenToKVPool:
     def cell_size(self) -> int:
         raise NotImplementedError()
 
-    def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
-        self.layer_transfer_counter = layer_transfer_counter
+    def register_layerwise_load_tracker(
+        self, layerwise_load_tracker: LayerwiseLoadTracker
+    ) -> None:
+        self.layerwise_load_tracker = layerwise_load_tracker
 
     def set_token_slot_refs(self, token_slot_refs: torch.Tensor):
         self.token_slot_refs = token_slot_refs

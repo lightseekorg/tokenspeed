@@ -18,16 +18,4 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from tokenspeed.runtime.cache.transfer.types import (
-    CacheKind,
-    Location,
-    TransferBatch,
-    TransferUnit,
-)
-
-__all__ = [
-    "CacheKind",
-    "Location",
-    "TransferBatch",
-    "TransferUnit",
-]
+"""Model-neutral cache transfer layout contracts."""

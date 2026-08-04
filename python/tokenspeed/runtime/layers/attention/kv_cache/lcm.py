@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.kvcache.triton import zero_byte_segments
+from tokenspeed_kernel.ops.kvcache.triton import zero_byte_ranges
 
 from tokenspeed.runtime.configs.lcm_memory_plan import LcmMemoryPlan
 
@@ -69,13 +69,13 @@ class LcmCachePool:
         return view
 
     def zero_pages(self, page_ids_by_group: dict[str, list[int]]) -> None:
-        segments = [
-            segment
+        ranges = [
+            byte_range
             for group_id, page_ids in page_ids_by_group.items()
-            for segment in self._page_byte_segments(group_id, page_ids)
+            for byte_range in self._page_byte_ranges(group_id, page_ids)
         ]
-        if segments:
-            zero_byte_segments(self.backing, segments)
+        if ranges:
+            zero_byte_ranges(self.backing, ranges)
 
     def pd_contract(self, group_specs):
         from tokenspeed.runtime.pd.cache_protocol import build_lcm_pd_cache_contract
@@ -99,7 +99,7 @@ class LcmCachePool:
         )
 
     def transfer_layout(self, consumers):
-        from tokenspeed.runtime.cache.layout import layout_from_lcm_plan
+        from tokenspeed.runtime.cache.transfer.layout import layout_from_lcm_plan
 
         return layout_from_lcm_plan(
             self.plan,
@@ -124,7 +124,7 @@ class LcmCachePool:
             + field.field_offset_bytes
         )
 
-    def _page_byte_segments(
+    def _page_byte_ranges(
         self, group_id: str, page_ids: list[int]
     ) -> list[tuple[int, int]]:
         self.plan.group(group_id)

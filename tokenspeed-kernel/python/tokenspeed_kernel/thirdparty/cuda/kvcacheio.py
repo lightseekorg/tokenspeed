@@ -289,19 +289,6 @@ def transfer_kv_direct(
         start_index = end_index
 
 
-def transfer_cache_segments(
-    device_buffers: List[torch.Tensor],
-    host_backing: torch.Tensor,
-    descriptors: torch.Tensor,
-    direction: int,
-):
-    """Transfer arbitrary byte segments with one mapped-Host kernel launch."""
-
-    _load_kvcacheio_module().transfer_cache_segments(
-        device_buffers, host_backing, descriptors, direction
-    )
-
-
 def transfer_kv_per_layer_mla(
     src: torch.Tensor,
     dst: torch.Tensor,
@@ -397,7 +384,6 @@ __all__ = [
     "transfer_kv_all_layer_lf_ph",
     "transfer_kv_all_layer_mla",
     "transfer_kv_all_layer_mla_lf_pf",
-    "transfer_cache_segments",
     "transfer_kv_direct",
     "transfer_kv_per_layer_mla",
     "transfer_kv_per_layer_mla_pf_lf",

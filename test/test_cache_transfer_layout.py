@@ -24,21 +24,21 @@ from types import SimpleNamespace
 
 import pytest
 
-from tokenspeed.runtime.cache.layout import (
+from tokenspeed.runtime.cache.transfer.layout import (
+    CacheField,
     CacheGroupLayout,
-    CacheSegment,
     CacheTransferLayout,
     combine_cache_transfer_layouts,
     layout_from_lcm_plan,
 )
 
 
-def _segment(segment_id: str, *, stride: int = 64, payload: int = 48):
-    return CacheSegment(
-        segment_id=segment_id,
-        buffer_index=0,
-        page_zero_offset=0,
-        page_stride_bytes=stride,
+def _field(field_id: str, *, stride: int = 64, payload: int = 48):
+    return CacheField(
+        field_id=field_id,
+        device_buffer_index=0,
+        device_block_zero_offset_bytes=0,
+        block_stride_bytes=stride,
         payload_bytes=payload,
     )
 
@@ -47,84 +47,50 @@ def test_layout_rejects_duplicate_group_ids():
     group = CacheGroupLayout(
         group_id="full",
         cache_blocks_per_lcm_block=16,
-        page_count=161,
-        segments=(_segment("k"),),
+        fields=(_field("k"),),
     )
 
     with pytest.raises(ValueError, match="duplicate group"):
         CacheTransferLayout(
-            logical_block_tokens=128,
+            num_lcm_blocks=10,
             groups=(group, group),
             buffers=(object(),),
             consumers=(("k",),),
         )
 
 
-def test_layout_rejects_duplicate_segment_ids_across_groups():
+def test_layout_rejects_duplicate_field_ids_across_groups():
     groups = (
-        CacheGroupLayout("full", 16, 161, (_segment("shared"),)),
-        CacheGroupLayout("state", 1, 11, (_segment("shared"),)),
+        CacheGroupLayout("full", 16, (_field("shared"),)),
+        CacheGroupLayout("state", 1, (_field("shared"),)),
     )
 
-    with pytest.raises(ValueError, match="duplicate segment"):
-        CacheTransferLayout(128, groups, (object(),), (("shared",),))
+    with pytest.raises(ValueError, match="duplicate field"):
+        CacheTransferLayout(10, groups, (object(),), (("shared",),))
 
 
 def test_layout_rejects_payload_larger_than_device_stride():
     with pytest.raises(ValueError, match="payload_bytes"):
-        _segment("bad", stride=31, payload=32)
+        _field("bad", stride=31, payload=32)
 
 
-def test_layout_rejects_unknown_consumer_segment():
-    group = CacheGroupLayout("full", 16, 161, (_segment("k"),))
+def test_layout_rejects_unknown_consumer_field():
+    group = CacheGroupLayout("full", 16, (_field("k"),))
 
-    with pytest.raises(ValueError, match="unknown segment"):
-        CacheTransferLayout(128, (group,), (object(),), (("v",),))
+    with pytest.raises(ValueError, match="unknown field"):
+        CacheTransferLayout(10, (group,), (object(),), (("v",),))
 
 
-def test_layout_rejects_parent_count_that_disagrees_with_group_geometry():
-    group = CacheGroupLayout("full", 16, 161, (_segment("k"),))
+def test_layout_requires_a_positive_num_lcm_blocks():
+    group = CacheGroupLayout("full", 16, (_field("k"),))
 
-    with pytest.raises(ValueError, match="disagrees"):
+    with pytest.raises(ValueError, match="num_lcm_blocks"):
         CacheTransferLayout(
-            128,
+            0,
             (group,),
             (object(),),
             (("k",),),
-            lcm_block_count=11,
         )
-
-
-def test_qwen_style_packing_excludes_device_padding():
-    full = CacheGroupLayout(
-        group_id="full",
-        cache_blocks_per_lcm_block=16,
-        page_count=161,
-        segments=(
-            _segment("full.k", stride=96, payload=40),
-            _segment("full.v", stride=96, payload=40),
-        ),
-    )
-    state = CacheGroupLayout(
-        group_id="state",
-        cache_blocks_per_lcm_block=1,
-        page_count=11,
-        segments=(
-            _segment("state.ssm", stride=2048, payload=1000),
-            _segment("state.conv", stride=1024, payload=200),
-        ),
-    )
-
-    packed = CacheTransferLayout(
-        logical_block_tokens=128,
-        groups=(full, state),
-        buffers=(object(),),
-        consumers=(("full.k", "full.v"), ("state.ssm", "state.conv")),
-    ).pack(alignment=16)
-
-    assert packed.child_bytes == (96, 1216)
-    assert packed.segment_offsets == ((0, 48), (0, 1008))
-    assert packed.parent_bytes == 1536
 
 
 def test_lcm_layout_is_derived_from_planned_field_offsets():
@@ -135,7 +101,13 @@ def test_lcm_layout_is_derived_from_planned_field_offsets():
         logical_block_tokens=128,
         num_lcm_blocks=10,
         planes=(plane,),
-        groups=(SimpleNamespace(group_id="full", cache_blocks_per_lcm_block=16, page_count=161),),
+        groups=(
+            SimpleNamespace(
+                group_id="full",
+                cache_blocks_per_lcm_block=16,
+                page_count=161,
+            ),
+        ),
         fields=(
             SimpleNamespace(
                 group_id="full",
@@ -156,12 +128,13 @@ def test_lcm_layout_is_derived_from_planned_field_offsets():
     )
 
     assert layout.buffers == (backing,)
-    assert layout.groups[0].segments == (
-        CacheSegment(
-            segment_id="layer.0.k",
-            buffer_index=0,
-            page_zero_offset=8192 + 4096 - 256 + 64,
-            page_stride_bytes=256,
+    assert layout.num_lcm_blocks == 10
+    assert layout.groups[0].fields == (
+        CacheField(
+            field_id="layer.0.k",
+            device_buffer_index=0,
+            device_block_zero_offset_bytes=8192 + 4096 - 256 + 64,
+            block_stride_bytes=256,
             payload_bytes=16,
         ),
     )
@@ -169,17 +142,17 @@ def test_lcm_layout_is_derived_from_planned_field_offsets():
 
 def test_target_and_draft_layouts_share_scheduler_groups_but_keep_both_payloads():
     target = CacheTransferLayout(
-        logical_block_tokens=128,
+        num_lcm_blocks=10,
         groups=(
-            CacheGroupLayout("full", 16, 161, (_segment("layer.0.k"),)),
-            CacheGroupLayout("state", 1, 11, (_segment("layer.1.state"),)),
+            CacheGroupLayout("full", 16, (_field("layer.0.k"),)),
+            CacheGroupLayout("state", 1, (_field("layer.1.state"),)),
         ),
         buffers=("target",),
         consumers=(("layer.0.k",), ("layer.1.state",)),
     )
     draft = CacheTransferLayout(
-        logical_block_tokens=128,
-        groups=(CacheGroupLayout("full", 16, 161, (_segment("layer.0.k"),)),),
+        num_lcm_blocks=10,
+        groups=(CacheGroupLayout("full", 16, (_field("layer.0.k"),)),),
         buffers=("draft",),
         consumers=(("layer.0.k",),),
     )
@@ -188,10 +161,11 @@ def test_target_and_draft_layouts_share_scheduler_groups_but_keep_both_payloads(
 
     assert tuple(group.group_id for group in combined.groups) == ("full", "state")
     assert combined.buffers == ("target", "draft")
-    assert tuple(
-        segment.segment_id for segment in combined.groups[0].segments
-    ) == ("target:layer.0.k", "draft:layer.0.k")
-    assert combined.groups[0].segments[1].buffer_index == 1
+    assert tuple(field.field_id for field in combined.groups[0].fields) == (
+        "target:layer.0.k",
+        "draft:layer.0.k",
+    )
+    assert combined.groups[0].fields[1].device_buffer_index == 1
     assert combined.consumers == (
         ("target:layer.0.k",),
         ("target:layer.1.state",),
@@ -199,16 +173,16 @@ def test_target_and_draft_layouts_share_scheduler_groups_but_keep_both_payloads(
     )
 
 
-def test_draft_layout_must_use_target_page_geometry():
+def test_draft_layout_must_use_target_block_geometry():
     target = CacheTransferLayout(
-        128,
-        (CacheGroupLayout("full", 16, 161, (_segment("target"),)),),
+        10,
+        (CacheGroupLayout("full", 16, (_field("target"),)),),
         (object(),),
         (("target",),),
     )
     draft = CacheTransferLayout(
-        128,
-        (CacheGroupLayout("full", 8, 81, (_segment("draft"),)),),
+        10,
+        (CacheGroupLayout("full", 8, (_field("draft"),)),),
         (object(),),
         (("draft",),),
     )
