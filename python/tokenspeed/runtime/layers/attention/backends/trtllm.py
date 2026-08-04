@@ -559,9 +559,9 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
 
     def _reads_mirrored_logical_pages(self) -> bool:
         """True when req_to_page holds mirrored scheduler (logical) page ids."""
-        logical = self._cache_logical_page_size
+        logical = getattr(self, "_cache_logical_page_size", None)
         return (
-            self._cache_contract_bound
+            getattr(self, "_cache_contract_bound", False)
             and logical is not None
             and logical != self.page_size
         )
