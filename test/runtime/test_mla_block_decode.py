@@ -57,14 +57,14 @@ def test_block_metadata_keeps_every_block_row() -> None:
     backend = _backend(spec_num_tokens=8)
     backend.page_size = 64
     backend.max_context_len = 512
-    req_to_page = torch.arange(2 * 4, dtype=torch.int32).view(2, 4) + 1
+    page_table = torch.arange(2 * 4, dtype=torch.int32).view(2, 4) + 1
 
     backend._init_decode_metadata(
         bs=2,
         num_extends=2,
         req_pool_indices=torch.tensor([0, 1]),
         seq_lens=torch.tensor([100, 200], dtype=torch.int32),
-        req_to_page=req_to_page,
+        page_table=page_table,
     )
 
     metadata = backend.forward_decode_metadata
@@ -169,12 +169,14 @@ def test_graph_replay_replicates_the_page_table_across_block_rows() -> None:
     backend.init_cuda_graph_state(max_bs=2)
     backend._capture_block_decode_graph(bs=2, seq_lens=torch.tensor([10, 20]))
 
-    req_to_page = torch.tensor([[9, 9, 9], [1, 2, 3], [4, 5, 6]], dtype=torch.int32)
+    # The unified cache path publishes a batch-ordered table; request-pool ids
+    # are deliberately unrelated and must not be used to index it.
+    page_table = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32)
     backend.init_forward_metadata_replay_cuda_graph(
         bs=2,
-        req_pool_indices=torch.tensor([1, 2]),
+        req_pool_indices=torch.tensor([11, 29]),
         seq_lens=torch.tensor([10, 20], dtype=torch.int32),
-        req_to_page=req_to_page,
+        page_table=page_table,
     )
 
     table = backend.cuda_graph_page_table[:8]
