@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Latent-MoE input projections as one MFMA pass over a concatenated weight.
+"""Small-batch latent-MoE input projections over one packed weight.
 
 The router, routed-down, and shared gate/up weights are consecutive rows of one
 tensor, so a single GEMM feeds all three projections. Their consumers disagree
@@ -57,13 +57,17 @@ def _split_k(tokens: int, total_n: int, hidden: int, block_m: int) -> int:
     tiles = -(-tokens // block_m) * (total_n // _BLOCK_N)
     k_tiles = hidden // _BLOCK_K
     split = 1
-    while split * 2 <= k_tiles and tiles * split < _TARGET_PROGRAMS:
+    while (
+        split * 2 <= k_tiles
+        and k_tiles % (split * 2) == 0
+        and tiles * split < _TARGET_PROGRAMS
+    ):
         split *= 2
     return split
 
 
 @gluon.jit
-def _fused_projection_gemm_kernel(
+def _packed_projection_gemm_kernel(
     a_ptr,
     b_ptr,
     partial_ptr,
@@ -78,9 +82,9 @@ def _fused_projection_gemm_kernel(
     NUM_WARPS: gl.constexpr,
     WARPS_M: gl.constexpr,
 ):
-    """Project one token tile against one column tile of the fused weight.
+    """Project one token tile against one column tile of the packed weight.
 
-    Only 47 column tiles span the fused weight, so at decode the token axis
+    Only 47 column tiles span the packed weight, so at decode the token axis
     cannot fill the machine on its own. Splitting K spreads each tile over
     SPLIT_K programs, which is what keeps a bandwidth-bound projection off a
     handful of compute units. Each split owns its own partial rather than
@@ -263,12 +267,12 @@ def _split_epilogue_kernel(
     )
 
 
-def gluon_fused_moe_input_projections_gfx950(
+def gluon_latent_input_small_batch_gfx950(
     hidden_states: torch.Tensor,
     router_weight: torch.Tensor,
     routed_weight: torch.Tensor,
     shared_gate_up_weight: torch.Tensor,
-    concatenated_weight: torch.Tensor,
+    packed_weight: torch.Tensor,
     *,
     beta: float,
     linear_beta: float | None,
@@ -280,7 +284,7 @@ def gluon_fused_moe_input_projections_gfx950(
         router_weight: Router rows of the concatenated weight.
         routed_weight: Latent-projection rows of the concatenated weight.
         shared_gate_up_weight: Stacked shared gate/up rows of the same weight.
-        concatenated_weight: The single tensor the three weights above are
+        packed_weight: The single tensor the three weights above are
             consecutive row views of.
         beta: Positive SiTU gate clipping scale.
         linear_beta: Optional positive SiTU linear-branch clipping scale.
@@ -307,9 +311,9 @@ def gluon_fused_moe_input_projections_gfx950(
     split_stride = tokens * total_n
 
     grid = (triton.cdiv(tokens, block_m) * split_k * (total_n // _BLOCK_N),)
-    _fused_projection_gemm_kernel[grid](
+    _packed_projection_gemm_kernel[grid](
         hidden_states,
-        concatenated_weight,
+        packed_weight,
         partials,
         tokens,
         split_stride,
@@ -349,4 +353,4 @@ def gluon_fused_moe_input_projections_gfx950(
     return router_out, routed_out, shared_out
 
 
-__all__ = ["gluon_fused_moe_input_projections_gfx950"]
+__all__ = ["gluon_latent_input_small_batch_gfx950"]

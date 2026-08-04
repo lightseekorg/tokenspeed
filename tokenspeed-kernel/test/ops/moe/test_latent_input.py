@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.gemm import moe_input_projections
-from tokenspeed_kernel.ops.gemm.moe_input_projections import fused_weight_view
+from tokenspeed_kernel.ops.moe import latent_moe_input_projections
+from tokenspeed_kernel.ops.moe.latent_input import packed_projection_weight_view
 
 if not torch.cuda.is_available():
     pytest.skip("requires a GPU", allow_module_level=True)
@@ -45,25 +45,25 @@ def _reference(
     return router, routed, shared
 
 
-def test_fused_weight_view_requires_consecutive_rows() -> None:
+def test_packed_weight_view_requires_consecutive_rows() -> None:
     fused, views = _concatenated_weights()
-    assert fused_weight_view(*views) is not None
-    assert fused_weight_view(*views).shape == fused.shape
-    assert fused_weight_view(views[1], views[0], views[2]) is None
-    assert fused_weight_view(views[0], views[1], views[2].clone()) is None
+    assert packed_projection_weight_view(*views) is not None
+    assert packed_projection_weight_view(*views).shape == fused.shape
+    assert packed_projection_weight_view(views[1], views[0], views[2]) is None
+    assert packed_projection_weight_view(views[0], views[1], views[2].clone()) is None
 
 
 @pytest.mark.parametrize("tokens", [1, 2, 7, 16, 33, 64, 129, 256, 512])
-def test_fused_moe_input_projections_matches_composition(tokens: int) -> None:
+def test_latent_input_matches_composition(tokens: int) -> None:
     _, views = _concatenated_weights()
     hidden = torch.randn(tokens, HIDDEN, dtype=torch.bfloat16, device="cuda") * 0.05
 
-    router, routed, shared = moe_input_projections(
+    router, routed, shared = latent_moe_input_projections(
         hidden,
         *views,
         gate_clamp=GATE_CLAMP,
         up_clamp=UP_CLAMP,
-        override="triton_fused_moe_input_projections",
+        override="triton_latent_input_packed",
     )
     expected_router, expected_routed, expected_shared = _reference(hidden, views)
 
@@ -75,16 +75,16 @@ def test_fused_moe_input_projections_matches_composition(tokens: int) -> None:
     torch.testing.assert_close(shared, expected_shared, atol=8e-3, rtol=8e-3)
 
 
-def test_fused_moe_input_projections_without_up_clamp() -> None:
+def test_latent_input_without_up_clamp() -> None:
     _, views = _concatenated_weights()
     hidden = torch.randn(8, HIDDEN, dtype=torch.bfloat16, device="cuda") * 0.05
 
-    _, _, shared = moe_input_projections(
+    _, _, shared = latent_moe_input_projections(
         hidden,
         *views,
         gate_clamp=GATE_CLAMP,
         up_clamp=None,
-        override="triton_fused_moe_input_projections",
+        override="triton_latent_input_packed",
     )
 
     gate, up = torch.nn.functional.linear(hidden, views[2]).chunk(2, dim=-1)
@@ -97,16 +97,37 @@ def test_fused_moe_input_projections_without_up_clamp() -> None:
     torch.testing.assert_close(shared, expected, atol=8e-3, rtol=8e-3)
 
 
-def test_unfused_weights_do_not_select_the_fused_kernel() -> None:
+def test_latent_input_masks_partial_k_tile() -> None:
+    hidden_size = 192
+    widths = (ROUTER_N, ROUTED_N, 2 * SHARED_N)
+    packed = torch.randn(sum(widths), hidden_size, dtype=torch.bfloat16, device="cuda")
+    views = list(packed.split(widths))
+    hidden = torch.randn(2, hidden_size, dtype=torch.bfloat16, device="cuda")
+
+    actual = latent_moe_input_projections(
+        hidden,
+        *views,
+        gate_clamp=GATE_CLAMP,
+        up_clamp=UP_CLAMP,
+        override="triton_latent_input_packed",
+    )
+    expected = _reference(hidden, views)
+    for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
+        torch.testing.assert_close(actual_tensor, expected_tensor, atol=8e-3, rtol=8e-3)
+
+
+def test_unpacked_weights_do_not_select_the_packed_kernel() -> None:
     _, views = _concatenated_weights()
     separate = [view.clone() for view in views]
     hidden = torch.randn(4, HIDDEN, dtype=torch.bfloat16, device="cuda") * 0.05
 
-    fused_result = moe_input_projections(
+    packed_result = latent_moe_input_projections(
         hidden, *views, gate_clamp=GATE_CLAMP, up_clamp=UP_CLAMP
     )
-    separate_result = moe_input_projections(
+    separate_result = latent_moe_input_projections(
         hidden, *separate, gate_clamp=GATE_CLAMP, up_clamp=UP_CLAMP
     )
-    for fused_tensor, separate_tensor in zip(fused_result, separate_result):
-        torch.testing.assert_close(fused_tensor, separate_tensor, atol=8e-3, rtol=8e-3)
+    for packed_tensor, separate_tensor in zip(
+        packed_result, separate_result, strict=True
+    ):
+        torch.testing.assert_close(packed_tensor, separate_tensor, atol=8e-3, rtol=8e-3)

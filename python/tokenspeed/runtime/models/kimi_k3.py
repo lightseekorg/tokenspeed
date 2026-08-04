@@ -78,7 +78,6 @@ from tokenspeed_kernel.ops.gemm import (
     kimi3_router_projection,
     kimi3_shared_down_projection,
     kimi3_shared_situ_projection,
-    moe_input_projections,
 )
 from tokenspeed_kernel.ops.gemm.triton_gemv import (
     decode_gemv,
@@ -86,6 +85,7 @@ from tokenspeed_kernel.ops.gemm.triton_gemv import (
 from tokenspeed_kernel.ops.moe import (
     latent_moe_decode_pipeline_available,
     latent_moe_expert_shared,
+    latent_moe_input_projections,
 )
 from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
     situ_moe_unavailable_reason,
@@ -1071,7 +1071,7 @@ class KimiLinearMoE(nn.Module):
             activation_situ_beta=situ_beta,
             activation_situ_linear_beta=situ_linear_beta,
         )
-        self.input_projection_weight: torch.Tensor | None = None
+        self.packed_input_projection_weight: torch.Tensor | None = None
         self.native_latent_moe = (
             LatentMoELayer(
                 router=self.gate,
@@ -1096,7 +1096,7 @@ class KimiLinearMoE(nn.Module):
                 ),
                 expert_parallel_group=mapping.moe.ep_group,
                 return_separate_outputs=True,
-                input_projections=self._fused_input_projections,
+                input_projections=self._latent_input_projections,
                 defer_routed_up_projection=True,
             )
             if self.execution_plan.use_native
@@ -1116,12 +1116,17 @@ class KimiLinearMoE(nn.Module):
                 self.routed_expert_down_proj.weight,
                 self.shared_experts.gate_up_proj.weight,
                 self.shared_experts.down_proj.weight,
+                self.experts.w13_weight,
+                self.experts.w13_weight_scale,
+                self.experts.w2_weight,
+                self.experts.w2_weight_scale,
                 self.experts.plan,
+                topk=self.top_k,
                 joint_reduce=self.execution_plan.joint_moe_reduce,
             )
         )
 
-    def fuse_input_projection_weights(self) -> None:
+    def pack_input_projection_weights(self) -> None:
         """Back the router, routed-down, and shared gate/up weights with one tensor.
 
         The three projections consume the same activation and reduce over the
@@ -1141,18 +1146,20 @@ class KimiLinearMoE(nn.Module):
         )
         # Held so the row views stay alive; deliberately not a registered
         # buffer, which would duplicate every projection in the state dict.
-        # Any layout a fused GEMM cannot read is caught downstream by
-        # ``fused_weight_view``, which leaves the composition in place.
-        self.input_projection_weight = torch.cat(
+        # Any layout a packed GEMM cannot read is caught downstream by
+        # ``packed_projection_weight_view``, leaving the composition in place.
+        self.packed_input_projection_weight = torch.cat(
             [module.weight for module in modules], dim=0
         )
         offset = 0
         for module in modules:
             rows = module.weight.shape[0]
-            module.weight.data = self.input_projection_weight.narrow(0, offset, rows)
+            module.weight.data = self.packed_input_projection_weight.narrow(
+                0, offset, rows
+            )
             offset += rows
 
-    def _fused_input_projections(
+    def _latent_input_projections(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
         """Project the router, routed latent, and shared partial in one pass.
@@ -1160,9 +1167,9 @@ class KimiLinearMoE(nn.Module):
         Returns ``None`` before the projection weights are concatenated, which
         leaves the caller on the separate per-module projections.
         """
-        if self.input_projection_weight is None:
+        if self.packed_input_projection_weight is None:
             return None
-        router_logits, routed_input, shared_input = moe_input_projections(
+        router_logits, routed_input, shared_input = latent_moe_input_projections(
             hidden_states,
             self.gate.weight,
             self.routed_expert_down_proj.weight,
@@ -1213,7 +1220,7 @@ class KimiLinearMoE(nn.Module):
     ) -> torch.Tensor:
         """Fuse K3 decode input projections and routed/shared expert execution."""
 
-        router_logits, routed_input, shared_input = moe_input_projections(
+        router_logits, routed_input, shared_input = latent_moe_input_projections(
             hidden_states,
             self.gate.weight,
             self.routed_expert_down_proj.weight,
@@ -2027,7 +2034,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
 
         for layer in self.model.layers:
             if getattr(layer, "is_moe_layer", False):
-                layer.block_sparse_moe.fuse_input_projection_weights()
+                layer.block_sparse_moe.pack_input_projection_weights()
 
 
 # ===----------------------------------------------------------------------=== #

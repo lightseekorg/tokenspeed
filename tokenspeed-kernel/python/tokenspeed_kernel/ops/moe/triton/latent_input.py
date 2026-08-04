@@ -15,13 +15,13 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.ops.gemm.moe_input_projections import fused_weight_view
+from tokenspeed_kernel.ops.moe.latent_input import packed_projection_weight_view
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 
 @triton.jit
-def _fused_input_projections_kernel(
+def _packed_input_projections_kernel(
     hidden_ptr,
     weight_ptr,
     router_ptr,
@@ -48,9 +48,14 @@ def _fused_input_projections_kernel(
     hidden_ptrs = hidden_ptr + offs_m[:, None] * stride_hm + offs_k[None, :]
     weight_ptrs = weight_ptr + offs_n[None, :] * stride_wn + offs_k[:, None]
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for _ in range(0, K, BLOCK_K):
-        activation = tl.load(hidden_ptrs, mask=m_mask[:, None], other=0.0)
-        weight = tl.load(weight_ptrs)
+    for k_start in range(0, K, BLOCK_K):
+        k_mask = k_start + offs_k < K
+        activation = tl.load(
+            hidden_ptrs,
+            mask=m_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        weight = tl.load(weight_ptrs, mask=k_mask[:, None], other=0.0)
         acc += tl.dot(activation, weight)
         hidden_ptrs += BLOCK_K
         weight_ptrs += BLOCK_K
@@ -137,9 +142,9 @@ def _schedule(tokens: int) -> tuple[int, int, int, int]:
 
 
 @register_kernel(
-    "gemm",
-    "moe_input_projections",
-    name="triton_fused_moe_input_projections",
+    "moe",
+    "latent_input",
+    name="triton_latent_input_packed",
     solution="triton",
     signatures=frozenset(
         {
@@ -154,11 +159,11 @@ def _schedule(tokens: int) -> tuple[int, int, int, int]:
     # Below the hand-written decode kernels, which stay ahead at one token.
     priority=Priority.PERFORMANT,
     traits={
-        "weights_fused": frozenset({True}),
+        "weights_packed": frozenset({True}),
         "inputs_contiguous": frozenset({True}),
     },
 )
-def triton_fused_moe_input_projections(
+def triton_latent_input_packed(
     hidden_states: torch.Tensor,
     router_weight: torch.Tensor,
     routed_weight: torch.Tensor,
@@ -180,7 +185,9 @@ def triton_fused_moe_input_projections(
     Returns:
         FP32 router logits, routed latent, and the activated shared input.
     """
-    weight = fused_weight_view(router_weight, routed_weight, shared_gate_up_weight)
+    weight = packed_projection_weight_view(
+        router_weight, routed_weight, shared_gate_up_weight
+    )
     if weight is None:
         raise ValueError("projection weights are not one concatenated allocation")
     tokens, hidden_size = hidden_states.shape
@@ -196,7 +203,7 @@ def triton_fused_moe_input_projections(
     shared_raw = torch.empty((tokens, shared_raw_n), dtype=dtype, device=device)
 
     block_m, block_n, block_k, warps = _schedule(tokens)
-    _fused_input_projections_kernel[
+    _packed_input_projections_kernel[
         (triton.cdiv(tokens, block_m), (router_n + routed_n + shared_raw_n) // block_n)
     ](
         hidden_states,
@@ -234,4 +241,4 @@ def triton_fused_moe_input_projections(
     return router_out, routed_out, shared_out
 
 
-__all__ = ["triton_fused_moe_input_projections"]
+__all__ = ["triton_latent_input_packed"]

@@ -75,12 +75,13 @@ def moe_sigmoid_bias_topk(
         raise ValueError("correction_bias and router_logits must share a device")
     if logical_to_physical_map is not None and (
         logical_to_physical_map.shape != (experts,)
-        or logical_to_physical_map.dtype != torch.int32
+        or logical_to_physical_map.dtype not in (torch.int32, torch.int64)
         or logical_to_physical_map.device != router_logits.device
         or not logical_to_physical_map.is_contiguous()
     ):
         raise ValueError(
-            "logical_to_physical_map must be contiguous colocated INT32 [experts]"
+            "logical_to_physical_map must be contiguous colocated INT32/INT64 "
+            "[experts]"
         )
     if not 0 < topk <= experts:
         raise ValueError(f"topk must be in [1, {experts}], got {topk}")
@@ -103,20 +104,35 @@ def moe_sigmoid_bias_topk(
         # decode shape: one bitonic top-16 instead of the grouped multi-pass
         # (NVIDIA B300: 3.7us vs 7.0us for the minimax path, bit-identical
         # selection and weights).
-        return kimi3_sigmoid_bias_topk(
+        topk_weights, topk_ids = kimi3_sigmoid_bias_topk(
             router_logits,
             correction_bias,
             routed_scaling_factor=routed_scaling_factor,
             normalize_topk_weights=normalize_topk_weights,
-            logical_to_physical_map=logical_to_physical_map,
+            logical_to_physical_map=(
+                logical_to_physical_map
+                if logical_to_physical_map is not None
+                and logical_to_physical_map.dtype == torch.int32
+                else None
+            ),
             weights_dtype=weights_dtype,
         )
+        if (
+            logical_to_physical_map is not None
+            and logical_to_physical_map.dtype == torch.int64
+        ):
+            topk_ids = logical_to_physical_map[topk_ids.long()].to(torch.int32)
+        return topk_weights, topk_ids
     if solution is None and not _gluon_eligible(router_logits, correction_bias, topk):
         solution = "torch"
 
     signature = format_signature(router_logits=dense_tensor_format(router_logits.dtype))
     traits = {"tokens": tokens, "experts": experts, "topk": topk}
-    if logical_to_physical_map is not None and solution is None:
+    if (
+        logical_to_physical_map is not None
+        and logical_to_physical_map.dtype == torch.int32
+        and solution is None
+    ):
         try:
             mapped_kernel = select_kernel(
                 "moe",

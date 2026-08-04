@@ -1,6 +1,6 @@
 # Copyright (c) 2026 LightSeek Foundation
 
-"""Independent input projections for latent-space MoE decode."""
+"""Input projections for latent-space MoE layers."""
 
 from __future__ import annotations
 
@@ -9,12 +9,12 @@ from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
-# Column tiles of a fused projection GEMM must not straddle a projection
+# Column tiles of a packed projection GEMM must not straddle a projection
 # boundary, so every projection width has to be a multiple of the tile width.
 REGION_ALIGNMENT = 128
 
 
-def fused_weight_view(
+def packed_projection_weight_view(
     router_weight: torch.Tensor,
     routed_weight: torch.Tensor,
     shared_gate_up_weight: torch.Tensor,
@@ -48,21 +48,19 @@ def fused_weight_view(
     return router_weight.as_strided((total_rows, hidden_size), (hidden_size, 1))
 
 
-def _weights_fused(hidden_size: int, weights: tuple[torch.Tensor, ...]) -> bool:
+def _weights_packed(weights: tuple[torch.Tensor, ...]) -> bool:
     """Return whether one GEMM can read the three weights as a single operand.
 
     Beyond sharing an allocation, every projection width must be a multiple of
     the column-tile width so that no tile straddles two projections and the
     epilogue stays uniform across a program.
     """
-    if fused_weight_view(*weights) is None:
+    if packed_projection_weight_view(*weights) is None:
         return False
-    return hidden_size % 64 == 0 and all(
-        weight.shape[0] % REGION_ALIGNMENT == 0 for weight in weights
-    )
+    return all(weight.shape[0] % REGION_ALIGNMENT == 0 for weight in weights)
 
 
-def moe_input_projections(
+def latent_moe_input_projections(
     hidden_states: torch.Tensor,
     router_weight: torch.Tensor,
     routed_weight: torch.Tensor,
@@ -128,12 +126,13 @@ def moe_input_projections(
         "inputs_contiguous": all(
             tensor.is_contiguous() for tensor in (hidden_states, *weights)
         ),
-        "weights_fused": _weights_fused(hidden_size, weights),
+        "weights_packed": _weights_packed(weights),
+        "hidden_size_multiple_64": hidden_size % 64 == 0,
     }
     try:
         kernel = select_kernel(
-            "gemm",
-            "moe_input_projections",
+            "moe",
+            "latent_input",
             signature,
             traits=traits,
             override=override,
@@ -146,15 +145,15 @@ def moe_input_projections(
 
     if kernel is not None:
         ShapeCapture.get().record(
-            "gemm",
-            "moe_input_projections",
+            "moe",
+            "latent_input",
             kernel.name,
             hidden_states.dtype,
             traits,
         )
         with kernel_scope(
-            "gemm",
-            "moe_input_projections",
+            "moe",
+            "latent_input",
             hidden_states.dtype,
             kernel_name=kernel.name,
             **traits,
@@ -184,4 +183,4 @@ def moe_input_projections(
     return router_logits, routed_input, shared_input
 
 
-__all__ = ["fused_weight_view", "moe_input_projections"]
+__all__ = ["latent_moe_input_projections", "packed_projection_weight_view"]

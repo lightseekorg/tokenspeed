@@ -130,3 +130,26 @@ def test_decode_sigmoid_bias_topk_fuses_logical_to_physical_map() -> None:
 
     torch.testing.assert_close(ids, expected_ids, rtol=0, atol=0)
     torch.testing.assert_close(weights, expected_weights, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("tokens", [1, 2])
+def test_decode_sigmoid_bias_topk_accepts_int64_map(tokens: int) -> None:
+    torch.manual_seed(13)
+    logits = torch.randn(tokens, 896, device="cuda", dtype=torch.float32)
+    bias = torch.randn(896, device="cuda", dtype=torch.float32)
+    logical_to_physical = torch.randperm(896, device="cuda", dtype=torch.int64)
+
+    expected_weights, logical_ids = tokenspeed_kernel.moe_sigmoid_bias_topk(
+        logits,
+        bias,
+        16,
+    )
+    weights, ids = tokenspeed_kernel.moe_sigmoid_bias_topk(
+        logits,
+        bias,
+        16,
+        logical_to_physical_map=logical_to_physical,
+    )
+
+    torch.testing.assert_close(ids, logical_to_physical[logical_ids.long()].int())
+    torch.testing.assert_close(weights, expected_weights)

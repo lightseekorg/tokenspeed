@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Fused decode input projections for latent MoE models on gfx950."""
+"""Decode input projections for latent MoE models on gfx950."""
 
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ _TOTAL_GRID = 896 // 4 + 3584 // 16 + 768 // 4
 
 
 @gluon.jit
-def _moe_input_projections_kernel(
+def _latent_input_decode_kernel(
     hidden_ptr,
     router_weight_ptr,
     routed_weight_ptr,
@@ -161,7 +161,7 @@ def _moe_input_projections_kernel(
     gl.store(shared_out_ptr + offs_n, gate * up)
 
 
-def gluon_moe_input_projections_gfx950(
+def gluon_latent_input_decode_gfx950(
     hidden_states: torch.Tensor,
     router_weight: torch.Tensor,
     routed_down_weight: torch.Tensor,
@@ -210,7 +210,7 @@ def gluon_moe_input_projections_gfx950(
     shared_out = torch.empty(
         (1, 768), dtype=torch.bfloat16, device=hidden_states.device
     )
-    _moe_input_projections_kernel[(_TOTAL_GRID,)](
+    _latent_input_decode_kernel[(_TOTAL_GRID,)](
         hidden_states,
         router_weight,
         routed_down_weight,
@@ -228,4 +228,4 @@ def gluon_moe_input_projections_gfx950(
     return router_out, routed_out, shared_out
 
 
-__all__ = ["gluon_moe_input_projections_gfx950"]
+__all__ = ["gluon_latent_input_decode_gfx950"]

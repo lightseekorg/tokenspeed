@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from typing import Any
 
 import torch
-from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 
@@ -72,8 +72,13 @@ def latent_moe_decode_pipeline_available(
     routed_weight: torch.Tensor,
     shared_gate_up_weight: torch.Tensor,
     shared_down_weight: torch.Tensor,
+    w13_weight: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w2_scale: torch.Tensor,
     expert_plan: Mapping[str, Any],
     *,
+    topk: int,
     joint_reduce: bool,
 ) -> bool:
     """Return whether joint routed/shared one-token decode is available.
@@ -81,7 +86,14 @@ def latent_moe_decode_pipeline_available(
     This construction-time probe owns backend, tensor-format, expert-plan, and
     exact-shape constraints needed by the orchestration-level optimization.
     """
-    return (
+    projection_weights = (
+        router_weight,
+        routed_weight,
+        shared_gate_up_weight,
+        shared_down_weight,
+    )
+    expert_tensors = (w13_weight, w13_scale, w2_weight, w2_scale)
+    if not (
         joint_reduce
         and expert_plan.get("apply_kernel_name")
         == "gluon_mxfp4_a16w4_situ_ep_precomputed_moe_apply"
@@ -90,16 +102,45 @@ def latent_moe_decode_pipeline_available(
         == shared_gate_up_weight.dtype
         == shared_down_weight.dtype
         == torch.bfloat16
+        and shared_gate_up_weight.shape[0] % 2 == 0
         and all(
-            weight.is_cuda and weight.is_contiguous()
-            for weight in (
-                router_weight,
-                routed_weight,
-                shared_gate_up_weight,
-                shared_down_weight,
-            )
+            tensor.is_cuda and tensor.is_contiguous()
+            for tensor in (*projection_weights, *expert_tensors)
         )
-    )
+    ):
+        return False
+
+    traits = {
+        "tokens": 1,
+        "latent_size": routed_weight.shape[0],
+        "topk": topk,
+        "num_local_experts": w13_weight.shape[0],
+        "intermediate_size": w2_weight.shape[-1] * 2,
+        "shared_size": shared_gate_up_weight.shape[0] // 2,
+        "output_size": shared_down_weight.shape[0],
+        "linear_weights": True,
+        "inputs_contiguous": True,
+    }
+    for topk_weight_dtype in (torch.bfloat16, torch.float32):
+        signature = format_signature(
+            hidden_states=dense_tensor_format(routed_weight.dtype),
+            w13_weight=dense_tensor_format(w13_weight.dtype),
+            w13_scale=dense_tensor_format(w13_scale.dtype),
+            w2_weight=dense_tensor_format(w2_weight.dtype),
+            w2_scale=dense_tensor_format(w2_scale.dtype),
+            topk_weights=dense_tensor_format(topk_weight_dtype),
+            topk_ids=dense_tensor_format(torch.int32),
+            shared_input=dense_tensor_format(shared_gate_up_weight.dtype),
+            shared_weight=dense_tensor_format(shared_down_weight.dtype),
+            routed_out=dense_tensor_format(routed_weight.dtype),
+            shared_out=dense_tensor_format(shared_down_weight.dtype),
+        )
+        try:
+            select_kernel("moe", "latent_expert_shared", signature, traits=traits)
+        except NoKernelFoundError:
+            continue
+        return True
+    return False
 
 
 def latent_moe_expert_shared(

@@ -14,8 +14,8 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 if current_platform().is_amd:
-    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_decode import (
-        gluon_a16w4_situ_warp_decode_ep_gfx950 as _joint_decode_impl,
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.latent_shared_decode import (
+        gluon_latent_expert_shared_decode_gfx950 as _joint_decode_impl,
     )
 
     @register_kernel(
@@ -69,7 +69,6 @@ if current_platform().is_amd:
             situ_beta=kwargs["activation_clamp"],
             situ_linear_beta=kwargs["linear_clamp"],
             expert_start=kwargs["expert_start"],
-            linear_weights=True,
             w13_interleaved=kwargs["w13_interleaved"],
             shared_input=kwargs["shared_input"],
             shared_weight=kwargs["shared_weight"],
