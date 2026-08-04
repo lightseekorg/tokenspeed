@@ -38,6 +38,21 @@ class _Trace(nn.Module):
         return _TRACE_FNS[self.name](hidden_states)
 
 
+class _Add3Up(_Trace):
+    def __init__(self, events: list[str]) -> None:
+        super().__init__(events, "up")
+
+    def forward_add3(
+        self,
+        routed_latent: torch.Tensor,
+        prefix_sum: torch.Tensor,
+        shared_output: torch.Tensor,
+    ) -> torch.Tensor:
+        self.events.append("up_add3")
+        routed_output, _ = _up(routed_latent)
+        return prefix_sum + routed_output + shared_output
+
+
 class _TopK(nn.Module):
     def __init__(self, events: list[str]) -> None:
         super().__init__()
@@ -195,12 +210,13 @@ def _layer(
     experts: nn.Module | None = None,
     **kwargs,
 ) -> LatentMoELayer:
+    routed_up_proj = kwargs.pop("routed_up_proj", _Trace(events, "up"))
     return LatentMoELayer(
         router=_Trace(events, "router"),
         topk=_TopK(events),
         routed_down_proj=_Trace(events, "down"),
         experts=experts or _Experts(events),
-        routed_up_proj=_Trace(events, "up"),
+        routed_up_proj=routed_up_proj,
         **kwargs,
     )
 
@@ -461,34 +477,30 @@ def test_latent_moe_can_return_separate_residual_components() -> None:
     torch.testing.assert_close(shared, hidden_states * 4)
 
 
-def test_latent_moe_can_defer_routed_up_projection() -> None:
+def test_latent_moe_fuses_output_projection_addends() -> None:
     events: list[str] = []
     layer = _layer(
         events,
         routed_norm=_Trace(events, "norm"),
         shared_experts=_Trace(events, "shared"),
-        return_separate_outputs=True,
-        defer_routed_up_projection=True,
+        routed_up_proj=_Add3Up(events),
     )
     hidden_states = torch.arange(12, dtype=torch.float32).view(3, 4)
+    prefix_sum = torch.full_like(hidden_states, 7)
 
-    routed_latent, shared = layer(hidden_states)
+    actual = layer(hidden_states, prefix_sum=prefix_sum)
 
-    torch.testing.assert_close(routed_latent, hidden_states[:, :2] + 4)
-    torch.testing.assert_close(shared, hidden_states * 4)
+    routed_latent = hidden_states[:, :2] + 4
+    routed_output, _ = _up(routed_latent)
+    expected = prefix_sum + routed_output + hidden_states * 4
+    torch.testing.assert_close(actual, expected)
+    assert "up_add3" in events
     assert "up" not in events
 
 
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"return_separate_outputs": False, "shared_experts": _Trace([], "shared")},
-        {"return_separate_outputs": True},
-    ],
-)
-def test_latent_moe_rejects_invalid_deferred_up_projection(kwargs) -> None:
-    with pytest.raises(ValueError, match="defer_routed_up_projection requires"):
-        _layer([], defer_routed_up_projection=True, **kwargs)
+def test_latent_moe_prefix_requires_shared_experts() -> None:
+    with pytest.raises(ValueError, match="prefix_sum requires shared_experts"):
+        _layer([])(torch.ones(2, 4), prefix_sum=torch.ones(2, 4))
 
 
 def test_latent_moe_rejects_joint_and_individual_reducers() -> None:

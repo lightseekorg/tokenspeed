@@ -298,7 +298,6 @@ class LatentMoELayer(nn.Module):
         expert_parallel_group: tuple[int, ...] | None = None,
         return_separate_outputs: bool = False,
         input_projections: InputProjector | None = None,
-        defer_routed_up_projection: bool = False,
     ) -> None:
         super().__init__()
         if input_projections is not None and shared_experts is None:
@@ -312,13 +311,6 @@ class LatentMoELayer(nn.Module):
         ):
             raise ValueError(
                 "joint_reduce cannot be combined with latent_reduce or shared_reduce"
-            )
-        if defer_routed_up_projection and (
-            not return_separate_outputs or shared_experts is None
-        ):
-            raise ValueError(
-                "defer_routed_up_projection requires shared_experts and "
-                "return_separate_outputs"
             )
         expert_parallel_size = int(getattr(experts, "ep_size", 1))
         num_experts = int(getattr(experts, "num_experts", 1))
@@ -358,18 +350,38 @@ class LatentMoELayer(nn.Module):
         self.stream_fork = StreamFork(shared_expert_stream)
         self.return_separate_outputs = return_separate_outputs
         self.input_projections = input_projections
-        self.defer_routed_up_projection = defer_routed_up_projection
+
+    def finalize_output(
+        self,
+        routed_latent: torch.Tensor,
+        prefix_sum: torch.Tensor,
+        shared_output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project the routed latent and add both full-width residuals."""
+
+        output_shape = tuple(shared_output.shape)
+        _check_shape(prefix_sum, output_shape, "prefix_sum")
+        output = self.routed_up_proj.forward_add3(
+            routed_latent,
+            prefix_sum,
+            shared_output,
+        )
+        _check_shape(output, output_shape, "routed_up_proj")
+        return output
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         num_global_tokens: int | None = None,
         max_num_tokens_per_gpu: int | None = None,
+        prefix_sum: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if hidden_states.ndim != 2:
             raise ValueError(
                 f"latent MoE expects hidden states [T, H], got {tuple(hidden_states.shape)}"
             )
+        if prefix_sum is not None and self.shared_experts is None:
+            raise ValueError("prefix_sum requires shared_experts")
         num_tokens, hidden_size = hidden_states.shape
         num_global_tokens = (
             num_tokens if num_global_tokens is None else num_global_tokens
@@ -494,16 +506,18 @@ class LatentMoELayer(nn.Module):
             routed_latent = _module_tensor_output(self.routed_norm, routed_latent)
             _check_shape(routed_latent, latent_shape, "routed_norm")
 
-        if shared_output is None or not self.defer_routed_up_projection:
+        if shared_output is None:
             routed_output = _module_tensor_output(self.routed_up_proj, routed_latent)
             _check_shape(routed_output, output_shape, "routed_up_proj")
-        if shared_output is None:
             return routed_output
+        if prefix_sum is None:
+            routed_output = _module_tensor_output(self.routed_up_proj, routed_latent)
+            _check_shape(routed_output, output_shape, "routed_up_proj")
         if self.shared_reduce is not None and not shared_reduction_applied:
             shared_output = self.shared_reduce(shared_output)
             _check_shape(shared_output, output_shape, "shared_reduce")
-        if self.defer_routed_up_projection:
-            return routed_latent, shared_output
+        if prefix_sum is not None:
+            return self.finalize_output(routed_latent, prefix_sum, shared_output)
         if self.return_separate_outputs:
             return routed_output, shared_output
         return routed_output + shared_output

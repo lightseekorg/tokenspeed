@@ -1091,9 +1091,7 @@ class KimiLinearMoE(nn.Module):
                     alt_stream if self.execution_plan.overlap_shared_experts else None
                 ),
                 expert_parallel_group=mapping.moe.ep_group,
-                return_separate_outputs=True,
                 input_projections=self._latent_input_projections,
-                defer_routed_up_projection=True,
             )
             if self.execution_plan.use_native
             else None
@@ -1252,7 +1250,7 @@ class KimiLinearMoE(nn.Module):
         )
         if self.routed_expert_norm is not None:
             routed_latent = self.routed_expert_norm(routed_latent)
-        return self.routed_expert_up_proj.forward_add3(
+        return self.native_latent_moe.finalize_output(
             routed_latent,
             prefix_sum,
             shared_output,
@@ -1273,15 +1271,11 @@ class KimiLinearMoE(nn.Module):
         if self.native_latent_moe is not None:
             if self._use_fused_decode_pipeline and hidden_states.shape[0] == 1:
                 return self._forward_fused_decode_pipeline(hidden_states, prefix_sum)
-            routed_latent, shared_out = self.native_latent_moe(
+            return self.native_latent_moe(
                 hidden_states,
                 num_global_tokens=num_global_tokens,
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
-            )
-            return self.routed_expert_up_proj.forward_add3(
-                routed_latent,
-                prefix_sum,
-                shared_out,
+                prefix_sum=prefix_sum,
             )
 
         num_tokens, hidden_size = hidden_states.shape
