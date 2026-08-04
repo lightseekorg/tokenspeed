@@ -35,8 +35,10 @@ from tokenspeed_kernel.ops.moe import kimi3_native_moe_available
 from torch import nn
 
 from tokenspeed.runtime.distributed.comm_ops import (
+    COMM_ONESHOT_MAX_BYTES,
     all_reduce,
     all_reduce_latent_norm,
+    all_reduce_two,
     prepare_all_reduce_fusion,
     prepare_all_reduce_lane,
 )
@@ -51,16 +53,47 @@ TensorPairReducer = Callable[
 _SUPPORTED_EP_SIZES = {1, 2, 4, 8}
 
 
-def kimi3_reduce_fused_moe(
-    fused: torch.Tensor,
+def kimi3_join_reduce_moe(
+    routed_partial: torch.Tensor,
+    shared_partial: torch.Tensor,
     *,
+    lane: torch.Tensor | None,
     routed_hidden: int,
     routed_norm: nn.Module | None,
     group: tuple[int, ...],
     enable_lane_norm: bool,
     max_token_num: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reduce fused routed/shared partials with eligible epilogue fusion."""
+    """Join the routed/shared partials and reduce them, owning the strategy.
+
+    Three regimes, all element-wise identical:
+
+    * Lane hit (decode batch=1): the partials were produced straight into the
+      persistent fused lane, one one-shot reduce with an eligible norm
+      epilogue and zero copies.
+    * Small partials: cat into one contiguous operand and take a single
+      one-shot reduce; the copy is a couple of microseconds there.
+    * Partials past the one-shot window (prefill-sized chunks): the cat would
+      copy a few hundred MB per layer just to feed one NCCL call, while a
+      grouped NCCL launch reduces both tensors in place with the same
+      single-launch latency -- so skip the join entirely.
+    """
+
+    if lane is not None and routed_partial.data_ptr() == lane.data_ptr():
+        fused = lane
+    elif (
+        routed_partial.numel() * routed_partial.element_size() > COMM_ONESHOT_MAX_BYTES
+    ):
+        routed_out, shared_out = all_reduce_two(
+            routed_partial,
+            shared_partial,
+            group=group,
+        )
+        if routed_norm is not None:
+            routed_out = routed_norm(routed_out)
+        return routed_out, shared_out
+    else:
+        fused = torch.cat((routed_partial, shared_partial), dim=-1)
 
     lane_norm_applied = routed_norm is not None and (
         allreduce_lane_latent_norm_supported(

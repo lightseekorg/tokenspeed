@@ -115,7 +115,7 @@ from tokenspeed.runtime.layers.moe.latent import (
     Kimi3LatentProjection,
     Kimi3MoEExecutionPlan,
     LatentMoELayer,
-    kimi3_reduce_fused_moe,
+    kimi3_join_reduce_moe,
 )
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
@@ -1184,14 +1184,10 @@ class KimiLinearMoE(nn.Module):
                     routed_out = self.routed_expert_norm(routed_out)
                 routed_out = self.routed_expert_up_proj(routed_out)[0]
         if self.execution_plan.fused_moe_ar:
-            # Post-join: one [T, latent+hidden] all-reduce covers both
-            # partials, element-wise identical to the two separate reduces.
-            if lane is not None and routed_out.data_ptr() == lane.data_ptr():
-                fused = lane
-            else:
-                fused = torch.cat((routed_out, shared_partial), dim=-1)
-            routed_out, shared_out = kimi3_reduce_fused_moe(
-                fused,
+            routed_out, shared_out = kimi3_join_reduce_moe(
+                routed_out,
+                shared_partial,
+                lane=lane,
                 routed_hidden=self.routed_hidden,
                 routed_norm=self.routed_expert_norm,
                 group=self.mapping.moe.tp_ep_group,

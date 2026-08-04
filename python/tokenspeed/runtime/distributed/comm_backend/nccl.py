@@ -94,6 +94,40 @@ class NcclBackend(CommBackend):
             torch.distributed.all_reduce(tensor, op=op, group=res["device_group"])
         return tensor
 
+    def all_reduce_two(
+        self,
+        first: torch.Tensor,
+        second: torch.Tensor,
+        group: Group,
+        op=None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reduce two tensors in one grouped NCCL launch.
+
+        NCCL group semantics aggregate the two collectives into a single
+        kernel launch, so callers get single-launch latency WITHOUT first
+        copying the operands into one contiguous buffer -- the copy-free
+        alternative to a cat + single all-reduce. Falls back to two ordinary
+        collectives when the coalescing manager is unavailable (pynccl-driven
+        groups, torch without ``_coalescing_manager``).
+        """
+        res = self._get_or_create_resources(group)
+        if res["world_size"] == 1:
+            return first, second
+        if op is None:
+            op = torch.distributed.ReduceOp.SUM
+        pynccl = res["pynccl_comm"]
+        coalescing = getattr(torch.distributed, "_coalescing_manager", None)
+        if coalescing is None or (pynccl is not None and not pynccl.disabled):
+            return (
+                self.all_reduce(first, group, op=op),
+                self.all_reduce(second, group, op=op),
+            )
+        device_group = res["device_group"]
+        with coalescing(group=device_group):
+            torch.distributed.all_reduce(first, op=op, group=device_group)
+            torch.distributed.all_reduce(second, op=op, group=device_group)
+        return first, second
+
     def all_gather(
         self, tensor: torch.Tensor, group: Group, dim: int = 0
     ) -> torch.Tensor:
