@@ -36,9 +36,7 @@ the null page 0 by the scheduler export.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import replace
-from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 import torch
@@ -171,13 +169,14 @@ class CacheGroupsMixin:
             tables = {gid: table for gid, table in tables.items() if gid not in skip}
         return tables or None
 
-    # Learned from the pool by _learn_cache_groups / set_cache_pool.
-    # Immutable class-level defaults keep the metadata paths working before
-    # those run -- init_cuda_graph_state is never reached under
-    # --enforce-eager.
-    state_group_ids: frozenset[str] = frozenset()
-    group_page_sizes: Mapping[str, int] = MappingProxyType({})
-    cache_pool: CachePool | None = None
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Learned from the pool by _learn_cache_groups / set_cache_pool;
+        # init_cuda_graph_state is never reached under --enforce-eager, so
+        # establish the empty state at construction.
+        self.state_group_ids: frozenset[str] = frozenset()
+        self.group_page_sizes: dict[str, int] = {}
+        self.cache_pool: CachePool | None = None
 
     def _learn_cache_groups(self, paged_cache_group_specs) -> None:
         """Record the pool's family="state" group ids (see
