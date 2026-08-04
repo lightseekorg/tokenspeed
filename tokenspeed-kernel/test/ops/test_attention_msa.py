@@ -559,7 +559,7 @@ def test_msa_fp8_kv_descale_matches_dequant_reference(phase: str) -> None:
 
 
 def _msa_cute_registered() -> bool:
-    import tokenspeed_kernel.ops.attention.msa as msa_mod
+    import tokenspeed_kernel.ops.attention.msa.cute_dsl.attention as msa_mod
 
     return hasattr(msa_mod, "msa_minimax_extend_with_kvcache")
 

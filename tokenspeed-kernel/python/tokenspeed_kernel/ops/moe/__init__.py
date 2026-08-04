@@ -41,20 +41,9 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
     "moe_apply",
-    "moe_grouped_routing",
     "moe_plan",
     "moe_process_weights",
-    "moe_sigmoid_bias_topk",
-    "moe_unfused_apply",
 ]
-
-from tokenspeed_kernel.ops.moe.grouped_routing import (  # noqa: E402
-    moe_grouped_routing,
-)
-from tokenspeed_kernel.ops.moe.sigmoid_topk import (  # noqa: E402
-    moe_sigmoid_bias_topk,
-)
-from tokenspeed_kernel.ops.moe.unfused import moe_unfused_apply  # noqa: E402
 
 
 def _normalize_weight_dtype(weight_dtype: str) -> str:

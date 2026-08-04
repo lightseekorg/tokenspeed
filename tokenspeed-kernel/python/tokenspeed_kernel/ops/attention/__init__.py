@@ -38,9 +38,6 @@ from tokenspeed_kernel.ops.attention.gdn.types import (
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
 )
-from tokenspeed_kernel.ops.attention.kda.triton.chunk import (
-    kda_chunk_prefill,
-)
 from tokenspeed_kernel.ops.attention.kda.types import KdaPrefillResult
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
@@ -117,7 +114,6 @@ __all__ = [
     "gdn_chunk_prefill",
     "gdn_decode_step",
     "gdn_decode_mtp",
-    "kda_chunk_prefill",
     "kda_paged_prefill",
     "kda_paged_decode",
     "try_kda_fused_paged_decode",

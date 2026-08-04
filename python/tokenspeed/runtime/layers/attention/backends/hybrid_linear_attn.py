@@ -1254,7 +1254,7 @@ class MambaAttnBackend(AttentionBackend):
             and cache_metadata is not None
         )
         if use_tape:
-            from tokenspeed_kernel.ops.other.metadata import PrepTape, Reg
+            from tokenspeed_kernel.ops.other.metadata.prep_tape import PrepTape, Reg
 
             tapes = getattr(self, "_replay_state_tapes", None)
             if tapes is None:

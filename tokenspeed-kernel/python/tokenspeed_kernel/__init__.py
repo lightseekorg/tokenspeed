@@ -22,7 +22,7 @@ from tokenspeed_kernel.profiling import bootstrap_profiling_from_env
 
 bootstrap_profiling_from_env()
 
-from tokenspeed_kernel.ops.activation import add3, situ_and_mul
+from tokenspeed_kernel.ops.activation.triton import add3, situ_and_mul
 from tokenspeed_kernel.ops.attention import (
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
@@ -64,8 +64,8 @@ from tokenspeed_kernel.ops.moe import (
     moe_apply,
     moe_plan,
     moe_process_weights,
-    moe_sigmoid_bias_topk,
 )
+from tokenspeed_kernel.ops.moe.sigmoid_topk.triton import moe_sigmoid_bias_topk
 from tokenspeed_kernel.ops.quantization import (
     quantize_fp8,
     quantize_fp8_with_scale,

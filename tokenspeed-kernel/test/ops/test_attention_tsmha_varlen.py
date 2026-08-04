@@ -243,7 +243,7 @@ def test_tsmha_varlen_extend_paged(
 def test_tsmha_varlen_gate_falls_back(device: str, require) -> None:
     """Ineligible extents (not 128-multiples) must keep the score_mod route."""
     _require_fa4(require)
-    from tokenspeed_kernel.ops.attention.rmha.cute_dsl import rel_extend
+    import tokenspeed_kernel.ops.attention.rmha.cute_dsl.rel_extend as rel_extend
 
     q_lens = [70, 130]
     rel_extent = 64

@@ -260,6 +260,35 @@ def test_solution_siblings_use_consistent_packages() -> None:
         assert not (attention_ops / old_bundle).exists()
 
 
+def test_family_initializers_do_not_reexport_solutions() -> None:
+    ops = SETUP_PY.parent / "tokenspeed_kernel" / "ops"
+
+    for relative_path in (
+        "activation/__init__.py",
+        "moe/grouped_routing/__init__.py",
+        "moe/sigmoid_topk/__init__.py",
+        "moe/unfused/__init__.py",
+        "other/metadata/__init__.py",
+    ):
+        assert not (ops / relative_path).read_text(encoding="utf-8")
+
+    attention = (ops / "attention/__init__.py").read_text(encoding="utf-8")
+    assert "kda_chunk_prefill" not in attention
+
+    communication = (ops / "communication/__init__.py").read_text(encoding="utf-8")
+    assert '"allgather_dual_rmsnorm"' not in communication
+    assert '"allreduce_residual_rmsnorm"' not in communication
+    assert '"reducescatter_residual_rmsnorm"' not in communication
+
+    moe = (ops / "moe/__init__.py").read_text(encoding="utf-8")
+    assert "moe_grouped_routing" not in moe
+    assert "moe_sigmoid_bias_topk" not in moe
+    assert "moe_unfused_apply" not in moe
+
+    msa = (ops / "attention/msa/__init__.py").read_text(encoding="utf-8")
+    assert " import *" not in msa
+
+
 def test_cuda_kernel_groups_and_output_packages(monkeypatch) -> None:
     monkeypatch.setenv("TOKENSPEED_KERNEL_BACKEND", "cuda")
     monkeypatch.setattr(setuptools, "setup", lambda **_kwargs: None)

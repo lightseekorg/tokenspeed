@@ -5,14 +5,7 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.communication.trtllm import (
-    allgather_dual_rmsnorm,
-)
-from tokenspeed_kernel.ops.communication.trtllm import (
     allreduce_lane_latent_norm as _allreduce_lane_latent_norm,
-)
-from tokenspeed_kernel.ops.communication.trtllm import (
-    allreduce_residual_rmsnorm,
-    reducescatter_residual_rmsnorm,
 )
 from tokenspeed_kernel.platform import current_platform
 
@@ -117,11 +110,8 @@ def allreduce_lane_latent_norm(
 
 
 __all__ = [
-    "allgather_dual_rmsnorm",
     "allreduce_fusion_lane",
     "allreduce_lane_latent_norm",
     "allreduce_lane_latent_norm_supported",
-    "allreduce_residual_rmsnorm",
     "prepare_allreduce_fusion",
-    "reducescatter_residual_rmsnorm",
 ]

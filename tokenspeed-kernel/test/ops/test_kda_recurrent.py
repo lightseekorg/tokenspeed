@@ -8,9 +8,9 @@ from kimi3_reference import kda_gate
 from kimi3_reference import kda_recurrent as reference_kda_recurrent
 from tokenspeed_kernel.ops.attention import (
     _attention_format_signature,
-    kda_chunk_prefill,
     kda_paged_decode,
 )
+from tokenspeed_kernel.ops.attention.kda.triton.chunk import kda_chunk_prefill
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 

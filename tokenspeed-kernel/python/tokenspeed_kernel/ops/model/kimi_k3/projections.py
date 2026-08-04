@@ -564,7 +564,7 @@ def kimi3_shared_situ_projection(
 
     gate_up = torch.nn.functional.linear(hidden_states, gate_up_weight)
     if gate_up.is_cuda:
-        from tokenspeed_kernel.ops.activation import situ_and_mul
+        from tokenspeed_kernel.ops.activation.triton import situ_and_mul
 
         return situ_and_mul(
             gate_up,

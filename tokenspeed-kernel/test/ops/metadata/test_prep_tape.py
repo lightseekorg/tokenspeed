@@ -2,7 +2,7 @@
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.other.metadata import PrepTape, Reg
+from tokenspeed_kernel.ops.other.metadata.prep_tape import PrepTape, Reg
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)

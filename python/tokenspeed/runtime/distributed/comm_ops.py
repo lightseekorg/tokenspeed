@@ -30,18 +30,14 @@ from enum import IntEnum
 import torch
 import torch.distributed
 from tokenspeed_kernel.ops.communication import (
-    allgather_dual_rmsnorm,
-)
-from tokenspeed_kernel.ops.communication import (
     allreduce_lane_latent_norm as kernel_allreduce_lane_latent_norm,
-)
-from tokenspeed_kernel.ops.communication import (
-    allreduce_residual_rmsnorm,
 )
 from tokenspeed_kernel.ops.communication import (
     prepare_allreduce_fusion as kernel_prepare_allreduce_fusion,
 )
-from tokenspeed_kernel.ops.communication import (
+from tokenspeed_kernel.ops.communication.trtllm import (
+    allgather_dual_rmsnorm,
+    allreduce_residual_rmsnorm,
     reducescatter_residual_rmsnorm,
 )
 

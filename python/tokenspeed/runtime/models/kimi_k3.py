@@ -1133,7 +1133,7 @@ class KimiLinearMoE(nn.Module):
             if self.mapping.moe.has_tp_ep and not skip_reduce:
                 out = all_reduce(out, self.mapping.moe.tp_ep_group)
         else:
-            from tokenspeed_kernel.ops.moe import moe_unfused_apply
+            from tokenspeed_kernel.ops.moe.unfused.torch import moe_unfused_apply
 
             if not hasattr(self.experts, "w13_weight_triton_tensor"):
                 raise RuntimeError(

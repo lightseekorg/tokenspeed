@@ -11,7 +11,7 @@ from tokenspeed_kernel.ops.model.kimi_k3.projections import (
     _use_gluon_largem,
     _use_gluon_mediumm,
 )
-from tokenspeed_kernel.ops.moe import moe_sigmoid_bias_topk
+from tokenspeed_kernel.ops.moe.sigmoid_topk.triton import moe_sigmoid_bias_topk
 
 
 def _is_gfx950() -> bool:

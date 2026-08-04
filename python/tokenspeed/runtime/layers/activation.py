@@ -123,7 +123,7 @@ class SituAndMul(torch.nn.Module):
                 f"SiTU expects an even [gate, up] width, got {x.shape[-1]}"
             )
         if x.is_cuda:
-            from tokenspeed_kernel import situ_and_mul
+            from tokenspeed_kernel.ops.activation.triton import situ_and_mul
 
             return situ_and_mul(
                 x,
