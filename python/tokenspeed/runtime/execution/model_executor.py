@@ -101,7 +101,12 @@ def _get_drafter_impl(spec_algo: str, model: torch.nn.Module):
         InklingForConditionalGenerationNextN,
     )
 
-    DRAFTER_MAPPING = {"EAGLE3": Eagle, "MTP": Eagle, "DFLASH": DFlash, "DSPARK": DSpark}
+    DRAFTER_MAPPING = {
+        "EAGLE3": Eagle,
+        "MTP": Eagle,
+        "DFLASH": DFlash,
+        "DSPARK": DSpark,
+    }
 
     # "MTP" covers two algorithms:
     # (1) Eagle-like MTP (e.g. DeepSeek) stays on Eagle in eagle.py;
