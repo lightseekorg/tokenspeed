@@ -1428,10 +1428,13 @@ class ServerArgs:
             type=str,
             choices=["auto", "fla", "flashkda", "cutedsl_kda"],
             default=ServerArgs.kda_backend,
-            help="KDA (Kimi Delta Attention) prefill kernel policy: 'auto' "
-            "picks the fastest available kernel (cutedsl_kda > flashkda > fla); "
-            "'fla' forces the portable FLA scan; 'flashkda' the optional "
-            "FlashKDA library (source build, SM90+); 'cutedsl_kda' the "
+            help="KDA (Kimi Delta Attention) prefill kernel policy. On AMD, "
+            "this setting is ignored and compatible kernels are selected using "
+            "registry priority. On NVIDIA, 'auto' selects the fastest available "
+            "backend "
+            "(cutedsl_kda > flashkda > fla). Named backends are NVIDIA-specific: "
+            "'fla' uses the portable FLA scan, 'flashkda' uses the optional "
+            "FlashKDA library (source build, SM90+), and 'cutedsl_kda' uses the "
             "CuteDSL KDA AOT kernel (prebuilt, sm_103a). Decode is unaffected.",
         )
         parser.add_argument(

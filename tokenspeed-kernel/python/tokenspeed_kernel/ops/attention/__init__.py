@@ -785,11 +785,7 @@ def kda_paged_prefill(
     num_sequences = cu_seqlens.numel() - 1
     if initial_state.ndim != 4 or initial_state.shape[0] != num_sequences:
         raise ValueError("KDA initial_state must contain one row per sequence")
-    # AMD historically ignores the NVIDIA prefill policy labels and uses its
-    # registered Gluon implementation.
-    if current_platform().is_amd and solution in {"fla", "flashkda", "cutedsl_kda"}:
-        solution = "gluon"
-    elif solution == "fla":
+    if solution == "fla":
         solution = "triton"
     kernel = select_kernel(
         "attention",
