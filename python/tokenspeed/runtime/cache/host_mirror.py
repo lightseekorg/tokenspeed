@@ -123,7 +123,9 @@ class HostMirror:
                     conv, _ssm = device_kv_pool.get_state_buffers(layer_id)
                 except ValueError:
                     continue  # not a state layer
-                self._layer_to_state_pair[layer_id] = pair_of_conv[(conv.data_ptr(), conv.nbytes)]
+                self._layer_to_state_pair[layer_id] = pair_of_conv[
+                    (conv.data_ptr(), conv.nbytes)
+                ]
 
         pin = torch.cuda.is_available()
         kv_pairs = [
