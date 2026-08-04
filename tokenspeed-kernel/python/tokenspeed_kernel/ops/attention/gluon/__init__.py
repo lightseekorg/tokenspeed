@@ -574,6 +574,7 @@ if current_platform().is_amd:
             "qk_rope_head_dim": frozenset({64}),
             "value_head_dim": frozenset({128}),
             "gate_kind": frozenset({"none", "sigmoid"}),
+            "support_logit_cap": frozenset({False}),
         },
     )(_mla_decode_projected_value_impl)
 

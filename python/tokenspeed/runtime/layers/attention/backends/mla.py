@@ -632,6 +632,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
                 value_weight,
                 gate=gate,
                 out=projected_out,
+                logit_cap=layer.logit_cap,
             )
         else:
             result = mla_decode_with_kvcache(

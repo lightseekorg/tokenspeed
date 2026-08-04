@@ -828,11 +828,14 @@ def test_mla_decode_projected_value_composes_split_fallback(
     output = torch.empty_like(raw_gate)
 
     def no_fused_kernel(*args, **kwargs):
+        if args[1] == "mla_decode_projected_value":
+            assert kwargs["traits"]["support_logit_cap"] is True
         raise NoKernelFoundError
 
     def split_decode(**kwargs):
         assert kwargs["kv_lora_rank"] == 4
         assert kwargs["qk_rope_head_dim"] == 2
+        assert kwargs["logit_cap"] == 2.5
         return latent
 
     monkeypatch.setattr(attention_ops, "select_kernel", no_fused_kernel)
@@ -851,6 +854,7 @@ def test_mla_decode_projected_value_composes_split_fallback(
         weight,
         gate=gate,
         out=output,
+        logit_cap=2.5,
     )
     expected = torch.bmm(
         latent.reshape(2, 3, 4).transpose(0, 1).contiguous(),

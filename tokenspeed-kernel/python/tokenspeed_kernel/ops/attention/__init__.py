@@ -2563,6 +2563,7 @@ def mla_decode_projected_value(
     *,
     gate: torch.Tensor | None = None,
     out: torch.Tensor,
+    logit_cap: float = 0.0,
     override: str | None = None,
     solution: str | None = None,
 ) -> torch.Tensor:
@@ -2585,6 +2586,7 @@ def mla_decode_projected_value(
         value_weight: Per-head value projection ``[heads,kv_lora_rank,value_dim]``.
         gate: Optional raw sigmoid gate ``[batch,heads*value_dim]``.
         out: Destination with the same shape and dtype as ``gate``.
+        logit_cap: Optional soft cap applied to attention logits.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
 
@@ -2629,6 +2631,7 @@ def mla_decode_projected_value(
         "qk_rope_head_dim": qk_rope_head_dim,
         "value_head_dim": value_weight.shape[2],
         "gate_kind": "none" if gate is None else "sigmoid",
+        "support_logit_cap": logit_cap != 0.0,
     }
     try:
         kernel = select_kernel(
@@ -2685,6 +2688,7 @@ def mla_decode_projected_value(
                 value_weight=value_weight,
                 gate=gate,
                 out=out,
+                logit_cap=logit_cap,
             )
 
     attention = mla_decode_with_kvcache(
@@ -2697,6 +2701,7 @@ def mla_decode_projected_value(
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
         softmax_scale=softmax_scale,
+        logit_cap=logit_cap,
         solution=solution,
     )
     return mla_project_value(

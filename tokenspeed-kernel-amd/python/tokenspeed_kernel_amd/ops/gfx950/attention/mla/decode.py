@@ -2084,6 +2084,7 @@ def gluon_mla_decode_projected_value_gfx950(
     *,
     gate: torch.Tensor | None = None,
     out: torch.Tensor,
+    logit_cap: float = 0.0,
 ) -> torch.Tensor:
     """Run native FP8 MLA with a projected-value epilogue."""
     if q.dtype != torch.float8_e4m3fn or kv_cache.dtype != torch.float8_e4m3fn:
@@ -2118,6 +2119,7 @@ def gluon_mla_decode_projected_value_gfx950(
         qk_rope_head_dim=qk_rope_head_dim,
         softmax_scale=softmax_scale,
         regime="bh16bn128",
+        logit_cap=logit_cap,
         value_weight=value_weight,
         gate=gate,
         projected_out=out,
