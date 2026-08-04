@@ -25,7 +25,12 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel import mla_decode_with_kvcache, mla_prefill
+from tokenspeed_kernel import (
+    mla_decode_with_kvcache,
+    mla_extend_with_kvcache,
+    mla_prefill,
+    mla_use_absorbed_extend,
+)
 
 from tokenspeed.runtime.configs.cache_runtime import cache_debug_enabled
 from tokenspeed.runtime.configs.model_config import AttentionArch
@@ -52,10 +57,13 @@ class MLAPrefillMetadata:
     extend_prefix_lens: torch.Tensor
     extend_seq_lens: torch.Tensor
     cum_extend_seq_lens: torch.Tensor
+    cum_seq_lens_kv: torch.Tensor | None
+    page_table: torch.Tensor | None
     # Host-side metadata.
     extend_seq_lens_cpu: list[int]
     max_extend_seq_len: int
     max_extend_prefix_len: int
+    use_absorbed_cached_extend: bool
     # Per-prefix-chunk arrays consumed by DeepSeek's chunked prefix replay.
     chunked_loop_num: int
     chunk_kv_indices_list: list[torch.Tensor]
@@ -121,6 +129,7 @@ class MLAAttnBackend(AttentionBackend):
         self.draft_block_decode = bool(getattr(config, "draft_block_decode", False))
 
         self.kernel_solution = None
+
         self.forward_decode_metadata: MLADecodeMetadata | None = None
         self.forward_prefill_metadata: MLAPrefillMetadata | None = None
         self.chunked_prefill_metadata: MLAPrefillMetadata | None = None
@@ -150,6 +159,21 @@ class MLAAttnBackend(AttentionBackend):
             and self._cache_logical_page_size is not None
             and bs > 0
             and not forward_mode.is_idle()
+        )
+
+    def _should_use_absorbed_cached_extend(
+        self, *, max_extend_seq_len: int, max_extend_prefix_len: int
+    ) -> bool:
+        return max_extend_prefix_len > 0 and mla_use_absorbed_extend(
+            q_dtype=self.q_data_type,
+            kv_dtype=self.data_type,
+            num_q_heads=self.num_local_heads,
+            page_size=self.page_size,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            max_seqlen_q=max_extend_seq_len,
+            solution=self.kernel_solution,
         )
 
     def _resolve_full_history_table(
@@ -415,6 +439,16 @@ class MLAAttnBackend(AttentionBackend):
 
         max_extend_seq_len = max(extend_seq_lens_cpu_list, default=0)
         max_extend_prefix_len = int(extend_prefix_lens_cpu.max().item())
+        use_absorbed_cached_extend = self._should_use_absorbed_cached_extend(
+            max_extend_seq_len=max_extend_seq_len,
+            max_extend_prefix_len=max_extend_prefix_len,
+        )
+
+        cum_seq_lens_kv = None
+        page_table = None
+        if use_absorbed_cached_extend:
+            cum_seq_lens_kv = torch.zeros_like(cum_extend_seq_lens)
+            torch.cumsum(seq_lens, dim=0, out=cum_seq_lens_kv[1:])
 
         if group_table is not None:
             assert logical_page_size is not None
@@ -430,11 +464,24 @@ class MLAAttnBackend(AttentionBackend):
                 seq_lens.shape[0], dtype=torch.int64, device=group_table.device
             )
             chunk_page_size = logical_page_size
+            if use_absorbed_cached_extend:
+                page_table = self._expand_group_page_table(
+                    group_table,
+                    batch_size=seq_lens.shape[0],
+                    logical_page_size=logical_page_size,
+                )
         else:
             group_out_cache_loc = None
             chunk_req_to_page = req_to_page
             chunk_req_pool_indices = req_pool_indices
             chunk_page_size = self.page_size
+            if use_absorbed_cached_extend:
+                page_table = build_page_table(
+                    req_pool_indices,
+                    req_to_page,
+                    self.page_size,
+                    self.max_context_len,
+                )
 
         (
             chunked_loop_num,
@@ -456,9 +503,12 @@ class MLAAttnBackend(AttentionBackend):
             extend_prefix_lens=extend_prefix_lens,
             extend_seq_lens=extend_seq_lens,
             cum_extend_seq_lens=cum_extend_seq_lens,
+            cum_seq_lens_kv=cum_seq_lens_kv,
+            page_table=page_table,
             extend_seq_lens_cpu=extend_seq_lens_cpu_list,
             max_extend_seq_len=max_extend_seq_len,
             max_extend_prefix_len=max_extend_prefix_len,
+            use_absorbed_cached_extend=use_absorbed_cached_extend,
             chunked_loop_num=chunked_loop_num,
             chunk_kv_indices_list=chunk_kv_indices_list,
             chunked_seq_len=chunked_seq_len,
@@ -994,6 +1044,34 @@ class MLAAttnBackend(AttentionBackend):
 
         metadata = self.forward_prefill_metadata
         assert metadata is not None
+        if metadata.use_absorbed_cached_extend:
+            assert metadata.page_table is not None
+            assert metadata.cum_seq_lens_kv is not None
+            q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+            kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
+            if self.data_type != kv_cache.dtype:
+                kv_cache = kv_cache.to(self.data_type)
+            kv_cache = kv_cache.view(-1, self.page_size, 1, self.kv_cache_dim)
+            result = mla_extend_with_kvcache(
+                q=q,
+                kv_cache=kv_cache,
+                page_table=metadata.page_table,
+                cache_seqlens=metadata.seq_lens,
+                cu_seqlens_q=metadata.cum_extend_seq_lens,
+                cu_seqlens_kv=metadata.cum_seq_lens_kv,
+                max_seqlen_q=metadata.max_extend_seq_len,
+                max_seqlen_k=self.max_context_len,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                softmax_scale=layer.scaling,
+                is_causal=True,
+                logit_cap=layer.logit_cap,
+                solution=self.kernel_solution,
+            )
+            output = self._unwrap_output(result)
+            return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+
         if metadata.max_extend_prefix_len > 0:
             raise NotImplementedError(
                 "MLA prefix-cache extend is handled by DeepSeek's chunked "

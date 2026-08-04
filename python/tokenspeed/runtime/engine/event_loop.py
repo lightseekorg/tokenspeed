@@ -44,6 +44,7 @@ from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
 from tokenspeed.runtime.engine.generation_output_processor import OutputProcesser
+from tokenspeed.runtime.engine.io_struct import IpcReceiver, IpcSender
 from tokenspeed.runtime.engine.memory_occupation import MemoryOccupationController
 from tokenspeed.runtime.engine.pause import PauseController
 from tokenspeed.runtime.engine.request_handler import RequestHandler
@@ -131,6 +132,41 @@ class _NullSender:
     @staticmethod
     def send_pyobj(x):
         return None
+
+
+# SMG decodes the ready response's dtype into a fixed enum of these strings, so
+# map tokenspeed's dtype onto the nearest one.
+_WIRE_DTYPE_MAP = {
+    "bfloat16": "bfloat16",
+    "bf16": "bfloat16",
+    "float16": "float16",
+    "half": "float16",
+    "fp16": "float16",
+    "float32": "float32",
+    "float": "float32",
+    "fp32": "float32",
+}
+
+
+def _wire_dtype(dtype) -> str:
+    key = str(dtype).lower().replace("torch.", "")
+    mapped = _WIRE_DTYPE_MAP.get(key)
+    if mapped is None:
+        # Fail at handshake time: misreporting the dtype to the frontend is
+        # worse than refusing to start.
+        raise ValueError(
+            f"dtype {dtype!r} has no SMG wire mapping; extend _WIRE_DTYPE_MAP"
+        )
+    return mapped
+
+
+def _tokenspeed_version() -> str:
+    try:
+        from tokenspeed.version import __version__
+
+        return __version__
+    except Exception:
+        return "unknown"
 
 
 @dataclass(frozen=True)
@@ -1027,15 +1063,68 @@ class EventLoop:
     def _init_interprocess_comm(self):
         context = zmq.Context(2)
         if self.attn_tp_rank == 0:
-            self.recv_from_tokenizer = get_zmq_socket(
-                context, zmq.PULL, self.port_args.scheduler_input_ipc_name, False
-            )
-            self.send_to_tokenizer = get_zmq_socket(
-                context, zmq.PUSH, self.port_args.tokenizer_ipc_name, False
-            )
+            if self.server_args.zmq_msgpack:
+                # SMG drives the scheduler directly: it binds the sockets and
+                # this engine connects in over the msgpack wire (see zmq_msgpack).
+                self.recv_from_tokenizer, self.send_to_tokenizer = (
+                    self._init_msgpack_transport(context)
+                )
+            else:
+                self.recv_from_tokenizer = IpcReceiver(
+                    get_zmq_socket(
+                        context,
+                        zmq.PULL,
+                        self.port_args.scheduler_input_ipc_name,
+                        False,
+                    )
+                )
+                self.send_to_tokenizer = IpcSender(
+                    get_zmq_socket(
+                        context, zmq.PUSH, self.port_args.tokenizer_ipc_name, False
+                    )
+                )
         else:
             self.recv_from_tokenizer = None
             self.send_to_tokenizer = _NullSender()
+
+    def _init_msgpack_transport(self, context):
+        """Complete the SMG startup handshake and return the wrapped msgpack
+        input/output sockets."""
+        from tokenspeed.runtime.engine import zmq_msgpack, zmq_wire
+
+        if self.dp_size > 1:
+            # Shared choke point for every launch path: all DP-rank engines
+            # would connect to SMG's ROUTER with the same zmq_engine_index
+            # identity, so their inputs and outputs would collide.
+            raise NotImplementedError(
+                "--zmq-msgpack does not support data-parallel size > 1 yet"
+            )
+        geometry = self._scheduler_cache_geometry
+        ready_response = zmq_wire.WireEngineCoreReadyResponse(
+            max_model_len=self.model_config.context_len,
+            num_gpu_blocks=geometry.num_device_pages,
+            block_size=geometry.page_size,
+            dtype=_wire_dtype(self.model_config.dtype),
+            vllm_version=f"tokenspeed-{_tokenspeed_version()}",
+            world_size=self.world_size,
+            data_parallel_size=self.dp_size,
+            tensor_parallel_size=self.attn_tp_size,
+            data_parallel_rank=self.dp_rank,
+            max_num_seqs=self.server_args.max_num_seqs,
+            # chunked_prefill_size=-1 means "disabled"; the wire field is a
+            # non-negative integer for the frontend, so clamp to 0 (= no cap).
+            max_num_batched_tokens=max(0, self.server_args.chunked_prefill_size),
+            instance_id=self.server_args.served_model_name or self.server_args.model,
+            kv_cache_size_tokens=self.max_total_num_tokens,
+        )
+        return zmq_msgpack.connect_msgpack_engine(
+            context,
+            self.server_args.zmq_handshake_endpoint(),
+            self.server_args.zmq_engine_index,
+            ready_response,
+            self.model_config.vocab_size,
+            enable_output_logprobs=self.server_args.enable_output_logprobs,
+        )
 
     # ------------------------------------------------------------------
     # Shared step helpers
@@ -1781,6 +1870,12 @@ class EventLoop:
             prev_forward_op = forward_op
 
     def close(self) -> None:
+        # Best-effort: tell an attached SMG frontend this engine is going away
+        # (msgpack mode only; the pickle sender has no such helper) so the
+        # worker is marked dead instead of staying healthy-idle.
+        send_engine_dead = getattr(self.send_to_tokenizer, "send_engine_dead", None)
+        if callable(send_engine_dead):
+            send_engine_dead()
         close_transfer = getattr(self.kv_transfer, "close", None)
         if callable(close_transfer):
             close_transfer()

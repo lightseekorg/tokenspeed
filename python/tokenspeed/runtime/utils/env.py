@@ -297,6 +297,10 @@ class Envs:
     TOKENSPEED_ENABLE_TORCH_INFERENCE_MODE = EnvBool(True)
     TOKENSPEED_NUMA_AWARE_WORKER_AFFINITY = EnvBool(True)
     TOKENSPEED_REQUEST_CONVERSION_WORKERS = EnvInt(8)
+    # Rollout escape hatch: revert engine IPC (frontend <-> controller <->
+    # scheduler ZMQ hops) from msgpack back to pickle. Read once at import of
+    # engine.io_struct.
+    TOKENSPEED_USE_PICKLE_IPC = EnvBool(False)
 
     # Multimodal / VLM
     TOKENSPEED_LOG_MM_TIMING = EnvBool(False)

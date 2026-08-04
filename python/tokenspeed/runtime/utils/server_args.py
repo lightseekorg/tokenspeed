@@ -61,6 +61,21 @@ def str_to_bool(value: str | bool) -> bool:
     raise argparse.ArgumentTypeError(f"invalid boolean value: {value!r}")
 
 
+def _uint16(value: str) -> int:
+    """argparse type for values packed as a two-byte identity (``<H``)."""
+    index = int(value)
+    if not 0 <= index <= 0xFFFF:
+        raise argparse.ArgumentTypeError(f"value must be in [0, 65535], got {value}")
+    return index
+
+
+def _nonempty_str(value: str) -> str:
+    """argparse type for string flags that must not be empty."""
+    if not value.strip():
+        raise argparse.ArgumentTypeError("value must be a non-empty string")
+    return value
+
+
 @dataclasses.dataclass
 class ServerArgs:
     # Model and tokenizer
@@ -80,6 +95,20 @@ class ServerArgs:
     served_model_name: str | None = None
     revision: str | None = None
     language_model_only: bool = False
+
+    # Direct SMG msgpack ZMQ path. When enabled, the scheduler skips the pickle
+    # PULL/PUSH IPC and instead connects to SMG (which binds the handshake/input/
+    # output sockets) over the msgpack wire. Default OFF;
+    # SMG tokenizes/detokenizes, so pair with --skip-tokenizer-init.
+    zmq_msgpack: bool = False
+    # The frontend handshake endpoint the scheduler dials; becomes the
+    # data-parallel rendezvous when DP is supported.
+    data_parallel_address: str = "127.0.0.1"
+    # Default chosen to avoid the 20000-29999 range used for derived
+    # per-worker handshake ports and common rendezvous defaults of
+    # co-located services.
+    data_parallel_rpc_port: int = 30500
+    zmq_engine_index: int = 0
 
     # Port for the HTTP server
     host: str = "127.0.0.1"
@@ -577,9 +606,7 @@ class ServerArgs:
                     "--disaggregation-mode null (aggregate serving) or prefill"
                 )
             if self.mapping.nnodes != 1:
-                raise ValueError(
-                    "--mm-encoder-tp-mode data currently supports a single node only"
-                )
+                logger.warning("--mm-encoder-tp-mode data on nnodes>1 is experimental")
             if self.mapping.has_attn_cp:
                 raise ValueError(
                     "--mm-encoder-tp-mode data does not currently support "
@@ -829,6 +856,41 @@ class ServerArgs:
             default=ServerArgs.language_model_only,
             help="Skip vision/audio encoders on a multimodal checkpoint and "
             "run text-only. Multimodal requests are rejected.",
+        )
+        parser.add_argument(
+            "--zmq-msgpack",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.zmq_msgpack,
+            help="Drive the scheduler directly from SMG over the msgpack ZMQ "
+            "wire instead of the Python tokenizer_manager (pickle IPC). SMG "
+            "binds the handshake/input/output sockets; the scheduler connects "
+            "in. Pair with --skip-tokenizer-init.",
+        )
+        parser.add_argument(
+            "--data-parallel-address",
+            type=_nonempty_str,
+            default=ServerArgs.data_parallel_address,
+            help="Host of the frontend-bound handshake ROUTER the scheduler "
+            "connects to under --zmq-msgpack (default "
+            f"{ServerArgs.data_parallel_address}).",
+        )
+        parser.add_argument(
+            "--data-parallel-rpc-port",
+            type=_uint16,
+            default=ServerArgs.data_parallel_rpc_port,
+            help="Port of the frontend-bound handshake ROUTER (default "
+            f"{ServerArgs.data_parallel_rpc_port}, outside the smg frontend's "
+            "derived-port band 20000..=29999). `smg serve --backend "
+            "tokenspeed --connection-mode zmq` passes an explicit port "
+            "derived from the worker's ipc:// URL instead.",
+        )
+        parser.add_argument(
+            "--zmq-engine-index",
+            type=_uint16,
+            default=ServerArgs.zmq_engine_index,
+            help="This engine's index under --zmq-msgpack; used as the two-byte "
+            "little-endian ZMQ routing identity SMG addresses it by "
+            "(0..65535).",
         )
         parser.add_argument("--ext-yaml", type=str, default=None)
         parser.add_argument(
@@ -1970,6 +2032,11 @@ class ServerArgs:
         if is_valid_ipv6_address(self.host):
             return f"http://[{self.host}]:{self.port}"
         return f"http://{self.host}:{self.port}"
+
+    def zmq_handshake_endpoint(self) -> str:
+        """The frontend handshake endpoint dialed under ``--zmq-msgpack``,
+        composed from ``--data-parallel-address``/``--data-parallel-rpc-port``."""
+        return f"tcp://{self.data_parallel_address}:{self.data_parallel_rpc_port}"
 
     def get_weight_transfer_config(self):
         """Parse ``--weight-transfer-config`` JSON into a ``WeightTransferConfig``."""

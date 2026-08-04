@@ -27,6 +27,11 @@ commit ae0bae8954110b12655e3232f68262dd63cd694e.
 Source:
 https://github.com/ROCm/aiter/blob/ae0bae8954110b12655e3232f68262dd63cd694e/aiter/ops/triton/gluon/mla_gluon.py
 
+The GFX1250 MLA decode and cached-extend kernels are adapted from ROCm/AITER commit
+4a1cc773f34cbfc74387259e51262556ee38edd0.
+Source:
+https://github.com/ROCm/aiter/blob/4a1cc773f34cbfc74387259e51262556ee38edd0/aiter/ops/triton/_gluon_kernels/gfx1250/attention/mla.py
+
 Licensed under the MIT License, whose full license text is available below.
 
 ================================================================================

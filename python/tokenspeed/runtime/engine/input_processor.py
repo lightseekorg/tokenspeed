@@ -167,13 +167,18 @@ class InputProcessor:
             # the un-padded input_ids (so get_rope_index can still locate the
             # image regions) BEFORE pad_input_tokens substitutes per-image
             # pad_value over the placeholders, then pad for the embed splice.
+            input_ids_list = None
+            if input_ids is not None:
+                input_ids_list = (
+                    input_ids if isinstance(input_ids, list) else list(input_ids)
+                )
             if (
-                input_ids is not None
+                input_ids_list is not None
                 and getattr(multimodal_inputs, "mrope_positions", None) is None
             ):
                 mrope_positions, mrope_position_delta = compute_mrope_positions(
                     self.engine.model_config.hf_config,
-                    list(input_ids),
+                    input_ids_list,
                     multimodal_inputs.mm_items,
                 )
                 multimodal_inputs.mrope_positions = mrope_positions
@@ -182,9 +187,9 @@ class InputProcessor:
                     multimodal_inputs.mrope_position_delta_scalar = int(
                         mrope_position_delta.flatten()[0].item()
                     )
-            if input_ids is not None:
-                input_ids_unpadded = list(input_ids)
-                input_ids = pad_input_tokens(list(input_ids), multimodal_inputs)
+            if input_ids_list is not None:
+                input_ids_unpadded = input_ids_list
+                input_ids = pad_input_tokens(input_ids_list, multimodal_inputs)
 
         if self.engine.is_generation:
             session_params = (
@@ -264,15 +269,15 @@ class InputProcessor:
 
         if isinstance(obj, GenerateReqInput):
             return TokenizedGenerateReqInput(
-                obj.rid,
-                input_text,
-                input_ids,
-                sampling_params,
-                return_logprob,
-                logprob_start_len,
-                top_logprobs_num,
-                token_ids_logprob,
-                obj.stream,
+                rid=obj.rid,
+                input_text=input_text,
+                input_ids=input_ids,
+                sampling_params=sampling_params,
+                return_logprob=return_logprob,
+                logprob_start_len=logprob_start_len,
+                top_logprobs_num=top_logprobs_num,
+                token_ids_logprob=token_ids_logprob,
+                stream=obj.stream,
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=obj.bootstrap_room,
@@ -288,9 +293,9 @@ class InputProcessor:
             )
 
         return TokenizedEmbeddingReqInput(
-            obj.rid,
-            input_text,
-            input_ids,
-            sampling_params,
+            rid=obj.rid,
+            input_text=input_text,
+            input_ids=input_ids,
+            sampling_params=sampling_params,
             created_time=time.time(),
         )

@@ -494,6 +494,7 @@ class _PrefillForwardOp:
     request_ids = ["prefill"]
     request_pool_indices = [3]
     input_lengths = [4]
+    prefill_lengths = [4]
     extend_prefix_lens = [0]
 
     def num_extends(self):
@@ -565,6 +566,30 @@ def test_prefill_first_token_checks_spec_candidate_bootstrap():
             is_prefill_instance=True,
             on_first_token=lambda *args: None,
         )
+
+
+@pytest.mark.parametrize("notify_client", [False, True])
+def test_aborted_prefill_waits_for_pd_transfer_completion(notify_client):
+    sender = _Sender()
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
+    state = _state([1, 2, 3, 4])
+    processor.rid_to_state["prefill"] = state
+    processor.mark_abort("prefill", notify_client=notify_client)
+
+    events = processor.post_process_forward_op(
+        _PrefillForwardOp(),
+        _PrefillExecutionResult(),
+        is_prefill_instance=True,
+        on_first_token=lambda *args: None,
+    )
+
+    assert [type(event).__name__ for event in events] == ["ExtendResult"]
+    assert processor.rid_to_state["prefill"] is state
+    assert sender.items == []
+
+    assert processor.finish_prefill_request("prefill") == []
+    assert "prefill" not in processor.rid_to_state
+    assert len(sender.items) == int(notify_client)
 
 
 def test_pd_one_token_request_finishes_at_remote_prefill_done():
