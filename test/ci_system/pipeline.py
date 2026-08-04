@@ -57,6 +57,11 @@ STALE_PROCESS_PATTERNS = [
     r"smg_grpc_servicer\.tokenspeed",
     r"run_ci_suite",
 ]
+JIT_CACHE_ENV_SUBDIRS = {
+    "TRITON_CACHE_DIR": "triton",
+    "CUTE_DSL_CACHE_DIR": "cute_dsl",
+    "TORCHINDUCTOR_CACHE_DIR": "torchinductor",
+}
 RUNNER_SM_PREFIXES = (
     (("h100", "h200"), "sm90"),
     (("b200", "gb200"), "sm100"),
@@ -420,6 +425,25 @@ def create_ci_venv_name(runner_name: str | None = None) -> str:
     run_id = os.environ.get("GITHUB_RUN_ID", "local")
     run_attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "0")
     return f"/tmp/ci-env-{run_id}-{run_attempt}-{os.getpid()}"
+
+
+def create_ci_jit_cache_root(runner_name: str | None = None) -> str:
+    if runner_name:
+        safe_name = re.sub(r"[^A-Za-z0-9_-]", "_", runner_name)
+        return f"/tmp/ci-jit-cache-{safe_name}"
+    return "/tmp/ci-jit-cache-local"
+
+
+def get_jit_cache_env(env: Dict[str, str]) -> Dict[str, str]:
+    runner_name = (
+        env.get("RUNNER_NAME") or env.get("CI_RUNNER_NAME") or env.get("HOSTNAME")
+    )
+    root = create_ci_jit_cache_root(runner_name)
+    return {
+        variable: os.path.join(root, subdir)
+        for variable, subdir in JIT_CACHE_ENV_SUBDIRS.items()
+        if not env.get(variable)
+    }
 
 
 def _pkill(
@@ -1548,6 +1572,12 @@ def execute_task(
     env["CI_RUNNER_LABEL"] = runner
     env.update(get_default_runner_env(runner))
     env.update(get_runner_specific_env(task, runner))
+
+    jit_cache_env = get_jit_cache_env(env) if is_gb200_runner(runner) else {}
+    env.update(jit_cache_env)
+    if not dry_run:
+        for cache_dir in jit_cache_env.values():
+            Path(cache_dir).mkdir(parents=True, exist_ok=True)
 
     stages = filter_stage_commands(
         get_stage_commands(task),
