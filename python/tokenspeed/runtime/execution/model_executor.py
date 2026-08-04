@@ -551,11 +551,6 @@ class ModelExecutor:
             self.forward_step.capture()
         if not self.prefill_graph.disable:
             self.prefill_graph.capture(self.forward_step)
-
-        self.encoder_graph_wrappers = MultimodalRuntime.install_encoder_graphs(
-            self.model_runner.model, self.model_runner.server_args
-        )
-
         self.execution_stream = torch.cuda.Stream()
         self.log_step = 0
         self._seen_prefill_ids: set[str] = set()
