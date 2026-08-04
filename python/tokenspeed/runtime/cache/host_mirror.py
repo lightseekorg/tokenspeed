@@ -38,7 +38,7 @@ def _physical_view_dedup(
     for t in tensors:
         if t is None:
             continue
-        seen.setdefault(t.data_ptr(), t)
+        seen.setdefault((t.data_ptr(), t.nbytes), t)
     return list(seen.values())
 
 
@@ -92,18 +92,18 @@ class HostMirror:
         v_tensors = _physical_view_dedup(device_kv_pool.v_buffer)
         self.num_k_tensors = len(k_tensors)
 
-        k_index = {t.data_ptr(): i for i, t in enumerate(k_tensors)}
-        v_index = {t.data_ptr(): i for i, t in enumerate(v_tensors)}
+        k_index = {(t.data_ptr(), t.nbytes): i for i, t in enumerate(k_tensors)}
+        v_index = {(t.data_ptr(), t.nbytes): i for i, t in enumerate(v_tensors)}
         # None entries (GDN state layers, no KV) map to None: those
         # layers fence on state_tensor_indices_of_layer instead.
         self._layer_to_k_index = [
-            None if t is None else k_index[t.data_ptr()]
+            None if t is None else k_index[(t.data_ptr(), t.nbytes)]
             for t in device_kv_pool.k_buffer
         ]
         # Invariant D2 relies on: a layer's V tensor sits at
         # tensor_index_of_layer(layer) + num_k_tensors.
         assert self._layer_to_k_index == [
-            None if t is None else v_index[t.data_ptr()]
+            None if t is None else v_index[(t.data_ptr(), t.nbytes)]
             for t in device_kv_pool.v_buffer
         ], "host mirror: K/V dedup orders diverge"
 
@@ -114,13 +114,16 @@ class HostMirror:
         # the pool's occurrence-indexed get_state_buffers binding).
         self._layer_to_state_pair: dict[int, int] = {}
         if state_slabs:
-            pair_of_conv = {id(conv): n for n, (conv, _) in enumerate(state_slabs)}
+            pair_of_conv = {
+                (conv.data_ptr(), conv.nbytes): n
+                for n, (conv, _) in enumerate(state_slabs)
+            }
             for layer_id in range(len(device_kv_pool.k_buffer)):
                 try:
                     conv, _ssm = device_kv_pool.get_state_buffers(layer_id)
                 except ValueError:
                     continue  # not a state layer
-                self._layer_to_state_pair[layer_id] = pair_of_conv[id(conv)]
+                self._layer_to_state_pair[layer_id] = pair_of_conv[(conv.data_ptr(), conv.nbytes)]
 
         pin = torch.cuda.is_available()
         kv_pairs = [

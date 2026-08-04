@@ -102,7 +102,6 @@ def _stub_contract(*, block_size: int, usable_pages: int):
             entry_stride_tokens=1,
             sliding_window_tokens=None,
             family="history" if group_id == "full_attention" else "state",
-            block_size=block_size,
         )
         for group_id in group_ids
     )
