@@ -140,6 +140,12 @@ void transfer_kv_all_layer_mla_lf_pf(
     int64_t block_quota,
     int64_t num_warps_per_block);
 
+void transfer_cache_segments(
+    const std::vector<TensorView>& device_buffers,
+    TensorView host_backing,
+    TensorView descriptors,
+    int64_t direction);
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(transfer_kv_per_layer, transfer_kv_per_layer);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(transfer_kv_per_layer_pf_lf, transfer_kv_per_layer_pf_lf);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(transfer_kv_per_layer_ph_lf, transfer_kv_per_layer_ph_lf);
@@ -150,3 +156,4 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(transfer_kv_per_layer_mla, transfer_kv_per_layer_m
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(transfer_kv_per_layer_mla_pf_lf, transfer_kv_per_layer_mla_pf_lf);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(transfer_kv_all_layer_mla, transfer_kv_all_layer_mla);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(transfer_kv_all_layer_mla_lf_pf, transfer_kv_all_layer_mla_lf_pf);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(transfer_cache_segments, transfer_cache_segments);

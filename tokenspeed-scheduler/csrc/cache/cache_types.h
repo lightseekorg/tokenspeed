@@ -83,9 +83,18 @@ struct KvCacheSpec {
 // Per-request logical-page -> physical-page mapping.
 class BlockTable {
 public:
+    static BlockTable FromBlocks(std::vector<CacheBlockRef> blocks, std::int32_t available_tokens) {
+        _assert(available_tokens >= 0, "BlockTable available_tokens must be non-negative");
+        BlockTable table;
+        table.blocks_ = std::move(blocks);
+        table.available_tokens_ = available_tokens;
+        return table;
+    }
+
     std::span<const CacheBlockRef> Blocks() const noexcept { return blocks_; }
     std::int32_t NumBlocks() const { return static_cast<std::int32_t>(blocks_.size()); }
     std::int32_t AvailableTokens() const { return available_tokens_; }
+    std::vector<CacheBlockRef> TakeBlocks() && { return std::move(blocks_); }
 
     CacheBlockRef EvictToNull(std::int32_t index) {
         _assert(0 <= index && index < static_cast<std::int32_t>(blocks_.size()), "EvictToNull index out of range");

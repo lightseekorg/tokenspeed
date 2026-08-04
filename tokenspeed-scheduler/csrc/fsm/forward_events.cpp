@@ -119,6 +119,20 @@ Finished FinishEvent::operator()(Decoding&& state) {
     return finish(std::move(state));
 }
 
+Finished FinishEvent::operator()(Retracting&& state) {
+    return finish(std::move(state.device_state));
+}
+
+Finished FinishEvent::operator()(Retracted&&) {
+    return Finished{};
+}
+
+Finished FinishEvent::operator()(Recovering&& state) {
+    _assert(coordinator_ != nullptr, "FinishEvent requires a cache coordinator");
+    FreeRequest(*coordinator_, state.device_tables);
+    return Finished{};
+}
+
 Finished AbortEvent::operator()(Bootstrapping&&) {
     return Finished{};
 }
@@ -145,6 +159,62 @@ Finished AbortEvent::operator()(PrefillDone&& state) {
 
 Finished AbortEvent::operator()(Decoding&& state) {
     return abortForward(std::move(state));
+}
+
+Finished AbortEvent::operator()(Retracting&& state) {
+    return abortForward(std::move(state.device_state));
+}
+
+Finished AbortEvent::operator()(Retracted&&) {
+    return Finished{};
+}
+
+Finished AbortEvent::operator()(Recovering&& state) {
+    _assert(coordinator_ != nullptr, "AbortEvent requires a cache coordinator");
+    FreeRequest(*coordinator_, state.device_tables);
+    return Finished{};
+}
+
+Retracted CompleteRetractionEvent::operator()(Retracting&& state) {
+    _assert(coordinator_ != nullptr, "CompleteRetractionEvent requires a cache coordinator");
+    Decoding device_state = std::move(state.device_state);
+    TokenContainer* token_container = device_state.TokenContainerPtr();
+    const std::int32_t page_size = device_state.PageSize();
+    const std::int32_t decode_reserve_tokens = device_state.ReserveNumTokensInNextScheduleEvent();
+    CacheProgress cache_progress = std::move(device_state).TakeCacheProgress();
+    RetractionSnapshot snapshot{
+        .token_container = token_container,
+        .page_size = page_size,
+        .frontier_tokens = token_container->Size(),
+        .host_tables = std::move(state.host_tables),
+        .cache_progress = std::move(cache_progress),
+        .decode_reserve_tokens = decode_reserve_tokens,
+    };
+    auto device_tables = std::move(device_state).TakeBlockTables();
+    FreeRequest(*coordinator_, device_tables);
+    return Retracted{std::move(snapshot)};
+}
+
+Recovering BeginRecoveryEvent::operator()(Retracted&& state) {
+    _assert(req_pool_allocator_ != nullptr, "BeginRecoveryEvent requires a request-pool allocator");
+    return Recovering{
+        .snapshot = std::move(state.snapshot),
+        .req_pool_index = std::make_unique<ReqPoolIndex>(req_pool_allocator_->Allocate()),
+        .device_tables = std::move(device_tables_),
+    };
+}
+
+Decoding CompleteRecoveryEvent::operator()(Recovering&& state) {
+    RetractionSnapshot snapshot = std::move(state.snapshot);
+    _assert(snapshot.token_container != nullptr, "retraction snapshot lost its token container");
+    _assert(snapshot.token_container->Size() == snapshot.frontier_tokens,
+            "request tokens changed while its retraction snapshot was pinned");
+    return Decoding{snapshot.token_container,
+                    snapshot.page_size,
+                    std::move(state.req_pool_index),
+                    snapshot.decode_reserve_tokens,
+                    std::move(state.device_tables),
+                    std::move(snapshot.cache_progress)};
 }
 
 template <typename State>

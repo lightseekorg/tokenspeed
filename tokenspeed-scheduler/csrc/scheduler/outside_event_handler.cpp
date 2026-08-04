@@ -155,6 +155,17 @@ void Scheduler::handleEvent(const forward::Abort& event) {
 }
 
 void Scheduler::handleEvent(const cache::WriteBackDone& event) {
+    if (auto it = retraction_ops_.find(event.op_id); it != retraction_ops_.end()) {
+        if (Request* request = findRequest(it->second.request_id); request != nullptr && request->Is<fsm::Retracting>()) {
+            if (event.success) {
+                request->Apply(fsm::CompleteRetractionEvent{&coordinator_});
+            } else {
+                request->Apply(fsm::CancelRetractionEvent{});
+            }
+        }
+        retraction_ops_.erase(it);
+        return;
+    }
     std::vector<StoreTicket> tickets = store_ops_.Retire(event.op_id);
     for (StoreTicket& ticket : tickets) {
         if (event.success) {
@@ -168,6 +179,14 @@ void Scheduler::handleEvent(const cache::WriteBackDone& event) {
 }
 
 void Scheduler::handleEvent(const cache::LoadBackDone& event) {
+    if (auto it = recovery_ops_.find(event.op_id); it != recovery_ops_.end()) {
+        _assert(event.success, "snapshot recovery H2D must not fail");
+        if (Request* request = findRequest(it->second.request_id); request != nullptr && request->Is<fsm::Recovering>()) {
+            request->Apply(fsm::CompleteRecoveryEvent{});
+        }
+        recovery_ops_.erase(it);
+        return;
+    }
     auto it = load_ops_.find(event.op_id);
     if (it == load_ops_.end()) {
         return;

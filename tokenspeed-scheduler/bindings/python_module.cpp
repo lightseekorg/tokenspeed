@@ -165,7 +165,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     nb::class_<tokenspeed::RequestSpec>(m, "RequestSpec")
         .def(nb::init<>())
         .def_rw("request_id", &tokenspeed::RequestSpec::request_id)
-        .def_rw("tokens", &tokenspeed::RequestSpec::tokens);
+        .def_rw("tokens", &tokenspeed::RequestSpec::tokens)
+        .def_rw("max_new_tokens", &tokenspeed::RequestSpec::max_new_tokens);
 
     nb::module_ forward_event = m.def_submodule("ForwardEvent");
     nb::class_<tokenspeed::forward::ExtendResult>(forward_event, "ExtendResult")
@@ -264,11 +265,13 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     // ─── CacheOperation (attached to the Cache submodule) ──────────
     nb::class_<tokenspeed::LoadBackBatch>(cache, "LoadBackOp")
         .def_ro("op_ids", &tokenspeed::LoadBackBatch::op_ids)
+        .def_ro("group_ids", &tokenspeed::LoadBackBatch::group_ids)
         .def_ro("src_pages", &tokenspeed::LoadBackBatch::src_pages)
         .def_ro("dst_pages", &tokenspeed::LoadBackBatch::dst_pages);
 
     nb::class_<tokenspeed::WriteBackBatch>(cache, "WriteBackOp")
         .def_ro("op_ids", &tokenspeed::WriteBackBatch::op_ids)
+        .def_ro("group_ids", &tokenspeed::WriteBackBatch::group_ids)
         .def_ro("src_pages", &tokenspeed::WriteBackBatch::src_pages)
         .def_ro("dst_pages", &tokenspeed::WriteBackBatch::dst_pages);
 
@@ -323,6 +326,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("active_kv_pages", &tokenspeed::Scheduler::ActiveKvPages)
         .def("request_token_size", &tokenspeed::Scheduler::RequestTokenSize, nb::arg("id"))
         .def("max_single_request_tokens", &tokenspeed::Scheduler::MaxSingleRequestTokens)
+        .def("max_host_snapshot_tokens", &tokenspeed::Scheduler::MaxHostSnapshotTokens)
+        .def("clear_l1_cache", &tokenspeed::Scheduler::ClearL1Cache)
         .def("paged_cache_group_total_pages", &tokenspeed::Scheduler::PagedCacheGroupTotalPages, nb::arg("group_id"))
         .def("paged_cache_group_available_pages", &tokenspeed::Scheduler::PagedCacheGroupAvailablePages,
              nb::arg("group_id"));

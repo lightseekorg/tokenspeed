@@ -24,6 +24,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <tuple>
 
 #include "cache/full_attn_manager.h"
 #include "cache/mamba_state_manager.h"
@@ -67,6 +68,26 @@ KvCacheCoordinator::KvCacheCoordinator(std::vector<CacheGroup> groups, std::int3
 bool KvCacheCoordinator::HasMambaStateGroup() const {
     return std::ranges::any_of(groups_,
                                [](const CacheGroup& group) { return group.Spec().kind == AttnKind::kMambaState; });
+}
+
+bool KvCacheCoordinator::ClearDeviceCache() {
+    std::vector<std::pair<GroupId, CacheBlockLocation>> cached_locations;
+    for (const CacheGroup& group : groups_) {
+        const KvCacheManager& manager = group.Manager();
+        std::vector<CacheBlockLocation> group_locations = manager.EvictableBlockLocations(pool_);
+        if (static_cast<std::int32_t>(group_locations.size()) != manager.NumCachedBlocks(pool_)) {
+            return false;
+        }
+        for (CacheBlockLocation location : group_locations) {
+            cached_locations.emplace_back(group.Id(), location);
+        }
+    }
+
+    pending_stores_.clear();
+    for (const auto& [group_id, location] : cached_locations) {
+        _assert(evictCachedBlock(group_id, location), "clearable Device cache entry disappeared");
+    }
+    return true;
 }
 
 std::vector<CacheKey> KvCacheCoordinator::keysForGroup(std::span<const std::string> content_hashes,
@@ -326,9 +347,87 @@ void KvCacheCoordinator::cacheFullBlocksForGroup(std::size_t group_index, BlockT
         }
         pending_stores_.push_back(StoreCandidate{
             .key = std::move(key),
-            .block_ref = std::move(block_ref),
         });
     }
+}
+
+CacheBlockRef KvCacheCoordinator::AcquireDeviceCachedBlock(const CacheKey& key) const {
+    if (key.group_id >= groups_.size()) {
+        return {};
+    }
+    return groups_[key.group_id].Manager().AcquireCachedBlock(pool_, key);
+}
+
+CacheBlockRef KvCacheCoordinator::AcquireHostBlockForStore(GroupId group_id) {
+    _assert(host_pool_ != nullptr, "AcquireHostBlockForStore requires a host pool");
+    _assert(group_id < groups_.size(), "Host store group id out of range");
+    KvCacheManager& target = groups_[group_id].Manager();
+    const std::int32_t packing = target.CacheBlocksPerLcmBlock();
+    if (CacheBlockRef block_ref = host_pool_->AcquireBlock(group_id, packing)) {
+        return block_ref;
+    }
+
+    const auto value = [&](GroupId candidate_group, CacheBlockLocation location) {
+        const auto metadata = groups_[candidate_group].Manager().CachedBlockMetadataFor(*host_pool_, location);
+        _assert(metadata.has_value(), "evictable Host block has no cache metadata");
+        return std::tuple{metadata->was_acquired,
+                          metadata->last_access_epoch,
+                          candidate_group,
+                          location.lcm_block_id,
+                          location.slot_index};
+    };
+    using HostCacheValue = decltype(value(group_id, CacheBlockLocation{}));
+
+    // Reusing one child of an already-bound parent destroys less cache than
+    // rebinding a complete parent from another group.
+    std::vector<CacheBlockLocation> local_victims = target.EvictableBlockLocations(*host_pool_);
+    if (!local_victims.empty()) {
+        const auto victim = std::ranges::min_element(
+            local_victims, {}, [&](CacheBlockLocation location) { return value(group_id, location); });
+        _assert(target.EvictCachedBlock(*host_pool_, *victim).has_value(), "selected Host child is not evictable");
+        CacheBlockRef block_ref = host_pool_->AcquireBlock(group_id, packing);
+        _assert(static_cast<bool>(block_ref), "evicting a same-group Host child did not free a placement");
+        return block_ref;
+    }
+
+    std::optional<std::int32_t> victim_parent;
+    std::optional<HostCacheValue> victim_value;
+    for (std::int32_t parent_id = 1; parent_id <= host_pool_->NumLcmBlocks(); ++parent_id) {
+        const std::optional<GroupId> bound_group = host_pool_->BoundGroup(parent_id);
+        if (!bound_group || !groups_[*bound_group].Manager().ParentIsFullyEvictable(*host_pool_, parent_id)) {
+            continue;
+        }
+        std::optional<HostCacheValue> parent_value;
+        for (std::int32_t slot = 0; slot < groups_[*bound_group].Manager().CacheBlocksPerLcmBlock(); ++slot) {
+            const CacheBlockLocation location{.lcm_block_id = parent_id, .slot_index = slot};
+            if (!host_pool_->IsOccupied(location)) {
+                continue;
+            }
+            const auto child_value = value(*bound_group, location);
+            parent_value = parent_value ? std::max(*parent_value, child_value) : child_value;
+        }
+        _assert(parent_value.has_value(), "evictable Host parent has no children");
+        if (!victim_value || *parent_value < *victim_value) {
+            victim_parent = parent_id;
+            victim_value = *parent_value;
+        }
+    }
+    if (!victim_parent) {
+        return {};
+    }
+
+    const GroupId bound_group = *host_pool_->BoundGroup(*victim_parent);
+    KvCacheManager& manager = groups_[bound_group].Manager();
+    for (std::int32_t slot = 0; slot < manager.CacheBlocksPerLcmBlock(); ++slot) {
+        const CacheBlockLocation location{.lcm_block_id = *victim_parent, .slot_index = slot};
+        if (host_pool_->IsOccupied(location)) {
+            _assert(manager.EvictCachedBlock(*host_pool_, location).has_value(),
+                    "selected Host parent changed before eviction");
+        }
+    }
+    CacheBlockRef block_ref = host_pool_->AcquireBlock(group_id, packing);
+    _assert(static_cast<bool>(block_ref), "evicting a Host parent did not free a placement");
+    return block_ref;
 }
 
 bool KvCacheCoordinator::evictCachedBlock(GroupId group_id, CacheBlockLocation location) {

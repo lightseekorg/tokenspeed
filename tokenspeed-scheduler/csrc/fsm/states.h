@@ -28,6 +28,7 @@
 // Put resources into each particular state
 namespace tokenspeed::fsm {
 
-using State = std::variant<Bootstrapping, Submitted, Prefilling, PrefillDone, Decoding, Finished>;
+using State = std::variant<Bootstrapping, Submitted, Prefilling, PrefillDone, Decoding, Retracting, Retracted,
+                           Recovering, Finished>;
 
 }  // namespace tokenspeed::fsm

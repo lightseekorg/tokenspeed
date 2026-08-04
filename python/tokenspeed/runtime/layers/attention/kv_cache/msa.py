@@ -15,6 +15,11 @@ class MSATokenToKVPool(MHATokenToKVPool):
 
     supports_hierarchical_kv_cache = False
 
+    def cache_transfer_layout(self):
+        raise RuntimeError(
+            "MSA Host L2 requires its index-K side cache in the transfer layout"
+        )
+
     def __init__(
         self,
         *,

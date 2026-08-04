@@ -108,6 +108,9 @@ struct FinishEvent : InvalidTransitionHandler<FinishEvent> {
 
     Finished operator()(PrefillDone&& state);
     Finished operator()(Decoding&& state);
+    Finished operator()(Retracting&& state);
+    Finished operator()(Retracted&& state);
+    Finished operator()(Recovering&& state);
     Finished operator()(Finished&& state) { return std::move(state); }
 
 private:
@@ -127,6 +130,9 @@ struct AbortEvent : InvalidTransitionHandler<AbortEvent> {
     Finished operator()(Prefilling&& state);
     Finished operator()(PrefillDone&& state);
     Finished operator()(Decoding&& state);
+    Finished operator()(Retracting&& state);
+    Finished operator()(Retracted&& state);
+    Finished operator()(Recovering&& state);
     Finished operator()(Finished&& state) { return std::move(state); }
 
 private:
@@ -134,6 +140,56 @@ private:
     Finished abortForward(State&& state);
 
     KvCacheCoordinator* coordinator_{};
+};
+
+struct BeginRetractionEvent : InvalidTransitionHandler<BeginRetractionEvent> {
+    using InvalidTransitionHandler<BeginRetractionEvent>::operator();
+
+    explicit BeginRetractionEvent(std::vector<BlockTable> host_tables)
+        : host_tables_{std::move(host_tables)} {}
+
+    Retracting operator()(Decoding&& state) {
+        return Retracting{std::move(state), std::move(host_tables_)};
+    }
+
+private:
+    std::vector<BlockTable> host_tables_;
+};
+
+struct CompleteRetractionEvent : InvalidTransitionHandler<CompleteRetractionEvent> {
+    using InvalidTransitionHandler<CompleteRetractionEvent>::operator();
+
+    explicit CompleteRetractionEvent(KvCacheCoordinator* coordinator) : coordinator_{coordinator} {}
+
+    Retracted operator()(Retracting&& state);
+
+private:
+    KvCacheCoordinator* coordinator_{};
+};
+
+struct CancelRetractionEvent : InvalidTransitionHandler<CancelRetractionEvent> {
+    using InvalidTransitionHandler<CancelRetractionEvent>::operator();
+
+    Decoding operator()(Retracting&& state) { return std::move(state.device_state); }
+};
+
+struct BeginRecoveryEvent : InvalidTransitionHandler<BeginRecoveryEvent> {
+    using InvalidTransitionHandler<BeginRecoveryEvent>::operator();
+
+    BeginRecoveryEvent(ReqPoolAllocator* req_pool_allocator, std::vector<BlockTable> device_tables)
+        : req_pool_allocator_{req_pool_allocator}, device_tables_{std::move(device_tables)} {}
+
+    Recovering operator()(Retracted&& state);
+
+private:
+    ReqPoolAllocator* req_pool_allocator_{};
+    std::vector<BlockTable> device_tables_;
+};
+
+struct CompleteRecoveryEvent : InvalidTransitionHandler<CompleteRecoveryEvent> {
+    using InvalidTransitionHandler<CompleteRecoveryEvent>::operator();
+
+    Decoding operator()(Recovering&& state);
 };
 
 // Release every request-owned page and requeue all accepted tokens as prefill.

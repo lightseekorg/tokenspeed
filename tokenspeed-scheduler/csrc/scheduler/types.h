@@ -41,11 +41,14 @@ struct SchedulerConfig {
 
     std::vector<PagedCacheGroupConfig> paged_cache_groups{};
 
-    // Streaming-sink enablement: an L2 host tier exists (> 1: page 0 is the null
-    // placeholder) and this role writes to it. Orthogonal to disable_prefix_cache by design:
-    // that flag gates MATCHING only, the sink gates STORING.
-    bool StreamingSinkEnabled() const {
-        return !disable_l2_cache && host_allocator.total_pages > 1 && role == Role::kFused;
+    // Ordinary L2 is a prefix tier. Decode keeps the same Host capacity only
+    // for request-owned retraction snapshots and never indexes it by prefix.
+    bool OrdinaryL2Enabled() const {
+        return !disable_l2_cache && host_allocator.total_pages > 1 && role != Role::kD;
+    }
+
+    bool DecodeSnapshotEnabled() const {
+        return !disable_l2_cache && host_allocator.total_pages > 1 && role == Role::kD;
     }
 
     std::int32_t max_scheduled_tokens{};

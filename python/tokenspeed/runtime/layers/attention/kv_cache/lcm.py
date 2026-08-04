@@ -98,6 +98,15 @@ class LcmCachePool:
             field_dtypes=field_dtypes,
         )
 
+    def transfer_layout(self, consumers):
+        from tokenspeed.runtime.cache.layout import layout_from_lcm_plan
+
+        return layout_from_lcm_plan(
+            self.plan,
+            self.backing,
+            consumers=tuple(tuple(consumer) for consumer in consumers),
+        )
+
     def _field_page_byte_offset(self, field_id: str, page_id: int) -> int:
         field = self.plan.field(field_id)
         group = self.plan.group(field.group_id)

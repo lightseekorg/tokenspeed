@@ -935,6 +935,8 @@ def build_lcm_pd_cache_contract(
     field_dtypes: Mapping[str, str],
 ) -> tuple[CachePDLayout, tuple[CachePDSlabRegistration, ...]]:
     """Describe one LCM arena without copying or flattening its backing."""
+    from tokenspeed.runtime.cache.layout import layout_from_lcm_plan
+
     groups = tuple(getattr(plan, "groups", ()))
     fields = tuple(getattr(plan, "fields", ()))
     planes = tuple(getattr(plan, "planes", ()))
@@ -953,8 +955,13 @@ def build_lcm_pd_cache_contract(
         )
 
     plan_groups = {group.group_id: group for group in groups}
-    plan_planes = {plane.plane_id: plane for plane in planes}
-    transfer_groups = []
+    transfer_layout = layout_from_lcm_plan(
+        plan,
+        backing,
+        consumers=(tuple(field.field_id for field in fields),),
+    )
+    transfer_groups = {group.group_id: group for group in transfer_layout.groups}
+    pd_groups = []
     for spec in specs:
         group = plan_groups[spec.group_id]
         transfer_policy = getattr(spec, "transfer_policy", None)
@@ -962,39 +969,30 @@ def build_lcm_pd_cache_contract(
             raise CachePDProtocolError(
                 f"LCM PD group {spec.group_id!r} requires a transfer policy"
             )
-        group_fields = tuple(
-            field for field in fields if field.group_id == spec.group_id
-        )
-        if not group_fields:
+        transfer_group = transfer_groups.get(spec.group_id)
+        if transfer_group is None or not transfer_group.segments:
             raise CachePDProtocolError(
                 f"LCM PD group {spec.group_id!r} has no planned fields"
             )
-        segments = []
-        for field in group_fields:
-            plane = plan_planes[field.plane_id]
-            segments.append(
-                CachePDTransferSegment(
-                    physical_slot=0,
-                    field_id=field.field_id,
-                    dtype=field_dtypes[field.field_id],
-                    page_zero_offset=(
-                        plane.arena_offset_bytes
-                        + plane.bytes_per_lcm_block
-                        - field.page_stride_bytes
-                        + field.field_offset_bytes
-                    ),
-                    page_stride_bytes=field.page_stride_bytes,
-                    payload_bytes=field.payload_bytes,
-                )
+        segments = tuple(
+            CachePDTransferSegment(
+                physical_slot=segment.buffer_index,
+                field_id=segment.segment_id,
+                dtype=field_dtypes[segment.segment_id],
+                page_zero_offset=segment.page_zero_offset,
+                page_stride_bytes=segment.page_stride_bytes,
+                payload_bytes=segment.payload_bytes,
             )
-        transfer_groups.append(
+            for segment in transfer_group.segments
+        )
+        pd_groups.append(
             CachePDGroup(
                 group_id=spec.group_id,
                 family=spec.family,
                 transfer_policy=transfer_policy,
                 physical_slots=(0,),
                 cache_blocks_per_lcm_block=group.cache_blocks_per_lcm_block,
-                transfer_segments=tuple(segments),
+                transfer_segments=segments,
             )
         )
 
@@ -1055,7 +1053,7 @@ def build_lcm_pd_cache_contract(
         num_pages_with_null=int(plan.num_lcm_blocks) + 1,
         physical_buffer_ids=("lcm_arena",),
         physical_page_bytes=int(plan.lcm_block_bytes),
-        groups=tuple(transfer_groups),
+        groups=tuple(pd_groups),
     )
 
     if (

@@ -299,6 +299,14 @@ public:
         const CacheEntries* cache_index = findCacheEntries(pool);
         return cache_index != nullptr && findEntry(*cache_index, key) != cache_index->entries.end();
     }
+    CacheBlockRef AcquireCachedBlock(const BlockPool& pool, const CacheKey& key) const {
+        const CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) {
+            return {};
+        }
+        ConstCacheEntryIterator entry_it = findEntry(*cache_index, key);
+        return entry_it == cache_index->entries.end() ? CacheBlockRef{} : entry_it->block_ref;
+    }
     bool ContainsCachedBlock(const BlockPool& pool, CacheBlockLocation location) const {
         const CacheEntries* cache_index = findCacheEntries(pool);
         return cache_index != nullptr && findEntry(*cache_index, location) != cache_index->entries.end();
@@ -334,14 +342,21 @@ public:
     }
 
     std::vector<CacheBlockLocation> EvictableBlockLocations(const BlockPool& pool) const {
+        return EvictableBlockLocationsAfterReleasing(pool, {});
+    }
+
+    std::vector<CacheBlockLocation> EvictableBlockLocationsAfterReleasing(
+        const BlockPool& pool, std::span<const CacheBlockLocation> released_locations) const {
         const CacheEntries* cache_index = findCacheEntries(pool);
         if (cache_index == nullptr) {
             return {};
         }
         std::vector<CacheBlockLocation> locations;
         for (const CacheEntry& cache_entry : cache_index->entries) {
-            if (cache_entry.block_ref.unique()) {
-                locations.push_back(cache_entry.block_ref->Location());
+            const CacheBlockLocation location = cache_entry.block_ref->Location();
+            const std::size_t released_owners = std::ranges::count(released_locations, location);
+            if (cache_entry.block_ref.use_count() == 1 + released_owners) {
+                locations.push_back(location);
             }
         }
         return locations;
@@ -388,7 +403,9 @@ public:
         return 0;
     }
     virtual std::vector<CacheBlockLocation> ReclaimableBlockLocationsAt(const BlockTable& /*table*/,
-                                                                        std::int32_t /*num_computed_tokens*/) const {
+                                                                        std::int32_t /*num_computed_tokens*/,
+                                                                        std::span<const CacheBlockLocation>
+                                                                        /*released_locations*/ = {}) const {
         return {};
     }
 

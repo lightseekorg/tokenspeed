@@ -88,6 +88,13 @@ class BaseTokenToKVPool:
         """Optional hook for model-specific paged-cache diagnostics."""
         return None
 
+    def cache_transfer_layout(self):
+        """Return the byte contract used by Host cache transfers."""
+
+        raise RuntimeError(
+            f"{type(self).__name__} does not publish a cache transfer layout"
+        )
+
     @torch.no_grad()
     def clear_kv_buffers(self) -> None:
         """Zero the KV buffers in place.

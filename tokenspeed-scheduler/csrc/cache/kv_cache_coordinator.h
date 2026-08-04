@@ -89,8 +89,8 @@ public:
     };
 
     // ProbePrefix is read-only. Cache state must not change before its
-    // result is passed to Admit. Admit consumes the probe even when admission
-    // fails. It returns nullopt before committing when capacity is unavailable.
+    // result is passed to Admit. Admit leaves the probe intact when capacity is
+    // unavailable so the caller may perform a hypothetical-release check.
     // A missing epoch starts a new request; a supplied epoch continues that
     // request. Once commit starts, an internal plan/pool mismatch is fatal
     // because partial commit is not rolled back.
@@ -101,6 +101,9 @@ public:
     PrefixProbe ProbeDecodeDestinationPrefix(std::span<const std::string> content_hashes) const;
     std::optional<AdmissionResult> Admit(PrefixProbe&& prefix, std::span<const GroupDemand> demands,
                                          std::optional<std::uint64_t> request_access_epoch = std::nullopt);
+    bool CanAdmitAfterReleasing(
+        const PrefixProbe& prefix, std::span<const GroupDemand> demands,
+        std::span<const std::pair<GroupId, CacheBlockLocation>> locations_released_on_ack) const;
 
     std::int32_t NumAvailableLcmBlocks() const;
 
@@ -115,12 +118,16 @@ public:
     void ReclaimExpired(std::span<BlockTable> tables, std::int32_t num_computed_tokens);
     void ConsumeReservedTokens(std::span<BlockTable> tables, std::int32_t num_tokens);
     void Free(std::span<BlockTable> tables);
+    // Clears only the Device prefix index. Returns false without mutation when
+    // any cached block still has an owner outside its Manager.
+    bool ClearDeviceCache();
 
     struct StoreCandidate {
         CacheKey key;
-        CacheBlockRef block_ref;  // pinned until WriteBackDone or a drain-time drop releases the ref
     };
     std::vector<StoreCandidate> TakePendingStores() { return std::exchange(pending_stores_, {}); }
+    CacheBlockRef AcquireDeviceCachedBlock(const CacheKey& key) const;
+    CacheBlockRef AcquireHostBlockForStore(GroupId group_id);
     // Collection/pinning follows host-tier presence, so the slide credit flips count_uncached on this.
     bool HasHostTier() const { return host_pool_ != nullptr; }
     bool ContainsHostCachedBlock(const CacheKey& key) const;

@@ -410,6 +410,43 @@ TEST(CoordinatorMatchTest, ProbeDoesNotRefreshAccessEpoch) {
     EXPECT_EQ(after->last_access_epoch, before->last_access_epoch);
 }
 
+TEST(KvCacheCoordinatorTest, ClearDeviceCacheLeavesHostCacheUntouched) {
+    BlockPool device_pool(4);
+    BlockPool host_pool(4);
+    const std::vector<KvCacheSpec> specs = {
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1}};
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, /*cache_block_tokens=*/4, device_pool, &host_pool);
+    const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}});
+
+    CacheForGroup(coordinator, device_pool, hashes[0], /*group_id=*/0);
+    CacheForGroup(coordinator, host_pool, hashes[0], /*group_id=*/0);
+
+    ASSERT_TRUE(coordinator.ClearDeviceCache());
+    const KvCacheCoordinator::PrefixProbe probe = coordinator.ProbePrefix(hashes);
+    EXPECT_EQ(probe.device.num_common_tokens, 0);
+    EXPECT_EQ(probe.host.num_common_tokens, 4);
+    EXPECT_EQ(device_pool.NumEmptyLcmBlocks(), 4);
+    EXPECT_EQ(host_pool.NumEmptyLcmBlocks(), 3);
+}
+
+TEST(KvCacheCoordinatorTest, ClearDeviceCacheRejectsPinnedEntryWithoutPartialMutation) {
+    BlockPool pool(4);
+    const std::vector<KvCacheSpec> specs = {
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1}};
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, /*cache_block_tokens=*/4, pool);
+    const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
+    CacheForGroup(coordinator, pool, hashes[0], /*group_id=*/0);
+    CacheForGroup(coordinator, pool, hashes[1], /*group_id=*/0);
+    CacheBlockRef pin = coordinator.AcquireDeviceCachedBlock(Key(hashes[0], /*group_id=*/0));
+
+    EXPECT_FALSE(coordinator.ClearDeviceCache());
+    EXPECT_EQ(coordinator.ProbePrefix(hashes).device.num_common_tokens, 8);
+
+    pin.reset();
+    EXPECT_TRUE(coordinator.ClearDeviceCache());
+    EXPECT_EQ(coordinator.ProbePrefix(hashes).device.num_common_tokens, 0);
+}
+
 std::vector<GroupDemand> FreshDemands(std::vector<BlockTable>& tables, std::span<const std::int32_t> tokens) {
     EXPECT_EQ(tables.size(), tokens.size());
     std::vector<GroupDemand> demands;
@@ -2231,7 +2268,7 @@ TEST(CoordinatorMatchTest, ThreeGroupsOneAllMissForcesZeroCommon) {
     EXPECT_EQ(m.num_common_tokens, 0) << "one group all-miss -> common 0";
 }
 
-TEST(KvCacheCoordinatorStoreCandidates, CollectsPinnedNewRegistrations) {
+TEST(KvCacheCoordinatorStoreCandidates, CollectsKeysWithoutPinningDeviceBlocks) {
     BlockPool pool(/*num_lcm_blocks=*/16);
     std::vector<KvCacheSpec> specs{
         KvCacheSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
@@ -2248,9 +2285,11 @@ TEST(KvCacheCoordinatorStoreCandidates, CollectsPinnedNewRegistrations) {
     std::vector<KvCacheCoordinator::StoreCandidate> pending = coordinator.TakePendingStores();
 
     ASSERT_EQ(pending.size(), 4u);  // 2 pages x 2 groups, group-wrapped keys
-    EXPECT_EQ(pool.NumEmptyLcmBlocks(), free_before) << "pinning ref'd blocks must not touch the free list";
-    for (const auto& candidate : pending) {
-        EXPECT_GE(candidate.block_ref.use_count(), 2) << "pinned on top of the table ref";
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), free_before);
+    for (const BlockTable& table : tables) {
+        for (const CacheBlockRef& block_ref : table.Blocks()) {
+            EXPECT_EQ(block_ref.use_count(), 2) << "only the request table and Device cache own the block";
+        }
     }
     // Typed keys keep the group distinct without changing the content hash.
     std::unordered_set<CacheKey, CacheKeyHash> keys;
@@ -2265,8 +2304,6 @@ TEST(KvCacheCoordinatorStoreCandidates, CollectsPinnedNewRegistrations) {
     CacheFullBlocksForTest(coordinator, tables, hashes, 0);
     EXPECT_TRUE(coordinator.TakePendingStores().empty());
 
-    // Unpin restores balance.
-    pending.clear();  // dropping the candidates releases the pins
     coordinator.Free(tables);
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 12);  // four Manager-owned cache entries remain resident
 }
@@ -2298,9 +2335,8 @@ std::int32_t SlideCredit(const KvCacheCoordinator& coord, std::span<const BlockT
     return total_freed;
 }
 
-// The exact slide-credit rule: collection-on credits a slide-out block only when it is CACHED
-// (an uncached one is this op's own registration and gets pinned before the slide); collection-off
-// keeps the unique-owner rule so uncached same-round registrations still free.
+// The exact slide-credit rule: collection-on credits a slide-out block only when it is cached;
+// a pending store key does not pin the Device block before an operation is emitted.
 TEST(KvCacheCoordinatorStoreCandidates, SlideCreditExcludesUncachedOnlyWhenCollecting) {
     BlockPool pool(16);
     std::vector<KvCacheSpec> specs{
@@ -2319,11 +2355,58 @@ TEST(KvCacheCoordinatorStoreCandidates, SlideCreditExcludesUncachedOnlyWhenColle
     EXPECT_EQ(SlideCredit(on, tables2, 8), 0) << "collection-on excludes uncached slide-out blocks";
 
     std::vector<std::string> hashes = ContentHashes({{1, 2}, {3, 4}});
-    CacheFullBlocksForTest(on, tables2, hashes, 0);  // registers + pins pages 0,1
-    EXPECT_EQ(SlideCredit(on, tables2, 8), 0) << "cached but still pinned: ref 2";
-    on.TakePendingStores();  // unpin, as WriteBackDone would: dropping the candidates releases the pins
-    EXPECT_EQ(SlideCredit(on, tables2, 8), 2) << "cached and unpinned: exact credit restored";
+    CacheFullBlocksForTest(on, tables2, hashes, 0);
+    EXPECT_EQ(SlideCredit(on, tables2, 8), 2) << "pending store keys do not change ownership";
+    on.TakePendingStores();
     on.Free(tables2);
+}
+
+TEST(KvCacheCoordinatorHostReplacement, ReusesOneColdChildBeforeRebindingAParent) {
+    BlockPool device_pool(2);
+    BlockPool host_pool(1);
+    std::vector<KvCacheSpec> specs{
+        KvCacheSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2},
+        KvCacheSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, &host_pool);
+    const CacheKey first = Key("first", 0);
+    const CacheKey second = Key("second", 0);
+    CacheBlockRef first_ref = host_pool.AcquireBlock(0, 2);
+    CacheBlockRef second_ref = host_pool.AcquireBlock(0, 2);
+    coordinator.CacheHostBlock(first_ref, first);
+    coordinator.CacheHostBlock(second_ref, second);
+    first_ref.reset();
+    second_ref.reset();
+
+    CacheBlockRef replacement = coordinator.AcquireHostBlockForStore(0);
+
+    ASSERT_TRUE(replacement);
+    EXPECT_EQ(host_pool.BoundGroup(replacement->Location().lcm_block_id), 0u);
+    EXPECT_EQ(coordinator.NumHostCachedBlocks(), 1);
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(first));
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(second));
+}
+
+TEST(KvCacheCoordinatorHostReplacement, RebindsACompleteEvictableParentAcrossGroups) {
+    BlockPool device_pool(2);
+    BlockPool host_pool(1);
+    std::vector<KvCacheSpec> specs{
+        KvCacheSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2},
+        KvCacheSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, &host_pool);
+    CacheBlockRef first = host_pool.AcquireBlock(0, 2);
+    CacheBlockRef second = host_pool.AcquireBlock(0, 2);
+    coordinator.CacheHostBlock(first, Key("first", 0));
+    coordinator.CacheHostBlock(second, Key("second", 0));
+    first.reset();
+    second.reset();
+
+    CacheBlockRef replacement = coordinator.AcquireHostBlockForStore(1);
+
+    ASSERT_TRUE(replacement);
+    EXPECT_EQ(host_pool.BoundGroup(replacement->Location().lcm_block_id), 1u);
+    EXPECT_EQ(coordinator.NumHostCachedBlocks(), 0);
 }
 
 // Publish a host page for (hash, group) directly (the scheduler's store path minus the

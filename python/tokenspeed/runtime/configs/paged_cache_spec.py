@@ -543,6 +543,17 @@ def group_specs_from_layer_types(
     return specs
 
 
+def layer_group_ids_from_layer_types(
+    layer_types: Sequence[str],
+    sliding_window_tokens: int | Sequence[int | None] | None,
+) -> tuple[str, ...]:
+    """Return the scheduler group selected for each model layer."""
+
+    return tuple(
+        group_id for group_id, _, _ in _layer_specs(layer_types, sliding_window_tokens)
+    )
+
+
 def publish_paged_cache_groups(
     *,
     layer_types: Sequence[str],

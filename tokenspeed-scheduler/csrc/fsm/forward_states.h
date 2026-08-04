@@ -198,6 +198,33 @@ private:
     std::int32_t reserve_num_tokens_in_next_schedule_event_{-1};
 };
 
+struct RetractionSnapshot {
+    TokenContainer* token_container{};
+    std::int32_t page_size{};
+    std::int32_t frontier_tokens{};
+    std::vector<BlockTable> host_tables;
+    CacheProgress cache_progress;
+    std::int32_t decode_reserve_tokens{};
+};
+
+// The Device state remains owned until the D2H acknowledgement commits the
+// complete snapshot. The Host tables are already pinned by strong refs.
+struct Retracting {
+    Decoding device_state;
+    std::vector<BlockTable> host_tables;
+};
+
+struct Retracted {
+    RetractionSnapshot snapshot;
+};
+
+// Host and newly allocated Device tables stay pinned together until H2D ACK.
+struct Recovering {
+    RetractionSnapshot snapshot;
+    std::unique_ptr<ReqPoolIndex> req_pool_index;
+    std::vector<BlockTable> device_tables;
+};
+
 struct Finished {};
 
 }  // namespace tokenspeed::fsm

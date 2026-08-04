@@ -131,6 +131,49 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         self.paged_cache_group_specs = tuple(specs)
         self.paged_cache_group_page_counts = counts
 
+    def cache_transfer_layout(self):
+        from tokenspeed.runtime.cache.layout import (
+            CacheGroupLayout,
+            CacheSegment,
+            CacheTransferLayout,
+        )
+
+        spec = self.paged_cache_group_specs[0]
+        buffers = []
+        segments = []
+        consumers = []
+        for layer_id, entry in enumerate(self.kv_buffer):
+            tensors = entry if isinstance(entry, tuple) else (entry,)
+            consumer = []
+            for field_index, tensor in enumerate(tensors):
+                row_bytes = int(tensor[0].numel() * tensor.element_size())
+                segment_id = f"layer.{layer_id}.field.{field_index}"
+                buffers.append(tensor)
+                segments.append(
+                    CacheSegment(
+                        segment_id=segment_id,
+                        buffer_index=len(buffers) - 1,
+                        page_zero_offset=0,
+                        page_stride_bytes=self.page_size * row_bytes,
+                        payload_bytes=self.page_size * row_bytes,
+                    )
+                )
+                consumer.append(segment_id)
+            consumers.append(tuple(consumer))
+        group = CacheGroupLayout(
+            group_id=spec.group_id,
+            cache_blocks_per_lcm_block=1,
+            page_count=self.size // self.page_size + 1,
+            segments=tuple(segments),
+        )
+        return CacheTransferLayout(
+            logical_block_tokens=self.page_size,
+            groups=(group,),
+            buffers=tuple(buffers),
+            consumers=tuple(consumers),
+            lcm_block_count=self.size // self.page_size,
+        )
+
     def _create_buffers(self) -> None:
         with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
             # The padded page 0 is used for writing dummy outputs from padded tokens.

@@ -1769,6 +1769,64 @@ TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
     EXPECT_EQ(request.ReserveNumTokensInNextScheduleEvent(), 3);
 }
 
+TEST(RetractionSnapshotFsmTest, PinsHostUntilRecoveryAck) {
+    BlockPool device_pool(/*num_lcm_blocks=*/12);
+    BlockPool host_pool(/*num_lcm_blocks=*/12);
+    std::vector<KvCacheSpec> specs{
+        KvCacheSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool);
+    ReqPoolAllocator req_pool{4};
+    RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*page_size=*/2)};
+    Request request{spec, /*page_size=*/2, Role::kD};
+    request.Apply(fsm::BootstrappedEvent{});
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    auto admission = AdmitForTest(coordinator, tables, GroupDemand{.num_tokens = 4, .reserve_tokens = 1});
+    ASSERT_TRUE(admission);
+    request.Apply(fsm::SchedulePrefillFirstChunkEvent{
+        /*tokens_this_round=*/4,
+        /*reserve_num_tokens_in_next_schedule_event=*/1,
+        &req_pool,
+        Role::kD,
+        &coordinator,
+        std::move(tables),
+        /*hit_tokens=*/0,
+        fsm::CacheProgress{.access_epoch = admission->access_epoch},
+        /*load_pairs=*/{},
+    });
+    request.Apply(fsm::RemotePrefillDoneEvent{/*token=*/42});
+    request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, request.CacheProgress()});
+    ASSERT_TRUE(request.Is<fsm::Decoding>());
+
+    std::vector<BlockTable> host_tables;
+    std::vector<CacheBlockRef> host_blocks;
+    for (const CacheBlockRef& block_ref : request.BlockTablesRef().front().Blocks()) {
+        host_blocks.push_back(block_ref ? host_pool.AcquireBlock(0, 1) : CacheBlockRef{});
+    }
+    host_tables.push_back(BlockTable::FromBlocks(std::move(host_blocks),
+                                                 request.BlockTablesRef().front().AvailableTokens()));
+    request.Apply(fsm::BeginRetractionEvent{std::move(host_tables)});
+    ASSERT_TRUE(request.Is<fsm::Retracting>());
+    request.Apply(fsm::CompleteRetractionEvent{&coordinator});
+    ASSERT_TRUE(request.Is<fsm::Retracted>());
+    EXPECT_LT(host_pool.NumEmptyLcmBlocks(), host_pool.NumLcmBlocks());
+
+    std::vector<CacheBlockRef> restored_blocks;
+    for (const CacheBlockRef& block_ref : request.RetractionSnapshotRef().host_tables.front().Blocks()) {
+        restored_blocks.push_back(block_ref ? device_pool.AcquireBlock(0, 1) : CacheBlockRef{});
+    }
+    std::vector<BlockTable> restored_tables;
+    restored_tables.push_back(BlockTable::FromBlocks(
+        std::move(restored_blocks), request.RetractionSnapshotRef().host_tables.front().AvailableTokens()));
+    request.Apply(fsm::BeginRecoveryEvent{&req_pool, std::move(restored_tables)});
+    ASSERT_TRUE(request.Is<fsm::Recovering>());
+    EXPECT_LT(host_pool.NumEmptyLcmBlocks(), host_pool.NumLcmBlocks());
+    request.Apply(fsm::CompleteRecoveryEvent{});
+
+    EXPECT_TRUE(request.Is<fsm::Decoding>());
+    EXPECT_EQ(host_pool.NumEmptyLcmBlocks(), host_pool.NumLcmBlocks());
+}
+
 // Drive the FSM directly to pin the PrefillDone retract overload.
 TEST(RetractEvent, PrefillDoneVictimReleasesPagesAndRequeues) {
     BlockPool pool(/*num_lcm_blocks=*/8);
@@ -2154,6 +2212,41 @@ TEST_F(PrefixHitSuite, FinishPublishesPagesFromLastForward) {
 
     // Finish before another scheduling round can publish the prefill pages.
     SendForwardDone("r1", {9001});
+    SendFinish("r1");
+    PlanOnce();
+
+    Submit(RequestSpec{.request_id = "r2", .tokens = first.tokens});
+    const ExecutionPlan second_plan = PlanOnce();
+    const ForwardBatch* second = FindForwardBatch(second_plan);
+    ASSERT_NE(second, nullptr);
+    ASSERT_EQ(second->request_ids.size(), 1u);
+    EXPECT_EQ(second->input_lengths.at(0), 2);
+    EXPECT_EQ(second->extend_prefix_lens.at(0), 6);
+}
+
+TEST_F(PrefixHitSuite, ClearL1CacheRemovesAnIdlePrefix) {
+    const RequestSpec first = MakeRequestSpec("r1", /*num_pages=*/4);
+    RunLifecycle(first);
+
+    ASSERT_TRUE(scheduler_->ClearL1Cache());
+    Submit(RequestSpec{.request_id = "r2", .tokens = first.tokens});
+    const ExecutionPlan second_plan = PlanOnce();
+    const ForwardBatch* second = FindForwardBatch(second_plan);
+    ASSERT_NE(second, nullptr);
+    ASSERT_EQ(second->request_ids.size(), 1u);
+    EXPECT_EQ(second->input_lengths.at(0), 8);
+    EXPECT_EQ(second->extend_prefix_lens.at(0), 0);
+}
+
+TEST_F(PrefixHitSuite, ClearL1CacheRejectsAnActiveRequestAndPreservesItsPrefix) {
+    const RequestSpec first = MakeRequestSpec("r1", /*num_pages=*/4);
+    Submit(first);
+    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
+    SendForwardDone("r1", {9001});
+    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
+
+    EXPECT_FALSE(scheduler_->ClearL1Cache());
+    SendForwardDone("r1", {9002});
     SendFinish("r1");
     PlanOnce();
 
@@ -2818,6 +2911,24 @@ TEST_F(StreamingSinkSuite, HostPoolExhaustionSkipsSilently) {
     SendWriteBackDone(wb1->op_ids.at(0), /*success=*/true);
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
     EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "everything balances after r1's commit";
+}
+
+TEST_F(StreamingSinkSuite, CommittedColdEntriesAreReplacedWhenHostPoolIsFull) {
+    ExecutionPlan finalize1 = RunToFinalize(MakeRequestSpec("r1", /*num_pages=*/4));
+    auto wb1 = FindWriteBack(finalize1);
+    ASSERT_TRUE(wb1.has_value());
+    FinishAndReap("r1");
+    SendWriteBackDone(wb1->op_ids.at(0), /*success=*/true);
+    ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
+    ASSERT_EQ(scheduler_->HostPoolFreeBlocks(), 0);
+
+    ExecutionPlan finalize2 = RunToFinalize(MakeRequestSpec("r2", /*num_pages=*/4, /*start=*/501));
+    auto wb2 = FindWriteBack(finalize2);
+    ASSERT_TRUE(wb2.has_value()) << "committed, unpinned Host entries are replaceable";
+    EXPECT_EQ(wb2->src_pages.at(0).size(), 6u);
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 0) << "old keys are removed before replacement D2H";
+    SendWriteBackDone(wb2->op_ids.at(0), /*success=*/true);
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
 }
 
 TEST_F(StreamingSinkSuite, SameRoundDuplicateKeysDedupeAtDrain) {

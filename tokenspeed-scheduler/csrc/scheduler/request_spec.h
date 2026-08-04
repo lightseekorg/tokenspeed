@@ -30,6 +30,7 @@ namespace tokenspeed {
 struct RequestSpec {
     std::string request_id;
     std::vector<std::int32_t> tokens;
+    std::int32_t max_new_tokens{0};
 };
 
 struct PrefillInfo {

@@ -175,5 +175,22 @@ class TestAttentionBackendChoices(unittest.TestCase):
         self.assertEqual(config.speculative_num_draft_tokens, 4)
 
 
+class TestDecodeHostL2(unittest.TestCase):
+    def test_decode_enables_host_l2_without_prefix_matching(self):
+        args = object.__new__(ServerArgs)
+        args.disaggregation_mode = "decode"
+        args.disable_kvstore = False
+        args.enable_kvstore = False
+        args.enable_prefix_caching = False
+        args.kvstore_storage_backend = None
+        args.kvstore_mem_layout = "layer_first"
+        args.kvstore_io_backend = "kernel"
+
+        args._handle_kvstore()
+        args.validate_cache_options()
+
+        self.assertTrue(args.enable_kvstore)
+
+
 if __name__ == "__main__":
     unittest.main()

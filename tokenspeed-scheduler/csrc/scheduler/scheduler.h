@@ -55,6 +55,9 @@ public:
     ExecutionPlan NextExecutionPlan();
     void Advance(const ExecutionEvent& event);
     std::vector<KvCacheEvent> DrainKvEvents();
+    // Testing/control-plane operation. A successful return means the complete
+    // Device L1 prefix cache was removed; Host L2 is never touched.
+    bool ClearL1Cache();
 
     std::size_t WaitingSize() const;
     std::size_t DecodingSize() const;
@@ -66,6 +69,7 @@ public:
     // otherwise reclaimable device pool. The runtime must enforce this limit
     // before submitting requests.
     std::int32_t MaxSingleRequestTokens() const { return max_single_request_tokens_; }
+    std::int32_t MaxHostSnapshotTokens() const { return max_host_snapshot_tokens_; }
 
     std::int32_t PagedCacheGroupTotalPages(const std::string& group_id) const;
     std::int32_t PagedCacheGroupAvailablePages(const std::string& group_id) const;
@@ -89,7 +93,7 @@ private:
     };
 
     std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> buildForwardOperations(
-        std::vector<Request*> candidates);
+        std::vector<Request*> candidates, std::vector<WriteBackOperation>& write_back_operations);
     std::optional<fsm::SchedulePrefillFirstChunkEvent> schedulePrefillFirstChunk(Request* request,
                                                                                  std::int32_t remaining,
                                                                                  std::int32_t decode_input_tokens);
@@ -113,7 +117,21 @@ private:
     void discardUncachedKvEventPages(std::span<const CacheKey> keys);
     void handleCacheMutation(const CacheKey& key, KvCacheCoordinator::CacheMutation mutation);
     void publishCompletedPages(Request& request);
-    void retractForCapacity(const std::vector<Request*>& candidates);
+    void retractForCapacity(const std::vector<Request*>& candidates,
+                            std::vector<WriteBackOperation>& write_back_operations);
+
+    struct PreparedTableCopy {
+        std::vector<BlockTable> destination_tables;
+        std::vector<CacheTransfer> transfers;
+        std::vector<CacheBlockRef> source_pins;
+        std::vector<CacheBlockRef> destination_pins;
+        std::vector<std::vector<std::int32_t>> new_page_ids;
+    };
+
+    std::optional<PreparedTableCopy> prepareHostSnapshot(const std::vector<BlockTable>& device_tables);
+    std::optional<PreparedTableCopy> prepareDeviceRestore(const std::vector<BlockTable>& host_tables);
+    std::optional<WriteBackOperation> beginRetraction(Request& request);
+    std::optional<LoadBackOperation> beginRecovery(Request& request);
 
     void emitPendingStores(std::vector<WriteBackOperation>& write_back_operations);
     cache_op_id allocateCacheOpId() { return next_cache_op_id_++; }
@@ -131,8 +149,11 @@ private:
     void handleEvent(const forward::Finish& event);
     void handleEvent(const forward::UpdateReserveNumTokens& event);
 
-    std::int32_t calculateMaxSingleRequestTokens() const;
+    std::int32_t calculateMaxSingleRequestTokens(std::int64_t usable_parents) const;
     std::int64_t singleRequestParentsRequired(std::int32_t token_limit) const;
+    bool preservesRetractionCapacityAfterAdmission(const Request& candidate) const;
+    bool preservesRetractionCapacityAfterRetraction(const Request& candidate) const;
+    bool preservesRetractionCapacityAfterRecovery(const Request& request) const;
 
     SchedulerConfig config_;
     ReqPoolAllocator req_pool_allocator_;
@@ -143,11 +164,13 @@ private:
     KvCacheCoordinator coordinator_;
     std::vector<std::string> cache_group_ids_;
     std::int32_t max_single_request_tokens_{0};
+    std::int32_t max_host_snapshot_tokens_{0};
 
     std::map<std::string, std::vector<std::int32_t>> new_page_ids_;
     std::unordered_map<std::string, std::int32_t> pending_forward_results_;
     std::unordered_set<std::string> pd_transfer_pins_;
     bool lcm_admission_failed_{false};
+    bool admission_waits_for_store_{false};
 
     struct StoreTicket {
         CacheKey key;
@@ -161,6 +184,7 @@ private:
         std::vector<StoreTicket> Retire(cache_op_id id);
         bool InFlight(const CacheKey& key) const { return keys_.contains(key); }
         bool Empty() const { return ops_.empty(); }
+        std::vector<std::pair<GroupId, CacheBlockLocation>> DeviceLocationsReleasedOnAck() const;
 
     private:
         std::unordered_map<cache_op_id, std::vector<StoreTicket>> ops_;
@@ -172,8 +196,16 @@ private:
         std::vector<CacheBlockRef> device_blocks;
     };
 
+    struct SnapshotTransferTicket {
+        std::string request_id;
+        std::vector<CacheBlockRef> source_pins;
+        std::vector<CacheBlockRef> destination_pins;
+    };
+
     StoreLedger store_ops_;
     std::unordered_map<cache_op_id, LoadTicket> load_ops_;
+    std::unordered_map<cache_op_id, SnapshotTransferTicket> retraction_ops_;
+    std::unordered_map<cache_op_id, SnapshotTransferTicket> recovery_ops_;
     cache_op_id next_cache_op_id_{0};
 
     std::unordered_map<std::string, std::unique_ptr<Request>> requests_;

@@ -214,6 +214,19 @@ class LcmMHATokenToKVPool(MHATokenToKVPool):
             raise RuntimeError("Paged cache PD requires an enabled MHA LCM pool")
         return self.lcm_pool.pd_contract(self.paged_cache_group_specs)
 
+    def cache_transfer_layout(self):
+        if self.lcm_pool is None:
+            raise RuntimeError("LCM backing is not allocated")
+        consumers = tuple(
+            tuple(
+                field.field_id
+                for field in self.lcm_pool.plan.fields
+                if field.field_id.startswith(f"layer.{layer_id}.")
+            )
+            for layer_id in range(self.layer_num)
+        )
+        return self.lcm_pool.transfer_layout(consumers)
+
     def get_lcm_field(self, field_id: str, dtype: torch.dtype) -> torch.Tensor:
         if self.lcm_pool is None:
             raise RuntimeError("LCM backing is not allocated")

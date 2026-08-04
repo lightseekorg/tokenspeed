@@ -1126,6 +1126,102 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
     def bind_paged_cache_scheduler(self, scheduler: object) -> None:
         self._paged_cache_scheduler = scheduler
 
+    def cache_transfer_layout(self):
+        if self.lcm_pool is not None:
+            consumers = []
+            for layer_id in range(self.layer_num):
+                prefix = f"layer.{layer_id}."
+                consumers.append(
+                    tuple(
+                        field.field_id
+                        for field in self._lcm_memory_plan.fields
+                        if field.field_id.startswith(prefix)
+                    )
+                )
+            return self.lcm_pool.transfer_layout(consumers)
+
+        from tokenspeed.runtime.cache.layout import (
+            CacheGroupLayout,
+            CacheSegment,
+            CacheTransferLayout,
+        )
+
+        specs = {spec.group_id: spec for spec in self.paged_cache_group_specs}
+        buffers = []
+        segments_by_group = {group_id: [] for group_id in specs}
+        consumers = []
+
+        def add_segment(group_id: str, segment_id: str, tensor: torch.Tensor):
+            payload_bytes = int(tensor[0].numel() * tensor.element_size())
+            buffers.append(tensor)
+            segments_by_group[group_id].append(
+                CacheSegment(
+                    segment_id=segment_id,
+                    buffer_index=len(buffers) - 1,
+                    page_zero_offset=0,
+                    page_stride_bytes=payload_bytes,
+                    payload_bytes=payload_bytes,
+                )
+            )
+            return segment_id
+
+        for layer_id, ratio in enumerate(self.layout.layer_ratio):
+            consumer = [
+                add_segment(
+                    V4_SWA_KV_GROUP_ID,
+                    f"layer.{layer_id}.swa",
+                    self.swa_kv_buffer[layer_id],
+                )
+            ]
+            if ratio > 1:
+                compressed_group = v4_compressed_kv_group_id(ratio)
+                consumer.append(
+                    add_segment(
+                        compressed_group,
+                        f"layer.{layer_id}.compressed_kv",
+                        self.compressed_kv_buffer[layer_id],
+                    )
+                )
+                consumer.append(
+                    add_segment(
+                        v4_compressor_state_group_id(ratio),
+                        f"layer.{layer_id}.compressor_state",
+                        self.compressor_state_buffer[layer_id],
+                    )
+                )
+                if ratio == 4:
+                    consumer.append(
+                        add_segment(
+                            compressed_group,
+                            f"layer.{layer_id}.indexer_kv",
+                            self.indexer_kv_buffer[layer_id],
+                        )
+                    )
+                    consumer.append(
+                        add_segment(
+                            V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
+                            f"layer.{layer_id}.indexer_state",
+                            self.indexer_state_buffer[layer_id],
+                        )
+                    )
+            consumers.append(tuple(consumer))
+        groups = tuple(
+            CacheGroupLayout(
+                group_id=spec.group_id,
+                cache_blocks_per_lcm_block=spec.cache_blocks_per_lcm_block,
+                page_count=self.paged_cache_group_page_counts[spec.group_id],
+                segments=tuple(segments_by_group[spec.group_id]),
+            )
+            for spec in self.paged_cache_group_specs
+        )
+        return CacheTransferLayout(
+            logical_block_tokens=self.page_size,
+            groups=groups,
+            buffers=tuple(buffers),
+            consumers=tuple(consumers),
+            lcm_block_count=self.num_pages - 1,
+        )
+
     def maybe_log_paged_cache_group_pages(self) -> None:
         scheduler = self._paged_cache_scheduler
         if self.rank != 0 or scheduler is None or not self._paged_cache_state_group_ids:

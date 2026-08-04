@@ -30,5 +30,6 @@ using token_t = std::int32_t;
 using token_vec_t = std::vector<token_t>;
 using token_slice = std::span<const token_t>;
 using cache_op_id = std::uint32_t;
+using GroupId = std::uint32_t;
 
 }  // namespace tokenspeed

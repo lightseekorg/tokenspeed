@@ -105,7 +105,9 @@ public:
     }
 
     std::vector<CacheBlockLocation> ReclaimableBlockLocationsAt(const BlockTable& table,
-                                                                std::int32_t num_computed_tokens) const override {
+                                                                std::int32_t num_computed_tokens,
+                                                                std::span<const CacheBlockLocation>
+                                                                    released_locations = {}) const override {
         const std::int32_t skipped_blocks = fullySlidOutBlocks(table, num_computed_tokens);
         std::vector<CacheBlockLocation> locations;
         for (std::int32_t i = skipped_blocks - 1; i >= 0; --i) {
@@ -114,7 +116,8 @@ public:
                 break;
             }
             const bool cached = ContainsCachedBlock(block);
-            if ((cached && block.use_count() == 2) || (!cached && block.unique())) {
+            const std::size_t released_owners = std::ranges::count(released_locations, block->Location());
+            if ((cached && block.use_count() == 2 + released_owners) || (!cached && block.unique())) {
                 locations.push_back(block->Location());
             }
         }

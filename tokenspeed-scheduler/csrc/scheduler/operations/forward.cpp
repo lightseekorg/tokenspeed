@@ -174,6 +174,11 @@ std::optional<KvCacheCoordinator::AdmissionResult> Scheduler::admit(KvCacheCoord
         coordinator_.Admit(std::move(prefix), demands, request_access_epoch);
     if (!result) {
         lcm_admission_failed_ = true;
+        if (!store_ops_.Empty()) {
+            const auto released_on_ack = store_ops_.DeviceLocationsReleasedOnAck();
+            admission_waits_for_store_ = admission_waits_for_store_ ||
+                                         coordinator_.CanAdmitAfterReleasing(prefix, demands, released_on_ack);
+        }
         return std::nullopt;
     }
 
@@ -373,7 +378,7 @@ PrefillOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::S
         return operation;
     }
 
-    std::vector<TransferPair> transfers;
+    std::vector<CacheTransfer> transfers;
     transfers.reserve(load_pairs.size());
     LoadTicket ticket;
     ticket.host_pins.reserve(load_pairs.size());
@@ -382,9 +387,10 @@ PrefillOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::S
         _assert(coordinator_.IsHostCachedBlock(pair.source->Location()),
                 "pinned host page lost its cache entry before load emission");
         const KvCacheManager& manager = coordinator_.GroupManager(static_cast<std::int32_t>(pair.group_id));
-        transfers.push_back(TransferPair{
-            manager.ResolveKernelPageId(pair.source->Location()),
-            manager.ResolveKernelPageId(pair.destination->Location()),
+        transfers.push_back(CacheTransfer{
+            .group_id = pair.group_id,
+            .source_page = manager.ResolveKernelPageId(pair.source->Location()),
+            .destination_page = manager.ResolveKernelPageId(pair.destination->Location()),
         });
         ticket.host_pins.push_back(std::move(pair.source));
         ticket.device_blocks.push_back(std::move(pair.destination));
@@ -411,21 +417,177 @@ DecodeOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::Sc
     return operation;
 }
 
-void Scheduler::retractForCapacity(const std::vector<Request*>& candidates) {
-    if (config_.role != Role::kFused || !lcm_admission_failed_ || !pending_forward_results_.empty() ||
-        !store_ops_.Empty() || !load_ops_.empty()) {
+std::optional<Scheduler::PreparedTableCopy> Scheduler::prepareHostSnapshot(
+    const std::vector<BlockTable>& device_tables) {
+    _assert(device_tables.size() == static_cast<std::size_t>(coordinator_.NumGroups()),
+            "snapshot requires one Device table per cache group");
+    PreparedTableCopy prepared;
+    prepared.destination_tables.reserve(device_tables.size());
+    for (std::size_t group_index = 0; group_index < device_tables.size(); ++group_index) {
+        const GroupId group_id = static_cast<GroupId>(group_index);
+        const KvCacheManager& manager = coordinator_.GroupManager(static_cast<std::int32_t>(group_index));
+        std::vector<CacheBlockRef> destination_blocks;
+        destination_blocks.reserve(static_cast<std::size_t>(device_tables[group_index].NumBlocks()));
+        for (const CacheBlockRef& source : device_tables[group_index].Blocks()) {
+            if (!source) {
+                destination_blocks.emplace_back();
+                continue;
+            }
+            CacheBlockRef destination = host_pool_.AcquireBlock(group_id, manager.CacheBlocksPerLcmBlock());
+            if (!destination) {
+                return std::nullopt;
+            }
+            prepared.transfers.push_back(CacheTransfer{
+                .group_id = group_id,
+                .source_page = manager.ResolveKernelPageId(source->Location()),
+                .destination_page = manager.ResolveKernelPageId(destination->Location()),
+            });
+            prepared.source_pins.push_back(source);
+            prepared.destination_pins.push_back(destination);
+            destination_blocks.push_back(std::move(destination));
+        }
+        prepared.destination_tables.push_back(BlockTable::FromBlocks(
+            std::move(destination_blocks), device_tables[group_index].AvailableTokens()));
+    }
+    return prepared;
+}
+
+std::optional<Scheduler::PreparedTableCopy> Scheduler::prepareDeviceRestore(
+    const std::vector<BlockTable>& host_tables) {
+    _assert(host_tables.size() == static_cast<std::size_t>(coordinator_.NumGroups()),
+            "snapshot requires one Host table per cache group");
+    std::vector<BlockTable> dense_tables(host_tables.size());
+    std::vector<GroupDemand> demands;
+    demands.reserve(host_tables.size());
+    for (std::size_t group_index = 0; group_index < host_tables.size(); ++group_index) {
+        const KvCacheManager& manager = coordinator_.GroupManager(static_cast<std::int32_t>(group_index));
+        const std::int32_t block_count = static_cast<std::int32_t>(
+            std::ranges::count_if(host_tables[group_index].Blocks(), [](const CacheBlockRef& block_ref) {
+                return static_cast<bool>(block_ref);
+            }));
+        demands.push_back(GroupDemand{
+            .table = &dense_tables[group_index],
+            .num_tokens = block_count * manager.CacheBlockTokens(),
+        });
+    }
+    // An empty prefix probe makes Admit the single placement/eviction engine
+    // while deliberately allocating a complete fresh Device snapshot.
+    std::optional<KvCacheCoordinator::AdmissionResult> allocation =
+        coordinator_.Admit(coordinator_.ProbePrefix({}), demands);
+    if (!allocation) {
+        return std::nullopt;
+    }
+
+    PreparedTableCopy prepared;
+    prepared.new_page_ids = std::move(allocation->new_page_ids);
+    prepared.destination_tables.reserve(host_tables.size());
+    for (std::size_t group_index = 0; group_index < host_tables.size(); ++group_index) {
+        const GroupId group_id = static_cast<GroupId>(group_index);
+        const KvCacheManager& manager = coordinator_.GroupManager(static_cast<std::int32_t>(group_index));
+        std::vector<CacheBlockRef> allocated = std::move(dense_tables[group_index]).TakeBlocks();
+        auto next = allocated.begin();
+        std::vector<CacheBlockRef> destination_blocks;
+        destination_blocks.reserve(static_cast<std::size_t>(host_tables[group_index].NumBlocks()));
+        for (const CacheBlockRef& source : host_tables[group_index].Blocks()) {
+            if (!source) {
+                destination_blocks.emplace_back();
+                continue;
+            }
+            _assert(next != allocated.end(), "snapshot allocation returned too few Device blocks");
+            CacheBlockRef destination = std::move(*next++);
+            prepared.transfers.push_back(CacheTransfer{
+                .group_id = group_id,
+                .source_page = manager.ResolveKernelPageId(source->Location()),
+                .destination_page = manager.ResolveKernelPageId(destination->Location()),
+            });
+            prepared.source_pins.push_back(source);
+            prepared.destination_pins.push_back(destination);
+            destination_blocks.push_back(std::move(destination));
+        }
+        _assert(next == allocated.end(), "snapshot allocation returned extra Device blocks");
+        prepared.destination_tables.push_back(BlockTable::FromBlocks(
+            std::move(destination_blocks), host_tables[group_index].AvailableTokens()));
+    }
+    return prepared;
+}
+
+std::optional<WriteBackOperation> Scheduler::beginRetraction(Request& request) {
+    auto prepared = prepareHostSnapshot(request.BlockTablesRef());
+    if (!prepared || !preservesRetractionCapacityAfterRetraction(request)) {
+        return std::nullopt;
+    }
+    const cache_op_id op_id = allocateCacheOpId();
+    SnapshotTransferTicket ticket{
+        .request_id = request.Id(),
+        .source_pins = std::move(prepared->source_pins),
+        .destination_pins = std::move(prepared->destination_pins),
+    };
+    request.Apply(fsm::BeginRetractionEvent{std::move(prepared->destination_tables)});
+    const bool inserted = retraction_ops_.emplace(op_id, std::move(ticket)).second;
+    _assert(inserted, "duplicate retraction cache op id");
+    return WriteBackOperation{op_id, std::move(prepared->transfers)};
+}
+
+std::optional<LoadBackOperation> Scheduler::beginRecovery(Request& request) {
+    const fsm::RetractionSnapshot& snapshot = request.RetractionSnapshotRef();
+    auto prepared = prepareDeviceRestore(snapshot.host_tables);
+    if (!prepared) {
+        return std::nullopt;
+    }
+    for (std::size_t group_index = 0; group_index < prepared->new_page_ids.size(); ++group_index) {
+        std::vector<std::int32_t>& pages = new_page_ids_[cache_group_ids_[group_index]];
+        std::ranges::move(prepared->new_page_ids[group_index], std::back_inserter(pages));
+    }
+    const cache_op_id op_id = allocateCacheOpId();
+    SnapshotTransferTicket ticket{
+        .request_id = request.Id(),
+        .source_pins = std::move(prepared->source_pins),
+        .destination_pins = std::move(prepared->destination_pins),
+    };
+    request.Apply(fsm::BeginRecoveryEvent{&req_pool_allocator_, std::move(prepared->destination_tables)});
+    const bool inserted = recovery_ops_.emplace(op_id, std::move(ticket)).second;
+    _assert(inserted, "duplicate recovery cache op id");
+    return LoadBackOperation{op_id, std::move(prepared->transfers)};
+}
+
+void Scheduler::retractForCapacity(const std::vector<Request*>& candidates,
+                                   std::vector<WriteBackOperation>& write_back_operations) {
+    if ((config_.role != Role::kFused && !config_.DecodeSnapshotEnabled()) || !lcm_admission_failed_ ||
+        !pending_forward_results_.empty() || admission_waits_for_store_ || !load_ops_.empty() ||
+        !retraction_ops_.empty() || !recovery_ops_.empty()) {
+        return;
+    }
+
+    if (config_.DecodeSnapshotEnabled()) {
+        std::vector<Request*> victims;
+        std::ranges::copy_if(candidates, std::back_inserter(victims),
+                             [](const Request* request) { return request->Is<fsm::Decoding>(); });
+        std::ranges::sort(victims, [](const Request* lhs, const Request* rhs) {
+            return lhs->TokenSize() != rhs->TokenSize() ? lhs->TokenSize() > rhs->TokenSize()
+                                                        : lhs->Id() < rhs->Id();
+        });
+        FatalCheck(!victims.empty(), "LCM admission failed without a retractable request");
+        // A failed preparation only drops temporary CacheBlockRefs, so trying
+        // the next victim has no scheduler-visible side effect.
+        for (Request* victim : victims) {
+            if (auto operation = beginRetraction(*victim)) {
+                write_back_operations.push_back(std::move(*operation));
+                spdlog::info("[Scheduler] retract: snapshotting request {} ({} tokens)", victim->Id(),
+                             victim->TokenSize());
+                return;
+            }
+        }
+        spdlog::warn("[Scheduler] retract: no running request fits the remaining Host snapshot capacity");
         return;
     }
 
     Request* request_to_retract = nullptr;
     for (Request* request : candidates) {
-        if (request->Is<fsm::Decoding>() || request->Is<fsm::PrefillDone>()) {
-            if (request_to_retract == nullptr || request->TokenSize() > request_to_retract->TokenSize()) {
-                request_to_retract = request;
-            }
+        if ((request->Is<fsm::Decoding>() || request->Is<fsm::PrefillDone>()) &&
+            (request_to_retract == nullptr || request->TokenSize() > request_to_retract->TokenSize())) {
+            request_to_retract = request;
         }
     }
-
     FatalCheck(request_to_retract != nullptr, "LCM admission failed without a retractable request");
     request_to_retract->Apply(fsm::RetractEvent{&coordinator_});
     spdlog::info("[Scheduler] retract: released request {} ({} tokens) for LCM capacity", request_to_retract->Id(),
@@ -433,8 +595,9 @@ void Scheduler::retractForCapacity(const std::vector<Request*>& candidates) {
 }
 
 std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Scheduler::buildForwardOperations(
-    std::vector<Request*> candidates) {
+    std::vector<Request*> candidates, std::vector<WriteBackOperation>& write_back_operations) {
     lcm_admission_failed_ = false;
+    admission_waits_for_store_ = false;
     const auto priority = [this](const Request* request) {
         if (request->Is<fsm::Prefilling>()) {
             return 1;
@@ -464,6 +627,13 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
 
     std::vector<ForwardOperation> operations;
     std::vector<LoadBackOperation> load_back_operations;
+    Request* retracted_request = nullptr;
+    for (Request* request : candidates) {
+        if (request->Is<fsm::Retracted>()) {
+            retracted_request = request;
+            break;
+        }
+    }
     std::int32_t token_budget = config_.max_scheduled_tokens;
     bool pushed_prefill = false;
     auto push_operation = [&](auto operation) {
@@ -510,6 +680,9 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
         }
 
         if (request->Is<fsm::Submitted>()) {
+            if (config_.role == Role::kD && !preservesRetractionCapacityAfterAdmission(*request)) {
+                continue;
+            }
             const std::int32_t decode_input_tokens = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
             const std::int32_t prefill_budget = config_.role == Role::kD ? request->PrefillSize() : token_budget;
             if (auto event = schedulePrefillFirstChunk(request, prefill_budget, decode_input_tokens)) {
@@ -539,8 +712,14 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
         }
     }
 
-    if (operations.empty()) {
-        retractForCapacity(candidates);
+    if (operations.empty() && lcm_admission_failed_) {
+        retractForCapacity(candidates, write_back_operations);
+    }
+    if (!lcm_admission_failed_ && retracted_request != nullptr &&
+        preservesRetractionCapacityAfterRecovery(*retracted_request)) {
+        if (auto recovery = beginRecovery(*retracted_request)) {
+            load_back_operations.push_back(std::move(*recovery));
+        }
     }
     return {std::move(operations), std::move(load_back_operations)};
 }

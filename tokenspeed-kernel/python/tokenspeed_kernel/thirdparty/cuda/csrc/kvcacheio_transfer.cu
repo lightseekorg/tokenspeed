@@ -24,6 +24,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -798,4 +799,113 @@ void transfer_kv_direct(
     }
     start_index = end_index;
   }
+}
+
+struct CacheSegmentCopy {
+  uintptr_t device_address;
+  uintptr_t host_address;
+  int64_t num_bytes;
+};
+
+__global__ void transfer_cache_segments_kernel(
+    const CacheSegmentCopy* segments,
+    int64_t direction) {
+  const CacheSegmentCopy segment = segments[blockIdx.x];
+  const auto* device = reinterpret_cast<const uint8_t*>(segment.device_address);
+  const auto* host = reinterpret_cast<const uint8_t*>(segment.host_address);
+  const uint8_t* source = direction == 0 ? device : host;
+  uint8_t* destination = direction == 0
+      ? reinterpret_cast<uint8_t*>(segment.host_address)
+      : reinterpret_cast<uint8_t*>(segment.device_address);
+  const int64_t first_offset =
+      (static_cast<int64_t>(blockIdx.y) * blockDim.x + threadIdx.x) * 16;
+  const int64_t stride = static_cast<int64_t>(gridDim.y) * blockDim.x * 16;
+  for (int64_t offset = first_offset; offset < segment.num_bytes; offset += stride) {
+#pragma unroll
+    for (int64_t i = 0; i < 16; ++i) {
+      if (offset + i < segment.num_bytes) {
+        destination[offset + i] = source[offset + i];
+      }
+    }
+  }
+}
+
+void transfer_cache_segments(
+    const std::vector<TensorView>& device_buffers,
+    TensorView host_backing,
+    TensorView descriptors,
+    int64_t direction) {
+  TVM_FFI_ICHECK(direction == 0 || direction == 1)
+      << "direction must be 0 (D2H) or 1 (H2D)";
+  CHECK_CPU(host_backing);
+  CHECK_CONTIGUOUS(host_backing);
+  CHECK_INPUT_TYPE(host_backing, dl_uint8);
+  CHECK_CPU(descriptors);
+  CHECK_CONTIGUOUS(descriptors);
+  CHECK_INPUT_TYPE(descriptors, dl_int64);
+  CHECK_DIM(2, descriptors);
+  TVM_FFI_ICHECK_EQ(descriptors.size(1), 4)
+      << "descriptors must have shape [N, 4]";
+  if (descriptors.size(0) == 0) {
+    return;
+  }
+  for (const TensorView& buffer : device_buffers) {
+    CHECK_CUDA(buffer);
+    CHECK_CONTIGUOUS(buffer);
+  }
+
+  void* mapped_host = nullptr;
+  check_cuda(
+      cudaHostGetDevicePointer(&mapped_host, host_backing.data_ptr(), 0),
+      "Host backing is pinned but not device-mapped");
+  const auto* rows = static_cast<const int64_t*>(descriptors.data_ptr());
+  std::vector<CacheSegmentCopy> copies;
+  copies.reserve(static_cast<size_t>(descriptors.size(0)));
+  int64_t max_bytes = 0;
+  for (int64_t i = 0; i < descriptors.size(0); ++i) {
+    const int64_t buffer_index = rows[i * 4];
+    const int64_t device_offset = rows[i * 4 + 1];
+    const int64_t host_offset = rows[i * 4 + 2];
+    const int64_t num_bytes = rows[i * 4 + 3];
+    TVM_FFI_ICHECK_GE(buffer_index, 0);
+    TVM_FFI_ICHECK_LT(buffer_index, static_cast<int64_t>(device_buffers.size()));
+    TVM_FFI_ICHECK_GE(device_offset, 0);
+    TVM_FFI_ICHECK_GE(host_offset, 0);
+    TVM_FFI_ICHECK_GT(num_bytes, 0);
+    const TensorView& buffer = device_buffers[static_cast<size_t>(buffer_index)];
+    TVM_FFI_ICHECK_LE(device_offset + num_bytes, buffer.numel() * get_element_size(buffer));
+    TVM_FFI_ICHECK_LE(host_offset + num_bytes, host_backing.numel());
+    copies.push_back(CacheSegmentCopy{
+        reinterpret_cast<uintptr_t>(buffer.data_ptr()) + static_cast<uintptr_t>(device_offset),
+        reinterpret_cast<uintptr_t>(mapped_host) + static_cast<uintptr_t>(host_offset),
+        num_bytes,
+    });
+    max_bytes = std::max(max_bytes, num_bytes);
+  }
+
+  const cudaStream_t stream = get_current_stream();
+  CacheSegmentCopy* device_copies = nullptr;
+  check_cuda(
+      cudaMallocAsync(
+          reinterpret_cast<void**>(&device_copies),
+          copies.size() * sizeof(CacheSegmentCopy),
+          stream),
+      "Failed to allocate cache transfer descriptors");
+  check_cuda(
+      cudaMemcpyAsync(
+          device_copies,
+          copies.data(),
+          copies.size() * sizeof(CacheSegmentCopy),
+          cudaMemcpyHostToDevice,
+          stream),
+      "Failed to upload cache transfer descriptors");
+  constexpr int64_t kThreads = 256;
+  constexpr int64_t kBytesPerBlock = kThreads * 16;
+  constexpr int64_t kMaxGridY = 65535;
+  const dim3 grid(
+      static_cast<unsigned int>(copies.size()),
+      static_cast<unsigned int>(std::min(div_up(max_bytes, kBytesPerBlock), kMaxGridY)));
+  transfer_cache_segments_kernel<<<grid, kThreads, 0, stream>>>(device_copies, direction);
+  check_cuda(cudaGetLastError(), "Failed to launch cache transfer kernel");
+  check_cuda(cudaFreeAsync(device_copies, stream), "Failed to free cache transfer descriptors");
 }

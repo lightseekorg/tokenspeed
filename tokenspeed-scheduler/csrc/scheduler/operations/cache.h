@@ -32,50 +32,58 @@
 
 namespace tokenspeed {
 
-struct TransferPair {
-    std::int32_t source{-1};
-    std::int32_t destination{-1};
+struct CacheTransfer {
+    GroupId group_id{0};
+    std::int32_t source_page{-1};
+    std::int32_t destination_page{-1};
 
-    bool operator==(const TransferPair& other) const {
-        return source == other.source && destination == other.destination;
-    }
+    bool operator==(const CacheTransfer&) const = default;
 };
 
-struct TransferPairHash {
-    std::size_t operator()(const TransferPair& pair) const {
-        const std::size_t source_hash = std::hash<std::int32_t>{}(pair.source);
-        const std::size_t destination_hash = std::hash<std::int32_t>{}(pair.destination);
-        return source_hash ^ (destination_hash + 0x9e3779b9 + (source_hash << 6) + (source_hash >> 2));
+struct CacheTransferHash {
+    std::size_t operator()(const CacheTransfer& transfer) const {
+        std::size_t seed = std::hash<GroupId>{}(transfer.group_id);
+        const auto combine = [&seed](std::int32_t value) {
+            const std::size_t hash = std::hash<std::int32_t>{}(value);
+            seed ^= hash + 0x9e3779b9U + (seed << 6U) + (seed >> 2U);
+        };
+        combine(transfer.source_page);
+        combine(transfer.destination_page);
+        return seed;
     }
 };
 
 struct WriteBackOperation {
     cache_op_id op_id{0};
-    std::vector<TransferPair> transfers;  // DEVICE→HOST.
+    std::vector<CacheTransfer> transfers;  // DEVICE→HOST.
 
     WriteBackOperation() = default;
-    WriteBackOperation(cache_op_id op_id, std::vector<TransferPair> transfers)
+    WriteBackOperation(cache_op_id op_id, std::vector<CacheTransfer> transfers)
         : op_id{op_id}, transfers{std::move(transfers)} {}
 };
 
 struct WriteBackBatch {
     std::vector<cache_op_id> op_ids;
+    std::vector<std::vector<GroupId>> group_ids;
     std::vector<std::vector<std::int32_t>> src_pages;
     std::vector<std::vector<std::int32_t>> dst_pages;
 
     explicit WriteBackBatch(const std::vector<WriteBackOperation>& ops) {
-        std::unordered_set<TransferPair, TransferPairHash> seen;
+        std::unordered_set<CacheTransfer, CacheTransferHash> seen;
         for (const auto& op : ops) {
+            std::vector<GroupId> operation_groups;
             std::vector<std::int32_t> operation_sources;
             std::vector<std::int32_t> operation_destinations;
             for (const auto& transfer : op.transfers) {
                 if (seen.insert(transfer).second) {
-                    operation_sources.push_back(transfer.source);
-                    operation_destinations.push_back(transfer.destination);
+                    operation_groups.push_back(transfer.group_id);
+                    operation_sources.push_back(transfer.source_page);
+                    operation_destinations.push_back(transfer.destination_page);
                 }
             }
 
             op_ids.push_back(op.op_id);
+            group_ids.push_back(std::move(operation_groups));
             src_pages.push_back(std::move(operation_sources));
             dst_pages.push_back(std::move(operation_destinations));
         }
@@ -84,31 +92,35 @@ struct WriteBackBatch {
 
 struct LoadBackOperation {
     cache_op_id op_id{0};
-    std::vector<TransferPair> transfers;  // HOST→DEVICE.
+    std::vector<CacheTransfer> transfers;  // HOST→DEVICE.
 
     LoadBackOperation() = default;
-    LoadBackOperation(cache_op_id op_id, std::vector<TransferPair> transfers)
+    LoadBackOperation(cache_op_id op_id, std::vector<CacheTransfer> transfers)
         : op_id{op_id}, transfers{std::move(transfers)} {}
 };
 
 struct LoadBackBatch {
     std::vector<cache_op_id> op_ids;
+    std::vector<std::vector<GroupId>> group_ids;
     std::vector<std::vector<std::int32_t>> src_pages;
     std::vector<std::vector<std::int32_t>> dst_pages;
 
     explicit LoadBackBatch(const std::vector<LoadBackOperation>& ops) {
-        std::unordered_set<TransferPair, TransferPairHash> seen;
+        std::unordered_set<CacheTransfer, CacheTransferHash> seen;
         for (const auto& op : ops) {
+            std::vector<GroupId> operation_groups;
             std::vector<std::int32_t> operation_sources;
             std::vector<std::int32_t> operation_destinations;
             for (const auto& transfer : op.transfers) {
                 if (seen.insert(transfer).second) {
-                    operation_sources.push_back(transfer.source);
-                    operation_destinations.push_back(transfer.destination);
+                    operation_groups.push_back(transfer.group_id);
+                    operation_sources.push_back(transfer.source_page);
+                    operation_destinations.push_back(transfer.destination_page);
                 }
             }
 
             op_ids.push_back(op.op_id);
+            group_ids.push_back(std::move(operation_groups));
             src_pages.push_back(std::move(operation_sources));
             dst_pages.push_back(std::move(operation_destinations));
         }

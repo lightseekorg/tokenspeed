@@ -40,7 +40,7 @@ namespace tokenspeed {
 
 class Request {
 public:
-    Request(const RequestSpec& spec, std::int32_t page_size, Role role);
+    Request(const RequestSpec& spec, std::int32_t page_size, Role role, std::int32_t max_snapshot_parents = 0);
 
     const std::string& Id() const { return id_; }
 
@@ -72,6 +72,7 @@ public:
     std::int32_t TokenSize() const { return token_container_.Size(); }
     std::int32_t LastToken() const { return token_container_.LastToken(); }
     std::int32_t PrefillSize() const { return token_container_.PrefillSize(); }
+    std::int32_t MaxSnapshotParents() const { return max_snapshot_parents_; }
 
     PrefillInfo CurrentPrefillInfo() const;
 
@@ -98,6 +99,13 @@ public:
 
     fsm::CacheProgress CacheProgress() const { return forwardState("CacheProgress").CacheProgressRef(); }
 
+    const fsm::RetractionSnapshot& RetractionSnapshotRef() const {
+        if (const auto* state = std::get_if<fsm::Retracted>(&state_)) {
+            return state->snapshot;
+        }
+        throw std::logic_error("Request::RetractionSnapshotRef: expected Retracted; got " + StateName());
+    }
+
     std::int32_t ReserveNumTokensInNextScheduleEvent() const {
         return std::visit(
             Overloaded{
@@ -119,6 +127,9 @@ public:
                               [](const fsm::Prefilling&) -> std::string { return "Prefilling"; },
                               [](const fsm::PrefillDone&) -> std::string { return "PrefillDone"; },
                               [](const fsm::Decoding&) -> std::string { return "Decoding"; },
+                              [](const fsm::Retracting&) -> std::string { return "Retracting"; },
+                              [](const fsm::Retracted&) -> std::string { return "Retracted"; },
+                              [](const fsm::Recovering&) -> std::string { return "Recovering"; },
                               [](const fsm::Finished&) -> std::string { return "Finished"; },
                           },
                           state_);
@@ -131,6 +142,7 @@ private:
     std::string id_;
     TokenContainer token_container_;
     std::int32_t page_size_{};
+    std::int32_t max_snapshot_parents_{};
     fsm::State state_;
 };
 

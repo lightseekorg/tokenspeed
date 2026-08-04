@@ -116,6 +116,14 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             int(kv_alloc_head_count) if kv_alloc_head_count else None
         )
         self._layer_types = tuple(layer_types or ())
+        if not hasattr(self, "layer_cache_group_ids"):
+            self.layer_cache_group_ids = (
+                paged_cache_spec.layer_group_ids_from_layer_types(
+                    self._layer_types, sliding_window_tokens
+                )
+                if self._layer_types
+                else ()
+            )
         self._pd_disaggregation_enabled = pd_disaggregation_enabled
         self._slab_group_size = hybrid_slab_group_size(
             self._layer_types,
@@ -165,6 +173,63 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         # Slab aliasing is only safe under the single-BlockPool ownership the
         # published groups configure.
         assert self._slab_group_size is None or self.paged_cache_group_specs
+        if not self.layer_cache_group_ids and self.paged_cache_group_specs:
+            self.layer_cache_group_ids = (
+                self.paged_cache_group_specs[0].group_id,
+            ) * self.layer_num
+
+    def cache_transfer_layout(self):
+        from tokenspeed.runtime.cache.layout import (
+            CacheGroupLayout,
+            CacheSegment,
+            CacheTransferLayout,
+        )
+
+        specs = {spec.group_id: spec for spec in self.paged_cache_group_specs}
+        buffers = []
+        segments_by_group = {group_id: [] for group_id in specs}
+        consumers = []
+        for layer_id, group_id in enumerate(self.layer_cache_group_ids):
+            spec = specs[group_id]
+            consumer = []
+            for kind, tensor in (
+                ("k", self.k_buffer[layer_id]),
+                ("v", self.v_buffer[layer_id]),
+            ):
+                if tensor is None:
+                    continue
+                view = self._layer_row_view(tensor, layer_id)
+                row_bytes = int(view[0].numel() * view.element_size())
+                segment_id = f"layer.{layer_id}.{kind}"
+                buffers.append(view)
+                segments_by_group[group_id].append(
+                    CacheSegment(
+                        segment_id=segment_id,
+                        buffer_index=len(buffers) - 1,
+                        page_zero_offset=0,
+                        page_stride_bytes=spec.rows_per_page * row_bytes,
+                        payload_bytes=spec.rows_per_page * row_bytes,
+                    )
+                )
+                consumer.append(segment_id)
+            consumers.append(tuple(consumer))
+        parent_count = self.size // self.page_size
+        groups = tuple(
+            CacheGroupLayout(
+                group_id=spec.group_id,
+                cache_blocks_per_lcm_block=spec.cache_blocks_per_lcm_block,
+                page_count=parent_count * spec.cache_blocks_per_lcm_block + 1,
+                segments=tuple(segments_by_group[spec.group_id]),
+            )
+            for spec in self.paged_cache_group_specs
+        )
+        return CacheTransferLayout(
+            logical_block_tokens=self.page_size,
+            groups=groups,
+            buffers=tuple(buffers),
+            consumers=tuple(consumers),
+            lcm_block_count=parent_count,
+        )
 
     def _publish_paged_cache_groups(
         self,

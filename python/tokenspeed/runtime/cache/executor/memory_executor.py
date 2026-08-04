@@ -18,13 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Host-tier executor for the paged cache.
-
-Drives batched writeback/loadback page pairs against the byte-blind
-:class:`HostMirror`. Loadbacks are acknowledged because the scheduler pins
-source host pages and destination device blocks until
-``Cache.LoadBackDoneEvent`` retires the operation.
-"""
+"""Descriptor-driven executor for compact Host cache transfers."""
 
 from __future__ import annotations
 
@@ -34,14 +28,12 @@ from typing import NamedTuple
 
 import psutil
 import torch
+from tokenspeed_kernel.ops.kvcache.host_transfer import transfer_cache_segments
 from tokenspeed_scheduler import Cache
 
-from tokenspeed.runtime.cache.host_mirror import (
-    HostMirror,
-    bytes_per_host_page,
-)
+from tokenspeed.runtime.cache.host_storage import HostCacheStorage
 from tokenspeed.runtime.cache.kvstore_controller import LayerDoneCounter
-from tokenspeed.runtime.cache.transfer.types import CacheKind
+from tokenspeed.runtime.cache.layout import combine_cache_transfer_layouts
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
 from tokenspeed.runtime.utils import get_colorful_logger, get_device_module
 
@@ -71,14 +63,7 @@ def _new_cache_stream(priority: int | None = None):
 
 
 def _ordered_unique(values: Iterable[int]) -> list[int]:
-    seen = set()
-    result = []
-    for value in values:
-        value = int(value)
-        if value not in seen:
-            seen.add(value)
-            result.append(value)
-    return result
+    return list(dict.fromkeys(int(value) for value in values))
 
 
 class _Ack(NamedTuple):
@@ -86,211 +71,161 @@ class _Ack(NamedTuple):
     op_ids: list[int]
 
 
-def num_host_pages(
-    *,
-    bytes_per_host_page: int,
-    device_pool_size: int,
-    page_size: int,
-    host_ratio: float,
-    host_size_gb: float,
+def _num_host_lcm_blocks(
+    *, parent_bytes: int, device_lcm_blocks: int, host_ratio: float, host_size_gb: float
 ) -> int:
-    """Host page budget from the kvstore sizing knobs (same knobs the single-table
-    ``HostKVCache`` resolves, kv_cache_host.py:91-102, budget arithmetic only):
-
-    - ``host_size_gb > 0``: explicit byte budget, floor to whole mirror pages
-      (never exceeds the requested bytes):
-      ``host_size_gb * 1e9 // bytes_per_host_page``.
-    - otherwise ratio sizing, mirroring the single-table token->page align-up:
-      ``int(device_pool_size * host_ratio) // page_size + 1``.
-    """
-    if bytes_per_host_page <= 0:
-        raise ValueError(f"bytes_per_host_page must be > 0, got {bytes_per_host_page}")
-    if page_size <= 0:
-        raise ValueError(f"page_size must be > 0, got {page_size}")
     if host_size_gb > 0:
-        num_pages = int(host_size_gb * 1e9 // bytes_per_host_page)
+        count = int(host_size_gb * 1e9 // parent_bytes)
     else:
-        num_pages = int(device_pool_size * host_ratio) // page_size + 1
-    if num_pages <= 0:
-        raise ValueError(
-            "host tier resolved to zero host pages "
-            f"(host_size_gb={host_size_gb}, host_ratio={host_ratio}, "
-            f"bytes_per_host_page={bytes_per_host_page}); increase the "
-            "kvstore size."
-        )
-    return num_pages
+        count = int(device_lcm_blocks * host_ratio)
+    if count <= 0:
+        raise ValueError("Host L2 resolved to zero LCM blocks")
+    return count
 
 
 class MemoryExecutor:
-    """Execute host-tier transfers for the paged cache.
+    """Execute group-aware D2H/H2D operations against one compact Host pool."""
 
-    Exposes the exact surface ``EventLoop`` drives: ``submit_plan`` /
-    ``poll_results`` / ``get_producer_index`` / ``set_consumer`` (plus the
-    ``host_exec.pools`` attribute walk in ``_setup_layerwise_loadback``).
-    """
-
-    # EventLoop keys per-op inflight accounting off this: loadbacks are
-    # acknowledged by LoadBackDoneEvent.
     emits_loadback_acks = True
 
-    def __init__(self, device_pool, *, host_ratio: float, host_size_gb: float):
-        self.page_size = int(device_pool.page_size)
-        self.layer_num = len(device_pool.k_buffer)
-
-        host_page_bytes = bytes_per_host_page(device_pool)
-        host_page_count = num_host_pages(
-            bytes_per_host_page=host_page_bytes,
-            device_pool_size=int(device_pool.size),
-            page_size=self.page_size,
+    def __init__(
+        self,
+        device_pool,
+        *,
+        draft_pool=None,
+        host_ratio: float,
+        host_size_gb: float,
+    ):
+        target_layout = device_pool.cache_transfer_layout()
+        draft_layout = (
+            draft_pool.cache_transfer_layout() if draft_pool is not None else None
+        )
+        self.layout = combine_cache_transfer_layouts(target_layout, draft_layout)
+        self.packed = self.layout.pack()
+        host_lcm_blocks = _num_host_lcm_blocks(
+            parent_bytes=self.packed.parent_bytes,
+            device_lcm_blocks=self.layout.num_lcm_blocks,
             host_ratio=host_ratio,
             host_size_gb=host_size_gb,
         )
-        requested_bytes = host_page_count * host_page_bytes
+        requested_bytes = host_lcm_blocks * self.packed.parent_bytes
         available_bytes = psutil.virtual_memory().available - _HOST_MEM_HEADROOM_BYTES
         if requested_bytes > available_bytes:
             raise ValueError(
-                f"Not enough host memory for the host tier. Requesting "
-                f"{requested_bytes / 1e9:.2f} GB but only have "
-                f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
-                f"size of the KVStore."
+                "Not enough Host memory for L2: requesting "
+                f"{requested_bytes / 1e9:.2f} GB, available "
+                f"{available_bytes / 1e9:.2f} GB"
             )
+        self.storage = HostCacheStorage(self.layout, num_lcm_blocks=host_lcm_blocks)
+        # C++ includes logical null parent 0 in allocator page counts.
+        self.num_host_pages = host_lcm_blocks + 1
         logger.info(
-            "Allocating %.2f GB pinned host memory for the host tier "
-            "(num_host_pages=%s bytes_per_host_page=%s host_size_gb=%r "
-            "host_ratio=%r device_pool.size=%r)",
+            "Allocated %.2f GB compact Host L2 (%s parents, %s bytes/parent)",
             requested_bytes / 1e9,
-            host_page_count,
-            host_page_bytes,
-            host_size_gb,
-            host_ratio,
-            device_pool.size,
+            host_lcm_blocks,
+            self.packed.parent_bytes,
         )
-        self.mirror = HostMirror(device_pool, host_page_count)
-        self.num_host_pages = host_page_count
 
-        # Layerwise loadback fencing: register the counter where the single-table
-        # KVCachePool would, so pool.get_key_buffer/get_value_buffer gate on
-        # the same wait_until(layer_id) machinery.
-        self._counter = LayerDoneCounter(self.layer_num)
-        device_pool.register_layer_transfer_counter(self._counter)
-        # _start_loading maps layer -> mirror V-tensor event and relies on
-        # load_events[-1] (LayerLoadingEvent.finish_event, reuse fence in
-        # update_producer) covering EVERY copy: it pins the last layer to
-        # the op's last per-tensor event, which without state slabs is the
-        # last layer's V event only if that V mirror is the last KV tensor
-        # pair. Holds for both layouts (legacy: identity; slab: last layer
-        # is the last occurrence of its group). A state last layer has no
-        # KV mirror at all -- its copies (state slabs trail every KV
-        # tensor) are covered by the events[-1] pin in _start_loading.
-        assert (
-            self.mirror.state_tensor_indices_of_layer(self.layer_num - 1) is not None
-            or self.mirror.tensor_index_of_layer(self.layer_num - 1)
-            == self.mirror.num_k_tensors - 1
-        ), "host tier: last layer's V mirror is not the last KV tensor pair"
-
+        pool_layouts = [(device_pool, target_layout)]
+        if draft_pool is not None:
+            pool_layouts.append((draft_pool, draft_layout))
+        self._consumer_counters = []
+        for pool, layout in pool_layouts:
+            counter = LayerDoneCounter(len(layout.consumers))
+            pool.register_layer_transfer_counter(counter)
+            self._consumer_counters.append((counter, len(layout.consumers)))
         write_priority, load_priority = _cache_stream_priorities()
         self.write_stream = _new_cache_stream(write_priority)
         self.load_stream = _new_cache_stream(load_priority)
 
-        # (device_page, host_page) pairs staged between submit() and flush().
-        self._pending_write_pairs: list[tuple[int, int]] = []
+        self._pending_write_transfers: list[tuple[int, int, int]] = []
         self._pending_write_op_ids: list[int] = []
-        self._pending_load_pairs: list[tuple[int, int]] = []
+        self._pending_load_transfers: list[tuple[int, int, int]] = []
         self._pending_load_op_ids: list[int] = []
         self.ack_write_queue: list[_Ack] = []
         self.ack_load_queue: list[_Ack] = []
-        # Ops whose page lists were empty on the wire (C++ dedups transfers
-        # across ops of one batched operation) and no batch event covers them.
         self._immediate_write_op_ids: list[int] = []
         self._immediate_load_op_ids: list[int] = []
-
         self._producer_map: OrderedDict[int, int] = OrderedDict()
         self._producer_map_limit = 1024
 
-        # Surface for EventLoop._setup_layerwise_loadback, which walks
-        # memory_executor.host_exec.pools to enumerate fencing kinds.
-        self.host_exec = self
-        self.pools = {CacheKind.KV: self.mirror}
-
-    # ------------------------------------------------------------------
-    # Submission
-    # ------------------------------------------------------------------
-
     def submit_plan(self, plan) -> None:
-        if plan.cache:
-            logger.debug("[cache_op] submit_plan: %s cache ops", len(plan.cache))
-        for op in plan.cache:
-            self.submit(op)
+        for operation in plan.cache:
+            self.submit(operation)
         self.flush()
 
-    def submit(self, op) -> None:
-        if isinstance(op, Cache.WriteBackOp):
-            self.submit_writeback(op.op_ids, op.src_pages, op.dst_pages)
-        elif isinstance(op, Cache.LoadBackOp):
-            self.submit_loadback(op.op_ids, op.src_pages, op.dst_pages)
-        else:
-            raise ValueError(
-                f"host tier: unsupported cache op kind {type(op).__name__}"
+    def submit(self, operation) -> None:
+        if isinstance(operation, Cache.WriteBackOp):
+            self._submit(
+                operation.op_ids,
+                operation.group_ids,
+                operation.src_pages,
+                operation.dst_pages,
+                pending_op_ids=self._pending_write_op_ids,
+                pending_transfers=self._pending_write_transfers,
+                source_is_device=True,
             )
+        elif isinstance(operation, Cache.LoadBackOp):
+            self._submit(
+                operation.op_ids,
+                operation.group_ids,
+                operation.src_pages,
+                operation.dst_pages,
+                pending_op_ids=self._pending_load_op_ids,
+                pending_transfers=self._pending_load_transfers,
+                source_is_device=False,
+            )
+        else:
+            raise ValueError(f"unsupported cache op {type(operation).__name__}")
 
+    @staticmethod
     def _submit(
-        self,
         op_ids: Sequence[int],
+        group_ids: Sequence[Sequence[int]],
         src_pages: Sequence[Sequence[int]],
         dst_pages: Sequence[Sequence[int]],
         *,
         pending_op_ids: list[int],
-        pending_pairs: list[tuple[int, int]],
-        src_is_device: bool,
+        pending_transfers: list[tuple[int, int, int]],
+        source_is_device: bool,
     ) -> None:
-        """Stage copies as (device_page, host_page) pairs; fail loud on a
-        ragged wire payload instead of silently dropping trailing ops."""
-        assert len(op_ids) == len(src_pages) == len(dst_pages), (
-            f"host tier: ragged cache-op payload (op_ids={len(op_ids)}, "
-            f"src_pages={len(src_pages)}, dst_pages={len(dst_pages)})"
-        )
-        for op_id, src, dst in zip(op_ids, src_pages, dst_pages):
-            assert len(src) == len(dst), (
-                f"host tier: op {op_id} src/dst page lists differ "
-                f"({len(src)} vs {len(dst)})"
-            )
+        if not (len(op_ids) == len(group_ids) == len(src_pages) == len(dst_pages)):
+            raise ValueError("ragged cache operation batch")
+        for op_id, groups, sources, destinations in zip(
+            op_ids, group_ids, src_pages, dst_pages
+        ):
+            if not (len(groups) == len(sources) == len(destinations)):
+                raise ValueError(f"ragged cache operation {op_id}")
             pending_op_ids.append(int(op_id))
-            device_pages, host_pages = (src, dst) if src_is_device else (dst, src)
-            pending_pairs.extend(
-                (int(d), int(h)) for d, h in zip(device_pages, host_pages)
-            )
+            for group, source, destination in zip(groups, sources, destinations):
+                device_page, host_page = (
+                    (source, destination) if source_is_device else (destination, source)
+                )
+                pending_transfers.append((int(group), int(device_page), int(host_page)))
 
-    def submit_writeback(
+    def _descriptors(
         self,
-        op_ids: Sequence[int],
-        src_pages: Sequence[Sequence[int]],
-        dst_pages: Sequence[Sequence[int]],
-    ) -> None:
-        """Stage device->host copies: src=device pages, dst=host pages."""
-        self._submit(
-            op_ids,
-            src_pages,
-            dst_pages,
-            pending_op_ids=self._pending_write_op_ids,
-            pending_pairs=self._pending_write_pairs,
-            src_is_device=True,
-        )
-
-    def submit_loadback(
-        self,
-        op_ids: Sequence[int],
-        src_pages: Sequence[Sequence[int]],
-        dst_pages: Sequence[Sequence[int]],
-    ) -> None:
-        """Stage host->device copies: src=host pages, dst=device pages."""
-        self._submit(
-            op_ids,
-            src_pages,
-            dst_pages,
-            pending_op_ids=self._pending_load_op_ids,
-            pending_pairs=self._pending_load_pairs,
-            src_is_device=False,
-        )
+        transfers: Sequence[tuple[int, int, int]],
+        segment_ids: set[str] | None = None,
+    ) -> list[tuple[int, int, int, int]]:
+        descriptors = []
+        for group_index, device_page, host_page in transfers:
+            group = self.layout.groups[group_index]
+            for segment_index, segment in enumerate(group.segments):
+                if segment_ids is not None and segment.segment_id not in segment_ids:
+                    continue
+                descriptors.append(
+                    (
+                        segment.buffer_index,
+                        segment.page_zero_offset
+                        + device_page * segment.page_stride_bytes,
+                        self.storage.segment_offset(
+                            group_index, host_page, segment_index
+                        ),
+                        segment.payload_bytes,
+                    )
+                )
+        return descriptors
 
     def flush(self) -> None:
         self._start_loading()
@@ -300,169 +235,137 @@ class MemoryExecutor:
         if not self._pending_write_op_ids:
             return
         op_ids = _ordered_unique(self._pending_write_op_ids)
-        pairs = self._pending_write_pairs
+        transfers = self._pending_write_transfers
         self._pending_write_op_ids = []
-        self._pending_write_pairs = []
-        if not pairs:
+        self._pending_write_transfers = []
+        if not transfers:
             self._immediate_write_op_ids.extend(op_ids)
             return
-        # Order the D2H copies after already-enqueued default-stream work
-        # (same fence the single-table _start_writing places).
-        start_event = torch.cuda.Event()
-        start_event.record()
-        start_event.wait(self.write_stream)
-        self.mirror.store_pages(pairs, self.write_stream)
-        finish_event = torch.cuda.Event()
-        finish_event.record(self.write_stream)
-        self.ack_write_queue.append(_Ack(finish_event, op_ids))
+        # Retraction is issued only after the scheduler has consumed every
+        # outstanding forward result. Still order this stream explicitly after
+        # current-stream work before reading the Device snapshot.
+        start = torch.cuda.Event()
+        start.record()
+        start.wait(self.write_stream)
+        transfer_cache_segments(
+            "d2h",
+            self.layout.buffers,
+            self.storage.backing,
+            self._descriptors(transfers),
+            self.write_stream,
+        )
+        finish = torch.cuda.Event()
+        finish.record(self.write_stream)
+        self.ack_write_queue.append(_Ack(finish, op_ids))
 
     def _start_loading(self) -> None:
         if not self._pending_load_op_ids:
             return
-        assert (
-            not get_is_capture_mode()
-        ), "cache loadback must run in eager admission iter"
+        if get_is_capture_mode():
+            raise RuntimeError("Host cache load must run outside CUDA Graph capture")
         op_ids = _ordered_unique(self._pending_load_op_ids)
-        pairs = self._pending_load_pairs
+        transfers = self._pending_load_transfers
         self._pending_load_op_ids = []
-        self._pending_load_pairs = []
-        if not pairs:
+        self._pending_load_transfers = []
+        if not transfers:
             self._immediate_load_op_ids.extend(op_ids)
             return
 
-        producer_id = self._counter.update_producer()
-        producer_event = self._counter.events[producer_id]
-        producer_event.start_event.record()
-        producer_event.start_event.wait(self.load_stream)
-
-        events = self.mirror.load_pages_with_events(pairs, self.load_stream)
-        # Layer fence: layer L is readable once its V mirror copy lands; the
-        # load stream is serial (all K copies precede all V copies), so the
-        # V-tensor event also covers L's K copy. Paired slab layers share the
-        # slab event -- correct by design. State layers instead fence on
-        # their ssm event: conv precedes ssm in tensor_pairs order (and both
-        # follow every KV tensor), so on the serial stream the ssm event
-        # covers the conv copy and the layer's KV copies -- the same
-        # K-before-V reasoning as above.
-        num_k = self.mirror.num_k_tensors
-        for layer_id in range(self.layer_num):
-            state_indices = self.mirror.state_tensor_indices_of_layer(layer_id)
-            if state_indices is not None:
-                producer_event.load_events[layer_id] = events[state_indices[1]]
-            else:
-                producer_event.load_events[layer_id] = events[
-                    num_k + self.mirror.tensor_index_of_layer(layer_id)
-                ]
-        # finish_event (== load_events[-1]) is the producer-slot reuse fence
-        # in update_producer and must cover EVERY copy of the op; state
-        # tensors copy after all KV tensors, so pin the last layer to the
-        # op's last per-tensor event. A no-op without state slabs: events[-1]
-        # is then the last layer's V event (ctor assert).
-        producer_event.load_events[self.layer_num - 1] = events[-1]
-        # events[-1] is also the reassigned finish_event, so the ack covers
-        # every copy.
-        self.ack_load_queue.append(_Ack(events[-1], op_ids))
+        # EventLoop zeroes freshly allocated Device pages before submitting the
+        # load. Recording the producer event here makes every layer-wise H2D
+        # copy wait for that zeroing; the per-layer load events then keep model
+        # consumers from reading a partially restored snapshot.
+        producer_id = None
+        consumer_offset = 0
+        finish = None
+        for counter, consumer_count in self._consumer_counters:
+            current_producer_id = counter.update_producer()
+            if producer_id is None:
+                producer_id = current_producer_id
+            elif current_producer_id != producer_id:
+                raise RuntimeError("target and draft Host-load counters diverged")
+            producer = counter.events[current_producer_id]
+            producer.start_event.record()
+            producer.start_event.wait(self.load_stream)
+            for layer_index in range(consumer_count):
+                consumer = self.layout.consumers[consumer_offset + layer_index]
+                transfer_cache_segments(
+                    "h2d",
+                    self.layout.buffers,
+                    self.storage.backing,
+                    self._descriptors(transfers, set(consumer)),
+                    self.load_stream,
+                )
+                finish = torch.cuda.Event()
+                finish.record(self.load_stream)
+                producer.load_events[layer_index] = finish
+            consumer_offset += consumer_count
+        if producer_id is None or finish is None:
+            raise RuntimeError("cache transfer layout has no layer consumers")
+        self.ack_load_queue.append(_Ack(finish, op_ids))
         for op_id in op_ids:
             self._producer_map[op_id] = producer_id
         while len(self._producer_map) > self._producer_map_limit:
             self._producer_map.popitem(last=False)
 
-    # ------------------------------------------------------------------
-    # Ack draining
-    # ------------------------------------------------------------------
-
     def poll_results(self) -> list:
-        results: list = []
-        for op_id in self._immediate_write_op_ids:
-            results.append(self._write_done(op_id))
+        results = [self._write_done(op_id) for op_id in self._immediate_write_op_ids]
         self._immediate_write_op_ids.clear()
-        for op_id in self._immediate_load_op_ids:
-            results.append(self._load_done(op_id))
+        results.extend(self._load_done(op_id) for op_id in self._immediate_load_op_ids)
         self._immediate_load_op_ids.clear()
-
-        remaining_writes = []
-        for ack in self.ack_write_queue:
-            if ack.finish_event.query():
-                results.extend(self._write_done(op_id) for op_id in ack.op_ids)
-            else:
-                remaining_writes.append(ack)
-        self.ack_write_queue[:] = remaining_writes
-
-        remaining_loads = []
-        for ack in self.ack_load_queue:
-            if ack.finish_event.query():
-                results.extend(self._load_done(op_id) for op_id in ack.op_ids)
-            else:
-                remaining_loads.append(ack)
-        self.ack_load_queue[:] = remaining_loads
-
-        if results:
-            for r in results:
-                logger.debug(
-                    "[cache_op] done op_id=%s success=%s type=%s",
-                    r.op_id,
-                    r.success,
-                    type(r).__name__,
-                )
+        self.ack_write_queue[:] = self._drain(
+            self.ack_write_queue, self._write_done, results
+        )
+        self.ack_load_queue[:] = self._drain(
+            self.ack_load_queue, self._load_done, results
+        )
         return results
 
     @staticmethod
+    def _drain(queue, done, results):
+        pending = []
+        for ack in queue:
+            if ack.finish_event.query():
+                results.extend(done(op_id) for op_id in ack.op_ids)
+            else:
+                pending.append(ack)
+        return pending
+
+    @staticmethod
     def _write_done(op_id: int):
-        evt = Cache.WriteBackDoneEvent()
-        evt.op_id = op_id
-        evt.success = True
-        return evt
+        event = Cache.WriteBackDoneEvent()
+        event.op_id = op_id
+        event.success = True
+        return event
 
     @staticmethod
     def _load_done(op_id: int):
-        evt = Cache.LoadBackDoneEvent()
-        evt.op_id = op_id
-        evt.success = True
-        return evt
+        event = Cache.LoadBackDoneEvent()
+        event.op_id = op_id
+        event.success = True
+        return event
 
-    # ------------------------------------------------------------------
-    # Layerwise loadback fencing (EventLoop._setup_layerwise_loadback)
-    # ------------------------------------------------------------------
-
-    def get_producer_index(
-        self, kind_or_op_id: CacheKind | str | int, op_id: int | None = None
-    ) -> int | None:
-        if op_id is None:
-            op_id = int(kind_or_op_id)
+    def get_producer_index(self, op_id: int):
         return self._producer_map.pop(int(op_id), None)
 
-    def set_consumer(
-        self,
-        kind_or_producer_index: CacheKind | str | int | Iterable[int],
-        producer_index: int | Iterable[int] | None = None,
-    ) -> None:
-        if producer_index is None:
-            producer_index = kind_or_producer_index
-        self._counter.set_consumer(producer_index)
-
-    # ------------------------------------------------------------------
-    # MemoryExecutor surface
-    # ------------------------------------------------------------------
-
-    def query_l3_pages(self, hashes: list[str]) -> int:
-        # No L3 storage tier is implemented for this executor (EventLoop refuses a
-        # storage backend up front); report zero hits.
-        return 0
+    def set_consumer(self, producer_index) -> None:
+        for counter, _ in self._consumer_counters:
+            counter.set_consumer(producer_index)
 
     def shutdown(self) -> None:
         self.write_stream.synchronize()
         self.load_stream.synchronize()
 
     def reset(self) -> None:
-        self.write_stream.synchronize()
-        self.load_stream.synchronize()
-        self._pending_write_pairs.clear()
+        self.shutdown()
+        self._pending_write_transfers.clear()
         self._pending_write_op_ids.clear()
-        self._pending_load_pairs.clear()
+        self._pending_load_transfers.clear()
         self._pending_load_op_ids.clear()
         self.ack_write_queue.clear()
         self.ack_load_queue.clear()
         self._immediate_write_op_ids.clear()
         self._immediate_load_op_ids.clear()
         self._producer_map.clear()
-        self._counter.reset()
+        for counter, _ in self._consumer_counters:
+            counter.reset()

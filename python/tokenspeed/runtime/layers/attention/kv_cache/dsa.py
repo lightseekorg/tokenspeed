@@ -61,6 +61,11 @@ class DSATokenToKVPool(MLATokenToKVPool):
             device=self.device,
         )
 
+    def cache_transfer_layout(self):
+        raise RuntimeError(
+            "DSA Host L2 requires its index-K side cache in the transfer layout"
+        )
+
     def _get_page_size_bytes(self):
         index_size_bytes = self.index_k_row_bytes
         return (

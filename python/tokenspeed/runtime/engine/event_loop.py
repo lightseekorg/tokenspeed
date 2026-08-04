@@ -35,7 +35,6 @@ from tokenspeed_scheduler import PD, Cache, ExecutionEvent, ForwardEvent, Schedu
 from tokenspeed.runtime.cache.executor.memory_executor import (
     MemoryExecutor,
 )
-from tokenspeed.runtime.cache.transfer.types import CacheKind
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.configs.paged_cache_spec import (
     validate_scheduler_config,
@@ -331,13 +330,9 @@ class EventLoop:
                     "the cache-group scheduler has no L3 storage tier; unset "
                     "--kvstore-storage-backend"
                 )
-            if getattr(token_to_kv_pool, "runtime_contract", None) is not None:
-                raise NotImplementedError(
-                    "the host tier does not support contract pools yet; pass "
-                    "--disable-kvstore"
-                )
             self.memory_executor = MemoryExecutor(
                 device_pool=token_to_kv_pool,
+                draft_pool=draft_token_to_kv_pool,
                 host_ratio=server_args.kvstore_ratio,
                 host_size_gb=server_args.kvstore_size,
             )
@@ -375,8 +370,6 @@ class EventLoop:
                 unsupported.append("layerwise cache transfer")
             if server_args.enable_memory_saver:
                 unsupported.append("memory saver/release")
-            if server_args.enable_kvstore:
-                unsupported.append("KVStore/host cache")
             # Prefill is forced onto the non-overlap loop by
             # should_use_overlap_schedule(). Decode uses the ordinary overlap
             # loop and the scheduler's one-step protected cache reservation.
@@ -436,6 +429,14 @@ class EventLoop:
             [group.group_id for group in paged_cache_groups],
         )
         self.scheduler = Scheduler(scheduler_cfg)
+        if server_args.disaggregation_mode == "decode" and server_args.enable_kvstore:
+            host_snapshot_tokens = self.scheduler.max_host_snapshot_tokens()
+            if host_snapshot_tokens < self.model_config.context_len:
+                raise RuntimeError(
+                    "Decode Host L2 must hold one max-context retraction "
+                    f"snapshot: capacity={host_snapshot_tokens}, "
+                    f"model_context_len={self.model_config.context_len}"
+                )
         self.max_single_request_tokens = self.scheduler.max_single_request_tokens()
         self.max_model_len = min(
             self.model_config.context_len, self.max_single_request_tokens
@@ -478,11 +479,11 @@ class EventLoop:
         # pause controller's drain machinery; frees memory via the memory-saver
         # adapter once the scheduler drains. See memory_occupation.py.
         # Releasing KV is only safe if any prefix cache it backs can be cleared:
-        # either prefix caching is off, or the scheduler exposes a reset. Decide
+        # either prefix caching is off, or the scheduler exposes a clear. Decide
         # once here (static config) and let the controller reject unsafe releases.
         kv_cache_release_allowed = (
             not self.server_args.enable_prefix_caching
-            or callable(getattr(self.scheduler, "reset_prefix_cache", None))
+            or callable(getattr(self.scheduler, "clear_l1_cache", None))
         )
         self._memory = MemoryOccupationController(
             send_func=self.send_to_tokenizer,
@@ -517,6 +518,7 @@ class EventLoop:
             recv_func=self.recv_from_tokenizer,
             send_func=self.send_to_tokenizer,
             get_load_fn=self._get_load,
+            clear_l1_cache_fn=self.scheduler.clear_l1_cache,
             architectures=self.model_config.hf_config.architectures,
             pause_controller=self._pause,
             memory_controller=self._memory,
@@ -997,29 +999,17 @@ class EventLoop:
         self._setup_layerwise_loadback(execution_plan)
 
     def _setup_layerwise_loadback(self, execution_plan) -> None:
-        host_exec = getattr(self.memory_executor, "host_exec", None)
-        available_pools = (
-            getattr(host_exec, "pools", {}) if host_exec is not None else {}
-        )
-        consumer_indices_by_kind: dict[CacheKind, list[int]] = {
-            kind: [] for kind in available_pools
-        }
+        consumer_indices = []
         for cache_op in execution_plan.cache:
             if isinstance(cache_op, Cache.LoadBackOp):
                 for op_id in cache_op.op_ids:
-                    for kind in consumer_indices_by_kind:
-                        producer_idx = self.memory_executor.get_producer_index(
-                            kind, op_id
-                        )
-                        if (
-                            producer_idx is not None
-                            and producer_idx not in consumer_indices_by_kind[kind]
-                        ):
-                            consumer_indices_by_kind[kind].append(producer_idx)
-        for kind, consumer_indices in consumer_indices_by_kind.items():
-            self.memory_executor.set_consumer(
-                kind, consumer_indices if consumer_indices else -1
-            )
+                    producer_index = self.memory_executor.get_producer_index(op_id)
+                    if (
+                        producer_index is not None
+                        and producer_index not in consumer_indices
+                    ):
+                        consumer_indices.append(producer_index)
+        self.memory_executor.set_consumer(consumer_indices or -1)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1525,12 +1515,12 @@ class EventLoop:
         KV pages are re-mapped + zeroed on wake, so any retained prefix entry
         would be stale. The unsafe case (prefix caching on with no reset) is
         rejected up front in ``MemoryOccupationController.handle_release`` via
-        ``kv_cache_release_allowed``, so by the time we get here either a reset
+        ``kv_cache_release_allowed``, so by the time we get here either a clear
         exists or prefix caching is off (nothing to invalidate).
         """
-        reset = getattr(self.scheduler, "reset_prefix_cache", None)
-        if callable(reset):
-            reset()
+        clear = getattr(self.scheduler, "clear_l1_cache", None)
+        if callable(clear) and not clear():
+            raise RuntimeError("L1 cache is still in use after scheduler drain")
 
     def _kv_pools(self) -> list:
         """All KV pools whose pages are tagged ``kv_cache`` — the target pool and

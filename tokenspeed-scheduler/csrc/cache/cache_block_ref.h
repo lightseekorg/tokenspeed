@@ -23,12 +23,12 @@
 #include <cstdint>
 #include <functional>
 
+#include "core/types.h"
+
 namespace tokenspeed {
 
 class BlockPool;
 class CacheBlockRef;
-
-using GroupId = std::uint32_t;
 
 // Stable logical placement of one cache block inside an LCM-sized physical
 // block. LCM block 0 remains reserved as the kernel null page.
