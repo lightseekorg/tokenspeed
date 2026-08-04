@@ -1177,7 +1177,7 @@ def _amd_rsag_cross_rank_barrier(
     signal_pad_ptrs_dev,
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
-    PEER_VECTOR_SIZE: tl.constexpr,
+    BARRIER_PEER_LANES: tl.constexpr,
 ):
     """Reusable centralized barrier for one subgroup per rank.
 
@@ -1203,7 +1203,7 @@ def _amd_rsag_cross_rank_barrier(
             scope="sys",
         )
 
-        peer_ids = tl.arange(0, PEER_VECTOR_SIZE)
+        peer_ids = tl.arange(0, BARRIER_PEER_LANES)
         peer_mask = (peer_ids > 0) & (peer_ids < WORLD_SIZE)
         remote_signals = tl.load(
             signal_ptrs + peer_ids,
@@ -1239,7 +1239,7 @@ def _amd_rsag_reduce_scatter_entry(
     signal_pad_ptrs_dev,
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
-    PEER_VECTOR_SIZE: tl.constexpr,
+    BARRIER_PEER_LANES: tl.constexpr,
 ):
     """Open a rank-local gate after one subgroup completes the RS entry barrier.
 
@@ -1262,7 +1262,7 @@ def _amd_rsag_reduce_scatter_entry(
             signal_pad_ptrs_dev,
             RANK,
             WORLD_SIZE,
-            PEER_VECTOR_SIZE,
+            BARRIER_PEER_LANES,
         )
     else:
         # Whichever subgroup starts first becomes the rank leader. This avoids
@@ -1283,7 +1283,7 @@ def _amd_rsag_reduce_scatter_entry(
                 signal_pad_ptrs_dev,
                 RANK,
                 WORLD_SIZE,
-                PEER_VECTOR_SIZE,
+                BARRIER_PEER_LANES,
             )
             tl.atomic_xchg(
                 entry_state,
@@ -1305,7 +1305,7 @@ def _amd_rsag_complete_grid(
     signal_pad_ptrs_dev,
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
-    PEER_VECTOR_SIZE: tl.constexpr,
+    BARRIER_PEER_LANES: tl.constexpr,
     RESET_ENTRY_STATE: tl.constexpr,
 ):
     """Elect the last local subgroup to perform the completion barrier.
@@ -1328,7 +1328,7 @@ def _amd_rsag_complete_grid(
             signal_pad_ptrs_dev,
             RANK,
             WORLD_SIZE,
-            PEER_VECTOR_SIZE,
+            BARRIER_PEER_LANES,
         )
         if RESET_ENTRY_STATE:
             entry_state = local_signal + entry_state_offset
@@ -1356,7 +1356,7 @@ def _amd_rsag_complete_grid(
                 signal_pad_ptrs_dev,
                 RANK,
                 WORLD_SIZE,
-                PEER_VECTOR_SIZE,
+                BARRIER_PEER_LANES,
             )
             tl.atomic_xchg(completion_count, 0, sem="relaxed", scope="gpu")
             if RESET_ENTRY_STATE:
@@ -1378,7 +1378,7 @@ def amd_rsag_all_gather_kernel(
     GLOBAL_OFFSET: tl.constexpr,
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
-    PEER_VECTOR_SIZE: tl.constexpr,
+    BARRIER_PEER_LANES: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -1403,7 +1403,7 @@ def amd_rsag_all_gather_kernel(
         signal_pad_ptrs_dev,
         RANK,
         WORLD_SIZE,
-        PEER_VECTOR_SIZE,
+        BARRIER_PEER_LANES,
         RESET_ENTRY_STATE=False,
     )
 
@@ -1417,14 +1417,14 @@ def amd_rsag_reduce_scatter_kernel(
     GLOBAL_OFFSET: tl.constexpr,
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
-    PEER_VECTOR_SIZE: tl.constexpr,
+    BARRIER_PEER_LANES: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     _amd_rsag_reduce_scatter_entry(
         signal_pad_ptrs_dev,
         RANK,
         WORLD_SIZE,
-        PEER_VECTOR_SIZE,
+        BARRIER_PEER_LANES,
     )
 
     pid = tl.program_id(0)
@@ -1455,7 +1455,7 @@ def amd_rsag_reduce_scatter_kernel(
         signal_pad_ptrs_dev,
         RANK,
         WORLD_SIZE,
-        PEER_VECTOR_SIZE,
+        BARRIER_PEER_LANES,
         RESET_ENTRY_STATE=True,
     )
 
@@ -1543,7 +1543,7 @@ def amd_rsag_reduce_scatter(
         GLOBAL_OFFSET=global_offset,
         RANK=state.symm_mem_hdl.rank,
         WORLD_SIZE=state.symm_mem_hdl.world_size,
-        PEER_VECTOR_SIZE=triton.next_power_of_2(state.symm_mem_hdl.world_size),
+        BARRIER_PEER_LANES=triton.next_power_of_2(state.symm_mem_hdl.world_size),
         BLOCK_SIZE=_AMD_RSAG_BLOCK_SIZE,
         num_warps=1,
     )
@@ -1585,7 +1585,9 @@ def amd_rsag_all_gather(
             GLOBAL_OFFSET=global_offset,
             RANK=state.symm_mem_hdl.rank,
             WORLD_SIZE=state.symm_mem_hdl.world_size,
-            PEER_VECTOR_SIZE=triton.next_power_of_2(state.symm_mem_hdl.world_size),
+            BARRIER_PEER_LANES=triton.next_power_of_2(
+                state.symm_mem_hdl.world_size
+            ),
             BLOCK_SIZE=_AMD_RSAG_BLOCK_SIZE,
             num_warps=1,
         )
