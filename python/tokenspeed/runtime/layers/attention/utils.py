@@ -72,45 +72,48 @@ def create_flashinfer_kv_indices_triton(
 
 def build_page_table(
     req_pool_indices: torch.Tensor,
-    req_to_page: torch.Tensor,
+    page_table: torch.Tensor,
     page_size: int,
     max_seq_len_k: int,
 ) -> torch.Tensor:
-    """Build page table from req_to_page.
+    """Build page table from a batch-ordered table.
 
-    req_to_page: [req_pool_size+1, max_pages] containing page IDs.
+    page_table: [bs, max_pages] page IDs, row i == batch position i (the
+    drafter's page table or the idle/warmup placeholder).
     Returns: [bs, max_pages_needed] page table slice.
     """
     max_pages = (max_seq_len_k + page_size - 1) // page_size
-    return req_to_page[req_pool_indices, :max_pages]
+    return page_table[: req_pool_indices.shape[0], :max_pages]
 
 
 def update_page_table_inplace(
     page_table_buf: torch.Tensor,
     req_pool_indices: torch.Tensor,
-    req_to_page: torch.Tensor,
+    page_table: torch.Tensor,
     page_size: int,
     max_seq_len_k: int,
 ):
-    """Copy page table from req_to_page into pre-allocated CUDA graph buffer."""
+    """Copy a batch-ordered page table into a pre-allocated CUDA graph buffer."""
     max_pages = (max_seq_len_k + page_size - 1) // page_size
-    page_table_buf[:, :max_pages].copy_(req_to_page[req_pool_indices, :max_pages])
+    page_table_buf[:, :max_pages].copy_(
+        page_table[: page_table_buf.shape[0], :max_pages]
+    )
 
 
 def token_indices_from_pages(
     req_pool_indices: torch.Tensor,
     token_positions: torch.Tensor,
-    req_to_page: torch.Tensor,
+    page_table: torch.Tensor,
     page_size: int,
 ) -> torch.Tensor:
-    """Convert token positions to KV slot indices using req_to_page.
+    """Convert token positions to KV slot indices using a batch-ordered table.
 
     token_positions: [bs, num_tokens] — token offsets within each request.
     Returns: [bs, num_tokens] — KV cache slot IDs (page_id * page_size + offset).
     """
     page_indices = token_positions // page_size
     offsets = token_positions % page_size
-    page_ids = req_to_page[req_pool_indices].gather(1, page_indices)
+    page_ids = page_table[: token_positions.shape[0]].gather(1, page_indices)
     return page_ids * page_size + offsets
 
 

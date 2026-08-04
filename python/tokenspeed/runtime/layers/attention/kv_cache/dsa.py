@@ -25,16 +25,22 @@ from tokenspeed_kernel.ops.kvcache.triton import index_k_block_split_scatter
 from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
 
 from tokenspeed.runtime.layers.attention.configs.dsa import dsa_index_k_row_bytes
-from tokenspeed.runtime.layers.attention.kv_cache.mla import (
-    MLATokenToKVPool,
-    _get_tensor_size_bytes,
-)
+from tokenspeed.runtime.layers.attention.kv_cache.lcm_mla import LcmMLATokenToKVPool
 
 _INDEX_K_FP8_GROUP_SIZE = 128
 _INDEX_K_SCALE_BYTES = torch._utils._element_size(torch.float32)
 
 
-class DSATokenToKVPool(MLATokenToKVPool):
+class DSATokenToKVPool(LcmMLATokenToKVPool):
+    """DSA (DeepSeek sparse attention) MLA pool on the shared LCM arena.
+
+    Extends the MLA latent-KV interface with a per-layer sparse index-K cache.
+    The index-K buffer lives in the same LCM arena as the latent KV (one
+    ``layer.{i}.index_k`` field per layer); ``_create_lcm_buffers`` binds those
+    field views, reshaped to the flat ``[num_slots, row_bytes]`` layout the
+    block-split FP8 scatter/gather kernels expect.
+    """
+
     def __init__(
         self,
         *args,
@@ -43,17 +49,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
     ):
         self.index_head_dim = int(index_head_dim)
         self.index_k_row_bytes = dsa_index_k_row_bytes(self.index_head_dim)
+        self.index_k_buffer: list[torch.Tensor] = []
         super().__init__(*args, **kwargs)
-
-        with self.memory_saver_adapter.region():
-            self.index_k_buffer = [
-                torch.zeros(
-                    (self.size + self.page_size, self.index_k_row_bytes),
-                    dtype=torch.uint8,
-                    device=self.device,
-                )
-                for _ in range(self.layer_num)
-            ]
 
         self.index_k_data_ptrs = torch.tensor(
             [buf.data_ptr() for buf in self.index_k_buffer],
@@ -61,34 +58,28 @@ class DSATokenToKVPool(MLATokenToKVPool):
             device=self.device,
         )
 
-    def _get_page_size_bytes(self):
-        index_size_bytes = self.index_k_row_bytes
-        return (
-            super()._get_page_size_bytes()
-            + self.page_size * self.layer_num * index_size_bytes
-        )
+    def _create_lcm_buffers(self) -> None:
+        super()._create_lcm_buffers()
+        assert self.lcm_pool is not None
+        self.index_k_buffer = [None] * self.layer_num
+        for layer_id in range(self.layer_num):
+            field = self.lcm_pool.field(f"layer.{layer_id}.index_k", torch.uint8)
+            # field is [page_count, page_size, row_bytes]; the DSA kernels want a
+            # flat [num_slots, row_bytes] buffer, and block-split views derive
+            # (page, slot) from a token's global slot index. as_strided in
+            # LcmCachePool keeps pages contiguous, so a plain reshape aliases the
+            # same storage.
+            page_elements = field.shape[1] * field.shape[2]
+            if field.stride(0) != page_elements:
+                raise ValueError(
+                    f"layer {layer_id} index-K pages have padding between pages"
+                )
+            self.index_k_buffer[layer_id] = field.reshape(-1, self.index_k_row_bytes)
 
     def get_kv_size_bytes(self):
-        return super().get_kv_size_bytes() + _get_tensor_size_bytes(self.index_k_buffer)
-
-    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
-        super().move_kv_cache(tgt_loc, src_loc)
-        if tgt_loc.numel() == 0:
-            return
-        tgt_loc_flat = tgt_loc.view(-1).long()
-        src_loc_flat = src_loc.view(-1).long()
-        for buf in self.index_k_buffer:
-            # Packed FP8 index-K is block-split per page, so a single token's
-            # bytes are NOT a contiguous row; move the FP8 values and FP32
-            # scales through their block-split views instead.
-            fp8_view, scale_view = self._index_k_block_views(buf)
-            ps = self.page_size
-            tgt_page = tgt_loc_flat // ps
-            tgt_slot = tgt_loc_flat % ps
-            src_page = src_loc_flat // ps
-            src_slot = src_loc_flat % ps
-            fp8_view[tgt_page, tgt_slot] = fp8_view[src_page, src_slot]
-            scale_view[tgt_page, tgt_slot] = scale_view[src_page, src_slot]
+        # The index-K field shares the single LCM arena already counted by the
+        # base pool, so there is nothing extra to charge here.
+        return super().get_kv_size_bytes()
 
     def has_index_k_buffer(self) -> bool:
         return True
@@ -204,42 +195,4 @@ class DSATokenToKVPool(MLATokenToKVPool):
             page_size=self.page_size,
             head_dim=self.index_head_dim,
             group_size=_INDEX_K_FP8_GROUP_SIZE,
-        )
-
-    def get_contiguous_buf_infos(self):
-        data_ptrs, data_lens, item_lens = super().get_contiguous_buf_infos()
-        data_ptrs = list(data_ptrs)
-        data_lens = list(data_lens)
-        item_lens = list(item_lens)
-        for buf in self.index_k_buffer:
-            data_ptrs.append(buf.data_ptr())
-            data_lens.append(buf.nbytes)
-            item_lens.append(buf[0].nbytes * self.page_size)
-        return data_ptrs, data_lens, item_lens
-
-    def get_layerwise_buf_info_offsets(self, start_idx=0):
-        offsets = super().get_layerwise_buf_info_offsets(start_idx)
-        if self.quant_method == "per_token_head":
-            base_count = 3 * self.layer_num
-        else:
-            base_count = self.layer_num
-        return [
-            layer_offsets + [start_idx + base_count + layer_id]
-            for layer_id, layer_offsets in enumerate(offsets)
-        ]
-
-    def get_cpu_copy(self, token_indices: list[int]) -> torch.Tensor:
-        del token_indices
-        raise NotImplementedError(
-            "DSA KV cache offload is not implemented; sparse/indexer cache "
-            "buffers require page-aware layout handling."
-        )
-
-    def load_cpu_copy(
-        self, kv_cache_cpu: torch.Tensor, token_indices: list[int]
-    ) -> None:
-        del kv_cache_cpu, token_indices
-        raise NotImplementedError(
-            "DSA KV cache reload is not implemented; sparse/indexer cache "
-            "buffers require page-aware layout handling."
         )

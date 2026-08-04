@@ -49,7 +49,6 @@ class ForwardContext:
     num_extends: int
     input_num_tokens: int
     forward_mode: ForwardMode | None
-    req_to_page: torch.Tensor | None = None
     capture_hidden_mode: CaptureHiddenMode | None = CaptureHiddenMode.NULL
     # Normalized explicit decode input overrides for this forward, if any.
     decode_input_ids: list[int] | None = None

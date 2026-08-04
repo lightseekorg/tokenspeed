@@ -155,16 +155,15 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
 
     def test_build_page_table_keeps_single_table_direct_copy_path(self):
         b = self._bare_backend(page_size=64, max_num_pages=4)
-        req_to_page = self.torch.tensor(
-            [[0, 0, 0, 0], [3, 5, 7, 9]], dtype=self.torch.int32
-        )
+        # Batch-ordered table: row i == batch position i.
+        page_table = self.torch.tensor([[3, 5, 7, 9]], dtype=self.torch.int32)
         out = self.torch.empty((1, 4), dtype=self.torch.int32)
 
         page_table = b._build_page_table(
             self.torch.tensor([1], dtype=self.torch.int32),
             self.torch.tensor([256], dtype=self.torch.int32),
             1,
-            req_to_page,
+            page_table,
             out,
         )
 
@@ -183,7 +182,7 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
             req_pool_indices=self.torch.tensor([0], dtype=self.torch.int32),
             seq_lens=self.torch.tensor([129], dtype=self.torch.int32),
             forward_mode=_DecodeMode(),
-            req_to_page=None,
+            page_table=None,
             block_tables={
                 "full_attention": self.torch.tensor([[3, 5]], dtype=self.torch.int32)
             },
@@ -231,7 +230,7 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
             bs,
             req_pool_indices=self.torch.tensor([0, 1], dtype=self.torch.int32),
             seq_lens=seq_lens,
-            req_to_page=None,
+            page_table=None,
             group_page_tables=tables,
             group_out_cache_locs=locs,
         )
@@ -263,7 +262,7 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
             bs,
             req_pool_indices=self.torch.tensor([0], dtype=self.torch.int32),
             seq_lens=seq_lens,
-            req_to_page=None,
+            page_table=None,
             extend_seq_lens_cpu=self.torch.tensor([2], dtype=self.torch.int32),
             group_page_tables=tables,
             group_out_cache_locs=locs,
@@ -354,7 +353,7 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
             req_pool_indices=self.torch.tensor([0, 1], dtype=self.torch.int32),
             seq_lens=seq_lens,
             forward_mode=_DecodeMode(),
-            req_to_page=None,
+            page_table=None,
             block_tables=tables,
         )
         meta = b.forward_prefill_metadata
@@ -441,7 +440,7 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
                 req_pool_indices=self.torch.tensor([0], dtype=self.torch.int32),
                 seq_lens=self.torch.tensor([1], dtype=self.torch.int32),
                 forward_mode=_DecodeMode(),
-                req_to_page=None,
+                page_table=None,
                 block_tables=tables,
             )
 

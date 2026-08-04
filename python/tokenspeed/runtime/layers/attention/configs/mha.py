@@ -135,40 +135,10 @@ class MHAConfig(BaseAttnConfig):
         rank: int,
         enable_memory_saver: bool,
     ) -> BaseTokenToKVPool:
-        if self.kv_cache_mxfp8:
-            assert self.page_size == 128, (
-                "mxfp8 KV cache requires --block-size 128 (the attention "
-                "kernel consumes the interleaved paged scale layout)"
-            )
-
-        from tokenspeed.runtime.layers.attention.kv_cache.mha import (
-            MHATokenToKVPool,
-            MHATokenToKVPoolMXFP8,
-        )
-
-        pool_cls = MHATokenToKVPoolMXFP8 if self.kv_cache_mxfp8 else MHATokenToKVPool
-
-        return pool_cls(
-            size=max_total_num_tokens,
-            dtype=self.kv_cache_dtype,
-            head_num=max(self.num_kv_heads // self.attn_tp_size, 1),
-            head_dim=self.head_dim,
-            layer_num=num_layers,
-            device=self.device,
-            enable_memory_saver=enable_memory_saver,
-            max_batch_size=self.max_bs,
-            max_context_len=self.context_len,
-            page_size=self.page_size,
-            rank=rank,
-            layer_types=self.layer_types,
-            sliding_window_tokens=self.sliding_window_tokens,
-            max_scheduled_tokens=self.max_scheduled_tokens,
-            pd_disaggregation_enabled=self.pd_disaggregation_enabled,
-            extra_paged_groups=self.extra_paged_groups,
-            slot_tokens=self.slot_tokens,
-            group_page_sizes=self.group_page_sizes,
-            layer_kv_head_counts=self.layer_kv_head_counts,
-            # Pre-TP width the slab rows are allocated at (head_num is its
-            # per-rank shard) — the per-layer view normalization base.
-            kv_alloc_head_count=self.num_kv_heads,
+        raise RuntimeError(
+            "Every KV pool now runs on the shared LCM arena with a "
+            "PagedCacheRuntimeContract; the classic MHA pool path was removed. "
+            "This model family has no LCM recipe yet: add one in "
+            "lcm_setup.prepare_lcm_setup (see the 'plain_mha' and 'msa' "
+            "recipes for the pattern) and gate it in registry.lcm_family."
         )

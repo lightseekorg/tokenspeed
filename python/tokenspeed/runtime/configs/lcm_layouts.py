@@ -159,6 +159,130 @@ def mla_history_lcm_fields(
     return tuple(fields)
 
 
+def plain_mha_lcm_fields(
+    *,
+    layer_types,
+    layer_group_ids,
+    logical_block_tokens,
+    kv_shape,
+    kv_element_size,
+) -> tuple[LcmFieldSpec, ...]:
+    """Describe a plain MHA/GQA model's per-layer K and V history pages.
+
+    No recurrent state: every layer contributes one K field and one V field of
+    ``kv_shape``. ``layer_group_ids`` splits full-attention from sliding-window
+    layers; K and V of a layer share that layer's occurrence unit plane so the
+    planner packs them together.
+    """
+    if len(layer_types) != len(layer_group_ids):
+        raise ValueError(
+            f"layer_types has {len(layer_types)} entries but layer_group_ids "
+            f"has {len(layer_group_ids)}"
+        )
+    if tuple(kv_shape)[0] != logical_block_tokens:
+        raise ValueError("kv_shape must start with logical_block_tokens")
+    if kv_element_size <= 0:
+        raise ValueError("kv_element_size must be positive")
+
+    occurrences: dict[str, int] = {}
+    fields = []
+    for layer_id, group_id in enumerate(layer_group_ids):
+        unit = occurrences.get(group_id, 0)
+        occurrences[group_id] = unit + 1
+        fields.extend(
+            (
+                LcmFieldSpec(
+                    group_id,
+                    f"layer.{layer_id}.k",
+                    f"unit.{unit}.a",
+                    tuple(kv_shape),
+                    kv_element_size,
+                ),
+                LcmFieldSpec(
+                    group_id,
+                    f"layer.{layer_id}.v",
+                    f"unit.{unit}.b",
+                    tuple(kv_shape),
+                    kv_element_size,
+                ),
+            )
+        )
+    return tuple(fields)
+
+
+def dsa_index_k_lcm_fields(
+    *,
+    layer_group_ids,
+    logical_block_tokens,
+    index_k_row_bytes,
+) -> tuple[LcmFieldSpec, ...]:
+    """Describe DSA sparse index-K history fields.
+
+    One uint8 field per layer, laid out per page as ``page_size`` rows of
+    ``index_k_row_bytes`` (a block-split FP8 payload plus FP32 scales). The
+    kernel walks pages by an implicit payload-sized stride, so
+    ``exact_page_stride`` is False and the reshaped field aliases the flat
+    ``[num_slots, row_bytes]`` buffer the DSA scatter/gather kernels expect.
+    """
+    if logical_block_tokens <= 0 or index_k_row_bytes <= 0:
+        raise ValueError("DSA index-K geometry must be positive")
+    occurrences: dict[str, int] = {}
+    fields = []
+    for layer_id, group_id in enumerate(layer_group_ids):
+        slot = occurrences.get(group_id, 0)
+        occurrences[group_id] = slot + 1
+        fields.append(
+            LcmFieldSpec(
+                group_id,
+                f"layer.{layer_id}.index_k",
+                f"index_k.slot.{slot}",
+                (logical_block_tokens, index_k_row_bytes),
+                1,
+                exact_page_stride=False,
+            )
+        )
+    return tuple(fields)
+
+
+def msa_index_k_lcm_fields(
+    *,
+    layer_group_ids,
+    indexed_layer_ids,
+    logical_block_tokens,
+    index_head_dim,
+    index_element_size,
+) -> tuple[LcmFieldSpec, ...]:
+    """Describe MiniMax sparse-attention per-layer index-K history fields.
+
+    One field per sparse layer (``indexed_layer_ids``), laid out as
+    ``page_size`` rows of ``index_head_dim`` values. Unlike DSA's block-split
+    FP8 payload this is a plain dense tensor, so the reshaped field aliases the
+    flat ``[num_slots, index_head_dim]`` buffer the MSA sparse kernels read.
+    The field shares its layer's cache group, packing into the same LCM parent
+    block as that layer's K/V (same page ids).
+    """
+    if logical_block_tokens <= 0 or index_head_dim <= 0 or index_element_size <= 0:
+        raise ValueError("MSA index-K geometry must be positive")
+    indexed = frozenset(indexed_layer_ids)
+    occurrences: dict[str, int] = {}
+    fields = []
+    for layer_id, group_id in enumerate(layer_group_ids):
+        if layer_id not in indexed:
+            continue
+        slot = occurrences.get(group_id, 0)
+        occurrences[group_id] = slot + 1
+        fields.append(
+            LcmFieldSpec(
+                group_id,
+                f"layer.{layer_id}.index_k",
+                f"index_k.slot.{slot}",
+                (logical_block_tokens, index_head_dim),
+                index_element_size,
+            )
+        )
+    return tuple(fields)
+
+
 def draft_history_lcm_fields(
     *,
     layer_group_ids,

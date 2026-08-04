@@ -166,27 +166,8 @@ class MSAConfig(BaseAttnConfig):
         rank: int,
         enable_memory_saver: bool,
     ) -> BaseTokenToKVPool:
-        from tokenspeed.runtime.layers.attention.kv_cache.msa import (
-            MSATokenToKVPool,
-        )
-
-        return MSATokenToKVPool(
-            size=max_total_num_tokens,
-            dtype=self.kv_cache_dtype,
-            head_num=max(self.num_kv_heads // self.attn_tp_size, 1),
-            head_dim=self.head_dim,
-            layer_num=num_layers,
-            device=self.device,
-            enable_memory_saver=enable_memory_saver,
-            max_batch_size=self.max_bs,
-            max_context_len=self.context_len,
-            page_size=self.page_size,
-            rank=rank,
-            index_head_dim=self.index_head_dim,
-            index_dtype=self.dtype,
-            indexed_layer_ids=self.sparse_layer_ids,
-            layer_types=self.layer_types,
-            sliding_window_tokens=self.sliding_window_tokens,
-            max_scheduled_tokens=self.max_scheduled_tokens,
-            pd_disaggregation_enabled=self.pd_disaggregation_enabled,
+        raise RuntimeError(
+            "MiniMax sparse attention now runs on the shared LCM arena; the "
+            "pool is built via create_lcm_pool (family 'msa'), not "
+            "MSAConfig.create_pool."
         )

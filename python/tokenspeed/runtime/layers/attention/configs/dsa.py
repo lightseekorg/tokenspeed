@@ -88,21 +88,12 @@ class DSAConfig(MLAConfig):
         rank: int,
         enable_memory_saver: bool,
     ) -> BaseTokenToKVPool:
-        from tokenspeed.runtime.layers.attention.kv_cache.dsa import DSATokenToKVPool
-
-        return DSATokenToKVPool(
-            size=max_total_num_tokens,
-            dtype=self.kv_cache_dtype,
-            model_dtype=self.dtype,
-            quant_method=self.kv_cache_quant_method,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            layer_num=num_layers,
-            device=self.device,
-            enable_memory_saver=enable_memory_saver,
-            max_batch_size=self.max_bs,
-            max_context_len=self.context_len,
-            page_size=self.page_size,
-            rank=rank,
-            index_head_dim=self.index_head_dim,
+        # DSA now runs exclusively on the shared LCM arena, built by
+        # lcm_setup.create_lcm_pool via the "dsa" recipe. The classic
+        # per-layer-tensor path was retired; the registry always resolves an
+        # LCM plan for DSA, so this factory is never the one that builds it.
+        raise RuntimeError(
+            "DSA KV cache is built through the LCM arena (lcm_setup), not "
+            "DSAConfig.create_pool; a DSA model reached the classic pool path, "
+            "which means the LCM gating did not fire."
         )

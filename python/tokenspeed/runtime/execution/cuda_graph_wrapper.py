@@ -179,7 +179,7 @@ class CudaGraphWrapper:
     Callers always use the same interface::
 
         output_tokens, output_lengths, output_logprobs = runner(
-            bs, ctx, sampling_info, req_to_page,
+            bs, ctx, sampling_info, page_table,
             extend_with_prefix=..., extend_prefix_lens=...,
         )
 
@@ -270,16 +270,14 @@ class CudaGraphWrapper:
                     if gid in target_ps:
                         draft_ps[gid] = target_ps[gid]
 
-            # Drafter (Eagle) is constructed with the target's req_to_page
-            # (ModelExecutor passes the same self.req_to_page to both), and the
-            # replay path hands both backends the same req_pool_indices. The
-            # block-table gather is req_to_page[req_pool_indices] (see
-            # _create_block_kv_indices; it does not depend on seq_lens), so both
-            # backends would compute identical block_kv_indices. When the backing
-            # buffer shapes/dtypes also line up, point the draft backend at the
-            # target's buffer and skip its gather+copy in the replay path: the
-            # target's metadata prep runs first and populates the shared buffer
-            # (see init_forward_metadata_replay_cuda_graph).
+            # Target and draft resolve the same batch-ordered full-history
+            # table (the target from cache metadata, the draft from the
+            # published draft page table), so both backends would compute
+            # identical block_kv_indices. When the backing buffer shapes/dtypes
+            # also line up, point the draft backend at the target's buffer and
+            # skip its gather+copy in the replay path: the target's metadata
+            # prep runs first and populates the shared buffer (see
+            # init_forward_metadata_replay_cuda_graph).
             target_kv = getattr(attn_backend, "decode_cuda_graph_kv_indices", None)
             draft_kv = getattr(draft_attn_backend, "decode_cuda_graph_kv_indices", None)
             if (
@@ -810,7 +808,7 @@ class CudaGraphWrapper:
         actual_bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        req_to_page: torch.Tensor,
+        page_table: torch.Tensor,
         forward_mode: ForwardMode,
         **kwargs,
     ):
@@ -885,7 +883,7 @@ class CudaGraphWrapper:
             padded_bs,
             req_pool_indices,
             seq_lens,
-            req_to_page=req_to_page,
+            page_table=page_table,
             forward_mode=forward_mode,
             **kwargs,
         )
@@ -911,7 +909,7 @@ class CudaGraphWrapper:
                 padded_bs,
                 req_pool_indices,
                 draft_seq_lens,
-                req_to_page=self.drafter.req_to_page,
+                page_table=self.drafter.page_table,
                 forward_mode=draft_forward_mode,
                 **draft_attn_kwargs,
             )
@@ -923,7 +921,7 @@ class CudaGraphWrapper:
         num_extends: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        req_to_page: torch.Tensor,
+        page_table: torch.Tensor,
         forward_mode: ForwardMode,
         **kwargs,
     ):
@@ -939,7 +937,7 @@ class CudaGraphWrapper:
             num_extends=num_extends,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            req_to_page=req_to_page,
+            page_table=page_table,
             forward_mode=forward_mode,
             **kwargs,
         )
@@ -983,7 +981,7 @@ class CudaGraphWrapper:
                     num_extends=num_extends,
                     req_pool_indices=req_pool_indices,
                     seq_lens=draft_prefill_seq_lens,
-                    req_to_page=self.drafter.req_to_page,
+                    page_table=self.drafter.page_table,
                     forward_mode=forward_mode,
                     **draft_extend_kwargs,
                 )
@@ -993,7 +991,7 @@ class CudaGraphWrapper:
                         num_extends=0,
                         req_pool_indices=req_pool_indices,
                         seq_lens=draft_seq_lens,
-                        req_to_page=self.drafter.req_to_page,
+                        page_table=self.drafter.page_table,
                         forward_mode=ForwardMode.DECODE,
                         **draft_kwargs,
                     )
@@ -1013,7 +1011,7 @@ class CudaGraphWrapper:
                     num_extends=0,
                     req_pool_indices=req_pool_indices,
                     seq_lens=draft_metadata_seq_lens,
-                    req_to_page=self.drafter.req_to_page,
+                    page_table=self.drafter.page_table,
                     forward_mode=draft_forward_mode,
                     **draft_kwargs,
                 )
@@ -1093,7 +1091,7 @@ class CudaGraphWrapper:
         bs: int,
         ctx: ForwardContext,
         sampling_info: SamplingBatchInfo,
-        req_to_page: torch.Tensor,
+        page_table: torch.Tensor,
         extend_with_prefix: bool = False,
         extend_prefix_lens: torch.Tensor | None = None,
         extend_prefix_lens_cpu: torch.Tensor | None = None,
@@ -1171,7 +1169,7 @@ class CudaGraphWrapper:
                 bs,
                 req_pool_indices,
                 seq_lens,
-                req_to_page=req_to_page,
+                page_table=page_table,
                 forward_mode=ctx.forward_mode,
                 num_padding=padded_bs - bs if padded_bs != bs else 0,
                 paged_cache_block_tables=paged_cache_block_tables,
@@ -1237,7 +1235,7 @@ class CudaGraphWrapper:
                 ctx.num_extends,
                 req_pool_indices,
                 seq_lens,
-                req_to_page=req_to_page,
+                page_table=page_table,
                 forward_mode=ctx.forward_mode,
                 extend_with_prefix=extend_with_prefix,
                 extend_prefix_lens=extend_prefix_lens,

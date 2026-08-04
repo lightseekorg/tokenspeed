@@ -312,7 +312,7 @@ class Mtp(BaseDrafter):
         spec_num_steps: int,
         page_size: int,
         draft_model_runner: ModelRunner,
-        req_to_page: torch.Tensor,
+        page_table: torch.Tensor,
         attn_backend: AttentionBackend | None = None,
         token_to_kv_pool: BaseTokenToKVPool | None = None,
         runtime_states: RuntimeStates | None = None,
@@ -327,7 +327,7 @@ class Mtp(BaseDrafter):
             runtime_states=runtime_states,
             input_buffers=input_buffers,
             page_size=page_size,
-            req_to_page=req_to_page,
+            page_table=page_table,
             attn_backend=attn_backend,
             token_to_kv_pool=token_to_kv_pool,
             vocab_size=vocab_size,
@@ -391,12 +391,12 @@ class Mtp(BaseDrafter):
         if lookback:
             model_config = draft_model_runner.model_config
             self._lookback_tokens_buf = torch.zeros(
-                (req_to_page.shape[0], lookback),
+                (page_table.shape[0], lookback),
                 dtype=torch.int64,
                 device=self.device,
             )
             self._lookback_hidden_buf = torch.zeros(
-                (req_to_page.shape[0], lookback, model_config.hidden_size),
+                (page_table.shape[0], lookback, model_config.hidden_size),
                 dtype=model_config.dtype,
                 device=self.device,
             )
@@ -541,7 +541,6 @@ class Mtp(BaseDrafter):
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
-            req_to_page=self.req_to_page,
             bs=bs,
             num_extends=draft_input.num_extends,
             input_num_tokens=input_num_tokens,
@@ -619,7 +618,6 @@ class Mtp(BaseDrafter):
                 num_extends=0,
                 attn_backend=self.attn_backend,
                 token_to_kv_pool=self.token_to_kv_pool,
-                req_to_page=self.req_to_page,
                 input_num_tokens=bs * k,
                 forward_mode=ForwardMode.DECODE,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
@@ -709,10 +707,9 @@ class Mtp(BaseDrafter):
         lb_cache_loc = self.draft_out_cache_loc_buf[: bs * lb]
         compute_out_cache_loc_uniform(
             out_cache_loc_ptr=lb_cache_loc,
-            req_pool_indices=buffers.req_pool_indices_buf[:bs],
             uniform_input_length=lb,
             cache_start=(first_pos - lb).clamp_min(0).to(torch.int32),
-            req_to_pages=self.req_to_page,
+            page_table=self.page_table,
             page_size=self.page_size,
         )
         out_cache_loc = torch.cat(
@@ -743,7 +740,6 @@ class Mtp(BaseDrafter):
                 num_extends=0,
                 attn_backend=self.attn_backend,
                 token_to_kv_pool=self.token_to_kv_pool,
-                req_to_page=self.req_to_page,
                 input_num_tokens=bs * total,
                 forward_mode=ForwardMode.DECODE,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
@@ -926,7 +922,6 @@ class Mtp(BaseDrafter):
                 num_extends=ne,
                 attn_backend=self.attn_backend,
                 token_to_kv_pool=self.token_to_kv_pool,
-                req_to_page=self.req_to_page,
                 input_num_tokens=input_num_tokens,
                 forward_mode=draft_input.forward_mode,
                 capture_hidden_mode=CaptureHiddenMode.FULL,

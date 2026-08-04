@@ -128,7 +128,7 @@ def test_replay_refreshes_buffers_in_place_and_pads_page_zero() -> None:
         req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
         seq_lens=torch.tensor([70, 1], dtype=torch.int32),  # real seq 70, pad 1
         forward_mode=ForwardMode.DECODE,
-        req_to_page=None,
+        page_table=None,
         cache_metadata=meta,
         forward_batch=forward_op,
     )
@@ -175,7 +175,7 @@ def test_amd_mla_grouped_graph_replay_is_pointer_stable_and_null_padded() -> Non
         req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
         seq_lens=torch.tensor([70, 1], dtype=torch.int32),
         forward_mode=ForwardMode.DECODE,
-        req_to_page=None,
+        page_table=None,
         cache_metadata=metadata,
         forward_batch=forward_op,
     )
@@ -203,7 +203,7 @@ def test_amd_mla_eager_decode_uses_group_table_and_refuses_fallback() -> None:
         num_extends=0,
         req_pool_indices=torch.tensor([-99, -99], dtype=torch.int64),
         seq_lens=seq_lens,
-        req_to_page=poisoned,
+        page_table=poisoned,
         forward_mode=ForwardMode.DECODE,
         cache_metadata=metadata,
         forward_batch=forward_op,
@@ -228,7 +228,7 @@ def test_amd_mla_eager_decode_uses_group_table_and_refuses_fallback() -> None:
             num_extends=0,
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             seq_lens=seq_lens,
-            req_to_page=torch.zeros((2, 4), dtype=torch.int32),
+            page_table=torch.zeros((2, 4), dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
         )
 
@@ -259,7 +259,7 @@ def test_amd_mla_eager_prefill_derives_group_write_locations(monkeypatch) -> Non
         num_extends=1,
         req_pool_indices=torch.tensor([-99], dtype=torch.int64),
         seq_lens=torch.tensor([150], dtype=torch.int32),
-        req_to_page=torch.full((4, 4), -99, dtype=torch.int32),
+        page_table=torch.full((4, 4), -99, dtype=torch.int32),
         forward_mode=ForwardMode.EXTEND,
         extend_prefix_lens=torch.tensor([100], dtype=torch.int32),
         extend_prefix_lens_cpu=torch.tensor([100], dtype=torch.int32),

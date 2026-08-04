@@ -292,28 +292,19 @@ def _make_config(page_size: int):
     )
 
 
-def test_config_selects_mxfp8_pool_and_sizes():
-    from tokenspeed.runtime.layers.attention.kv_cache.mha import (
-        MHATokenToKVPoolMXFP8,
-    )
-
+def test_config_cache_cell_size_includes_mxfp8_scales():
     config = _make_config(page_size=128)
     # fp8 data + 1 scale byte per 32: 33/32 of the fp8 cell.
     assert (
         config.cache_cell_size() == HEADS * HEAD_DIM * 2 + (HEADS * HEAD_DIM * 2) // 32
     )
-    pool = config.create_pool(
-        num_layers=LAYERS,
-        max_total_num_tokens=512,
-        rank=0,
-        enable_memory_saver=False,
-    )
-    assert isinstance(pool, MHATokenToKVPoolMXFP8)
 
 
-def test_config_rejects_non_128_page():
-    config = _make_config(page_size=64)
-    with pytest.raises(AssertionError, match="block-size 128"):
+def test_config_create_pool_requires_lcm_recipe():
+    # The classic (non-LCM) pool path is gone; pools are built via
+    # create_lcm_pool from a prepared LCM recipe.
+    config = _make_config(page_size=128)
+    with pytest.raises(RuntimeError, match="LCM recipe"):
         config.create_pool(
             num_layers=LAYERS,
             max_total_num_tokens=512,

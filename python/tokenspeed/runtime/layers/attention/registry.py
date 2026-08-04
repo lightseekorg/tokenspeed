@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-import inspect
 import logging
 import os
 from typing import TYPE_CHECKING
@@ -949,13 +948,55 @@ def create_attn_components(
     use_lcm_gdn = is_hybrid_gdn and has_state
     use_lcm_k3 = is_hybrid_mla_kda
     use_lcm_inkling = is_inkling
+    # A plain MLA model (no state layers, not one of the hybrid/v4 recipes)
+    # now also runs on the LCM arena: one full-attention group per layer.
+    use_lcm_plain_mla = (
+        arch == AttentionArch.MLA
+        and not is_deepseek_v4_model
+        and not use_lcm_k3
+        and not has_state
+    )
+    # DSA is a plain MLA layout plus a per-layer sparse index-K field; it takes
+    # the same single-group LCM arena.
+    use_lcm_dsa = arch == AttentionArch.DSA and not has_state
+    # A plain MHA/GQA model (no state layers, not inkling) runs on the LCM arena
+    # too: per-layer K/V history pages, one group per (retention, window).
+    use_lcm_plain_mha = (
+        arch == AttentionArch.MHA
+        and not use_lcm_gdn
+        and not is_inkling
+        and not has_state
+    )
+    # MiniMax sparse attention: plain full-history MHA plus a per-sparse-layer
+    # index-K field, on the same single-group LCM arena.
+    use_lcm_msa = arch == AttentionArch.MSA and not has_state
     lcm_family = (
         "deepseek_v4"
         if is_deepseek_v4_model
         else (
             "qwen_gdn"
             if use_lcm_gdn
-            else "kimi_k3" if use_lcm_k3 else "inkling" if use_lcm_inkling else None
+            else (
+                "kimi_k3"
+                if use_lcm_k3
+                else (
+                    "inkling"
+                    if use_lcm_inkling
+                    else (
+                        "plain_mla"
+                        if use_lcm_plain_mla
+                        else (
+                            "dsa"
+                            if use_lcm_dsa
+                            else (
+                                "plain_mha"
+                                if use_lcm_plain_mha
+                                else "msa" if use_lcm_msa else None
+                            )
+                        )
+                    )
+                )
+            )
         )
     )
     if has_state and lcm_family is None:
@@ -1235,6 +1276,21 @@ def create_attn_components(
                 config, num_layers, max_num_tokens, rank, enable_memory_saver
             )
         )
+        if use_lcm_plain_mla or use_lcm_dsa or use_lcm_plain_mha:
+            # A plain-MLA / DSA target on the LCM arena is a cache-group contract
+            # backend: its pool publishes a runtime_contract, so eager forwards
+            # bind the group tables automatically, but CUDA-graph capture needs
+            # the contract marked up front to size its write-location buffer
+            # (see MLAAttnBackend.mark_cache_contract). The generic hybrid path
+            # marks its full-attention sub-backend the same way (see line ~519);
+            # this covers the non-hybrid target that path never reaches.
+            _mark_target = getattr(backend, "mark_cache_contract", None)
+            if _mark_target is not None:
+                _mark_target(
+                    logical_page_size=int(
+                        lcm_setup.target.memory_plan.logical_block_tokens
+                    )
+                )
         if is_inkling:
             # Wrapper only adds sconv state keyed on req_pool_indices; attention stays on the dense backend
             text_config = model_config.hf_config.get_text_config()
@@ -1387,18 +1443,18 @@ def create_attn_components(
             )
 
     _validate_shared_lcm_geometry(pool, draft_pool)
-
+    # An LCM draft pool reuses the target's page ids in its own arena (that is
+    # exactly what _validate_shared_lcm_geometry just asserted), so the draft
+    # backend must read page ids through the cache-group bridge like the target
+    # does. Without this it falls back to page_table with the wrong page size
+    # and over-reads the table. Only MLA-family drafts define mark_cache_contract.
     if (
         draft_attn_backend is not None
         and getattr(draft_pool, "_lcm_memory_plan", None) is not None
     ):
         draft_mark_contract = getattr(draft_attn_backend, "mark_cache_contract", None)
         if draft_mark_contract is not None:
-            params = inspect.signature(draft_mark_contract).parameters
-            if "logical_page_size" in params:
-                draft_mark_contract(logical_page_size=int(draft_pool.page_size))
-            else:
-                draft_mark_contract()
+            draft_mark_contract(logical_page_size=int(draft_pool.page_size))
     if use_lcm_gdn and fixed_workspace_bytes:
         actual_workspace_bytes = (
             backend.linear_attn_backend.preallocate_verify_workspace(

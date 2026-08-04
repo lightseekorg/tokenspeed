@@ -186,9 +186,9 @@ class _Harness:
         self.backend = InklingAttnBackend(inner, conv_pool)
         # Request slot REQ_SLOT owns pages [1, 2, ...] -> token locs 64+.
         max_pages = 1024 // PAGE_SIZE
-        self.req_to_page = torch.zeros(8, max_pages, dtype=torch.int32, device=device)
+        self.page_table = torch.zeros(8, max_pages, dtype=torch.int32, device=device)
         for p in range(max_pages - 1):
-            self.req_to_page[REQ_SLOT, p] = p + 1
+            self.page_table[REQ_SLOT, p] = p + 1
         self.seq_len = 0
 
     def _ctx(self, mode):
@@ -216,7 +216,7 @@ class _Harness:
             num_extends=1,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            req_to_page=self.req_to_page,
+            page_table=self.page_table,
             forward_mode=ForwardMode.EXTEND,
             extend_seq_lens=seq_lens,
             extend_seq_lens_cpu=torch.tensor([T]),
@@ -241,7 +241,7 @@ class _Harness:
             num_extends=0,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            req_to_page=self.req_to_page,
+            page_table=self.page_table,
             forward_mode=ForwardMode.DECODE,
         )
         out_cache_loc = self._token_locs(self.seq_len - 1, 1)

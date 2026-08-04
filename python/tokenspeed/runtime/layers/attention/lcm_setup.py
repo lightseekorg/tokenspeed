@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -31,8 +32,11 @@ import torch
 
 from tokenspeed.runtime.configs.lcm_layouts import (
     draft_history_lcm_fields,
+    dsa_index_k_lcm_fields,
     inkling_lcm_fields,
     mla_history_lcm_fields,
+    msa_index_k_lcm_fields,
+    plain_mha_lcm_fields,
     qwen_gdn_lcm_fields,
 )
 from tokenspeed.runtime.configs.lcm_memory_plan import (
@@ -46,16 +50,34 @@ from tokenspeed.runtime.configs.paged_cache_spec import (
     split_recurrent_state_groups,
 )
 from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
+from tokenspeed.runtime.layers.attention.configs.dsa import (
+    DSAConfig,
+    dsa_index_k_row_bytes,
+)
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+from tokenspeed.runtime.layers.attention.configs.msa import MSAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 
-LcmModelFamily = Literal["qwen_gdn", "inkling", "kimi_k3", "deepseek_v4"]
+LcmModelFamily = Literal[
+    "qwen_gdn",
+    "inkling",
+    "kimi_k3",
+    "deepseek_v4",
+    "plain_mla",
+    "dsa",
+    "plain_mha",
+    "msa",
+]
 
 _LOGICAL_BLOCK_TOKENS = 128
 _MAX_PADDING_FRACTION = 1.0
 _DEEPSEEK_V4_LOGICAL_BLOCK_TOKENS = 256
+# DSA sparse decode kernels are built for a 64-token page.
+_DSA_LOGICAL_BLOCK_TOKENS = 64
 _DEEPSEEK_V4_MAX_PADDING_FRACTION = 2.0
+# Packing for a single full-attention group: one cache block per LCM parent.
+_PLAIN_MLA_PACKING = {FULL_ATTENTION: 1}
 
 
 @dataclass(frozen=True)
@@ -197,7 +219,8 @@ def _draft_history_fields(
     draft_model_config,
 ):
     num_layers = draft_model_config.num_attention_layers
-    if family == "qwen_gdn":
+    if family in ("qwen_gdn", "plain_mha", "msa"):
+        # All-full-attention MHA draft: one uniform history group per layer.
         layer_types = (FULL_ATTENTION,) * num_layers
         group_ids = layer_types
         layer_kv_head_counts = None
@@ -568,6 +591,248 @@ def _prepare_deepseek_v4(
     )
 
 
+def _plain_mla_full_attention_pages(
+    *,
+    token_capacity: int,
+    page_tokens: int,
+    max_live_requests: int,
+    max_scheduled_tokens: int,
+    decode_input_tokens: int,
+    overlap_schedule_depth: int,
+) -> int:
+    """Child pages a single full-attention group needs at this concurrency.
+
+    Mirrors the ``FULL_ATTENTION`` branch of the hybrid recipes' sizing: one
+    page per ``page_tokens`` of history, plus a partial page per live request,
+    plus the overlap-schedule protection pages. There is no state group.
+    """
+    del max_scheduled_tokens  # full-attention sizing does not use it
+    protected_pages = max_live_requests * math.ceil(
+        overlap_schedule_depth * decode_input_tokens / page_tokens
+    )
+    return (
+        math.ceil(token_capacity / page_tokens)
+        + max_live_requests
+        - 1
+        + protected_pages
+    )
+
+
+def _single_group_mla_fields(
+    layer_group_ids: tuple[str, ...],
+    *,
+    logical_block_tokens: int,
+    latent_width: int,
+    element_size: int,
+    index_k_row_bytes: int | None,
+) -> tuple:
+    """Latent-KV fields, plus DSA sparse index-K fields when requested."""
+    fields = list(
+        mla_history_lcm_fields(
+            layer_group_ids=layer_group_ids,
+            logical_block_tokens=logical_block_tokens,
+            latent_width=latent_width,
+            element_size=element_size,
+        )
+    )
+    if index_k_row_bytes is not None:
+        fields.extend(
+            dsa_index_k_lcm_fields(
+                layer_group_ids=layer_group_ids,
+                logical_block_tokens=logical_block_tokens,
+                index_k_row_bytes=index_k_row_bytes,
+            )
+        )
+    return tuple(fields)
+
+
+def _prepare_plain_mla(
+    *,
+    server_args,
+    model_config,
+    attn_config,
+    draft_model_config,
+    draft_attn_config,
+    cache_budget_bytes: int,
+    decode_input_tokens: int,
+    overlap_schedule_depth: int,
+    index_k_row_bytes: int | None = None,
+    logical_block_tokens: int = _LOGICAL_BLOCK_TOKENS,
+) -> LcmSetup:
+    """Size a pure-MLA model onto a single full-attention LCM group.
+
+    A plain MLA model (no KDA/state layers) has one latent-KV field per layer
+    and a single ``FULL_ATTENTION`` cache group. Everything reuses the shared
+    LCM machinery -- ``mla_history_lcm_fields`` for the field shapes and
+    ``plan_lcm_fields`` for the arena geometry -- with a trivial ``{FULL_ATTENTION: 1}``
+    packing. A draft (e.g. DeepSeek MTP) is an additional full-attention MLA
+    pool that shares the target's parent geometry.
+
+    ``index_k_row_bytes`` adds a per-layer DSA sparse index-K field to the same
+    arena (see :func:`dsa_index_k_lcm_fields`). A DSA draft (e.g. DeepSeek-V3.2
+    NextN) runs the same indexer as the target, so it gets index-K fields sized
+    from its own config; a plain-MLA draft keeps latent-only fields.
+    """
+    num_layers = model_config.num_attention_layers
+    latent_width = attn_config.kv_lora_rank + attn_config.qk_rope_head_dim
+    element_size = attn_config.kv_cache_dtype.itemsize
+    layer_group_ids = (FULL_ATTENTION,) * num_layers
+
+    fields = _single_group_mla_fields(
+        layer_group_ids,
+        logical_block_tokens=logical_block_tokens,
+        latent_width=latent_width,
+        element_size=element_size,
+        index_k_row_bytes=index_k_row_bytes,
+    )
+
+    draft_fields = None
+    draft_layer_types = ()
+    draft_parent_bytes = 0
+    if draft_attn_config is not None:
+        draft_layers = draft_model_config.num_attention_layers
+        draft_layer_types = (FULL_ATTENTION,) * draft_layers
+        # A DSA draft (e.g. DeepSeek-V3.2 NextN) runs the same sparse indexer as
+        # the target, so its pool needs the per-layer index-K field too; mirror
+        # the target's field structure rather than assuming latent-only.
+        draft_index_k_row_bytes = (
+            dsa_index_k_row_bytes(int(draft_attn_config.index_head_dim))
+            if isinstance(draft_attn_config, DSAConfig)
+            else None
+        )
+        draft_fields = _single_group_mla_fields(
+            draft_layer_types,
+            logical_block_tokens=logical_block_tokens,
+            latent_width=(
+                draft_attn_config.kv_lora_rank + draft_attn_config.qk_rope_head_dim
+            ),
+            element_size=draft_attn_config.kv_cache_dtype.itemsize,
+            index_k_row_bytes=draft_index_k_row_bytes,
+        )
+        draft_parent_bytes = plan_lcm_fields(
+            draft_fields,
+            logical_block_tokens=logical_block_tokens,
+            num_lcm_blocks=1,
+            cache_blocks_per_lcm_block=_PLAIN_MLA_PACKING,
+            alignment=256,
+        ).lcm_block_bytes
+
+    reference_plan = plan_lcm_fields(
+        fields,
+        logical_block_tokens=logical_block_tokens,
+        num_lcm_blocks=1,
+        cache_blocks_per_lcm_block=_PLAIN_MLA_PACKING,
+        alignment=256,
+    )
+    parent_bytes = reference_plan.lcm_block_bytes + draft_parent_bytes
+    num_lcm_blocks = cache_budget_bytes // parent_bytes - 1
+    if num_lcm_blocks < 1:
+        raise ValueError(
+            "plain MLA cache budget must hold a null parent and one usable "
+            "LCM parent"
+        )
+
+    token_limit = _token_limit(server_args)
+    if token_limit is not None:
+        requested = token_limit // logical_block_tokens
+        if requested < 1:
+            raise ValueError(
+                "the configured token limit must hold at least one LCM parent "
+                f"({logical_block_tokens} child tokens)"
+            )
+        num_lcm_blocks = min(num_lcm_blocks, requested)
+
+    # Admit as many tokens as the full-attention group's child pages allow.
+    admitted_tokens = num_lcm_blocks * logical_block_tokens
+    while admitted_tokens > 0:
+        pages = _plain_mla_full_attention_pages(
+            token_capacity=admitted_tokens,
+            page_tokens=logical_block_tokens,
+            max_live_requests=attn_config.max_bs,
+            max_scheduled_tokens=server_args.chunked_prefill_size,
+            decode_input_tokens=decode_input_tokens,
+            overlap_schedule_depth=overlap_schedule_depth,
+        )
+        if math.ceil(pages / _PLAIN_MLA_PACKING[FULL_ATTENTION]) <= num_lcm_blocks:
+            break
+        admitted_tokens -= logical_block_tokens
+    if admitted_tokens < 1:
+        raise ValueError(
+            "plain MLA LCM pool cannot admit one token at the configured " "concurrency"
+        )
+
+    target_plan = plan_lcm_fields(
+        fields,
+        logical_block_tokens=logical_block_tokens,
+        num_lcm_blocks=num_lcm_blocks,
+        cache_blocks_per_lcm_block=_PLAIN_MLA_PACKING,
+        alignment=256,
+    )
+    draft_spec = None
+    if draft_fields is not None:
+        draft_spec = LcmPoolSpec(
+            memory_plan=plan_lcm_fields(
+                draft_fields,
+                logical_block_tokens=logical_block_tokens,
+                num_lcm_blocks=num_lcm_blocks,
+                cache_blocks_per_lcm_block=_PLAIN_MLA_PACKING,
+                alignment=256,
+            ),
+            layer_types=draft_layer_types,
+            layer_group_ids=draft_layer_types,
+            state_field_dtypes={},
+            token_capacity=admitted_tokens,
+        )
+    return LcmSetup(
+        target=LcmPoolSpec(
+            memory_plan=target_plan,
+            layer_types=layer_group_ids,
+            layer_group_ids=layer_group_ids,
+            state_field_dtypes={},
+            token_capacity=admitted_tokens,
+        ),
+        draft=draft_spec,
+        cache_budget_bytes=cache_budget_bytes,
+        fixed_workspace_bytes=0,
+    )
+
+
+def _prepare_dsa(
+    *,
+    server_args,
+    model_config,
+    attn_config,
+    draft_model_config,
+    draft_attn_config,
+    cache_budget_bytes: int,
+    decode_input_tokens: int,
+    overlap_schedule_depth: int,
+) -> LcmSetup:
+    """Size a DSA (DeepSeek sparse attention) model onto the LCM arena.
+
+    DSA is a plain MLA model plus a per-layer sparse index-K cache, so it reuses
+    the single-full-attention-group MLA layout and only adds the index-K field
+    width. ``dsa_index_k_row_bytes`` gives the packed FP8 payload + FP32 scale
+    row size the DSA scatter/gather kernels use.
+    """
+    index_k_row_bytes = dsa_index_k_row_bytes(int(attn_config.index_head_dim))
+    return _prepare_plain_mla(
+        server_args=server_args,
+        model_config=model_config,
+        attn_config=attn_config,
+        draft_model_config=draft_model_config,
+        draft_attn_config=draft_attn_config,
+        cache_budget_bytes=cache_budget_bytes,
+        decode_input_tokens=decode_input_tokens,
+        overlap_schedule_depth=overlap_schedule_depth,
+        index_k_row_bytes=index_k_row_bytes,
+        # DSA's sparse decode kernel is only built for a 64-token page
+        # (dsa_decode_topk traits / forward_sparse_decode's page_size check),
+        # so the arena's logical block must match it.
+        logical_block_tokens=_DSA_LOGICAL_BLOCK_TOKENS,
+    )
+
+
 def _prepare_mha(
     *,
     family: LcmModelFamily,
@@ -628,6 +893,62 @@ def _prepare_mha(
                 for field in fields
                 if field.field_id.endswith((".conv", ".ssm"))
             )
+    elif family == "plain_mha":
+        # A plain MHA/GQA model: per-layer K and V history pages, no recurrent
+        # state. Layer labels split full vs sliding-window groups (empty labels
+        # mean one uniform full-attention group); plan_lcm_fields solves the
+        # per-group packing from the field byte ratios, which is what keeps the
+        # runtime contract's page-count invariant satisfied for several groups.
+        layer_types = (
+            tuple(attn_config.layer_types)
+            or (FULL_ATTENTION,) * model_config.num_attention_layers
+        )
+        group_ids = layer_types
+        fields = plain_mha_lcm_fields(
+            layer_types=layer_types,
+            layer_group_ids=group_ids,
+            logical_block_tokens=_LOGICAL_BLOCK_TOKENS,
+            kv_shape=(
+                _LOGICAL_BLOCK_TOKENS,
+                max(attn_config.num_kv_heads // attn_config.attn_tp_size, 1),
+                attn_config.head_dim,
+            ),
+            kv_element_size=attn_config.kv_cache_dtype.itemsize,
+        )
+        state_dtypes = {}
+        layer_kv_head_counts = None
+        max_padding_fraction = _MAX_PADDING_FRACTION
+        fixed_workspace_bytes = 0
+    elif family == "msa":
+        # MiniMax sparse attention: every layer keeps full history (one uniform
+        # full-attention group, like plain MHA) and the sparse layers add a
+        # per-layer index-K field that packs into the same LCM parent block.
+        num_attn_layers = len(attn_config.compute_layer_types) or (
+            model_config.num_attention_layers
+        )
+        layer_types = (FULL_ATTENTION,) * num_attn_layers
+        group_ids = layer_types
+        fields = plain_mha_lcm_fields(
+            layer_types=layer_types,
+            layer_group_ids=group_ids,
+            logical_block_tokens=_LOGICAL_BLOCK_TOKENS,
+            kv_shape=(
+                _LOGICAL_BLOCK_TOKENS,
+                max(attn_config.num_kv_heads // attn_config.attn_tp_size, 1),
+                attn_config.head_dim,
+            ),
+            kv_element_size=attn_config.kv_cache_dtype.itemsize,
+        ) + msa_index_k_lcm_fields(
+            layer_group_ids=group_ids,
+            indexed_layer_ids=attn_config.sparse_layer_ids,
+            logical_block_tokens=_LOGICAL_BLOCK_TOKENS,
+            index_head_dim=attn_config.index_head_dim,
+            index_element_size=attn_config.dtype.itemsize,
+        )
+        state_dtypes = {}
+        layer_kv_head_counts = None
+        max_padding_fraction = _MAX_PADDING_FRACTION
+        fixed_workspace_bytes = 0
     else:
         fields, layer_kv_head_counts = _inkling_fields(attn_config, model_config)
         layer_types = tuple(attn_config.layer_types)
@@ -800,6 +1121,28 @@ def prepare_lcm_setup(
             decode_input_tokens=decode_input_tokens,
             overlap_schedule_depth=overlap_schedule_depth,
         )
+    if family == "plain_mla":
+        return _prepare_plain_mla(
+            server_args=server_args,
+            model_config=model_config,
+            attn_config=attn_config,
+            draft_model_config=draft_model_config,
+            draft_attn_config=draft_attn_config,
+            cache_budget_bytes=cache_budget_bytes,
+            decode_input_tokens=decode_input_tokens,
+            overlap_schedule_depth=overlap_schedule_depth,
+        )
+    if family == "dsa":
+        return _prepare_dsa(
+            server_args=server_args,
+            model_config=model_config,
+            attn_config=attn_config,
+            draft_model_config=draft_model_config,
+            draft_attn_config=draft_attn_config,
+            cache_budget_bytes=cache_budget_bytes,
+            decode_input_tokens=decode_input_tokens,
+            overlap_schedule_depth=overlap_schedule_depth,
+        )
     return _prepare_mha(
         family=family,
         server_args=server_args,
@@ -821,6 +1164,34 @@ def create_lcm_pool(
 ) -> BaseTokenToKVPool:
     """Create the concrete compute interface for a prepared LCM spec."""
     plan = spec.memory_plan
+    if isinstance(config, MSAConfig):
+        from tokenspeed.runtime.layers.attention.kv_cache.lcm_msa import (
+            LcmMSATokenToKVPool,
+        )
+
+        return LcmMSATokenToKVPool(
+            size=spec.pool_size,
+            dtype=config.kv_cache_dtype,
+            head_num=max(config.num_kv_heads // config.attn_tp_size, 1),
+            head_dim=config.head_dim,
+            layer_num=num_layers,
+            device=config.device,
+            enable_memory_saver=enable_memory_saver,
+            max_batch_size=config.max_bs,
+            max_context_len=config.context_len,
+            page_size=plan.logical_block_tokens,
+            rank=rank,
+            layer_types=spec.layer_types,
+            sliding_window_tokens=config.sliding_window_tokens,
+            max_scheduled_tokens=config.max_scheduled_tokens,
+            pd_disaggregation_enabled=config.pd_disaggregation_enabled,
+            memory_plan=plan,
+            layer_group_ids=spec.layer_group_ids,
+            state_field_dtypes=spec.state_field_dtypes,
+            index_head_dim=config.index_head_dim,
+            index_dtype=config.dtype,
+            indexed_layer_ids=config.sparse_layer_ids,
+        )
     if isinstance(config, MHAConfig):
         from tokenspeed.runtime.layers.attention.kv_cache.lcm_mha import (
             LcmMHATokenToKVPool,
@@ -852,6 +1223,35 @@ def create_lcm_pool(
             memory_plan=plan,
             layer_group_ids=spec.layer_group_ids,
             state_field_dtypes=spec.state_field_dtypes,
+        )
+    # DSAConfig subclasses MLAConfig, so this branch must precede the MLA one.
+    if isinstance(config, DSAConfig):
+        from tokenspeed.runtime.layers.attention.kv_cache.dsa import (
+            DSATokenToKVPool,
+        )
+
+        return DSATokenToKVPool(
+            size=spec.pool_size,
+            dtype=config.kv_cache_dtype,
+            model_dtype=config.dtype,
+            quant_method=config.kv_cache_quant_method,
+            kv_lora_rank=config.kv_lora_rank,
+            qk_rope_head_dim=config.qk_rope_head_dim,
+            layer_num=num_layers,
+            device=config.device,
+            enable_memory_saver=enable_memory_saver,
+            max_batch_size=config.max_bs,
+            max_context_len=config.context_len,
+            page_size=plan.logical_block_tokens,
+            rank=rank,
+            layer_types=spec.layer_types,
+            layer_group_ids=spec.layer_group_ids,
+            max_scheduled_tokens=config.max_scheduled_tokens,
+            pd_disaggregation_enabled=config.pd_disaggregation_enabled,
+            state_field_dtypes=spec.state_field_dtypes,
+            memory_plan=plan,
+            token_capacity=spec.token_capacity,
+            index_head_dim=config.index_head_dim,
         )
     if isinstance(config, MLAConfig):
         from tokenspeed.runtime.layers.attention.kv_cache.lcm_mla import (

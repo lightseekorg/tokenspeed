@@ -59,7 +59,7 @@ def _make_backend(is_draft: bool = False) -> TRTLLMMHAAttnBackend:
     return TRTLLMMHAAttnBackend(cfg)
 
 
-def _req_to_page(req_pool_size: int, max_pages: int) -> torch.Tensor:
+def _page_table(req_pool_size: int, max_pages: int) -> torch.Tensor:
     # Each request maps to a couple of distinct page ids; row 0 is the
     # reserved/padding row. Values are arbitrary but valid (>=0).
     table = torch.zeros((req_pool_size + 1, max_pages), dtype=torch.int32)
@@ -76,10 +76,10 @@ def test_multi_token_metadata_clamps_padded_seqlen_runtime():
     # the layout that triggered the NaN (real_bs=2, padded to 4).
     seq_lens = torch.tensor([512, 300, 1, 1], dtype=torch.int32)
     req_pool_indices = torch.tensor([1, 2, 0, 0], dtype=torch.int32)
-    req_to_page = _req_to_page(req_pool_size=8, max_pages=be.max_num_pages)
+    page_table = _page_table(req_pool_size=8, max_pages=be.max_num_pages)
 
     be._init_multi_token_metadata(
-        bs, SPEC_NUM_TOKENS, req_pool_indices, seq_lens, req_to_page
+        bs, SPEC_NUM_TOKENS, req_pool_indices, seq_lens, page_table
     )
     cache_seqlens = be.forward_prefill_metadata.cache_seqlens_int32
 
@@ -101,10 +101,10 @@ def test_clamp_does_not_mutate_shared_seq_lens():
     seq_lens = torch.tensor([1, 1, 256], dtype=torch.int32)
     original = seq_lens.clone()
     req_pool_indices = torch.tensor([0, 0, 1], dtype=torch.int32)
-    req_to_page = _req_to_page(req_pool_size=8, max_pages=be.max_num_pages)
+    page_table = _page_table(req_pool_size=8, max_pages=be.max_num_pages)
 
     be._init_multi_token_metadata(
-        bs, SPEC_NUM_TOKENS, req_pool_indices, seq_lens, req_to_page
+        bs, SPEC_NUM_TOKENS, req_pool_indices, seq_lens, page_table
     )
 
     # Caller's seq_lens is unchanged; clamped values live in a separate buffer.
@@ -121,9 +121,9 @@ def test_plain_decode_seqlen_not_clamped():
     bs = 3
     seq_lens = torch.tensor([1, 5, 9], dtype=torch.int32)
     req_pool_indices = torch.tensor([1, 2, 3], dtype=torch.int32)
-    req_to_page = _req_to_page(req_pool_size=8, max_pages=be.max_num_pages)
+    page_table = _page_table(req_pool_size=8, max_pages=be.max_num_pages)
 
-    be._init_decode_metadata(bs, req_pool_indices, seq_lens, req_to_page)
+    be._init_decode_metadata(bs, req_pool_indices, seq_lens, page_table)
     cache_seqlens = be.forward_decode_metadata.cache_seqlens_int32
 
     # Decode path aliases seq_lens verbatim (no clamp): seq_len=1 stays 1.
@@ -173,7 +173,7 @@ def test_draft_replay_refreshes_spec_cache_seqlens_buf():
         req_pool_indices,
         real_seq_lens,
         ForwardMode.DECODE,
-        req_to_page=None,  # skip page-table gather (Triton kernel)
+        page_table=None,  # skip page-table gather (Triton kernel)
     )
 
     # spec_cache_seqlens_buf must now reflect the clamped real values.

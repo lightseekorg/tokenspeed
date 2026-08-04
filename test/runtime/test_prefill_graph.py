@@ -202,7 +202,7 @@ class DummyGroupTablesTest(unittest.TestCase):
                 token_to_kv_pool=pool,
                 input_buffers=object(),
                 config=config,
-                req_to_page=object(),
+                page_table=object(),
             )
 
         self.assertFalse(graph.disable)

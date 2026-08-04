@@ -33,6 +33,7 @@ from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
     DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT,
     V4_KERNEL_BLOCK_ROWS,
     deepseek_v4_swa_row_bytes,
+    first_v4_compressed_kv_group_id,
     v4_compressed_kv_group_id,
 )
 from tokenspeed.runtime.configs.model_config import AttentionArch
@@ -593,7 +594,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
-        req_to_page: torch.Tensor = None,
+        page_table: torch.Tensor = None,
         extend_seq_lens_cpu: torch.Tensor | None = None,
         extend_prefix_lens_cpu: torch.Tensor | None = None,
         extend_prefix_lens: torch.Tensor | None = None,
@@ -617,17 +618,27 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         else:
             num_tokens = bs
         del kwargs
+        # Batch-ordered base page table for ratio<=1 (uncompressed/SWA) indexer
+        # layers, which have no dedicated group: the first (smallest-ratio)
+        # compressed-KV full-history group's table (row i == batch position i).
+        base_block_table = None
         if cache_metadata is not None:
             logical_page_size = int(cache_metadata.block_size)
             self.logical_page_size = logical_page_size
             scheduler_tables = dict(
                 cache_metadata.tables(active_forward_op=forward_batch)
             )
+            base_group_id = first_v4_compressed_kv_group_id(scheduler_tables)
+            if base_group_id is not None:
+                base_block_table = scheduler_tables[base_group_id]
             paged_cache_block_tables = self._prepare_cache_group_tables(
                 scheduler_tables
             )
             paged_cache_block_table_base_offsets = {}
         elif block_tables:
+            base_group_id = first_v4_compressed_kv_group_id(block_tables)
+            if base_group_id is not None:
+                base_block_table = block_tables[base_group_id]
             paged_cache_block_tables = self._prepare_cache_group_tables(block_tables)
         device = seq_lens.device
         req_pool_indices = req_pool_indices[:bs]
@@ -692,14 +703,19 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if is_packed_decode:
             max_seq_len += max(int(query_lens.max().item()) - 1, 0)
         max_pages = (max_seq_len + self.page_size - 1) // self.page_size
-        if req_to_page is None:
+        if base_block_table is not None:
+            # The full-history group's batch-ordered table (row i == batch
+            # position i); slice by batch rows directly.
+            block_table = base_block_table[:bs, : max(max_pages, 1)].to(
+                device=device, dtype=torch.int32
+            )
+        else:
+            # Idle/warmup before any group table exists.
             block_table = torch.zeros(
                 (bs, max(max_pages, 1)),
                 dtype=torch.int32,
                 device=device,
             )
-        else:
-            block_table = req_to_page[req_pool_indices, : max(max_pages, 1)]
         paged_cache_block_tables = {
             str(gid): table[:bs].to(device=device, dtype=torch.int32)
             for gid, table in paged_cache_block_tables.items()
@@ -2000,7 +2016,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
-        req_to_page: torch.Tensor = None,
+        page_table: torch.Tensor = None,
         **kwargs,
     ):
         cache_metadata = kwargs.pop("cache_metadata", None)
@@ -2033,9 +2049,23 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         metadata = self._cuda_graph_metadata[bs]
         self._cuda_graph_req_pool_indices[:bs].copy_(req_pool_indices[:bs])
         self._cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs].to(torch.int32))
-        if req_to_page is not None:
-            self._cuda_graph_block_table[:bs, : self.max_num_pages].copy_(
-                req_to_page[req_pool_indices[:bs], : self.max_num_pages]
+        # Base page table for ratio<=1 indexer layers: the first (smallest-ratio)
+        # compressed-KV full-history group's batch-ordered table.
+        base_block_table = None
+        if cache_metadata is not None:
+            base_group_id = first_v4_compressed_kv_group_id(cache_metadata.group_ids)
+            if base_group_id is not None:
+                base_block_table = cache_metadata.require_table(
+                    base_group_id, active_forward_op=forward_batch
+                )
+        elif block_tables:
+            base_group_id = first_v4_compressed_kv_group_id(block_tables)
+            if base_group_id is not None:
+                base_block_table = block_tables[base_group_id]
+        if base_block_table is not None:
+            width = min(base_block_table.shape[1], self.max_num_pages)
+            self._cuda_graph_block_table[:bs, :width].copy_(
+                base_block_table[:bs, :width].to(device=self.device, dtype=torch.int32)
             )
         offsets_on_device = {
             str(gid): off.to(device=self.device, dtype=torch.int32)
