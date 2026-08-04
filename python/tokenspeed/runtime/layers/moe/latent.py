@@ -494,13 +494,11 @@ class LatentMoELayer(nn.Module):
             routed_latent = _module_tensor_output(self.routed_norm, routed_latent)
             _check_shape(routed_latent, latent_shape, "routed_norm")
 
+        if shared_output is None or not self.defer_routed_up_projection:
+            routed_output = _module_tensor_output(self.routed_up_proj, routed_latent)
+            _check_shape(routed_output, output_shape, "routed_up_proj")
         if shared_output is None:
-            routed_output = _module_tensor_output(self.routed_up_proj, routed_latent)
-            _check_shape(routed_output, output_shape, "routed_up_proj")
             return routed_output
-        if not self.defer_routed_up_projection:
-            routed_output = _module_tensor_output(self.routed_up_proj, routed_latent)
-            _check_shape(routed_output, output_shape, "routed_up_proj")
         if self.shared_reduce is not None and not shared_reduction_applied:
             shared_output = self.shared_reduce(shared_output)
             _check_shape(shared_output, output_shape, "shared_reduce")
