@@ -135,6 +135,12 @@ class MoriEpDispatcher:
         topk_ids: torch.Tensor,  # [num_tokens, topk] (global expert ids)
         scales: torch.Tensor | None = None,
     ) -> dict[str, Any]:
+        # One op is shared across all MoE layers and forwards (see get_dispatcher), so reset
+        # its arena staging + per-rank counters/barriers to a clean slate before each dispatch
+        # -- otherwise stale routing/buffer state from the previous combine can corrupt results
+        # or hang. Reset here (not after combine) so the prior combine's returned view stays
+        # valid until the caller consumes it. Cheap, on-device -> HIP-graph capturable.
+        self._op.reset()
         recv_x, _ow, _os, _oi, _total_recv, routing = self._op.dispatch(
             hidden_states,
             topk_weights,

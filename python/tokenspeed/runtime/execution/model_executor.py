@@ -307,19 +307,27 @@ class ModelExecutor:
         # tp_ep_size so the framework all_reduce reconstructs it (dp=1). A block that instead
         # rescales it as a partial contribution silently produces wrong output. Whitelist by
         # an explicit opt-in flag (not a method name, so rescale-only blocks can opt in too)
-        # and fail fast. (DeepEP is gated per-model via is_deepep().)
+        # and fail fast. Checks the target AND any speculative draft (the draft plans from the
+        # same server args); a dense model (no MoELayer) never plans MORI, so it is exempt.
+        # (DeepEP is gated per-model via is_deepep().)
+        from tokenspeed.runtime.layers.moe.expert import MoELayer
         from tokenspeed.runtime.layers.moe.utils import get_all2all_backend
 
-        if get_all2all_backend().is_mori() and not any(
-            getattr(m, "supports_mori_ep", False)
-            for m in self.model_runner.model.modules()
-        ):
-            raise ValueError(
-                "--all2all-backend mori requires a model whose MoE block sets "
-                "supports_mori_ep=True (correctly consumes MORI's complete routed output; "
-                f"DeepSeek-V3 family, e.g. Kimi-K2.5). {type(self.model_runner.model).__name__} "
-                "does not."
-            )
+        if get_all2all_backend().is_mori():
+            _runners = [self.model_runner]
+            if draft_model_runner is not None:
+                _runners.append(draft_model_runner)
+            for _r in _runners:
+                _mods = list(_r.model.modules())
+                _has_moe = any(isinstance(m, MoELayer) for m in _mods)
+                _supported = any(getattr(m, "supports_mori_ep", False) for m in _mods)
+                if _has_moe and not _supported:
+                    raise ValueError(
+                        "--all2all-backend mori requires every MoE model (target and any "
+                        "speculative draft) to have a MoE block that sets supports_mori_ep="
+                        "True (correctly consumes MORI's complete routed output; DeepSeek-V3 "
+                        f"family, e.g. Kimi-K2.5). {type(_r.model).__name__} does not."
+                    )
         self.sampling_backend = sampling_backend
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
