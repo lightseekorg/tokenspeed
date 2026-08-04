@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from enum import Enum, IntEnum
 from typing import TYPE_CHECKING
 
@@ -202,6 +203,18 @@ def initialize_moe_config(server_args: ServerArgs):
     DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER = (
         server_args.disable_flashinfer_cutlass_moe_fp4_allgather
     )
+
+    # The MORI EP kernels read their tuning from the environment (config crosses the
+    # runtime/tokenspeed-kernel boundary without threading MORI-specific args through the kernel
+    # signatures). Bridge the --mori-* server args into that environment here, once per rank at
+    # startup and before the first dispatch, so operators configure MORI via the CLI.
+    if ALL2ALL_BACKEND.is_mori():
+        if server_args.mori_per_rank_vmm is not None:
+            os.environ["MORI_PER_RANK_VMM"] = str(server_args.mori_per_rank_vmm)
+        if server_args.mori_ep_max_tokens_per_rank is not None:
+            os.environ["MORI_EP_MAX_TOKENS_PER_RANK"] = str(
+                server_args.mori_ep_max_tokens_per_rank
+            )
 
 
 def get_all2all_backend() -> All2AllBackend:

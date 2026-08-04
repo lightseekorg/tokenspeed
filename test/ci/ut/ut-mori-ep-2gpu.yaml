@@ -15,21 +15,13 @@ runner:
     - amd-mi35x-2gpu-test
 env:
   CI: "true"
-  MORI_PER_RANK_VMM: "4294967296"
 install:
+  # amd-mori + flydsl are pinned in tokenspeed-kernel/python/requirements/rocm-thirdparty.txt
+  # and installed with the ROCm kernel build; the libgrpc++.so.1.51 runtime that amd-mori's .so
+  # links is installed by install_deps_rocm.sh (this AMD runner delegates to it). The test still
+  # self-skips via mori_available() if the import fails for any reason, so a misconfigured
+  # runner degrades to a skip, never a blocking failure (job is `optional`).
   - bash test/ci_system/install_deps.sh
-  # MORI's .so links libgrpc++.so.1.51 (gRPC 1.51 C++ runtime), absent from the ROCm runner
-  # image; without it ``import mori`` fails and the test would skip via mori_available().
-  # Install the Ubuntu 24.04 (noble) t64 package so the test actually runs.
-  - sudo apt-get install -y libgrpc++1.51t64
-  # MORI EP deps from the pre-built PyPI wheel (amd-mori) — no source build, no build-time
-  # hipcc/cmake. The wheel ships the compiled libmori_*.so and the v2 dispatch_combine API;
-  # flydsl is the runtime JIT dep for the v2 device kernels. Pin flydsl to 0.2.4: amd-mori
-  # 1.2.2 needs the pre-0.3.0 flydsl API (0.3.0 renamed flydsl.expr.vector -> Vector, so
-  # ``import mori`` fails with the unpinned [flydsl] extra). The test still self-skips via
-  # mori_available() if the import fails for any other reason, so a misconfigured runner
-  # degrades to a skip, never a blocking failure (job is `optional`).
-  - python3 -m pip install "amd-mori==1.2.2" "flydsl==0.2.4"
 ut:
   commands:
     # Real all-to-all dispatch/combine across 2 ranks: bf16 + native mxfp4 vs a replicated

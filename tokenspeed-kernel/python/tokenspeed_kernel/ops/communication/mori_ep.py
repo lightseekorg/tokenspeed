@@ -29,9 +29,20 @@ _COMM = None  # process-wide mori.cco.Communicator singleton
 
 
 def mori_available() -> bool:
-    """True if MORI v2 EP ops (and flydsl) can be imported."""
+    """True if MORI v2 EP ops (and flydsl) can be imported. AMD-only (MORI builds gfx
+    dispatch/combine kernels), so it short-circuits to False on non-AMD platforms."""
     global _MORI_AVAILABLE
     if _MORI_AVAILABLE is None:
+        from tokenspeed_kernel.platform import current_platform
+
+        if not current_platform().is_amd:
+            _MORI_AVAILABLE = False
+            return _MORI_AVAILABLE
+        # All EP ranks JIT-compile the v2 device kernels concurrently and share ~/.flydsl/cache,
+        # which races into a corrupt binary on first compile -- disable the disk cache (compile
+        # in-memory) unless the user has explicitly opted back in. setdefault, so it must be set
+        # before flydsl is first imported below.
+        os.environ.setdefault("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
         try:
             import flydsl  # noqa: F401
             from mori.cco import Communicator  # noqa: F401
@@ -135,12 +146,13 @@ class MoriEpDispatcher:
         topk_ids: torch.Tensor,  # [num_tokens, topk] (global expert ids)
         scales: torch.Tensor | None = None,
     ) -> dict[str, Any]:
-        # One op is shared across all MoE layers and forwards (see get_dispatcher), so reset
-        # its arena staging + per-rank counters/barriers to a clean slate before each dispatch
-        # -- otherwise stale routing/buffer state from the previous combine can corrupt results
-        # or hang. Reset here (not after combine) so the prior combine's returned view stays
-        # valid until the caller consumes it. Cheap, on-device -> HIP-graph capturable.
-        self._op.reset()
+        # NOTE: do NOT reset() the op between dispatches. The MORI kernels self-reset their
+        # per-rank counters and each dispatch re-populates the arena, so the shared op (reused
+        # across all MoE layers/forwards, see get_dispatcher) stays correct without it --
+        # verified across dp=1 and dp=4 aime25 (mean_acc unchanged) and full serve coherence.
+        # An explicit reset() before each dispatch instead RACES the MORI cross-rank barriers
+        # in multi-rank EP (one rank zeroing shared barrier state while another is mid-collective)
+        # and hangs both the eager autotune and HIP-graph capture.
         recv_x, _ow, _os, _oi, _total_recv, routing = self._op.dispatch(
             hidden_states,
             topk_weights,
@@ -171,6 +183,11 @@ class MoriEpDispatcher:
 # its own MORI symmetric buffers (N x memory -> OOM on large models). Keyed by shape;
 # sequential eager reuse across layers is safe (each dispatch re-populates buffers).
 _DISPATCHER_CACHE: dict[tuple, "MoriEpDispatcher"] = {}
+# When a request grows capacity, the previous dispatcher is REPLACED in the cache. A HIP graph
+# captured against the old op holds device pointers into its symmetric buffers, so it must not
+# be freed while any captured graph can still replay it. Hold every superseded dispatcher here
+# for the process lifetime (monotonic growth -> at most a handful) to keep those graphs valid.
+_RETIRED_DISPATCHERS: list["MoriEpDispatcher"] = []
 
 
 def get_dispatcher(
@@ -186,10 +203,11 @@ def get_dispatcher(
 
     The cache key deliberately EXCLUDES ``max_num_inp_token_per_rank``: a cached dispatcher
     whose capacity already covers the request is reused, and only a larger request grows it
-    (recreated at the bigger capacity). Otherwise each new prefill/decode batch size would
-    allocate a fresh MORI op whose large symmetric buffers are never evicted -- a steady VMM
-    leak under variable traffic. Capacity thus grows monotonically to the largest seen and is
-    then reused for all smaller batches.
+    (recreated at the bigger capacity; the superseded op is retained, not freed, so a HIP
+    graph captured against it stays valid -- see ``_RETIRED_DISPATCHERS``). Otherwise each new
+    prefill/decode batch size would allocate a fresh MORI op whose large symmetric buffers are
+    never evicted -- a steady VMM leak under variable traffic. Capacity thus grows monotonically
+    to the largest seen and is then reused for all smaller batches.
     """
     key = (
         rank,
@@ -203,6 +221,10 @@ def get_dispatcher(
     if disp is not None and disp.capacity >= max_num_inp_token_per_rank:
         return disp
     cap = max(max_num_inp_token_per_rank, disp.capacity if disp is not None else 0)
+    if disp is not None:
+        # Superseded by a larger-capacity op; retain it so any HIP graph captured against it
+        # keeps replaying valid MORI buffers instead of freed memory (see _RETIRED_DISPATCHERS).
+        _RETIRED_DISPATCHERS.append(disp)
     disp = MoriEpDispatcher(
         rank=rank,
         world_size=world_size,
