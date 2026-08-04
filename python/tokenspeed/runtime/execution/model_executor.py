@@ -302,6 +302,24 @@ class ModelExecutor:
         self.device = config.device
         self.config = config
         self.model_runner = model_runner
+        # MORI's combine returns the COMPLETE per-token routed result, so a MoE block must
+        # consume it correctly -- directly (forward_alltoall, dp>1) or by pre-dividing by
+        # tp_ep_size so the framework all_reduce reconstructs it (dp=1). A block that instead
+        # rescales it as a partial contribution silently produces wrong output. Whitelist by
+        # an explicit opt-in flag (not a method name, so rescale-only blocks can opt in too)
+        # and fail fast. (DeepEP is gated per-model via is_deepep().)
+        from tokenspeed.runtime.layers.moe.utils import get_all2all_backend
+
+        if get_all2all_backend().is_mori() and not any(
+            getattr(m, "supports_mori_ep", False)
+            for m in self.model_runner.model.modules()
+        ):
+            raise ValueError(
+                "--all2all-backend mori requires a model whose MoE block sets "
+                "supports_mori_ep=True (correctly consumes MORI's complete routed output; "
+                f"DeepSeek-V3 family, e.g. Kimi-K2.5). {type(self.model_runner.model).__name__} "
+                "does not."
+            )
         self.sampling_backend = sampling_backend
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
