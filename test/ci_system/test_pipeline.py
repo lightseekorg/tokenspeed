@@ -376,6 +376,60 @@ def test_extract_evalscope_score_from_box_table():
     assert extract_evalscope_score(report_table) == 0.9667
 
 
+def test_extract_spec_acceptance_supports_tokenspeed_and_sglang_logs():
+    output = """
+Decode batch. avg_accept_len: 2.60, accept_rate: 0.23
+Decode batch, accept len: 3.20, accept rate: 0.37
+"""
+    assert pipeline.extract_accept_lengths(output) == [2.6, 3.2]
+    assert pipeline.extract_accept_rates(output) == [0.23, 0.37]
+
+
+def test_spec_acceptance_threshold_checks_rate_and_length(tmp_path):
+    server_log = tmp_path / "server.log"
+    server_log.write_text(
+        "Decode batch. avg_accept_len: 2.60, accept_rate: 0.23\n"
+        "Decode batch. avg_accept_len: 2.80, accept_rate: 0.25\n"
+    )
+    summary = pipeline.summarize_spec_acceptance(
+        {"type": "perf"}, [], ["perf"], server_log
+    )
+    assert summary is not None
+    assert summary["accept_length"] == pytest.approx(2.7)
+    assert summary["accept_rate"] == pytest.approx(0.24)
+
+    check = pipeline.check_spec_acceptance_threshold(
+        {
+            "accept_length_threshold": 2.5,
+            "accept_rate_threshold": 0.2,
+        },
+        summary,
+        "amd-mi35x-8gpu-test",
+    )
+    assert check is not None
+    assert check["passed"] is True
+
+
+def test_spec_acceptance_threshold_reports_regression():
+    check = pipeline.check_spec_acceptance_threshold(
+        {"accept_length_threshold": 2.5},
+        {"accept_length": 2.2},
+        "amd-mi35x-8gpu-test",
+    )
+    assert check is not None
+    assert check["passed"] is False
+    assert "below threshold" in check["failures"][0]
+
+
+def test_spec_acceptance_threshold_requires_metrics():
+    with pytest.raises(ValueError, match="no acceptance metrics"):
+        pipeline.check_spec_acceptance_threshold(
+            {"accept_rate_threshold": 0.2},
+            None,
+            "amd-mi35x-8gpu-test",
+        )
+
+
 PERF_CSV_FIXTURE = """\
 some unrelated log line
 config,Conc.,Latency (tps/user),Throughput (tps/gpu),Approx Cache Hit,Decoded Tok/Iter

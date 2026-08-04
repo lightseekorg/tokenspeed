@@ -891,11 +891,70 @@ def summarize_command_output(command: str, output: str) -> Dict[str, Any]:
     return result
 
 
-_ACCEPT_RATE_RE = re.compile(r"\baccept_rate:\s*([0-9]+(?:\.[0-9]+)?)")
+_ACCEPT_RATE_RE = re.compile(r"\baccept(?:_| )rate:\s*([0-9]+(?:\.[0-9]+)?)")
+_ACCEPT_LENGTH_RE = re.compile(
+    r"\b(?:avg_accept_len|accept len):\s*([0-9]+(?:\.[0-9]+)?)"
+)
 
 
 def extract_accept_rates(output: str) -> List[float]:
     return [float(value) for value in _ACCEPT_RATE_RE.findall(output)]
+
+
+def extract_accept_lengths(output: str) -> List[float]:
+    return [float(value) for value in _ACCEPT_LENGTH_RE.findall(output)]
+
+
+def summarize_spec_acceptance(
+    task: Dict[str, Any],
+    command_results: List[Dict[str, Any]],
+    stages_run: List[str],
+    server_log_path: Path | None,
+) -> Dict[str, Any] | None:
+    stage = str(task.get("type", ""))
+    if stage not in stages_run:
+        return None
+
+    outputs = [
+        str(result.get("output", ""))
+        for result in command_results
+        if result.get("stage") == stage
+    ]
+    if server_log_path is not None and server_log_path.exists():
+        outputs.append(server_log_path.read_text())
+
+    accept_rates = [
+        value for output in outputs for value in extract_accept_rates(output)
+    ]
+    accept_lengths = [
+        value for output in outputs for value in extract_accept_lengths(output)
+    ]
+    if not accept_rates and not accept_lengths:
+        print("[spec-acceptance] no acceptance metrics found", flush=True)
+        return None
+
+    summary: Dict[str, Any] = {}
+    if accept_rates:
+        summary["accept_rate"] = sum(accept_rates) / len(accept_rates)
+        summary["accept_rate_samples"] = len(accept_rates)
+        # Backward-compatible key used by the existing eval summary.
+        summary["samples"] = len(accept_rates)
+    if accept_lengths:
+        summary["accept_length"] = sum(accept_lengths) / len(accept_lengths)
+        summary["accept_length_samples"] = len(accept_lengths)
+
+    fields = []
+    if "accept_rate" in summary:
+        fields.append(
+            f"rate={summary['accept_rate']:g} " f"(n={summary['accept_rate_samples']})"
+        )
+    if "accept_length" in summary:
+        fields.append(
+            f"length={summary['accept_length']:g} "
+            f"(n={summary['accept_length_samples']})"
+        )
+    print(f"Spec acceptance: {', '.join(fields)}", flush=True)
+    return summary
 
 
 def extract_evalscope_score(report_table: str) -> float | None:
@@ -934,28 +993,82 @@ def summarize_eval_accept_rate(
 ) -> Dict[str, Any] | None:
     if task["type"] != "eval" or "eval" not in stages_run:
         return None
-
-    accept_rates: List[float] = []
-    for result in command_results:
-        if result.get("stage") == "eval":
-            accept_rates.extend(extract_accept_rates(str(result.get("output", ""))))
-
-    if server_log_path is not None and server_log_path.exists():
-        accept_rates.extend(extract_accept_rates(server_log_path.read_text()))
-
-    if not accept_rates:
+    summary = summarize_spec_acceptance(
+        task, command_results, stages_run, server_log_path
+    )
+    if summary is None or "accept_rate" not in summary:
         print("[eval-accept-rate] no accept_rate found in eval logs", flush=True)
         return None
+    return summary
 
-    average = sum(accept_rates) / len(accept_rates)
+
+def check_spec_acceptance_threshold(
+    task: Dict[str, Any],
+    summary: Dict[str, Any] | None,
+    runner: str,
+) -> Dict[str, Any] | None:
+    configured = {
+        "accept_rate": task.get("accept_rate_threshold"),
+        "accept_length": task.get("accept_length_threshold"),
+    }
+    configured = {
+        metric: resolve_score_threshold_for_runner(threshold, runner)
+        for metric, threshold in configured.items()
+        if threshold is not None
+    }
+    configured = {
+        metric: threshold
+        for metric, threshold in configured.items()
+        if threshold is not None
+    }
+    if not configured:
+        return None
+    if summary is None:
+        raise ValueError(
+            "acceptance threshold is configured but no acceptance metrics were found"
+        )
+
+    checks = []
+    failures = []
+    for metric, raw_threshold in configured.items():
+        try:
+            threshold = float(raw_threshold)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{metric}_threshold must be a number or runner mapping"
+            ) from exc
+        if metric not in summary:
+            failures.append(f"{metric}: no metric found")
+            continue
+        actual = float(summary[metric])
+        passed = actual >= threshold
+        checks.append(
+            {
+                "metric": metric,
+                "actual": actual,
+                "threshold": threshold,
+                "passed": passed,
+            }
+        )
+        if not passed:
+            failures.append(
+                f"{metric}: actual {actual:g} is below threshold {threshold:g}"
+            )
+
+    passed = not failures
     print(
-        f"Eval accept rate: {average:g} (samples={len(accept_rates)})",
+        f"[spec-acceptance] threshold status={'passed' if passed else 'failed'}",
         flush=True,
     )
-    return {
-        "accept_rate": average,
-        "samples": len(accept_rates),
-    }
+    for check in checks:
+        print(
+            f"[spec-acceptance]   {check['metric']}: "
+            f"actual={check['actual']:g}, threshold={check['threshold']:g}",
+            flush=True,
+        )
+    for failure in failures:
+        print(f"[spec-acceptance]   {failure}", flush=True)
+    return {"passed": passed, "checks": checks, "failures": failures}
 
 
 def parse_eval_score_threshold(threshold: Any) -> tuple[float, float | None]:
@@ -1296,6 +1409,16 @@ def build_step_summary_lines(result: Dict[str, Any]) -> List[str]:
             f"- Eval accept rate: `{accept_rate['accept_rate']:g}` "
             f"({accept_rate['samples']} samples)"
         )
+    if result.get("spec_acceptance_check"):
+        check = result["spec_acceptance_check"]
+        status = "pass" if check["passed"] else "fail"
+        metrics = ", ".join(
+            f"{item['metric']}={item['actual']:g} " f"(min {item['threshold']:g})"
+            for item in check["checks"]
+        )
+        lines.append(f"- Spec acceptance: `{status}` ({metrics})")
+        if not check["passed"]:
+            lines.extend([f"  - {failure}" for failure in check["failures"]])
 
     command_results = result.get("command_results", [])
     if command_results:
@@ -1616,6 +1739,8 @@ def execute_task(
     command_results: List[Dict[str, Any]] = []
     eval_score_check: Dict[str, Any] | None = None
     eval_accept_rate: Dict[str, Any] | None = None
+    spec_acceptance: Dict[str, Any] | None = None
+    spec_acceptance_check: Dict[str, Any] | None = None
     perf_reference_check: Dict[str, Any] | None = None
     server_process = None
     server_log_path: Path | None = None
@@ -1704,9 +1829,23 @@ def execute_task(
                         "after perf command", runner_env, repo_root, dry_run
                     )
 
-        eval_accept_rate = summarize_eval_accept_rate(
+        spec_acceptance = summarize_spec_acceptance(
             task, command_results, stages_run, server_log_path
         )
+        if (
+            task["type"] == "eval"
+            and spec_acceptance is not None
+            and "accept_rate" in spec_acceptance
+        ):
+            eval_accept_rate = spec_acceptance
+        spec_acceptance_check = check_spec_acceptance_threshold(
+            task, spec_acceptance, runner
+        )
+        if spec_acceptance_check is not None and not spec_acceptance_check["passed"]:
+            raise RuntimeError(
+                "spec acceptance threshold failed: "
+                + "; ".join(spec_acceptance_check["failures"])
+            )
         eval_score_check = check_eval_score_threshold(
             task, command_results, stages_run, runner
         )
@@ -1760,6 +1899,10 @@ def execute_task(
         result["perf_reference_check"] = perf_reference_check
     if eval_accept_rate is not None:
         result["eval_accept_rate"] = eval_accept_rate
+    if spec_acceptance is not None:
+        result["spec_acceptance"] = spec_acceptance
+    if spec_acceptance_check is not None:
+        result["spec_acceptance_check"] = spec_acceptance_check
     write_result(result_json, result)
     if task.get("report", {}).get("github_step_summary"):
         write_detailed_step_summary(result)

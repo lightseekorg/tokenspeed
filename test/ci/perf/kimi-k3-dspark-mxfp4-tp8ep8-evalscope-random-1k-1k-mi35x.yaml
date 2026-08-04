@@ -1,0 +1,103 @@
+api_version: ci.tokenspeed.io/v1
+# Multi-concurrency DSpark regression tracker. The sibling 4k/1k job retains
+# the original concurrency-1 bring-up point; this job covers the operating
+# curve where the sign of DSpark's benefit changes.
+name: perf-kimi-k3-dspark-mxfp4-tp8ep8-random-1k-1k-mi35x
+type: perf
+workflow_stage: model-test
+triggers:
+  - manual
+runner:
+  labels:
+    - amd-mi35x-8gpu-test
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps_rocm.sh
+server:
+  command: >-
+    ts serve
+    --model moonshotai/Kimi-K3
+    --served-model-name kimi-k3
+    --speculative-algorithm DSPARK
+    --speculative-draft-model-path Inferact/Kimi-K3-DSpark
+    --speculative-num-draft-tokens 8
+    --tp 8
+    --ep-size 8
+    --attention-backend mla
+    --drafter-attention-backend mla
+    --moe-backend auto
+    --kv-cache-dtype fp8
+    --mm-encoder-tp-mode data
+    --max-model-len 8192
+    --max-num-seqs 16
+    --max-cudagraph-capture-size 16
+    --cudagraph-capture-sizes 1 2 4 8 16
+    --disable-prefill-graph
+    --gpu-memory-utilization 0.88
+    --trust-remote-code
+    --sampling-backend greedy
+    --disable-kvstore
+    --kvstore-ratio 0.0
+    --no-enable-prefix-caching
+    --enable-cache-report
+    --host 127.0.0.1
+    --port 21000
+    --policy round_robin
+    --engine-startup-timeout 3000
+    --gateway-startup-timeout 600
+  ready:
+    url: http://127.0.0.1:21000/readiness
+    timeout: 3600
+    interval: 10
+perf:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
+  command: >-
+    REPO_ROOT=$PWD &&
+    MODEL=kimi-k3 &&
+    URL=http://127.0.0.1:21000/v1/completions &&
+    OUTPUTS_DIR=/tmp/tokenspeed-kimi-k3-dspark-1k1k-mi35x-perf &&
+    trap 'rm -rf "$OUTPUTS_DIR"' EXIT &&
+    rm -rf "$OUTPUTS_DIR" &&
+    set +e &&
+    /tmp/evalscope-perf/bin/evalscope perf
+    --model "$MODEL"
+    --url "$URL"
+    --api openai
+    --dataset random
+    --tokenizer-path moonshotai/Kimi-K3
+    --min-prompt-length 1024
+    --max-prompt-length 1024
+    --prefix-length 0
+    --min-tokens 1024
+    --max-tokens 1024
+    --parallel 1 4 8 16
+    --number 8 8 16 16
+    --warmup-num 2
+    --rate -1
+    --seed 1
+    --temperature 0
+    --stream
+    --outputs-dir "$OUTPUTS_DIR/input_1k"
+    --no-timestamp
+    --extra-args '{"ignore_eos": true}';
+    PERF_STATUS=$?;
+    python3 "$REPO_ROOT/test/random_benchmark/tokenspeed/collect_outputs.py" "$OUTPUTS_DIR" --num-gpus 8 --emit-csv;
+    PARSE_STATUS=$?;
+    if [ "$PERF_STATUS" -ne 0 ]; then exit "$PERF_STATUS"; fi;
+    exit "$PARSE_STATUS"
+report:
+  github_step_summary: true
+perf_threshold: 0.9
+# Measured on 8x MI355X at PR head 8adb73cf. Values are
+# [Latency (tps/user), output Throughput (tps/gpu)] and are rounded down.
+perf_reference:
+  1: [23.0, 3.0]
+  4: [16.2, 8.0]
+  8: [17.3, 11.4]
+  16: [21.0, 21.0]
+# The controlled random-token matrix measured accept length 2.00-2.05.
+# Leave enough noise margin to avoid making acceptance itself the benchmark.
+accept_length_threshold: 1.8
+accept_rate_threshold: 0.10

@@ -15,7 +15,7 @@ install:
   - bash test/ci_system/install_deps_rocm.sh
 # --disable-prefill-graph: prefill graphs want 40 buckets on top of the decode
 # ones and OOM at this memory fraction. Decode graphs are what speculative
-# decoding rides on, and all four batch buckets capture cleanly.
+# decoding rides on, and the concurrency-1 bucket captures cleanly.
 server:
   command: >-
     ts serve
@@ -97,6 +97,11 @@ perf:
 report:
   github_step_summary: true
 perf_threshold: 0.9
+# Acceptance is the earliest signal that the draft or verify path regressed.
+# K3's published 7-token draft measures ~2.6 accepted tokens on this workload;
+# these conservative floors still catch a collapse toward single-token decode.
+accept_length_threshold: 2.0
+accept_rate_threshold: 0.14
 # Values are [Latency (tps/user), Throughput (tps/gpu)].
 #
 # Measured on 8x MI355X with bf16 weights and decode graphs, alongside a
