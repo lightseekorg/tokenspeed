@@ -1783,20 +1783,22 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         bs: int,
         paged_cache_block_tables: dict[str, torch.Tensor],
         *,
+        actual_bs: int | None = None,
         pad_value: int,
     ) -> dict[str, torch.Tensor]:
         out: dict[str, torch.Tensor] = {}
         if not self._cuda_graph_paged_cache_block_tables:
             return out
+        active_rows = bs if actual_bs is None else actual_bs
         for group_id, buf in self._cuda_graph_paged_cache_block_tables.items():
             table = paged_cache_block_tables.get(group_id)
             buf[:bs].fill_(pad_value)
             if table is not None:
-                if int(table.shape[0]) != bs:
+                if int(table.shape[0]) < active_rows:
                     raise RuntimeError(
                         "DeepSeek V4 CUDA graph paged cache table row count "
                         f"mismatch for {group_id!r}: got {int(table.shape[0])}, "
-                        f"expected padded bs {bs}"
+                        f"expected at least actual_bs {active_rows}"
                     )
                 cols = int(table.shape[1])
                 if cols > int(buf.shape[1]):
@@ -1805,8 +1807,10 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                         f"mismatch for {group_id!r}: got {cols}, capture "
                         f"buffer has {int(buf.shape[1])}"
                     )
-                if cols > 0:
-                    buf[:bs, :cols].copy_(table[:bs, :cols].to(torch.int32))
+                if active_rows > 0 and cols > 0:
+                    buf[:active_rows, :cols].copy_(
+                        table[:active_rows, :cols].to(torch.int32)
+                    )
             out[group_id] = buf[:bs]
         return out
 
@@ -1814,24 +1818,27 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self,
         bs: int,
         base_offsets: dict[str, torch.Tensor],
+        *,
+        actual_bs: int | None = None,
     ) -> dict[str, torch.Tensor]:
         """Refresh persistent base-offset buffers from per-step input.
 
         Sliding groups whose key is missing fall back to 0. Returns the [:bs]
         views keyed by gid.
         """
+        active_rows = bs if actual_bs is None else actual_bs
         out: dict[str, torch.Tensor] = {}
         for gid, buf in self._cuda_graph_paged_cache_base_offsets.items():
             buf[:bs].fill_(0)
             src = base_offsets.get(gid)
-            if src is not None and bs > 0:
+            if src is not None and active_rows > 0:
                 rows = int(src.shape[0])
-                if rows < bs:
+                if rows < active_rows:
                     raise RuntimeError(
                         "DeepSeek V4 CUDA-graph replay base-offsets row count "
-                        f"{rows} < bs={bs} for group {gid!r}"
+                        f"{rows} < actual_bs={active_rows} for group {gid!r}"
                     )
-                buf[:bs].copy_(src[:bs].to(torch.int32))
+                buf[:active_rows].copy_(src[:active_rows].to(torch.int32))
             out[gid] = buf[:bs]
         return out
 
@@ -2064,26 +2071,39 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 base_block_table = block_tables[base_group_id]
         if base_block_table is not None:
             width = min(base_block_table.shape[1], self.max_num_pages)
-            self._cuda_graph_block_table[:bs, :width].copy_(
-                base_block_table[:bs, :width].to(device=self.device, dtype=torch.int32)
-            )
+            if int(base_block_table.shape[0]) < actual_bs:
+                raise RuntimeError(
+                    "DeepSeek V4 CUDA graph base table row count "
+                    f"{int(base_block_table.shape[0])} < actual_bs={actual_bs}"
+                )
+            self._cuda_graph_block_table[:bs].zero_()
+            if actual_bs > 0 and width > 0:
+                self._cuda_graph_block_table[:actual_bs, :width].copy_(
+                    base_block_table[:actual_bs, :width].to(
+                        device=self.device, dtype=torch.int32
+                    )
+                )
         offsets_on_device = {
             str(gid): off.to(device=self.device, dtype=torch.int32)
             for gid, off in paged_cache_block_table_base_offsets.items()
         }
         if block_tables:
-            metadata_paged = self._prepare_cache_group_tables(
+            metadata_paged = self._refresh_cuda_graph_paged_cache_block_tables(
+                bs,
                 block_tables,
-                output_buffers=self._cuda_graph_paged_cache_block_tables,
+                actual_bs=actual_bs,
+                pad_value=-1,
             )
             metadata_base_offsets = {}
         elif cache_metadata is not None:
             scheduler_tables = dict(
                 cache_metadata.tables(active_forward_op=forward_batch)
             )
-            metadata_paged = self._prepare_cache_group_tables(
+            metadata_paged = self._refresh_cuda_graph_paged_cache_block_tables(
+                bs,
                 scheduler_tables,
-                output_buffers=self._cuda_graph_paged_cache_block_tables,
+                actual_bs=actual_bs,
+                pad_value=-1,
             )
             metadata_base_offsets = {}
         else:
@@ -2093,11 +2113,13 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                     str(group_id): table.to(device=self.device, dtype=torch.int32)
                     for group_id, table in paged_cache_block_tables.items()
                 },
+                actual_bs=actual_bs,
                 pad_value=-1,
             )
             metadata_base_offsets = self._refresh_cuda_graph_base_offsets(
                 bs,
                 offsets_on_device,
+                actual_bs=actual_bs,
             )
         (
             swa_block_table,
