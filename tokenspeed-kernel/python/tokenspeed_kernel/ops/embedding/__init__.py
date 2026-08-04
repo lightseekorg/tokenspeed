@@ -183,7 +183,7 @@ def apply_rope_mla(
     k_rope: torch.Tensor,
     q_nope: torch.Tensor,
     k_nope: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
+    cos_sin_cache: torch.Tensor | None,
     # embedding options
     is_neox: bool = True,
     quantize_dtype: torch.dtype = torch.float8_e4m3fn,
@@ -199,6 +199,10 @@ def apply_rope_mla(
     override: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply MLA RoPE and quantize query/key parts to FP8.
+
+    With ``cos_sin_cache=None`` the rotation is skipped (NoPE models such as
+    Kimi-K3): the parts are quantized straight into the combined layout, and
+    a single-head ``k_rope`` broadcasts across the query heads.
 
     Args:
         positions: Token positions. Flattened to [tokens] before dispatch.
@@ -232,7 +236,7 @@ def apply_rope_mla(
     Returns:
         (query_fp8, key_fp8), where the last dimension is concat(nope, rope).
     """
-    positions = positions.flatten()
+    positions = positions.flatten() if cos_sin_cache is not None else positions
     query_fp8 = None
     key_fp8 = None
 
@@ -292,6 +296,7 @@ def apply_rope_mla(
         )
 
     traits = {
+        "has_rope": cos_sin_cache is not None,
         "is_neox": bool(is_neox),
         "quantize_dtype": quantize_dtype,
         "has_scale_q_tensor": isinstance(quant_scale_q, torch.Tensor),

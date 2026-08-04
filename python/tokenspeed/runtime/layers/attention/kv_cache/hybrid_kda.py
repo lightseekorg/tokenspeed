@@ -27,6 +27,7 @@ from dataclasses import replace
 
 import numpy as np
 import torch
+
 from tokenspeed.runtime.configs import paged_cache_spec
 from tokenspeed.runtime.configs.cache_runtime import (
     PagedCacheRuntimeContract,

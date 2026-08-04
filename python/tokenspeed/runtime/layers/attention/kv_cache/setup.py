@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 import torch
+
 from tokenspeed.runtime.configs.paged_cache_spec import PagedCacheGroupSpec
 from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
 from tokenspeed.runtime.layers.attention.kv_cache.plan import CacheMemoryPlan

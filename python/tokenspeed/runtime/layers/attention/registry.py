@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 from typing import TYPE_CHECKING
@@ -993,6 +994,18 @@ def create_attn_components(
     backend.set_cache_pool(pool)
     if draft_attn_backend is not None and draft_pool is not None:
         draft_attn_backend.set_cache_pool(draft_pool)
+        if getattr(draft_pool, "runtime_contract", None) is not None:
+            mark_cache_contract = getattr(
+                draft_attn_backend, "mark_cache_contract", None
+            )
+            if mark_cache_contract is not None:
+                params = inspect.signature(mark_cache_contract).parameters
+                if "logical_page_size" in params:
+                    mark_cache_contract(
+                        logical_page_size=draft_pool.plan.logical_block_tokens
+                    )
+                else:
+                    mark_cache_contract()
 
     _validate_shared_cache_geometry(pool, draft_pool)
     _prepare_verify_workspace(

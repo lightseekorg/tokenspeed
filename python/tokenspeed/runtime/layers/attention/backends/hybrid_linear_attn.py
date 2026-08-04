@@ -1841,6 +1841,10 @@ class HybridLinearAttnBackend(AttentionBackend):
     def chunked_prefill_metadata(self):
         return self.full_attn_backend.chunked_prefill_metadata
 
+    @property
+    def data_type(self):
+        return self.full_attn_backend.data_type
+
     def override_num_extends(self, num_extends: int):
         return self.full_attn_backend.override_num_extends(num_extends)
 

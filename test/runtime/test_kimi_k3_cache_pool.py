@@ -3,16 +3,18 @@ from __future__ import annotations
 import pytest
 import torch
 
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
-    kimi_k3_layer_group_ids,
-    solve_kimi_k3_cache_layout,
-)
 from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
 from tokenspeed.runtime.configs.paged_cache_spec import (
     FULL_ATTENTION,
     LINEAR_ATTENTION,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import HybridKDATokenToKVPool
+from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
+    HybridKDATokenToKVPool,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
+    kimi_k3_layer_group_ids,
+    solve_kimi_k3_cache_layout,
+)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

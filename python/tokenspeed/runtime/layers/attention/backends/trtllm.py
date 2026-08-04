@@ -50,6 +50,7 @@ from tokenspeed.runtime.layers.attention.backends.cache_groups import (
     CacheGroupsMixin,
 )
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+from tokenspeed.runtime.layers.attention.page_table import expand_page_table
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.layers.common import fp8_cast_contiguous
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -145,9 +146,13 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
 
         self.page_size = config.page_size
         self.group_page_sizes = dict(getattr(config, "group_page_sizes", None) or {})
+        self._cache_contract_bound = False
+        self._cache_logical_page_size: int | None = None
+        self._block_expand_buf: torch.Tensor | None = None
         self.max_context_len = config.context_len
         self.kv_cache_dtype = config.kv_cache_dtype
         max_bs = config.max_bs
+        self._max_bs = max_bs
 
         # Shared workspace buffer (allocated once per process).
         global _global_workspace_buffer
@@ -216,10 +221,17 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         """Build page table in [bs, max_pages] format from req_to_page.
 
         req_to_page is [req_pool_size+1, max_pages] containing page IDs.
+        A paged-cache-contract draft receives mirrored scheduler (logical)
+        page ids instead and expands them into kernel pages first.
         """
-        page_table_buf[:bs].copy_(
-            req_to_page[req_pool_indices[:bs], : self.max_num_pages]
-        )
+        if self._reads_mirrored_logical_pages():
+            page_table_buf[:bs].copy_(
+                self._expand_mirrored_page_table(req_pool_indices, bs, req_to_page)
+            )
+        else:
+            page_table_buf[:bs].copy_(
+                req_to_page[req_pool_indices[:bs], : self.max_num_pages]
+            )
         return page_table_buf[:bs]
 
     # ------------------------------------------------------------------
@@ -539,6 +551,40 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             out_cache_locs=group_out_cache_locs,
         )
 
+    def mark_cache_contract(self, logical_page_size: int | None = None) -> None:
+        """Record that the pool runs on the paged cache contract."""
+        self._cache_contract_bound = True
+        if logical_page_size is not None:
+            self._cache_logical_page_size = int(logical_page_size)
+
+    def _reads_mirrored_logical_pages(self) -> bool:
+        """True when req_to_page holds mirrored scheduler (logical) page ids."""
+        logical = getattr(self, "_cache_logical_page_size", None)
+        return (
+            getattr(self, "_cache_contract_bound", False)
+            and logical is not None
+            and logical != self.page_size
+        )
+
+    def _expand_mirrored_page_table(
+        self, req_pool_indices: torch.Tensor, bs: int, req_to_page: torch.Tensor
+    ) -> torch.Tensor:
+        """Expand mirrored logical page ids into kernel pages ([bs, max_num_pages])."""
+        if self._block_expand_buf is None:
+            with torch.inference_mode(False):
+                self._block_expand_buf = torch.zeros(
+                    (self._max_bs, self.max_num_pages),
+                    dtype=req_to_page.dtype,
+                    device=req_to_page.device,
+                )
+        return expand_page_table(
+            req_to_page[req_pool_indices[:bs]],
+            logical_page_size=self._cache_logical_page_size,
+            kernel_page_size=self.page_size,
+            max_kernel_pages=self.max_num_pages,
+            out=self._block_expand_buf,
+        )
+
     def _replicate_block_page_table(
         self,
         out: torch.Tensor,
@@ -546,14 +592,16 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         bs: int,
         req_to_page: torch.Tensor,
     ) -> None:
-        """Replicate each request's page table to its spec_num_tokens block rows.
-
-        ``out`` is the [bs*spec_num_tokens, max_num_pages] destination. All block
-        rows of a request share its pages (decode only reads KV), so a single
-        broadcast copy suffices.
-        """
+        """Replicate each request's page table to its spec_num_tokens block rows."""
         spec = self.spec_num_tokens
-        base_page_table = req_to_page[req_pool_indices[:bs], : self.max_num_pages]
+
+        if self._reads_mirrored_logical_pages():
+            base_page_table = self._expand_mirrored_page_table(
+                req_pool_indices, bs, req_to_page
+            )
+        else:
+            base_page_table = req_to_page[req_pool_indices[:bs], : self.max_num_pages]
+
         out[: bs * spec, :].view(bs, spec, self.max_num_pages).copy_(
             base_page_table[:, None, :]
         )
@@ -914,12 +962,11 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
                 f"trtllm CUDA graph replay not supported for {forward_mode}"
             )
 
-        # Fail loudly instead of replaying over stale/zero page tables.
-        self._replay_stale_guard(bs, block_tables)
-
         if self.draft_block_decode and self.spec_num_tokens > 1:
             # DFLASH draft block: replicate the page table to each request's
             # block rows. seq_lens are re-derived in-graph, so not touched here.
+            # The per-group stale guard doesn't apply: block-decode capture
+            # records only cuda_graph_page_table, refilled right here.
             if req_to_page is not None:
                 self._replicate_block_page_table(
                     self.cuda_graph_page_table, req_pool_indices, bs, req_to_page
@@ -927,6 +974,9 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             if bs in self.cuda_graph_decode_metadata:
                 self.forward_decode_metadata = self.cuda_graph_decode_metadata[bs]
             return
+
+        # Fail loudly instead of replaying over stale/zero page tables.
+        self._replay_stale_guard(bs, block_tables)
 
         # Copy the live cache lengths into our own buffer (the plain-decode and
         # draft-decode metadata view cuda_graph_cache_seqlens); the spec>1 verify

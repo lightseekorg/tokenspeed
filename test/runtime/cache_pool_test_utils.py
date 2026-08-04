@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+
 from tokenspeed.runtime.configs import paged_cache_spec
 from tokenspeed.runtime.layers.attention.kv_cache.plan import solve_cache_layout
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (

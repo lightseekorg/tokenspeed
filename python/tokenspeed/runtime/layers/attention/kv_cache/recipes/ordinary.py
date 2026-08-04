@@ -447,6 +447,7 @@ def _ordinary_setup(
 
 def _mha_fields(config, num_layers: int):
     import torch
+
     from tokenspeed.runtime.configs import paged_cache_spec
 
     if config.kv_cache_mxfp8:

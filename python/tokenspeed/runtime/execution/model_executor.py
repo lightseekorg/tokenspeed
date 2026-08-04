@@ -50,6 +50,7 @@ from tokenspeed.runtime.execution.cache_loc_kernel import update_block_table
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
+from tokenspeed.runtime.execution.drafter.dspark import DSpark
 from tokenspeed.runtime.execution.drafter.eagle import Eagle
 from tokenspeed.runtime.execution.drafter.mtp import Mtp
 from tokenspeed.runtime.execution.forward_batch_info import (
@@ -100,7 +101,12 @@ def _get_drafter_impl(spec_algo: str, model: torch.nn.Module):
         InklingForConditionalGenerationNextN,
     )
 
-    DRAFTER_MAPPING = {"EAGLE3": Eagle, "MTP": Eagle, "DFLASH": DFlash}
+    DRAFTER_MAPPING = {
+        "EAGLE3": Eagle,
+        "MTP": Eagle,
+        "DFLASH": DFlash,
+        "DSPARK": DSpark,
+    }
 
     # "MTP" covers two algorithms:
     # (1) Eagle-like MTP (e.g. DeepSeek) stays on Eagle in eagle.py;
@@ -313,6 +319,7 @@ class ModelExecutor:
         self._mirror_idx_cpu: torch.Tensor | None = None
         self._mirror_idx_dev: torch.Tensor | None = None
         self._mirror_row_buf: torch.Tensor | None = None
+        self._mirror_for_block_draft = config.spec_algo in ("DFLASH", "DSPARK")
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
 
@@ -335,7 +342,9 @@ class ModelExecutor:
             # out of bounds, hanging the attention kernel. Pad generously; a few
             # int32 columns per request. Non-DFLASH algorithms do not need this.
             draft_block_reservation_slack = (
-                config.spec_num_tokens * 64 if config.spec_algo == "DFLASH" else 0
+                config.spec_num_tokens * 64
+                if config.spec_algo in ("DFLASH", "DSPARK")
+                else 0
             )
             max_num_pages_per_req = (
                 config.context_len
@@ -420,7 +429,7 @@ class ModelExecutor:
                     draft_model_runner.model_config.hf_config
                 )
                 self.model_runner.model.set_eagle3_layers_to_capture(aux_layer_ids)
-            if config.spec_algo == "DFLASH":
+            if config.spec_algo in ("DFLASH", "DSPARK"):
                 if not hasattr(self.model_runner.model, "set_dflash_layers_to_capture"):
                     raise ValueError(
                         "DFLASH requires the target model to support "
@@ -743,10 +752,14 @@ class ModelExecutor:
     ) -> None:
         """Expose the full-history table to ordinary speculative consumers."""
         if (
-            self._cache_runtime_contract is not None
-            or self.drafter is None
+            self.drafter is None
             or not block_tables
             or self._full_history_group_id is None
+        ):
+            return
+        if (
+            self._cache_runtime_contract is not None
+            and not self._mirror_for_block_draft
         ):
             return
         table = block_tables.get(self._full_history_group_id)
@@ -916,7 +929,7 @@ class ModelExecutor:
             accept_lengths = self._apply_force_single_token_verify(
                 accept_lengths, 0, num_decodes, ctx.decode_input_ids
             )
-            if self.config.spec_algo == "DFLASH":
+            if self.config.spec_algo in ("DFLASH", "DSPARK"):
                 accept_lengths = self._cap_accept_to_context_len(
                     accept_lengths, sampling_info.req_pool_indices[:num_decodes]
                 )
@@ -934,7 +947,7 @@ class ModelExecutor:
         decode_accept = self._apply_force_single_token_verify(
             decode_accept, num_extends, num_decodes, ctx.decode_input_ids
         )
-        if self.config.spec_algo == "DFLASH":
+        if self.config.spec_algo in ("DFLASH", "DSPARK"):
             decode_accept = self._cap_accept_to_context_len(
                 decode_accept, sampling_info.req_pool_indices[num_extends:]
             )
@@ -1499,6 +1512,10 @@ class ModelExecutor:
                     num_requests=bs,
                 )
                 block_tables = dict(cache_metadata.tables(active_forward_op=forward_op))
+                # A block-decode drafter mirrors page tables.
+                self._mirror_full_history_table_into_req_to_page(
+                    forward_op, block_tables
+                )
             else:
                 block_tables = block_tables_from_forward_op(
                     forward_op,
@@ -1676,7 +1693,7 @@ class ModelExecutor:
                             time.perf_counter() - forward_step_start
                         ) * 1000.0
 
-                if self.config.spec_algo == "DFLASH":
+                if self.config.spec_algo in ("DFLASH", "DSPARK"):
                     # Clamp the committed-length delta so no request grows past
                     # context_len. Done here (outside the graph) so it reaches
                     # both _update_runtime_state and the scheduler page

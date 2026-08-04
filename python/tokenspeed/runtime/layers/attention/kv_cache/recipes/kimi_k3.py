@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import torch
+
 from tokenspeed.runtime.layers.attention.kv_cache.plan import (
     CacheFieldSpec,
     CacheMemoryPlan,

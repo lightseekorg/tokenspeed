@@ -213,6 +213,7 @@ def _workspace_bytes(
     lagged_window: bool = False,
 ) -> int:
     import torch
+
     from tokenspeed.runtime.configs.inkling_config import inkling_conv_total_dim
 
     rows = int(attn_config.max_bs) + 2

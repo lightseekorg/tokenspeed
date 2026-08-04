@@ -628,7 +628,7 @@ class GDNStatePagingGPUTest(unittest.TestCase):
         self.assertTrue(
             torch.allclose(paged_output.float(), o_ref.float(), atol=1e-1, rtol=1e-2)
         )
-        st_diff = (ssm_slab[3] - st_ref[0].float()).abs()
+        st_diff = (ssm_slab[3] - st_ref[0].float().transpose(-1, -2)).abs()
         self.assertLess(st_diff.mean().item(), 1e-3)
 
         # Null page 0 must never be written; page 2 (prefill's out page)
