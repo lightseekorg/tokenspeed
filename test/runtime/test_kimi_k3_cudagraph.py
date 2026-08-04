@@ -33,8 +33,12 @@ from ci_system.ci_register import register_cuda_ci
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.mla import MLAAttnBackend
+from tokenspeed.runtime.layers.attention.backends.mla_cache_groups import (
+    MlaCacheGroupMixin,
+)
 from tokenspeed.runtime.layers.attention.backends.tokenspeed_mla import (
     CuteDSLMLABackend,
+    CuteDSLMLADecodeMetadata,
 )
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
@@ -44,15 +48,20 @@ _LOGICAL_P = 128  # logical block size (ratio 2 kernel pages per logical page)
 _MAX_CTX = 256
 
 
-def _bare_mla_backend(*, cache_contract: bool) -> CuteDSLMLABackend:
+def _bare_mla_backend(
+    *,
+    cache_contract: bool,
+    is_draft: bool = False,
+    spec_num_tokens: int = 1,
+) -> CuteDSLMLABackend:
     """A CuteDSLMLABackend with only the attributes the CUDA-graph metadata
     paths touch — the full ctor JIT-compiles CuteDSL kernels (GPU only)."""
     backend = object.__new__(CuteDSLMLABackend)
     backend.device = "cpu"
     backend.page_size = _PAGE_SIZE
     backend.max_context_len = _MAX_CTX
-    backend.is_draft = False
-    backend.spec_num_tokens = 1
+    backend.is_draft = is_draft
+    backend.spec_num_tokens = spec_num_tokens
     backend._block_table_aliased = False
     backend._cache_groups_bound = False
     backend._cache_contract_bound = False
@@ -63,6 +72,42 @@ def _bare_mla_backend(*, cache_contract: bool) -> CuteDSLMLABackend:
     if cache_contract:
         backend.mark_cache_contract()
     return backend
+
+
+def test_target_verify_mixed_batch_skips_complete_prefill_windows() -> None:
+    backend = _bare_mla_backend(cache_contract=False, spec_num_tokens=8)
+    backend._cache_groups_bound = True
+    locations = torch.arange(16, dtype=torch.int64)
+    backend.forward_decode_metadata = CuteDSLMLADecodeMetadata(
+        num_extends=1,
+        group_out_cache_loc=locations,
+        group_q_len_per_req=8,
+    )
+
+    selected = backend.select_out_cache_loc(
+        SimpleNamespace(layer_id=0),
+        torch.full((8,), -1, dtype=torch.int64),
+        ForwardMode.DECODE,
+    )
+
+    assert selected.tolist() == list(range(8, 16))
+
+
+def test_mla_target_verify_width_applies_to_mixed_batches() -> None:
+    backend = object.__new__(MlaCacheGroupMixin)
+    backend.spec_num_tokens = 8
+    backend.is_draft = False
+
+    assert backend._verify_q_len(ForwardMode.DECODE) == 8
+    assert backend._verify_q_len(ForwardMode.MIXED) == 8
+
+
+def test_cutedsl_mla_draft_keeps_classic_page_table_contract() -> None:
+    backend = _bare_mla_backend(cache_contract=False, is_draft=True)
+
+    backend.mark_cache_contract(logical_page_size=_LOGICAL_P)
+
+    assert backend._cache_contract_bound is False
 
 
 def _bare_amd_mla_backend(*, cache_contract: bool) -> MLAAttnBackend:

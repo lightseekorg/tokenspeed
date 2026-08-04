@@ -878,7 +878,11 @@ class InklingAttnBackend(AttentionBackend):
                     -1, -1, old_state.shape[-1]
                 ),
             )
-            packed_rows = x[checkpoints.packed_rows]
+            # Static prefill-graph metadata includes padded requests whose
+            # packed row is the one-past-end sentinel. Gather a safe row first;
+            # packed_row_mask discards it below.
+            safe_packed_rows = checkpoints.packed_rows.clamp(max=x.shape[0] - 1)
+            packed_rows = x[safe_packed_rows]
             rows = torch.where(
                 checkpoints.packed_row_mask[..., None],
                 packed_rows,
