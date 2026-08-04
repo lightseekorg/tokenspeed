@@ -302,23 +302,19 @@ class ModelExecutor:
         self.device = config.device
         self.config = config
         self.model_runner = model_runner
-        # MORI's combine returns the COMPLETE per-token routed result. Only decoder layers that
-        # use DeepseekV3DecoderLayer.forward_mlp consume it correctly -- dp>1 keeps tokens local
-        # and dispatch/combines via forward_alltoall; dp=1 pre-divides by tp_ep_size so the
-        # decoder's post_mlp_fused all_reduce reconstructs it. A layer that OVERRIDES forward_mlp
-        # (e.g. GLM MoE-DSA / Qwen keep the framework all-gather + reduce-scatter) would rescale
-        # MORI's complete output as a partial contribution and silently produce wrong results.
-        # Whitelist by that exact method rather than a class flag -- the flag would be inherited
-        # by such overriding subclasses (they reuse DeepseekV3MoE) and wrongly pass. Checks the
-        # target AND any speculative draft (the draft plans from the same server args); a dense
-        # model (no MoELayer) never plans MORI, so it is exempt. (DeepEP is gated via is_deepep().)
+        # MORI's combine returns the COMPLETE per-token routed result, so a decoder layer must
+        # consume it correctly (dp>1 dispatch/combine via forward_alltoall; dp=1 /tp_ep_size
+        # pre-division reconstructed by post_mlp_fused). Whitelist by the @mori_ep_capable marker
+        # on the layer's forward_mlp: it travels with the specific implementation, so a subclass
+        # that OVERRIDES forward_mlp with a partial-contribution path (e.g. GLM MoE-DSA / Qwen keep
+        # the framework all-gather + reduce-scatter) drops the marker and is rejected -- and gains
+        # support by re-applying the decorator once its override adds MORI handling, no guard edit.
+        # Checks the target AND any speculative draft (the draft plans from the same server args);
+        # a dense model (no MoELayer) never plans MORI, so it is exempt. (DeepEP: is_deepep().)
         from tokenspeed.runtime.layers.moe.expert import MoELayer
         from tokenspeed.runtime.layers.moe.utils import get_all2all_backend
 
         if get_all2all_backend().is_mori():
-            from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3DecoderLayer
-
-            _mori_forward_mlp = DeepseekV3DecoderLayer.forward_mlp
             _runners = [self.model_runner]
             if draft_model_runner is not None:
                 _runners.append(draft_model_runner)
@@ -326,17 +322,18 @@ class ModelExecutor:
                 _mods = list(_r.model.modules())
                 _has_moe = any(isinstance(m, MoELayer) for m in _mods)
                 _supported = any(
-                    getattr(type(m), "forward_mlp", None) is _mori_forward_mlp
+                    getattr(
+                        getattr(type(m), "forward_mlp", None), "_mori_ep_capable", False
+                    )
                     for m in _mods
                 )
                 if _has_moe and not _supported:
                     raise ValueError(
                         "--all2all-backend mori requires every MoE model (target and any "
-                        "speculative draft) to have decoder layers using "
-                        "DeepseekV3DecoderLayer.forward_mlp, which correctly consumes MORI's "
-                        "complete routed output (DeepSeek-V3 family, e.g. Kimi-K2.5). "
-                        f"{type(_r.model).__name__} does not (its MoE decoder overrides "
-                        "forward_mlp with a partial-contribution path that mis-scales MORI)."
+                        "speculative draft) to have a decoder layer whose forward_mlp is marked "
+                        "@mori_ep_capable (correctly consumes MORI's complete routed output; "
+                        f"DeepSeek-V3 family, e.g. Kimi-K2.5). {type(_r.model).__name__} does not "
+                        "(its MoE decoder's forward_mlp mis-scales MORI as a partial contribution)."
                     )
         self.sampling_backend = sampling_backend
         self.attn_backend = attn_backend

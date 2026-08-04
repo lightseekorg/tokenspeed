@@ -32,6 +32,29 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def mori_ep_capable(forward_mlp):
+    """Mark a decoder-layer ``forward_mlp`` as correctly consuming MORI's COMPLETE routed output
+    -- dp>1 keeps tokens local and dispatch/combines via ``forward_alltoall``; dp=1 pre-divides by
+    tp_ep_size so ``post_mlp_fused``'s all_reduce reconstructs it. The executor's
+    ``--all2all-backend mori`` guard whitelists a model iff one of its decoder layers carries this
+    marker, so a block that would rescale the complete output as a partial contribution is
+    rejected up front.
+
+    The marker travels with the specific function, NOT the class: a subclass that reimplements
+    ``forward_mlp`` (e.g. GLM MoE-DSA / Qwen, which keep the framework all-gather + reduce-scatter)
+    does not inherit it and is excluded automatically. To extend MORI to such a model, add the
+    equivalent MORI handling to its ``forward_mlp`` override and re-apply this decorator -- no
+    change to the guard is needed.
+
+    Args:
+        forward_mlp: the decoder-layer ``forward_mlp`` method being marked.
+    Returns:
+        The same method, tagged with ``_mori_ep_capable = True``.
+    """
+    forward_mlp._mori_ep_capable = True
+    return forward_mlp
+
+
 class RoutingMethodType(IntEnum):
     Default = 0
     Renormalize = 1

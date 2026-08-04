@@ -92,7 +92,11 @@ from tokenspeed.runtime.layers.linear import (
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import TopK
-from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, get_all2all_backend
+from tokenspeed.runtime.layers.moe.utils import (
+    RoutingMethodType,
+    get_all2all_backend,
+    mori_ep_capable,
+)
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
@@ -1488,6 +1492,7 @@ class DeepseekV3DecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         return hidden_states, residual
 
+    @mori_ep_capable
     def forward_mlp(
         self,
         hidden_states,
