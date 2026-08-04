@@ -253,7 +253,11 @@ class MultimodalEmbedder:
         self._vision_tp_group = vision_tp_group
         self._vision_tp_process_group = None
         self._vision_tp_src_rank: int | None = None
-        if vision_tp_group is not None and len(vision_tp_group) > 1:
+        if (
+            vision_tp_group is not None
+            and len(vision_tp_group) > 1
+            and process_group_manager.has_process_group("nccl", vision_tp_group)
+        ):
             self._vision_tp_process_group = process_group_manager.get_process_group(
                 "nccl", vision_tp_group
             )
