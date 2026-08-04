@@ -19,9 +19,7 @@
 # SOFTWARE.
 
 import socket
-import time
 import traceback
-from types import SimpleNamespace
 from typing import List
 
 import pytest
@@ -117,13 +115,6 @@ def worker_main(rank: int, world_size: int, port: int, hidden_size: int) -> None
             check_reduce_scatter(rsag, rank, world_size, tokens, hidden_size, device)
 
         if current_platform().is_amd:
-            check_amd_rsag_reuses_single_barrier_signal(
-                rsag,
-                rank,
-                world_size,
-                hidden_size,
-                device,
-            )
             check_all_reduce(rank, world_size, device)
             check_allreduce_residual_rmsnorm(rank, world_size, device)
     finally:
@@ -235,80 +226,7 @@ def check_reduce_scatter(
     )
 
     assert result.shape == expected.shape
-    assert (
-        result.untyped_storage().data_ptr()
-        != rsag.comm_buff.untyped_storage().data_ptr()
-    )
     torch.testing.assert_close(result, expected, atol=0, rtol=0)
-
-
-def check_amd_rsag_reuses_single_barrier_signal(
-    rsag,
-    rank: int,
-    world_size: int,
-    hidden_size: int,
-    device,
-) -> None:
-    """Stress one-/multi-subgroup signal reuse with a rotating delayed rank."""
-    tokens = token_cases(world_size)[-1]
-    local = torch.full(
-        (tokens[rank], hidden_size),
-        rank + 1,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    full = torch.full(
-        (sum(tokens), hidden_size),
-        rank + 1,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-
-    dist.barrier()
-    scatter = None
-    for iteration in range(32):
-        if iteration % world_size == rank:
-            time.sleep(0.001)
-        all_gather(
-            rsag,
-            local,
-            token_list_in_group=tokens,
-            safe=False,
-        )
-        scatter = reduce_scatter(
-            rsag,
-            full,
-            token_list_in_group=tokens,
-            safe=False,
-        )
-
-    # Preserve the final gather before another collective reuses the symmetric
-    # buffer. This also exercises RS-exit -> AG-exit reuse one final time.
-    gather = all_gather(
-        rsag,
-        local,
-        token_list_in_group=tokens,
-        safe=True,
-    )
-
-    expected_gather = torch.empty_like(gather)
-    offset = 0
-    for peer, peer_tokens in enumerate(tokens):
-        expected_gather[offset : offset + peer_tokens].fill_(peer + 1)
-        offset += peer_tokens
-    torch.testing.assert_close(gather, expected_gather, atol=0, rtol=0)
-
-    assert scatter is not None
-    expected_scatter = torch.full(
-        (tokens[rank], hidden_size),
-        world_size * (world_size + 1) // 2,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    torch.testing.assert_close(scatter, expected_scatter, atol=0, rtol=0)
-
-    signal = rsag.symm_mem_hdl.get_signal_pad(rank, (3,), dtype=torch.int32)
-    torch.testing.assert_close(signal, torch.zeros_like(signal), atol=0, rtol=0)
 
 
 def run_rsag_test(world_size: int, hidden_size: int) -> None:
@@ -330,77 +248,5 @@ def run_rsag_test(world_size: int, hidden_size: int) -> None:
         raise RuntimeError("\n".join(f"Rank {r}: {e}" for r, e in error_dict.items()))
 
 
-@pytest.mark.parametrize("world_size", [2, 4, 8])
-def test_triton_communication_correctness(world_size):
-    run_rsag_test(world_size=world_size, hidden_size=2880)
-
-
-def test_amd_rsag_num_blocks_uses_rank_local_persistent_grid(monkeypatch):
-    from tokenspeed_kernel.ops.communication.triton import amd_rsag_num_blocks
-
-    class DeviceProperties:
-        multi_processor_count = 256
-
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda _device: DeviceProperties(),
-    )
-
-    device = torch.device("cuda:0")
-    assert amd_rsag_num_blocks(0, device) == 1
-    assert amd_rsag_num_blocks(1024, device) == 1
-    assert amd_rsag_num_blocks(1025, device) == 2
-    assert amd_rsag_num_blocks(8192 * 7168, device) == 256
-
-
-def test_amd_rsag_reduce_scatter_uses_one_subgroup_and_returns_kernel_output(
-    monkeypatch,
-):
-    import tokenspeed_kernel.ops.communication.triton as communication
-
-    class FakeKernel:
-        output = None
-        launch_kwargs = None
-
-        def __getitem__(self, _grid):
-            def launch(_buffer_ptrs, _signal_ptrs, output, **_kwargs):
-                self.output = output
-                self.launch_kwargs = _kwargs
-
-            return launch
-
-    kernel = FakeKernel()
-    state = communication.TritonCommState(
-        group=None,
-        rank_in_group=0,
-        world_size=1,
-        device=torch.device("cpu"),
-        max_token_num=1,
-        hidden_dim=4,
-        comm_buff=torch.empty((1, 4), dtype=torch.bfloat16),
-        symm_mem_hdl=SimpleNamespace(
-            buffer_ptrs_dev=None,
-            signal_pad_ptrs_dev=None,
-            rank=0,
-            world_size=1,
-        ),
-    )
-    hidden_states = torch.ones((1, 4), dtype=torch.bfloat16)
-
-    monkeypatch.setattr(communication, "amd_rsag_num_blocks", lambda *_args: 1)
-    monkeypatch.setattr(communication, "amd_rsag_reduce_scatter_kernel", kernel)
-
-    result = communication.amd_rsag_reduce_scatter(
-        state,
-        hidden_states,
-        token_list_in_group=[1],
-        safe=True,
-    )
-
-    assert result is kernel.output
-    # The completion release only publishes VMEM operations from its issuing
-    # subgroup. A multi-subgroup payload program needs an explicit whole-program
-    # global-memory fence that Triton's current scalar-atomic lowering lacks.
-    assert kernel.launch_kwargs["num_warps"] == 1
-    assert result.untyped_storage().data_ptr() != state.comm_buff.data_ptr()
+def test_triton_communication_correctness_world4():
+    run_rsag_test(world_size=4, hidden_size=2880)

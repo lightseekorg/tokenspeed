@@ -1243,10 +1243,10 @@ def _amd_rsag_reduce_scatter_entry(
 ):
     """Open a rank-local gate after one subgroup completes the RS entry barrier.
 
-    Entry state is a reusable local latch: idle means no leader, elected means
-    one resident subgroup is inside the cross-rank barrier, and ready releases
-    all current or late-starting payload subgroups. Ready remains set until the
-    final payload subgroup completes the reduce-scatter exit barrier.
+    Entry state is a reusable rank-local gate: idle means no leader, elected
+    means one resident subgroup is inside the cross-rank barrier, and ready
+    releases all current or late-starting payload subgroups. Ready remains set
+    until the final payload subgroup completes the reduce-scatter exit barrier.
     """
     signal_ptrs = signal_pad_ptrs_dev.to(tl.pointer_type(tl.uint64))
     local_signal = tl.load(signal_ptrs + RANK).to(tl.pointer_type(tl.uint32))
@@ -1310,9 +1310,9 @@ def _amd_rsag_complete_grid(
 ):
     """Elect the last local subgroup to perform the completion barrier.
 
-    RESET_ENTRY_STATE is true for reduce-scatter, whose entry latch must remain
+    RESET_ENTRY_STATE is true for reduce-scatter, whose entry gate must remain
     ready until every local payload subgroup has finished. All-gather never uses
-    that latch and passes false.
+    the entry gate and passes false.
     """
     signal_ptrs = signal_pad_ptrs_dev.to(tl.pointer_type(tl.uint64))
     local_signal = tl.load(signal_ptrs + RANK).to(tl.pointer_type(tl.uint32))
