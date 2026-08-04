@@ -1009,9 +1009,13 @@ class KimiLinearMoE(nn.Module):
                 "activation_situ_linear_beta": situ_linear_beta,
             },
             routing_mode="precomputed_topk",
-            # The SiTU paths run w4a8; flashinfer's SiTU cubins are MxFP4 x
-            # MxFP8 only.
-            internal_activation_dtype_override="fp8",
+            # Native gfx950 runs A16W4; FlashInfer's SiTU cubins require
+            # MXFP4 weights with MXFP8 activations.
+            internal_activation_dtype_override=(
+                "input"
+                if self.execution_plan.use_native
+                else "fp8" if self.execution_plan.use_trtllm else None
+            ),
         )
         if self.experts.support_routing:
             raise RuntimeError(
