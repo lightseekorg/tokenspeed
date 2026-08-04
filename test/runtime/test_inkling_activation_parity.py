@@ -162,7 +162,7 @@ class _Harness:
             kv_cache_quant_method="none",
         )
         inner = MHAAttnBackend(config)
-        from test.runtime.cache_pool_test_utils import make_mha_memory_plan
+        from cache_pool_test_utils import make_mha_memory_plan
 
         self.kv_pool = MHATokenToKVPool(
             size=1024,

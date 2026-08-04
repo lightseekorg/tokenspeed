@@ -111,7 +111,7 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
     assert pool.buffer is not None
 
 
-def test_ordinary_mha_uses_cache_setup_with_legacy_capacity() -> None:
+def test_ordinary_mha_reserves_null_parent_within_cache_budget() -> None:
     model_config = SimpleNamespace(
         num_attention_layers=2,
         hf_config=SimpleNamespace(),
@@ -150,8 +150,9 @@ def test_ordinary_mha_uses_cache_setup_with_legacy_capacity() -> None:
 
     assert setup.target.family == "mha"
     assert setup.target.memory_plan.logical_block_tokens == 64
-    assert setup.target.memory_plan.num_lcm_blocks == 16
-    assert setup.target.token_capacity == 1024
+    assert setup.target.memory_plan.num_lcm_blocks == 15
+    assert setup.target.memory_plan.arena_bytes <= 16_384
+    assert setup.target.token_capacity == 960
     assert setup.draft is None
     pool = create_cache_pool(
         setup.target,
@@ -171,7 +172,7 @@ def test_ordinary_mha_uses_cache_setup_with_legacy_capacity() -> None:
         )
 
 
-def test_ordinary_mla_uses_cache_setup_with_legacy_capacity() -> None:
+def test_ordinary_mla_reserves_null_parent_within_cache_budget() -> None:
     model_config = SimpleNamespace(
         num_attention_layers=2,
         hf_config=SimpleNamespace(),
@@ -214,8 +215,9 @@ def test_ordinary_mla_uses_cache_setup_with_legacy_capacity() -> None:
 
     assert setup.target.family == "mla"
     assert setup.target.memory_plan.logical_block_tokens == 64
-    assert setup.target.memory_plan.num_lcm_blocks == 16
-    assert setup.target.token_capacity == 1024
+    assert setup.target.memory_plan.num_lcm_blocks == 15
+    assert setup.target.memory_plan.arena_bytes <= 24_576
+    assert setup.target.token_capacity == 960
     assert setup.draft is None
     pool = create_cache_pool(
         setup.target,

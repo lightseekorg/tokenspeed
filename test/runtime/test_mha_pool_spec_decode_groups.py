@@ -36,7 +36,7 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
         self.MHATokenToKVPool = MHATokenToKVPool
 
     def _pool(self, **overrides):
-        from test.runtime.cache_pool_test_utils import make_mha_memory_plan
+        from cache_pool_test_utils import make_mha_memory_plan
 
         kwargs = {
             "size": 32,

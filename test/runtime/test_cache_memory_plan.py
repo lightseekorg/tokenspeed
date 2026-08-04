@@ -103,6 +103,30 @@ class CacheMemoryPlanTest(unittest.TestCase):
         self.assertEqual(by_id["layer.1.k"].shape[0], 128)
         self.assertEqual(by_id["layer.0.ssm"].shape, (8, 128, 128))
 
+    def test_ordinary_profile_reserves_null_page_inside_budget(self):
+        ordinary = sys.modules[
+            "tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary"
+        ]
+        env_module = types.ModuleType("tokenspeed.runtime.utils.env")
+        env_module.envs = types.SimpleNamespace(
+            TOKENSPEED_CI_SMALL_KV_SIZE=types.SimpleNamespace(
+                get_set_value_or=lambda default: default
+            )
+        )
+
+        with unittest.mock.patch.dict(
+            sys.modules,
+            {"tokenspeed.runtime.utils.env": env_module},
+        ):
+            usable_pages = ordinary._profiled_pages(
+                cache_budget_bytes=16_384,
+                bytes_per_token=16,
+                page_size=64,
+                max_total_tokens=None,
+            )
+
+        self.assertEqual(usable_pages, 15)
+
     def test_mha_layers_keep_distinct_fields_with_shared_placement(self):
         fields = self.layouts_module.mha_cache_fields(
             layer_group_ids=(

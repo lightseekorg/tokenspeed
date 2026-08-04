@@ -40,7 +40,7 @@ LAYERS = 2
 
 
 def _make_pool(page_size: int, size: int = 512):
-    from test.runtime.cache_pool_test_utils import make_mha_memory_plan
+    from cache_pool_test_utils import make_mha_memory_plan
 
     from tokenspeed.runtime.layers.attention.kv_cache.mha import (
         MHATokenToKVPoolMXFP8,
@@ -168,7 +168,7 @@ SHARED_KV_HEADS = (2, 4, 2, 4)
 
 
 def _make_shared_pool(size: int = 512):
-    from test.runtime.cache_pool_test_utils import make_mha_memory_plan
+    from cache_pool_test_utils import make_mha_memory_plan
 
     from tokenspeed.runtime.layers.attention.kv_cache.mha import (
         MHATokenToKVPoolMXFP8,

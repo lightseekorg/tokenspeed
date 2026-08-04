@@ -165,7 +165,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
         self.MHATokenToKVPool = MHATokenToKVPool
 
     def _pool(self, **overrides):
-        from test.runtime.cache_pool_test_utils import make_mha_memory_plan
+        from cache_pool_test_utils import make_mha_memory_plan
 
         kwargs = {
             "size": 32,
@@ -306,7 +306,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
             "rank": 0,
             "layer_types": ("full_attention",),
         }
-        from test.runtime.cache_pool_test_utils import make_mha_memory_plan
+        from cache_pool_test_utils import make_mha_memory_plan
 
         kwargs["memory_plan"] = make_mha_memory_plan(
             size=kwargs["size"],
@@ -339,7 +339,7 @@ class MLAPoolAllocationHookTest(unittest.TestCase):
 
     def test_constructor_uses_overridable_buffer_allocation(self):
         torch = self.torch
-        from test.runtime.cache_pool_test_utils import make_mla_memory_plan
+        from cache_pool_test_utils import make_mla_memory_plan
 
         class PoolWithCustomAllocation(self.MLATokenToKVPool):
             def _create_buffers(self):
@@ -494,7 +494,7 @@ class CachePoolFieldBindingTest(unittest.TestCase):
         )
 
     def _ordinary_pool(self):
-        from test.runtime.cache_pool_test_utils import make_mha_memory_plan
+        from cache_pool_test_utils import make_mha_memory_plan
 
         return self.mha_pool_cls(
             size=8,

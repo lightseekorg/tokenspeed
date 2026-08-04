@@ -322,11 +322,11 @@ def _profiled_pages(
     page_size: int,
     max_total_tokens: int | None,
 ) -> int:
-    """Preserve the existing page-count rounding and token-limit behavior."""
+    """Return usable pages while keeping the reserved null page in budget."""
     if bytes_per_token <= 0:
         raise ValueError(f"KV cache cell size must be positive, got {bytes_per_token}")
-    max_num_tokens = cache_budget_bytes // bytes_per_token
-    num_pages = (max_num_tokens + page_size - 1) // page_size
+    bytes_per_page = bytes_per_token * page_size
+    num_pages = cache_budget_bytes // bytes_per_page - 1
     if max_total_tokens is not None:
         requested_pages = max_total_tokens // page_size
         if requested_pages < 1:
@@ -345,7 +345,7 @@ def _profiled_pages(
             raise ValueError(
                 "TOKENSPEED_CI_SMALL_KV_SIZE must be divisible by page_size"
             )
-        num_pages = ci_tokens // page_size
+        num_pages = min(num_pages, ci_tokens // page_size)
     if num_pages < 1:
         raise ValueError("KV cache token pool size must be positive")
     return num_pages
