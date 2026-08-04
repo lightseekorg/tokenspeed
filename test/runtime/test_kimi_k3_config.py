@@ -148,6 +148,49 @@ class KimiK3ConfigTests(unittest.TestCase):
 
 
 class KimiK3RegistrationTests(unittest.TestCase):
+    def test_mla_mixed_batch_slices_decode_gate_to_live_rows(self):
+        from tokenspeed.runtime.execution.context import ForwardContext
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+        from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3AttentionMLA
+
+        metadata = SimpleNamespace(
+            extend_seq_lens_cpu=[1],
+            use_absorbed_cached_extend=False,
+        )
+        backend = SimpleNamespace(
+            spec_num_tokens=1,
+            chunked_prefill_metadata=metadata,
+        )
+        ctx = ForwardContext(
+            attn_backend=backend,
+            token_to_kv_pool=None,
+            bs=3,
+            num_extends=1,
+            input_num_tokens=4,
+            forward_mode=ForwardMode.DECODE,
+        )
+        attention = DeepseekV3AttentionMLA.__new__(DeepseekV3AttentionMLA)
+        torch.nn.Module.__init__(attention)
+        attention.num_local_heads = 2
+        attention.v_head_dim = 3
+        attention.forward_normal_chunked = mock.Mock()
+        attention.forward_absorb = mock.Mock()
+
+        output_gate = torch.arange(24).reshape(4, 6)
+        attention._attn(
+            positions=torch.arange(4),
+            q=torch.empty(4, 2, 8),
+            latent_cache=torch.empty(4, 1, 8),
+            ctx=ctx,
+            out_cache_loc=torch.arange(4),
+            output_gate=output_gate,
+        )
+
+        torch.testing.assert_close(
+            attention.forward_absorb.call_args.kwargs["output_gate"],
+            output_gate[1:3],
+        )
+
     def test_shared_projection_preserves_direct_write_output(self):
         import tokenspeed.runtime.models.kimi_k3 as kimi_k3
 

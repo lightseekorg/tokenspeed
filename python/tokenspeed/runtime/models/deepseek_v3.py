@@ -778,7 +778,11 @@ class DeepseekV3AttentionMLA(nn.Module):
                 decode_ctx,
                 out_cache_loc[num_prefill_tokens:real_total],
                 attn_output[num_prefill_tokens:real_total],
-                output_gate=output_gate,
+                output_gate=(
+                    None
+                    if output_gate is None
+                    else output_gate[num_prefill_tokens:real_total]
+                ),
                 absorbed_query=(
                     None
                     if absorbed_query is None
