@@ -15,13 +15,76 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""CUDA quantization kernels."""
+"""Marlin helper ops (GPTQ repacking).
+
+Provides Marlin helper ops for GPTQ repacking.
+"""
+
+from __future__ import annotations
+
+import functools
+from pathlib import Path
 
 from tokenspeed_kernel.registry import error_fn
 
 try:
-    from .native import gptq_marlin_repack
+    import torch
+    import tvm_ffi
 except ImportError:
+    torch = None
+    tvm_ffi = None
+
+
+def _objs_dir() -> Path:
+    return Path(__file__).resolve().parent / "objs"
+
+
+@functools.cache
+def _load_marlin_module():
+    """Load the pre-compiled marlin shared library via TVM FFI."""
+    so_path = _objs_dir() / "marlin" / "marlin.so"
+    if not so_path.exists():
+        raise RuntimeError(
+            f"tokenspeed_kernel marlin library not found at {so_path}. "
+            "Run `pip install -e tokenspeed_kernel/python/` to build."
+        )
+    return tvm_ffi.load_module(str(so_path))
+
+
+def gptq_marlin_repack(
+    b_q_weight: torch.Tensor,
+    perm: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    num_bits: int,
+) -> torch.Tensor:
+    """Repack GPTQ quantized weights into Marlin layout.
+
+    Args:
+        b_q_weight: int32 CUDA, shape [size_k / pack_factor, size_n]
+        perm: int32 CUDA, 1D; empty (numel==0) means no act_order
+        size_k: number of input features
+        size_n: number of output features
+        num_bits: quantization bits (4 or 8)
+
+    Returns:
+        int32 CUDA, shape [size_k / 16, size_n * 16 / pack_factor]
+    """
+    if num_bits not in (4, 8):
+        raise ValueError("num_bits must be 4 or 8")
+    pack_factor = 32 // int(num_bits)
+    out = torch.empty(
+        (int(size_k) // 16, int(size_n) * 16 // pack_factor),
+        device=b_q_weight.device,
+        dtype=torch.int32,
+    )
+    _load_marlin_module().gptq_marlin_repack(
+        out, b_q_weight, perm, int(size_k), int(size_n), int(num_bits)
+    )
+    return out
+
+
+if tvm_ffi is None:
     gptq_marlin_repack = error_fn
 
 __all__ = ["gptq_marlin_repack"]

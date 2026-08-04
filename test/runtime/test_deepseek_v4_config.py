@@ -20,7 +20,7 @@ from tokenspeed_kernel.ops.model.deepseek_v4.cuda import (
     has_indexer_topk_prefill,
     indexer_topk_prefill,
 )
-from tokenspeed_kernel.ops.moe.routing.cuda.native import (
+from tokenspeed_kernel.ops.moe.routing.cuda import (
     hash_softplus_sqrt_topk_flash,
     softplus_sqrt_topk_flash,
 )

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.model.minimax_m3.cuda.native import (
+from tokenspeed_kernel.ops.model.minimax_m3.cuda import (
     fused_qknorm_rope_kv_insert,
 )
 from tokenspeed_kernel.platform import current_platform

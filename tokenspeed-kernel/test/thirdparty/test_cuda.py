@@ -107,7 +107,7 @@ class TestApplyRopeWithCosSinCacheInplace:
 
     def test_outofplace_correctness(self):
         """Out-of-place RoPE matches torch reference."""
-        from tokenspeed_kernel.ops.embedding.cuda.native import (
+        from tokenspeed_kernel.ops.embedding.cuda import (
             apply_rope_with_cos_sin_cache_inplace as tk_rope,
         )
 
@@ -133,7 +133,7 @@ class TestApplyRopeWithCosSinCacheInplace:
 
     def test_inplace(self):
         """In-place RoPE works."""
-        from tokenspeed_kernel.ops.embedding.cuda.native import (
+        from tokenspeed_kernel.ops.embedding.cuda import (
             apply_rope_with_cos_sin_cache_inplace as tk_rope,
         )
 
@@ -144,7 +144,7 @@ class TestApplyRopeWithCosSinCacheInplace:
 
     def test_outofplace(self):
         """Out-of-place RoPE works."""
-        from tokenspeed_kernel.ops.embedding.cuda.native import (
+        from tokenspeed_kernel.ops.embedding.cuda import (
             apply_rope_with_cos_sin_cache_inplace as tk_rope,
         )
 
@@ -168,7 +168,7 @@ class TestApplyRopeWithCosSinCacheInplace:
 
     def test_outofplace_matches_inplace(self):
         """Out-of-place output matches in-place output."""
-        from tokenspeed_kernel.ops.embedding.cuda.native import (
+        from tokenspeed_kernel.ops.embedding.cuda import (
             apply_rope_with_cos_sin_cache_inplace as tk_rope,
         )
 
@@ -197,7 +197,7 @@ class TestApplyRopeWithCosSinCacheInplace:
 
     def test_correctness(self):
         """Matches torch reference."""
-        from tokenspeed_kernel.ops.embedding.cuda.native import (
+        from tokenspeed_kernel.ops.embedding.cuda import (
             apply_rope_with_cos_sin_cache_inplace as tk_rope,
         )
 
@@ -215,7 +215,7 @@ class TestApplyRopeWithCosSinCacheInplace:
 
     def test_float16(self):
         """Works with float16 (not just bfloat16)."""
-        from tokenspeed_kernel.ops.embedding.cuda.native import (
+        from tokenspeed_kernel.ops.embedding.cuda import (
             apply_rope_with_cos_sin_cache_inplace as tk_rope,
         )
 
