@@ -40,40 +40,20 @@ __all__ = [
 ]
 
 
-def _ts_supported_arch() -> bool:
-    """Gate: the CuTe DSL multi-CTA / cluster radix top-k needs NVIDIA sm_100+.
-
-    Returns False if platform detection raises (e.g. CPU-only host) so callers
-    fall back transparently.
-    """
-    try:
-        p = current_platform()
-    except Exception:
-        return False
-    if not p.is_nvidia:
-        return False
-    sm = p.arch_version.major * 10 + p.arch_version.minor
-    return sm >= 100
-
-
 _CUTE_DSL_TOPK_AVAILABLE = False
 _ClusterRunner = None
 _BaseRunner = None
 
-if _ts_supported_arch():
-    try:
-        import cutlass  # noqa: F401  (import probe: kernels JIT via cutlass-dsl)
-        import cutlass.cute  # noqa: F401
-        from tokenspeed_kernel.ops.attention.dsa.cute_dsl.topk import (
-            CuteDSLTopKDecodeSinglePassMultiCTAClusterRunner as _ClusterRunner,
-        )
-        from tokenspeed_kernel.ops.attention.dsa.cute_dsl.topk import (
-            CuteDSLTopKDecodeSinglePassMultiCTARunner as _BaseRunner,
-        )
+platform = current_platform()
+if platform.is_nvidia and platform.is_blackwell_plus:
+    from tokenspeed_kernel.ops.attention.dsa.cute_dsl.topk import (
+        CuteDSLTopKDecodeSinglePassMultiCTAClusterRunner as _ClusterRunner,
+    )
+    from tokenspeed_kernel.ops.attention.dsa.cute_dsl.topk import (
+        CuteDSLTopKDecodeSinglePassMultiCTARunner as _BaseRunner,
+    )
 
-        _CUTE_DSL_TOPK_AVAILABLE = True
-    except ImportError:
-        _CUTE_DSL_TOPK_AVAILABLE = False
+    _CUTE_DSL_TOPK_AVAILABLE = True
 
 
 def has_cute_dsl_decode_topk() -> bool:

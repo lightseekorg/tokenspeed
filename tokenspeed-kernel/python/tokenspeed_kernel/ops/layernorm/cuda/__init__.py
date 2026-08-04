@@ -22,14 +22,12 @@ from __future__ import annotations
 import functools
 from pathlib import Path
 
+import torch
+import tvm_ffi
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import error_fn
 
-try:
-    import torch
-    import tvm_ffi
-except ImportError:
-    torch = None
-    tvm_ffi = None
+rmsnorm_fused_parallel = error_fn
 
 
 @functools.cache
@@ -44,7 +42,7 @@ def _load_rmsnorm_module():
     return tvm_ffi.load_module(str(so_path))
 
 
-def rmsnorm_fused_parallel(
+def _rmsnorm_fused_parallel(
     input1: torch.Tensor,
     weight1: torch.Tensor,
     output1: torch.Tensor,
@@ -66,7 +64,8 @@ def rmsnorm_fused_parallel(
     )
 
 
-if tvm_ffi is None:
-    rmsnorm_fused_parallel = error_fn
+if current_platform().is_nvidia:
+    rmsnorm_fused_parallel = _rmsnorm_fused_parallel
+
 
 __all__ = ["rmsnorm_fused_parallel"]

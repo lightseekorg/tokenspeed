@@ -23,22 +23,20 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
-from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+)
+from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
-try:
+gluon_argmax_gfx950 = error_fn
+
+if current_platform().is_cdna4:
     from tokenspeed_kernel_amd.ops.gfx950.sampling.argmax import (
         gluon_argmax_gfx950 as _argmax_impl,
     )
-except ImportError as exc:
-    _IMPORT_ERROR = exc
-    _argmax_impl = None
-else:
-    _IMPORT_ERROR = None
-
-
-if _argmax_impl is not None:
 
     @register_kernel(
         "sampling",
@@ -62,17 +60,6 @@ if _argmax_impl is not None:
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return _argmax_impl(logits, out=out)
-
-else:
-
-    def gluon_argmax_gfx950(
-        logits: torch.Tensor,
-        *,
-        out: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        raise ImportError(
-            "gluon_argmax_gfx950 requires tokenspeed-kernel-amd"
-        ) from _IMPORT_ERROR
 
 
 __all__ = ["gluon_argmax_gfx950"]

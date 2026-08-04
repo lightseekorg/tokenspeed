@@ -35,10 +35,12 @@ from tokenspeed_triton import language as tl
 from tokenspeed_triton.experimental import gluon
 from tokenspeed_triton.language.core import _aggregate as aggregate
 from tokenspeed_triton.language.extra import libdevice
+from tokenspeed_triton.runtime.jit import ConstexprFunction
 from tokenspeed_triton.tools.tensor_descriptor import TensorDescriptor
 
 __all__ = [
     "aggregate",
+    "ConstexprFunction",
     "TensorDescriptor",
     "gl",
     "gluon",
@@ -80,10 +82,7 @@ class _TritonRedirectFinder(importlib.abc.MetaPathFinder):
         if fullname != _TRITON_SRC and not fullname.startswith(_TRITON_SRC + "."):
             return None
         target_name = _TRITON_DST + fullname[len(_TRITON_SRC) :]
-        try:
-            target_module = importlib.import_module(target_name)
-        except ImportError:
-            return None
+        target_module = importlib.import_module(target_name)
         is_pkg = hasattr(target_module, "__path__")
         spec = importlib.util.spec_from_loader(
             fullname, _ReuseModuleLoader(target_module), is_package=is_pkg

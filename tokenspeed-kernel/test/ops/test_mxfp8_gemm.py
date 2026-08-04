@@ -36,10 +36,10 @@ def test_triton_mxfp8_1x32_raw_ue8m0_weight(device: str) -> None:
 
 
 def _has_flashinfer_mxfp8() -> bool:
-    try:
-        from tokenspeed_kernel.ops.gemm.fp8.flashinfer import has_flashinfer_mxfp8
-    except ImportError:
+    if not current_platform().is_blackwell:
         return False
+    from tokenspeed_kernel.ops.gemm.fp8.flashinfer import has_flashinfer_mxfp8
+
     return has_flashinfer_mxfp8()
 
 

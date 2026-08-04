@@ -5,24 +5,21 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
-from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+)
+from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
-try:
+gluon_sigmoid_bias_topk_gfx950 = error_fn
+
+if current_platform().is_cdna4:
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.routing import (
         invoke_sigmoid_bias_topk_route_gluon,
         invoke_sigmoid_bias_topk_route_prefill_gluon,
     )
-except ImportError as exc:
-    _IMPORT_ERROR = exc
-    invoke_sigmoid_bias_topk_route_gluon = None
-    invoke_sigmoid_bias_topk_route_prefill_gluon = None
-else:
-    _IMPORT_ERROR = None
-
-
-if invoke_sigmoid_bias_topk_route_prefill_gluon is not None:
 
     @register_kernel(
         "moe",
@@ -61,13 +58,6 @@ if invoke_sigmoid_bias_topk_route_prefill_gluon is not None:
             normalize_topk_weights=normalize_topk_weights,
         )
         return topk_weights, topk_ids
-
-else:
-
-    def gluon_sigmoid_bias_topk_gfx950(**kwargs) -> tuple[torch.Tensor, torch.Tensor]:
-        raise ImportError(
-            "gluon_sigmoid_bias_topk_gfx950 requires tokenspeed-kernel-amd"
-        ) from _IMPORT_ERROR
 
 
 __all__ = ["gluon_sigmoid_bias_topk_gfx950"]

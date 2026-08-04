@@ -6,9 +6,6 @@ from tokenspeed_kernel.registry import error_fn
 tinygemm_bf16 = error_fn
 
 if current_platform().is_hopper_plus:
-    try:
-        from flashinfer.gemm import tinygemm_bf16
-    except ImportError:
-        pass
+    from flashinfer.gemm import tinygemm_bf16
 
 __all__ = ["tinygemm_bf16"]

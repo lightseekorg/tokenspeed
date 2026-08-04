@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import dataclasses
 import enum
-import importlib.util
 import inspect as _inspect
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -26,9 +25,6 @@ for _compat_name in ("ThrMma", "ThrCopy"):
         setattr(cute.core, _compat_name, getattr(cute, _compat_name))
 if not hasattr(cute, "make_fragment"):
     cute.make_fragment = cute.make_rmem_tensor
-
-if importlib.util.find_spec("flash_attn.cute") is None:
-    raise ImportError("tokenspeed-fa4 is required for the rel_mha kernels")
 
 from flash_attn.cute import blackwell_helpers as sm100_utils
 from flash_attn.cute import mma_sm100_desc as sm100_desc

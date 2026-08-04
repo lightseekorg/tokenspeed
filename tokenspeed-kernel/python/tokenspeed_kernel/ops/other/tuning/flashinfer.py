@@ -51,8 +51,11 @@ import functools
 import logging
 import os
 from collections.abc import Generator
-from importlib import import_module
 from importlib.metadata import version
+from pathlib import Path
+
+import torch
+from tokenspeed_kernel.platform import current_platform
 
 __all__ = [
     "autotune",
@@ -65,6 +68,7 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+platform = current_platform()
 
 _DEFAULT_AUTOTUNE_MAX_NUM_TOKENS = 8192
 
@@ -133,17 +137,17 @@ def autotune() -> Generator[None]:
 
     Kernels invoked inside the block profile their candidate tactics and cache
     the winner per shape bucket; outside it they are a cache lookup with a
-    heuristic fallback. A no-op when the tuning backend is unavailable.
+    heuristic fallback. A no-op on non-NVIDIA platforms.
 
     Yields:
         ``None``; tuning is disabled again when the block exits, including on
         error.
     """
-    try:
-        import flashinfer.autotuner
-    except ImportError:
+    if not platform.is_nvidia:
         yield
         return
+    import flashinfer.autotuner
+
     with flashinfer.autotuner.autotune():
         yield
 
@@ -156,18 +160,18 @@ def set_autotune_process_group(process_group) -> None:
     ranks converge on the same tactic despite per-GPU timing noise. Requires
     every rank in the group to profile the same tuned ops in the same order
     with identical caches at entry; set it before the tuning window opens and
-    clear it (pass ``None``) after the window closes. Like :func:`autotune`, a
-    no-op when the tuning backend is unavailable.
+    clear it (pass ``None``) after the window closes. Like :func:`autotune`,
+    this is a no-op on non-NVIDIA platforms.
 
     Args:
         process_group: A ``torch.distributed`` process group covering the
             ranks that tune together (prefer a CPU/gloo group), or ``None``
             to restore independent per-rank tuning.
     """
-    try:
-        import flashinfer.autotuner
-    except ImportError:
+    if not platform.is_nvidia:
         return
+    import flashinfer.autotuner
+
     flashinfer.autotuner.set_autotune_process_group(process_group)
 
 
@@ -185,16 +189,16 @@ def load_flashinfer_tuning_cache(path: str) -> bool:
             ``AutoTuner.save_configs``).
 
     Returns:
-        True when the table was loaded; False for every failure mode --
-        missing file, unimportable flashinfer, or an environment-metadata
-        mismatch. Failures log a warning and leave the startup autotune
-        window to tune those shapes rather than failing startup.
+        True when the table was loaded; False on unsupported platforms, a
+        missing file, or an environment-metadata mismatch. Failures log a
+        warning and leave the startup autotune window to tune those shapes
+        rather than failing startup.
     """
-    try:
-        from flashinfer.autotuner import AutoTuner
-    except ImportError as exc:
-        logger.warning(f"flashinfer tuning cache not loaded (no flashinfer): {exc}")
+    if not platform.is_nvidia:
+        logger.warning("flashinfer tuning cache not loaded on a non-NVIDIA platform")
         return False
+    from flashinfer.autotuner import AutoTuner
+
     try:
         loaded = AutoTuner.get().load_configs(path)
     except FileNotFoundError:
@@ -253,8 +257,6 @@ def load_packaged_flashinfer_tuning_cache(
         True when a matching packaged table was found and loaded.
     """
     try:
-        import torch
-
         device_name = torch.cuda.get_device_name()
         cudnn_version = torch.backends.cudnn.version()
         if cudnn_version is None:
@@ -263,11 +265,8 @@ def load_packaged_flashinfer_tuning_cache(
     except Exception as exc:
         logger.info(f"packaged tuning-cache lookup skipped: {exc}")
         return False
-    try:
-        model_package = import_module(
-            f"tokenspeed_kernel.ops.model.{model.replace('-', '_')}"
-        )
-    except ModuleNotFoundError:
+    model_dir = Path(__file__).resolve().parents[2] / "model" / model.replace("-", "_")
+    if not model_dir.is_dir():
         logger.info(f"no packaged tuning-cache namespace for model {model!r}")
         return False
 
@@ -279,7 +278,7 @@ def load_packaged_flashinfer_tuning_cache(
         fi_version,
         cudnn_version,
     )
-    tactics_dir = os.path.join(os.path.dirname(model_package.__file__), "tactics")
+    tactics_dir = model_dir / "tactics"
     path = os.path.join(tactics_dir, name)
     if not os.path.exists(path):
         # A table swept for this exact model/layout/device but a different

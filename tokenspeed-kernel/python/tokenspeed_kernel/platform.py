@@ -36,7 +36,11 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
+import torch.distributed._symmetric_memory as _symmetric_memory
 import torch.multiprocessing as mp
+
+if torch.version.hip is None:
+    import pynvml
 
 logger = logging.getLogger(__name__)
 
@@ -290,8 +294,6 @@ def current_platform() -> PlatformInfo:
 def _torch_version() -> tuple[int, ...]:
     """Return PyTorch version as a comparable tuple, e.g. (2, 7, 0)."""
     try:
-        import torch
-
         return tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:3])
     except Exception:
         return (0, 0, 0)
@@ -299,13 +301,6 @@ def _torch_version() -> tuple[int, ...]:
 
 def _detect_platform() -> PlatformInfo:
     """Detect current platform capabilities."""
-    try:
-        import torch
-    except ImportError:
-        raise RuntimeError(
-            "tokenspeed-kernel requires PyTorch with NVIDIA CUDA or AMD ROCm support."
-        ) from None
-
     if torch.cuda.is_available():
         if hasattr(torch.version, "hip") and torch.version.hip:
             return _detect_rocm_platform()
@@ -316,8 +311,6 @@ def _detect_platform() -> PlatformInfo:
 
 def _detect_cuda_platform() -> PlatformInfo:
     """Detect NVIDIA CUDA platform."""
-    import torch
-
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     arch_version = ArchVersion(props.major, props.minor)
     sm_features = _get_cuda_sm_features(arch_version)
@@ -380,8 +373,6 @@ def _get_cuda_runtime_features() -> frozenset[str]:
 
 def _detect_rocm_platform() -> PlatformInfo:
     """Detect AMD ROCm platform."""
-    import torch
-
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     arch = _extract_amd_arch(props.gcnArchName)
 
@@ -476,8 +467,6 @@ def _estimate_amd_bandwidth(props: object) -> float:
 def _detect_cuda_interconnect() -> InterconnectInfo | None:
     """Detect CUDA multi-GPU interconnect topology."""
     try:
-        import torch
-
         device_count = torch.cuda.device_count()
         if device_count <= 1:
             return InterconnectInfo(topology="single_gpu")
@@ -493,23 +482,19 @@ def _detect_cuda_interconnect() -> InterconnectInfo | None:
 def _detect_rocm_interconnect() -> InterconnectInfo | None:
     """Detect ROCm multi-GPU interconnect topology."""
     try:
-        import torch
-
         device_count = torch.cuda.device_count()
         if device_count <= 1:
             return InterconnectInfo(topology="single_gpu")
         # Probe /sys/class/kfd for xGMI links (HSA_IOLINK_TYPE_XGMI = 11).
         try:
-            import os as _os
-
             kfd_root = "/sys/class/kfd/kfd/topology/nodes"
             xgmi_count = 0
-            for node in _os.listdir(kfd_root):
-                links_dir = _os.path.join(kfd_root, node, "io_links")
-                if not _os.path.isdir(links_dir):
+            for node in os.listdir(kfd_root):
+                links_dir = os.path.join(kfd_root, node, "io_links")
+                if not os.path.isdir(links_dir):
                     continue
-                for link in _os.listdir(links_dir):
-                    pf = _os.path.join(links_dir, link, "properties")
+                for link in os.listdir(links_dir):
+                    pf = os.path.join(links_dir, link, "properties")
                     try:
                         with open(pf) as f:
                             for line in f:
@@ -532,8 +517,6 @@ def _detect_cuda_numa_cpu_affinity() -> tuple[tuple[int, ...], ...]:
     """Return NUMA-local CPU IDs per visible CUDA device using NVML."""
     nvml_initialized = False
     try:
-        import pynvml
-
         device_count = torch.cuda.device_count()
         if device_count == 0:
             return ()
@@ -579,8 +562,6 @@ def _detect_cuda_nvlink_topology() -> str | None:
     """Return NVLink topology for visible CUDA devices using NVML."""
     nvml_initialized = False
     try:
-        import pynvml
-
         device_count = torch.cuda.device_count()
         if device_count <= 1:
             return None
@@ -629,12 +610,7 @@ def _detect_cuda_nvlink_topology() -> str | None:
 
 def _check_symmetric_memory_available() -> bool:
     """Check if PyTorch symmetric memory is available."""
-    try:
-        import torch.distributed._symmetric_memory  # noqa: F401
-
-        return True
-    except (ImportError, AttributeError):
-        return False
+    return _symmetric_memory is not None
 
 
 def _check_nvlink_available() -> bool:

@@ -5,11 +5,6 @@ from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import Optional, Protocol, Tuple, runtime_checkable
 
-try:
-    from typing import override
-except ImportError:  # Python < 3.12
-    from typing_extensions import override
-
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, const_expr
@@ -21,6 +16,7 @@ from cutlass.utils import (
     ClcDynamicPersistentTileSchedulerParams,
 )
 from quack.cute_dsl_utils import ParamsBase
+from typing_extensions import override
 
 from . import utils
 from .fast_math import clz

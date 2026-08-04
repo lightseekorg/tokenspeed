@@ -27,6 +27,8 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.other.native.deep_ep import load_deep_ep
+from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.registry import ErrorClass
 
 __all__ = [
     "Buffer",
@@ -43,29 +45,10 @@ logger = logging.getLogger(__file__)
 _FP8_BLOCK = 128
 
 
-def _raise_deepep_unavailable() -> None:
-    raise ImportError(
-        "DeepEP is not available. Install the `deep_ep` package to use DeepEP "
-        "communication."
-    )
+Buffer = ErrorClass
 
-
-class _MissingBufferMeta(type):
-    def __getattr__(cls, name):
-        del name
-        _raise_deepep_unavailable()
-
-
-class _MissingBuffer(metaclass=_MissingBufferMeta):
-    def __init__(self, *args, **kwargs):
-        del args, kwargs
-        _raise_deepep_unavailable()
-
-
-try:
+if current_platform().is_nvidia:
     Buffer = load_deep_ep().Buffer
-except ImportError:
-    Buffer = _MissingBuffer
 
 
 def _get_available_gpu_memory(gpu_id: int, empty_cache: bool = True) -> float:

@@ -122,9 +122,9 @@ def test_pattern_enums():
 
 def _worker_allreduce(rank, world_size, port, results):
     device = setup_distributed(rank, world_size, port)
-    try:
-        import tokenspeed_kernel.ops.communication.trtllm.native as tk_comm
+    import tokenspeed_kernel.ops.communication.trtllm.native as tk_comm
 
+    try:
         hidden_dim = 4096
         max_token_num = 128
         eps = 1e-6
@@ -220,9 +220,9 @@ def _worker_allreduce(rank, world_size, port, results):
 
 def _worker_reducescatter(rank, world_size, port, results):
     device = setup_distributed(rank, world_size, port)
-    try:
-        import tokenspeed_kernel.ops.communication.trtllm.native as tk_comm
+    import tokenspeed_kernel.ops.communication.trtllm.native as tk_comm
 
+    try:
         hidden_dim = 4096
         max_token_num = 128
         eps = 1e-6

@@ -23,6 +23,7 @@ from __future__ import annotations
 import atexit
 import json
 import os
+import sys
 import threading
 import time
 import warnings
@@ -194,9 +195,9 @@ _VIZTRACER_PROTON_FLOW_CATEGORY = "tokenspeed.proton"
 
 def _active_viztracer():
     """Return the active process-local VizTracer instance, if any."""
-    try:
-        from viztracer import get_tracer
-    except ImportError:
+    viztracer = sys.modules.get("viztracer")
+    get_tracer = getattr(viztracer, "get_tracer", None)
+    if get_tracer is None:
         return None
 
     tracer = get_tracer()

@@ -42,10 +42,7 @@ platform = current_platform()
 mm_fp4 = error_fn
 
 if platform.is_nvidia and platform.is_blackwell:
-    try:
-        from flashinfer import mm_fp4
-    except ImportError:
-        pass
+    from flashinfer import mm_fp4
 
 if mm_fp4 is not error_fn:
 

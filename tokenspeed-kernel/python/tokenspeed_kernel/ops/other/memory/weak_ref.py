@@ -40,6 +40,7 @@ from __future__ import annotations
 import logging
 
 import torch
+from torch.utils.cpp_extension import load_inline
 
 logger = logging.getLogger(__name__)
 
@@ -66,8 +67,6 @@ def _load():
     if _module is not None or _load_failed:
         return _module
     try:
-        from torch.utils.cpp_extension import load_inline
-
         _module = load_inline(
             name="tokenspeed_weak_ref_tensor",
             cpp_sources=_CPP_SOURCE,

@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-import logging
 import math
 
 import torch
@@ -30,10 +29,8 @@ from tokenspeed_kernel.platform import (
     CapabilityRequirement,
     current_platform,
 )
-from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 from tokenspeed_kernel.signature import format_signatures
-
-logger = logging.getLogger(__name__)
 
 platform = current_platform()
 
@@ -41,6 +38,11 @@ _permute_indices_cache: dict[tuple[str, torch.Size], torch.Tensor] = {}
 _permute_indices_device_cache: dict[
     tuple[str, tuple[int, ...], int, int, str, int], torch.Tensor
 ] = {}
+
+flashinfer_trtllm_mxfp4_moe_apply = error_fn
+flashinfer_trtllm_mxfp4_moe_weights = error_fn
+flashinfer_trtllm_mxfp4_situ_moe_weights = error_fn
+flashinfer_trtllm_mxfp4_situ_routed_moe_apply = error_fn
 
 
 def _float8_view_dtype(x: torch.Tensor) -> torch.dtype | None:
@@ -90,26 +92,22 @@ def situ_moe_unavailable_reason() -> str | None:
     Importable on every platform so runtime callers need no vendor guards.
 
     Returns:
-        None when the installed flashinfer exposes ``ActivationType.Situ``
-        (which ships together with routed SiTU support); otherwise a
-        human-readable reason, suitable for surfacing in model-level
-        configuration errors.
+        None on NVIDIA Blackwell, where the required FlashInfer symbols are
+        imported eagerly; otherwise a human-readable platform error.
     """
-    if not platform.is_nvidia:
-        return "flashinfer TRTLLM-Gen SiTU MoE requires an NVIDIA platform"
-    if _SITU_ACTIVATION_TYPE is None or _fi_fp4_routed_moe is None:
-        return (
-            "Kimi-K3 SiTU requires flashinfer > 0.6.15 with native "
-            f"TRTLLM-Gen SiTU (PR #4180): {_situ_import_error}"
-        )
+    if not (platform.is_nvidia and platform.is_blackwell):
+        return "flashinfer TRTLLM-Gen SiTU MoE requires NVIDIA Blackwell"
     return None
 
 
-if platform.is_nvidia:
+if platform.is_nvidia and platform.is_blackwell:
     from flashinfer import (
         mxfp8_quantize,
         nvfp4_block_scale_interleave,
         trtllm_fp4_block_scale_moe,
+    )
+    from flashinfer.fused_moe import (
+        trtllm_fp4_block_scale_routed_moe as _fi_fp4_routed_moe,
     )
     from flashinfer.fused_moe.core import (
         _maybe_get_cached_w3_w1_permute_indices as maybe_get_cached_w3_w1_permute_indices,
@@ -117,25 +115,9 @@ if platform.is_nvidia:
     from flashinfer.fused_moe.core import (
         get_w2_permute_indices_with_cache,
     )
+    from flashinfer.tllm_enums import ActivationType as _FiActivationType
 
-    # SiTU is native in flashinfer's TRTLLM-Gen MoE since PR #4180 (> 0.6.15);
-    # older builds lack the ActivationType.Situ member.
-    try:
-        from flashinfer.fused_moe import (
-            trtllm_fp4_block_scale_routed_moe as _fi_fp4_routed_moe,
-        )
-        from flashinfer.tllm_enums import ActivationType as _FiActivationType
-
-        _SITU_ACTIVATION_TYPE = getattr(_FiActivationType, "Situ", None)
-        _situ_import_error: ImportError | None = (
-            None
-            if _SITU_ACTIVATION_TYPE is not None
-            else ImportError("flashinfer build has no ActivationType.Situ")
-        )
-    except ImportError as exc:
-        _fi_fp4_routed_moe = None
-        _SITU_ACTIVATION_TYPE = None
-        _situ_import_error = exc
+    _SITU_ACTIVATION_TYPE = _FiActivationType.Situ
 
     def _get_device_permute_indices(
         x: torch.Tensor,
@@ -583,14 +565,6 @@ if platform.is_nvidia:
         return result
 
     def _register_private_situ_kernel(function):
-        reason = situ_moe_unavailable_reason()
-        if reason is not None:
-            # Skipping is normal for deployments that don't serve Kimi-K3, so
-            # log at INFO -- but keep the reason (e.g. a flashinfer build
-            # without SiTU), which otherwise vanishes and makes "kernel not
-            # found" failures hard to trace back here.
-            logger.info("Kimi-K3 SiTU MoE kernel not registered: %s", reason)
-            return function
         return register_kernel(
             "moe",
             "apply",

@@ -17,6 +17,7 @@ from tokenspeed_kernel.ops.attention.msa.triton.indexer import minimax_indexer
 from tokenspeed_kernel.ops.attention.msa.triton.sparse_attention import (
     minimax_sparse_attention,
 )
+from tokenspeed_kernel.platform import current_platform
 
 _BLOCK_SIZE = 128
 _HEAD_DIM = 128
@@ -559,6 +560,8 @@ def test_msa_fp8_kv_descale_matches_dequant_reference(phase: str) -> None:
 
 
 def _msa_cute_registered() -> bool:
+    if not current_platform().is_blackwell:
+        return False
     import tokenspeed_kernel.ops.attention.msa.cute_dsl.attention as msa_mod
 
     return hasattr(msa_mod, "msa_minimax_extend_with_kvcache")
@@ -724,16 +727,12 @@ def test_msa_cute_extend_wins_selection_and_decode_stays_triton() -> None:
 
 
 def _cutedsl_decode_score_available() -> bool:
-    from tokenspeed_kernel.platform import current_platform
-
     if not current_platform().is_blackwell:
         return False
-    try:
-        from tokenspeed_kernel.ops.attention.msa.cute_dsl.index_decode_score import (  # noqa: F401
-            minimax_index_decode_score,
-        )
-    except ImportError:
-        return False
+    from tokenspeed_kernel.ops.attention.msa.cute_dsl.index_decode_score import (  # noqa: F401
+        minimax_index_decode_score,
+    )
+
     return True
 
 
@@ -862,14 +861,10 @@ def test_cutedsl_decode_score_gates() -> None:
 
 
 def _fmha_prefill_score_available() -> bool:
-    from tokenspeed_kernel.platform import current_platform
-
     if not torch.cuda.is_available() or not current_platform().is_blackwell:
         return False
-    try:
-        import tokenspeed_kernel.ops.attention.msa.cuda.jit  # noqa: F401
-    except ImportError:
-        return False
+    import tokenspeed_kernel.ops.attention.msa.cuda.jit  # noqa: F401
+
     return True
 
 

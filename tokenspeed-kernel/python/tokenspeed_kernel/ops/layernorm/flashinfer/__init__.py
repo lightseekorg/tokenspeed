@@ -27,16 +27,13 @@ layernorm = error_fn
 rmsnorm = error_fn
 
 if current_platform().is_nvidia:
-    try:
-        from flashinfer import (
-            fused_add_rmsnorm,
-            gemma_fused_add_rmsnorm,
-            gemma_rmsnorm,
-            layernorm,
-            rmsnorm,
-        )
-    except ImportError:
-        pass
+    from flashinfer import (
+        fused_add_rmsnorm,
+        gemma_fused_add_rmsnorm,
+        gemma_rmsnorm,
+        layernorm,
+        rmsnorm,
+    )
 
 __all__ = [
     "fused_add_rmsnorm",

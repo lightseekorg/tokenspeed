@@ -56,28 +56,17 @@ from tokenspeed_kernel.platform import (
     CapabilityRequirement,
     current_platform,
 )
-from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
 logger = logging.getLogger(__name__)
 _warned_about_requantization = False
 
-try:
-    from tokenspeed_kernel.ops.other.native.deep_gemm import (
-        get_mn_major_tma_aligned_tensor,
-        m_grouped_fp8_gemm_nt_contiguous,
-        m_grouped_fp8_gemm_nt_masked,
-        transform_sf_into_required_layout,
-    )
-except ImportError:  # pragma: no cover - DeepGEMM is an optional dependency
-    get_mn_major_tma_aligned_tensor = None
-    m_grouped_fp8_gemm_nt_contiguous = None
-    m_grouped_fp8_gemm_nt_masked = None
-    transform_sf_into_required_layout = None
+deep_gemm_deepep_fp8_moe_apply = error_fn
+deep_gemm_deepep_fp8_moe_weights = error_fn
 
-
-if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
+if platform.is_hopper_plus:
     from tokenspeed_kernel.ops.activation.cuda import silu_and_mul_fuse_block_quant
     from tokenspeed_kernel.ops.activation.triton import (
         fused_swiglu_fp8_ue8m0,
@@ -91,6 +80,12 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
         deep_gemm_requires_ue8m0,
         is_ue8m0,
         requantize_to_ue8m0_,
+    )
+    from tokenspeed_kernel.ops.other.native.deep_gemm import (
+        get_mn_major_tma_aligned_tensor,
+        m_grouped_fp8_gemm_nt_contiguous,
+        m_grouped_fp8_gemm_nt_masked,
+        transform_sf_into_required_layout,
     )
 
     _FP8_BLOCK = 128

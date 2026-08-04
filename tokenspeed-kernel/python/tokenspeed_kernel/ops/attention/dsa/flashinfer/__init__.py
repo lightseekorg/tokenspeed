@@ -41,7 +41,12 @@ from tokenspeed_kernel.platform import (
     CapabilityRequirement,
     current_platform,
 )
-from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.registry import (
+    ErrorClass,
+    Priority,
+    error_fn,
+    register_kernel,
+)
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 platform = current_platform()
@@ -49,19 +54,16 @@ platform = current_platform()
 _sparse_workspace_buffers: dict[torch.device, torch.Tensor] = {}
 _SPARSE_WORKSPACE_BYTES = 384 * 1024 * 1024
 
-top_k = None
-TopKTieBreak = None
+top_k = error_fn
+TopKTieBreak = ErrorClass
 
 if platform.is_nvidia:
-    try:
-        from flashinfer import TopKTieBreak, top_k
-    except ImportError:
-        pass
+    from flashinfer import TopKTieBreak, top_k
 
 
 def has_deterministic_decode_topk() -> bool:
     """Whether the flashinfer deterministic top-k fallback is importable."""
-    return top_k is not None and TopKTieBreak is not None
+    return top_k is not error_fn and TopKTieBreak is not ErrorClass
 
 
 def deterministic_decode_topk(
@@ -76,7 +78,7 @@ def deterministic_decode_topk(
     ``deterministic`` + ``dsa_graph_safe``. For the length-aware (ragged) path see
     :func:`tokenspeed_kernel.ops.attention.dsa.cuda.ragged_decode_topk`.
     """
-    if top_k is None or TopKTieBreak is None:
+    if top_k is error_fn or TopKTieBreak is ErrorClass:
         raise RuntimeError("flashinfer deterministic top_k is unavailable.")
     _values, indices = top_k(
         logits.contiguous(),

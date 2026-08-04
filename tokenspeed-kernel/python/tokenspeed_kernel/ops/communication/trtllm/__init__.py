@@ -57,6 +57,10 @@ trtllm_create_ipc_workspace_for_all_reduce_fusion = error_fn
 trtllm_create_ipc_workspace_for_minimax = error_fn
 
 if current_platform().is_nvidia:
+    from torch._C._autograd import DeviceType
+    from torch._C._distributed_c10d import _SymmetricMemory
+    from torch.distributed import _symmetric_memory  # noqa: F401
+
     from .native import (
         _MNNVL_SUPPORTED_WORLD_SIZES,
         MNNVL_ONESHOT_MAX_TOKEN,
@@ -94,10 +98,6 @@ if current_platform().is_nvidia:
         try:
             if torch.cuda.get_device_capability()[0] < 9:
                 return False
-            from torch._C._autograd import DeviceType
-            from torch._C._distributed_c10d import _SymmetricMemory
-            from torch.distributed import _symmetric_memory  # noqa: F401
-
             if not _SymmetricMemory.has_multicast_support(
                 DeviceType.CUDA, torch.cuda.current_device()
             ):

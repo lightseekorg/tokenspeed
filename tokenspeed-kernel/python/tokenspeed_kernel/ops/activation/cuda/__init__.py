@@ -23,14 +23,13 @@ import functools
 from pathlib import Path
 from typing import Optional, Tuple
 
+import torch
+import tvm_ffi
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import error_fn
 
-try:
-    import torch
-    import tvm_ffi
-except ImportError:
-    torch = None
-    tvm_ffi = None
+silu_and_mul_fuse_block_quant = error_fn
+silu_and_mul_fuse_nvfp4_quant = error_fn
 
 
 def _round_up(x: int, m: int) -> int:
@@ -49,7 +48,7 @@ def _load_silu_fuse_block_quant_module():
     return tvm_ffi.load_module(str(so_path))
 
 
-def silu_and_mul_fuse_block_quant(
+def _silu_and_mul_fuse_block_quant(
     input: torch.Tensor,
     scale_out: torch.Tensor,
     out: Optional[torch.Tensor] = None,
@@ -99,7 +98,7 @@ def _load_silu_fuse_nvfp4_quant_module():
     return tvm_ffi.load_module(str(so_path))
 
 
-def silu_and_mul_fuse_nvfp4_quant(
+def _silu_and_mul_fuse_nvfp4_quant(
     input: torch.Tensor,
     global_scale: torch.Tensor,
     enable_pdl: bool = False,
@@ -156,8 +155,9 @@ def silu_and_mul_fuse_nvfp4_quant(
     return out, scale_out
 
 
-if tvm_ffi is None:
-    silu_and_mul_fuse_block_quant = error_fn
-    silu_and_mul_fuse_nvfp4_quant = error_fn
+if current_platform().is_nvidia:
+    silu_and_mul_fuse_block_quant = _silu_and_mul_fuse_block_quant
+    silu_and_mul_fuse_nvfp4_quant = _silu_and_mul_fuse_nvfp4_quant
+
 
 __all__ = ["silu_and_mul_fuse_block_quant", "silu_and_mul_fuse_nvfp4_quant"]

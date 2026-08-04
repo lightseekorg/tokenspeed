@@ -18,11 +18,22 @@ import os
 from typing import Optional, Tuple
 
 import torch
+from tokenspeed_kernel.platform import current_platform
 
 from .interface import sparse_atten_func
 from .sparse_index_utils import build_k2q_csr
 from .src.common.aot_cache import _key_to_path
 from .src.sm100.prepare_scheduler import SPARSE_SCHEDULE_MODEL
+
+_cutlass_partial = None
+_cutlass_out = None
+
+platform = current_platform()
+if platform.is_nvidia and platform.is_blackwell:
+    import cutlass
+
+    _cutlass_partial = cutlass.Float32
+    _cutlass_out = cutlass.BFloat16
 
 
 def _compute_aot_kernel_paths(
@@ -49,14 +60,10 @@ def _compute_aot_kernel_paths(
         False,
     )
     k_block_size = 128 if head_dim > 64 else 64
-    try:
-        import cutlass
-
-        cutlass_partial = cutlass.Float32
-        cutlass_out = cutlass.BFloat16
-    except ImportError:
-        cutlass_partial = partial_dtype
-        cutlass_out = dtype
+    cutlass_partial = (
+        _cutlass_partial if _cutlass_partial is not None else partial_dtype
+    )
+    cutlass_out = _cutlass_out if _cutlass_out is not None else dtype
     combine_key = (
         "combine",
         head_dim,

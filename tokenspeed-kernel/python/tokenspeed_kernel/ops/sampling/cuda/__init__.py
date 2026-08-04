@@ -39,26 +39,19 @@ verify_chain_greedy = error_fn
 fused_topk_topp_available = False
 
 if current_platform().is_nvidia:
-    try:
-        from .sampling_chain import (
-            chain_speculative_sampling_target_only,
-            verify_chain_greedy,
-        )
-    except ImportError:
-        pass
+    from .fused_topk_topp import (
+        fused_topk_topp_renorm,
+        fused_topk_topp_workspace_size,
+    )
+    from .fused_topk_topp import prepare_for_device as fused_topk_topp_prepare
+    from .sampling_chain import (
+        chain_speculative_sampling_target_only,
+        verify_chain_greedy,
+    )
 
-    try:
-        from .fused_topk_topp import (
-            fused_topk_topp_renorm,
-            fused_topk_topp_workspace_size,
-        )
-        from .fused_topk_topp import prepare_for_device as fused_topk_topp_prepare
-
-        fused_topk_topp_available = (
-            _os.environ.get("TS_DISABLE_FUSED_TOPK_TOPP", "0") != "1"
-        )
-    except ImportError:
-        pass
+    fused_topk_topp_available = (
+        _os.environ.get("TS_DISABLE_FUSED_TOPK_TOPP", "0") != "1"
+    )
 
 __all__ = [
     "chain_speculative_sampling_target_only",

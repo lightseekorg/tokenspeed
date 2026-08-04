@@ -19,34 +19,27 @@ from tokenspeed_kernel.ops.attention.dsa.triton.topk import _topk_with_padding
 from tokenspeed_kernel.platform import current_platform
 
 SPARSE_BLOCK_SIZE = 128
-_is_nvidia = current_platform().is_nvidia
+platform = current_platform()
+_is_nvidia = platform.is_nvidia
 
-if current_platform().is_blackwell:
-    try:
-        from tokenspeed_kernel.ops.attention.msa.cute_dsl.index_decode_score import (
-            decode_score_supported as _cutedsl_decode_score_supported,
-        )
-        from tokenspeed_kernel.ops.attention.msa.cute_dsl.index_decode_score import (
-            minimax_index_decode_score as _cutedsl_decode_score,
-        )
-    except ImportError:
-        _cutedsl_decode_score = None
-        _cutedsl_decode_score_supported = None
-    try:
-        from tokenspeed_kernel.ops.attention.msa.cuda.prefill_score import (
-            minimax_prefill_score_topk as _fmha_prefill_score_topk,
-        )
-        from tokenspeed_kernel.ops.attention.msa.cuda.prefill_score import (
-            prefill_score_supported as _fmha_prefill_score_supported,
-        )
-    except ImportError:
-        _fmha_prefill_score_topk = None
-        _fmha_prefill_score_supported = None
-else:
-    _cutedsl_decode_score = None
-    _cutedsl_decode_score_supported = None
-    _fmha_prefill_score_topk = None
-    _fmha_prefill_score_supported = None
+_cutedsl_decode_score = None
+_cutedsl_decode_score_supported = None
+_fmha_prefill_score_topk = None
+_fmha_prefill_score_supported = None
+
+if platform.is_nvidia and platform.is_blackwell:
+    from tokenspeed_kernel.ops.attention.msa.cuda.prefill_score import (
+        minimax_prefill_score_topk as _fmha_prefill_score_topk,
+    )
+    from tokenspeed_kernel.ops.attention.msa.cuda.prefill_score import (
+        prefill_score_supported as _fmha_prefill_score_supported,
+    )
+    from tokenspeed_kernel.ops.attention.msa.cute_dsl.index_decode_score import (
+        decode_score_supported as _cutedsl_decode_score_supported,
+    )
+    from tokenspeed_kernel.ops.attention.msa.cute_dsl.index_decode_score import (
+        minimax_index_decode_score as _cutedsl_decode_score,
+    )
 
 
 @triton.jit

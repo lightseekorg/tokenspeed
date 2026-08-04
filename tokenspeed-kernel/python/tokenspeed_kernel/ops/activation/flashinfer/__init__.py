@@ -25,13 +25,10 @@ gelu_tanh_and_mul = error_fn
 silu_and_mul = error_fn
 
 if current_platform().is_nvidia:
-    try:
-        from flashinfer import (
-            gelu_and_mul,
-            gelu_tanh_and_mul,
-            silu_and_mul,
-        )
-    except ImportError:
-        pass
+    from flashinfer import (
+        gelu_and_mul,
+        gelu_tanh_and_mul,
+        silu_and_mul,
+    )
 
 __all__ = ["gelu_and_mul", "gelu_tanh_and_mul", "silu_and_mul"]

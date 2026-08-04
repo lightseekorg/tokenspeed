@@ -20,11 +20,17 @@
 
 """Optional bindings to the external TokenSpeed MLA package."""
 
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import error_fn
 
 AVAILABLE = False
+get_num_sm = error_fn
+mla_kv_pack_quantize_fp8 = error_fn
+tokenspeed_mla_decode = error_fn
+tokenspeed_mla_prefill = error_fn
+warmup_compile_prefill = error_fn
 
-try:
+if current_platform().is_blackwell:
     from tokenspeed_mla.mla_decode import tokenspeed_mla_decode
     from tokenspeed_mla.mla_kv_pack_quantize_fp8 import mla_kv_pack_quantize_fp8
     from tokenspeed_mla.mla_prefill import (
@@ -32,13 +38,7 @@ try:
         warmup_compile_prefill,
     )
     from tokenspeed_mla.utils import get_num_sm
-except ImportError:
-    get_num_sm = error_fn
-    mla_kv_pack_quantize_fp8 = error_fn
-    tokenspeed_mla_decode = error_fn
-    tokenspeed_mla_prefill = error_fn
-    warmup_compile_prefill = error_fn
-else:
+
     AVAILABLE = True
 
 __all__ = [

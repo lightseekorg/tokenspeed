@@ -13,7 +13,6 @@ vLLM as well).
 
 from __future__ import annotations
 
-import importlib.util
 from collections.abc import Sequence
 
 import torch
@@ -39,14 +38,7 @@ from tokenspeed_kernel.signature import (
 platform = current_platform()
 
 
-def _fmha_sm100_importable() -> bool:
-    return (
-        importlib.util.find_spec("cutlass") is not None
-        and importlib.util.find_spec("quack") is not None
-    )
-
-
-if platform.is_nvidia and platform.is_blackwell and _fmha_sm100_importable():
+if platform.is_nvidia and platform.is_blackwell:
     from tokenspeed_kernel.ops.attention.msa.cute_dsl.sparse import (
         build_k2q_csr,
         sparse_atten_func,
@@ -57,7 +49,7 @@ def _is_identity_scale(scale: float | torch.Tensor | None) -> bool:
     return scale is None or float(scale) == 1.0
 
 
-if platform.is_nvidia and platform.is_blackwell and _fmha_sm100_importable():
+if platform.is_nvidia and platform.is_blackwell:
     _MINIMAX_MSA_CUTE_TRAITS = {
         "head_dim": frozenset({128}),
         "index_head_dim": frozenset({128}),

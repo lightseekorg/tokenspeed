@@ -41,6 +41,7 @@ import os
 import pytest
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.platform import current_platform
 
 H, EPS = 7168, 1e-6
 # Must cover >128 tokens; the workspace is sized for this many.
@@ -55,14 +56,13 @@ def _supported_world_sizes() -> tuple[int, ...]:
     """Derive the guard from the kernel's own list so the two cannot drift:
     adding a world size to the kernel must not leave these tests silently
     skipped (which reads as success -- pytest exits 0 either way)."""
-    try:
-        from tokenspeed_kernel.ops.communication.trtllm.native import (
-            _MNNVL_SUPPORTED_WORLD_SIZES,
-        )
+    if not current_platform().is_nvidia:
+        return ()
+    from tokenspeed_kernel.ops.communication.trtllm.native import (
+        _MNNVL_SUPPORTED_WORLD_SIZES,
+    )
 
-        return tuple(_MNNVL_SUPPORTED_WORLD_SIZES)
-    except Exception:  # noqa: BLE001 -- kernel package unavailable
-        return (2, 4, 8)
+    return tuple(_MNNVL_SUPPORTED_WORLD_SIZES)
 
 
 pytestmark = pytest.mark.skipif(

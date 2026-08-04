@@ -719,32 +719,28 @@ class CudaKernelBuilder:
                 if found_wheel_headers:
                     break
 
-        try:
-            tvm_ffi = importlib.import_module("tvm_ffi")
-            _add_dir(Path(tvm_ffi.__file__).parent / "include")
-        except ImportError:
-            pass
+        import tvm_ffi
+
+        _add_dir(Path(tvm_ffi.__file__).parent / "include")
 
         # flashinfer bundles TRT-LLM internal FP4 helpers
         # (tensorrt_llm/kernels/quantization_utils.cuh: cvt_warp_fp16_to_fp4,
         # silu_and_mul, cvt_quant_to_fp4_get_sf_out_offset). Expose them so
         # our own fused silu+mul+nvfp4 kernel can reuse them.
-        try:
-            flashinfer = importlib.import_module("flashinfer")
-            fi_root = Path(flashinfer.__file__).parent / "data"
-            for sub in (
-                fi_root / "csrc" / "nv_internal",
-                fi_root / "csrc" / "nv_internal" / "include",
-                fi_root / "include",
-                fi_root / "cutlass" / "include",
-            ):
-                _add_dir(sub)
-            spdlog = fi_root / "spdlog" / "include"
-            if (spdlog / "spdlog" / "spdlog.h").exists():
-                _add_dir(spdlog)
-                return dirs
-        except ImportError:
-            pass
+        import flashinfer
+
+        fi_root = Path(flashinfer.__file__).parent / "data"
+        for sub in (
+            fi_root / "csrc" / "nv_internal",
+            fi_root / "csrc" / "nv_internal" / "include",
+            fi_root / "include",
+            fi_root / "cutlass" / "include",
+        ):
+            _add_dir(sub)
+        spdlog = fi_root / "spdlog" / "include"
+        if (spdlog / "spdlog" / "spdlog.h").exists():
+            _add_dir(spdlog)
+            return dirs
         if (Path("/usr/include") / "spdlog" / "spdlog.h").exists():
             _add_dir(Path("/usr/include"))
 

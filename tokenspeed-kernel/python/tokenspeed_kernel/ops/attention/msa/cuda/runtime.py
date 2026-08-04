@@ -3,10 +3,35 @@
 
 """FMHA varlen attention interfaces and TVM-FFI registrations for SM100."""
 
-__all__ = []
+from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.registry import ErrorClass, error_fn
 
+__all__ = [
+    "SparseDecodePagedAttentionWrapper",
+    "SparseK2qCsrBuilderSm100",
+    "build_k2q_csr",
+    "fmha_sm100",
+    "fmha_sm100_plan",
+    "fp4_indexer_block_scores",
+    "sparse_atten_func",
+    "sparse_atten_nvfp4_kv_func",
+    "sparse_decode_atten_func",
+    "sparse_topk_select",
+]
 
-try:
+SparseDecodePagedAttentionWrapper = ErrorClass
+SparseK2qCsrBuilderSm100 = ErrorClass
+build_k2q_csr = error_fn
+fmha_sm100 = error_fn
+fmha_sm100_plan = error_fn
+fp4_indexer_block_scores = error_fn
+sparse_atten_func = error_fn
+sparse_atten_nvfp4_kv_func = error_fn
+sparse_decode_atten_func = error_fn
+sparse_topk_select = error_fn
+
+platform = current_platform()
+if platform.is_nvidia and platform.is_blackwell:
     import ctypes
 
     import torch
@@ -23,26 +48,13 @@ try:
     )
     from .api import fmha_sm100, fmha_sm100_plan, sparse_topk_select
 
-    __all__ = [
-        "SparseDecodePagedAttentionWrapper",
-        "SparseK2qCsrBuilderSm100",
-        "build_k2q_csr",
-        "fmha_sm100",
-        "fmha_sm100_plan",
-        "fp4_indexer_block_scores",
-        "sparse_atten_func",
-        "sparse_atten_nvfp4_kv_func",
-        "sparse_decode_atten_func",
-        "sparse_topk_select",
-    ]
-
     _FP8_DTYPE_MAP = {
         "float8_e4m3fn": torch.float8_e4m3fn,
         "float8_e5m2": torch.float8_e5m2,
     }
 
     def _dlpack_capsule_set_dtype_int8(capsule):
-        """Patch DLPack capsule dtype to int8 for zero-copy fp8→torch conversion.
+        """Patch DLPack capsule dtype to int8 for zero-copy fp8->torch conversion.
 
         apache-tvm-ffi<=0.1.10 maps fp8 to DLPack type_code=10 (kDLBool)
         instead of 12/13, causing torch.from_dlpack to fail.
@@ -90,5 +102,3 @@ try:
     tvm_ffi.register_global_func(
         "minfer.ops.sparse_topk_select", _sparse_topk_select_ffi
     )
-except ImportError:
-    pass

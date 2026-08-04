@@ -142,30 +142,27 @@ _ARCH_SUPPORTED = _ts_supported_arch()
 # hit CUDA_ERROR_INVALID_CLUSTER_SIZE; route them through torch.argmax instead.
 _CUTE_AVAILABLE = False
 if _ARCH_SUPPORTED and _has_cluster_launch_support():
-    try:
-        import cuda.bindings.driver as cuda
-        import cutlass
-        import cutlass.cute as cute
-        from cutlass._mlir.dialects import llvm
-        from cutlass.cute.runtime import from_dlpack
-        from cutlass.cute.typing import Float32, Int32
-        from cutlass.cutlass_dsl import T, dsl_user_op
-        from tokenspeed_kernel.ops.sampling.cute_dsl.argmax import (
-            ArgmaxKernel,
-            CUDAGraphCompatibleWrapper,
-            domain_offset_i64,
-            elem_pointer,
-            fill_oob,
-            predicate_k,
-            store_shared_remote,
-            torch2cute_dtype_map,
-            warp_argmax_redux,
-            warp_reduce_argmax,
-        )
+    import cuda.bindings.driver as cuda
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass._mlir.dialects import llvm
+    from cutlass.cute.runtime import from_dlpack
+    from cutlass.cute.typing import Float32, Int32
+    from cutlass.cutlass_dsl import T, dsl_user_op
+    from tokenspeed_kernel.ops.sampling.cute_dsl.argmax import (
+        ArgmaxKernel,
+        CUDAGraphCompatibleWrapper,
+        domain_offset_i64,
+        elem_pointer,
+        fill_oob,
+        predicate_k,
+        store_shared_remote,
+        torch2cute_dtype_map,
+        warp_argmax_redux,
+        warp_reduce_argmax,
+    )
 
-        _CUTE_AVAILABLE = True
-    except ImportError:
-        _CUTE_AVAILABLE = False
+    _CUTE_AVAILABLE = True
 
 
 def is_available() -> bool:

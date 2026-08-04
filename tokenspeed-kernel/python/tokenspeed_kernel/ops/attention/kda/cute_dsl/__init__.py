@@ -35,9 +35,9 @@ from __future__ import annotations
 
 import math
 from functools import lru_cache
-from importlib.util import find_spec
 
 import torch
+from tokenspeed_kernel.platform import current_platform
 
 __all__ = [
     "DEFAULT_SCALE",
@@ -54,25 +54,25 @@ _INSTALL_HINT = (
     "`pip install tokenspeed-cutedsl-kda` (sm_100a / sm_103a, CUDA 13)."
 )
 
+_tokenspeed_cutedsl_kda = None
+
+platform = current_platform()
+if platform.is_nvidia and platform.is_blackwell:
+    import tokenspeed_cutedsl_kda as _tokenspeed_cutedsl_kda
+
 
 @lru_cache(maxsize=1)
 def is_cutedsl_kda_installed() -> bool:
-    """Whether the optional CuteDSL KDA package loads on this device."""
-    if find_spec("tokenspeed_cutedsl_kda") is None:
-        return False
-    try:
-        import tokenspeed_cutedsl_kda
-    except Exception:
-        return False
-    return bool(tokenspeed_cutedsl_kda.is_cutedsl_kda_installed())
+    """Whether the CuteDSL KDA package supports this device."""
+    return _tokenspeed_cutedsl_kda is not None and bool(
+        _tokenspeed_cutedsl_kda.is_cutedsl_kda_installed()
+    )
 
 
 def _cutedsl_kda_module():
     if not is_cutedsl_kda_installed():
         raise ImportError(_INSTALL_HINT)
-    import tokenspeed_cutedsl_kda
-
-    return tokenspeed_cutedsl_kda
+    return _tokenspeed_cutedsl_kda
 
 
 def cutedsl_kda_check_config(gate_lower_bound: float) -> None:

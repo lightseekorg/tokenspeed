@@ -63,15 +63,10 @@ _chunk_gated_delta_rule = error_fn
 _has_blackwell_prefill = False
 
 if platform.is_blackwell:
-    try:
-        from flashinfer.gdn_kernels import (
-            _has_blackwell_prefill,
-        )
-        from flashinfer.gdn_prefill import chunk_gated_delta_rule as _fi_chunk
+    from flashinfer.gdn_prefill import chunk_gated_delta_rule as _fi_chunk
 
-        _chunk_gated_delta_rule = _fi_chunk
-    except ImportError:
-        pass
+    _chunk_gated_delta_rule = _fi_chunk
+    _has_blackwell_prefill = True
 
 # Decode / MTP (K-last, SM90+): independent of the sm100 prefill import above.
 _gated_delta_rule_decode_pretranspose = error_fn
@@ -79,17 +74,14 @@ _gated_delta_rule_mtp = error_fn
 _has_gdn_decode = False
 
 if platform.is_hopper_plus:
-    try:
-        from flashinfer.gdn_decode import (
-            gated_delta_rule_decode_pretranspose as _fi_decode_pretranspose,
-        )
-        from flashinfer.gdn_decode import gated_delta_rule_mtp as _fi_mtp
+    from flashinfer.gdn_decode import (
+        gated_delta_rule_decode_pretranspose as _fi_decode_pretranspose,
+    )
+    from flashinfer.gdn_decode import gated_delta_rule_mtp as _fi_mtp
 
-        _gated_delta_rule_decode_pretranspose = _fi_decode_pretranspose
-        _gated_delta_rule_mtp = _fi_mtp
-        _has_gdn_decode = True
-    except ImportError:
-        pass
+    _gated_delta_rule_decode_pretranspose = _fi_decode_pretranspose
+    _gated_delta_rule_mtp = _fi_mtp
+    _has_gdn_decode = True
 
 # BF16-state MTP kernel: a separate, optional entry point. Needed so
 # gdn_decode_mtp can forward the intermediate-state and per-token state-pool
@@ -97,14 +89,11 @@ if platform.is_hopper_plus:
 _gated_delta_rule_bf16_mtp = None
 
 if platform.is_hopper_plus:
-    try:
-        from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
-            gated_delta_rule_mtp as _fi_bf16_mtp,
-        )
+    from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
+        gated_delta_rule_mtp as _fi_bf16_mtp,
+    )
 
-        _gated_delta_rule_bf16_mtp = _fi_bf16_mtp
-    except ImportError:
-        pass
+    _gated_delta_rule_bf16_mtp = _fi_bf16_mtp
 
 
 def is_available() -> bool:

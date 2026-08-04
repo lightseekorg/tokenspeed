@@ -17,10 +17,14 @@ from dataclasses import dataclass
 from typing import Tuple
 
 import torch
+from tokenspeed_kernel.platform import current_platform
 
 NVFP4_BLOCK_SIZE = 16
 NVFP4_FP4_MAX = 6.0
 NVFP4_FP8_E4M3_MAX = 448.0
+
+_NVFP4Quantizer = None
+platform = current_platform()
 
 
 @dataclass(frozen=True)
@@ -159,15 +163,18 @@ def nvfp4_global_scale_from_amax(amax: torch.Tensor) -> torch.Tensor:
 
 
 def _import_te_nvfp4_quantizer():
-    try:
-        from transformer_engine.pytorch.tensor import NVFP4Quantizer
-    except Exception as exc:  # pragma: no cover - environment dependent
+    global _NVFP4Quantizer
+    if not (platform.is_nvidia and platform.is_blackwell):
         raise RuntimeError(
-            "Transformer Engine NVFP4 quantization is unavailable. Install a "
-            "Transformer Engine build with its PyTorch dependencies, including "
-            "FlashAttention v3 when required by that TE build."
-        ) from exc
-    return NVFP4Quantizer
+            "Transformer Engine NVFP4 quantization requires NVIDIA Blackwell."
+        )
+    if _NVFP4Quantizer is None:
+        from transformer_engine.pytorch.tensor import (
+            NVFP4Quantizer as _TransformerEngineNVFP4Quantizer,
+        )
+
+        _NVFP4Quantizer = _TransformerEngineNVFP4Quantizer
+    return _NVFP4Quantizer
 
 
 def quantize_bf16_to_nvfp4_128x4(x: torch.Tensor) -> Nvfp4QuantizedTensor:

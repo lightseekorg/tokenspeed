@@ -35,9 +35,9 @@ from __future__ import annotations
 
 import math
 from functools import lru_cache
-from importlib.util import find_spec
 
 import torch
+from tokenspeed_kernel.platform import current_platform
 
 __all__ = ["flash_kda_chunk_prefill", "flash_kda_fwd", "is_flash_kda_installed"]
 
@@ -46,26 +46,24 @@ _INSTALL_HINT = (
     "`pip install tokenspeed-flashkda` (SM90+, CUDA 12.9+)."
 )
 
+_flash_kda = None
+
+platform = current_platform()
+if platform.is_nvidia and platform.is_hopper_plus:
+    import flash_kda as _flash_kda
+
 
 @lru_cache(maxsize=1)
 def is_flash_kda_installed() -> bool:
-    """Whether the optional ``flash_kda`` extension can be loaded."""
-    if find_spec("flash_kda") is None:
-        return False
-    try:
-        import flash_kda  # noqa: F401
-    except Exception:
-        return False
-    return True
+    """Whether the ``flash_kda`` extension supports this device."""
+    return _flash_kda is not None
 
 
 def flash_kda_fwd():
     """Return the optional ``flash_kda.fwd`` entry point."""
     if not is_flash_kda_installed():
         raise ImportError(_INSTALL_HINT)
-    import flash_kda
-
-    return flash_kda.fwd
+    return _flash_kda.fwd
 
 
 def flash_kda_chunk_prefill(

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.platform import current_platform
 
 triton_mod = pytest.importorskip("tokenspeed_kernel.ops.kvcache.triton")
 store_sf_interleaved = triton_mod.store_sf_interleaved
@@ -85,10 +86,9 @@ def test_matches_reference_scatter(num_tokens: int):
 def test_matches_fork_interleave_sf():
     """A full contiguous page written token-by-token must equal the fork's
     bulk interleave of the same [1, 128, H, 4] slab."""
-    try:
-        from flash_attn.cute.blockscaled_utils import interleave_sf
-    except ImportError:
-        pytest.skip("fa4 fork with blockscaled_utils not installed")
+    if not current_platform().is_nvidia:
+        pytest.skip("FA4 blockscaled utilities target NVIDIA GPUs")
+    from flash_attn.cute.blockscaled_utils import interleave_sf
 
     torch.manual_seed(5)
     sf_tok = torch.randint(

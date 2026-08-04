@@ -47,86 +47,74 @@ fast_topk_v2 = error_fn
 # the global libcudart.so.13, and all 820+ kernel registrations from
 # DeepEP silently fail (cudaFuncGetAttributes returns rc=400).
 if platform.is_nvidia:
-    try:
-        load_deep_ep()
-    except ImportError:
-        pass
+    load_deep_ep()
+    import trtllm_kernel  # noqa: F401  — loads .so and registers torch.ops.trtllm.*
 
-    trtllm_kernel_loaded = False
-    try:
-        import trtllm_kernel  # noqa: F401  — loads .so and registers torch.ops.trtllm.*
-    except ImportError:
-        pass
-    else:
-        trtllm_kernel_loaded = True
+    # DSv3 min-latency fused-A projection (hidden→q_a‖kv_a_mqa). On SM≥90
+    # with bf16 and shape [1..16, 7168] × [7168, 2112], trtllm fires a
+    # hand-rolled warp-specialized kernel; off-shape it falls back to cuBLAS.
+    def dsv3_fused_a_gemm(mat_a: torch.Tensor, mat_b: torch.Tensor) -> torch.Tensor:
+        return torch.ops.trtllm.dsv3_fused_a_gemm_op(mat_a, mat_b, None, None)
 
-    if trtllm_kernel_loaded:
+    # FP8 blockwise matmul helper.
+    def fp8_blockwise_scaled_mm(
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        scales_a: torch.Tensor,
+        scales_b: torch.Tensor,
+        out_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        alpha = torch.tensor(1.0, dtype=torch.float32, device=mat_a.device)
+        return torch.ops.trtllm.fp8_block_scaling_gemm_impl(
+            mat_a, mat_b, alpha, scales_a, scales_b, out_dtype
+        )
 
-        # DSv3 min-latency fused-A projection (hidden→q_a‖kv_a_mqa). On SM≥90
-        # with bf16 and shape [1..16, 7168] × [7168, 2112], trtllm fires a
-        # hand-rolled warp-specialized kernel; off-shape it falls back to cuBLAS.
-        def dsv3_fused_a_gemm(mat_a: torch.Tensor, mat_b: torch.Tensor) -> torch.Tensor:
-            return torch.ops.trtllm.dsv3_fused_a_gemm_op(mat_a, mat_b, None, None)
+    def per_token_group_quant_8bit(
+        x: torch.Tensor,
+        group_size: int = 128,
+        use_ue8m0: bool = False,
+    ) -> tuple:
+        assert (
+            group_size == 128
+        ), f"trtllm fp8_quantize_1x128 only supports group_size=128, got {group_size}"
+        return torch.ops.trtllm.fp8_quantize_1x128(x, use_ue8m0)
 
-        # FP8 blockwise matmul helper.
-        def fp8_blockwise_scaled_mm(
-            mat_a: torch.Tensor,
-            mat_b: torch.Tensor,
-            scales_a: torch.Tensor,
-            scales_b: torch.Tensor,
-            out_dtype: torch.dtype,
-        ) -> torch.Tensor:
-            alpha = torch.tensor(1.0, dtype=torch.float32, device=mat_a.device)
-            return torch.ops.trtllm.fp8_block_scaling_gemm_impl(
-                mat_a, mat_b, alpha, scales_a, scales_b, out_dtype
+    def per_tensor_quant_fp8(
+        input: torch.Tensor,
+        output: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> None:
+        q, s = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(input)
+        output.copy_(q)
+        scale.copy_(s.float().squeeze())
+
+    def per_token_quant_fp8(
+        input: torch.Tensor,
+        output: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> None:
+        q, s = torch.ops.tensorrt_llm.quantize_e4m3_activation(input)
+        output.copy_(q)
+        scale.copy_(s.float().squeeze(-1))
+
+    def fast_topk_v2(
+        values: torch.Tensor,
+        seq_lens: torch.Tensor,
+        indices: torch.Tensor,
+        topk: int,
+        next_n: int = 1,
+    ):
+        seq_lens = seq_lens.to(torch.int32).reshape(-1).contiguous()
+        if next_n == 1:
+            torch.ops.trtllm.indexer_topk_decode(
+                values, seq_lens, indices, next_n, topk
             )
-
-        def per_token_group_quant_8bit(
-            x: torch.Tensor,
-            group_size: int = 128,
-            use_ue8m0: bool = False,
-        ) -> tuple:
-            assert (
-                group_size == 128
-            ), f"trtllm fp8_quantize_1x128 only supports group_size=128, got {group_size}"
-            return torch.ops.trtllm.fp8_quantize_1x128(x, use_ue8m0)
-
-        def per_tensor_quant_fp8(
-            input: torch.Tensor,
-            output: torch.Tensor,
-            scale: torch.Tensor,
-        ) -> None:
-            q, s = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(input)
-            output.copy_(q)
-            scale.copy_(s.float().squeeze())
-
-        def per_token_quant_fp8(
-            input: torch.Tensor,
-            output: torch.Tensor,
-            scale: torch.Tensor,
-        ) -> None:
-            q, s = torch.ops.tensorrt_llm.quantize_e4m3_activation(input)
-            output.copy_(q)
-            scale.copy_(s.float().squeeze(-1))
-
-        def fast_topk_v2(
-            values: torch.Tensor,
-            seq_lens: torch.Tensor,
-            indices: torch.Tensor,
-            topk: int,
-            next_n: int = 1,
-        ):
-            seq_lens = seq_lens.to(torch.int32).reshape(-1).contiguous()
-            if next_n == 1:
-                torch.ops.trtllm.indexer_topk_decode(
-                    values, seq_lens, indices, next_n, topk
-                )
-            else:
-                row_ends = torch.cumsum(seq_lens, dim=0, dtype=torch.int32)
-                row_starts = row_ends - seq_lens
-                torch.ops.trtllm.indexer_topk_prefill(
-                    values, row_starts, row_ends, indices, topk
-                )
+        else:
+            row_ends = torch.cumsum(seq_lens, dim=0, dtype=torch.int32)
+            row_starts = row_ends - seq_lens
+            torch.ops.trtllm.indexer_topk_prefill(
+                values, row_starts, row_ends, indices, topk
+            )
 
 
 __all__ = [

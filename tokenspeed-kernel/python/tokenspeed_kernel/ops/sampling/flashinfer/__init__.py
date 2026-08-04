@@ -29,22 +29,16 @@ top_p_renorm_prob = error_fn
 top_p_renorm_probs = error_fn
 
 if current_platform().is_nvidia:
-    try:
-        from flashinfer.sampling import (
-            min_p_sampling_from_probs,
-            top_k_renorm_prob,
-            top_k_top_p_sampling_from_logits,
-            top_k_top_p_sampling_from_probs,
-            top_p_renorm_prob,
-            top_p_renorm_probs,
-        )
-    except ImportError:
-        pass
+    from flashinfer.sampling import (
+        min_p_sampling_from_probs,
+        top_k_renorm_prob,
+        top_k_top_p_sampling_from_logits,
+        top_k_top_p_sampling_from_probs,
+        top_p_renorm_prob,
+        top_p_renorm_probs,
+    )
 
-    try:
-        from .native import softmax
-    except ImportError:
-        pass
+    from .native import softmax
 
 __all__ = [
     "min_p_sampling_from_probs",

@@ -47,10 +47,7 @@ def _skip_if_unsupported(world_size: int, reason_prefix: str) -> None:
         pytest.skip(f"Need {world_size} GPUs, have {torch.cuda.device_count()}")
     if not current_platform().is_amd:
         pytest.skip(f"{reason_prefix} only targets AMD ROCm")
-    try:
-        import iris  # noqa: F401
-    except ImportError:
-        pytest.skip("iris is not installed")
+    import iris  # noqa: F401
 
 
 def _spawn_and_collect(worker_fn, args, world_size: int) -> None:
@@ -105,11 +102,11 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
         world_size=world_size,
     )
 
-    try:
-        # Importing inside the worker avoids pulling iris into the parent
-        # process (which has no distributed context).
-        from tokenspeed_kernel.ops.communication.iris import create_iris_state
+    # Importing inside the worker avoids pulling iris into the parent process,
+    # which has no distributed context.
+    from tokenspeed_kernel.ops.communication.iris import create_iris_state
 
+    try:
         first_shape, second_shape = _ar_two_shape_case()
         max_numel = max(
             max(int(torch.tensor(s).prod()) for s in _ar_shape_cases()),
@@ -243,9 +240,9 @@ def _rsag_worker_main(rank: int, world_size: int, port: int, hidden_size: int) -
         world_size=world_size,
     )
 
-    try:
-        from tokenspeed_kernel.ops.communication.iris import create_iris_rsag_state
+    from tokenspeed_kernel.ops.communication.iris import create_iris_rsag_state
 
+    try:
         cases = _rsag_uniform_token_cases(world_size)
         max_tokens = max(sum(tokens) for tokens in cases)
         rsag = create_iris_rsag_state(
@@ -372,11 +369,11 @@ def _arrms_worker_main(rank: int, world_size: int, port: int, persistent: bool) 
         world_size=world_size,
     )
 
-    try:
-        from tokenspeed_kernel.ops.communication.iris import (
-            create_iris_ar_rmsnorm_state,
-        )
+    from tokenspeed_kernel.ops.communication.iris import (
+        create_iris_ar_rmsnorm_state,
+    )
 
+    try:
         max_token_num = max(_ARRMS_TOKEN_CASES)
         state = create_iris_ar_rmsnorm_state(
             group=dist.group.WORLD,

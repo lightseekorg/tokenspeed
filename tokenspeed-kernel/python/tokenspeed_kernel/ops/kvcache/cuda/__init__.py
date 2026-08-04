@@ -24,15 +24,9 @@ import functools
 from pathlib import Path
 from typing import List
 
+import torch
+import tvm_ffi
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.registry import error_fn
-
-try:
-    import torch
-    import tvm_ffi
-except ImportError:
-    torch = None
-    tvm_ffi = None
 
 
 def _objs_dir() -> Path:
@@ -384,18 +378,6 @@ def transfer_kv_all_layer_mla_lf_pf(
         block_quota,
         num_warps_per_block,
     )
-
-
-if tvm_ffi is None:
-    transfer_kv_all_layer_lf_pf = error_fn
-    transfer_kv_all_layer_lf_ph = error_fn
-    transfer_kv_all_layer_mla = error_fn
-    transfer_kv_all_layer_mla_lf_pf = error_fn
-    transfer_kv_direct = error_fn
-    transfer_kv_per_layer_mla = error_fn
-    transfer_kv_per_layer_mla_pf_lf = error_fn
-    transfer_kv_per_layer_pf_lf = error_fn
-    transfer_kv_per_layer_ph_lf = error_fn
 
 
 __all__ = [

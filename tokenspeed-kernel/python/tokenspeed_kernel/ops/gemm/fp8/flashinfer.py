@@ -51,10 +51,7 @@ _MXFP8_FORMAT_SIGNATURES = format_signatures(
 gemm_fp8_nt_groupwise = error_fn
 
 if platform.is_hopper_plus:
-    try:
-        from flashinfer.gemm import gemm_fp8_nt_groupwise
-    except ImportError:
-        pass
+    from flashinfer.gemm import gemm_fp8_nt_groupwise
 
 
 def has_flashinfer_fp8_blockscale() -> bool:
@@ -233,10 +230,7 @@ if gemm_fp8_nt_groupwise is not error_fn:
 mm_mxfp8 = error_fn
 
 if platform.is_nvidia and platform.is_blackwell:
-    try:
-        from flashinfer.gemm import mm_mxfp8
-    except ImportError:
-        pass
+    from flashinfer.gemm import mm_mxfp8
 
 _MXFP8_UE8M0_1X32_SCALE = ScaleFormat(
     storage_dtype=torch.uint8,

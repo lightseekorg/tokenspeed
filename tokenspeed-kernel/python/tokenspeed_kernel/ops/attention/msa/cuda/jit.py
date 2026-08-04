@@ -20,6 +20,7 @@ from pathlib import Path
 
 import jinja2
 import tvm_ffi
+from tokenspeed_kernel.platform import current_platform
 
 from .source import msa_source_dir
 
@@ -61,6 +62,15 @@ def _release_file_lock(fd):
 
 _PACKAGE_DIR = Path(__file__).resolve().parent
 _FMHA_VARLEN_DIR = msa_source_dir()
+_FLASHINFER_CUTLASS_DIR = None
+
+platform = current_platform()
+if platform.is_nvidia and platform.is_blackwell:
+    import flashinfer
+
+    _FLASHINFER_CUTLASS_DIR = (
+        Path(flashinfer.__file__).resolve().parent / "data" / "cutlass"
+    )
 
 
 # TokenSpeed patch: the upstream cutlass/ submodule is not vendored; resolve
@@ -73,14 +83,11 @@ def _find_cutlass_dir():
     local = _PACKAGE_DIR / "cutlass"
     if (local / "include" / "cutlass").is_dir():
         return local
-    try:
-        import flashinfer
-
-        bundled = Path(flashinfer.__file__).resolve().parent / "data" / "cutlass"
-        if (bundled / "include" / "cutlass").is_dir():
-            return bundled
-    except ImportError:
-        pass
+    if (
+        _FLASHINFER_CUTLASS_DIR is not None
+        and (_FLASHINFER_CUTLASS_DIR / "include" / "cutlass").is_dir()
+    ):
+        return _FLASHINFER_CUTLASS_DIR
     raise RuntimeError(
         "Cannot find CUTLASS headers for the MSA FMHA JIT. Set "
         "TOKENSPEED_MSA_CUTLASS_DIR to a CUTLASS checkout, or install "
@@ -221,16 +228,13 @@ def _variant_key_from_runtime(
 
 def _get_tvm_ffi_include():
     """Find TVM-FFI include directory."""
-    try:
-        tvm_dir = Path(tvm_ffi.__path__[0])
-        inc = tvm_dir / "include"
-        if inc.exists():
-            return str(inc)
-        inc2 = tvm_dir.parent / "include"
-        if inc2.exists():
-            return str(inc2)
-    except ImportError:
-        pass
+    tvm_dir = Path(tvm_ffi.__path__[0])
+    inc = tvm_dir / "include"
+    if inc.exists():
+        return str(inc)
+    inc2 = tvm_dir.parent / "include"
+    if inc2.exists():
+        return str(inc2)
     raise RuntimeError("Cannot find TVM-FFI include directory; install apache-tvm-ffi")
 
 

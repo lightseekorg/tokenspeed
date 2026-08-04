@@ -9,15 +9,13 @@ flash_mla_with_kvcache = error_fn
 flash_mla_sparse_fwd = error_fn
 get_mla_metadata = error_fn
 
-if current_platform().is_nvidia and current_platform().is_hopper_plus:
-    try:
-        from flash_mla import (
-            flash_mla_sparse_fwd,
-            flash_mla_with_kvcache,
-            get_mla_metadata,
-        )
-    except ImportError:
-        pass
+platform = current_platform()
+if platform.is_nvidia and platform.is_hopper_plus:
+    from flash_mla import (
+        flash_mla_sparse_fwd,
+        flash_mla_with_kvcache,
+        get_mla_metadata,
+    )
 
 __all__ = [
     "flash_mla_sparse_fwd",

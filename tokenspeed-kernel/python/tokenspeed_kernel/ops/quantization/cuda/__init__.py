@@ -25,14 +25,12 @@ from __future__ import annotations
 import functools
 from pathlib import Path
 
+import torch
+import tvm_ffi
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import error_fn
 
-try:
-    import torch
-    import tvm_ffi
-except ImportError:
-    torch = None
-    tvm_ffi = None
+gptq_marlin_repack = error_fn
 
 
 def _objs_dir() -> Path:
@@ -51,7 +49,7 @@ def _load_marlin_module():
     return tvm_ffi.load_module(str(so_path))
 
 
-def gptq_marlin_repack(
+def _gptq_marlin_repack(
     b_q_weight: torch.Tensor,
     perm: torch.Tensor,
     size_k: int,
@@ -84,7 +82,8 @@ def gptq_marlin_repack(
     return out
 
 
-if tvm_ffi is None:
-    gptq_marlin_repack = error_fn
+if current_platform().is_nvidia:
+    gptq_marlin_repack = _gptq_marlin_repack
+
 
 __all__ = ["gptq_marlin_repack"]

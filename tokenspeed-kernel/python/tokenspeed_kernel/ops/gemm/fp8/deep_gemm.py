@@ -21,8 +21,12 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
-from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+)
+from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 from tokenspeed_kernel.signature import ScaleFormat, format_signatures
 
 _fp8_dtype = torch.float8_e4m3fn
@@ -35,7 +39,9 @@ _MXFP8_FORMAT_SIGNATURES = format_signatures(
     ("a", "b"), "mxfp8", {_fp8_dtype}, scale=_MXFP8_SCALE
 )
 
-try:
+deep_gemm_mm_fp8_blockscale = error_fn
+
+if current_platform().is_hopper_plus:
     from tokenspeed_kernel.ops.other.native.deep_gemm import (
         ceil_to_ue8m0,
         fp8_gemm_nt,
@@ -46,17 +52,6 @@ try:
         set_num_sms,
         transform_sf_into_required_layout,
     )
-except ImportError:
-    ceil_to_ue8m0 = None  # type: ignore[assignment]
-    fp8_gemm_nt = None  # type: ignore[assignment]
-    get_mn_major_tma_aligned_tensor = None  # type: ignore[assignment]
-    get_num_sms = None  # type: ignore[assignment]
-    m_grouped_fp8_gemm_nt_contiguous = None  # type: ignore[assignment]
-    m_grouped_fp8_gemm_nt_masked = None  # type: ignore[assignment]
-    set_num_sms = None  # type: ignore[assignment]
-    transform_sf_into_required_layout = None  # type: ignore[assignment]
-
-if fp8_gemm_nt is not None:
 
     @register_kernel(
         "gemm",

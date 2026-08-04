@@ -37,20 +37,16 @@ checkpoint stores ``A_log`` in a ``[head_dim]``-sized buffer zero-padded past
 from __future__ import annotations
 
 import torch
-
-_INSTALL_HINT = (
-    "Kimi-K3 KDA requires flash-linear-attention for this backend. Install it "
-    "into the active environment: `pip install flash-linear-attention`."
+from tokenspeed_kernel._triton import (
+    ConstexprFunction,
+    redirect_triton_to_tokenspeed_triton,
+    triton,
 )
+
 _CONSTEXPR_BUILTINS = ("next_power_of_2",)
 
 
 def _ensure_triton_constexpr() -> None:
-    try:
-        import triton
-        from triton.runtime.jit import ConstexprFunction
-    except Exception:  # pragma: no cover - triton always present with fla
-        return
     for name in _CONSTEXPR_BUILTINS:
         fn = getattr(triton, name, None)
         if fn is not None and not isinstance(fn, ConstexprFunction):
@@ -59,22 +55,20 @@ def _ensure_triton_constexpr() -> None:
 
 def chunk_kda(*args, **kwargs):
     """Run the optional FLA chunked KDA implementation."""
-    try:
-        from fla.ops.kda import chunk_kda
-    except ImportError as exc:  # pragma: no cover - optional dependency
-        raise ImportError(_INSTALL_HINT) from exc
+    with redirect_triton_to_tokenspeed_triton():
+        from fla.ops.kda import chunk_kda as implementation
+
     _ensure_triton_constexpr()
-    return chunk_kda(*args, **kwargs)
+    return implementation(*args, **kwargs)
 
 
 def fused_recurrent_kda(*args, **kwargs):
     """Run the optional FLA recurrent KDA implementation."""
-    try:
-        from fla.ops.kda.fused_recurrent import fused_recurrent_kda
-    except ImportError as exc:  # pragma: no cover - optional dependency
-        raise ImportError(_INSTALL_HINT) from exc
+    with redirect_triton_to_tokenspeed_triton():
+        from fla.ops.kda.fused_recurrent import fused_recurrent_kda as implementation
+
     _ensure_triton_constexpr()
-    return fused_recurrent_kda(*args, **kwargs)
+    return implementation(*args, **kwargs)
 
 
 def kda_chunk_prefill(

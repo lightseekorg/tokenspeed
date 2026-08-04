@@ -12,8 +12,31 @@ import logging
 from math import ceil
 
 import torch
+from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.registry import error_fn
 
 logger = logging.getLogger(__name__)
+
+fp8_einsum = error_fn
+fp8_fp4_mega_moe = error_fn
+fp8_fp4_mqa_logits = error_fn
+fp8_fp4_paged_mqa_logits = error_fn
+fp8_gemm_nt = error_fn
+get_num_sms = error_fn
+get_paged_mqa_logits_metadata = error_fn
+tf32_hc_prenorm_gemm = error_fn
+
+if current_platform().is_hopper_plus:
+    from tokenspeed_kernel.ops.other.native.deep_gemm import (
+        fp8_einsum,
+        fp8_fp4_mega_moe,
+        fp8_fp4_mqa_logits,
+        fp8_fp4_paged_mqa_logits,
+        fp8_gemm_nt,
+        get_num_sms,
+        get_paged_mqa_logits_metadata,
+        tf32_hc_prenorm_gemm,
+    )
 
 
 def _warmup_m_values(max_tokens: int) -> list[int]:
@@ -67,12 +90,6 @@ def warmup_mega_moe_jit(
     All heavy objects (weights, symmetric buffer) must be passed in from
     the already-initialized model to avoid duplicate GPU allocations.
     """
-    try:
-        from tokenspeed_kernel.ops.other.native.deep_gemm import fp8_fp4_mega_moe
-    except ImportError:
-        logger.warning("deep_gemm mega_moe symbols unavailable, skipping warmup")
-        return
-
     token_counts = _warmup_m_values(max_num_tokens)
     logger.info(
         "Warming up mega_moe JIT: %d token counts up to %d",
@@ -219,12 +236,6 @@ def _warmup_tf32_hc_prenorm_gemm(
     max_tokens: int,
     device: torch.device,
 ) -> None:
-    try:
-        from tokenspeed_kernel.ops.other.native.deep_gemm import tf32_hc_prenorm_gemm
-    except ImportError:
-        logger.warning("deep_gemm tf32_hc_prenorm_gemm unavailable, skipping")
-        return
-
     seen: set[tuple[int, ...]] = set()
     block_k = 64
     block_m = 64
@@ -288,12 +299,6 @@ def _warmup_fp8_fp4_mqa_logits(
         device: CUDA device.
         max_kv_len: representative KV length to warm up to.
     """
-    try:
-        from tokenspeed_kernel.ops.other.native.deep_gemm import fp8_fp4_mqa_logits
-    except ImportError:
-        logger.warning("deep_gemm fp8_fp4_mqa_logits unavailable, skipping")
-        return
-
     head_dim_bytes = index_head_dim // 2
     for num_tokens in (1, 256):
         q_vals = torch.zeros(
@@ -348,16 +353,6 @@ def _warmup_fp8_fp4_paged_mqa_logits(
             in-range decode batch hits an uncompiled cubin.
         device: CUDA device.
     """
-    try:
-        from tokenspeed_kernel.ops.other.native.deep_gemm import (
-            fp8_fp4_paged_mqa_logits,
-            get_num_sms,
-            get_paged_mqa_logits_metadata,
-        )
-    except ImportError:
-        logger.warning("deep_gemm paged MQA logits unavailable, skipping")
-        return
-
     # FP4 packs 2 values per byte; the paged KV row stores the value bytes plus
     # a single int32 scale (head_dim / 2 + sizeof(int)).
     head_dim_bytes = index_head_dim // 2
@@ -425,12 +420,6 @@ def warmup_fp8_gemm_nt(
         max_tokens: maximum prefill token count to warm up to.
         device: CUDA device.
     """
-    try:
-        from tokenspeed_kernel.ops.other.native.deep_gemm import fp8_gemm_nt
-    except ImportError:
-        logger.warning("deep_gemm fp8_gemm_nt unavailable, skipping warmup")
-        return
-
     block_size = 128
     seen: set[tuple[int, int]] = set()
 
@@ -485,12 +474,6 @@ def warmup_fp8_einsum(
         max_tokens: maximum prefill token count to warm up to.
         device: CUDA device.
     """
-    try:
-        from tokenspeed_kernel.ops.other.native.deep_gemm import fp8_einsum
-    except ImportError:
-        logger.warning("deep_gemm fp8_einsum unavailable, skipping bmm warmup")
-        return
-
     for weight, weight_scale_inv, n_groups, block_n in bmm_layers:
         in_dim = weight.shape[1]  # K (== r == per-group quant dim)
         o_lora_rank = weight.shape[0] // n_groups  # N (per-group output)

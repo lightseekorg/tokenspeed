@@ -28,6 +28,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Generator
 
+import yaml  # type: ignore[import-untyped]
 from tokenspeed_kernel.platform import PlatformInfo, current_platform
 from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
 from tokenspeed_kernel.signature import FormatSignature
@@ -258,16 +259,6 @@ def load_config_overrides(path: str | os.PathLike[str] | None = None) -> None:
     _config_overrides = {}
 
     if not path.exists():
-        return
-
-    try:
-        import yaml  # type: ignore[import-untyped]
-    except ImportError:
-        logger.warning(
-            "PyYAML not installed; cannot load overrides from %s. "
-            "Install with: pip install pyyaml",
-            path,
-        )
         return
 
     try:

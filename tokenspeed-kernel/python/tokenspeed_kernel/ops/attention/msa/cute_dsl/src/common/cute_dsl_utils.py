@@ -10,13 +10,17 @@ from functools import lru_cache, partial
 from typing import Tuple
 
 import torch
+from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
+from tokenspeed_kernel.platform import current_platform
 
 logger = logging.getLogger("minimax")
 
-try:
-    from triton.tools.disasm import extract
-except ImportError:
-    extract = None
+extract = None
+
+platform = current_platform()
+if platform.is_nvidia and platform.is_blackwell:
+    with redirect_triton_to_tokenspeed_triton():
+        from triton.tools.disasm import extract
 
 import cutlass
 import cutlass.cute as cute
