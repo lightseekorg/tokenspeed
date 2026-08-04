@@ -24,9 +24,9 @@ import importlib
 import math
 
 import pytest
-import tokenspeed_kernel.ops.attention.flash_attn as flash_attn_module
+import tokenspeed_kernel.ops.attention.mha.flash_attn as flash_attn_module
 import torch
-from tokenspeed_kernel.ops.attention.flash_attn import (
+from tokenspeed_kernel.ops.attention.mha.flash_attn import (
     flash_attn_func,
     flash_attn_varlen_func,
 )

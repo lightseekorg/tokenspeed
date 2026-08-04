@@ -20,18 +20,26 @@
 from collections.abc import Callable
 from typing import Any
 
-# Backend registration (side-effect imports)
-import tokenspeed_kernel.ops.moe.deep_gemm  # noqa: F401
-import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
-import tokenspeed_kernel.ops.moe.gluon  # noqa: F401
-import tokenspeed_kernel.ops.moe.triton  # noqa: F401
+import tokenspeed_kernel.ops.moe.fp8.deep_gemm.apply  # noqa: F401
+import tokenspeed_kernel.ops.moe.fp8.flashinfer_cutlass  # noqa: F401
+import tokenspeed_kernel.ops.moe.fp8.flashinfer_trtllm  # noqa: F401
+import tokenspeed_kernel.ops.moe.fp8.triton  # noqa: F401
+import tokenspeed_kernel.ops.moe.fp16.flashinfer_cutlass  # noqa: F401
+import tokenspeed_kernel.ops.moe.fp16.flashinfer_trtllm  # noqa: F401
+import tokenspeed_kernel.ops.moe.fp16.gluon  # noqa: F401
+import tokenspeed_kernel.ops.moe.int4.flashinfer_trtllm  # noqa: F401
+import tokenspeed_kernel.ops.moe.mxfp4.flashinfer_trtllm  # noqa: F401
+import tokenspeed_kernel.ops.moe.mxfp4.gluon  # noqa: F401
+import tokenspeed_kernel.ops.moe.mxfp4.triton  # noqa: F401
+import tokenspeed_kernel.ops.moe.nvfp4.flashinfer_cutedsl_deepep  # noqa: F401
+import tokenspeed_kernel.ops.moe.nvfp4.flashinfer_cutlass  # noqa: F401
+import tokenspeed_kernel.ops.moe.nvfp4.flashinfer_trtllm  # noqa: F401
 import torch
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
-    "kimi3_native_moe_available",
     "moe_apply",
     "moe_grouped_routing",
     "moe_plan",
@@ -43,10 +51,9 @@ __all__ = [
 from tokenspeed_kernel.ops.moe.grouped_routing import (  # noqa: E402
     moe_grouped_routing,
 )
-from tokenspeed_kernel.ops.moe.kimi3 import (  # noqa: E402
-    kimi3_native_moe_available,
+from tokenspeed_kernel.ops.moe.sigmoid_topk import (  # noqa: E402
+    moe_sigmoid_bias_topk,
 )
-from tokenspeed_kernel.ops.moe.sigmoid_topk import moe_sigmoid_bias_topk  # noqa: E402
 from tokenspeed_kernel.ops.moe.unfused import moe_unfused_apply  # noqa: E402
 
 

@@ -158,7 +158,7 @@ def _get_fused_lm_head_gemm():
         _FUSED_LM_HEAD_GEMM = (None, None)
         return _FUSED_LM_HEAD_GEMM
     try:
-        from tokenspeed_kernel.thirdparty.cuda.lm_head_gemm import (
+        from tokenspeed_kernel.ops.gemm.fp16.cuda import (
             lm_head_gemm,
             should_use_fused,
         )

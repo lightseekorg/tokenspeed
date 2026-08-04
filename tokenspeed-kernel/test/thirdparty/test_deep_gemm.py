@@ -26,7 +26,7 @@ import torch
 deep_gemm_testing = pytest.importorskip("deep_gemm.testing")
 deep_gemm_utils = pytest.importorskip("deep_gemm.utils")
 
-from tokenspeed_kernel.ops.gemm import deep_gemm as deep_gemm_ops
+from tokenspeed_kernel.ops.gemm.fp8 import deep_gemm as deep_gemm_ops
 from tokenspeed_kernel.platform import current_platform
 
 platform = current_platform()

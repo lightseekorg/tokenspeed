@@ -50,8 +50,8 @@ from tokenspeed_kernel.ops.attention import (
     rel_mha_plan,
     rel_mha_prefill,
 )
-from tokenspeed_kernel.ops.gemm import (
-    bmm,
+from tokenspeed_kernel.ops.gemm import bmm, mm
+from tokenspeed_kernel.ops.model.kimi_k3.projections import (
     kimi3_latent_projection,
     kimi3_latent_projection_add3,
     kimi3_mla_qkv_gate_projection,
@@ -59,7 +59,6 @@ from tokenspeed_kernel.ops.gemm import (
     kimi3_router_projection,
     kimi3_shared_down_projection,
     kimi3_shared_situ_projection,
-    mm,
 )
 from tokenspeed_kernel.ops.moe import (
     moe_apply,

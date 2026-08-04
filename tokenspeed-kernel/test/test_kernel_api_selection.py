@@ -39,24 +39,50 @@ import pytest
 import tokenspeed_kernel
 import tokenspeed_kernel.numerics.reference.gemm as _gemm_reference
 import tokenspeed_kernel.ops.attention as _attention_pkg
-import tokenspeed_kernel.ops.attention.cuda as _attention_cuda
-import tokenspeed_kernel.ops.attention.flash_attn as _attention_flash_attn
-import tokenspeed_kernel.ops.attention.flash_mla as _attention_flash_mla
-import tokenspeed_kernel.ops.attention.flashinfer as _attention_flashinfer
-import tokenspeed_kernel.ops.attention.flashinfer.gated_delta_rule as _attention_flashinfer_gdn
-import tokenspeed_kernel.ops.attention.gluon as _attention_gluon
-import tokenspeed_kernel.ops.attention.triton as _attention_triton
+import tokenspeed_kernel.ops.attention.dsa.deep_gemm as _attention_deep_gemm_dsa
+import tokenspeed_kernel.ops.attention.dsa.flash_mla as _attention_flash_mla_dsa
+import tokenspeed_kernel.ops.attention.dsa.flashinfer as _attention_flashinfer_dsa
+import tokenspeed_kernel.ops.attention.dsa.gluon as _attention_gluon_dsa
+import tokenspeed_kernel.ops.attention.dsa.triton.attention as _attention_triton_dsa
+import tokenspeed_kernel.ops.attention.dsa.triton.topk as _attention_triton_dsa_topk
+import tokenspeed_kernel.ops.attention.gdn.flashinfer as _attention_flashinfer_gdn
+import tokenspeed_kernel.ops.attention.gdn.triton.attention as _attention_triton_gdn
+import tokenspeed_kernel.ops.attention.kda.gluon as _attention_gluon_kda
+import tokenspeed_kernel.ops.attention.kda.triton.dispatch as _attention_triton_kda
+import tokenspeed_kernel.ops.attention.merge_state.cuda as _attention_cuda
+import tokenspeed_kernel.ops.attention.merge_state.triton as _attention_triton_merge_state
+import tokenspeed_kernel.ops.attention.mha.flash_attn as _attention_flash_attn_mha
+import tokenspeed_kernel.ops.attention.mha.flashinfer as _attention_flashinfer_mha
+import tokenspeed_kernel.ops.attention.mha.gluon as _attention_gluon_mha
+import tokenspeed_kernel.ops.attention.mla.gluon as _attention_gluon_mla
+import tokenspeed_kernel.ops.attention.msa.cute_dsl.attention as _attention_cuda_msa
+import tokenspeed_kernel.ops.attention.msa.triton.sparse_attention as _attention_triton_msa
+import tokenspeed_kernel.ops.attention.rmha.flash_attn as _attention_flash_attn_rmha
+import tokenspeed_kernel.ops.attention.rmha.gluon as _attention_gluon_rmha
+import tokenspeed_kernel.ops.communication.trtllm as _communication_trtllm
 import tokenspeed_kernel.ops.gemm as _gemm_pkg
-import tokenspeed_kernel.ops.gemm.deep_gemm as _gemm_deep_gemm
-import tokenspeed_kernel.ops.gemm.flashinfer as _gemm_flashinfer
-import tokenspeed_kernel.ops.gemm.gluon as _gemm_gluon
-import tokenspeed_kernel.ops.gemm.triton as _gemm_triton
-import tokenspeed_kernel.ops.gemm.trtllm as _gemm_trtllm
+import tokenspeed_kernel.ops.gemm.fp8.deep_gemm as _gemm_deep_gemm
+import tokenspeed_kernel.ops.gemm.fp8.flashinfer as _gemm_flashinfer
+import tokenspeed_kernel.ops.gemm.fp8.triton as _gemm_triton_fp8
+import tokenspeed_kernel.ops.gemm.fp16.gluon as _gemm_gluon
+import tokenspeed_kernel.ops.gemm.mxfp4.triton as _gemm_triton_mxfp4
+import tokenspeed_kernel.ops.gemm.nvfp4.flashinfer as _gemm_flashinfer_nvfp4
+import tokenspeed_kernel.ops.gemm.nvfp4.trtllm as _gemm_trtllm
 import tokenspeed_kernel.ops.moe as _moe_pkg
-import tokenspeed_kernel.ops.moe.deep_gemm as _moe_deep_gemm
-import tokenspeed_kernel.ops.moe.flashinfer as _moe_flashinfer
-import tokenspeed_kernel.ops.moe.gluon as _moe_gluon
-import tokenspeed_kernel.ops.moe.triton as _moe_triton
+import tokenspeed_kernel.ops.moe.fp8.deep_gemm.apply as _moe_deep_gemm_deepep_fp8
+import tokenspeed_kernel.ops.moe.fp8.flashinfer_cutlass as _moe_cutlass_fp8
+import tokenspeed_kernel.ops.moe.fp8.flashinfer_trtllm as _moe_trtllm_fp8
+import tokenspeed_kernel.ops.moe.fp8.triton as _moe_triton_fp8
+import tokenspeed_kernel.ops.moe.fp16.flashinfer_cutlass as _moe_cutlass_unquant
+import tokenspeed_kernel.ops.moe.fp16.flashinfer_trtllm as _moe_trtllm_unquant
+import tokenspeed_kernel.ops.moe.fp16.gluon as _moe_gluon_fp16
+import tokenspeed_kernel.ops.moe.int4.flashinfer_trtllm as _moe_trtllm_mxint4
+import tokenspeed_kernel.ops.moe.mxfp4.flashinfer_trtllm as _moe_trtllm_mxfp4
+import tokenspeed_kernel.ops.moe.mxfp4.gluon as _moe_gluon_mxfp4
+import tokenspeed_kernel.ops.moe.mxfp4.triton as _moe_triton_mxfp4
+import tokenspeed_kernel.ops.moe.nvfp4.flashinfer_cutedsl_deepep as _moe_cutedsl_deepep_nvfp4
+import tokenspeed_kernel.ops.moe.nvfp4.flashinfer_cutlass as _moe_cutlass_nvfp4
+import tokenspeed_kernel.ops.moe.nvfp4.flashinfer_trtllm as _moe_trtllm_nvfp4
 import tokenspeed_kernel.ops.quantization as _quantization_pkg
 import tokenspeed_kernel.ops.quantization.flashinfer as _quantization_flashinfer
 import tokenspeed_kernel.ops.quantization.triton as _quantization_triton
@@ -65,45 +91,26 @@ import tokenspeed_kernel.ops.sampling as _sampling_pkg
 import tokenspeed_kernel.ops.sampling.cute_dsl as _sampling_cute_dsl
 import tokenspeed_kernel.ops.sampling.gluon as _sampling_gluon
 import torch
-from tokenspeed_kernel.ops.attention.gdn_utils import GdnChunkPrefillResult
-from tokenspeed_kernel.ops.attention.triton import dsa as _attention_triton_dsa
-from tokenspeed_kernel.ops.attention.triton import (
-    dsa_topk as _attention_triton_dsa_topk,
+from tokenspeed_kernel.ops.attention.gdn.types import GdnChunkPrefillResult
+from tokenspeed_kernel.ops.attention.mha.triton import (
+    decode as _attention_triton_mha_decode,
 )
-from tokenspeed_kernel.ops.attention.triton import (
-    gated_delta_rule as _attention_triton_gdn,
+from tokenspeed_kernel.ops.attention.mha.triton import (
+    prefill as _attention_triton_mha_prefill,
 )
-from tokenspeed_kernel.ops.attention.triton import (
-    merge_state as _attention_triton_merge_state,
+from tokenspeed_kernel.ops.attention.mla.tokenspeed_mla import (
+    decode as _attention_tokenspeed_mla_decode,
 )
-from tokenspeed_kernel.ops.attention.triton import (
-    mha_decode as _attention_triton_mha_decode,
+from tokenspeed_kernel.ops.attention.mla.tokenspeed_mla import (
+    prefill as _attention_tokenspeed_mla_prefill,
 )
-from tokenspeed_kernel.ops.attention.triton import (
-    mha_prefill as _attention_triton_mha_prefill,
+from tokenspeed_kernel.ops.attention.mla.triton import (
+    decode as _attention_triton_mla_decode,
 )
-from tokenspeed_kernel.ops.attention.triton import (
-    mla_decode as _attention_triton_mla_decode,
+from tokenspeed_kernel.ops.attention.mla.triton import (
+    prefill as _attention_triton_mla_prefill,
 )
-from tokenspeed_kernel.ops.attention.triton import (
-    mla_prefill as _attention_triton_mla_prefill,
-)
-from tokenspeed_kernel.ops.attention.triton import rel_mha as _attention_triton_rel_mha
-from tokenspeed_kernel.ops.moe.deep_gemm import deepep_fp8 as _moe_deep_gemm_deepep_fp8
-from tokenspeed_kernel.ops.moe.flashinfer import (
-    cutedsl_deepep_nvfp4 as _moe_cutedsl_deepep_nvfp4,
-)
-from tokenspeed_kernel.ops.moe.flashinfer import cutlass_fp8 as _moe_cutlass_fp8
-from tokenspeed_kernel.ops.moe.flashinfer import cutlass_nvfp4 as _moe_cutlass_nvfp4
-from tokenspeed_kernel.ops.moe.flashinfer import cutlass_unquant as _moe_cutlass_unquant
-from tokenspeed_kernel.ops.moe.flashinfer import trtllm_fp8 as _moe_trtllm_fp8
-from tokenspeed_kernel.ops.moe.flashinfer import trtllm_mxfp4 as _moe_trtllm_mxfp4
-from tokenspeed_kernel.ops.moe.flashinfer import trtllm_mxint4 as _moe_trtllm_mxint4
-from tokenspeed_kernel.ops.moe.flashinfer import trtllm_nvfp4 as _moe_trtllm_nvfp4
-from tokenspeed_kernel.ops.moe.flashinfer import trtllm_unquant as _moe_trtllm_unquant
-from tokenspeed_kernel.ops.moe.gluon import mxfp4 as _moe_gluon_mxfp4
-from tokenspeed_kernel.ops.moe.triton import fp8 as _moe_triton_fp8
-from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
+from tokenspeed_kernel.ops.attention.rmha import triton as _attention_triton_rel_mha
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import SelectedKernel
@@ -111,33 +118,45 @@ from tokenspeed_kernel.selection import SelectedKernel
 _RELOAD_MODULES = [
     # Attention registration modules.
     _attention_cuda,
-    _attention_flash_attn,
-    _attention_flash_mla,
+    _attention_deep_gemm_dsa,
+    _attention_flash_mla_dsa,
+    _attention_flashinfer_dsa,
     _attention_flashinfer_gdn,
-    _attention_flashinfer,
-    _attention_gluon,
+    _attention_flashinfer_mha,
+    _attention_gluon_dsa,
+    _attention_gluon_kda,
+    _attention_gluon_mha,
+    _attention_gluon_mla,
+    _attention_gluon_rmha,
+    _attention_flash_attn_mha,
+    _attention_flash_attn_rmha,
     _attention_triton_mha_prefill,
     _attention_triton_mha_decode,
     _attention_triton_mla_prefill,
     _attention_triton_mla_decode,
+    _attention_tokenspeed_mla_decode,
+    _attention_tokenspeed_mla_prefill,
     _attention_triton_rel_mha,
     _attention_triton_merge_state,
     _attention_triton_dsa,
     _attention_triton_dsa_topk,
     _attention_triton_gdn,
-    _attention_triton,
+    _attention_triton_kda,
+    _attention_triton_msa,
+    _attention_cuda_msa,
     _attention_pkg,
     # GEMM registration modules.
     _gemm_reference,
     _gemm_deep_gemm,
     _gemm_flashinfer,
     _gemm_gluon,
-    _gemm_triton,
+    _gemm_triton_fp8,
+    _gemm_triton_mxfp4,
+    _gemm_flashinfer_nvfp4,
     _gemm_trtllm,
     _gemm_pkg,
     # MoE registration modules.
     _moe_deep_gemm_deepep_fp8,
-    _moe_deep_gemm,
     _moe_cutedsl_deepep_nvfp4,
     _moe_cutlass_fp8,
     _moe_cutlass_nvfp4,
@@ -147,12 +166,10 @@ _RELOAD_MODULES = [
     _moe_trtllm_mxint4,
     _moe_trtllm_nvfp4,
     _moe_trtllm_unquant,
-    _moe_flashinfer,
+    _moe_gluon_fp16,
     _moe_gluon_mxfp4,
-    _moe_gluon,
     _moe_triton_fp8,
     _moe_triton_mxfp4,
-    _moe_triton,
     _moe_pkg,
     # Quantization registration modules.
     _quantization_flashinfer,
@@ -173,6 +190,11 @@ def _kernel_registry(fresh_registry):
     """Reload real registrations into the fresh registry for each case."""
     for mod in _RELOAD_MODULES:
         importlib.reload(mod)
+
+
+def test_trtllm_communication_preserves_minimax_direct_exports():
+    assert callable(_communication_trtllm.minimax_allreduce_rms_qk)
+    assert callable(_communication_trtllm.trtllm_create_ipc_workspace_for_minimax)
 
 
 def test_builtin_moe_preprocessor_links_are_callables():
@@ -2728,7 +2750,8 @@ def test_b300_rel_decode_registration_and_selection(
     try:
         Platform.override(b300_platform)
         KernelRegistry.reset()
-        importlib.reload(_attention_flash_attn)
+        importlib.reload(_attention_flash_attn_mha)
+        importlib.reload(_attention_flash_attn_rmha)
         registry = KernelRegistry.get()
 
         expected_spec = registry.get_by_name(case.expected)
@@ -2746,7 +2769,8 @@ def test_b300_rel_decode_registration_and_selection(
     finally:
         Platform.override(real_platform)
         KernelRegistry.reset()
-        importlib.reload(_attention_flash_attn)
+        importlib.reload(_attention_flash_attn_mha)
+        importlib.reload(_attention_flash_attn_rmha)
 
 
 def test_attn_merge_state_routes_to_triton_on_cdna4(

@@ -32,17 +32,17 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.attention import attn_merge_state
-from tokenspeed_kernel.ops.attention.tokenspeed_mla import mla_kv_pack_quantize_fp8
-from tokenspeed_kernel.ops.attention.triton.mla_query_assemble import (
+from tokenspeed_kernel.ops.attention.mla.tokenspeed_mla import mla_kv_pack_quantize_fp8
+from tokenspeed_kernel.ops.attention.mla.triton.query_assemble import (
     mla_nope_query_fp8,
 )
 from tokenspeed_kernel.ops.embedding import apply_rope_mla
-from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
-from tokenspeed_kernel.ops.gemm.cute_dsl import (
+from tokenspeed_kernel.ops.gemm.fp16.cuda import dsv3_router_gemm
+from tokenspeed_kernel.ops.gemm.nvfp4.cute_dsl import (
     nvfp4_gemm_swiglu_nvfp4_quant,
 )
-from tokenspeed_kernel.ops.gemm.trtllm import dsv3_fused_a_gemm
-from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
+from tokenspeed_kernel.ops.model.deepseek_v3.trtllm import dsv3_fused_a_gemm
+from tokenspeed_kernel.ops.moe.finalize.cuda import moe_finalize_fuse_shared
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
 from tokenspeed_kernel.platform import current_platform

@@ -25,13 +25,13 @@ from __future__ import annotations
 import math
 
 import torch
-from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
+from tokenspeed_kernel.ops.model.deepseek_v4.cuda import (
     fused_qnorm_rope_kv_insert as _cuda_fused_qnorm_rope_kv_insert,
 )
-from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
+from tokenspeed_kernel.ops.model.deepseek_v4.cuda import (
     has_fused_qnorm_rope_kv_insert as _cuda_has_fused_qnorm_rope_kv_insert,
 )
-from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
+from tokenspeed_kernel.ops.model.deepseek_v4.triton import (
     deepseek_v4_build_dense_prefill_local_compressed_indices,
     deepseek_v4_combine_dense_swa_indices,
     deepseek_v4_combine_topk_swa_indices,
@@ -40,22 +40,22 @@ from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_decode_swa_indices_and_lens,
     deepseek_v4_dequantize_and_gather_k_cache,
 )
-from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
+from tokenspeed_kernel.ops.model.deepseek_v4.triton import (
     deepseek_v4_fused_csa_indexer_mxfp4_cache_insert as _triton_fused_csa_indexer_mxfp4_cache_insert,
 )
-from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
+from tokenspeed_kernel.ops.model.deepseek_v4.triton import (
     deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4 as _triton_fused_indexer_q_rope_hadamard_mxfp4,
 )
-from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
+from tokenspeed_kernel.ops.model.deepseek_v4.triton import (
     deepseek_v4_fused_inv_rope_fp8_quant,
 )
-from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
+from tokenspeed_kernel.ops.model.deepseek_v4.triton import (
     deepseek_v4_fused_sparse_compress_cache_insert as _triton_fused_sparse_compress_cache_insert,
 )
-from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
+from tokenspeed_kernel.ops.model.deepseek_v4.triton import (
     deepseek_v4_save_compressor_state as _triton_save_compressor_state,
 )
-from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
+from tokenspeed_kernel.ops.model.deepseek_v4.triton import (
     write_deepseek_v4_indexer_mxfp4_cache_cuda as _triton_write_indexer_mxfp4_cache_cuda,
 )
 from tokenspeed_kernel.ops.transform import hadamard_transform

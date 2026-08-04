@@ -21,9 +21,9 @@
 """
 tokenspeed_kernel build script.
 
-Compiles .cu files into shared libraries (.so) loaded via tvm_ffi.load_module().
-On systems without an NVIDIA CUDA build target, the build is skipped and the
-package installs as a pure-Python stub.
+Compiles CUDA sources into TVM-FFI shared libraries and PyTorch pybind
+extensions. On systems without an NVIDIA CUDA build target, the build is
+skipped and the package installs as a pure-Python stub.
 """
 
 import ctypes
@@ -33,11 +33,12 @@ import shutil
 import site
 import subprocess
 import sys
+import sysconfig
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
-from setuptools import Command, find_packages, setup
+from setuptools import Command, Distribution, find_packages, setup
 from setuptools.command.build_ext import build_ext
 from setuptools.command.build_py import build_py
 from setuptools.command.develop import develop
@@ -45,18 +46,13 @@ from setuptools.command.editable_wheel import editable_wheel
 
 ROOT = Path(__file__).resolve().parent
 REQUIREMENTS_DIR = ROOT / "requirements"
-THIRDPARTY_DIR = ROOT / "tokenspeed_kernel" / "thirdparty"
 BASE_VERSION = "0.1.3"
 BACKEND_ENV = "TOKENSPEED_KERNEL_BACKEND"
 VALID_BACKENDS = {"cuda", "rocm"}
 DEFAULT_CUDA_ARCHS = ("100a", "103a")
 
-# CUDA kernels source and output directories
-CUDA_CSRC_DIR = THIRDPARTY_DIR / "cuda" / "csrc"
-CUDA_OBJS_DIR = THIRDPARTY_DIR / "cuda" / "objs"
-
-# JIT kernels source directory (no pre-compilation, just need sources available)
-JIT_CSRC_DIR = THIRDPARTY_DIR / "jit_kernel" / "csrc"
+# CUDA kernel sources live outside the Python package and are included in sdists.
+CUDA_CSRC_DIR = ROOT / "csrc" / "cuda"
 
 CUDA_HOME = os.environ.get("CUDA_HOME", "/usr/local/cuda")
 NVCC = os.environ.get("FLASHINFER_NVCC", f"{CUDA_HOME}/bin/nvcc")
@@ -293,11 +289,8 @@ def _ensure_cuda_compiler() -> None:
         raise RuntimeError(f"CUDA backend selected but nvcc was not found: {NVCC}")
 
 
-# Kernel groups: each entry produces one .so file.
-# Format: (name, [source_files], extra_ldflags) or
-#         (name, [source_files], extra_ldflags, extra_cflags)
-# The 4-tuple form lets a kernel append nvcc flags on top of the global set —
-# e.g., fused_topk_topp needs ``--expt-extended-lambda`` for CUB lambdas.
+# Kernel groups: (name, sources, output package, extra ldflags, extra cflags).
+# Each group produces <output package>/objs/<name>/<name>.so.
 KERNEL_GROUPS = [
     (
         "rope",
@@ -305,6 +298,8 @@ KERNEL_GROUPS = [
             CUDA_CSRC_DIR / "rope.cu",
             CUDA_CSRC_DIR / "flashinfer_rope_binding.cu",
         ],
+        "tokenspeed_kernel.ops.embedding.cuda",
+        [],
         [],
     ),
     (
@@ -314,6 +309,8 @@ KERNEL_GROUPS = [
             CUDA_CSRC_DIR / "deepseek_v4_topk.cu",
             CUDA_CSRC_DIR / "deepseek_v4_attention_binding.cu",
         ],
+        "tokenspeed_kernel.ops.model.deepseek_v4.cuda",
+        [],
         [],
     ),
     (
@@ -321,6 +318,8 @@ KERNEL_GROUPS = [
         [
             CUDA_CSRC_DIR / "fused_minimax_m3_qknorm_rope_kv_insert.cu",
         ],
+        "tokenspeed_kernel.ops.model.minimax_m3.cuda",
+        [],
         [],
     ),
     (
@@ -330,7 +329,9 @@ KERNEL_GROUPS = [
             CUDA_CSRC_DIR / "dsv3_router_gemm.cu",
             CUDA_CSRC_DIR / "dsv3_router_gemm_binding.cu",
         ],
+        "tokenspeed_kernel.ops.gemm.fp16.cuda",
         ["-lcublas", "-lcublasLt"],
+        [],
     ),
     (
         "marlin",
@@ -338,6 +339,8 @@ KERNEL_GROUPS = [
             CUDA_CSRC_DIR / "gptq_marlin_repack.cu",
             CUDA_CSRC_DIR / "flashinfer_marlin_binding.cu",
         ],
+        "tokenspeed_kernel.ops.quantization.cuda",
+        [],
         [],
     ),
     (
@@ -345,6 +348,8 @@ KERNEL_GROUPS = [
         [
             CUDA_CSRC_DIR / "routing_flash.cu",
         ],
+        "tokenspeed_kernel.ops.moe.routing.cuda",
+        [],
         [],
     ),
     (
@@ -353,6 +358,8 @@ KERNEL_GROUPS = [
             CUDA_CSRC_DIR / "sampling_chain.cu",
             CUDA_CSRC_DIR / "flashinfer_sampling_chain_binding.cu",
         ],
+        "tokenspeed_kernel.ops.sampling.cuda",
+        [],
         [],
     ),
     (
@@ -361,6 +368,7 @@ KERNEL_GROUPS = [
             CUDA_CSRC_DIR / "fused_topk_topp" / "fused_topk_topp.cu",
             CUDA_CSRC_DIR / "fused_topk_topp" / "fused_topk_topp_binding.cu",
         ],
+        "tokenspeed_kernel.ops.sampling.cuda",
         [],
         # --expt-extended-lambda is required by air_topk_stable.cuh's CUB usage.
         ["--expt-extended-lambda"],
@@ -371,6 +379,8 @@ KERNEL_GROUPS = [
             CUDA_CSRC_DIR / "rmsnorm_fused_parallel.cu",
             CUDA_CSRC_DIR / "flashinfer_rmsnorm_fused_parallel_binding.cu",
         ],
+        "tokenspeed_kernel.ops.layernorm.cuda",
+        [],
         [],
     ),
     (
@@ -378,6 +388,8 @@ KERNEL_GROUPS = [
         [
             CUDA_CSRC_DIR / "merge_state.cu",
         ],
+        "tokenspeed_kernel.ops.attention.merge_state.cuda",
+        [],
         [],
     ),
     (
@@ -385,6 +397,8 @@ KERNEL_GROUPS = [
         [
             CUDA_CSRC_DIR / "flashinfer_softmax.cu",
         ],
+        "tokenspeed_kernel.ops.sampling.flashinfer",
+        [],
         [],
     ),
     (
@@ -393,6 +407,8 @@ KERNEL_GROUPS = [
             CUDA_CSRC_DIR / "silu_and_mul_fuse_block_quant.cu",
             CUDA_CSRC_DIR / "silu_and_mul_fuse_block_quant_ep.cu",
         ],
+        "tokenspeed_kernel.ops.activation.cuda",
+        [],
         [],
     ),
     (
@@ -400,6 +416,8 @@ KERNEL_GROUPS = [
         [
             CUDA_CSRC_DIR / "silu_and_mul_fuse_nvfp4_quant.cu",
         ],
+        "tokenspeed_kernel.ops.activation.cuda",
+        [],
         [],
     ),
     (
@@ -407,6 +425,8 @@ KERNEL_GROUPS = [
         [
             CUDA_CSRC_DIR / "moe_finalize_fuse_shared.cu",
         ],
+        "tokenspeed_kernel.ops.moe.finalize.cuda",
+        [],
         [],
     ),
     (
@@ -415,6 +435,8 @@ KERNEL_GROUPS = [
             CUDA_CSRC_DIR / "kvcacheio_transfer.cu",
             CUDA_CSRC_DIR / "flashinfer_kvcacheio_binding.cu",
         ],
+        "tokenspeed_kernel.ops.kvcache.cuda",
+        [],
         [],
     ),
     (
@@ -423,6 +445,8 @@ KERNEL_GROUPS = [
             CUDA_CSRC_DIR / "lm_head_gemm.cu",
             CUDA_CSRC_DIR / "lm_head_gemm_binding.cu",
         ],
+        "tokenspeed_kernel.ops.gemm.fp16.cuda",
+        [],
         [],
     ),
     (
@@ -435,6 +459,8 @@ KERNEL_GROUPS = [
             CUDA_CSRC_DIR / "trtllm_allgather_fusion.cu",
             CUDA_CSRC_DIR / "minimax_reduce_rms.cu",
         ],
+        "tokenspeed_kernel.ops.communication.trtllm",
+        [],
         [],
     ),
     (
@@ -443,14 +469,89 @@ KERNEL_GROUPS = [
             CUDA_CSRC_DIR / "attn_res" / "attn_res_fwd_tma.cu",
             CUDA_CSRC_DIR / "attn_res_binding.cu",
         ],
+        "tokenspeed_kernel.ops.model.kimi_k3.attn_res.cuda",
+        [],
         [],
     ),
 ]
 
+# PyTorch pybind extensions are built separately from the TVM-FFI groups.
+PYTORCH_CUDA_EXTENSION_GROUPS = [
+    (
+        "sparse_build_k2q_csr_ext",
+        CUDA_CSRC_DIR / "msa" / "build_k2q_csr.cu",
+        "tokenspeed_kernel.ops.attention.msa.cuda",
+    ),
+    (
+        "sparse_decode_schedule_ext",
+        CUDA_CSRC_DIR / "msa" / "build_decode_schedule.cu",
+        "tokenspeed_kernel.ops.attention.msa.cuda",
+    ),
+]
+
+
+def _package_dir(package: str) -> Path:
+    return ROOT.joinpath(*package.split("."))
+
+
+def _kernel_output_path(name: str, output_package: str) -> Path:
+    return _package_dir(output_package) / "objs" / name / f"{name}.so"
+
+
+def _python_extension_output_path(name: str, output_package: str) -> Path:
+    suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
+    return _package_dir(output_package) / "objs" / name / f"{name}{suffix}"
+
+
+def _validate_kernel_groups(kernel_groups) -> None:
+    missing_sources = [
+        source
+        for _name, sources, _package, _ldflags, _cflags in kernel_groups
+        for source in sources
+        if not source.is_file()
+    ]
+    if missing_sources:
+        missing = "\n".join(f"  - {path}" for path in missing_sources)
+        raise FileNotFoundError(f"CUDA kernel sources are missing:\n{missing}")
+
+    missing_packages = sorted(
+        {
+            package
+            for _name, _sources, package, _ldflags, _cflags in kernel_groups
+            if not _package_dir(package).is_dir()
+        }
+    )
+    if missing_packages:
+        missing = "\n".join(f"  - {package}" for package in missing_packages)
+        raise FileNotFoundError(f"CUDA output packages are missing:\n{missing}")
+
+
+def _validate_pytorch_extension_groups(extension_groups) -> None:
+    missing_sources = [
+        source for _name, source, _package in extension_groups if not source.is_file()
+    ]
+    if missing_sources:
+        missing = "\n".join(f"  - {path}" for path in missing_sources)
+        raise FileNotFoundError(
+            f"PyTorch CUDA extension sources are missing:\n{missing}"
+        )
+
+    missing_packages = sorted(
+        {
+            package
+            for _name, _source, package in extension_groups
+            if not _package_dir(package).is_dir()
+        }
+    )
+    if missing_packages:
+        missing = "\n".join(f"  - {package}" for package in missing_packages)
+        raise FileNotFoundError(f"PyTorch CUDA output packages are missing:\n{missing}")
+
 
 class CudaKernelBuilder:
-    def __init__(self, kernel_groups, verbose: bool):
+    def __init__(self, kernel_groups, verbose: bool, pytorch_extension_groups=()):
         self.kernel_groups = kernel_groups
+        self.pytorch_extension_groups = pytorch_extension_groups
         self.verbose = verbose
 
     # Target GPU architectures: detect from the CUDA driver or use env var override.
@@ -740,7 +841,71 @@ class CudaKernelBuilder:
         subprocess.check_call(cmd)
         return obj
 
+    def _build_pytorch_extensions(self, nvcc_flags, include_dirs, ldflags):
+        _validate_pytorch_extension_groups(self.pytorch_extension_groups)
+        if not self.pytorch_extension_groups:
+            return
+
+        # Build requirements are installed by BuildNative before this method
+        # runs, so resolve PyTorch dynamically rather than at setup import time.
+        torch = importlib.import_module("torch")
+        cpp_extension = importlib.import_module("torch.utils.cpp_extension")
+        extension_include_dirs = list(include_dirs)
+        for include_dir in [
+            *cpp_extension.include_paths(device_type="cuda"),
+            sysconfig.get_paths()["include"],
+        ]:
+            if include_dir not in extension_include_dirs:
+                extension_include_dirs.append(include_dir)
+
+        torch_library_dirs = cpp_extension.library_paths(device_type="cuda")
+        torch_ldflags = [f"-L{path}" for path in torch_library_dirs] + [
+            "-Wl,--no-as-needed",
+            "-lc10",
+            "-ltorch",
+            "-ltorch_cpu",
+            "-ltorch_python",
+            "-lc10_cuda",
+            "-ltorch_cuda",
+        ]
+        abi = int(torch._C._GLIBCXX_USE_CXX11_ABI)
+
+        stale_groups = []
+        for name, source, output_package in self.pytorch_extension_groups:
+            output = _python_extension_output_path(name, output_package)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            if output.exists() and all(
+                output.stat().st_mtime > dependency.stat().st_mtime
+                for dependency in (source, Path(__file__))
+            ):
+                continue
+            stale_groups.append((name, source, output))
+
+        print(
+            f"Building {len(stale_groups)}/{len(self.pytorch_extension_groups)} "
+            "PyTorch CUDA extension(s)..."
+        )
+        for name, source, output in stale_groups:
+            obj = output.parent / f"{source.stem}.o"
+            extension_flags = [
+                "-lineinfo",
+                "-DTORCH_API_INCLUDE_EXTENSION_H",
+                f"-DTORCH_EXTENSION_NAME={name}",
+                f"-D_GLIBCXX_USE_CXX11_ABI={abi}",
+            ]
+            self._compile_one(
+                source,
+                obj,
+                nvcc_flags,
+                extension_include_dirs,
+                extension_flags,
+            )
+            subprocess.check_call(
+                [CXX, str(obj)] + ldflags + torch_ldflags + ["-o", str(output)]
+            )
+
     def run(self):
+        _validate_kernel_groups(self.kernel_groups)
         self._prepare_cuda_toolchain_env()
         max_jobs = int(os.environ.get("MAX_JOBS", min(os.cpu_count() or 1, 16)))
         total_sources = sum(len(entry[1]) for entry in self.kernel_groups)
@@ -763,20 +928,30 @@ class CudaKernelBuilder:
         ] + gencode_flags
         include_dirs = self._resolve_include_dirs()
         ldflags = ["-shared"] + self._resolve_cuda_lib_flags()
+        self._build_pytorch_extensions(nvcc_flags, include_dirs, ldflags)
 
-        # Ensure output directory exists
-        CUDA_OBJS_DIR.mkdir(parents=True, exist_ok=True)
+        build_dependencies = [
+            path
+            for path in CUDA_CSRC_DIR.rglob("*")
+            if path.is_file() and "msa" not in path.relative_to(CUDA_CSRC_DIR).parts
+        ]
+        build_dependencies.append(Path(__file__))
 
         stale_groups = []
         skipped_groups = 0
-        for entry in self.kernel_groups:
-            name, sources, extra_ldflags = entry[0], entry[1], entry[2]
-            extra_cflags = entry[3] if len(entry) > 3 else []
-            out_dir = CUDA_OBJS_DIR / name
+        for (
+            name,
+            sources,
+            output_package,
+            extra_ldflags,
+            extra_cflags,
+        ) in self.kernel_groups:
+            so_path = _kernel_output_path(name, output_package)
+            out_dir = so_path.parent
             out_dir.mkdir(parents=True, exist_ok=True)
-            so_path = out_dir / f"{name}.so"
             if so_path.exists() and all(
-                so_path.stat().st_mtime > src.stat().st_mtime for src in sources
+                so_path.stat().st_mtime > dependency.stat().st_mtime
+                for dependency in build_dependencies
             ):
                 skipped_groups += 1
                 continue
@@ -844,7 +1019,11 @@ class BuildKernels(build_ext):
 
         _ensure_cuda_compiler()
         verbose = bool(getattr(self, "verbose", False))
-        CudaKernelBuilder(KERNEL_GROUPS, verbose=verbose).run()
+        CudaKernelBuilder(
+            KERNEL_GROUPS,
+            verbose=verbose,
+            pytorch_extension_groups=PYTORCH_CUDA_EXTENSION_GROUPS,
+        ).run()
 
 
 class BuildNative(Command):
@@ -884,11 +1063,42 @@ class DevelopWithBuild(develop):
 
 
 class BuildPyWithBuild(build_py):
-    """Ensure kernels and vendored deps are built for regular installs."""
+    """Ensure kernels are built for regular installs."""
 
     def run(self):
         self.run_command("build_native")
+        package_build_dir = Path(self.build_lib) / "tokenspeed_kernel"
+        if package_build_dir.exists():
+            shutil.rmtree(package_build_dir)
         super().run()
+
+
+class BinaryDistribution(Distribution):
+    """Mark CUDA wheels as platform-specific distributions."""
+
+    def has_ext_modules(self):
+        return _selected_backend() == "cuda"
+
+
+CUDA_OUTPUT_PACKAGES = sorted(
+    {entry[2] for entry in KERNEL_GROUPS}
+    | {entry[2] for entry in PYTORCH_CUDA_EXTENSION_GROUPS}
+)
+PACKAGE_DATA = {
+    # Pre-swept flashinfer MoE tactic tables.
+    "tokenspeed_kernel.ops.model.kimi_k3": ["tactics/*.json"],
+    # MSA runtime documentation and optional CuTeDSL requirements.
+    "tokenspeed_kernel.ops.attention.msa": ["README.md"],
+    "tokenspeed_kernel.ops.attention.msa.cute_dsl": [
+        "README.md",
+        "requirements.txt",
+    ],
+    **(
+        {package: ["objs/**/*.so"] for package in CUDA_OUTPUT_PACKAGES}
+        if _selected_backend() == "cuda"
+        else {}
+    ),
+}
 
 
 setup(
@@ -896,26 +1106,8 @@ setup(
     version=_package_version(),
     install_requires=_selected_install_requires(),
     packages=find_packages(),
-    package_data={
-        # Pre-swept flashinfer MoE tactic tables (see ops/tuning.py).
-        "tokenspeed_kernel.ops.moe.flashinfer": ["tactics/*.json"],
-        "tokenspeed_kernel.thirdparty.cuda": ["objs/**/*.so"],
-        # Vendored MiniMax MSA CuTe sources: cute/ has no __init__.py (it is
-        # loaded via the upstream sys.path bootstrap), so ship it as data.
-        "tokenspeed_kernel.thirdparty.msa": [
-            "README.md",
-            "cute/**/*.py",
-            "cute/**/*.cu",
-            "cute/README.md",
-            "cute/requirements.txt",
-            # nvcc-JIT FMHA sources: compiled at runtime by jit.py, so the
-            # kernel sources and headers must ship with the wheel.
-            "csrc/*.cu",
-            "csrc/*.h",
-            "csrc/*.jinja",
-            "csrc/include/*",
-        ],
-    },
+    package_data=PACKAGE_DATA,
+    distclass=BinaryDistribution,
     cmdclass={
         "build_native": BuildNative,
         "build_ext": BuildKernels,

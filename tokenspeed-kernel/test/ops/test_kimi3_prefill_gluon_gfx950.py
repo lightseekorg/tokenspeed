@@ -18,9 +18,9 @@ if not _is_gfx950():
     pytest.skip("gfx950 is required", allow_module_level=True)
 
 
-from tokenspeed_kernel.ops.attn_res import attn_res_fwd  # noqa: E402
+from tokenspeed_kernel.ops.model.kimi_k3.attn_res import attn_res_fwd  # noqa: E402
 from tokenspeed_kernel.ops.moe import moe_sigmoid_bias_topk  # noqa: E402
-from tokenspeed_kernel.ops.moe.sigmoid_topk import _gluon_eligible  # noqa: E402
+from tokenspeed_kernel.ops.moe.sigmoid_topk.triton import _gluon_eligible  # noqa: E402
 
 
 def _attn_res_reference(

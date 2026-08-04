@@ -32,7 +32,7 @@ from importlib.util import find_spec
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention.flash_kda import (
+from tokenspeed_kernel.ops.attention.kda.flash_kda import (
     flash_kda_chunk_prefill,
     is_flash_kda_installed,
 )
@@ -75,7 +75,9 @@ def _assert_matches_portable(
     out_max_error: float = OUTPUT_MAX_ERROR,
     state_max_error: float = STATE_MAX_ERROR,
 ):
-    from tokenspeed_kernel.ops.attention.triton.linear.kda import kda_chunk_prefill
+    from tokenspeed_kernel.ops.attention.kda.triton.fla import (
+        kda_chunk_prefill,
+    )
 
     kwargs = dict(cu_seqlens=cu_seqlens, lower_bound=LOWER_BOUND, beta_is_logit=True)
     expected_out, expected_state = kda_chunk_prefill(

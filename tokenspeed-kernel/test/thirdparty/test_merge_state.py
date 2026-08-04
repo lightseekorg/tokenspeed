@@ -25,12 +25,12 @@ from typing import Tuple
 
 import pytest
 import torch
-from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.thirdparty.cuda.merge_state import (
+from tokenspeed_kernel.ops.attention.merge_state.cuda.native import (
     LSE_LN,
     LSE_LOG2,
     merge_state,
 )
+from tokenspeed_kernel.platform import current_platform
 
 pytestmark = pytest.mark.skipif(
     not current_platform().is_nvidia,

@@ -27,7 +27,7 @@ import logging
 
 import tokenspeed_kernel
 import torch
-from tokenspeed_kernel.ops.gemm.fp8_utils import (
+from tokenspeed_kernel.ops.other.fp8_quantization.triton import (
     per_token_group_quant_fp8,
     per_token_quant_fp8,
     static_quant_fp8,
@@ -38,8 +38,8 @@ from torch.nn.parameter import Parameter
 logger = logging.getLogger(__name__)
 
 try:
-    from tokenspeed_kernel.thirdparty.deep_gemm import ceil_to_ue8m0 as _ceil_to_ue8m0
-    from tokenspeed_kernel.thirdparty.deep_gemm import (
+    from tokenspeed_kernel.ops.gemm.fp8.deep_gemm import ceil_to_ue8m0 as _ceil_to_ue8m0
+    from tokenspeed_kernel.ops.gemm.fp8.deep_gemm import (
         transform_sf_into_required_layout as _transform_sf,
     )
 except ImportError:
@@ -47,7 +47,7 @@ except ImportError:
     _transform_sf = None
 
 try:
-    from tokenspeed_kernel.ops.gemm.flashinfer import (
+    from tokenspeed_kernel.ops.gemm.fp8.flashinfer import (
         has_flashinfer_fp8_blockscale,
         has_flashinfer_mxfp8,
         prepare_flashinfer_fp8_blockscale_weight_scales,

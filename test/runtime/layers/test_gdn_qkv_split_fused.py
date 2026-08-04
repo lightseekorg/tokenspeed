@@ -21,10 +21,10 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention.triton.gdn_qkv_split import (
+from tokenspeed_kernel.ops.attention.gdn.triton.l2norm import l2norm_fwd
+from tokenspeed_kernel.ops.attention.gdn.triton.qkv_split import (
     fused_qkv_split_gdn_prefill,
 )
-from tokenspeed_kernel.ops.attention.triton.linear.l2norm import l2norm_fwd
 
 # Qwen3.5 production shapes
 CONFIGS = [

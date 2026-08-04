@@ -48,7 +48,7 @@ SCALE = 1.0 / HEAD_DIM
 
 def _skip_unless_supported() -> None:
     pytest.importorskip(
-        "tokenspeed_kernel.ops.attention.cute_dsl.rel_mha.fmha_bias_helper"
+        "tokenspeed_kernel.ops.attention.rmha.cute_dsl.fmha_bias_helper"
     )
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
@@ -98,7 +98,7 @@ def _build_paged(kv_lens, page, device):
 
 
 def _run_v2(q, k_cache, v_cache, table, kv_lens, rel, window_left):
-    from tokenspeed_kernel.ops.attention.cute_dsl.rel_mha.rel_decode_v2 import (
+    from tokenspeed_kernel.ops.attention.rmha.cute_dsl.rel_decode_v2 import (
         rel_mha_decode_tsmha_v2,
     )
 
@@ -149,7 +149,7 @@ def test_v2_native_paging_vs_v1_route(page, rel_extent, window_left) -> None:
     """Serving-geometry cross-check: v1 and v2 guard each other. Chunk-aligned
     lengths only — v1's tile-granular window over-attends on unaligned SWA."""
     _skip_unless_supported()
-    from tokenspeed_kernel.ops.attention.cute_dsl.rel_mha.rel_decode import (
+    from tokenspeed_kernel.ops.attention.rmha.cute_dsl.rel_decode import (
         rel_mha_decode_tsmha,
     )
 

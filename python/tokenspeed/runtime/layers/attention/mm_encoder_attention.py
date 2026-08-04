@@ -59,13 +59,13 @@ _is_nvidia = _platform.is_nvidia
 _is_amd = _platform.is_amd
 
 if _is_nvidia:
-    from tokenspeed_kernel.ops.attention.flash_attn import flash_attn_varlen_func
-    from tokenspeed_kernel.ops.attention.flashinfer import (
+    from tokenspeed_kernel.ops.attention.mha.flash_attn import flash_attn_varlen_func
+    from tokenspeed_kernel.ops.attention.mha.flashinfer import (
         cudnn_batch_prefill_with_kv_cache,
     )
 
-from tokenspeed_kernel.ops.attention.triton.context import context_attention_fwd
-from tokenspeed_kernel.ops.attention.triton.qkv_rotary import (
+from tokenspeed_kernel.ops.attention.mha.triton.context import context_attention_fwd
+from tokenspeed_kernel.ops.attention.mha.triton.qkv_rotary import (
     packed_qkv_complex_rotary,
     packed_qkv_neox_rotary,
 )

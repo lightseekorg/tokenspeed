@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.ops.activation.triton import fused_gate_sigmoid_mul_add
-from tokenspeed_kernel.ops.gemm.cute_dsl import (
+from tokenspeed_kernel.ops.gemm.nvfp4.cute_dsl import (
     nvfp4_gemm_swiglu_nvfp4_quant,
 )
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize

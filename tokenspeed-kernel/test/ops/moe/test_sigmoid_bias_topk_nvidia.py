@@ -23,7 +23,7 @@ reference (same expert set, same weights) and win selection on NVIDIA."""
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.moe.sigmoid_topk import (
+from tokenspeed_kernel.ops.moe.sigmoid_topk.triton import (
     moe_sigmoid_bias_topk,
     torch_sigmoid_bias_topk,
     triton_minimax_sigmoid_bias_topk,

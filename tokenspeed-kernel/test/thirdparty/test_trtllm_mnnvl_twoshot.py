@@ -56,7 +56,7 @@ def _supported_world_sizes() -> tuple[int, ...]:
     adding a world size to the kernel must not leave these tests silently
     skipped (which reads as success -- pytest exits 0 either way)."""
     try:
-        from tokenspeed_kernel.thirdparty.cuda.trtllm import (
+        from tokenspeed_kernel.ops.communication.trtllm.native import (
             _MNNVL_SUPPORTED_WORLD_SIZES,
         )
 
@@ -87,7 +87,7 @@ _ctx: dict = {}
 
 def _get_ctx():
     """Create (once) the IPC lamport and MNNVL workspaces sized for MAXTOK."""
-    from tokenspeed_kernel.thirdparty.cuda.trtllm import (
+    from tokenspeed_kernel.ops.communication.trtllm.native import (
         trtllm_create_ipc_workspace_for_all_reduce_fusion,
         trtllm_create_mnnvl_workspace_for_all_reduce_fusion,
     )
@@ -122,7 +122,9 @@ def _skip_unless_mnnvl():
 
 
 def _ar(ws, x, token_num, *, use_oneshot, pattern_kwargs, pattern_code):
-    from tokenspeed_kernel.thirdparty.cuda.trtllm import trtllm_allreduce_fusion
+    from tokenspeed_kernel.ops.communication.trtllm.native import (
+        trtllm_allreduce_fusion,
+    )
 
     c = _ctx
     trtllm_allreduce_fusion(
@@ -160,7 +162,7 @@ def _ref_allreduce(x):
 @pytest.mark.parametrize("token_num", [129, 256, 1024, 2048])
 def test_twoshot_plain_allreduce_matches_nccl(token_num):
     """Above the one-shot cap the kernel must still equal a NCCL all-reduce."""
-    from tokenspeed_kernel.thirdparty.cuda.trtllm import AllReduceFusionPattern
+    from tokenspeed_kernel.ops.communication.trtllm.native import AllReduceFusionPattern
 
     ctx = _skip_unless_mnnvl()
     x = _inputs(token_num, ctx["dev"], ctx["rank"])
@@ -179,7 +181,7 @@ def test_twoshot_plain_allreduce_matches_nccl(token_num):
 
 def test_dispatch_boundary_oneshot_vs_twoshot():
     """128 (one-shot) and 129 (two-shot) must agree with the same reference."""
-    from tokenspeed_kernel.thirdparty.cuda.trtllm import AllReduceFusionPattern
+    from tokenspeed_kernel.ops.communication.trtllm.native import AllReduceFusionPattern
 
     ctx = _skip_unless_mnnvl()
     for token_num in (128, 129):
@@ -202,7 +204,7 @@ def test_dispatch_boundary_oneshot_vs_twoshot():
 # --------------------------------------------------------------------------
 @pytest.mark.parametrize("token_num", [129, 512, 2048])
 def test_twoshot_residual_rmsnorm_matches_reference(token_num):
-    from tokenspeed_kernel.thirdparty.cuda.trtllm import AllReduceFusionPattern
+    from tokenspeed_kernel.ops.communication.trtllm.native import AllReduceFusionPattern
 
     ctx = _skip_unless_mnnvl()
     dev, rank = ctx["dev"], ctx["rank"]
@@ -248,7 +250,7 @@ def test_twoshot_residual_rmsnorm_matches_reference(token_num):
 def test_twoshot_epilogue_bitwise_identical_across_ranks():
     """Every rank re-runs the epilogue locally; outputs must match bit-for-bit,
     otherwise ranks silently diverge after a few layers."""
-    from tokenspeed_kernel.thirdparty.cuda.trtllm import AllReduceFusionPattern
+    from tokenspeed_kernel.ops.communication.trtllm.native import AllReduceFusionPattern
 
     ctx = _skip_unless_mnnvl()
     dev, world = ctx["dev"], ctx["world"]
@@ -288,7 +290,7 @@ def test_twoshot_epilogue_bitwise_identical_across_ranks():
 def test_twoshot_repeated_launches_rotate_cleanly():
     """The Lamport 3-slot rotation must survive back-to-back launches; a stale
     sentinel would hang or corrupt the 4th call."""
-    from tokenspeed_kernel.thirdparty.cuda.trtllm import AllReduceFusionPattern
+    from tokenspeed_kernel.ops.communication.trtllm.native import AllReduceFusionPattern
 
     ctx = _skip_unless_mnnvl()
     token_num = 300
@@ -312,7 +314,7 @@ def test_twoshot_repeated_launches_rotate_cleanly():
 def test_twoshot_cuda_graph_capture_replay():
     """Prefill graphs replay the kernel; rotation state lives in device memory
     and must self-advance across replays."""
-    from tokenspeed_kernel.thirdparty.cuda.trtllm import AllReduceFusionPattern
+    from tokenspeed_kernel.ops.communication.trtllm.native import AllReduceFusionPattern
 
     ctx = _skip_unless_mnnvl()
     token_num = 256

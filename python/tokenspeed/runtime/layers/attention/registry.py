@@ -434,8 +434,8 @@ def _resolve_kda_backend(kda_backend: str) -> str:
     install hint instead of silently mis-routing. Decode is unaffected either
     way.
     """
-    from tokenspeed_kernel.ops.attention.cutedsl_kda import is_cutedsl_kda_installed
-    from tokenspeed_kernel.ops.attention.flash_kda import is_flash_kda_installed
+    from tokenspeed_kernel.ops.attention.kda.cute_dsl import is_cutedsl_kda_installed
+    from tokenspeed_kernel.ops.attention.kda.flash_kda import is_flash_kda_installed
 
     if kda_backend == "auto":
         if is_cutedsl_kda_installed():

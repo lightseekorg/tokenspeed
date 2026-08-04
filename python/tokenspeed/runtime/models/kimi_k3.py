@@ -63,15 +63,20 @@ from typing import TYPE_CHECKING
 import torch
 from tokenspeed_kernel.ops.activation.triton import (
     add3,
-    attnres_combine,
-    attnres_partial,
-    attnres_partial_dual,
     rmsnorm_gated_sigmoid,
     sigmoid_mul,
 )
-from tokenspeed_kernel.ops.attn_res import attn_res_fwd
 from tokenspeed_kernel.ops.communication import allreduce_fusion_lane
-from tokenspeed_kernel.ops.gemm import (
+from tokenspeed_kernel.ops.model.kimi_k3.attn_res import attn_res_fwd
+from tokenspeed_kernel.ops.model.kimi_k3.attn_res.triton import (
+    attnres_combine,
+    attnres_partial,
+    attnres_partial_dual,
+)
+from tokenspeed_kernel.ops.model.kimi_k3.gemv import (
+    decode_gemv,
+)
+from tokenspeed_kernel.ops.model.kimi_k3.projections import (
     kimi3_latent_projection_add3,
     kimi3_mla_qkv_gate_projection,
     kimi3_qkvfab_projection,
@@ -79,13 +84,12 @@ from tokenspeed_kernel.ops.gemm import (
     kimi3_shared_down_projection,
     kimi3_shared_situ_projection,
 )
-from tokenspeed_kernel.ops.gemm.triton_gemv import (
-    decode_gemv,
-)
-from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
+from tokenspeed_kernel.ops.moe.mxfp4.flashinfer_trtllm import (
     situ_moe_unavailable_reason,
 )
-from tokenspeed_kernel.ops.tuning import load_packaged_flashinfer_tuning_cache
+from tokenspeed_kernel.ops.other.tuning.flashinfer import (
+    load_packaged_flashinfer_tuning_cache,
+)
 from torch import nn
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiK3Config, KimiLinearConfig

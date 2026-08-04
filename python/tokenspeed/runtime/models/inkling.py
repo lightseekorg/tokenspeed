@@ -87,9 +87,9 @@ from tokenspeed_kernel.ops.conv import (
     sconv_prefill,
     sconv_prefill_paged,
 )
-from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
+from tokenspeed_kernel.ops.gemm.fp16.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
-from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
+from tokenspeed_kernel.ops.moe.finalize.cuda import moe_finalize_fuse_shared
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
@@ -849,7 +849,7 @@ class InklingGate(nn.Module):
     thus compete for probability mass without entering top-k (a "sink").
 
     Selection and weighting run in one fused Triton kernel
-    (``tokenspeed_kernel.ops.moe.triton.inkling_topk``, reached through
+    (tokenspeed_kernel.ops.model.inkling.triton, reached through
     ``TopK`` / ``select_experts``), which implements the reference's
     deterministic lowest-index tie-breaking and computes the sink
     normalization in linear space (identical to the reference's

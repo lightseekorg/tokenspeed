@@ -50,7 +50,7 @@ from tokenspeed_kernel import (  # noqa: E402
     rel_mha_decode_with_kvcache,
     rel_mha_prefill,
 )
-from tokenspeed_kernel.ops.attention import flash_attn as fa_mod  # noqa: E402
+from tokenspeed_kernel.ops.attention.rmha import flash_attn as fa_mod  # noqa: E402
 
 torch.manual_seed(11)
 

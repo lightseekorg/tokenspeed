@@ -24,7 +24,7 @@ import math
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention.flash_mla import (
+from tokenspeed_kernel.ops.attention.mla.flash_mla import (
     flash_mla_with_kvcache,
     get_mla_metadata,
 )

@@ -22,8 +22,8 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.moe.finalize.cuda import moe_finalize_fuse_shared
 from tokenspeed_kernel.platform import ArchVersion, current_platform
-from tokenspeed_kernel.thirdparty.cuda import moe_finalize_fuse_shared
 
 pytestmark = pytest.mark.skipif(
     not current_platform().is_nvidia

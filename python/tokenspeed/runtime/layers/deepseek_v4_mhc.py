@@ -13,7 +13,7 @@ import triton.language as tl
 from tokenspeed.runtime.utils import ceil_div
 
 try:
-    from tokenspeed_kernel.thirdparty import deep_gemm
+    from tokenspeed_kernel.ops.model.deepseek_v4 import deep_gemm
 except Exception:
     deep_gemm = None  # type: ignore[assignment]
 

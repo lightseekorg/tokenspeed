@@ -7,7 +7,7 @@ import os
 import pytest
 import tokenspeed_kernel
 import torch
-from tokenspeed_kernel.ops.gemm.kimi3 import (
+from tokenspeed_kernel.ops.model.kimi_k3.projections import (
     _use_gluon_largem,
     _use_gluon_mediumm,
 )

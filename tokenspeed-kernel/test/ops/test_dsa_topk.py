@@ -41,14 +41,14 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention.cuda import dsa_topk as cuda_dsa_topk
-from tokenspeed_kernel.ops.attention.cute_dsl.dsa_topk import (
+from tokenspeed_kernel.ops.attention.dsa import cuda as cuda_dsa_topk
+from tokenspeed_kernel.ops.attention.dsa import flashinfer as fi_dsa_topk
+from tokenspeed_kernel.ops.attention.dsa.cute_dsl import (
     cute_dsl_decode_topk,
     has_cute_dsl_decode_topk,
 )
-from tokenspeed_kernel.ops.attention.deep_gemm import _prepare_logits_for_topk
-from tokenspeed_kernel.ops.attention.flashinfer import dsa_topk as fi_dsa_topk
-from tokenspeed_kernel.ops.attention.triton.dsa_topk import combine_topk_weights
+from tokenspeed_kernel.ops.attention.dsa.deep_gemm import _prepare_logits_for_topk
+from tokenspeed_kernel.ops.attention.dsa.triton.topk import combine_topk_weights
 
 requires_kernel = pytest.mark.skipif(
     not (torch.cuda.is_available() and has_cute_dsl_decode_topk()),

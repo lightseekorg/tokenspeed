@@ -362,9 +362,7 @@ class GDNStatePagingGPUTest(unittest.TestCase):
     def setUp(self):
         try:
             import torch
-            from tokenspeed_kernel.ops.attention.flashinfer import (
-                gated_delta_rule as gdn,
-            )
+            from tokenspeed_kernel.ops.attention.gdn import flashinfer as gdn
 
             from tokenspeed.runtime.execution.forward_batch_info import (
                 ForwardMode,
@@ -446,7 +444,7 @@ class GDNStatePagingGPUTest(unittest.TestCase):
             self.skipTest("sm100 GDN kernel unavailable")
         torch = self.torch
         ForwardMode = self.ForwardMode
-        from tokenspeed_kernel.ops.attention.triton.linear.chunk import (
+        from tokenspeed_kernel.ops.attention.gdn.triton.chunk import (
             chunk_gated_delta_rule,
         )
 

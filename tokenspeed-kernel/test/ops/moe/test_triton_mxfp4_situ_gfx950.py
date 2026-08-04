@@ -39,7 +39,7 @@ if not _is_gfx950():
     pytest.skip("MXFP4 SiTU Triton tests require gfx950", allow_module_level=True)
 
 import tokenspeed_kernel  # noqa: E402
-from tokenspeed_kernel.ops.moe.triton.mxfp4 import _routing_from_topk  # noqa: E402
+from tokenspeed_kernel.ops.moe.mxfp4.triton import _routing_from_topk  # noqa: E402
 
 
 def _make_mxfp4_module(

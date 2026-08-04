@@ -24,7 +24,7 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=90, suite="runtime-1gpu")
 
-from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
+from tokenspeed_kernel.ops.model.deepseek_v4.cuda import (
     has_indexer_mxfp4_paged_gather,
     has_persistent_topk,
     indexer_mxfp4_paged_gather,

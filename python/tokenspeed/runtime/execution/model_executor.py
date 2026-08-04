@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.tuning import (
+from tokenspeed_kernel.ops.other.tuning.flashinfer import (
     autotune,
     set_autotune_max_num_tokens,
     set_autotune_process_group,

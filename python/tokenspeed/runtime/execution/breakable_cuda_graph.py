@@ -59,7 +59,9 @@ from contextlib import contextmanager
 from typing import Any
 
 import torch
-from tokenspeed_kernel.ops.transform.weak_ref import weak_ref_tensor as _kernel_weak_ref
+from tokenspeed_kernel.ops.other.memory.weak_ref import (
+    weak_ref_tensor as _kernel_weak_ref,
+)
 
 __all__ = [
     "BreakableCapture",
@@ -109,7 +111,7 @@ def weak_ref_tensor(t: Any) -> Any:
     """Reference a break-point tensor without pinning its cudagraph mempool slot.
 
     CUDA tensors are wrapped in a non-owning view (``tokenspeed_kernel``
-    ``ops.transform.weak_ref``, an ``at::from_blob`` alias -- the vLLM/sglang
+    ops.other.memory.weak_ref, an at::from_blob alias -- the vLLM/sglang
     approach), so break closures do not pin pool blocks and graph capture
     memory stays ~peak-live instead of scaling with the bucket sum. Safe
     because replay is stream-ordered: the captured segment rewrites the

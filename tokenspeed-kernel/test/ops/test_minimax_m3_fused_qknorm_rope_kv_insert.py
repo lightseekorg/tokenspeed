@@ -14,10 +14,10 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.thirdparty.cuda.minimax_m3_fused import (
+from tokenspeed_kernel.ops.model.minimax_m3.cuda.native import (
     fused_qknorm_rope_kv_insert,
 )
+from tokenspeed_kernel.platform import current_platform
 
 pytestmark = pytest.mark.skipif(
     not current_platform().is_nvidia,

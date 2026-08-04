@@ -25,8 +25,8 @@ import platform
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention import tokenspeed_mla as kernel_mla
-from tokenspeed_kernel.ops.attention.tokenspeed_mla import (
+from tokenspeed_kernel.ops.attention.mla import tokenspeed_mla as kernel_mla
+from tokenspeed_kernel.ops.attention.mla.tokenspeed_mla import (
     mla_kv_pack_quantize_fp8,
 )
 from tokenspeed_kernel.platform import current_platform

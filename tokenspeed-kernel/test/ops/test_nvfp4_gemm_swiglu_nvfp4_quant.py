@@ -154,12 +154,12 @@ def test_nvfp4_gemm_swiglu_nvfp4_quant_matches_unfused_model_shapes(
     i: int,
 ) -> None:
     import tokenspeed_kernel
-    from tokenspeed_kernel.ops.gemm.cute_dsl import (
+    from tokenspeed_kernel.ops.activation.cuda import silu_and_mul_fuse_nvfp4_quant
+    from tokenspeed_kernel.ops.gemm.nvfp4.cute_dsl import (
         nvfp4_gemm_swiglu_nvfp4_quant,
     )
     from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
     from tokenspeed_kernel.registry import load_builtin_kernels
-    from tokenspeed_kernel.thirdparty.cuda import silu_and_mul_fuse_nvfp4_quant
 
     from tokenspeed.runtime.layers.dense.nvfp4 import (
         interleave_linear_and_gate,
@@ -266,7 +266,7 @@ def test_nvfp4_gemm_swiglu_nvfp4_quant_matches_unfused_model_shapes(
 
 
 def _autotune_operands(m: int, k: int, i: int):
-    from tokenspeed_kernel.ops.gemm.cute_dsl import _round_up
+    from tokenspeed_kernel.ops.gemm.nvfp4.cute_dsl import _round_up
 
     n = 2 * i
     dev = torch.device("cuda")
@@ -315,7 +315,7 @@ def test_nvfp4_gemm_swiglu_tactics_agree_with_heuristic(m: int, k: int, i: int) 
     silently mis-computes -- the autotuner would otherwise pick one for being
     fast at doing less work.
     """
-    from tokenspeed_kernel.ops.gemm.cute_dsl import (
+    from tokenspeed_kernel.ops.gemm.nvfp4.cute_dsl import (
         _Nvfp4GemmSwigluNvfp4QuantRunner,
     )
 
@@ -357,7 +357,9 @@ def test_nvfp4_gemm_swiglu_tactics_agree_with_heuristic(m: int, k: int, i: int) 
 def test_nvfp4_gemm_swiglu_autotune_populates_cache() -> None:
     """One call inside a tuning window fills every smaller shape bucket."""
     from flashinfer.autotuner import AutoTuner, autotune
-    from tokenspeed_kernel.ops.gemm.cute_dsl import nvfp4_gemm_swiglu_nvfp4_quant
+    from tokenspeed_kernel.ops.gemm.nvfp4.cute_dsl import (
+        nvfp4_gemm_swiglu_nvfp4_quant,
+    )
 
     m, k, i = 256, 7168, 512
     a, a_scale, b, b_scale, alpha, global_scale, _, _ = _autotune_operands(m, k, i)

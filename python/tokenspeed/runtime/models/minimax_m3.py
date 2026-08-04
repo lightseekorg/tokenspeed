@@ -27,13 +27,11 @@ from collections.abc import Iterable, Sequence
 
 import torch
 from tokenspeed_kernel.ops.activation.triton import swiglu_oai
-from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
+from tokenspeed_kernel.ops.gemm.fp16.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
-from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
+from tokenspeed_kernel.ops.model.minimax_m3.cuda import fused_qknorm_rope_kv_insert
+from tokenspeed_kernel.ops.moe.finalize.cuda import moe_finalize_fuse_shared
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.thirdparty.cuda.minimax_m3_fused import (
-    fused_qknorm_rope_kv_insert,
-)
 from torch import nn
 from transformers import MiniMaxM3VLTextConfig
 

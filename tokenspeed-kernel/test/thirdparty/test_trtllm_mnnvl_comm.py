@@ -80,7 +80,7 @@ def _get_workspaces():
     Cross-node ``ipc`` is None -- tests comparing against the IPC backend skip
     individually; mnnvl-only tests still run.
     """
-    from tokenspeed_kernel.thirdparty.cuda.trtllm import (
+    from tokenspeed_kernel.ops.communication.trtllm.native import (
         trtllm_create_ipc_workspace_for_all_reduce_fusion,
         trtllm_create_mnnvl_workspace_for_all_reduce_fusion,
     )
@@ -114,7 +114,9 @@ def _skip_unless_ipc(ws):
 
 
 def _run_ar(ws, x, out, pattern_kwargs, token_num, hidden_dim):
-    from tokenspeed_kernel.thirdparty.cuda.trtllm import trtllm_allreduce_fusion
+    from tokenspeed_kernel.ops.communication.trtllm.native import (
+        trtllm_allreduce_fusion,
+    )
 
     c = _workspaces
     trtllm_allreduce_fusion(
@@ -135,7 +137,7 @@ def _run_ar(ws, x, out, pattern_kwargs, token_num, hidden_dim):
 
 @pytest.mark.parametrize("token_num", [1, 4, 32])
 def test_plain_allreduce_matches_nccl(token_num):
-    from tokenspeed_kernel.thirdparty.cuda.trtllm import AllReduceFusionPattern
+    from tokenspeed_kernel.ops.communication.trtllm.native import AllReduceFusionPattern
 
     ws = _skip_unless_mnnvl()
     rank, dev = ws["rank"], ws["dev"]
@@ -158,7 +160,7 @@ def test_plain_allreduce_matches_nccl(token_num):
 
 @pytest.mark.parametrize("token_num", [1, 8])
 def test_residual_rmsnorm_matches_ipc_backend(token_num):
-    from tokenspeed_kernel.thirdparty.cuda.trtllm import AllReduceFusionPattern
+    from tokenspeed_kernel.ops.communication.trtllm.native import AllReduceFusionPattern
 
     ws = _skip_unless_mnnvl()
     _skip_unless_ipc(ws)
@@ -201,7 +203,7 @@ def test_residual_rmsnorm_matches_ipc_backend(token_num):
 
 
 def test_attnres_combine_matches_ipc_backend():
-    from tokenspeed_kernel.thirdparty.cuda.trtllm import AllReduceFusionPattern
+    from tokenspeed_kernel.ops.communication.trtllm.native import AllReduceFusionPattern
 
     ws = _skip_unless_mnnvl()
     _skip_unless_ipc(ws)
@@ -264,7 +266,7 @@ def test_latent_norm_supported_by_mnnvl():
     for the IPC lamport workspace on this wide [latent|hidden] lane (measured
     8.60us vs 6.64 on 8x B300) is enforced in _ar_fusion_workspace when an IPC
     workspace exists, not by supports()."""
-    from tokenspeed_kernel.thirdparty.cuda.trtllm import AllReduceFusionPattern
+    from tokenspeed_kernel.ops.communication.trtllm.native import AllReduceFusionPattern
 
     ws = _skip_unless_mnnvl()
     assert ws["mnnvl"].supports(
@@ -281,7 +283,7 @@ def test_graph_replay_self_reset():
     """The rotation state must self-reset: capture several AR calls in one
     graph and replay it many times; every replay must produce the correct
     result for freshly copied inputs."""
-    from tokenspeed_kernel.thirdparty.cuda.trtllm import AllReduceFusionPattern
+    from tokenspeed_kernel.ops.communication.trtllm.native import AllReduceFusionPattern
 
     ws = _skip_unless_mnnvl()
     rank, dev = ws["rank"], ws["dev"]

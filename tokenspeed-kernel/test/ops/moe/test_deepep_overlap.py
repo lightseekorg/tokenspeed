@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.moe import moe_apply
-from tokenspeed_kernel.ops.moe.deep_gemm import deepep_fp8
+from tokenspeed_kernel.ops.moe.fp8.deep_gemm import apply as deepep_fp8
 
 pytestmark = pytest.mark.skipif(
     not hasattr(deepep_fp8, "_apply_low_latency"),

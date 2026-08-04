@@ -22,7 +22,7 @@
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention.triton.mla_query_assemble import (
+from tokenspeed_kernel.ops.attention.mla.triton.query_assemble import (
     mla_nope_query_fp8,
 )
 

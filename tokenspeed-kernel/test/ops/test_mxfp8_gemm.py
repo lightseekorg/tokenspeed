@@ -37,7 +37,7 @@ def test_triton_mxfp8_1x32_raw_ue8m0_weight(device: str) -> None:
 
 def _has_flashinfer_mxfp8() -> bool:
     try:
-        from tokenspeed_kernel.ops.gemm.flashinfer import has_flashinfer_mxfp8
+        from tokenspeed_kernel.ops.gemm.fp8.flashinfer import has_flashinfer_mxfp8
     except ImportError:
         return False
     return has_flashinfer_mxfp8()
@@ -90,7 +90,7 @@ def test_flashinfer_mxfp8_matches_triton_on_identical_operands(
 
 @requires_flashinfer_mxfp8
 def test_flashinfer_mxfp8_selected_with_online_quant(device: str) -> None:
-    from tokenspeed_kernel.ops.gemm.fp8_utils import swizzle_mxfp8_scale
+    from tokenspeed_kernel.ops.other.fp8_quantization.triton import swizzle_mxfp8_scale
     from tokenspeed_kernel.selection import select_kernel
     from tokenspeed_kernel.signature import (
         ScaleFormat,
@@ -185,7 +185,7 @@ def test_flashinfer_mxfp8_square_weight_orientation(device: str) -> None:
 @requires_flashinfer_mxfp8
 def test_swizzle_mxfp8_scale_matches_flashinfer_layout(device: str) -> None:
     from flashinfer import mxfp8_quantize
-    from tokenspeed_kernel.ops.gemm.fp8_utils import swizzle_mxfp8_scale
+    from tokenspeed_kernel.ops.other.fp8_quantization.triton import swizzle_mxfp8_scale
 
     torch.manual_seed(0)
     for m, k in [(4, 512), (19, 2048), (300, 6144)]:

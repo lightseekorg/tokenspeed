@@ -2,7 +2,7 @@ import os
 import sys
 from types import ModuleType
 
-from tokenspeed_kernel.thirdparty.deep_ep import load_deep_ep
+from tokenspeed_kernel.ops.other.native.deep_ep import load_deep_ep
 
 
 def test_load_deep_ep_uses_lazy_global_symbols_and_restores_flags(
@@ -17,7 +17,8 @@ def test_load_deep_ep_uses_lazy_global_symbols_and_restores_flags(
         return imported
 
     monkeypatch.setattr(
-        "tokenspeed_kernel.thirdparty.deep_ep.importlib.import_module", import_module
+        "tokenspeed_kernel.ops.other.native.deep_ep.importlib.import_module",
+        import_module,
     )
 
     assert load_deep_ep() is imported
@@ -31,7 +32,8 @@ def test_load_deep_ep_restores_flags_after_import_error(monkeypatch) -> None:
         raise ImportError("unavailable")
 
     monkeypatch.setattr(
-        "tokenspeed_kernel.thirdparty.deep_ep.importlib.import_module", import_module
+        "tokenspeed_kernel.ops.other.native.deep_ep.importlib.import_module",
+        import_module,
     )
 
     try:

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import tokenspeed_kernel
 import torch
-from tokenspeed_kernel.ops.gemm.fp8_utils import (
+from tokenspeed_kernel.ops.other.fp8_quantization.triton import (
     per_token_group_quant_fp8,
     per_token_quant_fp8,
 )

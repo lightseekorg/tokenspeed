@@ -49,7 +49,7 @@ def _situ_runtime_reason() -> str | None:
         return "flashinfer TRTLLM-Gen SiTU targets the sm_100 family"
     if find_spec("flashinfer") is None:
         return "requires flashinfer"
-    from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
+    from tokenspeed_kernel.ops.moe.mxfp4.flashinfer_trtllm import (
         situ_moe_unavailable_reason,
     )
 
@@ -82,7 +82,7 @@ class _MoEWeights(torch.nn.Module):
 
 @requires_flashinfer_situ
 def test_flashinfer_situ_routed_moe_matches_portable_reference() -> None:
-    from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
+    from tokenspeed_kernel.ops.moe.mxfp4.flashinfer_trtllm import (
         flashinfer_trtllm_mxfp4_situ_moe_weights,
         flashinfer_trtllm_mxfp4_situ_routed_moe_apply,
     )

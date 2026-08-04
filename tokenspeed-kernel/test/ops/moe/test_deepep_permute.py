@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.moe.triton.deepep_permute import (
+from tokenspeed_kernel.ops.moe.fp8.deep_gemm.deepep_permute import (
     deepep_gather,
     deepep_scatter,
 )

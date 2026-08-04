@@ -29,7 +29,7 @@ from importlib.util import find_spec
 
 import pytest
 import torch
-from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+from tokenspeed_kernel.ops.attention.kda.triton.recurrent import (
     fused_recurrent_kda_mtp,
     fused_recurrent_kda_pool,
 )

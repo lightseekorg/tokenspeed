@@ -22,7 +22,7 @@ from __future__ import annotations
 import pytest
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.attention.flashinfer import gated_delta_rule as gdn
+from tokenspeed_kernel.ops.attention.gdn import flashinfer as gdn
 
 pytestmark = pytest.mark.skipif(
     not gdn.is_available(), reason="sm100 GDN kernel unavailable"
@@ -30,7 +30,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def _fla():
-    from tokenspeed_kernel.ops.attention.triton.linear.chunk import (
+    from tokenspeed_kernel.ops.attention.gdn.triton.chunk import (
         chunk_gated_delta_rule,
     )
 
@@ -38,7 +38,7 @@ def _fla():
 
 
 def _l2norm():
-    from tokenspeed_kernel.ops.attention.triton.linear.l2norm import l2norm_fwd
+    from tokenspeed_kernel.ops.attention.gdn.triton.l2norm import l2norm_fwd
 
     return l2norm_fwd
 

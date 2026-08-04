@@ -13,8 +13,8 @@ from tokenspeed_kernel.ops.attention import (
     msa_decode_with_kvcache,
     msa_extend_with_kvcache,
 )
-from tokenspeed_kernel.ops.attention.triton.minimax_indexer import minimax_indexer
-from tokenspeed_kernel.ops.attention.triton.minimax_sparse_attention import (
+from tokenspeed_kernel.ops.attention.msa.triton.indexer import minimax_indexer
+from tokenspeed_kernel.ops.attention.msa.triton.sparse_attention import (
     minimax_sparse_attention,
 )
 
@@ -672,7 +672,7 @@ def test_msa_cute_extend_matches_triton(kv_cache_dtype: torch.dtype) -> None:
         kwargs = _two_request_extend_case(kv_cache_dtype)
         # Each solution's indexer pass rewrites the same index_k_cache slots
         # with identical values, so back-to-back calls stay comparable.
-        out_cute = msa_extend_with_kvcache(solution="msa", **kwargs)
+        out_cute = msa_extend_with_kvcache(solution="cuda", **kwargs)
         out_triton = msa_extend_with_kvcache(solution="triton", **kwargs)
         assert out_cute.dtype == torch.bfloat16
         torch.testing.assert_close(out_cute, out_triton, atol=2e-2, rtol=2e-2)
@@ -729,7 +729,7 @@ def _cutedsl_decode_score_available() -> bool:
     if not current_platform().is_blackwell:
         return False
     try:
-        from tokenspeed_kernel.ops.attention.cute_dsl import (  # noqa: F401
+        from tokenspeed_kernel.ops.attention.msa.cute_dsl.index_decode_score import (  # noqa: F401
             minimax_index_decode_score,
         )
     except ImportError:
@@ -752,9 +752,9 @@ def _cutedsl_decode_score_available() -> bool:
 def test_cutedsl_decode_score_matches_triton(
     decode_query_len: int, seq_list: list[int]
 ) -> None:
-    import tokenspeed_kernel.ops.attention.triton.minimax_indexer as mi
+    import tokenspeed_kernel.ops.attention.msa.triton.indexer as mi
     import triton
-    from tokenspeed_kernel.ops.attention.cute_dsl.minimax_index_decode_score import (
+    from tokenspeed_kernel.ops.attention.msa.cute_dsl.index_decode_score import (
         decode_score_supported,
         minimax_index_decode_score,
     )
@@ -845,7 +845,7 @@ def test_cutedsl_decode_score_matches_triton(
     reason="CuteDSL index decode score requires SM100 and cutlass-dsl",
 )
 def test_cutedsl_decode_score_gates() -> None:
-    from tokenspeed_kernel.ops.attention.cute_dsl.minimax_index_decode_score import (
+    from tokenspeed_kernel.ops.attention.msa.cute_dsl.index_decode_score import (
         decode_score_supported,
     )
 
@@ -867,10 +867,19 @@ def _fmha_prefill_score_available() -> bool:
     if not torch.cuda.is_available() or not current_platform().is_blackwell:
         return False
     try:
-        import tokenspeed_kernel.thirdparty.msa.jit  # noqa: F401
+        import tokenspeed_kernel.ops.attention.msa.cuda.jit  # noqa: F401
     except ImportError:
         return False
     return True
+
+
+def test_msa_jit_source_resolution() -> None:
+    from tokenspeed_kernel.ops.attention.msa.cuda.source import msa_source_dir
+
+    source_dir = msa_source_dir()
+    assert (source_dir / "fmha_sm100_plan.cu").is_file()
+    assert (source_dir / "build_k2q_csr.cu").is_file()
+    assert (source_dir / "build_decode_schedule.cu").is_file()
 
 
 requires_fmha_prefill_score = pytest.mark.skipif(
@@ -964,7 +973,7 @@ def _prefill_indexer_case(
 def test_fmha_prefill_score_matches_triton(
     qo_lens: list[int], kv_lens: list[int]
 ) -> None:
-    from tokenspeed_kernel.ops.attention import msa_score
+    from tokenspeed_kernel.ops.attention.msa.cuda import prefill_score as msa_score
 
     if not msa_score.ensure_prefill_score_ready(None):
         pytest.skip("fmha OnlyScore JIT compilation failed (nvcc unavailable?)")
@@ -987,7 +996,9 @@ def test_fmha_prefill_score_matches_triton(
 
 @requires_fmha_prefill_score
 def test_fmha_prefill_score_gates() -> None:
-    from tokenspeed_kernel.ops.attention.msa_score import prefill_score_supported
+    from tokenspeed_kernel.ops.attention.msa.cuda.prefill_score import (
+        prefill_score_supported,
+    )
 
     device = "cuda"
     index_q = torch.randn(8, 4, 128, device=device, dtype=torch.bfloat16)

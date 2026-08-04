@@ -46,7 +46,7 @@ SCALE = 1.0 / HEAD_DIM
 
 
 def _skip_unless_supported() -> None:
-    pytest.importorskip("tokenspeed_kernel.ops.attention.cute_dsl.rel_mha")
+    pytest.importorskip("tokenspeed_kernel.ops.attention.rmha.cute_dsl")
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     if torch.cuda.get_device_capability()[0] != 10:
@@ -132,7 +132,7 @@ def test_dispatch_native_multiq(page, rel_extent, window_left, kv_lens, k_new) -
     attention alike (gate-validated route; full-attn prediction
     causality fixed 2026-07-14)."""
     _skip_unless_supported()
-    import tokenspeed_kernel.ops.attention.cute_dsl.rel_mha.rel_decode_v2 as v2mod
+    import tokenspeed_kernel.ops.attention.rmha.cute_dsl.rel_decode_v2 as v2mod
     from tokenspeed_kernel import rel_mha_decode_with_kvcache
 
     device = torch.device("cuda")
@@ -219,7 +219,7 @@ def test_v2_native_prediction_vs_reference(
     expansion): unexpanded [B] seqlens / [B, W] table, q token-major
     [B*k, H, D], in-kernel per-row causality."""
     _skip_unless_supported()
-    from tokenspeed_kernel.ops.attention.cute_dsl.rel_mha.rel_decode_v2 import (
+    from tokenspeed_kernel.ops.attention.rmha.cute_dsl.rel_decode_v2 import (
         rel_mha_decode_tsmha_v2,
     )
 
@@ -257,7 +257,7 @@ def test_v1_native_prediction_vs_reference(
     seqlens / [B, W] table, per-row sheared bias tile, in-kernel
     bottom-right causal masking."""
     _skip_unless_supported()
-    from tokenspeed_kernel.ops.attention.cute_dsl.rel_mha.rel_decode import (
+    from tokenspeed_kernel.ops.attention.rmha.cute_dsl.rel_decode import (
         rel_mha_decode_tsmha,
     )
 
@@ -292,7 +292,7 @@ def test_v1_native_prediction_tile_boundary() -> None:
     """P rows straddling a 128-tile boundary (positions 4094..4097): the
     shear's negative anchored phases must keep every row exact."""
     _skip_unless_supported()
-    from tokenspeed_kernel.ops.attention.cute_dsl.rel_mha.rel_decode import (
+    from tokenspeed_kernel.ops.attention.rmha.cute_dsl.rel_decode import (
         rel_mha_decode_tsmha,
     )
 
@@ -340,7 +340,7 @@ def test_v1_native_prediction_mxfp8(window_left) -> None:
     import math as _math
 
     from tokenspeed_kernel import quantize_mxfp8
-    from tokenspeed_kernel.ops.attention.cute_dsl.rel_mha.rel_decode import (
+    from tokenspeed_kernel.ops.attention.rmha.cute_dsl.rel_decode import (
         rel_mha_decode_tsmha,
     )
     from tokenspeed_kernel.ops.kvcache.triton import store_sf_interleaved

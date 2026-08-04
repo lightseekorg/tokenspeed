@@ -37,12 +37,12 @@ from tokenspeed_kernel.ops.attention import (
     try_kda_fused_paged_decode,
     try_kda_fused_paged_verify,
 )
-from tokenspeed_kernel.ops.attention.triton.gdn_qkv_split import (
-    fused_qkv_split_gdn_prefill,
-)
-from tokenspeed_kernel.ops.attention.triton.linear.index import (
+from tokenspeed_kernel.ops.attention.gdn.triton.index import (
     set_total_chunks_hint,
     set_total_chunks_hint_uniform,
+)
+from tokenspeed_kernel.ops.attention.gdn.triton.qkv_split import (
+    fused_qkv_split_gdn_prefill,
 )
 
 from tokenspeed.runtime.configs.cache_runtime import cache_debug_enabled
@@ -1254,7 +1254,7 @@ class MambaAttnBackend(AttentionBackend):
             and cache_metadata is not None
         )
         if use_tape:
-            from tokenspeed_kernel.ops.metadata import PrepTape, Reg
+            from tokenspeed_kernel.ops.other.metadata import PrepTape, Reg
 
             tapes = getattr(self, "_replay_state_tapes", None)
             if tapes is None:
@@ -1686,7 +1686,7 @@ class MambaAttnBackend(AttentionBackend):
         if is_target_verify:
             if self.is_kda:
                 verify_layer_state = self._verify_layer_state
-                from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+                from tokenspeed_kernel.ops.attention.kda.triton.recurrent import (
                     fused_recurrent_kda_mtp,
                 )
 

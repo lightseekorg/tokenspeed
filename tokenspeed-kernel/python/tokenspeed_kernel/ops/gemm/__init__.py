@@ -24,21 +24,14 @@ import logging
 
 # Backend registration (side-effect imports)
 import tokenspeed_kernel.numerics.reference.gemm  # noqa: F401
-import tokenspeed_kernel.ops.gemm.deep_gemm  # noqa: F401
-import tokenspeed_kernel.ops.gemm.flashinfer  # noqa: F401
-import tokenspeed_kernel.ops.gemm.gluon  # noqa: F401
-import tokenspeed_kernel.ops.gemm.triton  # noqa: F401
-import tokenspeed_kernel.ops.gemm.trtllm  # noqa: F401
+import tokenspeed_kernel.ops.gemm.fp8.deep_gemm  # noqa: F401
+import tokenspeed_kernel.ops.gemm.fp8.flashinfer  # noqa: F401
+import tokenspeed_kernel.ops.gemm.fp8.triton  # noqa: F401
+import tokenspeed_kernel.ops.gemm.fp16.gluon  # noqa: F401
+import tokenspeed_kernel.ops.gemm.mxfp4.triton  # noqa: F401
+import tokenspeed_kernel.ops.gemm.nvfp4.flashinfer  # noqa: F401
+import tokenspeed_kernel.ops.gemm.nvfp4.trtllm  # noqa: F401
 import torch
-from tokenspeed_kernel.ops.gemm.kimi3 import (
-    kimi3_latent_projection,
-    kimi3_latent_projection_add3,
-    kimi3_mla_qkv_gate_projection,
-    kimi3_qkvfab_projection,
-    kimi3_router_projection,
-    kimi3_shared_down_projection,
-    kimi3_shared_situ_projection,
-)
 from tokenspeed_kernel.platform import ArchVersion, Platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
@@ -54,13 +47,6 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "bmm",
-    "kimi3_latent_projection",
-    "kimi3_mla_qkv_gate_projection",
-    "kimi3_latent_projection_add3",
-    "kimi3_qkvfab_projection",
-    "kimi3_router_projection",
-    "kimi3_shared_down_projection",
-    "kimi3_shared_situ_projection",
     "mm",
 ]
 
@@ -259,7 +245,7 @@ def _online_quantize_mxfp8(
         return qA, A_scales
 
     if kernel_name == "deep_gemm_mm_fp8_blockscale":
-        from tokenspeed_kernel.ops.gemm.fp8_utils import (
+        from tokenspeed_kernel.ops.other.fp8_quantization.triton import (
             per_token_group_quant_fp8,
         )
 
@@ -271,14 +257,18 @@ def _online_quantize_mxfp8(
             scale_ue8m0=_platform.is_blackwell_plus,
         )
     elif kernel_name == "flashinfer_mm_fp8_blockscale":
-        from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
+        from tokenspeed_kernel.ops.other.fp8_quantization.triton import (
+            per_token_group_quant_fp8,
+        )
 
         return ensure_row_major_scales(
             *per_token_group_quant_fp8(A, block_k, column_major_scales=False),
             group_major_scales=_platform.is_nvidia,
         )
     elif kernel_name == "triton_mm_fp8_blockscale":
-        from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
+        from tokenspeed_kernel.ops.other.fp8_quantization.triton import (
+            per_token_group_quant_fp8,
+        )
 
         return ensure_row_major_scales(
             *per_token_group_quant_fp8(A, block_k, column_major_scales=False),
@@ -431,7 +421,7 @@ def mm(
             block_size is not None
         ), "block_size is required for online activation quantization"
         if prepacked_scales:
-            from tokenspeed_kernel.ops.gemm.fp8_utils import (
+            from tokenspeed_kernel.ops.other.fp8_quantization.triton import (
                 flashinfer_fp8_blockscale_quantize_prepacked,
             )
 

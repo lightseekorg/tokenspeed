@@ -29,11 +29,11 @@ from typing import Any, cast
 import torch
 import triton
 import triton.language as tl
-from tokenspeed_kernel.ops.communication.trtllm import (
+from tokenspeed_kernel.ops.gemm.fp16.cuda import dsv3_router_gemm
+from tokenspeed_kernel.ops.model.minimax_m2.trtllm import (
     minimax_allreduce_rms_qk,
     trtllm_create_ipc_workspace_for_minimax,
 )
-from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.torch_compile import get_compiler_backend
 from torch import nn

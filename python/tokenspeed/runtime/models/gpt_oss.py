@@ -71,7 +71,7 @@ from tokenspeed.runtime.utils.pdl import pdl_enabled
 logger = get_colorful_logger(__name__)
 
 
-from tokenspeed_kernel.ops.gemm.flashinfer import tinygemm_bf16
+from tokenspeed_kernel.ops.gemm.fp16.flashinfer import tinygemm_bf16
 from tokenspeed_kernel.registry import error_fn
 
 

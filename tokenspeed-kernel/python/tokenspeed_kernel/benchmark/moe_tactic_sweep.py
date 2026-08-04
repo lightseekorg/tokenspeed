@@ -34,7 +34,7 @@ representative random weights, writes the winners into flashinfer's autotuner,
 and saves the result via ``AutoTuner.save_configs`` -- a JSON table whose
 embedded metadata pins the GPU device name and FlashInfer/CUDA/cuDNN versions,
 so a table can never be applied on a mismatched host. Name it vLLM-configs style
-and ship it under ``ops/moe/flashinfer/tactics/`` to have it auto-load at
+and ship it under ops/model/kimi_k3/tactics/ to have it auto-load at
 startup (see ops.tuning). By default the output filename is generated from the
 model/layout and current GPU, FlashInfer, and cuDNN versions. Pass ``--output``
 to choose the path explicitly.
@@ -63,7 +63,7 @@ import sys
 from importlib.metadata import version
 
 import torch
-from tokenspeed_kernel.ops.tuning import (
+from tokenspeed_kernel.ops.other.tuning.flashinfer import (
     flashinfer_tuning_cache_filename,
     get_autotune_max_num_tokens,
 )

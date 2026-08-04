@@ -449,7 +449,7 @@ class _KDAHarness:
     def oracle(self, layer_id, mixed, g_raw, beta_raw):
         """(naive_out, naive_state, fla_out, fla_state) over one contiguous
         sequence starting from the zero state."""
-        from tokenspeed_kernel.ops.attention.triton.linear.kda import (
+        from tokenspeed_kernel.ops.attention.kda.triton.fla import (
             kda_chunk_prefill,
         )
 
@@ -802,7 +802,7 @@ def test_kda_lcm_pool_component_views_end_to_end(
             h.extend(layer_id, s["mixed"][:8], s["g_raw"][:8], s["beta_raw"][:8])
         )
 
-    from tokenspeed_kernel.thirdparty.triton import fla_kda_recurrent
+    from tokenspeed_kernel.ops.attention.kda.triton import recurrent
 
     def _unexpected_megafuse(*args, **kwargs):
         raise AssertionError("AMD paged cache decode must bypass the FLA KDA megafuse")
@@ -816,7 +816,7 @@ def test_kda_lcm_pool_component_views_end_to_end(
         return indexed_decode(*args, **kwargs)
 
     monkeypatch.setattr(
-        fla_kda_recurrent,
+        recurrent,
         "fused_recurrent_kda_megafuse",
         _unexpected_megafuse,
     )

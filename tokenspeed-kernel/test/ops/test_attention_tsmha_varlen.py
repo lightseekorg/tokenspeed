@@ -35,7 +35,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel import rel_mha_extend_with_kvcache, rel_mha_prefill
-from tokenspeed_kernel.ops.attention import flash_attn as fa_mod
+from tokenspeed_kernel.ops.attention.rmha import flash_attn as fa_mod
 
 torch.manual_seed(11)
 
@@ -243,7 +243,7 @@ def test_tsmha_varlen_extend_paged(
 def test_tsmha_varlen_gate_falls_back(device: str, require) -> None:
     """Ineligible extents (not 128-multiples) must keep the score_mod route."""
     _require_fa4(require)
-    from tokenspeed_kernel.ops.attention.cute_dsl.rel_mha import rel_extend
+    from tokenspeed_kernel.ops.attention.rmha.cute_dsl import rel_extend
 
     q_lens = [70, 130]
     rel_extent = 64

@@ -32,7 +32,7 @@ import json
 from importlib.util import find_spec
 
 import pytest
-from tokenspeed_kernel.ops.tuning import (
+from tokenspeed_kernel.ops.other.tuning.flashinfer import (
     flashinfer_tuning_cache_filename,
     load_flashinfer_tuning_cache,
     set_autotune_process_group,
@@ -72,7 +72,9 @@ def test_corrupt_file_returns_false(tmp_path) -> None:
 @requires_flashinfer
 def test_packaged_lookup_miss_returns_false() -> None:
     import torch
-    from tokenspeed_kernel.ops.tuning import load_packaged_flashinfer_tuning_cache
+    from tokenspeed_kernel.ops.other.tuning.flashinfer import (
+        load_packaged_flashinfer_tuning_cache,
+    )
 
     if not torch.cuda.is_available():
         pytest.skip("device-name lookup requires CUDA")

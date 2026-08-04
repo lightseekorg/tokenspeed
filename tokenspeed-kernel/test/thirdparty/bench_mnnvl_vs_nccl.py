@@ -99,7 +99,7 @@ def _time_us(fn) -> float:
 
 
 def main() -> None:
-    from tokenspeed_kernel.thirdparty.cuda.trtllm import (
+    from tokenspeed_kernel.ops.communication.trtllm.native import (
         AllReduceFusionPattern,
         trtllm_allreduce_fusion,
         trtllm_create_ipc_workspace_for_all_reduce_fusion,

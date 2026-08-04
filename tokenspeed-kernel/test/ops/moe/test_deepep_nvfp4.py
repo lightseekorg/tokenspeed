@@ -25,7 +25,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-nvfp4 = pytest.importorskip("tokenspeed_kernel.ops.moe.flashinfer.cutedsl_deepep_nvfp4")
+nvfp4 = pytest.importorskip("tokenspeed_kernel.ops.moe.nvfp4.flashinfer_cutedsl_deepep")
 
 pytestmark = pytest.mark.skipif(
     not hasattr(nvfp4, "flashinfer_cutedsl_deepep_nvfp4_moe_apply"),

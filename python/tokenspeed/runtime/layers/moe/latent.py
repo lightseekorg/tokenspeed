@@ -31,7 +31,7 @@ import torch
 from tokenspeed_kernel.ops.communication import (
     allreduce_lane_latent_norm_supported,
 )
-from tokenspeed_kernel.ops.moe import kimi3_native_moe_available
+from tokenspeed_kernel.ops.model.kimi_k3.moe import kimi3_native_moe_available
 from torch import nn
 
 from tokenspeed.runtime.distributed.comm_ops import (

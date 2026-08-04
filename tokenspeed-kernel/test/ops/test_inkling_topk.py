@@ -31,7 +31,7 @@ from __future__ import annotations
 import pytest
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.moe.triton.inkling_topk import inkling_topk
+from tokenspeed_kernel.ops.model.inkling.triton import inkling_topk
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="inkling_topk needs CUDA"

@@ -28,7 +28,7 @@ import random
 import socket
 from typing import Literal
 
-from tokenspeed_kernel.ops.attention.triton.linear.chunk_delta_h import (
+from tokenspeed_kernel.ops.attention.gdn.triton.chunk_delta_h import (
     CHUNK_SIZE as FLA_CHUNK_SIZE,
 )
 from tokenspeed_kernel.platform import current_platform

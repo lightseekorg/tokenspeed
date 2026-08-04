@@ -2,7 +2,7 @@
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.moe.triton.mxfp4 import triton_mxfp4_moe_weights
+from tokenspeed_kernel.ops.moe.mxfp4.triton import triton_mxfp4_moe_weights
 
 if not torch.cuda.is_available():
     pytest.skip("requires CUDA", allow_module_level=True)

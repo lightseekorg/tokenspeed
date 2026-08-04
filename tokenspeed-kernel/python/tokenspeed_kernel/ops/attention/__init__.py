@@ -23,24 +23,25 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 
-# Backend registration (side-effect imports)
-import tokenspeed_kernel.ops.attention.cuda  # noqa: F401
-import tokenspeed_kernel.ops.attention.deep_gemm  # noqa: F401
-import tokenspeed_kernel.ops.attention.flash_attn  # noqa: F401
-import tokenspeed_kernel.ops.attention.flash_mla  # noqa: F401
-import tokenspeed_kernel.ops.attention.flashinfer  # noqa: F401
-import tokenspeed_kernel.ops.attention.gluon  # noqa: F401
+import tokenspeed_kernel.ops.attention.dsa  # noqa: F401
+import tokenspeed_kernel.ops.attention.gdn  # noqa: F401
+import tokenspeed_kernel.ops.attention.kda  # noqa: F401
+import tokenspeed_kernel.ops.attention.merge_state  # noqa: F401
+import tokenspeed_kernel.ops.attention.mha  # noqa: F401
+import tokenspeed_kernel.ops.attention.mla  # noqa: F401
 import tokenspeed_kernel.ops.attention.msa  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton  # noqa: F401
+import tokenspeed_kernel.ops.attention.rmha  # noqa: F401
+
+# Backend registration (side-effect imports)
 import torch
-from tokenspeed_kernel.ops.attention.gdn_utils import (
+from tokenspeed_kernel.ops.attention.gdn.types import (
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
 )
-from tokenspeed_kernel.ops.attention.kda_utils import KdaPrefillResult
-from tokenspeed_kernel.ops.attention.triton.kda_chunk import (
+from tokenspeed_kernel.ops.attention.kda.triton.chunk import (
     kda_chunk_prefill,
 )
+from tokenspeed_kernel.ops.attention.kda.types import KdaPrefillResult
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry, Priority
