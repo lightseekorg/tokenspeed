@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Row-per-CTA M=1 bf16 GEMV.
+"""Triton FP16/BF16 GEMV implementations.
 
 Streams each weight row through one CTA (whole row in a single masked load,
 dot against the L2-resident activation, one store). In the L2-cold regime a

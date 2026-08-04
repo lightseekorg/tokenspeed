@@ -236,7 +236,7 @@ def test_solution_siblings_use_consistent_packages() -> None:
             "trtllm",
         },
         "embedding": {"cuda", "flashinfer", "triton"},
-        "gemm/fp16": {"cuda", "flashinfer", "gluon"},
+        "gemm/fp16": {"cuda", "flashinfer", "gluon", "triton"},
         "gemm/nvfp4": {"cute_dsl", "flashinfer", "trtllm"},
         "kvcache": {"cuda", "triton"},
         "layernorm": {"cuda", "flashinfer", "triton"},

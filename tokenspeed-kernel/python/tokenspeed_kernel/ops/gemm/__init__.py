@@ -28,6 +28,7 @@ import tokenspeed_kernel.ops.gemm.fp8.deep_gemm  # noqa: F401
 import tokenspeed_kernel.ops.gemm.fp8.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.gemm.fp8.triton  # noqa: F401
 import tokenspeed_kernel.ops.gemm.fp16.gluon  # noqa: F401
+import tokenspeed_kernel.ops.gemm.fp16.triton  # noqa: F401
 import tokenspeed_kernel.ops.gemm.mxfp4.triton  # noqa: F401
 import tokenspeed_kernel.ops.gemm.nvfp4.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.gemm.nvfp4.trtllm  # noqa: F401

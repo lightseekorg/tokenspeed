@@ -383,7 +383,7 @@ def kimi3_mla_qkv_gate_projection(
         solution = "split" if m > 32 else "fused"
 
     if solution == "fused":
-        from tokenspeed_kernel.ops.model.kimi_k3.gemv import decode_gemv
+        from tokenspeed_kernel.ops.gemm.fp16.triton import decode_gemv
 
         packed = decode_gemv(hidden_states, weight)
         qkv, gate = packed.split((qkv_width, output_width - qkv_width), dim=-1)
@@ -460,7 +460,7 @@ def kimi3_latent_projection_add3(
                 "rowcta_gemv projection-add3 requires a contiguous CUDA BF16 "
                 "7168<->3584 shape"
             )
-        from tokenspeed_kernel.ops.model.kimi_k3.gemv import rowcta_gemv_add3
+        from tokenspeed_kernel.ops.gemm.fp16.triton import rowcta_gemv_add3
 
         return rowcta_gemv_add3(
             hidden_states,
@@ -690,7 +690,7 @@ def kimi3_qkvfab_projection(
         else:
             solution = "torch"
     if solution == "decode_gemv":
-        from tokenspeed_kernel.ops.model.kimi_k3.gemv import decode_gemv
+        from tokenspeed_kernel.ops.gemm.fp16.triton import decode_gemv
 
         result = decode_gemv(hidden_states, weight)
         if out is None:

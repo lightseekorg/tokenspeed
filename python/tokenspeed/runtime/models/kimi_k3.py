@@ -67,14 +67,14 @@ from tokenspeed_kernel.ops.activation.triton import (
     sigmoid_mul,
 )
 from tokenspeed_kernel.ops.communication import allreduce_fusion_lane
+from tokenspeed_kernel.ops.gemm.fp16.triton import (
+    decode_gemv,
+)
 from tokenspeed_kernel.ops.model.kimi_k3.attn_res import attn_res_fwd
 from tokenspeed_kernel.ops.model.kimi_k3.attn_res.triton import (
     attnres_combine,
     attnres_partial,
     attnres_partial_dual,
-)
-from tokenspeed_kernel.ops.model.kimi_k3.gemv import (
-    decode_gemv,
 )
 from tokenspeed_kernel.ops.model.kimi_k3.projections import (
     kimi3_latent_projection_add3,
