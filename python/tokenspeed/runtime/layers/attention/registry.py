@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 from typing import TYPE_CHECKING
@@ -1386,6 +1387,18 @@ def create_attn_components(
             )
 
     _validate_shared_lcm_geometry(pool, draft_pool)
+    
+    if (
+        draft_attn_backend is not None
+        and getattr(draft_pool, "_lcm_memory_plan", None) is not None
+    ):
+        draft_mark_contract = getattr(draft_attn_backend, "mark_cache_contract", None)
+        if draft_mark_contract is not None:
+            params = inspect.signature(draft_mark_contract).parameters
+            if "logical_page_size" in params:
+                draft_mark_contract(logical_page_size=int(draft_pool.page_size))
+            else:
+                draft_mark_contract()
     if use_lcm_gdn and fixed_workspace_bytes:
         actual_workspace_bytes = (
             backend.linear_attn_backend.preallocate_verify_workspace(

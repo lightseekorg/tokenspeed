@@ -319,6 +319,7 @@ class ModelExecutor:
         self._mirror_idx_cpu: torch.Tensor | None = None
         self._mirror_idx_dev: torch.Tensor | None = None
         self._mirror_row_buf: torch.Tensor | None = None
+        self._mirror_for_block_draft = config.spec_algo in ("DFLASH", "DSPARK")
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
 
@@ -751,10 +752,14 @@ class ModelExecutor:
     ) -> None:
         """Expose the full-history table to ordinary speculative consumers."""
         if (
-            self._cache_runtime_contract is not None
-            or self.drafter is None
+            self.drafter is None
             or not block_tables
             or self._full_history_group_id is None
+        ):
+            return
+        if (
+            self._cache_runtime_contract is not None
+            and not self._mirror_for_block_draft
         ):
             return
         table = block_tables.get(self._full_history_group_id)
@@ -1507,6 +1512,10 @@ class ModelExecutor:
                     num_requests=bs,
                 )
                 block_tables = dict(cache_metadata.tables(active_forward_op=forward_op))
+                # A block-decode drafter mirrors page tables.
+                self._mirror_full_history_table_into_req_to_page(
+                    forward_op, block_tables
+                )
             else:
                 block_tables = block_tables_from_forward_op(
                     forward_op,
