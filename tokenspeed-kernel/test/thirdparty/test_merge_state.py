@@ -25,7 +25,7 @@ from typing import Tuple
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention.merge_state.cuda import (
+from tokenspeed_kernel.ops.other.merge_state.cuda import (
     LSE_LN,
     LSE_LOG2,
     merge_state,

@@ -20,9 +20,9 @@
 
 """merge_state: vendored from flashinfer's MergeStateKernel + lse_scale knob + PDL.
 
-The CUDA source lives at ``python/csrc/cuda/merge_state.cu``. This module is
-the public Python API — it loads the prebuilt ``.so`` lazily, validates inputs,
-allocates outputs, and forwards to the kernel.
+The CUDA source lives at ``python/csrc/cuda/merge_state.cu``. This low-level
+wrapper loads the prebuilt ``.so`` lazily, validates inputs, allocates outputs,
+and forwards to the kernel. The public dispatcher remains under attention.
 """
 
 from __future__ import annotations

@@ -26,11 +26,11 @@ from collections.abc import Sequence
 import tokenspeed_kernel.ops.attention.dsa  # noqa: F401
 import tokenspeed_kernel.ops.attention.gdn  # noqa: F401
 import tokenspeed_kernel.ops.attention.kda  # noqa: F401
-import tokenspeed_kernel.ops.attention.merge_state  # noqa: F401
 import tokenspeed_kernel.ops.attention.mha  # noqa: F401
 import tokenspeed_kernel.ops.attention.mla  # noqa: F401
 import tokenspeed_kernel.ops.attention.msa  # noqa: F401
 import tokenspeed_kernel.ops.attention.rmha  # noqa: F401
+import tokenspeed_kernel.ops.other.merge_state  # noqa: F401
 
 # Backend registration (side-effect imports)
 import torch

@@ -1,1 +1,1 @@
-"""Model-specific kernels awaiting a stable operator classification."""
+"""Shared utility kernels and implementations."""

@@ -49,8 +49,6 @@ import tokenspeed_kernel.ops.attention.gdn.flashinfer as _attention_flashinfer_g
 import tokenspeed_kernel.ops.attention.gdn.triton.attention as _attention_triton_gdn
 import tokenspeed_kernel.ops.attention.kda.gluon as _attention_gluon_kda
 import tokenspeed_kernel.ops.attention.kda.triton.dispatch as _attention_triton_kda
-import tokenspeed_kernel.ops.attention.merge_state.cuda as _attention_cuda
-import tokenspeed_kernel.ops.attention.merge_state.triton as _attention_triton_merge_state
 import tokenspeed_kernel.ops.attention.mha.flash_attn as _attention_flash_attn_mha
 import tokenspeed_kernel.ops.attention.mha.flashinfer as _attention_flashinfer_mha
 import tokenspeed_kernel.ops.attention.mha.gluon as _attention_gluon_mha
@@ -83,6 +81,8 @@ import tokenspeed_kernel.ops.moe.mxfp4.triton as _moe_triton_mxfp4
 import tokenspeed_kernel.ops.moe.nvfp4.flashinfer_cutedsl_deepep as _moe_cutedsl_deepep_nvfp4
 import tokenspeed_kernel.ops.moe.nvfp4.flashinfer_cutlass as _moe_cutlass_nvfp4
 import tokenspeed_kernel.ops.moe.nvfp4.flashinfer_trtllm as _moe_trtllm_nvfp4
+import tokenspeed_kernel.ops.other.merge_state.cuda as _other_merge_state_cuda
+import tokenspeed_kernel.ops.other.merge_state.triton as _other_merge_state_triton
 import tokenspeed_kernel.ops.quantization as _quantization_pkg
 import tokenspeed_kernel.ops.quantization.flashinfer as _quantization_flashinfer
 import tokenspeed_kernel.ops.quantization.triton as _quantization_triton
@@ -117,7 +117,7 @@ from tokenspeed_kernel.selection import SelectedKernel
 
 _RELOAD_MODULES = [
     # Attention registration modules.
-    _attention_cuda,
+    _other_merge_state_cuda,
     _attention_deep_gemm_dsa,
     _attention_flash_mla_dsa,
     _attention_flashinfer_dsa,
@@ -137,7 +137,7 @@ _RELOAD_MODULES = [
     _attention_tokenspeed_mla_decode,
     _attention_tokenspeed_mla_prefill,
     _attention_triton_rel_mha,
-    _attention_triton_merge_state,
+    _other_merge_state_triton,
     _attention_triton_dsa,
     _attention_triton_dsa_topk,
     _attention_triton_gdn,

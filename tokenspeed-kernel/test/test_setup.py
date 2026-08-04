@@ -216,7 +216,6 @@ def test_solution_siblings_use_consistent_packages() -> None:
         },
         "attention/gdn": {"flashinfer", "triton"},
         "attention/kda": {"cute_dsl", "flash_kda", "gluon", "triton"},
-        "attention/merge_state": {"cuda", "triton"},
         "attention/mha": {"flash_attn", "flashinfer", "gluon", "triton"},
         "attention/mla": {
             "flash_mla",
@@ -246,6 +245,7 @@ def test_solution_siblings_use_consistent_packages() -> None:
         "moe/fp8": {"deep_gemm", "flashinfer_cutlass", "flashinfer_trtllm", "triton"},
         "moe/routing": {"cuda", "triton"},
         "other/native": {"deep_ep", "deep_gemm", "trtllm"},
+        "other/merge_state": {"cuda", "triton"},
         "quantization": {"cuda", "flashinfer", "triton", "trtllm"},
     }
 
@@ -305,7 +305,7 @@ def test_cuda_kernel_groups_and_output_packages(monkeypatch) -> None:
         "sampling_chain": "tokenspeed_kernel.ops.sampling.cuda",
         "fused_topk_topp": "tokenspeed_kernel.ops.sampling.cuda",
         "rmsnorm_fused_parallel": "tokenspeed_kernel.ops.layernorm.cuda",
-        "merge_state": "tokenspeed_kernel.ops.attention.merge_state.cuda",
+        "merge_state": "tokenspeed_kernel.ops.other.merge_state.cuda",
         "flashinfer_softmax": "tokenspeed_kernel.ops.sampling.flashinfer",
         "silu_fuse_block_quant": "tokenspeed_kernel.ops.activation.cuda",
         "silu_fuse_nvfp4_quant": "tokenspeed_kernel.ops.activation.cuda",

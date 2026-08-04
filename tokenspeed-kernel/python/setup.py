@@ -388,7 +388,7 @@ KERNEL_GROUPS = [
         [
             CUDA_CSRC_DIR / "merge_state.cu",
         ],
-        "tokenspeed_kernel.ops.attention.merge_state.cuda",
+        "tokenspeed_kernel.ops.other.merge_state.cuda",
         [],
         [],
     ),
