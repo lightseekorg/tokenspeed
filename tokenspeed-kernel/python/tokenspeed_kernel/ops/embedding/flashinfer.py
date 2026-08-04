@@ -41,6 +41,7 @@ if platform.is_nvidia:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "has_rope": frozenset({True}),
             "is_neox": frozenset({True, False}),
             "quantize_dtype": frozenset({torch.float8_e4m3fn}),
             "has_scale_q_tensor": frozenset({False}),
