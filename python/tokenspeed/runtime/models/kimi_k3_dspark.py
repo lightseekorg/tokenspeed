@@ -293,6 +293,7 @@ class K3DSparkModel(nn.Module):
             logger.warning("K3 DSpark: %s", note)
         self.config = config
         self.mapping = mapping
+        self.attention_kind = "kimi_mla"
         hidden_size = int(config.hidden_size)
         eps = float(config.rms_norm_eps)
 
@@ -330,6 +331,14 @@ class K3DSparkModel(nn.Module):
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Concatenated target taps -> draft hidden space."""
         return self.context_norm(self.context_proj(target_hidden)[0])
+
+    def _finalize_hidden(
+        self, hidden_states: torch.Tensor, residual: torch.Tensor
+    ) -> torch.Tensor:
+        """Reduce the last row-parallel MLP output before final normalization."""
+        hidden_states = all_reduce(hidden_states, self.mapping.dense.tp_group)
+        hidden_states, _ = self.final_norm(hidden_states, residual)
+        return hidden_states
 
     # ------------------------------------------------------------------
     # Context-injection contract (see DFlashDraftModel for the GQA counterpart)
@@ -409,7 +418,7 @@ class K3DSparkModel(nn.Module):
         if residual is None:
             hidden_states = self.final_norm(hidden_states)
         else:
-            hidden_states, _ = self.final_norm(hidden_states, residual)
+            hidden_states = self._finalize_hidden(hidden_states, residual)
 
         return LogitsProcessorOutput(
             next_token_logits=None, hidden_states=hidden_states

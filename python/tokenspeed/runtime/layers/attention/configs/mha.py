@@ -29,6 +29,7 @@ from tokenspeed.runtime.configs.paged_cache_spec import PagedCacheGroupSpec
 from tokenspeed.runtime.layers.attention.configs.base import (
     BaseAttnConfig,
     resolve_dtype,
+    resolve_speculative_num_tokens,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.utils.server_args import ServerArgs
@@ -60,7 +61,9 @@ class MHAConfig(BaseAttnConfig):
         if server_args.speculative_algorithm is not None:
             kwargs.update(
                 speculative_num_steps=server_args.speculative_num_steps,
-                speculative_num_draft_tokens=server_args.speculative_num_draft_tokens,
+                speculative_num_draft_tokens=resolve_speculative_num_tokens(
+                    server_args, is_draft
+                ),
             )
         kv_cache_dtype = server_args.kv_cache_dtype
         draft_block_decode = bool(

@@ -35,6 +35,8 @@ logger = get_colorful_logger(__name__)
 class DSpark(DFlash):
     """DFlash block drafter + a Markov head (semi-autoregressive proposal)."""
 
+    sample_from_anchor = True
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.markov_head = getattr(self.model, "markov_head", None)

@@ -1697,31 +1697,16 @@ class KimiLinearModel(nn.Module):
         prefix_sum: torch.Tensor,
         block_residual: torch.Tensor,
     ) -> torch.Tensor:
-        """The stream value after ``layer_idx``, as its next consumer sees it.
+        """Capture vLLM's completed-layer DSpark target stream.
 
-        K3 does not carry a plain residual: ``prefix_sum`` is only one candidate
-        in the AttnRes mix, and the block snapshots carry the rest. Capturing
-        ``prefix_sum`` alone would hand the draft a tensor no layer ever reads.
-        So reproduce the pre-norm mixture the next layer's attention side would
-        compute (or the model's output mixing, for the last layer), leaving off
-        the consumer's own norm.
+        vLLM captures ``prefix_sum + hidden_states`` immediately after the
+        named layer. This implementation accumulates the layer output into
+        ``prefix_sum`` before returning from the layer, so that sum is already
+        represented by ``prefix_sum``. Clone because later layers may update
+        the same storage in place.
         """
-        num_layers = len(self.layers)
-        if layer_idx + 1 < num_layers:
-            consumer = self.layers[layer_idx + 1]
-            proj = consumer.self_attention_res_proj
-            norm = consumer.self_attention_res_norm
-            num_valid_blocks = consumer.prev_valid_blocks
-        else:
-            proj = self.output_attn_res_proj
-            norm = self.output_attn_res_norm
-            num_valid_blocks = ceil_div(num_layers, self.config.attn_res_block_size)
-        mixed = _apply_attn_res(
-            prefix_sum, block_residual, proj, norm, num_valid_blocks
-        )
-        # num_valid_blocks == 0 returns prefix_sum itself; the caller stores the
-        # capture past further in-place layer writes, so hand back a copy.
-        return mixed.clone() if mixed is prefix_sum else mixed
+        del layer_idx, block_residual
+        return prefix_sum.clone()
 
     @torch.no_grad()
     def forward(
@@ -1800,19 +1785,19 @@ class KimiLinearForCausalLM(BaseCausalLM):
     ) -> None:
         """Capture the K3 residual stream after each named target layer.
 
-        DFLASH/DSpark checkpoints name 0-indexed target layer *outputs*. Layer
-        ``i``'s output is only well defined as a stream once the next layer's
-        AttnRes mixing is applied to it, so ``i`` must have a successor.
+        DFLASH/DSpark checkpoints name 0-indexed completed-layer outputs. The
+        per-layer return has already accumulated the layer output into K3's
+        prefix stream, matching vLLM's target-side capture contract.
         """
         num_layers = len(self.model.layers)
         if len(set(layer_ids)) != len(layer_ids):
             raise ValueError("DFLASH target_layer_ids must be unique.")
-        invalid = [val for val in layer_ids if val < 0 or val + 1 >= num_layers]
+        invalid = [val for val in layer_ids if val < 0 or val >= num_layers]
         if invalid:
             raise ValueError(
                 "DFLASH target_layer_ids must map to capturable target layer "
                 f"outputs. Got invalid ids {invalid}; valid range is "
-                f"[0, {num_layers - 2}] for {num_layers} target layers."
+                f"[0, {num_layers - 1}] for {num_layers} target layers."
             )
         self.capture_aux_hidden_states = True
         # Ascending: the draft concatenates the taps positionally, so the

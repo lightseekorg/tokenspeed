@@ -45,6 +45,7 @@ from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
 )
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+from tokenspeed.runtime.layers.attention.page_table import expand_page_table
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
@@ -119,6 +120,7 @@ class TRTLLMMLABackend(AttentionBackend):
 
         self.max_context_len = config.context_len
         self.page_size = config.page_size
+        self._cache_logical_page_size = self.page_size
 
         # MLA dimensions
         self.kv_lora_rank = config.kv_lora_rank
@@ -129,6 +131,7 @@ class TRTLLMMLABackend(AttentionBackend):
         self.scaling = config.scaling
         self.data_type = config.kv_cache_dtype
         self.q_data_type = config.dtype
+        self.draft_block_decode = config.draft_block_decode
 
         # Workspace zero-initialized for the fused kernel semaphore.
         self.trtllm_workspace = get_trtllm_workspace_buffer(config.device)
@@ -156,6 +159,18 @@ class TRTLLMMLABackend(AttentionBackend):
             blocks = triton.cdiv(blocks, constraint) * constraint
         return blocks
 
+    def mark_cache_contract(self, logical_page_size: int | None = None) -> None:
+        """Record the scheduler page size used by an LCM-backed draft pool."""
+        if logical_page_size is None:
+            return
+        logical_page_size = int(logical_page_size)
+        if logical_page_size <= 0 or logical_page_size % self.page_size:
+            raise ValueError(
+                f"logical page size {logical_page_size} is not a positive multiple "
+                f"of the trtllm_mla kernel page size {self.page_size}"
+            )
+        self._cache_logical_page_size = logical_page_size
+
     def _create_block_kv_indices(
         self,
         batch_size: int,
@@ -165,22 +180,15 @@ class TRTLLMMLABackend(AttentionBackend):
         req_to_page: torch.Tensor,
         block_kv_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Build page-table from req_to_page using vectorized tensor indexing."""
-        if block_kv_indices is None:
-            block_kv_indices = torch.zeros(
-                (batch_size, max_blocks), dtype=torch.int32, device=self.device
-            )
-
-        copy_len = min(max_blocks, req_to_page.shape[1])
-
-        # Vectorized: gather all rows at once, no Python loop.
-        # Pages beyond actual seq_len are 0 (from req_to_page init); the kernel
-        # uses seq_lens to bound access so these padding entries are never read.
-        block_kv_indices[:batch_size, :copy_len] = req_to_page[
-            req_pool_indices[:batch_size], :copy_len
-        ]
-
-        return block_kv_indices
+        """Build the kernel page table from scheduler-owned logical page IDs."""
+        page_table = req_to_page[req_pool_indices[:batch_size]]
+        return expand_page_table(
+            page_table,
+            logical_page_size=self._cache_logical_page_size,
+            kernel_page_size=self.page_size,
+            max_kernel_pages=max_blocks,
+            out=block_kv_indices,
+        )
 
     # ---- Metadata initialization ----
 
@@ -391,6 +399,19 @@ class TRTLLMMLABackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
+    def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
+        """Publish block-end cache lengths inside a captured draft graph.
+
+        Args:
+            bs: Number of draft requests.
+            block_seq_lens: Per-request lengths after writing the draft block.
+        """
+        if not self.draft_block_decode:
+            raise RuntimeError("Block decode sequence lengths require DFLASH mode.")
+        self.cuda_graph_seq_lens_buf[:bs].copy_(
+            block_seq_lens[:bs].clamp(self.spec_num_tokens, self.max_context_len)
+        )
+
     # ---- Forward: Decode ----
 
     def forward_decode(
@@ -416,12 +437,13 @@ class TRTLLMMLABackend(AttentionBackend):
             )
 
         metadata = self.forward_decode_metadata
-        num_extends = metadata.num_extends
+        # A block drafter describes only decode rows. Older callers used
+        # num_extends=bs as an internal "whole block" convention; honoring it
+        # here slices every page-table and sequence-length row away.
+        num_extends = 0 if self.draft_block_decode else metadata.num_extends
         q_len_per_req = q.shape[0] // bs if bs > 0 else 1
 
         if q_len_per_req > 1 and self.is_draft:
-            # First draft step catching up its KV after verify: one query entry per token;
-            # per-token seq_lens advance by 1 so each successive token sees its own KV write.
             query = q.view(-1, layer.tp_q_head_num, layer.head_dim).unsqueeze(1)
             block_tables = metadata.block_kv_indices[num_extends:].repeat_interleave(
                 q_len_per_req, dim=0
@@ -429,11 +451,18 @@ class TRTLLMMLABackend(AttentionBackend):
             base_lens = metadata.seq_lens_k[num_extends:].repeat_interleave(
                 q_len_per_req
             )
-            offsets = torch.arange(
-                q_len_per_req, device=base_lens.device, dtype=base_lens.dtype
-            ).repeat(bs)
-            seq_lens = base_lens + offsets
-            max_seq_len = metadata.max_seq_len_k + q_len_per_req
+            if self.draft_block_decode:
+                # The whole latent block is written before attention, so every
+                # query sees the same block-end length (non-causal block decode).
+                seq_lens = base_lens
+                max_seq_len = metadata.max_seq_len_k
+            else:
+                # Eagle/MTP catch-up: each successive token sees one more KV.
+                offsets = torch.arange(
+                    q_len_per_req, device=base_lens.device, dtype=base_lens.dtype
+                ).repeat(bs)
+                seq_lens = base_lens + offsets
+                max_seq_len = metadata.max_seq_len_k + q_len_per_req
         else:
             # Plain decode (q_len=1) or bs-grouped multi-token decode.
             query = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)

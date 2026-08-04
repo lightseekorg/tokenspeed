@@ -353,7 +353,8 @@ def dflash_prepare_decode_kernel(
     block_ids_ptr,
     block_positions_ptr,
     out_cache_loc_ptr,
-    spec_num_tokens: tl.constexpr,
+    verify_width: tl.constexpr,
+    draft_query_width: tl.constexpr,
     page_size: tl.constexpr,
     max_pages: tl.constexpr,
     max_draft_prefix,
@@ -368,17 +369,19 @@ def dflash_prepare_decode_kernel(
     prefix_len = tl.minimum(prefix_len, max_draft_prefix)
     tl.store(draft_seq_lens_ptr + req_idx, prefix_len)
 
-    safe_accept = tl.minimum(tl.maximum(accept_len, 1), spec_num_tokens)
+    safe_accept = tl.minimum(tl.maximum(accept_len, 1), verify_width)
     current_token = tl.load(
-        output_tokens_ptr + req_idx * spec_num_tokens + safe_accept - 1
+        output_tokens_ptr + req_idx * verify_width + safe_accept - 1
     )
     tl.store(block_ids_ptr + req_idx * block_ids_stride, current_token)
 
     offsets = tl.arange(0, BLOCK_SIZE)
-    mask = offsets < spec_num_tokens
+    mask = offsets < draft_query_width
     positions = prefix_len + offsets
     tl.store(
-        block_positions_ptr + req_idx * spec_num_tokens + offsets, positions, mask=mask
+        block_positions_ptr + req_idx * draft_query_width + offsets,
+        positions,
+        mask=mask,
     )
 
     page_indices = positions // page_size
@@ -390,7 +393,9 @@ def dflash_prepare_decode_kernel(
     cache_locs = page_ids * page_size + offsets_in_page
     cache_locs = tl.where(overflow, 0, cache_locs)
     tl.store(
-        out_cache_loc_ptr + req_idx * spec_num_tokens + offsets, cache_locs, mask=mask
+        out_cache_loc_ptr + req_idx * draft_query_width + offsets,
+        cache_locs,
+        mask=mask,
     )
 
 
@@ -404,13 +409,14 @@ def dflash_prepare_decode(
     block_ids: torch.Tensor,
     block_positions: torch.Tensor,
     out_cache_loc: torch.Tensor,
-    spec_num_tokens: int,
+    verify_width: int,
+    draft_query_width: int,
     page_size: int,
     max_draft_prefix: int,
 ) -> None:
     batch_size = req_pool_indices.shape[0]
     max_pages = req_to_pages.shape[1]
-    BLOCK_SIZE = triton.next_power_of_2(spec_num_tokens)
+    BLOCK_SIZE = triton.next_power_of_2(draft_query_width)
     grid = (batch_size,)
     dflash_prepare_decode_kernel[grid](
         output_tokens,
@@ -422,7 +428,8 @@ def dflash_prepare_decode(
         block_ids,
         block_positions,
         out_cache_loc,
-        spec_num_tokens=spec_num_tokens,
+        verify_width=verify_width,
+        draft_query_width=draft_query_width,
         page_size=page_size,
         max_pages=max_pages,
         max_draft_prefix=max_draft_prefix,

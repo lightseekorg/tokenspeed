@@ -89,8 +89,15 @@ def _resolve_block_geometry(cfg, spec_num_tokens: int) -> tuple[int, int]:
     return verify_width, draft_block_size
 
 
+def _resolve_draft_query_width(verify_width: int, sample_from_anchor: bool) -> int:
+    """Resolve rows consumed by one native draft forward."""
+    return verify_width - 1 if sample_from_anchor else verify_width
+
+
 class DFlash(BaseDrafter):
     """DFlash block drafter backed by a native TokenSpeed draft model."""
+
+    sample_from_anchor = False
 
     def __init__(
         self,
@@ -125,6 +132,7 @@ class DFlash(BaseDrafter):
 
         self.device = torch.device(draft_model_runner.device)
         self.model = draft_model_runner.model
+        self.attention_kind = getattr(self.model, "attention_kind", "qwen_mha")
 
         cfg = self.model.config
         dflash_cfg = getattr(cfg, "dflash_config", {}) or {}
@@ -146,6 +154,9 @@ class DFlash(BaseDrafter):
         self.mask_token_id = int(mask_token_id)
         self.verify_width, self.draft_block_size = _resolve_block_geometry(
             cfg, int(spec_num_tokens)
+        )
+        self.draft_query_width = _resolve_draft_query_width(
+            self.verify_width, self.sample_from_anchor
         )
         # Legacy alias: callers that predate the verify/draft split.
         self.block_size = self.verify_width
@@ -171,33 +182,33 @@ class DFlash(BaseDrafter):
             (max_bs,), dtype=torch.int32, device=self.device
         )
         self.draft_out_cache_loc_buf = torch.empty(
-            (max_bs * self.spec_num_tokens,),
+            (max_bs * self.draft_query_width,),
             dtype=torch.int32,
             device=self.device,
         )
         self.draft_input_lengths_buf = torch.full(
             (max_bs,),
-            self.spec_num_tokens,
+            self.draft_query_width,
             dtype=torch.int32,
             device=self.device,
         )
         self.draft_extend_seq_lens_cpu = torch.full(
             (max_bs,),
-            self.spec_num_tokens,
+            self.draft_query_width,
             dtype=torch.int32,
             pin_memory=True,
         )
         self.block_offsets = torch.arange(
-            self.spec_num_tokens, dtype=torch.int64, device=self.device
+            self.draft_query_width, dtype=torch.int64, device=self.device
         )
         self.block_ids_buf = torch.full(
-            (max_bs, self.spec_num_tokens),
+            (max_bs, self.draft_query_width),
             self.mask_token_id,
             dtype=torch.int32,
             device=self.device,
         )
         self.block_positions_buf = torch.empty(
-            (max_bs, self.spec_num_tokens), dtype=torch.int64, device=self.device
+            (max_bs, self.draft_query_width), dtype=torch.int64, device=self.device
         )
         self.next_tokens_buf = torch.empty(
             (max_bs, self.spec_num_tokens), dtype=torch.int32, device=self.device
@@ -869,13 +880,13 @@ class DFlash(BaseDrafter):
         bs = current_tokens.shape[0]
         req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
         prefix_lens = self.draft_seq_lens_buf[:bs]
-        seq_lens_after = prefix_lens + int(self.spec_num_tokens)
+        seq_lens_after = prefix_lens + self.draft_query_width
 
         block_ids = self.block_ids_buf[:bs]
         # NOTE: callers (run/_run_overlap) write current_tokens directly into
         # block_ids_buf[:bs, 0] before invoking _draft_native
         block_positions = self.block_positions_buf[:bs]
-        cache_locs = self.draft_out_cache_loc_buf[: bs * self.spec_num_tokens]
+        cache_locs = self.draft_out_cache_loc_buf[: bs * self.draft_query_width]
         if not prepared:
             torch.add(
                 prefix_lens.unsqueeze(1),
@@ -886,7 +897,7 @@ class DFlash(BaseDrafter):
             compute_out_cache_loc_uniform(
                 out_cache_loc_ptr=cache_locs,
                 req_pool_indices=req_pool_indices,
-                uniform_input_length=self.spec_num_tokens,
+                uniform_input_length=self.draft_query_width,
                 cache_start=prefix_lens,
                 req_to_pages=self.req_to_page,
                 page_size=self.page_size,
@@ -895,10 +906,13 @@ class DFlash(BaseDrafter):
         is_capturing = (
             torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
         )
+        # MLA block rows are all decode rows. Treating them as extends makes
+        # MLA backends slice the entire block out of their decode metadata.
+        metadata_num_extends = 0 if self.attention_kind == "kimi_mla" else bs
         if not is_capturing:
             self.attn_backend.init_forward_metadata(
                 bs=bs,
-                num_extends=bs,
+                num_extends=metadata_num_extends,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens_after,
                 req_to_page=self.req_to_page,
@@ -916,8 +930,8 @@ class DFlash(BaseDrafter):
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_page=self.req_to_page,
             bs=bs,
-            num_extends=bs,
-            input_num_tokens=bs * self.spec_num_tokens,
+            num_extends=metadata_num_extends,
+            input_num_tokens=bs * self.draft_query_width,
             forward_mode=ForwardMode.DECODE,
             capture_hidden_mode=CaptureHiddenMode.FULL,
         )
@@ -941,7 +955,7 @@ class DFlash(BaseDrafter):
             raise RuntimeError(
                 "Native DFLASH draft model did not return hidden states."
             )
-        draft_hidden = draft_hidden.view(bs, self.spec_num_tokens, self.hidden_size)
+        draft_hidden = draft_hidden.view(bs, self.draft_query_width, self.hidden_size)
 
         next_tokens = self.next_tokens_buf[:bs]
         return self._sample_block(draft_hidden, block_ids, next_tokens)
@@ -996,9 +1010,11 @@ class DFlash(BaseDrafter):
         bs = base_ctx.bs
         current_tokens = self.block_ids_buf[:bs, 0]
         if base_ctx.num_extends == 0:
-            draft_cache_locs = self.draft_out_cache_loc_buf[: bs * self.spec_num_tokens]
+            draft_cache_locs = self.draft_out_cache_loc_buf[
+                : bs * self.draft_query_width
+            ]
             max_draft_prefix = (
-                self.req_to_page.shape[1] * self.page_size - self.spec_num_tokens
+                self.req_to_page.shape[1] * self.page_size - self.draft_query_width
             )
             dflash_prepare_decode(
                 output_tokens=output_tokens,
@@ -1010,7 +1026,8 @@ class DFlash(BaseDrafter):
                 block_ids=self.block_ids_buf[:bs],
                 block_positions=self.block_positions_buf[:bs],
                 out_cache_loc=draft_cache_locs,
-                spec_num_tokens=self.spec_num_tokens,
+                verify_width=self.spec_num_tokens,
+                draft_query_width=self.draft_query_width,
                 page_size=self.page_size,
                 max_draft_prefix=max_draft_prefix,
             )
@@ -1043,11 +1060,11 @@ class DFlash(BaseDrafter):
         bs = base_ctx.bs
         req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
         max_draft_prefix = (
-            self.req_to_page.shape[1] * self.page_size - self.spec_num_tokens
+            self.req_to_page.shape[1] * self.page_size - self.draft_query_width
         )
 
         current_tokens = self.block_ids_buf[:bs, 0]
-        draft_cache_locs = self.draft_out_cache_loc_buf[: bs * self.spec_num_tokens]
+        draft_cache_locs = self.draft_out_cache_loc_buf[: bs * self.draft_query_width]
         dflash_prepare_decode(
             output_tokens=output_tokens,
             accept_lengths=accept_lengths[:bs],
@@ -1058,7 +1075,8 @@ class DFlash(BaseDrafter):
             block_ids=self.block_ids_buf[:bs],
             block_positions=self.block_positions_buf[:bs],
             out_cache_loc=draft_cache_locs,
-            spec_num_tokens=self.spec_num_tokens,
+            verify_width=self.spec_num_tokens,
+            draft_query_width=self.draft_query_width,
             page_size=self.page_size,
             max_draft_prefix=max_draft_prefix,
         )

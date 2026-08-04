@@ -174,6 +174,13 @@ draft model, and token count together.
 | `--enable-cache-report` | Include cached-token counts in OpenAI-compatible usage details. |
 | `--kv-events-config` | JSON config for KV cache mutation events. Set `enable_kv_cache_events` and a publisher such as `zmq` to publish device prefix-cache stores and removals. |
 
+Set `TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS=1` to log each speculative verify
+step's committed widths and accepted draft-token counts. This reads the
+already-synchronized CPU result and does not add a GPU synchronization, but it
+is intentionally verbose and should only be enabled while debugging. For
+decode-only batches it also logs the anchor, draft candidates, target verify
+tokens, and their position-wise matches.
+
 ### Per-Request Stats
 
 `--enable-log-request-stats` enriches the scheduler's per-request finish line for

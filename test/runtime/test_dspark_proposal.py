@@ -142,8 +142,8 @@ def test_anchor_is_copied_and_drafts_fill_the_rest_of_the_block() -> None:
     _install_recording_argmax(drafter, lm_head)
 
     bs = 2
-    draft_hidden = torch.randn(bs, spec, HIDDEN)
-    block_ids = torch.full((bs, spec), 11, dtype=torch.int32)
+    draft_hidden = torch.randn(bs, spec - 1, HIDDEN)
+    block_ids = torch.full((bs, spec - 1), 11, dtype=torch.int32)
     block_ids[:, 0] = torch.tensor([4, 9], dtype=torch.int32)
     next_tokens = torch.zeros((bs, spec), dtype=torch.int32)
 
@@ -164,17 +164,17 @@ def test_each_step_reads_the_hidden_one_position_back() -> None:
     drafter = _drafter(spec_num_tokens=spec)
     lm_head = torch.zeros(VOCAB, HIDDEN)
     # Make position p's hidden select token p deterministically.
-    for p in range(spec):
+    for p in range(spec - 1):
         lm_head[p, p % HIDDEN] = 1.0
     drafter.markov_head.markov_w2.weight.data.zero_()
 
-    draft_hidden = torch.zeros(1, spec, HIDDEN)
-    for p in range(spec):
+    draft_hidden = torch.zeros(1, spec - 1, HIDDEN)
+    for p in range(spec - 1):
         draft_hidden[0, p, p % HIDDEN] = 10.0
 
     _install_recording_argmax(drafter, lm_head)
     next_tokens = torch.zeros((1, spec), dtype=torch.int32)
-    block_ids = torch.zeros((1, spec), dtype=torch.int32)
+    block_ids = torch.zeros((1, spec - 1), dtype=torch.int32)
 
     out = drafter._sample_block(draft_hidden, block_ids, next_tokens)
     # Token at column k came from hidden row k-1, which selects token k-1.
@@ -190,7 +190,7 @@ def test_the_chain_conditions_on_the_previous_proposal() -> None:
     spec = 5
     torch.manual_seed(3)
     lm_head = torch.randn(VOCAB, HIDDEN)
-    draft_hidden = torch.randn(1, spec, HIDDEN)
+    draft_hidden = torch.randn(1, spec - 1, HIDDEN)
 
     proposals = []
     for anchor in (2, 21):
@@ -199,7 +199,7 @@ def test_the_chain_conditions_on_the_previous_proposal() -> None:
         drafter.markov_head.markov_w1.weight.data.normal_(0.0, 3.0)
         drafter.markov_head.markov_w2.weight.data.normal_(0.0, 3.0)
         _install_recording_argmax(drafter, lm_head)
-        block_ids = torch.zeros((1, spec), dtype=torch.int32)
+        block_ids = torch.zeros((1, spec - 1), dtype=torch.int32)
         block_ids[0, 0] = anchor
         next_tokens = torch.zeros((1, spec), dtype=torch.int32)
         proposals.append(
@@ -215,8 +215,8 @@ def test_proposals_are_valid_token_ids() -> None:
     drafter = _drafter(spec_num_tokens=spec)
     _install_recording_argmax(drafter, torch.randn(VOCAB, HIDDEN))
     out = drafter._sample_block(
-        torch.randn(1, spec, HIDDEN),
-        torch.zeros((1, spec), dtype=torch.int32),
+        torch.randn(1, spec - 1, HIDDEN),
+        torch.zeros((1, spec - 1), dtype=torch.int32),
         torch.zeros((1, spec), dtype=torch.int32),
     )
     assert int(out.min()) >= 0

@@ -10,8 +10,11 @@ the exact set of checkpoint keys the loader must route, skip, or reject.
 from __future__ import annotations
 
 import copy
+from types import SimpleNamespace
+from unittest import mock
 
 import pytest
+import torch
 
 from tokenspeed.runtime.configs.kimi_k3_dspark_config import (
     K3_DSPARK_SKIPPED_WEIGHT_PREFIXES,
@@ -19,6 +22,8 @@ from tokenspeed.runtime.configs.kimi_k3_dspark_config import (
     k3_dspark_inactive_features,
     validate_k3_dspark_config,
 )
+from tokenspeed.runtime.models import kimi_k3_dspark as dspark_model_module
+from tokenspeed.runtime.models.kimi_k3_dspark import K3DSparkModel
 
 # The published Inferact/Kimi-K3-DSpark config.json.
 INFERACT_CONFIG = dict(
@@ -263,6 +268,31 @@ def test_confidence_head_is_reported_inactive_rather_than_dropped() -> None:
 
 def test_no_inactive_features_reported_without_a_confidence_head() -> None:
     assert k3_dspark_inactive_features(make_config(enable_confidence_head=False)) == []
+
+
+def test_final_norm_reduces_the_last_row_parallel_mlp_output() -> None:
+    model = K3DSparkModel.__new__(K3DSparkModel)
+    torch.nn.Module.__init__(model)
+    tp_group = object()
+    model.mapping = SimpleNamespace(dense=SimpleNamespace(tp_group=tp_group))
+
+    class _FinalNorm(torch.nn.Module):
+        def forward(self, hidden_states, residual):
+            return hidden_states + residual, residual
+
+    model.final_norm = _FinalNorm()
+    local_hidden = torch.tensor([[1.0, 2.0]])
+    residual = torch.tensor([[10.0, 20.0]])
+
+    with mock.patch.object(
+        dspark_model_module,
+        "all_reduce",
+        side_effect=lambda hidden, group: hidden * 8,
+    ) as reduce:
+        out = model._finalize_hidden(local_hidden, residual)
+
+    reduce.assert_called_once_with(local_hidden, tp_group)
+    torch.testing.assert_close(out, local_hidden * 8 + residual)
 
 
 def test_every_remaining_checkpoint_key_has_a_destination() -> None:

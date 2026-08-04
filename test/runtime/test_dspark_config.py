@@ -9,15 +9,25 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
+import torch
 
+from tokenspeed.runtime.execution import model_executor as model_executor_module
 from tokenspeed.runtime.execution.drafter.dflash import (
     DFlash,
     _resolve_block_geometry,
+    _resolve_draft_query_width,
 )
 from tokenspeed.runtime.execution.drafter.dspark import DSpark
-from tokenspeed.runtime.execution.model_executor import _get_drafter_impl
+from tokenspeed.runtime.execution.model_executor import ModelExecutor, _get_drafter_impl
+from tokenspeed.runtime.layers.attention.configs.base import (
+    resolve_speculative_num_tokens,
+)
+from tokenspeed.runtime.layers.attention.configs.mla import (
+    resolve_mla_kv_cache_dtype,
+)
 from tokenspeed.runtime.models.dspark import _get_markov_params
 from tokenspeed.runtime.utils.hf_transformers_utils import get_config
 
@@ -32,6 +42,45 @@ def test_geometry_splits_verify_width_from_draft_count() -> None:
         SimpleNamespace(), spec_num_tokens=8
     )
     assert (verify_width, draft_block_size) == (8, 7)
+
+
+def test_dspark_queries_one_row_per_draft_token() -> None:
+    assert _resolve_draft_query_width(verify_width=8, sample_from_anchor=True) == 7
+
+
+def test_dflash_keeps_the_anchor_plus_draft_query_layout() -> None:
+    assert _resolve_draft_query_width(verify_width=8, sample_from_anchor=False) == 8
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "is_draft", "expected"),
+    (("DSPARK", True, 7), ("DSPARK", False, 8), ("DFLASH", True, 8)),
+)
+def test_attention_query_width_matches_algorithm(
+    algorithm: str, is_draft: bool, expected: int
+) -> None:
+    args = SimpleNamespace(
+        speculative_num_draft_tokens=8,
+        speculative_algorithm=algorithm,
+    )
+    assert resolve_speculative_num_tokens(args, is_draft) == expected
+
+
+def test_k3_dspark_draft_cache_stays_bf16_when_target_cache_is_fp8() -> None:
+    args = SimpleNamespace(kv_cache_dtype="fp8_e4m3", speculative_algorithm="DSPARK")
+    config = SimpleNamespace(hf_config=SimpleNamespace(model_type="k3_dspark"))
+    assert resolve_mla_kv_cache_dtype(args, config, is_draft=True) == torch.bfloat16
+    assert (
+        resolve_mla_kv_cache_dtype(args, config, is_draft=False) == torch.float8_e4m3fn
+    )
+
+
+def test_other_mla_drafts_keep_the_requested_cache_dtype() -> None:
+    args = SimpleNamespace(kv_cache_dtype="fp8_e4m3", speculative_algorithm="DSPARK")
+    config = SimpleNamespace(hf_config=SimpleNamespace(model_type="other"))
+    assert (
+        resolve_mla_kv_cache_dtype(args, config, is_draft=True) == torch.float8_e4m3fn
+    )
 
 
 def test_geometry_accepts_torchspec_draft_count_convention() -> None:
@@ -98,6 +147,56 @@ def test_markov_params_default_to_disabled() -> None:
 
 def test_dspark_dispatches_to_dspark_drafter() -> None:
     assert _get_drafter_impl("DSPARK", SimpleNamespace()) is DSpark
+
+
+def test_step_acceptance_log_separates_committed_and_draft_tokens() -> None:
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.config = SimpleNamespace(global_rank=0, spec_num_steps=7)
+    executor.num_generated_tokens = 0
+    executor.num_decode_steps = 0
+    result = SimpleNamespace(output_lengths=torch.tensor([1, 3, 8]))
+
+    with (
+        mock.patch.object(model_executor_module, "LOG_SPEC_ACCEPT_LENGTHS", True),
+        mock.patch.object(model_executor_module.logger, "info") as log,
+    ):
+        executor.accumulate_decode_stats(result, bs=3)
+
+    assert executor.num_generated_tokens == 12
+    assert executor.num_decode_steps == 3
+    log.assert_called_once_with(
+        "Spec verify step. accept_lengths=%s, accepted_draft_tokens=%s",
+        [1, 3, 8],
+        [0, 2, 7],
+    )
+
+
+def test_step_token_log_aligns_drafts_with_predecessor_target_logits() -> None:
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.config = SimpleNamespace(
+        global_rank=0, spec_num_steps=3, spec_num_tokens=4
+    )
+    executor.num_generated_tokens = 0
+    executor.num_decode_steps = 0
+    result = SimpleNamespace(
+        output_lengths=torch.tensor([3]),
+        output_tokens=torch.tensor([11, 12, 99, 100]),
+        spec_candidate_tokens=torch.tensor([10, 11, 12, 13]),
+    )
+
+    with (
+        mock.patch.object(model_executor_module, "LOG_SPEC_ACCEPT_LENGTHS", True),
+        mock.patch.object(model_executor_module.logger, "info") as log,
+    ):
+        executor.accumulate_decode_stats(result, bs=1)
+
+    assert log.call_args_list[1] == mock.call(
+        "Spec token compare. anchor=%s, draft=%s, target=%s, match=%s",
+        [10],
+        [[11, 12, 13]],
+        [[11, 12, 99]],
+        [[True, True, False]],
+    )
 
 
 def test_dflash_dispatch_is_unchanged_by_dspark() -> None:

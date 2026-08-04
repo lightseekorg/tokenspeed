@@ -28,9 +28,30 @@ from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.layers.attention.configs.base import (
     BaseAttnConfig,
     resolve_dtype,
+    resolve_speculative_num_tokens,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.utils.server_args import ServerArgs
+
+
+def resolve_mla_kv_cache_dtype(
+    server_args: ServerArgs, model_config: ModelConfig, is_draft: bool
+) -> torch.dtype:
+    """Resolve MLA cache precision without quantizing K3 DSpark context blindly.
+
+    The public K3 DSpark checkpoint has no FP8 KV scales and its reference vLLM
+    launch uses the default BF16 cache. TokenSpeed's K3 target currently requires
+    FP8 LCM storage, but the draft owns a separate pool, so keep only that pool
+    in BF16. Other MLA drafts continue to honor the global cache setting.
+    """
+    hf_config = getattr(model_config, "hf_config", None)
+    if (
+        is_draft
+        and server_args.speculative_algorithm == "DSPARK"
+        and getattr(hf_config, "model_type", None) == "k3_dspark"
+    ):
+        return torch.bfloat16
+    return resolve_dtype(server_args.kv_cache_dtype)
 
 
 @dataclass
@@ -53,7 +74,9 @@ class MLAConfig(BaseAttnConfig):
         if server_args.speculative_algorithm is not None:
             kwargs.update(
                 speculative_num_steps=server_args.speculative_num_steps,
-                speculative_num_draft_tokens=server_args.speculative_num_draft_tokens,
+                speculative_num_draft_tokens=resolve_speculative_num_tokens(
+                    server_args, is_draft
+                ),
             )
         hf_config = getattr(model_config, "hf_config", None)
         layer_types = tuple(
@@ -77,7 +100,9 @@ class MLAConfig(BaseAttnConfig):
             head_dim=model_config.head_dim,
             attn_tp_size=server_args.attn_tp_size or server_args.mapping.attn.tp_size,
             dtype=model_config.dtype,
-            kv_cache_dtype=resolve_dtype(server_args.kv_cache_dtype),
+            kv_cache_dtype=resolve_mla_kv_cache_dtype(
+                server_args, model_config, is_draft
+            ),
             page_size=server_args.block_size,
             max_graph_bs=server_args.max_cudagraph_capture_size,
             max_bs=server_args.max_num_seqs
