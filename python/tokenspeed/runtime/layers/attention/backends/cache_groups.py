@@ -165,6 +165,13 @@ class CacheGroupsMixin:
             tables = {gid: table for gid, table in tables.items() if gid not in skip}
         return tables or None
 
+    # Defaults until _learn_cache_groups / set_cache_pool run
+    # (init_cuda_graph_state is not reached under --enforce-eager or before
+    # the first capture).
+    state_group_ids: frozenset[str] = frozenset()
+    group_page_sizes: dict[str, int] = {}
+    cache_pool = None
+
     def _learn_cache_groups(self, paged_cache_group_specs) -> None:
         """Record the pool's family="state" group ids (see
         state_group_ids) and per-group page sizes (heterogeneous block
