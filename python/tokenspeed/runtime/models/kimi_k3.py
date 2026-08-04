@@ -1098,8 +1098,8 @@ class KimiLinearMoE(nn.Module):
             if self.execution_plan.use_native
             else None
         )
-        # Dry-run exact registry selection for the optional joint decode path.
-        self._use_joint_decode = (
+        # Dry-run exact registry selection for the fused decode pipeline.
+        self._use_fused_decode_pipeline = (
             self.execution_plan.joint_moe_reduce
             and latent_moe_decode_pipeline_available(
                 self.gate.weight,
@@ -1198,12 +1198,20 @@ class KimiLinearMoE(nn.Module):
             out = all_reduce(out, self.mapping.moe.tp_ep_group)
         return out
 
-    def _forward_native_joint_decode(
+    def _forward_fused_decode_pipeline(
         self,
         hidden_states: torch.Tensor,
         prefix_sum: torch.Tensor,
     ) -> torch.Tensor:
-        """Fuse K3 decode input projections and routed/shared expert execution."""
+        """Run the fused multi-launch K3 decode pipeline.
+
+        One input-projection launch produces router logits, the routed latent,
+        and the activated shared input. The expert launch combines routed
+        W13/W2 with the shared down projection, then one collective reduces
+        both partials. The final routed up projection adds ``prefix_sum`` and
+        the shared output in its epilogue. Top-k and the optional routed norm
+        remain separate launches.
+        """
 
         router_logits, routed_input, shared_input = latent_moe_input_projections(
             hidden_states,
@@ -1263,8 +1271,8 @@ class KimiLinearMoE(nn.Module):
         the up-projection's store performs the accumulate in-kernel.
         """
         if self.native_latent_moe is not None:
-            if self._use_joint_decode and hidden_states.shape[0] == 1:
-                return self._forward_native_joint_decode(hidden_states, prefix_sum)
+            if self._use_fused_decode_pipeline and hidden_states.shape[0] == 1:
+                return self._forward_fused_decode_pipeline(hidden_states, prefix_sum)
             routed_latent, shared_out = self.native_latent_moe(
                 hidden_states,
                 num_global_tokens=num_global_tokens,
