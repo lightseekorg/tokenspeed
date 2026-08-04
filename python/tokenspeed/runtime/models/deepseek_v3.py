@@ -1019,26 +1019,36 @@ class DeepseekV3AttentionMLA(nn.Module):
 
         # FP8 prefill: fused RoPE + FP8 quantize, direct FP8 KV cache write.
         # Disabled when k_scale != 1.0; mla_fp8_utils.py documents the current limitation.
+        # NoPE models (rotary_emb is None, e.g. Kimi-K3) quantize standalone:
+        # the quantize is otherwise fused into the RoPE kernel, and leaving
+        # them on the BF16 kernel meant a JIT compile of a variant the backend
+        # never pre-warms.
         k_scale = getattr(self.attn_mha, "k_scale_float", 1.0)
         use_fp8_prefill = (
             self.attention_backend in self._MLA_KERNEL_BACKENDS
             and getattr(ctx.attn_backend, "data_type", None) == torch.float8_e4m3fn
-            and self.rotary_emb is not None
             and k_scale == 1.0
         )
 
         if use_fp8_prefill:
-            # Expand k_pe from [tokens,1,rope] to [tokens,heads,rope] for GQA
-            k_pe_expanded = k_pe.expand(-1, self.num_local_heads, -1)
+
+            if self.rotary_emb is not None:
+                k_rope = k_pe.expand(-1, self.num_local_heads, -1)
+                cos_sin_cache = self.rotary_emb.cos_sin_cache
+                is_neox = self.rotary_emb.is_neox_style
+            else:
+                k_rope = k_pe
+                cos_sin_cache = None
+                is_neox = False
 
             q_fp8, k_fp8 = apply_rope_mla(
                 positions=positions,
                 q_rope=q_pe,
-                k_rope=k_pe_expanded,
+                k_rope=k_rope,
                 q_nope=q_nope,
                 k_nope=k_nope,
-                cos_sin_cache=self.rotary_emb.cos_sin_cache,
-                is_neox=getattr(self.rotary_emb, "is_neox_style", True),
+                cos_sin_cache=cos_sin_cache,
+                is_neox=is_neox,
                 quant_scale_q=1.0,
                 quant_scale_kv=k_scale,
                 enable_pdl=pdl_enabled(),

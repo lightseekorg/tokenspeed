@@ -1003,7 +1003,10 @@ class CuteDSLMLABackend(AttentionBackend):
             v = v.to(torch.float8_e4m3fn)
 
         if not CuteDSLMLABackend._logged_prefill:
-            logger.info("CuteDSL MLA prefill kernel invoked (tokenspeed_mla_prefill)")
+            logger.info(
+                "CuteDSL MLA prefill kernel invoked (tokenspeed_mla_prefill, "
+                f"q_dtype={q.dtype})"
+            )
             CuteDSLMLABackend._logged_prefill = True
 
         result = tokenspeed_mla_prefill(
