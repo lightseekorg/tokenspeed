@@ -33,7 +33,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
-    from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 
 
 @dataclass
@@ -42,7 +42,7 @@ class ForwardContext:
 
     # --- attention infrastructure ---
     attn_backend: AttentionBackend
-    token_to_kv_pool: BaseTokenToKVPool
+    token_to_kv_pool: CachePool
 
     # --- meta data ---
     bs: int

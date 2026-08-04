@@ -485,17 +485,17 @@ class KimiK3LcmPlanTests(unittest.TestCase):
 
     @staticmethod
     def _plan(cfg, tp):
-        from tokenspeed.runtime.configs.kimi_k3_cache_spec import (
-            plan_kimi_k3_lcm_cache,
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
+            solve_kimi_k3_cache_layout,
         )
 
-        return plan_kimi_k3_lcm_cache(
+        layout = solve_kimi_k3_cache_layout(
             cfg,
             tp_size=tp,
             mla_cache_dtype=torch.float8_e4m3fn,
             mla_quant_method=None,
-            num_lcm_blocks=64,
         )
+        return layout.with_num_lcm_blocks(64)
 
     def test_linear_packing_scales_with_attn_tp(self):
         """KDA pages pack into an MLA-sized plane, so tp=16 -- where the KDA

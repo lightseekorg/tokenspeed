@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
-    from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 
 
@@ -47,7 +47,7 @@ class BaseDrafter:
         page_size: int | None = None,
         req_to_page: torch.Tensor | None = None,
         attn_backend: AttentionBackend | None = None,
-        token_to_kv_pool: BaseTokenToKVPool | None = None,
+        token_to_kv_pool: CachePool | None = None,
         vocab_size: int | None = None,
     ):
         self.spec_num_tokens = spec_num_tokens

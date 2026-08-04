@@ -5,6 +5,7 @@ import unittest
 from contextlib import redirect_stderr
 from io import StringIO
 from types import MethodType, SimpleNamespace
+from typing import ClassVar
 from unittest.mock import patch
 
 # CI Registration (parsed via AST, runtime no-op)
@@ -71,16 +72,17 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     deepseek_v4_compute_global_topk_indices_and_lens,
     fused_qnorm_rope_kv_insert,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
+from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
     DeepseekV4CacheMetadata,
-    DeepseekV4TokenToKVPool,
+    HybridDeepseekV4TokenToKVPool,
     _group_slot_mapping_from_raw,
     _mask_invalid_graph_tokens,
     _split_paged_cache_block_tables_into_v4_metadata,
+    build_deepseek_v4_cache_fields,
     deepseek_v4_cache_layout_from_config,
 )
-from tokenspeed.runtime.layers.attention.registry import (
-    _resolve_draft_cache_cell_size_for_profile,
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
+    solve_deepseek_v4_memory_layout,
 )
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.quantization import QUANTIZATION_METHODS
@@ -123,6 +125,38 @@ from tokenspeed.runtime.utils.hf_transformers_utils import (
     prefers_deepseek_v4_tokenizer,
 )
 from tokenspeed.runtime.utils.server_args import ServerArgs
+
+
+def _make_planned_deepseek_v4_pool(
+    layout,
+    hf_config,
+    *,
+    num_lcm_blocks: int = 2,
+):
+    fields = build_deepseek_v4_cache_fields(
+        layout,
+        sliding_window=int(hf_config.sliding_window),
+        logical_block_tokens=256,
+    )
+    plan = solve_deepseek_v4_memory_layout(fields).with_num_lcm_blocks(num_lcm_blocks)
+    max_packing = max(group.cache_blocks_per_lcm_block for group in plan.groups)
+    pool_size = num_lcm_blocks * max_packing * plan.logical_block_tokens
+    pool = HybridDeepseekV4TokenToKVPool(
+        size=pool_size,
+        model_dtype=torch.bfloat16,
+        layout=layout,
+        layer_num=len(layout.layer_ratio),
+        device="cpu",
+        enable_memory_saver=False,
+        max_batch_size=2,
+        max_context_len=1024,
+        page_size=layout.page_size,
+        rank=0,
+        hf_config=hf_config,
+        memory_plan=plan,
+        token_capacity=pool_size,
+    )
+    return pool, plan
 
 
 def _make_deepseek_v4_forward_metadata(
@@ -264,7 +298,7 @@ def _mhc_post_reference(
 
 
 class TestDeepseekV4Config(unittest.TestCase):
-    quant_config = {
+    quant_config: ClassVar = {
         "quant_method": "fp8",
         "activation_scheme": "dynamic",
         "scale_fmt": "ue8m0",
@@ -1197,7 +1231,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 get_mla_metadata,
             )
             from tokenspeed_kernel.registry import error_fn
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - optional kernel import
             self.skipTest(f"FlashMLA wrapper unavailable: {exc}")
         if (
             flash_mla_with_kvcache is error_fn
@@ -1334,47 +1368,12 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(layout.swa_token_stride, 576)
         self.assertEqual(layout.swa_scale_dim, 8)
         self.assertEqual(layout.swa_row_bytes, 584)
-        self.assertEqual(layout.swa_cell_bytes(), 585)
-        self.assertEqual(layout.compressed_cell_bytes(4), 585)
-        self.assertEqual(layout.compressed_cell_bytes(128), 27)
         self.assertEqual(layout.state_width(0), 512)
         self.assertEqual(layout.state_width(1), 1024)
         self.assertEqual(layout.state_width(2), 512)
         self.assertEqual(layout.state_width(1, indexer=True), 256)
         self.assertEqual(layout.indexer_row_bytes, 132)
         self.assertEqual(layout_fp4.indexer_row_bytes, 68)
-
-    def test_deepseek_v4_profile_uses_grouped_draft_cache_cell_size(self):
-        class GenericDraftAttnConfig:
-            def cache_cell_size(self):
-                return 11
-
-        draft_model_config = SimpleNamespace(num_attention_layers=3)
-
-        self.assertEqual(
-            _resolve_draft_cache_cell_size_for_profile(
-                GenericDraftAttnConfig(),
-                draft_model_config,
-                draft_profile_cache_cell_size=777,
-            ),
-            777,
-        )
-        self.assertEqual(
-            _resolve_draft_cache_cell_size_for_profile(
-                GenericDraftAttnConfig(),
-                draft_model_config,
-                draft_profile_cache_cell_size=None,
-            ),
-            33,
-        )
-        self.assertEqual(
-            _resolve_draft_cache_cell_size_for_profile(
-                None,
-                None,
-                draft_profile_cache_cell_size=None,
-            ),
-            0,
-        )
 
     def test_deepseek_v4_cache_layout_can_slice_mtp_layer_range(self):
         config = SimpleNamespace(
@@ -1392,7 +1391,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
 
         self.assertEqual(layout.layer_ratio, (1,))
-        self.assertEqual(layout.cache_cell_size(1), layout.swa_cell_bytes())
         with self.assertRaisesRegex(ValueError, "out of range"):
             deepseek_v4_cache_layout_from_config(
                 config,
@@ -1457,34 +1455,39 @@ class TestDeepseekV4Config(unittest.TestCase):
             use_fp4_indexer_cache=True,
         )
 
-        self.assertEqual(layout.cache_cell_size(3), 16771)
+        pool, plan = _make_planned_deepseek_v4_pool(layout, config)
 
-        pool = DeepseekV4TokenToKVPool(
-            size=128,
-            model_dtype=torch.bfloat16,
-            layout=layout,
-            layer_num=3,
-            device="cpu",
-            enable_memory_saver=False,
-            max_batch_size=2,
-            max_context_len=128,
-            page_size=64,
-            rank=0,
-            hf_config=config,
-            max_scheduled_tokens=1,
-        )
-
-        self.assertEqual(tuple(pool.get_swa_kv_buffer(0).shape), (8, 37440))
-        self.assertIsNone(pool.compressed_kv_buffer[0])
-        self.assertEqual(tuple(pool.get_compressed_kv_buffer_2d(1).shape), (4, 37440))
-        self.assertEqual(tuple(pool.get_compressor_state_buffer(1).shape), (8, 4, 2048))
         self.assertEqual(
-            tuple(pool.get_compressor_state_buffer(2).shape), (36, 8, 1024)
+            tuple(pool.get_swa_kv_buffer(0).shape),
+            (plan.group("v4.swa_kv").page_count, 37440),
+        )
+        self.assertIsNone(pool.compressed_kv_buffer[0])
+        self.assertEqual(
+            tuple(pool.get_compressed_kv_buffer_2d(1).shape),
+            (plan.group("v4.c4a.compressed_kv").page_count, 37440),
+        )
+        self.assertEqual(
+            tuple(pool.get_compressor_state_buffer(1).shape),
+            (plan.group("v4.c4a.compressor_state").page_count, 4, 2048),
+        )
+        self.assertEqual(
+            tuple(pool.get_compressor_state_buffer(2).shape),
+            (plan.group("v4.c128a.compressor_state").page_count, 8, 1024),
         )
         self.assertEqual(pool.get_compressor_state_buffer(1).dtype, torch.float32)
         self.assertEqual(pool.get_compressor_state_buffer(2).dtype, torch.float32)
-        self.assertEqual(tuple(pool.get_indexer_kv_buffer_2d(1).shape), (4, 64 * 68))
-        self.assertEqual(tuple(pool.get_indexer_state_buffer(1).shape), (8, 4, 512))
+        self.assertEqual(
+            tuple(pool.get_indexer_kv_buffer_2d(1).shape),
+            (plan.group("v4.c4a.compressed_kv").page_count, 64 * 68),
+        )
+        self.assertEqual(
+            tuple(pool.get_indexer_state_buffer(1).shape),
+            (
+                plan.group("v4.c4a.indexer_compressor_state").page_count,
+                4,
+                512,
+            ),
+        )
         self.assertEqual(pool.get_indexer_state_buffer(1).dtype, torch.float32)
 
     def test_deepseek_v4_kv_pool_uses_compressed_storage_blocks_for_page256(self):
@@ -1500,26 +1503,19 @@ class TestDeepseekV4Config(unittest.TestCase):
             page_size=256,
             use_fp4_indexer_cache=True,
         )
-        pool = DeepseekV4TokenToKVPool(
-            size=512,
-            model_dtype=torch.bfloat16,
-            layout=layout,
-            layer_num=3,
-            device="cpu",
-            enable_memory_saver=False,
-            max_batch_size=2,
-            max_context_len=512,
-            page_size=256,
-            rank=0,
-            hf_config=config,
-            max_scheduled_tokens=1,
-        )
+        pool, plan = _make_planned_deepseek_v4_pool(layout, config)
 
         self.assertEqual(pool.swa_block_size, 64)
         self.assertEqual(pool.get_compressed_block_size(1), 64)
         self.assertEqual(pool.get_compressed_block_size(2), 2)
-        self.assertEqual(tuple(pool.get_compressed_kv_buffer_2d(1).shape), (5, 37440))
-        self.assertEqual(tuple(pool.get_indexer_kv_buffer_2d(1).shape), (5, 64 * 68))
+        self.assertEqual(
+            tuple(pool.get_compressed_kv_buffer_2d(1).shape),
+            (plan.group("v4.c4a.compressed_kv").page_count, 37440),
+        )
+        self.assertEqual(
+            tuple(pool.get_indexer_kv_buffer_2d(1).shape),
+            (plan.group("v4.c4a.compressed_kv").page_count, 64 * 68),
+        )
 
     def test_deepseek_v4_kv_pool_rejects_nonpositive_size(self):
         config = SimpleNamespace(
@@ -1536,7 +1532,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "must be positive"):
-            DeepseekV4TokenToKVPool(
+            HybridDeepseekV4TokenToKVPool(
                 size=0,
                 model_dtype=torch.bfloat16,
                 layout=layout,
@@ -1548,7 +1544,14 @@ class TestDeepseekV4Config(unittest.TestCase):
                 page_size=64,
                 rank=0,
                 hf_config=config,
-                max_scheduled_tokens=1,
+                memory_plan=solve_deepseek_v4_memory_layout(
+                    build_deepseek_v4_cache_fields(
+                        layout,
+                        sliding_window=128,
+                        logical_block_tokens=256,
+                    )
+                ).with_num_lcm_blocks(1),
+                token_capacity=256,
             )
 
     def test_deepseek_v4_group_slot_mapping_consumes_compact_base_offsets(self):
@@ -2107,7 +2110,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "layer_num"):
-            DeepseekV4TokenToKVPool(
+            HybridDeepseekV4TokenToKVPool(
                 size=128,
                 model_dtype=torch.bfloat16,
                 layout=layout,
@@ -2119,7 +2122,14 @@ class TestDeepseekV4Config(unittest.TestCase):
                 page_size=64,
                 rank=0,
                 hf_config=config,
-                max_scheduled_tokens=1,
+                memory_plan=solve_deepseek_v4_memory_layout(
+                    build_deepseek_v4_cache_fields(
+                        layout,
+                        sliding_window=128,
+                        logical_block_tokens=256,
+                    )
+                ).with_num_lcm_blocks(1),
+                token_capacity=256,
             )
 
     def test_deepseek_v4_metadata_maps_compressed_slots(self):
@@ -3578,20 +3588,22 @@ class TestDeepseekV4Config(unittest.TestCase):
                 torch.tensor([[10], [20], [30]], dtype=torch.int32)
             )
 
-        with patch.dict(global_server_args_dict, {"max_model_len": None}):
-            with patch.object(
+        with (
+            patch.dict(global_server_args_dict, {"max_model_len": None}),
+            patch.object(
                 deepseek_v4_model,
                 "deepseek_v4_indexer_decode_metadata_compute",
                 fake_decode_metadata_compute,
-            ):
-                plan = deepseek_v4_model._deepseek_v4_indexer_decode_plan(
-                    positions=positions,
-                    token_to_req_indices=token_to_req_indices,
-                    block_table=block_table,
-                    cache_block_size=4,
-                    compress_ratio=4,
-                    is_valid_token=torch.tensor([True, False, True]),
-                )
+            ),
+        ):
+            plan = deepseek_v4_model._deepseek_v4_indexer_decode_plan(
+                positions=positions,
+                token_to_req_indices=token_to_req_indices,
+                block_table=block_table,
+                cache_block_size=4,
+                compress_ratio=4,
+                is_valid_token=torch.tensor([True, False, True]),
+            )
 
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["max_blocks"], 1)
@@ -3821,30 +3833,37 @@ class TestDeepseekV4Config(unittest.TestCase):
             max_context_len=1,
         )
 
-        with patch.object(
-            deepseek_v4_model,
-            "deepseek_v4_prepare_indexer_q_mxfp4",
-            side_effect=fake_prepare_mxfp4,
-        ), patch.object(
-            deepseek_v4_model,
-            "_deepseek_v4_deepgemm_fp4_indexer_available",
-            return_value=True,
-        ), patch.object(
-            deepseek_v4_model,
-            "_deepseek_v4_indexer_prefill_metadata",
-            return_value=empty_prefill_metadata,
-        ), patch.object(
-            deepseek_v4_model,
-            "_deepseek_v4_indexer_decode_plan",
-            return_value=decode_metadata,
-        ), patch.object(
-            deepseek_v4_model,
-            "_deepseek_v4_indexer_decode_schedule_metadata",
-            return_value=None,
-        ), patch.object(
-            deepseek_v4_model,
-            "_deepseek_v4_sparse_attn_indexer",
-            side_effect=fake_sparse_indexer,
+        with (
+            patch.object(
+                deepseek_v4_model,
+                "deepseek_v4_prepare_indexer_q_mxfp4",
+                side_effect=fake_prepare_mxfp4,
+            ),
+            patch.object(
+                deepseek_v4_model,
+                "_deepseek_v4_deepgemm_fp4_indexer_available",
+                return_value=True,
+            ),
+            patch.object(
+                deepseek_v4_model,
+                "_deepseek_v4_indexer_prefill_metadata",
+                return_value=empty_prefill_metadata,
+            ),
+            patch.object(
+                deepseek_v4_model,
+                "_deepseek_v4_indexer_decode_plan",
+                return_value=decode_metadata,
+            ),
+            patch.object(
+                deepseek_v4_model,
+                "_deepseek_v4_indexer_decode_schedule_metadata",
+                return_value=None,
+            ),
+            patch.object(
+                deepseek_v4_model,
+                "_deepseek_v4_sparse_attn_indexer",
+                side_effect=fake_sparse_indexer,
+            ),
         ):
             actual = DeepseekV4Indexer._forward_sparse_indexer_custom_op(
                 self_obj,

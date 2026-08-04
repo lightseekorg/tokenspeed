@@ -493,21 +493,13 @@ def _sconv_apply(
             )
         if conv_group == "kvconv":
             checkpoint_group = "kvconv"
-            checkpoint_buffers = (
-                ctx.token_to_kv_pool.get_lcm_field(
-                    f"layer.{layer_id}.kvconv_k", torch.bfloat16
-                ),
-                ctx.token_to_kv_pool.get_lcm_field(
-                    f"layer.{layer_id}.kvconv_v", torch.bfloat16
-                ),
+            checkpoint_buffers = ctx.token_to_kv_pool.kvconv_checkpoint_buffers(
+                layer_id
             )
         elif conv_group in ("attnconv", "mlpconv"):
             checkpoint_group = "hiddenconv"
             checkpoint_buffers = (
-                ctx.token_to_kv_pool.get_lcm_field(
-                    f"layer.{layer_id}.{conv_group}",
-                    ctx.token_to_kv_pool.conv_col_dtype,
-                ),
+                ctx.token_to_kv_pool.hiddenconv_checkpoint_buffer(layer_id, conv_group),
             )
         if checkpoint_buffers:
             backend.register_shortconv_checkpoint_stream(

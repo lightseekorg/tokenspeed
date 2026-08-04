@@ -926,7 +926,9 @@ class InklingAttnBackend(AttentionBackend):
             or lhs.stride() != rhs.stride()
             for lhs, rhs in zip(existing, buffers)
         ):
-            raise RuntimeError(f"ShortConv checkpoint stream {key!r} changed backing")
+            raise RuntimeError(
+                f"ShortConv checkpoint stream {key!r} changed storage buffer"
+            )
 
     def _publish_accepted_shortconv_checkpoints(
         self, accept_lengths: torch.Tensor

@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""MLA interfaces backed by one LCM cache arena."""
+"""Paged latent-KV and KDA-state cache."""
 
 from __future__ import annotations
 
@@ -27,23 +27,21 @@ from dataclasses import replace
 
 import numpy as np
 import torch
-
 from tokenspeed.runtime.configs import paged_cache_spec
 from tokenspeed.runtime.configs.cache_runtime import (
     PagedCacheRuntimeContract,
 )
-from tokenspeed.runtime.configs.lcm_memory_plan import LcmMemoryPlan
-from tokenspeed.runtime.layers.attention.kv_cache.lcm import LcmCachePool
 from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
+from tokenspeed.runtime.layers.attention.kv_cache.plan import CacheMemoryPlan
 
 
-class LcmMLATokenToKVPool(MLATokenToKVPool):
-    """MLA compute interface whose latent KV and KDA state share one arena."""
+class HybridKDATokenToKVPool(MLATokenToKVPool):
+    """MLA compute interface whose latent KV and KDA state share one buffer."""
 
     def __init__(
         self,
         *,
-        memory_plan: LcmMemoryPlan,
+        memory_plan: CacheMemoryPlan,
         layer_group_ids: tuple[str, ...],
         layer_types: tuple[str, ...],
         max_scheduled_tokens: int = 0,
@@ -52,7 +50,6 @@ class LcmMLATokenToKVPool(MLATokenToKVPool):
         token_capacity: int | None = None,
         **kwargs,
     ):
-        self._lcm_memory_plan = memory_plan
         self._layer_types = tuple(layer_types)
         self.layer_cache_group_ids = tuple(layer_group_ids)
         self._group_ids_by_layer = dict(enumerate(self.layer_cache_group_ids))
@@ -61,19 +58,36 @@ class LcmMLATokenToKVPool(MLATokenToKVPool):
         )
         self._pd_disaggregation_enabled = pd_disaggregation_enabled
         self._state_field_dtypes = dict(state_field_dtypes or {})
-        self.lcm_pool: LcmCachePool | None = None
         self._state_buffers_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self.paged_cache_requires_page_zeroing = True
 
         layer_num = kwargs["layer_num"]
         if len(self._layer_types) != layer_num:
-            raise ValueError("LCM layer types must cover every model layer")
+            raise ValueError("cache layer types must cover every model layer")
         if len(self.layer_cache_group_ids) != layer_num:
-            raise ValueError("LCM cache group ids must cover every model layer")
+            raise ValueError("cache group ids must cover every model layer")
 
-        max_live_requests = kwargs["max_batch_size"]
-        max_context_len = kwargs["max_context_len"]
-        super().__init__(**kwargs)
+        super().__init__(
+            max_scheduled_tokens=max_scheduled_tokens,
+            memory_plan=memory_plan,
+            **kwargs,
+        )
+        self.runtime_contract = PagedCacheRuntimeContract(
+            block_size=self.page_size,
+            num_lcm_blocks=memory_plan.num_lcm_blocks,
+            token_capacity=self._token_capacity,
+            group_specs=self.paged_cache_group_specs,
+            group_page_counts=self.paged_cache_group_page_counts,
+        )
+
+    def _publish_paged_cache_groups(
+        self,
+        *,
+        max_live_requests: int,
+        max_scheduled_tokens: int,
+        max_total_tokens: int,
+        max_context_len: int,
+    ) -> tuple[list[paged_cache_spec.PagedCacheGroupSpec], dict[str, int]]:
         published = paged_cache_spec.publish_paged_cache_groups(
             layer_types=self._layer_types,
             group_ids=self.layer_cache_group_ids,
@@ -81,15 +95,15 @@ class LcmMLATokenToKVPool(MLATokenToKVPool):
             page_size=self.page_size,
             cache_blocks_per_lcm_block={
                 group.group_id: group.cache_blocks_per_lcm_block
-                for group in memory_plan.groups
+                for group in self.plan.groups
             },
             max_live_requests=max_live_requests,
             max_scheduled_tokens=max_scheduled_tokens,
-            max_total_tokens=self.size,
+            max_total_tokens=max_total_tokens,
             max_context_len=max_context_len,
         )
         if published is None:
-            raise RuntimeError("MLA LCM cache requires cache-group scheduling")
+            raise RuntimeError("KDA cache requires cache-group scheduling")
         specs, counts = published
         if self._pd_disaggregation_enabled:
             specs = [
@@ -101,40 +115,30 @@ class LcmMLATokenToKVPool(MLATokenToKVPool):
                 )
                 for spec in specs
             ]
-        counts.update(
-            {group.group_id: group.page_count for group in memory_plan.groups}
-        )
-        self.paged_cache_group_specs = tuple(specs)
-        self.paged_cache_group_page_counts = counts
-        self.runtime_contract = PagedCacheRuntimeContract(
-            block_size=self.page_size,
-            num_lcm_blocks=memory_plan.num_lcm_blocks,
-            token_capacity=self._token_capacity,
-            group_specs=self.paged_cache_group_specs,
-            group_page_counts=self.paged_cache_group_page_counts,
-        )
+        counts.update({group.group_id: group.page_count for group in self.plan.groups})
+        return specs, counts
 
     def _create_buffers(self) -> None:
         with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
-            self._create_lcm_buffers()
+            self._bind_buffers()
 
-    def _create_lcm_buffers(self) -> None:
-        plan = self._lcm_memory_plan
+    def _bind_buffers(self) -> None:
         if self.quant_method == "per_token_head":
-            raise ValueError("MLA LCM cache does not support per-token-head KV")
-        if plan.logical_block_tokens != self.page_size:
+            raise ValueError("KDA cache does not support per-token-head KV")
+        if self.plan.logical_block_tokens != self.page_size:
             raise ValueError(
-                f"LCM plan P={plan.logical_block_tokens} does not match "
+                f"cache plan P={self.plan.logical_block_tokens} does not match "
                 f"pool page_size={self.page_size}"
             )
-        max_packing = max(group.cache_blocks_per_lcm_block for group in plan.groups)
-        expected_size = plan.num_lcm_blocks * max_packing * self.page_size
+        max_packing = max(
+            group.cache_blocks_per_lcm_block for group in self.plan.groups
+        )
+        expected_size = self.plan.num_lcm_blocks * max_packing * self.page_size
         if self.size != expected_size:
             raise ValueError(
-                f"LCM pool size {self.size} does not match child capacity "
+                f"cache pool size {self.size} does not match child capacity "
                 f"{expected_size}"
             )
-        self.lcm_pool = LcmCachePool(plan, self.device)
         self.kv_buffer = [None] * self.layer_num
         for layer_id, label in enumerate(self._layer_types):
             if label in paged_cache_spec.STATE_LAYER_TYPES:
@@ -145,32 +149,29 @@ class LcmMLATokenToKVPool(MLATokenToKVPool):
                     recurrent_dtype = self._state_field_dtypes[recurrent_id]
                 except KeyError as exc:
                     raise ValueError(
-                        f"LCM state field {exc.args[0]!r} has no dtype"
+                        f"cache state field {exc.args[0]!r} has no dtype"
                     ) from exc
-                conv = self.lcm_pool.field(
+                conv = self.field(
                     conv_id,
                     conv_dtype,
                 )
-                recurrent = self.lcm_pool.field(
+                recurrent = self.field(
                     recurrent_id,
                     recurrent_dtype,
                 )
                 self._state_buffers_by_layer[layer_id] = (conv, recurrent)
                 continue
-            latent = self.lcm_pool.field(
-                f"layer.{layer_id}.latent_kv", self.store_dtype
-            )
+            latent = self.field(f"layer.{layer_id}.latent_kv", self.store_dtype)
             page_elements = int(np.prod(latent.shape[1:]))
             if latent.stride(0) != page_elements:
                 raise ValueError(
                     f"layer {layer_id} latent pages have padding between pages"
                 )
             self.kv_buffer[layer_id] = latent.view(-1, 1, self.kv_cache_dim)
-        self.supports_hierarchical_kv_cache = False
 
     @property
     def num_lcm_blocks(self) -> int:
-        return self._lcm_memory_plan.num_lcm_blocks
+        return self.plan.num_lcm_blocks
 
     @property
     def state_slabs(self) -> list[tuple[torch.Tensor, torch.Tensor]]:
@@ -181,9 +182,9 @@ class LcmMLATokenToKVPool(MLATokenToKVPool):
         return self._pd_disaggregation_enabled
 
     def get_pd_cache_contract(self):
-        if not self.supports_disaggregation or self.lcm_pool is None:
-            raise RuntimeError("Paged cache PD requires an enabled MLA LCM pool")
-        return self.lcm_pool.pd_contract(self.paged_cache_group_specs)
+        if not self.supports_disaggregation:
+            raise RuntimeError("paged cache PD requires an enabled KDA pool")
+        return self.pd_contract(self.paged_cache_group_specs)
 
     def group_id_for_layer(self, layer_id: int) -> str:
         try:
@@ -194,9 +195,9 @@ class LcmMLATokenToKVPool(MLATokenToKVPool):
     def get_component(self, layer_id: int, component_name: str) -> torch.Tensor:
         if component_name == "latent_kv":
             buffer = self.kv_buffer[layer_id]
-            if buffer is None or self.lcm_pool is None:
+            if buffer is None:
                 raise ValueError(f"layer {layer_id} has no MLA latent cache")
-            return self.lcm_pool.field(f"layer.{layer_id}.latent_kv", self.store_dtype)
+            return self.field(f"layer.{layer_id}.latent_kv", self.store_dtype)
         try:
             conv, recurrent = self._state_buffers_by_layer[layer_id]
         except KeyError as exc:
@@ -215,28 +216,19 @@ class LcmMLATokenToKVPool(MLATokenToKVPool):
 
     def zero_new_pages(self, new_page_ids: dict[str, list[int]]) -> None:
         if new_page_ids:
-            assert self.lcm_pool is not None
-            self.lcm_pool.zero_pages(new_page_ids)
+            self.zero_blocks(new_page_ids)
 
     @torch.no_grad()
     def clear_kv_buffers(self) -> None:
-        assert self.lcm_pool is not None
-        self.lcm_pool.backing.zero_()
+        assert self.buffer is not None
+        self.buffer.zero_()
 
     def get_kv_size_bytes(self):
-        assert self.lcm_pool is not None
-        return self.lcm_pool.backing.nbytes
+        assert self.buffer is not None
+        return self.buffer.nbytes
 
     def get_contiguous_buf_infos(self):
-        raise RuntimeError("MLA LCM transfer uses get_pd_cache_contract()")
+        raise RuntimeError("KDA transfer uses get_pd_cache_contract()")
 
     def get_layerwise_buf_info_offsets(self, start_idx=0):
-        raise RuntimeError("MLA LCM transfer uses get_pd_cache_contract()")
-
-    def get_cpu_copy(self, token_indices: list[int]) -> torch.Tensor:
-        raise RuntimeError("MLA LCM cache does not use hierarchical copy")
-
-    def load_cpu_copy(
-        self, kv_cache_cpu: torch.Tensor, token_indices: list[int]
-    ) -> None:
-        raise RuntimeError("MLA LCM cache does not use hierarchical copy")
+        raise RuntimeError("KDA transfer uses get_pd_cache_contract()")

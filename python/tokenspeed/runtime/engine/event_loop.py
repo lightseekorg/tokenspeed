@@ -260,7 +260,6 @@ class EventLoop:
             max_scheduled_tokens = aligned_max_scheduled_tokens(
                 server_args.chunked_prefill_size,
                 paged_cache_groups,
-                geometry.page_size,
             )
             if max_scheduled_tokens != server_args.chunked_prefill_size:
                 logger.warning(

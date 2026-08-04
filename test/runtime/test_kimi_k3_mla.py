@@ -118,10 +118,7 @@ def test_pool_mla_views_are_no_copy_and_layer_gated() -> None:
     assert key.shape == ((2 * 12 + 1) * page_size, 1, _LATENT_DIM)
     assert key.dtype == torch.float8_e4m3fn
     assert key.data_ptr() == component.data_ptr()
-    assert (
-        key.untyped_storage().data_ptr()
-        == pool.lcm_pool.backing.untyped_storage().data_ptr()
-    )
+    assert key.untyped_storage().data_ptr() == pool.buffer.untyped_storage().data_ptr()
 
     value = pool.get_value_buffer(layer_id)
     assert value.shape[-1] == _KV_LORA_RANK

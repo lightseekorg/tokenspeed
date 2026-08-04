@@ -290,7 +290,7 @@ def deepseek_v4_lcm_blocks_needed(
     if token_capacity <= 0:
         raise ValueError("token_capacity must be positive")
     for spec in specs:
-        cache_block_tokens = int(spec.rows_per_page) * int(spec.entry_stride_tokens)
+        cache_block_tokens = spec.cache_block_tokens
         if cache_block_tokens <= 0 or logical_block_tokens % cache_block_tokens:
             raise ValueError(
                 f"group {spec.group_id!r} cache block tokens must divide "
@@ -313,7 +313,7 @@ def deepseek_v4_lcm_blocks_needed(
     return parents
 
 
-def deepseek_v4_token_capacity_for_lcm_pool(
+def deepseek_v4_token_capacity_for_cache_pool(
     specs: Sequence[PagedCacheGroupSpec],
     *,
     logical_block_tokens: int,
@@ -386,7 +386,7 @@ __all__ = [
     "deepseek_v4_swa_row_bytes",
     "deepseek_v4_swa_scale_dim",
     "deepseek_v4_swa_token_stride",
-    "deepseek_v4_token_capacity_for_lcm_pool",
+    "deepseek_v4_token_capacity_for_cache_pool",
     "parse_v4_compressor_state_group_id",
     "v4_compressed_kv_group_id",
     "v4_compressor_state_group_id",

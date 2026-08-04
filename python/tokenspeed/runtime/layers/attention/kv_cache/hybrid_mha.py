@@ -18,41 +18,38 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""MHA interfaces backed by one LCM cache arena."""
+"""Paged MHA-history and recurrent-state cache."""
 
 from __future__ import annotations
 
-import os
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 
 import numpy as np
 import torch
-
 from tokenspeed.runtime.configs import paged_cache_spec
 from tokenspeed.runtime.configs.cache_runtime import (
     PagedCacheRuntimeContract,
 )
-from tokenspeed.runtime.configs.lcm_memory_plan import LcmMemoryPlan
-from tokenspeed.runtime.layers.attention.kv_cache.lcm import LcmCachePool
 from tokenspeed.runtime.layers.attention.kv_cache.mha import (
     MHATokenToKVPool,
     MHATokenToKVPoolMXFP8,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.plan import CacheMemoryPlan
 
 
-class LcmMHATokenToKVPool(MHATokenToKVPool):
-    """MHA compute interface whose history and state fields share one arena."""
+class HybridMHATokenToKVPool(MHATokenToKVPool):
+    """MHA compute interface whose history and state share one buffer."""
 
     def __init__(
         self,
         *,
-        memory_plan: LcmMemoryPlan,
+        memory_plan: CacheMemoryPlan,
         layer_group_ids: tuple[str, ...],
         state_field_dtypes: Mapping[str, torch.dtype] | None = None,
+        token_capacity: int | None = None,
         **kwargs,
     ):
-        self._lcm_memory_plan = memory_plan
         self.layer_cache_group_ids = tuple(layer_group_ids)
         self._group_ids_by_layer = dict(enumerate(self.layer_cache_group_ids))
         self._state_field_dtypes = dict(state_field_dtypes or {})
@@ -63,25 +60,20 @@ class LcmMHATokenToKVPool(MHATokenToKVPool):
             if label in paged_cache_spec.STATE_LAYER_TYPES
         )
         self._state_buffers_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-        self.lcm_pool: LcmCachePool | None = None
         self.paged_cache_requires_page_zeroing = True
+        self._token_capacity = (
+            token_capacity if token_capacity is not None else kwargs["size"]
+        )
 
         if len(self.layer_cache_group_ids) != kwargs["layer_num"]:
-            raise ValueError("LCM cache group ids must cover every model layer")
+            raise ValueError("cache group ids must cover every model layer")
 
-        super().__init__(**kwargs)
+        super().__init__(memory_plan=memory_plan, **kwargs)
 
-        # Boundary checkpoints default to BF16. Direct FP8-E5M2 storage is an
-        # explicit capacity mode because its restore error affects model output.
-        self.conv_col_dtype = (
-            torch.bfloat16
-            if os.environ.get("INKLING_FP8_SCONV", "0") == "0"
-            else torch.float8_e5m2
-        )
         self.runtime_contract = PagedCacheRuntimeContract(
             block_size=self.page_size,
             num_lcm_blocks=memory_plan.num_lcm_blocks,
-            token_capacity=self.size,
+            token_capacity=self._token_capacity,
             group_specs=self.paged_cache_group_specs,
             group_page_counts=self.paged_cache_group_page_counts,
         )
@@ -107,7 +99,7 @@ class LcmMHATokenToKVPool(MHATokenToKVPool):
             page_sizes=page_sizes,
             cache_blocks_per_lcm_block={
                 group.group_id: group.cache_blocks_per_lcm_block
-                for group in self._lcm_memory_plan.groups
+                for group in self.plan.groups
             },
             extra_groups=extra_groups,
             max_live_requests=max_live_requests,
@@ -116,7 +108,7 @@ class LcmMHATokenToKVPool(MHATokenToKVPool):
             max_context_len=max_context_len,
         )
         if published is None:
-            raise RuntimeError("MHA LCM cache requires cache-group scheduling")
+            raise RuntimeError("state MHA cache requires cache-group scheduling")
         specs, counts = published
         if self._pd_disaggregation_enabled:
             specs = [
@@ -128,32 +120,29 @@ class LcmMHATokenToKVPool(MHATokenToKVPool):
                 )
                 for spec in specs
             ]
-        counts.update(
-            {group.group_id: group.page_count for group in self._lcm_memory_plan.groups}
-        )
+        counts.update({group.group_id: group.page_count for group in self.plan.groups})
         return specs, counts
 
     def _create_buffers(self) -> None:
         with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
-            self._create_lcm_buffers()
-            self._set_buffer_metadata()
+            self._bind_buffers()
 
-    def _create_lcm_buffers(self) -> None:
-        plan = self._lcm_memory_plan
-        if plan.logical_block_tokens != self.page_size:
+    def _bind_buffers(self) -> None:
+        if self.plan.logical_block_tokens != self.page_size:
             raise ValueError(
-                f"LCM plan P={plan.logical_block_tokens} does not match pool "
+                f"cache plan P={self.plan.logical_block_tokens} does not match pool "
                 f"page_size={self.page_size}"
             )
-        max_packing = max(group.cache_blocks_per_lcm_block for group in plan.groups)
-        expected_size = plan.num_lcm_blocks * max_packing * self.page_size
+        max_packing = max(
+            group.cache_blocks_per_lcm_block for group in self.plan.groups
+        )
+        expected_size = self.plan.num_lcm_blocks * max_packing * self.page_size
         if self.size != expected_size:
             raise ValueError(
-                f"LCM pool size {self.size} does not match plan child capacity "
+                f"cache pool size {self.size} does not match plan child capacity "
                 f"{expected_size}"
             )
 
-        self.lcm_pool = LcmCachePool(plan, self.device)
         self.k_buffer = [None] * self.layer_num
         self.v_buffer = [None] * self.layer_num
         for layer_id, label in enumerate(self._layer_types):
@@ -165,39 +154,37 @@ class LcmMHATokenToKVPool(MHATokenToKVPool):
                     ssm_dtype = self._state_field_dtypes[ssm_id]
                 except KeyError as exc:
                     raise ValueError(
-                        f"LCM state field {exc.args[0]!r} has no dtype"
+                        f"cache state field {exc.args[0]!r} has no dtype"
                     ) from exc
-                conv = self.get_lcm_field(conv_id, conv_dtype)
-                ssm = self.get_lcm_field(ssm_id, ssm_dtype)
+                conv = self.field(conv_id, conv_dtype)
+                ssm = self.field(ssm_id, ssm_dtype)
                 if ssm.stride(0) != int(np.prod(ssm.shape[1:])):
                     raise ValueError(
-                        f"LCM state plane for layer {layer_id} has padding "
+                        f"state plane for layer {layer_id} has padding "
                         "between pages; the GDN decode ABI requires contiguous "
                         "state page rows"
                     )
                 self._state_buffers_by_layer[layer_id] = (conv, ssm)
                 continue
 
-            k_pages = self.get_lcm_field(f"layer.{layer_id}.k", self.store_dtype)
-            v_pages = self.get_lcm_field(f"layer.{layer_id}.v", self.store_dtype)
+            k_pages = self.field(f"layer.{layer_id}.k", self.store_dtype)
+            v_pages = self.field(f"layer.{layer_id}.v", self.store_dtype)
             contiguous_page_elements = int(np.prod(k_pages.shape[1:]))
             if (
                 k_pages.stride(0) != contiguous_page_elements
                 or v_pages.stride(0) != contiguous_page_elements
             ):
                 raise ValueError(
-                    f"LCM history plane for layer {layer_id} has padding "
+                    f"history plane for layer {layer_id} has padding "
                     "between child pages; the attention ABI requires "
                     "contiguous flattened page rows"
                 )
             self.k_buffer[layer_id] = k_pages.view(-1, self.head_num, self.head_dim)
             self.v_buffer[layer_id] = v_pages.view(-1, self.head_num, self.head_dim)
 
-        self.supports_hierarchical_kv_cache = False
-
     @property
     def num_lcm_blocks(self) -> int:
-        return self._lcm_memory_plan.num_lcm_blocks
+        return self.plan.num_lcm_blocks
 
     @property
     def state_slabs(self) -> list[tuple[torch.Tensor, torch.Tensor]]:
@@ -210,14 +197,9 @@ class LcmMHATokenToKVPool(MHATokenToKVPool):
         return self._pd_disaggregation_enabled
 
     def get_pd_cache_contract(self):
-        if not self.supports_disaggregation or self.lcm_pool is None:
-            raise RuntimeError("Paged cache PD requires an enabled MHA LCM pool")
-        return self.lcm_pool.pd_contract(self.paged_cache_group_specs)
-
-    def get_lcm_field(self, field_id: str, dtype: torch.dtype) -> torch.Tensor:
-        if self.lcm_pool is None:
-            raise RuntimeError("LCM backing is not allocated")
-        return self.lcm_pool.field(field_id, dtype)
+        if not self.supports_disaggregation:
+            raise RuntimeError("paged cache PD requires an enabled state MHA pool")
+        return self.pd_contract(self.paged_cache_group_specs)
 
     def group_id_for_layer(self, layer_id: int) -> str:
         try:
@@ -243,20 +225,19 @@ class LcmMHATokenToKVPool(MHATokenToKVPool):
 
     def zero_new_pages(self, new_page_ids: dict[str, list[int]]) -> None:
         if new_page_ids:
-            assert self.lcm_pool is not None
-            self.lcm_pool.zero_pages(new_page_ids)
+            self.zero_blocks(new_page_ids)
 
     @torch.no_grad()
     def clear_kv_buffers(self) -> None:
-        assert self.lcm_pool is not None
-        self.lcm_pool.backing.zero_()
+        assert self.buffer is not None
+        self.buffer.zero_()
 
     def get_contiguous_buf_infos(self):
-        raise RuntimeError("MHA LCM transfer uses get_pd_cache_contract()")
+        raise RuntimeError("state MHA transfer uses get_pd_cache_contract()")
 
 
-class LcmMHATokenToKVPoolMXFP8(
-    LcmMHATokenToKVPool,
+class HybridMHATokenToKVPoolMXFP8(
+    HybridMHATokenToKVPool,
     MHATokenToKVPoolMXFP8,
 ):
     def _create_buffers(self) -> None:
@@ -265,11 +246,11 @@ class LcmMHATokenToKVPoolMXFP8(
         self.store_dtype = torch.float8_e4m3fn
         super()._create_buffers()
         self.k_scale_buffer = [
-            self.get_lcm_field(f"layer.{layer_id}.k_scale", torch.float8_e8m0fnu)
+            self.field(f"layer.{layer_id}.k_scale", torch.float8_e8m0fnu)
             for layer_id in range(self.layer_num)
         ]
         self.v_scale_buffer = [
-            self.get_lcm_field(f"layer.{layer_id}.v_scale", torch.float8_e8m0fnu)
+            self.field(f"layer.{layer_id}.v_scale", torch.float8_e8m0fnu)
             for layer_id in range(self.layer_num)
         ]
 

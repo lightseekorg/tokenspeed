@@ -55,7 +55,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     write_deepseek_v4_indexer_fp8_cache,
     write_deepseek_v4_indexer_mxfp4_cache,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
+from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
     _mask_invalid_graph_tokens,
 )
 from tokenspeed.runtime.models.deepseek_v4 import (

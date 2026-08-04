@@ -50,7 +50,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     deepseek_v4_decode_swa_indices_and_lens,
     deepseek_v4_dequantize_and_gather_k_cache,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
+from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
     DeepseekV4CacheMetadata,
     _split_paged_cache_block_tables_into_v4_metadata,
 )
@@ -327,7 +327,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         max_tokens_per_req: int,
         overlap_schedule_depth: int,
     ) -> int:
-        cache_block_tokens = int(spec.rows_per_page) * int(spec.entry_stride_tokens)
+        cache_block_tokens = spec.cache_block_tokens
         if cache_block_tokens <= 0:
             raise ValueError(
                 f"DeepSeek V4 cache group {spec.group_id!r} has invalid page size"

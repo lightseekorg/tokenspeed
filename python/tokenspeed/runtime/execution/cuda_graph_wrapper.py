@@ -56,7 +56,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.model_executor import ModelExecutorConfig
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
-    from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 
 logger = get_colorful_logger(__name__)
@@ -191,11 +191,11 @@ class CudaGraphWrapper:
         self,
         forward_func: Callable,
         attn_backend: AttentionBackend,
-        token_to_kv_pool: BaseTokenToKVPool,
+        token_to_kv_pool: CachePool,
         input_buffers: InputBuffers,
         config: ModelExecutorConfig,
         draft_attn_backend: AttentionBackend | None = None,
-        draft_token_to_kv_pool: BaseTokenToKVPool | None = None,
+        draft_token_to_kv_pool: CachePool | None = None,
         drafter: BaseDrafter | None = None,
         capturable_grammar=None,
         eager_grammar_buffers=None,

@@ -87,7 +87,7 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
-    from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 logger = get_colorful_logger(__name__)
@@ -281,11 +281,11 @@ class ModelExecutor:
         config: ModelExecutorConfig,
         model_runner: ModelRunner,
         attn_backend: AttentionBackend,
-        token_to_kv_pool: BaseTokenToKVPool,
+        token_to_kv_pool: CachePool,
         sampling_backend: SamplingBackend,
         draft_model_runner: ModelRunner | None = None,
         draft_attn_backend: AttentionBackend | None = None,
-        draft_token_to_kv_pool: BaseTokenToKVPool | None = None,
+        draft_token_to_kv_pool: CachePool | None = None,
     ):
         self.device = config.device
         self.config = config

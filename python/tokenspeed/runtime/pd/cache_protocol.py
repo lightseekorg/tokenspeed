@@ -930,11 +930,11 @@ def validate_cache_slab_registrations(
 def build_lcm_pd_cache_contract(
     *,
     plan: object,
-    backing: object,
+    buffer: object,
     group_specs: object,
     field_dtypes: Mapping[str, str],
 ) -> tuple[CachePDLayout, tuple[CachePDSlabRegistration, ...]]:
-    """Describe one LCM arena without copying or flattening its backing."""
+    """Describe one LCM arena without copying or flattening its buffer."""
     groups = tuple(getattr(plan, "groups", ()))
     fields = tuple(getattr(plan, "fields", ()))
     planes = tuple(getattr(plan, "planes", ()))
@@ -1059,22 +1059,22 @@ def build_lcm_pd_cache_contract(
     )
 
     if (
-        getattr(backing, "dtype", None) is None
-        or str(backing.dtype) != "torch.uint8"
-        or not backing.is_contiguous()
-        or backing.storage_offset() != 0
-        or backing.data_ptr() != backing.untyped_storage().data_ptr()
-        or int(backing.nbytes) != int(plan.arena_bytes)
+        getattr(buffer, "dtype", None) is None
+        or str(buffer.dtype) != "torch.uint8"
+        or not buffer.is_contiguous()
+        or buffer.storage_offset() != 0
+        or buffer.data_ptr() != buffer.untyped_storage().data_ptr()
+        or int(buffer.nbytes) != int(plan.arena_bytes)
     ):
         raise CachePDProtocolError(
-            "LCM PD backing must be the contiguous uint8 arena owner"
+            "LCM PD buffer must be the contiguous uint8 arena owner"
         )
     registrations = (
         CachePDSlabRegistration(
             physical_slot=0,
             buffer_id="lcm_arena",
-            base_addr=backing.data_ptr(),
-            length=backing.nbytes,
+            base_addr=buffer.data_ptr(),
+            length=buffer.nbytes,
         ),
     )
     return layout, validate_cache_slab_registrations(

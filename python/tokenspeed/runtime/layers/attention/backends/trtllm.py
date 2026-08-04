@@ -107,8 +107,8 @@ class TRTLLMMHAMetadata:
 class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
     """trtllm_mha attention backend optimized for SM100 (Blackwell)."""
 
-    # Per-group group tables: reads and writes route by layer.group_id, so
-    # slab-aliased pools (e.g. gpt-oss sliding+full pairing) are safe.
+    # Per-group tables route reads and writes by layer.group_id, so fields
+    # sharing a physical plan location (for example GPT-OSS SWA/full) are safe.
     uses_cache_groups: bool = True
     # Graph-buffer column tails pad with the zero-init dummy page, matching
     # the single-table replay contract (gather_page_table_with_padding dummy_slot=0).

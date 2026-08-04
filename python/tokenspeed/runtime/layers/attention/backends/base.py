@@ -32,7 +32,7 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
     from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
-    from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
     from tokenspeed.runtime.pd.utils import StepCounter
 
@@ -81,10 +81,14 @@ class AttentionBackend(ABC):
         self.head_dim = config.head_dim
         self.is_draft = config.is_draft
         self.spec_num_tokens = config.speculative_num_draft_tokens
+        self.cache_pool: CachePool | None = None
         # True when this backend's CUDA-graph block-table (kv_indices) buffer is
         # aliased to a peer backend's (e.g. a drafter sharing the target's), so
         # the replay path skips rebuilding it — the peer already populates it.
         self._block_table_aliased = False
+
+    def set_cache_pool(self, cache_pool: CachePool) -> None:
+        self.cache_pool = cache_pool
 
     @contextmanager
     def override_num_extends(self, num_extends: int):
@@ -231,7 +235,7 @@ class AttentionBackend(ABC):
         v: torch.Tensor,
         layer: PagedAttention,
         out_cache_loc: torch.Tensor,
-        token_to_kv_pool: BaseTokenToKVPool,
+        token_to_kv_pool: CachePool,
         forward_mode: ForwardMode,
         bs: int,
         save_kv_cache: bool = True,
@@ -279,7 +283,7 @@ class AttentionBackend(ABC):
         v: torch.Tensor,
         layer: PagedAttention,
         out_cache_loc: torch.Tensor,
-        token_to_kv_pool: BaseTokenToKVPool,
+        token_to_kv_pool: CachePool,
         bs: int,
         save_kv_cache: bool = True,
         **kwargs,
@@ -294,7 +298,7 @@ class AttentionBackend(ABC):
         v: torch.Tensor,
         layer: PagedAttention,
         out_cache_loc: torch.Tensor,
-        token_to_kv_pool: BaseTokenToKVPool,
+        token_to_kv_pool: CachePool,
         bs: int,
         save_kv_cache: bool = True,
         **kwargs,

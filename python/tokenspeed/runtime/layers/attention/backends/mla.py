@@ -40,7 +40,6 @@ from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
 )
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
-from tokenspeed.runtime.layers.attention.page_table import expand_page_table
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.layers.attention.utils import build_page_table
 from tokenspeed.runtime.utils.common import ceil_div
@@ -196,11 +195,13 @@ class MLAAttnBackend(AttentionBackend):
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Expand scheduler pages for this backend's MLA kernel pages."""
-        return expand_page_table(
+        if self.cache_pool is None:
+            raise RuntimeError("MLA backend has no bound CachePool")
+        return self.cache_pool.expand_block_table(
+            None,
             table[:batch_size],
-            logical_page_size=logical_page_size,
-            kernel_page_size=self.page_size,
-            max_kernel_pages=self.max_num_pages,
+            kernel_block_tokens=self.page_size,
+            max_kernel_blocks=self.max_num_pages,
             out=out,
         )
 

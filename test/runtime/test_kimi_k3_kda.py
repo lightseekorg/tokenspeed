@@ -771,7 +771,7 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
     not current_platform().is_amd,
     reason="indexed paged cache KDA decode is an AMD-specific contract",
 )
-def test_kda_lcm_pool_component_views_end_to_end(
+def test_kda_cache_pool_component_views_end_to_end(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The real LCM pool's page-strided component views flow

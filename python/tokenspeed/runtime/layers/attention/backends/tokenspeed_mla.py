@@ -54,7 +54,6 @@ from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
 )
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
-from tokenspeed.runtime.layers.attention.page_table import expand_page_table
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.pdl import pdl_enabled
@@ -321,11 +320,13 @@ class CuteDSLMLABackend(AttentionBackend):
         formula is preserved. -1 table tails clamp to the null page 0, whose
         kernel expansion stays inside the physical null page.
         """
-        return expand_page_table(
+        if self.cache_pool is None:
+            raise RuntimeError("MLA backend has no bound CachePool")
+        return self.cache_pool.expand_block_table(
+            None,
             group_table[:bs],
-            logical_page_size=logical_page_size,
-            kernel_page_size=self.page_size,
-            max_kernel_pages=max_blocks,
+            kernel_block_tokens=self.page_size,
+            max_kernel_blocks=max_blocks,
             out=block_kv_indices,
         )
 

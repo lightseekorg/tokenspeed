@@ -32,31 +32,31 @@ def _poison(shape, device="cuda", dtype=torch.int32):
 
 
 def kimi_tp8_plan(*, num_lcm_blocks: int = 7):
-    from tokenspeed.runtime.configs.kimi_k3_cache_spec import (
-        plan_kimi_k3_lcm_cache,
-    )
     from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
+        solve_kimi_k3_cache_layout,
+    )
 
-    return plan_kimi_k3_lcm_cache(
+    layout = solve_kimi_k3_cache_layout(
         KimiLinearConfig(),
         tp_size=8,
         mla_cache_dtype=torch.float8_e4m3fn,
         mla_quant_method=None,
-        num_lcm_blocks=num_lcm_blocks,
     )
+    return layout.with_num_lcm_blocks(num_lcm_blocks)
 
 
 def make_kimi_pool(device, usable_pages: int = 6, *, with_mla_dims: bool = True):
-    from tokenspeed.runtime.configs.kimi_k3_cache_spec import (
-        kimi_k3_layer_group_ids,
-    )
     from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
     from tokenspeed.runtime.configs.paged_cache_spec import (
         FULL_ATTENTION,
         LINEAR_ATTENTION,
     )
-    from tokenspeed.runtime.layers.attention.kv_cache.lcm_mla import (
-        LcmMLATokenToKVPool,
+    from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
+        HybridKDATokenToKVPool,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
+        kimi_k3_layer_group_ids,
     )
 
     del with_mla_dims
@@ -67,7 +67,7 @@ def make_kimi_pool(device, usable_pages: int = 6, *, with_mla_dims: bool = True)
         FULL_ATTENTION if group_id == FULL_ATTENTION else LINEAR_ATTENTION
         for group_id in group_ids
     )
-    return LcmMLATokenToKVPool(
+    return HybridKDATokenToKVPool(
         size=usable_pages * 12 * plan.logical_block_tokens,
         model_dtype=torch.bfloat16,
         dtype=torch.float8_e4m3fn,

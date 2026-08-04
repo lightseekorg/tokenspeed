@@ -46,7 +46,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.model_runner import ModelRunner
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
-    from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 
 
@@ -83,7 +83,7 @@ class Eagle(BaseDrafter):
         draft_model_runner: ModelRunner,
         req_to_page: torch.Tensor,
         attn_backend: AttentionBackend | None = None,
-        token_to_kv_pool: BaseTokenToKVPool | None = None,
+        token_to_kv_pool: CachePool | None = None,
         runtime_states: RuntimeStates | None = None,
         input_buffers: InputBuffers | None = None,
         vocab_size: int | None = None,
