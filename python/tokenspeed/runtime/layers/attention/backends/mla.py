@@ -82,8 +82,10 @@ class MLADecodeMetadata:
     num_extends: int
     page_table: torch.Tensor
     seq_lens: torch.Tensor
-    # Paged cache only: one absolute latent write location per batch row.
+    # Paged cache only: absolute latent write locations, request-major, with
+    # ``group_q_len_per_req`` entries per row (1 outside target verify).
     group_out_cache_loc: torch.Tensor | None = None
+    group_q_len_per_req: int = 1
 
     @property
     def block_kv_indices(self) -> torch.Tensor:
@@ -160,9 +162,9 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         group_table = None
         logical_page_size = None
         if cache_metadata is not None:
-            if self.is_draft or self.spec_num_tokens > 1:
+            if self.is_draft:
                 raise NotImplementedError(
-                    "MLA Paged cache does not support speculative decoding"
+                    "MLA draft worker does not take the Paged cache path"
                 )
             self._cache_groups_bound = True
             group_table, logical_page_size = self._resolve_full_history_table(
@@ -202,6 +204,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
                 page_table=page_table,
                 group_table=group_table,
                 logical_page_size=logical_page_size,
+                q_len_per_req=self._verify_q_len(forward_mode),
             )
 
     @contextmanager
@@ -329,6 +332,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         page_table: torch.Tensor,
         group_table: torch.Tensor | None = None,
         logical_page_size: int | None = None,
+        q_len_per_req: int = 1,
     ):
         if group_table is not None:
             assert logical_page_size is not None
@@ -343,6 +347,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
                 batch_size=bs,
                 logical_page_size=logical_page_size,
                 validate_pages=cache_debug_enabled(),
+                q_len_per_req=q_len_per_req,
             )
         else:
             page_table = build_page_table(
@@ -357,6 +362,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             page_table=page_table,
             seq_lens=seq_lens[:bs],
             group_out_cache_loc=group_out_cache_loc,
+            group_q_len_per_req=q_len_per_req,
         )
 
     def select_out_cache_loc(self, layer, out_cache_loc, forward_mode=None):
@@ -370,7 +376,9 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             metadata = self.forward_decode_metadata
             if metadata is None or metadata.group_out_cache_loc is None:
                 raise RuntimeError("MLA decode write locations are missing")
-            locs = metadata.group_out_cache_loc[metadata.num_extends :]
+            locs = metadata.group_out_cache_loc[
+                metadata.num_extends * metadata.group_q_len_per_req :
+            ]
         else:
             metadata = self.forward_prefill_metadata
             if metadata is None or metadata.group_out_cache_loc is None:
@@ -395,7 +403,9 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         self.decode_cuda_graph_metadata = {}
         if self._cache_contract_bound:
             self.decode_cuda_graph_group_out_cache_loc = torch.zeros(
-                max_bs, dtype=torch.int64, device=self.device
+                max_bs * max(1, self.spec_num_tokens),
+                dtype=torch.int64,
+                device=self.device,
             )
         else:
             self.decode_cuda_graph_group_out_cache_loc = None
@@ -415,11 +425,12 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             )
 
         uses_cache_groups = bool(cache_group_ids) or self._cache_contract_bound
-        if uses_cache_groups and (self.is_draft or self.spec_num_tokens > 1):
+        if uses_cache_groups and self.is_draft:
             raise NotImplementedError(
-                "MLA Paged cache CUDA graph capture does not support speculative decoding"
+                "MLA draft worker does not take the Paged cache path"
             )
         page_table = self.cuda_graph_page_table[:bs, :]
+        capture_q_len = self._graph_verify_q_len()
         if uses_cache_groups:
             self._cache_groups_bound = True
             if self.decode_cuda_graph_group_out_cache_loc is None:
@@ -428,7 +439,9 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
                     "mark_cache_contract must run before init_cuda_graph_state"
                 )
             page_table.zero_()
-            group_out_cache_loc = self.decode_cuda_graph_group_out_cache_loc[:bs]
+            group_out_cache_loc = self.decode_cuda_graph_group_out_cache_loc[
+                : bs * capture_q_len
+            ]
             group_out_cache_loc.zero_()
         else:
             group_out_cache_loc = None
@@ -437,9 +450,14 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             page_table=page_table,
             seq_lens=self.cuda_graph_seq_lens[:bs],
             group_out_cache_loc=group_out_cache_loc,
+            group_q_len_per_req=capture_q_len,
         )
-        # Seed the owned buffer: the capture run reads it before replay.
-        metadata.seq_lens.copy_(seq_lens[:bs])
+        # Seed the owned buffer: the capture run reads it before replay. Verify
+        # rows span seq-N..seq-1, so a shorter length would start before zero.
+        if capture_q_len > 1:
+            metadata.seq_lens.copy_(seq_lens[:bs].clamp_min(capture_q_len))
+        else:
+            metadata.seq_lens.copy_(seq_lens[:bs])
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
 
@@ -460,7 +478,11 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         metadata = self.decode_cuda_graph_metadata[bs]
         # Copy the live lengths into our own cache-seqlens buffer (metadata.seq_lens
         # views it); both metadata paths read it at replay.
-        self.cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs])
+        q_len = metadata.group_q_len_per_req
+        if q_len > 1:
+            self.cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs].clamp_min(q_len))
+        else:
+            self.cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs])
         if metadata.group_out_cache_loc is not None:
             self._replay_refresh_decode(
                 bs,
@@ -487,6 +509,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
     ) -> None:
         if metadata.group_out_cache_loc is None:
             raise RuntimeError("MLA graph metadata has no write-location buffer")
+        q_len = metadata.group_q_len_per_req
         real_bs = 0
         if cache_metadata is not None:
             table, logical_page_size = self._resolve_full_history_table(
@@ -507,9 +530,10 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
                     logical_page_size=logical_page_size,
                     validate_pages=cache_debug_enabled(),
                     out=metadata.group_out_cache_loc,
+                    q_len_per_req=q_len,
                 )
         metadata.page_table[real_bs:bs].zero_()
-        metadata.group_out_cache_loc[real_bs:bs].zero_()
+        metadata.group_out_cache_loc[real_bs * q_len : bs * q_len].zero_()
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1

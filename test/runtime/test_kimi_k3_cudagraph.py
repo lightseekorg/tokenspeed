@@ -40,12 +40,26 @@ from tokenspeed.runtime.layers.attention.backends.tokenspeed_mla import (
     CuteDSLMLABackend,
     CuteDSLMLADecodeMetadata,
 )
+from tokenspeed.runtime.layers.attention.page_table import expand_page_table
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 _PAGE_SIZE = 64  # kernel page
 _LOGICAL_P = 128  # logical block size (ratio 2 kernel pages per logical page)
 _MAX_CTX = 256
+
+
+class _StubCachePool:
+    def expand_block_table(
+        self, _group_id, block_table, *, kernel_block_tokens, max_kernel_blocks, out
+    ):
+        return expand_page_table(
+            block_table,
+            logical_page_size=_LOGICAL_P,
+            kernel_page_size=kernel_block_tokens,
+            max_kernel_pages=max_kernel_blocks,
+            out=out,
+        )
 
 
 def _bare_mla_backend(
@@ -65,6 +79,7 @@ def _bare_mla_backend(
     backend._block_table_aliased = False
     backend._cache_groups_bound = False
     backend._cache_contract_bound = False
+    backend.cache_pool = _StubCachePool()
     backend.decode_cuda_graph_metadata = {}
     backend.decode_cuda_graph_kv_indices = None
     backend.decode_cuda_graph_group_out_cache_loc = None
@@ -110,14 +125,16 @@ def test_cutedsl_mla_draft_keeps_classic_page_table_contract() -> None:
     assert backend._cache_contract_bound is False
 
 
-def _bare_amd_mla_backend(*, cache_contract: bool) -> MLAAttnBackend:
+def _bare_amd_mla_backend(
+    *, cache_contract: bool, spec_num_tokens: int = 1
+) -> MLAAttnBackend:
     backend = object.__new__(MLAAttnBackend)
     backend.device = "cpu"
     backend.page_size = _PAGE_SIZE
     backend.max_context_len = _MAX_CTX
     backend.max_num_pages = _MAX_CTX // _PAGE_SIZE
     backend.is_draft = False
-    backend.spec_num_tokens = 1
+    backend.spec_num_tokens = spec_num_tokens
     backend._cache_groups_bound = False
     backend._cache_contract_bound = False
     backend.decode_cuda_graph_metadata = {}
@@ -125,6 +142,7 @@ def _bare_amd_mla_backend(*, cache_contract: bool) -> MLAAttnBackend:
     backend.cuda_graph_seq_lens = None
     backend.decode_cuda_graph_group_out_cache_loc = None
     backend.forward_decode_metadata = None
+    backend._should_use_absorbed_cached_extend = lambda **_: False
     if cache_contract:
         backend.mark_cache_contract()
     return backend
@@ -233,6 +251,48 @@ def test_amd_mla_grouped_graph_replay_is_pointer_stable_and_null_padded() -> Non
     assert replayed.group_out_cache_loc[1].item() == 0
 
 
+def test_amd_mla_target_verify_graph_refreshes_all_write_locations() -> None:
+    backend = _bare_amd_mla_backend(cache_contract=True, spec_num_tokens=2)
+    backend.init_cuda_graph_state(max_bs=2)
+    backend.init_forward_metadata_capture_cuda_graph(
+        bs=2,
+        req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
+        seq_lens=torch.tensor([2, 2], dtype=torch.int32),
+        forward_mode=ForwardMode.DECODE,
+        cache_group_ids=("full_attention",),
+    )
+    captured = backend.decode_cuda_graph_metadata[2]
+    page_ptr = captured.page_table.data_ptr()
+    loc_ptr = captured.group_out_cache_loc.data_ptr()
+    assert captured.group_q_len_per_req == 2
+    assert captured.group_out_cache_loc.shape == (4,)
+
+    forward_op = object()
+    metadata = _StubFullAttnMeta(
+        torch.tensor([[3, 5]], dtype=torch.int32),
+        _LOGICAL_P,
+        forward_op,
+    )
+    backend.init_forward_metadata_replay_cuda_graph(
+        bs=2,
+        req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
+        seq_lens=torch.tensor([70, 1], dtype=torch.int32),
+        forward_mode=ForwardMode.DECODE,
+        page_table=None,
+        cache_metadata=metadata,
+        forward_batch=forward_op,
+    )
+    replayed = backend.forward_decode_metadata
+    assert replayed.page_table.data_ptr() == page_ptr
+    assert replayed.group_out_cache_loc.data_ptr() == loc_ptr
+    assert replayed.group_out_cache_loc.tolist() == [
+        3 * _LOGICAL_P + 68,
+        3 * _LOGICAL_P + 69,
+        0,
+        0,
+    ]
+
+
 def test_amd_mla_eager_decode_uses_group_table_and_refuses_fallback() -> None:
     backend = _bare_amd_mla_backend(cache_contract=True)
     forward_op = object()
@@ -276,6 +336,41 @@ def test_amd_mla_eager_decode_uses_group_table_and_refuses_fallback() -> None:
             page_table=torch.zeros((2, 4), dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
         )
+
+
+def test_amd_mla_eager_target_verify_writes_the_full_window() -> None:
+    backend = _bare_amd_mla_backend(cache_contract=True, spec_num_tokens=2)
+    forward_op = object()
+    metadata = _StubFullAttnMeta(
+        torch.tensor([[3, 5], [4, 6]], dtype=torch.int32),
+        _LOGICAL_P,
+        forward_op,
+    )
+    backend.init_forward_metadata(
+        bs=2,
+        num_extends=0,
+        req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+        seq_lens=torch.tensor([70, 130], dtype=torch.int32),
+        page_table=torch.zeros((2, 4), dtype=torch.int32),
+        forward_mode=ForwardMode.DECODE,
+        cache_metadata=metadata,
+        forward_batch=forward_op,
+    )
+
+    decode = backend.forward_decode_metadata
+    assert decode.group_q_len_per_req == 2
+    assert decode.group_out_cache_loc.tolist() == [
+        3 * _LOGICAL_P + 68,
+        3 * _LOGICAL_P + 69,
+        6 * _LOGICAL_P,
+        6 * _LOGICAL_P + 1,
+    ]
+    selected = backend.select_out_cache_loc(
+        SimpleNamespace(layer_id=0),
+        torch.full((4,), -1, dtype=torch.int64),
+        ForwardMode.DECODE,
+    )
+    assert torch.equal(selected, decode.group_out_cache_loc)
 
 
 def test_amd_mla_eager_prefill_derives_group_write_locations(monkeypatch) -> None:

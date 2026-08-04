@@ -234,7 +234,9 @@ def backend_factory(cuda_env, gpu_pool):
             scaling=192**-0.5,
             kv_cache_dim=_LATENT_DIM,
         )
-        return backend_cls(config)
+        backend = backend_cls(config)
+        backend.set_cache_pool(gpu_pool)
+        return backend
 
     return make
 
