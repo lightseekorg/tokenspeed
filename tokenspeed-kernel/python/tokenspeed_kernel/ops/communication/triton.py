@@ -1162,6 +1162,213 @@ def nvidia_rsag_all_gather(
 # ------------------------------------------------------------------------------
 
 
+_AMD_RSAG_BLOCK_SIZE = 1024
+# Semantics of every rank's symmetric signal
+#   0: reusable cross-rank barrier signal
+#      - rank zero: arrival count
+#      - other ranks: release flag
+#   1: local payload-subgroup completion count
+#   2: reduce-scatter entry state (idle/elected/ready)
+_AMD_RSAG_SIGNAL_WORDS = 3
+
+
+@triton.jit
+def _amd_rsag_cross_rank_barrier(
+    signal_pad_ptrs_dev,
+    RANK: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+    PEER_VECTOR_SIZE: tl.constexpr,
+):
+    """Reusable centralized barrier for one subgroup per rank.
+
+    Rank zero clears its arrival count before releasing the other ranks. Every
+    non-root rank clears its release flag before publishing its next arrival.
+    That next arrival therefore acknowledges consumption of the prior release,
+    so one signal per rank can be reused without an alternating slot.
+    """
+    signal_ptrs = signal_pad_ptrs_dev.to(tl.pointer_type(tl.uint64))
+    local_signal = tl.load(signal_ptrs + RANK).to(tl.pointer_type(tl.uint32))
+
+    if RANK == 0:
+        tl.atomic_poll(
+            local_signal,
+            WORLD_SIZE - 1,
+            sem="acquire",
+            scope="sys",
+        )
+        tl.atomic_xchg(
+            local_signal,
+            0,
+            sem="relaxed",
+            scope="sys",
+        )
+
+        peer_ids = tl.arange(0, PEER_VECTOR_SIZE)
+        peer_mask = (peer_ids > 0) & (peer_ids < WORLD_SIZE)
+        remote_signals = tl.load(
+            signal_ptrs + peer_ids,
+            mask=peer_mask,
+            other=0,
+        ).to(tl.pointer_type(tl.uint32))
+        tl.atomic_xchg(
+            remote_signals,
+            1,
+            mask=peer_mask,
+            sem="release",
+            scope="sys",
+        )
+    else:
+        root_signal = tl.load(signal_ptrs).to(tl.pointer_type(tl.uint32))
+        tl.atomic_add(
+            root_signal,
+            1,
+            sem="release",
+            scope="sys",
+        )
+        tl.atomic_poll(local_signal, 1, sem="acquire", scope="sys")
+        tl.atomic_xchg(
+            local_signal,
+            0,
+            sem="relaxed",
+            scope="sys",
+        )
+
+
+@triton.jit
+def _amd_rsag_reduce_scatter_entry(
+    signal_pad_ptrs_dev,
+    RANK: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+    PEER_VECTOR_SIZE: tl.constexpr,
+):
+    """Open a rank-local gate after one subgroup completes the RS entry barrier.
+
+    Entry state is a reusable local latch: idle means no leader, elected means
+    one resident subgroup is inside the cross-rank barrier, and ready releases
+    all current or late-starting payload subgroups. Ready remains set until the
+    final payload subgroup completes the reduce-scatter exit barrier.
+    """
+    signal_ptrs = signal_pad_ptrs_dev.to(tl.pointer_type(tl.uint64))
+    local_signal = tl.load(signal_ptrs + RANK).to(tl.pointer_type(tl.uint32))
+    entry_state_offset: tl.constexpr = 2
+    entry_elected: tl.constexpr = 1
+    entry_ready: tl.constexpr = 2
+    entry_state = local_signal + entry_state_offset
+
+    if tl.num_programs(0) == 1:
+        # The only subgroup is both entry leader and payload worker, so it needs
+        # no local election or ready-state publication.
+        _amd_rsag_cross_rank_barrier(
+            signal_pad_ptrs_dev,
+            RANK,
+            WORLD_SIZE,
+            PEER_VECTOR_SIZE,
+        )
+    else:
+        # Whichever subgroup starts first becomes the rank leader. This avoids
+        # relying on program-id scheduling: a leader is resident before any
+        # other subgroup can observe elected and wait. The leader orders the
+        # preceding stream-local copy against every peer, release-publishes
+        # ready. Every current or late-starting payload subgroup acquire-polls
+        # that state before reading remote buffers.
+        old_state = tl.atomic_cas(
+            entry_state,
+            0,
+            entry_elected,
+            sem="relaxed",
+            scope="gpu",
+        )
+        if old_state == 0:
+            _amd_rsag_cross_rank_barrier(
+                signal_pad_ptrs_dev,
+                RANK,
+                WORLD_SIZE,
+                PEER_VECTOR_SIZE,
+            )
+            tl.atomic_xchg(
+                entry_state,
+                entry_ready,
+                sem="release",
+                scope="gpu",
+            )
+        else:
+            tl.atomic_poll(
+                entry_state,
+                entry_ready,
+                sem="acquire",
+                scope="gpu",
+            )
+
+
+@triton.jit
+def _amd_rsag_complete_grid(
+    signal_pad_ptrs_dev,
+    RANK: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+    PEER_VECTOR_SIZE: tl.constexpr,
+    RESET_ENTRY_STATE: tl.constexpr,
+):
+    """Elect the last local subgroup to perform the completion barrier.
+
+    RESET_ENTRY_STATE is true for reduce-scatter, whose entry latch must remain
+    ready until every local payload subgroup has finished. All-gather never uses
+    that latch and passes false.
+    """
+    signal_ptrs = signal_pad_ptrs_dev.to(tl.pointer_type(tl.uint64))
+    local_signal = tl.load(signal_ptrs + RANK).to(tl.pointer_type(tl.uint32))
+    completion_count_offset: tl.constexpr = 1
+    entry_state_offset: tl.constexpr = 2
+    completion_count = local_signal + completion_count_offset
+    # Every payload program contains exactly one subgroup, so program count is
+    # also the number of independently publishing payload subgroups.
+    num_subgroups = tl.num_programs(0)
+
+    if num_subgroups == 1:
+        _amd_rsag_cross_rank_barrier(
+            signal_pad_ptrs_dev,
+            RANK,
+            WORLD_SIZE,
+            PEER_VECTOR_SIZE,
+        )
+        if RESET_ENTRY_STATE:
+            entry_state = local_signal + entry_state_offset
+            tl.atomic_xchg(
+                entry_state,
+                0,
+                sem="relaxed",
+                scope="gpu",
+            )
+    else:
+        # Each subgroup's system-release increment publishes all peer-memory
+        # accesses from its one-subgroup payload program. The final subgroup's
+        # acquire reads the RMW release sequence and can only arrive after every
+        # local subgroup has completed. It is therefore safe for that already-
+        # resident subgroup to wait for the leaders on other ranks; non-final
+        # subgroups exit without cross-rank waiting.
+        old_count = tl.atomic_add(
+            completion_count,
+            1,
+            sem="acq_rel",
+            scope="sys",
+        )
+        if old_count == num_subgroups - 1:
+            _amd_rsag_cross_rank_barrier(
+                signal_pad_ptrs_dev,
+                RANK,
+                WORLD_SIZE,
+                PEER_VECTOR_SIZE,
+            )
+            tl.atomic_xchg(completion_count, 0, sem="relaxed", scope="gpu")
+            if RESET_ENTRY_STATE:
+                entry_state = local_signal + entry_state_offset
+                tl.atomic_xchg(
+                    entry_state,
+                    0,
+                    sem="relaxed",
+                    scope="gpu",
+                )
+
+
 @triton.jit
 def amd_rsag_all_gather_kernel(
     input_ptr,
@@ -1171,19 +1378,34 @@ def amd_rsag_all_gather_kernel(
     GLOBAL_OFFSET: tl.constexpr,
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
+    PEER_VECTOR_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < LOCAL_NUMEL
-    vals = tl.load(input_ptr + offsets, mask=mask, other=0.0)
+    num_programs = tl.num_programs(0)
+    tile_offsets = tl.arange(0, BLOCK_SIZE)
     buffer_ptrs = buffer_ptrs_dev.to(tl.pointer_type(tl.uint64))
 
-    for peer in tl.static_range(0, WORLD_SIZE):
-        peer_base = tl.load(buffer_ptrs + peer).to(tl.pointer_type(tl.bfloat16))
-        tl.store(peer_base + GLOBAL_OFFSET + offsets, vals, mask=mask)
+    for tile_start in range(
+        pid * BLOCK_SIZE,
+        LOCAL_NUMEL,
+        num_programs * BLOCK_SIZE,
+    ):
+        offsets = tile_start + tile_offsets
+        mask = offsets < LOCAL_NUMEL
+        vals = tl.load(input_ptr + offsets, mask=mask, other=0.0)
 
-    symm_mem_barrier(signal_pad_ptrs_dev, tl.program_id(0), RANK, WORLD_SIZE)
+        for peer in tl.static_range(0, WORLD_SIZE):
+            peer_base = tl.load(buffer_ptrs + peer).to(tl.pointer_type(tl.bfloat16))
+            tl.store(peer_base + GLOBAL_OFFSET + offsets, vals, mask=mask)
+
+    _amd_rsag_complete_grid(
+        signal_pad_ptrs_dev,
+        RANK,
+        WORLD_SIZE,
+        PEER_VECTOR_SIZE,
+        RESET_ENTRY_STATE=False,
+    )
 
 
 @triton.jit
@@ -1195,29 +1417,54 @@ def amd_rsag_reduce_scatter_kernel(
     GLOBAL_OFFSET: tl.constexpr,
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
+    PEER_VECTOR_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    block_id = tl.program_id(0)
-    symm_mem_barrier(signal_pad_ptrs_dev, block_id, RANK, WORLD_SIZE)
+    _amd_rsag_reduce_scatter_entry(
+        signal_pad_ptrs_dev,
+        RANK,
+        WORLD_SIZE,
+        PEER_VECTOR_SIZE,
+    )
 
-    offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < LOCAL_NUMEL
+    pid = tl.program_id(0)
+    num_programs = tl.num_programs(0)
+    tile_offsets = tl.arange(0, BLOCK_SIZE)
     buffer_ptrs = buffer_ptrs_dev.to(tl.pointer_type(tl.uint64))
-    acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
 
-    for peer in tl.static_range(0, WORLD_SIZE):
-        peer_base = tl.load(buffer_ptrs + peer).to(tl.pointer_type(tl.bfloat16))
-        acc += tl.load(peer_base + GLOBAL_OFFSET + offsets, mask=mask, other=0.0).to(
-            tl.float32
-        )
+    for tile_start in range(
+        pid * BLOCK_SIZE,
+        LOCAL_NUMEL,
+        num_programs * BLOCK_SIZE,
+    ):
+        offsets = tile_start + tile_offsets
+        mask = offsets < LOCAL_NUMEL
+        acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
 
-    tl.store(output_ptr + offsets, acc, mask=mask)
-    symm_mem_barrier(signal_pad_ptrs_dev, block_id, RANK, WORLD_SIZE)
+        for peer in tl.static_range(0, WORLD_SIZE):
+            peer_base = tl.load(buffer_ptrs + peer).to(tl.pointer_type(tl.bfloat16))
+            acc += tl.load(
+                peer_base + GLOBAL_OFFSET + offsets,
+                mask=mask,
+                other=0.0,
+            ).to(tl.float32)
+
+        tl.store(output_ptr + offsets, acc, mask=mask)
+
+    _amd_rsag_complete_grid(
+        signal_pad_ptrs_dev,
+        RANK,
+        WORLD_SIZE,
+        PEER_VECTOR_SIZE,
+        RESET_ENTRY_STATE=True,
+    )
 
 
-def amd_rsag_num_blocks(token_list_in_group: list[int], hidden_size: int) -> int:
-    max_local_numel = max(token_list_in_group) * hidden_size
-    return max(1, triton.cdiv(max_local_numel, 1024))
+def amd_rsag_num_blocks(local_numel: int, device: torch.device) -> int:
+    """Choose a rank-local persistent grid; one subgroup remains for empty ranks."""
+    payload_blocks = triton.cdiv(local_numel, _AMD_RSAG_BLOCK_SIZE)
+    compute_units = torch.cuda.get_device_properties(device).multi_processor_count
+    return max(1, min(payload_blocks, compute_units))
 
 
 def amd_create_rsag_state(
@@ -1232,8 +1479,7 @@ def amd_create_rsag_state(
     ), f"Expected dist.ProcessGroup, got {type(group)}"
     device = device or torch.device(f"cuda:{torch.cuda.current_device()}")
     world_size = group.size()
-    max_blocks = max(1, triton.cdiv(max_tokens * hidden_size, 1024))
-    pad_bytes = max_blocks * world_size * 4
+    pad_bytes = _AMD_RSAG_SIGNAL_WORDS * 4
     symm_mem.set_signal_pad_size(max(symm_mem.get_signal_pad_size(), pad_bytes))
 
     free_gpu_memory_begin = _get_available_gpu_memory(torch.cuda.current_device())
@@ -1288,7 +1534,7 @@ def amd_rsag_reduce_scatter(
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
-    grid = (amd_rsag_num_blocks(token_list_in_group, state.hidden_dim),)
+    grid = (amd_rsag_num_blocks(local_numel, state.device),)
     amd_rsag_reduce_scatter_kernel[grid](
         state.symm_mem_hdl.buffer_ptrs_dev,
         state.symm_mem_hdl.signal_pad_ptrs_dev,
@@ -1297,10 +1543,11 @@ def amd_rsag_reduce_scatter(
         GLOBAL_OFFSET=global_offset,
         RANK=state.symm_mem_hdl.rank,
         WORLD_SIZE=state.symm_mem_hdl.world_size,
-        BLOCK_SIZE=1024,
-        num_warps=4,
+        PEER_VECTOR_SIZE=triton.next_power_of_2(state.symm_mem_hdl.world_size),
+        BLOCK_SIZE=_AMD_RSAG_BLOCK_SIZE,
+        num_warps=1,
     )
-    return output.clone() if safe else output
+    return output
 
 
 def amd_rsag_all_gather(
@@ -1329,7 +1576,7 @@ def amd_rsag_all_gather(
         ), f"{hidden_states.shape=}|{local_num_tokens=}|{hidden_states.device=} Mismatched shape"
         local_numel = local_num_tokens * state.hidden_dim
         global_offset = local_token_offset * state.hidden_dim
-        grid = (amd_rsag_num_blocks(token_list_in_group, state.hidden_dim),)
+        grid = (amd_rsag_num_blocks(local_numel, state.device),)
         amd_rsag_all_gather_kernel[grid](
             hidden_states,
             state.symm_mem_hdl.buffer_ptrs_dev,
@@ -1338,8 +1585,9 @@ def amd_rsag_all_gather(
             GLOBAL_OFFSET=global_offset,
             RANK=state.symm_mem_hdl.rank,
             WORLD_SIZE=state.symm_mem_hdl.world_size,
-            BLOCK_SIZE=1024,
-            num_warps=4,
+            PEER_VECTOR_SIZE=triton.next_power_of_2(state.symm_mem_hdl.world_size),
+            BLOCK_SIZE=_AMD_RSAG_BLOCK_SIZE,
+            num_warps=1,
         )
         output = state.comm_buff[:total_num_tokens, :]
         return output.clone() if safe else output
