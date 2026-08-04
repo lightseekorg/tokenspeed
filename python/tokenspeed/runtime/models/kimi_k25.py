@@ -124,43 +124,14 @@ class KimiK25ForConditionalGeneration(torch.nn.Module):
             raise RuntimeError("Kimi-K2.5 multimodal path is not initialized.")
         return self.vision.embed_media(items)
 
-    def make_encoder_warmup_items(
-        self, patches_per_side: int
-    ) -> dict[Modality, list[MultimodalDataItem]]:
-        """Build one synthetic image batch for startup encoder warmup.
-
-        Args:
-            patches_per_side: Number of vision patches along each spatial axis.
-
-        Returns:
-            An image-modality batch accepted by :meth:`get_image_feature`.
-        """
-        merge_h, merge_w = self.vision_tower.merge_kernel_size
-        if patches_per_side % merge_h or patches_per_side % merge_w:
-            raise ValueError(
-                f"Kimi encoder warmup patches_per_side={patches_per_side} must be "
-                f"divisible by merge_kernel_size={(merge_h, merge_w)}"
-            )
-        patch_embed = self.vision_tower.patch_embed
-        patch_height, patch_width = patch_embed.patch_size
-        feature = torch.zeros(
-            patches_per_side * patches_per_side,
-            3,
-            patch_height,
-            patch_width,
-            dtype=patch_embed.proj.weight.dtype,
-        )
-        grid_thws = torch.tensor(
-            [[1, patches_per_side, patches_per_side]], dtype=torch.long
-        )
+    def get_multimodal_encoder_specs(self) -> dict[Modality, EncoderSpec]:
+        if self.vision is None or self.image_encoder is None:
+            return {}
         return {
-            Modality.IMAGE: [
-                MultimodalDataItem(
-                    modality=Modality.IMAGE,
-                    feature=feature,
-                    model_specific_data={"grid_thws": grid_thws},
-                )
-            ]
+            Modality.IMAGE: EncoderSpec(
+                self.image_encoder,
+                make_warmup_items=self.vision.make_image_warmup_items,
+            )
         }
 
     def make_encoder_cudagraph_wrapper(self, mapping: Mapping):
@@ -215,7 +186,7 @@ class KimiK25ForConditionalGeneration(torch.nn.Module):
             input_ids=input_ids,
             text_embedding=self.get_input_embeddings(),
             ctx=multimodal_context,
-            encoders={Modality.IMAGE: EncoderSpec(self.image_encoder)},
+            encoders=self.get_multimodal_encoder_specs(),
             multimodal_model=self,
         )
         assert not model_kwargs, "Kimi-K2.5 multimodal path must stay embeds-only"

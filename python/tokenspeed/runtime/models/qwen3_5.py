@@ -1328,50 +1328,20 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         encoded = self.visual.forward_blocks(tokens, metadata)
         return self.post_encode([encoded], grid)
 
-    def make_encoder_warmup_items(
-        self, patches_per_side: int
-    ) -> dict[Modality, list[MultimodalDataItem]]:
-        """Build synthetic image and video batches for startup encoder warmup.
-
-        Args:
-            patches_per_side: Number of vision patches along each spatial axis.
-
-        Returns:
-            Image and video batches accepted by their corresponding encoders.
-        """
-        merge = int(self.visual.spatial_merge_size)
-        if patches_per_side % merge:
-            raise ValueError(
-                f"Qwen encoder warmup patches_per_side={patches_per_side} must be "
-                f"divisible by spatial_merge_size={merge}"
-            )
-        patch_embed = self.visual.patch_embed
-        flattened_patch_size = (
-            patch_embed.in_channels
-            * patch_embed.temporal_patch_size
-            * patch_embed.patch_size
-            * patch_embed.patch_size
-        )
-
-        def make_item(modality: Modality, temporal_patches: int, grid_key: str):
-            grid = torch.tensor(
-                [[temporal_patches, patches_per_side, patches_per_side]],
-                dtype=torch.long,
-            )
-            feature = torch.zeros(
-                temporal_patches * patches_per_side * patches_per_side,
-                flattened_patch_size,
-                dtype=self.visual.dtype,
-            )
-            return MultimodalDataItem(
-                modality=modality,
-                feature=feature,
-                model_specific_data={grid_key: grid},
-            )
-
+    def get_multimodal_encoder_specs(self) -> dict[Modality, EncoderSpec]:
+        if self.visual is None:
+            return {}
         return {
-            Modality.IMAGE: [make_item(Modality.IMAGE, 1, "image_grid_thw")],
-            Modality.VIDEO: [make_item(Modality.VIDEO, 2, "video_grid_thw")],
+            Modality.IMAGE: EncoderSpec(
+                self.image_encoder,
+                deepstack=True,
+                make_warmup_items=self.visual.make_image_warmup_items,
+            ),
+            Modality.VIDEO: EncoderSpec(
+                self.video_encoder,
+                deepstack=True,
+                make_warmup_items=self.visual.make_video_warmup_items,
+            ),
         }
 
     def pre_encode(
@@ -1526,10 +1496,7 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             input_ids=input_ids,
             text_embedding=self.model.get_input_embeddings(),
             ctx=multimodal_context,
-            encoders={
-                Modality.IMAGE: EncoderSpec(self.image_encoder, deepstack=True),
-                Modality.VIDEO: EncoderSpec(self.video_encoder, deepstack=True),
-            },
+            encoders=self.get_multimodal_encoder_specs(),
             multimodal_model=self,
         )
         hidden_states, aux_hidden_states = self.model(

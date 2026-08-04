@@ -144,14 +144,13 @@ class DisaggEncodeExecutor:
         )
 
     def _feature_fn(self, modality):
-        # Dispatch through the model's modality seam: encoder CUDA-graph wrappers
-        # override these attributes, while eager models leave them pointing at
-        # get_image_feature / get_video_feature.
-        if modality == Modality.IMAGE:
-            return self.model.image_encoder
-        if modality == Modality.VIDEO:
-            return self.model.video_encoder
-        raise ValueError(f"unsupported modality for encode: {modality}")
+        get_specs = getattr(self.model, "get_multimodal_encoder_specs", None)
+        if not callable(get_specs):
+            raise ValueError("model does not register multimodal encoders")
+        spec = get_specs().get(modality)
+        if spec is None:
+            raise ValueError(f"unsupported modality for encode: {modality}")
+        return spec.fn
 
     def execute(self, request_items: list[tuple[str, MultimodalDataItem]]) -> None:
         by_modality = {}

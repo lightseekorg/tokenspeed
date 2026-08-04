@@ -551,6 +551,13 @@ class ModelExecutor:
             self.forward_step.capture()
         if not self.prefill_graph.disable:
             self.prefill_graph.capture(self.forward_step)
+
+        # Encoder graphs are installed before KV-cache sizing and retained by
+        # the model runner; preserve the executor-level handle for callers.
+        self.encoder_graph_wrappers = getattr(
+            self.model_runner, "encoder_graph_wrappers", {}
+        )
+
         self.execution_stream = torch.cuda.Stream()
         self.log_step = 0
         self._seen_prefill_ids: set[str] = set()
