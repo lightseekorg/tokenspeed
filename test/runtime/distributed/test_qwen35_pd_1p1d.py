@@ -24,7 +24,7 @@ SERVE_SCRIPT = os.path.join(
     "ci_system",
     "serve_qwen35_397b_nvfp4_pd_1p1d.sh",
 )
-LB_PORT = int(os.environ.get("LB_PORT", "12345"))
+LB_PORT = int(os.environ.get("LB_PORT", "18345"))
 MODEL = os.environ.get("MODEL", "nvidia/Qwen3.5-397B-A17B-NVFP4")
 SERVED_MODEL_NAME = os.environ.get("SERVED_MODEL_NAME", MODEL)
 STARTUP_TIMEOUT = int(os.environ.get("PD_STARTUP_TIMEOUT", "2400"))
@@ -68,7 +68,11 @@ def _wait_for_server(proc: subprocess.Popen, port: int, timeout: int) -> bool:
         if proc.poll() is not None:
             return False
         try:
-            if requests.get(url, timeout=5).status_code == 200:
+            resp = requests.get(url, timeout=5)
+            # Grafana Alloy squats 127.0.0.1:12345 on the Slurm CI nodes and
+            # answers any path with 200 + an HTML SPA; require a real model
+            # list so a port squatter cannot fake readiness.
+            if resp.status_code == 200 and "data" in resp.json():
                 return True
         except Exception:
             pass
