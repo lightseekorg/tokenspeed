@@ -1982,6 +1982,16 @@ class KimiK3ForConditionalGeneration(nn.Module):
         """Expose the shared MoonViT attribute expected by EPD prefill."""
         return self.vision.vision_tower if self.vision is not None else None
 
+    def get_multimodal_encoder_specs(self) -> dict[Modality, EncoderSpec]:
+        if self.vision is None or self.image_encoder is None:
+            return {}
+        return {
+            Modality.IMAGE: EncoderSpec(
+                self.image_encoder,
+                make_warmup_items=self.vision.make_image_warmup_items,
+            )
+        }
+
     def make_encoder_cudagraph_wrapper(
         self, mapping: Mapping
     ) -> EncoderCudaGraphWrapper:
@@ -2015,7 +2025,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
             input_ids=input_ids,
             text_embedding=self.get_input_embeddings(),
             ctx=multimodal_context,
-            encoders={Modality.IMAGE: EncoderSpec(self.image_encoder)},
+            encoders=self.get_multimodal_encoder_specs(),
             multimodal_model=self,
         )
         assert not model_kwargs, "Kimi-K3 multimodal path must stay embeds-only"

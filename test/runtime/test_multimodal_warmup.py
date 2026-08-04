@@ -21,13 +21,26 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
+from torch import nn
 
 from tokenspeed.runtime.execution.model_runner import ModelRunner
 from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
+from tokenspeed.runtime.models.inkling import (
+    InklingAudioTower,
+    InklingForConditionalGeneration,
+    InklingVisionTower,
+)
+from tokenspeed.runtime.models.minimax_m3 import (
+    MiniMaxM3SparseForConditionalGeneration,
+)
 from tokenspeed.runtime.models.moonvit import MoonViTVisionPath
+from tokenspeed.runtime.models.qwen3_asr import Qwen3ASRForConditionalGeneration
+from tokenspeed.runtime.models.qwen3_audio import Qwen3AudioEncoder
+from tokenspeed.runtime.models.qwen3_omni import Qwen3OmniMoeForConditionalGeneration
 from tokenspeed.runtime.models.qwen3_vision import Qwen3VLMoeVisionModel
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
@@ -216,6 +229,64 @@ def test_qwen_encoder_warmup_items_cover_image_and_video_contracts():
     assert video.video_grid_thw.tolist() == [[2, 4, 4]]
 
 
+def test_minimax_m3_warmup_items_cover_image_and_video_contracts():
+    image_encoder = Mock()
+    video_encoder = Mock()
+    model = SimpleNamespace(
+        vl_config=SimpleNamespace(
+            image_seq_length=4,
+            vision_config=SimpleNamespace(
+                num_channels=3,
+                temporal_patch_size=3,
+                patch_size=2,
+                spatial_merge_size=2,
+            ),
+        ),
+        vision_tower=SimpleNamespace(dtype=torch.bfloat16),
+        image_encoder=image_encoder,
+        video_encoder=video_encoder,
+    )
+    model._make_vision_warmup_items = (
+        MiniMaxM3SparseForConditionalGeneration._make_vision_warmup_items.__get__(model)
+    )
+    model.make_image_warmup_items = (
+        MiniMaxM3SparseForConditionalGeneration.make_image_warmup_items.__get__(model)
+    )
+    model.make_video_warmup_items = (
+        MiniMaxM3SparseForConditionalGeneration.make_video_warmup_items.__get__(model)
+    )
+
+    image = MiniMaxM3SparseForConditionalGeneration.make_image_warmup_items(model)[0]
+    video = MiniMaxM3SparseForConditionalGeneration.make_video_warmup_items(model)[0]
+    specs = MiniMaxM3SparseForConditionalGeneration.get_multimodal_encoder_specs(model)
+
+    _assert_warmup_item(image, Modality.IMAGE, (16, 36), torch.bfloat16)
+    assert image.image_grid_thw.tolist() == [[1, 4, 4]]
+    _assert_warmup_item(video, Modality.VIDEO, (32, 36), torch.bfloat16)
+    assert video.video_grid_thw.tolist() == [[2, 4, 4]]
+    assert specs[Modality.IMAGE].fn is image_encoder
+    assert specs[Modality.IMAGE].make_warmup_items is model.make_image_warmup_items
+    assert specs[Modality.VIDEO].fn is video_encoder
+    assert specs[Modality.VIDEO].make_warmup_items is model.make_video_warmup_items
+
+
+def test_minimax_m3_warmup_rejects_nonpositive_token_count():
+    model = SimpleNamespace(
+        vl_config=SimpleNamespace(
+            image_seq_length=0,
+            vision_config=SimpleNamespace(spatial_merge_size=2),
+        )
+    )
+
+    with pytest.raises(ValueError, match="positive"):
+        MiniMaxM3SparseForConditionalGeneration._make_vision_warmup_items(
+            model,
+            Modality.IMAGE,
+            temporal_patches=1,
+            grid_key="image_grid_thw",
+        )
+
+
 def test_moonvit_warmup_rejects_misaligned_native_grid():
     model = SimpleNamespace(
         vision_spec=SimpleNamespace(
@@ -238,3 +309,84 @@ def test_qwen_warmup_rejects_non_square_native_position_grid():
 
     with pytest.raises(ValueError, match="square"):
         Qwen3VLMoeVisionModel.make_image_warmup_items(model)
+
+
+def test_qwen_audio_warmup_uses_configured_inference_window():
+    tower = SimpleNamespace(
+        n_window=4,
+        n_window_infer=16,
+        num_mel_bins=8,
+        dtype=torch.bfloat16,
+    )
+
+    item = Qwen3AudioEncoder.make_warmup_items(tower)[0]
+
+    _assert_warmup_item(item, Modality.AUDIO, (8, 16), torch.bfloat16)
+
+
+class _InklingPatchEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.temporal_patch_size = 2
+        self.patch_size = 4
+        self.n_channels = 3
+        self.weight = nn.Parameter(torch.zeros(1, dtype=torch.bfloat16))
+
+
+def test_inkling_warmup_items_use_one_independent_native_unit():
+    vision = SimpleNamespace(vision_encoder=_InklingPatchEncoder())
+    image = InklingVisionTower.make_warmup_items(vision)[0]
+    _assert_warmup_item(image, Modality.IMAGE, (1, 2, 4, 4, 3), torch.bfloat16)
+
+    audio = SimpleNamespace(n_mel_bins=80)
+    audio_item = InklingAudioTower.make_warmup_items(audio)[0]
+    _assert_warmup_item(audio_item, Modality.AUDIO, (1, 80), torch.long)
+
+
+def test_audio_and_mixed_models_register_family_warmup_factories():
+    audio_factory = Mock()
+    audio_encoder = Mock()
+    image_factory = Mock()
+    video_factory = Mock()
+    image_encoder = Mock()
+    video_encoder = Mock()
+
+    audio_tower = SimpleNamespace(make_warmup_items=audio_factory)
+    asr = SimpleNamespace(audio_tower=audio_tower, audio_encoder=audio_encoder)
+    asr_specs = Qwen3ASRForConditionalGeneration.get_multimodal_encoder_specs(asr)
+    assert asr_specs[Modality.AUDIO].fn is audio_encoder
+    assert asr_specs[Modality.AUDIO].make_warmup_items is audio_factory
+
+    visual = SimpleNamespace(
+        make_image_warmup_items=image_factory,
+        make_video_warmup_items=video_factory,
+    )
+    omni = SimpleNamespace(
+        visual=visual,
+        audio_tower=audio_tower,
+        image_encoder=image_encoder,
+        video_encoder=video_encoder,
+        audio_encoder=audio_encoder,
+    )
+    omni_specs = Qwen3OmniMoeForConditionalGeneration.get_multimodal_encoder_specs(omni)
+    assert set(omni_specs) == {Modality.IMAGE, Modality.VIDEO, Modality.AUDIO}
+    assert omni_specs[Modality.IMAGE].deepstack
+    assert omni_specs[Modality.VIDEO].deepstack
+    assert omni_specs[Modality.AUDIO].make_warmup_items is audio_factory
+    omni.audio_tower = None
+    assert set(
+        Qwen3OmniMoeForConditionalGeneration.get_multimodal_encoder_specs(omni)
+    ) == {Modality.IMAGE, Modality.VIDEO}
+
+    inkling = SimpleNamespace(
+        visual=SimpleNamespace(make_warmup_items=image_factory),
+        audio=SimpleNamespace(make_warmup_items=audio_factory),
+        image_encoder=image_encoder,
+        audio_encoder=audio_encoder,
+    )
+    inkling_specs = InklingForConditionalGeneration.get_multimodal_encoder_specs(
+        inkling
+    )
+    assert set(inkling_specs) == {Modality.IMAGE, Modality.AUDIO}
+    assert inkling_specs[Modality.IMAGE].make_warmup_items is image_factory
+    assert inkling_specs[Modality.AUDIO].make_warmup_items is audio_factory
