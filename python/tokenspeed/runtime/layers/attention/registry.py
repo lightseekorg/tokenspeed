@@ -1387,7 +1387,7 @@ def create_attn_components(
             )
 
     _validate_shared_lcm_geometry(pool, draft_pool)
-    
+
     if (
         draft_attn_backend is not None
         and getattr(draft_pool, "_lcm_memory_plan", None) is not None
