@@ -31,9 +31,13 @@ install:
   - python3 -m pip install "amd-mori[flydsl]==1.2.2"
 ut:
   commands:
+    # Diagnostic: mori_available() swallows import errors and pytest -v hides skip reasons,
+    # so surface the real MORI import status here (non-fatal -- the run still reaches the
+    # tests, and -rs below prints why they skip if they do).
+    - python3 -c "import flydsl, mori; from mori.ops.dispatch_combine_v2 import EpDispatchCombineOp; print('MORI import OK')" || echo "MORI import FAILED (traceback above)"
     # Real all-to-all dispatch/combine across 2 ranks: bf16 + native mxfp4 vs a
     # replicated full-MoE reference. The test self-skips if MORI/flydsl are missing
     # or world size < 2, so a misconfigured runner degrades to a skip, not a failure.
-    - torchrun --standalone --nproc-per-node=2 -m pytest tokenspeed-kernel/test/ops/moe/test_mori_ep_distributed_gfx950.py -v
+    - torchrun --standalone --nproc-per-node=2 -m pytest tokenspeed-kernel/test/ops/moe/test_mori_ep_distributed_gfx950.py -v -rs
 report:
   github_step_summary: true

@@ -390,13 +390,13 @@ class DeepseekV3MoE(nn.Module):
             # all_reduce comm-mode compensation for real all-to-all backends. When
             # attn.tp_size == moe.tp_ep_size (dp=1 full-EP) the decoder's post_mlp_fused
             # all_reduces the MoE output over the tp_ep group, expecting a PARTIAL
-            # (masked-replicate) contribution. MORI/DeepEP return the COMPLETE routed result
-            # on every rank, so pre-divide by tp_ep_size and let all_reduce reconstruct it.
-            # The shared expert is tp_ep-sharded (partial) and is completed by the same
-            # all_reduce, so it is NOT divided. (dp>1 uses forward_alltoall, which has no
-            # framework MoE reduce.)
+            # (masked-replicate) contribution. MORI returns the COMPLETE routed result on
+            # every rank, so pre-divide by tp_ep_size and let all_reduce reconstruct it. The
+            # shared expert is tp_ep-sharded (partial) and is completed by the same all_reduce,
+            # so it is NOT divided. (dp>1 uses forward_alltoall, no framework MoE reduce.)
+            # MORI only -- DeepEP keeps its upstream handling.
             if (
-                get_all2all_backend().is_all_to_all()
+                get_all2all_backend().is_mori()
                 and self.mapping.attn.tp_size == self.mapping.moe.tp_ep_size
                 and self.mapping.moe.tp_ep_size > 1
             ):
@@ -418,18 +418,19 @@ class DeepseekV3MoE(nn.Module):
         comm_manager,
         ctx: ForwardContext,
     ) -> torch.Tensor:
-        """All-to-all EP forward for real dispatch/combine backends (e.g. MORI), dp>1 only.
+        """All-to-all EP forward for the MORI dispatch/combine backend, dp>1 only.
 
-        Used for dp>1 DP-attention, where attn.tp_size != moe.tp_ep_size selects the RSAG
-        comm mode; dp=1 full-EP instead takes the standard DeepseekV3MoE.forward path (see
-        forward_mlp). The routed experts return the COMPLETE result from the backend's
-        combine (no framework MoE reduce); only the tp_ep-sharded shared expert is reduced,
-        via pre/post_moe_comm (all-gather + reduce-scatter under RSAG).
+        Gated to MORI (see forward_mlp); DeepEP keeps its upstream path. Used for dp>1
+        DP-attention, where attn.tp_size != moe.tp_ep_size selects the RSAG comm mode; dp=1
+        full-EP instead takes the standard DeepseekV3MoE.forward path. The routed experts
+        return the COMPLETE result from the backend's combine (no framework MoE reduce); only
+        the tp_ep-sharded shared expert is reduced, via pre/post_moe_comm (all-gather +
+        reduce-scatter under RSAG).
 
         Tokens are local per rank (distinct dp shards). Routing + routed experts run on the
-        LOCAL tokens; the MORI/DeepEP kernel does dispatch -> expert GEMM -> combine
-        internally and returns the COMPLETE per-local-token result, so NO framework MoE
-        collective is used for the routed path (unlike the masked-replicate ``none`` path).
+        LOCAL tokens; the MORI kernel does dispatch -> expert GEMM -> combine internally and
+        returns the COMPLETE per-local-token result, so NO framework MoE collective is used
+        for the routed path (unlike the masked-replicate ``none`` path).
 
         The shared expert is tp_ep-sharded (RowParallel, reduce_results=False), so it needs
         the full batch: all-gather the local shards over the moe.tp_ep group (``pre_moe_comm``),
@@ -1495,16 +1496,17 @@ class DeepseekV3DecoderLayer(nn.Module):
         num_global_tokens,
         max_num_tokens_per_gpu,
     ):
-        # All-to-all EP path (real dispatch/combine backend, e.g. MORI) in RSAG mode only
-        # (dp>1 DP-attention): the MoE keeps tokens LOCAL and does its own dispatch/combine,
-        # returning the COMPLETE routed result, so we bypass the framework's pre/post-MoE
-        # collectives for the routed path (forward_alltoall reduces only the shared expert
-        # via pre/post_moe_comm). dp=1 full-EP (use_all_reduce) instead falls through to the
-        # standard path below, whose post_mlp_fused all_reduce reconstructs the routed result
-        # from the /tp_ep_size-compensated per-rank output (see DeepseekV3MoE.forward).
+        # MORI all-to-all EP path in RSAG mode only (dp>1 DP-attention): the MoE keeps tokens
+        # LOCAL and does its own dispatch/combine, returning the COMPLETE routed result, so we
+        # bypass the framework's pre/post-MoE collectives for the routed path (forward_alltoall
+        # reduces only the shared expert via pre/post_moe_comm). dp=1 full-EP (use_all_reduce)
+        # instead falls through to the standard path below, whose post_mlp_fused all_reduce
+        # reconstructs the routed result from the /tp_ep_size-compensated per-rank output (see
+        # DeepseekV3MoE.forward). MORI only -- DeepEP keeps its upstream path (it needs the
+        # deepep-mode low_latency decision this path does not supply).
         if (
             self.is_moe_layer
-            and get_all2all_backend().is_all_to_all()
+            and get_all2all_backend().is_mori()
             and not self.comm_manager.use_all_reduce(is_moe=True)
         ):
             return self.mlp.forward_alltoall(
