@@ -1891,7 +1891,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         backend.init_cuda_graph_state(
             2,
             paged_cache_group_specs=(
-                SimpleNamespace(
+                PagedCacheGroupSpec(
                     group_id="v4.swa_kv",
                     retention="sliding_window",
                     rows_per_page=64,

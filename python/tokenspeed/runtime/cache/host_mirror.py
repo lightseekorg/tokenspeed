@@ -29,16 +29,16 @@ from collections.abc import Iterable, Sequence
 import torch
 
 
-def _identity_dedup(
+def _physical_view_dedup(
     tensors: Sequence[torch.Tensor | None],
 ) -> list[torch.Tensor]:
-    """Distinct tensors in first-appearance order; None slots (GDN
+    """Distinct physical views in first-appearance order; None slots (GDN
     state layers carry no KV) are skipped."""
     seen: dict[int, torch.Tensor] = {}
     for t in tensors:
         if t is None:
             continue
-        seen.setdefault(id(t), t)
+        seen.setdefault(t.data_ptr(), t)
     return list(seen.values())
 
 
@@ -52,7 +52,7 @@ def bytes_per_host_page(device_kv_pool) -> int:
     device pool alone (no mirror allocation) -- the sizing side of
     ``HostMirror.bytes_per_host_page`` for host-budget arithmetic.
     """
-    tensors = _identity_dedup(device_kv_pool.k_buffer) + _identity_dedup(
+    tensors = _physical_view_dedup(device_kv_pool.k_buffer) + _physical_view_dedup(
         device_kv_pool.v_buffer
     )
     page_size = int(device_kv_pool.page_size)
@@ -88,21 +88,23 @@ class HostMirror:
         # Slab layout dedups the per-layer entries to one K + one V slab per
         # paired layer set (layers-per-group slabs); legacy layout keeps all
         # per-layer buffers (dead-row copies are harmless).
-        k_tensors = _identity_dedup(device_kv_pool.k_buffer)
-        v_tensors = _identity_dedup(device_kv_pool.v_buffer)
+        k_tensors = _physical_view_dedup(device_kv_pool.k_buffer)
+        v_tensors = _physical_view_dedup(device_kv_pool.v_buffer)
         self.num_k_tensors = len(k_tensors)
 
-        k_index = {id(t): i for i, t in enumerate(k_tensors)}
-        v_index = {id(t): i for i, t in enumerate(v_tensors)}
+        k_index = {t.data_ptr(): i for i, t in enumerate(k_tensors)}
+        v_index = {t.data_ptr(): i for i, t in enumerate(v_tensors)}
         # None entries (GDN state layers, no KV) map to None: those
         # layers fence on state_tensor_indices_of_layer instead.
         self._layer_to_k_index = [
-            None if t is None else k_index[id(t)] for t in device_kv_pool.k_buffer
+            None if t is None else k_index[t.data_ptr()]
+            for t in device_kv_pool.k_buffer
         ]
         # Invariant D2 relies on: a layer's V tensor sits at
         # tensor_index_of_layer(layer) + num_k_tensors.
         assert self._layer_to_k_index == [
-            None if t is None else v_index[id(t)] for t in device_kv_pool.v_buffer
+            None if t is None else v_index[t.data_ptr()]
+            for t in device_kv_pool.v_buffer
         ], "host mirror: K/V dedup orders diverge"
 
         state_slabs = _state_slabs(device_kv_pool)
