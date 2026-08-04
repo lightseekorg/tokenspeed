@@ -1031,31 +1031,28 @@ class DeepseekV3AttentionMLA(nn.Module):
         )
 
         if use_fp8_prefill:
-            if self.rotary_emb is not None:
-                # Expand k_pe from [tokens,1,rope] to [tokens,heads,rope] for GQA
-                k_pe_expanded = k_pe.expand(-1, self.num_local_heads, -1)
 
-                q_fp8, k_fp8 = apply_rope_mla(
-                    positions=positions,
-                    q_rope=q_pe,
-                    k_rope=k_pe_expanded,
-                    q_nope=q_nope,
-                    k_nope=k_nope,
-                    cos_sin_cache=self.rotary_emb.cos_sin_cache,
-                    is_neox=getattr(self.rotary_emb, "is_neox_style", True),
-                    quant_scale_q=1.0,
-                    quant_scale_kv=k_scale,
-                    enable_pdl=pdl_enabled(),
-                )
+            if self.rotary_emb is not None:
+                k_rope = k_pe.expand(-1, self.num_local_heads, -1)
+                cos_sin_cache = self.rotary_emb.cos_sin_cache
+                is_neox = self.rotary_emb.is_neox_style
             else:
-                # Assemble exactly like the BF16 path, then quantize with the
-                # same scales the fused kernel would use (1.0 per the gate).
-                q[..., self.qk_nope_head_dim :] = q_pe
-                k = torch.empty_like(q)
-                k[..., : self.qk_nope_head_dim] = k_nope
-                k[..., self.qk_nope_head_dim :] = k_pe
-                q_fp8 = fp8_quantize(q, enable_pdl=pdl_enabled())
-                k_fp8 = fp8_quantize(k, enable_pdl=pdl_enabled())
+                k_rope = k_pe
+                cos_sin_cache = None
+                is_neox = False
+
+            q_fp8, k_fp8 = apply_rope_mla(
+                positions=positions,
+                q_rope=q_pe,
+                k_rope=k_rope,
+                q_nope=q_nope,
+                k_nope=k_nope,
+                cos_sin_cache=cos_sin_cache,
+                is_neox=is_neox,
+                quant_scale_q=1.0,
+                quant_scale_kv=k_scale,
+                enable_pdl=pdl_enabled(),
+            )
 
             v_fp8 = fp8_quantize(v, enable_pdl=pdl_enabled())
 
