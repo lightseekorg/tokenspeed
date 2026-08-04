@@ -42,12 +42,14 @@ logger = get_colorful_logger(__name__)
 
 
 def infer_multimodal_encoder_dtype(model: torch.nn.Module) -> str | None:
-    """Return the dtype of the loaded vision tower when it is discoverable."""
+    """Return the dtype of the loaded multimodal encoder when discoverable."""
     for path in (
         ("visual",),
         ("vision_tower",),
+        ("audio_tower",),
         ("model", "visual"),
         ("model", "vision_tower"),
+        ("model", "audio_tower"),
     ):
         component = model
         for name in path:
