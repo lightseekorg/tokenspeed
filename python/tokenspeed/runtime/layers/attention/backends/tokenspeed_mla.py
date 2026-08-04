@@ -134,7 +134,7 @@ class CuteDSLMLABackend(AttentionBackend):
 
         # Latched the first time paged cache metadata arrives. Once bound, a
         # forward without cache metadata is a hard error: the paged-cache contract
-        # forbids falling back to legacy req_to_page metadata.
+        # forbids falling back to legacy page_table metadata.
         self._cache_groups_bound = False
         # Set by the registry before graph capture; see mark_cache_contract.
         self._cache_contract_bound = False
@@ -202,15 +202,17 @@ class CuteDSLMLABackend(AttentionBackend):
         self.decode_cuda_graph_group_out_cache_loc: torch.Tensor | None = None
         self.chunked_prefill_metadata: TRTLLMMLAChunkedPrefillMetadata | None = None
 
-    def mark_cache_contract(self) -> None:
+    def mark_cache_contract(self, logical_page_size: int | None = None) -> None:
         """Mark this MLA backend as a Kimi-K3 Paged cache contract sub-backend.
 
         Called by the registry when the backend is constructed for the
         Kimi-K3 LCM contract path. Enables grouped CUDA-graph
         capture/replay with stable full-attention block-table and write-location
-        buffers; DeepSeek's shared backend is never marked and keeps the
-        single-table graph path unchanged.
+        buffers. ``logical_page_size`` is accepted for signature uniformity with
+        the other contract sub-backends; this backend derives its page geometry
+        from the cache metadata each forward.
         """
+        del logical_page_size
         self._cache_contract_bound = True
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
@@ -227,20 +229,23 @@ class CuteDSLMLABackend(AttentionBackend):
         max_blocks: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        req_to_page: torch.Tensor,
+        page_table: torch.Tensor,
         block_kv_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Build page-table from req_to_page using vectorized tensor indexing."""
+        """Build the page table from the batch-ordered placeholder table.
+
+        Only the idle/warmup path before the backend binds to the cache
+        contract reaches this; ``page_table`` is batch-ordered (row i == batch
+        position i).
+        """
         if block_kv_indices is None:
             block_kv_indices = torch.zeros(
                 (batch_size, max_blocks), dtype=torch.int32, device=self.device
             )
 
-        copy_len = min(max_blocks, req_to_page.shape[1])
+        copy_len = min(max_blocks, page_table.shape[1])
 
-        block_kv_indices[:batch_size, :copy_len] = req_to_page[
-            req_pool_indices[:batch_size], :copy_len
-        ]
+        block_kv_indices[:batch_size, :copy_len] = page_table[:batch_size, :copy_len]
 
         return block_kv_indices
 
@@ -419,7 +424,7 @@ class CuteDSLMLABackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
-        req_to_page: torch.Tensor,
+        page_table: torch.Tensor,
         seq_lens_cpu: torch.Tensor | None = None,
         **kwargs,
     ):
@@ -441,18 +446,18 @@ class CuteDSLMLABackend(AttentionBackend):
                 group_table, seq_lens[:bs], logical_page_size
             )
         elif self._cache_groups_bound and bs > 0 and not forward_mode.is_idle():
-            # Missing Paged cache metadata must never select the legacy req_to_page
+            # Missing Paged cache metadata must never select the legacy page_table
             # path after the backend is bound to the contract.
             raise RuntimeError(
                 "tokenspeed_mla is bound to the Paged cache contract but received "
-                "no paged cache metadata; refusing the legacy req_to_page path"
+                "no paged cache metadata; refusing the legacy page_table path"
             )
 
         if forward_mode.is_extend_or_mixed():
             self._init_prefill_metadata(
                 seq_lens[:num_extends],
                 req_pool_indices=req_pool_indices[:num_extends],
-                req_to_page=req_to_page,
+                page_table=page_table,
                 extend_prefix_lens=kwargs.pop("extend_prefix_lens"),
                 extend_prefix_lens_cpu=kwargs.pop("extend_prefix_lens_cpu"),
                 extend_seq_lens=kwargs.pop("extend_seq_lens"),
@@ -486,7 +491,7 @@ class CuteDSLMLABackend(AttentionBackend):
                 num_extends,
                 req_pool_indices,
                 seq_lens,
-                req_to_page,
+                page_table,
                 group_table=group_table,
                 logical_page_size=logical_page_size,
                 q_len_per_req=verify_q_len,
@@ -509,7 +514,7 @@ class CuteDSLMLABackend(AttentionBackend):
         byte-for-byte the base-class behavior, so DeepSeek-style MLA models
         once cache metadata is bound, the group-derived
         locations stored in the current forward's metadata are authoritative
-        and the caller's req_to_page-derived locations are discarded.
+        and the caller's page_table-derived locations are discarded.
         """
         if not self._cache_groups_bound:
             return out_cache_loc
@@ -544,7 +549,7 @@ class CuteDSLMLABackend(AttentionBackend):
         num_extends: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        req_to_page: torch.Tensor,
+        page_table: torch.Tensor,
         group_table: torch.Tensor | None = None,
         logical_page_size: int | None = None,
         q_len_per_req: int = 1,
@@ -552,7 +557,7 @@ class CuteDSLMLABackend(AttentionBackend):
         max_blocks = self._calc_padded_blocks(self.max_context_len)
         if group_table is not None:
             # Paged cache path: kernel pages and write locations both derive from
-            # the full-attention table; req_to_page is never consulted.
+            # the full-attention table; page_table is never consulted.
             block_kv_indices = self._expand_group_block_kv_indices(
                 bs, max_blocks, group_table, logical_page_size
             )
@@ -565,7 +570,7 @@ class CuteDSLMLABackend(AttentionBackend):
             )
         else:
             block_kv_indices = self._create_block_kv_indices(
-                bs, max_blocks, req_pool_indices, seq_lens, req_to_page
+                bs, max_blocks, req_pool_indices, seq_lens, page_table
             )
             group_out_cache_loc = None
 
@@ -581,7 +586,7 @@ class CuteDSLMLABackend(AttentionBackend):
         self,
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor | None = None,
-        req_to_page: torch.Tensor | None = None,
+        page_table: torch.Tensor | None = None,
         extend_prefix_lens: torch.Tensor | None = None,
         extend_prefix_lens_cpu: torch.Tensor | None = None,
         extend_seq_lens: torch.Tensor | None = None,
@@ -628,14 +633,18 @@ class CuteDSLMLABackend(AttentionBackend):
             # full-attention table (rows are batch-ordered, prefill rows
             # first), at the logical-page granularity — the produced KV slots
             # are the same absolute token locations either way.
-            chunk_req_to_page = group_table[:num_extends]
+            chunk_page_table = group_table[:num_extends]
             chunk_req_pool_indices = torch.arange(
                 num_extends, dtype=torch.int64, device=group_table.device
             )
             chunk_page_size = logical_page_size
         else:
-            chunk_req_to_page = req_to_page
-            chunk_req_pool_indices = req_pool_indices
+            # Idle/warmup placeholder: page_table is batch-ordered (row i ==
+            # batch position i), so identity row indices apply.
+            chunk_page_table = page_table
+            chunk_req_pool_indices = torch.arange(
+                num_extends, dtype=torch.int64, device=page_table.device
+            )
             chunk_page_size = self.page_size
         (
             chunked_loop_num,
@@ -646,7 +655,7 @@ class CuteDSLMLABackend(AttentionBackend):
         ) = build_chunked_prefill_metadata_arrays(
             extend_prefix_lens,
             extend_prefix_lens_cpu,
-            chunk_req_to_page,
+            chunk_page_table,
             chunk_req_pool_indices,
             chunk_page_size,
         )
@@ -764,7 +773,7 @@ class CuteDSLMLABackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
-        req_to_page: torch.Tensor = None,
+        page_table: torch.Tensor = None,
         **kwargs,
     ):
         cache_metadata = kwargs.get("cache_metadata")
@@ -799,13 +808,13 @@ class CuteDSLMLABackend(AttentionBackend):
 
         # Block indices are refreshed separately; when the block table is
         # aliased to a peer backend, that peer's replay already populated it.
-        if req_to_page is not None and not self._block_table_aliased:
+        if page_table is not None and not self._block_table_aliased:
             self._create_block_kv_indices(
                 bs,
                 metadata.block_kv_indices.shape[1],
                 req_pool_indices[:bs],
                 seq_lens[:bs],
-                req_to_page,
+                page_table,
                 metadata.block_kv_indices,
             )
 
@@ -902,7 +911,7 @@ class CuteDSLMLABackend(AttentionBackend):
             assert k is not None
             if self._cache_groups_bound:
                 # Paged cache: write locations derive from the full-attention
-                # table, never from the caller's req_to_page-derived locs.
+                # table, never from the caller's page_table-derived locs.
                 out_cache_loc = self.select_out_cache_loc(
                     layer, out_cache_loc, ForwardMode.DECODE
                 )

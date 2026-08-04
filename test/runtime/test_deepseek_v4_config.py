@@ -728,7 +728,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             actual_bs=0,
             req_pool_indices=torch.zeros(4, dtype=torch.int32),
             seq_lens=torch.ones(4, dtype=torch.int32),
-            req_to_page=torch.zeros((1, 1), dtype=torch.int32),
+            page_table=torch.zeros((1, 1), dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
             paged_cache_block_tables={
                 "v4.swa": torch.zeros((4, 1), dtype=torch.int32),
@@ -761,7 +761,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         wrapper.attn_backend = FakeBackend("target")
         wrapper.draft_attn_backend = FakeBackend("draft")
         wrapper.drafter = SimpleNamespace(
-            req_to_page=torch.zeros((1, 1), dtype=torch.int32),
+            page_table=torch.zeros((1, 1), dtype=torch.int32),
             draft_seq_lens_buf=torch.zeros(4, dtype=torch.int32),
         )
         wrapper.max_tokens_per_req = 4
@@ -774,7 +774,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             actual_bs=2,
             req_pool_indices=torch.zeros(4, dtype=torch.int32),
             seq_lens=torch.ones(4, dtype=torch.int32),
-            req_to_page=torch.zeros((1, 1), dtype=torch.int32),
+            page_table=torch.zeros((1, 1), dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
             paged_cache_block_tables={"v4.swa": table},
             paged_cache_block_table_base_offsets=offsets,
@@ -843,7 +843,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         wrapper.draft_attn_backend = FakeBackend("draft")
         wrapper.max_tokens_per_req = 4
         wrapper.drafter = SimpleNamespace(
-            req_to_page=torch.zeros((1, 1), dtype=torch.int32),
+            page_table=torch.zeros((1, 1), dtype=torch.int32),
             draft_seq_lens_buf=torch.tensor([0, 0], dtype=torch.int32),
         )
         wrapper.use_v4_mtp_paged_metadata = False
@@ -854,7 +854,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             num_extends=2,
             req_pool_indices=torch.zeros(2, dtype=torch.int32),
             seq_lens=seq_lens,
-            req_to_page=torch.zeros((1, 1), dtype=torch.int32),
+            page_table=torch.zeros((1, 1), dtype=torch.int32),
             forward_mode=ForwardMode.EXTEND,
             extend_seq_lens_cpu=torch.tensor([1, 1], dtype=torch.int32),
         )
@@ -885,7 +885,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         wrapper.draft_attn_backend = FakeBackend("draft")
         wrapper.max_tokens_per_req = 4
         wrapper.drafter = SimpleNamespace(
-            req_to_page=torch.zeros((1, 1), dtype=torch.int32),
+            page_table=torch.zeros((1, 1), dtype=torch.int32),
             draft_seq_lens_buf=torch.tensor([11, 12], dtype=torch.int32),
         )
 
@@ -896,7 +896,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             num_extends=0,
             req_pool_indices=torch.zeros(2, dtype=torch.int32),
             seq_lens=seq_lens,
-            req_to_page=torch.zeros((1, 1), dtype=torch.int32),
+            page_table=torch.zeros((1, 1), dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
         )
 
@@ -913,7 +913,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             num_extends=0,
             req_pool_indices=torch.zeros(2, dtype=torch.int32),
             seq_lens=seq_lens,
-            req_to_page=torch.zeros((1, 1), dtype=torch.int32),
+            page_table=torch.zeros((1, 1), dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
         )
 
@@ -1601,7 +1601,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             seq_lens=torch.tensor([200, 80], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
-            req_to_page=torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32),
+            page_table=torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32),
             paged_cache_block_tables={"v4.swa_kv": compact},
             paged_cache_block_table_base_offsets={"v4.swa_kv": base},
         )
@@ -1704,7 +1704,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int64),
             seq_lens=torch.tensor([7, 10, 4], dtype=torch.int32),
             forward_mode=ForwardMode.MIXED,
-            req_to_page=torch.zeros((3, 1), dtype=torch.int32),
+            page_table=torch.zeros((3, 1), dtype=torch.int32),
             extend_seq_lens_cpu=torch.tensor([7], dtype=torch.int32),
             num_extends=1,
         )
@@ -1750,7 +1750,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                         [prefill_tokens, 100, 200], dtype=torch.int32
                     ),
                     forward_mode=ForwardMode.MIXED,
-                    req_to_page=torch.zeros((3, 256), dtype=torch.int32),
+                    page_table=torch.zeros((3, 256), dtype=torch.int32),
                     extend_seq_lens_cpu=torch.tensor(
                         [prefill_tokens], dtype=torch.int32
                     ),
@@ -1809,7 +1809,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
                 seq_lens=torch.tensor([7, 20], dtype=torch.int32),
                 forward_mode=ForwardMode.MIXED,
-                req_to_page=torch.zeros((2, 64), dtype=torch.int32),
+                page_table=torch.zeros((2, 64), dtype=torch.int32),
                 extend_seq_lens_cpu=torch.tensor([7], dtype=torch.int32),
                 num_extends=1,
             )
@@ -1832,14 +1832,14 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         req_pool_indices = torch.tensor([0, 1], dtype=torch.int64)
         seq_lens = torch.tensor([7, 20], dtype=torch.int32)
-        req_to_page = torch.zeros((2, 64), dtype=torch.int32)
+        page_table = torch.zeros((2, 64), dtype=torch.int32)
         backend.init_forward_metadata(
             bs=2,
             num_tokens=7 + verify_width,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             forward_mode=ForwardMode.MIXED,
-            req_to_page=req_to_page,
+            page_table=page_table,
             extend_seq_lens_cpu=torch.tensor([7], dtype=torch.int32),
             num_extends=1,
         )
@@ -1852,7 +1852,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             forward_mode=ForwardMode.DECODE,
-            req_to_page=req_to_page,
+            page_table=page_table,
             num_extends=0,
         )
         decode_metadata = backend.forward_metadata
@@ -1939,7 +1939,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             seq_lens=torch.tensor([200, 80], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
-            req_to_page=torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32),
+            page_table=torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32),
             paged_cache_block_tables={
                 "v4.swa_kv": swa,
                 "v4.c4a.compressor_state": c4_state,
@@ -2288,7 +2288,14 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
             seq_lens=torch.tensor([5, 9, 12], dtype=torch.int32),
             forward_mode=ForwardMode.MIXED,
-            req_to_page=torch.tensor([[10], [20], [30]], dtype=torch.int32),
+            block_tables={
+                # Batch-ordered compressed-KV table (row i == batch position i);
+                # the base block_table for ratio<=1 indexer layers resolves from
+                # the smallest-ratio compressed-KV group.
+                "v4.c4a.compressed_kv": torch.tensor(
+                    [[10], [20], [30]], dtype=torch.int32
+                ),
+            },
             extend_seq_lens_cpu=torch.tensor([3, 1, 1], dtype=torch.int32),
             extend_prefix_lens_cpu=torch.tensor([2, 8, 11], dtype=torch.int32),
             num_extends=1,
@@ -2376,7 +2383,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
             seq_lens=torch.tensor([5, 9, 12, 6], dtype=torch.int32),
             forward_mode=ForwardMode.MIXED,
-            req_to_page=torch.tensor([[10], [20], [30], [40]], dtype=torch.int32),
+            page_table=torch.tensor([[10], [20], [30], [40]], dtype=torch.int32),
             extend_seq_lens_cpu=torch.tensor([3, 4, 1, 1], dtype=torch.int32),
             extend_prefix_lens_cpu=torch.tensor([2, 5, 11], dtype=torch.int32),
             num_extends=3,
@@ -2421,7 +2428,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
             seq_lens=torch.tensor([5, 9, 12], dtype=torch.int32),
             forward_mode=ForwardMode.MIXED,
-            req_to_page=torch.tensor([[10], [20], [30]], dtype=torch.int32),
+            page_table=torch.tensor([[10], [20], [30]], dtype=torch.int32),
             extend_seq_lens_cpu=torch.tensor([3, 1, 1], dtype=torch.int32),
             num_extends=1,
         )
@@ -2524,7 +2531,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
             seq_lens=torch.tensor([5, 9, 12], dtype=torch.int32),
             forward_mode=ForwardMode.MIXED,
-            req_to_page=torch.tensor([[10], [20], [30]], dtype=torch.int32),
+            page_table=torch.tensor([[10], [20], [30]], dtype=torch.int32),
             extend_seq_lens_cpu=torch.tensor([3, 1, 1], dtype=torch.int32),
             num_extends=1,
         )
@@ -2612,7 +2619,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             seq_lens=torch.tensor([70, 3], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
-            req_to_page=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
+            page_table=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
         )
         self.assertTrue(
             torch.equal(
@@ -2645,7 +2652,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             seq_lens=torch.tensor([70, 3], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
-            req_to_page=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
+            page_table=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
         )
         self.assertEqual(
             draft_backend.forward_metadata.forward_mode, ForwardMode.DECODE
@@ -2665,7 +2672,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
                 seq_lens=torch.tensor([70, 3], dtype=torch.int32),
                 forward_mode=ForwardMode.DECODE,
-                req_to_page=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
+                page_table=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
             )
 
     def test_deepseek_v4_decode_metadata_defaults_to_one_token(self):
@@ -2689,7 +2696,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             seq_lens=torch.tensor([70, 3], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
-            req_to_page=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
+            page_table=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
         )
 
         self.assertTrue(
@@ -2807,7 +2814,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             seq_lens=seq_lens,
             forward_mode=ForwardMode.DECODE,
-            req_to_page=c4_table,
+            page_table=c4_table,
             paged_cache_block_tables=_v4_compressed_kv_tables(c4=c4_table),
         )
         positions = seq_lens.to(torch.int64) - 1
@@ -2843,7 +2850,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             seq_lens=seq_lens,
             forward_mode=ForwardMode.DECODE,
-            req_to_page=c128_table,
+            page_table=c128_table,
             paged_cache_block_tables=_v4_compressed_kv_tables(c128=c128_table),
         )
         hca_positions = seq_lens.to(torch.int64) - 1
@@ -2900,7 +2907,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1], device=device, dtype=torch.int64),
             seq_lens=seq_lens,
             forward_mode=ForwardMode.DECODE,
-            req_to_page=c128_table,
+            page_table=c128_table,
             paged_cache_block_tables=_v4_compressed_kv_tables(c128=c128_table),
         )
         positions = seq_lens.to(torch.int64) - 1
@@ -3044,7 +3051,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             seq_lens=seq_lens,
             forward_mode=ForwardMode.DECODE,
-            req_to_page=compressed_table,
+            page_table=compressed_table,
             paged_cache_block_tables=_v4_compressed_kv_tables(
                 c4=compressed_table,
                 c128=compressed_table,
@@ -3120,7 +3127,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.arange(4, dtype=torch.int32),
             seq_lens=torch.tensor([70, 3, 1, 1], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
-            req_to_page=torch.tensor(
+            page_table=torch.tensor(
                 [
                     [10, 11],
                     [20, 21],
@@ -3346,7 +3353,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.arange(4, dtype=torch.int32),
             seq_lens=torch.tensor([70, 3, 1, 1], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
-            req_to_page=torch.tensor(
+            page_table=torch.tensor(
                 [
                     [10, 11],
                     [20, 21],
@@ -3401,7 +3408,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.arange(4, dtype=torch.int32),
             seq_lens=torch.tensor([70, 3, 1, 1], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
-            req_to_page=torch.tensor(
+            page_table=torch.tensor(
                 [
                     [10, 11],
                     [20, 21],
@@ -3490,14 +3497,14 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         req_pool_indices = torch.tensor([0], dtype=torch.int32)
         seq_lens = torch.tensor([6], dtype=torch.int32)
-        req_to_page = torch.tensor([[10]], dtype=torch.int32)
+        page_table = torch.tensor([[10]], dtype=torch.int32)
         backend.init_forward_metadata(
             bs=1,
             num_tokens=6,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             forward_mode=ForwardMode.EXTEND,
-            req_to_page=req_to_page,
+            page_table=page_table,
         )
         backend.init_forward_metadata(
             bs=1,
@@ -3505,7 +3512,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             forward_mode=ForwardMode.DECODE,
-            req_to_page=req_to_page,
+            page_table=page_table,
         )
         backend.advance_draft_forward_metadata()
 

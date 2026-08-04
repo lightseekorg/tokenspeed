@@ -264,7 +264,7 @@ class WrapperReplayGroupedTest(_TorchCase):
             ),
             drafter=SimpleNamespace(
                 draft_seq_lens_buf=torch.zeros(2, dtype=torch.int32),
-                req_to_page=torch.zeros((2, MAX_NUM_PAGES), dtype=torch.int32),
+                page_table=torch.zeros((2, MAX_NUM_PAGES), dtype=torch.int32),
             ),
             _draft_group_tables=lambda tables: tables,
         )
@@ -278,7 +278,7 @@ class WrapperReplayGroupedTest(_TorchCase):
             actual_bs=1,
             req_pool_indices=torch.arange(2, dtype=torch.int64),
             seq_lens=torch.ones(2, dtype=torch.int32),
-            req_to_page=torch.zeros((2, MAX_NUM_PAGES), dtype=torch.int32),
+            page_table=torch.zeros((2, MAX_NUM_PAGES), dtype=torch.int32),
             forward_mode=_decode_forward_mode(),
             block_tables=tables,
         )
@@ -396,7 +396,7 @@ class WrapperEagerGroupGuardTest(_TorchCase):
             bs=2,
             ctx=ctx,
             sampling_info=None,
-            req_to_page=torch.zeros((MAX_BS, MAX_NUM_PAGES), dtype=torch.int32),
+            page_table=torch.zeros((MAX_BS, MAX_NUM_PAGES), dtype=torch.int32),
             block_tables=block_tables,
         )
         return calls
@@ -572,7 +572,7 @@ class BackendStateGroupShedTest(_BackendCase):
             num_extends=0,
             req_pool_indices=torch.arange(2, dtype=torch.int64),
             seq_lens=torch.tensor([3, 4], dtype=torch.int32),
-            req_to_page=torch.zeros((MAX_BS, MAX_NUM_PAGES), dtype=torch.int32),
+            page_table=torch.zeros((MAX_BS, MAX_NUM_PAGES), dtype=torch.int32),
             forward_mode=forward_mode,
             block_tables={
                 "full_attention": torch.tensor([[1, 2], [3, 4]], dtype=torch.int32),

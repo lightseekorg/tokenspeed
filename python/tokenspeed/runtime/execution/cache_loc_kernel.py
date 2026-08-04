@@ -28,107 +28,17 @@ import torch
 import triton
 import triton.language as tl
 
-from tokenspeed.runtime.execution.block_table import (
-    select_block_table,
-    unpadded_block_table_row,
-)
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
 
 
 @triton.jit
-def write_req_to_page_rows_kernel(
-    # Input pointers
-    req_pool_indices_ptr,  # [batch_size]
-    page_ids_ptr,  # [total_entries] - flattened full page-table rows
-    page_counts_ptr,  # [batch_size] - entries per request
-    cumsum_page_counts_ptr,  # [batch_size]
-    # Output pointer
-    req_to_page_ptr,  # [req_pool_size+1, context_len]
-    # Scalars
-    context_len: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """
-    Write complete scheduler page-table rows to req_to_page.
-    Each program handles one request in the batch.
-    """
-    req_idx = tl.program_id(0)
-
-    # Load request metadata
-    req_pool_idx = tl.load(req_pool_indices_ptr + req_idx)
-    num_pages = tl.load(page_counts_ptr + req_idx)
-
-    # Get the request's offset into the flattened rows.
-    offset_idx = tl.where(req_idx > 0, req_idx - 1, 0)
-    pages_offset = tl.load(cumsum_page_counts_ptr + offset_idx)
-    pages_offset = tl.where(req_idx > 0, pages_offset, 0)
-
-    # Process pages in blocks
-    num_blocks = tl.cdiv(num_pages, BLOCK_SIZE)
-    for block_idx in range(num_blocks):
-        block_start = block_idx * BLOCK_SIZE
-
-        # Compute page indices within this block
-        page_offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = page_offsets < num_pages
-
-        # Load the page IDs to refresh.
-        page_ptrs = page_ids_ptr + pages_offset + page_offsets
-        new_page_ids = tl.load(page_ptrs, mask=mask, other=0)
-
-        # Compute target positions in req_to_page
-        output_ptrs = req_to_page_ptr + req_pool_idx * context_len + page_offsets
-        tl.store(output_ptrs, new_page_ids, mask=mask)
-
-
-def write_req_to_page_rows(
-    req_to_page: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-    page_ids: torch.Tensor,
-    page_counts: torch.Tensor,
-) -> None:
-    """
-    Write complete scheduler page-table rows to req_to_page using Triton.
-
-    Args:
-        req_to_page: Request to page table [req_pool_size+1, context_len]
-        req_pool_indices: Request pool indices [batch_size]
-        page_ids: Full page-table rows [total_entries] - flattened
-        page_counts: Number of entries per request [batch_size]
-    """
-    batch_size = req_pool_indices.shape[0]
-    context_len = req_to_page.shape[1]
-
-    if page_ids.shape[0] == 0:
-        return
-
-    # Compute cumulative sum for offset calculation.
-    cumsum_page_counts = torch.cumsum(page_counts, dim=0)
-
-    # Launch kernel - one program per request
-    BLOCK_SIZE = 128
-    grid = (batch_size,)
-
-    write_req_to_page_rows_kernel[grid](
-        req_pool_indices,
-        page_ids,
-        page_counts,
-        cumsum_page_counts,
-        req_to_page,
-        context_len=context_len,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
-
-
-@triton.jit
 def compute_out_cache_loc_kernel(
     # Input pointers
-    req_pool_indices_ptr,  # [batch_size]
     input_lengths_ptr,  # [batch_size] or None for uniform mode
     cache_start_ptr,  # [batch_size]
-    req_to_pages_ptr,  # [req_pool_size+1, max_pages]
+    page_table_ptr,  # [batch_size, max_pages], batch-ordered
     cumsum_lengths_ptr,  # [batch_size] or None for uniform mode
     # Output pointer
     out_cache_loc_ptr,  # [total_tokens]
@@ -145,8 +55,11 @@ def compute_out_cache_loc_kernel(
         position = cache_start[req_idx] + token_offset_in_seq
         page_idx = position // page_size
         offset_in_page = position % page_size
-        page_id = req_to_pages[req_pool_idx, page_idx]
+        page_id = page_table[req_idx, page_idx]
         out_cache_loc = page_id * page_size + offset_in_page
+
+    The page table is batch-ordered: row i holds the pages of the request at
+    batch position i.
 
     For decode, input_lengths are all 1.
     For prefill, input_lengths vary.
@@ -160,8 +73,6 @@ def compute_out_cache_loc_kernel(
     # Program ID represents which request we're processing
     req_idx = tl.program_id(0)
 
-    # Load request metadata.
-    req_pool_idx = tl.load(req_pool_indices_ptr + req_idx)
     valid_cache_len = tl.load(cache_start_ptr + req_idx)
 
     if input_lengths_ptr is not None:
@@ -194,16 +105,15 @@ def compute_out_cache_loc_kernel(
         page_indices = tl.minimum(page_indices, max_pages - 1)
         offsets_in_page = positions % page_size
 
-        # Load page IDs from req_to_pages
-        # req_to_pages is [req_pool_size+1, max_pages]
-        page_ptrs = req_to_pages_ptr + req_pool_idx * max_pages + page_indices
+        # Load page IDs from the batch-ordered page table.
+        page_ptrs = page_table_ptr + req_idx * max_pages + page_indices
         page_ids = tl.load(page_ptrs, mask=mask, other=0)
 
         # Compute physical cache locations
         cache_locs = page_ids * page_size + offsets_in_page
         # For overflow tokens, route to slot 0 (a fixed safe dummy target that
         # never aliases a real request's KV data). This avoids using a dynamic
-        # req_to_pages[0][0] load whose value can change at runtime and corrupt
+        # page_table[0][0] load whose value can change at runtime and corrupt
         # other requests' KV cache or trigger IndexKernel out-of-bounds.
         cache_locs = tl.where(overflow, 0, cache_locs)
 
@@ -214,14 +124,13 @@ def compute_out_cache_loc_kernel(
 
 def compute_out_cache_loc(
     out_cache_loc_ptr,
-    req_pool_indices: torch.Tensor,  # [batch_size]
     input_lengths: torch.Tensor,  # [batch_size]
     cache_start: torch.Tensor,  # [batch_size]
-    req_to_pages: torch.Tensor,  # [req_pool_size+1, max_pages]
+    page_table: torch.Tensor,  # [batch_size, max_pages], batch-ordered
     page_size: int,
 ) -> None:
-    batch_size = req_pool_indices.shape[0]
-    max_pages = req_to_pages.shape[1]
+    batch_size = input_lengths.shape[0]
+    max_pages = page_table.shape[1]
 
     cumsum_lengths = torch.cumsum(input_lengths, dim=0)
 
@@ -229,10 +138,9 @@ def compute_out_cache_loc(
     grid = (batch_size,)
 
     compute_out_cache_loc_kernel[grid](
-        req_pool_indices,
         input_lengths,
         cache_start,
-        req_to_pages,
+        page_table,
         cumsum_lengths,
         out_cache_loc_ptr,
         0,  # uniform_input_length unused when input_lengths_ptr is not None
@@ -247,7 +155,7 @@ def fused_decode_input_prep_kernel(
     # Inputs
     req_pool_indices_ptr,  # [batch_size]
     valid_cache_lengths_ptr,  # [req_pool_size+1]
-    req_to_pages_ptr,  # [req_pool_size+1, max_pages]
+    page_table_ptr,  # [batch_size, max_pages], batch-ordered
     # Outputs
     out_cache_loc_ptr,  # [batch_size * uniform_input_length]
     positions_ptr,  # [batch_size * uniform_input_length]
@@ -267,8 +175,9 @@ def fused_decode_input_prep_kernel(
       torch.add(input_lengths, valid_cache_lengths, out=seq_lens)
 
     Each program handles one request. We do one GMEM read of
-    `valid_cache_lengths[pool_idx]` and reuse it for the seq_lens write,
-    the position writes, and the out_cache_loc page-table lookup.
+    `valid_cache_lengths[pool_idx]` (runtime state is pool-indexed) and reuse
+    it for the seq_lens write, the position writes, and the out_cache_loc
+    page-table lookup; the page table itself is batch-ordered.
     """
     req_idx = tl.program_id(0)
     pool_idx = tl.load(req_pool_indices_ptr + req_idx)
@@ -292,7 +201,7 @@ def fused_decode_input_prep_kernel(
         page_indices = tl.minimum(page_indices, max_pages - 1)
         offsets_in_page = positions_local % page_size
 
-        page_ptrs = req_to_pages_ptr + pool_idx * max_pages + page_indices
+        page_ptrs = page_table_ptr + req_idx * max_pages + page_indices
         page_ids = tl.load(page_ptrs, mask=mask, other=0)
         cache_locs = page_ids * page_size + offsets_in_page
         # Route overflow tokens to slot 0 (fixed safe dummy target).
@@ -317,7 +226,7 @@ def fused_decode_input_prep(
     req_pool_indices: torch.Tensor,  # [batch_size]
     valid_cache_lengths: torch.Tensor,  # [req_pool_size+1]
     uniform_input_length: int,
-    req_to_pages: torch.Tensor,  # [req_pool_size+1, max_pages]
+    page_table: torch.Tensor,  # [batch_size, max_pages], batch-ordered
     page_size: int,
 ) -> None:
     """Decode-only fast path: one Triton launch writes out_cache_loc,
@@ -325,13 +234,13 @@ def fused_decode_input_prep(
     directly so the per-iter indexSelect + add are gone too.
     """
     batch_size = req_pool_indices.shape[0]
-    max_pages = req_to_pages.shape[1]
+    max_pages = page_table.shape[1]
     BLOCK_SIZE = 128
     grid = (batch_size,)
     fused_decode_input_prep_kernel[grid](
         req_pool_indices,
         valid_cache_lengths,
-        req_to_pages,
+        page_table,
         out_cache_loc_ptr,
         positions_ptr,
         seq_lens_out_ptr,
@@ -348,7 +257,7 @@ def dflash_prepare_decode_kernel(
     accept_lengths_ptr,
     req_pool_indices_ptr,
     valid_cache_lengths_ptr,
-    req_to_pages_ptr,
+    page_table_ptr,
     draft_seq_lens_ptr,
     block_ids_ptr,
     block_positions_ptr,
@@ -385,7 +294,8 @@ def dflash_prepare_decode_kernel(
     overflow = page_indices >= max_pages
     page_indices = tl.minimum(page_indices, max_pages - 1)
     offsets_in_page = positions % page_size
-    page_ptrs = req_to_pages_ptr + pool_idx * max_pages + page_indices
+    # The drafter's page table is batch-ordered (row i == batch position i).
+    page_ptrs = page_table_ptr + req_idx * max_pages + page_indices
     page_ids = tl.load(page_ptrs, mask=mask, other=0)
     cache_locs = page_ids * page_size + offsets_in_page
     cache_locs = tl.where(overflow, 0, cache_locs)
@@ -399,7 +309,7 @@ def dflash_prepare_decode(
     accept_lengths: torch.Tensor,
     req_pool_indices: torch.Tensor,
     valid_cache_lengths: torch.Tensor,
-    req_to_pages: torch.Tensor,
+    page_table: torch.Tensor,
     draft_seq_lens: torch.Tensor,
     block_ids: torch.Tensor,
     block_positions: torch.Tensor,
@@ -409,7 +319,7 @@ def dflash_prepare_decode(
     max_draft_prefix: int,
 ) -> None:
     batch_size = req_pool_indices.shape[0]
-    max_pages = req_to_pages.shape[1]
+    max_pages = page_table.shape[1]
     BLOCK_SIZE = triton.next_power_of_2(spec_num_tokens)
     grid = (batch_size,)
     dflash_prepare_decode_kernel[grid](
@@ -417,7 +327,7 @@ def dflash_prepare_decode(
         accept_lengths,
         req_pool_indices,
         valid_cache_lengths,
-        req_to_pages,
+        page_table,
         draft_seq_lens,
         block_ids,
         block_positions,
@@ -433,10 +343,9 @@ def dflash_prepare_decode(
 
 def compute_out_cache_loc_uniform(
     out_cache_loc_ptr,
-    req_pool_indices: torch.Tensor,  # [batch_size]
     uniform_input_length: int,
     cache_start: torch.Tensor,  # [batch_size]
-    req_to_pages: torch.Tensor,  # [req_pool_size+1, max_pages]
+    page_table: torch.Tensor,  # [batch_size, max_pages], batch-ordered
     page_size: int,
 ) -> None:
     """Specialized entry point when every request has the same ``input_length``.
@@ -445,89 +354,20 @@ def compute_out_cache_loc_uniform(
     corresponding GMEM reads inside the kernel. Used by the multi-step drafter
     where each request decodes exactly ``spec_num_steps - 1`` tokens.
     """
-    batch_size = req_pool_indices.shape[0]
-    max_pages = req_to_pages.shape[1]
+    batch_size = cache_start.shape[0]
+    max_pages = page_table.shape[1]
 
     BLOCK_SIZE = 128
     grid = (batch_size,)
 
     compute_out_cache_loc_kernel[grid](
-        req_pool_indices,
         None,  # input_lengths_ptr is None → kernel uses uniform_input_length
         cache_start,
-        req_to_pages,
+        page_table,
         None,  # cumsum_lengths_ptr is None → kernel computes offset analytically
         out_cache_loc_ptr,
         uniform_input_length,
         page_size=page_size,
         max_pages=max_pages,
         BLOCK_SIZE=BLOCK_SIZE,
-    )
-
-
-def update_block_table(
-    forward_op, device, req_to_page, history_group_id: str | None = None
-):
-    device = torch.device(device)
-
-    def flatten_and_to_device(data, dtype=torch.int32):
-        if not data:
-            return torch.tensor([], dtype=dtype, device=device)
-
-        # Flatten one level if data is a list of lists
-        if isinstance(data[0], (list, tuple)):
-            flat = [x for inner in data for x in inner]
-        else:
-            flat = data
-
-        if not flat:
-            return torch.tensor([], dtype=dtype, device=device)
-
-        tensor = torch.tensor(
-            flat,
-            dtype=dtype,
-            device="cpu",
-            pin_memory=device.type == "cuda",
-        )
-        return tensor.to(device, non_blocking=True)
-
-    table = select_block_table(forward_op, history_group_id)
-    page_rows = [
-        unpadded_block_table_row(table, row_index) for row_index in range(len(table))
-    ]
-    if all(not row for row in page_rows):
-        return
-
-    max_pages = req_to_page.shape[1]
-    # Clamp a request that would overflow req_to_page instead of crashing the
-    # engine. Happens when MTP accept-rate collapse keeps a request alive past
-    # context_len; its KV drops but it will be finished shortly.
-    sizes = [len(row) for row in page_rows]
-    request_ids = list(forward_op.request_ids)
-    for i, size in enumerate(sizes):
-        if size > max_pages:
-            logger.warning(
-                "page copy would exceed req_to_page capacity for req %s: "
-                "size=%s > req_to_page.shape[1]=%s; "
-                "clamping size to %s to avoid engine crash. The request is past "
-                "its context-length bound and will be finished by the length "
-                "check; KV writes after this point are dropped.",
-                request_ids[i] if i < len(request_ids) else "?",
-                size,
-                max_pages,
-                max_pages,
-            )
-            sizes[i] = max_pages
-            page_rows[i] = page_rows[i][:max_pages]
-
-    page_counts = flatten_and_to_device(sizes, dtype=torch.int32)
-    page_ids = flatten_and_to_device(page_rows, dtype=torch.int32)
-    request_pool_indices = flatten_and_to_device(
-        forward_op.request_pool_indices, dtype=torch.int64
-    )
-    write_req_to_page_rows(
-        req_to_page=req_to_page,
-        req_pool_indices=request_pool_indices,
-        page_ids=page_ids,
-        page_counts=page_counts,
     )

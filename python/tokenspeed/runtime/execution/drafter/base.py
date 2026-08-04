@@ -45,7 +45,7 @@ class BaseDrafter:
         runtime_states: RuntimeStates | None = None,
         input_buffers: InputBuffers | None = None,
         page_size: int | None = None,
-        req_to_page: torch.Tensor | None = None,
+        page_table: torch.Tensor | None = None,
         attn_backend: AttentionBackend | None = None,
         token_to_kv_pool: CachePool | None = None,
         vocab_size: int | None = None,
@@ -56,7 +56,11 @@ class BaseDrafter:
         self.runtime_states = runtime_states
         self.input_buffers = input_buffers
         self.page_size = page_size
-        self.req_to_page = req_to_page
+        # The batch-ordered draft page table (row i == batch position i), filled
+        # each forward from the target's full-history group table
+        # (ModelExecutor._publish_draft_page_table). All page lookups index by
+        # batch row.
+        self.page_table = page_table
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
         self.vocab_size = vocab_size

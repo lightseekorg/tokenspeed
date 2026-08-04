@@ -992,6 +992,17 @@ def create_attn_components(
     )
 
     backend.set_cache_pool(pool)
+    # A cache-group contract backend needs the contract marked before CUDA-graph
+    # state allocation (mark_cache_contract sizes the per-group write-location
+    # buffer). Composite/wrapper backends without the hook are a no-op.
+    if getattr(pool, "runtime_contract", None) is not None:
+        target_mark_contract = getattr(backend, "mark_cache_contract", None)
+        if target_mark_contract is not None:
+            params = inspect.signature(target_mark_contract).parameters
+            if "logical_page_size" in params:
+                target_mark_contract(logical_page_size=pool.plan.logical_block_tokens)
+            else:
+                target_mark_contract()
     if draft_attn_backend is not None and draft_pool is not None:
         draft_attn_backend.set_cache_pool(draft_pool)
         if getattr(draft_pool, "runtime_contract", None) is not None:

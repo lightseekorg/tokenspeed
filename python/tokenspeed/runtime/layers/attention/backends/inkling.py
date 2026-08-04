@@ -500,7 +500,7 @@ class InklingAttnBackend(AttentionBackend):
         num_extends: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        req_to_page: torch.Tensor,
+        page_table: torch.Tensor,
         forward_mode: ForwardMode,
         extend_seq_lens: torch.Tensor | None = None,
         extend_seq_lens_cpu: torch.Tensor | None = None,
@@ -551,7 +551,7 @@ class InklingAttnBackend(AttentionBackend):
             num_extends,
             req_pool_indices,
             seq_lens,
-            req_to_page,
+            page_table,
             forward_mode,
             extend_seq_lens=extend_seq_lens,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
@@ -1662,7 +1662,7 @@ class InklingAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
-        req_to_page: torch.Tensor = None,
+        page_table: torch.Tensor = None,
         **kwargs,
     ):
         actual_bs = kwargs.pop("actual_bs", None)
@@ -1671,7 +1671,7 @@ class InklingAttnBackend(AttentionBackend):
             req_pool_indices,
             seq_lens,
             forward_mode=forward_mode,
-            req_to_page=req_to_page,
+            page_table=page_table,
             **kwargs,
         )
         assert self._graph_cache_indices is not None

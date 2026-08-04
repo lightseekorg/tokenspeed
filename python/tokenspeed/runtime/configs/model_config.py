@@ -66,6 +66,10 @@ _DSA_ARCHITECTURES = frozenset(
     {
         "GlmMoeDsaForCausalLM",
         "GlmMoeDsaForCausalLMNextN",
+        # DeepSeek-V3.2: V3 MLA/MoE backbone + DSA sparse indexer. Same
+        # attention family and indexer geometry as GLM-DSA.
+        "DeepseekV32ForCausalLM",
+        "DeepseekV32ForCausalLMNextN",
     }
 )
 _MSA_ARCHITECTURES = frozenset(

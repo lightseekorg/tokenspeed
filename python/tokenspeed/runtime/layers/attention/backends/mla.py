@@ -36,6 +36,9 @@ from tokenspeed.runtime.configs.cache_runtime import cache_debug_enabled
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+from tokenspeed.runtime.layers.attention.backends.mla_cache_groups import (
+    MlaCacheGroupMixin,
+)
 from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
 )
@@ -91,10 +94,8 @@ class MLADecodeMetadata:
         return self.seq_lens
 
 
-class MLAAttnBackend(AttentionBackend):
+class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
     """Unified MLA backend routed through tokenspeed_kernel MLA APIs."""
-
-    cache_consumer_families = frozenset({"history"})
 
     def __init__(self, config: MLAConfig):
         super().__init__(config)
@@ -125,10 +126,6 @@ class MLAAttnBackend(AttentionBackend):
         self.cuda_graph_seq_lens: torch.Tensor | None = None
         self.decode_cuda_graph_group_out_cache_loc: torch.Tensor | None = None
 
-    def mark_cache_contract(self) -> None:
-        """Enable Paged cache graph state before capture buffers are allocated."""
-        self._cache_contract_bound = True
-
     def _should_use_absorbed_cached_extend(
         self, *, max_extend_seq_len: int, max_extend_prefix_len: int
     ) -> bool:
@@ -144,148 +141,13 @@ class MLAAttnBackend(AttentionBackend):
             solution=self.kernel_solution,
         )
 
-    def _resolve_full_history_table(
-        self, cache_metadata, forward_batch, bs: int
-    ) -> tuple[torch.Tensor, int]:
-        table = cache_metadata.require_full_attention_table(
-            active_forward_op=forward_batch
-        )
-        if table.shape[0] < bs:
-            raise RuntimeError(
-                f"full-attention table has {table.shape[0]} rows but the "
-                f"batch has {bs} requests"
-            )
-        logical_page_size = int(cache_metadata.block_size)
-        if logical_page_size <= 0 or logical_page_size % self.page_size:
-            raise RuntimeError(
-                f"logical page size {logical_page_size} is not a positive multiple "
-                f"of the MLA kernel page size {self.page_size}"
-            )
-        if table.stride(0) != table.shape[1] and table.shape[0] > 1:
-            table = table.contiguous()
-        return table, logical_page_size
-
-    @staticmethod
-    def _validate_live_pages(
-        table: torch.Tensor, seq_lens: torch.Tensor, logical_page_size: int
-    ) -> None:
-        """Reject null or missing Paged cache pages inside each request's live range."""
-        if table.numel() == 0 or seq_lens.numel() == 0:
-            return
-        batch_size = seq_lens.shape[0]
-        live_pages = (
-            (seq_lens.to(torch.int64) + logical_page_size - 1) // logical_page_size
-        ).clamp_max_(table.shape[1])
-        columns = torch.arange(table.shape[1], device=table.device)
-        live_entries = table[:batch_size][
-            columns.unsqueeze(0) < live_pages.unsqueeze(1)
-        ]
-        if not bool((live_entries > 0).all().item()):
-            raise RuntimeError(
-                "full-attention table contains -1 or the null page 0 "
-                "inside a live range"
-            )
-
-    def _expand_group_page_table(
-        self,
-        table: torch.Tensor,
-        *,
-        batch_size: int,
-        logical_page_size: int,
-        out: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Expand scheduler pages for this backend's MLA kernel pages."""
-        if self.cache_pool is None:
-            raise RuntimeError("MLA backend has no bound CachePool")
-        return self.cache_pool.expand_block_table(
-            None,
-            table[:batch_size],
-            kernel_block_tokens=self.page_size,
-            max_kernel_blocks=self.max_num_pages,
-            out=out,
-        )
-
-    @staticmethod
-    def _cache_decode_out_cache_loc(
-        table: torch.Tensor,
-        seq_lens: torch.Tensor,
-        *,
-        batch_size: int,
-        logical_page_size: int,
-        validate_pages: bool = False,
-        out: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Return absolute cache locations for decoded tokens in Paged cache."""
-        positions = (seq_lens[:batch_size].to(torch.int64) - 1).clamp_min(0)
-        page_indices = torch.div(positions, logical_page_size, rounding_mode="floor")
-        pages = table[:batch_size].gather(1, page_indices.unsqueeze(1)).squeeze(1)
-        if validate_pages and pages.numel() and not bool((pages > 0).all().item()):
-            raise RuntimeError(
-                "MLA write location resolves to the null page 0 or a " "-1 table hole"
-            )
-        locations = pages.clamp_min(0).to(torch.int64) * logical_page_size + (
-            positions % logical_page_size
-        )
-        if out is not None:
-            out[:batch_size].copy_(locations)
-            return out
-        return locations
-
-    @staticmethod
-    def _extend_out_cache_loc(
-        table: torch.Tensor,
-        extend_prefix_lens_cpu: torch.Tensor,
-        extend_seq_lens_cpu: torch.Tensor,
-        *,
-        logical_page_size: int,
-        validate_pages: bool = False,
-    ) -> torch.Tensor:
-        """Return packed Paged cache extend-write locations in query order."""
-        chunks: list[torch.Tensor] = []
-        pages_for_validation: list[torch.Tensor] = []
-        for row, (start, num_new) in enumerate(
-            zip(
-                extend_prefix_lens_cpu.tolist(),
-                extend_seq_lens_cpu.tolist(),
-                strict=True,
-            )
-        ):
-            start, num_new = int(start), int(num_new)
-            if num_new <= 0:
-                continue
-            max_column = (start + num_new - 1) // logical_page_size
-            if max_column >= table.shape[1]:
-                raise RuntimeError(
-                    "extend write locations exceed the full-attention "
-                    f"table: row={row}, prefix={start}, new={num_new}, "
-                    f"logical_page_size={logical_page_size}, columns={table.shape[1]}"
-                )
-            positions = torch.arange(
-                start, start + num_new, dtype=torch.int64, device=table.device
-            )
-            pages = table[row].gather(0, positions // logical_page_size)
-            pages_for_validation.append(pages)
-            chunks.append(
-                pages.to(torch.int64) * logical_page_size
-                + positions % logical_page_size
-            )
-        if not chunks:
-            return torch.empty(0, dtype=torch.int64, device=table.device)
-        if validate_pages and not bool(
-            (torch.cat(pages_for_validation) > 0).all().item()
-        ):
-            raise RuntimeError(
-                "MLA write location resolves to the null page 0 or a " "-1 table hole"
-            )
-        return torch.cat(chunks)
-
     def init_forward_metadata(
         self,
         bs: int,
         num_extends: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        req_to_page: torch.Tensor,
+        page_table: torch.Tensor,
         forward_mode: ForwardMode,
         extend_seq_lens: torch.Tensor | None = None,
         extend_seq_lens_cpu: torch.Tensor | None = None,
@@ -311,14 +173,14 @@ class MLAAttnBackend(AttentionBackend):
         elif self._cache_groups_bound and bs > 0 and not forward_mode.is_idle():
             raise RuntimeError(
                 "MLAAttnBackend is bound to Paged cache but received no paged cache "
-                "metadata; refusing the legacy req_to_page path"
+                "metadata; refusing the legacy page_table path"
             )
 
         if forward_mode.is_extend_or_mixed():
             self._init_prefill_metadata(
                 seq_lens=seq_lens[:num_extends],
                 req_pool_indices=req_pool_indices[:num_extends],
-                req_to_page=req_to_page,
+                page_table=page_table,
                 extend_prefix_lens=extend_prefix_lens[:num_extends],
                 extend_prefix_lens_cpu=extend_prefix_lens_cpu[:num_extends],
                 extend_seq_lens=extend_seq_lens[:num_extends],
@@ -337,7 +199,7 @@ class MLAAttnBackend(AttentionBackend):
                 num_extends=num_extends,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
-                req_to_page=req_to_page,
+                page_table=page_table,
                 group_table=group_table,
                 logical_page_size=logical_page_size,
             )
@@ -356,7 +218,7 @@ class MLAAttnBackend(AttentionBackend):
         self,
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
-        req_to_page: torch.Tensor,
+        page_table: torch.Tensor,
         extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
         extend_seq_lens: torch.Tensor,
@@ -380,7 +242,7 @@ class MLAAttnBackend(AttentionBackend):
         )
 
         cum_seq_lens_kv = None
-        page_table = None
+        absorbed_page_table = None
         if use_absorbed_cached_extend:
             cum_seq_lens_kv = torch.zeros_like(cum_extend_seq_lens)
             torch.cumsum(seq_lens, dim=0, out=cum_seq_lens_kv[1:])
@@ -394,26 +256,30 @@ class MLAAttnBackend(AttentionBackend):
                 logical_page_size=logical_page_size,
                 validate_pages=cache_debug_enabled(),
             )
-            chunk_req_to_page = group_table[: seq_lens.shape[0]]
+            chunk_page_table = group_table[: seq_lens.shape[0]]
             chunk_req_pool_indices = torch.arange(
                 seq_lens.shape[0], dtype=torch.int64, device=group_table.device
             )
             chunk_page_size = logical_page_size
             if use_absorbed_cached_extend:
-                page_table = self._expand_group_page_table(
+                absorbed_page_table = self._expand_group_page_table(
                     group_table,
                     batch_size=seq_lens.shape[0],
                     logical_page_size=logical_page_size,
                 )
         else:
+            # Idle/warmup placeholder: page_table is batch-ordered (row i ==
+            # batch position i), so identity row indices apply.
             group_out_cache_loc = None
-            chunk_req_to_page = req_to_page
-            chunk_req_pool_indices = req_pool_indices
+            chunk_page_table = page_table
+            chunk_req_pool_indices = torch.arange(
+                seq_lens.shape[0], dtype=torch.int64, device=page_table.device
+            )
             chunk_page_size = self.page_size
             if use_absorbed_cached_extend:
-                page_table = build_page_table(
+                absorbed_page_table = build_page_table(
                     req_pool_indices,
-                    req_to_page,
+                    page_table,
                     self.page_size,
                     self.max_context_len,
                 )
@@ -427,7 +293,7 @@ class MLAAttnBackend(AttentionBackend):
         ) = build_chunked_prefill_metadata_arrays(
             extend_prefix_lens,
             extend_prefix_lens_cpu,
-            chunk_req_to_page,
+            chunk_page_table,
             chunk_req_pool_indices,
             chunk_page_size,
         )
@@ -439,7 +305,7 @@ class MLAAttnBackend(AttentionBackend):
             extend_seq_lens=extend_seq_lens,
             cum_extend_seq_lens=cum_extend_seq_lens,
             cum_seq_lens_kv=cum_seq_lens_kv,
-            page_table=page_table,
+            page_table=absorbed_page_table,
             extend_seq_lens_cpu=extend_seq_lens_cpu_list,
             max_extend_seq_len=max_extend_seq_len,
             max_extend_prefix_len=max_extend_prefix_len,
@@ -460,7 +326,7 @@ class MLAAttnBackend(AttentionBackend):
         num_extends: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        req_to_page: torch.Tensor,
+        page_table: torch.Tensor,
         group_table: torch.Tensor | None = None,
         logical_page_size: int | None = None,
     ):
@@ -481,7 +347,7 @@ class MLAAttnBackend(AttentionBackend):
         else:
             page_table = build_page_table(
                 req_pool_indices[:bs],
-                req_to_page,
+                page_table,
                 self.page_size,
                 self.max_context_len,
             )
@@ -583,7 +449,7 @@ class MLAAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
-        req_to_page: torch.Tensor = None,
+        page_table: torch.Tensor = None,
         **kwargs,
     ):
         if forward_mode is not None and forward_mode.is_extend_or_mixed():
@@ -604,8 +470,10 @@ class MLAAttnBackend(AttentionBackend):
                 kwargs.get("forward_batch"),
             )
         else:
+            # Idle/warmup replay before the backend binds, or a draft driven with
+            # the batch-ordered draft page table (row i == batch position i).
             self.cuda_graph_page_table[:bs, : self.max_num_pages].copy_(
-                req_to_page[req_pool_indices[:bs], : self.max_num_pages]
+                page_table[:bs, : self.max_num_pages]
             )
         self.forward_decode_metadata = metadata
 

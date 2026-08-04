@@ -869,8 +869,6 @@ class EventLoop:
         dp_all_extend = dp_metadata.all_extend if dp_metadata is not None else False
         multimodal_context = self._get_multimodal_context_for_forward(forward_op)
 
-        self.model_executor.update_block_table(forward_op)
-
         if self.kv_transfer is None:
             # Path 1: normal (no disaggregation)
             self.model_executor.reset_valid_cache_length(forward_op)
@@ -1740,9 +1738,8 @@ class EventLoop:
         prev_forward_op = None
 
         while not self._shutdown_complete():
-            # Order this iter's default-stream writes (KVAllocator,
-            # update_block_table, prefix_cache writes to req_to_page)
-            # after the prev iter's forward on execution_stream that
+            # Order this iter's default-stream writes (prefix_cache page-table
+            # writes) after the prev iter's forward on execution_stream that
             # reads the same tensor. Non-blocking on host.
             torch.cuda.default_stream().wait_stream(
                 self.model_executor.execution_stream

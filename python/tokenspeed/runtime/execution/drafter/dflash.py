@@ -59,7 +59,7 @@ class DFlash(BaseDrafter):
         spec_num_steps: int,
         page_size: int,
         draft_model_runner: ModelRunner | None = None,
-        req_to_page: torch.Tensor | None = None,
+        page_table: torch.Tensor | None = None,
         attn_backend=None,
         token_to_kv_pool=None,
         runtime_states: RuntimeStates | None = None,
@@ -73,7 +73,7 @@ class DFlash(BaseDrafter):
             runtime_states=runtime_states,
             input_buffers=input_buffers,
             page_size=page_size,
-            req_to_page=req_to_page,
+            page_table=page_table,
             attn_backend=attn_backend,
             token_to_kv_pool=token_to_kv_pool,
             vocab_size=vocab_size,
@@ -125,8 +125,8 @@ class DFlash(BaseDrafter):
     def _init_native_buffers(self) -> None:
         if self.input_buffers is None:
             raise ValueError("Native DFLASH requires input buffers.")
-        if self.req_to_page is None:
-            raise ValueError("Native DFLASH requires req_to_page.")
+        if self.page_table is None:
+            raise ValueError("Native DFLASH requires page_table.")
         if self.attn_backend is None or self.token_to_kv_pool is None:
             raise ValueError("Native DFLASH requires draft attention components.")
 
@@ -862,10 +862,9 @@ class DFlash(BaseDrafter):
 
             compute_out_cache_loc_uniform(
                 out_cache_loc_ptr=cache_locs,
-                req_pool_indices=req_pool_indices,
                 uniform_input_length=self.spec_num_tokens,
                 cache_start=prefix_lens,
-                req_to_pages=self.req_to_page,
+                page_table=self.page_table,
                 page_size=self.page_size,
             )
 
@@ -878,7 +877,7 @@ class DFlash(BaseDrafter):
                 num_extends=bs,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens_after,
-                req_to_page=self.req_to_page,
+                page_table=self.page_table,
                 forward_mode=ForwardMode.DECODE,
                 extend_seq_lens=None,
                 extend_seq_lens_cpu=self.draft_extend_seq_lens_cpu[:bs],
@@ -891,7 +890,6 @@ class DFlash(BaseDrafter):
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
-            req_to_page=self.req_to_page,
             bs=bs,
             num_extends=bs,
             input_num_tokens=bs * self.spec_num_tokens,
@@ -975,14 +973,14 @@ class DFlash(BaseDrafter):
         if base_ctx.num_extends == 0:
             draft_cache_locs = self.draft_out_cache_loc_buf[: bs * self.spec_num_tokens]
             max_draft_prefix = (
-                self.req_to_page.shape[1] * self.page_size - self.spec_num_tokens
+                self.page_table.shape[1] * self.page_size - self.spec_num_tokens
             )
             dflash_prepare_decode(
                 output_tokens=output_tokens,
                 accept_lengths=accept_lengths[:bs],
                 req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
                 valid_cache_lengths=self.runtime_states.valid_cache_lengths,
-                req_to_pages=self.req_to_page,
+                page_table=self.page_table,
                 draft_seq_lens=self.draft_seq_lens_buf[:bs],
                 block_ids=self.block_ids_buf[:bs],
                 block_positions=self.block_positions_buf[:bs],
@@ -1020,7 +1018,7 @@ class DFlash(BaseDrafter):
         bs = base_ctx.bs
         req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
         max_draft_prefix = (
-            self.req_to_page.shape[1] * self.page_size - self.spec_num_tokens
+            self.page_table.shape[1] * self.page_size - self.spec_num_tokens
         )
 
         current_tokens = self.block_ids_buf[:bs, 0]
@@ -1030,7 +1028,7 @@ class DFlash(BaseDrafter):
             accept_lengths=accept_lengths[:bs],
             req_pool_indices=req_pool_indices,
             valid_cache_lengths=self.runtime_states.valid_cache_lengths,
-            req_to_pages=self.req_to_page,
+            page_table=self.page_table,
             draft_seq_lens=self.draft_seq_lens_buf[:bs],
             block_ids=self.block_ids_buf[:bs],
             block_positions=self.block_positions_buf[:bs],

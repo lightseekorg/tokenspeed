@@ -33,13 +33,13 @@ logger = get_colorful_logger(__name__)
 
 @triton.jit
 def create_chunked_cache_kv_indices_paged(
-    req_to_page_ptr,  # (max_batch, max_pages)
+    page_table_ptr,  # (max_batch, max_pages)
     req_pool_indices_ptr,  # (batch_size,)
     chunk_start_idx_ptr,  # (batch_size,)
     chunk_seq_lens_ptr,  # (batch_size,)
     chunk_cum_seq_lens_ptr,  # (batch_size + 1,)
     chunk_kv_indices_ptr,  # (num_chunk_tokens,)
-    req_to_page_ptr_stride: tl.constexpr,
+    page_table_ptr_stride: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
 ):
     BLOCK_SIZE: tl.constexpr = 512
@@ -58,7 +58,7 @@ def create_chunked_cache_kv_indices_paged(
         token_pos = chunk_start_pos + offset
         page_idx = token_pos // PAGE_SIZE
         page_id = tl.load(
-            req_to_page_ptr + req_pool_index * req_to_page_ptr_stride + page_idx,
+            page_table_ptr + req_pool_index * page_table_ptr_stride + page_idx,
             mask=mask,
         )
         kv_slot = page_id * PAGE_SIZE + token_pos % PAGE_SIZE
@@ -127,7 +127,7 @@ def chunking(prefix_lens: torch.Tensor, num_chunks, batch_size, chunk_len):
 
 
 def get_chunks_paged(
-    prefix_lens, prefix_lens_cpu, req_to_page, req_pool_indices, page_size
+    prefix_lens, prefix_lens_cpu, page_table, req_pool_indices, page_size
 ):
     """Page-table aware version of get_chunks."""
     device: torch.device = prefix_lens.device
@@ -149,13 +149,13 @@ def get_chunks_paged(
             num_tokens_per_forward[idx], dtype=torch.int32, device=device
         )
         create_chunked_cache_kv_indices_paged[(batch_size,)](
-            req_to_page,
+            page_table,
             req_pool_indices,
             chunks.starts[idx],
             chunks.len_in_chunk[idx],
             chunks.cum_seq_lens[idx],
             chunk_kv_indices,
-            req_to_page.shape[1],
+            page_table.shape[1],
             page_size,
         )
         chunk_kv_indices_list.append(chunk_kv_indices)
@@ -166,7 +166,7 @@ def get_chunks_paged(
 def build_chunked_prefill_metadata_arrays(
     extend_prefix_lens,
     extend_prefix_lens_cpu,
-    req_to_page,
+    page_table,
     req_pool_indices,
     page_size,
 ):
@@ -192,7 +192,7 @@ def build_chunked_prefill_metadata_arrays(
     chunks, chunk_kv_indices_list, chunks_cpu = get_chunks_paged(
         extend_prefix_lens,
         extend_prefix_lens_cpu,
-        req_to_page,
+        page_table,
         req_pool_indices,
         page_size,
     )

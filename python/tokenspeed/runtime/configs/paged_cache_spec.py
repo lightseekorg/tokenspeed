@@ -563,8 +563,8 @@ def publish_paged_cache_groups(
 
     Every cache pool publishes its scheduler groups. Speculative decoding is
     supported: verify writes per-group [bs*N] locations and the drafter
-    consumes the full-attention group's table (mirrored into req_to_page each
-    step).
+    consumes the full-attention group's table (published into the batch-ordered
+    draft page table each step).
 
     Args:
         layer_types: Per-layer paged-cache labels (empty -> single

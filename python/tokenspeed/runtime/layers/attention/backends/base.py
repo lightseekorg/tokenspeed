@@ -167,7 +167,7 @@ class AttentionBackend(ABC):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
-        req_to_page: torch.Tensor = None,
+        page_table: torch.Tensor = None,
         block_tables: dict[str, torch.Tensor] | None = None,
         **kwargs,
     ):
