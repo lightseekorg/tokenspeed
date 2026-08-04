@@ -35,6 +35,8 @@ import zmq
 from tokenspeed.runtime.engine.event_loop import run_event_loop
 from tokenspeed.runtime.engine.io_struct import (
     BlockReqInput,
+    IpcReceiver,
+    IpcSender,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     WatchLoadUpdateReq,
@@ -122,6 +124,7 @@ class DataParallelController:
         # Parse args
         self.max_total_num_tokens = None
         self.max_req_input_len = None
+        self.max_single_request_tokens = None
         self.max_num_seqs = None
         self.chunked_prefill_size = None
         self.max_model_len = None
@@ -134,8 +137,10 @@ class DataParallelController:
         # Init inter-process communication
         self.context = zmq.Context(1 + server_args.mapping.attn.dp_size)
         if server_args.node_rank == 0:
-            self.recv_from_tokenizer = get_zmq_socket(
-                self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
+            self.recv_from_tokenizer = IpcReceiver(
+                get_zmq_socket(
+                    self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
+                )
             )
         # dp_worker for fixed data dispatch can be set by SINGLE_WORKER_ID environment variable
         robin_scheduler = (
@@ -223,6 +228,7 @@ class DataParallelController:
                 tokenizer_ipc_name=port_args.tokenizer_ipc_name,
                 scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
                 nccl_port=port_args.nccl_port,
+                dist_init_addr=port_args.dist_init_addr,
                 rpc_ipc_name=port_args.rpc_ipc_name,
                 metrics_ipc_name=port_args.metrics_ipc_name,
                 tokenizer_worker_ipc_name=port_args.tokenizer_worker_ipc_name,
@@ -232,11 +238,13 @@ class DataParallelController:
             # Bind to scheduler_input_ipc_name BEFORE starting scheduler threads
             # This ensures the port is available when scheduler tries to connect
             if server_args.node_rank == 0:
-                self.workers[dp_rank] = get_zmq_socket(
-                    self.context,
-                    zmq.PUSH,
-                    tmp_port_args.scheduler_input_ipc_name,
-                    True,  # bind
+                self.workers[dp_rank] = IpcSender(
+                    get_zmq_socket(
+                        self.context,
+                        zmq.PUSH,
+                        tmp_port_args.scheduler_input_ipc_name,
+                        True,  # bind
+                    )
                 )
 
         if not server_args.mapping.attn.has_dp:
@@ -308,9 +316,11 @@ class DataParallelController:
 
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
+        self.max_single_request_tokens = scheduler_info[0]["max_single_request_tokens"]
         self.max_num_seqs = scheduler_info[0]["max_num_seqs"]
         self.chunked_prefill_size = scheduler_info[0]["chunked_prefill_size"]
         self.max_model_len = scheduler_info[0]["max_model_len"]
+        self.cache_storage = scheduler_info[0]["cache_storage"]
 
     def round_robin_scheduler(self, req: Req):
         if self.server_args.disaggregation_mode == "null":
@@ -361,9 +371,11 @@ def run_data_parallel_controller_process(
                 "status": "ready",
                 "max_total_num_tokens": controller.max_total_num_tokens,
                 "max_req_input_len": controller.max_req_input_len,
+                "max_single_request_tokens": controller.max_single_request_tokens,
                 "max_num_seqs": controller.max_num_seqs,
                 "chunked_prefill_size": controller.chunked_prefill_size,
                 "max_model_len": controller.max_model_len,
+                "cache_storage": controller.cache_storage,
             }
         )
         if server_args.node_rank == 0:

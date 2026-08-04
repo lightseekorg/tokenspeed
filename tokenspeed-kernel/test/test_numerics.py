@@ -40,7 +40,7 @@ from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, load_builtin_kernels
 from tokenspeed_kernel.signature import ScaleFormat, format_signatures
 
-_fp8_dtype = Platform.get().fp8e4m3fn.dtype
+_fp8_dtype = torch.float8_e4m3fn
 
 
 class TestCompareOutputs:

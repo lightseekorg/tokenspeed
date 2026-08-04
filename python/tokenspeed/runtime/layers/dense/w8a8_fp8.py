@@ -26,18 +26,14 @@ from tokenspeed_kernel.ops.gemm.fp8_utils import (
     per_token_group_quant_fp8,
     per_token_quant_fp8,
 )
-from tokenspeed_kernel.platform import Platform
 from torch.nn.parameter import Parameter
 
-from tokenspeed.runtime.layers.dense.utils import normalize_e4m3fn_to_e4m3fnuz
 from tokenspeed.runtime.layers.parameter import (
     ChannelQuantScaleParameter,
     ModelWeightParameter,
 )
 from tokenspeed.runtime.layers.quantization.base_config import LinearMethodBase
 from tokenspeed.runtime.layers.quantization.w8a8_fp8 import W8A8Fp8Config
-
-platform = Platform.get()
 
 
 class W8A8Fp8LinearMethod(LinearMethodBase):
@@ -51,11 +47,6 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
         if self.quantization_config.is_checkpoint_fp8_serialized:
             weight_scale = layer.weight_scale.detach()
             # If checkpoint offline quantized with w8a8_fp8, load the weight and weight_scale directly.
-            if platform.is_fp8e4m3fnuz:
-                weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-                    weight=weight, weight_scale=weight_scale
-                )
-
             layer.weight = Parameter(weight.t(), requires_grad=False)
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
         else:

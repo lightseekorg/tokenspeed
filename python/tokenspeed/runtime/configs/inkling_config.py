@@ -109,8 +109,10 @@ def inkling_kv_heads_for_layer(
     Uniform mode replicates every layer to ``num_key_value_heads`` (the max
     over layer kinds). Heterogeneous mode (byte-uniform slots, #647) serves
     each kind's native count: full layers keep the checkpoint's
-    ``ckpt_num_key_value_heads`` (half of swa), making a 256-token full
-    block byte-equal to a 128-token swa block with zero padding.
+    ``ckpt_num_key_value_heads``, so one slot's fixed bytes hold
+    proportionally more tokens for the narrower kind. How much more follows
+    from the two configured head counts, so consumers must derive page sizes
+    from the returned counts.
 
     Args:
         config: The Inkling text config.
@@ -380,8 +382,8 @@ class InklingModelConfig(PretrainedConfig):
         group (Inkling: 55 sliding + 11 full -> 5 sub-groups of 11 -> 11
         six-way-bound slabs). All sub-groups share the one window, so
         eviction semantics per layer are unchanged vs a single sliding
-        group. Consumed by the flat KV-cache path (paged-cache group
-        publication and the hybrid slab layout); inert on a radix-built
+        group. Consumed by the paged-cache path (cache-group
+        publication and the hybrid slab layout); inert on a single-table-built
         scheduler ext, so the scheduler-blind contract above still holds
         there.
         """

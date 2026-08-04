@@ -430,6 +430,7 @@ KERNEL_GROUPS = [
         [
             CUDA_CSRC_DIR / "trtllm_allreduce.cu",
             CUDA_CSRC_DIR / "trtllm_allreduce_fusion.cu",
+            CUDA_CSRC_DIR / "trtllm_mnnvl_allreduce_fusion.cu",
             CUDA_CSRC_DIR / "trtllm_reducescatter_fusion.cu",
             CUDA_CSRC_DIR / "trtllm_allgather_fusion.cu",
             CUDA_CSRC_DIR / "minimax_reduce_rms.cu",
@@ -896,6 +897,8 @@ setup(
     install_requires=_selected_install_requires(),
     packages=find_packages(),
     package_data={
+        # Pre-swept flashinfer MoE tactic tables (see ops/tuning.py).
+        "tokenspeed_kernel.ops.moe.flashinfer": ["tactics/*.json"],
         "tokenspeed_kernel.thirdparty.cuda": ["objs/**/*.so"],
         # Vendored MiniMax MSA CuTe sources: cute/ has no __init__.py (it is
         # loaded via the upstream sys.path bootstrap), so ship it as data.

@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -30,7 +31,6 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
-next_power_of_2 = lambda value: 1 if value <= 1 else 1 << (value - 1).bit_length()
 
 
 if platform.is_nvidia:
@@ -141,7 +141,7 @@ if platform.is_nvidia:
             local_expert_offset=getattr(w, "ep_rank", 0) * local_experts,
             local_num_experts=local_experts,
             do_finalize=do_finalize,
-            tune_max_num_tokens=next_power_of_2(x.shape[0]),
+            tune_max_num_tokens=get_autotune_max_num_tokens(),
         )
 
         if routed:

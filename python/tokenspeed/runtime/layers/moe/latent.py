@@ -91,7 +91,7 @@ class Kimi3MoEExecutionPlan:
     """Construction-time orchestration selected for Kimi-K3 latent MoE."""
 
     use_native: bool
-    use_sidecar: bool
+    use_trtllm: bool
     overlap_shared_experts: bool
     joint_moe_reduce: bool
     fused_moe_ar: bool = False
@@ -100,7 +100,7 @@ class Kimi3MoEExecutionPlan:
 
     @property
     def use_precomputed_topk(self) -> bool:
-        return self.use_native or self.use_sidecar
+        return self.use_native or self.use_trtllm
 
     @classmethod
     def build(
@@ -114,12 +114,12 @@ class Kimi3MoEExecutionPlan:
         """Select orchestration without exposing platform policy to the model."""
 
         use_native = kimi3_native_moe_available()
-        use_sidecar = not use_native and (
+        use_trtllm = not use_native and (
             moe_backend.is_auto() or moe_backend.is_flashinfer_trtllm()
         )
         return cls(
             use_native=use_native,
-            use_sidecar=use_sidecar,
+            use_trtllm=use_trtllm,
             overlap_shared_experts=(
                 use_native
                 and enforce_eager
@@ -145,7 +145,7 @@ class Kimi3MoEExecutionPlan:
         """Prepare optional communication fusions before graph capture."""
 
         fused_moe_ar = (
-            self.use_sidecar
+            self.use_trtllm
             and mapping.moe.has_tp_ep
             and prepare_all_reduce_lane(mapping.moe.tp_ep_group, lane_width)
         )

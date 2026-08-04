@@ -1,6 +1,7 @@
 api_version: ci.tokenspeed.io/v1
 name: eval-glm-5.2-nvfp4-mtp-aime26
 type: eval
+workflow_stage: model-test
 triggers:
   - per-commit
   - manual
@@ -14,6 +15,7 @@ install:
 server:
   command: >-
     ts serve
+    --disable-kvstore
     --model nvidia/GLM-5.2-NVFP4
     --attn-tp-size 4
     --ep-size 4
@@ -27,7 +29,6 @@ server:
     --moe-backend flashinfer_trtllm
     --quantization nvfp4
     --kv-cache-dtype fp8
-    --weight-loader-prefetch-checkpoints
     --speculative-algorithm MTP
     --speculative-num-steps 3
     --speculative-eagle-topk 1

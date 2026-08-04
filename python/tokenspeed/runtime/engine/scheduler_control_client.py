@@ -39,6 +39,7 @@ from tokenspeed.runtime.engine.io_struct import (
     DestroyWeightsUpdateGroupReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
+    ExpertDistributionReqType,
     FlushCacheReqInput,
     FlushCacheReqOutput,
     GetInternalStateReq,
@@ -361,15 +362,21 @@ class SchedulerControlClient:
 
     async def start_expert_distribution_record(self: AsyncLLM):
         self.auto_create_handle_loop()
-        await self.expert_distribution_communicator(ExpertDistributionReq.START_RECORD)
+        await self.expert_distribution_communicator(
+            ExpertDistributionReq(action=ExpertDistributionReqType.START_RECORD)
+        )
 
     async def stop_expert_distribution_record(self: AsyncLLM):
         self.auto_create_handle_loop()
-        await self.expert_distribution_communicator(ExpertDistributionReq.STOP_RECORD)
+        await self.expert_distribution_communicator(
+            ExpertDistributionReq(action=ExpertDistributionReqType.STOP_RECORD)
+        )
 
     async def dump_expert_distribution_record(self: AsyncLLM):
         self.auto_create_handle_loop()
-        await self.expert_distribution_communicator(ExpertDistributionReq.DUMP_RECORD)
+        await self.expert_distribution_communicator(
+            ExpertDistributionReq(action=ExpertDistributionReqType.DUMP_RECORD)
+        )
 
     async def init_weights_update_group(
         self: AsyncLLM,

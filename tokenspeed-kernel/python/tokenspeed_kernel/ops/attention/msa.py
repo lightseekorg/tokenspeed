@@ -122,10 +122,10 @@ if platform.is_nvidia and platform.is_blackwell and _fmha_sm100_importable():
         attention_scale: float,
         init_blocks: int,
         local_blocks: int,
+        seq_lens_cpu: Sequence[int],
         k_scale: float | torch.Tensor | None = None,
         v_scale: float | torch.Tensor | None = None,
         query_lens_cpu: Sequence[int] | None = None,
-        seq_lens_cpu: Sequence[int] | None = None,
     ) -> torch.Tensor:
         """Run MiniMax sparse-attention extend with the CuTe attend kernel."""
 
@@ -197,11 +197,9 @@ if platform.is_nvidia and platform.is_blackwell and _fmha_sm100_importable():
         cu_seqlens_k = torch.nn.functional.pad(
             torch.cumsum(seqused_k, dim=0, dtype=torch.int32), (1, 0)
         )
-        # Exact packed KV-block row count for the CSR builder; the host read is
-        # a sync, acceptable on the eager extend path (vLLM computes the same
-        # value host-side in its metadata builder).
-        total_rows = int(torch.sum((seqused_k + page_size - 1) // page_size).item())
-
+        total_rows = sum(
+            (int(length) + page_size - 1) // page_size for length in seq_lens_cpu
+        )
         k2q_row_ptr, k2q_q_indices, schedule = build_k2q_csr(
             selected_blocks.transpose(0, 1),
             cu_seqlens_q,

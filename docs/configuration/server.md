@@ -43,6 +43,29 @@ For a compact compatibility table, see
 | `--chat-template` | Built-in chat template name or template file path (handled by the smg gateway). |
 | `--stream-interval` | Streaming buffer interval in generated tokens. Smaller values stream more frequently. |
 | `--stream-output` | Return generated text as disjoint streaming segments. |
+| `--weight-version` | Initial model-weight version stamped into generation metadata. Defaults to `default`. |
+
+### Weight Version Metadata
+
+Every generation response includes the current version in
+`meta_info["weight_version"]`. RL trainers can use this value to identify the
+policy version that produced a sample.
+
+The RL control plane updates the version only when the trainer supplies one:
+
+- SGLang-compatible `update_weights_from_distributed`,
+  `update_weights_from_tensor`, and `update_weights_from_disk` requests accept
+  an optional `weight_version`. The version changes only after the update
+  succeeds.
+- The vLLM-compatible `finish_weight_update` request accepts an optional
+  `weight_version`. A version sent with an update chunk is deferred until
+  `finish_weight_update`, so partially updated weights never advertise the new
+  version.
+- Omitting `weight_version` preserves the current value.
+
+Use `GET /get_weight_version` to read the current value,
+`POST /update_weight_version` with `{"new_version": "..."}` to set it directly,
+and `GET /model_info` to read the model path and version together.
 
 ## Scheduler And Memory
 
@@ -70,7 +93,7 @@ issue budget, while `--max-total-tokens` controls the global token pool.
 | --- | --- |
 | `--tensor-parallel-size`, `--tp` | Familiar alias for setting attention tensor parallel size. |
 | `--attn-tp-size` | Tensor parallel size for attention. |
-| `--dense-tp-size` | Tensor parallel size for dense layers. |
+| `--dense-tp-size` | Tensor parallel size for dense layers. Defaults to the attention replica width (attn TP x CP): the full world without DP attention, one replica with it. |
 | `--moe-tp-size` | Tensor parallel size for MoE layers. |
 | `--data-parallel-size` | Number of data-parallel replicas. |
 | `--mm-encoder-tp-mode` | Multimodal encoder parallelism: `weights` shards encoder weights with attention TP; `data` uses TP1 whole-item DP and currently requires aggregate serving, one node, and no attention context parallelism. |

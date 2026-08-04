@@ -168,7 +168,7 @@ def set_mla_kv_buffer_triton(
     nope_dim = cache_k_nope.size(-1)
     rope_dim = cache_k_rope.size(-1)
     # Clamp to a value representable by both source and destination. K3's
-    # latent source can be bf16 while the FlatKV cache is fp8; using only the
+    # latent source can be bf16 while the Paged cache cache is fp8; using only the
     # source bound would overflow back to a non-finite fp8 encoding on store.
     float_maxes = [
         torch.finfo(t.dtype).max

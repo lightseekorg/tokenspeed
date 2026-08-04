@@ -255,9 +255,7 @@ class TestRegistryQueries:
         for s in paged:
             assert "paged" in s.features
 
-    def test_filter_by_platform(
-        self, sample_specs, h100_platform, mi300_platform, mi350_platform
-    ):
+    def test_filter_by_platform(self, sample_specs, h100_platform, mi350_platform):
         reg = KernelRegistry.get()
         register_all_samples(reg, sample_specs)
 
@@ -269,19 +267,12 @@ class TestRegistryQueries:
         assert "flashinfer_decode" in nvidia_names
 
         amd_kernels = reg.get_for_operator(
-            "attention", "decode", platform=mi300_platform
+            "attention", "decode", platform=mi350_platform
         )
         amd_names = {s.name for s in amd_kernels}
         assert "flashinfer_decode" not in amd_names
         assert "aiter_decode" in amd_names
-
-        mi350_kernels = reg.get_for_operator(
-            "attention", "decode", platform=mi350_platform
-        )
-        mi350_names = {s.name for s in mi350_kernels}
-        assert "flashinfer_decode" not in mi350_names
-        assert "aiter_decode" in mi350_names
-        assert "triton_decode" in mi350_names
+        assert "triton_decode" in amd_names
 
     def test_filter_by_signature(self, sample_specs):
         reg = KernelRegistry.get()

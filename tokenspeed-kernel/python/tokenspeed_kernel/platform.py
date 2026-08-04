@@ -89,16 +89,6 @@ class InterconnectInfo:
 
 
 @dataclass(frozen=True)
-class Fp8E4M3FnDType:
-    dtype: torch.dtype
-    max: float
-    min: float
-
-
-_fp8e4m3_dtype = None
-
-
-@dataclass(frozen=True)
 class PlatformInfo:
     """Complete description of a compute platform."""
 
@@ -153,10 +143,6 @@ class PlatformInfo:
         return self.vendor == "amd"
 
     @property
-    def is_cdna3(self) -> bool:
-        return self.is_amd and self.arch_version == ArchVersion(9, 4)
-
-    @property
     def is_cdna4(self) -> bool:
         return self.is_amd and self.arch_version == ArchVersion(9, 5)
 
@@ -177,10 +163,6 @@ class PlatformInfo:
         return self.is_nvidia and self.arch_version >= ArchVersion(10, 0)
 
     @property
-    def is_cdna3_plus(self) -> bool:
-        return self.is_amd and self.arch_version >= ArchVersion(9, 4)
-
-    @property
     def is_cdna4_plus(self) -> bool:
         return self.is_amd and self.arch_version >= ArchVersion(9, 5)
 
@@ -192,24 +174,6 @@ class PlatformInfo:
     def arch(self) -> str:
         """Short architecture string for cache keys."""
         return str(self.arch_version)
-
-    @property
-    def is_fp8e4m3fnuz(self) -> bool:
-        return self.is_cdna3
-
-    @property
-    def fp8e4m3fn(self) -> Fp8E4M3FnDType:
-        global _fp8e4m3_dtype
-        if _fp8e4m3_dtype is None:
-            if self.is_cdna3:
-                dtype = torch.float8_e4m3fnuz
-                fp8_max = 224.0
-            else:
-                dtype = torch.float8_e4m3fn
-                fp8_max = torch.finfo(dtype).max
-            fp8_min = -fp8_max
-            _fp8e4m3_dtype = Fp8E4M3FnDType(dtype=dtype, max=fp8_max, min=fp8_min)
-        return _fp8e4m3_dtype
 
     def register_host_tensor_for_gpu_access(self, tensor: torch.Tensor) -> None:
         """Register host memory that GPU kernels will directly dereference."""
@@ -243,7 +207,6 @@ class PlatformInfo:
             return names.get(arch_version, f"SM{arch_version[0]}.{arch_version[1]}")
         if self.is_amd:
             names = {
-                (9, 4): "CDNA3",  # MI300
                 (9, 5): "CDNA4",  # MI350
                 (12, 5): "CDNA5",
             }
@@ -422,13 +385,19 @@ def _detect_rocm_platform() -> PlatformInfo:
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     arch = _extract_amd_arch(props.gcnArchName)
 
-    # Map AMD architectures
+    # Map supported AMD architectures.
     arch_map = {
-        "gfx942": ArchVersion(9, 4),  # MI300
         "gfx950": ArchVersion(9, 5),  # MI350
         "gfx1250": ArchVersion(12, 5),
     }
-    arch_version = arch_map.get(arch, ArchVersion(9, 0))
+    try:
+        arch_version = arch_map[arch]
+    except KeyError:
+        supported_arches = ", ".join(sorted(arch_map))
+        raise RuntimeError(
+            f"Detected unsupported AMD GPU architecture {arch!r}; "
+            f"current support list: {supported_arches}"
+        ) from None
     sm_features = _get_rocm_sm_features(arch)
     runtime_features = _get_rocm_runtime_features()
 
@@ -442,7 +411,6 @@ def _detect_rocm_platform() -> PlatformInfo:
         sm_count=props.multi_processor_count,
         max_threads_per_sm=getattr(props, "max_threads_per_multi_processor", 0),
         max_shared_memory_per_sm={
-            "gfx942": 64 * 1024,
             "gfx950": 160 * 1024,
         }.get(arch, getattr(props, "max_shared_memory_per_block", 0)),
         sm_features=sm_features,
@@ -455,7 +423,7 @@ def _get_rocm_sm_features(arch: str) -> frozenset[str]:
     """Determine ROCm SM features from architecture."""
     features: set[str] = set()
 
-    if arch in ("gfx942", "gfx950", "gfx1250"):
+    if arch in ("gfx950", "gfx1250"):
         features |= {"tensor_core:f16", "tensor_core:f8"}
 
     if arch in ("gfx950", "gfx1250"):
@@ -482,7 +450,7 @@ def _get_rocm_runtime_features() -> frozenset[str]:
 def _extract_amd_arch(gcn_arch_name: str) -> str:
     """Extract base architecture from GCN arch name.
 
-    Example: 'gfx942:sramecc+:xnack-' -> 'gfx942'
+    Example: 'gfx950:sramecc+:xnack-' -> 'gfx950'
     """
     return gcn_arch_name.split(":")[0]
 

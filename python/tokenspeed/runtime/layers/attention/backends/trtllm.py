@@ -46,10 +46,11 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
-from tokenspeed.runtime.layers.attention.backends.flat_groups import (
-    FlatCacheGroupsMixin,
+from tokenspeed.runtime.layers.attention.backends.cache_groups import (
+    CacheGroupsMixin,
 )
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+from tokenspeed.runtime.layers.attention.page_table import expand_page_table
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.layers.common import fp8_cast_contiguous
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -97,29 +98,30 @@ class TRTLLMMHAMetadata:
     max_seq_len_k: int = 0
     cu_seqlens_q: torch.Tensor = None
     cu_seqlens_k: torch.Tensor = None
-    # page_table is None on the flat path (per-group page_tables route reads).
+    # page_table is None on the cache path (per-group page_tables route reads).
     page_table: torch.Tensor = None
-    # Flat per-group tables/write-locs, keyed by group id (see flat_groups).
+    # Per-group tables/write locations, keyed by group id.
     page_tables: dict[str, torch.Tensor] | None = None
     out_cache_locs: dict[str, torch.Tensor] | None = None
 
 
-class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
+class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
     """trtllm_mha attention backend optimized for SM100 (Blackwell)."""
 
-    # Per-group flat tables: reads and writes route by layer.group_id, so
+    # Per-group group tables: reads and writes route by layer.group_id, so
     # slab-aliased pools (e.g. gpt-oss sliding+full pairing) are safe.
-    uses_flat_cache_groups: bool = True
+    uses_cache_groups: bool = True
     # Graph-buffer column tails pad with the zero-init dummy page, matching
-    # the radix replay contract (gather_page_table_with_padding dummy_slot=0).
-    flat_table_tail_pad: int = 0
+    # the single-table replay contract (gather_page_table_with_padding dummy_slot=0).
+    table_tail_pad: int = 0
+    draft_seq_lens_attr: str = "cuda_graph_cache_seqlens"
 
     def support_kv_cache_prewrite(
         self, forward_mode: ForwardMode | None = None
     ) -> bool:
         # Under a breakable prefill-graph capture the prewrite would bake this
         # forward's write locations into the graph (stale on every replay;
-        # dummy-page locs on the flat path) -- bake the non-prewrite branch
+        # dummy-page locs on the cache path) -- bake the non-prewrite branch
         # instead: the eager attention break writes KV from fresh metadata.
         if is_breakable_capture_active():
             return False
@@ -143,9 +145,14 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         super().__init__(config)
 
         self.page_size = config.page_size
+        self.group_page_sizes = dict(getattr(config, "group_page_sizes", None) or {})
+        self._cache_contract_bound = False
+        self._cache_logical_page_size: int | None = None
+        self._block_expand_buf: torch.Tensor | None = None
         self.max_context_len = config.context_len
         self.kv_cache_dtype = config.kv_cache_dtype
         max_bs = config.max_bs
+        self._max_bs = max_bs
 
         # Shared workspace buffer (allocated once per process).
         global _global_workspace_buffer
@@ -214,10 +221,17 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         """Build page table in [bs, max_pages] format from req_to_page.
 
         req_to_page is [req_pool_size+1, max_pages] containing page IDs.
+        A paged-cache-contract draft receives mirrored scheduler (logical)
+        page ids instead and expands them into kernel pages first.
         """
-        page_table_buf[:bs].copy_(
-            req_to_page[req_pool_indices[:bs], : self.max_num_pages]
-        )
+        if self._reads_mirrored_logical_pages():
+            page_table_buf[:bs].copy_(
+                self._expand_mirrored_page_table(req_pool_indices, bs, req_to_page)
+            )
+        else:
+            page_table_buf[:bs].copy_(
+                req_to_page[req_pool_indices[:bs], : self.max_num_pages]
+            )
         return page_table_buf[:bs]
 
     # ------------------------------------------------------------------
@@ -408,35 +422,36 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         extend_prefix_lens_cpu: torch.Tensor | None = None,
         extend_seq_lens_cpu: torch.Tensor | None = None,
         use_cuda_graph: bool = False,
-        flat_block_tables: dict[str, torch.Tensor] | None = None,
+        block_tables: dict[str, torch.Tensor] | None = None,
         **kwargs,
     ):
-        flat_page_tables = self._shed_state_groups(flat_block_tables)
-        flat_out_cache_locs = None
-        if flat_page_tables:
-            # Verify keeps [bs]-row tables; only DFLASH expands rows. TODO(flat+dflash).
+        group_page_tables = self._shed_state_groups(block_tables)
+        group_out_cache_locs = None
+        if group_page_tables:
+            # Verify keeps [bs]-row tables; only DFLASH expands rows.
             assert not (
                 self.draft_block_decode and self.spec_num_tokens > 1
-            ), "flat cache groups are unsupported with DFLASH block decode"
+            ), "paged cache groups are unsupported with DFLASH block decode"
             if forward_mode.is_extend_or_mixed():
                 assert extend_prefix_lens_cpu is not None
                 assert extend_seq_lens_cpu is not None
-                flat_out_cache_locs = self._compute_flat_extend_out_cache_locs(
-                    flat_page_tables,
+                group_out_cache_locs = self._compute_extend_group_out_cache_locs(
+                    group_page_tables,
                     extend_prefix_lens_cpu[:bs],
                     extend_seq_lens_cpu[:bs],
                     self.page_size,
                 )
             else:
-                flat_out_cache_locs = self._compute_flat_decode_out_cache_locs(
-                    flat_page_tables,
+                group_out_cache_locs = self._compute_decode_group_out_cache_locs(
+                    group_page_tables,
                     seq_lens[:bs],
                     self.page_size,
-                    self._flat_verify_tokens(),
+                    self._verify_tokens(),
                 )
-            self._maybe_check_flat_write_locs(
-                flat_page_tables, flat_out_cache_locs, self.page_size
+            self._maybe_check_group_write_locs(
+                group_page_tables, group_out_cache_locs, self.page_size
             )
+            group_page_tables = self._kernel_page_tables(group_page_tables)
 
         if forward_mode.is_extend_or_mixed():
             self._init_extend_metadata(
@@ -448,14 +463,21 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 extend_prefix_lens=extend_prefix_lens,
                 extend_prefix_lens_cpu=extend_prefix_lens_cpu,
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
-                flat_page_tables=flat_page_tables,
-                flat_out_cache_locs=flat_out_cache_locs,
+                group_page_tables=group_page_tables,
+                group_out_cache_locs=group_out_cache_locs,
             )
             # Drafter: also fill decode_metadata so step 1+ multi-step has
             # metadata under EXTEND/MIXED target. seq_lens is the drafter's
             # live alias buffer (wrapper pre-writes before this call).
             if self.is_draft:
-                self._init_decode_metadata(bs, req_pool_indices, seq_lens, req_to_page)
+                self._init_decode_metadata(
+                    bs,
+                    req_pool_indices,
+                    seq_lens,
+                    req_to_page,
+                    group_page_tables=group_page_tables,
+                    group_out_cache_locs=group_out_cache_locs,
+                )
             return
 
         if self.draft_block_decode and self.spec_num_tokens > 1:
@@ -474,8 +496,8 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 req_pool_indices,
                 seq_lens,
                 req_to_page,
-                flat_page_tables=flat_page_tables,
-                flat_out_cache_locs=flat_out_cache_locs,
+                group_page_tables=group_page_tables,
+                group_out_cache_locs=group_out_cache_locs,
             )
             if self.is_draft:
                 # Drafter's N-1 single-token steps after the first.
@@ -484,8 +506,8 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                     req_pool_indices,
                     seq_lens,
                     req_to_page,
-                    flat_page_tables=flat_page_tables,
-                    flat_out_cache_locs=flat_out_cache_locs,
+                    group_page_tables=group_page_tables,
+                    group_out_cache_locs=group_out_cache_locs,
                 )
         else:
             self._init_decode_metadata(
@@ -493,8 +515,8 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 req_pool_indices,
                 seq_lens,
                 req_to_page,
-                flat_page_tables=flat_page_tables,
-                flat_out_cache_locs=flat_out_cache_locs,
+                group_page_tables=group_page_tables,
+                group_out_cache_locs=group_out_cache_locs,
             )
 
     def _init_decode_metadata(
@@ -503,16 +525,16 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         req_to_page: torch.Tensor,
-        flat_page_tables: dict[str, torch.Tensor] | None = None,
-        flat_out_cache_locs: dict[str, torch.Tensor] | None = None,
+        group_page_tables: dict[str, torch.Tensor] | None = None,
+        group_out_cache_locs: dict[str, torch.Tensor] | None = None,
     ):
         assert (
             seq_lens.dtype == torch.int32
         ), f"seq_lens must be int32, got {seq_lens.dtype}"
         device = seq_lens.device
         # Alias seq_lens (no copy, no mutation). cu_seqlens_k omitted:
-        # the decode kernel doesn't read it. On the flat path the per-group
-        # tables route every read; the radix single table would be dead work.
+        # the decode kernel doesn't read it. On the cache path the per-group
+        # tables route every read; the single-table single table would be dead work.
         self.forward_decode_metadata = TRTLLMMHAMetadata(
             cache_seqlens_int32=seq_lens[:bs],
             max_seq_len_q=1,
@@ -520,13 +542,47 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             cu_seqlens_q=torch.arange(0, bs + 1, dtype=torch.int32, device=device),
             page_table=(
                 None
-                if flat_page_tables
+                if group_page_tables
                 else self._build_page_table(
                     req_pool_indices, seq_lens, bs, req_to_page, self.page_table_buf
                 )
             ),
-            page_tables=flat_page_tables,
-            out_cache_locs=flat_out_cache_locs,
+            page_tables=group_page_tables,
+            out_cache_locs=group_out_cache_locs,
+        )
+
+    def mark_cache_contract(self, logical_page_size: int | None = None) -> None:
+        """Record that the pool runs on the paged cache contract."""
+        self._cache_contract_bound = True
+        if logical_page_size is not None:
+            self._cache_logical_page_size = int(logical_page_size)
+
+    def _reads_mirrored_logical_pages(self) -> bool:
+        """True when req_to_page holds mirrored scheduler (logical) page ids."""
+        logical = getattr(self, "_cache_logical_page_size", None)
+        return (
+            getattr(self, "_cache_contract_bound", False)
+            and logical is not None
+            and logical != self.page_size
+        )
+
+    def _expand_mirrored_page_table(
+        self, req_pool_indices: torch.Tensor, bs: int, req_to_page: torch.Tensor
+    ) -> torch.Tensor:
+        """Expand mirrored logical page ids into kernel pages ([bs, max_num_pages])."""
+        if self._block_expand_buf is None:
+            with torch.inference_mode(False):
+                self._block_expand_buf = torch.zeros(
+                    (self._max_bs, self.max_num_pages),
+                    dtype=req_to_page.dtype,
+                    device=req_to_page.device,
+                )
+        return expand_page_table(
+            req_to_page[req_pool_indices[:bs]],
+            logical_page_size=self._cache_logical_page_size,
+            kernel_page_size=self.page_size,
+            max_kernel_pages=self.max_num_pages,
+            out=self._block_expand_buf,
         )
 
     def _replicate_block_page_table(
@@ -536,14 +592,16 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         bs: int,
         req_to_page: torch.Tensor,
     ) -> None:
-        """Replicate each request's page table to its spec_num_tokens block rows.
-
-        ``out`` is the [bs*spec_num_tokens, max_num_pages] destination. All block
-        rows of a request share its pages (decode only reads KV), so a single
-        broadcast copy suffices.
-        """
+        """Replicate each request's page table to its spec_num_tokens block rows."""
         spec = self.spec_num_tokens
-        base_page_table = req_to_page[req_pool_indices[:bs], : self.max_num_pages]
+
+        if self._reads_mirrored_logical_pages():
+            base_page_table = self._expand_mirrored_page_table(
+                req_pool_indices, bs, req_to_page
+            )
+        else:
+            base_page_table = req_to_page[req_pool_indices[:bs], : self.max_num_pages]
+
         out[: bs * spec, :].view(bs, spec, self.max_num_pages).copy_(
             base_page_table[:, None, :]
         )
@@ -605,8 +663,8 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         torch.clamp_min(seq_lens[:bs], spec_num_tokens, out=dst)
         return dst
 
-    def _flat_verify_tokens(self) -> int:
-        # Write locs per request on the flat path: N for target verify
+    def _verify_tokens(self) -> int:
+        # Write locs per request on the cache path: N for target verify
         # ([bs*N], token-major), 1 elsewhere (draft chains use caller locs).
         return (
             self.spec_num_tokens
@@ -621,8 +679,8 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         req_to_page: torch.Tensor,
-        flat_page_tables: dict[str, torch.Tensor] | None = None,
-        flat_out_cache_locs: dict[str, torch.Tensor] | None = None,
+        group_page_tables: dict[str, torch.Tensor] | None = None,
+        group_out_cache_locs: dict[str, torch.Tensor] | None = None,
     ):
         """Prefill-slot metadata for multi-token decode (uniform q_len per
         request). Routes through the decode kernel via q_len_per_req; the
@@ -646,13 +704,13 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             ),
             page_table=(
                 None
-                if flat_page_tables
+                if group_page_tables
                 else self._build_page_table(
                     req_pool_indices, seq_lens, bs, req_to_page, self.page_table_buf
                 )
             ),
-            page_tables=flat_page_tables,
-            out_cache_locs=flat_out_cache_locs,
+            page_tables=group_page_tables,
+            out_cache_locs=group_out_cache_locs,
         )
 
     def _init_extend_metadata(
@@ -665,8 +723,8 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         extend_prefix_lens: torch.Tensor | None = None,
         extend_prefix_lens_cpu=None,
         extend_seq_lens_cpu=None,
-        flat_page_tables: dict[str, torch.Tensor] | None = None,
-        flat_out_cache_locs: dict[str, torch.Tensor] | None = None,
+        group_page_tables: dict[str, torch.Tensor] | None = None,
+        group_out_cache_locs: dict[str, torch.Tensor] | None = None,
     ):
         """Populate prefill slot for regular EXTEND (ragged query)."""
         assert (
@@ -679,10 +737,10 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         cu_seqlens_k = torch.nn.functional.pad(
             torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
         )
-        # Flat path: per-group tables route every read (see _init_decode_metadata).
+        # Cache path: per-group tables route every read (see _init_decode_metadata).
         page_table = (
             None
-            if flat_page_tables
+            if group_page_tables
             else self._build_page_table(
                 req_pool_indices, seq_lens, bs, req_to_page, self.page_table_buf
             )
@@ -719,8 +777,8 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             page_table=page_table,
-            page_tables=flat_page_tables,
-            out_cache_locs=flat_out_cache_locs,
+            page_tables=group_page_tables,
+            out_cache_locs=group_out_cache_locs,
         )
 
     # ------------------------------------------------------------------
@@ -730,24 +788,15 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
     def init_cuda_graph_state(
         self,
         max_bs: int,
-        seq_lens_buf: torch.Tensor,
         paged_cache_group_specs: Sequence = (),
         **kwargs,
     ):
-        assert (
-            seq_lens_buf.dtype == torch.int32
-            and seq_lens_buf.dim() == 1
-            and seq_lens_buf.shape[0] >= max_bs
-        ), (
-            f"seq_lens_buf must be int32 with shape[0] >= {max_bs}, "
-            f"got {seq_lens_buf.dtype} {tuple(seq_lens_buf.shape)}"
-        )
         self.cuda_graph_prefill_metadata = {}
         self.cuda_graph_decode_metadata = {}
-        # Flat per-group persistent buffers + state-group shed; before the
+        # Per-group persistent buffers + state-group shed; before the
         # DFLASH early return (replay reads the dict for the stale guard).
-        self._learn_flat_state_groups(paged_cache_group_specs)
-        self._init_flat_graph_buffers(max_bs)
+        self._learn_cache_groups(paged_cache_group_specs)
+        self._init_group_graph_buffers(max_bs)
         if self.draft_block_decode and self.spec_num_tokens > 1:
             # DFLASH draft block: spec_num_tokens decode rows per request. Unlike
             # the plain path, cache_seqlens is a dedicated buffer (NOT aliasing
@@ -764,11 +813,15 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 device=self.device,
             )
             return
-        # Alias controller's seq_lens_buf — backend never mutates it.
+        # Own the cache-seqlens buffer instead of aliasing the controller's
+        # seq_lens_buf; replay copies the live lengths in, so graph state does
+        # not depend on the controller mutating a shared tensor in place.
         self.cuda_graph_page_table = torch.zeros(
             (max_bs, self.max_num_pages), dtype=torch.int32, device=self.device
         )
-        self.cuda_graph_cache_seqlens = seq_lens_buf
+        self.cuda_graph_cache_seqlens = torch.zeros(
+            max_bs, dtype=torch.int32, device=self.device
+        )
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -776,7 +829,7 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
-        flat_cache_group_ids: tuple[str, ...] = (),
+        cache_group_ids: tuple[str, ...] = (),
         **kwargs,
     ):
         if forward_mode.is_extend_or_mixed():
@@ -786,13 +839,13 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
 
         # Real tables only arrive at replay; capture records metadata views
         # into the persistent per-group buffers.
-        if flat_cache_group_ids:
-            # Verify keeps [bs]-row tables + [bs*N] loc views. TODO(flat+dflash).
+        if cache_group_ids:
+            # Verify keeps [bs]-row tables plus [bs*N] location views.
             assert not (
                 self.draft_block_decode and self.spec_num_tokens > 1
-            ), "flat_cache_group_ids is unsupported with DFLASH block decode"
-        page_tables, out_cache_locs = self._flat_capture_group_views(
-            bs, flat_cache_group_ids, tokens_per_req=self._flat_verify_tokens()
+            ), "cache_group_ids is unsupported with DFLASH block decode"
+        page_tables, out_cache_locs = self._capture_group_views(
+            bs, cache_group_ids, tokens_per_req=self._verify_tokens()
         )
 
         if self.draft_block_decode and self.spec_num_tokens > 1:
@@ -800,6 +853,8 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             return
 
         if self.spec_num_tokens > 1:
+            # Seed the owned buffer first: it is the clamp source below.
+            self.cuda_graph_cache_seqlens[:bs].copy_(seq_lens[:bs])
             self._init_multi_token_metadata_capture(
                 bs, self.spec_num_tokens, page_tables, out_cache_locs
             )
@@ -838,9 +893,10 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         page_tables: dict[str, torch.Tensor] | None = None,
         out_cache_locs: dict[str, torch.Tensor] | None = None,
     ):
-        # cache_seqlens aliases seq_lens_buf (set in init_cuda_graph_state).
-        # Flat captures route reads through the per-group buffer views and
-        # replay never fills the radix single table, so record page_table=None
+        # cache_seqlens views the backend-owned cuda_graph_cache_seqlens (set in
+        # init_cuda_graph_state).
+        # Cache-group captures route reads through the per-group buffer views and
+        # replay never fills the single-table single table, so record page_table=None
         # instead of a slice of the never-filled zero buffer.
         metadata = TRTLLMMHAMetadata(
             cache_seqlens_int32=self.cuda_graph_cache_seqlens[:bs],
@@ -853,6 +909,8 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             page_tables=page_tables,
             out_cache_locs=out_cache_locs,
         )
+        # Seed the owned buffer: the capture run reads it before replay.
+        metadata.cache_seqlens_int32.copy_(seq_lens[:bs])
         self.cuda_graph_decode_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
 
@@ -896,7 +954,7 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
         req_to_page: torch.Tensor = None,
-        flat_block_tables: dict[str, torch.Tensor] | None = None,
+        block_tables: dict[str, torch.Tensor] | None = None,
         **kwargs,
     ):
         if forward_mode.is_extend_or_mixed():
@@ -904,12 +962,11 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 f"trtllm CUDA graph replay not supported for {forward_mode}"
             )
 
-        # Fail loudly instead of replaying over stale/zero page tables.
-        self._flat_replay_stale_guard(bs, flat_block_tables)
-
         if self.draft_block_decode and self.spec_num_tokens > 1:
             # DFLASH draft block: replicate the page table to each request's
             # block rows. seq_lens are re-derived in-graph, so not touched here.
+            # The per-group stale guard doesn't apply: block-decode capture
+            # records only cuda_graph_page_table, refilled right here.
             if req_to_page is not None:
                 self._replicate_block_page_table(
                     self.cuda_graph_page_table, req_pool_indices, bs, req_to_page
@@ -918,11 +975,19 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 self.forward_decode_metadata = self.cuda_graph_decode_metadata[bs]
             return
 
-        # cache_seqlens aliases seq_lens_buf; only page tables need refresh.
-        # Flat captures read only the per-group buffers; the radix single
+        # Fail loudly instead of replaying over stale/zero page tables.
+        self._replay_stale_guard(bs, block_tables)
+
+        # Copy the live cache lengths into our own buffer (the plain-decode and
+        # draft-decode metadata view cuda_graph_cache_seqlens); the spec>1 verify
+        # path instead reads spec_cache_seqlens_buf via _clamped_spec_seqlens.
+        self.cuda_graph_cache_seqlens[:bs].copy_(seq_lens[:bs])
+
+        # Only page tables need refresh beyond that.
+        # Cache-group captures read only the per-group buffers; the single-table single
         # table would be dead work there (and req_to_page is unpopulated on
-        # a flat scheduler build).
-        if not self.cuda_graph_flat_page_tables and req_to_page is not None:
+        # a cache-group scheduler).
+        if not self.cuda_graph_page_tables and req_to_page is not None:
             gather_page_table_with_padding(
                 req_to_page=req_to_page,
                 req_pool_indices=req_pool_indices,
@@ -933,14 +998,13 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 page_size=self.page_size,
                 dummy_slot=0,
             )
-        if flat_block_tables:
-            # cuda_graph_cache_seqlens aliases the controller's seq_lens_buf,
-            # filled by input prep BEFORE this call.
-            self._flat_replay_fill(
+        if block_tables:
+            # cuda_graph_cache_seqlens was refreshed from live seq_lens above.
+            self._fill_group_graph_buffers(
                 bs,
-                flat_block_tables,
+                block_tables,
                 self.cuda_graph_cache_seqlens,
-                tokens_per_req=self._flat_verify_tokens(),
+                tokens_per_req=self._verify_tokens(),
             )
 
         # Refresh for both verify and draft: draft step 1 is multi-token

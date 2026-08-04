@@ -30,7 +30,7 @@ _DENSE_HALF_SIGNATURES = format_signatures(
     capability=CapabilityRequirement(vendors=frozenset({"amd"})),
     signatures=_DENSE_HALF_SIGNATURES,
     priority=Priority.PERFORMANT,
-    tags={"amd", "flat_kv"},
+    tags={"amd", "paged_cache"},
 )
 def triton_amd_kda_paged_prefill(
     q: torch.Tensor,
@@ -45,7 +45,7 @@ def triton_amd_kda_paged_prefill(
     cu_seqlens: torch.Tensor,
     lower_bound: float | None,
 ) -> KdaPrefillResult:
-    """Adapt the existing AMD chunk kernels to the packed public contract."""
+    """Adapt the AMD chunk kernels to the canonical K-major public contract."""
     from tokenspeed_kernel.ops.attention.triton.kda_chunk import (
         kda_chunk_prefill,
     )
@@ -70,113 +70,14 @@ def triton_amd_kda_paged_prefill(
 
 @register_kernel(
     "attention",
-    "kda_paged_decode",
-    name="triton_amd_kda_paged_decode",
-    solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"amd"})),
-    signatures=_DENSE_HALF_SIGNATURES,
-    priority=Priority.PERFORMANT,
-    traits={"indexed_state": frozenset({True})},
-    tags={"amd", "flat_kv", "cuda_graph"},
-)
-def triton_amd_kda_paged_decode(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g_raw: torch.Tensor,
-    beta_logits: torch.Tensor,
-    A_log: torch.Tensor,
-    dt_bias: torch.Tensor,
-    *,
-    state_pool: torch.Tensor,
-    read_indices: torch.Tensor,
-    write_indices: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    lower_bound: float | None,
-) -> torch.Tensor:
-    """Adapt the existing AMD indexed recurrent kernel."""
-    from tokenspeed_kernel.ops.attention.triton.kda import (
-        kda_recurrent,
-        kda_recurrent_decode,
-        kda_state_scatter,
-    )
-
-    q_packed = q.squeeze(0)
-    k_packed = k.squeeze(0)
-    v_packed = v.squeeze(0)
-    g_packed = g_raw.squeeze(0)
-    beta_packed = beta_logits.squeeze(0)
-    if q_packed.shape[0] == read_indices.numel():
-        return kda_recurrent_decode(
-            q_packed,
-            k_packed,
-            v_packed,
-            g_packed,
-            beta_packed,
-            state_pool,
-            A_log,
-            dt_bias.view(q.shape[-2], q.shape[-1]),
-            lower_bound=lower_bound,
-            cu_seqlens=cu_seqlens,
-            read_indices=read_indices,
-            write_indices=write_indices,
-        ).unsqueeze(0)
-
-    # Compound decode packs multiple tokens per request. Gather each source
-    # state once, run the existing packed recurrence, then publish its final
-    # state to the independently selected destination page.
-    valid = read_indices >= 0
-    recurrent_state = state_pool[read_indices.clamp_min(0)].contiguous()
-    local_indices = torch.where(
-        valid,
-        torch.arange(
-            read_indices.numel(),
-            device=read_indices.device,
-            dtype=read_indices.dtype,
-        ),
-        -1,
-    )
-    out, final_state = kda_recurrent(
-        q_packed,
-        k_packed,
-        v_packed,
-        g_packed,
-        beta_packed,
-        recurrent_state,
-        A_log,
-        dt_bias.view(q.shape[-2], q.shape[-1]),
-        lower_bound=lower_bound,
-        cu_seqlens=cu_seqlens,
-        state_indices=local_indices,
-    )
-    final_state = final_state.to(state_pool.dtype, copy=False).contiguous()
-    write_indices = write_indices.to(torch.int64)
-    if state_pool.is_contiguous():
-        kda_state_scatter(state_pool, final_state, write_indices)
-    else:
-        # Page-strided FlatKV views reserve page zero as immutable graph
-        # padding. Keep the scatter capture-safe without dynamic filtering.
-        valid_write = write_indices > 0
-        safe_indices = torch.where(valid_write, write_indices, 0)
-        safe_updates = torch.where(
-            valid_write.view((-1,) + (1,) * (final_state.ndim - 1)),
-            final_state,
-            torch.zeros((), dtype=final_state.dtype, device=final_state.device),
-        )
-        state_pool.index_copy_(0, safe_indices, safe_updates)
-    return out.unsqueeze(0)
-
-
-@register_kernel(
-    "attention",
     "kda_fused_paged_decode",
     name="triton_nvidia_kda_fused_paged_decode",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
     signatures=_DENSE_HALF_SIGNATURES,
     priority=Priority.SPECIALIZED,
-    traits={"flat_state": frozenset({True})},
-    tags={"nvidia", "flat_kv", "cuda_graph", "fusion"},
+    traits={"paged_state": frozenset({True})},
+    tags={"nvidia", "paged_cache", "cuda_graph", "fusion"},
 )
 def triton_nvidia_kda_fused_paged_decode(
     mixed_qkv: torch.Tensor,
@@ -228,8 +129,8 @@ def triton_nvidia_kda_fused_paged_decode(
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
     signatures=_DENSE_HALF_SIGNATURES,
     priority=Priority.SPECIALIZED,
-    traits={"flat_state": frozenset({True})},
-    tags={"nvidia", "flat_kv", "cuda_graph", "fusion", "speculative"},
+    traits={"paged_state": frozenset({True})},
+    tags={"nvidia", "paged_cache", "cuda_graph", "fusion", "speculative"},
 )
 def triton_nvidia_kda_fused_paged_verify(
     mixed_qkv: torch.Tensor,
@@ -286,7 +187,7 @@ def triton_nvidia_kda_fused_paged_verify(
     signatures=_DENSE_HALF_SIGNATURES,
     priority=Priority.PERFORMANT,
     traits={"indexed_state": frozenset({True})},
-    tags={"nvidia", "flat_kv", "cuda_graph"},
+    tags={"nvidia", "paged_cache", "cuda_graph"},
 )
 def triton_nvidia_kda_paged_decode(
     q: torch.Tensor,
@@ -362,7 +263,7 @@ def _nvidia_kda_prefill(
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
     signatures=_DENSE_HALF_SIGNATURES,
     priority=Priority.PERFORMANT,
-    tags={"nvidia", "flat_kv"},
+    tags={"nvidia", "paged_cache"},
 )
 def triton_nvidia_kda_paged_prefill(**kwargs) -> KdaPrefillResult:
     from tokenspeed_kernel.ops.attention.triton.linear.kda import (
@@ -380,7 +281,7 @@ def triton_nvidia_kda_paged_prefill(**kwargs) -> KdaPrefillResult:
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
     signatures=_DENSE_HALF_SIGNATURES,
     priority=Priority.SPECIALIZED,
-    tags={"nvidia", "flat_kv"},
+    tags={"nvidia", "paged_cache"},
 )
 def flashkda_nvidia_kda_paged_prefill(**kwargs) -> KdaPrefillResult:
     from tokenspeed_kernel.ops.attention.flash_kda import flash_kda_chunk_prefill
@@ -396,7 +297,7 @@ def flashkda_nvidia_kda_paged_prefill(**kwargs) -> KdaPrefillResult:
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
     signatures=_DENSE_HALF_SIGNATURES,
     priority=Priority.SPECIALIZED,
-    tags={"nvidia", "flat_kv"},
+    tags={"nvidia", "paged_cache"},
 )
 def cutedsl_kda_nvidia_paged_prefill(**kwargs) -> KdaPrefillResult:
     from tokenspeed_kernel.ops.attention.cutedsl_kda import cutedsl_kda_chunk_prefill

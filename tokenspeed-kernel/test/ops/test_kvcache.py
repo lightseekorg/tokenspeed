@@ -28,38 +28,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     transfer_kv_all_layer_mla,
     transfer_kv_per_layer,
     transfer_kv_per_layer_mla,
-    zero_flat_cache_pages,
 )
-
-
-def test_zero_flat_cache_pages_clears_only_selected_pages(device: str) -> None:
-    num_pages, page_size_bytes, num_slabs = 7, 4_100, 3
-    slabs = [
-        torch.full(
-            (num_pages, page_size_bytes),
-            0xA0 + index,
-            dtype=torch.uint8,
-            device=device,
-        )
-        for index in range(num_slabs)
-    ]
-    expected = [slab.clone() for slab in slabs]
-    for slab in expected:
-        slab[[2, 5]] = 0
-
-    slab_addresses = torch.tensor(
-        [slab.data_ptr() for slab in slabs], dtype=torch.uint64, device=device
-    )
-    page_ids = torch.tensor([5, 2], dtype=torch.int32, device=device)
-    zero_flat_cache_pages(
-        slab_addresses,
-        page_ids,
-        page_size_bytes=page_size_bytes,
-    )
-    torch.cuda.synchronize()
-
-    for actual, reference in zip(slabs, expected):
-        assert torch.equal(actual, reference)
 
 
 def test_transfer_kv_per_layer(device: str) -> None:

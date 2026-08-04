@@ -1,13 +1,13 @@
-"""Inkling model unit tests: config registration, scheduler blindness, fixtures.
+"""Inkling model unit tests: config registration, scheduler blindness, modules.
 
-Model-module tests (gate math, sconv parity, shapes) are added alongside the
-model implementation. NOTE: intentionally NOT registered in CI suites while
-the Inkling port is confidential/local-only.
+All configs come from the released hub snapshots (``inkling_fixtures``),
+truncated in layer count only — module tests run at the real widths, on the
+real kernel paths (fused router GEMM etc.). Model-module tests (gate math,
+sconv parity, shapes) are added alongside the model implementation.
 """
 
 import os
 import sys
-import tempfile
 import unittest
 
 from tokenspeed.runtime.configs.inkling_config import (
@@ -26,10 +26,27 @@ sys.path.insert(
         os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     ),
 )
-from test.runtime.models.inkling_fixtures import (
-    TINY_MM_CONFIG,
-    make_inkling_dummy_checkpoint,
+sys.path.insert(
+    0,
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
 )
+from test.runtime.models.inkling_fixtures import (  # noqa: E402
+    INKLING_NVFP4,
+    NUM_TEST_LAYERS,
+    has_blackwell,
+    load_inkling_config,
+)
+
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(
+    est_time=40,
+    suite="runtime-1gpu",
+    disabled_on_runners=["amd-*", "h100-*"],
+)
+
+if not has_blackwell():
+    raise unittest.SkipTest("Inkling module tests require an NVIDIA Blackwell GPU")
 
 
 class TestInklingConfigRegistry(unittest.TestCase):
@@ -37,20 +54,29 @@ class TestInklingConfigRegistry(unittest.TestCase):
         self.assertIs(_CONFIG_REGISTRY["inkling_mm_model"], InklingMMConfig)
         self.assertIs(_CONFIG_REGISTRY["inkling_model"], InklingModelConfig)
 
-    def test_get_config_loads_tiny_fixture(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            ckpt = make_inkling_dummy_checkpoint(tmpdir, tiny=True)
-            config = get_config(str(ckpt), trust_remote_code=False, revision=None)
+    def test_get_config_loads_hub_snapshot(self):
+        config = get_config(INKLING_NVFP4, trust_remote_code=False, revision=None)
         self.assertIsInstance(config, InklingMMConfig)
         text = config.get_text_config()
-        self.assertEqual(text.num_hidden_layers, 6)
+        self.assertEqual(text.num_hidden_layers, 66)
+        # Full attention every 6th layer; the rest sliding.
+        self.assertEqual(text.global_attention_layer_ids, list(range(5, 66, 6)))
+        self.assertEqual(
+            text.swa_attention_layer_ids,
+            [i for i in range(66) if i % 6 != 5],
+        )
+
+    def test_truncated_config_keeps_all_layer_kinds(self):
+        text = load_inkling_config().get_text_config()
+        self.assertEqual(text.num_hidden_layers, NUM_TEST_LAYERS)
+        self.assertEqual(text.dense_mlp_idx, 2)  # dense layers present
         self.assertEqual(text.swa_attention_layer_ids, [0, 1, 2, 3, 4])
         self.assertEqual(text.global_attention_layer_ids, [5])
 
     def test_scheduler_blindness(self):
         """The engine enables mamba scheduling off attribute presence alone
         (event_loop.py); the Inkling config must never grow these attributes."""
-        config = InklingMMConfig(**{k: v for k, v in TINY_MM_CONFIG.items()})
+        config = load_inkling_config()
         text = config.get_text_config()
         for obj in (config, text):
             for attr in (
@@ -67,46 +93,44 @@ class TestInklingConfigRegistry(unittest.TestCase):
                 )
 
     def test_kv_head_uniformization(self):
-        text = InklingModelConfig(**TINY_MM_CONFIG["text_config"])
-        self.assertEqual(text.ckpt_num_key_value_heads, 2)
-        self.assertEqual(text.num_key_value_heads, 4)
+        text = load_inkling_config().get_text_config()
+        self.assertEqual(text.ckpt_num_key_value_heads, 8)
+        self.assertEqual(text.swa_num_key_value_heads, 16)
+        self.assertEqual(text.num_key_value_heads, 16)
 
     def test_vocab_semantics(self):
-        text = InklingModelConfig(**TINY_MM_CONFIG["text_config"])
-        self.assertEqual(text.vocab_size, 2000)  # unpadded, for reporting
-        self.assertEqual(text.padded_vocab_size, 2048)  # module shapes
+        text = load_inkling_config().get_text_config()
+        self.assertEqual(text.vocab_size, 200058)  # unpadded, for reporting
+        self.assertEqual(text.padded_vocab_size, 201024)  # module shapes
 
     def test_conv_stream_layout(self):
-        text = InklingModelConfig(**TINY_MM_CONFIG["text_config"])
+        text = load_inkling_config().get_text_config()
         layout = inkling_conv_stream_layout(text, attn_tp_size=1)
-        kv_dim = 4 * 32  # uniform kv heads * head_dim
+        kv_dim = text.num_key_value_heads * text.head_dim  # uniform kv width
+        h = text.hidden_size
         self.assertEqual(layout[InklingConvStream.K], (0, kv_dim))
         self.assertEqual(layout[InklingConvStream.V], (kv_dim, kv_dim))
-        self.assertEqual(layout[InklingConvStream.ATTN], (2 * kv_dim, 256))
-        self.assertEqual(layout[InklingConvStream.MLP], (2 * kv_dim + 256, 256))
-        self.assertEqual(inkling_conv_total_dim(text, 1), 2 * kv_dim + 2 * 256)
+        self.assertEqual(layout[InklingConvStream.ATTN], (2 * kv_dim, h))
+        self.assertEqual(layout[InklingConvStream.MLP], (2 * kv_dim + h, h))
+        self.assertEqual(inkling_conv_total_dim(text, 1), 2 * kv_dim + 2 * h)
 
     def test_paged_cache_layer_types_sliding_subgroups(self):
-        """Flat-KV group labels: sliding layers split round-robin into
+        """Cache-group labels: sliding layers split round-robin into
         equal-count sub-groups sized by the full-layer count, so every
-        hybrid slab is bound by one layer of each group (5+1 for Inkling;
-        see paged_cache_spec.hybrid_slab_group_size). Exposed as
-        paged_cache_layer_types, NOT layer_types: transformers validates
-        layer_types against ALLOWED_LAYER_TYPES, which rejects sub-group
-        labels."""
-        text = InklingModelConfig(**TINY_MM_CONFIG["text_config"])
+        hybrid slab is bound by one layer of each group (5+1 truncated,
+        5x11+11 at full depth; see paged_cache_spec.hybrid_slab_group_size).
+        Exposed as paged_cache_layer_types, NOT layer_types: transformers
+        validates layer_types against ALLOWED_LAYER_TYPES, which rejects
+        sub-group labels."""
+        text = load_inkling_config().get_text_config()
         self.assertEqual(
             text.paged_cache_layer_types,
             [f"sliding_attention_{k}" for k in range(5)] + ["full_attention"],
         )
-        # Real shape: 66 layers, full attention every 6th layer ->
-        # 5 sub-groups of 11 sliding + 11 full.
+        # Full depth: 66 layers -> 5 sub-groups of 11 sliding + 11 full.
+        full = load_inkling_config(num_layers=None).get_text_config()
         full_ids = list(range(5, 66, 6))
-        cfg = InklingModelConfig(
-            num_hidden_layers=66,
-            local_layer_ids=[i for i in range(66) if i not in set(full_ids)],
-        )
-        lt = cfg.paged_cache_layer_types
+        lt = full.paged_cache_layer_types
         self.assertEqual(
             [i for i, t in enumerate(lt) if t == "full_attention"], full_ids
         )
@@ -152,19 +176,32 @@ class TestInklingGate(unittest.TestCase):
         from tokenspeed.runtime.models.inkling import InklingGate
 
         torch.manual_seed(0)
-        text = InklingModelConfig(**TINY_MM_CONFIG["text_config"])
-        gate = InklingGate(text).cuda()
+        text = load_inkling_config().get_text_config()
+        # bf16 weight as in the engine: the real hidden size takes the fused
+        # router-GEMM path, which requires bf16 activations and weight.
+        torch.set_default_dtype(torch.bfloat16)
+        try:
+            gate = InklingGate(text).cuda()
+        finally:
+            torch.set_default_dtype(torch.float32)
+        self.assertTrue(gate.use_dsv3_router_gemm)
         with torch.no_grad():
             gate.weight.normal_(0, 0.5)
             gate.bias.normal_(0, 0.1)
             # Identity scale keeps the torch reference below exact.
             gate.global_scale.fill_(1.0)
-        x = torch.randn(64, text.hidden_size, device="cuda")
+        x = torch.randn(64, text.hidden_size, dtype=torch.bfloat16, device="cuda")
 
         full_weights, ids, logits = gate(x)
         weights, gammas = full_weights[:, : gate.top_k], full_weights[:, gate.top_k :]
         ref_w, ref_ids, ref_g = _reference_gate(
-            x.cpu(), gate.weight.cpu(), gate.bias.cpu(), 8, 2, 2, text.route_scale
+            x.cpu(),
+            gate.weight.cpu(),
+            gate.bias.cpu(),
+            text.n_routed_experts,
+            text.n_shared_experts,
+            gate.top_k,
+            text.route_scale,
         )
         weights, gammas, ids = weights.cpu(), gammas.cpu(), ids.cpu()
         self.assertTrue(torch.equal(ids.long(), ref_ids))
@@ -191,12 +228,14 @@ class TestInklingSharedExperts(unittest.TestCase):
         from tokenspeed.runtime.models.inkling import InklingSharedExperts
 
         torch.manual_seed(0)
-        text = InklingModelConfig(**TINY_MM_CONFIG["text_config"])
+        text = load_inkling_config().get_text_config()
         mapping = SimpleNamespace(attn=SimpleNamespace(tp_rank=0, tp_size=1))
         mod = InklingSharedExperts(text, mapping).to(torch.bfloat16).cuda()
         with torch.no_grad():
-            mod.w13_weight.normal_(0, 0.05)
-            mod.w2_weight.normal_(0, 0.05)
+            # Fan-in-scaled init keeps activations O(1) at the real widths, so
+            # the bf16 kernel/einsum comparison stays inside the tolerance.
+            mod.w13_weight.normal_(0, text.hidden_size**-0.5)
+            mod.w2_weight.normal_(0, text.intermediate_size**-0.5)
 
         x = torch.randn(37, text.hidden_size, dtype=torch.bfloat16, device="cuda")
         gammas = torch.rand(37, text.n_shared_experts, device="cuda") * 8
@@ -207,7 +246,11 @@ class TestInklingSharedExperts(unittest.TestCase):
             tuple(deferred.shape), (text.n_shared_experts, 37, text.hidden_size)
         )
         manual = torch.einsum("sth,ts->th", deferred.float(), gammas.float())
-        torch.testing.assert_close(finalized.float(), manual, atol=2e-2, rtol=2e-2)
+        # The finalized branch folds gammas into bf16 intermediates BEFORE the
+        # down-proj (linear, so mathematically equivalent); at the real widths
+        # that pre- vs post-weighting rounds differently, so tolerate bf16
+        # noise rather than near-equality.
+        torch.testing.assert_close(finalized.float(), manual, atol=2e-1, rtol=5e-2)
 
 
 def _ref_sconv(x, weight, prefix, use_residual=True):
@@ -235,7 +278,8 @@ class TestInklingShortConvolution(unittest.TestCase):
         pool = InklingConvStatePool(
             num_layers, num_slots, conv_dim, kernel_size, torch.bfloat16, device
         )
-        backend = SimpleNamespace(conv_pool=pool, conv_metadata=None)
+        # _draft_lookback=0: the target-worker default (no lag window).
+        backend = SimpleNamespace(conv_pool=pool, conv_metadata=None, _draft_lookback=0)
         # The real window-persist method; stateless in the default inplace
         # mode, so binding it to the namespace mock is faithful.
         backend.apply_conv_state_update = (
@@ -259,8 +303,10 @@ class TestInklingShortConvolution(unittest.TestCase):
         conv_dim = offset + dim + 16  # sconv operates on a channel slice
         ctx, backend, pool = self._make_ctx(1, 4, conv_dim, W, device)
 
+        # ATTN stream: K/V sconv instances no longer run forward (the
+        # attention module fuses them into one _sconv_apply call).
         mod = InklingShortConvolution(
-            dim, W, InklingConvStream.K, layer_id=0, channel_offset=offset
+            dim, W, InklingConvStream.ATTN, layer_id=0, channel_offset=offset
         ).to(device)
         with torch.no_grad():
             mod.weight.normal_(0, 0.5)

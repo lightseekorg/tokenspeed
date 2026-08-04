@@ -45,7 +45,6 @@ class TransferUnit:
     src_indices: torch.Tensor
     dst_indices: torch.Tensor
     op_id: int
-    is_retract: bool = False
     layerwise_cow_src_indices: torch.Tensor | None = None
     layerwise_cow_dst_indices: torch.Tensor | None = None
 

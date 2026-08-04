@@ -1,6 +1,7 @@
 api_version: ci.tokenspeed.io/v1
 name: eval-kimi-k2.5-nvfp4-eagle3-gpqa-diamond
 type: eval
+workflow_stage: model-test
 triggers:
   - manual
   - nightly
@@ -15,6 +16,7 @@ server:
   # Temporary NFS cold-load headroom; revert after the startup bottleneck is fixed.
   command: >-
     ts serve
+    --disable-kvstore
     --model nvidia/Kimi-K2.5-NVFP4
     --tp 4
     --max-model-len 80000
@@ -24,7 +26,6 @@ server:
     --moe-backend flashinfer_trtllm
     --quantization nvfp4
     --kv-cache-dtype fp8
-    --weight-loader-prefetch-checkpoints
     --speculative-algorithm EAGLE3
     --speculative-draft-model-path lightseekorg/kimi-k2.5-eagle3-mla
     --speculative-num-steps 1

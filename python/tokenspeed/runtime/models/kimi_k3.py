@@ -31,7 +31,7 @@ Implemented (full text path):
   conv + gated-delta scan + conv/recurrent state cache through the hybrid
   ``MambaAttnBackend`` KDA branch.
 * ``KimiLinearMLP`` — dense / shared-expert MLP with the SiTU activation.
-* ``KimiLinearMoE`` — sigmoid/noaux_tc router + Latent MoE + sidecar-backed
+* ``KimiLinearMoE`` — sigmoid/noaux_tc router + Latent MoE + flashinfer's
   TRT-LLM fused SiTU (or an explicit Triton unfused fallback) + shared experts.
 * ``KimiLinearDecoderLayer`` + ``KimiLinearModel`` — the AttnRes block-residual data
   flow.
@@ -82,6 +82,10 @@ from tokenspeed_kernel.ops.gemm import (
 from tokenspeed_kernel.ops.gemm.triton_gemv import (
     decode_gemv,
 )
+from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
+    situ_moe_unavailable_reason,
+)
+from tokenspeed_kernel.ops.tuning import load_packaged_flashinfer_tuning_cache
 from torch import nn
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiK3Config, KimiLinearConfig
@@ -342,7 +346,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             alt_stream=alt_stream,
             skip_rope=True,  # K3 MLA is NoPE (mla_use_nope=True)
         )
-        # The MLA layers belong to the FlatKV full_attention cache group. The
+        # The MLA layers belong to the Paged cache full_attention cache group. The
         # inherited attn_mqa/attn_mha PagedAttention modules are
         # built without a group_id; tag them so validate_paged_cache_group_ids
         # binds them to the published full_attention table. (KDA layers have no
@@ -486,24 +490,6 @@ def _apply_attn_res(
         norm.variance_epsilon,
         out_norm_weight=None if out_norm is None else out_norm.weight,
     )
-
-
-def _situ_sidecar_unavailable_reason() -> str | None:
-    """Why the sidecar-backed TRT-LLM SiTU kernel cannot serve this process.
-
-    Returns:
-        None when the ``tokenspeed_situ`` runtime is importable and exposes
-        the EP-capable API the fused kernel needs; otherwise a human-readable
-        reason. Module-level so tests can patch it and so the check stays out
-        of the hot path.
-    """
-    try:
-        from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
-            private_situ_runtime_status,
-        )
-    except ImportError as exc:  # non-NVIDIA build or older tokenspeed-kernel
-        return f"flashinfer TRT-LLM MXFP4 ops are unavailable: {exc}"
-    return private_situ_runtime_status()
 
 
 def _situ_betas(config: KimiLinearConfig) -> tuple[float, float | None]:
@@ -905,7 +891,7 @@ class KimiLinearMoE(nn.Module):
       ``routed_expert_up_proj``/``routed_expert_norm`` project back (7168).
     * **Routed experts** (MXFP4): AMD uses the native ``MoELayer`` plan wrapped
       by ``LatentMoELayer`` so Triton/Gluon owns EP8 dispatch and SiTU. Non-AMD
-      platforms use the standalone TRT-LLM SiTU sidecar, with an explicit
+      platforms use flashinfer's TRTLLM-Gen SiTU MoE, with an explicit
       two-GEMM Triton fallback.
     * **Shared experts**: a plain ``KimiLinearMLP`` (SiTU).
     """
@@ -924,7 +910,7 @@ class KimiLinearMoE(nn.Module):
         self.mapping = mapping
         # Router (gate+topk) and shared experts run on this stream during
         # graph capture, overlapped with the main-stream routed chain
-        # (down_proj -> sidecar -> up_proj). Collectives stay on the default
+        # (down_proj -> fused SiTU MoE -> up_proj). Collectives stay on the default
         # stream (aux-stream collectives can deadlock across ranks).
         self.stream_fork = StreamFork(alt_stream)
         self.num_experts = config.num_experts
@@ -945,28 +931,36 @@ class KimiLinearMoE(nn.Module):
             alt_stream,
             enforce_eager=bool(global_server_args_dict["enforce_eager"]),
         )
-        # AUTO intentionally requests the sidecar-backed SiTU plan when it was
+        # AUTO intentionally requests the flashinfer-backed SiTU plan when it was
         # registered at import time. Without that runtime, users must select the
         # explicit Triton fallback; AUTO cannot override MoELayer per model.
-        self.use_trtllm_situ_moe = self.execution_plan.use_sidecar
+        self.use_trtllm_situ_moe = self.execution_plan.use_trtllm
         if not self.execution_plan.use_native:
             if not self.use_trtllm_situ_moe and not moe_backend.is_triton():
                 raise ValueError(
-                    "Kimi-K3 MXFP4 SiTU MoE supports only the sidecar-backed "
+                    "Kimi-K3 MXFP4 SiTU MoE supports only the flashinfer-backed "
                     "flashinfer_trtllm backend or the Triton unfused fallback, "
                     f"got {moe_backend.value!r}"
                 )
             if self.use_trtllm_situ_moe:
                 # Fail here with the actual reason instead of letting MoELayer's
-                # kernel selection miss the (never-registered) sidecar kernel.
-                reason = _situ_sidecar_unavailable_reason()
+                # kernel selection miss the (never-registered) SiTU kernel.
+                reason = situ_moe_unavailable_reason()
                 if reason is not None:
                     raise ValueError(
-                        "Kimi-K3's fused SiTU MoE requires the tokenspeed-situ "
-                        f"runtime, which is unavailable: {reason}. Install it "
-                        "(pip install tokenspeed-situ==0.1.0.post20260726) or select the "
-                        "unfused fallback with --moe-backend triton."
+                        "Kimi-K3's fused SiTU MoE requires flashinfer > "
+                        f"0.6.15 with native SiTU, unavailable: {reason}. "
+                        "Upgrade flashinfer or select the unfused fallback "
+                        "with --moe-backend triton."
                     )
+                # Out-of-box tactics: seed the autotuner from the in-tree
+                # swept table for this GPU/flashinfer combo, if one ships
+                # (flashinfer's own heuristic mispicks MoE tactics at prefill
+                # batch sizes). A lookup miss leaves the startup autotune
+                # window to tune these shapes.
+                load_packaged_flashinfer_tuning_cache(
+                    "kimi-k3", mapping.moe.ep_size, mapping.moe.tp_size
+                )
             if mapping.moe.has_tp_ep and mapping.attn.tp_size != mapping.moe.tp_ep_size:
                 raise ValueError(
                     "Kimi-K3's SiTU MoE currently requires a "
@@ -976,7 +970,7 @@ class KimiLinearMoE(nn.Module):
             if not self.use_trtllm_situ_moe and mapping.moe.ep_size > 1:
                 raise ValueError(
                     "Kimi-K3's Triton SiTU fallback does not support expert "
-                    "parallelism; use MoE TP or the sidecar-backed TRT-LLM backend"
+                    "parallelism; use MoE TP or the flashinfer TRT-LLM backend"
                 )
 
         self.gate = KimiLinearMoEGate(config.hidden_size, config.num_experts)
@@ -991,13 +985,13 @@ class KimiLinearMoE(nn.Module):
             correction_bias=self.gate.e_score_correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
             output_format=TopKOutputFormat.STANDARD,
-            # bf16 weights out: makes the sidecar adapter's cast a no-op.
+            # bf16 weights out: makes the fused SiTU kernel's cast a no-op.
             topk_weights_dtype=(
                 torch.bfloat16 if self.use_trtllm_situ_moe else torch.float32
             ),
         )
 
-        # AMD native and the standalone TRT-LLM sidecar both consume K3's
+        # AMD native and flashinfer's TRT-LLM SiTU MoE both consume K3's
         # precomputed sigmoid/noaux_tc TopK. Explicit Triton keeps the original
         # two-GEMM fallback, where this layer stores/processes MXFP4 weights.
         use_precomputed_topk = self.execution_plan.use_precomputed_topk
@@ -1029,16 +1023,10 @@ class KimiLinearMoE(nn.Module):
                 "activation_situ_linear_beta": situ_linear_beta,
             },
             routing_mode=("precomputed_topk" if use_precomputed_topk else None),
-            # --moe-activation-dtype mxfp8: run the fused SiTU path in w4a8.
-            # Only the sidecar (precomputed-topk) path implements the w4a8
-            # chain; the Triton fallback stays bf16.
+            # The fused SiTU path always runs w4a8 (flashinfer's SiTU cubins
+            # are MxFP4 x MxFP8 only); the Triton fallback stays bf16.
             internal_activation_dtype_override=(
-                "fp8"
-                if (
-                    use_precomputed_topk
-                    and global_server_args_dict.get("moe_activation_dtype") == "mxfp8"
-                )
-                else None
+                "fp8" if use_precomputed_topk else None
             ),
         )
         if use_precomputed_topk and self.experts.support_routing:
@@ -1126,7 +1114,7 @@ class KimiLinearMoE(nn.Module):
         max_num_tokens_per_gpu: int,
         skip_reduce: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run fused sidecar-backed TRT-LLM SiTU or the Triton fallback."""
+        """Run flashinfer's fused TRT-LLM SiTU or the Triton fallback."""
         if self.use_trtllm_situ_moe:
             out = self.experts(
                 hidden_states=routed_in,
@@ -2057,6 +2045,11 @@ class KimiK3ForConditionalGeneration(nn.Module):
             out_cache_loc,
             **kwargs,
         )
+
+    def post_load_weights(self) -> None:
+        """Prepare text-model derived weights for loaders that skip checkpoints."""
+        if self.language_model is not None:
+            self.language_model.post_load_weights()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         """Route checkpoint weights by top-level prefix.

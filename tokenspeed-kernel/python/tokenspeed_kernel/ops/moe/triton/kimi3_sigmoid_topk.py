@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.platform import Platform, current_platform
 
 
 @triton.jit
@@ -22,14 +23,23 @@ def _kimi3_sigmoid_bias_topk_kernel(
     correction_bias,
     topk_ids,
     topk_weights,
+    logical_to_physical,
     ROUTED_SCALING_FACTOR: tl.constexpr,
     NORMALIZE_TOPK_WEIGHTS: tl.constexpr,
+    HAS_DISPATCH_MAP: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     num_experts: tl.constexpr = 896
     padded_experts: tl.constexpr = 1024
     topk: tl.constexpr = 16
     expert = tl.arange(0, padded_experts)
     valid = expert < num_experts
+
+    if ENABLE_PDL:
+        # ``logits`` is the router GEMV output written by the predecessor
+        # kernel; correction_bias / logical_to_physical are static, but the
+        # very first load below consumes logits, so fence up front.
+        tl.extra.cuda.gdc_wait()
 
     all_logits = tl.load(
         logits + expert,
@@ -62,9 +72,16 @@ def _kimi3_sigmoid_bias_topk_kernel(
         selected_weights /= denominator
     selected_weights *= ROUTED_SCALING_FACTOR
 
+    if HAS_DISPATCH_MAP:
+        # Static expert-location dispatch: route each selected logical expert
+        # to this rank's physical replica inside the same launch.
+        selected_ids = tl.load(logical_to_physical + selected_ids).to(tl.int32)
+
     offset = tl.arange(0, topk)
     tl.store(topk_ids + offset, selected_ids)
     tl.store(topk_weights + offset, selected_weights)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def kimi3_sigmoid_bias_topk(
@@ -73,6 +90,9 @@ def kimi3_sigmoid_bias_topk(
     *,
     routed_scaling_factor: float,
     normalize_topk_weights: bool,
+    logical_to_physical_map: torch.Tensor | None = None,
+    weights_dtype: torch.dtype = torch.float32,
+    enable_pdl: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Route one Kimi K3 decode token to its top 16 of 896 experts.
 
@@ -81,10 +101,19 @@ def kimi3_sigmoid_bias_topk(
         correction_bias: Contiguous FP32 selection bias shaped ``[896]``.
         routed_scaling_factor: Scale applied to selected route weights.
         normalize_topk_weights: Normalize selected sigmoid scores when true.
+        logical_to_physical_map: Optional contiguous integer map shaped
+            ``[896]``; when given, selected logical expert ids are translated
+            to physical ids inside the kernel (static EP dispatch).
+        weights_dtype: Output dtype for the route weights (selection and
+            normalization always run in FP32; the store casts).
+        enable_pdl: Launch with programmatic dependent launch and fence the
+            router-logits read with ``gdc_wait`` / ``gdc_launch_dependents``
+            (NVIDIA only; ignored elsewhere). Safe only when the router GEMV
+            that writes ``router_logits`` is chained on the same stream/graph.
 
     Returns:
-        ``(topk_weights, topk_ids)`` shaped ``[1, 16]`` with FP32 weights and
-        INT32 ids.
+        ``(topk_weights, topk_ids)`` shaped ``[1, 16]`` with ``weights_dtype``
+        weights and INT32 ids (physical ids when a dispatch map is given).
     """
     if (
         router_logits.shape != (1, 896)
@@ -100,6 +129,16 @@ def kimi3_sigmoid_bias_topk(
         or not correction_bias.is_contiguous()
     ):
         raise ValueError("Kimi K3 top-k requires contiguous colocated FP32 bias [896]")
+    if logical_to_physical_map is not None and (
+        logical_to_physical_map.shape != (896,)
+        or logical_to_physical_map.dtype not in (torch.int32, torch.int64)
+        or logical_to_physical_map.device != router_logits.device
+        or not logical_to_physical_map.is_contiguous()
+    ):
+        raise ValueError(
+            "Kimi K3 top-k dispatch map must be a contiguous colocated "
+            "int32/int64 [896] tensor"
+        )
 
     topk_ids = torch.empty(
         (1, 16),
@@ -108,19 +147,28 @@ def kimi3_sigmoid_bias_topk(
     )
     topk_weights = torch.empty(
         (1, 16),
-        dtype=torch.float32,
+        dtype=weights_dtype,
         device=router_logits.device,
+    )
+    # waves_per_eu is a CDNA-only occupancy hint; NVIDIA Triton rejects it.
+    amd_kwargs = {"waves_per_eu": 1} if Platform.get().is_amd else {}
+    pdl_kwargs = (
+        {"launch_pdl": True} if enable_pdl and current_platform().is_nvidia else {}
     )
     _kimi3_sigmoid_bias_topk_kernel[(1,)](
         router_logits,
         correction_bias,
         topk_ids,
         topk_weights,
+        logical_to_physical_map,
         ROUTED_SCALING_FACTOR=float(routed_scaling_factor),
         NORMALIZE_TOPK_WEIGHTS=normalize_topk_weights,
+        HAS_DISPATCH_MAP=logical_to_physical_map is not None,
+        ENABLE_PDL=enable_pdl,
         num_warps=8,
         num_stages=1,
-        waves_per_eu=1,
+        **amd_kwargs,
+        **pdl_kwargs,
     )
     return topk_weights, topk_ids
 

@@ -16,8 +16,9 @@ on:
       - ".github/workflows/pr-test-amd.yml"
       - ".github/workflows/pr-test-nvidia.yml"
       - ".github/workflows/pr-test-nvidia-arm.yml"
+      - ".github/workflows/run-pr-test-stage.yml"
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
     branches: [main]
     paths:
       - "python/pyproject.toml"
@@ -30,6 +31,7 @@ on:
       - ".github/workflows/pr-test-amd.yml"
       - ".github/workflows/pr-test-nvidia.yml"
       - ".github/workflows/pr-test-nvidia-arm.yml"
+      - ".github/workflows/run-pr-test-stage.yml"
   workflow_dispatch:
     inputs:
       trigger:
@@ -44,10 +46,10 @@ on:
 env:
   PIP_BREAK_SYSTEM_PACKAGES: 1
   CUDA_VERSION: 13.0.1
-  TOKENSPEED_B200_RUNNER_LABEL: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL }}
+  TOKENSPEED_B200_RUNNER_LABEL: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL || 'b200v2' }}
 
 concurrency:
-  group: pr-test-nvidia-${{ github.event.pull_request.number || github.ref }}
+  group: pr-test-nvidia-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'high priority' && format('-ignored-label-{0}', github.run_id) || '' }}
   cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
@@ -55,13 +57,19 @@ jobs:
     # Run jobs for pull requests, or for push/manual events in the official
     # repository or a repository whose full name matches TOKENSPEED_CI_REPOSITORY.
     if: |
-      github.event_name == 'pull_request' ||
-      github.repository == 'lightseekorg/tokenspeed' ||
-      github.repository == vars.TOKENSPEED_CI_REPOSITORY
+      (github.event.action != 'labeled' || github.event.label.name == 'high priority') &&
+      (
+        github.event_name == 'pull_request' ||
+        github.repository == 'lightseekorg/tokenspeed' ||
+        github.repository == vars.TOKENSPEED_CI_REPOSITORY
+      )
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.scan.outputs.matrix }}
-      has_tasks: ${{ steps.scan.outputs.has_tasks }}
+      unit_matrix: ${{ steps.scan.outputs.unit_matrix }}
+      unit_has_tasks: ${{ steps.scan.outputs.unit_has_tasks }}
+      model_matrix: ${{ steps.scan.outputs.model_matrix }}
+      model_has_tasks: ${{ steps.scan.outputs.model_has_tasks }}
+      eager_model: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'high priority') }}
       install_tokenspeed_mla_from_source: ${{ steps.detect_mla.outputs.changed }}
     steps:
       - name: Checkout code
@@ -81,18 +89,25 @@ jobs:
       - name: Build task matrix
         id: scan
         env:
-          TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS: ${{ vars.TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS }}
+          TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS: h100,${{ vars.TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS }}
         run: |
-          MATRIX=$(python3 test/ci_system/pipeline.py scan \
-            --root test/ci \
-            --trigger "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.trigger || 'per-commit' }}" \
-            --runner-group "nvidia-x86")
-          echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
-          printf '%s' "$MATRIX" | python3 -c "import json, sys; print('has_tasks=' + ('true' if json.load(sys.stdin).get('include') else 'false'))" >> "$GITHUB_OUTPUT"
+          for stage in \
+            unit:unit-test \
+            model:model-test; do
+            output=${stage%%:*}
+            workflow_stage=${stage#*:}
+            matrix=$(python3 test/ci_system/pipeline.py scan \
+              --root test/ci \
+              --trigger "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.trigger || 'per-commit' }}" \
+              --runner-group "nvidia-x86" \
+              --workflow-stage "$workflow_stage")
+            echo "${output}_matrix=${matrix}" >> "$GITHUB_OUTPUT"
+            printf '%s' "$matrix" | python3 -c "import json, sys; print('${output}_has_tasks=' + ('true' if json.load(sys.stdin).get('include') else 'false'))" >> "$GITHUB_OUTPUT"
+          done
 
       # Compute this once on the hosted runner (where `gh` is pre-installed)
       # and propagate the result to every matrix job via job output. The
-      # downstream unit-test job reads it as an env var and `install_deps.sh`
+      # downstream stage jobs read it as an env var and `install_deps.sh`
       # gates its in-tree `tokenspeed-mla` reinstall on it. Without this
       # detection, CI would always exercise the pinned PyPI wheel and edits
       # under `tokenspeed-mla/` would be silently uncovered.
@@ -128,7 +143,7 @@ jobs:
   unit-test:
     needs: scan
     if: |
-      needs.scan.outputs.has_tasks == 'true' &&
+      needs.scan.outputs.unit_has_tasks == 'true' &&
       (github.event_name != 'pull_request' || github.event.action != 'closed') &&
       (
         github.event_name == 'pull_request' ||
@@ -139,88 +154,44 @@ jobs:
         github.event_name != 'pull_request' ||
         github.event.pull_request.draft == false
       )
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(needs.scan.outputs.matrix) }}
-    name: ${{ matrix.name }} (${{ matrix.runner }})
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
-    continue-on-error: ${{ matrix.optional }}
-    env:
-      # When the scan job determined that this run touched `tokenspeed-mla/`,
-      # `install_deps.sh` will reinstall the in-tree source on top of the
-      # pinned PyPI wheel. See the matching detect step in the `scan` job.
-      INSTALL_TOKENSPEED_MLA_FROM_SOURCE: ${{ needs.scan.outputs.install_tokenspeed_mla_from_source }}
-      # Authenticate Hugging Face Hub downloads so checkpoint pulls during
-      # `ts serve` startup are not throttled by the anonymous rate limit. The
-      # 600s per-file `runtime-1gpu` timeout is otherwise exceeded on cold
-      # runners (e.g. `amd-mi35x-1gpu-test` loading `openai/gpt-oss-120b` +
-      # EAGLE3 draft).
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          path: run-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.name }}-${{ matrix.runner }}
+    uses: ./.github/workflows/run-pr-test-stage.yml
+    with:
+      matrix: ${{ needs.scan.outputs.unit_matrix }}
+      install_tokenspeed_mla_from_source: ${{ needs.scan.outputs.install_tokenspeed_mla_from_source }}
+      b200_runner_label: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL || 'b200v2' }}
+    secrets: inherit
 
-      - name: Set work directory
-        run: |
-          echo "WORK_DIR=${{ github.workspace }}/run-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.name }}-${{ matrix.runner }}" >> "$GITHUB_ENV"
+  model-test:
+    needs: [scan, unit-test]
+    if: |
+      !cancelled() &&
+      needs.scan.result == 'success' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.scan.outputs.eager_model != 'true' &&
+      (
+        needs.unit-test.result == 'success' ||
+        needs.scan.outputs.unit_has_tasks != 'true'
+      ) &&
+      needs.scan.outputs.model_has_tasks == 'true'
+    uses: ./.github/workflows/run-pr-test-stage.yml
+    with:
+      matrix: ${{ needs.scan.outputs.model_matrix }}
+      install_tokenspeed_mla_from_source: ${{ needs.scan.outputs.install_tokenspeed_mla_from_source }}
+      b200_runner_label: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL || 'b200v2' }}
+    secrets: inherit
 
-      - name: Install pipeline dependency
-        # See note in the scan job — pypi.org "Content-Type: Unknown" flake.
-        run: |
-          for i in 1 2 3 4 5; do
-            python3 -m pip install pyyaml && exit 0
-            echo "pyyaml install attempt $i failed, retrying in 10s..."
-            sleep 10
-          done
-          exit 1
-
-      # When the diff touches `tokenspeed-mla/`, ask install_deps.sh to
-      # rebuild + install that package from the in-tree source after the
-      # pinned PyPI wheel has been installed (transitively via
-      # tokenspeed-kernel). Without this, CI keeps testing whichever
-      # `tokenspeed-mla` version is pinned in
-      # `tokenspeed-kernel/python/requirements/cuda-thirdparty.txt`, not
-      # the code on the PR/branch. When the diff doesn't touch
-      # `tokenspeed-mla/` we keep using the pinned PyPI wheel.
-      - name: Install CI task
-        run: |
-          cd "${{ env.WORK_DIR }}"
-          mkdir -p .ci-artifacts
-          python3 test/ci_system/pipeline.py execute \
-            --config "${{ matrix.config }}" \
-            --runner "${{ matrix.runner }}" \
-            --work-dir "${{ env.WORK_DIR }}" \
-            --print-plan \
-            --only-stage install \
-            --keep-runner-state \
-            --result-json .ci-artifacts/result.json
-
-      - name: Execute CI task
-        run: |
-          cd "${{ env.WORK_DIR }}"
-          mkdir -p .ci-artifacts
-          python3 test/ci_system/pipeline.py execute \
-            --config "${{ matrix.config }}" \
-            --runner "${{ matrix.runner }}" \
-            --work-dir "${{ env.WORK_DIR }}" \
-            --print-plan \
-            --skip-stage install \
-            --reuse-runner-state \
-            --result-json .ci-artifacts/result.json
-
-      - name: Upload task result
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: pr-test-${{ matrix.name }}-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.WORK_DIR }}/.ci-artifacts/result.json
-
-      - name: Cleanup work directory
-        if: always()
-        run: rm -rf "${{ env.WORK_DIR }}"
+  model-test-eager:
+    needs: scan
+    if: |
+      needs.scan.outputs.eager_model == 'true' &&
+      github.event.pull_request.draft == false &&
+      needs.scan.outputs.model_has_tasks == 'true'
+    uses: ./.github/workflows/run-pr-test-stage.yml
+    with:
+      matrix: ${{ needs.scan.outputs.model_matrix }}
+      install_tokenspeed_mla_from_source: ${{ needs.scan.outputs.install_tokenspeed_mla_from_source }}
+      b200_runner_label: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL || 'b200v2' }}
+    secrets: inherit
 
   finish:
     if: |
@@ -230,9 +201,21 @@ jobs:
         github.event_name == 'pull_request' ||
         github.repository == 'lightseekorg/tokenspeed' ||
         github.repository == vars.TOKENSPEED_CI_REPOSITORY
-      )
-    needs: [unit-test]
+      ) &&
+      (github.event.action != 'labeled' || github.event.label.name == 'high priority')
+    needs: [unit-test, model-test, model-test-eager]
     runs-on: ubuntu-latest
     steps:
       - name: Finish
-        run: echo "PR Test finished."
+        env:
+          UNIT_TEST_RESULT: ${{ needs.unit-test.result }}
+          MODEL_TEST_RESULT: ${{ needs.model-test.result }}
+          MODEL_TEST_EAGER_RESULT: ${{ needs.model-test-eager.result }}
+        run: |
+          for result in "$UNIT_TEST_RESULT" "$MODEL_TEST_RESULT" "$MODEL_TEST_EAGER_RESULT"; do
+            if [[ "$result" != "success" && "$result" != "skipped" ]]; then
+              echo "PR Test did not finish successfully: dependency result=$result"
+              exit 1
+            fi
+          done
+          echo "PR Test finished."

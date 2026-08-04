@@ -47,9 +47,9 @@ from tokenspeed.runtime.engine.io_struct import (
 def _own_multimodal_inputs(tokenized_copy) -> None:
     """Give this fan-out copy its own multimodal feature tensors.
 
-    ``MultimodalInputs.publish_shm_features`` rewrites ``item.feature``
-    in place from tensor to SHM handle, and consumers later unlink the
-    segment. The prefix warmup and each n>1 replica are shallow
+    ``MultimodalInputs.publish_shm_features`` moves ``item.feature`` in
+    place into an ``item.feature_shm`` handle, and consumers later unlink
+    the segment. The prefix warmup and each n>1 replica are shallow
     ``copy.copy`` of the same tokenized payload, so without an independent
     copy they would publish only once (the 2nd+ ``publish`` is a no-op
     because the feature is already a handle) and share the SHM segment.

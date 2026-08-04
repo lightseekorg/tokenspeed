@@ -62,7 +62,7 @@ if platform.is_nvidia:
         trtllm_ragged_attention_deepseek,
     )
 
-if platform.is_blackwell:
+if platform.is_blackwell or platform.is_hopper:
     from flashinfer.mla import (
         BatchMLAPagedAttentionWrapper,
         trtllm_batch_decode_with_kv_cache_mla,

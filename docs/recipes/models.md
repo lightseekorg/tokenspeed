@@ -14,9 +14,9 @@ Blog: https://lightseek.org/blog/tokenspeed-inkling.html
 ## Docker
 
 ### nvidia
-docker pull lightseekorg/tokenspeed:tml
+docker pull lightseekorg/tokenspeed:latest
 ### amd
-docker pull lightseekorg/tokenspeed-amd:tml
+docker pull lightseekorg/tokenspeed-amd:latest
 
 ## Launch command
 
@@ -88,8 +88,6 @@ tokenspeed serve nvidia/MiniMax-M3-NVFP4 \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
-    --drafter-attention-backend fa4 \
-    --disable-prefill-graph \
     --disable-kvstore \
     --block-size 128 \
     --trust-remote-code \
@@ -169,54 +167,37 @@ pip install flash-linear-attention
 
 Notes:
 
-- K3 is FlatKV-only. Build the `tokenspeed_scheduler` extension with
-  `-DTOKENSPEED_FLAT_KVCACHE=ON`
-  (`SKBUILD_CMAKE_DEFINE="TOKENSPEED_FLAT_KVCACHE=ON" pip install -e
-  tokenspeed-scheduler/`); startup preflight rejects radix builds with a
-  clear error.
+- K3 uses the grouped paged-cache scheduler and KDA state groups.
 - KDA dispatch is vendor-neutral at the runtime boundary. The kernel registry
   selects the existing FLA-derived NVIDIA implementation or the native AMD
   implementation, including each backend's preferred recurrent-state layout.
   The runtime does not transpose or reinterpret that state.
-- NVIDIA auto-selects `--attention-backend tokenspeed_mla` for K3 FlatKV
+- NVIDIA auto-selects `--attention-backend tokenspeed_mla` for K3
   (fp8 KV required). AMD uses the `mla` backend.
 - `tokenspeed serve` auto-selects the `kimi_k3` reasoning and tool-call
   parsers. Explicit parser flags override these defaults.
-- Point `--model` at a **flattened local copy** of the checkpoint: real files
-  for the configs/tokenizer/`*.py` (weights may stay symlinks). An HF hub
-  snapshot directory fails engine startup — `tokenization_kimi.py`'s relative
-  `encoding_k3` import breaks when transformers resolves the module file
-  through the snapshot's `blobs/` symlinks — and the bare repo id fails the
-  smg gateway, which needs an on-disk tokenizer directory.
-- On a shared `HF_HOME`, set `HF_MODULES_CACHE` to a user-writable directory;
-  transformers stages the checkpoint's remote code under
-  `$HF_HOME/modules/transformers_modules/<model>` and a new model name fails
-  with `PermissionError` when that tree belongs to another user.
+- The SMG packages pinned by TokenSpeed resolve `moonshotai/Kimi-K3` directly;
+  a flattened local checkpoint and separately staged remote-code cache are no
+  longer required.
 - The checkpoint carries no fp8 KV scaling factors; the loader defaults them
   to 1.0 (a warning at load). Expect a small accuracy delta vs bf16 KV.
 - The vision encoder has 12 attention heads. For an 8-way text TP deployment,
   use `--mm-encoder-tp-mode data` so each rank runs the vision encoder at TP1
   on a different whole image.
-- Use the current `lightseekorg/smg-private` frontend, which registers Kimi-K3's
-  chat renderer and multimodal processor. Preserve the checkpoint's
+- The pinned SMG frontend registers Kimi-K3's chat renderer and multimodal
+  processor. Preserve the checkpoint's
   `media_proc_cfg.in_patch_limit=65536`; silently falling back to K2.5's
   16384-patch default reduces OCR resolution.
+- KDA recurrent-state pages register for prefix-cache reuse only when a
+  prefill chunk ends exactly on a logical cache-page boundary. The engine floors
+  `--chunked-prefill-size` to the plan's page grain automatically (logged as
+  a warning when it adjusts); the page grain is budget-dependent (e.g. 1472
+  at 32k context, 1536 at 1M), so do not hand-tune the chunk size against a
+  hard-coded page value. Prefix hits are page-granular.
 
 ### NVIDIA
 
-The standard NVIDIA path uses the fused TensorRT-LLM-Gen MXFP4 + SiTU MoE
-backend.
-On 8x B300 (`sm103a`, CUDA 13) the `tokenspeed-situ` sidecar is pulled in as a
-`tokenspeed-kernel` CUDA dependency; no separate private FlashInfer repository
-or `FLASHINFER_PRIVATE_CUBIN_DIR` is required. To install or verify it directly:
-
-```bash
-python -m pip install "tokenspeed-situ==0.1.0.post20260726"
-python -c \
-  'import tokenspeed_situ as s; print(s.verify_bundle())'
-```
-
-Then serve with expert parallelism (recommended):
+Serve with expert parallelism (recommended) on 8x B300:
 
 ```bash
 tokenspeed serve moonshotai/Kimi-K3 \
@@ -235,15 +216,9 @@ tokenspeed serve moonshotai/Kimi-K3 \
   --port 8000
 ```
 
-Plain TP8 (drop `--ep-size 8`) uses the native-384 expert layout and requires
-sidecar (tokenspeed-situ) >= 0.1.0.post20260726. Memory is identical either way on 8x B300: ~73 GB free
-per rank after load, and `--gpu-memory-utilization 0.94` yields a KV capacity
-of 4,437,504 tokens.
-
-The checked-in sidecar AOT bundle is a Linux x86_64 development artifact for
-B300/CUDA 13 (`sm103a`) only. On other NVIDIA platforms, fall back to the
-unfused Triton grouped-GEMM MoE backend: skip the sidecar install and
-substitute `--moe-backend triton`.
+Plain TP8 (drop `--ep-size 8`) works too. The fused MoE path needs a
+Blackwell GPU (B200/B300); on other NVIDIA platforms use
+`--moe-backend triton`.
 
 ### AMD
 
@@ -312,6 +287,127 @@ tokenspeed serve Qwen/Qwen3-30B-A3B \
   --host 0.0.0.0 \
   --port 8000
 ```
+
+## Qwen3.8-max
+
+Qwen3.8-max needs 16 GPUs, so it runs on two 8-GPU nodes. Launch
+`tokenspeed serve` on every node with the same command, changing only
+`--node-rank`; every node points `--dist-init-addr` at node 0, which is the only
+rank that serves the HTTP API. See [Parallelism](../serving/parallelism.md) for
+the multi-node rules.
+
+This family has no parser auto-selection, so set `--reasoning-parser` and
+`--tool-call-parser` explicitly. `--speculative-algorithm MTP` without
+`--speculative-draft-model-path` drafts from the base checkpoint. Set
+`--dist-init-addr` to node 0's own address and port throughout
+(`<node0-host>:25000` below).
+
+### TP16
+
+One replica across both nodes. `--ep-size` defaults to 1, so the experts stay
+tensor-parallel over the full world and all-to-all stays out of the path. Keep
+`--moe-backend auto`: the block-scale FP8 `deep_gemm` experts implement only the
+DeepEP legs and are unavailable without `--all2all-backend deepep`.
+
+```bash
+# node 0 (serves the HTTP API)
+tokenspeed serve /path/to/qwen3.8-max-fp8 \
+  --served-model-name qwen3.8-max \
+  --nnodes 2 --node-rank 0 --nprocs-per-node 8 --world-size 16 \
+  --dist-init-addr <node0-host>:25000 \
+  --attn-tp-size 16 \
+  --moe-backend auto \
+  --quantization fp8 --kv-cache-dtype fp8 \
+  --attention-backend trtllm \
+  --chunked-prefill-size 8192 \
+  --gpu-memory-utilization 0.95 --max-num-seqs 128 \
+  --disable-kvstore \
+  --speculative-algorithm MTP --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+  --reasoning-parser qwen3_thinking --tool-call-parser qwen_coder \
+  --host 0.0.0.0 --port 8000
+
+# node 1 (same command, --node-rank 1)
+tokenspeed serve /path/to/qwen3.8-max-fp8 \
+  --served-model-name qwen3.8-max \
+  --nnodes 2 --node-rank 1 --nprocs-per-node 8 --world-size 16 \
+  --dist-init-addr <node0-host>:25000 \
+  --attn-tp-size 16 \
+  --moe-backend auto \
+  --quantization fp8 --kv-cache-dtype fp8 \
+  --attention-backend trtllm \
+  --chunked-prefill-size 8192 \
+  --gpu-memory-utilization 0.95 --max-num-seqs 128 \
+  --disable-kvstore \
+  --speculative-algorithm MTP --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+  --reasoning-parser qwen3_thinking --tool-call-parser qwen_coder \
+  --host 0.0.0.0 --port 8000
+```
+
+### TP8 DP2 EP16 (DeepEP)
+
+Two TP8 attention replicas, experts sharded across all 16 ranks, and expert
+routing on DeepEP dispatch/combine instead of all-gather:
+
+```bash
+# node 0 (serves the HTTP API)
+tokenspeed serve /path/to/qwen3.8-max-fp8 \
+  --served-model-name qwen3.8-max \
+  --nnodes 2 --node-rank 0 --nprocs-per-node 8 --world-size 16 \
+  --dist-init-addr <node0-host>:25000 \
+  --attn-tp-size 8 --data-parallel-size 2 --ep-size 16 \
+  --moe-backend deep_gemm \
+  --all2all-backend deepep --deepep-mode auto \
+  --low-latency-max-num-tokens-per-gpu 64 \
+  --quantization fp8 --kv-cache-dtype fp8 \
+  --attention-backend trtllm \
+  --chunked-prefill-size 8192 \
+  --gpu-memory-utilization 0.95 --max-num-seqs 128 \
+  --disable-kvstore \
+  --speculative-algorithm MTP --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+  --reasoning-parser qwen3_thinking --tool-call-parser qwen_coder \
+  --host 0.0.0.0 --port 8000
+
+# node 1 (same command, --node-rank 1)
+tokenspeed serve /path/to/qwen3.8-max-fp8 \
+  --served-model-name qwen3.8-max \
+  --nnodes 2 --node-rank 1 --nprocs-per-node 8 --world-size 16 \
+  --dist-init-addr <node0-host>:25000 \
+  --attn-tp-size 8 --data-parallel-size 2 --ep-size 16 \
+  --moe-backend deep_gemm \
+  --all2all-backend deepep --deepep-mode auto \
+  --low-latency-max-num-tokens-per-gpu 64 \
+  --quantization fp8 --kv-cache-dtype fp8 \
+  --attention-backend trtllm \
+  --chunked-prefill-size 8192 \
+  --gpu-memory-utilization 0.95 --max-num-seqs 128 \
+  --disable-kvstore \
+  --speculative-algorithm MTP --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+  --reasoning-parser qwen3_thinking --tool-call-parser qwen_coder \
+  --host 0.0.0.0 --port 8000
+```
+
+Notes:
+- `--low-latency-max-num-tokens-per-gpu` sizes DeepEP's NVSHMEM heap (roughly
+  2.0 GB at 64, 8.1 GB at 256), and that heap is claimed after the KV pool is
+  profiled. An oversized value therefore fails late, when the first dispatch
+  runs out of fabric memory. Size it to the real per-rank decode token bound
+  and no lower: a batch above the capacity is rejected, not truncated.
+- Internode DeepEP rides NVSHMEM IBGDA. On a RoCE fabric, mirror the NCCL
+  values into `NVSHMEM_IB_GID_INDEX`, `NVSHMEM_IB_TRAFFIC_CLASS`, and
+  `NVSHMEM_IB_SL`, and point `NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME` at the same
+  interface as `NCCL_SOCKET_IFNAME`.
+
+### Choosing a layout
+
+- TP16 has the lower TTFT and TPOT at batch 1-2: no dispatch/combine hop, and
+  the single replica owns the whole batch.
+- The DeepEP layout pulls ahead from mid batch up, where its expert kernels and
+  the second attention replica both pay off.
+
 
 ## GPT-OSS 20B / 120B
 

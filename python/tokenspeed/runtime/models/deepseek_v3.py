@@ -684,7 +684,7 @@ class DeepseekV3AttentionMLA(nn.Module):
             q = self.q_proj(hidden_states)[0]
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
             kv_a = latent_cache[..., : self.kv_lora_rank]
-            self.kv_a_layernorm(kv_a, inplace=True)
+            self.kv_a_layernorm(kv_a, out=kv_a)
         return q, latent_cache
 
     @break_point
@@ -731,14 +731,27 @@ class DeepseekV3AttentionMLA(nn.Module):
                 input_num_tokens=num_prefill_tokens,
                 forward_mode=ForwardMode.EXTEND,
             )
-            self.forward_normal_chunked(
-                positions[:num_prefill_tokens],
-                q[:num_prefill_tokens],
-                latent_cache[:num_prefill_tokens],
-                prefill_ctx,
-                out_cache_loc[:num_prefill_tokens],
-                attn_output[:num_prefill_tokens],
-            )
+            # Use absorbed attention for cached-prefix extend when supported by
+            # the backend and profitable for this query shape; otherwise use
+            # normal chunked prefill.
+            if getattr(cmeta, "use_absorbed_cached_extend", False):
+                self.forward_absorb(
+                    positions[:num_prefill_tokens],
+                    q[:num_prefill_tokens],
+                    latent_cache[:num_prefill_tokens],
+                    prefill_ctx,
+                    out_cache_loc[:num_prefill_tokens],
+                    attn_output[:num_prefill_tokens],
+                )
+            else:
+                self.forward_normal_chunked(
+                    positions[:num_prefill_tokens],
+                    q[:num_prefill_tokens],
+                    latent_cache[:num_prefill_tokens],
+                    prefill_ctx,
+                    out_cache_loc[:num_prefill_tokens],
+                    attn_output[:num_prefill_tokens],
+                )
 
         if num_decode_tokens > 0:
             decode_ctx = replace(
@@ -787,7 +800,7 @@ class DeepseekV3AttentionMLA(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Model-owned KV writes route their locations through the backend:
         # identity on the legacy path (base AttentionBackend hook), the
-        # group-derived locations on the FlatKV path.
+        # group-derived locations on the Paged cache path.
         out_cache_loc = ctx.attn_backend.select_out_cache_loc(
             self.attn_mqa, out_cache_loc, ctx.forward_mode
         )
@@ -986,7 +999,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         out_cache_loc: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # See forward_absorb_qkv_proj: backend-selected write locations
-        # (identity off the FlatKV path).
+        # (identity off the Paged cache path).
         out_cache_loc = ctx.attn_backend.select_out_cache_loc(
             self.attn_mha, out_cache_loc, ctx.forward_mode
         )
@@ -997,33 +1010,45 @@ class DeepseekV3AttentionMLA(nn.Module):
 
         q = q.view(-1, self.num_local_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        kv = self.kv_b_proj(kv_a)[0]
+        # kv_a is a split view of latent_cache (non-contiguous); the fp8 online-quant
+        # GEMM in kv_b_proj asserts contiguous input.
+        kv = self.kv_b_proj(kv_a.contiguous())[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope = kv[..., : self.qk_nope_head_dim]
         v = kv[..., self.qk_nope_head_dim :]
 
         # FP8 prefill: fused RoPE + FP8 quantize, direct FP8 KV cache write.
         # Disabled when k_scale != 1.0; mla_fp8_utils.py documents the current limitation.
+        # NoPE models (rotary_emb is None, e.g. Kimi-K3) quantize standalone:
+        # the quantize is otherwise fused into the RoPE kernel, and leaving
+        # them on the BF16 kernel meant a JIT compile of a variant the backend
+        # never pre-warms.
         k_scale = getattr(self.attn_mha, "k_scale_float", 1.0)
         use_fp8_prefill = (
             self.attention_backend in self._MLA_KERNEL_BACKENDS
             and getattr(ctx.attn_backend, "data_type", None) == torch.float8_e4m3fn
-            and self.rotary_emb is not None
             and k_scale == 1.0
         )
 
         if use_fp8_prefill:
-            # Expand k_pe from [tokens,1,rope] to [tokens,heads,rope] for GQA
-            k_pe_expanded = k_pe.expand(-1, self.num_local_heads, -1)
+
+            if self.rotary_emb is not None:
+                k_rope = k_pe.expand(-1, self.num_local_heads, -1)
+                cos_sin_cache = self.rotary_emb.cos_sin_cache
+                is_neox = self.rotary_emb.is_neox_style
+            else:
+                k_rope = k_pe
+                cos_sin_cache = None
+                is_neox = False
 
             q_fp8, k_fp8 = apply_rope_mla(
                 positions=positions,
                 q_rope=q_pe,
-                k_rope=k_pe_expanded,
+                k_rope=k_rope,
                 q_nope=q_nope,
                 k_nope=k_nope,
-                cos_sin_cache=self.rotary_emb.cos_sin_cache,
-                is_neox=getattr(self.rotary_emb, "is_neox_style", True),
+                cos_sin_cache=cos_sin_cache,
+                is_neox=is_neox,
                 quant_scale_q=1.0,
                 quant_scale_kv=k_scale,
                 enable_pdl=pdl_enabled(),
@@ -1230,6 +1255,8 @@ class DeepseekV3DraftAttentionMLA(DeepseekV3AttentionMLA):
             ctx.attn_backend.spec_num_tokens - ctx.accept_lengths[num_extends:]
         ).to(seq_lens_buf.dtype)
         seq_lens_buf[num_extends : ctx.bs].sub_(correction).clamp_(min=1)
+        # Publish: the backend owns its buffer, so in-graph edits need a copy.
+        ctx.attn_backend.advance_draft_forward_metadata(seq_lens_buf[: ctx.bs])
 
 
 class DeepseekV3DecoderLayer(nn.Module):
@@ -2036,6 +2063,16 @@ class Eagle3MlaModel(nn.Module):
             if getattr(config, "fc_norm", False)
             else None
         )
+        self.fused_fc_norms = (
+            nn.ModuleList(
+                [
+                    FusedRMSNorm(self.fc_norm[i], self.fc_norm[i + 1])
+                    for i in range(0, self.num_fc_input_dim - 1, 2)
+                ]
+            )
+            if self.fc_norm is not None
+            else None
+        )
         self.norm_output = getattr(config, "norm_output", False)
 
     def forward(
@@ -2056,15 +2093,23 @@ class Eagle3MlaModel(nn.Module):
 
         hidden_states = captured_hidden_states
         if hidden_states.size(-1) != embeds.size(-1):
-            if self.fc_norm is not None:
+            if self.fc_norm is not None and hidden_states.shape[0] > 0:
                 chunks = hidden_states.chunk(self.num_fc_input_dim, dim=-1)
-                hidden_states = torch.cat(
-                    [
-                        norm(chunk)
-                        for norm, chunk in zip(self.fc_norm, chunks, strict=True)
-                    ],
-                    dim=-1,
-                )
+                normed = torch.empty_like(hidden_states)
+                out_chunks = normed.chunk(self.num_fc_input_dim, dim=-1)
+                i = 0
+                for fused in self.fused_fc_norms:
+                    fused(
+                        input_q_a=chunks[i],
+                        input_kv_a=chunks[i + 1],
+                        output_q_a=out_chunks[i],
+                        output_kv_a=out_chunks[i + 1],
+                    )
+                    i += 2
+                if i < self.num_fc_input_dim:
+                    # Odd count: single norm into the last slice.
+                    self.fc_norm[i](chunks[i], out=out_chunks[i])
+                hidden_states = normed
             hidden_states, _ = self.fc(hidden_states)
 
         residual = None

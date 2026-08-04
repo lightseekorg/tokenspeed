@@ -116,6 +116,7 @@ class _StubTokenizerManager(AsyncLLM):
             stream_output=stream_output,
             speculative_algorithm=speculative_algorithm,
             skip_tokenizer_init=False,
+            weight_version="test-v0",
         )
         # OutputProcessor holds a back-reference to this stub via
         # ``engine``.
@@ -356,6 +357,7 @@ class TestInlineBasicEmit(unittest.TestCase):
         self.assertEqual(
             out["meta_info"]["finish_reason"], {"type": "stop", "matched": None}
         )
+        self.assertEqual(out["meta_info"]["weight_version"], "test-v0")
         self.assertTrue(state.finished)
 
 

@@ -81,22 +81,57 @@ class TrtllmAllReduceBackend(CommBackend):
                 process_group_manager as pg_manager,
             )
 
+            # No same-node gate here: only the IPC workspace is node-local
+            # (opening a remote rank's IPC handle poisons the CUDA context),
+            # and _skip_ipc_workspace below detects exactly that and skips it.
+            # The mnnvl fabric workspace is the cross-node path -- an early
+            # same-node return would disable it on precisely the groups it
+            # exists to serve.
             device_group = pg_manager.get_process_group("nccl", group)
 
-            ipc_handles, workspace_tensor = (
-                trtllm_create_ipc_workspace_for_all_reduce_fusion(
-                    rank,
-                    len(group),
-                    max_token_num,
-                    hidden_dim,
-                    group=device_group,
-                    use_fp32_lamport=use_fp32_lamport,
-                )
+            from tokenspeed_kernel.ops.communication.trtllm import (
+                _skip_ipc_workspace,
             )
+
+            if _skip_ipc_workspace(device_group):
+                ipc_handles, workspace_tensor = None, None
+            else:
+                ipc_handles, workspace_tensor = (
+                    trtllm_create_ipc_workspace_for_all_reduce_fusion(
+                        rank,
+                        len(group),
+                        max_token_num,
+                        hidden_dim,
+                        group=device_group,
+                        use_fp32_lamport=use_fp32_lamport,
+                    )
+                )
+
+            # NVLS variant for the plain one-shot path (capability-gated,
+            # collective, symmetric fallback): the fused-pattern wrappers in
+            # the kernel package arm their own copy; this one serves the
+            # backend-level all_reduce (post-restructure attention ARs).
+            from tokenspeed_kernel.ops.communication.trtllm import (
+                _try_create_mnnvl_workspace,
+            )
+
+            mnnvl_workspace = _try_create_mnnvl_workspace(
+                rank,
+                len(group),
+                max_token_num,
+                hidden_dim,
+                device_group,
+            )
+
+            # Nothing usable -> report failure so the backend keeps routing
+            # this group through NCCL.
+            if workspace_tensor is None and mnnvl_workspace is None:
+                return False
 
             self._resources[group] = {
                 "ipc_handles": ipc_handles,
                 "workspace": workspace_tensor,
+                "mnnvl": mnnvl_workspace,
                 "rank": rank,
                 "world_size": len(group),
                 "max_token_num": max_token_num,
@@ -135,9 +170,13 @@ class TrtllmAllReduceBackend(CommBackend):
         )
 
         try:
-            trtllm_destroy_ipc_workspace_for_all_reduce_fusion(
-                res["ipc_handles"], group=res["device_group"]
-            )
+            # Cross-node groups have no IPC workspace (ipc_handles is None);
+            # destroying it raised, and the except below then popped the group
+            # and permanently disabled the fused path.
+            if res["ipc_handles"] is not None:
+                trtllm_destroy_ipc_workspace_for_all_reduce_fusion(
+                    res["ipc_handles"], group=res["device_group"]
+                )
             del self._resources[group]
             return (
                 self.configure_group(
@@ -196,9 +235,41 @@ class TrtllmAllReduceBackend(CommBackend):
         if token_num == 0:
             return tensor
 
+        from tokenspeed_kernel.ops.communication.trtllm import (
+            MNNVL_PREFER_IPC_BYTES,
+        )
+
         from tokenspeed.runtime.utils.pdl import pdl_enabled
 
         allreduce_out = torch.empty_like(tensor_2d)
+
+        workspace = res["workspace"]
+        mnnvl = res.get("mnnvl")
+        # Same Tier-2 split as _ar_fusion_workspace: prefer the IPC lamport
+        # workspace (single-node only; cross-node it is None) once the payload
+        # reaches MNNVL_PREFER_IPC_BYTES, mnnvl below it. Unreachable while
+        # _MAX_ONESHOT_BYTES stays under the threshold, but keeps this path
+        # consistent with the kernel-side dispatch if either bound moves.
+        payload_bytes = token_num * hidden_dim * tensor_2d.dtype.itemsize
+        prefer_ipc = workspace is not None and payload_bytes >= MNNVL_PREFER_IPC_BYTES
+        if (
+            not prefer_ipc
+            and mnnvl is not None
+            and mnnvl.supports(
+                token_num,
+                hidden_dim,
+                tensor_2d.dtype,
+                res["world_size"],
+                AllReduceFusionPattern.kAllReduce,
+                use_oneshot=True,
+            )
+        ):
+            workspace = mnnvl
+
+        # Shape not covered by mnnvl and no IPC fallback -> let the caller
+        # fall back to NCCL (this function's None contract).
+        if workspace is None:
+            return None
 
         trtllm_allreduce_fusion(
             allreduce_in=tensor_2d,
@@ -206,7 +277,7 @@ class TrtllmAllReduceBackend(CommBackend):
             world_rank=res["rank"],
             token_num=token_num,
             hidden_dim=hidden_dim,
-            workspace_ptrs=res["workspace"],
+            workspace_ptrs=workspace,
             launch_with_pdl=pdl_enabled(),
             use_oneshot=True,
             trigger_completion_at_end=True,

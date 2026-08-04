@@ -211,6 +211,7 @@ def all_reduce_latent_norm(
         eps=eps,
         max_token_num=max_token_num,
         launch_with_pdl=pdl_enabled(),
+        trigger_completion_at_end=True,
     )
 
 

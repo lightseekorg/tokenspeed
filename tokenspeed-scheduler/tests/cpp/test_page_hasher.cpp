@@ -234,135 +234,22 @@ TEST(ComputePagedHashesTest, IncrementalChainEqualsOneShot) {
     EXPECT_EQ(incremental, one_shot);
 }
 
-// ---- group_id pack / unpack --------------------------------------------
-
-TEST(GroupIdTest, KeyIsContentHashPlusEightHex) {
-    std::string content(64, 'a');
-    std::string key = MakeKeyWithGroupId(content, 7);
-    EXPECT_EQ(key.size(), 72u);
-    EXPECT_EQ(key.substr(0, 64), content);
-    EXPECT_EQ(key.substr(64), "00000007");  // big-endian
-}
-
-TEST(GroupIdTest, BigEndianByteOrder) {
-    std::string key = MakeKeyWithGroupId(std::string(64, 'a'), 0x01020304u);
-    EXPECT_EQ(key.substr(64), "01020304");
-}
-
-TEST(GroupIdTest, RoundTrip) {
-    std::string content(64, 'd');
-    for (uint32_t gid : {0u, 1u, 7u, 255u, 256u, 0xdeadbeefu, 0xffffffffu}) {
-        std::string key = MakeKeyWithGroupId(content, gid);
-        EXPECT_EQ(GetBlockHashFromKey(key), content) << "gid " << gid;
-        EXPECT_EQ(GetGroupIdFromHashKey(key), gid) << "gid " << gid;
+TEST(ComputePagedHashesTest, AdvancePagedHashesReturnsOnlyNewPages) {
+    std::vector<std::int32_t> tokens(12);
+    for (std::int32_t i = 0; i < 12; ++i) {
+        tokens[i] = 100 + i;
     }
-}
-
-TEST(GroupIdTest, ContentHashIndependentOfGroup) {
-    std::string content(64, 'c');
-    std::string k0 = MakeKeyWithGroupId(content, 0);
-    std::string k1 = MakeKeyWithGroupId(content, 1);
-    EXPECT_EQ(GetBlockHashFromKey(k0), GetBlockHashFromKey(k1));
-    EXPECT_NE(k0, k1);
-}
-
-TEST(GroupIdTest, ShortKeyDecodesDefensively) {
-    EXPECT_EQ(GetBlockHashFromKey("abc"), "");
-    EXPECT_EQ(GetGroupIdFromHashKey("abc"), 0u);
-}
-
-// ---- ComputePagedHashesWithGroup ---------------------------------------
-
-TEST(ComputePagedHashesWithGroupTest, EqualsBareHashesWrappedWithGroup) {
-    std::vector<std::int32_t> p0 = {1, 2};
-    std::vector<std::int32_t> p1 = {3, 4};
-    std::vector<token_span> pages = {Tokens(p0), Tokens(p1)};
-
-    std::vector<std::string> bare = ComputePagedHashes(pages, "r");
-    std::vector<std::string> grouped = ComputePagedHashesWithGroup(pages, "r", 42);
-
-    ASSERT_EQ(grouped.size(), bare.size());
-    for (std::size_t i = 0; i < bare.size(); ++i) {
-        EXPECT_EQ(grouped[i], MakeKeyWithGroupId(bare[i], 42)) << "page " << i;
-        // group_id rides outside the chain: stripping it recovers the bare hash.
-        EXPECT_EQ(GetBlockHashFromKey(grouped[i]), bare[i]) << "page " << i;
+    std::vector<token_span> pages;
+    for (std::size_t start = 0; start < tokens.size(); start += 2) {
+        pages.push_back(token_span(tokens.data() + start, 2));
     }
-}
 
-TEST(ComputePagedHashesWithGroupTest, GroupDoesNotLeakIntoPrefixChain) {
-    std::vector<std::int32_t> p0 = {1, 2};
-    std::vector<std::int32_t> p1 = {3, 4};
-    std::vector<token_span> pages = {Tokens(p0), Tokens(p1)};
+    const std::vector<std::string> one_shot = ComputePagedHashes(pages, "");
+    const std::vector<std::string> first = AdvancePagedHashes(pages, 0, "", 2);
+    const std::vector<std::string> second = AdvancePagedHashes(pages, 2, first.back(), 5);
 
-    std::vector<std::string> g0 = ComputePagedHashesWithGroup(pages, "r", 0);
-    std::vector<std::string> g9 = ComputePagedHashesWithGroup(pages, "r", 9);
-
-    for (std::size_t i = 0; i < g0.size(); ++i) {
-        EXPECT_EQ(GetBlockHashFromKey(g0[i]), GetBlockHashFromKey(g9[i])) << "page " << i;
-    }
-}
-
-// ---- FoldBaseHashes ----------------------------------------------------
-
-TEST(FoldBaseHashesTest, IdentityWhenGroupEqualsBase) {
-    std::vector<std::string> base = {"aa", "bb", "cc"};
-    auto folded = FoldBaseHashes(base, /*first_base=*/0, /*m=*/1);
-    ASSERT_EQ(folded.size(), 3u);
-    EXPECT_EQ(folded[0], HashPage(std::span<const std::int32_t>{}, "", std::vector<std::string>{"aa"}));
-}
-
-TEST(FoldBaseHashesTest, FoldsMConsecutiveIntoOneOrderSensitive) {
-    std::vector<std::string> base = {"a0", "a1", "a2", "a3", "a4", "a5"};
-    auto folded = FoldBaseHashes(base, 0, 2);
-    ASSERT_EQ(folded.size(), 3u);
-    std::vector<std::string> swapped = {"a1", "a0", "a2", "a3", "a4", "a5"};
-    auto folded2 = FoldBaseHashes(swapped, 0, 2);
-    EXPECT_NE(folded[0], folded2[0]);
-    EXPECT_EQ(folded[1], folded2[1]);
-}
-
-TEST(FoldBaseHashesTest, DropsIncompleteTrailingGroupBlock) {
-    std::vector<std::string> base = {"a0", "a1", "a2", "a3", "a4"};
-    auto folded = FoldBaseHashes(base, 0, 2);
-    EXPECT_EQ(folded.size(), 2u);
-}
-
-TEST(FoldBaseHashesTest, FirstBaseOffsetShiftsFoldWindow) {
-    // first_base=1, m=2: first_base%m==1 -> drop 1 leading page, [a2,a3] folds into 1 block
-    std::vector<std::string> base = {"a1", "a2", "a3"};
-    auto folded = FoldBaseHashes(base, /*first_base=*/1, /*m=*/2);
-    ASSERT_EQ(folded.size(), 1u);
-}
-
-// ---- MakeFoldedGroupKeys ----------------------------------------------
-
-TEST(MakeFoldedGroupKeysTest, MEqualsOneIsByteIdenticalToRawPerBaseKey) {
-    std::vector<std::string> base = {"aa", "bb", "cc"};
-    auto keys = MakeFoldedGroupKeys(base, /*group_id=*/7, /*m=*/1);
-    ASSERT_EQ(keys.size(), 3u);
-    for (std::size_t i = 0; i < base.size(); ++i) {
-        EXPECT_EQ(keys[i], MakeKeyWithGroupId(base[i], 7)) << "page " << i;
-    }
-}
-
-TEST(MakeFoldedGroupKeysTest, MTwoFoldsThenWrapsGroupId) {
-    std::vector<std::string> base = {"a0", "a1", "a2", "a3"};
-    auto keys = MakeFoldedGroupKeys(base, /*group_id=*/3, /*m=*/2);
-    auto folded = FoldBaseHashes(base, /*first_base=*/0, /*m=*/2);
-    ASSERT_EQ(keys.size(), 2u);
-    ASSERT_EQ(folded.size(), 2u);
-    for (std::size_t i = 0; i < folded.size(); ++i) {
-        EXPECT_EQ(keys[i], MakeKeyWithGroupId(folded[i], 3)) << "coarse block " << i;
-    }
-}
-
-TEST(MakeFoldedGroupKeysTest, FirstBaseOffsetShiftsFoldedKeys) {
-    // first_base=1, m=2 -> drop 1 leading base page, [a2,a3] fold into 1 coarse key.
-    std::vector<std::string> base = {"a1", "a2", "a3"};
-    auto keys = MakeFoldedGroupKeys(base, /*group_id=*/0, /*m=*/2, /*first_base=*/1);
-    auto folded = FoldBaseHashes(base, /*first_base=*/1, /*m=*/2);
-    ASSERT_EQ(keys.size(), 1u);
-    EXPECT_EQ(keys[0], MakeKeyWithGroupId(folded[0], 0));
+    EXPECT_EQ(first, std::vector<std::string>(one_shot.begin(), one_shot.begin() + 2));
+    EXPECT_EQ(second, std::vector<std::string>(one_shot.begin() + 2, one_shot.begin() + 5));
 }
 
 }  // namespace

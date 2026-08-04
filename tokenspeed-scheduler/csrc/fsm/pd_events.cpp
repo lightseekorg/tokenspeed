@@ -38,21 +38,20 @@ Finished SucceededEvent::operator()(Decoding&& /*state*/) {
 }
 
 PrefillDone RemotePrefillDoneEvent::operator()(Prefilling&& state) {
-    TokenContainer::Window w = state.window;
+    const TokenContainer::Window window = state.window;
+    TokenContainer* token_container = state.TokenContainerPtr();
+    const std::int32_t page_size = state.PageSize();
+    const std::int32_t reserve_num_tokens_in_next_schedule_event = state.ReserveNumTokensInNextScheduleEvent();
+    auto req_pool_index = std::move(state).TakeRequestPoolIndex();
     auto block_tables = std::move(state).TakeBlockTables();
-    auto prefill_done = PrefillDone{
-        state.GetTokenContainer(),
-        state.GetPageSize(),
-        std::move(state).TakeHostNodeRef(),
-        std::move(state).TakeDeviceNodeRef(),
-        std::move(state).TakeLocalKVAllocator(),
-        std::move(state).TakeReqPoolIndex(),
-        w,
-        0,  // reserve_num_tokens_in_next_schedule_event
-        std::move(state).TakeLocalMambaAllocator(),
-    };
-
-    prefill_done.SetBlockTables(std::move(block_tables));
+    auto cache_progress = std::move(state).TakeCacheProgress();
+    auto prefill_done = PrefillDone{token_container,
+                                    page_size,
+                                    std::move(req_pool_index),
+                                    window,
+                                    reserve_num_tokens_in_next_schedule_event,
+                                    std::move(block_tables),
+                                    std::move(cache_progress)};
     prefill_done.ExtendResultTokens({bootstrap_token});
     return prefill_done;
 }

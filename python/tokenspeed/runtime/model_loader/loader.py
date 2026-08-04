@@ -29,7 +29,7 @@ import dataclasses
 import glob
 import os
 from abc import ABC, abstractmethod
-from collections.abc import Generator, Iterable, Iterator
+from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager
 from typing import Any, cast
 
@@ -53,6 +53,7 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     download_weights_from_hf,
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
+    filter_safetensors_files_by_weight_names,
     get_quant_config,
     initialize_dummy_weights,
     np_cache_weights_iterator,
@@ -66,7 +67,7 @@ from tokenspeed.runtime.utils import get_colorful_logger, is_pin_memory_availabl
 @contextmanager
 def device_loading_context(
     module: torch.nn.Module, target_device: torch.device
-) -> Iterator[torch.nn.Module]:
+) -> Generator[torch.nn.Module]:
     if target_device.type == "cpu":
         # If target is CPU, no need to move anything
         yield module
@@ -318,12 +319,32 @@ class DefaultModelLoader(BaseModelLoader):
         return hf_folder, hf_weights_files, use_safetensors
 
     def _get_weights_iterator(
-        self, source: "Source"
+        self,
+        source: "Source",
+        weight_name_filter: Callable[[str], bool] | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """Get an iterator for the model weights based on the load format."""
+        """Get an iterator for the model weights based on the load format.
+
+        When ``weight_name_filter`` is given, safetensors shards whose index
+        entries contain no accepted weight name are skipped entirely (not
+        read or prefetched). The predicate sees names as yielded to the
+        consumer, i.e. with ``source.prefix`` applied.
+        """
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path, source.revision, source.fall_back_to_pt
         )
+        if use_safetensors and weight_name_filter is not None:
+            index_file = (
+                "consolidated.safetensors.index.json"
+                if self.load_config.load_format == LoadFormat.MISTRAL
+                else SAFE_WEIGHTS_INDEX_NAME
+            )
+            hf_weights_files = filter_safetensors_files_by_weight_names(
+                hf_weights_files,
+                hf_folder,
+                index_file,
+                lambda name: weight_name_filter(source.prefix + name),
+            )
         if self.load_config.load_format == LoadFormat.NPCACHE:
             # Currently np_cache only support *.bin checkpoints
             if use_safetensors:
@@ -351,6 +372,10 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         model: nn.Module,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        # Draft (NextN/MTP) models embedded in the target checkpoint expose
+        # ``checkpoint_weight_name_filter`` so only the shards holding their
+        # weights are read instead of the whole checkpoint.
+        weight_name_filter = getattr(model, "checkpoint_weight_name_filter", None)
 
         primary_weights = DefaultModelLoader.Source(
             model_config.model_path,
@@ -358,13 +383,13 @@ class DefaultModelLoader(BaseModelLoader):
             prefix="",
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", False),
         )
-        yield from self._get_weights_iterator(primary_weights)
+        yield from self._get_weights_iterator(primary_weights, weight_name_filter)
 
         secondary_weights = cast(
             Iterable[DefaultModelLoader.Source], getattr(model, "secondary_weights", ())
         )
         for source in secondary_weights:
-            yield from self._get_weights_iterator(source)
+            yield from self._get_weights_iterator(source, weight_name_filter)
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(

@@ -20,8 +20,8 @@
 
 #pragma once
 
-#include <span>
 #include <cstdint>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -30,8 +30,6 @@ namespace tokenspeed {
 struct RequestSpec {
     std::string request_id;
     std::vector<std::int32_t> tokens;
-    std::vector<std::string> rolling_hashes;
-    std::int32_t storage_hit_pages{0};
 };
 
 struct PrefillInfo {
@@ -39,11 +37,6 @@ struct PrefillInfo {
     std::vector<std::int32_t> shifted_input_ids;
     std::int32_t already_scheduled_len;
     std::int32_t extend_len;
-};
-
-struct StorageInfo {
-    std::vector<std::string> rolling_hashes;
-    std::int32_t hit_pages{0};
 };
 
 }  // namespace tokenspeed

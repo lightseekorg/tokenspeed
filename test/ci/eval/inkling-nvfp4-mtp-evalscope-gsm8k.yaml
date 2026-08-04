@@ -1,6 +1,7 @@
 api_version: ci.tokenspeed.io/v1
 name: eval-inkling-nvfp4-mtp-gsm8k
 type: eval
+workflow_stage: model-test
 triggers:
   - per-commit
   - manual
@@ -9,7 +10,6 @@ runner:
     - b200-4gpu
 env:
   CI: "true"
-  TOKENSPEED_FLAT_KV: "ON"
 install:
   - bash test/ci_system/install_deps.sh
 server:
@@ -25,7 +25,6 @@ server:
     --gpu-memory-utilization 0.95
     --disable-cuda-graph-padding
     --trust-remote-code
-    --weight-loader-prefetch-checkpoints
     --attention-backend fa4
     --moe-backend flashinfer_trtllm
     --enable-prefix-caching
