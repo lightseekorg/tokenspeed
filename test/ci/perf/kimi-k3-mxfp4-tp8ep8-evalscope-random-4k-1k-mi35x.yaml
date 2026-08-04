@@ -71,7 +71,7 @@ perf:
     --max-tokens 1024
     --parallel 1
     --number 1
-    --warmup-num 0
+    --warmup-num 1
     --rate -1
     --seed 1
     --temperature 0
