@@ -106,4 +106,8 @@ jobs:
 
       - name: Cleanup work directory
         if: always()
-        run: rm -rf "${{ env.WORK_DIR }}"
+        run: |
+          case "${{ matrix.runner }}" in
+            gb200*) python3 "${{ env.WORK_DIR }}/test/ci_system/process_group_manager.py" cleanup-stale || true ;;
+          esac
+          rm -rf "${{ env.WORK_DIR }}"
