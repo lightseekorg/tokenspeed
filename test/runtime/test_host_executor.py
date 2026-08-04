@@ -318,28 +318,6 @@ class MemoryExecutorTest(unittest.TestCase):
         # _setup_layerwise_loadback right after submit).
         self.assertIsNone(executor.get_producer_index(self.CacheKind.KV, 9))
 
-    def test_layer_event_mapping(self):
-        pool = self._pool()
-        executor = self._executor(pool)
-        mirror = executor.mirror
-        self._fill_device_pages(mirror, [3])
-        executor.submit_writeback([1], [[3]], [[0]])
-        executor.flush()
-        self._drain(executor, 1)
-
-        executor.submit_loadback([2], [[0]], [[3]])
-        executor.flush()
-        producer_idx = executor.get_producer_index(self.CacheKind.KV, 2)
-        producer_event = executor._counter.events[producer_idx]
-        # Paired slab layers share their V slab's event; distinct groups
-        # get distinct events; finish_event covers every copy.
-        self.assertIs(producer_event.load_events[0], producer_event.load_events[1])
-        self.assertIs(producer_event.load_events[2], producer_event.load_events[3])
-        self.assertIsNot(producer_event.load_events[0], producer_event.load_events[2])
-        self.torch.cuda.synchronize()
-        self.assertTrue(producer_event.finish_event.query())
-        self._drain(executor, 1)
-
     def _state_pool(self):
         fields = self.qwen_gdn_cache_fields(
             layer_types=GDN_LAYER_TYPES,

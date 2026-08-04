@@ -471,6 +471,7 @@ class _BackendCase(_TorchCase):
         backend.is_draft = False
         backend.draft_block_decode = False
         backend.state_group_ids = frozenset()
+        backend.group_page_sizes = {}
         backend.max_num_pages = MAX_NUM_PAGES
         backend.page_size = 2
         backend.device = "cpu"
