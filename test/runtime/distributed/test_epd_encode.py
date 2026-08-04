@@ -99,7 +99,13 @@ def _worker(max_tokens=10_000, max_items=99, cap_bytes=10**6):
 
 
 def _req(rid, items, room=0):
-    return EncodeRequest(rid, "h", 1, room, items)
+    return EncodeRequest(
+        request_id=rid,
+        bootstrap_host="h",
+        bootstrap_port=1,
+        bootstrap_room=room,
+        items=items,
+    )
 
 
 def test_miss_runs_tower_and_caches():

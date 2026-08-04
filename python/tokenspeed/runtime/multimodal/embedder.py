@@ -75,7 +75,6 @@ from tokenspeed.runtime.multimodal.inputs import (
     MultimodalForwardContext,
     MultimodalInputs,
 )
-from tokenspeed.runtime.multimodal.shm_transport import ShmTensorHandle
 from tokenspeed.runtime.utils.env import envs
 
 EncoderFn = Callable[[list[MultimodalDataItem]], torch.Tensor]
@@ -674,33 +673,42 @@ class MultimodalEmbedder:
         pending = [
             it
             for it in items
-            if isinstance(it.feature, (torch.Tensor, ShmTensorHandle))
-            and (isinstance(it.feature, ShmTensorHandle) or it.feature.device != device)
+            if it.feature_shm is not None
+            or (isinstance(it.feature, torch.Tensor) and it.feature.device != device)
         ]
         if not pending:
             return
 
         if device.type != "cuda":
             for it in pending:
-                if isinstance(it.feature, ShmTensorHandle):
-                    it.feature = it.feature.consume()
+                handle = it.feature_shm
+                if handle is not None:
+                    try:
+                        it.feature = handle.consume()
+                    finally:
+                        it.feature_shm = None
                 if isinstance(it.feature, torch.Tensor):
                     it.feature = it.feature.to(device, non_blocking=True)
             return
 
-        shm_count = 0
-        shm_nbytes = 0
-        for item in pending:
-            if isinstance(item.feature, ShmTensorHandle):
-                shm_count += 1
-                shm_nbytes += item.feature.nbytes
+        shm_items = [item for item in pending if item.feature_shm is not None]
+        shm_count = len(shm_items)
+        shm_nbytes = sum(
+            item.feature_shm.nbytes()
+            for item in shm_items
+            if item.feature_shm is not None
+        )
         use_tp_broadcast = self._should_move_shm_via_tp_broadcast(pending)
         interleave_h2d = shm_nbytes > shm_count * _INTERLEAVED_H2D_MIN_AVERAGE_BYTES
         defer_shm_cleanup = shm_count == 1 and interleave_h2d
         if not use_tp_broadcast and not interleave_h2d:
-            for item in pending:
-                if isinstance(item.feature, ShmTensorHandle):
-                    item.feature = item.feature.consume()
+            for item in shm_items:
+                handle = item.feature_shm
+                assert handle is not None
+                try:
+                    item.feature = handle.consume()
+                finally:
+                    item.feature_shm = None
 
         # Keep collectives on the model stream so their ordering matches other
         # TP collectives queued by the forward pass on every rank.
@@ -712,16 +720,20 @@ class MultimodalEmbedder:
         current = torch.cuda.current_stream(device)
         with torch.cuda.stream(h2d):
             for it in pending:
-                if isinstance(it.feature, ShmTensorHandle):
+                handle = it.feature_shm
+                if handle is not None:
                     if defer_shm_cleanup:
-                        handle = it.feature
                         try:
                             it.feature = handle.copy_to_pinned()
                             it.feature = it.feature.to(device, non_blocking=True)
                         finally:
                             handle.release()
+                            it.feature_shm = None
                         continue
-                    it.feature = it.feature.consume()
+                    try:
+                        it.feature = handle.consume()
+                    finally:
+                        it.feature_shm = None
                 if isinstance(it.feature, torch.Tensor):
                     it.feature = it.feature.to(device, non_blocking=True)
         current.wait_stream(h2d)
@@ -738,15 +750,19 @@ class MultimodalEmbedder:
             or self._vision_tp_process_group is None
             or self._vision_tp_src_rank is None
             or not items
-            or not all(isinstance(item.feature, ShmTensorHandle) for item in items)
+            or not all(item.feature_shm is not None for item in items)
         ):
             return False
 
-        handles = [item.feature for item in items]
+        handles = []
+        for item in items:
+            handle = item.feature_shm
+            assert handle is not None
+            handles.append(handle)
         dtype = handles[0].dtype
         if any(handle.dtype != dtype for handle in handles):
             return False
-        total_nbytes = sum(handle.nbytes for handle in handles)
+        total_nbytes = sum(handle.nbytes() for handle in handles)
         return total_nbytes >= _TP_BROADCAST_BASE_MIN_BYTES // len(tp_group)
 
     def _move_shm_via_tp_broadcast(
@@ -761,7 +777,11 @@ class MultimodalEmbedder:
         assert process_group is not None
         assert src_rank is not None
 
-        handles = [item.feature for item in items]
+        handles = []
+        for item in items:
+            handle = item.feature_shm
+            assert handle is not None
+            handles.append(handle)
         dtype = handles[0].dtype
 
         element_lengths = [math.prod(handle.shape) for handle in handles]
@@ -769,16 +789,24 @@ class MultimodalEmbedder:
         is_source = torch.distributed.get_rank() == src_rank
         offset = 0
         if is_source:
-            for handle, length in zip(handles, element_lengths, strict=True):
-                if len(handles) == 1:
-                    handle.copy_into(base.narrow(0, offset, length))
-                else:
-                    source = handle.consume().reshape(-1)
-                    base.narrow(0, offset, length).copy_(source, non_blocking=True)
+            for item, handle, length in zip(
+                items, handles, element_lengths, strict=True
+            ):
+                try:
+                    if len(handles) == 1:
+                        handle.copy_into(base.narrow(0, offset, length))
+                    else:
+                        source = handle.consume().reshape(-1)
+                        base.narrow(0, offset, length).copy_(source, non_blocking=True)
+                finally:
+                    item.feature_shm = None
                 offset += length
         else:
-            for handle in handles:
-                handle.release()
+            for item, handle in zip(items, handles, strict=True):
+                try:
+                    handle.release()
+                finally:
+                    item.feature_shm = None
 
         torch.distributed.broadcast(base, src=src_rank, group=process_group)
         offset = 0
@@ -788,10 +816,11 @@ class MultimodalEmbedder:
 
     @staticmethod
     def _drop_raw_feature(item: MultimodalDataItem) -> bool:
-        if item.feature is None:
+        if item.feature is None and item.feature_shm is None:
             return False
-        if isinstance(item.feature, ShmTensorHandle):
-            item.feature.release()
+        if item.feature_shm is not None:
+            item.feature_shm.release()
+            item.feature_shm = None
         item.feature = None
         return True
 

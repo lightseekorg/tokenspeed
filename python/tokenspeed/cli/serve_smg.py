@@ -19,7 +19,16 @@
 # SOFTWARE.
 
 """``ts serve`` orchestrator: spawn smg gateway + gRPC engine, tag logs, probe
-readiness, and tear down gateway-first on shutdown."""
+readiness, and tear down gateway-first on shutdown.
+
+``ts serve`` is the full serving command; today its internals are the smg
+gateway plus the gRPC engine servicer. ``ts serve --headless`` is engine-only:
+nothing else is spawned here — an external frontend such as ``smg serve
+--backend tokenspeed --connection-mode zmq`` binds the msgpack ZMQ sockets and
+this engine dials in at ``tcp://{--data-parallel-address}:
+{--data-parallel-rpc-port}`` (default ``tcp://127.0.0.1:30500``). Headless
+mode implies ``--zmq-msgpack`` + ``--skip-tokenizer-init`` (see
+``launch_scheduler_headless``)."""
 
 from __future__ import annotations
 
@@ -34,7 +43,7 @@ from pathlib import Path
 
 from tokenspeed_kernel.platform import current_platform
 
-from tokenspeed.cli._argsplit import OrchestratorOpts, split_argv
+from tokenspeed.cli._argsplit import OrchestratorOpts, split_argv, split_headless_argv
 from tokenspeed.cli._logo import print_logo
 from tokenspeed.cli._logprefix import ENGINE_TAG, GATEWAY_TAG, tag_stream
 from tokenspeed.cli._proc import (
@@ -683,8 +692,35 @@ async def run_smg(
                     pass
 
 
+def _run_headless(argv: list[str]) -> None:
+    """``ts serve --headless``: run the scheduler-only launcher in-process.
+
+    No gateway, gRPC servicer, or control server: the external frontend owns
+    the HTTP surface, binds the ZMQ sockets, and does the (de)tokenization.
+    Reuses the ``python -m tokenspeed.runtime.entrypoints.engine``
+    implementation; ``argv`` is a plain ServerArgs argv.
+    """
+    try:
+        import setproctitle
+
+        setproctitle.setproctitle("ts-serve-headless")
+    except ImportError:
+        pass
+
+    from tokenspeed.runtime.entrypoints.engine import run_scheduler_headless_from_cli
+
+    run_scheduler_headless_from_cli(argv)
+
+
 def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
     """Entry point called from cli/__main__.py for ``ts serve``."""
+    headless_argv = split_headless_argv(raw_argv)
+    if headless_argv is not None:
+        # Engine-only: skip the orchestrator entirely, including its
+        # gRPC-specific env defaults and bundled-gateway install check.
+        _run_headless(headless_argv)
+        return
+
     _set_default_grpc_max_message_bytes()
 
     try:

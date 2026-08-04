@@ -35,6 +35,8 @@ import zmq
 from tokenspeed.runtime.engine.event_loop import run_event_loop
 from tokenspeed.runtime.engine.io_struct import (
     BlockReqInput,
+    IpcReceiver,
+    IpcSender,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     WatchLoadUpdateReq,
@@ -135,8 +137,10 @@ class DataParallelController:
         # Init inter-process communication
         self.context = zmq.Context(1 + server_args.mapping.attn.dp_size)
         if server_args.node_rank == 0:
-            self.recv_from_tokenizer = get_zmq_socket(
-                self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
+            self.recv_from_tokenizer = IpcReceiver(
+                get_zmq_socket(
+                    self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
+                )
             )
         # dp_worker for fixed data dispatch can be set by SINGLE_WORKER_ID environment variable
         robin_scheduler = (
@@ -234,11 +238,13 @@ class DataParallelController:
             # Bind to scheduler_input_ipc_name BEFORE starting scheduler threads
             # This ensures the port is available when scheduler tries to connect
             if server_args.node_rank == 0:
-                self.workers[dp_rank] = get_zmq_socket(
-                    self.context,
-                    zmq.PUSH,
-                    tmp_port_args.scheduler_input_ipc_name,
-                    True,  # bind
+                self.workers[dp_rank] = IpcSender(
+                    get_zmq_socket(
+                        self.context,
+                        zmq.PUSH,
+                        tmp_port_args.scheduler_input_ipc_name,
+                        True,  # bind
+                    )
                 )
 
         if not server_args.mapping.attn.has_dp:

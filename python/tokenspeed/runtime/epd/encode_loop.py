@@ -30,7 +30,7 @@ The assembly is: load the model, stand up the Mooncake encode manager + bootstra
 server, the DisaggEncodeExecutor, and the EncodeWorker, reusing the SAME request
 IPC the LM scheduler uses: a ZMQ PULL
 on ``port_args.scheduler_input_ipc_name``. The smg grpc_servicer's TokenSpeedEncoder
-handler sends an :class:`EncodeRequest` (pickled) over that channel; the loop
+handler sends an :class:`EncodeRequest` (msgpack, tagged) over that channel; the loop
 drains them into ``EncodeWorker.submit`` and runs ``step`` to encode + transfer.
 
 TP: the vision tower is TP-sharded, so all encode ranks run each batch in lockstep
@@ -267,8 +267,10 @@ def run_encode_loop(server_args, port_args, pipe_writer, gpu_id, global_rank):
     context = zmq.Context(2)
     recv_from_gateway = None
     if attn_tp_rank == 0:
-        recv_from_gateway = get_zmq_socket(
-            context, zmq.PULL, port_args.scheduler_input_ipc_name, False
+        from tokenspeed.runtime.engine.io_struct import IpcReceiver
+
+        recv_from_gateway = IpcReceiver(
+            get_zmq_socket(context, zmq.PULL, port_args.scheduler_input_ipc_name, False)
         )
 
     # Unblock the launcher. The encode role has no KV pool, so the token/seq
