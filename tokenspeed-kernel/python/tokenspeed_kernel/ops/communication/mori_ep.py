@@ -95,6 +95,16 @@ class MoriEpDispatcher:
         data_type: torch.dtype = torch.bfloat16,
     ) -> None:
         assert mori_available(), "MORI v2 EP not importable"
+        # The CCO communicator is initialized over the GLOBAL torch.distributed world
+        # (ensure_mori_comm), so the dispatcher's EP world must be that same global world --
+        # i.e. full-world EP (ep_size == world_size). With ep_size < world_size there would be
+        # multiple EP groups sharing one global communicator and dispatch/combine could route
+        # across the wrong peers. Reject that until the communicator is scoped per EP group.
+        assert world_size == dist.get_world_size(), (
+            f"MORI EP requires ep_size == torch.distributed world_size (full-world EP); got "
+            f"ep_size={world_size}, world_size={dist.get_world_size()}. Sub-world EP groups "
+            "are not yet supported."
+        )
         from mori.ops.dispatch_combine_v2 import (
             EpDispatchCombineConfig,
             EpDispatchCombineOp,
@@ -112,6 +122,11 @@ class MoriEpDispatcher:
             enable_std_moe=True,
         )
         self._op = EpDispatchCombineOp(self._cfg, comm)
+
+    @property
+    def capacity(self) -> int:
+        """Configured max input tokens/rank (the symmetric-buffer capacity)."""
+        return self._cfg.max_num_inp_token_per_rank
 
     def dispatch(
         self,
@@ -161,26 +176,35 @@ def get_dispatcher(
     max_num_inp_token_per_rank: int,
     data_type: torch.dtype = torch.bfloat16,
 ) -> "MoriEpDispatcher":
-    """Return a process-wide MoriEpDispatcher for this EP shape, creating it once."""
+    """Return a process-wide MoriEpDispatcher for this EP shape.
+
+    The cache key deliberately EXCLUDES ``max_num_inp_token_per_rank``: a cached dispatcher
+    whose capacity already covers the request is reused, and only a larger request grows it
+    (recreated at the bigger capacity). Otherwise each new prefill/decode batch size would
+    allocate a fresh MORI op whose large symmetric buffers are never evicted -- a steady VMM
+    leak under variable traffic. Capacity thus grows monotonically to the largest seen and is
+    then reused for all smaller batches.
+    """
     key = (
         rank,
         world_size,
         hidden_dim,
         num_local_experts,
         num_experts_per_token,
-        max_num_inp_token_per_rank,
         str(data_type),
     )
     disp = _DISPATCHER_CACHE.get(key)
-    if disp is None:
-        disp = MoriEpDispatcher(
-            rank=rank,
-            world_size=world_size,
-            hidden_dim=hidden_dim,
-            num_local_experts=num_local_experts,
-            num_experts_per_token=num_experts_per_token,
-            max_num_inp_token_per_rank=max_num_inp_token_per_rank,
-            data_type=data_type,
-        )
-        _DISPATCHER_CACHE[key] = disp
+    if disp is not None and disp.capacity >= max_num_inp_token_per_rank:
+        return disp
+    cap = max(max_num_inp_token_per_rank, disp.capacity if disp is not None else 0)
+    disp = MoriEpDispatcher(
+        rank=rank,
+        world_size=world_size,
+        hidden_dim=hidden_dim,
+        num_local_experts=num_local_experts,
+        num_experts_per_token=num_experts_per_token,
+        max_num_inp_token_per_rank=cap,
+        data_type=data_type,
+    )
+    _DISPATCHER_CACHE[key] = disp
     return disp

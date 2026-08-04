@@ -18,14 +18,16 @@ env:
   MORI_PER_RANK_VMM: "4294967296"
 install:
   - bash test/ci_system/install_deps.sh
+  # MORI's .so links libgrpc++.so.1.51 (gRPC 1.51 C++ runtime), absent from the ROCm runner
+  # image; without it ``import mori`` fails and the test would skip via mori_available().
+  # Install the Ubuntu 24.04 (noble) t64 package so the test actually runs.
+  - sudo apt-get install -y libgrpc++1.51t64
   # MORI EP deps from the pre-built PyPI wheel (amd-mori) — no source build, no
   # build-time hipcc/cmake. The wheel ships the compiled libmori_*.so and the v2
   # dispatch_combine API this backend uses; the [flydsl] extra pulls the runtime JIT
-  # dep for the v2 device kernels (compiled on the runner's ROCm at first use).
-  # NOTE: the wheel's .so links libgrpc++.so.1.51 (Ubuntu: libgrpc++1.51t64) at
-  # runtime — provide it in the runner image if absent. This job is `optional` and the
-  # test self-skips via mori_available() (which catches import errors), so a missing
-  # grpc/ROCm dep surfaces as a skip, never a blocking failure.
+  # dep for the v2 device kernels (compiled on the runner's ROCm at first use). The test
+  # still self-skips via mori_available() if the import fails for any other reason, so a
+  # misconfigured runner degrades to a skip, never a blocking failure (job is `optional`).
   - python3 -m pip install "amd-mori[flydsl]==1.2.2"
 ut:
   commands:

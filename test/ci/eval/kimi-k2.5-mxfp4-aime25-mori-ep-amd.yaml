@@ -30,9 +30,12 @@ env:
   MORI_EP_MAX_TOKENS_PER_RANK: "2048"
 install:
   - bash test/ci_system/install_deps_rocm.sh
-  # MORI EP deps from the pre-built PyPI wheel (amd-mori) -- no source build. The wheel's
-  # .so links libgrpc++.so.1.51 (Ubuntu: libgrpc++1.51t64) at runtime; provide it in the
-  # runner image if absent. This job is `optional`, so a missing grpc/ROCm dep is soft-fail.
+  # MORI's .so links libgrpc++.so.1.51 (gRPC 1.51 C++ runtime), which is absent from the
+  # ROCm runner image -- without it ``import mori`` fails and the serve aborts on the first
+  # MoE forward (mori_available() -> False). The runner is Ubuntu 24.04 (noble), so install
+  # the t64 package that provides libgrpc++.so.1.51.
+  - sudo apt-get install -y libgrpc++1.51t64
+  # MORI EP deps from the pre-built PyPI wheel (amd-mori) -- no source build.
   - python3 -m pip install "amd-mori[flydsl]==1.2.2"
 server:
   command: >-
