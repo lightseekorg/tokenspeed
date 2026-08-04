@@ -285,16 +285,24 @@ class KimiK3RegistrationTests(unittest.TestCase):
         class FakeLinear(torch.nn.Module):
             def __init__(self, *args, **kwargs):
                 super().__init__()
+                self.weight = torch.empty(0)
 
         class FakeExperts(torch.nn.Module):
             def __init__(self, *args, **kwargs):
                 super().__init__()
                 expert_calls.append(kwargs)
                 self.support_routing = False
+                self.w13_weight = torch.empty(0)
+                self.w13_weight_scale = torch.empty(0)
+                self.w2_weight = torch.empty(0)
+                self.w2_weight_scale = torch.empty(0)
+                self.plan = {}
 
         class FakeSharedExperts(torch.nn.Module):
             def __init__(self, *args, **kwargs):
                 super().__init__()
+                self.gate_up_proj = FakeLinear()
+                self.down_proj = FakeLinear()
                 shared_calls.append(kwargs)
 
         class FakeLatentMoE(torch.nn.Module):

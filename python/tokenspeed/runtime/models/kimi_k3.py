@@ -258,18 +258,14 @@ class KimiLinearMLP(nn.Module):
         self.act_fn = SituAndMul(
             beta=activation_situ_beta, linear_beta=activation_situ_linear_beta
         )
-        self._has_unquantized_shared_weights = (
-            is_shared_expert
-            and hasattr(self.gate_up_proj, "weight")
-            and hasattr(self.down_proj, "weight")
-        )
+        self.is_shared_expert = is_shared_expert
 
     def forward(
         self, x: torch.Tensor, down_out: torch.Tensor | None = None
     ) -> torch.Tensor:
         if x.size(0) == 0:
             return x
-        if self._has_unquantized_shared_weights:
+        if self.is_shared_expert:
             x = kimi3_shared_situ_projection(
                 x,
                 self.gate_up_proj.weight,
@@ -1102,28 +1098,19 @@ class KimiLinearMoE(nn.Module):
             if self.execution_plan.use_native
             else None
         )
-        self._use_joint_decode = (
-            self.native_latent_moe is not None
-            and bool(
-                getattr(
-                    self.shared_experts,
-                    "_has_unquantized_shared_weights",
-                    False,
-                )
-            )
-            and latent_moe_decode_pipeline_available(
-                self.gate.weight,
-                self.routed_expert_down_proj.weight,
-                self.shared_experts.gate_up_proj.weight,
-                self.shared_experts.down_proj.weight,
-                self.experts.w13_weight,
-                self.experts.w13_weight_scale,
-                self.experts.w2_weight,
-                self.experts.w2_weight_scale,
-                self.experts.plan,
-                topk=self.top_k,
-                joint_reduce=self.execution_plan.joint_moe_reduce,
-            )
+        # Dry-run exact registry selection for the optional joint decode path.
+        self._use_joint_decode = latent_moe_decode_pipeline_available(
+            self.gate.weight,
+            self.routed_expert_down_proj.weight,
+            self.shared_experts.gate_up_proj.weight,
+            self.shared_experts.down_proj.weight,
+            self.experts.w13_weight,
+            self.experts.w13_weight_scale,
+            self.experts.w2_weight,
+            self.experts.w2_weight_scale,
+            self.experts.plan,
+            topk=self.top_k,
+            joint_reduce=self.execution_plan.joint_moe_reduce,
         )
 
     def pack_input_projection_weights(self) -> None:
@@ -1133,12 +1120,8 @@ class KimiLinearMoE(nn.Module):
         same width, so one ``[experts + latent + 2 * shared, hidden]`` weight
         lets a single GEMM replace three. Each module keeps a contiguous row
         view of that tensor, so the rebinding adds no steady-state memory and
-        leaves every unfused composition working unchanged.
+        leaves the separate composition working unchanged.
         """
-        if not bool(
-            getattr(self.shared_experts, "_has_unquantized_shared_weights", False)
-        ):
-            return
         modules = (
             self.gate,
             self.routed_expert_down_proj,
