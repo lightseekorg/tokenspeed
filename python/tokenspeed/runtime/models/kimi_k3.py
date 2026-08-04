@@ -1099,18 +1099,20 @@ class KimiLinearMoE(nn.Module):
             else None
         )
         # Dry-run exact registry selection for the optional joint decode path.
-        self._use_joint_decode = latent_moe_decode_pipeline_available(
-            self.gate.weight,
-            self.routed_expert_down_proj.weight,
-            self.shared_experts.gate_up_proj.weight,
-            self.shared_experts.down_proj.weight,
-            self.experts.w13_weight,
-            self.experts.w13_weight_scale,
-            self.experts.w2_weight,
-            self.experts.w2_weight_scale,
-            self.experts.plan,
-            topk=self.top_k,
-            joint_reduce=self.execution_plan.joint_moe_reduce,
+        self._use_joint_decode = (
+            self.execution_plan.joint_moe_reduce
+            and latent_moe_decode_pipeline_available(
+                self.gate.weight,
+                self.routed_expert_down_proj.weight,
+                self.shared_experts.gate_up_proj.weight,
+                self.shared_experts.down_proj.weight,
+                self.experts.w13_weight,
+                self.experts.w13_weight_scale,
+                self.experts.w2_weight,
+                self.experts.w2_weight_scale,
+                self.experts.plan,
+                topk=self.top_k,
+            )
         )
 
     def pack_input_projection_weights(self) -> None:

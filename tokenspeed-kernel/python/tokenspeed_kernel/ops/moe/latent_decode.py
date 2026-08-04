@@ -79,7 +79,6 @@ def latent_moe_decode_pipeline_available(
     expert_plan: Mapping[str, Any],
     *,
     topk: int,
-    joint_reduce: bool,
 ) -> bool:
     """Return whether joint routed/shared one-token decode is available.
 
@@ -94,8 +93,7 @@ def latent_moe_decode_pipeline_available(
     )
     expert_tensors = (w13_weight, w13_scale, w2_weight, w2_scale)
     if not (
-        joint_reduce
-        and expert_plan.get("apply_kernel_name")
+        expert_plan.get("apply_kernel_name")
         == "gluon_mxfp4_a16w4_situ_ep_precomputed_moe_apply"
         and router_weight.dtype
         == routed_weight.dtype
