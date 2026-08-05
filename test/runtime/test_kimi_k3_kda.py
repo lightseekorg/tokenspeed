@@ -84,8 +84,11 @@ def _backend_config(device: str, *, spec_tokens: int = 1) -> SimpleNamespace:
 
 
 def _backend(device: str, *, contract_pool, spec_tokens: int = 1) -> MambaAttnBackend:
+    kda_backend = "auto" if current_platform().is_amd else "fla"
     backend = MambaAttnBackend(
-        _backend_config(device, spec_tokens=spec_tokens), is_kda=True
+        _backend_config(device, spec_tokens=spec_tokens),
+        is_kda=True,
+        kda_backend=kda_backend,
     )
     backend.set_kv_pool(contract_pool)
     return backend
@@ -515,9 +518,9 @@ class _KDAHarness:
         )
         return (
             naive_out.flatten(0, 1),
-            naive_state.transpose(-1, -2),
+            naive_state,
             fla_out[0].flatten(0, 1),
-            fla_state[0].float().transpose(-1, -2),
+            fla_state[0].float(),
         )
 
 

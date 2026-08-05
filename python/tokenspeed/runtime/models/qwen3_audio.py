@@ -51,7 +51,7 @@ from tokenspeed.runtime.layers.linear import (
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
-from tokenspeed.runtime.multimodal.inputs import MultimodalDataItem
+from tokenspeed.runtime.multimodal.inputs import Modality, MultimodalDataItem
 from tokenspeed.runtime.utils import add_prefix
 
 
@@ -393,6 +393,20 @@ class Qwen3AudioEncoder(nn.Module):
     @property
     def device(self) -> torch.device:
         return self.conv2d1.weight.device
+
+    def make_warmup_items(self) -> list[MultimodalDataItem]:
+        """Build one configured inference-window of synthetic log-Mel input."""
+        num_frames = max(2 * self.n_window, self.n_window_infer)
+        return [
+            MultimodalDataItem(
+                modality=Modality.AUDIO,
+                feature=torch.zeros(
+                    self.num_mel_bins,
+                    num_frames,
+                    dtype=self.dtype,
+                ),
+            )
+        ]
 
     def encode(self, items: Sequence[MultimodalDataItem]) -> torch.Tensor:
         input_features, feature_lengths = pack_qwen3_audio_features(

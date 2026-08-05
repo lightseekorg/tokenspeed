@@ -360,15 +360,18 @@ def _create_attn_backend_with_name(
 
 
 def _resolve_kda_backend(kda_backend: str) -> str:
-    """Resolve the KDA prefill backend policy to a concrete choice.
+    """Resolve the KDA prefill backend policy.
 
-    ``auto`` picks the fastest available kernel — ``cutedsl_kda`` (the tokenspeed-cutedsl-kda AOT build
-    matching this device), then ``flashkda`` (optional source-built package),
-    falling back to the portable FLA scan. ``fla`` forces the portable scan.
-    Explicit choices are validated against availability and fail fast with an
-    install hint instead of silently mis-routing. Decode is unaffected either
-    way.
+    On AMD, the backend policy is ignored and compatible kernels are selected
+    using registry priority. On NVIDIA, ``auto`` picks the fastest available
+    kernel — ``cutedsl_kda``, then ``flashkda``, falling back to the portable
+    FLA scan. Explicit NVIDIA choices are validated against availability and
+    fail fast with an install hint. Decode is unaffected.
     """
+    if current_platform().is_amd:
+        # Named backend policies are NVIDIA-specific; let the registry decide.
+        return "auto"
+
     from tokenspeed_kernel.ops.attention.cutedsl_kda import is_cutedsl_kda_installed
     from tokenspeed_kernel.ops.attention.flash_kda import is_flash_kda_installed
 

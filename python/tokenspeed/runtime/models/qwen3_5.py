@@ -1296,8 +1296,8 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             )
             self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
             self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
-            # Encoder callables may be swapped to cudagraph wrappers by
-            # ModelExecutor.
+            # Encoder callables may be swapped to cudagraph wrappers during
+            # runtime startup.
             self.vision_embedder = VisionEmbedder(encoder_mapping=mapping.vision)
             self.image_encoder = self.get_image_feature
             self.video_encoder = self.get_video_feature
@@ -1331,6 +1331,22 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         metadata = self.visual.prepare_metadata(grid)
         encoded = self.visual.forward_blocks(tokens, metadata)
         return self.post_encode([encoded], grid)
+
+    def get_multimodal_encoder_specs(self) -> dict[Modality, EncoderSpec]:
+        if self.visual is None:
+            return {}
+        return {
+            Modality.IMAGE: EncoderSpec(
+                self.image_encoder,
+                deepstack=True,
+                make_warmup_items=self.visual.make_image_warmup_items,
+            ),
+            Modality.VIDEO: EncoderSpec(
+                self.video_encoder,
+                deepstack=True,
+                make_warmup_items=self.visual.make_video_warmup_items,
+            ),
+        }
 
     def pre_encode(
         self,
@@ -1484,10 +1500,7 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             input_ids=input_ids,
             text_embedding=self.model.get_input_embeddings(),
             ctx=multimodal_context,
-            encoders={
-                Modality.IMAGE: EncoderSpec(self.image_encoder, deepstack=True),
-                Modality.VIDEO: EncoderSpec(self.video_encoder, deepstack=True),
-            },
+            encoders=self.get_multimodal_encoder_specs(),
             multimodal_model=self,
         )
         hidden_states, aux_hidden_states = self.model(
