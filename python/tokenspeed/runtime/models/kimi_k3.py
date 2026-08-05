@@ -1231,13 +1231,15 @@ class KimiLinearMoE(nn.Module):
                 routed_out = self.routed_expert_up_proj(routed_out)[0]
         if use_tail:
             # Both partials stay pre-reduce; the tail owns all communication.
-            tail_out = self._latent_tail(
+            # The lamport gather fuses the residual accumulate (identical
+            # rounding to the eager add), removing one elementwise launch.
+            return self._latent_tail(
                 routed_out,
                 shared_partial,
                 self.routed_expert_norm.weight,
                 self.routed_expert_up_proj.weight,
+                prefix=prefix_sum,
             )
-            return prefix_sum + tail_out
         if self.execution_plan.fused_moe_ar:
             # Post-join: one [T, latent+hidden] all-reduce covers both
             # partials, element-wise identical to the two separate reduces.

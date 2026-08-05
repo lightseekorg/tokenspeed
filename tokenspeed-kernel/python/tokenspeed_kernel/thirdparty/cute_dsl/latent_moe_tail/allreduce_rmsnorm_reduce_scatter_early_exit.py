@@ -316,10 +316,15 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
             )
 
             cute.arch.cluster_arrive()
-            if cluster_rank == 0 and tidx < 32:
-                cute.arch.cluster_wait()
-                if tidx == 0:
-                    red_async_release_gpu_add_u32(latent_flags.iterator + 8, Uint32(1))
+            # All CTAs must complete the cluster handshake before the later
+            # st.shared::cluster exchange: a partial (single-CTA) wait leaves
+            # the barrier phases skewed across CTAs, so the pre-DSM wait can
+            # match a stale phase and lose the peer-entered guarantee. Only
+            # manifests under perturbed SM scheduling (eager prefill bursts,
+            # heavy co-residency); see the campaign ledger's DSM race notes.
+            cute.arch.cluster_wait()
+            if cluster_rank == 0 and tidx == 0:
+                red_async_release_gpu_add_u32(latent_flags.iterator + 8, Uint32(1))
 
             global_tid = (
                 Int64(token) * self.cluster_ctas + Int64(cta_y)
@@ -521,12 +526,18 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
                 volatile=False,
             )
 
-            # One arrival per shared destination group and token.
+            # One arrival per shared destination group and token. The wait is
+            # unconditional: every barrier use in the per-token loop must be
+            # arrive/wait-symmetric on every CTA, or the phase counters skew
+            # across iterations and the NEXT iteration's pre-DSM wait can
+            # match a stale phase (losing the peer-entered guarantee for the
+            # st.shared::cluster exchange). Fires only at m >= 2 — i.e. the
+            # bs>=2 decode graphs right after a prefill admits a second
+            # sequence — under perturbed SM scheduling.
             cute.arch.cluster_arrive()
-            if cluster_rank == 0 and tidx < 32:
-                cute.arch.cluster_wait()
-                if tidx == 0:
-                    red_async_release_gpu_add_u32(shared_flags.iterator + 8, Uint32(1))
+            cute.arch.cluster_wait()
+            if cluster_rank == 0 and tidx == 0:
+                red_async_release_gpu_add_u32(shared_flags.iterator + 8, Uint32(1))
 
             global_tid = (
                 Int64(token) * self.tp_size + Int64(destination)

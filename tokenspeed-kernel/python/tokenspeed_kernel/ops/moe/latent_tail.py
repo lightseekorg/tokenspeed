@@ -171,6 +171,7 @@ class KimiK3LatentTailOp:
         shared_partial: torch.Tensor,
         rms_weight: torch.Tensor,
         up_weight: torch.Tensor,
+        prefix: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Fused tail for one decode step.
 
@@ -181,10 +182,13 @@ class KimiK3LatentTailOp:
             rms_weight: Latent RMSNorm weight ``[3584]``.
             up_weight: Replicated up-projection weight ``[7168, 3584]``; this
                 rank's ``hidden/tp`` row shard is consumed.
+            prefix: Optional residual stream ``[M, 7168]``; when given the
+                lamport gather fuses ``+ prefix`` (same rounding as an eager
+                add) and the caller's accumulate disappears.
 
         Returns:
-            ``[M, 7168]`` post-communication hidden (up-projection + shared);
-            the caller still owns the residual accumulate.
+            ``[M, 7168]`` post-communication hidden (up-projection + shared,
+            plus ``prefix`` when provided).
         """
         m = routed_partial.shape[0]
         self._up_projection.ensure_compiled(m)
@@ -196,7 +200,7 @@ class KimiK3LatentTailOp:
         local_hidden = self.contract.hidden_size // self.contract.tp_size
         local_up_weight = up_weight.narrow(0, self.rank * local_hidden, local_hidden)
         mailbox = self._up_projection(latent, local_up_weight, shared_shard)
-        return self._lamport_copy(mailbox, m=m).squeeze(0)
+        return self._lamport_copy(mailbox, m=m, residual=prefix).squeeze(0)
 
 
 __all__ = ["KimiK3LatentTailOp", "latent_tail_supported"]

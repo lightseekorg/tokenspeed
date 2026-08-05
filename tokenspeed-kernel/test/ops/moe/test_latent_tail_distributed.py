@@ -140,3 +140,31 @@ def test_latent_tail_graph_replay():
         scale = ref.float().abs().max().item()
         err = (out.float() - ref.float()).abs().max().item()
         assert err < 0.05 * max(scale, 1.0), f"seed={seed}: err {err}"
+
+
+@pytest.mark.parametrize("m", [1, 4, 16])
+def test_latent_tail_fused_prefix_matches_eager(m):
+    from tokenspeed_kernel.ops.moe.latent_tail import (
+        KimiK3LatentTailOp,
+        latent_tail_supported,
+    )
+
+    rank, dev = _setup()
+    if not latent_tail_supported(
+        tp_size=_world_size(), hidden_size=H, latent_size=L, dtype=torch.bfloat16
+    ):
+        pytest.skip("platform does not support the multicast tail")
+    op = KimiK3LatentTailOp.initialize(
+        group=dist.group.WORLD,
+        hidden_size=H,
+        latent_size=L,
+        rms_eps=EPS,
+        device=dev,
+    )
+    routed, shared, rms_w, up_w = _inputs(rank, dev, m, seed=700)
+    torch.manual_seed(900 + rank)
+    prefix = (torch.randn(m, H, dtype=torch.bfloat16, device=dev) * 0.1).contiguous()
+    eager = op(routed, shared, rms_w, up_w) + prefix
+    fused = op(routed, shared, rms_w, up_w, prefix=prefix)
+    torch.cuda.synchronize()
+    assert torch.equal(eager, fused), "fused prefix add must be bit-identical"
