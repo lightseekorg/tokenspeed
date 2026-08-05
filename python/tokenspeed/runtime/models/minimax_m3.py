@@ -30,7 +30,7 @@ from tokenspeed_kernel.ops.activation.triton import swiglu_oai
 from tokenspeed_kernel.ops.gemm.fp16.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
 from tokenspeed_kernel.ops.model.minimax_m3.cuda import fused_qknorm_rope_kv_insert
-from tokenspeed_kernel.ops.moe.finalize.cuda import moe_finalize_fuse_shared
+from tokenspeed_kernel.ops.other.moe_finalize.cuda import moe_finalize_fuse_shared
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 from transformers import MiniMaxM3VLTextConfig

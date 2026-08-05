@@ -348,7 +348,7 @@ KERNEL_GROUPS = [
         [
             CUDA_CSRC_DIR / "routing_flash.cu",
         ],
-        "tokenspeed_kernel.ops.moe.routing.cuda",
+        "tokenspeed_kernel.ops.other.moe_routing.cuda",
         [],
         [],
     ),
@@ -425,7 +425,7 @@ KERNEL_GROUPS = [
         [
             CUDA_CSRC_DIR / "moe_finalize_fuse_shared.cu",
         ],
-        "tokenspeed_kernel.ops.moe.finalize.cuda",
+        "tokenspeed_kernel.ops.other.moe_finalize.cuda",
         [],
         [],
     ),

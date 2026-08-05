@@ -152,7 +152,9 @@ def triton_minimax_sigmoid_bias_topk(
     (40us vs 13us at [1, 896] topk=16). ``hidden_states`` is only shape-
     validated by the kernel wrapper, so the logits stand in for it.
     """
-    from tokenspeed_kernel.ops.moe.routing.triton import minimax_biased_grouped_topk
+    from tokenspeed_kernel.ops.other.moe_routing.triton import (
+        minimax_biased_grouped_topk,
+    )
 
     topk_weights, topk_ids = minimax_biased_grouped_topk(
         router_logits,
@@ -200,6 +202,6 @@ def torch_sigmoid_bias_topk(
     return topk_weights.float(), topk_ids.to(torch.int32)
 
 
-import tokenspeed_kernel.ops.moe.sigmoid_topk.gluon  # noqa: E402,F401
+import tokenspeed_kernel.ops.other.moe_sigmoid_topk.gluon  # noqa: E402,F401
 
 __all__ = ["moe_sigmoid_bias_topk"]

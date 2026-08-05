@@ -17,11 +17,13 @@ if not _is_gfx950():
     pytest.skip("gfx950 is required for Kimi routing tests", allow_module_level=True)
 
 
-from tokenspeed_kernel.ops.moe.routing.triton import (  # noqa: E402
+from tokenspeed_kernel.ops.other.moe_routing.triton import (  # noqa: E402
     minimax_biased_grouped_topk,
 )
-from tokenspeed_kernel.ops.moe.sigmoid_topk import gluon as routing_module  # noqa: E402
-from tokenspeed_kernel.ops.moe.sigmoid_topk import (  # noqa: E402
+from tokenspeed_kernel.ops.other.moe_sigmoid_topk import (  # noqa: E402
+    gluon as routing_module,
+)
+from tokenspeed_kernel.ops.other.moe_sigmoid_topk import (  # noqa: E402
     triton as packed_topk_module,
 )
 

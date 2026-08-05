@@ -65,7 +65,7 @@ from tokenspeed_kernel.ops.moe import (
     moe_plan,
     moe_process_weights,
 )
-from tokenspeed_kernel.ops.moe.sigmoid_topk.triton import moe_sigmoid_bias_topk
+from tokenspeed_kernel.ops.other.moe_sigmoid_topk.triton import moe_sigmoid_bias_topk
 from tokenspeed_kernel.ops.quantization import (
     quantize_fp8,
     quantize_fp8_with_scale,

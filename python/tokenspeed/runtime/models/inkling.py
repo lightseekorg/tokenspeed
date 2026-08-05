@@ -89,7 +89,7 @@ from tokenspeed_kernel.ops.conv import (
 )
 from tokenspeed_kernel.ops.gemm.fp16.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
-from tokenspeed_kernel.ops.moe.finalize.cuda import moe_finalize_fuse_shared
+from tokenspeed_kernel.ops.other.moe_finalize.cuda import moe_finalize_fuse_shared
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 

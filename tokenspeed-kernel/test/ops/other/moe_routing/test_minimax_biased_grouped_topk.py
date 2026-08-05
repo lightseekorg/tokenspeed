@@ -7,7 +7,7 @@ config both models use.
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.moe.routing.triton import (
+from tokenspeed_kernel.ops.other.moe_routing.triton import (
     _biased_grouped_topk_reference,
     minimax_biased_grouped_topk,
 )
@@ -150,7 +150,7 @@ def test_k3_shape_takes_fused_path():
     """896 experts / topk 16 must not silently fall back to the reference."""
     from unittest import mock
 
-    import tokenspeed_kernel.ops.moe.routing.triton as tt
+    import tokenspeed_kernel.ops.other.moe_routing.triton as tt
 
     with mock.patch.object(
         tt, "_biased_grouped_topk_reference", side_effect=AssertionError("fell back")

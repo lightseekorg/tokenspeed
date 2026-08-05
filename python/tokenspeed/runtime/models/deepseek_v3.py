@@ -42,7 +42,7 @@ from tokenspeed_kernel.ops.gemm.nvfp4.cute_dsl import (
     nvfp4_gemm_swiglu_nvfp4_quant,
 )
 from tokenspeed_kernel.ops.model.deepseek_v3.trtllm import dsv3_fused_a_gemm
-from tokenspeed_kernel.ops.moe.finalize.cuda import moe_finalize_fuse_shared
+from tokenspeed_kernel.ops.other.moe_finalize.cuda import moe_finalize_fuse_shared
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
 from tokenspeed_kernel.platform import current_platform

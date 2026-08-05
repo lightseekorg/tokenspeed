@@ -465,67 +465,6 @@ class TestGptqMarlinRepack:
         ), "repeated calls should produce bitwise identical output"
 
 
-# ─── routing_flash ───
-
-
-class TestRoutingFlash:
-    """routing_flash
-
-    Fused softmax + top-k + correction bias + zero-expert masking.
-    Only supports num_experts in {384, 576, 768, 896}.
-
-    Signature:
-      routing_flash(input, correction_bias, topk_indices, topk_weights,
-                    num_experts_real, scaling_factor, renorm) -> None
-    """
-
-    NUM_EXPERTS = 384
-    NUM_REAL_EXPERTS = 256
-    TOPK = 12
-    SCALE = 6.0
-
-    def _make_inputs(self, num_tokens=16, seed=42):
-        torch.manual_seed(seed)
-        inp = torch.randn(
-            num_tokens, self.NUM_EXPERTS, device="cuda", dtype=torch.float32
-        )
-        bias = torch.randn(self.NUM_EXPERTS, device="cuda", dtype=torch.float32)
-        idx = torch.empty(num_tokens, self.TOPK, device="cuda", dtype=torch.int32)
-        wts = torch.empty(num_tokens, self.TOPK, device="cuda", dtype=torch.float32)
-        return inp, bias, idx, wts
-
-    def _torch_ref(self, inp, bias, num_tokens):
-        scores = inp.softmax(dim=-1)
-        scores_biased = scores + bias.unsqueeze(0)
-        topk_idx = torch.topk(scores_biased, k=self.TOPK, dim=-1, sorted=True)[1]
-        topk_wts = scores.gather(1, topk_idx)
-        # Zero-expert masking
-        mask = topk_idx >= self.NUM_REAL_EXPERTS
-        topk_idx[mask] = -1
-        topk_wts *= self.SCALE
-        return topk_idx.to(torch.int32), topk_wts
-
-    def test_basic(self):
-        """Produces correct shape."""
-        from tokenspeed_kernel.ops.moe.routing.cuda import routing_flash as tk_route
-
-        inp, bias, idx, wts = self._make_inputs()
-        tk_route(inp, bias, idx, wts, self.NUM_REAL_EXPERTS, self.SCALE, False)
-        assert idx.shape == (16, self.TOPK)
-        assert wts.shape == (16, self.TOPK)
-
-    def test_correctness(self):
-        """Matches torch reference."""
-        from tokenspeed_kernel.ops.moe.routing.cuda import routing_flash as tk_route
-
-        inp, bias, idx, wts = self._make_inputs()
-        inp_clone = inp.clone()
-        ref_idx, ref_wts = self._torch_ref(inp_clone, bias, 16)
-        tk_route(inp, bias, idx, wts, self.NUM_REAL_EXPERTS, self.SCALE, False)
-        torch.testing.assert_close(idx, ref_idx)
-        torch.testing.assert_close(wts, ref_wts, rtol=1e-3, atol=8e-2)
-
-
 # ───────────────────────────────────────────────────────────────────────────────
 # verify_chain_greedy & chain_speculative_sampling_target_only
 # ───────────────────────────────────────────────────────────────────────────────

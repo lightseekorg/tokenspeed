@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.moe.finalize.cuda import moe_finalize_fuse_shared
+from tokenspeed_kernel.ops.other.moe_finalize.cuda import moe_finalize_fuse_shared
 from tokenspeed_kernel.platform import ArchVersion, current_platform
 
 pytestmark = pytest.mark.skipif(

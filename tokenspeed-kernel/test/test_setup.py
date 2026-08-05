@@ -244,9 +244,10 @@ def test_solution_siblings_use_consistent_packages() -> None:
         "model/deepseek_v4": {"cuda", "deep_gemm", "triton"},
         "model/kimi_k3/attn_res": {"cuda", "gluon", "torch", "triton"},
         "moe/fp8": {"deep_gemm", "flashinfer_cutlass", "flashinfer_trtllm", "triton"},
-        "moe/routing": {"cuda", "triton"},
         "other/native": {"deep_ep", "deep_gemm", "trtllm"},
         "other/merge_state": {"cuda", "triton"},
+        "other/moe_finalize": {"cuda"},
+        "other/moe_routing": {"cuda", "triton"},
         "quantization": {"cuda", "flashinfer", "triton", "trtllm"},
     }
 
@@ -261,6 +262,26 @@ def test_solution_siblings_use_consistent_packages() -> None:
         assert not (attention_ops / old_bundle).exists()
 
 
+def test_moe_family_contains_only_weight_datatypes() -> None:
+    moe_ops = SETUP_PY.parent / "tokenspeed_kernel" / "ops" / "moe"
+    old_non_weight_dirs = {
+        "finalize",
+        "grouped_routing",
+        "routing",
+        "sigmoid_topk",
+        "unfused",
+    }
+    entries = {
+        path.relative_to(moe_ops).parts[0]
+        for path in moe_ops.rglob("*")
+        if path.is_file()
+        and "__pycache__" not in path.parts
+        and path != moe_ops / "__init__.py"
+    }
+    assert entries.isdisjoint(old_non_weight_dirs)
+    assert entries == {"fp16", "fp8", "int4", "mxfp4", "nvfp4"}
+
+
 def test_operator_tests_are_grouped_by_family() -> None:
     assert not list(OPS_TEST_DIR.glob("test_*.py"))
 
@@ -270,10 +291,10 @@ def test_family_initializers_do_not_reexport_solutions() -> None:
 
     for relative_path in (
         "activation/__init__.py",
-        "moe/grouped_routing/__init__.py",
-        "moe/sigmoid_topk/__init__.py",
-        "moe/unfused/__init__.py",
         "other/metadata/__init__.py",
+        "other/moe_grouped_routing/__init__.py",
+        "other/moe_sigmoid_topk/__init__.py",
+        "other/moe_unfused/__init__.py",
     ):
         assert not (ops / relative_path).read_text(encoding="utf-8")
 
@@ -306,7 +327,7 @@ def test_cuda_kernel_groups_and_output_packages(monkeypatch) -> None:
         "minimax_m3_fused": "tokenspeed_kernel.ops.model.minimax_m3.cuda",
         "dsv3_gemm": "tokenspeed_kernel.ops.gemm.fp16.cuda",
         "marlin": "tokenspeed_kernel.ops.quantization.cuda",
-        "routing": "tokenspeed_kernel.ops.moe.routing.cuda",
+        "routing": "tokenspeed_kernel.ops.other.moe_routing.cuda",
         "sampling_chain": "tokenspeed_kernel.ops.sampling.cuda",
         "fused_topk_topp": "tokenspeed_kernel.ops.sampling.cuda",
         "rmsnorm_fused_parallel": "tokenspeed_kernel.ops.layernorm.cuda",
@@ -314,7 +335,7 @@ def test_cuda_kernel_groups_and_output_packages(monkeypatch) -> None:
         "flashinfer_softmax": "tokenspeed_kernel.ops.sampling.flashinfer",
         "silu_fuse_block_quant": "tokenspeed_kernel.ops.activation.cuda",
         "silu_fuse_nvfp4_quant": "tokenspeed_kernel.ops.activation.cuda",
-        "moe_finalize_fuse_shared": "tokenspeed_kernel.ops.moe.finalize.cuda",
+        "moe_finalize_fuse_shared": "tokenspeed_kernel.ops.other.moe_finalize.cuda",
         "kvcacheio": "tokenspeed_kernel.ops.kvcache.cuda",
         "lm_head_gemm": "tokenspeed_kernel.ops.gemm.fp16.cuda",
         "trtllm_comm": "tokenspeed_kernel.ops.communication.trtllm",

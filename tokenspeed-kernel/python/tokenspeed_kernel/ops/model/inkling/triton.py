@@ -21,10 +21,11 @@
 """Fused Inkling MoE gate: sigmoid+bias top-k with shared-expert-sink weights.
 
 One program per token, modeled on the MiniMax biased grouped top-k kernel in
-``ops/moe/routing/triton/__init__.py``. Selection is ``sigmoid(routed logits) + bias``
-with the reference's deterministic lowest-index tie-breaking; weights are the
-raw-logit sigmoids of the selected routed experts jointly normalized with the
-shared-expert sigmoids (the "sink"), scaled by ``route_scale * global_scale``.
+``ops/other/moe_routing/triton/__init__.py``. Selection is
+``sigmoid(routed logits) + bias`` with the reference's deterministic lowest-index
+tie-breaking; weights are the raw-logit sigmoids of the selected routed experts
+jointly normalized with the shared-expert sigmoids (the "sink"), scaled by
+``route_scale * global_scale``.
 
 Numerics: the normalization is computed in linear space,
 ``sigmoid(z) / sum(sigmoid(z))``, which is identical to the reference's

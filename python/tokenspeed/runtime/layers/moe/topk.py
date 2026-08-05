@@ -26,9 +26,11 @@ from typing import Any, Literal, NamedTuple, Protocol, runtime_checkable
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.model.inkling.triton import inkling_topk
-from tokenspeed_kernel.ops.moe.routing.cuda import routing_flash as cuda_routing_flash
-from tokenspeed_kernel.ops.moe.routing.triton import minimax_biased_grouped_topk
-from tokenspeed_kernel.ops.moe.sigmoid_topk.triton import moe_sigmoid_bias_topk
+from tokenspeed_kernel.ops.other.moe_routing.cuda import (
+    routing_flash as cuda_routing_flash,
+)
+from tokenspeed_kernel.ops.other.moe_routing.triton import minimax_biased_grouped_topk
+from tokenspeed_kernel.ops.other.moe_sigmoid_topk.triton import moe_sigmoid_bias_topk
 
 from tokenspeed.runtime.moe.distribution_recorder import (
     get_global_expert_distribution_recorder,

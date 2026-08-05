@@ -33,7 +33,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import torch
-from tokenspeed_kernel.ops.moe.grouped_routing.torch import moe_grouped_routing
+from tokenspeed_kernel.ops.other.moe_grouped_routing.torch import moe_grouped_routing
 
 
 def moe_unfused_apply(
