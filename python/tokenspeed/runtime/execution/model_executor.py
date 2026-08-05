@@ -35,9 +35,6 @@ from tokenspeed_kernel.ops.tuning import (
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import AttentionArch, ModelConfig
-from tokenspeed.runtime.configs.paged_cache_spec import (
-    validate_scheduler_config,
-)
 from tokenspeed.runtime.configs.utils import get_rope_parameters
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -66,6 +63,9 @@ from tokenspeed.runtime.grammar.capturable_grammar import (
 )
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
     CacheBatchMetadata,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    validate_scheduler_config,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.layers.paged_attention import (
@@ -319,7 +319,7 @@ class ModelExecutor:
         # contract; the per-group tables travel as CacheBatchMetadata. Fail fast
         # here rather than at the first forward: a missing contract means the
         # model family has no cache recipe yet (add one in
-        # kv_cache.setup.prepare_cache_setup, see the 'mha' / 'msa' recipes for
+        # kv_cache.recipes.setup.prepare_cache_setup, see the 'mha' / 'msa' recipes for
         # the pattern).
         self._cache_runtime_contract = getattr(
             token_to_kv_pool, "runtime_contract", None
@@ -328,7 +328,7 @@ class ModelExecutor:
             raise RuntimeError(
                 f"KV pool {type(token_to_kv_pool).__name__} publishes no "
                 "PagedCacheRuntimeContract. Every pool must be built from a "
-                "cache recipe (kv_cache.setup.prepare_cache_setup)."
+                "cache recipe (kv_cache.recipes.setup.prepare_cache_setup)."
             )
         # The batch-ordered full-history table backs out_cache_loc and the
         # draft page table. First contract group with family=history and

@@ -48,6 +48,19 @@ deep_gemm = pytest.importorskip(
 _BLOCK = 128
 
 
+@pytest.fixture(params=[False, True], ids=["pdl_off", "pdl_on"])
+def enable_pdl(request):
+    """Run the full DG1 -> activation -> DG2 chain in both launch modes."""
+    if request.param and torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("PDL requires SM90+")
+    previous = deep_gemm.get_pdl()
+    deep_gemm.set_pdl(request.param)
+    try:
+        yield request.param
+    finally:
+        deep_gemm.set_pdl(previous)
+
+
 def _quantize_blockwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-row 1x128 block FP8 quantize with UE8M0 scales."""
     rows, cols = x.shape
@@ -129,7 +142,7 @@ def test_fused_silu_block_quant_fills_mn_major_scales():
     )
 
 
-def test_normal_mode_expert_compute_matches_dequantized_reference():
+def test_normal_mode_expert_compute_matches_dequantized_reference(enable_pdl):
     torch.manual_seed(0)
     num_recv, hidden, ispp, top_k, num_local_experts = 96, 512, 256, 4, 4
     device = "cuda"
@@ -175,7 +188,7 @@ def test_normal_mode_expert_compute_matches_dequantized_reference():
         recipe=(1, 1, _BLOCK),
     )
 
-    down_in, down_scales = fused_swiglu_fp8_ue8m0(gateup)
+    down_in, down_scales = fused_swiglu_fp8_ue8m0(gateup, enable_pdl=enable_pdl)
 
     expert_out = torch.empty((total_rows, hidden), dtype=torch.bfloat16, device=device)
     deep_gemm.m_grouped_fp8_gemm_nt_contiguous(

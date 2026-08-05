@@ -42,12 +42,14 @@ from tokenspeed.runtime.configs.minimax_m3_config import (
     MiniMaxM3Config,
     MiniMaxM3VisionConfig,
 )
-from tokenspeed.runtime.configs.paged_cache_spec import FULL_ATTENTION
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.utils import divide
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    FULL_ATTENTION,
+)
 from tokenspeed.runtime.layers.attention.mm_encoder_attention import VisionAttention
 from tokenspeed.runtime.layers.conv import Conv3dLayer
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm

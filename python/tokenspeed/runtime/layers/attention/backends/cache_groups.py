@@ -45,7 +45,9 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     unpack_group_tables,
 )
 
-from tokenspeed.runtime.configs.cache_runtime import cache_debug_enabled
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+    cache_debug_enabled,
+)
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.common import ceil_div
 

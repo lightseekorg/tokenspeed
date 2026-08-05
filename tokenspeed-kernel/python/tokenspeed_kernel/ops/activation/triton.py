@@ -24,9 +24,6 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
-from tokenspeed_kernel.ops.gemm.fp8_utils import (
-    create_per_token_group_quant_fp8_output_scale,
-)
 
 __all__ = [
     "add3",
@@ -512,6 +509,7 @@ def _fused_swiglu_fp8_ue8m0_kernel(
     bit8_max,
     GROUP_SIZE: tl.constexpr,
     PACK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     # Each program covers PACK=4 adjacent scale groups of one row: the four
     # UE8M0 exponents that share one packed int32 are produced together, so
@@ -527,6 +525,11 @@ def _fused_swiglu_fp8_ue8m0_kernel(
     col0 = pack_col * BLOCK
     cols = col0 + tl.arange(0, BLOCK)
     col_mask = cols < N
+
+    if ENABLE_PDL:
+        # ``gate_up`` is produced by the first DeepGEMM. Do not read it until
+        # that PDL producer has made its stores visible.
+        tl.extra.cuda.gdc_wait()
 
     gate_base = row.to(tl.int64) * gate_up_stride_row
     gate = tl.load(gate_up_ptr + gate_base + cols, mask=col_mask, other=0.0).to(
@@ -561,12 +564,18 @@ def _fused_swiglu_fp8_ue8m0_kernel(
     scale_ptr_offset = pack_col.to(tl.int64) * scale_col_stride + row.to(tl.int64)
     tl.store(scale_ptr + scale_ptr_offset, packed_scale)
 
+    if ENABLE_PDL:
+        # Both activation values and packed scales are ready for DeepGEMM 2.
+        tl.extra.cuda.gdc_launch_dependents()
+
 
 def fused_swiglu_fp8_ue8m0(
     gate_up: torch.Tensor,
     swiglu_limit: float = 0.0,
     swiglu_alpha: float = 1.0,
     swiglu_beta: float = 0.0,
+    *,
+    enable_pdl: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused SwiGLU activation + FP8 UE8M0 block-scale quantization.
 
@@ -579,6 +588,9 @@ def fused_swiglu_fp8_ue8m0(
         swiglu_limit: Clamp bound. 0 or negative disables clamping.
         swiglu_alpha: Sigmoid multiplier applied to the gate.
         swiglu_beta: Value added to the up projection before multiplication.
+        enable_pdl: Join an SM90+ Programmatic Dependent Launch chain. The
+            kernel waits for the preceding producer before reading ``gate_up``
+            and releases the following dependent after writing both outputs.
 
     Returns:
         ``(fp8_out, scale)``: ``fp8_out`` is ``[M, N]`` float8_e4m3fn,
@@ -595,18 +607,21 @@ def fused_swiglu_fp8_ue8m0(
     info = torch.finfo(dtype)
 
     out = torch.empty((M, N), device=gate_up.device, dtype=dtype)
-    scale = create_per_token_group_quant_fp8_output_scale(
-        x_shape=(M, N),
-        device=gate_up.device,
-        group_size=GROUP_SIZE,
-        column_major_scales=True,
-        scale_tma_aligned=True,
-        scale_ue8m0=True,
+    # Every packed word, including tail bytes, is overwritten by the fused
+    # kernel. Allocate directly so a zero-fill kernel does not break the
+    # DeepGEMM 1 -> SwiGLU PDL chain.
+    groups_per_row = N // GROUP_SIZE
+    aligned_m = (M + 3) // 4 * 4
+    packed_groups = (groups_per_row + 3) // 4
+    scale_base = torch.empty(
+        (packed_groups, aligned_m), device=gate_up.device, dtype=torch.int32
     )
+    scale = scale_base.transpose(0, 1)[:M, :]
 
     PACK = 4
-    packs_per_row = (N // GROUP_SIZE + PACK - 1) // PACK
+    packs_per_row = (groups_per_row + PACK - 1) // PACK
     num_programs = M * packs_per_row
+    pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _fused_swiglu_fp8_ue8m0_kernel[(num_programs,)](
         gate_up,
         out,
@@ -624,8 +639,10 @@ def fused_swiglu_fp8_ue8m0(
         bit8_max=info.max,
         GROUP_SIZE=GROUP_SIZE,
         PACK=PACK,
+        ENABLE_PDL=enable_pdl,
         num_warps=2,
         num_stages=1,
+        **pdl_kwargs,
     )
 
     return out, scale
@@ -718,12 +735,20 @@ def _fused_swiglu_fp8_ue8m0_masked_packed_kernel(
     PACK: tl.constexpr,
     ROW_SPLITS: tl.constexpr,
     USE_ROW_LOOP: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     """Masked SwiGLU quantization writing DeepGEMM's packed scale layout."""
     pid = tl.program_id(0)
     expert = tl.program_id(1)
     groups_per_row: tl.constexpr = N // GROUP_SIZE
     packs_per_row: tl.constexpr = (groups_per_row + PACK - 1) // PACK
+
+    if ENABLE_PDL:
+        # The first masked DeepGEMM owns ``gate_up``. The row-count tensor is
+        # already available, but waiting here keeps every source load behind
+        # the producer's completion point.
+        tl.extra.cuda.gdc_wait()
+
     valid_rows = tl.load(masked_m_ptr + expert)
 
     if USE_ROW_LOOP:
@@ -761,6 +786,8 @@ def _fused_swiglu_fp8_ue8m0_masked_packed_kernel(
         row = pid // packs_per_row
         pack_col = pid % packs_per_row
         if row >= valid_rows:
+            # Block termination implicitly signals PDL completion, so invalid
+            # capacity rows retain the fast early-exit path.
             return
         _fused_swiglu_fp8_ue8m0_masked_packed_row(
             gate_up_ptr,
@@ -784,6 +811,11 @@ def _fused_swiglu_fp8_ue8m0_masked_packed_kernel(
             PACK,
         )
 
+    if ENABLE_PDL:
+        # Release the second masked DeepGEMM only after every active row has
+        # stored both its FP8 values and its packed UE8M0 scales.
+        tl.extra.cuda.gdc_launch_dependents()
+
 
 def _masked_swiglu_row_splits(capacity: int, expected_m: int | None) -> int:
     """Choose bounded row parallelism without reading device-side masks."""
@@ -805,6 +837,8 @@ def fused_swiglu_fp8_ue8m0_masked_packed(
     gate_up: torch.Tensor,
     masked_m: torch.Tensor,
     expected_m: int | None = None,
+    *,
+    enable_pdl: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused masked SwiGLU and FP8 quantization with packed UE8M0 scales.
 
@@ -821,6 +855,9 @@ def fused_swiglu_fp8_ue8m0_masked_packed(
         expected_m: Host-side estimate of valid rows per expert. Sparse launches
             use it only to choose row parallelism; ``masked_m`` remains the
             correctness bound. ``None`` retains one CTA per capacity row.
+        enable_pdl: Join an SM90+ Programmatic Dependent Launch chain. The
+            kernel waits for the preceding masked GEMM before reading
+            ``gate_up`` and releases the following GEMM after its stores.
 
     Returns:
         A pair ``(out, scales)``. ``out`` has shape
@@ -857,6 +894,7 @@ def fused_swiglu_fp8_ue8m0_masked_packed(
     use_row_loop = row_splits < capacity
     grid_rows = row_splits if use_row_loop else capacity
     info = torch.finfo(out.dtype)
+    pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _fused_swiglu_fp8_ue8m0_masked_packed_kernel[
         (grid_rows * packs_per_row, num_experts)
     ](
@@ -879,8 +917,10 @@ def fused_swiglu_fp8_ue8m0_masked_packed(
         PACK=PACK,
         ROW_SPLITS=row_splits,
         USE_ROW_LOOP=use_row_loop,
+        ENABLE_PDL=enable_pdl,
         num_warps=2,
         num_stages=1,
+        **pdl_kwargs,
     )
     return out, scales
 

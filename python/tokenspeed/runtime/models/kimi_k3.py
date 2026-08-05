@@ -89,7 +89,6 @@ from tokenspeed_kernel.ops.tuning import load_packaged_flashinfer_tuning_cache
 from torch import nn
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiK3Config, KimiLinearConfig
-from tokenspeed.runtime.configs.paged_cache_spec import FULL_ATTENTION
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import (
     all_reduce,
@@ -101,6 +100,9 @@ from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
 from tokenspeed.runtime.execution.dspark_parity import record_dspark_parity_tensor
 from tokenspeed.runtime.layers.activation import SituAndMul
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    FULL_ATTENTION,
+)
 from tokenspeed.runtime.layers.layernorm import (
     RMSNorm,
     _get_process_group,

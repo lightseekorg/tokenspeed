@@ -172,10 +172,9 @@ class _Harness:
             layer_num=text.num_hidden_layers,
             device=device,
             enable_memory_saver=False,
-            max_batch_size=4,
-            max_context_len=1024,
             page_size=PAGE_SIZE,
             rank=0,
+            layer_group_ids=("full_attention",) * text.num_hidden_layers,
             memory_plan=make_mha_memory_plan(
                 size=1024,
                 page_size=PAGE_SIZE,
