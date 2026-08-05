@@ -46,8 +46,6 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
             "layer_num": 2,
             "device": "cpu",
             "enable_memory_saver": False,
-            "max_batch_size": 2,
-            "max_context_len": 64,
             "page_size": 16,
             "rank": 0,
         }
@@ -72,6 +70,20 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
                 sliding_window_tokens=kwargs.get("sliding_window_tokens"),
             ),
         )
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+            build_paged_cache_group_specs,
+        )
+
+        kwargs.setdefault(
+            "paged_cache_group_specs",
+            build_paged_cache_group_specs(
+                layer_types=kwargs.get("layer_types", ()),
+                group_ids=kwargs["layer_group_ids"],
+                sliding_window_tokens=kwargs.get("sliding_window_tokens"),
+                page_size=kwargs["page_size"],
+            ),
+        )
+        kwargs.pop("sliding_window_tokens", None)
         return self.MHATokenToKVPool(**kwargs)
 
     def test_plain_no_spec_publishes_single_full_group(self):

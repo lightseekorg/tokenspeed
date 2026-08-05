@@ -54,8 +54,6 @@ def _make_pool(page_size: int, size: int = 512):
         layer_num=LAYERS,
         device="cuda",
         enable_memory_saver=False,
-        max_batch_size=8,
-        max_context_len=size,
         page_size=page_size,
         rank=0,
         layer_group_ids=("full_attention",) * LAYERS,
@@ -183,16 +181,10 @@ def _make_shared_pool(size: int = 512):
         layer_num=len(SHARED_LAYER_TYPES),
         device="cuda",
         enable_memory_saver=False,
-        max_batch_size=8,
-        max_context_len=size,
         page_size=128,
         rank=0,
         layer_types=SHARED_LAYER_TYPES,
         layer_group_ids=SHARED_LAYER_TYPES,
-        sliding_window_tokens=512,
-        max_scheduled_tokens=size,
-        slot_tokens=256,
-        group_page_sizes={"full_attention": 256},
         layer_kv_head_counts=SHARED_KV_HEADS,
         memory_plan=make_mha_memory_plan(
             size=size,
@@ -297,7 +289,7 @@ def _create_config_pool(config):
     from tokenspeed.runtime.layers.attention.kv_cache.factory import (
         create_cache_pool,
     )
-    from tokenspeed.runtime.layers.attention.kv_cache.setup import (
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
         prepare_cache_setup,
     )
 

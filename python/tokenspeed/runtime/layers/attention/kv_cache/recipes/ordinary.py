@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from tokenspeed.runtime.layers.attention.kv_cache.plan import (
-    CacheFieldSpec,
-    solve_cache_layout,
-)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes import (
     configured_token_limit,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    CacheFieldSpec,
+    solve_cache_layout,
 )
 
 
@@ -219,19 +219,27 @@ def build_hybrid_cache_setup(
     fields,
     layer_types: tuple[str, ...],
     group_ids: tuple[str, ...],
+    group_specs: tuple,
     state_dtypes,
     layer_kv_head_counts: tuple[int, ...] | None,
     draft_fields,
     draft_layer_types: tuple[str, ...],
     draft_group_ids: tuple[str, ...],
+    draft_group_specs: tuple,
     draft_layer_kv_head_counts: tuple[int, ...] | None,
     cache_budget_bytes: int,
     fixed_workspace_bytes: int,
     logical_block_tokens: int,
     max_padding_fraction: float,
 ):
-    """Bind one hybrid cache layout and its draft to a common capacity."""
-    from tokenspeed.runtime.layers.attention.kv_cache.setup import (
+    """Bind one hybrid cache layout and its draft to a common capacity.
+
+    The recipe owns the complete published specs (``group_specs`` /
+    ``draft_group_specs``, incl. groups outside the layer-type vocabulary
+    and PD transfer policies); this helper only solves the shared layout
+    and sizes the arenas.
+    """
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
         CachePoolSpec,
         CacheSetup,
     )
@@ -291,6 +299,7 @@ def build_hybrid_cache_setup(
         memory_plan=target_plan,
         layer_types=layer_types,
         layer_group_ids=group_ids,
+        paged_cache_group_specs=tuple(group_specs),
         state_field_dtypes=state_dtypes,
         token_capacity=(num_lcm_blocks * max_packing * logical_block_tokens),
         layer_kv_head_counts=layer_kv_head_counts,
@@ -303,6 +312,7 @@ def build_hybrid_cache_setup(
             memory_plan=draft_plan,
             layer_types=draft_layer_types,
             layer_group_ids=draft_group_ids,
+            paged_cache_group_specs=tuple(draft_group_specs),
             state_field_dtypes={},
             token_capacity=target_spec.token_capacity,
             layer_kv_head_counts=draft_layer_kv_head_counts,
@@ -352,7 +362,7 @@ def _profiled_pages(
 
 
 def _storage_layers(config, num_layers: int) -> int:
-    from tokenspeed.runtime.layers.attention.kv_cache.publish import (
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
         hybrid_slab_group_size,
     )
 
@@ -377,7 +387,7 @@ def _ordinary_setup(
     draft_group_ids: tuple[str, ...],
     cache_budget_bytes: int,
 ):
-    from tokenspeed.runtime.layers.attention.kv_cache.setup import (
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
         CachePoolSpec,
         CacheSetup,
     )
@@ -409,14 +419,30 @@ def _ordinary_setup(
     )
     target_plan = target_layout.with_num_lcm_blocks(num_pages)
     token_capacity = num_pages * page_size
+
+    def _group_specs(config, group_ids):
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+            build_paged_cache_group_specs,
+        )
+
+        return build_paged_cache_group_specs(
+            layer_types=tuple(getattr(config, "layer_types", ())),
+            group_ids=group_ids,
+            sliding_window_tokens=getattr(config, "sliding_window_tokens", None),
+            page_size=page_size,
+            pd_disaggregation_enabled=getattr(
+                config, "pd_disaggregation_enabled", False
+            ),
+        )
+
     target_spec = CachePoolSpec(
         family=family,
         memory_plan=target_plan,
         layer_types=tuple(getattr(attn_config, "layer_types", ())),
         layer_group_ids=target_group_ids,
+        paged_cache_group_specs=_group_specs(attn_config, target_group_ids),
         state_field_dtypes={},
         token_capacity=token_capacity,
-        extra_paged_groups=tuple(getattr(attn_config, "extra_paged_groups", ())),
     )
     draft_spec = None
     if draft_fields is not None:
@@ -433,11 +459,9 @@ def _ordinary_setup(
             memory_plan=draft_plan,
             layer_types=tuple(getattr(draft_attn_config, "layer_types", ())),
             layer_group_ids=draft_group_ids,
+            paged_cache_group_specs=_group_specs(draft_attn_config, draft_group_ids),
             state_field_dtypes={},
             token_capacity=token_capacity,
-            extra_paged_groups=tuple(
-                getattr(draft_attn_config, "extra_paged_groups", ())
-            ),
         )
     return CacheSetup(
         target=target_spec,
@@ -450,7 +474,7 @@ def _ordinary_setup(
 def _mha_fields(config, num_layers: int):
     import torch
 
-    from tokenspeed.runtime.layers.attention.kv_cache import publish
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes import spec
 
     if config.kv_cache_mxfp8:
         assert config.page_size == 128, (
@@ -460,7 +484,7 @@ def _mha_fields(config, num_layers: int):
     layer_types = tuple(config.layer_types)
     group_ids = (
         tuple(
-            publish.layer_group_ids(
+            spec.layer_group_ids(
                 layer_types=layer_types,
                 sliding_window_tokens=config.sliding_window_tokens,
             )

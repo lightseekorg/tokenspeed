@@ -52,17 +52,17 @@ from test.runtime.conftest import requires_cuda
 
 from ci_system.ci_register import register_cuda_ci
 
-from tokenspeed.runtime.configs.cache_runtime import (
-    PagedCacheRuntimeContract,
-)
-from tokenspeed.runtime.configs.paged_cache_spec import (
-    PagedCacheGroupSpec,
-)
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends import hybrid_linear_attn
 from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
     MambaAttnBackend,
     compute_state_page_indices,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+    PagedCacheRuntimeContract,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    PagedCacheGroupSpec,
 )
 
 register_cuda_ci(est_time=240, suite="runtime-1gpu")

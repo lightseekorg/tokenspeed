@@ -28,9 +28,7 @@ from typing import Literal
 
 import torch
 
-from tokenspeed.runtime.configs.paged_cache_spec import PagedCacheGroupSpec
 from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
-from tokenspeed.runtime.layers.attention.kv_cache.plan import CacheMemoryPlan
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
     prepare_deepseek_v4_cache,
 )
@@ -46,8 +44,12 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
     prepare_mla_cache,
     prepare_msa_cache,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheMemoryPlan
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen35 import (
     prepare_qwen35_cache,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    PagedCacheGroupSpec,
 )
 
 CacheModelFamily = Literal[
@@ -70,10 +72,13 @@ class CachePoolSpec:
     memory_plan: CacheMemoryPlan
     layer_types: tuple[str, ...]
     layer_group_ids: tuple[str, ...]
+    # Scheduler group specs, computed once by the recipe. The pool aligns
+    # their physical fields (packing) with the memory plan and publishes the
+    # runtime contract from the pair.
+    paged_cache_group_specs: tuple[PagedCacheGroupSpec, ...]
     state_field_dtypes: Mapping[str, torch.dtype]
     token_capacity: int
     layer_kv_head_counts: tuple[int, ...] | None = None
-    extra_paged_groups: tuple[PagedCacheGroupSpec, ...] = ()
     pool_options: object | None = None
 
     @property

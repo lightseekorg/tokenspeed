@@ -41,8 +41,8 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 _RUNTIME_DIR = (
     pathlib.Path(__file__).resolve().parents[2] / "python" / "tokenspeed" / "runtime"
 )
-_CONFIGS_DIR = _RUNTIME_DIR / "configs"
 _KV_CACHE_DIR = _RUNTIME_DIR / "layers" / "attention" / "kv_cache"
+_RECIPES_DIR = _KV_CACHE_DIR / "recipes"
 
 # compute_paged_cache_group_page_counts lazily imports ceil_div from
 # tokenspeed.runtime.utils.common, whose package pulls torch/psutil. Prefer the
@@ -66,15 +66,11 @@ def _load(mod_name: str, file_path: pathlib.Path):
     return mod
 
 
-# Register under the real name so publish.py's from-import binds THIS repo
-# file via the sys.modules short-circuit (no real package import).
-_pcs = _load(
-    "tokenspeed.runtime.configs.paged_cache_spec",
-    _CONFIGS_DIR / "paged_cache_spec.py",
-)
-_publish = _load("kv_cache_publish_for_page_counts", _KV_CACHE_DIR / "publish.py")
+# spec.py is self-contained: load it from the repo file under a private
+# name (no real package import, no sys.modules shadowing needed).
+_pcs = _load("kv_cache_spec_for_page_counts", _RECIPES_DIR / "spec.py")
 compute_paged_cache_group_page_counts = _pcs.compute_paged_cache_group_page_counts
-group_specs_from_layer_types = _publish.group_specs_from_layer_types
+group_specs_from_layer_types = _pcs.group_specs_from_layer_types
 PagedCacheGroupSpec = _pcs.PagedCacheGroupSpec
 DUMMY = _pcs._PAGED_CACHE_GROUP_DUMMY_PAGES
 
@@ -164,7 +160,7 @@ class SuffixedGroupIdFlowTest(unittest.TestCase):
         windows = [None, 128, None, 4]
         specs = group_specs_from_layer_types(
             layer_types=layer_types,
-            group_ids=_publish.layer_group_ids(
+            group_ids=_pcs.layer_group_ids(
                 layer_types=layer_types, sliding_window_tokens=windows
             ),
             page_size=64,

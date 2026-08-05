@@ -29,7 +29,6 @@ import torch
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import AttentionArch, is_deepseek_v4
-from tokenspeed.runtime.configs.paged_cache_spec import STATE_LAYER_TYPES
 from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
@@ -39,9 +38,12 @@ from tokenspeed.runtime.layers.attention.configs.msa import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 from tokenspeed.runtime.layers.attention.kv_cache.factory import create_cache_pool
-from tokenspeed.runtime.layers.attention.kv_cache.setup import (
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
     CachePoolSpec,
     prepare_cache_setup,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    STATE_LAYER_TYPES,
 )
 from tokenspeed.runtime.layers.attention.utils import (
     profile_available_cache_memory_bytes,

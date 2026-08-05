@@ -24,7 +24,7 @@ from tokenspeed.runtime.configs.kimi_k3_config import (  # noqa: E402
     KimiK3VisionConfig,
     KimiLinearConfig,
 )
-from tokenspeed.runtime.configs.paged_cache_spec import (  # noqa: E402
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (  # noqa: E402
     FULL_ATTENTION,
     LINEAR_ATTENTION,
 )

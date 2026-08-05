@@ -15,8 +15,8 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 _RUNTIME_DIR = (
     pathlib.Path(__file__).resolve().parents[2] / "python" / "tokenspeed" / "runtime"
 )
-_CONFIGS_DIR = _RUNTIME_DIR / "configs"
 _KV_CACHE_DIR = _RUNTIME_DIR / "layers" / "attention" / "kv_cache"
+_RECIPES_DIR = _KV_CACHE_DIR / "recipes"
 
 
 def _load(mod_name: str, file_path: pathlib.Path):
@@ -30,16 +30,12 @@ def _load(mod_name: str, file_path: pathlib.Path):
     return mod
 
 
-# Register under the real name so publish.py's from-import binds THIS repo
-# file via the sys.modules short-circuit (no real package import).
-_pcs = _load(
-    "tokenspeed.runtime.configs.paged_cache_spec",
-    _CONFIGS_DIR / "paged_cache_spec.py",
-)
-_publish = _load("kv_cache_publish_under_test", _KV_CACHE_DIR / "publish.py")
-group_specs_from_layer_types = _publish.group_specs_from_layer_types
-layer_group_ids = _publish.layer_group_ids
-PagedCacheGroupSpec = _pcs.PagedCacheGroupSpec
+# spec.py is self-contained: load it from the repo file under a private
+# name (no real package import, no sys.modules shadowing needed).
+_spec = _load("kv_cache_spec_under_test", _RECIPES_DIR / "spec.py")
+group_specs_from_layer_types = _spec.group_specs_from_layer_types
+layer_group_ids = _spec.layer_group_ids
+PagedCacheGroupSpec = _spec.PagedCacheGroupSpec
 
 
 def _specs(**kwargs):

@@ -206,8 +206,6 @@ class MemoryExecutorTest(unittest.TestCase):
             "layer_num": 4,
             "device": "cuda",
             "enable_memory_saver": False,
-            "max_batch_size": 2,
-            "max_context_len": 64,
             "page_size": 4,
             "rank": 0,
             "layer_types": LAYER_TYPES,
@@ -230,6 +228,7 @@ class MemoryExecutorTest(unittest.TestCase):
             layer_types=kwargs["layer_types"],
             sliding_window_tokens=kwargs["sliding_window_tokens"],
         )
+        kwargs.pop("sliding_window_tokens", None)
         return self.MHATokenToKVPool(**kwargs)
 
     def _executor(self, pool):
@@ -356,8 +355,6 @@ class MemoryExecutorTest(unittest.TestCase):
             "layer_num": 4,
             "device": "cuda",
             "enable_memory_saver": False,
-            "max_batch_size": 2,
-            "max_context_len": 64,
             "page_size": 4,
             "rank": 0,
             "layer_types": GDN_LAYER_TYPES,
@@ -375,6 +372,7 @@ class MemoryExecutorTest(unittest.TestCase):
                 for field in ("conv", "ssm")
             },
         }
+        kwargs.pop("sliding_window_tokens", None)
         return self.HybridMHATokenToKVPool(**kwargs)
 
     def _fill_spans(self, mirror, device_pages):

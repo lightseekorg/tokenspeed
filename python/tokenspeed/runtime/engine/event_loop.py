@@ -37,9 +37,6 @@ from tokenspeed.runtime.cache.executor.memory_executor import (
 )
 from tokenspeed.runtime.cache.transfer.types import CacheKind
 from tokenspeed.runtime.configs.model_config import ModelConfig
-from tokenspeed.runtime.configs.paged_cache_spec import (
-    validate_scheduler_config,
-)
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -73,6 +70,9 @@ from tokenspeed.runtime.execution.factory import (
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.types import ModelExecutionResult
 from tokenspeed.runtime.grammar.capturable_grammar import GrammarStepInputs
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    validate_scheduler_config,
+)
 from tokenspeed.runtime.layers.attention.registry import create_attn_components
 from tokenspeed.runtime.metrics.collector import EngineMetrics
 from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor

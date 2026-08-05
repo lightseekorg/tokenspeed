@@ -117,7 +117,7 @@ if os.environ.get("TOKENSPEED_FORCE_LEGACY_KV_LAYOUT") == "1":
     # imports) is silently overwritten when its from-import line runs --
     # only a later re-assert survives.
     _TARGETS = (
-        "tokenspeed.runtime.layers.attention.kv_cache.publish",
+        "tokenspeed.runtime.layers.attention.kv_cache.recipes.spec",
     )
 
     def _null_predicate(*a, **k):

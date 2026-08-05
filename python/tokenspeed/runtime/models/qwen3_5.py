@@ -35,8 +35,6 @@ from tokenspeed_kernel.ops.layernorm.triton import (
     qk_rmsnorm,
 )
 
-# Configs
-from tokenspeed.runtime.configs.paged_cache_spec import FULL_ATTENTION
 from tokenspeed.runtime.configs.qwen3_5_config import (
     Qwen3_5Config,
     Qwen3_5TextConfig,
@@ -47,6 +45,11 @@ from tokenspeed.runtime.configs.utils import get_rope_parameters
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
+
+# Configs
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    FULL_ATTENTION,
+)
 
 # Layers - Attention
 from tokenspeed.runtime.layers.attention.linear.layernorm_gated import (

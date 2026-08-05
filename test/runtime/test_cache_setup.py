@@ -4,10 +4,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tokenspeed.runtime.configs.paged_cache_spec import (
-    FULL_ATTENTION,
-    LINEAR_ATTENTION,
-)
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.factory import create_cache_pool
@@ -16,7 +12,13 @@ from tokenspeed.runtime.layers.attention.kv_cache.hybrid_mha import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
-from tokenspeed.runtime.layers.attention.kv_cache.setup import prepare_cache_setup
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
+    prepare_cache_setup,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    FULL_ATTENTION,
+    LINEAR_ATTENTION,
+)
 
 
 def test_attention_configs_do_not_own_cache_setup() -> None:

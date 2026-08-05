@@ -27,10 +27,11 @@ from tokenspeed.runtime.cache.utils import (
     get_mla_kv_buffer_triton,
     set_mla_kv_buffer_triton,
 )
-from tokenspeed.runtime.configs.paged_cache_spec import PagedCacheGroupSpec
-from tokenspeed.runtime.layers.attention.kv_cache import publish
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
-from tokenspeed.runtime.layers.attention.kv_cache.plan import CacheMemoryPlan
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheMemoryPlan
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    PagedCacheGroupSpec,
+)
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.pdl import pdl_enabled
@@ -59,14 +60,13 @@ class MLATokenToKVPool(CachePool):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
-        max_batch_size: int,
-        max_context_len: int,
         page_size: int,
         rank: int,
         *,
         memory_plan: CacheMemoryPlan,
+        paged_cache_group_specs: tuple[PagedCacheGroupSpec, ...] = (),
+        token_capacity: int | None = None,
         layer_group_ids: tuple[str, ...] = (),
-        max_scheduled_tokens: int = 0,
     ):
         super().__init__(
             size,
@@ -75,6 +75,8 @@ class MLATokenToKVPool(CachePool):
             page_size,
             rank,
             memory_plan,
+            paged_cache_group_specs=paged_cache_group_specs,
+            token_capacity=token_capacity,
         )
         self.model_dtype = model_dtype
         self.quant_method = quant_method
@@ -99,34 +101,6 @@ class MLATokenToKVPool(CachePool):
         )
 
         self._create_buffers()
-
-        specs, counts = self._publish_paged_cache_groups(
-            max_live_requests=max_batch_size,
-            max_scheduled_tokens=max_scheduled_tokens,
-            max_total_tokens=size,
-            max_context_len=max_context_len,
-        )
-        self.paged_cache_group_specs = tuple(specs)
-        self.paged_cache_group_page_counts = counts
-
-    def _publish_paged_cache_groups(
-        self,
-        *,
-        max_live_requests: int,
-        max_scheduled_tokens: int,
-        max_total_tokens: int,
-        max_context_len: int,
-    ) -> tuple[list[PagedCacheGroupSpec], dict[str, int]]:
-        return publish.publish_paged_cache_groups(
-            layer_types=(),
-            group_ids=self.layer_cache_group_ids,
-            sliding_window_tokens=None,
-            page_size=self.page_size,
-            max_live_requests=max_live_requests,
-            max_scheduled_tokens=max_scheduled_tokens,
-            max_total_tokens=max_total_tokens,
-            max_context_len=max_context_len,
-        )
 
     def _create_buffers(self) -> None:
         with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):

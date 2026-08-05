@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
 
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
-from tokenspeed.runtime.layers.attention.kv_cache.plan import (
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
     solve_cache_layout,
 )

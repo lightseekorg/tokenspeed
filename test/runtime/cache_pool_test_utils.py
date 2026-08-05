@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import torch
 
-from tokenspeed.runtime.layers.attention.kv_cache import publish
-from tokenspeed.runtime.layers.attention.kv_cache.plan import solve_cache_layout
+from tokenspeed.runtime.layers.attention.kv_cache.recipes import spec
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
     mha_cache_fields,
     mla_cache_fields,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import solve_cache_layout
 
 
 def plan_fields(
@@ -40,7 +40,7 @@ def make_layer_group_ids(
     if not layer_types:
         return ("full_attention",) * layer_num
     return tuple(
-        publish.layer_group_ids(
+        spec.layer_group_ids(
             layer_types=layer_types,
             sliding_window_tokens=sliding_window_tokens,
         )

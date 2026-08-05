@@ -29,15 +29,7 @@ try:
 except Exception:
     deep_gemm = None  # type: ignore[assignment]
 
-from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
-    DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT,
-    V4_KERNEL_BLOCK_ROWS,
-    deepseek_v4_swa_row_bytes,
-    first_v4_compressed_kv_group_id,
-    v4_compressed_kv_group_id,
-)
 from tokenspeed.runtime.configs.model_config import AttentionArch
-from tokenspeed.runtime.configs.paged_cache_spec import PagedCacheGroupSpec
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.deepseek_v4.metadata import (
@@ -54,6 +46,16 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
     DeepseekV4CacheMetadata,
     _split_paged_cache_block_tables_into_v4_metadata,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4_cache_spec import (
+    DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT,
+    V4_KERNEL_BLOCK_ROWS,
+    deepseek_v4_swa_row_bytes,
+    first_v4_compressed_kv_group_id,
+    v4_compressed_kv_group_id,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    PagedCacheGroupSpec,
 )
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils.env import global_server_args_dict

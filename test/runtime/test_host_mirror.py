@@ -57,8 +57,6 @@ class HostMirrorTest(unittest.TestCase):
             "layer_num": 4,
             "device": "cuda",
             "enable_memory_saver": False,
-            "max_batch_size": 2,
-            "max_context_len": 64,
             "page_size": 4,
             "rank": 0,
             "layer_types": LAYER_TYPES,
@@ -81,6 +79,7 @@ class HostMirrorTest(unittest.TestCase):
             layer_types=kwargs["layer_types"],
             sliding_window_tokens=kwargs["sliding_window_tokens"],
         )
+        kwargs.pop("sliding_window_tokens", None)
         return self.MHATokenToKVPool(**kwargs)
 
     def _fill_device_pages(self, mirror, device_pages):
@@ -243,8 +242,6 @@ class HostMirrorStateSlabTest(unittest.TestCase):
             "layer_num": 4,
             "device": "cuda",
             "enable_memory_saver": False,
-            "max_batch_size": 2,
-            "max_context_len": 64,
             "page_size": 4,
             "rank": 0,
             "layer_types": GDN_LAYER_TYPES,
@@ -265,6 +262,7 @@ class HostMirrorStateSlabTest(unittest.TestCase):
                     "full_attention",
                 ),
             )
+        kwargs.pop("sliding_window_tokens", None)
         pool_cls = self.HybridMHATokenToKVPool if with_state else self.MHATokenToKVPool
         return pool_cls(**kwargs)
 

@@ -47,8 +47,8 @@ def _load_cache_modules():
     ):
         sys.modules.setdefault(package_name, types.ModuleType(package_name))
     plan = _load(
-        "tokenspeed.runtime.layers.attention.kv_cache.plan",
-        _KV_CACHE_DIR / "plan.py",
+        "tokenspeed.runtime.layers.attention.kv_cache.recipes.plan",
+        _RECIPE_DIR / "plan.py",
     )
     _load(
         "tokenspeed.runtime.layers.attention.kv_cache.recipes",
@@ -233,12 +233,12 @@ class CacheMemoryPlanTest(unittest.TestCase):
             }
             self.assertTrue(function_names.issubset(definitions), file_name)
 
-        planner_source = (_KV_CACHE_DIR / "plan.py").read_text().lower()
+        planner_source = (_RECIPE_DIR / "plan.py").read_text().lower()
         for model_name in ("qwen", "inkling", "kimi", "deepseek"):
             self.assertNotIn(model_name, planner_source)
 
     def test_cache_pool_factory_is_separate_from_setup(self):
-        setup_module = ast.parse((_KV_CACHE_DIR / "setup.py").read_text())
+        setup_module = ast.parse((_RECIPE_DIR / "setup.py").read_text())
         factory_module = ast.parse((_KV_CACHE_DIR / "factory.py").read_text())
 
         setup_functions = {
