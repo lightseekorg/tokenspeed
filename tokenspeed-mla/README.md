@@ -157,7 +157,7 @@ What it supports:
   `H=64, q_len=4` is supported.
 - `split_kv` and `workspace_size` are computed and cached from runtime shape/device info.
 - `is_var_seq`, `is_persistent`, and `enable_pdl` affect scheduling/compile variants.
-- `causal_mask` is currently effective on the FP8 decode kernel path.
+- `causal_mask` supports causal and non-causal execution on FP16/BF16/FP8 paths.
 - Optional `out` tensor reuse
 - `is_var_seq` and `enable_pdl` controls
 

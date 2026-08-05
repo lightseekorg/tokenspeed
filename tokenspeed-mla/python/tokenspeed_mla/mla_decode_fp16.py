@@ -2755,8 +2755,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                 (tTR_rAcc_red, tTR_rMax),
             )
             tTR_rAcc = cute.make_tensor(tTR_rAcc_red.iterator, tTR_rAcc.layout)
+            # Keep this value defined on both sides of the dynamic apply_mask
+            # branch so CuTe DSL can assign it a stable type at the join.
+            cta_m_rows = self.mma_qk_tiler[0] // self.cluster_shape_mnk[0]
             if apply_mask:
-                cta_m_rows = self.mma_qk_tiler[0] // self.cluster_shape_mnk[0]
                 for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
                     qk_col = tTR_tS[i][1]
                     if cutlass.const_expr(self.is_causal):
