@@ -1764,7 +1764,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoeForConditionalGeneration):
             config=config,
             mapping=mapping,
             quant_config=quant_config,
-            prefix=add_prefix("model", prefix), # no ``model.language_model`` scope
+            prefix=add_prefix("model", prefix),  # no ``model.language_model`` scope
         )
 
 
