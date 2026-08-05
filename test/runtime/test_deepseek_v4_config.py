@@ -35,9 +35,6 @@ from tokenspeed.runtime.configs.model_config import (
     is_deepseek_v4,
     is_deepseek_v4_nextn,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    PagedCacheGroupSpec,
-)
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.execution.cuda_graph_wrapper import (
     CudaGraphWrapper,
@@ -86,6 +83,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4_cache_spec
     deepseek_v4_swa_token_stride,
     v4_compressed_kv_group_id,
     v4_compressor_state_group_id,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    PagedCacheGroupSpec,
 )
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.quantization import QUANTIZATION_METHODS
