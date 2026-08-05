@@ -26,7 +26,6 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel import (
-    mla_decode_projected_value,
     mla_decode_with_kvcache,
     mla_extend_with_kvcache,
     mla_prefill,
@@ -619,7 +618,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         gate = kwargs.get("output_gate")
         projected_out = kwargs.get("projected_output")
         if value_weight is not None:
-            result = mla_decode_projected_value(
+            result = mla_decode_with_kvcache(
                 query,
                 kv_cache,
                 page_table,
@@ -629,7 +628,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
                 self.kv_lora_rank,
                 self.qk_rope_head_dim,
                 softmax_scale,
-                value_weight,
+                value_weight=value_weight,
                 gate=gate,
                 out=projected_out,
                 logit_cap=layer.logit_cap,

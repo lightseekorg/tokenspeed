@@ -142,7 +142,6 @@ __all__ = [
     "mla_normalize_project_query",
     "mla_project_value",
     "mla_decode_with_kvcache",
-    "mla_decode_projected_value",
     "dsa_prefill",
     "dsa_decode",
     "dsa_prefill_topk",
@@ -2430,6 +2429,9 @@ def mla_decode_with_kvcache(
     # dispatch options
     override: str | None = None,
     solution: str | None = None,
+    # optional projected-value epilogue
+    value_weight: torch.Tensor | None = None,
+    gate: torch.Tensor | None = None,
 ) -> AttentionResult:
     """MLA absorbed decode over compressed paged MLA KV cache.
 
@@ -2437,7 +2439,10 @@ def mla_decode_with_kvcache(
     transformed the non-RoPE query part into latent space using the key half of
     kv_b_proj, so Q and the compressed cache share the same q/k dimension:
     kv_lora_rank + qk_rope_head_dim. The kernel returns the attention-weighted
-    latent value; the model applies the value half of kv_b_proj afterward.
+    latent value. When ``value_weight`` is provided, a supporting kernel may
+    instead apply the value projection and optional output gate while reducing
+    the attention partials. Otherwise the API composes the latent decode and
+    value projection.
 
     Args:
         q: Absorbed query with shape
@@ -2460,16 +2465,55 @@ def mla_decode_with_kvcache(
         logit_cap: Optional soft cap applied to attention logits.
         return_lse: Whether to also return log-sum-exp values.
         out: Optional output tensor with shape [batch, q_len, num_q_heads,
-            kv_lora_rank].
+            kv_lora_rank]. When ``value_weight`` is provided, this is required
+            and has shape [batch, num_q_heads * value_head_dim].
+        value_weight: Optional per-head value projection with shape
+            [num_q_heads, kv_lora_rank, value_head_dim].
+        gate: Optional raw sigmoid gate with shape
+            [batch, num_q_heads * value_head_dim]. Requires ``value_weight``.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
     Returns:
         Latent attention output with shape [batch, q_len, num_q_heads,
-        kv_lora_rank], or (output, lse) when return_lse is True. The caller is
-        responsible for applying the MLA value projection from latent rank to
-        v_head_dim.
+        kv_lora_rank], or (output, lse) when return_lse is True. When
+        ``value_weight`` is provided, returns ``out`` containing the projected
+        and optionally gated value.
     """
+    if gate is not None and value_weight is None:
+        raise ValueError("gate requires value_weight")
+
+    projected_value = value_weight is not None
+    if projected_value:
+        if q.ndim != 4 or q.shape[1] != 1:
+            raise ValueError(
+                "projected MLA decode requires q shape [batch,1,heads,dim]"
+            )
+        if value_weight.ndim != 3 or value_weight.shape[:2] != (
+            q.shape[2],
+            kv_lora_rank,
+        ):
+            raise ValueError(
+                "value_weight must have shape [heads,kv_lora_rank,value_head_dim]"
+            )
+        if out is None:
+            raise ValueError("projected MLA decode requires out")
+        expected_output = (q.shape[0], q.shape[2] * value_weight.shape[2])
+        if out.shape != expected_output:
+            raise ValueError(f"out must have shape {expected_output}")
+        if (
+            out.dtype != value_weight.dtype
+            or out.device != q.device
+            or not out.is_contiguous()
+        ):
+            raise ValueError(
+                "out must match value_weight dtype and be contiguous and colocated with q"
+            )
+        if gate is not None and gate.shape != expected_output:
+            raise ValueError(f"gate must have shape {expected_output}")
+        if return_lse:
+            raise ValueError("projected MLA decode does not support return_lse")
+
     traits = {
         "batch_size": q.shape[0],
         "page_size": kv_cache.shape[1],
@@ -2482,17 +2526,55 @@ def mla_decode_with_kvcache(
         "support_logit_cap": logit_cap != 0.0,
         "return_lse": return_lse,
     }
-    signature = _attention_format_signature(q=q, kv_cache=kv_cache)
+    if projected_value:
+        traits.update(
+            {
+                "value_head_dim": value_weight.shape[2],
+                "gate_kind": "none" if gate is None else "sigmoid",
+            }
+        )
+        signature = _attention_format_signature(
+            q=q,
+            kv_cache=kv_cache,
+            value_weight=value_weight,
+            out=out,
+        )
+    else:
+        signature = _attention_format_signature(q=q, kv_cache=kv_cache)
+    dispatch_mode = (
+        "mla_decode_projected_value" if projected_value else "mla_decode_with_kvcache"
+    )
     try:
         kernel = select_kernel(
             "attention",
-            "mla_decode_with_kvcache",
+            dispatch_mode,
             signature,
             traits=traits,
             solution=solution,
             override=override,
         )
     except NoKernelFoundError:
+        if projected_value:
+            if override is not None or solution is not None:
+                raise
+            attention = mla_decode_with_kvcache(
+                q=q,
+                kv_cache=kv_cache,
+                page_table=page_table,
+                cache_seqlens=cache_seqlens,
+                max_seqlen_k=max_seqlen_k,
+                qk_nope_head_dim=qk_nope_head_dim,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                softmax_scale=softmax_scale,
+                logit_cap=logit_cap,
+            )
+            return mla_project_value(
+                attention.reshape(q.shape[0], q.shape[2], kv_lora_rank),
+                value_weight,
+                gate=gate,
+                out=out,
+            )
         if q.dtype == kv_cache.dtype:
             raise
         q = q.to(kv_cache.dtype)
@@ -2518,9 +2600,11 @@ def mla_decode_with_kvcache(
         "qk_rope_head_dim": qk_rope_head_dim,
         "max_seqlen_k": max_seqlen_k,
     }
+    if projected_value:
+        shape_params["value_head_dim"] = value_weight.shape[2]
     ShapeCapture.get().record(
         "attention",
-        "mla_decode_with_kvcache",
+        dispatch_mode,
         kernel.name,
         q.dtype,
         shape_params,
@@ -2528,153 +2612,12 @@ def mla_decode_with_kvcache(
 
     with kernel_scope(
         "attention",
-        "mla_decode_with_kvcache",
+        dispatch_mode,
         q.dtype,
         kernel_name=kernel.name,
         **shape_params,
     ):
-        return kernel(
-            q=q,
-            kv_cache=kv_cache,
-            page_table=page_table,
-            cache_seqlens=cache_seqlens,
-            max_seqlen_k=max_seqlen_k,
-            qk_nope_head_dim=qk_nope_head_dim,
-            kv_lora_rank=kv_lora_rank,
-            qk_rope_head_dim=qk_rope_head_dim,
-            softmax_scale=softmax_scale,
-            logit_cap=logit_cap,
-            return_lse=return_lse,
-            out=out,
-        )
-
-
-def mla_decode_projected_value(
-    q: torch.Tensor,
-    kv_cache: torch.Tensor,
-    page_table: torch.Tensor,
-    cache_seqlens: torch.Tensor,
-    max_seqlen_k: int,
-    qk_nope_head_dim: int,
-    kv_lora_rank: int,
-    qk_rope_head_dim: int,
-    softmax_scale: float,
-    value_weight: torch.Tensor,
-    *,
-    gate: torch.Tensor | None = None,
-    out: torch.Tensor,
-    logit_cap: float = 0.0,
-    override: str | None = None,
-    solution: str | None = None,
-) -> torch.Tensor:
-    """Decode MLA and emit its projected, optionally gated value.
-
-    The registry selects a fused implementation when one supports the full
-    contract. Otherwise this entry point runs MLA decode, value projection, and
-    gating as separate operations.
-
-    Args:
-        q: Absorbed query ``[batch,1,heads,kv_lora_rank+qk_rope_head_dim]``.
-        kv_cache: Compressed paged MLA cache.
-        page_table: Int32 page table for the batch.
-        cache_seqlens: Int32 visible sequence lengths.
-        max_seqlen_k: Captured maximum context length.
-        qk_nope_head_dim: Original non-RoPE query/key head dimension.
-        kv_lora_rank: Compressed latent rank.
-        qk_rope_head_dim: RoPE query/key head dimension.
-        softmax_scale: QK softmax scale, including the KV scale.
-        value_weight: Per-head value projection ``[heads,kv_lora_rank,value_dim]``.
-        gate: Optional raw sigmoid gate ``[batch,heads*value_dim]``.
-        out: Destination with the same shape and dtype as ``gate``.
-        logit_cap: Optional soft cap applied to attention logits.
-        override: Optional exact registered kernel name.
-        solution: Optional registered solution name.
-
-    Returns:
-        ``out`` containing the projected and gated attention value.
-    """
-    if q.ndim != 4 or q.shape[1] != 1:
-        raise ValueError("projected MLA decode requires q shape [batch,1,heads,dim]")
-    if value_weight.ndim != 3 or value_weight.shape[:2] != (
-        q.shape[2],
-        kv_lora_rank,
-    ):
-        raise ValueError(
-            "value_weight must have shape [heads,kv_lora_rank,value_head_dim]"
-        )
-    expected_output = (q.shape[0], q.shape[2] * value_weight.shape[2])
-    if out.shape != expected_output:
-        raise ValueError(f"out must have shape {expected_output}")
-    if (
-        out.dtype != value_weight.dtype
-        or out.device != q.device
-        or not out.is_contiguous()
-    ):
-        raise ValueError(
-            "out must match value_weight dtype and be contiguous and colocated with q"
-        )
-    if gate is not None and gate.shape != expected_output:
-        raise ValueError(f"gate must have shape {expected_output}")
-
-    signature = _attention_format_signature(
-        q=q,
-        kv_cache=kv_cache,
-        value_weight=value_weight,
-        out=out,
-    )
-    traits = {
-        "batch_size": q.shape[0],
-        "q_len": q.shape[1],
-        "num_q_heads": q.shape[2],
-        "page_size": kv_cache.shape[1],
-        "kv_lora_rank": kv_lora_rank,
-        "qk_rope_head_dim": qk_rope_head_dim,
-        "value_head_dim": value_weight.shape[2],
-        "gate_kind": "none" if gate is None else "sigmoid",
-        "support_logit_cap": logit_cap != 0.0,
-    }
-    try:
-        kernel = select_kernel(
-            "attention",
-            "mla_decode_projected_value",
-            signature,
-            traits=traits,
-            solution=solution,
-            override=override,
-        )
-    except NoKernelFoundError:
-        if override is not None or solution is not None:
-            raise
-        kernel = None
-
-    if kernel is not None:
-        shape_params = {
-            "batch_size": q.shape[0],
-            "q_len": q.shape[1],
-            "num_q_heads": q.shape[2],
-            "num_pages": kv_cache.shape[0],
-            "page_size": kv_cache.shape[1],
-            "max_pages_per_seq": page_table.shape[1],
-            "qk_nope_head_dim": qk_nope_head_dim,
-            "kv_lora_rank": kv_lora_rank,
-            "qk_rope_head_dim": qk_rope_head_dim,
-            "value_head_dim": value_weight.shape[2],
-            "max_seqlen_k": max_seqlen_k,
-        }
-        ShapeCapture.get().record(
-            "attention",
-            "mla_decode_projected_value",
-            kernel.name,
-            q.dtype,
-            shape_params,
-        )
-        with kernel_scope(
-            "attention",
-            "mla_decode_projected_value",
-            q.dtype,
-            kernel_name=kernel.name,
-            **shape_params,
-        ):
+        if projected_value:
             return kernel(
                 q=q,
                 kv_cache=kv_cache,
@@ -2690,26 +2633,20 @@ def mla_decode_projected_value(
                 out=out,
                 logit_cap=logit_cap,
             )
-
-    attention = mla_decode_with_kvcache(
-        q=q,
-        kv_cache=kv_cache,
-        page_table=page_table,
-        cache_seqlens=cache_seqlens,
-        max_seqlen_k=max_seqlen_k,
-        qk_nope_head_dim=qk_nope_head_dim,
-        kv_lora_rank=kv_lora_rank,
-        qk_rope_head_dim=qk_rope_head_dim,
-        softmax_scale=softmax_scale,
-        logit_cap=logit_cap,
-        solution=solution,
-    )
-    return mla_project_value(
-        attention.reshape(q.shape[0], q.shape[2], kv_lora_rank),
-        value_weight,
-        gate=gate,
-        out=out,
-    )
+        return kernel(
+            q=q,
+            kv_cache=kv_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            max_seqlen_k=max_seqlen_k,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            softmax_scale=softmax_scale,
+            logit_cap=logit_cap,
+            return_lse=return_lse,
+            out=out,
+        )
 
 
 # ===-----------------------------------------------------------------------===#

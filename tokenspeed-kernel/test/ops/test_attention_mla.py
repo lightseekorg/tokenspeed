@@ -6,7 +6,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 from tokenspeed_kernel import (
-    mla_decode_projected_value,
     mla_decode_with_kvcache,
     mla_extend_with_kvcache,
     mla_prefill,
@@ -731,7 +730,7 @@ def test_mla_decode_small_batch_fixed_entrypoints_use_out(
     )
 
 
-def test_mla_decode_projected_value_matches_split_and_captures(
+def test_mla_decode_with_kvcache_projected_value_matches_split_and_captures(
     device: str,
 ) -> None:
     if not platform.is_cdna4:
@@ -768,34 +767,34 @@ def test_mla_decode_projected_value_matches_split_and_captures(
         gate=gate,
     )
 
-    mla_decode_projected_value(
-        q,
-        kv_cache,
-        page_table,
-        cache_seqlens,
-        8192,
-        128,
-        512,
-        64,
-        1.0 / math.sqrt(192),
-        weight,
+    mla_decode_with_kvcache(
+        q=q,
+        kv_cache=kv_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_k=8192,
+        qk_nope_head_dim=128,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        softmax_scale=1.0 / math.sqrt(192),
+        value_weight=weight,
         gate=gate,
         out=output,
     )
     eager_output = output.clone()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        returned = mla_decode_projected_value(
-            q,
-            kv_cache,
-            page_table,
-            cache_seqlens,
-            8192,
-            128,
-            512,
-            64,
-            1.0 / math.sqrt(192),
-            weight,
+        returned = mla_decode_with_kvcache(
+            q=q,
+            kv_cache=kv_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            max_seqlen_k=8192,
+            qk_nope_head_dim=128,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            softmax_scale=1.0 / math.sqrt(192),
+            value_weight=weight,
             gate=gate,
             out=output,
         )
@@ -810,7 +809,7 @@ def test_mla_decode_projected_value_matches_split_and_captures(
 
 
 @pytest.mark.parametrize("use_gate", [False, True])
-def test_mla_decode_projected_value_composes_split_fallback(
+def test_mla_decode_with_kvcache_composes_projected_value_fallback(
     monkeypatch: pytest.MonkeyPatch,
     use_gate: bool,
 ) -> None:
@@ -827,10 +826,15 @@ def test_mla_decode_projected_value_composes_split_fallback(
     gate = raw_gate if use_gate else None
     output = torch.empty_like(raw_gate)
 
-    def no_fused_kernel(*args, **kwargs):
+    def select_decode_kernel(*args, **kwargs):
+        if args[1] == "mla_project_value":
+            raise NoKernelFoundError
         if args[1] == "mla_decode_projected_value":
             assert kwargs["traits"]["support_logit_cap"] is True
-        raise NoKernelFoundError
+            raise NoKernelFoundError
+        assert args[1] == "mla_decode_with_kvcache"
+        split_decode.name = "split_decode"
+        return split_decode
 
     def split_decode(**kwargs):
         assert kwargs["kv_lora_rank"] == 4
@@ -838,20 +842,19 @@ def test_mla_decode_projected_value_composes_split_fallback(
         assert kwargs["logit_cap"] == 2.5
         return latent
 
-    monkeypatch.setattr(attention_ops, "select_kernel", no_fused_kernel)
-    monkeypatch.setattr(attention_ops, "mla_decode_with_kvcache", split_decode)
+    monkeypatch.setattr(attention_ops, "select_kernel", select_decode_kernel)
 
-    returned = attention_ops.mla_decode_projected_value(
-        q,
-        kv_cache,
-        page_table,
-        cache_seqlens,
-        8,
-        2,
-        4,
-        2,
-        1.0,
-        weight,
+    returned = attention_ops.mla_decode_with_kvcache(
+        q=q,
+        kv_cache=kv_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_k=8,
+        qk_nope_head_dim=2,
+        kv_lora_rank=4,
+        qk_rope_head_dim=2,
+        softmax_scale=1.0,
+        value_weight=weight,
         gate=gate,
         out=output,
         logit_cap=2.5,
@@ -867,7 +870,7 @@ def test_mla_decode_projected_value_composes_split_fallback(
     torch.testing.assert_close(output, expected)
 
 
-def test_mla_decode_projected_value_rejects_invalid_out() -> None:
+def test_mla_decode_with_kvcache_rejects_invalid_projected_out() -> None:
     q = torch.empty(2, 1, 3, 6)
     kv_cache = torch.empty(1, 8, 1, 6)
     page_table = torch.zeros(2, 1, dtype=torch.int32)
@@ -875,17 +878,17 @@ def test_mla_decode_projected_value_rejects_invalid_out() -> None:
     weight = torch.empty(3, 4, 2)
 
     def call(out: torch.Tensor) -> None:
-        mla_decode_projected_value(
-            q,
-            kv_cache,
-            page_table,
-            cache_seqlens,
-            8,
-            2,
-            4,
-            2,
-            1.0,
-            weight,
+        mla_decode_with_kvcache(
+            q=q,
+            kv_cache=kv_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            max_seqlen_k=8,
+            qk_nope_head_dim=2,
+            kv_lora_rank=4,
+            qk_rope_head_dim=2,
+            softmax_scale=1.0,
+            value_weight=weight,
             out=out,
         )
 
@@ -893,6 +896,35 @@ def test_mla_decode_projected_value_rejects_invalid_out() -> None:
         call(torch.empty(2, 12)[:, ::2])
     with pytest.raises(ValueError, match="contiguous and colocated"):
         call(torch.empty(2, 6, device="meta"))
+
+    with pytest.raises(ValueError, match="gate requires value_weight"):
+        mla_decode_with_kvcache(
+            q=q,
+            kv_cache=kv_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            max_seqlen_k=8,
+            qk_nope_head_dim=2,
+            kv_lora_rank=4,
+            qk_rope_head_dim=2,
+            softmax_scale=1.0,
+            gate=torch.empty(2, 6),
+        )
+    with pytest.raises(ValueError, match="does not support return_lse"):
+        mla_decode_with_kvcache(
+            q=q,
+            kv_cache=kv_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            max_seqlen_k=8,
+            qk_nope_head_dim=2,
+            kv_lora_rank=4,
+            qk_rope_head_dim=2,
+            softmax_scale=1.0,
+            return_lse=True,
+            value_weight=weight,
+            out=torch.empty(2, 6),
+        )
 
 
 def test_mla_project_value_fallback_preserves_fp32_gate_math(
