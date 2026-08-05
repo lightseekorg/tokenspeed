@@ -30,8 +30,11 @@ from __future__ import annotations
 
 import torch
 
-_BUFFERS: dict[tuple[int, int], torch.Tensor] = {}
+_BUFFERS: dict[tuple[int, int, str], torch.Tensor] = {}
+# Replaced buffers stay referenced: in-flight kernels may still read them.
+_RETIRED: list[torch.Tensor] = []
 _SUPPORTED: bool | None = None
+_AGREED: bool | None = None
 _MIN_BUFFER_ROWS = 2048
 
 
@@ -61,6 +64,25 @@ def multimem_available() -> bool:
     return _SUPPORTED
 
 
+def multimem_available_all_ranks() -> bool:
+    """Collectively-agreed availability (min over ranks); call in lockstep.
+
+    Returns:
+        True only when every rank's local probe succeeded, so no rank can
+        privately fall back while its peers wait in a multimem barrier.
+    """
+    global _AGREED
+    if _AGREED is None:
+        import torch.distributed as dist
+
+        flag = torch.tensor(
+            [int(multimem_available())], dtype=torch.int32, device="cuda"
+        )
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+        _AGREED = bool(flag.item())
+    return _AGREED
+
+
 def _ensure_buffer(
     rows: int, width: int, device: torch.device, group_name: str
 ) -> torch.Tensor | None:
@@ -71,12 +93,14 @@ def _ensure_buffer(
     """
     import torch.distributed._symmetric_memory as symm_mem
 
-    key = (device.index, width)
+    key = (device.index, width, group_name)
     buf = _BUFFERS.get(key)
     if buf is None or buf.shape[0] < rows:
         if torch.cuda.is_current_stream_capturing():
             return None
-        cap = max(rows, _MIN_BUFFER_ROWS)
+        cap = max(rows, _MIN_BUFFER_ROWS if buf is None else 2 * buf.shape[0])
+        if buf is not None:
+            _RETIRED.append(buf)
         buf = symm_mem.empty((cap, width), dtype=torch.bfloat16, device=device)
         symm_mem.rendezvous(buf, group_name)
         _BUFFERS[key] = buf
@@ -112,13 +136,23 @@ def multimem_stage(tensor: torch.Tensor, group_name: str) -> torch.Tensor | None
 
 
 def multimem_all_reduce_staged(view: torch.Tensor, group_name: str) -> torch.Tensor:
-    """In-place ld_reduce all-reduce of a view returned by ``multimem_stage``."""
+    """In-switch (ld_reduce) sum all-reduce of a staged view, in place.
+
+    Args:
+        view: A view previously returned by ``multimem_stage``; every rank
+            must call with its own staged view of the same shape, in lockstep.
+        group_name: The same group name the view was staged with.
+
+    Returns:
+        The reduced view (same storage as the input).
+    """
     torch.ops.symm_mem.multimem_all_reduce_(view, "sum", group_name)
     return view
 
 
 __all__ = [
     "multimem_available",
+    "multimem_available_all_ranks",
     "multimem_stage",
     "multimem_all_reduce_staged",
 ]

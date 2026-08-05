@@ -73,6 +73,7 @@ from tokenspeed_kernel.ops.attn_res import attn_res_fwd
 from tokenspeed_kernel.ops.communication import allreduce_fusion_lane
 from tokenspeed_kernel.ops.communication.multimem import (
     multimem_all_reduce_staged,
+    multimem_available_all_ranks,
     multimem_stage,
 )
 from tokenspeed_kernel.ops.gemm import (
@@ -163,11 +164,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Measured tp16 crossover: below this the fused lane AR wins, above it the
-# column-parallel tail's 1/tp up-projection pays for the lost AR fusion.
+# Measured tp16 crossover vs the fused lane AR.
 _COLUMN_PARALLEL_MIN_TOKENS = 2048
-# With in-switch (ld_reduce) reduces the column-parallel tail wins everywhere
-# above the decode range — the ring-AR latency floor it traded against is gone.
+# ld_reduce stays flat down here, so the stitch engages right above decode.
 _MULTIMEM_MIN_TOKENS = 16
 
 
@@ -1107,6 +1106,14 @@ class KimiLinearMoE(nn.Module):
             else None
         )
 
+        # A rank diverging on eligibility would deadlock the barrier; agree once.
+        self._multimem_tail_ok = False
+        if (
+            torch.distributed.is_initialized()
+            and len(mapping.moe.tp_ep_group) == torch.distributed.get_world_size()
+        ):
+            self._multimem_tail_ok = multimem_available_all_ranks()
+
         # Fused AR(latent)+norm+RS tail with 1/tp-sharded up-projection.
         self._latent_tail = None
         if (
@@ -1257,8 +1264,9 @@ class KimiLinearMoE(nn.Module):
         hidden_size: int,
     ) -> torch.Tensor:
         """Combine the routed/shared partials onto ``prefix_sum``, best tier first:
-        fused decode kernel (<=16 tokens, graph replay), column-parallel stitch
-        (prefill-sized), fused-lane all-reduce, then the separate-reduce fallback
+        fused decode kernel (<=16 tokens, graph replay), multimem column-parallel
+        stitch (eager, >16 tokens), NCCL column-parallel stitch (no multicast,
+        >=2048), fused-lane all-reduce, then the separate-reduce fallback
         (``routed_out`` arrives already normed and up-projected there)."""
         if use_tail:
             # Partials are pre-reduce; the tail owns all communication.
@@ -1271,13 +1279,12 @@ class KimiLinearMoE(nn.Module):
             )
         if (
             self.execution_plan.fused_moe_ar
+            and self._multimem_tail_ok
             and num_tokens > _MULTIMEM_MIN_TOKENS
+            and not get_is_cuda_graph_phase()
             and hidden_size % self.mapping.moe.tp_ep_size == 0
-            and torch.distributed.is_initialized()
-            and len(self.mapping.moe.tp_ep_group) == torch.distributed.get_world_size()
         ):
-            # In-switch (ld_reduce) reduces staged through symmetric memory,
-            # with the same column-parallel stitch as below.
+            # In-switch (ld_reduce) reduces via symmetric memory, same stitch as below.
             group_name = torch.distributed.group.WORLD.group_name
             routed_stage = multimem_stage(routed_out, group_name)
             shared_stage = (
@@ -1302,9 +1309,7 @@ class KimiLinearMoE(nn.Module):
             and num_tokens >= _COLUMN_PARALLEL_MIN_TOKENS
             and hidden_size % self.mapping.moe.tp_ep_size == 0
         ):
-            # After AR(latent)+norm each rank up-projects only its hidden shard
-            # into the shared partial, so the shared reduce also stitches the
-            # shards (1/tp of the up-projection GEMM).
+            # Each rank up-projects only its hidden shard; the shared reduce stitches.
             routed_out = all_reduce(routed_out, self.mapping.moe.tp_ep_group)
             if self.routed_expert_norm is not None:
                 routed_out = self.routed_expert_norm(routed_out)
