@@ -87,7 +87,7 @@ def gluon_mla_project_value_gfx950(
     gate: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Project one token of per-head BF16 MLA values."""
+    """Fuse per-head latent-to-value projection with optional sigmoid gating."""
 
     heads, latent, value = weight.shape
     expected_attention = (1, heads, latent)

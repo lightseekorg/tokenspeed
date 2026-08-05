@@ -130,7 +130,7 @@ def gluon_mla_normalize_project_query_gfx950(
     out: torch.Tensor,
     tail_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Normalize MLA query/KV latents and project the normalized query."""
+    """Fuse query RMSNorm and projection with in-place KV RMSNorm."""
 
     output_width = projection_weight.shape[0]
     expected_inputs = (

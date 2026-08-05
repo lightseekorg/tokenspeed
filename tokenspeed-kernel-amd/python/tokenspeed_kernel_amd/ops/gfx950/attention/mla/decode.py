@@ -1858,6 +1858,7 @@ def _gluon_mla_decode_gfx950(
         if value_weight is not None:
             if return_lse or projected_out is None:
                 raise ValueError("MLA projected-value decode requires out")
+            # Fuse softmax reduction, value projection, and optional gating.
             gluon_mla_reduce_project_value_gfx950(
                 logits,
                 mid_lse,

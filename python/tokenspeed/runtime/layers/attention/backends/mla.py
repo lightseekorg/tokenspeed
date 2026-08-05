@@ -618,6 +618,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         gate = kwargs.get("output_gate")
         projected_out = kwargs.get("projected_output")
         if value_weight is not None:
+            # Fuse projection and gate into decode to avoid materializing latent output.
             result = mla_decode_with_kvcache(
                 query,
                 kv_cache,
