@@ -45,16 +45,33 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
         device="cpu",
         groups=None,
     ):
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    PagedCacheGroupSpec,
+)
+        from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
+
         # Bypass __init__: the paths under test read only these attributes.
         # Capture/replay tests pass device="cuda" and declare their groups —
         # replay write locs are triton-only (no python fallback).
         b = self.Backend.__new__(self.Backend)
         b.page_size = page_size
+        b.group_page_sizes = dict(groups or {})
+        b.cache_pool = None
+        if groups:
+            b.cache_pool = CachePool.__new__(CachePool)
+            b.cache_pool.paged_cache_group_specs = tuple(
+                PagedCacheGroupSpec(
+                    group_id=group_id,
+                    retention="full_history",
+                    rows_per_page=group_page_size,
+                    entry_stride_tokens=1,
+                    sliding_window_tokens=None,
+                )
+                for group_id, group_page_size in groups.items()
+            )
         b.max_num_pages = max_num_pages
         b.max_context_len = page_size * max_num_pages
         b.device = device
-        if groups is not None:
-            b.group_page_sizes = groups
         b.spec_num_tokens = spec_num_tokens
         b.is_draft = False
         b.draft_block_decode = False

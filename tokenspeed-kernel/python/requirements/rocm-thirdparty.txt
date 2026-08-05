@@ -1,2 +1,1 @@
-tokenspeed-triton-kernels==1.0.0.post20260510
 tokenspeed-iris==0.0.0.post20260511

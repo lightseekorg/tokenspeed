@@ -88,10 +88,10 @@ class _Experts(nn.Module):
         return hidden_states + 1
 
 
-def test_kimi3_reduce_fused_moe_selects_lane_norm(
+def test_kimi3_join_reduce_moe_selects_lane_norm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fused = torch.arange(6, dtype=torch.float32).view(1, 6)
+    lane = torch.arange(6, dtype=torch.float32).view(1, 6)
     norm = _Trace([], "norm")
     norm.weight = nn.Parameter(torch.ones(2))
     norm.variance_epsilon = 1e-6
@@ -106,8 +106,10 @@ def test_kimi3_reduce_fused_moe_selects_lane_norm(
         lambda *_args, **_kwargs: pytest.fail("lane norm must own the reduction"),
     )
 
-    routed, shared = latent_module.kimi3_reduce_fused_moe(
-        fused,
+    routed, shared = latent_module.kimi3_join_reduce_moe(
+        lane[:, :2],
+        lane[:, 2:],
+        lane=lane,
         routed_hidden=2,
         routed_norm=norm,
         group=(0, 1),
@@ -115,23 +117,33 @@ def test_kimi3_reduce_fused_moe_selects_lane_norm(
         max_token_num=8,
     )
 
-    torch.testing.assert_close(routed, fused[:, :2] + 10)
-    torch.testing.assert_close(shared, fused[:, 2:] + 10)
+    torch.testing.assert_close(routed, lane[:, :2] + 10)
+    torch.testing.assert_close(shared, lane[:, 2:] + 10)
 
 
-def test_kimi3_reduce_fused_moe_falls_back_for_multiple_tokens(
+def test_kimi3_join_reduce_moe_cats_small_partials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fused = torch.arange(12, dtype=torch.float32).view(2, 6)
+    routed_partial = torch.arange(4, dtype=torch.float32).view(2, 2)
+    shared_partial = torch.arange(8, dtype=torch.float32).view(2, 4)
     norm = _Trace([], "norm")
     monkeypatch.setattr(
         latent_module,
         "all_reduce",
         lambda value, _group: value + 10,
     )
+    monkeypatch.setattr(
+        latent_module,
+        "all_reduce_two",
+        lambda *_args, **_kwargs: pytest.fail(
+            "small partials must take the cat + single-reduce path"
+        ),
+    )
 
-    routed, shared = latent_module.kimi3_reduce_fused_moe(
-        fused,
+    routed, shared = latent_module.kimi3_join_reduce_moe(
+        routed_partial,
+        shared_partial,
+        lane=None,
         routed_hidden=2,
         routed_norm=norm,
         group=(0, 1),
@@ -139,8 +151,43 @@ def test_kimi3_reduce_fused_moe_falls_back_for_multiple_tokens(
         max_token_num=8,
     )
 
-    torch.testing.assert_close(routed, fused[:, :2] + 13)
-    torch.testing.assert_close(shared, fused[:, 2:] + 10)
+    torch.testing.assert_close(routed, routed_partial + 13)
+    torch.testing.assert_close(shared, shared_partial + 10)
+
+
+def test_kimi3_join_reduce_moe_grouped_reduce_for_large_partials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    routed_partial = torch.arange(4, dtype=torch.float32).view(2, 2)
+    shared_partial = torch.arange(8, dtype=torch.float32).view(2, 4)
+    norm = _Trace([], "norm")
+    monkeypatch.setattr(latent_module, "COMM_ONESHOT_MAX_BYTES", 1)
+    monkeypatch.setattr(
+        latent_module,
+        "all_reduce_two",
+        lambda first, second, group: (first + 20, second + 20),
+    )
+    monkeypatch.setattr(
+        latent_module,
+        "all_reduce",
+        lambda *_args, **_kwargs: pytest.fail(
+            "large partials must skip the cat + single-reduce path"
+        ),
+    )
+
+    routed, shared = latent_module.kimi3_join_reduce_moe(
+        routed_partial,
+        shared_partial,
+        lane=None,
+        routed_hidden=2,
+        routed_norm=norm,
+        group=(0, 1),
+        enable_lane_norm=True,
+        max_token_num=8,
+    )
+
+    torch.testing.assert_close(routed, routed_partial + 23)
+    torch.testing.assert_close(shared, shared_partial + 20)
 
 
 def _layer(

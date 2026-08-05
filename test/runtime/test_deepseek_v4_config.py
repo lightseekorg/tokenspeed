@@ -35,6 +35,9 @@ from tokenspeed.runtime.configs.model_config import (
     is_deepseek_v4,
     is_deepseek_v4_nextn,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    PagedCacheGroupSpec,
+)
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.execution.cuda_graph_wrapper import (
     CudaGraphWrapper,
@@ -1892,7 +1895,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         backend.init_cuda_graph_state(
             2,
             paged_cache_group_specs=(
-                SimpleNamespace(
+                PagedCacheGroupSpec(
                     group_id="v4.swa_kv",
                     retention="sliding_window",
                     rows_per_page=64,
@@ -3146,6 +3149,57 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
         )
         self.assertEqual(metadata.decode_token_count(), 4)
+
+    def test_deepseek_v4_cuda_graph_replay_pads_actual_batch_cache_tables(self):
+        backend = DeepseekV4AttentionBackend(
+            SimpleNamespace(
+                page_size=64,
+                device="cpu",
+                num_attention_heads=64,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                is_draft=False,
+                speculative_num_draft_tokens=1,
+                head_dim=512,
+                context_len=512,
+            )
+        )
+        group_id = v4_compressed_kv_group_id(4)
+        backend.init_cuda_graph_state(
+            max_bs=4,
+            paged_cache_group_specs=(
+                PagedCacheGroupSpec(
+                    group_id=group_id,
+                    retention="full_history",
+                    rows_per_page=64,
+                    entry_stride_tokens=4,
+                    sliding_window_tokens=None,
+                ),
+            ),
+        )
+        backend.init_forward_metadata_capture_cuda_graph(
+            bs=4,
+            req_pool_indices=torch.arange(4, dtype=torch.int32),
+            seq_lens=torch.ones(4, dtype=torch.int32),
+            forward_mode=ForwardMode.DECODE,
+        )
+        active_table = torch.tensor([[10, 11], [20, 21]], dtype=torch.int32)
+
+        backend.init_forward_metadata_replay_cuda_graph(
+            bs=4,
+            actual_bs=2,
+            req_pool_indices=torch.arange(4, dtype=torch.int32),
+            seq_lens=torch.tensor([70, 3, 1, 1], dtype=torch.int32),
+            forward_mode=ForwardMode.DECODE,
+            block_tables={group_id: active_table},
+        )
+
+        table = backend.forward_metadata.cache.block_table
+        self.assertTrue(torch.equal(table[:2, :2], active_table))
+        self.assertTrue(
+            torch.equal(table[2:, :2], torch.zeros((2, 2), dtype=torch.int32))
+        )
 
     def test_deepseek_v4_indexer_metadata_refresh_masks_padding_tokens(self):
         key = (4, 4, 3)

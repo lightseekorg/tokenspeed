@@ -280,6 +280,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
         import tokenspeed.runtime.models.kimi_k3 as kimi_k3
 
         shared_calls = []
+        expert_calls = []
 
         class FakeLinear(torch.nn.Module):
             def __init__(self, *args, **kwargs):
@@ -288,6 +289,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
         class FakeExperts(torch.nn.Module):
             def __init__(self, *args, **kwargs):
                 super().__init__()
+                expert_calls.append(kwargs)
                 self.support_routing = False
 
         class FakeSharedExperts(torch.nn.Module):
@@ -357,6 +359,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             )
 
         self.assertFalse(shared_calls[0]["reduce_results"])
+        self.assertEqual(expert_calls[0]["internal_activation_dtype_override"], "input")
         joint_reduce = layer.native_latent_moe.components["joint_reduce"]
         self.assertIs(joint_reduce.func, kimi_k3.all_reduce_two)
         self.assertEqual(joint_reduce.keywords, {"group": ep_group})

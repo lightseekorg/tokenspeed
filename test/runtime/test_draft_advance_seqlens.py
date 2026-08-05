@@ -18,7 +18,10 @@ from tokenspeed.runtime.layers.attention.backends.base import (
     init_backend_cuda_graph_state,
 )
 from tokenspeed.runtime.layers.attention.backends.mha import MHAAttnBackend
-from tokenspeed.runtime.layers.attention.backends.msa import MSAAttnBackend
+from tokenspeed.runtime.layers.attention.backends.msa import (
+    MSAAttnBackend,
+    MSAHybridAttnBackend,
+)
 from tokenspeed.runtime.layers.attention.backends.trtllm import (
     TRTLLMMHAAttnBackend,
 )
@@ -142,6 +145,30 @@ def test_msa_inherits_default_advance():
     seq_lens = torch.tensor([11, 12, 13, 14], dtype=torch.int32)
     be.advance_draft_forward_metadata(seq_lens)
     assert torch.equal(be.cuda_graph_seq_lens[:4], seq_lens)
+
+
+def test_msa_hybrid_composes_cache_contract_from_children():
+    class ChildBackend:
+        def __init__(self, families):
+            self.cache_consumer_families = frozenset(families)
+            self.cache_pool = None
+
+        def set_cache_pool(self, cache_pool):
+            self.cache_pool = cache_pool
+
+    dense = ChildBackend({"history"})
+    sparse = ChildBackend({"history"})
+    backend = object.__new__(MSAHybridAttnBackend)
+    backend.full_attn_backend = dense
+    backend.sparse_attn_backend = sparse
+    pool = object()
+
+    backend.set_cache_pool(pool)
+
+    assert backend.cache_consumer_families == frozenset({"history"})
+    assert backend.cache_pool is pool
+    assert dense.cache_pool is pool
+    assert sparse.cache_pool is pool
 
 
 def test_default_advance_is_a_noop_before_graph_state_exists():

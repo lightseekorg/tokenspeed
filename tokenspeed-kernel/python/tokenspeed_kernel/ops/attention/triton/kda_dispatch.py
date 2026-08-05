@@ -4,8 +4,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023-2026, Songlin Yang, Yu Zhang,
 # Zhiyuan Li
 #
-# The adapters in this file preserve the existing AMD and NVIDIA KDA
-# implementations behind one public kernel contract.
+# The adapters in this file preserve the NVIDIA KDA implementations behind one
+# public kernel contract.
 
 """Registered adapters for KDA implementations."""
 
@@ -20,52 +20,6 @@ from tokenspeed_kernel.signature import format_signatures
 _DENSE_HALF_SIGNATURES = format_signatures(
     ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
 )
-
-
-@register_kernel(
-    "attention",
-    "kda_paged_prefill",
-    name="triton_amd_kda_paged_prefill",
-    solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"amd"})),
-    signatures=_DENSE_HALF_SIGNATURES,
-    priority=Priority.PERFORMANT,
-    tags={"amd", "paged_cache"},
-)
-def triton_amd_kda_paged_prefill(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g_raw: torch.Tensor,
-    beta_logits: torch.Tensor,
-    A_log: torch.Tensor,
-    dt_bias: torch.Tensor,
-    *,
-    initial_state: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    lower_bound: float | None,
-) -> KdaPrefillResult:
-    """Adapt the AMD chunk kernels to the canonical K-major public contract."""
-    from tokenspeed_kernel.ops.attention.triton.kda_chunk import (
-        kda_chunk_prefill,
-    )
-
-    args = (
-        q.squeeze(0),
-        k.squeeze(0),
-        v.squeeze(0),
-        g_raw.squeeze(0),
-        beta_logits.squeeze(0),
-        initial_state,
-        A_log,
-        dt_bias.view(q.shape[-2], q.shape[-1]),
-    )
-    out, final_state = kda_chunk_prefill(
-        *args,
-        lower_bound=lower_bound,
-        cu_seqlens=cu_seqlens,
-    )
-    return KdaPrefillResult(out.unsqueeze(0), final_state)
 
 
 @register_kernel(

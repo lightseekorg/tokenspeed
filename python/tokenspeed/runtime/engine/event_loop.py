@@ -212,6 +212,10 @@ class EventLoop:
         target, draft = create_model_runner(
             server_args, self.model_config, draft_model_config, gpu_id, global_rank
         )
+        if server_args.disaggregation_mode in ("null", "prefill"):
+            # Keep this after all target/draft weights are loaded and before
+            # create_attn_components profiles memory for the KV-cache budget.
+            target.prepare_multimodal_runtime()
         self.use_overlap_schedule = should_use_overlap_schedule(
             disable_overlap_schedule=server_args.disable_overlap_schedule,
             disaggregation_mode=server_args.disaggregation_mode,

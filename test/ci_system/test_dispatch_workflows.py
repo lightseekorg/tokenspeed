@@ -14,6 +14,10 @@ def workflow_dispatch_inputs(name: str) -> dict:
     return triggers["workflow_dispatch"]["inputs"]
 
 
+def load_yaml(path: Path) -> dict:
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
 def eligible_config_paths(runner_prefixes: tuple[str, ...]) -> set[str]:
     paths = set()
     for path in (REPO_ROOT / "test" / "ci").rglob("*.yaml"):
@@ -44,3 +48,18 @@ def test_slurm_dispatch_lists_every_b200_and_gb200_ci_yaml():
 def test_slurm_dispatch_lists_every_supported_trigger():
     choices = workflow_dispatch_inputs("slurm-dispatch.yml")["trigger"]["options"]
     assert set(choices) == {"all", "per-commit", "manual", "nightly", "debug"}
+
+
+def test_qwen35_agentic_allows_declared_80k_context():
+    task = load_yaml(
+        REPO_ROOT / "test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-agentic.yaml"
+    )
+
+    assert "--max-model-len 80000" in task["server"]["command"]
+    assert task["env"]["TOKENSPEED_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] == "1"
+
+
+def test_nvidia_arm_model_tests_allow_runner_wait_time():
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/pr-test-nvidia-arm.yml")
+
+    assert workflow["jobs"]["model-test"]["with"]["timeout_minutes"] >= 120

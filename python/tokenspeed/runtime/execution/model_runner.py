@@ -25,8 +25,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 from tokenspeed.runtime.execution.weight_loader import WeightLoader
 from tokenspeed.runtime.layers.moe.utils import initialize_moe_config
+from tokenspeed.runtime.multimodal.embedder import warmup_multimodal_encoders
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import global_server_args_dict_update
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -113,6 +115,32 @@ class ModelRunner:
         )
         self._model_forward_accepts_spec_step_idx = self._forward_accepts_kwarg(
             self.model, "spec_step_idx"
+        )
+
+    def prepare_multimodal_runtime(self) -> None:
+        """Prepare loaded multimodal encoders for serving.
+
+        This is an explicit post-load phase because it can execute substantial
+        GPU work. Language workers must call it before KV-cache memory
+        profiling so retained encoder graph pools and lazy buffers are included
+        in the cache budget. Encoder-only EPD workers call the same phase even
+        though they do not allocate a KV cache.
+        """
+        self.encoder_graph_wrappers = MultimodalRuntime.install_encoder_graphs(
+            self.model, self.server_args
+        )
+        if self.encoder_graph_wrappers:
+            logger.info(
+                "Multimodal encoder CUDA graphs installed for %s",
+                sorted(self.encoder_graph_wrappers),
+            )
+
+        warmup_device = torch.device(self.device)
+        if warmup_device.type == "cuda" and warmup_device.index is None:
+            warmup_device = torch.device("cuda", self.gpu_id)
+        warmup_multimodal_encoders(
+            self.model,
+            device=warmup_device,
         )
 
     @staticmethod

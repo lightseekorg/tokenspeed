@@ -37,6 +37,7 @@ the null page 0 by the scheduler export.
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import (
@@ -49,6 +50,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
 )
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.common import ceil_div
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 
 logger = get_colorful_logger(__name__)
 
@@ -166,6 +170,15 @@ class CacheGroupsMixin:
         if skip:
             tables = {gid: table for gid, table in tables.items() if gid not in skip}
         return tables or None
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Learned from the pool by _learn_cache_groups / set_cache_pool;
+        # init_cuda_graph_state is never reached under --enforce-eager, so
+        # establish the empty state at construction.
+        self.state_group_ids: frozenset[str] = frozenset()
+        self.group_page_sizes: dict[str, int] = {}
+        self.cache_pool: CachePool | None = None
 
     def _learn_cache_groups(self, paged_cache_group_specs) -> None:
         """Record the pool's family="state" group ids (see

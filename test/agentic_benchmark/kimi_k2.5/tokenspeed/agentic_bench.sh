@@ -3,7 +3,7 @@
 set -euo pipefail
 
 # Prepare dataset
-EVALSCOPE_COMMIT=acd09b44384d53174768bb1063f675420f76fae9
+EVALSCOPE_COMMIT=9d052ca0240ebf8b603c053fa44727b863ff3933
 pip install "evalscope[perf] @ git+https://github.com/modelscope/evalscope.git@${EVALSCOPE_COMMIT}"
 
 [ -f build_swe_smith_dataset.py ] || wget https://raw.githubusercontent.com/modelscope/evalscope/${EVALSCOPE_COMMIT}/examples/perf/build_swe_smith_dataset.py \

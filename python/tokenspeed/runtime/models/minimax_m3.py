@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Iterable, Sequence
 
 import torch
@@ -1653,6 +1654,89 @@ class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForCausalLM):
 
         return self._get_vision_feature(items, Modality.VIDEO)
 
+    def _make_vision_warmup_items(
+        self,
+        modality: Modality,
+        *,
+        temporal_patches: int,
+        grid_key: str,
+    ) -> list[MultimodalDataItem]:
+        """Build one input on MiniMax-M3's configured default image-token grid."""
+        vision_config = self.vl_config.vision_config
+        merge = int(vision_config.spatial_merge_size)
+        num_merged_tokens = int(self.vl_config.image_seq_length)
+        if merge <= 0 or num_merged_tokens <= 0:
+            raise ValueError(
+                "MiniMax-M3 image_seq_length and spatial_merge_size must be "
+                "positive, got "
+                f"image_seq_length={self.vl_config.image_seq_length}, "
+                f"spatial_merge_size={merge}"
+            )
+
+        # MiniMax-M3 accepts dynamic rectangular grids. Choose the closest
+        # factor pair so the configured default token count remains exact;
+        # the released 576-token config resolves to a 48x48 raw-patch grid.
+        merged_grid_h = math.isqrt(num_merged_tokens)
+        while num_merged_tokens % merged_grid_h:
+            merged_grid_h -= 1
+        merged_grid_w = num_merged_tokens // merged_grid_h
+        grid_h = merged_grid_h * merge
+        grid_w = merged_grid_w * merge
+        num_spatial_patches = grid_h * grid_w
+
+        flattened_patch_size = (
+            int(vision_config.num_channels)
+            * int(vision_config.temporal_patch_size)
+            * int(vision_config.patch_size) ** 2
+        )
+        grid = torch.tensor(
+            [[temporal_patches, grid_h, grid_w]],
+            dtype=torch.long,
+        )
+        feature = torch.zeros(
+            temporal_patches * num_spatial_patches,
+            flattened_patch_size,
+            dtype=self.vision_tower.dtype,
+        )
+        return [
+            MultimodalDataItem(
+                modality=modality,
+                feature=feature,
+                model_specific_data={grid_key: grid},
+            )
+        ]
+
+    def make_image_warmup_items(self) -> list[MultimodalDataItem]:
+        return self._make_vision_warmup_items(
+            Modality.IMAGE,
+            temporal_patches=1,
+            grid_key="image_grid_thw",
+        )
+
+    def make_video_warmup_items(self) -> list[MultimodalDataItem]:
+        return self._make_vision_warmup_items(
+            Modality.VIDEO,
+            # Use two temporal groups. Each group already contains
+            # vision_config.temporal_patch_size raw frames in the flattened
+            # patch width, so grid_t must not scale with that value.
+            temporal_patches=2,
+            grid_key="video_grid_thw",
+        )
+
+    def get_multimodal_encoder_specs(self) -> dict[Modality, EncoderSpec]:
+        if self.vision_tower is None:
+            return {}
+        return {
+            Modality.IMAGE: EncoderSpec(
+                self.image_encoder,
+                make_warmup_items=self.make_image_warmup_items,
+            ),
+            Modality.VIDEO: EncoderSpec(
+                self.video_encoder,
+                make_warmup_items=self.make_video_warmup_items,
+            ),
+        }
+
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
@@ -1689,10 +1773,7 @@ class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForCausalLM):
             input_ids=input_ids,
             text_embedding=self.model.embed_tokens,
             ctx=multimodal_context,
-            encoders={
-                Modality.IMAGE: EncoderSpec(self.image_encoder),
-                Modality.VIDEO: EncoderSpec(self.video_encoder),
-            },
+            encoders=self.get_multimodal_encoder_specs(),
             multimodal_model=self,
             is_decode_or_idle=ctx.forward_mode.is_decode_or_idle(),
         )
