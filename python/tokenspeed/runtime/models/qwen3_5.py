@@ -39,6 +39,7 @@ from tokenspeed_kernel.ops.layernorm.triton import (
 from tokenspeed.runtime.configs.paged_cache_spec import FULL_ATTENTION
 from tokenspeed.runtime.configs.qwen3_5_config import (
     Qwen3_5Config,
+    Qwen3_5MoeConfig,
     Qwen3_5TextConfig,
 )
 from tokenspeed.runtime.configs.utils import get_rope_parameters
@@ -1134,7 +1135,10 @@ class Qwen3_5ForCausalLM(nn.Module):
         return loaded_params
 
 
-class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
+class Qwen3_5MoeModel(Qwen3_5ForCausalLM):
+    """MoE backbone (internal). The ``Qwen3_5MoeForCausalLM`` name is taken by
+    the registry entry class for text-only flat checkpoints below."""
+
     def __init__(
         self,
         config: Qwen3_5TextConfig,
@@ -1292,8 +1296,8 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             )
             self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
             self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
-            # Encoder callables may be swapped to cudagraph wrappers by
-            # ModelExecutor.
+            # Encoder callables may be swapped to cudagraph wrappers during
+            # runtime startup.
             self.vision_embedder = VisionEmbedder(encoder_mapping=mapping.vision)
             self.image_encoder = self.get_image_feature
             self.video_encoder = self.get_video_feature
@@ -1327,6 +1331,22 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         metadata = self.visual.prepare_metadata(grid)
         encoded = self.visual.forward_blocks(tokens, metadata)
         return self.post_encode([encoded], grid)
+
+    def get_multimodal_encoder_specs(self) -> dict[Modality, EncoderSpec]:
+        if self.visual is None:
+            return {}
+        return {
+            Modality.IMAGE: EncoderSpec(
+                self.image_encoder,
+                deepstack=True,
+                make_warmup_items=self.visual.make_image_warmup_items,
+            ),
+            Modality.VIDEO: EncoderSpec(
+                self.video_encoder,
+                deepstack=True,
+                make_warmup_items=self.visual.make_video_warmup_items,
+            ),
+        }
 
     def pre_encode(
         self,
@@ -1480,10 +1500,7 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             input_ids=input_ids,
             text_embedding=self.model.get_input_embeddings(),
             ctx=multimodal_context,
-            encoders={
-                Modality.IMAGE: EncoderSpec(self.image_encoder, deepstack=True),
-                Modality.VIDEO: EncoderSpec(self.video_encoder, deepstack=True),
-            },
+            encoders=self.get_multimodal_encoder_specs(),
             multimodal_model=self,
         )
         hidden_states, aux_hidden_states = self.model(
@@ -1587,7 +1604,7 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
 class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
     """Qwen3.5 MoE Vision-Language Model."""
 
-    model_cls = Qwen3_5MoeForCausalLM
+    model_cls = Qwen3_5MoeModel
 
     def __init__(
         self,
@@ -1724,6 +1741,43 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             num_layers=text_config.num_hidden_layers,
             num_logical_experts=text_config.num_experts,
             num_groups=None,
+        )
+
+
+class Qwen3_5MoeForCausalLM(Qwen3_5MoeForConditionalGeneration):
+    """Text-only Qwen3.5-MoE entry."""
+
+    def __init__(
+        self,
+        config,
+        mapping: Mapping,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        if not hasattr(config, "text_config"):
+            archs = list(getattr(config, "architectures", None) or [])
+            config = Qwen3_5MoeConfig(text_config=config)
+            config.__dict__["architectures"] = archs or ["Qwen3_5MoeForCausalLM"]
+        super().__init__(
+            config=config,
+            mapping=mapping,
+            quant_config=quant_config,
+            prefix=prefix,
+            is_multimodal_active=False,
+        )
+
+    def resolve_model(
+        self,
+        config,
+        mapping: Mapping,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ):
+        return self.model_cls(
+            config=config,
+            mapping=mapping,
+            quant_config=quant_config,
+            prefix=add_prefix("model", prefix),  # no ``model.language_model`` scope
         )
 
 
@@ -1899,4 +1953,8 @@ def fused_qkvzba_split_reshape_cat_contiguous(
     return mixed_qkv, z, b, a
 
 
-EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]
+EntryClass = [
+    Qwen3_5MoeForConditionalGeneration,
+    Qwen3_5ForConditionalGeneration,
+    Qwen3_5MoeForCausalLM,
+]

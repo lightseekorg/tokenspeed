@@ -65,7 +65,7 @@ from tokenspeed.runtime.multimodal.encoder_cudagraph import (
     EncoderCudaGraphWrapper,
     VisionEncoderCudaGraphAdapter,
 )
-from tokenspeed.runtime.multimodal.inputs import MultimodalDataItem
+from tokenspeed.runtime.multimodal.inputs import Modality, MultimodalDataItem
 from tokenspeed.runtime.utils import add_prefix
 
 
@@ -928,6 +928,35 @@ class MoonViTVisionPath(nn.Module):
             mm_attention_backend=mm_attention_backend,
         )
         self.mm_projector = MoonViTMultiModalProjector(self.vision_spec)
+
+    def make_image_warmup_items(self) -> list[MultimodalDataItem]:
+        """Build a synthetic image at MoonViT's native position grid."""
+        grid_height = int(self.vision_spec.init_pos_emb_height)
+        grid_width = int(self.vision_spec.init_pos_emb_width)
+        merge_h, merge_w = self.vision_tower.merge_kernel_size
+        if grid_height % merge_h or grid_width % merge_w:
+            raise ValueError(
+                "MoonViT's native position grid "
+                f"{(grid_height, grid_width)} must be divisible by "
+                f"merge_kernel_size={(merge_h, merge_w)}"
+            )
+        patch_embed = self.vision_tower.patch_embed
+        patch_height, patch_width = patch_embed.patch_size
+        feature = torch.zeros(
+            grid_height * grid_width,
+            3,
+            patch_height,
+            patch_width,
+            dtype=patch_embed.proj.weight.dtype,
+        )
+        grid_thws = torch.tensor([[1, grid_height, grid_width]], dtype=torch.long)
+        return [
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                feature=feature,
+                model_specific_data={"grid_thws": grid_thws},
+            )
+        ]
 
     def pre_encode(
         self, items: list[MultimodalDataItem]

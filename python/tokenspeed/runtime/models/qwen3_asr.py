@@ -127,6 +127,16 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
             raise RuntimeError("Qwen3-ASR audio tower is disabled")
         return self.audio_tower.encode(items)
 
+    def get_multimodal_encoder_specs(self) -> dict[Modality, EncoderSpec]:
+        if self.audio_tower is None or self.audio_encoder is None:
+            return {}
+        return {
+            Modality.AUDIO: EncoderSpec(
+                self.audio_encoder,
+                make_warmup_items=self.audio_tower.make_warmup_items,
+            )
+        }
+
     def pad_input_ids(
         self, input_ids: list[int], mm_inputs: MultimodalInputs
     ) -> list[int]:
@@ -190,7 +200,7 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
                 input_ids=input_ids,
                 text_embedding=self.get_input_embeddings(),
                 ctx=multimodal_context,
-                encoders={Modality.AUDIO: EncoderSpec(self.audio_encoder)},
+                encoders=self.get_multimodal_encoder_specs(),
                 multimodal_model=self,
             )
             kwargs.update(model_kwargs)

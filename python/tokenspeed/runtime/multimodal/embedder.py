@@ -77,6 +77,7 @@ from tokenspeed.runtime.multimodal.inputs import (
 from tokenspeed.runtime.utils.env import envs
 
 EncoderFn = Callable[[list[MultimodalDataItem]], torch.Tensor]
+EncoderWarmupItemsFactory = Callable[[], list[MultimodalDataItem]]
 
 logger = logging.getLogger(__name__)
 LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
@@ -88,11 +89,61 @@ class EncoderSpec:
 
     Bundles the encoder callable with whether its output needs to be
     split into a main + deepstack pair via the model's
-    ``separate_deepstack_embeds`` hook.
+    ``separate_deepstack_embeds`` hook. ``make_warmup_items`` is optional so
+    each encoder family can describe its native startup input without the
+    startup path assuming a particular modality or feature layout.
     """
 
     fn: EncoderFn
     deepstack: bool = False
+    make_warmup_items: EncoderWarmupItemsFactory | None = None
+
+
+def warmup_multimodal_encoders(
+    model: Any,
+    *,
+    device: str | torch.device,
+) -> None:
+    """Run each registered encoder family's native synthetic input."""
+    if not getattr(model, "is_multimodal_active", False):
+        return
+
+    get_specs = getattr(model, "get_multimodal_encoder_specs", None)
+    if not callable(get_specs):
+        return
+
+    warmup_device = torch.device(device)
+    specs: dict[Modality, EncoderSpec] = get_specs()
+    for modality, spec in specs.items():
+        if spec.make_warmup_items is None:
+            continue
+        items = spec.make_warmup_items()
+        if not items:
+            continue
+
+        start = time.perf_counter()
+        try:
+            with torch.inference_mode():
+                output = spec.fn(items)
+                del output
+                if warmup_device.type == "cuda":
+                    torch.cuda.synchronize(warmup_device)
+        except Exception:
+            logger.exception(
+                "Multimodal encoder warmup failed: modality=%s",
+                modality.name.lower(),
+            )
+            raise
+        logger.info(
+            "Multimodal encoder warmup complete: modality=%s "
+            "feature_shapes=%s elapsed=%.3f ms",
+            modality.name.lower(),
+            [
+                tuple(item.feature.shape) if item.feature is not None else None
+                for item in items
+            ],
+            (time.perf_counter() - start) * 1000.0,
+        )
 
 
 # ---------------------------------------------------------------------------
