@@ -54,6 +54,12 @@ class DSABackend(AttentionBackend):
     Dense MLA metadata and dense attention calls are delegated to a platform backend.
     """
 
+    # DSA reads the history (full-attention) family: the dense sub-backend holds
+    # the group tables, and the sparse path maps its top-k slots through the same
+    # block_kv_indices. Declared here because the scheduler validates the
+    # outermost backend, not the delegate.
+    cache_consumer_families = frozenset({"history"})
+
     def __init__(self, config: DSAConfig):
         super().__init__(config)
         platform = current_platform()
@@ -120,6 +126,16 @@ class DSABackend(AttentionBackend):
     def override_num_extends(self, num_extends: int):
         return self._dense_backend.override_num_extends(num_extends)
 
+    def mark_cache_contract(self, logical_page_size: int | None = None) -> None:
+        """Forward the contract mark to the dense sub-backend, which owns the
+        group tables and the graph write-location buffer."""
+        self._dense_backend.mark_cache_contract(logical_page_size=logical_page_size)
+
+    def select_out_cache_loc(self, layer, out_cache_loc, forward_mode=None):
+        return self._dense_backend.select_out_cache_loc(
+            layer, out_cache_loc, forward_mode
+        )
+
     def init_cuda_graph_state(self, max_bs: int):
         self._dense_backend.init_cuda_graph_state(max_bs)
 
@@ -137,10 +153,15 @@ class DSABackend(AttentionBackend):
             forward_mode=forward_mode,
         )
         metadata = self.forward_decode_metadata
-        # Full-length broadcast: the plan and paged-MQA-logits kernels read only
-        # the last column, and the per-token causal bound is applied downstream.
+        # Per-token context lengths: the paged-MQA-logits kernel only supports
+        # next_n == 1, so each verify token is its own row (bs * spec_num_tokens
+        # rows, each holding its request's full KV length). The per-token causal
+        # bound is applied downstream in the top-k. See deep_gemm_dsa_decode_topk.
         metadata._dsa_seq_lens_2d = (
-            seq_lens.unsqueeze(1).expand(-1, self.spec_num_tokens).contiguous()
+            seq_lens.unsqueeze(1)
+            .expand(-1, self.spec_num_tokens)
+            .reshape(-1, 1)
+            .contiguous()
         )
         metadata._dsa_plan = dsa_plan(
             seq_lens_2d=metadata._dsa_seq_lens_2d, page_size=self.page_size
@@ -152,7 +173,7 @@ class DSABackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
-        req_to_page: torch.Tensor = None,
+        page_table: torch.Tensor = None,
         **kwargs,
     ):
         self._dense_backend.init_forward_metadata_replay_cuda_graph(
@@ -160,12 +181,12 @@ class DSABackend(AttentionBackend):
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             forward_mode=forward_mode,
-            req_to_page=req_to_page,
+            page_table=page_table,
             **kwargs,
         )
         metadata = self.forward_decode_metadata
         metadata._dsa_seq_lens_2d.copy_(
-            seq_lens.unsqueeze(1).expand(-1, self.spec_num_tokens)
+            seq_lens.unsqueeze(1).expand(-1, self.spec_num_tokens).reshape(-1, 1)
         )
         dsa_plan(
             seq_lens_2d=metadata._dsa_seq_lens_2d,
@@ -198,7 +219,7 @@ class DSABackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
-        req_to_page: torch.Tensor,
+        page_table: torch.Tensor,
         **kwargs,
     ):
         self._dense_backend.init_forward_metadata(
@@ -207,7 +228,7 @@ class DSABackend(AttentionBackend):
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             forward_mode=forward_mode,
-            req_to_page=req_to_page,
+            page_table=page_table,
             **kwargs,
         )
         if (
@@ -216,13 +237,21 @@ class DSABackend(AttentionBackend):
             or (forward_mode.is_extend() and self.is_draft)
         ):
             metadata = self.forward_decode_metadata
-            # Full-length broadcast: the plan and paged-MQA-logits kernels read only
-            # the last column, and the per-token causal bound is applied downstream.
+            # Per-token context lengths: the paged-MQA-logits kernel only supports
+            # next_n == 1, so each verify token is its own row (bs * spec_num_tokens
+            # rows). The per-token causal bound is applied downstream in the top-k.
+            # See deep_gemm_dsa_decode_topk.
             metadata._dsa_seq_lens_2d = (
-                seq_lens.unsqueeze(1).expand(-1, self.spec_num_tokens).contiguous()
+                seq_lens.unsqueeze(1)
+                .expand(-1, self.spec_num_tokens)
+                .reshape(-1, 1)
+                .contiguous()
             )
             if num_extends < bs:
-                seq_lens_2d = metadata._dsa_seq_lens_2d[num_extends:]
+                # Decode rows only: skip the extend requests' per-token block.
+                seq_lens_2d = metadata._dsa_seq_lens_2d[
+                    num_extends * self.spec_num_tokens :
+                ]
             else:
                 # The dsa_plan is unused, alias to full-batch seq_lens_2d to generate dsa_plan as a placeholder
                 seq_lens_2d = metadata._dsa_seq_lens_2d
@@ -231,17 +260,23 @@ class DSABackend(AttentionBackend):
             )
 
         self._prefill_block_tables = None
-        if (
-            num_extends > 0
-            and req_to_page is not None
-            and forward_mode.is_extend_or_mixed()
-        ):
+        if num_extends > 0 and forward_mode.is_extend_or_mixed():
+            cache_metadata = kwargs.get("cache_metadata")
             cmeta = getattr(self._dense_backend, "chunked_prefill_metadata", None)
-            cmeta_req_pool_indices = getattr(cmeta, "req_pool_indices", None)
-            if cmeta is not None and cmeta_req_pool_indices is not None:
-                ext_idx = cmeta_req_pool_indices[:num_extends].long()
-                self._prefill_block_tables = req_to_page[ext_idx]
-                cmeta.block_tables = self._prefill_block_tables
+            if cmeta is not None:
+                # Extend requests are the first num_extends batch rows. The
+                # target carries the full-history table in cache_metadata; a
+                # draft is handed the batch-ordered draft page table directly.
+                table = None
+                if cache_metadata is not None:
+                    table = cache_metadata.require_full_attention_table(
+                        active_forward_op=kwargs.get("forward_batch")
+                    )
+                elif page_table is not None:
+                    table = page_table
+                if table is not None:
+                    self._prefill_block_tables = table[:num_extends]
+                    cmeta.block_tables = self._prefill_block_tables
 
     def _validate_logit_cap(self, logits_soft_cap: float) -> None:
         if logits_soft_cap and logits_soft_cap > 0:

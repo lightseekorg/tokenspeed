@@ -201,7 +201,7 @@ class PrefillGraph:
         token_to_kv_pool: KV pool the dummy batch points at (reserved dummy slot).
         input_buffers: The shared static input buffers the graphs read from.
         config: Model-executor config (buckets, DP/world topology, device).
-        req_to_page: Request page table; row 0 backs the dummy capture request.
+        page_table: Request page table; row 0 backs the dummy capture request.
         drafter: If present, aux-hidden capture (EAGLE3/MTP) is baked into the
             captured graphs.
     """
@@ -213,7 +213,7 @@ class PrefillGraph:
         token_to_kv_pool,
         input_buffers: InputBuffers,
         config: ModelExecutorConfig,
-        req_to_page: torch.Tensor | None,
+        page_table: torch.Tensor | None,
         drafter=None,
         num_warmup: int = 3,
     ) -> None:
@@ -233,7 +233,7 @@ class PrefillGraph:
         self.token_to_kv_pool = token_to_kv_pool
         self.input_buffers = input_buffers
         self.config = config
-        self.req_to_page = req_to_page
+        self.page_table = page_table
         self.drafter = drafter
         self.num_warmup = num_warmup
         self.dp_size = config.data_parallel_size
@@ -311,7 +311,7 @@ class PrefillGraph:
             if init_pfg_state is not None:
                 init_pfg_state(
                     max_num_tokens=max(self.capture_buckets),
-                    max_bs=int(self.req_to_page.shape[0]),
+                    max_bs=int(self.page_table.shape[0]),
                 )
             with maybe_inference_mode():
                 self._capture_all_buckets(decode_wrapper)
@@ -330,6 +330,7 @@ class PrefillGraph:
                 "prefill. This model family may need dedicated dummy-batch support.",
                 type(exc).__name__,
                 exc,
+                exc_info=True,
             )
             captured_ok = False
         if not self._capture_unanimous(captured_ok):
@@ -497,12 +498,11 @@ class PrefillGraph:
         ib.extend_prefix_lens_buf[:bs].zero_()
         ib.extend_prefix_lens_cpu[:bs].zero_()
         # Dummy requests' pages -> page 0 (valid memory).
-        self.req_to_page[:bs].zero_()
+        self.page_table[:bs].zero_()
 
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
-            req_to_page=self.req_to_page,
             bs=bs,
             num_extends=bs,
             input_num_tokens=num_tokens,
@@ -555,7 +555,7 @@ class PrefillGraph:
             num_extends=bs,
             req_pool_indices=ib.req_pool_indices_buf[:bs],
             seq_lens=ib.seq_lens_buf[:bs],
-            req_to_page=self.req_to_page,
+            page_table=self.page_table,
             forward_mode=ForwardMode.EXTEND,
             extend_seq_lens=ib.extend_seq_lens_buf[:bs],
             extend_seq_lens_cpu=ib.extend_seq_lens_cpu[:bs],
@@ -706,16 +706,16 @@ class PrefillGraph:
     def _padded_bucket(self, num_tokens: int) -> int | None:
         """Smallest bucket >= ``num_tokens``, or ``None`` if over the largest.
 
-        With ``--disable-cuda-graph-padding``, only an exact bucket match
-        replays (mirroring the decode wrapper's no-padding semantics).
+        ``--disable-cuda-graph-padding`` deliberately does NOT apply here: the
+        bucket ladder IS the padding scheme (real token counts almost never
+        equal a bucket, so honoring the flag reduced the prefill graph to
+        exact matches -- effectively off for ragged traffic). The flag keeps
+        its decode-wrapper meaning, where padding trades wasted compute.
         """
         idx = bisect.bisect_left(self.capture_buckets, num_tokens)
         if idx == len(self.capture_buckets):
             return None
-        bucket = self.capture_buckets[idx]
-        if self.config.disable_cuda_graph_padding and bucket != num_tokens:
-            return None
-        return bucket
+        return self.capture_buckets[idx]
 
     @contextmanager
     def _padded_to(self, ctx: ForwardContext, bucket: int):

@@ -214,6 +214,7 @@ class InitForwardMetadataAssemblyTest(_MHACase):
         torch = self.torch
         backend = self.MHAAttnBackend.__new__(self.MHAAttnBackend)
         backend.page_size = PAGE
+        backend.group_page_sizes = {}
         backend.max_context_len = MAX_NUM_PAGES * PAGE
         backend.max_num_pages = MAX_NUM_PAGES
         backend.spec_num_tokens = 1
@@ -223,9 +224,7 @@ class InitForwardMetadataAssemblyTest(_MHACase):
         backend.forward_decode_metadata = None
         backend.forward_extend_metadata = None
         self.backend = backend
-        self.req_to_page = torch.zeros(
-            (MAX_NUM_PAGES, MAX_NUM_PAGES), dtype=torch.int32
-        )
+        self.page_table = torch.zeros((MAX_NUM_PAGES, MAX_NUM_PAGES), dtype=torch.int32)
 
     def _init(
         self,
@@ -246,7 +245,7 @@ class InitForwardMetadataAssemblyTest(_MHACase):
             bs,
             torch.arange(bs, dtype=torch.int64),
             seq_lens,
-            self.req_to_page,
+            self.page_table,
             forward_mode,
             extend_seq_lens,
             extend_seq_lens,  # *_cpu twin: same values, sliced + tolist'ed

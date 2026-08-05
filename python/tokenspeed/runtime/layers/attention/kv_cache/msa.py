@@ -8,12 +8,11 @@ from __future__ import annotations
 import torch
 
 from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPool
+from tokenspeed.runtime.layers.attention.kv_cache.plan import CacheMemoryPlan
 
 
 class MSATokenToKVPool(MHATokenToKVPool):
     """MHA K/V cache plus a key-only sparse-index side cache."""
-
-    supports_hierarchical_kv_cache = False
 
     def __init__(
         self,
@@ -32,6 +31,7 @@ class MSATokenToKVPool(MHATokenToKVPool):
         index_head_dim: int,
         index_dtype: torch.dtype,
         indexed_layer_ids: frozenset[int],
+        memory_plan: CacheMemoryPlan,
         layer_types: tuple[str, ...] = (),
         sliding_window_tokens: int | tuple[int | None, ...] | None = None,
         max_scheduled_tokens: int = 0,
@@ -57,17 +57,16 @@ class MSATokenToKVPool(MHATokenToKVPool):
             sliding_window_tokens=sliding_window_tokens,
             max_scheduled_tokens=max_scheduled_tokens,
             pd_disaggregation_enabled=pd_disaggregation_enabled,
+            memory_plan=memory_plan,
         )
         with self.memory_saver_adapter.region(
             tag="kv_cache",
             enable_cpu_backup=False,
         ):
             self.index_k_buffer = {
-                layer_id: torch.zeros(
-                    (self.size + self.page_size, self.index_head_dim),
-                    dtype=self.index_dtype,
-                    device=self.device,
-                )
+                layer_id: self.field(
+                    f"layer.{layer_id}.index_k", self.index_dtype
+                ).view(-1, self.index_head_dim)
                 for layer_id in sorted(self.indexed_layer_ids)
             }
 
@@ -77,21 +76,6 @@ class MSATokenToKVPool(MHATokenToKVPool):
         if layer_id not in self.index_k_buffer:
             raise RuntimeError(f"Layer {layer_id} has no index-key cache.")
         return self.index_k_buffer[layer_id]
-
-    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
-        super().move_kv_cache(tgt_loc, src_loc)
-        if tgt_loc.numel() == 0:
-            return
-        target = tgt_loc.view(-1).long()
-        source = src_loc.view(-1).long()
-        for cache in self.index_k_buffer.values():
-            cache[target] = cache[source]
-
-    @torch.no_grad()
-    def clear_kv_buffers(self) -> None:
-        super().clear_kv_buffers()
-        for cache in self.index_k_buffer.values():
-            cache.zero_()
 
     def get_kv_size_bytes(self) -> tuple[int, int]:
         key_bytes, value_bytes = super().get_kv_size_bytes()

@@ -101,7 +101,6 @@ def test_distributed_ep_partial_sum_matches_global_reference() -> None:
     module.activation_situ_beta = 4.0
     module.activation_situ_linear_beta = 25.0
 
-    solution = os.environ.get("KIMI3_EP_SOLUTION", "triton")
     plan = tokenspeed_kernel.moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
@@ -110,7 +109,7 @@ def test_distributed_ep_partial_sum_matches_global_reference() -> None:
         ep_size=world_size,
         ispp=intermediate_size,
         internal_activation_dtype="input",
-        solution=solution,
+        solution="gluon",
     )
     tokenspeed_kernel.moe_process_weights(plan, module)
     partial = tokenspeed_kernel.moe_apply(

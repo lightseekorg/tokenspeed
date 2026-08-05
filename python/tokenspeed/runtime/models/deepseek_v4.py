@@ -106,7 +106,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     fused_qnorm_rope_kv_insert,
     save_deepseek_v4_compressor_state,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
+from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
     _group_slot_mapping_from_raw,
     _mask_invalid_graph_tokens,
 )

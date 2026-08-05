@@ -27,7 +27,6 @@ from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
-from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 _INDEX_K_FP8_GROUP_SIZE = 128
@@ -80,29 +79,3 @@ class DSAConfig(MLAConfig):
             self.index_head_dim,
         )
         return super().cache_cell_size() + index_k_cell_size
-
-    def create_pool(
-        self,
-        num_layers: int,
-        max_total_num_tokens: int,
-        rank: int,
-        enable_memory_saver: bool,
-    ) -> BaseTokenToKVPool:
-        from tokenspeed.runtime.layers.attention.kv_cache.dsa import DSATokenToKVPool
-
-        return DSATokenToKVPool(
-            size=max_total_num_tokens,
-            dtype=self.kv_cache_dtype,
-            model_dtype=self.dtype,
-            quant_method=self.kv_cache_quant_method,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            layer_num=num_layers,
-            device=self.device,
-            enable_memory_saver=enable_memory_saver,
-            max_batch_size=self.max_bs,
-            max_context_len=self.context_len,
-            page_size=self.page_size,
-            rank=rank,
-            index_head_dim=self.index_head_dim,
-        )

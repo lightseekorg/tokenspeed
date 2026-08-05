@@ -44,9 +44,6 @@ struct PagedCacheGroupConfig {
     std::int32_t rows_per_page{};
     std::int32_t entry_stride_tokens{};
     std::int32_t total_pages{};
-    // Serialization compatibility only. Logical cache granularity is the
-    // scheduler-wide block_size and cannot vary by group.
-    std::int32_t block_size{0};
     // Number of this group's CacheBlocks packed into one physical LCM block.
     std::int32_t cache_blocks_per_lcm_block{1};
     Retention retention{Retention::FullHistory};
@@ -54,7 +51,7 @@ struct PagedCacheGroupConfig {
     PagedCacheGroupFamily family{PagedCacheGroupFamily::History};
     PagedCacheTransferPolicy transfer_policy{PagedCacheTransferPolicy::Unspecified};
 
-    std::int32_t RawTokensPerPage() const { return rows_per_page * entry_stride_tokens; }
+    std::int32_t CacheBlockTokens() const { return rows_per_page * entry_stride_tokens; }
     void Validate() const;
 };
 

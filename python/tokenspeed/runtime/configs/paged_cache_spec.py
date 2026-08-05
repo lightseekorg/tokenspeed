@@ -34,15 +34,22 @@ class PagedCacheGroupSpec:
     sliding_window_tokens: int | None
     # History groups form a chain; State groups only need the trailing window.
     family: Family = "history"
-    # Per-group page tokens; None -> scheduler global block_size, else a multiple of it.
-    block_size: int | None = None
     # Physical child CacheBlocks packed into one shared LCM parent.
     cache_blocks_per_lcm_block: int = 1
     # None preserves standalone/non-PD behavior; PD plans set this explicitly.
     transfer_policy: TransferPolicy | None = None
 
+    @property
+    def cache_block_tokens(self) -> int:
+        """Raw-token span represented by one CacheBlock in this group."""
+        return self.rows_per_page * self.entry_stride_tokens
+
 
 _PAGED_CACHE_GROUP_DUMMY_PAGES = 1
+
+
+def _ceil_div(dividend: int, divisor: int) -> int:
+    return (dividend + divisor - 1) // divisor
 
 
 # Paged-cache label vocabulary (NOT the HF checkpoint's serialized enum:
@@ -237,9 +244,6 @@ def compute_paged_cache_group_page_counts(
     overlap_schedule_depth: int = 0,
     safety_margin: int = 0,
 ) -> dict[str, int]:
-    # Local import: keeps this module torch-free at import time.
-    from tokenspeed.runtime.utils.common import ceil_div
-
     if max_live_requests < 0:
         raise ValueError(f"max_live_requests must be >= 0, got {max_live_requests}")
     if max_scheduled_tokens < 0:
@@ -265,14 +269,14 @@ def compute_paged_cache_group_page_counts(
 
     counts: dict[str, int] = {}
     for spec in specs:
-        raw_per_page = spec.rows_per_page * spec.entry_stride_tokens
-        if raw_per_page <= 0:
+        cache_block_tokens = spec.cache_block_tokens
+        if cache_block_tokens <= 0:
             raise ValueError(
-                f"PagedCacheGroupSpec {spec.group_id}: rows_per_page * "
-                "entry_stride_tokens must be > 0"
+                f"PagedCacheGroupSpec {spec.group_id}: cache_block_tokens "
+                "(rows_per_page * entry_stride_tokens) must be > 0"
             )
-        protected_pages = max_live_requests * ceil_div(
-            overlap_schedule_depth * decode_input_tokens, raw_per_page
+        protected_pages = max_live_requests * _ceil_div(
+            overlap_schedule_depth * decode_input_tokens, cache_block_tokens
         )
         # Mamba-state kind = family "state" AND retention != sliding_window
         # (the C++ side keys it the same way); V4's sliding-window state tail
@@ -282,7 +286,7 @@ def compute_paged_cache_group_page_counts(
             # floor(T/P) snapshot pages (snapshots are bounded by the shared
             # page-id space), capped at the full-history count.
             full_history_total = (
-                ceil_div(max_total_tokens, raw_per_page)
+                _ceil_div(max_total_tokens, cache_block_tokens)
                 + max_live_requests
                 + protected_pages
                 + _PAGED_CACHE_GROUP_DUMMY_PAGES
@@ -290,14 +294,14 @@ def compute_paged_cache_group_page_counts(
             )
             state_total = (
                 max_live_requests * 2
-                + max_total_tokens // raw_per_page
+                + max_total_tokens // cache_block_tokens
                 + protected_pages
                 + _PAGED_CACHE_GROUP_DUMMY_PAGES
                 + safety_margin
             )
             total = min(state_total, full_history_total)
         elif spec.retention == "full_history":
-            full_pages = ceil_div(max_total_tokens, raw_per_page)
+            full_pages = _ceil_div(max_total_tokens, cache_block_tokens)
             total = (
                 full_pages
                 + max_live_requests
@@ -314,11 +318,11 @@ def compute_paged_cache_group_page_counts(
                 )
             # Capacity tracks resident history before the next token.
             resident_tokens_per_req = min(max(window - 1, 0), max_context_len)
-            resident_pages = max_live_requests * ceil_div(
-                resident_tokens_per_req, raw_per_page
+            resident_pages = max_live_requests * _ceil_div(
+                resident_tokens_per_req, cache_block_tokens
             )
             scheduled_tokens = min(max_scheduled_tokens, max_total_tokens)
-            scheduled_pages = ceil_div(scheduled_tokens, raw_per_page)
+            scheduled_pages = _ceil_div(scheduled_tokens, cache_block_tokens)
             total = (
                 resident_pages
                 + scheduled_pages
@@ -345,7 +349,7 @@ def _layer_specs(
     label_<window>), so single-window models keep byte-identical ids.
     A scalar window broadcasts to sliding layers; a sequence lines up 1:1."""
     if isinstance(sliding_window_tokens, str):
-        raise ValueError(
+        raise ValueError(  # noqa: TRY004 - preserve the existing API contract
             "_layer_specs: sliding_window_tokens must be None, an int, or a "
             f"sequence of int/None, got {sliding_window_tokens!r}"
         )
@@ -529,8 +533,6 @@ def group_specs_from_layer_types(
                 entry_stride_tokens=1,
                 sliding_window_tokens=window,
                 family=family,
-                # Always explicit: unset groups inherit the C++ gcd base, which a finer extra group silently lowers.
-                block_size=ps,
                 cache_blocks_per_lcm_block=group_packing,
             )
         )
@@ -538,7 +540,7 @@ def group_specs_from_layer_types(
         raise ValueError(f"page_sizes for unknown groups: {sorted(sizes)}")
     if packing:
         raise ValueError(
-            "cache_blocks_per_lcm_block for unknown groups: " f"{sorted(packing)}"
+            f"cache_blocks_per_lcm_block for unknown groups: {sorted(packing)}"
         )
     return specs
 
@@ -561,8 +563,8 @@ def publish_paged_cache_groups(
 
     Every cache pool publishes its scheduler groups. Speculative decoding is
     supported: verify writes per-group [bs*N] locations and the drafter
-    consumes the full-attention group's table (mirrored into req_to_page each
-    step).
+    consumes the full-attention group's table (published into the batch-ordered
+    draft page table each step).
 
     Args:
         layer_types: Per-layer paged-cache labels (empty -> single
@@ -597,9 +599,6 @@ def publish_paged_cache_groups(
     for spec in extra_groups:
         if any(sp.group_id == spec.group_id for sp in specs):
             raise ValueError(f"extra_groups: duplicate group id {spec.group_id!r}")
-        # Smaller extra-group blocks lower the gcd base by design; MakeCoordinator asserts divisibility.
-        if spec.block_size is not None and spec.block_size <= 0:
-            raise ValueError(f"extra_groups[{spec.group_id!r}]: block_size must be > 0")
         if spec.cache_blocks_per_lcm_block <= 0:
             raise ValueError(
                 f"extra_groups[{spec.group_id!r}]: "
@@ -640,9 +639,6 @@ def compute_max_logical_pages_for_capture(
     Returns:
         Required block-table columns for one request.
     """
-    # Local import: keeps this module torch-free at import time.
-    from tokenspeed.runtime.utils.common import ceil_div
-
     if max_context_len < 0:
         raise ValueError(f"max_context_len must be >= 0, got {max_context_len}")
     if max_tokens_per_req <= 0:
@@ -651,11 +647,11 @@ def compute_max_logical_pages_for_capture(
         raise ValueError(
             f"overlap_schedule_depth must be 0 or 1, got {overlap_schedule_depth}"
         )
-    raw_per_page = spec.rows_per_page * spec.entry_stride_tokens
-    if raw_per_page <= 0:
+    cache_block_tokens = spec.cache_block_tokens
+    if cache_block_tokens <= 0:
         raise ValueError(
-            f"PagedCacheGroupSpec {spec.group_id}: rows_per_page * "
-            "entry_stride_tokens must be > 0"
+            f"PagedCacheGroupSpec {spec.group_id}: cache_block_tokens "
+            "(rows_per_page * entry_stride_tokens) must be > 0"
         )
     reservation_horizon = (overlap_schedule_depth + 1) * max_tokens_per_req
     if spec.retention == "sliding_window":
@@ -669,22 +665,21 @@ def compute_max_logical_pages_for_capture(
         # per-token attention history counted as window - 1 above.
         retention_bound = min(window, max_context_len)
         live_tokens = retention_bound + reservation_horizon
-        return ceil_div(live_tokens, raw_per_page) + 1
+        return _ceil_div(live_tokens, cache_block_tokens) + 1
     if spec.retention == "full_history":
         live_tokens = max_context_len + reservation_horizon
-        return ceil_div(live_tokens, raw_per_page)
+        return _ceil_div(live_tokens, cache_block_tokens)
     raise ValueError(
-        f"PagedCacheGroupSpec {spec.group_id}: unsupported retention "
-        f"{spec.retention!r}"
+        f"PagedCacheGroupSpec {spec.group_id}: unsupported retention {spec.retention!r}"
     )
 
 
 __all__ = [
     "FULL_ATTENTION",
     "LINEAR_ATTENTION",
+    "STATE_LAYER_TYPES",
     "PagedCacheGroupSpec",
     "Retention",
-    "STATE_LAYER_TYPES",
     "compute_max_logical_pages_for_capture",
     "compute_paged_cache_group_page_counts",
     "group_specs_from_layer_types",

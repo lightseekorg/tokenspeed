@@ -33,7 +33,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
-    from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 
 
 @dataclass
@@ -42,14 +42,13 @@ class ForwardContext:
 
     # --- attention infrastructure ---
     attn_backend: AttentionBackend
-    token_to_kv_pool: BaseTokenToKVPool
+    token_to_kv_pool: CachePool
 
     # --- meta data ---
     bs: int
     num_extends: int
     input_num_tokens: int
     forward_mode: ForwardMode | None
-    req_to_page: torch.Tensor | None = None
     capture_hidden_mode: CaptureHiddenMode | None = CaptureHiddenMode.NULL
     # Normalized explicit decode input overrides for this forward, if any.
     decode_input_ids: list[int] | None = None

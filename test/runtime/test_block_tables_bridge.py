@@ -4,7 +4,6 @@ import os
 import sys
 import unittest
 from types import SimpleNamespace
-from unittest import mock
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -107,29 +106,6 @@ class CacheGroupGatingTest(unittest.TestCase):
 
     def test_default_backend_does_not_use_cache_groups(self):
         self.assertFalse(self.AttentionBackend.uses_cache_groups)
-
-
-class LegacyBlockTableMirrorTest(unittest.TestCase):
-    def setUp(self):
-        try:
-            from tokenspeed.runtime.execution.model_executor import ModelExecutor
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch + runtime dependencies: {exc}")
-        self.ModelExecutor = ModelExecutor
-
-    def test_group_contract_without_full_history_skips_legacy_table(self):
-        executor = self.ModelExecutor.__new__(self.ModelExecutor)
-        executor._cache_runtime_contract = SimpleNamespace()
-        executor._full_history_group_id = None
-        executor.device = "cpu"
-        executor.req_to_page = object()
-
-        with mock.patch(
-            "tokenspeed.runtime.execution.model_executor.update_block_table"
-        ) as update:
-            executor.update_block_table(object())
-
-        update.assert_not_called()
 
 
 if __name__ == "__main__":

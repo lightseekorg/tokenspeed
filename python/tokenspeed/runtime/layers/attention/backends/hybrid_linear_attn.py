@@ -67,7 +67,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
-    from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
 # Default cache group id carrying GDN/Mamba state pages.
@@ -285,9 +285,7 @@ class LayerMappedKVPool:
     translates global layer IDs (e.g., 3, 7, 11) to pool indices (0, 1, 2).
     """
 
-    def __init__(
-        self, inner_pool: BaseTokenToKVPool, full_attention_layer_ids: list[int]
-    ):
+    def __init__(self, inner_pool: CachePool, full_attention_layer_ids: list[int]):
         self.inner = inner_pool
         self.layer_ids = list(full_attention_layer_ids)
         self.layer_map = {
@@ -1100,7 +1098,7 @@ class MambaAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
-        req_to_page: torch.Tensor = None,
+        page_table: torch.Tensor = None,
         **kwargs,
     ):
         num_padding = kwargs.get("num_padding", 0)
@@ -1878,6 +1876,11 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     def _backends(self):
         return [self.full_attn_backend, self.linear_attn_backend]
+
+    def set_cache_pool(self, cache_pool) -> None:
+        self.cache_pool = cache_pool
+        for backend in self._backends():
+            backend.set_cache_pool(cache_pool)
 
     def _backend_for_layer(self, layer_id: int) -> AttentionBackend:
         if self.linear_attn_backend is None or layer_id in self.full_attn_layers:
