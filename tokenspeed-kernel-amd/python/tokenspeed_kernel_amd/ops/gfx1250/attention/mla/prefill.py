@@ -703,12 +703,13 @@ def gluon_mla_prefill_gfx1250(
     for name, tensor in (("q", q), ("k", k), ("v", v)):
         if tensor.stride(-1) != 1:
             raise ValueError(f"{name} must have contiguous last dimension")
-    supported_dtypes = (torch.bfloat16, torch.float8_e4m3fn)
+    fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+    supported_dtypes = (torch.float16, torch.bfloat16, *fp8_dtypes)
     if q.dtype not in supported_dtypes:
         raise TypeError(f"unsupported MLA prefill dtype {q.dtype}")
     if k.dtype != q.dtype or v.dtype != q.dtype:
         raise TypeError("q, k, and v must use the same dtype")
-    is_fp8 = q.dtype == torch.float8_e4m3fn
+    is_fp8 = q.dtype in fp8_dtypes
 
     total_tokens, n_heads, _ = q.shape
     output_shape = (total_tokens, n_heads, 128)

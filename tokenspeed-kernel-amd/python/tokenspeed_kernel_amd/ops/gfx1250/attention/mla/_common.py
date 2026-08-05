@@ -2,7 +2,7 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc.
 # Copyright (c) 2026 LightSeek Foundation
 
-"""Shared layouts and helpers for BF16/FP8 GFX1250 Gluon MLA kernels.
+"""Shared layouts and helpers for GFX1250 Gluon MLA kernels.
 
 The device implementation is ported from ROCm/AITER commit
 4a1cc773f34cbfc74387259e51262556ee38edd0.
@@ -13,8 +13,8 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon
 
-e4m3_dtype = torch.float8_e4m3fn
-float8_info = torch.finfo(e4m3_dtype)
+e4m3_info = torch.finfo(torch.float8_e4m3fn)
+e5m2_info = torch.finfo(torch.float8_e5m2)
 
 
 def _sanitize_constexpr_value(value):
@@ -58,7 +58,7 @@ def absorbed_mla_layouts(
     WARP_SIZE,
     K_WIDTH,
 ):
-    """Build BF16 or E4M3 operand, load, and LDS layouts for absorbed MLA."""
+    """Build operand, load, and LDS layouts for absorbed MLA."""
     assert WARP_SIZE == 32
     assert NUM_WARPS == 1 or NUM_WARPS == 2 or NUM_WARPS == 4 or NUM_WARPS == 8
     assert K_WIDTH == 8 or K_WIDTH == 16

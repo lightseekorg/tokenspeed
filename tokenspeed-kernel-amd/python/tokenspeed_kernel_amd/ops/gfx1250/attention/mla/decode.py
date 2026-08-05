@@ -14,7 +14,8 @@ from tokenspeed_kernel_amd.ops.gfx1250.attention._common import _INV_LN2_VALUE
 from tokenspeed_kernel_amd.ops.gfx1250.attention.mla._common import (
     absorbed_mla_layouts,
     cdiv_fn,
-    float8_info,
+    e4m3_info,
+    e5m2_info,
     make_kernel_repr,
 )
 
@@ -23,8 +24,6 @@ from tokenspeed_kernel_amd.ops.gfx1250.attention.mla._common import (
 class AttentionConfig:
     NUM_QUERIES_PER_KV: gl.constexpr
     QK_SCALE: gl.constexpr
-    QUERY_DTYPE: gl.constexpr
-    KV_CACHE_DTYPE: gl.constexpr
     QK_WMMA_LAYOUT: gl.constexpr
     PV_WMMA_LAYOUT: gl.constexpr
     Q_DOT_LAYOUT: gl.constexpr
@@ -51,14 +50,10 @@ class AttentionConfig:
         NUM_WARPS,
         WARP_SIZE,
         SCALE,
-        QUERY_DTYPE,
-        KV_CACHE_DTYPE,
         K_WIDTH,
     ):
         self.NUM_QUERIES_PER_KV = gl.constexpr(NUM_QUERY_HEADS // NUM_KV_HEADS)
         self.QK_SCALE = gl.constexpr(SCALE * _INV_LN2_VALUE)
-        self.QUERY_DTYPE = gl.constexpr(QUERY_DTYPE)
-        self.KV_CACHE_DTYPE = gl.constexpr(KV_CACHE_DTYPE)
         (
             qk_wmma_layout,
             pv_wmma_layout,
@@ -158,16 +153,11 @@ def _mla_decode_fwd_kernel(
     K_WIDTH: gl.constexpr = 0,  # int
     SCALE_K_WIDTH_LORA: gl.constexpr = 16,  # int
     SCALE_K_WIDTH_ROPE: gl.constexpr = 16,  # int
-    QUERY_DTYPE: gl.constexpr = "bf16",  # str: "bf16" | "fp8"
-    KV_CACHE_DTYPE: gl.constexpr = "bf16",  # str: "bf16" | "fp8"
+    IS_FP8: gl.constexpr = False,
     BLOCK_SCALES_SIZE: gl.constexpr = 4,  # int
 ):
     assert not SHUFFLED_KV_CACHE
-    assert QUERY_DTYPE == KV_CACHE_DTYPE
-    assert QUERY_DTYPE == "bf16" or QUERY_DTYPE == "fp8"
-    assert K_WIDTH == (16 if QUERY_DTYPE == "fp8" else 8)
-    IS_Q_FP8: gl.constexpr = QUERY_DTYPE == "fp8"
-    IS_KV_FP8: gl.constexpr = KV_CACHE_DTYPE == "fp8"
+    assert K_WIDTH == (16 if IS_FP8 else 8)
     cfg = AttentionConfig(
         KV_LORA_RANK,
         QK_ROPE_HEAD_DIM,
@@ -178,8 +168,6 @@ def _mla_decode_fwd_kernel(
         num_warps,
         WARP_SIZE,
         SCALE,
-        QUERY_DTYPE,
-        KV_CACHE_DTYPE,
         K_WIDTH,
     )
     q_block_global_idx = gl.program_id(0)
@@ -459,13 +447,10 @@ def _mla_decode_fwd_kernel(
 
         # acc : (BLOCK_M, KV_LORA_RANK)
         KV_lora_trans = kv_lora_shared.load(layout=cfg.V_DOT_LAYOUT)
-        if IS_Q_FP8 and IS_KV_FP8:
+        if IS_FP8:
             P = P.to(KV_lora_trans.dtype)
-        elif IS_KV_FP8:
-            P = P.to(gl.bfloat16, fp_downcast_rounding="rtz")
-            KV_lora_trans = KV_lora_trans.to(gl.bfloat16)
         else:
-            P = P.to(gl.bfloat16, fp_downcast_rounding="rtz")
+            P = P.to(KV_lora_trans.dtype, fp_downcast_rounding="rtz")
         P = gl.convert_layout(P, layout=cfg.P_DOT_LAYOUT)
         acc = gl.amd.gfx1250.wmma(P, KV_lora_trans, acc)
         seq_offset += TILE_SIZE
@@ -553,8 +538,10 @@ def _mla_decode_fwd_reduce_kernel(
     num_stages: gl.constexpr = 1,
     ALL_DECODE: gl.constexpr = False,  # int
     HAS_LSE: gl.constexpr = False,
-    FP8_MIN: gl.constexpr = float8_info.min,
-    FP8_MAX: gl.constexpr = float8_info.max,
+    E4M3_MIN: gl.constexpr = e4m3_info.min,
+    E4M3_MAX: gl.constexpr = e4m3_info.max,
+    E5M2_MIN: gl.constexpr = e5m2_info.min,
+    E5M2_MAX: gl.constexpr = e5m2_info.max,
 ):
     WARP_SIZE: gl.constexpr = 32
 
@@ -664,8 +651,10 @@ def _mla_decode_fwd_reduce_kernel(
     if out_scale_ptr is not None:
         acc = acc * out_scale
 
-    if output_ptr.type.element_ty.is_fp8():
-        acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
+    if output_ptr.type.element_ty == gl.float8e4nv:
+        acc = tl.clamp(acc, E4M3_MIN, E4M3_MAX)
+    elif output_ptr.type.element_ty == gl.float8e5:
+        acc = tl.clamp(acc, E5M2_MIN, E5M2_MAX)
 
     offs_d = gl.arange(0, KV_LORA_RANK, layout=OUTPUT_LAYOUT)
     output_offset = (
@@ -728,12 +717,13 @@ def gluon_mla_decode_gfx1250(
             "q must be [batch, 1, num_q_heads, kv_lora_rank + "
             f"qk_rope_head_dim], got {tuple(q.shape)}"
         )
-    supported_dtypes = (torch.bfloat16, torch.float8_e4m3fn)
+    fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+    supported_dtypes = (torch.float16, torch.bfloat16, *fp8_dtypes)
     if q.dtype not in supported_dtypes:
         raise TypeError(f"unsupported MLA decode dtype {q.dtype}")
     if kv_cache.dtype != q.dtype:
         raise TypeError("q and kv_cache must use the same dtype")
-    is_fp8 = q.dtype == torch.float8_e4m3fn
+    is_fp8 = q.dtype in fp8_dtypes
     if kv_lora_rank != 512 or qk_rope_head_dim != 64:
         raise NotImplementedError(
             "gluon MLA decode gfx1250 requires kv_lora_rank=512 and "
@@ -848,8 +838,7 @@ def gluon_mla_decode_gfx1250(
         K_WIDTH=16 if is_fp8 else 8,
         SCALE_K_WIDTH_LORA=0,
         SCALE_K_WIDTH_ROPE=0,
-        QUERY_DTYPE="fp8" if is_fp8 else "bf16",
-        KV_CACHE_DTYPE="fp8" if is_fp8 else "bf16",
+        IS_FP8=is_fp8,
         BLOCK_SCALES_SIZE=16,
         num_warps=2,
         waves_per_eu=1,

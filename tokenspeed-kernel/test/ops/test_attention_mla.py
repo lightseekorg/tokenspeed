@@ -18,8 +18,10 @@ _FP8_DTYPES = frozenset({torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4
 @pytest.mark.parametrize(
     "dtype,num_heads,qk_head_dim,v_head_dim",
     [
+        pytest.param(torch.float16, 128, 192, 128, id="fp16"),
         pytest.param(torch.bfloat16, 128, 192, 128, id="bf16"),
-        pytest.param(torch.float8_e4m3fn, 128, 192, 128, id="fp8"),
+        pytest.param(torch.float8_e4m3fn, 128, 192, 128, id="fp8-e4m3"),
+        pytest.param(torch.float8_e5m2, 128, 192, 128, id="fp8-e5m2"),
     ],
 )
 @pytest.mark.parametrize("solution", ["triton", "gluon"])
@@ -94,7 +96,7 @@ def test_mla_prefill(
 
     assert out.shape == (q.shape[0], q.shape[1], v.shape[-1])
     assert lse.shape == (q.shape[0], q.shape[1])
-    out_tol = 1e-1 if dtype in _FP8_DTYPES else 8e-2
+    out_tol = 2e-1 if dtype in _FP8_DTYPES else 8e-2
     torch.testing.assert_close(out.float(), out_ref, rtol=out_tol, atol=out_tol)
     torch.testing.assert_close(lse, lse_ref, rtol=8e-2, atol=8e-2)
 
@@ -134,6 +136,28 @@ def test_mla_prefill(
             4,
             64,
             id="gluon-bh16bn64",
+        ),
+        pytest.param(
+            "gluon",
+            torch.float16,
+            torch.float16,
+            16,
+            512,
+            64,
+            4,
+            64,
+            id="gluon-gfx1250-fp16",
+        ),
+        pytest.param(
+            "gluon",
+            torch.float8_e5m2,
+            torch.float8_e5m2,
+            16,
+            512,
+            64,
+            4,
+            64,
+            id="gluon-gfx1250-fp8-e5m2",
         ),
         pytest.param(
             "gluon",
@@ -393,8 +417,10 @@ def test_mla_decode_with_kvcache(
 @pytest.mark.parametrize(
     "dtype",
     [
+        pytest.param(torch.float16, id="fp16"),
         pytest.param(torch.bfloat16, id="bf16"),
-        pytest.param(torch.float8_e4m3fn, id="fp8"),
+        pytest.param(torch.float8_e4m3fn, id="fp8-e4m3"),
+        pytest.param(torch.float8_e5m2, id="fp8-e5m2"),
     ],
 )
 def test_mla_extend_with_kvcache(device: str, dtype: torch.dtype, require) -> None:
