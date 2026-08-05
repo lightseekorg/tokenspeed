@@ -66,8 +66,7 @@ class LamportCopy:
         residual: cute.Tensor,
         m: cutlass.Int32,
     ):
-        # The CTA may be scheduled early, but mailbox inspection must not pass
-        # the producer GEMM's programmatic completion point.
+        # Mailbox inspection must not pass the producer GEMM's programmatic completion point.
         cute.arch.griddepcontrol_wait()
 
         tidx, _, _ = cute.arch.thread_idx()
@@ -112,8 +111,7 @@ class LamportCopy:
             store_global_u32x4(destination, packed, volatile=False)
             fragment = fragment + stride
 
-        # The returned ordinary tensor is complete. A same-stream successor
-        # may overlap the mailbox cleanup below.
+        # The returned tensor is complete; a same-stream successor may overlap the mailbox cleanup below.
         cute.arch.griddepcontrol_launch_dependents()
 
         fragment = thread

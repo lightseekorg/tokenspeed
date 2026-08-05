@@ -131,9 +131,7 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
             self.threads, self.cluster_ctas = _select_routed_schedule(
                 tp_size, latent_dim, hidden_dim, max_m
             )
-        # Diagnostic specialization: a one-role grid executes only the routed
-        # AllReduce/RMSNorm path.  Keep this compile-time so the production
-        # fused path is unchanged when include_reduce_scatter=True.
+        # Compile-time diagnostic specialization: a one-role grid runs only the routed path, leaving the production fused path unchanged.
         if include_routed and include_reduce_scatter:
             self.roles = 1 + shared_roles
         elif include_routed:
@@ -143,10 +141,7 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
         self.warps = (self.threads + 31) // 32
         self.last_warp_lanes = self.threads - (self.warps - 1) * 32
         self.last_warp_mask = (1 << self.last_warp_lanes) - 1
-        # The upstream MNNVL oneshot protocol assigns one cluster to each
-        # token.  Keep that exact ownership in the routed-only diagnostic;
-        # reusing a cluster for multiple token waves allows the Lamport
-        # generation metadata to change between waves.
+        # Keep one cluster per token in the routed-only diagnostic: reusing a cluster across token waves lets the Lamport generation metadata change between waves.
         self.token_ctas = (
             min(max_m, max_token_ctas) if include_reduce_scatter else max_m
         )
@@ -216,8 +211,7 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
         token_cta, cta_y, role = cute.arch.block_idx()
         logical_role = role
         if cutlass.const_expr(not self.include_routed):
-            # A shared-only grid starts at z=0, while _token_device reserves
-            # logical role 0 for the routed collective.
+            # A shared-only grid starts at z=0; _token_device reserves logical role 0 for the routed collective.
             logical_role = role + Int32(1)
         cluster_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
 
@@ -316,12 +310,7 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
             )
 
             cute.arch.cluster_arrive()
-            # All CTAs must complete the cluster handshake before the later
-            # st.shared::cluster exchange: a partial (single-CTA) wait leaves
-            # the barrier phases skewed across CTAs, so the pre-DSM wait can
-            # match a stale phase and lose the peer-entered guarantee. Only
-            # manifests under perturbed SM scheduling (eager prefill bursts,
-            # heavy co-residency); see the campaign ledger's DSM race notes.
+            # All CTAs must complete this handshake before the st.shared::cluster exchange: a partial wait skews barrier phases and the pre-DSM wait can match a stale phase, losing the peer-entered guarantee.
             cute.arch.cluster_wait()
             if cluster_rank == 0 and tidx == 0:
                 red_async_release_gpu_add_u32(latent_flags.iterator + 8, Uint32(1))
@@ -387,15 +376,13 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
             cute.arch.griddepcontrol_launch_dependents()
 
             if cutlass.const_expr(self.fp32_internal):
-                # High-precision fused mode: retain the rank reduction in
-                # FP32 through the RMS square and row reduction.
+                # High-precision fused mode: keep the rank reduction in FP32 through the RMS square.
                 norm_input = accum.load()
                 norm_square = norm_input * norm_input
             else:
                 norm_input_bf16 = accum.load().to(BFloat16)
                 norm_input = norm_input_bf16.to(Float32)
-                # Upstream-compatible mode: FlashInfer evaluates BF16 *
-                # BF16 first, then promotes the rounded square to FP32.
+                # Upstream-compatible mode: BF16 * BF16 first, then promote the rounded square to FP32.
                 norm_square = (norm_input_bf16 * norm_input_bf16).to(Float32)
             thread_sum = norm_square.reduce(
                 cute.ReductionOp.ADD,
@@ -448,9 +435,7 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
                 volatile=False,
             )
 
-            # The x=0 CTA rotates only after reaching its final token wave.
-            # Waiting for all M arrivals then guarantees every token-wave CTA
-            # loaded the current generation before the metadata is advanced.
+            # The x=0 CTA rotates only on its final token wave: waiting for all M arrivals guarantees every token-wave CTA loaded the current generation before the metadata advances.
             if (
                 token_cta == 0
                 and token + self.token_ctas >= m
@@ -526,14 +511,7 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
                 volatile=False,
             )
 
-            # One arrival per shared destination group and token. The wait is
-            # unconditional: every barrier use in the per-token loop must be
-            # arrive/wait-symmetric on every CTA, or the phase counters skew
-            # across iterations and the NEXT iteration's pre-DSM wait can
-            # match a stale phase (losing the peer-entered guarantee for the
-            # st.shared::cluster exchange). Fires only at m >= 2 — i.e. the
-            # bs>=2 decode graphs right after a prefill admits a second
-            # sequence — under perturbed SM scheduling.
+            # The wait must be unconditional: every per-token-loop barrier use must be arrive/wait-symmetric on every CTA, or the phase counters skew across iterations and the next pre-DSM wait matches a stale phase.
             cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
             if cluster_rank == 0 and tidx == 0:
