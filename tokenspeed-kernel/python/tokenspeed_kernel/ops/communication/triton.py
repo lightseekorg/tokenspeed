@@ -1585,9 +1585,7 @@ def amd_rsag_all_gather(
             GLOBAL_OFFSET=global_offset,
             RANK=state.symm_mem_hdl.rank,
             WORLD_SIZE=state.symm_mem_hdl.world_size,
-            BARRIER_PEER_LANES=triton.next_power_of_2(
-                state.symm_mem_hdl.world_size
-            ),
+            BARRIER_PEER_LANES=triton.next_power_of_2(state.symm_mem_hdl.world_size),
             BLOCK_SIZE=_AMD_RSAG_BLOCK_SIZE,
             num_warps=1,
         )
