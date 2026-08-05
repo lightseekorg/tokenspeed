@@ -11,6 +11,56 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.mark.skipif(
+    not current_platform().is_blackwell_plus,
+    reason="Packed UE8M0 activation scales are consumed on Blackwell.",
+)
+@pytest.mark.parametrize("m,k", [(1, 128), (5, 384), (7, 640)])
+def test_packed_ue8m0_quant_pdl_matches_reference(device: str, m: int, k: int) -> None:
+    from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
+
+    torch.manual_seed(0)
+    x = torch.randn((m, k), device=device, dtype=torch.bfloat16)
+    outputs = []
+    for enable_pdl in (False, True):
+        outputs.append(
+            per_token_group_quant_fp8(
+                x,
+                128,
+                column_major_scales=True,
+                scale_tma_aligned=True,
+                scale_ue8m0=True,
+                enable_pdl=enable_pdl,
+            )
+        )
+
+    q, packed_scales = outputs[0]
+    torch.cuda.synchronize()
+    assert torch.equal(outputs[1][0], q)
+    assert torch.equal(outputs[1][1], packed_scales)
+
+    groups = x.float().view(m, k // 128, 128)
+    fp8_info = torch.finfo(torch.float8_e4m3fn)
+    absmax = groups.abs().amax(dim=-1)
+    exponent = torch.ceil(torch.log2(torch.clamp(absmax / fp8_info.max, min=1e-10)))
+    expected_q = torch.clamp(
+        groups / torch.exp2(exponent).unsqueeze(-1),
+        fp8_info.min,
+        fp8_info.max,
+    ).to(torch.float8_e4m3fn)
+    assert torch.equal(q, expected_q.view(m, k))
+
+    packs = (k // 128 + 3) // 4
+    expected_bytes = torch.zeros((m, packs, 4), device=device, dtype=torch.int64)
+    biased_exponents = torch.clamp(exponent + 127, 0, 255).to(torch.int64)
+    expected_bytes.view(m, -1)[:, : k // 128] = biased_exponents
+    actual_bytes = torch.stack(
+        [(packed_scales.to(torch.int64) >> shift) & 0xFF for shift in (0, 8, 16, 24)],
+        dim=-1,
+    )
+    assert torch.equal(actual_bytes, expected_bytes)
+
+
 def test_triton_mxfp8_1x32_raw_ue8m0_weight(device: str) -> None:
     torch.manual_seed(0)
     m, n, k = 19, 128, 128

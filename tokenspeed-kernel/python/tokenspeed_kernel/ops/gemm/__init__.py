@@ -81,6 +81,7 @@ _KERNELS_WITH_FUSED_BIAS: frozenset[str] = frozenset(
 # Kernels that accept an ``enable_pdl`` kwarg for Programmatic Dependent Launch.
 _KERNELS_WITH_PDL: frozenset[str] = frozenset(
     {
+        "deep_gemm_mm_fp8_blockscale",
         "flashinfer_mm_nvfp4",
     }
 )
@@ -195,7 +196,8 @@ def _online_quantize_mxfp8(
         block_size: Block-scale dimensions used by the selected GEMM.
         kernel_name: Name of the selected GEMM implementation.
         enable_pdl: Request Programmatic Dependent Launch for the quantize
-            kernel. Only the flashinfer path honors it; other backends ignore it.
+            kernel. FlashInfer MXFP8 and DeepGEMM's UE8M0 path honor it;
+            other backends ignore it.
     """
     block_k = block_size[1]
 
@@ -269,6 +271,7 @@ def _online_quantize_mxfp8(
             column_major_scales=True,
             scale_tma_aligned=True,
             scale_ue8m0=_platform.is_blackwell_plus,
+            enable_pdl=enable_pdl,
         )
     elif kernel_name == "flashinfer_mm_fp8_blockscale":
         from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8

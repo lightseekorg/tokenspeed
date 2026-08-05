@@ -66,14 +66,18 @@ _warned_about_requantization = False
 try:
     from tokenspeed_kernel.thirdparty.deep_gemm import (
         get_mn_major_tma_aligned_tensor,
+        get_pdl,
         m_grouped_fp8_gemm_nt_contiguous,
         m_grouped_fp8_gemm_nt_masked,
+        set_pdl,
         transform_sf_into_required_layout,
     )
 except ImportError:  # pragma: no cover - DeepGEMM is an optional dependency
     get_mn_major_tma_aligned_tensor = None
+    get_pdl = None
     m_grouped_fp8_gemm_nt_contiguous = None
     m_grouped_fp8_gemm_nt_masked = None
+    set_pdl = None
     transform_sf_into_required_layout = None
 
 
@@ -96,6 +100,12 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
     _FP8_BLOCK = 128
     _UE8M0_WEIGHT_RECIPE = (1, _FP8_BLOCK, _FP8_BLOCK)
     _UE8M0_PACKED_RECIPE = (1, 1, _FP8_BLOCK)
+
+    def _configure_deep_gemm_pdl(enable_pdl: bool) -> None:
+        """Keep DeepGEMM's process-wide launch mode aligned with this MoE call."""
+        requested = bool(enable_pdl)
+        if get_pdl() != requested:
+            set_pdl(requested)
 
     def _prepare_routing_tensors(
         topk_weights: torch.Tensor,
@@ -254,6 +264,7 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
         overlap_fn: Callable[[], None] | None = None,
     ) -> torch.Tensor:
         """Decode-shaped path: padded per-expert buffers + masked grouped GEMMs."""
+        _configure_deep_gemm_pdl(enable_pdl)
         dispatcher.dispatch_a(x, topk_ids, topk_weights, low_latency=True)
         # dispatch_a only launched the send phase, so the RDMA transfer is in
         # flight on the NIC: any work queued here runs while it lands instead of
@@ -296,7 +307,10 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
             # kernel itself. Masked GEMM never reads padded rows, so neither
             # output needs a separate zero-fill pass.
             down_in, down_scales = fused_swiglu_fp8_ue8m0_masked_packed(
-                gateup, masked_m, expected_m=expected_m
+                gateup,
+                masked_m,
+                expected_m=expected_m,
+                enable_pdl=enable_pdl,
             )
         else:
             down_in = torch.empty(
@@ -357,6 +371,7 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
         overlap_fn: Callable[[], None] | None = None,
     ) -> torch.Tensor:
         """Extend-shaped path: permuted expert blocks + contiguous grouped GEMMs."""
+        _configure_deep_gemm_pdl(enable_pdl)
         dispatcher.dispatch_a(x, topk_ids, topk_weights, low_latency=False)
         # Normal-mode dispatch finishes asynchronously, so work queued here
         # overlaps the transfer rather than waiting behind it.
@@ -418,7 +433,9 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
             if requires_ue8m0:
                 # Power-of-two scales, packed in the column-major TMA layout the
                 # grouped GEMM consumes directly (no realignment needed).
-                down_in, down_scales = fused_swiglu_fp8_ue8m0(gateup)
+                down_in, down_scales = fused_swiglu_fp8_ue8m0(
+                    gateup, enable_pdl=enable_pdl
+                )
                 gemm2_scales = down_scales
             else:
                 down_in = torch.empty(
@@ -532,7 +549,8 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
             max_num_tokens_per_gpu: Unused; the low-latency capacity is pinned by
                 the plan so the DeepEP buffer does not depend on batch order.
             do_finalize: Must be True; this kernel cannot defer finalize.
-            enable_pdl: Honor PDL in the fused activation kernel.
+            enable_pdl: Enable PDL for both DeepGEMM launches and the fused
+                activation joining them.
             low_latency: Which DeepEP mode to run when the plan mode is ``auto``.
                 Every rank of the EP group must pass the same value.
             overlap_fn: Optional work to queue inside the dispatch window, i.e.
