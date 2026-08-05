@@ -20,19 +20,38 @@
 #
 # Attention-Residual mixing op: RMSNorm + per-candidate softmax score + weighted
 # sum over a set of residual-stream snapshots (the Kimi-K3 AttnRes block-mix).
-# Dispatches to the Blackwell TMA kernel, falling back to a portable torch path
-# on other hardware or for shapes outside the kernel's supported range.
+# Dispatches to a specialized kernel when supported, otherwise to portable torch.
+from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = ["attn_res_fwd"]
 
-# Blackwell kernel coverage. This must stay a subset of the authoritative
-# TVM_FFI_ICHECK bounds in csrc/attn_res_binding.cu; this gate only decides when
-# to fall back to torch.
+# Common specialized-kernel coverage. The larger gfx950 bound is restricted to
+# the Kimi K3 shape and its fused output RMSNorm below.
 _SUPPORTED_H = frozenset({4096, 5120, 6144, 7168, 8192})
 _MAX_T = 16384
+_MAX_GFX950_T = 65536
 _MAX_N = 12
+
+
+def _specialized_shape_eligible(
+    tokens: int,
+    hidden: int,
+    candidates: int,
+    *,
+    fused_output_norm: bool,
+) -> bool:
+    if hidden not in _SUPPORTED_H or not 1 <= candidates <= _MAX_N:
+        return False
+    if 1 <= tokens <= _MAX_T:
+        return True
+    return (
+        Platform.get().is_cdna4
+        and hidden == 7168
+        and fused_output_norm
+        and _MAX_T < tokens <= _MAX_GFX950_T
+    )
 
 
 def attn_res_fwd(
@@ -64,7 +83,12 @@ def attn_res_fwd(
     """
     T, H = layer_residual.shape
     N = block_residual.shape[0] + 1
-    eligible = H in _SUPPORTED_H and 1 <= T <= _MAX_T and 1 <= N <= _MAX_N
+    eligible = _specialized_shape_eligible(
+        T,
+        H,
+        N,
+        fused_output_norm=out_norm_weight is not None,
+    )
     signature = format_signature(
         layer_residual=dense_tensor_format(layer_residual.dtype),
         block_residual=dense_tensor_format(block_residual.dtype),

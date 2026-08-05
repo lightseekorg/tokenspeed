@@ -15,7 +15,10 @@ if not is_cdna4():
     )
 
 
-from tokenspeed_kernel.ops.attn_res import attn_res_fwd  # noqa: E402
+from tokenspeed_kernel.ops.attn_res import (  # noqa: E402
+    _specialized_shape_eligible,
+    attn_res_fwd,
+)
 from tokenspeed_kernel.ops.moe import moe_sigmoid_bias_topk  # noqa: E402
 from tokenspeed_kernel.ops.moe.sigmoid_topk import _gluon_eligible  # noqa: E402
 
@@ -77,6 +80,13 @@ def test_attn_res_public_block_major_dispatch_matches_reference() -> None:
         valid_blocks,
     )
     torch.testing.assert_close(actual, expected, rtol=5e-3, atol=1.6e-2)
+
+
+def test_attn_res_large_prefill_dispatch_boundary() -> None:
+    assert not _specialized_shape_eligible(0, 7168, 12, fused_output_norm=True)
+    assert _specialized_shape_eligible(32768, 7168, 12, fused_output_norm=True)
+    assert not _specialized_shape_eligible(32768, 7168, 12, fused_output_norm=False)
+    assert not _specialized_shape_eligible(65537, 7168, 12, fused_output_norm=True)
 
 
 @pytest.mark.parametrize("tokens", [1, 17, 8192])

@@ -30,8 +30,11 @@ def _load_candidate(
         ptr = layer_residual
         offset = token * stride_layer_t + hidden
     else:
-        ptr = block_residual
-        offset = token * stride_block_t + candidate * stride_block_n + hidden
+        # Keep the candidate stride in pointer arithmetic. At large prefill
+        # sizes the block-major candidate offset can exceed signed int32 even
+        # though each token row remains within the buffer-load offset range.
+        ptr = block_residual + candidate * stride_block_n
+        offset = token * stride_block_t + hidden
     return cdna4.buffer_load(
         ptr,
         offset.to(gl.int32),
