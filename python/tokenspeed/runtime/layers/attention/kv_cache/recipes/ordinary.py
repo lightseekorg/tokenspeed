@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from tokenspeed.runtime.layers.attention.kv_cache.plan import (
-    CacheFieldSpec,
-    solve_cache_layout,
-)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes import (
     configured_token_limit,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    CacheFieldSpec,
+    solve_cache_layout,
 )
 
 
@@ -219,19 +219,27 @@ def build_hybrid_cache_setup(
     fields,
     layer_types: tuple[str, ...],
     group_ids: tuple[str, ...],
+    group_specs: tuple,
     state_dtypes,
     layer_kv_head_counts: tuple[int, ...] | None,
     draft_fields,
     draft_layer_types: tuple[str, ...],
     draft_group_ids: tuple[str, ...],
+    draft_group_specs: tuple,
     draft_layer_kv_head_counts: tuple[int, ...] | None,
     cache_budget_bytes: int,
     fixed_workspace_bytes: int,
     logical_block_tokens: int,
     max_padding_fraction: float,
 ):
-    """Bind one hybrid cache layout and its draft to a common capacity."""
-    from tokenspeed.runtime.layers.attention.kv_cache.setup import (
+    """Bind one hybrid cache layout and its draft to a common capacity.
+
+    The recipe owns the complete published specs (``group_specs`` /
+    ``draft_group_specs``, incl. groups outside the layer-type vocabulary
+    and PD transfer policies); this helper only solves the shared layout
+    and sizes the arenas.
+    """
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
         CachePoolSpec,
         CacheSetup,
     )
@@ -291,6 +299,7 @@ def build_hybrid_cache_setup(
         memory_plan=target_plan,
         layer_types=layer_types,
         layer_group_ids=group_ids,
+        paged_cache_group_specs=tuple(group_specs),
         state_field_dtypes=state_dtypes,
         token_capacity=(num_lcm_blocks * max_packing * logical_block_tokens),
         layer_kv_head_counts=layer_kv_head_counts,
@@ -298,13 +307,15 @@ def build_hybrid_cache_setup(
     draft_spec = None
     if draft_layout is not None:
         draft_plan = draft_layout.with_num_lcm_blocks(num_lcm_blocks)
+        draft_max_packing = max(draft_group_packing.values())
         draft_spec = CachePoolSpec(
             family=family,
             memory_plan=draft_plan,
             layer_types=draft_layer_types,
             layer_group_ids=draft_group_ids,
+            paged_cache_group_specs=tuple(draft_group_specs),
             state_field_dtypes={},
-            token_capacity=target_spec.token_capacity,
+            token_capacity=(num_lcm_blocks * draft_max_packing * logical_block_tokens),
             layer_kv_head_counts=draft_layer_kv_head_counts,
         )
     return CacheSetup(
@@ -352,7 +363,9 @@ def _profiled_pages(
 
 
 def _storage_layers(config, num_layers: int) -> int:
-    from tokenspeed.runtime.configs.paged_cache_spec import hybrid_slab_group_size
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+        hybrid_slab_group_size,
+    )
 
     group_size = hybrid_slab_group_size(
         getattr(config, "layer_types", None),
@@ -373,9 +386,10 @@ def _ordinary_setup(
     draft_attn_config,
     draft_fields,
     draft_group_ids: tuple[str, ...],
+    draft_family: str,
     cache_budget_bytes: int,
 ):
-    from tokenspeed.runtime.layers.attention.kv_cache.setup import (
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
         CachePoolSpec,
         CacheSetup,
     )
@@ -407,14 +421,36 @@ def _ordinary_setup(
     )
     target_plan = target_layout.with_num_lcm_blocks(num_pages)
     token_capacity = num_pages * page_size
+
+    def _group_specs(config, group_ids):
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+            build_paged_cache_group_specs,
+        )
+
+        # Draft configs inherit the target hf_config's layer_types (e.g.
+        # NextN: 1 draft layer vs 61 target labels); when the labels don't
+        # line up 1:1 with this pool's layers, publish as all full-history.
+        layer_types = tuple(getattr(config, "layer_types", ()))
+        if len(layer_types) != len(group_ids):
+            layer_types = ()
+        return build_paged_cache_group_specs(
+            layer_types=layer_types,
+            group_ids=group_ids,
+            sliding_window_tokens=getattr(config, "sliding_window_tokens", None),
+            page_size=page_size,
+            pd_disaggregation_enabled=getattr(
+                config, "pd_disaggregation_enabled", False
+            ),
+        )
+
     target_spec = CachePoolSpec(
         family=family,
         memory_plan=target_plan,
         layer_types=tuple(getattr(attn_config, "layer_types", ())),
         layer_group_ids=target_group_ids,
+        paged_cache_group_specs=_group_specs(attn_config, target_group_ids),
         state_field_dtypes={},
         token_capacity=token_capacity,
-        extra_paged_groups=tuple(getattr(attn_config, "extra_paged_groups", ())),
     )
     draft_spec = None
     if draft_fields is not None:
@@ -427,15 +463,13 @@ def _ordinary_setup(
         )
         draft_plan = draft_layout.with_num_lcm_blocks(num_pages)
         draft_spec = CachePoolSpec(
-            family=family,
+            family=draft_family,
             memory_plan=draft_plan,
             layer_types=tuple(getattr(draft_attn_config, "layer_types", ())),
             layer_group_ids=draft_group_ids,
+            paged_cache_group_specs=_group_specs(draft_attn_config, draft_group_ids),
             state_field_dtypes={},
             token_capacity=token_capacity,
-            extra_paged_groups=tuple(
-                getattr(draft_attn_config, "extra_paged_groups", ())
-            ),
         )
     return CacheSetup(
         target=target_spec,
@@ -445,10 +479,38 @@ def _ordinary_setup(
     )
 
 
+def _ordinary_fields(config, num_layers: int):
+    """Return the recipe family and fields for one ordinary attention config."""
+    from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+    from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+    from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+    from tokenspeed.runtime.layers.attention.configs.msa import MSAConfig
+
+    if isinstance(config, DSAConfig):
+        return (
+            "dsa",
+            _dsa_fields(config, num_layers),
+            ("full_attention",) * num_layers,
+        )
+    if isinstance(config, MSAConfig):
+        fields, group_ids = _msa_fields(config, num_layers)
+        return "msa", fields, group_ids
+    if isinstance(config, MLAConfig):
+        return (
+            "mla",
+            _mla_fields(config, num_layers),
+            ("full_attention",) * num_layers,
+        )
+    if isinstance(config, MHAConfig):
+        fields, group_ids = _mha_fields(config, num_layers)
+        return "mha", fields, group_ids
+    raise TypeError(f"no ordinary cache recipe for {type(config).__name__}")
+
+
 def _mha_fields(config, num_layers: int):
     import torch
 
-    from tokenspeed.runtime.configs import paged_cache_spec
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes import spec
 
     if config.kv_cache_mxfp8:
         assert config.page_size == 128, (
@@ -458,7 +520,7 @@ def _mha_fields(config, num_layers: int):
     layer_types = tuple(config.layer_types)
     group_ids = (
         tuple(
-            paged_cache_spec.layer_group_ids(
+            spec.layer_group_ids(
                 layer_types=layer_types,
                 sliding_window_tokens=config.sliding_window_tokens,
             )
@@ -501,8 +563,9 @@ def prepare_mha_cache(
     )
     draft_fields = None
     draft_group_ids = ()
+    draft_family = "mha"
     if draft_attn_config is not None:
-        draft_fields, draft_group_ids = _mha_fields(
+        draft_family, draft_fields, draft_group_ids = _ordinary_fields(
             draft_attn_config, draft_model_config.num_attention_layers
         )
     return _ordinary_setup(
@@ -516,6 +579,7 @@ def prepare_mha_cache(
         draft_attn_config=draft_attn_config,
         draft_fields=draft_fields,
         draft_group_ids=draft_group_ids,
+        draft_family=draft_family,
         cache_budget_bytes=cache_budget_bytes,
     )
 
@@ -573,9 +637,9 @@ def prepare_mla_cache(
     target_fields = _mla_fields(attn_config, model_config.num_attention_layers)
     draft_fields = None
     draft_group_ids = ()
+    draft_family = "mla"
     if draft_attn_config is not None:
-        draft_group_ids = ("full_attention",) * draft_model_config.num_attention_layers
-        draft_fields = _mla_fields(
+        draft_family, draft_fields, draft_group_ids = _ordinary_fields(
             draft_attn_config, draft_model_config.num_attention_layers
         )
     return _ordinary_setup(
@@ -589,6 +653,7 @@ def prepare_mla_cache(
         draft_attn_config=draft_attn_config,
         draft_fields=draft_fields,
         draft_group_ids=draft_group_ids,
+        draft_family=draft_family,
         cache_budget_bytes=cache_budget_bytes,
     )
 
@@ -629,9 +694,9 @@ def prepare_dsa_cache(
     target_fields = _dsa_fields(attn_config, model_config.num_attention_layers)
     draft_fields = None
     draft_group_ids = ()
+    draft_family = "dsa"
     if draft_attn_config is not None:
-        draft_group_ids = ("full_attention",) * draft_model_config.num_attention_layers
-        draft_fields = _dsa_fields(
+        draft_family, draft_fields, draft_group_ids = _ordinary_fields(
             draft_attn_config, draft_model_config.num_attention_layers
         )
     return _ordinary_setup(
@@ -645,6 +710,7 @@ def prepare_dsa_cache(
         draft_attn_config=draft_attn_config,
         draft_fields=draft_fields,
         draft_group_ids=draft_group_ids,
+        draft_family=draft_family,
         cache_budget_bytes=cache_budget_bytes,
     )
 
@@ -685,8 +751,9 @@ def prepare_msa_cache(
     )
     draft_fields = None
     draft_group_ids = ()
+    draft_family = "msa"
     if draft_attn_config is not None:
-        draft_fields, draft_group_ids = _msa_fields(
+        draft_family, draft_fields, draft_group_ids = _ordinary_fields(
             draft_attn_config, draft_model_config.num_attention_layers
         )
     return _ordinary_setup(
@@ -700,5 +767,6 @@ def prepare_msa_cache(
         draft_attn_config=draft_attn_config,
         draft_fields=draft_fields,
         draft_group_ids=draft_group_ids,
+        draft_family=draft_family,
         cache_budget_bytes=cache_budget_bytes,
     )

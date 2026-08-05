@@ -1,15 +1,13 @@
 """Inkling cache recipe."""
 
 import os
-from dataclasses import replace
 
-from tokenspeed.runtime.layers.attention.kv_cache.plan import (
-    CacheFieldSpec,
-    CacheMemoryPlan,
-)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
     build_hybrid_cache_setup,
     draft_cache_fields,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    CacheFieldSpec,
 )
 
 
@@ -181,24 +179,21 @@ def _inkling_fields(attn_config, model_config, logical_block_tokens: int):
     return fields, layer_kv_head_counts
 
 
-def _checkpoint_groups(plan: CacheMemoryPlan):
-    from tokenspeed.runtime.configs.paged_cache_spec import PagedCacheGroupSpec
+def _checkpoint_groups(logical_block_tokens: int):
+    # Physical packing is aligned with the memory plan by the pool at
+    # construction; the recipe only declares the scheduler semantics.
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+        PagedCacheGroupSpec,
+    )
 
-    packing = {
-        group.group_id: group.cache_blocks_per_lcm_block for group in plan.groups
-    }
-    missing = {"kvconv", "hiddenconv"} - packing.keys()
-    if missing:
-        raise ValueError(f"Inkling LCM plan is missing groups: {sorted(missing)}")
     return tuple(
         PagedCacheGroupSpec(
             group_id=group_id,
             retention="full_history",
-            rows_per_page=plan.logical_block_tokens,
+            rows_per_page=logical_block_tokens,
             entry_stride_tokens=1,
             sliding_window_tokens=None,
             family="state",
-            cache_blocks_per_lcm_block=packing[group_id],
         )
         for group_id in ("kvconv", "hiddenconv")
     )
@@ -243,8 +238,6 @@ def prepare_inkling_cache(
     overlap_schedule_depth: int,
 ):
     """Build target and optional draft cache specs for Inkling."""
-    from tokenspeed.runtime.layers.attention.kv_cache.setup import CacheSetup
-
     logical_block_tokens = 128
     fields, layer_kv_head_counts = _inkling_fields(
         attn_config, model_config, logical_block_tokens
@@ -306,30 +299,50 @@ def prepare_inkling_cache(
     max_padding_fraction = (
         float("inf") if os.environ.get("INKLING_FP8_SCONV", "0") == "0" else 1.0
     )
-    setup = build_hybrid_cache_setup(
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+        apply_pd_transfer_policies,
+        build_paged_cache_group_specs,
+    )
+
+    # The published specs are the layer-group fold plus the paged sconv
+    # checkpoint groups (per-layer state columns outside the layer-type
+    # vocabulary); PD policies stamp the complete tuple.
+    group_specs = (
+        *build_paged_cache_group_specs(
+            layer_types=layer_types,
+            group_ids=layer_types,
+            sliding_window_tokens=attn_config.sliding_window_tokens,
+            page_size=logical_block_tokens,
+        ),
+        *_checkpoint_groups(logical_block_tokens),
+    )
+    draft_group_specs = ()
+    if draft_attn_config is not None:
+        draft_group_specs = build_paged_cache_group_specs(
+            layer_types=draft_layer_types,
+            group_ids=draft_group_ids,
+            sliding_window_tokens=draft_attn_config.sliding_window_tokens,
+            page_size=logical_block_tokens,
+        )
+    if attn_config.pd_disaggregation_enabled:
+        group_specs = tuple(apply_pd_transfer_policies(group_specs))
+        draft_group_specs = tuple(apply_pd_transfer_policies(draft_group_specs))
+    return build_hybrid_cache_setup(
         family="inkling",
         server_args=server_args,
         fields=fields,
         layer_types=layer_types,
         group_ids=layer_types,
+        group_specs=group_specs,
         state_dtypes={},
         layer_kv_head_counts=layer_kv_head_counts,
         draft_fields=draft_fields,
         draft_layer_types=draft_layer_types,
         draft_group_ids=draft_group_ids,
+        draft_group_specs=draft_group_specs,
         draft_layer_kv_head_counts=draft_layer_kv_head_counts,
         cache_budget_bytes=cache_budget_bytes,
         fixed_workspace_bytes=fixed_workspace_bytes,
         logical_block_tokens=logical_block_tokens,
         max_padding_fraction=max_padding_fraction,
-    )
-    target = replace(
-        setup.target,
-        extra_paged_groups=_checkpoint_groups(setup.target.memory_plan),
-    )
-    return CacheSetup(
-        target=target,
-        draft=setup.draft,
-        cache_budget_bytes=setup.cache_budget_bytes,
-        fixed_workspace_bytes=setup.fixed_workspace_bytes,
     )

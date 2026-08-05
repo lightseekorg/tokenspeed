@@ -116,7 +116,7 @@ class MSAAttnBackend(CacheGroupsMixin, AttentionBackend):
     """MiniMax sparse attention backend that routes through tokenspeed_kernel attention APIs."""
 
     # Unconditional: safety comes from the publication rule
-    # (paged_cache_spec.publish_paged_cache_groups) plus the replay
+    # (kv_cache.recipes.publish) plus the replay
     # stale-table guard. drop the flag.
     uses_cache_groups: bool = True
 
@@ -820,6 +820,18 @@ class MSAHybridAttnBackend(AttentionBackend):
         if layer_id in self.sparse_layer_ids:
             return self.sparse_attn_backend
         return self.full_attn_backend
+
+    @property
+    def cache_consumer_families(self) -> frozenset[str]:
+        """Cache families consumed by the dense and sparse children."""
+        return frozenset(
+            getattr(self.full_attn_backend, "cache_consumer_families", ())
+        ) | frozenset(getattr(self.sparse_attn_backend, "cache_consumer_families", ()))
+
+    def set_cache_pool(self, cache_pool) -> None:
+        self.cache_pool = cache_pool
+        self.full_attn_backend.set_cache_pool(cache_pool)
+        self.sparse_attn_backend.set_cache_pool(cache_pool)
 
     @property
     def sinks_dtype(self) -> torch.dtype:

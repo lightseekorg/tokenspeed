@@ -15,17 +15,15 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-_CONFIGS_DIR = (
-    pathlib.Path(__file__).resolve().parents[2]
-    / "python"
-    / "tokenspeed"
-    / "runtime"
-    / "configs"
+_RUNTIME_DIR = (
+    pathlib.Path(__file__).resolve().parents[2] / "python" / "tokenspeed" / "runtime"
 )
+_KV_CACHE_DIR = _RUNTIME_DIR / "layers" / "attention" / "kv_cache"
+_RECIPES_DIR = _KV_CACHE_DIR / "recipes"
 
 
-def _load(mod_name: str, file_name: str):
-    spec = importlib.util.spec_from_file_location(mod_name, _CONFIGS_DIR / file_name)
+def _load(mod_name: str, file_path: pathlib.Path):
+    spec = importlib.util.spec_from_file_location(mod_name, file_path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     # Register before exec: on py3.9 @dataclass + `from __future__ import
@@ -35,8 +33,20 @@ def _load(mod_name: str, file_name: str):
     return mod
 
 
-_pcs = _load("paged_cache_spec_slab_under_test", "paged_cache_spec.py")
+# spec.py is self-contained: load it from the repo file under a private
+# name (no real package import, no sys.modules shadowing needed).
+_pcs = _load("kv_cache_spec_slab_under_test", _RECIPES_DIR / "spec.py")
 hybrid_slab_group_size = _pcs.hybrid_slab_group_size
+
+
+def _real_spec():
+    # The REAL package module (not the file-loaded shadow above): pool
+    # constructions need specs whose class passes the contract's
+    # isinstance check.
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes import spec
+
+    return spec
+
 
 GPT_OSS_LAYER_TYPES = ("sliding_attention", "full_attention") * 12
 
@@ -149,7 +159,6 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
     When placement sharing is active, paired layer views address the same
     bytes without sharing a Python tensor object.
     Constructs a real (tiny, CPU) MHATokenToKVPool; skips without deps.
-    Patch target is the PACKAGE paged_cache_spec probe (see above).
     """
 
     def setUp(self):
@@ -165,7 +174,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
         self.MHATokenToKVPool = MHATokenToKVPool
 
     def _pool(self, **overrides):
-        from cache_pool_test_utils import make_mha_memory_plan
+        from cache_pool_test_utils import make_layer_group_ids, make_mha_memory_plan
 
         kwargs = {
             "size": 32,
@@ -175,8 +184,6 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
             "layer_num": 24,
             "device": "cpu",
             "enable_memory_saver": False,
-            "max_batch_size": 2,
-            "max_context_len": 64,
             "page_size": 16,
             "rank": 0,
             "layer_types": GPT_OSS_LAYER_TYPES,
@@ -193,6 +200,15 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
             layer_types=kwargs.get("layer_types", ()),
             sliding_window_tokens=kwargs.get("sliding_window_tokens"),
         )
+        kwargs.setdefault(
+            "layer_group_ids",
+            make_layer_group_ids(
+                layer_num=kwargs["layer_num"],
+                layer_types=kwargs.get("layer_types", ()),
+                sliding_window_tokens=kwargs.get("sliding_window_tokens"),
+            ),
+        )
+        kwargs.pop("sliding_window_tokens", None)
         return self.MHATokenToKVPool(**kwargs)
 
     def test_plan_aliases_distinct_layer_views(self):
@@ -287,11 +303,9 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
         ):
             self._pool(pd_disaggregation_enabled=True)
 
-    def test_constructor_uses_overridable_group_publication(self):
-        class PoolWithCustomPublication(self.MHATokenToKVPool):
-            def _publish_paged_cache_groups(self, **kwargs):
-                self.publication_args = kwargs
-
+    def test_constructor_without_specs_publishes_no_contract(self):
+        # The recipe is the single source of group specs; a pool constructed
+        # without them (tests, partial harnesses) publishes no contract.
         kwargs = {
             "size": 32,
             "dtype": self.torch.bfloat16,
@@ -300,11 +314,10 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
             "layer_num": 1,
             "device": "cpu",
             "enable_memory_saver": False,
-            "max_batch_size": 2,
-            "max_context_len": 64,
             "page_size": 16,
             "rank": 0,
             "layer_types": ("full_attention",),
+            "layer_group_ids": ("full_attention",),
         }
         from cache_pool_test_utils import make_mha_memory_plan
 
@@ -317,11 +330,57 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
             dtype=kwargs["dtype"],
             layer_types=kwargs["layer_types"],
         )
-        pool = PoolWithCustomPublication(**kwargs)
+        pool = self.MHATokenToKVPool(**kwargs)
 
         self.assertEqual(pool.paged_cache_group_specs, ())
-        self.assertEqual(pool.publication_args["layer_types"], ("full_attention",))
-        self.assertEqual(pool.publication_args["max_total_tokens"], 32)
+        self.assertIsNone(pool.runtime_contract)
+
+    def test_constructor_aligns_recipe_specs_with_plan(self):
+        # Recipe specs carry default packing; the pool overwrites it (and the
+        # page counts) from the memory plan before publishing the contract.
+        kwargs = {
+            "size": 32,
+            "dtype": self.torch.bfloat16,
+            "head_num": 1,
+            "head_dim": 8,
+            "layer_num": 1,
+            "device": "cpu",
+            "enable_memory_saver": False,
+            "page_size": 16,
+            "rank": 0,
+            "layer_types": ("full_attention",),
+            "layer_group_ids": ("full_attention",),
+        }
+        from cache_pool_test_utils import make_mha_memory_plan
+
+        kwargs["memory_plan"] = make_mha_memory_plan(
+            size=kwargs["size"],
+            page_size=kwargs["page_size"],
+            layer_num=kwargs["layer_num"],
+            kv_heads=kwargs["head_num"],
+            head_dim=kwargs["head_dim"],
+            dtype=kwargs["dtype"],
+            layer_types=kwargs["layer_types"],
+        )
+        kwargs["paged_cache_group_specs"] = _real_spec().build_paged_cache_group_specs(
+            layer_types=kwargs["layer_types"],
+            group_ids=kwargs["layer_group_ids"],
+            sliding_window_tokens=None,
+            page_size=kwargs["page_size"],
+        )
+        pool = self.MHATokenToKVPool(**kwargs)
+
+        self.assertIsNotNone(pool.runtime_contract)
+        self.assertEqual(
+            [spec.group_id for spec in pool.paged_cache_group_specs],
+            ["full_attention"],
+        )
+        plan_group = kwargs["memory_plan"].group("full_attention")
+        self.assertEqual(
+            pool.paged_cache_group_page_counts["full_attention"],
+            plan_group.page_count,
+        )
+        self.assertEqual(pool.runtime_contract.token_capacity, kwargs["size"])
 
 
 class MLAPoolAllocationHookTest(unittest.TestCase):
@@ -363,8 +422,6 @@ class MLAPoolAllocationHookTest(unittest.TestCase):
             layer_num=1,
             device="cpu",
             enable_memory_saver=False,
-            max_batch_size=2,
-            max_context_len=32,
             page_size=4,
             rank=0,
             memory_plan=make_mla_memory_plan(
@@ -373,6 +430,13 @@ class MLAPoolAllocationHookTest(unittest.TestCase):
                 layer_num=1,
                 latent_width=6,
                 dtype=torch.bfloat16,
+            ),
+            layer_group_ids=("full_attention",),
+            paged_cache_group_specs=_real_spec().build_paged_cache_group_specs(
+                layer_types=(),
+                group_ids=("full_attention",),
+                sliding_window_tokens=None,
+                page_size=4,
             ),
         )
 
@@ -406,6 +470,7 @@ class StatePagedCacheGroupPageCountTest(unittest.TestCase):
     def _counts(self, **overrides):
         specs = _pcs.group_specs_from_layer_types(
             layer_types=("linear_attention", "full_attention"),
+            group_ids=("linear_attention", "full_attention"),
             sliding_window_tokens=None,
             page_size=16,
         )
@@ -435,15 +500,13 @@ class CachePoolFieldBindingTest(unittest.TestCase):
     def setUp(self):
         try:
             import torch
+            from cache_pool_test_utils import plan_fields
 
             from tokenspeed.runtime.layers.attention.kv_cache.hybrid_mha import (
                 HybridMHATokenToKVPool,
             )
             from tokenspeed.runtime.layers.attention.kv_cache.mha import (
                 MHATokenToKVPool,
-            )
-            from tokenspeed.runtime.layers.attention.kv_cache.plan import (
-                plan_cache_fields,
             )
             from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen35 import (
                 qwen_gdn_cache_fields,
@@ -464,7 +527,7 @@ class CachePoolFieldBindingTest(unittest.TestCase):
             ssm_shape=(1, 2, 2),
             ssm_element_size=2,
         )
-        self.plan = plan_cache_fields(
+        self.plan = plan_fields(
             fields,
             logical_block_tokens=4,
             budget_bytes=64,
@@ -480,8 +543,6 @@ class CachePoolFieldBindingTest(unittest.TestCase):
             layer_num=2,
             device="cpu",
             enable_memory_saver=False,
-            max_batch_size=2,
-            max_context_len=32,
             page_size=4,
             rank=0,
             layer_types=("linear_attention", "full_attention"),
@@ -491,6 +552,12 @@ class CachePoolFieldBindingTest(unittest.TestCase):
             },
             memory_plan=self.plan,
             layer_group_ids=("linear_attention_0", "full_attention"),
+            paged_cache_group_specs=_real_spec().build_paged_cache_group_specs(
+                layer_types=("linear_attention", "full_attention"),
+                group_ids=("linear_attention_0", "full_attention"),
+                sliding_window_tokens=None,
+                page_size=4,
+            ),
         )
 
     def _ordinary_pool(self):
@@ -504,11 +571,10 @@ class CachePoolFieldBindingTest(unittest.TestCase):
             layer_num=2,
             device="cpu",
             enable_memory_saver=False,
-            max_batch_size=2,
-            max_context_len=32,
             page_size=4,
             rank=0,
             layer_types=("linear_attention", "full_attention"),
+            layer_group_ids=("linear_attention", "full_attention"),
             memory_plan=make_mha_memory_plan(
                 size=8,
                 page_size=4,

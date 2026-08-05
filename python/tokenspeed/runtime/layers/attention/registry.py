@@ -29,7 +29,6 @@ import torch
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import AttentionArch, is_deepseek_v4
-from tokenspeed.runtime.configs.paged_cache_spec import STATE_LAYER_TYPES
 from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
@@ -39,9 +38,12 @@ from tokenspeed.runtime.layers.attention.configs.msa import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 from tokenspeed.runtime.layers.attention.kv_cache.factory import create_cache_pool
-from tokenspeed.runtime.layers.attention.kv_cache.setup import (
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
     CachePoolSpec,
     prepare_cache_setup,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    STATE_LAYER_TYPES,
 )
 from tokenspeed.runtime.layers.attention.utils import (
     profile_available_cache_memory_bytes,
@@ -121,7 +123,6 @@ def _validate_shared_cache_geometry(pool, draft_pool) -> None:
             "entry_stride_tokens",
             "sliding_window_tokens",
             "family",
-            "block_size",
             "cache_blocks_per_lcm_block",
         )
         if any(
@@ -234,6 +235,8 @@ _HYBRID_GDN_ARCHITECTURES = {
     "Qwen3_5MoeForConditionalGenerationNextN",
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5ForConditionalGenerationNextN",
+    "Qwen3_5MoeForCausalLM",
+    "Qwen3_5MoeForCausalLMNextN",
 }
 # Hybrid linear-attention models whose full-attention layers are MLA (not MHA)
 # and whose linear layers are KDA (per-channel gated delta rule), not GDN.
@@ -359,15 +362,18 @@ def _create_attn_backend_with_name(
 
 
 def _resolve_kda_backend(kda_backend: str) -> str:
-    """Resolve the KDA prefill backend policy to a concrete choice.
+    """Resolve the KDA prefill backend policy.
 
-    ``auto`` picks the fastest available kernel — ``cutedsl_kda`` (the tokenspeed-cutedsl-kda AOT build
-    matching this device), then ``flashkda`` (optional source-built package),
-    falling back to the portable FLA scan. ``fla`` forces the portable scan.
-    Explicit choices are validated against availability and fail fast with an
-    install hint instead of silently mis-routing. Decode is unaffected either
-    way.
+    On AMD, the backend policy is ignored and compatible kernels are selected
+    using registry priority. On NVIDIA, ``auto`` picks the fastest available
+    kernel — ``cutedsl_kda``, then ``flashkda``, falling back to the portable
+    FLA scan. Explicit NVIDIA choices are validated against availability and
+    fail fast with an install hint. Decode is unaffected.
     """
+    if current_platform().is_amd:
+        # Named backend policies are NVIDIA-specific; let the registry decide.
+        return "auto"
+
     from tokenspeed_kernel.ops.attention.cutedsl_kda import is_cutedsl_kda_installed
     from tokenspeed_kernel.ops.attention.flash_kda import is_flash_kda_installed
 

@@ -147,6 +147,7 @@ from tokenspeed_kernel import (
     msa_extend_with_kvcache, msa_decode_with_kvcache,
     gdn_chunk_prefill,
     mm,
+    moe_softmax_topk,
     moe_route, moe_dispatch, moe_experts, moe_combine, moe_fused,
     ...
 )

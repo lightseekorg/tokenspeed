@@ -214,6 +214,7 @@ class InitForwardMetadataAssemblyTest(_MHACase):
         torch = self.torch
         backend = self.MHAAttnBackend.__new__(self.MHAAttnBackend)
         backend.page_size = PAGE
+        backend.group_page_sizes = {}
         backend.max_context_len = MAX_NUM_PAGES * PAGE
         backend.max_num_pages = MAX_NUM_PAGES
         backend.spec_num_tokens = 1

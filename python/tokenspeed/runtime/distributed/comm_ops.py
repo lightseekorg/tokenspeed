@@ -50,6 +50,12 @@ from tokenspeed.runtime.distributed.comm_backend import (
     Group,
     get_global_backend,
 )
+
+# Re-exported for reduce-strategy callers (e.g. kimi3_join_reduce_moe):
+# tensors past the one-shot admission window always take an NCCL path.
+from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (  # noqa: F401
+    MAX_ONESHOT_BYTES as COMM_ONESHOT_MAX_BYTES,
+)
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )

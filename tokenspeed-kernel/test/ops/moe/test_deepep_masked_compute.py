@@ -50,6 +50,19 @@ from tokenspeed_kernel.thirdparty.deep_gemm.utils.layout import (  # noqa: E402
 _BLOCK = 128
 
 
+@pytest.fixture(params=[False, True], ids=["pdl_off", "pdl_on"])
+def enable_pdl(request):
+    """Run the full DG1 -> activation -> DG2 chain in both launch modes."""
+    if request.param and torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("PDL requires SM90+")
+    previous = deep_gemm.get_pdl()
+    deep_gemm.set_pdl(request.param)
+    try:
+        yield request.param
+    finally:
+        deep_gemm.set_pdl(previous)
+
+
 def _quantize_masked(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-row 1x128 block FP8 quantize with UE8M0 scales, [E, M, K] layout."""
     experts, rows, cols = x.shape
@@ -164,7 +177,7 @@ def test_sparse_and_full_launch_mappings_match_exactly():
         assert torch.equal(sparse_scales[expert, :valid], full_scales[expert, :valid])
 
 
-def test_low_latency_expert_compute_matches_dequantized_reference():
+def test_low_latency_expert_compute_matches_dequantized_reference(enable_pdl):
     torch.manual_seed(0)
     experts, capacity, hidden, ispp = 4, 128, 512, 256
     device = "cuda"
@@ -198,7 +211,10 @@ def test_low_latency_expert_compute_matches_dequantized_reference():
     )
 
     down_in, down_scales = fused_swiglu_fp8_ue8m0_masked_packed(
-        gateup, masked_m, expected_m=expected_m
+        gateup,
+        masked_m,
+        expected_m=expected_m,
+        enable_pdl=enable_pdl,
     )
 
     out = torch.empty((experts, capacity, hidden), dtype=torch.bfloat16, device=device)

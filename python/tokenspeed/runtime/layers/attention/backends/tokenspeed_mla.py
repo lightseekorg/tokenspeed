@@ -42,7 +42,6 @@ from tokenspeed_kernel.ops.attention.tokenspeed_mla import (
     warmup_compile_prefill,
 )
 
-from tokenspeed.runtime.configs.cache_runtime import cache_debug_enabled
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -54,6 +53,9 @@ from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
 )
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+    cache_debug_enabled,
+)
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.pdl import pdl_enabled
@@ -109,9 +111,10 @@ class CuteDSLMLADecodeMetadata:
     block_kv_indices: torch.Tensor | None = None
     max_seq_len_k: int | None = None
     seq_lens_k: torch.Tensor | None = None
-    # Paged cache only: absolute latent write locations, one per batch row
-    # (position seq_len - 1); decode consumers slice [num_extends:].
+    # Paged cache only: absolute latent write locations, group_q_len_per_req
+    # entries per batch row. Mixed-batch decode skips whole prefill windows.
     group_out_cache_loc: torch.Tensor | None = None
+    group_q_len_per_req: int = 1
 
 
 class CuteDSLMLABackend(AttentionBackend):
@@ -213,6 +216,10 @@ class CuteDSLMLABackend(AttentionBackend):
         from the cache metadata each forward.
         """
         del logical_page_size
+        if self.is_draft:
+            # The CuteDSL draft keeps its batch-ordered page table. Only target
+            # forwards consume scheduler cache-group metadata.
+            return
         self._cache_contract_bound = True
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
@@ -482,7 +489,7 @@ class CuteDSLMLABackend(AttentionBackend):
                 if (
                     self.spec_num_tokens > 1
                     and not self.is_draft
-                    and forward_mode.is_decode()
+                    and (forward_mode.is_decode() or forward_mode.is_mixed())
                 )
                 else 1
             )
@@ -527,7 +534,9 @@ class CuteDSLMLABackend(AttentionBackend):
                     "MLA decode write locations are missing; "
                     "init_forward_metadata must run with paged cache metadata"
                 )
-            locs = metadata.group_out_cache_loc[metadata.num_extends :]
+            locs = metadata.group_out_cache_loc[
+                metadata.num_extends * metadata.group_q_len_per_req :
+            ]
         else:
             metadata = self.forward_prefill_metadata
             if metadata is None or metadata.group_out_cache_loc is None:
@@ -580,6 +589,7 @@ class CuteDSLMLABackend(AttentionBackend):
             seq_lens_k=seq_lens,
             num_extends=num_extends,
             group_out_cache_loc=group_out_cache_loc,
+            group_q_len_per_req=q_len_per_req,
         )
 
     def _init_prefill_metadata(
@@ -754,6 +764,7 @@ class CuteDSLMLABackend(AttentionBackend):
                 seq_lens_k=self.cuda_graph_seq_lens_buf[:bs],
                 num_extends=0,
                 group_out_cache_loc=group_out_cache_loc,
+                group_q_len_per_req=capture_q_len,
             )
         else:
             metadata = CuteDSLMLADecodeMetadata(
@@ -846,11 +857,7 @@ class CuteDSLMLABackend(AttentionBackend):
             )
         # Target verify graphs are captured with q_len write locations per
         # request (request-major flattened); mirror the capture-time width.
-        replay_q_len = (
-            self.spec_num_tokens
-            if (self.spec_num_tokens > 1 and not self.is_draft)
-            else 1
-        )
+        replay_q_len = metadata.group_q_len_per_req
         max_blocks = metadata.block_kv_indices.shape[1]
         real_bs = 0
         if cache_metadata is not None:

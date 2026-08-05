@@ -35,7 +35,7 @@ def collect(sweep_dir: Path):
             if not summary_path.is_file():
                 continue
             s = json.loads(summary_path.read_text())
-            tpot_ms = s["TPOT (ms)"]
+            tpot_ms = s["Avg TPOT (ms)"]
             decode_tps_user = 1000.0 / tpot_ms if tpot_ms else 0.0
             tps_gpu = s["Total Throughput (tok/s)"] / n_gpus
             rows.append(
@@ -45,7 +45,7 @@ def collect(sweep_dir: Path):
                     "Latency (tps/user)": round(decode_tps_user, 2),
                     "Throughput (tps/gpu)": round(tps_gpu, 2),
                     "Approx Cache Hit": round(s["KV Cache Hit Rate (%)"], 2),
-                    "Decoded Tok/Iter": round(s["Decoded Tok/Iter"], 4),
+                    "Decoded Tok/Iter": round(s["Avg Decoded Tok/Iter"], 4),
                 }
             )
     rows.sort(key=lambda r: (r["config"], r["Conc."]))

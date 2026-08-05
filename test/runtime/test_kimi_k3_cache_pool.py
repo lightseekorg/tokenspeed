@@ -4,16 +4,17 @@ import pytest
 import torch
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
-from tokenspeed.runtime.configs.paged_cache_spec import (
-    FULL_ATTENTION,
-    LINEAR_ATTENTION,
-)
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
     HybridKDATokenToKVPool,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
     kimi_k3_layer_group_ids,
     solve_kimi_k3_cache_layout,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    FULL_ATTENTION,
+    LINEAR_ATTENTION,
+    build_paged_cache_group_specs,
 )
 
 
@@ -54,14 +55,18 @@ def test_kimi_k3_pool_binds_mla_and_kda_to_one_lcm_backing() -> None:
         layer_num=text_config.num_hidden_layers,
         device="cuda",
         enable_memory_saver=False,
-        max_batch_size=1,
-        max_context_len=4096,
         page_size=plan.logical_block_tokens,
         rank=0,
         layer_types=layer_types,
         layer_group_ids=group_ids,
-        max_scheduled_tokens=1024,
         pd_disaggregation_enabled=True,
+        paged_cache_group_specs=build_paged_cache_group_specs(
+            layer_types=layer_types,
+            group_ids=group_ids,
+            sliding_window_tokens=None,
+            page_size=plan.logical_block_tokens,
+            pd_disaggregation_enabled=True,
+        ),
         state_field_dtypes={
             field_id: dtype
             for layer_id, layer_type in enumerate(layer_types)

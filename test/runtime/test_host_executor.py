@@ -164,6 +164,7 @@ class MemoryExecutorTest(unittest.TestCase):
     def setUp(self):
         try:
             import torch
+            from cache_pool_test_utils import plan_fields
             from tokenspeed_scheduler import Cache
 
             from tokenspeed.runtime.cache.executor.memory_executor import (
@@ -175,9 +176,6 @@ class MemoryExecutorTest(unittest.TestCase):
             )
             from tokenspeed.runtime.layers.attention.kv_cache.mha import (
                 MHATokenToKVPool,
-            )
-            from tokenspeed.runtime.layers.attention.kv_cache.plan import (
-                plan_cache_fields,
             )
             from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen35 import (
                 qwen_gdn_cache_fields,
@@ -195,7 +193,7 @@ class MemoryExecutorTest(unittest.TestCase):
         self.MHATokenToKVPool = MHATokenToKVPool
         self.HybridMHATokenToKVPool = HybridMHATokenToKVPool
         self.qwen_gdn_cache_fields = qwen_gdn_cache_fields
-        self.plan_cache_fields = plan_cache_fields
+        self.plan_fields = plan_fields
 
     def _pool(self):
         from cache_pool_test_utils import make_mha_memory_plan
@@ -208,13 +206,13 @@ class MemoryExecutorTest(unittest.TestCase):
             "layer_num": 4,
             "device": "cuda",
             "enable_memory_saver": False,
-            "max_batch_size": 2,
-            "max_context_len": 64,
             "page_size": 4,
             "rank": 0,
             "layer_types": LAYER_TYPES,
             "sliding_window_tokens": 128,
         }
+        from cache_pool_test_utils import make_layer_group_ids
+
         kwargs["memory_plan"] = make_mha_memory_plan(
             size=kwargs["size"],
             page_size=kwargs["page_size"],
@@ -225,6 +223,12 @@ class MemoryExecutorTest(unittest.TestCase):
             layer_types=kwargs["layer_types"],
             sliding_window_tokens=kwargs["sliding_window_tokens"],
         )
+        kwargs["layer_group_ids"] = make_layer_group_ids(
+            layer_num=kwargs["layer_num"],
+            layer_types=kwargs["layer_types"],
+            sliding_window_tokens=kwargs["sliding_window_tokens"],
+        )
+        kwargs.pop("sliding_window_tokens", None)
         return self.MHATokenToKVPool(**kwargs)
 
     def _executor(self, pool):
@@ -335,7 +339,7 @@ class MemoryExecutorTest(unittest.TestCase):
             ssm_shape=(2, 8),
             ssm_element_size=2,
         )
-        plan = self.plan_cache_fields(
+        plan = self.plan_fields(
             fields,
             logical_block_tokens=4,
             num_lcm_blocks=4,
@@ -351,8 +355,6 @@ class MemoryExecutorTest(unittest.TestCase):
             "layer_num": 4,
             "device": "cuda",
             "enable_memory_saver": False,
-            "max_batch_size": 2,
-            "max_context_len": 64,
             "page_size": 4,
             "rank": 0,
             "layer_types": GDN_LAYER_TYPES,
@@ -370,6 +372,7 @@ class MemoryExecutorTest(unittest.TestCase):
                 for field in ("conv", "ssm")
             },
         }
+        kwargs.pop("sliding_window_tokens", None)
         return self.HybridMHATokenToKVPool(**kwargs)
 
     def _fill_spans(self, mirror, device_pages):

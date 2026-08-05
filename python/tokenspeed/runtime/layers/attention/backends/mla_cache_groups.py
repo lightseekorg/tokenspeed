@@ -221,7 +221,11 @@ class MlaCacheGroupMixin:
         """
         if self.spec_num_tokens <= 1:
             return 1
-        if not self.is_draft and forward_mode is not None and forward_mode.is_decode():
+        if (
+            not self.is_draft
+            and forward_mode is not None
+            and (forward_mode.is_decode() or forward_mode.is_mixed())
+        ):
             return self.spec_num_tokens
         return 1
 

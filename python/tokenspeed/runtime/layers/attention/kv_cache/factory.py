@@ -6,7 +6,7 @@ from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.configs.msa import MSAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
-from tokenspeed.runtime.layers.attention.kv_cache.setup import CachePoolSpec
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import CachePoolSpec
 
 
 def create_cache_pool(
@@ -17,7 +17,12 @@ def create_cache_pool(
     rank: int,
     enable_memory_saver: bool,
 ) -> CachePool:
-    """Create the concrete compute interface for a prepared cache spec."""
+    """Create the concrete compute interface for a prepared cache spec.
+
+    The recipe's group specs and token capacity travel via the spec; the
+    pool base aligns the specs' physical fields with the memory plan and
+    publishes the runtime contract (ModelExecutor fails fast without one).
+    """
     plan = spec.memory_plan
     if spec.family == "deepseek_v4":
         from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
@@ -37,12 +42,10 @@ def create_cache_pool(
             layer_num=num_layers,
             device=config.device,
             enable_memory_saver=enable_memory_saver,
-            max_batch_size=config.max_bs,
-            max_context_len=config.context_len,
             page_size=config.page_size,
             rank=rank,
-            hf_config=options.hf_config,
             memory_plan=plan,
+            paged_cache_group_specs=spec.paged_cache_group_specs,
             token_capacity=spec.token_capacity,
         )
     if isinstance(config, DSAConfig):
@@ -60,12 +63,13 @@ def create_cache_pool(
             layer_num=num_layers,
             device=config.device,
             enable_memory_saver=enable_memory_saver,
-            max_batch_size=config.max_bs,
-            max_context_len=config.context_len,
             page_size=plan.logical_block_tokens,
             rank=rank,
             index_head_dim=config.index_head_dim,
             memory_plan=plan,
+            paged_cache_group_specs=spec.paged_cache_group_specs,
+            token_capacity=spec.token_capacity,
+            layer_group_ids=spec.layer_group_ids,
         )
     if isinstance(config, MSAConfig):
         from tokenspeed.runtime.layers.attention.kv_cache.msa import (
@@ -80,18 +84,17 @@ def create_cache_pool(
             layer_num=num_layers,
             device=config.device,
             enable_memory_saver=enable_memory_saver,
-            max_batch_size=config.max_bs,
-            max_context_len=config.context_len,
             page_size=plan.logical_block_tokens,
             rank=rank,
             index_head_dim=config.index_head_dim,
             index_dtype=config.dtype,
             indexed_layer_ids=config.sparse_layer_ids,
             layer_types=spec.layer_types,
-            sliding_window_tokens=config.sliding_window_tokens,
-            max_scheduled_tokens=config.max_scheduled_tokens,
+            layer_group_ids=spec.layer_group_ids,
             pd_disaggregation_enabled=config.pd_disaggregation_enabled,
             memory_plan=plan,
+            paged_cache_group_specs=spec.paged_cache_group_specs,
+            token_capacity=spec.token_capacity,
         )
     if isinstance(config, MHAConfig):
         if spec.family == "mha":
@@ -111,16 +114,14 @@ def create_cache_pool(
                 layer_num=num_layers,
                 device=config.device,
                 enable_memory_saver=enable_memory_saver,
-                max_batch_size=config.max_bs,
-                max_context_len=config.context_len,
                 page_size=plan.logical_block_tokens,
                 rank=rank,
                 layer_types=spec.layer_types,
-                sliding_window_tokens=config.sliding_window_tokens,
-                max_scheduled_tokens=config.max_scheduled_tokens,
+                layer_group_ids=spec.layer_group_ids,
                 pd_disaggregation_enabled=config.pd_disaggregation_enabled,
-                extra_paged_groups=spec.extra_paged_groups,
                 memory_plan=plan,
+                paged_cache_group_specs=spec.paged_cache_group_specs,
+                token_capacity=spec.token_capacity,
             )
         if spec.family == "inkling":
             from tokenspeed.runtime.layers.attention.kv_cache.hybrid_inkling import (
@@ -156,20 +157,16 @@ def create_cache_pool(
             layer_num=num_layers,
             device=config.device,
             enable_memory_saver=enable_memory_saver,
-            max_batch_size=config.max_bs,
-            max_context_len=config.context_len,
             page_size=plan.logical_block_tokens,
             rank=rank,
             layer_types=spec.layer_types,
-            sliding_window_tokens=config.sliding_window_tokens,
-            max_scheduled_tokens=config.max_scheduled_tokens,
             pd_disaggregation_enabled=config.pd_disaggregation_enabled,
-            extra_paged_groups=spec.extra_paged_groups,
             layer_kv_head_counts=spec.layer_kv_head_counts,
             kv_alloc_head_count=config.num_kv_heads,
             memory_plan=plan,
             layer_group_ids=spec.layer_group_ids,
             state_field_dtypes=spec.state_field_dtypes,
+            paged_cache_group_specs=spec.paged_cache_group_specs,
             token_capacity=spec.token_capacity,
         )
     if isinstance(config, MLAConfig):
@@ -188,12 +185,12 @@ def create_cache_pool(
                 layer_num=num_layers,
                 device=config.device,
                 enable_memory_saver=enable_memory_saver,
-                max_batch_size=config.max_bs,
-                max_context_len=config.context_len,
                 page_size=plan.logical_block_tokens,
                 rank=rank,
-                max_scheduled_tokens=config.max_scheduled_tokens,
                 memory_plan=plan,
+                paged_cache_group_specs=spec.paged_cache_group_specs,
+                token_capacity=spec.token_capacity,
+                layer_group_ids=spec.layer_group_ids,
             )
 
         if spec.family != "kimi_k3":
@@ -215,16 +212,14 @@ def create_cache_pool(
             layer_num=num_layers,
             device=config.device,
             enable_memory_saver=enable_memory_saver,
-            max_batch_size=config.max_bs,
-            max_context_len=config.context_len,
             page_size=plan.logical_block_tokens,
             rank=rank,
             layer_types=spec.layer_types,
             layer_group_ids=spec.layer_group_ids,
-            max_scheduled_tokens=config.max_scheduled_tokens,
             pd_disaggregation_enabled=config.pd_disaggregation_enabled,
             state_field_dtypes=spec.state_field_dtypes,
             memory_plan=plan,
+            paged_cache_group_specs=spec.paged_cache_group_specs,
             token_capacity=spec.token_capacity,
         )
     raise TypeError(f"cache setup does not support config type {type(config).__name__}")

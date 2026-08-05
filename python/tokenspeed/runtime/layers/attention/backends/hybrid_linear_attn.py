@@ -45,8 +45,6 @@ from tokenspeed_kernel.ops.attention.triton.linear.index import (
     set_total_chunks_hint_uniform,
 )
 
-from tokenspeed.runtime.configs.cache_runtime import cache_debug_enabled
-from tokenspeed.runtime.configs.paged_cache_spec import LINEAR_ATTENTION
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
     current_forward_ctx,
@@ -56,6 +54,12 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
     init_backend_cuda_graph_state,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+    cache_debug_enabled,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    LINEAR_ATTENTION,
 )
 from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
     causal_conv1d_fn,
@@ -382,15 +386,16 @@ class MambaAttnBackend(AttentionBackend):
         self.pad_slot_id = -1
         # Kernel family: GDN (scalar decay) or KDA (per-channel, Kimi-K3).
         self.is_kda = is_kda
-        # KDA prefill kernel policy, resolved by the registry: "auto" picks
-        # the fastest available kernel (cutedsl_kda > flashkda > fla), "fla" forces
-        # the portable scan (decode is unaffected either way).
-        self.kda_backend = "fla"
+        # KDA prefill kernel policy: unresolved "auto" delegates to the registry;
+        # otherwise this is cutedsl_kda, flashkda, or fla. Decode is unaffected.
+        self.kda_backend = (kda_backend or "auto").strip().lower()
         if self.is_kda:
-            self.kda_backend = (kda_backend or "auto").strip().lower()
-            if self.kda_backend == "auto":
-                self.kda_backend = "fla"
-            if self.kda_backend not in ("fla", "flashkda", "cutedsl_kda"):
+            if self.kda_backend not in (
+                "auto",
+                "fla",
+                "flashkda",
+                "cutedsl_kda",
+            ):
                 raise ValueError(
                     "--kda-backend must be one of auto, fla, flashkda, cutedsl_kda; "
                     f"got {self.kda_backend!r}"

@@ -33,21 +33,17 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 __all__ = [
     "kimi3_native_moe_available",
     "moe_apply",
-    "moe_grouped_routing",
     "moe_plan",
     "moe_process_weights",
     "moe_sigmoid_bias_topk",
-    "moe_unfused_apply",
+    "moe_softmax_topk",
 ]
 
-from tokenspeed_kernel.ops.moe.grouped_routing import (  # noqa: E402
-    moe_grouped_routing,
-)
 from tokenspeed_kernel.ops.moe.kimi3 import (  # noqa: E402
     kimi3_native_moe_available,
 )
 from tokenspeed_kernel.ops.moe.sigmoid_topk import moe_sigmoid_bias_topk  # noqa: E402
-from tokenspeed_kernel.ops.moe.unfused import moe_unfused_apply  # noqa: E402
+from tokenspeed_kernel.ops.moe.softmax_topk import moe_softmax_topk  # noqa: E402
 
 
 def _normalize_weight_dtype(weight_dtype: str) -> str:
@@ -209,7 +205,8 @@ def moe_plan(
         fp8_scale_block_shape: Optional FP8 block-scale shape requirement.
         internal_activation_dtype: Optional internal activation dtype requirement.
             "input" is a special value that uses the whatever dtype the input
-            activations have. Defaults to "input" if not set.
+            activations have. "mxfp4" requests dynamic MXFP4 activation
+            quantization. Defaults to "input" if not set.
         with_bias: Whether the selected kernel must support expert bias tensors.
         deepep_group: Runtime-created process group used by DeepEP plans.
         deepep_mode: Optional DeepEP mode for all-to-all plans: "low_latency"
