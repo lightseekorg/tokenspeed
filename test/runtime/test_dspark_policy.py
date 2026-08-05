@@ -19,6 +19,7 @@ def test_short_generation_routes_to_w4() -> None:
         input_tokens=1024,
         max_new_tokens=512,
         concurrency=1,
+        workload="gsm8k",
     )
     assert route.mode == "w4"
 
@@ -41,7 +42,7 @@ def test_uncalibrated_confidence_cannot_override_validated_route() -> None:
         confidence=0.01,
         confidence_calibrated=False,
     )
-    assert route.mode == "w4"
+    assert route.mode == "no-spec"
 
 
 def test_calibrated_low_confidence_routes_to_no_spec() -> None:
@@ -53,3 +54,14 @@ def test_calibrated_low_confidence_routes_to_no_spec() -> None:
         confidence_calibrated=True,
     )
     assert route.mode == "no-spec"
+
+
+def test_calibrated_high_confidence_routes_to_w4() -> None:
+    route = route_kimi_k3_dspark(
+        input_tokens=4096,
+        max_new_tokens=1024,
+        concurrency=4,
+        confidence=0.8,
+        confidence_calibrated=True,
+    )
+    assert route.mode == "w4"

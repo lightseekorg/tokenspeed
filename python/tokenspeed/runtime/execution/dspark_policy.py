@@ -37,10 +37,19 @@ def route_kimi_k3_dspark(
     if workload in {"aime", "math-reasoning", "reasoning"} and concurrency >= 8:
         return DSparkRoute("w8", "reasoning c8+ uses the validated W8 pool")
 
-    if input_tokens <= 4096 and max_new_tokens >= 256:
-        return DSparkRoute("w4", "short-context generation favors W4 break-even")
+    if (
+        workload in {"gsm8k", "humaneval", "mbpp", "code"}
+        and input_tokens <= 4096
+        and max_new_tokens >= 256
+    ):
+        return DSparkRoute("w4", "validated low-entropy workload favors W4")
 
-    if input_tokens <= 8192 and concurrency >= 8:
-        return DSparkRoute("w4", "batched context fits the validated W4 pool")
+    if (
+        confidence_calibrated
+        and confidence is not None
+        and confidence >= 0.5
+        and input_tokens <= 8192
+    ):
+        return DSparkRoute("w4", "calibrated confidence selects the W4 pool")
 
     return DSparkRoute("no-spec", "no validated >=1.30x DSpark operating point")

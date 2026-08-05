@@ -21,7 +21,7 @@ server:
     --served-model-name kimi-k3
     --speculative-algorithm DSPARK
     --speculative-draft-model-path Inferact/Kimi-K3-DSpark
-    --speculative-num-draft-tokens 8
+    --speculative-num-draft-tokens 4
     --tp 8
     --ep-size 8
     --attention-backend mla
@@ -90,14 +90,14 @@ perf:
 report:
   github_step_summary: true
 perf_threshold: 0.9
-# Measured on 8x MI355X at PR head 8adb73cf. Values are
+# Measured on 8x MI355X with W4 on the recovery branch. Values are
 # [Latency (tps/user), output Throughput (tps/gpu)] and are rounded down.
 perf_reference:
-  1: [23.0, 3.0]
-  4: [16.2, 8.0]
-  8: [17.3, 11.4]
-  16: [21.0, 21.0]
-# The controlled random-token matrix measured accept length 2.00-2.05.
+  1: [49.0, 6.0]
+  4: [20.2, 9.4]
+  8: [15.9, 12.0]
+  16: [15.8, 20.3]
+# The controlled random-token matrix measured accept length 1.94-2.68.
 # Leave enough noise margin to avoid making acceptance itself the benchmark.
 accept_length_threshold: 1.8
 accept_rate_threshold: 0.10
