@@ -47,14 +47,14 @@ if not _is_gfx950():
 import tokenspeed_kernel  # noqa: E402
 from kimi3_reference import dequantize_mxfp4  # noqa: E402
 from tokenspeed_kernel.ops.moe.mori.bf16 import masked_grouped_gemm  # noqa: E402
-from tokenspeed_kernel.ops.moe.mori.mxfp4 import _grouped_mxfp4_gemm_3d  # noqa: E402
-from tokenspeed_kernel.ops.moe.triton.mxfp4 import (  # noqa: E402
-    grouped_mxfp4_ffn,
-    triton_mxfp4_moe_weights,
+from tokenspeed_kernel.ops.moe.mori.mxfp4 import (  # noqa: E402
+    _grouped_mxfp4_gemm_3d,
+    _grouped_mxfp4_swiglu_ffn,
+    _mori_mxfp4_weight_preprocessor,
 )
-
-with tokenspeed_kernel._triton.redirect_triton_to_tokenspeed_triton():  # noqa: E402
-    from triton_kernels.tensor import make_ragged_tensor_metadata
+from tokenspeed_kernel_amd.ops.gfx950.moe._common import (  # noqa: E402
+    make_ragged_tensor_metadata,
+)
 
 
 def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -88,9 +88,9 @@ def _swizzled_weight_module(w13_p, w13_s, w2_p, w2_s, top_k=8):
     w.w13_weight, w.w13_weight_scale = w13_p, w13_s
     w.w2_weight, w.w2_weight_scale = w2_p, w2_s
     w.top_k = top_k
-    triton_mxfp4_moe_weights(
+    _mori_mxfp4_weight_preprocessor(
         {}, w
-    )  # swizzle once -> w13_weight_triton_tensor, precision_config
+    )  # gluon prep -> w13_weight_triton_tensor, precision_config.b_mx_scale
     return w
 
 
@@ -125,10 +125,12 @@ def test_masked_grouped_gemm_matches_per_expert_loop() -> None:
     assert got[~valid].abs().max().item() == 0.0
 
 
-def test_grouped_mxfp4_ffn_matches_dequant_reference() -> None:
+def test_grouped_mxfp4_swiglu_ffn_matches_dequant_reference() -> None:
     dev = torch.device("cuda", 0)
     gen = torch.Generator(device=dev).manual_seed(3)
-    E, H, I = 4, 256, 128
+    # I (GEMM2 K) must be >= 256 for the Gluon swizzle scale layout (BLOCK_K//32 >= 8);
+    # real MoE intermediates are far larger, so use representative >=256 dims here.
+    E, H, I = 4, 512, 512
     counts_list = [8, 0, 20, 12]
     counts = torch.tensor(counts_list, device=dev, dtype=torch.int32)
     total = int(counts.sum().item())
@@ -142,7 +144,7 @@ def test_grouped_mxfp4_ffn_matches_dequant_reference() -> None:
         torch.randn(total, H, generator=gen, device=dev, dtype=torch.bfloat16) * 0.1
     )
     meta = make_ragged_tensor_metadata(counts, total)
-    got = grouped_mxfp4_ffn(x_flat, meta, w).float()
+    got = _grouped_mxfp4_swiglu_ffn(x_flat, meta, w).float()
 
     ref = torch.zeros(total, H, device=dev, dtype=torch.float32)
     off = 0
@@ -154,7 +156,12 @@ def test_grouped_mxfp4_ffn_matches_dequant_reference() -> None:
         ref[off : off + n] = inter @ w2_dq[e].t()
         off += n
 
-    assert _cos(got, ref) > 0.98
+    # The gfx950 Gluon path is W4A4: it quantizes BOTH weights and activations (and the
+    # intermediate) to MXFP4, while this reference dequantizes weights to bf16 and keeps
+    # activations in bf16. That extra activation/intermediate quantization is the dominant
+    # error vs the reference, so ~0.97 cos is expected-correct (end-to-end accuracy is gated
+    # by the aime25 eval). A real bug would collapse cos far below this.
+    assert _cos(got, ref) > 0.97
 
 
 def test_grouped_mxfp4_gemm_3d_bridge() -> None:
@@ -167,7 +174,8 @@ def test_grouped_mxfp4_gemm_3d_bridge() -> None:
     """
     dev = torch.device("cuda", 0)
     gen = torch.Generator(device=dev).manual_seed(11)
-    E, cap, H, I = 6, 32, 256, 128
+    # I (GEMM2 K) >= 256 for the Gluon swizzle scale layout (see swiglu FFN test).
+    E, cap, H, I = 6, 32, 512, 512
     counts_list = [5, 0, 32, 1, 17, 8]
     counts = torch.tensor(counts_list, device=dev, dtype=torch.int32)
 
@@ -201,6 +209,7 @@ def test_grouped_mxfp4_gemm_3d_bridge() -> None:
     got = packed  # mutated in place
 
     valid = torch.arange(cap, device=dev)[None, :] < counts[:, None].to(torch.long)
-    assert _cos(got[valid], ref[valid]) > 0.98
+    # W4A4 Gluon path vs bf16-weight reference -> ~0.97 cos (see the swiglu FFN test).
+    assert _cos(got[valid], ref[valid]) > 0.97
     # padding rows are only ignored downstream, so they must be left exactly as-is
     assert torch.equal(got[~valid], packed_before[~valid])

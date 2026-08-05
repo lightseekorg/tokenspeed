@@ -3,13 +3,13 @@
 # SPDX-License-Identifier: MIT
 """Registered MXFP4 MoE apply using MORI all-to-all EP.
 
-Native MXFP4 path (NO dequant): weights are swizzled once at load via the shared
-``triton_mxfp4_moe_weights`` preprocessor; each forward MORI dispatches bf16 hidden
-states, the tokens (already grouped per local expert in MORI's 3D [E,cap,H] buffer)
-are gathered into a contiguous expert-sorted buffer and run through the triton mxfp4
-grouped-GEMM (``grouped_mxfp4_ffn``) directly on the packed MXFP4 weights, scattered
-back into the 3D buffer, and combined. Selected for Kimi-K2.5-MXFP4 with
---enable-expert-parallel --all2all-backend mori.
+Native MXFP4 path (NO dequant): weights are prepared once at load via the gfx950 Gluon
+MXFP4 preprocessor; each forward MORI dispatches bf16 hidden states, the tokens (already
+grouped per local expert in MORI's 3D [E,cap,H] buffer) are gathered into a contiguous
+expert-sorted buffer and run through the gfx950 Gluon grouped MXFP4 SwiGLU FFN
+(``_grouped_mxfp4_swiglu_ffn`` -> ``gluon_mxfp_dispatch_swiglu`` + ``gluon_mxfp_combine``)
+directly on the packed MXFP4 weights, scattered back into the 3D buffer, and combined.
+Selected for Kimi-K2.5-MXFP4 with --enable-expert-parallel --all2all-backend mori.
 """
 
 from __future__ import annotations
@@ -30,16 +30,114 @@ platform = current_platform()
 
 
 if platform.is_amd:
-    from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
-
-    with redirect_triton_to_tokenspeed_triton():
-        from triton_kernels.tensor import make_ragged_tensor_metadata
-
     from tokenspeed_kernel.ops.communication.mori_ep import get_dispatcher
-    from tokenspeed_kernel.ops.moe.triton.mxfp4 import (
-        grouped_mxfp4_ffn,
-        triton_mxfp4_moe_weights,
+    from tokenspeed_kernel_amd.ops.gfx950.moe._common import (
+        make_ragged_tensor_metadata,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
+        _extract_gluon_raw_s,
+        _extract_gluon_raw_w,
+        _quantize_mxfp4_activation,
+        gluon_mxfp_combine,
+        gluon_mxfp_dispatch_swiglu,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.weight_preprocess import (
+        preprocess_gluon_mxfp4_gfx950_moe_weights,
+    )
+
+    def _mori_mxfp4_weight_preprocessor(plan: dict, w: torch.nn.Module) -> None:
+        """Prepare MXFP4 expert weights in the gfx950 Gluon layout the grouped primitives
+        below consume: K-packed uint8 storage + swizzled CDNA4 E8M0 scales, gate/up
+        interleaved, Gluon-preshuffled. Sets ``w13_weight_triton_tensor`` /
+        ``w2_weight_triton_tensor`` and their ``*_precision_config.b_mx_scale``."""
+        return preprocess_gluon_mxfp4_gfx950_moe_weights(plan, w, preshuffle=True)
+
+    def _swiglu_args(w: torch.nn.Module) -> tuple[float, float, float]:
+        """Gate activation params for the SwiGLU reducer. Mirrors
+        ``ops.moe.gluon.mxfp4._swiglu_args``: default ``(alpha=1, limit=0, beta=0)`` is an
+        unclamped SiLU gate times the linear branch (what Kimi-K2.5 uses)."""
+        swiglu_arg = getattr(w, "swiglu_arg", None)
+        if swiglu_arg is None:
+            return 1.0, 0.0, 0.0
+        swiglu_beta = getattr(w, "swiglu_beta", None)
+        return (
+            1.0 if swiglu_arg.alpha is None else swiglu_arg.alpha,
+            0.0 if swiglu_arg.limit is None else swiglu_arg.limit,
+            0.0 if swiglu_beta is None else swiglu_beta,
+        )
+
+    def _grouped_mxfp4_swiglu_ffn(
+        x_flat: torch.Tensor, meta, w: torch.nn.Module
+    ) -> torch.Tensor:
+        """Pure grouped MXFP4 SwiGLU FFN over expert-sorted CONTIGUOUS rows, on the gfx950
+        Gluon primitives. ``x_flat`` [total, H] bf16 (rows grouped by local expert per
+        ``meta``); returns [total, H] bf16. No routing / gather / scatter / gate-weighting --
+        MORI owns dispatch/combine and applies the gate weights in combine.
+
+        GEMM1 = ``gluon_mxfp_dispatch_swiglu`` (gate/up matmul + SiLU, requantized to mxfp4);
+        GEMM2 = ``gluon_mxfp_combine`` with ``scatter_indx=None`` (down-proj, output left in
+        the same expert-sorted ragged order as the input). This mirrors the standard dynamic
+        path (_gluon_mxfp_dynamic_mxfp4_fused_moe_from_route) minus the routing indices.
+        """
+        alpha, limit, beta = _swiglu_args(w)
+        w13 = _extract_gluon_raw_w(w.w13_weight_triton_tensor)
+        s13 = _extract_gluon_raw_s(w.w13_precision_config.b_mx_scale)
+        w2 = _extract_gluon_raw_w(w.w2_weight_triton_tensor)
+        s2 = _extract_gluon_raw_s(w.w2_precision_config.b_mx_scale)
+        w13_bias = (
+            None
+            if getattr(w, "_gluon_w13_bias_is_zero", False)
+            else getattr(w, "w13_weight_bias", None)
+        )
+        w2_bias = (
+            None
+            if getattr(w, "_gluon_w2_bias_is_zero", False)
+            else getattr(w, "w2_weight_bias", None)
+        )
+
+        gemm1_input, gemm1_scale = _quantize_mxfp4_activation(
+            x_flat, gather_indx=None, ragged_metadata=meta
+        )
+        inter, inter_scale = gluon_mxfp_dispatch_swiglu(
+            gemm1_input,
+            w13,
+            s13,
+            x_scale=_extract_gluon_raw_s(gemm1_scale),
+            x_format="e2m1",
+            x_global_scale=1.0,
+            bias=w13_bias,
+            a_ragged_metadata=meta,
+            gather_indx=None,
+            out_dtype=torch.bfloat16,
+            swiglu_alpha=alpha,
+            swiglu_limit=limit,
+            swiglu_beta=beta,
+            scale_load_mode="swizzle",
+            w_transpose=True,
+            out_quant_scale=None,
+            out_quant_format="mxfp4",
+            w_preshuffle=bool(getattr(w13, "is_shuffled_for_gluon_dot", False)),
+            x_scale_ragged_padded=True,
+        )
+        return gluon_mxfp_combine(
+            inter.view(torch.uint8) if inter.dtype != torch.uint8 else inter,
+            w2,
+            s2,
+            x_scale=_extract_gluon_raw_s(inter_scale),
+            x_format="e2m1",
+            x_global_scale=1.0,
+            bias=w2_bias,
+            a_ragged_metadata=meta,
+            scatter_indx=None,
+            gate_scal=None,
+            n_tokens=None,
+            n_expts_act=None,
+            out_dtype=torch.bfloat16,
+            scale_load_mode="swizzle",
+            w_transpose=True,
+            w_preshuffle=bool(getattr(w2, "is_shuffled_for_gluon_dot", False)),
+            x_scale_ragged_padded=True,
+        )
 
     def _grouped_mxfp4_gemm_3d(
         packed_x: torch.Tensor,
@@ -100,7 +198,7 @@ if platform.is_amd:
         flat = packed_x.reshape(n_slots, H)
         x_flat = flat[gather_idx]  # [m,H] valid front, pad back
         meta = make_ragged_tensor_metadata(counts.to(torch.int32), m)
-        y_flat = grouped_mxfp4_ffn(x_flat, meta, w).to(
+        y_flat = _grouped_mxfp4_swiglu_ffn(x_flat, meta, w).to(
             packed_x.dtype
         )  # first sum(counts) rows set
 
@@ -115,7 +213,7 @@ if platform.is_amd:
         "apply",
         name="mori_ep_mxfp4_moe_apply",
         solution="mori",
-        weight_preprocessor=triton_mxfp4_moe_weights,
+        weight_preprocessor=_mori_mxfp4_weight_preprocessor,
         capability=CapabilityRequirement(
             vendors=frozenset({"amd"}),
             min_arch_version=ArchVersion(9, 5),
@@ -124,16 +222,19 @@ if platform.is_amd:
         signatures=format_signatures("x", "dense", {torch.bfloat16}),
         traits={
             "weight_dtype": frozenset({"mxfp4"}),
-            # silu only: grouped_mxfp4_ffn computes plain silu(gate)*up and does not apply
-            # swiglu_arg/alpha/limit, so do not advertise "swiglu" (would select this kernel
-            # for clamped-swiglu configs and silently compute the wrong activation).
+            # Kimi-K2.5 uses an unclamped SiLU gate (_swiglu_args default alpha=1,limit=0,
+            # beta=0). The dispatch_swiglu reducer does support clamped SwiGLU via swiglu_arg,
+            # but keep selection scoped to "silu" (the validated config) here.
             "activation": frozenset({"silu"}),
             "routing_mode": frozenset({"precomputed_topk"}),
             "supports_deferred_finalize": frozenset({False}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({True}),
             "ispp_alignment": frozenset({1}),
-            "internal_activation_dtype": frozenset({"input", "fp8"}),
+            # The gfx950 Gluon path quantizes activations (and the intermediate) to MXFP4
+            # dynamically (_quantize_mxfp4_activation -> e2m1), so the internal activation is
+            # mxfp4 -- matches the planner's requested trait for MXFP4 EP.
+            "internal_activation_dtype": frozenset({"mxfp4"}),
             "supports_bias": frozenset({True}),
         },
         priority=Priority.SPECIALIZED + 2,

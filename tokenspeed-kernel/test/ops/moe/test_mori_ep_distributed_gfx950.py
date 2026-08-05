@@ -62,9 +62,9 @@ from tokenspeed_kernel.ops.communication.mori_ep import (  # noqa: E402
     mori_available,
 )
 from tokenspeed_kernel.ops.moe.mori.bf16 import masked_grouped_gemm  # noqa: E402
-from tokenspeed_kernel.ops.moe.mori.mxfp4 import _grouped_mxfp4_gemm_3d  # noqa: E402
-from tokenspeed_kernel.ops.moe.triton.mxfp4 import (  # noqa: E402
-    triton_mxfp4_moe_weights,
+from tokenspeed_kernel.ops.moe.mori.mxfp4 import (  # noqa: E402
+    _grouped_mxfp4_gemm_3d,
+    _mori_mxfp4_weight_preprocessor,
 )
 
 # Fixed local experts per rank -> total experts scale linearly with world size, so
@@ -135,7 +135,7 @@ def _run(quant: str) -> None:
             w2_s[lo:hi].contiguous(),
         )
         wmod.top_k = K
-        triton_mxfp4_moe_weights({}, wmod)
+        _mori_mxfp4_weight_preprocessor({}, wmod)
 
     torch.manual_seed(100 + rank)
     x = torch.randn(T, H, dtype=torch.bfloat16, device="cuda") * 0.1
