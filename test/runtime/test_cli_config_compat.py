@@ -35,6 +35,13 @@ class TestCLIConfigCompat(unittest.TestCase):
         with patch.object(ServerArgs, "__post_init__"):
             return ServerArgs.from_cli_args(args)
 
+    def _resolve_speculative_config(self, model: str, config: str) -> ServerArgs:
+        args = self._parse_args(["--model", model, "--speculative-config", config])
+        server_args = self._from_cli_args_no_init(args)
+        server_args.resolve_basic_defaults()
+        server_args.resolve_speculative_decoding()
+        return server_args
+
     def _parallelism_snapshot(self, argv: list[str]) -> tuple[int, ...]:
         args = self._parse_args(argv)
         sa = self._from_cli_args_no_init(args)
@@ -546,6 +553,56 @@ class TestCLIConfigCompat(unittest.TestCase):
             config_server_args.speculative_num_draft_tokens,
             explicit_server_args.speculative_num_draft_tokens,
         )
+
+    def test_dspark_same_checkpoint_config_uses_block_plus_bonus_width(self):
+        server_args = self._resolve_speculative_config(
+            "same-checkpoint",
+            (
+                '{"method":"dspark","model":"same-checkpoint",'
+                '"num_speculative_tokens":5}'
+            ),
+        )
+
+        self.assertTrue(server_args.draft_model_path_use_base)
+        self.assertEqual(server_args.speculative_draft_model_path, "same-checkpoint")
+        self.assertEqual(server_args.speculative_num_steps, 5)
+        self.assertEqual(server_args.speculative_num_draft_tokens, 6)
+
+    def test_dspark_redirected_same_checkpoint_uses_block_plus_bonus_width(self):
+        with patch(
+            "tokenspeed.runtime.utils.server_args.maybe_model_redirect",
+            side_effect=lambda model: (
+                "resolved-checkpoint" if model == "model-alias" else model
+            ),
+        ):
+            server_args = self._resolve_speculative_config(
+                "model-alias",
+                (
+                    '{"method":"dspark","model":"model-alias",'
+                    '"num_speculative_tokens":5}'
+                ),
+            )
+
+        self.assertTrue(server_args.draft_model_path_use_base)
+        self.assertEqual(
+            server_args.speculative_draft_model_path, "resolved-checkpoint"
+        )
+        self.assertEqual(server_args.speculative_num_steps, 5)
+        self.assertEqual(server_args.speculative_num_draft_tokens, 6)
+
+    def test_dspark_external_checkpoint_config_uses_verify_width(self):
+        server_args = self._resolve_speculative_config(
+            "target-checkpoint",
+            (
+                '{"method":"dspark","model":"draft-checkpoint",'
+                '"num_speculative_tokens":6}'
+            ),
+        )
+
+        self.assertFalse(server_args.draft_model_path_use_base)
+        self.assertEqual(server_args.speculative_draft_model_path, "draft-checkpoint")
+        self.assertEqual(server_args.speculative_num_steps, 5)
+        self.assertEqual(server_args.speculative_num_draft_tokens, 6)
 
     def test_speculative_config_must_be_json_object(self):
         args = self._parse_args(["--model", "test/model", "--speculative-config", "[]"])

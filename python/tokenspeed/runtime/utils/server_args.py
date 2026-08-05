@@ -387,12 +387,21 @@ class ServerArgs:
             if draft_model is not None and self.speculative_draft_model_path is None:
                 self.speculative_draft_model_path = str(draft_model)
 
+            dspark_draft_model = self.speculative_draft_model_path
+            dspark_uses_base_model = self.speculative_algorithm == "DSPARK" and (
+                self.draft_model_path_use_base
+                or dspark_draft_model is None
+                or maybe_model_redirect(dspark_draft_model) == self.model
+            )
+            if dspark_uses_base_model:
+                self.draft_model_path_use_base = True
+
             num_speculative_tokens = config.get("num_speculative_tokens")
             if num_speculative_tokens is not None:
                 num_speculative_tokens = int(num_speculative_tokens)
                 if self.speculative_algorithm == "DFLASH" or (
                     self.speculative_algorithm == "DSPARK"
-                    and self.speculative_draft_model_path is not None
+                    and not dspark_uses_base_model
                 ):
                     if self.speculative_num_draft_tokens is None:
                         self.speculative_num_draft_tokens = num_speculative_tokens
