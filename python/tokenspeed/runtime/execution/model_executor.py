@@ -158,6 +158,14 @@ def _resolve_prefill_graph_max_tokens(server_args) -> int:
     return cap
 
 
+def _resolve_autotune_num_tokens(
+    chunked_prefill_size: int, autotune_max_num_tokens: int
+) -> int:
+    if chunked_prefill_size <= 0 or autotune_max_num_tokens <= 0:
+        return 0
+    return min(int(chunked_prefill_size), int(autotune_max_num_tokens))
+
+
 @dataclass
 class ModelExecutorConfig:
     """
@@ -175,6 +183,7 @@ class ModelExecutorConfig:
     logical_page_size: int
     max_num_seqs: int
     chunked_prefill_size: int
+    autotune_max_num_tokens: int
     vocab_size: int
     context_len: int
     device: str
@@ -253,6 +262,7 @@ class ModelExecutorConfig:
             logical_page_size=logical_page_size,
             max_num_seqs=server_args.max_num_seqs,
             chunked_prefill_size=server_args.chunked_prefill_size,
+            autotune_max_num_tokens=server_args.autotune_max_num_tokens,
             vocab_size=model_config.vocab_size,
             context_len=model_config.context_len,
             device=server_args.device,
@@ -587,7 +597,10 @@ class ModelExecutor:
         cannot change a replay. On distributed boots, per-tactic timings are
         averaged over the world so every rank picks the same tactic.
         """
-        num_tokens = int(self.config.chunked_prefill_size)
+        num_tokens = _resolve_autotune_num_tokens(
+            self.config.chunked_prefill_size,
+            self.config.autotune_max_num_tokens,
+        )
         if num_tokens <= 0 or self.model_runner is None:
             return
 

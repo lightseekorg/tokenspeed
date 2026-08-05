@@ -46,6 +46,7 @@ from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.registry import error_fn
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -67,6 +68,36 @@ _is_amd = _platform.is_amd
 _is_blackwell = _platform.is_blackwell
 _is_hopper_plus = _platform.is_hopper_plus
 _device_sm = _platform.arch_version.major * 10 + _platform.arch_version.minor
+
+
+def _pack_mla_kv_fp8(
+    k_nope: torch.Tensor,
+    k_pe: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    k_scale_inv: float = 1.0,
+    v_scale_inv: float = 1.0,
+    enable_pdl: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Use the fused NVIDIA packer when present, otherwise a portable fallback."""
+    if mla_kv_pack_quantize_fp8 is not error_fn:
+        return mla_kv_pack_quantize_fp8(
+            k_nope,
+            k_pe,
+            v,
+            k_scale_inv=k_scale_inv,
+            v_scale_inv=v_scale_inv,
+            enable_pdl=enable_pdl,
+        )
+
+    if k_pe.dim() == 2:
+        k_pe = k_pe.unsqueeze(1)
+    k = torch.cat([k_nope, k_pe.expand(-1, k_nope.shape[1], -1)], dim=-1)
+    return (
+        (k * k_scale_inv).to(torch.float8_e4m3fn),
+        (v * v_scale_inv).to(torch.float8_e4m3fn),
+    )
+
 
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
@@ -1155,7 +1186,7 @@ class DeepseekV3AttentionMLA(nn.Module):
 
             if q.dtype == torch.float8_e4m3fn:
                 # FP8 Attention
-                k, v = mla_kv_pack_quantize_fp8(
+                k, v = _pack_mla_kv_fp8(
                     k_nope, k_pe, v, k_scale_inv=1.0 / k_scale, enable_pdl=pdl_enabled()
                 )
             else:

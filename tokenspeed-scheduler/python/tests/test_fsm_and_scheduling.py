@@ -342,6 +342,24 @@ class TestPrefillFirst:
         # r0 decode = 1 token; r1 prefill chunk takes the remaining 15.
         assert op.input_lengths == [15, 1]
 
+    def test_mixed_batch_reserves_full_dspark_verify_width(self):
+        cfg = make_config(max_scheduled_tokens=16, max_batch_size=8)
+        cfg.enable_mixed_prefill_decode = True
+        cfg.decode_input_tokens = 8
+        s = Scheduler(cfg)
+
+        submit(s, "r0", list(range(8)))
+        s.next_execution_plan()
+        s.next_execution_plan()
+        advance_forward(s, "r0", tokens=[99])
+
+        submit(s, "r1", list(range(32)))
+        op = s.next_execution_plan().forward[0]
+        assert op.request_ids == ["r1", "r0"]
+        assert op.num_extends() == 1
+        # Keep all eight target-verify rows; the prefill receives the remainder.
+        assert op.input_lengths == [8, 8]
+
     def test_max_batch_size_limits_scheduled_requests(self):
         """max_batch_size caps the number of requests per plan."""
         s = Scheduler(make_config(max_scheduled_tokens=512, max_batch_size=2))

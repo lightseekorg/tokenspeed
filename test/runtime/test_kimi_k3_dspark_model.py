@@ -21,7 +21,10 @@ from tokenspeed.runtime.configs.kimi_k3_dspark_config import (
     k3_dspark_inactive_features,
     validate_k3_dspark_config,
 )
-from tokenspeed.runtime.models.kimi_k3_dspark import K3DSparkModel
+from tokenspeed.runtime.models.kimi_k3_dspark import (
+    K3DSparkConfidenceHead,
+    K3DSparkModel,
+)
 
 # The published Inferact/Kimi-K3-DSpark config.json.
 INFERACT_CONFIG = dict(
@@ -241,26 +244,21 @@ def test_vocab_mismatch_is_rejected() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_skipped_prefixes_cover_exactly_the_shared_and_training_only_weights() -> None:
+def test_skipped_prefixes_cover_exactly_the_shared_target_weights() -> None:
     skipped = [
         k for k in CHECKPOINT_KEYS if k.startswith(K3_DSPARK_SKIPPED_WEIGHT_PREFIXES)
     ]
-    assert sorted(skipped) == [
-        "confidence_head.proj.bias",
-        "confidence_head.proj.weight",
-        "embed_tokens.weight",
-    ]
+    assert sorted(skipped) == ["embed_tokens.weight"]
     # No lm_head ships at all; the draft borrows the target's.
     assert not any(k.startswith("lm_head") for k in CHECKPOINT_KEYS)
 
 
-def test_confidence_head_is_reported_inactive_rather_than_dropped() -> None:
-    """Issue #879: unsupported optional scheduling must be stated, not silent."""
+def test_confidence_head_is_reported_loaded_but_not_scheduling() -> None:
     notes = k3_dspark_inactive_features(make_config())
     assert len(notes) == 1
     note = notes[0]
     assert "confidence_head" in note
-    # It names both what is ignored and what runs instead.
+    assert "loaded" in note
     assert "static" in note
 
 
@@ -280,6 +278,8 @@ def test_every_remaining_checkpoint_key_has_a_destination() -> None:
         "context_proj.weight",
         "context_norm.weight",
         "final_norm.weight",
+        "confidence_head.proj.bias",
+        "confidence_head.proj.weight",
         "markov_head.markov_w1.weight",
         "markov_head.markov_w2.weight",
     }
@@ -316,6 +316,14 @@ def test_every_remaining_checkpoint_key_has_a_destination() -> None:
         routed.add(target)
 
     assert routed == expected_params
+
+
+def test_confidence_head_consumes_hidden_and_markov_features() -> None:
+    head = K3DSparkConfidenceHead(hidden_size=6, markov_rank=2, with_markov=True)
+    output = head(torch.randn(3, 6), torch.randn(3, 2))
+    assert output.shape == (3,)
+    with pytest.raises(ValueError, match="Markov latent"):
+        head(torch.randn(3, 6), None)
 
 
 class _FakePackedParameter:

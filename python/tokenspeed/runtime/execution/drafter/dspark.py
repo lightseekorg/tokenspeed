@@ -26,6 +26,7 @@ from __future__ import annotations
 import torch
 
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
+from tokenspeed.runtime.execution.dspark_parity import record_dspark_parity_tensor
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
@@ -43,6 +44,16 @@ class DSpark(DFlash):
                 "DSPARK requires the draft model to define a markov_head "
                 "(use a DSparkDraftModel checkpoint with markov_rank > 0)."
             )
+        self.confidence_head = getattr(self.model, "confidence_head", None)
+        self.confidence_scores_buf = (
+            torch.empty(
+                (self.input_buffers.max_bs, max(self.spec_num_tokens - 1, 1)),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            if self.confidence_head is not None
+            else None
+        )
 
     @nvtx_range("dspark_sample_block", color="purple")
     def _sample_block(
@@ -53,22 +64,53 @@ class DSpark(DFlash):
     ) -> torch.Tensor:
         """Semi-autoregressive greedy proposal over the block positions."""
         next_tokens[:, 0] = block_ids[:, 0]
+        confidence_scores = (
+            self.confidence_scores_buf[: draft_hidden.shape[0]]
+            if getattr(self, "confidence_scores_buf", None) is not None
+            else None
+        )
         for k in range(1, self.spec_num_tokens):
             # The Markov head embeds the previous token, so it must be in range
             # before this step, not after the loop: the anchor comes from the
             # target's last output (garbage during warmup) and each proposal
             # from a vocab-parallel argmax that can lose every shard. An
             # out-of-range id here indexes past the embedding table.
-            bias_fn = self._make_step_bias_fn(next_tokens[:, k - 1])
+            prev_tokens = next_tokens[:, k - 1]
+            vocab_size = int(self.markov_head.markov_w2.weight.shape[0])
+            markov_latent = self.markov_head.get_prev_latent(
+                prev_tokens.clamp(0, vocab_size - 1)
+            )
+            bias_fn = self._make_step_bias_fn(prev_tokens, markov_latent=markov_latent)
+            if confidence_scores is not None:
+                confidence_scores[:, k - 1].copy_(
+                    torch.sigmoid(
+                        self.confidence_head(draft_hidden[:, k - 1, :], markov_latent)
+                    )
+                )
             self._greedy_argmax_vocab_parallel(
                 draft_hidden[:, k - 1, :],
                 out=next_tokens[:, k],
                 bias_fn=bias_fn,
             )
         next_tokens.clamp_(min=0)
+        record_dspark_parity_tensor(
+            "proposed_tokens",
+            next_tokens,
+            {"verify_width": self.spec_num_tokens},
+        )
+        record_dspark_parity_tensor(
+            "confidence_scores",
+            confidence_scores,
+            {"verify_width": self.spec_num_tokens},
+        )
         return next_tokens
 
-    def _make_step_bias_fn(self, prev_tokens: torch.Tensor):
+    def _make_step_bias_fn(
+        self,
+        prev_tokens: torch.Tensor,
+        *,
+        markov_latent: torch.Tensor | None = None,
+    ):
         """Build the per-position additive-bias hook for the Markov head.
 
         Returns a closure ``bias_fn(vocab_start, count) -> [rows, count]`` that
@@ -82,7 +124,11 @@ class DSpark(DFlash):
         """
         w2_weight = self.markov_head.markov_w2.weight
         vocab_size = int(w2_weight.shape[0])
-        latent = self.markov_head.get_prev_latent(prev_tokens.clamp(0, vocab_size - 1))
+        latent = (
+            markov_latent
+            if markov_latent is not None
+            else self.markov_head.get_prev_latent(prev_tokens.clamp(0, vocab_size - 1))
+        )
         rows = int(latent.shape[0])
 
         def bias_fn(vocab_start: int, count: int) -> torch.Tensor:

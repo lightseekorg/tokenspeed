@@ -46,6 +46,8 @@ from tokenspeed.runtime.utils.launcher import check_dist_init_port, detect_topol
 from tokenspeed.runtime.utils.network import is_port_available
 
 logger = get_colorful_logger(__name__)
+AMD_DSPARK_MAX_CUDAGRAPH_BS = 16
+AMD_DSPARK_MAX_BATCH_SIZE = 16
 
 ENABLE_CP = os.environ.get("ENABLE_CP", "false").lower() in ("true", "1")
 
@@ -302,6 +304,7 @@ class ServerArgs:
     enable_memory_saver: bool = False
     enable_custom_logit_processor: bool = False
     mla_disable_ragged: bool = False
+    autotune_max_num_tokens: int = 8192
     warmups: str | None = None
 
     # parallel strategy
@@ -442,6 +445,18 @@ class ServerArgs:
                 self.max_cudagraph_capture_size = 80
             else:
                 self.max_cudagraph_capture_size = 160
+        if (
+            current_platform().is_amd
+            and self.speculative_algorithm == "DSPARK"
+            and self.max_cudagraph_capture_size > AMD_DSPARK_MAX_CUDAGRAPH_BS
+        ):
+            logger.warning(
+                "Capping AMD DSPARK CUDA graph capture at batch %d (requested %d); "
+                "larger batches run eager to avoid verify-graph OOM.",
+                AMD_DSPARK_MAX_CUDAGRAPH_BS,
+                self.max_cudagraph_capture_size,
+            )
+            self.max_cudagraph_capture_size = AMD_DSPARK_MAX_CUDAGRAPH_BS
 
         # Set max number of sequences.
         if self.max_num_seqs is None:
@@ -449,6 +464,18 @@ class ServerArgs:
                 self.max_num_seqs = 80
             else:
                 self.max_num_seqs = 160
+        if (
+            current_platform().is_amd
+            and self.speculative_algorithm == "DSPARK"
+            and self.max_num_seqs > AMD_DSPARK_MAX_BATCH_SIZE
+        ):
+            logger.warning(
+                "Capping AMD DSPARK server batch at %d (requested %d); excess "
+                "concurrency remains queued to preserve verify scratch headroom.",
+                AMD_DSPARK_MAX_BATCH_SIZE,
+                self.max_num_seqs,
+            )
+            self.max_num_seqs = AMD_DSPARK_MAX_BATCH_SIZE
 
     def resolve_kernel_backends(self):
         # Choose kernel backends
@@ -1745,6 +1772,14 @@ class ServerArgs:
             "breakable prefill graph (like --cudagraph-capture-sizes for "
             "decode). Unset: a relative-stride ladder bounding padded compute "
             "at ~12.5%% of any size.",
+        )
+        parser.add_argument(
+            "--autotune-max-num-tokens",
+            type=int,
+            default=ServerArgs.autotune_max_num_tokens,
+            help="Cap the dummy prefill used for kernel autotuning. This is "
+            "independent of --chunked-prefill-size so larger mixed-batch "
+            "budgets do not OOM during startup. Set 0 to skip autotuning.",
         )
         parser.add_argument(
             "--enable-nan-detection",

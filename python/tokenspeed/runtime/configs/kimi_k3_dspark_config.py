@@ -36,9 +36,9 @@ from typing import Any
 
 from transformers.configuration_utils import PretrainedConfig
 
-# The checkpoint ships an embed_tokens copy of the frozen target embedding and
-# a training-only confidence head. Neither is instantiated at serving time.
-K3_DSPARK_SKIPPED_WEIGHT_PREFIXES = ("embed_tokens.", "lm_head.", "confidence_head.")
+# The checkpoint ships an embed_tokens copy of the frozen target embedding;
+# the draft borrows both embedding and lm_head from the target.
+K3_DSPARK_SKIPPED_WEIGHT_PREFIXES = ("embed_tokens.", "lm_head.")
 
 SUPPORTED_MARKOV_HEAD_TYPES = ("vanilla",)
 
@@ -172,9 +172,9 @@ def k3_dspark_inactive_features(config: KimiK3DSparkConfig) -> list[str]:
     inactive = []
     if config.enable_confidence_head:
         inactive.append(
-            "confidence_head: present in the checkpoint but unused. Verify is "
-            "static (the full block is verified every step); confidence-scheduled "
-            "ragged verify is not implemented."
+            "confidence_head: loaded for calibration/observability, but verify "
+            "scheduling is still static (the full block is verified every step); "
+            "confidence-guided routing is not enabled."
         )
     return inactive
 

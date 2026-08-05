@@ -10,6 +10,7 @@ recurrent KDA state still gets committed after a DSpark verify.
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from tokenspeed.runtime.execution.cuda_graph_wrapper import (
@@ -18,6 +19,8 @@ from tokenspeed.runtime.execution.cuda_graph_wrapper import (
 from tokenspeed.runtime.execution.drafter.dspark import DSpark
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.models.dspark import VanillaMarkov
+from tokenspeed.runtime.models.kimi_k3_dspark import K3DSparkConfidenceHead
+from tokenspeed.runtime.sampling.backends.greedy import _verify_chain_greedy_torch
 
 VOCAB = 32
 RANK = 4
@@ -154,6 +157,44 @@ def test_anchor_is_copied_and_drafts_fill_the_rest_of_the_block() -> None:
     assert out.shape == (bs, spec)
 
 
+@pytest.mark.parametrize("verify_width", [2, 3, 4, 6, 8])
+def test_proposal_shape_generalizes_across_verify_widths(verify_width: int) -> None:
+    drafter = _drafter(spec_num_tokens=verify_width)
+    _install_recording_argmax(drafter, torch.randn(VOCAB, HIDDEN))
+    block_ids = torch.zeros((2, verify_width), dtype=torch.int32)
+    block_ids[:, 0] = torch.tensor([3, 7], dtype=torch.int32)
+    output = drafter._sample_block(
+        torch.randn(2, verify_width, HIDDEN),
+        block_ids,
+        torch.zeros_like(block_ids),
+    )
+    assert output.shape == (2, verify_width)
+    assert torch.equal(output[:, 0], block_ids[:, 0])
+
+
+@pytest.mark.parametrize("verify_width", [2, 3, 4, 6, 8])
+def test_greedy_verify_accepts_a_matching_variable_width_chain(
+    verify_width: int,
+) -> None:
+    candidates = torch.arange(verify_width, dtype=torch.int32).view(1, -1)
+    target_predict = torch.zeros((1, verify_width), dtype=torch.int64)
+    target_predict[:, :-1] = candidates[:, 1:]
+    predicts = torch.empty(verify_width, dtype=torch.int32)
+    accept_index = torch.full((1, verify_width), -1, dtype=torch.int32)
+    accepted_drafts = torch.zeros(1, dtype=torch.int32)
+
+    _verify_chain_greedy_torch(
+        predicts,
+        accept_index,
+        accepted_drafts,
+        candidates,
+        target_predict,
+        batch_size=1,
+        num_draft_tokens=verify_width,
+    )
+    assert accepted_drafts.item() == verify_width - 1
+
+
 def test_each_step_reads_the_hidden_one_position_back() -> None:
     """Block position k is proposed from draft_hidden[k-1], not [k].
 
@@ -220,6 +261,22 @@ def test_proposals_are_valid_token_ids() -> None:
         torch.zeros((1, spec), dtype=torch.int32),
     )
     assert int(out.min()) >= 0
+
+
+def test_confidence_scores_are_recorded_per_proposal_position() -> None:
+    spec = 4
+    drafter = _drafter(spec_num_tokens=spec)
+    drafter.confidence_head = K3DSparkConfidenceHead(HIDDEN, RANK, with_markov=True)
+    drafter.confidence_scores_buf = torch.empty((1, spec - 1))
+    _install_recording_argmax(drafter, torch.randn(VOCAB, HIDDEN))
+    drafter._sample_block(
+        torch.randn(1, spec, HIDDEN),
+        torch.zeros((1, spec), dtype=torch.int32),
+        torch.zeros((1, spec), dtype=torch.int32),
+    )
+    scores = drafter.confidence_scores_buf
+    assert scores.shape == (1, spec - 1)
+    assert bool(((scores >= 0) & (scores <= 1)).all())
 
 
 # --------------------------------------------------------------------------

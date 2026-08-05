@@ -50,6 +50,7 @@ from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.dspark_parity import record_dspark_parity_tensor
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
@@ -277,6 +278,25 @@ class K3DSparkDecoderLayer(nn.Module):
         return norm(hidden_states, residual)
 
 
+class K3DSparkConfidenceHead(nn.Module):
+    def __init__(
+        self, hidden_size: int, markov_rank: int, *, with_markov: bool
+    ) -> None:
+        super().__init__()
+        self.with_markov = with_markov
+        input_size = hidden_size + (markov_rank if with_markov else 0)
+        self.proj = nn.Linear(input_size, 1, bias=True)
+
+    def forward(
+        self, hidden_states: torch.Tensor, markov_latent: torch.Tensor | None
+    ) -> torch.Tensor:
+        if self.with_markov:
+            if markov_latent is None:
+                raise ValueError("confidence head requires Markov latent features")
+            hidden_states = torch.cat([hidden_states, markov_latent], dim=-1)
+        return self.proj(hidden_states.to(self.proj.weight.dtype)).squeeze(-1)
+
+
 class K3DSparkModel(nn.Module):
     """The draft network. Interface-compatible with ``DFlashDraftModel``."""
 
@@ -323,13 +343,28 @@ class K3DSparkModel(nn.Module):
             vocab_size=int(config.vocab_size),
             markov_rank=int(config.markov_rank),
         )
+        self.confidence_head = (
+            K3DSparkConfidenceHead(
+                hidden_size,
+                int(config.markov_rank),
+                with_markov=bool(config.confidence_head_with_markov),
+            )
+            if config.enable_confidence_head
+            else None
+        )
         # Names the DFlash drafter reads off the draft model.
         self.block_size = None
         self.hidden_size = hidden_size
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Concatenated target taps -> draft hidden space."""
-        return self.context_norm(self.context_proj(target_hidden)[0])
+        projected = self.context_norm(self.context_proj(target_hidden)[0])
+        record_dspark_parity_tensor(
+            "projected_context",
+            projected,
+            {"input_shape": list(target_hidden.shape)},
+        )
+        return projected
 
     # ------------------------------------------------------------------
     # Context-injection contract (see DFlashDraftModel for the GQA counterpart)
@@ -444,6 +479,8 @@ class K3DSparkModel(nn.Module):
         for name, loaded_weight in weights:
             name = name.removeprefix("model.")
             if name.startswith(K3_DSPARK_SKIPPED_WEIGHT_PREFIXES):
+                continue
+            if name.startswith("confidence_head.") and self.confidence_head is None:
                 continue
             if "rotary_emb.inv_freq" in name:
                 continue
