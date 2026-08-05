@@ -335,7 +335,7 @@ class WrapperReplayGroupedTest(_TorchCase):
             ),
             drafter=SimpleNamespace(
                 draft_seq_lens_buf=torch.zeros(4, dtype=torch.int32),
-                req_to_page=torch.zeros((4, MAX_NUM_PAGES), dtype=torch.int32),
+                page_table=torch.zeros((4, MAX_NUM_PAGES), dtype=torch.int32),
             ),
             _draft_group_tables=lambda tables: {
                 "full_attention": tables["full_attention"]
@@ -355,7 +355,7 @@ class WrapperReplayGroupedTest(_TorchCase):
             actual_bs=3,
             req_pool_indices=torch.arange(4, dtype=torch.int64),
             seq_lens=torch.ones(4, dtype=torch.int32),
-            req_to_page=torch.zeros((4, MAX_NUM_PAGES), dtype=torch.int32),
+            page_table=torch.zeros((4, MAX_NUM_PAGES), dtype=torch.int32),
             forward_mode=_decode_forward_mode(),
             block_tables=tables,
         )

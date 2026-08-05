@@ -42,6 +42,9 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 from tokenspeed.runtime.execution.breakable_cuda_graph import active_forward
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
+from tokenspeed.runtime.execution.drafter.deepseek_v4_dspark import (
+    DeepseekV4DSpark,
+)
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
 from tokenspeed.runtime.execution.drafter.dspark import DSpark
 from tokenspeed.runtime.execution.drafter.eagle import Eagle
@@ -108,6 +111,13 @@ def _get_drafter_impl(spec_algo: str, model: torch.nn.Module):
     # "MTP" covers two algorithms:
     # (1) Eagle-like MTP (e.g. DeepSeek) stays on Eagle in eagle.py;
     # (2) Vanilla MTP (e.g. Inkling) with multi-layer weights stays on Mtp in mtp.py.
+    if spec_algo == "DSPARK":
+        from tokenspeed.runtime.models.deepseek_v4_dspark import (
+            DeepseekV4ForCausalLMDSpark,
+        )
+
+        if isinstance(model, DeepseekV4ForCausalLMDSpark):
+            return DeepseekV4DSpark
     if spec_algo == "MTP" and isinstance(model, InklingForConditionalGenerationNextN):
         return Mtp
     else:
@@ -428,9 +438,11 @@ class ModelExecutor:
             )
             if hasattr(self.drafter, "bind_target_model"):
                 self.drafter.bind_target_model(self.model_runner.model)
-            # EAGLE3/MTP share the target's embed + lm_head; DFLASH ships its
-            # own draft weights, so it must NOT inherit the target's.
-            if config.spec_algo in ("EAGLE3", "MTP"):
+            # The V4 checkpoint-local DSpark path shares the target's embed and
+            # LM head. Generic DSpark and DFlash ship their own draft weights.
+            if config.spec_algo in ("EAGLE3", "MTP") or isinstance(
+                self.drafter, DeepseekV4DSpark
+            ):
                 embed, head = self.model_runner.model.get_embed_and_head()
                 draft_model_runner.model.set_embed_and_head(embed, head)
             MultimodalRuntime.wire_drafter(
@@ -444,7 +456,9 @@ class ModelExecutor:
                     draft_model_runner.model_config.hf_config
                 )
                 self.model_runner.model.set_eagle3_layers_to_capture(aux_layer_ids)
-            if config.spec_algo in ("DFLASH", "DSPARK"):
+            if config.spec_algo in ("DFLASH", "DSPARK") and not isinstance(
+                self.drafter, DeepseekV4DSpark
+            ):
                 if not hasattr(self.model_runner.model, "set_dflash_layers_to_capture"):
                     raise ValueError(
                         "DFLASH requires the target model to support "
@@ -459,6 +473,15 @@ class ModelExecutor:
                     self.drafter.target_layer_ids,
                     incremental_callback=incr_callback,
                     slot_bufs=incr_slot_bufs,
+                )
+            if isinstance(self.drafter, DeepseekV4DSpark):
+                if not hasattr(self.model_runner.model, "set_dspark_layers_to_capture"):
+                    raise ValueError(
+                        "DSPARK requires the target model to support "
+                        "set_dspark_layers_to_capture."
+                    )
+                self.model_runner.model.set_dspark_layers_to_capture(
+                    self.drafter.target_layer_ids
                 )
         else:
             self.drafter = None
@@ -1414,6 +1437,14 @@ class ModelExecutor:
                 total_tokens=total_tokens,
                 page_table=page_table,
             )
+            if self.drafter is not None and hasattr(
+                self.drafter, "prepare_request_state"
+            ):
+                self.drafter.prepare_request_state(
+                    forward_op.request_ids,
+                    forward_op.request_pool_indices,
+                    num_extends,
+                )
             if timing_enabled:
                 input_fill_done = time.perf_counter()
                 input_fill_ms = (input_fill_done - timing_start) * 1000.0

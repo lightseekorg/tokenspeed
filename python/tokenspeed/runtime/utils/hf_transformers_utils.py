@@ -216,6 +216,7 @@ def get_config(
     revision: str | None = None,
     model_override_args: dict | None = None,
     is_draft_worker: bool | None = False,
+    speculative_algorithm: str | None = None,
     **kwargs,
 ):
     if os.path.isdir(model):
@@ -286,7 +287,12 @@ def get_config(
         and "DFlash" not in config.architectures[0]
         and "DSpark" not in config.architectures[0]
     ):
-        if config.architectures[0] == "MiniMaxM2ForCausalLM":
+        if (
+            speculative_algorithm == "DSPARK"
+            and config.architectures[0] == "DeepseekV4ForCausalLM"
+        ):
+            config.architectures[0] = "DeepseekV4ForCausalLMDSpark"
+        elif config.architectures[0] == "MiniMaxM2ForCausalLM":
             config.architectures[0] = "LlamaForCausalLMEagle3"
         else:
             config.architectures[0] += "NextN"

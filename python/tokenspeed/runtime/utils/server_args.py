@@ -390,10 +390,17 @@ class ServerArgs:
             num_speculative_tokens = config.get("num_speculative_tokens")
             if num_speculative_tokens is not None:
                 num_speculative_tokens = int(num_speculative_tokens)
-                if self.speculative_algorithm in ("DFLASH", "DSPARK"):
+                if self.speculative_algorithm == "DFLASH" or (
+                    self.speculative_algorithm == "DSPARK"
+                    and self.speculative_draft_model_path is not None
+                ):
                     if self.speculative_num_draft_tokens is None:
                         self.speculative_num_draft_tokens = num_speculative_tokens
                     self.speculative_num_steps = max(num_speculative_tokens - 1, 0)
+                elif self.speculative_algorithm == "DSPARK":
+                    self.speculative_num_steps = num_speculative_tokens
+                    if self.speculative_num_draft_tokens is None:
+                        self.speculative_num_draft_tokens = num_speculative_tokens + 1
                 else:
                     self.speculative_num_steps = num_speculative_tokens
 
@@ -632,7 +639,7 @@ class ServerArgs:
             self.drafter_attention_backend = self.attention_backend
 
         if (
-            self.speculative_algorithm == "MTP"
+            self.speculative_algorithm in ("MTP", "DSPARK")
             and self.speculative_draft_model_path is None
         ):
             self.draft_model_path_use_base = True
@@ -653,6 +660,23 @@ class ServerArgs:
             elif self.speculative_num_steps != expected_steps:
                 raise ValueError(
                     "DFLASH requires speculative_num_steps to equal "
+                    "speculative_num_draft_tokens - 1. "
+                    f"Got {self.speculative_num_steps=} and "
+                    f"{self.speculative_num_draft_tokens=}."
+                )
+
+        if self.speculative_algorithm == "DSPARK" and self.draft_model_path_use_base:
+            if self.enable_prefix_caching:
+                raise ValueError(
+                    "DSPARK does not yet preserve its captured-context windows "
+                    "across prefix-cache hits; use --no-enable-prefix-caching."
+                )
+            expected_steps = max(int(self.speculative_num_draft_tokens) - 1, 0)
+            if self.speculative_num_steps == ServerArgs.speculative_num_steps:
+                self.speculative_num_steps = expected_steps
+            elif self.speculative_num_steps != expected_steps:
+                raise ValueError(
+                    "DSPARK requires speculative_num_steps to equal "
                     "speculative_num_draft_tokens - 1. "
                     f"Got {self.speculative_num_steps=} and "
                     f"{self.speculative_num_draft_tokens=}."
@@ -755,6 +779,15 @@ class ServerArgs:
 
     def validate_cache_options(self):
         if self.enable_kvstore and not self.enable_prefix_caching:
+            if self.speculative_algorithm == "DSPARK" and (
+                self.draft_model_path_use_base
+                or self.speculative_draft_model_path is None
+                or self.speculative_draft_model_path == self.model
+            ):
+                raise ValueError(
+                    "DSPARK currently requires both --disable-kvstore and "
+                    "--no-enable-prefix-caching."
+                )
             raise ValueError(
                 "KVStore and disabled prefix caching are mutually exclusive "
                 "and cannot be used at the same time. Please use only one of them."
