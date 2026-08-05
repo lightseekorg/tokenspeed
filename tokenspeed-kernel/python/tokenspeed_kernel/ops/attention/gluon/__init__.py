@@ -116,7 +116,7 @@ if current_platform().is_amd:
         gluon_mla_extend_bf16_gfx1250 as _mla_extend_bf16_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.prefill import (
-        gluon_mla_prefill_bf16_gfx1250 as _mla_prefill_gfx1250_impl,
+        gluon_mla_prefill_gfx1250 as _mla_prefill_gfx1250_impl,
     )
 
     @register_kernel(
@@ -657,7 +657,7 @@ if current_platform().is_amd:
     @register_kernel(
         "attention",
         "mla_prefill",
-        name="gluon_mla_prefill_bf16_gfx1250",
+        name="gluon_mla_prefill_gfx1250",
         solution="gluon",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(12, 5),
@@ -667,7 +667,7 @@ if current_platform().is_amd:
         signatures=format_signatures(
             ("q", "k", "v"),
             "dense",
-            {torch.bfloat16},
+            {torch.bfloat16, torch.float8_e4m3fn},
         ),
         priority=Priority.SPECIALIZED,
         traits={
@@ -678,7 +678,7 @@ if current_platform().is_amd:
             "return_lse": frozenset({False, True}),
         },
     )
-    def gluon_mla_prefill_bf16_gfx1250(*args, **kwargs):
+    def gluon_mla_prefill_gfx1250(*args, **kwargs):
         return _mla_prefill_gfx1250_impl(*args, **kwargs)
 
     @register_kernel(
