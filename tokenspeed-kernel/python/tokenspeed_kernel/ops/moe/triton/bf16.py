@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import TensorDescriptor, libdevice, tl, triton
-from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -170,18 +169,14 @@ def _validate(
             raise ValueError("SiTU linear beta must be positive")
 
     w13 = w.w13_weight
-    w13_scale = w.w13_weight_scale
     w2 = w.w2_weight
-    w2_scale = w.w2_weight_scale
-    if x.ndim != 2:
-        raise ValueError("x must have shape [num_tokens, hidden_size]")
+    if x.ndim != 2 or w13.ndim != 3 or w2.ndim != 3:
+        raise ValueError("x and unquantized MoE weights must be rank-2/rank-3")
     if x.dtype not in (torch.float16, torch.bfloat16):
         raise TypeError("x must use torch.float16 or torch.bfloat16")
-    if any(t.dtype != torch.uint8 for t in (w13, w13_scale, w2, w2_scale)):
-        raise TypeError("MXFP4 packed values and scales must use torch.uint8")
-    if not all(
-        t.is_cuda and t.is_contiguous() for t in (x, w13, w13_scale, w2, w2_scale)
-    ):
+    if w13.dtype != x.dtype or w2.dtype != x.dtype:
+        raise TypeError("x, w13_weight, and w2_weight must have the same dtype")
+    if not all(t.is_cuda and t.is_contiguous() for t in (x, w13, w2)):
         raise ValueError("x and weights must be contiguous GPU tensors")
     if topk_ids.ndim != 2 or topk_weights.shape != topk_ids.shape:
         raise ValueError("top-k tensors must have shape [num_tokens, top_k]")
@@ -191,117 +186,33 @@ def _validate(
         raise TypeError("topk_weights must use a floating-point dtype")
     if topk_ids.device != x.device or topk_weights.device != x.device:
         raise ValueError("top-k tensors and x must be on the same device")
-    if any(t.device != x.device for t in (w13, w13_scale, w2, w2_scale)):
+    if w13.device != x.device or w2.device != x.device:
         raise ValueError("x and weights must be on the same device")
 
     num_tokens, hidden_size = x.shape
-    num_experts, twice_intermediate_size, packed_hidden_size = w13.shape
+    num_experts, twice_intermediate_size, weight_hidden_size = w13.shape
     intermediate_size = twice_intermediate_size // 2
     top_k = topk_ids.shape[1]
     if num_experts == 0:
-        raise ValueError("MXFP4 MoE requires at least one expert")
+        raise ValueError("unquantized MoE requires at least one expert")
     if topk_ids.shape[0] != num_tokens or top_k == 0:
         raise ValueError("top-k tensors must have shape [num_tokens, top_k > 0]")
-    if twice_intermediate_size % 2 or packed_hidden_size * 2 != hidden_size:
-        raise ValueError("w13_weight has an incompatible packed shape")
-    if w13_scale.shape != (num_experts, 2 * intermediate_size, hidden_size // 32):
-        raise ValueError("w13_weight_scale must have shape [E, 2I, H/32]")
-    if w2.shape != (num_experts, hidden_size, intermediate_size // 2):
-        raise ValueError("w2_weight must have shape [E, H, I/2]")
-    if w2_scale.shape != (num_experts, hidden_size, intermediate_size // 32):
-        raise ValueError("w2_weight_scale must have shape [E, H, I/32]")
-    if hidden_size % 128 or intermediate_size % 128:
-        raise ValueError("hidden and intermediate sizes must be multiples of 128")
+    if twice_intermediate_size % 2 or weight_hidden_size != hidden_size:
+        raise ValueError("w13_weight has an incompatible shape")
+    if w2.shape != (num_experts, hidden_size, intermediate_size):
+        raise ValueError("w2_weight has an incompatible shape")
+    if hidden_size % 128 or intermediate_size % 32:
+        raise ValueError(
+            "hidden size must be a multiple of 128 and intermediate size of 32"
+        )
     return topk_weights, topk_ids, activation
-
-
-@triton.jit
-def _quantize_mxfp4_routine(values, valid_mask):
-    block_m: tl.constexpr = values.shape[0]
-    block_k: tl.constexpr = values.shape[1]
-    num_scale_blocks: tl.constexpr = block_k // 32
-    values_f32 = values.to(tl.float32)
-    abs_values = tl.where(valid_mask, tl.abs(values_f32), 0.0)
-    abs_values = abs_values.reshape((block_m, num_scale_blocks, 32))
-    max_values = tl.max(abs_values, axis=2, keep_dims=True)
-
-    dequant_scale = max_values / 6.0
-    scale_bits = (dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000
-    dequant_scale = scale_bits.to(tl.float32, bitcast=True)
-    scales = (scale_bits.reshape((block_m, num_scale_blocks)) >> 23).to(tl.uint8)
-    quant_scale = tl.where(dequant_scale == 0, 0.0, 1.0 / dequant_scale)
-    normalized = values_f32.reshape((block_m, num_scale_blocks, 32)) * quant_scale
-    normalized = normalized.reshape((block_m, block_k))
-    normalized = tl.where(valid_mask, normalized, 0.0)
-
-    bits = normalized.to(tl.uint32, bitcast=True)
-    signs = bits & 0x80000000
-    exponents = (bits >> 23) & 0xFF
-    original_mantissas = bits & 0x7FFFFF
-    is_subnormal = exponents < 127
-    exponent_shift = 127 - (exponents + 1)
-    subnormal_mantissas = 0x400000 | (original_mantissas >> 1)
-    mantissas = tl.where(
-        is_subnormal,
-        subnormal_mantissas >> exponent_shift,
-        original_mantissas,
-    )
-    exponents = tl.maximum(exponents, 126) - 126
-    mantissa_bits = mantissas >> 21
-    kept_lsb = (mantissa_bits >> 1) & 1
-    guard = mantissa_bits & 1
-    sticky = (mantissas & 0x1FFFFF) != 0
-    round_up = guard & (sticky | kept_lsb)
-    codes = tl.minimum((((exponents << 2) | mantissa_bits) + round_up) >> 1, 7)
-    codes = ((signs >> 28) | codes).to(tl.uint8)
-    code_pairs = codes.reshape((block_m, block_k // 2, 2))
-    low, high = tl.split(code_pairs)
-    return low | (high << 4), scales
-
-
-@triton.jit
-def _quantize_mxfp4_kernel(
-    x_ptr,
-    packed_ptr,
-    scale_ptr,
-    num_rows,
-    K: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    row_offsets = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
-    k_start = tl.program_id(1) * BLOCK_K
-    k_offsets = k_start + tl.arange(0, BLOCK_K)
-    valid_mask = (row_offsets[:, None] < num_rows) & (k_offsets[None, :] < K)
-    values = tl.load(
-        x_ptr + row_offsets[:, None] * K + k_offsets[None, :],
-        mask=valid_mask,
-        other=0.0,
-    )
-    packed, scales = _quantize_mxfp4_routine(values, valid_mask)
-    packed_offsets = (
-        row_offsets[:, None] * (K // 2)
-        + k_start // 2
-        + tl.arange(0, BLOCK_K // 2)[None, :]
-    )
-    scale_offsets = (
-        row_offsets[:, None] * (K // 32)
-        + k_start // 32
-        + tl.arange(0, BLOCK_K // 32)[None, :]
-    )
-    row_mask = row_offsets < num_rows
-    tl.store(packed_ptr + packed_offsets, packed, mask=row_mask[:, None])
-    tl.store(scale_ptr + scale_offsets, scales, mask=row_mask[:, None])
 
 
 @triton.jit
 def _stage1_kernel(
     x_desc,
-    x_scale_ptr,
     w13_desc,
-    w13_scale_ptr,
-    inter_packed_ptr,
-    inter_scale_ptr,
+    inter_ptr,
     expert_route_ids_ptr,
     expert_counts_ptr,
     num_tokens,
@@ -311,7 +222,6 @@ def _stage1_kernel(
     top_k: tl.constexpr,
     situ_beta,
     situ_linear_beta,
-    OUTPUT_DTYPE: tl.constexpr,
     ACTIVATION: tl.constexpr,
     HAS_LINEAR_BETA: tl.constexpr,
     NUM_PROGRAMS: tl.constexpr,
@@ -320,7 +230,6 @@ def _stage1_kernel(
     BLOCK_K: tl.constexpr,
 ):
     route_count = num_tokens * top_k
-    scale_k = hidden_size // 32
     tile_idx = tl.program_id(0)
     problem_start = 0
 
@@ -343,106 +252,35 @@ def _stage1_kernel(
             ).to(tl.int32)
             token_ids = tl.where(row_mask, route_ids // top_k, 0).to(tl.int32)
             n_offset = tile_n * BLOCK_N
-            scale_rows = n_offset + tl.arange(0, BLOCK_N)
-            scale_cols = tl.arange(0, BLOCK_K // 32)
-            expert_scale = w13_scale_ptr + expert_id * 2 * intermediate_size * scale_k
             gate_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
             up_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
             for k_offset in range(0, hidden_size, BLOCK_K):
-                x = x_desc.gather(token_ids, k_offset // 2)
-                x_scale_offsets = (
-                    token_ids[:, None] * scale_k + k_offset // 32 + scale_cols[None, :]
-                )
-                x_scale = tl.load(
-                    x_scale_ptr + x_scale_offsets,
-                    mask=row_mask[:, None],
-                    other=0,
-                )
-                gate = w13_desc.load([expert_id, n_offset, k_offset // 2]).reshape(
-                    (BLOCK_N, BLOCK_K // 2)
+                x = x_desc.gather(token_ids, k_offset)
+                gate = w13_desc.load([expert_id, n_offset, k_offset]).reshape(
+                    (BLOCK_N, BLOCK_K)
                 )
                 up = w13_desc.load(
-                    [expert_id, intermediate_size + n_offset, k_offset // 2]
-                ).reshape((BLOCK_N, BLOCK_K // 2))
-                gate_scale = tl.load(
-                    expert_scale
-                    + scale_rows[:, None] * scale_k
-                    + k_offset // 32
-                    + scale_cols[None, :]
-                )
-                up_scale = tl.load(
-                    expert_scale
-                    + (intermediate_size + scale_rows[:, None]) * scale_k
-                    + k_offset // 32
-                    + scale_cols[None, :]
-                )
-                gate_acc = tl.dot_scaled(
-                    x,
-                    x_scale,
-                    "e2m1",
-                    gate.T,
-                    gate_scale,
-                    "e2m1",
-                    gate_acc,
-                    fast_math=False,
-                    lhs_k_pack=True,
-                    rhs_k_pack=True,
-                )
-                up_acc = tl.dot_scaled(
-                    x,
-                    x_scale,
-                    "e2m1",
-                    up.T,
-                    up_scale,
-                    "e2m1",
-                    up_acc,
-                    fast_math=False,
-                    lhs_k_pack=True,
-                    rhs_k_pack=True,
-                )
+                    [expert_id, intermediate_size + n_offset, k_offset]
+                ).reshape((BLOCK_N, BLOCK_K))
+                gate_acc += tl.dot(x, gate.T)
+                up_acc += tl.dot(x, up.T)
 
-            output_dtype: tl.constexpr = (
-                tl.bfloat16 if OUTPUT_DTYPE == "bf16" else tl.float16
-            )
-            gate = gate_acc.to(output_dtype)
-            up = up_acc.to(output_dtype)
             if ACTIVATION == "situ":
-                gate = gate.to(tl.float32)
-                up = up.to(tl.float32)
+                gate = gate_acc.to(x_desc.dtype).to(tl.float32)
+                up = up_acc.to(x_desc.dtype).to(tl.float32)
                 gate = situ_beta * libdevice.tanh(gate / situ_beta) * tl.sigmoid(gate)
                 if HAS_LINEAR_BETA:
                     up = situ_linear_beta * libdevice.tanh(up / situ_linear_beta)
-                activated = (gate * up).to(output_dtype)
+                activated = (gate * up).to(x_desc.dtype)
             else:
-                silu = (gate.to(tl.float32) * tl.sigmoid(gate.to(tl.float32))).to(
-                    output_dtype
-                )
-                activated = (silu * up).to(output_dtype)
-            valid_mask = row_mask[:, None] & (tl.arange(0, BLOCK_N)[None, :] < BLOCK_N)
-            activated_packed, activated_scales = _quantize_mxfp4_routine(
-                activated, valid_mask
+                activated = (gate_acc * tl.sigmoid(gate_acc) * up_acc).to(x_desc.dtype)
+            inter_offsets = (
+                route_ids[:, None] * intermediate_size
+                + n_offset
+                + tl.arange(0, BLOCK_N)[None, :]
             )
-            inter_packed_offsets = (
-                route_ids[:, None] * (intermediate_size // 2)
-                + n_offset // 2
-                + tl.arange(0, BLOCK_N // 2)[None, :]
-            )
-            inter_scale_offsets = (
-                route_ids[:, None] * (intermediate_size // 32)
-                + n_offset // 32
-                + tl.arange(0, BLOCK_N // 32)[None, :]
-            )
-            tl.store(
-                inter_packed_ptr + inter_packed_offsets,
-                activated_packed,
-                mask=row_mask[:, None],
-            )
-            tl.store(
-                inter_scale_ptr + inter_scale_offsets,
-                activated_scales,
-                mask=row_mask[:, None],
-            )
+            tl.store(inter_ptr + inter_offsets, activated, mask=row_mask[:, None])
             tile_idx += NUM_PROGRAMS
 
         problem_start += problem_tiles
@@ -450,10 +288,8 @@ def _stage1_kernel(
 
 @triton.jit
 def _stage2_kernel(
-    inter_packed_ptr,
-    inter_scale_ptr,
+    inter_ptr,
     w2_desc,
-    w2_scale_ptr,
     route_output_ptr,
     expert_route_ids_ptr,
     expert_counts_ptr,
@@ -468,7 +304,6 @@ def _stage2_kernel(
     BLOCK_K: tl.constexpr,
 ):
     route_count = num_tokens * top_k
-    scale_k = intermediate_size // 32
     tile_idx = tl.program_id(0)
     problem_start = 0
 
@@ -491,51 +326,23 @@ def _stage2_kernel(
             ).to(tl.int32)
             route_ids = tl.where(row_mask, route_ids, -1).to(tl.int32)
             n_offset = tile_n * BLOCK_N
-            scale_rows = n_offset + tl.arange(0, BLOCK_N)
-            scale_cols = tl.arange(0, BLOCK_K // 32)
-            expert_scale = w2_scale_ptr + expert_id * hidden_size * scale_k
             acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
             for k_offset in range(0, intermediate_size, BLOCK_K):
                 intermediate_offsets = (
-                    route_ids[:, None] * (intermediate_size // 2)
-                    + k_offset // 2
-                    + tl.arange(0, BLOCK_K // 2)[None, :]
+                    route_ids[:, None] * intermediate_size
+                    + k_offset
+                    + tl.arange(0, BLOCK_K)[None, :]
                 )
                 intermediate = tl.load(
-                    inter_packed_ptr + intermediate_offsets,
+                    inter_ptr + intermediate_offsets,
                     mask=row_mask[:, None],
-                    other=0,
+                    other=0.0,
                 )
-                intermediate_scale_offsets = (
-                    route_ids[:, None] * scale_k + k_offset // 32 + scale_cols[None, :]
+                weight = w2_desc.load([expert_id, n_offset, k_offset]).reshape(
+                    (BLOCK_N, BLOCK_K)
                 )
-                intermediate_scale = tl.load(
-                    inter_scale_ptr + intermediate_scale_offsets,
-                    mask=row_mask[:, None],
-                    other=0,
-                )
-                weight = w2_desc.load([expert_id, n_offset, k_offset // 2]).reshape(
-                    (BLOCK_N, BLOCK_K // 2)
-                )
-                weight_scale = tl.load(
-                    expert_scale
-                    + scale_rows[:, None] * scale_k
-                    + k_offset // 32
-                    + scale_cols[None, :]
-                )
-                acc = tl.dot_scaled(
-                    intermediate,
-                    intermediate_scale,
-                    "e2m1",
-                    weight.T,
-                    weight_scale,
-                    "e2m1",
-                    acc,
-                    fast_math=False,
-                    lhs_k_pack=True,
-                    rhs_k_pack=True,
-                )
+                acc += tl.dot(intermediate, weight.T)
 
             output_offsets = (
                 route_ids[:, None] * hidden_size
@@ -551,9 +358,7 @@ def _stage2_kernel(
 def _moe(
     x: torch.Tensor,
     w13: torch.Tensor,
-    w13_scale: torch.Tensor,
     w2: torch.Tensor,
-    w2_scale: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     activation: str,
@@ -569,17 +374,8 @@ def _moe(
 
     expert_route_ids, expert_counts = _routing(topk_ids, num_experts)
     route_count = num_tokens * top_k
-    x_packed = torch.empty(
-        (num_tokens, hidden_size // 2), device=x.device, dtype=torch.uint8
-    )
-    x_scale = torch.empty(
-        (num_tokens, hidden_size // 32), device=x.device, dtype=torch.uint8
-    )
-    intermediate_packed = torch.empty(
-        (route_count, intermediate_size // 2), device=x.device, dtype=torch.uint8
-    )
-    intermediate_scale = torch.empty(
-        (route_count, intermediate_size // 32), device=x.device, dtype=torch.uint8
+    intermediate = torch.empty(
+        (route_count, intermediate_size), device=x.device, dtype=x.dtype
     )
     # Invalid expert ids are absent from routing; zero their canonical rows.
     route_output = torch.zeros(
@@ -587,9 +383,9 @@ def _moe(
     )
     output = torch.empty_like(x)
     block_m = 16 if num_tokens <= 16 else 64
-    stage1_block_n = 64
+    stage1_block_n = 64 if intermediate_size % 64 == 0 else 32
     stage2_block_n = 128
-    block_k = 128
+    block_k = 64 if intermediate_size % 64 == 0 else 32
     num_sms = torch.cuda.get_device_properties(x.device).multi_processor_count
     stage1_programs = min(
         num_sms, route_count * triton.cdiv(intermediate_size, stage1_block_n)
@@ -597,32 +393,14 @@ def _moe(
     stage2_programs = min(
         num_sms, route_count * triton.cdiv(hidden_size, stage2_block_n)
     )
-    backend = triton.runtime.driver.active.get_current_target().backend
-    amd_options = {"matrix_instr_nonkdim": 32, "kpack": 1} if backend == "hip" else {}
-    quant_block_k = 256 if hidden_size % 256 == 0 else 128
-    _quantize_mxfp4_kernel[
-        (triton.cdiv(num_tokens, block_m), triton.cdiv(hidden_size, quant_block_k))
-    ](
-        x,
-        x_packed,
-        x_scale,
-        num_tokens,
-        K=hidden_size,
-        BLOCK_M=block_m,
-        BLOCK_K=quant_block_k,
-        num_warps=4,
-    )
-    x_desc = TensorDescriptor.from_tensor(x_packed, [1, block_k // 2])
-    w13_desc = TensorDescriptor.from_tensor(w13, [1, stage1_block_n, block_k // 2])
-    w2_desc = TensorDescriptor.from_tensor(w2, [1, stage2_block_n, block_k // 2])
+    x_desc = TensorDescriptor.from_tensor(x, [1, block_k])
+    w13_desc = TensorDescriptor.from_tensor(w13, [1, stage1_block_n, block_k])
+    w2_desc = TensorDescriptor.from_tensor(w2, [1, stage2_block_n, block_k])
 
     _stage1_kernel[(stage1_programs,)](
         x_desc,
-        x_scale,
         w13_desc,
-        w13_scale,
-        intermediate_packed,
-        intermediate_scale,
+        intermediate,
         expert_route_ids,
         expert_counts,
         num_tokens,
@@ -632,7 +410,6 @@ def _moe(
         top_k=top_k,
         situ_beta=situ_beta,
         situ_linear_beta=(1.0 if situ_linear_beta is None else situ_linear_beta),
-        OUTPUT_DTYPE="bf16" if x.dtype == torch.bfloat16 else "fp16",
         ACTIVATION=activation,
         HAS_LINEAR_BETA=situ_linear_beta is not None,
         NUM_PROGRAMS=stage1_programs,
@@ -641,13 +418,10 @@ def _moe(
         BLOCK_K=block_k,
         num_warps=4 if block_m == 16 else 8,
         num_stages=3,
-        **amd_options,
     )
     _stage2_kernel[(stage2_programs,)](
-        intermediate_packed,
-        intermediate_scale,
+        intermediate,
         w2_desc,
-        w2_scale,
         route_output,
         expert_route_ids,
         expert_counts,
@@ -662,7 +436,6 @@ def _moe(
         BLOCK_K=block_k,
         num_warps=4 if block_m == 16 else 8,
         num_stages=3,
-        **amd_options,
     )
     _combine(route_output, topk_weights, output)
     return output
@@ -673,49 +446,26 @@ def _moe(
 # ===-----------------------------------------------------------------------===#
 
 
-def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module) -> None:
-    """Validate that the module retains the linear OCP MXFP4 weight layout."""
-    names = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
-    if any(not hasattr(w, name) for name in names):
-        raise ValueError("linear MXFP4 MoE weights are incomplete")
-    tensors = tuple(getattr(w, name) for name in names)
-    if any(t.dtype != torch.uint8 for t in tensors):
-        raise TypeError("MXFP4 packed values and scales must use torch.uint8")
-    if any(not t.is_cuda or not t.is_contiguous() for t in tensors):
-        raise ValueError("linear MXFP4 weights must be contiguous GPU tensors")
-    if any(t.ndim != 3 for t in tensors):
-        raise ValueError("linear MXFP4 weights must be rank-3")
-    if len({t.shape[0] for t in tensors}) != 1:
-        raise ValueError("linear MXFP4 weights must share an expert axis")
-    if getattr(w, "w13_input_layout", "concatenated") != "concatenated":
-        raise ValueError("Triton MXFP4 MoE requires concatenated gate/up weights")
-    activation = plan.get("activation") or getattr(w, "activation", "silu")
-    if activation not in {"silu", "situ", "swiglu"}:
-        raise ValueError(f"Triton MXFP4 MoE does not support {activation!r}")
-
-
 @register_kernel(
     "moe",
     "apply",
-    name="triton_mxfp4_precomputed_moe_apply",
+    name="triton_bf16_precomputed_moe_apply",
     solution="triton",
-    weight_preprocessor=triton_mxfp4_moe_weights,
-    capability=CapabilityRequirement(vendors=frozenset({"amd"})),
     signatures=format_signatures("x", "dense", {torch.float16, torch.bfloat16}),
     traits={
-        "weight_dtype": frozenset({"mxfp4"}),
+        "weight_dtype": frozenset({"unquant"}),
         "activation": frozenset({"silu", "situ", "swiglu"}),
         "routing_mode": frozenset({"precomputed_topk"}),
         "supports_deferred_finalize": frozenset({False}),
         "supports_ep": frozenset({False}),
         "supports_all_to_all_ep": frozenset({False}),
-        "ispp_alignment": frozenset({128}),
-        "internal_activation_dtype": frozenset({"mxfp4"}),
+        "ispp_alignment": frozenset({32}),
+        "internal_activation_dtype": frozenset({"input"}),
         "supports_bias": frozenset({False}),
     },
     priority=Priority.PORTABLE,
 )
-def triton_mxfp4_precomputed_moe_apply(
+def triton_bf16_precomputed_moe_apply(
     plan: dict,
     x: torch.Tensor,
     w: torch.nn.Module,
@@ -727,13 +477,13 @@ def triton_mxfp4_precomputed_moe_apply(
     do_finalize: bool = True,
     enable_pdl: bool = False,
 ) -> torch.Tensor:
-    """Apply a dynamic A4W4 MXFP4 Triton MoE with precomputed routing.
+    """Apply an FP16/BF16 Triton MoE using precomputed top-k routing.
 
     Args:
         plan: MoE plan selecting standard SiLU/SwiGLU or SiTU activation.
-        x: Contiguous FP16/BF16 hidden states `[tokens, hidden]`.
-        w: Module holding linear packed E2M1 `w13_weight`/`w2_weight` and
-            E8M0 `w13_weight_scale`/`w2_weight_scale` tensors.
+        x: Contiguous hidden states `[tokens, hidden]` in FP16 or BF16.
+        w: Module with contiguous `w13_weight` `[E, 2I, H]` and
+            `w2_weight` `[E, H, I]` tensors matching `x.dtype`.
         router_logits: Unused because routing must be precomputed.
         topk_weights: Route weights `[tokens, top_k]`.
         topk_ids: Expert ids `[tokens, top_k]`. Out-of-range ids contribute zero.
@@ -751,9 +501,7 @@ def triton_mxfp4_precomputed_moe_apply(
     return _moe(
         x,
         w.w13_weight,
-        w.w13_weight_scale,
         w.w2_weight,
-        w.w2_weight_scale,
         topk_weights,
         topk_ids,
         activation,

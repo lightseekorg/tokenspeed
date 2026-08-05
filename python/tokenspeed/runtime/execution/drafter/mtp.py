@@ -389,14 +389,19 @@ class Mtp(BaseDrafter):
         # run inside CUDA graph capture, where allocation is off-limits.
         self._lookback_hidden_buf: torch.Tensor | None = None
         if lookback:
+            if self.runtime_states is None:
+                raise RuntimeError("MTP lookback requires request-pool runtime state")
             model_config = draft_model_runner.model_config
+            # page_table is batch-ordered and may have fewer rows than the
+            # request-pool indices used to address these persistent stashes.
+            request_pool_rows = self.runtime_states.valid_cache_lengths.shape[0]
             self._lookback_tokens_buf = torch.zeros(
-                (page_table.shape[0], lookback),
+                (request_pool_rows, lookback),
                 dtype=torch.int64,
                 device=self.device,
             )
             self._lookback_hidden_buf = torch.zeros(
-                (page_table.shape[0], lookback, model_config.hidden_size),
+                (request_pool_rows, lookback, model_config.hidden_size),
                 dtype=model_config.dtype,
                 device=self.device,
             )

@@ -121,7 +121,6 @@ def _validate_shared_cache_geometry(pool, draft_pool) -> None:
             "entry_stride_tokens",
             "sliding_window_tokens",
             "family",
-            "block_size",
             "cache_blocks_per_lcm_block",
         )
         if any(
