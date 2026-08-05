@@ -1639,7 +1639,9 @@ async def benchmark(
         "output_lens": actual_output_lens,
         "ttfts": [output.ttft for output in outputs],
         "itls": [output.itl for output in outputs],
+        "latencies": [output.latency for output in outputs],
         "start_times": [output.start_time for output in outputs],
+        "request_ids": [request.request_id for request in input_requests],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
         "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
@@ -1976,6 +1978,8 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
             "start_times",
             "ttfts",
             "itls",
+            "latencies",
+            "request_ids",
             "generated_texts",
             "errors",
         ]:

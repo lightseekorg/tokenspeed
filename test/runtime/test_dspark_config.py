@@ -34,6 +34,16 @@ def test_geometry_splits_verify_width_from_draft_count() -> None:
     assert (verify_width, draft_block_size) == (8, 7)
 
 
+@pytest.mark.parametrize("verify_width", [2, 3, 4, 6, 8])
+def test_k3_checkpoint_without_block_metadata_allows_width_sweep(
+    verify_width: int,
+) -> None:
+    assert _resolve_block_geometry(SimpleNamespace(), spec_num_tokens=verify_width) == (
+        verify_width,
+        verify_width - 1,
+    )
+
+
 def test_geometry_accepts_torchspec_draft_count_convention() -> None:
     """DSpark/TorchSpec checkpoints store the draft count (7 for K3)."""
     cfg = SimpleNamespace(block_size=7)

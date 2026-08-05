@@ -29,6 +29,7 @@ from tokenspeed_kernel.ops.sampling.cuda import (
 )
 from tokenspeed_kernel.registry import error_fn
 
+from tokenspeed.runtime.execution.dspark_parity import record_dspark_parity_tensor
 from tokenspeed.runtime.sampling.backends.base import (
     SamplingBackend,
     SamplingBackendConfig,
@@ -221,6 +222,11 @@ class GreedySamplingBackend(SamplingBackend):
                 vocab_mask=sampling_info.vocab_mask,
             )
         target_predict = sampling_argmax(logits).reshape(bs, num_tokens_per_req)
+        record_dspark_parity_tensor(
+            "target_predict",
+            target_predict,
+            {"batch_size": bs, "verify_width": num_tokens_per_req},
+        )
 
         _verify_chain_greedy(
             predicts=predict,
@@ -234,6 +240,16 @@ class GreedySamplingBackend(SamplingBackend):
         )
 
         accept_length += 1
+        record_dspark_parity_tensor(
+            "accept_length",
+            accept_length,
+            {"batch_size": bs, "verify_width": num_tokens_per_req},
+        )
+        record_dspark_parity_tensor(
+            "verified_output_tokens",
+            predict.view(bs, num_tokens_per_req),
+            {"batch_size": bs, "verify_width": num_tokens_per_req},
+        )
 
         # TP-rank sync on the full verify-output triple, mirrors
         # FlashInferSamplingBackend.verify. Per-rank argmax / accept-length

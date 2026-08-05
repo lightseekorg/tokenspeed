@@ -33,6 +33,7 @@ from tokenspeed.runtime.execution.drafter._dflash_fused_kv import (
     _get_kv_buffer_ptrs,
 )
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter
+from tokenspeed.runtime.execution.dspark_parity import record_dspark_parity_tensor
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -297,6 +298,11 @@ class DFlash(BaseDrafter):
             )
             if bias_fn is not None:
                 logits = logits + bias_fn(0, int(logits.shape[-1])).to(logits.dtype)
+            record_dspark_parity_tensor(
+                "draft_corrected_logits",
+                logits,
+                {"vocab_start": 0, "bias_applied": bias_fn is not None},
+            )
             argmax = torch.argmax(logits, dim=-1)
             if out is not None:
                 out.copy_(argmax.view_as(out))
@@ -320,6 +326,15 @@ class DFlash(BaseDrafter):
                 base_logits = base_logits + bias_fn(org_vocab_start, num_org).to(
                     base_logits.dtype
                 )
+            record_dspark_parity_tensor(
+                "draft_corrected_logits",
+                base_logits,
+                {
+                    "vocab_start": org_vocab_start,
+                    "bias_applied": bias_fn is not None,
+                    "vocab_kind": "original",
+                },
+            )
             local_max, local_arg = torch.max(base_logits, dim=-1)
         else:
             local_max = torch.full(
@@ -341,6 +356,15 @@ class DFlash(BaseDrafter):
                 added_logits = added_logits + bias_fn(added_vocab_start, num_added).to(
                     added_logits.dtype
                 )
+            record_dspark_parity_tensor(
+                "draft_corrected_logits",
+                added_logits,
+                {
+                    "vocab_start": added_vocab_start,
+                    "bias_applied": bias_fn is not None,
+                    "vocab_kind": "added",
+                },
+            )
             added_max, added_arg = torch.max(added_logits, dim=-1)
             use_added = added_max > local_max
             local_max = torch.where(use_added, added_max, local_max)
@@ -853,9 +877,15 @@ class DFlash(BaseDrafter):
             return None
         num_decode_tokens = num_decodes * self.spec_num_tokens
         num_prefill_tokens = base_ctx.input_num_tokens - num_decode_tokens
-        return self.input_buffers.input_ids_buf[
+        candidates = self.input_buffers.input_ids_buf[
             num_prefill_tokens : base_ctx.input_num_tokens
         ].reshape(num_decodes, self.spec_num_tokens)
+        record_dspark_parity_tensor(
+            "verify_candidates",
+            candidates,
+            {"num_extends": num_extends, "num_decodes": num_decodes},
+        )
+        return candidates
 
     def draft(self, current_tokens: torch.Tensor) -> torch.Tensor:
         return self._draft_native(current_tokens)
@@ -941,6 +971,11 @@ class DFlash(BaseDrafter):
                 "Native DFLASH draft model did not return hidden states."
             )
         draft_hidden = draft_hidden.view(bs, self.spec_num_tokens, self.hidden_size)
+        record_dspark_parity_tensor(
+            "draft_hidden",
+            draft_hidden,
+            {"batch_size": bs, "verify_width": self.spec_num_tokens},
+        )
 
         next_tokens = self.next_tokens_buf[:bs]
         return self._sample_block(draft_hidden, block_ids, next_tokens)

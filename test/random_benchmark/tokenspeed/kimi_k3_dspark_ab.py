@@ -45,6 +45,9 @@ ACCEPT_LENGTH_RE = re.compile(
     r"\b(?:avg_accept_len|accept len):\s*([0-9]+(?:\.[0-9]+)?)"
 )
 ACCEPT_RATE_RE = re.compile(r"\baccept(?:_| )rate:\s*([0-9]+(?:\.[0-9]+)?)")
+REQUEST_ACCEPT_RE = re.compile(
+    r"Req:\s+(\S+)\s+Finish!\s+Accept_num_tokens_avg:\s+" r"([0-9]+(?:\.[0-9]+)?)"
+)
 SUMMARY_FIELDS = (
     "engine",
     "group",
@@ -61,6 +64,12 @@ SUMMARY_FIELDS = (
     "no_spec_tpot_ms",
     "dspark_tpot_ms",
     "tpot_speedup",
+    "no_spec_tpot_p99_ms",
+    "dspark_tpot_p99_ms",
+    "dspark_tpot_tail_ratio",
+    "spec_iteration_ms",
+    "break_even_accept",
+    "accept_margin",
     "no_spec_output_tps",
     "dspark_output_tps",
     "output_speedup",
@@ -69,6 +78,10 @@ SUMMARY_FIELDS = (
     "total_speedup",
     "no_spec_ttft_p99_ms",
     "dspark_ttft_p99_ms",
+    "ttft_p99_ratio",
+    "no_spec_e2e_p99_ms",
+    "dspark_e2e_p99_ms",
+    "e2e_p99_speedup",
     "dspark_accept_length",
     "dspark_accept_rate",
     "status",
@@ -77,6 +90,20 @@ REFERENCE_METRICS = (
     "median_tpot_ms",
     "output_throughput",
     "total_token_throughput",
+)
+REQUEST_TAIL_FIELDS = (
+    "engine",
+    "arm",
+    "group",
+    "point",
+    "repeat",
+    "request_id",
+    "latency_ms",
+    "ttft_ms",
+    "mean_itl_ms",
+    "output_tokens",
+    "accept_length",
+    "error",
 )
 
 
@@ -271,6 +298,8 @@ def build_server_command(
                 *(str(size) for size in sizes),
                 "--disable-prefill-graph",
             ]
+        if args.enable_mixed_batch:
+            command.append("--enable-mixed-batch")
         if arm == "dspark":
             command += [
                 "--speculative-algorithm",
@@ -463,16 +492,22 @@ def flush_cache(port: int) -> None:
         raise
 
 
-def parse_acceptance(text: str) -> dict[str, float | int]:
+def parse_acceptance(text: str) -> dict[str, Any]:
     lengths = [float(value) for value in ACCEPT_LENGTH_RE.findall(text)]
     rates = [float(value) for value in ACCEPT_RATE_RE.findall(text)]
-    result: dict[str, float | int] = {}
+    request_acceptance = [
+        {"request_id": request_id, "accept_length": float(value)}
+        for request_id, value in REQUEST_ACCEPT_RE.findall(text)
+    ]
+    result: dict[str, Any] = {}
     if lengths:
         result["accept_length"] = statistics.median(lengths)
         result["accept_length_samples"] = len(lengths)
     if rates:
         result["accept_rate"] = statistics.median(rates)
         result["accept_rate_samples"] = len(rates)
+    if request_acceptance:
+        result["request_acceptance"] = request_acceptance
     return result
 
 
@@ -503,7 +538,7 @@ def benchmark_command(
     model_name: str,
     output_path: Path,
 ) -> list[str]:
-    return [
+    command = [
         args.bench_command,
         "bench",
         "serve",
@@ -540,9 +575,14 @@ def benchmark_command(
         "--extra-request-body",
         '{"temperature":0}',
         "--disable-tqdm",
+        "--request-id-prefix",
+        f"{output_path.stem}-",
         "--output-file",
         str(output_path),
     ]
+    if args.save_detailed:
+        command.append("--save-detailed")
+    return command
 
 
 def _read_log_segment(path: Path, offset: int) -> str:
@@ -579,8 +619,10 @@ def run_arm(
         "draft": args.draft or DEFAULT_DRAFTS[args.engine],
         "target_snapshot": _snapshot_id(args.target or DEFAULT_TARGETS[args.engine]),
         "draft_snapshot": _snapshot_id(args.draft or DEFAULT_DRAFTS[args.engine]),
+        "speculative_width": args.speculative_width if arm == "dspark" else None,
+        "enable_mixed_batch": args.enable_mixed_batch,
         "server_command": command,
-        "tokenspeed_sha": _git_sha(Path("/sgl-workspace/tokenspeed")),
+        "tokenspeed_sha": _git_sha(args.repo_root),
         "sglang_sha": _git_sha(Path("/sgl-workspace/sglang")),
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
@@ -656,11 +698,15 @@ def run_arm(
                             "arm": arm,
                             "repeat": repeat,
                             "returncode": returncode,
+                            "speculative_width": (
+                                args.speculative_width if arm == "dspark" else None
+                            ),
                             "memory_fraction": args.memory_fraction,
                             "server_max_concurrency": args.max_concurrency,
                             "graph_max_concurrency": (
                                 args.graph_max_concurrency or args.max_concurrency
                             ),
+                            "enable_mixed_batch": args.enable_mixed_batch,
                             **acceptance,
                         },
                         "failed": 1,
@@ -679,11 +725,15 @@ def run_arm(
                     "arm": arm,
                     "repeat": repeat,
                     "returncode": returncode,
+                    "speculative_width": (
+                        args.speculative_width if arm == "dspark" else None
+                    ),
                     "memory_fraction": args.memory_fraction,
                     "server_max_concurrency": args.max_concurrency,
                     "graph_max_concurrency": (
                         args.graph_max_concurrency or args.max_concurrency
                     ),
+                    "enable_mixed_batch": args.enable_mixed_batch,
                     **acceptance,
                 }
                 output_path.write_text(json.dumps(result, indent=2))
@@ -746,7 +796,9 @@ def aggregate_results(
             "repeats": len(rows),
             "successful_repeats": sum(int(row.get("failed", 0)) == 0 for row in rows),
             "median_tpot_ms": _median(rows, "median_tpot_ms"),
+            "p99_tpot_ms": _median(rows, "p99_tpot_ms"),
             "p99_ttft_ms": _median(rows, "p99_ttft_ms"),
+            "p99_e2el_ms": _median(rows, "p99_e2el_ms"),
             "output_throughput": _median(rows, "output_throughput"),
             "output_tps_per_gpu": (
                 _median(rows, "output_throughput") / num_gpus
@@ -773,6 +825,15 @@ def aggregate_results(
             or dspark["successful_repeats"] != dspark["repeats"]
         ):
             status = "failed"
+        no_spec_tpot = no_spec["median_tpot_ms"] if no_spec else None
+        dspark_tpot = dspark["median_tpot_ms"] if dspark else None
+        accept_length = dspark["accept_length"] if dspark else None
+        spec_iteration_ms = (
+            dspark_tpot * accept_length
+            if dspark_tpot is not None and accept_length is not None
+            else None
+        )
+        break_even_accept = _ratio(spec_iteration_ms, no_spec_tpot)
         paired_rows.append(
             {
                 "engine": engine,
@@ -795,11 +856,21 @@ def aggregate_results(
                 "dspark_graph_max": (
                     dspark["graph_max_concurrency"] if dspark else None
                 ),
-                "no_spec_tpot_ms": no_spec["median_tpot_ms"] if no_spec else None,
-                "dspark_tpot_ms": dspark["median_tpot_ms"] if dspark else None,
-                "tpot_speedup": _ratio(
-                    no_spec["median_tpot_ms"] if no_spec else None,
-                    dspark["median_tpot_ms"] if dspark else None,
+                "no_spec_tpot_ms": no_spec_tpot,
+                "dspark_tpot_ms": dspark_tpot,
+                "tpot_speedup": _ratio(no_spec_tpot, dspark_tpot),
+                "no_spec_tpot_p99_ms": no_spec["p99_tpot_ms"] if no_spec else None,
+                "dspark_tpot_p99_ms": dspark["p99_tpot_ms"] if dspark else None,
+                "dspark_tpot_tail_ratio": _ratio(
+                    dspark["p99_tpot_ms"] if dspark else None,
+                    dspark_tpot,
+                ),
+                "spec_iteration_ms": spec_iteration_ms,
+                "break_even_accept": break_even_accept,
+                "accept_margin": (
+                    accept_length - break_even_accept
+                    if accept_length is not None and break_even_accept is not None
+                    else None
                 ),
                 "no_spec_output_tps": (
                     no_spec["output_throughput"] if no_spec else None
@@ -821,7 +892,17 @@ def aggregate_results(
                 ),
                 "no_spec_ttft_p99_ms": no_spec["p99_ttft_ms"] if no_spec else None,
                 "dspark_ttft_p99_ms": dspark["p99_ttft_ms"] if dspark else None,
-                "dspark_accept_length": (dspark["accept_length"] if dspark else None),
+                "ttft_p99_ratio": _ratio(
+                    dspark["p99_ttft_ms"] if dspark else None,
+                    no_spec["p99_ttft_ms"] if no_spec else None,
+                ),
+                "no_spec_e2e_p99_ms": no_spec["p99_e2el_ms"] if no_spec else None,
+                "dspark_e2e_p99_ms": dspark["p99_e2el_ms"] if dspark else None,
+                "e2e_p99_speedup": _ratio(
+                    no_spec["p99_e2el_ms"] if no_spec else None,
+                    dspark["p99_e2el_ms"] if dspark else None,
+                ),
+                "dspark_accept_length": accept_length,
                 "dspark_accept_rate": dspark["accept_rate"] if dspark else None,
                 "status": status,
             }
@@ -882,6 +963,83 @@ def check_results(
                             f"(minimum {reference_threshold:.3f}x)"
                         )
     return {"passed": not failures, "failures": failures}
+
+
+def request_tail_rows(raw_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = []
+    for result in raw_rows:
+        request_ids = result.get("request_ids")
+        if not isinstance(request_ids, list):
+            continue
+        metadata = result["ab_metadata"]
+        acceptance = {
+            item["request_id"]: item["accept_length"]
+            for item in metadata.get("request_acceptance", [])
+        }
+        latencies = result.get("latencies", [])
+        ttfts = result.get("ttfts", [])
+        itls = result.get("itls", [])
+        output_lens = result.get("output_lens", [])
+        errors = result.get("errors", [])
+        for index, request_id in enumerate(request_ids):
+            request_itls = itls[index] if index < len(itls) else []
+            accept_length = acceptance.get(request_id)
+            if accept_length is None and request_id:
+                accept_length = next(
+                    (
+                        value
+                        for logged_id, value in acceptance.items()
+                        if logged_id.startswith(f"{request_id}-")
+                    ),
+                    None,
+                )
+            rows.append(
+                {
+                    "engine": metadata["engine"],
+                    "arm": metadata["arm"],
+                    "group": metadata["group"],
+                    "point": metadata["name"],
+                    "repeat": metadata["repeat"],
+                    "request_id": request_id,
+                    "latency_ms": (
+                        float(latencies[index]) * 1000
+                        if index < len(latencies)
+                        else None
+                    ),
+                    "ttft_ms": (
+                        float(ttfts[index]) * 1000 if index < len(ttfts) else None
+                    ),
+                    "mean_itl_ms": (
+                        statistics.mean(request_itls) * 1000 if request_itls else None
+                    ),
+                    "output_tokens": (
+                        output_lens[index] if index < len(output_lens) else None
+                    ),
+                    "accept_length": accept_length,
+                    "error": errors[index] if index < len(errors) else None,
+                }
+            )
+    return sorted(
+        rows,
+        key=lambda row: (
+            row["engine"],
+            row["arm"],
+            row["group"],
+            row["point"],
+            row["repeat"],
+            row["request_id"] or "",
+        ),
+    )
+
+
+def write_request_tail(run_dir: Path, raw_rows: list[dict[str, Any]]) -> None:
+    rows = request_tail_rows(raw_rows)
+    if not rows:
+        return
+    with (run_dir / "request_tail.csv").open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=REQUEST_TAIL_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def write_summary(
@@ -956,7 +1114,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--repo-root", type=Path, default=Path("/sgl-workspace/tokenspeed")
     )
     parser.add_argument("--eager", action="store_true")
+    parser.add_argument("--enable-mixed-batch", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--save-detailed", action="store_true")
     parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
@@ -977,7 +1137,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    run_dir = (args.analyze_only or args.output_dir).resolve()
+    source_dir = (args.analyze_only or args.output_dir).resolve()
+    run_dir = (
+        args.output_dir.resolve()
+        if args.analyze_only is not None and args.output_dir is not None
+        else source_dir
+    )
     run_dir.mkdir(parents=True, exist_ok=True)
 
     if args.analyze_only is None:
@@ -993,7 +1158,8 @@ def main(argv: list[str] | None = None) -> int:
                 for arm in arms:
                     run_arm(args, arm, points, run_dir)
 
-    raw_rows = load_raw_results(run_dir, args.engine)
+    raw_rows = load_raw_results(source_dir, args.engine)
+    write_request_tail(run_dir, raw_rows)
     paired_rows, reference = aggregate_results(raw_rows, args.num_gpus)
     baseline = json.loads(args.reference.read_text()) if args.reference else None
     checks = check_results(

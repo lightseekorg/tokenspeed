@@ -99,6 +99,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
 )
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
+from tokenspeed.runtime.execution.dspark_parity import record_dspark_parity_tensor
 from tokenspeed.runtime.layers.activation import SituAndMul
 from tokenspeed.runtime.layers.layernorm import (
     RMSNorm,
@@ -1723,6 +1724,14 @@ class KimiLinearModel(nn.Module):
             if aux_hidden_states is not None and layer_idx in capture_layers:
                 captured = self._dspark_capture_stream(
                     layer_idx, prefix_sum, block_residual
+                )
+                record_dspark_parity_tensor(
+                    f"target_tap_{layer_idx}",
+                    captured,
+                    {
+                        "forward_mode": str(getattr(ctx, "forward_mode", None)),
+                        "num_tokens": int(captured.shape[0]),
+                    },
                 )
                 capture_idx = self._dflash_capture_idx_map.get(layer_idx)
                 if (

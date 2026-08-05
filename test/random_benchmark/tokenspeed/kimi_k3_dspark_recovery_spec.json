@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "source": {
+    "pr": "https://github.com/lightseekorg/tokenspeed/pull/905",
+    "base_head": "0061fcd0e6df5fd4633c37de48bc524644be2257",
+    "target": "/sgl-workspace/models/Kimi-K3-flat",
+    "draft": "/sgl-workspace/models/hub/models--Inferact--Kimi-K3-DSpark/snapshots/cf6b8244620e7ea4b0651d214f28e89eac75bed6",
+    "baseline_summary": "/sgl-workspace/workspace/ab_results/k3-dspark-comprehensive/summary.csv"
+  },
+  "protocol": {
+    "gpu_lease": "/sgl-workspace/workspace/gpu-lease.sh",
+    "gpu_lock": "/tmp/k3-grid.lock",
+    "max_claim_minutes": 30,
+    "repeats": 3,
+    "success_metric": "paired aggregate output tokens per second",
+    "stress_only_workload": "exact-length random tokens"
+  },
+  "gates": {
+    "enabled_workload_median_speedup": 1.3,
+    "enabled_workload_min_repeat_speedup": 1.2,
+    "enabled_workload_bootstrap_ci95_floor": 1.15,
+    "gsm8k_max_regression_pp": 1.0,
+    "zero_failed_requests": true,
+    "stable_concurrency": [1, 4, 8, 16, 32, 48]
+  },
+  "primary_workloads": [
+    "gsm8k",
+    "humaneval",
+    "mbpp",
+    "aime26",
+    "chat_rag",
+    "long_context"
+  ],
+  "parity": {
+    "reference_engine": "vllm",
+    "same_checkpoint_required": true,
+    "vllm_checkout_present": false,
+    "aggregate_acceptance_max_relative_delta": 0.1,
+    "hidden_cosine_floor": 0.999
+  }
+}

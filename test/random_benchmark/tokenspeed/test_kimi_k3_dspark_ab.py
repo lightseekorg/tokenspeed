@@ -33,7 +33,9 @@ def _row(arm: str, repeat: int, *, tpot: float, output_tps: float):
         "ab_metadata": metadata,
         "failed": 0,
         "median_tpot_ms": tpot,
+        "p99_tpot_ms": tpot * (1.5 if arm == "dspark" else 1.05),
         "p99_ttft_ms": 1000 + repeat,
+        "p99_e2el_ms": tpot * 1000,
         "output_throughput": output_tps,
         "total_token_throughput": output_tps * 5,
     }
@@ -81,6 +83,14 @@ def test_server_commands_only_add_native_dspark_flags():
         "mla",
     ]
 
+    mixed_args = ab.parse_args(
+        ["--engine", "tokenspeed", "--enable-mixed-batch", "--dry-run"]
+    )
+    mixed_baseline, _, _ = ab.build_server_command(mixed_args, "no-spec")
+    mixed_dspark, _, _ = ab.build_server_command(mixed_args, "dspark")
+    assert "--enable-mixed-batch" in mixed_baseline
+    assert "--enable-mixed-batch" in mixed_dspark
+
     sgl_args = ab.parse_args(["--engine", "sglang", "--dry-run"])
     baseline, _, _ = ab.build_server_command(sgl_args, "no-spec")
     dspark, _, _ = ab.build_server_command(sgl_args, "dspark")
@@ -109,7 +119,57 @@ def test_aggregate_reports_paired_speedups_and_acceptance():
     assert result["tpot_speedup"] == pytest.approx(2.0)
     assert result["output_speedup"] == pytest.approx(2.0)
     assert result["dspark_accept_length"] == pytest.approx(2.6)
+    assert result["spec_iteration_ms"] == pytest.approx(130.0)
+    assert result["break_even_accept"] == pytest.approx(1.3)
+    assert result["accept_margin"] == pytest.approx(1.3)
+    assert result["dspark_tpot_tail_ratio"] == pytest.approx(1.5)
+    assert result["e2e_p99_speedup"] == pytest.approx(2.0)
     assert "tokenspeed|ci|4k-1k-c16|dspark" in reference
+
+
+def test_parse_acceptance_keeps_per_request_values():
+    parsed = ab.parse_acceptance(
+        "avg_accept_len: 2.50, accept_rate: 0.21\n"
+        "Req: bench-0 Finish! Accept_num_tokens_avg: 4.25\n"
+    )
+    assert parsed["accept_length"] == pytest.approx(2.5)
+    assert parsed["request_acceptance"] == [
+        {"request_id": "bench-0", "accept_length": 4.25}
+    ]
+
+
+def test_request_tail_rows_join_acceptance_and_latency():
+    row = _row("dspark", 1, tpot=50, output_tps=160)
+    row["ab_metadata"]["request_acceptance"] = [
+        {"request_id": "bench-0-server-uuid", "accept_length": 4.25}
+    ]
+    row.update(
+        {
+            "request_ids": ["bench-0"],
+            "latencies": [2.0],
+            "ttfts": [0.25],
+            "itls": [[0.1, 0.2]],
+            "output_lens": [16],
+            "errors": [""],
+        }
+    )
+    tail = ab.request_tail_rows([row])
+    assert tail == [
+        {
+            "engine": "tokenspeed",
+            "arm": "dspark",
+            "group": "ci",
+            "point": "4k-1k-c16",
+            "repeat": 1,
+            "request_id": "bench-0",
+            "latency_ms": 2000.0,
+            "ttft_ms": 250.0,
+            "mean_itl_ms": pytest.approx(150.0),
+            "output_tokens": 16,
+            "accept_length": 4.25,
+            "error": "",
+        }
+    ]
 
 
 def test_reference_check_catches_throughput_and_acceptance_regressions():
