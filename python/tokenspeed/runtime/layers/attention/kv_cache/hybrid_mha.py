@@ -28,10 +28,14 @@ from dataclasses import replace
 import numpy as np
 import torch
 
-from tokenspeed.runtime.configs import paged_cache_spec
 from tokenspeed.runtime.configs.cache_runtime import (
     PagedCacheRuntimeContract,
 )
+from tokenspeed.runtime.configs.paged_cache_spec import (
+    STATE_LAYER_TYPES,
+    PagedCacheGroupSpec,
+)
+from tokenspeed.runtime.layers.attention.kv_cache import publish
 from tokenspeed.runtime.layers.attention.kv_cache.mha import (
     MHATokenToKVPool,
     MHATokenToKVPoolMXFP8,
@@ -51,14 +55,14 @@ class HybridMHATokenToKVPool(MHATokenToKVPool):
         token_capacity: int | None = None,
         **kwargs,
     ):
-        self.layer_cache_group_ids = tuple(layer_group_ids)
-        self._group_ids_by_layer = dict(enumerate(self.layer_cache_group_ids))
+        group_ids = tuple(layer_group_ids)
+        self._group_ids_by_layer = dict(enumerate(group_ids))
         self._state_field_dtypes = dict(state_field_dtypes or {})
         layer_types = tuple(kwargs.get("layer_types", ()))
         self._state_layer_ids = tuple(
             layer_id
             for layer_id, label in enumerate(layer_types)
-            if label in paged_cache_spec.STATE_LAYER_TYPES
+            if label in STATE_LAYER_TYPES
         )
         self._state_buffers_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self.paged_cache_requires_page_zeroing = True
@@ -66,10 +70,10 @@ class HybridMHATokenToKVPool(MHATokenToKVPool):
             token_capacity if token_capacity is not None else kwargs["size"]
         )
 
-        if len(self.layer_cache_group_ids) != kwargs["layer_num"]:
+        if len(group_ids) != kwargs["layer_num"]:
             raise ValueError("cache group ids must cover every model layer")
 
-        super().__init__(memory_plan=memory_plan, **kwargs)
+        super().__init__(memory_plan=memory_plan, layer_group_ids=group_ids, **kwargs)
 
         self.runtime_contract = PagedCacheRuntimeContract(
             block_size=self.page_size,
@@ -86,13 +90,13 @@ class HybridMHATokenToKVPool(MHATokenToKVPool):
         sliding_window_tokens: int | Sequence[int | None] | None,
         page_size: int,
         page_sizes: Mapping[str, int] | None,
-        extra_groups: Sequence[paged_cache_spec.PagedCacheGroupSpec],
+        extra_groups: Sequence[PagedCacheGroupSpec],
         max_live_requests: int,
         max_scheduled_tokens: int,
         max_total_tokens: int,
         max_context_len: int,
-    ) -> tuple[list[paged_cache_spec.PagedCacheGroupSpec], dict[str, int]]:
-        published = paged_cache_spec.publish_paged_cache_groups(
+    ) -> tuple[list[PagedCacheGroupSpec], dict[str, int]]:
+        published = publish.publish_paged_cache_groups(
             layer_types=layer_types,
             group_ids=self.layer_cache_group_ids,
             sliding_window_tokens=sliding_window_tokens,
@@ -147,7 +151,7 @@ class HybridMHATokenToKVPool(MHATokenToKVPool):
         self.k_buffer = [None] * self.layer_num
         self.v_buffer = [None] * self.layer_num
         for layer_id, label in enumerate(self._layer_types):
-            if label in paged_cache_spec.STATE_LAYER_TYPES:
+            if label in STATE_LAYER_TYPES:
                 conv_id = f"layer.{layer_id}.conv"
                 ssm_id = f"layer.{layer_id}.ssm"
                 try:

@@ -90,6 +90,8 @@ def prepare_qwen35_cache(
     from tokenspeed.runtime.configs.paged_cache_spec import (
         FULL_ATTENTION,
         LINEAR_ATTENTION,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.publish import (
         split_recurrent_state_groups,
     )
 

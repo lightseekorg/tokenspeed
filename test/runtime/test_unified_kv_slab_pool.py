@@ -15,17 +15,15 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-_CONFIGS_DIR = (
-    pathlib.Path(__file__).resolve().parents[2]
-    / "python"
-    / "tokenspeed"
-    / "runtime"
-    / "configs"
+_RUNTIME_DIR = (
+    pathlib.Path(__file__).resolve().parents[2] / "python" / "tokenspeed" / "runtime"
 )
+_CONFIGS_DIR = _RUNTIME_DIR / "configs"
+_KV_CACHE_DIR = _RUNTIME_DIR / "layers" / "attention" / "kv_cache"
 
 
-def _load(mod_name: str, file_name: str):
-    spec = importlib.util.spec_from_file_location(mod_name, _CONFIGS_DIR / file_name)
+def _load(mod_name: str, file_path: pathlib.Path):
+    spec = importlib.util.spec_from_file_location(mod_name, file_path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     # Register before exec: on py3.9 @dataclass + `from __future__ import
@@ -35,8 +33,14 @@ def _load(mod_name: str, file_name: str):
     return mod
 
 
-_pcs = _load("paged_cache_spec_slab_under_test", "paged_cache_spec.py")
-hybrid_slab_group_size = _pcs.hybrid_slab_group_size
+# Register under the real name so publish.py's from-import binds THIS repo
+# file (the v4 smoke test's pattern) rather than an installed copy.
+_pcs = _load(
+    "tokenspeed.runtime.configs.paged_cache_spec",
+    _CONFIGS_DIR / "paged_cache_spec.py",
+)
+_publish = _load("kv_cache_publish_slab_under_test", _KV_CACHE_DIR / "publish.py")
+hybrid_slab_group_size = _publish.hybrid_slab_group_size
 
 GPT_OSS_LAYER_TYPES = ("sliding_attention", "full_attention") * 12
 
@@ -149,7 +153,6 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
     When placement sharing is active, paired layer views address the same
     bytes without sharing a Python tensor object.
     Constructs a real (tiny, CPU) MHATokenToKVPool; skips without deps.
-    Patch target is the PACKAGE paged_cache_spec probe (see above).
     """
 
     def setUp(self):
@@ -165,7 +168,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
         self.MHATokenToKVPool = MHATokenToKVPool
 
     def _pool(self, **overrides):
-        from cache_pool_test_utils import make_mha_memory_plan
+        from cache_pool_test_utils import make_layer_group_ids, make_mha_memory_plan
 
         kwargs = {
             "size": 32,
@@ -192,6 +195,14 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
             dtype=kwargs["dtype"],
             layer_types=kwargs.get("layer_types", ()),
             sliding_window_tokens=kwargs.get("sliding_window_tokens"),
+        )
+        kwargs.setdefault(
+            "layer_group_ids",
+            make_layer_group_ids(
+                layer_num=kwargs["layer_num"],
+                layer_types=kwargs.get("layer_types", ()),
+                sliding_window_tokens=kwargs.get("sliding_window_tokens"),
+            ),
         )
         return self.MHATokenToKVPool(**kwargs)
 
@@ -305,6 +316,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
             "page_size": 16,
             "rank": 0,
             "layer_types": ("full_attention",),
+            "layer_group_ids": ("full_attention",),
         }
         from cache_pool_test_utils import make_mha_memory_plan
 
@@ -374,6 +386,7 @@ class MLAPoolAllocationHookTest(unittest.TestCase):
                 latent_width=6,
                 dtype=torch.bfloat16,
             ),
+            layer_group_ids=("full_attention",),
         )
 
         self.assertTrue(pool.allocation_hook_called)
@@ -404,8 +417,9 @@ class StatePagedCacheGroupPageCountTest(unittest.TestCase):
             self.skipTest(f"page-count math needs the real package: {exc}")
 
     def _counts(self, **overrides):
-        specs = _pcs.group_specs_from_layer_types(
+        specs = _publish.group_specs_from_layer_types(
             layer_types=("linear_attention", "full_attention"),
+            group_ids=("linear_attention", "full_attention"),
             sliding_window_tokens=None,
             page_size=16,
         )
@@ -435,15 +449,13 @@ class CachePoolFieldBindingTest(unittest.TestCase):
     def setUp(self):
         try:
             import torch
+            from cache_pool_test_utils import plan_fields
 
             from tokenspeed.runtime.layers.attention.kv_cache.hybrid_mha import (
                 HybridMHATokenToKVPool,
             )
             from tokenspeed.runtime.layers.attention.kv_cache.mha import (
                 MHATokenToKVPool,
-            )
-            from tokenspeed.runtime.layers.attention.kv_cache.plan import (
-                plan_cache_fields,
             )
             from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen35 import (
                 qwen_gdn_cache_fields,
@@ -464,7 +476,7 @@ class CachePoolFieldBindingTest(unittest.TestCase):
             ssm_shape=(1, 2, 2),
             ssm_element_size=2,
         )
-        self.plan = plan_cache_fields(
+        self.plan = plan_fields(
             fields,
             logical_block_tokens=4,
             budget_bytes=64,
@@ -509,6 +521,7 @@ class CachePoolFieldBindingTest(unittest.TestCase):
             page_size=4,
             rank=0,
             layer_types=("linear_attention", "full_attention"),
+            layer_group_ids=("linear_attention", "full_attention"),
             memory_plan=make_mha_memory_plan(
                 size=8,
                 page_size=4,

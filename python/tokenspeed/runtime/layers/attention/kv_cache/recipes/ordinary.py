@@ -352,7 +352,9 @@ def _profiled_pages(
 
 
 def _storage_layers(config, num_layers: int) -> int:
-    from tokenspeed.runtime.configs.paged_cache_spec import hybrid_slab_group_size
+    from tokenspeed.runtime.layers.attention.kv_cache.publish import (
+        hybrid_slab_group_size,
+    )
 
     group_size = hybrid_slab_group_size(
         getattr(config, "layer_types", None),
@@ -448,7 +450,7 @@ def _ordinary_setup(
 def _mha_fields(config, num_layers: int):
     import torch
 
-    from tokenspeed.runtime.configs import paged_cache_spec
+    from tokenspeed.runtime.layers.attention.kv_cache import publish
 
     if config.kv_cache_mxfp8:
         assert config.page_size == 128, (
@@ -458,7 +460,7 @@ def _mha_fields(config, num_layers: int):
     layer_types = tuple(config.layer_types)
     group_ids = (
         tuple(
-            paged_cache_spec.layer_group_ids(
+            publish.layer_group_ids(
                 layer_types=layer_types,
                 sliding_window_tokens=config.sliding_window_tokens,
             )

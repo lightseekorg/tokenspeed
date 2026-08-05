@@ -12,17 +12,15 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-_CONFIGS_DIR = (
-    pathlib.Path(__file__).resolve().parents[2]
-    / "python"
-    / "tokenspeed"
-    / "runtime"
-    / "configs"
+_RUNTIME_DIR = (
+    pathlib.Path(__file__).resolve().parents[2] / "python" / "tokenspeed" / "runtime"
 )
+_CONFIGS_DIR = _RUNTIME_DIR / "configs"
+_KV_CACHE_DIR = _RUNTIME_DIR / "layers" / "attention" / "kv_cache"
 
 
-def _load(mod_name: str, file_name: str):
-    spec = importlib.util.spec_from_file_location(mod_name, _CONFIGS_DIR / file_name)
+def _load(mod_name: str, file_path: pathlib.Path):
+    spec = importlib.util.spec_from_file_location(mod_name, file_path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     # Register before exec: on py3.9 @dataclass + `from __future__ import
@@ -32,10 +30,29 @@ def _load(mod_name: str, file_name: str):
     return mod
 
 
-_pcs = _load("paged_cache_spec_under_test", "paged_cache_spec.py")
-group_specs_from_layer_types = _pcs.group_specs_from_layer_types
-layer_group_ids = _pcs.layer_group_ids
+# Register under the real name so publish.py's from-import binds THIS repo
+# file via the sys.modules short-circuit (no real package import).
+_pcs = _load(
+    "tokenspeed.runtime.configs.paged_cache_spec",
+    _CONFIGS_DIR / "paged_cache_spec.py",
+)
+_publish = _load("kv_cache_publish_under_test", _KV_CACHE_DIR / "publish.py")
+group_specs_from_layer_types = _publish.group_specs_from_layer_types
+layer_group_ids = _publish.layer_group_ids
 PagedCacheGroupSpec = _pcs.PagedCacheGroupSpec
+
+
+def _specs(**kwargs):
+    """Call group_specs_from_layer_types the way the recipes do: group_ids
+    derived from the layer types unless the test supplies a finer split."""
+    kwargs.setdefault(
+        "group_ids",
+        layer_group_ids(
+            layer_types=kwargs["layer_types"],
+            sliding_window_tokens=kwargs["sliding_window_tokens"],
+        ),
+    )
+    return group_specs_from_layer_types(**kwargs)
 
 
 class GroupSpecsFromLayerTypesTest(unittest.TestCase):
@@ -52,7 +69,7 @@ class GroupSpecsFromLayerTypesTest(unittest.TestCase):
             "full_attention",
             "sliding_attention",
         ]
-        specs = group_specs_from_layer_types(
+        specs = _specs(
             layer_types=layer_types,
             sliding_window_tokens=128,
             page_size=16,
@@ -76,7 +93,7 @@ class GroupSpecsFromLayerTypesTest(unittest.TestCase):
         self.assertEqual(swa.family, "history")
 
     def test_all_full_yields_single_group(self):
-        specs = group_specs_from_layer_types(
+        specs = _specs(
             layer_types=["full_attention"] * 8,
             sliding_window_tokens=None,
             page_size=16,
@@ -87,7 +104,7 @@ class GroupSpecsFromLayerTypesTest(unittest.TestCase):
         self.assertIsNone(specs[0].sliding_window_tokens)
 
     def test_group_order_is_first_appearance(self):
-        specs = group_specs_from_layer_types(
+        specs = _specs(
             layer_types=["sliding_attention", "full_attention", "full_attention"],
             sliding_window_tokens=64,
             page_size=8,
@@ -101,7 +118,7 @@ class GroupSpecsFromLayerTypesTest(unittest.TestCase):
         # Inkling step 2.5 shape: 5 sliding sub-groups + full -> 6 specs,
         # first-appearance order, all sliding specs share the one window.
         block = [f"sliding_attention_{k}" for k in range(5)] + ["full_attention"]
-        specs = group_specs_from_layer_types(
+        specs = _specs(
             layer_types=block * 2,
             sliding_window_tokens=512,
             page_size=128,
@@ -124,7 +141,7 @@ class GroupSpecsFromLayerTypesTest(unittest.TestCase):
 
     def test_sliding_subgroup_nondigit_suffix_raises(self):
         with self.assertRaises(ValueError):
-            group_specs_from_layer_types(
+            _specs(
                 layer_types=["full_attention", "sliding_attention_x"],
                 sliding_window_tokens=64,
                 page_size=16,
@@ -132,7 +149,7 @@ class GroupSpecsFromLayerTypesTest(unittest.TestCase):
 
     def test_unknown_layer_type_raises(self):
         with self.assertRaises(ValueError):
-            group_specs_from_layer_types(
+            _specs(
                 layer_types=["full_attention", "banana_attention"],
                 sliding_window_tokens=None,
                 page_size=16,
@@ -140,7 +157,7 @@ class GroupSpecsFromLayerTypesTest(unittest.TestCase):
 
     def test_sliding_without_window_raises(self):
         with self.assertRaises(ValueError):
-            group_specs_from_layer_types(
+            _specs(
                 layer_types=["sliding_attention"],
                 sliding_window_tokens=None,
                 page_size=16,
@@ -148,7 +165,7 @@ class GroupSpecsFromLayerTypesTest(unittest.TestCase):
 
     def test_sliding_with_nonpositive_window_raises(self):
         with self.assertRaises(ValueError):
-            group_specs_from_layer_types(
+            _specs(
                 layer_types=["sliding_attention"],
                 sliding_window_tokens=0,
                 page_size=16,
@@ -156,7 +173,7 @@ class GroupSpecsFromLayerTypesTest(unittest.TestCase):
 
     def test_qwen35_linear_attention_yields_state_group(self):
         layer_types = ["linear_attention", "linear_attention", "full_attention"]
-        specs = group_specs_from_layer_types(
+        specs = _specs(
             layer_types=layer_types,
             sliding_window_tokens=None,
             page_size=16,
@@ -171,7 +188,7 @@ class GroupSpecsFromLayerTypesTest(unittest.TestCase):
 
     def test_qwen35_mixed_with_sliding_and_state_layers(self):
         layer_types = ["sliding_attention", "linear_attention", "full_attention"]
-        specs = group_specs_from_layer_types(
+        specs = _specs(
             layer_types=layer_types,
             sliding_window_tokens=[128, None, None],
             page_size=16,
@@ -233,7 +250,7 @@ class LayerGroupIdsTest(unittest.TestCase):
 
 class MultiWindowGroupSpecsTest(unittest.TestCase):
     def test_two_windows_yield_three_groups_in_first_appearance_order(self):
-        specs = group_specs_from_layer_types(
+        specs = _specs(
             layer_types=[
                 "full_attention",
                 "sliding_attention",
@@ -256,7 +273,7 @@ class MultiWindowGroupSpecsTest(unittest.TestCase):
 
     def test_window_sequence_length_mismatch_raises(self):
         with self.assertRaises(ValueError):
-            group_specs_from_layer_types(
+            _specs(
                 layer_types=["full_attention", "sliding_attention"],
                 sliding_window_tokens=[None, 4, 512],
                 page_size=16,
@@ -264,7 +281,7 @@ class MultiWindowGroupSpecsTest(unittest.TestCase):
 
     def test_sliding_layer_without_window_in_sequence_raises(self):
         with self.assertRaises(ValueError):
-            group_specs_from_layer_types(
+            _specs(
                 layer_types=["full_attention", "sliding_attention"],
                 sliding_window_tokens=[None, None],
                 page_size=16,
@@ -272,7 +289,7 @@ class MultiWindowGroupSpecsTest(unittest.TestCase):
 
     def test_sliding_layer_nonpositive_window_in_sequence_raises(self):
         with self.assertRaises(ValueError):
-            group_specs_from_layer_types(
+            _specs(
                 layer_types=["sliding_attention"],
                 sliding_window_tokens=[0],
                 page_size=16,
@@ -280,7 +297,7 @@ class MultiWindowGroupSpecsTest(unittest.TestCase):
 
     def test_full_layer_with_positive_window_in_sequence_raises(self):
         with self.assertRaises(ValueError):
-            group_specs_from_layer_types(
+            _specs(
                 layer_types=["full_attention", "sliding_attention"],
                 sliding_window_tokens=[64, 64],
                 page_size=16,
@@ -288,14 +305,14 @@ class MultiWindowGroupSpecsTest(unittest.TestCase):
 
     def test_linear_layer_with_positive_window_in_sequence_raises(self):
         with self.assertRaises(ValueError):
-            group_specs_from_layer_types(
+            _specs(
                 layer_types=["linear_attention", "full_attention"],
                 sliding_window_tokens=[128, None],
                 page_size=16,
             )
 
     def test_repeated_window_across_layers_dedups_to_one_group(self):
-        specs = group_specs_from_layer_types(
+        specs = _specs(
             layer_types=[
                 "full_attention",
                 "sliding_attention",
@@ -312,13 +329,13 @@ class MultiWindowGroupSpecsTest(unittest.TestCase):
 
     def test_bool_window_raises(self):
         with self.assertRaises(ValueError):
-            group_specs_from_layer_types(
+            _specs(
                 layer_types=["sliding_attention"],
                 sliding_window_tokens=True,
                 page_size=16,
             )
         with self.assertRaises(ValueError):
-            group_specs_from_layer_types(
+            _specs(
                 layer_types=["sliding_attention"],
                 sliding_window_tokens=[True],
                 page_size=16,
@@ -326,7 +343,7 @@ class MultiWindowGroupSpecsTest(unittest.TestCase):
 
     def test_float_window_raises(self):
         with self.assertRaises(ValueError):
-            group_specs_from_layer_types(
+            _specs(
                 layer_types=["sliding_attention"],
                 sliding_window_tokens=[4.7],
                 page_size=16,
@@ -334,7 +351,7 @@ class MultiWindowGroupSpecsTest(unittest.TestCase):
 
     def test_scalar_str_window_raises(self):
         with self.assertRaises(ValueError):
-            group_specs_from_layer_types(
+            _specs(
                 layer_types=["sliding_attention"],
                 sliding_window_tokens="128",
                 page_size=16,
@@ -342,14 +359,14 @@ class MultiWindowGroupSpecsTest(unittest.TestCase):
 
     def test_scalar_float_window_raises(self):
         with self.assertRaises(ValueError):
-            group_specs_from_layer_types(
+            _specs(
                 layer_types=["sliding_attention"],
                 sliding_window_tokens=4.5,
                 page_size=16,
             )
 
     def test_scalar_window_with_full_layers_does_not_raise(self):
-        specs = group_specs_from_layer_types(
+        specs = _specs(
             layer_types=["full_attention", "sliding_attention"],
             sliding_window_tokens=128,
             page_size=16,
@@ -379,7 +396,7 @@ class PoolToPagedCacheGroupsIntegrationTest(unittest.TestCase):
 
         pool_to_paged_cache_groups = self._import_converter()
 
-        specs = group_specs_from_layer_types(
+        specs = _specs(
             layer_types=["full_attention", "sliding_attention"],
             sliding_window_tokens=128,
             page_size=16,

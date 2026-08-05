@@ -64,6 +64,8 @@ class HostMirrorTest(unittest.TestCase):
             "layer_types": LAYER_TYPES,
             "sliding_window_tokens": 128,
         }
+        from cache_pool_test_utils import make_layer_group_ids
+
         kwargs["memory_plan"] = make_mha_memory_plan(
             size=kwargs["size"],
             page_size=kwargs["page_size"],
@@ -71,6 +73,11 @@ class HostMirrorTest(unittest.TestCase):
             kv_heads=kwargs["head_num"],
             head_dim=kwargs["head_dim"],
             dtype=kwargs["dtype"],
+            layer_types=kwargs["layer_types"],
+            sliding_window_tokens=kwargs["sliding_window_tokens"],
+        )
+        kwargs["layer_group_ids"] = make_layer_group_ids(
+            layer_num=kwargs["layer_num"],
             layer_types=kwargs["layer_types"],
             sliding_window_tokens=kwargs["sliding_window_tokens"],
         )
@@ -179,6 +186,7 @@ class HostMirrorStateSlabTest(unittest.TestCase):
     def setUp(self):
         try:
             import torch
+            from cache_pool_test_utils import plan_fields
 
             from tokenspeed.runtime.cache.host_mirror import (
                 HostMirror,
@@ -189,9 +197,6 @@ class HostMirrorStateSlabTest(unittest.TestCase):
             )
             from tokenspeed.runtime.layers.attention.kv_cache.mha import (
                 MHATokenToKVPool,
-            )
-            from tokenspeed.runtime.layers.attention.kv_cache.plan import (
-                plan_cache_fields,
             )
             from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen35 import (
                 qwen_gdn_cache_fields,
@@ -221,7 +226,7 @@ class HostMirrorStateSlabTest(unittest.TestCase):
             ssm_shape=self.SSM_SHAPE,
             ssm_element_size=2,
         )
-        self.lcm_plan = plan_cache_fields(
+        self.lcm_plan = plan_fields(
             fields,
             logical_block_tokens=4,
             budget_bytes=1280,

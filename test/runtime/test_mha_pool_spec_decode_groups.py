@@ -52,6 +52,8 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
             "rank": 0,
         }
         kwargs.update(overrides)
+        from cache_pool_test_utils import make_layer_group_ids
+
         kwargs["memory_plan"] = make_mha_memory_plan(
             size=kwargs["size"],
             page_size=kwargs["page_size"],
@@ -61,6 +63,14 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
             dtype=kwargs["dtype"],
             layer_types=kwargs.get("layer_types", ()),
             sliding_window_tokens=kwargs.get("sliding_window_tokens"),
+        )
+        kwargs.setdefault(
+            "layer_group_ids",
+            make_layer_group_ids(
+                layer_num=kwargs["layer_num"],
+                layer_types=kwargs.get("layer_types", ()),
+                sliding_window_tokens=kwargs.get("sliding_window_tokens"),
+            ),
         )
         return self.MHATokenToKVPool(**kwargs)
 

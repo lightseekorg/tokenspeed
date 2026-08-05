@@ -38,13 +38,11 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-_CONFIGS_DIR = (
-    pathlib.Path(__file__).resolve().parents[2]
-    / "python"
-    / "tokenspeed"
-    / "runtime"
-    / "configs"
+_RUNTIME_DIR = (
+    pathlib.Path(__file__).resolve().parents[2] / "python" / "tokenspeed" / "runtime"
 )
+_CONFIGS_DIR = _RUNTIME_DIR / "configs"
+_KV_CACHE_DIR = _RUNTIME_DIR / "layers" / "attention" / "kv_cache"
 
 # compute_paged_cache_group_page_counts lazily imports ceil_div from
 # tokenspeed.runtime.utils.common, whose package pulls torch/psutil. Prefer the
@@ -59,8 +57,8 @@ except Exception:
         sys.modules["tokenspeed.runtime.utils.common"] = _common
 
 
-def _load(mod_name: str, file_name: str):
-    spec = importlib.util.spec_from_file_location(mod_name, _CONFIGS_DIR / file_name)
+def _load(mod_name: str, file_path: pathlib.Path):
+    spec = importlib.util.spec_from_file_location(mod_name, file_path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     sys.modules[mod_name] = mod
@@ -68,9 +66,15 @@ def _load(mod_name: str, file_name: str):
     return mod
 
 
-_pcs = _load("paged_cache_spec_for_page_counts", "paged_cache_spec.py")
+# Register under the real name so publish.py's from-import binds THIS repo
+# file via the sys.modules short-circuit (no real package import).
+_pcs = _load(
+    "tokenspeed.runtime.configs.paged_cache_spec",
+    _CONFIGS_DIR / "paged_cache_spec.py",
+)
+_publish = _load("kv_cache_publish_for_page_counts", _KV_CACHE_DIR / "publish.py")
 compute_paged_cache_group_page_counts = _pcs.compute_paged_cache_group_page_counts
-group_specs_from_layer_types = _pcs.group_specs_from_layer_types
+group_specs_from_layer_types = _publish.group_specs_from_layer_types
 PagedCacheGroupSpec = _pcs.PagedCacheGroupSpec
 DUMMY = _pcs._PAGED_CACHE_GROUP_DUMMY_PAGES
 
@@ -159,7 +163,12 @@ class SuffixedGroupIdFlowTest(unittest.TestCase):
         ]
         windows = [None, 128, None, 4]
         specs = group_specs_from_layer_types(
-            layer_types=layer_types, page_size=64, sliding_window_tokens=windows
+            layer_types=layer_types,
+            group_ids=_publish.layer_group_ids(
+                layer_types=layer_types, sliding_window_tokens=windows
+            ),
+            page_size=64,
+            sliding_window_tokens=windows,
         )
         self.assertEqual(
             [s.group_id for s in specs],

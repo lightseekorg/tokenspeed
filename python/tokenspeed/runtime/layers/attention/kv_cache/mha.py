@@ -29,7 +29,8 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     store_sf_interleaved,
 )
 
-from tokenspeed.runtime.configs import paged_cache_spec
+from tokenspeed.runtime.configs.paged_cache_spec import PagedCacheGroupSpec
+from tokenspeed.runtime.layers.attention.kv_cache import publish
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 from tokenspeed.runtime.layers.attention.kv_cache.plan import CacheMemoryPlan
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
@@ -60,6 +61,7 @@ class MHATokenToKVPool(CachePool):
         *,
         memory_plan: CacheMemoryPlan,
         layer_types: tuple[str, ...] = (),
+        layer_group_ids: tuple[str, ...] = (),
         sliding_window_tokens: int | tuple[int | None, ...] | None = None,
         max_scheduled_tokens: int = 0,
         pd_disaggregation_enabled: bool = False,
@@ -105,6 +107,17 @@ class MHATokenToKVPool(CachePool):
             int(kv_alloc_head_count) if kv_alloc_head_count else None
         )
         self._layer_types = tuple(layer_types or ())
+        # Physical group id per layer, from the cache recipe
+        # (CachePoolSpec.layer_group_ids) — the single source the scheduler
+        # groups are published from.
+        self.layer_cache_group_ids = tuple(layer_group_ids)
+        if len(self.layer_cache_group_ids) != layer_num:
+            raise ValueError(
+                f"layer_group_ids has {len(self.layer_cache_group_ids)} "
+                f"entries but the pool has {layer_num} layers; the cache "
+                "recipe must supply one group id per layer "
+                "(CachePoolSpec.layer_group_ids)"
+            )
         self._sliding_window_tokens = sliding_window_tokens
         self._pd_disaggregation_enabled = pd_disaggregation_enabled
         self._create_buffers()
@@ -116,7 +129,7 @@ class MHATokenToKVPool(CachePool):
             v_size / GB,
         )
 
-        # Publication rule lives in paged_cache_spec.publish_paged_cache_groups
+        # Publication rule lives in publish.publish_paged_cache_groups
         # (module-attr call so tests can patch the scheduler probe at call time).
         published = self._publish_paged_cache_groups(
             layer_types=self._layer_types,
@@ -144,14 +157,15 @@ class MHATokenToKVPool(CachePool):
         sliding_window_tokens: int | Sequence[int | None] | None,
         page_size: int,
         page_sizes: Mapping[str, int] | None,
-        extra_groups: Sequence[paged_cache_spec.PagedCacheGroupSpec],
+        extra_groups: Sequence[PagedCacheGroupSpec],
         max_live_requests: int,
         max_scheduled_tokens: int,
         max_total_tokens: int,
         max_context_len: int,
-    ) -> tuple[list[paged_cache_spec.PagedCacheGroupSpec], dict[str, int]] | None:
-        return paged_cache_spec.publish_paged_cache_groups(
+    ) -> tuple[list[PagedCacheGroupSpec], dict[str, int]] | None:
+        return publish.publish_paged_cache_groups(
             layer_types=layer_types,
+            group_ids=self.layer_cache_group_ids,
             sliding_window_tokens=sliding_window_tokens,
             page_size=page_size,
             page_sizes=page_sizes,
@@ -193,7 +207,7 @@ class MHATokenToKVPool(CachePool):
         if not self._layer_types:
             return ("full_attention",) * self.layer_num
         group_ids = tuple(
-            paged_cache_spec.layer_group_ids(
+            publish.layer_group_ids(
                 layer_types=self._layer_types,
                 sliding_window_tokens=self._sliding_window_tokens,
             )

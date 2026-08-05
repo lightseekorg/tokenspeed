@@ -28,10 +28,14 @@ from dataclasses import replace
 import numpy as np
 import torch
 
-from tokenspeed.runtime.configs import paged_cache_spec
 from tokenspeed.runtime.configs.cache_runtime import (
     PagedCacheRuntimeContract,
 )
+from tokenspeed.runtime.configs.paged_cache_spec import (
+    STATE_LAYER_TYPES,
+    PagedCacheGroupSpec,
+)
+from tokenspeed.runtime.layers.attention.kv_cache import publish
 from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.plan import CacheMemoryPlan
 
@@ -52,8 +56,8 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
         **kwargs,
     ):
         self._layer_types = tuple(layer_types)
-        self.layer_cache_group_ids = tuple(layer_group_ids)
-        self._group_ids_by_layer = dict(enumerate(self.layer_cache_group_ids))
+        group_ids = tuple(layer_group_ids)
+        self._group_ids_by_layer = dict(enumerate(group_ids))
         self._token_capacity = (
             token_capacity if token_capacity is not None else kwargs["size"]
         )
@@ -65,12 +69,13 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
         layer_num = kwargs["layer_num"]
         if len(self._layer_types) != layer_num:
             raise ValueError("cache layer types must cover every model layer")
-        if len(self.layer_cache_group_ids) != layer_num:
+        if len(group_ids) != layer_num:
             raise ValueError("cache group ids must cover every model layer")
 
         super().__init__(
             max_scheduled_tokens=max_scheduled_tokens,
             memory_plan=memory_plan,
+            layer_group_ids=group_ids,
             **kwargs,
         )
         self.runtime_contract = PagedCacheRuntimeContract(
@@ -88,8 +93,8 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
         max_scheduled_tokens: int,
         max_total_tokens: int,
         max_context_len: int,
-    ) -> tuple[list[paged_cache_spec.PagedCacheGroupSpec], dict[str, int]]:
-        published = paged_cache_spec.publish_paged_cache_groups(
+    ) -> tuple[list[PagedCacheGroupSpec], dict[str, int]]:
+        published = publish.publish_paged_cache_groups(
             layer_types=self._layer_types,
             group_ids=self.layer_cache_group_ids,
             sliding_window_tokens=None,
@@ -142,7 +147,7 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
             )
         self.kv_buffer = [None] * self.layer_num
         for layer_id, label in enumerate(self._layer_types):
-            if label in paged_cache_spec.STATE_LAYER_TYPES:
+            if label in STATE_LAYER_TYPES:
                 conv_id = f"layer.{layer_id}.conv_state"
                 recurrent_id = f"layer.{layer_id}.recurrent_state"
                 try:

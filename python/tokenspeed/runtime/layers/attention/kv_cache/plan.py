@@ -41,26 +41,6 @@ class CacheGroupLayout:
 
 
 @dataclass(frozen=True)
-class CacheFieldSpec:
-    group_id: str
-    field_id: str
-    plane_id: str
-    shape: tuple[int, ...]
-    element_size: int
-    # True when the field's kernel walks pages by an implicit payload-sized
-    # stride. False when the kernel consumes the tensor's runtime stride.
-    exact_page_stride: bool = True
-    # Some kernels accept padded pages but still require the runtime page
-    # stride to satisfy an alignment constraint (for example, a TMA row
-    # stride). The planner applies this in bytes after group packing.
-    page_stride_alignment_bytes: int = 1
-
-    @property
-    def payload_bytes(self) -> int:
-        return math.prod(self.shape) * self.element_size
-
-
-@dataclass(frozen=True)
 class CachePlaneLayout:
     plane_id: str
     bytes_per_lcm_block: int
@@ -76,6 +56,63 @@ class CacheFieldLayout:
     element_size: int
     field_offset_bytes: int
     page_stride_bytes: int
+
+    @property
+    def payload_bytes(self) -> int:
+        return math.prod(self.shape) * self.element_size
+
+
+@dataclass(frozen=True)
+class CacheMemoryPlan:
+    """Static byte geometry for one shared physical LCM arena.
+
+    ``num_lcm_blocks`` excludes the null parent. ``arena_bytes`` includes it.
+    """
+
+    logical_block_tokens: int
+    lcm_block_bytes: int
+    num_lcm_blocks: int
+    groups: tuple[CacheGroupLayout, ...]
+    planes: tuple[CachePlaneLayout, ...] = ()
+    fields: tuple[CacheFieldLayout, ...] = ()
+
+    @property
+    def arena_bytes(self) -> int:
+        return (self.num_lcm_blocks + 1) * self.lcm_block_bytes
+
+    def group(self, group_id: str) -> CacheGroupLayout:
+        for group in self.groups:
+            if group.group_id == group_id:
+                return group
+        raise KeyError(group_id)
+
+    def field(self, field_id: str) -> CacheFieldLayout:
+        for field in self.fields:
+            if field.field_id == field_id:
+                return field
+        raise KeyError(field_id)
+
+    def plane(self, plane_id: str) -> CachePlaneLayout:
+        for plane in self.planes:
+            if plane.plane_id == plane_id:
+                return plane
+        raise KeyError(plane_id)
+
+
+@dataclass(frozen=True)
+class CacheFieldSpec:
+    group_id: str
+    field_id: str
+    plane_id: str
+    shape: tuple[int, ...]
+    element_size: int
+    # True when the field's kernel walks pages by an implicit payload-sized
+    # stride. False when the kernel consumes the tensor's runtime stride.
+    exact_page_stride: bool = True
+    # Some kernels accept padded pages but still require the runtime page
+    # stride to satisfy an alignment constraint (for example, a TMA row
+    # stride). The planner applies this in bytes after group packing.
+    page_stride_alignment_bytes: int = 1
 
     @property
     def payload_bytes(self) -> int:
@@ -135,43 +172,6 @@ class CacheLayout:
             planes=tuple(planes),
             fields=self.fields,
         )
-
-
-@dataclass(frozen=True)
-class CacheMemoryPlan:
-    """Static byte geometry for one shared physical LCM arena.
-
-    ``num_lcm_blocks`` excludes the null parent. ``arena_bytes`` includes it.
-    """
-
-    logical_block_tokens: int
-    lcm_block_bytes: int
-    num_lcm_blocks: int
-    groups: tuple[CacheGroupLayout, ...]
-    planes: tuple[CachePlaneLayout, ...] = ()
-    fields: tuple[CacheFieldLayout, ...] = ()
-
-    @property
-    def arena_bytes(self) -> int:
-        return (self.num_lcm_blocks + 1) * self.lcm_block_bytes
-
-    def group(self, group_id: str) -> CacheGroupLayout:
-        for group in self.groups:
-            if group.group_id == group_id:
-                return group
-        raise KeyError(group_id)
-
-    def field(self, field_id: str) -> CacheFieldLayout:
-        for field in self.fields:
-            if field.field_id == field_id:
-                return field
-        raise KeyError(field_id)
-
-    def plane(self, plane_id: str) -> CachePlaneLayout:
-        for plane in self.planes:
-            if plane.plane_id == plane_id:
-                return plane
-        raise KeyError(plane_id)
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -494,44 +494,3 @@ def solve_cache_layout(
         ),
         fields=tuple(field_layouts),
     )
-
-
-def plan_cache_fields(
-    fields,
-    *,
-    logical_block_tokens,
-    budget_bytes=None,
-    num_lcm_blocks=None,
-    cache_blocks_per_lcm_block: Mapping[str, int] | None = None,
-    alignment=1,
-    max_padding_fraction=0.25,
-):
-    """Solve an LCM layout and bind it to the requested cache capacity."""
-    if (budget_bytes is None) == (num_lcm_blocks is None):
-        raise ValueError(
-            "exactly one of budget_bytes and num_lcm_blocks must be provided"
-        )
-    if budget_bytes is not None and (
-        isinstance(budget_bytes, bool) or budget_bytes < 0
-    ):
-        raise ValueError("budget_bytes must be >= 0")
-    if num_lcm_blocks is not None and (
-        isinstance(num_lcm_blocks, bool)
-        or not isinstance(num_lcm_blocks, int)
-        or num_lcm_blocks < 1
-    ):
-        raise ValueError("num_lcm_blocks must be a positive integer")
-
-    layout = solve_cache_layout(
-        fields,
-        logical_block_tokens=logical_block_tokens,
-        cache_blocks_per_lcm_block=cache_blocks_per_lcm_block,
-        alignment=alignment,
-        max_padding_fraction=max_padding_fraction,
-    )
-    if budget_bytes is not None:
-        # Parent 0 backs logical null page 0 and is never schedulable.
-        num_lcm_blocks = budget_bytes // layout.lcm_block_bytes - 1
-        if num_lcm_blocks < 1:
-            raise ValueError("budget must hold a null parent and one usable LCM block")
-    return layout.with_num_lcm_blocks(num_lcm_blocks)

@@ -109,17 +109,15 @@ def _chain_next_sitecustomize():
 _chain_next_sitecustomize()
 
 if os.environ.get("TOKENSPEED_FORCE_LEGACY_KV_LAYOUT") == "1":
-    # Both consumers bind hybrid_slab_group_size by from-import at module
-    # top, so the defining module alone is not enough: patch every consumer
-    # namespace once it appears in sys.modules. Re-assert on EVERY hook
-    # fire rather than mark-and-skip: a module is registered in sys.modules
-    # while its body is still executing, so an early patch (fired by one of
-    # the module's own imports) is silently overwritten when its
-    # from-import line runs -- only a later re-assert survives.
+    # The only consumer (recipes/ordinary.py) binds hybrid_slab_group_size
+    # by a function-local from-import at call time, so patching the defining
+    # publish module is enough. Re-assert on EVERY hook fire rather than
+    # mark-and-skip: a module is registered in sys.modules while its body is
+    # still executing, so an early patch (fired by one of the module's own
+    # imports) is silently overwritten when its from-import line runs --
+    # only a later re-assert survives.
     _TARGETS = (
-        "tokenspeed.runtime.configs.paged_cache_spec",
-        "tokenspeed.runtime.layers.attention.registry",
-        "tokenspeed.runtime.layers.attention.kv_cache.mha",
+        "tokenspeed.runtime.layers.attention.kv_cache.publish",
     )
 
     def _null_predicate(*a, **k):

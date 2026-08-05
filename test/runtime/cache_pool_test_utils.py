@@ -2,12 +2,49 @@ from __future__ import annotations
 
 import torch
 
-from tokenspeed.runtime.configs import paged_cache_spec
+from tokenspeed.runtime.layers.attention.kv_cache import publish
 from tokenspeed.runtime.layers.attention.kv_cache.plan import solve_cache_layout
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
     mha_cache_fields,
     mla_cache_fields,
 )
+
+
+def plan_fields(
+    fields,
+    *,
+    logical_block_tokens,
+    budget_bytes=None,
+    num_lcm_blocks=None,
+    **kwargs,
+):
+    """Solve a layout and bind capacity the way the recipes do."""
+    layout = solve_cache_layout(
+        fields,
+        logical_block_tokens=logical_block_tokens,
+        **kwargs,
+    )
+    if budget_bytes is not None:
+        # Parent 0 backs logical null page 0 and is never schedulable.
+        num_lcm_blocks = budget_bytes // layout.lcm_block_bytes - 1
+    return layout.with_num_lcm_blocks(num_lcm_blocks)
+
+
+def make_layer_group_ids(
+    *,
+    layer_num: int,
+    layer_types: tuple[str, ...] = (),
+    sliding_window_tokens: int | tuple[int | None, ...] | None = None,
+) -> tuple[str, ...]:
+    """Derive per-layer cache group ids the way the recipes do."""
+    if not layer_types:
+        return ("full_attention",) * layer_num
+    return tuple(
+        publish.layer_group_ids(
+            layer_types=layer_types,
+            sliding_window_tokens=sliding_window_tokens,
+        )
+    )
 
 
 def make_mha_memory_plan(
@@ -24,15 +61,10 @@ def make_mha_memory_plan(
 ):
     if size % page_size:
         raise ValueError("test pool size must be divisible by page_size")
-    group_ids = (
-        tuple(
-            paged_cache_spec.layer_group_ids(
-                layer_types=layer_types,
-                sliding_window_tokens=sliding_window_tokens,
-            )
-        )
-        if layer_types
-        else ("full_attention",) * layer_num
+    group_ids = make_layer_group_ids(
+        layer_num=layer_num,
+        layer_types=layer_types,
+        sliding_window_tokens=sliding_window_tokens,
     )
     fields = mha_cache_fields(
         layer_group_ids=group_ids,

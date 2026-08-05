@@ -27,7 +27,8 @@ from tokenspeed.runtime.cache.utils import (
     get_mla_kv_buffer_triton,
     set_mla_kv_buffer_triton,
 )
-from tokenspeed.runtime.configs import paged_cache_spec
+from tokenspeed.runtime.configs.paged_cache_spec import PagedCacheGroupSpec
+from tokenspeed.runtime.layers.attention.kv_cache import publish
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 from tokenspeed.runtime.layers.attention.kv_cache.plan import CacheMemoryPlan
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
@@ -64,6 +65,7 @@ class MLATokenToKVPool(CachePool):
         rank: int,
         *,
         memory_plan: CacheMemoryPlan,
+        layer_group_ids: tuple[str, ...] = (),
         max_scheduled_tokens: int = 0,
     ):
         super().__init__(
@@ -81,6 +83,17 @@ class MLATokenToKVPool(CachePool):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.layer_num = layer_num
         self.kv_cache_dim = kv_lora_rank + qk_rope_head_dim
+        # Physical group id per layer, from the cache recipe
+        # (CachePoolSpec.layer_group_ids) — the single source the scheduler
+        # groups are published from.
+        self.layer_cache_group_ids = tuple(layer_group_ids)
+        if len(self.layer_cache_group_ids) != layer_num:
+            raise ValueError(
+                f"layer_group_ids has {len(self.layer_cache_group_ids)} "
+                f"entries but the pool has {layer_num} layers; the cache "
+                "recipe must supply one group id per layer "
+                "(CachePoolSpec.layer_group_ids)"
+            )
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
@@ -103,9 +116,10 @@ class MLATokenToKVPool(CachePool):
         max_scheduled_tokens: int,
         max_total_tokens: int,
         max_context_len: int,
-    ) -> tuple[list[paged_cache_spec.PagedCacheGroupSpec], dict[str, int]]:
-        return paged_cache_spec.publish_paged_cache_groups(
+    ) -> tuple[list[PagedCacheGroupSpec], dict[str, int]]:
+        return publish.publish_paged_cache_groups(
             layer_types=(),
+            group_ids=self.layer_cache_group_ids,
             sliding_window_tokens=None,
             page_size=self.page_size,
             max_live_requests=max_live_requests,

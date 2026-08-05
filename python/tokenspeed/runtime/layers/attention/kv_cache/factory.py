@@ -1,5 +1,8 @@
 """Concrete cache-pool construction from a prepared cache spec."""
 
+from dataclasses import replace
+
+from tokenspeed.runtime.configs.cache_runtime import PagedCacheRuntimeContract
 from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
@@ -18,6 +21,58 @@ def create_cache_pool(
     enable_memory_saver: bool,
 ) -> CachePool:
     """Create the concrete compute interface for a prepared cache spec."""
+    pool = _construct_pool(
+        spec,
+        config,
+        num_layers=num_layers,
+        rank=rank,
+        enable_memory_saver=enable_memory_saver,
+    )
+    # Every pool must publish the scheduler contract (ModelExecutor fails fast
+    # otherwise). Hybrid pools build it themselves with pool-specific token
+    # capacities; for the ordinary pools derive it here from the prepared spec,
+    # the same way the merged Lcm* pool classes used to: the memory plan is the
+    # source of truth for per-group packing and page counts, so align the
+    # published specs/counts with it before building the contract.
+    if getattr(pool, "runtime_contract", None) is None and pool.paged_cache_group_specs:
+        plan_groups = {group.group_id: group for group in spec.memory_plan.groups}
+        aligned_specs = tuple(
+            (
+                replace(
+                    group_spec,
+                    cache_blocks_per_lcm_block=plan_groups[
+                        group_spec.group_id
+                    ].cache_blocks_per_lcm_block,
+                )
+                if group_spec.group_id in plan_groups
+                else group_spec
+            )
+            for group_spec in pool.paged_cache_group_specs
+        )
+        counts = dict(pool.paged_cache_group_page_counts)
+        counts.update(
+            {group.group_id: group.page_count for group in spec.memory_plan.groups}
+        )
+        pool.paged_cache_group_specs = aligned_specs
+        pool.paged_cache_group_page_counts = counts
+        pool.runtime_contract = PagedCacheRuntimeContract(
+            block_size=pool.page_size,
+            num_lcm_blocks=spec.memory_plan.num_lcm_blocks,
+            token_capacity=spec.token_capacity,
+            group_specs=aligned_specs,
+            group_page_counts=counts,
+        )
+    return pool
+
+
+def _construct_pool(
+    spec: CachePoolSpec,
+    config: BaseAttnConfig,
+    *,
+    num_layers: int,
+    rank: int,
+    enable_memory_saver: bool,
+) -> CachePool:
     plan = spec.memory_plan
     if spec.family == "deepseek_v4":
         from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
@@ -66,6 +121,7 @@ def create_cache_pool(
             rank=rank,
             index_head_dim=config.index_head_dim,
             memory_plan=plan,
+            layer_group_ids=spec.layer_group_ids,
         )
     if isinstance(config, MSAConfig):
         from tokenspeed.runtime.layers.attention.kv_cache.msa import (
@@ -88,6 +144,7 @@ def create_cache_pool(
             index_dtype=config.dtype,
             indexed_layer_ids=config.sparse_layer_ids,
             layer_types=spec.layer_types,
+            layer_group_ids=spec.layer_group_ids,
             sliding_window_tokens=config.sliding_window_tokens,
             max_scheduled_tokens=config.max_scheduled_tokens,
             pd_disaggregation_enabled=config.pd_disaggregation_enabled,
@@ -116,6 +173,7 @@ def create_cache_pool(
                 page_size=plan.logical_block_tokens,
                 rank=rank,
                 layer_types=spec.layer_types,
+                layer_group_ids=spec.layer_group_ids,
                 sliding_window_tokens=config.sliding_window_tokens,
                 max_scheduled_tokens=config.max_scheduled_tokens,
                 pd_disaggregation_enabled=config.pd_disaggregation_enabled,
@@ -194,6 +252,7 @@ def create_cache_pool(
                 rank=rank,
                 max_scheduled_tokens=config.max_scheduled_tokens,
                 memory_plan=plan,
+                layer_group_ids=spec.layer_group_ids,
             )
 
         if spec.family != "kimi_k3":
