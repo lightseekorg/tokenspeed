@@ -98,7 +98,6 @@ PACKAGE_LIST = [
     "tokenspeed-smg-grpc-proto",
     "tokenspeed-smg-grpc-servicer",
     "tokenspeed-triton",
-    "tokenspeed-triton-kernels",
     "tokenspeed-trtllm-kernel",
     "torch",
     "torch_memory_saver",

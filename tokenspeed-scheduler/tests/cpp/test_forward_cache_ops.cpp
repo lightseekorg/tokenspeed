@@ -531,14 +531,6 @@ TEST(MakeSpecsFromConfigTest, PagedCacheGroupConfigRejectsNonPositivePacking) {
     EXPECT_THROW(group.Validate(), std::invalid_argument);
 }
 
-TEST(MakeSpecsFromConfigTest, RejectsLegacyPerGroupLogicalPThatDiffersFromGlobalP) {
-    SchedulerConfig config;
-    config.block_size = 128;
-    config.paged_cache_groups.resize(1);
-    config.paged_cache_groups[0].block_size = 1024;
-    EXPECT_THROW(MakeSpecsFromConfig(config), std::runtime_error);
-}
-
 TEST(ForwardCacheOpsBuildBlockTables, TwoGroupsRowsAndIds) {
     BlockPool pool(/*num_lcm_blocks=*/32);
     KvCacheCoordinator coordinator = MakeTwoGroup(pool);

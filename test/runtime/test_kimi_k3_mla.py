@@ -7,8 +7,8 @@ Coverage:
 - write-location oracles proving latent writes land at
   ``page_id * P + offset`` (decode, eager/chunked prefill, page boundaries);
 - decode and chunked-prefill numerical parity between the grouped-cache path and the
-  single-table req_to_page path, plus a naive fp32 reference;
-- proof the grouped-cache path never consumes req_to_page (poisoned tensors, and hard
+  single-table page_table path, plus a naive fp32 reference;
+- proof the grouped-cache path never consumes page_table (poisoned tensors, and hard
   errors when cache metadata goes missing after binding);
 - debug-gated rejection of null-page writes, out-of-capacity locations, and -1
   inside a live table range.
@@ -72,7 +72,7 @@ def _token_locs(pages: list[int], positions: torch.Tensor, page_size: int):
 
 
 def _kernel_page_table(logical_rows: list[list[int]], logical_page_size: int, device):
-    """Legacy req_to_page equivalent: each logical page as 24 kernel pages."""
+    """Legacy page_table equivalent: each logical page as 24 kernel pages."""
     ratio = logical_page_size // _KERNEL_PAGE
     rows = []
     for pages in logical_rows:
@@ -118,10 +118,7 @@ def test_pool_mla_views_are_no_copy_and_layer_gated() -> None:
     assert key.shape == ((2 * 12 + 1) * page_size, 1, _LATENT_DIM)
     assert key.dtype == torch.float8_e4m3fn
     assert key.data_ptr() == component.data_ptr()
-    assert (
-        key.untyped_storage().data_ptr()
-        == pool.lcm_pool.backing.untyped_storage().data_ptr()
-    )
+    assert key.untyped_storage().data_ptr() == pool.buffer.untyped_storage().data_ptr()
 
     value = pool.get_value_buffer(layer_id)
     assert value.shape[-1] == _KV_LORA_RANK
@@ -237,7 +234,9 @@ def backend_factory(cuda_env, gpu_pool):
             scaling=192**-0.5,
             kv_cache_dim=_LATENT_DIM,
         )
-        return backend_cls(config)
+        backend = backend_cls(config)
+        backend.set_cache_pool(gpu_pool)
+        return backend
 
     return make
 
@@ -271,7 +270,7 @@ def _init_cache_decode(backend, pool, logical_rows, seq_lens_cpu):
         req_pool_indices=_poison((bs,)).to(torch.int64),
         seq_lens=seq_lens,
         forward_mode=ForwardMode.DECODE,
-        req_to_page=_poison((16, 256)),
+        page_table=_poison((16, 256)),
         cache_metadata=metadata,
         forward_batch=forward_op,
     )
@@ -308,9 +307,9 @@ def test_decode_grouped_matches_single_table_and_reference(
         q, None, None, layer, None, pool, bs, save_kv_cache=False
     )
 
-    # Single-table arm: byte-equivalent kernel-page req_to_page.
+    # Single-table arm: byte-equivalent kernel-page page_table.
     single_table_backend = backend_factory()
-    req_to_page = _kernel_page_table(logical_rows, page_size, "cuda")
+    page_table = _kernel_page_table(logical_rows, page_size, "cuda")
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
     single_table_backend.init_forward_metadata(
@@ -319,10 +318,10 @@ def test_decode_grouped_matches_single_table_and_reference(
         req_pool_indices=torch.arange(bs, device="cuda", dtype=torch.int64),
         seq_lens=seq_lens,
         forward_mode=ForwardMode.DECODE,
-        req_to_page=req_to_page,
+        page_table=page_table,
     )
     single_table_md = single_table_backend.forward_decode_metadata
-    width = req_to_page.shape[1]
+    width = page_table.shape[1]
     assert torch.equal(
         grouped_md.block_kv_indices[:, :width],
         single_table_md.block_kv_indices[:, :width],
@@ -352,7 +351,7 @@ def test_decode_grouped_writes_land_at_group_locations(
     backend_factory, gpu_pool
 ) -> None:
     """forward_decode(save_kv_cache=True) writes via grouped locationations, not the
-    caller's req_to_page-derived out_cache_loc."""
+    caller's page_table-derived out_cache_loc."""
     pool = gpu_pool
     page_size = pool.page_size
     layer = _fake_layer(_mla_layer_id(pool))
@@ -401,7 +400,7 @@ def _init_prefill(backend, pool, logical_rows, prefix, extend, *, grouped: bool)
         metadata, forward_op = _metadata_for(pool, table_np, "cuda")
         backend.init_forward_metadata(
             req_pool_indices=_poison((bs,)).to(torch.int64),
-            req_to_page=_poison((16, 256)),
+            page_table=_poison((16, 256)),
             cache_metadata=metadata,
             forward_batch=forward_op,
             **kwargs,
@@ -409,7 +408,7 @@ def _init_prefill(backend, pool, logical_rows, prefix, extend, *, grouped: bool)
     else:
         backend.init_forward_metadata(
             req_pool_indices=torch.arange(bs, device="cuda", dtype=torch.int64),
-            req_to_page=_kernel_page_table(logical_rows, pool.page_size, "cuda"),
+            page_table=_kernel_page_table(logical_rows, pool.page_size, "cuda"),
             **kwargs,
         )
     return seq_lens
@@ -448,7 +447,7 @@ def test_chunked_prefill_grouped_matches_single_table_and_reference(
             expected.append(pages[pos // page_size] * page_size + pos % page_size)
     assert locs.tolist() == expected
 
-    # Chunked-prefill metadata parity with the single-table req_to_page build.
+    # Chunked-prefill metadata parity with the single-table page_table build.
     grouped_cm = grouped_backend.chunked_prefill_metadata
     single_table_cm = single_table_backend.chunked_prefill_metadata
     assert grouped_cm.chunked_loop_num == single_table_cm.chunked_loop_num
@@ -553,9 +552,9 @@ def test_chunked_prefill_grouped_matches_single_table_and_reference(
 
 
 @requires_cuda
-def test_path_never_reads_req_to_page(backend_factory, gpu_pool) -> None:
-    """Same batch, three req_to_page flavors (real, poisoned, None): the flat
-    metadata is identical, proving req_to_page is never consumed."""
+def test_path_never_reads_page_table(backend_factory, gpu_pool) -> None:
+    """Same batch, three page_table flavors (real, poisoned, None): the flat
+    metadata is identical, proving page_table is never consumed."""
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
     pool = gpu_pool
@@ -565,7 +564,7 @@ def test_path_never_reads_req_to_page(backend_factory, gpu_pool) -> None:
     backend = backend_factory()
 
     results = []
-    for req_to_page in (
+    for page_table in (
         _kernel_page_table(logical_rows, page_size, "cuda"),
         _poison((16, 256)),
         None,
@@ -578,7 +577,7 @@ def test_path_never_reads_req_to_page(backend_factory, gpu_pool) -> None:
             req_pool_indices=_poison((2,)).to(torch.int64),
             seq_lens=torch.tensor(seq_lens_cpu, device="cuda", dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
-            req_to_page=req_to_page,
+            page_table=page_table,
             cache_metadata=metadata,
             forward_batch=forward_op,
         )

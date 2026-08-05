@@ -468,7 +468,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             hidden_states
         )
 
-        if self.num_v_heads // self.num_k_heads in [1, 2, 4]:
+        if self.num_v_heads % self.num_k_heads == 0:
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
                 projected_states_qkvz,
                 projected_states_ba,
@@ -1806,26 +1806,6 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
         + i_qk * HEAD_QK
         + tl.arange(0, HEAD_QK)
     )
-    # v for head group i_qk: in the all_v region
-    blk_v_ptr = (
-        mixed_qkvz
-        + i_bs * stride_qkvz
-        + TOTAL_Q
-        + TOTAL_K
-        + i_qk * V_PER_GROUP * HEAD_V
-        + tl.arange(0, V_PER_GROUP * HEAD_V)
-    )
-    # z for head group i_qk: in the all_z region
-    blk_z_ptr = (
-        mixed_qkvz
-        + i_bs * stride_qkvz
-        + TOTAL_Q
-        + TOTAL_K
-        + TOTAL_V
-        + i_qk * V_PER_GROUP * HEAD_V
-        + tl.arange(0, V_PER_GROUP * HEAD_V)
-    )
-
     # ── Write to output (identical layout to the interleaved kernel) ──
     blk_q_st_ptr = mixed_qkv + i_bs * QKV_DIM_T + i_qk * HEAD_QK + tl.arange(0, HEAD_QK)
     blk_k_st_ptr = (
@@ -1835,24 +1815,60 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
         + i_qk * HEAD_QK
         + tl.arange(0, HEAD_QK)
     )
-    blk_v_st_ptr = (
-        mixed_qkv
-        + i_bs * QKV_DIM_T
-        + NUM_HEADS_QK * HEAD_QK * 2
-        + i_qk * V_PER_GROUP * HEAD_V
-        + tl.arange(0, V_PER_GROUP * HEAD_V)
-    )
-    blk_z_st_ptr = (
-        z
-        + i_bs * NUM_HEADS_V * HEAD_V
-        + i_qk * V_PER_GROUP * HEAD_V
-        + tl.arange(0, V_PER_GROUP * HEAD_V)
-    )
 
     tl.store(blk_q_st_ptr, tl.load(blk_q_ptr))
     tl.store(blk_k_st_ptr, tl.load(blk_k_ptr))
-    tl.store(blk_v_st_ptr, tl.load(blk_v_ptr))
-    tl.store(blk_z_st_ptr, tl.load(blk_z_ptr))
+
+    # Compile-time branch keeps the fast
+    # vectorized path for pow2 ratios and loops per head otherwise
+    IS_POW2: tl.constexpr = (V_PER_GROUP & (V_PER_GROUP - 1)) == 0
+
+    if IS_POW2:
+        blk_v_ptr = (
+            mixed_qkvz
+            + i_bs * stride_qkvz
+            + TOTAL_Q
+            + TOTAL_K
+            + i_qk * V_PER_GROUP * HEAD_V
+            + tl.arange(0, V_PER_GROUP * HEAD_V)
+        )
+        blk_z_ptr = (
+            mixed_qkvz
+            + i_bs * stride_qkvz
+            + TOTAL_Q
+            + TOTAL_K
+            + TOTAL_V
+            + i_qk * V_PER_GROUP * HEAD_V
+            + tl.arange(0, V_PER_GROUP * HEAD_V)
+        )
+        blk_v_st_ptr = (
+            mixed_qkv
+            + i_bs * QKV_DIM_T
+            + NUM_HEADS_QK * HEAD_QK * 2
+            + i_qk * V_PER_GROUP * HEAD_V
+            + tl.arange(0, V_PER_GROUP * HEAD_V)
+        )
+        blk_z_st_ptr = (
+            z
+            + i_bs * NUM_HEADS_V * HEAD_V
+            + i_qk * V_PER_GROUP * HEAD_V
+            + tl.arange(0, V_PER_GROUP * HEAD_V)
+        )
+        tl.store(blk_v_st_ptr, tl.load(blk_v_ptr))
+        tl.store(blk_z_st_ptr, tl.load(blk_z_ptr))
+    else:
+        for i in tl.static_range(V_PER_GROUP):
+            head_off = (i_qk * V_PER_GROUP + i) * HEAD_V + tl.arange(0, HEAD_V)
+            blk_v_ptr = mixed_qkvz + i_bs * stride_qkvz + TOTAL_Q + TOTAL_K + head_off
+            blk_z_ptr = (
+                mixed_qkvz + i_bs * stride_qkvz + TOTAL_Q + TOTAL_K + TOTAL_V + head_off
+            )
+            blk_v_st_ptr = (
+                mixed_qkv + i_bs * QKV_DIM_T + NUM_HEADS_QK * HEAD_QK * 2 + head_off
+            )
+            blk_z_st_ptr = z + i_bs * NUM_HEADS_V * HEAD_V + head_off
+            tl.store(blk_v_st_ptr, tl.load(blk_v_ptr))
+            tl.store(blk_z_st_ptr, tl.load(blk_z_ptr))
 
     # ── b and a ──
     for i in tl.static_range(V_PER_GROUP):

@@ -38,7 +38,6 @@ import torch
 from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
     LayerMappedKVPool,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
 
 
 class _RecordingInnerPool:
@@ -101,30 +100,3 @@ def test_set_mla_kv_buffer_noop_for_finite_input():
     assert sanitize is True
     assert got_nope is k_nope
     assert got_rope is k_rope
-
-
-def test_quantized_writer_honors_sanitize_request():
-    pool = object.__new__(MLATokenToKVPool)
-    pool.quant_method = "per_token_head"
-    pool.store_dtype = torch.uint8
-    pool.model_dtype = torch.bfloat16
-    pool.kv_buffer = [
-        (
-            torch.zeros(2, 1, 2, dtype=torch.uint8),
-            torch.zeros(2, 1, 1, dtype=torch.float32),
-            torch.zeros(2, 1, 1, dtype=torch.bfloat16),
-        )
-    ]
-
-    pool.set_mla_kv_buffer(
-        _Layer(0),
-        torch.tensor([1]),
-        torch.tensor([[[float("nan"), float("inf")]]], dtype=torch.bfloat16),
-        torch.tensor([[[-float("inf")]]], dtype=torch.bfloat16),
-        sanitize=True,
-    )
-
-    k_lora, scale, k_rope = pool.kv_buffer[0]
-    assert torch.isfinite(k_lora[1].view(torch.float8_e4m3fn).float()).all()
-    assert torch.isfinite(scale[1]).all()
-    assert torch.isfinite(k_rope[1]).all()

@@ -214,6 +214,9 @@ def test_msa_config_kv_cache_dtype_guards() -> None:
         )
 
 
+@pytest.mark.skipif(
+    torch.version.hip is not None, reason="FP8 MoE backends are NVIDIA-only"
+)
 def test_minimax_m3_tp4_meta_layout_and_loader(monkeypatch: pytest.MonkeyPatch) -> None:
     model = _build_model(monkeypatch, quant_config=_mxfp8_config())
 

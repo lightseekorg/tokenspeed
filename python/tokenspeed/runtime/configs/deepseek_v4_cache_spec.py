@@ -172,6 +172,38 @@ def parse_v4_compressor_state_group_id(group_id: str) -> int | None:
         return None
 
 
+def parse_v4_compressed_kv_group_id(group_id: str) -> int | None:
+    """Return the compress ratio of a ``v4.c{ratio}a.compressed_kv`` group id,
+    or ``None`` when the id is not a compressed-KV (full-history) group."""
+    prefix = "v4.c"
+    suffix = "a.compressed_kv"
+    if not group_id.startswith(prefix) or not group_id.endswith(suffix):
+        return None
+    ratio_text = group_id[len(prefix) : -len(suffix)]
+    try:
+        return int(ratio_text)
+    except ValueError:
+        return None
+
+
+def first_v4_compressed_kv_group_id(group_ids) -> str | None:
+    """Pick the smallest-ratio compressed-KV group id present in ``group_ids``.
+
+    Mirrors the executor's ``next(...)`` full-history selection (contract order
+    is ratio-ascending), so the base page table for ratio<=1 indexer layers
+    resolves to the same group whether it comes from cache metadata or a
+    capture-time block-tables dict.
+    """
+    ratios = {
+        parse_v4_compressed_kv_group_id(gid): gid
+        for gid in group_ids
+        if parse_v4_compressed_kv_group_id(gid) is not None
+    }
+    if not ratios:
+        return None
+    return ratios[min(ratios)]
+
+
 def _compressed_kernel_block_size(ratio: int) -> int:
     if ratio <= 1:
         raise ValueError(f"ratio must be > 1, got {ratio}")
@@ -290,7 +322,7 @@ def deepseek_v4_lcm_blocks_needed(
     if token_capacity <= 0:
         raise ValueError("token_capacity must be positive")
     for spec in specs:
-        cache_block_tokens = int(spec.rows_per_page) * int(spec.entry_stride_tokens)
+        cache_block_tokens = spec.cache_block_tokens
         if cache_block_tokens <= 0 or logical_block_tokens % cache_block_tokens:
             raise ValueError(
                 f"group {spec.group_id!r} cache block tokens must divide "
@@ -313,7 +345,7 @@ def deepseek_v4_lcm_blocks_needed(
     return parents
 
 
-def deepseek_v4_token_capacity_for_lcm_pool(
+def deepseek_v4_token_capacity_for_cache_pool(
     specs: Sequence[PagedCacheGroupSpec],
     *,
     logical_block_tokens: int,
@@ -386,7 +418,9 @@ __all__ = [
     "deepseek_v4_swa_row_bytes",
     "deepseek_v4_swa_scale_dim",
     "deepseek_v4_swa_token_stride",
-    "deepseek_v4_token_capacity_for_lcm_pool",
+    "deepseek_v4_token_capacity_for_cache_pool",
+    "first_v4_compressed_kv_group_id",
+    "parse_v4_compressed_kv_group_id",
     "parse_v4_compressor_state_group_id",
     "v4_compressed_kv_group_id",
     "v4_compressor_state_group_id",

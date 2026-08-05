@@ -4,22 +4,26 @@ from test.runtime.conftest import TP8_PAGE_SET_BYTES
 
 import torch
 
-from tokenspeed.runtime.configs.kimi_k3_cache_spec import (
-    kimi_k3_lcm_blocks_needed,
-    kimi_k3_token_capacity_for_lcm_pool,
-    plan_kimi_k3_lcm_cache,
-)
 from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
+    kimi_k3_lcm_blocks_needed,
+    kimi_k3_token_capacity_for_cache_pool,
+    solve_kimi_k3_cache_layout,
+)
+
+
+def _plan(num_lcm_blocks: int, *, tp_size: int = 8):
+    layout = solve_kimi_k3_cache_layout(
+        KimiLinearConfig(),
+        tp_size=tp_size,
+        mla_cache_dtype=torch.float8_e4m3fn,
+        mla_quant_method=None,
+    )
+    return layout.with_num_lcm_blocks(num_lcm_blocks)
 
 
 def test_lcm_reference_geometry_is_exact() -> None:
-    plan = plan_kimi_k3_lcm_cache(
-        KimiLinearConfig(),
-        tp_size=8,
-        mla_cache_dtype=torch.float8_e4m3fn,
-        mla_quant_method=None,
-        num_lcm_blocks=7,
-    )
+    plan = _plan(7)
 
     assert plan.logical_block_tokens == 128
     assert plan.lcm_block_bytes == TP8_PAGE_SET_BYTES
@@ -59,14 +63,7 @@ def test_lcm_reference_geometry_is_exact() -> None:
 
 def test_lcm_geometry_packs_two_kda_pages_at_tp16() -> None:
     """KDA state halves at TP16; two pages pack per MLA-sized plane."""
-    plan = plan_kimi_k3_lcm_cache(
-        KimiLinearConfig(),
-        flat_kvcache_enabled=True,
-        tp_size=16,
-        mla_cache_dtype=torch.float8_e4m3fn,
-        mla_quant_method=None,
-        num_lcm_blocks=7,
-    )
+    plan = _plan(7, tp_size=16)
 
     assert {
         group.group_id: group.cache_blocks_per_lcm_block for group in plan.groups
@@ -82,13 +79,7 @@ def test_lcm_geometry_packs_two_kda_pages_at_tp16() -> None:
 
 
 def test_lcm_parent_demand_uses_per_group_packing() -> None:
-    plan = plan_kimi_k3_lcm_cache(
-        KimiLinearConfig(),
-        tp_size=8,
-        mla_cache_dtype=torch.float8_e4m3fn,
-        mla_quant_method=None,
-        num_lcm_blocks=300,
-    )
+    plan = _plan(300)
     sizing = dict(
         max_scheduled_tokens=8_192,
         max_live_requests=1,
@@ -98,7 +89,7 @@ def test_lcm_parent_demand_uses_per_group_packing() -> None:
 
     assert kimi_k3_lcm_blocks_needed(plan, token_capacity=131_072, **sizing) == 284
     assert (
-        kimi_k3_token_capacity_for_lcm_pool(
+        kimi_k3_token_capacity_for_cache_pool(
             plan,
             num_lcm_blocks=284,
             upper_bound_tokens=131_072,
@@ -107,7 +98,7 @@ def test_lcm_parent_demand_uses_per_group_packing() -> None:
         == 131_072
     )
     assert (
-        kimi_k3_token_capacity_for_lcm_pool(
+        kimi_k3_token_capacity_for_cache_pool(
             plan,
             num_lcm_blocks=283,
             upper_bound_tokens=131_072,

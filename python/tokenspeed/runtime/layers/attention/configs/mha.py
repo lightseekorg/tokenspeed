@@ -30,7 +30,6 @@ from tokenspeed.runtime.layers.attention.configs.base import (
     BaseAttnConfig,
     resolve_dtype,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
@@ -41,8 +40,8 @@ class MHAConfig(BaseAttnConfig):
     layer_types: tuple[str, ...] = ()
     sliding_window_tokens: int | tuple[int | None, ...] | None = None
     max_scheduled_tokens: int = 0
-    # True iff server_args.disaggregation_mode != "null"; the pool's slab
-    # guards consume it.
+    # True iff server_args.disaggregation_mode != "null"; used to reject
+    # layouts whose aliased fields cannot use legacy per-layer transfers.
     pd_disaggregation_enabled: bool = False
     # Extra model-declared paged-cache groups (e.g. Inkling paged sconv); forwarded to publication
     extra_paged_groups: tuple[PagedCacheGroupSpec, ...] = ()
@@ -127,48 +126,3 @@ class MHAConfig(BaseAttnConfig):
             # One UE8M0 byte per 32 fp8 data bytes.
             cell += cell // 32
         return cell
-
-    def create_pool(
-        self,
-        num_layers: int,
-        max_total_num_tokens: int,
-        rank: int,
-        enable_memory_saver: bool,
-    ) -> BaseTokenToKVPool:
-        if self.kv_cache_mxfp8:
-            assert self.page_size == 128, (
-                "mxfp8 KV cache requires --block-size 128 (the attention "
-                "kernel consumes the interleaved paged scale layout)"
-            )
-
-        from tokenspeed.runtime.layers.attention.kv_cache.mha import (
-            MHATokenToKVPool,
-            MHATokenToKVPoolMXFP8,
-        )
-
-        pool_cls = MHATokenToKVPoolMXFP8 if self.kv_cache_mxfp8 else MHATokenToKVPool
-
-        return pool_cls(
-            size=max_total_num_tokens,
-            dtype=self.kv_cache_dtype,
-            head_num=max(self.num_kv_heads // self.attn_tp_size, 1),
-            head_dim=self.head_dim,
-            layer_num=num_layers,
-            device=self.device,
-            enable_memory_saver=enable_memory_saver,
-            max_batch_size=self.max_bs,
-            max_context_len=self.context_len,
-            page_size=self.page_size,
-            rank=rank,
-            layer_types=self.layer_types,
-            sliding_window_tokens=self.sliding_window_tokens,
-            max_scheduled_tokens=self.max_scheduled_tokens,
-            pd_disaggregation_enabled=self.pd_disaggregation_enabled,
-            extra_paged_groups=self.extra_paged_groups,
-            slot_tokens=self.slot_tokens,
-            group_page_sizes=self.group_page_sizes,
-            layer_kv_head_counts=self.layer_kv_head_counts,
-            # Pre-TP width the slab rows are allocated at (head_num is its
-            # per-rank shard) — the per-layer view normalization base.
-            kv_alloc_head_count=self.num_kv_heads,
-        )

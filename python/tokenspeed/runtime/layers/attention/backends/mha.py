@@ -182,7 +182,7 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         num_extends: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        req_to_page: torch.Tensor,
+        page_table: torch.Tensor,
         forward_mode: ForwardMode,
         # Only consumed on the extend/mixed path; decode callers (e.g. the
         # DFLASH draft and the cuda-graph wrapper's draft decode init) omit
@@ -241,7 +241,7 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         else:
             page_table = build_page_table(
                 req_pool_indices[:bs],
-                req_to_page,
+                page_table,
                 self.page_size,
                 self.max_context_len,
             )
@@ -435,7 +435,7 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        req_to_page: torch.Tensor,
+        page_table: torch.Tensor,
         forward_mode: ForwardMode,
         block_tables: dict[str, torch.Tensor] | None = None,
         **kwargs,
@@ -449,7 +449,7 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         # table (cuda_graph_page_table) would be dead work there.
         if not self.cuda_graph_page_tables:
             gather_page_table_with_padding(
-                req_to_page=req_to_page,
+                page_table=page_table,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 out=self.cuda_graph_page_table,
@@ -467,10 +467,12 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             )
         elif self.draft_block_decode:
             # DFLASH draft: replicate each request's page table to its
-            # spec_num_tokens block rows. The block-end seq_lens are filled by
-            # the drafter inside the captured graph, so they are not touched
-            # here (they re-derive from the live draft length on every replay).
-            base_page_table = req_to_page[req_pool_indices[:bs], : self.max_num_pages]
+            # spec_num_tokens block rows. The drafter's page table is
+            # batch-ordered (row i == batch position i). The block-end seq_lens
+            # are filled by the drafter inside the captured graph, so they are
+            # not touched here (they re-derive from the live draft length on
+            # every replay).
+            base_page_table = page_table[:bs, : self.max_num_pages]
             self.cuda_graph_page_table[: bs * self.spec_num_tokens, :].view(
                 bs, self.spec_num_tokens, self.max_num_pages
             ).copy_(base_page_table[:, None, :])

@@ -3,17 +3,17 @@ from __future__ import annotations
 import pytest
 import torch
 
-from tokenspeed.runtime.configs.kimi_k3_cache_spec import (
-    kimi_k3_layer_group_ids,
-    plan_kimi_k3_lcm_cache,
-)
 from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
 from tokenspeed.runtime.configs.paged_cache_spec import (
     FULL_ATTENTION,
     LINEAR_ATTENTION,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.lcm_mla import (
-    LcmMLATokenToKVPool,
+from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
+    HybridKDATokenToKVPool,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
+    kimi_k3_layer_group_ids,
+    solve_kimi_k3_cache_layout,
 )
 
 
@@ -21,13 +21,13 @@ from tokenspeed.runtime.layers.attention.kv_cache.lcm_mla import (
 def test_kimi_k3_pool_binds_mla_and_kda_to_one_lcm_backing() -> None:
     text_config = KimiLinearConfig()
     num_lcm_blocks = 2
-    plan = plan_kimi_k3_lcm_cache(
+    layout = solve_kimi_k3_cache_layout(
         text_config,
         tp_size=8,
         mla_cache_dtype=torch.float8_e4m3fn,
         mla_quant_method=None,
-        num_lcm_blocks=num_lcm_blocks,
     )
+    plan = layout.with_num_lcm_blocks(num_lcm_blocks)
     group_ids = kimi_k3_layer_group_ids(text_config)
     layer_types = tuple(
         FULL_ATTENTION if group_id == FULL_ATTENTION else LINEAR_ATTENTION
@@ -44,7 +44,7 @@ def test_kimi_k3_pool_binds_mla_and_kda_to_one_lcm_backing() -> None:
         linear["head_dim"],
         linear["head_dim"],
     )
-    pool = LcmMLATokenToKVPool(
+    pool = HybridKDATokenToKVPool(
         size=num_lcm_blocks * 12 * plan.logical_block_tokens,
         model_dtype=torch.bfloat16,
         dtype=torch.float8_e4m3fn,
@@ -100,7 +100,7 @@ def test_kimi_k3_pool_binds_mla_and_kda_to_one_lcm_backing() -> None:
     )
     assert (
         pool.kv_buffer[full_layer].untyped_storage().data_ptr()
-        == pool.lcm_pool.backing.untyped_storage().data_ptr()
+        == pool.buffer.untyped_storage().data_ptr()
     )
     conv, recurrent = pool.get_state_buffers(state_layer)
     assert tuple(conv.shape[1:]) == conv_shape
@@ -108,5 +108,5 @@ def test_kimi_k3_pool_binds_mla_and_kda_to_one_lcm_backing() -> None:
     assert (
         conv.untyped_storage().data_ptr()
         == recurrent.untyped_storage().data_ptr()
-        == pool.lcm_pool.backing.untyped_storage().data_ptr()
+        == pool.buffer.untyped_storage().data_ptr()
     )
