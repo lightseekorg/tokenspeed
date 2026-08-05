@@ -86,7 +86,7 @@ if current_platform().is_amd:
         gluon_mla_decode_fp8xfp8_gfx950 as _mla_decode_fp8xfp8_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.mla.prefill import (
-        gluon_mla_prefill_bf16_gfx950 as _mla_prefill_impl,
+        gluon_mla_prefill_gfx950 as _mla_prefill_gfx950_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.rmha.decode import (
         gluon_rel_mha_decode_gfx950 as _rel_decode_impl,
@@ -630,7 +630,7 @@ if current_platform().is_amd:
     @register_kernel(
         "attention",
         "mla_prefill",
-        name="gluon_mla_prefill_bf16_gfx950",
+        name="gluon_mla_prefill_gfx950",
         solution="gluon",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 5),
@@ -640,7 +640,7 @@ if current_platform().is_amd:
         signatures=format_signatures(
             ("q", "k", "v"),
             "dense",
-            {torch.bfloat16},
+            {torch.bfloat16, torch.float8_e4m3fn},
         ),
         priority=Priority.SPECIALIZED,
         traits={
@@ -651,8 +651,8 @@ if current_platform().is_amd:
             "return_lse": frozenset({False, True}),
         },
     )
-    def gluon_mla_prefill_bf16_gfx950(*args, **kwargs):
-        return _mla_prefill_impl(*args, **kwargs)
+    def gluon_mla_prefill_gfx950(*args, **kwargs):
+        return _mla_prefill_gfx950_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",

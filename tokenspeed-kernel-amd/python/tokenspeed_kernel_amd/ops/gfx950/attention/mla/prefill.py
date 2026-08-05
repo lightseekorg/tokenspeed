@@ -60,6 +60,7 @@ class AttentionConfig:
     BATCH_SIZE: gl.constexpr
     NUM_XCDS: gl.constexpr
     NUM_BLOCKS: gl.constexpr
+    IS_FP8: gl.constexpr
     q_strides: InputStrides
     k_strides: InputStrides
     v_strides: InputStrides
@@ -94,6 +95,8 @@ class AttentionConfig:
         BLOCK_N,
         NUM_WARPS,
         BATCH_SIZE,
+        IS_FP8,
+        KV_DTYPE,
         q_strides,
         k_strides,
         v_strides,
@@ -119,13 +122,13 @@ class AttentionConfig:
         ) = attention_layouts(
             HEAD_DIM,
             BLOCK_N,
-            is_fp8=False,
-            dtype=gl.bfloat16,
+            IS_FP8,
+            KV_DTYPE,
             num_warps=NUM_WARPS,
             instr_shape=[32, 32, 16],
         )
-        # RoPE uses the same 128-bit bf16 load width as the content path.
-        load_vec = 8
+        # RoPE uses the same 128-bit load width as the content path.
+        load_vec = 16 if IS_FP8 else 8
         load_pe_threads = ROPE_DIM // load_vec
         load_pe_layout = gl.BlockedLayout(
             [1, load_vec],
@@ -136,7 +139,7 @@ class AttentionConfig:
         # RoPE K smem padding, derived from the built-in like the content K/V.
         # The RoPE K dot operand reuses the NoPE k_layout, so pass it here too.
         k_pe_smem_layout = padded_shared_layout(
-            k_layout, [BLOCK_N, ROPE_DIM], gl.bfloat16, is_k_contig=True
+            k_layout, [BLOCK_N, ROPE_DIM], KV_DTYPE, is_k_contig=True
         )
 
         self.N_HEADS = gl.constexpr(N_HEADS)
@@ -152,6 +155,7 @@ class AttentionConfig:
         self.BATCH_SIZE = gl.constexpr(BATCH_SIZE)
         self.NUM_XCDS = gl.constexpr(8)
         self.NUM_BLOCKS = gl.constexpr(512)
+        self.IS_FP8 = gl.constexpr(IS_FP8)
         self.q_strides = q_strides
         self.k_strides = k_strides
         self.v_strides = v_strides
@@ -836,6 +840,7 @@ def _mla_prefill_kernel(
     NUM_WARPS: gl.constexpr,
     BATCH_SIZE: gl.constexpr,
     max_seqlen_q,
+    IS_FP8: gl.constexpr,
 ):
     cfg = AttentionConfig(
         N_HEADS,
@@ -849,6 +854,8 @@ def _mla_prefill_kernel(
         BLOCK_N,
         NUM_WARPS,
         BATCH_SIZE,
+        IS_FP8,
+        k_ptr.dtype.element_ty,
         InputStrides(Q_STRIDE_T, Q_STRIDE_H, 1),
         InputStrides(K_STRIDE_T, K_STRIDE_H, 1),
         InputStrides(V_STRIDE_T, V_STRIDE_H, 1),
@@ -920,7 +927,7 @@ def get_config(*, q: torch.Tensor, k: torch.Tensor) -> LaunchConfig:
     )
 
 
-def gluon_mla_prefill_bf16_gfx950(
+def gluon_mla_prefill_gfx950(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -936,16 +943,14 @@ def gluon_mla_prefill_bf16_gfx950(
     out: torch.Tensor | None = None,
     seq_lens_kv: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Dense non-absorbed MLA prefill on AMD gfx950 (bf16).
+    """Dense non-absorbed MLA prefill on AMD gfx950.
 
     ``q``/``k`` are ``[total_tokens, num_heads, 192]`` (128 NoPE + 64 RoPE),
     ``v`` is ``[total_tokens, num_kv_heads, 128]``. Output is
     ``[total_tokens, num_heads, 128]``.
     """
     if logit_cap != 0.0:
-        raise NotImplementedError(
-            "gluon_mla_prefill_bf16_gfx950 does not support logit_cap"
-        )
+        raise NotImplementedError("gluon MLA prefill gfx950 does not support logit_cap")
     if q.dim() != 3 or k.dim() != 3 or v.dim() != 3:
         raise ValueError("q, k, v must be 3D [tokens, heads, head_dim]")
     if q.shape[-1] != 192 or k.shape[-1] != 192:
@@ -964,6 +969,12 @@ def gluon_mla_prefill_bf16_gfx950(
     for name, tensor in (("q", q), ("k", k), ("v", v)):
         if tensor.stride(-1) != 1:
             raise ValueError(f"{name} must have contiguous last dimension")
+    supported_dtypes = (torch.bfloat16, torch.float8_e4m3fn)
+    if q.dtype not in supported_dtypes:
+        raise TypeError(f"unsupported MLA prefill dtype {q.dtype}")
+    if k.dtype != q.dtype or v.dtype != q.dtype:
+        raise TypeError("q, k, and v must use the same dtype")
+    is_fp8 = q.dtype == torch.float8_e4m3fn
 
     total_tokens, n_heads, _ = q.shape
     v_head_dim = v.shape[-1]
@@ -1020,6 +1031,7 @@ def gluon_mla_prefill_bf16_gfx950(
         NUM_WARPS=config.num_warps,
         BATCH_SIZE=batch_size,
         max_seqlen_q=max_seqlen_q,
+        IS_FP8=is_fp8,
         num_warps=config.num_warps,
         num_stages=1,
     )
