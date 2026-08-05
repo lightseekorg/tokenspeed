@@ -35,8 +35,18 @@ class TestCLIConfigCompat(unittest.TestCase):
         with patch.object(ServerArgs, "__post_init__"):
             return ServerArgs.from_cli_args(args)
 
-    def _resolve_speculative_config(self, model: str, config: str) -> ServerArgs:
-        args = self._parse_args(["--model", model, "--speculative-config", config])
+    def _resolve_speculative_config(
+        self,
+        model: str,
+        config: str,
+        *,
+        enable_prefix_caching: bool = True,
+    ) -> ServerArgs:
+        argv = ["--model", model]
+        if not enable_prefix_caching:
+            argv.append("--no-enable-prefix-caching")
+        argv.extend(["--speculative-config", config])
+        args = self._parse_args(argv)
         server_args = self._from_cli_args_no_init(args)
         server_args.resolve_basic_defaults()
         server_args.resolve_speculative_decoding()
@@ -561,6 +571,7 @@ class TestCLIConfigCompat(unittest.TestCase):
                 '{"method":"dspark","model":"same-checkpoint",'
                 '"num_speculative_tokens":5}'
             ),
+            enable_prefix_caching=False,
         )
 
         self.assertTrue(server_args.draft_model_path_use_base)
@@ -581,6 +592,7 @@ class TestCLIConfigCompat(unittest.TestCase):
                     '{"method":"dspark","model":"model-alias",'
                     '"num_speculative_tokens":5}'
                 ),
+                enable_prefix_caching=False,
             )
 
         self.assertTrue(server_args.draft_model_path_use_base)
