@@ -159,6 +159,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Measured tp16 crossover: below this the fused lane AR wins, above it the
+# column-parallel tail's 1/tp up-projection pays for the lost AR fusion.
+_COLUMN_PARALLEL_MIN_TOKENS = 2048
+
 
 # ===----------------------------------------------------------------------=== #
 # Multimodal vision path
@@ -1225,6 +1229,30 @@ class KimiLinearMoE(nn.Module):
                 if self.routed_expert_norm is not None:
                     routed_out = self.routed_expert_norm(routed_out)
                 routed_out = self.routed_expert_up_proj(routed_out)[0]
+        return self._moe_tail(
+            routed_out,
+            shared_partial,
+            prefix_sum,
+            lane,
+            use_tail,
+            num_tokens,
+            hidden_size,
+        )
+
+    def _moe_tail(
+        self,
+        routed_out: torch.Tensor,
+        shared_partial: torch.Tensor,
+        prefix_sum: torch.Tensor,
+        lane: torch.Tensor | None,
+        use_tail: bool,
+        num_tokens: int,
+        hidden_size: int,
+    ) -> torch.Tensor:
+        """Combine the routed/shared partials onto ``prefix_sum``, best tier first:
+        fused decode kernel (<=16 tokens, graph replay), column-parallel stitch
+        (prefill-sized), fused-lane all-reduce, then the separate-reduce fallback
+        (``routed_out`` arrives already normed and up-projected there)."""
         if use_tail:
             # Partials are pre-reduce; the tail owns all communication.
             return self._latent_tail(
@@ -1234,6 +1262,25 @@ class KimiLinearMoE(nn.Module):
                 self.routed_expert_up_proj.weight,
                 prefix=prefix_sum,
             )
+        if (
+            self.execution_plan.fused_moe_ar
+            and num_tokens >= _COLUMN_PARALLEL_MIN_TOKENS
+            and hidden_size % self.mapping.moe.tp_ep_size == 0
+        ):
+            # After AR(latent)+norm each rank up-projects only its hidden shard
+            # into the shared partial, so the shared reduce also stitches the
+            # shards (1/tp of the up-projection GEMM).
+            routed_out = all_reduce(routed_out, self.mapping.moe.tp_ep_group)
+            if self.routed_expert_norm is not None:
+                routed_out = self.routed_expert_norm(routed_out)
+            shard = hidden_size // self.mapping.moe.tp_ep_size
+            start = self.mapping.moe.tp_ep_rank * shard
+            shared_partial.narrow(-1, start, shard).addmm_(
+                routed_out,
+                self.routed_expert_up_proj.weight.narrow(0, start, shard).t(),
+            )
+            shared_out = self._reduce_shared(shared_partial)
+            return (prefix_sum + shared_out).view(num_tokens, hidden_size)
         if self.execution_plan.fused_moe_ar:
             # Post-join: one [T, latent+hidden] all-reduce covers both
             # partials, element-wise identical to the two separate reduces.
@@ -1255,8 +1302,7 @@ class KimiLinearMoE(nn.Module):
                 prefix_sum,
                 shared_out,
             ).view(num_tokens, hidden_size)
-        else:
-            shared_out = self._reduce_shared(shared_partial)
+        shared_out = self._reduce_shared(shared_partial)
         # routed_scaling_factor already applied in TopK; not re-applied here
         # (matches the reference).
         return add3(
