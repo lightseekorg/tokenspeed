@@ -72,9 +72,10 @@ class All2AllBackend(Enum):
     NONE = "none"
     DEEPEP = "deepep"
     FLASHINFER_NVLINK_ONE_SIDED = "flashinfer_nvlink_one_sided"
-    # AMD-native EP dispatch/combine via MORI (github.com/ROCm/mori). IntraNode
-    # (XGMI) + InterNode (RDMA) kernels; real all-to-all, unlike the masked-replicate
-    # `none` fallback.
+    # AMD-native EP dispatch/combine via MORI (github.com/ROCm/mori). This backend uses
+    # MORI's intranode v2 op (dispatch_combine_v2, XGMI/single-node, EP<=8): real all-to-all,
+    # unlike the masked-replicate `none` fallback. Internode (RDMA) is not supported here --
+    # MORI's internode path is the separate v1 API and is not wired up.
     MORI = "mori"
 
     @classmethod
