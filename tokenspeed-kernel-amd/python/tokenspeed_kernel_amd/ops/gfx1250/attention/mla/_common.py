@@ -2,7 +2,7 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc.
 # Copyright (c) 2026 LightSeek Foundation
 
-"""Shared layouts and helpers for BF16 GFX1250 Gluon MLA kernels.
+"""Shared layouts and helpers for BF16/FP8 GFX1250 Gluon MLA kernels.
 
 The device implementation is ported from ROCm/AITER commit
 4a1cc773f34cbfc74387259e51262556ee38edd0.
@@ -58,10 +58,12 @@ def absorbed_mla_layouts(
     WARP_SIZE,
     K_WIDTH,
 ):
-    """Build the shared BF16 operand, load, and LDS layouts for absorbed MLA."""
+    """Build BF16 or E4M3 operand, load, and LDS layouts for absorbed MLA."""
     assert WARP_SIZE == 32
     assert NUM_WARPS == 1 or NUM_WARPS == 2 or NUM_WARPS == 4 or NUM_WARPS == 8
-    assert K_WIDTH == 8
+    assert K_WIDTH == 8 or K_WIDTH == 16
+    is_fp8 = K_WIDTH == 16
+    instr_shape = [16, 16, 64] if is_fp8 else [16, 16, 32]
 
     if NUM_WARPS == 1:
         warp_bases_qk = []
@@ -81,34 +83,34 @@ def absorbed_mla_layouts(
         transposed=True,
         warp_bases=warp_bases_qk,
         reg_bases=[],
-        instr_shape=[16, 16, 32],
+        instr_shape=instr_shape,
     )
     pv_wmma_layout = gl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
         warp_bases=warp_bases_pv,
         reg_bases=[],
-        instr_shape=[16, 16, 32],
+        instr_shape=instr_shape,
     )
     q_dot_layout = gl.DotOperandLayout(0, qk_wmma_layout, k_width=K_WIDTH)
     k_dot_layout = gl.DotOperandLayout(1, qk_wmma_layout, k_width=K_WIDTH)
-    p_dot_layout = gl.DotOperandLayout(0, pv_wmma_layout, k_width=K_WIDTH)
-    v_dot_layout = gl.DotOperandLayout(1, pv_wmma_layout, k_width=K_WIDTH)
+    p_dot_layout = gl.DotOperandLayout(0, pv_wmma_layout, k_width=8)
+    v_dot_layout = gl.DotOperandLayout(1, pv_wmma_layout, k_width=8)
 
     q_lora_shared_layout = gl.PaddedSharedLayout.with_identity_for(
-        [[KV_LORA_RANK, 8]], [BLOCK_M, KV_LORA_RANK], [1, 0]
+        [[KV_LORA_RANK, K_WIDTH]], [BLOCK_M, KV_LORA_RANK], [1, 0]
     )
     q_rope_shared_layout = gl.PaddedSharedLayout.with_identity_for(
-        [[QK_ROPE_HEAD_DIM, 8]], [BLOCK_M, QK_ROPE_HEAD_DIM], [1, 0]
+        [[QK_ROPE_HEAD_DIM, K_WIDTH]], [BLOCK_M, QK_ROPE_HEAD_DIM], [1, 0]
     )
     kv_lora_shared_layout = gl.PaddedSharedLayout.with_identity_for(
-        [[KV_LORA_RANK, 8]], [BLOCK_SIZE, KV_LORA_RANK], [1, 0]
+        [[KV_LORA_RANK, K_WIDTH]], [BLOCK_SIZE, KV_LORA_RANK], [1, 0]
     )
     k_rope_shared_layout = gl.PaddedSharedLayout.with_identity_for(
-        [[QK_ROPE_HEAD_DIM, 8]], [BLOCK_SIZE, QK_ROPE_HEAD_DIM], [1, 0]
+        [[QK_ROPE_HEAD_DIM, K_WIDTH]], [BLOCK_SIZE, QK_ROPE_HEAD_DIM], [1, 0]
     )
 
-    load_vec = 8
+    load_vec = K_WIDTH
     lora_threads = min(max(KV_LORA_RANK // load_vec, 1), WARP_SIZE)
     q_lora_load_layout = gl.BlockedLayout(
         [1, load_vec],

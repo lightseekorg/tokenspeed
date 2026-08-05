@@ -390,12 +390,19 @@ def test_mla_decode_with_kvcache(
     torch.testing.assert_close(lse, lse_ref, rtol=8e-2, atol=8e-2)
 
 
-def test_mla_extend_with_kvcache_bf16(device: str, require) -> None:
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.bfloat16, id="bf16"),
+        pytest.param(torch.float8_e4m3fn, id="fp8"),
+    ],
+)
+def test_mla_extend_with_kvcache(device: str, dtype: torch.dtype, require) -> None:
     require(
         "attention",
         "mla_extend_with_kvcache",
         "gluon",
-        torch.bfloat16,
+        dtype,
         "q",
     )
 
@@ -418,7 +425,7 @@ def test_mla_extend_with_kvcache_bf16(device: str, require) -> None:
         qk_dim,
         device=device,
         dtype=torch.bfloat16,
-    )
+    ).to(dtype)
     kv_cache = torch.randn(
         len(query_lens),
         page_size,
@@ -426,7 +433,7 @@ def test_mla_extend_with_kvcache_bf16(device: str, require) -> None:
         qk_dim,
         device=device,
         dtype=torch.bfloat16,
-    )
+    ).to(dtype)
     page_table = torch.arange(
         len(query_lens), device=device, dtype=torch.int32
     ).unsqueeze(1)
@@ -451,6 +458,7 @@ def test_mla_extend_with_kvcache_bf16(device: str, require) -> None:
         is_causal=True,
         solution="gluon",
     )
+    assert out.dtype == torch.bfloat16
 
     refs = []
     q_start = 0
@@ -468,7 +476,8 @@ def test_mla_extend_with_kvcache_bf16(device: str, require) -> None:
             refs.append(torch.matmul(probs, visible_kv[:, :kv_lora_rank]))
         q_start += q_len
 
-    torch.testing.assert_close(out.float(), torch.stack(refs), rtol=8e-2, atol=8e-2)
+    tol = 1e-1 if dtype in _FP8_DTYPES else 8e-2
+    torch.testing.assert_close(out.float(), torch.stack(refs), rtol=tol, atol=tol)
 
 
 def _run_fixed_bf16_mla_decode_case(

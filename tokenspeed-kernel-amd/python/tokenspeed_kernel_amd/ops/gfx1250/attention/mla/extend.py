@@ -154,7 +154,9 @@ def _mla_extend_fwd_kernel(
     FP8_MIN: gl.constexpr = float8_info.min,
     FP8_MAX: gl.constexpr = float8_info.max,
 ):
-    assert QUERY_DTYPE == "bf16" and KV_CACHE_DTYPE == "bf16"
+    assert QUERY_DTYPE == KV_CACHE_DTYPE
+    assert QUERY_DTYPE == "bf16" or QUERY_DTYPE == "fp8"
+    assert K_WIDTH == (16 if QUERY_DTYPE == "fp8" else 8)
     cfg = AttentionConfig(
         KV_LORA_RANK,
         QK_ROPE_HEAD_DIM,
@@ -245,14 +247,15 @@ def _mla_extend_fwd_kernel(
         0, QK_ROPE_HEAD_DIM, layout=gl.SliceLayout(0, cfg.Q_ROPE_LOAD_LAYOUT)
     )
     KV_LORA_LOAD_LAYOUT: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 8],
+        size_per_thread=[1, K_WIDTH],
         threads_per_warp=[1, 32],
         warps_per_cta=[num_warps, 1],
         order=[1, 0],
     )
+    rope_threads: gl.constexpr = QK_ROPE_HEAD_DIM // K_WIDTH
     K_ROPE_LOAD_LAYOUT: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 8],
-        threads_per_warp=[4, 8],
+        size_per_thread=[1, K_WIDTH],
+        threads_per_warp=[WARP_SIZE // rope_threads, rope_threads],
         warps_per_cta=[num_warps, 1],
         order=[1, 0],
     )
@@ -501,7 +504,7 @@ def _mla_extend_fwd_kernel(
     )
 
 
-def gluon_mla_extend_bf16_gfx1250(
+def gluon_mla_extend_gfx1250(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
     page_table: torch.Tensor,
@@ -520,7 +523,7 @@ def gluon_mla_extend_bf16_gfx1250(
     return_lse: bool = False,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run absorbed BF16 MLA prefill/extend over paged KV on GFX1250.
+    """Run absorbed MLA prefill/extend over paged KV on GFX1250.
 
     Queries are packed as ``[total_q, heads, 576]``. The compressed cache must
     already include the current query tokens; causal masking derives each
@@ -528,25 +531,22 @@ def gluon_mla_extend_bf16_gfx1250(
     """
     del max_seqlen_q, max_seqlen_k, qk_nope_head_dim
     if not is_causal:
-        raise NotImplementedError(
-            "gluon_mla_extend_bf16_gfx1250 requires causal attention"
-        )
+        raise NotImplementedError("gluon MLA extend gfx1250 requires causal attention")
     if logit_cap != 0.0:
-        raise NotImplementedError(
-            "gluon_mla_extend_bf16_gfx1250 does not support logit_cap"
-        )
+        raise NotImplementedError("gluon MLA extend gfx1250 does not support logit_cap")
     if return_lse:
-        raise NotImplementedError("gluon_mla_extend_bf16_gfx1250 does not return LSE")
+        raise NotImplementedError("gluon MLA extend gfx1250 does not return LSE")
     if q.ndim != 3:
         raise ValueError(f"q must be [total_q, num_q_heads, head_dim], got {q.shape}")
-    if q.dtype != torch.bfloat16 or kv_cache.dtype != torch.bfloat16:
-        raise TypeError(
-            "gluon_mla_extend_bf16_gfx1250 requires BF16 q and kv_cache, "
-            f"got {q.dtype} and {kv_cache.dtype}"
-        )
+    supported_dtypes = (torch.bfloat16, torch.float8_e4m3fn)
+    if q.dtype not in supported_dtypes:
+        raise TypeError(f"unsupported MLA extend dtype {q.dtype}")
+    if kv_cache.dtype != q.dtype:
+        raise TypeError("q and kv_cache must use the same dtype")
+    is_fp8 = q.dtype == torch.float8_e4m3fn
     if kv_lora_rank != 512 or qk_rope_head_dim != 64:
         raise NotImplementedError(
-            "gluon_mla_extend_bf16_gfx1250 requires kv_lora_rank=512 and "
+            "gluon MLA extend gfx1250 requires kv_lora_rank=512 and "
             f"qk_rope_head_dim=64, got {kv_lora_rank} and {qk_rope_head_dim}"
         )
 
@@ -584,11 +584,12 @@ def gluon_mla_extend_bf16_gfx1250(
 
     total_q, num_query_heads, _ = q.shape
     expected_out_shape = (total_q, num_query_heads, kv_lora_rank)
+    output_dtype = torch.bfloat16
     if out is None:
-        out = torch.empty(expected_out_shape, dtype=q.dtype, device=q.device)
-    elif out.shape != expected_out_shape or out.dtype != q.dtype:
+        out = torch.empty(expected_out_shape, dtype=output_dtype, device=q.device)
+    elif out.shape != expected_out_shape or out.dtype != output_dtype:
         raise ValueError(
-            f"out must have shape {expected_out_shape} and dtype {q.dtype}, "
+            f"out must have shape {expected_out_shape} and dtype {output_dtype}, "
             f"got {tuple(out.shape)} and {out.dtype}"
         )
 
@@ -634,9 +635,9 @@ def gluon_mla_extend_bf16_gfx1250(
         BLOCK_M=block_m,
         WARP_SIZE=32,
         NUM_HEAD_BLOCKS=num_head_blocks,
-        QUERY_DTYPE="bf16",
-        KV_CACHE_DTYPE="bf16",
-        K_WIDTH=8,
+        QUERY_DTYPE="fp8" if is_fp8 else "bf16",
+        KV_CACHE_DTYPE="fp8" if is_fp8 else "bf16",
+        K_WIDTH=16 if is_fp8 else 8,
         num_warps=8,
         waves_per_eu=1,
         num_stages=1,
@@ -644,4 +645,4 @@ def gluon_mla_extend_bf16_gfx1250(
     return out
 
 
-__all__ = ["gluon_mla_extend_bf16_gfx1250"]
+__all__ = ["gluon_mla_extend_gfx1250"]

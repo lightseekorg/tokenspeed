@@ -163,7 +163,9 @@ def _mla_decode_fwd_kernel(
     BLOCK_SCALES_SIZE: gl.constexpr = 4,  # int
 ):
     assert not SHUFFLED_KV_CACHE
-    assert QUERY_DTYPE == "bf16" and KV_CACHE_DTYPE == "bf16"
+    assert QUERY_DTYPE == KV_CACHE_DTYPE
+    assert QUERY_DTYPE == "bf16" or QUERY_DTYPE == "fp8"
+    assert K_WIDTH == (16 if QUERY_DTYPE == "fp8" else 8)
     IS_Q_FP8: gl.constexpr = QUERY_DTYPE == "fp8"
     IS_KV_FP8: gl.constexpr = KV_CACHE_DTYPE == "fp8"
     cfg = AttentionConfig(
@@ -256,14 +258,15 @@ def _mla_decode_fwd_kernel(
         0, QK_ROPE_HEAD_DIM, layout=gl.SliceLayout(0, cfg.Q_ROPE_LOAD_LAYOUT)
     )
     KV_LORA_LOAD_LAYOUT: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 8],
+        size_per_thread=[1, K_WIDTH],
         threads_per_warp=[1, 32],
         warps_per_cta=[num_warps, 1],
         order=[1, 0],
     )
+    rope_threads: gl.constexpr = QK_ROPE_HEAD_DIM // K_WIDTH
     K_ROPE_LOAD_LAYOUT: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 8],
-        threads_per_warp=[4, 8],
+        size_per_thread=[1, K_WIDTH],
+        threads_per_warp=[WARP_SIZE // rope_threads, rope_threads],
         warps_per_cta=[num_warps, 1],
         order=[1, 0],
     )
@@ -697,7 +700,7 @@ def _select_num_kv_splits(
     return triton.next_power_of_2(min(max_kv_splits, target))
 
 
-def gluon_mla_decode_bf16_gfx1250(
+def gluon_mla_decode_gfx1250(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
     page_table: torch.Tensor,
@@ -712,29 +715,28 @@ def gluon_mla_decode_bf16_gfx1250(
     return_lse: bool = False,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Run absorbed BF16 MLA decode over a paged cache on GFX1250.
+    """Run absorbed MLA decode over a paged cache on GFX1250.
 
     Args follow :func:`tokenspeed_kernel.ops.attention.mla_decode_with_kvcache`.
     This initial port supports one decode token, a single compressed KV head,
     latent rank 512, RoPE head dimension 64, and page size 64.
     """
     if logit_cap != 0.0:
-        raise NotImplementedError(
-            "gluon_mla_decode_bf16_gfx1250 does not support logit_cap"
-        )
+        raise NotImplementedError("gluon MLA decode gfx1250 does not support logit_cap")
     if q.ndim != 4 or q.shape[1] != 1:
         raise ValueError(
             "q must be [batch, 1, num_q_heads, kv_lora_rank + "
             f"qk_rope_head_dim], got {tuple(q.shape)}"
         )
-    if q.dtype != torch.bfloat16 or kv_cache.dtype != torch.bfloat16:
-        raise TypeError(
-            "gluon_mla_decode_bf16_gfx1250 requires BF16 q and kv_cache, "
-            f"got {q.dtype} and {kv_cache.dtype}"
-        )
+    supported_dtypes = (torch.bfloat16, torch.float8_e4m3fn)
+    if q.dtype not in supported_dtypes:
+        raise TypeError(f"unsupported MLA decode dtype {q.dtype}")
+    if kv_cache.dtype != q.dtype:
+        raise TypeError("q and kv_cache must use the same dtype")
+    is_fp8 = q.dtype == torch.float8_e4m3fn
     if kv_lora_rank != 512 or qk_rope_head_dim != 64:
         raise NotImplementedError(
-            "gluon_mla_decode_bf16_gfx1250 requires kv_lora_rank=512 and "
+            "gluon MLA decode gfx1250 requires kv_lora_rank=512 and "
             f"qk_rope_head_dim=64, got {kv_lora_rank} and {qk_rope_head_dim}"
         )
     if qk_nope_head_dim <= 0:
@@ -767,11 +769,12 @@ def gluon_mla_decode_bf16_gfx1250(
         raise ValueError("num_query_heads must be positive")
 
     expected_out_shape = (batch_size, 1, num_query_heads, kv_lora_rank)
+    output_dtype = torch.bfloat16
     if out is None:
-        out = torch.empty(expected_out_shape, dtype=q.dtype, device=q.device)
-    elif out.shape != expected_out_shape or out.dtype != q.dtype:
+        out = torch.empty(expected_out_shape, dtype=output_dtype, device=q.device)
+    elif out.shape != expected_out_shape or out.dtype != output_dtype:
         raise ValueError(
-            f"out must have shape {expected_out_shape} and dtype {q.dtype}, "
+            f"out must have shape {expected_out_shape} and dtype {output_dtype}, "
             f"got {tuple(out.shape)} and {out.dtype}"
         )
 
@@ -842,11 +845,11 @@ def gluon_mla_decode_bf16_gfx1250(
         NUM_HEAD_BLOCKS=num_head_blocks,
         SHUFFLED_KV_CACHE=False,
         ALL_DECODE=True,
-        K_WIDTH=8,
+        K_WIDTH=16 if is_fp8 else 8,
         SCALE_K_WIDTH_LORA=0,
         SCALE_K_WIDTH_ROPE=0,
-        QUERY_DTYPE="bf16",
-        KV_CACHE_DTYPE="bf16",
+        QUERY_DTYPE="fp8" if is_fp8 else "bf16",
+        KV_CACHE_DTYPE="fp8" if is_fp8 else "bf16",
         BLOCK_SCALES_SIZE=16,
         num_warps=2,
         waves_per_eu=1,
@@ -893,4 +896,4 @@ def gluon_mla_decode_bf16_gfx1250(
     return (out, lse) if return_lse else out
 
 
-__all__ = ["gluon_mla_decode_bf16_gfx1250"]
+__all__ = ["gluon_mla_decode_gfx1250"]
