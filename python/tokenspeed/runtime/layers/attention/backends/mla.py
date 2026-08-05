@@ -548,18 +548,10 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             return
         if uses_cache_groups and self.is_draft and not self._cache_contract_bound:
             raise NotImplementedError(
-<<<<<<< HEAD
-                "MLA draft worker does not take the Paged cache path"
-=======
                 "MLA draft worker does not take the cache-group path"
->>>>>>> 8c0ba980 (feat(mla): support speculative target verify on the cache-group path)
             )
         page_table = self.cuda_graph_page_table[:bs, :]
-<<<<<<< HEAD
         capture_q_len = self._graph_verify_q_len()
-=======
-        capture_q_len = 1
->>>>>>> 8c0ba980 (feat(mla): support speculative target verify on the cache-group path)
         if uses_cache_groups:
             self._cache_groups_bound = True
             if self.decode_cuda_graph_group_out_cache_loc is None:
@@ -568,10 +560,6 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
                     "mark_cache_contract must run before init_cuda_graph_state"
                 )
             page_table.zero_()
-<<<<<<< HEAD
-=======
-            capture_q_len = self._graph_verify_q_len()
->>>>>>> 8c0ba980 (feat(mla): support speculative target verify on the cache-group path)
             group_out_cache_loc = self.decode_cuda_graph_group_out_cache_loc[
                 : bs * capture_q_len
             ]
@@ -586,16 +574,9 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             group_q_len_per_req=capture_q_len,
         )
         # Seed the owned buffer: the capture run reads it before replay. Verify
-<<<<<<< HEAD
         # rows span seq-N..seq-1, so a shorter length would start before zero.
         if capture_q_len > 1:
             metadata.seq_lens.copy_(seq_lens[:bs].clamp_min(capture_q_len))
-=======
-        # rows span seq-N..seq-1, so a length below N would make the window
-        # start before the sequence.
-        if self.spec_num_tokens > 1 and not self.is_draft:
-            metadata.seq_lens.copy_(seq_lens[:bs].clamp_min(self.spec_num_tokens))
->>>>>>> 8c0ba980 (feat(mla): support speculative target verify on the cache-group path)
         else:
             metadata.seq_lens.copy_(seq_lens[:bs])
         self.decode_cuda_graph_metadata[bs] = metadata
@@ -692,19 +673,11 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             )
             self.forward_decode_metadata = metadata
             return
-        # Copy the live lengths into our own cache-seqlens buffer (metadata.seq_lens
-<<<<<<< HEAD
-        # views it); both metadata paths read it at replay.
+        # Copy the live lengths into our own cache-seqlens buffer
+        # (metadata.seq_lens views it); both metadata paths read it at replay.
         q_len = metadata.group_q_len_per_req
         if q_len > 1:
             self.cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs].clamp_min(q_len))
-=======
-        # views it); both the flat and legacy paths read it at replay.
-        if self.spec_num_tokens > 1 and not self.is_draft:
-            self.cuda_graph_seq_lens[:bs].copy_(
-                seq_lens[:bs].clamp_min(self.spec_num_tokens)
-            )
->>>>>>> 8c0ba980 (feat(mla): support speculative target verify on the cache-group path)
         else:
             self.cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs])
         if metadata.group_out_cache_loc is not None:
@@ -732,12 +705,8 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         forward_batch,
     ) -> None:
         if metadata.group_out_cache_loc is None:
-<<<<<<< HEAD
             raise RuntimeError("MLA graph metadata has no write-location buffer")
-=======
-            raise RuntimeError("flat MLA graph metadata has no write-location buffer")
         # Must match the width baked into the captured buffer view.
->>>>>>> 8c0ba980 (feat(mla): support speculative target verify on the cache-group path)
         q_len = metadata.group_q_len_per_req
         real_bs = 0
         if cache_metadata is not None:
