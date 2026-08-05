@@ -1,12 +1,17 @@
 #include <gtest/gtest.h>
 
-#include "cache/block_pool.h"
-#include "cache/cache_types.h"
-#include "scheduler/operations/cache.h"
+#include <type_traits>
+
+#include "cache/core/block_pool.h"
+#include "cache/core/cache_types.h"
+#include "cache/tier/transfer.h"
 #include "scheduler/scheduler.h"
 #include "scheduler/types.h"
 
 namespace tokenspeed::test {
+
+static_assert(std::is_aggregate_v<WriteBackOperation>);
+static_assert(std::is_aggregate_v<LoadBackOperation>);
 
 TEST(CacheOperationTest, WriteBackDeduplicatesTransfersAcrossBatch) {
     WriteBackOperation op;
@@ -22,8 +27,8 @@ TEST(CacheOperationTest, WriteBackDeduplicatesTransfersAcrossBatch) {
 
     WriteBackBatch batch({op, duplicate});
 
-    ASSERT_EQ(batch.op_ids, std::vector<cache_op_id>({7, 8}));
-    EXPECT_EQ(batch.group_ids[0], std::vector<GroupId>({0, 0}));
+    ASSERT_EQ(batch.op_ids, std::vector<std::uint32_t>({7, 8}));
+    EXPECT_EQ(batch.group_ids[0], std::vector<std::uint32_t>({0, 0}));
     EXPECT_EQ(batch.src_pages[0], std::vector<std::int32_t>({1, 2}));
     EXPECT_EQ(batch.dst_pages[0], std::vector<std::int32_t>({11, 22}));
     EXPECT_EQ(batch.src_pages[1], std::vector<std::int32_t>({3}));
@@ -40,7 +45,7 @@ TEST(CacheOperationTest, SamePagesInDifferentGroupsAreDistinctTransfers) {
 
     WriteBackBatch batch({op});
 
-    EXPECT_EQ(batch.group_ids[0], std::vector<GroupId>({0, 1}));
+    EXPECT_EQ(batch.group_ids[0], std::vector<std::uint32_t>({0, 1}));
     EXPECT_EQ(batch.src_pages[0], std::vector<std::int32_t>({1, 1}));
     EXPECT_EQ(batch.dst_pages[0], std::vector<std::int32_t>({11, 11}));
 }
@@ -55,8 +60,8 @@ TEST(CacheOperationTest, LoadBackPreservesTransferOrder) {
 
     LoadBackBatch batch({op});
 
-    ASSERT_EQ(batch.op_ids, std::vector<cache_op_id>({9}));
-    EXPECT_EQ(batch.group_ids[0], std::vector<GroupId>({0, 0}));
+    ASSERT_EQ(batch.op_ids, std::vector<std::uint32_t>({9}));
+    EXPECT_EQ(batch.group_ids[0], std::vector<std::uint32_t>({0, 0}));
     EXPECT_EQ(batch.src_pages[0], std::vector<std::int32_t>({10, 30}));
     EXPECT_EQ(batch.dst_pages[0], std::vector<std::int32_t>({20, 40}));
 }
@@ -114,6 +119,33 @@ TEST(CacheOperationTest, DecodeRejectsRequestWhoseSnapshotCannotFitHostL2) {
         << "Decode must advertise the smaller of Device and snapshot capacity";
     RequestSpec spec{
         .request_id = "too-large",
+        .tokens = {1, 2, 3, 4},
+        .max_new_tokens = 4,
+    };
+
+    EXPECT_THROW(scheduler.SubmitRequests({spec}), std::invalid_argument);
+}
+
+TEST(CacheOperationTest, DecodeRejectsRequestWhoseMaximumExtentCannotFitDevice) {
+    SchedulerConfig config;
+    config.block_size = 2;
+    config.device_allocator.total_pages = 4;
+    config.host_allocator.total_pages = 10;
+    config.max_scheduled_tokens = 8;
+    config.max_batch_size = 2;
+    config.role = Role::kD;
+    config.paged_cache_groups.push_back(PagedCacheGroupConfig{
+        .group_id = "full",
+        .rows_per_page = 2,
+        .entry_stride_tokens = 1,
+        .total_pages = 4,
+        .retention = PagedCacheGroupConfig::Retention::FullHistory,
+        .family = PagedCacheGroupFamily::History,
+    });
+    Scheduler scheduler{std::move(config)};
+    ASSERT_EQ(scheduler.MaxSingleRequestTokens(), 6);
+    RequestSpec spec{
+        .request_id = "too-large-for-device",
         .tokens = {1, 2, 3, 4},
         .max_new_tokens = 4,
     };

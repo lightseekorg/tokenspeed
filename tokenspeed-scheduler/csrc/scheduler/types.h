@@ -23,7 +23,7 @@
 #include <cstdint>
 #include <vector>
 
-#include "cache/cache_config.h"
+#include "cache/core/cache_config.h"
 #include "utils.h"
 
 namespace tokenspeed {

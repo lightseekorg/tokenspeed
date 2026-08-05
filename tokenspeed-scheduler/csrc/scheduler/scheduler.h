@@ -31,16 +31,16 @@
 #include <unordered_set>
 #include <vector>
 
-#include "cache/block_pool.h"
-#include "core/types.h"
-#include "cache/forward_cache_ops.h"
-#include "cache/kv_cache_coordinator.h"
+#include "cache/coordinator/kv_cache_coordinator.h"
+#include "cache/core/block_pool.h"
+#include "cache/tier/transfer_manager.h"
 #include "fsm/forward_events.h"
 #include "fsm/pd_events.h"
 #include "resource/allocator/req_pool_allocator.h"
 #include "scheduler/execution_event.h"
 #include "scheduler/execution_plan.h"
 #include "scheduler/kv_cache_events.h"
+#include "scheduler/operations/cache.h"
 #include "scheduler/request.h"
 #include "scheduler/types.h"
 
@@ -120,21 +120,9 @@ private:
     void retractForCapacity(const std::vector<Request*>& candidates,
                             std::vector<WriteBackOperation>& write_back_operations);
 
-    struct PreparedTableCopy {
-        std::vector<BlockTable> destination_tables;
-        std::vector<CacheTransfer> transfers;
-        std::vector<CacheBlockRef> source_pins;
-        std::vector<CacheBlockRef> destination_pins;
-        std::vector<std::vector<std::int32_t>> new_page_ids;
-    };
-
-    std::optional<PreparedTableCopy> prepareHostSnapshot(const std::vector<BlockTable>& device_tables);
-    std::optional<PreparedTableCopy> prepareDeviceRestore(const std::vector<BlockTable>& host_tables);
     std::optional<WriteBackOperation> beginRetraction(Request& request);
     std::optional<LoadBackOperation> beginRecovery(Request& request);
 
-    void emitPendingStores(std::vector<WriteBackOperation>& write_back_operations);
-    cache_op_id allocateCacheOpId() { return next_cache_op_id_++; }
     std::size_t groupIndex(const std::string& group_id) const;
     Request* findRequest(const std::string& request_id);
 
@@ -162,6 +150,7 @@ private:
     BlockPool block_pool_;
     BlockPool host_pool_;
     KvCacheCoordinator coordinator_;
+    TierTransferManager tier_transfers_;
     std::vector<std::string> cache_group_ids_;
     std::int32_t max_single_request_tokens_{0};
     std::int32_t max_host_snapshot_tokens_{0};
@@ -171,42 +160,6 @@ private:
     std::unordered_set<std::string> pd_transfer_pins_;
     bool lcm_admission_failed_{false};
     bool admission_waits_for_store_{false};
-
-    struct StoreTicket {
-        CacheKey key;
-        CacheBlockRef device_block_ref;
-        CacheBlockRef host_block_ref;
-    };
-
-    class StoreLedger {
-    public:
-        void Add(cache_op_id id, std::vector<StoreTicket> tickets);
-        std::vector<StoreTicket> Retire(cache_op_id id);
-        bool InFlight(const CacheKey& key) const { return keys_.contains(key); }
-        bool Empty() const { return ops_.empty(); }
-        std::vector<std::pair<GroupId, CacheBlockLocation>> DeviceLocationsReleasedOnAck() const;
-
-    private:
-        std::unordered_map<cache_op_id, std::vector<StoreTicket>> ops_;
-        std::unordered_set<CacheKey, CacheKeyHash> keys_;
-    };
-
-    struct LoadTicket {
-        std::vector<CacheBlockRef> host_pins;
-        std::vector<CacheBlockRef> device_blocks;
-    };
-
-    struct SnapshotTransferTicket {
-        std::string request_id;
-        std::vector<CacheBlockRef> source_pins;
-        std::vector<CacheBlockRef> destination_pins;
-    };
-
-    StoreLedger store_ops_;
-    std::unordered_map<cache_op_id, LoadTicket> load_ops_;
-    std::unordered_map<cache_op_id, SnapshotTransferTicket> retraction_ops_;
-    std::unordered_map<cache_op_id, SnapshotTransferTicket> recovery_ops_;
-    cache_op_id next_cache_op_id_{0};
 
     std::unordered_map<std::string, std::unique_ptr<Request>> requests_;
     std::vector<KvCacheEvent> kv_events_;

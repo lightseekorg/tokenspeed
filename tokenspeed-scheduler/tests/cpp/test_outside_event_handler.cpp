@@ -218,6 +218,28 @@ protected:
     }
 };
 
+class DecodeSnapshotRecoveryAdmissionTestSuite : public DecodeSnapshotL2TestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = DecodeSnapshotL2TestSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 7;  // null parent + six Device parents
+        cfg.host_allocator.total_pages = 20;
+        cfg.max_batch_size = 3;
+        cfg.enable_mixed_prefill_decode = false;
+        cfg.paged_cache_groups.front().total_pages = cfg.device_allocator.total_pages;
+        return cfg;
+    }
+};
+
+class DecodeSnapshotRequestSlotTestSuite : public DecodeSnapshotRecoveryAdmissionTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = DecodeSnapshotRecoveryAdmissionTestSuite::MakeConfig();
+        cfg.max_batch_size = 2;
+        return cfg;
+    }
+};
+
 TEST_F(DecodeSnapshotCapacityTestSuite, AdmissionReservesHostCapacityForActiveRequestsOnly) {
     RequestSpec longest = MakeRequestSpec("a", /*num_pages=*/2, /*start=*/1);
     longest.max_new_tokens = 6;  // five-parent maximum snapshot
@@ -367,6 +389,124 @@ TEST_F(DecodeSnapshotL2TestSuite, RetractionLetsBlockedAdmissionRunBeforeRecover
     EXPECT_EQ(scheduler_->DecodingSize(), 1u);
 }
 
+TEST_F(DecodeSnapshotRecoveryAdmissionTestSuite, SubmittedAdmissionWaitsForRecoveryAck) {
+    Submit({MakeRequestSpec("running", /*num_pages=*/2, /*start=*/1)});
+    SendBootstrapped("running");
+    PlanOnce();
+    SendRemotePrefillDone("running", /*bootstrap_token=*/42);
+    PlanOnce();
+    SendForwardDone("running", {43});
+    ASSERT_EQ(scheduler_->ActiveKvPages(), 3u);
+
+    RequestSpec filler = MakeRequestSpec("filler", /*num_pages=*/1, /*start=*/101);
+    filler.tokens.resize(1);
+    Submit({filler});
+    SendBootstrapped("filler");
+    const ExecutionPlan filler_admission = PlanOnce();
+    const ForwardBatch* filler_forward = FindForwardBatch(filler_admission.Operations());
+    ASSERT_GE(FindRequestIndex(filler_forward, "filler"), 0);
+    if (FindRequestIndex(filler_forward, "running") >= 0) {
+        SendForwardDone("running", {44});
+    }
+    SendRemotePrefillDone("filler", /*bootstrap_token=*/142);
+
+    RequestSpec blocked = MakeRequestSpec("blocked", /*num_pages=*/1, /*start=*/201);
+    blocked.tokens.resize(1);
+    Submit({blocked});
+    SendBootstrapped("blocked");
+    std::vector<CacheOperation> write_back_ops;
+    std::int32_t running_token = 45;
+    std::int32_t filler_token = 143;
+    for (std::int32_t round = 0; round < 12 && write_back_ops.empty(); ++round) {
+        const ExecutionPlan plan = PlanOnce();
+        write_back_ops = ExtractCacheOpsOfKind<WriteBackBatch>(plan);
+        const ForwardBatch* forward = FindForwardBatch(plan.Operations());
+        if (write_back_ops.empty() && FindRequestIndex(forward, "running") >= 0) {
+            SendForwardDone("running", {running_token++});
+        }
+        if (write_back_ops.empty() && FindRequestIndex(forward, "filler") >= 0) {
+            SendForwardDone("filler", {filler_token++});
+        }
+    }
+    ASSERT_EQ(write_back_ops.size(), 1u);
+    const auto& write_back = std::get<WriteBackBatch>(write_back_ops.front());
+    ASSERT_EQ(write_back.op_ids.size(), 1u);
+    SendWriteBackDone(write_back.op_ids.front());
+    ASSERT_EQ(scheduler_->WaitingSize(), 0u);
+    SendRemotePrefillDone("blocked", /*bootstrap_token=*/242);
+    SendFinish("filler");
+    SendFinish("blocked");
+
+    const ExecutionPlan recover = PlanOnce();
+    const auto load_back_ops = ExtractCacheOpsOfKind<LoadBackBatch>(recover);
+    ASSERT_EQ(load_back_ops.size(), 1u);
+
+    RequestSpec late = MakeRequestSpec("late", /*num_pages=*/1, /*start=*/301);
+    late.tokens.resize(1);
+    Submit({late});
+    SendBootstrapped("late");
+    const ExecutionPlan while_recovering = PlanOnce();
+    const ForwardBatch* forward = FindForwardBatch(while_recovering.Operations());
+    ASSERT_NE(forward, nullptr);
+    EXPECT_TRUE(forward->request_ids.empty());
+    EXPECT_EQ(scheduler_->WaitingSize(), 1u);
+}
+
+TEST_F(DecodeSnapshotRequestSlotTestSuite, RecoveryWaitsForAvailableRequestPoolSlot) {
+    Submit({MakeRequestSpec("a", /*num_pages=*/2, /*start=*/1)});
+    SendBootstrapped("a");
+    PlanOnce();
+    SendRemotePrefillDone("a", /*bootstrap_token=*/42);
+
+    Submit({MakeRequestSpec("holder", /*num_pages=*/2, /*start=*/101)});
+    SendBootstrapped("holder");
+    PlanOnce();
+    SendRemotePrefillDone("holder", /*bootstrap_token=*/142);
+    PlanOnce();
+    SendForwardDone("a", {43});
+    SendForwardDone("holder", {143});
+
+    RequestSpec first_small = MakeRequestSpec("first_small", /*num_pages=*/1, /*start=*/201);
+    first_small.tokens.resize(1);
+    Submit({first_small});
+    SendBootstrapped("first_small");
+
+    std::vector<CacheOperation> write_back_ops;
+    std::int32_t a_token = 44;
+    std::int32_t holder_token = 144;
+    for (std::int32_t round = 0; round < 12 && write_back_ops.empty(); ++round) {
+        const ExecutionPlan plan = PlanOnce();
+        write_back_ops = ExtractCacheOpsOfKind<WriteBackBatch>(plan);
+        const ForwardBatch* forward = FindForwardBatch(plan.Operations());
+        if (write_back_ops.empty() && FindRequestIndex(forward, "a") >= 0) {
+            SendForwardDone("a", {a_token++});
+        }
+        if (write_back_ops.empty() && FindRequestIndex(forward, "holder") >= 0) {
+            SendForwardDone("holder", {holder_token++});
+        }
+    }
+    ASSERT_EQ(write_back_ops.size(), 1u);
+    const auto& write_back = std::get<WriteBackBatch>(write_back_ops.front());
+    ASSERT_EQ(write_back.op_ids.size(), 1u);
+    SendWriteBackDone(write_back.op_ids.front());
+
+    const ExecutionPlan first_small_admission = PlanOnce();
+    ASSERT_GE(FindRequestIndex(FindForwardBatch(first_small_admission.Operations()), "first_small"), 0);
+    SendRemotePrefillDone("first_small", /*bootstrap_token=*/242);
+
+    RequestSpec second_small = MakeRequestSpec("second_small", /*num_pages=*/1, /*start=*/301);
+    second_small.tokens.resize(1);
+    Submit({second_small});
+    SendBootstrapped("second_small");
+    SendFinish("holder");
+
+    ExecutionPlan second_small_admission;
+    EXPECT_NO_THROW(second_small_admission = PlanOnce());
+    ASSERT_GE(FindRequestIndex(FindForwardBatch(second_small_admission.Operations()), "second_small"), 0);
+    EXPECT_TRUE(ExtractCacheOpsOfKind<LoadBackBatch>(second_small_admission).empty())
+        << "recovery must wait while both request-pool slots are occupied";
+}
+
 TEST_F(DecodeSnapshotL2TestSuite, FailedSnapshotKeepsTheRequestOnDevice) {
     Submit({MakeRequestSpec("running", /*num_pages=*/2, /*start=*/1)});
     SendBootstrapped("running");
@@ -395,6 +535,85 @@ TEST_F(DecodeSnapshotL2TestSuite, FailedSnapshotKeepsTheRequestOnDevice) {
     EXPECT_EQ(scheduler_->DecodingSize(), 1u);
     EXPECT_EQ(scheduler_->WaitingSize(), 1u);
     EXPECT_GT(scheduler_->ActiveKvPages(), 0u);
+}
+
+TEST_F(DecodeSnapshotRecoveryAdmissionTestSuite, SubmittedAdmissionWaitsForRetractionAck) {
+    Submit({MakeRequestSpec("a", /*num_pages=*/2, /*start=*/1),
+            MakeRequestSpec("b", /*num_pages=*/2, /*start=*/101)});
+    SendBootstrapped("a");
+    SendBootstrapped("b");
+    PlanOnce();
+    PlanOnce();
+    SendRemotePrefillDone("a", /*bootstrap_token=*/42);
+    SendRemotePrefillDone("b", /*bootstrap_token=*/142);
+
+    Submit({MakeRequestSpec("blocked", /*num_pages=*/2, /*start=*/201)});
+    SendBootstrapped("blocked");
+    std::vector<CacheOperation> write_back_ops;
+    std::int32_t a_token = 43;
+    std::int32_t b_token = 143;
+    for (std::int32_t round = 0; round < 12 && write_back_ops.empty(); ++round) {
+        const ExecutionPlan plan = PlanOnce();
+        write_back_ops = ExtractCacheOpsOfKind<WriteBackBatch>(plan);
+        const ForwardBatch* forward = FindForwardBatch(plan.Operations());
+        if (write_back_ops.empty() && FindRequestIndex(forward, "a") >= 0) {
+            SendForwardDone("a", {a_token++});
+        }
+        if (write_back_ops.empty() && FindRequestIndex(forward, "b") >= 0) {
+            SendForwardDone("b", {b_token++});
+        }
+    }
+    ASSERT_EQ(write_back_ops.size(), 1u);
+
+    // The victim's Device pages remain pinned until the D2H ACK. Free the
+    // other request so Device capacity alone would allow a new admission.
+    SendAbortEvent("b");
+    const ExecutionPlan while_retracting = PlanOnce();
+    const ForwardBatch* forward = FindForwardBatch(while_retracting.Operations());
+    ASSERT_NE(forward, nullptr);
+    EXPECT_TRUE(forward->request_ids.empty());
+    EXPECT_EQ(scheduler_->WaitingSize(), 1u);
+
+    const auto& write_back = std::get<WriteBackBatch>(write_back_ops.front());
+    ASSERT_EQ(write_back.op_ids.size(), 1u);
+    SendWriteBackDone(write_back.op_ids.front(), /*success=*/false);
+    const ExecutionPlan after_failure = PlanOnce();
+    ASSERT_GE(FindRequestIndex(FindForwardBatch(after_failure.Operations()), "blocked"), 0)
+        << "a failed snapshot restores the victim and releases the temporary admission gate";
+}
+
+TEST_F(DecodeSnapshotL2TestSuite, AbortDuringSnapshotWriteBackKeepsTransferBlocksPinnedUntilAck) {
+    Submit({MakeRequestSpec("running", /*num_pages=*/2, /*start=*/1)});
+    SendBootstrapped("running");
+    PlanOnce();
+    SendRemotePrefillDone("running", /*bootstrap_token=*/42);
+    PlanOnce();
+    SendForwardDone("running", {43});
+
+    Submit({MakeRequestSpec("blocked", /*num_pages=*/2, /*start=*/101)});
+    SendBootstrapped("blocked");
+    std::vector<CacheOperation> write_back_ops;
+    for (std::int32_t token = 44; token < 48 && write_back_ops.empty(); ++token) {
+        const ExecutionPlan plan = PlanOnce();
+        write_back_ops = ExtractCacheOpsOfKind<WriteBackBatch>(plan);
+        const ForwardBatch* forward = FindForwardBatch(plan.Operations());
+        if (write_back_ops.empty() && forward != nullptr && !forward->request_ids.empty()) {
+            SendForwardDone("running", {token});
+        }
+    }
+    ASSERT_EQ(write_back_ops.size(), 1u);
+    const auto& write_back = std::get<WriteBackBatch>(write_back_ops.front());
+    ASSERT_EQ(write_back.op_ids.size(), 1u);
+
+    SendAbortEvent("running");
+    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 0)
+        << "the in-flight D2H operation must outlive request-owned Device tables";
+    EXPECT_EQ(scheduler_->HostPoolFreeBlocks(), 0)
+        << "the in-flight D2H operation must keep its Host destinations pinned";
+
+    SendWriteBackDone(write_back.op_ids.front());
+    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 3);
+    EXPECT_EQ(scheduler_->HostPoolFreeBlocks(), 3);
 }
 
 class PdSparseDecodeAdmissionTestSuite : public DisaggDecodeAdmissionTestSuite {

@@ -27,7 +27,7 @@
 #include <set>
 #include <stdexcept>
 
-#include "cache/forward_cache_ops.h"
+#include "scheduler/operations/cache.h"
 #include "cache_test_access.h"
 #include "integration_test_helper.h"
 
@@ -2117,7 +2117,7 @@ protected:
         return cfg;
     }
 
-    RequestSpec MakeSpecWithTokens(const std::string& id, token_vec_t tokens) {
+    RequestSpec MakeSpecWithTokens(const std::string& id, std::vector<std::int32_t> tokens) {
         return RequestSpec{.request_id = id, .tokens = std::move(tokens)};
     }
 
@@ -2163,8 +2163,8 @@ TEST_F(PrefixHitSuite, TwoRequestsSharePrefixReusePages) {
     // r2: 12 tokens, first 8 == r1's. Hit: cap = (12-1)/2 = 5 pages; r1
     // registered 4, r2's page-4 hash chains off different tail tokens -> full
     // hits 4; swa (W=32, needed 16 > 4) keeps 4 -> fixpoint 4 blocks = 8 tokens.
-    token_vec_t r2_tokens = MakeAlignedTokens(/*num_pages=*/4, PageSize());  // tokens 1..8 == r1's
-    const token_vec_t tail = MakeTokens(/*count=*/4, /*start=*/901);
+    std::vector<std::int32_t> r2_tokens = MakeAlignedTokens(/*num_pages=*/4, PageSize());  // tokens 1..8 == r1's
+    const std::vector<std::int32_t> tail = MakeTokens(/*count=*/4, /*start=*/901);
     r2_tokens.insert(r2_tokens.end(), tail.begin(), tail.end());
     Submit(MakeSpecWithTokens("r2", r2_tokens));
 
@@ -2308,8 +2308,8 @@ TEST_F(PrefixHitDisabledSuite, DisablePrefixCacheSkipsMatch) {
     RunLifecycle(MakeRequestSpec("r1", /*num_pages=*/4));
     ASSERT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
 
-    token_vec_t r2_tokens = MakeAlignedTokens(/*num_pages=*/4, PageSize());
-    const token_vec_t tail = MakeTokens(/*count=*/4, /*start=*/901);
+    std::vector<std::int32_t> r2_tokens = MakeAlignedTokens(/*num_pages=*/4, PageSize());
+    const std::vector<std::int32_t> tail = MakeTokens(/*count=*/4, /*start=*/901);
     r2_tokens.insert(r2_tokens.end(), tail.begin(), tail.end());
     Submit(MakeSpecWithTokens("r2", r2_tokens));
 
@@ -2342,8 +2342,8 @@ TEST_F(PrefixHitSuite, PartialHit) {
 
     // r2: 12 tokens, only the first 4 match r1 (pages 0..1); the hash chain
     // propagates the divergence to every later page. Hit = 2 pages = 4 tokens.
-    token_vec_t r2_tokens = MakeTokens(/*count=*/4);  // 1..4 == r1's first 4
-    const token_vec_t tail = MakeTokens(/*count=*/8, /*start=*/801);
+    std::vector<std::int32_t> r2_tokens = MakeTokens(/*count=*/4);  // 1..4 == r1's first 4
+    const std::vector<std::int32_t> tail = MakeTokens(/*count=*/8, /*start=*/801);
     r2_tokens.insert(r2_tokens.end(), tail.begin(), tail.end());
     Submit(MakeSpecWithTokens("r2", r2_tokens));
 
@@ -2394,8 +2394,8 @@ TEST_F(PrefixHitSmallWindowSuite, SwaGroupHitRespectsWindow) {
     // r2: 10 tokens, first 8 == r1's. Fixpoint (W=4, page=2, pages_needed
     // = ceil(3/2) = 2): cap = (10-1)/2 = 4, full matches 4; swa scan stops at
     // run 2 -> keep 4 with 2 holes -> common stays 4 = 8 hit tokens.
-    token_vec_t r2_tokens = MakeAlignedTokens(/*num_pages=*/4, PageSize());  // 1..8 == r1's
-    const token_vec_t tail = MakeTokens(/*count=*/2, /*start=*/901);
+    std::vector<std::int32_t> r2_tokens = MakeAlignedTokens(/*num_pages=*/4, PageSize());  // 1..8 == r1's
+    const std::vector<std::int32_t> tail = MakeTokens(/*count=*/2, /*start=*/901);
     r2_tokens.insert(r2_tokens.end(), tail.begin(), tail.end());
     Submit(MakeSpecWithTokens("r2", r2_tokens));
 
@@ -2475,8 +2475,8 @@ TEST_F(PrefixHitTightPoolSuite, ProtectedHitAndFreshDemandMustFitTogether) {
     // r2: 8 tokens, first 4 == r1's. The 4 cached hit parents are protected.
     // Its suffix and reserve need 6 empty parents, but r3 pins 4 and leaves only
     // 2 empty, so the whole admission defers without acquiring the hits.
-    token_vec_t r2_tokens = MakeAlignedTokens(/*num_pages=*/2, PageSize());  // tokens 1..4 == r1's
-    const token_vec_t tail = MakeTokens(/*count=*/4, /*start=*/901);
+    std::vector<std::int32_t> r2_tokens = MakeAlignedTokens(/*num_pages=*/2, PageSize());  // tokens 1..4 == r1's
+    const std::vector<std::int32_t> tail = MakeTokens(/*count=*/4, /*start=*/901);
     r2_tokens.insert(r2_tokens.end(), tail.begin(), tail.end());
     Submit(MakeSpecWithTokens("r2", r2_tokens));
     ExecutionPlan blocked = PlanOnce();
@@ -2525,7 +2525,7 @@ class DecodeCachingSuite : public PrefixHitSuite {
 protected:
     // Deliver one sampled token and run the next schedule round, returning the
     // per-group rows the round's op carried. Single-request rounds only.
-    std::map<std::string, std::vector<std::int32_t>> AdvanceOneRound(const std::string& id, token_t token) {
+    std::map<std::string, std::vector<std::int32_t>> AdvanceOneRound(const std::string& id, std::int32_t token) {
         SendForwardDone(id, {token});
         ExecutionPlan plan = PlanOnce();
         const ForwardBatch* op = FindForwardBatch(plan);
@@ -2559,21 +2559,21 @@ protected:
 
     // Turn-2 prompt: r1's 4 prompt tokens + first 4 generated + 2 new = 10;
     // pages 0..3 match r1's registration by content.
-    token_vec_t MakeTurnTwoPrompt() {
-        token_vec_t tokens = MakeAlignedTokens(/*num_pages=*/2, PageSize());  // {1,2,3,4} == r1's prompt
-        const token_vec_t response = MakeTokens(/*count=*/4, /*start=*/101);  // r1's generated 101..104
+    std::vector<std::int32_t> MakeTurnTwoPrompt() {
+        std::vector<std::int32_t> tokens = MakeAlignedTokens(/*num_pages=*/2, PageSize());  // {1,2,3,4} == r1's prompt
+        const std::vector<std::int32_t> response = MakeTokens(/*count=*/4, /*start=*/101);  // r1's generated 101..104
         tokens.insert(tokens.end(), response.begin(), response.end());
-        const token_vec_t fresh = MakeTokens(/*count=*/2, /*start=*/901);
+        const std::vector<std::int32_t> fresh = MakeTokens(/*count=*/2, /*start=*/901);
         tokens.insert(tokens.end(), fresh.begin(), fresh.end());
         return tokens;
     }
 
     // Turn-3 prompt: turn 2's full 13-token stream + 3 new tokens = 16.
-    token_vec_t MakeTurnThreePrompt() {
-        token_vec_t tokens = MakeTurnTwoPrompt();
-        const token_vec_t r2_response = MakeTokens(/*count=*/3, /*start=*/201);
+    std::vector<std::int32_t> MakeTurnThreePrompt() {
+        std::vector<std::int32_t> tokens = MakeTurnTwoPrompt();
+        const std::vector<std::int32_t> r2_response = MakeTokens(/*count=*/3, /*start=*/201);
         tokens.insert(tokens.end(), r2_response.begin(), r2_response.end());
-        const token_vec_t fresh = MakeTokens(/*count=*/3, /*start=*/951);
+        const std::vector<std::int32_t> fresh = MakeTokens(/*count=*/3, /*start=*/951);
         tokens.insert(tokens.end(), fresh.begin(), fresh.end());
         return tokens;
     }
@@ -2652,7 +2652,7 @@ TEST_F(DecodeCachingSuite, MultiTurnConversationReusesResponsePages) {
     EXPECT_EQ(op3->extend_prefix_lens.at(0), 12) << "hit grows across turns: 8 -> 12 tokens";
     EXPECT_EQ(op3->input_lengths.at(0), 4);
     EXPECT_EQ(op3->prefill_lengths.at(0), 16);
-    EXPECT_EQ(op3->input_ids, (token_vec_t{203, 951, 952, 953}));
+    EXPECT_EQ(op3->input_ids, (std::vector<std::int32_t>{203, 951, 952, 953}));
     // 6 claimed + 2 fresh + 1 preallocated decode page.
     EXPECT_EQ(op3->block_tables.at("full").at(0).size(), 9u);
     EXPECT_EQ(op3->block_tables.at("swa").at(0).size(), 9u);
@@ -2712,7 +2712,7 @@ TEST_F(DecodeCachingSmallWindowSuite, SwaPunchedDecodePageStillHittable) {
     // r2: same 8-token prefix + 2 new. Fixpoint (W=4, needed 2): cap =
     // (10-1)/2 = 4, all four hashes cached (0,1,2 punched WITH hash); full
     // matches 4, swa bounded scan keeps 4 (2 holes) -> common 4 = 8 hit tokens.
-    token_vec_t r2_tokens = MakeTurnTwoPrompt();
+    std::vector<std::int32_t> r2_tokens = MakeTurnTwoPrompt();
     Submit(MakeSpecWithTokens("r2", r2_tokens));
     ExecutionPlan plan = PlanOnce();
     const ForwardBatch* op = FindForwardBatch(plan);
@@ -3282,7 +3282,7 @@ protected:
 
     void AckWriteBacks(const ExecutionPlan& plan) {
         for (const CacheOperation& op : ExtractCacheOpsOfKind<WriteBackBatch>(plan)) {
-            for (cache_op_id id : std::get<WriteBackBatch>(op).op_ids) {
+            for (std::uint32_t id : std::get<WriteBackBatch>(op).op_ids) {
                 SendWriteBackDone(id, /*success=*/true);
             }
         }

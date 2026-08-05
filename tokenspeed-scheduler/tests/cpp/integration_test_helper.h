@@ -30,7 +30,7 @@
 #include "scheduler/scheduler.h"
 #include "scheduler/execution_plan.h"
 #include "scheduler/execution_event.h"
-#include "scheduler/operations/cache.h"
+#include "cache/tier/transfer.h"
 #include "scheduler/operations/inc.h"
 #include "scheduler/types.h"
 
@@ -67,7 +67,7 @@ protected:
 
     const SchedulerConfig& Config() const { return config_; }
     std::int32_t PageSize() const { return config_.block_size; }
-    RequestSpec MakeRequestSpec(const std::string& id, std::int32_t num_pages, token_t start = 1) {
+    RequestSpec MakeRequestSpec(const std::string& id, std::int32_t num_pages, std::int32_t start = 1) {
         auto tokens = MakeAlignedTokens(num_pages, PageSize(), start);
         return RequestSpec{
             .request_id = id,
@@ -107,7 +107,7 @@ protected:
         return FilterByKind<Kind>(ExtractCacheOps(plan));
     }
 
-    void SendWriteBackDone(cache_op_id op_id, bool success = true) {
+    void SendWriteBackDone(std::uint32_t op_id, bool success = true) {
         ExecutionEvent event;
         event.With(CacheEvent{cache::WriteBackDone{
             .op_id = op_id,
@@ -116,7 +116,7 @@ protected:
         scheduler_->Advance(std::move(event));
     }
 
-    void SendLoadBackDone(cache_op_id op_id, bool success = true) {
+    void SendLoadBackDone(std::uint32_t op_id, bool success = true) {
         ExecutionEvent event;
         event.With(CacheEvent{cache::LoadBackDone{
             .op_id = op_id,
@@ -142,6 +142,12 @@ protected:
         event.With(ForwardEvent{forward::Finish{
             .request_id = request_id,
         }});
+        scheduler_->Advance(std::move(event));
+    }
+
+    void SendAbortEvent(const std::string& request_id) {
+        ExecutionEvent event;
+        event.With(ForwardEvent{forward::Abort{.request_id = request_id}});
         scheduler_->Advance(std::move(event));
     }
 
@@ -217,11 +223,7 @@ protected:
         return cfg;
     }
 
-    void AbortRequest(const std::string& id) {
-        ExecutionEvent event;
-        event.With(ForwardEvent{forward::Abort{.request_id = id}});
-        scheduler_->Advance(std::move(event));
-    }
+    void AbortRequest(const std::string& id) { SendAbortEvent(id); }
 };
 
 }  // namespace tokenspeed::test

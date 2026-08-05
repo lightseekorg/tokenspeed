@@ -20,113 +20,30 @@
 
 #pragma once
 
-#include <cstddef>
-#include <cstdint>
-#include <functional>
-#include <unordered_set>
-#include <utility>
-#include <variant>
+#include <map>
+#include <span>
+#include <string>
 #include <vector>
 
-#include "core/types.h"
+#include "cache/core/cache_types.h"
+#include "cache/coordinator/kv_cache_coordinator.h"
 
 namespace tokenspeed {
 
-struct CacheTransfer {
-    GroupId group_id{0};
-    std::int32_t source_page{-1};
-    std::int32_t destination_page{-1};
+struct SchedulerConfig;
 
-    bool operator==(const CacheTransfer&) const = default;
-};
+// One KvCacheSpec per config paged_cache_group (group_id = index); all groups share config.block_size.
+std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config);
 
-struct CacheTransferHash {
-    std::size_t operator()(const CacheTransfer& transfer) const {
-        std::size_t seed = std::hash<GroupId>{}(transfer.group_id);
-        const auto combine = [&seed](std::int32_t value) {
-            const std::size_t hash = std::hash<std::int32_t>{}(value);
-            seed ^= hash + 0x9e3779b9U + (seed << 6U) + (seed >> 2U);
-        };
-        combine(transfer.source_page);
-        combine(transfer.destination_page);
-        return seed;
-    }
-};
+std::int32_t AlignPrefillChunk(std::int32_t first_pos, std::int32_t unscheduled, std::int32_t token_budget,
+                               std::int32_t page_size, std::int32_t promotion_boundary_tokens);
 
-struct WriteBackOperation {
-    cache_op_id op_id{0};
-    std::vector<CacheTransfer> transfers;  // DEVICE→HOST.
+void FreeRequest(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables);
 
-    WriteBackOperation() = default;
-    WriteBackOperation(cache_op_id op_id, std::vector<CacheTransfer> transfers)
-        : op_id{op_id}, transfers{std::move(transfers)} {}
-};
-
-struct WriteBackBatch {
-    std::vector<cache_op_id> op_ids;
-    std::vector<std::vector<GroupId>> group_ids;
-    std::vector<std::vector<std::int32_t>> src_pages;
-    std::vector<std::vector<std::int32_t>> dst_pages;
-
-    explicit WriteBackBatch(const std::vector<WriteBackOperation>& ops) {
-        std::unordered_set<CacheTransfer, CacheTransferHash> seen;
-        for (const auto& op : ops) {
-            std::vector<GroupId> operation_groups;
-            std::vector<std::int32_t> operation_sources;
-            std::vector<std::int32_t> operation_destinations;
-            for (const auto& transfer : op.transfers) {
-                if (seen.insert(transfer).second) {
-                    operation_groups.push_back(transfer.group_id);
-                    operation_sources.push_back(transfer.source_page);
-                    operation_destinations.push_back(transfer.destination_page);
-                }
-            }
-
-            op_ids.push_back(op.op_id);
-            group_ids.push_back(std::move(operation_groups));
-            src_pages.push_back(std::move(operation_sources));
-            dst_pages.push_back(std::move(operation_destinations));
-        }
-    }
-};
-
-struct LoadBackOperation {
-    cache_op_id op_id{0};
-    std::vector<CacheTransfer> transfers;  // HOST→DEVICE.
-
-    LoadBackOperation() = default;
-    LoadBackOperation(cache_op_id op_id, std::vector<CacheTransfer> transfers)
-        : op_id{op_id}, transfers{std::move(transfers)} {}
-};
-
-struct LoadBackBatch {
-    std::vector<cache_op_id> op_ids;
-    std::vector<std::vector<GroupId>> group_ids;
-    std::vector<std::vector<std::int32_t>> src_pages;
-    std::vector<std::vector<std::int32_t>> dst_pages;
-
-    explicit LoadBackBatch(const std::vector<LoadBackOperation>& ops) {
-        std::unordered_set<CacheTransfer, CacheTransferHash> seen;
-        for (const auto& op : ops) {
-            std::vector<GroupId> operation_groups;
-            std::vector<std::int32_t> operation_sources;
-            std::vector<std::int32_t> operation_destinations;
-            for (const auto& transfer : op.transfers) {
-                if (seen.insert(transfer).second) {
-                    operation_groups.push_back(transfer.group_id);
-                    operation_sources.push_back(transfer.source_page);
-                    operation_destinations.push_back(transfer.destination_page);
-                }
-            }
-
-            op_ids.push_back(op.op_id);
-            group_ids.push_back(std::move(operation_groups));
-            src_pages.push_back(std::move(operation_sources));
-            dst_pages.push_back(std::move(operation_destinations));
-        }
-    }
-};
-
-using CacheOperation = std::variant<LoadBackBatch, WriteBackBatch>;
+// One row per config group_id. Each manager resolves the group's LCM placement
+// to the kernel-visible page id.
+std::map<std::string, std::vector<std::int32_t>> BuildBlockTables(const KvCacheCoordinator& coordinator,
+                                                                  const std::vector<BlockTable>& tables,
+                                                                  std::span<const std::string> group_ids);
 
 }  // namespace tokenspeed

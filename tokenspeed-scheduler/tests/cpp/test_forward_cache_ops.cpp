@@ -25,11 +25,11 @@
 #include <string>
 #include <vector>
 
-#include "cache/block_pool.h"
-#include "cache/cache_types.h"
-#include "cache/forward_cache_ops.h"
-#include "cache/kv_cache_coordinator.h"
+#include "cache/core/block_pool.h"
+#include "cache/core/cache_types.h"
+#include "cache/coordinator/kv_cache_coordinator.h"
 #include "cache_test_access.h"
+#include "scheduler/operations/cache.h"
 #include "scheduler/page_hasher.h"
 #include "scheduler/types.h"
 

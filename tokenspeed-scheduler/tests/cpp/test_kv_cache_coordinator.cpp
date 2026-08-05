@@ -32,12 +32,12 @@
 #include <unordered_set>
 #include <vector>
 
-#include "cache/block_pool.h"
-#include "cache/cache_group.h"
-#include "cache/kv_cache_coordinator.h"
-#include "cache/cache_types.h"
-#include "cache/full_attn_manager.h"
-#include "cache/swa_manager.h"
+#include "cache/core/block_pool.h"
+#include "cache/manager/cache_group.h"
+#include "cache/coordinator/kv_cache_coordinator.h"
+#include "cache/core/cache_types.h"
+#include "cache/manager/full_attn_manager.h"
+#include "cache/manager/swa_manager.h"
 #include "cache_test_access.h"
 #include "scheduler/page_hasher.h"
 
@@ -69,7 +69,7 @@ std::uint64_t NextTestAccessEpoch() {
     return ++next_access_epoch;
 }
 
-CacheKey Key(const std::string& content_hash, GroupId group_id, std::int32_t cache_block_offset = 0) {
+CacheKey Key(const std::string& content_hash, std::uint32_t group_id, std::int32_t cache_block_offset = 0) {
     return CacheKey{
         .group_id = group_id,
         .content_hash = content_hash,
@@ -90,7 +90,7 @@ std::int32_t CacheForGroup(KvCacheCoordinator& coordinator, BlockPool& pool, con
 }
 
 CacheBlockLocation CacheBoundaryForGroup(KvCacheCoordinator& coordinator, BlockPool& pool,
-                                         const std::string& content_hash, GroupId group_id, std::uint64_t access_epoch,
+                                         const std::string& content_hash, std::uint32_t group_id, std::uint64_t access_epoch,
                                          std::int32_t logical_block_index,
                                          CacheBoundaryKind boundary_kind = CacheBoundaryKind::kChunk) {
     KvCacheManager& manager = coordinator.GroupManager(static_cast<std::int32_t>(group_id));
@@ -904,7 +904,7 @@ TEST(KvCacheCoordinatorAdmissionTest, DoesNotShareFreeSlotsFromBoundForeignParen
     std::vector<GroupDemand> demands = FreshDemands(tables, tokens);
     EXPECT_FALSE(coordinator.Admit(coordinator.ProbePrefix({}), demands));
 
-    EXPECT_EQ(pool.BoundGroup(1), std::optional<GroupId>{0});
+    EXPECT_EQ(pool.BoundGroup(1), std::optional<std::uint32_t>{0});
     EXPECT_TRUE(tables[0].Blocks().empty());
     EXPECT_TRUE(tables[1].Blocks().empty());
 }
@@ -1255,14 +1255,14 @@ TEST(KvCacheCoordinatorAdmissionTest, RebindsOnlyAfterEvictingWholeForeignParent
     const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
     CacheForGroup(coordinator, pool, hashes[0], 0);
     CacheForGroup(coordinator, pool, hashes[1], 0);
-    ASSERT_EQ(pool.BoundGroup(1), std::optional<GroupId>{0});
+    ASSERT_EQ(pool.BoundGroup(1), std::optional<std::uint32_t>{0});
 
     std::vector<BlockTable> tables(coordinator.NumGroups());
     const std::array<std::int32_t, 2> tokens{0, 4};
     std::vector<GroupDemand> demands = FreshDemands(tables, tokens);
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands));
 
-    EXPECT_EQ(pool.BoundGroup(1), std::optional<GroupId>{1});
+    EXPECT_EQ(pool.BoundGroup(1), std::optional<std::uint32_t>{1});
     EXPECT_EQ(tables[1].NumBlocks(), 1);
     EXPECT_EQ(coordinator.GroupManager(0).NumCachedBlocks(pool), 0);
 }
@@ -1341,7 +1341,7 @@ TEST(KvCacheCoordinatorAdmissionTest, ProspectiveHitParentCannotBecomeVictim) {
     KvCacheCoordinator::PrefixProbe prefix = coordinator.ProbePrefix(std::span<const std::string>{hashes}.first(1));
 
     EXPECT_FALSE(coordinator.Admit(std::move(prefix), demands));
-    EXPECT_EQ(pool.BoundGroup(protected_parent), std::optional<GroupId>{0});
+    EXPECT_EQ(pool.BoundGroup(protected_parent), std::optional<std::uint32_t>{0});
     EXPECT_EQ(coordinator.GroupManager(0).NumCachedBlocks(pool), 2);
     EXPECT_TRUE(tables[0].Blocks().empty());
     EXPECT_TRUE(tables[1].Blocks().empty());
@@ -2297,7 +2297,7 @@ TEST(KvCacheCoordinatorStoreCandidates, CollectsKeysWithoutPinningDeviceBlocks) 
     EXPECT_EQ(keys.size(), 4u);
     // Collection is group-major: 2 pages for group 0, then 2 for group 1.
     for (std::size_t i = 0; i < pending.size(); ++i) {
-        EXPECT_EQ(pending[i].key, Key(hashes[i % 2], static_cast<GroupId>(i / 2))) << "candidate " << i;
+        EXPECT_EQ(pending[i].key, Key(hashes[i % 2], static_cast<std::uint32_t>(i / 2))) << "candidate " << i;
     }
 
     // Re-registering the same hashes yields nothing new (IsCached skip).

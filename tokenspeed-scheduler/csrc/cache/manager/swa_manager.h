@@ -25,9 +25,9 @@
 #include <span>
 #include <vector>
 
-#include "cache/block_pool.h"
-#include "cache/cache_types.h"
-#include "cache/kv_cache_manager.h"
+#include "cache/core/block_pool.h"
+#include "cache/core/cache_types.h"
+#include "cache/manager/kv_cache_manager.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -38,7 +38,7 @@ public:
         : SwaManager(cache_block_tokens, /*cache_blocks_per_lcm_block=*/1, sliding_window, /*group_id=*/0) {}
 
     SwaManager(std::int32_t cache_block_tokens, std::int32_t cache_blocks_per_lcm_block, std::int32_t sliding_window,
-               GroupId group_id = 0)
+               std::uint32_t group_id = 0)
         : KvCacheManager(cache_block_tokens, cache_blocks_per_lcm_block, group_id), sliding_window_{sliding_window} {
         _assert(sliding_window > 0, "sliding_window must be > 0");
     }

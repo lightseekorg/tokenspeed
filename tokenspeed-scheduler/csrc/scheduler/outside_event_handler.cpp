@@ -20,7 +20,6 @@
 
 #include "scheduler/scheduler.h"
 
-#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -34,16 +33,6 @@
 #include "utils.h"
 
 namespace tokenspeed {
-
-namespace {
-
-void FreeAll(std::vector<CacheBlockRef>&& block_refs) {
-    for (auto it = block_refs.rbegin(); it != block_refs.rend(); ++it) {
-        it->reset();
-    }
-}
-
-}  // namespace
 
 void Scheduler::handleEvent(const pd::BootstrappedEvent& event) {
     Request* request = findRequest(event.request_id);
@@ -155,46 +144,23 @@ void Scheduler::handleEvent(const forward::Abort& event) {
 }
 
 void Scheduler::handleEvent(const cache::WriteBackDone& event) {
-    if (auto it = retraction_ops_.find(event.op_id); it != retraction_ops_.end()) {
-        if (Request* request = findRequest(it->second.request_id); request != nullptr && request->Is<fsm::Retracting>()) {
+    if (auto request_id = tier_transfers_.CompleteWriteBack(event.op_id, event.success)) {
+        if (Request* request = findRequest(*request_id); request != nullptr && request->Is<fsm::Retracting>()) {
             if (event.success) {
                 request->Apply(fsm::CompleteRetractionEvent{&coordinator_});
             } else {
                 request->Apply(fsm::CancelRetractionEvent{});
             }
         }
-        retraction_ops_.erase(it);
-        return;
-    }
-    std::vector<StoreTicket> tickets = store_ops_.Retire(event.op_id);
-    for (StoreTicket& ticket : tickets) {
-        if (event.success) {
-            coordinator_.CacheHostBlock(ticket.host_block_ref, ticket.key);
-        }
-    }
-    for (auto it = tickets.rbegin(); it != tickets.rend(); ++it) {
-        it->device_block_ref.reset();
-        it->host_block_ref.reset();
     }
 }
 
 void Scheduler::handleEvent(const cache::LoadBackDone& event) {
-    if (auto it = recovery_ops_.find(event.op_id); it != recovery_ops_.end()) {
-        _assert(event.success, "snapshot recovery H2D must not fail");
-        if (Request* request = findRequest(it->second.request_id); request != nullptr && request->Is<fsm::Recovering>()) {
+    if (auto request_id = tier_transfers_.CompleteLoadBack(event.op_id, event.success)) {
+        if (Request* request = findRequest(*request_id); request != nullptr && request->Is<fsm::Recovering>()) {
             request->Apply(fsm::CompleteRecoveryEvent{});
         }
-        recovery_ops_.erase(it);
-        return;
     }
-    auto it = load_ops_.find(event.op_id);
-    if (it == load_ops_.end()) {
-        return;
-    }
-    _assert(event.success, "host loadback failed: host bytes integrity");
-    FreeAll(std::move(it->second.host_pins));
-    FreeAll(std::move(it->second.device_blocks));
-    load_ops_.erase(it);
 }
 
 }  // namespace tokenspeed

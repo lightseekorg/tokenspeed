@@ -18,18 +18,31 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#pragma once
+#include "cache/core/cache_config.h"
 
-#include <cstdint>
-#include <span>
-#include <vector>
+#include <stdexcept>
 
 namespace tokenspeed {
 
-using token_t = std::int32_t;
-using token_vec_t = std::vector<token_t>;
-using token_slice = std::span<const token_t>;
-using cache_op_id = std::uint32_t;
-using GroupId = std::uint32_t;
+void PagedCacheGroupConfig::Validate() const {
+    if (group_id.empty()) {
+        throw std::invalid_argument("PagedCacheGroupConfig: group_id must be non-empty");
+    }
+    if (rows_per_page <= 0) {
+        throw std::invalid_argument("PagedCacheGroupConfig: rows_per_page must be > 0");
+    }
+    if (entry_stride_tokens <= 0) {
+        throw std::invalid_argument("PagedCacheGroupConfig: entry_stride_tokens must be > 0");
+    }
+    if (total_pages < 1) {
+        throw std::invalid_argument("PagedCacheGroupConfig: total_pages must include the null page");
+    }
+    if (cache_blocks_per_lcm_block <= 0) {
+        throw std::invalid_argument("PagedCacheGroupConfig: cache_blocks_per_lcm_block must be > 0");
+    }
+    if (retention == Retention::SlidingWindow && (!sliding_window_tokens || *sliding_window_tokens <= 0)) {
+        throw std::invalid_argument("PagedCacheGroupConfig: sliding_window_tokens must be > 0 for sliding groups");
+    }
+}
 
 }  // namespace tokenspeed

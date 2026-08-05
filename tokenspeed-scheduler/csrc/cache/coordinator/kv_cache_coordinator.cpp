@@ -18,7 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#include "cache/kv_cache_coordinator.h"
+#include "cache/coordinator/kv_cache_coordinator.h"
 
 #include <algorithm>
 #include <limits>
@@ -26,9 +26,9 @@
 #include <optional>
 #include <tuple>
 
-#include "cache/full_attn_manager.h"
-#include "cache/mamba_state_manager.h"
-#include "cache/swa_manager.h"
+#include "cache/manager/full_attn_manager.h"
+#include "cache/manager/mamba_state_manager.h"
+#include "cache/manager/swa_manager.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -46,7 +46,7 @@ KvCacheCoordinator::KvCacheCoordinator(std::vector<CacheGroup> groups, std::int3
     : groups_{std::move(groups)}, pool_{pool}, host_pool_{host_pool}, cache_block_tokens_{cache_block_tokens} {
     _assert(cache_block_tokens_ > 0, "coordinator needs positive cache_block_tokens");
     for (std::size_t i = 0; i < groups_.size(); ++i) {
-        _assert(groups_[i].Id() == static_cast<GroupId>(i), "cache manager group id must equal its group index");
+        _assert(groups_[i].Id() == static_cast<std::uint32_t>(i), "cache manager group id must equal its group index");
         const std::int32_t group_cache_block_tokens = EffectiveCacheBlockTokens(groups_[i].Spec(), cache_block_tokens_);
         _assert(group_cache_block_tokens > 0 && cache_block_tokens_ % group_cache_block_tokens == 0,
                 "manager cache block tokens must divide the coordinator domain");
@@ -71,7 +71,7 @@ bool KvCacheCoordinator::HasMambaStateGroup() const {
 }
 
 bool KvCacheCoordinator::ClearDeviceCache() {
-    std::vector<std::pair<GroupId, CacheBlockLocation>> cached_locations;
+    std::vector<std::pair<std::uint32_t, CacheBlockLocation>> cached_locations;
     for (const CacheGroup& group : groups_) {
         const KvCacheManager& manager = group.Manager();
         std::vector<CacheBlockLocation> group_locations = manager.EvictableBlockLocations(pool_);
@@ -91,7 +91,7 @@ bool KvCacheCoordinator::ClearDeviceCache() {
 }
 
 std::vector<CacheKey> KvCacheCoordinator::keysForGroup(std::span<const std::string> content_hashes,
-                                                       GroupId group_id) const {
+                                                       std::uint32_t group_id) const {
     _assert(group_id < groups_.size(), "cache key group id out of range");
     const std::int32_t group_cache_block_tokens = groups_[group_id].Manager().CacheBlockTokens();
     const std::int32_t cache_blocks_per_hash = cache_block_tokens_ / group_cache_block_tokens;
@@ -291,7 +291,7 @@ KvCacheCoordinator::AcquiredPrefix KvCacheCoordinator::acquirePrefix(PrefixProbe
 std::int32_t KvCacheCoordinator::NumAvailableLcmBlocks() const {
     std::int32_t available = 0;
     for (std::int32_t parent_id = 1; parent_id <= pool_.NumLcmBlocks(); ++parent_id) {
-        const std::optional<GroupId> group_id = pool_.BoundGroup(parent_id);
+        const std::optional<std::uint32_t> group_id = pool_.BoundGroup(parent_id);
         if (!group_id || groups_[*group_id].Manager().ParentIsFullyEvictable(pool_, parent_id)) {
             ++available;
         }
@@ -358,7 +358,7 @@ CacheBlockRef KvCacheCoordinator::AcquireDeviceCachedBlock(const CacheKey& key) 
     return groups_[key.group_id].Manager().AcquireCachedBlock(pool_, key);
 }
 
-CacheBlockRef KvCacheCoordinator::AcquireHostBlockForStore(GroupId group_id) {
+CacheBlockRef KvCacheCoordinator::AcquireHostBlockForStore(std::uint32_t group_id) {
     _assert(host_pool_ != nullptr, "AcquireHostBlockForStore requires a host pool");
     _assert(group_id < groups_.size(), "Host store group id out of range");
     KvCacheManager& target = groups_[group_id].Manager();
@@ -367,7 +367,7 @@ CacheBlockRef KvCacheCoordinator::AcquireHostBlockForStore(GroupId group_id) {
         return block_ref;
     }
 
-    const auto value = [&](GroupId candidate_group, CacheBlockLocation location) {
+    const auto value = [&](std::uint32_t candidate_group, CacheBlockLocation location) {
         const auto metadata = groups_[candidate_group].Manager().CachedBlockMetadataFor(*host_pool_, location);
         _assert(metadata.has_value(), "evictable Host block has no cache metadata");
         return std::tuple{metadata->was_acquired,
@@ -393,7 +393,7 @@ CacheBlockRef KvCacheCoordinator::AcquireHostBlockForStore(GroupId group_id) {
     std::optional<std::int32_t> victim_parent;
     std::optional<HostCacheValue> victim_value;
     for (std::int32_t parent_id = 1; parent_id <= host_pool_->NumLcmBlocks(); ++parent_id) {
-        const std::optional<GroupId> bound_group = host_pool_->BoundGroup(parent_id);
+        const std::optional<std::uint32_t> bound_group = host_pool_->BoundGroup(parent_id);
         if (!bound_group || !groups_[*bound_group].Manager().ParentIsFullyEvictable(*host_pool_, parent_id)) {
             continue;
         }
@@ -416,7 +416,7 @@ CacheBlockRef KvCacheCoordinator::AcquireHostBlockForStore(GroupId group_id) {
         return {};
     }
 
-    const GroupId bound_group = *host_pool_->BoundGroup(*victim_parent);
+    const std::uint32_t bound_group = *host_pool_->BoundGroup(*victim_parent);
     KvCacheManager& manager = groups_[bound_group].Manager();
     for (std::int32_t slot = 0; slot < manager.CacheBlocksPerLcmBlock(); ++slot) {
         const CacheBlockLocation location{.lcm_block_id = *victim_parent, .slot_index = slot};
@@ -430,7 +430,7 @@ CacheBlockRef KvCacheCoordinator::AcquireHostBlockForStore(GroupId group_id) {
     return block_ref;
 }
 
-bool KvCacheCoordinator::evictCachedBlock(GroupId group_id, CacheBlockLocation location) {
+bool KvCacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocation location) {
     std::optional<CacheKey> removed = groups_[group_id].Manager().EvictCachedBlock(pool_, location);
     if (!removed) {
         return false;
@@ -552,7 +552,7 @@ KvCacheCoordinator MakeCoordinator(std::span<const KvCacheSpec> specs, std::int3
     groups.reserve(specs.size());
     for (std::size_t i = 0; i < specs.size(); ++i) {
         const KvCacheSpec& spec = specs[i];
-        const GroupId group_id = static_cast<GroupId>(i);
+        const std::uint32_t group_id = static_cast<std::uint32_t>(i);
         _assert(spec.cache_blocks_per_lcm_block > 0, "cache_blocks_per_lcm_block must be > 0");
         const std::int32_t group_cache_block_tokens = EffectiveCacheBlockTokens(spec, cache_block_tokens);
         _assert(group_cache_block_tokens > 0 && cache_block_tokens % group_cache_block_tokens == 0,

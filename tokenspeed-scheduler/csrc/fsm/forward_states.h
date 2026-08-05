@@ -28,7 +28,7 @@
 #include <utility>
 #include <vector>
 
-#include "cache/cache_types.h"
+#include "cache/core/cache_types.h"
 #include "core/token_container.h"
 #include "resource/allocator/req_pool_allocator.h"
 #include "scheduler/request_spec.h"

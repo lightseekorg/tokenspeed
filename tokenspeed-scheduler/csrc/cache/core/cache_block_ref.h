@@ -23,8 +23,6 @@
 #include <cstdint>
 #include <functional>
 
-#include "core/types.h"
-
 namespace tokenspeed {
 
 class BlockPool;

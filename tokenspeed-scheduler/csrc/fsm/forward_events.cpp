@@ -23,7 +23,7 @@
 #include <memory>
 #include <utility>
 
-#include "cache/forward_cache_ops.h"
+#include "scheduler/operations/cache.h"
 #include "core/token_container.h"
 #include "fsm/pd_states.h"
 

@@ -32,9 +32,9 @@
 #include <utility>
 #include <vector>
 
-#include "cache/block_pool.h"
-#include "cache/cache_block_ref.h"
-#include "cache/cache_types.h"
+#include "cache/core/block_pool.h"
+#include "cache/core/cache_block_ref.h"
+#include "cache/core/cache_types.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -52,7 +52,7 @@ public:
     };
 
     explicit KvCacheManager(std::int32_t cache_block_tokens, std::int32_t cache_blocks_per_lcm_block = 1,
-                            GroupId group_id = 0)
+                            std::uint32_t group_id = 0)
         : cache_block_tokens_{cache_block_tokens},
           cache_blocks_per_lcm_block_{cache_blocks_per_lcm_block},
           group_id_{group_id} {
@@ -66,7 +66,7 @@ public:
 
     std::int32_t CacheBlockTokens() const noexcept { return cache_block_tokens_; }
     std::int32_t CacheBlocksPerLcmBlock() const noexcept { return cache_blocks_per_lcm_block_; }
-    GroupId Id() const noexcept { return group_id_; }
+    std::uint32_t Id() const noexcept { return group_id_; }
 
     std::int32_t ResolveKernelPageId(CacheBlockLocation location) const {
         _assert(location.lcm_block_id > 0, "LCM block id must be > 0");
@@ -438,7 +438,7 @@ protected:
 
     std::int32_t cache_block_tokens_;
     std::int32_t cache_blocks_per_lcm_block_;
-    GroupId group_id_;
+    std::uint32_t group_id_;
 
 private:
     struct CacheEntry {

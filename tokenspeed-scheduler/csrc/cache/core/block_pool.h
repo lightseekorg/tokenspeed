@@ -25,10 +25,11 @@
 #include <cstdint>
 #include <deque>
 #include <optional>
+#include <span>
 #include <utility>
 #include <vector>
 
-#include "cache/cache_block_ref.h"
+#include "cache/core/cache_block_ref.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -51,7 +52,7 @@ public:
     std::int32_t NumLcmBlocks() const noexcept { return static_cast<std::int32_t>(lcm_blocks_.size()); }
     std::int32_t NumEmptyLcmBlocks() const noexcept { return static_cast<std::int32_t>(free_parent_ids_.size()); }
 
-    CacheBlockRef AcquireBlock(GroupId group_id, std::int32_t cache_blocks_per_lcm_block) {
+    CacheBlockRef AcquireBlock(std::uint32_t group_id, std::int32_t cache_blocks_per_lcm_block) {
         std::vector<CacheBlockRef> blocks = AcquireBlocks(group_id, cache_blocks_per_lcm_block, 1);
         if (blocks.empty()) {
             return {};
@@ -59,7 +60,7 @@ public:
         return std::move(blocks.front());
     }
 
-    std::vector<CacheBlockRef> AcquireBlocks(GroupId group_id, std::int32_t cache_blocks_per_lcm_block,
+    std::vector<CacheBlockRef> AcquireBlocks(std::uint32_t group_id, std::int32_t cache_blocks_per_lcm_block,
                                              std::int32_t num) {
         _assert(cache_blocks_per_lcm_block > 0, "cache_blocks_per_lcm_block must be > 0");
         if (num <= 0) {
@@ -91,7 +92,7 @@ public:
         return out;
     }
 
-    std::optional<GroupId> BoundGroup(std::int32_t lcm_block_id) const { return lcmBlock(lcm_block_id).bound_group; }
+    std::optional<std::uint32_t> BoundGroup(std::int32_t lcm_block_id) const { return lcmBlock(lcm_block_id).bound_group; }
     std::int32_t OccupiedCount(std::int32_t lcm_block_id) const {
         return static_cast<std::int32_t>(lcmBlock(lcm_block_id).occupied_count);
     }
@@ -120,6 +121,34 @@ public:
         return locations;
     }
 
+    std::int32_t NumParentsFreedBy(std::span<const CacheBlockLocation> locations) const {
+        std::vector<CacheBlockLocation> unique_locations{locations.begin(), locations.end()};
+        std::ranges::sort(unique_locations, [](CacheBlockLocation lhs, CacheBlockLocation rhs) {
+            return lhs.lcm_block_id != rhs.lcm_block_id ? lhs.lcm_block_id < rhs.lcm_block_id
+                                                       : lhs.slot_index < rhs.slot_index;
+        });
+        unique_locations.erase(std::unique(unique_locations.begin(), unique_locations.end()), unique_locations.end());
+
+        std::int32_t freed_parents = 0;
+        for (auto first = unique_locations.begin(); first != unique_locations.end();) {
+            const std::int32_t parent_id = first->lcm_block_id;
+            const auto last = std::find_if(first, unique_locations.end(),
+                                           [parent_id](CacheBlockLocation location) {
+                                               return location.lcm_block_id != parent_id;
+                                           });
+            _assert(std::ranges::all_of(first, last, [this](CacheBlockLocation location) {
+                        return IsOccupied(location);
+                    }),
+                    "released CacheBlock location is not occupied");
+            const auto released_children = static_cast<std::int32_t>(last - first);
+            if (released_children == OccupiedCount(parent_id)) {
+                ++freed_parents;
+            }
+            first = last;
+        }
+        return freed_parents;
+    }
+
     void Release(CacheBlockLocation location) noexcept {
         FatalCheck(location.lcm_block_id > 0 && static_cast<std::size_t>(location.lcm_block_id) <= lcm_blocks_.size(),
                    "CacheBlock location has invalid LCM block id");
@@ -141,7 +170,7 @@ public:
 
 private:
     struct LcmBlock {
-        std::optional<GroupId> bound_group;
+        std::optional<std::uint32_t> bound_group;
         std::vector<bool> occupancy;
         std::uint32_t occupied_count{0};
     };
@@ -157,7 +186,7 @@ private:
         return lcm_blocks_[static_cast<std::size_t>(lcm_block_id - 1)];
     }
 
-    CacheBlockRef createBlockRef(GroupId group_id, std::int32_t slots_per_parent, CacheBlockLocation location) {
+    CacheBlockRef createBlockRef(std::uint32_t group_id, std::int32_t slots_per_parent, CacheBlockLocation location) {
         auto* control = new internal_cache_block_ref::CacheBlockControl(*this, location);
         // Allocate the control before mutating the pool, then commit the
         // location before publishing its RAII owner: CacheBlock destruction
@@ -166,7 +195,7 @@ private:
         return CacheBlockRef{*control};
     }
 
-    void occupy(GroupId group_id, std::int32_t slots_per_parent, CacheBlockLocation location) noexcept {
+    void occupy(std::uint32_t group_id, std::int32_t slots_per_parent, CacheBlockLocation location) noexcept {
         LcmBlock& parent = lcm_blocks_[static_cast<std::size_t>(location.lcm_block_id - 1)];
         if (parent.occupied_count == 0) {
             FatalCheck(!free_parent_ids_.empty() && free_parent_ids_.front() == location.lcm_block_id,
@@ -186,7 +215,7 @@ private:
         ++parent.occupied_count;
     }
 
-    std::vector<CacheBlockLocation> planLocations(GroupId group_id, std::int32_t slots_per_parent,
+    std::vector<CacheBlockLocation> planLocations(std::uint32_t group_id, std::int32_t slots_per_parent,
                                                   std::size_t count) const {
         std::vector<std::int32_t> partially_filled_parent_ids;
         partially_filled_parent_ids.reserve(lcm_blocks_.size());

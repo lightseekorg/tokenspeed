@@ -18,31 +18,34 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#include "cache/cache_config.h"
+#pragma once
 
-#include <stdexcept>
+#include <cstdint>
+#include <memory>
+
+#include "cache/core/cache_types.h"
+#include "cache/manager/kv_cache_manager.h"
 
 namespace tokenspeed {
 
-void PagedCacheGroupConfig::Validate() const {
-    if (group_id.empty()) {
-        throw std::invalid_argument("PagedCacheGroupConfig: group_id must be non-empty");
-    }
-    if (rows_per_page <= 0) {
-        throw std::invalid_argument("PagedCacheGroupConfig: rows_per_page must be > 0");
-    }
-    if (entry_stride_tokens <= 0) {
-        throw std::invalid_argument("PagedCacheGroupConfig: entry_stride_tokens must be > 0");
-    }
-    if (total_pages < 1) {
-        throw std::invalid_argument("PagedCacheGroupConfig: total_pages must include the null page");
-    }
-    if (cache_blocks_per_lcm_block <= 0) {
-        throw std::invalid_argument("PagedCacheGroupConfig: cache_blocks_per_lcm_block must be > 0");
-    }
-    if (retention == Retention::SlidingWindow && (!sliding_window_tokens || *sliding_window_tokens <= 0)) {
-        throw std::invalid_argument("PagedCacheGroupConfig: sliding_window_tokens must be > 0 for sliding groups");
-    }
-}
+// One attention group: spec plus the manager that owns its group identity.
+class CacheGroup {
+public:
+    CacheGroup(KvCacheSpec spec, std::unique_ptr<KvCacheManager> manager) : spec_{spec}, manager_{std::move(manager)} {}
+
+    CacheGroup(const CacheGroup&) = delete;
+    CacheGroup& operator=(const CacheGroup&) = delete;
+    CacheGroup(CacheGroup&&) = default;
+    CacheGroup& operator=(CacheGroup&&) = default;
+
+    KvCacheManager& Manager() { return *manager_; }
+    const KvCacheManager& Manager() const { return *manager_; }
+    const KvCacheSpec& Spec() const { return spec_; }
+    std::uint32_t Id() const { return manager_->Id(); }
+
+private:
+    KvCacheSpec spec_;
+    std::unique_ptr<KvCacheManager> manager_;
+};
 
 }  // namespace tokenspeed

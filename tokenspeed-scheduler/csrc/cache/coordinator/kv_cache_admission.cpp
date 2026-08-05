@@ -18,7 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#include "cache/kv_cache_coordinator.h"
+#include "cache/coordinator/kv_cache_coordinator.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -34,15 +34,15 @@ namespace {
 
 struct AdmissionPlan {
     KvCacheCoordinator::PrefixProbe prefix;
-    std::vector<std::pair<GroupId, CacheBlockLocation>> victims;
+    std::vector<std::pair<std::uint32_t, CacheBlockLocation>> victims;
 };
 
 class AdmissionPlanner {
 public:
     AdmissionPlanner(const std::vector<CacheGroup>& groups, const BlockPool& pool, std::span<const GroupDemand> demands,
                      const KvCacheCoordinator::PrefixProbe& prefix,
-                     std::span<const std::pair<GroupId, CacheBlockLocation>> released_locations,
-                     std::vector<std::pair<GroupId, CacheBlockLocation>>& victims)
+                     std::span<const std::pair<std::uint32_t, CacheBlockLocation>> released_locations,
+                     std::vector<std::pair<std::uint32_t, CacheBlockLocation>>& victims)
         : groups_{groups},
           pool_{pool},
           demands_{demands},
@@ -79,7 +79,7 @@ public:
         // tail also fits. Tentatively restore the prefix newest-first using
         // only the planner's shadow occupancy. If a restore makes admission
         // infeasible, undo it and keep that block as a required victim.
-        std::vector<std::pair<GroupId, CacheBlockLocation>> required_victims;
+        std::vector<std::pair<std::uint32_t, CacheBlockLocation>> required_victims;
         required_victims.reserve(victims_.size());
         for (std::size_t i = victims_.size(); i > 0; --i) {
             const auto& [group_id, location] = victims_[i - 1];
@@ -108,7 +108,7 @@ private:
     };
 
     struct VictimCandidate {
-        GroupId group_id;
+        std::uint32_t group_id;
         CacheBlockLocation location;
         std::uint64_t last_access_epoch;
         EvictionTier eviction_tier;
@@ -139,7 +139,7 @@ private:
         }
 
         for (std::int32_t parent_id = 1; parent_id <= pool_.NumLcmBlocks(); ++parent_id) {
-            const std::optional<GroupId> group_id = pool_.BoundGroup(parent_id);
+            const std::optional<std::uint32_t> group_id = pool_.BoundGroup(parent_id);
             if (!group_id) {
                 ++empty_parent_count_;
                 continue;
@@ -163,7 +163,7 @@ private:
         }
 
         std::unordered_set<CacheBlockLocation, CacheBlockLocationHash> candidates;
-        const auto add_candidate = [&](GroupId group_id, CacheBlockLocation location) {
+        const auto add_candidate = [&](std::uint32_t group_id, CacheBlockLocation location) {
             if (protected_locations.contains(location) || !candidates.insert(location).second) {
                 return;
             }
@@ -205,7 +205,7 @@ private:
         };
 
         for (std::size_t i = 0; i < groups_.size(); ++i) {
-            const GroupId group_id = static_cast<GroupId>(i);
+            const std::uint32_t group_id = static_cast<std::uint32_t>(i);
             const KvCacheManager& manager = groups_[i].Manager();
             std::vector<CacheBlockLocation> released_for_group;
             for (const auto& [released_group_id, location] : released_locations_) {
@@ -228,7 +228,7 @@ private:
         std::ranges::make_heap(victim_candidates_, evictedAfter);
     }
 
-    void removeOccupant(GroupId group_id, CacheBlockLocation location) {
+    void removeOccupant(std::uint32_t group_id, CacheBlockLocation location) {
         _assert(pool_.BoundGroup(location.lcm_block_id) == group_id,
                 "released admission location belongs to another group");
         std::int32_t& occupied = remaining_occupied_[static_cast<std::size_t>(location.lcm_block_id)];
@@ -244,7 +244,7 @@ private:
         }
     }
 
-    void restoreOccupant(GroupId group_id, CacheBlockLocation location) {
+    void restoreOccupant(std::uint32_t group_id, CacheBlockLocation location) {
         std::int32_t& occupied = remaining_occupied_[static_cast<std::size_t>(location.lcm_block_id)];
         const std::int32_t slots = groups_[group_id].Manager().CacheBlocksPerLcmBlock();
         if (occupied == 0) {
@@ -273,8 +273,8 @@ private:
     const BlockPool& pool_;
     std::span<const GroupDemand> demands_;
     const KvCacheCoordinator::PrefixProbe& prefix_;
-    std::span<const std::pair<GroupId, CacheBlockLocation>> released_locations_;
-    std::vector<std::pair<GroupId, CacheBlockLocation>>& victims_;
+    std::span<const std::pair<std::uint32_t, CacheBlockLocation>> released_locations_;
+    std::vector<std::pair<std::uint32_t, CacheBlockLocation>>& victims_;
     std::vector<std::int32_t> remaining_occupied_;
     std::vector<std::int64_t> local_free_slots_;
     std::vector<std::int64_t> blocks_needed_;
@@ -287,7 +287,7 @@ std::optional<AdmissionPlan> planAdmission(const std::vector<CacheGroup>& groups
                                            std::span<const GroupDemand> demands) {
     _assert(demands.size() == groups.size(), "demands/groups size mismatch");
 
-    std::vector<std::pair<GroupId, CacheBlockLocation>> victims;
+    std::vector<std::pair<std::uint32_t, CacheBlockLocation>> victims;
     AdmissionPlanner planner{groups, pool, demands, prefix, {}, victims};
     if (!planner.Plan()) {
         return std::nullopt;
@@ -299,8 +299,8 @@ std::optional<AdmissionPlan> planAdmission(const std::vector<CacheGroup>& groups
 
 bool KvCacheCoordinator::CanAdmitAfterReleasing(
     const PrefixProbe& prefix, std::span<const GroupDemand> demands,
-    std::span<const std::pair<GroupId, CacheBlockLocation>> locations_released_on_ack) const {
-    std::vector<std::pair<GroupId, CacheBlockLocation>> victims;
+    std::span<const std::pair<std::uint32_t, CacheBlockLocation>> locations_released_on_ack) const {
+    std::vector<std::pair<std::uint32_t, CacheBlockLocation>> victims;
     AdmissionPlanner planner{groups_, pool_, demands, prefix, locations_released_on_ack, victims};
     return planner.Plan();
 }
@@ -347,7 +347,7 @@ std::optional<KvCacheCoordinator::AdmissionResult> KvCacheCoordinator::Admit(
             groups_[i].Manager().ClaimHitBlocks(*demands[i].table, std::move(acquired_prefix.device.per_group[i]));
         }
     }
-    std::vector<std::pair<GroupId, CacheBlockLocation>> prospective_victims;
+    std::vector<std::pair<std::uint32_t, CacheBlockLocation>> prospective_victims;
     prospective_victims.reserve(plan.victims.size());
     // A reclaimable table block may still be pinned by both the request and
     // cache here. Evict what is already free, then slide the request tables and

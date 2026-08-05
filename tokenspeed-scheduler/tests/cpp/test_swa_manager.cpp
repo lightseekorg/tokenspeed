@@ -25,10 +25,10 @@
 #include <string>
 #include <vector>
 
-#include "cache/block_pool.h"
-#include "cache/cache_types.h"
+#include "cache/core/block_pool.h"
+#include "cache/core/cache_types.h"
 #include "scheduler/page_hasher.h"
-#include "cache/swa_manager.h"
+#include "cache/manager/swa_manager.h"
 
 namespace tokenspeed::test {
 namespace {
@@ -44,7 +44,7 @@ std::vector<std::int32_t> BlockIds(const std::vector<CacheBlockRef>& refs) {
 
 using token_span = std::span<const std::int32_t>;
 
-CacheKey RealKey(const std::vector<std::int32_t>& tokens, GroupId group_id) {
+CacheKey RealKey(const std::vector<std::int32_t>& tokens, std::uint32_t group_id) {
     std::vector<token_span> pages = {token_span(tokens.data(), tokens.size())};
     std::vector<std::string> hashes = ComputePagedHashes(pages, "");
     return CacheKey{.group_id = group_id, .content_hash = std::move(hashes.front())};

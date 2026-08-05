@@ -26,19 +26,18 @@
 
 #include <gtest/gtest.h>
 
-#include "core/types.h"
 
 namespace tokenspeed::test {
 
 // Generate a consecutive token sequence for test inputs.
-inline token_vec_t MakeTokens(int32_t count, token_t start = 1) {
-    token_vec_t tokens(count);
+inline std::vector<std::int32_t> MakeTokens(int32_t count, std::int32_t start = 1) {
+    std::vector<std::int32_t> tokens(count);
     std::iota(tokens.begin(), tokens.end(), start);
     return tokens;
 }
 
 // Generate a token sequence aligned to page_size.
-inline token_vec_t MakeAlignedTokens(int32_t num_pages, int32_t page_size, token_t start = 1) {
+inline std::vector<std::int32_t> MakeAlignedTokens(int32_t num_pages, int32_t page_size, std::int32_t start = 1) {
     return MakeTokens(num_pages * page_size, start);
 }
 

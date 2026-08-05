@@ -28,7 +28,7 @@
 #include <variant>
 #include <vector>
 
-#include "cache/kv_cache_coordinator.h"
+#include "cache/coordinator/kv_cache_coordinator.h"
 #include "fsm/base_event.h"
 #include "fsm/forward_states.h"
 #include "utils.h"

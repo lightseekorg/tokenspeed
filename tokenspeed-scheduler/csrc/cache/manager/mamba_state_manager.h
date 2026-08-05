@@ -20,30 +20,20 @@
 
 #pragma once
 
-#include <map>
-#include <span>
-#include <string>
-#include <vector>
+#include <cstdint>
 
-#include "cache/cache_types.h"
-#include "cache/kv_cache_coordinator.h"
+#include "cache/manager/swa_manager.h"
 
 namespace tokenspeed {
 
-struct SchedulerConfig;
-
-// One KvCacheSpec per config paged_cache_group (group_id = index); all groups share config.block_size.
-std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config);
-
-std::int32_t AlignPrefillChunk(std::int32_t first_pos, std::int32_t unscheduled, std::int32_t token_budget,
-                               std::int32_t page_size, std::int32_t promotion_boundary_tokens);
-
-void FreeRequest(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables);
-
-// One row per config group_id. Each manager resolves the group's LCM placement
-// to the kernel-visible page id.
-std::map<std::string, std::vector<std::int32_t>> BuildBlockTables(const KvCacheCoordinator& coordinator,
-                                                                  const std::vector<BlockTable>& tables,
-                                                                  std::span<const std::string> group_ids);
+// GDN/mamba semantics: hit the nearest P-boundary snapshot and retain only the
+// request's live state page. Completed pages remain cache-owned after the
+// request table releases them.
+class MambaStateManager : public SwaManager {
+public:
+    explicit MambaStateManager(std::int32_t cache_block_tokens, std::int32_t cache_blocks_per_lcm_block = 1,
+                               std::uint32_t group_id = 0)
+        : SwaManager(cache_block_tokens, cache_blocks_per_lcm_block, /*sliding_window=*/2, group_id) {}
+};
 
 }  // namespace tokenspeed

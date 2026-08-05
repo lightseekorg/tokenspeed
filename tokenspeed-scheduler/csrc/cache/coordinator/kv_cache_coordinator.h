@@ -28,10 +28,10 @@
 #include <utility>
 #include <vector>
 
-#include "cache/block_pool.h"
-#include "cache/cache_block_ref.h"
-#include "cache/cache_group.h"
-#include "cache/cache_types.h"
+#include "cache/core/block_pool.h"
+#include "cache/core/cache_block_ref.h"
+#include "cache/manager/cache_group.h"
+#include "cache/core/cache_types.h"
 
 namespace tokenspeed {
 
@@ -84,7 +84,7 @@ public:
         std::uint64_t access_epoch{0};
         std::vector<BlockTransfer> load_pairs;
         // Fresh device child pages appended by ordinary Acquire, aligned by
-        // GroupId. Cache hits and host-loaded destinations are excluded.
+        // group_id. Cache hits and host-loaded destinations are excluded.
         std::vector<std::vector<std::int32_t>> new_page_ids;
     };
 
@@ -103,7 +103,7 @@ public:
                                          std::optional<std::uint64_t> request_access_epoch = std::nullopt);
     bool CanAdmitAfterReleasing(
         const PrefixProbe& prefix, std::span<const GroupDemand> demands,
-        std::span<const std::pair<GroupId, CacheBlockLocation>> locations_released_on_ack) const;
+        std::span<const std::pair<std::uint32_t, CacheBlockLocation>> locations_released_on_ack) const;
 
     std::int32_t NumAvailableLcmBlocks() const;
 
@@ -127,7 +127,7 @@ public:
     };
     std::vector<StoreCandidate> TakePendingStores() { return std::exchange(pending_stores_, {}); }
     CacheBlockRef AcquireDeviceCachedBlock(const CacheKey& key) const;
-    CacheBlockRef AcquireHostBlockForStore(GroupId group_id);
+    CacheBlockRef AcquireHostBlockForStore(std::uint32_t group_id);
     // Collection/pinning follows host-tier presence, so the slide credit flips count_uncached on this.
     bool HasHostTier() const { return host_pool_ != nullptr; }
     bool ContainsHostCachedBlock(const CacheKey& key) const;
@@ -148,7 +148,7 @@ private:
         CoordinatorMatch host;
     };
 
-    std::vector<CacheKey> keysForGroup(std::span<const std::string> content_hashes, GroupId group_id) const;
+    std::vector<CacheKey> keysForGroup(std::span<const std::string> content_hashes, std::uint32_t group_id) const;
     std::vector<std::vector<CacheKey>> buildGroupKeys(std::span<const std::string> content_hashes) const;
     PrefixProbe::Tier probeTierWithKeys(const BlockPool& pool, std::span<const std::vector<CacheKey>> group_keys,
                                         std::span<const std::size_t> match_order, std::int32_t num_cache_blocks,
@@ -161,7 +161,7 @@ private:
                                  std::int32_t first_cache_block, std::uint64_t access_epoch,
                                  CacheBoundaryKind boundary_kind);
     void cacheCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand, std::uint64_t access_epoch);
-    bool evictCachedBlock(GroupId group_id, CacheBlockLocation location);
+    bool evictCachedBlock(std::uint32_t group_id, CacheBlockLocation location);
     std::vector<CacheGroup> groups_;
     // Closed groups first, so non-closed groups match against a settled bound.
     std::vector<std::size_t> match_order_;
