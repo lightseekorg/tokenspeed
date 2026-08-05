@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import threading
 
+from tokenspeed.runtime.utils.logger import logger
+
 from tokenspeed.runtime.epd.entities import (
     EmbeddingArgs,
     EmbeddingManagerArgs,
@@ -62,9 +64,13 @@ class MooncakeEmbeddingManagerPrefill(MooncakeEmbeddingManagerBase):
         def loop():
             while True:
                 parts = self.server_socket.recv_multipart()
-                room = int(parts[0].decode("ascii"))
-                status = int(parts[1].decode("ascii"))
-                rank = int(parts[2].decode("ascii"))
+                try:
+                    room = int(parts[0].decode("ascii"))
+                    status = int(parts[1].decode("ascii"))
+                    rank = int(parts[2].decode("ascii"))
+                except (ValueError, UnicodeDecodeError, IndexError):
+                    logger.warning("Malformed status message received, dropping")
+                    continue
                 if status == TransferPoll.Success and room in self.request_status:
                     self.response_tracker.setdefault(room, set()).add(rank)
                     if len(
