@@ -24,8 +24,8 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
-from tokenspeed_kernel.ops.other.fp8_quantization.triton import (
-    create_per_token_group_quant_fp8_output_scale,
+from tokenspeed_kernel.ops.quantization.triton import (
+    allocate_fp8_token_group_scales,
 )
 
 __all__ = [
@@ -595,13 +595,12 @@ def fused_swiglu_fp8_ue8m0(
     info = torch.finfo(dtype)
 
     out = torch.empty((M, N), device=gate_up.device, dtype=dtype)
-    scale = create_per_token_group_quant_fp8_output_scale(
+    scale = allocate_fp8_token_group_scales(
         x_shape=(M, N),
         device=gate_up.device,
         group_size=GROUP_SIZE,
-        column_major_scales=True,
-        scale_tma_aligned=True,
-        scale_ue8m0=True,
+        scale_layout="column_major_tma",
+        scale_encoding="packed_ue8m0",
     )
 
     PACK = 4

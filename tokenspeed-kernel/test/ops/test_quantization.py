@@ -248,8 +248,10 @@ def test_fp8_quantize_rejects_e4m3fnuz(device: str) -> None:
         fp8_quantize(x, fp8_dtype=torch.float8_e4m3fnuz)
 
 
-@pytest.mark.parametrize("solution", ["trtllm"])
-@pytest.mark.parametrize("granularity", ["tensor", "token"])
+@pytest.mark.parametrize(
+    "solution,granularity",
+    [("trtllm", "tensor"), ("trtllm", "token"), ("triton", "token")],
+)
 def test_quantize_fp8_with_scale_tensor_and_token(
     device: str,
     solution: str,
@@ -307,6 +309,94 @@ def test_quantize_fp8_with_scale_token_group(
     assert scale.numel() == expected_num_scales
     if solution == "triton":
         assert scale.shape == (x.shape[0], x.shape[1] // group_size)
+
+
+@pytest.mark.parametrize(
+    "scale_layout,expected_shape,expected_stride",
+    [
+        ("row_major", (5, 4), (4, 1)),
+        ("column_major", (4, 5), (5, 1)),
+        ("column_major_tma", (5, 4), (1, 8)),
+    ],
+)
+def test_quantize_fp8_with_scale_layouts(
+    device: str,
+    scale_layout: str,
+    expected_shape: tuple[int, int],
+    expected_stride: tuple[int, int],
+) -> None:
+    torch.manual_seed(6)
+    x = torch.randn(5, 512, device=device, dtype=torch.bfloat16)
+    out, scales = quantize_fp8_with_scale(
+        x,
+        granularity="token_group",
+        group_size=128,
+        scale_layout=scale_layout,
+        solution="triton",
+    )
+    torch.cuda.synchronize()
+
+    assert out.shape == x.shape
+    assert scales.shape == expected_shape
+    assert scales.stride() == expected_stride
+    logical_scales = scales.t() if scale_layout == "column_major" else scales
+    restored = out.float().view(5, 4, 128) * logical_scales.float().unsqueeze(-1)
+    assert torch.allclose(restored.flatten(1), x.float(), atol=0.15, rtol=0.05)
+
+
+def test_quantize_fp8_token_flattens_leading_dimensions(device: str) -> None:
+    x = torch.randn(2, 3, 128, device=device, dtype=torch.bfloat16)
+    out, scales = quantize_fp8_with_scale(
+        x,
+        granularity="token",
+        scale_layout="row_major",
+        solution="triton",
+    )
+    torch.cuda.synchronize()
+
+    assert out.shape == x.shape
+    assert scales.shape == (6, 1)
+
+
+def test_quantize_fp8_token_group_flattens_leading_dimensions(device: str) -> None:
+    x = torch.randn(2, 3, 256, device=device, dtype=torch.bfloat16)
+    out, scales = quantize_fp8_with_scale(
+        x,
+        granularity="token_group",
+        group_size=128,
+        scale_layout="row_major",
+        override="triton",
+    )
+    torch.cuda.synchronize()
+
+    assert out.shape == x.shape
+    assert scales.shape == (6, 2)
+
+
+def test_quantize_fp8_with_packed_ue8m0_scales(device: str) -> None:
+    torch.manual_seed(7)
+    x = torch.randn(5, 512, device=device, dtype=torch.bfloat16)
+    out, packed = quantize_fp8_with_scale(
+        x,
+        granularity="token_group",
+        group_size=128,
+        scale_encoding="packed_ue8m0",
+        scale_layout="column_major_tma",
+        solution="triton",
+    )
+    torch.cuda.synchronize()
+
+    assert out.shape == x.shape
+    assert packed.shape == (5, 1)
+    assert packed.dtype == torch.int32
+    assert packed.stride() == (1, 8)
+    packed64 = packed.to(torch.int64)
+    exponents = torch.stack(
+        [((packed64 >> (offset * 8)) & 0xFF) for offset in range(4)], dim=-1
+    ).flatten(1)
+    scales = torch.exp2(exponents.float() - 127.0)
+    restored = out.float().view(5, 4, 128) * scales.unsqueeze(-1)
+    assert torch.allclose(restored.flatten(1), x.float(), atol=0.25, rtol=0.08)
 
 
 @pytest.mark.parametrize("solution", ["flashinfer"])

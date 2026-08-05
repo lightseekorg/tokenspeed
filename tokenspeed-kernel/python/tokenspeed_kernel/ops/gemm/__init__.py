@@ -33,7 +33,7 @@ import tokenspeed_kernel.ops.gemm.mxfp4.triton  # noqa: F401
 import tokenspeed_kernel.ops.gemm.nvfp4.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.gemm.nvfp4.trtllm  # noqa: F401
 import torch
-from tokenspeed_kernel.platform import ArchVersion, Platform
+from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import select_kernel
@@ -193,90 +193,28 @@ def _online_quantize_mxfp8(
         # SfLayout enum overload and works on flashinfer 0.6.15).
         return mxfp8_quantize(A, is_sf_swizzled_layout=True, enable_pdl=enable_pdl)
 
-    if kernel_name == "triton_mm_fp8_blockscale" and block_k == 32:
-        from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
-
-        return quantize_fp8_with_scale(
-            A,
-            granularity="token_group",
-            group_size=block_k,
-            scale_encoding="float32",
-            solution="triton",
-        )
-
-    if (
-        kernel_name in {"flashinfer_mm_fp8_blockscale", "triton_mm_fp8_blockscale"}
-        and _platform.is_nvidia
-        and _platform.arch_version == ArchVersion(12, 0)
-    ):
-        from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
-
-        return quantize_fp8_with_scale(
-            A,
-            granularity="token_group",
-            group_size=block_k,
-            scale_encoding="float32",
-            solution="triton",
-        )
-
-    def ensure_row_major_scales(
-        qA: torch.Tensor,
-        A_scales: torch.Tensor,
-        *,
-        group_major_scales: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # On NVIDIA, the TRT-LLM helper used by per_token_group_quant_fp8
-        # returns [num_groups, num_tokens] scales. FlashInfer and Triton GEMMs
-        # consume [num_tokens, num_groups].
-        expected_groups = (qA.shape[-1] + block_k - 1) // block_k
-        if group_major_scales:
-            if A_scales.dim() != 2 or A_scales.shape[0] != expected_groups:
-                raise ValueError(
-                    "TRTLLM per-token-group quantization returned unexpected "
-                    f"scale shape {tuple(A_scales.shape)} for "
-                    f"tokens={qA.shape[0]}, groups={expected_groups}."
-                )
-            A_scales = A_scales.transpose(0, 1).contiguous()
-            return qA, A_scales
-        if (
-            A_scales.shape[-1] != expected_groups
-            and A_scales.shape[0] == expected_groups
-        ):
-            A_scales = A_scales.transpose(0, 1).contiguous()
-        return qA, A_scales
-
     if kernel_name == "deep_gemm_mm_fp8_blockscale":
-        from tokenspeed_kernel.ops.other.fp8_quantization.triton import (
-            per_token_group_quant_fp8,
-        )
-
-        return per_token_group_quant_fp8(
-            A,
-            block_k,
-            column_major_scales=True,
-            scale_tma_aligned=True,
-            scale_ue8m0=_platform.is_blackwell_plus,
-        )
-    elif kernel_name == "flashinfer_mm_fp8_blockscale":
-        from tokenspeed_kernel.ops.other.fp8_quantization.triton import (
-            per_token_group_quant_fp8,
-        )
-
-        return ensure_row_major_scales(
-            *per_token_group_quant_fp8(A, block_k, column_major_scales=False),
-            group_major_scales=_platform.is_nvidia,
-        )
-    elif kernel_name == "triton_mm_fp8_blockscale":
-        from tokenspeed_kernel.ops.other.fp8_quantization.triton import (
-            per_token_group_quant_fp8,
-        )
-
-        return ensure_row_major_scales(
-            *per_token_group_quant_fp8(A, block_k, column_major_scales=False),
-            group_major_scales=_platform.is_nvidia,
-        )
+        scale_encoding = "packed_ue8m0" if _platform.is_blackwell_plus else "float32"
+        scale_layout = "column_major_tma"
+    elif kernel_name in {
+        "flashinfer_mm_fp8_blockscale",
+        "triton_mm_fp8_blockscale",
+    }:
+        scale_encoding = "float32"
+        scale_layout = "row_major"
     else:
         raise ValueError(f"No online quantization defined for kernel {kernel_name!r}")
+
+    from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
+
+    return quantize_fp8_with_scale(
+        A,
+        granularity="token_group",
+        group_size=block_k,
+        scale_encoding=scale_encoding,
+        scale_layout=scale_layout,
+        enable_pdl=enable_pdl,
+    )
 
 
 def _kernel_handles_online_mxfp8(kernel_name: str) -> bool:
@@ -422,7 +360,7 @@ def mm(
             block_size is not None
         ), "block_size is required for online activation quantization"
         if prepacked_scales:
-            from tokenspeed_kernel.ops.other.fp8_quantization.triton import (
+            from tokenspeed_kernel.ops.gemm.fp8.flashinfer import (
                 flashinfer_fp8_blockscale_quantize_prepacked,
             )
 

@@ -6,12 +6,10 @@ import pytest
 import torch
 from tokenspeed_kernel import mm
 from tokenspeed_kernel.ops.gemm.fp8.flashinfer import (
+    flashinfer_fp8_blockscale_quantize_prepacked,
     gemm_fp8_nt_groupwise,
     has_flashinfer_fp8_blockscale,
     prepare_flashinfer_fp8_blockscale_weight_scales,
-)
-from tokenspeed_kernel.ops.other.fp8_quantization.triton import (
-    flashinfer_fp8_blockscale_quantize_prepacked,
 )
 
 pytestmark = pytest.mark.skipif(

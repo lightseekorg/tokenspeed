@@ -98,6 +98,9 @@ def quantize_fp8_with_scale(
     granularity: Literal["tensor", "token", "token_group"] = "tensor",
     group_size: int | None = None,
     scale_encoding: Literal["float32", "ue8m0", "packed_ue8m0"] = "float32",
+    scale_layout: Literal[
+        "row_major", "column_major", "column_major_tma"
+    ] = "row_major",
     # kernel options
     enable_pdl: bool = False,
     # dispatch options
@@ -119,6 +122,11 @@ def quantize_fp8_with_scale(
             dimension. Required for token_group granularity.
         scale_encoding: Scale encoding for token_group granularity, such as
             float32, ue8m0, or packed_ue8m0.
+        scale_layout: Scale layout. ``row_major`` returns contiguous
+            ``[tokens, groups]`` scales. ``column_major`` returns contiguous
+            ``[groups, tokens]`` scales. ``column_major_tma`` returns a
+            ``[tokens, groups]`` view whose group stride is padded to a multiple
+            of four tokens for TMA consumers.
         enable_pdl: Whether to request Programmatic Dependent Launch support.
         override: Optional exact kernel name or solution override.
         solution: Optional registered solution to select.
@@ -147,6 +155,7 @@ def quantize_fp8_with_scale(
     traits = {
         "granularity": granularity_trait,
         "scale_encoding": scale_encoding,
+        "scale_layout": scale_layout,
     }
     signature = format_signature(x=dense_tensor_format(x.dtype))
     kernel = select_kernel(
@@ -162,6 +171,7 @@ def quantize_fp8_with_scale(
         "granularity": granularity_trait,
         "group_size": group_size,
         "scale_encoding": scale_encoding,
+        "scale_layout": scale_layout,
     }
     ShapeCapture.get().record(
         "quantization", "fp8_with_scale", kernel.name, x.dtype, shape_params
@@ -178,6 +188,7 @@ def quantize_fp8_with_scale(
             granularity=granularity,
             group_size=group_size,
             scale_encoding=scale_encoding,
+            scale_layout=scale_layout,
             enable_pdl=enable_pdl,
         )
 
@@ -370,7 +381,8 @@ def quantize_mxfp4(
         )
 
 
-# Backend registration (side-effect imports).
 import tokenspeed_kernel.ops.quantization.flashinfer  # noqa: E402,F401
+
+# Backend registration (side-effect imports).
 import tokenspeed_kernel.ops.quantization.triton  # noqa: E402,F401
 import tokenspeed_kernel.ops.quantization.trtllm  # noqa: E402,F401

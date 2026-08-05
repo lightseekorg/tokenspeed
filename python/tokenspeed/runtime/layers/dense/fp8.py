@@ -27,11 +27,10 @@ import logging
 
 import tokenspeed_kernel
 import torch
-from tokenspeed_kernel.ops.other.fp8_quantization.triton import (
-    per_token_group_quant_fp8,
-    per_token_quant_fp8,
-    static_quant_fp8,
-    swizzle_mxfp8_scale,
+from tokenspeed_kernel.ops.gemm.fp8.flashinfer import swizzle_mxfp8_scale
+from tokenspeed_kernel.ops.quantization import (
+    quantize_fp8,
+    quantize_fp8_with_scale,
 )
 from torch.nn.parameter import Parameter
 
@@ -320,10 +319,11 @@ class Fp8LinearMethod(LinearMethodBase):
             # If checkpoint not serialized fp8, quantize the weights.
             if not self.quant_config.is_checkpoint_fp8_serialized:
                 # apply per-channel quantization default as
-                qweight, weight_scale = per_token_group_quant_fp8(
-                    layer.weight, layer.weight.shape[-1]
+                qweight, weight_scale = quantize_fp8_with_scale(
+                    layer.weight,
+                    granularity="token",
+                    scale_layout="row_major",
                 )
-                weight_scale = weight_scale.t().contiguous()
 
                 # Update the layer with the new values.
                 layer.weight = Parameter(qweight.t(), requires_grad=False)
@@ -425,9 +425,14 @@ class Fp8LinearMethod(LinearMethodBase):
                     raise ValueError(
                         f"input_scale must contain exactly one value, got {input_scale.numel()}."
                     )
-                qinput, x_scale = static_quant_fp8(input_2d, input_scale)
+                qinput = quantize_fp8(input_2d, scale=input_scale)
+                x_scale = input_scale
             else:
-                qinput, x_scale = per_token_quant_fp8(input_2d)
+                qinput, x_scale = quantize_fp8_with_scale(
+                    input_2d,
+                    granularity="token",
+                    scale_layout="row_major",
+                )
 
             qinput = qinput.view(-1, qinput.shape[-1])
 

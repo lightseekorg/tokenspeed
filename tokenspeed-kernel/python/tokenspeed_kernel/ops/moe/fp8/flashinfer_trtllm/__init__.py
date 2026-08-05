@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.ops.other.tuning.flashinfer import get_autotune_max_num_tokens
+from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -37,9 +38,6 @@ platform = current_platform()
 
 if platform.is_nvidia:
     from flashinfer.fused_moe import RoutingMethodType, trtllm_fp8_block_scale_moe
-    from tokenspeed_kernel.ops.other.fp8_quantization.triton import (
-        per_token_group_quant_fp8,
-    )
 
     _FP8_BLOCK = 128
 
@@ -120,13 +118,14 @@ if platform.is_nvidia:
         # Per-token group (block=128) FP8 quantization of activations. The
         # TRT-LLM-Gen kernel expects ``hidden_states_scale`` as a 2D
         # ``[hidden_size // 128, num_tokens]`` float32 tensor for the DeepSeekFp8
-        # recipe. ``per_token_group_quant_fp8`` already emits the scale in that
+        # recipe. The TRT-LLM quantizer emits the scale in that
         # ``[K, M]`` (group-major) orientation, so no transpose is needed.
-        x_fp8, x_scale = per_token_group_quant_fp8(
+        x_fp8, x_scale = quantize_fp8_with_scale(
             x,
-            _FP8_BLOCK,
-            column_major_scales=False,
-            scale_tma_aligned=False,
+            granularity="token_group",
+            group_size=_FP8_BLOCK,
+            scale_encoding="float32",
+            scale_layout="column_major",
         )
         x_scale = x_scale.to(torch.float32).contiguous()
         hidden_blocks = hidden_size // _FP8_BLOCK

@@ -225,9 +225,125 @@ def _fp8_token_group_quantize_kernel(
     tl.store(scale_ptr + group_id, scale)
 
 
+@triton.jit
+def _fp8_token_group_quantize_column_major_kernel(
+    x_ptr,
+    out_ptr,
+    scale_ptr,
+    group_size,
+    row_size,
+    scale_column_stride,
+    eps,
+    bit8_min,
+    bit8_max,
+    BLOCK: tl.constexpr,
+):
+    group_id = tl.program_id(0)
+    groups_per_row = row_size // group_size
+    scale_column = group_id % groups_per_row
+    scale_row = group_id // groups_per_row
+    cols = tl.arange(0, BLOCK)
+    mask = cols < group_size
+    offsets = group_id.to(tl.int64) * group_size + cols
+
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    scale = tl.maximum(tl.max(tl.abs(x), axis=0), eps) / bit8_max
+    out = tl.clamp(x / scale, bit8_min, bit8_max).to(out_ptr.dtype.element_ty)
+
+    tl.store(out_ptr + offsets, out, mask=mask)
+    tl.store(scale_ptr + scale_column * scale_column_stride + scale_row, scale)
+
+
+@triton.jit
+def _fp8_token_group_quantize_packed_ue8m0_kernel(
+    x_ptr,
+    out_ptr,
+    scale_ptr,
+    group_size,
+    row_size,
+    scale_column_stride,
+    eps,
+    bit8_min,
+    bit8_max,
+    BLOCK: tl.constexpr,
+):
+    group_id = tl.program_id(0)
+    groups_per_row = row_size // group_size
+    row = group_id // groups_per_row
+    group_column = group_id % groups_per_row
+    cols = tl.arange(0, BLOCK)
+    mask = cols < group_size
+    offsets = group_id.to(tl.int64) * group_size + cols
+
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    scale_raw = tl.maximum(tl.max(tl.abs(x), axis=0) / bit8_max, eps)
+    exponent = tl.ceil(tl.log2(scale_raw))
+    scale = tl.exp2(exponent)
+    out = tl.clamp(x / scale, bit8_min, bit8_max).to(out_ptr.dtype.element_ty)
+
+    packed_column = group_column // 4
+    packed_position = group_column % 4
+    packed_offset = packed_column * scale_column_stride + row
+    biased_exponent = tl.clamp(exponent + 127.0, 0.0, 255.0).to(tl.uint32)
+
+    tl.store(out_ptr + offsets, out, mask=mask)
+    tl.atomic_or(
+        scale_ptr + packed_offset,
+        biased_exponent << (packed_position * 8),
+        sem="relaxed",
+    )
+
+
+def _align(value: int, alignment: int) -> int:
+    return (value + alignment - 1) // alignment * alignment
+
+
+def allocate_fp8_token_group_scales(
+    x_shape: tuple[int, ...] | torch.Size,
+    device: torch.device,
+    group_size: int,
+    scale_layout: str = "row_major",
+    scale_encoding: str = "float32",
+) -> torch.Tensor:
+    """Allocate token-group FP8 scales with the requested storage layout."""
+    groups = x_shape[-1] // group_size
+    if scale_encoding == "packed_ue8m0":
+        if scale_layout != "column_major_tma" or len(x_shape) != 2:
+            raise ValueError(
+                "packed UE8M0 scales require 2-D input and column_major_tma layout"
+            )
+        if group_size != 128:
+            raise ValueError("packed UE8M0 scales require group_size=128")
+        rows = x_shape[-2]
+        base = torch.zeros(
+            ((groups + 3) // 4, _align(rows, 4)),
+            device=device,
+            dtype=torch.int32,
+        )
+        return base.transpose(0, 1)[:rows, :]
+
+    if scale_encoding != "float32":
+        raise ValueError(f"unsupported Triton FP8 scale encoding: {scale_encoding!r}")
+    if scale_layout == "row_major":
+        return torch.empty((*x_shape[:-1], groups), device=device, dtype=torch.float32)
+    if len(x_shape) != 2:
+        raise ValueError(f"{scale_layout} scales require 2-D input")
+    rows = x_shape[-2]
+    if scale_layout == "column_major":
+        return torch.empty((groups, rows), device=device, dtype=torch.float32)
+    if scale_layout == "column_major_tma":
+        base = torch.empty(
+            (groups, _align(rows, 4)), device=device, dtype=torch.float32
+        )
+        return base.t()[:rows, :]
+    raise ValueError(f"unsupported FP8 scale layout: {scale_layout!r}")
+
+
 def _fp8_token_group_quantize(
     x: torch.Tensor,
     group_size: int,
+    scale_encoding: str = "float32",
+    scale_layout: str = "row_major",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if x.shape[-1] % group_size != 0:
         raise ValueError(
@@ -237,12 +353,16 @@ def _fp8_token_group_quantize(
     if not x.is_contiguous():
         raise ValueError("x must be contiguous")
 
+    rows = x.numel() // x.shape[-1]
+    matrix_shape = (rows, x.shape[-1])
     out_dtype = torch.float8_e4m3fn
     out = torch.empty_like(x, device=x.device, dtype=out_dtype)
-    scales = torch.empty(
-        x.shape[:-1] + (x.shape[-1] // group_size,),
-        device=x.device,
-        dtype=torch.float32,
+    scales = allocate_fp8_token_group_scales(
+        matrix_shape,
+        x.device,
+        group_size,
+        scale_layout=scale_layout,
+        scale_encoding=scale_encoding,
     )
 
     groups = x.numel() // group_size
@@ -250,18 +370,47 @@ def _fp8_token_group_quantize(
     num_warps = min(max(block // 256, 1), 8)
     fp8_finfo = torch.finfo(out_dtype)
 
-    _fp8_token_group_quantize_kernel[(groups,)](
-        x,
-        out,
-        scales,
-        group_size,
-        1e-10,
-        bit8_min=fp8_finfo.min,
-        bit8_max=fp8_finfo.max,
-        BLOCK=block,
-        num_warps=num_warps,
-        num_stages=1,
-    )
+    common_kwargs = {
+        "bit8_min": fp8_finfo.min,
+        "bit8_max": fp8_finfo.max,
+        "BLOCK": block,
+        "num_warps": num_warps,
+        "num_stages": 1,
+    }
+    if scale_encoding == "packed_ue8m0":
+        _fp8_token_group_quantize_packed_ue8m0_kernel[(groups,)](
+            x,
+            out,
+            scales,
+            group_size,
+            x.shape[-1],
+            scales.stride(1),
+            1e-10,
+            **common_kwargs,
+        )
+    elif scale_layout in {"column_major", "column_major_tma"}:
+        scale_column_stride = (
+            scales.stride(0) if scale_layout == "column_major" else scales.stride(1)
+        )
+        _fp8_token_group_quantize_column_major_kernel[(groups,)](
+            x,
+            out,
+            scales,
+            group_size,
+            x.shape[-1],
+            scale_column_stride,
+            1e-10,
+            **common_kwargs,
+        )
+    else:
+        _fp8_token_group_quantize_kernel[(groups,)](
+            x,
+            out,
+            scales,
+            group_size,
+            1e-10,
+            **common_kwargs,
+        )
     return out, scales
 
 
@@ -285,21 +434,57 @@ def triton_quantize_fp8(
 @register_kernel(
     "quantization",
     "fp8_with_scale",
-    name="triton_quantize_fp8_with_scale",
+    name="triton_quantize_fp8_token",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
+    signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
+    traits={
+        "granularity": frozenset({"token"}),
+        "scale_encoding": frozenset({"float32"}),
+        "scale_layout": frozenset({"row_major"}),
+    },
+    priority=Priority.PORTABLE,
+)
+def triton_quantize_fp8_token(
+    x: torch.Tensor,
+    granularity: str = "token",
+    group_size: int | None = None,
+    scale_encoding: str = "float32",
+    scale_layout: str = "row_major",
+    enable_pdl: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if (
+        granularity != "token"
+        or scale_encoding != "float32"
+        or scale_layout != "row_major"
+    ):
+        raise ValueError("token FP8 quantization requires row-major float32 scales")
+    q, scales = _fp8_token_group_quantize(
+        x.contiguous(), x.shape[-1], scale_layout=scale_layout
+    )
+    return q, scales.reshape(-1, 1)
+
+
+@register_kernel(
+    "quantization",
+    "fp8_with_scale",
+    name="triton_quantize_fp8_token_group",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
     signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
     traits={
         "granularity": frozenset({"token_group_32", "token_group_128"}),
         "scale_encoding": frozenset({"float32"}),
+        "scale_layout": frozenset({"row_major", "column_major", "column_major_tma"}),
     },
     priority=Priority.PORTABLE,
 )
-def triton_quantize_fp8_with_scale(
+def triton_quantize_fp8_token_group(
     x: torch.Tensor,
-    granularity: str = "tensor",
+    granularity: str = "token_group",
     group_size: int | None = None,
     scale_encoding: str = "float32",
+    scale_layout: str = "row_major",
     enable_pdl: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if granularity != "token_group" or group_size not in {32, 128}:
@@ -309,11 +494,50 @@ def triton_quantize_fp8_with_scale(
             f"granularity={granularity!r}, group_size={group_size}."
         )
     if scale_encoding != "float32":
-        raise ValueError(
-            "triton FP8 dynamic quantization currently requires "
-            f"scale_encoding='float32', got {scale_encoding!r}."
-        )
-    return _fp8_token_group_quantize(x.contiguous(), group_size)
+        raise ValueError("Triton token-group FP8 requires float32 scales")
+    return _fp8_token_group_quantize(
+        x.contiguous(),
+        group_size,
+        scale_encoding=scale_encoding,
+        scale_layout=scale_layout,
+    )
+
+
+@register_kernel(
+    "quantization",
+    "fp8_with_scale",
+    name="triton_quantize_fp8_token_group_packed_ue8m0",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
+    signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
+    traits={
+        "granularity": frozenset({"token_group_128"}),
+        "scale_encoding": frozenset({"packed_ue8m0"}),
+        "scale_layout": frozenset({"column_major_tma"}),
+    },
+    priority=Priority.PORTABLE,
+)
+def triton_quantize_fp8_token_group_packed_ue8m0(
+    x: torch.Tensor,
+    granularity: str = "token_group",
+    group_size: int | None = None,
+    scale_encoding: str = "packed_ue8m0",
+    scale_layout: str = "column_major_tma",
+    enable_pdl: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if (
+        granularity != "token_group"
+        or group_size != 128
+        or scale_encoding != "packed_ue8m0"
+        or scale_layout != "column_major_tma"
+    ):
+        raise ValueError("packed UE8M0 requires token-group-128 column_major_tma")
+    return _fp8_token_group_quantize(
+        x.contiguous(),
+        group_size,
+        scale_encoding=scale_encoding,
+        scale_layout=scale_layout,
+    )
 
 
 @triton.jit
@@ -547,5 +771,7 @@ __all__ = [
     "fp8_quantize",
     "mxfp4_quantize",
     "triton_quantize_mxfp4",
-    "triton_quantize_fp8_with_scale",
+    "triton_quantize_fp8_token",
+    "triton_quantize_fp8_token_group",
+    "triton_quantize_fp8_token_group_packed_ue8m0",
 ]

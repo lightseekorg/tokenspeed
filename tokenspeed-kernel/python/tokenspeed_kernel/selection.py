@@ -416,7 +416,7 @@ def _ispp_satisfies_alignment(spec: KernelSpec, ispp: Any) -> bool:
 
 def spec_matches_traits(
     spec: KernelSpec,
-    traits: dict[str, Any],
+    traits: dict[str, Any] | None,
     *,
     require_all_traits: bool = False,
 ) -> bool:
@@ -519,12 +519,22 @@ def _resolve_override(
     format_signature: object,
     override: str,
     platform: PlatformInfo,
+    features: frozenset[str] | None,
+    traits: dict[str, Any],
 ) -> SelectedKernel:
     impl = registry.get_impl(override)
     if impl is not None:
         return SelectedKernel(name=override, impl=impl)
 
-    specs = registry.get_for_operator(family, mode, solution=override)
+    specs = registry.get_for_operator(
+        family,
+        mode,
+        features=features,
+        platform=platform,
+        format_signature=format_signature,
+        solution=override,
+    )
+    specs = _filter_by_traits(specs, traits or {})
     if specs:
         kernel_name = specs[0].name
         impl = registry.get_impl(kernel_name)
@@ -659,7 +669,14 @@ def select_kernel(
 
     if override:
         return _resolve_override(
-            registry, family, mode, format_signature, override, platform
+            registry,
+            family,
+            mode,
+            format_signature,
+            override,
+            platform,
+            features,
+            traits,
         )
 
     # Get candidates (same filtering for both strategies)

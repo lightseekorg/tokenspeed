@@ -27,6 +27,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.other.native.deep_ep import load_deep_ep
+from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import ErrorClass
 
@@ -342,15 +343,15 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                     hidden_states, _FP8_BLOCK
                 )
             else:
-                from tokenspeed_kernel.ops.other.fp8_quantization.triton import (
-                    per_token_group_quant_fp8,
+                quantized, scales = quantize_fp8_with_scale(
+                    hidden_states,
+                    granularity="token_group",
+                    group_size=_FP8_BLOCK,
+                    scale_encoding="float32",
+                    scale_layout="row_major",
+                    solution="triton",
                 )
-
-                quantized, scales = per_token_group_quant_fp8(hidden_states, _FP8_BLOCK)
-                # The quantizer hands back scales as [hidden / block, tokens]
-                # (block major, what the GEMMs want); DeepEP requires the
-                # token-major [tokens, hidden / block] and asserts on size(0).
-                hidden_states = (quantized, scales.t().contiguous())
+                hidden_states = (quantized, scales)
         topk_idx = topk_idx.to(torch.int64)
         topk_weights = topk_weights.to(torch.float32)
         previous_event = Buffer.capture() if self.async_finish else None

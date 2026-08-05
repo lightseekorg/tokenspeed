@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -36,6 +37,12 @@ from tokenspeed_kernel.signature import (
 
 platform = current_platform()
 _fp8_dtype = torch.float8_e4m3fn
+
+_trtllm_per_token_group_quant_fp8 = error_fn
+if platform.is_nvidia:
+    from tokenspeed_kernel.ops.other.native.trtllm import (
+        per_token_group_quant_8bit as _trtllm_per_token_group_quant_fp8,
+    )
 
 _MXFP8_SCALE = ScaleFormat(
     storage_dtype=torch.float32,
@@ -82,6 +89,134 @@ def prepare_flashinfer_fp8_blockscale_weight_scales(
             f"got {scales.dtype}"
         )
     return scales.transpose(0, 1).contiguous()
+
+
+def swizzle_mxfp8_scale(scales: torch.Tensor, M: int, K: int) -> torch.Tensor:
+    """Pack row-major MXFP8 scales into FlashInfer's F8_128x4 layout."""
+    num_m_tiles = (M + 127) // 128
+    num_k_tiles = (K + 127) // 128
+    scale_columns = K // 32
+    padded = torch.zeros(
+        (num_m_tiles * 128, num_k_tiles * 4),
+        dtype=scales.dtype,
+        device=scales.device,
+    )
+    padded[:M, :scale_columns] = scales
+    return (
+        padded.view(num_m_tiles, 4, 32, num_k_tiles, 4)
+        .transpose(1, 3)
+        .contiguous()
+        .view(-1)
+    )
+
+
+@triton.jit
+def _flashinfer_fp8_blockscale_quantize_prepacked_kernel(
+    x_ptr,
+    out_ptr,
+    scale_ptr,
+    group_size,
+    columns,
+    valid_rows,
+    padded_rows,
+    bit8_min,
+    bit8_max,
+    BLOCK: tl.constexpr,
+):
+    group_id = tl.program_id(0)
+    groups_per_row = columns // group_size
+    row = group_id // groups_per_row
+    scale_column = group_id % groups_per_row
+    cols = tl.arange(0, BLOCK)
+    col_mask = cols < group_size
+    row_offset = row.to(tl.int64) * columns
+    group_offset = scale_column.to(tl.int64) * group_size
+    offsets = row_offset + group_offset + cols
+
+    x = tl.load(x_ptr + offsets, mask=col_mask, other=0.0).to(tl.float32)
+    amax = tl.max(tl.abs(x))
+    scale_inv = tl.where(amax == 0.0, 1.0, bit8_max / amax)
+    scale = 1.0 / scale_inv
+    q = tl.clamp(x * scale_inv, bit8_min, bit8_max).to(out_ptr.dtype.element_ty)
+
+    tl.store(out_ptr + offsets, q, mask=col_mask)
+    tl.store(scale_ptr + scale_column.to(tl.int64) * padded_rows + row, scale)
+
+    for pad_offset in tl.static_range(0, 3):
+        pad_row = valid_rows + pad_offset
+        pad_mask = (row == 0) & (pad_row < padded_rows)
+        pad_offsets = pad_row.to(tl.int64) * columns + group_offset + cols
+        tl.store(out_ptr + pad_offsets, 0.0, mask=pad_mask & col_mask)
+        tl.store(
+            scale_ptr + scale_column.to(tl.int64) * padded_rows + pad_row,
+            1.0,
+            mask=pad_mask,
+        )
+
+
+def flashinfer_fp8_blockscale_quantize_prepacked(
+    x: torch.Tensor,
+    group_size: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize activations into FlashInfer's native MN-major scale layout."""
+    if not platform.is_nvidia:
+        raise RuntimeError("FlashInfer FP8 block-scale quantization requires NVIDIA")
+    if x.ndim != 2:
+        raise ValueError(f"x must be 2-D, got shape {tuple(x.shape)}")
+    if not x.is_contiguous():
+        raise ValueError("x must be contiguous")
+    if x.shape[0] <= 0:
+        raise ValueError(f"x must contain at least one row, got {x.shape[0]}")
+    if group_size != 128:
+        raise ValueError(
+            "FlashInfer FP8 block-scale prepacking requires group_size=128, "
+            f"got {group_size}"
+        )
+    if x.shape[1] % group_size:
+        raise ValueError(
+            f"x.shape[1] must be divisible by {group_size}, got {x.shape[1]}"
+        )
+
+    valid_rows, columns = x.shape
+    padded_rows = (valid_rows + 3) // 4 * 4
+    if (
+        padded_rows == valid_rows
+        and x.dtype == torch.bfloat16
+        and _trtllm_per_token_group_quant_fp8 is not error_fn
+    ):
+        q, scales = _trtllm_per_token_group_quant_fp8(x, group_size, False)
+        expected_shape = (columns // group_size, valid_rows)
+        if tuple(scales.shape) != expected_shape or not scales.is_contiguous():
+            raise RuntimeError(
+                "TRT-LLM FP8 quantizer returned unexpected prepared scales: "
+                f"shape={tuple(scales.shape)}, stride={tuple(scales.stride())}, "
+                f"expected contiguous {expected_shape}"
+            )
+        return q, scales
+
+    q = torch.empty((padded_rows, columns), device=x.device, dtype=torch.float8_e4m3fn)
+    scales = torch.empty(
+        (columns // group_size, padded_rows),
+        device=x.device,
+        dtype=torch.float32,
+    )
+    groups = valid_rows * (columns // group_size)
+    fp8_info = torch.finfo(torch.float8_e4m3fn)
+    _flashinfer_fp8_blockscale_quantize_prepacked_kernel[(groups,)](
+        x,
+        q,
+        scales,
+        group_size,
+        columns,
+        valid_rows,
+        padded_rows,
+        bit8_min=fp8_info.min,
+        bit8_max=fp8_info.max,
+        BLOCK=group_size,
+        num_warps=1,
+        num_stages=1,
+    )
+    return q, scales
 
 
 def _prepare_flashinfer_fp8_blockscale_inputs(
@@ -262,7 +397,6 @@ def has_flashinfer_mxfp8() -> bool:
 
 
 if mm_mxfp8 is not error_fn:
-    from tokenspeed_kernel.ops.other.fp8_quantization.triton import swizzle_mxfp8_scale
 
     @register_kernel(
         "gemm",
