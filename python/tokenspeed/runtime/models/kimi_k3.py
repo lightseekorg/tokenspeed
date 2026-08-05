@@ -71,6 +71,10 @@ from tokenspeed_kernel.ops.activation.triton import (
 )
 from tokenspeed_kernel.ops.attn_res import attn_res_fwd
 from tokenspeed_kernel.ops.communication import allreduce_fusion_lane
+from tokenspeed_kernel.ops.communication.multimem import (
+    multimem_all_reduce_staged,
+    multimem_stage,
+)
 from tokenspeed_kernel.ops.gemm import (
     kimi3_latent_projection_add3,
     kimi3_mla_qkv_gate_projection,
@@ -162,6 +166,9 @@ logger = logging.getLogger(__name__)
 # Measured tp16 crossover: below this the fused lane AR wins, above it the
 # column-parallel tail's 1/tp up-projection pays for the lost AR fusion.
 _COLUMN_PARALLEL_MIN_TOKENS = 2048
+# With in-switch (ld_reduce) reduces the column-parallel tail wins everywhere
+# above the decode range — the ring-AR latency floor it traded against is gone.
+_MULTIMEM_MIN_TOKENS = 16
 
 
 # ===----------------------------------------------------------------------=== #
@@ -1262,6 +1269,34 @@ class KimiLinearMoE(nn.Module):
                 self.routed_expert_up_proj.weight,
                 prefix=prefix_sum,
             )
+        if (
+            self.execution_plan.fused_moe_ar
+            and num_tokens > _MULTIMEM_MIN_TOKENS
+            and hidden_size % self.mapping.moe.tp_ep_size == 0
+            and torch.distributed.is_initialized()
+            and len(self.mapping.moe.tp_ep_group) == torch.distributed.get_world_size()
+        ):
+            # In-switch (ld_reduce) reduces staged through symmetric memory,
+            # with the same column-parallel stitch as below.
+            group_name = torch.distributed.group.WORLD.group_name
+            routed_stage = multimem_stage(routed_out, group_name)
+            shared_stage = (
+                multimem_stage(shared_partial, group_name)
+                if routed_stage is not None
+                else None
+            )
+            if shared_stage is not None:
+                routed_red = multimem_all_reduce_staged(routed_stage, group_name)
+                if self.routed_expert_norm is not None:
+                    routed_red = self.routed_expert_norm(routed_red)
+                shard = hidden_size // self.mapping.moe.tp_ep_size
+                start = self.mapping.moe.tp_ep_rank * shard
+                shared_stage.narrow(-1, start, shard).addmm_(
+                    routed_red,
+                    self.routed_expert_up_proj.weight.narrow(0, start, shard).t(),
+                )
+                shared_out = multimem_all_reduce_staged(shared_stage, group_name)
+                return (prefix_sum + shared_out).view(num_tokens, hidden_size)
         if (
             self.execution_plan.fused_moe_ar
             and num_tokens >= _COLUMN_PARALLEL_MIN_TOKENS
