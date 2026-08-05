@@ -268,6 +268,8 @@ class HostMirrorStateSlabTest(unittest.TestCase):
                 ),
             )
         else:
+            from cache_pool_test_utils import make_layer_group_ids
+
             kwargs["memory_plan"] = make_mha_memory_plan(
                 size=kwargs["size"],
                 page_size=kwargs["page_size"],
@@ -275,6 +277,11 @@ class HostMirrorStateSlabTest(unittest.TestCase):
                 kv_heads=kwargs["head_num"],
                 head_dim=kwargs["head_dim"],
                 dtype=kwargs["dtype"],
+                layer_types=kwargs["layer_types"],
+                sliding_window_tokens=kwargs["sliding_window_tokens"],
+            )
+            kwargs["layer_group_ids"] = make_layer_group_ids(
+                layer_num=kwargs["layer_num"],
                 layer_types=kwargs["layer_types"],
                 sliding_window_tokens=kwargs["sliding_window_tokens"],
             )
