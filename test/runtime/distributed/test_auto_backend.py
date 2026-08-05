@@ -75,3 +75,30 @@ def test_force_deterministic_rsag_routes_all_reduce_two_to_nccl(backend, monkeyp
     backend._nccl.all_reduce_two.assert_called_once_with(first, second, group, op=None)
     backend._trtllm_ar.has_trtllm_ar.assert_not_called()
     backend._triton_ar.can_run_two.assert_not_called()
+
+
+def test_prepare_all_reduce_two_uses_triton(backend, monkeypatch):
+    monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", False)
+    monkeypatch.setitem(global_server_args_dict, "mapping", None)
+    backend._trtllm_ar.has_trtllm_ar.return_value = False
+    backend._triton_ar.prepare_all_reduce_two.return_value = "staging"
+
+    result = backend.prepare_all_reduce_two(
+        (1, 7168), (1, 3584), torch.bfloat16, (0, 1)
+    )
+
+    assert result == "staging"
+    backend._triton_ar.prepare_all_reduce_two.assert_called_once()
+
+
+def test_prepare_all_reduce_two_preserves_trtllm(backend, monkeypatch):
+    monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", False)
+    monkeypatch.setitem(global_server_args_dict, "mapping", None)
+    backend._trtllm_ar.has_trtllm_ar.return_value = True
+
+    result = backend.prepare_all_reduce_two(
+        (1, 7168), (1, 3584), torch.bfloat16, (0, 1)
+    )
+
+    assert result is None
+    backend._triton_ar.prepare_all_reduce_two.assert_not_called()

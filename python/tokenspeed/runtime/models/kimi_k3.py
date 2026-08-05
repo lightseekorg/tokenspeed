@@ -101,6 +101,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
     all_reduce_two,
     prepare_all_reduce_fusion,
     prepare_all_reduce_lane,
+    prepare_all_reduce_two,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
@@ -1240,8 +1241,9 @@ class KimiLinearMoE(nn.Module):
         W13 and SiTU run separately; the next launch computes routed W2 beside
         the shared down projection. One collective reduces both partials. The
         final routed up projection adds ``prefix_sum`` and the shared output in
-        its epilogue when a specialized implementation is available. Top-k and
-        the optional routed norm remain separate launches.
+        its epilogue when a specialized implementation is available. The
+        optional routed norm folds into that final projection; top-k remains
+        a separate launch.
         """
 
         router_logits, routed_input, shared_input = latent_moe_input_projections(
@@ -1253,11 +1255,29 @@ class KimiLinearMoE(nn.Module):
             up_clamp=self.shared_experts.act_fn.linear_beta,
         )
         topk_output = self.topk(hidden_states, router_logits)
-        routed_output = hidden_states.new_empty(
-            (hidden_states.shape[0], self.routed_expert_down_proj.weight.shape[0])
+        staging = prepare_all_reduce_two(
+            (hidden_states.shape[0], self.shared_experts.down_proj.weight.shape[0]),
+            (hidden_states.shape[0], self.routed_expert_down_proj.weight.shape[0]),
+            hidden_states.dtype,
+            self.mapping.moe.ep_group,
         )
-        shared_output = hidden_states.new_empty(
-            (hidden_states.shape[0], self.shared_experts.down_proj.weight.shape[0])
+        shared_staging, routed_staging = (
+            staging
+            if staging is not None
+            else (
+                hidden_states.new_empty(
+                    (
+                        hidden_states.shape[0],
+                        self.shared_experts.down_proj.weight.shape[0],
+                    )
+                ),
+                hidden_states.new_empty(
+                    (
+                        hidden_states.shape[0],
+                        self.routed_expert_down_proj.weight.shape[0],
+                    )
+                ),
+            )
         )
         routed_latent, shared_output = latent_moe_expert_shared(
             routed_input,
@@ -1273,16 +1293,14 @@ class KimiLinearMoE(nn.Module):
             linear_clamp=self.experts.activation_situ_linear_beta,
             expert_start=self.experts.ep_rank * self.experts.num_local_experts,
             w13_interleaved=self.experts.w13_input_layout == "interleaved",
-            routed_out=routed_output,
-            shared_out=shared_output,
+            routed_out=routed_staging,
+            shared_out=shared_staging,
         )
         shared_output, routed_latent = all_reduce_two(
             shared_output,
             routed_latent,
             group=self.mapping.moe.ep_group,
         )
-        if self.routed_expert_norm is not None:
-            routed_latent = self.routed_expert_norm(routed_latent)
         return self.native_latent_moe.finalize_output(
             routed_latent,
             prefix_sum,

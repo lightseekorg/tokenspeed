@@ -63,6 +63,7 @@ from tokenspeed_kernel.ops.gemm import (
     kimi3_shared_down_projection,
     kimi3_shared_situ_projection,
     mm,
+    rmsnorm_linear_add,
 )
 from tokenspeed_kernel.ops.moe import (
     moe_apply,
@@ -96,6 +97,7 @@ __all__ = [
     "kimi3_shared_down_projection",
     "kimi3_shared_situ_projection",
     "mm",
+    "rmsnorm_linear_add",
     # attention
     "mha_plan",
     "mha_prefill",

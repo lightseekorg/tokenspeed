@@ -45,6 +45,10 @@ class _Shared(nn.Module):
 
 
 class _Add3Up(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(4, 2))
+
     def forward_add3(
         self,
         routed_latent: torch.Tensor,
@@ -53,6 +57,13 @@ class _Add3Up(nn.Module):
     ) -> torch.Tensor:
         routed_output, _ = _up(routed_latent)
         return prefix_sum + routed_output + shared_output
+
+
+class _WeightedNorm(_Norm):
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(2))
+        self.variance_epsilon = 1e-6
 
 
 class _TopK(nn.Module):
@@ -432,9 +443,77 @@ def test_latent_moe_can_return_separate_residual_components() -> None:
     torch.testing.assert_close(shared, hidden_states * 4)
 
 
-def test_latent_moe_fuses_output_projection_addends() -> None:
+def test_latent_moe_fuses_output_projection_addends_without_norm() -> None:
     layer = _layer(
-        routed_norm=_Norm(),
+        shared_experts=_Shared(),
+        routed_up_proj=_Add3Up(),
+    )
+    hidden_states = torch.arange(12, dtype=torch.float32).view(3, 4)
+    prefix_sum = torch.full_like(hidden_states, 7)
+
+    actual = layer(hidden_states, prefix_sum=prefix_sum)
+
+    routed_latent = hidden_states[:, :2] + 1
+    routed_output, _ = _up(routed_latent)
+    expected = prefix_sum + routed_output + hidden_states * 4
+    torch.testing.assert_close(actual, expected)
+
+
+def test_latent_moe_fuses_norm_output_projection_addends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[torch.Tensor, ...]] = []
+
+    def fused_norm_projection(
+        routed_latent: torch.Tensor,
+        norm_weight: torch.Tensor,
+        projection_weight: torch.Tensor,
+        prefix_sum: torch.Tensor,
+        shared_output: torch.Tensor,
+        *,
+        eps: float,
+    ) -> torch.Tensor:
+        del norm_weight, projection_weight
+        calls.append((routed_latent, prefix_sum, shared_output))
+        assert eps == 1e-6
+        routed_output, _ = _up(routed_latent + 3)
+        return prefix_sum + routed_output + shared_output
+
+    monkeypatch.setattr(
+        latent_module.tokenspeed_kernel,
+        "rmsnorm_linear_add",
+        fused_norm_projection,
+    )
+    layer = _layer(
+        routed_norm=_WeightedNorm(),
+        shared_experts=_Shared(),
+        routed_up_proj=_Add3Up(),
+    )
+    hidden_states = torch.arange(4, dtype=torch.float32).view(1, 4)
+    prefix_sum = torch.full_like(hidden_states, 7)
+
+    actual = layer(hidden_states, prefix_sum=prefix_sum)
+
+    routed_latent = hidden_states[:, :2] + 4
+    routed_output, _ = _up(routed_latent)
+    expected = prefix_sum + routed_output + hidden_states * 4
+    torch.testing.assert_close(actual, expected)
+    assert len(calls) == 1
+
+
+def test_latent_moe_preserves_multi_token_norm_add3_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_fused_call(*_args, **_kwargs) -> None:
+        pytest.fail("single-token fused kernel called for multiple tokens")
+
+    monkeypatch.setattr(
+        latent_module.tokenspeed_kernel,
+        "rmsnorm_linear_add",
+        unexpected_fused_call,
+    )
+    layer = _layer(
+        routed_norm=_WeightedNorm(),
         shared_experts=_Shared(),
         routed_up_proj=_Add3Up(),
     )

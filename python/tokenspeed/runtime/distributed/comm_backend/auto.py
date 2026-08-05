@@ -153,6 +153,68 @@ class AutoBackend(CommBackend):
     def prepare_all_reduce_lane(self, group: Group, hidden_dim: int) -> bool:
         return self._trtllm_ar.ensure_group_lane(group, hidden_dim)
 
+    def prepare_all_reduce_two(
+        self,
+        first_shape: tuple[int, ...],
+        second_shape: tuple[int, ...],
+        dtype: torch.dtype,
+        group: Group,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if (
+            self._force_deterministic_rsag()
+            or self._group_spans_nodes(group)
+            or self._trtllm_ar.has_trtllm_ar(group)
+        ):
+            return None
+        return self._triton_ar.prepare_all_reduce_two(
+            first_shape, second_shape, dtype, group
+        )
+
+    def all_reduce_residual_attnres(
+        self,
+        partial: torch.Tensor,
+        residual: torch.Tensor,
+        score_weight: torch.Tensor,
+        output_weight: torch.Tensor,
+        scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        eps: float,
+        group: Group,
+        op=None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not (
+            self._force_deterministic_rsag()
+            or self._group_spans_nodes(group)
+            or self._trtllm_ar.has_trtllm_ar(group)
+        ) and self._triton_ar.can_run_residual_attnres(
+            partial,
+            residual,
+            score_weight,
+            output_weight,
+            scratch,
+            group,
+            op=op,
+        ):
+            return self._triton_ar.all_reduce_residual_attnres(
+                partial,
+                residual,
+                score_weight,
+                output_weight,
+                scratch,
+                eps,
+                group,
+                op=op,
+            )
+        return super().all_reduce_residual_attnres(
+            partial,
+            residual,
+            score_weight,
+            output_weight,
+            scratch,
+            eps,
+            group,
+            op=op,
+        )
+
     def all_gather(
         self, tensor: torch.Tensor, group: Group, dim: int = 0
     ) -> torch.Tensor:

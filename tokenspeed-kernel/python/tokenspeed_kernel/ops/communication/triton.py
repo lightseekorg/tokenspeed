@@ -40,6 +40,9 @@ __all__ = [
     "all_reduce",
     "all_reduce_two_can_run",
     "all_reduce_two",
+    "all_reduce_two_staging",
+    "all_reduce_residual_attnres_can_run",
+    "all_reduce_residual_attnres",
     "allreduce_residual_rmsnorm",
     "create_dp_sampling_state",
     "dp_sampling_gather",
@@ -2019,6 +2022,129 @@ def all_reduce_two(
         )
 
     raise AssertionError(f"Unsupported platform: {platform}")
+
+
+def all_reduce_two_staging(
+    state: TritonCommState,
+    first_shape: tuple[int, ...],
+    second_shape: tuple[int, ...],
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Acquire Iris symmetric views for a producer-direct two-part reduction."""
+    platform = current_platform()
+    if not platform.is_amd or dtype != torch.bfloat16 or state.world_size != 8:
+        raise RuntimeError("symmetric two-part staging requires AMD TP8 BF16")
+    from . import iris as _iris_mod
+
+    key = (id(state.group), state.max_numel, dtype)
+    iris_state = _iris_mod.IRIS_AR_STATES.get(key)
+    if iris_state is None:
+        iris_state = _iris_mod.create_iris_state(
+            group=state.group,
+            rank_in_group=state.rank_in_group,
+            max_numel=state.max_numel,
+            dtype=dtype,
+            device=state.device,
+        )
+        _iris_mod.IRIS_AR_STATES[key] = iris_state
+    return _iris_mod.iris_all_reduce_two_staging(iris_state, first_shape, second_shape)
+
+
+def all_reduce_residual_attnres_can_run(
+    state: TritonCommState,
+    partial: torch.Tensor,
+    residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    output_weight: torch.Tensor,
+    scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    op=None,
+) -> bool:
+    """Return whether Iris can finish the exact K3 attention prefix mix."""
+    if op is None:
+        op = torch.distributed.ReduceOp.SUM
+    m, s_, acc = scratch
+    platform = current_platform()
+    return (
+        platform.is_cdna4
+        and state.world_size == 8
+        and op == torch.distributed.ReduceOp.SUM
+        and partial.shape == residual.shape == (1, 7168)
+        and score_weight.shape == output_weight.shape == (7168,)
+        and m.shape == s_.shape == (1,)
+        and acc.shape == (1, 7168)
+        and partial.dtype
+        == residual.dtype
+        == score_weight.dtype
+        == output_weight.dtype
+        == torch.bfloat16
+        and m.dtype == s_.dtype == acc.dtype == torch.float32
+        and partial.device
+        == residual.device
+        == score_weight.device
+        == output_weight.device
+        == m.device
+        == s_.device
+        == acc.device
+        == state.device
+        and all(
+            tensor.is_contiguous()
+            for tensor in (
+                partial,
+                residual,
+                score_weight,
+                output_weight,
+                m,
+                s_,
+                acc,
+            )
+        )
+        and partial.numel() <= state.max_numel
+    )
+
+
+def all_reduce_residual_attnres(
+    state: TritonCommState,
+    partial: torch.Tensor,
+    residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    output_weight: torch.Tensor,
+    scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    eps: float,
+    op=None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the exact K3 Iris attention reduction and AttnRes epilogue."""
+    assert all_reduce_residual_attnres_can_run(
+        state,
+        partial,
+        residual,
+        score_weight,
+        output_weight,
+        scratch,
+        op=op,
+    )
+    from . import iris as _iris_mod
+
+    key = (id(state.group), state.max_numel, partial.dtype)
+    iris_state = _iris_mod.IRIS_AR_STATES.get(key)
+    if iris_state is None:
+        iris_state = _iris_mod.create_iris_state(
+            group=state.group,
+            rank_in_group=state.rank_in_group,
+            max_numel=state.max_numel,
+            dtype=partial.dtype,
+            device=state.device,
+        )
+        _iris_mod.IRIS_AR_STATES[key] = iris_state
+    return _iris_mod.iris_all_reduce_residual_attnres(
+        iris_state,
+        partial,
+        residual,
+        score_weight,
+        output_weight,
+        scratch,
+        eps,
+        op=op,
+    )
 
 
 def get_token_dist(state: TritonCommState, total_tokens_in_group: int) -> list:

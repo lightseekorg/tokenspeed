@@ -35,6 +35,25 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
         gluon_bmm_a16w16_gfx950 as _bmm_a16w16_impl,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.rmsnorm_linear_add import (
+        gluon_rmsnorm_linear_add_gfx950 as _rmsnorm_linear_add_impl,
+    )
+
+    _BF16_SIGNATURE = frozenset(
+        {
+            format_signature(
+                hidden_states=dense_tensor_format(torch.bfloat16),
+                norm_weight=dense_tensor_format(torch.bfloat16),
+                linear_weight=dense_tensor_format(torch.bfloat16),
+                out=dense_tensor_format(torch.bfloat16),
+            )
+        }
+    )
+    _GFX950 = CapabilityRequirement(
+        min_arch_version=ArchVersion(9, 5),
+        max_arch_version=ArchVersion(9, 5),
+        vendors=frozenset({"amd"}),
+    )
 
     @register_kernel(
         "gemm",
@@ -99,3 +118,31 @@ if current_platform().is_amd:
         if alpha is not None:
             output.mul_(alpha.to(device=output.device, dtype=output.dtype))
         return output
+
+    @register_kernel(
+        "gemm",
+        "rmsnorm_linear_add",
+        name="gluon_rmsnorm_linear_add_gfx950",
+        solution="gluon",
+        capability=_GFX950,
+        signatures=_BF16_SIGNATURE,
+        priority=Priority.SPECIALIZED,
+        traits={
+            "tokens": frozenset({1}),
+            "input_size": frozenset({3584}),
+            "output_size": frozenset({7168}),
+            "num_addends": frozenset({2}),
+            "inputs_contiguous": frozenset({True}),
+        },
+    )
+    def gluon_rmsnorm_linear_add_gfx950(**kwargs):
+        addends = kwargs["addends"]
+        return _rmsnorm_linear_add_impl(
+            kwargs["hidden_states"],
+            kwargs["norm_weight"],
+            kwargs["linear_weight"],
+            addends[0],
+            addends[1],
+            eps=kwargs["eps"],
+            out=kwargs["out"],
+        )

@@ -132,6 +132,11 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             second_shape,
             device,
         )
+        if world_size == 8:
+            _check_all_reduce_two_symmetric_staging(
+                state, rank, first_shape, second_shape, device
+            )
+            _check_all_reduce_residual_attnres(state, rank, device)
     finally:
         dist.destroy_process_group()
 
@@ -192,6 +197,104 @@ def _check_all_reduce_two(
         atol=0,
         rtol=0,
     )
+
+
+def _check_all_reduce_two_symmetric_staging(
+    state, rank: int, first_shape, second_shape, device
+) -> None:
+    from tokenspeed_kernel.ops.communication.iris import (
+        iris_all_reduce_two,
+        iris_all_reduce_two_staging,
+    )
+
+    first, second = iris_all_reduce_two_staging(state, first_shape, second_shape)
+    first.fill_(rank + 1)
+    second.fill_(2 * (rank + 1))
+    first_result, second_result = iris_all_reduce_two(state, first, second, safe=False)
+    expected_value = 8 * 9 // 2
+    torch.testing.assert_close(
+        first_result, torch.full_like(first, expected_value), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        second_result,
+        torch.full_like(second, 2 * expected_value),
+        atol=0,
+        rtol=0,
+    )
+
+
+def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
+    from tokenspeed_kernel.ops.activation.triton import (
+        attnres_combine,
+        attnres_partial,
+    )
+    from tokenspeed_kernel.ops.communication.iris import (
+        iris_all_reduce,
+        iris_all_reduce_residual_attnres,
+    )
+
+    torch.manual_seed(101)
+    hidden = 7168
+    blocks = (torch.randn(4, 1, hidden, device=device, dtype=torch.float32) * 0.1).to(
+        torch.bfloat16
+    )
+    score_weight = (torch.randn(hidden, device=device, dtype=torch.float32) * 0.02).to(
+        torch.bfloat16
+    )
+    output_weight = (
+        1.0 + torch.randn(hidden, device=device, dtype=torch.float32) * 0.02
+    ).to(torch.bfloat16)
+    residual = (torch.randn(1, hidden, device=device, dtype=torch.float32) * 0.1).to(
+        torch.bfloat16
+    )
+    local = (
+        torch.randn(1, hidden, device=device, dtype=torch.float32) * 0.01
+        + (rank + 1) * 0.002
+    ).to(torch.bfloat16)
+    scratch = (
+        torch.empty(1, device=device, dtype=torch.float32),
+        torch.empty(1, device=device, dtype=torch.float32),
+        torch.empty(1, hidden, device=device, dtype=torch.float32),
+    )
+    attnres_partial(blocks, score_weight, 1e-6, scratch)
+
+    reduced = iris_all_reduce(state, local.clone(), safe=False)
+    expected_residual = residual + reduced
+    expected_hidden = attnres_combine(
+        expected_residual,
+        score_weight,
+        output_weight,
+        1e-6,
+        scratch,
+        torch.empty_like(residual),
+    )
+    actual_hidden, actual_residual = iris_all_reduce_residual_attnres(
+        state,
+        local,
+        residual,
+        score_weight,
+        output_weight,
+        scratch,
+        1e-6,
+    )
+    torch.testing.assert_close(actual_residual, expected_residual, atol=0, rtol=0)
+    torch.testing.assert_close(actual_hidden, expected_hidden, atol=2e-2, rtol=2e-2)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_hidden, graph_residual = iris_all_reduce_residual_attnres(
+            state,
+            local,
+            residual,
+            score_weight,
+            output_weight,
+            scratch,
+            1e-6,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(graph_residual, expected_residual, atol=0, rtol=0)
+    torch.testing.assert_close(graph_hidden, expected_hidden, atol=2e-2, rtol=2e-2)
 
 
 def _run_ar_test(world_size: int) -> None:

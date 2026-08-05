@@ -221,6 +221,60 @@ def all_reduce_latent_norm(
     )
 
 
+def prepare_all_reduce_two(
+    first_shape: tuple[int, ...],
+    second_shape: tuple[int, ...],
+    dtype: torch.dtype,
+    group: Group,
+    backend: CommBackend | None = None,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Acquire producer-direct buffers for a fused two-part reduction."""
+    if backend is None:
+        backend = get_global_backend()
+    return backend.prepare_all_reduce_two(first_shape, second_shape, dtype, group)
+
+
+def all_reduce_residual_attnres(
+    partial: torch.Tensor,
+    residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    output_weight: torch.Tensor,
+    scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    eps: float,
+    group: Group,
+    backend: CommBackend | None = None,
+    op: torch.distributed.ReduceOp = torch.distributed.ReduceOp.SUM,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reduce K3 attention output and finish its residual AttnRes mix.
+
+    Args:
+        partial: Per-rank attention output.
+        residual: Residual prefix accumulated after the reduction.
+        score_weight: Precomputed AttnRes scoring weight.
+        output_weight: RMSNorm weight applied to the mixed hidden row.
+        scratch: Block-side split AttnRes partial ``(m, s, acc)``.
+        eps: Shared AttnRes/RMSNorm epsilon.
+        group: Global ranks participating in the reduction.
+        backend: Optional communication backend override.
+        op: Reduction operation.
+
+    Returns:
+        The normalized mixed hidden row and new residual prefix.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.all_reduce_residual_attnres(
+        partial,
+        residual,
+        score_weight,
+        output_weight,
+        scratch,
+        eps,
+        group,
+        op=op,
+    )
+
+
 def all_gather(
     tensor: torch.Tensor,
     group: Group,

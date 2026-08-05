@@ -386,15 +386,32 @@ class LatentMoELayer(nn.Module):
         prefix_sum: torch.Tensor,
         shared_output: torch.Tensor,
     ) -> torch.Tensor:
-        """Project the routed latent and add both full-width residuals."""
+        """Finish routed normalization/projection and add both residuals."""
 
         output_shape = tuple(shared_output.shape)
         _check_shape(prefix_sum, output_shape, "prefix_sum")
-        output = self.routed_up_proj.forward_add3(
-            routed_latent,
-            prefix_sum,
-            shared_output,
-        )
+        if self.routed_norm is None:
+            output = self.routed_up_proj.forward_add3(
+                routed_latent,
+                prefix_sum,
+                shared_output,
+            )
+        elif routed_latent.shape[0] == 1:
+            output = tokenspeed_kernel.rmsnorm_linear_add(
+                routed_latent,
+                self.routed_norm.weight,
+                self.routed_up_proj.weight,
+                prefix_sum,
+                shared_output,
+                eps=self.routed_norm.variance_epsilon,
+            )
+        else:
+            routed_latent = _module_tensor_output(self.routed_norm, routed_latent)
+            output = self.routed_up_proj.forward_add3(
+                routed_latent,
+                prefix_sum,
+                shared_output,
+            )
         _check_shape(output, output_shape, "routed_up_proj")
         return output
 
@@ -531,15 +548,17 @@ class LatentMoELayer(nn.Module):
         elif self.latent_reduce is not None:
             routed_latent = self.latent_reduce(routed_latent)
             _check_shape(routed_latent, latent_shape, "latent_reduce")
-        if self.routed_norm is not None:
-            routed_latent = _module_tensor_output(self.routed_norm, routed_latent)
-            _check_shape(routed_latent, latent_shape, "routed_norm")
-
         if shared_output is None:
+            if self.routed_norm is not None:
+                routed_latent = _module_tensor_output(self.routed_norm, routed_latent)
+                _check_shape(routed_latent, latent_shape, "routed_norm")
             routed_output = _module_tensor_output(self.routed_up_proj, routed_latent)
             _check_shape(routed_output, output_shape, "routed_up_proj")
             return routed_output
         if prefix_sum is None:
+            if self.routed_norm is not None:
+                routed_latent = _module_tensor_output(self.routed_norm, routed_latent)
+                _check_shape(routed_latent, latent_shape, "routed_norm")
             routed_output = _module_tensor_output(self.routed_up_proj, routed_latent)
             _check_shape(routed_output, output_shape, "routed_up_proj")
         if self.shared_reduce is not None and not shared_reduction_applied:

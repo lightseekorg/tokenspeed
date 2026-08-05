@@ -39,6 +39,7 @@ from tokenspeed_kernel.ops.gemm.kimi3 import (
     kimi3_shared_down_projection,
     kimi3_shared_situ_projection,
 )
+from tokenspeed_kernel.ops.gemm.rmsnorm_linear_add import rmsnorm_linear_add
 from tokenspeed_kernel.platform import ArchVersion, Platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
@@ -62,6 +63,7 @@ __all__ = [
     "kimi3_shared_down_projection",
     "kimi3_shared_situ_projection",
     "mm",
+    "rmsnorm_linear_add",
 ]
 
 _platform = Platform.get()

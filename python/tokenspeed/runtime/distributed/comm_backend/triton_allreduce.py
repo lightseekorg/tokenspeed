@@ -25,8 +25,11 @@ import torch.distributed as dist
 from tokenspeed_kernel.ops.communication.triton import (
     all_reduce,
     all_reduce_can_run,
+    all_reduce_residual_attnres,
+    all_reduce_residual_attnres_can_run,
     all_reduce_two,
     all_reduce_two_can_run,
+    all_reduce_two_staging,
     create_state,
 )
 
@@ -112,6 +115,86 @@ class TritonAllReduceBackend(CommBackend):
         if all_reduce_two_can_run(state, first, second, op=op):
             return all_reduce_two(state, first, second, op=op)
         return super().all_reduce_two(first, second, group, op=op)
+
+    def prepare_all_reduce_two(
+        self,
+        first_shape: tuple[int, ...],
+        second_shape: tuple[int, ...],
+        dtype: torch.dtype,
+        group: Group,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if len(group) != 8 or dtype != torch.bfloat16:
+            return None
+        return all_reduce_two_staging(
+            self._get_or_create(group), first_shape, second_shape, dtype
+        )
+
+    def can_run_residual_attnres(
+        self,
+        partial: torch.Tensor,
+        residual: torch.Tensor,
+        score_weight: torch.Tensor,
+        output_weight: torch.Tensor,
+        scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        group: Group,
+        op=None,
+    ) -> bool:
+        if len(group) != 8:
+            return False
+        try:
+            return all_reduce_residual_attnres_can_run(
+                self._get_or_create(group),
+                partial,
+                residual,
+                score_weight,
+                output_weight,
+                scratch,
+                op=op,
+            )
+        except Exception:
+            return False
+
+    def all_reduce_residual_attnres(
+        self,
+        partial: torch.Tensor,
+        residual: torch.Tensor,
+        score_weight: torch.Tensor,
+        output_weight: torch.Tensor,
+        scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        eps: float,
+        group: Group,
+        op=None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        state = self._get_or_create(group)
+        if all_reduce_residual_attnres_can_run(
+            state,
+            partial,
+            residual,
+            score_weight,
+            output_weight,
+            scratch,
+            op=op,
+        ):
+            return all_reduce_residual_attnres(
+                state,
+                partial,
+                residual,
+                score_weight,
+                output_weight,
+                scratch,
+                eps,
+                op=op,
+            )
+        return super().all_reduce_residual_attnres(
+            partial,
+            residual,
+            score_weight,
+            output_weight,
+            scratch,
+            eps,
+            group,
+            op=op,
+        )
 
     def all_gather(
         self, tensor: torch.Tensor, group: Group, dim: int = 0
