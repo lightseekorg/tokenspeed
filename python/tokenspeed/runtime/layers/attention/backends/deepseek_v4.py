@@ -2023,9 +2023,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self._cuda_graph_paged_cache_base_offsets = {}
         for spec, gid in zip(specs, group_ids, strict=True):
             sliding = str(getattr(spec, "retention", "")) == "sliding_window"
-            raw_tokens_per_page = int(spec.rows_per_page) * int(
-                spec.entry_stride_tokens
-            )
             max_pages = self._cuda_graph_group_table_width(
                 spec,
                 max_tokens_per_req=max_tokens_per_req,

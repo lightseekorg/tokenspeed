@@ -51,7 +51,6 @@ from tokenspeed.runtime.models.deepseek_v4_dspark_ops.attention import (
 from tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads import (
     DSparkConfidenceHead,
     DSparkVanillaMarkov,
-    sample_dspark_block_greedy,
 )
 from tokenspeed.runtime.utils import add_prefix
 

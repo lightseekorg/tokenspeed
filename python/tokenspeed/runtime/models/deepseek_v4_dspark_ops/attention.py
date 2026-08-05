@@ -6,7 +6,11 @@
 
 The math follows the public DeepSeek DSpark reference. The production entry
 point is fixed-shape and tensorized so it can execute inside TokenSpeed's target
-CUDA Graph.
+CUDA Graph. These local primitives intentionally preserve reference-level
+position, FP8, and normalization semantics during correctness bring-up instead
+of mixing in runtime kernels with different contracts. Follow-up performance
+work may replace them with library or fused kernels only after parity and
+endpoint gains are demonstrated.
 """
 
 from __future__ import annotations
