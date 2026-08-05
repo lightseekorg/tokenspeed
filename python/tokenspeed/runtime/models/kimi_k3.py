@@ -56,7 +56,6 @@ Module hierarchy matches the checkpoint::
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import Iterable
 from functools import partial
 from typing import TYPE_CHECKING
@@ -1111,9 +1110,7 @@ class KimiLinearMoE(nn.Module):
                 latent_tail_supported,
             )
 
-            if os.environ.get("TOKENSPEED_K3_MULTICAST_TAIL", "1") != "1":
-                logger.info("multicast latent tail disabled via env")
-            elif latent_tail_supported(
+            if latent_tail_supported(
                 tp_size=mapping.moe.tp_size,
                 hidden_size=config.hidden_size,
                 latent_size=self.routed_hidden,
@@ -1127,9 +1124,7 @@ class KimiLinearMoE(nn.Module):
                         rms_eps=self.routed_expert_norm.variance_epsilon,
                         device=torch.device("cuda", torch.cuda.current_device()),
                     )
-                    logger.info(
-                        "multicast latent tail engaged (tp=%d)", mapping.moe.tp_size
-                    )
+                    logger.info("multicast latent tail engaged")
                 except Exception:  # noqa: BLE001 - keep the fused-AR tail
                     logger.exception("multicast latent tail unavailable; falling back")
                     self._latent_tail = None
