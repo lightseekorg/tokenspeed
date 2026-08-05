@@ -25,7 +25,6 @@ import os
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
-from pathlib import Path
 from typing import Any, Callable, Generator
 
 from tokenspeed_kernel.platform import PlatformInfo, current_platform
@@ -47,8 +46,6 @@ __all__ = [
     "set_selection_policy",
     "register_oracle",
     "kernel_override",
-    "load_config_overrides",
-    "clear_config_overrides",
     "explain_selection",
     "spec_matches_traits",
     "ref_compatible_with_spec",
@@ -161,19 +158,9 @@ class SelectionPolicy:
         return self.op_strategies.get((family, mode), self.default_strategy)
 
 
-@dataclass
-class _ConfigOverrideEntry:
-    """A single override entry parsed from overrides.yaml."""
-
-    name: str | None = None  # Exact kernel name
-    solution: str | None = None  # Solution backend to match
-    objective: str | None = None  # SelectionObjective value string
-
-
 _policy = SelectionPolicy()
 _oracles: dict[str, SelectionOracle] = {}
 _global_overrides: dict[tuple[str, str], str] = {}
-_config_overrides: dict[tuple[str, str], _ConfigOverrideEntry] | None = None
 
 
 def set_selection_policy(policy: SelectionPolicy) -> None:
@@ -190,124 +177,6 @@ def register_oracle(family: str, oracle: SelectionOracle) -> None:
 
 def _get_oracle(family: str) -> SelectionOracle | None:
     return _oracles.get(family)
-
-
-def _parse_overrides(
-    raw: dict,
-) -> dict[tuple[str, str], _ConfigOverrideEntry]:
-    """Parse the ``overrides`` section of the YAML config.
-
-    Accepted formats::
-
-        overrides:
-          attention.decode:
-            solution: flashinfer
-          gemm.mm:
-            name: gluon_gemm_mm_fp8
-          moe.experts:
-            objective: determinism
-          norm.rmsnorm: triton_rmsnorm   # shorthand: treated as kernel name
-    """
-    result: dict[tuple[str, str], _ConfigOverrideEntry] = {}
-    if not isinstance(raw, dict):
-        return result
-
-    for op_key, entry in raw.items():
-        parts = str(op_key).split(".", 1)
-        if len(parts) != 2:
-            logger.warning("Invalid override key '%s' (expected 'family.mode')", op_key)
-            continue
-        family, mode = parts
-
-        if isinstance(entry, str):
-            result[(family, mode)] = _ConfigOverrideEntry(name=entry)
-        elif isinstance(entry, dict):
-            name = entry.get("name")
-            solution = entry.get("solution")
-            objective = entry.get("objective")
-            result[(family, mode)] = _ConfigOverrideEntry(
-                name=str(name) if name else None,
-                solution=str(solution) if solution else None,
-                objective=str(objective) if objective else None,
-            )
-        else:
-            logger.warning("Invalid override value for '%s': %r", op_key, entry)
-
-    return result
-
-
-def load_config_overrides(path: str | os.PathLike[str] | None = None) -> None:
-    """Load kernel overrides from a YAML config file.
-
-    Args:
-        path: Path to the YAML file.  If *None*, uses the
-            ``TOKENSPEED_KERNEL_OVERRIDES_FILE`` env var or falls back to
-            ``~/.config/tokenspeed-kernel/overrides.yaml``.
-    """
-    global _config_overrides
-
-    if path is None:
-        env_path = os.environ.get("TOKENSPEED_KERNEL_OVERRIDES_FILE")
-        if env_path:
-            path = Path(env_path)
-        else:
-            path = Path("~/.config/tokenspeed-kernel/overrides.yaml").expanduser()
-    else:
-        path = Path(path)
-
-    _config_overrides = {}
-
-    if not path.exists():
-        return
-
-    try:
-        import yaml  # type: ignore[import-untyped]
-    except ImportError:
-        logger.warning(
-            "PyYAML not installed; cannot load overrides from %s. "
-            "Install with: pip install pyyaml",
-            path,
-        )
-        return
-
-    try:
-        with open(path) as f:
-            data = yaml.safe_load(f)
-    except Exception:
-        logger.warning("Failed to load overrides from %s", path, exc_info=True)
-        return
-
-    if not isinstance(data, dict):
-        return
-
-    _config_overrides = _parse_overrides(data.get("overrides", {}))
-
-    if _config_overrides:
-        logger.debug(
-            "Loaded %d config override(s) from %s",
-            len(_config_overrides),
-            path,
-        )
-        KernelRegistry.get().clear_cache()
-
-
-def clear_config_overrides() -> None:
-    """Clear loaded config overrides.
-
-    After this call no config-file overrides are active.  Call
-    :func:`load_config_overrides` again to reload from a file.
-    """
-    global _config_overrides
-    _config_overrides = {}
-
-
-def _get_config_override(family: str, mode: str) -> _ConfigOverrideEntry | None:
-    """Return the config-file override for *(family, mode)*, lazily loading
-    from the default path on first access."""
-    global _config_overrides
-    if _config_overrides is None:
-        load_config_overrides()
-    return _config_overrides.get((family, mode))  # type: ignore[union-attr]
 
 
 def _make_cache_key(
@@ -617,33 +486,12 @@ def select_kernel(
     """
     platform = platform or current_platform()
 
-    # --- Override resolution (lowest → highest priority) ---
-
-    # 1. Config file (lowest priority)
-    config_entry = _get_config_override(family, mode)
-    if config_entry is not None:
-        if override is None and solution is None:
-            if config_entry.name:
-                override = config_entry.name
-            elif config_entry.solution:
-                solution = config_entry.solution
-        if config_entry.objective and objective == SelectionObjective.DEFAULT:
-            try:
-                objective = SelectionObjective(config_entry.objective)
-            except ValueError:
-                logger.warning(
-                    "Invalid objective '%s' in overrides config for %s.%s",
-                    config_entry.objective,
-                    family,
-                    mode,
-                )
-
-    # 2. Context-manager global overrides
+    # Context-manager global overrides
     global_override = _global_overrides.get((family, mode))
     if global_override:
         override = global_override
 
-    # 3. Environment variable
+    # Environment variables take precedence over context-manager overrides.
     env_key = f"TOKENSPEED_KERNEL_OVERRIDE_{family.upper()}_{mode.upper()}"
     env_override = os.environ.get(env_key)
     if env_override:
