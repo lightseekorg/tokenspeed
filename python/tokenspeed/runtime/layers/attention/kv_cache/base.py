@@ -25,8 +25,13 @@ from typing import TYPE_CHECKING
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import zero_byte_segments
 
-from tokenspeed.runtime.configs.paged_cache_spec import PagedCacheGroupSpec
-from tokenspeed.runtime.layers.attention.kv_cache.plan import CacheMemoryPlan
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+    PagedCacheRuntimeContract,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheMemoryPlan
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    PagedCacheGroupSpec,
+)
 from tokenspeed.runtime.layers.attention.page_table import expand_page_table
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -53,6 +58,9 @@ class CachePool:
         page_size: int,
         rank: int,
         memory_plan: CacheMemoryPlan,
+        *,
+        paged_cache_group_specs: tuple[PagedCacheGroupSpec, ...] = (),
+        token_capacity: int | None = None,
     ):
         self.dtype = dtype
         self.rank = rank
@@ -65,8 +73,19 @@ class CachePool:
             self.store_dtype = dtype
         self.device = device
         self.plan = memory_plan
+        # The cache recipe is the single source of the scheduler group specs
+        # (CachePoolSpec.paged_cache_group_specs); the pool aligns their
+        # physical fields with the memory plan and publishes the runtime
+        # contract from the pair. Pools constructed without specs (tests)
+        # publish no contract.
+        self.runtime_contract: PagedCacheRuntimeContract | None = None
         self.paged_cache_group_specs: tuple[PagedCacheGroupSpec, ...] = ()
         self.paged_cache_group_page_counts: dict[str, int] = {}
+        if paged_cache_group_specs:
+            self._publish_runtime_contract(
+                paged_cache_group_specs,
+                token_capacity if token_capacity is not None else size,
+            )
         # Allocate lazily when the first field is bound. Concrete pools do
         # that inside their memory-saver region, so the shared buffer keeps
         # the same sleep/wake lifetime as the legacy per-buffer allocations.
@@ -77,6 +96,47 @@ class CachePool:
         self.layer_transfer_counter = None
         logger.info(
             f"Initialized token to kv pool with size {size}, dtype {dtype}, device {device}, page size {page_size}, rank {rank}"
+        )
+
+    def _publish_runtime_contract(
+        self,
+        group_specs: tuple[PagedCacheGroupSpec, ...],
+        token_capacity: int,
+    ) -> None:
+        """Align recipe group specs with the memory plan and publish the
+        scheduler contract. The plan is the source of truth for per-group
+        packing and page counts, so every spec group must be planned."""
+        from dataclasses import replace
+
+        plan_groups = {group.group_id: group for group in self.plan.groups}
+        aligned = []
+        counts: dict[str, int] = {}
+        for spec in group_specs:
+            if spec.group_id in counts:
+                raise ValueError(
+                    f"cache group {spec.group_id!r} is published more than once"
+                )
+            group = plan_groups.get(spec.group_id)
+            if group is None:
+                raise ValueError(
+                    f"cache group {spec.group_id!r} has no planned fields; "
+                    "every published group must appear in the memory plan"
+                )
+            aligned.append(
+                replace(
+                    spec,
+                    cache_blocks_per_lcm_block=group.cache_blocks_per_lcm_block,
+                )
+            )
+            counts[spec.group_id] = group.page_count
+        self.paged_cache_group_specs = tuple(aligned)
+        self.paged_cache_group_page_counts = counts
+        self.runtime_contract = PagedCacheRuntimeContract(
+            block_size=self.page_size,
+            num_lcm_blocks=self.plan.num_lcm_blocks,
+            token_capacity=token_capacity,
+            group_specs=self.paged_cache_group_specs,
+            group_page_counts=counts,
         )
 
     def field(self, field_id: str, dtype: torch.dtype) -> torch.Tensor:

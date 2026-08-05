@@ -1,10 +1,10 @@
 """Qwen3.5 cache field recipe."""
 
-from tokenspeed.runtime.layers.attention.kv_cache.plan import CacheFieldSpec
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
     build_hybrid_cache_setup,
     draft_cache_fields,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheFieldSpec
 
 
 def qwen_gdn_cache_fields(
@@ -87,9 +87,10 @@ def prepare_qwen35_cache(
     overlap_schedule_depth: int,
 ):
     """Build target and optional draft cache specs for Qwen3.5."""
-    from tokenspeed.runtime.configs.paged_cache_spec import (
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
         FULL_ATTENTION,
         LINEAR_ATTENTION,
+        build_paged_cache_group_specs,
         split_recurrent_state_groups,
     )
 
@@ -160,17 +161,36 @@ def prepare_qwen35_cache(
             if field.field_id.endswith((".conv", ".ssm"))
         )
 
+    pd_enabled = attn_config.pd_disaggregation_enabled
+    group_specs = build_paged_cache_group_specs(
+        layer_types=layer_types,
+        group_ids=group_ids,
+        sliding_window_tokens=None,
+        page_size=logical_block_tokens,
+        pd_disaggregation_enabled=pd_enabled,
+    )
+    draft_group_specs = ()
+    if draft_attn_config is not None:
+        draft_group_specs = build_paged_cache_group_specs(
+            layer_types=draft_layer_types,
+            group_ids=draft_group_ids,
+            sliding_window_tokens=None,
+            page_size=logical_block_tokens,
+            pd_disaggregation_enabled=pd_enabled,
+        )
     return build_hybrid_cache_setup(
         family="qwen_gdn",
         server_args=server_args,
         fields=fields,
         layer_types=layer_types,
         group_ids=group_ids,
+        group_specs=group_specs,
         state_dtypes=state_dtypes,
         layer_kv_head_counts=None,
         draft_fields=draft_fields,
         draft_layer_types=draft_layer_types,
         draft_group_ids=draft_group_ids,
+        draft_group_specs=draft_group_specs,
         draft_layer_kv_head_counts=None,
         cache_budget_bytes=cache_budget_bytes,
         fixed_workspace_bytes=fixed_workspace_bytes,

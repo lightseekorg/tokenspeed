@@ -32,7 +32,7 @@ from tokenspeed.runtime.epd.mooncake.sender import (
     MooncakeEmbeddingSender,
 )
 from tokenspeed.runtime.multimodal.embedder import _item_token_count
-from tokenspeed.runtime.multimodal.inputs import Modality, MultimodalDataItem
+from tokenspeed.runtime.multimodal.inputs import MultimodalDataItem
 from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.utils.env import envs
 
@@ -144,16 +144,13 @@ class DisaggEncodeExecutor:
         )
 
     def _feature_fn(self, modality):
-        # IMAGE dispatches through the model's ``image_encoder`` seam, NOT
-        # ``get_image_feature`` directly: that seam is what the encoder CUDA-graph
-        # wrapper overrides (see _maybe_install_encoder_cudagraph). When the graph
-        # is disabled the model leaves ``image_encoder = get_image_feature`` (eager);
-        # VIDEO has no captured graph -> always eager.
-        if modality == Modality.IMAGE:
-            return self.model.image_encoder
-        if modality == Modality.VIDEO:
-            return self.model.get_video_feature
-        raise ValueError(f"unsupported modality for encode: {modality}")
+        get_specs = getattr(self.model, "get_multimodal_encoder_specs", None)
+        if not callable(get_specs):
+            raise ValueError("model does not register multimodal encoders")
+        spec = get_specs().get(modality)
+        if spec is None:
+            raise ValueError(f"unsupported modality for encode: {modality}")
+        return spec.fn
 
     def execute(self, request_items: list[tuple[str, MultimodalDataItem]]) -> None:
         by_modality = {}

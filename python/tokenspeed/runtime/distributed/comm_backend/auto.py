@@ -37,6 +37,7 @@ from tokenspeed.runtime.distributed.comm_backend.triton_allreduce import (
 )
 from tokenspeed.runtime.distributed.comm_backend.triton_rsag import TritonRSAGBackend
 from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (
+    MAX_ONESHOT_BYTES,
     TrtllmAllReduceBackend,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -157,6 +158,13 @@ class AutoBackend(CommBackend):
                     group,
                     op=op,
                 )
+        # Both segments past the one-shot window are headed for NCCL either
+        # way; a grouped launch reduces them in one kernel without the
+        # cat/copy a fused lane would need.
+        if first.numel() * first.element_size() > MAX_ONESHOT_BYTES and (
+            second.numel() * second.element_size() > MAX_ONESHOT_BYTES
+        ):
+            return self._nccl.all_reduce_two(first, second, group, op=op)
         return super().all_reduce_two(first, second, group, op=op)
 
     def prepare_all_reduce_lane(self, group: Group, hidden_dim: int) -> bool:

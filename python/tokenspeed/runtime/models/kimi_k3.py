@@ -89,7 +89,6 @@ from tokenspeed_kernel.ops.tuning import load_packaged_flashinfer_tuning_cache
 from torch import nn
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiK3Config, KimiLinearConfig
-from tokenspeed.runtime.configs.paged_cache_spec import FULL_ATTENTION
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import (
     all_reduce,
@@ -100,6 +99,9 @@ from tokenspeed.runtime.distributed.comm_ops import (
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
 from tokenspeed.runtime.layers.activation import SituAndMul
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    FULL_ATTENTION,
+)
 from tokenspeed.runtime.layers.layernorm import (
     RMSNorm,
     _get_process_group,
@@ -115,7 +117,7 @@ from tokenspeed.runtime.layers.moe.latent import (
     Kimi3LatentProjection,
     Kimi3MoEExecutionPlan,
     LatentMoELayer,
-    kimi3_reduce_fused_moe,
+    kimi3_join_reduce_moe,
 )
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
@@ -1184,14 +1186,10 @@ class KimiLinearMoE(nn.Module):
                     routed_out = self.routed_expert_norm(routed_out)
                 routed_out = self.routed_expert_up_proj(routed_out)[0]
         if self.execution_plan.fused_moe_ar:
-            # Post-join: one [T, latent+hidden] all-reduce covers both
-            # partials, element-wise identical to the two separate reduces.
-            if lane is not None and routed_out.data_ptr() == lane.data_ptr():
-                fused = lane
-            else:
-                fused = torch.cat((routed_out, shared_partial), dim=-1)
-            routed_out, shared_out = kimi3_reduce_fused_moe(
-                fused,
+            routed_out, shared_out = kimi3_join_reduce_moe(
+                routed_out,
+                shared_partial,
+                lane=lane,
                 routed_hidden=self.routed_hidden,
                 routed_norm=self.routed_expert_norm,
                 group=self.mapping.moe.tp_ep_group,
@@ -1949,6 +1947,16 @@ class KimiK3ForConditionalGeneration(nn.Module):
         """Expose the shared MoonViT attribute expected by EPD prefill."""
         return self.vision.vision_tower if self.vision is not None else None
 
+    def get_multimodal_encoder_specs(self) -> dict[Modality, EncoderSpec]:
+        if self.vision is None or self.image_encoder is None:
+            return {}
+        return {
+            Modality.IMAGE: EncoderSpec(
+                self.image_encoder,
+                make_warmup_items=self.vision.make_image_warmup_items,
+            )
+        }
+
     def make_encoder_cudagraph_wrapper(
         self, mapping: Mapping
     ) -> EncoderCudaGraphWrapper:
@@ -1982,7 +1990,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
             input_ids=input_ids,
             text_embedding=self.get_input_embeddings(),
             ctx=multimodal_context,
-            encoders={Modality.IMAGE: EncoderSpec(self.image_encoder)},
+            encoders=self.get_multimodal_encoder_specs(),
             multimodal_model=self,
         )
         assert not model_kwargs, "Kimi-K3 multimodal path must stay embeds-only"

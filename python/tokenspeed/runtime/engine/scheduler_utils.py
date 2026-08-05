@@ -40,7 +40,9 @@ from tokenspeed_scheduler import (
     SchedulerConfig,
 )
 
-from tokenspeed.runtime.configs.cache_runtime import require_positive_int
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+    require_positive_int,
+)
 
 _CACHE_EVENT_TYPES = {
     "WriteBackDoneEvent": Cache.WriteBackDoneEvent,

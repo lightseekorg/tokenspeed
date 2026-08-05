@@ -37,9 +37,6 @@ from tokenspeed.runtime.cache.executor.memory_executor import (
 )
 from tokenspeed.runtime.cache.transfer.types import CacheKind
 from tokenspeed.runtime.configs.model_config import ModelConfig
-from tokenspeed.runtime.configs.paged_cache_spec import (
-    validate_scheduler_config,
-)
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -73,6 +70,9 @@ from tokenspeed.runtime.execution.factory import (
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.types import ModelExecutionResult
 from tokenspeed.runtime.grammar.capturable_grammar import GrammarStepInputs
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    validate_scheduler_config,
+)
 from tokenspeed.runtime.layers.attention.registry import create_attn_components
 from tokenspeed.runtime.metrics.collector import EngineMetrics
 from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
@@ -212,6 +212,10 @@ class EventLoop:
         target, draft = create_model_runner(
             server_args, self.model_config, draft_model_config, gpu_id, global_rank
         )
+        if server_args.disaggregation_mode in ("null", "prefill"):
+            # Keep this after all target/draft weights are loaded and before
+            # create_attn_components profiles memory for the KV-cache budget.
+            target.prepare_multimodal_runtime()
         self.use_overlap_schedule = should_use_overlap_schedule(
             disable_overlap_schedule=server_args.disable_overlap_schedule,
             disaggregation_mode=server_args.disaggregation_mode,

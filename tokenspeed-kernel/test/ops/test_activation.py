@@ -386,3 +386,16 @@ def test_fused_swiglu_fp8_ue8m0_partial_pack_keeps_padding_zero(device: str) -> 
     _, packed_scale = fused_swiglu_fp8_ue8m0(gate_up)
     tail = packed_scale[:, 1]
     assert bool(((tail >> 8) == 0).all()), "padding scale bytes must remain zero"
+
+
+@pytest.mark.skipif(not platform.is_hopper_plus, reason="PDL requires SM90+")
+def test_fused_swiglu_fp8_ue8m0_pdl_matches_serial(device: str) -> None:
+    """The PDL consumer/producer path must preserve values and packed scales."""
+    from tokenspeed_kernel.ops.activation.triton import fused_swiglu_fp8_ue8m0
+
+    gate_up = torch.randn(33, 1280, device=device, dtype=torch.bfloat16)
+    serial_out, serial_scale = fused_swiglu_fp8_ue8m0(gate_up)
+    pdl_out, pdl_scale = fused_swiglu_fp8_ue8m0(gate_up, enable_pdl=True)
+
+    assert torch.equal(pdl_out, serial_out)
+    assert torch.equal(pdl_scale, serial_scale)
