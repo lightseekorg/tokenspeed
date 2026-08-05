@@ -38,9 +38,6 @@ from tokenspeed_kernel.ops.attention.gdn_utils import (
     GdnChunkPrefillResult,
 )
 from tokenspeed_kernel.ops.attention.kda_utils import KdaPrefillResult
-from tokenspeed_kernel.ops.attention.triton.kda_chunk import (
-    kda_chunk_prefill,
-)
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry, Priority
@@ -116,7 +113,6 @@ __all__ = [
     "gdn_chunk_prefill",
     "gdn_decode_step",
     "gdn_decode_mtp",
-    "kda_chunk_prefill",
     "kda_paged_prefill",
     "kda_paged_decode",
     "try_kda_fused_paged_decode",
@@ -789,11 +785,7 @@ def kda_paged_prefill(
     num_sequences = cu_seqlens.numel() - 1
     if initial_state.ndim != 4 or initial_state.shape[0] != num_sequences:
         raise ValueError("KDA initial_state must contain one row per sequence")
-    # AMD historically ignores the NVIDIA prefill policy labels and uses its
-    # registered Triton implementation.
-    if current_platform().is_amd and solution in {"fla", "flashkda", "cutedsl_kda"}:
-        solution = "triton"
-    elif solution == "fla":
+    if solution == "fla":
         solution = "triton"
     kernel = select_kernel(
         "attention",

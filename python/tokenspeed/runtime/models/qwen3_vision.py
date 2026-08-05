@@ -45,6 +45,7 @@ from tokenspeed.runtime.layers.linear import ColumnParallelLinear, RowParallelLi
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from tokenspeed.runtime.multimodal.inputs import Modality, MultimodalDataItem
 from tokenspeed.runtime.utils import add_prefix
 
 
@@ -384,6 +385,65 @@ class Qwen3VLMoeVisionModel(nn.Module):
     @property
     def device(self) -> torch.device:
         return self.patch_embed.proj.weight.device
+
+    def _make_warmup_items(
+        self,
+        modality: Modality,
+        *,
+        temporal_patches: int,
+        grid_key: str,
+    ) -> list[MultimodalDataItem]:
+        """Build one input on Qwen's native absolute-position grid."""
+        patches_per_side = int(self.num_grid_per_side)
+        if patches_per_side * patches_per_side != self.num_position_embeddings:
+            raise ValueError(
+                "Qwen vision num_position_embeddings must describe a square "
+                f"grid, got {self.num_position_embeddings}"
+            )
+        merge = int(self.spatial_merge_size)
+        if patches_per_side % merge:
+            raise ValueError(
+                f"Qwen's native grid {patches_per_side} must be divisible by "
+                f"spatial_merge_size={merge}"
+            )
+        patch_embed = self.patch_embed
+        flattened_patch_size = (
+            patch_embed.in_channels
+            * patch_embed.temporal_patch_size
+            * patch_embed.patch_size
+            * patch_embed.patch_size
+        )
+
+        grid = torch.tensor(
+            [[temporal_patches, patches_per_side, patches_per_side]],
+            dtype=torch.long,
+        )
+        feature = torch.zeros(
+            temporal_patches * patches_per_side * patches_per_side,
+            flattened_patch_size,
+            dtype=self.dtype,
+        )
+        return [
+            MultimodalDataItem(
+                modality=modality,
+                feature=feature,
+                model_specific_data={grid_key: grid},
+            )
+        ]
+
+    def make_image_warmup_items(self) -> list[MultimodalDataItem]:
+        return self._make_warmup_items(
+            Modality.IMAGE,
+            temporal_patches=1,
+            grid_key="image_grid_thw",
+        )
+
+    def make_video_warmup_items(self) -> list[MultimodalDataItem]:
+        return self._make_warmup_items(
+            Modality.VIDEO,
+            temporal_patches=max(2, int(self.patch_embed.temporal_patch_size)),
+            grid_key="video_grid_thw",
+        )
 
     def rot_pos_emb(
         self, grid_thw: list[list[int]]

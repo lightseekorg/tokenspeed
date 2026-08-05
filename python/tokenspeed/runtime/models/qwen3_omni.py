@@ -265,6 +265,26 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3MoeForCausalLM):
         output = self.visual.forward_blocks(tokens, self.visual.prepare_metadata(grid))
         return self.post_encode([output], grid)
 
+    def get_multimodal_encoder_specs(self) -> dict[Modality, EncoderSpec]:
+        specs = {}
+        if self.visual is not None:
+            specs[Modality.IMAGE] = EncoderSpec(
+                self.image_encoder,
+                deepstack=True,
+                make_warmup_items=self.visual.make_image_warmup_items,
+            )
+            specs[Modality.VIDEO] = EncoderSpec(
+                self.video_encoder,
+                deepstack=True,
+                make_warmup_items=self.visual.make_video_warmup_items,
+            )
+        if self.audio_tower is not None:
+            specs[Modality.AUDIO] = EncoderSpec(
+                self.audio_encoder,
+                make_warmup_items=self.audio_tower.make_warmup_items,
+            )
+        return specs
+
     def _build_encoder_cudagraph_wrapper(
         self,
         mapping: Mapping,
@@ -336,11 +356,7 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3MoeForCausalLM):
             input_ids=input_ids,
             text_embedding=self.model.embed_tokens,
             ctx=multimodal_context,
-            encoders={
-                Modality.IMAGE: EncoderSpec(self.image_encoder, deepstack=True),
-                Modality.VIDEO: EncoderSpec(self.video_encoder, deepstack=True),
-                Modality.AUDIO: EncoderSpec(self.audio_encoder),
-            },
+            encoders=self.get_multimodal_encoder_specs(),
             multimodal_model=self,
         )
         hidden_states, aux_hidden_states = self.model(
