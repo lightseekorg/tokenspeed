@@ -1097,11 +1097,7 @@ class KimiLinearMoE(nn.Module):
             else None
         )
 
-        # Multicast latent tail: one kernel for AR(latent)+norm+RS(shared),
-        # a per-rank-sharded up-projection whose epilogue multicast-stores
-        # into every rank's mailbox (NVLS all-gather), and a Lamport gather.
-        # Replaces the fused-AR + replicated up-projection tail on short
-        # decode batches; the replicated weight read drops to 1/tp per rank.
+        # Fused AR(latent)+norm+RS tail with 1/tp-sharded up-projection.
         self._latent_tail = None
         if (
             not self.execution_plan.use_native
@@ -1194,8 +1190,7 @@ class KimiLinearMoE(nn.Module):
         # under concurrent GEMMs). Topk is a single small CTA, so it overlaps
         # down_proj from the aux stream, followed by the shared chain.
         router_logits = self.gate(hidden_states)
-        # Graph-phase only: the tail is a decode-graph optimization; eager
-        # forwards (prefill, uncaptured sizes) keep the fused-AR path.
+        # Decode-graph only; eager forwards keep the fused-AR path.
         use_tail = (
             self._latent_tail is not None
             and get_is_cuda_graph_phase()
@@ -1236,9 +1231,7 @@ class KimiLinearMoE(nn.Module):
                     routed_out = self.routed_expert_norm(routed_out)
                 routed_out = self.routed_expert_up_proj(routed_out)[0]
         if use_tail:
-            # Both partials stay pre-reduce; the tail owns all communication.
-            # The lamport gather fuses the residual accumulate (identical
-            # rounding to the eager add), removing one elementwise launch.
+            # Partials are pre-reduce; the tail owns all communication.
             return self._latent_tail(
                 routed_out,
                 shared_partial,
