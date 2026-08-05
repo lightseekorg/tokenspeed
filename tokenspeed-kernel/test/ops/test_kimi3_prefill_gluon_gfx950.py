@@ -15,12 +15,13 @@ if not is_cdna4():
     )
 
 
-from tokenspeed_kernel.ops.attn_res import (  # noqa: E402
-    _specialized_shape_eligible,
-    attn_res_fwd,
-)
+import tokenspeed_kernel.ops.attn_res as attn_res  # noqa: E402
+from tokenspeed_kernel.ops.attn_res import attn_res_fwd  # noqa: E402
 from tokenspeed_kernel.ops.moe import moe_sigmoid_bias_topk  # noqa: E402
 from tokenspeed_kernel.ops.moe.sigmoid_topk import _gluon_eligible  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.attention.kda.attn_res import (  # noqa: E402
+    _attn_res_rmsnorm_kernel,
+)
 
 
 def _attn_res_reference(
@@ -82,11 +83,58 @@ def test_attn_res_public_block_major_dispatch_matches_reference() -> None:
     torch.testing.assert_close(actual, expected, rtol=5e-3, atol=1.6e-2)
 
 
-def test_attn_res_large_prefill_dispatch_boundary() -> None:
-    assert not _specialized_shape_eligible(0, 7168, 12, fused_output_norm=True)
-    assert _specialized_shape_eligible(32768, 7168, 12, fused_output_norm=True)
-    assert not _specialized_shape_eligible(32768, 7168, 12, fused_output_norm=False)
-    assert not _specialized_shape_eligible(65537, 7168, 12, fused_output_norm=True)
+def test_attn_res_large_prefill_dispatch_boundary(monkeypatch) -> None:
+    selected = []
+    real_select = attn_res.select_kernel
+
+    def capture_selection(*args, **kwargs):
+        selected.append(real_select(*args, **kwargs).name)
+        return lambda **kwargs: None
+
+    monkeypatch.setattr(attn_res, "select_kernel", capture_selection)
+    norm = torch.empty(7168, device="meta", dtype=torch.bfloat16)
+    cases = (
+        (16384, norm),
+        (16385, norm),
+        (65536, norm),
+        (65537, norm),
+        (32768, None),
+    )
+    for tokens, output_norm in cases:
+        layer = torch.empty(tokens, 7168, device="meta", dtype=torch.bfloat16)
+        history = torch.empty(11, tokens, 7168, device="meta", dtype=torch.bfloat16)
+        attn_res.attn_res_fwd(layer, history, norm, norm, out_norm_weight=output_norm)
+
+    assert selected == [
+        "gluon_attn_res_fwd_gfx950",
+        "gluon_attn_res_fwd_gfx950",
+        "gluon_attn_res_fwd_gfx950",
+        "torch_attn_res_fwd",
+        "torch_attn_res_fwd",
+    ]
+
+
+def test_attn_res_large_candidate_stride_compiles() -> None:
+    tensor = torch.empty(1, device="cuda", dtype=torch.bfloat16)
+    _attn_res_rmsnorm_kernel.warmup(
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        stride_layer_t=7168,
+        stride_block_t=7168,
+        stride_block_n=32768 * 7168,
+        stride_output_t=7168,
+        H=7168,
+        N=12,
+        SCORE_EPS=1e-6,
+        OUTPUT_EPS=1e-6,
+        NUM_WARPS=8,
+        num_warps=8,
+        grid=(1,),
+    )
 
 
 @pytest.mark.parametrize("tokens", [1, 17, 8192])
