@@ -216,3 +216,47 @@ def test_resume_only_keeps_results_with_ab_metadata(tmp_path):
     assert ab._is_complete_result(result) is True
     result.write_text('{"ab_metadata": {"repeat": 1}, "failed": 1}')
     assert ab._is_complete_result(result) is False
+
+
+@pytest.mark.parametrize(
+    ("returncode", "message"),
+    [(124, "timed out"), (125, "lost its serving process")],
+)
+def test_infrastructure_failure_aborts_even_with_continue_on_error(
+    tmp_path, returncode, message
+):
+    with pytest.raises(RuntimeError, match=message):
+        ab._handle_benchmark_failure(
+            returncode=returncode,
+            point_name="8k-1k-c48",
+            bench_log=tmp_path / "bench.log",
+            continue_on_error=True,
+        )
+
+
+def test_continue_on_error_only_tolerates_point_failures(tmp_path):
+    ab._handle_benchmark_failure(
+        returncode=1,
+        point_name="8k-1k-c48",
+        bench_log=tmp_path / "bench.log",
+        continue_on_error=True,
+    )
+
+
+def test_partial_ab_pair_fails_final_check():
+    check = ab.check_results(
+        [
+            {
+                "engine": "tokenspeed",
+                "point": "8k-1k-c48",
+                "status": "partial",
+                "dspark_accept_length": None,
+            }
+        ],
+        {},
+        min_accept_length=1.1,
+        baseline=None,
+        reference_threshold=0.9,
+    )
+    assert check["passed"] is False
+    assert check["failures"] == ["tokenspeed/8k-1k-c48: missing A/B arm"]

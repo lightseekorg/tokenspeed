@@ -602,6 +602,23 @@ def _is_complete_result(path: Path) -> bool:
     )
 
 
+def _handle_benchmark_failure(
+    *,
+    returncode: int,
+    point_name: str,
+    bench_log: Path,
+    continue_on_error: bool,
+) -> None:
+    """Abort on infrastructure loss even when point failures are tolerated."""
+    if returncode in (124, 125):
+        reason = "timed out" if returncode == 124 else "lost its serving process"
+        raise RuntimeError(
+            f"benchmark infrastructure {reason} at {point_name}; see {bench_log}"
+        )
+    if not continue_on_error:
+        raise RuntimeError(f"benchmark failed for {point_name}; see {bench_log}")
+
+
 def run_arm(
     args: argparse.Namespace,
     arm: str,
@@ -713,10 +730,12 @@ def run_arm(
                         "error": _last_lines(bench_log),
                     }
                     output_path.write_text(json.dumps(failure, indent=2))
-                    if not args.continue_on_error:
-                        raise RuntimeError(
-                            f"benchmark failed for {point.name}; see {bench_log}"
-                        )
+                    _handle_benchmark_failure(
+                        returncode=returncode,
+                        point_name=point.name,
+                        bench_log=bench_log,
+                        continue_on_error=args.continue_on_error,
+                    )
                     continue
                 result = json.loads(output_path.read_text())
                 result["ab_metadata"] = {
@@ -924,6 +943,8 @@ def check_results(
     for row in paired_rows:
         if row["status"] == "failed":
             failures.append(f"{row['engine']}/{row['point']}: failed repeats")
+        elif row["status"] == "partial":
+            failures.append(f"{row['engine']}/{row['point']}: missing A/B arm")
         accept_length = row.get("dspark_accept_length")
         if accept_length is not None and accept_length < min_accept_length:
             failures.append(
