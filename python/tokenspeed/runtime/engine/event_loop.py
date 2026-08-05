@@ -1107,6 +1107,7 @@ class EventLoop:
             num_gpu_blocks=geometry.num_device_pages,
             block_size=geometry.page_size,
             dtype=_wire_dtype(self.model_config.dtype),
+            multimodal_encoder_dtype=self.multimodal_encoder_dtype,
             vllm_version=f"tokenspeed-{_tokenspeed_version()}",
             world_size=self.world_size,
             data_parallel_size=self.dp_size,
