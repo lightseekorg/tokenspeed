@@ -661,6 +661,8 @@ def _mfma_lds_mediumm_kernel(
     a_ptr,
     b_ptr,
     c_ptr,
+    addend_a_ptr,
+    addend_b_ptr,
     M,
     N,
     K: gl.constexpr,
@@ -670,6 +672,10 @@ def _mfma_lds_mediumm_kernel(
     stride_bn,
     stride_cm,
     stride_cn,
+    stride_addend_am,
+    stride_addend_an,
+    stride_addend_bm,
+    stride_addend_bn,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
@@ -677,6 +683,7 @@ def _mfma_lds_mediumm_kernel(
     WARPS_N: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     GROUP_SIZE_M: gl.constexpr,
+    ADD3: gl.constexpr,
 ):
     """MFMA/LDS dense16 GEMM for selected 8 <= M <= 128 decode tiles."""
     pid = gl.program_id(axis=0)
@@ -985,6 +992,35 @@ def _mfma_lds_mediumm_kernel(
     cn = pid_n * BLOCK_N + offs_cn
     c_offsets = offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn
     c_mask = (cm[:, None] < M) & (cn[None, :] < N)
+    if ADD3:
+        addend_a_offsets = (
+            offs_cm[:, None] * stride_addend_am + offs_cn[None, :] * stride_addend_an
+        )
+        addend_b_offsets = (
+            offs_cm[:, None] * stride_addend_bm + offs_cn[None, :] * stride_addend_bn
+        )
+        addend_a_base = (
+            addend_a_ptr
+            + pid_m * BLOCK_M * stride_addend_am
+            + pid_n * BLOCK_N * stride_addend_an
+        )
+        addend_b_base = (
+            addend_b_ptr
+            + pid_m * BLOCK_M * stride_addend_bm
+            + pid_n * BLOCK_N * stride_addend_bn
+        )
+        acc_store += cdna4.buffer_load(
+            ptr=addend_a_base,
+            offsets=addend_a_offsets,
+            mask=c_mask,
+            other=0.0,
+        )
+        acc_store += cdna4.buffer_load(
+            ptr=addend_b_base,
+            offsets=addend_b_offsets,
+            mask=c_mask,
+            other=0.0,
+        )
     c_base = c_ptr + pid_m * BLOCK_M * stride_cm + pid_n * BLOCK_N * stride_cn
     cdna4.buffer_store(
         ptr=c_base,
@@ -1407,6 +1443,8 @@ def gluon_mm_a16w16_mfma_lds_mediumm_gfx950(
         A,
         B,
         C,
+        C,
+        C,
         M,
         N,
         K,
@@ -1416,6 +1454,10 @@ def gluon_mm_a16w16_mfma_lds_mediumm_gfx950(
         B.stride(0),
         C.stride(0),
         C.stride(1),
+        C.stride(0),
+        C.stride(1),
+        C.stride(0),
+        C.stride(1),
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_K=block_k,
@@ -1423,12 +1465,80 @@ def gluon_mm_a16w16_mfma_lds_mediumm_gfx950(
         WARPS_N=warps_n,
         NUM_BUFFERS=num_buffers,
         GROUP_SIZE_M=GROUP_SIZE_M,
+        ADD3=False,
         num_warps=warps_m * warps_n,
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )
 
     if alpha is not None:
         C.mul_(alpha.to(device=C.device, dtype=C.dtype))
+    return C
+
+
+def gluon_mm_a16w16_add3_m16_gfx950(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    addend_a: torch.Tensor,
+    addend_b: torch.Tensor,
+) -> torch.Tensor:
+    """Compute ``A @ B.T + addend_a + addend_b`` for the tuned M=16 tile."""
+    if A.shape != (16, 3584) or B.shape != (7168, 3584):
+        raise ValueError(
+            "M=16 dense16 add3 expects A [16, 3584] and B [7168, 3584], "
+            f"got A={tuple(A.shape)} B={tuple(B.shape)}"
+        )
+    for name, tensor in (
+        ("B", B),
+        ("addend_a", addend_a),
+        ("addend_b", addend_b),
+    ):
+        if tensor.device != A.device or tensor.dtype != A.dtype:
+            raise ValueError(f"M=16 dense16 add3 {name} must match A dtype and device")
+    if A.dtype not in _SUPPORTED_DTYPES or not A.is_cuda:
+        raise ValueError("M=16 dense16 add3 requires CUDA/HIP fp16 or bf16 tensors")
+    if not A.is_contiguous() or not B.is_contiguous():
+        raise ValueError("M=16 dense16 add3 requires contiguous GEMM inputs")
+    for name, tensor in (("addend_a", addend_a), ("addend_b", addend_b)):
+        if tensor.shape != (16, 7168) or tensor.stride(1) != 1:
+            raise ValueError(
+                f"M=16 dense16 add3 {name} must have shape [16, 7168] "
+                "and unit inner stride"
+            )
+
+    C = A.new_empty((16, 7168))
+    block_m, block_n, block_k = 16, 32, 128
+    warps_m, warps_n, num_buffers = 2, 2, 3
+    grid = (triton.cdiv(7168, block_n),)
+    _mfma_lds_mediumm_kernel[grid](
+        A,
+        B,
+        C,
+        addend_a,
+        addend_b,
+        16,
+        7168,
+        3584,
+        A.stride(0),
+        A.stride(1),
+        B.stride(1),
+        B.stride(0),
+        C.stride(0),
+        C.stride(1),
+        addend_a.stride(0),
+        addend_a.stride(1),
+        addend_b.stride(0),
+        addend_b.stride(1),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        WARPS_M=warps_m,
+        WARPS_N=warps_n,
+        NUM_BUFFERS=num_buffers,
+        GROUP_SIZE_M=1,
+        ADD3=True,
+        num_warps=warps_m * warps_n,
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+    )
     return C
 
 

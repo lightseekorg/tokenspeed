@@ -1203,12 +1203,13 @@ class KimiLinearMoE(nn.Module):
     ) -> torch.Tensor:
         """Run the fused multi-launch K3 decode pipeline.
 
-        One input-projection launch produces router logits, the routed latent,
-        and the activated shared input. The expert launch combines routed
-        W13/W2 with the shared down projection, then one collective reduces
-        both partials. The final routed up projection adds ``prefix_sum`` and
-        the shared output in its epilogue. Top-k and the optional routed norm
-        remain separate launches.
+        The input-projection operation produces router logits, the routed
+        latent, and the activated shared input from one packed weight. Routed
+        W13 and SiTU run separately; the next launch computes routed W2 beside
+        the shared down projection. One collective reduces both partials. The
+        final routed up projection adds ``prefix_sum`` and the shared output in
+        its epilogue when a specialized implementation is available. Top-k and
+        the optional routed norm remain separate launches.
         """
 
         router_logits, routed_input, shared_input = latent_moe_input_projections(
