@@ -37,11 +37,11 @@ import math
 import torch
 from transformers.configuration_utils import PretrainedConfig
 
-from tokenspeed.runtime.configs.paged_cache_spec import (
+from tokenspeed.runtime.distributed.utils import divide
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     LINEAR_ATTENTION,
 )
-from tokenspeed.runtime.distributed.utils import divide
 
 # "linear_attention" comes from paged_cache_spec (the KV-cache label vocabulary
 # the hybrid allocator keys on). "attention" is the value of

@@ -45,7 +45,9 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
         device="cpu",
         groups=None,
     ):
-        from tokenspeed.runtime.configs.paged_cache_spec import PagedCacheGroupSpec
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    PagedCacheGroupSpec,
+)
         from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 
         # Bypass __init__: the paths under test read only these attributes.

@@ -45,8 +45,6 @@ from tokenspeed_kernel.ops.attention.triton.linear.index import (
     set_total_chunks_hint_uniform,
 )
 
-from tokenspeed.runtime.configs.cache_runtime import cache_debug_enabled
-from tokenspeed.runtime.configs.paged_cache_spec import LINEAR_ATTENTION
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
     current_forward_ctx,
@@ -56,6 +54,12 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
     init_backend_cuda_graph_state,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+    cache_debug_enabled,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    LINEAR_ATTENTION,
 )
 from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
     causal_conv1d_fn,

@@ -288,7 +288,12 @@ tokenspeed serve Qwen/Qwen3-30B-A3B \
   --port 8000
 ```
 
-## Qwen3.8-max
+## Qwen3.8
+
+Qwen3.8 shares the hybrid linear-attention (GDN) / full-attention layer
+pattern with Qwen3.5.
+
+### Qwen3.8-Max
 
 Qwen3.8-max needs 16 GPUs, so it runs on two 8-GPU nodes. Launch
 `tokenspeed serve` on every node with the same command, changing only
@@ -302,7 +307,7 @@ This family has no parser auto-selection, so set `--reasoning-parser` and
 `--dist-init-addr` to node 0's own address and port throughout
 (`<node0-host>:25000` below).
 
-### TP16
+#### TP16
 
 One replica across both nodes. `--ep-size` defaults to 1, so the experts stay
 tensor-parallel over the full world and all-to-all stays out of the path. Keep
@@ -345,7 +350,7 @@ tokenspeed serve /path/to/qwen3.8-max-fp8 \
   --host 0.0.0.0 --port 8000
 ```
 
-### TP8 DP2 EP16 (DeepEP)
+#### TP8 DP2 EP16 (DeepEP)
 
 Two TP8 attention replicas, experts sharded across all 16 ranks, and expert
 routing on DeepEP dispatch/combine instead of all-gather:
@@ -401,13 +406,37 @@ Notes:
   `NVSHMEM_IB_SL`, and point `NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME` at the same
   interface as `NCCL_SOCKET_IFNAME`.
 
-### Choosing a layout
+#### Choosing a layout
 
 - TP16 has the lower TTFT and TPOT at batch 1-2: no dispatch/combine hop, and
   the single replica owns the whole batch.
 - The DeepEP layout pulls ahead from mid batch up, where its expert kernels and
   the second attention replica both pay off.
 
+### Qwen3.8-27B
+
+A dense 27B-class Qwen3.8 FP8 checkpoint on a single GPU, with self-speculative
+MTP (the draft model path points at the same checkpoint):
+
+```bash
+tokenspeed serve /path/to/qwen3.8-27b-fp8 \
+  --served-model-name qwen3.8-27b \
+  --world-size 1 \
+  --gpu-memory-utilization 0.9 \
+  --attention-backend trtllm \
+  --moe-backend flashinfer_trtllm \
+  --chunked-prefill-size 8192 \
+  --max-model-len 262144 \
+  --max-num-seqs 128 \
+  --kv-cache-dtype fp8_e4m3 \
+  --speculative-algorithm MTP \
+  --speculative-draft-model-path /path/to/qwen3.8-27b-fp8 \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --disable-kvstore \
+  --host 0.0.0.0 --port 8000
+```
 
 ## GPT-OSS 20B / 120B
 

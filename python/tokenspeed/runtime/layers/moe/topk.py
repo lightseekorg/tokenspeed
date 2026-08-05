@@ -25,7 +25,7 @@ from typing import Any, Literal, NamedTuple, Protocol, runtime_checkable
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.moe import moe_sigmoid_bias_topk
+from tokenspeed_kernel.ops.moe import moe_sigmoid_bias_topk, moe_softmax_topk
 from tokenspeed_kernel.ops.moe.triton.inkling_topk import inkling_topk
 from tokenspeed_kernel.thirdparty.cuda import routing_flash as cuda_routing_flash
 from tokenspeed_kernel.thirdparty.triton import minimax_biased_grouped_topk
@@ -596,14 +596,18 @@ def select_experts(
             renormalize,
         )
     elif custom_routing_function is None:
-        topk_weights, topk_ids = torch_native_fused_topk(
-            hidden_states,
+        assert (
+            hidden_states.shape[0] == router_logits.shape[0]
+        ), f"Number of tokens mismatch, {hidden_states.shape=} vs {router_logits.shape=}"
+        topk_weights, topk_ids = moe_softmax_topk(
             router_logits,
-            topk=top_k,
+            top_k,
             renormalize=renormalize,
+            routed_scaling_factor=(
+                1.0 if routed_scaling_factor is None else routed_scaling_factor
+            ),
+            enable_pdl=pdl_enabled(),
         )
-        if routed_scaling_factor is not None:
-            topk_weights *= routed_scaling_factor
         topk_ids = topk_ids_logical_to_physical(
             topk_ids,
             expert_location_dispatch_info,

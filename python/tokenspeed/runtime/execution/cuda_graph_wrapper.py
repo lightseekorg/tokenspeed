@@ -31,9 +31,6 @@ import torch
 import torch.distributed as dist
 import tqdm
 
-from tokenspeed.runtime.configs.paged_cache_spec import (
-    compute_max_logical_pages_for_capture,
-)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
@@ -41,6 +38,9 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 )
 from tokenspeed.runtime.layers.attention.backends.base import (
     init_backend_cuda_graph_state,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    compute_max_logical_pages_for_capture,
 )
 from tokenspeed.runtime.sampling.backends.base import CUDA_GRAPH_VARIANT_DEFAULT
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo

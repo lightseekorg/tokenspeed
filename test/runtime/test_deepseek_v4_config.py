@@ -26,18 +26,6 @@ from tokenspeed_kernel.thirdparty.cuda import (
     softplus_sqrt_topk_flash,
 )
 
-from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
-    V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
-    V4_SWA_KV_GROUP_ID,
-    build_v4_cache_specs,
-    deepseek_v4_indexer_fp8_row_bytes,
-    deepseek_v4_indexer_mxfp4_row_bytes,
-    deepseek_v4_nope_dim,
-    deepseek_v4_swa_row_bytes,
-    deepseek_v4_swa_token_stride,
-    v4_compressed_kv_group_id,
-    v4_compressor_state_group_id,
-)
 from tokenspeed.runtime.configs.deepseek_v4_config import DeepseekV4Config
 from tokenspeed.runtime.configs.model_config import (
     AttentionArch,
@@ -47,7 +35,9 @@ from tokenspeed.runtime.configs.model_config import (
     is_deepseek_v4,
     is_deepseek_v4_nextn,
 )
-from tokenspeed.runtime.configs.paged_cache_spec import PagedCacheGroupSpec
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    PagedCacheGroupSpec,
+)
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.execution.cuda_graph_wrapper import (
     CudaGraphWrapper,
@@ -79,11 +69,23 @@ from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
     _group_slot_mapping_from_raw,
     _mask_invalid_graph_tokens,
     _split_paged_cache_block_tables_into_v4_metadata,
-    build_deepseek_v4_cache_fields,
-    deepseek_v4_cache_layout_from_config,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
+    build_deepseek_v4_cache_fields,
     solve_deepseek_v4_memory_layout,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4_cache_spec import (
+    V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
+    V4_SWA_KV_GROUP_ID,
+    build_v4_cache_specs,
+    deepseek_v4_cache_layout_from_config,
+    deepseek_v4_indexer_fp8_row_bytes,
+    deepseek_v4_indexer_mxfp4_row_bytes,
+    deepseek_v4_nope_dim,
+    deepseek_v4_swa_row_bytes,
+    deepseek_v4_swa_token_stride,
+    v4_compressed_kv_group_id,
+    v4_compressor_state_group_id,
 )
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.quantization import QUANTIZATION_METHODS
@@ -142,6 +144,12 @@ def _make_planned_deepseek_v4_pool(
     plan = solve_deepseek_v4_memory_layout(fields).with_num_lcm_blocks(num_lcm_blocks)
     max_packing = max(group.cache_blocks_per_lcm_block for group in plan.groups)
     pool_size = num_lcm_blocks * max_packing * plan.logical_block_tokens
+    specs = tuple(
+        build_v4_cache_specs(
+            hf_config,
+            layer_ratio=layout.layer_ratio,
+        )
+    )
     pool = HybridDeepseekV4TokenToKVPool(
         size=pool_size,
         model_dtype=torch.bfloat16,
@@ -149,12 +157,10 @@ def _make_planned_deepseek_v4_pool(
         layer_num=len(layout.layer_ratio),
         device="cpu",
         enable_memory_saver=False,
-        max_batch_size=2,
-        max_context_len=1024,
         page_size=layout.page_size,
         rank=0,
-        hf_config=hf_config,
         memory_plan=plan,
+        paged_cache_group_specs=specs,
         token_capacity=pool_size,
     )
     return pool, plan
@@ -1540,11 +1546,8 @@ class TestDeepseekV4Config(unittest.TestCase):
                 layer_num=1,
                 device="cpu",
                 enable_memory_saver=False,
-                max_batch_size=2,
-                max_context_len=128,
                 page_size=64,
                 rank=0,
-                hf_config=config,
                 memory_plan=solve_deepseek_v4_memory_layout(
                     build_deepseek_v4_cache_fields(
                         layout,
@@ -1552,6 +1555,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                         logical_block_tokens=256,
                     )
                 ).with_num_lcm_blocks(1),
+                paged_cache_group_specs=(),
                 token_capacity=256,
             )
 
@@ -2118,11 +2122,8 @@ class TestDeepseekV4Config(unittest.TestCase):
                 layer_num=2,
                 device="cpu",
                 enable_memory_saver=False,
-                max_batch_size=2,
-                max_context_len=128,
                 page_size=64,
                 rank=0,
-                hf_config=config,
                 memory_plan=solve_deepseek_v4_memory_layout(
                     build_deepseek_v4_cache_fields(
                         layout,
@@ -2130,6 +2131,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                         logical_block_tokens=256,
                     )
                 ).with_num_lcm_blocks(1),
+                paged_cache_group_specs=(),
                 token_capacity=256,
             )
 

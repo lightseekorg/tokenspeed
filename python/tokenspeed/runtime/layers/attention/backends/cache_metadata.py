@@ -27,12 +27,12 @@ from typing import Any
 
 import torch
 
-from tokenspeed.runtime.configs.cache_runtime import (
-    PagedCacheRuntimeContract,
-    require_positive_int,
-)
 from tokenspeed.runtime.engine.scheduler_utils import (
     block_tables_from_forward_op,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+    PagedCacheRuntimeContract,
+    require_positive_int,
 )
 
 

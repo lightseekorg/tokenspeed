@@ -21,3 +21,4 @@
 import tokenspeed_kernel.ops.moe.triton.bf16  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton.inkling_topk  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton.mxfp4  # noqa: F401
+import tokenspeed_kernel.ops.moe.triton.softmax_topk  # noqa: F401

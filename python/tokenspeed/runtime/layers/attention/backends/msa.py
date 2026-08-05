@@ -116,7 +116,7 @@ class MSAAttnBackend(CacheGroupsMixin, AttentionBackend):
     """MiniMax sparse attention backend that routes through tokenspeed_kernel attention APIs."""
 
     # Unconditional: safety comes from the publication rule
-    # (paged_cache_spec.publish_paged_cache_groups) plus the replay
+    # (kv_cache.recipes.publish) plus the replay
     # stale-table guard. drop the flag.
     uses_cache_groups: bool = True
 
