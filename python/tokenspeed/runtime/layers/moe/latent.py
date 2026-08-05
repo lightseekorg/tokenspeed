@@ -245,7 +245,10 @@ class Kimi3LatentProjection(ReplicatedLinear):
         addend_a: torch.Tensor,
         addend_c: torch.Tensor,
     ) -> torch.Tensor:
-        """Project routed latents and accumulate two full-width addends."""
+        """Project routed latents and accumulate two full-width addends.
+
+        ``result = addend_a + hidden_states @ self.weight.T + addend_c``
+        """
         return tokenspeed_kernel.kimi3_latent_projection_add3(
             hidden_states,
             self.weight,
