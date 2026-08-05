@@ -58,5 +58,5 @@ that order. The csrc tree compiles cleanly against flashinfer's CUTLASS
 Re-copy from the upstream fork at a newer commit, let `pre-commit run`
 reformat the tree, re-apply the `TokenSpeed patch` block in `cuda/jit.py`,
 update the pinned commit above, and re-run
-`tokenspeed-kernel/test/ops/test_attention_msa.py`. To diff against
+`tokenspeed-kernel/test/ops/attention/test_attention_msa.py`. To diff against
 upstream, black/isort-format the upstream side first.

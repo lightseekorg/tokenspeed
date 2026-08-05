@@ -7,8 +7,8 @@ the FA4 compatibility layer, and the runtime-facing `rel_*` operator
 modules. The local validation harnesses referenced below
 (`test_*_local.py`, `compare_prefill_decode_swa.py`) live in the original
 standalone repository, not in this tree; the in-tree coverage is
-`tokenspeed-kernel/test/ops/test_attention_tsmha_*.py` and
-`test_mxfp8_attention.py`.
+`tokenspeed-kernel/test/ops/attention/test_attention_tsmha_*.py` and
+`tokenspeed-kernel/test/ops/attention/test_mxfp8_attention.py`.
 
 The prefill entry point uses two Python files at runtime:
 

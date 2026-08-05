@@ -14,6 +14,7 @@ from setuptools import build_meta
 SETUP_PY = Path(__file__).parents[1] / "python" / "setup.py"
 REQUIREMENTS_DIR = SETUP_PY.parent / "requirements"
 CUDA_CSRC_DIR = SETUP_PY.parent / "csrc" / "cuda"
+OPS_TEST_DIR = Path(__file__).parent / "ops"
 
 
 def _capture_install_requires(monkeypatch, backend: str) -> list[str]:
@@ -258,6 +259,10 @@ def test_solution_siblings_use_consistent_packages() -> None:
     attention_ops = ops / "attention"
     for old_bundle in ("flash_attn", "flash_mla", "flashinfer", "gluon"):
         assert not (attention_ops / old_bundle).exists()
+
+
+def test_operator_tests_are_grouped_by_family() -> None:
+    assert not list(OPS_TEST_DIR.glob("test_*.py"))
 
 
 def test_family_initializers_do_not_reexport_solutions() -> None:
