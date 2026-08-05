@@ -109,18 +109,6 @@ TEST_F(LoadBackDoneTestSuite, LoadBackDone_Success_PrefixLenChangesInForward) {
     }
 }
 
-// LoadBack is inline (synchronous); subsequent plans proceed normally.
-TEST_F(LoadBackDoneTestSuite, LoadBack_SubsequentPlanProceeds) {
-    SetupHostCache();
-
-    Submit(MakeRequestSpec("r2", /*num_pages=*/2, /*start=*/1));
-    auto plan = PlanOnce();
-
-    auto plan2 = PlanOnce();
-    (void)plan2;
-    EXPECT_TRUE(true);
-}
-
 class DisaggDecodeAdmissionTestSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
@@ -134,7 +122,7 @@ protected:
         cfg.decode_input_tokens = 1;
         cfg.role = Role::kD;
         cfg.enable_l3_storage = false;
-        cfg.disable_l2_cache = true;
+        cfg.disable_l2_cache = false;
         cfg.disable_prefix_cache = true;
 
         PagedCacheGroupConfig full;
@@ -185,7 +173,7 @@ TEST_F(DisaggDecodeAdmissionTestSuite, ReservesWholeDestinationAndSurvivesRemote
     EXPECT_EQ(decode->block_tables.at("full")[static_cast<std::size_t>(r0)].size(), 3u);
 }
 
-class DecodeSnapshotL2TestSuite : public DisaggDecodeAdmissionTestSuite {
+class DecodeRetractionL2TestSuite : public DisaggDecodeAdmissionTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = DisaggDecodeAdmissionTestSuite::MakeConfig();
@@ -194,34 +182,34 @@ protected:
     }
 };
 
-class DecodeSnapshotCapacityTestSuite : public DecodeSnapshotL2TestSuite {
+class DecodeRetractionCapacityTestSuite : public DecodeRetractionL2TestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
-        SchedulerConfig cfg = DecodeSnapshotL2TestSuite::MakeConfig();
+        SchedulerConfig cfg = DecodeRetractionL2TestSuite::MakeConfig();
         cfg.device_allocator.total_pages = 16;
-        cfg.host_allocator.total_pages = 6;  // null parent + five snapshot parents
+        cfg.host_allocator.total_pages = 6;  // null parent + five retraction parents
         cfg.max_batch_size = 3;
         cfg.paged_cache_groups.front().total_pages = cfg.device_allocator.total_pages;
         return cfg;
     }
 };
 
-class DecodeSnapshotVictimSelectionTestSuite : public DecodeSnapshotL2TestSuite {
+class DecodeRetractionVictimSelectionTestSuite : public DecodeRetractionL2TestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
-        SchedulerConfig cfg = DecodeSnapshotL2TestSuite::MakeConfig();
+        SchedulerConfig cfg = DecodeRetractionL2TestSuite::MakeConfig();
         cfg.device_allocator.total_pages = 6;  // null parent + five Device parents
-        cfg.host_allocator.total_pages = 8;    // null parent + seven snapshot parents
+        cfg.host_allocator.total_pages = 8;    // null parent + seven retraction parents
         cfg.max_batch_size = 3;
         cfg.paged_cache_groups.front().total_pages = cfg.device_allocator.total_pages;
         return cfg;
     }
 };
 
-class DecodeSnapshotRecoveryAdmissionTestSuite : public DecodeSnapshotL2TestSuite {
+class DecodeRetractionRecoveryAdmissionTestSuite : public DecodeRetractionL2TestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
-        SchedulerConfig cfg = DecodeSnapshotL2TestSuite::MakeConfig();
+        SchedulerConfig cfg = DecodeRetractionL2TestSuite::MakeConfig();
         cfg.device_allocator.total_pages = 7;  // null parent + six Device parents
         cfg.host_allocator.total_pages = 20;
         cfg.max_batch_size = 3;
@@ -231,20 +219,20 @@ protected:
     }
 };
 
-class DecodeSnapshotRequestSlotTestSuite : public DecodeSnapshotRecoveryAdmissionTestSuite {
+class DecodeRetractionRequestSlotTestSuite : public DecodeRetractionRecoveryAdmissionTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
-        SchedulerConfig cfg = DecodeSnapshotRecoveryAdmissionTestSuite::MakeConfig();
+        SchedulerConfig cfg = DecodeRetractionRecoveryAdmissionTestSuite::MakeConfig();
         cfg.max_batch_size = 2;
         return cfg;
     }
 };
 
-TEST_F(DecodeSnapshotCapacityTestSuite, AdmissionReservesHostCapacityForActiveRequestsOnly) {
+TEST_F(DecodeRetractionCapacityTestSuite, AdmissionDoesNotReserveFutureRetractionCapacity) {
     RequestSpec longest = MakeRequestSpec("a", /*num_pages=*/2, /*start=*/1);
-    longest.max_new_tokens = 6;  // five-parent maximum snapshot
+    longest.max_new_tokens = 6;  // five-parent maximum retraction state
     RequestSpec short_b = MakeRequestSpec("b", /*num_pages=*/2, /*start=*/101);
-    short_b.max_new_tokens = 2;  // three-parent maximum snapshot
+    short_b.max_new_tokens = 2;  // three-parent maximum retraction state
     RequestSpec short_c = MakeRequestSpec("c", /*num_pages=*/2, /*start=*/201);
     short_c.max_new_tokens = 2;
     Submit({longest, short_b, short_c});
@@ -260,14 +248,14 @@ TEST_F(DecodeSnapshotCapacityTestSuite, AdmissionReservesHostCapacityForActiveRe
     const ForwardBatch* second = FindForwardBatch(second_plan.Operations());
     ASSERT_NE(second, nullptr);
     EXPECT_EQ(second->request_ids, (std::vector<std::string>{"b"}));
-    const ExecutionPlan blocked_plan = PlanOnce();
-    const ForwardBatch* blocked = FindForwardBatch(blocked_plan.Operations());
-    ASSERT_NE(blocked, nullptr);
-    EXPECT_TRUE(blocked->request_ids.empty());
-    EXPECT_EQ(scheduler_->WaitingSize(), 1u);
+    const ExecutionPlan third_plan = PlanOnce();
+    const ForwardBatch* third = FindForwardBatch(third_plan.Operations());
+    ASSERT_NE(third, nullptr);
+    EXPECT_EQ(third->request_ids, (std::vector<std::string>{"c"}));
+    EXPECT_EQ(scheduler_->WaitingSize(), 0u);
 }
 
-TEST_F(DecodeSnapshotVictimSelectionTestSuite, TriesAnotherVictimWhenLargestSnapshotDoesNotFit) {
+TEST_F(DecodeRetractionVictimSelectionTestSuite, AbortsLargestVictimWhenItsRetractionStateDoesNotFit) {
     Submit({MakeRequestSpec("parked", /*num_pages=*/2, /*start=*/1)});
     SendBootstrapped("parked");
     PlanOnce();
@@ -303,14 +291,14 @@ TEST_F(DecodeSnapshotVictimSelectionTestSuite, TriesAnotherVictimWhenLargestSnap
               (std::vector<std::string>{"short"}));
     SendRemotePrefillDone("short", /*bootstrap_token=*/242);
 
-    std::vector<CacheOperation> victim_writebacks;
+    std::optional<std::string> aborted_request_id;
     std::int32_t long_token = 143;
     std::int32_t short_token = 243;
-    for (std::int32_t round = 0; round < 8 && victim_writebacks.empty(); ++round) {
+    for (std::int32_t round = 0; round < 8 && !aborted_request_id; ++round) {
         const ExecutionPlan plan = PlanOnce();
-        victim_writebacks = ExtractCacheOpsOfKind<WriteBackBatch>(plan);
+        aborted_request_id = plan.aborted_request_id;
         if (const ForwardBatch* forward = FindForwardBatch(plan.Operations());
-            victim_writebacks.empty() && forward != nullptr) {
+            !aborted_request_id && forward != nullptr) {
             for (const std::string& request_id : forward->request_ids) {
                 if (request_id == "long") {
                     SendForwardDone(request_id, {long_token++});
@@ -321,13 +309,12 @@ TEST_F(DecodeSnapshotVictimSelectionTestSuite, TriesAnotherVictimWhenLargestSnap
         }
     }
 
-    ASSERT_EQ(victim_writebacks.size(), 1u);
-    const auto& victim_writeback = std::get<WriteBackBatch>(victim_writebacks.front());
-    EXPECT_EQ(victim_writeback.src_pages.front().size(), 2u)
-        << "the three-page longest request cannot fit beside the pinned snapshot";
+    EXPECT_EQ(aborted_request_id, std::optional<std::string>{"long"});
+    PlanOnce();
+    EXPECT_EQ(scheduler_->RequestTokenSize("long"), -1);
 }
 
-TEST_F(DecodeSnapshotL2TestSuite, InitialAdmissionAndDecodeDoNotReadOrWriteOrdinaryL2) {
+TEST_F(DecodeRetractionL2TestSuite, InitialAdmissionAndDecodeDoNotUsePrefixL2) {
     Submit({MakeRequestSpec("r0", /*num_pages=*/2, /*start=*/1)});
     SendBootstrapped("r0");
 
@@ -341,7 +328,7 @@ TEST_F(DecodeSnapshotL2TestSuite, InitialAdmissionAndDecodeDoNotReadOrWriteOrdin
     ASSERT_NE(FindForwardBatch(decode.Operations()), nullptr);
 }
 
-TEST_F(DecodeSnapshotL2TestSuite, RetractionLetsBlockedAdmissionRunBeforeRecovery) {
+TEST_F(DecodeRetractionL2TestSuite, RetractionLetsBlockedAdmissionRun) {
     Submit({MakeRequestSpec("running", /*num_pages=*/2, /*start=*/1)});
     SendBootstrapped("running");
     PlanOnce();
@@ -370,6 +357,8 @@ TEST_F(DecodeSnapshotL2TestSuite, RetractionLetsBlockedAdmissionRunBeforeRecover
 
     SendWriteBackDone(write_back.op_ids.front());
     SendWriteBackDone(write_back.op_ids.front());  // Duplicate ACK is ignored.
+    EXPECT_GT(scheduler_->HostPoolCachedBlocks(), 0)
+        << "retraction ACK must publish completed Host boundaries for future reuse";
     const ExecutionPlan admitted = PlanOnce();
     const ForwardBatch* blocked = FindForwardBatch(admitted.Operations());
     ASSERT_NE(blocked, nullptr);
@@ -379,17 +368,9 @@ TEST_F(DecodeSnapshotL2TestSuite, RetractionLetsBlockedAdmissionRunBeforeRecover
 
     SendRemotePrefillDone("blocked", /*bootstrap_token=*/142);
     SendFinish("blocked");
-    const ExecutionPlan recover = PlanOnce();
-    const auto load_back_ops = ExtractCacheOpsOfKind<LoadBackBatch>(recover);
-    ASSERT_EQ(load_back_ops.size(), 1u);
-    const auto& load_back = std::get<LoadBackBatch>(load_back_ops.front());
-    ASSERT_EQ(load_back.op_ids.size(), 1u);
-    SendLoadBackDone(load_back.op_ids.front());
-    SendLoadBackDone(load_back.op_ids.front());  // Duplicate ACK is ignored.
-    EXPECT_EQ(scheduler_->DecodingSize(), 1u);
 }
 
-TEST_F(DecodeSnapshotRecoveryAdmissionTestSuite, SubmittedAdmissionWaitsForRecoveryAck) {
+TEST_F(DecodeRetractionRecoveryAdmissionTestSuite, RecoveryStartsDecodeWithoutWaitingForLoadBackAck) {
     Submit({MakeRequestSpec("running", /*num_pages=*/2, /*start=*/1)});
     SendBootstrapped("running");
     PlanOnce();
@@ -440,19 +421,13 @@ TEST_F(DecodeSnapshotRecoveryAdmissionTestSuite, SubmittedAdmissionWaitsForRecov
     const ExecutionPlan recover = PlanOnce();
     const auto load_back_ops = ExtractCacheOpsOfKind<LoadBackBatch>(recover);
     ASSERT_EQ(load_back_ops.size(), 1u);
-
-    RequestSpec late = MakeRequestSpec("late", /*num_pages=*/1, /*start=*/301);
-    late.tokens.resize(1);
-    Submit({late});
-    SendBootstrapped("late");
-    const ExecutionPlan while_recovering = PlanOnce();
-    const ForwardBatch* forward = FindForwardBatch(while_recovering.Operations());
+    const ForwardBatch* forward = FindForwardBatch(recover.Operations());
     ASSERT_NE(forward, nullptr);
-    EXPECT_TRUE(forward->request_ids.empty());
-    EXPECT_EQ(scheduler_->WaitingSize(), 1u);
+    EXPECT_EQ(forward->request_ids, (std::vector<std::string>{"running"}));
+    EXPECT_EQ(scheduler_->DecodingSize(), 1u);
 }
 
-TEST_F(DecodeSnapshotRequestSlotTestSuite, RecoveryWaitsForAvailableRequestPoolSlot) {
+TEST_F(DecodeRetractionRequestSlotTestSuite, RecoveryWaitsForAvailableRequestPoolSlot) {
     Submit({MakeRequestSpec("a", /*num_pages=*/2, /*start=*/1)});
     SendBootstrapped("a");
     PlanOnce();
@@ -507,37 +482,7 @@ TEST_F(DecodeSnapshotRequestSlotTestSuite, RecoveryWaitsForAvailableRequestPoolS
         << "recovery must wait while both request-pool slots are occupied";
 }
 
-TEST_F(DecodeSnapshotL2TestSuite, FailedSnapshotKeepsTheRequestOnDevice) {
-    Submit({MakeRequestSpec("running", /*num_pages=*/2, /*start=*/1)});
-    SendBootstrapped("running");
-    PlanOnce();
-    SendRemotePrefillDone("running", /*bootstrap_token=*/42);
-    PlanOnce();
-    SendForwardDone("running", {43});
-
-    Submit({MakeRequestSpec("blocked", /*num_pages=*/2, /*start=*/101)});
-    SendBootstrapped("blocked");
-    std::vector<CacheOperation> write_back_ops;
-    for (std::int32_t token = 44; token < 48 && write_back_ops.empty(); ++token) {
-        const ExecutionPlan plan = PlanOnce();
-        write_back_ops = ExtractCacheOpsOfKind<WriteBackBatch>(plan);
-        const ForwardBatch* forward = FindForwardBatch(plan.Operations());
-        if (write_back_ops.empty() && forward != nullptr && !forward->request_ids.empty()) {
-            SendForwardDone("running", {token});
-        }
-    }
-    ASSERT_EQ(write_back_ops.size(), 1u);
-    const auto& write_back = std::get<WriteBackBatch>(write_back_ops.front());
-    ASSERT_EQ(write_back.op_ids.size(), 1u);
-
-    SendWriteBackDone(write_back.op_ids.front(), /*success=*/false);
-
-    EXPECT_EQ(scheduler_->DecodingSize(), 1u);
-    EXPECT_EQ(scheduler_->WaitingSize(), 1u);
-    EXPECT_GT(scheduler_->ActiveKvPages(), 0u);
-}
-
-TEST_F(DecodeSnapshotRecoveryAdmissionTestSuite, SubmittedAdmissionWaitsForRetractionAck) {
+TEST_F(DecodeRetractionRecoveryAdmissionTestSuite, SubmittedAdmissionUsesIndependentCapacityBeforeRetractionAck) {
     Submit({MakeRequestSpec("a", /*num_pages=*/2, /*start=*/1),
             MakeRequestSpec("b", /*num_pages=*/2, /*start=*/101)});
     SendBootstrapped("a");
@@ -571,18 +516,16 @@ TEST_F(DecodeSnapshotRecoveryAdmissionTestSuite, SubmittedAdmissionWaitsForRetra
     const ExecutionPlan while_retracting = PlanOnce();
     const ForwardBatch* forward = FindForwardBatch(while_retracting.Operations());
     ASSERT_NE(forward, nullptr);
-    EXPECT_TRUE(forward->request_ids.empty());
-    EXPECT_EQ(scheduler_->WaitingSize(), 1u);
+    EXPECT_GE(FindRequestIndex(forward, "blocked"), 0)
+        << "in-flight retraction pins only its own blocks and must not impose a global admission gate";
+    EXPECT_EQ(scheduler_->WaitingSize(), 0u);
 
     const auto& write_back = std::get<WriteBackBatch>(write_back_ops.front());
     ASSERT_EQ(write_back.op_ids.size(), 1u);
-    SendWriteBackDone(write_back.op_ids.front(), /*success=*/false);
-    const ExecutionPlan after_failure = PlanOnce();
-    ASSERT_GE(FindRequestIndex(FindForwardBatch(after_failure.Operations()), "blocked"), 0)
-        << "a failed snapshot restores the victim and releases the temporary admission gate";
+    SendWriteBackDone(write_back.op_ids.front());
 }
 
-TEST_F(DecodeSnapshotL2TestSuite, AbortDuringSnapshotWriteBackKeepsTransferBlocksPinnedUntilAck) {
+TEST_F(DecodeRetractionL2TestSuite, AbortDuringRetractionWriteBackKeepsTransferBlocksPinnedUntilAck) {
     Submit({MakeRequestSpec("running", /*num_pages=*/2, /*start=*/1)});
     SendBootstrapped("running");
     PlanOnce();
@@ -621,6 +564,7 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = DisaggDecodeAdmissionTestSuite::MakeConfig();
         cfg.device_allocator.total_pages = 6;  // null parent + five usable LCM parents
+        cfg.host_allocator.total_pages = 32;   // Keep retraction capacity outside these placement tests.
         cfg.max_scheduled_tokens = 8;
         cfg.enable_pd_cache = true;
         cfg.disable_prefix_cache = false;

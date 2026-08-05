@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -44,6 +45,10 @@ public:
     // required because one LCM parent can still contain live sibling children.
     // The runtime clears these exact byte ranges before transfers/forward.
     std::map<std::string, std::vector<std::int32_t>> pages_to_zero;
+
+    // Request dropped because Decode could not secure Host space for
+    // retraction. At most one capacity victim is selected per plan.
+    std::optional<std::string> aborted_request_id;
 
 private:
     std::vector<Operation> operations_;

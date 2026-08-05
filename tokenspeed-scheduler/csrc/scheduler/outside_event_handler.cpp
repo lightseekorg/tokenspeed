@@ -144,23 +144,15 @@ void Scheduler::handleEvent(const forward::Abort& event) {
 }
 
 void Scheduler::handleEvent(const cache::WriteBackDone& event) {
-    if (auto request_id = tier_transfers_.CompleteWriteBack(event.op_id, event.success)) {
+    if (auto request_id = tier_transfers_.CompleteWriteBack(event.op_id)) {
         if (Request* request = findRequest(*request_id); request != nullptr && request->Is<fsm::Retracting>()) {
-            if (event.success) {
-                request->Apply(fsm::CompleteRetractionEvent{&coordinator_});
-            } else {
-                request->Apply(fsm::CancelRetractionEvent{});
-            }
+            request->Apply(fsm::CompleteRetractionEvent{&coordinator_});
         }
     }
 }
 
 void Scheduler::handleEvent(const cache::LoadBackDone& event) {
-    if (auto request_id = tier_transfers_.CompleteLoadBack(event.op_id, event.success)) {
-        if (Request* request = findRequest(*request_id); request != nullptr && request->Is<fsm::Recovering>()) {
-            request->Apply(fsm::CompleteRecoveryEvent{});
-        }
-    }
+    tier_transfers_.CompleteLoadBack(event.op_id);
 }
 
 }  // namespace tokenspeed

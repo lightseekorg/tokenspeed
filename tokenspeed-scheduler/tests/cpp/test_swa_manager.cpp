@@ -471,7 +471,7 @@ TEST(SwaManagerTest, WriteBackAckMakesSlidCachedPageReclaimable) {
     CacheBlockRef writeback_pin = table.Blocks().front();
     const CacheBlockLocation location = writeback_pin->Location();
 
-    EXPECT_TRUE(mgr.ReclaimableBlockLocationsAt(table, /*num_computed_tokens=*/7).empty());
+    EXPECT_TRUE(mgr.ReclaimableBlockLocationsAt(table, /*num_computed_tokens=*/7, {}).empty());
     EXPECT_TRUE(mgr.EvictableBlockLocationsAfterReleasing(pool, std::vector{location}).empty());
     EXPECT_EQ(mgr.ReclaimableBlockLocationsAt(table, /*num_computed_tokens=*/7, std::vector{location}),
               std::vector{location});

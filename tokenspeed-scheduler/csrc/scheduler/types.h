@@ -41,14 +41,10 @@ struct SchedulerConfig {
 
     std::vector<PagedCacheGroupConfig> paged_cache_groups{};
 
-    // Ordinary L2 is a prefix tier. Decode keeps the same Host capacity only
-    // for request-owned retraction snapshots and never indexes it by prefix.
-    bool OrdinaryL2Enabled() const {
+    // Prefix L2 serves normal admission outside Decode. Decode keeps its Host
+    // pool exclusively for content-indexed retraction and recovery state.
+    bool PrefixL2Enabled() const {
         return !disable_l2_cache && host_allocator.total_pages > 1 && role != Role::kD;
-    }
-
-    bool DecodeSnapshotEnabled() const {
-        return !disable_l2_cache && host_allocator.total_pages > 1 && role == Role::kD;
     }
 
     std::int32_t max_scheduled_tokens{};

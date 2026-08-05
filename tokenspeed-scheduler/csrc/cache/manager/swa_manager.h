@@ -104,10 +104,9 @@ public:
         return freed;
     }
 
-    std::vector<CacheBlockLocation> ReclaimableBlockLocationsAt(const BlockTable& table,
-                                                                std::int32_t num_computed_tokens,
-                                                                std::span<const CacheBlockLocation>
-                                                                    released_locations = {}) const override {
+    std::vector<CacheBlockLocation> ReclaimableBlockLocationsAt(
+        const BlockTable& table, std::int32_t num_computed_tokens,
+        std::span<const CacheBlockLocation> released_locations) const override {
         const std::int32_t skipped_blocks = fullySlidOutBlocks(table, num_computed_tokens);
         std::vector<CacheBlockLocation> locations;
         for (std::int32_t i = skipped_blocks - 1; i >= 0; --i) {

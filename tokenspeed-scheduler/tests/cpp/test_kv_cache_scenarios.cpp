@@ -18,9 +18,9 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// End-to-end scenario tests for the two-level KV-cache FSM path.
-// Cache retract (release-and-requeue, see RetractSuite) replaces the
-// old writeback-based retract.
+// End-to-end scenario tests for the two-level KV-cache FSM path. Fused
+// scheduling uses release-and-requeue (see RetractSuite); Decode PD uses Host
+// writeback and recovery.
 
 #include <algorithm>
 #include <optional>
@@ -962,7 +962,7 @@ TEST_F(PrefillSlideAdmissionSuite, SinkPinsDeferAdmissionUntilWriteBackDone) {
     EXPECT_TRUE(FindForwardBatch(d2)->request_ids.empty());
     EXPECT_EQ(scheduler_->PoolFreeBlocks(), 4);
 
-    SendWriteBackDone(op1.op_ids.at(0), /*success=*/true);
+    SendWriteBackDone(op1.op_ids.at(0));
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 4);
 
     ExecutionPlan c3 = PlanOnce();  // unpinned + cached -> credit 2 restored: admitted; emits op2
@@ -988,8 +988,8 @@ TEST_F(PrefillSlideAdmissionSuite, SinkPinsDeferAdmissionUntilWriteBackDone) {
     PlanOnce();  // reap: op2 + op3 pins (8 blocks) stay off the free list
     EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 8);
 
-    SendWriteBackDone(op2.op_ids.at(0), /*success=*/true);
-    SendWriteBackDone(op3.op_ids.at(0), /*success=*/true);
+    SendWriteBackDone(op2.op_ids.at(0));
+    SendWriteBackDone(op3.op_ids.at(0));
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 12);
     EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
 }
@@ -1769,7 +1769,7 @@ TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
     EXPECT_EQ(request.ReserveNumTokensInNextScheduleEvent(), 3);
 }
 
-TEST(RetractionSnapshotFsmTest, PinsHostUntilRecoveryAck) {
+TEST(RetractionStateFsmTest, RecoveryTransitionsDirectlyToDecoding) {
     BlockPool device_pool(/*num_lcm_blocks=*/12);
     BlockPool host_pool(/*num_lcm_blocks=*/12);
     std::vector<KvCacheSpec> specs{
@@ -1805,23 +1805,21 @@ TEST(RetractionSnapshotFsmTest, PinsHostUntilRecoveryAck) {
     }
     host_tables.push_back(BlockTable::FromBlocks(std::move(host_blocks),
                                                  request.BlockTablesRef().front().AvailableTokens()));
-    request.Apply(fsm::BeginRetractionEvent{std::move(host_tables)});
+    request.Apply(fsm::BeginRetractionEvent{std::move(host_tables), /*host_prefix_tokens=*/0,
+                                            request.CacheProgress()});
     ASSERT_TRUE(request.Is<fsm::Retracting>());
     request.Apply(fsm::CompleteRetractionEvent{&coordinator});
     ASSERT_TRUE(request.Is<fsm::Retracted>());
     EXPECT_LT(host_pool.NumEmptyLcmBlocks(), host_pool.NumLcmBlocks());
 
     std::vector<CacheBlockRef> restored_blocks;
-    for (const CacheBlockRef& block_ref : request.RetractionSnapshotRef().host_tables.front().Blocks()) {
+    for (const CacheBlockRef& block_ref : request.RetractedState().host_tables.front().Blocks()) {
         restored_blocks.push_back(block_ref ? device_pool.AcquireBlock(0, 1) : CacheBlockRef{});
     }
     std::vector<BlockTable> restored_tables;
     restored_tables.push_back(BlockTable::FromBlocks(
-        std::move(restored_blocks), request.RetractionSnapshotRef().host_tables.front().AvailableTokens()));
-    request.Apply(fsm::BeginRecoveryEvent{&req_pool, std::move(restored_tables)});
-    ASSERT_TRUE(request.Is<fsm::Recovering>());
-    EXPECT_LT(host_pool.NumEmptyLcmBlocks(), host_pool.NumLcmBlocks());
-    request.Apply(fsm::CompleteRecoveryEvent{});
+        std::move(restored_blocks), request.RetractedState().host_tables.front().AvailableTokens()));
+    request.Recover(&req_pool, std::move(restored_tables));
 
     EXPECT_TRUE(request.Is<fsm::Decoding>());
     EXPECT_EQ(host_pool.NumEmptyLcmBlocks(), host_pool.NumLcmBlocks());
@@ -2782,8 +2780,8 @@ TEST_F(DecodeCachingSuite, PoolBalanceAcrossDecodeCaching) {
 
 // ---------------------------------------------------------------------------
 // M15 streaming L2 sink: pages registered by a planning round batch into ONE
-// D2H write-back; WriteBackDone commits/aborts the host index and unpins the
-// pinned source blocks. Byte movement itself is Phase D.
+// D2H write-back; WriteBackDone commits the host index and unpins the source
+// blocks. Byte movement itself is Phase D.
 // ---------------------------------------------------------------------------
 class StreamingSinkSuite : public SchedulerTestSuite {
 protected:
@@ -2850,7 +2848,7 @@ TEST_F(StreamingSinkSuite, RegisteredPagesEmitWriteBackAndIndexOnDone) {
         << "the 6 pinned sources stay off the free list past request finish";
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 0);
 
-    SendWriteBackDone(wb->op_ids.at(0), /*success=*/true);
+    SendWriteBackDone(wb->op_ids.at(0));
     PlanOnce();
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
     EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "commit unpins every source block";
@@ -2863,7 +2861,7 @@ TEST_F(StreamingSinkSuite, DuplicateRegistrationsAreDroppedAtDrain) {
     auto wb1 = FindWriteBack(finalize1);
     ASSERT_TRUE(wb1.has_value());
     FinishAndReap("r1");
-    SendWriteBackDone(wb1->op_ids.at(0), /*success=*/true);
+    SendWriteBackDone(wb1->op_ids.at(0));
     PlanOnce();
     ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
     ASSERT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
@@ -2874,21 +2872,6 @@ TEST_F(StreamingSinkSuite, DuplicateRegistrationsAreDroppedAtDrain) {
     EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start)
         << "duplicate candidates are unpinned at drain, pool back to baseline";
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
-}
-
-TEST_F(StreamingSinkSuite, FailedWriteBackAbortsAndUnpins) {
-    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
-
-    ExecutionPlan finalize = RunToFinalize(MakeRequestSpec("r1", /*num_pages=*/4));
-    auto wb = FindWriteBack(finalize);
-    ASSERT_TRUE(wb.has_value());
-    FinishAndReap("r1");
-    ASSERT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 6);
-
-    SendWriteBackDone(wb->op_ids.at(0), /*success=*/false);
-    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 0) << "a failed transfer must not be indexed";
-    EXPECT_EQ(scheduler_->HostPoolFreeBlocks(), 6) << "aborted host pages return to the host pool";
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "abort still unpins the sources";
 }
 
 TEST_F(StreamingSinkSuite, HostPoolExhaustionSkipsSilently) {
@@ -2908,7 +2891,7 @@ TEST_F(StreamingSinkSuite, HostPoolExhaustionSkipsSilently) {
     EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 6)
         << "r2's candidates unpinned at drain; only r1's 6 pins remain";
 
-    SendWriteBackDone(wb1->op_ids.at(0), /*success=*/true);
+    SendWriteBackDone(wb1->op_ids.at(0));
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
     EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "everything balances after r1's commit";
 }
@@ -2918,7 +2901,7 @@ TEST_F(StreamingSinkSuite, CommittedColdEntriesAreReplacedWhenHostPoolIsFull) {
     auto wb1 = FindWriteBack(finalize1);
     ASSERT_TRUE(wb1.has_value());
     FinishAndReap("r1");
-    SendWriteBackDone(wb1->op_ids.at(0), /*success=*/true);
+    SendWriteBackDone(wb1->op_ids.at(0));
     ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
     ASSERT_EQ(scheduler_->HostPoolFreeBlocks(), 0);
 
@@ -2927,7 +2910,7 @@ TEST_F(StreamingSinkSuite, CommittedColdEntriesAreReplacedWhenHostPoolIsFull) {
     ASSERT_TRUE(wb2.has_value()) << "committed, unpinned Host entries are replaceable";
     EXPECT_EQ(wb2->src_pages.at(0).size(), 6u);
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 0) << "old keys are removed before replacement D2H";
-    SendWriteBackDone(wb2->op_ids.at(0), /*success=*/true);
+    SendWriteBackDone(wb2->op_ids.at(0));
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
 }
 
@@ -2957,7 +2940,7 @@ TEST_F(StreamingSinkSuite, SameRoundDuplicateKeysDedupeAtDrain) {
     EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start - 6)
         << "only the emitted op's 6 pins survive; the duplicate candidates unpinned at drain";
 
-    SendWriteBackDone(wb->op_ids.at(0), /*success=*/true);
+    SendWriteBackDone(wb->op_ids.at(0));
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
     EXPECT_EQ(scheduler_->HostPoolFreeBlocks(), 6) << "the six cached host pages remain occupied";
     EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
@@ -2977,7 +2960,7 @@ TEST_F(StreamingSinkSuite, MidDrainPoolFillEmitsPartialOp) {
     EXPECT_EQ(scheduler_->HostPoolFreeBlocks(), 0);
 
     FinishAndReap("r1");
-    SendWriteBackDone(wb->op_ids.at(0), /*success=*/true);
+    SendWriteBackDone(wb->op_ids.at(0));
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 4);
     EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "dropped candidates unpinned at drain";
 }
@@ -2989,13 +2972,13 @@ TEST_F(StreamingSinkSuite, DuplicateWriteBackDoneIsIgnored) {
     FinishAndReap("r1");
     const std::int32_t free_after_reap = scheduler_->PoolFreeBlocks();
 
-    SendWriteBackDone(wb->op_ids.at(0), /*success=*/true);
+    SendWriteBackDone(wb->op_ids.at(0));
     ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
     const std::int32_t free_after_ack = scheduler_->PoolFreeBlocks();
     EXPECT_EQ(free_after_ack, free_after_reap + 6);
 
     // A replayed ack must be a no-op (the ledger already retired the op).
-    SendWriteBackDone(wb->op_ids.at(0), /*success=*/true);
+    SendWriteBackDone(wb->op_ids.at(0));
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
     EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_after_ack);
 }
@@ -3042,14 +3025,14 @@ protected:
     void SeedHostThenEvictDevice() {
         auto wb1 = RunSinkLifecycle(MakeRequestSpec("r1", /*num_pages=*/4));
         ASSERT_TRUE(wb1.has_value());
-        SendWriteBackDone(wb1->op_ids.at(0), /*success=*/true);
+        SendWriteBackDone(wb1->op_ids.at(0));
         ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
         // Host cache entries retain their host blocks until host eviction.
         ASSERT_EQ(scheduler_->HostPoolFreeBlocks(), 26);
 
         auto wb3 = RunSinkLifecycle(MakeRequestSpec("churn", /*num_pages=*/5, /*start=*/501));
         ASSERT_TRUE(wb3.has_value());
-        SendWriteBackDone(wb3->op_ids.at(0), /*success=*/true);
+        SendWriteBackDone(wb3->op_ids.at(0));
         ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 13);
         ASSERT_EQ(scheduler_->PoolFreeBlocks(), 12) << "both seeding requests fully retired";
     }
@@ -3108,7 +3091,7 @@ TEST_F(HostHitSuite, HostHitLoadsBackAfterDeviceEviction) {
     ExecutionPlan finalize = PlanOnce();
     auto wb = FindWriteBack(finalize);
     ASSERT_TRUE(wb.has_value()) << "r2's extended endpoint must be persisted";
-    SendWriteBackDone(wb->op_ids.at(0), /*success=*/true);
+    SendWriteBackDone(wb->op_ids.at(0));
     SendForwardDone("r2", {9002});
     SendFinish("r2");
     PlanOnce();  // reap
@@ -3147,7 +3130,7 @@ TEST_F(HostHitSuite, AbandonedAdmissionUnpins) {
     // Free the filler (its write-back pins included) -> r2 admits with the load-back.
     SendForwardDone("filler", {9002});
     SendFinish("filler");
-    SendWriteBackDone(filler_wb->op_ids.at(0), /*success=*/true);
+    SendWriteBackDone(filler_wb->op_ids.at(0));
     ExecutionPlan plan = PlanOnce();
     auto lb = FindLoadBack(plan);
     ASSERT_TRUE(lb.has_value());
@@ -3161,7 +3144,7 @@ TEST_F(HostHitSuite, AbandonedAdmissionUnpins) {
     ExecutionPlan finalize = PlanOnce();
     auto wb = FindWriteBack(finalize);
     ASSERT_TRUE(wb.has_value()) << "r2's extended endpoint must be persisted";
-    SendWriteBackDone(wb->op_ids.at(0), /*success=*/true);
+    SendWriteBackDone(wb->op_ids.at(0));
     SendForwardDone("r2", {9002});
     SendFinish("r2");
     PlanOnce();
@@ -3254,7 +3237,7 @@ TEST_F(HostHitSuite, DuplicateLoadBackDoneIsIgnored) {
     ExecutionPlan finalize = PlanOnce();
     auto wb = FindWriteBack(finalize);
     ASSERT_TRUE(wb.has_value()) << "r2's extended endpoint must be persisted";
-    SendWriteBackDone(wb->op_ids.at(0), /*success=*/true);
+    SendWriteBackDone(wb->op_ids.at(0));
     SendForwardDone("r2", {9002});
     SendFinish("r2");
     PlanOnce();
@@ -3283,7 +3266,7 @@ protected:
     void AckWriteBacks(const ExecutionPlan& plan) {
         for (const CacheOperation& op : ExtractCacheOpsOfKind<WriteBackBatch>(plan)) {
             for (std::uint32_t id : std::get<WriteBackBatch>(op).op_ids) {
-                SendWriteBackDone(id, /*success=*/true);
+                SendWriteBackDone(id);
             }
         }
     }

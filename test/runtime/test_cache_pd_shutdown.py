@@ -41,7 +41,7 @@ class _SchedulerHarness:
 
     def next_execution_plan(self):
         self._trace.append("next_plan")
-        return SimpleNamespace(pages_to_zero=())
+        return SimpleNamespace(pages_to_zero=(), aborted_request_id=None)
 
 
 class _ModelExecutorHarness:
@@ -71,9 +71,6 @@ class _EventLoopHarness:
     def _shutdown_complete(self) -> bool:
         return EventLoop._shutdown_complete(self)
 
-    def _pages_to_zero(self, execution_plan):
-        return EventLoop._pages_to_zero(self, execution_plan)
-
     def _process_new_requests(self) -> None:
         self.trace.append("process_requests")
         # Exercise the important case where SIGTERM arrives during an
@@ -88,6 +85,9 @@ class _EventLoopHarness:
 
     def _publish_scheduler_kv_events(self) -> None:
         self.trace.append("publish_kv")
+
+    def _publish_scheduler_abort(self, _execution_plan) -> None:
+        self.trace.append("publish_aborts")
 
     def _submit_cache_ops(self, _execution_plan) -> None:
         self.trace.append("submit_cache")
@@ -124,6 +124,7 @@ def test_event_loop_finishes_current_iteration_then_observes_shutdown() -> None:
         "drain_epd",
         "commit_cache",
         "next_plan",
+        "publish_aborts",
         "publish_kv",
         "zero_pages",
         "submit_cache",
@@ -155,6 +156,29 @@ def test_abort_uses_the_same_output_marker_for_every_layout(
     )
 
     assert calls == [("request-0", {"notify_client": True})]
+
+
+def test_scheduler_capacity_abort_is_published_immediately() -> None:
+    calls = []
+
+    class _State:
+        def set_finish_with_abort(self, message: str, notify_client: bool) -> None:
+            calls.append(("finish", message, notify_client))
+
+    state = _State()
+    output = SimpleNamespace(
+        rid_to_state={"request-0": state},
+        reap_finished_orphan=lambda rid, item: calls.append(("publish", rid, item)),
+    )
+    loop = SimpleNamespace(output_processor=output)
+    plan = SimpleNamespace(aborted_request_id="request-0")
+
+    EventLoop._publish_scheduler_abort(loop, plan)
+
+    assert calls == [
+        ("finish", "Decode cache capacity exhausted", True),
+        ("publish", "request-0", state),
+    ]
 
 
 def test_run_event_loop_sigterm_sets_event_and_finally_closes(

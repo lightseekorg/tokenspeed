@@ -21,6 +21,7 @@
 #include "cache/tier/transfer_manager.h"
 
 #include <algorithm>
+#include <limits>
 #include <ranges>
 #include <utility>
 
@@ -28,11 +29,11 @@
 
 namespace tokenspeed {
 
-std::vector<std::pair<std::uint32_t, CacheBlockLocation>>
-TierTransferManager::DeviceLocationsReleasedOnStoreAck() const {
+std::vector<std::pair<std::uint32_t, CacheBlockLocation>> TierTransferManager::DeviceLocationsReleasedOnStoreAck()
+    const {
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>> locations;
-    for (const auto& [_, tickets] : stores_) {
-        for (const StoreTicket& ticket : tickets) {
+    for (const auto& [_, write_back] : write_backs_) {
+        for (const StoreTicket& ticket : write_back.stores) {
             locations.emplace_back(ticket.key.group_id, ticket.device_block_ref->Location());
         }
     }
@@ -53,9 +54,8 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores() {
         if (!device_block_ref) {
             continue;
         }
-        const KvCacheManager& manager =
-            coordinator_.GroupManager(static_cast<std::int32_t>(candidate.key.group_id));
-        CacheBlockRef host_block_ref = coordinator_.AcquireHostBlockForStore(candidate.key.group_id);
+        const KvCacheManager& manager = coordinator_.GroupManager(static_cast<std::int32_t>(candidate.key.group_id));
+        CacheBlockRef host_block_ref = coordinator_.AcquireHostBlock(candidate.key.group_id);
         if (!host_block_ref) {
             continue;
         }
@@ -78,183 +78,198 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores() {
     for (const StoreTicket& ticket : tickets) {
         store_keys_.insert(ticket.key);
     }
-    const bool inserted = stores_.emplace(op_id, std::move(tickets)).second;
+    const bool inserted =
+        write_backs_.emplace(op_id, WriteBackTicket{.stores = std::move(tickets), .retraction = std::nullopt}).second;
     _assert(inserted, "duplicate store op id");
     return WriteBackOperation{op_id, std::move(transfers)};
 }
 
 LoadBackOperation TierTransferManager::StartPrefixLoad(std::vector<BlockTransfer> block_transfers) {
     _assert(!block_transfers.empty(), "prefix load requires at least one block transfer");
-    std::vector<CacheTransfer> transfers = resolveTransfers(block_transfers);
     for (const BlockTransfer& pair : block_transfers) {
         _assert(coordinator_.IsHostCachedBlock(pair.source->Location()),
                 "pinned Host block lost its cache entry before load emission");
     }
-    const std::uint32_t op_id = nextOpId();
-    const bool inserted = prefix_loads_.emplace(op_id, std::move(block_transfers)).second;
-    _assert(inserted, "duplicate loadback op id");
-    return LoadBackOperation{op_id, std::move(transfers)};
+    return startLoadBack(std::move(block_transfers));
 }
 
-std::optional<PreparedSnapshotTransfer> TierTransferManager::PrepareOffload(
+std::optional<PreparedRetraction> TierTransferManager::PrepareRetraction(
+    std::span<const std::string> page_hashes, std::uint64_t access_epoch,
     std::span<const BlockTable> device_tables) {
     _assert(device_tables.size() == static_cast<std::size_t>(coordinator_.NumGroups()),
-            "snapshot requires one Device table per cache group");
-    PreparedSnapshotTransfer prepared;
-    prepared.destination_tables.reserve(device_tables.size());
+            "retraction requires one Device table per cache group");
+    std::optional<CoordinatorMatch> host_match =
+        coordinator_.TryAcquireRetractionHostPrefix(page_hashes, access_epoch, device_tables);
+    if (!host_match) {
+        return std::nullopt;
+    }
+    PreparedRetraction prepared;
+    prepared.host_prefix_tokens = host_match->num_common_tokens;
+    prepared.host_tables.reserve(device_tables.size());
     for (std::size_t group_index = 0; group_index < device_tables.size(); ++group_index) {
         const std::uint32_t group_id = static_cast<std::uint32_t>(group_index);
-        const KvCacheManager& manager = coordinator_.GroupManager(static_cast<std::int32_t>(group_index));
+        std::vector<CacheBlockRef>& matched_blocks = host_match->per_group[group_index].blocks;
         std::vector<CacheBlockRef> destination_blocks;
         destination_blocks.reserve(static_cast<std::size_t>(device_tables[group_index].NumBlocks()));
-        for (const CacheBlockRef& source : device_tables[group_index].Blocks()) {
+        for (std::size_t block_index = 0; block_index < device_tables[group_index].Blocks().size(); ++block_index) {
+            const CacheBlockRef& source = device_tables[group_index].Blocks()[block_index];
             if (!source) {
                 destination_blocks.emplace_back();
                 continue;
             }
-            CacheBlockRef destination = host_pool_.AcquireBlock(group_id, manager.CacheBlocksPerLcmBlock());
-            if (!destination) {
-                return std::nullopt;
+            if (block_index < matched_blocks.size() && matched_blocks[block_index]) {
+                destination_blocks.push_back(std::move(matched_blocks[block_index]));
+                continue;
             }
-            prepared.block_transfers.push_back(BlockTransfer{
+            CacheBlockRef destination = coordinator_.AcquireHostBlock(group_id);
+            FatalCheck(static_cast<bool>(destination),
+                       "Retraction Host allocation diverged from its capacity precheck");
+            prepared.transfers.push_back(BlockTransfer{
                 .group_id = group_id,
                 .source = source,
                 .destination = destination,
             });
             destination_blocks.push_back(std::move(destination));
         }
-        prepared.destination_tables.push_back(BlockTable::FromBlocks(
-            std::move(destination_blocks), device_tables[group_index].AvailableTokens()));
+        prepared.host_tables.push_back(
+            BlockTable::FromBlocks(std::move(destination_blocks), device_tables[group_index].AvailableTokens()));
     }
     return prepared;
 }
 
-std::optional<PreparedSnapshotTransfer> TierTransferManager::PrepareRestore(std::span<const BlockTable> host_tables) {
+std::optional<PreparedRecovery> TierTransferManager::PrepareRecovery(
+    std::span<const std::string> page_hashes, std::uint64_t access_epoch, std::span<const BlockTable> host_tables,
+    std::int32_t decode_reserve_tokens) {
     _assert(host_tables.size() == static_cast<std::size_t>(coordinator_.NumGroups()),
-            "snapshot requires one Host table per cache group");
-    std::vector<BlockTable> dense_tables(host_tables.size());
+            "retraction recovery requires one Host table per cache group");
+    _assert(decode_reserve_tokens >= 0, "retraction recovery reserve must be non-negative");
+    std::vector<BlockTable> device_tables(host_tables.size());
     std::vector<GroupDemand> demands;
     demands.reserve(host_tables.size());
+    KvCacheCoordinator::PrefixProbe probe = coordinator_.ProbeDecodeDevicePrefix(page_hashes);
+    const std::int32_t device_prefix_tokens = probe.device.num_common_tokens;
     for (std::size_t group_index = 0; group_index < host_tables.size(); ++group_index) {
         const KvCacheManager& manager = coordinator_.GroupManager(static_cast<std::int32_t>(group_index));
-        const std::int32_t block_count = static_cast<std::int32_t>(
-            std::ranges::count_if(host_tables[group_index].Blocks(), [](const CacheBlockRef& block_ref) {
-                return static_cast<bool>(block_ref);
-            }));
-        demands.push_back(GroupDemand{
-            .table = &dense_tables[group_index],
-            .num_tokens = block_count * manager.CacheBlockTokens(),
-        });
+        const BlockTable& host_table = host_tables[group_index];
+        const std::int64_t consumed_tokens_wide =
+            static_cast<std::int64_t>(host_table.NumBlocks()) * manager.CacheBlockTokens() -
+            host_table.AvailableTokens();
+        _assert(consumed_tokens_wide >= 0 && consumed_tokens_wide <= std::numeric_limits<std::int32_t>::max(),
+                "retraction recovery token extent exceeds int32 range");
+        const std::int32_t consumed_tokens = static_cast<std::int32_t>(consumed_tokens_wide);
+        GroupDemand demand{
+            .table = &device_tables[group_index],
+            .num_tokens = std::max(consumed_tokens - device_prefix_tokens, 0),
+            .reserve_tokens = decode_reserve_tokens,
+        };
+        if (coordinator_.GroupKind(static_cast<std::int32_t>(group_index)) == AttnKind::kMambaState) {
+            const std::int32_t prefix_blocks = device_prefix_tokens / manager.CacheBlockTokens();
+            const std::size_t search_begin = std::min<std::size_t>(static_cast<std::size_t>(prefix_blocks),
+                                                                   host_table.Blocks().size());
+            const auto first_live = std::find_if(host_table.Blocks().begin() + search_begin,
+                                                 host_table.Blocks().end(), [](const CacheBlockRef& block_ref) {
+                                                     return static_cast<bool>(block_ref);
+                                                 });
+            demand.num_tokens = consumed_tokens;
+            if (first_live != host_table.Blocks().end()) {
+                demand.materialized_suffix_start = static_cast<std::int32_t>(first_live - host_table.Blocks().begin());
+            }
+        }
+        demands.push_back(demand);
     }
     std::optional<KvCacheCoordinator::AdmissionResult> allocation =
-        coordinator_.Admit(coordinator_.ProbePrefix({}), demands);
+        coordinator_.Admit(std::move(probe), demands, access_epoch);
     if (!allocation) {
         return std::nullopt;
     }
 
-    PreparedSnapshotTransfer prepared;
+    PreparedRecovery prepared;
     prepared.new_device_page_ids = std::move(allocation->new_page_ids);
-    prepared.destination_tables.reserve(host_tables.size());
+    prepared.device_tables.reserve(host_tables.size());
     for (std::size_t group_index = 0; group_index < host_tables.size(); ++group_index) {
         const std::uint32_t group_id = static_cast<std::uint32_t>(group_index);
         const KvCacheManager& manager = coordinator_.GroupManager(static_cast<std::int32_t>(group_index));
-        std::vector<CacheBlockRef> allocated = std::move(dense_tables[group_index]).TakeBlocks();
-        auto next = allocated.begin();
-        std::vector<CacheBlockRef> destination_blocks;
-        destination_blocks.reserve(static_cast<std::size_t>(host_tables[group_index].NumBlocks()));
-        for (const CacheBlockRef& source : host_tables[group_index].Blocks()) {
-            if (!source) {
-                destination_blocks.emplace_back();
+        const std::int32_t prefix_blocks = device_prefix_tokens / manager.CacheBlockTokens();
+        const auto& destination_blocks = device_tables[group_index].Blocks();
+        _assert(destination_blocks.size() >= host_tables[group_index].Blocks().size(),
+                "retraction recovery allocated too few Device blocks");
+        for (std::size_t block_index = 0; block_index < host_tables[group_index].Blocks().size(); ++block_index) {
+            const CacheBlockRef& source = host_tables[group_index].Blocks()[block_index];
+            const CacheBlockRef& destination = destination_blocks[block_index];
+            if (!source || !destination || static_cast<std::int32_t>(block_index) < prefix_blocks) {
                 continue;
             }
-            _assert(next != allocated.end(), "snapshot allocation returned too few Device blocks");
-            CacheBlockRef destination = std::move(*next++);
-            prepared.block_transfers.push_back(BlockTransfer{
+            prepared.transfers.push_back(BlockTransfer{
                 .group_id = group_id,
                 .source = source,
                 .destination = destination,
             });
-            destination_blocks.push_back(std::move(destination));
         }
-        _assert(next == allocated.end(), "snapshot allocation returned extra Device blocks");
-        prepared.destination_tables.push_back(BlockTable::FromBlocks(
-            std::move(destination_blocks), host_tables[group_index].AvailableTokens()));
+        prepared.device_tables.push_back(std::move(device_tables[group_index]));
     }
     return prepared;
 }
 
-WriteBackOperation TierTransferManager::StartOffload(std::string request_id,
-                                                     std::vector<BlockTransfer> block_transfers) {
+WriteBackOperation TierTransferManager::StartRetraction(std::string request_id,
+                                                        std::vector<BlockTransfer> block_transfers) {
     std::vector<CacheTransfer> transfers = resolveTransfers(block_transfers);
     const std::uint32_t op_id = nextOpId();
-    const bool inserted =
-        retraction_offloads_
-            .emplace(op_id, SnapshotTransfer{std::move(request_id), std::move(block_transfers)})
-            .second;
+    const bool inserted = write_backs_
+                              .emplace(op_id, WriteBackTicket{.stores = {},
+                                                              .retraction = RetractionTicket{
+                                                                  std::move(request_id), std::move(block_transfers)}})
+                              .second;
     _assert(inserted, "duplicate retraction cache op id");
     return WriteBackOperation{op_id, std::move(transfers)};
 }
 
-LoadBackOperation TierTransferManager::StartRestore(std::string request_id,
-                                                    std::vector<BlockTransfer> block_transfers) {
+LoadBackOperation TierTransferManager::StartRecovery(std::vector<BlockTransfer> block_transfers) {
+    _assert(!block_transfers.empty(), "retraction recovery load requires at least one block transfer");
+    return startLoadBack(std::move(block_transfers));
+}
+
+LoadBackOperation TierTransferManager::startLoadBack(std::vector<BlockTransfer> block_transfers) {
     std::vector<CacheTransfer> transfers = resolveTransfers(block_transfers);
     const std::uint32_t op_id = nextOpId();
-    const bool inserted =
-        recovery_loads_.emplace(op_id, SnapshotTransfer{std::move(request_id), std::move(block_transfers)}).second;
-    _assert(inserted, "duplicate recovery cache op id");
+    const bool inserted = load_backs_.emplace(op_id, std::move(block_transfers)).second;
+    _assert(inserted, "duplicate loadback op id");
     return LoadBackOperation{op_id, std::move(transfers)};
 }
 
-std::optional<std::string> TierTransferManager::CompleteWriteBack(std::uint32_t op_id, bool success) {
-    if (auto it = retraction_offloads_.find(op_id); it != retraction_offloads_.end()) {
-        std::string request_id = std::move(it->second.request_id);
-        retraction_offloads_.erase(it);
-        return request_id;
-    }
-
-    auto it = stores_.find(op_id);
-    if (it == stores_.end()) {
+std::optional<std::string> TierTransferManager::CompleteWriteBack(std::uint32_t op_id) {
+    auto it = write_backs_.find(op_id);
+    if (it == write_backs_.end()) {
         return std::nullopt;
     }
-    for (const StoreTicket& ticket : it->second) {
+    WriteBackTicket write_back = std::move(it->second);
+    write_backs_.erase(it);
+    if (write_back.retraction) {
+        return std::move(write_back.retraction->request_id);
+    }
+    for (const StoreTicket& ticket : write_back.stores) {
         store_keys_.erase(ticket.key);
     }
-    std::vector<StoreTicket> tickets = std::move(it->second);
-    stores_.erase(it);
-    for (StoreTicket& ticket : tickets) {
-        if (success) {
-            coordinator_.CacheHostBlock(ticket.host_block_ref, ticket.key);
-        }
+    for (StoreTicket& ticket : write_back.stores) {
+        coordinator_.CacheHostBlock(ticket.host_block_ref, ticket.key);
     }
     return std::nullopt;
 }
 
-std::optional<std::string> TierTransferManager::CompleteLoadBack(std::uint32_t op_id, bool success) {
-    if (auto it = recovery_loads_.find(op_id); it != recovery_loads_.end()) {
-        _assert(success, "snapshot recovery H2D must not fail");
-        std::string request_id = std::move(it->second.request_id);
-        recovery_loads_.erase(it);
-        return request_id;
-    }
-
-    auto it = prefix_loads_.find(op_id);
-    if (it == prefix_loads_.end()) {
-        return std::nullopt;
-    }
-    _assert(success, "host loadback failed: host bytes integrity");
-    prefix_loads_.erase(it);
-    return std::nullopt;
+bool TierTransferManager::HasStoresInFlight() const {
+    return std::ranges::any_of(write_backs_, [](const auto& entry) { return !entry.second.stores.empty(); });
 }
 
-std::vector<CacheTransfer> TierTransferManager::resolveTransfers(
-    std::span<const BlockTransfer> block_transfers) const {
+void TierTransferManager::CompleteLoadBack(std::uint32_t op_id) {
+    load_backs_.erase(op_id);
+}
+
+std::vector<CacheTransfer> TierTransferManager::resolveTransfers(std::span<const BlockTransfer> block_transfers) const {
     std::vector<CacheTransfer> transfers;
     transfers.reserve(block_transfers.size());
     for (const BlockTransfer& block_transfer : block_transfers) {
         _assert(block_transfer.source && block_transfer.destination,
                 "cache transfer requires pinned source and destination blocks");
-        const KvCacheManager& manager =
-            coordinator_.GroupManager(static_cast<std::int32_t>(block_transfer.group_id));
+        const KvCacheManager& manager = coordinator_.GroupManager(static_cast<std::int32_t>(block_transfer.group_id));
         transfers.push_back(CacheTransfer{
             .group_id = block_transfer.group_id,
             .source_page = manager.ResolveKernelPageId(block_transfer.source->Location()),

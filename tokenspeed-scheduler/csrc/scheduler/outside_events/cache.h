@@ -27,12 +27,10 @@ namespace tokenspeed {
 namespace cache {
 struct WriteBackDone {
     std::uint32_t op_id{};
-    bool success;
 };
 
 struct LoadBackDone {
     std::uint32_t op_id{0};
-    bool success{true};
 };
 
 };  // namespace cache

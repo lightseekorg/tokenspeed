@@ -31,8 +31,8 @@ namespace tokenspeed {
 class TokenContainer {
 public:
     struct Window {
-        std::int32_t begin;
-        std::int32_t size;
+        std::int32_t begin{0};
+        std::int32_t size{0};
     };
 
     explicit TokenContainer(const std::vector<std::int32_t>& new_tokens)

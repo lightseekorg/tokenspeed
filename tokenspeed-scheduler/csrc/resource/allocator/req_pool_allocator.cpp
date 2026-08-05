@@ -34,7 +34,7 @@ ReqPoolIndex::ReqPoolIndex(ReqPoolIndex&& other) noexcept : slot_(other.slot_), 
 ReqPoolIndex& ReqPoolIndex::operator=(ReqPoolIndex&& other) noexcept {
     if (this != &other) {
         if (allocator_) {
-            allocator_->deAllocate(slot_);
+            allocator_->deallocate(slot_);
         }
         slot_ = other.slot_;
         allocator_ = other.allocator_;
@@ -46,7 +46,7 @@ ReqPoolIndex& ReqPoolIndex::operator=(ReqPoolIndex&& other) noexcept {
 
 ReqPoolIndex::~ReqPoolIndex() {
     if (allocator_) {
-        allocator_->deAllocate(slot_);
+        allocator_->deallocate(slot_);
     }
 }
 
@@ -79,7 +79,7 @@ std::int32_t ReqPoolAllocator::AvailableSlots() const {
     return static_cast<std::int32_t>(free_slots_.size());
 }
 
-void ReqPoolAllocator::deAllocate(std::int32_t slot) {
+void ReqPoolAllocator::deallocate(std::int32_t slot) {
     free_slots_.push_back(slot);
 }
 

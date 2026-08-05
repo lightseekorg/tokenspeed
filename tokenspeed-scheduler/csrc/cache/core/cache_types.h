@@ -68,13 +68,13 @@ struct CacheKeyHash {
 };
 
 struct KvCacheSpec {
-    AttnKind kind;
+    AttnKind kind{AttnKind::kFull};
     // Only kSlidingWindow uses this value. Mamba's one-checkpoint lookback is
     // an internal Manager policy rather than a model window.
-    std::int32_t sliding_window;
+    std::int32_t sliding_window{0};
     // Number of this group's CacheBlocks packed into one physical LCM block.
     // It affects placement only, not the scheduler-wide prefix boundary P.
-    std::int32_t cache_blocks_per_lcm_block;
+    std::int32_t cache_blocks_per_lcm_block{1};
     // Tokens represented by one CacheBlock in this group. Zero keeps the
     // legacy meaning: use the coordinator-wide logical granularity P.
     std::int32_t cache_block_tokens{0};

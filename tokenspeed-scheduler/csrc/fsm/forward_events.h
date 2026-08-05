@@ -97,6 +97,9 @@ struct ScheduleDecodeEvent : InvalidTransitionHandler<ScheduleDecodeEvent> {
     Decoding operator()(Decoding&& state);
 
 private:
+    template <typename State>
+    Decoding decode(State&& state);
+
     std::int32_t decode_input_tokens_{};
     CacheProgress cache_progress_;
 };
@@ -110,7 +113,6 @@ struct FinishEvent : InvalidTransitionHandler<FinishEvent> {
     Finished operator()(Decoding&& state);
     Finished operator()(Retracting&& state);
     Finished operator()(Retracted&& state);
-    Finished operator()(Recovering&& state);
     Finished operator()(Finished&& state) { return std::move(state); }
 
 private:
@@ -132,7 +134,6 @@ struct AbortEvent : InvalidTransitionHandler<AbortEvent> {
     Finished operator()(Decoding&& state);
     Finished operator()(Retracting&& state);
     Finished operator()(Retracted&& state);
-    Finished operator()(Recovering&& state);
     Finished operator()(Finished&& state) { return std::move(state); }
 
 private:
@@ -145,15 +146,20 @@ private:
 struct BeginRetractionEvent : InvalidTransitionHandler<BeginRetractionEvent> {
     using InvalidTransitionHandler<BeginRetractionEvent>::operator();
 
-    explicit BeginRetractionEvent(std::vector<BlockTable> host_tables)
-        : host_tables_{std::move(host_tables)} {}
+    BeginRetractionEvent(std::vector<BlockTable> host_tables, std::int32_t host_prefix_tokens,
+                         CacheProgress cache_progress)
+        : host_tables_{std::move(host_tables)},
+          host_prefix_tokens_{host_prefix_tokens},
+          cache_progress_{std::move(cache_progress)} {}
 
     Retracting operator()(Decoding&& state) {
-        return Retracting{std::move(state), std::move(host_tables_)};
+        return Retracting{std::move(state), std::move(host_tables_), host_prefix_tokens_, std::move(cache_progress_)};
     }
 
 private:
     std::vector<BlockTable> host_tables_;
+    std::int32_t host_prefix_tokens_{0};
+    CacheProgress cache_progress_;
 };
 
 struct CompleteRetractionEvent : InvalidTransitionHandler<CompleteRetractionEvent> {
@@ -167,29 +173,23 @@ private:
     KvCacheCoordinator* coordinator_{};
 };
 
-struct CancelRetractionEvent : InvalidTransitionHandler<CancelRetractionEvent> {
-    using InvalidTransitionHandler<CancelRetractionEvent>::operator();
+struct RecoverEvent : InvalidTransitionHandler<RecoverEvent> {
+    using InvalidTransitionHandler<RecoverEvent>::operator();
 
-    Decoding operator()(Retracting&& state) { return std::move(state.device_state); }
-};
+    RecoverEvent(ReqPoolAllocator* req_pool_allocator, TokenContainer* token_container, std::int32_t page_size,
+                 std::vector<BlockTable> device_tables)
+        : req_pool_allocator_{req_pool_allocator},
+          token_container_{token_container},
+          page_size_{page_size},
+          device_tables_{std::move(device_tables)} {}
 
-struct BeginRecoveryEvent : InvalidTransitionHandler<BeginRecoveryEvent> {
-    using InvalidTransitionHandler<BeginRecoveryEvent>::operator();
-
-    BeginRecoveryEvent(ReqPoolAllocator* req_pool_allocator, std::vector<BlockTable> device_tables)
-        : req_pool_allocator_{req_pool_allocator}, device_tables_{std::move(device_tables)} {}
-
-    Recovering operator()(Retracted&& state);
+    Decoding operator()(Retracted&& state);
 
 private:
     ReqPoolAllocator* req_pool_allocator_{};
+    TokenContainer* token_container_{};
+    std::int32_t page_size_{};
     std::vector<BlockTable> device_tables_;
-};
-
-struct CompleteRecoveryEvent : InvalidTransitionHandler<CompleteRecoveryEvent> {
-    using InvalidTransitionHandler<CompleteRecoveryEvent>::operator();
-
-    Decoding operator()(Recovering&& state);
 };
 
 // Release every request-owned page and requeue all accepted tokens as prefill.

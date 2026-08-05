@@ -90,7 +90,8 @@ std::int32_t CacheForGroup(KvCacheCoordinator& coordinator, BlockPool& pool, con
 }
 
 CacheBlockLocation CacheBoundaryForGroup(KvCacheCoordinator& coordinator, BlockPool& pool,
-                                         const std::string& content_hash, std::uint32_t group_id, std::uint64_t access_epoch,
+                                         const std::string& content_hash, std::uint32_t group_id,
+                                         std::uint64_t access_epoch,
                                          std::int32_t logical_block_index,
                                          CacheBoundaryKind boundary_kind = CacheBoundaryKind::kChunk) {
     KvCacheManager& manager = coordinator.GroupManager(static_cast<std::int32_t>(group_id));
@@ -131,6 +132,15 @@ TEST(MakeCoordinatorTest, BuildsOneGroupPerSpec) {
     };
     KvCacheCoordinator coord = MakeCoordinator(specs, 4, pool);
     EXPECT_EQ(coord.NumGroups(), 2);
+}
+
+TEST(MakeCoordinatorTest, UsesOneCacheBlockPerLcmBlockByDefault) {
+    BlockPool pool(1);
+    const std::array specs{KvCacheSpec{}};
+
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, /*cache_block_tokens=*/4, pool);
+
+    EXPECT_EQ(coordinator.GroupManager(0).CacheBlocksPerLcmBlock(), 1);
 }
 
 TEST(MakeCoordinatorTest, Qwen35UsesUniformLogicalPWithDifferentPacking) {
@@ -2330,7 +2340,7 @@ std::int32_t SlideCredit(const KvCacheCoordinator& coord, std::span<const BlockT
     for (std::int32_t i = 0; i < coord.NumGroups(); ++i) {
         total_freed +=
             coord.GroupManager(i).BlocksReclaimableAt(tables[static_cast<std::size_t>(i)], num_computed_tokens,
-                                                      /*count_uncached=*/!coord.HasHostTier());
+                                                      /*count_uncached=*/!coord.StreamsDeviceCacheToHost());
     }
     return total_freed;
 }
@@ -2378,7 +2388,7 @@ TEST(KvCacheCoordinatorHostReplacement, ReusesOneColdChildBeforeRebindingAParent
     first_ref.reset();
     second_ref.reset();
 
-    CacheBlockRef replacement = coordinator.AcquireHostBlockForStore(0);
+    CacheBlockRef replacement = coordinator.AcquireHostBlock(0);
 
     ASSERT_TRUE(replacement);
     EXPECT_EQ(host_pool.BoundGroup(replacement->Location().lcm_block_id), 0u);
@@ -2402,7 +2412,7 @@ TEST(KvCacheCoordinatorHostReplacement, RebindsACompleteEvictableParentAcrossGro
     first.reset();
     second.reset();
 
-    CacheBlockRef replacement = coordinator.AcquireHostBlockForStore(1);
+    CacheBlockRef replacement = coordinator.AcquireHostBlock(1);
 
     ASSERT_TRUE(replacement);
     EXPECT_EQ(host_pool.BoundGroup(replacement->Location().lcm_block_id), 1u);
@@ -2436,6 +2446,33 @@ void SeedDeviceFloor(BlockPool& pool, KvCacheCoordinator& coord, std::span<const
 std::vector<KvCacheSpec> HostExtSpecs() {
     return {KvCacheSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
             KvCacheSpec{.kind = AttnKind::kSlidingWindow, .sliding_window = 4, .cache_blocks_per_lcm_block = 1}};
+}
+
+TEST(KvCacheCoordinatorHostTier, RetractionHostPrefixMatchesFromTokenZero) {
+    BlockPool device_pool(8);
+    BlockPool host_pool(8);
+    KvCacheCoordinator coordinator = MakeCoordinator(HostExtSpecs(), /*cache_block_tokens=*/2, device_pool, &host_pool);
+    const std::vector<std::string> hashes = ContentHashes({{0, 0}, {1, 1}, {2, 2}, {3, 3}});
+    for (std::uint32_t group_id = 0; group_id < 2; ++group_id) {
+        for (const std::string& hash : hashes) {
+            (void)HostPut(coordinator, host_pool, hash, group_id);
+        }
+    }
+
+    std::vector<BlockTable> device_tables;
+    device_tables.push_back(
+        BlockTable::FromBlocks(device_pool.AcquireBlocks(/*group_id=*/0, 1, 4), /*available_tokens=*/0));
+    device_tables.push_back(
+        BlockTable::FromBlocks(device_pool.AcquireBlocks(/*group_id=*/1, 1, 2), /*available_tokens=*/0));
+    std::optional<CoordinatorMatch> match = coordinator.TryAcquireRetractionHostPrefix(
+        hashes, KvCacheCoordinatorTestAccess::NextAccessEpoch(coordinator), device_tables);
+
+    ASSERT_TRUE(match);
+    EXPECT_EQ(match->num_common_tokens, 8);
+    ASSERT_EQ(match->per_group.size(), 2u);
+    EXPECT_EQ(match->per_group[0].NumHitBlocks(), 4);
+    EXPECT_EQ(match->per_group[1].NumHitBlocks(), 2);
+    EXPECT_EQ(coordinator.NumPinnedHostCachedBlocks(), 6);
 }
 
 TEST(KvCacheCoordinatorHostExtension, PreservesAllNullWindowExtensionSlots) {
@@ -3001,7 +3038,7 @@ TEST(DecodeDestinationTest, HistoryGroupsDeterminePrefixAndStateGetsAlignedHoles
 
     EXPECT_EQ(coordinator.ProbePrefix(hashes).device.num_common_tokens, 0);
 
-    KvCacheCoordinator::PrefixProbe probe = coordinator.ProbeDecodeDestinationPrefix(hashes);
+    KvCacheCoordinator::PrefixProbe probe = coordinator.ProbeDecodeDevicePrefix(hashes);
     EXPECT_EQ(probe.device.num_common_tokens, 6);
     ASSERT_EQ(probe.device.per_group.size(), 2u);
     ASSERT_EQ(probe.device.per_group[0].hits.size(), 3u);

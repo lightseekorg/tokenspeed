@@ -49,25 +49,27 @@ std::int64_t ceilDiv(std::int64_t value, std::int64_t divisor) {
     return (value + divisor - 1) / divisor;
 }
 
+std::int32_t hostPoolBlocks(const SchedulerConfig& config) {
+    if (config.role == Role::kD) {
+        if (config.disable_l2_cache) {
+            throw std::invalid_argument("Scheduler: Decode requires Host L2 for retraction");
+        }
+        if (config.host_allocator.total_pages <= 1) {
+            throw std::invalid_argument("Scheduler: Decode Host L2 must contain a null page and usable capacity");
+        }
+        return config.host_allocator.total_pages - 1;
+    }
+    return config.PrefixL2Enabled() ? config.host_allocator.total_pages - 1 : 0;
+}
+
 CacheKey eventKey(const CacheKey& key) {
+    // External events describe one scheduler-level boundary. Fold every
+    // group/child offset behind that boundary into the same accounting key.
     return CacheKey{
         .namespace_id = key.namespace_id,
         .group_id = 0,
         .content_hash = key.content_hash,
     };
-}
-
-std::vector<CacheBlockLocation> snapshotLocations(const std::vector<BlockTable>& tables) {
-    std::vector<CacheBlockLocation> locations;
-    for (const BlockTable& table : tables) {
-        for (const CacheBlockRef& block_ref : table.Blocks()) {
-            if (block_ref) {
-                _assert(block_ref.unique(), "snapshot Host block has an owner outside its request table");
-                locations.push_back(block_ref->Location());
-            }
-        }
-    }
-    return locations;
 }
 
 }  // namespace
@@ -76,12 +78,11 @@ Scheduler::Scheduler(SchedulerConfig config)
     : config_{std::move(config)},
       req_pool_allocator_{config_.max_batch_size},
       block_pool_{config_.device_allocator.total_pages - 1},
-      host_pool_{(config_.OrdinaryL2Enabled() || config_.DecodeSnapshotEnabled())
-                     ? config_.host_allocator.total_pages - 1
-                     : 0},
+      host_pool_{hostPoolBlocks(config_)},
       coordinator_{MakeCoordinator(MakeSpecsFromConfig(config_), config_.block_size, block_pool_,
-                                   config_.OrdinaryL2Enabled() ? &host_pool_ : nullptr)},
-      tier_transfers_{coordinator_, host_pool_} {
+                                   host_pool_.NumLcmBlocks() > 0 ? &host_pool_ : nullptr,
+                                   config_.PrefixL2Enabled())},
+      tier_transfers_{coordinator_} {
     if (config_.block_size <= 0) {
         throw std::invalid_argument("Scheduler: block_size must be > 0");
     }
@@ -114,11 +115,16 @@ Scheduler::Scheduler(SchedulerConfig config)
     for (const PagedCacheGroupConfig& group : config_.paged_cache_groups) {
         group.Validate();
         cache_group_ids_.push_back(group.group_id);
+        const std::int32_t child_entries = config_.block_size / group.CacheBlockTokens();
+        if (cache_entries_per_event_boundary_ > std::numeric_limits<std::int32_t>::max() - child_entries) {
+            throw std::invalid_argument("Scheduler: cache entries per event boundary exceed int32 range");
+        }
+        cache_entries_per_event_boundary_ += child_entries;
     }
     max_single_request_tokens_ = calculateMaxSingleRequestTokens(block_pool_.NumLcmBlocks());
-    if (config_.DecodeSnapshotEnabled()) {
-        max_host_snapshot_tokens_ = calculateMaxSingleRequestTokens(host_pool_.NumLcmBlocks());
-        max_single_request_tokens_ = std::min(max_single_request_tokens_, max_host_snapshot_tokens_);
+    if (config_.role == Role::kD) {
+        max_host_retraction_tokens_ = calculateMaxSingleRequestTokens(host_pool_.NumLcmBlocks());
+        max_single_request_tokens_ = std::min(max_single_request_tokens_, max_host_retraction_tokens_);
     }
 
     if (config_.enable_kv_cache_events) {
@@ -215,8 +221,8 @@ std::vector<KvCacheEvent> Scheduler::DrainKvEvents() {
 }
 
 bool Scheduler::ClearL1Cache() {
-    const bool has_live_request = std::ranges::any_of(
-        requests_, [](const auto& item) { return !item.second->template Is<fsm::Finished>(); });
+    const bool has_live_request =
+        std::ranges::any_of(requests_, [](const auto& item) { return !item.second->template Is<fsm::Finished>(); });
     if (has_live_request || !pending_forward_results_.empty() || !pd_transfer_pins_.empty() ||
         tier_transfers_.HasAnyInFlight()) {
         return false;
@@ -263,7 +269,7 @@ std::vector<CacheKey> Scheduler::registerKvEventPages(const Request& request, st
 
 void Scheduler::discardUncachedKvEventPages(std::span<const CacheKey> keys) {
     for (const CacheKey& key : keys) {
-        if (!cached_event_group_counts_.contains(key)) {
+        if (!cached_event_child_counts_.contains(key)) {
             kv_event_pages_.erase(key);
         }
     }
@@ -272,10 +278,10 @@ void Scheduler::discardUncachedKvEventPages(std::span<const CacheKey> keys) {
 void Scheduler::handleCacheMutation(const CacheKey& key, KvCacheCoordinator::CacheMutation mutation) {
     const CacheKey prefix_key = eventKey(key);
     if (mutation == KvCacheCoordinator::CacheMutation::kStored) {
-        std::int32_t& group_count = cached_event_group_counts_[prefix_key];
-        FatalCheck(group_count < coordinator_.NumGroups(), "duplicate group entry for one KV event boundary");
-        ++group_count;
-        if (group_count == coordinator_.NumGroups()) {
+        std::int32_t& child_count = cached_event_child_counts_[prefix_key];
+        FatalCheck(child_count < cache_entries_per_event_boundary_, "duplicate child entry for one KV event boundary");
+        ++child_count;
+        if (child_count == cache_entries_per_event_boundary_) {
             const auto page_it = kv_event_pages_.find(prefix_key);
             FatalCheck(page_it != kv_event_pages_.end(), "cached KV event boundary has no token descriptor");
             kv_events_.emplace_back(page_it->second);
@@ -283,120 +289,51 @@ void Scheduler::handleCacheMutation(const CacheKey& key, KvCacheCoordinator::Cac
         return;
     }
 
-    auto count_it = cached_event_group_counts_.find(prefix_key);
-    FatalCheck(count_it != cached_event_group_counts_.end() && count_it->second > 0,
+    auto count_it = cached_event_child_counts_.find(prefix_key);
+    FatalCheck(count_it != cached_event_child_counts_.end() && count_it->second > 0,
                "removed KV event boundary was not registered");
-    if (count_it->second == coordinator_.NumGroups()) {
+    if (count_it->second == cache_entries_per_event_boundary_) {
         const auto page_it = kv_event_pages_.find(prefix_key);
         FatalCheck(page_it != kv_event_pages_.end(), "removed KV event boundary has no token descriptor");
         kv_events_.emplace_back(KvBlockRemovedEvent{.block_hashes = page_it->second.block_hashes});
     }
     if (--count_it->second == 0) {
-        cached_event_group_counts_.erase(count_it);
+        cached_event_child_counts_.erase(count_it);
         kv_event_pages_.erase(prefix_key);
     }
 }
 
 void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
+    std::unordered_set<std::string> request_ids;
+    request_ids.reserve(request_specs.size());
+    std::vector<std::unique_ptr<Request>> pending_requests;
+    pending_requests.reserve(request_specs.size());
     for (const RequestSpec& spec : request_specs) {
+        if (spec.tokens.empty()) {
+            throw std::invalid_argument("Scheduler: request tokens must be non-empty");
+        }
+        if (requests_.contains(spec.request_id) || !request_ids.insert(spec.request_id).second) {
+            throw std::invalid_argument("Scheduler: duplicate request id '" + spec.request_id + "'");
+        }
         if (spec.max_new_tokens < 0) {
             throw std::invalid_argument("Scheduler: max_new_tokens must be non-negative");
         }
         const std::int64_t minimum_generation_reserve = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
-        const std::int64_t token_limit =
-            static_cast<std::int64_t>(spec.tokens.size()) + std::max<std::int64_t>(spec.max_new_tokens,
-                                                                                  minimum_generation_reserve);
+        const std::int64_t token_limit = static_cast<std::int64_t>(spec.tokens.size()) +
+                                         std::max<std::int64_t>(spec.max_new_tokens, minimum_generation_reserve);
         if (token_limit > std::numeric_limits<std::int32_t>::max()) {
             throw std::invalid_argument("Scheduler: request token limit exceeds int32 range");
         }
         if (token_limit > max_single_request_tokens_) {
             throw std::invalid_argument("Scheduler: request token limit exceeds paged-cache capacity");
         }
-        std::int32_t max_snapshot_parents = 0;
-        if (config_.DecodeSnapshotEnabled()) {
-            const std::int64_t required = singleRequestParentsRequired(static_cast<std::int32_t>(token_limit));
-            max_snapshot_parents = static_cast<std::int32_t>(required);
-        }
-        auto request = std::make_unique<Request>(spec, config_.block_size, config_.role, max_snapshot_parents);
-        const bool inserted = requests_.emplace(spec.request_id, std::move(request)).second;
-        if (!inserted) {
-            throw std::invalid_argument("Scheduler: duplicate request id '" + spec.request_id + "'");
-        }
+        pending_requests.push_back(std::make_unique<Request>(spec, config_.block_size, config_.role));
     }
-}
 
-bool Scheduler::preservesRetractionCapacityAfterAdmission(const Request& candidate) const {
-    if (!config_.DecodeSnapshotEnabled()) {
-        return true;
+    for (std::size_t i = 0; i < request_specs.size(); ++i) {
+        const bool inserted = requests_.emplace(request_specs[i].request_id, std::move(pending_requests[i])).second;
+        FatalCheck(inserted, "validated request id became duplicate before insertion");
     }
-    // A request in snapshot transfer is absent from the active-state sum
-    // below. Its post-ACK state depends on transfer success, so do not admit
-    // against that temporary undercount.
-    if (tier_transfers_.HasSnapshotsInFlight()) {
-        return false;
-    }
-    const std::int64_t occupied_parents = host_pool_.NumLcmBlocks() - host_pool_.NumEmptyLcmBlocks();
-    // Keep enough Host parents to retract every active request except the
-    // largest one, which may remain on Device: P + sum(S) - max(S) <= H.
-    std::int64_t sum = candidate.MaxSnapshotParents();
-    std::int64_t largest = candidate.MaxSnapshotParents();
-    for (const auto& [_, request] : requests_) {
-        if (request.get() == &candidate ||
-            (!request->Is<fsm::Prefilling>() && !request->Is<fsm::PrefillDone>() &&
-             !request->Is<fsm::Decoding>())) {
-            continue;
-        }
-        const std::int64_t bound = request->MaxSnapshotParents();
-        sum += bound;
-        largest = std::max(largest, bound);
-    }
-    return occupied_parents + sum - largest <= host_pool_.NumLcmBlocks();
-}
-
-bool Scheduler::preservesRetractionCapacityAfterRetraction(const Request& candidate) const {
-    if (!config_.DecodeSnapshotEnabled()) {
-        return true;
-    }
-    // PrepareOffload already holds the candidate's Host destinations, so
-    // current occupancy is exactly P after the proposed migration.
-    const std::int64_t occupied_parents = host_pool_.NumLcmBlocks() - host_pool_.NumEmptyLcmBlocks();
-    std::int64_t sum = 0;
-    std::int64_t largest = 0;
-    for (const auto& [_, request] : requests_) {
-        if (request.get() == &candidate ||
-            (!request->Is<fsm::Prefilling>() && !request->Is<fsm::PrefillDone>() &&
-             !request->Is<fsm::Decoding>())) {
-            continue;
-        }
-        const std::int64_t bound = request->MaxSnapshotParents();
-        sum += bound;
-        largest = std::max(largest, bound);
-    }
-    return occupied_parents + sum - largest <= host_pool_.NumLcmBlocks();
-}
-
-bool Scheduler::preservesRetractionCapacityAfterRecovery(const Request& request) const {
-    if (!config_.DecodeSnapshotEnabled()) {
-        return true;
-    }
-    const fsm::RetractionSnapshot& snapshot = request.RetractionSnapshotRef();
-    const std::vector<CacheBlockLocation> snapshot_locations = snapshotLocations(snapshot.host_tables);
-    const std::int64_t released_parents = host_pool_.NumParentsFreedBy(snapshot_locations);
-    const std::int64_t occupied_parents = host_pool_.NumLcmBlocks() - host_pool_.NumEmptyLcmBlocks();
-    _assert(released_parents <= occupied_parents, "snapshot releases more than the occupied Host parents");
-
-    std::int64_t sum = request.MaxSnapshotParents();
-    std::int64_t largest = request.MaxSnapshotParents();
-    for (const auto& [_, active] : requests_) {
-        if (!active->Is<fsm::Prefilling>() && !active->Is<fsm::PrefillDone>() &&
-            !active->Is<fsm::Decoding>()) {
-            continue;
-        }
-        const std::int64_t bound = active->MaxSnapshotParents();
-        sum += bound;
-        largest = std::max(largest, bound);
-    }
-    return occupied_parents - released_parents + sum - largest <= host_pool_.NumLcmBlocks();
 }
 
 std::size_t Scheduler::WaitingSize() const {
@@ -473,14 +410,13 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
         }
     }
 
+    ExecutionPlan plan;
     std::vector<WriteBackOperation> write_back_operations;
     auto [forward_operations, load_back_operations] =
-        buildForwardOperations(std::move(candidates), write_back_operations);
-
-    ExecutionPlan plan;
+        buildForwardOperations(plan, std::move(candidates), write_back_operations);
     plan.With(ForwardBatch{std::move(forward_operations)});
 
-    if (config_.OrdinaryL2Enabled()) {
+    if (config_.PrefixL2Enabled()) {
         if (auto store = tier_transfers_.StartPendingStores()) {
             write_back_operations.push_back(std::move(*store));
         }
@@ -491,7 +427,6 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     if (!load_back_operations.empty()) {
         plan.With(CacheOperation{LoadBackBatch{load_back_operations}});
     }
-    plan.pages_to_zero = std::exchange(new_page_ids_, {});
     return plan;
 }
 

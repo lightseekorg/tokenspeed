@@ -35,6 +35,7 @@
 #include "scheduler/request.h"
 #include "scheduler/scheduler.h"
 #include "scheduler/types.h"
+#include "utils.h"
 
 /*
 Writable types:
@@ -192,13 +193,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
 
     nb::class_<tokenspeed::cache::WriteBackDone>(cache, "WriteBackDoneEvent")
         .def(nb::init<>())
-        .def_rw("op_id", &tokenspeed::cache::WriteBackDone::op_id)
-        .def_rw("success", &tokenspeed::cache::WriteBackDone::success);
+        .def_rw("op_id", &tokenspeed::cache::WriteBackDone::op_id);
 
     nb::class_<tokenspeed::cache::LoadBackDone>(cache, "LoadBackDoneEvent")
         .def(nb::init<>())
-        .def_rw("op_id", &tokenspeed::cache::LoadBackDone::op_id)
-        .def_rw("success", &tokenspeed::cache::LoadBackDone::success);
+        .def_rw("op_id", &tokenspeed::cache::LoadBackDone::op_id);
 
     nb::class_<tokenspeed::pd::BootstrappedEvent>(pd, "BootstrappedEvent")
         .def(nb::init<std::string>(), nb::arg("request_id"))
@@ -251,6 +250,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                  nb::dict out;
                  for (auto& [gid, buf] : op.block_tables_contig) {
                      const std::size_t rows = op.request_ids.size();
+                     tokenspeed::FatalCheck(rows == 0 || buf.size() % rows == 0,
+                                            "block-table buffer must contain complete rows");
                      const std::size_t columns = rows == 0 ? 0 : buf.size() / rows;
                      out[nb::str(gid.c_str())] =
                          nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>>(buf.data(), {rows, columns}, self);
@@ -296,7 +297,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def(nb::init<>())
         .def_prop_ro("forward", collect_forward)
         .def_prop_ro("cache", collect_cache)
-        .def_ro("pages_to_zero", &tokenspeed::ExecutionPlan::pages_to_zero);
+        .def_ro("pages_to_zero", &tokenspeed::ExecutionPlan::pages_to_zero)
+        .def_ro("aborted_request_id", &tokenspeed::ExecutionPlan::aborted_request_id);
 
     nb::class_<tokenspeed::Scheduler>(m, "Scheduler")
         .def(nb::init<tokenspeed::SchedulerConfig>(), nb::arg("config") = tokenspeed::SchedulerConfig{})
@@ -305,16 +307,14 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              nb::arg("request_specs"))
         .def("next_execution_plan", [](tokenspeed::Scheduler& s) { return s.NextExecutionPlan(); })
         .def("advance", &tokenspeed::Scheduler::Advance, nb::arg("event"))
-        .def(
-            "drain_kv_events",
-            [](tokenspeed::Scheduler& s) {
-                nb::list result;
-                for (auto& event : s.DrainKvEvents()) {
-                    std::visit([&result](auto& inner) { result.append(nb::cast(inner, nb::rv_policy::copy)); }, event);
-                }
-                return result;
-            },
-            nb::rv_policy::move)
+        .def("drain_kv_events",
+             [](tokenspeed::Scheduler& s) {
+                 nb::list result;
+                 for (auto& event : s.DrainKvEvents()) {
+                     std::visit([&result](auto& inner) { result.append(nb::cast(inner, nb::rv_policy::copy)); }, event);
+                 }
+                 return result;
+             })
         .def("waiting_size", &tokenspeed::Scheduler::WaitingSize)
         .def("decoding_size", &tokenspeed::Scheduler::DecodingSize)
         .def("prefilling_size", &tokenspeed::Scheduler::PrefillSize)
@@ -323,7 +323,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("active_kv_pages", &tokenspeed::Scheduler::ActiveKvPages)
         .def("request_token_size", &tokenspeed::Scheduler::RequestTokenSize, nb::arg("id"))
         .def("max_single_request_tokens", &tokenspeed::Scheduler::MaxSingleRequestTokens)
-        .def("max_host_snapshot_tokens", &tokenspeed::Scheduler::MaxHostSnapshotTokens)
+        .def("max_host_retraction_tokens", &tokenspeed::Scheduler::MaxHostRetractionTokens)
         .def("clear_l1_cache", &tokenspeed::Scheduler::ClearL1Cache)
         .def("paged_cache_group_total_pages", &tokenspeed::Scheduler::PagedCacheGroupTotalPages, nb::arg("group_id"))
         .def("paged_cache_group_available_pages", &tokenspeed::Scheduler::PagedCacheGroupAvailablePages,

@@ -22,15 +22,20 @@
 
 #include <stdexcept>
 
+#include "fsm/forward_events.h"
+
 namespace tokenspeed {
 
-Request::Request(const RequestSpec& spec, std::int32_t page_size, Role role, std::int32_t max_snapshot_parents)
+Request::Request(const RequestSpec& spec, std::int32_t page_size, Role role)
     : id_{spec.request_id},
       token_container_{spec.tokens},
       page_size_{page_size},
-      max_snapshot_parents_{max_snapshot_parents},
       state_{role == Role::kFused ? fsm::State{fsm::Submitted{&token_container_, page_size}}
                                   : fsm::State{fsm::Bootstrapping{&token_container_, page_size}}} {}
+
+void Request::Recover(ReqPoolAllocator* req_pool_allocator, std::vector<BlockTable> device_tables) {
+    Apply(fsm::RecoverEvent{req_pool_allocator, &token_container_, page_size_, std::move(device_tables)});
+}
 
 PrefillInfo Request::CurrentPrefillInfo() const {
     return std::visit(

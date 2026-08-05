@@ -338,11 +338,6 @@ class EventLoop:
             self.l2_cache_executor = None
             num_host_pages = 0
 
-        # The host tier acks loadbacks, so they join the in-flight accounting.
-        self._loadback_acks_expected = getattr(
-            self.l2_cache_executor, "emits_loadback_acks", False
-        )
-
         self._kv_events_enabled = (
             EventPublisherFactory.is_enabled(server_args.kv_events_config)
             and attn_tp_rank == 0
@@ -426,12 +421,12 @@ class EventLoop:
             [group.group_id for group in paged_cache_groups],
         )
         self.scheduler = Scheduler(scheduler_cfg)
-        if server_args.disaggregation_mode == "decode" and server_args.enable_kvstore:
-            host_snapshot_tokens = self.scheduler.max_host_snapshot_tokens()
-            if host_snapshot_tokens < self.model_config.context_len:
+        if server_args.disaggregation_mode == "decode":
+            host_retraction_tokens = self.scheduler.max_host_retraction_tokens()
+            if host_retraction_tokens < self.model_config.context_len:
                 raise RuntimeError(
-                    "Decode Host L2 must hold one max-context retraction "
-                    f"snapshot: capacity={host_snapshot_tokens}, "
+                    "Decode Host L2 must hold one max-context retraction state: "
+                    f"capacity={host_retraction_tokens}, "
                     f"model_context_len={self.model_config.context_len}"
                 )
         self.max_single_request_tokens = self.scheduler.max_single_request_tokens()
@@ -755,9 +750,8 @@ class EventLoop:
         for payload in ready_payloads:
             e = cache_event_from_payload(payload)
             logger.debug(
-                "[cache_poll] event: op_id=%s success=%s type=%s request_id=%s",
+                "[cache_poll] event: op_id=%s type=%s request_id=%s",
                 e.op_id,
-                e.success,
                 type(e).__name__,
                 getattr(e, "request_id", "N/A"),
             )
@@ -987,21 +981,9 @@ class EventLoop:
             if isinstance(op, Cache.WriteBackOp):
                 self._num_inflight_cache_ops += len(op.op_ids)
             elif isinstance(op, Cache.LoadBackOp):
-                if self._loadback_acks_expected:
-                    self._num_inflight_cache_ops += len(op.op_ids)
+                self._num_inflight_cache_ops += len(op.op_ids)
             else:
                 raise ValueError(f"unsupported cache op kind: {type(op).__name__}")
-        self._setup_layerwise_loadback(execution_plan)
-
-    def _setup_layerwise_loadback(self, execution_plan) -> None:
-        load_indices = []
-        for cache_op in execution_plan.cache:
-            if isinstance(cache_op, Cache.LoadBackOp):
-                for op_id in cache_op.op_ids:
-                    load_index = self.l2_cache_executor.take_load_index(op_id)
-                    if load_index is not None and load_index not in load_indices:
-                        load_indices.append(load_index)
-        self.l2_cache_executor.set_consumers(load_indices or -1)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1346,6 +1328,19 @@ class EventLoop:
             return None
         return forward_ops[0]
 
+    def _publish_scheduler_abort(self, execution_plan) -> None:
+        """Finish requests the scheduler dropped after Host retraction failed."""
+        request_id = execution_plan.aborted_request_id
+        if request_id is None:
+            return
+        state = self.output_processor.rid_to_state.get(request_id)
+        if state is None:
+            return
+        state.set_finish_with_abort(
+            "Decode cache capacity exhausted", notify_client=True
+        )
+        self.output_processor.reap_finished_orphan(request_id, state)
+
     def _process_kv_transfer_events(self, kv_transfer_events: list) -> list:
         processed = []
         for event in kv_transfer_events:
@@ -1569,10 +1564,6 @@ class EventLoop:
     def _shutdown_complete(self) -> bool:
         return self.shutdown_event.is_set()
 
-    def _pages_to_zero(self, execution_plan):
-        """Group-aware child pages assigned by the scheduler in this step."""
-        return execution_plan.pages_to_zero
-
     def event_loop(self):
         """Non-overlapping scheduler loop."""
         while not self._shutdown_complete():
@@ -1587,9 +1578,10 @@ class EventLoop:
                 self._paused_idle_step()
                 continue
             execution_plan = self.scheduler.next_execution_plan()
+            self._publish_scheduler_abort(execution_plan)
             self._publish_scheduler_kv_events()
             cache_zero_event = self.model_executor.zero_cache_pages(
-                self._pages_to_zero(execution_plan)
+                execution_plan.pages_to_zero
             )
             self._submit_cache_ops(execution_plan)
 
@@ -1739,10 +1731,11 @@ class EventLoop:
                 prev_forward_op = None
                 continue
             execution_plan = self.scheduler.next_execution_plan()
+            self._publish_scheduler_abort(execution_plan)
             self._publish_scheduler_kv_events()
 
             cache_zero_event = self.model_executor.zero_cache_pages(
-                self._pages_to_zero(execution_plan)
+                execution_plan.pages_to_zero
             )
             self._submit_cache_ops(execution_plan)
 

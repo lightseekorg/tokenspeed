@@ -22,7 +22,6 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
 from collections.abc import Iterable, Sequence
 from typing import NamedTuple
 
@@ -93,8 +92,6 @@ def _num_host_lcm_blocks(
 class L2CacheExecutor:
     """Execute group-aware D2H/H2D operations against one compact Host pool."""
 
-    emits_loadback_acks = True
-
     def __init__(
         self,
         device_pool,
@@ -150,72 +147,71 @@ class L2CacheExecutor:
         self.write_stream = _new_cache_stream(write_priority)
         self.load_stream = _new_cache_stream(load_priority)
 
-        self._pending_write_transfers: list[tuple[int, int, int]] = []
-        self._pending_write_op_ids: list[int] = []
-        self._pending_load_transfers: list[tuple[int, int, int]] = []
-        self._pending_load_op_ids: list[int] = []
-        self.ack_write_queue: list[_Ack] = []
-        self.ack_load_queue: list[_Ack] = []
-        self._immediate_write_op_ids: list[int] = []
-        self._immediate_load_op_ids: list[int] = []
-        self._load_index_by_op_id: OrderedDict[int, int] = OrderedDict()
-        self._load_index_history_limit = 1024
+        self._write_acks: list[_Ack] = []
+        self._load_acks: list[_Ack] = []
+        self._ready_write_op_ids: list[int] = []
+        self._ready_load_op_ids: list[int] = []
 
     def submit_plan(self, plan) -> None:
+        write_op_ids: list[int] = []
+        write_transfers: list[tuple[int, int, int]] = []
+        load_op_ids: list[int] = []
+        load_transfers: list[tuple[int, int, int]] = []
         for operation in plan.cache:
-            self.submit(operation)
-        self.flush()
+            if isinstance(operation, Cache.WriteBackOp):
+                self._append_transfers(
+                    operation.op_ids,
+                    operation.group_ids,
+                    operation.src_pages,
+                    operation.dst_pages,
+                    collected_op_ids=write_op_ids,
+                    transfers=write_transfers,
+                    source_is_device=True,
+                )
+            elif isinstance(operation, Cache.LoadBackOp):
+                self._append_transfers(
+                    operation.op_ids,
+                    operation.group_ids,
+                    operation.src_pages,
+                    operation.dst_pages,
+                    collected_op_ids=load_op_ids,
+                    transfers=load_transfers,
+                    source_is_device=False,
+                )
+            else:
+                raise TypeError(f"unsupported cache op {type(operation).__name__}")
 
-    def submit(self, operation) -> None:
-        if isinstance(operation, Cache.WriteBackOp):
-            self._submit(
-                operation.op_ids,
-                operation.group_ids,
-                operation.src_pages,
-                operation.dst_pages,
-                pending_op_ids=self._pending_write_op_ids,
-                pending_transfers=self._pending_write_transfers,
-                source_is_device=True,
-            )
-        elif isinstance(operation, Cache.LoadBackOp):
-            self._submit(
-                operation.op_ids,
-                operation.group_ids,
-                operation.src_pages,
-                operation.dst_pages,
-                pending_op_ids=self._pending_load_op_ids,
-                pending_transfers=self._pending_load_transfers,
-                source_is_device=False,
-            )
-        else:
-            raise TypeError(f"unsupported cache op {type(operation).__name__}")
+        load_index = self._start_loading(load_op_ids, load_transfers)
+        for tracker, _ in self._load_trackers:
+            tracker.set_consumers(load_index if load_index is not None else -1)
+        self._start_writing(write_op_ids, write_transfers)
 
     @staticmethod
-    def _submit(
-        op_ids: Sequence[int],
+    def _append_transfers(
+        operation_ids: Sequence[int],
         group_ids: Sequence[Sequence[int]],
         src_blocks: Sequence[Sequence[int]],
         dst_blocks: Sequence[Sequence[int]],
         *,
-        pending_op_ids: list[int],
-        pending_transfers: list[tuple[int, int, int]],
+        collected_op_ids: list[int],
+        transfers: list[tuple[int, int, int]],
         source_is_device: bool,
     ) -> None:
-        if not (len(op_ids) == len(group_ids) == len(src_blocks) == len(dst_blocks)):
+        if not (
+            len(operation_ids) == len(group_ids) == len(src_blocks) == len(dst_blocks)
+        ):
             raise ValueError("ragged cache operation batch")
         for op_id, groups, sources, destinations in zip(
-            op_ids, group_ids, src_blocks, dst_blocks
+            operation_ids, group_ids, src_blocks, dst_blocks
         ):
             if not (len(groups) == len(sources) == len(destinations)):
                 raise ValueError(f"ragged cache operation {op_id}")
-            pending_op_ids.append(int(op_id))
+            collected_op_ids.append(int(op_id))
             for group, source, destination in zip(groups, sources, destinations):
                 device_block_id, host_block_id = (
                     (source, destination) if source_is_device else (destination, source)
                 )
-                pending_transfers.append(
-                    (int(group), int(device_block_id), int(host_block_id))
-                )
+                transfers.append((int(group), int(device_block_id), int(host_block_id)))
 
     def _transfer_ranges(
         self,
@@ -241,23 +237,20 @@ class L2CacheExecutor:
                 )
         return ranges
 
-    def flush(self) -> None:
-        self._start_loading()
-        self._start_writing()
-
-    def _start_writing(self) -> None:
-        if not self._pending_write_op_ids:
+    def _start_writing(
+        self,
+        op_ids: Sequence[int],
+        transfers: Sequence[tuple[int, int, int]],
+    ) -> None:
+        if not op_ids:
             return
-        op_ids = _ordered_unique(self._pending_write_op_ids)
-        transfers = self._pending_write_transfers
-        self._pending_write_op_ids = []
-        self._pending_write_transfers = []
+        op_ids = _ordered_unique(op_ids)
         if not transfers:
-            self._immediate_write_op_ids.extend(op_ids)
+            self._ready_write_op_ids.extend(op_ids)
             return
         # Retraction is issued only after the scheduler has consumed every
         # outstanding forward result. Still order this stream explicitly after
-        # current-stream work before reading the Device snapshot.
+        # current-stream work before reading the Device cache state.
         start = torch.cuda.Event()
         start.record()
         start.wait(self.write_stream)
@@ -270,25 +263,26 @@ class L2CacheExecutor:
         )
         finish = torch.cuda.Event()
         finish.record(self.write_stream)
-        self.ack_write_queue.append(_Ack(finish, op_ids))
+        self._write_acks.append(_Ack(finish, op_ids))
 
-    def _start_loading(self) -> None:
-        if not self._pending_load_op_ids:
-            return
+    def _start_loading(
+        self,
+        op_ids: Sequence[int],
+        transfers: Sequence[tuple[int, int, int]],
+    ) -> int | None:
+        if not op_ids:
+            return None
         if get_is_capture_mode():
             raise RuntimeError("Host cache load must run outside CUDA Graph capture")
-        op_ids = _ordered_unique(self._pending_load_op_ids)
-        transfers = self._pending_load_transfers
-        self._pending_load_op_ids = []
-        self._pending_load_transfers = []
+        op_ids = _ordered_unique(op_ids)
         if not transfers:
-            self._immediate_load_op_ids.extend(op_ids)
-            return
+            self._ready_load_op_ids.extend(op_ids)
+            return None
 
         # EventLoop zeroes freshly allocated Device blocks before submitting the
         # load. Recording the start event here makes every layer-wise H2D
         # copy wait for that zeroing; the per-layer load events then keep model
-        # consumers from reading a partially restored snapshot.
+        # consumers from reading partially restored cache state.
         load_index = None
         consumer_offset = 0
         finish = None
@@ -316,23 +310,16 @@ class L2CacheExecutor:
             consumer_offset += consumer_count
         if load_index is None or finish is None:
             raise RuntimeError("cache transfer layout has no layer consumers")
-        self.ack_load_queue.append(_Ack(finish, op_ids))
-        for op_id in op_ids:
-            self._load_index_by_op_id[op_id] = load_index
-        while len(self._load_index_by_op_id) > self._load_index_history_limit:
-            self._load_index_by_op_id.popitem(last=False)
+        self._load_acks.append(_Ack(finish, op_ids))
+        return load_index
 
     def poll_results(self) -> list:
-        results = [self._write_done(op_id) for op_id in self._immediate_write_op_ids]
-        self._immediate_write_op_ids.clear()
-        results.extend(self._load_done(op_id) for op_id in self._immediate_load_op_ids)
-        self._immediate_load_op_ids.clear()
-        self.ack_write_queue[:] = self._drain(
-            self.ack_write_queue, self._write_done, results
-        )
-        self.ack_load_queue[:] = self._drain(
-            self.ack_load_queue, self._load_done, results
-        )
+        results = [self._write_done(op_id) for op_id in self._ready_write_op_ids]
+        self._ready_write_op_ids.clear()
+        results.extend(self._load_done(op_id) for op_id in self._ready_load_op_ids)
+        self._ready_load_op_ids.clear()
+        self._write_acks[:] = self._drain(self._write_acks, self._write_done, results)
+        self._load_acks[:] = self._drain(self._load_acks, self._load_done, results)
         return results
 
     @staticmethod
@@ -349,22 +336,13 @@ class L2CacheExecutor:
     def _write_done(op_id: int):
         event = Cache.WriteBackDoneEvent()
         event.op_id = op_id
-        event.success = True
         return event
 
     @staticmethod
     def _load_done(op_id: int):
         event = Cache.LoadBackDoneEvent()
         event.op_id = op_id
-        event.success = True
         return event
-
-    def take_load_index(self, op_id: int):
-        return self._load_index_by_op_id.pop(int(op_id), None)
-
-    def set_consumers(self, load_indices) -> None:
-        for tracker, _ in self._load_trackers:
-            tracker.set_consumers(load_indices)
 
     def shutdown(self) -> None:
         self.write_stream.synchronize()
@@ -372,14 +350,9 @@ class L2CacheExecutor:
 
     def reset(self) -> None:
         self.shutdown()
-        self._pending_write_transfers.clear()
-        self._pending_write_op_ids.clear()
-        self._pending_load_transfers.clear()
-        self._pending_load_op_ids.clear()
-        self.ack_write_queue.clear()
-        self.ack_load_queue.clear()
-        self._immediate_write_op_ids.clear()
-        self._immediate_load_op_ids.clear()
-        self._load_index_by_op_id.clear()
+        self._write_acks.clear()
+        self._load_acks.clear()
+        self._ready_write_op_ids.clear()
+        self._ready_load_op_ids.clear()
         for tracker, _ in self._load_trackers:
             tracker.reset()

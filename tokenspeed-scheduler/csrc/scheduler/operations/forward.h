@@ -33,9 +33,9 @@ namespace tokenspeed {
 
 struct ForwardOperationBase {
     std::string request_id;
-    std::int32_t request_pool_index;
-    std::int32_t input_length;
-    std::int32_t prefill_length;
+    std::int32_t request_pool_index{-1};
+    std::int32_t input_length{0};
+    std::int32_t prefill_length{0};
 
     // Per-group block tables. Rows use absolute logical-page indexing; null
     // holes are page 0 and rows are not compacted.
@@ -45,7 +45,7 @@ struct ForwardOperationBase {
 struct PrefillOperation : public ForwardOperationBase {
     std::vector<std::int32_t> input_ids;
     std::vector<std::int32_t> shifted_input_ids;
-    std::int32_t extend_prefix_len;
+    std::int32_t extend_prefix_len{0};
 };
 
 struct DecodeOperation : public ForwardOperationBase {

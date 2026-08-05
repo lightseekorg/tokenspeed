@@ -45,10 +45,10 @@ class KvCacheManager {
 public:
     // Read-only admission snapshot from one cache-index lookup; owns no block.
     struct CachedBlockMetadata {
-        std::uint64_t last_access_epoch;
-        std::int32_t logical_block_index;
-        CacheBoundaryKind boundary_kind;
-        bool was_acquired;
+        std::uint64_t last_access_epoch{0};
+        std::int32_t logical_block_index{-1};
+        CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
+        bool was_acquired{false};
     };
 
     explicit KvCacheManager(std::int32_t cache_block_tokens, std::int32_t cache_blocks_per_lcm_block = 1,
@@ -238,6 +238,8 @@ public:
         return true;
     }
 
+    // Registers block_ref under key. If key already has a canonical block,
+    // block_ref is replaced with a reference to that block.
     void RegisterCachedBlock(BlockPool& pool, CacheBlockRef& block_ref, const CacheKey& key, std::uint64_t access_epoch,
                              std::int32_t logical_block_index = -1,
                              CacheBoundaryKind boundary_kind = CacheBoundaryKind::kChunk,
@@ -405,7 +407,7 @@ public:
     virtual std::vector<CacheBlockLocation> ReclaimableBlockLocationsAt(const BlockTable& /*table*/,
                                                                         std::int32_t /*num_computed_tokens*/,
                                                                         std::span<const CacheBlockLocation>
-                                                                        /*released_locations*/ = {}) const {
+                                                                        /*released_locations*/) const {
         return {};
     }
 

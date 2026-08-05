@@ -25,7 +25,6 @@
 #include <cstdint>
 #include <deque>
 #include <optional>
-#include <span>
 #include <utility>
 #include <vector>
 
@@ -119,34 +118,6 @@ public:
             }
         }
         return locations;
-    }
-
-    std::int32_t NumParentsFreedBy(std::span<const CacheBlockLocation> locations) const {
-        std::vector<CacheBlockLocation> unique_locations{locations.begin(), locations.end()};
-        std::ranges::sort(unique_locations, [](CacheBlockLocation lhs, CacheBlockLocation rhs) {
-            return lhs.lcm_block_id != rhs.lcm_block_id ? lhs.lcm_block_id < rhs.lcm_block_id
-                                                       : lhs.slot_index < rhs.slot_index;
-        });
-        unique_locations.erase(std::unique(unique_locations.begin(), unique_locations.end()), unique_locations.end());
-
-        std::int32_t freed_parents = 0;
-        for (auto first = unique_locations.begin(); first != unique_locations.end();) {
-            const std::int32_t parent_id = first->lcm_block_id;
-            const auto last = std::find_if(first, unique_locations.end(),
-                                           [parent_id](CacheBlockLocation location) {
-                                               return location.lcm_block_id != parent_id;
-                                           });
-            _assert(std::ranges::all_of(first, last, [this](CacheBlockLocation location) {
-                        return IsOccupied(location);
-                    }),
-                    "released CacheBlock location is not occupied");
-            const auto released_children = static_cast<std::int32_t>(last - first);
-            if (released_children == OccupiedCount(parent_id)) {
-                ++freed_parents;
-            }
-            first = last;
-        }
-        return freed_parents;
     }
 
     void Release(CacheBlockLocation location) noexcept {

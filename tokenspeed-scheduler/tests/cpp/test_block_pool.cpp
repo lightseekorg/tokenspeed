@@ -154,27 +154,6 @@ TEST(BlockPoolLcmPlacementTest, IndependentChildrenShareOneParent) {
     EXPECT_EQ(pool.OccupiedCount(1), 2);
 }
 
-TEST(BlockPoolLcmPlacementTest, ParentIsFreedOnlyWhenAllOccupiedChildrenAreReleased) {
-    BlockPool pool(1);
-    std::vector<CacheBlockRef> blocks =
-        pool.AcquireBlocks(/*group_id=*/3, /*cache_blocks_per_lcm_block=*/4, /*num=*/4);
-    ASSERT_EQ(blocks.size(), 4u);
-
-    const std::vector<CacheBlockLocation> first_snapshot{
-        blocks[0]->Location(),
-        blocks[1]->Location(),
-    };
-    EXPECT_EQ(pool.NumParentsFreedBy(first_snapshot), 0);
-
-    const std::vector<CacheBlockLocation> both_snapshots{
-        blocks[0]->Location(),
-        blocks[1]->Location(),
-        blocks[2]->Location(),
-        blocks[3]->Location(),
-    };
-    EXPECT_EQ(pool.NumParentsFreedBy(both_snapshots), 1);
-}
-
 TEST(BlockPoolLcmPlacementTest, ReleasingOneChildKeepsSiblingAndReusesOnlyItsSlot) {
     BlockPool pool(1);
     CacheBlockRef first = pool.AcquireBlock(/*group_id=*/3, /*cache_blocks_per_lcm_block=*/2);

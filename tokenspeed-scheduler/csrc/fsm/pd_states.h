@@ -20,6 +20,8 @@
 
 #pragma once
 
+#include <cstdint>
+
 #include "core/token_container.h"
 
 namespace tokenspeed {

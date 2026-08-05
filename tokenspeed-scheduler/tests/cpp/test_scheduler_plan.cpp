@@ -20,6 +20,8 @@
 
 #include "integration_test_helper.h"
 
+#include <unordered_set>
+
 namespace tokenspeed::test {
 
 class LoadBackViaCacheTestSuite : public SchedulerTestSuite {
@@ -270,6 +272,73 @@ TEST_F(MultiGroupKvCacheEventTestSuite, PublishesOneEventAfterAllGroupsCacheBoun
     std::vector<KvCacheEvent> events = scheduler_->DrainKvEvents();
     ASSERT_EQ(events.size(), 1u);
     EXPECT_TRUE(std::holds_alternative<KvBlockStoredEvent>(events[0]));
+}
+
+class SubpageKvCacheEventTestSuite : public SchedulerKvCacheEventTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SchedulerKvCacheEventTestSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 4;
+        auto& group = cfg.paged_cache_groups.front();
+        group.rows_per_page = 1;
+        group.total_pages = 2 * cfg.device_allocator.total_pages;
+        group.cache_blocks_per_lcm_block = 2;
+        return cfg;
+    }
+};
+
+TEST_F(SubpageKvCacheEventTestSuite, PublishesOneEventAfterAllChildBlocksCacheBoundary) {
+    const RequestSpec spec = MakeRequestSpec("r1", 1);
+    Submit(spec);
+    PlanOnce();
+    SendForwardDone("r1", {42});
+    PlanOnce();
+    SendFinish("r1");
+
+    std::vector<KvCacheEvent> events = scheduler_->DrainKvEvents();
+    ASSERT_EQ(events.size(), 1u);
+    ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(events[0]));
+    EXPECT_EQ(std::get<KvBlockStoredEvent>(events[0]).token_ids, spec.tokens);
+}
+
+TEST_F(SubpageKvCacheEventTestSuite, PublishesRemovalWhenAnyChildBlockIsEvicted) {
+    Submit(MakeRequestSpec("seed", 2));
+    PlanOnce();
+    SendForwardDone("seed", {42});
+    PlanOnce();
+    SendFinish("seed");
+
+    std::vector<KvCacheEvent> stored = scheduler_->DrainKvEvents();
+    ASSERT_EQ(stored.size(), 2u);
+    const std::uint64_t first_stored_hash = std::get<KvBlockStoredEvent>(stored[0]).block_hashes.front();
+    const std::uint64_t second_stored_hash = std::get<KvBlockStoredEvent>(stored[1]).block_hashes.front();
+
+    Submit(MakeRequestSpec("replacement", 2, 100));
+    PlanOnce();
+
+    std::vector<KvCacheEvent> removed = scheduler_->DrainKvEvents();
+    ASSERT_EQ(removed.size(), 2u);
+    std::unordered_set<std::uint64_t> remaining_hashes{first_stored_hash, second_stored_hash};
+    for (const KvCacheEvent& event : removed) {
+        ASSERT_TRUE(std::holds_alternative<KvBlockRemovedEvent>(event));
+        const auto& removed_hashes = std::get<KvBlockRemovedEvent>(event).block_hashes;
+        ASSERT_EQ(removed_hashes.size(), 1u);
+        EXPECT_EQ(remaining_hashes.erase(removed_hashes[0]), 1u);
+    }
+    EXPECT_TRUE(remaining_hashes.empty());
+}
+
+TEST_F(SchedulerTestSuite, SubmitRequestsRejectsEmptyTokens) {
+    EXPECT_THROW(Submit(RequestSpec{.request_id = "empty"}), std::invalid_argument);
+}
+
+TEST_F(SchedulerTestSuite, SubmitRequestsValidatesWholeBatchBeforeInsertion) {
+    const RequestSpec valid = MakeRequestSpec("valid", 1);
+    RequestSpec invalid = MakeRequestSpec("invalid", 1);
+    invalid.max_new_tokens = -1;
+
+    EXPECT_THROW(Submit(std::vector<RequestSpec>{valid, invalid}), std::invalid_argument);
+    EXPECT_NO_THROW(Submit(valid));
 }
 
 class HybridPrefixPromotionTestSuite : public SchedulerTestSuite {

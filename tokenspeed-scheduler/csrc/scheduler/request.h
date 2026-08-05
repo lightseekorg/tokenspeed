@@ -40,7 +40,7 @@ namespace tokenspeed {
 
 class Request {
 public:
-    Request(const RequestSpec& spec, std::int32_t page_size, Role role, std::int32_t max_snapshot_parents = 0);
+    Request(const RequestSpec& spec, std::int32_t page_size, Role role);
 
     const std::string& Id() const { return id_; }
 
@@ -65,6 +65,8 @@ public:
         return std::holds_alternative<State>(state_);
     }
 
+    void Recover(ReqPoolAllocator* req_pool_allocator, std::vector<BlockTable> device_tables);
+
     std::vector<std::span<const std::int32_t>> FullPagedTokens(bool except_last) const {
         return token_container_.FullPagedTokens(page_size_, except_last);
     }
@@ -72,8 +74,6 @@ public:
     std::int32_t TokenSize() const { return token_container_.Size(); }
     std::int32_t LastToken() const { return token_container_.LastToken(); }
     std::int32_t PrefillSize() const { return token_container_.PrefillSize(); }
-    std::int32_t MaxSnapshotParents() const { return max_snapshot_parents_; }
-
     PrefillInfo CurrentPrefillInfo() const;
 
     std::int32_t UnscheduledPrefillSize() const {
@@ -99,11 +99,11 @@ public:
 
     fsm::CacheProgress CacheProgress() const { return forwardState("CacheProgress").CacheProgressRef(); }
 
-    const fsm::RetractionSnapshot& RetractionSnapshotRef() const {
+    const fsm::Retracted& RetractedState() const {
         if (const auto* state = std::get_if<fsm::Retracted>(&state_)) {
-            return state->snapshot;
+            return *state;
         }
-        throw std::logic_error("Request::RetractionSnapshotRef: expected Retracted; got " + StateName());
+        throw std::logic_error("Request::RetractedState: expected Retracted; got " + StateName());
     }
 
     std::int32_t ReserveNumTokensInNextScheduleEvent() const {
@@ -129,7 +129,6 @@ public:
                               [](const fsm::Decoding&) -> std::string { return "Decoding"; },
                               [](const fsm::Retracting&) -> std::string { return "Retracting"; },
                               [](const fsm::Retracted&) -> std::string { return "Retracted"; },
-                              [](const fsm::Recovering&) -> std::string { return "Recovering"; },
                               [](const fsm::Finished&) -> std::string { return "Finished"; },
                           },
                           state_);
@@ -142,7 +141,6 @@ private:
     std::string id_;
     TokenContainer token_container_;
     std::int32_t page_size_{};
-    std::int32_t max_snapshot_parents_{};
     fsm::State state_;
 };
 

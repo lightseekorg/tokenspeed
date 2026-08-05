@@ -37,6 +37,8 @@ namespace tokenspeed {
 
 struct KvCacheCoordinatorTestAccess;
 
+enum class CacheTier { kDevice, kHost };
+
 // num_common_tokens is in tokens at the one shared CacheBlock granularity P.
 // per_group[i] is group i's PrefixMatch at exactly that length.
 struct CoordinatorMatch {
@@ -51,9 +53,10 @@ public:
     enum class CacheMutation { kStored, kRemoved };
     using CacheMutationSink = std::function<void(const CacheKey&, CacheMutation)>;
 
-    // The host tier is fixed at construction: bound, CacheFullBlocks feeds the sink mailbox.
+    // The Host pool is available to explicit tier operations. Streaming controls
+    // whether ordinary Device prefix publication also feeds the Host tier.
     KvCacheCoordinator(std::vector<CacheGroup> groups, std::int32_t cache_block_tokens, BlockPool& pool,
-                       BlockPool* host_pool = nullptr);
+                       BlockPool* host_pool = nullptr, bool stream_device_cache_to_host = true);
 
     std::int32_t NumGroups() const { return static_cast<std::int32_t>(groups_.size()); }
 
@@ -62,6 +65,7 @@ public:
 
     KvCacheManager& GroupManager(std::int32_t i) { return groups_[static_cast<std::size_t>(i)].Manager(); }
     const KvCacheManager& GroupManager(std::int32_t i) const { return groups_[static_cast<std::size_t>(i)].Manager(); }
+    AttnKind GroupKind(std::int32_t i) const { return groups_[static_cast<std::size_t>(i)].Spec().kind; }
 
     struct PrefixProbe {
         struct Tier {
@@ -98,12 +102,17 @@ public:
     // Decode-side PD reuses local history pages, while final-state groups are
     // restored from the remote endpoint snapshot. Their aligned null holes do
     // not count as cache hits.
-    PrefixProbe ProbeDecodeDestinationPrefix(std::span<const std::string> content_hashes) const;
+    PrefixProbe ProbeDecodeDevicePrefix(std::span<const std::string> content_hashes) const;
+    // Returns without touching Host cache metadata or eviction state when the
+    // complete retraction image cannot be placed.
+    std::optional<CoordinatorMatch> TryAcquireRetractionHostPrefix(
+        std::span<const std::string> content_hashes, std::uint64_t access_epoch,
+        std::span<const BlockTable> device_tables);
     std::optional<AdmissionResult> Admit(PrefixProbe&& prefix, std::span<const GroupDemand> demands,
                                          std::optional<std::uint64_t> request_access_epoch = std::nullopt);
     bool CanAdmitAfterReleasing(
         const PrefixProbe& prefix, std::span<const GroupDemand> demands,
-        std::span<const std::pair<std::uint32_t, CacheBlockLocation>> locations_released_on_ack) const;
+        std::span<const std::pair<std::uint32_t, CacheBlockLocation>> pending_store_releases) const;
 
     std::int32_t NumAvailableLcmBlocks() const;
 
@@ -127,14 +136,17 @@ public:
     };
     std::vector<StoreCandidate> TakePendingStores() { return std::exchange(pending_stores_, {}); }
     CacheBlockRef AcquireDeviceCachedBlock(const CacheKey& key) const;
-    CacheBlockRef AcquireHostBlockForStore(std::uint32_t group_id);
+    CacheBlockRef AcquireHostBlock(std::uint32_t group_id);
     // Collection/pinning follows host-tier presence, so the slide credit flips count_uncached on this.
-    bool HasHostTier() const { return host_pool_ != nullptr; }
+    bool StreamsDeviceCacheToHost() const { return stream_device_cache_to_host_; }
     bool ContainsHostCachedBlock(const CacheKey& key) const;
     bool IsHostCachedBlock(CacheBlockLocation location) const;
     std::int32_t NumHostCachedBlocks() const;
     std::int32_t NumPinnedHostCachedBlocks() const;
     void CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key);
+    void CacheHostCompletedBlocks(std::span<BlockTable> tables, std::span<const std::string> page_hashes,
+                                  std::uint64_t access_epoch, std::int32_t first_new_page,
+                                  std::int32_t num_computed_tokens, CacheBoundaryKind boundary_kind);
 
     // Reports real device-cache entry insertions and removals. The scheduler
     // folds the per-group mutations into one externally visible prefix event.
@@ -150,23 +162,38 @@ private:
 
     std::vector<CacheKey> keysForGroup(std::span<const std::string> content_hashes, std::uint32_t group_id) const;
     std::vector<std::vector<CacheKey>> buildGroupKeys(std::span<const std::string> content_hashes) const;
-    PrefixProbe::Tier probeTierWithKeys(const BlockPool& pool, std::span<const std::vector<CacheKey>> group_keys,
+    template <CacheTier Tier>
+    BlockPool& tierPool();
+    template <CacheTier Tier>
+    const BlockPool& tierPool() const;
+    template <CacheTier Tier>
+    PrefixProbe::Tier probeTierWithKeys(std::span<const std::vector<CacheKey>> group_keys,
                                         std::span<const std::size_t> match_order, std::int32_t num_cache_blocks,
                                         std::int32_t floor_tokens) const;
-    CoordinatorMatch acquireTierWithKeys(BlockPool& pool, std::span<const std::vector<CacheKey>> group_keys,
+    template <CacheTier Tier>
+    CoordinatorMatch acquireTierWithKeys(std::span<const std::vector<CacheKey>> group_keys,
                                          std::int32_t floor_tokens, PrefixProbe::Tier&& probe,
                                          std::uint64_t access_epoch);
     AcquiredPrefix acquirePrefix(PrefixProbe&& probe, std::uint64_t access_epoch);
+    bool canAllocateRetractionHostBlocks(std::span<const std::vector<CacheKey>> group_keys,
+                                         const PrefixProbe::Tier& probe,
+                                         std::span<const BlockTable> device_tables) const;
+    template <CacheTier Tier>
     void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table, std::span<const CacheKey> keys,
                                  std::int32_t first_cache_block, std::uint64_t access_epoch,
                                  CacheBoundaryKind boundary_kind);
-    void cacheCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand, std::uint64_t access_epoch);
+    template <CacheTier Tier>
+    void cacheCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand,
+                                      std::uint64_t access_epoch);
+    void cacheDeviceCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand,
+                                            std::uint64_t access_epoch);
     bool evictCachedBlock(std::uint32_t group_id, CacheBlockLocation location);
     std::vector<CacheGroup> groups_;
     // Closed groups first, so non-closed groups match against a settled bound.
     std::vector<std::size_t> match_order_;
     BlockPool& pool_;
     BlockPool* host_pool_{nullptr};
+    bool stream_device_cache_to_host_{false};
     std::int32_t cache_block_tokens_{0};
     std::uint64_t next_access_epoch_{0};
     std::vector<StoreCandidate> pending_stores_;
@@ -176,6 +203,6 @@ private:
 // One CacheGroup per spec (group_id = index), sharing one scheduler prefix
 // domain P while each manager may use a smaller cache-page token count.
 KvCacheCoordinator MakeCoordinator(std::span<const KvCacheSpec> specs, std::int32_t cache_block_tokens, BlockPool& pool,
-                                   BlockPool* host_pool = nullptr);
+                                   BlockPool* host_pool = nullptr, bool stream_device_cache_to_host = true);
 
 }  // namespace tokenspeed

@@ -107,20 +107,18 @@ protected:
         return FilterByKind<Kind>(ExtractCacheOps(plan));
     }
 
-    void SendWriteBackDone(std::uint32_t op_id, bool success = true) {
+    void SendWriteBackDone(std::uint32_t op_id) {
         ExecutionEvent event;
         event.With(CacheEvent{cache::WriteBackDone{
             .op_id = op_id,
-            .success = success,
         }});
         scheduler_->Advance(std::move(event));
     }
 
-    void SendLoadBackDone(std::uint32_t op_id, bool success = true) {
+    void SendLoadBackDone(std::uint32_t op_id) {
         ExecutionEvent event;
         event.With(CacheEvent{cache::LoadBackDone{
             .op_id = op_id,
-            .success = success,
         }});
         scheduler_->Advance(std::move(event));
     }
