@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.configs.lcm_memory_plan import LcmMemoryPlan
+    from tokenspeed.runtime.layers.attention.kv_cache.plan import CacheMemoryPlan
 
 
 def _positive(name: str, value: int) -> int:
@@ -121,8 +121,8 @@ class CacheTransferLayout:
 
 
 def layout_from_lcm_plan(
-    plan: LcmMemoryPlan,
-    backing: object,
+    plan: CacheMemoryPlan,
+    buffer: object,
     *,
     consumers: tuple[tuple[str, ...], ...],
 ) -> CacheTransferLayout:
@@ -164,7 +164,7 @@ def layout_from_lcm_plan(
     return CacheTransferLayout(
         num_lcm_blocks=plan.num_lcm_blocks,
         groups=tuple(groups),
-        buffers=(backing,),
+        buffers=(buffer,),
         consumers=consumers,
     )
 

@@ -930,13 +930,11 @@ def validate_cache_slab_registrations(
 def build_lcm_pd_cache_contract(
     *,
     plan: object,
-    backing: object,
+    buffer: object,
     group_specs: object,
     field_dtypes: Mapping[str, str],
 ) -> tuple[CachePDLayout, tuple[CachePDSlabRegistration, ...]]:
-    """Describe one LCM arena without copying or flattening its backing."""
-    from tokenspeed.runtime.cache.transfer.layout import layout_from_lcm_plan
-
+    """Describe one LCM arena without copying or flattening its buffer."""
     groups = tuple(getattr(plan, "groups", ()))
     fields = tuple(getattr(plan, "fields", ()))
     planes = tuple(getattr(plan, "planes", ()))
@@ -955,13 +953,8 @@ def build_lcm_pd_cache_contract(
         )
 
     plan_groups = {group.group_id: group for group in groups}
-    transfer_layout = layout_from_lcm_plan(
-        plan,
-        backing,
-        consumers=(tuple(field.field_id for field in fields),),
-    )
-    transfer_groups = {group.group_id: group for group in transfer_layout.groups}
-    pd_groups = []
+    plan_planes = {plane.plane_id: plane for plane in planes}
+    transfer_groups = []
     for spec in specs:
         group = plan_groups[spec.group_id]
         transfer_policy = getattr(spec, "transfer_policy", None)
@@ -969,30 +962,39 @@ def build_lcm_pd_cache_contract(
             raise CachePDProtocolError(
                 f"LCM PD group {spec.group_id!r} requires a transfer policy"
             )
-        transfer_group = transfer_groups.get(spec.group_id)
-        if transfer_group is None or not transfer_group.fields:
+        group_fields = tuple(
+            field for field in fields if field.group_id == spec.group_id
+        )
+        if not group_fields:
             raise CachePDProtocolError(
                 f"LCM PD group {spec.group_id!r} has no planned fields"
             )
-        transfer_segments = tuple(
-            CachePDTransferSegment(
-                physical_slot=field.device_buffer_index,
-                field_id=field.field_id,
-                dtype=field_dtypes[field.field_id],
-                page_zero_offset=field.device_block_zero_offset_bytes,
-                page_stride_bytes=field.block_stride_bytes,
-                payload_bytes=field.payload_bytes,
+        segments = []
+        for field in group_fields:
+            plane = plan_planes[field.plane_id]
+            segments.append(
+                CachePDTransferSegment(
+                    physical_slot=0,
+                    field_id=field.field_id,
+                    dtype=field_dtypes[field.field_id],
+                    page_zero_offset=(
+                        plane.arena_offset_bytes
+                        + plane.bytes_per_lcm_block
+                        - field.page_stride_bytes
+                        + field.field_offset_bytes
+                    ),
+                    page_stride_bytes=field.page_stride_bytes,
+                    payload_bytes=field.payload_bytes,
+                )
             )
-            for field in transfer_group.fields
-        )
-        pd_groups.append(
+        transfer_groups.append(
             CachePDGroup(
                 group_id=spec.group_id,
                 family=spec.family,
                 transfer_policy=transfer_policy,
                 physical_slots=(0,),
                 cache_blocks_per_lcm_block=group.cache_blocks_per_lcm_block,
-                transfer_segments=transfer_segments,
+                transfer_segments=tuple(segments),
             )
         )
 
@@ -1053,26 +1055,26 @@ def build_lcm_pd_cache_contract(
         num_pages_with_null=int(plan.num_lcm_blocks) + 1,
         physical_buffer_ids=("lcm_arena",),
         physical_page_bytes=int(plan.lcm_block_bytes),
-        groups=tuple(pd_groups),
+        groups=tuple(transfer_groups),
     )
 
     if (
-        getattr(backing, "dtype", None) is None
-        or str(backing.dtype) != "torch.uint8"
-        or not backing.is_contiguous()
-        or backing.storage_offset() != 0
-        or backing.data_ptr() != backing.untyped_storage().data_ptr()
-        or int(backing.nbytes) != int(plan.arena_bytes)
+        getattr(buffer, "dtype", None) is None
+        or str(buffer.dtype) != "torch.uint8"
+        or not buffer.is_contiguous()
+        or buffer.storage_offset() != 0
+        or buffer.data_ptr() != buffer.untyped_storage().data_ptr()
+        or int(buffer.nbytes) != int(plan.arena_bytes)
     ):
         raise CachePDProtocolError(
-            "LCM PD backing must be the contiguous uint8 arena owner"
+            "LCM PD buffer must be the contiguous uint8 arena owner"
         )
     registrations = (
         CachePDSlabRegistration(
             physical_slot=0,
             buffer_id="lcm_arena",
-            base_addr=backing.data_ptr(),
-            length=backing.nbytes,
+            base_addr=buffer.data_ptr(),
+            length=buffer.nbytes,
         ),
     )
     return layout, validate_cache_slab_registrations(

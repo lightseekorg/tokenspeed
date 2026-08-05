@@ -32,8 +32,8 @@ import-guarded on missing optional backend packages are skipped.
 from __future__ import annotations
 
 import importlib
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 import pytest
 import tokenspeed_kernel
@@ -102,11 +102,11 @@ from tokenspeed_kernel.ops.moe.flashinfer import trtllm_mxint4 as _moe_trtllm_mx
 from tokenspeed_kernel.ops.moe.flashinfer import trtllm_nvfp4 as _moe_trtllm_nvfp4
 from tokenspeed_kernel.ops.moe.flashinfer import trtllm_unquant as _moe_trtllm_unquant
 from tokenspeed_kernel.ops.moe.gluon import mxfp4 as _moe_gluon_mxfp4
-from tokenspeed_kernel.ops.moe.triton import fp8 as _moe_triton_fp8
+from tokenspeed_kernel.ops.moe.triton import bf16 as _moe_triton_bf16
 from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry
-from tokenspeed_kernel.selection import SelectedKernel
+from tokenspeed_kernel.selection import SelectedKernel, spec_matches_traits
 
 _RELOAD_MODULES = [
     # Attention registration modules.
@@ -150,7 +150,7 @@ _RELOAD_MODULES = [
     _moe_flashinfer,
     _moe_gluon_mxfp4,
     _moe_gluon,
-    _moe_triton_fp8,
+    _moe_triton_bf16,
     _moe_triton_mxfp4,
     _moe_triton,
     _moe_pkg,
@@ -798,6 +798,29 @@ def _attention_decode() -> object:
     )
 
 
+def _attention_mla_decode(
+    batch_size: int,
+    *,
+    override: str | None = None,
+) -> object:
+    q = torch.empty((batch_size, 1, 64, 576), dtype=torch.bfloat16)
+    kv_cache = torch.empty((batch_size, 64, 1, 576), dtype=torch.bfloat16)
+    page_table = torch.arange(batch_size, dtype=torch.int32).view(batch_size, 1)
+    cache_seqlens = torch.full((batch_size,), 64, dtype=torch.int32)
+    return tokenspeed_kernel.mla_decode_with_kvcache(
+        q=q,
+        kv_cache=kv_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_k=64,
+        qk_nope_head_dim=128,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        softmax_scale=1.0,
+        override=override,
+    )
+
+
 def _attention_mla_decode_fp8_k3() -> object:
     q = torch.empty((1, 1, 12, 576), dtype=torch.bfloat16)
     kv_cache = torch.empty((2, 64, 1, 576), dtype=torch.float8_e4m3fn)
@@ -1319,12 +1342,13 @@ def test_deepep_plan_carries_mode_and_low_latency_capacity(b200_platform) -> Non
 
 def test_moe_plan_defaults_deepep_mode_to_auto() -> None:
     plan = tokenspeed_kernel.moe_plan(
-        "fp8",
+        "unquant",
         input_dtype=torch.bfloat16,
         activation="silu",
+        routing_mode="precomputed_topk",
         ep_size=1,
-        ispp=256,
-        fp8_scale_block_shape=(128, 128),
+        ispp=128,
+        solution="triton",
     )
     assert plan["deepep_mode"] == "auto"
     assert plan["deepep_low_latency_max_num_tokens_per_gpu"] is None
@@ -1462,12 +1486,32 @@ def test_gluon_mxfp4_plan_selects_dynamic_apply_on_cdna4(
     assert plan["support_routing"] is True
 
 
+def test_triton_mxfp4_requires_dynamic_activation_quantization(
+    mi350_platform: PlatformInfo,
+) -> None:
+    registry = KernelRegistry.get()
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi350_platform)
+        registry.clear_cache()
+        with pytest.raises(tokenspeed_kernel.NoKernelFoundError, match="traits"):
+            tokenspeed_kernel.moe_plan(
+                "mxfp4",
+                input_dtype=torch.bfloat16,
+                activation="swiglu",
+                routing_mode="precomputed_topk",
+                ispp=128,
+                internal_activation_dtype="input",
+                solution="triton",
+            )
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+
 @pytest.mark.parametrize(
     "ep_size,solution,kernel_name,preprocessor",
     [
-        (1, "triton", "triton_mxfp4_precomputed_moe_apply", "triton_mxfp4_moe_weights"),
-        (2, None, "triton_mxfp4_ep_precomputed_moe_apply", "triton_mxfp4_moe_weights"),
-        (4, None, "triton_mxfp4_ep_precomputed_moe_apply", "triton_mxfp4_moe_weights"),
         (
             8,
             None,
@@ -1895,18 +1939,59 @@ def _moe_apply_mxfp4_triton() -> object:
         "mxfp4",
         input_dtype=torch.bfloat16,
         activation="swiglu",
+        routing_mode="precomputed_topk",
         ispp=128,
-        internal_activation_dtype="fp8",
-        with_bias=True,
+        internal_activation_dtype="mxfp4",
+        with_bias=False,
+        solution="triton",
     )
     _assert_moe_plan(
         plan,
-        apply="triton_mxfp4_moe_apply",
+        apply="triton_mxfp4_precomputed_moe_apply",
         preprocessor="triton_mxfp4_moe_weights",
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
-    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
+    topk_weights = torch.empty((4, 2), dtype=torch.float32)
+    topk_ids = torch.empty((4, 2), dtype=torch.int64)
+    return tokenspeed_kernel.moe_apply(
+        plan,
+        x,
+        torch.nn.Module(),
+        router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    )
+
+
+def _moe_apply_unquant_triton() -> object:
+    plan = tokenspeed_kernel.moe_plan(
+        "unquant",
+        input_dtype=torch.bfloat16,
+        activation="swiglu",
+        routing_mode="precomputed_topk",
+        ispp=128,
+        internal_activation_dtype="input",
+        with_bias=False,
+        solution="triton",
+    )
+    _assert_moe_plan(
+        plan,
+        apply="triton_bf16_precomputed_moe_apply",
+        preprocessor=None,
+    )
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    topk_weights = torch.empty((4, 2), dtype=torch.float32)
+    topk_ids = torch.empty((4, 2), dtype=torch.int64)
+    return tokenspeed_kernel.moe_apply(
+        plan,
+        x,
+        torch.nn.Module(),
+        router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    )
 
 
 def _moe_apply_mxfp4_gluon() -> object:
@@ -1968,108 +2053,6 @@ def _moe_apply_mxfp4_dynamic_tp() -> object:
         x,
         torch.nn.Module(),
         router_logits,
-    )
-
-
-def _moe_apply_fp8_precomputed_tp() -> object:
-    plan = _moe_pkg.moe_plan(
-        "fp8",
-        input_dtype=torch.bfloat16,
-        activation="silu",
-        ep_size=1,
-        fp8_scale_block_shape=(128, 128),
-        solution="triton",
-    )
-    x = torch.empty((4, 16), dtype=torch.bfloat16)
-    router_logits = torch.empty((4, 8), dtype=torch.float32)
-    topk_weights = torch.empty((4, 2), dtype=torch.float32)
-    topk_ids = torch.empty((4, 2), dtype=torch.int64)
-    return tokenspeed_kernel.moe_apply(
-        plan,
-        x,
-        torch.nn.Module(),
-        router_logits,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-    )
-
-
-def _moe_apply_fp8_precomputed_ep() -> object:
-    plan = _moe_pkg.moe_plan(
-        "fp8",
-        input_dtype=torch.bfloat16,
-        activation="silu",
-        ep_size=2,
-        fp8_scale_block_shape=(128, 128),
-        solution="triton",
-    )
-    _assert_moe_plan(
-        plan,
-        apply="triton_fp8_ep_precomputed_moe_apply",
-        preprocessor="triton_fp8_moe_weights",
-    )
-    x = torch.empty((4, 16), dtype=torch.bfloat16)
-    router_logits = torch.empty((4, 8), dtype=torch.float32)
-    topk_weights = torch.empty((4, 2), dtype=torch.float32)
-    topk_ids = torch.empty((4, 2), dtype=torch.int64)
-    return tokenspeed_kernel.moe_apply(
-        plan,
-        x,
-        torch.nn.Module(),
-        router_logits,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-    )
-
-
-def _moe_apply_mxfp4_precomputed_ep() -> object:
-    plan = tokenspeed_kernel.moe_plan(
-        "mxfp4",
-        input_dtype=torch.bfloat16,
-        activation="silu",
-        ep_size=4,
-        internal_activation_dtype="input",
-    )
-    x = torch.empty((4, 16), dtype=torch.bfloat16)
-    router_logits = torch.empty((4, 8), dtype=torch.float32)
-    topk_weights = torch.empty((4, 2), dtype=torch.float32)
-    topk_ids = torch.empty((4, 2), dtype=torch.int64)
-    return tokenspeed_kernel.moe_apply(
-        plan,
-        x,
-        torch.nn.Module(),
-        router_logits,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-    )
-
-
-def test_mxfp4_ep_topk_localization_masks_remote_experts() -> None:
-    w = torch.nn.Module()
-    w.num_experts = 8
-    w.num_local_experts = 2
-    w.ep_rank = 2
-    w.ep_size = 4
-    topk_weights = torch.tensor(
-        [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]],
-        dtype=torch.float32,
-    )
-    topk_ids = torch.tensor([[0, 4, 5], [6, 7, 3]], dtype=torch.int64)
-
-    local_weights, local_ids, num_experts = _moe_triton_mxfp4._local_topk_for_ep(
-        topk_weights,
-        topk_ids,
-        w,
-    )
-
-    assert num_experts == 2
-    torch.testing.assert_close(
-        local_weights,
-        torch.tensor([[0.0, 0.2, 0.3], [0.0, 0.0, 0.0]], dtype=torch.float32),
-    )
-    assert torch.equal(
-        local_ids,
-        torch.tensor([[-1, 0, 1], [-1, -1, -1]], dtype=torch.int64),
     )
 
 
@@ -2548,12 +2531,20 @@ _CASES = [
         _moe_apply_mxint4_trtllm,
     ),
     _case(
-        _is_hopper,
-        "hopper",
+        _is_cdna4,
+        "cdna4",
         "moe",
         "apply",
-        "triton_mxfp4_moe_apply",
+        "triton_mxfp4_precomputed_moe_apply",
         _moe_apply_mxfp4_triton,
+    ),
+    _case(
+        _is_supported_gpu,
+        "supported-gpu",
+        "moe",
+        "apply",
+        "triton_bf16_precomputed_moe_apply",
+        _moe_apply_unquant_triton,
     ),
     _case(
         _is_cdna4,
@@ -2570,30 +2561,6 @@ _CASES = [
         "apply",
         "gluon_mxfp4_dynamic_moe_apply",
         _moe_apply_mxfp4_dynamic_tp,
-    ),
-    _case(
-        _is_cdna4,
-        "cdna4",
-        "moe",
-        "apply",
-        "triton_mxfp4_ep_precomputed_moe_apply",
-        _moe_apply_mxfp4_precomputed_ep,
-    ),
-    _case(
-        _is_cdna4,
-        "cdna4",
-        "moe",
-        "apply",
-        "triton_fp8_ep_precomputed_moe_apply",
-        _moe_apply_fp8_precomputed_tp,
-    ),
-    _case(
-        _is_cdna4,
-        "cdna4",
-        "moe",
-        "apply",
-        "triton_fp8_ep_precomputed_moe_apply",
-        _moe_apply_fp8_precomputed_ep,
     ),
 ]
 
@@ -2772,6 +2739,120 @@ def test_attn_merge_state_routes_to_triton_on_cdna4(
     finally:
         Platform.override(real_platform)
         registry.clear_cache()
+
+
+_GLUON_MLA_FIXED_KERNELS = (
+    "gluon_mla_decode_bf16xbf16_gfx950_bh16bn64",
+    "gluon_mla_decode_bf16xbf16_gfx950_bh64",
+    "gluon_mla_decode_bf16xbf16_gfx950_bh16_multiblock",
+    "gluon_mla_decode_bf16xbf16_gfx950_bh64_small",
+)
+
+
+def _require_gluon_mla_fixed_kernel(name: str):
+    registry = KernelRegistry.get()
+    if registry.get_by_name(_GLUON_MLA_FIXED_KERNELS[0]) is None:
+        pytest.skip("gfx950 Gluon MLA registrations are unavailable")
+    spec = registry.get_by_name(name)
+    assert spec is not None
+    return spec
+
+
+@pytest.mark.parametrize("name", _GLUON_MLA_FIXED_KERNELS)
+def test_gluon_mla_fixed_entrypoints_are_registered(name: str) -> None:
+    _require_gluon_mla_fixed_kernel(name)
+
+
+@pytest.mark.parametrize(
+    "name,expected_batches",
+    [
+        pytest.param(
+            "gluon_mla_decode_bf16xbf16_gfx950_bh16_multiblock",
+            frozenset({1}),
+            id="bh16-multiblock",
+        ),
+        pytest.param(
+            "gluon_mla_decode_bf16xbf16_gfx950_bh64_small",
+            frozenset({2, 4}),
+            id="bh64-small",
+        ),
+    ],
+)
+@pytest.mark.parametrize("batch", [1, 2, 3, 4, 64])
+def test_gluon_mla_small_batch_registrations_have_disjoint_traits(
+    name: str,
+    expected_batches: frozenset[int],
+    batch: int,
+) -> None:
+    spec = _require_gluon_mla_fixed_kernel(name)
+
+    traits = {
+        "batch_size": batch,
+        "batch_size_div_64": batch % 64 == 0,
+        "q_len": 1,
+        "num_q_heads": 64,
+        "page_size": 64,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "support_logit_cap": False,
+        "return_lse": False,
+    }
+    assert spec_matches_traits(spec, traits) is (batch in expected_batches)
+
+
+@pytest.mark.parametrize(
+    "batch,expected",
+    [
+        pytest.param(
+            1,
+            "gluon_mla_decode_bf16xbf16_gfx950_bh16_multiblock",
+            id="b1-bh16-multiblock",
+        ),
+        pytest.param(
+            2,
+            "gluon_mla_decode_bf16xbf16_gfx950_bh64_small",
+            id="b2-bh64-small",
+        ),
+        pytest.param(
+            4,
+            "gluon_mla_decode_bf16xbf16_gfx950_bh64_small",
+            id="b4-bh64-small",
+        ),
+        pytest.param(
+            64,
+            "gluon_mla_decode_bf16xbf16_gfx950_bh64",
+            id="b64-bh64",
+        ),
+    ],
+)
+def test_gluon_mla_fixed_regime_auto_selection(
+    batch: int,
+    expected: str,
+    mi350_platform: PlatformInfo,
+    selected_kernel_spy,
+) -> None:
+    _require_gluon_mla_fixed_kernel(expected)
+    case = _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "mla_decode_with_kvcache",
+        expected,
+        lambda: _attention_mla_decode(batch),
+    )
+    host_platform = Platform.get()
+    active_case, calls = selected_kernel_spy
+    active_case["case"] = case
+    registry = KernelRegistry.get()
+    try:
+        Platform.override(mi350_platform)
+        registry.clear_cache()
+        case.invoke()
+    finally:
+        Platform.override(host_platform)
+        registry.clear_cache()
+
+    assert calls == [expected]
 
 
 _CASE_PLATFORM_PARAMS = [

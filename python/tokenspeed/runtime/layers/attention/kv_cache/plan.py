@@ -26,6 +26,7 @@ import math
 from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
+from itertools import pairwise
 
 # Planner/runtime limits, not model layout inputs.
 _MAX_LCM_BLOCK_BYTES = (1 << 63) - 1
@@ -33,14 +34,14 @@ _MAX_KERNEL_PAGE_ID = (1 << 31) - 1
 
 
 @dataclass(frozen=True)
-class LcmGroupLayout:
+class CacheGroupLayout:
     group_id: str
     cache_blocks_per_lcm_block: int
     page_count: int
 
 
 @dataclass(frozen=True)
-class LcmFieldSpec:
+class CacheFieldSpec:
     group_id: str
     field_id: str
     plane_id: str
@@ -60,14 +61,14 @@ class LcmFieldSpec:
 
 
 @dataclass(frozen=True)
-class LcmPlaneLayout:
+class CachePlaneLayout:
     plane_id: str
     bytes_per_lcm_block: int
     arena_offset_bytes: int
 
 
 @dataclass(frozen=True)
-class LcmFieldLayout:
+class CacheFieldLayout:
     group_id: str
     field_id: str
     plane_id: str
@@ -82,7 +83,62 @@ class LcmFieldLayout:
 
 
 @dataclass(frozen=True)
-class LcmMemoryPlan:
+class CacheLayout:
+    """Capacity-independent byte geometry for one LCM block."""
+
+    logical_block_tokens: int
+    lcm_block_bytes: int
+    group_packing: tuple[tuple[str, int], ...]
+    plane_bytes: tuple[tuple[str, int], ...]
+    fields: tuple[CacheFieldLayout, ...]
+
+    def with_num_lcm_blocks(self, num_lcm_blocks: int) -> CacheMemoryPlan:
+        if (
+            isinstance(num_lcm_blocks, bool)
+            or not isinstance(num_lcm_blocks, int)
+            or num_lcm_blocks < 1
+        ):
+            raise ValueError("num_lcm_blocks must be a positive integer")
+
+        groups = []
+        for group_id, count in self.group_packing:
+            if num_lcm_blocks * count > _MAX_KERNEL_PAGE_ID:
+                raise ValueError(
+                    f"cache group {group_id!r}: kernel page id exceeds "
+                    f"{_MAX_KERNEL_PAGE_ID}"
+                )
+            groups.append(
+                CacheGroupLayout(
+                    group_id=group_id,
+                    cache_blocks_per_lcm_block=count,
+                    page_count=1 + num_lcm_blocks * count,
+                )
+            )
+
+        planes = []
+        arena_offset = 0
+        for plane_id, bytes_per_lcm_block in self.plane_bytes:
+            planes.append(
+                CachePlaneLayout(
+                    plane_id=plane_id,
+                    bytes_per_lcm_block=bytes_per_lcm_block,
+                    arena_offset_bytes=arena_offset,
+                )
+            )
+            arena_offset += (num_lcm_blocks + 1) * bytes_per_lcm_block
+
+        return CacheMemoryPlan(
+            logical_block_tokens=self.logical_block_tokens,
+            lcm_block_bytes=self.lcm_block_bytes,
+            num_lcm_blocks=num_lcm_blocks,
+            groups=tuple(groups),
+            planes=tuple(planes),
+            fields=self.fields,
+        )
+
+
+@dataclass(frozen=True)
+class CacheMemoryPlan:
     """Static byte geometry for one shared physical LCM arena.
 
     ``num_lcm_blocks`` excludes the null parent. ``arena_bytes`` includes it.
@@ -91,27 +147,27 @@ class LcmMemoryPlan:
     logical_block_tokens: int
     lcm_block_bytes: int
     num_lcm_blocks: int
-    groups: tuple[LcmGroupLayout, ...]
-    planes: tuple[LcmPlaneLayout, ...] = ()
-    fields: tuple[LcmFieldLayout, ...] = ()
+    groups: tuple[CacheGroupLayout, ...]
+    planes: tuple[CachePlaneLayout, ...] = ()
+    fields: tuple[CacheFieldLayout, ...] = ()
 
     @property
     def arena_bytes(self) -> int:
         return (self.num_lcm_blocks + 1) * self.lcm_block_bytes
 
-    def group(self, group_id: str) -> LcmGroupLayout:
+    def group(self, group_id: str) -> CacheGroupLayout:
         for group in self.groups:
             if group.group_id == group_id:
                 return group
         raise KeyError(group_id)
 
-    def field(self, field_id: str) -> LcmFieldLayout:
+    def field(self, field_id: str) -> CacheFieldLayout:
         for field in self.fields:
             if field.field_id == field_id:
                 return field
         raise KeyError(field_id)
 
-    def plane(self, plane_id: str) -> LcmPlaneLayout:
+    def plane(self, plane_id: str) -> CachePlaneLayout:
         for plane in self.planes:
             if plane.plane_id == plane_id:
                 return plane
@@ -146,9 +202,7 @@ def _solve_packing(fields):
 
     for plane_id in sorted(exact_by_plane):
         tenants = sorted(exact_by_plane[plane_id].items())
-        for (first_id, first_bytes), (other_id, other_bytes) in zip(
-            tenants, tenants[1:]
-        ):
+        for (first_id, first_bytes), (other_id, other_bytes) in pairwise(tenants):
             first_root, (f_num, f_den) = resolve(first_id)
             other_root, (o_num, o_den) = resolve(other_id)
             if first_root == other_root:
@@ -218,38 +272,17 @@ def _check_exact_page_strides(fields, plane_bytes, packing):
             )
 
 
-def plan_lcm_fields(
+def solve_cache_layout(
     fields,
     *,
     logical_block_tokens,
-    budget_bytes=None,
-    num_lcm_blocks=None,
     cache_blocks_per_lcm_block: Mapping[str, int] | None = None,
     alignment=1,
     max_padding_fraction=0.25,
 ):
-    """Plan a plane-major arena whose fields overlay across cache groups.
-
-    Capacity can be derived from ``budget_bytes`` or fixed by
-    ``num_lcm_blocks``. Explicit per-group packing preserves an existing
-    target arena's parent geometry, as required by a colocated draft cache.
-    """
+    """Solve one capacity-independent, plane-major LCM block layout."""
     if logical_block_tokens <= 0:
         raise ValueError("logical_block_tokens must be > 0")
-    if (budget_bytes is None) == (num_lcm_blocks is None):
-        raise ValueError(
-            "exactly one of budget_bytes and num_lcm_blocks must be provided"
-        )
-    if budget_bytes is not None and (
-        isinstance(budget_bytes, bool) or budget_bytes < 0
-    ):
-        raise ValueError("budget_bytes must be >= 0")
-    if num_lcm_blocks is not None and (
-        isinstance(num_lcm_blocks, bool)
-        or not isinstance(num_lcm_blocks, int)
-        or num_lcm_blocks < 1
-    ):
-        raise ValueError("num_lcm_blocks must be a positive integer")
     if alignment <= 0:
         raise ValueError("alignment must be > 0")
     if max_padding_fraction < 0:
@@ -304,7 +337,7 @@ def plan_lcm_fields(
         if constrained is not None:
             packing.update(constrained)
 
-    plane_fields: dict[str, dict[str, list[LcmFieldSpec]]] = {}
+    plane_fields: dict[str, dict[str, list[CacheFieldSpec]]] = {}
     for field in ordered_fields:
         plane_fields.setdefault(field.plane_id, {}).setdefault(
             field.group_id, []
@@ -420,13 +453,6 @@ def plan_lcm_fields(
             f"LCM block size {lcm_block_bytes} exceeds limit {_MAX_LCM_BLOCK_BYTES}"
         )
 
-    # Parent 0 backs logical null page 0 and is never schedulable.
-    if budget_bytes is not None:
-        num_lcm_blocks = budget_bytes // lcm_block_bytes - 1
-    if num_lcm_blocks < 1:
-        raise ValueError("budget must hold a null parent and one usable LCM block")
-
-    groups = []
     for group_id in ordered_group_ids:
         count = packing[group_id]
         if lcm_block_bytes % count:
@@ -441,30 +467,11 @@ def plan_lcm_fields(
                 f"cache group {group_id!r}: padding fraction "
                 f"{padding_fraction:.6f} exceeds limit {max_padding_fraction:.6f}"
             )
-        if num_lcm_blocks * count > _MAX_KERNEL_PAGE_ID:
-            raise ValueError(
-                f"cache group {group_id!r}: kernel page id exceeds "
-                f"{_MAX_KERNEL_PAGE_ID}"
-            )
-        groups.append(
-            LcmGroupLayout(
-                group_id=group_id,
-                cache_blocks_per_lcm_block=count,
-                page_count=1 + num_lcm_blocks * count,
-            )
-        )
-
-    planes = []
-    arena_offset = 0
-    for plane_id in sorted(plane_bytes):
-        nbytes = plane_bytes[plane_id]
-        planes.append(LcmPlaneLayout(plane_id, nbytes, arena_offset))
-        arena_offset += (num_lcm_blocks + 1) * nbytes
 
     field_layouts = []
     for field in ordered_fields:
         field_layouts.append(
-            LcmFieldLayout(
+            CacheFieldLayout(
                 group_id=field.group_id,
                 field_id=field.field_id,
                 plane_id=field.plane_id,
@@ -476,11 +483,55 @@ def plan_lcm_fields(
             )
         )
 
-    return LcmMemoryPlan(
+    return CacheLayout(
         logical_block_tokens=logical_block_tokens,
         lcm_block_bytes=lcm_block_bytes,
-        num_lcm_blocks=num_lcm_blocks,
-        groups=tuple(groups),
-        planes=tuple(planes),
+        group_packing=tuple(
+            (group_id, packing[group_id]) for group_id in ordered_group_ids
+        ),
+        plane_bytes=tuple(
+            (plane_id, plane_bytes[plane_id]) for plane_id in sorted(plane_bytes)
+        ),
         fields=tuple(field_layouts),
     )
+
+
+def plan_cache_fields(
+    fields,
+    *,
+    logical_block_tokens,
+    budget_bytes=None,
+    num_lcm_blocks=None,
+    cache_blocks_per_lcm_block: Mapping[str, int] | None = None,
+    alignment=1,
+    max_padding_fraction=0.25,
+):
+    """Solve an LCM layout and bind it to the requested cache capacity."""
+    if (budget_bytes is None) == (num_lcm_blocks is None):
+        raise ValueError(
+            "exactly one of budget_bytes and num_lcm_blocks must be provided"
+        )
+    if budget_bytes is not None and (
+        isinstance(budget_bytes, bool) or budget_bytes < 0
+    ):
+        raise ValueError("budget_bytes must be >= 0")
+    if num_lcm_blocks is not None and (
+        isinstance(num_lcm_blocks, bool)
+        or not isinstance(num_lcm_blocks, int)
+        or num_lcm_blocks < 1
+    ):
+        raise ValueError("num_lcm_blocks must be a positive integer")
+
+    layout = solve_cache_layout(
+        fields,
+        logical_block_tokens=logical_block_tokens,
+        cache_blocks_per_lcm_block=cache_blocks_per_lcm_block,
+        alignment=alignment,
+        max_padding_fraction=max_padding_fraction,
+    )
+    if budget_bytes is not None:
+        # Parent 0 backs logical null page 0 and is never schedulable.
+        num_lcm_blocks = budget_bytes // layout.lcm_block_bytes - 1
+        if num_lcm_blocks < 1:
+            raise ValueError("budget must hold a null parent and one usable LCM block")
+    return layout.with_num_lcm_blocks(num_lcm_blocks)

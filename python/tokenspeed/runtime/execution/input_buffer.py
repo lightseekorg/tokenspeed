@@ -124,9 +124,11 @@ class InputBuffers:
         self,
         forward_op,
         runtime_states: RuntimeStates,
-        req_to_page: torch.Tensor,
         total_tokens: int,
+        page_table: torch.Tensor,
     ):
+        # out_cache_loc derives from the per-forward, batch-ordered full-history
+        # table (row i == batch position i) exported by the scheduler.
         batch_size = len(forward_op.request_ids)
         num_extends = forward_op.num_extends()
 
@@ -251,7 +253,7 @@ class InputBuffers:
                 req_pool_indices=req_pool_indices_device,
                 valid_cache_lengths=runtime_states.valid_cache_lengths,
                 uniform_input_length=total_tokens // batch_size,
-                req_to_pages=req_to_page,
+                page_table=page_table,
                 page_size=self.page_size,
             )
             # Decode path's seq_lens / positions / out_cache_loc are done.
@@ -265,10 +267,9 @@ class InputBuffers:
             )
             compute_out_cache_loc(
                 out_cache_loc_ptr=self.out_cache_loc_buf[:total_tokens],
-                req_pool_indices=req_pool_indices_device,
                 input_lengths=input_lengths_device,
                 cache_start=valid_cache_lengths,
-                req_to_pages=req_to_page,
+                page_table=page_table,
                 page_size=self.page_size,
             )
 

@@ -107,8 +107,8 @@ class TRTLLMMHAMetadata:
 class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
     """trtllm_mha attention backend optimized for SM100 (Blackwell)."""
 
-    # Per-group group tables: reads and writes route by layer.group_id, so
-    # slab-aliased pools (e.g. gpt-oss sliding+full pairing) are safe.
+    # Per-group tables route reads and writes by layer.group_id, so fields
+    # sharing a physical plan location (for example GPT-OSS SWA/full) are safe.
     uses_cache_groups: bool = True
     # Graph-buffer column tails pad with the zero-init dummy page, matching
     # the single-table replay contract (gather_page_table_with_padding dummy_slot=0).
@@ -210,16 +210,16 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         bs: int,
-        req_to_page: torch.Tensor,
+        page_table: torch.Tensor,
         page_table_buf: torch.Tensor,
     ) -> torch.Tensor:
-        """Build page table in [bs, max_pages] format from req_to_page.
+        """Build page table in [bs, max_pages] format.
 
-        req_to_page is [req_pool_size+1, max_pages] containing page IDs.
+        ``page_table`` is batch-ordered (row i == batch position i): the
+        drafter's page table, or the idle/warmup placeholder. A live grouped
+        batch resolves per-group tables instead.
         """
-        page_table_buf[:bs].copy_(
-            req_to_page[req_pool_indices[:bs], : self.max_num_pages]
-        )
+        page_table_buf[:bs].copy_(page_table[:bs, : self.max_num_pages])
         return page_table_buf[:bs]
 
     # ------------------------------------------------------------------
@@ -404,7 +404,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
-        req_to_page: torch.Tensor,
+        page_table: torch.Tensor,
         extend_with_prefix: bool = False,
         extend_prefix_lens: torch.Tensor | None = None,
         extend_prefix_lens_cpu: torch.Tensor | None = None,
@@ -446,7 +446,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
                 bs,
                 req_pool_indices,
                 seq_lens,
-                req_to_page,
+                page_table,
                 extend_with_prefix=extend_with_prefix,
                 extend_prefix_lens=extend_prefix_lens,
                 extend_prefix_lens_cpu=extend_prefix_lens_cpu,
@@ -462,7 +462,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
                     bs,
                     req_pool_indices,
                     seq_lens,
-                    req_to_page,
+                    page_table,
                     group_page_tables=group_page_tables,
                     group_out_cache_locs=group_out_cache_locs,
                 )
@@ -472,9 +472,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             # DFLASH draft block (eager): expand to spec_num_tokens single-query
             # rows per request; seq_lens is the block-end length the drafter
             # already wrote.
-            self._init_block_decode_metadata(
-                bs, req_pool_indices, seq_lens, req_to_page
-            )
+            self._init_block_decode_metadata(bs, req_pool_indices, seq_lens, page_table)
             return
 
         if self.spec_num_tokens > 1:
@@ -483,7 +481,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
                 self.spec_num_tokens,
                 req_pool_indices,
                 seq_lens,
-                req_to_page,
+                page_table,
                 group_page_tables=group_page_tables,
                 group_out_cache_locs=group_out_cache_locs,
             )
@@ -493,7 +491,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
                     bs,
                     req_pool_indices,
                     seq_lens,
-                    req_to_page,
+                    page_table,
                     group_page_tables=group_page_tables,
                     group_out_cache_locs=group_out_cache_locs,
                 )
@@ -502,7 +500,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
                 bs,
                 req_pool_indices,
                 seq_lens,
-                req_to_page,
+                page_table,
                 group_page_tables=group_page_tables,
                 group_out_cache_locs=group_out_cache_locs,
             )
@@ -512,7 +510,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        req_to_page: torch.Tensor,
+        page_table: torch.Tensor,
         group_page_tables: dict[str, torch.Tensor] | None = None,
         group_out_cache_locs: dict[str, torch.Tensor] | None = None,
     ):
@@ -532,7 +530,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
                 None
                 if group_page_tables
                 else self._build_page_table(
-                    req_pool_indices, seq_lens, bs, req_to_page, self.page_table_buf
+                    req_pool_indices, seq_lens, bs, page_table, self.page_table_buf
                 )
             ),
             page_tables=group_page_tables,
@@ -544,16 +542,12 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         out: torch.Tensor,
         req_pool_indices: torch.Tensor,
         bs: int,
-        req_to_page: torch.Tensor,
+        page_table: torch.Tensor,
     ) -> None:
-        """Replicate each request's page table to its spec_num_tokens block rows.
-
-        ``out`` is the [bs*spec_num_tokens, max_num_pages] destination. All block
-        rows of a request share its pages (decode only reads KV), so a single
-        broadcast copy suffices.
-        """
+        """Replicate each request's page table to its spec_num_tokens block rows."""
         spec = self.spec_num_tokens
-        base_page_table = req_to_page[req_pool_indices[:bs], : self.max_num_pages]
+        # The drafter's page table is batch-ordered (row i == batch position i).
+        base_page_table = page_table[:bs, : self.max_num_pages]
         out[: bs * spec, :].view(bs, spec, self.max_num_pages).copy_(
             base_page_table[:, None, :]
         )
@@ -563,7 +557,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        req_to_page: torch.Tensor,
+        page_table: torch.Tensor,
     ):
         """Eager DFLASH draft-block metadata: spec_num_tokens single-query rows
         per request, all carrying the block-end seq_len (prefix + spec_num_tokens)
@@ -577,10 +571,12 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         device = seq_lens.device
         expanded_bs = bs * spec
 
-        page_table = torch.empty(
+        expanded_page_table = torch.empty(
             (expanded_bs, self.max_num_pages), dtype=torch.int32, device=device
         )
-        self._replicate_block_page_table(page_table, req_pool_indices, bs, req_to_page)
+        self._replicate_block_page_table(
+            expanded_page_table, req_pool_indices, bs, page_table
+        )
 
         # Clamp the block-end length so the decode never asks for more page-table
         # columns than exist (prefix + spec_num_tokens can exceed max_context_len).
@@ -600,7 +596,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             cu_seqlens_q=torch.arange(
                 0, expanded_bs + 1, dtype=torch.int32, device=device
             ),
-            page_table=page_table,
+            page_table=expanded_page_table,
         )
 
     def _clamped_spec_seqlens(
@@ -630,7 +626,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         spec_num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        req_to_page: torch.Tensor,
+        page_table: torch.Tensor,
         group_page_tables: dict[str, torch.Tensor] | None = None,
         group_out_cache_locs: dict[str, torch.Tensor] | None = None,
     ):
@@ -658,7 +654,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
                 None
                 if group_page_tables
                 else self._build_page_table(
-                    req_pool_indices, seq_lens, bs, req_to_page, self.page_table_buf
+                    req_pool_indices, seq_lens, bs, page_table, self.page_table_buf
                 )
             ),
             page_tables=group_page_tables,
@@ -670,7 +666,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        req_to_page: torch.Tensor,
+        page_table: torch.Tensor,
         extend_with_prefix: bool = False,
         extend_prefix_lens: torch.Tensor | None = None,
         extend_prefix_lens_cpu=None,
@@ -694,7 +690,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             None
             if group_page_tables
             else self._build_page_table(
-                req_pool_indices, seq_lens, bs, req_to_page, self.page_table_buf
+                req_pool_indices, seq_lens, bs, page_table, self.page_table_buf
             )
         )
 
@@ -905,7 +901,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
-        req_to_page: torch.Tensor = None,
+        page_table: torch.Tensor = None,
         block_tables: dict[str, torch.Tensor] | None = None,
         **kwargs,
     ):
@@ -914,19 +910,21 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
                 f"trtllm CUDA graph replay not supported for {forward_mode}"
             )
 
-        # Fail loudly instead of replaying over stale/zero page tables.
-        self._replay_stale_guard(bs, block_tables)
-
         if self.draft_block_decode and self.spec_num_tokens > 1:
             # DFLASH draft block: replicate the page table to each request's
             # block rows. seq_lens are re-derived in-graph, so not touched here.
-            if req_to_page is not None:
+            # The per-group stale guard doesn't apply: block-decode capture
+            # records only cuda_graph_page_table, refilled right here.
+            if page_table is not None:
                 self._replicate_block_page_table(
-                    self.cuda_graph_page_table, req_pool_indices, bs, req_to_page
+                    self.cuda_graph_page_table, req_pool_indices, bs, page_table
                 )
             if bs in self.cuda_graph_decode_metadata:
                 self.forward_decode_metadata = self.cuda_graph_decode_metadata[bs]
             return
+
+        # Fail loudly instead of replaying over stale/zero page tables.
+        self._replay_stale_guard(bs, block_tables)
 
         # Copy the live cache lengths into our own buffer (the plain-decode and
         # draft-decode metadata view cuda_graph_cache_seqlens); the spec>1 verify
@@ -935,11 +933,11 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
 
         # Only page tables need refresh beyond that.
         # Cache-group captures read only the per-group buffers; the single-table single
-        # table would be dead work there (and req_to_page is unpopulated on
+        # table would be dead work there (and page_table is unpopulated on
         # a cache-group scheduler).
-        if not self.cuda_graph_page_tables and req_to_page is not None:
+        if not self.cuda_graph_page_tables and page_table is not None:
             gather_page_table_with_padding(
-                req_to_page=req_to_page,
+                page_table=page_table,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 out=self.cuda_graph_page_table,

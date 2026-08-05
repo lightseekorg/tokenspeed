@@ -406,3 +406,14 @@ def make_manager(term_timeout: float = 10.0) -> ProcessGroupManager:
         flush=True,
     )
     return ProcessGroupManager(runner_id=runner_id, term_timeout=term_timeout)
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=["cleanup-stale"])
+    args = parser.parse_args()
+    if args.command == "cleanup-stale":
+        # Survivors of cancelled/timed-out jobs hold WORK_DIR files open, so rm -rf fails on NFS.
+        make_manager().cleanup_stale()

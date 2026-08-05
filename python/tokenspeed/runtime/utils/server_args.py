@@ -390,7 +390,7 @@ class ServerArgs:
             num_speculative_tokens = config.get("num_speculative_tokens")
             if num_speculative_tokens is not None:
                 num_speculative_tokens = int(num_speculative_tokens)
-                if self.speculative_algorithm == "DFLASH":
+                if self.speculative_algorithm in ("DFLASH", "DSPARK"):
                     if self.speculative_num_draft_tokens is None:
                         self.speculative_num_draft_tokens = num_speculative_tokens
                     self.speculative_num_steps = max(num_speculative_tokens - 1, 0)
@@ -540,12 +540,15 @@ class ServerArgs:
             world_size, attn_tp_size, attn_cp_size, attn_dp_size
         )
 
-        # Dense layers still default to full TP participation when no
-        # dedicated dense_tp_size is provided.
+        # Dense layers default to the attention replica's TP width
+        # (attn_tp_size x attn_cp_size == world_size // attn_dp_size). Without
+        # DP attention this is the full world, unchanged from before; with DP
+        # attention it keeps each dense all-reduce inside one replica (matching
+        # attn) instead of spanning the whole world, which would otherwise cross
+        # nodes and force attn_tp != dense_tp. Pass --dense-tp-size to override.
         dense_tp_size = self.dense_tp_size
         if self.dense_tp_size is None:
-            # dense always do tp now.
-            dense_tp_size = world_size
+            dense_tp_size = attn_tp_size * attn_cp_size
         dense_dp_size = None
 
         # --enable-expert-parallel auto-sets ep_size = world_size
@@ -606,9 +609,7 @@ class ServerArgs:
                     "--disaggregation-mode null (aggregate serving) or prefill"
                 )
             if self.mapping.nnodes != 1:
-                raise ValueError(
-                    "--mm-encoder-tp-mode data currently supports a single node only"
-                )
+                logger.warning("--mm-encoder-tp-mode data on nnodes>1 is experimental")
             if self.mapping.has_attn_cp:
                 raise ValueError(
                     "--mm-encoder-tp-mode data does not currently support "
@@ -645,7 +646,7 @@ class ServerArgs:
         if self.speculative_draft_model_quantization == "unquant":
             self.speculative_draft_model_quantization = None
 
-        if self.speculative_algorithm == "DFLASH":
+        if self.speculative_algorithm in ("DFLASH", "DSPARK"):
             expected_steps = max(int(self.speculative_num_draft_tokens) - 1, 0)
             if self.speculative_num_steps == ServerArgs.speculative_num_steps:
                 self.speculative_num_steps = expected_steps
@@ -1434,10 +1435,13 @@ class ServerArgs:
             type=str,
             choices=["auto", "fla", "flashkda", "cutedsl_kda"],
             default=ServerArgs.kda_backend,
-            help="KDA (Kimi Delta Attention) prefill kernel policy: 'auto' "
-            "picks the fastest available kernel (cutedsl_kda > flashkda > fla); "
-            "'fla' forces the portable FLA scan; 'flashkda' the optional "
-            "FlashKDA library (source build, SM90+); 'cutedsl_kda' the "
+            help="KDA (Kimi Delta Attention) prefill kernel policy. On AMD, "
+            "this setting is ignored and compatible kernels are selected using "
+            "registry priority. On NVIDIA, 'auto' selects the fastest available "
+            "backend "
+            "(cutedsl_kda > flashkda > fla). Named backends are NVIDIA-specific: "
+            "'fla' uses the portable FLA scan, 'flashkda' uses the optional "
+            "FlashKDA library (source build, SM90+), and 'cutedsl_kda' uses the "
             "CuteDSL KDA AOT kernel (prebuilt, sm_103a). Decode is unaffected.",
         )
         parser.add_argument(
@@ -1601,7 +1605,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE3", "MTP", "DFLASH"],
+            choices=["EAGLE3", "MTP", "DFLASH", "DSPARK"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -1846,7 +1850,9 @@ class ServerArgs:
             "--dense-tp-size",
             type=int,
             default=ServerArgs.dense_tp_size,
-            help="Specify tp size for dense part, default equals nprocs-per-node, if non dp_attn && combine_dense mode, this parameter will be overridden by attn_tp_size",
+            help="Specify tp size for dense part. Defaults to the attention "
+            "replica width (attn_tp_size x attn_cp_size): the full world without "
+            "DP attention, one replica with it.",
         )
         parser.add_argument(
             "--moe-tp-size",

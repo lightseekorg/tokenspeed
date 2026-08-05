@@ -47,14 +47,12 @@ std::int32_t AlignPrefillChunk(std::int32_t first_pos, std::int32_t unscheduled,
 }
 
 std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
-    _assert(config.block_size > 0, "cache_block_tokens must be > 0");
+    _assert(config.block_size > 0, "scheduler block_size must be > 0");
     std::vector<KvCacheSpec> specs;
     specs.reserve(config.paged_cache_groups.size());
     for (const PagedCacheGroupConfig& group : config.paged_cache_groups) {
         _assert(group.cache_blocks_per_lcm_block > 0, "cache_blocks_per_lcm_block must be > 0");
-        _assert(group.block_size == 0 || group.block_size == config.block_size,
-                "per-group block_size cannot override the shared cache_block_tokens");
-        const std::int32_t cache_block_tokens = group.RawTokensPerPage();
+        const std::int32_t cache_block_tokens = group.CacheBlockTokens();
         _assert(cache_block_tokens > 0, "cache group must have positive tokens per cache block");
         _assert(config.block_size % cache_block_tokens == 0,
                 "cache group block tokens must divide the scheduler cache block tokens");

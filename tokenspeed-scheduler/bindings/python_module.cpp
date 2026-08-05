@@ -116,7 +116,6 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                                                              rows_per_page,
                                                              entry_stride_tokens,
                                                              total_pages,
-                                                             /*block_size=*/0,
                                                              cache_blocks_per_lcm_block,
                                                              retention,
                                                              sliding_window_tokens,
@@ -132,13 +131,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("rows_per_page", &tokenspeed::PagedCacheGroupConfig::rows_per_page)
         .def_rw("entry_stride_tokens", &tokenspeed::PagedCacheGroupConfig::entry_stride_tokens)
         .def_rw("total_pages", &tokenspeed::PagedCacheGroupConfig::total_pages)
-        .def_rw("block_size", &tokenspeed::PagedCacheGroupConfig::block_size)
         .def_rw("cache_blocks_per_lcm_block", &tokenspeed::PagedCacheGroupConfig::cache_blocks_per_lcm_block)
         .def_rw("retention", &tokenspeed::PagedCacheGroupConfig::retention)
         .def_rw("sliding_window_tokens", &tokenspeed::PagedCacheGroupConfig::sliding_window_tokens)
         .def_rw("family", &tokenspeed::PagedCacheGroupConfig::family)
         .def_rw("transfer_policy", &tokenspeed::PagedCacheGroupConfig::transfer_policy)
-        .def("raw_tokens_per_page", &tokenspeed::PagedCacheGroupConfig::RawTokensPerPage)
         .def("validate", &tokenspeed::PagedCacheGroupConfig::Validate);
 
     scheduler_config.def(nb::init<>())

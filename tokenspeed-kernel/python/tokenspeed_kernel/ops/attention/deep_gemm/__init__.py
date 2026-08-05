@@ -245,12 +245,29 @@ if platform.is_nvidia:
             1,
             index_k_cache.shape[-1],
         )
+        # This DeepGEMM build's paged MQA logits kernel only supports next_n == 1:
+        # for a grouped q ([num_reqs, next_n>1, ...]) it derives num_kv_multicast
+        # from next_n but the schedule_meta was built for multicast 1, tripping an
+        # internal size assertion. So flatten the verify window into per-token
+        # rows -- each spec token becomes its own request row with next_n == 1 --
+        # exactly the layout DeepSeek-V4's indexer uses. The caller builds the
+        # per-token ``seq_lens_2d`` ([tokens, 1]) and matching ``plan`` (so the
+        # plan buffer stays graph-managed by the backend); here we only expand the
+        # per-request block table to per-token. Row order is unchanged (token t =
+        # req t // q_len_per_req), so the downstream top-k and slot mapping, which
+        # read the per-request block_table + seq_lens + q_len_per_req, are untouched.
+        tokens = q.shape[0]
+        logits_block_table = (
+            block_table.repeat_interleave(q_len_per_req, dim=0).contiguous()
+            if q_len_per_req > 1
+            else block_table
+        )
         logits = deep_gemm.fp8_paged_mqa_logits(
-            q_fp8.view(-1, q_len_per_req, q.shape[1], q.shape[-1]),
+            q_fp8.view(tokens, 1, q.shape[1], q.shape[-1]),
             kv_cache,
             scaled_weights,
             seq_lens_2d,
-            block_table,
+            logits_block_table,
             plan,
             max_seq_len,
             clean_logits=False,

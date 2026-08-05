@@ -42,6 +42,8 @@ from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
 )
+from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.utils import should_exclude_quant_module
 from tokenspeed.runtime.layers.vocab_parallel_embedding import ParallelLMHead
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.qwen3_5 import (
@@ -51,6 +53,18 @@ from tokenspeed.runtime.models.qwen3_5 import (
 from tokenspeed.runtime.utils import add_prefix
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_mtp_quant_config(
+    quant_config: QuantizationConfig | None,
+) -> QuantizationConfig | None:
+    # ModelOpt recipes may leave the MTP subtree unquantized even when the
+    # target model is NVFP4. Honor that checkpoint contract during construction.
+    if quant_config is not None and should_exclude_quant_module(
+        "mtp.layers.0", quant_config.exclude_modules
+    ):
+        return None
+    return quant_config
 
 
 class Qwen3_5DraftAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
@@ -164,6 +178,8 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
         self.is_multimodal = hasattr(config, "text_config")
         if self.is_multimodal:
             config = config.text_config
+
+        quant_config = _resolve_mtp_quant_config(quant_config)
 
         self.config = config
         self.mapping = mapping
