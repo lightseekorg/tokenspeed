@@ -32,6 +32,7 @@ __all__ = [
     "add3",
     "fused_gate_sigmoid_mul_add",
     "fused_swiglu_fp8_ue8m0",
+    "fused_swiglu_fp8_ue8m0_masked_packed",
     "sigmoid_mul",
     "silu_and_mul",
     "situ_and_mul",
@@ -510,44 +511,55 @@ def _fused_swiglu_fp8_ue8m0_kernel(
     bit8_min,
     bit8_max,
     GROUP_SIZE: tl.constexpr,
+    PACK: tl.constexpr,
 ):
+    # Each program covers PACK=4 adjacent scale groups of one row: the four
+    # UE8M0 exponents that share one packed int32 are produced together, so
+    # the scale write is a plain store instead of four atomic_or's racing on
+    # the same word.
     pid = tl.program_id(0)
-    groups_per_row = N // GROUP_SIZE
-    row = pid // groups_per_row
-    group_col = pid % groups_per_row
+    groups_per_row: tl.constexpr = N // GROUP_SIZE
+    packs_per_row: tl.constexpr = (groups_per_row + PACK - 1) // PACK
+    row = pid // packs_per_row
+    pack_col = pid % packs_per_row
 
-    gate_offset = (
-        row.to(tl.int64) * gate_up_stride_row + group_col.to(tl.int64) * GROUP_SIZE
+    BLOCK: tl.constexpr = GROUP_SIZE * PACK
+    col0 = pack_col * BLOCK
+    cols = col0 + tl.arange(0, BLOCK)
+    col_mask = cols < N
+
+    gate_base = row.to(tl.int64) * gate_up_stride_row
+    gate = tl.load(gate_up_ptr + gate_base + cols, mask=col_mask, other=0.0).to(
+        tl.float32
     )
-    up_offset = gate_offset + N
-    out_offset = row.to(tl.int64) * out_stride_row + group_col.to(tl.int64) * GROUP_SIZE
-
-    cols = tl.arange(0, GROUP_SIZE)
-
-    gate = tl.load(gate_up_ptr + gate_offset + cols).to(tl.float32)
-    up = tl.load(gate_up_ptr + up_offset + cols).to(tl.float32)
+    up = tl.load(gate_up_ptr + gate_base + N + cols, mask=col_mask, other=0.0).to(
+        tl.float32
+    )
 
     if swiglu_limit > 0.0:
         gate = tl.minimum(gate, swiglu_limit)
         up = tl.clamp(up, -swiglu_limit, swiglu_limit)
 
     silu_gate = gate * tl.sigmoid(swiglu_alpha * gate)
-    y = silu_gate * (up + swiglu_beta)
+    y = tl.reshape(silu_gate * (up + swiglu_beta), (PACK, GROUP_SIZE))
 
-    _absmax = tl.max(tl.abs(y))
+    _absmax = tl.max(tl.abs(y), axis=1)
     scale_raw = tl.maximum(_absmax / bit8_max, eps)
     exponent = tl.ceil(tl.log2(scale_raw))
     y_s = tl.exp2(exponent)
-    y_q = tl.clamp(y / y_s, bit8_min, bit8_max).to(out_ptr.dtype.element_ty)
+    y_q = tl.clamp(y / y_s[:, None], bit8_min, bit8_max).to(out_ptr.dtype.element_ty)
 
-    tl.store(out_ptr + out_offset + cols, y_q)
+    out_base = row.to(tl.int64) * out_stride_row
+    tl.store(out_ptr + out_base + cols, tl.reshape(y_q, (BLOCK,)), mask=col_mask)
 
-    scale_pack_col = group_col // 4
-    scale_pack_pos = group_col % 4
-    scale_ptr_offset = scale_pack_col.to(tl.int64) * scale_col_stride + row.to(tl.int64)
-    exponent_biased = tl.clamp(exponent + 127.0, 0.0, 255.0).to(tl.uint32)
-    packed_scale = exponent_biased << (scale_pack_pos * 8)
-    tl.atomic_or(scale_ptr + scale_ptr_offset, packed_scale, sem="relaxed")
+    group_ids = pack_col * PACK + tl.arange(0, PACK)
+    group_mask = group_ids < groups_per_row
+    exponent_biased = tl.where(
+        group_mask, tl.clamp(exponent + 127.0, 0.0, 255.0), 0.0
+    ).to(tl.uint32)
+    packed_scale = tl.sum(exponent_biased << (tl.arange(0, PACK) * 8))
+    scale_ptr_offset = pack_col.to(tl.int64) * scale_col_stride + row.to(tl.int64)
+    tl.store(scale_ptr + scale_ptr_offset, packed_scale)
 
 
 def fused_swiglu_fp8_ue8m0(
@@ -592,8 +604,10 @@ def fused_swiglu_fp8_ue8m0(
         scale_ue8m0=True,
     )
 
-    num_groups = M * (N // GROUP_SIZE)
-    _fused_swiglu_fp8_ue8m0_kernel[(num_groups,)](
+    PACK = 4
+    packs_per_row = (N // GROUP_SIZE + PACK - 1) // PACK
+    num_programs = M * packs_per_row
+    _fused_swiglu_fp8_ue8m0_kernel[(num_programs,)](
         gate_up,
         out,
         scale,
@@ -609,11 +623,266 @@ def fused_swiglu_fp8_ue8m0(
         bit8_min=info.min,
         bit8_max=info.max,
         GROUP_SIZE=GROUP_SIZE,
-        num_warps=min(max(GROUP_SIZE // 256, 1), 8),
+        PACK=PACK,
+        num_warps=2,
         num_stages=1,
     )
 
     return out, scale
+
+
+@triton.jit
+def _fused_swiglu_fp8_ue8m0_masked_packed_row(
+    gate_up_ptr,
+    out_ptr,
+    scale_ptr,
+    expert,
+    row,
+    pack_col,
+    N: tl.constexpr,
+    gate_up_stride_e,
+    gate_up_stride_m,
+    out_stride_e,
+    out_stride_m,
+    scale_stride_e,
+    scale_stride_m,
+    scale_stride_p,
+    eps,
+    bit8_min,
+    bit8_max,
+    GROUP_SIZE: tl.constexpr,
+    PACK: tl.constexpr,
+):
+    """Process one expert row and one four-scale pack."""
+    groups_per_row: tl.constexpr = N // GROUP_SIZE
+    BLOCK: tl.constexpr = GROUP_SIZE * PACK
+    col0 = pack_col * BLOCK
+    cols = col0 + tl.arange(0, BLOCK)
+    col_mask = cols < N
+    gate_base = (
+        expert.to(tl.int64) * gate_up_stride_e + row.to(tl.int64) * gate_up_stride_m
+    )
+    gate = tl.load(gate_up_ptr + gate_base + cols, mask=col_mask, other=0.0).to(
+        tl.float32
+    )
+    up = tl.load(gate_up_ptr + gate_base + N + cols, mask=col_mask, other=0.0).to(
+        tl.float32
+    )
+
+    y = tl.reshape(gate * tl.sigmoid(gate) * up, (PACK, GROUP_SIZE))
+    _absmax = tl.max(tl.abs(y), axis=1)
+    scale_raw = tl.maximum(_absmax / bit8_max, eps)
+    exponent = tl.ceil(tl.log2(scale_raw))
+    y_s = tl.exp2(exponent)
+    y_q = tl.clamp(y / y_s[:, None], bit8_min, bit8_max).to(out_ptr.dtype.element_ty)
+
+    out_base = expert.to(tl.int64) * out_stride_e + row.to(tl.int64) * out_stride_m
+    tl.store(
+        out_ptr + out_base + cols,
+        tl.reshape(y_q, (BLOCK,)),
+        mask=col_mask,
+    )
+
+    group_ids = pack_col * PACK + tl.arange(0, PACK)
+    group_mask = group_ids < groups_per_row
+    exponent_biased = tl.where(
+        group_mask, tl.clamp(exponent + 127.0, 0.0, 255.0), 0.0
+    ).to(tl.uint32)
+    packed_scale = tl.sum(exponent_biased << (tl.arange(0, PACK) * 8))
+    scale_offset = (
+        expert.to(tl.int64) * scale_stride_e
+        + row.to(tl.int64) * scale_stride_m
+        + pack_col.to(tl.int64) * scale_stride_p
+    )
+    tl.store(scale_ptr + scale_offset, packed_scale)
+
+
+@triton.jit
+def _fused_swiglu_fp8_ue8m0_masked_packed_kernel(
+    gate_up_ptr,
+    out_ptr,
+    scale_ptr,
+    masked_m_ptr,
+    N: tl.constexpr,
+    gate_up_stride_e,
+    gate_up_stride_m,
+    out_stride_e,
+    out_stride_m,
+    scale_stride_e,
+    scale_stride_m,
+    scale_stride_p,
+    eps,
+    bit8_min,
+    bit8_max,
+    GROUP_SIZE: tl.constexpr,
+    PACK: tl.constexpr,
+    ROW_SPLITS: tl.constexpr,
+    USE_ROW_LOOP: tl.constexpr,
+):
+    """Masked SwiGLU quantization writing DeepGEMM's packed scale layout."""
+    pid = tl.program_id(0)
+    expert = tl.program_id(1)
+    groups_per_row: tl.constexpr = N // GROUP_SIZE
+    packs_per_row: tl.constexpr = (groups_per_row + PACK - 1) // PACK
+    valid_rows = tl.load(masked_m_ptr + expert)
+
+    if USE_ROW_LOOP:
+        # Sparse decode: launch a bounded number of row splits per expert and
+        # let each CTA walk only valid rows. This avoids scheduling one CTA for
+        # every row in DeepEP's heavily over-provisioned capacity buffer.
+        pack_col = pid // ROW_SPLITS
+        row = pid % ROW_SPLITS
+        while row < valid_rows:
+            _fused_swiglu_fp8_ue8m0_masked_packed_row(
+                gate_up_ptr,
+                out_ptr,
+                scale_ptr,
+                expert,
+                row,
+                pack_col,
+                N,
+                gate_up_stride_e,
+                gate_up_stride_m,
+                out_stride_e,
+                out_stride_m,
+                scale_stride_e,
+                scale_stride_m,
+                scale_stride_p,
+                eps,
+                bit8_min,
+                bit8_max,
+                GROUP_SIZE,
+                PACK,
+            )
+            row += ROW_SPLITS
+    else:
+        # Dense/full-capacity fallback: retain one CTA per row and pack so full
+        # loads keep the original parallelism and do not serialize row work.
+        row = pid // packs_per_row
+        pack_col = pid % packs_per_row
+        if row >= valid_rows:
+            return
+        _fused_swiglu_fp8_ue8m0_masked_packed_row(
+            gate_up_ptr,
+            out_ptr,
+            scale_ptr,
+            expert,
+            row,
+            pack_col,
+            N,
+            gate_up_stride_e,
+            gate_up_stride_m,
+            out_stride_e,
+            out_stride_m,
+            scale_stride_e,
+            scale_stride_m,
+            scale_stride_p,
+            eps,
+            bit8_min,
+            bit8_max,
+            GROUP_SIZE,
+            PACK,
+        )
+
+
+def _masked_swiglu_row_splits(capacity: int, expected_m: int | None) -> int:
+    """Choose bounded row parallelism without reading device-side masks."""
+    if expected_m is None:
+        return capacity
+    expected_m = int(expected_m)
+    if expected_m <= 0:
+        raise ValueError(f"expected_m must be positive, got {expected_m}")
+
+    # Two-way over-provisioning absorbs ordinary router imbalance. A minimum of
+    # 16 splits protects a hot expert while still shrinking Qwen3.5 EP4's
+    # sparse grid from 65,536 CTAs to 1,024 CTAs.
+    target = max(16, min(expected_m, capacity) * 2)
+    power_of_two = 1 << (target - 1).bit_length()
+    return min(capacity, power_of_two)
+
+
+def fused_swiglu_fp8_ue8m0_masked_packed(
+    gate_up: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused masked SwiGLU and FP8 quantization with packed UE8M0 scales.
+
+    This is the decode-oriented counterpart of
+    :func:`fused_swiglu_fp8_ue8m0`. It writes the packed int32, MN-major,
+    TMA-aligned scale tensor consumed directly by DeepGEMM, avoiding a scale
+    clear followed by separate transpose and pack kernels. Rows beyond each
+    expert's ``masked_m`` are left uninitialized because masked grouped GEMM
+    never reads them.
+
+    Args:
+        gate_up: ``[experts, capacity, 2*N]`` BF16 gate/up activations.
+        masked_m: ``[experts]`` int32 valid-row counts.
+        expected_m: Host-side estimate of valid rows per expert. Sparse launches
+            use it only to choose row parallelism; ``masked_m`` remains the
+            correctness bound. ``None`` retains one CTA per capacity row.
+
+    Returns:
+        A pair ``(out, scales)``. ``out`` has shape
+        ``[experts, capacity, N]`` and FP8 E4M3 dtype. ``scales`` is an int32
+        view of shape ``[experts, capacity, ceil((N / 128) / 4)]`` with
+        MN-major, four-exponents-per-word UE8M0 packing.
+    """
+    assert gate_up.ndim == 3, f"Expected 3D input, got {gate_up.ndim}D"
+    num_experts, capacity, two_N = gate_up.shape
+    assert two_N % 2 == 0
+    N = two_N // 2
+    GROUP_SIZE = 128
+    PACK = 4
+    assert N % GROUP_SIZE == 0, f"N={N} must be a multiple of {GROUP_SIZE}"
+    assert masked_m.shape == (num_experts,)
+    assert masked_m.dtype == torch.int32
+
+    out = torch.empty(
+        (num_experts, capacity, N),
+        dtype=torch.float8_e4m3fn,
+        device=gate_up.device,
+    )
+    groups_per_row = N // GROUP_SIZE
+    packs_per_row = (groups_per_row + PACK - 1) // PACK
+    aligned_capacity = (capacity + 3) // 4 * 4
+    scale_base = torch.empty(
+        (num_experts, packs_per_row, aligned_capacity),
+        dtype=torch.int32,
+        device=gate_up.device,
+    )
+    scales = scale_base.transpose(1, 2)[:, :capacity, :]
+
+    row_splits = _masked_swiglu_row_splits(capacity, expected_m)
+    use_row_loop = row_splits < capacity
+    grid_rows = row_splits if use_row_loop else capacity
+    info = torch.finfo(out.dtype)
+    _fused_swiglu_fp8_ue8m0_masked_packed_kernel[
+        (grid_rows * packs_per_row, num_experts)
+    ](
+        gate_up,
+        out,
+        scales,
+        masked_m,
+        N,
+        gate_up.stride(0),
+        gate_up.stride(1),
+        out.stride(0),
+        out.stride(1),
+        scales.stride(0),
+        scales.stride(1),
+        scales.stride(2),
+        1e-10,
+        bit8_min=info.min,
+        bit8_max=info.max,
+        GROUP_SIZE=GROUP_SIZE,
+        PACK=PACK,
+        ROW_SPLITS=row_splits,
+        USE_ROW_LOOP=use_row_loop,
+        num_warps=2,
+        num_stages=1,
+    )
+    return out, scales
 
 
 @triton.jit

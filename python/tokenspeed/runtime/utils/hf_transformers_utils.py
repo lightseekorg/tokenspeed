@@ -219,9 +219,12 @@ def get_config(
     if os.path.isdir(model):
         model_path = model
     else:
-        model_path = snapshot_download(
-            model, ignore_patterns=["*.pt", "*.safetensors", "*.bin"]
-        )
+        from tokenspeed.runtime.model_loader.weight_utils import get_lock
+
+        with get_lock(model):
+            model_path = snapshot_download(
+                model, ignore_patterns=["*.pt", "*.safetensors", "*.bin"]
+            )
 
     try:
         with open(os.path.join(model_path, "config.json")) as file:
@@ -269,9 +272,17 @@ def get_config(
     if (
         is_draft_worker
         and config.architectures
+        and config.architectures[0].startswith("Qwen3DSparkModel")
+    ):
+        config.architectures[0] = "DSparkDraftModel"
+
+    if (
+        is_draft_worker
+        and config.architectures
         and "NextN" not in config.architectures[0]
         and "Eagle" not in config.architectures[0]
         and "DFlash" not in config.architectures[0]
+        and "DSpark" not in config.architectures[0]
     ):
         if config.architectures[0] == "MiniMaxM2ForCausalLM":
             config.architectures[0] = "LlamaForCausalLMEagle3"
@@ -546,6 +557,16 @@ def get_tokenizer(
         if kwargs.get("use_fast", False):
             raise ValueError("Cannot use the fast tokenizer in slow tokenizer mode.")
         kwargs["use_fast"] = False
+
+    if not os.path.isdir(tokenizer_name):
+        from tokenspeed.runtime.model_loader.weight_utils import get_lock
+
+        with get_lock(tokenizer_name):
+            snapshot_download(
+                tokenizer_name,
+                revision=tokenizer_revision,
+                ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
+            )
 
     fast_tokenizer = None
     if (

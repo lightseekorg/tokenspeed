@@ -27,10 +27,9 @@ from tokenspeed.runtime.cache.utils import (
     get_mla_kv_buffer_triton,
     set_mla_kv_buffer_triton,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
-from tokenspeed.runtime.layers.attention.kv_cache.utils import (
-    copy_all_layer_kv_cache_tiled,
-)
+from tokenspeed.runtime.configs import paged_cache_spec
+from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
+from tokenspeed.runtime.layers.attention.kv_cache.plan import CacheMemoryPlan
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.pdl import pdl_enabled
@@ -47,7 +46,7 @@ def _get_tensor_size_bytes(t: torch.Tensor | list[torch.Tensor]):
     return np.prod(t.shape) * t.dtype.itemsize
 
 
-class MLATokenToKVPool(BaseTokenToKVPool):
+class MLATokenToKVPool(CachePool):
     def __init__(
         self,
         size: int,
@@ -63,11 +62,17 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         max_context_len: int,
         page_size: int,
         rank: int,
-        enable_kv_cache_copy: bool = False,
-        enable_alt_stream: bool = True,
+        *,
+        memory_plan: CacheMemoryPlan,
+        max_scheduled_tokens: int = 0,
     ):
         super().__init__(
-            size, dtype, device, max_batch_size, max_context_len, page_size, rank
+            size,
+            dtype,
+            device,
+            page_size,
+            rank,
+            memory_plan,
         )
         self.model_dtype = model_dtype
         self.quant_method = quant_method
@@ -76,49 +81,38 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.layer_num = layer_num
         self.kv_cache_dim = kv_lora_rank + qk_rope_head_dim
-
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
-        self.page_size_bytes = self._get_page_size_bytes()
 
         self._create_buffers()
 
-        # Calculate data pointers and strides for all buffers
-        all_buffers = []
-        if self.quant_method == "per_token_head":
-            # kv_buffer is a list of tuples (k_lora_cache, k_scale_cache, k_rope_cache)
-            for layer_buffers in self.kv_buffer:
-                # Each layer has 3 tensors
-                all_buffers.extend(layer_buffers)
-        else:
-            # kv_buffer is a list of single tensors
-            all_buffers = [buffer for buffer in self.kv_buffer if buffer is not None]
-
-        self.data_ptrs = torch.tensor(
-            [buf.data_ptr() for buf in all_buffers],
-            dtype=torch.uint64,
-            device=self.device,
+        specs, counts = self._publish_paged_cache_groups(
+            max_live_requests=max_batch_size,
+            max_scheduled_tokens=max_scheduled_tokens,
+            max_total_tokens=size,
+            max_context_len=max_context_len,
         )
-        self.data_strides = torch.tensor(
-            [np.prod(buf.shape[1:]) * buf.dtype.itemsize for buf in all_buffers],
-            device=self.device,
+        self.paged_cache_group_specs = tuple(specs)
+        self.paged_cache_group_page_counts = counts
+
+    def _publish_paged_cache_groups(
+        self,
+        *,
+        max_live_requests: int,
+        max_scheduled_tokens: int,
+        max_total_tokens: int,
+        max_context_len: int,
+    ) -> tuple[list[paged_cache_spec.PagedCacheGroupSpec], dict[str, int]]:
+        return paged_cache_spec.publish_paged_cache_groups(
+            layer_types=(),
+            sliding_window_tokens=None,
+            page_size=self.page_size,
+            max_live_requests=max_live_requests,
+            max_scheduled_tokens=max_scheduled_tokens,
+            max_total_tokens=max_total_tokens,
+            max_context_len=max_context_len,
         )
-
-        self.device_module = torch.get_device_module(self.device)
-        self.alt_stream = (
-            self.device_module.Stream()
-            if torch.cuda.is_available() and enable_alt_stream
-            else None
-        )
-
-        if enable_kv_cache_copy:
-            self._init_kv_copy_and_warmup()
-        else:
-            self._kv_copy_config = None
-
-        self.paged_cache_group_specs = ()
-        self.paged_cache_group_page_counts = {}
 
     def _create_buffers(self) -> None:
         with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
@@ -126,124 +120,25 @@ class MLATokenToKVPool(BaseTokenToKVPool):
             if self.quant_method == "per_token_head":
                 self.kv_buffer = [
                     (
-                        torch.zeros(
-                            (self.size + self.page_size, 1, self.kv_lora_rank),
-                            dtype=self.store_dtype,
-                            device=self.device,
-                        ),
-                        torch.zeros(
-                            (self.size + self.page_size, 1, 1),
-                            dtype=torch.float32,
-                            device=self.device,
-                        ),
-                        torch.zeros(
-                            (self.size + self.page_size, 1, self.qk_rope_head_dim),
-                            dtype=self.model_dtype,
-                            device=self.device,
+                        self.field(
+                            f"layer.{layer_id}.latent_kv", self.store_dtype
+                        ).view(-1, 1, self.kv_lora_rank),
+                        self.field(
+                            f"layer.{layer_id}.latent_scale", torch.float32
+                        ).view(-1, 1, 1),
+                        self.field(f"layer.{layer_id}.rope_k", self.model_dtype).view(
+                            -1, 1, self.qk_rope_head_dim
                         ),
                     )
-                    for _ in range(self.layer_num)
+                    for layer_id in range(self.layer_num)
                 ]
             else:
                 self.kv_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, 1, self.kv_cache_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
+                    self.field(f"layer.{layer_id}.latent_kv", self.store_dtype).view(
+                        -1, 1, self.kv_cache_dim
                     )
-                    for _ in range(self.layer_num)
+                    for layer_id in range(self.layer_num)
                 ]
-
-    def _get_page_size_bytes(self):
-        if self.quant_method == "per_token_head":
-            dim_size_bytes = (
-                self.kv_lora_rank * torch._utils._element_size(self.dtype)
-                + self.qk_rope_head_dim * torch._utils._element_size(self.model_dtype)
-                + 1 * torch._utils._element_size(torch.float32)
-            )
-        else:
-            dim_size_bytes = (
-                self.kv_lora_rank + self.qk_rope_head_dim
-            ) * torch._utils._element_size(self.dtype)
-        return self.page_size * self.layer_num * dim_size_bytes
-
-    def _init_kv_copy_and_warmup(self):
-        # Heuristics for KV copy tiling
-        _KV_COPY_STRIDE_THRESHOLD_LARGE = 8192
-        _KV_COPY_STRIDE_THRESHOLD_MEDIUM = 4096
-        _KV_COPY_TILE_SIZE_LARGE = 512
-        _KV_COPY_TILE_SIZE_MEDIUM = 256
-        _KV_COPY_TILE_SIZE_SMALL = 128
-        _KV_COPY_NUM_WARPS_LARGE_TILE = 8
-        _KV_COPY_NUM_WARPS_SMALL_TILE = 4
-
-        stride_bytes = int(self.data_strides[0].item())
-        if stride_bytes >= _KV_COPY_STRIDE_THRESHOLD_LARGE:
-            bytes_per_tile = _KV_COPY_TILE_SIZE_LARGE
-        elif stride_bytes >= _KV_COPY_STRIDE_THRESHOLD_MEDIUM:
-            bytes_per_tile = _KV_COPY_TILE_SIZE_MEDIUM
-        else:
-            bytes_per_tile = _KV_COPY_TILE_SIZE_SMALL
-
-        self._kv_copy_config = {
-            "bytes_per_tile": bytes_per_tile,
-            "byte_tiles": (stride_bytes + bytes_per_tile - 1) // bytes_per_tile,
-            "num_warps": (
-                _KV_COPY_NUM_WARPS_SMALL_TILE
-                if bytes_per_tile <= _KV_COPY_TILE_SIZE_MEDIUM
-                else _KV_COPY_NUM_WARPS_LARGE_TILE
-            ),
-        }
-
-        dummy_loc = torch.zeros(1, dtype=torch.int32, device=self.device)
-        grid = (self.data_ptrs.numel(), self._kv_copy_config["byte_tiles"])
-
-        copy_all_layer_kv_cache_tiled[grid](
-            self.data_ptrs,
-            self.data_strides,
-            dummy_loc,
-            dummy_loc,
-            1,
-            1,
-            BYTES_PER_TILE=self._kv_copy_config["bytes_per_tile"],
-            num_warps=self._kv_copy_config["num_warps"],
-            num_stages=2,
-        )
-
-    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
-        if self._kv_copy_config is None:
-            # Native implementation for MLA
-            if tgt_loc.numel() == 0:
-                return
-
-            tgt_loc_flat = tgt_loc.view(-1).long()
-            src_loc_flat = src_loc.view(-1).long()
-
-            if self.quant_method == "per_token_head":
-                # kv_buffer is a list of tuples
-                for layer_buffers in self.kv_buffer:
-                    # Each layer has 3 tensors: k_lora_cache, k_scale_cache, k_rope_cache
-                    for buf in layer_buffers:
-                        buf[tgt_loc_flat] = buf[src_loc_flat]
-            else:
-                # kv_buffer is a list of single tensors
-                for buf in self.kv_buffer:
-                    if buf is None:
-                        continue
-                    buf[tgt_loc_flat] = buf[src_loc_flat]
-        else:
-            grid = (self.data_ptrs.numel(), self._kv_copy_config["byte_tiles"])
-            copy_all_layer_kv_cache_tiled[grid](
-                self.data_ptrs,
-                self.data_strides,
-                tgt_loc,
-                src_loc,
-                tgt_loc.numel(),
-                tgt_loc.numel(),
-                BYTES_PER_TILE=self._kv_copy_config["bytes_per_tile"],
-                num_warps=self._kv_copy_config["num_warps"],
-                num_stages=2,
-            )
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "kv_buffer")
@@ -413,48 +308,3 @@ class MLATokenToKVPool(BaseTokenToKVPool):
             kv_buffer, loc, cache_k_nope, cache_k_rope, enable_pdl=pdl_enabled()
         )
         return cache_k_nope, cache_k_rope
-
-    def get_cpu_copy(self, token_indices: list[int]) -> torch.Tensor:
-        torch.cuda.synchronize()
-        kv_cache_cpu = []
-        for layer_id in range(self.layer_num):
-            kv_cache_cpu.append([])
-            for i in range(0, len(token_indices), self.offload_chunk_page_num):
-                chunk_indices = token_indices[i : i + self.offload_chunk_page_num]
-                if self.quant_method == "per_token_head":
-                    kv_cache_cpu[-1].append(
-                        [
-                            buffer[chunk_indices].to("cpu", non_blocking=True)
-                            for buffer in self.kv_buffer[layer_id]
-                        ]
-                    )
-                else:
-                    kv_cpu = self.kv_buffer[layer_id][chunk_indices].to(
-                        "cpu", non_blocking=True
-                    )
-                    kv_cache_cpu[-1].append([kv_cpu])
-        torch.cuda.synchronize()
-        return kv_cache_cpu
-
-    def load_cpu_copy(
-        self, kv_cache_cpu: torch.Tensor, token_indices: list[int]
-    ) -> None:
-        torch.cuda.synchronize()
-        for layer_id in range(self.layer_num):
-            for i in range(0, len(token_indices), self.offload_chunk_page_num):
-                chunk_indices = token_indices[i : i + self.offload_chunk_page_num]
-                if self.quant_method == "per_token_head":
-                    for j in range(3):
-                        t = kv_cache_cpu[layer_id][i // self.offload_chunk_page_num][j]
-                        assert t.shape[0] == len(chunk_indices)
-                        self.kv_buffer[layer_id][j][chunk_indices] = t.to(
-                            self.kv_buffer[0][0].device, non_blocking=True
-                        )
-                else:
-                    kv_cpu = kv_cache_cpu[layer_id][i // self.offload_chunk_page_num][0]
-                    assert kv_cpu.shape[0] == len(
-                        chunk_indices
-                    ), f"kv_cpu.shape[0] {kv_cpu.shape[0]} != len(chunk_indices) {len(chunk_indices)}"
-                    kv_chunk = kv_cpu.to(self.kv_buffer[0].device, non_blocking=True)
-                    self.kv_buffer[layer_id][chunk_indices] = kv_chunk
-        torch.cuda.synchronize()

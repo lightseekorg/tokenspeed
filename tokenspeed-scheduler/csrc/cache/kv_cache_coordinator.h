@@ -21,6 +21,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -47,6 +48,9 @@ struct CoordinatorMatch {
 // state; the request access clock is global, while each request carries its issued epoch.
 class KvCacheCoordinator {
 public:
+    enum class CacheMutation { kStored, kRemoved };
+    using CacheMutationSink = std::function<void(const CacheKey&, CacheMutation)>;
+
     // The host tier is fixed at construction: bound, CacheFullBlocks feeds the sink mailbox.
     KvCacheCoordinator(std::vector<CacheGroup> groups, std::int32_t cache_block_tokens, BlockPool& pool,
                        BlockPool* host_pool = nullptr);
@@ -84,7 +88,7 @@ public:
         std::vector<std::vector<std::int32_t>> new_page_ids;
     };
 
-    // ProbePrefix is read-only. Flat cache state must not change before its
+    // ProbePrefix is read-only. Cache state must not change before its
     // result is passed to Admit. Admit consumes the probe even when admission
     // fails. It returns nullopt before committing when capacity is unavailable.
     // A missing epoch starts a new request; a supplied epoch continues that
@@ -105,8 +109,11 @@ public:
     void CacheFullBlocks(std::span<BlockTable> tables, std::span<const std::string> content_hashes,
                          std::uint64_t access_epoch, std::int32_t first_slot = 0,
                          CacheBoundaryKind boundary_kind = CacheBoundaryKind::kChunk);
+    void CacheCompletedBlocks(std::span<BlockTable> tables, std::span<const std::string> page_hashes,
+                              std::uint64_t access_epoch, std::int32_t first_new_page, std::int32_t num_computed_tokens,
+                              CacheBoundaryKind boundary_kind);
     void ReclaimExpired(std::span<BlockTable> tables, std::int32_t num_computed_tokens);
-    void ConsumeAvailable(std::span<BlockTable> tables, std::int32_t num_tokens);
+    void ConsumeReservedTokens(std::span<BlockTable> tables, std::int32_t num_tokens);
     void Free(std::span<BlockTable> tables);
 
     struct StoreCandidate {
@@ -121,6 +128,10 @@ public:
     std::int32_t NumHostCachedBlocks() const;
     std::int32_t NumPinnedHostCachedBlocks() const;
     void CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key);
+
+    // Reports real device-cache entry insertions and removals. The scheduler
+    // folds the per-group mutations into one externally visible prefix event.
+    void SetCacheMutationSink(CacheMutationSink sink) { cache_mutation_sink_ = std::move(sink); }
 
 private:
     friend struct KvCacheCoordinatorTestAccess;
@@ -139,10 +150,11 @@ private:
                                          std::int32_t floor_tokens, PrefixProbe::Tier&& probe,
                                          std::uint64_t access_epoch);
     AcquiredPrefix acquirePrefix(PrefixProbe&& probe, std::uint64_t access_epoch);
-    void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table,
-                                 std::span<const std::string> content_hashes, std::int32_t first_slot,
-                                 std::uint64_t access_epoch, CacheBoundaryKind boundary_kind);
+    void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table, std::span<const CacheKey> keys,
+                                 std::int32_t first_cache_block, std::uint64_t access_epoch,
+                                 CacheBoundaryKind boundary_kind);
     void cacheCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand, std::uint64_t access_epoch);
+    bool evictCachedBlock(GroupId group_id, CacheBlockLocation location);
     std::vector<CacheGroup> groups_;
     // Closed groups first, so non-closed groups match against a settled bound.
     std::vector<std::size_t> match_order_;
@@ -151,9 +163,11 @@ private:
     std::int32_t cache_block_tokens_{0};
     std::uint64_t next_access_epoch_{0};
     std::vector<StoreCandidate> pending_stores_;
+    CacheMutationSink cache_mutation_sink_;
 };
 
-// One CacheGroup per spec (group_id = index), all sharing cache_block_tokens.
+// One CacheGroup per spec (group_id = index), sharing one scheduler prefix
+// domain P while each manager may use a smaller cache-page token count.
 KvCacheCoordinator MakeCoordinator(std::span<const KvCacheSpec> specs, std::int32_t cache_block_tokens, BlockPool& pool,
                                    BlockPool* host_pool = nullptr);
 

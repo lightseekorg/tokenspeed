@@ -24,10 +24,7 @@ import torch
 from torch import nn
 
 from tokenspeed.runtime.layers.moe.types import MoELayerSpec
-from tokenspeed.runtime.layers.moe.weights.loaders import (
-    make_weight_loader,
-    round_up,
-)
+from tokenspeed.runtime.layers.moe.weights.loaders import make_weight_loader, round_up
 from tokenspeed.runtime.utils import set_weight_attrs
 
 

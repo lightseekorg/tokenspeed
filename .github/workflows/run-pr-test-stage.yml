@@ -1,0 +1,113 @@
+name: Run PR Test Stage
+
+on:
+  workflow_call:
+    inputs:
+      matrix:
+        description: "JSON matrix for this CI stage"
+        required: true
+        type: string
+      install_tokenspeed_mla_from_source:
+        description: "Whether to install the in-tree tokenspeed-mla package"
+        required: true
+        type: string
+      b200_runner_label:
+        description: "Runner family used to resolve b200 task labels"
+        required: false
+        default: ""
+        type: string
+      checkout_ref:
+        description: "Optional commit to check out"
+        required: false
+        default: ""
+        type: string
+      timeout_minutes:
+        description: "Maximum task runtime"
+        required: false
+        default: 60
+        type: number
+    secrets:
+      HF_TOKEN:
+        required: false
+
+env:
+  PIP_BREAK_SYSTEM_PACKAGES: 1
+  CUDA_VERSION: 13.0.1
+  TOKENSPEED_B200_RUNNER_LABEL: ${{ inputs.b200_runner_label }}
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(inputs.matrix) }}
+    name: ${{ matrix.name }} (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    continue-on-error: ${{ matrix.optional }}
+    env:
+      INSTALL_TOKENSPEED_MLA_FROM_SOURCE: ${{ inputs.install_tokenspeed_mla_from_source }}
+      # Authenticate model downloads so cold runners do not hit anonymous
+      # Hugging Face rate limits while starting `ts serve`.
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
+          path: run-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.name }}-${{ matrix.runner }}
+
+      - name: Set work directory
+        run: |
+          echo "WORK_DIR=${{ github.workspace }}/run-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.name }}-${{ matrix.runner }}" >> "$GITHUB_ENV"
+
+      - name: Install pipeline dependency
+        # pypi.org occasionally returns "Content-Type: Unknown" for the simple
+        # index, which strict pip>=22 refuses to parse. Retry a few times.
+        run: |
+          for i in 1 2 3 4 5; do
+            python3 -m pip install pyyaml && exit 0
+            echo "pyyaml install attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
+          exit 1
+
+      - name: Install CI task
+        run: |
+          cd "${{ env.WORK_DIR }}"
+          mkdir -p .ci-artifacts
+          python3 test/ci_system/pipeline.py execute \
+            --config "${{ matrix.config }}" \
+            --runner "${{ matrix.runner }}" \
+            --work-dir "${{ env.WORK_DIR }}" \
+            --print-plan \
+            --only-stage install \
+            --keep-runner-state \
+            --result-json .ci-artifacts/result.json
+
+      - name: Execute CI task
+        run: |
+          cd "${{ env.WORK_DIR }}"
+          mkdir -p .ci-artifacts
+          python3 test/ci_system/pipeline.py execute \
+            --config "${{ matrix.config }}" \
+            --runner "${{ matrix.runner }}" \
+            --work-dir "${{ env.WORK_DIR }}" \
+            --print-plan \
+            --skip-stage install \
+            --reuse-runner-state \
+            --result-json .ci-artifacts/result.json
+
+      - name: Upload task result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-test-${{ matrix.name }}-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.WORK_DIR }}/.ci-artifacts/result.json
+
+      - name: Cleanup work directory
+        if: always()
+        run: |
+          case "${{ matrix.runner }}" in
+            gb200*) python3 "${{ env.WORK_DIR }}/test/ci_system/process_group_manager.py" cleanup-stale || true ;;
+          esac
+          rm -rf "${{ env.WORK_DIR }}"

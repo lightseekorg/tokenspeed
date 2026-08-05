@@ -45,7 +45,7 @@ if platform.is_nvidia:
         per_token_quant_fp8 as _trtllm_per_token_quant_fp8,
     )
 
-    _FP8_DTYPE = platform.fp8e4m3fn.dtype
+    _FP8_DTYPE = torch.float8_e4m3fn
 
     def trtllm_fp8_token_group_128(x: torch.Tensor) -> torch.Tensor:
         qweight, _scale = _trtllm_per_token_group_quant_8bit(x, group_size=128)

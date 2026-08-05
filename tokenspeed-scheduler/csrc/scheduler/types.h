@@ -20,65 +20,18 @@
 
 #pragma once
 
-#include <optional>
-#include <map>
-#include <unordered_map>
-#include <variant>
 #include <cstdint>
-#include <numeric>
-#include <string>
 #include <vector>
-#include <memory>
 
-#include "fsm/forward_events.h"
-#include "resource/allocator/paged_cache_group.h"
-#include "resource/types.h"
-#include "scheduler/operations/inc.h"
+#include "cache/cache_config.h"
+#include "utils.h"
 
 namespace tokenspeed {
-
-class TreeNode;
-
-enum class DisaggregationMode {
-    kNone,
-    kPrefill,
-    kDecode,
-};
-// `PagedCacheGroupFamily` is defined in
-// resource/allocator/paged_cache_group.h (transitively included above).
-
-template <ResourceType>
-class NodeRef;
-using HostNodeRef = NodeRef<ResourceType::Host>;
-using DeviceNodeRef = NodeRef<ResourceType::Device>;
-
-struct SchedulerStats {
-    std::int64_t total_batches = 0;
-    std::int64_t mixed_batches = 0;
-    std::int64_t retract_count = 0;
-    std::int64_t abort_count = 0;
-    std::int64_t schedule_latency_count = 0;
-    std::int64_t schedule_latency_sum_us = 0;
-    std::int64_t schedule_latency_max_us = 0;
-    std::int64_t prefix_cache_hit_tokens = 0;
-    std::int64_t prefix_cache_req_tokens = 0;
-
-    std::int64_t pending_queue_size = 0;
-    std::int64_t plan_queue_size = 0;
-    std::int64_t event_queue_size = 0;
-    std::int64_t active_requests = 0;
-};
-
-// Opt-in spec for the paged-cache prefix-cache adjunct. Unset means paged-cache
-// groups are transport-only (no snapshot chain, no prefix-cache reuse).
-struct PrefixCacheAdjunctSpec {
-    std::vector<std::string> required_groups{};
-};
 
 struct SchedulerConfig {
     std::int32_t block_size{};
     struct {
-        // Flat builds: page 0 is the null placeholder (device convention), so usable = total - 1.
+        // Page 0 is the null placeholder, so usable = total - 1.
         std::int32_t total_pages{};
     } host_allocator;
 
@@ -87,17 +40,13 @@ struct SchedulerConfig {
     } device_allocator;
 
     std::vector<PagedCacheGroupConfig> paged_cache_groups{};
-    std::map<std::string, std::int32_t> paged_cache_host_group_pages{};
 
-    // Streaming-sink (flat L2) enablement: an L2 host tier exists (> 1: page 0 is the null
+    // Streaming-sink enablement: an L2 host tier exists (> 1: page 0 is the null
     // placeholder) and this role writes to it. Orthogonal to disable_prefix_cache by design:
     // that flag gates MATCHING only, the sink gates STORING.
-    bool FlatStreamingSinkEnabled() const {
+    bool StreamingSinkEnabled() const {
         return !disable_l2_cache && host_allocator.total_pages > 1 && role == Role::kFused;
     }
-
-    // Unset means paged-cache groups are transport-only.
-    std::optional<PrefixCacheAdjunctSpec> prefix_cache_adjunct{};
 
     std::int32_t max_scheduled_tokens{};
     std::int32_t max_batch_size{};
@@ -108,22 +57,13 @@ struct SchedulerConfig {
     std::int32_t overlap_schedule_depth{0};
     bool disable_l2_cache{false};
     bool enable_l3_storage{false};
-    std::int32_t prefetch_threshold{4};  // num pages
     bool enable_kv_cache_events{false};
     bool enable_mixed_prefill_decode{false};
 
-    std::int32_t num_pages_reserved_for_retracted_or_running{};
     Role role{Role::kFused};
-    // Explicit opt-in for the Flat KV Prefill/Decode lifecycle. This keeps
-    // legacy non-flat PD and Flat standalone scheduling unchanged.
-    bool enable_flatkv_pd{false};
+    bool enable_pd_cache{false};
 
     bool disable_prefix_cache{false};
-    bool enable_mamba{false};
-    std::int32_t mamba_cache_chunk_size{64};
-    std::int32_t mamba_pool_total_chunks{0};
-    bool enable_mamba_l2{false};
-    std::int32_t mamba_l2_host_slots{0};
 };
 
 }  // namespace tokenspeed

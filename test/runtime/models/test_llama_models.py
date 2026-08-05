@@ -81,6 +81,7 @@ def _serve_server(port: int, extra_args=()) -> subprocess.Popen:
         "0.5",
         "--max-total-tokens",
         "8192",
+        "--disable-kvstore",
     ] + list(extra_args)
     return subprocess.Popen(cmd, env=os.environ.copy())
 

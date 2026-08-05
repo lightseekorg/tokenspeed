@@ -110,7 +110,7 @@ class DistributedConfig:
             moe_ep_size=mapping.moe.ep_size,
             moe_ep_rank=mapping.moe.ep_rank,
             nccl_port=port_args.nccl_port,
-            dist_init_addr=server_args.dist_init_addr,
+            dist_init_addr=port_args.dist_init_addr,
             distributed_timeout_seconds=(
                 server_args.distributed_timeout_seconds
                 if server_args.distributed_timeout_seconds is not None

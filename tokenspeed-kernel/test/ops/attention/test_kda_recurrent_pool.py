@@ -95,7 +95,7 @@ class TestKdaRecurrentPool:
         torch.testing.assert_close(pool_new, pool_ref, atol=1e-4, rtol=1e-4)
 
     def test_dual_index_page_crossing(self):
-        # Read page != write page (flat-KV boundary crossing): the old page
+        # Read page != write page (logical-page boundary crossing): the old page
         # must stay unmodified and the new page must receive the state.
         bs = 3
         q, k, v, g, beta, A_log, dt_bias, cu = _make_inputs(bs, seed=1)

@@ -134,26 +134,6 @@ def test_mark_abort_notify_client_flag():
     assert not client_state.abort_notify_client
 
 
-def test_scheduler_abort_publishes_once_and_releases_request_state():
-    from tokenspeed.runtime.engine.request_types import FINISH_ABORT
-
-    sender = _Sender()
-    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
-    state = _state([1, 2, 3])
-    processor.rid_to_state["r"] = state
-    processor.pending_aborts["r"] = 0.0
-
-    processor.publish_scheduler_abort("r", "paged cache exhausted")
-    processor.publish_scheduler_abort("r", "duplicate")
-
-    assert isinstance(state.finished_reason, FINISH_ABORT)
-    assert state.finished_reason.message == "paged cache exhausted"
-    assert "r" not in processor.rid_to_state
-    assert "r" not in processor.pending_aborts
-    assert len(sender.items) == 1
-    assert sender.items[0].rids == ["r"]
-
-
 def test_nan_flag_finishes_request_with_numerical_error():
     """A request flagged by the NaN guard is finished with
     ABORT_CODE.NumericalError while the rest of the batch continues."""
@@ -175,7 +155,7 @@ def test_nan_flag_finishes_request_with_numerical_error():
 
     # Flagged request: aborted with NumericalError, removed from tracking.
     # The scheduler gets an Abort (NOT Finish) event — AbortEvent skips the
-    # radix-tree insert and host-KV writeback, so corrupted KV is not reused.
+    # single-table-tree insert and host-KV writeback, so corrupted KV is not reused.
     assert isinstance(decode_state.finished_reason, FINISH_ABORT)
     assert decode_state.finished_reason.err_type == ABORT_CODE.NumericalError
     assert "decode" not in processor.rid_to_state
@@ -514,6 +494,7 @@ class _PrefillForwardOp:
     request_ids = ["prefill"]
     request_pool_indices = [3]
     input_lengths = [4]
+    prefill_lengths = [4]
     extend_prefix_lens = [0]
 
     def num_extends(self):
@@ -587,7 +568,31 @@ def test_prefill_first_token_checks_spec_candidate_bootstrap():
         )
 
 
-def test_flat_pd_one_token_request_finishes_at_remote_prefill_done():
+@pytest.mark.parametrize("notify_client", [False, True])
+def test_aborted_prefill_waits_for_pd_transfer_completion(notify_client):
+    sender = _Sender()
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
+    state = _state([1, 2, 3, 4])
+    processor.rid_to_state["prefill"] = state
+    processor.mark_abort("prefill", notify_client=notify_client)
+
+    events = processor.post_process_forward_op(
+        _PrefillForwardOp(),
+        _PrefillExecutionResult(),
+        is_prefill_instance=True,
+        on_first_token=lambda *args: None,
+    )
+
+    assert [type(event).__name__ for event in events] == ["ExtendResult"]
+    assert processor.rid_to_state["prefill"] is state
+    assert sender.items == []
+
+    assert processor.finish_prefill_request("prefill") == []
+    assert "prefill" not in processor.rid_to_state
+    assert len(sender.items) == int(notify_client)
+
+
+def test_pd_one_token_request_finishes_at_remote_prefill_done():
     sender = _Sender()
     processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
     state = _state([1, 2, 3], computed_length=3)
@@ -610,7 +615,7 @@ def test_flat_pd_one_token_request_finishes_at_remote_prefill_done():
     assert output.finished_reasons[0] == {"type": "length", "length": 1}
 
 
-def test_flat_pd_multi_token_request_continues_after_remote_prefill_done():
+def test_pd_multi_token_request_continues_after_remote_prefill_done():
     sender = _Sender()
     processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
     state = _state([1, 2, 3], computed_length=3)

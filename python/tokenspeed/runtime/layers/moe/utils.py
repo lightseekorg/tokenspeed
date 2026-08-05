@@ -25,6 +25,7 @@ from enum import Enum, IntEnum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.execution.context import ForwardContext
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,7 @@ class MoeBackend(Enum):
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
 
+    DEEP_GEMM = "deep_gemm"
     DEEP_GEMM_MEGA_MOE = "deep_gemm_mega_moe"
     MEGA_MOE = "mega_moe"
 
@@ -97,6 +99,9 @@ class MoeBackend(Enum):
     def is_flashinfer_cutedsl(self):
         return self == MoeBackend.FLASHINFER_CUTEDSL
 
+    def is_deep_gemm(self):
+        return self == MoeBackend.DEEP_GEMM
+
     def is_deep_gemm_mega_moe(self):
         return self in (MoeBackend.DEEP_GEMM_MEGA_MOE, MoeBackend.MEGA_MOE)
 
@@ -105,6 +110,11 @@ class MoeBackend(Enum):
 
 
 class DeepEPMode(Enum):
+    """Which DeepEP dispatch/combine legs a deployment may use.
+
+    ``AUTO`` allocates both and lets every forward choose through
+    :func:`use_deepep_low_latency`.
+    """
 
     NORMAL = "normal"
     LOW_LATENCY = "low_latency"
@@ -116,15 +126,6 @@ class DeepEPMode(Enum):
     def enable_low_latency(self) -> bool:
         return self in [DeepEPMode.LOW_LATENCY, DeepEPMode.AUTO]
 
-    def resolve(self, is_extend_in_batch: bool) -> DeepEPMode:
-        if self != DeepEPMode.AUTO:
-            return self
-
-        if is_extend_in_batch:
-            return DeepEPMode.NORMAL
-        else:
-            return DeepEPMode.LOW_LATENCY
-
     def is_normal(self) -> bool:
         return self == DeepEPMode.NORMAL
 
@@ -135,18 +136,55 @@ class DeepEPMode(Enum):
         return self == DeepEPMode.AUTO
 
 
+def use_deepep_low_latency(ctx: ForwardContext, attn_dp_size: int) -> bool:
+    """Whether this forward should take DeepEP's low-latency legs.
+
+    The low-latency dispatch is bounded by a preallocated per-GPU capacity
+    (``--low-latency-max-num-tokens-per-gpu``), so only decode-shaped forwards
+    fit; extend-shaped ones need the normal legs. The two are separate
+    collectives, so every rank of the EP group must reach the same answer.
+
+    Without DP attention the whole EP group forwards one batch, so the local
+    ``forward_mode`` already is that shared answer. With DP attention each rank
+    has its own batch and its own mode, and the only agreed-upon value is the
+    replicated ``all_decode_or_idle`` flag -- so a single extending rank moves
+    the entire group onto the normal legs.
+
+    Args:
+        ctx: Forward context for the current forward.
+        attn_dp_size: Attention data-parallel degree, i.e. whether per-rank
+            forward modes can diverge at all.
+
+    Returns:
+        True for the low-latency legs, False for the normal legs.
+    """
+    # A pinned mode leaves no choice: only AUTO allocates both legs, and a
+    # low_latency-only deployment has no normal buffers to fall back to.
+    mode = get_deepep_mode()
+    if mode is DeepEPMode.LOW_LATENCY:
+        return True
+    if mode is DeepEPMode.NORMAL:
+        return False
+    if attn_dp_size > 1:
+        return ctx.all_decode_or_idle
+    return ctx.forward_mode is not None and ctx.forward_mode.is_decode_or_idle()
+
+
 ALL2ALL_BACKEND: All2AllBackend | None = None
 MOE_BACKEND: MoeBackend | None = None
+DEEPEP_MODE: DeepEPMode | None = None
 DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER: bool | None = None
 
 
 def initialize_moe_config(server_args: ServerArgs):
     global ALL2ALL_BACKEND
     global MOE_BACKEND
+    global DEEPEP_MODE
     global DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
 
     ALL2ALL_BACKEND = All2AllBackend(server_args.all2all_backend)
     MOE_BACKEND = MoeBackend(server_args.moe_backend)
+    DEEPEP_MODE = DeepEPMode(server_args.deepep_mode)
     DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER = (
         server_args.disable_flashinfer_cutlass_moe_fp4_allgather
     )
@@ -166,3 +204,11 @@ def get_moe_backend() -> MoeBackend:
         logger.warning("MOE_BACKEND is not initialized, using auto backend")
         MOE_BACKEND = MoeBackend.AUTO
     return MOE_BACKEND
+
+
+def get_deepep_mode() -> DeepEPMode:
+    global DEEPEP_MODE
+    if DEEPEP_MODE is None:
+        logger.warning("DEEPEP_MODE is not initialized, using auto mode")
+        DEEPEP_MODE = DeepEPMode.AUTO
+    return DEEPEP_MODE

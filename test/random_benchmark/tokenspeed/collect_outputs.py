@@ -52,14 +52,16 @@ def _sort_key(row: dict) -> tuple[int, int]:
     return (INPUT_ORDER.get(config, 0), int(row["Conc."]))
 
 
-def _float(summary: dict, key: str) -> float:
-    value = summary.get(key)
-    if value is None:
-        return 0.0
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return 0.0
+def _float(summary: dict, *keys: str) -> float:
+    for key in keys:
+        value = summary.get(key)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return 0.0
 
 
 def collect(sweep_dir: Path, num_gpus: int):
@@ -74,12 +76,17 @@ def collect(sweep_dir: Path, num_gpus: int):
             print(f"[warn] skip {summary_path}: {exc}", file=sys.stderr)
             continue
 
-        tpot_ms = _float(summary, "TPOT (ms)")
+        # EvalScope 1.10 renamed these summary fields. Accept both spellings so
+        # an unpinned CI dependency cannot silently turn real metrics into 0.
+        tpot_ms = _float(summary, "Avg TPOT (ms)", "TPOT (ms)")
         tps_user = 1000.0 / tpot_ms if tpot_ms else 0.0
         output_tps = _float(summary, "Output Throughput (tok/s)")
         cache_hit = _float(summary, "KV Cache Hit Rate (%)")
-        decoded_per_iter = _float(summary, "Decoded Tok/Iter") or _float(
-            summary, "Avg Decoded Tokens/Iter"
+        decoded_per_iter = _float(
+            summary,
+            "Avg Decoded Tok/Iter",
+            "Decoded Tok/Iter",
+            "Avg Decoded Tokens/Iter",
         )
 
         rows.append(

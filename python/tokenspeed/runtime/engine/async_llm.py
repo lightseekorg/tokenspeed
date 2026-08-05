@@ -206,6 +206,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
 
         # Set after scheduler is initialized
         self.max_req_input_len = None
+        self.max_single_request_tokens = None
 
         self.metrics = RequestMetrics(
             labels={
@@ -526,7 +527,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         if rid not in self.rid_to_state:
             return
         del self.rid_to_state[rid]
-        req = AbortReq(rid)
+        req = AbortReq(rid=rid)
         self.engine_core_client.send_to_scheduler.send_pyobj(req)
 
     # ---- RL weight-transfer admission gate ------------------------------

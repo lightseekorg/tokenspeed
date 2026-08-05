@@ -1,6 +1,7 @@
 api_version: ci.tokenspeed.io/v1
 name: eval-qwen3.5-122b-a10b-nvfp4-ocr-bench
 type: eval
+workflow_stage: model-test
 triggers:
   - per-commit
   - manual
@@ -14,6 +15,7 @@ install:
 server:
   command: >-
     ts serve
+    --disable-kvstore
     --model nvidia/Qwen3.5-122B-A10B-NVFP4
     --tp 1
     --max-model-len 131072

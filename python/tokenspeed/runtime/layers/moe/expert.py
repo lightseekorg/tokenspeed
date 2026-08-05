@@ -19,6 +19,8 @@
 # SOFTWARE.
 
 
+from collections.abc import Callable
+
 import tokenspeed_kernel
 import torch
 
@@ -31,6 +33,7 @@ from tokenspeed.runtime.layers.moe.types import MoELayerSpec
 from tokenspeed.runtime.layers.moe.utils import (
     RoutingMethodType,
     get_all2all_backend,
+    get_deepep_mode,
     get_moe_backend,
 )
 from tokenspeed.runtime.layers.moe.weights import create_layer_weights
@@ -189,7 +192,7 @@ class MoELayer(torch.nn.Module):
             if self.quant_config.is_w4a8_fp8:
                 internal_activation_dtype = "fp8"
             elif getattr(self.quant_config, "use_dynamic_mxfp4_activations", False):
-                internal_activation_dtype = "input"
+                internal_activation_dtype = "mxfp4"
         if self._internal_activation_dtype_override is not None:
             internal_activation_dtype = self._internal_activation_dtype_override
 
@@ -198,12 +201,22 @@ class MoELayer(torch.nn.Module):
             input_dtype = torch.float16
 
         deepep_group = None
+        deepep_mode = None
+        deepep_low_latency_max_num_tokens_per_gpu = None
         if self._spec.use_deepep:
             mapping = global_server_args_dict["mapping"]
             deepep_group = pg_manager.get_process_group(
                 "nccl",
                 mapping.moe.tp_ep_group,
             )
+            deepep_mode = get_deepep_mode().value
+            # Pin the low-latency capacity from the server arg: the DeepEP
+            # buffer is allocated once, on the first forward that dispatches,
+            # so sizing it from that batch would make decode depend on
+            # whichever batch happened to arrive first.
+            deepep_low_latency_max_num_tokens_per_gpu = global_server_args_dict[
+                "low_latency_max_num_tokens_per_gpu"
+            ]
 
         # Moe Backend plan
         moe_backend = get_moe_backend().value
@@ -221,6 +234,10 @@ class MoELayer(torch.nn.Module):
             internal_activation_dtype=internal_activation_dtype,
             with_bias=with_bias,
             deepep_group=deepep_group,
+            deepep_mode=deepep_mode,
+            deepep_low_latency_max_num_tokens_per_gpu=(
+                deepep_low_latency_max_num_tokens_per_gpu
+            ),
             solution=moe_backend,
         )
 
@@ -274,7 +291,25 @@ class MoELayer(torch.nn.Module):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
         do_finalize: bool = True,
+        low_latency: bool | None = None,
+        overlap_fn: Callable[[], None] | None = None,
     ):
+        """Run the planned MoE kernel over this layer's weights.
+
+        Args:
+            hidden_states: ``[tokens, hidden]`` local hidden states.
+            topk_output: Routing result, or the raw logits when the kernel
+                routes itself.
+            num_global_tokens: Token count summed over the attention DP ranks.
+            max_num_tokens_per_gpu: Largest per-GPU token count this forward.
+            do_finalize: Whether the kernel must produce the finalized output.
+            low_latency: For all-to-all EP plans, whether to take the
+                latency-optimized dispatch/combine legs. Must be identical on
+                every rank of the EP group; see
+                ``moe.utils.use_deepep_low_latency``.
+            overlap_fn: Optional work to run inside an all-to-all EP dispatch
+                window; ignored by plans that own no dispatch legs.
+        """
         if not do_finalize and not self.supports_deferred_finalize:
             raise AssertionError("MoELayer does not support do_finalize=False")
 
@@ -288,6 +323,8 @@ class MoELayer(torch.nn.Module):
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
                 do_finalize=do_finalize,
                 enable_pdl=pdl_enabled(),
+                low_latency=low_latency,
+                overlap_fn=overlap_fn,
             )
         else:
             return tokenspeed_kernel.moe_apply(
@@ -301,4 +338,6 @@ class MoELayer(torch.nn.Module):
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
                 do_finalize=do_finalize,
                 enable_pdl=pdl_enabled(),
+                low_latency=low_latency,
+                overlap_fn=overlap_fn,
             )

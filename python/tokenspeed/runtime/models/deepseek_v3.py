@@ -731,14 +731,27 @@ class DeepseekV3AttentionMLA(nn.Module):
                 input_num_tokens=num_prefill_tokens,
                 forward_mode=ForwardMode.EXTEND,
             )
-            self.forward_normal_chunked(
-                positions[:num_prefill_tokens],
-                q[:num_prefill_tokens],
-                latent_cache[:num_prefill_tokens],
-                prefill_ctx,
-                out_cache_loc[:num_prefill_tokens],
-                attn_output[:num_prefill_tokens],
-            )
+            # Use absorbed attention for cached-prefix extend when supported by
+            # the backend and profitable for this query shape; otherwise use
+            # normal chunked prefill.
+            if getattr(cmeta, "use_absorbed_cached_extend", False):
+                self.forward_absorb(
+                    positions[:num_prefill_tokens],
+                    q[:num_prefill_tokens],
+                    latent_cache[:num_prefill_tokens],
+                    prefill_ctx,
+                    out_cache_loc[:num_prefill_tokens],
+                    attn_output[:num_prefill_tokens],
+                )
+            else:
+                self.forward_normal_chunked(
+                    positions[:num_prefill_tokens],
+                    q[:num_prefill_tokens],
+                    latent_cache[:num_prefill_tokens],
+                    prefill_ctx,
+                    out_cache_loc[:num_prefill_tokens],
+                    attn_output[:num_prefill_tokens],
+                )
 
         if num_decode_tokens > 0:
             decode_ctx = replace(
@@ -787,7 +800,7 @@ class DeepseekV3AttentionMLA(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Model-owned KV writes route their locations through the backend:
         # identity on the legacy path (base AttentionBackend hook), the
-        # group-derived locations on the FlatKV path.
+        # group-derived locations on the Paged cache path.
         out_cache_loc = ctx.attn_backend.select_out_cache_loc(
             self.attn_mqa, out_cache_loc, ctx.forward_mode
         )
@@ -986,7 +999,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         out_cache_loc: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # See forward_absorb_qkv_proj: backend-selected write locations
-        # (identity off the FlatKV path).
+        # (identity off the Paged cache path).
         out_cache_loc = ctx.attn_backend.select_out_cache_loc(
             self.attn_mha, out_cache_loc, ctx.forward_mode
         )
@@ -1006,26 +1019,36 @@ class DeepseekV3AttentionMLA(nn.Module):
 
         # FP8 prefill: fused RoPE + FP8 quantize, direct FP8 KV cache write.
         # Disabled when k_scale != 1.0; mla_fp8_utils.py documents the current limitation.
+        # NoPE models (rotary_emb is None, e.g. Kimi-K3) quantize standalone:
+        # the quantize is otherwise fused into the RoPE kernel, and leaving
+        # them on the BF16 kernel meant a JIT compile of a variant the backend
+        # never pre-warms.
         k_scale = getattr(self.attn_mha, "k_scale_float", 1.0)
         use_fp8_prefill = (
             self.attention_backend in self._MLA_KERNEL_BACKENDS
             and getattr(ctx.attn_backend, "data_type", None) == torch.float8_e4m3fn
-            and self.rotary_emb is not None
             and k_scale == 1.0
         )
 
         if use_fp8_prefill:
-            # Expand k_pe from [tokens,1,rope] to [tokens,heads,rope] for GQA
-            k_pe_expanded = k_pe.expand(-1, self.num_local_heads, -1)
+
+            if self.rotary_emb is not None:
+                k_rope = k_pe.expand(-1, self.num_local_heads, -1)
+                cos_sin_cache = self.rotary_emb.cos_sin_cache
+                is_neox = self.rotary_emb.is_neox_style
+            else:
+                k_rope = k_pe
+                cos_sin_cache = None
+                is_neox = False
 
             q_fp8, k_fp8 = apply_rope_mla(
                 positions=positions,
                 q_rope=q_pe,
-                k_rope=k_pe_expanded,
+                k_rope=k_rope,
                 q_nope=q_nope,
                 k_nope=k_nope,
-                cos_sin_cache=self.rotary_emb.cos_sin_cache,
-                is_neox=getattr(self.rotary_emb, "is_neox_style", True),
+                cos_sin_cache=cos_sin_cache,
+                is_neox=is_neox,
                 quant_scale_q=1.0,
                 quant_scale_kv=k_scale,
                 enable_pdl=pdl_enabled(),

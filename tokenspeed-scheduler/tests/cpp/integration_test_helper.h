@@ -20,7 +20,6 @@
 
 #pragma once
 
-#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -49,8 +48,15 @@ protected:
         cfg.host_allocator.total_pages = 32;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
-        cfg.enable_l3_storage = true;
-        cfg.prefetch_threshold = 2;
+        cfg.enable_l3_storage = false;
+        cfg.paged_cache_groups.push_back(PagedCacheGroupConfig{
+            .group_id = "full_attention",
+            .rows_per_page = cfg.block_size,
+            .entry_stride_tokens = 1,
+            .total_pages = cfg.device_allocator.total_pages,
+            .retention = PagedCacheGroupConfig::Retention::FullHistory,
+            .family = PagedCacheGroupFamily::History,
+        });
         return cfg;
     }
 
@@ -69,65 +75,11 @@ protected:
         };
     }
 
-    RequestSpec MakePrefetchableSpec(const std::string& id, std::int32_t num_pages, std::int32_t storage_hit_pages,
-                                     token_t start = 1) {
-        auto tokens = MakeAlignedTokens(num_pages, PageSize(), start);
-        return RequestSpec{
-            .request_id = id,
-            .tokens = tokens,
-            .rolling_hashes = MakePageHashes(storage_hit_pages, "rh"),
-            .storage_hit_pages = storage_hit_pages,
-        };
-    }
-
     void Submit(const RequestSpec& spec) { scheduler_->SubmitRequests({spec}); }
 
     void Submit(const std::vector<RequestSpec>& specs) { scheduler_->SubmitRequests(specs); }
 
     ExecutionPlan PlanOnce() { return scheduler_->NextExecutionPlan(); }
-
-    static const FlatForwardOperation* GetForward(const std::vector<Operation>& operations) {
-        for (const auto& op : operations) {
-            if (auto* forward = std::get_if<FlatForwardOperation>(&op)) return forward;
-        }
-        return nullptr;
-    }
-
-    static const FlatForwardOperation* GetForward(const ExecutionPlan& plan) { return GetForward(plan.Operations()); }
-
-    template <typename PlanOrOperations>
-    static const FlatForwardOperation* GetForwardOp(const PlanOrOperations& value) {
-        return GetForward(value);
-    }
-
-    template <typename Kind>
-    static const Kind* GetCacheOperation(const ExecutionPlan& plan) {
-        for (const auto& op : plan.Operations()) {
-            if (auto* cache_op = std::get_if<CacheOperation>(&op)) {
-                if (auto* result = std::get_if<Kind>(cache_op)) return result;
-            }
-        }
-        return nullptr;
-    }
-
-    static const FlatWriteBackOperation* GetWriteBack(const ExecutionPlan& plan) {
-        return GetCacheOperation<FlatWriteBackOperation>(plan);
-    }
-
-    static const FlatLoadBackOperation* GetLoadBack(const ExecutionPlan& plan) {
-        return GetCacheOperation<FlatLoadBackOperation>(plan);
-    }
-
-    static bool RequestInFwd(const ExecutionPlan& plan, const std::string& id) {
-        for (const auto& op : plan.Operations()) {
-            if (auto* forward = std::get_if<FlatForwardOperation>(&op);
-                forward != nullptr &&
-                std::find(forward->request_ids.begin(), forward->request_ids.end(), id) != forward->request_ids.end()) {
-                return true;
-            }
-        }
-        return false;
-    }
 
     static std::vector<CacheOperation> ExtractCacheOps(const ExecutionPlan& plan) {
         std::vector<CacheOperation> result;
@@ -193,31 +145,14 @@ protected:
         scheduler_->Advance(std::move(event));
     }
 
-    void SendAbortEvent(const std::string& request_id) {
-        ExecutionEvent event;
-        event.With(ForwardEvent{forward::Abort{.request_id = request_id}});
-        scheduler_->Advance(std::move(event));
-    }
-
-    void SendReserveNumTokens(const std::string& request_id, std::int32_t value) {
-        ExecutionEvent event;
-        event.With(ForwardEvent{forward::UpdateReserveNumTokens{
-            .request_id = request_id,
-            .reserve_num_tokens_in_next_schedule_event = value,
-        }});
-        scheduler_->Advance(std::move(event));
-    }
-
     SchedulerConfig config_{};
     std::unique_ptr<Scheduler> scheduler_;
 };
 
-#if TOKENSPEED_FLAT_KVCACHE
-
-// Returns the first FlatForwardOperation in `plan`, or nullptr if none.
-inline const FlatForwardOperation* FindFlatOp(const ExecutionPlan& plan) {
+// Returns the first ForwardBatch in `plan`, or nullptr if none.
+inline const ForwardBatch* FindForwardBatch(const ExecutionPlan& plan) {
     for (const auto& op : plan.Operations()) {
-        if (const auto* flat = std::get_if<FlatForwardOperation>(&op)) return flat;
+        if (const auto* batch = std::get_if<ForwardBatch>(&op)) return batch;
     }
     return nullptr;
 }
@@ -247,10 +182,10 @@ inline std::size_t CollectDisjointRealPages(const std::vector<std::vector<std::i
     return real_entries;
 }
 
-// Kimi-K3-shaped flat KV-cache fixture: one full-attention (history) group
+// Kimi-K3-shaped KV-cache fixture: one full-attention (history) group
 // plus three linear-attention (state) groups drawing from one global pool.
-// Shared by test_flat_kvcache_lifecycle.cpp and test_flat_kvcache_scenarios.cpp.
-class FlatKimiFourGroupSuite : public SchedulerTestSuite {
+// Shared by test_kv_cache_lifecycle.cpp and test_kv_cache_scenarios.cpp.
+class KimiFourGroupSuite : public SchedulerTestSuite {
 protected:
     static const std::array<std::string, 4>& GroupIds() {
         static const std::array<std::string, 4> ids{"full_attention", "linear_attention_0", "linear_attention_1",
@@ -288,7 +223,5 @@ protected:
         scheduler_->Advance(std::move(event));
     }
 };
-
-#endif  // TOKENSPEED_FLAT_KVCACHE
 
 }  // namespace tokenspeed::test

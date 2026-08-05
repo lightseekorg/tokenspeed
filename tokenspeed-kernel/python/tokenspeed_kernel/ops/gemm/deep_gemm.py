@@ -21,11 +21,11 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, Platform
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import ScaleFormat, format_signatures
 
-_fp8_dtype = Platform.get().fp8e4m3fn.dtype
+_fp8_dtype = torch.float8_e4m3fn
 _MXFP8_SCALE = ScaleFormat(
     storage_dtype=torch.float32,
     granularity="block",
@@ -67,6 +67,9 @@ if fp8_gemm_nt is not None:
         traits={
             "n_align_64": frozenset({True}),
             "k_align_128": frozenset({True}),
+            # On Blackwell, the installed 1d1d kernel consumes transformed
+            # UE8M0 scales and is reached through an explicit runtime override.
+            "block_scale_layout": frozenset({"canonical"}),
         },
         priority=Priority.SPECIALIZED + 2,
         tags={"throughput"},

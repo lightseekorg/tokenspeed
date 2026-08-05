@@ -19,6 +19,7 @@ from pipeline import (
     format_perf_reference_markdown_table,
     format_perf_reference_table,
     get_excluded_runner_labels,
+    get_jit_cache_env,
     get_runner_specific_env,
     get_stage_commands,
     is_amd_runner,
@@ -600,6 +601,7 @@ _DEFAULT_BODY_TEMPLATE = """\
 api_version: ci.tokenspeed.io/v1
 name: {name}
 type: ut
+workflow_stage: unit-test
 triggers:
   - per-commit
 runner:
@@ -1064,3 +1066,18 @@ def test_slurm_server_command_inherits_readiness_timeout():
     explicit = "ts serve --model example --engine-startup-timeout 300"
     assert configure_slurm_server_command(explicit, 7200) == explicit
     assert configure_slurm_server_command("python serve.py", 7200) == "python serve.py"
+
+
+def test_jit_caches_are_redirected_off_the_work_dir():
+    env = {"RUNNER_NAME": "gb200-1gpu-0"}
+    resolved = get_jit_cache_env(env)
+    assert resolved == {
+        "TRITON_CACHE_DIR": "/tmp/ci-jit-cache-gb200-1gpu-0/triton",
+        "CUTE_DSL_CACHE_DIR": "/tmp/ci-jit-cache-gb200-1gpu-0/cute_dsl",
+        "TORCHINDUCTOR_CACHE_DIR": "/tmp/ci-jit-cache-gb200-1gpu-0/torchinductor",
+    }
+
+
+def test_jit_cache_env_keeps_explicit_overrides():
+    env = {"RUNNER_NAME": "gb200-1gpu-0", "TRITON_CACHE_DIR": "/mnt/triton"}
+    assert "TRITON_CACHE_DIR" not in get_jit_cache_env(env)

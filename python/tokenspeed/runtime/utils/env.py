@@ -62,8 +62,8 @@ global_server_args_dict: dict = {
     "cudagraph_capture_sizes": ServerArgs.cudagraph_capture_sizes,
     "disable_prefill_graph": ServerArgs.disable_prefill_graph,
     "prefill_graph_max_tokens": ServerArgs.prefill_graph_max_tokens,
-    "mamba_track_interval": ServerArgs.mamba_track_interval,
     "all2all_backend": ServerArgs.all2all_backend,
+    "deepep_mode": ServerArgs.deepep_mode,
 }
 
 
@@ -112,6 +112,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "disable_prefill_graph": server_args.disable_prefill_graph,
             "prefill_graph_max_tokens": server_args.prefill_graph_max_tokens,
             "all2all_backend": server_args.all2all_backend,
+            "deepep_mode": server_args.deepep_mode,
         }
     )
     pdl_enabled.cache_clear()
@@ -295,6 +296,10 @@ class Envs:
     TOKENSPEED_ENABLE_TORCH_INFERENCE_MODE = EnvBool(True)
     TOKENSPEED_NUMA_AWARE_WORKER_AFFINITY = EnvBool(True)
     TOKENSPEED_REQUEST_CONVERSION_WORKERS = EnvInt(8)
+    # Rollout escape hatch: revert engine IPC (frontend <-> controller <->
+    # scheduler ZMQ hops) from msgpack back to pickle. Read once at import of
+    # engine.io_struct.
+    TOKENSPEED_USE_PICKLE_IPC = EnvBool(False)
 
     # Multimodal / VLM
     TOKENSPEED_LOG_MM_TIMING = EnvBool(False)

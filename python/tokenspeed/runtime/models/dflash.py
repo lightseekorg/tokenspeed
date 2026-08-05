@@ -380,8 +380,8 @@ class DFlashDraftModel(nn.Module):
         )
         self.norm = RMSNorm(int(config.hidden_size), eps=eps)
         target_layer_ids = (getattr(config, "dflash_config", {}) or {}).get(
-            "target_layer_ids", []
-        )
+            "target_layer_ids"
+        ) or (getattr(config, "target_layer_ids", None) or [])
         self.num_context_features = len(target_layer_ids)
         self.fc = nn.Linear(
             self.num_context_features * int(config.hidden_size),

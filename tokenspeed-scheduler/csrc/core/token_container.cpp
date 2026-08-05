@@ -28,8 +28,8 @@ void TokenContainer::Extend(const std::vector<std::int32_t>& new_tokens) {
     tokens_.insert(tokens_.end(), new_tokens.begin(), new_tokens.end());
 }
 
-std::vector<std::span<const std::int32_t>> TokenContainer::GetFullPagedTokens(std::int32_t page_size,
-                                                                              bool except_last) const {
+std::vector<std::span<const std::int32_t>> TokenContainer::FullPagedTokens(std::int32_t page_size,
+                                                                           bool except_last) const {
     std::vector<std::span<const std::int32_t>> result;
 
     if (tokens_.empty()) {
@@ -47,7 +47,7 @@ std::vector<std::span<const std::int32_t>> TokenContainer::GetFullPagedTokens(st
     return result;
 }
 
-std::span<const std::int32_t> TokenContainer::GetTokenSlice(Window window) const {
+std::span<const std::int32_t> TokenContainer::TokenSlice(Window window) const {
     return {tokens_.data() + window.begin, static_cast<std::size_t>(window.size)};
 }
 

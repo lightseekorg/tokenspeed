@@ -29,7 +29,6 @@ from tokenspeed.runtime.layers.attention.configs.base import (
     BaseAttnConfig,
     resolve_dtype,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
@@ -108,30 +107,3 @@ class MLAConfig(BaseAttnConfig):
                 self.kv_lora_rank + self.qk_rope_head_dim
             ) * torch._utils._element_size(self.kv_cache_dtype)
         return cell_size
-
-    def create_pool(
-        self,
-        num_layers: int,
-        max_total_num_tokens: int,
-        rank: int,
-        enable_memory_saver: bool,
-    ) -> BaseTokenToKVPool:
-        from tokenspeed.runtime.layers.attention.kv_cache.mla import (
-            MLATokenToKVPool,
-        )
-
-        return MLATokenToKVPool(
-            size=max_total_num_tokens,
-            dtype=self.kv_cache_dtype,
-            model_dtype=self.dtype,
-            quant_method=self.kv_cache_quant_method,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            layer_num=num_layers,
-            device=self.device,
-            enable_memory_saver=enable_memory_saver,
-            max_batch_size=self.max_bs,
-            max_context_len=self.context_len,
-            page_size=self.page_size,
-            rank=rank,
-        )

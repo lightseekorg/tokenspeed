@@ -29,6 +29,7 @@ on:
           - test/ci/eval/minimax-m3-nvfp4-evalscope-aime25.yaml
           - test/ci/eval/qwen3.5-122b-a10b-nvfp4-epd-1e1p2d-evalscope-ocr-bench.yaml
           - test/ci/eval/qwen3.5-122b-a10b-nvfp4-evalscope-ocr-bench.yaml
+          - test/ci/eval/qwen3.5-35b-a3b-fp8-deepep-tp2dp2ep4-evalscope-gsm8k.yaml
           - test/ci/eval/qwen3.5-397b-a17b-nvfp4-dp4ep4-evalscope-aime25.yaml
           - test/ci/eval/qwen3.5-397b-a17b-nvfp4-evalscope-aime25.yaml
           - test/ci/eval/qwen3.5-397b-a17b-nvfp4-pd-1p1d-evalscope-aime25.yaml
@@ -70,6 +71,7 @@ on:
           - manual
           - nightly
           - debug
+          - per-commit
 
 concurrency:
   group: slurm-dispatch-${{ inputs.pr || 'main' }}-${{ inputs.yaml }}-${{ inputs.runners }}-${{ inputs.match }}

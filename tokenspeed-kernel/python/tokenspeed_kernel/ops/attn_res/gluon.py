@@ -10,7 +10,7 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 try:
-    from tokenspeed_kernel_amd.ops.attn_res import (
+    from tokenspeed_kernel_amd.ops.gfx950.attention.kda.attn_res import (
         attn_res_rmsnorm_gfx950 as _attn_res_rmsnorm_impl,
     )
 except ImportError as exc:

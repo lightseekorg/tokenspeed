@@ -11,9 +11,13 @@ from slurm_submit import (
     load_task,
     parse_pr_number,
     pr_worktree,
+    print_progress,
+    print_target,
+    queued_states,
     render_script,
     result_detail,
     select_tasks,
+    source_pr_url,
     write_report,
 )
 
@@ -24,6 +28,7 @@ def write_task(
     task_type: str = "eval",
     model: str = "example/model",
 ) -> str:
+    workflow_stage = "unit-test" if task_type == "ut" else "model-test"
     relative = Path(f"test/ci/{task_type}/example.yaml")
     path = repo / relative
     path.parent.mkdir(parents=True)
@@ -31,6 +36,7 @@ def write_task(
             api_version: ci.tokenspeed.io/v1
             name: example
             type: {task_type}
+            workflow_stage: {workflow_stage}
             triggers: [manual]
             runner:
               labels: [{runner}]
@@ -154,6 +160,27 @@ def test_parse_pr_number_rejects_other_urls():
         parse_pr_number("https://example.com/pull/795")
 
 
+def test_source_pr_url_uses_repository_environment(monkeypatch):
+    monkeypatch.setenv("GITHUB_REPOSITORY", "lightseekorg/tokenspeed")
+    assert source_pr_url("884") == "https://github.com/lightseekorg/tokenspeed/pull/884"
+
+
+def test_print_target_distinguishes_pr_head_from_merge(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("GITHUB_REPOSITORY", "lightseekorg/tokenspeed")
+    commits = {"HEAD^2": "pr-head", "HEAD^1": "base-head"}
+    monkeypatch.setattr("slurm_submit.git", lambda _repo, *_args: commits[_args[-1]])
+
+    print_target(tmp_path, "884", "merged-test")
+
+    assert capsys.readouterr().out.splitlines() == [
+        "Target: PR #884",
+        "Link: https://github.com/lightseekorg/tokenspeed/pull/884",
+        "Target commit: pr-head",
+        "Merged test commit: merged-test",
+        "Base commit: base-head",
+    ]
+
+
 def test_pr_worktree_rejects_shallow_checkout(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
@@ -236,3 +263,62 @@ def test_write_report_collects_logs_and_results(tmp_path):
         "| 123 | eval | gb200-1gpu | example | ✅ |"
         in (report / "summary.md").read_text()
     )
+
+
+def test_queued_states_queries_only_requested_jobs(monkeypatch):
+    def fake_run(command, **kwargs):
+        assert command == [
+            "squeue",
+            "--noheader",
+            "--jobs=123,456",
+            "--format=%i|%T|%M|%R",
+        ]
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=(
+                "123|RUNNING|00:01|node-a\n"
+                "456|PENDING|00:00|Resources\n"
+                "999|RUNNING|12:00|node-private\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("slurm_submit.subprocess.run", fake_run)
+    assert queued_states(["123", "456"]) == {
+        "123": {
+            "state": "RUNNING",
+            "elapsed": "00:01",
+            "exit_code": "",
+            "reason": "",
+        },
+        "456": {
+            "state": "PENDING",
+            "elapsed": "00:00",
+            "exit_code": "",
+            "reason": "Resources",
+        },
+    }
+
+
+def test_print_progress_omits_running_node(capsys, tmp_path):
+    submission = Submission(
+        Task("test/ci/eval/example.yaml", "example", "eval", "gb200-1gpu", 1),
+        "123",
+        tmp_path / "job.log",
+    )
+    print_progress(
+        [submission],
+        {
+            "123": {
+                "state": "RUNNING",
+                "elapsed": "00:01",
+                "exit_code": "",
+                "reason": "",
+            }
+        },
+    )
+    output = capsys.readouterr().out
+    assert "123" in output
+    assert "example" in output
+    assert "node" not in output
