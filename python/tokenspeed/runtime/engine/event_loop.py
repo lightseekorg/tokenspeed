@@ -213,6 +213,10 @@ class EventLoop:
             server_args, self.model_config, draft_model_config, gpu_id, global_rank
         )
         self.multimodal_encoder_dtype = target.multimodal_encoder_dtype
+        if server_args.disaggregation_mode in ("null", "prefill"):
+            # Keep this after all target/draft weights are loaded and before
+            # create_attn_components profiles memory for the KV-cache budget.
+            target.prepare_multimodal_runtime()
         self.use_overlap_schedule = should_use_overlap_schedule(
             disable_overlap_schedule=server_args.disable_overlap_schedule,
             disaggregation_mode=server_args.disaggregation_mode,
@@ -261,7 +265,6 @@ class EventLoop:
             max_scheduled_tokens = aligned_max_scheduled_tokens(
                 server_args.chunked_prefill_size,
                 paged_cache_groups,
-                geometry.page_size,
             )
             if max_scheduled_tokens != server_args.chunked_prefill_size:
                 logger.warning(
@@ -739,7 +742,7 @@ class EventLoop:
         local_has_work = bool(
             self._num_inflight_cache_ops != 0 or self._pending_cache_event_payloads
         )
-        if self.server_args.speculative_algorithm == "DFLASH":
+        if self.server_args.speculative_algorithm in ("DFLASH", "DSPARK"):
             if not self._cache_group_has_work(local_has_work):
                 return
         else:
@@ -870,8 +873,6 @@ class EventLoop:
         )
         dp_all_extend = dp_metadata.all_extend if dp_metadata is not None else False
         multimodal_context = self._get_multimodal_context_for_forward(forward_op)
-
-        self.model_executor.update_block_table(forward_op)
 
         if self.kv_transfer is None:
             # Path 1: normal (no disaggregation)
@@ -1742,9 +1743,8 @@ class EventLoop:
         prev_forward_op = None
 
         while not self._shutdown_complete():
-            # Order this iter's default-stream writes (KVAllocator,
-            # update_block_table, prefix_cache writes to req_to_page)
-            # after the prev iter's forward on execution_stream that
+            # Order this iter's default-stream writes (prefix_cache page-table
+            # writes) after the prev iter's forward on execution_stream that
             # reads the same tensor. Non-blocking on host.
             torch.cuda.default_stream().wait_stream(
                 self.model_executor.execution_stream

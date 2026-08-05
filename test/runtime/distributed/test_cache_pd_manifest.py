@@ -447,7 +447,7 @@ def test_registration_validation_rejects_bad_extents() -> None:
         CachePDSlabRegistration(0, "slab.0", (1 << 64) - extent + 1, extent)
 
 
-def _lcm_backing(nbytes: int, data_ptr: int = 0x10000):
+def _cache_buffer(nbytes: int, data_ptr: int = 0x10000):
     class _Dtype:
         def __str__(self):
             return "torch.uint8"
@@ -574,7 +574,7 @@ def test_lcm_contract_registers_one_arena_and_preserves_group_geometry() -> None
     )
     layout, registrations = build_lcm_pd_cache_contract(
         plan=plan,
-        backing=_lcm_backing(4096),
+        buffer=_cache_buffer(4096),
         group_specs=_LCM_SPECS,
         field_dtypes={"layer.0.k": "bfloat16"},
     )
@@ -589,13 +589,13 @@ def test_lcm_contract_registers_one_arena_and_preserves_group_geometry() -> None
 def test_fingerprint_ignores_num_lcm_blocks_but_peer_offsets_differ() -> None:
     small, _ = build_lcm_pd_cache_contract(
         plan=_two_plane_lcm_plan(3),
-        backing=_lcm_backing(4096),
+        buffer=_cache_buffer(4096),
         group_specs=_LCM_SPECS,
         field_dtypes={"layer.0.k": "bfloat16", "layer.0.v": "bfloat16"},
     )
     large, _ = build_lcm_pd_cache_contract(
         plan=_two_plane_lcm_plan(5),
-        backing=_lcm_backing(6144, data_ptr=0x20000),
+        buffer=_cache_buffer(6144, data_ptr=0x20000),
         group_specs=_LCM_SPECS,
         field_dtypes={"layer.0.k": "bfloat16", "layer.0.v": "bfloat16"},
     )

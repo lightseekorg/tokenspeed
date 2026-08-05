@@ -119,31 +119,6 @@ def _build_manager_args(server_args, mapping):
     )
 
 
-def _maybe_install_encoder_cudagraph(model, server_args) -> bool:
-    """Install the vision-encoder CUDA-graph wrapper as ``model.image_encoder``,
-    mirroring the aggregated path's hook in ``execution/model_executor.py``.
-
-    The encode loop never builds a ModelExecutor, so this is where the encode
-    worker opts into capture/replay of the tower instead of running it eager. Same
-    gate as the aggregated install: the model exposes the builder, multimodal is
-    active, the env flag is on, and the attention backend is graph-capturable. The
-    wrapper IS the model's ``image_encoder`` seam (lazy capture on first encode);
-    the executor's IMAGE path dispatches through ``model.image_encoder`` and falls
-    back to eager ``get_image_feature`` (the default) when this returns False.
-    Returns whether the wrapper was installed.
-    """
-    if not (
-        hasattr(model, "make_encoder_cudagraph_wrapper")
-        and getattr(model, "is_multimodal_active", True)
-        and envs.TOKENSPEED_MM_ENABLE_ENCODER_CUDA_GRAPH.get()
-        and server_args.mm_attention_backend != "flashinfer_cudnn"
-    ):
-        return False
-    model.image_encoder = model.make_encoder_cudagraph_wrapper(model.mapping)
-    logger.info("EPD encode worker: vision-encoder CUDA graph installed")
-    return True
-
-
 def _build_encode_worker(server_args, port_args, gpu_id, global_rank):
     """Assemble the encode worker: model + Mooncake manager + bootstrap server +
     executor + scheduler + cache, driven from the real ServerArgs."""
@@ -194,10 +169,10 @@ def _build_encode_worker(server_args, port_args, gpu_id, global_rank):
     model_runner = create_model_runner(
         server_args, model_config, None, gpu_id, global_rank
     )[0]
+    # The encode path never builds a ModelExecutor, so run the same explicit
+    # post-load encoder preparation used by aggregated and prefill workers.
+    model_runner.prepare_multimodal_runtime()
     model = model_runner.model
-    # Opt into vision-encoder CUDA-graph capture (mirrors the aggregated path,
-    # which the encode worker bypasses by never building a ModelExecutor).
-    _maybe_install_encoder_cudagraph(model, server_args)
 
     manager_args = _build_manager_args(server_args, mapping)
     embedding_args = EmbeddingArgs(

@@ -47,48 +47,14 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
         with self.memory_saver_adapter.region():
             self.index_k_buffer = [
-                torch.zeros(
-                    (self.size + self.page_size, self.index_k_row_bytes),
-                    dtype=torch.uint8,
-                    device=self.device,
+                self.field(f"layer.{layer_id}.index_k", torch.uint8).view(
+                    -1, self.index_k_row_bytes
                 )
-                for _ in range(self.layer_num)
+                for layer_id in range(self.layer_num)
             ]
-
-        self.index_k_data_ptrs = torch.tensor(
-            [buf.data_ptr() for buf in self.index_k_buffer],
-            dtype=torch.uint64,
-            device=self.device,
-        )
-
-    def _get_page_size_bytes(self):
-        index_size_bytes = self.index_k_row_bytes
-        return (
-            super()._get_page_size_bytes()
-            + self.page_size * self.layer_num * index_size_bytes
-        )
 
     def get_kv_size_bytes(self):
         return super().get_kv_size_bytes() + _get_tensor_size_bytes(self.index_k_buffer)
-
-    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
-        super().move_kv_cache(tgt_loc, src_loc)
-        if tgt_loc.numel() == 0:
-            return
-        tgt_loc_flat = tgt_loc.view(-1).long()
-        src_loc_flat = src_loc.view(-1).long()
-        for buf in self.index_k_buffer:
-            # Packed FP8 index-K is block-split per page, so a single token's
-            # bytes are NOT a contiguous row; move the FP8 values and FP32
-            # scales through their block-split views instead.
-            fp8_view, scale_view = self._index_k_block_views(buf)
-            ps = self.page_size
-            tgt_page = tgt_loc_flat // ps
-            tgt_slot = tgt_loc_flat % ps
-            src_page = src_loc_flat // ps
-            src_slot = src_loc_flat % ps
-            fp8_view[tgt_page, tgt_slot] = fp8_view[src_page, src_slot]
-            scale_view[tgt_page, tgt_slot] = scale_view[src_page, src_slot]
 
     def has_index_k_buffer(self) -> bool:
         return True
@@ -227,19 +193,3 @@ class DSATokenToKVPool(MLATokenToKVPool):
             layer_offsets + [start_idx + base_count + layer_id]
             for layer_id, layer_offsets in enumerate(offsets)
         ]
-
-    def get_cpu_copy(self, token_indices: list[int]) -> torch.Tensor:
-        del token_indices
-        raise NotImplementedError(
-            "DSA KV cache offload is not implemented; sparse/indexer cache "
-            "buffers require page-aware layout handling."
-        )
-
-    def load_cpu_copy(
-        self, kv_cache_cpu: torch.Tensor, token_indices: list[int]
-    ) -> None:
-        del kv_cache_cpu, token_indices
-        raise NotImplementedError(
-            "DSA KV cache reload is not implemented; sparse/indexer cache "
-            "buffers require page-aware layout handling."
-        )

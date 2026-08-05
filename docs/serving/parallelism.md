@@ -32,7 +32,7 @@ tokenspeed serve <model> \
 | `--world-size` | Total worker processes across all nodes. |
 | `--nprocs-per-node` | Worker processes launched on each node. |
 | `--attn-tp-size` | Attention tensor parallel size. |
-| `--dense-tp-size` | Dense layer tensor parallel size. |
+| `--dense-tp-size` | Dense layer tensor parallel size. Defaults to the attention replica width (attn TP x CP): the full world without DP attention, one replica with it. |
 | `--moe-tp-size` | MoE layer tensor parallel size. |
 | `--data-parallel-size` | Replicated data-parallel groups. |
 | `--mm-encoder-tp-mode` | `weights` (default), or TP1 whole-item DP within each attention TP group (`data`). |

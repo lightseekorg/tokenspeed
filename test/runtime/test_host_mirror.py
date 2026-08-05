@@ -47,21 +47,32 @@ class HostMirrorTest(unittest.TestCase):
         self.MHATokenToKVPool = MHATokenToKVPool
 
     def _pool(self):
-        kwargs = dict(
-            size=32,
-            dtype=self.torch.bfloat16,
-            head_num=1,
-            head_dim=8,
-            layer_num=4,
-            device="cuda",
-            enable_memory_saver=False,
-            max_batch_size=2,
-            max_context_len=64,
-            page_size=4,
-            rank=0,
-            layer_types=LAYER_TYPES,
-            sliding_window_tokens=128,
-            enable_alt_stream=False,
+        from cache_pool_test_utils import make_mha_memory_plan
+
+        kwargs = {
+            "size": 32,
+            "dtype": self.torch.bfloat16,
+            "head_num": 1,
+            "head_dim": 8,
+            "layer_num": 4,
+            "device": "cuda",
+            "enable_memory_saver": False,
+            "max_batch_size": 2,
+            "max_context_len": 64,
+            "page_size": 4,
+            "rank": 0,
+            "layer_types": LAYER_TYPES,
+            "sliding_window_tokens": 128,
+        }
+        kwargs["memory_plan"] = make_mha_memory_plan(
+            size=kwargs["size"],
+            page_size=kwargs["page_size"],
+            layer_num=kwargs["layer_num"],
+            kv_heads=kwargs["head_num"],
+            head_dim=kwargs["head_dim"],
+            dtype=kwargs["dtype"],
+            layer_types=kwargs["layer_types"],
+            sliding_window_tokens=kwargs["sliding_window_tokens"],
         )
         return self.MHATokenToKVPool(**kwargs)
 
@@ -149,10 +160,13 @@ class HostMirrorTest(unittest.TestCase):
         )
         for layer_id in range(4):
             idx = mirror.tensor_index_of_layer(layer_id)
-            self.assertIs(mirror.tensor_pairs[idx][0], pool.k_buffer[layer_id])
-            self.assertIs(
-                mirror.tensor_pairs[idx + mirror.num_k_tensors][0],
-                pool.v_buffer[layer_id],
+            self.assertEqual(
+                mirror.tensor_pairs[idx][0].data_ptr(),
+                pool.k_buffer[layer_id].data_ptr(),
+            )
+            self.assertEqual(
+                mirror.tensor_pairs[idx + mirror.num_k_tensors][0].data_ptr(),
+                pool.v_buffer[layer_id].data_ptr(),
             )
 
 
@@ -173,13 +187,17 @@ class HostMirrorStateSlabTest(unittest.TestCase):
                 HostMirror,
                 bytes_per_host_page,
             )
-            from tokenspeed.runtime.configs.lcm_layouts import qwen_gdn_lcm_fields
-            from tokenspeed.runtime.configs.lcm_memory_plan import plan_lcm_fields
-            from tokenspeed.runtime.layers.attention.kv_cache.lcm_mha import (
-                LcmMHATokenToKVPool,
+            from tokenspeed.runtime.layers.attention.kv_cache.hybrid_mha import (
+                HybridMHATokenToKVPool,
             )
             from tokenspeed.runtime.layers.attention.kv_cache.mha import (
                 MHATokenToKVPool,
+            )
+            from tokenspeed.runtime.layers.attention.kv_cache.plan import (
+                plan_cache_fields,
+            )
+            from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen35 import (
+                qwen_gdn_cache_fields,
             )
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
@@ -189,8 +207,8 @@ class HostMirrorStateSlabTest(unittest.TestCase):
         self.HostMirror = HostMirror
         self.bytes_per_host_page = bytes_per_host_page
         self.MHATokenToKVPool = MHATokenToKVPool
-        self.LcmMHATokenToKVPool = LcmMHATokenToKVPool
-        fields = qwen_gdn_lcm_fields(
+        self.HybridMHATokenToKVPool = HybridMHATokenToKVPool
+        fields = qwen_gdn_cache_fields(
             layer_types=GDN_LAYER_TYPES,
             layer_group_ids=(
                 "linear_attention_0",
@@ -206,7 +224,7 @@ class HostMirrorStateSlabTest(unittest.TestCase):
             ssm_shape=self.SSM_SHAPE,
             ssm_element_size=2,
         )
-        self.lcm_plan = plan_lcm_fields(
+        self.lcm_plan = plan_cache_fields(
             fields,
             logical_block_tokens=4,
             budget_bytes=1280,
@@ -215,22 +233,23 @@ class HostMirrorStateSlabTest(unittest.TestCase):
         )
 
     def _pool(self, *, with_state: bool = True):
-        kwargs = dict(
-            size=32,
-            dtype=self.torch.bfloat16,
-            head_num=1,
-            head_dim=8,
-            layer_num=4,
-            device="cuda",
-            enable_memory_saver=False,
-            max_batch_size=2,
-            max_context_len=64,
-            page_size=4,
-            rank=0,
-            layer_types=GDN_LAYER_TYPES,
-            sliding_window_tokens=None,
-            enable_alt_stream=False,
-        )
+        from cache_pool_test_utils import make_mha_memory_plan
+
+        kwargs = {
+            "size": 32,
+            "dtype": self.torch.bfloat16,
+            "head_num": 1,
+            "head_dim": 8,
+            "layer_num": 4,
+            "device": "cuda",
+            "enable_memory_saver": False,
+            "max_batch_size": 2,
+            "max_context_len": 64,
+            "page_size": 4,
+            "rank": 0,
+            "layer_types": GDN_LAYER_TYPES,
+            "sliding_window_tokens": None,
+        }
         if with_state:
             kwargs.update(
                 state_field_dtypes={
@@ -246,7 +265,18 @@ class HostMirrorStateSlabTest(unittest.TestCase):
                     "full_attention",
                 ),
             )
-        pool_cls = self.LcmMHATokenToKVPool if with_state else self.MHATokenToKVPool
+        else:
+            kwargs["memory_plan"] = make_mha_memory_plan(
+                size=kwargs["size"],
+                page_size=kwargs["page_size"],
+                layer_num=kwargs["layer_num"],
+                kv_heads=kwargs["head_num"],
+                head_dim=kwargs["head_dim"],
+                dtype=kwargs["dtype"],
+                layer_types=kwargs["layer_types"],
+                sliding_window_tokens=kwargs["sliding_window_tokens"],
+            )
+        pool_cls = self.HybridMHATokenToKVPool if with_state else self.MHATokenToKVPool
         return pool_cls(**kwargs)
 
     def _fill_device_pages(self, mirror, device_pages):
@@ -287,10 +317,10 @@ class HostMirrorStateSlabTest(unittest.TestCase):
                 self.assertEqual(host.shape, (8 * 4, *dev.shape[1:]))
 
     def test_bytes_per_host_page_includes_state_rows(self):
-        # Without state shapes the grouped GDN predicate is off: all 4 layers
-        # keep KV -> 8 mirrors x page_size 4 x 16 B rows = 512 B.
+        # Without state shapes all layers keep KV, but the two cache groups
+        # share two physical K/V planes -> 4 mirrors total.
         base = self.bytes_per_host_page(self._pool(with_state=False))
-        self.assertEqual(base, 512)
+        self.assertEqual(base, 256)
         # Grouped GDN: state layers carry no KV -> 4 KV mirrors (256 B) plus
         # 2 state layers x (conv 2*4 + ssm 2*8) bf16 page rows (2 x 48 B).
         pool = self._pool()

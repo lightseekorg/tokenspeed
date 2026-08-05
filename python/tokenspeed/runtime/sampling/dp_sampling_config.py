@@ -21,8 +21,11 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -149,6 +152,84 @@ def resolve_dp_sampling_runtime(
         topology=topology,
         device=limits.device,
     )
+
+
+def setup_dp_sampling(
+    *,
+    model,
+    sampling_backend,
+    requested: bool,
+    drafter_available: bool,
+    limits: DpSamplingRuntimeLimits,
+) -> DpSamplingRuntimeConfig:
+    """Resolve, validate and install the batch-DP spec-verify configuration.
+
+    One-stop assembly for the executor: derives the topology from the model's
+    logits processor, resolves support and runtime limits, and — when enabled —
+    configures both the sampling backend and the logits processor for the DP
+    logits layout.
+
+    Args:
+        model: The target model (provides ``logits_processor`` and, when
+            enabled, ``lm_head`` for the vocab-shard width).
+        sampling_backend: Backend to receive ``configure_dp_sampling``.
+        requested: The user's ``--dp-sampling`` choice.
+        drafter_available: Whether a speculative drafter is active.
+        limits: Static runtime bounds (vocab size, batch limits, device).
+
+    Returns:
+        The resolved runtime config (``enabled=False`` when unsupported).
+    """
+    processor = model.logits_processor
+    topology = DpSamplingTopology(
+        tp_rank=processor.tp_rank,
+        tp_size=processor.tp_size,
+        tp_group=processor.tp_group,
+        skip_all_gather=processor.skip_all_gather,
+        tie_word_embeddings=bool(
+            getattr(processor.config, "tie_word_embeddings", False)
+        ),
+    )
+    support = resolve_dp_sampling_support(
+        requested=requested,
+        drafter_available=drafter_available,
+        backend_supports_verify=bool(
+            getattr(sampling_backend, "_SUPPORTS_DP_VERIFY", False)
+        ),
+        topology=topology,
+    )
+    lm_head_rows = 0
+    if support.enabled:
+        lm_head_weight = model.lm_head.weight
+        if lm_head_weight.ndim < 1:
+            raise RuntimeError(
+                "dp_sampling LM head weight must be at least 1D, got "
+                f"{lm_head_weight.ndim}D"
+            )
+        lm_head_rows = int(lm_head_weight.shape[0])
+    runtime = resolve_dp_sampling_runtime(
+        support=support,
+        lm_head_rows=lm_head_rows,
+        topology=topology,
+        limits=limits,
+    )
+    if runtime.enabled:
+        sampling_backend.configure_dp_sampling(runtime)
+        processor.configure_dp_logits_layout(runtime)
+    logger.info(
+        "Batch-DP spec-verify: requested=%s, infra_supports=%s, enabled=%s "
+        "min_bs=%s (drafter=%s, backend_supports_dp=%s, "
+        "tp_size=%s, tp_group=%s)",
+        support.requested,
+        support.infra_supports,
+        support.enabled,
+        runtime.min_bs,
+        support.drafter_available,
+        support.backend_supports_verify,
+        support.tp_size,
+        support.tp_group_set,
+    )
+    return runtime
 
 
 def slice_dp_vocab_mask(

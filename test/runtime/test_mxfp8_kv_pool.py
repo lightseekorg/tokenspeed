@@ -40,6 +40,8 @@ LAYERS = 2
 
 
 def _make_pool(page_size: int, size: int = 512):
+    from cache_pool_test_utils import make_mha_memory_plan
+
     from tokenspeed.runtime.layers.attention.kv_cache.mha import (
         MHATokenToKVPoolMXFP8,
     )
@@ -56,6 +58,15 @@ def _make_pool(page_size: int, size: int = 512):
         max_context_len=size,
         page_size=page_size,
         rank=0,
+        memory_plan=make_mha_memory_plan(
+            size=size,
+            page_size=page_size,
+            layer_num=LAYERS,
+            kv_heads=HEADS,
+            head_dim=HEAD_DIM,
+            dtype=torch.bfloat16,
+            mxfp8=True,
+        ),
     )
 
 
@@ -70,7 +81,7 @@ def _quantize(x: torch.Tensor):
 
 def _dequant(q: torch.Tensor, sf: torch.Tensor) -> torch.Tensor:
     """Blockwise dequant: e8m0 scale s applies to 32 consecutive elements."""
-    t, h, d = q.shape
+    _t, _h, _d = q.shape
     scale = sf.to(torch.float32).repeat_interleave(32, dim=-1)
     return q.to(torch.float32) * scale
 
@@ -126,7 +137,7 @@ def test_requires_prequantized_and_scales():
     bf16 = torch.randn(4, HEADS, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
     with pytest.raises(AssertionError):
         pool.set_kv_buffer(layer, loc, bf16, bf16, None, None)
-    q, sf = _quantize(bf16)
+    q, _sf = _quantize(bf16)
     with pytest.raises(AssertionError):
         pool.set_kv_buffer(layer, loc, q, q, None, None)
 
@@ -142,10 +153,10 @@ def test_size_accounting_includes_scales():
 
 
 # -----------------------------------------------------------------------------
-# Hybrid-slab mode (flat ext): fp8 data slabs + parallel SF slabs
+# Plan-aliased MHA fields: FP8 data and scale fields share physical units.
 # -----------------------------------------------------------------------------
 
-SLAB_LAYER_TYPES = (
+SHARED_LAYER_TYPES = (
     "full_attention",
     "sliding_attention_0",
     "full_attention",
@@ -153,10 +164,12 @@ SLAB_LAYER_TYPES = (
 )
 # Byte-uniform hetero slots: full layers serve half the heads at twice the
 # tokens per page (slot bytes equal).
-SLAB_KV_HEADS = (2, 4, 2, 4)
+SHARED_KV_HEADS = (2, 4, 2, 4)
 
 
-def _make_slab_pool(size: int = 512):
+def _make_shared_pool(size: int = 512):
+    from cache_pool_test_utils import make_mha_memory_plan
+
     from tokenspeed.runtime.layers.attention.kv_cache.mha import (
         MHATokenToKVPoolMXFP8,
     )
@@ -166,53 +179,64 @@ def _make_slab_pool(size: int = 512):
         dtype=torch.float8_e4m3fn,
         head_num=HEADS,
         head_dim=HEAD_DIM,
-        layer_num=len(SLAB_LAYER_TYPES),
+        layer_num=len(SHARED_LAYER_TYPES),
         device="cuda",
         enable_memory_saver=False,
         max_batch_size=8,
         max_context_len=size,
         page_size=128,
         rank=0,
-        layer_types=SLAB_LAYER_TYPES,
+        layer_types=SHARED_LAYER_TYPES,
         sliding_window_tokens=512,
         max_scheduled_tokens=size,
         slot_tokens=256,
         group_page_sizes={"full_attention": 256},
-        layer_kv_head_counts=SLAB_KV_HEADS,
+        layer_kv_head_counts=SHARED_KV_HEADS,
+        memory_plan=make_mha_memory_plan(
+            size=size,
+            page_size=128,
+            layer_num=len(SHARED_LAYER_TYPES),
+            kv_heads=HEADS,
+            head_dim=HEAD_DIM,
+            dtype=torch.float8_e4m3fn,
+            layer_types=SHARED_LAYER_TYPES,
+            sliding_window_tokens=512,
+            mxfp8=True,
+        ),
     )
 
 
-def test_slab_geometry_and_aliasing():
-    pool = _make_slab_pool()
-    num_ids = (pool.size + pool._slot_tokens) // pool.page_size
+def test_shared_field_geometry_and_aliasing():
+    pool = _make_shared_pool()
+    num_blocks = pool.k_scale_buffer[0].shape[0]
 
-    # Paired layers alias data AND scale slabs.
-    assert pool.k_buffer[0] is pool.k_buffer[1]
-    assert pool.k_scale_buffer[0] is pool.k_scale_buffer[1]
-    assert pool.k_buffer[0] is not pool.k_buffer[2]
-    assert pool.k_scale_buffer[0] is not pool.k_scale_buffer[2]
+    # Layer-local views alias data and scale fields through the plan.
+    assert pool.k_buffer[0] is not pool.k_buffer[1]
+    assert pool.k_scale_buffer[0] is not pool.k_scale_buffer[1]
+    assert pool.k_buffer[0].data_ptr() == pool.k_buffer[1].data_ptr()
+    assert pool.k_scale_buffer[0].data_ptr() == pool.k_scale_buffer[1].data_ptr()
+    assert pool.k_buffer[0].data_ptr() != pool.k_buffer[2].data_ptr()
+    assert pool.k_scale_buffer[0].data_ptr() != pool.k_scale_buffer[2].data_ptr()
     assert pool.k_buffer[0].dtype == torch.float8_e4m3fn
 
-    # One byte-uniform SF slot per id: slot_bytes / 32 e8m0 each.
+    # One byte-uniform scale field per block: data bytes / 32 e8m0 each.
     slot_sf = 128 * HEADS * HEAD_DIM // 32
-    assert pool.k_scale_buffer[0].shape == (num_ids, slot_sf)
+    assert pool.k_scale_buffer[0].shape == (num_blocks, slot_sf)
 
     # Layer views factorize the same bytes: full (h/2, k=2), swa (h, k=1).
     k_full, _ = pool.get_kv_scale_buffer(0)
     k_swa, _ = pool.get_kv_scale_buffer(1)
-    assert k_full.shape == (num_ids, 2, 2, 32, SF_DIM, SF_DIM)
-    assert k_swa.shape == (num_ids, 4, 1, 32, SF_DIM, SF_DIM)
+    assert k_full.shape == (num_blocks, 2, 2, 32, SF_DIM, SF_DIM)
+    assert k_swa.shape == (num_blocks, 4, 1, 32, SF_DIM, SF_DIM)
 
 
 @pytest.mark.parametrize("layer_id, heads_l", [(0, 2), (1, 4)])
-def test_slab_store_matches_standalone_scatter(layer_id: int, heads_l: int):
-    """set_kv_buffer on a slab layer must land data in the layer's hetero
-    row view and scales exactly where a standalone store_sf_interleaved at
-    the layer's page size puts them."""
+def test_shared_field_store_matches_standalone_scatter(layer_id: int, heads_l: int):
+    """A layer view must match an independent scale scatter."""
     from tokenspeed_kernel.ops.kvcache.triton import store_sf_interleaved
 
     torch.manual_seed(2)
-    pool = _make_slab_pool()
+    pool = _make_shared_pool()
     layer = SimpleNamespace(layer_id=layer_id)
     page_tokens = pool._layer_page_tokens(layer_id)
     num_ids = pool.k_scale_buffer[layer_id].shape[0]
@@ -246,31 +270,6 @@ def test_slab_store_matches_standalone_scatter(layer_id: int, heads_l: int):
     assert torch.equal(k_view.view(torch.uint8), ref.view(torch.uint8))
 
 
-def test_slab_conv_views_are_bf16_over_fp8_slots():
-    """bf16 conv columns over fp8 slots: half the token capacity, zero-copy,
-    and writes through the view land in the slab's leading slot bytes."""
-    pool = _make_slab_pool()
-    swa_layer = 1
-
-    # 64-token kvconv block fills the 64 KB fp8 slot byte-exactly at the
-    # swa width; 128 no longer fits.
-    ch = HEADS * HEAD_DIM
-    k_cols, v_cols = pool.kvconv_slot_views_for_layer(swa_layer, 64)
-    assert k_cols.dtype == torch.bfloat16 and k_cols.shape[1:] == (64, ch)
-    with pytest.raises(AssertionError):
-        pool.kvconv_slot_views_for_layer(swa_layer, 128)
-
-    # Zero-copy: writing via the view mutates the slab's slot bytes.
-    k_cols[3].fill_(1.0)
-    slot_bytes = 128 * HEADS * HEAD_DIM  # fp8: 1 byte/elem
-    slab_bytes = pool.k_buffer[swa_layer].view(torch.uint8).reshape(-1, slot_bytes)
-    assert slab_bytes[3, : 64 * ch * 2].view(torch.bfloat16).eq(1.0).all()
-
-    # Hetero full layer: half-width columns, leading half of the slot.
-    k_full, _ = pool.kvconv_slot_views_for_layer(0, 64)
-    assert k_full.shape[1:] == (64, ch // 2)
-
-
 def _make_config(page_size: int):
     from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 
@@ -292,6 +291,34 @@ def _make_config(page_size: int):
     )
 
 
+def _create_config_pool(config):
+    from tokenspeed.runtime.layers.attention.kv_cache.factory import (
+        create_cache_pool,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.setup import (
+        prepare_cache_setup,
+    )
+
+    setup = prepare_cache_setup(
+        family="mha",
+        server_args=SimpleNamespace(max_total_tokens=512),
+        model_config=SimpleNamespace(num_attention_layers=LAYERS),
+        attn_config=config,
+        draft_model_config=None,
+        draft_attn_config=None,
+        cache_budget_bytes=config.cache_cell_size() * LAYERS * 512,
+        decode_input_tokens=1,
+        overlap_schedule_depth=0,
+    )
+    return create_cache_pool(
+        setup.target,
+        config,
+        num_layers=LAYERS,
+        rank=0,
+        enable_memory_saver=False,
+    )
+
+
 def test_config_selects_mxfp8_pool_and_sizes():
     from tokenspeed.runtime.layers.attention.kv_cache.mha import (
         MHATokenToKVPoolMXFP8,
@@ -302,24 +329,14 @@ def test_config_selects_mxfp8_pool_and_sizes():
     assert (
         config.cache_cell_size() == HEADS * HEAD_DIM * 2 + (HEADS * HEAD_DIM * 2) // 32
     )
-    pool = config.create_pool(
-        num_layers=LAYERS,
-        max_total_num_tokens=512,
-        rank=0,
-        enable_memory_saver=False,
-    )
+    pool = _create_config_pool(config)
     assert isinstance(pool, MHATokenToKVPoolMXFP8)
 
 
 def test_config_rejects_non_128_page():
     config = _make_config(page_size=64)
     with pytest.raises(AssertionError, match="block-size 128"):
-        config.create_pool(
-            num_layers=LAYERS,
-            max_total_num_tokens=512,
-            rank=0,
-            enable_memory_saver=False,
-        )
+        _create_config_pool(config)
 
 
 if __name__ == "__main__":
