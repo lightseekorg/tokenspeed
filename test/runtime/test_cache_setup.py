@@ -4,12 +4,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    FULL_ATTENTION,
-    LINEAR_ATTENTION,
-    PagedCacheGroupSpec,
-    build_paged_cache_group_specs,
-)
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.configs.msa import MSAConfig
@@ -19,12 +13,18 @@ from tokenspeed.runtime.layers.attention.kv_cache.hybrid_mha import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheFieldSpec
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
     build_hybrid_cache_setup,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheFieldSpec
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
     prepare_cache_setup,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    FULL_ATTENTION,
+    LINEAR_ATTENTION,
+    PagedCacheGroupSpec,
+    build_paged_cache_group_specs,
 )
 from tokenspeed.runtime.layers.attention.registry import (
     _validate_shared_cache_geometry,
