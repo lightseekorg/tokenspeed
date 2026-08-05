@@ -50,6 +50,10 @@ def _randn(shape: tuple[int, ...], *, device: str, dtype: torch.dtype) -> torch.
     [
         pytest.param(torch.bfloat16, 64, 8, 2, id="bf16-d64"),
         pytest.param(torch.bfloat16, 128, 8, 2, id="bf16-d128"),
+        pytest.param(torch.float8_e4m3fn, 64, 8, 2, id="e4m3-d64"),
+        pytest.param(torch.float8_e4m3fn, 128, 8, 2, id="e4m3-d128"),
+        pytest.param(torch.float8_e5m2, 64, 8, 2, id="e5m2-d64"),
+        pytest.param(torch.float8_e5m2, 128, 8, 2, id="e5m2-d128"),
     ],
 )
 @pytest.mark.parametrize("solution", ["triton", "fa3", "fa4", "gluon"])
@@ -403,7 +407,7 @@ def test_mha_decode_with_kvcache(
                 ).to(dtype)
 
     expected_out = None
-    if seqlen_q == 1 and dtype not in _FP8_DTYPES:
+    if seqlen_q == 1:
         group_size = num_q_heads // num_kv_heads
         expected = []
         for batch_idx, cache_len in enumerate(cache_seqlens.tolist()):
@@ -415,9 +419,9 @@ def test_mha_decode_with_kvcache(
             v_i = v_i[:cache_len].repeat_interleave(group_size, dim=1)
             expected.append(
                 torch.nn.functional.scaled_dot_product_attention(
-                    q[batch_idx : batch_idx + 1].unsqueeze(2),
-                    k_i.permute(1, 0, 2).unsqueeze(0),
-                    v_i.permute(1, 0, 2).unsqueeze(0),
+                    q[batch_idx : batch_idx + 1].float().unsqueeze(2),
+                    k_i.float().permute(1, 0, 2).unsqueeze(0),
+                    v_i.float().permute(1, 0, 2).unsqueeze(0),
                 ).squeeze(2)
             )
         expected_out = torch.cat(expected, dim=0)
@@ -441,8 +445,11 @@ def test_mha_decode_with_kvcache(
 
     assert out.shape == q.shape
     assert not torch.isnan(out).any()
+    expected_dtype = torch.bfloat16 if dtype in _FP8_DTYPES else dtype
+    assert out.dtype == expected_dtype
     if expected_out is not None:
-        torch.testing.assert_close(out.cpu(), expected_out, rtol=3e-2, atol=3e-2)
+        tol = 3e-1 if dtype in _FP8_DTYPES else 3e-2
+        torch.testing.assert_close(out.float().cpu(), expected_out, rtol=tol, atol=tol)
 
 
 @pytest.mark.parametrize(

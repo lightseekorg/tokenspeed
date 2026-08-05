@@ -266,6 +266,8 @@ if current_platform().is_amd:
             {
                 torch.float16,
                 torch.bfloat16,
+                torch.float8_e4m3fn,
+                torch.float8_e5m2,
             },
         ),
         priority=Priority.SPECIALIZED,
@@ -330,6 +332,8 @@ if current_platform().is_amd:
             {
                 torch.float16,
                 torch.bfloat16,
+                torch.float8_e4m3fn,
+                torch.float8_e5m2,
             },
         ),
         priority=Priority.SPECIALIZED,
