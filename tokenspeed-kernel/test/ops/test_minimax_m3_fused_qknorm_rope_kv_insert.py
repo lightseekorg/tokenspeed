@@ -5,7 +5,7 @@ Validates against an independent torch golden (Gemma RMSNorm with the raw weight
 -- the kernel adds ``1 + w`` internally -- then partial-NeoX RoPE) across:
   * norm+RoPE only (no cache insert),
   * K/V + index-K insert into TokenSpeed's separate flat slot-indexed buffers,
-  * fp8 KV cache + fp8 index cache / index_q output.
+  * production mixed cache dtypes: FP8 K/V and BF16 index state.
 
 Requires an NVIDIA GPU and the built ``minimax_m3_fused`` kernel module.
 """
@@ -14,14 +14,18 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.attention import (
+    MinimaxSparseCacheInsertArgs,
+    minimax_sparse_qknorm_rope,
+)
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.cuda.minimax_m3_fused import (
     fused_qknorm_rope_kv_insert,
 )
 
 pytestmark = pytest.mark.skipif(
-    not current_platform().is_nvidia,
-    reason="minimax_m3_fused kernel is NVIDIA-only",
+    not current_platform().is_hopper_plus,
+    reason="minimax_m3_fused kernel requires NVIDIA Hopper or newer",
 )
 
 HD, RD, EPS = 128, 64, 1e-6
@@ -70,24 +74,17 @@ def test_norm_rope_only():
     dev = "cuda"
     qkv, w, positions, csc, cos, sin = _fixtures(dev, 0)
     qkv_in = qkv.clone()
-    q_out = torch.empty(T, NQ * HD, device=dev, dtype=torch.bfloat16)
-    iq_out = torch.empty(T, NIQ * HD, device=dev, dtype=torch.bfloat16)
-
-    fused_qknorm_rope_kv_insert(
-        qkv,
-        w["q"],
-        w["k"],
-        csc,
-        positions,
-        NQ,
-        NKV,
-        RD,
-        EPS,
+    q_out, iq_out = minimax_sparse_qknorm_rope(
+        qkv=qkv,
+        q_norm_weight=w["q"],
+        k_norm_weight=w["k"],
         index_q_norm_weight=w["iq"],
         index_k_norm_weight=w["ik"],
-        num_index_heads=NIQ,
-        q_out=q_out,
-        index_q_out=iq_out,
+        cos_sin_cache=csc,
+        positions=positions,
+        num_heads=NQ,
+        num_kv_heads=NKV,
+        eps=EPS,
     )
 
     g_q = _golden_norm_rope(_slice(qkv_in, "q", NQ), w["q"], cos, sin)
@@ -109,11 +106,10 @@ def test_kv_and_index_insert_bf16():
     dev = "cuda"
     qkv, w, positions, csc, cos, sin = _fixtures(dev, 1)
     qkv_in = qkv.clone()
-    slots = torch.randperm(NUM_SLOTS, device=dev)[:T].to(torch.int64)
+    slots = torch.randperm(NUM_SLOTS, device=dev)[:T].to(torch.int32)
     k_cache = torch.zeros(NUM_SLOTS, NKV, HD, device=dev, dtype=torch.bfloat16)
     v_cache = torch.zeros(NUM_SLOTS, NKV, HD, device=dev, dtype=torch.bfloat16)
     index_cache = torch.zeros(NUM_SLOTS, HD, device=dev, dtype=torch.bfloat16)
-
     fused_qknorm_rope_kv_insert(
         qkv,
         w["q"],
@@ -152,54 +148,48 @@ def test_kv_and_index_insert_bf16():
     torch.testing.assert_close(index_cache, gidx, atol=2e-2, rtol=0)
 
 
-def test_fp8_kv_and_index():
+def test_fp8_kv_and_bf16_index():
     dev = "cuda"
     qkv, w, positions, csc, cos, sin = _fixtures(dev, 2)
     qkv_in = qkv.clone()
-    slots = torch.randperm(NUM_SLOTS, device=dev)[:T].to(torch.int64)
-    k_cache = torch.zeros(NUM_SLOTS, NKV, HD, device=dev, dtype=torch.uint8)
-    v_cache = torch.zeros(NUM_SLOTS, NKV, HD, device=dev, dtype=torch.uint8)
-    index_cache = torch.zeros(NUM_SLOTS, HD, device=dev, dtype=E4M3)
-    iq_out = torch.empty(T, NIQ * HD, device=dev, dtype=E4M3)
-
-    fused_qknorm_rope_kv_insert(
-        qkv,
-        w["q"],
-        w["k"],
-        csc,
-        positions,
-        NQ,
-        NKV,
-        RD,
-        EPS,
+    slots = torch.randperm(NUM_SLOTS, device=dev)[:T].to(torch.int32)
+    k_cache = torch.zeros(NUM_SLOTS, NKV, HD, device=dev, dtype=E4M3)
+    v_cache = torch.zeros(NUM_SLOTS, NKV, HD, device=dev, dtype=E4M3)
+    index_cache = torch.zeros(NUM_SLOTS, HD, device=dev, dtype=torch.bfloat16)
+    _, iq_out = minimax_sparse_qknorm_rope(
+        qkv=qkv,
+        q_norm_weight=w["q"],
+        k_norm_weight=w["k"],
         index_q_norm_weight=w["iq"],
         index_k_norm_weight=w["ik"],
-        num_index_heads=NIQ,
-        slot_mapping=slots,
-        k_cache=k_cache,
-        v_cache=v_cache,
-        index_cache=index_cache,
-        index_q_out=iq_out,
-        block_size=1,
-        kv_cache_dtype="fp8_e4m3",
+        cos_sin_cache=csc,
+        positions=positions,
+        num_heads=NQ,
+        num_kv_heads=NKV,
+        eps=EPS,
+        cache_insert=MinimaxSparseCacheInsertArgs(
+            slot_mapping=slots,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            index_k_cache=index_cache,
+        ),
     )
 
     gk = torch.zeros(NUM_SLOTS, NKV, HD, device=dev, dtype=E4M3)
     gv = torch.zeros(NUM_SLOTS, NKV, HD, device=dev, dtype=E4M3)
-    gidx = torch.zeros(NUM_SLOTS, HD, device=dev, dtype=E4M3)
-    gk[slots] = _golden_norm_rope(_slice(qkv_in, "k", NKV), w["k"], cos, sin).to(E4M3)
+    gidx = torch.zeros_like(index_cache)
+    gk[slots] = _slice(qkv, "k", NKV).to(E4M3)
     gv[slots] = _slice(qkv_in, "v", NKV).to(E4M3)
-    gidx[slots] = (
-        _golden_norm_rope(_slice(qkv_in, "ik", 1), w["ik"], cos, sin)
-        .to(E4M3)
-        .view(T, HD)
-    )
-    g_iq = _golden_norm_rope(_slice(qkv_in, "iq", NIQ), w["iq"], cos, sin).to(E4M3)
+    gidx[slots] = _slice(qkv, "ik", 1).view(T, HD)
 
-    # Compare decoded fp8 (identity scale) -- expected bit-identical rounding.
-    torch.testing.assert_close(k_cache.view(E4M3).float(), gk.float(), atol=0, rtol=0)
-    torch.testing.assert_close(v_cache.view(E4M3).float(), gv.float(), atol=0, rtol=0)
-    torch.testing.assert_close(index_cache.float(), gidx.float(), atol=0, rtol=0)
+    # The fused cache writes match the original two-step path bit for bit:
+    # qk-norm/RoPE materializes BF16 before the paged-cache FP8 conversion.
+    torch.testing.assert_close(k_cache.float(), gk.float(), atol=0, rtol=0)
+    torch.testing.assert_close(v_cache.float(), gv.float(), atol=0, rtol=0)
+    torch.testing.assert_close(index_cache, gidx, atol=0, rtol=0)
     torch.testing.assert_close(
-        iq_out.view(T, NIQ, HD).float(), g_iq.float(), atol=0, rtol=0
+        iq_out.view(T, NIQ, HD).float(),
+        _golden_norm_rope(_slice(qkv_in, "iq", NIQ), w["iq"], cos, sin),
+        atol=2e-2,
+        rtol=0,
     )

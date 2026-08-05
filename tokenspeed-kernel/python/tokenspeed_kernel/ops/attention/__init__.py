@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 # Backend registration (side-effect imports)
 import tokenspeed_kernel.ops.attention.cuda  # noqa: F401
@@ -55,6 +56,17 @@ from tokenspeed_kernel.signature import (
 )
 
 AttentionResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]
+
+
+@dataclass(frozen=True)
+class MinimaxSparseCacheInsertArgs:
+    """Destination buffers for the fused MiniMax sparse-attention producer."""
+
+    slot_mapping: torch.Tensor
+    k_cache: torch.Tensor
+    v_cache: torch.Tensor
+    index_k_cache: torch.Tensor
+
 
 # One UE8M0 scale per 32 consecutive head_dim elements (MXFP8).
 MXFP8_ATTENTION_BLOCK_SCALE = MXFP8_BLOCK_SCALE
@@ -129,6 +141,8 @@ __all__ = [
     "dsa_prefill_topk",
     "dsa_decode_topk",
     "dsa_plan",
+    "MinimaxSparseCacheInsertArgs",
+    "minimax_sparse_qknorm_rope",
     "msa_decode_with_kvcache",
     "msa_extend_with_kvcache",
     "attn_merge_state",
@@ -136,6 +150,112 @@ __all__ = [
 ]
 
 LSE_LN = math.log2(math.e)
+
+
+def minimax_sparse_qknorm_rope(
+    qkv: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    index_q_norm_weight: torch.Tensor,
+    index_k_norm_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    num_heads: int,
+    num_kv_heads: int,
+    eps: float,
+    cache_insert: MinimaxSparseCacheInsertArgs | None = None,
+    enable_pdl: bool = False,
+    override: str | None = None,
+    solution: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Normalize and rotate MiniMax sparse Q/K and optionally insert caches.
+
+    Args:
+        qkv: Packed ``[Q | K | V | index-Q | index-K]`` projection output.
+        q_norm_weight: Main-query Gemma RMSNorm weight.
+        k_norm_weight: Main-key Gemma RMSNorm weight.
+        index_q_norm_weight: Index-query Gemma RMSNorm weight.
+        index_k_norm_weight: Index-key Gemma RMSNorm weight.
+        cos_sin_cache: Packed FP32 rotary-embedding cache.
+        positions: Int64 token positions.
+        num_heads: Number of local main-query heads.
+        num_kv_heads: Number of local K/V heads.
+        eps: RMSNorm epsilon.
+        cache_insert: Optional complete K/V/index-K cache insertion target.
+        enable_pdl: Request Programmatic Dependent Launch where supported.
+        override: Optional exact kernel-name override.
+        solution: Optional kernel solution override.
+
+    Returns:
+        Contiguous normalized and rotated main-query and index-query tensors.
+    """
+    if not qkv.is_contiguous():
+        raise ValueError("qkv must be contiguous")
+    head_dim = q_norm_weight.numel()
+    index_head_dim = index_q_norm_weight.numel()
+    index_width = qkv.shape[-1] - (num_heads + 2 * num_kv_heads) * head_dim
+    num_index_heads = index_width // index_head_dim - 1
+    rotary_dim = cos_sin_cache.shape[-1]
+    q_out = qkv.new_empty(qkv.shape[0], num_heads * head_dim)
+    index_q_out = qkv.new_empty(qkv.shape[0], num_index_heads * index_head_dim)
+    signature = format_signature(qkv=dense_tensor_format(qkv.dtype))
+    traits = {
+        "head_dim": head_dim,
+        "index_head_dim": index_head_dim,
+        "rotary_dim": rotary_dim,
+        "cache_dtype": cache_insert.k_cache.dtype if cache_insert else None,
+    }
+    kernel = select_kernel(
+        "attention",
+        "minimax_sparse_qknorm_rope",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+    shape_params = {
+        "num_tokens": qkv.shape[0],
+        "num_heads": num_heads,
+        "num_kv_heads": num_kv_heads,
+        "num_index_heads": num_index_heads,
+        "head_dim": head_dim,
+        "rotary_dim": rotary_dim,
+        "has_cache_insert": cache_insert is not None,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "minimax_sparse_qknorm_rope",
+        kernel.name,
+        qkv.dtype,
+        shape_params,
+    )
+    with kernel_scope(
+        "attention",
+        "minimax_sparse_qknorm_rope",
+        qkv.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        kernel(
+            qkv=qkv,
+            q_norm_weight=q_norm_weight,
+            k_norm_weight=k_norm_weight,
+            index_q_norm_weight=index_q_norm_weight,
+            index_k_norm_weight=index_k_norm_weight,
+            cos_sin_cache=cos_sin_cache,
+            positions=positions,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            num_index_heads=num_index_heads,
+            rotary_dim=rotary_dim,
+            eps=eps,
+            q_out=q_out,
+            index_q_out=index_q_out,
+            cache_insert=cache_insert,
+            enable_pdl=enable_pdl,
+        )
+    return q_out, index_q_out
 
 
 def msa_decode_with_kvcache(
@@ -161,6 +281,7 @@ def msa_decode_with_kvcache(
     v_scale: float | torch.Tensor | None = None,
     score_out: torch.Tensor | None = None,
     enable_pdl: bool = False,
+    index_k_cache_prewritten: bool = False,
     override: str | None = None,
     solution: str | None = None,
 ) -> torch.Tensor:
@@ -197,6 +318,8 @@ def msa_decode_with_kvcache(
             accept it or when its shape does not match.
         enable_pdl: Request Programmatic Dependent Launch (SM90+) for the
             indexer's index-key store; forwarded to the kernel.
+        index_k_cache_prewritten: Skip the index-key store because the current
+            tokens were inserted by an earlier producer on the same stream.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -279,6 +402,7 @@ def msa_decode_with_kvcache(
             v_scale=v_scale,
             score_out=score_out,
             enable_pdl=enable_pdl,
+            index_k_cache_prewritten=index_k_cache_prewritten,
         )
 
 
