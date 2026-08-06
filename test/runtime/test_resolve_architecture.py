@@ -18,6 +18,9 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 from tokenspeed.runtime.configs import Qwen3_5MoeConfig  # noqa: E402
+from tokenspeed.runtime.configs.model_config import (  # noqa: E402
+    _normalize_architecture_aliases_for_dispatch,
+)
 from tokenspeed.runtime.configs.model_config import get_hf_text_config  # noqa: E402
 from tokenspeed.runtime.configs.qwen3_5_config import Qwen3_5MoeTextConfig  # noqa: E402
 from tokenspeed.runtime.configs.utils import get_rope_parameters  # noqa: E402
@@ -141,6 +144,37 @@ class MaterializeArchitecturesTests(unittest.TestCase):
         self.assertEqual(
             config.architectures, ["Qwen3_5MoeForConditionalGenerationNextN"]
         )
+
+
+class ArchitectureDispatchNormalizationTests(unittest.TestCase):
+    def test_nemotron_architecture_alias_maps_to_llama(self) -> None:
+        hf_config = PretrainedConfig(architectures=["NemotronForCausalLM"])
+        hf_text_config = PretrainedConfig(architectures=["NemotronForCausalLM"])
+
+        _normalize_architecture_aliases_for_dispatch(hf_config, hf_text_config)
+
+        self.assertEqual(hf_config.architectures, ["LlamaForCausalLM"])
+        self.assertEqual(hf_text_config.architectures, ["LlamaForCausalLM"])
+
+    def test_unknown_architecture_is_left_unchanged(self) -> None:
+        hf_config = PretrainedConfig(architectures=["SomeFutureForCausalLM"])
+        hf_text_config = PretrainedConfig(architectures=["SomeFutureForCausalLM"])
+
+        _normalize_architecture_aliases_for_dispatch(hf_config, hf_text_config)
+
+        self.assertEqual(hf_config.architectures, ["SomeFutureForCausalLM"])
+        self.assertEqual(hf_text_config.architectures, ["SomeFutureForCausalLM"])
+
+    def test_invalid_architectures_shape_is_ignored(self) -> None:
+        hf_config = PretrainedConfig()
+        hf_text_config = PretrainedConfig()
+        hf_config.architectures = "NemotronForCausalLM"
+        hf_text_config.architectures = None
+
+        _normalize_architecture_aliases_for_dispatch(hf_config, hf_text_config)
+
+        self.assertEqual(hf_config.architectures, "NemotronForCausalLM")
+        self.assertIsNone(hf_text_config.architectures)
 
 
 if __name__ == "__main__":

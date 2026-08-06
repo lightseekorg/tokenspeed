@@ -83,6 +83,13 @@ _DOUBLE_ATTENTION_LAYER_ARCHITECTURES = frozenset(
         "LongcatFlashForCausalLM",
     }
 )
+_LLAMA_DENSE_ARCH_ALIASES = frozenset(
+    {
+        # Nemotron-3 Super checkpoints are Llama-family dense models but may
+        # publish a Nemotron-specific architecture label in config.json.
+        "NemotronForCausalLM",
+    }
+)
 
 
 class AttentionArch(IntEnum):
@@ -276,6 +283,30 @@ def _resolve_attention_family(
     return None
 
 
+def _normalize_architecture_aliases_for_dispatch(
+    hf_config: PretrainedConfig,
+    hf_text_config: PretrainedConfig,
+) -> None:
+    """Normalize known architecture aliases to runtime registry entry names."""
+
+    def _rewrite(config: PretrainedConfig) -> bool:
+        archs = getattr(config, "architectures", None)
+        if not isinstance(archs, list) or not archs:
+            return False
+        if archs[0] not in _LLAMA_DENSE_ARCH_ALIASES:
+            return False
+        archs[0] = "LlamaForCausalLM"
+        return True
+
+    rewritten_hf = _rewrite(hf_config)
+    rewritten_text = _rewrite(hf_text_config)
+    if rewritten_hf or rewritten_text:
+        logger.info(
+            "Normalized Llama-family architecture alias for model dispatch: %s",
+            _LLAMA_DENSE_ARCH_ALIASES,
+        )
+
+
 def _apply_attention_family_defaults(
     server_args: ServerArgs,
     spec: _AttentionFamilySpec,
@@ -354,6 +385,10 @@ class ModelConfig:
         )
 
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        _normalize_architecture_aliases_for_dispatch(
+            self.hf_config,
+            self.hf_text_config,
+        )
         if (
             is_draft_worker
             and getattr(server_args, "speculative_algorithm", None) == "DSPARK"
