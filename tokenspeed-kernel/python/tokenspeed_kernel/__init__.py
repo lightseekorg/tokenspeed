@@ -66,6 +66,7 @@ from tokenspeed_kernel.ops.moe import (
     moe_plan,
     moe_process_weights,
     moe_sigmoid_bias_topk,
+    moe_softmax_topk,
 )
 from tokenspeed_kernel.ops.quantization import (
     quantize_fp8,
@@ -125,6 +126,7 @@ __all__ = [
     "moe_plan",
     "moe_process_weights",
     "moe_sigmoid_bias_topk",
+    "moe_softmax_topk",
     # quantization
     "quantize_fp8",
     "quantize_fp8_with_scale",

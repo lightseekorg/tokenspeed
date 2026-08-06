@@ -22,21 +22,19 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from dataclasses import replace
+from collections.abc import Mapping
 
 import numpy as np
 import torch
 
-from tokenspeed.runtime.configs import paged_cache_spec
-from tokenspeed.runtime.configs.cache_runtime import (
-    PagedCacheRuntimeContract,
-)
 from tokenspeed.runtime.layers.attention.kv_cache.mha import (
     MHATokenToKVPool,
     MHATokenToKVPoolMXFP8,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.plan import CacheMemoryPlan
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheMemoryPlan
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    STATE_LAYER_TYPES,
+)
 
 
 class HybridMHATokenToKVPool(MHATokenToKVPool):
@@ -48,81 +46,24 @@ class HybridMHATokenToKVPool(MHATokenToKVPool):
         memory_plan: CacheMemoryPlan,
         layer_group_ids: tuple[str, ...],
         state_field_dtypes: Mapping[str, torch.dtype] | None = None,
-        token_capacity: int | None = None,
         **kwargs,
     ):
-        self.layer_cache_group_ids = tuple(layer_group_ids)
-        self._group_ids_by_layer = dict(enumerate(self.layer_cache_group_ids))
+        group_ids = tuple(layer_group_ids)
+        self._group_ids_by_layer = dict(enumerate(group_ids))
         self._state_field_dtypes = dict(state_field_dtypes or {})
         layer_types = tuple(kwargs.get("layer_types", ()))
         self._state_layer_ids = tuple(
             layer_id
             for layer_id, label in enumerate(layer_types)
-            if label in paged_cache_spec.STATE_LAYER_TYPES
+            if label in STATE_LAYER_TYPES
         )
         self._state_buffers_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self.paged_cache_requires_page_zeroing = True
-        self._token_capacity = (
-            token_capacity if token_capacity is not None else kwargs["size"]
-        )
 
-        if len(self.layer_cache_group_ids) != kwargs["layer_num"]:
+        if len(group_ids) != kwargs["layer_num"]:
             raise ValueError("cache group ids must cover every model layer")
 
-        super().__init__(memory_plan=memory_plan, **kwargs)
-
-        self.runtime_contract = PagedCacheRuntimeContract(
-            block_size=self.page_size,
-            num_lcm_blocks=memory_plan.num_lcm_blocks,
-            token_capacity=self._token_capacity,
-            group_specs=self.paged_cache_group_specs,
-            group_page_counts=self.paged_cache_group_page_counts,
-        )
-
-    def _publish_paged_cache_groups(
-        self,
-        *,
-        layer_types: Sequence[str],
-        sliding_window_tokens: int | Sequence[int | None] | None,
-        page_size: int,
-        page_sizes: Mapping[str, int] | None,
-        extra_groups: Sequence[paged_cache_spec.PagedCacheGroupSpec],
-        max_live_requests: int,
-        max_scheduled_tokens: int,
-        max_total_tokens: int,
-        max_context_len: int,
-    ) -> tuple[list[paged_cache_spec.PagedCacheGroupSpec], dict[str, int]]:
-        published = paged_cache_spec.publish_paged_cache_groups(
-            layer_types=layer_types,
-            group_ids=self.layer_cache_group_ids,
-            sliding_window_tokens=sliding_window_tokens,
-            page_size=page_size,
-            page_sizes=page_sizes,
-            cache_blocks_per_lcm_block={
-                group.group_id: group.cache_blocks_per_lcm_block
-                for group in self.plan.groups
-            },
-            extra_groups=extra_groups,
-            max_live_requests=max_live_requests,
-            max_scheduled_tokens=max_scheduled_tokens,
-            max_total_tokens=max_total_tokens,
-            max_context_len=max_context_len,
-        )
-        if published is None:
-            raise RuntimeError("state MHA cache requires cache-group scheduling")
-        specs, counts = published
-        if self._pd_disaggregation_enabled:
-            specs = [
-                replace(
-                    spec,
-                    transfer_policy=(
-                        "latest_snapshot" if spec.family == "state" else "full_suffix"
-                    ),
-                )
-                for spec in specs
-            ]
-        counts.update({group.group_id: group.page_count for group in self.plan.groups})
-        return specs, counts
+        super().__init__(memory_plan=memory_plan, layer_group_ids=group_ids, **kwargs)
 
     def _create_buffers(self) -> None:
         with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
@@ -147,7 +88,7 @@ class HybridMHATokenToKVPool(MHATokenToKVPool):
         self.k_buffer = [None] * self.layer_num
         self.v_buffer = [None] * self.layer_num
         for layer_id, label in enumerate(self._layer_types):
-            if label in paged_cache_spec.STATE_LAYER_TYPES:
+            if label in STATE_LAYER_TYPES:
                 conv_id = f"layer.{layer_id}.conv"
                 ssm_id = f"layer.{layer_id}.ssm"
                 try:

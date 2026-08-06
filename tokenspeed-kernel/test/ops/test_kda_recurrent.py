@@ -8,8 +8,8 @@ from kimi3_reference import kda_gate
 from kimi3_reference import kda_recurrent as reference_kda_recurrent
 from tokenspeed_kernel.ops.attention import (
     _attention_format_signature,
-    kda_chunk_prefill,
     kda_paged_decode,
+    kda_paged_prefill,
 )
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
@@ -34,11 +34,15 @@ def test_k3_safe_gate_reference_matches_sigmoid_contract() -> None:
     assert not torch.allclose(actual, legacy)
 
 
-def test_kda_chunk_prefill_uses_canonical_k_major_state() -> None:
+def test_kda_paged_prefill_uses_canonical_k_major_state() -> None:
     """Native prefill preserves the public [N,H,K,V] state layout."""
+    platform = current_platform()
+    if not (platform.is_cdna4 or platform.is_cdna5):
+        pytest.skip("gfx950/gfx1250 KDA dispatch test")
+
     device = "cuda"
     torch.manual_seed(3)
-    tokens, heads, key_dim, value_dim = 65, 2, 16, 4
+    tokens, heads, key_dim, value_dim = 65, 2, 128, 128
     q = torch.randn(tokens, heads, key_dim, device=device, dtype=torch.bfloat16)
     k = torch.randn_like(q)
     v = torch.randn(
@@ -60,6 +64,7 @@ def test_kda_chunk_prefill_uses_canonical_k_major_state() -> None:
     )
     a_log = torch.randn(heads, device=device, dtype=torch.float32)
     dt_bias = torch.randn(heads, key_dim, device=device, dtype=torch.float32)
+    cu_seqlens = torch.tensor([0, tokens], device=device, dtype=torch.int32)
 
     expected_out, expected_state = reference_kda_recurrent(
         q,
@@ -71,23 +76,23 @@ def test_kda_chunk_prefill_uses_canonical_k_major_state() -> None:
         a_log,
         dt_bias,
     )
-    actual_out, actual_state = kda_chunk_prefill(
-        q,
-        k,
-        v,
-        raw_g,
-        beta,
-        state,
+    result = kda_paged_prefill(
+        q.unsqueeze(0),
+        k.unsqueeze(0),
+        v.unsqueeze(0),
+        raw_g.unsqueeze(0),
+        beta.unsqueeze(0),
         a_log,
         dt_bias,
-        block_value=8,
+        initial_state=state,
+        cu_seqlens=cu_seqlens,
     )
 
     torch.testing.assert_close(
-        actual_out.float(), expected_out.float(), atol=6e-2, rtol=6e-2
+        result.out[0].float(), expected_out.float(), atol=6e-2, rtol=6e-2
     )
     torch.testing.assert_close(
-        actual_state,
+        result.final_state,
         expected_state.transpose(-1, -2).unsqueeze(0),
         atol=6e-2,
         rtol=6e-2,
@@ -95,18 +100,24 @@ def test_kda_chunk_prefill_uses_canonical_k_major_state() -> None:
 
 
 @pytest.mark.parametrize("lower_bound", [-5.0, None])
-@pytest.mark.parametrize("value_dim", [8, 5])
+@pytest.mark.parametrize(
+    ("heads", "key_dim", "value_dim"),
+    [(2, 8, 8), (2, 8, 5), (12, 128, 128)],
+)
 def test_kda_paged_decode_defaults_to_specialized_kernel_on_amd(
     lower_bound: float | None,
+    heads: int,
+    key_dim: int,
     value_dim: int,
 ) -> None:
     """AMD single-token dispatch must select Gluon and preserve native math."""
-    if not current_platform().is_cdna4:
-        pytest.skip("gfx950 KDA dispatch test")
+    platform = current_platform()
+    if not (platform.is_cdna4 or platform.is_cdna5):
+        pytest.skip("gfx950/gfx1250 KDA dispatch test")
 
     device = "cuda"
     torch.manual_seed(13)
-    tokens, heads, key_dim = 3, 2, 8
+    tokens = 3
     q = torch.randn(1, tokens, heads, key_dim, device=device, dtype=torch.bfloat16)
     k = torch.randn_like(q)
     v = torch.randn(1, tokens, heads, value_dim, device=device, dtype=torch.bfloat16)
@@ -134,7 +145,12 @@ def test_kda_paged_decode_defaults_to_specialized_kernel_on_amd(
         _attention_format_signature(q=q, k=k, v=v),
         traits={"indexed_state": True, "single_token": True},
     )
-    assert selected.name == "gluon_kda_paged_decode_gfx950"
+    expected_kernel = (
+        "gluon_kda_paged_decode_gfx1250"
+        if platform.is_cdna5
+        else "gluon_kda_paged_decode_gfx950"
+    )
+    assert selected.name == expected_kernel
 
     expected_out = []
     for row in range(tokens):
@@ -175,8 +191,8 @@ def test_kda_paged_decode_defaults_to_specialized_kernel_on_amd(
 
 def test_kda_paged_decode_graph_padding_and_page_stride() -> None:
     """Gluon decode supports padded graph batches and strided state pages."""
-    if not current_platform().is_cdna4:
-        pytest.skip("gfx950 KDA dispatch test")
+    if not (current_platform().is_cdna4 or current_platform().is_cdna5):
+        pytest.skip("gfx950/gfx1250 KDA dispatch test")
 
     torch.manual_seed(23)
     batch, active, heads, key_dim, value_dim = 4, 2, 2, 8, 5

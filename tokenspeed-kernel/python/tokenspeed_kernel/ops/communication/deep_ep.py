@@ -21,11 +21,13 @@
 from __future__ import annotations
 
 import logging
+import os
 from enum import Enum, IntEnum, auto
 from typing import Any
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.ops.communication.fabric import fabric_allocation_supported
 from tokenspeed_kernel.thirdparty.deep_ep import load_deep_ep
 
 __all__ = [
@@ -41,6 +43,32 @@ logger = logging.getLogger(__file__)
 # FP8 block-scale granularity shared by the dispatch quantization and the
 # per-local-expert receive alignment DeepGEMM's contiguous layout requires.
 _FP8_BLOCK = 128
+
+# MNNVL/fabric buffers need the full IMEX stack, which only exists on multi-node
+# NVLink domains such as GB200 NVL72. TS_DEEPEP_ALLOW_MNNVL=0/1 forces the
+# decision; when unset, the shared fabric-allocation probe decides.
+_ALLOW_MNNVL_ENV = "TS_DEEPEP_ALLOW_MNNVL"
+_allow_mnnvl_resolved: bool | None = None
+
+
+def _resolve_allow_mnnvl(device_index: int) -> bool:
+    """Decide once per process whether DeepEP may use MNNVL/fabric buffers.
+
+    ``TS_DEEPEP_ALLOW_MNNVL`` ("0"/"1") wins when set; otherwise the fabric
+    allocation probe decides. The result is cached because every rank must
+    hand the same choice to every DeepEP buffer it creates.
+    """
+    global _allow_mnnvl_resolved
+    if _allow_mnnvl_resolved is None:
+        override = os.environ.get(_ALLOW_MNNVL_ENV)
+        if override is not None:
+            _allow_mnnvl_resolved = override == "1"
+            source = f"{_ALLOW_MNNVL_ENV}={override}"
+        else:
+            _allow_mnnvl_resolved = fabric_allocation_supported(device_index)
+            source = "fabric allocation probe"
+        logger.info("DeepEP allow_mnnvl=%s (%s)", _allow_mnnvl_resolved, source)
+    return _allow_mnnvl_resolved
 
 
 def _raise_deepep_unavailable() -> None:
@@ -199,7 +227,7 @@ class DeepEPBuffer:
             num_rdma_bytes,
             low_latency_mode=deepep_mode.enable_low_latency(),
             num_qps_per_rank=num_qps_per_rank,
-            allow_mnnvl=True,
+            allow_mnnvl=_resolve_allow_mnnvl(torch.cuda.current_device()),
         )
         free_gpu_memory_end = _get_available_gpu_memory(torch.cuda.current_device())
         logger.info(

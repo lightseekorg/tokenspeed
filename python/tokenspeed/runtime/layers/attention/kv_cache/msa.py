@@ -8,7 +8,7 @@ from __future__ import annotations
 import torch
 
 from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPool
-from tokenspeed.runtime.layers.attention.kv_cache.plan import CacheMemoryPlan
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheMemoryPlan
 
 
 class MSATokenToKVPool(MHATokenToKVPool):
@@ -24,17 +24,16 @@ class MSATokenToKVPool(MHATokenToKVPool):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
-        max_batch_size: int,
-        max_context_len: int,
         page_size: int,
         rank: int,
         index_head_dim: int,
         index_dtype: torch.dtype,
         indexed_layer_ids: frozenset[int],
         memory_plan: CacheMemoryPlan,
+        paged_cache_group_specs: tuple = (),
+        token_capacity: int | None = None,
         layer_types: tuple[str, ...] = (),
-        sliding_window_tokens: int | tuple[int | None, ...] | None = None,
-        max_scheduled_tokens: int = 0,
+        layer_group_ids: tuple[str, ...] = (),
         pd_disaggregation_enabled: bool = False,
     ) -> None:
         self.index_head_dim = index_head_dim
@@ -49,15 +48,14 @@ class MSATokenToKVPool(MHATokenToKVPool):
             layer_num=layer_num,
             device=device,
             enable_memory_saver=enable_memory_saver,
-            max_batch_size=max_batch_size,
-            max_context_len=max_context_len,
             page_size=page_size,
             rank=rank,
             layer_types=layer_types,
-            sliding_window_tokens=sliding_window_tokens,
-            max_scheduled_tokens=max_scheduled_tokens,
+            layer_group_ids=layer_group_ids,
             pd_disaggregation_enabled=pd_disaggregation_enabled,
             memory_plan=memory_plan,
+            paged_cache_group_specs=paged_cache_group_specs,
+            token_capacity=token_capacity,
         )
         with self.memory_saver_adapter.region(
             tag="kv_cache",

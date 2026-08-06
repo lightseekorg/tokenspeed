@@ -57,6 +57,7 @@ trtllm_create_ipc_workspace_for_all_reduce_fusion = error_fn
 trtllm_create_ipc_workspace_for_minimax = error_fn
 
 if current_platform().is_nvidia:
+    from tokenspeed_kernel.ops.communication.fabric import fabric_allocation_supported
     from tokenspeed_kernel.thirdparty.cuda.trtllm import (
         _MNNVL_SUPPORTED_WORLD_SIZES,
         MNNVL_ONESHOT_MAX_TOKEN,
@@ -81,9 +82,10 @@ if current_platform().is_nvidia:
     def _mnnvl_locally_available(world_size: int) -> bool:
         """Non-collective capability probe for the MNNVL one-shot AR path.
 
-        Checks the compiled kernel symbol, torch symmetric-memory support and
-        NVLS multicast availability on this device. Purely local: safe to call
-        before any collective.
+        Checks the compiled kernel symbol, torch symmetric-memory support, NVLS
+        multicast availability, and -- for groups wider than this host -- that
+        fabric-handle memory really works. Purely local: safe to call before any
+        collective.
         """
         # Single source of truth: the kernel's own list. A duplicated literal
         # here silently gated out world 16 even after the kernel gained it --
@@ -100,6 +102,16 @@ if current_platform().is_nvidia:
 
             if not _SymmetricMemory.has_multicast_support(
                 DeviceType.CUDA, torch.cuda.current_device()
+            ):
+                return False
+            # One rank per GPU, so a wider group necessarily spans hosts, and
+            # its symmetric buffer needs multi-node NVLink rather than plain
+            # NVLS multicast. Multicast support is still advertised on hosts
+            # without the IMEX stack, where symm_mem.rendezvous() then hangs
+            # instead of failing, so the allocation has to be probed.
+            if (
+                world_size > torch.cuda.device_count()
+                and not fabric_allocation_supported(torch.cuda.current_device())
             ):
                 return False
             return hasattr(_load_trtllm_comm_module(), "trtllm_mnnvl_allreduce_fusion")
