@@ -41,11 +41,11 @@ struct SchedulerConfig {
 
     std::vector<PagedCacheGroupConfig> paged_cache_groups{};
 
-    // Prefix L2 serves normal admission outside Decode. Decode keeps its Host
-    // pool exclusively for content-indexed retraction and recovery state.
-    bool PrefixL2Enabled() const {
-        return !disable_l2_cache && host_allocator.total_pages > 1 && role != Role::kD;
-    }
+    bool HasHostCache() const { return !disable_l2_cache && host_allocator.total_pages > 1; }
+
+    // Decode uses Host cache only for best-effort Retraction and recovery. It
+    // does not continuously stream ordinary Device cache entries to Host.
+    bool StreamsDeviceCacheToHost() const { return HasHostCache() && role != Role::kD; }
 
     std::int32_t max_scheduled_tokens{};
     std::int32_t max_batch_size{};

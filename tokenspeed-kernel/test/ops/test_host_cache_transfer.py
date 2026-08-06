@@ -2,13 +2,23 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.kvcache.host_transfer import transfer_cache_ranges
+from tokenspeed_kernel.ops.kvcache.host_transfer import (
+    _triton_is_unavailable,
+    transfer_cache_ranges,
+)
 
-pytestmark = pytest.mark.skipif(
+requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires a CUDA device"
 )
 
 
+def test_unrelated_triton_runtime_error_does_not_fall_back_to_dma():
+    assert not _triton_is_unavailable(
+        RuntimeError("requested kernel specialization is not available")
+    )
+
+
+@requires_cuda
 @pytest.mark.parametrize("backend", ["dma", "auto", "triton"])
 def test_cache_ranges_round_trip_across_multiple_device_buffers(backend):
     first = torch.arange(64, dtype=torch.uint8, device="cuda")

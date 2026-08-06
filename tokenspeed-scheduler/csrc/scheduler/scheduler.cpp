@@ -50,16 +50,7 @@ std::int64_t ceilDiv(std::int64_t value, std::int64_t divisor) {
 }
 
 std::int32_t hostPoolBlocks(const SchedulerConfig& config) {
-    if (config.role == Role::kD) {
-        if (config.disable_l2_cache) {
-            throw std::invalid_argument("Scheduler: Decode requires Host L2 for retraction");
-        }
-        if (config.host_allocator.total_pages <= 1) {
-            throw std::invalid_argument("Scheduler: Decode Host L2 must contain a null page and usable capacity");
-        }
-        return config.host_allocator.total_pages - 1;
-    }
-    return config.PrefixL2Enabled() ? config.host_allocator.total_pages - 1 : 0;
+    return config.HasHostCache() ? config.host_allocator.total_pages - 1 : 0;
 }
 
 CacheKey eventKey(const CacheKey& key) {
@@ -81,7 +72,7 @@ Scheduler::Scheduler(SchedulerConfig config)
       host_pool_{hostPoolBlocks(config_)},
       coordinator_{MakeCoordinator(MakeSpecsFromConfig(config_), config_.block_size, block_pool_,
                                    host_pool_.NumLcmBlocks() > 0 ? &host_pool_ : nullptr,
-                                   config_.PrefixL2Enabled())},
+                                   config_.StreamsDeviceCacheToHost())},
       tier_transfers_{coordinator_} {
     if (config_.block_size <= 0) {
         throw std::invalid_argument("Scheduler: block_size must be > 0");
@@ -122,10 +113,6 @@ Scheduler::Scheduler(SchedulerConfig config)
         cache_entries_per_event_boundary_ += child_entries;
     }
     max_single_request_tokens_ = calculateMaxSingleRequestTokens(block_pool_.NumLcmBlocks());
-    if (config_.role == Role::kD) {
-        max_host_retraction_tokens_ = calculateMaxSingleRequestTokens(host_pool_.NumLcmBlocks());
-        max_single_request_tokens_ = std::min(max_single_request_tokens_, max_host_retraction_tokens_);
-    }
 
     if (config_.enable_kv_cache_events) {
         coordinator_.SetCacheMutationSink([this](const CacheKey& key, KvCacheCoordinator::CacheMutation mutation) {
@@ -337,8 +324,9 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
 }
 
 std::size_t Scheduler::WaitingSize() const {
-    return static_cast<std::size_t>(
-        std::ranges::count_if(requests_, [](const auto& item) { return item.second->template Is<fsm::Submitted>(); }));
+    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const auto& item) {
+        return item.second->template Is<fsm::Submitted>() || item.second->template Is<fsm::Retracted>();
+    }));
 }
 
 std::size_t Scheduler::DecodingSize() const {
@@ -416,7 +404,7 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
         buildForwardOperations(plan, std::move(candidates), write_back_operations);
     plan.With(ForwardBatch{std::move(forward_operations)});
 
-    if (config_.PrefixL2Enabled()) {
+    if (config_.StreamsDeviceCacheToHost()) {
         if (auto store = tier_transfers_.StartPendingStores()) {
             write_back_operations.push_back(std::move(*store));
         }

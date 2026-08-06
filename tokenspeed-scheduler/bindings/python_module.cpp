@@ -237,6 +237,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             [](const tokenspeed::ForwardBatch& op) -> const std::vector<std::int32_t>& { return op.prefill_lengths; },
             nb::rv_policy::reference_internal)
         .def_ro("decode_input_ids", &tokenspeed::ForwardBatch::decode_input_ids)
+        .def("is_local_prefill", &tokenspeed::ForwardBatch::IsLocalPrefill)
         .def_prop_ro(
             "block_tables",
             [](const tokenspeed::ForwardBatch& op)
@@ -297,8 +298,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def(nb::init<>())
         .def_prop_ro("forward", collect_forward)
         .def_prop_ro("cache", collect_cache)
-        .def_ro("pages_to_zero", &tokenspeed::ExecutionPlan::pages_to_zero)
-        .def_ro("aborted_request_id", &tokenspeed::ExecutionPlan::aborted_request_id);
+        .def_ro("pages_to_zero", &tokenspeed::ExecutionPlan::pages_to_zero);
 
     nb::class_<tokenspeed::Scheduler>(m, "Scheduler")
         .def(nb::init<tokenspeed::SchedulerConfig>(), nb::arg("config") = tokenspeed::SchedulerConfig{})
@@ -323,7 +323,6 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("active_kv_pages", &tokenspeed::Scheduler::ActiveKvPages)
         .def("request_token_size", &tokenspeed::Scheduler::RequestTokenSize, nb::arg("id"))
         .def("max_single_request_tokens", &tokenspeed::Scheduler::MaxSingleRequestTokens)
-        .def("max_host_retraction_tokens", &tokenspeed::Scheduler::MaxHostRetractionTokens)
         .def("clear_l1_cache", &tokenspeed::Scheduler::ClearL1Cache)
         .def("paged_cache_group_total_pages", &tokenspeed::Scheduler::PagedCacheGroupTotalPages, nb::arg("group_id"))
         .def("paged_cache_group_available_pages", &tokenspeed::Scheduler::PagedCacheGroupAvailablePages,

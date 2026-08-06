@@ -35,6 +35,8 @@
 
 namespace tokenspeed::fsm {
 
+enum class PrefillSource { kLocal, kRemote };
+
 struct CacheProgress {
     // One source of truth for both the next hash-chain seed and the cumulative
     // history needed to publish a resumable boundary across chunk edges.
@@ -124,11 +126,13 @@ private:
 struct Prefilling : public ForwardState {
     Prefilling(TokenContainer* token_container, std::int32_t page_size, std::unique_ptr<ReqPoolIndex> req_pool_index,
                TokenContainer::Window window, std::int32_t reserve_num_tokens_in_next_schedule_event,
-               std::vector<BlockTable> block_tables, CacheProgress cache_progress)
+               std::vector<BlockTable> block_tables, CacheProgress cache_progress,
+               PrefillSource source = PrefillSource::kLocal)
         : ForwardState(token_container, page_size, std::move(req_pool_index), std::move(block_tables),
                        std::move(cache_progress)),
           window{window},
-          reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event} {}
+          reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event},
+          source_{source} {}
 
     std::span<const std::int32_t> PrefillInputIds() const { return token_container_->TokenSlice(window); }
     std::vector<std::int32_t> ShiftedInputIds() const { return ComputeShiftedInputIds(token_container_, window); }
@@ -142,11 +146,13 @@ struct Prefilling : public ForwardState {
     }
 
     std::int32_t ReserveNumTokensInNextScheduleEvent() const { return reserve_num_tokens_in_next_schedule_event_; }
+    PrefillSource Source() const { return source_; }
 
     TokenContainer::Window window{};
 
 private:
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
+    PrefillSource source_{PrefillSource::kLocal};
 };
 
 struct PrefillDone : public ForwardState {
@@ -198,19 +204,12 @@ private:
     std::int32_t reserve_num_tokens_in_next_schedule_event_{-1};
 };
 
-// The Device state remains owned until the D2H acknowledgement commits the
-// complete retraction state. The Host tables are already pinned by strong refs.
-struct Retracting {
-    Decoding device_state;
-    std::vector<BlockTable> host_tables;
-    std::int32_t host_prefix_tokens{0};
-    CacheProgress cache_progress;
-};
-
 struct Retracted {
-    std::vector<BlockTable> host_tables;
-    CacheProgress cache_progress;
-    std::int32_t decode_reserve_tokens{};
+    TokenContainer* token_container{};
+    std::int32_t page_size{};
+
+    TokenContainer* TokenContainerPtr() const { return token_container; }
+    std::int32_t PageSize() const { return page_size; }
 };
 
 struct Finished {};

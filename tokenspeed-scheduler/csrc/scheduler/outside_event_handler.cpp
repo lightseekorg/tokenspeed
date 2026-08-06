@@ -144,11 +144,7 @@ void Scheduler::handleEvent(const forward::Abort& event) {
 }
 
 void Scheduler::handleEvent(const cache::WriteBackDone& event) {
-    if (auto request_id = tier_transfers_.CompleteWriteBack(event.op_id)) {
-        if (Request* request = findRequest(*request_id); request != nullptr && request->Is<fsm::Retracting>()) {
-            request->Apply(fsm::CompleteRetractionEvent{&coordinator_});
-        }
-    }
+    tier_transfers_.CompleteWriteBack(event.op_id);
 }
 
 void Scheduler::handleEvent(const cache::LoadBackDone& event) {

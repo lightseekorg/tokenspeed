@@ -22,6 +22,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
 #include <optional>
@@ -69,7 +70,6 @@ public:
     // otherwise reclaimable device pool. The runtime must enforce this limit
     // before submitting requests.
     std::int32_t MaxSingleRequestTokens() const { return max_single_request_tokens_; }
-    std::int32_t MaxHostRetractionTokens() const { return max_host_retraction_tokens_; }
 
     std::int32_t PagedCacheGroupTotalPages(const std::string& group_id) const;
     std::int32_t PagedCacheGroupAvailablePages(const std::string& group_id) const;
@@ -96,11 +96,7 @@ private:
         ExecutionPlan& plan;
         bool admission_failed{false};
         bool waits_for_store_ack{false};
-    };
-
-    struct RecoveryOperations {
-        std::optional<LoadBackOperation> load_back;
-        DecodeOperation decode;
+        std::optional<std::string> capacity_blocker;
     };
 
     std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> buildForwardOperations(
@@ -137,8 +133,6 @@ private:
                             std::vector<WriteBackOperation>& write_back_operations);
 
     std::optional<WriteBackOperation> beginRetraction(Request& request);
-    std::optional<RecoveryOperations> beginRecovery(PlanBuildContext& context, Request& request);
-
     std::size_t groupIndex(const std::string& group_id) const;
     Request* findRequest(const std::string& request_id);
 
@@ -166,10 +160,11 @@ private:
     TierTransferManager tier_transfers_;
     std::vector<std::string> cache_group_ids_;
     std::int32_t max_single_request_tokens_{0};
-    std::int32_t max_host_retraction_tokens_{0};
 
     std::unordered_map<std::string, std::int32_t> pending_forward_results_;
     std::unordered_set<std::string> pd_transfer_pins_;
+    std::deque<std::string> recovery_queue_;
+    std::optional<std::string> recovery_barrier_;
 
     std::unordered_map<std::string, std::unique_ptr<Request>> requests_;
     std::vector<KvCacheEvent> kv_events_;

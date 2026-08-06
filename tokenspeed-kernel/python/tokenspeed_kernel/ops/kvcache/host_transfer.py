@@ -42,7 +42,6 @@ def _triton_is_unavailable(error: Exception) -> bool:
             "triton is not available",
             "hostgetdevicepointer",
             "mapped host access is not available",
-            "is not available",
             "has no attribute 'transfer_cache_ranges'",
         )
     )

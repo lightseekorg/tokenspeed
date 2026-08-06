@@ -2448,33 +2448,6 @@ std::vector<KvCacheSpec> HostExtSpecs() {
             KvCacheSpec{.kind = AttnKind::kSlidingWindow, .sliding_window = 4, .cache_blocks_per_lcm_block = 1}};
 }
 
-TEST(KvCacheCoordinatorHostTier, RetractionHostPrefixMatchesFromTokenZero) {
-    BlockPool device_pool(8);
-    BlockPool host_pool(8);
-    KvCacheCoordinator coordinator = MakeCoordinator(HostExtSpecs(), /*cache_block_tokens=*/2, device_pool, &host_pool);
-    const std::vector<std::string> hashes = ContentHashes({{0, 0}, {1, 1}, {2, 2}, {3, 3}});
-    for (std::uint32_t group_id = 0; group_id < 2; ++group_id) {
-        for (const std::string& hash : hashes) {
-            (void)HostPut(coordinator, host_pool, hash, group_id);
-        }
-    }
-
-    std::vector<BlockTable> device_tables;
-    device_tables.push_back(
-        BlockTable::FromBlocks(device_pool.AcquireBlocks(/*group_id=*/0, 1, 4), /*available_tokens=*/0));
-    device_tables.push_back(
-        BlockTable::FromBlocks(device_pool.AcquireBlocks(/*group_id=*/1, 1, 2), /*available_tokens=*/0));
-    std::optional<CoordinatorMatch> match = coordinator.TryAcquireRetractionHostPrefix(
-        hashes, KvCacheCoordinatorTestAccess::NextAccessEpoch(coordinator), device_tables);
-
-    ASSERT_TRUE(match);
-    EXPECT_EQ(match->num_common_tokens, 8);
-    ASSERT_EQ(match->per_group.size(), 2u);
-    EXPECT_EQ(match->per_group[0].NumHitBlocks(), 4);
-    EXPECT_EQ(match->per_group[1].NumHitBlocks(), 2);
-    EXPECT_EQ(coordinator.NumPinnedHostCachedBlocks(), 6);
-}
-
 TEST(KvCacheCoordinatorHostExtension, PreservesAllNullWindowExtensionSlots) {
     BlockPool pool(3);
     const std::vector<KvCacheSpec> specs = {

@@ -65,8 +65,6 @@ public:
         return std::holds_alternative<State>(state_);
     }
 
-    void Recover(ReqPoolAllocator* req_pool_allocator, std::vector<BlockTable> device_tables);
-
     std::vector<std::span<const std::int32_t>> FullPagedTokens(bool except_last) const {
         return token_container_.FullPagedTokens(page_size_, except_last);
     }
@@ -99,11 +97,11 @@ public:
 
     fsm::CacheProgress CacheProgress() const { return forwardState("CacheProgress").CacheProgressRef(); }
 
-    const fsm::Retracted& RetractedState() const {
-        if (const auto* state = std::get_if<fsm::Retracted>(&state_)) {
-            return *state;
+    fsm::PrefillSource PrefillSource() const {
+        if (const auto* state = std::get_if<fsm::Prefilling>(&state_)) {
+            return state->Source();
         }
-        throw std::logic_error("Request::RetractedState: expected Retracted; got " + StateName());
+        throw std::logic_error("Request::PrefillSource: expected Prefilling; got " + StateName());
     }
 
     std::int32_t ReserveNumTokensInNextScheduleEvent() const {
@@ -127,7 +125,6 @@ public:
                               [](const fsm::Prefilling&) -> std::string { return "Prefilling"; },
                               [](const fsm::PrefillDone&) -> std::string { return "PrefillDone"; },
                               [](const fsm::Decoding&) -> std::string { return "Decoding"; },
-                              [](const fsm::Retracting&) -> std::string { return "Retracting"; },
                               [](const fsm::Retracted&) -> std::string { return "Retracted"; },
                               [](const fsm::Finished&) -> std::string { return "Finished"; },
                           },

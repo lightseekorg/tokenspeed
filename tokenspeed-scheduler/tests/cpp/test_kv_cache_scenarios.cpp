@@ -1671,7 +1671,7 @@ TEST(CacheProgressTest, PromotionBoundarySurvivesPrefillRounds) {
 
     request.Apply(fsm::SchedulePrefillFirstChunkEvent{/*tokens_this_round=*/4,
                                                       /*reserve_num_tokens_in_next_schedule_event=*/0, &req_pool,
-                                                      Role::kFused, &coordinator, std::move(tables),
+                                                      fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
                                                       /*hit_tokens=*/0,
                                                       fsm::CacheProgress{
                                                           .access_epoch = admission->access_epoch,
@@ -1758,7 +1758,8 @@ TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
 
     request.Apply(fsm::SchedulePrefillFirstChunkEvent{
         /*tokens_this_round=*/4,
-        /*reserve_num_tokens_in_next_schedule_event=*/3, &req_pool, Role::kD, &coordinator, std::move(tables),
+        /*reserve_num_tokens_in_next_schedule_event=*/3, &req_pool, fsm::PrefillSource::kRemote, &coordinator,
+        std::move(tables),
         /*hit_tokens=*/0, fsm::CacheProgress{.access_epoch = admission->access_epoch},
         /*load_pairs=*/{}});
     ASSERT_TRUE(request.Is<fsm::Prefilling>());
@@ -1769,9 +1770,8 @@ TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
     EXPECT_EQ(request.ReserveNumTokensInNextScheduleEvent(), 3);
 }
 
-TEST(RetractionStateFsmTest, RecoveryTransitionsDirectlyToDecoding) {
+TEST(RetractionStateFsmTest, RetractionTransitionsImmediatelyAndRebasesPrefill) {
     BlockPool device_pool(/*num_lcm_blocks=*/12);
-    BlockPool host_pool(/*num_lcm_blocks=*/12);
     std::vector<KvCacheSpec> specs{
         KvCacheSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
     };
@@ -1787,7 +1787,7 @@ TEST(RetractionStateFsmTest, RecoveryTransitionsDirectlyToDecoding) {
         /*tokens_this_round=*/4,
         /*reserve_num_tokens_in_next_schedule_event=*/1,
         &req_pool,
-        Role::kD,
+        fsm::PrefillSource::kRemote,
         &coordinator,
         std::move(tables),
         /*hit_tokens=*/0,
@@ -1798,31 +1798,29 @@ TEST(RetractionStateFsmTest, RecoveryTransitionsDirectlyToDecoding) {
     request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, request.CacheProgress()});
     ASSERT_TRUE(request.Is<fsm::Decoding>());
 
-    std::vector<BlockTable> host_tables;
-    std::vector<CacheBlockRef> host_blocks;
-    for (const CacheBlockRef& block_ref : request.BlockTablesRef().front().Blocks()) {
-        host_blocks.push_back(block_ref ? host_pool.AcquireBlock(0, 1) : CacheBlockRef{});
-    }
-    host_tables.push_back(BlockTable::FromBlocks(std::move(host_blocks),
-                                                 request.BlockTablesRef().front().AvailableTokens()));
-    request.Apply(fsm::BeginRetractionEvent{std::move(host_tables), /*host_prefix_tokens=*/0,
-                                            request.CacheProgress()});
-    ASSERT_TRUE(request.Is<fsm::Retracting>());
-    request.Apply(fsm::CompleteRetractionEvent{&coordinator});
+    request.Apply(fsm::RetractionEvent{&coordinator});
+
     ASSERT_TRUE(request.Is<fsm::Retracted>());
-    EXPECT_LT(host_pool.NumEmptyLcmBlocks(), host_pool.NumLcmBlocks());
+    EXPECT_EQ(request.PrefillSize(), request.TokenSize());
+    EXPECT_EQ(device_pool.NumEmptyLcmBlocks(), device_pool.NumLcmBlocks());
 
-    std::vector<CacheBlockRef> restored_blocks;
-    for (const CacheBlockRef& block_ref : request.RetractedState().host_tables.front().Blocks()) {
-        restored_blocks.push_back(block_ref ? device_pool.AcquireBlock(0, 1) : CacheBlockRef{});
-    }
-    std::vector<BlockTable> restored_tables;
-    restored_tables.push_back(BlockTable::FromBlocks(
-        std::move(restored_blocks), request.RetractedState().host_tables.front().AvailableTokens()));
-    request.Recover(&req_pool, std::move(restored_tables));
-
-    EXPECT_TRUE(request.Is<fsm::Decoding>());
-    EXPECT_EQ(host_pool.NumEmptyLcmBlocks(), host_pool.NumLcmBlocks());
+    std::vector<BlockTable> recovery_tables(coordinator.NumGroups());
+    auto recovery_admission = AdmitForTest(
+        coordinator, recovery_tables,
+        GroupDemand{.num_tokens = request.PrefillSize(), .reserve_tokens = 1});
+    ASSERT_TRUE(recovery_admission);
+    request.Apply(fsm::SchedulePrefillFirstChunkEvent{
+        request.PrefillSize(),
+        /*reserve_num_tokens_in_next_schedule_event=*/1,
+        &req_pool,
+        fsm::PrefillSource::kLocal,
+        &coordinator,
+        std::move(recovery_tables),
+        /*hit_tokens=*/0,
+        fsm::CacheProgress{.access_epoch = recovery_admission->access_epoch},
+        /*load_pairs=*/{},
+    });
+    EXPECT_TRUE(request.Is<fsm::PrefillDone>());
 }
 
 // Drive the FSM directly to pin the PrefillDone retract overload.
@@ -1845,7 +1843,8 @@ TEST(RetractEvent, PrefillDoneVictimReleasesPagesAndRequeues) {
     // Whole 4-token prompt in one chunk -> PrefillDone: holds pages, no decode yet.
     request.Apply(fsm::SchedulePrefillFirstChunkEvent{
         /*tokens_this_round=*/4,
-        /*reserve_num_tokens_in_next_schedule_event=*/1, &req_pool, Role::kFused, &coordinator, std::move(tables),
+        /*reserve_num_tokens_in_next_schedule_event=*/1, &req_pool, fsm::PrefillSource::kLocal, &coordinator,
+        std::move(tables),
         /*hit_tokens=*/0, fsm::CacheProgress{.access_epoch = admission->access_epoch},
         /*load_pairs=*/{}});
     ASSERT_TRUE(request.Is<fsm::PrefillDone>());
@@ -1919,7 +1918,8 @@ TEST(EventFailurePath, ReqPoolExhaustionAtFirstChunkLeavesPoolBalanced) {
     EXPECT_THROW(
         request.Apply(fsm::SchedulePrefillFirstChunkEvent{/*tokens_this_round=*/4,
                                                           /*reserve_num_tokens_in_next_schedule_event=*/1, &req_pool,
-                                                          Role::kFused, &coordinator, std::move(tables),
+                                                          fsm::PrefillSource::kLocal, &coordinator,
+                                                          std::move(tables),
                                                           /*hit_tokens=*/0,
                                                           /*cache_progress=*/{},
                                                           /*load_pairs=*/{}}),

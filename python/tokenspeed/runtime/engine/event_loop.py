@@ -118,7 +118,11 @@ def _forward_op_executes_model_forward(forward_op, *, is_disagg_decode: bool) ->
         return False
     if sum(forward_op.input_lengths) <= 0:
         return False
-    if is_disagg_decode and forward_op.num_extends() > 0:
+    if (
+        is_disagg_decode
+        and forward_op.num_extends() > 0
+        and not forward_op.is_local_prefill()
+    ):
         return False
     return True
 
@@ -421,14 +425,6 @@ class EventLoop:
             [group.group_id for group in paged_cache_groups],
         )
         self.scheduler = Scheduler(scheduler_cfg)
-        if server_args.disaggregation_mode == "decode":
-            host_retraction_tokens = self.scheduler.max_host_retraction_tokens()
-            if host_retraction_tokens < self.model_config.context_len:
-                raise RuntimeError(
-                    "Decode Host L2 must hold one max-context retraction state: "
-                    f"capacity={host_retraction_tokens}, "
-                    f"model_context_len={self.model_config.context_len}"
-                )
         self.max_single_request_tokens = self.scheduler.max_single_request_tokens()
         self.max_model_len = min(
             self.model_config.context_len, self.max_single_request_tokens
@@ -750,10 +746,9 @@ class EventLoop:
         for payload in ready_payloads:
             e = cache_event_from_payload(payload)
             logger.debug(
-                "[cache_poll] event: op_id=%s type=%s request_id=%s",
+                "[cache_poll] event: op_id=%s type=%s",
                 e.op_id,
                 type(e).__name__,
-                getattr(e, "request_id", "N/A"),
             )
             ec.add_event(e)
         self.scheduler.advance(ec)
@@ -883,7 +878,7 @@ class EventLoop:
 
         elif isinstance(self.kv_transfer, DisaggDecodeExecutor):
             # Decode node
-            if forward_op.num_extends() > 0:
+            if forward_op.num_extends() > 0 and not forward_op.is_local_prefill():
                 # Path 2: new requests waiting for remote KV — trigger RDMA receive
                 self.kv_transfer.reset_valid_cache_length(
                     forward_op,
@@ -900,7 +895,7 @@ class EventLoop:
                 self.kv_transfer.execute(forward_op)
                 return None, None
             else:
-                # Path 3b: decode batch — normal forward
+                # Decode and local recovery-prefill batches execute normally.
                 self.model_executor.reset_valid_cache_length(forward_op)
                 return (
                     self.model_executor.execute_forward_op_with_log(
@@ -1328,19 +1323,6 @@ class EventLoop:
             return None
         return forward_ops[0]
 
-    def _publish_scheduler_abort(self, execution_plan) -> None:
-        """Finish requests the scheduler dropped after Host retraction failed."""
-        request_id = execution_plan.aborted_request_id
-        if request_id is None:
-            return
-        state = self.output_processor.rid_to_state.get(request_id)
-        if state is None:
-            return
-        state.set_finish_with_abort(
-            "Decode cache capacity exhausted", notify_client=True
-        )
-        self.output_processor.reap_finished_orphan(request_id, state)
-
     def _process_kv_transfer_events(self, kv_transfer_events: list) -> list:
         processed = []
         for event in kv_transfer_events:
@@ -1578,7 +1560,6 @@ class EventLoop:
                 self._paused_idle_step()
                 continue
             execution_plan = self.scheduler.next_execution_plan()
-            self._publish_scheduler_abort(execution_plan)
             self._publish_scheduler_kv_events()
             cache_zero_event = self.model_executor.zero_cache_pages(
                 execution_plan.pages_to_zero
@@ -1731,7 +1712,6 @@ class EventLoop:
                 prev_forward_op = None
                 continue
             execution_plan = self.scheduler.next_execution_plan()
-            self._publish_scheduler_abort(execution_plan)
             self._publish_scheduler_kv_events()
 
             cache_zero_event = self.model_executor.zero_cache_pages(

@@ -22,8 +22,6 @@
 
 #include <cstdint>
 #include <optional>
-#include <span>
-#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -33,22 +31,6 @@
 #include "cache/tier/transfer.h"
 
 namespace tokenspeed {
-
-// Temporary ownership between fallible Host allocation and the committed
-// retraction transition. Destruction rolls back an unstarted writeback.
-struct PreparedRetraction {
-    std::vector<BlockTable> host_tables;
-    std::vector<BlockTransfer> transfers;
-    std::int32_t host_prefix_tokens{0};
-};
-
-// Temporary ownership between fallible Device admission and the committed
-// recovery transition. Destruction rolls back an unstarted loadback.
-struct PreparedRecovery {
-    std::vector<BlockTable> device_tables;
-    std::vector<BlockTransfer> transfers;
-    std::vector<std::vector<std::int32_t>> new_device_page_ids;
-};
 
 // Owns the mechanics and asynchronous lifetime of transfers between Device and
 // Host cache tiers. Scheduling policy and request state transitions stay in
@@ -60,19 +42,7 @@ public:
     std::optional<WriteBackOperation> StartPendingStores();
     LoadBackOperation StartPrefixLoad(std::vector<BlockTransfer> block_transfers);
 
-    std::optional<PreparedRetraction> PrepareRetraction(std::span<const std::string> page_hashes,
-                                                        std::uint64_t access_epoch,
-                                                        std::span<const BlockTable> device_tables);
-    std::optional<PreparedRecovery> PrepareRecovery(std::span<const std::string> page_hashes,
-                                                    std::uint64_t access_epoch,
-                                                    std::span<const BlockTable> host_tables,
-                                                    std::int32_t decode_reserve_tokens);
-    WriteBackOperation StartRetraction(std::string request_id, std::vector<BlockTransfer> block_transfers);
-    LoadBackOperation StartRecovery(std::vector<BlockTransfer> block_transfers);
-
-    // Returns a request id only for a retraction writeback. Ordinary cache
-    // stores are retired internally.
-    std::optional<std::string> CompleteWriteBack(std::uint32_t op_id);
+    void CompleteWriteBack(std::uint32_t op_id);
     void CompleteLoadBack(std::uint32_t op_id);
 
     bool HasStoresInFlight() const;
@@ -87,15 +57,8 @@ private:
         CacheBlockRef host_block_ref;
     };
 
-    struct RetractionTicket {
-        std::string request_id;
-        // Pins both tiers until the runtime acknowledges the copy.
-        std::vector<BlockTransfer> transfers;
-    };
-
     struct WriteBackTicket {
         std::vector<StoreTicket> stores;
-        std::optional<RetractionTicket> retraction;
     };
 
     std::uint32_t nextOpId() { return next_op_id_++; }

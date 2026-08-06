@@ -25,6 +25,7 @@
 #include <memory>
 #include <optional>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "cache/manager/full_attn_manager.h"
@@ -257,7 +258,7 @@ KvCacheCoordinator::PrefixProbe KvCacheCoordinator::ProbePrefix(std::span<const 
     out.group_keys = buildGroupKeys(content_hashes);
     out.device = probeTierWithKeys<CacheTier::kDevice>(out.group_keys, match_order_, num_cache_blocks,
                                                        /*floor_tokens=*/0);
-    if (stream_device_cache_to_host_) {
+    if (host_pool_ != nullptr) {
         out.host = probeTierWithKeys<CacheTier::kHost>(out.group_keys, match_order_, num_cache_blocks,
                                                        /*floor_tokens=*/out.device.num_common_tokens);
     }
@@ -301,96 +302,11 @@ KvCacheCoordinator::PrefixProbe KvCacheCoordinator::ProbeDecodeDevicePrefix(
     return out;
 }
 
-std::optional<CoordinatorMatch> KvCacheCoordinator::TryAcquireRetractionHostPrefix(
-    std::span<const std::string> content_hashes, std::uint64_t access_epoch,
-    std::span<const BlockTable> device_tables) {
-    _assert(host_pool_ != nullptr, "Retraction Host prefix acquisition requires a Host tier");
-    _assert(access_epoch > 0 && access_epoch <= next_access_epoch_,
-            "Retraction Host prefix acquisition requires a coordinator-issued access epoch");
-    _assert(device_tables.size() == groups_.size(), "retraction requires one Device table per cache group");
-    _assert(content_hashes.size() <=
-                static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max() / cache_block_tokens_),
-            "prefix length exceeds int32 token range");
-    const std::int32_t num_cache_blocks = static_cast<std::int32_t>(content_hashes.size());
-    std::vector<std::vector<CacheKey>> group_keys = buildGroupKeys(content_hashes);
-    PrefixProbe::Tier probe = probeTierWithKeys<CacheTier::kHost>(group_keys, match_order_, num_cache_blocks,
-                                                                  /*floor_tokens=*/0);
-    if (!canAllocateRetractionHostBlocks(group_keys, probe, device_tables)) {
-        return std::nullopt;
-    }
-    return acquireTierWithKeys<CacheTier::kHost>(group_keys, /*floor_tokens=*/0, std::move(probe), access_epoch);
-}
-
-bool KvCacheCoordinator::canAllocateRetractionHostBlocks(
-    std::span<const std::vector<CacheKey>> group_keys, const PrefixProbe::Tier& probe,
-    std::span<const BlockTable> device_tables) const {
-    _assert(host_pool_ != nullptr, "Retraction Host capacity check requires a Host tier");
-    _assert(group_keys.size() == groups_.size() && probe.per_group.size() == groups_.size() &&
-                device_tables.size() == groups_.size(),
-            "Retraction Host capacity inputs must cover every cache group");
-
-    std::unordered_set<CacheBlockLocation, CacheBlockLocationHash> matched_host_locations;
-    std::unordered_set<CacheBlockLocation, CacheBlockLocationHash> evictable_host_locations;
-    std::vector<std::int64_t> missing_blocks_by_group(groups_.size(), 0);
-    for (std::size_t group_index = 0; group_index < groups_.size(); ++group_index) {
-        const KvCacheManager& manager = groups_[group_index].Manager();
-        const GroupPrefixProbe& group_probe = probe.per_group[group_index];
-        for (CacheBlockLocation location :
-             manager.MatchedBlockLocations(*host_pool_, group_keys[group_index], /*begin_blocks=*/0, group_probe)) {
-            matched_host_locations.insert(location);
-        }
-        for (CacheBlockLocation location : manager.EvictableBlockLocations(*host_pool_)) {
-            evictable_host_locations.insert(location);
-        }
-        const auto& source_blocks = device_tables[group_index].Blocks();
-        for (std::size_t block_index = 0; block_index < source_blocks.size(); ++block_index) {
-            const bool matched = block_index < group_probe.hits.size() && group_probe.hits[block_index] != 0;
-            if (source_blocks[block_index] && !matched) {
-                ++missing_blocks_by_group[group_index];
-            }
-        }
-    }
-
-    // Simulate evicting every cache-only, non-matched Host child. This proves
-    // the entire image fits before prefix acquisition can touch recency or a
-    // real allocation can evict an entry.
-    std::vector<std::int64_t> free_slots_by_group(groups_.size(), 0);
-    std::int64_t num_empty_parents = 0;
-    for (std::int32_t parent_id = 1; parent_id <= host_pool_->NumLcmBlocks(); ++parent_id) {
-        const std::optional<std::uint32_t> group_id = host_pool_->BoundGroup(parent_id);
-        if (!group_id) {
-            ++num_empty_parents;
-            continue;
-        }
-        const KvCacheManager& manager = groups_[*group_id].Manager();
-        std::int32_t retained_children = 0;
-        for (CacheBlockLocation location : host_pool_->OccupiedLocations(parent_id)) {
-            if (matched_host_locations.contains(location) || !evictable_host_locations.contains(location)) {
-                ++retained_children;
-            }
-        }
-        if (retained_children == 0) {
-            ++num_empty_parents;
-        } else {
-            free_slots_by_group[*group_id] += manager.CacheBlocksPerLcmBlock() - retained_children;
-        }
-    }
-
-    std::int64_t num_required_parents = 0;
-    for (std::size_t group_index = 0; group_index < groups_.size(); ++group_index) {
-        const std::int64_t remaining = std::max(
-            missing_blocks_by_group[group_index] - free_slots_by_group[group_index], std::int64_t{0});
-        const std::int64_t packing = groups_[group_index].Manager().CacheBlocksPerLcmBlock();
-        num_required_parents += (remaining + packing - 1) / packing;
-    }
-    return num_required_parents <= num_empty_parents;
-}
-
 KvCacheCoordinator::AcquiredPrefix KvCacheCoordinator::acquirePrefix(PrefixProbe&& probe, std::uint64_t access_epoch) {
     AcquiredPrefix out;
     out.device = acquireTierWithKeys<CacheTier::kDevice>(probe.group_keys, /*floor_tokens=*/0,
                                                          std::move(probe.device), access_epoch);
-    if (stream_device_cache_to_host_ && !probe.host.per_group.empty()) {
+    if (host_pool_ != nullptr && !probe.host.per_group.empty()) {
         out.host = acquireTierWithKeys<CacheTier::kHost>(probe.group_keys, out.device.num_common_tokens,
                                                          std::move(probe.host), access_epoch);
     }
@@ -408,6 +324,57 @@ std::int32_t KvCacheCoordinator::NumAvailableLcmBlocks() const {
     return available;
 }
 
+std::int32_t KvCacheCoordinator::NumNewlyReleasableLcmBlocks(std::span<const BlockTable> tables) const {
+    _assert(tables.size() == groups_.size(), "release estimate requires one table per cache group");
+
+    struct ReleasedRefs {
+        const CacheBlockRef* block_ref{};
+        std::uint32_t count{0};
+    };
+    std::vector<std::unordered_map<CacheBlockLocation, ReleasedRefs, CacheBlockLocationHash>> released_by_group(
+        groups_.size());
+    std::unordered_set<std::int32_t> referenced_parents;
+    for (std::size_t group_id = 0; group_id < tables.size(); ++group_id) {
+        for (const CacheBlockRef& block_ref : tables[group_id].Blocks()) {
+            if (!block_ref) {
+                continue;
+            }
+            const CacheBlockLocation location = block_ref->Location();
+            ReleasedRefs& refs = released_by_group[group_id][location];
+            refs.block_ref = &block_ref;
+            ++refs.count;
+            referenced_parents.insert(location.lcm_block_id);
+        }
+    }
+
+    std::int32_t count = 0;
+    for (std::int32_t parent_id : referenced_parents) {
+        const std::optional<std::uint32_t> group_id = pool_.BoundGroup(parent_id);
+        _assert(group_id.has_value(), "request table references an unbound LCM block");
+        const KvCacheManager& manager = groups_[*group_id].Manager();
+        bool parent_becomes_reclaimable = true;
+        for (CacheBlockLocation location : pool_.OccupiedLocations(parent_id)) {
+            const auto released = released_by_group[*group_id].find(location);
+            if (released == released_by_group[*group_id].end()) {
+                parent_becomes_reclaimable = false;
+                break;
+            }
+            const std::uint32_t owners = released->second.block_ref->use_count();
+            _assert(owners >= released->second.count, "request-owned reference count exceeds total owners");
+            const std::uint32_t retained_owners = owners - released->second.count;
+            const std::uint32_t allowed_owners = manager.ContainsCachedBlock(pool_, location) ? 1U : 0U;
+            if (retained_owners != allowed_owners) {
+                parent_becomes_reclaimable = false;
+                break;
+            }
+        }
+        if (parent_becomes_reclaimable) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 void KvCacheCoordinator::CacheFullBlocks(std::span<BlockTable> tables, std::span<const std::string> content_hashes,
                                          std::uint64_t access_epoch, std::int32_t first_slot,
                                          CacheBoundaryKind boundary_kind) {
@@ -420,6 +387,19 @@ void KvCacheCoordinator::CacheFullBlocks(std::span<BlockTable> tables, std::span
         const std::int32_t cache_blocks_per_hash = cache_block_tokens_ / groups_[i].Manager().CacheBlockTokens();
         cacheFullBlocksForGroup<CacheTier::kDevice>(i, tables[i], keys, first_slot * cache_blocks_per_hash,
                                                     access_epoch, boundary_kind);
+    }
+}
+
+void KvCacheCoordinator::QueueCachedBlocksForStore(std::span<const std::string> page_hashes) {
+    if (host_pool_ == nullptr) {
+        return;
+    }
+    for (const CacheGroup& group : groups_) {
+        for (CacheKey& key : keysForGroup(page_hashes, group.Id())) {
+            if (group.Manager().ContainsCachedBlock(pool_, key)) {
+                pending_stores_.push_back(StoreCandidate{.key = std::move(key)});
+            }
+        }
     }
 }
 
@@ -438,27 +418,6 @@ void KvCacheCoordinator::CacheCompletedBlocks(std::span<BlockTable> tables, std:
             .num_computed_tokens = num_computed_tokens,
         };
         cacheDeviceCompletedBlocksForGroup(i, demand, access_epoch);
-    }
-}
-
-void KvCacheCoordinator::CacheHostCompletedBlocks(std::span<BlockTable> tables,
-                                                  std::span<const std::string> page_hashes,
-                                                  std::uint64_t access_epoch, std::int32_t first_new_page,
-                                                  std::int32_t num_computed_tokens,
-                                                  CacheBoundaryKind boundary_kind) {
-    _assert(host_pool_ != nullptr, "CacheHostCompletedBlocks requires a Host tier");
-    _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
-    _assert(first_new_page >= 0 && static_cast<std::size_t>(first_new_page) < page_hashes.size(),
-            "completed Host page range must be non-empty");
-    for (std::size_t i = 0; i < groups_.size(); ++i) {
-        const GroupDemand demand{
-            .table = &tables[i],
-            .page_hashes = page_hashes,
-            .new_page_hash_begin = first_new_page,
-            .completed_boundary_kind = boundary_kind,
-            .num_computed_tokens = num_computed_tokens,
-        };
-        cacheCompletedBlocksForGroup<CacheTier::kHost>(i, demand, access_epoch);
     }
 }
 

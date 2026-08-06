@@ -103,16 +103,14 @@ public:
     // restored from the remote endpoint snapshot. Their aligned null holes do
     // not count as cache hits.
     PrefixProbe ProbeDecodeDevicePrefix(std::span<const std::string> content_hashes) const;
-    // Returns without touching Host cache metadata or eviction state when the
-    // complete retraction image cannot be placed.
-    std::optional<CoordinatorMatch> TryAcquireRetractionHostPrefix(
-        std::span<const std::string> content_hashes, std::uint64_t access_epoch,
-        std::span<const BlockTable> device_tables);
     std::optional<AdmissionResult> Admit(PrefixProbe&& prefix, std::span<const GroupDemand> demands,
                                          std::optional<std::uint64_t> request_access_epoch = std::nullopt);
     bool CanAdmitAfterReleasing(
         const PrefixProbe& prefix, std::span<const GroupDemand> demands,
         std::span<const std::pair<std::uint32_t, CacheBlockLocation>> pending_store_releases) const;
+    // Number of physical parents that become reclaimable after dropping the
+    // exact request-owned refs in tables. Used only to rank Retraction victims.
+    std::int32_t NumNewlyReleasableLcmBlocks(std::span<const BlockTable> tables) const;
 
     std::int32_t NumAvailableLcmBlocks() const;
 
@@ -134,6 +132,9 @@ public:
     struct StoreCandidate {
         CacheKey key;
     };
+    // Retry ordinary D2H Store for already-published Device cache entries.
+    // Missing keys and an absent Host tier are silently skipped.
+    void QueueCachedBlocksForStore(std::span<const std::string> page_hashes);
     std::vector<StoreCandidate> TakePendingStores() { return std::exchange(pending_stores_, {}); }
     CacheBlockRef AcquireDeviceCachedBlock(const CacheKey& key) const;
     CacheBlockRef AcquireHostBlock(std::uint32_t group_id);
@@ -144,9 +145,6 @@ public:
     std::int32_t NumHostCachedBlocks() const;
     std::int32_t NumPinnedHostCachedBlocks() const;
     void CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key);
-    void CacheHostCompletedBlocks(std::span<BlockTable> tables, std::span<const std::string> page_hashes,
-                                  std::uint64_t access_epoch, std::int32_t first_new_page,
-                                  std::int32_t num_computed_tokens, CacheBoundaryKind boundary_kind);
 
     // Reports real device-cache entry insertions and removals. The scheduler
     // folds the per-group mutations into one externally visible prefix event.
@@ -175,9 +173,6 @@ private:
                                          std::int32_t floor_tokens, PrefixProbe::Tier&& probe,
                                          std::uint64_t access_epoch);
     AcquiredPrefix acquirePrefix(PrefixProbe&& probe, std::uint64_t access_epoch);
-    bool canAllocateRetractionHostBlocks(std::span<const std::vector<CacheKey>> group_keys,
-                                         const PrefixProbe::Tier& probe,
-                                         std::span<const BlockTable> device_tables) const;
     template <CacheTier Tier>
     void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table, std::span<const CacheKey> keys,
                                  std::int32_t first_cache_block, std::uint64_t access_epoch,
