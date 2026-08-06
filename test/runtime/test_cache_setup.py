@@ -4,11 +4,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tokenspeed.runtime.configs.paged_cache_spec import (
-    FULL_ATTENTION,
-    LINEAR_ATTENTION,
-    PagedCacheGroupSpec,
-)
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.configs.msa import MSAConfig
@@ -18,11 +13,19 @@ from tokenspeed.runtime.layers.attention.kv_cache.hybrid_mha import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
-from tokenspeed.runtime.layers.attention.kv_cache.plan import CacheFieldSpec
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
     build_hybrid_cache_setup,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.setup import prepare_cache_setup
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheFieldSpec
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
+    prepare_cache_setup,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    FULL_ATTENTION,
+    LINEAR_ATTENTION,
+    PagedCacheGroupSpec,
+    build_paged_cache_group_specs,
+)
 from tokenspeed.runtime.layers.attention.registry import (
     _validate_shared_cache_geometry,
 )
@@ -102,6 +105,31 @@ def _msa_config() -> MSAConfig:
 
 
 def _hybrid_setup_with_narrow_draft():
+    # The recipe owns the complete published specs; "state" here is a
+    # layer-external group, plain tuple concatenation like Inkling's
+    # checkpoint columns.
+    group_specs = (
+        *build_paged_cache_group_specs(
+            layer_types=("full_attention",),
+            group_ids=("full_attention",),
+            sliding_window_tokens=None,
+            page_size=4,
+        ),
+        PagedCacheGroupSpec(
+            group_id="state",
+            retention="full_history",
+            rows_per_page=4,
+            entry_stride_tokens=1,
+            sliding_window_tokens=None,
+            family="state",
+        ),
+    )
+    draft_group_specs = build_paged_cache_group_specs(
+        layer_types=("full_attention",),
+        group_ids=("full_attention",),
+        sliding_window_tokens=None,
+        page_size=4,
+    )
     return build_hybrid_cache_setup(
         family="inkling",
         server_args=SimpleNamespace(max_total_tokens=None),
@@ -111,6 +139,7 @@ def _hybrid_setup_with_narrow_draft():
         ),
         layer_types=("full_attention",),
         group_ids=("full_attention",),
+        group_specs=group_specs,
         state_dtypes={},
         layer_kv_head_counts=None,
         draft_fields=(
@@ -118,6 +147,7 @@ def _hybrid_setup_with_narrow_draft():
         ),
         draft_layer_types=("full_attention",),
         draft_group_ids=("full_attention",),
+        draft_group_specs=draft_group_specs,
         draft_layer_kv_head_counts=None,
         cache_budget_bytes=2_048,
         fixed_workspace_bytes=0,

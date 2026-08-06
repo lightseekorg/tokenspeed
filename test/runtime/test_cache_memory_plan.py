@@ -47,8 +47,8 @@ def _load_cache_modules():
     ):
         sys.modules.setdefault(package_name, types.ModuleType(package_name))
     plan = _load(
-        "tokenspeed.runtime.layers.attention.kv_cache.plan",
-        _KV_CACHE_DIR / "plan.py",
+        "tokenspeed.runtime.layers.attention.kv_cache.recipes.plan",
+        _RECIPE_DIR / "plan.py",
     )
     _load(
         "tokenspeed.runtime.layers.attention.kv_cache.recipes",
@@ -81,6 +81,26 @@ class CacheMemoryPlanTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.plan_module, cls.layouts_module = _load_cache_modules()
+
+    def _plan_fields(
+        self,
+        fields,
+        *,
+        logical_block_tokens,
+        budget_bytes=None,
+        num_lcm_blocks=None,
+        **kwargs,
+    ):
+        """Solve a layout and bind capacity the way the recipes do."""
+        layout = self.plan_module.solve_cache_layout(
+            fields,
+            logical_block_tokens=logical_block_tokens,
+            **kwargs,
+        )
+        if budget_bytes is not None:
+            # Parent 0 backs logical null page 0 and is never schedulable.
+            num_lcm_blocks = budget_bytes // layout.lcm_block_bytes - 1
+        return layout.with_num_lcm_blocks(num_lcm_blocks)
 
     def test_qwen_recipe_keeps_one_logical_block_size(self):
         fields = self.layouts_module.qwen_gdn_cache_fields(
@@ -150,7 +170,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
             by_id["layer.2.k"].plane_id,
         )
 
-        plan = self.plan_module.plan_cache_fields(
+        plan = self._plan_fields(
             fields,
             logical_block_tokens=128,
             num_lcm_blocks=2,
@@ -213,12 +233,12 @@ class CacheMemoryPlanTest(unittest.TestCase):
             }
             self.assertTrue(function_names.issubset(definitions), file_name)
 
-        planner_source = (_KV_CACHE_DIR / "plan.py").read_text().lower()
+        planner_source = (_RECIPE_DIR / "plan.py").read_text().lower()
         for model_name in ("qwen", "inkling", "kimi", "deepseek"):
             self.assertNotIn(model_name, planner_source)
 
     def test_cache_pool_factory_is_separate_from_setup(self):
-        setup_module = ast.parse((_KV_CACHE_DIR / "setup.py").read_text())
+        setup_module = ast.parse((_RECIPE_DIR / "setup.py").read_text())
         factory_module = ast.parse((_KV_CACHE_DIR / "factory.py").read_text())
 
         setup_functions = {
@@ -247,7 +267,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
         }
         self.assertNotIn("create_cache_pool", called_names)
-        self.assertNotIn("plan_cache_fields", called_names)
+        self.assertNotIn("solve_cache_layout", called_names)
         self.assertNotIn("profile_max_num_pages", called_names)
 
     def test_deepseek_v4_recipe_uses_one_p256_scheduler_domain(self):
@@ -282,7 +302,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
             576,
         )
 
-        plan = self.plan_module.plan_cache_fields(
+        plan = self._plan_fields(
             fields,
             logical_block_tokens=256,
             num_lcm_blocks=4,
@@ -318,7 +338,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
             ),
         )
 
-        plan = self.plan_module.plan_cache_fields(
+        plan = self._plan_fields(
             fields,
             logical_block_tokens=128,
             budget_bytes=8192,
@@ -364,7 +384,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
 
     def test_flexible_field_preserves_required_page_stride_alignment(self):
         field = self.plan_module.CacheFieldSpec
-        plan = self.plan_module.plan_cache_fields(
+        plan = self._plan_fields(
             (
                 field(
                     "compressed",
@@ -429,20 +449,10 @@ class CacheMemoryPlanTest(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "field ids must be unique"):
-            self.plan_module.plan_cache_fields(
+            self._plan_fields(
                 fields,
                 logical_block_tokens=16,
                 budget_bytes=4096,
-            )
-
-    def test_budget_must_hold_null_and_usable_parent(self):
-        field = self.plan_module.CacheFieldSpec
-
-        with self.assertRaisesRegex(ValueError, "null parent"):
-            self.plan_module.plan_cache_fields(
-                (field("history", "history.k", "plane.a", (128, 8), 2),),
-                logical_block_tokens=128,
-                budget_bytes=2048,
             )
 
     def test_fixed_parent_count_and_explicit_packing(self):
@@ -452,7 +462,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
             field("state", "state.ssm", "plane.k", (128, 2), 2),
         )
 
-        plan = self.plan_module.plan_cache_fields(
+        plan = self._plan_fields(
             fields,
             logical_block_tokens=128,
             num_lcm_blocks=7,
@@ -468,7 +478,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
 
     def test_explicit_packing_is_bounded_by_page_ids_not_a_magic_count(self):
         field = self.plan_module.CacheFieldSpec
-        plan = self.plan_module.plan_cache_fields(
+        plan = self._plan_fields(
             (field("history", "history.k", "plane.k", (1,), 1),),
             logical_block_tokens=16,
             num_lcm_blocks=2,
@@ -483,7 +493,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
 
     def test_automatic_packing_keeps_large_exact_byte_ratio(self):
         field = self.plan_module.CacheFieldSpec
-        plan = self.plan_module.plan_cache_fields(
+        plan = self._plan_fields(
             (
                 field("history", "history.k", "plane.shared", (1,), 1),
                 field("state", "state.ssm", "plane.shared", (256,), 1),
@@ -498,26 +508,6 @@ class CacheMemoryPlanTest(unittest.TestCase):
         )
         self.assertEqual(plan.group("state").cache_blocks_per_lcm_block, 1)
 
-    def test_requires_exactly_one_capacity_input(self):
-        field = self.plan_module.CacheFieldSpec
-        fields = (field("history", "history.k", "plane.k", (128, 8), 2),)
-
-        for kwargs in (
-            {},
-            {"budget_bytes": 4096, "num_lcm_blocks": 2},
-        ):
-            with (
-                self.subTest(kwargs=kwargs),
-                self.assertRaisesRegex(
-                    ValueError, "exactly one of budget_bytes and num_lcm_blocks"
-                ),
-            ):
-                self.plan_module.plan_cache_fields(
-                    fields,
-                    logical_block_tokens=128,
-                    **kwargs,
-                )
-
     def test_fixed_parent_count_must_be_a_positive_integer(self):
         field = self.plan_module.CacheFieldSpec
         fields = (field("history", "history.k", "plane.k", (128, 8), 2),)
@@ -527,7 +517,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
                 self.subTest(count=count),
                 self.assertRaisesRegex(ValueError, "positive integer"),
             ):
-                self.plan_module.plan_cache_fields(
+                self._plan_fields(
                     fields,
                     logical_block_tokens=128,
                     num_lcm_blocks=count,
@@ -548,7 +538,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
                 self.subTest(packing=packing),
                 self.assertRaisesRegex(ValueError, "exactly the cache groups"),
             ):
-                self.plan_module.plan_cache_fields(
+                self._plan_fields(
                     fields,
                     logical_block_tokens=128,
                     num_lcm_blocks=2,
@@ -564,7 +554,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
                 self.subTest(count=count),
                 self.assertRaisesRegex(ValueError, "packing"),
             ):
-                self.plan_module.plan_cache_fields(
+                self._plan_fields(
                     fields,
                     logical_block_tokens=128,
                     num_lcm_blocks=2,
@@ -579,7 +569,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "needs page stride"):
-            self.plan_module.plan_cache_fields(
+            self._plan_fields(
                 fields,
                 logical_block_tokens=128,
                 num_lcm_blocks=2,

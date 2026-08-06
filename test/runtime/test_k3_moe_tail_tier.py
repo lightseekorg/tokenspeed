@@ -57,8 +57,7 @@ def test_fused_tail_needs_graph_phase_and_capacity():
 def test_no_fused_ar_always_separate_reduce():
     for m in (1, 17, 2048, 8192):
         assert (
-            _select(num_tokens=m, fused_moe_ar=False)
-            is K3MoETailTier.SEPARATE_REDUCE
+            _select(num_tokens=m, fused_moe_ar=False) is K3MoETailTier.SEPARATE_REDUCE
         )
 
 
@@ -72,11 +71,14 @@ def test_multimem_lower_bound_is_exclusive_of_decode_range():
     assert _select(num_tokens=17) is K3MoETailTier.MULTIMEM_STITCH
 
 
-@pytest.mark.parametrize("m,expected", [
-    (2047, K3MoETailTier.FUSED_LANE_AR),
-    (2048, K3MoETailTier.NCCL_STITCH),
-    (8192, K3MoETailTier.NCCL_STITCH),
-])
+@pytest.mark.parametrize(
+    "m,expected",
+    [
+        (2047, K3MoETailTier.FUSED_LANE_AR),
+        (2048, K3MoETailTier.NCCL_STITCH),
+        (8192, K3MoETailTier.NCCL_STITCH),
+    ],
+)
 def test_nccl_stitch_fallback_without_multimem(m, expected):
     assert _select(num_tokens=m, multimem_ok=False) is expected
 
@@ -84,8 +86,7 @@ def test_nccl_stitch_fallback_without_multimem(m, expected):
 def test_unshardable_hidden_stays_on_fused_lane():
     for m in (17, 2048, 8192):
         assert (
-            _select(num_tokens=m, hidden_shardable=False)
-            is K3MoETailTier.FUSED_LANE_AR
+            _select(num_tokens=m, hidden_shardable=False) is K3MoETailTier.FUSED_LANE_AR
         )
 
 

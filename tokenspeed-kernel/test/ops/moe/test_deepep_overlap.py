@@ -72,6 +72,7 @@ def _weights() -> torch.nn.Module:
 @pytest.fixture
 def stub_compute(monkeypatch):
     """Replace the GEMM / activation kernels: only the call order is under test."""
+    seen = {"activation_pdl": []}
     monkeypatch.setattr(
         deepep_fp8, "m_grouped_fp8_gemm_nt_masked", lambda *a, **k: None
     )
@@ -80,8 +81,9 @@ def stub_compute(monkeypatch):
     )
     monkeypatch.setattr(deepep_fp8, "deep_gemm_requires_ue8m0", lambda: True)
 
-    def fake_packed_activation(gateup, masked_m, *, expected_m):
+    def fake_packed_activation(gateup, masked_m, *, expected_m, enable_pdl=False):
         del masked_m, expected_m
+        seen["activation_pdl"].append(enable_pdl)
         experts, rows, two_intermediate = gateup.shape
         intermediate = two_intermediate // 2
         return (
@@ -97,9 +99,10 @@ def stub_compute(monkeypatch):
         "fused_swiglu_fp8_ue8m0_masked_packed",
         fake_packed_activation,
     )
+    return seen
 
 
-def _run_low_latency(calls: list[str], overlap_fn) -> None:
+def _run_low_latency(calls: list[str], overlap_fn, *, enable_pdl: bool = False) -> None:
     deepep_fp8._apply_low_latency(
         _RecordingDispatcher(calls),
         torch.zeros((1, HIDDEN), dtype=torch.bfloat16),
@@ -107,7 +110,7 @@ def _run_low_latency(calls: list[str], overlap_fn) -> None:
         torch.zeros((1, TOP_K)),
         torch.zeros((1, TOP_K), dtype=torch.int64),
         None,
-        False,
+        enable_pdl,
         overlap_fn=overlap_fn,
     )
 
@@ -129,6 +132,37 @@ def test_without_overlap_the_legs_are_unchanged(stub_compute) -> None:
     calls: list[str] = []
     _run_low_latency(calls, None)
     assert calls == ["dispatch_a", "dispatch_b", "combine_a", "combine_b"]
+
+
+def test_pdl_is_configured_and_forwarded_to_the_fused_activation(
+    stub_compute, monkeypatch
+) -> None:
+    configured: list[bool] = []
+    monkeypatch.setattr(deepep_fp8, "_configure_deep_gemm_pdl", configured.append)
+
+    _run_low_latency([], None, enable_pdl=True)
+
+    assert configured == [True]
+    assert stub_compute["activation_pdl"] == [True]
+
+
+def test_deep_gemm_pdl_configuration_avoids_redundant_updates(monkeypatch) -> None:
+    state = {"enabled": False}
+    updates: list[bool] = []
+
+    monkeypatch.setattr(deepep_fp8, "get_pdl", lambda: state["enabled"])
+
+    def set_pdl(enabled: bool) -> None:
+        state["enabled"] = enabled
+        updates.append(enabled)
+
+    monkeypatch.setattr(deepep_fp8, "set_pdl", set_pdl)
+
+    deepep_fp8._configure_deep_gemm_pdl(False)
+    deepep_fp8._configure_deep_gemm_pdl(True)
+    deepep_fp8._configure_deep_gemm_pdl(True)
+
+    assert updates == [True]
 
 
 def test_routing_metadata_is_reused_when_already_canonical() -> None:

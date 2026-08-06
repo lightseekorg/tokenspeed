@@ -25,7 +25,6 @@ from dataclasses import dataclass
 import torch
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
-from tokenspeed.runtime.configs.paged_cache_spec import PagedCacheGroupSpec
 from tokenspeed.runtime.layers.attention.configs.base import (
     BaseAttnConfig,
     resolve_dtype,
@@ -43,11 +42,8 @@ class MHAConfig(BaseAttnConfig):
     # True iff server_args.disaggregation_mode != "null"; used to reject
     # layouts whose aliased fields cannot use legacy per-layer transfers.
     pd_disaggregation_enabled: bool = False
-    # Extra model-declared paged-cache groups (e.g. Inkling paged sconv); forwarded to publication
-    extra_paged_groups: tuple[PagedCacheGroupSpec, ...] = ()
-    # Slot span in tokens (largest group's block)
-    slot_tokens: int | None = None
-    # Per-group page sizes (hetero zero-padding slots)
+    # Per-group scheduler page sizes, published by the registry for
+    # group-aware backends (backends/cache_groups.py).
     group_page_sizes: dict[str, int] | None = None
     layer_kv_head_counts: tuple[int, ...] | None = None
 

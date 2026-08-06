@@ -58,6 +58,56 @@ def test_kimi3_router_projection_falls_back_for_noncanonical_shape() -> None:
     torch.testing.assert_close(actual, expected)
 
 
+def test_kimi3_router_projection_auto_splits_on_token_count() -> None:
+    """auto keeps the CUDA kernel at small M and switches to cublas above it.
+
+    The CUDA kernel's per-thread token loop runs on CUDA cores, so its time
+    grows linearly with M while the tensor-core GEMM stays flat; the dispatch
+    threshold is where they cross. Solution selection is observed by mocking
+    the two terminal paths -- no GPU needed.
+    """
+    hidden_states = torch.randn(1, kimi3_module.KIMI3_HIDDEN_SIZE).to(torch.bfloat16)
+    weight = torch.randn(
+        kimi3_module.KIMI3_ROUTER_SIZE, kimi3_module.KIMI3_HIDDEN_SIZE
+    ).to(torch.bfloat16)
+    platform = SimpleNamespace(is_cdna4=False, is_hopper_plus=True)
+
+    def solution_for(m: int) -> str:
+        x = hidden_states.expand(m, -1).contiguous()
+        with (
+            mock.patch.object(kimi3_module.Platform, "get", return_value=platform),
+            mock.patch.object(
+                kimi3_module, "_mm_out_dtype_supported", return_value=True
+            ),
+            mock.patch.object(
+                type(x), "is_cuda", new_callable=mock.PropertyMock
+            ) as is_cuda,
+            mock.patch.object(torch, "mm", return_value=torch.empty(0)) as mm,
+        ):
+            is_cuda.return_value = True
+            try:
+                kimi3_router_projection(x, weight)
+            except Exception:
+                pass  # the mocked/CPU terminal paths need not succeed
+            return "cublas" if mm.called else "cuda-or-torch"
+
+    assert solution_for(kimi3_module._ROUTER_CUDA_MAX_TOKENS) == "cuda-or-torch"
+    assert solution_for(kimi3_module._ROUTER_CUDA_MAX_TOKENS + 1) == "cublas"
+
+
+def test_kimi3_router_projection_cublas_requires_out_dtype_support() -> None:
+    hidden_states = torch.randn(8, kimi3_module.KIMI3_HIDDEN_SIZE).to(torch.bfloat16)
+    weight = torch.randn(
+        kimi3_module.KIMI3_ROUTER_SIZE, kimi3_module.KIMI3_HIDDEN_SIZE
+    ).to(torch.bfloat16)
+    with mock.patch.object(kimi3_module, "_mm_out_dtype_supported", return_value=False):
+        try:
+            kimi3_router_projection(hidden_states, weight, solution="cublas")
+            raise AssertionError("expected ValueError")
+        except ValueError as exc:
+            assert "out_dtype" in str(exc)
+
+
 def test_kimi3_shared_projection_falls_back_for_noncanonical_shape() -> None:
     hidden_states = torch.randn(3, 64, dtype=torch.bfloat16)
     gate_up_weight = torch.randn(32, 64, dtype=torch.bfloat16)

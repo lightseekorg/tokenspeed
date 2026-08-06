@@ -330,6 +330,7 @@ class PrefillGraph:
                 "prefill. This model family may need dedicated dummy-batch support.",
                 type(exc).__name__,
                 exc,
+                exc_info=True,
             )
             captured_ok = False
         if not self._capture_unanimous(captured_ok):
@@ -705,16 +706,16 @@ class PrefillGraph:
     def _padded_bucket(self, num_tokens: int) -> int | None:
         """Smallest bucket >= ``num_tokens``, or ``None`` if over the largest.
 
-        With ``--disable-cuda-graph-padding``, only an exact bucket match
-        replays (mirroring the decode wrapper's no-padding semantics).
+        ``--disable-cuda-graph-padding`` deliberately does NOT apply here: the
+        bucket ladder IS the padding scheme (real token counts almost never
+        equal a bucket, so honoring the flag reduced the prefill graph to
+        exact matches -- effectively off for ragged traffic). The flag keeps
+        its decode-wrapper meaning, where padding trades wasted compute.
         """
         idx = bisect.bisect_left(self.capture_buckets, num_tokens)
         if idx == len(self.capture_buckets):
             return None
-        bucket = self.capture_buckets[idx]
-        if self.config.disable_cuda_graph_padding and bucket != num_tokens:
-            return None
-        return bucket
+        return self.capture_buckets[idx]
 
     @contextmanager
     def _padded_to(self, ctx: ForwardContext, bucket: int):

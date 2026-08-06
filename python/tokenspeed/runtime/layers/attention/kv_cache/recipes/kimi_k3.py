@@ -8,16 +8,16 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from tokenspeed.runtime.layers.attention.kv_cache.plan import (
-    CacheFieldSpec,
-    CacheMemoryPlan,
-    solve_cache_layout,
-)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes import (
     configured_token_limit,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
     mla_cache_fields,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    CacheFieldSpec,
+    CacheMemoryPlan,
+    solve_cache_layout,
 )
 
 _KIMI_K3_LAYERS = 93
@@ -370,7 +370,7 @@ def prepare_kimi_k3_cache(
     decode_input_tokens: int,
     overlap_schedule_depth: int,
 ):
-    from tokenspeed.runtime.layers.attention.kv_cache.setup import (
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
         CachePoolSpec,
         CacheSetup,
     )
@@ -450,6 +450,11 @@ def prepare_kimi_k3_cache(
         upper_bound_tokens=token_limit,
         **sizing,
     )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+        build_paged_cache_group_specs,
+    )
+
+    pd_enabled = attn_config.pd_disaggregation_enabled
     target_plan = target_layout.with_num_lcm_blocks(num_lcm_blocks)
     draft_spec = None
     if draft_fields is not None:
@@ -458,6 +463,13 @@ def prepare_kimi_k3_cache(
             memory_plan=draft_layout.with_num_lcm_blocks(num_lcm_blocks),
             layer_types=draft_layer_types,
             layer_group_ids=draft_layer_types,
+            paged_cache_group_specs=build_paged_cache_group_specs(
+                layer_types=draft_layer_types,
+                group_ids=draft_layer_types,
+                sliding_window_tokens=None,
+                page_size=target_plan.logical_block_tokens,
+                pd_disaggregation_enabled=pd_enabled,
+            ),
             state_field_dtypes={},
             token_capacity=admitted_tokens,
         )
@@ -467,6 +479,13 @@ def prepare_kimi_k3_cache(
             memory_plan=target_plan,
             layer_types=layer_types,
             layer_group_ids=group_ids,
+            paged_cache_group_specs=build_paged_cache_group_specs(
+                layer_types=layer_types,
+                group_ids=group_ids,
+                sliding_window_tokens=None,
+                page_size=target_plan.logical_block_tokens,
+                pd_disaggregation_enabled=pd_enabled,
+            ),
             state_field_dtypes=state_dtypes,
             token_capacity=admitted_tokens,
         ),

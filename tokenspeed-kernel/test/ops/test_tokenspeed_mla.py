@@ -21,7 +21,12 @@
 from __future__ import annotations
 
 import math
+import os
 import platform
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
 
 import pytest
 import torch
@@ -403,3 +408,67 @@ def test_pdl_off_matches_pdl_on(
 
     assert _bitwise_equal(k_off, k_on)
     assert _bitwise_equal(v_off, v_on)
+
+
+def test_sm103_bf16_decode_causal_variants_compile() -> None:
+    """The SM103 BF16 decode path compiles for both mask variants."""
+    repo_root = Path(__file__).resolve().parents[3]
+    mla_python = repo_root / "tokenspeed-mla" / "python"
+    script = textwrap.dedent("""
+        import torch
+        import tokenspeed_mla.mla_decode as mla_decode
+
+        # Cross-target compilation must not query occupancy from the host GPU.
+        mla_decode.get_max_active_clusters = lambda _cluster_size: 1
+
+        for causal_mask in (False, True):
+            mla_decode._get_compiled_mla_kernel.cache_clear()
+            compiled_kernel = mla_decode._get_compiled_mla_kernel(
+                torch_dtype=torch.bfloat16,
+                page_size=64,
+                kv_lora_rank=512,
+                qk_rope_head_dim=64,
+                is_persistent=False,
+                is_var_seq=True,
+                is_var_split_kv=False,
+                is_workspace_size_zero=False,
+                fold_sq_factor=4,
+                causal_mask=causal_mask,
+                num_heads=16,
+                seq_len_q=4,
+                cp_world=1,
+                use_pdl=False,
+                return_lse=False,
+                compute_capability=(10, 3),
+            )
+            assert compiled_kernel is not None
+        """)
+    env = os.environ.copy()
+    env.update(
+        {
+            "CUDA_VISIBLE_DEVICES": "",
+            "CUTE_DSL_ARCH": "sm_103a",
+            "CUTE_DSL_DISABLE_FILE_CACHING": "1",
+            "CUTE_DSL_NO_CACHE": "1",
+        }
+    )
+    python_path = [str(mla_python)]
+    if env.get("PYTHONPATH"):
+        python_path.append(env["PYTHONPATH"])
+    env["PYTHONPATH"] = os.pathsep.join(python_path)
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+
+    assert result.returncode == 0, (
+        "SM103 BF16 decode compilation failed:\n"
+        f"stdout:\n{result.stdout}\n"
+        f"stderr:\n{result.stderr}"
+    )

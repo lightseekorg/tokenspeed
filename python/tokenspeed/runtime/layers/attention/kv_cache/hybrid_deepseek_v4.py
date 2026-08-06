@@ -14,91 +14,31 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any
 
 import torch
 
-from tokenspeed.runtime.configs.cache_runtime import PagedCacheRuntimeContract
-from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
-    DEEPSEEK_V4_COMPRESSED_LOGICAL_BLOCK_SIZE,
-    V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
-    V4_KERNEL_BLOCK_ROWS,
-    V4_SWA_KV_GROUP_ID,
-    build_v4_cache_specs,
-    deepseek_v4_indexer_fp8_row_bytes,
-    deepseek_v4_indexer_mxfp4_row_bytes,
-    deepseek_v4_swa_scale_dim,
-    deepseek_v4_swa_token_stride,
-    parse_v4_compressor_state_group_id,
-    v4_compressed_kv_group_id,
-    v4_compressor_state_group_id,
-)
 from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     deepseek_v4_compressed_slot_mapping,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
-from tokenspeed.runtime.layers.attention.kv_cache.plan import CacheMemoryPlan
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
-    deepseek_v4_cache_fields,
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4_cache_spec import (
+    V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
+    V4_KERNEL_BLOCK_ROWS,
+    V4_SWA_KV_GROUP_ID,
+    DeepseekV4CacheLayout,
+    parse_v4_compressor_state_group_id,
+    v4_compressed_kv_group_id,
+    v4_compressor_state_group_id,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheMemoryPlan
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    PagedCacheGroupSpec,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = get_colorful_logger(__name__)
-
-
-@dataclass(frozen=True)
-class DeepseekV4CacheLayout:
-    layer_ratio: tuple[int, ...]
-    head_dim: int
-    rope_head_dim: int
-    page_size: int
-    use_fp4_indexer_cache: bool
-    index_head_dim: int = 128
-
-    @property
-    def swa_token_stride(self) -> int:
-        return deepseek_v4_swa_token_stride(self.head_dim, self.rope_head_dim)
-
-    @property
-    def swa_scale_dim(self) -> int:
-        return deepseek_v4_swa_scale_dim(self.head_dim, self.rope_head_dim)
-
-    @property
-    def swa_row_bytes(self) -> int:
-        return self.swa_token_stride + self.swa_scale_dim
-
-    def swa_block_bytes(self, page_size: int | None = None) -> int:
-        if page_size is None:
-            page_size = self.page_size
-        block_bytes = page_size * self.swa_row_bytes
-        alignment = self.swa_token_stride
-        return ((block_bytes + alignment - 1) // alignment) * alignment
-
-    def storage_block_size(self, compress_ratio: int) -> int:
-        if compress_ratio > 1:
-            return max(1, DEEPSEEK_V4_COMPRESSED_LOGICAL_BLOCK_SIZE // compress_ratio)
-        return self.page_size
-
-    def compressor_state_block_size(self, compress_ratio: int) -> int:
-        if compress_ratio == 4:
-            return 4
-        if compress_ratio == 128:
-            return 8
-        return self.page_size
-
-    @property
-    def indexer_row_bytes(self) -> int:
-        if self.use_fp4_indexer_cache:
-            return deepseek_v4_indexer_mxfp4_row_bytes(self.index_head_dim)
-        return deepseek_v4_indexer_fp8_row_bytes(self.index_head_dim)
-
-    def state_width(self, layer_id: int, *, indexer: bool = False) -> int:
-        if indexer:
-            return self.index_head_dim * 2
-        return self.head_dim * (2 if self.layer_ratio[layer_id] == 4 else 1)
 
 
 def _split_paged_cache_block_tables_into_v4_metadata(
@@ -469,85 +409,6 @@ class DeepseekV4CacheMetadata:
         return _mask_invalid_graph_tokens(slot_mapping, is_valid_token)
 
 
-def deepseek_v4_cache_layout_from_config(
-    hf_config,
-    page_size: int,
-    use_fp4_indexer_cache: bool,
-    layer_indices: Iterable[int] | None = None,
-) -> DeepseekV4CacheLayout:
-    compress_ratios = tuple(hf_config.compress_ratios)
-    if layer_indices is None:
-        layer_ratios = compress_ratios
-    else:
-        layer_indices = tuple(layer_indices)
-        if any(idx < 0 or idx >= len(compress_ratios) for idx in layer_indices):
-            raise ValueError(
-                "DeepSeek V4 cache layout layer index out of range: "
-                f"indices={layer_indices}, ratios={len(compress_ratios)}"
-            )
-        layer_ratios = [compress_ratios[idx] for idx in layer_indices]
-    raw_layer_ratios = tuple(int(x) for x in layer_ratios)
-    for ratio in raw_layer_ratios:
-        if ratio not in (0, 1, 4, 128):
-            raise ValueError(
-                "Unsupported DeepSeek V4 cache compress_ratio="
-                f"{ratio}; expected one of 0, 1, 4, or 128"
-            )
-
-    return DeepseekV4CacheLayout(
-        layer_ratio=tuple(max(1, ratio) for ratio in raw_layer_ratios),
-        head_dim=int(hf_config.head_dim),
-        rope_head_dim=int(hf_config.qk_rope_head_dim),
-        page_size=page_size,
-        use_fp4_indexer_cache=use_fp4_indexer_cache,
-        index_head_dim=int(getattr(hf_config, "index_head_dim", 128)),
-    )
-
-
-def build_deepseek_v4_cache_fields(
-    layout: DeepseekV4CacheLayout,
-    *,
-    sliding_window: int,
-    logical_block_tokens: int = DEEPSEEK_V4_COMPRESSED_LOGICAL_BLOCK_SIZE,
-):
-    """Build DSV4 fields for one scheduler-wide logical page size."""
-    if sliding_window <= 0 or logical_block_tokens % sliding_window:
-        raise ValueError(
-            "DeepSeek V4 sliding_window must divide the logical block size"
-        )
-    if sliding_window % V4_KERNEL_BLOCK_ROWS:
-        raise ValueError(
-            "DeepSeek V4 sliding_window must be divisible by the SWA kernel page"
-        )
-
-    compressed_shapes = {
-        ratio: (layout.swa_block_bytes(layout.storage_block_size(ratio)),)
-        for ratio in set(layout.layer_ratio)
-        if ratio > 1
-    }
-    compressor_state_shapes = {
-        ratio: (
-            layout.compressor_state_block_size(ratio),
-            layout.head_dim * (2 if ratio == 4 else 1) * 2,
-        )
-        for ratio in set(layout.layer_ratio)
-        if ratio > 1
-    }
-    return deepseek_v4_cache_fields(
-        layer_ratios=layout.layer_ratio,
-        logical_block_tokens=logical_block_tokens,
-        swa_shape=(layout.swa_block_bytes(V4_KERNEL_BLOCK_ROWS),),
-        compressed_shapes=compressed_shapes,
-        compressor_state_shapes=compressor_state_shapes,
-        indexer_kv_shape=(V4_KERNEL_BLOCK_ROWS, layout.indexer_row_bytes),
-        indexer_state_shape=(
-            layout.compressor_state_block_size(4),
-            layout.index_head_dim * 2 * 2,
-        ),
-        kv_page_stride_alignment_bytes=layout.swa_token_stride,
-    )
-
-
 class HybridDeepseekV4TokenToKVPool(CachePool):
     """DeepSeek V4 fp8_ds_mla cache pool.
 
@@ -567,12 +428,10 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
-        max_batch_size: int,
-        max_context_len: int,
         page_size: int,
         rank: int,
-        hf_config: Any,
         memory_plan: CacheMemoryPlan,
+        paged_cache_group_specs: tuple[PagedCacheGroupSpec, ...],
         token_capacity: int,
     ) -> None:
         if size <= 0:
@@ -590,6 +449,8 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
             page_size=scheduler_page_size,
             rank=rank,
             memory_plan=memory_plan,
+            paged_cache_group_specs=paged_cache_group_specs,
+            token_capacity=token_capacity,
         )
         # Tag KV allocations as "kv_cache" (no CPU backup: discarded on sleep)
         # so release/resume_memory_occupation frees them. See memory_occupation.py.
@@ -599,17 +460,6 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
         self.model_dtype = model_dtype
         self.layout = layout
         self.layer_num = layer_num
-        packing = {
-            group.group_id: group.cache_blocks_per_lcm_block
-            for group in memory_plan.groups
-        }
-        self.paged_cache_group_specs = tuple(
-            build_v4_cache_specs(
-                hf_config,
-                layer_ratio=layout.layer_ratio,
-                cache_blocks_per_lcm_block=packing,
-            )
-        )
         self._paged_cache_group_specs_by_id = {
             spec.group_id: spec for spec in self.paged_cache_group_specs
         }
@@ -618,16 +468,6 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
             str(spec.group_id)
             for spec in self.paged_cache_group_specs
             if spec.family == "state"
-        )
-        self.paged_cache_group_page_counts = {
-            group.group_id: group.page_count for group in memory_plan.groups
-        }
-        self.runtime_contract = PagedCacheRuntimeContract(
-            block_size=memory_plan.logical_block_tokens,
-            num_lcm_blocks=memory_plan.num_lcm_blocks,
-            token_capacity=token_capacity,
-            group_specs=self.paged_cache_group_specs,
-            group_page_counts=self.paged_cache_group_page_counts,
         )
         self.paged_cache_requires_page_zeroing = True
 

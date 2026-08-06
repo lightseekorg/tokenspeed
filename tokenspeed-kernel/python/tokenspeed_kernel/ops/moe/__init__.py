@@ -36,12 +36,14 @@ __all__ = [
     "moe_plan",
     "moe_process_weights",
     "moe_sigmoid_bias_topk",
+    "moe_softmax_topk",
 ]
 
 from tokenspeed_kernel.ops.moe.kimi3 import (  # noqa: E402
     kimi3_native_moe_available,
 )
 from tokenspeed_kernel.ops.moe.sigmoid_topk import moe_sigmoid_bias_topk  # noqa: E402
+from tokenspeed_kernel.ops.moe.softmax_topk import moe_softmax_topk  # noqa: E402
 
 
 def _normalize_weight_dtype(weight_dtype: str) -> str:

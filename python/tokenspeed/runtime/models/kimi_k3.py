@@ -94,7 +94,6 @@ from tokenspeed_kernel.ops.tuning import load_packaged_flashinfer_tuning_cache
 from torch import nn
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiK3Config, KimiLinearConfig
-from tokenspeed.runtime.configs.paged_cache_spec import FULL_ATTENTION
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import (
     all_reduce,
@@ -108,6 +107,9 @@ from tokenspeed.runtime.execution.cuda_graph_wrapper import (
     get_is_cuda_graph_phase,
 )
 from tokenspeed.runtime.layers.activation import SituAndMul
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    FULL_ATTENTION,
+)
 from tokenspeed.runtime.layers.layernorm import (
     RMSNorm,
     _get_process_group,
@@ -124,7 +126,7 @@ from tokenspeed.runtime.layers.moe.latent import (
     Kimi3LatentProjection,
     Kimi3MoEExecutionPlan,
     LatentMoELayer,
-    kimi3_reduce_fused_moe,
+    kimi3_join_reduce_moe,
     select_k3_moe_tail_tier,
 )
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
@@ -1367,13 +1369,11 @@ class KimiLinearMoE(nn.Module):
         num_tokens: int,
         hidden_size: int,
     ) -> torch.Tensor:
-        # One [T, latent+hidden] AR, element-wise identical to two reduces.
-        if lane is not None and routed_out.data_ptr() == lane.data_ptr():
-            fused = lane
-        else:
-            fused = torch.cat((routed_out, shared_partial), dim=-1)
-        routed_red, shared_out = kimi3_reduce_fused_moe(
-            fused,
+        # The join owns the lane/cat/grouped-NCCL strategy per token count.
+        routed_red, shared_out = kimi3_join_reduce_moe(
+            routed_out,
+            shared_partial,
+            lane=lane,
             routed_hidden=self.routed_hidden,
             routed_norm=self.routed_expert_norm,
             group=self.mapping.moe.tp_ep_group,
@@ -1840,6 +1840,8 @@ class KimiLinearModel(nn.Module):
             bias=False,
             prefix=add_prefix("output_attn_res_proj", prefix),
         )
+        # One-based completed-layer ids; see set_eagle3_layers_to_capture.
+        self.eagle3_layers_to_capture: tuple[int, ...] = ()
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
@@ -1870,10 +1872,17 @@ class KimiLinearModel(nn.Module):
         )
 
         prefix_sum = hidden_states
-        for layer in self.layers:
+        aux_hidden_states = [] if self.eagle3_layers_to_capture else None
+        for layer_idx, layer in enumerate(self.layers):
             prefix_sum, block_residual = layer(
                 positions, prefix_sum, ctx, out_cache_loc, block_residual
             )
+            # Clone: the copy must survive the next layer's in-place residual writes.
+            if (
+                aux_hidden_states is not None
+                and layer_idx + 1 in self.eagle3_layers_to_capture
+            ):
+                aux_hidden_states.append(prefix_sum.clone())
 
         hidden_states = _apply_attn_res(
             prefix_sum,
@@ -1883,7 +1892,7 @@ class KimiLinearModel(nn.Module):
             num_blocks,
             out_norm=self.norm,
         )
-        return hidden_states, None
+        return hidden_states, aux_hidden_states
 
 
 class KimiLinearForCausalLM(BaseCausalLM):
@@ -1895,6 +1904,27 @@ class KimiLinearForCausalLM(BaseCausalLM):
     """
 
     model_cls = KimiLinearModel
+
+    def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
+        """Take the draft config's one-based completed-layer ids unchanged."""
+        num_layers = len(self.model.layers)
+        selected = (
+            [2, num_layers // 2, num_layers - 3]
+            if layer_ids is None
+            else list(layer_ids)
+        )
+        if selected != sorted(selected) or len(set(selected)) != len(selected):
+            raise ValueError(
+                "K3 EAGLE3 layer ids must be unique and sorted ascending, "
+                f"got {selected}."
+            )
+        invalid = [layer_id for layer_id in selected if not 1 <= layer_id <= num_layers]
+        if invalid:
+            raise ValueError(
+                "K3 EAGLE3 layer ids must identify a completed K3 layer; "
+                f"got invalid ids {invalid} for {num_layers} layers."
+            )
+        self.model.eagle3_layers_to_capture = tuple(selected)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
@@ -2119,6 +2149,13 @@ class KimiK3ForConditionalGeneration(nn.Module):
     def get_embed_and_head(self):
         return self.language_model.get_embed_and_head()
 
+    def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
+        if self.language_model is None:
+            raise AttributeError(
+                "Kimi-K3 encoder-only mode does not support EAGLE3 speculative decoding."
+            )
+        self.language_model.set_eagle3_layers_to_capture(layer_ids)
+
     @property
     def logits_processor(self):
         # The runtime reads ``model.logits_processor`` on the top-level model
@@ -2142,6 +2179,16 @@ class KimiK3ForConditionalGeneration(nn.Module):
     def vision_tower(self):
         """Expose the shared MoonViT attribute expected by EPD prefill."""
         return self.vision.vision_tower if self.vision is not None else None
+
+    def get_multimodal_encoder_specs(self) -> dict[Modality, EncoderSpec]:
+        if self.vision is None or self.image_encoder is None:
+            return {}
+        return {
+            Modality.IMAGE: EncoderSpec(
+                self.image_encoder,
+                make_warmup_items=self.vision.make_image_warmup_items,
+            )
+        }
 
     def make_encoder_cudagraph_wrapper(
         self, mapping: Mapping
@@ -2176,7 +2223,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
             input_ids=input_ids,
             text_embedding=self.get_input_embeddings(),
             ctx=multimodal_context,
-            encoders={Modality.IMAGE: EncoderSpec(self.image_encoder)},
+            encoders=self.get_multimodal_encoder_specs(),
             multimodal_model=self,
         )
         assert not model_kwargs, "Kimi-K3 multimodal path must stay embeds-only"
