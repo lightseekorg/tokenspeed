@@ -68,9 +68,7 @@ def test_fill_block_decode_seq_lens_publishes_clamped_lengths() -> None:
     backend = _backend(draft_block_decode=True)
     backend.cuda_graph_seq_lens_buf = torch.zeros(2, dtype=torch.int32)
 
-    backend.fill_block_decode_seq_lens(
-        2, torch.tensor([3, 99], dtype=torch.int32)
-    )
+    backend.fill_block_decode_seq_lens(2, torch.tensor([3, 99], dtype=torch.int32))
 
     assert backend.cuda_graph_seq_lens_buf.tolist() == [4, 64]
 
