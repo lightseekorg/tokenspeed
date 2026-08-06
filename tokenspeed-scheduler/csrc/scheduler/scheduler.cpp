@@ -210,11 +210,22 @@ std::vector<KvCacheEvent> Scheduler::DrainKvEvents() {
 bool Scheduler::ClearL1Cache() {
     const bool has_live_request =
         std::ranges::any_of(requests_, [](const auto& item) { return !item.second->template Is<fsm::Finished>(); });
-    if (has_live_request || !pending_forward_results_.empty() || !pd_transfer_pins_.empty() ||
-        tier_transfers_.HasAnyInFlight()) {
+    const bool has_pending_forward_results = !pending_forward_results_.empty();
+    const bool has_pd_transfers = !pd_transfer_pins_.empty();
+    const bool has_tier_transfers = tier_transfers_.HasAnyInFlight();
+    if (has_live_request || has_pending_forward_results || has_pd_transfers || has_tier_transfers) {
+        spdlog::info(
+            "[Scheduler] flush L1 cache rejected: live_requests={} pending_forward_results={} pd_transfers={} "
+            "tier_transfers={}",
+            has_live_request, has_pending_forward_results, has_pd_transfers, has_tier_transfers);
         return false;
     }
-    return coordinator_.ClearDeviceCache();
+    if (!coordinator_.ClearDeviceCache()) {
+        spdlog::info("[Scheduler] flush L1 cache rejected: cached blocks are still pinned");
+        return false;
+    }
+    spdlog::info("[Scheduler] flush L1 cache completed");
+    return true;
 }
 
 std::vector<CacheKey> Scheduler::registerKvEventPages(const Request& request, std::span<const std::string> page_hashes,

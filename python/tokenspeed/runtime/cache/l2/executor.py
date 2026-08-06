@@ -278,6 +278,11 @@ class L2CacheExecutor:
         if not transfers:
             self._ready_load_op_ids.extend(op_ids)
             return None
+        logger.info(
+            "[L2] load started: operations=%d blocks=%d",
+            len(op_ids),
+            len(transfers),
+        )
 
         # EventLoop zeroes freshly allocated Device blocks before submitting the
         # load. Recording the start event here makes every layer-wise H2D

@@ -130,6 +130,40 @@ class GroupAwareWireTest(unittest.TestCase):
         start.wait.assert_called_once_with(executor.write_stream)
         finish.record.assert_called_once_with(executor.write_stream)
 
+    def test_loadback_logs_non_empty_batch(self):
+        try:
+            import tokenspeed.runtime.cache.l2.executor as executor_module
+
+            L2CacheExecutor = executor_module.L2CacheExecutor
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor._ready_load_op_ids = []
+        executor._load_acks = []
+        executor.load_stream = object()
+        executor.layout = SimpleNamespace(buffers=("device",), consumers=(("field",),))
+        executor.host_storage = SimpleNamespace(host_buffer="host")
+        executor._transfer_ranges = Mock(return_value=[(0, 64, 128, 32)])
+        load_events = SimpleNamespace(start_event=Mock(), layer_done_events=[None])
+        tracker = Mock()
+        tracker.begin_load.return_value = 0
+        tracker.event_sets = [load_events]
+        executor._load_trackers = [(tracker, 1)]
+        finish = Mock()
+
+        with (
+            patch.object(executor_module, "get_is_capture_mode", return_value=False),
+            patch.object(executor_module.device_module, "Event", return_value=finish),
+            patch.object(executor_module, "transfer_cache_ranges"),
+            patch.object(executor_module.logger, "info") as log_info,
+        ):
+            executor._start_loading([9], [(0, 2, 1), (0, 5, 4)])
+
+        log_info.assert_called_once_with(
+            "[L2] load started: operations=%d blocks=%d", 1, 2
+        )
+
 
 class CompactLayoutRoundTripTest(unittest.TestCase):
     def setUp(self):

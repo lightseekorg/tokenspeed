@@ -23,9 +23,15 @@
 // writeback and recovery.
 
 #include <algorithm>
+#include <memory>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <stdexcept>
+#include <utility>
+
+#include <spdlog/sinks/ostream_sink.h>
+#include <spdlog/spdlog.h>
 
 #include "scheduler/operations/cache.h"
 #include "cache_test_access.h"
@@ -34,6 +40,19 @@
 namespace tokenspeed::test {
 
 namespace {
+
+std::pair<bool, std::string> ClearL1CacheWithCapturedLog(Scheduler* scheduler) {
+    std::ostringstream output;
+    auto previous_logger = spdlog::default_logger();
+    auto sink = std::make_shared<spdlog::sinks::ostream_sink_mt>(output);
+    auto logger = std::make_shared<spdlog::logger>("clear-l1-cache-test", std::move(sink));
+    logger->set_pattern("%v");
+    logger->set_level(spdlog::level::info);
+    spdlog::set_default_logger(std::move(logger));
+    const bool cleared = scheduler->ClearL1Cache();
+    spdlog::set_default_logger(std::move(previous_logger));
+    return {cleared, output.str()};
+}
 
 PagedCacheGroupConfig MakeGroup(const std::string& id, std::int32_t block_size, std::int32_t total_pages,
                                 PagedCacheGroupConfig::Retention retention, PagedCacheGroupFamily family,
@@ -2226,7 +2245,9 @@ TEST_F(PrefixHitSuite, ClearL1CacheRemovesAnIdlePrefix) {
     const RequestSpec first = MakeRequestSpec("r1", /*num_pages=*/4);
     RunLifecycle(first);
 
-    ASSERT_TRUE(scheduler_->ClearL1Cache());
+    const auto [cleared, log] = ClearL1CacheWithCapturedLog(scheduler_.get());
+    ASSERT_TRUE(cleared);
+    EXPECT_NE(log.find("flush L1 cache completed"), std::string::npos);
     Submit(RequestSpec{.request_id = "r2", .tokens = first.tokens});
     const ExecutionPlan second_plan = PlanOnce();
     const ForwardBatch* second = FindForwardBatch(second_plan);
@@ -2243,7 +2264,9 @@ TEST_F(PrefixHitSuite, ClearL1CacheRejectsAnActiveRequestAndPreservesItsPrefix) 
     SendForwardDone("r1", {9001});
     ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
 
-    EXPECT_FALSE(scheduler_->ClearL1Cache());
+    const auto [cleared, log] = ClearL1CacheWithCapturedLog(scheduler_.get());
+    EXPECT_FALSE(cleared);
+    EXPECT_NE(log.find("flush L1 cache rejected: live_requests=true"), std::string::npos);
     SendForwardDone("r1", {9002});
     SendFinish("r1");
     PlanOnce();
