@@ -190,6 +190,9 @@ class KimiK3LatentTailOp:
             ``[M, 7168]`` post-communication hidden (up-projection + shared,
             plus ``prefix`` when provided).
         """
+        # Upstream-inherited hazard: the single mailbox's sentinel cleanup
+        # overlaps the next layer via PDL; remote stores are ordered only by
+        # the cross-rank latency window, not a sync edge.
         m = routed_partial.shape[0]
         self._up_projection.ensure_compiled(m)
         latent, shared_shard = self._collective(

@@ -114,6 +114,30 @@ def _ensure_buffer(
     return buf
 
 
+def multimem_prealloc(rows: int, widths: tuple[int, ...], group_name: str) -> bool:
+    """Allocate and rendezvous the staging buffers up front, collectively.
+
+    Call once at init on every rank in lockstep. With capacity pre-sized to
+    the dispatch ceiling, serving-time growth (a collective rendezvous inside
+    a forward, where one rank's allocation failure strands its peers) can
+    never happen.
+
+    Args:
+        rows: Capacity to reserve, normally the caller's dispatch ceiling.
+        widths: The tensor widths that will be staged.
+        group_name: Process-group name covering every rank.
+
+    Returns:
+        True when every buffer is ready.
+    """
+    if not multimem_available():
+        return False
+    device = torch.device("cuda", torch.cuda.current_device())
+    for width in widths:
+        _ensure_buffer(rows, width, device, group_name, rows)
+    return True
+
+
 def multimem_stage(
     tensor: torch.Tensor, group_name: str, max_rows: int | None = None
 ) -> torch.Tensor | None:
@@ -165,6 +189,7 @@ def multimem_all_reduce_staged(view: torch.Tensor, group_name: str) -> torch.Ten
 
 __all__ = [
     "multimem_available",
+    "multimem_prealloc",
     "multimem_available_all_ranks",
     "multimem_stage",
     "multimem_all_reduce_staged",

@@ -206,7 +206,7 @@ def test_width_caches_are_independent():
 
 def test_stage_refuses_unsupported_tensors():
     """multimem_stage must return None (fallback signal) for CPU, non-bf16,
-    and non-2-D tensors, without raising."""
+    non-2-D, and misaligned-width tensors, without raising."""
     from tokenspeed_kernel.ops.communication.multimem import multimem_stage
 
     _, dev = _setup()
@@ -219,6 +219,8 @@ def test_stage_refuses_unsupported_tensors():
     assert multimem_stage(fp32, name) is None, "fp32 tensor must be refused"
     three_d = torch.randn(2, 4, LATENT, dtype=torch.bfloat16, device=dev)
     assert multimem_stage(three_d, name) is None, "3-D tensor must be refused"
+    misaligned = torch.randn(4, LATENT + 1, dtype=torch.bfloat16, device=dev)
+    assert multimem_stage(misaligned, name) is None, "width % 8 must be refused"
 
 
 def test_stage_view_invalidated_by_next_stage_of_same_width():

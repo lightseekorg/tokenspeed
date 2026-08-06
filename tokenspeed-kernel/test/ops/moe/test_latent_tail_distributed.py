@@ -89,7 +89,7 @@ def _inputs(rank, dev, m, seed):
     return routed, shared, rms_w, up_w
 
 
-@pytest.mark.parametrize("m", [1, 4, 16])
+@pytest.mark.parametrize("m", [1, 4, 5, 6, 16])
 def test_latent_tail_matches_reference(m):
     from tokenspeed_kernel.ops.moe.latent_tail import KimiK3LatentTailOp
 

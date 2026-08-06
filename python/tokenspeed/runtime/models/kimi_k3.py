@@ -74,6 +74,7 @@ from tokenspeed_kernel.ops.communication import allreduce_fusion_lane
 from tokenspeed_kernel.ops.communication.multimem import (
     multimem_all_reduce_staged,
     multimem_available_all_ranks,
+    multimem_prealloc,
     multimem_stage,
 )
 from tokenspeed_kernel.ops.gemm import (
@@ -1119,6 +1120,13 @@ class KimiLinearMoE(nn.Module):
             and self.routed_hidden != config.hidden_size
         ):
             self._multimem_ar_ok = multimem_available_all_ranks()
+            if self._multimem_ar_ok:
+                # Pre-size to the ceiling so serving never grows collectively.
+                self._multimem_ar_ok = multimem_prealloc(
+                    MULTIMEM_AR_MAX_TOKENS,
+                    (self.routed_hidden, config.hidden_size),
+                    torch.distributed.group.WORLD.group_name,
+                )
 
         # Fused AR(latent)+norm+RS tail with 1/tp-sharded up-projection.
         self._latent_tail = None
