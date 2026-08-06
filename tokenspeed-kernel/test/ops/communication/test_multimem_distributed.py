@@ -137,7 +137,12 @@ def test_buffer_growth_reallocates_and_stays_correct():
     dist.barrier()
     key = (dev.index, LATENT, _group_name())
     # step -> (m, expected capacity, expect re-allocation)
-    plan = [(64, 2048, True), (2049, 4096, True), (4096, 4096, False), (64, 4096, False)]
+    plan = [
+        (64, 2048, True),
+        (2049, 4096, True),
+        (4096, 4096, False),
+        (64, 4096, False),
+    ]
     retired_before = len(multimem._RETIRED)
     prev_buf = None
     for step, (m, expected_cap, expect_realloc) in enumerate(plan):
@@ -146,19 +151,19 @@ def test_buffer_growth_reallocates_and_stays_correct():
         out = _staged_reduce(x)
         _assert_matches(out, ref, f"growth step {step} m={m}")
         buf = multimem._BUFFERS[key]
-        assert buf.shape[0] == expected_cap, (
-            f"step {step} m={m}: capacity {buf.shape[0]} != {expected_cap}"
-        )
+        assert (
+            buf.shape[0] == expected_cap
+        ), f"step {step} m={m}: capacity {buf.shape[0]} != {expected_cap}"
         if prev_buf is not None:
             realloced = buf.data_ptr() != prev_buf.data_ptr()
-            assert realloced == expect_realloc, (
-                f"step {step} m={m}: realloc={realloced}, expected {expect_realloc}"
-            )
+            assert (
+                realloced == expect_realloc
+            ), f"step {step} m={m}: realloc={realloced}, expected {expect_realloc}"
         prev_buf = buf
     # Exactly one growth after the fresh allocation -> exactly one retirement.
-    assert len(multimem._RETIRED) == retired_before + 1, (
-        "replaced buffer must be kept alive on the retired list"
-    )
+    assert (
+        len(multimem._RETIRED) == retired_before + 1
+    ), "replaced buffer must be kept alive on the retired list"
 
 
 def test_width_caches_are_independent():

@@ -1265,7 +1265,7 @@ class KimiLinearMoE(nn.Module):
     ) -> torch.Tensor:
         """Combine the routed/shared partials onto ``prefix_sum``, best tier first:
         fused decode kernel (<=16 tokens, graph replay), multimem column-parallel
-        stitch (eager, >16 tokens), NCCL column-parallel stitch (no multicast,
+        stitch (>16 tokens), NCCL column-parallel stitch (no multicast,
         >=2048), fused-lane all-reduce, then the separate-reduce fallback
         (``routed_out`` arrives already normed and up-projected there)."""
         if use_tail:
@@ -1281,7 +1281,6 @@ class KimiLinearMoE(nn.Module):
             self.execution_plan.fused_moe_ar
             and self._multimem_tail_ok
             and num_tokens > _MULTIMEM_MIN_TOKENS
-            and not get_is_cuda_graph_phase()
             and hidden_size % self.mapping.moe.tp_ep_size == 0
         ):
             # In-switch (ld_reduce) reduces via symmetric memory, same stitch as below.
