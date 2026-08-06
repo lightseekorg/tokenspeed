@@ -68,6 +68,7 @@ dependencies = [
     "setproctitle",
     "tiktoken",
     "torch",
+    "torchvision",
     "tokenspeed-kernel>=0.1.3.dev0",
     "tokenspeed-mooncake>=0.3.12.post20260803",
     "tokenspeed-scheduler>=0.1.3",
@@ -78,7 +79,6 @@ dependencies = [
     # resume). Bundles cu12/cu13 binaries; import-guarded so it's a no-op unless
     # --enable-memory-saver is set. See runtime/utils/torch_memory_saver_adapter.py.
     "torch_memory_saver==0.0.9.post1",
-    "torchvision",
     "tqdm",
     "transformers==5.12.0",
     "uv",
