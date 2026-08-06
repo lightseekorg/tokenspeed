@@ -36,8 +36,7 @@ def _direct_requirements(path: Path) -> list[str]:
 
 
 def _expected_install_requires(backend: str) -> list[str]:
-    requirements = _direct_requirements(REQUIREMENTS_DIR / "common.txt")
-    requirements.extend(_direct_requirements(REQUIREMENTS_DIR / f"{backend}.txt"))
+    requirements = _direct_requirements(REQUIREMENTS_DIR / f"{backend}.txt")
     requirements.extend(
         _direct_requirements(REQUIREMENTS_DIR / f"{backend}-thirdparty.txt")
     )
