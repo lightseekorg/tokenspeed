@@ -140,7 +140,7 @@ class KimiK3LatentTailOp:
                 max_m=_MAX_NUM_TOKENS,
                 max_token_ctas=_COLLECTIVE_TOKEN_CTAS,
                 rms_eps=contract.rms_eps,
-                fp32_internal=False,
+                fp32_internal=True,
             )
             self._up_projection = AdaptiveUpProjectionKernel(
                 group=group,
