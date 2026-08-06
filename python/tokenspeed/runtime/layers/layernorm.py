@@ -168,8 +168,8 @@ class RMSNorm(torch.nn.Module):
         Forward method with allreduce fusion, prioritizing flashinfer fused operations
         """
 
+        needs_unfused_allreduce = False
         if residual is not None:
-
             if len(group) > 1:
                 if _is_amd:
                     allreduce_residual_rmsnorm = triton_allreduce_residual_rmsnorm
@@ -194,6 +194,12 @@ class RMSNorm(torch.nn.Module):
                 )
                 if fused_result[0] is not None:
                     return fused_result
+                needs_unfused_allreduce = True
+
+        if needs_unfused_allreduce:
+            from tokenspeed.runtime.distributed.comm_ops import all_reduce
+
+            x = all_reduce(x, group)
 
         result = self.forward(x, residual)
         if isinstance(result, tuple):
@@ -323,8 +329,8 @@ class GemmaRMSNorm(torch.nn.Module):
         fused kernel computes x * (1 + weight) matching GemmaRMSNorm semantics.
         """
 
+        needs_unfused_allreduce = False
         if residual is not None:
-
             if len(group) > 1:
                 if _is_amd:
                     allreduce_residual_rmsnorm = triton_allreduce_residual_rmsnorm
@@ -349,6 +355,12 @@ class GemmaRMSNorm(torch.nn.Module):
                 )
                 if fused_result[0] is not None:
                     return fused_result
+                needs_unfused_allreduce = True
+
+        if needs_unfused_allreduce:
+            from tokenspeed.runtime.distributed.comm_ops import all_reduce
+
+            x = all_reduce(x, group)
 
         result = self.forward(x, residual)
         if isinstance(result, tuple):
