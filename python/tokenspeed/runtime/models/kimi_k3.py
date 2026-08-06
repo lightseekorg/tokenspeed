@@ -123,6 +123,7 @@ from tokenspeed.runtime.layers.linear import (
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.latent import (
     MULTIMEM_AR_MAX_TOKENS,
+    MULTIMEM_AR_MIN_TOKENS,
     K3MoETailTier,
     Kimi3LatentProjection,
     Kimi3MoEExecutionPlan,
@@ -1106,17 +1107,18 @@ class KimiLinearMoE(nn.Module):
         )
 
         # A rank diverging on eligibility would strand peers in the collective.
-        self._multimem_tail_ok = False
+        self._multimem_ar_ok = False
         if (
             torch.distributed.is_initialized()
+            # EP is fine here (partials sum over tp_ep); the fused tail is not.
             and mapping.moe.tp_ep_size > 1
-            and len(mapping.moe.tp_ep_group) == torch.distributed.get_world_size()
+            and mapping.moe.tp_ep_size == torch.distributed.get_world_size()
             and mapping.attn.dp_size == 1
             and mapping.attn.cp_size == 1
             # Staging buffers are per-width; equal widths would clobber the stage.
             and self.routed_hidden != config.hidden_size
         ):
-            self._multimem_tail_ok = multimem_available_all_ranks()
+            self._multimem_ar_ok = multimem_available_all_ranks()
 
         # Fused AR(latent)+norm+RS tail with 1/tp-sharded up-projection.
         self._latent_tail = None
@@ -1160,6 +1162,9 @@ class KimiLinearMoE(nn.Module):
                         rms_eps=self.routed_expert_norm.variance_epsilon,
                         device=torch.device("cuda", torch.cuda.current_device()),
                     )
+                    assert (
+                        self._latent_tail.max_num_tokens < MULTIMEM_AR_MIN_TOKENS
+                    ), "fused-tail capacity must stay below the multimem window"
                     logger.info("multicast latent tail engaged")
                 except Exception:  # noqa: BLE001 - keep the fused-AR tail
                     logger.exception("multicast latent tail unavailable; falling back")
@@ -1269,7 +1274,7 @@ class KimiLinearMoE(nn.Module):
                 self._latent_tail.max_num_tokens if self._latent_tail is not None else 0
             ),
             fused_moe_ar=self.execution_plan.fused_moe_ar,
-            multimem_ok=self._multimem_tail_ok,
+            multimem_ok=self._multimem_ar_ok,
         )
 
     def _moe_tail(
@@ -1284,7 +1289,8 @@ class KimiLinearMoE(nn.Module):
     ) -> torch.Tensor:
         """Dispatch the selected tier over raw routed/shared partials."""
         if tier is K3MoETailTier.TAIL_FUSION:
-            # Graph-only: the lamport tail needs capture/replay determinism.
+            # Selector pins the graph phase: warmup/capture/replay all take
+            # this path, and eager serving keeps the NCCL tiers.
             return self._tail_fusion(routed_out, shared_partial, prefix_sum)
         if tier is K3MoETailTier.MULTIMEM_AR:
             return self._tail_multimem_ar(
@@ -1325,6 +1331,7 @@ class KimiLinearMoE(nn.Module):
         # tail is the same replicated norm+up_proj+add3 as the fused-lane tier.
         # WORLD is safe: the eligibility gate pinned tp_ep == WORLD at init.
         group_name = torch.distributed.group.WORLD.group_name
+        # Warmup ran this shape eagerly, so the buffers exist by capture time.
         routed_stage = multimem_stage(routed_out, group_name, MULTIMEM_AR_MAX_TOKENS)
         shared_stage = (
             multimem_stage(shared_partial, group_name, MULTIMEM_AR_MAX_TOKENS)

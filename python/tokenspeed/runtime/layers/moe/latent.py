@@ -57,7 +57,7 @@ _SUPPORTED_EP_SIZES = {1, 2, 4, 8}
 class K3MoETailTier(IntEnum):
     """How the K3 MoE tail combines routed/shared partials, best first."""
 
-    TAIL_FUSION = 0  # fused decode kernel: AR + norm + sharded up_proj + multicast
+    TAIL_FUSION = 0  # fused decode kernel (aka the multicast latent tail)
     MULTIMEM_AR = 1  # in-switch (ld_reduce) reduces, then the replicated tail
     FUSED_LANE_AR = 2  # NCCL tier: the join picks lane/cat/grouped per size
     SEPARATE_REDUCE = 3  # portable: reduce each partial on its own

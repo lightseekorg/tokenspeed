@@ -122,8 +122,8 @@ def multimem_stage(
     Args:
         tensor: 2-D BF16 CUDA tensor, rank-identical shape, width % 8 == 0.
         group_name: Process-group name covering every rank of the reduction.
-        max_rows: Optional clamp on capacity growth (rows are still served
-            up to this bound; callers cap it at their dispatch ceiling).
+        max_rows: Caps the speculative doubling only; an explicit request
+            larger than this still allocates to fit.
 
     Returns:
         A ``[rows, width]`` view of the symmetric buffer (valid until the next

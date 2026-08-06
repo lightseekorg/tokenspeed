@@ -46,10 +46,10 @@ def test_decode_graph_range_uses_fused_tail(m):
 
 
 def test_fused_tail_needs_graph_phase_and_capacity():
-    assert _select(num_tokens=8, graph_phase=False) is not K3MoETailTier.TAIL_FUSION
+    assert _select(num_tokens=8, graph_phase=False) is K3MoETailTier.FUSED_LANE_AR
     assert (
         _select(num_tokens=8, graph_phase=True, tail_fusion_max_tokens=0)
-        is not K3MoETailTier.TAIL_FUSION
+        is K3MoETailTier.FUSED_LANE_AR
     )
 
 
@@ -77,7 +77,7 @@ def test_fused_tail_wins_even_without_fused_ar():
     )
 
 
-def test_capture_time_multimem_miss_lands_on_fused_lane():
+def test_graph_phase_without_multimem_lands_on_fused_lane():
     assert (
         _select(num_tokens=32, graph_phase=True, multimem_ok=False)
         is K3MoETailTier.FUSED_LANE_AR

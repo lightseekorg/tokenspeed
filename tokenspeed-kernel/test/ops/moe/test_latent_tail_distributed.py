@@ -91,10 +91,7 @@ def _inputs(rank, dev, m, seed):
 
 @pytest.mark.parametrize("m", [1, 4, 16])
 def test_latent_tail_matches_reference(m):
-    from tokenspeed_kernel.ops.moe.latent_tail import (
-        KimiK3LatentTailOp,
-        latent_tail_supported,
-    )
+    from tokenspeed_kernel.ops.moe.latent_tail import KimiK3LatentTailOp
 
     rank, dev = _setup()
     _require_latent_tail()
@@ -115,10 +112,7 @@ def test_latent_tail_matches_reference(m):
 
 
 def test_latent_tail_graph_replay():
-    from tokenspeed_kernel.ops.moe.latent_tail import (
-        KimiK3LatentTailOp,
-        latent_tail_supported,
-    )
+    from tokenspeed_kernel.ops.moe.latent_tail import KimiK3LatentTailOp
 
     rank, dev = _setup()
     _require_latent_tail()
@@ -152,10 +146,7 @@ def test_latent_tail_graph_replay():
 
 @pytest.mark.parametrize("m", [1, 4, 16])
 def test_latent_tail_fused_prefix_matches_eager(m):
-    from tokenspeed_kernel.ops.moe.latent_tail import (
-        KimiK3LatentTailOp,
-        latent_tail_supported,
-    )
+    from tokenspeed_kernel.ops.moe.latent_tail import KimiK3LatentTailOp
 
     rank, dev = _setup()
     _require_latent_tail()

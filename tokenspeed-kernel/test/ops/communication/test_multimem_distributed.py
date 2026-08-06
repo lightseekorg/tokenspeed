@@ -38,7 +38,7 @@ import torch
 import torch.distributed as dist
 
 LATENT, HIDDEN = 3584, 7168
-# Spans MULTIMEM_AR_MIN_TOKENS (17, >=, latent.py) and _MIN_BUFFER_ROWS
+# Spans the runtime MULTIMEM_AR window floor (17) and _MIN_BUFFER_ROWS
 # (2048) in the staging module, on both sides of each.
 M_VALUES = [17, 64, 1024, 2047, 2048, 4096]
 
