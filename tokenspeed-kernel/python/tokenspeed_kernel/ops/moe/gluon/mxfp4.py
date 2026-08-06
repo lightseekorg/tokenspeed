@@ -31,9 +31,9 @@ from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
 
-# TP8/EP8 model measurements favor warp GEMV through M=4 and grouped MFMA
-# above it, despite a later crossover in isolated kernel measurements.
-_ROUTE_DIRECT_DECODE_MAX_TOKENS = 4
+# TP8/EP8 model measurements favor warp GEMV through M=8 and grouped MFMA
+# above it.
+_ROUTE_DIRECT_DECODE_MAX_TOKENS = 8
 
 
 if platform.is_amd:
