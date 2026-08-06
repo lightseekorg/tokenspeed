@@ -300,19 +300,20 @@ if platform.is_amd:
         if overlap_fn is not None:
             overlap_fn()
         packed = handle["packed_x"]  # [E_local, cap, H]
-        # Static upper bound on rows THIS rank can receive after dispatch: (max tokens on any EP
-        # rank this forward) * ep_size senders * top_k. It must NOT be derived from this rank's
-        # own token count ``x.shape[0]``: after dispatch a rank owns experts for tokens sent by
-        # every OTHER rank, so under DP attention an idle/imbalanced rank (few or zero local
-        # tokens while peers are busy) still receives their tokens -- a local-only bound would
-        # truncate (or, at x.shape[0]==0, skip) those rows, leaving raw dispatched input in place
-        # of the FFN output and corrupting the combine result on the sender ranks. ``max_num_
-        # tokens_per_gpu`` is the per-rank max the runtime reports (identical on every rank), so
-        # this stays a true upper bound under eager imbalance and equals ep_size*batch under the
-        # uniform decode-graph padding -- all without a host sync (keeps the GEMM capturable).
-        per_rank = (
-            int(max_num_tokens_per_gpu) if max_num_tokens_per_gpu else int(x.shape[0])
-        )
+        # Static upper bound on rows THIS rank can receive after dispatch: (max tokens any EP rank
+        # SENDS this forward) * ep_size senders * top_k. The per-rank send count is the SAME
+        # ``max(max_num_tokens_per_gpu, x.shape[0])`` used to size ``cap`` above, and must account
+        # for BOTH ways a rank's dispatched-token count can exceed a naive single signal:
+        #   - DP attention (dp>1): this rank's own ``x.shape[0]`` may be small or zero (idle /
+        #     imbalanced) while peers dispatch many tokens to THIS rank's experts;
+        #     ``max_num_tokens_per_gpu`` (the global per-rank max) covers what it then receives.
+        #   - Non-DP full-EP (attn TP == moe EP): ``x`` carries the FULL batch on every rank
+        #     (pre the all_reduce compensation in DeepseekV3MoE.forward), so ``x.shape[0]`` exceeds
+        #     the scattered-TP ``max_num_tokens_per_gpu`` and is the true per-rank send count.
+        # Taking the max is safe either way -- it only ever widens the bound, never truncates -- so
+        # no received row is dropped before combine, and it needs no host sync (GEMM stays
+        # capturable; equals ep_size*batch under uniform decode-graph padding).
+        per_rank = max(int(max_num_tokens_per_gpu or 0), int(x.shape[0]))
         n_recv_bound = ep_size * per_rank * int(getattr(w, "top_k"))
         _grouped_mxfp4_gemm_3d(packed, handle["counts"], w, n_recv_bound)  # in place
         # Return the COMPLETE per-token routed result on every rank; do NOT reduce/scale here.
