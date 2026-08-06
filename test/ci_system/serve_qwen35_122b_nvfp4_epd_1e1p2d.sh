@@ -4,7 +4,7 @@
 # Serves nvidia/Qwen3.5-122B-A10B-NVFP4 (override via MODEL). EPD mode is
 # gRPC-only (the SMG gateway refuses HTTP connection_mode for EPD), so the
 # workers are gRPC servicers launched via `python3 -m smg_grpc_servicer.tokenspeed`
-# (one unified entrypoint for all roles) rather than the HTTP pd_http_worker.py.
+# (one unified entrypoint for all roles) rather than a role-specific adapter.
 # The encode worker is LM-free: it runs only the vision tower and ships image
 # embeddings to prefill over Mooncake; pixels reach it INLINE over gRPC (the
 # default, no node-specific RDMA-listen config). Topology (4 GPUs, all TP1):
