@@ -67,6 +67,7 @@ from tokenspeed.runtime.grammar.capturable_grammar import (
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
     CacheBatchMetadata,
 )
+from tokenspeed.runtime.layers.attention.page_table import expand_page_table
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.layers.paged_attention import (
     validate_paged_cache_group_ids,
@@ -371,6 +372,24 @@ class ModelExecutor:
             speculative_algorithm=config.spec_algo,
         )
 
+        # Two tables, two page-id domains. ``fill_input_buffers`` indexes the
+        # scheduler's own full-history table, whose ids are logical pages; the
+        # drafter and its backend index ``draft_page_table``, published in the
+        # draft backend's (possibly smaller) kernel pages. Keeping each stride
+        # with its own table is what makes both address the same KV rows.
+        self._logical_page_size = int(
+            getattr(draft_token_to_kv_pool, "page_size", 0) or config.logical_page_size
+        )
+        self._draft_page_size = int(
+            getattr(draft_attn_backend, "page_size", 0) or self._logical_page_size
+        )
+        if self._logical_page_size % self._draft_page_size:
+            raise ValueError(
+                f"logical page size {self._logical_page_size} is not a multiple "
+                f"of the draft kernel page size {self._draft_page_size}"
+            )
+        self._draft_page_ratio = self._logical_page_size // self._draft_page_size
+
         if config.spec_algo is not None:
             # The DFLASH overlap scheduler reserves a fresh draft block per
             # decode step a request stays scheduled, including the few steps it
@@ -388,13 +407,13 @@ class ModelExecutor:
                 config.context_len
                 + config.spec_num_tokens
                 + draft_block_reservation_slack
-                + config.logical_page_size
+                + self._draft_page_size
                 - 1
-            ) // config.logical_page_size
+            ) // self._draft_page_size
         else:
             max_num_pages_per_req = (
-                config.context_len + config.logical_page_size
-            ) // config.logical_page_size
+                config.context_len + self._draft_page_size
+            ) // self._draft_page_size
 
         max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
 
@@ -409,15 +428,11 @@ class ModelExecutor:
             device=self.device,
         )
         spec_num_tokens = config.spec_num_tokens if config.spec_algo is not None else 1
-        # Stride for indexing page_table when building drafter caller-side
-        # write locations for ordinary attention backends.
-        self._draft_page_size = int(
-            getattr(draft_token_to_kv_pool, "page_size", 0) or config.logical_page_size
-        )
         self.input_buffers = InputBuffers(
             max_bs=max_bs,
             max_num_tokens=config.chunked_prefill_size,
-            page_size=self._draft_page_size,
+            # Indexes the scheduler's full-history table: logical page ids.
+            page_size=self._logical_page_size,
             # token_to_kv_pool allocates size+page_size slots; index `size` is
             # the reserved dummy slot (see MHATokenToKVPool._create_buffers).
             dummy_kv_slot=0,
@@ -677,9 +692,10 @@ class ModelExecutor:
         """Publish the full-history table into the batch-ordered draft table.
 
         Every draft reads its pages from ``draft_page_table`` (the drafter
-        passes no cache metadata) and shares the target's page-id geometry. The
-        table is batch-ordered -- row ``i`` is batch position ``i`` -- so the
-        draft indexes it directly by batch row, no page_table round-trip.
+        passes no cache metadata). The table is batch-ordered -- row ``i`` is
+        batch position ``i`` -- so the draft indexes it directly by batch row,
+        no page_table round-trip. Ids arrive in the allocator's logical pages
+        and are published in draft-page units (see ``_draft_page_ratio``).
         """
         if (
             self.drafter is None
@@ -694,6 +710,16 @@ class ModelExecutor:
         width = table.shape[1]
         max_width = self.draft_page_table.shape[1]
         rows = self.draft_page_table[:bs]
+        if self._draft_page_ratio > 1:
+            # -1 pads clamp into logical page 0, itself reserved as the null page.
+            expand_page_table(
+                table,
+                logical_page_size=self._logical_page_size,
+                kernel_page_size=self._draft_page_size,
+                max_kernel_pages=max_width,
+                out=rows,
+            )
+            return
         # -1 column pads -> dummy page 0 (negative locs otherwise).
         rows[:, :width].copy_(table)
         rows[:, :width].clamp_min_(0)
