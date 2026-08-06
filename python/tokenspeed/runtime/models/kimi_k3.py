@@ -120,10 +120,12 @@ from tokenspeed.runtime.layers.linear import (
 )
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.latent import (
+    K3MoETailTier,
     Kimi3LatentProjection,
     Kimi3MoEExecutionPlan,
     LatentMoELayer,
     kimi3_reduce_fused_moe,
+    select_k3_moe_tail_tier,
 )
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
@@ -163,12 +165,6 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
-
-# Measured tp16 crossover vs the fused lane AR.
-_COLUMN_PARALLEL_MIN_TOKENS = 2048
-# ld_reduce stays flat down here, so the stitch engages right above decode.
-_MULTIMEM_MIN_TOKENS = 16
-
 
 # ===----------------------------------------------------------------------=== #
 # Multimodal vision path
@@ -1110,7 +1106,10 @@ class KimiLinearMoE(nn.Module):
         self._multimem_tail_ok = False
         if (
             torch.distributed.is_initialized()
+            and mapping.moe.tp_ep_size > 1
             and len(mapping.moe.tp_ep_group) == torch.distributed.get_world_size()
+            and mapping.attn.dp_size == 1
+            and mapping.attn.cp_size == 1
         ):
             self._multimem_tail_ok = multimem_available_all_ranks()
 
@@ -1147,13 +1146,20 @@ class KimiLinearMoE(nn.Module):
                     logger.exception("multicast latent tail unavailable; falling back")
                     self._latent_tail = None
 
+            # A rank diverging on tail eligibility would deadlock the collective.
+            flag = torch.tensor(
+                [int(self._latent_tail is not None)], dtype=torch.int32, device="cuda"
+            )
+            torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
+            if not bool(flag.item()):
+                self._latent_tail = None
+
     def _routed_experts(
         self,
         routed_in: torch.Tensor,
         topk_output: TopKOutput,
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
-        skip_reduce: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run flashinfer's fused TRT-LLM SiTU MoE."""
         if not self.use_trtllm_situ_moe:
@@ -1167,12 +1173,8 @@ class KimiLinearMoE(nn.Module):
             num_global_tokens=num_global_tokens,
             max_num_tokens_per_gpu=max_num_tokens_per_gpu,
         )
-        # Each TP rank owns an intermediate shard; each EP rank owns a
-        # contiguous expert shard. The routed kernel returns that rank's
-        # partial contribution, which must be combined before the replicated
-        # norm/up projection (skip_reduce: caller's fused AR covers it).
-        if self.mapping.moe.has_tp_ep and not skip_reduce:
-            out = all_reduce(out, self.mapping.moe.tp_ep_group)
+        # The kernel returns this rank's pre-reduce partial; the selected
+        # tail tier owns the combining reduction.
         return out
 
     def forward(
@@ -1203,16 +1205,12 @@ class KimiLinearMoE(nn.Module):
         # under concurrent GEMMs). Topk is a single small CTA, so it overlaps
         # down_proj from the aux stream, followed by the shared chain.
         router_logits = self.gate(hidden_states)
-        # Decode-graph only; eager forwards keep the fused-AR path.
-        use_tail = (
-            self._latent_tail is not None
-            and get_is_cuda_graph_phase()
-            and 1 <= num_tokens <= self._latent_tail.max_num_tokens
-        )
+        tier = self._select_tail_tier(num_tokens, hidden_size)
+        # Lane only materializes at bs==1, where the stitch tiers cannot win.
         lane = allreduce_fusion_lane(
             hidden_states,
             self.routed_hidden + hidden_size,
-            enabled=self.execution_plan.fused_moe_ar and not use_tail,
+            enabled=tier is K3MoETailTier.FUSED_LANE_AR,
         )
         if lane is not None:
             self.experts._situ_output_buffer = lane[:, : self.routed_hidden]
@@ -1232,118 +1230,178 @@ class KimiLinearMoE(nn.Module):
             routed_in = decode_gemv(hidden_states, self.routed_expert_down_proj.weight)
             if self._topk_ready is not None and fork._active:
                 self._topk_ready.wait(torch.cuda.current_stream())
+            # Raw partials out; each tail tier owns its own reduction.
             routed_out = self._routed_experts(
                 routed_in,
                 topk_output,
                 num_global_tokens,
                 max_num_tokens_per_gpu,
-                skip_reduce=self.execution_plan.fused_moe_ar or use_tail,
             )
-            if not (self.execution_plan.fused_moe_ar or use_tail):
-                if self.routed_expert_norm is not None:
-                    routed_out = self.routed_expert_norm(routed_out)
-                routed_out = self.routed_expert_up_proj(routed_out)[0]
         return self._moe_tail(
-            routed_out,
-            shared_partial,
-            prefix_sum,
-            lane,
-            use_tail,
-            num_tokens,
-            hidden_size,
+            tier, routed_out, shared_partial, prefix_sum, lane, num_tokens, hidden_size
+        )
+
+    def _select_tail_tier(
+        self, num_tokens: int, hidden_size: int, *, multimem_ok: bool | None = None
+    ) -> K3MoETailTier:
+        return select_k3_moe_tail_tier(
+            num_tokens=num_tokens,
+            graph_phase=get_is_cuda_graph_phase(),
+            tail_fusion_max_tokens=(
+                self._latent_tail.max_num_tokens if self._latent_tail is not None else 0
+            ),
+            fused_moe_ar=self.execution_plan.fused_moe_ar,
+            multimem_ok=self._multimem_tail_ok if multimem_ok is None else multimem_ok,
+            hidden_shardable=hidden_size % self.mapping.moe.tp_ep_size == 0,
         )
 
     def _moe_tail(
+        self,
+        tier: K3MoETailTier,
+        routed_out: torch.Tensor,
+        shared_partial: torch.Tensor,
+        prefix_sum: torch.Tensor,
+        lane: torch.Tensor | None,
+        num_tokens: int,
+        hidden_size: int,
+    ) -> torch.Tensor:
+        """Dispatch the selected tier over raw routed/shared partials."""
+        if tier is K3MoETailTier.TAIL_FUSION:
+            return self._tail_fusion(routed_out, shared_partial, prefix_sum)
+        if tier is K3MoETailTier.MULTIMEM_STITCH:
+            return self._tail_multimem_stitch(
+                routed_out, shared_partial, prefix_sum, lane, num_tokens, hidden_size
+            )
+        if tier is K3MoETailTier.NCCL_STITCH:
+            return self._tail_nccl_stitch(
+                routed_out, shared_partial, prefix_sum, num_tokens, hidden_size
+            )
+        if tier is K3MoETailTier.FUSED_LANE_AR:
+            return self._tail_fused_lane_ar(
+                routed_out, shared_partial, prefix_sum, lane, num_tokens, hidden_size
+            )
+        return self._tail_separate_reduce(
+            routed_out, shared_partial, prefix_sum, num_tokens, hidden_size
+        )
+
+    def _tail_fusion(
+        self,
+        routed_out: torch.Tensor,
+        shared_partial: torch.Tensor,
+        prefix_sum: torch.Tensor,
+    ) -> torch.Tensor:
+        # Partials are pre-reduce; the tail owns all communication.
+        return self._latent_tail(
+            routed_out,
+            shared_partial,
+            self.routed_expert_norm.weight,
+            self.routed_expert_up_proj.weight,
+            prefix=prefix_sum,
+        )
+
+    def _stitch_up_proj(
+        self, latent_red: torch.Tensor, shared_buf: torch.Tensor, hidden_size: int
+    ) -> None:
+        # Each rank norms then up-projects only its hidden shard into shared_buf.
+        if self.routed_expert_norm is not None:
+            latent_red = self.routed_expert_norm(latent_red)
+        shard = hidden_size // self.mapping.moe.tp_ep_size
+        start = self.mapping.moe.tp_ep_rank * shard
+        shared_buf.narrow(-1, start, shard).addmm_(
+            latent_red, self.routed_expert_up_proj.weight.narrow(0, start, shard).t()
+        )
+
+    def _tail_multimem_stitch(
         self,
         routed_out: torch.Tensor,
         shared_partial: torch.Tensor,
         prefix_sum: torch.Tensor,
         lane: torch.Tensor | None,
-        use_tail: bool,
         num_tokens: int,
         hidden_size: int,
     ) -> torch.Tensor:
-        """Combine the routed/shared partials onto ``prefix_sum``, best tier first:
-        fused decode kernel (<=16 tokens, graph replay), multimem column-parallel
-        stitch (>16 tokens), NCCL column-parallel stitch (no multicast,
-        >=2048), fused-lane all-reduce, then the separate-reduce fallback
-        (``routed_out`` arrives already normed and up-projected there)."""
-        if use_tail:
-            # Partials are pre-reduce; the tail owns all communication.
-            return self._latent_tail(
+        # In-switch (ld_reduce) reduces via symmetric memory, NCCL-stitch layout.
+        group_name = torch.distributed.group.WORLD.group_name
+        routed_stage = multimem_stage(routed_out, group_name)
+        shared_stage = (
+            multimem_stage(shared_partial, group_name)
+            if routed_stage is not None
+            else None
+        )
+        if shared_stage is None:
+            # Capture-time stage miss is rank-uniform; re-select without multimem.
+            tier = self._select_tail_tier(num_tokens, hidden_size, multimem_ok=False)
+            return self._moe_tail(
+                tier,
                 routed_out,
                 shared_partial,
-                self.routed_expert_norm.weight,
-                self.routed_expert_up_proj.weight,
-                prefix=prefix_sum,
-            )
-        if (
-            self.execution_plan.fused_moe_ar
-            and self._multimem_tail_ok
-            and num_tokens > _MULTIMEM_MIN_TOKENS
-            and hidden_size % self.mapping.moe.tp_ep_size == 0
-        ):
-            # In-switch (ld_reduce) reduces via symmetric memory, same stitch as below.
-            group_name = torch.distributed.group.WORLD.group_name
-            routed_stage = multimem_stage(routed_out, group_name)
-            shared_stage = (
-                multimem_stage(shared_partial, group_name)
-                if routed_stage is not None
-                else None
-            )
-            if shared_stage is not None:
-                routed_red = multimem_all_reduce_staged(routed_stage, group_name)
-                if self.routed_expert_norm is not None:
-                    routed_red = self.routed_expert_norm(routed_red)
-                shard = hidden_size // self.mapping.moe.tp_ep_size
-                start = self.mapping.moe.tp_ep_rank * shard
-                shared_stage.narrow(-1, start, shard).addmm_(
-                    routed_red,
-                    self.routed_expert_up_proj.weight.narrow(0, start, shard).t(),
-                )
-                shared_out = multimem_all_reduce_staged(shared_stage, group_name)
-                return (prefix_sum + shared_out).view(num_tokens, hidden_size)
-        if (
-            self.execution_plan.fused_moe_ar
-            and num_tokens >= _COLUMN_PARALLEL_MIN_TOKENS
-            and hidden_size % self.mapping.moe.tp_ep_size == 0
-        ):
-            # Each rank up-projects only its hidden shard; the shared reduce stitches.
-            routed_out = all_reduce(routed_out, self.mapping.moe.tp_ep_group)
-            if self.routed_expert_norm is not None:
-                routed_out = self.routed_expert_norm(routed_out)
-            shard = hidden_size // self.mapping.moe.tp_ep_size
-            start = self.mapping.moe.tp_ep_rank * shard
-            shared_partial.narrow(-1, start, shard).addmm_(
-                routed_out,
-                self.routed_expert_up_proj.weight.narrow(0, start, shard).t(),
-            )
-            shared_out = self._reduce_shared(shared_partial)
-            return (prefix_sum + shared_out).view(num_tokens, hidden_size)
-        if self.execution_plan.fused_moe_ar:
-            # Post-join: one [T, latent+hidden] all-reduce covers both
-            # partials, element-wise identical to the two separate reduces.
-            if lane is not None and routed_out.data_ptr() == lane.data_ptr():
-                fused = lane
-            else:
-                fused = torch.cat((routed_out, shared_partial), dim=-1)
-            routed_out, shared_out = kimi3_reduce_fused_moe(
-                fused,
-                routed_hidden=self.routed_hidden,
-                routed_norm=self.routed_expert_norm,
-                group=self.mapping.moe.tp_ep_group,
-                enable_lane_norm=self.execution_plan.lane_latent_norm_ar,
-                max_token_num=self.execution_plan.comm_fusion_max_num_tokens,
-            )
-            return kimi3_latent_projection_add3(
-                routed_out,
-                self.routed_expert_up_proj.weight,
                 prefix_sum,
-                shared_out,
-            ).view(num_tokens, hidden_size)
+                lane,
+                num_tokens,
+                hidden_size,
+            )
+        routed_red = multimem_all_reduce_staged(routed_stage, group_name)
+        self._stitch_up_proj(routed_red, shared_stage, hidden_size)
+        shared_out = multimem_all_reduce_staged(shared_stage, group_name)
+        return (prefix_sum + shared_out).view(num_tokens, hidden_size)
+
+    def _tail_nccl_stitch(
+        self,
+        routed_out: torch.Tensor,
+        shared_partial: torch.Tensor,
+        prefix_sum: torch.Tensor,
+        num_tokens: int,
+        hidden_size: int,
+    ) -> torch.Tensor:
+        routed_red = all_reduce(routed_out, self.mapping.moe.tp_ep_group)
+        self._stitch_up_proj(routed_red, shared_partial, hidden_size)
         shared_out = self._reduce_shared(shared_partial)
-        # routed_scaling_factor already applied in TopK; not re-applied here
-        # (matches the reference).
+        return (prefix_sum + shared_out).view(num_tokens, hidden_size)
+
+    def _tail_fused_lane_ar(
+        self,
+        routed_out: torch.Tensor,
+        shared_partial: torch.Tensor,
+        prefix_sum: torch.Tensor,
+        lane: torch.Tensor | None,
+        num_tokens: int,
+        hidden_size: int,
+    ) -> torch.Tensor:
+        # One [T, latent+hidden] AR, element-wise identical to two reduces.
+        if lane is not None and routed_out.data_ptr() == lane.data_ptr():
+            fused = lane
+        else:
+            fused = torch.cat((routed_out, shared_partial), dim=-1)
+        routed_red, shared_out = kimi3_reduce_fused_moe(
+            fused,
+            routed_hidden=self.routed_hidden,
+            routed_norm=self.routed_expert_norm,
+            group=self.mapping.moe.tp_ep_group,
+            enable_lane_norm=self.execution_plan.lane_latent_norm_ar,
+            max_token_num=self.execution_plan.comm_fusion_max_num_tokens,
+        )
+        return kimi3_latent_projection_add3(
+            routed_red,
+            self.routed_expert_up_proj.weight,
+            prefix_sum,
+            shared_out,
+        ).view(num_tokens, hidden_size)
+
+    def _tail_separate_reduce(
+        self,
+        routed_out: torch.Tensor,
+        shared_partial: torch.Tensor,
+        prefix_sum: torch.Tensor,
+        num_tokens: int,
+        hidden_size: int,
+    ) -> torch.Tensor:
+        if self.mapping.moe.has_tp_ep:
+            routed_out = all_reduce(routed_out, self.mapping.moe.tp_ep_group)
+        if self.routed_expert_norm is not None:
+            routed_out = self.routed_expert_norm(routed_out)
+        routed_out = self.routed_expert_up_proj(routed_out)[0]
+        shared_out = self._reduce_shared(shared_partial)
+        # routed_scaling_factor already applied in TopK (matches reference).
         return add3(
             prefix_sum,
             routed_out.view(num_tokens, hidden_size),
