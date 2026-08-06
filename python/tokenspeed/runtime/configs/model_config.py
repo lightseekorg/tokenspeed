@@ -359,11 +359,19 @@ class ModelConfig:
             and getattr(server_args, "speculative_algorithm", None) == "DSPARK"
             and resolve_architecture(self.hf_config) == "DeepseekV4ForCausalLMDSpark"
         ):
+            if server_args.enable_prefix_caching:
+                raise ValueError(
+                    "DSPARK does not yet preserve its captured-context windows "
+                    "across prefix-cache hits; use --no-enable-prefix-caching."
+                )
             from tokenspeed.runtime.models.deepseek_v4_dspark import (
                 count_dspark_stages,
             )
 
-            dspark_num_stages = count_dspark_stages(model_path)
+            dspark_num_stages = count_dspark_stages(
+                model_path,
+                revision=revision,
+            )
             if dspark_num_stages is None:
                 raise ValueError(
                     "DSPARK requires a safetensors index with mtp.<stage> weights."

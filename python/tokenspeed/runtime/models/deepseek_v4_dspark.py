@@ -120,10 +120,31 @@ def _is_zero_initialized_expert_bias(name: str) -> bool:
     return name.endswith(_ZERO_INITIALIZED_EXPERT_BIAS_SUFFIXES)
 
 
-def count_dspark_stages(model_path: str) -> int | None:
+def count_dspark_stages(
+    model_path: str,
+    revision: str | None = None,
+) -> int | None:
     """Count contiguous ``mtp.<stage>`` namespaces in a safetensors index."""
 
-    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    index_filename = "model.safetensors.index.json"
+    if os.path.isdir(model_path):
+        index_path = os.path.join(model_path, index_filename)
+    else:
+        from huggingface_hub import hf_hub_download
+
+        try:
+            index_path = hf_hub_download(
+                repo_id=model_path,
+                filename=index_filename,
+                revision=revision,
+            )
+        except Exception as exc:  # noqa: BLE001 - fail closed below
+            logger.debug(
+                "Unable to resolve DSpark safetensors index for %s: %s",
+                model_path,
+                exc,
+            )
+            return None
     if not os.path.isfile(index_path):
         return None
     with open(index_path, encoding="utf-8") as handle:

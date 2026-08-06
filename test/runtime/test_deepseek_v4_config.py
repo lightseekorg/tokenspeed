@@ -1285,6 +1285,44 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(build(64).block_size, 256)
         self.assertEqual(build(128).block_size, 128)
 
+    def test_model_config_rejects_prefix_cache_for_external_v4_dspark(self):
+        hf_config = SimpleNamespace(
+            architectures=["DeepseekV4ForCausalLMDSpark"],
+        )
+        server_args = SimpleNamespace(
+            mapping=None,
+            speculative_algorithm="DSPARK",
+            enable_prefix_caching=True,
+        )
+        with (
+            patch(
+                "tokenspeed.runtime.configs.model_config.get_config",
+                return_value=hf_config,
+            ),
+            patch(
+                "tokenspeed.runtime.configs.model_config.get_generation_config",
+                return_value=None,
+            ),
+            patch(
+                "tokenspeed.runtime.configs.model_config.get_hf_text_config",
+                return_value=hf_config,
+            ),
+            patch(
+                "tokenspeed.runtime.models.deepseek_v4_dspark.count_dspark_stages"
+            ) as count_stages,
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "--no-enable-prefix-caching",
+            ):
+                ModelConfig(
+                    "external-draft",
+                    model_override_args="{}",
+                    is_draft_worker=True,
+                    server_args=server_args,
+                )
+        count_stages.assert_not_called()
+
     def test_model_config_keeps_incompatible_user_quantization_error(self):
         model_config = object.__new__(ModelConfig)
         model_config.hf_config = SimpleNamespace(
@@ -1481,6 +1519,41 @@ class TestDeepseekV4Config(unittest.TestCase):
                 )
             with self.assertRaisesRegex(ValueError, "contiguous from zero"):
                 count_dspark_stages(model_path)
+
+    def test_dspark_stage_count_resolves_hub_index(self):
+        with tempfile.TemporaryDirectory() as model_path:
+            index_path = os.path.join(model_path, "model.safetensors.index.json")
+            with open(index_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "weight_map": {
+                            "mtp.0.main_proj.weight": "a.safetensors",
+                            "mtp.1.norm.weight": "b.safetensors",
+                        }
+                    },
+                    handle,
+                )
+            with patch(
+                "huggingface_hub.hf_hub_download",
+                return_value=index_path,
+            ) as download:
+                self.assertEqual(
+                    count_dspark_stages("public/model", revision="revision-a"),
+                    2,
+                )
+
+        download.assert_called_once_with(
+            repo_id="public/model",
+            filename="model.safetensors.index.json",
+            revision="revision-a",
+        )
+
+    def test_dspark_stage_count_fails_closed_when_hub_index_is_unavailable(self):
+        with patch(
+            "huggingface_hub.hf_hub_download",
+            side_effect=OSError("offline"),
+        ):
+            self.assertIsNone(count_dspark_stages("public/model"))
 
     def test_dspark_checkpoint_name_mapping_is_stage_stable(self):
         model = object.__new__(DeepseekV4ForCausalLMDSpark)
@@ -1737,8 +1810,9 @@ class TestDeepseekV4Config(unittest.TestCase):
         for field in ("dp_size", "cp_size"):
             invalid = SimpleNamespace(attn=SimpleNamespace(dp_size=1, cp_size=1))
             setattr(invalid.attn, field, 2)
-            with self.subTest(field=field), self.assertRaisesRegex(
-                ValueError, "tensor parallelism only"
+            with (
+                self.subTest(field=field),
+                self.assertRaisesRegex(ValueError, "tensor parallelism only"),
             ):
                 DeepseekV4DSpark._validate_tp_only_mapping(invalid)
 
