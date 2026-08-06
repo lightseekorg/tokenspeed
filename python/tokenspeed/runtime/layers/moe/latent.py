@@ -58,16 +58,13 @@ class K3MoETailTier(IntEnum):
     """How the K3 MoE tail combines routed/shared partials, best first."""
 
     TAIL_FUSION = 0  # fused decode kernel: AR + norm + sharded up_proj + multicast
-    MULTIMEM_STITCH = 1  # ld_reduce latent AR, column-parallel up_proj stitch
-    NCCL_STITCH = 2  # NCCL latent AR, same column-parallel stitch
-    FUSED_LANE_AR = 3  # one [T, latent+hidden] AR covers both partials
-    SEPARATE_REDUCE = 4  # portable: reduce each partial on its own
+    MULTIMEM_AR = 1  # in-switch (ld_reduce) reduces, then the replicated tail
+    FUSED_LANE_AR = 2  # one [T, latent+hidden] AR covers both partials
+    SEPARATE_REDUCE = 3  # portable: reduce each partial on its own
 
 
 # Fused decode tail tops out at 16; ld_reduce stays flat right above it.
-MULTIMEM_STITCH_MIN_TOKENS = 17
-# Measured tp16 crossover vs the fused lane AR.
-NCCL_STITCH_MIN_TOKENS = 2048
+MULTIMEM_AR_MIN_TOKENS = 17
 
 
 def select_k3_moe_tail_tier(
@@ -77,7 +74,6 @@ def select_k3_moe_tail_tier(
     tail_fusion_max_tokens: int,
     fused_moe_ar: bool,
     multimem_ok: bool,
-    hidden_shardable: bool,
 ) -> K3MoETailTier:
     """Pick the tail tier; every input must be rank-uniform.
 
@@ -87,7 +83,6 @@ def select_k3_moe_tail_tier(
         tail_fusion_max_tokens: Fused decode kernel capacity, 0 when absent.
         fused_moe_ar: Whether the fused-AR execution plan is armed.
         multimem_ok: Collectively-agreed multimem availability.
-        hidden_shardable: Whether hidden divides evenly across tp_ep ranks.
 
     Returns:
         The best applicable ``K3MoETailTier``.
@@ -96,10 +91,8 @@ def select_k3_moe_tail_tier(
         return K3MoETailTier.TAIL_FUSION
     if not fused_moe_ar:
         return K3MoETailTier.SEPARATE_REDUCE
-    if multimem_ok and hidden_shardable and num_tokens >= MULTIMEM_STITCH_MIN_TOKENS:
-        return K3MoETailTier.MULTIMEM_STITCH
-    if hidden_shardable and num_tokens >= NCCL_STITCH_MIN_TOKENS:
-        return K3MoETailTier.NCCL_STITCH
+    if multimem_ok and num_tokens >= MULTIMEM_AR_MIN_TOKENS:
+        return K3MoETailTier.MULTIMEM_AR
     return K3MoETailTier.FUSED_LANE_AR
 
 

@@ -35,7 +35,6 @@ def _select(**overrides):
         tail_fusion_max_tokens=16,
         fused_moe_ar=True,
         multimem_ok=True,
-        hidden_shardable=True,
     )
     base.update(overrides)
     return select_k3_moe_tail_tier(**base)
@@ -62,33 +61,19 @@ def test_no_fused_ar_always_separate_reduce():
 
 
 @pytest.mark.parametrize("m", [17, 1024, 2047, 2048, 8192])
-def test_multimem_stitch_covers_everything_above_decode(m):
-    assert _select(num_tokens=m) is K3MoETailTier.MULTIMEM_STITCH
+def test_multimem_ar_covers_everything_above_decode(m):
+    assert _select(num_tokens=m) is K3MoETailTier.MULTIMEM_AR
 
 
 def test_multimem_lower_bound_is_exclusive_of_decode_range():
     assert _select(num_tokens=16) is K3MoETailTier.FUSED_LANE_AR
-    assert _select(num_tokens=17) is K3MoETailTier.MULTIMEM_STITCH
+    assert _select(num_tokens=17) is K3MoETailTier.MULTIMEM_AR
 
 
-@pytest.mark.parametrize(
-    "m,expected",
-    [
-        (2047, K3MoETailTier.FUSED_LANE_AR),
-        (2048, K3MoETailTier.NCCL_STITCH),
-        (8192, K3MoETailTier.NCCL_STITCH),
-    ],
-)
-def test_nccl_stitch_fallback_without_multimem(m, expected):
-    assert _select(num_tokens=m, multimem_ok=False) is expected
-
-
-def test_unshardable_hidden_stays_on_fused_lane():
-    for m in (17, 2048, 8192):
-        assert (
-            _select(num_tokens=m, hidden_shardable=False) is K3MoETailTier.FUSED_LANE_AR
-        )
+@pytest.mark.parametrize("m", [17, 2047, 2048, 8192])
+def test_fused_lane_fallback_without_multimem(m):
+    assert _select(num_tokens=m, multimem_ok=False) is K3MoETailTier.FUSED_LANE_AR
 
 
 def test_graph_phase_above_fused_capacity_still_tiers_by_tokens():
-    assert _select(num_tokens=32, graph_phase=True) is K3MoETailTier.MULTIMEM_STITCH
+    assert _select(num_tokens=32, graph_phase=True) is K3MoETailTier.MULTIMEM_AR

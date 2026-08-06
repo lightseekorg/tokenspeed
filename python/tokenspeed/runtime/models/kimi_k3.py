@@ -1208,7 +1208,7 @@ class KimiLinearMoE(nn.Module):
         # down_proj from the aux stream, followed by the shared chain.
         router_logits = self.gate(hidden_states)
         tier = self._select_tail_tier(num_tokens, hidden_size)
-        # Lane only materializes at bs==1, where the stitch tiers cannot win.
+        # Lane only materializes at bs==1, below the multimem tier window.
         lane = allreduce_fusion_lane(
             hidden_states,
             self.routed_hidden + hidden_size,
@@ -1254,7 +1254,6 @@ class KimiLinearMoE(nn.Module):
             ),
             fused_moe_ar=self.execution_plan.fused_moe_ar,
             multimem_ok=self._multimem_tail_ok if multimem_ok is None else multimem_ok,
-            hidden_shardable=hidden_size % self.mapping.moe.tp_ep_size == 0,
         )
 
     def _moe_tail(
@@ -1270,13 +1269,9 @@ class KimiLinearMoE(nn.Module):
         """Dispatch the selected tier over raw routed/shared partials."""
         if tier is K3MoETailTier.TAIL_FUSION:
             return self._tail_fusion(routed_out, shared_partial, prefix_sum)
-        if tier is K3MoETailTier.MULTIMEM_STITCH:
-            return self._tail_multimem_stitch(
+        if tier is K3MoETailTier.MULTIMEM_AR:
+            return self._tail_multimem_ar(
                 routed_out, shared_partial, prefix_sum, lane, num_tokens, hidden_size
-            )
-        if tier is K3MoETailTier.NCCL_STITCH:
-            return self._tail_nccl_stitch(
-                routed_out, shared_partial, prefix_sum, num_tokens, hidden_size
             )
         if tier is K3MoETailTier.FUSED_LANE_AR:
             return self._tail_fused_lane_ar(
@@ -1301,19 +1296,7 @@ class KimiLinearMoE(nn.Module):
             prefix=prefix_sum,
         )
 
-    def _stitch_up_proj(
-        self, latent_red: torch.Tensor, shared_buf: torch.Tensor, hidden_size: int
-    ) -> None:
-        # Each rank norms then up-projects only its hidden shard into shared_buf.
-        if self.routed_expert_norm is not None:
-            latent_red = self.routed_expert_norm(latent_red)
-        shard = hidden_size // self.mapping.moe.tp_ep_size
-        start = self.mapping.moe.tp_ep_rank * shard
-        shared_buf.narrow(-1, start, shard).addmm_(
-            latent_red, self.routed_expert_up_proj.weight.narrow(0, start, shard).t()
-        )
-
-    def _tail_multimem_stitch(
+    def _tail_multimem_ar(
         self,
         routed_out: torch.Tensor,
         shared_partial: torch.Tensor,
@@ -1322,7 +1305,8 @@ class KimiLinearMoE(nn.Module):
         num_tokens: int,
         hidden_size: int,
     ) -> torch.Tensor:
-        # In-switch (ld_reduce) reduces via symmetric memory, NCCL-stitch layout.
+        # In-switch (ld_reduce) reduces via symmetric memory; the projection
+        # tail is the same replicated norm+up_proj+add3 as the fused-lane tier.
         group_name = torch.distributed.group.WORLD.group_name
         routed_stage = multimem_stage(routed_out, group_name)
         shared_stage = (
@@ -1343,22 +1327,15 @@ class KimiLinearMoE(nn.Module):
                 hidden_size,
             )
         routed_red = multimem_all_reduce_staged(routed_stage, group_name)
-        self._stitch_up_proj(routed_red, shared_stage, hidden_size)
-        shared_out = multimem_all_reduce_staged(shared_stage, group_name)
-        return (prefix_sum + shared_out).view(num_tokens, hidden_size)
-
-    def _tail_nccl_stitch(
-        self,
-        routed_out: torch.Tensor,
-        shared_partial: torch.Tensor,
-        prefix_sum: torch.Tensor,
-        num_tokens: int,
-        hidden_size: int,
-    ) -> torch.Tensor:
-        routed_red = all_reduce(routed_out, self.mapping.moe.tp_ep_group)
-        self._stitch_up_proj(routed_red, shared_partial, hidden_size)
-        shared_out = self._reduce_shared(shared_partial)
-        return (prefix_sum + shared_out).view(num_tokens, hidden_size)
+        shared_red = multimem_all_reduce_staged(shared_stage, group_name)
+        if self.routed_expert_norm is not None:
+            routed_red = self.routed_expert_norm(routed_red)
+        return kimi3_latent_projection_add3(
+            routed_red,
+            self.routed_expert_up_proj.weight,
+            prefix_sum,
+            shared_red,
+        ).view(num_tokens, hidden_size)
 
     def _tail_fused_lane_ar(
         self,
