@@ -147,14 +147,52 @@ class MaterializeArchitecturesTests(unittest.TestCase):
 
 
 class ArchitectureDispatchNormalizationTests(unittest.TestCase):
-    def test_nemotron_architecture_alias_maps_to_llama(self) -> None:
-        hf_config = PretrainedConfig(architectures=["NemotronForCausalLM"])
-        hf_text_config = PretrainedConfig(architectures=["NemotronForCausalLM"])
+    def test_nemotron_llama_compatible_alias_maps_to_llama(self) -> None:
+        hf_config = PretrainedConfig(
+            architectures=["NemotronForCausalLM"],
+            hidden_act="silu",
+        )
+        hf_text_config = PretrainedConfig(
+            architectures=["NemotronForCausalLM"],
+            hidden_act="silu",
+        )
 
         _normalize_architecture_aliases_for_dispatch(hf_config, hf_text_config)
 
         self.assertEqual(hf_config.architectures, ["LlamaForCausalLM"])
         self.assertEqual(hf_text_config.architectures, ["LlamaForCausalLM"])
+
+    def test_nemotron_incompatible_activation_is_left_unchanged(self) -> None:
+        hf_config = PretrainedConfig(
+            architectures=["NemotronForCausalLM"],
+            hidden_act="relu2",
+        )
+        hf_text_config = PretrainedConfig(
+            architectures=["NemotronForCausalLM"],
+            hidden_act="relu2",
+        )
+
+        _normalize_architecture_aliases_for_dispatch(hf_config, hf_text_config)
+
+        self.assertEqual(hf_config.architectures, ["NemotronForCausalLM"])
+        self.assertEqual(hf_text_config.architectures, ["NemotronForCausalLM"])
+
+    def test_nemotron_partial_rotary_is_left_unchanged(self) -> None:
+        hf_config = PretrainedConfig(
+            architectures=["NemotronForCausalLM"],
+            hidden_act="silu",
+            partial_rotary_factor=0.5,
+        )
+        hf_text_config = PretrainedConfig(
+            architectures=["NemotronForCausalLM"],
+            hidden_act="silu",
+            partial_rotary_factor=0.5,
+        )
+
+        _normalize_architecture_aliases_for_dispatch(hf_config, hf_text_config)
+
+        self.assertEqual(hf_config.architectures, ["NemotronForCausalLM"])
+        self.assertEqual(hf_text_config.architectures, ["NemotronForCausalLM"])
 
     def test_unknown_architecture_is_left_unchanged(self) -> None:
         hf_config = PretrainedConfig(architectures=["SomeFutureForCausalLM"])

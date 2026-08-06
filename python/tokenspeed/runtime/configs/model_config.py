@@ -90,6 +90,7 @@ _LLAMA_DENSE_ARCH_ALIASES = frozenset(
         "NemotronForCausalLM",
     }
 )
+_LLAMA_DENSE_HIDDEN_ACTS = frozenset({"silu"})
 
 
 class AttentionArch(IntEnum):
@@ -289,11 +290,19 @@ def _normalize_architecture_aliases_for_dispatch(
 ) -> None:
     """Normalize known architecture aliases to runtime registry entry names."""
 
+    def _is_llama_dense_compatible(config: PretrainedConfig) -> bool:
+        hidden_act = getattr(config, "hidden_act", None)
+        if hidden_act not in _LLAMA_DENSE_HIDDEN_ACTS:
+            return False
+        return not hasattr(config, "partial_rotary_factor")
+
     def _rewrite(config: PretrainedConfig) -> bool:
         archs = getattr(config, "architectures", None)
         if not isinstance(archs, list) or not archs:
             return False
         if archs[0] not in _LLAMA_DENSE_ARCH_ALIASES:
+            return False
+        if not _is_llama_dense_compatible(config):
             return False
         archs[0] = "LlamaForCausalLM"
         return True
