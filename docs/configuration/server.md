@@ -63,9 +63,19 @@ The RL control plane updates the version only when the trainer supplies one:
   version.
 - Omitting `weight_version` preserves the current value.
 
+These routes are served by the **control HTTP server**, not the OpenAI-compatible
+gateway. With the default `tokenspeed serve` / `ts serve` layout the control
+server listens on `--port + 1` (for example `http://localhost:8001` when
+`--port 8000`). Override the bind port with `--control-port` if needed.
+
 Use `GET /get_weight_version` to read the current value,
 `POST /update_weight_version` with `{"new_version": "..."}` to set it directly,
-and `GET /model_info` to read the model path and version together.
+and `GET /model_info` to read the model path and version together:
+
+```bash
+curl http://localhost:8001/get_weight_version
+curl http://localhost:8001/model_info
+```
 
 ## Scheduler And Memory
 
