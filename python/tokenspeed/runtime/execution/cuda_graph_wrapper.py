@@ -1103,22 +1103,15 @@ class CudaGraphWrapper:
         pad = padded_bs - active_req_pool_indices.shape[0]
         if pad <= 0:
             return active_req_pool_indices
-        if self.config.spec_algo in ("DFLASH", "DSPARK"):
-            # Route padding rows to the sentinel req-pool slot
-            # (max_req_pool_size), not slot 0. The DFLASH draft derives each
-            # row's block seq_len from valid_cache_lengths[req_pool], so
-            # padding rows pointing at slot 0 would grow unbounded with
-            # request 0's context and hang the draft block-decode kernel.
-            # The sentinel row stays zero-init (length 0, dummy page 0).
-            sentinel = int(self.config.max_req_pool_size)
-            return torch.cat(
-                [
-                    active_req_pool_indices,
-                    active_req_pool_indices.new_full((pad,), sentinel),
-                ]
-            )
+        # Slot 0 is scheduler-owned and can contain live request state. Every
+        # padded graph row must use the reserved sink row, which remains neutral
+        # across capture and replay for attention and sampling consumers.
+        sentinel = int(self.config.max_req_pool_size)
         return torch.cat(
-            [active_req_pool_indices, active_req_pool_indices.new_zeros(pad)]
+            [
+                active_req_pool_indices,
+                active_req_pool_indices.new_full((pad,), sentinel),
+            ]
         )
 
     def _set_graph_state_write_indices(

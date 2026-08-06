@@ -343,6 +343,7 @@ class ServerArgs:
     # For communication + norm fusion
     comm_fusion_max_num_tokens: int = 2048
     enable_allreduce_fusion: bool = False
+    disable_allreduce_fusion: bool = False
 
     enable_expert_parallel: bool = False
 
@@ -728,10 +729,45 @@ class ServerArgs:
             )
 
     def resolve_communication(self):
+        if self.enable_allreduce_fusion and self.disable_allreduce_fusion:
+            raise ValueError(
+                "--enable-allreduce-fusion and --disable-allreduce-fusion "
+                "are mutually exclusive"
+            )
+
+        arnorm_backend = os.environ.get("TS_ARNORM_BACKEND", "auto").strip().lower()
+        if arnorm_backend not in {"auto", "triton_shmem", "iris", "symm_mem"}:
+            raise ValueError(
+                "TS_ARNORM_BACKEND must be auto, triton_shmem, iris, or "
+                f"symm_mem; got {arnorm_backend!r}"
+            )
+
+        if arnorm_backend == "triton_shmem":
+            incompatible: list[str] = []
+            if self.mapping.nnodes != 1:
+                incompatible.append("multi-node mapping")
+            if not self.mapping.has_attn_tp:
+                incompatible.append("no attention tensor-parallel group")
+            if self.mapping.has_attn_dp:
+                incompatible.append("attention data parallelism")
+            if self.speculative_algorithm is not None:
+                incompatible.append(
+                    f"speculative decoding ({self.speculative_algorithm})"
+                )
+            if incompatible:
+                self.enable_allreduce_fusion = False
+                self.disable_allreduce_fusion = True
+                logger.warning(
+                    "Declined triton_shmem allreduce fusion before model "
+                    "initialization (%s); using the complete unfused path",
+                    ", ".join(incompatible),
+                )
+
         # Auto-enable allreduce fusion on supported single-node TP configurations.
         platform = current_platform()
         if (
             not self.enable_allreduce_fusion
+            and not self.disable_allreduce_fusion
             and (current_platform().is_hopper_plus or platform.is_amd)
             and self.mapping.nnodes == 1
             and self.mapping.has_attn_tp
@@ -2030,6 +2066,11 @@ class ServerArgs:
             "--enable-allreduce-fusion",
             action="store_true",
             help="Enable allreduce fusion for improved decode performance. Auto-enabled on supported single-node TP configurations.",
+        )
+        parser.add_argument(
+            "--disable-allreduce-fusion",
+            action="store_true",
+            help="Disable allreduce fusion and suppress automatic enablement.",
         )
         parser.add_argument(
             "--disaggregation-bootstrap-port",
