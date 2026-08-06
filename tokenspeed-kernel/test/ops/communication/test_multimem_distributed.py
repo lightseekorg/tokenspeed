@@ -246,6 +246,7 @@ def test_stage_view_invalidated_by_next_stage_of_same_width():
 
 def test_graph_replay_survives_buffer_growth():
     """A captured staged reduce must stay valid after the buffer is retired."""
+    from tokenspeed_kernel.ops.communication import multimem
     from tokenspeed_kernel.ops.communication.multimem import (
         multimem_all_reduce_staged,
         multimem_stage,
@@ -254,6 +255,14 @@ def test_graph_replay_survives_buffer_growth():
     rank, dev = _setup()
     _require_multimem()
     gname = _group_name()
+    # Reset this width symmetrically so the later stage really grows/retires,
+    # regardless of what earlier tests left cached.
+    torch.cuda.synchronize()
+    dist.barrier()
+    for key in [k for k in multimem._BUFFERS if k[1] == LATENT]:
+        multimem._RETIRED.append(multimem._BUFFERS.pop(key))
+    dist.barrier()
+    retired_before = len(multimem._RETIRED)
     small = _inputs(rank, dev, 64, 3584, seed=41_000)
     ref_small = _nccl_reference(small)
 
@@ -274,6 +283,9 @@ def test_graph_replay_survives_buffer_growth():
     ref_big = _nccl_reference(big)
     grown = multimem_stage(big, gname)
     assert grown is not None
+    assert (
+        len(multimem._RETIRED) > retired_before
+    ), "growth must retire the captured buffer"
     out_big = multimem_all_reduce_staged(grown, gname)
     torch.cuda.synchronize()
     _assert_matches(out_big, ref_big, "post-growth eager")
