@@ -1641,7 +1641,9 @@ class EventLoop:
             self._commit_cache_results()
             if self._pause.forward_blocked:
                 # A pause may precede a weight update; a pending replay must
-                # commit under the weights that produced it.
+                # commit under the weights that produced it. Flushing every
+                # entry is safe here because pages are only re-assigned by a
+                # new execution plan, and the pause admits none.
                 self._flush_kda_pending_now()
                 self._paused_idle_step()
                 continue

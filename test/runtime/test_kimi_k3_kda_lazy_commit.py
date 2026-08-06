@@ -178,7 +178,8 @@ def _run_rounds(h, rounds, accepts, rpis, eager):
         h.accept(accepted)
         if eager:
             h.flush()
-        seq_lens = [s + a for s, a in zip(seq_lens, accepted)]
+        # The engine always commits at least the target's own sample.
+        seq_lens = [s + max(a, 1) for s, a in zip(seq_lens, accepted)]
     h.flush()  # commit the last window either way
     return outs, pages
 

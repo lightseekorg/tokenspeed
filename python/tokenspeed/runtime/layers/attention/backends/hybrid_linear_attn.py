@@ -613,6 +613,7 @@ class MambaAttnBackend(AttentionBackend):
         padded_bs: int,
         kwargs: dict,
         state_in_by_group: dict[str, torch.Tensor] | None,
+        committed: torch.Tensor | None = None,
     ) -> None:
         """Compose this verify round's lazy-commit inputs from the pending
         record, flushing any pending request that left the verify batch.
@@ -637,13 +638,14 @@ class MambaAttnBackend(AttentionBackend):
                     state_in_by_group[gid][:real_bs].to(torch.int32)
                 )
         if real_bs <= 0:
-            # Idle / fully padded verify replay. The captured graph includes
-            # the payload-capture copies, which re-execute with whatever junk
-            # the input buffers hold -- so a pending kept across this round
-            # would replay from clobbered payload later. Commit it NOW, while
-            # the payload is still intact (metadata prep runs before the
-            # graph replay).
-            self._flush_kda_pending()
+            # Idle / fully padded verify replay: nothing was schedulable, so
+            # every pending owner has left the engine and its pages may be
+            # someone else's. Discard -- the same premise the no-forward loop
+            # hook drops on. (Keeping it is also unsound: the captured graph
+            # re-executes the payload-capture copies over junk inputs.)
+            pending = getattr(self, "_kda_pending", None)
+            if pending is not None:
+                self._drop_kda_pending(list(pending["slot_by_rpi"]))
             return
         pending = getattr(self, "_kda_pending", None)
         if pending is None:
@@ -667,6 +669,15 @@ class MambaAttnBackend(AttentionBackend):
             # commit the pending eagerly and run a plain round.
             self._flush_kda_pending()
             return
+        arm_req_ids = list(
+            getattr(kwargs.get("forward_batch"), "request_ids", None) or []
+        )[:real_bs]
+        _, corpses = self._kda_pending_owner_mask(rpis, arm_req_ids)
+        if corpses:
+            self._drop_kda_pending(corpses)
+            pending = getattr(self, "_kda_pending", None)
+            if pending is None:
+                return
         current = set(rpis)
         departed = [r for r in pending["slot_by_rpi"] if r not in current]
         if departed:
@@ -687,17 +698,48 @@ class MambaAttnBackend(AttentionBackend):
         # non-verify forward in between. The impostor's committed page never
         # matches the dead pending's commit page, so gate on that (one state
         # group suffices -- groups page in lockstep). Mismatched entries are
-        # simply not armed; the record after this round's forward replaces
-        # the whole pending, which garbage-collects them. They are NOT
-        # flushed: the dead request's pages may already belong to someone
-        # else.
+        # dropped on the spot: the dead request's pages may already belong to
+        # someone else, so they must never be flushed -- not even by a later
+        # disposal site if this round's forward is abandoned before its
+        # record replaces the pending.
         check_gid = self._state_group_ids[0]
         pending_commit = (
             pending["commit_by_group"][check_gid].to(torch.int64).gather(0, safe)
         )
-        has = has & (
-            pending_commit == state_in_by_group[check_gid][:real_bs].to(torch.int64)
+        identity_ok = pending_commit == state_in_by_group[check_gid][:real_bs].to(
+            torch.int64
         )
+        if committed is not None:
+            # Causal-progress check: this pending's window can only continue
+            # a request whose committed position equals the one the record
+            # anticipated. A recycled pool index whose new owner also reuses
+            # the same state page passes the page-identity gate, but a new
+            # request's progress never matches a dead one's continuation.
+            expected = pending["expect"].gather(0, safe)
+            identity_ok = identity_ok & (
+                expected == committed[:real_bs].to(torch.int64)
+            )
+        impostor_mask = (has & ~identity_ok).tolist()
+        impostors = [r for i, r in enumerate(rpis) if impostor_mask[i]]
+        if impostors:
+            self._drop_kda_pending(impostors)
+            pending = getattr(self, "_kda_pending", None)
+            if pending is None:
+                return
+        has = has & identity_ok
+        t_now = int(
+            kwargs.get("tokens_per_req", 0)
+            or self.speculative_num_draft_tokens
+            or t_prev
+        )
+        if t_prev != t_now:
+            # The payload layout and step counts are in t_prev units; a
+            # different window size this round would silently truncate or
+            # overrun the replay. Everyone left in the pending is a resident
+            # of this batch (departed and recycled entries were just
+            # dropped), so flushing is safe and exact.
+            self._flush_kda_pending()
+            return
         neg = torch.full_like(slot_map, -1)
         bufs["base"][:real_bs].copy_(
             torch.where(has, safe * t_prev, neg).to(torch.int32)
@@ -720,6 +762,13 @@ class MambaAttnBackend(AttentionBackend):
             bufs["commit"][gid][:real_bs].copy_(
                 torch.where(has, commit, neg).to(torch.int32)
             )
+        self._kt(
+            "arm",
+            rpis=rpis,
+            fused=has,
+            base=bufs["base"][:real_bs],
+            commit=bufs["commit"][self._state_group_ids[0]][:real_bs],
+        )
         # NOT consumed here: the pending survives until the record that
         # follows a COMPLETED verify forward replaces it. If the forward is
         # abandoned after this prep (retract), the pending is still intact
@@ -729,6 +778,47 @@ class MambaAttnBackend(AttentionBackend):
         # scheduler re-raises and the rank exits), which is what makes
         # arm -> forward -> record atomic as far as this machinery sees.
         return
+
+    def _kt(self, tag, **kv):
+        import os
+
+        if not os.environ.get("TS_KDA_TRACE"):
+            return
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return
+        import torch.distributed as dist
+
+        if dist.is_initialized() and dist.get_rank() != 0:
+            return
+        out = []
+        for k, v in kv.items():
+            if isinstance(v, torch.Tensor):
+                v = v.detach().cpu().tolist()
+            out.append(f"{k}={v}")
+        print(f"[kt] {tag} " + " ".join(out), flush=True)
+
+    def _kda_pending_owner_mask(self, rpis, req_ids):
+        """Split batch rpis into (owners, corpses) against the pending.
+
+        The engine request id is the one credential pool-index recycling
+        cannot forge. ``None`` ids (no identity available) count as owners,
+        matching the pre-identity behavior.
+        """
+        pending = getattr(self, "_kda_pending", None)
+        if pending is None:
+            return [], []
+        id_by_rpi = pending.get("id_by_rpi", {})
+        owners, corpses = [], []
+        for i, r in enumerate(rpis):
+            if r not in pending["slot_by_rpi"]:
+                continue
+            rec = id_by_rpi.get(r)
+            cur = req_ids[i] if i < len(req_ids) else None
+            if rec is None or cur is None or rec == cur:
+                owners.append(r)
+            else:
+                corpses.append(r)
+        return owners, corpses
 
     def _drop_kda_pending(self, only_rpis) -> None:
         """Discard pending windows for requests that left the engine.
@@ -744,6 +834,7 @@ class MambaAttnBackend(AttentionBackend):
         pending = getattr(self, "_kda_pending", None)
         if pending is None:
             return
+        self._kt("drop", only=list(only_rpis))
         for r in list(only_rpis):
             pending["slot_by_rpi"].pop(r, None)
         if not pending["slot_by_rpi"]:
@@ -763,6 +854,12 @@ class MambaAttnBackend(AttentionBackend):
         pending = getattr(self, "_kda_pending", None)
         if pending is None:
             return
+        self._kt(
+            "flush",
+            only=only_rpis,
+            slots=list(pending["slot_by_rpi"]),
+            commit=pending["commit_by_group"][self._state_group_ids[0]],
+        )
         from tokenspeed_kernel.ops.attention import try_kda_replay_commit
 
         slot_by_rpi = pending["slot_by_rpi"]
@@ -985,9 +1082,13 @@ class MambaAttnBackend(AttentionBackend):
         if not self.state_paging_active or self.is_draft:
             return 0
         self._ensure_verify_scratch(max_bs, draft_token_num)
+        # The replay path deliberately allocates no scratch.
+        scratch = getattr(self, "_verify_scratch", None)
+        if scratch is None:
+            return 0
         return sum(
             tensor.nbytes
-            for layer_scratch in self._verify_scratch.values()
+            for layer_scratch in scratch.values()
             for tensor in layer_scratch
         )
 
@@ -1237,12 +1338,24 @@ class MambaAttnBackend(AttentionBackend):
             # pending: reaching this record means the verify forward that
             # was armed with it completed, i.e. its commit happened.
             rpis = ctx[4] if len(ctx) > 4 else []
+            req_ids = ctx[5] if len(ctx) > 5 else []
             self._kda_pending = dict(
                 slot_by_rpi={r: i for i, r in enumerate(rpis[:bs])},
                 steps=k.to(torch.int32),
+                expect=(committed[:bs].to(torch.int64) + k.to(torch.int64)),
+                id_by_rpi={
+                    r: (req_ids[i] if i < len(req_ids) else None)
+                    for i, r in enumerate(rpis[:bs])
+                },
                 anchor_by_group={g: t[:bs] for g, t in read_pages_by_group.items()},
                 commit_by_group=pages_by_group,
                 draft_token_num=draft_token_num,
+            )
+            self._kt(
+                "record",
+                rpis=rpis[:bs],
+                k=k,
+                commit=pages_by_group[self._state_group_ids[0]][:bs],
             )
             self._verify_commit_ctx = None
             if not rpis:
@@ -1445,10 +1558,20 @@ class MambaAttnBackend(AttentionBackend):
         state_in_pages_by_group = None
         state_out_pages_by_group = None
         if getattr(self, "_kda_pending", None) is not None and not is_target_verify:
-            # A pending lazy commit only fuses into a verify round. Any other
-            # forward may read or repage the pending requests' state, so
-            # commit first (eager launches, before this forward's kernels).
-            self._flush_kda_pending()
+            # A pending lazy commit only fuses into a verify round; this
+            # batch's owners are resident, so their windows commit before a
+            # forward that reads or repages their state. Out-of-batch entries
+            # are reaped by the verify-prep departed/causal gates.
+            batch_ids = list(
+                getattr(kwargs.get("forward_batch"), "request_ids", None) or []
+            )
+            owners, corpses = self._kda_pending_owner_mask(
+                req_pool_indices.tolist(), batch_ids
+            )
+            if corpses:
+                self._drop_kda_pending(corpses)
+            if owners and getattr(self, "_kda_pending", None) is not None:
+                self._flush_kda_pending(only_rpis=owners)
         # Idle/bs==0 forwards carry no requests and never reach the mamba
         # forward (router returns early), so no tables are required.
         if bs > 0 and not forward_mode.is_idle():
@@ -1472,15 +1595,21 @@ class MambaAttnBackend(AttentionBackend):
                 verify_rpis = list(
                     getattr(verify_op, "request_pool_indices", None) or []
                 )[:bs]
+                verify_req_ids = list(getattr(verify_op, "request_ids", None) or [])[
+                    :bs
+                ]
                 self._verify_commit_ctx = (
                     verify_committed,
                     verify_tables,
                     draft_token_num,
                     state_in_pages_by_group,
                     verify_rpis,
+                    verify_req_ids,
                 )
                 if self._kda_replay_active():
-                    self._arm_kda_pending(bs, bs, kwargs, state_in_pages_by_group)
+                    self._arm_kda_pending(
+                        bs, bs, kwargs, state_in_pages_by_group, verify_committed
+                    )
             else:
                 (
                     state_in_pages_by_group,
@@ -1696,9 +1825,17 @@ class MambaAttnBackend(AttentionBackend):
         state_in_pages_by_group = None
         state_out_pages_by_group = None
         if getattr(self, "_kda_pending", None) is not None and not is_target_verify:
-            # See init_forward_metadata: non-verify rounds must not run over
-            # an uncommitted pending window.
-            self._flush_kda_pending()
+            # See init_forward_metadata: in-batch owners commit first.
+            batch_ids = list(
+                getattr(kwargs.get("forward_batch"), "request_ids", None) or []
+            )[:bs]
+            owners, corpses = self._kda_pending_owner_mask(
+                req_pool_indices[:bs].tolist(), batch_ids
+            )
+            if corpses:
+                self._drop_kda_pending(corpses)
+            if owners and getattr(self, "_kda_pending", None) is not None:
+                self._flush_kda_pending(only_rpis=owners)
         if self.state_paging_active and is_target_verify:
             # Target-verify replay: refresh the CAPTURED per-bs state_in
             # buffers with each group's committed-state page (page of
@@ -1720,12 +1857,16 @@ class MambaAttnBackend(AttentionBackend):
                 verify_rpis = list(
                     getattr(verify_op, "request_pool_indices", None) or []
                 )[:real_bs]
+                verify_req_ids = list(getattr(verify_op, "request_ids", None) or [])[
+                    :real_bs
+                ]
                 self._verify_commit_ctx = (
                     verify_committed,
                     verify_tables,
                     draft_token_num,
                     pages_by_group,
                     verify_rpis,
+                    verify_req_ids,
                 )
             else:
                 self._verify_commit_ctx = None
@@ -1752,7 +1893,9 @@ class MambaAttnBackend(AttentionBackend):
                 state_in_pages_by_group[group_id] = state_in
                 state_out_pages_by_group[group_id] = state_out
             if self._kda_replay_active():
-                self._arm_kda_pending(real_bs, bs, kwargs, pages_by_group)
+                self._arm_kda_pending(
+                    real_bs, bs, kwargs, pages_by_group, verify_committed
+                )
         elif self.state_paging_active:
             # For multi-group KDA state paging, dual indexing runs once per
             # state group over the real rows. Padded rows get pad_slot_id (-1),
