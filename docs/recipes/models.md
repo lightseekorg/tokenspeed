@@ -231,8 +231,8 @@ supported (SM100-family, bf16, NVLS available) and falls back to the fused-AR
 tail otherwise. Separately — and also under EP — batches above the decode
 range and up to 8192 tokens reduce both MoE partials in-switch
 (`multimem.ld_reduce` over symmetric memory) before the replicated projection
-tail: about 2x faster than ring all-reduce at these sizes, worth ~14% TTFT on
-8192-token prefills at TP16. The staging buffers are pre-sized once at init
+tail: about 2x faster than ring all-reduce at these sizes, worth ~20% TTFT on
+8192-token prefills at TP16 against the grouped-NCCL join. The staging buffers are pre-sized once at init
 (~176 MB of symmetric memory per rank across both widths).
 
 ### AMD

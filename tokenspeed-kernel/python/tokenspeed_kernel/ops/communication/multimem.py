@@ -133,9 +133,12 @@ def multimem_prealloc(rows: int, widths: tuple[int, ...], group_name: str) -> bo
     if not multimem_available():
         return False
     device = torch.device("cuda", torch.cuda.current_device())
+    ready = True
     for width in widths:
-        _ensure_buffer(rows, width, device, group_name, rows)
-    return True
+        ready = (
+            _ensure_buffer(rows, width, device, group_name, rows) is not None and ready
+        )
+    return ready
 
 
 def multimem_stage(

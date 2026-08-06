@@ -59,12 +59,16 @@ class K3MoETailTier(IntEnum):
 
     TAIL_FUSION = 0  # fused decode kernel (aka the multicast latent tail)
     MULTIMEM_AR = 1  # in-switch (ld_reduce) reduces, then the replicated tail
-    FUSED_LANE_AR = 2  # NCCL tier: the join picks lane/cat/grouped per size
+    FUSED_LANE_AR = 2  # join tier: lane one-shot / cat+one-shot / grouped NCCL
     SEPARATE_REDUCE = 3  # portable: reduce each partial on its own
 
 
-# Above every decode-graph bucket: at decode sizes the two staged reduces
+# Above plain decode-graph buckets: at decode sizes the two staged reduces
 # lose ~4% TPOT to the single fused-lane AR; the ld_reduce win is prefill's.
+# Caveat: spec-decode buckets reach bs*q tokens and can re-enter this window
+# in-graph (correct, but decode-suboptimal) — a follow-up should add an
+# is_decode axis rather than gate on the graph phase, which prefill graphs
+# legitimately share.
 MULTIMEM_AR_MIN_TOKENS = 256
 # Upper edge of the measured window; larger batches take the join's grouped path.
 MULTIMEM_AR_MAX_TOKENS = 8192

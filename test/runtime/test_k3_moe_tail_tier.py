@@ -90,7 +90,7 @@ def test_multimem_lower_bound_excludes_decode_bucket_sizes():
     assert _select(num_tokens=256) is K3MoETailTier.MULTIMEM_AR
 
 
-@pytest.mark.parametrize("m", [17, 2047, 2048, 8192])
+@pytest.mark.parametrize("m", [256, 2047, 2048, 8192])
 def test_fused_lane_fallback_without_multimem(m):
     assert _select(num_tokens=m, multimem_ok=False) is K3MoETailTier.FUSED_LANE_AR
 

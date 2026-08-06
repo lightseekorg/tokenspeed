@@ -1174,9 +1174,11 @@ class KimiLinearMoE(nn.Module):
                         self._latent_tail.max_num_tokens < MULTIMEM_AR_MIN_TOKENS
                     ), "fused-tail capacity must stay below the multimem window"
                     logger.info("multicast latent tail engaged")
-                except Exception:  # noqa: BLE001 - keep the fused-AR tail
-                    logger.exception("multicast latent tail unavailable; falling back")
-                    self._latent_tail = None
+                except Exception:
+                    # A non-uniform mid-constructor failure would strand peers
+                    # in its collectives; die loudly instead of half-hanging.
+                    logger.exception("multicast latent tail init failed")
+                    raise
 
             # A rank diverging on tail eligibility would deadlock the collective.
             flag = torch.tensor(
@@ -1306,7 +1308,7 @@ class KimiLinearMoE(nn.Module):
         """
         if tier is K3MoETailTier.TAIL_FUSION:
             # Selector pins the graph phase: warmup/capture/replay all take
-            # this path, and eager serving keeps the NCCL tiers.
+            # this path, and eager serving keeps the join/portable tiers.
             return self._tail_fusion(routed_out, shared_partial, prefix_sum)
         if tier is K3MoETailTier.MULTIMEM_AR:
             return self._tail_multimem_ar(
@@ -1347,7 +1349,8 @@ class KimiLinearMoE(nn.Module):
         # tail is the same replicated norm+up_proj+add3 as the fused-lane tier.
         # WORLD is safe: the eligibility gate pinned tp_ep == WORLD at init.
         group_name = torch.distributed.group.WORLD.group_name
-        # Warmup ran this shape eagerly, so the buffers exist by capture time.
+        # multimem_prealloc sized the buffers at init; a stage miss can only
+        # come from stage validation (e.g. non-bf16 activations), rank-uniform.
         routed_stage = multimem_stage(routed_out, group_name, MULTIMEM_AR_MAX_TOKENS)
         shared_stage = (
             multimem_stage(shared_partial, group_name, MULTIMEM_AR_MAX_TOKENS)
