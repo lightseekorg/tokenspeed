@@ -4053,6 +4053,29 @@ class DeepseekV4Model(nn.Module):
         self.hc_head_scale = nn.Parameter(
             torch.empty(1, dtype=torch.float32), requires_grad=False
         )
+        self.dspark_layers_to_capture: tuple[int, ...] = ()
+
+    def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
+        normalized = tuple(int(layer_id) for layer_id in layer_ids)
+        if not normalized:
+            raise ValueError("DSpark requires at least one target capture layer.")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("DSpark target capture layer IDs must be unique.")
+        if tuple(sorted(normalized)) != normalized:
+            raise ValueError(
+                "DSpark target capture layer IDs must be strictly increasing."
+            )
+        invalid = [
+            layer_id
+            for layer_id in normalized
+            if layer_id < 0 or layer_id >= len(self.layers)
+        ]
+        if invalid:
+            raise ValueError(
+                "DSpark target capture layer IDs are out of range: "
+                f"{invalid}; target has {len(self.layers)} layers."
+            )
+        self.dspark_layers_to_capture = normalized
 
     def forward(
         self,
@@ -4075,6 +4098,8 @@ class DeepseekV4Model(nn.Module):
         hc_x_prev = None
         hc_post_prev = None
         hc_comb_prev = None
+        dspark_captures = []
+        dspark_capture_set = frozenset(self.dspark_layers_to_capture)
         for layer in self.layers:
             hidden_states, hc_x_prev, hc_post_prev, hc_comb_prev = layer(
                 positions,
@@ -4088,6 +4113,14 @@ class DeepseekV4Model(nn.Module):
                 hc_post_prev,
                 hc_comb_prev,
             )
+            if layer.layer_id in dspark_capture_set:
+                resolved_hidden_states = mhc_post(
+                    hc_x_prev,
+                    hidden_states,
+                    hc_post_prev,
+                    hc_comb_prev,
+                )
+                dspark_captures.append(resolved_hidden_states.mean(dim=1))
         with nvtx_range("hc_ffn_post_final"):
             hidden_states = mhc_post(
                 hc_x_prev, hidden_states, hc_post_prev, hc_comb_prev
@@ -4097,8 +4130,17 @@ class DeepseekV4Model(nn.Module):
             ctx.capture_hidden_mode is not None
             and ctx.capture_hidden_mode.need_capture()
         ):
-            # V4 MTP consumes the pre-hc_head hypercompressed residual.
-            aux_hidden_states = [hidden_states.flatten(1)]
+            if self.dspark_layers_to_capture:
+                if len(dspark_captures) != len(self.dspark_layers_to_capture):
+                    raise RuntimeError(
+                        "DSpark target hidden-state capture is incomplete: "
+                        f"expected {self.dspark_layers_to_capture}, captured "
+                        f"{len(dspark_captures)} tensors."
+                    )
+                aux_hidden_states = dspark_captures
+            else:
+                # V4 MTP consumes the pre-hc_head hypercompressed residual.
+                aux_hidden_states = [hidden_states.flatten(1)]
         with nvtx_range("hc_head"):
             hidden_states = hc_head(
                 hidden_states,
@@ -4115,6 +4157,10 @@ class DeepseekV4Model(nn.Module):
 
 class DeepseekV4ForCausalLM(BaseCausalLM):
     model_cls = DeepseekV4Model
+
+    def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
+        self.capture_aux_hidden_states = True
+        self.model.set_dspark_layers_to_capture(layer_ids)
 
     def get_stacked_params_mapping(self):
         return [

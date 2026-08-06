@@ -42,6 +42,9 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 from tokenspeed.runtime.execution.breakable_cuda_graph import active_forward
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
+from tokenspeed.runtime.execution.drafter.deepseek_v4_dspark import (
+    DeepseekV4DSpark,
+)
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
 from tokenspeed.runtime.execution.drafter.dspark import DSpark
 from tokenspeed.runtime.execution.drafter.eagle import Eagle
@@ -67,6 +70,7 @@ from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     validate_scheduler_config,
 )
+from tokenspeed.runtime.layers.attention.page_table import expand_page_table
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.layers.paged_attention import (
     validate_paged_cache_group_ids,
@@ -108,6 +112,13 @@ def _get_drafter_impl(spec_algo: str, model: torch.nn.Module):
     # "MTP" covers two algorithms:
     # (1) Eagle-like MTP (e.g. DeepSeek) stays on Eagle in eagle.py;
     # (2) Vanilla MTP (e.g. Inkling) with multi-layer weights stays on Mtp in mtp.py.
+    if spec_algo == "DSPARK":
+        from tokenspeed.runtime.models.deepseek_v4_dspark import (
+            DeepseekV4ForCausalLMDSpark,
+        )
+
+        if isinstance(model, DeepseekV4ForCausalLMDSpark):
+            return DeepseekV4DSpark
     if spec_algo == "MTP" and isinstance(model, InklingForConditionalGenerationNextN):
         return Mtp
     else:
@@ -115,15 +126,37 @@ def _get_drafter_impl(spec_algo: str, model: torch.nn.Module):
 
 
 def _eagle_aux_layer_ids(hf_config) -> list[int] | None:
-    """Draft's eagle_aux_hidden_state_layer_ids (nested or top-level), or None."""
-    eagle_config = getattr(hf_config, "eagle_config", None)
-    if isinstance(eagle_config, dict):
-        ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
-    elif eagle_config is not None:
-        ids = getattr(eagle_config, "eagle_aux_hidden_state_layer_ids", None)
-    else:
-        ids = getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None)
-    return list(ids) if ids else None
+    """Return EAGLE3 capture ids from a draft config, including K3 text config.
+
+    K3 wraps the language configuration in ``text_config``.  Draft exports may
+    place ``eagle_config`` either on that text config or on the top-level
+    wrapper, so inspect both without falling back to the target's defaults.
+    """
+    candidates = [hf_config]
+    text_config = (
+        hf_config.get("text_config")
+        if isinstance(hf_config, dict)
+        else getattr(hf_config, "text_config", None)
+    )
+    if text_config is not None:
+        candidates.append(text_config)
+
+    for config in candidates:
+        if isinstance(config, dict):
+            eagle_config = config.get("eagle_config")
+            direct_ids = config.get("eagle_aux_hidden_state_layer_ids")
+        else:
+            eagle_config = getattr(config, "eagle_config", None)
+            direct_ids = getattr(config, "eagle_aux_hidden_state_layer_ids", None)
+        if isinstance(eagle_config, dict):
+            ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
+        elif eagle_config is not None:
+            ids = getattr(eagle_config, "eagle_aux_hidden_state_layer_ids", None)
+        else:
+            ids = direct_ids
+        if ids:
+            return list(ids)
+    return None
 
 
 def _draft_idle_global_num_tokens_for_step(
@@ -198,6 +231,8 @@ class ModelExecutorConfig:
     spec_num_steps: int | None = None
     # spec_num_tokens == spec_num_steps + 1 for now (without Tree Attention)
     spec_num_tokens: int | None = None
+    # Explicit EAGLE3 capture ids; overrides the draft checkpoint's ids.
+    eagle3_layers_to_capture: list[int] | None = None
     overlap_schedule_depth: int = 0
     dp_sampling: bool = False
     dp_sampling_min_bs: int | None = None
@@ -273,6 +308,7 @@ class ModelExecutorConfig:
             spec_algo=server_args.speculative_algorithm,
             spec_num_steps=server_args.speculative_num_steps,
             spec_num_tokens=server_args.speculative_num_draft_tokens,
+            eagle3_layers_to_capture=server_args.eagle3_layers_to_capture,
             overlap_schedule_depth=overlap_schedule_depth,
             dp_sampling=server_args.dp_sampling,
             dp_sampling_min_bs=server_args.dp_sampling_min_bs,
@@ -346,6 +382,20 @@ class ModelExecutor:
             speculative_algorithm=config.spec_algo,
         )
 
+        # fill_input_buffers indexes the scheduler table in logical pages; the drafter indexes draft_page_table in its backend's kernel pages.
+        self._logical_page_size = int(
+            getattr(draft_token_to_kv_pool, "page_size", 0) or config.logical_page_size
+        )
+        self._draft_page_size = int(
+            getattr(draft_attn_backend, "page_size", 0) or self._logical_page_size
+        )
+        if self._logical_page_size % self._draft_page_size:
+            raise ValueError(
+                f"logical page size {self._logical_page_size} is not a multiple "
+                f"of the draft kernel page size {self._draft_page_size}"
+            )
+        self._draft_page_ratio = self._logical_page_size // self._draft_page_size
+
         if config.spec_algo is not None:
             # The DFLASH overlap scheduler reserves a fresh draft block per
             # decode step a request stays scheduled, including the few steps it
@@ -363,13 +413,13 @@ class ModelExecutor:
                 config.context_len
                 + config.spec_num_tokens
                 + draft_block_reservation_slack
-                + config.logical_page_size
+                + self._draft_page_size
                 - 1
-            ) // config.logical_page_size
+            ) // self._draft_page_size
         else:
             max_num_pages_per_req = (
-                config.context_len + config.logical_page_size
-            ) // config.logical_page_size
+                config.context_len + self._draft_page_size
+            ) // self._draft_page_size
 
         max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
 
@@ -384,15 +434,11 @@ class ModelExecutor:
             device=self.device,
         )
         spec_num_tokens = config.spec_num_tokens if config.spec_algo is not None else 1
-        # Stride for indexing page_table when building drafter caller-side
-        # write locations for ordinary attention backends.
-        self._draft_page_size = int(
-            getattr(draft_token_to_kv_pool, "page_size", 0) or config.logical_page_size
-        )
         self.input_buffers = InputBuffers(
             max_bs=max_bs,
             max_num_tokens=config.chunked_prefill_size,
-            page_size=self._draft_page_size,
+            # Indexes the scheduler's full-history table: logical page ids.
+            page_size=self._logical_page_size,
             # token_to_kv_pool allocates size+page_size slots; index `size` is
             # the reserved dummy slot (see MHATokenToKVPool._create_buffers).
             dummy_kv_slot=0,
@@ -428,9 +474,11 @@ class ModelExecutor:
             )
             if hasattr(self.drafter, "bind_target_model"):
                 self.drafter.bind_target_model(self.model_runner.model)
-            # EAGLE3/MTP share the target's embed + lm_head; DFLASH ships its
-            # own draft weights, so it must NOT inherit the target's.
-            if config.spec_algo in ("EAGLE3", "MTP"):
+            # The V4 checkpoint-local DSpark path shares the target's embed and
+            # LM head. Generic DSpark and DFlash ship their own draft weights.
+            if config.spec_algo in ("EAGLE3", "MTP") or isinstance(
+                self.drafter, DeepseekV4DSpark
+            ):
                 embed, head = self.model_runner.model.get_embed_and_head()
                 draft_model_runner.model.set_embed_and_head(embed, head)
             MultimodalRuntime.wire_drafter(
@@ -440,11 +488,13 @@ class ModelExecutor:
                 self.model_runner.model, "set_eagle3_layers_to_capture"
             ):
                 # capture the layers the draft was trained on, not the default
-                aux_layer_ids = _eagle_aux_layer_ids(
+                aux_layer_ids = config.eagle3_layers_to_capture or _eagle_aux_layer_ids(
                     draft_model_runner.model_config.hf_config
                 )
                 self.model_runner.model.set_eagle3_layers_to_capture(aux_layer_ids)
-            if config.spec_algo in ("DFLASH", "DSPARK"):
+            if config.spec_algo in ("DFLASH", "DSPARK") and not isinstance(
+                self.drafter, DeepseekV4DSpark
+            ):
                 if not hasattr(self.model_runner.model, "set_dflash_layers_to_capture"):
                     raise ValueError(
                         "DFLASH requires the target model to support "
@@ -459,6 +509,15 @@ class ModelExecutor:
                     self.drafter.target_layer_ids,
                     incremental_callback=incr_callback,
                     slot_bufs=incr_slot_bufs,
+                )
+            if isinstance(self.drafter, DeepseekV4DSpark):
+                if not hasattr(self.model_runner.model, "set_dspark_layers_to_capture"):
+                    raise ValueError(
+                        "DSPARK requires the target model to support "
+                        "set_dspark_layers_to_capture."
+                    )
+                self.model_runner.model.set_dspark_layers_to_capture(
+                    self.drafter.target_layer_ids
                 )
         else:
             self.drafter = None
@@ -475,10 +534,24 @@ class ModelExecutor:
 
         attn_backend.configure_runtime(
             sliding_window_size=model_runner.sliding_window_size,
+            paged_cache_group_specs=tuple(token_to_kv_pool.paged_cache_group_specs),
+            paged_cache_group_page_counts=getattr(
+                token_to_kv_pool,
+                "paged_cache_group_page_counts",
+                None,
+            ),
         )
         if draft_attn_backend is not None:
             draft_attn_backend.configure_runtime(
                 sliding_window_size=model_runner.sliding_window_size,
+                paged_cache_group_specs=tuple(
+                    getattr(draft_token_to_kv_pool, "paged_cache_group_specs", ())
+                ),
+                paged_cache_group_page_counts=getattr(
+                    draft_token_to_kv_pool,
+                    "paged_cache_group_page_counts",
+                    None,
+                ),
             )
 
         validate_paged_cache_group_ids(
@@ -654,12 +727,18 @@ class ModelExecutor:
         """Publish the full-history table into the batch-ordered draft table.
 
         Every draft reads its pages from ``draft_page_table`` (the drafter
-        passes no cache metadata) and shares the target's page-id geometry. The
-        table is batch-ordered -- row ``i`` is batch position ``i`` -- so the
-        draft indexes it directly by batch row, no page_table round-trip.
+        passes no cache metadata). The table is batch-ordered -- row ``i`` is
+        batch position ``i`` -- so the draft indexes it directly by batch row,
+        no page_table round-trip. Ids arrive in the allocator's logical pages
+        and are published in draft-page units (see ``_draft_page_ratio``).
         """
         if (
-            self.drafter is None
+            getattr(
+                getattr(self, "attn_backend", None),
+                "cache_group_tables_replace_draft_page_table",
+                False,
+            )
+            or self.drafter is None
             or not block_tables
             or self._full_history_group_id is None
         ):
@@ -671,11 +750,23 @@ class ModelExecutor:
         width = table.shape[1]
         max_width = self.draft_page_table.shape[1]
         rows = self.draft_page_table[:bs]
+        if self._draft_page_ratio > 1:
+            # -1 pads clamp into logical page 0, itself reserved as the null page.
+            expand_page_table(
+                table,
+                logical_page_size=self._logical_page_size,
+                kernel_page_size=self._draft_page_size,
+                max_kernel_pages=max_width,
+                out=rows,
+            )
+            return
         # -1 column pads -> dummy page 0 (negative locs otherwise).
         rows[:, :width].copy_(table)
         rows[:, :width].clamp_min_(0)
         if width < max_width:
             rows[:, width:].zero_()
+        # Graph replay reads padded_bs rows; stale ids past bs alias another request's pages.
+        self.draft_page_table[bs:].zero_()
 
     @nvtx_range("target_forward", color="red")
     def _run_target_forward(self, bs: int, ctx: ForwardContext, req_pool_indices):
@@ -1393,6 +1484,14 @@ class ModelExecutor:
                 total_tokens=total_tokens,
                 page_table=page_table,
             )
+            if self.drafter is not None and hasattr(
+                self.drafter, "prepare_request_state"
+            ):
+                self.drafter.prepare_request_state(
+                    forward_op.request_ids,
+                    forward_op.request_pool_indices,
+                    num_extends,
+                )
             if timing_enabled:
                 input_fill_done = time.perf_counter()
                 input_fill_ms = (input_fill_done - timing_start) * 1000.0

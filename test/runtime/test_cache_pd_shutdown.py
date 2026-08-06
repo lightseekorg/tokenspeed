@@ -200,6 +200,7 @@ def test_run_event_loop_sigterm_sets_event_and_finally_closes(
             self.max_single_request_tokens = 768
             self.max_model_len = 4096
             self.max_req_input_len = 512
+            self.multimodal_encoder_dtype = None
             self.model_config = SimpleNamespace(context_len=4096)
             self.has_dp = False
             self.use_overlap_schedule = False
