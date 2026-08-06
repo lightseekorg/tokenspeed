@@ -1104,7 +1104,7 @@ class KimiLinearMoE(nn.Module):
             else None
         )
 
-        # A rank diverging on eligibility would deadlock the barrier; agree once.
+        # A rank diverging on eligibility would strand peers in the collective.
         self._multimem_tail_ok = False
         if (
             torch.distributed.is_initialized()
@@ -1112,6 +1112,7 @@ class KimiLinearMoE(nn.Module):
             and len(mapping.moe.tp_ep_group) == torch.distributed.get_world_size()
             and mapping.attn.dp_size == 1
             and mapping.attn.cp_size == 1
+            and self.routed_hidden != config.hidden_size
         ):
             self._multimem_tail_ok = multimem_available_all_ranks()
 
@@ -1123,6 +1124,8 @@ class KimiLinearMoE(nn.Module):
             and mapping.moe.ep_size == 1
             and torch.distributed.is_initialized()
             and mapping.moe.tp_size == torch.distributed.get_world_size()
+            and mapping.attn.dp_size == 1
+            and mapping.attn.cp_size == 1
         ):
             from tokenspeed_kernel.ops.moe.latent_tail import (
                 KimiK3LatentTailOp,
@@ -1162,7 +1165,7 @@ class KimiLinearMoE(nn.Module):
         topk_output: TopKOutput,
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """Run flashinfer's fused TRT-LLM SiTU MoE."""
         if not self.use_trtllm_situ_moe:
             raise RuntimeError(
@@ -1207,7 +1210,7 @@ class KimiLinearMoE(nn.Module):
         # under concurrent GEMMs). Topk is a single small CTA, so it overlaps
         # down_proj from the aux stream, followed by the shared chain.
         router_logits = self.gate(hidden_states)
-        tier = self._select_tail_tier(num_tokens, hidden_size)
+        tier = self._select_tail_tier(num_tokens)
         # Lane only materializes at bs==1, below the multimem tier window.
         lane = allreduce_fusion_lane(
             hidden_states,
@@ -1243,9 +1246,8 @@ class KimiLinearMoE(nn.Module):
             tier, routed_out, shared_partial, prefix_sum, lane, num_tokens, hidden_size
         )
 
-    def _select_tail_tier(
-        self, num_tokens: int, hidden_size: int, *, multimem_ok: bool | None = None
-    ) -> K3MoETailTier:
+    def _select_tail_tier(self, num_tokens: int) -> K3MoETailTier:
+        # Graph *phase*, not capture mode: warmup replays must pick the same tier.
         return select_k3_moe_tail_tier(
             num_tokens=num_tokens,
             graph_phase=get_is_cuda_graph_phase(),
@@ -1253,7 +1255,7 @@ class KimiLinearMoE(nn.Module):
                 self._latent_tail.max_num_tokens if self._latent_tail is not None else 0
             ),
             fused_moe_ar=self.execution_plan.fused_moe_ar,
-            multimem_ok=self._multimem_tail_ok if multimem_ok is None else multimem_ok,
+            multimem_ok=self._multimem_tail_ok,
         )
 
     def _moe_tail(
@@ -1268,10 +1270,11 @@ class KimiLinearMoE(nn.Module):
     ) -> torch.Tensor:
         """Dispatch the selected tier over raw routed/shared partials."""
         if tier is K3MoETailTier.TAIL_FUSION:
+            # Graph-only: the lamport tail needs capture/replay determinism.
             return self._tail_fusion(routed_out, shared_partial, prefix_sum)
         if tier is K3MoETailTier.MULTIMEM_AR:
             return self._tail_multimem_ar(
-                routed_out, shared_partial, prefix_sum, lane, num_tokens, hidden_size
+                routed_out, shared_partial, prefix_sum, num_tokens, hidden_size
             )
         if tier is K3MoETailTier.FUSED_LANE_AR:
             return self._tail_fused_lane_ar(
@@ -1301,12 +1304,12 @@ class KimiLinearMoE(nn.Module):
         routed_out: torch.Tensor,
         shared_partial: torch.Tensor,
         prefix_sum: torch.Tensor,
-        lane: torch.Tensor | None,
         num_tokens: int,
         hidden_size: int,
     ) -> torch.Tensor:
         # In-switch (ld_reduce) reduces via symmetric memory; the projection
         # tail is the same replicated norm+up_proj+add3 as the fused-lane tier.
+        # WORLD is safe: the eligibility gate pinned tp_ep == WORLD at init.
         group_name = torch.distributed.group.WORLD.group_name
         routed_stage = multimem_stage(routed_out, group_name)
         shared_stage = (
@@ -1315,21 +1318,27 @@ class KimiLinearMoE(nn.Module):
             else None
         )
         if shared_stage is None:
-            # Capture-time stage miss is rank-uniform; re-select without multimem.
-            tier = self._select_tail_tier(num_tokens, hidden_size, multimem_ok=False)
-            return self._moe_tail(
-                tier,
-                routed_out,
-                shared_partial,
-                prefix_sum,
-                lane,
-                num_tokens,
-                hidden_size,
+            # Capture-time stage miss, rank-uniform; the only tier below us.
+            return self._tail_fused_lane_ar(
+                routed_out, shared_partial, prefix_sum, None, num_tokens, hidden_size
             )
         routed_red = multimem_all_reduce_staged(routed_stage, group_name)
         shared_red = multimem_all_reduce_staged(shared_stage, group_name)
         if self.routed_expert_norm is not None:
             routed_red = self.routed_expert_norm(routed_red)
+        return self._projection_tail(
+            routed_red, shared_red, prefix_sum, num_tokens, hidden_size
+        )
+
+    def _projection_tail(
+        self,
+        routed_red: torch.Tensor,
+        shared_red: torch.Tensor,
+        prefix_sum: torch.Tensor,
+        num_tokens: int,
+        hidden_size: int,
+    ) -> torch.Tensor:
+        # Replicated up_proj + prefix/shared accumulate; both AR tiers end here.
         return kimi3_latent_projection_add3(
             routed_red,
             self.routed_expert_up_proj.weight,
@@ -1346,7 +1355,7 @@ class KimiLinearMoE(nn.Module):
         num_tokens: int,
         hidden_size: int,
     ) -> torch.Tensor:
-        # The join owns the lane/cat/grouped-NCCL strategy per token count.
+        # The join owns the lane/cat/grouped-NCCL strategy per size and lane hit.
         routed_red, shared_out = kimi3_join_reduce_moe(
             routed_out,
             shared_partial,
@@ -1357,12 +1366,9 @@ class KimiLinearMoE(nn.Module):
             enable_lane_norm=self.execution_plan.lane_latent_norm_ar,
             max_token_num=self.execution_plan.comm_fusion_max_num_tokens,
         )
-        return kimi3_latent_projection_add3(
-            routed_red,
-            self.routed_expert_up_proj.weight,
-            prefix_sum,
-            shared_out,
-        ).view(num_tokens, hidden_size)
+        return self._projection_tail(
+            routed_red, shared_out, prefix_sum, num_tokens, hidden_size
+        )
 
     def _tail_separate_reduce(
         self,

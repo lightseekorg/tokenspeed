@@ -59,12 +59,14 @@ class K3MoETailTier(IntEnum):
 
     TAIL_FUSION = 0  # fused decode kernel: AR + norm + sharded up_proj + multicast
     MULTIMEM_AR = 1  # in-switch (ld_reduce) reduces, then the replicated tail
-    FUSED_LANE_AR = 2  # one [T, latent+hidden] AR covers both partials
+    FUSED_LANE_AR = 2  # NCCL tier: the join picks lane/cat/grouped per size
     SEPARATE_REDUCE = 3  # portable: reduce each partial on its own
 
 
-# Fused decode tail tops out at 16; ld_reduce stays flat right above it.
+# One past the fused tail's _MAX_NUM_TOKENS; ld_reduce stays flat above it.
 MULTIMEM_AR_MIN_TOKENS = 17
+# Upper edge of the measured window; larger batches take the join's grouped path.
+MULTIMEM_AR_MAX_TOKENS = 8192
 
 
 def select_k3_moe_tail_tier(
@@ -91,7 +93,7 @@ def select_k3_moe_tail_tier(
         return K3MoETailTier.TAIL_FUSION
     if not fused_moe_ar:
         return K3MoETailTier.SEPARATE_REDUCE
-    if multimem_ok and num_tokens >= MULTIMEM_AR_MIN_TOKENS:
+    if multimem_ok and MULTIMEM_AR_MIN_TOKENS <= num_tokens <= MULTIMEM_AR_MAX_TOKENS:
         return K3MoETailTier.MULTIMEM_AR
     return K3MoETailTier.FUSED_LANE_AR
 
@@ -497,10 +499,10 @@ class LatentMoELayer(nn.Module):
 
 
 __all__ = [
+    "K3MoETailTier",
     "Kimi3LatentProjection",
     "Kimi3MoEExecutionPlan",
     "LatentMoELayer",
-    "K3MoETailTier",
     "kimi3_join_reduce_moe",
     "select_k3_moe_tail_tier",
 ]

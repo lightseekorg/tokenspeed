@@ -38,8 +38,8 @@ import torch
 import torch.distributed as dist
 
 LATENT, HIDDEN = 3584, 7168
-# Spans _MULTIMEM_MIN_TOKENS (16, strict >), _COLUMN_PARALLEL_MIN_TOKENS
-# (2048, >=) in the kimi_k3 runtime, and _MIN_BUFFER_ROWS (2048) in multimem.
+# Spans MULTIMEM_AR_MIN_TOKENS (17, >=, latent.py) and _MIN_BUFFER_ROWS
+# (2048) in the staging module, on both sides of each.
 M_VALUES = [17, 64, 1024, 2047, 2048, 4096]
 
 
@@ -73,7 +73,7 @@ def _require_multimem():
 
 
 def _group_name() -> str:
-    # Mirrors the runtime call site in kimi_k3._moe_tail.
+    # Mirrors the runtime call site in kimi_k3._tail_multimem_ar.
     return dist.group.WORLD.group_name
 
 

@@ -53,7 +53,7 @@ def test_fused_tail_needs_graph_phase_and_capacity():
     )
 
 
-def test_no_fused_ar_always_separate_reduce():
+def test_no_fused_ar_selects_separate_reduce_outside_the_fused_tail():
     for m in (1, 17, 2048, 8192):
         assert (
             _select(num_tokens=m, fused_moe_ar=False) is K3MoETailTier.SEPARATE_REDUCE
@@ -61,8 +61,27 @@ def test_no_fused_ar_always_separate_reduce():
 
 
 @pytest.mark.parametrize("m", [17, 1024, 2047, 2048, 8192])
-def test_multimem_ar_covers_everything_above_decode(m):
+def test_multimem_ar_covers_the_measured_window(m):
     assert _select(num_tokens=m) is K3MoETailTier.MULTIMEM_AR
+
+
+def test_multimem_ar_upper_bound_hands_off_to_the_join():
+    assert _select(num_tokens=8192) is K3MoETailTier.MULTIMEM_AR
+    assert _select(num_tokens=8193) is K3MoETailTier.FUSED_LANE_AR
+
+
+def test_fused_tail_wins_even_without_fused_ar():
+    assert (
+        _select(num_tokens=8, graph_phase=True, fused_moe_ar=False)
+        is K3MoETailTier.TAIL_FUSION
+    )
+
+
+def test_capture_time_multimem_miss_lands_on_fused_lane():
+    assert (
+        _select(num_tokens=32, graph_phase=True, multimem_ok=False)
+        is K3MoETailTier.FUSED_LANE_AR
+    )
 
 
 def test_multimem_lower_bound_is_exclusive_of_decode_range():

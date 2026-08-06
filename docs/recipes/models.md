@@ -228,7 +228,10 @@ multicast-stores its shard into every rank's mailbox (NVLS via PyTorch
 symmetric memory), gathered barrier-free. This is worth ~0.6 ms per decode
 step at bs1 on 8x B300 (~95 -> ~100 tok/s). It engages automatically when
 supported (SM100-family, bf16, NVLS available) and falls back to the fused-AR
-tail otherwise.
+tail otherwise. Above the decode range (17-8192 tokens), both MoE partials are
+instead reduced in-switch (`multimem.ld_reduce` over symmetric memory) before
+the replicated projection tail — about 2x faster than ring all-reduce at these
+sizes, worth ~14% TTFT on 8192-token prefills at TP16.
 
 ### AMD
 
