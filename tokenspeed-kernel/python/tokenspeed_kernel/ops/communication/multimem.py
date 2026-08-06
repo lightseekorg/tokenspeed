@@ -20,8 +20,8 @@
 
 """NVLS multimem all-reduce over torch symmetric memory.
 
-The in-switch ``ld_reduce`` collective measures ~2x under NCCL at latent-tail
-widths on GB200 and stays flat down to tens of tokens, where ring all-reduce
+The in-switch ``ld_reduce`` collective takes about half NCCL's latency at
+latent-tail widths on GB200 and stays flat down to tens of tokens, where ring all-reduce
 pays its full latency floor. Tensors are staged through cached
 symmetric-memory buffers (one per width) so callers keep ordinary allocators.
 """
@@ -84,7 +84,11 @@ def multimem_available_all_ranks() -> bool:
 
 
 def _ensure_buffer(
-    rows: int, width: int, device: torch.device, group_name: str
+    rows: int,
+    width: int,
+    device: torch.device,
+    group_name: str,
+    max_rows: int | None,
 ) -> torch.Tensor | None:
     """Return a symmetric buffer with >= rows capacity (collective on growth).
 
@@ -98,7 +102,10 @@ def _ensure_buffer(
     if buf is None or buf.shape[0] < rows:
         if torch.cuda.is_current_stream_capturing():
             return None
-        cap = max(rows, _MIN_BUFFER_ROWS if buf is None else 2 * buf.shape[0])
+        grown = _MIN_BUFFER_ROWS if buf is None else 2 * buf.shape[0]
+        if max_rows is not None:
+            grown = min(grown, max_rows)
+        cap = max(rows, grown)
         if buf is not None:
             _RETIRED.append(buf)
         buf = symm_mem.empty((cap, width), dtype=torch.bfloat16, device=device)
@@ -107,12 +114,16 @@ def _ensure_buffer(
     return buf
 
 
-def multimem_stage(tensor: torch.Tensor, group_name: str) -> torch.Tensor | None:
+def multimem_stage(
+    tensor: torch.Tensor, group_name: str, max_rows: int | None = None
+) -> torch.Tensor | None:
     """Copy ``tensor`` into its width's symmetric buffer.
 
     Args:
-        tensor: Contiguous 2-D BF16 CUDA tensor with rank-identical shape.
+        tensor: 2-D BF16 CUDA tensor, rank-identical shape, width % 8 == 0.
         group_name: Process-group name covering every rank of the reduction.
+        max_rows: Optional clamp on capacity growth (rows are still served
+            up to this bound; callers cap it at their dispatch ceiling).
 
     Returns:
         A ``[rows, width]`` view of the symmetric buffer (valid until the next
@@ -129,7 +140,7 @@ def multimem_stage(tensor: torch.Tensor, group_name: str) -> torch.Tensor | None
     ):
         return None
     rows, width = tensor.shape
-    buf = _ensure_buffer(rows, width, tensor.device, group_name)
+    buf = _ensure_buffer(rows, width, tensor.device, group_name, max_rows)
     if buf is None:
         return None
     view = buf[:rows]

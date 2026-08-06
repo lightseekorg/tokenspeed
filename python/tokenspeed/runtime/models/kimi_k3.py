@@ -122,6 +122,7 @@ from tokenspeed.runtime.layers.linear import (
 )
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.latent import (
+    MULTIMEM_AR_MAX_TOKENS,
     K3MoETailTier,
     Kimi3LatentProjection,
     Kimi3MoEExecutionPlan,
@@ -1112,6 +1113,7 @@ class KimiLinearMoE(nn.Module):
             and len(mapping.moe.tp_ep_group) == torch.distributed.get_world_size()
             and mapping.attn.dp_size == 1
             and mapping.attn.cp_size == 1
+            # Staging buffers are per-width; equal widths would clobber the stage.
             and self.routed_hidden != config.hidden_size
         ):
             self._multimem_tail_ok = multimem_available_all_ranks()
@@ -1132,12 +1134,24 @@ class KimiLinearMoE(nn.Module):
                 latent_tail_supported,
             )
 
-            if latent_tail_supported(
-                tp_size=mapping.moe.tp_size,
-                hidden_size=config.hidden_size,
-                latent_size=self.routed_hidden,
-                dtype=torch.bfloat16,
-            ):
+            # Agree on the non-collective probe first: a rank entering the
+            # constructor's rendezvous alone would strand its peers.
+            supported = torch.tensor(
+                [
+                    int(
+                        latent_tail_supported(
+                            tp_size=mapping.moe.tp_size,
+                            hidden_size=config.hidden_size,
+                            latent_size=self.routed_hidden,
+                            dtype=torch.bfloat16,
+                        )
+                    )
+                ],
+                dtype=torch.int32,
+                device="cuda",
+            )
+            torch.distributed.all_reduce(supported, op=torch.distributed.ReduceOp.MIN)
+            if bool(supported.item()):
                 try:
                     self._latent_tail = KimiK3LatentTailOp.initialize(
                         group=torch.distributed.group.WORLD,
@@ -1191,8 +1205,8 @@ class KimiLinearMoE(nn.Module):
     ) -> torch.Tensor:
         """Routed + shared experts, accumulated onto ``prefix_sum``.
 
-        Returns the new prefix (``prefix_sum + routed + shared``); at bs=1
-        the up-projection's store performs the accumulate in-kernel.
+        Returns the new prefix (``prefix_sum + routed + shared``); the tail
+        tiers fuse the accumulate in-kernel.
         """
         if self.native_latent_moe is not None:
             routed_out, shared_out = self.native_latent_moe(
@@ -1311,14 +1325,15 @@ class KimiLinearMoE(nn.Module):
         # tail is the same replicated norm+up_proj+add3 as the fused-lane tier.
         # WORLD is safe: the eligibility gate pinned tp_ep == WORLD at init.
         group_name = torch.distributed.group.WORLD.group_name
-        routed_stage = multimem_stage(routed_out, group_name)
+        routed_stage = multimem_stage(routed_out, group_name, MULTIMEM_AR_MAX_TOKENS)
         shared_stage = (
-            multimem_stage(shared_partial, group_name)
+            multimem_stage(shared_partial, group_name, MULTIMEM_AR_MAX_TOKENS)
             if routed_stage is not None
             else None
         )
         if shared_stage is None:
-            # Capture-time stage miss, rank-uniform; the only tier below us.
+            # Stage miss is rank-uniform; MULTIMEM_AR implies fused_moe_ar,
+            # so the fused-lane tier is the next one down.
             return self._tail_fused_lane_ar(
                 routed_out, shared_partial, prefix_sum, None, num_tokens, hidden_size
             )

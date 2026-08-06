@@ -47,6 +47,20 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _require_latent_tail():
+    # Collectively-agreed probe: skips must match across ranks, or the
+    # remaining ranks hang in the op's rendezvous.
+    from tokenspeed_kernel.ops.moe.latent_tail import latent_tail_supported
+
+    ok = latent_tail_supported(
+        tp_size=_world_size(), hidden_size=H, latent_size=L, dtype=torch.bfloat16
+    )
+    flag = torch.tensor([int(ok)], dtype=torch.int32, device="cuda")
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    if not bool(flag.item()):
+        pytest.skip("platform has no rank-agreed multicast tail support")
+
+
 def _setup():
     rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(rank)
@@ -83,10 +97,7 @@ def test_latent_tail_matches_reference(m):
     )
 
     rank, dev = _setup()
-    if not latent_tail_supported(
-        tp_size=_world_size(), hidden_size=H, latent_size=L, dtype=torch.bfloat16
-    ):
-        pytest.skip("platform does not support the multicast tail")
+    _require_latent_tail()
     op = KimiK3LatentTailOp.initialize(
         group=dist.group.WORLD,
         hidden_size=H,
@@ -110,10 +121,7 @@ def test_latent_tail_graph_replay():
     )
 
     rank, dev = _setup()
-    if not latent_tail_supported(
-        tp_size=_world_size(), hidden_size=H, latent_size=L, dtype=torch.bfloat16
-    ):
-        pytest.skip("platform does not support the multicast tail")
+    _require_latent_tail()
     op = KimiK3LatentTailOp.initialize(
         group=dist.group.WORLD,
         hidden_size=H,
@@ -150,10 +158,7 @@ def test_latent_tail_fused_prefix_matches_eager(m):
     )
 
     rank, dev = _setup()
-    if not latent_tail_supported(
-        tp_size=_world_size(), hidden_size=H, latent_size=L, dtype=torch.bfloat16
-    ):
-        pytest.skip("platform does not support the multicast tail")
+    _require_latent_tail()
     op = KimiK3LatentTailOp.initialize(
         group=dist.group.WORLD,
         hidden_size=H,
