@@ -242,3 +242,46 @@ def test_stage_view_invalidated_by_next_stage_of_same_width():
     torch.cuda.synchronize()
     assert torch.equal(view_a, b), "old view must hold the NEW payload"
     assert not torch.equal(view_a, a), "old view must no longer hold its payload"
+
+
+def test_graph_replay_survives_buffer_growth():
+    """A captured staged reduce must stay valid after the buffer is retired."""
+    from tokenspeed_kernel.ops.communication.multimem import (
+        multimem_all_reduce_staged,
+        multimem_stage,
+    )
+
+    rank, dev = _setup()
+    _require_multimem()
+    gname = _group_name()
+    small = _inputs(rank, dev, 64, 3584, seed=41_000)
+    ref_small = _nccl_reference(small)
+
+    # Warm the path eagerly, then capture the m=64 staged reduce.
+    view = multimem_stage(small, gname)
+    assert view is not None
+    multimem_all_reduce_staged(view, gname)
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = multimem_stage(small, gname)
+        assert captured is not None
+        multimem_all_reduce_staged(captured, gname)
+
+    # Eager growth retires the captured buffer's slot in _BUFFERS.
+    big = _inputs(rank, dev, 4096, 3584, seed=41_001)
+    ref_big = _nccl_reference(big)
+    grown = multimem_stage(big, gname)
+    assert grown is not None
+    out_big = multimem_all_reduce_staged(grown, gname)
+    torch.cuda.synchronize()
+    _assert_matches(out_big, ref_big, "post-growth eager")
+    dist.barrier()
+
+    # Replay must still reduce through the retired (kept-alive) buffer.
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+    _assert_matches(captured, ref_small, "replay after growth")
+    dist.barrier()

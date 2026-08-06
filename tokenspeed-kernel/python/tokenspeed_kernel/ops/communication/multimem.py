@@ -117,13 +117,15 @@ def multimem_stage(tensor: torch.Tensor, group_name: str) -> torch.Tensor | None
     Returns:
         A ``[rows, width]`` view of the symmetric buffer (valid until the next
         stage of the same width), or None when multimem is unavailable — the
-        caller falls back to its ordinary reduction path.
+        caller falls back to its ordinary reduction path. Callers must keep
+        their capacity history rank-lockstep: growth is a collective.
     """
     if (
         not multimem_available()
         or tensor.ndim != 2
         or tensor.dtype != torch.bfloat16
         or not tensor.is_cuda
+        or tensor.shape[1] % 8 != 0
     ):
         return None
     rows, width = tensor.shape
