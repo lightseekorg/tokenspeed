@@ -1559,6 +1559,40 @@ def test_kimi3_mxfp4_situ_selection_on_cdna4(
     assert plan["support_routing"] is False
 
 
+def test_kimi3_mxfp4_situ_selection_on_cdna5(
+    mi450_platform: PlatformInfo,
+) -> None:
+    registry = KernelRegistry.get()
+    kernel_name = "gluon_mxfp4_gfx1250_precomputed_moe_apply"
+    if registry.get_by_name(kernel_name) is None:
+        pytest.skip(f"{kernel_name} is unavailable")
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi450_platform)
+        registry.clear_cache()
+        plan = tokenspeed_kernel.moe_plan(
+            "mxfp4",
+            input_dtype=torch.bfloat16,
+            activation="situ",
+            routing_mode="precomputed_topk",
+            ep_size=8,
+            ispp=3072,
+            internal_activation_dtype="input",
+            solution="gluon",
+        )
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+    _assert_moe_plan(
+        plan,
+        apply=kernel_name,
+        preprocessor="gluon_mxfp4_gfx1250_moe_weights",
+    )
+    assert plan["activation"] == "situ"
+    assert plan["support_routing"] is False
+
+
 def _make_fake_gluon_mxfp4_layer(top_k: int) -> torch.nn.Module:
     """Minimal ``w`` exposing only the attributes the apply wrapper reads.
 

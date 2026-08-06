@@ -205,13 +205,14 @@ if platform.is_amd:
         ),
         traits={
             "weight_dtype": frozenset({"mxfp4"}),
-            "activation": frozenset({"silu", "swiglu"}),
+            "activation": frozenset({"silu", "swiglu", "situ"}),
             "routing_mode": frozenset({"precomputed_topk"}),
             "supports_deferred_finalize": frozenset({False}),
-            "supports_ep": frozenset({False}),
+            "supports_ep": frozenset({False, True}),
             "supports_all_to_all_ep": frozenset({False}),
+            "ep_size": frozenset({1, 8}),
             "ispp_alignment": frozenset({1}),
-            "internal_activation_dtype": frozenset({"fp8"}),
+            "internal_activation_dtype": frozenset({"fp8", "input"}),
             "supports_bias": frozenset({True}),
         },
         priority=Priority.SPECIALIZED + 4,
@@ -228,8 +229,9 @@ if platform.is_amd:
         do_finalize: bool = True,
         enable_pdl: bool = False,
     ):
-        del plan, router_logits, num_tokens_global, max_num_tokens_per_gpu
-        del do_finalize, enable_pdl
+        del router_logits, num_tokens_global, max_num_tokens_per_gpu, enable_pdl
+        if not do_finalize:
+            raise ValueError("gfx1250 Gluon MoE cannot defer finalization")
         if topk_weights is None or topk_ids is None:
             raise ValueError(
                 "gluon_mxfp4_gfx1250_precomputed_moe_apply requires "
@@ -237,6 +239,14 @@ if platform.is_amd:
             )
 
         swiglu_alpha, swiglu_limit, swiglu_beta = _swiglu_args(w)
+        num_local_experts = int(
+            getattr(
+                w,
+                "num_local_experts",
+                w.w13_weight_triton_tensor.storage.data.shape[0],
+            )
+        )
+        expert_start = int(getattr(w, "ep_rank", 0)) * num_local_experts
         w13_pc = w.w13_precision_config
         w2_pc = w.w2_precision_config
 
@@ -262,6 +272,10 @@ if platform.is_amd:
             swiglu_alpha=swiglu_alpha,
             swiglu_limit=swiglu_limit,
             swiglu_beta=swiglu_beta,
+            activation=plan["activation"],
+            situ_beta=float(getattr(w, "activation_situ_beta", 1.0)),
+            situ_linear_beta=getattr(w, "activation_situ_linear_beta", None),
+            expert_start=expert_start,
         )
 
     @register_kernel(

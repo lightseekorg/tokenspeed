@@ -147,6 +147,31 @@ def mi350_platform() -> PlatformInfo:
 
 
 @pytest.fixture
+def mi450_platform() -> PlatformInfo:
+    return PlatformInfo(
+        vendor="amd",
+        arch_version=ArchVersion(12, 5),
+        device_name="AMD Instinct MI455X",
+        device_count=8,
+        total_memory=432 * (1024**3),
+        memory_bandwidth=23300.0,
+        sm_count=256,
+        max_threads_per_sm=2048,
+        max_shared_memory_per_sm=320 * 1024,
+        sm_features=frozenset(
+            {
+                "tensor_core:f16",
+                "tensor_core:f8",
+                "tensor_core:f4",
+                "memory:async_copy",
+            }
+        ),
+        runtime_features=frozenset(),
+        interconnect=InterconnectInfo(topology="pcie"),
+    )
+
+
+@pytest.fixture
 def b200_platform() -> PlatformInfo:
     return PlatformInfo(
         vendor="nvidia",
