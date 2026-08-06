@@ -1683,8 +1683,7 @@ class KimiLinearModel(nn.Module):
             prefix_sum, block_residual = layer(
                 positions, prefix_sum, ctx, out_cache_loc, block_residual
             )
-            # Clone prefix_sum after completed layer layer_idx + 1; the copy
-            # survives the next layer's in-place residual writes.
+            # Clone: the copy must survive the next layer's in-place residual writes.
             if (
                 aux_hidden_states is not None
                 and layer_idx + 1 in self.eagle3_layers_to_capture

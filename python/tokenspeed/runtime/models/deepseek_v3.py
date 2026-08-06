@@ -2201,6 +2201,7 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
         )
 
         self.load_lm_head_from_target = False
+        self._embed_loaded_from_checkpoint = False
         if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
@@ -2320,11 +2321,10 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
         ):
             return
         if self.model.embed_tokens.weight.shape == embed.shape:
-            # Only share when shapes match; a TP-sharded target embedding
-            # would read out of bounds in this replicated module.
+            # A TP-sharded target embedding would read out of bounds here.
             del self.model.embed_tokens.weight
             self.model.embed_tokens.weight = embed
-        elif not getattr(self, "_embed_loaded_from_checkpoint", False):
+        elif not self._embed_loaded_from_checkpoint:
             raise ValueError(
                 "EAGLE3 draft cannot share the target embedding "
                 f"(target {tuple(embed.shape)} vs draft "

@@ -372,11 +372,7 @@ class ModelExecutor:
             speculative_algorithm=config.spec_algo,
         )
 
-        # Two tables, two page-id domains. ``fill_input_buffers`` indexes the
-        # scheduler's own full-history table, whose ids are logical pages; the
-        # drafter and its backend index ``draft_page_table``, published in the
-        # draft backend's (possibly smaller) kernel pages. Keeping each stride
-        # with its own table is what makes both address the same KV rows.
+        # fill_input_buffers indexes the scheduler table in logical pages; the drafter indexes draft_page_table in its backend's kernel pages.
         self._logical_page_size = int(
             getattr(draft_token_to_kv_pool, "page_size", 0) or config.logical_page_size
         )
