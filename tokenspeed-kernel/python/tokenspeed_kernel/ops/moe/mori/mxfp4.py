@@ -148,13 +148,13 @@ if platform.is_amd:
         """Native MXFP4 grouped SwiGLU FFN over MORI's 3D [E,cap,H] padded buffer, IN PLACE.
 
         Bridges MORI's padded 3D layout to the triton ragged (contiguous, expert-sorted)
-        layout with no host sync under HIP-graph capture, so the whole MoE forward captures.
-        ``n_recv_bound`` is a STATIC (shape-derived, not ``.item()``) upper bound on the rows
-        this rank received this step, used only while capturing; the ragged buffer is sized to
-        ``m = min(E*cap, received)`` so the gather/scatter + GEMM stay proportional to real work
-        rather than the full E*cap capacity (the decisive factor for graph-mode decode
-        throughput -- sizing to E*cap moves ~E*cap rows and launches a padded-capacity grid
-        every layer).
+        layout with NO host sync (in eager OR under HIP-graph capture), so the whole MoE forward
+        captures and the eager path never drains the GPU pipeline per layer. ``n_recv_bound`` is
+        a STATIC (shape-derived, not ``.item()``) upper bound on the rows this rank received this
+        step; the ragged buffer is sized to ``m = min(E*cap, n_recv_bound)`` so the gather/scatter
+        + GEMM stay proportional to real work rather than the full E*cap capacity (the decisive
+        factor for graph-mode decode throughput -- sizing to E*cap moves ~E*cap rows and launches
+        a padded-capacity grid every layer).
 
         Build a fixed-size [E*cap] permutation of slots (valid rows -- local < counts[e] --
         first in expert-major order, padding rows after), take the first ``m`` (>= sum(counts))
@@ -169,19 +169,23 @@ if platform.is_amd:
         counts_long = counts.to(torch.long)
         total = counts_long.sum()  # sum(counts), 0-dim tensor (no host sync)
 
-        # Ragged-row count ``m`` (>= sum(counts)). Under HIP-graph capture host syncs are
-        # forbidden, so use the static ``n_recv_bound`` -- a true upper bound there because the
-        # decode graph pads every rank to the SAME batch (global tokens = ep_size * batch), so
-        # this rank receives at most ep_size*batch*top_k rows. Outside capture (eager, incl.
-        # non-uniform dp batches) a sync is fine, so use the EXACT count -- always correct and
-        # tighter. Either way ``m`` bounds the gather/scatter + GEMM to real work, not E*cap.
-        if torch.cuda.is_current_stream_capturing():
-            m = min(n_slots, n_recv_bound)
-        else:
-            total_i = int(total.item())
-            if total_i == 0:
-                return
-            m = min(n_slots, total_i)
+        # Ragged-row count ``m`` (>= sum(counts)): the static, shape-derived ``n_recv_bound``
+        # (ep_size * batch * top_k, capped at E*cap) is a true upper bound on the rows this rank
+        # can receive -- every rank dispatches at most ``batch*top_k`` slots, so no rank receives
+        # more than ep_size of those. Use it in BOTH capture AND eager. The obvious "tighter"
+        # eager choice ``sum(counts).item()`` needs a device->host sync, and because the MoE runs
+        # this per layer (x61) that sync DRAINS the GPU pipeline every layer -- on the eager
+        # prefill path (batches above the captured decode sizes) that serialization, not compute,
+        # was the dominant cost: multi-second worker stalls -> gateway health timeouts and mass
+        # request failures at concurrency. The ragged GEMM is bounded by the device-side per-expert
+        # ``counts`` (via ``meta``) regardless of ``m``, so an ``m`` above sum(counts) only widens
+        # the gather buffer (cheap bandwidth), never the GEMM work; the padding rows (row >= total)
+        # are written back unchanged by the device-side ``row < total`` mask in the scatter below.
+        # For decode ``n_recv_bound`` is already tight (small batch); for prefill the buffer
+        # genuinely fills, so it is near-exact there too.
+        m = min(n_slots, n_recv_bound)
+        if m == 0:
+            return
 
         # Fixed-size [E*cap] permutation of slots -> valid rows (local < counts[e]) first in
         # expert-major order, padding rows after; take the first ``m`` as the ragged buffer.
@@ -204,8 +208,9 @@ if platform.is_amd:
 
         # Scatter back IN PLACE. Comparing against the 0-dim ``total`` needs no host sync;
         # gather_idx is a permutation prefix, so valid rows land in their slots collision-free
-        # and padding rows (row >= total, only present when m > sum(counts) under capture) write
-        # their own original value back -- left exactly as-is for MORI combine.
+        # and padding rows (row >= total, present whenever m > sum(counts) -- the common case now
+        # that ``m`` is the static bound) write their own original value back -- left exactly
+        # as-is for MORI combine.
         flat[gather_idx] = torch.where((row < total)[:, None], y_flat, x_flat)
 
     @register_kernel(
