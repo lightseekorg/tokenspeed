@@ -22,7 +22,6 @@ PROMETHEUS_PORT=${PROMETHEUS_PORT:-18422}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.9}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-131072}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-16}
-KVSTORE_RATIO=${KVSTORE_RATIO:-0.5}
 WORLD_SIZE=${WORLD_SIZE:-2}
 ATTENTION_BACKEND=${ATTENTION_BACKEND:-trtllm}
 DRAFTER_ATTENTION_BACKEND=${DRAFTER_ATTENTION_BACKEND:-$ATTENTION_BACKEND}
@@ -40,7 +39,6 @@ export MC_LOG_LEVEL=${MC_LOG_LEVEL:-INFO}
 export LD_LIBRARY_PATH=/usr/local/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
 export NO_PROXY=${NO_PROXY:-*}
 export no_proxy=${no_proxy:-*}
-export TOKENSPEED_GRPC_MAX_MESSAGE_BYTES=${TOKENSPEED_GRPC_MAX_MESSAGE_BYTES:-2000000000}
 export TOKENSPEED_SKIP_GRPC_WARMUP=${TOKENSPEED_SKIP_GRPC_WARMUP:-1}
 
 IFS=',' read -r -a PREFILL_GPU_LIST <<< "$PREFILL_GPUS"
@@ -154,11 +152,8 @@ COMMON_ARGS=(
   --quantization "$QUANTIZATION"
   --kv-cache-dtype "$KV_CACHE_DTYPE"
   --disable-kvstore
-  --kvstore-ratio "$KVSTORE_RATIO"
-  --enable-cache-report
   --disaggregation-transfer-backend mooncake
   --disaggregation-layerwise-interval 0
-  --skip-server-warmup
 )
 
 if [[ "$ENABLE_MTP" == "1" ]]; then
@@ -215,14 +210,10 @@ python3 -m smg launch \
   --reasoning-parser passthrough \
   --prefill-policy round_robin \
   --decode-policy round_robin \
-  --max-payload-size 2000000000 \
   --max-concurrent-requests "$MAX_CONCURRENT_REQUESTS" \
   --queue-size "$QUEUE_SIZE" \
   --queue-timeout-secs 1800 \
   --request-timeout-secs 1800 \
-  --worker-startup-timeout-secs 1800 \
-  --health-check-timeout-secs 60 \
-  --health-check-interval-secs 30 \
   --log-level info \
   --disable-retries \
   --disable-circuit-breaker \
