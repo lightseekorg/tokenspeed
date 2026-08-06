@@ -1269,6 +1269,10 @@ class KimiLinearMoE(nn.Module):
                 num_global_tokens,
                 max_num_tokens_per_gpu,
             )
+            if tier is K3MoETailTier.SEPARATE_REDUCE:
+                # No fused collective to hide behind: reduce and project here
+                # so the work overlaps the shared branch inside the fork.
+                routed_out = self._reduce_project_routed(routed_out)
         return self._moe_tail(
             tier, routed_out, shared_partial, prefix_sum, lane, num_tokens, hidden_size
         )
@@ -1295,7 +1299,11 @@ class KimiLinearMoE(nn.Module):
         num_tokens: int,
         hidden_size: int,
     ) -> torch.Tensor:
-        """Dispatch the selected tier over raw routed/shared partials."""
+        """Dispatch the selected tier over the partials.
+
+        Raw partials everywhere except SEPARATE_REDUCE, whose routed side
+        already ran inside the fork scope to overlap the shared branch.
+        """
         if tier is K3MoETailTier.TAIL_FUSION:
             # Selector pins the graph phase: warmup/capture/replay all take
             # this path, and eager serving keeps the NCCL tiers.
@@ -1400,6 +1408,19 @@ class KimiLinearMoE(nn.Module):
             routed_red, shared_out, prefix_sum, num_tokens, hidden_size
         )
 
+    def _reduce_project_routed(self, routed_out: torch.Tensor) -> torch.Tensor:
+        """Reduce, norm and up-project the routed partial (SEPARATE_REDUCE).
+
+        Runs in ``forward`` inside the stream fork so it overlaps the
+        shared-expert branch; the tier method then receives an
+        already-projected routed output, unlike the other tiers.
+        """
+        if self.mapping.moe.has_tp_ep:
+            routed_out = all_reduce(routed_out, self.mapping.moe.tp_ep_group)
+        if self.routed_expert_norm is not None:
+            routed_out = self.routed_expert_norm(routed_out)
+        return self.routed_expert_up_proj(routed_out)[0]
+
     def _tail_separate_reduce(
         self,
         routed_out: torch.Tensor,
@@ -1408,11 +1429,7 @@ class KimiLinearMoE(nn.Module):
         num_tokens: int,
         hidden_size: int,
     ) -> torch.Tensor:
-        if self.mapping.moe.has_tp_ep:
-            routed_out = all_reduce(routed_out, self.mapping.moe.tp_ep_group)
-        if self.routed_expert_norm is not None:
-            routed_out = self.routed_expert_norm(routed_out)
-        routed_out = self.routed_expert_up_proj(routed_out)[0]
+        # routed_out arrives reduced and projected from the fork scope.
         shared_out = self._reduce_shared(shared_partial)
         # routed_scaling_factor already applied in TopK (matches reference).
         return add3(
