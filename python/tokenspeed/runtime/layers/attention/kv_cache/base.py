@@ -23,7 +23,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.kvcache.triton import zero_byte_segments
+from tokenspeed_kernel.ops.kvcache.triton import zero_byte_ranges
 
 from tokenspeed.runtime.configs.paged_cache_spec import PagedCacheGroupSpec
 from tokenspeed.runtime.layers.attention.kv_cache.plan import CacheMemoryPlan
@@ -159,7 +159,7 @@ class CachePool:
             for segment in self._block_byte_segments(group_id, block_ids)
         ]
         if segments:
-            zero_byte_segments(buffer, segments)
+            zero_byte_ranges(buffer, segments)
 
     def pd_contract(self, group_specs):
         buffer = self._ensure_buffer()
