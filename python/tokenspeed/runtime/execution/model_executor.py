@@ -676,6 +676,8 @@ class ModelExecutor:
         rows[:, :width].clamp_min_(0)
         if width < max_width:
             rows[:, width:].zero_()
+        # Graph replay reads padded_bs rows; stale ids past bs alias another request's pages.
+        self.draft_page_table[bs:].zero_()
 
     @nvtx_range("target_forward", color="red")
     def _run_target_forward(self, bs: int, ctx: ForwardContext, req_pool_indices):
