@@ -192,16 +192,19 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         page_table: torch.Tensor,
         block_kv_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Build the page table from the batch-ordered placeholder table.
+        """Copy a batch-ordered kernel page table into TRTLLM metadata.
 
-        Only the idle/warmup path before the backend binds to the cache
-        contract reaches this; a live LCM batch resolves a group table instead.
-        ``page_table`` is batch-ordered (row i == batch position i).
+        ``page_table`` is batch-ordered (row i == batch position i) and already
+        uses this backend's kernel-page units. For an LCM-backed draft,
+        ``ModelExecutor`` performs the logical-to-kernel expansion when it
+        publishes ``draft_page_table``.
         """
         if block_kv_indices is None:
             block_kv_indices = torch.zeros(
                 (batch_size, max_blocks), dtype=torch.int32, device=self.device
             )
+        else:
+            block_kv_indices[:batch_size].zero_()
 
         copy_len = min(max_blocks, page_table.shape[1])
 
@@ -237,8 +240,6 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
             # metadata; the batch-ordered draft page table (row i is batch
             # position i) carries the scheduler pages.
             self._cache_groups_bound = True
-            group_table = page_table[:bs]
-            logical_page_size = self._cache_logical_page_size
         if forward_mode.is_extend_or_mixed():
             self._init_prefill_metadata(
                 seq_lens[:num_extends],
@@ -535,11 +536,6 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
             group_table, logical_page_size = self._resolve_full_history_table(
                 cache_metadata, kwargs.get("forward_batch"), 0
             )
-        elif self._draft_reads_batch_pages(bs, forward_mode) and (
-            page_table is not None
-        ):
-            group_table = page_table[:bs]
-            logical_page_size = self._cache_logical_page_size
         if group_table is not None:
             real_bs = min(int(group_table.shape[0]), bs)
             if real_bs > 0 and not self._block_table_aliased:

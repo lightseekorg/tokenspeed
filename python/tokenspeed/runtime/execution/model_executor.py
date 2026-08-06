@@ -744,11 +744,6 @@ class ModelExecutor:
             or self._full_history_group_id is None
         ):
             return
-        if (
-            self._cache_runtime_contract is not None
-            and not self._mirror_for_block_draft
-        ):
-            return
         table = block_tables.get(self._full_history_group_id)
         if table is None:
             return
