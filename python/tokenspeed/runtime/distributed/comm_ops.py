@@ -225,7 +225,26 @@ def all_reduce_residual_attnres(
     backend: CommBackend | None = None,
     op: torch.distributed.ReduceOp = torch.distributed.ReduceOp.SUM,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reduce attention output and finish its residual AttnRes mix."""
+    """Reduce attention output and finish its residual AttnRes mix.
+
+    Args:
+        partial: Local BF16 attention projection partial shaped
+            ``[tokens, hidden]``.
+        residual: BF16 residual stream with the same shape as ``partial``.
+        score_weight: AttnRes score weight shaped ``[hidden]``.
+        output_weight: Output RMSNorm weight shaped ``[hidden]``.
+        scratch: FP32 ``(max_logit, exp_sum, weighted_sum)`` tensors containing
+            the historical AttnRes candidate partials.
+        eps: Positive epsilon used for AttnRes scoring and output RMSNorm.
+        group: Tensor-parallel ranks participating in the reduction.
+        backend: Optional communication backend override.
+        op: Reduction operation. The fused Iris implementation supports
+            ``SUM``.
+
+    Returns:
+        A pair containing the normalized AttnRes output and the residual plus
+        reduced attention projection, in that order.
+    """
     if backend is None:
         backend = get_global_backend()
     return backend.all_reduce_residual_attnres(
