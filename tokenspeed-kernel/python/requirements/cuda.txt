@@ -2,6 +2,7 @@ packaging
 wheel
 psutil
 numpy
+# torch version needs to pinned here for CUDA builds
 torch==2.11.0
 apache-tvm-ffi==0.1.13
 tokenspeed-proton>=3.8.10.post20260721
