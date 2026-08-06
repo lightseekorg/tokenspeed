@@ -1,6 +1,6 @@
 # Copyright (c) 2026 LightSeek Foundation
 
-"""Registration for gfx950 joint latent/shared MoE decode."""
+"""Gluon registration for gfx950 joint latent/shared MoE decode."""
 
 from __future__ import annotations
 

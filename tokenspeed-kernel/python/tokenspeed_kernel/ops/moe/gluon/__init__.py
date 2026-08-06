@@ -19,9 +19,6 @@
 # SOFTWARE.
 
 import tokenspeed_kernel.ops.moe.gluon.bf16  # noqa: F401
+import tokenspeed_kernel.ops.moe.gluon.latent_decode  # noqa: F401
+import tokenspeed_kernel.ops.moe.gluon.latent_input  # noqa: F401
 import tokenspeed_kernel.ops.moe.gluon.mxfp4  # noqa: F401
-from tokenspeed_kernel.platform import current_platform
-
-if current_platform().is_amd:
-    import tokenspeed_kernel_amd.ops.gfx950.moe.latent_decode  # noqa: F401
-    import tokenspeed_kernel_amd.ops.gfx950.moe.latent_input  # noqa: F401

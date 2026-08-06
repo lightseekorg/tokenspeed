@@ -24,13 +24,13 @@ def test_amd_latent_moe_registrations_are_platform_scoped() -> None:
     registry = KernelRegistry.get()
     expected_modules = {
         "gluon_latent_expert_shared_gfx950": (
-            "tokenspeed_kernel_amd.ops.gfx950.moe.latent_decode"
+            "tokenspeed_kernel.ops.moe.gluon.latent_decode"
         ),
         "gluon_latent_input_decode_gfx950": (
-            "tokenspeed_kernel_amd.ops.gfx950.moe.latent_input"
+            "tokenspeed_kernel.ops.moe.gluon.latent_input"
         ),
         "gluon_latent_input_small_batch_gfx950": (
-            "tokenspeed_kernel_amd.ops.gfx950.moe.latent_input"
+            "tokenspeed_kernel.ops.moe.gluon.latent_input"
         ),
     }
     implementations = {name: registry.get_impl(name) for name in expected_modules}

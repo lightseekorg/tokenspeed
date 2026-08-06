@@ -1,6 +1,6 @@
 # Copyright (c) 2026 LightSeek Foundation
 
-"""Gluon registrations for latent-MoE input projections."""
+"""Gluon registrations for gfx950 latent-MoE input projections."""
 
 from __future__ import annotations
 
