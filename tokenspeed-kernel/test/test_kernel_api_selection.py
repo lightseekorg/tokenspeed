@@ -275,6 +275,10 @@ def _is_cdna4(platform: PlatformInfo) -> bool:
     return platform.is_cdna4
 
 
+def _is_cdna5(platform: PlatformInfo) -> bool:
+    return platform.is_cdna5
+
+
 def _is_supported_gpu(platform: PlatformInfo) -> bool:
     return platform.is_nvidia or platform.is_amd
 
@@ -1097,6 +1101,46 @@ def _attention_dsa_prefill_fp8_dense() -> object:
         max_seqlen_k=64,
         qk_nope_head_dim=192,
         kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        softmax_scale=1.0,
+        page_size=64,
+    )
+
+
+def _attention_dsa_decode_fp8_dense_rank128() -> object:
+    q = torch.empty((2, 8, 192), dtype=torch.float8_e4m3fn)
+    kv_cache = torch.empty((64, 192), dtype=torch.float8_e4m3fn)
+    topk_slots = torch.empty((2, 2048), dtype=torch.int32)
+    topk_lens = torch.empty((2,), dtype=torch.int32)
+    return tokenspeed_kernel.dsa_decode(
+        q=q,
+        kv_cache=kv_cache,
+        sparse_kv_cache=None,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        max_seqlen_k=2048,
+        qk_nope_head_dim=128,
+        kv_lora_rank=128,
+        qk_rope_head_dim=64,
+        softmax_scale=1.0,
+        page_size=64,
+    )
+
+
+def _attention_dsa_prefill_bf16_dense_rank128() -> object:
+    q = torch.empty((2, 8, 192), dtype=torch.bfloat16)
+    kv_cache = torch.empty((64, 192), dtype=torch.bfloat16)
+    topk_slots = torch.empty((2, 1024), dtype=torch.int32)
+    topk_lens = torch.empty((2,), dtype=torch.int32)
+    return tokenspeed_kernel.dsa_prefill(
+        q=q,
+        kv_cache=kv_cache,
+        sparse_kv_cache=None,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        max_seqlen_k=1024,
+        qk_nope_head_dim=192,
+        kv_lora_rank=128,
         qk_rope_head_dim=64,
         softmax_scale=1.0,
         page_size=64,
@@ -2326,6 +2370,62 @@ _CASES = [
         _attention_dsa_plan,
     ),
     _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "dsa_decode",
+        "gluon_dsa_decode_gfx1250",
+        _attention_dsa_decode,
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "dsa_prefill",
+        "gluon_dsa_prefill_gfx1250",
+        _attention_dsa_prefill,
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "dsa_decode",
+        "gluon_dsa_decode_gfx1250",
+        _attention_dsa_decode_fp8_dense_rank128,
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "dsa_prefill",
+        "gluon_dsa_prefill_gfx1250",
+        _attention_dsa_prefill_bf16_dense_rank128,
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "dsa_prefill",
+        "triton_dsa_prefill",
+        _attention_dsa_prefill_fp8_dense,
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "dsa_decode_topk",
+        "gluon_dsa_decode_topk_fp8_gfx1250",
+        _attention_dsa_decode_topk,
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "dsa_prefill_topk",
+        "gluon_dsa_prefill_topk_fp8_gfx1250",
+        _attention_dsa_prefill_topk,
+    ),
+    _case(
         _is_supported_gpu,
         "supported-gpu",
         "attention",
@@ -2636,6 +2736,7 @@ _ARCH_FIXTURES: dict[str, tuple[str, ...]] = {
     "blackwell-sm103": ("b300_platform",),
     "blackwell-plus": ("b200_platform", "b300_platform"),
     "cdna4": ("mi350_platform",),
+    "cdna5": ("mi450_platform",),
     "supported-gpu": (
         "h100_platform",
         "b200_platform",
