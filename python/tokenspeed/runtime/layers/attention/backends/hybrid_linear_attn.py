@@ -549,12 +549,413 @@ class MambaAttnBackend(AttentionBackend):
             tables[group_id] = rows
         return state_in_pages, committed, tables
 
+    def _kda_replay_active(self) -> bool:
+        """Whether partial accepts commit by replay instead of by scratch.
+
+        Replay re-runs the accepted prefix from the committed page, so
+        verification never has to store a state per draft position. That
+        scratch is by far the largest verify allocation -- at the K3 TP8
+        geometry it is ~795 KiB per (request, position, layer), i.e. ~10 GiB
+        at bs=64 with two draft tokens across 69 KDA layers -- so the replay
+        path skips allocating it entirely.
+
+        Only the KDA fused verify path can do this; platforms without that
+        kernel fall back to ``fused_recurrent_kda_mtp``, which still writes
+        per-position states and still needs the scratch.
+        """
+        active = getattr(self, "_kda_replay_active_cache", None)
+        if active is None:
+            active = False
+            # Post-radix main: KDA state always lives in the LCM slabs.
+            if self.is_kda:
+                from tokenspeed_kernel.ops.attention import kda_replay_commit_supported
+
+                active = kda_replay_commit_supported()
+            self._kda_replay_active_cache = active
+        return active
+
+    def _kda_lazy_buffers(self, min_slots: int = 1) -> dict:
+        """Stable composed control buffers for the fused lazy commit.
+
+        CUDA-graph capture records these tensors' storage, so they are
+        allocated once at the largest batch the backend can see and refreshed
+        in place at every verify metadata prep. Contents per slot: the payload
+        base row and step count of that request's pending window (base ``-1``
+        = no pending, plain verify), the anchor page the fused kernel reads
+        (pre-pending-window for pendings, the committed page for fresh
+        requests), and the page the deferred commit stores to (``-1`` skips).
+        """
+        bufs = getattr(self, "_kda_lazy_bufs", None)
+        cap = max(len(self.query_start_loc_list), min_slots, 1)
+        if bufs is None or bufs["base"].shape[0] < cap:
+            # Growth happens outside any captured region (metadata prep or an
+            # eager warmup forward); graph capture then records the final,
+            # largest allocation. Allocated outside inference mode: the first
+            # touch may come from a warmup forward running under
+            # torch.inference_mode, but metadata prep refreshes these in
+            # place from OUTSIDE it, which PyTorch forbids for inference
+            # tensors.
+            with torch.inference_mode(False):
+                mk = lambda: torch.full(  # noqa: E731
+                    (cap,), -1, dtype=torch.int32, device=self.device
+                )
+                bufs = self._kda_lazy_bufs = {
+                    "base": mk(),
+                    "steps": torch.zeros(cap, dtype=torch.int32, device=self.device),
+                    "anchor": {g: mk() for g in self._state_group_ids},
+                    "commit": {g: mk() for g in self._state_group_ids},
+                }
+        return bufs
+
+    def _arm_kda_pending(
+        self,
+        real_bs: int,
+        padded_bs: int,
+        kwargs: dict,
+        state_in_by_group: dict[str, torch.Tensor] | None,
+    ) -> None:
+        """Compose this verify round's lazy-commit inputs from the pending
+        record, flushing any pending request that left the verify batch.
+
+        Runs at metadata prep, outside any captured region. Must refresh the
+        buffers on EVERY verify round -- a stale base would make the graphed
+        kernel re-replay an already-committed prefix onto its own result,
+        which double-applies the accepted tokens when the commit was in
+        place. ``real_bs == 0`` (idle replay) only neutralizes the buffers
+        and keeps the pending for the next real round.
+        """
+        bufs = self._kda_lazy_buffers(min_slots=padded_bs)
+        n = padded_bs
+        bufs["base"][:n].fill_(-1)
+        bufs["steps"][:n].fill_(0)
+        for gid in self._state_group_ids:
+            bufs["anchor"][gid][:n].fill_(self.pad_slot_id)
+            bufs["commit"][gid][:n].fill_(-1)
+        if state_in_by_group is not None and real_bs > 0:
+            for gid in self._state_group_ids:
+                bufs["anchor"][gid][:real_bs].copy_(
+                    state_in_by_group[gid][:real_bs].to(torch.int32)
+                )
+        if real_bs <= 0:
+            # Idle / fully padded verify replay. The captured graph includes
+            # the payload-capture copies, which re-execute with whatever junk
+            # the input buffers hold -- so a pending kept across this round
+            # would replay from clobbered payload later. Commit it NOW, while
+            # the payload is still intact (metadata prep runs before the
+            # graph replay).
+            self._flush_kda_pending()
+            return
+        pending = getattr(self, "_kda_pending", None)
+        if pending is None:
+            return
+        cache = getattr(self, "_replay_payload_cache", None)
+        needed_rows = max(len(self.query_start_loc_list), real_bs) * int(
+            self.speculative_num_draft_tokens
+        )
+        if cache is not None and cache["rows"] < needed_rows:
+            # This round's payload capture would rebuild the buffers the
+            # pending's replay reads (enforce-eager batch growth; graph mode
+            # preallocates at max). Commit the pending now -- BEFORE arming,
+            # so the fused kernels see no pending and the forward starts
+            # from clean composed buffers.
+            self._flush_kda_pending()
+            return
+        op = kwargs.get("forward_batch")
+        rpis = list(getattr(op, "request_pool_indices", None) or [])[:real_bs]
+        if not rpis:
+            # No request identity for this batch: cannot fuse safely, so
+            # commit the pending eagerly and run a plain round.
+            self._flush_kda_pending()
+            return
+        current = set(rpis)
+        departed = [r for r in pending["slot_by_rpi"] if r not in current]
+        if departed:
+            self._drop_kda_pending(departed)
+            pending = getattr(self, "_kda_pending", None)
+            if pending is None:
+                return
+        t_prev = pending["draft_token_num"]
+        slot_map = torch.tensor(
+            [pending["slot_by_rpi"].get(r, -1) for r in rpis],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        has = slot_map >= 0
+        safe = slot_map.clamp_min(0)
+        # Identity check beyond the rpi: a finished request's pool index can
+        # be recycled by a NEW request that enters verify without any
+        # non-verify forward in between. The impostor's committed page never
+        # matches the dead pending's commit page, so gate on that (one state
+        # group suffices -- groups page in lockstep). Mismatched entries are
+        # simply not armed; the record after this round's forward replaces
+        # the whole pending, which garbage-collects them. They are NOT
+        # flushed: the dead request's pages may already belong to someone
+        # else.
+        check_gid = self._state_group_ids[0]
+        pending_commit = (
+            pending["commit_by_group"][check_gid].to(torch.int64).gather(0, safe)
+        )
+        has = has & (
+            pending_commit == state_in_by_group[check_gid][:real_bs].to(torch.int64)
+        )
+        neg = torch.full_like(slot_map, -1)
+        bufs["base"][:real_bs].copy_(
+            torch.where(has, safe * t_prev, neg).to(torch.int32)
+        )
+        bufs["steps"][:real_bs].copy_(
+            torch.where(
+                has,
+                pending["steps"].to(torch.int64).gather(0, safe),
+                torch.zeros_like(slot_map),
+            ).to(torch.int32)
+        )
+        for gid in self._state_group_ids:
+            anchor = pending["anchor_by_group"][gid].to(torch.int64).gather(0, safe)
+            commit = pending["commit_by_group"][gid].to(torch.int64).gather(0, safe)
+            bufs["anchor"][gid][:real_bs].copy_(
+                torch.where(
+                    has, anchor, state_in_by_group[gid][:real_bs].to(torch.int64)
+                ).to(torch.int32)
+            )
+            bufs["commit"][gid][:real_bs].copy_(
+                torch.where(has, commit, neg).to(torch.int32)
+            )
+        # NOT consumed here: the pending survives until the record that
+        # follows a COMPLETED verify forward replaces it. If the forward is
+        # abandoned after this prep (retract), the pending is still intact
+        # and the retract-hook flush commits it from the untouched anchor;
+        # if the forward runs, the record overwrites it with the new window.
+        # A forward that dies mid-layer is fatal at the engine level (the
+        # scheduler re-raises and the rank exits), which is what makes
+        # arm -> forward -> record atomic as far as this machinery sees.
+        return
+
+    def _drop_kda_pending(self, only_rpis) -> None:
+        """Discard pending windows for requests that left the engine.
+
+        A request absent from the batch has been finished or retracted, and
+        on the LCM pool that means its state pages are already reclaimed --
+        possibly re-assigned and re-written by a NEW request's prefill.
+        Replaying the dead window would overwrite the new owner's state
+        (observed as all-[PAD] outputs after client aborts), and a retracted
+        request resumes with a full prefill, so its state is rebuilt from
+        scratch anyway. Dropping, never writing, is the only safe commit.
+        """
+        pending = getattr(self, "_kda_pending", None)
+        if pending is None:
+            return
+        for r in list(only_rpis):
+            pending["slot_by_rpi"].pop(r, None)
+        if not pending["slot_by_rpi"]:
+            self._kda_pending = None
+
+    def _flush_kda_pending(self, only_rpis=None) -> None:
+        """Commit pending windows with the standalone replay kernels.
+
+        The escape hatch for a pending that cannot ride the next fused
+        verify while its owner is still resident: identity-less batches,
+        payload-capacity growth, mode switches, pause/weight-update
+        freezes. Requests that LEFT the engine must go through
+        ``_drop_kda_pending`` instead -- their pages may already belong to
+        someone else. ``only_rpis`` restricts the flush; the rest stay
+        pending for fusion.
+        """
+        pending = getattr(self, "_kda_pending", None)
+        if pending is None:
+            return
+        from tokenspeed_kernel.ops.attention import try_kda_replay_commit
+
+        slot_by_rpi = pending["slot_by_rpi"]
+        targets = set(slot_by_rpi if only_rpis is None else only_rpis) & set(
+            slot_by_rpi
+        )
+        if not targets:
+            return
+        old_bs = pending["steps"].shape[0]
+        t_prev = pending["draft_token_num"]
+        weights = getattr(self, "_replay_layer_weights", None)
+        if not weights:
+            raise RuntimeError("KDA pending flush has no captured verify projections")
+        mask = torch.zeros(old_bs, dtype=torch.bool, device=self.device)
+        flush_slots = torch.tensor(
+            [slot_by_rpi[r] for r in targets], dtype=torch.int64, device=self.device
+        )
+        mask[flush_slots] = True
+        rows = old_bs * t_prev
+        for layer_id in self._state_layer_ids():
+            if layer_id not in weights:
+                # A layer absent from the capture never ran a fused verify,
+                # so its state was never tentatively advanced and there is
+                # nothing to commit for it. (In production every KDA layer
+                # runs in every verify forward, so this only skips layers a
+                # partial harness never drove.)
+                continue
+            gid = self.kv_pool.group_id_for_layer(layer_id)
+            (
+                conv_w,
+                f_b_weight,
+                A_log,
+                dt_bias,
+                num_heads,
+                head_dim,
+                lower_bound,
+            ) = weights[layer_id]
+            qkv_buf, f_a_buf, beta_buf = self._replay_payload_cache["buffers"][layer_id]
+            conv_comp = self.kv_pool.get_component(layer_id, "conv_state")
+            ssm_comp = self.kv_pool.get_component(layer_id, "recurrent_state")
+            write = torch.where(
+                mask,
+                pending["commit_by_group"][gid].to(torch.int64),
+                torch.full((old_bs,), -1, dtype=torch.int64, device=self.device),
+            ).to(torch.int32)
+            ok = try_kda_replay_commit(
+                qkv_buf[:rows],
+                conv_w,
+                conv_comp,
+                conv_comp,
+                f_a_buf[:rows],
+                f_b_weight,
+                beta_buf[:rows],
+                A_log,
+                dt_bias,
+                state_pool=ssm_comp,
+                state_out=ssm_comp,
+                read_indices=pending["anchor_by_group"][gid][:old_bs],
+                write_indices=write,
+                accepted_length=pending["steps"],
+                num_heads=num_heads,
+                head_dim=head_dim,
+                draft_token_num=t_prev,
+                lower_bound=lower_bound,
+            )
+            if not ok:
+                raise RuntimeError(
+                    "KDA replay commit kernel vanished after the capability "
+                    "probe reported it available"
+                )
+        remaining = {r: i for r, i in slot_by_rpi.items() if r not in targets}
+        if remaining:
+            pending["slot_by_rpi"] = remaining
+        else:
+            self._kda_pending = None
+
+    def flush_kda_pending_commits(self) -> None:
+        """Commit every pending KDA window now (lifecycle escape hatch).
+
+        Must run before anything invalidates the replay inputs: a weight
+        update (replay uses the layer weights), a pause writeback, or any
+        teardown that releases state pages.
+        """
+        self._flush_kda_pending()
+
+    def _replay_payload(
+        self,
+        layer_id: int,
+        rows: int,
+        widths: tuple[int, int, int],
+        dtype: torch.dtype,
+    ):
+        """Per-layer capture buffers for the replay payload of one window.
+
+        Replay needs the projections the TARGET model computed while
+        verifying: the pre-convolution packed ``q|k|v``, the low-rank gate
+        input, and the raw beta logits. Those are ~9.3 KiB per token per
+        layer at the K3 TP8 geometry, against ~795 KiB for the recurrent
+        state and conv window a per-position scratch would have held -- 86x
+        less, which is the whole point of replaying.
+
+        They are copied rather than referenced because the layer forward is
+        captured into a CUDA graph and does not re-run on replay: a stashed
+        reference would point at whichever bs bucket was captured last, while
+        a copy into a stable buffer replays correctly for every bucket.
+
+        Args:
+            layer_id: KDA layer to get buffers for.
+            rows: capacity in tokens (``max_bs * draft_token_num``).
+            widths: ``(3*P, D_FA, HV)`` channel counts of the three payloads.
+            dtype: activation dtype of the captured projections.
+
+        Returns:
+            ``(qkv_raw, f_a, beta)`` buffers, each ``[rows, width]``.
+        """
+        cache = getattr(self, "_replay_payload_cache", None)
+        if cache is None or cache["rows"] < rows or cache["widths"] != widths:
+            # A rebuild replaces the tensors a live pending's replay would
+            # read (enforce-eager batch growth reaches here; graph mode is
+            # preallocated at max size). Commit that pending first, while
+            # its payload still exists.
+            if cache is not None:
+                self._flush_kda_pending()
+            cache = self._replay_payload_cache = {
+                "rows": rows,
+                "widths": widths,
+                "buffers": {},
+            }
+        buffers = cache["buffers"]
+        entry = buffers.get(layer_id)
+        if entry is None:
+            # Normally preallocated by _preallocate_kda_replay_buffers; this
+            # fallback covers enforce-eager runs (no graph-state init) and a
+            # model whose f_a width defies the preallocation guess. Either
+            # way it must never fire inside a capture -- the tensor would
+            # come from the capture mempool and alias across graphs.
+            assert (
+                not torch.cuda.is_current_stream_capturing()
+            ), "KDA replay payload buffers must exist before graph capture"
+            # Outside inference mode for the same reason as the lazy control
+            # buffers: the flush path feeds these to kernels from metadata
+            # prep, outside the mode they would otherwise be created under.
+            with torch.inference_mode(False):
+                entry = buffers[layer_id] = tuple(
+                    torch.zeros((cache["rows"], width), dtype=dtype, device=self.device)
+                    for width in widths
+                )
+        return entry
+
+    def _capture_replay_payload(
+        self,
+        layer_id: int,
+        mixed_qkv: torch.Tensor,
+        f_a_out: torch.Tensor,
+        beta_raw: torch.Tensor,
+        *,
+        batch_size: int,
+        draft_token_num: int,
+        weights: tuple,
+    ) -> None:
+        """Stage one KDA layer's verify projections for a later replay.
+
+        Called from inside the captured region, so the copies replay with the
+        graph. ``weights`` holds the layer's model-lifetime tensors plus its
+        head geometry; those are bs-independent, so recording them by
+        reference is safe across CUDA-graph buckets in a way the projections
+        themselves are not.
+        """
+        rows = batch_size * draft_token_num
+        max_rows = max(len(self.query_start_loc_list), batch_size) * draft_token_num
+        widths = (mixed_qkv.shape[-1], f_a_out.shape[-1], beta_raw.shape[-1])
+        qkv_buf, f_a_buf, beta_buf = self._replay_payload(
+            layer_id, max_rows, widths, mixed_qkv.dtype
+        )
+        qkv_buf[:rows].copy_(mixed_qkv[:rows])
+        f_a_buf[:rows].copy_(f_a_out[:rows])
+        beta_buf[:rows].copy_(beta_raw[:rows])
+        state = getattr(self, "_replay_layer_weights", None)
+        if state is None:
+            state = self._replay_layer_weights = {}
+        state[layer_id] = weights
+
     def _ensure_verify_scratch(self, bs: int, draft_token_num: int) -> None:
         """Lazily allocate per-group verify scratch: one init row plus
         ``draft_token_num`` per-position rows per request, for both the conv
         window and the recurrent state (rollback source for partial accepts).
         Sized once at the max the backend can see; graph warmup runs this
-        path eagerly before capture."""
+        path eagerly before capture.
+
+        Skipped entirely on the replay path, which commits from the committed
+        page instead of from a per-position row."""
+        if self._kda_replay_active():
+            return
         max_bs = max(len(self.query_start_loc_list), bs)
         rows_needed = max_bs * (draft_token_num + 1)
         scratch = getattr(self, "_verify_scratch", None)
@@ -731,14 +1132,82 @@ class MambaAttnBackend(AttentionBackend):
         cache[(bs, draft_token_num)] = grid
         return grid
 
+    def _replay_commit_state(
+        self,
+        bs: int,
+        accepted: torch.Tensor,
+        draft_token_num: int,
+        write_pages_by_group: dict[str, torch.Tensor],
+        read_pages_by_group: dict[str, torch.Tensor],
+    ) -> None:
+        """Rebuild each KDA layer's committed state by replaying the accepted
+        prefix of the draft window from the pre-draft committed page.
+
+        The destination page is usually the source page (a draft window
+        rarely crosses a flat page boundary), which the replay kernels
+        support in place.
+        """
+        from tokenspeed_kernel.ops.attention import try_kda_replay_commit
+
+        weights = getattr(self, "_replay_layer_weights", None)
+        if not weights:
+            raise RuntimeError(
+                "KDA replay commit has no captured verify projections; the "
+                "verify pass must run the fused KDA path"
+            )
+        rows = bs * draft_token_num
+        accepted_i32 = accepted.to(torch.int32)
+        for layer_id in self._state_layer_ids():
+            group_id = self.kv_pool.group_id_for_layer(layer_id)
+            (
+                conv_w,
+                f_b_weight,
+                A_log,
+                dt_bias,
+                num_heads,
+                head_dim,
+                lower_bound,
+            ) = weights[layer_id]
+            qkv_buf, f_a_buf, beta_buf = self._replay_payload_cache["buffers"][layer_id]
+            conv_comp = self.kv_pool.get_component(layer_id, "conv_state")
+            ssm_comp = self.kv_pool.get_component(layer_id, "recurrent_state")
+            ok = try_kda_replay_commit(
+                qkv_buf[:rows],
+                conv_w,
+                conv_comp,
+                conv_comp,
+                f_a_buf[:rows],
+                f_b_weight,
+                beta_buf[:rows],
+                A_log,
+                dt_bias,
+                state_pool=ssm_comp,
+                state_out=ssm_comp,
+                read_indices=read_pages_by_group[group_id][:bs],
+                write_indices=write_pages_by_group[group_id][:bs],
+                accepted_length=accepted_i32,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                draft_token_num=draft_token_num,
+                lower_bound=lower_bound,
+            )
+            if not ok:
+                raise RuntimeError(
+                    "KDA replay commit kernel vanished after the capability "
+                    "probe reported it available"
+                )
+
     def commit_verified_state(self, accepted_length: torch.Tensor) -> None:
-        """Commit the accepted draft position's state (conv window +
-        recurrent) from the verify scratch into each group's state slab at
-        the new committed page. All device-side; graph-safe."""
+        """Commit the state for the accepted draft prefix into each group's
+        state slab at the new committed page. All device-side; graph-safe.
+
+        On the replay path the accepted prefix is re-run from the committed
+        page (see ``_kda_replay_active``); otherwise the accepted position's
+        row is copied out of the per-position verify scratch."""
         ctx = getattr(self, "_verify_commit_ctx", None)
         if ctx is None:
             return
-        committed, tables, draft_token_num = ctx
+        committed, tables, draft_token_num, read_pages_by_group = ctx[:4]
         bs = accepted_length.shape[0]
         k = accepted_length.to(torch.int64).clamp(min=1, max=draft_token_num)
         new_last = committed[:bs] + k - 1
@@ -759,6 +1228,28 @@ class MambaAttnBackend(AttentionBackend):
                 .to(torch.int64)
                 .clamp_min(0)
             )
+        if self._kda_replay_active():
+            # Lazy commit: record what a replay needs and let the NEXT verify
+            # round's fused kernel perform it on the way in. Anything that
+            # leaves the verify stream first is flushed by
+            # ``_flush_kda_pending`` at the next metadata prep. Overwriting
+            # ``_kda_pending`` here is the consumption point of the PREVIOUS
+            # pending: reaching this record means the verify forward that
+            # was armed with it completed, i.e. its commit happened.
+            rpis = ctx[4] if len(ctx) > 4 else []
+            self._kda_pending = dict(
+                slot_by_rpi={r: i for i, r in enumerate(rpis[:bs])},
+                steps=k.to(torch.int32),
+                anchor_by_group={g: t[:bs] for g, t in read_pages_by_group.items()},
+                commit_by_group=pages_by_group,
+                draft_token_num=draft_token_num,
+            )
+            self._verify_commit_ctx = None
+            if not rpis:
+                # No request identity: nothing can ever fuse or flush this
+                # record, so commit it eagerly right now.
+                self._flush_kda_pending()
+            return
         # Batched commit: scratch row -> committed page for every KDA layer in
         # one launch per state kind (was a per-layer gather/scatter pair).
         from tokenspeed_kernel.ops.kvcache.triton import copy_state_rows
@@ -953,6 +1444,11 @@ class MambaAttnBackend(AttentionBackend):
 
         state_in_pages_by_group = None
         state_out_pages_by_group = None
+        if getattr(self, "_kda_pending", None) is not None and not is_target_verify:
+            # A pending lazy commit only fuses into a verify round. Any other
+            # forward may read or repage the pending requests' state, so
+            # commit first (eager launches, before this forward's kernels).
+            self._flush_kda_pending()
         # Idle/bs==0 forwards carry no requests and never reach the mamba
         # forward (router returns early), so no tables are required.
         if bs > 0 and not forward_mode.is_idle():
@@ -972,11 +1468,19 @@ class MambaAttnBackend(AttentionBackend):
                 state_out_pages_by_group = state_in_pages_by_group
                 self._ensure_verify_scratch(bs, draft_token_num)
                 mamba_output_indices = self._verify_scratch_grid(bs, draft_token_num)
+                verify_op = kwargs.get("forward_batch")
+                verify_rpis = list(
+                    getattr(verify_op, "request_pool_indices", None) or []
+                )[:bs]
                 self._verify_commit_ctx = (
                     verify_committed,
                     verify_tables,
                     draft_token_num,
+                    state_in_pages_by_group,
+                    verify_rpis,
                 )
+                if self._kda_replay_active():
+                    self._arm_kda_pending(bs, bs, kwargs, state_in_pages_by_group)
             else:
                 (
                     state_in_pages_by_group,
@@ -1032,6 +1536,35 @@ class MambaAttnBackend(AttentionBackend):
             )
         self._qsl_dirty = [False] * max_num_tokens
         self._qsl_last_mode = [None] * max_num_tokens
+        if self._kda_replay_active() and self.speculative_num_draft_tokens > 1:
+            self._preallocate_kda_replay_buffers(max_num_tokens)
+
+    def _preallocate_kda_replay_buffers(self, max_bs: int) -> None:
+        """Allocate every lazy-commit buffer before any forward runs.
+
+        Called from ``init_cuda_graph_state`` -- after ``set_kv_pool`` (so
+        the pool components give the payload geometry) and before any
+        warmup, capture, or inference-mode context. Keeping the forward path
+        allocation-free avoids inference-mode tensor restrictions and any
+        chance of a first touch landing inside a capture mempool.
+
+        The f_a payload width is not in the pool geometry; KDA's low-rank
+        gate uses the state head dim (K3: 128 == K). If a model ever
+        disagrees, the width check in ``_replay_payload`` rebuilds the
+        buffers during the eager warmup forward, before anything captures.
+        """
+        rows = max(max_bs, 1) * int(self.speculative_num_draft_tokens)
+        for layer_id in self._state_layer_ids():
+            conv = self.kv_pool.get_component(layer_id, "conv_state")
+            ssm = self.kv_pool.get_component(layer_id, "recurrent_state")
+            hv, k = ssm.shape[1], ssm.shape[2]
+            self._replay_payload(
+                layer_id,
+                rows,
+                (conv.shape[1], k, hv),
+                self.dtype,
+            )
+        self._kda_lazy_buffers(min_slots=max_bs)
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -1162,6 +1695,10 @@ class MambaAttnBackend(AttentionBackend):
 
         state_in_pages_by_group = None
         state_out_pages_by_group = None
+        if getattr(self, "_kda_pending", None) is not None and not is_target_verify:
+            # See init_forward_metadata: non-verify rounds must not run over
+            # an uncommitted pending window.
+            self._flush_kda_pending()
         if self.state_paging_active and is_target_verify:
             # Target-verify replay: refresh the CAPTURED per-bs state_in
             # buffers with each group's committed-state page (page of
@@ -1179,10 +1716,16 @@ class MambaAttnBackend(AttentionBackend):
                     verify_committed,
                     verify_tables,
                 ) = self._verify_state_pages(real_bs, seq_lens, draft_token_num, kwargs)
+                verify_op = kwargs.get("forward_batch")
+                verify_rpis = list(
+                    getattr(verify_op, "request_pool_indices", None) or []
+                )[:real_bs]
                 self._verify_commit_ctx = (
                     verify_committed,
                     verify_tables,
                     draft_token_num,
+                    pages_by_group,
+                    verify_rpis,
                 )
             else:
                 self._verify_commit_ctx = None
@@ -1208,6 +1751,8 @@ class MambaAttnBackend(AttentionBackend):
                 state_out.fill_(self.pad_slot_id)
                 state_in_pages_by_group[group_id] = state_in
                 state_out_pages_by_group[group_id] = state_out
+            if self._kda_replay_active():
+                self._arm_kda_pending(real_bs, bs, kwargs, pages_by_group)
         elif self.state_paging_active:
             # For multi-group KDA state paging, dual indexing runs once per
             # state group over the real rows. Padded rows get pad_slot_id (-1),
@@ -1577,35 +2122,121 @@ class MambaAttnBackend(AttentionBackend):
                 and kwargs.get("bias") is None
             ):
                 # Verify megafusion: conv(+silu), f_b gate GEMV, and the
-                # per-position recurrence in one launch, per-position conv
-                # windows and states landing in the verify scratches.
+                # per-position recurrence in one launch. It writes no state:
+                # verification is tentative, so the committed pages are left
+                # intact as the anchor the post-acceptance replay starts from,
+                # and the projections it consumed are captured for that replay.
                 state_in_pages, _, conv_comp, ssm_states = state
-                conv_scratch, ssm_scratch = self._verify_scratch[layer_id]
                 num_value_heads = value_dim // attn_tp_size // head_v_dim
+                f_a_out = kwargs["f_a_out"]
+                lazy = self._kda_replay_active()
+                if lazy:
+                    # Fused lazy commit: replay the previous round's accepted
+                    # prefix on the way into this verify (see the kernel
+                    # docstring). The payload buffers must exist BEFORE the
+                    # launch (they are kernel inputs even on the first,
+                    # pending-free round), the composed control buffers were
+                    # refreshed at metadata prep, and the kernel reads the
+                    # composed anchor -- NOT state_in, which for a pending
+                    # request already names the not-yet-written commit page.
+                    gid = self.kv_pool.group_id_for_layer(layer_id)
+                    bufs = self._kda_lazy_buffers(min_slots=batch_size)
+                    max_rows = (
+                        max(len(self.query_start_loc_list), batch_size)
+                        * draft_token_num
+                    )
+                    widths = (
+                        mixed_qkv.shape[-1],
+                        f_a_out.shape[-1],
+                        beta_raw.shape[-1],
+                    )
+                    qkv_buf, f_a_buf, beta_buf = self._replay_payload(
+                        layer_id, max_rows, widths, mixed_qkv.dtype
+                    )
+                    fused_kwargs = dict(
+                        read_indices=bufs["anchor"][gid][:batch_size],
+                        prev_qkv=qkv_buf,
+                        prev_f_a=f_a_buf,
+                        prev_beta=beta_buf,
+                        prev_base=bufs["base"][:batch_size],
+                        prev_steps=bufs["steps"][:batch_size],
+                        commit_indices=bufs["commit"][gid][:batch_size],
+                    )
+                else:
+                    fused_kwargs = dict(read_indices=state_in_pages[:batch_size])
                 fused_out = try_kda_fused_paged_verify(
                     mixed_qkv,
                     conv_weights,
                     conv_comp,
-                    conv_scratch,
-                    kwargs["f_a_out"],
+                    f_a_out,
                     kwargs["f_b_weight"],
                     beta_raw,
                     A_log,
                     dt_bias,
                     state_pool=ssm_states,
-                    state_scratch=ssm_scratch,
-                    read_indices=state_in_pages[:batch_size],
-                    write_indices=output_indices[:batch_size],
                     num_heads=num_value_heads,
                     head_dim=head_v_dim,
                     draft_token_num=draft_token_num,
                     lower_bound=kda_lower_bound,
+                    **fused_kwargs,
                 )
+                if fused_out is not None and lazy:
+                    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+                        kda_commit_conv_window,
+                    )
+
+                    # The matching conv-window half of the deferred commit;
+                    # separate launch because the window's q/k slots are
+                    # shared across the recurrence kernel's column split.
+                    # Ordered after the fused kernel on the stream, so the
+                    # in-place case reads before this writes.
+                    kda_commit_conv_window(
+                        qkv_buf,
+                        conv_comp,
+                        conv_comp,
+                        bufs["anchor"][gid][:batch_size],
+                        bufs["commit"][gid][:batch_size],
+                        bufs["steps"][:batch_size],
+                        conv_dim=mixed_qkv.shape[-1],
+                        draft_token_num=draft_token_num,
+                        row_base=bufs["base"][:batch_size],
+                    )
+                    # Capture THIS window's payload for the next round's
+                    # commit -- after both consumers of the previous
+                    # window's payload, so the same buffers can be reused
+                    # (stream order makes the single buffer safe, and CUDA
+                    # graphs preserve that order).
+                    self._capture_replay_payload(
+                        layer_id,
+                        mixed_qkv,
+                        f_a_out,
+                        beta_raw,
+                        batch_size=batch_size,
+                        draft_token_num=draft_token_num,
+                        weights=(
+                            conv_weights,
+                            kwargs["f_b_weight"],
+                            A_log,
+                            dt_bias,
+                            num_value_heads,
+                            head_v_dim,
+                            kda_lower_bound,
+                        ),
+                    )
                 if fused_out is not None:
                     return fused_out
             # Read the committed window and write per-position states into the
             # verify scratch. The accepted position is committed afterward.
             state_in_pages, _, conv_comp, ssm_states = state
+            if self._kda_replay_active():
+                # The scratch this path needs was deliberately not
+                # allocated, so failing over to it would surface as a
+                # confusing KeyError several frames down.
+                raise RuntimeError(
+                    "KDA verify fell through to the per-position scratch "
+                    "path while replay commit is active; the fused KDA "
+                    "verify kernel must handle every verify batch"
+                )
             conv_scratch, ssm_scratch = self._verify_scratch[layer_id]
             if layer_id == self._state_layer_ids()[0]:
                 self._seed_verify_scratch_batched(batch_size, draft_token_num)
@@ -2036,6 +2667,23 @@ class HybridLinearAttnBackend(AttentionBackend):
         return self._backend_for_layer(layer_id).forward_extend(
             q, k, v, layer, out_cache_loc, token_to_kv_pool, bs, **kwargs
         )
+
+    def has_kda_pending_commits(self) -> bool:
+        """Cheap host-side probe for a deferred lazy KDA window."""
+        return getattr(self.linear_attn_backend, "_kda_pending", None) is not None
+
+    def drop_kda_pending_commits(self) -> None:
+        """Discard every deferred window (owners left; pages reclaimed)."""
+        inner = self.linear_attn_backend
+        pending = getattr(inner, "_kda_pending", None)
+        if pending is not None:
+            inner._drop_kda_pending(list(pending["slot_by_rpi"]))
+
+    def flush_kda_pending_commits(self) -> None:
+        """Commit any pending lazy KDA window now (weight update / pause)."""
+        flush = getattr(self.linear_attn_backend, "flush_kda_pending_commits", None)
+        if flush is not None:
+            flush()
 
     def update_mamba_state_after_mtp_verify(self, accepted_length, model):
         self.linear_attn_backend.commit_verified_state(accepted_length)

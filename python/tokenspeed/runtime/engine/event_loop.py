@@ -1023,6 +1023,41 @@ class EventLoop:
                 kind, consumer_indices if consumer_indices else -1
             )
 
+    def _flush_kda_pending_on_retract(self, forward_op) -> None:
+        """Land deferred KDA commits before a retract's pages can be repaged.
+
+        With a forward scheduled the backend flushes at its own metadata
+        prep; only the no-forward retract round needs this hook. The flush
+        runs on the execution stream so an overlap-scheduled verify still in
+        flight finishes writing the pending's payload buffers first.
+        """
+        if forward_op is not None:
+            return
+        # No forward at all means no request is schedulable: every pending
+        # owner has finished or been retracted and its pages are reclaimed.
+        # Writing would corrupt whoever owns them next -- discard instead.
+        backend = self.model_executor.attn_backend
+        drop = getattr(backend, "drop_kda_pending_commits", None)
+        if drop is not None:
+            drop()
+
+    def _flush_kda_pending_now(self) -> None:
+        backend = self.model_executor.attn_backend
+        probe = getattr(backend, "has_kda_pending_commits", None)
+        if probe is not None and not probe():
+            return
+        flush = getattr(backend, "flush_kda_pending_commits", None)
+        if flush is None:
+            return
+        stream = getattr(self.model_executor, "execution_stream", None)
+        if stream is not None:
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                flush()
+            torch.cuda.current_stream().wait_stream(stream)
+        else:
+            flush()
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -1605,6 +1640,9 @@ class EventLoop:
             self._drain_ready_epd_embeddings()
             self._commit_cache_results()
             if self._pause.forward_blocked:
+                # A pause may precede a weight update; a pending replay must
+                # commit under the weights that produced it.
+                self._flush_kda_pending_now()
                 self._paused_idle_step()
                 continue
             execution_plan = self.scheduler.next_execution_plan()
@@ -1615,6 +1653,7 @@ class EventLoop:
             self._submit_cache_ops(execution_plan)
 
             forward_op = self._get_forward_op(execution_plan)
+            self._flush_kda_pending_on_retract(forward_op)
             stats = self._get_scheduler_stats()
             num_iter_tokens = (
                 sum(forward_op.input_lengths) if forward_op is not None else 0
@@ -1754,7 +1793,9 @@ class EventLoop:
             self._commit_cache_results()
             if self._pause.forward_blocked:
                 # Freeze: commit any in-flight (overlapped) step — a forward
-                # already on the GPU can't be un-launched — then idle.
+                # already on the GPU can't be un-launched — then idle. A
+                # pending replay must commit under the weights that made it.
+                self._flush_kda_pending_now()
                 self._paused_idle_step(prev_forward_op, prev_results)
                 prev_results = None
                 prev_forward_op = None
@@ -1768,6 +1809,7 @@ class EventLoop:
             self._submit_cache_ops(execution_plan)
 
             forward_op = self._get_forward_op(execution_plan)
+            self._flush_kda_pending_on_retract(forward_op)
             stats = self._get_scheduler_stats()
             num_iter_tokens = (
                 sum(forward_op.input_lengths) if forward_op is not None else 0
