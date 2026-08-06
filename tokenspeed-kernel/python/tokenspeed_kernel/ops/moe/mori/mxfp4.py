@@ -170,9 +170,10 @@ if platform.is_amd:
         total = counts_long.sum()  # sum(counts), 0-dim tensor (no host sync)
 
         # Ragged-row count ``m`` (>= sum(counts)): the static, shape-derived ``n_recv_bound``
-        # (ep_size * batch * top_k, capped at E*cap) is a true upper bound on the rows this rank
-        # can receive -- every rank dispatches at most ``batch*top_k`` slots, so no rank receives
-        # more than ep_size of those. Use it in BOTH capture AND eager. The obvious "tighter"
+        # (ep_size * max-tokens-per-rank * top_k, capped at E*cap; see the caller) is a true upper
+        # bound on the rows this rank can receive -- every rank dispatches at most
+        # ``max_tokens_per_rank*top_k`` slots, so no rank receives more than ep_size of those.
+        # Use it in BOTH capture AND eager. The obvious "tighter"
         # eager choice ``sum(counts).item()`` needs a device->host sync, and because the MoE runs
         # this per layer (x61) that sync DRAINS the GPU pipeline every layer -- on the eager
         # prefill path (batches above the captured decode sizes) that serialization, not compute,
@@ -299,11 +300,20 @@ if platform.is_amd:
         if overlap_fn is not None:
             overlap_fn()
         packed = handle["packed_x"]  # [E_local, cap, H]
-        # Static upper bound on rows this rank can receive: global tokens (ep_size * this
-        # step's batch, uniform across ranks under decode graph capture) times top_k. Derived
-        # from x.shape (no host sync) so the GEMM stays graph-capturable while its ragged grid
-        # tracks real work instead of the full E_local*cap buffer.
-        n_recv_bound = ep_size * int(x.shape[0]) * int(getattr(w, "top_k"))
+        # Static upper bound on rows THIS rank can receive after dispatch: (max tokens on any EP
+        # rank this forward) * ep_size senders * top_k. It must NOT be derived from this rank's
+        # own token count ``x.shape[0]``: after dispatch a rank owns experts for tokens sent by
+        # every OTHER rank, so under DP attention an idle/imbalanced rank (few or zero local
+        # tokens while peers are busy) still receives their tokens -- a local-only bound would
+        # truncate (or, at x.shape[0]==0, skip) those rows, leaving raw dispatched input in place
+        # of the FFN output and corrupting the combine result on the sender ranks. ``max_num_
+        # tokens_per_gpu`` is the per-rank max the runtime reports (identical on every rank), so
+        # this stays a true upper bound under eager imbalance and equals ep_size*batch under the
+        # uniform decode-graph padding -- all without a host sync (keeps the GEMM capturable).
+        per_rank = (
+            int(max_num_tokens_per_gpu) if max_num_tokens_per_gpu else int(x.shape[0])
+        )
+        n_recv_bound = ep_size * per_rank * int(getattr(w, "top_k"))
         _grouped_mxfp4_gemm_3d(packed, handle["counts"], w, n_recv_bound)  # in place
         # Return the COMPLETE per-token routed result on every rank; do NOT reduce/scale here.
         return dispatcher.combine(handle)
