@@ -1959,6 +1959,27 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
 # ---------------------------------------------------------------------------
 
 
+def _draft_rope_scaling(rope_scaling: dict | None) -> dict | None:
+    """Keep only yarn-style rope_scaling for the EAGLE3 MLA draft layer.
+
+    The layer implements plain rope and (deepseek-)yarn. transformers may
+    normalize plain rope into a factor-less ``{"rope_type": "default"}``
+    dict; anything else unsupported is dropped with a warning.
+    """
+    if not rope_scaling:
+        return None
+    if rope_scaling.get("rope_type", rope_scaling.get("type")) in (
+        "yarn",
+        "deepseek_yarn",
+    ):
+        return rope_scaling
+    if "factor" in rope_scaling:
+        logger.warning(
+            "EAGLE3 MLA draft ignores unsupported rope_scaling %s", rope_scaling
+        )
+    return None
+
+
 class Eagle3MlaDecoderLayer(nn.Module):
     """Single decoder layer for Eagle3 MLA draft model.
 
@@ -1980,7 +2001,7 @@ class Eagle3MlaDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.layer_id = layer_id
         rope_theta = get_rope_theta(config)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_scaling = _draft_rope_scaling(getattr(config, "rope_scaling", None))
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
 
         self.self_attn = DeepseekV3DraftAttentionMLA(
@@ -2281,6 +2302,7 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
         )
 
         self.load_lm_head_from_target = False
+        self._embed_loaded_from_checkpoint = False
         if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
@@ -2350,6 +2372,8 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
                 continue
             if "t2d" in name:
                 continue
+            if "embed_tokens" in name:
+                self._embed_loaded_from_checkpoint = True
 
             new_name = re.sub(r"^layers\.0\.", "midlayer.", name)
 
@@ -2397,8 +2421,22 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
             and self.config.target_hidden_size != self.config.hidden_size
         ):
             return
-        del self.model.embed_tokens.weight
-        self.model.embed_tokens.weight = embed
+        if self.model.embed_tokens.weight.shape == embed.shape:
+            # A TP-sharded target embedding would read out of bounds here.
+            del self.model.embed_tokens.weight
+            self.model.embed_tokens.weight = embed
+        elif not self._embed_loaded_from_checkpoint:
+            raise ValueError(
+                "EAGLE3 draft cannot share the target embedding "
+                f"(target {tuple(embed.shape)} vs draft "
+                f"{tuple(self.model.embed_tokens.weight.shape)}) and the draft "
+                "checkpoint provided no embed_tokens weight"
+            )
+        else:
+            logger.info(
+                "EAGLE3 draft keeps its own embedding; target shape %s differs",
+                tuple(embed.shape),
+            )
         if head is not None and self.load_lm_head_from_target:
             del self.lm_head.weight
             self.lm_head.weight = head

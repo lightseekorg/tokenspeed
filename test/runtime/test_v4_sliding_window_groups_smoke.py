@@ -392,6 +392,26 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
         self.assertEqual(rows["v4.c4a.compressor_state"], 4)
         self.assertEqual(rows["v4.c128a.compressor_state"], 8)
 
+    def test_c4_state_window_covers_wide_verify_blocks(self):
+        base = build_v4_cache_specs(
+            SimpleNamespace(sliding_window=128),
+            layer_ratio=(4,),
+        )
+        wide = build_v4_cache_specs(
+            SimpleNamespace(sliding_window=128),
+            layer_ratio=(4,),
+            decode_input_tokens=6,
+        )
+
+        base_windows = {spec.group_id: spec.sliding_window_tokens for spec in base}
+        wide_windows = {spec.group_id: spec.sliding_window_tokens for spec in wide}
+        for group_id in (
+            "v4.c4a.compressor_state",
+            "v4.c4a.indexer_compressor_state",
+        ):
+            self.assertEqual(base_windows[group_id], 8)
+            self.assertEqual(wide_windows[group_id], 10)
+
     def test_lcm_capacity_is_the_inverse_of_parent_demand(self):
         packing = {
             "v4.swa_kv": 1,
