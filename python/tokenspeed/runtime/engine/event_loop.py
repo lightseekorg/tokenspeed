@@ -212,6 +212,7 @@ class EventLoop:
         target, draft = create_model_runner(
             server_args, self.model_config, draft_model_config, gpu_id, global_rank
         )
+        self.multimodal_encoder_dtype = target.multimodal_encoder_dtype
         if server_args.disaggregation_mode in ("null", "prefill"):
             # Keep this after all target/draft weights are loaded and before
             # create_attn_components profiles memory for the KV-cache budget.
@@ -1106,6 +1107,7 @@ class EventLoop:
             num_gpu_blocks=geometry.num_device_pages,
             block_size=geometry.page_size,
             dtype=_wire_dtype(self.model_config.dtype),
+            multimodal_encoder_dtype=self.multimodal_encoder_dtype,
             vllm_version=f"tokenspeed-{_tokenspeed_version()}",
             world_size=self.world_size,
             data_parallel_size=self.dp_size,
@@ -1941,6 +1943,7 @@ def run_event_loop(
                 "max_num_seqs": server_args.max_num_seqs,
                 "chunked_prefill_size": server_args.chunked_prefill_size,
                 "max_model_len": event_loop.max_model_len,
+                "multimodal_encoder_dtype": event_loop.multimodal_encoder_dtype,
                 "cache_storage": getattr(event_loop, "cache_storage", None),
             }
         )

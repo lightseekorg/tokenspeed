@@ -91,6 +91,55 @@ class BlockTablesBridgeTest(unittest.TestCase):
         self.assertEqual(self.bridge(op, device="cpu", num_reqs=0), {})
         self.assertEqual(self.bridge(op, device="cpu"), {})
 
+    def test_strict_contract_rejects_missing_extra_and_duplicate_normalized_ids(self):
+        op = self._make_op({"full": [[1]]})
+        with self.assertRaisesRegex(ValueError, "missing=.*swa"):
+            self.bridge(
+                op,
+                device="cpu",
+                num_reqs=1,
+                expected_group_ids=("full", "swa"),
+            )
+
+        op = self._make_op({"full": [[1]], "swa": [[2]], "extra": [[3]]})
+        with self.assertRaisesRegex(ValueError, "extra=.*extra"):
+            self.bridge(
+                op,
+                device="cpu",
+                num_reqs=1,
+                expected_group_ids=("full", "swa"),
+            )
+
+        import numpy as np
+
+        collision = SimpleNamespace(
+            block_tables_arrays=lambda: {
+                1: np.array([[1]], dtype=np.int32),
+                "1": np.array([[2]], dtype=np.int32),
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "collide"):
+            self.bridge(collision, device="cpu", num_reqs=1, max_page_id=8)
+
+    def test_strict_contract_rejects_malformed_and_out_of_range_tables(self):
+        import numpy as np
+
+        wrong_dtype = SimpleNamespace(
+            block_tables_arrays=lambda: {"full": np.array([[1]], dtype=np.int64)}
+        )
+        with self.assertRaisesRegex(ValueError, "int32"):
+            self.bridge(wrong_dtype, device="cpu", num_reqs=1, max_page_id=8)
+
+        out_of_range = self._make_op({"full": [[1, 99]]})
+        with self.assertRaisesRegex(ValueError, "outside -1..8"):
+            self.bridge(
+                out_of_range,
+                device="cpu",
+                num_reqs=1,
+                expected_group_ids=("full",),
+                max_page_ids={"full": 8},
+            )
+
 
 class CacheGroupGatingTest(unittest.TestCase):
     """Backends opt into cache-group metadata explicitly."""
@@ -106,6 +155,9 @@ class CacheGroupGatingTest(unittest.TestCase):
 
     def test_default_backend_does_not_use_cache_groups(self):
         self.assertFalse(self.AttentionBackend.uses_cache_groups)
+        self.assertFalse(
+            self.AttentionBackend.cache_group_tables_replace_draft_page_table
+        )
 
 
 if __name__ == "__main__":

@@ -808,8 +808,19 @@ def create_attn_components(
     # (GDN scalar decay vs KDA per-channel) and the base attn arch (MHA vs MLA).
     is_hybrid_linear = is_hybrid_gdn or is_hybrid_mla_kda
     is_deepseek_v4_model = is_deepseek_v4(model_config.hf_config)
-    is_deepseek_v4_draft_model = draft_model_config is not None and is_deepseek_v4(
-        draft_model_config.hf_config
+    draft_architectures = (
+        getattr(draft_model_config.hf_config, "architectures", None) or []
+        if draft_model_config is not None
+        else []
+    )
+    is_dspark_draft_model = any(
+        architecture == "DeepseekV4ForCausalLMDSpark"
+        for architecture in draft_architectures
+    )
+    is_deepseek_v4_draft_model = (
+        draft_model_config is not None
+        and not is_dspark_draft_model
+        and is_deepseek_v4(draft_model_config.hf_config)
     )
     original_attn_backend = server_args.attention_backend
     if is_deepseek_v4_model:
@@ -884,18 +895,13 @@ def create_attn_components(
     )
     draft_attn_config = (
         _create_attn_config(server_args, draft_model_config, is_draft=True)
-        if draft_model_config
+        if draft_model_config and not is_dspark_draft_model
         else None
     )
     if is_deepseek_v4_draft_model:
         draft_attn_config.sliding_window_tokens = int(
             draft_model_config.hf_config.sliding_window
         )
-    draft_architectures = (
-        getattr(draft_model_config.hf_config, "architectures", None) or []
-        if draft_model_config is not None
-        else []
-    )
     draft_is_hybrid_gdn = any(
         architecture in _HYBRID_GDN_ARCHITECTURES
         for architecture in draft_architectures

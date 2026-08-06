@@ -200,7 +200,11 @@ def _build_encode_worker(server_args, port_args, gpu_id, global_rank):
         max_tokens_per_batch=server_args.chunked_prefill_size or 8192,
         max_items_per_batch=server_args.max_num_seqs,
     )
-    return EncodeWorker(executor, scheduler, cache), model_config
+    return (
+        EncodeWorker(executor, scheduler, cache),
+        model_config,
+        model_runner.multimodal_encoder_dtype,
+    )
 
 
 def run_encode_loop(server_args, port_args, pipe_writer, gpu_id, global_rank):
@@ -210,7 +214,7 @@ def run_encode_loop(server_args, port_args, pipe_writer, gpu_id, global_rank):
     EncodeWorker.submit, then runs EncodeWorker.step to encode + ship each pending
     item over Mooncake. Synchronous; no KV, no LM forward.
     """
-    worker, model_config = _build_encode_worker(
+    worker, model_config, multimodal_encoder_dtype = _build_encode_worker(
         server_args, port_args, gpu_id, global_rank
     )
 
@@ -255,6 +259,7 @@ def run_encode_loop(server_args, port_args, pipe_writer, gpu_id, global_rank):
             "max_num_seqs": server_args.max_num_seqs,
             "chunked_prefill_size": server_args.chunked_prefill_size,
             "max_model_len": model_config.context_len,
+            "multimodal_encoder_dtype": multimodal_encoder_dtype,
         }
     )
 
