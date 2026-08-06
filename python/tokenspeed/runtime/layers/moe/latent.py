@@ -63,8 +63,9 @@ class K3MoETailTier(IntEnum):
     SEPARATE_REDUCE = 3  # portable: reduce each partial on its own
 
 
-# One past the fused tail's _MAX_NUM_TOKENS; ld_reduce stays flat above it.
-MULTIMEM_AR_MIN_TOKENS = 17
+# Above every decode-graph bucket: at decode sizes the two staged reduces
+# lose ~4% TPOT to the single fused-lane AR; the ld_reduce win is prefill's.
+MULTIMEM_AR_MIN_TOKENS = 256
 # Upper edge of the measured window; larger batches take the join's grouped path.
 MULTIMEM_AR_MAX_TOKENS = 8192
 
