@@ -176,8 +176,6 @@ Notes:
   (fp8 KV required). AMD uses the `mla` backend.
 - `tokenspeed serve` auto-selects the `kimi_k3` reasoning and tool-call
   parsers. Explicit parser flags override these defaults.
-- K3 EAGLE3 capture takes the draft checkpoint's one-based completed-layer
-  ids directly, e.g. `--eagle3-layers-to-capture 2,46,90`.
 - The SMG packages pinned by TokenSpeed resolve `moonshotai/Kimi-K3` directly;
   a flattened local checkpoint and separately staged remote-code cache are no
   longer required.
