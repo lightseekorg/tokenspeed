@@ -35,10 +35,9 @@ from tokenspeed_kernel.ops.layernorm.triton import (
     qk_rmsnorm,
 )
 
-# Configs
-from tokenspeed.runtime.configs.paged_cache_spec import FULL_ATTENTION
 from tokenspeed.runtime.configs.qwen3_5_config import (
     Qwen3_5Config,
+    Qwen3_5MoeConfig,
     Qwen3_5TextConfig,
 )
 from tokenspeed.runtime.configs.utils import get_rope_parameters
@@ -47,6 +46,11 @@ from tokenspeed.runtime.configs.utils import get_rope_parameters
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
+
+# Configs
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    FULL_ATTENTION,
+)
 
 # Layers - Attention
 from tokenspeed.runtime.layers.attention.linear.layernorm_gated import (
@@ -467,7 +471,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             hidden_states
         )
 
-        if self.num_v_heads // self.num_k_heads in [1, 2, 4]:
+        if self.num_v_heads % self.num_k_heads == 0:
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
                 projected_states_qkvz,
                 projected_states_ba,
@@ -1134,7 +1138,10 @@ class Qwen3_5ForCausalLM(nn.Module):
         return loaded_params
 
 
-class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
+class Qwen3_5MoeModel(Qwen3_5ForCausalLM):
+    """MoE backbone (internal). The ``Qwen3_5MoeForCausalLM`` name is taken by
+    the registry entry class for text-only flat checkpoints below."""
+
     def __init__(
         self,
         config: Qwen3_5TextConfig,
@@ -1292,8 +1299,8 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             )
             self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
             self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
-            # Encoder callables may be swapped to cudagraph wrappers by
-            # ModelExecutor.
+            # Encoder callables may be swapped to cudagraph wrappers during
+            # runtime startup.
             self.vision_embedder = VisionEmbedder(encoder_mapping=mapping.vision)
             self.image_encoder = self.get_image_feature
             self.video_encoder = self.get_video_feature
@@ -1327,6 +1334,22 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         metadata = self.visual.prepare_metadata(grid)
         encoded = self.visual.forward_blocks(tokens, metadata)
         return self.post_encode([encoded], grid)
+
+    def get_multimodal_encoder_specs(self) -> dict[Modality, EncoderSpec]:
+        if self.visual is None:
+            return {}
+        return {
+            Modality.IMAGE: EncoderSpec(
+                self.image_encoder,
+                deepstack=True,
+                make_warmup_items=self.visual.make_image_warmup_items,
+            ),
+            Modality.VIDEO: EncoderSpec(
+                self.video_encoder,
+                deepstack=True,
+                make_warmup_items=self.visual.make_video_warmup_items,
+            ),
+        }
 
     def pre_encode(
         self,
@@ -1480,10 +1503,7 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             input_ids=input_ids,
             text_embedding=self.model.get_input_embeddings(),
             ctx=multimodal_context,
-            encoders={
-                Modality.IMAGE: EncoderSpec(self.image_encoder, deepstack=True),
-                Modality.VIDEO: EncoderSpec(self.video_encoder, deepstack=True),
-            },
+            encoders=self.get_multimodal_encoder_specs(),
             multimodal_model=self,
         )
         hidden_states, aux_hidden_states = self.model(
@@ -1587,7 +1607,7 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
 class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
     """Qwen3.5 MoE Vision-Language Model."""
 
-    model_cls = Qwen3_5MoeForCausalLM
+    model_cls = Qwen3_5MoeModel
 
     def __init__(
         self,
@@ -1727,6 +1747,43 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         )
 
 
+class Qwen3_5MoeForCausalLM(Qwen3_5MoeForConditionalGeneration):
+    """Text-only Qwen3.5-MoE entry."""
+
+    def __init__(
+        self,
+        config,
+        mapping: Mapping,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        if not hasattr(config, "text_config"):
+            archs = list(getattr(config, "architectures", None) or [])
+            config = Qwen3_5MoeConfig(text_config=config)
+            config.__dict__["architectures"] = archs or ["Qwen3_5MoeForCausalLM"]
+        super().__init__(
+            config=config,
+            mapping=mapping,
+            quant_config=quant_config,
+            prefix=prefix,
+            is_multimodal_active=False,
+        )
+
+    def resolve_model(
+        self,
+        config,
+        mapping: Mapping,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ):
+        return self.model_cls(
+            config=config,
+            mapping=mapping,
+            quant_config=quant_config,
+            prefix=add_prefix("model", prefix),  # no ``model.language_model`` scope
+        )
+
+
 @triton.jit
 def fused_qkvzba_split_reshape_cat_contiguous_kernel(
     mixed_qkv,
@@ -1765,26 +1822,6 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
         + i_qk * HEAD_QK
         + tl.arange(0, HEAD_QK)
     )
-    # v for head group i_qk: in the all_v region
-    blk_v_ptr = (
-        mixed_qkvz
-        + i_bs * stride_qkvz
-        + TOTAL_Q
-        + TOTAL_K
-        + i_qk * V_PER_GROUP * HEAD_V
-        + tl.arange(0, V_PER_GROUP * HEAD_V)
-    )
-    # z for head group i_qk: in the all_z region
-    blk_z_ptr = (
-        mixed_qkvz
-        + i_bs * stride_qkvz
-        + TOTAL_Q
-        + TOTAL_K
-        + TOTAL_V
-        + i_qk * V_PER_GROUP * HEAD_V
-        + tl.arange(0, V_PER_GROUP * HEAD_V)
-    )
-
     # ── Write to output (identical layout to the interleaved kernel) ──
     blk_q_st_ptr = mixed_qkv + i_bs * QKV_DIM_T + i_qk * HEAD_QK + tl.arange(0, HEAD_QK)
     blk_k_st_ptr = (
@@ -1794,24 +1831,60 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
         + i_qk * HEAD_QK
         + tl.arange(0, HEAD_QK)
     )
-    blk_v_st_ptr = (
-        mixed_qkv
-        + i_bs * QKV_DIM_T
-        + NUM_HEADS_QK * HEAD_QK * 2
-        + i_qk * V_PER_GROUP * HEAD_V
-        + tl.arange(0, V_PER_GROUP * HEAD_V)
-    )
-    blk_z_st_ptr = (
-        z
-        + i_bs * NUM_HEADS_V * HEAD_V
-        + i_qk * V_PER_GROUP * HEAD_V
-        + tl.arange(0, V_PER_GROUP * HEAD_V)
-    )
 
     tl.store(blk_q_st_ptr, tl.load(blk_q_ptr))
     tl.store(blk_k_st_ptr, tl.load(blk_k_ptr))
-    tl.store(blk_v_st_ptr, tl.load(blk_v_ptr))
-    tl.store(blk_z_st_ptr, tl.load(blk_z_ptr))
+
+    # Compile-time branch keeps the fast
+    # vectorized path for pow2 ratios and loops per head otherwise
+    IS_POW2: tl.constexpr = (V_PER_GROUP & (V_PER_GROUP - 1)) == 0
+
+    if IS_POW2:
+        blk_v_ptr = (
+            mixed_qkvz
+            + i_bs * stride_qkvz
+            + TOTAL_Q
+            + TOTAL_K
+            + i_qk * V_PER_GROUP * HEAD_V
+            + tl.arange(0, V_PER_GROUP * HEAD_V)
+        )
+        blk_z_ptr = (
+            mixed_qkvz
+            + i_bs * stride_qkvz
+            + TOTAL_Q
+            + TOTAL_K
+            + TOTAL_V
+            + i_qk * V_PER_GROUP * HEAD_V
+            + tl.arange(0, V_PER_GROUP * HEAD_V)
+        )
+        blk_v_st_ptr = (
+            mixed_qkv
+            + i_bs * QKV_DIM_T
+            + NUM_HEADS_QK * HEAD_QK * 2
+            + i_qk * V_PER_GROUP * HEAD_V
+            + tl.arange(0, V_PER_GROUP * HEAD_V)
+        )
+        blk_z_st_ptr = (
+            z
+            + i_bs * NUM_HEADS_V * HEAD_V
+            + i_qk * V_PER_GROUP * HEAD_V
+            + tl.arange(0, V_PER_GROUP * HEAD_V)
+        )
+        tl.store(blk_v_st_ptr, tl.load(blk_v_ptr))
+        tl.store(blk_z_st_ptr, tl.load(blk_z_ptr))
+    else:
+        for i in tl.static_range(V_PER_GROUP):
+            head_off = (i_qk * V_PER_GROUP + i) * HEAD_V + tl.arange(0, HEAD_V)
+            blk_v_ptr = mixed_qkvz + i_bs * stride_qkvz + TOTAL_Q + TOTAL_K + head_off
+            blk_z_ptr = (
+                mixed_qkvz + i_bs * stride_qkvz + TOTAL_Q + TOTAL_K + TOTAL_V + head_off
+            )
+            blk_v_st_ptr = (
+                mixed_qkv + i_bs * QKV_DIM_T + NUM_HEADS_QK * HEAD_QK * 2 + head_off
+            )
+            blk_z_st_ptr = z + i_bs * NUM_HEADS_V * HEAD_V + head_off
+            tl.store(blk_v_st_ptr, tl.load(blk_v_ptr))
+            tl.store(blk_z_st_ptr, tl.load(blk_z_ptr))
 
     # ── b and a ──
     for i in tl.static_range(V_PER_GROUP):
@@ -1883,4 +1956,8 @@ def fused_qkvzba_split_reshape_cat_contiguous(
     return mixed_qkv, z, b, a
 
 
-EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]
+EntryClass = [
+    Qwen3_5MoeForConditionalGeneration,
+    Qwen3_5ForConditionalGeneration,
+    Qwen3_5MoeForCausalLM,
+]

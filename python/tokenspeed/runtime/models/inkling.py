@@ -493,21 +493,13 @@ def _sconv_apply(
             )
         if conv_group == "kvconv":
             checkpoint_group = "kvconv"
-            checkpoint_buffers = (
-                ctx.token_to_kv_pool.get_lcm_field(
-                    f"layer.{layer_id}.kvconv_k", torch.bfloat16
-                ),
-                ctx.token_to_kv_pool.get_lcm_field(
-                    f"layer.{layer_id}.kvconv_v", torch.bfloat16
-                ),
+            checkpoint_buffers = ctx.token_to_kv_pool.kvconv_checkpoint_buffers(
+                layer_id
             )
         elif conv_group in ("attnconv", "mlpconv"):
             checkpoint_group = "hiddenconv"
             checkpoint_buffers = (
-                ctx.token_to_kv_pool.get_lcm_field(
-                    f"layer.{layer_id}.{conv_group}",
-                    ctx.token_to_kv_pool.conv_col_dtype,
-                ),
+                ctx.token_to_kv_pool.hiddenconv_checkpoint_buffer(layer_id, conv_group),
             )
         if checkpoint_buffers:
             backend.register_shortconv_checkpoint_stream(
@@ -1473,6 +1465,23 @@ class InklingVisionTower(nn.Module):
     def forward(self, vision_features: torch.Tensor) -> torch.Tensor:
         return self.vision_encoder(vision_features)
 
+    def make_warmup_items(self) -> list[MultimodalDataItem]:
+        """Build one independent hMLP patch, which exercises the whole tower."""
+        encoder = self.vision_encoder
+        return [
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                feature=torch.zeros(
+                    1,
+                    encoder.temporal_patch_size,
+                    encoder.patch_size,
+                    encoder.patch_size,
+                    encoder.n_channels,
+                    dtype=next(encoder.parameters()).dtype,
+                ),
+            )
+        ]
+
 
 class InklingAudioTower(nn.Module):
     """dMel audio tower (checkpoint key ``audio``).
@@ -1515,6 +1524,15 @@ class InklingAudioTower(nn.Module):
         if self.final_norm is not None:
             hidden_states = self.final_norm(hidden_states)
         return hidden_states
+
+    def make_warmup_items(self) -> list[MultimodalDataItem]:
+        """Build one independent dMel frame, which exercises the whole tower."""
+        return [
+            MultimodalDataItem(
+                modality=Modality.AUDIO,
+                feature=torch.zeros(1, self.n_mel_bins, dtype=torch.long),
+            )
+        ]
 
 
 class InklingTextModel(nn.Module):
@@ -1693,6 +1711,8 @@ class InklingForConditionalGeneration(nn.Module):
             if (self.audio is not None or self.visual is not None)
             else None
         )
+        self.image_encoder = self.get_image_feature if self.visual is not None else None
+        self.audio_encoder = self.get_audio_feature if self.audio is not None else None
 
         self.lm_head = ParallelLMHead(
             text_config.padded_vocab_size,
@@ -1754,6 +1774,20 @@ class InklingForConditionalGeneration(nn.Module):
         dmel = torch.cat([item.feature for item in items], dim=0)
         return self.audio(dmel)
 
+    def get_multimodal_encoder_specs(self) -> dict[Modality, EncoderSpec]:
+        specs = {}
+        if self.visual is not None:
+            specs[Modality.IMAGE] = EncoderSpec(
+                self.image_encoder,
+                make_warmup_items=self.visual.make_warmup_items,
+            )
+        if self.audio is not None:
+            specs[Modality.AUDIO] = EncoderSpec(
+                self.audio_encoder,
+                make_warmup_items=self.audio.make_warmup_items,
+            )
+        return specs
+
     def _embed_multimodal(self, ctx, input_ids, multimodal_context):
         """Run the shared MM embed pipeline; ``None`` -> text-only path."""
         if (
@@ -1769,16 +1803,11 @@ class InklingForConditionalGeneration(nn.Module):
                 "no audio/vision towers (audio_config/vision_config "
                 "decoder_dmodel unset) or runs with --language-model-only."
             )
-        encoders = {}
-        if self.visual is not None:
-            encoders[Modality.IMAGE] = EncoderSpec(self.get_image_feature)
-        if self.audio is not None:
-            encoders[Modality.AUDIO] = EncoderSpec(self.get_audio_feature)
         input_embeds, _ = self.vision_embedder.apply(
             input_ids=input_ids,
             text_embedding=self.model.mm_text_embedding(),
             ctx=multimodal_context,
-            encoders=encoders,
+            encoders=self.get_multimodal_encoder_specs(),
             multimodal_model=self,
         )
         return input_embeds

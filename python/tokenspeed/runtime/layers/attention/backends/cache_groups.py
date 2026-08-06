@@ -37,6 +37,7 @@ the null page 0 by the scheduler export.
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import (
@@ -44,10 +45,14 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     unpack_group_tables,
 )
 
-from tokenspeed.runtime.configs.cache_runtime import cache_debug_enabled
-from tokenspeed.runtime.layers.attention.page_table import expand_page_table
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+    cache_debug_enabled,
+)
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.common import ceil_div
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 
 logger = get_colorful_logger(__name__)
 
@@ -69,9 +74,6 @@ class CacheGroupsMixin:
 
     # Wrapper-owned (Inkling conv) groups: mixin skips their write-loc math and capture buffers
     engine_owned_group_ids: frozenset[str] = frozenset()
-
-    # Per-group page size in tokens (hetero block sizes); groups absent here use self.page_size
-    group_page_sizes: dict[str, int] = {}
 
     # Draft decode-window lookback rows (Inkling MTP): armed by the conv
     # wrapper's configure_draft_lookback BEFORE graph init, so the lookback
@@ -169,6 +171,15 @@ class CacheGroupsMixin:
             tables = {gid: table for gid, table in tables.items() if gid not in skip}
         return tables or None
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Learned from the pool by _learn_cache_groups / set_cache_pool;
+        # init_cuda_graph_state is never reached under --enforce-eager, so
+        # establish the empty state at construction.
+        self.state_group_ids: frozenset[str] = frozenset()
+        self.group_page_sizes: dict[str, int] = {}
+        self.cache_pool: CachePool | None = None
+
     def _learn_cache_groups(self, paged_cache_group_specs) -> None:
         """Record the pool's family="state" group ids (see
         state_group_ids) and per-group page sizes (heterogeneous block
@@ -180,7 +191,7 @@ class CacheGroupsMixin:
             if spec.family == "state"
         )
         self.group_page_sizes = {
-            str(spec.group_id): int(spec.rows_per_page) * int(spec.entry_stride_tokens)
+            str(spec.group_id): spec.cache_block_tokens
             for spec in paged_cache_group_specs
             if spec.family != "state"
         }
@@ -201,12 +212,14 @@ class CacheGroupsMixin:
             for gid in page_tables
         ):
             return page_tables
+        if self.cache_pool is None:
+            raise RuntimeError("cache-aware backend has no bound CachePool")
         return {
-            gid: expand_page_table(
+            gid: self.cache_pool.expand_block_table(
+                gid,
                 table,
-                logical_page_size=self._group_page_size(gid),
-                kernel_page_size=self._consumer_page_size(gid),
-                max_kernel_pages=self.max_num_pages,
+                kernel_block_tokens=self._consumer_page_size(gid),
+                max_kernel_blocks=self.max_num_pages,
             )
             for gid, table in page_tables.items()
         }
@@ -618,11 +631,13 @@ class CacheGroupsMixin:
                 rows = min(src.shape[0], bs)
                 ratio = self._group_page_ratios[i]
                 if ratio != 1:
-                    expand_page_table(
+                    if self.cache_pool is None:
+                        raise RuntimeError("cache-aware backend has no bound CachePool")
+                    self.cache_pool.expand_block_table(
+                        gid,
                         src[:rows, :source_cols],
-                        logical_page_size=self._group_page_size(gid),
-                        kernel_page_size=self._consumer_page_size(gid),
-                        max_kernel_pages=buf.shape[1],
+                        kernel_block_tokens=self._consumer_page_size(gid),
+                        max_kernel_blocks=buf.shape[1],
                         out=buf[:rows],
                     )
                     if rows < bs:

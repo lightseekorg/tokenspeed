@@ -37,9 +37,6 @@ from tokenspeed.runtime.cache.executor.memory_executor import (
 )
 from tokenspeed.runtime.cache.transfer.types import CacheKind
 from tokenspeed.runtime.configs.model_config import ModelConfig
-from tokenspeed.runtime.configs.paged_cache_spec import (
-    validate_scheduler_config,
-)
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -73,6 +70,9 @@ from tokenspeed.runtime.execution.factory import (
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.types import ModelExecutionResult
 from tokenspeed.runtime.grammar.capturable_grammar import GrammarStepInputs
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    validate_scheduler_config,
+)
 from tokenspeed.runtime.layers.attention.registry import create_attn_components
 from tokenspeed.runtime.metrics.collector import EngineMetrics
 from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
@@ -212,6 +212,11 @@ class EventLoop:
         target, draft = create_model_runner(
             server_args, self.model_config, draft_model_config, gpu_id, global_rank
         )
+        self.multimodal_encoder_dtype = target.multimodal_encoder_dtype
+        if server_args.disaggregation_mode in ("null", "prefill"):
+            # Keep this after all target/draft weights are loaded and before
+            # create_attn_components profiles memory for the KV-cache budget.
+            target.prepare_multimodal_runtime()
         self.use_overlap_schedule = should_use_overlap_schedule(
             disable_overlap_schedule=server_args.disable_overlap_schedule,
             disaggregation_mode=server_args.disaggregation_mode,
@@ -260,7 +265,6 @@ class EventLoop:
             max_scheduled_tokens = aligned_max_scheduled_tokens(
                 server_args.chunked_prefill_size,
                 paged_cache_groups,
-                geometry.page_size,
             )
             if max_scheduled_tokens != server_args.chunked_prefill_size:
                 logger.warning(
@@ -870,8 +874,6 @@ class EventLoop:
         dp_all_extend = dp_metadata.all_extend if dp_metadata is not None else False
         multimodal_context = self._get_multimodal_context_for_forward(forward_op)
 
-        self.model_executor.update_block_table(forward_op)
-
         if self.kv_transfer is None:
             # Path 1: normal (no disaggregation)
             self.model_executor.reset_valid_cache_length(forward_op)
@@ -1105,6 +1107,7 @@ class EventLoop:
             num_gpu_blocks=geometry.num_device_pages,
             block_size=geometry.page_size,
             dtype=_wire_dtype(self.model_config.dtype),
+            multimodal_encoder_dtype=self.multimodal_encoder_dtype,
             vllm_version=f"tokenspeed-{_tokenspeed_version()}",
             world_size=self.world_size,
             data_parallel_size=self.dp_size,
@@ -1741,9 +1744,8 @@ class EventLoop:
         prev_forward_op = None
 
         while not self._shutdown_complete():
-            # Order this iter's default-stream writes (KVAllocator,
-            # update_block_table, prefix_cache writes to req_to_page)
-            # after the prev iter's forward on execution_stream that
+            # Order this iter's default-stream writes (prefix_cache page-table
+            # writes) after the prev iter's forward on execution_stream that
             # reads the same tensor. Non-blocking on host.
             torch.cuda.default_stream().wait_stream(
                 self.model_executor.execution_stream
@@ -1941,6 +1943,7 @@ def run_event_loop(
                 "max_num_seqs": server_args.max_num_seqs,
                 "chunked_prefill_size": server_args.chunked_prefill_size,
                 "max_model_len": event_loop.max_model_len,
+                "multimodal_encoder_dtype": event_loop.multimodal_encoder_dtype,
                 "cache_storage": getattr(event_loop, "cache_storage", None),
             }
         )

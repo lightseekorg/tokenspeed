@@ -34,21 +34,17 @@ from tokenspeed_kernel.ops.tuning import (
 )
 from tokenspeed_kernel.platform import current_platform
 
-from tokenspeed.runtime.configs.model_config import ModelConfig
-from tokenspeed.runtime.configs.paged_cache_spec import (
-    validate_scheduler_config,
-)
+from tokenspeed.runtime.configs.model_config import AttentionArch, ModelConfig
 from tokenspeed.runtime.configs.utils import get_rope_parameters
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
-from tokenspeed.runtime.engine.scheduler_utils import (
-    block_tables_from_forward_op,
-)
 from tokenspeed.runtime.execution.breakable_cuda_graph import active_forward
-from tokenspeed.runtime.execution.cache_loc_kernel import update_block_table
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
+from tokenspeed.runtime.execution.drafter.deepseek_v4_dspark import (
+    DeepseekV4DSpark,
+)
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
 from tokenspeed.runtime.execution.drafter.dspark import DSpark
 from tokenspeed.runtime.execution.drafter.eagle import Eagle
@@ -59,25 +55,30 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 )
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
 from tokenspeed.runtime.execution.model_runner import ModelRunner
+from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 from tokenspeed.runtime.execution.nan_guard import NanGuard
 from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import ModelExecutionResult
-from tokenspeed.runtime.grammar.capturable_grammar import setup_grammar_step
+from tokenspeed.runtime.grammar.capturable_grammar import (
+    create_grammar_runtime,
+    setup_grammar_step,
+)
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
     CacheBatchMetadata,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    validate_scheduler_config,
+)
+from tokenspeed.runtime.layers.attention.page_table import expand_page_table
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.layers.paged_attention import (
     validate_paged_cache_group_ids,
 )
-from tokenspeed.runtime.multimodal.inputs import resolve_mm_pad_substitute_ids
 from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 from tokenspeed.runtime.sampling.dp_sampling_config import (
     DpSamplingRuntimeLimits,
-    DpSamplingTopology,
-    resolve_dp_sampling_runtime,
-    resolve_dp_sampling_support,
+    setup_dp_sampling,
 )
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.utils import get_colorful_logger, set_random_seed
@@ -88,7 +89,7 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
-    from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 logger = get_colorful_logger(__name__)
@@ -112,6 +113,13 @@ def _get_drafter_impl(spec_algo: str, model: torch.nn.Module):
     # "MTP" covers two algorithms:
     # (1) Eagle-like MTP (e.g. DeepSeek) stays on Eagle in eagle.py;
     # (2) Vanilla MTP (e.g. Inkling) with multi-layer weights stays on Mtp in mtp.py.
+    if spec_algo == "DSPARK":
+        from tokenspeed.runtime.models.deepseek_v4_dspark import (
+            DeepseekV4ForCausalLMDSpark,
+        )
+
+        if isinstance(model, DeepseekV4ForCausalLMDSpark):
+            return DeepseekV4DSpark
     if spec_algo == "MTP" and isinstance(model, InklingForConditionalGenerationNextN):
         return Mtp
     else:
@@ -119,15 +127,37 @@ def _get_drafter_impl(spec_algo: str, model: torch.nn.Module):
 
 
 def _eagle_aux_layer_ids(hf_config) -> list[int] | None:
-    """Draft's eagle_aux_hidden_state_layer_ids (nested or top-level), or None."""
-    eagle_config = getattr(hf_config, "eagle_config", None)
-    if isinstance(eagle_config, dict):
-        ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
-    elif eagle_config is not None:
-        ids = getattr(eagle_config, "eagle_aux_hidden_state_layer_ids", None)
-    else:
-        ids = getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None)
-    return list(ids) if ids else None
+    """Return EAGLE3 capture ids from a draft config, including K3 text config.
+
+    K3 wraps the language configuration in ``text_config``.  Draft exports may
+    place ``eagle_config`` either on that text config or on the top-level
+    wrapper, so inspect both without falling back to the target's defaults.
+    """
+    candidates = [hf_config]
+    text_config = (
+        hf_config.get("text_config")
+        if isinstance(hf_config, dict)
+        else getattr(hf_config, "text_config", None)
+    )
+    if text_config is not None:
+        candidates.append(text_config)
+
+    for config in candidates:
+        if isinstance(config, dict):
+            eagle_config = config.get("eagle_config")
+            direct_ids = config.get("eagle_aux_hidden_state_layer_ids")
+        else:
+            eagle_config = getattr(config, "eagle_config", None)
+            direct_ids = getattr(config, "eagle_aux_hidden_state_layer_ids", None)
+        if isinstance(eagle_config, dict):
+            ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
+        elif eagle_config is not None:
+            ids = getattr(eagle_config, "eagle_aux_hidden_state_layer_ids", None)
+        else:
+            ids = direct_ids
+        if ids:
+            return list(ids)
+    return None
 
 
 def _draft_idle_global_num_tokens_for_step(
@@ -202,6 +232,8 @@ class ModelExecutorConfig:
     spec_num_steps: int | None = None
     # spec_num_tokens == spec_num_steps + 1 for now (without Tree Attention)
     spec_num_tokens: int | None = None
+    # Explicit EAGLE3 capture ids; overrides the draft checkpoint's ids.
+    eagle3_layers_to_capture: list[int] | None = None
     overlap_schedule_depth: int = 0
     dp_sampling: bool = False
     dp_sampling_min_bs: int | None = None
@@ -241,6 +273,15 @@ class ModelExecutorConfig:
         rope_parameters = get_rope_parameters(model_config.hf_text_config)
         model_is_mrope = bool(rope_parameters and "mrope_section" in rope_parameters)
 
+        # DSA's sparse indexer reads the attention backend's
+        # ``chunked_prefill_metadata`` from inside the captured prefill segment,
+        # but the prefill graph rebinds only the live ForwardContext at replay --
+        # the backend metadata object stays frozen at capture-time (dummy) values.
+        # So the two are fundamentally incompatible; force eager prefill for DSA.
+        disable_prefill_graph = bool(server_args.disable_prefill_graph) or (
+            model_config.attention_arch == AttentionArch.DSA
+        )
+
         return ModelExecutorConfig(
             max_req_pool_size=max_req_pool_size,
             output_length=output_length,
@@ -258,7 +299,7 @@ class ModelExecutorConfig:
             cudagraph_capture_sizes=server_args.cudagraph_capture_sizes,
             disable_cuda_graph_padding=server_args.disable_cuda_graph_padding,
             max_cudagraph_capture_size=server_args.max_cudagraph_capture_size,
-            disable_prefill_graph=bool(server_args.disable_prefill_graph),
+            disable_prefill_graph=disable_prefill_graph,
             prefill_graph_max_tokens=_resolve_prefill_graph_max_tokens(server_args),
             prefill_graph_capture_sizes=server_args.prefill_graph_capture_sizes,
             model_is_mrope=model_is_mrope,
@@ -268,6 +309,7 @@ class ModelExecutorConfig:
             spec_algo=server_args.speculative_algorithm,
             spec_num_steps=server_args.speculative_num_steps,
             spec_num_tokens=server_args.speculative_num_draft_tokens,
+            eagle3_layers_to_capture=server_args.eagle3_layers_to_capture,
             overlap_schedule_depth=overlap_schedule_depth,
             dp_sampling=server_args.dp_sampling,
             dp_sampling_min_bs=server_args.dp_sampling_min_bs,
@@ -288,11 +330,11 @@ class ModelExecutor:
         config: ModelExecutorConfig,
         model_runner: ModelRunner,
         attn_backend: AttentionBackend,
-        token_to_kv_pool: BaseTokenToKVPool,
+        token_to_kv_pool: CachePool,
         sampling_backend: SamplingBackend,
         draft_model_runner: ModelRunner | None = None,
         draft_attn_backend: AttentionBackend | None = None,
-        draft_token_to_kv_pool: BaseTokenToKVPool | None = None,
+        draft_token_to_kv_pool: CachePool | None = None,
     ):
         self.device = config.device
         self.config = config
@@ -300,29 +342,34 @@ class ModelExecutor:
         self.sampling_backend = sampling_backend
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
-        # Hybrid pools publish a runtime contract. Their per-group tables
-        # travel as CacheBatchMetadata rather than through req_to_page.
+        # Every pool runs on the shared cache arena and publishes a runtime
+        # contract; the per-group tables travel as CacheBatchMetadata. Fail fast
+        # here rather than at the first forward: a missing contract means the
+        # model family has no cache recipe yet (add one in
+        # kv_cache.recipes.setup.prepare_cache_setup, see the 'mha' / 'msa' recipes for
+        # the pattern).
         self._cache_runtime_contract = getattr(
             token_to_kv_pool, "runtime_contract", None
         )
-        # Full-attention group mirrored into req_to_page for ordinary
-        # speculative consumers that still use the single-table interface.
-        _group_specs = getattr(token_to_kv_pool, "paged_cache_group_specs", ()) or ()
+        if self._cache_runtime_contract is None:
+            raise RuntimeError(
+                f"KV pool {type(token_to_kv_pool).__name__} publishes no "
+                "PagedCacheRuntimeContract. Every pool must be built from a "
+                "cache recipe (kv_cache.recipes.setup.prepare_cache_setup)."
+            )
+        # The batch-ordered full-history table backs out_cache_loc and the
+        # draft page table. First contract group with family=history and
+        # retention=full_history -- the same selection CacheBatchMetadata
+        # exposes as ``first_full_attention_group_id``.
         self._full_history_group_id = next(
             (
                 str(spec.group_id)
-                for spec in _group_specs
-                if getattr(spec, "family", "history") != "state"
+                for spec in self._cache_runtime_contract.group_specs
+                if getattr(spec, "family", "history") == "history"
                 and getattr(spec, "retention", None) == "full_history"
             ),
             None,
         )
-        self._mirror_idx_cpu: torch.Tensor | None = None
-        self._mirror_idx_dev: torch.Tensor | None = None
-        self._mirror_row_buf: torch.Tensor | None = None
-        # Block-decode drafters need req_to_page mirrored even under the flat
-        # contract; see _mirror_flat_full_table_into_req_to_page.
-        self._mirror_for_block_draft = config.spec_algo in ("DFLASH", "DSPARK")
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
 
@@ -330,18 +377,32 @@ class ModelExecutor:
         # (e.g. spec on a backend without cache_group_spec_capable) would otherwise
         # die on a capture-path assert instead of this actionable error.
         validate_scheduler_config(
-            paged_cache_groups=_group_specs,
+            paged_cache_groups=self._cache_runtime_contract.group_specs,
             attn_backend=attn_backend,
             kv_pool=token_to_kv_pool,
             speculative_algorithm=config.spec_algo,
         )
+
+        # fill_input_buffers indexes the scheduler table in logical pages; the drafter indexes draft_page_table in its backend's kernel pages.
+        self._logical_page_size = int(
+            getattr(draft_token_to_kv_pool, "page_size", 0) or config.logical_page_size
+        )
+        self._draft_page_size = int(
+            getattr(draft_attn_backend, "page_size", 0) or self._logical_page_size
+        )
+        if self._logical_page_size % self._draft_page_size:
+            raise ValueError(
+                f"logical page size {self._logical_page_size} is not a multiple "
+                f"of the draft kernel page size {self._draft_page_size}"
+            )
+        self._draft_page_ratio = self._logical_page_size // self._draft_page_size
 
         if config.spec_algo is not None:
             # The DFLASH overlap scheduler reserves a fresh draft block per
             # decode step a request stays scheduled, including the few steps it
             # lingers between finishing and eviction, so peak page count runs
             # ~1 page past context_len + spec_num_tokens. Without headroom
-            # req_to_page overflows and the next draft block's page write goes
+            # page_table overflows and the next draft block's page write goes
             # out of bounds, hanging the attention kernel. Pad generously; a few
             # int32 columns per request. Non-DFLASH algorithms do not need this.
             draft_block_reservation_slack = (
@@ -353,31 +414,32 @@ class ModelExecutor:
                 config.context_len
                 + config.spec_num_tokens
                 + draft_block_reservation_slack
-                + config.logical_page_size
+                + self._draft_page_size
                 - 1
-            ) // config.logical_page_size
+            ) // self._draft_page_size
         else:
             max_num_pages_per_req = (
-                config.context_len + config.logical_page_size
-            ) // config.logical_page_size
+                config.context_len + self._draft_page_size
+            ) // self._draft_page_size
 
         max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
 
-        self.req_to_page = torch.zeros(
-            (config.max_req_pool_size + 1, max_num_pages_per_req),
+        # Batch-ordered page table (row i == batch position i). Populated per
+        # forward from the target's full-history table so drafts read their
+        # pages without a req-pool round-trip; also the zero/dummy placeholder
+        # for idle/warmup forwards before the cache contract binds. Graph-
+        # stable: the drafter's captured segments record this buffer's address.
+        self.draft_page_table = torch.zeros(
+            (max_bs, max_num_pages_per_req),
             dtype=torch.int32,
             device=self.device,
         )
         spec_num_tokens = config.spec_num_tokens if config.spec_algo is not None else 1
-        # Stride for indexing req_to_page when building drafter caller-side
-        # write locations for ordinary attention backends.
-        self._draft_page_size = int(
-            getattr(draft_token_to_kv_pool, "page_size", 0) or config.logical_page_size
-        )
         self.input_buffers = InputBuffers(
             max_bs=max_bs,
             max_num_tokens=config.chunked_prefill_size,
-            page_size=self._draft_page_size,
+            # Indexes the scheduler's full-history table: logical page ids.
+            page_size=self._logical_page_size,
             # token_to_kv_pool allocates size+page_size slots; index `size` is
             # the reserved dummy slot (see MHATokenToKVPool._create_buffers).
             dummy_kv_slot=0,
@@ -406,33 +468,34 @@ class ModelExecutor:
                 page_size=self._draft_page_size,
                 runtime_states=self.runtime_states,
                 input_buffers=self.input_buffers,
-                req_to_page=self.req_to_page,
+                page_table=self.draft_page_table,
                 attn_backend=draft_attn_backend,
                 token_to_kv_pool=draft_token_to_kv_pool,
                 vocab_size=config.vocab_size,
             )
             if hasattr(self.drafter, "bind_target_model"):
                 self.drafter.bind_target_model(self.model_runner.model)
-            # EAGLE3/MTP share the target's embed + lm_head; DFLASH ships its
-            # own draft weights, so it must NOT inherit the target's.
-            if config.spec_algo in ("EAGLE3", "MTP"):
+            # The V4 checkpoint-local DSpark path shares the target's embed and
+            # LM head. Generic DSpark and DFlash ship their own draft weights.
+            if config.spec_algo in ("EAGLE3", "MTP") or isinstance(
+                self.drafter, DeepseekV4DSpark
+            ):
                 embed, head = self.model_runner.model.get_embed_and_head()
                 draft_model_runner.model.set_embed_and_head(embed, head)
-            target_hf = self.model_runner.model_config.hf_config
-            mm_pad_substitute_ids = resolve_mm_pad_substitute_ids(target_hf)
-            if mm_pad_substitute_ids and hasattr(
-                self.drafter, "set_mm_pad_substitute_ids"
-            ):
-                self.drafter.set_mm_pad_substitute_ids(mm_pad_substitute_ids)
+            MultimodalRuntime.wire_drafter(
+                self.drafter, self.model_runner.model_config.hf_config
+            )
             if config.spec_algo in ("EAGLE3",) and hasattr(
                 self.model_runner.model, "set_eagle3_layers_to_capture"
             ):
                 # capture the layers the draft was trained on, not the default
-                aux_layer_ids = _eagle_aux_layer_ids(
+                aux_layer_ids = config.eagle3_layers_to_capture or _eagle_aux_layer_ids(
                     draft_model_runner.model_config.hf_config
                 )
                 self.model_runner.model.set_eagle3_layers_to_capture(aux_layer_ids)
-            if config.spec_algo in ("DFLASH", "DSPARK"):
+            if config.spec_algo in ("DFLASH", "DSPARK") and not isinstance(
+                self.drafter, DeepseekV4DSpark
+            ):
                 if not hasattr(self.model_runner.model, "set_dflash_layers_to_capture"):
                     raise ValueError(
                         "DFLASH requires the target model to support "
@@ -448,48 +511,48 @@ class ModelExecutor:
                     incremental_callback=incr_callback,
                     slot_bufs=incr_slot_bufs,
                 )
+            if isinstance(self.drafter, DeepseekV4DSpark):
+                if not hasattr(self.model_runner.model, "set_dspark_layers_to_capture"):
+                    raise ValueError(
+                        "DSPARK requires the target model to support "
+                        "set_dspark_layers_to_capture."
+                    )
+                self.model_runner.model.set_dspark_layers_to_capture(
+                    self.drafter.target_layer_ids
+                )
         else:
             self.drafter = None
 
-        # Single grammar handle: CapturableGrammarExecutor on CUDA (uses
-        # cudaLaunchHostFunc on a side stream so the xgrammar fill +
-        # H2D overlap with the forward, and is also CUDA-graph-capturable),
-        # EagerGrammarBuffers on non-CUDA (synchronous fallback).
-        # ``disable_capturable_grammar`` forces the eager path on CUDA too
-        # for parity-testing.
-        self.grammar_runtime = None
-        if config.grammar_backend != "none":
-            from tokenspeed.runtime.grammar.capturable_grammar import (
-                CapturableGrammarExecutor,
-                EagerGrammarBuffers,
-            )
-
-            use_captured = (
-                current_platform().is_nvidia and not config.disable_capturable_grammar
-            )
-            if use_captured:
-                self.grammar_runtime = CapturableGrammarExecutor(
-                    max_bs=max_bs,
-                    vocab_size=config.vocab_size,
-                    max_tokens_per_req=spec_num_tokens,
-                    device=self.device,
-                )
-            else:
-                self.grammar_runtime = EagerGrammarBuffers(
-                    max_bs=max_bs,
-                    vocab_size=config.vocab_size,
-                    max_tokens_per_req=spec_num_tokens,
-                    device=self.device,
-                )
+        self.grammar_runtime = create_grammar_runtime(
+            grammar_backend=config.grammar_backend,
+            disable_capturable=config.disable_capturable_grammar,
+            is_nvidia=current_platform().is_nvidia,
+            max_bs=max_bs,
+            vocab_size=config.vocab_size,
+            max_tokens_per_req=spec_num_tokens,
+            device=self.device,
+        )
 
         attn_backend.configure_runtime(
             sliding_window_size=model_runner.sliding_window_size,
-            req_to_page=self.req_to_page,
+            paged_cache_group_specs=tuple(token_to_kv_pool.paged_cache_group_specs),
+            paged_cache_group_page_counts=getattr(
+                token_to_kv_pool,
+                "paged_cache_group_page_counts",
+                None,
+            ),
         )
         if draft_attn_backend is not None:
             draft_attn_backend.configure_runtime(
                 sliding_window_size=model_runner.sliding_window_size,
-                req_to_page=self.req_to_page,
+                paged_cache_group_specs=tuple(
+                    getattr(draft_token_to_kv_pool, "paged_cache_group_specs", ())
+                ),
+                paged_cache_group_page_counts=getattr(
+                    draft_token_to_kv_pool,
+                    "paged_cache_group_page_counts",
+                    None,
+                ),
             )
 
         validate_paged_cache_group_ids(
@@ -502,38 +565,11 @@ class ModelExecutor:
                 draft_token_to_kv_pool.paged_cache_group_specs,
             )
 
-        processor = self.model_runner.model.logits_processor
-        dp_topology = DpSamplingTopology(
-            tp_rank=processor.tp_rank,
-            tp_size=processor.tp_size,
-            tp_group=processor.tp_group,
-            skip_all_gather=processor.skip_all_gather,
-            tie_word_embeddings=bool(
-                getattr(processor.config, "tie_word_embeddings", False)
-            ),
-        )
-        dp_support = resolve_dp_sampling_support(
+        self.dp_sampling_runtime_config = setup_dp_sampling(
+            model=self.model_runner.model,
+            sampling_backend=self.sampling_backend,
             requested=self.config.dp_sampling,
             drafter_available=self.drafter is not None,
-            backend_supports_verify=bool(
-                getattr(self.sampling_backend, "_SUPPORTS_DP_VERIFY", False)
-            ),
-            topology=dp_topology,
-        )
-
-        lm_head_rows = 0
-        if dp_support.enabled:
-            lm_head_weight = self.model_runner.model.lm_head.weight
-            if lm_head_weight.ndim < 1:
-                raise RuntimeError(
-                    "dp_sampling LM head weight must be at least 1D, got "
-                    f"{lm_head_weight.ndim}D"
-                )
-            lm_head_rows = int(lm_head_weight.shape[0])
-        dp_runtime_config = resolve_dp_sampling_runtime(
-            support=dp_support,
-            lm_head_rows=lm_head_rows,
-            topology=dp_topology,
             limits=DpSamplingRuntimeLimits(
                 runtime_vocab_size=self.config.vocab_size,
                 max_num_seqs=config.max_num_seqs,
@@ -543,26 +579,9 @@ class ModelExecutor:
                 device=self.device,
             ),
         )
-        self.dp_sampling_runtime_config = dp_runtime_config
         self._last_dp_sampling_route_log: (
             tuple[str, int, bool, int, int, bool, int] | None
         ) = None
-        if dp_runtime_config.enabled:
-            self.sampling_backend.configure_dp_sampling(dp_runtime_config)
-            processor.configure_dp_logits_layout(dp_runtime_config)
-        logger.info(
-            "Batch-DP spec-verify: requested=%s, infra_supports=%s, enabled=%s "
-            "min_bs=%s (drafter=%s, backend_supports_dp=%s, "
-            "tp_size=%s, tp_group=%s)",
-            dp_support.requested,
-            dp_support.infra_supports,
-            dp_support.enabled,
-            dp_runtime_config.min_bs,
-            dp_support.drafter_available,
-            dp_support.backend_supports_verify,
-            dp_support.tp_size,
-            dp_support.tp_group_set,
-        )
 
         self._active_multimodal_context = None
         self._active_positions_override = None
@@ -596,7 +615,7 @@ class ModelExecutor:
             token_to_kv_pool=token_to_kv_pool,
             input_buffers=self.input_buffers,
             config=config,
-            req_to_page=self.req_to_page,
+            page_table=self.draft_page_table,
             drafter=self.drafter,
         )
 
@@ -607,60 +626,22 @@ class ModelExecutor:
         if not self.prefill_graph.disable:
             self.prefill_graph.capture(self.forward_step)
 
-        # Encoder CUDA graph: install model-built wrappers by overriding
-        # modality encoder callables (e.g. ``image_encoder``, ``video_encoder``).
-        # Multimodal-encoder analogue of ``forward_step``'s ``CudaGraphWrapper``.
-        self.encoder_graph_wrappers = {}
-        _mm_model = self.model_runner.model
-        if (
-            hasattr(_mm_model, "make_encoder_cudagraph_wrappers")
-            and getattr(_mm_model, "is_multimodal_active", True)
-            and envs.TOKENSPEED_MM_ENABLE_ENCODER_CUDA_GRAPH.get()
-            and self.model_runner.server_args.mm_attention_backend != "flashinfer_cudnn"
-        ):
-            self.encoder_graph_wrappers = _mm_model.make_encoder_cudagraph_wrappers(
-                _mm_model.mapping
-            )
-
-            active_encoder_graph_wrappers = {}
-            for encoder_attr, wrapper in self.encoder_graph_wrappers.items():
-                if not hasattr(_mm_model, encoder_attr):
-                    logger.warning(
-                        "Skipping encoder CUDA graph wrapper for missing attribute %s",
-                        encoder_attr,
-                    )
-                    continue
-                setattr(_mm_model, encoder_attr, wrapper)
-                active_encoder_graph_wrappers[encoder_attr] = wrapper
-
-            self.encoder_graph_wrappers = active_encoder_graph_wrappers
+        # Encoder graphs are installed before KV-cache sizing and retained by
+        # the model runner; preserve the executor-level handle for callers.
+        self.encoder_graph_wrappers = getattr(
+            self.model_runner, "encoder_graph_wrappers", {}
+        )
 
         self.execution_stream = torch.cuda.Stream()
         self.log_step = 0
         self._seen_prefill_ids: set[str] = set()
         self._prev_decode_bs: int = 0
         self._sentinel_neg1 = torch.tensor(-1, device=self.device, dtype=torch.int64)
-        if config.model_is_mrope:
-            mrope_decode_capacity = self.input_buffers.max_num_tokens
-            # Double-buffered pinned host staging for the decode delta copy.
-            # Under overlap scheduling the next decode forward is dispatched
-            # before the previous result is synchronized, so a single reused
-            # pinned buffer could be refilled by the next step while the prior
-            # step's ``non_blocking=True`` H2D copy is still reading it (a race
-            # that corrupts M-RoPE deltas). Ping-pong two buffers so a buffer is
-            # never overwritten while its copy is in flight (overlap depth 1).
-            self._mrope_decode_deltas_cpu = [
-                self._make_mrope_decode_deltas_cpu(mrope_decode_capacity),
-                self._make_mrope_decode_deltas_cpu(mrope_decode_capacity),
-            ]
-            self._mrope_decode_deltas_cpu_idx = 0
-            self._mrope_decode_deltas_buf = torch.zeros(
-                mrope_decode_capacity, device=self.device, dtype=torch.int64
-            )
-        else:
-            self._mrope_decode_deltas_cpu = None
-            self._mrope_decode_deltas_cpu_idx = 0
-            self._mrope_decode_deltas_buf = None
+        self.mm_runtime = MultimodalRuntime(
+            model_is_mrope=config.model_is_mrope,
+            input_buffers=self.input_buffers,
+            device=self.device,
+        )
         # Decode stats — accumulated from synced results (no GPU sync needed)
         self.num_generated_tokens = 0
         self.num_decode_steps = 0
@@ -712,13 +693,6 @@ class ModelExecutor:
         dist.barrier()
         logger.info(f"Kernel tuning finished in {time.time() - tic:.1f}s")
 
-    @staticmethod
-    def _make_mrope_decode_deltas_cpu(size: int) -> torch.Tensor:
-        try:
-            return torch.zeros(size, dtype=torch.int64, pin_memory=True)
-        except RuntimeError:
-            return torch.zeros(size, dtype=torch.int64)
-
     @property
     def capturable_grammar(self):
         """Captured-graph grammar handle, or None on the eager-fallback path.
@@ -750,22 +724,22 @@ class ModelExecutor:
             else None
         )
 
-    def _mirror_full_history_table_into_req_to_page(
-        self, forward_op, block_tables
-    ) -> None:
-        """Expose the full-history table to ordinary speculative consumers.
+    def _publish_draft_page_table(self, forward_op, block_tables) -> None:
+        """Publish the full-history table into the batch-ordered draft table.
 
-        On the cache-contract path this normally stays off: mirroring into
-        req_to_page would resurrect the legacy path for the target. A
-        block-decode drafter is the exception. It derives its own KV write
-        locations from req_to_page (the scheduler never allocates draft
-        pages, so nothing else can), and its draft pool shares the target's
-        page-id geometry by construction. Leaving the table zeroed there
-        does not fall back to anything -- it silently addresses page 0 for
-        every request.
+        Every draft reads its pages from ``draft_page_table`` (the drafter
+        passes no cache metadata). The table is batch-ordered -- row ``i`` is
+        batch position ``i`` -- so the draft indexes it directly by batch row,
+        no page_table round-trip. Ids arrive in the allocator's logical pages
+        and are published in draft-page units (see ``_draft_page_ratio``).
         """
         if (
-            self.drafter is None
+            getattr(
+                getattr(self, "attn_backend", None),
+                "cache_group_tables_replace_draft_page_table",
+                False,
+            )
+            or self.drafter is None
             or not block_tables
             or self._full_history_group_id is None
         ):
@@ -779,34 +753,26 @@ class ModelExecutor:
         if table is None:
             return
         bs = len(forward_op.request_pool_indices)
-        if self._mirror_idx_cpu is None or self._mirror_idx_cpu.shape[0] < bs:
-            cap = max(bs, self.input_buffers.max_bs)
-            self._mirror_idx_cpu = torch.empty(cap, dtype=torch.long, pin_memory=True)
-            self._mirror_idx_dev = torch.empty(
-                cap, dtype=torch.long, device=self.device
-            )
-        self._mirror_idx_cpu[:bs] = torch.tensor(
-            forward_op.request_pool_indices, dtype=torch.long
-        )
-        self._mirror_idx_dev[:bs].copy_(self._mirror_idx_cpu[:bs], non_blocking=True)
-        idx = self._mirror_idx_dev[:bs]
         width = table.shape[1]
-        max_width = self.req_to_page.shape[1]
-        if self._mirror_row_buf is None:
-            self._mirror_row_buf = torch.zeros(
-                (self.input_buffers.max_bs, max_width),
-                dtype=self.req_to_page.dtype,
-                device=self.device,
+        max_width = self.draft_page_table.shape[1]
+        rows = self.draft_page_table[:bs]
+        if self._draft_page_ratio > 1:
+            # -1 pads clamp into logical page 0, itself reserved as the null page.
+            expand_page_table(
+                table,
+                logical_page_size=self._logical_page_size,
+                kernel_page_size=self._draft_page_size,
+                max_kernel_pages=max_width,
+                out=rows,
             )
-        # Staged rows + index_copy_ (advanced-index setitem costs ~150us dispatch).
-        rows = self._mirror_row_buf[:bs]
+            return
+        # -1 column pads -> dummy page 0 (negative locs otherwise).
         rows[:, :width].copy_(table)
-        rows[:, :width].clamp_min_(
-            0
-        )  # -1 column pads -> dummy page 0 (negative locs otherwise)
+        rows[:, :width].clamp_min_(0)
         if width < max_width:
             rows[:, width:].zero_()
-        self.req_to_page.index_copy_(0, idx, rows)
+        # Graph replay reads padded_bs rows; stale ids past bs alias another request's pages.
+        self.draft_page_table[bs:].zero_()
 
     @nvtx_range("target_forward", color="red")
     def _run_target_forward(self, bs: int, ctx: ForwardContext, req_pool_indices):
@@ -866,10 +832,10 @@ class ModelExecutor:
         """Clamp spec-verify accept so committed length never exceeds
         ``context_len``.
 
-        ``req_to_page`` is sized for ``context_len + spec_num_tokens`` pages. A
+        ``page_table`` is sized for ``context_len + spec_num_tokens`` pages. A
         request at the context limit whose ``max_new_tokens`` termination lags a
         step can accept past ``context_len``, so its next draft block needs a
-        page beyond ``req_to_page``'s width — an out-of-bounds access that hangs
+        page beyond ``page_table``'s width — an out-of-bounds access that hangs
         the attention kernel. Clamping to the remaining budget keeps the table in
         range; the request is still removed a step later. Deterministic in
         ``valid_cache_lengths`` / ``accept_lengths``, so no cross-rank divergence.
@@ -900,7 +866,7 @@ class ModelExecutor:
         tensor, not the persistent ``_accept_length_buf``: the verify path also
         mirrors accept counts into ``_output_pack_buf``, and an in-place clamp
         would leave that mirror (read by the packed-D2H fast path) uncapped,
-        reserving a draft block past ``req_to_page``'s width and hanging the
+        reserving a draft block past ``page_table``'s width and hanging the
         kernel. A fresh tensor forces the safe two-D2H fallback.
 
         Only decode rows ``[num_extends:bs]`` carry an accept delta; prefill rows
@@ -1313,7 +1279,6 @@ class ModelExecutor:
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
-            req_to_page=self.req_to_page,
             bs=0,
             num_extends=0,
             input_num_tokens=0,
@@ -1348,7 +1313,7 @@ class ModelExecutor:
                     bs=0,
                     ctx=ctx,
                     sampling_info=sampling_info,
-                    req_to_page=self.req_to_page,
+                    page_table=self.draft_page_table,
                 )
             return
 
@@ -1384,7 +1349,6 @@ class ModelExecutor:
                 draft_ctx = ForwardContext(
                     attn_backend=self.drafter.attn_backend,
                     token_to_kv_pool=self.drafter.token_to_kv_pool,
-                    req_to_page=self.drafter.req_to_page,
                     bs=0,
                     num_extends=0,
                     input_num_tokens=0,
@@ -1400,25 +1364,6 @@ class ModelExecutor:
                     out_cache_loc=empty,
                     spec_step_idx=step_idx,
                 )
-
-    def update_block_table(self, forward_op) -> ModelExecutionResult:
-        # Group-aware backends consume CacheBatchMetadata directly. Without a
-        # full-history group there is no unambiguous table to mirror into the
-        # legacy single-table req_to_page view.
-        if (
-            self._cache_runtime_contract is not None
-            and self._full_history_group_id is None
-        ):
-            return
-        # Update page tables on the default stream before switching to execution stream.
-        # HostTodevice segment begins
-        with nvtx_range("update_block_table", color="cyan"):
-            update_block_table(
-                forward_op=forward_op,
-                device=self.device,
-                req_to_page=self.req_to_page,
-                history_group_id=self._full_history_group_id,
-            )
 
     def zero_cache_pages(self, pages):
         """Clear newly owned pages and return a CUDA completion event when needed."""
@@ -1545,7 +1490,8 @@ class ModelExecutor:
             # Outside the graph: in-graph sites only OR into the flag buffer.
             self.nan_guard.reset(bs)
             cache_metadata = None
-            if self._cache_runtime_contract is not None and bs > 0:
+            block_tables = {}
+            if bs > 0:
                 # Validate and pack the per-group tables once for this batch.
                 cache_metadata = CacheBatchMetadata.from_forward_op(
                     forward_op,
@@ -1554,31 +1500,38 @@ class ModelExecutor:
                     num_requests=bs,
                 )
                 block_tables = dict(cache_metadata.tables(active_forward_op=forward_op))
-                # A block-decode drafter reads its draft KV write locations
-                # out of req_to_page, which the scheduler leaves empty.
-                self._mirror_full_history_table_into_req_to_page(
-                    forward_op, block_tables
-                )
-            else:
-                block_tables = block_tables_from_forward_op(
-                    forward_op,
-                    device=self.device,
-                    num_reqs=bs,
-                )
-                self._mirror_full_history_table_into_req_to_page(
-                    forward_op, block_tables
-                )
+            # out_cache_loc reads the batch-ordered full-history table (row i ==
+            # batch position i). Without a full-history group the zeroed draft
+            # table stands in (out_cache_loc then lands on the dummy page 0;
+            # such pools address their KV through their own per-group tables).
+            page_table = (
+                block_tables.get(self._full_history_group_id)
+                if self._full_history_group_id is not None
+                else None
+            )
+            if page_table is None:
+                page_table = self.draft_page_table
+            # Drafts read their pages from the batch-ordered draft page table.
+            self._publish_draft_page_table(forward_op, block_tables)
             decode_input_ids = self.input_buffers.fill_input_buffers(
                 forward_op=forward_op,
                 runtime_states=self.runtime_states,
-                req_to_page=self.req_to_page,
                 total_tokens=total_tokens,
+                page_table=page_table,
             )
+            if self.drafter is not None and hasattr(
+                self.drafter, "prepare_request_state"
+            ):
+                self.drafter.prepare_request_state(
+                    forward_op.request_ids,
+                    forward_op.request_pool_indices,
+                    num_extends,
+                )
             if timing_enabled:
                 input_fill_done = time.perf_counter()
                 input_fill_ms = (input_fill_done - timing_start) * 1000.0
             mrope_start = time.perf_counter() if timing_enabled else 0.0
-            self._active_positions_override = self._build_mrope_positions_override(
+            self._active_positions_override = self.mm_runtime.build_positions_override(
                 forward_op=forward_op,
                 multimodal_context=multimodal_context,
                 total_tokens=total_tokens,
@@ -1638,7 +1591,6 @@ class ModelExecutor:
                 ctx = ForwardContext(
                     attn_backend=self.attn_backend,
                     token_to_kv_pool=self.token_to_kv_pool,
-                    req_to_page=self.req_to_page,
                     bs=bs,
                     num_extends=num_extends,
                     input_num_tokens=total_tokens,
@@ -1711,7 +1663,7 @@ class ModelExecutor:
                         bs=bs,
                         ctx=ctx,
                         sampling_info=sampling_info,
-                        req_to_page=self.req_to_page,
+                        page_table=self.draft_page_table,
                         extend_with_prefix=extend_with_prefix,
                         extend_prefix_lens=self.input_buffers.extend_prefix_lens_buf[
                             :num_extends
@@ -1815,18 +1767,9 @@ class ModelExecutor:
             if timing_enabled and (
                 num_extends > 0 or self.log_step < 64 or self.log_step % 100 == 0
             ):
-                has_mm = (
-                    multimodal_context is not None and multimodal_context.has_inputs()
+                has_mm, mm_count, mm_delta_count = MultimodalRuntime.timing_counts(
+                    multimodal_context
                 )
-                mm_count = 0
-                mm_delta_count = 0
-                if has_mm:
-                    for mm_input in multimodal_context.mm_inputs:
-                        if mm_input is None:
-                            continue
-                        mm_count += 1
-                        if mm_input.mrope_position_delta is not None:
-                            mm_delta_count += 1
                 logger.info(
                     "mm_timing forward_execute_ms total=%.3f input_fill=%.3f "
                     "mrope=%.3f sampling=%.3f forward_step=%.3f output_d2h=%.3f "
@@ -1869,160 +1812,3 @@ class ModelExecutor:
             self.runtime_states.write_remote_spec_candidate_ids(
                 req_pool_idx, candidate_ids
             )
-
-    def _expand_mrope_from_input(self, mm_input, seq_len: int) -> torch.Tensor:
-        # Cache delta expansion for retracted/chunked requests.
-        if mm_input.mrope_position_delta_repeated_cache is None:
-            mm_input.mrope_position_delta_repeated_cache = (
-                (mm_input.mrope_position_delta - 1).flatten().unsqueeze(0).repeat(3, 1)
-            )
-        return mm_input.mrope_position_delta_repeated_cache + seq_len
-
-    @staticmethod
-    def _mrope_delta_scalar(mm_input) -> int:
-        delta = getattr(mm_input, "mrope_position_delta_scalar", None)
-        if delta is not None:
-            return int(delta)
-        tensor = getattr(mm_input, "mrope_position_delta", None)
-        if tensor is None:
-            return 0
-        delta = int(tensor.flatten()[0].item())
-        mm_input.mrope_position_delta_scalar = delta
-        return delta
-
-    def _build_decode_mrope_positions_override(
-        self,
-        forward_op,
-        mm_inputs,
-        total_tokens: int,
-    ) -> torch.Tensor:
-        if (
-            self._mrope_decode_deltas_cpu is None
-            or self._mrope_decode_deltas_buf is None
-        ):
-            raise RuntimeError(
-                "M-RoPE decode buffers were not initialized for this model"
-            )
-
-        base_positions = self.input_buffers.positions_buf[:total_tokens]
-        # Ping-pong the pinned host staging buffer (see __init__): the previous
-        # step's non_blocking H2D copy may still be reading the other buffer.
-        cpu_staging = self._mrope_decode_deltas_cpu[self._mrope_decode_deltas_cpu_idx]
-        self._mrope_decode_deltas_cpu_idx ^= 1
-        token_deltas_cpu = cpu_staging[:total_tokens]
-
-        offset = 0
-        has_nonzero_delta = False
-        for batch_idx, input_len in enumerate(forward_op.input_lengths):
-            input_len = int(input_len)
-            if input_len <= 0:
-                continue
-
-            delta = 0
-            mm_input = mm_inputs[batch_idx] if batch_idx < len(mm_inputs) else None
-            # Honor scalar-only deltas: an upstream payload may set
-            # mrope_position_delta_scalar while leaving the tensor field
-            # mrope_position_delta as None (positions precomputed upstream).
-            # _mrope_delta_scalar handles scalar, tensor, and the absent case
-            # (returns 0), so call it whenever an mm_input is present.
-            if mm_input is not None:
-                delta = self._mrope_delta_scalar(mm_input)
-                has_nonzero_delta = has_nonzero_delta or delta != 0
-
-            token_deltas_cpu[offset : offset + input_len].fill_(delta)
-            offset += input_len
-
-        if offset != total_tokens:
-            token_deltas_cpu[offset:total_tokens].zero_()
-
-        if has_nonzero_delta:
-            token_deltas = self._mrope_decode_deltas_buf[:total_tokens]
-            token_deltas.copy_(token_deltas_cpu, non_blocking=True)
-            mrope_base = base_positions + token_deltas
-        else:
-            mrope_base = base_positions
-
-        self.input_buffers.mrope_positions_buf[:, :total_tokens].copy_(
-            mrope_base.unsqueeze(0).expand(3, -1)
-        )
-        return self.input_buffers.mrope_positions_buf[:, :total_tokens]
-
-    def _build_mrope_positions_override(
-        self,
-        forward_op,
-        multimodal_context,
-        total_tokens: int,
-    ) -> torch.Tensor | None:
-        if not self.config.model_is_mrope or total_tokens == 0:
-            return None
-
-        is_prefill = forward_op.num_extends() > 0
-        base_positions = self.input_buffers.positions_buf[:total_tokens]
-        mm_inputs = (
-            multimodal_context.mm_inputs
-            if multimodal_context is not None and multimodal_context.has_inputs()
-            else []
-        )
-        if not mm_inputs:
-            mrope_positions = self.input_buffers.mrope_positions_buf[:, :total_tokens]
-            mrope_positions.copy_(
-                base_positions.unsqueeze(0).expand_as(mrope_positions)
-            )
-            return mrope_positions
-
-        if not is_prefill:
-            return self._build_decode_mrope_positions_override(
-                forward_op=forward_op,
-                mm_inputs=mm_inputs,
-                total_tokens=total_tokens,
-            )
-
-        pos_chunks = torch.split(base_positions, list(forward_op.input_lengths), dim=0)
-        mrope_chunks = []
-        for batch_idx, base_chunk in enumerate(pos_chunks):
-            mm_input = mm_inputs[batch_idx] if batch_idx < len(mm_inputs) else None
-            # Fall back to linear only when there is neither a per-token mrope table
-            # nor a transferred scalar delta. A decode-only mm_input may carry just
-            # the delta (post-image decode positions = base+delta); it must skip the
-            # fallback and take the base+delta branch below.
-            if mm_input is None or (
-                mm_input.mrope_positions is None
-                and mm_input.mrope_position_delta is None
-            ):
-                mrope_chunks.append(base_chunk.unsqueeze(0).expand(3, -1))
-                continue
-
-            if (
-                is_prefill
-                and mm_input.mrope_positions is not None
-                and batch_idx < len(forward_op.extend_prefix_lens)
-            ):
-                start = int(forward_op.extend_prefix_lens[batch_idx])
-                end = start + int(forward_op.input_lengths[batch_idx])
-                positions = mm_input.mrope_positions[:, start:end]
-                if positions.numel() != 0:
-                    mrope_chunks.append(
-                        positions.to(device=self.device, dtype=torch.int64)
-                    )
-                    continue
-                if base_chunk.numel() == 1:
-                    seq_len = int(base_chunk[-1].item()) + 1
-                    mrope_chunks.append(
-                        self._expand_mrope_from_input(mm_input, seq_len).to(
-                            device=self.device, dtype=torch.int64
-                        )
-                    )
-                    continue
-
-            delta = mm_input.mrope_position_delta
-            if delta is None:
-                delta = torch.zeros(1, dtype=torch.int64)
-            delta = delta.flatten()[0].to(device=self.device, dtype=torch.int64)
-            # Decode positions need (mrope_delta - 1) + seq_len. positions_buf
-            # already stores the per-token zero-based position (seq_len - 1 for
-            # decode), so this is the same value without a GPU-to-CPU sync.
-            mrope_chunks.append((base_chunk + delta).unsqueeze(0).expand(3, -1))
-
-        mrope_positions = torch.cat(mrope_chunks, dim=1).contiguous()
-        self.input_buffers.mrope_positions_buf[:, :total_tokens].copy_(mrope_positions)
-        return self.input_buffers.mrope_positions_buf[:, :total_tokens]

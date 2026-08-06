@@ -45,8 +45,6 @@ from tokenspeed_kernel.ops.attention.triton.linear.index import (
     set_total_chunks_hint_uniform,
 )
 
-from tokenspeed.runtime.configs.cache_runtime import cache_debug_enabled
-from tokenspeed.runtime.configs.paged_cache_spec import LINEAR_ATTENTION
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
     current_forward_ctx,
@@ -56,6 +54,12 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
     init_backend_cuda_graph_state,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+    cache_debug_enabled,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    LINEAR_ATTENTION,
 )
 from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
     causal_conv1d_fn,
@@ -67,7 +71,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
-    from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
 # Default cache group id carrying GDN/Mamba state pages.
@@ -303,9 +307,7 @@ class LayerMappedKVPool:
     translates global layer IDs (e.g., 3, 7, 11) to pool indices (0, 1, 2).
     """
 
-    def __init__(
-        self, inner_pool: BaseTokenToKVPool, full_attention_layer_ids: list[int]
-    ):
+    def __init__(self, inner_pool: CachePool, full_attention_layer_ids: list[int]):
         self.inner = inner_pool
         self.layer_ids = list(full_attention_layer_ids)
         self.layer_map = {
@@ -402,15 +404,16 @@ class MambaAttnBackend(AttentionBackend):
         self.pad_slot_id = -1
         # Kernel family: GDN (scalar decay) or KDA (per-channel, Kimi-K3).
         self.is_kda = is_kda
-        # KDA prefill kernel policy, resolved by the registry: "auto" picks
-        # the fastest available kernel (cutedsl_kda > flashkda > fla), "fla" forces
-        # the portable scan (decode is unaffected either way).
-        self.kda_backend = "fla"
+        # KDA prefill kernel policy: unresolved "auto" delegates to the registry;
+        # otherwise this is cutedsl_kda, flashkda, or fla. Decode is unaffected.
+        self.kda_backend = (kda_backend or "auto").strip().lower()
         if self.is_kda:
-            self.kda_backend = (kda_backend or "auto").strip().lower()
-            if self.kda_backend == "auto":
-                self.kda_backend = "fla"
-            if self.kda_backend not in ("fla", "flashkda", "cutedsl_kda"):
+            if self.kda_backend not in (
+                "auto",
+                "fla",
+                "flashkda",
+                "cutedsl_kda",
+            ):
                 raise ValueError(
                     "--kda-backend must be one of auto, fla, flashkda, cutedsl_kda; "
                     f"got {self.kda_backend!r}"
@@ -1118,7 +1121,7 @@ class MambaAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
-        req_to_page: torch.Tensor = None,
+        page_table: torch.Tensor = None,
         **kwargs,
     ):
         num_padding = kwargs.get("num_padding", 0)
@@ -1870,6 +1873,10 @@ class HybridLinearAttnBackend(AttentionBackend):
     def chunked_prefill_metadata(self):
         return self.full_attn_backend.chunked_prefill_metadata
 
+    @property
+    def data_type(self):
+        return self.full_attn_backend.data_type
+
     def override_num_extends(self, num_extends: int):
         return self.full_attn_backend.override_num_extends(num_extends)
 
@@ -1901,6 +1908,11 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     def _backends(self):
         return [self.full_attn_backend, self.linear_attn_backend]
+
+    def set_cache_pool(self, cache_pool) -> None:
+        self.cache_pool = cache_pool
+        for backend in self._backends():
+            backend.set_cache_pool(cache_pool)
 
     def _backend_for_layer(self, layer_id: int) -> AttentionBackend:
         if self.linear_attn_backend is None or layer_id in self.full_attn_layers:

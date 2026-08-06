@@ -7,6 +7,39 @@ from tokenspeed.runtime.layers.moe import topk as topk_module
 from tokenspeed.runtime.layers.moe.topk import TopKConfig, select_experts
 
 
+def test_plain_route_uses_kernel_package_softmax_topk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[int, bool, float]] = []
+
+    def fake_softmax_topk(
+        router_logits: torch.Tensor,
+        topk: int,
+        *,
+        renormalize: bool,
+        routed_scaling_factor: float,
+        enable_pdl: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del enable_pdl
+        calls.append((topk, renormalize, routed_scaling_factor))
+        shape = (router_logits.shape[0], topk)
+        return torch.ones(shape), torch.zeros(shape, dtype=torch.int64)
+
+    monkeypatch.setattr(topk_module, "moe_softmax_topk", fake_softmax_topk)
+    output = select_experts(
+        hidden_states=torch.empty((2, 4), dtype=torch.float32),
+        router_logits=torch.empty((2, 8), dtype=torch.float32),
+        topk_config=TopKConfig(
+            top_k=2,
+            renormalize=True,
+            routed_scaling_factor=2.5,
+        ),
+    )
+
+    assert calls == [(2, True, 2.5)]
+    assert output.topk_weights.shape == output.topk_ids.shape == (2, 2)
+
+
 @pytest.mark.parametrize("renormalize", [False, True])
 def test_correction_bias_route_forwards_renormalize(
     monkeypatch: pytest.MonkeyPatch,

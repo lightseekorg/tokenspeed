@@ -164,19 +164,21 @@ class MemoryExecutorTest(unittest.TestCase):
     def setUp(self):
         try:
             import torch
+            from cache_pool_test_utils import plan_fields
             from tokenspeed_scheduler import Cache
 
             from tokenspeed.runtime.cache.executor.memory_executor import (
                 MemoryExecutor,
             )
             from tokenspeed.runtime.cache.transfer.types import CacheKind
-            from tokenspeed.runtime.configs.lcm_layouts import qwen_gdn_lcm_fields
-            from tokenspeed.runtime.configs.lcm_memory_plan import plan_lcm_fields
-            from tokenspeed.runtime.layers.attention.kv_cache.lcm_mha import (
-                LcmMHATokenToKVPool,
+            from tokenspeed.runtime.layers.attention.kv_cache.hybrid_mha import (
+                HybridMHATokenToKVPool,
             )
             from tokenspeed.runtime.layers.attention.kv_cache.mha import (
                 MHATokenToKVPool,
+            )
+            from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen35 import (
+                qwen_gdn_cache_fields,
             )
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs torch + tokenspeed_kernel + scheduler ext: {exc}")
@@ -189,27 +191,44 @@ class MemoryExecutorTest(unittest.TestCase):
         self.CacheKind = CacheKind
         self.MemoryExecutor = MemoryExecutor
         self.MHATokenToKVPool = MHATokenToKVPool
-        self.LcmMHATokenToKVPool = LcmMHATokenToKVPool
-        self.qwen_gdn_lcm_fields = qwen_gdn_lcm_fields
-        self.plan_lcm_fields = plan_lcm_fields
+        self.HybridMHATokenToKVPool = HybridMHATokenToKVPool
+        self.qwen_gdn_cache_fields = qwen_gdn_cache_fields
+        self.plan_fields = plan_fields
 
     def _pool(self):
-        kwargs = dict(
-            size=32,
-            dtype=self.torch.bfloat16,
-            head_num=1,
-            head_dim=8,
-            layer_num=4,
-            device="cuda",
-            enable_memory_saver=False,
-            max_batch_size=2,
-            max_context_len=64,
-            page_size=4,
-            rank=0,
-            layer_types=LAYER_TYPES,
-            sliding_window_tokens=128,
-            enable_alt_stream=False,
+        from cache_pool_test_utils import make_mha_memory_plan
+
+        kwargs = {
+            "size": 32,
+            "dtype": self.torch.bfloat16,
+            "head_num": 1,
+            "head_dim": 8,
+            "layer_num": 4,
+            "device": "cuda",
+            "enable_memory_saver": False,
+            "page_size": 4,
+            "rank": 0,
+            "layer_types": LAYER_TYPES,
+            "sliding_window_tokens": 128,
+        }
+        from cache_pool_test_utils import make_layer_group_ids
+
+        kwargs["memory_plan"] = make_mha_memory_plan(
+            size=kwargs["size"],
+            page_size=kwargs["page_size"],
+            layer_num=kwargs["layer_num"],
+            kv_heads=kwargs["head_num"],
+            head_dim=kwargs["head_dim"],
+            dtype=kwargs["dtype"],
+            layer_types=kwargs["layer_types"],
+            sliding_window_tokens=kwargs["sliding_window_tokens"],
         )
+        kwargs["layer_group_ids"] = make_layer_group_ids(
+            layer_num=kwargs["layer_num"],
+            layer_types=kwargs["layer_types"],
+            sliding_window_tokens=kwargs["sliding_window_tokens"],
+        )
+        kwargs.pop("sliding_window_tokens", None)
         return self.MHATokenToKVPool(**kwargs)
 
     def _executor(self, pool):
@@ -303,30 +322,8 @@ class MemoryExecutorTest(unittest.TestCase):
         # _setup_layerwise_loadback right after submit).
         self.assertIsNone(executor.get_producer_index(self.CacheKind.KV, 9))
 
-    def test_layer_event_mapping(self):
-        pool = self._pool()
-        executor = self._executor(pool)
-        mirror = executor.mirror
-        self._fill_device_pages(mirror, [3])
-        executor.submit_writeback([1], [[3]], [[0]])
-        executor.flush()
-        self._drain(executor, 1)
-
-        executor.submit_loadback([2], [[0]], [[3]])
-        executor.flush()
-        producer_idx = executor.get_producer_index(self.CacheKind.KV, 2)
-        producer_event = executor._counter.events[producer_idx]
-        # Paired slab layers share their V slab's event; distinct groups
-        # get distinct events; finish_event covers every copy.
-        self.assertIs(producer_event.load_events[0], producer_event.load_events[1])
-        self.assertIs(producer_event.load_events[2], producer_event.load_events[3])
-        self.assertIsNot(producer_event.load_events[0], producer_event.load_events[2])
-        self.torch.cuda.synchronize()
-        self.assertTrue(producer_event.finish_event.query())
-        self._drain(executor, 1)
-
     def _state_pool(self):
-        fields = self.qwen_gdn_lcm_fields(
+        fields = self.qwen_gdn_cache_fields(
             layer_types=GDN_LAYER_TYPES,
             layer_group_ids=(
                 "linear_attention_0",
@@ -342,7 +339,7 @@ class MemoryExecutorTest(unittest.TestCase):
             ssm_shape=(2, 8),
             ssm_element_size=2,
         )
-        plan = self.plan_lcm_fields(
+        plan = self.plan_fields(
             fields,
             logical_block_tokens=4,
             num_lcm_blocks=4,
@@ -350,35 +347,33 @@ class MemoryExecutorTest(unittest.TestCase):
             max_padding_fraction=1.0,
         )
         max_packing = max(group.cache_blocks_per_lcm_block for group in plan.groups)
-        kwargs = dict(
-            size=plan.num_lcm_blocks * max_packing * plan.logical_block_tokens,
-            dtype=self.torch.bfloat16,
-            head_num=1,
-            head_dim=8,
-            layer_num=4,
-            device="cuda",
-            enable_memory_saver=False,
-            max_batch_size=2,
-            max_context_len=64,
-            page_size=4,
-            rank=0,
-            layer_types=GDN_LAYER_TYPES,
-            sliding_window_tokens=None,
-            enable_alt_stream=False,
-            memory_plan=plan,
-            layer_group_ids=(
+        kwargs = {
+            "size": plan.num_lcm_blocks * max_packing * plan.logical_block_tokens,
+            "dtype": self.torch.bfloat16,
+            "head_num": 1,
+            "head_dim": 8,
+            "layer_num": 4,
+            "device": "cuda",
+            "enable_memory_saver": False,
+            "page_size": 4,
+            "rank": 0,
+            "layer_types": GDN_LAYER_TYPES,
+            "sliding_window_tokens": None,
+            "memory_plan": plan,
+            "layer_group_ids": (
                 "linear_attention_0",
                 "full_attention",
                 "linear_attention_0",
                 "full_attention",
             ),
-            state_field_dtypes={
+            "state_field_dtypes": {
                 f"layer.{layer_id}.{field}": self.torch.bfloat16
                 for layer_id in (0, 2)
                 for field in ("conv", "ssm")
             },
-        )
-        return self.LcmMHATokenToKVPool(**kwargs)
+        }
+        kwargs.pop("sliding_window_tokens", None)
+        return self.HybridMHATokenToKVPool(**kwargs)
 
     def _fill_spans(self, mirror, device_pages):
         for tensor_idx, ((dev, _), span) in enumerate(

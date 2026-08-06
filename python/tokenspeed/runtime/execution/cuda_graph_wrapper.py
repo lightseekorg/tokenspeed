@@ -31,9 +31,6 @@ import torch
 import torch.distributed as dist
 import tqdm
 
-from tokenspeed.runtime.configs.paged_cache_spec import (
-    compute_max_logical_pages_for_capture,
-)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
@@ -41,6 +38,9 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 )
 from tokenspeed.runtime.layers.attention.backends.base import (
     init_backend_cuda_graph_state,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    compute_max_logical_pages_for_capture,
 )
 from tokenspeed.runtime.sampling.backends.base import CUDA_GRAPH_VARIANT_DEFAULT
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
@@ -56,7 +56,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.model_executor import ModelExecutorConfig
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
-    from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 
 logger = get_colorful_logger(__name__)
@@ -179,7 +179,7 @@ class CudaGraphWrapper:
     Callers always use the same interface::
 
         output_tokens, output_lengths, output_logprobs = runner(
-            bs, ctx, sampling_info, req_to_page,
+            bs, ctx, sampling_info, page_table,
             extend_with_prefix=..., extend_prefix_lens=...,
         )
 
@@ -191,11 +191,11 @@ class CudaGraphWrapper:
         self,
         forward_func: Callable,
         attn_backend: AttentionBackend,
-        token_to_kv_pool: BaseTokenToKVPool,
+        token_to_kv_pool: CachePool,
         input_buffers: InputBuffers,
         config: ModelExecutorConfig,
         draft_attn_backend: AttentionBackend | None = None,
-        draft_token_to_kv_pool: BaseTokenToKVPool | None = None,
+        draft_token_to_kv_pool: CachePool | None = None,
         drafter: BaseDrafter | None = None,
         capturable_grammar=None,
         eager_grammar_buffers=None,
@@ -238,6 +238,11 @@ class CudaGraphWrapper:
             attn_backend,
             self.max_bs,
             paged_cache_group_specs=tuple(token_to_kv_pool.paged_cache_group_specs),
+            paged_cache_group_page_counts=getattr(
+                token_to_kv_pool,
+                "paged_cache_group_page_counts",
+                None,
+            ),
             logical_page_size=getattr(
                 getattr(token_to_kv_pool, "runtime_contract", None),
                 "block_size",
@@ -252,6 +257,11 @@ class CudaGraphWrapper:
                 self.max_bs,
                 paged_cache_group_specs=tuple(
                     draft_token_to_kv_pool.paged_cache_group_specs
+                ),
+                paged_cache_group_page_counts=getattr(
+                    draft_token_to_kv_pool,
+                    "paged_cache_group_page_counts",
+                    None,
                 ),
                 logical_page_size=getattr(
                     getattr(draft_token_to_kv_pool, "runtime_contract", None),
@@ -270,16 +280,14 @@ class CudaGraphWrapper:
                     if gid in target_ps:
                         draft_ps[gid] = target_ps[gid]
 
-            # Drafter (Eagle) is constructed with the target's req_to_page
-            # (ModelExecutor passes the same self.req_to_page to both), and the
-            # replay path hands both backends the same req_pool_indices. The
-            # block-table gather is req_to_page[req_pool_indices] (see
-            # _create_block_kv_indices; it does not depend on seq_lens), so both
-            # backends would compute identical block_kv_indices. When the backing
-            # buffer shapes/dtypes also line up, point the draft backend at the
-            # target's buffer and skip its gather+copy in the replay path: the
-            # target's metadata prep runs first and populates the shared buffer
-            # (see init_forward_metadata_replay_cuda_graph).
+            # Target and draft resolve the same batch-ordered full-history
+            # table (the target from cache metadata, the draft from the
+            # published draft page table), so both backends would compute
+            # identical block_kv_indices. When the backing buffer shapes/dtypes
+            # also line up, point the draft backend at the target's buffer and
+            # skip its gather+copy in the replay path: the target's metadata
+            # prep runs first and populates the shared buffer (see
+            # init_forward_metadata_replay_cuda_graph).
             target_kv = getattr(attn_backend, "decode_cuda_graph_kv_indices", None)
             draft_kv = getattr(draft_attn_backend, "decode_cuda_graph_kv_indices", None)
             if (
@@ -759,14 +767,26 @@ class CudaGraphWrapper:
         Group-table captures pass page 0; backends using a sentinel tail keep
         -1. See the MHA replay guard for the padding contract.
         """
-        if padded_bs <= actual_bs:
-            return block_tables
+        if actual_bs < 0 or padded_bs < actual_bs:
+            raise RuntimeError(
+                "Grouped cache table batch contract requires "
+                f"0 <= actual_bs <= padded_bs, got {actual_bs=} {padded_bs=}"
+            )
         out = {}
         for key, table in block_tables.items():
             if not isinstance(table, torch.Tensor):
                 out[key] = table
                 continue
+            if table.ndim < 1:
+                raise RuntimeError(
+                    f"Grouped cache table {key!r} must have a batch dimension"
+                )
             rows = int(table.shape[0])
+            if rows not in {actual_bs, padded_bs}:
+                raise RuntimeError(
+                    f"Grouped cache table {key!r} has {rows} rows; expected "
+                    f"actual_bs={actual_bs} or padded_bs={padded_bs}"
+                )
             if rows == padded_bs:
                 out[key] = table
                 continue
@@ -810,7 +830,7 @@ class CudaGraphWrapper:
         actual_bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        req_to_page: torch.Tensor,
+        page_table: torch.Tensor,
         forward_mode: ForwardMode,
         **kwargs,
     ):
@@ -827,6 +847,16 @@ class CudaGraphWrapper:
         )
         draft_uses_paged_groups = self.draft_attn_backend is not None and getattr(
             self.draft_attn_backend, "uses_paged_cache_groups", False
+        )
+        target_uses_cache_groups = getattr(
+            self.attn_backend,
+            "uses_cache_groups",
+            False,
+        )
+        draft_uses_cache_groups = self.draft_attn_backend is not None and getattr(
+            self.draft_attn_backend,
+            "uses_cache_groups",
+            False,
         )
         if paged_cache_block_tables is not None and (
             target_uses_paged_groups or draft_uses_paged_groups
@@ -856,27 +886,36 @@ class CudaGraphWrapper:
                     kwargs["paged_cache_block_table_base_offsets"] = (
                         paged_cache_block_table_base_offsets
                     )
-        if block_tables is not None and getattr(
-            self.attn_backend, "uses_cache_groups", False
-        ):
-            table_batch_size = next(
-                (
-                    int(table.shape[0])
-                    for table in block_tables.values()
-                    if isinstance(table, torch.Tensor)
-                ),
-                int(req_pool_indices.shape[0]),
+        padded_block_tables = None
+        if block_tables is not None and (
+            (
+                target_uses_cache_groups
+                and not getattr(self.attn_backend, "tables_self_padding", False)
             )
+            or (
+                draft_uses_cache_groups
+                and not getattr(
+                    self.draft_attn_backend,
+                    "tables_self_padding",
+                    False,
+                )
+            )
+        ):
+            # Normalize once so target and draft consume the same authoritative
+            # replay rows. In particular, an actual batch smaller than the
+            # selected graph batch must not reach the draft as an unpadded map.
+            padded_block_tables = self._pad_block_tables_to_padded_bs(
+                block_tables,
+                actual_bs=actual_bs,
+                padded_bs=padded_bs,
+                pad_value=0,
+            )
+        if block_tables is not None and target_uses_cache_groups:
             if getattr(self.attn_backend, "tables_self_padding", False):
                 # Backend pads dummy rows itself; F.pad would reallocate tables and break storage sharing.
                 kwargs["block_tables"] = block_tables
             else:
-                kwargs["block_tables"] = self._pad_block_tables_to_padded_bs(
-                    block_tables,
-                    actual_bs=table_batch_size,
-                    padded_bs=padded_bs,
-                    pad_value=0,
-                )
+                kwargs["block_tables"] = padded_block_tables
         if self.attn_backend.uses_padded_decode_token_mask:
             kwargs["actual_bs"] = actual_bs
         if target_uses_paged_groups and getattr(self, "drafter", None) is not None:
@@ -885,7 +924,7 @@ class CudaGraphWrapper:
             padded_bs,
             req_pool_indices,
             seq_lens,
-            req_to_page=req_to_page,
+            page_table=page_table,
             forward_mode=forward_mode,
             **kwargs,
         )
@@ -899,7 +938,16 @@ class CudaGraphWrapper:
                     )
             if getattr(self.draft_attn_backend, "uses_padded_decode_token_mask", False):
                 draft_attn_kwargs["actual_bs"] = actual_bs
-            draft_group_tables = self._draft_group_tables(block_tables)
+            draft_table_source = (
+                block_tables
+                if getattr(
+                    self.draft_attn_backend,
+                    "tables_self_padding",
+                    False,
+                )
+                else padded_block_tables
+            )
+            draft_group_tables = self._draft_group_tables(draft_table_source)
             if draft_group_tables is not None:
                 draft_attn_kwargs["block_tables"] = draft_group_tables
             draft_forward_mode = ForwardMode.DECODE
@@ -911,7 +959,7 @@ class CudaGraphWrapper:
                 padded_bs,
                 req_pool_indices,
                 draft_seq_lens,
-                req_to_page=self.drafter.req_to_page,
+                page_table=self.drafter.page_table,
                 forward_mode=draft_forward_mode,
                 **draft_attn_kwargs,
             )
@@ -923,7 +971,7 @@ class CudaGraphWrapper:
         num_extends: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        req_to_page: torch.Tensor,
+        page_table: torch.Tensor,
         forward_mode: ForwardMode,
         **kwargs,
     ):
@@ -939,7 +987,7 @@ class CudaGraphWrapper:
             num_extends=num_extends,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            req_to_page=req_to_page,
+            page_table=page_table,
             forward_mode=forward_mode,
             **kwargs,
         )
@@ -978,12 +1026,21 @@ class CudaGraphWrapper:
                     if kwargs.get("block_tables") is not None
                     else kwargs
                 )
+                if self.use_v4_mtp_paged_metadata:
+                    # cache_metadata describes the target pool and exposes all
+                    # target cache groups. The V4 drafter has a narrower cache
+                    # contract, so it must consume only the identity-selected
+                    # subset above instead of rebuilding tables from the target
+                    # metadata.
+                    draft_extend_kwargs = dict(draft_extend_kwargs)
+                    draft_extend_kwargs.pop("cache_metadata", None)
+                    draft_extend_kwargs.pop("forward_batch", None)
                 self.draft_attn_backend.init_forward_metadata(
                     bs=padded_bs,
                     num_extends=num_extends,
                     req_pool_indices=req_pool_indices,
                     seq_lens=draft_prefill_seq_lens,
-                    req_to_page=self.drafter.req_to_page,
+                    page_table=self.drafter.page_table,
                     forward_mode=forward_mode,
                     **draft_extend_kwargs,
                 )
@@ -993,7 +1050,7 @@ class CudaGraphWrapper:
                         num_extends=0,
                         req_pool_indices=req_pool_indices,
                         seq_lens=draft_seq_lens,
-                        req_to_page=self.drafter.req_to_page,
+                        page_table=self.drafter.page_table,
                         forward_mode=ForwardMode.DECODE,
                         **draft_kwargs,
                     )
@@ -1013,7 +1070,7 @@ class CudaGraphWrapper:
                     num_extends=0,
                     req_pool_indices=req_pool_indices,
                     seq_lens=draft_metadata_seq_lens,
-                    req_to_page=self.drafter.req_to_page,
+                    page_table=self.drafter.page_table,
                     forward_mode=draft_forward_mode,
                     **draft_kwargs,
                 )
@@ -1093,7 +1150,7 @@ class CudaGraphWrapper:
         bs: int,
         ctx: ForwardContext,
         sampling_info: SamplingBatchInfo,
-        req_to_page: torch.Tensor,
+        page_table: torch.Tensor,
         extend_with_prefix: bool = False,
         extend_prefix_lens: torch.Tensor | None = None,
         extend_prefix_lens_cpu: torch.Tensor | None = None,
@@ -1171,7 +1228,7 @@ class CudaGraphWrapper:
                 bs,
                 req_pool_indices,
                 seq_lens,
-                req_to_page=req_to_page,
+                page_table=page_table,
                 forward_mode=ctx.forward_mode,
                 num_padding=padded_bs - bs if padded_bs != bs else 0,
                 paged_cache_block_tables=paged_cache_block_tables,
@@ -1237,7 +1294,7 @@ class CudaGraphWrapper:
                 ctx.num_extends,
                 req_pool_indices,
                 seq_lens,
-                req_to_page=req_to_page,
+                page_table=page_table,
                 forward_mode=ctx.forward_mode,
                 extend_with_prefix=extend_with_prefix,
                 extend_prefix_lens=extend_prefix_lens,

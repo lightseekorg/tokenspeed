@@ -16,12 +16,12 @@ register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 def _load_paged_cache_spec():
     try:
-        from tokenspeed.runtime.configs import paged_cache_spec
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes import spec
 
-        return paged_cache_spec
+        return spec
     except (ImportError, ModuleNotFoundError):
-        # The configs package imports transformer-backed model configs. This
-        # module is torch-free, so load it directly in a bare environment.
+        # The package pulls torch-backed modules. spec.py itself is
+        # torch-free, so load it directly in a bare environment.
         repo_root = os.path.dirname(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         )
@@ -30,8 +30,11 @@ def _load_paged_cache_spec():
             "python",
             "tokenspeed",
             "runtime",
-            "configs",
-            "paged_cache_spec.py",
+            "layers",
+            "attention",
+            "kv_cache",
+            "recipes",
+            "spec.py",
         )
         spec = importlib.util.spec_from_file_location("_paged_cache_spec_guard", path)
         module = importlib.util.module_from_spec(spec)

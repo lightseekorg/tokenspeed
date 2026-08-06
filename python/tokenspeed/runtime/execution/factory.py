@@ -37,7 +37,7 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
-    from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 
 
 def create_model_runner(
@@ -73,10 +73,10 @@ def create_model_executor(
     config: ModelExecutorConfig,
     model_runner: ModelRunner,
     attn_backend: AttentionBackend,
-    token_to_kv_pool: BaseTokenToKVPool,
+    token_to_kv_pool: CachePool,
     draft_model_runner: ModelRunner | None = None,
     draft_attn_backend: AttentionBackend | None = None,
-    draft_token_to_kv_pool: BaseTokenToKVPool | None = None,
+    draft_token_to_kv_pool: CachePool | None = None,
 ) -> ModelExecutor:
     """Create the model executor with its sampler configuration."""
     if server_args.enable_nvtx:

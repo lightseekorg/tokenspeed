@@ -52,17 +52,17 @@ from test.runtime.conftest import requires_cuda
 
 from ci_system.ci_register import register_cuda_ci
 
-from tokenspeed.runtime.configs.cache_runtime import (
-    PagedCacheRuntimeContract,
-)
-from tokenspeed.runtime.configs.paged_cache_spec import (
-    PagedCacheGroupSpec,
-)
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends import hybrid_linear_attn
 from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
     MambaAttnBackend,
     compute_state_page_indices,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+    PagedCacheRuntimeContract,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    PagedCacheGroupSpec,
 )
 
 register_cuda_ci(est_time=240, suite="runtime-1gpu")
@@ -84,8 +84,11 @@ def _backend_config(device: str, *, spec_tokens: int = 1) -> SimpleNamespace:
 
 
 def _backend(device: str, *, contract_pool, spec_tokens: int = 1) -> MambaAttnBackend:
+    kda_backend = "auto" if current_platform().is_amd else "fla"
     backend = MambaAttnBackend(
-        _backend_config(device, spec_tokens=spec_tokens), is_kda=True
+        _backend_config(device, spec_tokens=spec_tokens),
+        is_kda=True,
+        kda_backend=kda_backend,
     )
     backend.set_kv_pool(contract_pool)
     return backend
@@ -102,7 +105,6 @@ def _stub_contract(*, block_size: int, usable_pages: int):
             entry_stride_tokens=1,
             sliding_window_tokens=None,
             family="history" if group_id == "full_attention" else "state",
-            block_size=block_size,
         )
         for group_id in group_ids
     )
@@ -516,9 +518,9 @@ class _KDAHarness:
         )
         return (
             naive_out.flatten(0, 1),
-            naive_state.transpose(-1, -2),
+            naive_state,
             fla_out[0].flatten(0, 1),
-            fla_state[0].float().transpose(-1, -2),
+            fla_state[0].float(),
         )
 
 
@@ -771,7 +773,7 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
     not current_platform().is_amd,
     reason="indexed paged cache KDA decode is an AMD-specific contract",
 )
-def test_kda_lcm_pool_component_views_end_to_end(
+def test_kda_cache_pool_component_views_end_to_end(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The real LCM pool's page-strided component views flow

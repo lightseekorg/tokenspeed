@@ -32,7 +32,7 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
     from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
-    from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
     from tokenspeed.runtime.pd.utils import StepCounter
 
@@ -67,6 +67,13 @@ class AttentionBackend(ABC):
     # different hole/index semantics; a group-aware backend sets
     # this True. Default False keeps every existing backend on today's path.
     uses_cache_groups: bool = False
+    # True when authoritative per-group tables also replace the shared
+    # full-history draft table for this backend. Keep this separate from
+    # uses_cache_groups: generic speculative backends still consume that table.
+    cache_group_tables_replace_draft_page_table: bool = False
+    # Capture helpers use a real writable page for every active group when
+    # the backend rejects the reserved null page for live sequence metadata.
+    cache_active_pages_must_be_real: bool = False
     # False for group-aware backends whose spec-verify path is not wired yet.
     cache_group_spec_capable: bool = True
     uses_padded_decode_token_mask: bool = False
@@ -81,10 +88,14 @@ class AttentionBackend(ABC):
         self.head_dim = config.head_dim
         self.is_draft = config.is_draft
         self.spec_num_tokens = config.speculative_num_draft_tokens
+        self.cache_pool: CachePool | None = None
         # True when this backend's CUDA-graph block-table (kv_indices) buffer is
         # aliased to a peer backend's (e.g. a drafter sharing the target's), so
         # the replay path skips rebuilding it — the peer already populates it.
         self._block_table_aliased = False
+
+    def set_cache_pool(self, cache_pool: CachePool) -> None:
+        self.cache_pool = cache_pool
 
     @contextmanager
     def override_num_extends(self, num_extends: int):
@@ -163,7 +174,7 @@ class AttentionBackend(ABC):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
-        req_to_page: torch.Tensor = None,
+        page_table: torch.Tensor = None,
         block_tables: dict[str, torch.Tensor] | None = None,
         **kwargs,
     ):
@@ -231,7 +242,7 @@ class AttentionBackend(ABC):
         v: torch.Tensor,
         layer: PagedAttention,
         out_cache_loc: torch.Tensor,
-        token_to_kv_pool: BaseTokenToKVPool,
+        token_to_kv_pool: CachePool,
         forward_mode: ForwardMode,
         bs: int,
         save_kv_cache: bool = True,
@@ -279,7 +290,7 @@ class AttentionBackend(ABC):
         v: torch.Tensor,
         layer: PagedAttention,
         out_cache_loc: torch.Tensor,
-        token_to_kv_pool: BaseTokenToKVPool,
+        token_to_kv_pool: CachePool,
         bs: int,
         save_kv_cache: bool = True,
         **kwargs,
@@ -294,7 +305,7 @@ class AttentionBackend(ABC):
         v: torch.Tensor,
         layer: PagedAttention,
         out_cache_loc: torch.Tensor,
-        token_to_kv_pool: BaseTokenToKVPool,
+        token_to_kv_pool: CachePool,
         bs: int,
         save_kv_cache: bool = True,
         **kwargs,

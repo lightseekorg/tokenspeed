@@ -25,7 +25,6 @@ from dataclasses import dataclass
 import torch
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
-from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
@@ -91,13 +90,4 @@ class BaseAttnConfig:
         raise NotImplementedError("Not Implemented!")
 
     def cache_cell_size(self) -> int:
-        raise NotImplementedError("Not Implemented!")
-
-    def create_pool(
-        self,
-        num_layers: int,
-        max_total_num_tokens: int,
-        rank: int,
-        enable_memory_saver: bool,
-    ) -> BaseTokenToKVPool:
         raise NotImplementedError("Not Implemented!")

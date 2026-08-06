@@ -32,7 +32,7 @@ Implemented (full text path):
   ``MambaAttnBackend`` KDA branch.
 * ``KimiLinearMLP`` — dense / shared-expert MLP with the SiTU activation.
 * ``KimiLinearMoE`` — sigmoid/noaux_tc router + Latent MoE + flashinfer's
-  TRT-LLM fused SiTU (or an explicit Triton unfused fallback) + shared experts.
+  TRT-LLM fused SiTU + shared experts.
 * ``KimiLinearDecoderLayer`` + ``KimiLinearModel`` — the AttnRes block-residual data
   flow.
 * ``KimiLinearForCausalLM.load_weights`` — stacked / fused-qkv-a / expert
@@ -89,7 +89,6 @@ from tokenspeed_kernel.ops.tuning import load_packaged_flashinfer_tuning_cache
 from torch import nn
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiK3Config, KimiLinearConfig
-from tokenspeed.runtime.configs.paged_cache_spec import FULL_ATTENTION
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import (
     all_reduce,
@@ -100,6 +99,9 @@ from tokenspeed.runtime.distributed.comm_ops import (
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
 from tokenspeed.runtime.layers.activation import SituAndMul
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    FULL_ATTENTION,
+)
 from tokenspeed.runtime.layers.layernorm import (
     RMSNorm,
     _get_process_group,
@@ -115,7 +117,7 @@ from tokenspeed.runtime.layers.moe.latent import (
     Kimi3LatentProjection,
     Kimi3MoEExecutionPlan,
     LatentMoELayer,
-    kimi3_reduce_fused_moe,
+    kimi3_join_reduce_moe,
 )
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
@@ -891,8 +893,7 @@ class KimiLinearMoE(nn.Module):
       ``routed_expert_up_proj``/``routed_expert_norm`` project back (7168).
     * **Routed experts** (MXFP4): AMD uses the native ``MoELayer`` plan wrapped
       by ``LatentMoELayer`` so Triton/Gluon owns EP8 dispatch and SiTU. Non-AMD
-      platforms use flashinfer's TRTLLM-Gen SiTU MoE, with an explicit
-      two-GEMM Triton fallback.
+      platforms use flashinfer's TRTLLM-Gen SiTU MoE.
     * **Shared experts**: a plain ``KimiLinearMLP`` (SiTU).
     """
 
@@ -932,47 +933,38 @@ class KimiLinearMoE(nn.Module):
             enforce_eager=bool(global_server_args_dict["enforce_eager"]),
         )
         # AUTO intentionally requests the flashinfer-backed SiTU plan when it was
-        # registered at import time. Without that runtime, users must select the
-        # explicit Triton fallback; AUTO cannot override MoELayer per model.
+        # registered at import time; AUTO cannot override MoELayer per model.
         self.use_trtllm_situ_moe = self.execution_plan.use_trtllm
         if not self.execution_plan.use_native:
-            if not self.use_trtllm_situ_moe and not moe_backend.is_triton():
-                raise ValueError(
-                    "Kimi-K3 MXFP4 SiTU MoE supports only the flashinfer-backed "
-                    "flashinfer_trtllm backend or the Triton unfused fallback, "
-                    f"got {moe_backend.value!r}"
+            if not self.use_trtllm_situ_moe:
+                raise RuntimeError(
+                    "Kimi-K3 MXFP4 SiTU MoE requires the native backend or the "
+                    "FlashInfer TRT-LLM backend; no portable SiTU Triton fallback "
+                    f"exists (selected MoE backend: {moe_backend.value!r})."
                 )
-            if self.use_trtllm_situ_moe:
-                # Fail here with the actual reason instead of letting MoELayer's
-                # kernel selection miss the (never-registered) SiTU kernel.
-                reason = situ_moe_unavailable_reason()
-                if reason is not None:
-                    raise ValueError(
-                        "Kimi-K3's fused SiTU MoE requires flashinfer > "
-                        f"0.6.15 with native SiTU, unavailable: {reason}. "
-                        "Upgrade flashinfer or select the unfused fallback "
-                        "with --moe-backend triton."
-                    )
-                # Out-of-box tactics: seed the autotuner from the in-tree
-                # swept table for this GPU/flashinfer combo, if one ships
-                # (flashinfer's own heuristic mispicks MoE tactics at prefill
-                # batch sizes). A lookup miss leaves the startup autotune
-                # window to tune these shapes.
-                load_packaged_flashinfer_tuning_cache(
-                    "kimi-k3", mapping.moe.ep_size, mapping.moe.tp_size
+            # Fail here with the actual reason instead of letting MoELayer's
+            # kernel selection miss the (never-registered) SiTU kernel.
+            reason = situ_moe_unavailable_reason()
+            if reason is not None:
+                raise RuntimeError(
+                    "Kimi-K3's fused SiTU MoE requires flashinfer > 0.6.15 "
+                    f"with native SiTU, unavailable: {reason}. Upgrade "
+                    "flashinfer; no portable SiTU Triton fallback exists."
                 )
+            # Out-of-box tactics: seed the autotuner from the in-tree
+            # swept table for this GPU/flashinfer combo, if one ships
+            # (flashinfer's own heuristic mispicks MoE tactics at prefill
+            # batch sizes). A lookup miss leaves the startup autotune
+            # window to tune these shapes.
+            load_packaged_flashinfer_tuning_cache(
+                "kimi-k3", mapping.moe.ep_size, mapping.moe.tp_size
+            )
             if mapping.moe.has_tp_ep and mapping.attn.tp_size != mapping.moe.tp_ep_size:
                 raise ValueError(
                     "Kimi-K3's SiTU MoE currently requires a "
                     "replicated-token all-reduce topology: attn TP size must equal "
                     "MoE TP*EP size. Attn-DP/MoE-EP RSAG is not supported."
                 )
-            if not self.use_trtllm_situ_moe and mapping.moe.ep_size > 1:
-                raise ValueError(
-                    "Kimi-K3's Triton SiTU fallback does not support expert "
-                    "parallelism; use MoE TP or the flashinfer TRT-LLM backend"
-                )
-
         self.gate = KimiLinearMoEGate(config.hidden_size, config.num_experts)
 
         self.topk = TopK(
@@ -992,9 +984,7 @@ class KimiLinearMoE(nn.Module):
         )
 
         # AMD native and flashinfer's TRT-LLM SiTU MoE both consume K3's
-        # precomputed sigmoid/noaux_tc TopK. Explicit Triton keeps the original
-        # two-GEMM fallback, where this layer stores/processes MXFP4 weights.
-        use_precomputed_topk = self.execution_plan.use_precomputed_topk
+        # precomputed sigmoid/noaux_tc TopK.
         self.experts = MoELayer(
             top_k=self.top_k,
             num_experts=self.num_experts,
@@ -1007,11 +997,9 @@ class KimiLinearMoE(nn.Module):
             tp_size=mapping.moe.tp_size,
             ep_rank=mapping.moe.ep_rank,
             ep_size=mapping.moe.ep_size,
-            activation="situ" if use_precomputed_topk else "silu",
-            activation_situ_beta=(situ_beta if use_precomputed_topk else None),
-            activation_situ_linear_beta=(
-                situ_linear_beta if use_precomputed_topk else None
-            ),
+            activation="situ",
+            activation_situ_beta=situ_beta,
+            activation_situ_linear_beta=situ_linear_beta,
             routing_config={
                 "n_group": config.num_expert_group,
                 "topk_group": config.topk_group,
@@ -1022,19 +1010,20 @@ class KimiLinearMoE(nn.Module):
                 "activation_situ_beta": situ_beta,
                 "activation_situ_linear_beta": situ_linear_beta,
             },
-            routing_mode=("precomputed_topk" if use_precomputed_topk else None),
-            # The fused SiTU path always runs w4a8 (flashinfer's SiTU cubins
-            # are MxFP4 x MxFP8 only); the Triton fallback stays bf16.
+            routing_mode="precomputed_topk",
+            # Native gfx950 runs A16W4; FlashInfer's SiTU cubins require
+            # MXFP4 weights with MXFP8 activations.
             internal_activation_dtype_override=(
-                "fp8" if use_precomputed_topk else None
+                "input"
+                if self.execution_plan.use_native
+                else "fp8" if self.execution_plan.use_trtllm else None
             ),
         )
-        if use_precomputed_topk and self.experts.support_routing:
+        if self.experts.support_routing:
             raise RuntimeError(
                 "Kimi-K3 requires a precomputed-TopK SiTU MoE kernel; the "
                 "selected backend unexpectedly performs internal routing"
             )
-        self.act_fn = SituAndMul(beta=situ_beta, linear_beta=situ_linear_beta)
 
         self.routed_expert_down_proj = Kimi3LatentProjection(
             config.hidden_size,
@@ -1114,44 +1103,24 @@ class KimiLinearMoE(nn.Module):
         max_num_tokens_per_gpu: int,
         skip_reduce: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run flashinfer's fused TRT-LLM SiTU or the Triton fallback."""
-        if self.use_trtllm_situ_moe:
-            out = self.experts(
-                hidden_states=routed_in,
-                topk_output=topk_output,
-                num_global_tokens=num_global_tokens,
-                max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+        """Run flashinfer's fused TRT-LLM SiTU MoE."""
+        if not self.use_trtllm_situ_moe:
+            raise RuntimeError(
+                "Kimi-K3 has no portable SiTU Triton fallback; use the native "
+                "or FlashInfer TRT-LLM SiTU MoE path."
             )
-            # Each TP rank owns an intermediate shard; each EP rank owns a
-            # contiguous expert shard. The routed kernel returns that rank's
-            # partial contribution, which must be combined before the replicated
-            # norm/up projection (skip_reduce: caller's fused AR covers it).
-            if self.mapping.moe.has_tp_ep and not skip_reduce:
-                out = all_reduce(out, self.mapping.moe.tp_ep_group)
-        else:
-            from tokenspeed_kernel.ops.moe import moe_unfused_apply
-
-            if not hasattr(self.experts, "w13_weight_triton_tensor"):
-                raise RuntimeError(
-                    "Kimi-K3's Triton SiTU fallback needs the matmul_ogs "
-                    "weight representation. Run with `--moe-backend triton`."
-                )
-
-            out = moe_unfused_apply(
-                routed_in,
-                self.experts.w13_weight_triton_tensor,
-                self.experts.w13_precision_config,
-                self.experts.w2_weight_triton_tensor,
-                self.experts.w2_precision_config,
-                topk_output.topk_weights,
-                topk_output.topk_ids,
-                self.num_experts,
-                self.top_k,
-                self.act_fn,
-            )
-            # The Triton grouped GEMM returns a partial TP sum.
-            if self.mapping.moe.tp_size > 1:
-                out = all_reduce(out, self.mapping.moe.tp_group)
+        out = self.experts(
+            hidden_states=routed_in,
+            topk_output=topk_output,
+            num_global_tokens=num_global_tokens,
+            max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+        )
+        # Each TP rank owns an intermediate shard; each EP rank owns a
+        # contiguous expert shard. The routed kernel returns that rank's
+        # partial contribution, which must be combined before the replicated
+        # norm/up projection (skip_reduce: caller's fused AR covers it).
+        if self.mapping.moe.has_tp_ep and not skip_reduce:
+            out = all_reduce(out, self.mapping.moe.tp_ep_group)
         return out
 
     def forward(
@@ -1217,14 +1186,10 @@ class KimiLinearMoE(nn.Module):
                     routed_out = self.routed_expert_norm(routed_out)
                 routed_out = self.routed_expert_up_proj(routed_out)[0]
         if self.execution_plan.fused_moe_ar:
-            # Post-join: one [T, latent+hidden] all-reduce covers both
-            # partials, element-wise identical to the two separate reduces.
-            if lane is not None and routed_out.data_ptr() == lane.data_ptr():
-                fused = lane
-            else:
-                fused = torch.cat((routed_out, shared_partial), dim=-1)
-            routed_out, shared_out = kimi3_reduce_fused_moe(
-                fused,
+            routed_out, shared_out = kimi3_join_reduce_moe(
+                routed_out,
+                shared_partial,
+                lane=lane,
                 routed_hidden=self.routed_hidden,
                 routed_norm=self.routed_expert_norm,
                 group=self.mapping.moe.tp_ep_group,
@@ -1679,6 +1644,8 @@ class KimiLinearModel(nn.Module):
             bias=False,
             prefix=add_prefix("output_attn_res_proj", prefix),
         )
+        # One-based completed-layer ids; see set_eagle3_layers_to_capture.
+        self.eagle3_layers_to_capture: tuple[int, ...] = ()
 
         # DFLASH/DSpark speculative decoding: layer indices whose *output*
         # stream is captured for the draft. Populated by
@@ -1734,14 +1701,18 @@ class KimiLinearModel(nn.Module):
         )
 
         capture_layers = self.layers_to_capture
-        aux_hidden_states: list[torch.Tensor] | None = [] if capture_layers else None
+        capture_dflash = bool(capture_layers)
+        capture_eagle3 = bool(self.eagle3_layers_to_capture)
+        aux_hidden_states: list[torch.Tensor] | None = (
+            [] if capture_dflash or capture_eagle3 else None
+        )
 
         prefix_sum = hidden_states
         for layer_idx, layer in enumerate(self.layers):
             prefix_sum, block_residual = layer(
                 positions, prefix_sum, ctx, out_cache_loc, block_residual
             )
-            if aux_hidden_states is not None and layer_idx in capture_layers:
+            if capture_dflash and layer_idx in capture_layers:
                 captured = self._dspark_capture_stream(
                     layer_idx, prefix_sum, block_residual
                 )
@@ -1751,7 +1722,12 @@ class KimiLinearModel(nn.Module):
                     self._dflash_slot_bufs[capture_idx][:num_tokens].copy_(captured)
                     if self._dflash_incremental_callback is not None:
                         self._dflash_incremental_callback(capture_idx, num_tokens)
+                assert aux_hidden_states is not None
                 aux_hidden_states.append(captured)
+            # Clone: the copy must survive the next layer's in-place residual writes.
+            elif capture_eagle3 and layer_idx + 1 in self.eagle3_layers_to_capture:
+                assert aux_hidden_states is not None
+                aux_hidden_states.append(prefix_sum.clone())
 
         hidden_states = _apply_attn_res(
             prefix_sum,
@@ -1773,6 +1749,27 @@ class KimiLinearForCausalLM(BaseCausalLM):
     """
 
     model_cls = KimiLinearModel
+
+    def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
+        """Take the draft config's one-based completed-layer ids unchanged."""
+        num_layers = len(self.model.layers)
+        selected = (
+            [2, num_layers // 2, num_layers - 3]
+            if layer_ids is None
+            else list(layer_ids)
+        )
+        if selected != sorted(selected) or len(set(selected)) != len(selected):
+            raise ValueError(
+                "K3 EAGLE3 layer ids must be unique and sorted ascending, "
+                f"got {selected}."
+            )
+        invalid = [layer_id for layer_id in selected if not 1 <= layer_id <= num_layers]
+        if invalid:
+            raise ValueError(
+                "K3 EAGLE3 layer ids must identify a completed K3 layer; "
+                f"got invalid ids {invalid} for {num_layers} layers."
+            )
+        self.model.eagle3_layers_to_capture = tuple(selected)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
@@ -2045,6 +2042,13 @@ class KimiK3ForConditionalGeneration(nn.Module):
             slot_bufs=slot_bufs,
         )
 
+    def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
+        if self.language_model is None:
+            raise AttributeError(
+                "Kimi-K3 encoder-only mode does not support EAGLE3 speculative decoding."
+            )
+        self.language_model.set_eagle3_layers_to_capture(layer_ids)
+
     @property
     def logits_processor(self):
         # The runtime reads ``model.logits_processor`` on the top-level model
@@ -2068,6 +2072,16 @@ class KimiK3ForConditionalGeneration(nn.Module):
     def vision_tower(self):
         """Expose the shared MoonViT attribute expected by EPD prefill."""
         return self.vision.vision_tower if self.vision is not None else None
+
+    def get_multimodal_encoder_specs(self) -> dict[Modality, EncoderSpec]:
+        if self.vision is None or self.image_encoder is None:
+            return {}
+        return {
+            Modality.IMAGE: EncoderSpec(
+                self.image_encoder,
+                make_warmup_items=self.vision.make_image_warmup_items,
+            )
+        }
 
     def make_encoder_cudagraph_wrapper(
         self, mapping: Mapping
@@ -2102,7 +2116,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
             input_ids=input_ids,
             text_embedding=self.get_input_embeddings(),
             ctx=multimodal_context,
-            encoders={Modality.IMAGE: EncoderSpec(self.image_encoder)},
+            encoders=self.get_multimodal_encoder_specs(),
             multimodal_model=self,
         )
         assert not model_kwargs, "Kimi-K3 multimodal path must stay embeds-only"

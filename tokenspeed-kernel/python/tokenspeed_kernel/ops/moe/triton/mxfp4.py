@@ -20,464 +20,678 @@
 
 from __future__ import annotations
 
-import copy
-from contextlib import contextmanager
-
-import tokenspeed_kernel
 import torch
-import torch.nn.functional as F
-from tokenspeed_kernel._triton import (
-    libdevice,
-    redirect_triton_to_tokenspeed_triton,
-    tl,
-    triton,
-)
-from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
+from tokenspeed_kernel._triton import TensorDescriptor, libdevice, tl, triton
+from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
-with redirect_triton_to_tokenspeed_triton():
-    import triton_kernels  # noqa: F401
-    import triton_kernels.matmul  # noqa: F401
-    import triton_kernels.matmul_details  # noqa: F401
-    import triton_kernels.matmul_details.opt_flags  # noqa: F401
-    import triton_kernels.numerics  # noqa: F401
-    import triton_kernels.swiglu  # noqa: F401
-    import triton_kernels.tensor  # noqa: F401
-    import triton_kernels.tensor_details  # noqa: F401
-    import triton_kernels.tensor_details.layout  # noqa: F401
-    import triton_kernels.topk  # noqa: F401
-
-import triton_kernels.matmul_details.opt_flags as opt_flags
-from triton_kernels.matmul import (
-    FlexCtx,
-    FnSpecs,
-    FusedActivation,
-    PrecisionConfig,
-    matmul,
-)
-from triton_kernels.matmul_details.opt_flags import scoped_opt_flags_constraints
-from triton_kernels.numerics import InFlexData
-from triton_kernels.swiglu import swiglu_fn
-from triton_kernels.tensor import (
-    FP4,
-    RaggedTensorMetadata,
-    convert_layout,
-    make_ragged_tensor_metadata,
-    wrap_torch_tensor,
-)
-from triton_kernels.tensor_details import layout
-from triton_kernels.topk import topk
-
-# isort: off
-from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
-
-platform = current_platform()
-
-MXFP4_BLOCK = 32
-MXFP4_ACTIVATION_SCALE_LAYOUT = "linear"
-MXFP4_SITU_WARP_DECODE_MAX_TOKENS = 4
-
 
 @triton.jit
-def _situ_fused_fn(input, beta, linear_beta, HAS_LINEAR_BETA: tl.constexpr):
-    """SiTU epilogue for gate/up rows interleaved at weight-process time."""
-    paired = tl.reshape(input, (input.shape[0], input.shape[1] // 2, 2))
-    gate, up = tl.split(paired)
-    # Kimi's reference writes W13 to BF16 before evaluating SiTU in FP32.
-    gate = gate.to(tl.bfloat16).to(tl.float32)
-    up = up.to(tl.bfloat16).to(tl.float32)
-    gate = beta * libdevice.tanh(gate / beta) * tl.sigmoid(gate)
-    if HAS_LINEAR_BETA:
-        up = linear_beta * libdevice.tanh(up / linear_beta)
-    return gate * up
-
-
-@triton.jit
-def _reduce_local_topk_kernel(
-    routed_ptr,
-    local_ids_ptr,
-    out_ptr,
-    num_tokens,
-    hidden_dim,
-    routed_stride_m,
-    routed_stride_n,
-    ids_stride_m,
-    ids_stride_k,
-    out_stride_m,
-    out_stride_n,
-    TOP_K: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+def _routing_kernel(
+    topk_ids_ptr,
+    expert_route_ids_ptr,
+    expert_counts_ptr,
+    num_routes,
+    BLOCK_ROUTES: tl.constexpr,
 ):
-    """Reduce only locally-owned route slots from a fixed-size EP buffer."""
-    token = tl.program_id(0)
-    block_n = tl.program_id(1)
-    offs_n = block_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    n_mask = offs_n < hidden_dim
-    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
-    for slot in tl.static_range(0, TOP_K):
-        local_id = tl.load(
-            local_ids_ptr + token * ids_stride_m + slot * ids_stride_k,
-            mask=token < num_tokens,
-            other=-1,
+    expert_id = tl.program_id(0)
+    count = 0
+    num_blocks = tl.cdiv(num_routes, BLOCK_ROUTES)
+    for block_id in range(num_blocks):
+        route_ids = block_id * BLOCK_ROUTES + tl.arange(0, BLOCK_ROUTES)
+        route_mask = route_ids < num_routes
+        selected_experts = tl.load(topk_ids_ptr + route_ids, mask=route_mask, other=-1)
+        matches = route_mask & (selected_experts == expert_id)
+        local_rank = tl.cumsum(matches.to(tl.int32), axis=0) - 1
+        tl.store(
+            expert_route_ids_ptr + expert_id * num_routes + count + local_rank,
+            route_ids,
+            mask=matches,
         )
-        valid = (token < num_tokens) & (local_id >= 0)
-        route_row = token * TOP_K + slot
-        value = tl.load(
-            routed_ptr + route_row * routed_stride_m + offs_n * routed_stride_n,
-            mask=valid & n_mask,
-            other=0.0,
-        )
-        acc += value.to(tl.float32)
-    tl.store(
-        out_ptr + token * out_stride_m + offs_n * out_stride_n,
-        acc,
-        mask=(token < num_tokens) & n_mask,
-    )
-
-
-def _reduce_local_topk(
-    routed: torch.Tensor,
-    local_ids: torch.Tensor,
-    num_tokens: int,
-) -> torch.Tensor:
-    """Mask remote EP slots while reducing grouped-matmul route outputs."""
-    top_k = int(local_ids.shape[1])
-    hidden_dim = int(routed.shape[-1])
-    out = torch.empty(
-        (num_tokens, hidden_dim),
-        dtype=routed.dtype,
-        device=routed.device,
-    )
-    block_n = 256
-    _reduce_local_topk_kernel[(num_tokens, triton.cdiv(hidden_dim, block_n))](
-        routed,
-        local_ids,
-        out,
-        num_tokens,
-        hidden_dim,
-        routed.stride(0),
-        routed.stride(1),
-        local_ids.stride(0),
-        local_ids.stride(1),
-        out.stride(0),
-        out.stride(1),
-        TOP_K=top_k,
-        BLOCK_N=block_n,
-        num_warps=4,
-    )
-    return out
-
-
-def _uses_dynamic_mxfp4_activations(w: torch.nn.Module) -> bool:
-    quant_config = getattr(w, "quant_config", None)
-    return current_platform().is_amd and bool(
-        getattr(quant_config, "use_dynamic_mxfp4_activations", False)
-    )
-
-
-def _quantize_mxfp4_activation(
-    activations: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return tokenspeed_kernel.quantize_mxfp4(
-        activations.contiguous(),
-        scale_size=MXFP4_BLOCK,
-        scale_layout=MXFP4_ACTIVATION_SCALE_LAYOUT,
-        solution="triton",
-        enable_pdl=False,
-    )
-
-
-def _with_activation_mx_scale(
-    precision_config: PrecisionConfig | None,
-    activation_scale: torch.Tensor,
-) -> PrecisionConfig:
-    if precision_config is None:
-        precision_config = PrecisionConfig()
-    precision_config = copy.copy(precision_config)
-    precision_config.a_mx_scale = activation_scale
-    precision_config.a_microblock_size = MXFP4_BLOCK
-    return precision_config
-
-
-def _release_parameter(module: torch.nn.Module, name: str) -> None:
-    if name in module._parameters:
-        module.register_parameter(name, None)
-    elif hasattr(module, name):
-        delattr(module, name)
-
-
-def _interleave_gate_up(tensor: torch.Tensor, dim: int) -> torch.Tensor:
-    dim %= tensor.ndim
-    if tensor.shape[dim] % 2:
-        raise ValueError("SiTU W13 gate/up dimension must be even")
-    gate, up = tensor.chunk(2, dim=dim)
-    return torch.stack((gate, up), dim=dim + 1).flatten(dim, dim + 1).contiguous()
-
-
-def _silu_gate_up(
-    gate_up: torch.Tensor,
-    *,
-    output_dtype: torch.dtype,
-) -> torch.Tensor:
-    gate, up = gate_up.float().chunk(2, dim=-1)
-    return (F.silu(gate) * up).to(output_dtype)
-
-
-def _is_bf16_mxfp4(x, w, precision_config):
-    if precision_config is None:
-        return False
-    if getattr(precision_config, "b_mx_scale", None) is None:
-        return False
-    x_dtype = getattr(x, "dtype", None)
-    if x_dtype not in (torch.float16, torch.bfloat16):
-        return False
-    w_bw = getattr(getattr(w, "dtype", None), "bitwidth", None)
-    return w_bw == 4
-
-
-def _lds_guard_should_apply(x, w, precision_config):
-    if scoped_opt_flags_constraints is None:
-        return False
-    if not current_platform().is_cdna4:
-        return False
-    return _is_bf16_mxfp4(x, w, precision_config)
-
-
-@contextmanager
-def _maybe_lds_guard(x, w, precision_config):
-    if not _lds_guard_should_apply(x, w, precision_config):
-        yield
-        return
-    with scoped_opt_flags_constraints({"block_m": 64, "block_n": 128, "block_k": 256}):
-        yield
+        count += tl.sum(matches.to(tl.int32), axis=0)
+    tl.store(expert_counts_ptr + expert_id, count)
 
 
 def _routing(
-    logits: torch.Tensor,
-    n_expts_act: int,
-    sm_first: bool = False,
-    dtype: torch.dtype | None = None,
-) -> tuple[RaggedTensorMetadata, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if dtype is None:
-        dtype = logits.dtype
-
-    assert logits.ndim == 2, "router_logits must be (n_tokens, n_expts_tot)"
-    n_tokens, _ = logits.shape
-
-    assert sm_first is False, "sm_first=True not supported for triton_kernels routing"
-    sparse = topk(logits, n_expts_act, apply_softmax=not sm_first)
-    mask_metadata = sparse.mask_metadata
-
-    col_sorted = mask_metadata.col_sorted_indx
-    gather_indx = col_sorted // n_expts_act
-    scatter_indx = col_sorted
-
-    vals_flat = sparse.vals.reshape(-1)
-    if dtype is not None and vals_flat.dtype != dtype:
-        vals_flat = vals_flat.to(dtype)
-    gate_scal = vals_flat[scatter_indx]
-
-    n_total_rows = n_tokens * n_expts_act
-    ragged_metadata = make_ragged_tensor_metadata(mask_metadata.col_sum, n_total_rows)
-
-    return ragged_metadata, gather_indx, scatter_indx, gate_scal
-
-
-def _swizzle_mxfp4(quant_tensor, scale, num_warps):
-    """Weight swizzle for mxfp4 MoE, used for OAI mxfp4 kernel."""
-
-    value_layout = layout.make_default_matmul_mxfp4_w_layout(mx_axis=-2)
-    scale_layout = layout.make_default_matmul_mxfp4_w_scale_layout(
-        mx_axis=-2, num_warps=num_warps
+    topk_ids: torch.Tensor, num_experts: int
+) -> tuple[torch.Tensor, torch.Tensor, str]:
+    topk_ids = topk_ids.to(torch.int32).contiguous()
+    num_routes = topk_ids.numel()
+    expert_route_ids = torch.empty(
+        (num_experts, num_routes), device=topk_ids.device, dtype=torch.int32
     )
-    if platform.is_blackwell:
-        constraints = {
-            "is_persistent": True,
-            "epilogue_subtile": 1,
-        }
-        opt_flags.update_opt_flags_constraints(constraints)
-    elif platform.is_hopper:
-        constraints = {
-            "split_k": 1,
-        }
-        opt_flags.update_opt_flags_constraints(constraints)
-    elif platform.is_amd:
-        # Fix block_k=256 to support scale swizzling.
-        constraints = {
-            "block_k": 256,
-        }
-        opt_flags.update_opt_flags_constraints(constraints)
-    # transpose the tensor so that the quantization axis is on dim1
-    quant_tensor = quant_tensor.transpose(-2, -1)
-    scale = scale.transpose(-2, -1)
-    quant_tensor = convert_layout(
-        wrap_torch_tensor(quant_tensor, dtype=FP4), value_layout
+    expert_counts = torch.empty(num_experts, device=topk_ids.device, dtype=torch.int32)
+    block_routes = 128 if num_routes <= 128 else 1024
+    _routing_kernel[(num_experts,)](
+        topk_ids,
+        expert_route_ids,
+        expert_counts,
+        num_routes,
+        BLOCK_ROUTES=block_routes,
+        num_warps=4,
     )
-    scale = convert_layout(wrap_torch_tensor(scale), scale_layout)
-    return quant_tensor, InFlexData(), scale
+    return expert_route_ids, expert_counts
 
 
-def _routing_from_topk(
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    num_experts: int,
-    dtype: torch.dtype | None = None,
-    compact_invalid: bool = False,
-) -> tuple[RaggedTensorMetadata, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if topk_ids.ndim != 2:
-        raise ValueError(f"topk_ids must be rank-2, got {tuple(topk_ids.shape)}")
-    if topk_weights.shape != topk_ids.shape:
-        raise ValueError(
-            "topk_weights and topk_ids must have the same shape, got "
-            f"{tuple(topk_weights.shape)} and {tuple(topk_ids.shape)}"
+@triton.jit
+def _combine_kernel(
+    route_output_ptr,
+    topk_weights_ptr,
+    output_ptr,
+    num_tokens,
+    hidden_size,
+    top_k: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    token_offsets = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    hidden_offsets = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    token_mask = token_offsets < num_tokens
+    hidden_mask = hidden_offsets < hidden_size
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for slot in range(top_k):
+        route_offsets = token_offsets * top_k + slot
+        values = tl.load(
+            route_output_ptr
+            + route_offsets[:, None] * hidden_size
+            + hidden_offsets[None, :],
+            mask=token_mask[:, None] & hidden_mask[None, :],
+            other=0.0,
         )
-    if num_experts <= 0:
-        raise ValueError(f"num_experts must be positive, got {num_experts}")
-
-    flat_ids = topk_ids.reshape(-1).to(torch.long)
-    valid = flat_ids >= 0
-    sort_keys = torch.where(valid, flat_ids, flat_ids.new_zeros(()))
-    if compact_invalid:
-        sort_keys = torch.where(valid, flat_ids, flat_ids.new_full((), num_experts))
-    sort_order = torch.argsort(sort_keys, stable=True)
-
-    top_k = topk_ids.shape[1]
-    gather_indx = (sort_order // top_k).to(torch.int32)
-    scatter_indx = sort_order.to(torch.int32)
-    gate_scal = topk_weights.reshape(-1)[sort_order]
-    gate_scal = torch.where(valid[sort_order], gate_scal, torch.zeros_like(gate_scal))
-    if dtype is not None and gate_scal.dtype != dtype:
-        gate_scal = gate_scal.to(dtype)
-
-    col_sum = torch.zeros((num_experts,), dtype=torch.int32, device=flat_ids.device)
-    col_sum.scatter_add_(
-        0,
-        torch.where(valid, flat_ids, flat_ids.new_zeros(())),
-        (
-            valid.to(torch.int32)
-            if compact_invalid
-            else torch.ones_like(flat_ids, dtype=torch.int32)
-        ),
+        weights = tl.load(topk_weights_ptr + route_offsets, mask=token_mask, other=0.0)
+        acc += values.to(tl.float32) * weights[:, None]
+    tl.store(
+        output_ptr + token_offsets[:, None] * hidden_size + hidden_offsets[None, :],
+        acc,
+        mask=token_mask[:, None] & hidden_mask[None, :],
     )
-    n_total_rows = int(sort_order.numel())
-    ragged_metadata = make_ragged_tensor_metadata(col_sum, n_total_rows)
-
-    return ragged_metadata, gather_indx, scatter_indx, gate_scal
 
 
-def _local_topk_for_ep(
+def _combine(
+    route_output: torch.Tensor,
     topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    num_tokens, top_k = topk_weights.shape
+    hidden_size = output.shape[1]
+    _combine_kernel[(triton.cdiv(num_tokens, 4), triton.cdiv(hidden_size, 256))](
+        route_output,
+        topk_weights.contiguous(),
+        output,
+        num_tokens,
+        hidden_size,
+        top_k=top_k,
+        BLOCK_M=4,
+        BLOCK_N=256,
+        num_warps=4,
+    )
+
+
+def _validate(
+    plan: dict,
+    x: torch.Tensor,
     w: torch.nn.Module,
-) -> tuple[torch.Tensor, torch.Tensor, int]:
-    ep_size = int(getattr(w, "ep_size", 1))
-    if ep_size <= 1:
-        return topk_weights, topk_ids, int(getattr(w, "num_experts"))
+    topk_weights: torch.Tensor | None,
+    topk_ids: torch.Tensor | None,
+    do_finalize: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not do_finalize:
+        raise ValueError("Triton MoE does not support deferred finalization")
+    if int(getattr(w, "ep_size", 1)) != 1:
+        raise ValueError("Triton MoE does not support expert parallelism")
+    if any(
+        getattr(w, name, None) is not None
+        for name in ("w13_weight_bias", "w2_weight_bias")
+    ):
+        raise ValueError("Triton MoE does not support expert bias")
+    if topk_weights is None or topk_ids is None:
+        raise ValueError("Triton MoE requires precomputed topk weights and ids")
 
-    num_experts = int(getattr(w, "num_experts"))
-    num_local_experts = int(getattr(w, "num_local_experts"))
-    if num_experts != num_local_experts * ep_size:
-        raise ValueError("inconsistent contiguous EP metadata")
-    ep_rank = int(getattr(w, "ep_rank", 0))
-    if not 0 <= ep_rank < ep_size:
-        raise ValueError(f"ep_rank must be in [0, {ep_size}), got {ep_rank}")
-    local_ids = topk_ids - ep_rank * num_local_experts
-    local_mask = (local_ids >= 0) & (local_ids < num_local_experts)
-    return (
-        torch.where(local_mask, topk_weights, torch.zeros_like(topk_weights)),
-        torch.where(local_mask, local_ids, topk_ids.new_full((), -1)),
-        num_local_experts,
+    activation = plan.get("activation") or getattr(w, "activation", "silu")
+    if activation not in {"silu", "situ", "swiglu"}:
+        raise ValueError(f"Triton MoE does not support activation {activation!r}")
+    swiglu_arg = getattr(w, "swiglu_arg", None)
+    if swiglu_arg is not None and (
+        getattr(swiglu_arg, "alpha", None) not in {None, 1.0}
+        or getattr(swiglu_arg, "limit", None) is not None
+    ):
+        raise ValueError("Triton MoE supports only standard SwiGLU")
+    if getattr(w, "swiglu_beta", None) not in {None, 0.0}:
+        raise ValueError("Triton MoE supports only standard SwiGLU")
+    if getattr(w, "w13_input_layout", "concatenated") != "concatenated":
+        raise ValueError("Triton MoE requires concatenated gate/up weights")
+    if activation == "situ":
+        situ_beta = getattr(w, "activation_situ_beta", None)
+        situ_linear_beta = getattr(w, "activation_situ_linear_beta", None)
+        if situ_beta is None or situ_beta <= 0:
+            raise ValueError("SiTU beta must be positive")
+        if situ_linear_beta is not None and situ_linear_beta <= 0:
+            raise ValueError("SiTU linear beta must be positive")
+
+    w13 = w.w13_weight
+    w13_scale = w.w13_weight_scale
+    w2 = w.w2_weight
+    w2_scale = w.w2_weight_scale
+    if x.ndim != 2:
+        raise ValueError("x must have shape [num_tokens, hidden_size]")
+    if x.dtype not in (torch.float16, torch.bfloat16):
+        raise TypeError("x must use torch.float16 or torch.bfloat16")
+    if any(t.dtype != torch.uint8 for t in (w13, w13_scale, w2, w2_scale)):
+        raise TypeError("MXFP4 packed values and scales must use torch.uint8")
+    if not all(
+        t.is_cuda and t.is_contiguous() for t in (x, w13, w13_scale, w2, w2_scale)
+    ):
+        raise ValueError("x and weights must be contiguous GPU tensors")
+    if topk_ids.ndim != 2 or topk_weights.shape != topk_ids.shape:
+        raise ValueError("top-k tensors must have shape [num_tokens, top_k]")
+    if topk_ids.dtype not in (torch.int32, torch.int64):
+        raise TypeError("topk_ids must use torch.int32 or torch.int64")
+    if not topk_weights.is_floating_point():
+        raise TypeError("topk_weights must use a floating-point dtype")
+    if topk_ids.device != x.device or topk_weights.device != x.device:
+        raise ValueError("top-k tensors and x must be on the same device")
+    if any(t.device != x.device for t in (w13, w13_scale, w2, w2_scale)):
+        raise ValueError("x and weights must be on the same device")
+
+    num_tokens, hidden_size = x.shape
+    num_experts, twice_intermediate_size, packed_hidden_size = w13.shape
+    intermediate_size = twice_intermediate_size // 2
+    top_k = topk_ids.shape[1]
+    if num_experts == 0:
+        raise ValueError("MXFP4 MoE requires at least one expert")
+    if topk_ids.shape[0] != num_tokens or top_k == 0:
+        raise ValueError("top-k tensors must have shape [num_tokens, top_k > 0]")
+    if twice_intermediate_size % 2 or packed_hidden_size * 2 != hidden_size:
+        raise ValueError("w13_weight has an incompatible packed shape")
+    if w13_scale.shape != (num_experts, 2 * intermediate_size, hidden_size // 32):
+        raise ValueError("w13_weight_scale must have shape [E, 2I, H/32]")
+    if w2.shape != (num_experts, hidden_size, intermediate_size // 2):
+        raise ValueError("w2_weight must have shape [E, H, I/2]")
+    if w2_scale.shape != (num_experts, hidden_size, intermediate_size // 32):
+        raise ValueError("w2_weight_scale must have shape [E, H, I/32]")
+    if hidden_size % 128 or intermediate_size % 128:
+        raise ValueError("hidden and intermediate sizes must be multiples of 128")
+    return topk_weights, topk_ids, activation
+
+
+@triton.jit
+def _quantize_mxfp4_routine(values, valid_mask):
+    block_m: tl.constexpr = values.shape[0]
+    block_k: tl.constexpr = values.shape[1]
+    num_scale_blocks: tl.constexpr = block_k // 32
+    values_f32 = values.to(tl.float32)
+    abs_values = tl.where(valid_mask, tl.abs(values_f32), 0.0)
+    abs_values = abs_values.reshape((block_m, num_scale_blocks, 32))
+    max_values = tl.max(abs_values, axis=2, keep_dims=True)
+
+    dequant_scale = max_values / 6.0
+    scale_bits = (dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000
+    dequant_scale = scale_bits.to(tl.float32, bitcast=True)
+    scales = (scale_bits.reshape((block_m, num_scale_blocks)) >> 23).to(tl.uint8)
+    quant_scale = tl.where(dequant_scale == 0, 0.0, 1.0 / dequant_scale)
+    normalized = values_f32.reshape((block_m, num_scale_blocks, 32)) * quant_scale
+    normalized = normalized.reshape((block_m, block_k))
+    normalized = tl.where(valid_mask, normalized, 0.0)
+
+    bits = normalized.to(tl.uint32, bitcast=True)
+    signs = bits & 0x80000000
+    exponents = (bits >> 23) & 0xFF
+    original_mantissas = bits & 0x7FFFFF
+    is_subnormal = exponents < 127
+    exponent_shift = 127 - (exponents + 1)
+    subnormal_mantissas = 0x400000 | (original_mantissas >> 1)
+    mantissas = tl.where(
+        is_subnormal,
+        subnormal_mantissas >> exponent_shift,
+        original_mantissas,
     )
+    exponents = tl.maximum(exponents, 126) - 126
+    mantissa_bits = mantissas >> 21
+    kept_lsb = (mantissa_bits >> 1) & 1
+    guard = mantissa_bits & 1
+    sticky = (mantissas & 0x1FFFFF) != 0
+    round_up = guard & (sticky | kept_lsb)
+    codes = tl.minimum((((exponents << 2) | mantissa_bits) + round_up) >> 1, 7)
+    codes = ((signs >> 28) | codes).to(tl.uint8)
+    code_pairs = codes.reshape((block_m, block_k // 2, 2))
+    low, high = tl.split(code_pairs)
+    return low | (high << 4), scales
 
 
-def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
-    MXFP_BLOCK_SIZE = 32
-
-    uses_situ = plan.get("activation") == "situ"
-
-    if hasattr(w, "w13_weight_bias"):
-        w13_bias = w.w13_weight_bias
-        if uses_situ:
-            w13_bias = _interleave_gate_up(w13_bias, -1)
-        w.w13_weight_bias = torch.nn.Parameter(
-            w13_bias.to(torch.float32), requires_grad=False
-        )
-    if hasattr(w, "w2_weight_bias"):
-        w.w2_weight_bias = torch.nn.Parameter(
-            w.w2_weight_bias.to(torch.float32), requires_grad=False
-        )
-
-    num_warps = 8
-    w13_linear = w.w13_weight
-    w13_scale_linear = w.w13_weight_scale
-    if uses_situ:
-        w13_linear = _interleave_gate_up(w13_linear, -2)
-        w13_scale_linear = _interleave_gate_up(w13_scale_linear, -2)
-    w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
-        w13_linear, w13_scale_linear, num_warps
+@triton.jit
+def _quantize_mxfp4_kernel(
+    x_ptr,
+    packed_ptr,
+    scale_ptr,
+    num_rows,
+    K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    row_offsets = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    k_start = tl.program_id(1) * BLOCK_K
+    k_offsets = k_start + tl.arange(0, BLOCK_K)
+    valid_mask = (row_offsets[:, None] < num_rows) & (k_offsets[None, :] < K)
+    values = tl.load(
+        x_ptr + row_offsets[:, None] * K + k_offsets[None, :],
+        mask=valid_mask,
+        other=0.0,
     )
-    w2_weight, w2_flex, w2_scale = _swizzle_mxfp4(
-        w.w2_weight, w.w2_weight_scale, num_warps
+    packed, scales = _quantize_mxfp4_routine(values, valid_mask)
+    packed_offsets = (
+        row_offsets[:, None] * (K // 2)
+        + k_start // 2
+        + tl.arange(0, BLOCK_K // 2)[None, :]
     )
-
-    if hasattr(w, "w13_input_scale") and hasattr(w, "w2_input_scale"):
-        # Collapse per-expert input scales to a single per-tensor scale
-        # per GEMM. Quark exports a constant value across experts for
-        # static ``per_tensor`` quantisation; ``max`` is a safe reduction
-        # in case individual experts reach slightly different values.
-        w13_in_scale = (
-            w.w13_input_scale.data.to(torch.float32)
-            .max()
-            .reshape(1)
-            .to(w.w13_input_scale.device)
-            .contiguous()
-        )
-        w2_in_scale = (
-            w.w2_input_scale.data.to(torch.float32)
-            .max()
-            .reshape(1)
-            .to(w.w2_input_scale.device)
-            .contiguous()
-        )
-        w.w13_act_scale = w13_in_scale
-        w.w2_act_scale = w2_in_scale
-
-        fp8_dtype = torch.float8_e4m3fn
-        w13_lhs = InFlexData(dtype=fp8_dtype, scale=w13_in_scale)
-        w2_lhs = InFlexData(dtype=fp8_dtype, scale=w2_in_scale)
-        # Force bf16 output so the swiglu / down-proj results stay in a
-        # standard floating dtype; without this, ``triton_kernels.matmul``
-        # defaults ``out_dtype`` to the input dtype (fp8) which would
-        # make the subsequent reductions / re-quantisation blow up.
-        out_dtype = torch.bfloat16
-    else:
-        w13_lhs = InFlexData()
-        w2_lhs = InFlexData()
-        out_dtype = torch.bfloat16 if _uses_dynamic_mxfp4_activations(w) else None
-
-    w.w13_precision_config = PrecisionConfig(
-        flex_ctx=FlexCtx(lhs_data=w13_lhs, rhs_data=w13_flex),
-        b_mx_scale=w13_scale,
-        b_microblock_size=MXFP_BLOCK_SIZE,
-        out_dtype=out_dtype,
+    scale_offsets = (
+        row_offsets[:, None] * (K // 32)
+        + k_start // 32
+        + tl.arange(0, BLOCK_K // 32)[None, :]
     )
-    w.w2_precision_config = PrecisionConfig(
-        flex_ctx=FlexCtx(lhs_data=w2_lhs, rhs_data=w2_flex),
-        b_mx_scale=w2_scale,
-        b_microblock_size=MXFP_BLOCK_SIZE,
-        out_dtype=out_dtype,
-    )
+    row_mask = row_offsets < num_rows
+    tl.store(packed_ptr + packed_offsets, packed, mask=row_mask[:, None])
+    tl.store(scale_ptr + scale_offsets, scales, mask=row_mask[:, None])
 
-    w.w13_weight_triton_tensor = w13_weight
-    w.w2_weight_triton_tensor = w2_weight
-    # Free original weights and scales (replaced by shuffled copies held in
-    # the triton tensors / precision configs above).
-    _release_parameter(w, "w13_weight")
-    _release_parameter(w, "w2_weight")
-    _release_parameter(w, "w13_weight_scale")
-    _release_parameter(w, "w2_weight_scale")
-    torch.cuda.empty_cache()
+
+@triton.jit
+def _stage1_kernel(
+    x_desc,
+    x_scale_ptr,
+    w13_desc,
+    w13_scale_ptr,
+    inter_packed_ptr,
+    inter_scale_ptr,
+    expert_route_ids_ptr,
+    expert_counts_ptr,
+    num_tokens,
+    hidden_size: tl.constexpr,
+    intermediate_size: tl.constexpr,
+    num_experts: tl.constexpr,
+    top_k: tl.constexpr,
+    situ_beta,
+    situ_linear_beta,
+    OUTPUT_DTYPE: tl.constexpr,
+    ACTIVATION: tl.constexpr,
+    HAS_LINEAR_BETA: tl.constexpr,
+    NUM_PROGRAMS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    route_count = num_tokens * top_k
+    scale_k = hidden_size // 32
+    tile_idx = tl.program_id(0)
+    problem_start = 0
+
+    for expert_id in range(num_experts):
+        group_m = tl.load(expert_counts_ptr + expert_id)
+        num_m_tiles = tl.cdiv(group_m, BLOCK_M)
+        num_n_tiles = tl.cdiv(intermediate_size, BLOCK_N)
+        problem_tiles = num_m_tiles * num_n_tiles
+
+        while tile_idx >= problem_start and tile_idx < problem_start + problem_tiles:
+            tile_in_problem = tile_idx - problem_start
+            tile_m = tile_in_problem // num_n_tiles
+            tile_n = tile_in_problem % num_n_tiles
+            local_rows = tile_m * BLOCK_M + tl.arange(0, BLOCK_M)
+            row_mask = local_rows < group_m
+            route_ids = tl.load(
+                expert_route_ids_ptr + expert_id * route_count + local_rows,
+                mask=row_mask,
+                other=-1,
+            ).to(tl.int32)
+            token_ids = tl.where(row_mask, route_ids // top_k, 0).to(tl.int32)
+            n_offset = tile_n * BLOCK_N
+            scale_rows = n_offset + tl.arange(0, BLOCK_N)
+            scale_cols = tl.arange(0, BLOCK_K // 32)
+            expert_scale = w13_scale_ptr + expert_id * 2 * intermediate_size * scale_k
+            gate_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            up_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+            for k_offset in range(0, hidden_size, BLOCK_K):
+                x = x_desc.gather(token_ids, k_offset // 2)
+                x_scale_offsets = (
+                    token_ids[:, None] * scale_k + k_offset // 32 + scale_cols[None, :]
+                )
+                x_scale = tl.load(
+                    x_scale_ptr + x_scale_offsets,
+                    mask=row_mask[:, None],
+                    other=0,
+                )
+                gate = w13_desc.load([expert_id, n_offset, k_offset // 2]).reshape(
+                    (BLOCK_N, BLOCK_K // 2)
+                )
+                up = w13_desc.load(
+                    [expert_id, intermediate_size + n_offset, k_offset // 2]
+                ).reshape((BLOCK_N, BLOCK_K // 2))
+                gate_scale = tl.load(
+                    expert_scale
+                    + scale_rows[:, None] * scale_k
+                    + k_offset // 32
+                    + scale_cols[None, :]
+                )
+                up_scale = tl.load(
+                    expert_scale
+                    + (intermediate_size + scale_rows[:, None]) * scale_k
+                    + k_offset // 32
+                    + scale_cols[None, :]
+                )
+                gate_acc = tl.dot_scaled(
+                    x,
+                    x_scale,
+                    "e2m1",
+                    gate.T,
+                    gate_scale,
+                    "e2m1",
+                    gate_acc,
+                    fast_math=False,
+                    lhs_k_pack=True,
+                    rhs_k_pack=True,
+                )
+                up_acc = tl.dot_scaled(
+                    x,
+                    x_scale,
+                    "e2m1",
+                    up.T,
+                    up_scale,
+                    "e2m1",
+                    up_acc,
+                    fast_math=False,
+                    lhs_k_pack=True,
+                    rhs_k_pack=True,
+                )
+
+            output_dtype: tl.constexpr = (
+                tl.bfloat16 if OUTPUT_DTYPE == "bf16" else tl.float16
+            )
+            gate = gate_acc.to(output_dtype)
+            up = up_acc.to(output_dtype)
+            if ACTIVATION == "situ":
+                gate = gate.to(tl.float32)
+                up = up.to(tl.float32)
+                gate = situ_beta * libdevice.tanh(gate / situ_beta) * tl.sigmoid(gate)
+                if HAS_LINEAR_BETA:
+                    up = situ_linear_beta * libdevice.tanh(up / situ_linear_beta)
+                activated = (gate * up).to(output_dtype)
+            else:
+                silu = (gate.to(tl.float32) * tl.sigmoid(gate.to(tl.float32))).to(
+                    output_dtype
+                )
+                activated = (silu * up).to(output_dtype)
+            valid_mask = row_mask[:, None] & (tl.arange(0, BLOCK_N)[None, :] < BLOCK_N)
+            activated_packed, activated_scales = _quantize_mxfp4_routine(
+                activated, valid_mask
+            )
+            inter_packed_offsets = (
+                route_ids[:, None] * (intermediate_size // 2)
+                + n_offset // 2
+                + tl.arange(0, BLOCK_N // 2)[None, :]
+            )
+            inter_scale_offsets = (
+                route_ids[:, None] * (intermediate_size // 32)
+                + n_offset // 32
+                + tl.arange(0, BLOCK_N // 32)[None, :]
+            )
+            tl.store(
+                inter_packed_ptr + inter_packed_offsets,
+                activated_packed,
+                mask=row_mask[:, None],
+            )
+            tl.store(
+                inter_scale_ptr + inter_scale_offsets,
+                activated_scales,
+                mask=row_mask[:, None],
+            )
+            tile_idx += NUM_PROGRAMS
+
+        problem_start += problem_tiles
+
+
+@triton.jit
+def _stage2_kernel(
+    inter_packed_ptr,
+    inter_scale_ptr,
+    w2_desc,
+    w2_scale_ptr,
+    route_output_ptr,
+    expert_route_ids_ptr,
+    expert_counts_ptr,
+    num_tokens,
+    hidden_size: tl.constexpr,
+    intermediate_size: tl.constexpr,
+    num_experts: tl.constexpr,
+    top_k: tl.constexpr,
+    NUM_PROGRAMS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    route_count = num_tokens * top_k
+    scale_k = intermediate_size // 32
+    tile_idx = tl.program_id(0)
+    problem_start = 0
+
+    for expert_id in range(num_experts):
+        group_m = tl.load(expert_counts_ptr + expert_id)
+        num_m_tiles = tl.cdiv(group_m, BLOCK_M)
+        num_n_tiles = tl.cdiv(hidden_size, BLOCK_N)
+        problem_tiles = num_m_tiles * num_n_tiles
+
+        while tile_idx >= problem_start and tile_idx < problem_start + problem_tiles:
+            tile_in_problem = tile_idx - problem_start
+            tile_m = tile_in_problem // num_n_tiles
+            tile_n = tile_in_problem % num_n_tiles
+            local_rows = tile_m * BLOCK_M + tl.arange(0, BLOCK_M)
+            row_mask = local_rows < group_m
+            route_ids = tl.load(
+                expert_route_ids_ptr + expert_id * route_count + local_rows,
+                mask=row_mask,
+                other=-1,
+            ).to(tl.int32)
+            route_ids = tl.where(row_mask, route_ids, -1).to(tl.int32)
+            n_offset = tile_n * BLOCK_N
+            scale_rows = n_offset + tl.arange(0, BLOCK_N)
+            scale_cols = tl.arange(0, BLOCK_K // 32)
+            expert_scale = w2_scale_ptr + expert_id * hidden_size * scale_k
+            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+            for k_offset in range(0, intermediate_size, BLOCK_K):
+                intermediate_offsets = (
+                    route_ids[:, None] * (intermediate_size // 2)
+                    + k_offset // 2
+                    + tl.arange(0, BLOCK_K // 2)[None, :]
+                )
+                intermediate = tl.load(
+                    inter_packed_ptr + intermediate_offsets,
+                    mask=row_mask[:, None],
+                    other=0,
+                )
+                intermediate_scale_offsets = (
+                    route_ids[:, None] * scale_k + k_offset // 32 + scale_cols[None, :]
+                )
+                intermediate_scale = tl.load(
+                    inter_scale_ptr + intermediate_scale_offsets,
+                    mask=row_mask[:, None],
+                    other=0,
+                )
+                weight = w2_desc.load([expert_id, n_offset, k_offset // 2]).reshape(
+                    (BLOCK_N, BLOCK_K // 2)
+                )
+                weight_scale = tl.load(
+                    expert_scale
+                    + scale_rows[:, None] * scale_k
+                    + k_offset // 32
+                    + scale_cols[None, :]
+                )
+                acc = tl.dot_scaled(
+                    intermediate,
+                    intermediate_scale,
+                    "e2m1",
+                    weight.T,
+                    weight_scale,
+                    "e2m1",
+                    acc,
+                    fast_math=False,
+                    lhs_k_pack=True,
+                    rhs_k_pack=True,
+                )
+
+            output_offsets = (
+                route_ids[:, None] * hidden_size
+                + n_offset
+                + tl.arange(0, BLOCK_N)[None, :]
+            )
+            tl.store(route_output_ptr + output_offsets, acc, mask=row_mask[:, None])
+            tile_idx += NUM_PROGRAMS
+
+        problem_start += problem_tiles
+
+
+def _moe(
+    x: torch.Tensor,
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    activation: str,
+    situ_beta: float,
+    situ_linear_beta: float | None,
+) -> torch.Tensor:
+    num_tokens, hidden_size = x.shape
+    num_experts, twice_intermediate_size, _ = w13.shape
+    intermediate_size = twice_intermediate_size // 2
+    top_k = topk_ids.shape[1]
+    if num_tokens == 0:
+        return torch.empty_like(x)
+
+    expert_route_ids, expert_counts = _routing(topk_ids, num_experts)
+    route_count = num_tokens * top_k
+    x_packed = torch.empty(
+        (num_tokens, hidden_size // 2), device=x.device, dtype=torch.uint8
+    )
+    x_scale = torch.empty(
+        (num_tokens, hidden_size // 32), device=x.device, dtype=torch.uint8
+    )
+    intermediate_packed = torch.empty(
+        (route_count, intermediate_size // 2), device=x.device, dtype=torch.uint8
+    )
+    intermediate_scale = torch.empty(
+        (route_count, intermediate_size // 32), device=x.device, dtype=torch.uint8
+    )
+    # Invalid expert ids are absent from routing; zero their canonical rows.
+    route_output = torch.zeros(
+        (route_count, hidden_size), device=x.device, dtype=x.dtype
+    )
+    output = torch.empty_like(x)
+    block_m = 16 if num_tokens <= 16 else 64
+    stage1_block_n = 64
+    stage2_block_n = 128
+    block_k = 128
+    num_sms = torch.cuda.get_device_properties(x.device).multi_processor_count
+    stage1_programs = min(
+        num_sms, route_count * triton.cdiv(intermediate_size, stage1_block_n)
+    )
+    stage2_programs = min(
+        num_sms, route_count * triton.cdiv(hidden_size, stage2_block_n)
+    )
+    backend = triton.runtime.driver.active.get_current_target().backend
+    amd_options = {"matrix_instr_nonkdim": 32, "kpack": 1} if backend == "hip" else {}
+    quant_block_k = 256 if hidden_size % 256 == 0 else 128
+    _quantize_mxfp4_kernel[
+        (triton.cdiv(num_tokens, block_m), triton.cdiv(hidden_size, quant_block_k))
+    ](
+        x,
+        x_packed,
+        x_scale,
+        num_tokens,
+        K=hidden_size,
+        BLOCK_M=block_m,
+        BLOCK_K=quant_block_k,
+        num_warps=4,
+    )
+    x_desc = TensorDescriptor.from_tensor(x_packed, [1, block_k // 2])
+    w13_desc = TensorDescriptor.from_tensor(w13, [1, stage1_block_n, block_k // 2])
+    w2_desc = TensorDescriptor.from_tensor(w2, [1, stage2_block_n, block_k // 2])
+
+    _stage1_kernel[(stage1_programs,)](
+        x_desc,
+        x_scale,
+        w13_desc,
+        w13_scale,
+        intermediate_packed,
+        intermediate_scale,
+        expert_route_ids,
+        expert_counts,
+        num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        top_k=top_k,
+        situ_beta=situ_beta,
+        situ_linear_beta=(1.0 if situ_linear_beta is None else situ_linear_beta),
+        OUTPUT_DTYPE="bf16" if x.dtype == torch.bfloat16 else "fp16",
+        ACTIVATION=activation,
+        HAS_LINEAR_BETA=situ_linear_beta is not None,
+        NUM_PROGRAMS=stage1_programs,
+        BLOCK_M=block_m,
+        BLOCK_N=stage1_block_n,
+        BLOCK_K=block_k,
+        num_warps=4 if block_m == 16 else 8,
+        num_stages=3,
+        **amd_options,
+    )
+    _stage2_kernel[(stage2_programs,)](
+        intermediate_packed,
+        intermediate_scale,
+        w2_desc,
+        w2_scale,
+        route_output,
+        expert_route_ids,
+        expert_counts,
+        num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        top_k=top_k,
+        NUM_PROGRAMS=stage2_programs,
+        BLOCK_M=block_m,
+        BLOCK_N=stage2_block_n,
+        BLOCK_K=block_k,
+        num_warps=4 if block_m == 16 else 8,
+        num_stages=3,
+        **amd_options,
+    )
+    _combine(route_output, topk_weights, output)
+    return output
+
+
+# ===-----------------------------------------------------------------------===#
+# Kernel Registry
+# ===-----------------------------------------------------------------------===#
+
+
+def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module) -> None:
+    """Validate that the module retains the linear OCP MXFP4 weight layout."""
+    names = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
+    if any(not hasattr(w, name) for name in names):
+        raise ValueError("linear MXFP4 MoE weights are incomplete")
+    tensors = tuple(getattr(w, name) for name in names)
+    if any(t.dtype != torch.uint8 for t in tensors):
+        raise TypeError("MXFP4 packed values and scales must use torch.uint8")
+    if any(not t.is_cuda or not t.is_contiguous() for t in tensors):
+        raise ValueError("linear MXFP4 weights must be contiguous GPU tensors")
+    if any(t.ndim != 3 for t in tensors):
+        raise ValueError("linear MXFP4 weights must be rank-3")
+    if len({t.shape[0] for t in tensors}) != 1:
+        raise ValueError("linear MXFP4 weights must share an expert axis")
+    if getattr(w, "w13_input_layout", "concatenated") != "concatenated":
+        raise ValueError("Triton MXFP4 MoE requires concatenated gate/up weights")
+    activation = plan.get("activation") or getattr(w, "activation", "silu")
+    if activation not in {"silu", "situ", "swiglu"}:
+        raise ValueError(f"Triton MXFP4 MoE does not support {activation!r}")
 
 
 @register_kernel(
@@ -487,76 +701,21 @@ def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
     solution="triton",
     weight_preprocessor=triton_mxfp4_moe_weights,
     capability=CapabilityRequirement(vendors=frozenset({"amd"})),
-    signatures=format_signatures(
-        "x",
-        "dense",
-        {torch.float16, torch.bfloat16},
-    ),
+    signatures=format_signatures("x", "dense", {torch.float16, torch.bfloat16}),
     traits={
         "weight_dtype": frozenset({"mxfp4"}),
-        "activation": frozenset({"silu", "situ"}),
+        "activation": frozenset({"silu", "situ", "swiglu"}),
         "routing_mode": frozenset({"precomputed_topk"}),
         "supports_deferred_finalize": frozenset({False}),
         "supports_ep": frozenset({False}),
         "supports_all_to_all_ep": frozenset({False}),
-        "ispp_alignment": frozenset({1}),
-        "internal_activation_dtype": frozenset({"fp8", "input"}),
-        "supports_bias": frozenset({True}),
-    },
-    priority=Priority.SPECIALIZED + 2,
-)
-@register_kernel(
-    "moe",
-    "apply",
-    name="triton_mxfp4_ep_precomputed_moe_apply",
-    solution="triton",
-    weight_preprocessor=triton_mxfp4_moe_weights,
-    capability=CapabilityRequirement(vendors=frozenset({"amd"})),
-    signatures=format_signatures(
-        "x",
-        "dense",
-        {torch.float16, torch.bfloat16},
-    ),
-    traits={
-        "weight_dtype": frozenset({"mxfp4"}),
-        "activation": frozenset({"silu", "situ"}),
-        "routing_mode": frozenset({"precomputed_topk"}),
-        "supports_deferred_finalize": frozenset({False}),
-        "supports_ep": frozenset({True}),
-        "supports_all_to_all_ep": frozenset({False}),
-        "ispp_alignment": frozenset({1}),
-        "internal_activation_dtype": frozenset({"fp8", "input"}),
-        "supports_bias": frozenset({True}),
-    },
-    # Broad AMD EP fallback. Gfx950 K3 EP8 selects the narrower Gluon path;
-    # Triton remains the default for other supported AMD EP layouts.
-    priority=Priority.PERFORMANT + 1,
-)
-@register_kernel(
-    "moe",
-    "apply",
-    name="triton_mxfp4_moe_apply",
-    solution="triton",
-    weight_preprocessor=triton_mxfp4_moe_weights,
-    signatures=format_signatures(
-        "x",
-        "dense",
-        {torch.float16, torch.bfloat16},
-    ),
-    traits={
-        "weight_dtype": frozenset({"mxfp4"}),
-        "activation": frozenset({"silu", "swiglu"}),
-        "routing_mode": frozenset({"kernel_routing"}),
-        "supports_deferred_finalize": frozenset({False}),
-        "supports_ep": frozenset({False}),
-        "supports_all_to_all_ep": frozenset({False}),
-        "ispp_alignment": frozenset({1}),
-        "internal_activation_dtype": frozenset({"input", "fp8"}),
-        "supports_bias": frozenset({True}),
+        "ispp_alignment": frozenset({128}),
+        "internal_activation_dtype": frozenset({"mxfp4"}),
+        "supports_bias": frozenset({False}),
     },
     priority=Priority.PORTABLE,
 )
-def triton_mxfp4_moe_apply(
+def triton_mxfp4_precomputed_moe_apply(
     plan: dict,
     x: torch.Tensor,
     w: torch.nn.Module,
@@ -567,157 +726,37 @@ def triton_mxfp4_moe_apply(
     max_num_tokens_per_gpu: int | None = None,
     do_finalize: bool = True,
     enable_pdl: bool = False,
-):
-    del enable_pdl
-    swiglu_arg = getattr(w, "swiglu_arg", None)
+) -> torch.Tensor:
+    """Apply a dynamic A4W4 MXFP4 Triton MoE with precomputed routing.
 
-    top_k = getattr(w, "top_k")
-    n_tokens = router_logits.shape[0]
-    uses_ep = int(getattr(w, "ep_size", 1)) > 1
-    activation = plan.get("activation") or getattr(w, "activation", "silu")
-    w13_weight = w.w13_weight_triton_tensor
-    w2_weight = w.w2_weight_triton_tensor
-    w13_bias = getattr(w, "w13_weight_bias", None)
-    w2_bias = getattr(w, "w2_weight_bias", None)
-    w13_pc = getattr(w, "w13_precision_config", None)
-    w2_pc = getattr(w, "w2_precision_config", None)
+    Args:
+        plan: MoE plan selecting standard SiLU/SwiGLU or SiTU activation.
+        x: Contiguous FP16/BF16 hidden states `[tokens, hidden]`.
+        w: Module holding linear packed E2M1 `w13_weight`/`w2_weight` and
+            E8M0 `w13_weight_scale`/`w2_weight_scale` tensors.
+        router_logits: Unused because routing must be precomputed.
+        topk_weights: Route weights `[tokens, top_k]`.
+        topk_ids: Expert ids `[tokens, top_k]`. Out-of-range ids contribute zero.
+        num_tokens_global: Unused; distributed expert parallelism is unsupported.
+        max_num_tokens_per_gpu: Unused token-capacity hint.
+        do_finalize: Must be true.
+        enable_pdl: Unused launch hint.
 
-    if topk_weights is not None or topk_ids is not None:
-        if topk_weights is None or topk_ids is None:
-            raise ValueError("topk_weights and topk_ids must be provided together")
-        # Decode reuses Triton's K-packed value tensors and CDNA4-swizzled
-        # scales directly.  It skips route sorting and the 64-row grouped-MFMA
-        # padding that dominates sparse EP8 M=1 execution. The kernels localize
-        # global expert ids while loading them, avoiding a separate subtract,
-        # two masks, and two ``where`` kernels before every MoE layer. Prefill
-        # remains on the regular Triton matmuls below.
-        use_gfx950_warp_decode = (
-            current_platform().is_cdna4
-            and uses_ep
-            and n_tokens <= MXFP4_SITU_WARP_DECODE_MAX_TOKENS
-            and x.dtype == torch.bfloat16
-            and activation == "situ"
-            and do_finalize
-            and w13_bias is None
-            and w2_bias is None
-            and not hasattr(w, "w13_act_scale")
-            and not hasattr(w, "w2_act_scale")
-            and not _uses_dynamic_mxfp4_activations(w)
-            and x.shape[1] % 256 == 0
-            and w13_weight.shape[-1] % 512 == 0
-        )
-        if use_gfx950_warp_decode:
-            from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_decode import (
-                gluon_a16w4_situ_warp_decode_ep_gfx950,
-            )
-
-            return gluon_a16w4_situ_warp_decode_ep_gfx950(
-                x,
-                w13_weight.storage.data,
-                w13_pc.b_mx_scale.storage.data,
-                w2_weight.storage.data,
-                w2_pc.b_mx_scale.storage.data,
-                topk_weights,
-                topk_ids,
-                situ_beta=float(getattr(w, "activation_situ_beta", 1.0)),
-                situ_linear_beta=getattr(w, "activation_situ_linear_beta", None),
-                expert_start=(
-                    int(getattr(w, "ep_rank", 0)) * int(getattr(w, "num_local_experts"))
-                ),
-            )
-        topk_weights, topk_ids, num_experts = _local_topk_for_ep(
-            topk_weights,
-            topk_ids,
-            w,
-        )
-        ragged_metadata, gather_indx, scatter_indx, gate_scal = _routing_from_topk(
-            topk_weights,
-            topk_ids,
-            num_experts=num_experts,
-            dtype=router_logits.dtype,
-            compact_invalid=uses_ep,
-        )
-    else:
-        ragged_metadata, gather_indx, scatter_indx, gate_scal = _routing(
-            router_logits,
-            top_k,
-            sm_first=False,
-            dtype=router_logits.dtype,
-        )
-
-    act = None
-    if activation == "situ":
-        linear_beta = getattr(w, "activation_situ_linear_beta", None)
-        act = FusedActivation(
-            FnSpecs(
-                "situ",
-                _situ_fused_fn,
-                ("beta", "linear_beta", "HAS_LINEAR_BETA"),
-                reduction_n=2,
-            ),
-            (
-                float(getattr(w, "activation_situ_beta", 1.0)),
-                1.0 if linear_beta is None else float(linear_beta),
-                linear_beta is not None,
-            ),
-        )
-    elif swiglu_arg is not None:
-        act = FusedActivation(
-            FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), reduction_n=2),
-            (swiglu_arg.alpha, swiglu_arg.limit),
-        )
-
-    use_dynamic_mxfp4 = _uses_dynamic_mxfp4_activations(w)
-    if hasattr(w, "w13_act_scale"):
-        gemm1_input = fp8_quantize(x, scale=w.w13_act_scale)
-    elif use_dynamic_mxfp4:
-        gemm1_input, gemm1_scale = _quantize_mxfp4_activation(x)
-        w13_pc = _with_activation_mx_scale(
-            w13_pc,
-            gemm1_scale,
-        )
-    else:
-        gemm1_input = x
-
-    with _maybe_lds_guard(gemm1_input, w13_weight, w13_pc):
-        intermediate_cache = matmul(
-            gemm1_input,
-            w13_weight,
-            w13_bias,
-            a_ragged_metadata=ragged_metadata,
-            gather_indx=gather_indx,
-            precision_config=w13_pc,
-            fused_activation=act,
-        )
-    if act is None:
-        intermediate_cache = _silu_gate_up(
-            intermediate_cache,
-            output_dtype=x.dtype,
-        )
-
-    if hasattr(w, "w2_act_scale"):
-        gemm2_input = fp8_quantize(intermediate_cache, scale=w.w2_act_scale)
-    elif use_dynamic_mxfp4:
-        gemm2_input, gemm2_scale = _quantize_mxfp4_activation(intermediate_cache)
-        w2_pc = _with_activation_mx_scale(
-            w2_pc,
-            gemm2_scale,
-        )
-    else:
-        gemm2_input = intermediate_cache
-
-    with _maybe_lds_guard(gemm2_input, w2_weight, w2_pc):
-        output = matmul(
-            gemm2_input,
-            w2_weight,
-            w2_bias,
-            a_ragged_metadata=ragged_metadata,
-            precision_config=w2_pc,
-            scatter_indx=scatter_indx,
-            gammas=gate_scal,
-        )
-    if uses_ep:
-        return _reduce_local_topk(output, topk_ids, n_tokens)
-    if top_k > 1:
-        return output.view(n_tokens, top_k, output.shape[-1]).sum(dim=1)
-    return output
+    Returns:
+        Finalized hidden states `[tokens, hidden]` with dtype matching `x`.
+    """
+    topk_weights, topk_ids, activation = _validate(
+        plan, x, w, topk_weights, topk_ids, do_finalize
+    )
+    return _moe(
+        x,
+        w.w13_weight,
+        w.w13_weight_scale,
+        w.w2_weight,
+        w.w2_weight_scale,
+        topk_weights,
+        topk_ids,
+        activation,
+        float(getattr(w, "activation_situ_beta", 1.0) or 1.0),
+        getattr(w, "activation_situ_linear_beta", None),
+    )

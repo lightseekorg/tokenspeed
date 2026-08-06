@@ -79,6 +79,18 @@ class PadBlockTablesTest(_TorchCase):
         out = self.pad(tables, actual_bs=3, padded_bs=3)
         self.assertIs(out["full_attention"], tables["full_attention"])
 
+    def test_rejects_partial_or_oversized_batch_rows(self):
+        torch = self.torch
+        for rows in (2, 5):
+            with self.subTest(rows=rows), self.assertRaisesRegex(
+                RuntimeError, "expected actual_bs=3 or padded_bs=4"
+            ):
+                self.pad(
+                    {"full_attention": torch.ones((rows, 2), dtype=torch.int32)},
+                    actual_bs=3,
+                    padded_bs=4,
+                )
+
 
 class CacheGroupIdsTest(_TorchCase):
     """Wrapper-side capture contract: group ids only, no fabricated tensors."""
@@ -238,7 +250,7 @@ class WrapperReplayGroupedTest(_TorchCase):
             src["full_attention"],
         )
 
-    def test_single_table_target_still_routes_group_tables_to_draft(self):
+    def test_single_table_target_pads_group_tables_before_draft_routing(self):
         torch = self.torch
         from tokenspeed.runtime.execution.cuda_graph_wrapper import (
             CudaGraphWrapper,
@@ -264,9 +276,12 @@ class WrapperReplayGroupedTest(_TorchCase):
             ),
             drafter=SimpleNamespace(
                 draft_seq_lens_buf=torch.zeros(2, dtype=torch.int32),
-                req_to_page=torch.zeros((2, MAX_NUM_PAGES), dtype=torch.int32),
+                page_table=torch.zeros((2, MAX_NUM_PAGES), dtype=torch.int32),
             ),
             _draft_group_tables=lambda tables: tables,
+            _pad_block_tables_to_padded_bs=(
+                CudaGraphWrapper._pad_block_tables_to_padded_bs
+            ),
         )
         tables = {
             "full_attention": torch.tensor([[3, 4]], dtype=torch.int32),
@@ -278,12 +293,82 @@ class WrapperReplayGroupedTest(_TorchCase):
             actual_bs=1,
             req_pool_indices=torch.arange(2, dtype=torch.int64),
             seq_lens=torch.ones(2, dtype=torch.int32),
-            req_to_page=torch.zeros((2, MAX_NUM_PAGES), dtype=torch.int32),
+            page_table=torch.zeros((2, MAX_NUM_PAGES), dtype=torch.int32),
             forward_mode=_decode_forward_mode(),
             block_tables=tables,
         )
 
-        self.assertIs(draft_call["block_tables"], tables)
+        padded = draft_call["block_tables"]
+        self.assertEqual(tuple(padded["full_attention"].shape), (2, 2))
+        self.assertTrue(
+            (padded["full_attention"][:1] == tables["full_attention"]).all()
+        )
+        self.assertTrue((padded["full_attention"][1:] == 0).all())
+
+    def test_target_and_draft_share_padded_replay_tables(self):
+        torch = self.torch
+        from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+            CudaGraphWrapper,
+        )
+
+        calls = {}
+
+        def record_target(bs, req_pool_indices, seq_lens, **kwargs):
+            calls["target"] = kwargs["block_tables"]
+
+        def record_draft(bs, req_pool_indices, seq_lens, **kwargs):
+            calls["draft"] = kwargs["block_tables"]
+
+        backend_contract = {
+            "uses_cache_groups": True,
+            "uses_paged_cache_groups": False,
+            "uses_padded_decode_token_mask": True,
+        }
+        mock = SimpleNamespace(
+            attn_backend=SimpleNamespace(
+                **backend_contract,
+                init_forward_metadata_replay_cuda_graph=record_target,
+            ),
+            draft_attn_backend=SimpleNamespace(
+                **backend_contract,
+                init_forward_metadata_replay_cuda_graph=record_draft,
+            ),
+            drafter=SimpleNamespace(
+                draft_seq_lens_buf=torch.zeros(4, dtype=torch.int32),
+                page_table=torch.zeros((4, MAX_NUM_PAGES), dtype=torch.int32),
+            ),
+            _draft_group_tables=lambda tables: {
+                "full_attention": tables["full_attention"]
+            },
+            _pad_block_tables_to_padded_bs=(
+                CudaGraphWrapper._pad_block_tables_to_padded_bs
+            ),
+        )
+        tables = {
+            "full_attention": torch.arange(6, dtype=torch.int32).reshape(3, 2),
+            "state": torch.ones((3, 2), dtype=torch.int32),
+        }
+
+        CudaGraphWrapper._init_replay_metadata(
+            mock,
+            padded_bs=4,
+            actual_bs=3,
+            req_pool_indices=torch.arange(4, dtype=torch.int64),
+            seq_lens=torch.ones(4, dtype=torch.int32),
+            page_table=torch.zeros((4, MAX_NUM_PAGES), dtype=torch.int32),
+            forward_mode=_decode_forward_mode(),
+            block_tables=tables,
+        )
+
+        self.assertIs(
+            calls["draft"]["full_attention"],
+            calls["target"]["full_attention"],
+        )
+        self.assertEqual(set(calls["target"]), set(tables))
+        self.assertEqual(set(calls["draft"]), {"full_attention"})
+        for table in calls["target"].values():
+            self.assertEqual(tuple(table.shape), (4, 2))
+            self.assertTrue((table[3:] == 0).all())
 
 
 class WrapperCaptureGroupIdsTest(_TorchCase):
@@ -396,7 +481,7 @@ class WrapperEagerGroupGuardTest(_TorchCase):
             bs=2,
             ctx=ctx,
             sampling_info=None,
-            req_to_page=torch.zeros((MAX_BS, MAX_NUM_PAGES), dtype=torch.int32),
+            page_table=torch.zeros((MAX_BS, MAX_NUM_PAGES), dtype=torch.int32),
             block_tables=block_tables,
         )
         return calls
@@ -471,6 +556,7 @@ class _BackendCase(_TorchCase):
         backend.is_draft = False
         backend.draft_block_decode = False
         backend.state_group_ids = frozenset()
+        backend.group_page_sizes = {}
         backend.max_num_pages = MAX_NUM_PAGES
         backend.page_size = 2
         backend.device = "cpu"
@@ -572,7 +658,7 @@ class BackendStateGroupShedTest(_BackendCase):
             num_extends=0,
             req_pool_indices=torch.arange(2, dtype=torch.int64),
             seq_lens=torch.tensor([3, 4], dtype=torch.int32),
-            req_to_page=torch.zeros((MAX_BS, MAX_NUM_PAGES), dtype=torch.int32),
+            page_table=torch.zeros((MAX_BS, MAX_NUM_PAGES), dtype=torch.int32),
             forward_mode=forward_mode,
             block_tables={
                 "full_attention": torch.tensor([[1, 2], [3, 4]], dtype=torch.int32),

@@ -46,7 +46,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.model_runner import ModelRunner
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
-    from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 
 
@@ -81,9 +81,9 @@ class Eagle(BaseDrafter):
         spec_num_steps: int,
         page_size: int,
         draft_model_runner: ModelRunner,
-        req_to_page: torch.Tensor,
+        page_table: torch.Tensor,
         attn_backend: AttentionBackend | None = None,
-        token_to_kv_pool: BaseTokenToKVPool | None = None,
+        token_to_kv_pool: CachePool | None = None,
         runtime_states: RuntimeStates | None = None,
         input_buffers: InputBuffers | None = None,
         vocab_size: int | None = None,
@@ -96,7 +96,7 @@ class Eagle(BaseDrafter):
             runtime_states=runtime_states,
             input_buffers=input_buffers,
             page_size=page_size,
-            req_to_page=req_to_page,
+            page_table=page_table,
             attn_backend=attn_backend,
             token_to_kv_pool=token_to_kv_pool,
             vocab_size=vocab_size,
@@ -293,7 +293,6 @@ class Eagle(BaseDrafter):
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
-            req_to_page=self.req_to_page,
             bs=bs,
             num_extends=draft_input.num_extends,
             input_num_tokens=input_num_tokens,
@@ -367,10 +366,9 @@ class Eagle(BaseDrafter):
         cache_locs = self.draft_out_cache_loc_buf[: bs * (self.spec_num_steps - 1)]
         compute_out_cache_loc_uniform(
             out_cache_loc_ptr=cache_locs,
-            req_pool_indices=req_pool_indices,
             uniform_input_length=self.spec_num_steps - 1,
             cache_start=cache_start,
-            req_to_pages=self.req_to_page,
+            page_table=self.page_table,
             page_size=self.page_size,
         )
         cache_locs = cache_locs.view(bs, self.spec_num_steps - 1)
@@ -399,7 +397,6 @@ class Eagle(BaseDrafter):
                 num_extends=0,
                 attn_backend=self.attn_backend,
                 token_to_kv_pool=self.token_to_kv_pool,
-                req_to_page=self.req_to_page,
                 input_num_tokens=bs,
                 forward_mode=ForwardMode.DECODE,
                 capture_hidden_mode=CaptureHiddenMode.LAST,
