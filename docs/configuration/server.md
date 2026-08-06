@@ -82,6 +82,8 @@ and `GET /model_info` to read the model path and version together.
 | `--enforce-eager` | Disable CUDA graph execution. |
 | `--max-cudagraph-capture-size` | Largest batch size to capture with CUDA graphs. |
 | `--cudagraph-capture-sizes` | Explicit CUDA graph capture sizes. |
+| `--disable-kvstore` | Disable the KVStore host-memory/offload path. |
+| `--disable-cuda-graph-padding` | Skip CUDA graphs when padding is required; still use graphs when no padding is needed. |
 
 `--chunked-prefill-size` is intentionally separate from
 `--max-num-batched-tokens`: in TokenSpeed it is the scheduler's per-iteration
