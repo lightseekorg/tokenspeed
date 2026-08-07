@@ -46,92 +46,67 @@ def _load_paged_cache_spec():
 _pcs = _load_paged_cache_spec()
 
 
-class FakeCacheGroupBackend:
-    uses_cache_groups = True
+class FakeGroupSpec:
+    def __init__(self, family: str):
+        self.family = family
 
 
-class FakeSpecIncapableBackend:
-    uses_cache_groups = True
-    cache_group_spec_capable = False
+class FakeContract:
+    def __init__(self, *families: str):
+        self.group_specs = tuple(FakeGroupSpec(f) for f in families)
 
 
 class FakePool:
-    pass
+    def __init__(self, contract: FakeContract | None):
+        self.runtime_contract = contract
 
 
-class FakeGroup:
-    group_id = "full_attention"
+class HistoryBackend:
+    cache_consumer_families = frozenset({"history"})
+
+
+class HybridBackend:
+    cache_consumer_families = frozenset({"history", "state"})
 
 
 class ValidateSchedulerConfigTest(unittest.TestCase):
     def test_no_build_capability_probe(self):
         self.assertNotIn("scheduler_ext_flat_kvcache", _pcs.__dict__)
 
-    def test_zero_groups_rejected(self):
-        with self.assertRaisesRegex(RuntimeError, "at least one paged-cache group"):
+    def test_contractless_pool_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, "PagedCacheRuntimeContract"):
             _pcs.validate_scheduler_config(
-                paged_cache_groups=[],
-                attn_backend=FakeCacheGroupBackend(),
-                kv_pool=FakePool(),
+                attn_backend=HistoryBackend(),
+                kv_pool=FakePool(None),
             )
 
-    def test_single_group_table_blind_backend_uses_compatibility_table(self):
-        class SingleTableBackend:
+    def test_covered_families_pass(self):
+        _pcs.validate_scheduler_config(
+            attn_backend=HistoryBackend(),
+            kv_pool=FakePool(FakeContract("history")),
+        )
+        _pcs.validate_scheduler_config(
+            attn_backend=HybridBackend(),
+            kv_pool=FakePool(FakeContract("history", "state")),
+        )
+
+    def test_missing_family_rejected(self):
+        # A hybrid pool's state group has no consumer in a history-only
+        # backend; its tables would go unread.
+        with self.assertRaisesRegex(RuntimeError, r"missing \['state'\]"):
+            _pcs.validate_scheduler_config(
+                attn_backend=HistoryBackend(),
+                kv_pool=FakePool(FakeContract("history", "state")),
+            )
+
+    def test_backend_without_declared_families_rejected(self):
+        class UndeclaredBackend:
             pass
 
-        _pcs.validate_scheduler_config(
-            paged_cache_groups=[FakeGroup()],
-            attn_backend=SingleTableBackend(),
-            kv_pool=FakePool(),
-        )
-
-    def test_multi_group_table_blind_backend_rejected(self):
-        class SingleTableBackend:
-            pass
-
-        with self.assertRaisesRegex(RuntimeError, "single-table fallback"):
+        with self.assertRaisesRegex(RuntimeError, "consumer families"):
             _pcs.validate_scheduler_config(
-                paged_cache_groups=[FakeGroup(), FakeGroup()],
-                attn_backend=SingleTableBackend(),
-                kv_pool=FakePool(),
-            )
-
-    def test_multi_group_consumer_passes(self):
-        _pcs.validate_scheduler_config(
-            paged_cache_groups=[FakeGroup(), FakeGroup()],
-            attn_backend=FakeCacheGroupBackend(),
-            kv_pool=FakePool(),
-        )
-
-    def test_spec_incapable_backend_rejected(self):
-        with self.assertRaisesRegex(RuntimeError, "speculative decoding"):
-            _pcs.validate_scheduler_config(
-                paged_cache_groups=[FakeGroup()],
-                attn_backend=FakeSpecIncapableBackend(),
-                kv_pool=FakePool(),
-                speculative_algorithm="EAGLE3",
-            )
-
-    def test_dflash_uses_the_normal_speculative_capability_checks(self):
-        _pcs.validate_scheduler_config(
-            paged_cache_groups=[FakeGroup()],
-            attn_backend=FakeCacheGroupBackend(),
-            kv_pool=FakePool(),
-            speculative_algorithm="DFLASH",
-        )
-
-    def test_hybrid_checks_full_attention_backend(self):
-        class Wrapper:
-            uses_cache_groups = True
-
-            def __init__(self):
-                self.full_attn_backend = object()
-
-        with self.assertRaisesRegex(RuntimeError, "object"):
-            _pcs.validate_scheduler_config(
-                paged_cache_groups=[FakeGroup(), FakeGroup()],
-                attn_backend=Wrapper(),
-                kv_pool=FakePool(),
+                attn_backend=UndeclaredBackend(),
+                kv_pool=FakePool(FakeContract("history")),
             )
 
 

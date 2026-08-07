@@ -4,7 +4,10 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
     build_hybrid_cache_setup,
     draft_cache_fields,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheFieldSpec
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    CacheFieldSpec,
+    merge_continuation_layers,
+)
 
 
 def qwen_gdn_cache_fields(
@@ -161,37 +164,39 @@ def prepare_qwen35_cache(
             if field.field_id.endswith((".conv", ".ssm"))
         )
 
-    pd_enabled = attn_config.pd_disaggregation_enabled
-    group_specs = build_paged_cache_group_specs(
-        layer_types=layer_types,
-        group_ids=group_ids,
-        sliding_window_tokens=None,
-        page_size=logical_block_tokens,
-        pd_disaggregation_enabled=pd_enabled,
-    )
-    draft_group_specs = ()
-    if draft_attn_config is not None:
-        draft_group_specs = build_paged_cache_group_specs(
-            layer_types=draft_layer_types,
-            group_ids=draft_group_ids,
-            sliding_window_tokens=None,
-            page_size=logical_block_tokens,
-            pd_disaggregation_enabled=pd_enabled,
-        )
-    return build_hybrid_cache_setup(
-        family="qwen_gdn",
-        server_args=server_args,
+    (
+        merged_fields,
+        merged_layer_types,
+        merged_group_ids,
+        _,
+        num_draft_layers,
+    ) = merge_continuation_layers(
         fields=fields,
         layer_types=layer_types,
         group_ids=group_ids,
-        group_specs=group_specs,
-        state_dtypes=state_dtypes,
-        layer_kv_head_counts=None,
         draft_fields=draft_fields,
         draft_layer_types=draft_layer_types,
         draft_group_ids=draft_group_ids,
-        draft_group_specs=draft_group_specs,
-        draft_layer_kv_head_counts=None,
+    )
+    # ONE spec derivation over the merged layers: shared groups validate
+    # for consistent policy instead of the draft's being silently dropped.
+    group_specs = build_paged_cache_group_specs(
+        layer_types=merged_layer_types,
+        group_ids=merged_group_ids,
+        sliding_window_tokens=None,
+        page_size=logical_block_tokens,
+        pd_disaggregation_enabled=attn_config.pd_disaggregation_enabled,
+    )
+    return build_hybrid_cache_setup(
+        family="qwen_gdn",
+        server_args=server_args,
+        fields=merged_fields,
+        layer_types=merged_layer_types,
+        group_ids=merged_group_ids,
+        group_specs=group_specs,
+        state_dtypes=state_dtypes,
+        layer_kv_head_counts=None,
+        num_draft_layers=num_draft_layers,
         cache_budget_bytes=cache_budget_bytes,
         fixed_workspace_bytes=fixed_workspace_bytes,
         logical_block_tokens=logical_block_tokens,

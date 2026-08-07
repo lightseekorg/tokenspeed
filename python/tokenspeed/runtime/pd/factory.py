@@ -61,10 +61,10 @@ def get_kv_args(
 ):
     cache_contract = _get_cache_contract(token_to_kv_pool)
     if cache_contract is not None:
-        if draft_token_to_kv_pool is not None:
-            raise NotImplementedError(
-                "Paged-cache PD does not support speculative/draft/MTP caches"
-            )
+        # One big model, one arena: the draft's continuation-layer planes
+        # live inside the same merged plan the contract describes, so slab
+        # pages carry the draft KV with no extra registration
+        # (draft_token_to_kv_pool is a layer-mapped view of the same pool).
         layout, registrations = cache_contract
         registrations = validate_cache_slab_registrations(
             registrations,
@@ -101,42 +101,24 @@ def get_kv_args(
             cache_layout=layout,
         )
 
+    # One big model, one pool: the pool's buffers already cover the draft's
+    # continuation layers (the pool binds every planned layer), so a single
+    # enumeration registers everything. The draft pool is a layer-mapped
+    # view of the same pool; only the layer partition is derived from it.
     kv_data_ptrs, kv_data_lens, kv_item_lens = (
         token_to_kv_pool.get_contiguous_buf_infos()
     )
     kv_unit_lens = _get_contiguous_buf_unit_lens(token_to_kv_pool, kv_item_lens)
     # [[layer0buf0, layer0buf1...], [layer1buf0, layer1buf1...], ...]
     offsets = token_to_kv_pool.get_layerwise_buf_info_offsets()
-    target_layer_num = token_to_kv_pool.layer_num
-    kv_layer_ids = list(getattr(token_to_kv_pool, "layer_ids", range(target_layer_num)))
-
-    if draft_token_to_kv_pool is not None:
-        draft_layer_num = draft_token_to_kv_pool.layer_num
-        # We should also transfer draft model kv cache. The indices are
-        # always shared with a target model.
-        draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
-            draft_token_to_kv_pool.get_contiguous_buf_infos()
-        )
-        draft_kv_unit_lens = _get_contiguous_buf_unit_lens(
-            draft_token_to_kv_pool, draft_kv_item_lens
-        )
-        draft_offsets = draft_token_to_kv_pool.get_layerwise_buf_info_offsets(
-            len(kv_data_ptrs)
-        )
-
-        kv_data_ptrs += draft_kv_data_ptrs
-        kv_data_lens += draft_kv_data_lens
-        kv_item_lens += draft_kv_item_lens
-        kv_unit_lens += draft_kv_unit_lens
-        offsets += draft_offsets
-        draft_base_layer_id = (
-            max(kv_layer_ids) + 1 if kv_layer_ids else target_layer_num
-        )
-        kv_layer_ids += list(
-            range(draft_base_layer_id, draft_base_layer_id + draft_layer_num)
-        )
-    else:
-        draft_layer_num = 0
+    total_layer_num = token_to_kv_pool.layer_num
+    kv_layer_ids = list(getattr(token_to_kv_pool, "layer_ids", range(total_layer_num)))
+    draft_layer_num = (
+        len(draft_token_to_kv_pool.layer_ids)
+        if draft_token_to_kv_pool is not None
+        else 0
+    )
+    target_layer_num = total_layer_num - draft_layer_num
 
     state_data_ptrs = []
     state_data_lens = []

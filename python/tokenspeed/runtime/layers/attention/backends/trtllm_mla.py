@@ -133,6 +133,10 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         # padded to the fused-kernel block constraint (see _calc_padded_blocks).
         self._cache_groups_bound = False
         self._cache_contract_bound = False
+        # A draft consumes its history group table from the wrapper's
+        # per-group distribution (_draft_group_tables); the target reads the
+        # richer cache_metadata instead (see FlashMLABackend for rationale).
+        self.uses_cache_groups = bool(getattr(config, "is_draft", False))
         self.max_num_pages = self._calc_padded_blocks(config.context_len)
 
         # MLA dimensions
@@ -228,12 +232,19 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
     ):
         cache_metadata = kwargs.pop("cache_metadata", None)
         forward_batch = kwargs.pop("forward_batch", None)
+        draft_group_table = self._resolve_draft_group_table(
+            kwargs.pop("block_tables", None)
+        )
         group_table = None
         logical_page_size = None
         if cache_metadata is not None:
             self._cache_groups_bound = True
             group_table, logical_page_size = self._resolve_full_history_table(
                 cache_metadata, forward_batch, bs
+            )
+        elif draft_group_table is not None:
+            group_table, logical_page_size = self._bind_draft_group_table(
+                draft_group_table, bs
             )
         elif self._draft_reads_batch_pages(bs, forward_mode):
             # The drafter drives this backend directly and passes no cache
@@ -459,7 +470,10 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
+        **kwargs,
     ):
+        # cache_group_ids arrives for the draft (uses_cache_groups); the
+        # persistent kv-indices buffer already exists, nothing to allocate.
         if forward_mode.is_extend_or_mixed():
             raise NotImplementedError(
                 f"trtllm_mla CUDA graph capture not supported for {forward_mode}"
@@ -530,12 +544,23 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
             self.cuda_graph_seq_lens_buf[:bs].copy_(seq_lens[:bs])
 
         cache_metadata = kwargs.get("cache_metadata")
+        draft_group_table = self._resolve_draft_group_table(kwargs.get("block_tables"))
         group_table = None
         logical_page_size = None
         if self._cache_groups_bound and cache_metadata is not None:
             group_table, logical_page_size = self._resolve_full_history_table(
                 cache_metadata, kwargs.get("forward_batch"), 0
             )
+        elif draft_group_table is not None:
+            # Already padded to the replay bs by the wrapper.
+            group_table, logical_page_size = self._bind_draft_group_table(
+                draft_group_table, bs
+            )
+        elif self._draft_reads_batch_pages(bs, forward_mode) and (
+            page_table is not None
+        ):
+            group_table = page_table[:bs]
+            logical_page_size = self._cache_logical_page_size
         if group_table is not None:
             real_bs = min(int(group_table.shape[0]), bs)
             if real_bs > 0 and not self._block_table_aliased:

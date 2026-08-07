@@ -68,6 +68,39 @@ class MlaCacheGroupMixin:
         if logical_page_size is not None:
             self._cache_logical_page_size = int(logical_page_size)
 
+    def _resolve_draft_group_table(self, block_tables) -> torch.Tensor | None:
+        """Full-history table when the wrapper hands the draft its group tables.
+
+        The wrapper subsets the batch's per-group tables to this backend's
+        consumer families (history only for MLA), so exactly one table is
+        expected. Ids are scheduler pages in the contract's logical size
+        recorded by :meth:`mark_cache_contract`.
+        """
+        if not block_tables or not getattr(self, "is_draft", False):
+            return None
+        if self._cache_logical_page_size is None:
+            raise RuntimeError(
+                "draft received group tables before mark_cache_contract "
+                "recorded the scheduler's logical page size"
+            )
+        if len(block_tables) != 1:
+            raise RuntimeError(
+                "MLA draft consumes exactly one history group table, got "
+                f"{sorted(block_tables)}"
+            )
+        return next(iter(block_tables.values()))
+
+    def _bind_draft_group_table(
+        self, draft_group_table: torch.Tensor, bs: int
+    ) -> tuple[torch.Tensor, int]:
+        """Adopt the wrapper-distributed draft history table for this step.
+
+        Rows are batch-ordered scheduler pages; the logical size to expand
+        with is the one recorded by :meth:`mark_cache_contract`.
+        """
+        self._cache_groups_bound = True
+        return draft_group_table[:bs], self._cache_logical_page_size
+
     def _draft_reads_batch_pages(self, bs: int, forward_mode) -> bool:
         """True when this draft reads the published draft page table directly.
 
@@ -76,6 +109,13 @@ class MlaCacheGroupMixin:
         full-history table into the batch-ordered draft page table (row i ==
         batch position i), expanding scheduler pages into draft kernel pages
         exactly once while publishing it.
+
+        This path is NOT redundant with the wrapper's group-table
+        distribution (:meth:`_bind_draft_group_table`): the wrapper drives
+        MTP/Eagle metadata inits and hands over group tables, but a
+        block-drafting drafter (DFLASH) initializes its backend directly
+        mid-step with only the staged draft page table — this fallback is
+        that mode's delivery path.
         """
         return (
             self.is_draft

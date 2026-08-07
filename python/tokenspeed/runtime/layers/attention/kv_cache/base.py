@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 import torch
@@ -326,3 +327,88 @@ class CachePool:
     # Layerwise buffer offsets used by prefill/decode disaggregation.
     def get_layerwise_buf_info_offsets(self, start_idx=0):
         raise NotImplementedError()
+
+
+class LayerMappedKVPool:
+    """Wraps a KV pool to map global layer IDs to internal pool indices.
+
+    For hybrid models, only full attention layers have KV cache. This wrapper
+    translates global layer IDs (e.g., 3, 7, 11) to pool indices (0, 1, 2).
+    """
+
+    def __init__(self, inner_pool, full_attention_layer_ids: list[int]):
+        self.inner = inner_pool
+        self.layer_ids = list(full_attention_layer_ids)
+        self.layer_map = {
+            global_id: pool_idx
+            for pool_idx, global_id in enumerate(full_attention_layer_ids)
+        }
+        # Expose page_size from inner pool for the scheduler
+        self.page_size = getattr(inner_pool, "page_size", 1)
+
+    def _map(self, layer_id: int) -> int:
+        return self.layer_map.get(layer_id, layer_id)
+
+    @contextmanager
+    def _mapped(self, layer):
+        """Temporarily remap ``layer.layer_id`` to its inner-pool slot."""
+        orig = layer.layer_id
+        layer.layer_id = self._map(orig)
+        try:
+            yield
+        finally:
+            layer.layer_id = orig
+
+    def set_kv_buffer(
+        self,
+        layer,
+        out_cache_loc: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor | None,
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
+    ):
+        with self._mapped(layer):
+            self.inner.set_kv_buffer(layer, out_cache_loc, k, v, k_scale, v_scale)
+
+    def get_kv_buffer(self, layer_id: int):
+        return self.inner.get_kv_buffer(self._map(layer_id))
+
+    def get_key_buffer(self, layer_id: int):
+        return self.inner.get_key_buffer(self._map(layer_id))
+
+    def get_value_buffer(self, layer_id: int):
+        return self.inner.get_value_buffer(self._map(layer_id))
+
+    # MLA pools index their per-layer kv_buffer by ``layer.layer_id`` directly.
+    # In a hybrid model the inner MLA pool only holds the full-attention layers,
+    # so the global id must be mapped to its pool slot first (mirrors
+    # ``set_kv_buffer``). Reached via the DeepseekV3-style MLA chunked-prefill
+    # path (Kimi-K3).
+    def set_mla_kv_buffer(self, layer, loc, cache_k_nope, cache_k_rope):
+        # Prefill breakable-graph padding contract: the dummy-batch capture (and
+        # bucket-padding rows) whose ``out_cache_loc`` is the reserved
+        # ``dummy_kv_slot`` can carry NaN into this fp8 KV write. The paged MLA
+        # decode kernel reads that shared dummy slot through the zero-padded
+        # block-table entries and computes ``q·k`` BEFORE applying the causal
+        # mask, so the NaN survives it (``NaN + -inf = NaN``) and poisons a live
+        # row's softmax -> NaN logits -> token 0. Eager prefill leaves the dummy
+        # slot finite (``q·0`` masks cleanly), which is why the bug only appears
+        # with the prefill graph on. Ask the cache writer to sanitize in-kernel
+        # so real rows stay bitwise unchanged without allocating two temporary
+        # tensors or launching two separate nan_to_num kernels.
+        with self._mapped(layer):
+            self.inner.set_mla_kv_buffer(
+                layer,
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+                sanitize=True,
+            )
+
+    def get_mla_kv_buffer(self, layer, loc, dst_dtype=None):
+        with self._mapped(layer):
+            return self.inner.get_mla_kv_buffer(layer, loc, dst_dtype)
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)

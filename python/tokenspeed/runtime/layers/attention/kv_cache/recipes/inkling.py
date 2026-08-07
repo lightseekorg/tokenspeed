@@ -8,6 +8,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
+    merge_continuation_layers,
 )
 
 
@@ -304,43 +305,48 @@ def prepare_inkling_cache(
         build_paged_cache_group_specs,
     )
 
-    # The published specs are the layer-group fold plus the paged sconv
-    # checkpoint groups (per-layer state columns outside the layer-type
-    # vocabulary); PD policies stamp the complete tuple.
+    (
+        merged_fields,
+        merged_layer_types,
+        merged_group_ids,
+        merged_head_counts,
+        num_draft_layers,
+    ) = merge_continuation_layers(
+        fields=fields,
+        layer_types=layer_types,
+        group_ids=layer_types,
+        layer_kv_head_counts=layer_kv_head_counts,
+        draft_fields=draft_fields,
+        draft_layer_types=draft_layer_types,
+        draft_group_ids=draft_group_ids,
+        draft_layer_kv_head_counts=draft_layer_kv_head_counts,
+    )
+    # ONE spec derivation over the merged layers (shared groups validate
+    # for consistent policy), plus the paged sconv checkpoint groups
+    # (per-layer state columns outside the layer-type vocabulary); PD
+    # policies stamp the complete tuple. Target and draft share the
+    # sliding window width by construction (same architecture family).
     group_specs = (
         *build_paged_cache_group_specs(
-            layer_types=layer_types,
-            group_ids=layer_types,
+            layer_types=merged_layer_types,
+            group_ids=merged_group_ids,
             sliding_window_tokens=attn_config.sliding_window_tokens,
             page_size=logical_block_tokens,
         ),
         *_checkpoint_groups(logical_block_tokens),
     )
-    draft_group_specs = ()
-    if draft_attn_config is not None:
-        draft_group_specs = build_paged_cache_group_specs(
-            layer_types=draft_layer_types,
-            group_ids=draft_group_ids,
-            sliding_window_tokens=draft_attn_config.sliding_window_tokens,
-            page_size=logical_block_tokens,
-        )
     if attn_config.pd_disaggregation_enabled:
         group_specs = tuple(apply_pd_transfer_policies(group_specs))
-        draft_group_specs = tuple(apply_pd_transfer_policies(draft_group_specs))
     return build_hybrid_cache_setup(
         family="inkling",
         server_args=server_args,
-        fields=fields,
-        layer_types=layer_types,
-        group_ids=layer_types,
+        fields=merged_fields,
+        layer_types=merged_layer_types,
+        group_ids=merged_group_ids,
         group_specs=group_specs,
         state_dtypes={},
-        layer_kv_head_counts=layer_kv_head_counts,
-        draft_fields=draft_fields,
-        draft_layer_types=draft_layer_types,
-        draft_group_ids=draft_group_ids,
-        draft_group_specs=draft_group_specs,
-        draft_layer_kv_head_counts=draft_layer_kv_head_counts,
+        layer_kv_head_counts=merged_head_counts,
+        num_draft_layers=num_draft_layers,
         cache_budget_bytes=cache_budget_bytes,
         fixed_workspace_bytes=fixed_workspace_bytes,
         logical_block_tokens=logical_block_tokens,

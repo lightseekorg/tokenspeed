@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import partial
 from typing import Literal
 
 import torch
@@ -39,10 +40,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
     prepare_kimi_k3_cache,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
-    prepare_dsa_cache,
-    prepare_mha_cache,
-    prepare_mla_cache,
-    prepare_msa_cache,
+    prepare_ordinary_cache,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheMemoryPlan
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen35 import (
@@ -95,17 +93,32 @@ class CachePoolSpec:
 
 @dataclass(frozen=True)
 class CacheSetup:
-    target: CachePoolSpec
-    draft: CachePoolSpec | None
+    """One big model, one spec: target and draft layers share everything.
+
+    Draft layers are continuation layers of the one merged model (global
+    layer ids ``num_target_layers..``, the DeepSeek-V4 MTP convention
+    generalized): one plan, one arena, one contract, one pool.
+    ``num_draft_layers`` is the only draft-specific fact, consumed at
+    model-runner wiring time (a draft model's local layer ``i`` maps to
+    global layer ``num_target_layers + i``); the spec itself is
+    draft-oblivious.
+    """
+
+    spec: CachePoolSpec
+    num_draft_layers: int
     cache_budget_bytes: int
     fixed_workspace_bytes: int
 
+    @property
+    def num_target_layers(self) -> int:
+        return len(self.spec.layer_group_ids) - self.num_draft_layers
+
 
 _PREPARE_CACHE = {
-    "mha": prepare_mha_cache,
-    "mla": prepare_mla_cache,
-    "dsa": prepare_dsa_cache,
-    "msa": prepare_msa_cache,
+    "mha": partial(prepare_ordinary_cache, family="mha"),
+    "mla": partial(prepare_ordinary_cache, family="mla"),
+    "dsa": partial(prepare_ordinary_cache, family="dsa"),
+    "msa": partial(prepare_ordinary_cache, family="msa"),
     "qwen_gdn": prepare_qwen35_cache,
     "inkling": prepare_inkling_cache,
     "kimi_k3": prepare_kimi_k3_cache,

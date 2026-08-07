@@ -41,9 +41,6 @@ from tokenspeed_kernel.ops.conv import seq_idx_from_cu_seqlens
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from typing_extensions import override
 
-from tokenspeed.runtime.execution.cache_loc_kernel import (
-    compute_out_cache_loc_uniform,
-)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter
 from tokenspeed.runtime.execution.forward_batch_info import (
@@ -310,9 +307,8 @@ class Mtp(BaseDrafter):
         self,
         spec_num_tokens: int,
         spec_num_steps: int,
-        page_size: int,
         draft_model_runner: ModelRunner,
-        page_table: torch.Tensor,
+        cache_view=None,
         attn_backend: AttentionBackend | None = None,
         token_to_kv_pool: CachePool | None = None,
         runtime_states: RuntimeStates | None = None,
@@ -326,8 +322,7 @@ class Mtp(BaseDrafter):
             draft_model_runner,
             runtime_states=runtime_states,
             input_buffers=input_buffers,
-            page_size=page_size,
-            page_table=page_table,
+            cache_view=cache_view,
             attn_backend=attn_backend,
             token_to_kv_pool=token_to_kv_pool,
             vocab_size=vocab_size,
@@ -710,12 +705,10 @@ class Mtp(BaseDrafter):
         ).clamp_min(0)
         step_positions = torch.cat([lb_positions, positions.view(bs, k)], 1).reshape(-1)
         lb_cache_loc = self.draft_out_cache_loc_buf[: bs * lb]
-        compute_out_cache_loc_uniform(
-            out_cache_loc_ptr=lb_cache_loc,
-            uniform_input_length=lb,
+        self.cache_view.out_cache_loc_uniform(
+            out=lb_cache_loc,
             cache_start=(first_pos - lb).clamp_min(0).to(torch.int32),
-            page_table=self.page_table,
-            page_size=self.page_size,
+            num_tokens=lb,
         )
         out_cache_loc = torch.cat(
             [
