@@ -17,6 +17,7 @@ import torch
 
 _TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _TEST_DIR)
+sys.path.insert(0, os.path.dirname(_TEST_DIR))
 
 from ci_system.ci_register import register_cuda_ci
 

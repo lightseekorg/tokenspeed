@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import os
+import sys
+
+_TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(_TEST_DIR))
+
 from test.runtime.conftest import TP8_PAGE_SET_BYTES
 
 import torch

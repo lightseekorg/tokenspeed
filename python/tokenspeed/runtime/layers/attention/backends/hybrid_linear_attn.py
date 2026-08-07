@@ -23,7 +23,6 @@
 from __future__ import annotations
 
 import logging
-from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -71,7 +70,6 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
-    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
 # Default cache group id carrying GDN/Mamba state pages.
