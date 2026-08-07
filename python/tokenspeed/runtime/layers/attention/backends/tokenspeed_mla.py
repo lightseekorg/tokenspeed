@@ -718,9 +718,10 @@ class CuteDSLMLABackend(AttentionBackend):
         cache_group_ids: tuple[str, ...] = (),
         **kwargs,
     ):
-        # Structural gate: the contract sub-backend (or a wrapper passing cache
-        # group ids) takes the Paged cache capture path; DeepSeek's unmarked
-        # backend, which never sees either signal, keeps the non-cache path.
+        # Structural gate: the target (contract always marked by the registry)
+        # takes the Paged cache capture path; the MTP draft, whose
+        # mark_cache_contract deliberately early-returns, keeps the
+        # batch-ordered non-cache path.
         uses_cache_groups = bool(cache_group_ids) or self._cache_contract_bound
         if uses_cache_groups and self.is_draft:
             raise NotImplementedError(

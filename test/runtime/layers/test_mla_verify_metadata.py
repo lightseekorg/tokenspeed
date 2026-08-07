@@ -33,6 +33,7 @@ def _run_mla_decode(
         seq_lens=torch.tensor([64, 128], dtype=torch.int32)[:bs],
     )
     backend.is_draft = is_draft
+    backend.draft_block_decode = False
     backend.max_context_len = 256
     backend.page_size = page_size
     backend.kv_lora_rank = 2

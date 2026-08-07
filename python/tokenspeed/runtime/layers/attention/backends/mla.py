@@ -131,7 +131,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         # block-end seq_len, so every block query sees the whole block including
         # its own future. Mirrors the MHA/MSA/TRTLLM draft_block_decode path;
         # target verify and ordinary decode are untouched.
-        self.draft_block_decode = bool(getattr(config, "draft_block_decode", False))
+        self.draft_block_decode = bool(config.draft_block_decode)
 
         self.kernel_solution = None
 
@@ -142,29 +142,6 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         self.cuda_graph_page_table: torch.Tensor | None = None
         self.cuda_graph_seq_lens: torch.Tensor | None = None
         self.decode_cuda_graph_group_out_cache_loc: torch.Tensor | None = None
-
-    def mark_cache_contract(self, logical_page_size: int | None = None) -> None:
-        """Enable Paged cache graph state before capture buffers are allocated.
-
-        ``logical_page_size`` is the pool's scheduler page size. The target
-        learns it per step from ``cache_metadata``, but a draft is driven
-        directly by the drafter, which passes no metadata and hands over its
-        batch-ordered page table instead. Recording the size here lets the
-        draft translate those scheduler pages into kernel pages.
-        """
-        self._cache_contract_bound = True
-        if logical_page_size is not None:
-            self._cache_logical_page_size = int(logical_page_size)
-
-    def _draft_reads_batch_pages(self, bs: int, forward_mode: ForwardMode) -> bool:
-        """True when this draft reads scheduler pages from its batch table."""
-        return (
-            self.is_draft
-            and self._cache_contract_bound
-            and self._cache_logical_page_size is not None
-            and bs > 0
-            and not forward_mode.is_idle()
-        )
 
     def _should_use_absorbed_cached_extend(
         self, *, max_extend_seq_len: int, max_extend_prefix_len: int
@@ -180,155 +157,6 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             max_seqlen_q=max_extend_seq_len,
             solution=self.kernel_solution,
         )
-
-    def _resolve_full_history_table(
-        self, cache_metadata, forward_batch, bs: int
-    ) -> tuple[torch.Tensor, int]:
-        table = cache_metadata.require_full_attention_table(
-            active_forward_op=forward_batch
-        )
-        if table.shape[0] < bs:
-            raise RuntimeError(
-                f"full-attention table has {table.shape[0]} rows but the "
-                f"batch has {bs} requests"
-            )
-        logical_page_size = int(cache_metadata.block_size)
-        if logical_page_size <= 0 or logical_page_size % self.page_size:
-            raise RuntimeError(
-                f"logical page size {logical_page_size} is not a positive multiple "
-                f"of the MLA kernel page size {self.page_size}"
-            )
-        if table.stride(0) != table.shape[1] and table.shape[0] > 1:
-            table = table.contiguous()
-        return table, logical_page_size
-
-    @staticmethod
-    def _validate_live_pages(
-        table: torch.Tensor, seq_lens: torch.Tensor, logical_page_size: int
-    ) -> None:
-        """Reject null or missing Paged cache pages inside each request's live range."""
-        if table.numel() == 0 or seq_lens.numel() == 0:
-            return
-        batch_size = seq_lens.shape[0]
-        live_pages = (
-            (seq_lens.to(torch.int64) + logical_page_size - 1) // logical_page_size
-        ).clamp_max_(table.shape[1])
-        columns = torch.arange(table.shape[1], device=table.device)
-        live_entries = table[:batch_size][
-            columns.unsqueeze(0) < live_pages.unsqueeze(1)
-        ]
-        if not bool((live_entries > 0).all().item()):
-            raise RuntimeError(
-                "full-attention table contains -1 or the null page 0 "
-                "inside a live range"
-            )
-
-    def _expand_group_page_table(
-        self,
-        table: torch.Tensor,
-        *,
-        batch_size: int,
-        logical_page_size: int,
-        out: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Expand scheduler pages for this backend's MLA kernel pages."""
-        return expand_page_table(
-            table[:batch_size],
-            logical_page_size=logical_page_size,
-            kernel_page_size=self.page_size,
-            max_kernel_pages=self.max_num_pages,
-            out=out,
-        )
-
-    @staticmethod
-    def _cache_decode_out_cache_loc(
-        table: torch.Tensor,
-        seq_lens: torch.Tensor,
-        *,
-        batch_size: int,
-        logical_page_size: int,
-        validate_pages: bool = False,
-        out: torch.Tensor | None = None,
-        q_len_per_req: int = 1,
-    ) -> torch.Tensor:
-        """Absolute latent write locations for decoded tokens in Paged cache.
-
-        Plain decode writes one location per request (position ``seq-1``).
-        Speculative target verify decodes ``q_len_per_req`` tokens per request
-        and must write every one of them, at the trailing positions
-        ``seq-q_len .. seq-1``, flattened request-major to match the query
-        layout the verify read path builds.
-        """
-        last = (seq_lens[:batch_size].to(torch.int64) - 1).clamp_min(0)
-        if q_len_per_req == 1:
-            positions = last.unsqueeze(1)
-        else:
-            steps = torch.arange(
-                1 - q_len_per_req, 1, device=seq_lens.device, dtype=torch.int64
-            )
-            positions = (last.unsqueeze(1) + steps).clamp_min(0)
-        page_indices = torch.div(positions, logical_page_size, rounding_mode="floor")
-        pages = table[:batch_size].gather(1, page_indices)
-        if validate_pages and pages.numel() and not bool((pages > 0).all().item()):
-            raise RuntimeError(
-                "MLA write location resolves to the null page 0 or a " "-1 table hole"
-            )
-        locations = (
-            pages.clamp_min(0).to(torch.int64) * logical_page_size
-            + (positions % logical_page_size)
-        ).reshape(-1)
-        if out is not None:
-            out[: batch_size * q_len_per_req].copy_(locations)
-            return out
-        return locations
-
-    @staticmethod
-    def _extend_out_cache_loc(
-        table: torch.Tensor,
-        extend_prefix_lens_cpu: torch.Tensor,
-        extend_seq_lens_cpu: torch.Tensor,
-        *,
-        logical_page_size: int,
-        validate_pages: bool = False,
-    ) -> torch.Tensor:
-        """Return packed Paged cache extend-write locations in query order."""
-        chunks: list[torch.Tensor] = []
-        pages_for_validation: list[torch.Tensor] = []
-        for row, (start, num_new) in enumerate(
-            zip(
-                extend_prefix_lens_cpu.tolist(),
-                extend_seq_lens_cpu.tolist(),
-                strict=True,
-            )
-        ):
-            start, num_new = int(start), int(num_new)
-            if num_new <= 0:
-                continue
-            max_column = (start + num_new - 1) // logical_page_size
-            if max_column >= table.shape[1]:
-                raise RuntimeError(
-                    "extend write locations exceed the full-attention "
-                    f"table: row={row}, prefix={start}, new={num_new}, "
-                    f"logical_page_size={logical_page_size}, columns={table.shape[1]}"
-                )
-            positions = torch.arange(
-                start, start + num_new, dtype=torch.int64, device=table.device
-            )
-            pages = table[row].gather(0, positions // logical_page_size)
-            pages_for_validation.append(pages)
-            chunks.append(
-                pages.to(torch.int64) * logical_page_size
-                + positions % logical_page_size
-            )
-        if not chunks:
-            return torch.empty(0, dtype=torch.int64, device=table.device)
-        if validate_pages and not bool(
-            (torch.cat(pages_for_validation) > 0).all().item()
-        ):
-            raise RuntimeError(
-                "MLA write location resolves to the null page 0 or a " "-1 table hole"
-            )
-        return torch.cat(chunks)
 
     def init_forward_metadata(
         self,
@@ -529,17 +357,6 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         )
         self.forward_prefill_metadata = metadata
         self.chunked_prefill_metadata = metadata
-
-    def _graph_verify_q_len(self) -> int:
-        """Verify-window width for captured decode graphs.
-
-        Graphs only ever record decode, so unlike ``_verify_q_len`` there is no
-        forward mode to consult. Capture and replay must agree exactly: the
-        recorded buffer view has this width baked into its shape.
-        """
-        if self.spec_num_tokens > 1 and not self.is_draft:
-            return self.spec_num_tokens
-        return 1
 
     def _verify_q_len(self, forward_mode: ForwardMode) -> int:
         """KV write locations each request needs this step.

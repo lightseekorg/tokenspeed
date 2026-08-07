@@ -34,7 +34,6 @@ from tokenspeed_kernel import (
 )
 from tokenspeed_kernel.ops.kvcache.triton import (
     fused_fp8_set_kv_buffer,
-    gather_page_table_with_padding,
 )
 from tokenspeed_kernel.ops.quantization import quantize_mxfp8
 
@@ -161,7 +160,7 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         )
         # DFLASH draft: expand decode metadata to spec_num_tokens rows/request
         # (whole block in one decode forward), with uniform non-causal seq_lens.
-        self.draft_block_decode = bool(getattr(config, "draft_block_decode", False))
+        self.draft_block_decode = bool(config.draft_block_decode)
 
         # Forward metadata is initialized in the runner per forward call
         self.forward_decode_metadata: MHADecodeMetadata | None = None
@@ -170,7 +169,7 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         # family="state" ids (GDN/mamba) learned in init_cuda_graph_state; this backend sheds them
         self.state_group_ids: frozenset[str] = frozenset()
         # Group geometry is available to eager metadata before graph setup.
-        self.group_page_sizes = dict(getattr(config, "group_page_sizes", None) or {})
+        self.group_page_sizes = dict(config.group_page_sizes or {})
 
     # ------------------------------------------------------------------
     # Metadata initialization
@@ -445,18 +444,13 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         # Fail loudly instead of replaying over stale/zero page tables.
         self._replay_stale_guard(bs, block_tables)
 
-        # Cache-group captures read only the per-group buffers; the single-table single
-        # table (cuda_graph_page_table) would be dead work there.
+        # Every pool publishes at least one history group now, so the
+        # per-group capture buffers always exist; the pre-LCM single-table
+        # gather has no remaining producer.
         if not self.cuda_graph_page_tables:
-            gather_page_table_with_padding(
-                page_table=page_table,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                out=self.cuda_graph_page_table,
-                bs=bs,
-                max_num_pages=self.max_num_pages,
-                page_size=self.page_size,
-                dummy_slot=0,
+            raise RuntimeError(
+                "MHA replay without per-group capture buffers: the pool "
+                "published no cache groups, which the LCM contract forbids"
             )
         if self.spec_num_tokens > 1 and not self.is_draft:
             # Clamp padded rows (seq_len 1) to N: verify derives row lengths as seq - N + t + 1, which must stay positive.

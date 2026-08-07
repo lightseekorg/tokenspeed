@@ -136,7 +136,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         # A draft consumes its history group table from the wrapper's
         # per-group distribution (_draft_group_tables); the target reads the
         # richer cache_metadata instead (see FlashMLABackend for rationale).
-        self.uses_cache_groups = bool(getattr(config, "is_draft", False))
+        self.uses_cache_groups = bool(config.is_draft)
         self.max_num_pages = self._calc_padded_blocks(config.context_len)
 
         # MLA dimensions

@@ -34,7 +34,6 @@ from tokenspeed_kernel import (
 )
 from tokenspeed_kernel.ops.kvcache.triton import (
     fused_fp8_set_kv_buffer,
-    gather_page_table_with_padding,
 )
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
@@ -151,7 +150,7 @@ class MSAAttnBackend(CacheGroupsMixin, AttentionBackend):
 
         # DFLASH draft: expand decode metadata to spec_num_tokens rows/request
         # (whole block in one decode forward), with uniform non-causal seq_lens.
-        self.draft_block_decode = bool(getattr(config, "draft_block_decode", False))
+        self.draft_block_decode = bool(config.draft_block_decode)
 
         # Forward metadata is initialized in the runner per forward call
         self.forward_decode_metadata: MSADecodeMetadata | None = None
@@ -443,18 +442,13 @@ class MSAAttnBackend(CacheGroupsMixin, AttentionBackend):
         # Fail loudly instead of replaying over stale/zero page tables.
         self._replay_stale_guard(bs, block_tables)
 
-        # Cache-group captures read only the per-group buffers; the single-table single
-        # table (cuda_graph_page_table) would be dead work there.
+        # Every pool publishes at least one history group now, so the
+        # per-group capture buffers always exist; the pre-LCM single-table
+        # gather has no remaining producer.
         if not self.cuda_graph_page_tables:
-            gather_page_table_with_padding(
-                page_table=page_table,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                out=self.cuda_graph_page_table,
-                bs=bs,
-                max_num_pages=self.max_num_pages,
-                page_size=self.page_size,
-                dummy_slot=0,
+            raise RuntimeError(
+                "MSA replay without per-group capture buffers: the pool "
+                "published no cache groups, which the LCM contract forbids"
             )
         if self.spec_num_tokens > 1 and not self.is_draft:
             self.cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs])

@@ -134,7 +134,7 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         # per-group distribution (_draft_group_tables); the target reads the
         # richer cache_metadata instead and must stay off the block_tables
         # path (its capture/eager guards key on this flag).
-        self.uses_cache_groups = bool(getattr(config, "is_draft", False))
+        self.uses_cache_groups = bool(config.is_draft)
         self.page_size = PAGE_SIZE
         self.max_num_pages = (self.max_context_len + PAGE_SIZE - 1) // PAGE_SIZE
 
