@@ -66,11 +66,12 @@ std::vector<GroupDemand> makeGroupDemands(std::vector<BlockTable>& tables, Group
 
 void appendCompletedPageHashes(std::vector<std::string>& page_hashes,
                                const std::vector<std::span<const std::int32_t>>& paged_tokens,
-                               std::int32_t filled_pages) {
+                               std::int32_t filled_pages, std::span<const std::string> namespace_keys) {
     const std::int32_t first_new_page = static_cast<std::int32_t>(page_hashes.size());
     _assert(filled_pages > first_new_page, "caller must pre-check page-hash progress");
     const std::string previous_hash = page_hashes.empty() ? std::string{} : page_hashes.back();
-    std::vector<std::string> new_hashes = AdvancePagedHashes(paged_tokens, first_new_page, previous_hash, filled_pages);
+    std::vector<std::string> new_hashes =
+        AdvancePagedHashes(paged_tokens, first_new_page, previous_hash, filled_pages, namespace_keys);
     page_hashes.insert(page_hashes.end(), std::make_move_iterator(new_hashes.begin()),
                        std::make_move_iterator(new_hashes.end()));
 }
@@ -148,7 +149,7 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
     const std::int32_t cacheable_pages = std::max((request->PrefillSize() - 1) / cache_block_tokens, 0);
     std::vector<std::span<const std::int32_t>> paged_tokens = request->FullPagedTokens(false);
     paged_tokens.resize(std::min(paged_tokens.size(), static_cast<std::size_t>(cacheable_pages)));
-    std::vector<std::string> hashes = ComputePagedHashes(paged_tokens, "");
+    std::vector<std::string> hashes = ComputeNamespacedPagedHashes(paged_tokens, "", request->CacheNamespaceKeys());
 
     AdmissionMatch match;
     match.candidate_page_hashes = hashes;
@@ -288,7 +289,8 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     const std::int32_t new_page_hash_begin = static_cast<std::int32_t>(cache_progress.page_hashes.size());
     const std::int32_t filled_pages = num_computed_tokens / coordinator_.CacheBlockTokens();
     if (filled_pages > static_cast<std::int32_t>(cache_progress.page_hashes.size())) {
-        appendCompletedPageHashes(cache_progress.page_hashes, request->FullPagedTokens(false), filled_pages);
+        appendCompletedPageHashes(cache_progress.page_hashes, request->FullPagedTokens(false), filled_pages,
+                                  request->CacheNamespaceKeys());
     }
     std::optional<CacheBoundaryKind> completed_boundary_kind;
     if (new_page_hash_begin < static_cast<std::int32_t>(cache_progress.page_hashes.size())) {
@@ -334,7 +336,8 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
     const std::int32_t new_page_hash_begin = static_cast<std::int32_t>(cache_progress.page_hashes.size());
     const std::int32_t filled_pages = num_computed_tokens / coordinator_.CacheBlockTokens();
     if (filled_pages > static_cast<std::int32_t>(cache_progress.page_hashes.size())) {
-        appendCompletedPageHashes(cache_progress.page_hashes, request->FullPagedTokens(false), filled_pages);
+        appendCompletedPageHashes(cache_progress.page_hashes, request->FullPagedTokens(false), filled_pages,
+                                  request->CacheNamespaceKeys());
     }
     std::optional<CacheBoundaryKind> completed_boundary_kind;
     if (new_page_hash_begin < static_cast<std::int32_t>(cache_progress.page_hashes.size())) {
