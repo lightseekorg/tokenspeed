@@ -191,15 +191,15 @@ def make_spec(
     rid: str,
     tokens: list[int],
     max_new_tokens: int = 0,
-    lora_id: str | None = None,
+    lora_id: int = 0,
 ) -> RequestSpec:
     spec = RequestSpec()
     spec.request_id = rid
     spec.tokens = tokens
     spec.max_new_tokens = max_new_tokens
-    # The scheduler spells "no adapter" as the empty string; the front-end
-    # spells it None.
-    spec.lora_id = lora_id or ""
+    # 0 is the base model on both sides of the boundary; tolerate None from
+    # callers that have not resolved an adapter.
+    spec.lora_id = lora_id or 0
     return spec
 
 

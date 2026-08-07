@@ -44,8 +44,8 @@ public:
 
     const std::string& Id() const { return id_; }
 
-    // Resolved LoRA adapter id, or empty for a base-model request.
-    const std::string& LoraId() const { return lora_id_; }
+    // Resolved LoRA adapter id; 0 means base model.
+    std::int32_t LoraId() const { return lora_id_; }
 
     // Keys that namespace this request's KV pages, for the page hasher. Holds
     // the adapter id for a LoRA request and nothing for a base-model one, whose
@@ -145,10 +145,10 @@ private:
     const fsm::ForwardState& forwardState(const char* operation) const;
 
     std::string id_;
-    std::string lora_id_;
-    // Same value as lora_id_, held as a 0-or-1 element vector so
-    // CacheNamespaceKeys() can hand out a span without materializing a
-    // temporary on every hash call.
+    std::int32_t lora_id_{0};
+    // lora_id_ rendered once, held as a 0-or-1 element vector so
+    // CacheNamespaceKeys() can hand out a span without re-formatting the id on
+    // every hash call.
     std::vector<std::string> lora_hash_keys_;
     TokenContainer token_container_;
     std::int32_t page_size_{};
