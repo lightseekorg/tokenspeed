@@ -193,21 +193,6 @@ class CacheBatchMetadata:
         except KeyError:
             raise KeyError(f"missing paged cache group {group_id!r}") from None
 
-    def table_for_layer(
-        self,
-        pool: object,
-        layer_id: int,
-        *,
-        active_forward_op: Any,
-    ) -> torch.Tensor:
-        """Resolve a layer and return its fresh operation-bound table."""
-        self._validate_active_forward_op(active_forward_op)
-        group_id = pool.group_id_for_layer(layer_id)
-        return self.require_table(
-            group_id,
-            active_forward_op=active_forward_op,
-        )
-
     def require_full_attention_table(self, *, active_forward_op: Any) -> torch.Tensor:
         """Return the unique full-history history-group table.
 

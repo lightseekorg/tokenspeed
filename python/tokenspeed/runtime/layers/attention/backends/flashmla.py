@@ -706,9 +706,6 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         block_table = page_table[:bs]
         self.cuda_graph_kv_indices[:bs, : block_table.shape[1]].copy_(block_table)
 
-    def get_cuda_graph_seq_len_fill_value(self):
-        return 1
-
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------

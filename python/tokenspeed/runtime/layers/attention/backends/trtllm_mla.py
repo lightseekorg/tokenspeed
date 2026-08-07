@@ -191,8 +191,6 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         self,
         batch_size: int,
         max_blocks: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
         page_table: torch.Tensor,
         block_kv_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -332,9 +330,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
                 q_len_per_req=q_len_per_req,
             )
         else:
-            block_kv_indices = self._create_block_kv_indices(
-                bs, max_blocks, req_pool_indices, seq_lens, page_table
-            )
+            block_kv_indices = self._create_block_kv_indices(bs, max_blocks, page_table)
 
         assert (
             seq_lens.dtype == torch.int32
@@ -588,16 +584,11 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
             self._create_block_kv_indices(
                 bs,
                 metadata.block_kv_indices.shape[1],
-                req_pool_indices[:bs],
-                seq_lens[:bs],
                 page_table,
                 metadata.block_kv_indices,
             )
 
         self.forward_decode_metadata = metadata
-
-    def get_cuda_graph_seq_len_fill_value(self):
-        return 1
 
     def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
         """Publish block-end cache lengths inside a captured draft graph.

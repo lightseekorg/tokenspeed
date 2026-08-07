@@ -234,8 +234,6 @@ class CuteDSLMLABackend(AttentionBackend):
         self,
         batch_size: int,
         max_blocks: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
         page_table: torch.Tensor,
         block_kv_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -578,9 +576,7 @@ class CuteDSLMLABackend(AttentionBackend):
                 q_len_per_req=q_len_per_req,
             )
         else:
-            block_kv_indices = self._create_block_kv_indices(
-                bs, max_blocks, req_pool_indices, seq_lens, page_table
-            )
+            block_kv_indices = self._create_block_kv_indices(bs, max_blocks, page_table)
             group_out_cache_loc = None
 
         self.forward_decode_metadata = CuteDSLMLADecodeMetadata(
@@ -824,8 +820,6 @@ class CuteDSLMLABackend(AttentionBackend):
             self._create_block_kv_indices(
                 bs,
                 metadata.block_kv_indices.shape[1],
-                req_pool_indices[:bs],
-                seq_lens[:bs],
                 page_table,
                 metadata.block_kv_indices,
             )
@@ -896,9 +890,6 @@ class CuteDSLMLABackend(AttentionBackend):
             metadata.group_out_cache_loc[
                 real_bs * replay_q_len : bs * replay_q_len
             ].zero_()
-
-    def get_cuda_graph_seq_len_fill_value(self):
-        return 1
 
     # ---- Forward: Decode ----
 
