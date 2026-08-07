@@ -24,26 +24,27 @@ import pytest
 import tokenspeed_kernel.ops.moe.gluon.sigmoid_topk as gluon_sigmoid_topk
 import torch
 from tokenspeed_kernel.ops.moe import moe_sigmoid_bias_topk
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4 import decode_kernels
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_kernels import (
-    gluon_topk_route_supported,
-    invoke_sigmoid_bias_topk_route_gluon,
-)
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
-    _biased_grouped_topk_reference,
-)
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.routing import (
-    invoke_sigmoid_bias_topk_route_prefill_gluon,
-)
+from utils import is_cdna4
 
-
-def _is_gfx950() -> bool:
-    return torch.cuda.is_available() and "gfx950" in getattr(
-        torch.cuda.get_device_properties(0), "gcnArchName", ""
+if not is_cdna4():
+    pytest.skip(
+        "AMD CDNA4 is required for Gluon MXFP4 routing tests",
+        allow_module_level=True,
     )
 
 
-requires_gfx950 = pytest.mark.skipif(not _is_gfx950(), reason="requires gfx950")
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4 import decode_kernels  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_kernels import (  # noqa: E402
+    gluon_topk_route_supported,
+    invoke_sigmoid_bias_topk_route_gluon,
+)
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (  # noqa: E402
+    _biased_grouped_topk_reference,
+)
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.routing import (  # noqa: E402
+    invoke_sigmoid_bias_topk_route_prefill_gluon,
+)
+
 _ROUTE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
@@ -71,7 +72,6 @@ def test_gluon_topk_route_rejects_cpu_tensor() -> None:
     assert not gluon_topk_route_supported(router, 8)
 
 
-@requires_gfx950
 def test_public_sigmoid_bias_topk_dispatch_uses_gluon_kernel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -103,7 +103,6 @@ def test_public_sigmoid_bias_topk_dispatch_uses_gluon_kernel(
     assert actual_ids is sentinel_ids
 
 
-@requires_gfx950
 @pytest.mark.parametrize("dtype", _ROUTE_DTYPES)
 def test_sigmoid_bias_topk_route_gluon_fuses_sigmoid(
     monkeypatch: pytest.MonkeyPatch,
@@ -129,7 +128,6 @@ def test_sigmoid_bias_topk_route_gluon_fuses_sigmoid(
     assert actual_weights is sentinel_weights
 
 
-@requires_gfx950
 @pytest.mark.parametrize("dtype", _ROUTE_DTYPES)
 def test_sigmoid_bias_topk_route_gluon_matches_supported_dtype_reference(
     dtype: torch.dtype,
@@ -153,7 +151,6 @@ def test_sigmoid_bias_topk_route_gluon_matches_supported_dtype_reference(
     torch.testing.assert_close(actual_weights, expected_weights, atol=0, rtol=0)
 
 
-@requires_gfx950
 @pytest.mark.parametrize("dtype", _ROUTE_DTYPES)
 @pytest.mark.parametrize(
     "logit_value",
@@ -193,7 +190,6 @@ def test_sigmoid_bias_topk_route_gluon_matches_nan_and_neg_inf_reference(
     )
 
 
-@requires_gfx950
 @pytest.mark.parametrize(
     ("num_tokens", "seed"),
     [(8, 17), (8, 990611), (8, 20260731), (16, 17), (16, 990611), (16, 20260731)],
@@ -227,7 +223,6 @@ def test_sigmoid_bias_topk_route_gluon_matches_bf16_e384(
     torch.testing.assert_close(actual_weights, expected_weights, atol=0, rtol=0)
 
 
-@requires_gfx950
 @pytest.mark.parametrize("dtype", _ROUTE_DTYPES)
 def test_sigmoid_bias_topk_route_gluon_handles_strided_inputs(
     dtype: torch.dtype,
@@ -266,7 +261,6 @@ def test_sigmoid_bias_topk_route_gluon_handles_strided_inputs(
     torch.testing.assert_close(actual_weights, expected_weights, atol=0, rtol=0)
 
 
-@requires_gfx950
 def test_prefill_sigmoid_bias_topk_route_gluon_handles_strided_inputs() -> None:
     generator = torch.Generator(device="cuda").manual_seed(61129)
     logits = torch.randn(
@@ -302,7 +296,6 @@ def test_prefill_sigmoid_bias_topk_route_gluon_handles_strided_inputs() -> None:
     torch.testing.assert_close(actual_weights, expected_weights, atol=0, rtol=0)
 
 
-@requires_gfx950
 def test_sigmoid_bias_topk_route_gluon_matches_bf16_extremes() -> None:
     logits = torch.tensor(
         [[-float("inf"), -100.0, -10.0, -1.0, -0.0, 0.0, 1.0, float("inf")]],
@@ -329,7 +322,6 @@ def test_sigmoid_bias_topk_route_gluon_matches_bf16_extremes() -> None:
     torch.testing.assert_close(actual_weights_by_id, expected_weights, atol=0, rtol=0)
 
 
-@requires_gfx950
 def test_sigmoid_bias_topk_route_gluon_matches_bf16_rounding_boundaries() -> None:
     logits = torch.full((2, 16), -float("inf"), device="cuda", dtype=torch.bfloat16)
     logits[0, :8] = torch.tensor(
@@ -382,7 +374,6 @@ def test_sigmoid_bias_topk_route_gluon_matches_bf16_rounding_boundaries() -> Non
     torch.testing.assert_close(actual_weights, expected_weights.float(), atol=0, rtol=0)
 
 
-@requires_gfx950
 @pytest.mark.parametrize("dtype", _ROUTE_DTYPES)
 def test_sigmoid_bias_topk_route_gluon_graph_replay_uses_updated_inputs(
     dtype: torch.dtype,

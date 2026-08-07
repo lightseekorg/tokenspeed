@@ -22,16 +22,9 @@ from __future__ import annotations
 
 import pytest
 import torch
+from utils import is_cdna4
 
-
-def _is_gfx950() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
-    return "gfx950" in arch
-
-
-if not _is_gfx950():
+if not is_cdna4():
     pytest.skip(
         "Gluon bf16 MoE apply is gfx950 (CDNA4) only",
         allow_module_level=True,

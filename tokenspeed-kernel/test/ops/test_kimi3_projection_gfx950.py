@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import os
-
 import pytest
 import tokenspeed_kernel
 import torch
@@ -12,16 +10,10 @@ from tokenspeed_kernel.ops.gemm.kimi3 import (
     _use_gluon_mediumm,
 )
 from tokenspeed_kernel.ops.moe import moe_sigmoid_bias_topk
+from utils import is_cdna4
 
-
-def _is_gfx950() -> bool:
-    return "gfx950" in os.environ.get("PYTORCH_ROCM_ARCH", "") or (
-        torch.cuda.is_available() and "MI350" in torch.cuda.get_device_name()
-    )
-
-
-if not _is_gfx950():
-    pytest.skip("Kimi K3 projection tests require gfx950", allow_module_level=True)
+if not is_cdna4():
+    pytest.skip("Kimi K3 projection tests require AMD CDNA4", allow_module_level=True)
 
 
 @pytest.mark.parametrize(

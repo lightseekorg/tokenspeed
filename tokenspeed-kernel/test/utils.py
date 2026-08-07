@@ -23,11 +23,51 @@ from __future__ import annotations
 from typing import Callable
 
 import torch
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    PlatformInfo,
+    current_platform,
+)
 from tokenspeed_kernel.registry import KernelRegistry, register_kernel
 from tokenspeed_kernel.signature import FormatSignature, format_signatures
 
 SampleRegistration = tuple[dict, Callable]
+
+
+def detected_platform() -> PlatformInfo | None:
+    """Return the current platform, or ``None`` when none is usable.
+
+    ``current_platform()`` raises when PyTorch sees no GPU, or when it sees an
+    AMD architecture that ``tokenspeed-kernel`` does not support. Tests gate
+    themselves at import time, so turn that into a value they can branch on
+    instead of a collection error.
+
+    Returns:
+        The detected :class:`PlatformInfo`, or ``None`` if detection failed.
+    """
+    try:
+        return current_platform()
+    except RuntimeError:
+        return None
+
+
+def is_cdna4() -> bool:
+    """Return whether the current GPU is AMD CDNA4 (gfx950)."""
+    platform = detected_platform()
+    return platform is not None and platform.is_cdna4
+
+
+def is_cdna5() -> bool:
+    """Return whether the current GPU is AMD CDNA5 (gfx1250)."""
+    platform = detected_platform()
+    return platform is not None and platform.is_cdna5
+
+
+def is_amd() -> bool:
+    """Return whether the current GPU is an AMD device."""
+    platform = detected_platform()
+    return platform is not None and platform.is_amd
 
 
 def make_mxfp4_moe_weights(

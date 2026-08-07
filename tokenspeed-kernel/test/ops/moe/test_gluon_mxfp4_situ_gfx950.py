@@ -25,18 +25,10 @@ import torch
 from kimi3_reference import (
     a16w4_mxfp4_moe_reference,
 )
-from utils import make_mxfp4_moe_weights, make_round_robin_topk
+from utils import is_cdna4, make_mxfp4_moe_weights, make_round_robin_topk
 
-
-def _is_gfx950() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
-    return "gfx950" in arch
-
-
-if not _is_gfx950():
-    pytest.skip("MXFP4 SiTU Gluon tests require gfx950", allow_module_level=True)
+if not is_cdna4():
+    pytest.skip("MXFP4 SiTU Gluon tests require AMD CDNA4", allow_module_level=True)
 
 import tokenspeed_kernel  # noqa: E402
 

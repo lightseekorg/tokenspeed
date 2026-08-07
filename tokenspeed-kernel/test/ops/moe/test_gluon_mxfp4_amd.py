@@ -2,31 +2,37 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
+from utils import is_amd, is_cdna4, is_cdna5
+
+if not is_amd():
+    pytest.skip(
+        "MXFP4-weight Gluon MoE requires an AMD GPU",
+        allow_module_level=True,
+    )
+
+
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (  # noqa: E402
     gluon_mxfp_dynamic_mxfp4_fused_moe,
 )
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (  # noqa: E402
     gluon_mxfp_fused_moe as _gfx950_static_moe,
 )
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_decode import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_decode import (  # noqa: E402
     gluon_a16w4_situ_warp_decode_ep_gfx950,
 )
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.weight_preprocess import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.weight_preprocess import (  # noqa: E402
     preprocess_gluon_mxfp4_gfx950_moe_weights,
 )
-from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.fused import (
+from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.fused import (  # noqa: E402
     gluon_mxfp_precomputed_mxfp4_fused_moe as _gfx1250_static_moe,
 )
-from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.weight_preprocess import (
+from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.weight_preprocess import (  # noqa: E402
     preprocess_gluon_mxfp4_gfx1250_moe_weights,
 )
 
 
 def test_dynamic_mxfp4_activation_moe() -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("MXFP4-weight Gluon MoE requires an AMD GPU")
-    arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
-    if "gfx950" not in arch:
+    if not is_cdna4():
         pytest.skip("Dynamic MXFP4 activation is unavailable on this GPU")
 
     num_tokens = 4
@@ -104,10 +110,7 @@ def test_dynamic_mxfp4_activation_moe() -> None:
 
 
 def test_bf16_activation_situ_moe() -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("MXFP4-weight Gluon MoE requires an AMD GPU")
-    arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
-    if "gfx950" not in arch:
+    if not is_cdna4():
         pytest.skip("BF16 SiTU activation is unavailable on this GPU")
 
     num_tokens = 1
@@ -169,14 +172,12 @@ def test_bf16_activation_situ_moe() -> None:
 
 
 def test_static_fp8_activation_moe() -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("MXFP4-weight Gluon MoE requires an AMD GPU")
-    arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
-    if "gfx950" in arch:
+    cdna4 = is_cdna4()
+    if cdna4:
         hidden_size = 256
         intermediate_size = 256
         preprocess = preprocess_gluon_mxfp4_gfx950_moe_weights
-    elif "gfx1250" in arch:
+    elif is_cdna5():
         hidden_size = 128
         intermediate_size = 128
         preprocess = preprocess_gluon_mxfp4_gfx1250_moe_weights
@@ -237,7 +238,7 @@ def test_static_fp8_activation_moe() -> None:
     hidden_states = torch.randn(
         num_tokens, hidden_size, dtype=torch.bfloat16, device="cuda"
     )
-    if "gfx950" in arch:
+    if cdna4:
         router_logits = torch.randn(
             num_tokens, num_experts, dtype=torch.bfloat16, device="cuda"
         )

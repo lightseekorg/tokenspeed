@@ -3,12 +3,10 @@ from __future__ import annotations
 import pytest
 import tokenspeed_kernel
 import torch
+from utils import is_cdna4
 
-if not torch.cuda.is_available():
-    pytest.skip("requires a GPU", allow_module_level=True)
-
-if torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0] != "gfx950":
-    pytest.skip("requires gfx950", allow_module_level=True)
+if not is_cdna4():
+    pytest.skip("requires AMD CDNA4", allow_module_level=True)
 
 
 @pytest.mark.parametrize("normalize", [False, True])
