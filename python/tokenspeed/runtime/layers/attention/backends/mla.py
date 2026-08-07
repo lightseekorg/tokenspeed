@@ -45,7 +45,6 @@ from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     cache_debug_enabled,
 )
-from tokenspeed.runtime.layers.attention.page_table import expand_page_table
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.layers.attention.utils import build_page_table
 from tokenspeed.runtime.utils.common import ceil_div
