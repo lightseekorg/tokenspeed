@@ -16,6 +16,8 @@ def create_cache_pool(
     num_layers: int,
     rank: int,
     enable_memory_saver: bool,
+    field_layer_offset: int = 0,
+    backing_pool: CachePool | None = None,
 ) -> CachePool:
     """Create the concrete compute interface for a prepared cache spec.
 
@@ -23,6 +25,10 @@ def create_cache_pool(
     pool base aligns the specs' physical fields with the memory plan and
     publishes the runtime contract (ModelExecutor fails fast without one).
     """
+    if (backing_pool is not None or field_layer_offset) and not (
+        isinstance(config, MHAConfig) and spec.family == "mha"
+    ):
+        raise ValueError("backing cache views are only supported by ordinary MHA pools")
     plan = spec.memory_plan
     if spec.family == "deepseek_v4":
         from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
@@ -122,6 +128,8 @@ def create_cache_pool(
                 memory_plan=plan,
                 paged_cache_group_specs=spec.paged_cache_group_specs,
                 token_capacity=spec.token_capacity,
+                field_layer_offset=field_layer_offset,
+                backing_pool=backing_pool,
             )
         if spec.family == "inkling":
             from tokenspeed.runtime.layers.attention.kv_cache.hybrid_inkling import (
@@ -168,6 +176,8 @@ def create_cache_pool(
             state_field_dtypes=spec.state_field_dtypes,
             paged_cache_group_specs=spec.paged_cache_group_specs,
             token_capacity=spec.token_capacity,
+            field_layer_offset=field_layer_offset,
+            backing_pool=backing_pool,
         )
     if isinstance(config, MLAConfig):
         if spec.family == "mla":
