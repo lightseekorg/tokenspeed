@@ -1251,9 +1251,6 @@ class MambaAttnBackend(AttentionBackend):
             out_by_group[gid] = state_out_pages
         return in_by_group, out_by_group
 
-    def get_cuda_graph_seq_len_fill_value(self):
-        return 1
-
     # ---- Forward ----
 
     def _layer_state(

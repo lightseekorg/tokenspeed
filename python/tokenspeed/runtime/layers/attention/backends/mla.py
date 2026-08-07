@@ -751,9 +751,6 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         metadata.page_table[real_bs:bs].zero_()
         metadata.group_out_cache_loc[real_bs * q_len : bs * q_len].zero_()
 
-    def get_cuda_graph_seq_len_fill_value(self):
-        return 1
-
     def forward_decode(
         self,
         q: torch.Tensor,

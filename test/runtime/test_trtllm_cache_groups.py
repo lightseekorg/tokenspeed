@@ -177,8 +177,6 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
         out = self.torch.empty((1, 4), dtype=self.torch.int32)
 
         page_table = b._build_page_table(
-            self.torch.tensor([1], dtype=self.torch.int32),
-            self.torch.tensor([256], dtype=self.torch.int32),
             1,
             page_table,
             out,

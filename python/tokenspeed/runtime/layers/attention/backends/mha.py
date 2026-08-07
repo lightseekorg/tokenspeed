@@ -94,7 +94,7 @@ class MHAExtendMetadata:
     max_extend_seq_len: int
     max_extend_prefix_len: int = 0
     # Per-group page tables (group_id -> [num_reqs, max_pages]); None on
-    # the single-table path. drop the single page_table.
+    # the cache path (DFLASH block-decode drafts still use it).
     page_tables: dict[str, torch.Tensor] | None = None
     # Per-group KV write locations (group_id -> [num_tokens] int32),
     # built with page_tables — same groups, same lifecycle.
@@ -205,7 +205,7 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
                 self.draft_block_decode and self.spec_num_tokens > 1
             ), "paged cache groups are unsupported with DFLASH block decode"
             # The cache path routes every read/write through the per-group
-            # tables; the single-table single table would be dead work.
+            # tables; a shared single page_table would be dead work.
             page_table = None
             if forward_mode.is_extend_or_mixed():
                 assert extend_prefix_lens_cpu is not None
@@ -409,7 +409,7 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         else:
             metadata = MHADecodeMetadata(
                 # Cache-group captures route reads through the per-group tables and
-                # replay never fills the single-table single table, so mirror the
+                # replay never fills a shared single page_table, so mirror the
                 # eager cache path: page_table=None instead of a slice of the
                 # never-filled zero buffer.
                 page_table=(
