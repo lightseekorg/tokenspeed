@@ -45,7 +45,7 @@ def set_default_torch_dtype(dtype: torch.dtype) -> Generator[None]:
 def get_model_architecture(model_config: ModelConfig) -> tuple[type[nn.Module], str]:
     from tokenspeed.runtime.models.registry import ModelRegistry
 
-    architectures = getattr(model_config.hf_config, "architectures", [])
+    architectures = getattr(model_config.hf_config, "architectures", None) or []
     # Mixtral only supports the quantization backends listed here in the
     # current model registry and loader stack.
     mixtral_supported = ["fp8", "compressed-tensors"]

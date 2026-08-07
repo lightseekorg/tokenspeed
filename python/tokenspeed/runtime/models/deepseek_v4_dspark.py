@@ -15,8 +15,8 @@ from collections.abc import Iterable
 import torch
 from tokenspeed_kernel import mhc_fused_hc, mhc_post, mhc_pre
 from torch import nn
-from transformers import PretrainedConfig
 
+from tokenspeed.runtime.configs.base_config import BaseConfig, get_rope_theta
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.layernorm import RMSNorm
@@ -210,7 +210,7 @@ def _apply_dspark_hc_head(
 class _DSparkStage(nn.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None,
         *,
@@ -266,7 +266,7 @@ class _DSparkStage(nn.Module):
 class DeepseekV4DSparkModel(nn.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None,
         prefix: str,
@@ -388,7 +388,7 @@ class DeepseekV4DSparkModel(nn.Module):
             precompute_dspark_freqs_cis(
                 self.attention_params["rope_head_dim"],
                 frequency_capacity,
-                float(getattr(config, "rope_theta", 10000.0)),
+                get_rope_theta(config, 10000.0),
                 frequency_device,
             ),
             persistent=False,
@@ -586,7 +586,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
 
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",

@@ -16,6 +16,7 @@ from unittest import mock
 import pytest
 import torch
 
+from tokenspeed.runtime.configs.base_config import get_rope_theta
 from tokenspeed.runtime.configs.kimi_k3_dspark_config import (
     K3_DSPARK_SKIPPED_WEIGHT_PREFIXES,
     KimiK3DSparkConfig,
@@ -133,7 +134,7 @@ def test_yarn_scaling_is_translated_for_get_rope() -> None:
     assert scaling["factor"] == 32.0
     assert scaling["original_max_position_embeddings"] == 32768
     # rope_parameters.rope_theta is what the draft trained with.
-    assert config.resolved_rope_theta() == 50000.0
+    assert get_rope_theta(config) == 50000.0
 
 
 def test_non_yarn_rope_yields_no_scaling() -> None:
@@ -141,7 +142,7 @@ def test_non_yarn_rope_yields_no_scaling() -> None:
         rope_parameters={"rope_type": "default", "rope_theta": 10000.0}
     )
     assert config.rope_scaling_dict() is None
-    assert config.resolved_rope_theta() == 10000.0
+    assert get_rope_theta(config) == 10000.0
 
 
 # --------------------------------------------------------------------------

@@ -32,9 +32,9 @@ from typing import Any
 
 import torch
 from torch import nn
-from transformers import LlamaConfig
 
-from tokenspeed.runtime.configs.utils import get_rope_theta
+from tokenspeed.runtime.configs.base_config import get_rope_theta
+from tokenspeed.runtime.configs.llama_config import LlamaConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.activation import SiluAndMul

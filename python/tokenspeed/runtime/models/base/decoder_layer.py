@@ -30,8 +30,8 @@ from typing import Generic, TypeVar
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
 
+from tokenspeed.runtime.configs.base_config import BaseConfig
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
@@ -62,7 +62,7 @@ def _default_compute_output_placement(
     return Partial(group) if has_parallel else None
 
 
-_C = TypeVar("_C", bound=PretrainedConfig)
+_C = TypeVar("_C", bound=BaseConfig)
 
 
 class BaseDecoderLayer(nn.Module, Generic[_C]):

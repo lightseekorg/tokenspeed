@@ -4,10 +4,12 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from transformers import MiniMaxM3VLTextConfig
 
-from tokenspeed.runtime.configs import MiniMaxM3Config
-from tokenspeed.runtime.configs.minimax_m3_config import MiniMaxM3VisionConfig
+from tokenspeed.runtime.configs import MiniMaxM3Config, get_config_class
+from tokenspeed.runtime.configs.minimax_m3_config import (
+    MiniMaxM3VisionConfig,
+    MiniMaxM3VLTextConfig,
+)
 from tokenspeed.runtime.configs.model_config import (
     AttentionArch,
     _resolve_attention_family,
@@ -21,7 +23,6 @@ from tokenspeed.runtime.models.minimax_m3 import (
     MiniMaxM3SparseMoeBlock,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
-from tokenspeed.runtime.utils.hf_transformers_utils import _CONFIG_REGISTRY
 
 
 def _tiny_config() -> MiniMaxM3Config:
@@ -137,13 +138,49 @@ def _build_model(
 def test_minimax_m3_config() -> None:
     config = _tiny_config()
 
-    assert _CONFIG_REGISTRY["minimax_m3_vl"] is MiniMaxM3Config
+    assert get_config_class("minimax_m3_vl") is MiniMaxM3Config
+    assert isinstance(config.text_config, MiniMaxM3VLTextConfig)
     assert config.runtime_attention_arch == "MSA"
     assert config.text_config.layer_types[-1] == "minimax_m3_sparse"
     assert config.text_config.mlp_layer_types[-1] == "sparse"
     assert config.text_config.index_block_size == 128
     assert isinstance(config.vision_config, MiniMaxM3VisionConfig)
     assert is_multimodal_model(["MiniMaxM3SparseForConditionalGeneration"])
+
+
+def test_minimax_m3_config_builds_text_config_from_dict() -> None:
+    config = MiniMaxM3Config(
+        text_config={
+            "model_type": "minimax_m3_vl_text",
+            "hidden_size": 256,
+        }
+    )
+
+    assert isinstance(config.text_config, MiniMaxM3VLTextConfig)
+    assert config.text_config.hidden_size == 256
+
+
+def test_minimax_m3_text_config_explicit_init_normalizes_legacy_fields() -> None:
+    config = MiniMaxM3VLTextConfig(
+        num_hidden_layers=2,
+        hidden_act="swigluoai",
+        num_experts=16,
+        sparse_attention_config={
+            "sparse_num_index_heads": 2,
+            "sparse_index_dim": 64,
+            "sparse_attention_freq": [0, 1],
+        },
+        moe_layer_freq=[0, 1],
+        checkpoint_extension="preserved",
+    )
+
+    assert config.hidden_act == "silu"
+    assert config.num_local_experts == 16
+    assert config.index_n_heads == 2
+    assert config.index_head_dim == 64
+    assert config.layer_types == ["full_attention", "minimax_m3_sparse"]
+    assert config.mlp_layer_types == ["dense", "sparse"]
+    assert config.checkpoint_extension == "preserved"
 
 
 def test_minimax_m3_attention_family_selects_msa() -> None:

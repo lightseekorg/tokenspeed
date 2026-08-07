@@ -18,8 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from tokenspeed._logging import suppress_noisy_third_party_logs
+from tokenspeed._logging import install_logger_extensions as _install_logger_extensions
+from tokenspeed._logging import (
+    suppress_noisy_third_party_logs as _suppress_noisy_third_party_logs,
+)
 
-_suppress_noisy_third_party_logs = suppress_noisy_third_party_logs
-
+_install_logger_extensions()
 _suppress_noisy_third_party_logs()

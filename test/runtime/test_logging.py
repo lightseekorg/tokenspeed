@@ -49,5 +49,17 @@ class TestThirdPartyLogging(unittest.TestCase):
         self.assertNotIn("Persistent cache disabled", stderr.getvalue())
 
 
+class TestLoggerExtensions(unittest.TestCase):
+    def test_warning_once_emits_same_message_once(self):
+        logger = logging.getLogger("tokenspeed.test.warning_once")
+
+        with self.assertLogs(logger, level=logging.WARNING) as captured:
+            logger.warning_once("warning %s", "once")
+            logger.warning_once("warning %s", "once")
+
+        self.assertEqual(len(captured.records), 1)
+        self.assertEqual(captured.records[0].getMessage(), "warning once")
+
+
 if __name__ == "__main__":
     unittest.main()

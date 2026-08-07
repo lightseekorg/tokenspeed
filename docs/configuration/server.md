@@ -17,10 +17,15 @@ For a compact compatibility table, see
 | `--tokenizer-mode` | Select tokenizer behavior. `auto` uses fast tokenizers and model-specific hooks when available. |
 | `--skip-tokenizer-init` | Skip tokenizer initialization for input-ID-only serving paths. |
 | `--load-format` | Weight loading format: `auto`, `pt`, `safetensors`, `instanttensor`, `npcache`, `dummy`, or `extensible`. See [InstantTensor](/guides/instanttensor) for the accelerated NVIDIA loader. |
-| `--trust-remote-code` | Allow custom model code from the model repository. |
+| `--trust-remote-code` | Allow custom tokenizer code from the model repository. This does not enable remote model config or model implementation code. |
 | `--revision` | Model branch, tag, or commit. |
 | `--download-dir` | Hugging Face download/cache directory. |
-| `--hf-overrides` | JSON overrides for model configuration values. |
+| `--hf-overrides` | JSON overrides for model configuration values. Setting legacy `rope_scaling` to `null` or `{}` removes checkpoint scaling and restores default RoPE. |
+
+TokenSpeed loads model configurations only through its locally registered
+configuration classes. A checkpoint's `config.json` must declare a `model_type`
+registered by TokenSpeed; unknown or missing values are rejected. Enabling
+`--trust-remote-code` does not expand this model configuration support boundary.
 
 ## Precision And Quantization
 

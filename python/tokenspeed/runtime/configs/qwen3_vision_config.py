@@ -18,42 +18,28 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from transformers import PretrainedConfig
+from dataclasses import field
+
+from tokenspeed.runtime.configs.base_config import BaseConfig
 
 
-class Qwen3VLVisionConfig(PretrainedConfig):
+class Qwen3VLVisionConfig(BaseConfig):
     model_type = "qwen3_vl"
     base_config_key = "vision_config"
 
-    def __init__(
-        self,
-        depth=27,
-        hidden_size=1152,
-        hidden_act="gelu_pytorch_tanh",
-        intermediate_size=4304,
-        num_heads=16,
-        in_channels=3,
-        patch_size=16,
-        spatial_merge_size=2,
-        temporal_patch_size=2,
-        out_hidden_size=3584,
-        num_position_embeddings=2304,
-        deepstack_visual_indexes=[8, 16, 24],
-        initializer_range=0.02,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
+    depth: int = 27
+    hidden_size: int = 1152
+    hidden_act: str = "gelu_pytorch_tanh"
+    intermediate_size: int = 4304
+    num_heads: int = 16
+    in_channels: int = 3
+    patch_size: int = 16
+    spatial_merge_size: int = 2
+    temporal_patch_size: int = 2
+    out_hidden_size: int = 3584
+    num_position_embeddings: int = 2304
+    deepstack_visual_indexes: list = field(default_factory=lambda: [8, 16, 24])
+    initializer_range: float = 0.02
 
-        self.depth = depth
-        self.hidden_size = hidden_size
-        self.hidden_act = hidden_act
-        self.intermediate_size = intermediate_size
-        self.num_heads = num_heads
-        self.in_channels = in_channels
-        self.patch_size = patch_size
-        self.spatial_merge_size = spatial_merge_size
-        self.temporal_patch_size = temporal_patch_size
-        self.out_hidden_size = out_hidden_size
-        self.num_position_embeddings = num_position_embeddings
-        self.initializer_range = initializer_range
-        self.deepstack_visual_indexes = deepstack_visual_indexes
+    def __post_init__(self, **kwargs):
+        super().__post_init__(**kwargs)

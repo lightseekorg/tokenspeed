@@ -153,11 +153,11 @@ class TestInklingRealCheckpointLoad(unittest.TestCase):
 
     @classmethod
     def _build_model(cls, ckpt: str, quant_config=None):
+        from tokenspeed.runtime.configs.utils import get_config
         from tokenspeed.runtime.distributed.mapping import Mapping
         from tokenspeed.runtime.layers.moe import utils as moe_utils
         from tokenspeed.runtime.models.inkling import InklingForConditionalGeneration
         from tokenspeed.runtime.utils.env import global_server_args_dict
-        from tokenspeed.runtime.utils.hf_transformers_utils import get_config
 
         # Same precomputed-topk backend the engine resolves for Inkling (the
         # standalone auto default plans its own routing, which Inkling rejects).
@@ -165,7 +165,7 @@ class TestInklingRealCheckpointLoad(unittest.TestCase):
         mapping = Mapping(rank=0, world_size=1)
         global_server_args_dict["mapping"] = mapping
         global_server_args_dict["enable_prefix_caching"] = False
-        config = get_config(ckpt, trust_remote_code=False, revision=None)
+        config = get_config(ckpt, revision=None)
         with torch.device("cuda"):
             torch.set_default_dtype(torch.bfloat16)
             try:

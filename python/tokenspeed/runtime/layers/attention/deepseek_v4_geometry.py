@@ -33,6 +33,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from tokenspeed.runtime.configs.deepseek_v4_config import get_deepseek_v4_compress_ratio
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     DEEPSEEK_V4_PAGE_SIZE,
 )
@@ -233,27 +234,22 @@ def deepseek_v4_cache_layout_from_config(
     use_fp4_indexer_cache: bool,
     layer_indices: Iterable[int] | None = None,
 ) -> DeepseekV4CacheLayout:
-    compress_ratios = tuple(hf_config.compress_ratios)
+    num_hidden_layers = len(hf_config.layer_types)
     if layer_indices is None:
-        layer_ratios = compress_ratios
+        layer_indices = range(num_hidden_layers)
     else:
         layer_indices = tuple(layer_indices)
-        if any(idx < 0 or idx >= len(compress_ratios) for idx in layer_indices):
+        if any(idx < 0 for idx in layer_indices):
             raise ValueError(
                 "DeepSeek V4 cache layout layer index out of range: "
-                f"indices={layer_indices}, ratios={len(compress_ratios)}"
+                f"indices={layer_indices}, layers={num_hidden_layers}"
             )
-        layer_ratios = [compress_ratios[idx] for idx in layer_indices]
-    raw_layer_ratios = tuple(int(x) for x in layer_ratios)
-    for ratio in raw_layer_ratios:
-        if ratio not in (0, 1, 4, 128):
-            raise ValueError(
-                "Unsupported DeepSeek V4 cache compress_ratio="
-                f"{ratio}; expected one of 0, 1, 4, or 128"
-            )
+    raw_layer_ratios = tuple(
+        get_deepseek_v4_compress_ratio(hf_config, idx) for idx in layer_indices
+    )
 
     return DeepseekV4CacheLayout(
-        layer_ratio=tuple(max(1, ratio) for ratio in raw_layer_ratios),
+        layer_ratio=raw_layer_ratios,
         head_dim=int(hf_config.head_dim),
         rope_head_dim=int(hf_config.qk_rope_head_dim),
         page_size=page_size,

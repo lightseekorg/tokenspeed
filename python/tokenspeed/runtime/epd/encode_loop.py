@@ -143,7 +143,6 @@ def _build_encode_worker(server_args, port_args, gpu_id, global_rank):
 
     model_config = ModelConfig(
         server_args.model,
-        trust_remote_code=server_args.trust_remote_code,
         revision=server_args.revision,
         context_length=server_args.max_model_len,
         model_override_args=server_args.hf_overrides,

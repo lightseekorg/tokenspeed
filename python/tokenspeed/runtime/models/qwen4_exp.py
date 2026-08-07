@@ -30,11 +30,11 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
+from tokenspeed.runtime.configs.base_config import get_rope_parameters
 from tokenspeed.runtime.configs.qwen4_exp_config import (
     Qwen4ExpConfig,
     Qwen4ExpTextConfig,
 )
-from tokenspeed.runtime.configs.utils import get_rope_parameters
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext

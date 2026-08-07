@@ -27,8 +27,8 @@ from typing import Any
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
 
+from tokenspeed.runtime.configs.base_config import BaseConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
@@ -46,7 +46,7 @@ class BaseCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -81,7 +81,7 @@ class BaseCausalLM(nn.Module):
 
     def resolve_model(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None,
         prefix: str,
@@ -96,7 +96,7 @@ class BaseCausalLM(nn.Module):
 
     def resolve_lm_head(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         quant_config: QuantizationConfig | None,
         prefix: str,
     ) -> nn.Module:
@@ -123,7 +123,7 @@ class BaseCausalLM(nn.Module):
             tp_group=self.mapping.attn.tp_group,
         )
 
-    def resolve_logits_processor(self, config: PretrainedConfig) -> LogitsProcessor:
+    def resolve_logits_processor(self, config: BaseConfig) -> LogitsProcessor:
 
         return LogitsProcessor(
             config,

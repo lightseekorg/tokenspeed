@@ -27,7 +27,7 @@ with ``sigmoid`` / ``noaux_tc`` routing), so we expose a thin subclass that
 inherits ``DeepseekV3Config`` and only overrides the registered ``model_type``.
 """
 
-from transformers import DeepseekV3Config
+from tokenspeed.runtime.configs.deepseek_v3_config import DeepseekV3Config
 
 
 class KimiK2Config(DeepseekV3Config):

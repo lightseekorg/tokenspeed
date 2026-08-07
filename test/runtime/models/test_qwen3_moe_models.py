@@ -4,12 +4,13 @@ import unittest
 import torch
 from torch import nn
 
+from tokenspeed.runtime.configs import get_config_class
 from tokenspeed.runtime.configs.qwen3_moe_config import Qwen3MoeConfig
+from tokenspeed.runtime.configs.utils import get_config
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.utils.env import global_server_args_dict
-from tokenspeed.runtime.utils.hf_transformers_utils import _CONFIG_REGISTRY, get_config
 
 
 def _tiny_qwen3_moe_config() -> Qwen3MoeConfig:
@@ -44,7 +45,7 @@ def _ep_rank_mapping(rank: int) -> Mapping:
 class TestQwen3MoeConfig(unittest.TestCase):
     def test_config_registry(self):
         self.assertEqual(Qwen3MoeConfig.model_type, "qwen3_moe")
-        self.assertIs(_CONFIG_REGISTRY["qwen3_moe"], Qwen3MoeConfig)
+        self.assertIs(get_config_class("qwen3_moe"), Qwen3MoeConfig)
 
     def test_get_config_loads_qwen3_30b_a3b_shape(self):
         import tempfile
@@ -81,7 +82,7 @@ class TestQwen3MoeConfig(unittest.TestCase):
                 )
             )
 
-            config = get_config(tmpdir, trust_remote_code=False)
+            config = get_config(tmpdir)
 
         self.assertIsInstance(config, Qwen3MoeConfig)
         self.assertEqual(config.architectures, ["Qwen3MoeForCausalLM"])

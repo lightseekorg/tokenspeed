@@ -179,9 +179,10 @@ class DeepseekV4PoolOptions:
 class DeepseekV4Recipe(CacheRecipe):
     """DeepSeek V4: one arena for SWA, compressed chains and indexer state.
 
-    The MTP layer already is a continuation layer of the target config
-    (``compress_ratios`` carries ``num_hidden_layers + num_nextn`` entries), so
-    one pass over the full layer range builds the merged plan.
+    The MTP layer is a continuation layer of the target config: ``layer_types``
+    carries only ``num_hidden_layers`` entries and draft layers (indices at or
+    past ``num_hidden_layers``) resolve to sliding-window, so one pass over the
+    full layer range builds the merged plan.
     """
 
     family = "deepseek_v4"

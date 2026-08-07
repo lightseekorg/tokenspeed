@@ -63,18 +63,18 @@ class _ModelRegistry:
 
     def _normalize_archs(
         self,
-        architectures: str | list[str],
+        architectures: str | list[str] | None,
     ) -> list[str]:
         if isinstance(architectures, str):
             architectures = [architectures]
         if not architectures:
             logger.warning("No model architectures are specified")
 
-        return architectures
+        return architectures or []
 
     def resolve_model_cls(
         self,
-        architectures: str | list[str],
+        architectures: str | list[str] | None,
     ) -> tuple[type[nn.Module], str]:
         architectures = self._normalize_archs(architectures)
 

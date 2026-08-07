@@ -88,9 +88,13 @@ class Qwen4ExpTextConfig(Qwen3_5TextConfig):
         self.make_ngram_vocab_size_divisible_by = int(
             make_ngram_vocab_size_divisible_by
         )
-        self._qwen4_exp_layer_types = (
-            list(layer_types) if layer_types is not None else None
-        )
+        # ``layer_types`` is finalized by ``Qwen3_5BaseTextConfig.__post_init__``
+        # through the ``layer_types`` property setter: it either derives the
+        # legacy ``full_attention_interval`` interleave (when the checkpoint
+        # omits it) or remaps legacy label spellings into the paged-cache
+        # vocabulary. Re-capturing the raw argument here would reset
+        # ``_qwen4_exp_layer_types`` to ``None`` and clobber that derived value,
+        # so no explicit capture is needed.
 
     @property
     def layers_block_type(self) -> list[str]:

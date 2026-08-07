@@ -27,11 +27,11 @@ import dataclasses
 import uuid
 from collections.abc import Mapping
 from enum import Enum, auto
-from typing import Any
 
 import msgspec
 import torch
 
+from tokenspeed.runtime.configs.base_config import BaseConfig
 from tokenspeed.runtime.multimodal.hash import hash_feature
 from tokenspeed.runtime.multimodal.shm_transport import ShmTensorHandle
 from tokenspeed.runtime.utils.env import envs
@@ -95,7 +95,7 @@ class Modality(Enum):
     AUDIO = auto()
 
 
-def resolve_mm_pad_substitute_ids(config: Any) -> dict[Modality, int]:
+def resolve_mm_pad_substitute_ids(config: BaseConfig) -> dict[Modality, int]:
     """Resolve in-vocab speculative-draft tokens for each media modality.
 
     Model families use different configuration names. Prefer a modality's

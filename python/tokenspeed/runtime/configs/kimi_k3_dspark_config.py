@@ -34,7 +34,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from transformers.configuration_utils import PretrainedConfig
+from tokenspeed.runtime.configs.base_config import TextConfigBase
 
 # The checkpoint ships an embed_tokens copy of the frozen target embedding and
 # a training-only confidence head. Neither is instantiated at serving time.
@@ -45,86 +45,88 @@ SUPPORTED_MARKOV_HEAD_TYPES = ("vanilla",)
 SUPPORTED_AUX_HIDDEN_STREAMS = ("prefix", "attn_res")
 
 
-class KimiK3DSparkConfig(PretrainedConfig):
+class KimiK3DSparkConfig(TextConfigBase):
     """Draft-side config for `K3DSparkModel`."""
 
     model_type = "k3_dspark"
 
-    def __init__(
-        self,
-        hidden_size: int = 7168,
-        intermediate_size: int = 14336,
-        num_hidden_layers: int = 5,
-        num_attention_heads: int = 64,
-        num_key_value_heads: int = 64,
-        q_lora_rank: int = 1536,
-        kv_lora_rank: int = 512,
-        qk_nope_head_dim: int = 128,
-        qk_rope_head_dim: int = 64,
-        v_head_dim: int = 128,
-        mla_use_nope: bool = False,
-        mla_use_output_gate: bool = False,
-        vocab_size: int = 163840,
-        draft_vocab_size: int | None = None,
-        rms_norm_eps: float = 1e-5,
-        hidden_act: str = "silu",
-        max_position_embeddings: int = 1048576,
-        rope_theta: float = 50000.0,
-        rope_parameters: dict[str, Any] | None = None,
-        num_target_layers: int = 5,
-        target_hidden_size: int = 7168,
-        target_num_hidden_layers: int = 93,
-        target_layer_ids: list[int] | None = None,
-        fc_norm: bool = False,
-        aux_hidden_stream: str = "prefix",
-        mask_token_id: int | None = None,
-        markov_rank: int = 256,
-        markov_head_type: str = "vanilla",
-        enable_confidence_head: bool = True,
-        confidence_head_with_markov: bool = True,
-        **kwargs,
-    ) -> None:
-        self.hidden_size = int(hidden_size)
-        self.intermediate_size = int(intermediate_size)
-        self.num_hidden_layers = int(num_hidden_layers)
-        self.num_attention_heads = int(num_attention_heads)
-        self.num_key_value_heads = int(num_key_value_heads)
-        self.q_lora_rank = int(q_lora_rank)
-        self.kv_lora_rank = int(kv_lora_rank)
-        self.qk_nope_head_dim = int(qk_nope_head_dim)
-        self.qk_rope_head_dim = int(qk_rope_head_dim)
-        self.v_head_dim = int(v_head_dim)
-        self.mla_use_nope = bool(mla_use_nope)
-        self.mla_use_output_gate = bool(mla_use_output_gate)
-        self.vocab_size = int(vocab_size)
+    hidden_size: int = 7168
+    intermediate_size: int = 14336
+    num_hidden_layers: int = 5
+    num_attention_heads: int = 64
+    num_key_value_heads: int = 64
+    q_lora_rank: int = 1536
+    kv_lora_rank: int = 512
+    qk_nope_head_dim: int = 128
+    qk_rope_head_dim: int = 64
+    v_head_dim: int = 128
+    mla_use_nope: bool = False
+    mla_use_output_gate: bool = False
+    vocab_size: int = 163840
+    draft_vocab_size: int | None = None
+    rms_norm_eps: float = 1e-5
+    hidden_act: str = "silu"
+    max_position_embeddings: int = 1048576
+    rope_theta: float = 50000.0
+    rope_parameters: dict[str, Any] | None = None
+    num_target_layers: int = 5
+    target_hidden_size: int = 7168
+    target_num_hidden_layers: int = 93
+    target_layer_ids: list[int] | None = None
+    fc_norm: bool = False
+    aux_hidden_stream: str = "prefix"
+    mask_token_id: int | None = None
+    markov_rank: int = 256
+    markov_head_type: str = "vanilla"
+    enable_confidence_head: bool = True
+    confidence_head_with_markov: bool = True
+
+    def __post_init__(self, **kwargs) -> None:
+        # MLA
+        self.q_lora_rank = int(self.q_lora_rank)
+        self.kv_lora_rank = int(self.kv_lora_rank)
+        self.qk_nope_head_dim = int(self.qk_nope_head_dim)
+        self.qk_rope_head_dim = int(self.qk_rope_head_dim)
+        self.v_head_dim = int(self.v_head_dim)
+        self.mla_use_nope = bool(self.mla_use_nope)
+        self.mla_use_output_gate = bool(self.mla_use_output_gate)
+
         self.draft_vocab_size = int(
-            draft_vocab_size if draft_vocab_size is not None else vocab_size
+            self.draft_vocab_size
+            if self.draft_vocab_size is not None
+            else self.vocab_size
         )
-        self.rms_norm_eps = float(rms_norm_eps)
-        self.hidden_act = str(hidden_act)
-        self.max_position_embeddings = int(max_position_embeddings)
-        self.rope_theta = float(rope_theta)
-        self.rope_parameters = rope_parameters
-        self.num_target_layers = int(num_target_layers)
-        self.target_hidden_size = int(target_hidden_size)
-        self.target_num_hidden_layers = int(target_num_hidden_layers)
-        self.target_layer_ids = [int(x) for x in (target_layer_ids or [])]
-        self.fc_norm = bool(fc_norm)
-        self.aux_hidden_stream = str(aux_hidden_stream).lower()
+        self.rope_theta = float(self.rope_theta)
+        self.num_target_layers = int(self.num_target_layers)
+        self.target_hidden_size = int(self.target_hidden_size)
+        self.target_num_hidden_layers = int(self.target_num_hidden_layers)
+        self.target_layer_ids = [int(x) for x in (self.target_layer_ids or [])]
+        self.fc_norm = bool(self.fc_norm)
+        self.aux_hidden_stream = str(self.aux_hidden_stream).lower()
         self.mask_token_id = (
-            mask_token_id if mask_token_id is None else int(mask_token_id)
+            self.mask_token_id
+            if self.mask_token_id is None
+            else int(self.mask_token_id)
         )
-        self.markov_rank = int(markov_rank)
-        self.markov_head_type = str(markov_head_type).lower()
-        self.enable_confidence_head = bool(enable_confidence_head)
-        self.confidence_head_with_markov = bool(confidence_head_with_markov)
-        if not kwargs.get("architectures"):
-            # The published K3 DSpark config may omit ``architectures``. The
-            # runtime model registry dispatches by this field, so materialize
-            # the native entry class instead of falling back to the config
-            # class name (which has no registered model implementation).
-            kwargs["architectures"] = ["K3DSparkModel"]
-        super().__init__(**kwargs)
+        self.markov_rank = int(self.markov_rank)
+        self.markov_head_type = str(self.markov_head_type).lower()
+        self.enable_confidence_head = bool(self.enable_confidence_head)
+        self.confidence_head_with_markov = bool(self.confidence_head_with_markov)
+        if not self.architectures:
+            self.architectures = ["K3DSparkModel"]
+
+        self.vocab_size = int(self.vocab_size)
+        self.hidden_size = int(self.hidden_size)
+        self.intermediate_size = int(self.intermediate_size)
+        self.num_hidden_layers = int(self.num_hidden_layers)
+        self.num_attention_heads = int(self.num_attention_heads)
+        self.num_key_value_heads = int(self.num_key_value_heads)
+        self.hidden_act = str(self.hidden_act)
+        self.max_position_embeddings = int(self.max_position_embeddings)
+        self.rms_norm_eps = float(self.rms_norm_eps)
+        self.head_dim = self.qk_rope_head_dim
+
+        super().__post_init__(**kwargs)
 
     @property
     def qk_head_dim(self) -> int:
@@ -134,16 +136,6 @@ class KimiK3DSparkConfig(PretrainedConfig):
     def kv_latent_dim(self) -> int:
         """Width of one cached latent row: [c_KV_norm | k_PE_RoPE]."""
         return self.kv_lora_rank + self.qk_rope_head_dim
-
-    @property
-    def rope_scaling(self) -> dict[str, Any] | None:
-        """Alias for the runtime's MLA setup, which reads ``rope_scaling``.
-
-        The checkpoint spells YaRN under ``rope_parameters``. Without this the
-        runtime derives the softmax scale with no mscale correction while the
-        model applies one, and the two disagree.
-        """
-        return self.rope_scaling_dict()
 
     def rope_scaling_dict(self) -> dict[str, Any] | None:
         """YaRN parameters in the shape ``get_rope`` expects, or None."""
@@ -167,11 +159,6 @@ class KimiK3DSparkConfig(PretrainedConfig):
         }
         scaling["rope_type"] = "deepseek_yarn"
         return scaling
-
-    def resolved_rope_theta(self) -> float:
-        """rope_parameters.rope_theta wins; it is what the draft trained with."""
-        params = self.rope_parameters or {}
-        return float(params.get("rope_theta", self.rope_theta))
 
 
 def k3_dspark_inactive_features(config: KimiK3DSparkConfig) -> list[str]:

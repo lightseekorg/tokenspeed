@@ -2,7 +2,7 @@
 
 Covers the parts landed in the Kimi-K3 model-registration change: the
 ``KimiLinearConfig`` mixed-layer protocol (consumed by the hybrid KV-cache
-layer) and the architecture-registration touchpoints (``_CONFIG_REGISTRY``,
+layer) and the architecture-registration touchpoints (``get_config_class``,
 ``_MLA_ARCHITECTURES``, ``is_multimodal_model``, ``EntryClass``).
 """
 
@@ -760,12 +760,12 @@ class KimiK3RegistrationTests(unittest.TestCase):
         self.assertFalse(attention.can_fuse_attnres_partials(torch.empty(1, 4), ()))
 
     def test_config_registry_maps_model_type(self):
-        from tokenspeed.runtime.utils.hf_transformers_utils import _CONFIG_REGISTRY
+        from tokenspeed.runtime.configs import get_config_class
 
-        self.assertIs(_CONFIG_REGISTRY.get("kimi_k3"), KimiK3Config)
+        self.assertIs(get_config_class("kimi_k3"), KimiK3Config)
 
     def test_resolve_architecture_returns_registered_name(self):
-        from tokenspeed.runtime.utils.hf_transformers_utils import resolve_architecture
+        from tokenspeed.runtime.configs.utils import resolve_architecture
 
         cfg = KimiK3Config(architectures=["KimiK3ForConditionalGeneration"])
         self.assertEqual(resolve_architecture(cfg), "KimiK3ForConditionalGeneration")

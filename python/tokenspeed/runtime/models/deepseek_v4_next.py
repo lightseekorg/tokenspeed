@@ -29,8 +29,8 @@ from collections.abc import Iterable
 import torch
 from tokenspeed_kernel import mhc_post
 from torch import nn
-from transformers import PretrainedConfig
 
+from tokenspeed.runtime.configs.base_config import BaseConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.layernorm import RMSNorm
@@ -80,7 +80,7 @@ _MTP_CORE_WEIGHT_SUFFIXES = frozenset(
 )
 
 
-def _spec_layer_idx(config: PretrainedConfig, weight_name: str) -> int | None:
+def _spec_layer_idx(config: BaseConfig, weight_name: str) -> int | None:
     if getattr(config, "num_nextn_predict_layers", 0) <= 0:
         return None
     start = config.num_hidden_layers
@@ -106,7 +106,7 @@ def _find_mtp_layer_idx(name: str) -> int:
 
 
 def _mtp_checkpoint_weight(
-    config: PretrainedConfig,
+    config: BaseConfig,
     name: str,
 ) -> tuple[int, str] | None:
     """Return the local MTP layer and suffix for a draft checkpoint weight."""
@@ -127,13 +127,13 @@ def _mtp_checkpoint_weight(
     return layer_idx - int(config.num_hidden_layers), name[len(prefix) :]
 
 
-def _is_dspark_checkpoint_weight(config: PretrainedConfig, name: str) -> bool:
+def _is_dspark_checkpoint_weight(config: BaseConfig, name: str) -> bool:
     parsed = _mtp_checkpoint_weight(config, name)
     return parsed is not None and parsed[1] in _DSPARK_ONLY_WEIGHT_SUFFIXES
 
 
 class DeepseekV4MTPSharedHead(nn.Module):
-    def __init__(self, config: PretrainedConfig) -> None:
+    def __init__(self, config: BaseConfig) -> None:
         super().__init__()
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -141,7 +141,7 @@ class DeepseekV4MTPSharedHead(nn.Module):
 class DeepseekV4MultiTokenPredictorLayer(nn.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         mapping: Mapping,
         layer_id: int,
         quant_config: QuantizationConfig | None = None,
@@ -244,7 +244,7 @@ class DeepseekV4MultiTokenPredictorLayer(nn.Module):
 class DeepseekV4MultiTokenPredictor(nn.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -310,7 +310,7 @@ class DeepseekV4MultiTokenPredictor(nn.Module):
 class DeepseekV4ForCausalLMNextN(nn.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",

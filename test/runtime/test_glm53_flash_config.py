@@ -17,11 +17,11 @@ from tokenspeed.runtime.configs.model_config import (
     AttentionArch,
     configure_glm_attention,
 )
+from tokenspeed.runtime.configs.utils import get_config
 from tokenspeed.runtime.layers.attention.configs.linear_attn import (
     LinearAttnConfig,
 )
 from tokenspeed.runtime.layers.attention.registry import _LINEAR_ATTN_CLS
-from tokenspeed.runtime.utils.hf_transformers_utils import get_config
 
 _NUM_LAYERS = 45
 _NUM_KDA = 34
@@ -91,21 +91,20 @@ class Glm53FlashConfigTests(unittest.TestCase):
         self.assertEqual(config.vision_config.out_hidden_size, config.hidden_size)
         self.assertEqual(config.vision_config.swiglu_limit, 10.0)
 
-    def test_legacy_checkpoint_metadata_loads_canonical_config(self):
+    def test_checkpoint_loads_via_registered_config(self):
         raw_config = {
-            "model_type": "glm5_next",
-            "architectures": ["Glm5NextForConditionalGeneration"],
-            "text_config": {"model_type": "glm5_next_text"},
-            "vision_config": {"model_type": "glm5_next_vision"},
+            "model_type": "glm53_flash",
+            "architectures": ["Glm53FlashForConditionalGeneration"],
+            "text_config": {"model_type": "glm53_flash_text"},
+            "vision_config": {"model_type": "glm53_flash_vision"},
         }
         with tempfile.TemporaryDirectory() as model_dir:
             Path(model_dir, "config.json").write_text(
                 json.dumps(raw_config), encoding="utf-8"
             )
-            config = get_config(model_dir, trust_remote_code=False)
+            config = get_config(model_dir)
             draft_config = get_config(
                 model_dir,
-                trust_remote_code=False,
                 is_draft_worker=True,
                 speculative_algorithm="MTP",
             )
@@ -121,6 +120,23 @@ class Glm53FlashConfigTests(unittest.TestCase):
             draft_config.architectures,
             ["Glm53FlashForConditionalGenerationNextN"],
         )
+
+    def test_checkpoint_loads_via_legacy_glm5_next_names(self):
+        raw_config = {
+            "model_type": "glm5_next",
+            "architectures": ["Glm5NextForConditionalGeneration"],
+            "text_config": {"model_type": "glm53_flash_text"},
+            "vision_config": {"model_type": "glm53_flash_vision"},
+        }
+        with tempfile.TemporaryDirectory() as model_dir:
+            Path(model_dir, "config.json").write_text(
+                json.dumps(raw_config), encoding="utf-8"
+            )
+            config = get_config(model_dir)
+
+        self.assertIsInstance(config, Glm53FlashConfig)
+        self.assertEqual(config.model_type, "glm53_flash")
+        self.assertEqual(config.architectures, ["Glm53FlashForConditionalGeneration"])
 
     def test_vision_swiglu_limit_precedence(self):
         text_config = {
@@ -256,7 +272,7 @@ class Glm53FlashConfigTests(unittest.TestCase):
             text_config={"linear_attn_config": _linear_attn_config()},
             vision_config={},
         )
-        serialized = config.to_diff_dict()
+        serialized = config.to_dict()
         self.assertEqual(
             serialized["text_config"]["linear_attn_config"],
             _linear_attn_config(),

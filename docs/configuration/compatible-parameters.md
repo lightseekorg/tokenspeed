@@ -14,7 +14,6 @@ TokenSpeed-specific behavior explicitly.
 | `--tokenizer-mode` | Tokenizer implementation mode. |
 | `--skip-tokenizer-init` | Skip tokenizer initialization. |
 | `--load-format` | Weight loading format. |
-| `--trust-remote-code` | Allow custom model code from the model repository. |
 | `--dtype` | Weight and activation dtype. |
 | `--kv-cache-dtype` | KV cache storage dtype. |
 | `--quantization` | Weight quantization method. |
@@ -55,11 +54,12 @@ TokenSpeed-specific behavior explicitly.
 | `--expert-parallel-size` | `--expert-parallel-size`, `--ep-size` | TokenSpeed supports the familiar name and its existing short form. |
 | `--attention-backend` | `--attention-backend` | Name is aligned; available backend values are TokenSpeed-specific. |
 | `--moe-backend` | `--moe-backend` | Name is aligned; available backend values are TokenSpeed-specific. |
+| `--trust-remote-code` | `--trust-remote-code` | TokenSpeed applies this only to custom tokenizer code. It does not enable remote model config or model implementation code; `model_type` must be registered locally. |
 
 ## Recipe Translation Notes
 
 - Use `tokenspeed serve` as the launcher.
-- Pass the model path positionally, then keep `--trust-remote-code`, `--max-model-len`, `--kv-cache-dtype`, `--gpu-memory-utilization`, `--max-num-seqs`, `--tensor-parallel-size`, `--reasoning-parser`, and `--tool-call-parser` when the model needs them.
+- Pass the model path positionally, then keep `--trust-remote-code` only when the tokenizer needs custom repository code. Keep `--max-model-len`, `--kv-cache-dtype`, `--gpu-memory-utilization`, `--max-num-seqs`, `--tensor-parallel-size`, `--reasoning-parser`, and `--tool-call-parser` when the model needs them.
 - Review `--max-num-batched-tokens` before copying it. TokenSpeed usually wants `--chunked-prefill-size` for per-iteration scheduling.
 - Review backend names. TokenSpeed backends are optimized for its runtime and kernel packages.
 - Keep TokenSpeed-specific `--attn-tp-size`, `--moe-tp-size`, `--disaggregation-*`, and `--kvstore-*` only when the deployment needs those features.

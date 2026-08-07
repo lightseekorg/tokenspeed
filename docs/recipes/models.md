@@ -140,6 +140,11 @@ Notes:
 - The draft's 1024-token sliding window is an attention mask its own layers
   apply. It is deliberately not a cache-retention policy, because the draft's
   pages are the target's pages.
+- During draft config loading, TokenSpeed translates
+  `dflash_config.use_swa`/`swa_window_size` into Qwen3's
+  `use_sliding_window`/`sliding_window` fields before constructing the config.
+  This keeps an inferred per-layer attention schedule consistent even when a
+  future draft checkpoint omits an explicit `layer_types` list.
 - Target features are captured from the residual stream after each layer in
   `dflash_config.target_layer_ids` (`[1, 12, 23, 35, 46, 57]` of M3's 60
   layers) and concatenated in ascending layer order to feed the draft's `fc`.
@@ -153,8 +158,8 @@ Notes:
 
 ## Kimi K2.5 / K2.6
 
-Kimi-style MoE launches usually need remote code, long context, reasoning and
-tool parsers, and explicit MLA/MoE backends.
+Kimi-style MoE launches usually need remote tokenizer code, long context,
+reasoning and tool parsers, and explicit MLA/MoE backends.
 
 ```bash
 tokenspeed serve nvidia/Kimi-K2.5-NVFP4 \
