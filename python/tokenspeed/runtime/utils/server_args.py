@@ -276,6 +276,7 @@ class ServerArgs:
     disable_kvstore: bool = False
     enforce_eager: bool = False
     disable_cuda_graph_padding: bool = False
+    disable_autotune: bool = False
     enable_cudagraph_gc: bool = False
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
@@ -387,13 +388,29 @@ class ServerArgs:
             if draft_model is not None and self.speculative_draft_model_path is None:
                 self.speculative_draft_model_path = str(draft_model)
 
+            dspark_draft_model = self.speculative_draft_model_path
+            dspark_uses_base_model = self.speculative_algorithm == "DSPARK" and (
+                self.draft_model_path_use_base
+                or dspark_draft_model is None
+                or maybe_model_redirect(dspark_draft_model) == self.model
+            )
+            if dspark_uses_base_model:
+                self.draft_model_path_use_base = True
+
             num_speculative_tokens = config.get("num_speculative_tokens")
             if num_speculative_tokens is not None:
                 num_speculative_tokens = int(num_speculative_tokens)
-                if self.speculative_algorithm in ("DFLASH", "DSPARK"):
+                if self.speculative_algorithm == "DFLASH" or (
+                    self.speculative_algorithm == "DSPARK"
+                    and not dspark_uses_base_model
+                ):
                     if self.speculative_num_draft_tokens is None:
                         self.speculative_num_draft_tokens = num_speculative_tokens
                     self.speculative_num_steps = max(num_speculative_tokens - 1, 0)
+                elif self.speculative_algorithm == "DSPARK":
+                    self.speculative_num_steps = num_speculative_tokens
+                    if self.speculative_num_draft_tokens is None:
+                        self.speculative_num_draft_tokens = num_speculative_tokens + 1
                 else:
                     self.speculative_num_steps = num_speculative_tokens
 
@@ -632,7 +649,7 @@ class ServerArgs:
             self.drafter_attention_backend = self.attention_backend
 
         if (
-            self.speculative_algorithm == "MTP"
+            self.speculative_algorithm in ("MTP", "DSPARK")
             and self.speculative_draft_model_path is None
         ):
             self.draft_model_path_use_base = True
@@ -653,6 +670,23 @@ class ServerArgs:
             elif self.speculative_num_steps != expected_steps:
                 raise ValueError(
                     "DFLASH requires speculative_num_steps to equal "
+                    "speculative_num_draft_tokens - 1. "
+                    f"Got {self.speculative_num_steps=} and "
+                    f"{self.speculative_num_draft_tokens=}."
+                )
+
+        if self.speculative_algorithm == "DSPARK" and self.draft_model_path_use_base:
+            if self.enable_prefix_caching:
+                raise ValueError(
+                    "DSPARK does not yet preserve its captured-context windows "
+                    "across prefix-cache hits; use --no-enable-prefix-caching."
+                )
+            expected_steps = max(int(self.speculative_num_draft_tokens) - 1, 0)
+            if self.speculative_num_steps == ServerArgs.speculative_num_steps:
+                self.speculative_num_steps = expected_steps
+            elif self.speculative_num_steps != expected_steps:
+                raise ValueError(
+                    "DSPARK requires speculative_num_steps to equal "
                     "speculative_num_draft_tokens - 1. "
                     f"Got {self.speculative_num_steps=} and "
                     f"{self.speculative_num_draft_tokens=}."
@@ -755,6 +789,15 @@ class ServerArgs:
 
     def validate_cache_options(self):
         if self.enable_kvstore and not self.enable_prefix_caching:
+            if self.speculative_algorithm == "DSPARK" and (
+                self.draft_model_path_use_base
+                or self.speculative_draft_model_path is None
+                or self.speculative_draft_model_path == self.model
+            ):
+                raise ValueError(
+                    "DSPARK currently requires both --disable-kvstore and "
+                    "--no-enable-prefix-caching."
+                )
             raise ValueError(
                 "KVStore and disabled prefix caching are mutually exclusive "
                 "and cannot be used at the same time. Please use only one of them."
@@ -1675,6 +1718,14 @@ class ServerArgs:
             "--disable-cuda-graph-padding",
             action="store_true",
             help="Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
+        )
+        parser.add_argument(
+            "--disable-autotune",
+            "--disable-flashinfer-autotune",
+            action="store_true",
+            help="Skip the startup kernel-tuning pass; tunable kernels use each "
+            "library's heuristic tactics instead. Speeds up startup for "
+            "debugging at the cost of serving performance.",
         )
         parser.add_argument(
             "--enable-cudagraph-gc",

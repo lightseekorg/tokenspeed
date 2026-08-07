@@ -421,7 +421,7 @@ class PrefillGraph:
     def _dummy_group_tables(
         self, req_tokens: int, bs: int
     ) -> dict[str, "torch.Tensor"]:
-        """Build capture tables: null KV pages and one writable state page."""
+        """Build capture tables that honor each backend's active-page contract."""
         backend = self.attn_backend
         if not getattr(backend, "uses_cache_groups", False):
             return {}
@@ -436,6 +436,9 @@ class PrefillGraph:
         # Composite wrappers hold the cache-group consumer as a child.
         if not hasattr(backend, "page_size") and hasattr(backend, "full_attn_backend"):
             backend = backend.full_attn_backend
+        require_real_active_pages = bool(
+            getattr(backend, "cache_active_pages_must_be_real", False)
+        )
         # Full width: backends that derive the row stride from max_kv_len
         # (trtllm) index the whole row even when the bucket is small.
         width = getattr(backend, "max_num_pages", 0) or -(
@@ -444,15 +447,29 @@ class PrefillGraph:
         # ALL groups, state included: hybrid wrappers forward the dict to the
         # mamba child, which requires its state group; KV children shed state
         # groups themselves (_shed_state_groups).
-        return {
-            str(spec.group_id): torch.full(
-                (bs, width),
-                1 if str(spec.group_id) in state_group_ids else 0,
+        out = {}
+        for spec in specs:
+            group_id = str(spec.group_id)
+            group_width = width
+            if require_real_active_pages:
+                raw_tokens_per_page = int(spec.rows_per_page) * int(
+                    spec.entry_stride_tokens
+                )
+                if raw_tokens_per_page <= 0:
+                    raise RuntimeError(
+                        f"cache group {group_id!r} has invalid page geometry"
+                    )
+                group_width = max(
+                    1,
+                    (req_tokens + raw_tokens_per_page - 1) // raw_tokens_per_page,
+                )
+            out[group_id] = torch.full(
+                (bs, group_width),
+                1 if require_real_active_pages or group_id in state_group_ids else 0,
                 dtype=torch.int32,
                 device=self.config.device,
             )
-            for spec in specs
-        }
+        return out
 
     def make_dummy_batch(
         self, num_tokens: int, decode_wrapper: CudaGraphWrapper | None
@@ -468,13 +485,11 @@ class PrefillGraph:
         a multi-request batch, never as one sequence.
 
         The prefill analogue of decode's ``_init_capture_metadata``. KV writes
-        go to the reserved dummy slot and the page table points at page 0, so
-        the forward runs (producing discarded garbage) without touching real
-        cache state. Backends with extra paged caches (DeepSeek-V4 DSA: SWA +
-        compressor + indexer state) also need per-cache block tables, or their
-        extend metadata comes up incomplete and the eager attention break
-        aborts the capture -- reuse the decode wrapper's dummy-table builder
-        (all zeros, the safe page 0) for those.
+        go to the reserved dummy slot. Per-group tables use page 0 when a
+        backend permits the null page for capture and page 1 when active
+        metadata requires a real writable page. Backends with extra paged
+        caches (DeepSeek-V4 DSA: SWA + compressor + indexer state) need every
+        group table, or their extend metadata is incomplete.
         """
         ib = self.input_buffers
         max_req_tokens = max(1, int(self.config.context_len))

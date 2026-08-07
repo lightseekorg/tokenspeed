@@ -463,6 +463,13 @@ def test_handshake_structs_are_map_encoded():
     assert isinstance(raw, dict)
     assert raw["status"] == "HELLO"
 
+    engine_ready = zmq_wire.WireEngineCoreReadyResponse(
+        dtype="float16", multimodal_encoder_dtype="bfloat16"
+    )
+    raw_engine_ready = msgspec.msgpack.decode(zmq_wire.encode(engine_ready))
+    assert raw_engine_ready["dtype"] == "float16"
+    assert raw_engine_ready["multimodal_encoder_dtype"] == "bfloat16"
+
     init = zmq_wire.WireHandshakeInitMessage(
         addresses=zmq_wire.WireHandshakeAddresses(
             inputs=["ipc://in"], outputs=["ipc://out"]

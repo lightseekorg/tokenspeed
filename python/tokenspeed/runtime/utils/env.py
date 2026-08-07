@@ -240,6 +240,7 @@ class Envs:
     TOKENSPEED_CUDA_COREDUMP_DIR = EnvStr("/tmp/tokenspeed_cuda_coredumps")
     TOKENSPEED_PROFILE_WITH_STACK = EnvBool(True)
     TOKENSPEED_TEST_REQUEST_TIME_STATS = EnvBool(False)
+    TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS = EnvBool(False)
     TOKENSPEED_PROFILER_DIR = EnvStr("/tmp")
     TOKENSPEED_CI_SMALL_KV_SIZE = EnvInt(-1)
     TOKENSPEED_NVTX = EnvBool(False)

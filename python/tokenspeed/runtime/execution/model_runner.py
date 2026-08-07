@@ -43,6 +43,33 @@ if TYPE_CHECKING:
 logger = get_colorful_logger(__name__)
 
 
+def infer_multimodal_encoder_dtype(model: torch.nn.Module) -> str | None:
+    """Return the dtype of the loaded multimodal encoder when discoverable."""
+    for path in (
+        ("visual",),
+        ("vision_tower",),
+        ("audio_tower",),
+        ("model", "visual"),
+        ("model", "vision_tower"),
+        ("model", "audio_tower"),
+    ):
+        component = model
+        for name in path:
+            component = getattr(component, name, None)
+            if component is None:
+                break
+        else:
+            dtype = getattr(component, "dtype", None)
+            if isinstance(dtype, torch.dtype):
+                return str(dtype).removeprefix("torch.")
+            if isinstance(component, torch.nn.Module):
+                for tensors in (component.parameters(), component.buffers()):
+                    for tensor in tensors:
+                        if tensor.is_floating_point():
+                            return str(tensor.dtype).removeprefix("torch.")
+    return None
+
+
 class ModelRunner:
     def __init__(
         self,
@@ -116,6 +143,10 @@ class ModelRunner:
         self._model_forward_accepts_spec_step_idx = self._forward_accepts_kwarg(
             self.model, "spec_step_idx"
         )
+
+    @property
+    def multimodal_encoder_dtype(self) -> str | None:
+        return infer_multimodal_encoder_dtype(self.model)
 
     def prepare_multimodal_runtime(self) -> None:
         """Prepare loaded multimodal encoders for serving.

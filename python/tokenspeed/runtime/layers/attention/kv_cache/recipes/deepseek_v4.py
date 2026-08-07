@@ -242,12 +242,6 @@ def prepare_deepseek_v4_cache(
         attn_config,
         layer_indices=range(model_config.num_attention_layers),
     )
-    # The c4 ring keeps eight rows: four prior rows plus the four verify rows.
-    if 4 in target_layout.layer_ratio and decode_input_tokens > 4:
-        raise ValueError(
-            "DeepSeek V4 c4 LCM cache supports at most four verify tokens; "
-            f"got {decode_input_tokens}"
-        )
     target_layout_plan = solve_deepseek_v4_memory_layout(target_fields)
     packing = dict(target_layout_plan.group_packing)
 
@@ -290,6 +284,7 @@ def prepare_deepseek_v4_cache(
             model_config.hf_config,
             layer_ratio=target_layout.layer_ratio,
             cache_blocks_per_lcm_block=packing,
+            decode_input_tokens=decode_input_tokens,
         )
     )
     max_packing = max(packing.values())

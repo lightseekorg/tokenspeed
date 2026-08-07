@@ -151,6 +151,36 @@ class DummyGroupTablesTest(unittest.TestCase):
         tables = self._bare(backend, pool)._dummy_group_tables(100, 1)
         self.assertEqual(tables["full_attention"].shape, (1, 2500))
 
+    def test_real_active_page_contract_uses_per_group_geometry(self):
+        backend = SimpleNamespace(
+            uses_cache_groups=True,
+            cache_active_pages_must_be_real=True,
+            page_size=256,
+            max_num_pages=257,
+            state_group_ids=frozenset(),
+        )
+        pool = SimpleNamespace(
+            paged_cache_group_specs=(
+                SimpleNamespace(
+                    group_id="fine",
+                    rows_per_page=4,
+                    entry_stride_tokens=1,
+                ),
+                SimpleNamespace(
+                    group_id="coarse",
+                    rows_per_page=64,
+                    entry_stride_tokens=4,
+                ),
+            )
+        )
+
+        tables = self._bare(backend, pool)._dummy_group_tables(65536, 1)
+
+        self.assertEqual(tables["fine"].shape, (1, 16384))
+        self.assertEqual(tables["coarse"].shape, (1, 256))
+        self.assertTrue(bool((tables["fine"] == 1).all()))
+        self.assertTrue(bool((tables["coarse"] == 1).all()))
+
     def test_composite_wrapper_resolves_grouped_cache_child(self):
         # Hybrid wrappers set the flag but hold the paged KV consumer as
         # full_attn_backend; the helper must not AttributeError (which would

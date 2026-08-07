@@ -320,9 +320,23 @@ def build_v4_cache_specs(
     *,
     layer_ratio: Sequence[int],
     cache_blocks_per_lcm_block: Mapping[str, int] | None = None,
+    decode_input_tokens: int = 1,
 ) -> list[PagedCacheGroupSpec]:
+    if (
+        isinstance(decode_input_tokens, bool)
+        or not isinstance(decode_input_tokens, int)
+        or decode_input_tokens <= 0
+    ):
+        raise ValueError("decode_input_tokens must be a positive integer")
     swa_window = _resolve_sliding_window(hf_config)
     unique_compress_ratios = sorted({int(r) for r in layer_ratio if int(r) > 1})
+    # c4 compression consumes the prior four-token state plus every token in
+    # the target verify block. Preserve the historical eight-token window for
+    # verify widths <= 4 and grow it for wider block-speculative decoders.
+    c4_state_window = max(
+        _COMPRESSOR_STATE_WINDOW_TOKENS[4],
+        4 + decode_input_tokens,
+    )
 
     specs: list[PagedCacheGroupSpec] = [
         # SWA kv: trailing window only -> State family.
@@ -345,7 +359,11 @@ def build_v4_cache_specs(
                 retention="sliding_window",
                 rows_per_page=_COMPRESSOR_STATE_ROWS_PER_PAGE[ratio],
                 entry_stride_tokens=1,
-                sliding_window_tokens=_COMPRESSOR_STATE_WINDOW_TOKENS[ratio],
+                sliding_window_tokens=(
+                    c4_state_window
+                    if ratio == 4
+                    else _COMPRESSOR_STATE_WINDOW_TOKENS[ratio]
+                ),
                 family="state",
             )
         )
@@ -368,7 +386,7 @@ def build_v4_cache_specs(
                 retention="sliding_window",
                 rows_per_page=_COMPRESSOR_STATE_ROWS_PER_PAGE[4],
                 entry_stride_tokens=1,
-                sliding_window_tokens=_COMPRESSOR_STATE_WINDOW_TOKENS[4],
+                sliding_window_tokens=c4_state_window,
                 family="state",
             )
         )
