@@ -76,7 +76,7 @@ class MlaCacheGroupMixin:
         expected. Ids are scheduler pages in the contract's logical size
         recorded by :meth:`mark_cache_contract`.
         """
-        if not block_tables or not getattr(self, "is_draft", False):
+        if not block_tables or not self.is_draft:
             return None
         if self._cache_logical_page_size is None:
             raise RuntimeError(

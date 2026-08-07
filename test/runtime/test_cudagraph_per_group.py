@@ -276,7 +276,9 @@ class WrapperReplayGroupedTest(_TorchCase):
             ),
             drafter=SimpleNamespace(
                 draft_seq_lens_buf=torch.zeros(2, dtype=torch.int32),
-                page_table=torch.zeros((2, MAX_NUM_PAGES), dtype=torch.int32),
+                cache_view=SimpleNamespace(
+                    table=torch.zeros((2, MAX_NUM_PAGES), dtype=torch.int32)
+                ),
             ),
             _draft_group_tables=lambda tables: tables,
             _pad_block_tables_to_padded_bs=(
@@ -335,7 +337,9 @@ class WrapperReplayGroupedTest(_TorchCase):
             ),
             drafter=SimpleNamespace(
                 draft_seq_lens_buf=torch.zeros(4, dtype=torch.int32),
-                page_table=torch.zeros((4, MAX_NUM_PAGES), dtype=torch.int32),
+                cache_view=SimpleNamespace(
+                    table=torch.zeros((4, MAX_NUM_PAGES), dtype=torch.int32)
+                ),
             ),
             _draft_group_tables=lambda tables: {
                 "full_attention": tables["full_attention"]
@@ -465,9 +469,13 @@ class WrapperEagerGroupGuardTest(_TorchCase):
                 )
             ),
             drafter=None,
+            draft_attn_backend=None,
             _can_use_graph=lambda bs, ctx: False,
             _init_forward_metadata=init_forward_metadata,
             _forward_func=lambda **kwargs: (None, None, None),
+        )
+        mock._any_backend_uses_cache_groups = (
+            lambda: CudaGraphWrapper._any_backend_uses_cache_groups(mock)
         )
         ctx = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
@@ -674,24 +682,14 @@ class BackendStateGroupShedTest(_BackendCase):
 
 
 class BackendReplayNoGroupBuffersTest(_BackendCase):
-    def _replay_with_recorded_gather(self, bs, block_tables=None):
-        # The single-table fill is a GPU Triton kernel; record the call
-        # instead of launching it on this test's CPU tensors.
-        from unittest import mock
-
-        import tokenspeed.runtime.layers.attention.backends.mha as mha_mod
-
-        with mock.patch.object(mha_mod, "gather_page_table_with_padding") as gather:
-            self._replay(bs, block_tables)
-        return gather
-
-    def test_replay_without_group_capture_needs_no_tables(self):
-        # No flat buffers captured (single-table path): replay without
-        # tables stays valid and fills the single-table single table.
+    def test_replay_without_group_capture_is_a_contract_violation(self):
+        # Every LCM pool publishes at least one history group, so the wrapper
+        # always passes cache_group_ids at capture; a replay that finds no
+        # per-group buffers means the contract was bypassed. The pre-LCM
+        # single-table gather fallback is gone — fail loudly instead.
         self._capture(2)
-        gather = self._replay_with_recorded_gather(2)
-        gather.assert_called_once()
-        self.assertEqual(self.backend.cuda_graph_page_tables, {})
+        with self.assertRaisesRegex(RuntimeError, "published no cache groups"):
+            self._replay(2)
 
 
 if __name__ == "__main__":

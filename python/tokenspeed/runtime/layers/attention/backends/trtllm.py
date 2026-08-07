@@ -144,7 +144,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         super().__init__(config)
 
         self.page_size = config.page_size
-        self.group_page_sizes = dict(getattr(config, "group_page_sizes", None) or {})
+        self.group_page_sizes = dict(config.group_page_sizes or {})
         self.max_context_len = config.context_len
         self.kv_cache_dtype = config.kv_cache_dtype
         max_bs = config.max_bs
@@ -199,7 +199,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         # single-query rows sharing the SAME block-end seq_len, so each row
         # attends over the whole block. Mirrors the MHA draft_block_decode path;
         # target verify and ordinary trtllm decode are untouched.
-        self.draft_block_decode = bool(getattr(config, "draft_block_decode", False))
+        self.draft_block_decode = bool(config.draft_block_decode)
 
     # ------------------------------------------------------------------
     # Page table helpers
