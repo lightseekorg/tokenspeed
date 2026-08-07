@@ -101,6 +101,77 @@ def test_configuration_guard_is_gfx950_bf16_only():
     assert len(errors) == 5
 
 
+def test_dispatch_caches_triton_shmem_state_creation_decline(monkeypatch):
+    from tokenspeed_kernel.ops.communication import triton as dispatch
+    from tokenspeed_kernel.ops.communication import triton_shmem as backend
+
+    class FakePlatform:
+        is_amd = True
+        is_nvidia = False
+
+    class FakeGroup:
+        @staticmethod
+        def size():
+            return 2
+
+    class FakeTensor:
+        is_cuda = True
+        dtype = torch.bfloat16
+
+        def __init__(self, shape):
+            self.shape = shape
+
+        @staticmethod
+        def is_contiguous():
+            return True
+
+        def dim(self):
+            return len(self.shape)
+
+    key = ("declined",)
+    states = {}
+    create_calls = 0
+
+    def decline_state_creation(**_kwargs):
+        nonlocal create_calls
+        create_calls += 1
+        return None
+
+    monkeypatch.setenv("TS_ARNORM_BACKEND", "triton_shmem")
+    monkeypatch.setattr(dispatch, "current_platform", lambda: FakePlatform())
+    monkeypatch.setattr(backend, "TRITON_SHMEM_AR_RMSNORM_STATES", states)
+    monkeypatch.setattr(backend, "triton_shmem_state_cache_key", lambda *_args: key)
+    monkeypatch.setattr(
+        backend,
+        "create_triton_shmem_ar_rmsnorm_state",
+        decline_state_creation,
+    )
+    monkeypatch.setattr(
+        backend,
+        "triton_shmem_can_run",
+        lambda *_args: pytest.fail("a declined state must not reach can_run"),
+    )
+
+    input_tensor = FakeTensor((4, 8))
+    residual = FakeTensor((4, 8))
+    weight = FakeTensor((8,))
+    group = FakeGroup()
+
+    for _ in range(2):
+        assert dispatch.allreduce_residual_rmsnorm(
+            input_tensor=input_tensor,
+            residual=residual,
+            weight=weight,
+            rank=0,
+            group=group,
+            max_token_num=16,
+        ) == (None, None, None, None)
+
+    assert create_calls == 1
+    assert key in states
+    assert states[key] is None
+
+
 def _get_open_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("", 0))
