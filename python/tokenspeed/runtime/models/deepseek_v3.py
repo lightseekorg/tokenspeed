@@ -817,18 +817,11 @@ class DeepseekV3AttentionMLA(nn.Module):
         # latent_cache contains normalized kv_a and k_pe before rotate.
         K = latent_cache.unsqueeze(1)
         q_nope_out_view = Q[..., : self.kv_lora_rank]
-        if _is_amd:
-            q_nope_projected = torch.bmm(
-                q_nope.transpose(0, 1).contiguous(),
-                self.w_kc.contiguous(),
-            )
-            q_nope_out_view.copy_(q_nope_projected.transpose(0, 1))
-        else:
-            torch.bmm(
-                q_nope.transpose(0, 1),
-                self.w_kc,
-                out=q_nope_out_view.transpose(0, 1),
-            )
+        torch.bmm(
+            q_nope.transpose(0, 1),
+            self.w_kc,
+            out=q_nope_out_view.transpose(0, 1),
+        )
         # Model-owned fused FP8 decode: RoPE + quantize + KV cache write
         # all done here, so backend only needs to do attention.
         k_scale = getattr(self.attn_mqa, "k_scale_float", 1.0)
@@ -957,19 +950,12 @@ class DeepseekV3AttentionMLA(nn.Module):
             record_kv_cache=record_kv_cache,
         )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
-        if _is_amd:
-            projected = torch.bmm(
-                attn_output.transpose(0, 1).contiguous(),
-                self.w_vc.contiguous(),
-            )
-            output.copy_(projected.transpose(0, 1).reshape_as(output))
-        else:
-            output_view = output.view(-1, self.num_local_heads, self.v_head_dim)
-            torch.bmm(
-                attn_output.transpose(0, 1),
-                self.w_vc,
-                out=output_view.transpose(0, 1),
-            )
+        output_view = output.view(-1, self.num_local_heads, self.v_head_dim)
+        torch.bmm(
+            attn_output.transpose(0, 1),
+            self.w_vc,
+            out=output_view.transpose(0, 1),
+        )
         return output
 
     def forward_normal_chunked(
