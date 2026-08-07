@@ -187,6 +187,7 @@ class ModelExecutorConfig:
     max_cudagraph_capture_size: int
     model_is_mrope: bool
     enable_nan_detection: bool = False
+    disable_autotune: bool = False
 
     # ====== DP =========
     data_parallel_size: int = 1
@@ -262,6 +263,7 @@ class ModelExecutorConfig:
             decode_log_interval=server_args.decode_log_interval,
             cudagraph_capture_sizes=server_args.cudagraph_capture_sizes,
             disable_cuda_graph_padding=server_args.disable_cuda_graph_padding,
+            disable_autotune=server_args.disable_autotune,
             max_cudagraph_capture_size=server_args.max_cudagraph_capture_size,
             disable_prefill_graph=disable_prefill_graph,
             prefill_graph_max_tokens=_resolve_prefill_graph_max_tokens(server_args),
@@ -591,6 +593,16 @@ class ModelExecutor:
         if num_tokens <= 0 or self.model_runner is None:
             return
 
+        # The bucket mapper keys serving-time tactic lookups, so it must match
+        # any pre-swept table loaded earlier even when tuning itself is off.
+        set_autotune_max_num_tokens(num_tokens)
+        if self.config.disable_autotune:
+            logger.info(
+                "Kernel tuning disabled (--disable-autotune); tunable kernels "
+                "use heuristic tactics"
+            )
+            return
+
         cpu_group = None
         if self.config.world_size > 1:
             cpu_group = pg_manager.get_process_group("gloo", self.config.world_group)
@@ -598,7 +610,6 @@ class ModelExecutor:
         logger.info(f"Kernel tuning with a dummy prefill of {num_tokens} tokens")
         ib = self.input_buffers
         tic = time.time()
-        set_autotune_max_num_tokens(num_tokens)
         set_autotune_process_group(cpu_group)
         with autotune(), maybe_inference_mode():
             ctx = self.prefill_graph.make_dummy_batch(num_tokens, self.forward_step)

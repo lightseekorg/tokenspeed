@@ -276,6 +276,7 @@ class ServerArgs:
     disable_kvstore: bool = False
     enforce_eager: bool = False
     disable_cuda_graph_padding: bool = False
+    disable_autotune: bool = False
     enable_cudagraph_gc: bool = False
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
@@ -1675,6 +1676,14 @@ class ServerArgs:
             "--disable-cuda-graph-padding",
             action="store_true",
             help="Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
+        )
+        parser.add_argument(
+            "--disable-autotune",
+            "--disable-flashinfer-autotune",
+            action="store_true",
+            help="Skip the startup kernel-tuning pass; tunable kernels use each "
+            "library's heuristic tactics instead. Speeds up startup for "
+            "debugging at the cost of serving performance.",
         )
         parser.add_argument(
             "--enable-cudagraph-gc",
