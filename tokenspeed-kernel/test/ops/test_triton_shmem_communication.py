@@ -55,6 +55,9 @@ def test_arch_profile_is_separate_from_device_kernels():
 
     assert profile.recommended_kernel(2, 2880, profile="gfx950") == "oneshot_blocked"
     assert profile.recommended_kernel(4, 2880, profile="gfx950") == "twoshot_blocked"
+    assert profile.recommended_block_n(torch.bfloat16, 96, profile="gfx950") == 128
+    assert profile.recommended_block_n(torch.bfloat16, 300, profile="gfx950") == 512
+    assert profile.recommended_block_n(torch.bfloat16, 2880, profile="gfx950") == 512
     assert (
         profile.recommended_grid(
             "oneshot_wholerow",
@@ -76,7 +79,6 @@ def test_padded_kernel_keeps_m_dynamic():
 
 
 def test_configuration_guard_is_gfx950_bf16_only():
-    _skip_if_unsupported(1)
     from tokenspeed_kernel.ops.communication.triton_shmem import (
         _configuration_errors,
     )
@@ -99,6 +101,94 @@ def test_configuration_guard_is_gfx950_bf16_only():
         dtype=torch.float16,
     )
     assert len(errors) == 5
+
+
+def test_state_creation_failure_propagates_instead_of_declining(monkeypatch):
+    from tokenspeed_kernel.ops.communication import triton_shmem as backend
+
+    monkeypatch.setattr(backend, "is_available", lambda: True)
+    monkeypatch.setattr(backend, "_configuration_is_eligible", lambda **_kwargs: True)
+    monkeypatch.setattr(backend, "_policy_is_consistent", lambda _group: True)
+
+    def fail_construction(**_kwargs):
+        raise RuntimeError("rank-local allocation failed")
+
+    monkeypatch.setattr(
+        backend, "TritonShmemAllReduceResidualRMSNorm", fail_construction
+    )
+
+    with pytest.raises(RuntimeError, match="rank-local allocation failed"):
+        backend.create_triton_shmem_ar_rmsnorm_state(
+            group=object(),
+            rank_in_group=0,
+            max_token_num=16,
+            hidden_dim=8,
+            device=torch.device("cuda:0"),
+        )
+
+
+def test_policy_mismatch_declines_collectively(monkeypatch):
+    from tokenspeed_kernel.ops.communication import triton_shmem as backend
+
+    class FakeGroup:
+        @staticmethod
+        def size():
+            return 2
+
+    def gather(reports, local_report, group):
+        assert isinstance(group, FakeGroup)
+        different = list(local_report)
+        name, value = different[0]
+        different[0] = (name, "0" if value != "0" else "1")
+        reports[:] = [local_report, tuple(different)]
+
+    monkeypatch.setattr(backend.dist, "all_gather_object", gather)
+    assert not backend._policy_is_consistent(FakeGroup())
+
+
+def test_matching_profile_policy_is_accepted_collectively(monkeypatch):
+    from tokenspeed_kernel.ops.communication import triton_shmem as backend
+
+    class FakeGroup:
+        @staticmethod
+        def size():
+            return 2
+
+    def gather(reports, local_report, group):
+        assert isinstance(group, FakeGroup)
+        reports[:] = [local_report, local_report]
+
+    monkeypatch.setenv("TS_TRITON_SHMEM_OUTPUT_RING", "72")
+    monkeypatch.setattr(backend.dist, "all_gather_object", gather)
+    assert backend._policy_is_consistent(FakeGroup())
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        torch.empty((1, 8), dtype=torch.bfloat16),
+        torch.empty((2, 8), dtype=torch.float32),
+        torch.empty((8, 2), dtype=torch.bfloat16).T,
+    ],
+)
+def test_fused_rejects_invalid_caller_output(output):
+    from tokenspeed_kernel.ops.communication.triton_shmem import (
+        TritonShmemAllReduceResidualRMSNorm,
+    )
+
+    state = TritonShmemAllReduceResidualRMSNorm.__new__(
+        TritonShmemAllReduceResidualRMSNorm
+    )
+    state.dtype = torch.bfloat16
+    state.device = torch.device("cpu")
+    state.hidden_dim = 8
+    state.max_token_num = 2
+
+    x = torch.empty((2, 8), dtype=torch.bfloat16)
+    residual = torch.empty_like(x)
+    weight = torch.empty((8,), dtype=torch.bfloat16)
+    with pytest.raises(ValueError):
+        state.fused(x, residual, weight, _EPS, norm_out=output)
 
 
 def test_dispatch_caches_triton_shmem_state_creation_decline(monkeypatch):
@@ -157,6 +247,19 @@ def test_dispatch_caches_triton_shmem_state_creation_decline(monkeypatch):
     weight = FakeTensor((8,))
     group = FakeGroup()
 
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    assert dispatch.allreduce_residual_rmsnorm(
+        input_tensor=input_tensor,
+        residual=residual,
+        weight=weight,
+        rank=0,
+        group=group,
+        max_token_num=16,
+    ) == (None, None, None, None)
+    assert create_calls == 0
+    assert key not in states
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     for _ in range(2):
         assert dispatch.allreduce_residual_rmsnorm(
             input_tensor=input_tensor,
@@ -194,13 +297,9 @@ def _spawn_and_collect(worker_fn, args, world_size: int) -> None:
         raise RuntimeError("\n".join(f"Rank {r}: {e}" for r, e in error_dict.items()))
 
 
-def _reference(x, residual, weight, world_size, hidden, eps, device):
-    reduced = torch.full(
-        (x.shape[0], hidden),
-        world_size * (world_size + 1) // 2,
-        dtype=torch.float32,
-        device=device,
-    )
+def _reference(x, residual, weight, eps):
+    reduced = x.float()
+    dist.all_reduce(reduced)
     ref_residual = reduced + residual.float()
     ref_norm = ref_residual * torch.rsqrt(
         ref_residual.pow(2).mean(dim=-1, keepdim=True) + eps
@@ -210,10 +309,10 @@ def _reference(x, residual, weight, world_size, hidden, eps, device):
 
 
 def _make_inputs(tokens, hidden, rank, device):
-    # Each rank contributes rank+1 (sum across ranks = ws*(ws+1)/2); residual is
-    # non-uniform (deterministic, identical across ranks -> replicated per TP)
-    # so a weight/residual bug can't be masked.
-    x = torch.full((tokens, hidden), rank + 1, dtype=torch.bfloat16, device=device)
+    # Rank-, row-, and column-dependent input catches remote pointer/offset bugs.
+    rows = torch.arange(tokens, dtype=torch.float32, device=device)[:, None]
+    cols = torch.arange(hidden, dtype=torch.float32, device=device)[None, :]
+    x = (rank + 1 + rows * 0.01 + cols * 0.001).to(torch.bfloat16)
     residual = (
         torch.arange(tokens * hidden, dtype=torch.float32, device=device)
         .reshape(tokens, hidden)
@@ -269,9 +368,7 @@ def _corr_worker_main(rank: int, world_size: int, port: int, hidden: int) -> Non
                 weight=weight,
                 eps=_EPS,
             )
-            ref_residual, ref_norm = _reference(
-                x, residual, weight, world_size, hidden, _EPS, device
-            )
+            ref_residual, ref_norm = _reference(x, residual, weight, _EPS)
             torch.testing.assert_close(
                 residual_out.float(), ref_residual, atol=2e-2, rtol=2e-2
             )
@@ -328,14 +425,16 @@ def test_triton_shmem_arrms_world2_wholerow():
 # migrate off the rocSHMEM host barrier). Replays with changing input must
 # recompute the reduction correctly.
 # ---------------------------------------------------------------------------
-def _graph_worker_fn(rank, world_size, port, hidden, error_dict):
+def _graph_worker_fn(rank, world_size, port, hidden, tokens, error_dict):
     try:
-        _graph_worker_main(rank, world_size, port, hidden)
+        _graph_worker_main(rank, world_size, port, hidden, tokens)
     except Exception:
         error_dict[rank] = traceback.format_exc()
 
 
-def _graph_worker_main(rank: int, world_size: int, port: int, hidden: int) -> None:
+def _graph_worker_main(
+    rank: int, world_size: int, port: int, hidden: int, tokens: int
+) -> None:
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
     dist.init_process_group(
@@ -350,7 +449,6 @@ def _graph_worker_main(rank: int, world_size: int, port: int, hidden: int) -> No
             triton_shmem_allreduce_residual_rmsnorm,
         )
 
-        tokens = 256
         state = create_triton_shmem_ar_rmsnorm_state(
             group=dist.group.WORLD,
             rank_in_group=rank,
@@ -421,10 +519,10 @@ def _graph_worker_main(rank: int, world_size: int, port: int, hidden: int) -> No
         dist.destroy_process_group()
 
 
-def _run_graph(world_size: int, hidden: int) -> None:
+def _run_graph(world_size: int, hidden: int, tokens: int = 256) -> None:
     _skip_if_unsupported(world_size)
     port = _get_open_port()
-    _spawn_and_collect(_graph_worker_fn, (world_size, port, hidden), world_size)
+    _spawn_and_collect(_graph_worker_fn, (world_size, port, hidden, tokens), world_size)
 
 
 def test_triton_shmem_arrms_graph_capture_world2():
@@ -434,11 +532,10 @@ def test_triton_shmem_arrms_graph_capture_world2():
 
 def test_triton_shmem_arrms_graph_capture_world8():
     # twoshot_blocked under graph capture/replay -- the production path.
-    _run_graph(world_size=8, hidden=2880)
+    _run_graph(world_size=8, hidden=2880, tokens=512)
 
 
 def test_triton_shmem_capture_requires_persistent_output(monkeypatch):
-    _skip_if_unsupported(1)
     from tokenspeed_kernel.ops.communication.triton_shmem import (
         triton_shmem_can_run,
     )

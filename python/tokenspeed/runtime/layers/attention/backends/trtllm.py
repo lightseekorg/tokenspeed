@@ -946,7 +946,6 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         if not self.cuda_graph_page_tables and page_table is not None:
             gather_page_table_with_padding(
                 page_table=page_table,
-                req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 out=self.cuda_graph_page_table,
                 bs=bs,

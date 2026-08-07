@@ -1857,9 +1857,13 @@ def allreduce_residual_rmsnorm(
             )
             ts_states = _ts_mod.TRITON_SHMEM_AR_RMSNORM_STATES
             if ts_key not in ts_states:
+                # State setup performs object collectives, rendezvous, and
+                # allocations. If warmup did not create this exact policy key,
+                # capture the complete unfused path instead.
+                if torch.cuda.is_current_stream_capturing():
+                    return None, None, None, None
                 # Cache None as a permanent decline for this complete policy key.
-                # Retrying may otherwise repeat distributed validation or memory
-                # setup during CUDA graph capture.
+                # Retrying would repeat distributed validation and memory setup.
                 ts_states[ts_key] = _ts_mod.create_triton_shmem_ar_rmsnorm_state(
                     group=group,
                     rank_in_group=rank,

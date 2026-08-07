@@ -435,27 +435,42 @@ def _test_declined_arrms_fusion_falls_back(rank, world_size, device, group, ref_
         0, 1, tokens * hidden, dtype=torch.bfloat16, device=device
     ).reshape(tokens, hidden)
 
-    original = layernorm_mod.triton_allreduce_residual_rmsnorm
-    layernorm_mod.triton_allreduce_residual_rmsnorm = lambda **_: (
-        None,
-        None,
-        None,
-        None,
-    )
-    try:
-        for norm_cls in (RMSNorm, GemmaRMSNorm):
-            norm = norm_cls(hidden).to(device=device, dtype=torch.bfloat16)
-            expected_x = x.clone()
-            dist.all_reduce(expected_x, group=ref_group)
-            expected_norm, expected_residual = norm(expected_x, residual)
+    missing = object()
+    previous_enabled = global_server_args_dict.get("enable_allreduce_fusion", missing)
+    original_triton = layernorm_mod.triton_allreduce_residual_rmsnorm
+    original_trtllm = layernorm_mod.trtllm_allreduce_residual_rmsnorm
 
-            actual_norm, actual_residual, _ = norm.forward_with_allreduce_fusion(
-                rank, group, x, residual
-            )
-            torch.testing.assert_close(actual_residual, expected_residual)
-            torch.testing.assert_close(actual_norm, expected_norm)
+    def decline(**_):
+        return None, None, None, None
+
+    def unexpected_fused_call(**_):
+        raise AssertionError("disabled all-reduce fusion reached a fused backend")
+
+    try:
+        for fusion_enabled in (True, False):
+            global_server_args_dict["enable_allreduce_fusion"] = fusion_enabled
+            fused_impl = decline if fusion_enabled else unexpected_fused_call
+            layernorm_mod.triton_allreduce_residual_rmsnorm = fused_impl
+            layernorm_mod.trtllm_allreduce_residual_rmsnorm = fused_impl
+
+            for norm_cls in (RMSNorm, GemmaRMSNorm):
+                norm = norm_cls(hidden).to(device=device, dtype=torch.bfloat16)
+                expected_x = x.clone()
+                dist.all_reduce(expected_x, group=ref_group)
+                expected_norm, expected_residual = norm(expected_x, residual.clone())
+
+                actual_norm, actual_residual, _ = norm.forward_with_allreduce_fusion(
+                    rank, group, x.clone(), residual.clone()
+                )
+                torch.testing.assert_close(actual_residual, expected_residual)
+                torch.testing.assert_close(actual_norm, expected_norm)
     finally:
-        layernorm_mod.triton_allreduce_residual_rmsnorm = original
+        layernorm_mod.triton_allreduce_residual_rmsnorm = original_triton
+        layernorm_mod.trtllm_allreduce_residual_rmsnorm = original_trtllm
+        if previous_enabled is missing:
+            global_server_args_dict.pop("enable_allreduce_fusion", None)
+        else:
+            global_server_args_dict["enable_allreduce_fusion"] = previous_enabled
 
 
 # ---------------------------------------------------------------------------
