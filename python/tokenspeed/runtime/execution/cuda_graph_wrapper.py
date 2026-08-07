@@ -1099,6 +1099,13 @@ class CudaGraphWrapper:
             return self._has_cuda_graph_for_bs(bs)
         return bs <= self.max_bs
 
+    @staticmethod
+    def _has_custom_tree_mask(spec_info) -> bool:
+        return (
+            spec_info is not None
+            and getattr(spec_info, "custom_mask", None) is not None
+        )
+
     def can_run(self, bs: int, ctx: ForwardContext) -> bool:
         return self._can_use_graph(bs, ctx)
 
@@ -1158,6 +1165,7 @@ class CudaGraphWrapper:
         extend_seq_lens_cpu: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
         out_cache_loc: torch.Tensor | None = None,
+        spec_info=None,
         paged_cache_block_tables: dict | None = None,
         paged_cache_block_table_base_offsets: dict | None = None,
         block_tables: dict | None = None,
@@ -1172,6 +1180,11 @@ class CudaGraphWrapper:
         path was taken.
         """
         use_graph = self._can_use_graph(bs, ctx)
+        if use_graph and self._has_custom_tree_mask(spec_info):
+            # Tree-mask verify needs per-request mask tensors. The current decode
+            # graph captures stable dummy non-tree masks and replay only refreshes
+            # metadata, so run these batches eagerly until graph mask buffers exist.
+            use_graph = False
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
         active_req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
 
@@ -1306,6 +1319,7 @@ class CudaGraphWrapper:
                 global_num_tokens=ctx.global_num_tokens,
                 all_decode_or_idle=ctx.all_decode_or_idle,
                 capture_hidden_mode=ctx.capture_hidden_mode,
+                spec_info=spec_info,
                 **metadata_num_tokens,
                 paged_cache_block_tables=(
                     paged_cache_block_tables
