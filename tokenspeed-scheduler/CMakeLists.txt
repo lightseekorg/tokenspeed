@@ -105,6 +105,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
 
     add_executable(tokenspeed_scheduler_tests
         tests/cpp/test_page_hasher.cpp
+        tests/cpp/test_lora_namespace.cpp
         tests/cpp/test_max_loras.cpp
         tests/cpp/test_block_pool.cpp
         tests/cpp/test_cache_block_ref.cpp
