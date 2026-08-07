@@ -303,6 +303,39 @@ class ModelExecutor:
         self.device = config.device
         self.config = config
         self.model_runner = model_runner
+        # MORI's combine returns the COMPLETE per-token routed result, so a decoder layer must
+        # consume it correctly (dp>1 dispatch/combine via forward_alltoall; dp=1 /tp_ep_size
+        # pre-division reconstructed by post_mlp_fused). Whitelist by the @mori_ep_capable marker
+        # on the layer's forward_mlp: it travels with the specific implementation, so a subclass
+        # that OVERRIDES forward_mlp with a partial-contribution path (e.g. GLM MoE-DSA / Qwen keep
+        # the framework all-gather + reduce-scatter) drops the marker and is rejected -- and gains
+        # support by re-applying the decorator once its override adds MORI handling, no guard edit.
+        # Checks the target AND any speculative draft (the draft plans from the same server args);
+        # a dense model (no MoELayer) never plans MORI, so it is exempt. (DeepEP: is_deepep().)
+        from tokenspeed.runtime.layers.moe.expert import MoELayer
+        from tokenspeed.runtime.layers.moe.utils import get_all2all_backend
+
+        if get_all2all_backend().is_mori():
+            _runners = [self.model_runner]
+            if draft_model_runner is not None:
+                _runners.append(draft_model_runner)
+            for _r in _runners:
+                _mods = list(_r.model.modules())
+                _has_moe = any(isinstance(m, MoELayer) for m in _mods)
+                _supported = any(
+                    getattr(
+                        getattr(type(m), "forward_mlp", None), "_mori_ep_capable", False
+                    )
+                    for m in _mods
+                )
+                if _has_moe and not _supported:
+                    raise ValueError(
+                        "--all2all-backend mori requires every MoE model (target and any "
+                        "speculative draft) to have a decoder layer whose forward_mlp is marked "
+                        "@mori_ep_capable (correctly consumes MORI's complete routed output; "
+                        f"DeepSeek-V3 family, e.g. Kimi-K2.5). {type(_r.model).__name__} does not "
+                        "(its MoE decoder's forward_mlp mis-scales MORI as a partial contribution)."
+                    )
         self.sampling_backend = sampling_backend
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
@@ -1085,6 +1118,15 @@ class ModelExecutor:
 
         return result
 
+    # Must run in the same inference-mode context as the real forward (_forward_step).
+    # In any DP configuration this idle forward still joins the MLP/MoE collectives --
+    # RSAG reduce-scatter for the dense / masked-replicate-EP path, or an all-to-all
+    # backend's dispatch/combine -- and those update accumulation / symmetric buffers
+    # in place. The buffers are allocated as inference tensors by the real forward, so
+    # touching them outside inference_mode raises ("Inplace update to inference tensor
+    # ...") and crashes this rank mid-collective, hanging every other rank waiting on
+    # it -> a deadlock. Applies to both the AMD Triton RSAG path and MORI.
+    @maybe_inference_mode()
     def execute_idle_forward(
         self,
         global_num_tokens: list[int],

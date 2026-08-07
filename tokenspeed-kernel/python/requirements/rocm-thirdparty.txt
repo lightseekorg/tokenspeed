@@ -1,2 +1,8 @@
 tokenspeed-iris==0.0.0.post20260511
 tokenspeed-kernel-amd>=0.1.3
+# AMD-native MORI all-to-all EP dispatch/combine backend (--all2all-backend mori). amd-mori
+# 1.2.2 requires the pre-0.3.0 flydsl API (0.3.0 renamed flydsl.expr.vector -> Vector), so pin
+# flydsl explicitly instead of amd-mori's unpinned [flydsl] extra. Usage is opt-in at runtime
+# and self-skips if the import fails (see ops/communication/mori_ep.py:mori_available).
+amd-mori==1.2.2
+flydsl==0.2.4

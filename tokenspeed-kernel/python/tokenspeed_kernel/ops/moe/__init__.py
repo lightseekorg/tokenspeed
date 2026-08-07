@@ -24,6 +24,7 @@ from typing import Any
 import tokenspeed_kernel.ops.moe.deep_gemm  # noqa: F401
 import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.moe.gluon  # noqa: F401
+import tokenspeed_kernel.ops.moe.mori  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton  # noqa: F401
 import torch
 from tokenspeed_kernel.registry import KernelRegistry
@@ -57,7 +58,7 @@ def _uses_all_to_all_ep(a2a_backend: str | None) -> bool:
 
 
 def _validate_a2a_backend(a2a_backend: str | None) -> None:
-    if a2a_backend in {None, "none", "deepep"}:
+    if a2a_backend in {None, "none", "deepep", "mori"}:
         return
     raise NotImplementedError(f"MoE all-to-all backend is unsupported: {a2a_backend}")
 
@@ -232,7 +233,11 @@ def moe_plan(
     # DeepEP does not pin a solution: the ``supports_all_to_all_ep`` trait plus
     # ``weight_dtype`` already narrow the candidates to the apply kernels that
     # own the dispatch/combine legs (nvfp4 cutedsl, block-scale fp8 DeepGEMM).
-    # Callers may still force one explicitly through ``solution``.
+    # MORI pins ``solution="mori"``: both MORI apply kernels share that solution and
+    # are disambiguated by ``weight_dtype`` (mxfp4 vs bf16). Callers may still force
+    # a solution explicitly.
+    if solution is None and a2a_backend == "mori":
+        solution = "mori"
 
     traits = _build_traits(
         weight_dtype=weight_dtype,

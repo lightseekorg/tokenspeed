@@ -1,0 +1,32 @@
+api_version: ci.tokenspeed.io/v1
+name: ut-mori-ep-2gpu
+type: ut
+workflow_stage: unit-test
+# MORI is AMD-only and builds gfx950 dispatch/combine kernels from source, so this
+# job runs on a 2-GPU MI350X runner. Kept `optional` (continue-on-error) and
+# manual/per-commit until the ROCm CI image ships MORI + flydsl by default; promote
+# to a required per-commit gate once the runner provides them out of the box.
+triggers:
+  - manual
+  - per-commit
+optional: true
+runner:
+  labels:
+    - amd-mi35x-2gpu-test
+env:
+  CI: "true"
+install:
+  # amd-mori + flydsl are pinned in tokenspeed-kernel/python/requirements/rocm-thirdparty.txt
+  # and installed with the ROCm kernel build; the libgrpc++.so.1.51 runtime that amd-mori's .so
+  # links is installed by install_deps_rocm.sh (this AMD runner delegates to it). The test still
+  # self-skips via mori_available() if the import fails for any reason, so a misconfigured
+  # runner degrades to a skip, never a blocking failure (job is `optional`).
+  - bash test/ci_system/install_deps.sh
+ut:
+  commands:
+    # Real all-to-all dispatch/combine across 2 ranks: bf16 + native mxfp4 vs a replicated
+    # full-MoE reference. The test self-skips (see -rs output) if MORI/flydsl are missing or
+    # world size < 2, so a misconfigured runner degrades to a skip, not a blocking failure.
+    - torchrun --standalone --nproc-per-node=2 -m pytest tokenspeed-kernel/test/ops/moe/test_mori_ep_distributed_gfx950.py -v -rs
+report:
+  github_step_summary: true

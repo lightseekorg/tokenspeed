@@ -220,6 +220,9 @@ class ServerArgs:
     all2all_backend: str = "none"
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     disable_flashinfer_cutlass_moe_fp4_allgather: bool = False
+    # MORI all-to-all EP backend (--all2all-backend mori) tuning; None -> kernel defaults.
+    mori_per_rank_vmm: int | None = None
+    mori_ep_max_tokens_per_rank: int | None = None
 
     # KVStore
     enable_kvstore: bool = False
@@ -1434,6 +1437,23 @@ class ServerArgs:
             choices=["normal", "low_latency", "auto"],
             default=ServerArgs.deepep_mode,
             help="Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
+        )
+        parser.add_argument(
+            "--mori-per-rank-vmm",
+            type=int,
+            default=ServerArgs.mori_per_rank_vmm,
+            help="MORI all-to-all EP backend: per-rank symmetric-buffer VMM reservation in "
+            "bytes. Only used with --all2all-backend mori. Defaults to the kernel's built-in "
+            "value (4 GiB) if unset; raise it for larger --mori-ep-max-tokens-per-rank.",
+        )
+        parser.add_argument(
+            "--mori-ep-max-tokens-per-rank",
+            type=int,
+            default=ServerArgs.mori_ep_max_tokens_per_rank,
+            help="MORI all-to-all EP backend: per-rank dispatch capacity (max tokens/rank). "
+            "Only used with --all2all-backend mori. Must upper-bound tokens/rank per step "
+            "(e.g. >= --chunked-prefill-size). Defaults to the runtime per-GPU token capacity "
+            "if unset.",
         )
         parser.add_argument(
             "--disable-flashinfer-cutlass-moe-fp4-allgather",

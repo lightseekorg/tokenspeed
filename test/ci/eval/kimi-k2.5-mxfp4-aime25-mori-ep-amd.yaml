@@ -1,0 +1,70 @@
+api_version: ci.tokenspeed.io/v1
+name: eval-kimi-k2.5-mxfp4-aime25-mori-ep-amd
+type: eval
+workflow_stage: model-test
+# End-to-end accuracy for the MORI all-to-all expert-parallel MoE path (the AMD-native
+# EP dispatch/combine backend + native MXFP4 grouped-GEMM). Runs dp=4 DP-attention
+# (--data-parallel-size 4, RSAG comm mode) -- the performant use case -- so it exercises
+# forward_alltoall (real dispatch/combine + shared-expert all-gather/reduce-scatter), not
+# just the kernel. GRAPH mode (no --enforce-eager) also gates the graph-capturable mxfp4 EP
+# kernel. Kept `optional` (continue-on-error) and manual/per-commit until the ROCm CI image
+# ships MORI + flydsl by default; promote to a required gate once the runner provides them.
+triggers:
+  - manual
+  - per-commit
+optional: true
+runner:
+  labels:
+    - amd-mi35x-4gpu-test
+env:
+  CI: "true"
+install:
+  # amd-mori + flydsl are pinned in tokenspeed-kernel/python/requirements/rocm-thirdparty.txt
+  # and installed with the ROCm kernel build; the libgrpc++.so.1.51 runtime that amd-mori's .so
+  # links is installed by install_deps_rocm.sh. MORI tuning is passed via --mori-* server args
+  # below, and the flydsl disk cache is disabled from code (mori_ep.mori_available), so no
+  # MORI/flydsl environment variables are needed here.
+  - bash test/ci_system/install_deps_rocm.sh
+server:
+  command: >-
+    ts serve
+    --model amd/Kimi-K2.5-MXFP4
+    --host 127.0.0.1
+    --port 8000
+    --world-size 4
+    --max-model-len 32768
+    --max-num-seqs 16
+    --trust-remote-code
+    --quantization mxfp4
+    --enable-expert-parallel
+    --all2all-backend mori
+    --mori-per-rank-vmm 8589934592
+    --mori-ep-max-tokens-per-rank 2048
+    --data-parallel-size 4
+    --dist-init-addr 127.0.0.1:4100
+    --dense-tp-size 1
+    --chunked-prefill-size 2048
+    --sampling-backend greedy
+    --disable-kvstore
+    --kvstore-ratio 0.0
+    --enable-cache-report
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 1800
+    interval: 10
+eval:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
+  command: >-
+    /tmp/evalscope-perf/bin/evalscope eval
+    --model amd/Kimi-K2.5-MXFP4
+    --api-url http://127.0.0.1:8000/v1
+    --api-key EMPTY_TOKEN
+    --datasets aime25
+    --limit 4
+    --eval-batch-size 4
+    --stream
+    --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":8192}'
+report:
+  github_step_summary: true
+score_threshold: 0.75

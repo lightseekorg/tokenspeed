@@ -1,0 +1,238 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# SPDX-License-Identifier: MIT
+"""AMD-native EP dispatch/combine backed by MORI (github.com/ROCm/mori).
+
+Uses MORI's v2 op API (``mori.ops.dispatch_combine_v2``), which yields the grouped
+``[num_local_experts, cap, hidden]`` layout that a masked grouped-GEMM consumes.
+
+Validated end-to-end on gfx950 (dispatch -> convert_dispatch_output -> masked
+grouped-GEMM -> convert_combine_input -> combine) vs a reference MoE: cos=1.0.
+
+Requires the ``mori`` and ``flydsl`` packages. Selected when ``--all2all-backend mori``
+(``All2AllBackend.MORI``) + expert parallel.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from typing import Any
+
+import torch
+import torch.distributed as dist
+
+logger = logging.getLogger(__name__)
+
+_MORI_AVAILABLE = None
+_COMM = None  # process-wide mori.cco.Communicator singleton
+
+
+def mori_available() -> bool:
+    """True if MORI v2 EP ops (and flydsl) can be imported. AMD-only (MORI builds gfx
+    dispatch/combine kernels), so it short-circuits to False on non-AMD platforms."""
+    global _MORI_AVAILABLE
+    if _MORI_AVAILABLE is None:
+        from tokenspeed_kernel.platform import current_platform
+
+        if not current_platform().is_amd:
+            _MORI_AVAILABLE = False
+            return _MORI_AVAILABLE
+        # All EP ranks JIT-compile the v2 device kernels concurrently and share ~/.flydsl/cache,
+        # which races into a corrupt binary on first compile -- disable the disk cache (compile
+        # in-memory) unless the user has explicitly opted back in. setdefault, so it must be set
+        # before flydsl is first imported below.
+        os.environ.setdefault("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
+        try:
+            import flydsl  # noqa: F401
+            from mori.cco import Communicator  # noqa: F401
+            from mori.ops.dispatch_combine_v2 import (  # noqa: F401
+                EpDispatchCombineConfig,
+                EpDispatchCombineOp,
+            )
+
+            _MORI_AVAILABLE = True
+        except Exception as e:  # pragma: no cover
+            logger.warning("MORI v2 EP not available: %s", e)
+            _MORI_AVAILABLE = False
+    return _MORI_AVAILABLE
+
+
+def ensure_mori_comm(per_rank_vmm: int | None = None):
+    """Create the process-wide MORI CCO Communicator once (uid broadcast over the
+    world group). torch.distributed must already be initialized. Returns the comm."""
+    global _COMM
+    if _COMM is not None:
+        return _COMM
+    from mori.cco import Communicator
+
+    assert (
+        dist.is_initialized()
+    ), "torch.distributed must be initialized before MORI comm init"
+    rank = dist.get_rank()
+    uid = Communicator.get_unique_id() if rank == 0 else None
+    objs = [uid]
+    dist.broadcast_object_list(objs, src=0)
+    uid = objs[0]
+    if per_rank_vmm is None:
+        per_rank_vmm = int(
+            os.environ.get("MORI_PER_RANK_VMM", str(4 << 30))
+        )  # 4 GiB default
+    _COMM = Communicator.init(
+        dist.get_world_size(), rank, uid, per_rank_vmm=per_rank_vmm
+    )
+    return _COMM
+
+
+class MoriEpDispatcher:
+    """MORI v2 dispatch/combine for one MoE layer-group shape.
+
+    Usage (mirrors the registered kernel):
+        h = disp.dispatch(hidden, topk_weights, topk_ids)
+        packed = h["packed_x"]                                   # [E_local, cap, H]
+        # run the per-expert grouped GEMM in place (see ops/moe/mori/{bf16,mxfp4}.py)
+        packed.copy_(expert_grouped_gemm(packed, h["counts"], ...))
+        out = disp.combine(h)                                    # [num_tokens, H]
+    """
+
+    def __init__(
+        self,
+        rank: int,
+        world_size: int,
+        hidden_dim: int,
+        num_local_experts: int,
+        num_experts_per_token: int,
+        max_num_inp_token_per_rank: int,
+        data_type: torch.dtype = torch.bfloat16,
+    ) -> None:
+        assert mori_available(), "MORI v2 EP not importable"
+        # The CCO communicator is initialized over the GLOBAL torch.distributed world
+        # (ensure_mori_comm), so the dispatcher's EP world must be that same global world --
+        # i.e. full-world EP (ep_size == world_size). With ep_size < world_size there would be
+        # multiple EP groups sharing one global communicator and dispatch/combine could route
+        # across the wrong peers. Reject that until the communicator is scoped per EP group.
+        assert world_size == dist.get_world_size(), (
+            f"MORI EP requires ep_size == torch.distributed world_size (full-world EP); got "
+            f"ep_size={world_size}, world_size={dist.get_world_size()}. Sub-world EP groups "
+            "are not yet supported."
+        )
+        from mori.ops.dispatch_combine_v2 import (
+            EpDispatchCombineConfig,
+            EpDispatchCombineOp,
+        )
+
+        comm = ensure_mori_comm()
+        self._cfg = EpDispatchCombineConfig(
+            rank=rank,
+            world_size=world_size,
+            hidden_dim=hidden_dim,
+            max_num_inp_token_per_rank=max_num_inp_token_per_rank,
+            num_experts_per_rank=num_local_experts,
+            num_experts_per_token=num_experts_per_token,
+            data_type=data_type,
+            enable_std_moe=True,
+        )
+        self._op = EpDispatchCombineOp(self._cfg, comm)
+
+    @property
+    def capacity(self) -> int:
+        """Configured max input tokens/rank (the symmetric-buffer capacity)."""
+        return self._cfg.max_num_inp_token_per_rank
+
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,  # [num_tokens, hidden]
+        topk_weights: torch.Tensor,  # [num_tokens, topk] fp32
+        topk_ids: torch.Tensor,  # [num_tokens, topk] (global expert ids)
+        scales: torch.Tensor | None = None,
+    ) -> dict[str, Any]:
+        # NOTE: do NOT reset() the op between dispatches. The MORI kernels self-reset their
+        # per-rank counters and each dispatch re-populates the arena, so the shared op (reused
+        # across all MoE layers/forwards, see get_dispatcher) stays correct without it --
+        # verified across dp=1 and dp=4 aime25 (mean_acc unchanged) and full serve coherence.
+        # An explicit reset() before each dispatch instead RACES the MORI cross-rank barriers
+        # in multi-rank EP (one rank zeroing shared barrier state while another is mid-collective)
+        # and hangs both the eager autotune and HIP-graph capture.
+        recv_x, _ow, _os, _oi, _total_recv, routing = self._op.dispatch(
+            hidden_states,
+            topk_weights,
+            scales,
+            topk_ids.to(torch.int32),
+            return_routing=True,
+        )
+        packed_x, counts, packed_src = self._op.convert_dispatch_output()
+        return {
+            "recv_x": recv_x,  # combine's input buffer handle
+            "packed_x": packed_x,  # [E_local, cap, hidden]; write expert output here in place
+            "counts": counts,  # [E_local] per-expert valid-row counts
+            "routing": routing,
+        }
+
+    def combine(self, handle: dict[str, Any]) -> torch.Tensor:
+        """Reduce grouped expert outputs back to origin tokens (applies top-k weights)."""
+        self._op.convert_combine_input(handle["routing"])
+        out, _ = self._op.combine(handle["recv_x"], routing=handle["routing"])
+        return out
+
+    def reset(self) -> None:
+        self._op.reset()
+
+
+# All MoE layers in a model share the same EP shape (hidden, local experts, top-k),
+# so they should share ONE dispatcher/op — otherwise each of the N layers allocates
+# its own MORI symmetric buffers (N x memory -> OOM on large models). Keyed by shape;
+# sequential eager reuse across layers is safe (each dispatch re-populates buffers).
+_DISPATCHER_CACHE: dict[tuple, "MoriEpDispatcher"] = {}
+# When a request grows capacity, the previous dispatcher is REPLACED in the cache. A HIP graph
+# captured against the old op holds device pointers into its symmetric buffers, so it must not
+# be freed while any captured graph can still replay it. Hold every superseded dispatcher here
+# for the process lifetime (monotonic growth -> at most a handful) to keep those graphs valid.
+_RETIRED_DISPATCHERS: list["MoriEpDispatcher"] = []
+
+
+def get_dispatcher(
+    rank: int,
+    world_size: int,
+    hidden_dim: int,
+    num_local_experts: int,
+    num_experts_per_token: int,
+    max_num_inp_token_per_rank: int,
+    data_type: torch.dtype = torch.bfloat16,
+) -> "MoriEpDispatcher":
+    """Return a process-wide MoriEpDispatcher for this EP shape.
+
+    The cache key deliberately EXCLUDES ``max_num_inp_token_per_rank``: a cached dispatcher
+    whose capacity already covers the request is reused, and only a larger request grows it
+    (recreated at the bigger capacity; the superseded op is retained, not freed, so a HIP
+    graph captured against it stays valid -- see ``_RETIRED_DISPATCHERS``). Otherwise each new
+    prefill/decode batch size would allocate a fresh MORI op whose large symmetric buffers are
+    never evicted -- a steady VMM leak under variable traffic. Capacity thus grows monotonically
+    to the largest seen and is then reused for all smaller batches.
+    """
+    key = (
+        rank,
+        world_size,
+        hidden_dim,
+        num_local_experts,
+        num_experts_per_token,
+        str(data_type),
+    )
+    disp = _DISPATCHER_CACHE.get(key)
+    if disp is not None and disp.capacity >= max_num_inp_token_per_rank:
+        return disp
+    cap = max(max_num_inp_token_per_rank, disp.capacity if disp is not None else 0)
+    if disp is not None:
+        # Superseded by a larger-capacity op; retain it so any HIP graph captured against it
+        # keeps replaying valid MORI buffers instead of freed memory (see _RETIRED_DISPATCHERS).
+        _RETIRED_DISPATCHERS.append(disp)
+    disp = MoriEpDispatcher(
+        rank=rank,
+        world_size=world_size,
+        hidden_dim=hidden_dim,
+        num_local_experts=num_local_experts,
+        num_experts_per_token=num_experts_per_token,
+        max_num_inp_token_per_rank=cap,
+        data_type=data_type,
+    )
+    _DISPATCHER_CACHE[key] = disp
+    return disp

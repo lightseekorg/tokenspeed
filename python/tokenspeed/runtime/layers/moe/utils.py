@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from enum import Enum, IntEnum
 from typing import TYPE_CHECKING
 
@@ -29,6 +30,29 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+def mori_ep_capable(forward_mlp):
+    """Mark a decoder-layer ``forward_mlp`` as correctly consuming MORI's COMPLETE routed output
+    -- dp>1 keeps tokens local and dispatch/combines via ``forward_alltoall``; dp=1 pre-divides by
+    tp_ep_size so ``post_mlp_fused``'s all_reduce reconstructs it. The executor's
+    ``--all2all-backend mori`` guard whitelists a model iff one of its decoder layers carries this
+    marker, so a block that would rescale the complete output as a partial contribution is
+    rejected up front.
+
+    The marker travels with the specific function, NOT the class: a subclass that reimplements
+    ``forward_mlp`` (e.g. GLM MoE-DSA / Qwen, which keep the framework all-gather + reduce-scatter)
+    does not inherit it and is excluded automatically. To extend MORI to such a model, add the
+    equivalent MORI handling to its ``forward_mlp`` override and re-apply this decorator -- no
+    change to the guard is needed.
+
+    Args:
+        forward_mlp: the decoder-layer ``forward_mlp`` method being marked.
+    Returns:
+        The same method, tagged with ``_mori_ep_capable = True``.
+    """
+    forward_mlp._mori_ep_capable = True
+    return forward_mlp
 
 
 class RoutingMethodType(IntEnum):
@@ -48,6 +72,11 @@ class All2AllBackend(Enum):
     NONE = "none"
     DEEPEP = "deepep"
     FLASHINFER_NVLINK_ONE_SIDED = "flashinfer_nvlink_one_sided"
+    # AMD-native EP dispatch/combine via MORI (github.com/ROCm/mori). This backend uses
+    # MORI's intranode v2 op (dispatch_combine_v2, XGMI/single-node, EP<=8): real all-to-all,
+    # unlike the masked-replicate `none` fallback. Internode (RDMA) is not supported here --
+    # MORI's internode path is the separate v1 API and is not wired up.
+    MORI = "mori"
 
     @classmethod
     def _missing_(cls, value):
@@ -66,6 +95,16 @@ class All2AllBackend(Enum):
 
     def is_flashinfer_nvlink_one_sided(self):
         return self == All2AllBackend.FLASHINFER_NVLINK_ONE_SIDED
+
+    def is_mori(self):
+        return self == All2AllBackend.MORI
+
+    def is_all_to_all(self):
+        """True for backends that perform a real dispatch/combine all-to-all inside the
+        MoE kernel (as opposed to the masked-replicate ``none`` fallback). Such backends
+        return the COMPLETE per-token result and must run through the model's all-to-all
+        MoE forward (local/dp-sharded tokens, no framework MoE collective)."""
+        return self in (All2AllBackend.DEEPEP, All2AllBackend.MORI)
 
 
 class MoeBackend(Enum):
@@ -188,6 +227,18 @@ def initialize_moe_config(server_args: ServerArgs):
     DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER = (
         server_args.disable_flashinfer_cutlass_moe_fp4_allgather
     )
+
+    # The MORI EP kernels read their tuning from the environment (config crosses the
+    # runtime/tokenspeed-kernel boundary without threading MORI-specific args through the kernel
+    # signatures). Bridge the --mori-* server args into that environment here, once per rank at
+    # startup and before the first dispatch, so operators configure MORI via the CLI.
+    if ALL2ALL_BACKEND.is_mori():
+        if server_args.mori_per_rank_vmm is not None:
+            os.environ["MORI_PER_RANK_VMM"] = str(server_args.mori_per_rank_vmm)
+        if server_args.mori_ep_max_tokens_per_rank is not None:
+            os.environ["MORI_EP_MAX_TOKENS_PER_RANK"] = str(
+                server_args.mori_ep_max_tokens_per_rank
+            )
 
 
 def get_all2all_backend() -> All2AllBackend:

@@ -39,7 +39,9 @@ echo "WORKSPACE=${WORKSPACE}"
 echo "=========================================="
 
 echo "=== Step 1: apt deps ==="
-sudo apt-get install -y openmpi-bin libopenmpi-dev libssl-dev pkg-config
+# libgrpc++1.51t64 (Ubuntu 24.04 noble) provides libgrpc++.so.1.51, which amd-mori's .so links
+# against; without it ``import mori`` fails and the MORI EP backend self-skips.
+sudo apt-get install -y openmpi-bin libopenmpi-dev libssl-dev pkg-config libgrpc++1.51t64
 
 echo "=== Step 2: Upgrade pip/setuptools/wheel ==="
 pip install --upgrade pip "setuptools<82" wheel
