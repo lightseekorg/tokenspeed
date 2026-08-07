@@ -194,6 +194,31 @@ class ArchitectureDispatchNormalizationTests(unittest.TestCase):
         self.assertEqual(hf_config.architectures, ["NemotronForCausalLM"])
         self.assertEqual(hf_text_config.architectures, ["NemotronForCausalLM"])
 
+    def test_nemotron_hybrid_architecture_is_left_unchanged(self) -> None:
+        # NVIDIA-Nemotron-3-Super-120B-A12B is published as NemotronH and is
+        # a hybrid Mamba/attention model, not a dense Llama checkpoint.
+        hf_config = PretrainedConfig(
+            architectures=["NemotronHForCausalLM"],
+            model_type="nemotron_h",
+            mamba_hidden_act="silu",
+            mlp_hidden_act="relu2",
+            partial_rotary_factor=1.0,
+            hybrid_override_pattern="MEME",
+        )
+        hf_text_config = PretrainedConfig(
+            architectures=["NemotronHForCausalLM"],
+            model_type="nemotron_h",
+            mamba_hidden_act="silu",
+            mlp_hidden_act="relu2",
+            partial_rotary_factor=1.0,
+            hybrid_override_pattern="MEME",
+        )
+
+        _normalize_architecture_aliases_for_dispatch(hf_config, hf_text_config)
+
+        self.assertEqual(hf_config.architectures, ["NemotronHForCausalLM"])
+        self.assertEqual(hf_text_config.architectures, ["NemotronHForCausalLM"])
+
     def test_unknown_architecture_is_left_unchanged(self) -> None:
         hf_config = PretrainedConfig(architectures=["SomeFutureForCausalLM"])
         hf_text_config = PretrainedConfig(architectures=["SomeFutureForCausalLM"])

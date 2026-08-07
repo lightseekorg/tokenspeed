@@ -276,6 +276,11 @@ Qwen2, dense Qwen3, and Qwen3 MoE checkpoints use different architecture names.
 For Qwen3 30B-A3B, the Hugging Face config advertises `qwen3_moe` and
 `Qwen3MoeForCausalLM`, so launch it as a MoE model.
 
+Nemotron-H checkpoints, including `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16`,
+are hybrid Mamba/attention models and are not dense Llama checkpoints. Their
+`NemotronHForCausalLM` architecture must not be dispatched through the Llama
+model implementation until dedicated model support is available.
+
 ```bash
 tokenspeed serve Qwen/Qwen3-30B-A3B \
   --served-model-name qwen3-30b-a3b \

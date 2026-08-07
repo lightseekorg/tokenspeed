@@ -85,8 +85,10 @@ _DOUBLE_ATTENTION_LAYER_ARCHITECTURES = frozenset(
 )
 _LLAMA_DENSE_ARCH_ALIASES = frozenset(
     {
-        # Nemotron-3 Super checkpoints are Llama-family dense models but may
+        # Some older Nemotron checkpoints are Llama-compatible dense models but
         # publish a Nemotron-specific architecture label in config.json.
+        # Nemotron-H is intentionally not listed: it is a hybrid architecture
+        # and requires a dedicated runtime implementation.
         "NemotronForCausalLM",
     }
 )
