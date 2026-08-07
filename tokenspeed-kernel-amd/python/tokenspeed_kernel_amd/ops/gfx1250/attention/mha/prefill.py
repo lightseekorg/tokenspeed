@@ -53,6 +53,7 @@ class AttentionConfig:
     BLOCK_M: gl.constexpr
     BLOCK_N: gl.constexpr
     NUM_BUFFERS: gl.constexpr
+    IS_FP8: gl.constexpr
     HAS_SINK: gl.constexpr
     HAS_LSE: gl.constexpr
     WINDOW_LEFT: gl.constexpr
@@ -79,6 +80,7 @@ class AttentionConfig:
         BLOCK_M,
         BLOCK_N,
         NUM_BUFFERS,
+        IS_FP8,
         HAS_SINK,
         HAS_LSE,
         WINDOW_LEFT,
@@ -91,17 +93,20 @@ class AttentionConfig:
         assert BLOCK_N % 16 == 0
 
         warp_bases = [[1, 0], [2, 0]]
+        instr_shape = [16, 16, 64] if IS_FP8 else [16, 16, 32]
+        qk_operand_width = 16 if IS_FP8 else 8
+        shared_width = 16 if IS_FP8 else 8
         qk_layout = gl.amd.AMDWMMALayout(
             3,
             transposed=True,
             warp_bases=warp_bases,
-            instr_shape=[16, 16, 32],
+            instr_shape=instr_shape,
         )
         pv_layout = gl.amd.AMDWMMALayout(
             3,
             transposed=True,
             warp_bases=warp_bases,
-            instr_shape=[16, 16, 32],
+            instr_shape=instr_shape,
         )
 
         self.N_HEADS = gl.constexpr(N_HEADS)
@@ -111,6 +116,7 @@ class AttentionConfig:
         self.BLOCK_M = gl.constexpr(BLOCK_M)
         self.BLOCK_N = gl.constexpr(BLOCK_N)
         self.NUM_BUFFERS = gl.constexpr(NUM_BUFFERS)
+        self.IS_FP8 = gl.constexpr(IS_FP8)
         self.HAS_SINK = gl.constexpr(HAS_SINK)
         self.HAS_LSE = gl.constexpr(HAS_LSE)
         self.WINDOW_LEFT = gl.constexpr(WINDOW_LEFT)
@@ -119,13 +125,17 @@ class AttentionConfig:
         self.v_strides = v_strides
         self.qk_layout = gl.constexpr(qk_layout)
         self.pv_layout = gl.constexpr(pv_layout)
-        self.q_layout = gl.constexpr(gl.DotOperandLayout(0, qk_layout, 8))
-        self.k_layout = gl.constexpr(gl.DotOperandLayout(1, qk_layout, 8))
+        self.q_layout = gl.constexpr(
+            gl.DotOperandLayout(0, qk_layout, qk_operand_width)
+        )
+        self.k_layout = gl.constexpr(
+            gl.DotOperandLayout(1, qk_layout, qk_operand_width)
+        )
         self.p_layout = gl.constexpr(gl.DotOperandLayout(0, pv_layout, 8))
         self.v_layout = gl.constexpr(gl.DotOperandLayout(1, pv_layout, 8))
         self.k_smem_layout = gl.constexpr(
             gl.PaddedSharedLayout.with_identity_for(
-                [[HEAD_DIM, 8]], [BLOCK_N, HEAD_DIM], [1, 0]
+                [[HEAD_DIM, shared_width]], [BLOCK_N, HEAD_DIM], [1, 0]
             )
         )
         self.v_smem_layout = gl.constexpr(
@@ -619,6 +629,7 @@ def _mha_prefill_gfx1250(
     SM_SCALE: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
+    IS_FP8: gl.constexpr,
     HAS_SINK: gl.constexpr,
     HAS_LSE: gl.constexpr,
     WINDOW_LEFT: gl.constexpr,
@@ -631,6 +642,7 @@ def _mha_prefill_gfx1250(
         BLOCK_M,
         BLOCK_N,
         2,
+        IS_FP8,
         HAS_SINK,
         HAS_LSE,
         WINDOW_LEFT,
@@ -724,8 +736,16 @@ def gluon_mha_prefill_gfx1250(
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if logit_cap != 0.0:
         raise NotImplementedError("GFX1250 Gluon prefill does not support logit_cap")
-    if q.dtype not in (torch.float16, torch.bfloat16):
-        raise TypeError(f"GFX1250 Gluon prefill supports fp16/bf16, got {q.dtype}")
+    supported_dtypes = (
+        torch.float16,
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    )
+    if q.dtype not in supported_dtypes:
+        raise TypeError(f"GFX1250 Gluon prefill supports fp16/bf16/fp8, got {q.dtype}")
+    if k.dtype != q.dtype or v.dtype != q.dtype:
+        raise TypeError("Q, K, and V must use the same dtype")
     if q.shape[2] not in (64, 128):
         raise ValueError(f"unsupported head_dim={q.shape[2]}; expected 64 or 128")
 
@@ -738,7 +758,9 @@ def gluon_mha_prefill_gfx1250(
         window_left=window_left,
         softmax_scale=softmax_scale,
     )
-    output = torch.empty_like(q)
+    is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    output_dtype = torch.bfloat16 if is_fp8 else q.dtype
+    output = torch.empty(q.shape, dtype=output_dtype, device=q.device)
     lse = (
         torch.empty((total_tokens, n_heads), device=q.device, dtype=torch.float32)
         if return_lse
@@ -770,6 +792,7 @@ def gluon_mha_prefill_gfx1250(
         config.sm_scale,
         config.block_m,
         config.block_n,
+        is_fp8,
         sinks is not None,
         return_lse,
         config.window_left,

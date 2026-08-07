@@ -82,6 +82,16 @@ class DraftPageTableUnitsTest(unittest.TestCase):
             )
         )
 
+    def test_expansion_clears_rows_past_the_live_batch(self):
+        ex = _stub(page_ratio=2, page_size=64, columns=4, rows=4)
+        ex.draft_page_table.fill_(99)
+
+        _publish(ex, [0], torch.tensor([[3, -1]], dtype=torch.int32))
+
+        self.assertTrue(
+            torch.equal(ex.draft_page_table[1:], torch.zeros((3, 4), dtype=torch.int32))
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

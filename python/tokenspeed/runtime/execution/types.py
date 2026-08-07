@@ -59,6 +59,9 @@ class ModelExecutionResult:
     next_input_ids: torch.Tensor | None = None
     # Per-request NaN-guard flags (int32, [bs]); None when the guard is disabled.
     output_nan_flags: torch.Tensor | None = None
+    # Optional verify-input snapshot used by speculative diagnostics. Layout is
+    # [batch, verify_width]: anchor followed by draft candidate token ids.
+    spec_candidate_tokens: torch.Tensor | None = None
 
     def sync(self) -> None:
         if self.copy_event is None:

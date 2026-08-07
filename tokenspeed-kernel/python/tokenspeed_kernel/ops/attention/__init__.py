@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 # Backend registration (side-effect imports)
 import tokenspeed_kernel.ops.attention.cuda  # noqa: F401
@@ -55,6 +56,20 @@ from tokenspeed_kernel.signature import (
 )
 
 AttentionResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]
+
+
+@dataclass(frozen=True)
+class MLAQueryProjection:
+    """Projected MLA query and an optional prepared absorb destination.
+
+    When ``absorbed_query`` is present, ``query`` contains only the per-head
+    NoPE channels and the RoPE tail of ``absorbed_query`` is populated. The
+    absorb BMM owns the remaining latent prefix.
+    """
+
+    query: torch.Tensor
+    absorbed_query: torch.Tensor | None
+
 
 # One UE8M0 scale per 32 consecutive head_dim elements (MXFP8).
 MXFP8_ATTENTION_BLOCK_SCALE = MXFP8_BLOCK_SCALE
@@ -120,9 +135,12 @@ __all__ = [
     "KdaPrefillResult",
     "GdnCheckpointLayout",
     "GdnChunkPrefillResult",
+    "MLAQueryProjection",
     "mla_prefill",
     "mla_use_absorbed_extend",
     "mla_extend_with_kvcache",
+    "mla_normalize_project_query",
+    "mla_project_value",
     "mla_decode_with_kvcache",
     "dsa_prefill",
     "dsa_decode",
@@ -136,6 +154,367 @@ __all__ = [
 ]
 
 LSE_LN = math.log2(math.e)
+
+
+def mla_project_value(
+    attention: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    gate: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """Project per-head MLA values and optionally apply a sigmoid gate.
+
+    The headwise projection accumulates in FP32 and is materialized in the
+    input dtype before the optional gate, preserving the unfused numerical
+    boundary.
+
+    Args:
+        attention: Absorbed values shaped ``[batch, heads, latent_dim]``.
+        weight: Per-head projection shaped ``[heads, latent_dim, value_dim]``.
+        gate: Optional raw sigmoid gate shaped ``[batch, heads * value_dim]``.
+        out: Optional output with the same shape as ``gate`` when provided, or
+            ``[batch, heads * value_dim]`` otherwise.
+        override: Optional exact registered kernel name.
+        solution: Optional registered solution name.
+
+    Returns:
+        Projected values shaped ``[batch, heads * value_dim]``.
+    """
+    if attention.ndim != 3 or attention.shape[0] < 1:
+        raise ValueError("attention must have shape [batch, heads, latent_dim]")
+    if weight.ndim != 3 or weight.shape[:2] != attention.shape[1:]:
+        raise ValueError("weight must have shape [heads, latent_dim, value_dim]")
+    if attention.dtype != weight.dtype or attention.device != weight.device:
+        raise ValueError("attention and weight must match dtype and device")
+
+    batch, heads, latent_dim = attention.shape
+    value_dim = weight.shape[2]
+    expected_output = (batch, heads * value_dim)
+    if gate is not None and (
+        tuple(gate.shape) != expected_output
+        or gate.dtype != attention.dtype
+        or gate.device != attention.device
+    ):
+        raise ValueError(f"gate must match attention and have shape {expected_output}")
+    if out is None:
+        out = attention.new_empty(expected_output)
+    elif (
+        tuple(out.shape) != expected_output
+        or out.dtype != attention.dtype
+        or out.device != attention.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError(f"out must be contiguous and have shape {expected_output}")
+
+    signature = _attention_format_signature(
+        attention=attention,
+        weight=weight,
+        out=out,
+    )
+    traits = {
+        "batch_size": batch,
+        "num_heads": heads,
+        "latent_dim": latent_dim,
+        "value_dim": value_dim,
+        "gate_kind": "none" if gate is None else "sigmoid",
+        "inputs_contiguous": (
+            attention.is_contiguous()
+            and weight.is_contiguous()
+            and (gate is None or gate.is_contiguous())
+            and out.is_contiguous()
+        ),
+    }
+    try:
+        kernel = select_kernel(
+            "attention",
+            "mla_project_value",
+            signature,
+            traits=traits,
+            solution=solution,
+            override=override,
+        )
+    except NoKernelFoundError:
+        if override is not None or solution is not None:
+            raise
+        kernel = None
+
+    if kernel is not None:
+        shape_params = {
+            "batch_size": batch,
+            "num_heads": heads,
+            "latent_dim": latent_dim,
+            "value_dim": value_dim,
+            "gate_kind": traits["gate_kind"],
+        }
+        ShapeCapture.get().record(
+            "attention",
+            "mla_project_value",
+            kernel.name,
+            attention.dtype,
+            shape_params,
+        )
+        with kernel_scope(
+            "attention",
+            "mla_project_value",
+            attention.dtype,
+            kernel_name=kernel.name,
+            **shape_params,
+        ):
+            return kernel(attention=attention, weight=weight, gate=gate, out=out)
+
+    output_view = out.view(batch, heads, value_dim)
+    if current_platform().is_nvidia:
+        torch.bmm(
+            attention.transpose(0, 1),
+            weight,
+            out=output_view.transpose(0, 1),
+        )
+    else:
+        projected = torch.bmm(attention.transpose(0, 1).contiguous(), weight)
+        output_view.copy_(projected.transpose(0, 1))
+    if gate is not None:
+        if out.is_cuda:
+            from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
+
+            sigmoid_mul(out, gate)
+        else:
+            out.copy_(out.float() * torch.sigmoid(gate.float()))
+    return out
+
+
+def mla_normalize_project_query(
+    query: torch.Tensor,
+    kv: torch.Tensor,
+    query_norm_weight: torch.Tensor,
+    kv_norm_weight: torch.Tensor,
+    projection_weight: torch.Tensor,
+    *,
+    eps: float,
+    prepare_absorbed_query: bool = False,
+    qk_nope_head_dim: int | None = None,
+    qk_rope_head_dim: int | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> MLAQueryProjection:
+    """Normalize MLA query/KV latents and project the normalized query.
+
+    The query normalization is materialized in its input dtype before the
+    projection. ``kv`` is normalized in place so callers can retain a view
+    into a larger latent-cache tensor.
+
+    Args:
+        query: Query latent shaped ``[tokens, query_width]``.
+        kv: KV latent shaped ``[tokens, kv_width]``; modified in place.
+        query_norm_weight: Query RMSNorm weight shaped ``[query_width]``.
+        kv_norm_weight: KV RMSNorm weight shaped ``[kv_width]``.
+        projection_weight: Query projection weight shaped
+            ``[output_width, query_width]``.
+        eps: Positive RMSNorm epsilon.
+        prepare_absorbed_query: Whether to prepare the per-head query layout
+            consumed by MLA absorb decode when a compatible kernel is available.
+        qk_nope_head_dim: Per-head NoPE width required when preparing an
+            absorbed query.
+        qk_rope_head_dim: Per-head RoPE width required when preparing an
+            absorbed query.
+        override: Optional exact registered kernel name.
+        solution: Optional registered solution name.
+
+    Returns:
+        The projected query and an optional absorbed-query destination. The
+        ordinary query is shaped ``[tokens, output_width]``. When an absorbed
+        destination is returned, the query is instead shaped
+        ``[tokens, heads, qk_nope_head_dim]``.
+    """
+    if query.ndim != 2 or query.shape[0] < 1:
+        raise ValueError("query must have shape [tokens, query_width]")
+    tokens, query_width = query.shape
+    if kv.ndim != 2 or kv.shape[0] != tokens:
+        raise ValueError("kv must have shape [tokens, kv_width]")
+    kv_width = kv.shape[1]
+    output_width = projection_weight.shape[0] if projection_weight.ndim == 2 else 0
+    expected = (
+        (query_norm_weight, (query_width,), "query_norm_weight"),
+        (kv_norm_weight, (kv_width,), "kv_norm_weight"),
+        (projection_weight, (output_width, query_width), "projection_weight"),
+    )
+    for tensor, shape, name in expected:
+        if tuple(tensor.shape) != shape:
+            raise ValueError(f"{name} must have shape {shape}")
+    for tensor, name in (
+        (kv, "kv"),
+        (query_norm_weight, "query_norm_weight"),
+        (kv_norm_weight, "kv_norm_weight"),
+        (projection_weight, "projection_weight"),
+    ):
+        if tensor.dtype != query.dtype or tensor.device != query.device:
+            raise ValueError(f"{name} must match query dtype and device")
+        if tensor.stride(-1) != 1:
+            raise ValueError(f"{name} must have unit inner stride")
+    if eps <= 0.0:
+        raise ValueError("eps must be positive")
+
+    num_heads = None
+    if prepare_absorbed_query:
+        if qk_nope_head_dim is None or qk_nope_head_dim <= 0:
+            raise ValueError(
+                "qk_nope_head_dim must be positive when preparing an absorbed query"
+            )
+        if qk_rope_head_dim is None or qk_rope_head_dim <= 0:
+            raise ValueError(
+                "qk_rope_head_dim must be positive when preparing an absorbed query"
+            )
+        head_width = qk_nope_head_dim + qk_rope_head_dim
+        if output_width % head_width != 0:
+            raise ValueError(
+                f"projection width {output_width} is not divisible by head width {head_width}"
+            )
+        num_heads = output_width // head_width
+
+    def select_for_layout(
+        *, prefix_width: int, tail_width: int, required: bool = False
+    ):
+        tensor_roles = {
+            "query": dense_tensor_format(query.dtype),
+            "kv": dense_tensor_format(kv.dtype),
+            "projection_weight": dense_tensor_format(projection_weight.dtype),
+            "out": dense_tensor_format(query.dtype),
+        }
+        split_output = tail_width > 0
+        if split_output:
+            tensor_roles["tail_out"] = dense_tensor_format(query.dtype)
+        signature = format_signature(**tensor_roles)
+        traits = {
+            "num_tokens": tokens,
+            "query_width": query_width,
+            "kv_width": kv_width,
+            "output_width": output_width,
+            "output_prefix_width": prefix_width,
+            "output_tail_width": tail_width,
+            "split_output": split_output,
+            "inputs_contiguous": all(
+                tensor.is_contiguous()
+                for tensor in (
+                    query,
+                    kv,
+                    query_norm_weight,
+                    kv_norm_weight,
+                    projection_weight,
+                )
+            ),
+            "outputs_inner_contiguous": True,
+        }
+        try:
+            return select_kernel(
+                "attention",
+                "mla_normalize_project_query",
+                signature,
+                traits=traits,
+                solution=solution,
+                override=override,
+            )
+        except NoKernelFoundError:
+            if required:
+                raise
+            return None
+
+    kernel = None
+    split_selected = False
+    if num_heads is not None:
+        assert qk_nope_head_dim is not None and qk_rope_head_dim is not None
+        kernel = select_for_layout(
+            prefix_width=qk_nope_head_dim,
+            tail_width=qk_rope_head_dim,
+        )
+        split_selected = kernel is not None
+    if kernel is None:
+        kernel = select_for_layout(
+            prefix_width=output_width,
+            tail_width=0,
+            required=override is not None or solution is not None,
+        )
+
+    absorbed_query = None
+    tail_out = None
+    if split_selected:
+        assert num_heads is not None
+        assert qk_nope_head_dim is not None and qk_rope_head_dim is not None
+        out = query.new_empty(tokens, num_heads, qk_nope_head_dim)
+        absorbed_query = query.new_empty(tokens, num_heads, kv_width + qk_rope_head_dim)
+        tail_out = absorbed_query[..., kv_width:]
+    else:
+        out = query.new_empty((tokens, output_width))
+
+    if kernel is not None:
+        shape_params = {
+            "num_tokens": tokens,
+            "query_width": query_width,
+            "kv_width": kv_width,
+            "output_width": output_width,
+        }
+        ShapeCapture.get().record(
+            "attention",
+            "mla_normalize_project_query",
+            kernel.name,
+            query.dtype,
+            shape_params,
+        )
+        with kernel_scope(
+            "attention",
+            "mla_normalize_project_query",
+            query.dtype,
+            kernel_name=kernel.name,
+            **shape_params,
+        ):
+            output = kernel(
+                query=query,
+                kv=kv,
+                query_norm_weight=query_norm_weight,
+                kv_norm_weight=kv_norm_weight,
+                projection_weight=projection_weight,
+                eps=eps,
+                out=out,
+                tail_out=tail_out,
+            )
+            return MLAQueryProjection(output, absorbed_query)
+
+    projection_out = out
+    if query.is_cuda and query.dtype == torch.bfloat16:
+        if current_platform().is_amd:
+            from tokenspeed_kernel.ops.layernorm.triton import (
+                rmsnorm_fused_parallel,
+            )
+        else:
+            from tokenspeed_kernel.ops.layernorm.cuda import rmsnorm_fused_parallel
+
+        from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
+
+        query_norm = torch.empty_like(query)
+        rmsnorm_fused_parallel(
+            input1=query,
+            weight1=query_norm_weight,
+            output1=query_norm,
+            input2=kv,
+            weight2=kv_norm_weight,
+            output2=kv,
+            eps=eps,
+        )
+        decode_gemv(query_norm, projection_weight, out=projection_out)
+    else:
+        query_fp32 = query.float()
+        query_norm = query_fp32 * torch.rsqrt(
+            query_fp32.square().mean(dim=-1, keepdim=True) + eps
+        )
+        query_norm = (query_norm * query_norm_weight.float()).to(query.dtype)
+        kv_fp32 = kv.float()
+        kv_norm = kv_fp32 * torch.rsqrt(
+            kv_fp32.square().mean(dim=-1, keepdim=True) + eps
+        )
+        kv.copy_((kv_norm * kv_norm_weight.float()).to(kv.dtype))
+        torch.mm(query_norm, projection_weight.t(), out=projection_out)
+    return MLAQueryProjection(out, None)
 
 
 def msa_decode_with_kvcache(
@@ -2050,6 +2429,9 @@ def mla_decode_with_kvcache(
     # dispatch options
     override: str | None = None,
     solution: str | None = None,
+    # optional projected-value epilogue
+    value_weight: torch.Tensor | None = None,
+    gate: torch.Tensor | None = None,
 ) -> AttentionResult:
     """MLA absorbed decode over compressed paged MLA KV cache.
 
@@ -2057,7 +2439,10 @@ def mla_decode_with_kvcache(
     transformed the non-RoPE query part into latent space using the key half of
     kv_b_proj, so Q and the compressed cache share the same q/k dimension:
     kv_lora_rank + qk_rope_head_dim. The kernel returns the attention-weighted
-    latent value; the model applies the value half of kv_b_proj afterward.
+    latent value. When ``value_weight`` is provided, a supporting kernel may
+    instead apply the value projection and optional output gate while reducing
+    the attention partials. Otherwise the API composes the latent decode and
+    value projection.
 
     Args:
         q: Absorbed query with shape
@@ -2080,16 +2465,55 @@ def mla_decode_with_kvcache(
         logit_cap: Optional soft cap applied to attention logits.
         return_lse: Whether to also return log-sum-exp values.
         out: Optional output tensor with shape [batch, q_len, num_q_heads,
-            kv_lora_rank].
+            kv_lora_rank]. When ``value_weight`` is provided, this is required
+            and has shape [batch, num_q_heads * value_head_dim].
+        value_weight: Optional per-head value projection with shape
+            [num_q_heads, kv_lora_rank, value_head_dim].
+        gate: Optional raw sigmoid gate with shape
+            [batch, num_q_heads * value_head_dim]. Requires ``value_weight``.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
     Returns:
         Latent attention output with shape [batch, q_len, num_q_heads,
-        kv_lora_rank], or (output, lse) when return_lse is True. The caller is
-        responsible for applying the MLA value projection from latent rank to
-        v_head_dim.
+        kv_lora_rank], or (output, lse) when return_lse is True. When
+        ``value_weight`` is provided, returns ``out`` containing the projected
+        and optionally gated value.
     """
+    if gate is not None and value_weight is None:
+        raise ValueError("gate requires value_weight")
+
+    projected_value = value_weight is not None
+    if projected_value:
+        if q.ndim != 4 or q.shape[1] != 1:
+            raise ValueError(
+                "projected MLA decode requires q shape [batch,1,heads,dim]"
+            )
+        if value_weight.ndim != 3 or value_weight.shape[:2] != (
+            q.shape[2],
+            kv_lora_rank,
+        ):
+            raise ValueError(
+                "value_weight must have shape [heads,kv_lora_rank,value_head_dim]"
+            )
+        if out is None:
+            raise ValueError("projected MLA decode requires out")
+        expected_output = (q.shape[0], q.shape[2] * value_weight.shape[2])
+        if out.shape != expected_output:
+            raise ValueError(f"out must have shape {expected_output}")
+        if (
+            out.dtype != value_weight.dtype
+            or out.device != q.device
+            or not out.is_contiguous()
+        ):
+            raise ValueError(
+                "out must match value_weight dtype and be contiguous and colocated with q"
+            )
+        if gate is not None and gate.shape != expected_output:
+            raise ValueError(f"gate must have shape {expected_output}")
+        if return_lse:
+            raise ValueError("projected MLA decode does not support return_lse")
+
     traits = {
         "batch_size": q.shape[0],
         "page_size": kv_cache.shape[1],
@@ -2102,17 +2526,55 @@ def mla_decode_with_kvcache(
         "support_logit_cap": logit_cap != 0.0,
         "return_lse": return_lse,
     }
-    signature = _attention_format_signature(q=q, kv_cache=kv_cache)
+    if projected_value:
+        traits.update(
+            {
+                "value_head_dim": value_weight.shape[2],
+                "gate_kind": "none" if gate is None else "sigmoid",
+            }
+        )
+        signature = _attention_format_signature(
+            q=q,
+            kv_cache=kv_cache,
+            value_weight=value_weight,
+            out=out,
+        )
+    else:
+        signature = _attention_format_signature(q=q, kv_cache=kv_cache)
+    dispatch_mode = (
+        "mla_decode_projected_value" if projected_value else "mla_decode_with_kvcache"
+    )
     try:
         kernel = select_kernel(
             "attention",
-            "mla_decode_with_kvcache",
+            dispatch_mode,
             signature,
             traits=traits,
             solution=solution,
             override=override,
         )
     except NoKernelFoundError:
+        if projected_value:
+            if override is not None or solution is not None:
+                raise
+            attention = mla_decode_with_kvcache(
+                q=q,
+                kv_cache=kv_cache,
+                page_table=page_table,
+                cache_seqlens=cache_seqlens,
+                max_seqlen_k=max_seqlen_k,
+                qk_nope_head_dim=qk_nope_head_dim,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                softmax_scale=softmax_scale,
+                logit_cap=logit_cap,
+            )
+            return mla_project_value(
+                attention.reshape(q.shape[0], q.shape[2], kv_lora_rank),
+                value_weight,
+                gate=gate,
+                out=out,
+            )
         if q.dtype == kv_cache.dtype:
             raise
         q = q.to(kv_cache.dtype)
@@ -2138,9 +2600,11 @@ def mla_decode_with_kvcache(
         "qk_rope_head_dim": qk_rope_head_dim,
         "max_seqlen_k": max_seqlen_k,
     }
+    if projected_value:
+        shape_params["value_head_dim"] = value_weight.shape[2]
     ShapeCapture.get().record(
         "attention",
-        "mla_decode_with_kvcache",
+        dispatch_mode,
         kernel.name,
         q.dtype,
         shape_params,
@@ -2148,11 +2612,27 @@ def mla_decode_with_kvcache(
 
     with kernel_scope(
         "attention",
-        "mla_decode_with_kvcache",
+        dispatch_mode,
         q.dtype,
         kernel_name=kernel.name,
         **shape_params,
     ):
+        if projected_value:
+            return kernel(
+                q=q,
+                kv_cache=kv_cache,
+                page_table=page_table,
+                cache_seqlens=cache_seqlens,
+                max_seqlen_k=max_seqlen_k,
+                qk_nope_head_dim=qk_nope_head_dim,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                softmax_scale=softmax_scale,
+                value_weight=value_weight,
+                gate=gate,
+                out=out,
+                logit_cap=logit_cap,
+            )
         return kernel(
             q=q,
             kv_cache=kv_cache,

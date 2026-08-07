@@ -53,6 +53,7 @@ def test_capture_tensor_matches_post_layer_attnres_reference():
         output_attn_res_proj=None,
         output_attn_res_norm=None,
         norm=None,
+        layers_to_capture=[],
         eagle3_layers_to_capture=(2, 3),
     )
 

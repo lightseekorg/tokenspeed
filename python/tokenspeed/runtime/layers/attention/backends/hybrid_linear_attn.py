@@ -78,6 +78,24 @@ if TYPE_CHECKING:
 _STATE_GROUP_ID = LINEAR_ATTENTION
 
 
+def _slice_kda_prefill_inputs(
+    num_real_tokens: int,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Slice packed KDA inputs to the real-token prefix along their token axis."""
+    return (
+        query[:, :num_real_tokens],
+        key[:, :num_real_tokens],
+        value[:, :num_real_tokens],
+        gate[:, :num_real_tokens],
+        beta[:, :num_real_tokens],
+    )
+
+
 def _mask_fresh_initial_state(
     recurrent_state: torch.Tensor,
     has_initial_states: torch.Tensor | None,
@@ -1654,9 +1672,10 @@ class MambaAttnBackend(AttentionBackend):
                 extend_seq_lens_cpu = self.forward_metadata.extend_seq_lens_cpu
 
             # Zero padded rows so garbage can't reach recurrent state (see scrub_padding_tail).
+            num_real_tokens = seq_len
             if extend_seq_lens_cpu is not None:
-                ntok = int(sum(int(x) for x in extend_seq_lens_cpu))
-                scrub_padding_tail(ntok, mixed_qkv, a, b)
+                num_real_tokens = int(sum(int(x) for x in extend_seq_lens_cpu))
+                scrub_padding_tail(num_real_tokens, mixed_qkv, a, b)
 
             mixed_qkv_t = mixed_qkv.transpose(0, 1)
             mixed_qkv = causal_conv1d_fn(
@@ -1767,8 +1786,16 @@ class MambaAttnBackend(AttentionBackend):
                 solution=mtp_solution,
             ).reshape(1, seq_len, num_value_heads, head_v_dim)
         elif self.is_kda:
+            # FlashKDA derives its output extent from the input shape but derives
+            # sequence tiles from cu_seqlens. With bucket-sized inputs it leaves
+            # the uncovered output tail unwritten, and its final full-tile loads
+            # can consume in-bounds padding. Run only the real prefix; the graph
+            # handoff clears and restores the bucket tail afterward.
             g_kda = _kda_g_raw().view(1, seq_len, num_value_heads, head_k_dim)
             beta_kda = beta_raw.view(1, seq_len, num_value_heads)
+            query, key, value, g_kda, beta_kda = _slice_kda_prefill_inputs(
+                num_real_tokens, query, key, value, g_kda, beta_kda
+            )
             kda_result = kda_paged_prefill(
                 query,
                 key,
@@ -1849,6 +1876,10 @@ class HybridLinearAttnBackend(AttentionBackend):
     @property
     def data_type(self):
         return self.full_attn_backend.data_type
+
+    @property
+    def supports_mla_projected_value_decode(self) -> bool:
+        return self.full_attn_backend.supports_mla_projected_value_decode
 
     def override_num_extends(self, num_extends: int):
         return self.full_attn_backend.override_num_extends(num_extends)
