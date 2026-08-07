@@ -22,10 +22,9 @@ from __future__ import annotations
 
 import pytest
 import torch
+from utils import is_cdna4
 
-if not torch.cuda.is_available() or "gfx950" not in getattr(
-    torch.cuda.get_device_properties(0), "gcnArchName", ""
-):
+if not is_cdna4():
     pytest.skip(
         "BF16-weight Gluon MoE is unavailable on this GPU",
         allow_module_level=True,
