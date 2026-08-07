@@ -271,6 +271,10 @@ class RequestHandler:
         req_spec = make_spec(
             rid=recv_req.rid,
             tokens=recv_req.input_ids,
+            # getattr: the adapter registry that resolves and attaches lora_id
+            # to the request input lands separately. Until it does, every
+            # request is base-model and the scheduler behaves exactly as before.
+            lora_id=getattr(recv_req, "lora_id", None),
         )
         req_state = RequestState.from_recv_req(
             recv_req,

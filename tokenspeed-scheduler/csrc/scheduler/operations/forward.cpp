@@ -26,6 +26,7 @@
 #include <iterator>
 #include <optional>
 #include <ranges>
+#include <set>
 #include <span>
 #include <string>
 #include <type_traits>
@@ -466,14 +467,30 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
     std::vector<LoadBackOperation> load_back_operations;
     std::int32_t token_budget = config_.max_scheduled_tokens;
     bool pushed_prefill = false;
-    auto push_operation = [&](auto operation) {
+    // Distinct adapters already in this batch, tracked so the batch never
+    // presents the runtime with more than max_loras of them.
+    std::set<std::string> batch_lora_ids;
+    auto push_operation = [&](const Request* request, auto operation) {
         if (config_.role != Role::kD) {
             token_budget -= operation.input_length;
         }
         if constexpr (std::is_same_v<std::decay_t<decltype(operation)>, PrefillOperation>) {
             pushed_prefill = true;
         }
+        if (!request->LoraId().empty()) {
+            batch_lora_ids.insert(request->LoraId());
+        }
         operations.push_back(std::move(operation));
+    };
+    // A request whose adapter is already in the batch is always admissible --
+    // it costs no additional slot. Only one that would introduce a *new*
+    // adapter can hit the cap.
+    const auto loraAdmits = [&](const Request* request) {
+        if (config_.max_loras <= 0 || request->LoraId().empty()) {
+            return true;
+        }
+        return batch_lora_ids.size() < static_cast<std::size_t>(config_.max_loras) ||
+               batch_lora_ids.contains(request->LoraId());
     };
     const auto trackPendingForwardResult = [&](const Request* request) {
         // Intermediate prefill and D-side cache admission do not produce a
@@ -488,10 +505,17 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
             break;
         }
 
+        // Defer rather than break: the adapter budget is exhausted for this
+        // request, but a later candidate may reuse an adapter already in the
+        // batch and still belongs in this step.
+        if (!loraAdmits(request)) {
+            continue;
+        }
+
         if (request->Is<fsm::Prefilling>() && config_.role != Role::kD) {
             const std::int32_t reserve = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
             if (auto event = schedulePrefill(request, token_budget, reserve)) {
-                push_operation(applyEventAndBuildOperation(request, std::move(*event)));
+                push_operation(request, applyEventAndBuildOperation(request, std::move(*event)));
                 if (config_.enable_pd_cache) {
                     pd_transfer_pins_.insert(request->Id());
                 }
@@ -513,7 +537,7 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
             const std::int32_t decode_input_tokens = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
             const std::int32_t prefill_budget = config_.role == Role::kD ? request->PrefillSize() : token_budget;
             if (auto event = schedulePrefillFirstChunk(request, prefill_budget, decode_input_tokens)) {
-                push_operation(applyEventAndBuildOperation(request, std::move(*event), load_back_operations));
+                push_operation(request, applyEventAndBuildOperation(request, std::move(*event), load_back_operations));
                 if (config_.enable_pd_cache) {
                     pd_transfer_pins_.insert(request->Id());
                 }
@@ -533,7 +557,7 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
                 continue;
             }
             if (auto event = scheduleDecode(request)) {
-                push_operation(applyEventAndBuildOperation(request, std::move(*event)));
+                push_operation(request, applyEventAndBuildOperation(request, std::move(*event)));
                 trackPendingForwardResult(request);
             }
         }

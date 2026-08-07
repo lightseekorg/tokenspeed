@@ -44,6 +44,9 @@ public:
 
     const std::string& Id() const { return id_; }
 
+    // Resolved LoRA adapter id, or empty for a base-model request.
+    const std::string& LoraId() const { return lora_id_; }
+
     template <typename Event>
     void Apply(Event&& event) {
         state_ = std::visit(
@@ -129,6 +132,7 @@ private:
     const fsm::ForwardState& forwardState(const char* operation) const;
 
     std::string id_;
+    std::string lora_id_;
     TokenContainer token_container_;
     std::int32_t page_size_{};
     fsm::State state_;
