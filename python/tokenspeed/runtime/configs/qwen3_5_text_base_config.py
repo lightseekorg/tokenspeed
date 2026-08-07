@@ -26,16 +26,12 @@
 """Qwen3.5 text model configuration definitions."""
 
 import enum
+from dataclasses import field
 
-from transformers.configuration_utils import PretrainedConfig
-from transformers.modeling_rope_utils import rope_config_validation
-from transformers.utils import logging
-
+from tokenspeed.runtime.configs.base_config import TextConfigBase
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
 )
-
-logger = logging.get_logger(__name__)
 
 
 #  HybridLayerType
@@ -46,12 +42,21 @@ class HybridLayerType(enum.Enum):
     mamba2 = "mamba"
 
 
-class Qwen3_5BaseTextConfig(PretrainedConfig):
+# Legacy checkpoint label spellings, normalized to the paged-cache vocabulary
+# on load (mirrors transformers' ``_LEGACY_LAYER_TYPE_REMAP``).
+_LEGACY_LAYER_TYPE_REMAP = {
+    "conv": "linear_attention",
+    "mamba": "linear_attention",
+    "attention": "full_attention",
+}
+
+
+class Qwen3_5BaseTextConfig(TextConfigBase):
     r"""
     Shared text configuration base used by Qwen3.5 dense and MoE configs.
 
-    Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
-    documentation from [`PretrainedConfig`] for more information.
+    Configuration objects inherit from [`BaseConfig`] and store the checkpoint
+    metadata consumed by TokenSpeed's runtime.
 
 
     Args:
@@ -165,7 +170,10 @@ class Qwen3_5BaseTextConfig(PretrainedConfig):
             The list contains layer index, from 0 to num_layers-1 if we have num_layers layers
             If `mlp_only_layers` is empty, `decoder_sparse_step` is used to determine the sparsity.
         layer_types (`list[str]`, *optional*, defaults to None):
-            Types of each layer (attention or linear).
+            Per-layer attention type in the paged-cache vocabulary
+            (`"full_attention"` / `"linear_attention"`). When omitted, derived
+            from `full_attention_interval`. Legacy spellings (`"attention"`,
+            `"mamba"`, `"conv"`) are remapped on load.
 
     ```python
     >>> from transformers import Qwen3_5TextModel, Qwen3_5BaseTextConfig
@@ -184,111 +192,70 @@ class Qwen3_5BaseTextConfig(PretrainedConfig):
     model_type = "qwen3_5_text_base"
     keys_to_ignore_at_inference = ["past_key_values"]
 
-    def __init__(
-        self,
-        vocab_size=151936,
-        hidden_size=2048,
-        intermediate_size=5632,
-        num_hidden_layers=48,
-        num_attention_heads=16,
-        num_key_value_heads=2,
-        hidden_act="silu",
-        max_position_embeddings=32768,
-        initializer_range=0.02,
-        rms_norm_eps=1e-6,
-        use_cache=True,
-        tie_word_embeddings=False,
-        rope_theta=10000.0,
-        rope_parameters=None,
-        partial_rotary_factor=0.25,
-        attention_bias=False,
-        attention_dropout=0.0,
-        head_dim=256,
-        linear_conv_kernel_dim=4,
-        linear_key_head_dim=128,
-        linear_value_head_dim=128,
-        linear_num_key_heads=16,
-        linear_num_value_heads=32,
-        decoder_sparse_step=1,
-        moe_intermediate_size=512,
-        shared_expert_intermediate_size=512,
-        num_experts_per_tok=10,
-        num_experts=512,
-        norm_topk_prob=True,
-        output_router_logits=False,
-        router_aux_loss_coef=0.001,
-        mlp_only_layers=[],
-        layer_types=None,
-        **kwargs,
-    ):
-        super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
-        self.vocab_size = vocab_size
-        self.max_position_embeddings = max_position_embeddings
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
-        self.num_key_value_heads = num_key_value_heads
-        self.hidden_act = hidden_act
-        self.initializer_range = initializer_range
-        self.rms_norm_eps = rms_norm_eps
-        self.use_cache = use_cache
-        self.rope_theta = rope_theta
-        self.rope_parameters = rope_parameters
-        self.partial_rotary_factor = partial_rotary_factor
-        self.attention_bias = attention_bias
-        self.attention_dropout = attention_dropout
-        self.head_dim = head_dim
-        rope_config_validation(self)
+    vocab_size: int = 151936
+    hidden_size: int = 2048
+    intermediate_size: int = 5632
+    num_hidden_layers: int = 48
+    num_attention_heads: int = 16
+    num_key_value_heads: int = 2
+    hidden_act: str = "silu"
+    max_position_embeddings: int = 32768
+    initializer_range: float = 0.02
+    rms_norm_eps: float = 1e-6
+    use_cache: bool = True
+    tie_word_embeddings: bool = False
+    rope_theta: float = 10000.0
+    rope_parameters: dict | None = None
+    partial_rotary_factor: float = 0.25
+    attention_bias: bool = False
+    attention_dropout: float = 0.0
+    head_dim: int = 256
+    linear_conv_kernel_dim: int = 4
+    linear_key_head_dim: int = 128
+    linear_value_head_dim: int = 128
+    linear_num_key_heads: int = 16
+    linear_num_value_heads: int = 32
+    decoder_sparse_step: int = 1
+    moe_intermediate_size: int = 512
+    shared_expert_intermediate_size: int = 512
+    num_experts_per_tok: int = 10
+    num_experts: int = 512
+    norm_topk_prob: bool = True
+    output_router_logits: bool = False
+    router_aux_loss_coef: float = 0.001
+    mlp_only_layers: list = field(default_factory=list)
+    layer_types: list[str] | None = None
 
-        # linear attention (gdn now part)
-        self.linear_conv_kernel_dim = linear_conv_kernel_dim
-        self.linear_key_head_dim = linear_key_head_dim
-        self.linear_value_head_dim = linear_value_head_dim
-        self.linear_num_key_heads = linear_num_key_heads
-        self.linear_num_value_heads = linear_num_value_heads
+    def __post_init__(self, **kwargs):
+        # ``layer_types`` is a stored field (paged-cache labels), not a derived
+        # property. When the checkpoint omits it, fall back to the legacy
+        # ``full_attention_interval`` interleave; when present, normalize the
+        # legacy label spellings exactly like transformers.
+        interval = kwargs.pop("full_attention_interval", 4)
+        if self.layer_types is None:
+            self.layer_types = [
+                "linear_attention" if (i + 1) % interval else "full_attention"
+                for i in range(self.num_hidden_layers)
+            ]
+        else:
+            self.layer_types = [
+                _LEGACY_LAYER_TYPE_REMAP.get(t, t) for t in self.layer_types
+            ]
 
-        # MoE arguments
-        self.decoder_sparse_step = decoder_sparse_step
-        self.moe_intermediate_size = moe_intermediate_size
-        self.shared_expert_intermediate_size = shared_expert_intermediate_size
-        self.num_experts_per_tok = num_experts_per_tok
-        self.num_experts = num_experts
-        self.norm_topk_prob = norm_topk_prob
-        self.output_router_logits = output_router_logits
-        self.router_aux_loss_coef = router_aux_loss_coef
-        self.mlp_only_layers = mlp_only_layers
+        super().__post_init__(**kwargs)
 
     @property
     def layers_block_type(self):
-        layer_type_list = []
+        """Per-layer type in the model-dispatch vocabulary.
 
-        for layer_index in range(self.num_hidden_layers):
-            if (layer_index + 1) % self.full_attention_interval == 0:
-                layer_type_list.append(HybridLayerType.full_attention.value)
-            else:
-                layer_type_list.append(HybridLayerType.linear_attention.value)
-
-        return layer_type_list
-
-    @property
-    def layer_types(self):
-        """Per-layer cache-group labels: "full_attention" / "linear_attention".
-
-        Same interleaving as ``layers_block_type``, translated to the label
-        vocabulary of ``cache_spec`` (``HybridLayerType.full_attention``
-        serializes as the checkpoint's "attention", which the KV-cache layer
-        has no retention entry for). A property rather than an ``__init__``
-        attribute because NextN drafts overwrite ``full_attention_interval``
-        after construction (models/qwen3_5_nextn.py).
+        ``HybridLayerType.full_attention`` serializes as ``"attention"``, which
+        is the paged-cache label ``FULL_ATTENTION`` translated back; linear
+        layers keep their label. Derived from the stored ``layer_types`` field
+        so an explicit checkpoint schedule drives dispatch directly.
         """
         return [
-            (
-                FULL_ATTENTION
-                if layer_type == HybridLayerType.full_attention.value
-                else layer_type
-            )
-            for layer_type in self.layers_block_type
+            HybridLayerType.full_attention.value if t == FULL_ATTENTION else t
+            for t in self.layer_types
         ]
 
     @property

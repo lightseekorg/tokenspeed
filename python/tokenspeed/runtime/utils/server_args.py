@@ -1073,7 +1073,11 @@ class ServerArgs:
             "--trust-remote-code",
             action=argparse.BooleanOptionalAction,
             default=False,
-            help="Whether or not to allow for custom models defined on the Hub in their own modeling files.",
+            help=(
+                "Allow custom tokenizer code from the model repository. "
+                "This does not enable remote model config or model implementation "
+                "code; model configs must use a model_type registered by TokenSpeed."
+            ),
         )
         parser.add_argument(
             "--dtype",

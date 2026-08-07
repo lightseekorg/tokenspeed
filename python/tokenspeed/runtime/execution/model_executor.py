@@ -34,8 +34,9 @@ from tokenspeed_kernel.ops.tuning import (
 )
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.configs.base_config import get_rope_parameters
 from tokenspeed.runtime.configs.model_config import AttentionArch, ModelConfig
-from tokenspeed.runtime.configs.utils import get_rope_parameters
+from tokenspeed.runtime.configs.utils import get_context_length
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -83,7 +84,6 @@ from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.utils import get_colorful_logger, set_random_seed
 from tokenspeed.runtime.utils.common import maybe_inference_mode
 from tokenspeed.runtime.utils.env import envs
-from tokenspeed.runtime.utils.hf_transformers_utils import get_context_length
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.server_args import ServerArgs
 

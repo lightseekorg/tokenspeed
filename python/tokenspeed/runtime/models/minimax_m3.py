@@ -36,11 +36,12 @@ from tokenspeed_kernel.thirdparty.cuda.minimax_m3_fused import (
     fused_qknorm_rope_kv_insert,
 )
 from torch import nn
-from transformers import MiniMaxM3VLTextConfig
 
+from tokenspeed.runtime.configs.base_config import get_rope_parameters
 from tokenspeed.runtime.configs.minimax_m3_config import (
     MiniMaxM3Config,
     MiniMaxM3VisionConfig,
+    MiniMaxM3VLTextConfig,
 )
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
@@ -525,13 +526,14 @@ class MiniMaxM3Indexer(nn.Module):
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        rope_type = (config.rope_parameters or {}).get("rope_type", "default")
+        rope_parameters = get_rope_parameters(config)
+        rope_type = rope_parameters.get("rope_type", "default")
         assert rope_type == "default", f"RoPE type {rope_type} is not supported."
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=config.rotary_dim,
             max_position=config.max_position_embeddings,
-            base=int(config.rope_parameters["rope_theta"]),
+            base=int(rope_parameters.get("rope_theta")),
         )
 
     def forward(
@@ -631,13 +633,14 @@ class MiniMaxM3Attention(nn.Module):
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        rope_type = (config.rope_parameters or {}).get("rope_type", "default")
+        rope_parameters = get_rope_parameters(config)
+        rope_type = rope_parameters.get("rope_type", "default")
         assert rope_type == "default", f"RoPE type {rope_type} is not supported."
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=config.rotary_dim,
             max_position=config.max_position_embeddings,
-            base=int(config.rope_parameters["rope_theta"]),
+            base=int(rope_parameters.get("rope_theta")),
         )
         self.indexer = (
             MiniMaxM3Indexer(config=config, mapping=mapping) if self.is_sparse else None
@@ -1290,7 +1293,7 @@ class MiniMaxM3VisionTransformer(nn.Module):
         rotary_dims = 2 * (head_dim // 2)
         self.axis_dim = 2 * ((rotary_dims // 3) // 2)
         inv_freq = 1.0 / (
-            config.rope_parameters["rope_theta"]
+            get_rope_parameters(config).get("rope_theta")
             ** (torch.arange(0, self.axis_dim, 2, dtype=torch.float32) / self.axis_dim)
         )
         self.register_buffer("inv_freq", inv_freq, persistent=False)

@@ -29,8 +29,8 @@ import torch
 from tokenspeed_kernel.ops.layernorm import qk_rmsnorm
 from torch import nn
 
+from tokenspeed.runtime.configs.base_config import get_rope_theta
 from tokenspeed.runtime.configs.qwen3_config import Qwen3Config
-from tokenspeed.runtime.configs.utils import get_rope_theta
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext

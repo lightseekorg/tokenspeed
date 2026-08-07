@@ -20,6 +20,8 @@
 
 """Qwen3 MoE model configuration definitions."""
 
+from dataclasses import field
+
 from tokenspeed.runtime.configs.qwen3_config import Qwen3Config
 
 
@@ -28,29 +30,22 @@ class Qwen3MoeConfig(Qwen3Config):
 
     model_type = "qwen3_moe"
 
-    def __init__(
-        self,
-        decoder_sparse_step=1,
-        moe_intermediate_size=768,
-        shared_expert_intermediate_size=0,
-        num_experts_per_tok=8,
-        num_experts=128,
-        norm_topk_prob=True,
-        output_router_logits=False,
-        router_aux_loss_coef=0.001,
-        mlp_only_layers=None,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
-        self.decoder_sparse_step = decoder_sparse_step
-        self.moe_intermediate_size = moe_intermediate_size
-        self.shared_expert_intermediate_size = shared_expert_intermediate_size
-        self.num_experts_per_tok = num_experts_per_tok
-        self.num_experts = num_experts
-        self.norm_topk_prob = norm_topk_prob
-        self.output_router_logits = output_router_logits
-        self.router_aux_loss_coef = router_aux_loss_coef
-        self.mlp_only_layers = [] if mlp_only_layers is None else mlp_only_layers
+    decoder_sparse_step: int = 1
+    moe_intermediate_size: int = 768
+    shared_expert_intermediate_size: int = 0
+    num_experts_per_tok: int = 8
+    num_experts: int = 128
+    norm_topk_prob: bool = True
+    output_router_logits: bool = False
+    router_aux_loss_coef: float = 0.001
+    mlp_only_layers: list = field(default_factory=list)
+
+    def __post_init__(self, **kwargs):
+        self.mlp_only_layers = (
+            [] if self.mlp_only_layers is None else self.mlp_only_layers
+        )
+
+        super().__post_init__(**kwargs)
 
 
 __all__ = ["Qwen3MoeConfig"]
