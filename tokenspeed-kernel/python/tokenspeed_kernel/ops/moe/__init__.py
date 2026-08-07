@@ -270,6 +270,9 @@ def moe_plan(
     supports_deferred_finalize = True in apply_spec.traits.get(
         "supports_deferred_finalize", frozenset({False})
     )
+    supports_moe_lora = True in apply_spec.traits.get(
+        "supports_moe_lora", frozenset({False})
+    )
     return {
         "weight_dtype": weight_dtype,
         "activation": activation,
@@ -283,6 +286,7 @@ def moe_plan(
         ),
         "support_routing": support_routing,
         "supports_deferred_finalize": supports_deferred_finalize,
+        "supports_moe_lora": supports_moe_lora,
         "solution": apply_spec.solution,
         "internal_activation_dtype": internal_activation_dtype,
     }

@@ -209,6 +209,75 @@ def _validate(
 
 
 @triton.jit
+def _gate_up_activation(
+    gate_acc,
+    up_acc,
+    situ_beta,
+    situ_linear_beta,
+    DTYPE: tl.constexpr,
+    ACTIVATION: tl.constexpr,
+    HAS_LINEAR_BETA: tl.constexpr,
+):
+    """Combine pre-activation gate/up accumulators into the intermediate value.
+
+    Shared by the fused stage-1 store and by _activate_kernel, which runs on the
+    un-fused MoE LoRA path. Keeping one definition is the point: the two paths
+    must agree bit for bit, and the situ branch's round trip through DTYPE is
+    easy to drop when the expression is written out twice.
+    """
+    if ACTIVATION == "situ":
+        gate = gate_acc.to(DTYPE).to(tl.float32)
+        up = up_acc.to(DTYPE).to(tl.float32)
+        gate = situ_beta * libdevice.tanh(gate / situ_beta) * tl.sigmoid(gate)
+        if HAS_LINEAR_BETA:
+            up = situ_linear_beta * libdevice.tanh(up / situ_linear_beta)
+        return (gate * up).to(DTYPE)
+    return (gate_acc * tl.sigmoid(gate_acc) * up_acc).to(DTYPE)
+
+
+@triton.jit
+def _activate_kernel(
+    gate_up_ptr,
+    inter_ptr,
+    route_count,
+    intermediate_size: tl.constexpr,
+    situ_beta,
+    situ_linear_beta,
+    DTYPE: tl.constexpr,
+    ACTIVATION: tl.constexpr,
+    HAS_LINEAR_BETA: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Activate a (route_count, 2I) gate/up buffer into (route_count, I).
+
+    Only used when MoE LoRA is attached: the LoRA delta has to land on the
+    pre-activation gate/up values, so stage 1 stores them raw and the activation
+    happens here instead.
+    """
+    pid = tl.program_id(0)
+    row = pid // tl.cdiv(intermediate_size, BLOCK)
+    col_block = pid % tl.cdiv(intermediate_size, BLOCK)
+    if row < route_count:
+        cols = col_block * BLOCK + tl.arange(0, BLOCK)
+        col_mask = cols < intermediate_size
+        gate_up_row = gate_up_ptr + row * (2 * intermediate_size)
+        gate_acc = tl.load(gate_up_row + cols, mask=col_mask, other=0.0).to(tl.float32)
+        up_acc = tl.load(
+            gate_up_row + intermediate_size + cols, mask=col_mask, other=0.0
+        ).to(tl.float32)
+        activated = _gate_up_activation(
+            gate_acc,
+            up_acc,
+            situ_beta,
+            situ_linear_beta,
+            DTYPE,
+            ACTIVATION,
+            HAS_LINEAR_BETA,
+        )
+        tl.store(inter_ptr + row * intermediate_size + cols, activated, mask=col_mask)
+
+
+@triton.jit
 def _stage1_kernel(
     x_desc,
     w13_desc,
@@ -222,8 +291,10 @@ def _stage1_kernel(
     top_k: tl.constexpr,
     situ_beta,
     situ_linear_beta,
+    gate_up_ptr,
     ACTIVATION: tl.constexpr,
     HAS_LINEAR_BETA: tl.constexpr,
+    STORE_PREACT: tl.constexpr,
     NUM_PROGRAMS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -266,21 +337,42 @@ def _stage1_kernel(
                 gate_acc += tl.dot(x, gate.T)
                 up_acc += tl.dot(x, up.T)
 
-            if ACTIVATION == "situ":
-                gate = gate_acc.to(x_desc.dtype).to(tl.float32)
-                up = up_acc.to(x_desc.dtype).to(tl.float32)
-                gate = situ_beta * libdevice.tanh(gate / situ_beta) * tl.sigmoid(gate)
-                if HAS_LINEAR_BETA:
-                    up = situ_linear_beta * libdevice.tanh(up / situ_linear_beta)
-                activated = (gate * up).to(x_desc.dtype)
+            if STORE_PREACT:
+                # MoE LoRA path: hand the raw gate/up accumulators out so the
+                # LoRA delta can be added before the activation, then let
+                # _activate_kernel finish the job. Gate occupies columns
+                # [0, I) and up [I, 2I), matching w13's [E, 2I, H] layout.
+                gate_up_offsets = (
+                    route_ids[:, None] * (2 * intermediate_size)
+                    + n_offset
+                    + tl.arange(0, BLOCK_N)[None, :]
+                )
+                tl.store(
+                    gate_up_ptr + gate_up_offsets,
+                    gate_acc.to(x_desc.dtype),
+                    mask=row_mask[:, None],
+                )
+                tl.store(
+                    gate_up_ptr + gate_up_offsets + intermediate_size,
+                    up_acc.to(x_desc.dtype),
+                    mask=row_mask[:, None],
+                )
             else:
-                activated = (gate_acc * tl.sigmoid(gate_acc) * up_acc).to(x_desc.dtype)
-            inter_offsets = (
-                route_ids[:, None] * intermediate_size
-                + n_offset
-                + tl.arange(0, BLOCK_N)[None, :]
-            )
-            tl.store(inter_ptr + inter_offsets, activated, mask=row_mask[:, None])
+                activated = _gate_up_activation(
+                    gate_acc,
+                    up_acc,
+                    situ_beta,
+                    situ_linear_beta,
+                    x_desc.dtype,
+                    ACTIVATION,
+                    HAS_LINEAR_BETA,
+                )
+                inter_offsets = (
+                    route_ids[:, None] * intermediate_size
+                    + n_offset
+                    + tl.arange(0, BLOCK_N)[None, :]
+                )
+                tl.store(inter_ptr + inter_offsets, activated, mask=row_mask[:, None])
             tile_idx += NUM_PROGRAMS
 
         problem_start += problem_tiles
@@ -364,6 +456,8 @@ def _moe(
     activation: str,
     situ_beta: float,
     situ_linear_beta: float | None,
+    moe_lora_ctx=None,
+    layer_index: int = 0,
 ) -> torch.Tensor:
     num_tokens, hidden_size = x.shape
     num_experts, twice_intermediate_size, _ = w13.shape
@@ -376,6 +470,17 @@ def _moe(
     route_count = num_tokens * top_k
     intermediate = torch.empty(
         (route_count, intermediate_size), device=x.device, dtype=x.dtype
+    )
+    # With LoRA attached the activation moves out of stage 1 so the delta can be
+    # added to the pre-activation gate/up values. Costs one (route_count, 2I)
+    # buffer and an extra pass; the LoRA-free path is unchanged.
+    apply_lora = moe_lora_ctx is not None
+    gate_up = (
+        torch.empty(
+            (route_count, 2 * intermediate_size), device=x.device, dtype=x.dtype
+        )
+        if apply_lora
+        else None
     )
     # Invalid expert ids are absent from routing; zero their canonical rows.
     route_output = torch.zeros(
@@ -410,8 +515,10 @@ def _moe(
         top_k=top_k,
         situ_beta=situ_beta,
         situ_linear_beta=(1.0 if situ_linear_beta is None else situ_linear_beta),
+        gate_up_ptr=gate_up,
         ACTIVATION=activation,
         HAS_LINEAR_BETA=situ_linear_beta is not None,
+        STORE_PREACT=apply_lora,
         NUM_PROGRAMS=stage1_programs,
         BLOCK_M=block_m,
         BLOCK_N=stage1_block_n,
@@ -419,6 +526,26 @@ def _moe(
         num_warps=4 if block_m == 16 else 8,
         num_stages=3,
     )
+    if apply_lora:
+        # topk_ids is (num_tokens, top_k) and gate_up is indexed by the same
+        # canonical tok * top_k + k slot the LoRA kernels use, so the flat-pair
+        # entry points apply directly -- no gathered-layout bridging needed.
+        moe_lora_ctx.apply_gate_up_lora(layer_index, x, topk_ids, gate_up)
+        activate_block = 256 if intermediate_size >= 256 else 64
+        activate_programs = route_count * triton.cdiv(intermediate_size, activate_block)
+        _activate_kernel[(activate_programs,)](
+            gate_up,
+            intermediate,
+            route_count,
+            intermediate_size=intermediate_size,
+            situ_beta=situ_beta,
+            situ_linear_beta=(1.0 if situ_linear_beta is None else situ_linear_beta),
+            DTYPE=intermediate.dtype,
+            ACTIVATION=activation,
+            HAS_LINEAR_BETA=situ_linear_beta is not None,
+            BLOCK=activate_block,
+            num_warps=4,
+        )
     _stage2_kernel[(stage2_programs,)](
         intermediate,
         w2_desc,
@@ -438,6 +565,12 @@ def _moe(
         num_stages=3,
     )
     _combine(route_output, topk_weights, output)
+    if apply_lora:
+        # Applied after the combine because apply_down_lora does its own top-k
+        # weighting and accumulates straight into the token-major output.
+        moe_lora_ctx.apply_down_lora(
+            layer_index, intermediate, topk_ids, topk_weights, output
+        )
     return output
 
 
@@ -462,6 +595,7 @@ def _moe(
         "ispp_alignment": frozenset({32}),
         "internal_activation_dtype": frozenset({"input"}),
         "supports_bias": frozenset({False}),
+        "supports_moe_lora": frozenset({True}),
     },
     priority=Priority.PORTABLE,
 )
@@ -507,4 +641,7 @@ def triton_bf16_precomputed_moe_apply(
         activation,
         float(getattr(w, "activation_situ_beta", 1.0) or 1.0),
         getattr(w, "activation_situ_linear_beta", None),
+        # Stashed on the module by MoELayer.forward when an adapter is active.
+        moe_lora_ctx=getattr(w, "_moe_lora_ctx", None),
+        layer_index=getattr(w, "layer_index", 0),
     )
