@@ -71,6 +71,21 @@ def test_cuda_install_requires_include_runtime_dependencies(monkeypatch) -> None
     assert requirements["nvidia-cutlass-dsl"].extras == {"cu13"}
 
 
+def test_cuda_thirdparty_requirements_are_exactly_pinned() -> None:
+    requirements = _requirements_by_name(
+        _direct_requirements(REQUIREMENTS_DIR / "cuda-thirdparty.txt")
+    )
+
+    not_exactly_pinned = sorted(
+        name
+        for name, requirement in requirements.items()
+        if {specifier.operator for specifier in requirement.specifier} != {"=="}
+    )
+    assert (
+        not not_exactly_pinned
+    ), f"CUDA third-party requirements must use ==: {not_exactly_pinned}"
+
+
 def test_rocm_install_requires_exclude_cuda_dependencies(monkeypatch) -> None:
     install_requires = _capture_install_requires(monkeypatch, "rocm")
 
