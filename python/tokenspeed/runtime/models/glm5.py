@@ -598,8 +598,10 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         topk_lens_slice = topk_lens[decode_start : decode_start + num_decode_tokens]
 
         metadata = ctx.attn_backend.forward_decode_metadata
+        # _dsa_seq_lens_2d is per-token ([bs * q_len_per_req, 1]); skip the extend
+        # requests' per-token rows to align with this decode window.
         seq_lens_2d = (
-            metadata._dsa_seq_lens_2d[ctx.num_extends :]
+            metadata._dsa_seq_lens_2d[ctx.num_extends * q_len_per_req :]
             if q_len_per_req > 1
             else seq_lens.unsqueeze(1)
         )
@@ -641,8 +643,10 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 f"metadata={int(extend_lens.sum().item())}, "
                 f"tokens={num_prefill_tokens}"
             )
-        if ctx.req_to_page is None:
-            raise RuntimeError("GLM DSA sparse prefill requires req_to_page metadata")
+        if chunk_meta.block_tables is None:
+            raise RuntimeError(
+                "GLM DSA sparse prefill requires the chunked-prefill block tables"
+            )
 
         topk = self.index_topk
         page_size = ctx.token_to_kv_pool.page_size

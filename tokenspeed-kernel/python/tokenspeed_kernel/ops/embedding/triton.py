@@ -611,6 +611,170 @@ def _fp8_quantize(
     )
 
 
+@triton.jit
+def _mla_nope_quantize_fp8_kernel(
+    q_nope,
+    q_rope,
+    k_nope,
+    k_rope,
+    q_nope_out,
+    q_rope_out,
+    k_nope_out,
+    k_rope_out,
+    scale_q,
+    scale_kv,
+    qn_stride_t,
+    qn_stride_h,
+    qr_stride_t,
+    qr_stride_h,
+    kn_stride_t,
+    kn_stride_h,
+    kr_stride_t,
+    kr_stride_h,
+    qno_stride_t,
+    qno_stride_h,
+    qro_stride_t,
+    qro_stride_h,
+    kno_stride_t,
+    kno_stride_h,
+    kro_stride_t,
+    kro_stride_h,
+    nope_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    HAS_SCALE_Q_TENSOR: tl.constexpr,
+    HAS_SCALE_KV_TENSOR: tl.constexpr,
+):
+    token = tl.program_id(0)
+    head = tl.program_id(1)
+    if HAS_SCALE_Q_TENSOR:
+        scale_q = tl.load(scale_q)
+    if HAS_SCALE_KV_TENSOR:
+        scale_kv = tl.load(scale_kv)
+
+    offs_n = tl.arange(0, BLOCK_N)
+    mask_n = offs_n < nope_dim
+    offs_r = tl.arange(0, BLOCK_R)
+    mask_r = offs_r < rope_dim
+
+    qn = tl.load(
+        q_nope + token * qn_stride_t + head * qn_stride_h + offs_n,
+        mask=mask_n,
+        other=0.0,
+    ).to(tl.float32)
+    tl.store(
+        q_nope_out + token * qno_stride_t + head * qno_stride_h + offs_n,
+        (qn * scale_q).to(tl.float8e4nv),
+        mask=mask_n,
+    )
+    qr = tl.load(
+        q_rope + token * qr_stride_t + head * qr_stride_h + offs_r,
+        mask=mask_r,
+        other=0.0,
+    ).to(tl.float32)
+    tl.store(
+        q_rope_out + token * qro_stride_t + head * qro_stride_h + offs_r,
+        (qr * scale_q).to(tl.float8e4nv),
+        mask=mask_r,
+    )
+
+    kn = tl.load(
+        k_nope + token * kn_stride_t + head * kn_stride_h + offs_n,
+        mask=mask_n,
+        other=0.0,
+    ).to(tl.float32)
+    tl.store(
+        k_nope_out + token * kno_stride_t + head * kno_stride_h + offs_n,
+        (kn * scale_kv).to(tl.float8e4nv),
+        mask=mask_n,
+    )
+    kr = tl.load(
+        k_rope + token * kr_stride_t + head * kr_stride_h + offs_r,
+        mask=mask_r,
+        other=0.0,
+    ).to(tl.float32)
+    tl.store(
+        k_rope_out + token * kro_stride_t + head * kro_stride_h + offs_r,
+        (kr * scale_kv).to(tl.float8e4nv),
+        mask=mask_r,
+    )
+
+
+def mla_nope_quantize_fp8_triton(
+    *,
+    q_rope: torch.Tensor,
+    k_rope: torch.Tensor,
+    q_nope: torch.Tensor,
+    k_nope: torch.Tensor,
+    q_rope_out: torch.Tensor,
+    k_rope_out: torch.Tensor,
+    q_nope_out: torch.Tensor,
+    k_nope_out: torch.Tensor,
+    quant_scale_q: float | torch.Tensor = 1.0,
+    quant_scale_kv: float | torch.Tensor = 1.0,
+    enable_pdl: bool = False,
+) -> None:
+    """The no-RoPE tail of apply_rope_mla: quantize the four query/key parts
+    straight into their FP8 output slices in one launch. ``k_rope`` may carry
+    a single head; it broadcasts across the output heads via a zero stride."""
+    num_tokens, num_heads, nope_dim = q_nope.shape
+    rope_dim = q_rope.shape[-1]
+    if k_nope.shape != q_nope.shape:
+        raise ValueError(f"k_nope {k_nope.shape} must match q_nope {q_nope.shape}")
+    if k_rope.shape[1] not in (1, num_heads):
+        raise ValueError(
+            f"k_rope heads must be 1 or {num_heads}, got {k_rope.shape[1]}"
+        )
+    if k_rope_out.shape[1] != num_heads:
+        # A one-head k_rope broadcasts on load, but every output slice must
+        # carry the full head count -- the grid writes all heads.
+        raise ValueError(
+            f"k_rope_out must carry {num_heads} heads, got {k_rope_out.shape[1]}"
+        )
+    if isinstance(quant_scale_q, torch.Tensor):
+        quant_scale_q = quant_scale_q.contiguous()
+    if isinstance(quant_scale_kv, torch.Tensor):
+        quant_scale_kv = quant_scale_kv.contiguous()
+
+    extra_kwargs = {"launch_pdl": True} if enable_pdl else {}
+    _mla_nope_quantize_fp8_kernel[(num_tokens, num_heads)](
+        q_nope,
+        q_rope,
+        k_nope,
+        k_rope,
+        q_nope_out,
+        q_rope_out,
+        k_nope_out,
+        k_rope_out,
+        quant_scale_q,
+        quant_scale_kv,
+        q_nope.stride(0),
+        q_nope.stride(1),
+        q_rope.stride(0),
+        q_rope.stride(1),
+        k_nope.stride(0),
+        k_nope.stride(1),
+        k_rope.stride(0),
+        0 if k_rope.shape[1] == 1 else k_rope.stride(1),
+        q_nope_out.stride(0),
+        q_nope_out.stride(1),
+        q_rope_out.stride(0),
+        q_rope_out.stride(1),
+        k_nope_out.stride(0),
+        k_nope_out.stride(1),
+        k_rope_out.stride(0),
+        k_rope_out.stride(1),
+        nope_dim=nope_dim,
+        rope_dim=rope_dim,
+        BLOCK_N=max(16, _next_power_of_2(nope_dim)),
+        BLOCK_R=max(16, _next_power_of_2(rope_dim)),
+        HAS_SCALE_Q_TENSOR=isinstance(quant_scale_q, torch.Tensor),
+        HAS_SCALE_KV_TENSOR=isinstance(quant_scale_kv, torch.Tensor),
+        **extra_kwargs,
+    )
+
+
 def mla_rope_quantize_fp8_triton(
     *,
     positions: torch.Tensor,
@@ -707,6 +871,59 @@ def triton_embedding_rope(
 @register_kernel(
     "embedding",
     "rope_mla",
+    name="triton_embedding_nope_mla",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
+    signatures=format_signatures(
+        ("q_rope", "k_rope", "q_nope", "k_nope"),
+        "dense",
+        {torch.float16, torch.bfloat16},
+    ),
+    priority=Priority.PORTABLE,
+    traits={
+        "has_rope": frozenset({False}),
+        "is_neox": frozenset({True, False}),
+        "quantize_dtype": frozenset({torch.float8_e4m3fn}),
+        "has_scale_q_tensor": frozenset({True, False}),
+        "has_scale_kv_tensor": frozenset({True, False}),
+    },
+    tags={"portability"},
+)
+def triton_embedding_nope_mla(
+    *,
+    positions: torch.Tensor,
+    q_rope: torch.Tensor,
+    k_rope: torch.Tensor,
+    q_nope: torch.Tensor,
+    k_nope: torch.Tensor,
+    cos_sin_cache: torch.Tensor | None,
+    q_rope_out: torch.Tensor,
+    k_rope_out: torch.Tensor,
+    q_nope_out: torch.Tensor,
+    k_nope_out: torch.Tensor,
+    is_neox: bool = True,
+    quant_scale_q: float | torch.Tensor = 1.0,
+    quant_scale_kv: float | torch.Tensor = 1.0,
+    enable_pdl: bool = False,
+) -> None:
+    mla_nope_quantize_fp8_triton(
+        q_rope=q_rope,
+        k_rope=k_rope,
+        q_nope=q_nope,
+        k_nope=k_nope,
+        q_rope_out=q_rope_out,
+        k_rope_out=k_rope_out,
+        q_nope_out=q_nope_out,
+        k_nope_out=k_nope_out,
+        quant_scale_q=quant_scale_q,
+        quant_scale_kv=quant_scale_kv,
+        enable_pdl=enable_pdl,
+    )
+
+
+@register_kernel(
+    "embedding",
+    "rope_mla",
     name="triton_embedding_rope_mla",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
@@ -717,6 +934,7 @@ def triton_embedding_rope(
     ),
     priority=Priority.PORTABLE,
     traits={
+        "has_rope": frozenset({True}),
         "is_neox": frozenset({True, False}),
         "quantize_dtype": frozenset({torch.float8_e4m3fn}),
         "has_scale_q_tensor": frozenset({True, False}),

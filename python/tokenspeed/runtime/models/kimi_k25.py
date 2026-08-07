@@ -102,6 +102,7 @@ class KimiK25ForConditionalGeneration(torch.nn.Module):
                 target_dtype = self.language_model.dtype
                 self.vision = self.vision.to(dtype=target_dtype)
 
+            # image_encoder may be swapped to a cudagraph wrapper during startup.
             self.vision_embedder = VisionEmbedder(encoder_mapping=mapping.vision)
             self.image_encoder = self.vision.embed_media
         else:
@@ -122,6 +123,16 @@ class KimiK25ForConditionalGeneration(torch.nn.Module):
         if self.vision is None:
             raise RuntimeError("Kimi-K2.5 multimodal path is not initialized.")
         return self.vision.embed_media(items)
+
+    def get_multimodal_encoder_specs(self) -> dict[Modality, EncoderSpec]:
+        if self.vision is None or self.image_encoder is None:
+            return {}
+        return {
+            Modality.IMAGE: EncoderSpec(
+                self.image_encoder,
+                make_warmup_items=self.vision.make_image_warmup_items,
+            )
+        }
 
     def make_encoder_cudagraph_wrapper(self, mapping: Mapping):
         if self.vision is None:
@@ -175,7 +186,7 @@ class KimiK25ForConditionalGeneration(torch.nn.Module):
             input_ids=input_ids,
             text_embedding=self.get_input_embeddings(),
             ctx=multimodal_context,
-            encoders={Modality.IMAGE: EncoderSpec(self.image_encoder)},
+            encoders=self.get_multimodal_encoder_specs(),
             multimodal_model=self,
         )
         assert not model_kwargs, "Kimi-K2.5 multimodal path must stay embeds-only"

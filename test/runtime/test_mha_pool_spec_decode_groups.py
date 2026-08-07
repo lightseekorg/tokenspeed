@@ -36,21 +36,54 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
         self.MHATokenToKVPool = MHATokenToKVPool
 
     def _pool(self, **overrides):
-        kwargs = dict(
-            size=32,
-            dtype=self.torch.bfloat16,
-            head_num=1,
-            head_dim=8,
-            layer_num=2,
-            device="cpu",
-            enable_memory_saver=False,
-            max_batch_size=2,
-            max_context_len=64,
-            page_size=16,
-            rank=0,
-            enable_alt_stream=False,
-        )
+        from cache_pool_test_utils import make_mha_memory_plan
+
+        kwargs = {
+            "size": 32,
+            "dtype": self.torch.bfloat16,
+            "head_num": 1,
+            "head_dim": 8,
+            "layer_num": 2,
+            "device": "cpu",
+            "enable_memory_saver": False,
+            "page_size": 16,
+            "rank": 0,
+        }
         kwargs.update(overrides)
+        from cache_pool_test_utils import make_layer_group_ids
+
+        kwargs["memory_plan"] = make_mha_memory_plan(
+            size=kwargs["size"],
+            page_size=kwargs["page_size"],
+            layer_num=kwargs["layer_num"],
+            kv_heads=kwargs["head_num"],
+            head_dim=kwargs["head_dim"],
+            dtype=kwargs["dtype"],
+            layer_types=kwargs.get("layer_types", ()),
+            sliding_window_tokens=kwargs.get("sliding_window_tokens"),
+        )
+        kwargs.setdefault(
+            "layer_group_ids",
+            make_layer_group_ids(
+                layer_num=kwargs["layer_num"],
+                layer_types=kwargs.get("layer_types", ()),
+                sliding_window_tokens=kwargs.get("sliding_window_tokens"),
+            ),
+        )
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+            build_paged_cache_group_specs,
+        )
+
+        kwargs.setdefault(
+            "paged_cache_group_specs",
+            build_paged_cache_group_specs(
+                layer_types=kwargs.get("layer_types", ()),
+                group_ids=kwargs["layer_group_ids"],
+                sliding_window_tokens=kwargs.get("sliding_window_tokens"),
+                page_size=kwargs["page_size"],
+            ),
+        )
+        kwargs.pop("sliding_window_tokens", None)
         return self.MHATokenToKVPool(**kwargs)
 
     def test_plain_no_spec_publishes_single_full_group(self):
@@ -62,6 +95,11 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
         self.assertEqual(spec.group_id, "full_attention")
         self.assertEqual(spec.retention, "full_history")
         self.assertIn("full_attention", pool.paged_cache_group_page_counts)
+        self.assertIsNotNone(pool.buffer)
+        self.assertEqual(
+            pool.k_buffer[0].untyped_storage().data_ptr(),
+            pool.buffer.untyped_storage().data_ptr(),
+        )
 
     def test_hybrid_no_spec_publishes_two_groups(self):
         # layer_num must match len(layer_types): the M12 slab layout's

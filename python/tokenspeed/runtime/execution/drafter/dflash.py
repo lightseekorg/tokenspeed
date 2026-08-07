@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
@@ -58,7 +59,7 @@ class DFlash(BaseDrafter):
         spec_num_steps: int,
         page_size: int,
         draft_model_runner: ModelRunner | None = None,
-        req_to_page: torch.Tensor | None = None,
+        page_table: torch.Tensor | None = None,
         attn_backend=None,
         token_to_kv_pool=None,
         runtime_states: RuntimeStates | None = None,
@@ -72,7 +73,7 @@ class DFlash(BaseDrafter):
             runtime_states=runtime_states,
             input_buffers=input_buffers,
             page_size=page_size,
-            req_to_page=req_to_page,
+            page_table=page_table,
             attn_backend=attn_backend,
             token_to_kv_pool=token_to_kv_pool,
             vocab_size=vocab_size,
@@ -88,16 +89,22 @@ class DFlash(BaseDrafter):
 
         cfg = self.model.config
         dflash_cfg = getattr(cfg, "dflash_config", {}) or {}
-        self.target_layer_ids = [int(x) for x in dflash_cfg.get("target_layer_ids", [])]
+        target_layer_ids = dflash_cfg.get("target_layer_ids") or getattr(
+            cfg, "target_layer_ids", None
+        )
+        self.target_layer_ids = [int(x) for x in (target_layer_ids or [])]
         if not self.target_layer_ids:
             raise ValueError(
                 "DFLASH draft config must define dflash_config.target_layer_ids."
             )
-        if "mask_token_id" not in dflash_cfg:
+        mask_token_id = dflash_cfg.get("mask_token_id")
+        if mask_token_id is None:
+            mask_token_id = getattr(cfg, "mask_token_id", None)
+        if mask_token_id is None:
             raise ValueError(
                 "DFLASH draft config must define dflash_config.mask_token_id."
             )
-        self.mask_token_id = int(dflash_cfg["mask_token_id"])
+        self.mask_token_id = int(mask_token_id)
         self.block_size = int(getattr(cfg, "block_size", spec_num_tokens))
         if self.block_size != int(spec_num_tokens):
             logger.warning(
@@ -118,8 +125,8 @@ class DFlash(BaseDrafter):
     def _init_native_buffers(self) -> None:
         if self.input_buffers is None:
             raise ValueError("Native DFLASH requires input buffers.")
-        if self.req_to_page is None:
-            raise ValueError("Native DFLASH requires req_to_page.")
+        if self.page_table is None:
+            raise ValueError("Native DFLASH requires page_table.")
         if self.attn_backend is None or self.token_to_kv_pool is None:
             raise ValueError("Native DFLASH requires draft attention components.")
 
@@ -235,6 +242,15 @@ class DFlash(BaseDrafter):
         hidden_states: torch.Tensor,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        return self._greedy_argmax_vocab_parallel(hidden_states, out=out)
+
+    def _greedy_argmax_vocab_parallel(
+        self,
+        hidden_states: torch.Tensor,
+        out: torch.Tensor | None = None,
+        bias_fn: "Callable[[int, int], torch.Tensor] | None" = None,
+    ) -> torch.Tensor:
+        """Shared vocab-parallel greedy argmax primitive."""
         if not hasattr(self.lm_head, "weight") or not hasattr(
             self.lm_head, "shard_indices"
         ):
@@ -242,6 +258,8 @@ class DFlash(BaseDrafter):
             logits = self.logits_processor._get_logits(
                 hidden_states, self.lm_head, metadata
             )
+            if bias_fn is not None:
+                logits = logits + bias_fn(0, int(logits.shape[-1])).to(logits.dtype)
             argmax = torch.argmax(logits, dim=-1)
             if out is not None:
                 out.copy_(argmax.view_as(out))
@@ -261,6 +279,10 @@ class DFlash(BaseDrafter):
         chunk_len = int(hidden_states.shape[0])
         if num_org > 0:
             base_logits = torch.matmul(hidden_states, weight[:num_org].T)
+            if bias_fn is not None:
+                base_logits = base_logits + bias_fn(org_vocab_start, num_org).to(
+                    base_logits.dtype
+                )
             local_max, local_arg = torch.max(base_logits, dim=-1)
         else:
             local_max = torch.full(
@@ -278,6 +300,10 @@ class DFlash(BaseDrafter):
             added_end = num_org_padded + num_added
             added_weight = weight[added_start:added_end]
             added_logits = torch.matmul(hidden_states, added_weight.T)
+            if bias_fn is not None:
+                added_logits = added_logits + bias_fn(added_vocab_start, num_added).to(
+                    added_logits.dtype
+                )
             added_max, added_arg = torch.max(added_logits, dim=-1)
             use_added = added_max > local_max
             local_max = torch.where(use_added, added_max, local_max)
@@ -836,10 +862,9 @@ class DFlash(BaseDrafter):
 
             compute_out_cache_loc_uniform(
                 out_cache_loc_ptr=cache_locs,
-                req_pool_indices=req_pool_indices,
                 uniform_input_length=self.spec_num_tokens,
                 cache_start=prefix_lens,
-                req_to_pages=self.req_to_page,
+                page_table=self.page_table,
                 page_size=self.page_size,
             )
 
@@ -852,7 +877,7 @@ class DFlash(BaseDrafter):
                 num_extends=bs,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens_after,
-                req_to_page=self.req_to_page,
+                page_table=self.page_table,
                 forward_mode=ForwardMode.DECODE,
                 extend_seq_lens=None,
                 extend_seq_lens_cpu=self.draft_extend_seq_lens_cpu[:bs],
@@ -865,7 +890,6 @@ class DFlash(BaseDrafter):
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
-            req_to_page=self.req_to_page,
             bs=bs,
             num_extends=bs,
             input_num_tokens=bs * self.spec_num_tokens,
@@ -895,6 +919,15 @@ class DFlash(BaseDrafter):
         draft_hidden = draft_hidden.view(bs, self.spec_num_tokens, self.hidden_size)
 
         next_tokens = self.next_tokens_buf[:bs]
+        return self._sample_block(draft_hidden, block_ids, next_tokens)
+
+    def _sample_block(
+        self,
+        draft_hidden: torch.Tensor,
+        block_ids: torch.Tensor,
+        next_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sample the block draft tokens from the draft hidden states."""
         next_tokens[:, 0] = block_ids[:, 0]
         self._greedy_sample_from_vocab_parallel_head(
             draft_hidden[:, 1:, :].reshape(-1, self.hidden_size),
@@ -940,14 +973,14 @@ class DFlash(BaseDrafter):
         if base_ctx.num_extends == 0:
             draft_cache_locs = self.draft_out_cache_loc_buf[: bs * self.spec_num_tokens]
             max_draft_prefix = (
-                self.req_to_page.shape[1] * self.page_size - self.spec_num_tokens
+                self.page_table.shape[1] * self.page_size - self.spec_num_tokens
             )
             dflash_prepare_decode(
                 output_tokens=output_tokens,
                 accept_lengths=accept_lengths[:bs],
                 req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
                 valid_cache_lengths=self.runtime_states.valid_cache_lengths,
-                req_to_pages=self.req_to_page,
+                page_table=self.page_table,
                 draft_seq_lens=self.draft_seq_lens_buf[:bs],
                 block_ids=self.block_ids_buf[:bs],
                 block_positions=self.block_positions_buf[:bs],
@@ -985,7 +1018,7 @@ class DFlash(BaseDrafter):
         bs = base_ctx.bs
         req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
         max_draft_prefix = (
-            self.req_to_page.shape[1] * self.page_size - self.spec_num_tokens
+            self.page_table.shape[1] * self.page_size - self.spec_num_tokens
         )
 
         current_tokens = self.block_ids_buf[:bs, 0]
@@ -995,7 +1028,7 @@ class DFlash(BaseDrafter):
             accept_lengths=accept_lengths[:bs],
             req_pool_indices=req_pool_indices,
             valid_cache_lengths=self.runtime_states.valid_cache_lengths,
-            req_to_pages=self.req_to_page,
+            page_table=self.page_table,
             draft_seq_lens=self.draft_seq_lens_buf[:bs],
             block_ids=self.block_ids_buf[:bs],
             block_positions=self.block_positions_buf[:bs],

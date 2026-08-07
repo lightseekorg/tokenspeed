@@ -1,10 +1,13 @@
 import argparse
+import json
 import os
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stderr
 from io import StringIO
 from types import MethodType, SimpleNamespace
+from typing import ClassVar
 from unittest.mock import patch
 
 # CI Registration (parsed via AST, runtime no-op)
@@ -25,18 +28,6 @@ from tokenspeed_kernel.thirdparty.cuda import (
     softplus_sqrt_topk_flash,
 )
 
-from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
-    V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
-    V4_SWA_KV_GROUP_ID,
-    build_v4_cache_specs,
-    deepseek_v4_indexer_fp8_row_bytes,
-    deepseek_v4_indexer_mxfp4_row_bytes,
-    deepseek_v4_nope_dim,
-    deepseek_v4_swa_row_bytes,
-    deepseek_v4_swa_token_stride,
-    v4_compressed_kv_group_id,
-    v4_compressor_state_group_id,
-)
 from tokenspeed.runtime.configs.deepseek_v4_config import DeepseekV4Config
 from tokenspeed.runtime.configs.model_config import (
     AttentionArch,
@@ -50,6 +41,11 @@ from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.execution.cuda_graph_wrapper import (
     CudaGraphWrapper,
     _should_update_mamba_state_after_mtp_verify,
+)
+from tokenspeed.runtime.execution.drafter.deepseek_v4_dspark import (
+    DeepseekV4DSpark,
+    _dspark_decode_position_plan,
+    _dspark_prefill_position_plan,
 )
 from tokenspeed.runtime.execution.drafter.eagle import (
     _advance_draft_forward_metadata_if_supported,
@@ -71,16 +67,32 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     deepseek_v4_compute_global_topk_indices_and_lens,
     fused_qnorm_rope_kv_insert,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
+from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
     DeepseekV4CacheMetadata,
-    DeepseekV4TokenToKVPool,
+    HybridDeepseekV4TokenToKVPool,
     _group_slot_mapping_from_raw,
     _mask_invalid_graph_tokens,
     _split_paged_cache_block_tables_into_v4_metadata,
-    deepseek_v4_cache_layout_from_config,
 )
-from tokenspeed.runtime.layers.attention.registry import (
-    _resolve_draft_cache_cell_size_for_profile,
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
+    build_deepseek_v4_cache_fields,
+    solve_deepseek_v4_memory_layout,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4_cache_spec import (
+    V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
+    V4_SWA_KV_GROUP_ID,
+    build_v4_cache_specs,
+    deepseek_v4_cache_layout_from_config,
+    deepseek_v4_indexer_fp8_row_bytes,
+    deepseek_v4_indexer_mxfp4_row_bytes,
+    deepseek_v4_nope_dim,
+    deepseek_v4_swa_row_bytes,
+    deepseek_v4_swa_token_stride,
+    v4_compressed_kv_group_id,
+    v4_compressor_state_group_id,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    PagedCacheGroupSpec,
 )
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.quantization import QUANTIZATION_METHODS
@@ -88,6 +100,7 @@ from tokenspeed.runtime.models import deepseek_v4 as deepseek_v4_model
 from tokenspeed.runtime.models.deepseek_v4 import (
     DeepseekV4Indexer,
     DeepseekV4MLP,
+    DeepseekV4Model,
     DeepseekV4MoE,
     DeepseekV4MoEGate,
     _deepseek_v4_forward_metadata,
@@ -110,6 +123,21 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     mhc_pre,
     pack_topk_as_router_logits,
 )
+from tokenspeed.runtime.models.deepseek_v4_dspark import (
+    _ATTENTION_CHECKPOINT_TENSORS,
+    DeepseekV4DSparkModel,
+    DeepseekV4ForCausalLMDSpark,
+    _apply_dspark_hc_head,
+    _is_zero_initialized_expert_bias,
+    count_dspark_stages,
+)
+from tokenspeed.runtime.models.deepseek_v4_dspark_ops.attention import (
+    _dspark_output_projection,
+    _quantize_dspark_non_rope,
+    dspark_fp8_quant_dequant,
+    get_dspark_topk_idxs_batched,
+)
+from tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads import _local_vocab_argmax
 from tokenspeed.runtime.models.deepseek_v4_mtp import DeepseekV4ForCausalLMNextN
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import (
@@ -123,6 +151,42 @@ from tokenspeed.runtime.utils.hf_transformers_utils import (
     prefers_deepseek_v4_tokenizer,
 )
 from tokenspeed.runtime.utils.server_args import ServerArgs
+
+
+def _make_planned_deepseek_v4_pool(
+    layout,
+    hf_config,
+    *,
+    num_lcm_blocks: int = 2,
+):
+    fields = build_deepseek_v4_cache_fields(
+        layout,
+        sliding_window=int(hf_config.sliding_window),
+        logical_block_tokens=256,
+    )
+    plan = solve_deepseek_v4_memory_layout(fields).with_num_lcm_blocks(num_lcm_blocks)
+    max_packing = max(group.cache_blocks_per_lcm_block for group in plan.groups)
+    pool_size = num_lcm_blocks * max_packing * plan.logical_block_tokens
+    specs = tuple(
+        build_v4_cache_specs(
+            hf_config,
+            layer_ratio=layout.layer_ratio,
+        )
+    )
+    pool = HybridDeepseekV4TokenToKVPool(
+        size=pool_size,
+        model_dtype=torch.bfloat16,
+        layout=layout,
+        layer_num=len(layout.layer_ratio),
+        device="cpu",
+        enable_memory_saver=False,
+        page_size=layout.page_size,
+        rank=0,
+        memory_plan=plan,
+        paged_cache_group_specs=specs,
+        token_capacity=pool_size,
+    )
+    return pool, plan
 
 
 def _make_deepseek_v4_forward_metadata(
@@ -264,7 +328,7 @@ def _mhc_post_reference(
 
 
 class TestDeepseekV4Config(unittest.TestCase):
-    quant_config = {
+    quant_config: ClassVar = {
         "quant_method": "fp8",
         "activation_scheme": "dynamic",
         "scale_fmt": "ue8m0",
@@ -694,7 +758,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             actual_bs=0,
             req_pool_indices=torch.zeros(4, dtype=torch.int32),
             seq_lens=torch.ones(4, dtype=torch.int32),
-            req_to_page=torch.zeros((1, 1), dtype=torch.int32),
+            page_table=torch.zeros((1, 1), dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
             paged_cache_block_tables={
                 "v4.swa": torch.zeros((4, 1), dtype=torch.int32),
@@ -727,7 +791,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         wrapper.attn_backend = FakeBackend("target")
         wrapper.draft_attn_backend = FakeBackend("draft")
         wrapper.drafter = SimpleNamespace(
-            req_to_page=torch.zeros((1, 1), dtype=torch.int32),
+            page_table=torch.zeros((1, 1), dtype=torch.int32),
             draft_seq_lens_buf=torch.zeros(4, dtype=torch.int32),
         )
         wrapper.max_tokens_per_req = 4
@@ -740,7 +804,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             actual_bs=2,
             req_pool_indices=torch.zeros(4, dtype=torch.int32),
             seq_lens=torch.ones(4, dtype=torch.int32),
-            req_to_page=torch.zeros((1, 1), dtype=torch.int32),
+            page_table=torch.zeros((1, 1), dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
             paged_cache_block_tables={"v4.swa": table},
             paged_cache_block_table_base_offsets=offsets,
@@ -809,7 +873,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         wrapper.draft_attn_backend = FakeBackend("draft")
         wrapper.max_tokens_per_req = 4
         wrapper.drafter = SimpleNamespace(
-            req_to_page=torch.zeros((1, 1), dtype=torch.int32),
+            page_table=torch.zeros((1, 1), dtype=torch.int32),
             draft_seq_lens_buf=torch.tensor([0, 0], dtype=torch.int32),
         )
         wrapper.use_v4_mtp_paged_metadata = False
@@ -820,7 +884,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             num_extends=2,
             req_pool_indices=torch.zeros(2, dtype=torch.int32),
             seq_lens=seq_lens,
-            req_to_page=torch.zeros((1, 1), dtype=torch.int32),
+            page_table=torch.zeros((1, 1), dtype=torch.int32),
             forward_mode=ForwardMode.EXTEND,
             extend_seq_lens_cpu=torch.tensor([1, 1], dtype=torch.int32),
         )
@@ -833,6 +897,66 @@ class TestDeepseekV4Config(unittest.TestCase):
             wrapper.drafter.draft_seq_lens_buf.data_ptr(),
         )
         self.assertEqual(wrapper.drafter.draft_seq_lens_buf.tolist(), [21, 22])
+
+    def test_cuda_graph_eager_v4_draft_uses_only_its_cache_group_subset(self):
+        captured = {"target": [], "draft": []}
+
+        class FakeBackend:
+            uses_paged_cache_groups = True
+            uses_cache_groups = True
+
+            def __init__(self, key):
+                self.key = key
+
+            def init_forward_metadata(self, *args, **kwargs):
+                captured[self.key].append((args, kwargs))
+
+        target_cache_metadata = object()
+        forward_batch = object()
+        swa_table = torch.ones((1, 1), dtype=torch.int32)
+        state_table = torch.full((1, 1), 2, dtype=torch.int32)
+
+        wrapper = object.__new__(CudaGraphWrapper)
+        wrapper.attn_backend = FakeBackend("target")
+        wrapper.draft_attn_backend = FakeBackend("draft")
+        wrapper.max_tokens_per_req = 4
+        wrapper.drafter = SimpleNamespace(
+            page_table=torch.zeros((1, 1), dtype=torch.int32),
+            draft_seq_lens_buf=torch.zeros(1, dtype=torch.int32),
+        )
+        wrapper.use_v4_mtp_paged_metadata = True
+        wrapper.token_to_kv_pool = SimpleNamespace(
+            paged_cache_group_specs=(
+                SimpleNamespace(group_id="v4.swa_kv", family="history"),
+                SimpleNamespace(group_id="v4.state", family="state"),
+            )
+        )
+        wrapper.draft_token_to_kv_pool = SimpleNamespace(
+            paged_cache_group_specs=(
+                SimpleNamespace(group_id="v4.swa_kv", family="history"),
+            )
+        )
+
+        wrapper._init_forward_metadata(
+            padded_bs=1,
+            num_extends=1,
+            req_pool_indices=torch.zeros(1, dtype=torch.int32),
+            seq_lens=torch.ones(1, dtype=torch.int32),
+            page_table=torch.zeros((1, 1), dtype=torch.int32),
+            forward_mode=ForwardMode.EXTEND,
+            block_tables={"v4.swa_kv": swa_table, "v4.state": state_table},
+            cache_metadata=target_cache_metadata,
+            forward_batch=forward_batch,
+        )
+
+        self.assertIs(captured["target"][0][1]["cache_metadata"], target_cache_metadata)
+        self.assertIs(captured["target"][0][1]["forward_batch"], forward_batch)
+        self.assertEqual(len(captured["draft"]), 2)
+        draft_prefill_kwargs = captured["draft"][0][1]
+        self.assertNotIn("cache_metadata", draft_prefill_kwargs)
+        self.assertNotIn("forward_batch", draft_prefill_kwargs)
+        self.assertEqual(tuple(draft_prefill_kwargs["block_tables"]), ("v4.swa_kv",))
+        self.assertIs(draft_prefill_kwargs["block_tables"]["v4.swa_kv"], swa_table)
 
     def test_cuda_graph_eager_draft_decode_preserves_non_v4_seq_lens_alias(self):
         captured = {"target": [], "draft": []}
@@ -851,7 +975,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         wrapper.draft_attn_backend = FakeBackend("draft")
         wrapper.max_tokens_per_req = 4
         wrapper.drafter = SimpleNamespace(
-            req_to_page=torch.zeros((1, 1), dtype=torch.int32),
+            page_table=torch.zeros((1, 1), dtype=torch.int32),
             draft_seq_lens_buf=torch.tensor([11, 12], dtype=torch.int32),
         )
 
@@ -862,7 +986,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             num_extends=0,
             req_pool_indices=torch.zeros(2, dtype=torch.int32),
             seq_lens=seq_lens,
-            req_to_page=torch.zeros((1, 1), dtype=torch.int32),
+            page_table=torch.zeros((1, 1), dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
         )
 
@@ -879,7 +1003,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             num_extends=0,
             req_pool_indices=torch.zeros(2, dtype=torch.int32),
             seq_lens=seq_lens,
-            req_to_page=torch.zeros((1, 1), dtype=torch.int32),
+            page_table=torch.zeros((1, 1), dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
         )
 
@@ -1161,6 +1285,44 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(build(64).block_size, 256)
         self.assertEqual(build(128).block_size, 128)
 
+    def test_model_config_rejects_prefix_cache_for_external_v4_dspark(self):
+        hf_config = SimpleNamespace(
+            architectures=["DeepseekV4ForCausalLMDSpark"],
+        )
+        server_args = SimpleNamespace(
+            mapping=None,
+            speculative_algorithm="DSPARK",
+            enable_prefix_caching=True,
+        )
+        with (
+            patch(
+                "tokenspeed.runtime.configs.model_config.get_config",
+                return_value=hf_config,
+            ),
+            patch(
+                "tokenspeed.runtime.configs.model_config.get_generation_config",
+                return_value=None,
+            ),
+            patch(
+                "tokenspeed.runtime.configs.model_config.get_hf_text_config",
+                return_value=hf_config,
+            ),
+            patch(
+                "tokenspeed.runtime.models.deepseek_v4_dspark.count_dspark_stages"
+            ) as count_stages,
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "--no-enable-prefix-caching",
+            ):
+                ModelConfig(
+                    "external-draft",
+                    model_override_args="{}",
+                    is_draft_worker=True,
+                    server_args=server_args,
+                )
+        count_stages.assert_not_called()
+
     def test_model_config_keeps_incompatible_user_quantization_error(self):
         model_config = object.__new__(ModelConfig)
         model_config.hf_config = SimpleNamespace(
@@ -1197,7 +1359,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 get_mla_metadata,
             )
             from tokenspeed_kernel.registry import error_fn
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - optional kernel import
             self.skipTest(f"FlashMLA wrapper unavailable: {exc}")
         if (
             flash_mla_with_kvcache is error_fn
@@ -1256,6 +1418,11 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         self.assertTrue(is_deepseek_v4(model_config.hf_config))
         self.assertTrue(is_deepseek_v4_nextn(model_config.hf_config))
+        self.assertTrue(
+            is_deepseek_v4(
+                SimpleNamespace(architectures=["DeepseekV4ForCausalLMDSpark"])
+            )
+        )
 
         configure_deepseek_v4_attention(model_config)
 
@@ -1309,6 +1476,535 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertIsNone(model._map_checkpoint_name("model.layers.43.head.weight"))
         self.assertIsNone(model._map_checkpoint_name("model.layers.1.attn.wq_a.weight"))
 
+    def test_deepseek_v4_mtp_rejects_dspark_checkpoint_during_shard_filter(self):
+        model = object.__new__(DeepseekV4ForCausalLMNextN)
+        model.config = SimpleNamespace(
+            num_hidden_layers=43,
+            num_nextn_predict_layers=1,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "MTP cannot load a DSpark checkpoint",
+        ):
+            model.checkpoint_weight_name_filter("mtp.0.main_proj.weight")
+
+        self.assertTrue(model.checkpoint_weight_name_filter("mtp.0.e_proj.weight"))
+
+    def test_dspark_stage_count_requires_contiguous_namespaces(self):
+        with tempfile.TemporaryDirectory() as model_path:
+            index_path = os.path.join(model_path, "model.safetensors.index.json")
+            with open(index_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "weight_map": {
+                            "mtp.0.main_proj.weight": "a.safetensors",
+                            "mtp.1.attn.wq_a.weight": "b.safetensors",
+                            "mtp.2.norm.weight": "c.safetensors",
+                        }
+                    },
+                    handle,
+                )
+            self.assertEqual(count_dspark_stages(model_path), 3)
+
+            with open(index_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "weight_map": {
+                            "mtp.0.main_proj.weight": "a.safetensors",
+                            "mtp.2.norm.weight": "c.safetensors",
+                        }
+                    },
+                    handle,
+                )
+            with self.assertRaisesRegex(ValueError, "contiguous from zero"):
+                count_dspark_stages(model_path)
+
+    def test_dspark_stage_count_resolves_hub_index(self):
+        with tempfile.TemporaryDirectory() as model_path:
+            index_path = os.path.join(model_path, "model.safetensors.index.json")
+            with open(index_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "weight_map": {
+                            "mtp.0.main_proj.weight": "a.safetensors",
+                            "mtp.1.norm.weight": "b.safetensors",
+                        }
+                    },
+                    handle,
+                )
+            with patch(
+                "huggingface_hub.hf_hub_download",
+                return_value=index_path,
+            ) as download:
+                self.assertEqual(
+                    count_dspark_stages("public/model", revision="revision-a"),
+                    2,
+                )
+
+        download.assert_called_once_with(
+            repo_id="public/model",
+            filename="model.safetensors.index.json",
+            revision="revision-a",
+        )
+
+    def test_dspark_stage_count_fails_closed_when_hub_index_is_unavailable(self):
+        with patch(
+            "huggingface_hub.hf_hub_download",
+            side_effect=OSError("offline"),
+        ):
+            self.assertIsNone(count_dspark_stages("public/model"))
+
+    def test_dspark_checkpoint_name_mapping_is_stage_stable(self):
+        model = object.__new__(DeepseekV4ForCausalLMDSpark)
+        model.model = SimpleNamespace(num_stages=3)
+
+        self.assertEqual(
+            model._map_checkpoint_name("mtp.0.main_proj.scale"),
+            "model.stages.0.main_proj.weight_scale_inv",
+        )
+        self.assertEqual(
+            model._map_checkpoint_name("mtp.1.ffn.experts.7.w1.scale"),
+            "model.stages.1.block.ffn.experts.7.w1.weight_scale",
+        )
+        self.assertEqual(
+            model._map_checkpoint_name("mtp.2.markov_head.markov_w1.weight"),
+            "model.markov_embedding.weight",
+        )
+        self.assertIsNone(model._map_checkpoint_name("mtp.3.norm.weight"))
+
+    def test_dspark_attention_contract_uses_checkpoint_namespace(self):
+        self.assertIn("attn.attn_sink", _ATTENTION_CHECKPOINT_TENSORS)
+        self.assertIn("attn.wq_a.weight", _ATTENTION_CHECKPOINT_TENSORS)
+        self.assertIn("attn.wo_b.scale", _ATTENTION_CHECKPOINT_TENSORS)
+        self.assertNotIn("wq_a.weight", _ATTENTION_CHECKPOINT_TENSORS)
+
+    def test_dspark_only_allows_implicit_zero_expert_bias_parameters(self):
+        self.assertTrue(
+            _is_zero_initialized_expert_bias(
+                "model.stages.0.block.ffn.experts.w13_weight_bias"
+            )
+        )
+        self.assertTrue(
+            _is_zero_initialized_expert_bias(
+                "model.stages.2.block.ffn.experts.w2_weight_bias"
+            )
+        )
+        self.assertFalse(
+            _is_zero_initialized_expert_bias(
+                "model.stages.0.block.ffn.experts.w13_weight"
+            )
+        )
+
+    def test_dspark_target_capture_layers_fail_closed(self):
+        model = object.__new__(DeepseekV4Model)
+        model.layers = [SimpleNamespace(layer_id=i) for i in range(4)]
+
+        model.set_dspark_layers_to_capture([1, 3])
+        self.assertEqual(model.dspark_layers_to_capture, (1, 3))
+        with self.assertRaisesRegex(ValueError, "strictly increasing"):
+            model.set_dspark_layers_to_capture([3, 1])
+        with self.assertRaisesRegex(ValueError, "unique"):
+            model.set_dspark_layers_to_capture([1, 1])
+        with self.assertRaisesRegex(ValueError, "out of range"):
+            model.set_dspark_layers_to_capture([1, 4])
+
+    def test_dspark_graph_safe_context_indices_mask_unwritten_slots(self):
+        indices = get_dspark_topk_idxs_batched(
+            window_size=4,
+            block_size=2,
+            start_pos=torch.tensor([0, 2, 8]),
+        )
+
+        self.assertEqual(tuple(indices.shape), (3, 2, 6))
+        self.assertTrue(torch.equal(indices[0, 0], torch.tensor([0, -1, -1, -1, 4, 5])))
+        self.assertTrue(torch.equal(indices[1, 0], torch.tensor([0, 1, 2, -1, 4, 5])))
+        self.assertTrue(torch.equal(indices[2, 0], torch.tensor([0, 1, 2, 3, 4, 5])))
+        self.assertTrue(torch.equal(indices[:, 0], indices[:, 1]))
+
+    def test_dspark_bonus_selection_matches_verify_layout(self):
+        output = torch.tensor(
+            [
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                20,
+                21,
+                22,
+                23,
+                24,
+                25,
+            ],
+            dtype=torch.int32,
+        )
+        out = torch.empty(2, dtype=torch.int32)
+
+        DeepseekV4DSpark._bonus_tokens_from_output(
+            output,
+            torch.tensor([1, 4], dtype=torch.int32),
+            num_extends=0,
+            verify_width=6,
+            out=out,
+        )
+
+        self.assertTrue(torch.equal(out, torch.tensor([9, 23], dtype=torch.int32)))
+
+    def test_dspark_decode_positions_follow_target_absolute_positions(self):
+        (
+            interim_positions,
+            interim_valid,
+            main_positions,
+            next_context_lengths,
+        ) = _dspark_decode_position_plan(
+            old_context_lengths=torch.tensor([128, 128]),
+            accepted=torch.tensor([1, 4]),
+            block_offsets=torch.arange(5),
+        )
+
+        self.assertTrue(
+            torch.equal(
+                interim_positions,
+                torch.tensor(
+                    [
+                        [128, 129, 130, 131, 132],
+                        [128, 129, 130, 131, 132],
+                    ]
+                ),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                interim_valid,
+                torch.tensor(
+                    [
+                        [False, False, False, False, False],
+                        [True, True, True, False, False],
+                    ]
+                ),
+            )
+        )
+        self.assertTrue(torch.equal(main_positions, torch.tensor([128, 131])))
+        self.assertTrue(torch.equal(next_context_lengths, torch.tensor([129, 132])))
+
+    def test_dspark_prefill_positions_are_not_shifted(self):
+        target_positions = torch.tensor([[124, 125, 126, 127]])
+
+        window_positions, next_context_lengths = _dspark_prefill_position_plan(
+            target_positions
+        )
+
+        self.assertTrue(torch.equal(window_positions, target_positions))
+        self.assertTrue(torch.equal(next_context_lengths, torch.tensor([128])))
+
+    def test_dspark_hc_head_preserves_batch_and_block_axes(self):
+        batch_size, block_size, hc_mult, hidden_size = 2, 5, 4, 8
+        hidden_states = torch.randn(
+            batch_size,
+            block_size,
+            hc_mult,
+            hidden_size,
+        )
+        hc_fn = torch.randn(hc_mult, hc_mult * hidden_size)
+        hc_scale = torch.randn(1)
+        hc_base = torch.randn(hc_mult)
+
+        actual = _apply_dspark_hc_head(
+            hidden_states,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            1e-6,
+            1e-6,
+        )
+        expected = torch.stack(
+            [
+                hc_head(
+                    hidden_states[:, step],
+                    hc_fn,
+                    hc_scale,
+                    hc_base,
+                    1e-6,
+                    1e-6,
+                )
+                for step in range(block_size)
+            ],
+            dim=1,
+        )
+
+        self.assertEqual(tuple(actual.shape), (batch_size, block_size, hidden_size))
+        self.assertTrue(torch.allclose(actual, expected))
+
+    def test_dspark_context_projection_materializes_strided_decode_slice(self):
+        captured_hidden_states = torch.arange(48).reshape(2, 3, 8)[:, :2]
+        self.assertFalse(captured_hidden_states.is_contiguous())
+
+        def assert_contiguous(input_):
+            self.assertTrue(input_.is_contiguous())
+            self.assertTrue(torch.equal(input_, captured_hidden_states))
+            raise RuntimeError("projection reached")
+
+        model = SimpleNamespace(
+            stages=[SimpleNamespace(main_proj=assert_contiguous)],
+        )
+        with self.assertRaisesRegex(RuntimeError, "projection reached"):
+            DeepseekV4DSparkModel.write_context_windows_batched(
+                model,
+                captured_hidden_states,
+                torch.zeros((2, 2), dtype=torch.int64),
+                torch.zeros(2, dtype=torch.int64),
+                torch.ones((2, 2), dtype=torch.bool),
+                torch.empty(0),
+                0,
+            )
+
+    def test_dspark_tp_argmax_uses_contiguous_full_workspace_for_partial_batch(self):
+        local_logits = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+        lm_head = SimpleNamespace(
+            shard_indices=SimpleNamespace(
+                num_org_elements=4,
+                num_org_elements_padded=4,
+                num_added_elements=0,
+                org_vocab_start_index=0,
+                added_vocab_start_index=4,
+            )
+        )
+        gathered_values = torch.empty(4, 8)
+        gathered_ids = torch.empty(4, 8, dtype=torch.int64)
+
+        def fake_all_gather(output, input_, group):
+            self.assertTrue(output.is_contiguous())
+            self.assertEqual(output.numel(), 4)
+            output.copy_(input_.repeat(4))
+
+        with patch(
+            "tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads.all_gather_into_tensor",
+            side_effect=fake_all_gather,
+        ) as gather:
+            token_ids = _local_vocab_argmax(
+                local_logits,
+                lm_head,
+                object(),
+                gathered_values,
+                gathered_ids,
+            )
+
+        self.assertEqual(gather.call_count, 2)
+        self.assertTrue(torch.equal(token_ids, torch.tensor([3], dtype=torch.int32)))
+
+        with self.assertRaisesRegex(ValueError, "must be contiguous"):
+            _local_vocab_argmax(
+                local_logits,
+                lm_head,
+                object(),
+                gathered_values[:, :1],
+                gathered_ids[:, :1],
+            )
+
+    def test_dspark_tp_only_contract_uses_resolved_mapping(self):
+        mapping = SimpleNamespace(attn=SimpleNamespace(dp_size=1, cp_size=1))
+        DeepseekV4DSpark._validate_tp_only_mapping(mapping)
+
+        for field in ("dp_size", "cp_size"):
+            invalid = SimpleNamespace(attn=SimpleNamespace(dp_size=1, cp_size=1))
+            setattr(invalid.attn, field, 2)
+            with (
+                self.subTest(field=field),
+                self.assertRaisesRegex(ValueError, "tensor parallelism only"),
+            ):
+                DeepseekV4DSpark._validate_tp_only_mapping(invalid)
+
+    def test_dspark_padding_slots_reset_before_every_graph_replay(self):
+        drafter = object.__new__(DeepseekV4DSpark)
+        drafter.device = torch.device("cpu")
+        drafter.first_padding_slot = 3
+        drafter.padding_slots = torch.arange(3, 7, dtype=torch.int64)
+        drafter.slot_indices_buf = drafter.padding_slots.clone()
+        drafter.kv_windows = torch.full((7, 2, 4, 8), 7.0)
+        drafter.context_lengths = torch.full((7,), 123, dtype=torch.int64)
+        drafter._request_by_pool_slot = [None, "request-1", None]
+        drafter.input_buffers = SimpleNamespace(
+            max_bs=4,
+            req_pool_indices_buf=torch.tensor([1, 0, 0, 0], dtype=torch.int64),
+            extend_prefix_lens_cpu=torch.zeros(4, dtype=torch.int64),
+        )
+
+        active_window = drafter.kv_windows[1].clone()
+        active_context = drafter.context_lengths[1].clone()
+        for _ in range(10):
+            drafter.kv_windows[3:].fill_(9)
+            drafter.context_lengths[3:].fill_(1048575)
+            drafter.prepare_request_state(["request-1"], [1], num_extends=0)
+            self.assertTrue(
+                torch.equal(
+                    drafter.kv_windows[3:],
+                    torch.zeros_like(drafter.kv_windows[3:]),
+                )
+            )
+            self.assertTrue(
+                torch.equal(
+                    drafter.context_lengths[3:],
+                    torch.zeros_like(drafter.context_lengths[3:]),
+                )
+            )
+            self.assertTrue(
+                torch.equal(
+                    drafter.slot_indices_buf,
+                    torch.tensor([1, 4, 5, 6]),
+                )
+            )
+
+        self.assertTrue(torch.equal(drafter.kv_windows[1], active_window))
+        self.assertTrue(torch.equal(drafter.context_lengths[1], active_context))
+
+        drafter.kv_windows[3:].fill_(11)
+        drafter.context_lengths[3:].fill_(999)
+        drafter.prepare_request_state([], [], num_extends=0)
+        self.assertTrue(torch.equal(drafter.slot_indices_buf, drafter.padding_slots))
+        self.assertTrue(
+            torch.equal(
+                drafter.kv_windows[3:],
+                torch.zeros_like(drafter.kv_windows[3:]),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                drafter.context_lengths[3:],
+                torch.zeros_like(drafter.context_lengths[3:]),
+            )
+        )
+
+    def test_dspark_fp8_quant_dequant_matches_ue8m0_reference(self):
+        values = torch.linspace(-7.0, 7.0, 256, dtype=torch.float32).reshape(2, 128)
+        actual = dspark_fp8_quant_dequant(values, 64)
+
+        blocks = values.unflatten(-1, (-1, 64))
+        absmax = blocks.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)
+        scales = torch.exp2(torch.ceil(torch.log2(absmax / 448.0)))
+        expected = (
+            (blocks / scales)
+            .clamp(-448.0, 448.0)
+            .to(torch.float8_e4m3fn)
+            .float()
+            .mul(scales)
+            .flatten(-2)
+        )
+
+        self.assertTrue(torch.equal(actual, expected))
+        with self.assertRaisesRegex(ValueError, "must be divisible"):
+            dspark_fp8_quant_dequant(values[:, :-1], 64)
+
+    def test_dspark_kv_quantizes_only_non_rope_channels(self):
+        tensor = torch.linspace(-8.0, 8.0, 512, dtype=torch.float32).reshape(1, 1, 512)
+
+        actual = _quantize_dspark_non_rope(tensor, rope_head_dim=64)
+
+        self.assertTrue(torch.equal(actual[..., -64:], tensor[..., -64:]))
+        self.assertTrue(
+            torch.equal(
+                actual[..., :-64],
+                dspark_fp8_quant_dequant(tensor[..., :-64], 64),
+            )
+        )
+        self.assertFalse(torch.equal(actual[..., :-64], tensor[..., :-64]))
+
+    def test_dspark_output_projection_keeps_wo_a_input_in_bf16(self):
+        output = torch.linspace(
+            -3.0,
+            3.0,
+            128,
+            dtype=torch.bfloat16,
+        ).reshape(1, 1, 1, 128)
+        wo_a = torch.linspace(
+            -0.5,
+            0.5,
+            128 * 128,
+            dtype=torch.bfloat16,
+        ).reshape(128, 128)
+        wo_b = torch.linspace(
+            -0.25,
+            0.25,
+            4 * 128,
+            dtype=torch.bfloat16,
+        ).reshape(4, 128)
+
+        bf16_intermediate = torch.einsum(
+            "bsgd,grd->bsgr",
+            output,
+            wo_a.view(1, 128, 128),
+        ).flatten(2)
+        with patch(
+            "tokenspeed.runtime.models.deepseek_v4_dspark_ops.attention.dspark_fp8_quant_dequant",
+            wraps=dspark_fp8_quant_dequant,
+        ) as quantize:
+            actual = _dspark_output_projection(
+                output,
+                wo_a,
+                wo_b,
+                n_groups=1,
+                o_lora_rank=128,
+            )
+
+        expected = F.linear(
+            dspark_fp8_quant_dequant(bf16_intermediate, 128),
+            wo_b,
+        )
+        self.assertTrue(torch.equal(actual, expected))
+        self.assertEqual(quantize.call_count, 1)
+        quantize_input, quantize_block_size = quantize.call_args.args
+        self.assertTrue(torch.equal(quantize_input, bf16_intermediate))
+        self.assertEqual(quantize_block_size, 128)
+
+    def test_dspark_base_logits_use_public_fp32_head_math(self):
+        model = object.__new__(DeepseekV4DSparkModel)
+        hidden = torch.tensor([[1.0, -2.0]], dtype=torch.bfloat16)
+        head = SimpleNamespace(
+            weight=torch.tensor([[0.5, 0.25], [-1.0, 2.0]], dtype=torch.bfloat16)
+        )
+
+        logits = model.local_base_logits(hidden, head)
+
+        self.assertEqual(logits.dtype, torch.float32)
+        self.assertTrue(torch.equal(logits, hidden.float() @ head.weight.float().T))
+
+    def test_dspark_speculative_config_uses_block_plus_bonus_width(self):
+        server_args = ServerArgs(
+            model="unused",
+            disable_kvstore=True,
+            enable_prefix_caching=False,
+            speculative_config=json.dumps(
+                {"method": "dspark", "num_speculative_tokens": 5}
+            ),
+        )
+
+        self.assertEqual(server_args.speculative_algorithm, "DSPARK")
+        self.assertEqual(server_args.speculative_num_steps, 5)
+        self.assertEqual(server_args.speculative_num_draft_tokens, 6)
+
+    def test_dspark_rejects_prefix_cache_until_state_reuse_is_supported(self):
+        with self.assertRaisesRegex(ValueError, "--no-enable-prefix-caching"):
+            ServerArgs(
+                model="unused",
+                speculative_config=json.dumps(
+                    {"method": "dspark", "num_speculative_tokens": 5}
+                ),
+            )
+
+    def test_dspark_requires_kvstore_and_prefix_cache_to_be_disabled_together(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "both --disable-kvstore and --no-enable-prefix-caching",
+        ):
+            ServerArgs(
+                model="unused",
+                enable_prefix_caching=False,
+                speculative_config=json.dumps(
+                    {"method": "dspark", "num_speculative_tokens": 5}
+                ),
+            )
+
     def test_deepseek_v4_attention_layout_matches_compressed_cache_contract(self):
         config = SimpleNamespace(
             compress_ratios=[0, 4, 128],
@@ -1334,47 +2030,12 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(layout.swa_token_stride, 576)
         self.assertEqual(layout.swa_scale_dim, 8)
         self.assertEqual(layout.swa_row_bytes, 584)
-        self.assertEqual(layout.swa_cell_bytes(), 585)
-        self.assertEqual(layout.compressed_cell_bytes(4), 585)
-        self.assertEqual(layout.compressed_cell_bytes(128), 27)
         self.assertEqual(layout.state_width(0), 512)
         self.assertEqual(layout.state_width(1), 1024)
         self.assertEqual(layout.state_width(2), 512)
         self.assertEqual(layout.state_width(1, indexer=True), 256)
         self.assertEqual(layout.indexer_row_bytes, 132)
         self.assertEqual(layout_fp4.indexer_row_bytes, 68)
-
-    def test_deepseek_v4_profile_uses_grouped_draft_cache_cell_size(self):
-        class GenericDraftAttnConfig:
-            def cache_cell_size(self):
-                return 11
-
-        draft_model_config = SimpleNamespace(num_attention_layers=3)
-
-        self.assertEqual(
-            _resolve_draft_cache_cell_size_for_profile(
-                GenericDraftAttnConfig(),
-                draft_model_config,
-                draft_profile_cache_cell_size=777,
-            ),
-            777,
-        )
-        self.assertEqual(
-            _resolve_draft_cache_cell_size_for_profile(
-                GenericDraftAttnConfig(),
-                draft_model_config,
-                draft_profile_cache_cell_size=None,
-            ),
-            33,
-        )
-        self.assertEqual(
-            _resolve_draft_cache_cell_size_for_profile(
-                None,
-                None,
-                draft_profile_cache_cell_size=None,
-            ),
-            0,
-        )
 
     def test_deepseek_v4_cache_layout_can_slice_mtp_layer_range(self):
         config = SimpleNamespace(
@@ -1392,7 +2053,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
 
         self.assertEqual(layout.layer_ratio, (1,))
-        self.assertEqual(layout.cache_cell_size(1), layout.swa_cell_bytes())
         with self.assertRaisesRegex(ValueError, "out of range"):
             deepseek_v4_cache_layout_from_config(
                 config,
@@ -1457,34 +2117,39 @@ class TestDeepseekV4Config(unittest.TestCase):
             use_fp4_indexer_cache=True,
         )
 
-        self.assertEqual(layout.cache_cell_size(3), 16771)
+        pool, plan = _make_planned_deepseek_v4_pool(layout, config)
 
-        pool = DeepseekV4TokenToKVPool(
-            size=128,
-            model_dtype=torch.bfloat16,
-            layout=layout,
-            layer_num=3,
-            device="cpu",
-            enable_memory_saver=False,
-            max_batch_size=2,
-            max_context_len=128,
-            page_size=64,
-            rank=0,
-            hf_config=config,
-            max_scheduled_tokens=1,
-        )
-
-        self.assertEqual(tuple(pool.get_swa_kv_buffer(0).shape), (8, 37440))
-        self.assertIsNone(pool.compressed_kv_buffer[0])
-        self.assertEqual(tuple(pool.get_compressed_kv_buffer_2d(1).shape), (4, 37440))
-        self.assertEqual(tuple(pool.get_compressor_state_buffer(1).shape), (8, 4, 2048))
         self.assertEqual(
-            tuple(pool.get_compressor_state_buffer(2).shape), (36, 8, 1024)
+            tuple(pool.get_swa_kv_buffer(0).shape),
+            (plan.group("v4.swa_kv").page_count, 37440),
+        )
+        self.assertIsNone(pool.compressed_kv_buffer[0])
+        self.assertEqual(
+            tuple(pool.get_compressed_kv_buffer_2d(1).shape),
+            (plan.group("v4.c4a.compressed_kv").page_count, 37440),
+        )
+        self.assertEqual(
+            tuple(pool.get_compressor_state_buffer(1).shape),
+            (plan.group("v4.c4a.compressor_state").page_count, 4, 2048),
+        )
+        self.assertEqual(
+            tuple(pool.get_compressor_state_buffer(2).shape),
+            (plan.group("v4.c128a.compressor_state").page_count, 8, 1024),
         )
         self.assertEqual(pool.get_compressor_state_buffer(1).dtype, torch.float32)
         self.assertEqual(pool.get_compressor_state_buffer(2).dtype, torch.float32)
-        self.assertEqual(tuple(pool.get_indexer_kv_buffer_2d(1).shape), (4, 64 * 68))
-        self.assertEqual(tuple(pool.get_indexer_state_buffer(1).shape), (8, 4, 512))
+        self.assertEqual(
+            tuple(pool.get_indexer_kv_buffer_2d(1).shape),
+            (plan.group("v4.c4a.compressed_kv").page_count, 64 * 68),
+        )
+        self.assertEqual(
+            tuple(pool.get_indexer_state_buffer(1).shape),
+            (
+                plan.group("v4.c4a.indexer_compressor_state").page_count,
+                4,
+                512,
+            ),
+        )
         self.assertEqual(pool.get_indexer_state_buffer(1).dtype, torch.float32)
 
     def test_deepseek_v4_kv_pool_uses_compressed_storage_blocks_for_page256(self):
@@ -1500,26 +2165,19 @@ class TestDeepseekV4Config(unittest.TestCase):
             page_size=256,
             use_fp4_indexer_cache=True,
         )
-        pool = DeepseekV4TokenToKVPool(
-            size=512,
-            model_dtype=torch.bfloat16,
-            layout=layout,
-            layer_num=3,
-            device="cpu",
-            enable_memory_saver=False,
-            max_batch_size=2,
-            max_context_len=512,
-            page_size=256,
-            rank=0,
-            hf_config=config,
-            max_scheduled_tokens=1,
-        )
+        pool, plan = _make_planned_deepseek_v4_pool(layout, config)
 
         self.assertEqual(pool.swa_block_size, 64)
         self.assertEqual(pool.get_compressed_block_size(1), 64)
         self.assertEqual(pool.get_compressed_block_size(2), 2)
-        self.assertEqual(tuple(pool.get_compressed_kv_buffer_2d(1).shape), (5, 37440))
-        self.assertEqual(tuple(pool.get_indexer_kv_buffer_2d(1).shape), (5, 64 * 68))
+        self.assertEqual(
+            tuple(pool.get_compressed_kv_buffer_2d(1).shape),
+            (plan.group("v4.c4a.compressed_kv").page_count, 37440),
+        )
+        self.assertEqual(
+            tuple(pool.get_indexer_kv_buffer_2d(1).shape),
+            (plan.group("v4.c4a.compressed_kv").page_count, 64 * 68),
+        )
 
     def test_deepseek_v4_kv_pool_rejects_nonpositive_size(self):
         config = SimpleNamespace(
@@ -1536,19 +2194,24 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "must be positive"):
-            DeepseekV4TokenToKVPool(
+            HybridDeepseekV4TokenToKVPool(
                 size=0,
                 model_dtype=torch.bfloat16,
                 layout=layout,
                 layer_num=1,
                 device="cpu",
                 enable_memory_saver=False,
-                max_batch_size=2,
-                max_context_len=128,
                 page_size=64,
                 rank=0,
-                hf_config=config,
-                max_scheduled_tokens=1,
+                memory_plan=solve_deepseek_v4_memory_layout(
+                    build_deepseek_v4_cache_fields(
+                        layout,
+                        sliding_window=128,
+                        logical_block_tokens=256,
+                    )
+                ).with_num_lcm_blocks(1),
+                paged_cache_group_specs=(),
+                token_capacity=256,
             )
 
     def test_deepseek_v4_group_slot_mapping_consumes_compact_base_offsets(self):
@@ -1598,7 +2261,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             seq_lens=torch.tensor([200, 80], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
-            req_to_page=torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32),
+            page_table=torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32),
             paged_cache_block_tables={"v4.swa_kv": compact},
             paged_cache_block_table_base_offsets={"v4.swa_kv": base},
         )
@@ -1675,10 +2338,396 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
         )
         table = torch.tensor([[11, 12, 13, 14]], dtype=torch.int32)
+        backend._expected_cache_group_ids = (V4_SWA_KV_GROUP_ID,)
+        backend._cache_group_raw_tokens_per_page = {V4_SWA_KV_GROUP_ID: 64}
+        backend._cache_group_max_page_ids = {V4_SWA_KV_GROUP_ID: 100}
 
-        materialized = backend._prepare_cache_group_tables({V4_SWA_KV_GROUP_ID: table})
+        materialized = backend._prepare_cache_group_tables(
+            {V4_SWA_KV_GROUP_ID: table},
+            bs=1,
+            actual_bs=1,
+            seq_lens=torch.tensor([1], dtype=torch.int32),
+            device=torch.device("cpu"),
+            phase="test",
+        )
 
         self.assertEqual(materialized[V4_SWA_KV_GROUP_ID].tolist(), table.tolist())
+
+    def _make_deepseek_v4_cache_group_contract_backend(self):
+        backend = DeepseekV4AttentionBackend.__new__(DeepseekV4AttentionBackend)
+        backend._expected_cache_group_ids = ("fine", "coarse")
+        backend._cache_group_raw_tokens_per_page = {"fine": 4, "coarse": 256}
+        backend._cache_group_max_page_ids = {"fine": 20000, "coarse": 1024}
+        return backend
+
+    def test_deepseek_v4_runtime_configures_eager_cache_group_contract(self):
+        backend = DeepseekV4AttentionBackend(
+            SimpleNamespace(
+                page_size=64,
+                device="cpu",
+                num_attention_heads=64,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                is_draft=False,
+                speculative_num_draft_tokens=1,
+                head_dim=512,
+                context_len=4096,
+            )
+        )
+        specs = (
+            PagedCacheGroupSpec(
+                group_id="fine",
+                retention="full_history",
+                rows_per_page=4,
+                entry_stride_tokens=1,
+                sliding_window_tokens=None,
+            ),
+            PagedCacheGroupSpec(
+                group_id="coarse",
+                retention="full_history",
+                rows_per_page=256,
+                entry_stride_tokens=1,
+                sliding_window_tokens=None,
+            ),
+        )
+        counts = {"fine": 20001, "coarse": 1025}
+
+        backend.configure_runtime(
+            paged_cache_group_specs=specs,
+            paged_cache_group_page_counts=counts,
+        )
+        tables = {
+            "fine": torch.ones((1, 1), dtype=torch.int32),
+            "coarse": torch.ones((1, 1), dtype=torch.int32),
+        }
+        materialized = backend._prepare_cache_group_tables(
+            tables,
+            bs=1,
+            actual_bs=1,
+            seq_lens=torch.ones(1, dtype=torch.int32),
+            device=torch.device("cpu"),
+            phase="eager",
+        )
+        self.assertEqual(tuple(materialized), ("fine", "coarse"))
+
+        # Graph setup may repeat the same contract but must not replace it.
+        backend.init_cuda_graph_state(
+            max_bs=1,
+            paged_cache_group_specs=specs,
+            paged_cache_group_page_counts=counts,
+        )
+        changed = {"fine": 20002, "coarse": 1025}
+        with self.assertRaisesRegex(RuntimeError, "changed after initialization"):
+            backend._configure_cache_group_contract(specs, changed)
+
+    def test_deepseek_v4_cache_group_contract_covers_64k_boundary(self):
+        backend = self._make_deepseek_v4_cache_group_contract_backend()
+        tables = {
+            "fine": torch.ones((1, 16384), dtype=torch.int32),
+            "coarse": torch.ones((1, 256), dtype=torch.int32),
+        }
+
+        materialized = backend._prepare_cache_group_tables(
+            tables,
+            bs=1,
+            actual_bs=1,
+            seq_lens=torch.tensor([65536], dtype=torch.int32),
+            device=torch.device("cpu"),
+            phase="test",
+        )
+        self.assertEqual(tuple(materialized), ("fine", "coarse"))
+
+        with self.assertRaisesRegex(RuntimeError, "missing a real page"):
+            backend._prepare_cache_group_tables(
+                tables,
+                bs=1,
+                actual_bs=1,
+                seq_lens=torch.tensor([65537], dtype=torch.int32),
+                device=torch.device("cpu"),
+                phase="test",
+            )
+
+    def test_deepseek_v4_cache_group_contract_fails_closed(self):
+        backend = self._make_deepseek_v4_cache_group_contract_backend()
+        valid = {
+            "fine": torch.ones((2, 2), dtype=torch.int32),
+            "coarse": torch.ones((2, 2), dtype=torch.int32),
+        }
+        malformed = []
+        malformed.append(({"fine": valid["fine"]}, "group mismatch"))
+        malformed.append(
+            (
+                {
+                    "fine": valid["fine"],
+                    "coarse": valid["coarse"],
+                    "extra": valid["fine"],
+                },
+                "group mismatch",
+            )
+        )
+        malformed.append(
+            (
+                {"coarse": valid["coarse"], "fine": valid["fine"]},
+                "wrong order",
+            )
+        )
+        malformed.append(
+            (
+                {**valid, "fine": valid["fine"].to(torch.int64)},
+                "torch.int32",
+            )
+        )
+        malformed.append(({**valid, "fine": valid["fine"][0]}, "rank 2"))
+        malformed.append(({**valid, "fine": valid["fine"][:1]}, "rows"))
+        malformed.append(
+            (
+                {**valid, "fine": torch.empty((2, 0), dtype=torch.int32)},
+                "zero width",
+            )
+        )
+
+        for tables, error in malformed:
+            with self.subTest(error=error), self.assertRaisesRegex(RuntimeError, error):
+                backend._prepare_cache_group_tables(
+                    tables,
+                    bs=2,
+                    actual_bs=2,
+                    seq_lens=torch.ones(2, dtype=torch.int32),
+                    device=torch.device("cpu"),
+                    phase="test",
+                )
+
+        null_active = {**valid, "fine": valid["fine"].clone()}
+        null_active["fine"][0, 0] = 0
+        with self.assertRaisesRegex(RuntimeError, "missing a real page"):
+            backend._prepare_cache_group_tables(
+                null_active,
+                bs=2,
+                actual_bs=2,
+                seq_lens=torch.ones(2, dtype=torch.int32),
+                device=torch.device("cpu"),
+                phase="test",
+            )
+
+        # A zero-token idle row has no active logical page and may keep the
+        # reserved null entry. Negative lengths are always malformed.
+        idle = {key: torch.zeros_like(table) for key, table in valid.items()}
+        backend._prepare_cache_group_tables(
+            idle,
+            bs=2,
+            actual_bs=2,
+            seq_lens=torch.zeros(2, dtype=torch.int32),
+            device=torch.device("cpu"),
+            phase="idle",
+        )
+        with self.assertRaisesRegex(RuntimeError, "nonnegative"):
+            backend._prepare_cache_group_tables(
+                idle,
+                bs=2,
+                actual_bs=1,
+                seq_lens=torch.tensor([-1, 0], dtype=torch.int32),
+                device=torch.device("cpu"),
+                phase="test",
+            )
+
+    def test_deepseek_v4_cache_group_replay_refreshes_only_live_rows(self):
+        backend = self._make_deepseek_v4_cache_group_contract_backend()
+        output_buffers = {
+            "fine": torch.zeros((2, 4), dtype=torch.int32),
+            "coarse": torch.zeros((2, 4), dtype=torch.int32),
+        }
+
+        for step in range(1, 11):
+            tables = {
+                "fine": torch.tensor([[step], [0]], dtype=torch.int32),
+                "coarse": torch.tensor([[step], [0]], dtype=torch.int32),
+            }
+            materialized = backend._prepare_cache_group_tables(
+                tables,
+                bs=2,
+                actual_bs=1,
+                seq_lens=torch.ones(2, dtype=torch.int32),
+                device=torch.device("cpu"),
+                phase="replay",
+                output_buffers=output_buffers,
+            )
+            for table in materialized.values():
+                self.assertEqual(int(table[0, 0]), step)
+                self.assertTrue(bool((table[:, 1:] == -1).all()))
+
+        zero_tables = {
+            "fine": torch.zeros((2, 1), dtype=torch.int32),
+            "coarse": torch.zeros((2, 1), dtype=torch.int32),
+        }
+        backend._prepare_cache_group_tables(
+            zero_tables,
+            bs=2,
+            actual_bs=0,
+            seq_lens=torch.ones(2, dtype=torch.int32),
+            device=torch.device("cpu"),
+            phase="idle",
+            output_buffers=output_buffers,
+        )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_deepseek_v4_target_mtp_graph_replay_refreshes_flat_tables(self):
+        device = torch.device("cuda")
+        target_specs = tuple(
+            build_v4_cache_specs(
+                SimpleNamespace(sliding_window=128),
+                layer_ratio=(1, 4, 128),
+            )
+        )
+        draft_specs = tuple(
+            build_v4_cache_specs(
+                SimpleNamespace(sliding_window=128),
+                layer_ratio=(1,),
+            )
+        )
+        target_counts = {str(spec.group_id): 4096 for spec in target_specs}
+        draft_counts = {str(spec.group_id): 4096 for spec in draft_specs}
+
+        def make_backend(*, is_draft: bool) -> DeepseekV4AttentionBackend:
+            return DeepseekV4AttentionBackend(
+                SimpleNamespace(
+                    page_size=64,
+                    device="cuda",
+                    num_attention_heads=64,
+                    num_kv_heads=1,
+                    attn_tp_size=1,
+                    dtype=torch.bfloat16,
+                    is_draft=is_draft,
+                    speculative_num_draft_tokens=4,
+                    speculative_num_steps=1,
+                    head_dim=512,
+                    qk_rope_head_dim=64,
+                    context_len=65536,
+                )
+            )
+
+        target = make_backend(is_draft=False)
+        draft = make_backend(is_draft=True)
+        target.init_cuda_graph_state(
+            max_bs=2,
+            paged_cache_group_specs=target_specs,
+            paged_cache_group_page_counts=target_counts,
+            max_tokens_per_req=4,
+        )
+        draft.init_cuda_graph_state(
+            max_bs=2,
+            paged_cache_group_specs=draft_specs,
+            paged_cache_group_page_counts=draft_counts,
+            max_tokens_per_req=4,
+        )
+
+        common = {
+            "bs": 2,
+            "req_pool_indices": torch.tensor([0, 1], dtype=torch.int32, device=device),
+            "seq_lens": torch.tensor([65536, 0], dtype=torch.int32, device=device),
+            "forward_mode": ForwardMode.DECODE,
+            "num_tokens": 8,
+        }
+        target_capture = {
+            group_id: torch.zeros_like(table)
+            for group_id, table in target._cuda_graph_paged_cache_block_tables.items()
+        }
+        draft_capture = {
+            group_id: torch.zeros_like(table)
+            for group_id, table in draft._cuda_graph_paged_cache_block_tables.items()
+        }
+        target.init_forward_metadata_capture_cuda_graph(
+            **common,
+            paged_cache_block_tables=target_capture,
+        )
+        draft.init_forward_metadata_capture_cuda_graph(
+            **common,
+            paged_cache_block_tables=draft_capture,
+        )
+        target_metadata = target.forward_metadata
+        draft_metadata = draft.forward_metadata
+        assert target_metadata is not None
+        assert draft_metadata is not None
+
+        target_ids = tuple(target._expected_cache_group_ids or ())
+        draft_ids = tuple(draft._expected_cache_group_ids or ())
+        observed = torch.empty(
+            len(target_ids) + len(draft_ids), dtype=torch.int32, device=device
+        )
+        graph = torch.cuda.CUDAGraph()
+        torch.cuda.synchronize()
+        with torch.cuda.graph(graph):
+            for index, group_id in enumerate(target_ids):
+                observed[index].copy_(
+                    target_metadata.cache.paged_cache_block_tables[group_id][0, 0]
+                )
+            for index, group_id in enumerate(draft_ids, start=len(target_ids)):
+                observed[index].copy_(
+                    draft_metadata.cache.paged_cache_block_tables[group_id][0, 0]
+                )
+
+        target_live = {
+            group_id: torch.zeros_like(table)
+            for group_id, table in target_capture.items()
+        }
+        draft_live = {group_id: target_live[group_id] for group_id in draft_ids}
+
+        def replay(step: int) -> None:
+            for index, table in enumerate(target_live.values()):
+                table[0].fill_(step + index + 1)
+                table[1].zero_()
+            target.init_forward_metadata_replay_cuda_graph(
+                **common,
+                actual_bs=1,
+                block_tables=target_live,
+            )
+            draft.init_forward_metadata_replay_cuda_graph(
+                **common,
+                actual_bs=1,
+                block_tables=draft_live,
+            )
+            graph.replay()
+
+        for step in range(10):
+            replay(step)
+            torch.cuda.synchronize()
+            target_expected = [step + index + 1 for index in range(len(target_ids))]
+            draft_expected = [
+                step + target_ids.index(group_id) + 1 for group_id in draft_ids
+            ]
+            self.assertEqual(observed.cpu().tolist(), target_expected + draft_expected)
+
+        self.assertEqual(
+            target.forward_metadata.is_valid_token.tolist(),
+            [True, True, True, True, False, False, False, False],
+        )
+        self.assertEqual(
+            draft.forward_metadata.is_valid_token.tolist(),
+            [True, True, True, True, False, False, False, False],
+        )
+        base_group_id = v4_compressed_kv_group_id(4)
+        base_value = 9 + target_ids.index(base_group_id) + 1
+        base_width = target_live[base_group_id].shape[1]
+        self.assertTrue(
+            bool(
+                (
+                    target.forward_metadata.cache.block_table[0, :base_width]
+                    == base_value
+                ).all()
+            )
+        )
+        self.assertTrue(
+            bool((target.forward_metadata.cache.block_table[0, base_width:] == 0).all())
+        )
+        self.assertTrue(bool((target.forward_metadata.cache.block_table[1] == 0).all()))
+        self.assertTrue(bool((draft.forward_metadata.cache.block_table == 0).all()))
+
+        torch.cuda.synchronize()
+        reserved_before = torch.cuda.memory_reserved()
+        for step in range(50):
+            replay(step + 100)
+        torch.cuda.synchronize()
+        self.assertLessEqual(torch.cuda.memory_reserved(), reserved_before)
 
     def test_deepseek_v4_mixed_metadata_keeps_decode_rows_single_token(self):
         backend = DeepseekV4AttentionBackend(
@@ -1701,7 +2750,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int64),
             seq_lens=torch.tensor([7, 10, 4], dtype=torch.int32),
             forward_mode=ForwardMode.MIXED,
-            req_to_page=torch.zeros((3, 1), dtype=torch.int32),
+            page_table=torch.zeros((3, 1), dtype=torch.int32),
             extend_seq_lens_cpu=torch.tensor([7], dtype=torch.int32),
             num_extends=1,
         )
@@ -1747,7 +2796,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                         [prefill_tokens, 100, 200], dtype=torch.int32
                     ),
                     forward_mode=ForwardMode.MIXED,
-                    req_to_page=torch.zeros((3, 256), dtype=torch.int32),
+                    page_table=torch.zeros((3, 256), dtype=torch.int32),
                     extend_seq_lens_cpu=torch.tensor(
                         [prefill_tokens], dtype=torch.int32
                     ),
@@ -1806,7 +2855,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
                 seq_lens=torch.tensor([7, 20], dtype=torch.int32),
                 forward_mode=ForwardMode.MIXED,
-                req_to_page=torch.zeros((2, 64), dtype=torch.int32),
+                page_table=torch.zeros((2, 64), dtype=torch.int32),
                 extend_seq_lens_cpu=torch.tensor([7], dtype=torch.int32),
                 num_extends=1,
             )
@@ -1829,14 +2878,14 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         req_pool_indices = torch.tensor([0, 1], dtype=torch.int64)
         seq_lens = torch.tensor([7, 20], dtype=torch.int32)
-        req_to_page = torch.zeros((2, 64), dtype=torch.int32)
+        page_table = torch.zeros((2, 64), dtype=torch.int32)
         backend.init_forward_metadata(
             bs=2,
             num_tokens=7 + verify_width,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             forward_mode=ForwardMode.MIXED,
-            req_to_page=req_to_page,
+            page_table=page_table,
             extend_seq_lens_cpu=torch.tensor([7], dtype=torch.int32),
             num_extends=1,
         )
@@ -1849,7 +2898,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             forward_mode=ForwardMode.DECODE,
-            req_to_page=req_to_page,
+            page_table=page_table,
             num_extends=0,
         )
         decode_metadata = backend.forward_metadata
@@ -1887,7 +2936,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         backend.init_cuda_graph_state(
             2,
             paged_cache_group_specs=(
-                SimpleNamespace(
+                PagedCacheGroupSpec(
                     group_id="v4.swa_kv",
                     retention="sliding_window",
                     rows_per_page=64,
@@ -1895,6 +2944,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                     sliding_window_tokens=128,
                 ),
             ),
+            paged_cache_group_page_counts={"v4.swa_kv": 1024},
             max_tokens_per_req=1,
         )
         compact = torch.tensor([[10, 11], [20, -1]], dtype=torch.int32)
@@ -1936,7 +2986,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             seq_lens=torch.tensor([200, 80], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
-            req_to_page=torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32),
+            page_table=torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32),
             paged_cache_block_tables={
                 "v4.swa_kv": swa,
                 "v4.c4a.compressor_state": c4_state,
@@ -2107,19 +3157,24 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "layer_num"):
-            DeepseekV4TokenToKVPool(
+            HybridDeepseekV4TokenToKVPool(
                 size=128,
                 model_dtype=torch.bfloat16,
                 layout=layout,
                 layer_num=2,
                 device="cpu",
                 enable_memory_saver=False,
-                max_batch_size=2,
-                max_context_len=128,
                 page_size=64,
                 rank=0,
-                hf_config=config,
-                max_scheduled_tokens=1,
+                memory_plan=solve_deepseek_v4_memory_layout(
+                    build_deepseek_v4_cache_fields(
+                        layout,
+                        sliding_window=128,
+                        logical_block_tokens=256,
+                    )
+                ).with_num_lcm_blocks(1),
+                paged_cache_group_specs=(),
+                token_capacity=256,
             )
 
     def test_deepseek_v4_metadata_maps_compressed_slots(self):
@@ -2273,12 +3328,25 @@ class TestDeepseekV4Config(unittest.TestCase):
                 context_len=256,
             )
         )
+        backend.configure_runtime(
+            paged_cache_group_specs=(
+                SimpleNamespace(
+                    group_id=V4_SWA_KV_GROUP_ID,
+                    retention="sliding_window",
+                    rows_per_page=64,
+                    entry_stride_tokens=1,
+                ),
+            ),
+            paged_cache_group_page_counts={V4_SWA_KV_GROUP_ID: 128},
+        )
         backend.init_forward_metadata(
             bs=3,
             req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
             seq_lens=torch.tensor([5, 9, 12], dtype=torch.int32),
             forward_mode=ForwardMode.MIXED,
-            req_to_page=torch.tensor([[10], [20], [30]], dtype=torch.int32),
+            block_tables={
+                V4_SWA_KV_GROUP_ID: torch.tensor([[10], [20], [30]], dtype=torch.int32)
+            },
             extend_seq_lens_cpu=torch.tensor([3, 1, 1], dtype=torch.int32),
             extend_prefix_lens_cpu=torch.tensor([2, 8, 11], dtype=torch.int32),
             num_extends=1,
@@ -2337,8 +3405,9 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
         )
         self.assertTrue(
-            torch.equal(decode.cache.block_table[:, 0], torch.tensor([20, 30]))
+            torch.equal(decode.cache.swa_block_table[:, 0], torch.tensor([20, 30]))
         )
+        self.assertTrue(bool((decode.cache.block_table == 0).all()))
         self.assertTrue(
             torch.equal(prefill.seq_lens_cpu, torch.tensor([5], dtype=torch.int32))
         )
@@ -2366,7 +3435,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
             seq_lens=torch.tensor([5, 9, 12, 6], dtype=torch.int32),
             forward_mode=ForwardMode.MIXED,
-            req_to_page=torch.tensor([[10], [20], [30], [40]], dtype=torch.int32),
+            page_table=torch.tensor([[10], [20], [30], [40]], dtype=torch.int32),
             extend_seq_lens_cpu=torch.tensor([3, 4, 1, 1], dtype=torch.int32),
             extend_prefix_lens_cpu=torch.tensor([2, 5, 11], dtype=torch.int32),
             num_extends=3,
@@ -2411,7 +3480,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
             seq_lens=torch.tensor([5, 9, 12], dtype=torch.int32),
             forward_mode=ForwardMode.MIXED,
-            req_to_page=torch.tensor([[10], [20], [30]], dtype=torch.int32),
+            page_table=torch.tensor([[10], [20], [30]], dtype=torch.int32),
             extend_seq_lens_cpu=torch.tensor([3, 1, 1], dtype=torch.int32),
             num_extends=1,
         )
@@ -2514,7 +3583,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
             seq_lens=torch.tensor([5, 9, 12], dtype=torch.int32),
             forward_mode=ForwardMode.MIXED,
-            req_to_page=torch.tensor([[10], [20], [30]], dtype=torch.int32),
+            page_table=torch.tensor([[10], [20], [30]], dtype=torch.int32),
             extend_seq_lens_cpu=torch.tensor([3, 1, 1], dtype=torch.int32),
             num_extends=1,
         )
@@ -2602,7 +3671,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             seq_lens=torch.tensor([70, 3], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
-            req_to_page=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
+            page_table=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
         )
         self.assertTrue(
             torch.equal(
@@ -2635,7 +3704,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             seq_lens=torch.tensor([70, 3], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
-            req_to_page=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
+            page_table=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
         )
         self.assertEqual(
             draft_backend.forward_metadata.forward_mode, ForwardMode.DECODE
@@ -2655,7 +3724,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
                 seq_lens=torch.tensor([70, 3], dtype=torch.int32),
                 forward_mode=ForwardMode.DECODE,
-                req_to_page=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
+                page_table=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
             )
 
     def test_deepseek_v4_decode_metadata_defaults_to_one_token(self):
@@ -2679,7 +3748,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             seq_lens=torch.tensor([70, 3], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
-            req_to_page=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
+            page_table=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
         )
 
         self.assertTrue(
@@ -2797,7 +3866,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             seq_lens=seq_lens,
             forward_mode=ForwardMode.DECODE,
-            req_to_page=c4_table,
+            page_table=c4_table,
             paged_cache_block_tables=_v4_compressed_kv_tables(c4=c4_table),
         )
         positions = seq_lens.to(torch.int64) - 1
@@ -2833,7 +3902,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             seq_lens=seq_lens,
             forward_mode=ForwardMode.DECODE,
-            req_to_page=c128_table,
+            page_table=c128_table,
             paged_cache_block_tables=_v4_compressed_kv_tables(c128=c128_table),
         )
         hca_positions = seq_lens.to(torch.int64) - 1
@@ -2890,7 +3959,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1], device=device, dtype=torch.int64),
             seq_lens=seq_lens,
             forward_mode=ForwardMode.DECODE,
-            req_to_page=c128_table,
+            page_table=c128_table,
             paged_cache_block_tables=_v4_compressed_kv_tables(c128=c128_table),
         )
         positions = seq_lens.to(torch.int64) - 1
@@ -3034,7 +4103,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             seq_lens=seq_lens,
             forward_mode=ForwardMode.DECODE,
-            req_to_page=compressed_table,
+            page_table=compressed_table,
             paged_cache_block_tables=_v4_compressed_kv_tables(
                 c4=compressed_table,
                 c128=compressed_table,
@@ -3110,7 +4179,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.arange(4, dtype=torch.int32),
             seq_lens=torch.tensor([70, 3, 1, 1], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
-            req_to_page=torch.tensor(
+            page_table=torch.tensor(
                 [
                     [10, 11],
                     [20, 21],
@@ -3129,6 +4198,61 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
         )
         self.assertEqual(metadata.decode_token_count(), 4)
+
+    def test_deepseek_v4_cuda_graph_replay_preserves_padded_cache_tables(self):
+        backend = DeepseekV4AttentionBackend(
+            SimpleNamespace(
+                page_size=64,
+                device="cpu",
+                num_attention_heads=64,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                is_draft=False,
+                speculative_num_draft_tokens=1,
+                head_dim=512,
+                context_len=512,
+            )
+        )
+        group_id = v4_compressed_kv_group_id(4)
+        backend.init_cuda_graph_state(
+            max_bs=4,
+            paged_cache_group_specs=(
+                PagedCacheGroupSpec(
+                    group_id=group_id,
+                    retention="full_history",
+                    rows_per_page=64,
+                    entry_stride_tokens=4,
+                    sliding_window_tokens=None,
+                ),
+            ),
+            paged_cache_group_page_counts={group_id: 128},
+        )
+        backend.init_forward_metadata_capture_cuda_graph(
+            bs=4,
+            req_pool_indices=torch.arange(4, dtype=torch.int32),
+            seq_lens=torch.ones(4, dtype=torch.int32),
+            forward_mode=ForwardMode.DECODE,
+            paged_cache_block_tables={group_id: torch.ones((4, 2), dtype=torch.int32)},
+        )
+        active_table = torch.tensor(
+            [[10, 11], [20, 21], [0, 0], [0, 0]], dtype=torch.int32
+        )
+
+        backend.init_forward_metadata_replay_cuda_graph(
+            bs=4,
+            actual_bs=2,
+            req_pool_indices=torch.arange(4, dtype=torch.int32),
+            seq_lens=torch.tensor([70, 3, 1, 1], dtype=torch.int32),
+            forward_mode=ForwardMode.DECODE,
+            block_tables={group_id: active_table},
+        )
+
+        table = backend.forward_metadata.cache.block_table
+        self.assertTrue(torch.equal(table[:2, :2], active_table[:2]))
+        self.assertTrue(
+            torch.equal(table[2:, :2], torch.zeros((2, 2), dtype=torch.int32))
+        )
 
     def test_deepseek_v4_indexer_metadata_refresh_masks_padding_tokens(self):
         key = (4, 4, 3)
@@ -3336,7 +4460,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.arange(4, dtype=torch.int32),
             seq_lens=torch.tensor([70, 3, 1, 1], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
-            req_to_page=torch.tensor(
+            page_table=torch.tensor(
                 [
                     [10, 11],
                     [20, 21],
@@ -3391,7 +4515,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=torch.arange(4, dtype=torch.int32),
             seq_lens=torch.tensor([70, 3, 1, 1], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
-            req_to_page=torch.tensor(
+            page_table=torch.tensor(
                 [
                     [10, 11],
                     [20, 21],
@@ -3480,14 +4604,14 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         req_pool_indices = torch.tensor([0], dtype=torch.int32)
         seq_lens = torch.tensor([6], dtype=torch.int32)
-        req_to_page = torch.tensor([[10]], dtype=torch.int32)
+        page_table = torch.tensor([[10]], dtype=torch.int32)
         backend.init_forward_metadata(
             bs=1,
             num_tokens=6,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             forward_mode=ForwardMode.EXTEND,
-            req_to_page=req_to_page,
+            page_table=page_table,
         )
         backend.init_forward_metadata(
             bs=1,
@@ -3495,7 +4619,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             forward_mode=ForwardMode.DECODE,
-            req_to_page=req_to_page,
+            page_table=page_table,
         )
         backend.advance_draft_forward_metadata()
 
@@ -3578,20 +4702,22 @@ class TestDeepseekV4Config(unittest.TestCase):
                 torch.tensor([[10], [20], [30]], dtype=torch.int32)
             )
 
-        with patch.dict(global_server_args_dict, {"max_model_len": None}):
-            with patch.object(
+        with (
+            patch.dict(global_server_args_dict, {"max_model_len": None}),
+            patch.object(
                 deepseek_v4_model,
                 "deepseek_v4_indexer_decode_metadata_compute",
                 fake_decode_metadata_compute,
-            ):
-                plan = deepseek_v4_model._deepseek_v4_indexer_decode_plan(
-                    positions=positions,
-                    token_to_req_indices=token_to_req_indices,
-                    block_table=block_table,
-                    cache_block_size=4,
-                    compress_ratio=4,
-                    is_valid_token=torch.tensor([True, False, True]),
-                )
+            ),
+        ):
+            plan = deepseek_v4_model._deepseek_v4_indexer_decode_plan(
+                positions=positions,
+                token_to_req_indices=token_to_req_indices,
+                block_table=block_table,
+                cache_block_size=4,
+                compress_ratio=4,
+                is_valid_token=torch.tensor([True, False, True]),
+            )
 
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["max_blocks"], 1)
@@ -3821,30 +4947,37 @@ class TestDeepseekV4Config(unittest.TestCase):
             max_context_len=1,
         )
 
-        with patch.object(
-            deepseek_v4_model,
-            "deepseek_v4_prepare_indexer_q_mxfp4",
-            side_effect=fake_prepare_mxfp4,
-        ), patch.object(
-            deepseek_v4_model,
-            "_deepseek_v4_deepgemm_fp4_indexer_available",
-            return_value=True,
-        ), patch.object(
-            deepseek_v4_model,
-            "_deepseek_v4_indexer_prefill_metadata",
-            return_value=empty_prefill_metadata,
-        ), patch.object(
-            deepseek_v4_model,
-            "_deepseek_v4_indexer_decode_plan",
-            return_value=decode_metadata,
-        ), patch.object(
-            deepseek_v4_model,
-            "_deepseek_v4_indexer_decode_schedule_metadata",
-            return_value=None,
-        ), patch.object(
-            deepseek_v4_model,
-            "_deepseek_v4_sparse_attn_indexer",
-            side_effect=fake_sparse_indexer,
+        with (
+            patch.object(
+                deepseek_v4_model,
+                "deepseek_v4_prepare_indexer_q_mxfp4",
+                side_effect=fake_prepare_mxfp4,
+            ),
+            patch.object(
+                deepseek_v4_model,
+                "_deepseek_v4_deepgemm_fp4_indexer_available",
+                return_value=True,
+            ),
+            patch.object(
+                deepseek_v4_model,
+                "_deepseek_v4_indexer_prefill_metadata",
+                return_value=empty_prefill_metadata,
+            ),
+            patch.object(
+                deepseek_v4_model,
+                "_deepseek_v4_indexer_decode_plan",
+                return_value=decode_metadata,
+            ),
+            patch.object(
+                deepseek_v4_model,
+                "_deepseek_v4_indexer_decode_schedule_metadata",
+                return_value=None,
+            ),
+            patch.object(
+                deepseek_v4_model,
+                "_deepseek_v4_sparse_attn_indexer",
+                side_effect=fake_sparse_indexer,
+            ),
         ):
             actual = DeepseekV4Indexer._forward_sparse_indexer_custom_op(
                 self_obj,

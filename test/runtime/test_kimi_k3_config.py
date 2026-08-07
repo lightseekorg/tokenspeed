@@ -24,7 +24,7 @@ from tokenspeed.runtime.configs.kimi_k3_config import (  # noqa: E402
     KimiK3VisionConfig,
     KimiLinearConfig,
 )
-from tokenspeed.runtime.configs.paged_cache_spec import (  # noqa: E402
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (  # noqa: E402
     FULL_ATTENTION,
     LINEAR_ATTENTION,
 )
@@ -280,6 +280,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
         import tokenspeed.runtime.models.kimi_k3 as kimi_k3
 
         shared_calls = []
+        expert_calls = []
 
         class FakeLinear(torch.nn.Module):
             def __init__(self, *args, **kwargs):
@@ -288,6 +289,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
         class FakeExperts(torch.nn.Module):
             def __init__(self, *args, **kwargs):
                 super().__init__()
+                expert_calls.append(kwargs)
                 self.support_routing = False
 
         class FakeSharedExperts(torch.nn.Module):
@@ -357,6 +359,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             )
 
         self.assertFalse(shared_calls[0]["reduce_results"])
+        self.assertEqual(expert_calls[0]["internal_activation_dtype_override"], "input")
         joint_reduce = layer.native_latent_moe.components["joint_reduce"]
         self.assertIs(joint_reduce.func, kimi_k3.all_reduce_two)
         self.assertEqual(joint_reduce.keywords, {"group": ep_group})
@@ -478,3 +481,83 @@ class KimiK3RegistrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class KimiK3LcmPlanTests(unittest.TestCase):
+    """LCM planning across attention-TP widths and reduced-layer variants."""
+
+    @staticmethod
+    def _plan(cfg, tp):
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
+            solve_kimi_k3_cache_layout,
+        )
+
+        layout = solve_kimi_k3_cache_layout(
+            cfg,
+            tp_size=tp,
+            mla_cache_dtype=torch.float8_e4m3fn,
+            mla_quant_method=None,
+        )
+        return layout.with_num_lcm_blocks(64)
+
+    def test_linear_packing_scales_with_attn_tp(self):
+        """KDA pages pack into an MLA-sized plane, so tp=16 -- where the KDA
+        state page halves while the MLA latent page is tp-invariant -- packs
+        twice as many KDA pages per plane instead of failing the planner's
+        padding bound (1.268089 > 0.25 before the fix)."""
+        cfg = KimiLinearConfig()
+        plan8 = self._plan(cfg, 8)
+        plan16 = self._plan(cfg, 16)
+        packs8 = {g.group_id: g.cache_blocks_per_lcm_block for g in plan8.groups}
+        packs16 = {g.group_id: g.cache_blocks_per_lcm_block for g in plan16.groups}
+        self.assertEqual(packs8[FULL_ATTENTION], packs16[FULL_ATTENTION])
+        for gid in (f"{LINEAR_ATTENTION}_0", f"{LINEAR_ATTENTION}_1"):
+            self.assertEqual(packs16[gid], 2 * packs8[gid])
+        self.assertEqual(len(plan8.planes), _NUM_MLA)
+        self.assertEqual(len(plan16.planes), _NUM_MLA)
+
+    def test_reduced_layer_variant_plans(self):
+        """Layer counts derive from the config: a structurally-identical
+        reduced-layer checkpoint (same per-layer specs, fewer layers) plans
+        with one plane per MLA layer instead of tripping hardcoded 93/69/24
+        checks."""
+        base = KimiLinearConfig()
+        linear = dict(base.linear_attn_config)
+        num_layers = 24
+        linear["kda_layers"] = [x for x in linear["kda_layers"] if x <= num_layers]
+        linear["full_attn_layers"] = [
+            x for x in linear["full_attn_layers"] if x <= num_layers
+        ]
+        cfg = KimiLinearConfig(num_hidden_layers=num_layers, linear_attn_config=linear)
+        plan = self._plan(cfg, 8)
+        self.assertEqual(len(plan.planes), len(linear["full_attn_layers"]))
+
+    def test_full_size_split_is_enforced(self):
+        """A 93-layer config must keep exactly 69 KDA + 24 MLA; the relaxed
+        reduced-layer path must not weaken the released-checkpoint check."""
+        base = KimiLinearConfig()
+        linear = dict(base.linear_attn_config)
+        kda = list(linear["kda_layers"])
+        # 66 KDA (still /3 for the state groups) + 27 full: wrong split.
+        kda.pop()
+        kda.pop()
+        kda.pop()
+        linear["kda_layers"] = kda
+        linear["full_attn_layers"] = sorted(set(range(1, _NUM_LAYERS + 1)) - set(kda))
+        cfg = KimiLinearConfig(linear_attn_config=linear)
+        with self.assertRaisesRegex(ValueError, "69 KDA and 24 MLA"):
+            self._plan(cfg, 8)
+
+    def test_kda_group_split_must_divide(self):
+        """A KDA layer count that does not split into the fixed state groups
+        is rejected loudly."""
+        base = KimiLinearConfig()
+        linear = dict(base.linear_attn_config)
+        num_layers = 23  # 17 KDA layers: not divisible by 3
+        linear["kda_layers"] = [x for x in linear["kda_layers"] if x <= num_layers]
+        linear["full_attn_layers"] = [
+            x for x in linear["full_attn_layers"] if x <= num_layers
+        ]
+        cfg = KimiLinearConfig(num_hidden_layers=num_layers, linear_attn_config=linear)
+        with self.assertRaises(ValueError):
+            self._plan(cfg, 8)

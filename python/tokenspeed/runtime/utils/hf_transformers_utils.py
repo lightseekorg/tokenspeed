@@ -54,6 +54,7 @@ from tokenspeed.runtime.configs import (
     Qwen2Config,
     Qwen3_5Config,
     Qwen3_5MoeConfig,
+    Qwen3_5MoeTextConfig,
     Qwen3ASRConfig,
     Qwen3Config,
     Qwen3MoeConfig,
@@ -68,6 +69,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     DeepseekV4Config.model_type: DeepseekV4Config,
     Qwen3_5Config.model_type: Qwen3_5Config,
     Qwen3_5MoeConfig.model_type: Qwen3_5MoeConfig,
+    Qwen3_5MoeTextConfig.model_type: Qwen3_5MoeTextConfig,
     MiniMaxM2Config.model_type: MiniMaxM2Config,
     MiniMaxM3Config.model_type: MiniMaxM3Config,
     KimiK2Config.model_type: KimiK2Config,
@@ -214,6 +216,7 @@ def get_config(
     revision: str | None = None,
     model_override_args: dict | None = None,
     is_draft_worker: bool | None = False,
+    speculative_algorithm: str | None = None,
     **kwargs,
 ):
     if os.path.isdir(model):
@@ -272,11 +275,24 @@ def get_config(
     if (
         is_draft_worker
         and config.architectures
+        and config.architectures[0].startswith("Qwen3DSparkModel")
+    ):
+        config.architectures[0] = "DSparkDraftModel"
+
+    if (
+        is_draft_worker
+        and config.architectures
         and "NextN" not in config.architectures[0]
         and "Eagle" not in config.architectures[0]
         and "DFlash" not in config.architectures[0]
+        and "DSpark" not in config.architectures[0]
     ):
-        if config.architectures[0] == "MiniMaxM2ForCausalLM":
+        if (
+            speculative_algorithm == "DSPARK"
+            and config.architectures[0] == "DeepseekV4ForCausalLM"
+        ):
+            config.architectures[0] = "DeepseekV4ForCausalLMDSpark"
+        elif config.architectures[0] == "MiniMaxM2ForCausalLM":
             config.architectures[0] = "LlamaForCausalLMEagle3"
         else:
             config.architectures[0] += "NextN"

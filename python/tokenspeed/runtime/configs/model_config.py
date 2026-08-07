@@ -48,6 +48,7 @@ logger = get_colorful_logger(__name__)
 _DEEPSEEK_V4_ARCHITECTURES = frozenset(
     {
         "DeepseekV4ForCausalLM",
+        "DeepseekV4ForCausalLMDSpark",
         "DeepseekV4ForCausalLMNextN",
     }
 )
@@ -66,6 +67,10 @@ _DSA_ARCHITECTURES = frozenset(
     {
         "GlmMoeDsaForCausalLM",
         "GlmMoeDsaForCausalLMNextN",
+        # DeepSeek-V3.2: V3 MLA/MoE backbone + DSA sparse indexer. Same
+        # attention family and indexer geometry as GLM-DSA.
+        "DeepseekV32ForCausalLM",
+        "DeepseekV32ForCausalLMNextN",
     }
 )
 _MSA_ARCHITECTURES = frozenset(
@@ -334,6 +339,11 @@ class ModelConfig:
             revision=revision,
             model_override_args=self.model_override_args,
             is_draft_worker=is_draft_worker,
+            speculative_algorithm=(
+                getattr(server_args, "speculative_algorithm", None)
+                if is_draft_worker
+                else None
+            ),
             **kwargs,
         )
         self.hf_generation_config = get_generation_config(
@@ -344,6 +354,40 @@ class ModelConfig:
         )
 
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        if (
+            is_draft_worker
+            and getattr(server_args, "speculative_algorithm", None) == "DSPARK"
+            and resolve_architecture(self.hf_config) == "DeepseekV4ForCausalLMDSpark"
+        ):
+            if server_args.enable_prefix_caching:
+                raise ValueError(
+                    "DSPARK does not yet preserve its captured-context windows "
+                    "across prefix-cache hits; use --no-enable-prefix-caching."
+                )
+            from tokenspeed.runtime.models.deepseek_v4_dspark import (
+                count_dspark_stages,
+            )
+
+            dspark_num_stages = count_dspark_stages(
+                model_path,
+                revision=revision,
+            )
+            if dspark_num_stages is None:
+                raise ValueError(
+                    "DSPARK requires a safetensors index with mtp.<stage> weights."
+                )
+            self.hf_text_config.dspark_num_stages = dspark_num_stages
+            if self.hf_config is not self.hf_text_config:
+                self.hf_config.dspark_num_stages = dspark_num_stages
+            trained_verify_width = int(self.hf_text_config.dspark_block_size) + 1
+            requested_verify_width = int(server_args.speculative_num_draft_tokens)
+            if requested_verify_width != trained_verify_width:
+                raise ValueError(
+                    "DSPARK target verify width must equal checkpoint block_size + 1; "
+                    f"expected {trained_verify_width}, got {requested_verify_width}."
+                )
+            server_args.speculative_num_steps = trained_verify_width - 1
+            server_args.speculative_num_draft_tokens = trained_verify_width
         if (
             is_draft_worker
             and resolve_architecture(self.hf_config)
@@ -514,8 +558,11 @@ class ModelConfig:
             self.num_hidden_layers,
         )
         if is_draft_worker:
+            dspark_layers = getattr(self.hf_text_config, "dspark_num_stages", None)
             mtp_layers = getattr(self.hf_text_config, "mtp_num_hidden_layers", None)
-            if mtp_layers is not None:
+            if dspark_layers is not None:
+                self.num_attention_layers = int(dspark_layers)
+            elif mtp_layers is not None:
                 self.num_attention_layers = mtp_layers
             else:
                 nextn_layers = getattr(

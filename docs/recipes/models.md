@@ -288,6 +288,156 @@ tokenspeed serve Qwen/Qwen3-30B-A3B \
   --port 8000
 ```
 
+## Qwen3.8
+
+Qwen3.8 shares the hybrid linear-attention (GDN) / full-attention layer
+pattern with Qwen3.5.
+
+### Qwen3.8-Max
+
+Qwen3.8-max needs 16 GPUs, so it runs on two 8-GPU nodes. Launch
+`tokenspeed serve` on every node with the same command, changing only
+`--node-rank`; every node points `--dist-init-addr` at node 0, which is the only
+rank that serves the HTTP API. See [Parallelism](../serving/parallelism.md) for
+the multi-node rules.
+
+This family has no parser auto-selection, so set `--reasoning-parser` and
+`--tool-call-parser` explicitly. `--speculative-algorithm MTP` without
+`--speculative-draft-model-path` drafts from the base checkpoint. Set
+`--dist-init-addr` to node 0's own address and port throughout
+(`<node0-host>:25000` below).
+
+#### TP16
+
+One replica across both nodes. `--ep-size` defaults to 1, so the experts stay
+tensor-parallel over the full world and all-to-all stays out of the path. Keep
+`--moe-backend auto`: the block-scale FP8 `deep_gemm` experts implement only the
+DeepEP legs and are unavailable without `--all2all-backend deepep`.
+
+```bash
+# node 0 (serves the HTTP API)
+tokenspeed serve /path/to/qwen3.8-max-fp8 \
+  --served-model-name qwen3.8-max \
+  --nnodes 2 --node-rank 0 --nprocs-per-node 8 --world-size 16 \
+  --dist-init-addr <node0-host>:25000 \
+  --attn-tp-size 16 \
+  --moe-backend auto \
+  --quantization fp8 --kv-cache-dtype fp8 \
+  --attention-backend trtllm \
+  --chunked-prefill-size 8192 \
+  --gpu-memory-utilization 0.95 --max-num-seqs 128 \
+  --disable-kvstore \
+  --speculative-algorithm MTP --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+  --reasoning-parser qwen3_thinking --tool-call-parser qwen_coder \
+  --host 0.0.0.0 --port 8000
+
+# node 1 (same command, --node-rank 1)
+tokenspeed serve /path/to/qwen3.8-max-fp8 \
+  --served-model-name qwen3.8-max \
+  --nnodes 2 --node-rank 1 --nprocs-per-node 8 --world-size 16 \
+  --dist-init-addr <node0-host>:25000 \
+  --attn-tp-size 16 \
+  --moe-backend auto \
+  --quantization fp8 --kv-cache-dtype fp8 \
+  --attention-backend trtllm \
+  --chunked-prefill-size 8192 \
+  --gpu-memory-utilization 0.95 --max-num-seqs 128 \
+  --disable-kvstore \
+  --speculative-algorithm MTP --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+  --reasoning-parser qwen3_thinking --tool-call-parser qwen_coder \
+  --host 0.0.0.0 --port 8000
+```
+
+#### TP8 DP2 EP16 (DeepEP)
+
+Two TP8 attention replicas, experts sharded across all 16 ranks, and expert
+routing on DeepEP dispatch/combine instead of all-gather:
+
+```bash
+# node 0 (serves the HTTP API)
+tokenspeed serve /path/to/qwen3.8-max-fp8 \
+  --served-model-name qwen3.8-max \
+  --nnodes 2 --node-rank 0 --nprocs-per-node 8 --world-size 16 \
+  --dist-init-addr <node0-host>:25000 \
+  --attn-tp-size 8 --data-parallel-size 2 --ep-size 16 \
+  --moe-backend deep_gemm \
+  --all2all-backend deepep --deepep-mode auto \
+  --low-latency-max-num-tokens-per-gpu 64 \
+  --quantization fp8 --kv-cache-dtype fp8 \
+  --attention-backend trtllm \
+  --chunked-prefill-size 8192 \
+  --gpu-memory-utilization 0.95 --max-num-seqs 128 \
+  --disable-kvstore \
+  --speculative-algorithm MTP --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+  --reasoning-parser qwen3_thinking --tool-call-parser qwen_coder \
+  --host 0.0.0.0 --port 8000
+
+# node 1 (same command, --node-rank 1)
+tokenspeed serve /path/to/qwen3.8-max-fp8 \
+  --served-model-name qwen3.8-max \
+  --nnodes 2 --node-rank 1 --nprocs-per-node 8 --world-size 16 \
+  --dist-init-addr <node0-host>:25000 \
+  --attn-tp-size 8 --data-parallel-size 2 --ep-size 16 \
+  --moe-backend deep_gemm \
+  --all2all-backend deepep --deepep-mode auto \
+  --low-latency-max-num-tokens-per-gpu 64 \
+  --quantization fp8 --kv-cache-dtype fp8 \
+  --attention-backend trtllm \
+  --chunked-prefill-size 8192 \
+  --gpu-memory-utilization 0.95 --max-num-seqs 128 \
+  --disable-kvstore \
+  --speculative-algorithm MTP --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+  --reasoning-parser qwen3_thinking --tool-call-parser qwen_coder \
+  --host 0.0.0.0 --port 8000
+```
+
+Notes:
+- `--low-latency-max-num-tokens-per-gpu` sizes DeepEP's NVSHMEM heap (roughly
+  2.0 GB at 64, 8.1 GB at 256), and that heap is claimed after the KV pool is
+  profiled. An oversized value therefore fails late, when the first dispatch
+  runs out of fabric memory. Size it to the real per-rank decode token bound
+  and no lower: a batch above the capacity is rejected, not truncated.
+- Internode DeepEP rides NVSHMEM IBGDA. On a RoCE fabric, mirror the NCCL
+  values into `NVSHMEM_IB_GID_INDEX`, `NVSHMEM_IB_TRAFFIC_CLASS`, and
+  `NVSHMEM_IB_SL`, and point `NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME` at the same
+  interface as `NCCL_SOCKET_IFNAME`.
+
+#### Choosing a layout
+
+- TP16 has the lower TTFT and TPOT at batch 1-2: no dispatch/combine hop, and
+  the single replica owns the whole batch.
+- The DeepEP layout pulls ahead from mid batch up, where its expert kernels and
+  the second attention replica both pay off.
+
+### Qwen3.8-27B
+
+A dense 27B-class Qwen3.8 FP8 checkpoint on a single GPU, with self-speculative
+MTP (the draft model path points at the same checkpoint):
+
+```bash
+tokenspeed serve /path/to/qwen3.8-27b-fp8 \
+  --served-model-name qwen3.8-27b \
+  --world-size 1 \
+  --gpu-memory-utilization 0.9 \
+  --attention-backend trtllm \
+  --moe-backend flashinfer_trtllm \
+  --chunked-prefill-size 8192 \
+  --max-model-len 262144 \
+  --max-num-seqs 128 \
+  --kv-cache-dtype fp8_e4m3 \
+  --speculative-algorithm MTP \
+  --speculative-draft-model-path /path/to/qwen3.8-27b-fp8 \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --disable-kvstore \
+  --host 0.0.0.0 --port 8000
+```
+
 ## GPT-OSS 20B / 120B
 
 Small GPT-OSS launches can start simple. Large GPT-OSS launches usually tune

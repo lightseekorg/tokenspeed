@@ -40,7 +40,9 @@ from tokenspeed_scheduler import (
     SchedulerConfig,
 )
 
-from tokenspeed.runtime.configs.cache_runtime import require_positive_int
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+    require_positive_int,
+)
 
 _CACHE_EVENT_TYPES = {
     "WriteBackDoneEvent": Cache.WriteBackDoneEvent,
@@ -134,64 +136,52 @@ def scheduler_cache_geometry_from_pool(
     )
 
 
-def resolve_scheduler_block_size(page_size: int, paged_cache_groups) -> int:
-    """Scheduler block_size = hash-grain BASE: gcd of group block sizes, not the KV page geometry."""
-    base = page_size
-    for group in paged_cache_groups or ():
-        gb = int(getattr(group, "block_size", 0) or 0) or page_size
-        base = math.gcd(base, gb)
-    return base
-
-
 def aligned_max_scheduled_tokens(
     max_scheduled_tokens: int,
     paged_cache_groups,
-    page_size: int,
 ) -> int:
     """Floor ``max_scheduled_tokens`` to the state-snapshot grain, if any.
 
     Recurrent-state groups (family=State, retention=FullHistory — the C++
     ``final_state_manager`` criterion) register their state snapshot only when
-    a prefill chunk ends exactly on a page boundary
+    a prefill chunk ends exactly on a CacheBlock boundary
     (``RegistersAlignedFinalPageOnly``); interior boundaries never received a
     state write. A chunk size that is not a multiple of every such group's
-    page size therefore never registers a state page, and since the admission
-    probe takes the minimum hit across groups, prefix-cache reuse silently
-    degrades to zero for the whole model.
+    CacheBlock token span therefore never registers a state block. Since the
+    admission probe takes the minimum hit across groups, prefix-cache reuse
+    silently degrades to zero for the whole model.
 
     Args:
         max_scheduled_tokens: Requested per-step token budget
             (``--chunked-prefill-size``).
         paged_cache_groups: Scheduler ``PagedCacheGroupConfig`` sequence, or
             None/empty when the model declares no paged cache groups.
-        page_size: Global page size in tokens; the fallback grain for groups
-            whose ``block_size`` is 0 (= unset, global base).
-
     Returns:
-        ``max_scheduled_tokens`` floored to the LCM of the state groups' page
-        sizes. Returned unchanged when no such group exists or the value is
-        already aligned.
+        ``max_scheduled_tokens`` floored to the LCM of the state groups'
+        CacheBlock token spans. Returned unchanged when no such group exists
+        or the value is already aligned.
 
     Raises:
-        ValueError: If the configured budget is smaller than one state page.
+        ValueError: If the configured budget is smaller than one state CacheBlock.
             Raising is safer than increasing a limit that may already have
             sized executor buffers.
     """
     require_positive_int("max_scheduled_tokens", max_scheduled_tokens)
-    require_positive_int("page_size", page_size)
     grain = 1
     for group in paged_cache_groups or ():
         if group.family != PagedCacheGroupFamily.State:
             continue
         if group.retention == PagedCacheRetention.SlidingWindow:
             continue
-        group_block = int(getattr(group, "block_size", 0) or 0) or page_size
-        grain = math.lcm(grain, group_block)
+        grain = math.lcm(
+            grain,
+            int(group.rows_per_page) * int(group.entry_stride_tokens),
+        )
     if grain == 1:
         return max_scheduled_tokens
     if max_scheduled_tokens < grain:
         raise ValueError(
-            "chunked_prefill_size must be at least one recurrent-state page: "
+            "chunked_prefill_size must be at least one recurrent-state CacheBlock: "
             f"got {max_scheduled_tokens}, minimum {grain}"
         )
     return max_scheduled_tokens - max_scheduled_tokens % grain
@@ -224,7 +214,7 @@ def make_config(
     cfg.num_device_pages = num_device_pages
     cfg.max_scheduled_tokens = max_scheduled_tokens
     cfg.max_batch_size = max_batch_size
-    cfg.block_size = resolve_scheduler_block_size(page_size, paged_cache_groups)
+    cfg.block_size = page_size
 
     cfg.num_host_pages = num_host_pages
     cfg.enable_l3_storage = enable_l3_storage
@@ -294,11 +284,7 @@ def pool_to_paged_cache_groups(pool: Any) -> list:
             kwargs["transfer_policy"] = mapped_policy
         if spec.retention == "sliding_window":
             kwargs["sliding_window_tokens"] = int(spec.sliding_window_tokens)
-        cfg = PagedCacheGroupConfig(**kwargs)
-        # Ctor default 0 = global base; a spec block_size sets the per-group granularity.
-        if getattr(spec, "block_size", None):
-            cfg.block_size = int(spec.block_size)
-        out.append(cfg)
+        out.append(PagedCacheGroupConfig(**kwargs))
     return out
 
 

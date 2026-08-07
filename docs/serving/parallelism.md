@@ -32,7 +32,7 @@ tokenspeed serve <model> \
 | `--world-size` | Total worker processes across all nodes. |
 | `--nprocs-per-node` | Worker processes launched on each node. |
 | `--attn-tp-size` | Attention tensor parallel size. |
-| `--dense-tp-size` | Dense layer tensor parallel size. |
+| `--dense-tp-size` | Dense layer tensor parallel size. Defaults to the attention replica width (attn TP x CP): the full world without DP attention, one replica with it. |
 | `--moe-tp-size` | MoE layer tensor parallel size. |
 | `--data-parallel-size` | Replicated data-parallel groups. |
 | `--mm-encoder-tp-mode` | `weights` (default), or TP1 whole-item DP within each attention TP group (`data`). |
@@ -97,7 +97,10 @@ host sync cannot be captured. Decode graphs are unaffected.
 
 For block-scale FP8 decode on NVIDIA, the low-latency path keeps routing
 metadata in DeepEP's required contiguous int64/float32 formats across both
-collective legs. Its fused SwiGLU quantizer writes packed UE8M0 scales directly
+collective legs. Ordinary softmax routing selects experts and normalizes their
+weights in one Triton launch before dispatch, instead of materializing the
+full softmax and launching separate ATen top-k, reduction, and division kernels.
+Its fused SwiGLU quantizer writes packed UE8M0 scales directly
 in DeepGEMM's MN-major TMA layout, so padded rows need no zero-fill and the
 second expert GEMM needs no separate activation-scale transpose/pack pass.
 For sparse decode it launches a bounded number of row splits per expert and

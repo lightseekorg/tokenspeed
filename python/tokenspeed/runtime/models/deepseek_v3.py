@@ -1019,26 +1019,36 @@ class DeepseekV3AttentionMLA(nn.Module):
 
         # FP8 prefill: fused RoPE + FP8 quantize, direct FP8 KV cache write.
         # Disabled when k_scale != 1.0; mla_fp8_utils.py documents the current limitation.
+        # NoPE models (rotary_emb is None, e.g. Kimi-K3) quantize standalone:
+        # the quantize is otherwise fused into the RoPE kernel, and leaving
+        # them on the BF16 kernel meant a JIT compile of a variant the backend
+        # never pre-warms.
         k_scale = getattr(self.attn_mha, "k_scale_float", 1.0)
         use_fp8_prefill = (
             self.attention_backend in self._MLA_KERNEL_BACKENDS
             and getattr(ctx.attn_backend, "data_type", None) == torch.float8_e4m3fn
-            and self.rotary_emb is not None
             and k_scale == 1.0
         )
 
         if use_fp8_prefill:
-            # Expand k_pe from [tokens,1,rope] to [tokens,heads,rope] for GQA
-            k_pe_expanded = k_pe.expand(-1, self.num_local_heads, -1)
+
+            if self.rotary_emb is not None:
+                k_rope = k_pe.expand(-1, self.num_local_heads, -1)
+                cos_sin_cache = self.rotary_emb.cos_sin_cache
+                is_neox = self.rotary_emb.is_neox_style
+            else:
+                k_rope = k_pe
+                cos_sin_cache = None
+                is_neox = False
 
             q_fp8, k_fp8 = apply_rope_mla(
                 positions=positions,
                 q_rope=q_pe,
-                k_rope=k_pe_expanded,
+                k_rope=k_rope,
                 q_nope=q_nope,
                 k_nope=k_nope,
-                cos_sin_cache=self.rotary_emb.cos_sin_cache,
-                is_neox=getattr(self.rotary_emb, "is_neox_style", True),
+                cos_sin_cache=cos_sin_cache,
+                is_neox=is_neox,
                 quant_scale_q=1.0,
                 quant_scale_kv=k_scale,
                 enable_pdl=pdl_enabled(),
@@ -1848,6 +1858,27 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
 # ---------------------------------------------------------------------------
 
 
+def _draft_rope_scaling(rope_scaling: dict | None) -> dict | None:
+    """Keep only yarn-style rope_scaling for the EAGLE3 MLA draft layer.
+
+    The layer implements plain rope and (deepseek-)yarn. transformers may
+    normalize plain rope into a factor-less ``{"rope_type": "default"}``
+    dict; anything else unsupported is dropped with a warning.
+    """
+    if not rope_scaling:
+        return None
+    if rope_scaling.get("rope_type", rope_scaling.get("type")) in (
+        "yarn",
+        "deepseek_yarn",
+    ):
+        return rope_scaling
+    if "factor" in rope_scaling:
+        logger.warning(
+            "EAGLE3 MLA draft ignores unsupported rope_scaling %s", rope_scaling
+        )
+    return None
+
+
 class Eagle3MlaDecoderLayer(nn.Module):
     """Single decoder layer for Eagle3 MLA draft model.
 
@@ -1869,7 +1900,7 @@ class Eagle3MlaDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.layer_id = layer_id
         rope_theta = get_rope_theta(config)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_scaling = _draft_rope_scaling(getattr(config, "rope_scaling", None))
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
 
         self.self_attn = DeepseekV3DraftAttentionMLA(
@@ -2170,6 +2201,7 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
         )
 
         self.load_lm_head_from_target = False
+        self._embed_loaded_from_checkpoint = False
         if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
@@ -2239,6 +2271,8 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
                 continue
             if "t2d" in name:
                 continue
+            if "embed_tokens" in name:
+                self._embed_loaded_from_checkpoint = True
 
             new_name = re.sub(r"^layers\.0\.", "midlayer.", name)
 
@@ -2286,8 +2320,22 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
             and self.config.target_hidden_size != self.config.hidden_size
         ):
             return
-        del self.model.embed_tokens.weight
-        self.model.embed_tokens.weight = embed
+        if self.model.embed_tokens.weight.shape == embed.shape:
+            # A TP-sharded target embedding would read out of bounds here.
+            del self.model.embed_tokens.weight
+            self.model.embed_tokens.weight = embed
+        elif not self._embed_loaded_from_checkpoint:
+            raise ValueError(
+                "EAGLE3 draft cannot share the target embedding "
+                f"(target {tuple(embed.shape)} vs draft "
+                f"{tuple(self.model.embed_tokens.weight.shape)}) and the draft "
+                "checkpoint provided no embed_tokens weight"
+            )
+        else:
+            logger.info(
+                "EAGLE3 draft keeps its own embedding; target shape %s differs",
+                tuple(embed.shape),
+            )
         if head is not None and self.load_lm_head_from_target:
             del self.lm_head.weight
             self.lm_head.weight = head
