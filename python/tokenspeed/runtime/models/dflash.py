@@ -394,6 +394,46 @@ class DFlashDraftModel(nn.Module):
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         return self.hidden_norm(self.fc(target_hidden))
 
+    # ------------------------------------------------------------------
+    # Context-injection contract
+    #
+    # The drafter is attention-shape agnostic: it projects the captured target
+    # hidden states and hands them to the draft model, which knows how its own
+    # KV is laid out. An MLA draft writes one latent row per token; this GQA
+    # draft writes separate K and V.
+    # ------------------------------------------------------------------
+
+    @property
+    def context_in_features(self) -> int:
+        return int(self.fc.in_features)
+
+    @property
+    def context_dtype(self) -> torch.dtype:
+        return self.fc.weight.dtype
+
+    def write_context_kv(
+        self,
+        ctx_hidden: torch.Tensor,
+        positions: torch.Tensor,
+        cache_locs: torch.Tensor,
+        token_to_kv_pool,
+    ) -> None:
+        for layer in self.layers:
+            attn = layer.self_attn
+            k, v = attn.kv_proj_only(ctx_hidden)
+            k = attn.apply_k_norm(k)
+            k = attn.apply_k_rope(positions, k)
+            k = k.view(-1, attn.num_kv_heads, attn.head_dim)
+            v = v.view(-1, attn.num_kv_heads, attn.head_dim)
+            token_to_kv_pool.set_kv_buffer(
+                attn.attn,
+                cache_locs,
+                k,
+                v,
+                attn.attn.k_scale,
+                attn.attn.v_scale,
+            )
+
     @torch.no_grad()
     def forward(
         self,

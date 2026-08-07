@@ -33,6 +33,7 @@ from tokenspeed.runtime.configs.kimi_k3_config import (
     KimiK3VisionConfig,
     KimiLinearConfig,
 )
+from tokenspeed.runtime.configs.kimi_k3_dspark_config import KimiK3DSparkConfig
 from tokenspeed.runtime.configs.kimi_k25_config import KimiK25Config
 from tokenspeed.runtime.configs.minimax_m2_config import MiniMaxM2Config
 from tokenspeed.runtime.configs.minimax_m3_config import MiniMaxM3Config
@@ -66,6 +67,7 @@ __all__ = [
     "KimiK2Config",
     "KimiK25Config",
     "KimiK3Config",
+    "KimiK3DSparkConfig",
     "KimiK3VisionConfig",
     "KimiLinearConfig",
     "InklingAudioConfig",

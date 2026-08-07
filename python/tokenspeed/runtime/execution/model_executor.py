@@ -95,6 +95,7 @@ if TYPE_CHECKING:
 logger = get_colorful_logger(__name__)
 
 LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
+LOG_SPEC_ACCEPT_LENGTHS = envs.TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS.get()
 
 
 def _get_drafter_impl(spec_algo: str, model: torch.nn.Module):
@@ -220,6 +221,7 @@ class ModelExecutorConfig:
     max_cudagraph_capture_size: int
     model_is_mrope: bool
     enable_nan_detection: bool = False
+    disable_autotune: bool = False
 
     # ====== DP =========
     data_parallel_size: int = 1
@@ -297,6 +299,7 @@ class ModelExecutorConfig:
             decode_log_interval=server_args.decode_log_interval,
             cudagraph_capture_sizes=server_args.cudagraph_capture_sizes,
             disable_cuda_graph_padding=server_args.disable_cuda_graph_padding,
+            disable_autotune=server_args.disable_autotune,
             max_cudagraph_capture_size=server_args.max_cudagraph_capture_size,
             disable_prefill_graph=disable_prefill_graph,
             prefill_graph_max_tokens=_resolve_prefill_graph_max_tokens(server_args),
@@ -664,6 +667,16 @@ class ModelExecutor:
         if num_tokens <= 0 or self.model_runner is None:
             return
 
+        # The bucket mapper keys serving-time tactic lookups, so it must match
+        # any pre-swept table loaded earlier even when tuning itself is off.
+        set_autotune_max_num_tokens(num_tokens)
+        if self.config.disable_autotune:
+            logger.info(
+                "Kernel tuning disabled (--disable-autotune); tunable kernels "
+                "use heuristic tactics"
+            )
+            return
+
         cpu_group = None
         if self.config.world_size > 1:
             cpu_group = pg_manager.get_process_group("gloo", self.config.world_group)
@@ -671,7 +684,6 @@ class ModelExecutor:
         logger.info(f"Kernel tuning with a dummy prefill of {num_tokens} tokens")
         ib = self.input_buffers
         tic = time.time()
-        set_autotune_max_num_tokens(num_tokens)
         set_autotune_process_group(cpu_group)
         with autotune(), maybe_inference_mode():
             ctx = self.prefill_graph.make_dummy_batch(num_tokens, self.forward_step)
@@ -750,6 +762,9 @@ class ModelExecutor:
         width = table.shape[1]
         max_width = self.draft_page_table.shape[1]
         rows = self.draft_page_table[:bs]
+        # Graph replay reads padded_bs rows. Clear inactive rows for both the
+        # identity and logical-to-kernel expansion paths before either returns.
+        self.draft_page_table[bs:].zero_()
         if self._draft_page_ratio > 1:
             # -1 pads clamp into logical page 0, itself reserved as the null page.
             expand_page_table(
@@ -765,8 +780,6 @@ class ModelExecutor:
         rows[:, :width].clamp_min_(0)
         if width < max_width:
             rows[:, width:].zero_()
-        # Graph replay reads padded_bs rows; stale ids past bs alias another request's pages.
-        self.draft_page_table[bs:].zero_()
 
     @nvtx_range("target_forward", color="red")
     def _run_target_forward(self, bs: int, ctx: ForwardContext, req_pool_indices):
@@ -1109,8 +1122,37 @@ class ModelExecutor:
 
     def accumulate_decode_stats(self, results: ModelExecutionResult, bs: int):
         """Accumulate decode stats from already-synced results. No GPU sync."""
-        self.num_generated_tokens += int(results.output_lengths.sum().item())
+        accept_lengths = results.output_lengths
+        self.num_generated_tokens += int(accept_lengths.sum().item())
         self.num_decode_steps += bs
+        if (
+            LOG_SPEC_ACCEPT_LENGTHS
+            and self.config.global_rank == 0
+            and self.config.spec_num_steps
+        ):
+            accepted_widths = [int(value) for value in accept_lengths.tolist()]
+            accepted_draft_tokens = [max(0, value - 1) for value in accepted_widths]
+            logger.info(
+                "Spec verify step. accept_lengths=%s, accepted_draft_tokens=%s",
+                accepted_widths,
+                accepted_draft_tokens,
+            )
+            candidates = getattr(results, "spec_candidate_tokens", None)
+            if candidates is not None:
+                verify_width = int(self.config.spec_num_tokens)
+                candidate_rows = candidates.view(bs, verify_width)
+                target_rows = results.output_tokens.view(bs, verify_width)
+                # Candidate column j+1 is verified by the target token sampled
+                # from column j. The final target column is the bonus token.
+                draft_rows = candidate_rows[:, 1:]
+                target_draft_rows = target_rows[:, :-1]
+                logger.info(
+                    "Spec token compare. anchor=%s, draft=%s, target=%s, match=%s",
+                    candidate_rows[:, 0].tolist(),
+                    draft_rows.tolist(),
+                    target_draft_rows.tolist(),
+                    draft_rows.eq(target_draft_rows).tolist(),
+                )
 
     def execute_forward_op_with_log(
         self,
@@ -1673,6 +1715,7 @@ class ModelExecutor:
             with nvtx_range("output_d2h", color="green"):
                 output_d2h_start = time.perf_counter() if timing_enabled else 0.0
                 next_input_ids = None
+                spec_candidate_tokens = None
                 if (
                     capture_next_input_ids
                     and self.drafter is not None
@@ -1681,6 +1724,15 @@ class ModelExecutor:
                     next_input_ids = self.runtime_states.future_input_map.index_select(
                         0, self.input_buffers.req_pool_indices_buf[:num_extends]
                     ).to("cpu", non_blocking=True)
+
+                if (
+                    LOG_SPEC_ACCEPT_LENGTHS
+                    and self.config.spec_num_steps
+                    and num_extends == 0
+                ):
+                    spec_candidate_tokens = self.input_buffers.input_ids_buf[
+                        : bs * self.config.spec_num_tokens
+                    ].to("cpu", non_blocking=True)
 
                 # Defensive clamp into the valid vocab range (kept from the
                 # pre-pack path). An out-of-range token id -- e.g. a stale/corrupt
@@ -1754,6 +1806,7 @@ class ModelExecutor:
             grammar_completion=grammar_completion,
             next_input_ids=next_input_ids,
             output_nan_flags=output_nan_flags,
+            spec_candidate_tokens=spec_candidate_tokens,
         )
 
     def write_remote_spec_candidate_ids(
