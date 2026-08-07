@@ -751,6 +751,9 @@ class ModelExecutor:
         width = table.shape[1]
         max_width = self.draft_page_table.shape[1]
         rows = self.draft_page_table[:bs]
+        # Graph replay reads padded_bs rows. Clear inactive rows for both the
+        # identity and logical-to-kernel expansion paths before either returns.
+        self.draft_page_table[bs:].zero_()
         if self._draft_page_ratio > 1:
             # -1 pads clamp into logical page 0, itself reserved as the null page.
             expand_page_table(
@@ -766,8 +769,6 @@ class ModelExecutor:
         rows[:, :width].clamp_min_(0)
         if width < max_width:
             rows[:, width:].zero_()
-        # Graph replay reads padded_bs rows; stale ids past bs alias another request's pages.
-        self.draft_page_table[bs:].zero_()
 
     @nvtx_range("target_forward", color="red")
     def _run_target_forward(self, bs: int, ctx: ForwardContext, req_pool_indices):

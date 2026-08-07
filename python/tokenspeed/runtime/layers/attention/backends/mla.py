@@ -346,6 +346,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         forward_batch = kwargs.pop("forward_batch", None)
         group_table = None
         logical_page_size = None
+        published_draft_page_table = False
         if (
             cache_metadata is not None
             and self.is_draft
@@ -367,12 +368,12 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
                 self._validate_live_pages(group_table, seq_lens[:bs], logical_page_size)
         elif self._draft_reads_batch_pages(bs, forward_mode):
             # The drafter drives the draft backend directly and passes no cache
-            # metadata; the executor publishes the target's group table into
-            # the batch-ordered draft page table. The ids are scheduler pages,
-            # so record the size the expansion needs.
+            # metadata. ModelExecutor has already published and expanded the
+            # target's group table into this backend's kernel-page units, so
+            # consume the batch-ordered rows directly instead of expanding them
+            # a second time.
             self._cache_groups_bound = True
-            group_table = page_table[:bs]
-            logical_page_size = self._cache_logical_page_size
+            published_draft_page_table = True
         elif self._cache_groups_bound and bs > 0 and not forward_mode.is_idle():
             raise RuntimeError(
                 "MLAAttnBackend is bound to Paged cache but received no paged cache "
@@ -408,6 +409,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
                 group_table=group_table,
                 logical_page_size=logical_page_size,
                 q_len_per_req=self._verify_q_len(forward_mode),
+                page_table_is_batch_ordered=published_draft_page_table,
             )
 
     @contextmanager
@@ -562,6 +564,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         group_table: torch.Tensor | None = None,
         logical_page_size: int | None = None,
         q_len_per_req: int = 1,
+        page_table_is_batch_ordered: bool = False,
     ):
         if group_table is not None:
             assert logical_page_size is not None
@@ -578,6 +581,12 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
                 validate_pages=cache_debug_enabled(),
                 q_len_per_req=q_len_per_req,
             )
+        elif page_table_is_batch_ordered:
+            # The executor publishes draft rows in batch order and in this
+            # backend's kernel-page units. Do not index them by request-pool id
+            # and do not run logical-page expansion again.
+            page_table = page_table[:bs, : self.max_num_pages]
+            group_out_cache_loc = None
         else:
             page_table = build_page_table(
                 req_pool_indices[:bs],
@@ -804,30 +813,27 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         spec = self.spec_num_tokens
         width = self.max_num_pages
         rows = self.cuda_graph_page_table[: bs * spec, :width].view(bs, spec, width)
-        table = None
-        logical_page_size = None
         if self._cache_groups_bound and cache_metadata is not None:
             table, logical_page_size = self._resolve_full_history_table(
                 cache_metadata, forward_batch, 0
             )
-        elif (
-            self._cache_groups_bound
-            and self._cache_logical_page_size is not None
-            and page_table is not None
-        ):
-            # Draft replay: scheduler pages arrive through the batch table.
-            table = page_table[:bs]
-            logical_page_size = self._cache_logical_page_size
-        if table is not None:
             real_bs = min(int(table.shape[0]), bs)
             if real_bs > 0:
                 expanded = self._expand_group_page_table(
                     table, batch_size=real_bs, logical_page_size=logical_page_size
                 )
                 rows[:real_bs].copy_(expanded[:, None, :width])
-            # Padded rows resolve to the null page 0.
             if real_bs < bs:
                 rows[real_bs:].zero_()
+            return
+        if (
+            self._cache_groups_bound
+            and self._cache_logical_page_size is not None
+            and page_table is not None
+        ):
+            # Draft replay receives the already-expanded batch table published
+            # by ModelExecutor. Padded rows were zeroed at publication time.
+            rows.copy_(page_table[:bs, :width][:, None, :])
             return
         if page_table is None:
             raise RuntimeError(

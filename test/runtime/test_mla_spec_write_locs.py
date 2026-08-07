@@ -9,8 +9,17 @@ select_out_cache_loc guard or, worse, folds N tokens' KV into one slot.
 
 from __future__ import annotations
 
+import os
+import sys
+
 import pytest
 import torch
+
+# CI Registration (parsed via AST, runtime no-op)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.mla import (
@@ -326,9 +335,10 @@ def test_an_unmarked_draft_is_refused_on_the_group_graph_path() -> None:
         )
 
 
-def test_a_contract_bound_draft_is_admitted_on_the_group_graph_path() -> None:
+def test_a_contract_bound_block_draft_is_admitted_on_the_group_graph_path() -> None:
     """A draft sharing the target's LCM page ids reads them through the bridge."""
     backend = _backend(spec_num_tokens=8, is_draft=True)
+    backend.draft_block_decode = True
     backend.init_cuda_graph_state(max_bs=2)
     backend.init_forward_metadata_capture_cuda_graph(
         bs=2,
