@@ -236,6 +236,14 @@ def test_dspark_archs_are_never_suffixed_with_nextn(tmp_path) -> None:
         assert config.architectures[0] == arch
 
 
+def test_k3_dspark_config_defaults_to_the_entry_architecture(tmp_path) -> None:
+    path = _write_config(tmp_path, model_type="k3_dspark")
+
+    config = get_config(path, trust_remote_code=False, is_draft_worker=True)
+
+    assert config.architectures == ["K3DSparkModel"]
+
+
 def test_non_spec_archs_still_get_the_nextn_rewrite(tmp_path) -> None:
     path = _write_config(tmp_path, architectures=["Qwen3ForCausalLM"])
     config = get_config(path, trust_remote_code=False, is_draft_worker=True)

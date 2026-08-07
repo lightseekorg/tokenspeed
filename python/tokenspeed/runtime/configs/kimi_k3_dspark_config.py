@@ -112,6 +112,12 @@ class KimiK3DSparkConfig(PretrainedConfig):
         self.markov_head_type = str(markov_head_type).lower()
         self.enable_confidence_head = bool(enable_confidence_head)
         self.confidence_head_with_markov = bool(confidence_head_with_markov)
+        if not kwargs.get("architectures"):
+            # The published K3 DSpark config may omit ``architectures``. The
+            # runtime model registry dispatches by this field, so materialize
+            # the native entry class instead of falling back to the config
+            # class name (which has no registered model implementation).
+            kwargs["architectures"] = ["K3DSparkModel"]
         super().__init__(**kwargs)
 
     @property
