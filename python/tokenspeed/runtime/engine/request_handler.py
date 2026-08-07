@@ -271,10 +271,13 @@ class RequestHandler:
         req_spec = make_spec(
             rid=recv_req.rid,
             tokens=recv_req.input_ids,
-            # getattr: the adapter registry that resolves and attaches lora_id
-            # to the request input lands separately. Until it does, every
-            # request is base-model and the scheduler behaves exactly as before.
-            lora_id=getattr(recv_req, "lora_id", None),
+            # getattr, not a direct read: TokenizedGenerateReqInput is a
+            # positionally-encoded msgspec Struct whose field order and arity
+            # are the IPC wire contract with the frontend, so the adapter id is
+            # added there by the LoRA front-end change rather than here. Until
+            # that lands every request resolves to 0 (base model) and
+            # scheduling is byte-for-byte what it was before this PR.
+            lora_id=getattr(recv_req, "lora_id", 0),
         )
         req_state = RequestState.from_recv_req(
             recv_req,

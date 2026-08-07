@@ -30,10 +30,10 @@ namespace tokenspeed {
 struct RequestSpec {
     std::string request_id;
     std::vector<std::int32_t> tokens;
-    // Resolved LoRA adapter id, or empty for a base-model request. Opaque to the
-    // scheduler: it only ever compares it for equality and folds it into page
-    // hashes, so the front-end is free to change how it mints the value.
-    std::string lora_id;
+    // Resolved LoRA adapter id from the front-end registry; 0 means base model.
+    // Opaque to the scheduler: it only ever compares ids for equality and folds
+    // them into page hashes, never interpreting the value itself.
+    std::int32_t lora_id{0};
 };
 
 struct PrefillInfo {

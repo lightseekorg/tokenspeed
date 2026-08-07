@@ -47,10 +47,10 @@ protected:
 };
 
 TEST_F(MaxLorasSuite, BatchNeverExceedsDistinctAdapterCap) {
-    Submit(MakeRequestSpec("r1", 2, 100, "adapter-a"));
-    Submit(MakeRequestSpec("r2", 2, 200, "adapter-b"));
-    Submit(MakeRequestSpec("r3", 2, 300, "adapter-c"));
-    Submit(MakeRequestSpec("r4", 2, 400, "adapter-d"));
+    Submit(MakeRequestSpec("r1", 2, 100, 1));
+    Submit(MakeRequestSpec("r2", 2, 200, 2));
+    Submit(MakeRequestSpec("r3", 2, 300, 3));
+    Submit(MakeRequestSpec("r4", 2, 400, 4));
 
     const std::vector<std::string> ids = BatchRequestIds(PlanOnce());
     ASSERT_FALSE(ids.empty());
@@ -61,10 +61,10 @@ TEST_F(MaxLorasSuite, BatchNeverExceedsDistinctAdapterCap) {
 
 TEST_F(MaxLorasSuite, RepeatedAdapterCostsNoAdditionalSlot) {
     // Four requests but only two distinct adapters: nothing should be deferred.
-    Submit(MakeRequestSpec("r1", 2, 100, "adapter-a"));
-    Submit(MakeRequestSpec("r2", 2, 200, "adapter-a"));
-    Submit(MakeRequestSpec("r3", 2, 300, "adapter-b"));
-    Submit(MakeRequestSpec("r4", 2, 400, "adapter-b"));
+    Submit(MakeRequestSpec("r1", 2, 100, 1));
+    Submit(MakeRequestSpec("r2", 2, 200, 1));
+    Submit(MakeRequestSpec("r3", 2, 300, 2));
+    Submit(MakeRequestSpec("r4", 2, 400, 2));
 
     const std::vector<std::string> ids = BatchRequestIds(PlanOnce());
     EXPECT_EQ(ids, (std::vector<std::string>{"r1", "r2", "r3", "r4"}));
@@ -73,8 +73,8 @@ TEST_F(MaxLorasSuite, RepeatedAdapterCostsNoAdditionalSlot) {
 TEST_F(MaxLorasSuite, BaseModelRequestsAreNotCharged) {
     // Base-model requests hold no adapter slot, so they coexist with a full
     // adapter budget rather than being deferred behind it.
-    Submit(MakeRequestSpec("r1", 2, 100, "adapter-a"));
-    Submit(MakeRequestSpec("r2", 2, 200, "adapter-b"));
+    Submit(MakeRequestSpec("r1", 2, 100, 1));
+    Submit(MakeRequestSpec("r2", 2, 200, 2));
     Submit(MakeRequestSpec("r3", 2, 300));
     Submit(MakeRequestSpec("r4", 2, 400));
 
@@ -94,9 +94,9 @@ protected:
 TEST_F(LorasDisabledSuite, ZeroMaxLorasEnforcesNoCap) {
     // max_loras == 0 means LoRA scheduling is off, not "admit zero adapters":
     // the cap simply is not applied, matching the pre-LoRA scheduler exactly.
-    Submit(MakeRequestSpec("r1", 2, 100, "adapter-a"));
-    Submit(MakeRequestSpec("r2", 2, 200, "adapter-b"));
-    Submit(MakeRequestSpec("r3", 2, 300, "adapter-c"));
+    Submit(MakeRequestSpec("r1", 2, 100, 1));
+    Submit(MakeRequestSpec("r2", 2, 200, 2));
+    Submit(MakeRequestSpec("r3", 2, 300, 3));
 
     const std::vector<std::string> ids = BatchRequestIds(PlanOnce());
     EXPECT_EQ(ids, (std::vector<std::string>{"r1", "r2", "r3"}));

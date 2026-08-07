@@ -472,7 +472,7 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
     bool pushed_prefill = false;
     // Distinct adapters already in this batch, tracked so the batch never
     // presents the runtime with more than max_loras of them.
-    std::set<std::string> batch_lora_ids;
+    std::set<std::int32_t> batch_lora_ids;
     auto push_operation = [&](const Request* request, auto operation) {
         if (config_.role != Role::kD) {
             token_budget -= operation.input_length;
@@ -480,7 +480,7 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
         if constexpr (std::is_same_v<std::decay_t<decltype(operation)>, PrefillOperation>) {
             pushed_prefill = true;
         }
-        if (!request->LoraId().empty()) {
+        if (request->LoraId() != 0) {
             batch_lora_ids.insert(request->LoraId());
         }
         operations.push_back(std::move(operation));
@@ -489,7 +489,7 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
     // it costs no additional slot. Only one that would introduce a *new*
     // adapter can hit the cap.
     const auto loraAdmits = [&](const Request* request) {
-        if (config_.max_loras <= 0 || request->LoraId().empty()) {
+        if (config_.max_loras <= 0 || request->LoraId() == 0) {
             return true;
         }
         return batch_lora_ids.size() < static_cast<std::size_t>(config_.max_loras) ||
