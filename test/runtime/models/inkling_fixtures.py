@@ -70,9 +70,9 @@ def load_inkling_config(
     Returns:
         The ``InklingMMConfig`` for the snapshot.
     """
-    from tokenspeed.runtime.utils.hf_transformers_utils import get_config
+    from tokenspeed.runtime.configs.utils import get_config
 
-    cfg = get_config(model_id, trust_remote_code=False, revision=None)
+    cfg = get_config(model_id, revision=None)
     if num_layers is not None:
         truncate_text_config(cfg.get_text_config(), num_layers)
     if num_experts is not None:

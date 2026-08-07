@@ -41,6 +41,7 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
+from tokenspeed.runtime.configs.base_config import get_rope_theta
 from tokenspeed.runtime.configs.kimi_k3_dspark_config import (
     K3_DSPARK_SKIPPED_WEIGHT_PREFIXES,
     k3_dspark_inactive_features,
@@ -194,7 +195,7 @@ class K3DSparkDecoderLayer(nn.Module):
             v_head_dim=int(config.v_head_dim),
             q_lora_rank=int(config.q_lora_rank),
             kv_lora_rank=int(config.kv_lora_rank),
-            rope_theta=config.resolved_rope_theta(),
+            rope_theta=get_rope_theta(config),
             rope_scaling=config.rope_scaling_dict(),
             max_position_embeddings=int(config.max_position_embeddings),
             quant_config=quant_config,

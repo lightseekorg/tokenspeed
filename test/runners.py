@@ -37,7 +37,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, GenerationConfig
 
 from tokenspeed.runtime.entrypoints.engine import Engine
 from tokenspeed.runtime.utils import get_device
-from tokenspeed.runtime.utils.hf_transformers_utils import get_tokenizer
+from tokenspeed.runtime.utils.tokenizer_utils import get_tokenizer
 
 DEFAULT_PROMPTS = [
     "Apple is red. Banana is Yellow. " * 800 + "Apple is",

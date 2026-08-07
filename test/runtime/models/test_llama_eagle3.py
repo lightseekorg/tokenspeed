@@ -10,8 +10,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from transformers import LlamaConfig
 
+from tokenspeed.runtime.configs.llama_config import LlamaConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.layernorm import RMSNorm

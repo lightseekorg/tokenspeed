@@ -30,9 +30,9 @@ from tokenspeed_kernel.thirdparty.cuda import dsv3_router_gemm as _dsv3_router_g
 from tokenspeed_kernel.thirdparty.cuda import (
     moe_finalize_fuse_shared as _moe_finalize_fuse_shared,
 )
-from transformers import PretrainedConfig as _PretrainedConfig
 
-from tokenspeed.runtime.configs.utils import get_rope_theta as _get_rope_theta
+from tokenspeed.runtime.configs.base_config import BaseConfig as _BaseConfig
+from tokenspeed.runtime.configs.base_config import get_rope_theta as _get_rope_theta
 from tokenspeed.runtime.distributed.comm_manager import CommManager as _CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping as _Mapping
 from tokenspeed.runtime.execution.context import ForwardContext as _ForwardContext
@@ -128,7 +128,7 @@ def _ensure_longcat_config(config):
 
 
 def _get_longcat_moe_quant_config(
-    config: _PretrainedConfig,
+    config: _BaseConfig,
     quant_config: _QuantizationConfig | None,
     prefix: str,
 ):
@@ -164,7 +164,7 @@ def _get_longcat_moe_quant_config(
 
 
 class _RuntimeLongcatRouter(nn.Module):
-    def __init__(self, config: _PretrainedConfig, prefix: str = ""):
+    def __init__(self, config: _BaseConfig, prefix: str = ""):
         super().__init__()
         if getattr(config, "router_bias", False):
             raise ValueError("LongCat router bias is not supported.")
@@ -198,7 +198,7 @@ class _RuntimeLongcatRouter(nn.Module):
 class _RuntimeLongcatMoE(nn.Module):
     def __init__(
         self,
-        config: _PretrainedConfig,
+        config: _BaseConfig,
         mapping: _Mapping,
         quant_config: _QuantizationConfig | None = None,
         layer_index: int = -1,
@@ -353,7 +353,7 @@ class _RuntimeLongcatMoE(nn.Module):
 class _RuntimeLongcatDecoderLayer(nn.Module):
     def __init__(
         self,
-        config: _PretrainedConfig,
+        config: _BaseConfig,
         layer_id: int,
         mapping: _Mapping,
         quant_config: _QuantizationConfig | None = None,
@@ -577,7 +577,7 @@ class _RuntimeLongcatModel(nn.Module):
 
     def __init__(
         self,
-        config: _PretrainedConfig,
+        config: _BaseConfig,
         mapping: _Mapping,
         quant_config: _QuantizationConfig | None = None,
         prefix: str = "",
@@ -659,7 +659,7 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
 
     def __init__(
         self,
-        config: _PretrainedConfig,
+        config: _BaseConfig,
         mapping: _Mapping,
         model: _RuntimeLongcatModel | None = None,
         quant_config: _QuantizationConfig | None = None,
@@ -676,7 +676,7 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
 
     def resolve_model(
         self,
-        config: _PretrainedConfig,
+        config: _BaseConfig,
         mapping: _Mapping,
         quant_config: _QuantizationConfig | None,
         prefix: str,

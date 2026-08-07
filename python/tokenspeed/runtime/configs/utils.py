@@ -18,792 +18,457 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Shared configuration utilities."""
+"""Configuration helpers and HuggingFace checkpoint loaders."""
 
-import math
+import copy
+import json
+import logging
+import os
+from typing import Any
 
-from transformers.configuration_utils import PretrainedConfig
-from transformers.utils import is_torch_available, logging
+import huggingface_hub
+import torch
+from huggingface_hub import hf_hub_download, snapshot_download
 
-logger = logging.get_logger(__name__)
-
-
-if is_torch_available():
-    import torch
-
-
-def get_rope_theta(config, default: float = 10000.0) -> float:
-    """Return rope_theta from config, including the transformers 5.x fallback."""
-    theta = getattr(config, "rope_theta", None)
-    if theta is not None:
-        return theta
-    rope_scaling = getattr(config, "rope_scaling", None)
-    if isinstance(rope_scaling, dict):
-        return rope_scaling.get("rope_theta", default)
-    return default
+from tokenspeed.runtime.configs import get_config_class
+from tokenspeed.runtime.configs.base_config import BaseConfig
+from tokenspeed.runtime.utils import lru_cache_frozenset
 
 
-def get_rope_parameters(config):
-    """Return TokenSpeed's full RoPE config, including private extensions."""
-    return (
-        getattr(config, "_tokenspeed_rope_parameters", None)
-        or getattr(config, "rope_parameters", None)
-        or {}
-    )
+def resolve_architecture(config: BaseConfig) -> str:
+    """Return ``config.architectures[0]`` or the config class name.
 
-
-def _compute_default_rope_parameters(
-    config: PretrainedConfig | None = None,
-    device: "torch.device | None" = None,
-    seq_len: int | None = None,
-    **rope_kwargs,
-) -> tuple["torch.Tensor", float]:
+    ``config.architectures`` can be ``None`` on configs that forward
+    attribute access to a nested ``text_config`` (e.g. ``Qwen3_5MoeConfig``).
+    Callers should use this helper instead of indexing the list directly.
     """
-    Computes the inverse frequencies according to the original RoPE implementation
-    Args:
-        config ([`~transformers.PretrainedConfig`]):
-            The model configuration.
-        device (`torch.device`):
-            The device to use for initialization of the inverse frequencies.
-        seq_len (`int`, *optional*):
-            The current sequence length. Unused for this type of RoPE.
-        rope_kwargs (`Dict`, *optional*):
-            BC compatibility with the previous RoPE class instantiation, will be removed in v4.45.
-    Returns:
-        Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
-        post-processing scaling factor applied to the computed cos/sin (unused in this type of RoPE).
+    archs = getattr(config, "architectures", None)
+    if archs:
+        return archs[0]
+    return type(config).__name__
+
+
+def get_hf_text_config(config: BaseConfig):
+    """Get the "sub" config relevant to llm for multi modal models.
+    No op for pure text models.
     """
-    if config is not None and rope_kwargs:
-        raise ValueError(
-            "Unexpected arguments: `**rope_kwargs` and `config` are mutually exclusive in "
-            f"`_compute_default_rope_parameters`, got `rope_kwargs`={rope_kwargs} and `config`={config}"
-        )
-    if rope_kwargs:
-        base = rope_kwargs["base"]
-        dim = rope_kwargs["dim"]
-    elif config is not None:
-        base = config.rope_theta
-        partial_rotary_factor = (
-            config.partial_rotary_factor
-            if hasattr(config, "partial_rotary_factor")
-            else 1.0
-        )
-        head_dim = getattr(
-            config, "head_dim", config.hidden_size // config.num_attention_heads
-        )
-        dim = int(head_dim * partial_rotary_factor)
+    class_name = resolve_architecture(config)
+    if class_name.startswith("Llava") and class_name.endswith("ForCausalLM"):
+        # We support non-hf version of llava models, so we do not want to
+        # read the wrong values from the unused default text_config.
+        # We set `dtype` of config to `torch.float16` for the weights, as
+        # `torch.float16` is default used for image features in
+        # `python/tokenspeed/runtime/models/llava.py`.
+        config.dtype = torch.float16
+        return config
 
-    attention_factor = 1.0  # Unused in this type of RoPE
-
-    # Compute the inverse frequencies
-    inv_freq = 1.0 / (
-        base
-        ** (
-            torch.arange(0, dim, 2, dtype=torch.int64).to(
-                device=device, dtype=torch.float
-            )
-            / dim
-        )
-    )
-    return inv_freq, attention_factor
-
-
-def _compute_linear_scaling_rope_parameters(
-    config: PretrainedConfig | None = None,
-    device: "torch.device | None" = None,
-    seq_len: int | None = None,
-    **rope_kwargs,
-) -> tuple["torch.Tensor", float]:
-    """
-    Computes the inverse frequencies with linear scaling. Credits to the Reddit user /u/kaiokendev
-    Args:
-        config ([`~transformers.PretrainedConfig`]):
-            The model configuration.
-        device (`torch.device`):
-            The device to use for initialization of the inverse frequencies.
-        seq_len (`int`, *optional*):
-            The current sequence length. Unused for this type of RoPE.
-        rope_kwargs (`Dict`, *optional*):
-            BC compatibility with the previous RoPE class instantiation, will be removed in v4.45.
-    Returns:
-        Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
-        post-processing scaling factor applied to the computed cos/sin (unused in this type of RoPE).
-    """
-    if config is not None and rope_kwargs:
-        raise ValueError(
-            "Unexpected arguments: `**rope_kwargs` and `config` are mutually exclusive in "
-            f"`_compute_linear_scaling_rope_parameters`, got `rope_kwargs`={rope_kwargs} and `config`={config}"
-        )
-    if rope_kwargs:
-        factor = rope_kwargs["factor"]
-    elif config is not None:
-        factor = config.rope_scaling["factor"]
-
-    # Gets the default RoPE parameters
-    inv_freq, attention_factor = _compute_default_rope_parameters(
-        config, device, seq_len, **rope_kwargs
-    )
-
-    # Then applies linear scaling to the frequencies.
-    #  originally, scaling was applied to the position_ids. However, we get `embs = inv_freq @ position_ids`, so
-    # applying scaling to the inverse frequencies is equivalent.
-    inv_freq /= factor
-    return inv_freq, attention_factor
-
-
-def _compute_dynamic_ntk_parameters(
-    config: PretrainedConfig | None = None,
-    device: "torch.device | None" = None,
-    seq_len: int | None = None,
-    **rope_kwargs,
-) -> tuple["torch.Tensor", float]:
-    """
-    Computes the inverse frequencies with NTK scaling. Credits to the Reddit users /u/bloc97 and /u/emozilla
-    Args:
-        config ([`~transformers.PretrainedConfig`]):
-            The model configuration.
-        device (`torch.device`):
-            The device to use for initialization of the inverse frequencies.
-        seq_len (`int`, *optional*):
-            The current sequence length, used to update the dynamic RoPE at inference time.
-        rope_kwargs (`Dict`, *optional*):
-            BC compatibility with the previous RoPE class instantiation, will be removed in v4.45.
-    Returns:
-        Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
-        post-processing scaling factor applied to the computed cos/sin (unused in this type of RoPE).
-    """
-    if config is not None and rope_kwargs:
-        raise ValueError(
-            "Unexpected arguments: `**rope_kwargs` and `config` are mutually exclusive in "
-            f"`_compute_dynamic_ntk_parameters`, got `rope_kwargs`={rope_kwargs} and `config`={config}"
-        )
-    if rope_kwargs:
-        base = rope_kwargs["base"]
-        dim = rope_kwargs["dim"]
-        max_position_embeddings = rope_kwargs["max_position_embeddings"]
-        factor = rope_kwargs["factor"]
-    elif config is not None:
-        base = config.rope_theta
-        partial_rotary_factor = (
-            config.partial_rotary_factor
-            if hasattr(config, "partial_rotary_factor")
-            else 1.0
-        )
-        head_dim = getattr(
-            config, "head_dim", config.hidden_size // config.num_attention_heads
-        )
-        dim = int(head_dim * partial_rotary_factor)
-        max_position_embeddings = config.max_position_embeddings
-        factor = config.rope_scaling["factor"]
-
-    attention_factor = 1.0  # Unused in this type of RoPE
-
-    # seq_len: default to max_position_embeddings, e.g. at init time
-    seq_len = (
-        seq_len
-        if seq_len is not None and seq_len > max_position_embeddings
-        else max_position_embeddings
-    )
-
-    # Compute the inverse frequencies
-    base = base * ((factor * seq_len / max_position_embeddings) - (factor - 1)) ** (
-        dim / (dim - 2)
-    )
-    inv_freq = 1.0 / (
-        base
-        ** (
-            torch.arange(0, dim, 2, dtype=torch.int64).to(
-                device=device, dtype=torch.float
-            )
-            / dim
-        )
-    )
-    return inv_freq, attention_factor
-
-
-def _compute_yarn_parameters(
-    config: PretrainedConfig,
-    device: "torch.device",
-    seq_len: int | None = None,
-    **rope_kwargs,
-) -> tuple["torch.Tensor", float]:
-    """
-    Computes the inverse frequencies with NTK scaling. Please refer to the
-    [original paper](https://arxiv.org/abs/2309.00071)
-    Args:
-        config ([`~transformers.PretrainedConfig`]):
-            The model configuration.
-        device (`torch.device`):
-            The device to use for initialization of the inverse frequencies.
-        seq_len (`int`, *optional*):
-            The current sequence length. Unused for this type of RoPE.
-        rope_kwargs (`Dict`, *optional*):
-            BC compatibility with the previous RoPE class instantiation, will be removed in v4.45.
-    Returns:
-        Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
-        post-processing scaling factor applied to the computed cos/sin.
-    """
-    # No need to keep BC with yarn, unreleased when this new pattern was created.
-    if rope_kwargs:
-        raise ValueError(
-            f"Unexpected arguments: `**rope_kwargs` should be unset in `_compute_yarn_parameters`, got {rope_kwargs}"
-        )
-
-    base = config.rope_theta
-    partial_rotary_factor = (
-        config.partial_rotary_factor
-        if hasattr(config, "partial_rotary_factor")
-        else 1.0
-    )
-    head_dim = getattr(
-        config, "head_dim", config.hidden_size // config.num_attention_heads
-    )
-    dim = int(head_dim * partial_rotary_factor)
-    factor = config.rope_scaling["factor"]
-    attention_factor = config.rope_scaling.get("attention_factor")
-    mscale = config.rope_scaling.get("mscale")
-    mscale_all_dim = config.rope_scaling.get("mscale_all_dim")
-
-    #  DeekSeek-V3 (and potentially other models) modify `max_position_embeddings` and have a
-    # `original_max_position_embeddings` field containing the pretrained value. They use the ratio between these two
-    # values to compute the default attention scaling factor, instead of using `factor`.
-    if "original_max_position_embeddings" in config.rope_scaling:
-        original_max_position_embeddings = config.rope_scaling[
-            "original_max_position_embeddings"
-        ]
-        factor = config.max_position_embeddings / original_max_position_embeddings
-    else:
-        original_max_position_embeddings = config.max_position_embeddings
-
-    def get_mscale(scale, mscale=1):
-        if scale <= 1:
-            return 1.0
-        return 0.1 * mscale * math.log(scale) + 1.0
-
-    # Sets the attention factor as suggested in the paper
-    if attention_factor is None:
-        if mscale and mscale_all_dim:
-            attention_factor = float(
-                get_mscale(factor, mscale) / get_mscale(factor, mscale_all_dim)
-            )
+    text_config = None
+    if hasattr(config, "text_config"):
+        # The code operates under the assumption that text_config should have
+        # `num_attention_heads` (among others). Check here to fail early
+        # if transformers config doesn't align with this assumption.
+        if not hasattr(config.text_config, "num_attention_heads"):
+            raise AttributeError("text_config must define num_attention_heads.")
+        text_config = config.text_config
+    if hasattr(config, "language_config"):
+        text_config = config.language_config
+    if hasattr(config, "thinker_config"):
+        # Qwen Omni wrappers keep the language model below thinker_config.
+        thinker_config = config.thinker_config
+        if hasattr(thinker_config, "text_config"):
+            thinker_config.text_config.dtype = thinker_config.dtype
+            text_config = thinker_config.text_config
         else:
-            attention_factor = get_mscale(factor)
+            text_config = thinker_config
 
-    # Optional config options
-    # beta_fast/beta_slow: as suggested in the paper, default to 32/1 (correspondingly)
-    beta_fast = config.rope_scaling.get("beta_fast") or 32
-    beta_slow = config.rope_scaling.get("beta_slow") or 1
+    if text_config is None:
+        return config
 
-    # Compute the inverse frequencies
-    def find_correction_dim(num_rotations, dim, base, max_position_embeddings):
-        """Inverse dimension formula to find the dimension based on the number of rotations"""
-        return (
-            dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))
-        ) / (2 * math.log(base))
+    if hasattr(config, "quantization_config") and not hasattr(
+        text_config, "quantization_config"
+    ):
+        quantization_config = config.quantization_config
+        for key in ["ignore", "ignored_layers", "modules_to_not_convert"]:
+            if key in quantization_config and isinstance(
+                quantization_config[key], list
+            ):
+                quantization_config[key] = [
+                    (
+                        x.replace("language_model.", "")
+                        if x.startswith("language_model.")
+                        else x
+                    )
+                    for x in quantization_config[key]
+                ]
+        text_config.quantization_config = quantization_config
 
-    def find_correction_range(low_rot, high_rot, dim, base, max_position_embeddings):
-        """Find dimension range bounds based on rotations"""
-        low = math.floor(
-            find_correction_dim(low_rot, dim, base, max_position_embeddings)
-        )
-        high = math.ceil(
-            find_correction_dim(high_rot, dim, base, max_position_embeddings)
-        )
-        return max(low, 0), min(high, dim - 1)
-
-    def linear_ramp_factor(min, max, dim):
-        if min == max:
-            max += 0.001  # Prevent singularity
-
-        linear_func = (torch.arange(dim, dtype=torch.float32) - min) / (max - min)
-        ramp_func = torch.clamp(linear_func, 0, 1)
-        return ramp_func
-
-    # Note on variable naming: "interpolation" comes from the original technique, where we interpolate the position IDs
-    # to expand the possible context length. In other words, interpolation = apply scaling factor.
-    pos_freqs = base ** (
-        torch.arange(0, dim, 2).to(device=device, dtype=torch.float) / dim
-    )
-    inv_freq_extrapolation = 1.0 / pos_freqs
-    inv_freq_interpolation = 1.0 / (factor * pos_freqs)
-
-    low, high = find_correction_range(
-        beta_fast, beta_slow, dim, base, original_max_position_embeddings
-    )
-
-    # Get n-dimensional rotational scaling corrected for extrapolation
-    inv_freq_extrapolation_factor = 1 - linear_ramp_factor(low, high, dim // 2).to(
-        device=device, dtype=torch.float
-    )
-    inv_freq = (
-        inv_freq_interpolation * (1 - inv_freq_extrapolation_factor)
-        + inv_freq_extrapolation * inv_freq_extrapolation_factor
-    )
-    return inv_freq, attention_factor
+    return text_config
 
 
-def _compute_longrope_parameters(
-    config: PretrainedConfig,
-    device: "torch.device",
-    seq_len: int | None = None,
-    **rope_kwargs,
-) -> tuple["torch.Tensor", float]:
+def _text_config_sub_class(
+    config_class: type[BaseConfig], key: str
+) -> type[BaseConfig] | None:
+    """Return the sub-config class registered under ``key``, or None."""
+    sub = getattr(config_class, "sub_configs", {})
+    cls = sub.get(key)
+    return cls if isinstance(cls, type) else None
+
+
+def _resolve_text_config(
+    config_class: type[BaseConfig],
+    config_values: dict[str, Any],
+) -> tuple[dict[str, Any], type[BaseConfig]]:
+    """Resolve ``(dict, class)`` that ``get_hf_text_config`` would select.
+
+    Mirrors the selection order in ``get_hf_text_config``
+    (``thinker_config.text_config`` > ``thinker_config`` > ``language_config``
+    > ``text_config`` > self), but walks the ``sub_configs`` class tree in
+    lockstep so the caller also gets the class that actually parses the
+    returned dict. Returning both from a single walk is what keeps the dict
+    and its ``attribute_map`` from drifting apart (e.g. a sibling talker text
+    config's aliases leaking onto the thinker's dict).
     """
-    Computes the inverse frequencies with LongRoPE scaling. Please refer to the
-    [original implementation](https://github.com/microsoft/LongRoPE)
-    Args:
-        config ([`~transformers.PretrainedConfig`]):
-            The model configuration.
-        device (`torch.device`):
-            The device to use for initialization of the inverse frequencies.
-        seq_len (`int`, *optional*):
-            The current sequence length.
-        rope_kwargs (`Dict`, *optional*):
-            BC compatibility with the previous RoPE class instantiation, will be removed in v4.45.
-    Returns:
-        Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
-        post-processing scaling factor applied to the computed cos/sin.
-    """
-    # No need to keep BC with longrope, unreleased when this new pattern was created.
-    if rope_kwargs:
-        raise ValueError(
-            "Unexpected arguments: `**rope_kwargs` should be unset in `_compute_longrope_parameters`, got "
-            f"{rope_kwargs}"
-        )
-
-    base = config.rope_theta
-    partial_rotary_factor = (
-        config.partial_rotary_factor
-        if hasattr(config, "partial_rotary_factor")
-        else 1.0
-    )
-    head_dim = getattr(
-        config, "head_dim", config.hidden_size // config.num_attention_heads
-    )
-    dim = int(head_dim * partial_rotary_factor)
-    long_factor = config.rope_scaling["long_factor"]
-    short_factor = config.rope_scaling["short_factor"]
-    factor = config.rope_scaling.get("factor")
-    attention_factor = config.rope_scaling.get("attention_factor")
-
-    #  Phi3 (and potentially other models) modify `max_position_embeddings` and have a
-    # `original_max_position_embeddings` field containing the pretrained value. They use the ratio between these two
-    # values to compute the default attention scaling factor, instead of using `factor`.
-    if hasattr(config, "original_max_position_embeddings"):
-        original_max_position_embeddings = config.original_max_position_embeddings
-        factor = (
-            config.max_position_embeddings / config.original_max_position_embeddings
-        )
-    else:
-        original_max_position_embeddings = config.max_position_embeddings
-
-    # Sets the attention factor as suggested in the paper
-    if attention_factor is None:
-        if factor <= 1.0:
-            attention_factor = 1.0
-        else:
-            attention_factor = math.sqrt(
-                1 + math.log(factor) / math.log(original_max_position_embeddings)
+    thinker = config_values.get("thinker_config")
+    if isinstance(thinker, dict):
+        thinker_cls = _text_config_sub_class(config_class, "thinker_config")
+        text = thinker.get("text_config")
+        if isinstance(text, dict):
+            text_cls = (
+                _text_config_sub_class(thinker_cls, "text_config")
+                if thinker_cls is not None
+                else None
             )
+            return text, text_cls or thinker_cls or config_class
+        return thinker, thinker_cls or config_class
 
-    # Compute the inverse frequencies -- scaled based on the target sequence length
-    if seq_len and seq_len > original_max_position_embeddings:
-        ext_factors = torch.tensor(long_factor, dtype=torch.float32, device=device)
-    else:
-        ext_factors = torch.tensor(short_factor, dtype=torch.float32, device=device)
-    inv_freq_shape = (
-        torch.arange(0, dim, 2, dtype=torch.int64, device=device).float() / dim
-    )
-    inv_freq = 1.0 / (ext_factors * base**inv_freq_shape)
+    language = config_values.get("language_config")
+    if isinstance(language, dict):
+        language_cls = _text_config_sub_class(config_class, "language_config")
+        return language, language_cls or config_class
 
-    return inv_freq, attention_factor
+    text = config_values.get("text_config")
+    if isinstance(text, dict):
+        text_cls = _text_config_sub_class(config_class, "text_config")
+        return text, text_cls or config_class
+
+    return config_values, config_class
 
 
-def _compute_llama3_parameters(
-    config: PretrainedConfig,
-    device: "torch.device",
-    seq_len: int | None = None,
-    **rope_kwargs,
-) -> tuple["torch.Tensor", float]:
-    """
-    Computes the inverse frequencies for llama 3.1.
+def _apply_dflash_aliases(text_values: dict[str, Any]) -> None:
+    """Translate a DFLASH/DSpark draft's SWA fields before construction.
+
+    ``Qwen3DSparkModel`` checkpoints declare ``model_type: "qwen3"`` and so
+    parse as ``Qwen3Config``, which nulls ``sliding_window`` unless
+    ``use_sliding_window`` is set -- a flag these checkpoints never write,
+    since they carry the window in ``dflash_config``. Apply the aliases to the
+    raw text config so Qwen3 derives ``layer_types`` and validates the final
+    sliding-window state in one pass.
 
     Args:
-        config ([`~transformers.PretrainedConfig`]):
-            The model configuration.
-        device (`torch.device`):
-            The device to use for initialization of the inverse frequencies.
-        seq_len (`int`, *optional*):
-            The current sequence length. Unused for this type of RoPE.
-        rope_kwargs (`Dict`, *optional*):
-            BC compatibility with the previous RoPE class instantiation, will be removed in v4.45.
-    Returns:
-        Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
-        post-processing scaling factor applied to the computed cos/sin.
+        text_values: The effective raw text config (the dict selected by
+            ``_resolve_text_config``), mutated in place.
     """
-    # Gets the default RoPE parameters
-    inv_freq, attention_factor = _compute_default_rope_parameters(
-        config, device, seq_len, **rope_kwargs
-    )
-
-    factor = config.rope_scaling["factor"]  # `8` in the original implementation
-    low_freq_factor = config.rope_scaling[
-        "low_freq_factor"
-    ]  # `1` in the original implementation
-    high_freq_factor = config.rope_scaling[
-        "high_freq_factor"
-    ]  # `4` in the original implementation
-    old_context_len = config.rope_scaling[
-        "original_max_position_embeddings"
-    ]  # `8192` in the original implementation
-
-    low_freq_wavelen = old_context_len / low_freq_factor
-    high_freq_wavelen = old_context_len / high_freq_factor
-
-    wavelen = 2 * math.pi / inv_freq
-    # wavelen < high_freq_wavelen: do nothing
-    # wavelen > low_freq_wavelen: divide by factor
-    inv_freq_llama = torch.where(
-        wavelen > low_freq_wavelen, inv_freq / factor, inv_freq
-    )
-    # otherwise: interpolate between the two, using a smooth factor
-    smooth_factor = (old_context_len / wavelen - low_freq_factor) / (
-        high_freq_factor - low_freq_factor
-    )
-    smoothed_inv_freq = (
-        1 - smooth_factor
-    ) * inv_freq_llama / factor + smooth_factor * inv_freq_llama
-    is_medium_freq = ~(wavelen < high_freq_wavelen) * ~(wavelen > low_freq_wavelen)
-    inv_freq_llama = torch.where(is_medium_freq, smoothed_inv_freq, inv_freq_llama)
-
-    return inv_freq_llama, attention_factor
-
-
-# This maps the "rope_type" string field in rope config to the corresponding function to compute the RoPE parameters
-# from the model config. You can append new {'rope_type': callable} pairs to this dictionary to enable custom RoPE
-# parameterizations, as long as the callable has the same signature.
-ROPE_INIT_FUNCTIONS = {
-    "default": _compute_default_rope_parameters,
-    "linear": _compute_linear_scaling_rope_parameters,
-    "dynamic": _compute_dynamic_ntk_parameters,
-    "yarn": _compute_yarn_parameters,
-    "longrope": _compute_longrope_parameters,
-    "llama3": _compute_llama3_parameters,
-}
-
-
-def _check_received_keys(
-    rope_type: str,
-    received_keys: set,
-    required_keys: set,
-    optional_keys: set | None = None,
-    ignore_keys: set | None = None,
-):
-    """Compare the received keys in `config.rope_scaling` against the expected and optional keys"""
-    # BC: "rope_type" was originally "type" -- let's check for "rope_type" when "type" is present
-    if "type" in received_keys:
-        received_keys -= {"type"}
-        required_keys.add("rope_type")
-
-    # Some models need to store model-specific keys, and we don't want to throw warning at them
-    if ignore_keys is not None:
-        received_keys -= ignore_keys
-
-    missing_keys = required_keys - received_keys
-    if missing_keys:
-        raise KeyError(
-            f"Missing required keys in `rope_scaling` for 'rope_type'='{rope_type}': {missing_keys}"
-        )
-
-    if optional_keys is not None:
-        unused_keys = received_keys - required_keys - optional_keys
-    else:
-        unused_keys = received_keys - required_keys
-    if unused_keys:
-        logger.warning(
-            "Unrecognized keys in `rope_scaling` for 'rope_type'='%s': %s",
-            rope_type,
-            unused_keys,
-        )
-
-
-def _validate_default_rope_parameters(
-    config: PretrainedConfig, ignore_keys: set | None = None
-):
-    rope_scaling = config.rope_scaling
-    rope_type = rope_scaling.get(
-        "rope_type", rope_scaling.get("type", None)
-    )  # BC: "rope_type" was originally "type"
-    required_keys = {"rope_type"}
-    received_keys = set(rope_scaling.keys())
-    _check_received_keys(
-        rope_type, received_keys, required_keys, ignore_keys=ignore_keys
-    )
-
-
-def _validate_linear_scaling_rope_parameters(
-    config: PretrainedConfig, ignore_keys: set | None = None
-):
-    rope_scaling = config.rope_scaling
-    rope_type = rope_scaling.get(
-        "rope_type", rope_scaling.get("type", None)
-    )  # BC: "rope_type" was originally "type"
-    required_keys = {"rope_type", "factor"}
-    received_keys = set(rope_scaling.keys())
-    _check_received_keys(
-        rope_type, received_keys, required_keys, ignore_keys=ignore_keys
-    )
-
-    factor = rope_scaling["factor"]
-    if factor is None or not isinstance(factor, float) or factor < 1.0:
-        logger.warning(
-            "`rope_scaling`'s factor field must be a float >= 1, got %s", factor
-        )
-
-
-def _validate_dynamic_scaling_rope_parameters(
-    config: PretrainedConfig, ignore_keys: set | None = None
-):
-    rope_scaling = config.rope_scaling
-    rope_type = rope_scaling.get(
-        "rope_type", rope_scaling.get("type", None)
-    )  # BC: "rope_type" was originally "type"
-    required_keys = {"rope_type", "factor"}
-    optional_keys = {"original_max_position_embeddings"}
-    received_keys = set(rope_scaling.keys())
-    _check_received_keys(
-        rope_type, received_keys, required_keys, optional_keys, ignore_keys=ignore_keys
-    )
-
-    factor = rope_scaling["factor"]
-    if factor is None or not isinstance(factor, float) or factor < 1.0:
-        logger.warning(
-            "`rope_scaling`'s factor field must be a float >= 1, got %s", factor
-        )
-
-
-def _validate_yarn_parameters(config: PretrainedConfig, ignore_keys: set | None = None):
-    rope_scaling = config.rope_scaling
-    rope_type = rope_scaling.get(
-        "rope_type", rope_scaling.get("type", None)
-    )  # BC: "rope_type" was originally "type"
-    required_keys = {"rope_type", "factor"}
-    optional_keys = {
-        "attention_factor",
-        "beta_fast",
-        "beta_slow",
-        "original_max_position_embeddings",
-        "mscale",
-        "mscale_all_dim",
-    }
-    received_keys = set(rope_scaling.keys())
-    _check_received_keys(
-        rope_type, received_keys, required_keys, optional_keys, ignore_keys=ignore_keys
-    )
-
-    factor = rope_scaling["factor"]
-    if factor is None or not isinstance(factor, float) or factor < 1.0:
-        logger.warning(
-            "`rope_scaling`'s factor field must be a float >= 1, got %s", factor
-        )
-
-    attention_factor = rope_scaling.get("attention_factor")
-    if attention_factor is not None and (
-        not isinstance(attention_factor, float) or attention_factor < 0
-    ):
-        logger.warning(
-            "`rope_scaling`'s attention_factor field must be a float greater than 0, got %s",
-            attention_factor,
-        )
-    beta_fast = rope_scaling.get("beta_fast")
-    if beta_fast is not None and not isinstance(beta_fast, float):
-        logger.warning(
-            "`rope_scaling`'s beta_fast field must be a float, got %s", beta_fast
-        )
-    beta_slow = rope_scaling.get("beta_slow")
-    if beta_slow is not None and not isinstance(beta_slow, float):
-        logger.warning(
-            "`rope_scaling`'s beta_slow field must be a float, got %s", beta_slow
-        )
-
-    if (beta_fast or 32) < (beta_slow or 1):
-        logger.warning(
-            "`rope_scaling`'s beta_fast field must be greater than beta_slow, got beta_fast=%s (defaults to 32 if None) and beta_slow=%s (defaults to 1 if None)",
-            beta_fast,
-            beta_slow,
-        )
-
-
-def _validate_longrope_parameters(
-    config: PretrainedConfig, ignore_keys: set | None = None
-):
-    rope_scaling = config.rope_scaling
-    rope_type = rope_scaling.get(
-        "rope_type", rope_scaling.get("type", None)
-    )  # BC: "rope_type" was originally "type"
-    required_keys = {"rope_type", "short_factor", "long_factor"}
-    optional_keys = {"attention_factor", "factor", "original_max_position_embeddings"}
-    received_keys = set(rope_scaling.keys())
-    _check_received_keys(
-        rope_type, received_keys, required_keys, optional_keys, ignore_keys=ignore_keys
-    )
-
-    partial_rotary_factor = (
-        config.partial_rotary_factor
-        if hasattr(config, "partial_rotary_factor")
-        else 1.0
-    )
-    head_dim = getattr(
-        config, "head_dim", config.hidden_size // config.num_attention_heads
-    )
-    dim = int(head_dim * partial_rotary_factor)
-
-    short_factor = rope_scaling.get("short_factor")
-    if not isinstance(short_factor, list) and all(
-        isinstance(x, (int, float)) for x in short_factor
-    ):
-        logger.warning(
-            "`rope_scaling`'s short_factor field must be a list of numbers, got %s",
-            short_factor,
-        )
-    if not len(short_factor) == dim // 2:
-        logger.warning(
-            "`rope_scaling`'s short_factor field must have length %s, got %s",
-            dim // 2,
-            len(short_factor),
-        )
-
-    long_factor = rope_scaling.get("long_factor")
-    if not isinstance(long_factor, list) and all(
-        isinstance(x, (int, float)) for x in long_factor
-    ):
-        logger.warning(
-            "`rope_scaling`'s long_factor field must be a list of numbers, got %s",
-            long_factor,
-        )
-    if not len(long_factor) == dim // 2:
-        logger.warning(
-            "`rope_scaling`'s long_factor field must have length %s, got %s",
-            dim // 2,
-            len(long_factor),
-        )
-
-    # Handle Phi3 divergence: prefer the use of `attention_factor` and/or `factor` over
-    # `original_max_position_embeddings` to compute internal variables. The latter lives outside `rope_scaling` and is
-    # unique to longrope (= undesirable)
-    if hasattr(config, "original_max_position_embeddings"):
-        logger.warning_once(
-            "This model has set a `original_max_position_embeddings` field, to be used together with "
-            "`max_position_embeddings` to determine a scaling factor. Please set the `factor` field of `rope_scaling`"
-            "with this ratio instead -- we recommend the use of this field over `original_max_position_embeddings`, "
-            "as it is compatible with most model architectures."
-        )
-    else:
-        factor = rope_scaling.get("factor")
-        if factor is None:
-            logger.warning("Missing required keys in `rope_scaling`: 'factor'")
-        elif not isinstance(factor, float) or factor < 1.0:
-            logger.warning(
-                "`rope_scaling`'s factor field must be a float >= 1, got %s", factor
-            )
-
-        attention_factor = rope_scaling.get("attention_factor")
-        if attention_factor is not None:
-            if not isinstance(attention_factor, float) or attention_factor < 0.0:
-                logger.warning(
-                    "`rope_scaling`'s attention_factor field must be a float greater than 0, got %s",
-                    attention_factor,
-                )
-
-
-def _validate_llama3_parameters(
-    config: PretrainedConfig, ignore_keys: set | None = None
-):
-    rope_scaling = config.rope_scaling
-    rope_type = rope_scaling.get(
-        "rope_type", rope_scaling.get("type", None)
-    )  # BC: "rope_type" was originally "type"
-    required_keys = {
-        "rope_type",
-        "factor",
-        "original_max_position_embeddings",
-        "low_freq_factor",
-        "high_freq_factor",
-    }
-    received_keys = set(rope_scaling.keys())
-    _check_received_keys(
-        rope_type, received_keys, required_keys, ignore_keys=ignore_keys
-    )
-
-    factor = rope_scaling["factor"]
-    if factor is None or not isinstance(factor, float) or factor < 1.0:
-        logger.warning(
-            "`rope_scaling`'s factor field must be a float >= 1, got %s", factor
-        )
-
-    low_freq_factor = rope_scaling["low_freq_factor"]
-    high_freq_factor = rope_scaling["high_freq_factor"]
-    if low_freq_factor is None or not isinstance(low_freq_factor, float):
-        logger.warning(
-            "`rope_scaling`'s low_freq_factor field must be a float, got %s",
-            low_freq_factor,
-        )
-    if high_freq_factor is None or not isinstance(high_freq_factor, float):
-        logger.warning(
-            "`rope_scaling`'s high_freq_factor field must be a float, got %s",
-            high_freq_factor,
-        )
-    if high_freq_factor <= low_freq_factor:
-        logger.warning(
-            "`rope_scaling`'s high_freq_factor field must be greater than low_freq_factor, got high_freq_factor=%s and low_freq_factor=%s",
-            high_freq_factor,
-            low_freq_factor,
-        )
-
-    original_max_position_embeddings = rope_scaling["original_max_position_embeddings"]
-    if original_max_position_embeddings is None or not isinstance(
-        original_max_position_embeddings, int
-    ):
-        logger.warning(
-            "`rope_scaling`'s original_max_position_embeddings field must be an integer, got %s",
-            original_max_position_embeddings,
-        )
-    if original_max_position_embeddings >= config.max_position_embeddings:
-        logger.warning(
-            "`rope_scaling`'s original_max_position_embeddings field must be less than max_position_embeddings, got %s and max_position_embeddings=%s",
-            original_max_position_embeddings,
-            config.max_position_embeddings,
-        )
-
-
-# Like `ROPE_INIT_FUNCTIONS`, this validation function mapping can be dynamically updated for custom RoPE types.
-ROPE_VALIDATION_FUNCTIONS = {
-    "default": _validate_default_rope_parameters,
-    "linear": _validate_linear_scaling_rope_parameters,
-    "dynamic": _validate_dynamic_scaling_rope_parameters,
-    "yarn": _validate_yarn_parameters,
-    "longrope": _validate_longrope_parameters,
-    "llama3": _validate_llama3_parameters,
-}
-
-
-def rope_config_validation(config: PretrainedConfig, ignore_keys: set | None = None):
-    """
-    Validate the RoPE config arguments, given a `PretrainedConfig` object
-    """
-    rope_scaling = getattr(
-        config, "rope_scaling", None
-    )  # not a default parameter in `PretrainedConfig`
-    if rope_scaling is None:
+    dflash_config = text_values.get("dflash_config")
+    if not isinstance(dflash_config, dict):
         return
 
-    # BC: "rope_type" was originally "type"
-    rope_type = rope_scaling.get("rope_type", rope_scaling.get("type", "default"))
-    validation_fn = ROPE_VALIDATION_FUNCTIONS.get(rope_type)
-    if validation_fn is not None:
-        validation_fn(config, ignore_keys=ignore_keys)
+    explicit_use_sliding_window = "use_sliding_window" in text_values
+    sliding_window = text_values.get("sliding_window")
+    if explicit_use_sliding_window:
+        use_sliding_window = bool(text_values["use_sliding_window"])
     else:
-        logger.warning(
-            "Missing validation function mapping in `ROPE_VALIDATION_FUNCTIONS` for 'rope_type'='%s'",
-            rope_type,
+        use_sliding_window = sliding_window is not None or bool(
+            dflash_config.get("use_swa")
         )
+
+    if not use_sliding_window:
+        return
+
+    text_values["use_sliding_window"] = True
+    if sliding_window is not None:
+        text_values["sliding_window"] = int(sliding_window)
+        return
+
+    dflash_window = dflash_config.get("swa_window_size")
+    if dflash_window is not None:
+        text_values["sliding_window"] = int(dflash_window)
+    elif not explicit_use_sliding_window:
+        raise ValueError(
+            "`dflash_config.swa_window_size` must be provided when "
+            "`dflash_config.use_swa` is enabled"
+        )
+
+
+def _apply_rope_override(
+    text_values: dict[str, Any], overrides: dict[str, Any]
+) -> None:
+    """Reconcile a RoPE override with the checkpoint's RoPE spelling.
+
+    A checkpoint may ship its rope configuration under the legacy
+    ``rope_scaling`` key or the canonical ``rope_parameters`` key, and an
+    override may use either spelling too. Normalize the override onto the
+    canonical field so ``__post_init__`` sees a single authoritative value,
+    covering all four checkpoint/override combinations:
+
+    * ``rope_parameters`` override -- written canonical, and the checkpoint's
+      stale ``rope_scaling`` is dropped so it cannot shadow the override.
+    * ``rope_scaling`` override -- the checkpoint's ``rope_parameters`` is
+      dropped and the legacy dict written in its place; ``__post_init__``
+      converts it with the same model-specific rules as a legacy checkpoint.
+    * Both override keys -- the canonical ``rope_parameters`` wins and the
+      legacy spelling is discarded, mirroring ``__post_init__`` precedence.
+
+    Args:
+        text_values: The effective raw text config, mutated in place.
+        overrides: The override fields; ``rope_scaling``/``rope_parameters``
+            are consumed here, remaining fields are left for the caller.
+    """
+    has_parameters = "rope_parameters" in overrides
+    has_scaling = "rope_scaling" in overrides
+    override_parameters = overrides.pop("rope_parameters", None)
+    override_scaling = overrides.pop("rope_scaling", None)
+
+    if has_parameters:
+        text_values["rope_parameters"] = override_parameters
+        text_values.pop("rope_scaling", None)
+    elif has_scaling:
+        text_values.pop("rope_parameters", None)
+        text_values["rope_scaling"] = override_scaling
+
+
+def _apply_alias_override(
+    text_values: dict[str, Any],
+    overrides: dict[str, Any],
+    attribute_map: dict[str, str],
+) -> None:
+    """Reconcile ``attribute_map`` aliases so an override always wins.
+
+    ``attribute_map`` maps a legacy checkpoint name (key) onto a canonical field
+    name (value). A checkpoint may write a field under the legacy alias while an
+    override uses the canonical name, or vice versa. After the override is
+    merged both keys coexist, and ``__post_init__``'s setattr loop applies the
+    leftover alias last, silently shadowing the override. Normalize each pair
+    onto the canonical field so the override is the single authoritative value
+    regardless of which spelling either side used.
+
+    Args:
+        text_values: The effective raw text config, mutated in place.
+        overrides: The override fields; alias and canonical spellings are
+            consumed here, remaining fields are left for the caller.
+        attribute_map: ``alias -> canonical`` pairs of the config that parses
+            ``text_values``.
+    """
+    for alias, canonical in attribute_map.items():
+        if canonical in overrides:
+            text_values[canonical] = overrides.pop(canonical)
+            text_values.pop(alias, None)
+        elif alias in overrides:
+            text_values[canonical] = overrides.pop(alias)
+            text_values.pop(alias, None)
+
+
+def get_config(
+    model: str,
+    revision: str | None = None,
+    model_override_args: dict | None = None,
+    is_draft_worker: bool | None = False,
+    speculative_algorithm: str | None = None,
+    override_config_file: str | None = None,
+):
+    # Mirrors transformers' ``_configuration_file`` (default ``config.json``):
+    # the config filename within the model directory/repo.
+    config_file = override_config_file or "config.json"
+    if os.path.isdir(model):
+        model_path = model
+    else:
+        from tokenspeed.runtime.model_loader.weight_utils import get_lock
+
+        with get_lock(model):
+            model_path = snapshot_download(
+                model,
+                revision=revision,
+                ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
+            )
+
+    try:
+        with open(os.path.join(model_path, config_file)) as file:
+            raw_config = json.load(file)
+    except FileNotFoundError:
+        raise RuntimeError(f"Config file not found in {model}. Please check the path.")
+    except json.JSONDecodeError:
+        raise RuntimeError(
+            f"Failed to decode JSON from config file in {model}. Please ensure the file is valid JSON."
+        )
+
+    model_type = raw_config.get("model_type")
+    config_class = get_config_class(model_type)
+    if config_class is None:
+        raise ValueError(
+            f"Unsupported model_type '{model_type}' for model '{model}'. "
+            "Only model types with a config class registered in "
+            "tokenspeed.runtime.configs are supported."
+        )
+
+    config_values = copy.deepcopy(raw_config)
+    text_values, text_config_class = _resolve_text_config(config_class, config_values)
+    if model_override_args:
+        # An override may spell a field with either its canonical name or a
+        # legacy ``attribute_map`` alias, independent of the checkpoint's
+        # spelling. Normalize both RoPE and attribute-map aliases onto the
+        # canonical field first so the override always wins. The alias map is
+        # taken from the config class that actually parses ``text_values``,
+        # not from sibling sub-configs.
+        overrides = dict(model_override_args)
+        _apply_rope_override(text_values, overrides)
+        _apply_alias_override(
+            text_values,
+            overrides,
+            getattr(text_config_class, "attribute_map", {}),
+        )
+        text_values.update(overrides)
+    if is_draft_worker:
+        _apply_dflash_aliases(text_values)
+
+    # Construct from the overridden raw fields so __post_init__ recomputes
+    # dependent values such as head_dim and per-layer dispatch schedules.
+    config = config_class.from_dict(config_values)
+    config.name_or_path = model
+
+    # extract 'text_config'
+    text_config = get_hf_text_config(config)
+
+    # quantization config will copy to text_config
+    if hasattr(text_config, "quantization_config"):
+        if "modules_to_not_convert" in text_config.quantization_config:
+            text_config.quantization_config["ignored_layers"] = (
+                text_config.quantization_config["modules_to_not_convert"]
+            )
+            del text_config.quantization_config["modules_to_not_convert"]
+
+    # If the draft head ships in the same checkpoint as the base model,
+    # rewrite the architecture in place so the model loader dispatches
+    # to the *NextN / *Eagle3 entry class instead of the base one.
+    # ``architectures`` may be None when the on-disk config.json lacks the
+    # field, so the truthiness checks below stay.
+    if (
+        is_draft_worker
+        and config.architectures
+        and config.architectures[0].startswith("Qwen3DSparkModel")
+    ):
+        config.architectures[0] = "DSparkDraftModel"
+
+    if (
+        is_draft_worker
+        and config.architectures
+        and "NextN" not in config.architectures[0]
+        and "Eagle" not in config.architectures[0]
+        and "DFlash" not in config.architectures[0]
+        and "DSpark" not in config.architectures[0]
+    ):
+        if (
+            speculative_algorithm == "DSPARK"
+            and config.architectures[0] == "DeepseekV4ForCausalLM"
+        ):
+            config.architectures[0] = "DeepseekV4ForCausalLMDSpark"
+        else:
+            config.architectures[0] += "NextN"
+
+    if text_config.architectures == ["LlamaForCausalLMNextN"]:
+        text_config.num_hidden_layers = 1
+
+    if resolve_architecture(config) in [
+        "KimiK25ForConditionalGeneration",
+        "KimiK25Config",
+        "KimiK3ForConditionalGeneration",
+        "KimiK3ForConditionalGenerationNextN",
+        "KimiK3Config",
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGenerationNextN",
+        "Qwen3_5MoeConfig",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5ForConditionalGenerationNextN",
+        "InklingForConditionalGeneration",
+        "InklingForConditionalGenerationNextN",
+        "InklingMMConfig",
+        "Qwen3OmniMoeForConditionalGeneration",
+        "Qwen3OmniMoeConfig",
+        "Qwen3ASRForConditionalGeneration",
+        "Qwen3ASRConfig",
+        "Glm53FlashForConditionalGeneration",
+        "Glm53FlashForConditionalGenerationNextN",
+        "MiniMaxM3SparseForConditionalGeneration",
+    ]:
+        config.text_config = text_config
+        return config
+
+    return text_config
+
+
+@lru_cache_frozenset(maxsize=32)
+def get_generation_config(
+    model: str,
+    revision: str | None = None,
+):
+    """Load ``generation_config.json`` as a plain dict, or ``None`` if absent.
+
+    ``GenerationConfig.from_pretrained`` was dropped together with the other
+    transformers config interfaces; only ``eos_token_id`` is read downstream,
+    so a raw JSON load is sufficient.
+    """
+    try:
+        if os.path.isdir(model):
+            generation_config_path = os.path.join(model, "generation_config.json")
+        else:
+            generation_config_path = hf_hub_download(
+                model,
+                "generation_config.json",
+                revision=revision,
+            )
+
+        with open(generation_config_path, encoding="utf-8") as file:
+            return json.load(file)
+    except (
+        OSError,
+        huggingface_hub.utils.EntryNotFoundError,
+        huggingface_hub.utils.LocalEntryNotFoundError,
+    ):
+        logging.debug("model doesn't have generation_config.json")
+        return None
+
+
+# Models don't use the same configuration key for determining the maximum
+# context length.  Store them here so we can sanely check them.
+#  The ordering here is important. Some models have two of these and we
+# have a preference for which value gets used.
+CONTEXT_LENGTH_KEYS = [
+    "max_sequence_length",
+    "seq_length",
+    "max_seq_len",
+    "model_max_length",
+    "max_position_embeddings",
+]
+
+
+def get_context_length(config):
+    """Get the context length of a model from a Hugging Face model config.
+
+    For YaRN, a missing ``original_max_position_embeddings`` means
+    ``max_position_embeddings`` is the pre-extension length and still needs to
+    be multiplied by ``factor``. Config normalization must preserve that
+    absence; an explicitly present field means the maximum is already scaled.
+    """
+    text_config = config
+    rope_scaling = getattr(text_config, "rope_scaling", None)
+    rope_scaling_factor = 1
+    if isinstance(rope_scaling, dict) and "factor" in rope_scaling:
+        rope_scaling_factor = rope_scaling.get("factor", 1)
+        if "original_max_position_embeddings" in rope_scaling:
+            rope_scaling_factor = 1
+        if rope_scaling.get("rope_type", None) == "llama3":
+            rope_scaling_factor = 1
+
+    for key in CONTEXT_LENGTH_KEYS:
+        val = getattr(text_config, key, None)
+        if val is not None:
+            return int(rope_scaling_factor * val)
+    return 2048

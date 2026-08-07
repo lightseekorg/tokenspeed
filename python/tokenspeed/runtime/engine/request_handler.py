@@ -74,7 +74,7 @@ from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo
 from tokenspeed.runtime.utils import PipelinedPyobjBroadcaster
 from tokenspeed.runtime.utils.dispatch import TypeBasedDispatcher
 from tokenspeed.runtime.utils.env import envs
-from tokenspeed.runtime.utils.hf_transformers_utils import get_tokenizer
+from tokenspeed.runtime.utils.tokenizer_utils import get_tokenizer
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.utils.server_args import ServerArgs

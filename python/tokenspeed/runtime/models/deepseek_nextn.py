@@ -27,8 +27,8 @@ from collections.abc import Iterable
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
 
+from tokenspeed.runtime.configs.base_config import BaseConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import (
     ForwardContext,
@@ -132,7 +132,7 @@ class DeepseekV3DraftDecoderLayer(DeepseekV3DecoderLayer):
 class DeepseekModelNextN(nn.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
     ) -> None:
@@ -231,7 +231,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
 
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
     ) -> None:

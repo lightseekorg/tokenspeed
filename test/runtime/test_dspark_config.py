@@ -15,6 +15,8 @@ from unittest import mock
 import pytest
 import torch
 
+from tokenspeed.runtime.configs.kimi_k3_dspark_config import KimiK3DSparkConfig
+from tokenspeed.runtime.configs.utils import get_config
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
 from tokenspeed.runtime.execution.drafter.dflash import (
     DFlash,
@@ -32,7 +34,6 @@ from tokenspeed.runtime.layers.attention.configs.mla import (
 from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 from tokenspeed.runtime.models.base.transformer_model import BaseTransformerModel
 from tokenspeed.runtime.models.dspark import _get_markov_params
-from tokenspeed.runtime.utils.hf_transformers_utils import get_config
 
 # --------------------------------------------------------------------------
 # Block geometry: verify width vs draft block size
@@ -177,7 +178,7 @@ def _write_config(tmp_path, **fields) -> str:
 
 def test_qwen3_dspark_arch_is_rewritten_to_the_entry_class(tmp_path) -> None:
     path = _write_config(tmp_path, architectures=["Qwen3DSparkModel"])
-    config = get_config(path, trust_remote_code=False, is_draft_worker=True)
+    config = get_config(path, is_draft_worker=True)
     assert config.architectures[0] == "DSparkDraftModel"
 
 
@@ -185,21 +186,32 @@ def test_dspark_archs_are_never_suffixed_with_nextn(tmp_path) -> None:
     """The NextN rewrite must not fire for a DSpark draft checkpoint."""
     for arch in ("DSparkDraftModel", "K3DSparkModel"):
         path = _write_config(tmp_path, architectures=[arch])
-        config = get_config(path, trust_remote_code=False, is_draft_worker=True)
+        config = get_config(path, is_draft_worker=True)
         assert config.architectures[0] == arch
 
 
 def test_k3_dspark_config_defaults_to_the_entry_architecture(tmp_path) -> None:
     path = _write_config(tmp_path, model_type="k3_dspark")
 
-    config = get_config(path, trust_remote_code=False, is_draft_worker=True)
+    config = get_config(path, is_draft_worker=True)
 
     assert config.architectures == ["K3DSparkModel"]
 
 
+def test_k3_dspark_config_preserves_explicit_architecture() -> None:
+    config = KimiK3DSparkConfig.from_dict(
+        {
+            "model_type": "k3_dspark",
+            "architectures": ["MyCustomDraft"],
+        }
+    )
+
+    assert config.architectures == ["MyCustomDraft"]
+
+
 def test_non_spec_archs_still_get_the_nextn_rewrite(tmp_path) -> None:
     path = _write_config(tmp_path, architectures=["Qwen3ForCausalLM"])
-    config = get_config(path, trust_remote_code=False, is_draft_worker=True)
+    config = get_config(path, is_draft_worker=True)
     assert config.architectures[0] == "Qwen3ForCausalLMNextN"
 
 
@@ -231,17 +243,119 @@ def test_dspark_draft_keeps_the_window_transformers_would_null(
 ) -> None:
     """``Qwen3Config`` drops ``sliding_window`` unless ``use_sliding_window``.
 
-    DSpark checkpoints never write that flag, so without the restore every
-    consumer -- draft layer construction, the draft attention config, the cache
-    recipe -- sees None on a sliding draft. The window is read from the raw
-    config when present, else from ``dflash_config.swa_window_size``.
+    DSpark checkpoints never write that flag, so without alias translation
+    every consumer -- draft layer construction, the draft attention config,
+    the cache recipe -- sees None on a sliding draft. The window is read from
+    the raw config when present, else from ``dflash_config.swa_window_size``.
     """
     extra = {"sliding_window": 1024} if declare_top_level else {}
     path = _write_swa_draft_config(tmp_path, **extra)
 
-    config = get_config(path, trust_remote_code=False, is_draft_worker=True)
+    config = get_config(path, is_draft_worker=True)
 
     assert config.sliding_window == 1024
+    # The window and the layer types have to stay consistent: dflash raises on
+    # a config whose layers are sliding but whose window is None.
+    assert config.layer_types == ["sliding_attention", "sliding_attention"]
+
+
+def test_dspark_draft_window_survives_a_model_override(tmp_path) -> None:
+    """Alias translation reads the overridden fields, not the on-disk ones.
+
+    ``model_override_args`` is merged before the config is constructed, so a
+    translation that re-read the untouched ``config.json`` would quietly undo
+    the caller's window.
+    """
+    path = _write_swa_draft_config(tmp_path, sliding_window=1024)
+
+    config = get_config(
+        path,
+        model_override_args={"sliding_window": 512},
+        is_draft_worker=True,
+    )
+
+    assert config.sliding_window == 512
+
+
+def test_dspark_draft_derives_layer_types_from_dflash_swa(tmp_path) -> None:
+    path = _write_config(
+        tmp_path,
+        architectures=["Qwen3DSparkModel"],
+        num_hidden_layers=4,
+        max_window_layers=2,
+        dflash_config={"use_swa": True, "swa_window_size": 1024},
+    )
+
+    config = get_config(path, is_draft_worker=True)
+
+    assert config.use_sliding_window is True
+    assert config.sliding_window == 1024
+    assert config.layer_types == [
+        "full_attention",
+        "full_attention",
+        "sliding_attention",
+        "sliding_attention",
+    ]
+
+
+def test_dflash_swa_aliases_apply_only_to_draft_workers(tmp_path) -> None:
+    path = _write_config(
+        tmp_path,
+        architectures=["Qwen3DSparkModel"],
+        num_hidden_layers=4,
+        max_window_layers=2,
+        dflash_config={"use_swa": True, "swa_window_size": 1024},
+    )
+
+    config = get_config(path, is_draft_worker=False)
+
+    assert config.use_sliding_window is False
+    assert config.sliding_window is None
+    assert config.layer_types == ["full_attention"] * 4
+
+
+def test_explicit_standard_flag_can_disable_dflash_swa(tmp_path) -> None:
+    path = _write_config(
+        tmp_path,
+        architectures=["Qwen3DSparkModel"],
+        use_sliding_window=False,
+        dflash_config={"use_swa": True, "swa_window_size": 1024},
+    )
+
+    config = get_config(path, is_draft_worker=True)
+
+    assert config.use_sliding_window is False
+    assert config.sliding_window is None
+    assert config.layer_types == ["full_attention"] * 2
+
+
+def test_dflash_swa_requires_a_window_when_inferred(tmp_path) -> None:
+    path = _write_config(
+        tmp_path,
+        architectures=["Qwen3DSparkModel"],
+        dflash_config={"use_swa": True},
+    )
+
+    with pytest.raises(ValueError, match="swa_window_size"):
+        get_config(path, is_draft_worker=True)
+
+
+def test_dspark_draft_without_a_declared_window_stays_null(tmp_path) -> None:
+    """Nothing is invented for a draft that declares no window at all.
+
+    ``dflash_config`` alone must not conjure one: with ``use_swa`` unset and no
+    raw ``sliding_window``, there is no window to translate and the stock
+    ``Qwen3Config`` behaviour has to stand.
+    """
+    path = _write_config(
+        tmp_path,
+        architectures=["Qwen3DSparkModel"],
+        dflash_config={"mask_token_id": 127, "use_swa": False},
+    )
+
+    config = get_config(path, is_draft_worker=True)
+
+    assert config.sliding_window is None
 
 
 # --------------------------------------------------------------------------

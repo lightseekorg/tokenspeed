@@ -49,9 +49,8 @@ from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
-from transformers import PretrainedConfig
 
-from tokenspeed.runtime.configs.utils import get_rope_theta
+from tokenspeed.runtime.configs.base_config import BaseConfig, get_rope_theta
 from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
@@ -279,7 +278,7 @@ class MoEGate(nn.Module):
 class DeepseekV3MoE(nn.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         layer_index: int = -1,
@@ -488,7 +487,7 @@ class DeepseekV3AttentionMLA(nn.Module):
 
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         mapping: Mapping,
         hidden_size: int,
         num_heads: int,
@@ -534,6 +533,7 @@ class DeepseekV3AttentionMLA(nn.Module):
 
         # modification to rope_scaling must be done early enough, b/c e.g. Indexer needs it
         if rope_scaling:
+            rope_scaling = dict(rope_scaling)
             rope_scaling["rope_type"] = "deepseek_yarn"
 
         if self.q_lora_rank is not None:
@@ -1372,7 +1372,7 @@ class DeepseekV3DecoderLayer(nn.Module):
 
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         layer_id: int,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
@@ -1545,7 +1545,7 @@ class DeepseekV3Model(nn.Module):
 
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -1659,7 +1659,7 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
 
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         mapping: Mapping,
         model: DeepseekV3Model | None = None,
         quant_config: QuantizationConfig | None = None,
@@ -1675,7 +1675,7 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
 
     def resolve_model(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None,
         prefix: str,
@@ -1995,7 +1995,7 @@ class Eagle3MlaDecoderLayer(nn.Module):
 
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         mapping: Mapping,
         layer_id: int = 0,
         quant_config: QuantizationConfig | None = None,
@@ -2126,7 +2126,7 @@ class Eagle3MlaDecoderLayer(nn.Module):
 
 class Eagle3MlaModel(nn.Module):
     @staticmethod
-    def _get_eagle_layer_ids(config: PretrainedConfig):
+    def _get_eagle_layer_ids(config: BaseConfig):
         """Extract eagle aux hidden state layer IDs from config, or None if absent."""
         eagle_config = getattr(config, "eagle_config", None)
         if eagle_config is None:
@@ -2137,7 +2137,7 @@ class Eagle3MlaModel(nn.Module):
 
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -2286,7 +2286,7 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
 
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",

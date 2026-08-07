@@ -35,6 +35,8 @@ from tokenspeed_kernel.ops.embedding import (
 )
 from tokenspeed_kernel.torch_compile import get_compiler_backend
 
+from tokenspeed.runtime.configs.base_config import BaseConfig
+
 logger = logging.getLogger(__name__)
 
 
@@ -1093,7 +1095,7 @@ class MRotaryEmbedding(RotaryEmbedding):
     @staticmethod
     def get_rope_index_glm4v(
         input_ids: torch.Tensor,
-        hf_config: Any,
+        hf_config: BaseConfig,
         image_grid_thw: list[list[int]] | torch.Tensor,
         video_grid_thw: list[list[int]] | torch.Tensor,
         attention_mask: torch.Tensor,
@@ -1412,7 +1414,16 @@ def get_rope(
                 )
         elif scaling_type == "yarn":
             scaling_factor = rope_scaling["factor"]
-            original_max_position = rope_scaling["original_max_position_embeddings"]
+            # A checkpoint that omits ``original_max_position_embeddings``
+            # declares ``max_position_embeddings`` as the pre-extension length,
+            # so it is the extrapolation baseline. Configs deliberately leave
+            # the key absent in that case (see
+            # ``RotaryConfigMixin.standardize_rope_params``) so that
+            # ``get_context_length`` still knows to apply ``factor``; the
+            # fallback belongs here, where ``max_position`` is in scope.
+            original_max_position = rope_scaling.get(
+                "original_max_position_embeddings", max_position
+            )
             extra_kwargs = {
                 k: v
                 for k, v in rope_scaling.items()
@@ -1431,7 +1442,12 @@ def get_rope(
             )
         elif scaling_type == "deepseek_yarn":
             scaling_factor = rope_scaling["factor"]
-            original_max_position = rope_scaling["original_max_position_embeddings"]
+            # DeepSeek/GLM/Kimi adapters can translate a plain YaRN override
+            # into this runtime variant. Preserve the same missing-field
+            # convention as the standard YaRN branch above.
+            original_max_position = rope_scaling.get(
+                "original_max_position_embeddings", max_position
+            )
             extra_kwargs = {
                 k: v
                 for k, v in rope_scaling.items()

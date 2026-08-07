@@ -26,11 +26,11 @@
 Kimi K25 Model Configuration.
 """
 
-from transformers import DeepseekV3Config
-from transformers.configuration_utils import PretrainedConfig
+from tokenspeed.runtime.configs.base_config import BaseConfig
+from tokenspeed.runtime.configs.deepseek_v3_config import DeepseekV3Config
 
 
-class KimiK25VisionConfig(PretrainedConfig):
+class KimiK25VisionConfig(BaseConfig):
     """Vision configuration for K2-VL (vision tower + mm projector).
 
     Args:
@@ -57,60 +57,49 @@ class KimiK25VisionConfig(PretrainedConfig):
 
     model_type = "kimi_k25"
 
-    def __init__(
-        self,
-        # Vision Tower
-        patch_size: int = 14,
-        init_pos_emb_height: int = 64,
-        init_pos_emb_width: int = 64,
-        init_pos_emb_time: int = 4,
-        pos_emb_type: str = "divided_fixed",
-        num_attention_heads: int = 16,
-        num_hidden_layers: int = 27,
-        hidden_size: int = 1152,
-        intermediate_size: int = 4304,
-        merge_kernel_size: tuple[int, int] = (2, 2),
-        video_attn_type: str = "spatial_temporal",
-        merge_type: str = "sd2_tpool",
-        # MM Projector
-        mm_projector_type: str = "patchmerger",
-        mm_hidden_size: int | None = None,
-        projector_hidden_act: str = "gelu",
-        projector_ln_eps: float = 1e-5,
-        text_hidden_size: int = 7168,
-        vt_hidden_size: int | None = None,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
-        # Vision Tower
-        self.patch_size = patch_size
-        self.init_pos_emb_height = init_pos_emb_height
-        self.init_pos_emb_width = init_pos_emb_width
-        self.init_pos_emb_time = init_pos_emb_time
-        self.pos_emb_type = pos_emb_type
+    # Vision Tower
+    patch_size: int = 14
+    init_pos_emb_height: int = 64
+    init_pos_emb_width: int = 64
+    init_pos_emb_time: int = 4
+    pos_emb_type: str = "divided_fixed"
+    num_attention_heads: int = 16
+    num_hidden_layers: int = 27
+    hidden_size: int = 1152
+    intermediate_size: int = 4304
+    merge_kernel_size: tuple[int, int] = (2, 2)
+    video_attn_type: str = "spatial_temporal"
+    merge_type: str = "sd2_tpool"
+    # MM Projector
+    mm_projector_type: str = "patchmerger"
+    mm_hidden_size: int | None = None
+    projector_hidden_act: str = "gelu"
+    projector_ln_eps: float = 1e-5
+    text_hidden_size: int = 7168
+    vt_hidden_size: int | None = None
+
+    def __post_init__(self, **kwargs):
+        # The legacy constructor called ``super().__init__`` *before* assigning
+        # its fields, so BaseConfig's GQA head_dim resolution never saw them.
+        # Hide the two fields that drive that derivation for the duration of
+        # ``super().__post_init__`` to preserve the exact serialized state.
+        num_attention_heads = self.num_attention_heads
+        hidden_size = self.hidden_size
+        self.__dict__.pop("num_attention_heads", None)
+        self.__dict__.pop("hidden_size", None)
+        super().__post_init__(**kwargs)
         self.num_attention_heads = num_attention_heads
-        self.num_hidden_layers = num_hidden_layers
         self.hidden_size = hidden_size
+
         # Vision-tower hidden size the mm projector reads; defaults to hidden_size.
         self.vt_hidden_size = (
-            vt_hidden_size if vt_hidden_size is not None else hidden_size
+            self.vt_hidden_size if self.vt_hidden_size is not None else self.hidden_size
         )
-        self.intermediate_size = intermediate_size
-        self.merge_kernel_size = merge_kernel_size
-        self.video_attn_type = video_attn_type
-        self.merge_type = merge_type
-        # MM Projector
-        self.mm_projector_type = mm_projector_type
-        if mm_hidden_size is not None:
-            self.mm_hidden_size = mm_hidden_size
-        else:
-            self.mm_hidden_size = hidden_size
-        self.projector_hidden_act = projector_hidden_act
-        self.projector_ln_eps = projector_ln_eps
-        self.text_hidden_size = text_hidden_size
+        if self.mm_hidden_size is None:
+            self.mm_hidden_size = self.hidden_size
 
 
-class KimiK25Config(PretrainedConfig):
+class KimiK25Config(BaseConfig):
     """K2-VL model configuration.
 
     K2-VL extends Kimi-VL with video support using video-chunks.
@@ -154,40 +143,31 @@ class KimiK25Config(PretrainedConfig):
 
     model_type = "kimi_k25"
 
-    def __init__(
-        self,
-        text_config: dict | DeepseekV3Config | None = None,
-        vision_config: dict | KimiK25VisionConfig | None = None,
-        # Other parameters
-        ignore_index: int = -100,
-        media_placeholder_token_id: int = 163605,
-        pad_token_id: int = 0,
-        use_unified_vision_chunk: bool = False,
-        video_placeholder: str = "<|kimi_k25_video_placeholder|>",
-        **kwargs,
-    ):
-        if text_config is None:
-            text_config = DeepseekV3Config()
-        elif isinstance(text_config, dict):
-            text_config = DeepseekV3Config(**text_config)
+    text_config: dict | DeepseekV3Config | None = None
+    vision_config: dict | KimiK25VisionConfig | None = None
+    # Other parameters
+    ignore_index: int = -100
+    media_placeholder_token_id: int = 163605
+    pad_token_id: int = 0
+    use_unified_vision_chunk: bool = False
+    video_placeholder: str = "<|kimi_k25_video_placeholder|>"
 
-        if vision_config is None:
-            vision_config = KimiK25VisionConfig()
-        elif isinstance(vision_config, dict):
-            vision_config = KimiK25VisionConfig(**vision_config)
-        self.vision_config = vision_config
-        self.text_config = text_config
-        # Other config
-        self.ignore_index = ignore_index
-        self.media_placeholder_token_id = media_placeholder_token_id
-        self.use_unified_vision_chunk = use_unified_vision_chunk
-        self.video_placeholder = video_placeholder
+    def __post_init__(self, **kwargs):
+        if self.text_config is None:
+            self.text_config = DeepseekV3Config()
+        elif isinstance(self.text_config, dict):
+            self.text_config = DeepseekV3Config(**self.text_config)
+
+        if self.vision_config is None:
+            self.vision_config = KimiK25VisionConfig()
+        elif isinstance(self.vision_config, dict):
+            self.vision_config = KimiK25VisionConfig(**self.vision_config)
 
         # Propagate quantization config from text model
         if getattr(self.text_config, "quantization_config", None) is not None:
             self.quantization_config = self.text_config.quantization_config
 
-        super().__init__(pad_token_id=pad_token_id, **kwargs)
+        super().__post_init__(**kwargs)
 
     @property
     def hidden_size(self) -> int:
