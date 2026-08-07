@@ -82,6 +82,31 @@ class ShortConvCheckpointMetadata:
 
 
 @dataclass
+class _CheckpointScatterClass:
+    """One batched scatter over checkpoint buffers sharing a storage, dtype
+    and channel width; destinations are flat element offsets into ``flat``."""
+
+    flat: torch.Tensor  # 1-D view spanning the buffers' shared storage
+    dtype: torch.dtype
+    layer: torch.Tensor  # [E] conv-state layer per entry
+    chan: torch.Tensor  # [E, width] conv-state channel coordinates
+    group_idx: torch.Tensor  # [E] row into the stacked per-group tensors
+    page_stride: torch.Tensor  # [E] storage elements per buffer page
+    dst_static: torch.Tensor  # [E, W-1, width] page-invariant flat offsets
+
+
+@dataclass
+class _CheckpointPublishPlan:
+    """Static scatter layout for ``_publish_accepted_shortconv_checkpoints``."""
+
+    groups: tuple[str, ...]
+    classes: tuple[_CheckpointScatterClass, ...]
+    num_streams: int
+    zero_src: torch.Tensor
+    zero_page: torch.Tensor
+
+
+@dataclass
 class InklingConvMetadata:
     """Per-forward metadata for the sconv state kernels.
 
@@ -934,6 +959,99 @@ class InklingAttnBackend(AttentionBackend):
                 f"ShortConv checkpoint stream {key!r} changed storage buffer"
             )
 
+    def _build_checkpoint_publish_plan(
+        self, state: torch.Tensor
+    ) -> _CheckpointPublishPlan:
+        """Precompute the batched-scatter layout of the registered checkpoint
+        streams.
+
+        Streams are grouped by ``(storage, dtype, width)`` so each class
+        publishes with one state gather plus one flat ``index_put_``,
+        keeping per-step launch count independent of layer count (the
+        per-stream loop used to dominate decode host time).
+        """
+        device = state.device
+        w1 = state.shape[2]
+        groups: list[str] = []
+        buckets: dict[tuple[int, torch.dtype, int], dict] = {}
+        for (
+            layer_id,
+            offset,
+            dim,
+            group_id,
+        ), buffers in self._checkpoint_streams.items():
+            if group_id not in groups:
+                groups.append(group_id)
+            field_offset = 0
+            for buffer in buffers:
+                if buffer.dim() != 3 or buffer.shape[1] != w1:
+                    raise ValueError(
+                        f"ShortConv checkpoint buffer shape {tuple(buffer.shape)} "
+                        f"does not match [pages, {w1}, width]"
+                    )
+                width = buffer.shape[-1]
+                key = (buffer.untyped_storage().data_ptr(), buffer.dtype, width)
+                bucket = buckets.setdefault(
+                    key,
+                    {
+                        "rep": buffer,
+                        "layer": [],
+                        "chan": [],
+                        "group": [],
+                        "base": [],
+                        "ps": [],
+                        "ws": [],
+                        "cs": [],
+                    },
+                )
+                page_stride, w_stride, c_stride = buffer.stride()
+                bucket["layer"].append(layer_id)
+                bucket["chan"].append(offset + field_offset)
+                bucket["group"].append(groups.index(group_id))
+                bucket["base"].append(buffer.storage_offset())
+                bucket["ps"].append(page_stride)
+                bucket["ws"].append(w_stride)
+                bucket["cs"].append(c_stride)
+                field_offset += width
+            if field_offset != dim:
+                raise ValueError(
+                    f"ShortConv checkpoint buffers cover {field_offset} "
+                    f"channels but stream width is {dim}"
+                )
+
+        classes = []
+        w_idx = torch.arange(w1, dtype=torch.int64, device=device)
+        for (_, dtype, width), bucket in buckets.items():
+            rep = bucket["rep"]
+            storage_numel = rep.untyped_storage().nbytes() // rep.element_size()
+            cols = {
+                name: torch.tensor(bucket[name], dtype=torch.int64, device=device)
+                for name in ("layer", "chan", "group", "base", "ps", "ws", "cs")
+            }
+            c_idx = torch.arange(width, dtype=torch.int64, device=device)
+            classes.append(
+                _CheckpointScatterClass(
+                    flat=rep.as_strided((storage_numel,), (1,), 0),
+                    dtype=dtype,
+                    layer=cols["layer"],
+                    chan=cols["chan"][:, None] + c_idx[None, :],
+                    group_idx=cols["group"],
+                    page_stride=cols["ps"],
+                    dst_static=(
+                        cols["base"][:, None, None]
+                        + w_idx[None, :, None] * cols["ws"][:, None, None]
+                        + c_idx[None, None, :] * cols["cs"][:, None, None]
+                    ),
+                )
+            )
+        return _CheckpointPublishPlan(
+            groups=tuple(groups),
+            classes=tuple(classes),
+            num_streams=len(self._checkpoint_streams),
+            zero_src=torch.zeros((), dtype=state.dtype, device=device),
+            zero_page=torch.zeros((), dtype=torch.int64, device=device),
+        )
+
     def _publish_accepted_shortconv_checkpoints(
         self, accept_lengths: torch.Tensor
     ) -> None:
@@ -950,50 +1068,48 @@ class InklingAttnBackend(AttentionBackend):
         n = min(metadata.cache_indices.shape[0], accept_lengths.shape[0])
         if n == 0:
             return
+        state = self.conv_pool.conv_state
+        plan = getattr(self, "_checkpoint_publish_plan", None)
+        if plan is None or plan.num_streams != len(checkpoint_streams):
+            plan = self._build_checkpoint_publish_plan(state)
+            self._checkpoint_publish_plan = plan
         page_size = int(geometry["block_tokens"])
         accepted_seq_lens = (
             metadata.col_seq_lens[:n].to(torch.int64)
             - metadata.tokens_per_req
             + accept_lengths[:n].to(torch.int64)
         )
-        pages_by_group = {
-            group_id: self._checkpoint_pages_at_boundaries(
-                metadata.col_page_table[group_id][:n],
-                accepted_seq_lens,
-                page_size,
-            )
-            for group_id in geometry["group_block_tokens"]
-        }
+        pages = torch.stack(
+            [
+                self._checkpoint_pages_at_boundaries(
+                    metadata.col_page_table[group_id][:n],
+                    accepted_seq_lens,
+                    page_size,
+                )
+                for group_id in plan.groups
+            ]
+        )
         slots = metadata.cache_indices[:n].to(torch.int64)
-        valid_slots = slots >= 0
-        state = self.conv_pool.conv_state
-        for (layer_id, offset, dim, group_id), buffers in checkpoint_streams.items():
-            pages = pages_by_group[group_id]
-            valid = valid_slots & (pages > 0) & (accept_lengths[:n] > 0)
-            rows = state[layer_id, slots.clamp_min(0), :, offset : offset + dim]
-            pages = torch.where(
-                valid,
-                pages.to(torch.int64).clamp_min(0),
-                torch.zeros((), dtype=torch.int64, device=pages.device),
+        # [G, n]; invalid rows are routed to each buffer's reserved page 0.
+        valid = (slots >= 0)[None] & (pages > 0) & (accept_lengths[:n] > 0)[None]
+        pages = torch.where(valid, pages.to(torch.int64).clamp_min(0), plan.zero_page)
+        slots = slots.clamp_min(0)
+        w_idx = self._cached_arange_w1(state.shape[2], state.device)
+        for cls in plan.classes:
+            rows = state[
+                cls.layer[:, None, None, None],
+                slots[None, :, None, None],
+                w_idx[None, None, :, None],
+                cls.chan[:, None, None, :],
+            ]
+            rows = torch.where(
+                valid[cls.group_idx][:, :, None, None], rows, plan.zero_src
+            ).to(cls.dtype)
+            dst = (
+                cls.dst_static[:, None]
+                + (pages[cls.group_idx] * cls.page_stride[:, None])[:, :, None, None]
             )
-            field_offset = 0
-            for buffer in buffers:
-                width = buffer.shape[-1]
-                field_rows = rows[..., field_offset : field_offset + width].to(
-                    buffer.dtype
-                )
-                field_rows = torch.where(
-                    valid[:, None, None],
-                    field_rows,
-                    torch.zeros((), dtype=field_rows.dtype, device=field_rows.device),
-                )
-                buffer[pages] = field_rows
-                field_offset += width
-            if field_offset != dim:
-                raise ValueError(
-                    f"ShortConv checkpoint buffers cover {field_offset} "
-                    f"channels but stream width is {dim}"
-                )
+            cls.flat[dst.reshape(-1)] = rows.reshape(-1)
 
     def apply_conv_state_update(
         self,

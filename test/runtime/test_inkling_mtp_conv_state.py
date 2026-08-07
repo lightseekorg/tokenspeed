@@ -360,6 +360,141 @@ class TestInklingConvSpecState(unittest.TestCase):
             for slot in (1, 3):
                 self.assertTrue(torch.equal(state[slot], pre[layer, slot]))
 
+    def test_publish_batched_matches_reference(self):
+        """The batched checkpoint publication must write exactly what the
+        per-stream reference loop writes: multiple layers and groups, split
+        buffers sharing one storage, a dtype-converting buffer, a padded
+        slot, a zero accept and a non-aligned endpoint — over two calls to
+        cover plan reuse."""
+        from tokenspeed.runtime.layers.attention.backends.inkling import (
+            InklingAttnBackend,
+            InklingConvMetadata,
+        )
+
+        def reference_publish(streams, state, metadata, accept_lengths, page_size):
+            n = metadata.cache_indices.shape[0]
+            accepted_seq_lens = (
+                metadata.col_seq_lens[:n].to(torch.int64)
+                - metadata.tokens_per_req
+                + accept_lengths[:n].to(torch.int64)
+            )
+            slots = metadata.cache_indices[:n].to(torch.int64)
+            for (layer_id, offset, dim, group_id), buffers in streams.items():
+                pages = InklingAttnBackend._checkpoint_pages_at_boundaries(
+                    metadata.col_page_table[group_id][:n],
+                    accepted_seq_lens,
+                    page_size,
+                )
+                valid = (slots >= 0) & (pages > 0) & (accept_lengths[:n] > 0)
+                rows = state[layer_id, slots.clamp_min(0), :, offset : offset + dim]
+                pages = torch.where(
+                    valid, pages.to(torch.int64).clamp_min(0), torch.zeros_like(pages)
+                )
+                field_offset = 0
+                for buffer in buffers:
+                    width = buffer.shape[-1]
+                    field_rows = rows[..., field_offset : field_offset + width].to(
+                        buffer.dtype
+                    )
+                    field_rows = torch.where(
+                        valid[:, None, None],
+                        field_rows,
+                        torch.zeros((), dtype=field_rows.dtype, device="cuda"),
+                    )
+                    buffer[pages] = field_rows
+                    field_offset += width
+
+        pool = self._make_pool()
+        backend = InklingAttnBackend.__new__(InklingAttnBackend)
+        backend.conv_pool = pool
+        backend.conv_spec_num_tokens = self.K
+        backend.conv_columns = {
+            "mode": "checkpoint",
+            "block_tokens": 4,
+            "group_block_tokens": {"kv": 4, "hidden": 4},
+        }
+        backend._checkpoint_streams = {}
+
+        pages_cap = 50
+        # kv streams (offset 0, dim 6) split into width-2 + width-4 buffers;
+        # all layers' kv buffers are slices of one shared allocation.
+        kv_pool = torch.full(
+            (self.LAYERS * pages_cap, self.W - 1, 6), -3.0, device="cuda"
+        )
+        # hidden streams (offset 6, dim 2): standalone bf16 buffer per layer.
+        hidden_bufs = [
+            torch.full(
+                (pages_cap, self.W - 1, 2), -5.0, dtype=torch.bfloat16, device="cuda"
+            )
+            for _ in range(self.LAYERS)
+        ]
+        for layer in range(self.LAYERS):
+            rows = kv_pool[layer * pages_cap : (layer + 1) * pages_cap]
+            backend.register_shortconv_checkpoint_stream(
+                layer_id=layer,
+                channel_offset=0,
+                dim=6,
+                group_id="kv",
+                buffers=(rows[..., :2], rows[..., 2:6]),
+            )
+            backend.register_shortconv_checkpoint_stream(
+                layer_id=layer,
+                channel_offset=6,
+                dim=2,
+                group_id="hidden",
+                buffers=(hidden_bufs[layer],),
+            )
+
+        n = 4
+        tables = {
+            "kv": torch.tensor(
+                [[11, 12], [21, 22], [31, 32], [41, 42]],
+                dtype=torch.int32,
+                device="cuda",
+            ),
+            "hidden": torch.tensor(
+                [[13, 14], [23, 24], [33, 34], [43, 44]],
+                dtype=torch.int32,
+                device="cuda",
+            ),
+        }
+        backend.conv_metadata = InklingConvMetadata(
+            query_start_loc=torch.arange(0, n * self.K + 1, self.K, device="cuda"),
+            cache_indices=torch.tensor([1, 2, -1, 3], dtype=torch.int32).cuda(),
+            has_initial_state=torch.ones(n, dtype=torch.bool).cuda(),
+            is_decode=False,
+            update_mode="stash",
+            tokens_per_req=self.K,
+            col_page_table=tables,
+            col_seq_lens=torch.tensor([8, 7, 8, 8], dtype=torch.int32).cuda(),
+        )
+
+        ref_kv_pool = kv_pool.clone()
+        ref_hidden = [buf.clone() for buf in hidden_bufs]
+        ref_streams = {}
+        for layer in range(self.LAYERS):
+            rows = ref_kv_pool[layer * pages_cap : (layer + 1) * pages_cap]
+            ref_streams[(layer, 0, 6, "kv")] = (rows[..., :2], rows[..., 2:6])
+            ref_streams[(layer, 6, 2, "hidden")] = (ref_hidden[layer],)
+
+        # accept: boundary hit, non-aligned endpoint, padded slot, zero accept
+        for accepts in ([4, 3, 4, 0], [4, 4, 4, 4]):
+            accept = torch.tensor(accepts, dtype=torch.int32).cuda()
+            backend._publish_accepted_shortconv_checkpoints(accept)
+            reference_publish(
+                ref_streams,
+                pool.conv_state,
+                backend.conv_metadata,
+                accept,
+                page_size=4,
+            )
+            self.assertTrue(torch.equal(kv_pool, ref_kv_pool))
+            for layer in range(self.LAYERS):
+                self.assertTrue(
+                    torch.equal(hidden_bufs[layer], ref_hidden[layer]),
+                    f"hidden layer {layer}",
+                )
+
     def test_channel_slice_update(self):
         """valid_len write through a channel-offset slice only touches that
         slice (the fused K+V call updates a sub-range of conv_dim)."""
