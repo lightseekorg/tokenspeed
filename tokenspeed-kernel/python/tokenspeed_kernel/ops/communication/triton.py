@@ -40,6 +40,8 @@ __all__ = [
     "all_reduce",
     "all_reduce_two_can_run",
     "all_reduce_two",
+    "all_reduce_residual_attnres_can_run",
+    "all_reduce_residual_attnres",
     "allreduce_residual_rmsnorm",
     "create_dp_sampling_state",
     "dp_sampling_gather",
@@ -2019,6 +2021,137 @@ def all_reduce_two(
         )
 
     raise AssertionError(f"Unsupported platform: {platform}")
+
+
+def all_reduce_residual_attnres_can_run(
+    state: TritonCommState,
+    partial: torch.Tensor,
+    residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    output_weight: torch.Tensor,
+    scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    op=None,
+) -> bool:
+    """Return whether Iris can reduce and consume a Kimi-K3 attention partial.
+
+    Args:
+        state: Initialized communication state for the tensor-parallel group.
+        partial: Contiguous local BF16 attention partial shaped ``[1, 7168]``.
+        residual: Contiguous BF16 residual stream shaped ``[1, 7168]``.
+        score_weight: Contiguous BF16 AttnRes score weight shaped ``[7168]``.
+        output_weight: Contiguous BF16 output RMSNorm weight shaped ``[7168]``.
+        scratch: Contiguous FP32 ``(max_logit, exp_sum, weighted_sum)`` tensors
+            for the historical AttnRes candidates, shaped ``[1]``, ``[1]``,
+            and ``[1, 7168]``.
+        op: Reduction operation; only ``SUM`` is supported.
+
+    Returns:
+        True for a colocated CDNA4, eight-rank input that the fused Iris kernel
+        supports, otherwise false.
+    """
+    if op is None:
+        op = torch.distributed.ReduceOp.SUM
+    m, s_, acc = scratch
+    platform = current_platform()
+    return (
+        platform.is_cdna4
+        and state.world_size == 8
+        and op == torch.distributed.ReduceOp.SUM
+        and partial.shape == residual.shape == (1, 7168)
+        and score_weight.shape == output_weight.shape == (7168,)
+        and m.shape == s_.shape == (1,)
+        and acc.shape == (1, 7168)
+        and partial.dtype
+        == residual.dtype
+        == score_weight.dtype
+        == output_weight.dtype
+        == torch.bfloat16
+        and m.dtype == s_.dtype == acc.dtype == torch.float32
+        and partial.device
+        == residual.device
+        == score_weight.device
+        == output_weight.device
+        == m.device
+        == s_.device
+        == acc.device
+        == state.device
+        and all(
+            tensor.is_contiguous()
+            for tensor in (
+                partial,
+                residual,
+                score_weight,
+                output_weight,
+                m,
+                s_,
+                acc,
+            )
+        )
+        and partial.numel() <= state.max_numel
+    )
+
+
+def all_reduce_residual_attnres(
+    state: TritonCommState,
+    partial: torch.Tensor,
+    residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    output_weight: torch.Tensor,
+    scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    eps: float,
+    op=None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reduce a Kimi-K3 attention partial and finish its AttnRes epilogue.
+
+    Args:
+        state: Initialized communication state for the tensor-parallel group.
+        partial: Contiguous local BF16 attention partial shaped ``[1, 7168]``.
+        residual: Contiguous BF16 residual stream shaped ``[1, 7168]``.
+        score_weight: Contiguous BF16 AttnRes score weight shaped ``[7168]``.
+        output_weight: Contiguous BF16 output RMSNorm weight shaped ``[7168]``.
+        scratch: Contiguous FP32 ``(max_logit, exp_sum, weighted_sum)`` tensors
+            for the historical AttnRes candidates, shaped ``[1]``, ``[1]``,
+            and ``[1, 7168]``.
+        eps: Positive epsilon used for AttnRes scoring and output RMSNorm.
+        op: Reduction operation; only ``SUM`` is supported.
+
+    Returns:
+        A pair containing the normalized AttnRes mixture and the BF16 sum of
+        ``residual`` with the all-reduced attention partial, both shaped
+        ``[1, 7168]``.
+    """
+    assert all_reduce_residual_attnres_can_run(
+        state,
+        partial,
+        residual,
+        score_weight,
+        output_weight,
+        scratch,
+        op=op,
+    )
+    from . import iris as _iris_mod
+
+    key = (id(state.group), state.max_numel, partial.dtype)
+    iris_state = _iris_mod.IRIS_AR_STATES.get(key)
+    if iris_state is None:
+        iris_state = _iris_mod.create_iris_state(
+            group=state.group,
+            rank_in_group=state.rank_in_group,
+            max_numel=state.max_numel,
+            dtype=partial.dtype,
+            device=state.device,
+        )
+        _iris_mod.IRIS_AR_STATES[key] = iris_state
+    return _iris_mod.iris_all_reduce_residual_attnres(
+        iris_state,
+        partial,
+        residual,
+        score_weight,
+        output_weight,
+        scratch,
+        eps,
+        op=op,
+    )
 
 
 def get_token_dist(state: TritonCommState, total_tokens_in_group: int) -> list:
