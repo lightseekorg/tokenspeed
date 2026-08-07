@@ -238,3 +238,101 @@ def test_flashmla_classic_path_uses_page_table() -> None:
     assert torch.equal(
         backend.select_out_cache_loc(None, caller, ForwardMode.DECODE), caller
     )
+
+
+def _make_draft_flashmla_backend(pool):
+    from tokenspeed.runtime.layers.attention.backends.flashmla import FlashMLABackend
+    from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+
+    config = MLAConfig(
+        device="cuda",
+        backend_name="flashmla",
+        num_attention_heads=16,
+        num_kv_heads=1,
+        head_dim=_LATENT_DIM,
+        attn_tp_size=1,
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        page_size=_KERNEL_PAGE,
+        context_len=8 * pool.page_size,
+        max_bs=8,
+        max_graph_bs=8,
+        kv_cache_quant_method="",
+        kv_lora_rank=_KV_LORA_RANK,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=_QK_ROPE_DIM,
+        v_head_dim=128,
+        scaling=192**-0.5,
+        kv_cache_dim=_LATENT_DIM,
+        is_draft=True,
+    )
+    backend = FlashMLABackend(config)
+    backend.mark_cache_contract(logical_page_size=pool.page_size)
+    return backend
+
+
+@requires_cuda
+def test_flashmla_draft_declares_cache_groups() -> None:
+    """The wrapper's group-table distribution keys on uses_cache_groups: a
+    draft must declare it (it consumes block_tables), the target must not
+    (it reads the richer cache_metadata)."""
+    pool = _make_pool("cuda", usable_pages=6)
+    assert _make_draft_flashmla_backend(pool).uses_cache_groups is True
+    assert _make_flashmla_backend(pool).uses_cache_groups is False
+
+
+@requires_cuda
+def test_flashmla_draft_consumes_group_table() -> None:
+    """A draft handed its history group table (wrapper distribution) expands
+    scheduler pages to kernel pages without touching page_table."""
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+
+    pool = _make_pool("cuda", usable_pages=6)
+    page_size = pool.page_size
+    ratio = page_size // _KERNEL_PAGE
+    backend = _make_draft_flashmla_backend(pool)
+
+    logical_rows = torch.tensor([[3, 5], [1, 4]], device="cuda", dtype=torch.int32)
+    seq_lens = torch.tensor(
+        [page_size + 41, page_size + 7], device="cuda", dtype=torch.int32
+    )
+    backend.init_forward_metadata(
+        bs=2,
+        num_extends=0,
+        req_pool_indices=_poison((2,)).to(torch.int64),
+        seq_lens=seq_lens,
+        forward_mode=ForwardMode.DECODE,
+        # Poisoned: the group-table path must never consume page_table.
+        page_table=_poison((16, 256)),
+        block_tables={"full_attention": logical_rows},
+    )
+    assert backend._cache_groups_bound is True
+    meta = backend.forward_decode_metadata
+    expected_row0 = []
+    for lpage in logical_rows[0].tolist():
+        expected_row0.extend(lpage * ratio + k for k in range(ratio))
+    got_row0 = meta.block_table[0, : len(expected_row0)].tolist()
+    assert got_row0 == expected_row0, (got_row0, expected_row0)
+
+
+@requires_cuda
+def test_flashmla_draft_rejects_multiple_group_tables() -> None:
+    """The wrapper subsets to the draft's consumer families; more than one
+    table means a selection bug upstream, not a legal input."""
+    import pytest
+
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+
+    pool = _make_pool("cuda", usable_pages=6)
+    backend = _make_draft_flashmla_backend(pool)
+    rows = torch.tensor([[3]], device="cuda", dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="exactly one history group"):
+        backend.init_forward_metadata(
+            bs=1,
+            num_extends=0,
+            req_pool_indices=_poison((1,)).to(torch.int64),
+            seq_lens=torch.tensor([5], device="cuda", dtype=torch.int32),
+            forward_mode=ForwardMode.DECODE,
+            page_table=_poison((16, 256)),
+            block_tables={"a": rows, "b": rows},
+        )

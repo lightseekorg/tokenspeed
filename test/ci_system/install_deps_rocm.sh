@@ -8,7 +8,7 @@ GFX_ARCH=${GFX_ARCH:-gfx950}
 ROCM_VERSION=${ROCM_VERSION:-7.2}
 BUILD_AND_DOWNLOAD_PARALLEL=${BUILD_AND_DOWNLOAD_PARALLEL:-16}
 
-ROCM_INDEX="https://download.pytorch.org/whl/rocm${ROCM_VERSION}"
+ROCM_INDEX="https://repo.amd.com/rocm/whl-multi-arch/"
 
 export MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL}
 WORKSPACE=${WORKSPACE:-$(pwd)}
@@ -44,9 +44,14 @@ echo "=== Step 1: apt deps ==="
 sudo apt-get install -y openmpi-bin libopenmpi-dev libssl-dev pkg-config libgrpc++1.51t64
 
 echo "=== Step 2: Upgrade pip/setuptools/wheel ==="
-python3 -m pip install --upgrade pip "setuptools<82" wheel
+pip install --upgrade pip "setuptools<82" wheel
 
-echo "=== Step 3: Install tokenspeed-kernel packages ==="
+echo "=== Step 3: Install PyTorch for ROCm ==="
+pip install --index-url "${ROCM_INDEX}" \
+	"torch[device-${GFX_ARCH}]==2.11.0" \
+	"torchvision[device-${GFX_ARCH}]==0.26.0" \
+
+echo "=== Step 4: Install tokenspeed-kernel packages ==="
 
 cd "${WORKSPACE}"
 # `tokenspeed-kernel` installs requirements/rocm.txt during its native build.
@@ -56,21 +61,20 @@ pip3 install --force-reinstall --no-deps \
     "${WORKSPACE}/tokenspeed-kernel-amd" --no-build-isolation
 
 cd "${WORKSPACE}"
-export PIP_EXTRA_INDEX_URL="${ROCM_INDEX}"
+
 TOKENSPEED_KERNEL_BACKEND=rocm \
 pip_install_with_retry pip3 install tokenspeed-kernel/python/ \
     --no-build-isolation -v
 
-echo "=== Step 4: Install TokenSpeed Scheduler ==="
+echo "=== Step 5: Install TokenSpeed Scheduler ==="
 pip_install_with_retry pip3 install cmake ninja
 pip_install_with_retry pip3 install tokenspeed-scheduler/
 
-echo "=== Step 5: Install TokenSpeed ==="
+echo "=== Step 6: Install TokenSpeed ==="
 # tokenspeed-smg / -grpc-servicer / -grpc-proto are pinned in
 # python/pyproject.toml; pip resolves them from PyPI as part of the
 # editable install below.
-pip_install_with_retry pip3 install -e ./python --no-build-isolation \
-    --extra-index-url "${ROCM_INDEX}"
+pip_install_with_retry pip3 install -e ./python --no-build-isolation
 
 echo ""
 echo "=========================================="

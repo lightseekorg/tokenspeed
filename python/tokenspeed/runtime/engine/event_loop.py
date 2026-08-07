@@ -70,9 +70,6 @@ from tokenspeed.runtime.execution.factory import (
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.types import ModelExecutionResult
 from tokenspeed.runtime.grammar.capturable_grammar import GrammarStepInputs
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    validate_scheduler_config,
-)
 from tokenspeed.runtime.layers.attention.registry import create_attn_components
 from tokenspeed.runtime.metrics.collector import EngineMetrics
 from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
@@ -397,12 +394,8 @@ class EventLoop:
                     "Paged-cache PD currently does not support: "
                     + ", ".join(unsupported)
                 )
-        validate_scheduler_config(
-            paged_cache_groups=paged_cache_groups,
-            attn_backend=attn_backend,
-            kv_pool=token_to_kv_pool,
-            speculative_algorithm=server_args.speculative_algorithm,
-        )
+        # Backend/pool compatibility is validated inside ModelExecutor
+        # (validate_scheduler_config), before CUDA-graph capture.
         self._paged_cache_groups = paged_cache_groups
         scheduler_cfg = make_config(
             num_device_pages=geometry.num_device_pages,
@@ -538,6 +531,9 @@ class EventLoop:
             ),
             stream_interval=self.server_args.stream_interval,
             enable_log_request_stats=self.server_args.enable_log_request_stats,
+            physical_context_len=(
+                self.model_config.context_len + self.server_args.spec_context_pad
+            ),
             metrics=self.metrics,
         )
         if server_args.disaggregation_mode != "null":

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # EPD (encode-prefill-decode) 1E-1P-2D smoke/eval topology on a single node.
 #
-# Serves nvidia/Qwen3.5-122B-A10B-NVFP4 (override via MODEL). EPD mode is
-# gRPC-only (the SMG gateway refuses HTTP connection_mode for EPD), so the
-# workers are gRPC servicers launched via `python3 -m smg_grpc_servicer.tokenspeed`
-# (one unified entrypoint for all roles) rather than the HTTP pd_http_worker.py.
+# Serves nvidia/Qwen3.5-122B-A10B-NVFP4 (override via MODEL). TokenSpeed's EPD
+# data plane requires gRPC, so workers are launched via
+# `python3 -m smg_grpc_servicer.tokenspeed`
+# (one unified entrypoint for all roles) rather than a role-specific adapter.
 # The encode worker is LM-free: it runs only the vision tower and ships image
 # embeddings to prefill over Mooncake; pixels reach it INLINE over gRPC (the
 # default, no node-specific RDMA-listen config). Topology (4 GPUs, all TP1):
@@ -37,7 +37,7 @@ PREFILL_DIST_PORT=${PREFILL_DIST_PORT:-26000}
 DECODE0_DIST_PORT=${DECODE0_DIST_PORT:-32000}
 DECODE1_DIST_PORT=${DECODE1_DIST_PORT:-33000}
 LB_HOST=${LB_HOST:-0.0.0.0}
-LB_PORT=${LB_PORT:-12345}
+LB_PORT=${LB_PORT:-19345}
 PROMETHEUS_PORT=${PROMETHEUS_PORT:-29080}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.9}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-131072}
@@ -47,16 +47,14 @@ KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-fp8_e4m3}
 ATTENTION_BACKEND=${ATTENTION_BACKEND:-trtllm}
 DRAFTER_ATTENTION_BACKEND=${DRAFTER_ATTENTION_BACKEND:-$ATTENTION_BACKEND}
 MOE_BACKEND=${MOE_BACKEND:-flashinfer_trtllm}
-KVSTORE_RATIO=${KVSTORE_RATIO:-0.5}
 ENABLE_MTP=${ENABLE_MTP:-0}
 ENCODE_ROUTING_POLICY=${ENCODE_ROUTING_POLICY:-consistent_hashing}
 LOG_DIR=${EPD_CI_LOG_DIR:-.ci-artifacts/epd-qwen35-122b-1e1p2d}
 
 # The E->P embedding ships over Mooncake; pixels go inline over gRPC, sized by
 # TOKENSPEED_GRPC_MAX_MESSAGE_BYTES.
-export TOKENSPEED_GRPC_MAX_MESSAGE_BYTES=${TOKENSPEED_GRPC_MAX_MESSAGE_BYTES:-2000000000}
+export TOKENSPEED_GRPC_MAX_MESSAGE_BYTES=${TOKENSPEED_GRPC_MAX_MESSAGE_BYTES:-536870912}
 export TOKENSPEED_SKIP_GRPC_WARMUP=${TOKENSPEED_SKIP_GRPC_WARMUP:-1}
-export EPD_RECV_POOL_SLOT_MB=${EPD_RECV_POOL_SLOT_MB:-256}
 export MC_INTRANODE_NVLINK=${MC_INTRANODE_NVLINK:-1}
 export MC_INTRA_NVLINK=${MC_INTRA_NVLINK:-1}
 export LD_LIBRARY_PATH=/usr/local/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
@@ -162,11 +160,8 @@ COMMON_ARGS=(
   --quantization "$QUANTIZATION"
   --kv-cache-dtype "$KV_CACHE_DTYPE"
   --disable-kvstore
-  --kvstore-ratio "$KVSTORE_RATIO"
-  --enable-cache-report
   --disaggregation-transfer-backend mooncake
   --disaggregation-layerwise-interval 0
-  --skip-server-warmup
 )
 
 MTP_ARGS=()
@@ -192,7 +187,6 @@ start_worker() {
   local port=$5
   local dist_port=$6
   local bootstrap_port=$7   # empty for decode
-  shift 7
   local log="$LOG_DIR/${label}.log"
   # Speculative decoding is LM-only; keep the encode worker independent.
   local -a role_mtp_args=()
@@ -202,7 +196,7 @@ start_worker() {
   echo "[epd-1e1p2d] starting ${label} (mode=$mode): gpus=$gpus ws=$world_size port=$port dist=$dist_port bootstrap=${bootstrap_port:-none} log=$log"
   (
     export CUDA_VISIBLE_DEVICES="$gpus"
-    exec env "$@" python3 -m smg_grpc_servicer.tokenspeed \
+    exec python3 -m smg_grpc_servicer.tokenspeed \
       "${COMMON_ARGS[@]}" \
       "${role_mtp_args[@]}" \
       --world-size "$world_size" \
@@ -242,8 +236,6 @@ python3 -m smg launch \
   --encode-policy "$ENCODE_ROUTING_POLICY" \
   --prefill-policy round_robin \
   --decode-policy round_robin \
-  --max-payload-size 2000000000 \
-  --worker-startup-timeout-secs 1800 \
   --request-timeout-secs 1800 \
   --disable-circuit-breaker \
   --disable-health-check \

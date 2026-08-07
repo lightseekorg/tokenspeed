@@ -130,6 +130,11 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         # page size the group-table expansion targets.
         self._cache_groups_bound = False
         self._cache_contract_bound = False
+        # A draft consumes its history group table from the wrapper's
+        # per-group distribution (_draft_group_tables); the target reads the
+        # richer cache_metadata instead and must stay off the block_tables
+        # path (its capture/eager guards key on this flag).
+        self.uses_cache_groups = bool(getattr(config, "is_draft", False))
         self.page_size = PAGE_SIZE
         self.max_num_pages = (self.max_context_len + PAGE_SIZE - 1) // PAGE_SIZE
 
@@ -225,12 +230,19 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
     ):
         cache_metadata = kwargs.pop("cache_metadata", None)
         forward_batch = kwargs.pop("forward_batch", None)
+        draft_group_table = self._resolve_draft_group_table(
+            kwargs.pop("block_tables", None)
+        )
         group_table = None
         logical_page_size = None
         if cache_metadata is not None:
             self._cache_groups_bound = True
             group_table, logical_page_size = self._resolve_full_history_table(
                 cache_metadata, forward_batch, bs
+            )
+        elif draft_group_table is not None:
+            group_table, logical_page_size = self._bind_draft_group_table(
+                draft_group_table, bs
             )
         elif self._draft_reads_batch_pages(bs, forward_mode):
             # The drafter drives this draft backend directly and passes no cache
@@ -559,7 +571,10 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
+        **kwargs,
     ):
+        # cache_group_ids arrives for the draft (uses_cache_groups); the
+        # persistent kv-indices buffer already exists, nothing to allocate.
         decode_no_spec = forward_mode.is_decode_or_idle() and self.spec_num_tokens == 1
         is_target_verify = (
             forward_mode.is_decode_or_idle()
@@ -657,6 +672,20 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
                 self.cuda_graph_group_out_cache_loc[
                     real_bs * q_len : bs * q_len
                 ].zero_()
+            return
+
+        draft_group_table = self._resolve_draft_group_table(kwargs.get("block_tables"))
+        if draft_group_table is not None:
+            # Already padded to the replay bs by the wrapper.
+            group_table, logical_page_size = self._bind_draft_group_table(
+                draft_group_table, bs
+            )
+            expanded = self._expand_group_page_table(
+                group_table,
+                batch_size=bs,
+                logical_page_size=logical_page_size,
+            )
+            self.cuda_graph_kv_indices[:bs, : expanded.shape[1]].copy_(expanded)
             return
 
         if self._draft_reads_batch_pages(bs, forward_mode):

@@ -305,7 +305,7 @@ def _create_config_pool(config):
         overlap_schedule_depth=0,
     )
     return create_cache_pool(
-        setup.target,
+        setup.spec,
         config,
         num_layers=LAYERS,
         rank=0,

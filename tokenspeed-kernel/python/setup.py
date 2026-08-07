@@ -19,7 +19,28 @@
 # SOFTWARE.
 
 """
-tokenspeed_kernel build script.
+Build and package tokenspeed_kernel.
+
+This script will automatically detect the CUDA or ROCm backend and install the
+appropriate dependencies, and compile the native kernels for the selected
+backend.
+
+Dependency handling
+===================
+
+Dependencies are split by purpose:
+
+* requirements/<backend>.txt contains core build and runtime dependencies.
+* requirements/<backend>-thirdparty.txt contains external kernel packages.
+
+Both files are combined into install_requires and recorded in wheel
+metadata. During a source or editable build, the native build step also
+installs the core backend file before compiling. Third-party dependencies are
+installed by the outer package installer from the generated metadata. They are
+not optional despite being kept in a separate file.
+
+Kernel compilation
+==================
 
 Compiles .cu files into shared libraries (.so) loaded via tvm_ffi.load_module().
 On systems without an NVIDIA CUDA build target, the build is skipped and the

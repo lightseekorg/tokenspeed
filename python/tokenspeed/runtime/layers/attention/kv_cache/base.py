@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 import torch
@@ -326,3 +327,118 @@ class CachePool:
     # Layerwise buffer offsets used by prefill/decode disaggregation.
     def get_layerwise_buf_info_offsets(self, start_idx=0):
         raise NotImplementedError()
+
+
+class LayerMappedKVPool:
+    """Wraps a KV pool to map the caller's layer IDs to inner pool indices.
+
+    Two callers, one mechanism — a dict from the id a model layer carries to
+    the index its plane occupies in the wrapped pool:
+
+    - Hybrid models: layers carry global sparse ids (e.g. 3, 7, 11) while the
+      inner pool holds compact full-attention planes (0, 1, 2); the map is
+      ``{global_id: pool_idx}`` (the default built from ``layer_ids``).
+    - Draft views of the ONE merged pool: draft layers carry LOCAL ids
+      (0..n-1) while their planes are the continuation range
+      ``num_target_layers..``; the map is ``{local: global}`` (pass
+      ``layer_map`` explicitly).
+    """
+
+    def __init__(
+        self,
+        inner_pool,
+        full_attention_layer_ids: list[int],
+        *,
+        layer_map: dict[int, int] | None = None,
+    ):
+        self.inner = inner_pool
+        self.layer_ids = list(full_attention_layer_ids)
+        self.layer_map = (
+            dict(layer_map)
+            if layer_map is not None
+            else {
+                global_id: pool_idx
+                for pool_idx, global_id in enumerate(full_attention_layer_ids)
+            }
+        )
+        # Expose page_size from inner pool for the scheduler
+        self.page_size = getattr(inner_pool, "page_size", 1)
+
+    def _map(self, layer_id: int) -> int:
+        return self.layer_map.get(layer_id, layer_id)
+
+    @contextmanager
+    def _mapped(self, layer):
+        """Temporarily remap ``layer.layer_id`` to its inner-pool slot."""
+        orig = layer.layer_id
+        layer.layer_id = self._map(orig)
+        try:
+            yield
+        finally:
+            layer.layer_id = orig
+
+    def set_kv_buffer(
+        self,
+        layer,
+        out_cache_loc: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor | None,
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
+    ):
+        with self._mapped(layer):
+            self.inner.set_kv_buffer(layer, out_cache_loc, k, v, k_scale, v_scale)
+
+    def get_kv_buffer(self, layer_id: int):
+        return self.inner.get_kv_buffer(self._map(layer_id))
+
+    def get_key_buffer(self, layer_id: int):
+        return self.inner.get_key_buffer(self._map(layer_id))
+
+    def get_value_buffer(self, layer_id: int):
+        return self.inner.get_value_buffer(self._map(layer_id))
+
+    # MLA pools index their per-layer kv_buffer by ``layer.layer_id`` directly.
+    # In a hybrid model the inner MLA pool only holds the full-attention layers,
+    # so the global id must be mapped to its pool slot first (mirrors
+    # ``set_kv_buffer``). Reached via the DeepseekV3-style MLA chunked-prefill
+    # path (Kimi-K3).
+    def set_mla_kv_buffer(self, layer, loc, cache_k_nope, cache_k_rope):
+        # Prefill breakable-graph padding contract: the dummy-batch capture (and
+        # bucket-padding rows) whose ``out_cache_loc`` is the reserved
+        # ``dummy_kv_slot`` can carry NaN into this fp8 KV write. The paged MLA
+        # decode kernel reads that shared dummy slot through the zero-padded
+        # block-table entries and computes ``q·k`` BEFORE applying the causal
+        # mask, so the NaN survives it (``NaN + -inf = NaN``) and poisons a live
+        # row's softmax -> NaN logits -> token 0. Eager prefill leaves the dummy
+        # slot finite (``q·0`` masks cleanly), which is why the bug only appears
+        # with the prefill graph on. Ask the cache writer to sanitize in-kernel
+        # so real rows stay bitwise unchanged without allocating two temporary
+        # tensors or launching two separate nan_to_num kernels.
+        with self._mapped(layer):
+            self.inner.set_mla_kv_buffer(
+                layer,
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+                sanitize=True,
+            )
+
+    def get_mla_kv_buffer(self, layer, loc, dst_dtype=None):
+        with self._mapped(layer):
+            return self.inner.get_mla_kv_buffer(layer, loc, dst_dtype)
+
+    # DSA/MSA index-key planes are layer-indexed like the KV planes; a draft
+    # view must map its local layer ids onto the continuation range here too
+    # (an unmapped pass-through would read/write the target's planes).
+    def get_index_k_buffer(self, layer_id: int):
+        return self.inner.get_index_k_buffer(self._map(layer_id))
+
+    def set_index_k_buffer(self, layer_id: int, loc, index_k):
+        self.inner.set_index_k_buffer(self._map(layer_id), loc, index_k)
+
+    def gather_index_k(self, layer_id: int, slots):
+        return self.inner.gather_index_k(self._map(layer_id), slots)
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)

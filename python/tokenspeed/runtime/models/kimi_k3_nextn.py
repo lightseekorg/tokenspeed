@@ -83,7 +83,7 @@ class KimiK3DraftAttentionMLA(KimiLinearMLAAttention, DeepseekV3DraftAttentionML
         if hidden_states.shape[0] == 0:
             return hidden_states
         if self.use_output_gate:
-            q, latent_cache, gate = self._project_q_latent_gated(
+            q, latent_cache, gate, absorbed_query = self._project_q_latent_gated(
                 hidden_states, ctx, comm_manager, block_scale
             )
         else:
@@ -91,7 +91,15 @@ class KimiK3DraftAttentionMLA(KimiLinearMLAAttention, DeepseekV3DraftAttentionML
                 hidden_states, ctx, comm_manager, block_scale
             )
             gate = None
-        attn_output = self._attn(positions, q, latent_cache, ctx, out_cache_loc)
+            absorbed_query = None
+        attn_output = self._attn(
+            positions,
+            q,
+            latent_cache,
+            ctx,
+            out_cache_loc,
+            absorbed_query=absorbed_query,
+        )
         if gate is not None:
             if attn_output.shape[0] != gate.shape[0]:
                 gate = gate.index_select(0, ctx.gather_ids)
