@@ -28,6 +28,21 @@ from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
+def resolve_speculative_num_tokens(
+    server_args: ServerArgs, is_draft: bool = False
+) -> int:
+    """Return the query width seen by this attention backend.
+
+    Target verification consumes the full candidate window. DSpark's draft
+    model samples from its anchor row, so seven draft queries produce the seven
+    proposals in an eight-token verify window.
+    """
+    width = int(server_args.speculative_num_draft_tokens)
+    if is_draft and server_args.speculative_algorithm == "DSPARK":
+        return width - 1
+    return width
+
+
 def resolve_dtype(kv_cache_dtype_str: str) -> torch.dtype:
     if kv_cache_dtype_str == "auto":
         return torch.bfloat16
@@ -54,6 +69,10 @@ class BaseAttnConfig:
     kv_cache_dtype: torch.dtype
     # Tokens covered by one page as seen by the attention kernel.
     page_size: int
+    # Physical per-request KV extent: the model's logical context_len plus
+    # ServerArgs.spec_context_pad (spec verify overshoot for a finished request
+    # lingering one overlap step). Backends size page tables and clamp seq_lens
+    # against this; user-facing limits stay on the logical context_len.
     context_len: int
     max_bs: int
     max_graph_bs: int

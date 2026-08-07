@@ -492,6 +492,10 @@ class PrefillGraph:
         group table, or their extend metadata is incomplete.
         """
         ib = self.input_buffers
+        # Logical context_len, deliberately NOT physical_context_len: the
+        # fabricated positions run 0..max_req_tokens-1 and must stay inside
+        # the rope tables; per-request structures are sized for the (larger)
+        # physical extent, so this remains in bounds.
         max_req_tokens = max(1, int(self.config.context_len))
         bs = max(1, -(-num_tokens // max_req_tokens))
         seq_lens = [max_req_tokens] * (bs - 1) + [

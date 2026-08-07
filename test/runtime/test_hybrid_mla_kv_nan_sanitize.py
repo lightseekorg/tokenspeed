@@ -35,9 +35,7 @@ from __future__ import annotations
 
 import torch
 
-from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
-    LayerMappedKVPool,
-)
+from tokenspeed.runtime.layers.attention.kv_cache.base import LayerMappedKVPool
 
 
 class _RecordingInnerPool:

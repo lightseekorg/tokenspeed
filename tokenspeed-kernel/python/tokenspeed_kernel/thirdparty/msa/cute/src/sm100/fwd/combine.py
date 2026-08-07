@@ -583,6 +583,11 @@ class SparseAttentionForwardCombine:
         if const_expr(mOutputScale is not None):
             output_scale = mOutputScale[0]
 
+        # `cLSE` (identity tensor for row/split coord tracking) must be
+        # assigned before the dynamic varlen guard so the if-join sees one
+        # type on both paths.
+        cLSE = cute.make_identity_tensor((self.topk, self.tile_m))
+
         if const_expr(not varlen) or m_block * self.tile_m < max_idx:
             # Wait for dependent grids (e.g., the main attention kernel that produces O_partial/LSE_partial)
             if const_expr(use_pdl):
@@ -591,9 +596,6 @@ class SparseAttentionForwardCombine:
             # ===============================
             # Step 1: Load LSE_partial from gmem to shared memory
             # ===============================
-            # `cLSE` (identity tensor for row/split coord tracking) is reused
-            # later in steps 4-5, so it must be defined on both branches.
-            cLSE = cute.make_identity_tensor((self.topk, self.tile_m))
             # Reshape mLSE_partial to PackGQA packed layout and delegate the
             # tile load to PackGQAComb.load_LSE. The packed form folds (H_q, Sq)
             # into one compound dim with H_q innermost (stride 1), so thread

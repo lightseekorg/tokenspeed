@@ -77,13 +77,16 @@ def _dspark_prefill_position_plan(
 class DeepseekV4DSpark(BaseDrafter):
     """DeepSeek V4 DSpark block drafter with request-persistent context windows."""
 
+    # The V4 checkpoint-local DSpark path shares the target's embed and LM
+    # head. Generic DSpark and DFlash ship their own draft weights.
+    shares_target_embed_head = True
+
     def __init__(
         self,
         spec_num_tokens: int,
         spec_num_steps: int,
-        page_size: int,
         draft_model_runner: ModelRunner | None = None,
-        page_table: torch.Tensor | None = None,
+        cache_view=None,
         attn_backend=None,
         token_to_kv_pool=None,
         runtime_states: RuntimeStates | None = None,
@@ -96,8 +99,7 @@ class DeepseekV4DSpark(BaseDrafter):
             draft_model_runner=draft_model_runner,
             runtime_states=runtime_states,
             input_buffers=input_buffers,
-            page_size=page_size,
-            page_table=page_table,
+            cache_view=cache_view,
             attn_backend=attn_backend,
             token_to_kv_pool=token_to_kv_pool,
             vocab_size=vocab_size,
@@ -188,10 +190,16 @@ class DeepseekV4DSpark(BaseDrafter):
             (tp_size, max_bs), dtype=torch.int64, device=self.device
         )
 
-    def bind_target_model(self, target_model) -> None:
+    def wire_target(self, target_model) -> None:
         self.target_model = target_model
         self.lm_head = target_model.lm_head
         self.tp_group = target_model.logits_processor.tp_group
+        if not hasattr(target_model, "set_dspark_layers_to_capture"):
+            raise ValueError(
+                "DSPARK requires the target model to support "
+                "set_dspark_layers_to_capture."
+            )
+        target_model.set_dspark_layers_to_capture(self.target_layer_ids)
 
     def prepare_request_state(
         self,

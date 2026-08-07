@@ -17,6 +17,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
     CacheMemoryPlan,
+    continue_layer_fields,
     solve_cache_layout,
 )
 
@@ -229,14 +230,29 @@ def solve_kimi_k3_cache_layout(
     tp_size: int,
     mla_cache_dtype: torch.dtype,
     mla_quant_method: str | None,
+    draft_fields=None,
 ):
-    """Solve Kimi-K3's capacity-independent P=128 LCM layout."""
+    """Solve Kimi-K3's capacity-independent P=128 LCM layout.
+
+    ``draft_fields`` join the same solve as continuation layers of the one
+    big model: their field ids are renumbered after the target's 93 layers
+    (``layer.93``, ``layer.94``, ...) so they share the full-attention
+    group's packing and page-id space with globally unique ids.
+    """
     fields = build_kimi_k3_cache_fields(
         text_config,
         tp_size=tp_size,
         mla_cache_dtype=mla_cache_dtype,
         mla_quant_method=mla_quant_method,
     )
+    layer_group_ids = kimi_k3_layer_group_ids(text_config)
+    num_draft_layers = 0
+    if draft_fields is not None:
+        continued = continue_layer_fields(
+            draft_fields, first_layer_id=len(layer_group_ids)
+        )
+        num_draft_layers = len(continued)
+        fields += continued
     mla_plane_bytes = _KIMI_K3_MLA_PACKING * next(
         field.payload_bytes for field in fields if field.group_id == FULL_ATTENTION
     )
@@ -262,13 +278,12 @@ def solve_kimi_k3_cache_layout(
         raise ValueError(
             f"Kimi-K3 LCM packing must be {packing}, got {dict(layout.group_packing)}"
         )
-    num_mla_layers = sum(
-        group_id == FULL_ATTENTION for group_id in kimi_k3_layer_group_ids(text_config)
-    )
-    if len(layout.plane_bytes) != num_mla_layers:
+    num_mla_layers = sum(gid == FULL_ATTENTION for gid in layer_group_ids)
+    if len(layout.plane_bytes) != num_mla_layers + num_draft_layers:
         raise ValueError(
-            f"Kimi-K3 LCM requires {num_mla_layers} planes (one per MLA "
-            f"layer), got {len(layout.plane_bytes)}"
+            f"Kimi-K3 LCM requires {num_mla_layers} target planes (one per "
+            f"MLA layer) plus {num_draft_layers} draft planes, got "
+            f"{len(layout.plane_bytes)}"
         )
     return layout
 
@@ -391,38 +406,33 @@ def prepare_kimi_k3_cache(
         for layer_id, layer_type in enumerate(layer_types)
         if layer_type == LINEAR_ATTENTION
     }
-    target_layout = solve_kimi_k3_cache_layout(
-        text_config,
-        tp_size=attn_config.attn_tp_size,
-        mla_cache_dtype=attn_config.kv_cache_dtype,
-        mla_quant_method=attn_config.kv_cache_quant_method or None,
-    )
-    reference_plan = target_layout.with_num_lcm_blocks(1)
-
+    # One big model, one solve, one spec: draft MLA layers continue the
+    # target's layer numbering and join the same solve, sharing the
+    # full-attention group's packing and page-id space.
     draft_fields = None
-    draft_parent_bytes = 0
     draft_layer_types = ()
+    num_draft_layers = 0
     if draft_attn_config is not None:
-        draft_layers = draft_model_config.num_attention_layers
-        draft_layer_types = (FULL_ATTENTION,) * draft_layers
+        num_draft_layers = draft_model_config.num_attention_layers
+        draft_layer_types = (FULL_ATTENTION,) * num_draft_layers
         draft_fields = mla_cache_fields(
             layer_group_ids=draft_layer_types,
-            logical_block_tokens=reference_plan.logical_block_tokens,
+            logical_block_tokens=_KIMI_K3_LOGICAL_BLOCK_TOKENS,
             latent_width=(
                 draft_attn_config.kv_lora_rank + draft_attn_config.qk_rope_head_dim
             ),
             element_size=draft_attn_config.kv_cache_dtype.itemsize,
         )
-        draft_layout = solve_cache_layout(
-            draft_fields,
-            logical_block_tokens=reference_plan.logical_block_tokens,
-            cache_blocks_per_lcm_block={FULL_ATTENTION: 12},
-            alignment=256,
-        )
-        draft_parent_bytes = draft_layout.lcm_block_bytes
+    merged_layout = solve_kimi_k3_cache_layout(
+        text_config,
+        tp_size=attn_config.attn_tp_size,
+        mla_cache_dtype=attn_config.kv_cache_dtype,
+        mla_quant_method=attn_config.kv_cache_quant_method or None,
+        draft_fields=draft_fields,
+    )
+    reference_plan = merged_layout.with_num_lcm_blocks(1)
 
-    bytes_per_parent = reference_plan.lcm_block_bytes + draft_parent_bytes
-    num_lcm_blocks = cache_budget_bytes // bytes_per_parent - 1
+    num_lcm_blocks = cache_budget_bytes // merged_layout.lcm_block_bytes - 1
     if num_lcm_blocks < 1:
         raise ValueError(
             "Kimi-K3 cache budget must hold a null parent and one usable LCM parent"
@@ -454,42 +464,28 @@ def prepare_kimi_k3_cache(
         build_paged_cache_group_specs,
     )
 
-    pd_enabled = attn_config.pd_disaggregation_enabled
-    target_plan = target_layout.with_num_lcm_blocks(num_lcm_blocks)
-    draft_spec = None
-    if draft_fields is not None:
-        draft_spec = CachePoolSpec(
-            family="kimi_k3",
-            memory_plan=draft_layout.with_num_lcm_blocks(num_lcm_blocks),
-            layer_types=draft_layer_types,
-            layer_group_ids=draft_layer_types,
-            paged_cache_group_specs=build_paged_cache_group_specs(
-                layer_types=draft_layer_types,
-                group_ids=draft_layer_types,
-                sliding_window_tokens=None,
-                page_size=target_plan.logical_block_tokens,
-                pd_disaggregation_enabled=pd_enabled,
-            ),
-            state_field_dtypes={},
-            token_capacity=admitted_tokens,
-        )
+    merged_plan = merged_layout.with_num_lcm_blocks(num_lcm_blocks)
+    # ONE spec derivation over the merged layers (draft MLA layers all
+    # join the shared full-attention group).
+    merged_layer_types = layer_types + draft_layer_types
+    merged_group_ids = group_ids + draft_layer_types
     return CacheSetup(
-        target=CachePoolSpec(
+        spec=CachePoolSpec(
             family="kimi_k3",
-            memory_plan=target_plan,
-            layer_types=layer_types,
-            layer_group_ids=group_ids,
+            memory_plan=merged_plan,
+            layer_types=merged_layer_types,
+            layer_group_ids=merged_group_ids,
             paged_cache_group_specs=build_paged_cache_group_specs(
-                layer_types=layer_types,
-                group_ids=group_ids,
+                layer_types=merged_layer_types,
+                group_ids=merged_group_ids,
                 sliding_window_tokens=None,
-                page_size=target_plan.logical_block_tokens,
-                pd_disaggregation_enabled=pd_enabled,
+                page_size=merged_plan.logical_block_tokens,
+                pd_disaggregation_enabled=attn_config.pd_disaggregation_enabled,
             ),
             state_field_dtypes=state_dtypes,
             token_capacity=admitted_tokens,
         ),
-        draft=draft_spec,
+        num_draft_layers=num_draft_layers,
         cache_budget_bytes=cache_budget_bytes,
         fixed_workspace_bytes=0,
     )

@@ -523,27 +523,52 @@ class CacheMemoryPlanTest(unittest.TestCase):
                     num_lcm_blocks=count,
                 )
 
-    def test_explicit_packing_keys_must_match_groups(self):
+    def test_explicit_packing_rejects_groups_outside_plan(self):
         field = self.plan_module.CacheFieldSpec
         fields = (
             field("history", "history.k", "plane.k", (128, 8), 2),
             field("state", "state.ssm", "plane.s", (128, 2), 2),
         )
 
-        for packing in (
-            {"history": 1},
-            {"history": 1, "state": 4, "extra": 1},
-        ):
-            with (
-                self.subTest(packing=packing),
-                self.assertRaisesRegex(ValueError, "exactly the cache groups"),
-            ):
-                self._plan_fields(
-                    fields,
-                    logical_block_tokens=128,
-                    num_lcm_blocks=2,
-                    cache_blocks_per_lcm_block=packing,
-                )
+        with self.assertRaisesRegex(ValueError, "outside the plan"):
+            self._plan_fields(
+                fields,
+                logical_block_tokens=128,
+                num_lcm_blocks=2,
+                cache_blocks_per_lcm_block={"history": 1, "state": 4, "extra": 1},
+            )
+
+    def test_partial_packing_pins_named_groups_and_solves_the_rest(self):
+        # A draft plan pins the groups it shares with the target (page ids
+        # must align) while its draft-only groups pack by byte ratio.
+        field = self.plan_module.CacheFieldSpec
+        fields = (
+            field("history", "history.k", "plane.k", (128, 8), 2),
+            field("state", "state.ssm", "plane.s", (128, 2), 2),
+        )
+
+        unpinned = self._plan_fields(
+            fields,
+            logical_block_tokens=128,
+            num_lcm_blocks=2,
+            max_padding_fraction=1.0,
+        )
+        history_count = unpinned.group("history").cache_blocks_per_lcm_block
+        pinned = self._plan_fields(
+            fields,
+            logical_block_tokens=128,
+            num_lcm_blocks=2,
+            max_padding_fraction=1.0,
+            cache_blocks_per_lcm_block={"history": history_count},
+        )
+        self.assertEqual(
+            pinned.group("history").cache_blocks_per_lcm_block, history_count
+        )
+        # The unnamed group packs exactly as the fully-unpinned solve does.
+        self.assertEqual(
+            pinned.group("state").cache_blocks_per_lcm_block,
+            unpinned.group("state").cache_blocks_per_lcm_block,
+        )
 
     def test_explicit_packing_rejects_invalid_count(self):
         field = self.plan_module.CacheFieldSpec
@@ -634,3 +659,143 @@ class CacheMemoryPlanTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CapacityReportTest(unittest.TestCase):
+    """Per-group capacity in its own unit; binding admission = min."""
+
+    def _mixed_plan(self):
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+            CacheFieldSpec,
+            solve_cache_layout,
+        )
+
+        fields = (
+            CacheFieldSpec("history", "history.k", "plane.shared", (128, 8), 2),
+            CacheFieldSpec("state", "state.ssm", "plane.shared", (128, 8), 2),
+            CacheFieldSpec("swa", "swa.kv", "plane.shared", (128, 8), 2),
+        )
+        return solve_cache_layout(fields, logical_block_tokens=128).with_num_lcm_blocks(
+            100
+        )
+
+    def test_units_and_supported_requests(self):
+        plan = self._mixed_plan()
+        report = plan.capacity_report(
+            window_tokens={"swa": 512},
+            per_request_blocks={"state": 2},
+            max_num_seqs=32,
+        )
+        state = report["state"]
+        self.assertEqual(state["unit"], "requests")
+        state_pages = 100 * plan.group("state").cache_blocks_per_lcm_block
+        self.assertEqual(state["supported_requests"], state_pages // 2)
+
+        swa = report["swa"]
+        self.assertEqual(swa["unit"], "tokens")
+        swa_tokens = 100 * plan.group("swa").cache_blocks_per_lcm_block * 128
+        self.assertEqual(swa["supported_requests"], swa_tokens // 512)
+
+        history = report["history"]
+        self.assertIsNone(history["supported_requests"])
+        self.assertEqual(history["dead_bytes"], 0)
+
+    def test_window_group_dead_bytes_bounded_by_demand(self):
+        plan = self._mixed_plan()
+        report = plan.capacity_report(
+            window_tokens={"swa": 512},
+            max_num_seqs=4,
+        )
+        swa = report["swa"]
+        # 4 requests x 512-token windows is the whole active demand; the
+        # rest of the group's rows are stranded by the static slab split.
+        swa_tokens = 100 * plan.group("swa").cache_blocks_per_lcm_block * 128
+        self.assertGreater(swa["dead_bytes"], 0)
+        demand_tokens = 4 * 512
+        field_bytes = 128 * 8 * 2
+        expected = (swa_tokens - demand_tokens) // 128 * field_bytes
+        self.assertEqual(swa["dead_bytes"], expected)
+
+
+class ContinuationLayerFieldsTest(CacheMemoryPlanTest):
+    """One-big-model merged solve: draft fields join as continuation layers
+    (renumbered after the target's), sharing group ids and packing."""
+
+    def test_renumbering_shifts_layer_unit_and_slot_ids(self):
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+            CacheFieldSpec,
+            continue_layer_fields,
+        )
+
+        draft = (
+            CacheFieldSpec("history", "layer.0.kv", "slot.0", (128, 8), 2),
+            CacheFieldSpec("history", "layer.1.k", "unit.1.k", (128, 8), 2),
+        )
+        shifted = continue_layer_fields(draft, first_layer_id=24)
+        self.assertEqual(shifted[0].field_id, "layer.24.kv")
+        self.assertEqual(shifted[0].plane_id, "slot.24")
+        self.assertEqual(shifted[1].field_id, "layer.25.k")
+        self.assertEqual(shifted[1].plane_id, "unit.25.k")
+        # Group ids are untouched: shared page-id space by construction.
+        self.assertTrue(all(f.group_id == "history" for f in shifted))
+
+    def test_merged_solve_shares_group_packing(self):
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+            CacheFieldSpec,
+            continue_layer_fields,
+        )
+
+        target = (
+            CacheFieldSpec("history", "layer.0.kv", "slot.0", (128, 8), 2),
+            CacheFieldSpec("history", "layer.1.kv", "slot.1", (128, 8), 2),
+        )
+        draft = (CacheFieldSpec("history", "layer.0.kv", "slot.0", (128, 8), 2),)
+        merged = self.plan_module.solve_cache_layout(
+            target + continue_layer_fields(draft, first_layer_id=2),
+            logical_block_tokens=128,
+        )
+        plan = merged.with_num_lcm_blocks(2)
+        # One group, one packing, one page-id space; the draft layer is
+        # just layer 2 of the one big model.
+        self.assertEqual(dict(merged.group_packing), {"history": 1})
+        self.assertEqual(
+            plan.field("layer.2.kv").page_stride_bytes,
+            plan.field("layer.0.kv").page_stride_bytes,
+        )
+        self.assertEqual(len(plan.planes), 3)
+
+
+class BindingUtilizationTest(CacheMemoryPlanTest):
+    """util(g) = K_g x group_bytes / parent_bytes — the binding-hole metric.
+
+    Aliased slabs are sized by their widest tenant; a narrower group's
+    binding uses only its own shape and the rest of the parent is dead
+    for that binding's lifetime.
+    """
+
+    def test_wide_group_full_narrow_group_partial(self):
+        field = self.plan_module.CacheFieldSpec
+        # Two groups share one plane (aliased): wide 256B/page x1, narrow
+        # 100B/page x1 -> parent is sized by the wide tenant.
+        plan = self._plan_fields(
+            (
+                field("wide", "w.kv", "plane.shared", (256,), 1),
+                field(
+                    "narrow",
+                    "n.state",
+                    "plane.shared",
+                    (100,),
+                    1,
+                    exact_page_stride=False,
+                ),
+            ),
+            logical_block_tokens=16,
+            num_lcm_blocks=2,
+            cache_blocks_per_lcm_block={"wide": 1, "narrow": 1},
+            max_padding_fraction=2.0,
+        )
+        report = plan.capacity_report()
+        self.assertAlmostEqual(report["wide"]["binding_utilization"], 1.0)
+        self.assertAlmostEqual(
+            report["narrow"]["binding_utilization"], 100 / 256, places=3
+        )

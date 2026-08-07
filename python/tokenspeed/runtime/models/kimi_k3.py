@@ -69,6 +69,7 @@ from tokenspeed_kernel.ops.activation.triton import (
     rmsnorm_gated_sigmoid,
     sigmoid_mul,
 )
+from tokenspeed_kernel.ops.attention import mla_normalize_project_query
 from tokenspeed_kernel.ops.attn_res import attn_res_fwd
 from tokenspeed_kernel.ops.communication import allreduce_fusion_lane
 from tokenspeed_kernel.ops.gemm import (
@@ -380,8 +381,15 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         ctx: "ForwardContext",
         comm_manager: CommManager,
         block_scale: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Project MLA Q, latent KV, and the local output gate in one GEMM."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Project MLA Q, latent KV, and the local output gate in one GEMM.
+
+        Returns:
+            query: Normalized and projected MLA query.
+            latent_cache: Compressed latent KV and RoPE cache row.
+            gate: Local output-gate shard.
+            absorbed_query: Optional decode query projected into latent key space.
+        """
         if block_scale is not None:
             qkv_gate = self.fused_qkv_a_proj_with_mqa(
                 hidden_states, block_scale, torch.bfloat16
@@ -419,11 +427,18 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
                 )
                 gate = projection.gate
         kv_a = latent_cache[..., : self.kv_lora_rank]
-        q_norm = torch.empty_like(q_a)
-        if q_a.size(0) > 0:
-            self.fused_qk_layernorm(input_q_a=q_a, input_kv_a=kv_a, output_q_a=q_norm)
-        q = decode_gemv(q_norm, self.q_b_proj.weight)
-        return q, latent_cache, gate
+        projection = mla_normalize_project_query(
+            q_a,
+            kv_a,
+            self.fused_qk_layernorm.weight_q_a,
+            self.fused_qk_layernorm.weight_kv_a,
+            self.q_b_proj.weight,
+            eps=self.q_a_layernorm.variance_epsilon,
+            prepare_absorbed_query=ctx is not None and ctx.num_extends == 0,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+        )
+        return projection.query, latent_cache, gate, projection.absorbed_query
 
     def forward(
         self,
@@ -437,7 +452,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         if hidden_states.shape[0] == 0:
             return hidden_states
         if self.use_output_gate:
-            q, latent_cache, gate = self._project_q_latent_gated(
+            q, latent_cache, gate, absorbed_query = self._project_q_latent_gated(
                 hidden_states, ctx, comm_manager, block_scale
             )
         else:
@@ -445,8 +460,22 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
                 hidden_states, ctx, comm_manager, block_scale
             )
             gate = None
-        attn_output = self._attn(positions, q, latent_cache, ctx, out_cache_loc)
-        if gate is not None:
+            absorbed_query = None
+        fuse_value_gate = (
+            gate is not None
+            and ctx.num_extends == 0
+            and ctx.attn_backend.supports_mla_projected_value_decode
+        )
+        attn_output = self._attn(
+            positions,
+            q,
+            latent_cache,
+            ctx,
+            out_cache_loc,
+            output_gate=gate if fuse_value_gate else None,
+            absorbed_query=absorbed_query,
+        )
+        if gate is not None and not fuse_value_gate:
             # Fused in-place fp32 sigmoid+mul; the gate shard matches the
             # head-sharded attn_output.
             attn_output = sigmoid_mul(attn_output, gate)
@@ -1783,8 +1812,33 @@ class KimiLinearModel(nn.Module):
         # One-based completed-layer ids; see set_eagle3_layers_to_capture.
         self.eagle3_layers_to_capture: tuple[int, ...] = ()
 
+        # DFLASH/DSpark speculative decoding: layer indices whose *output*
+        # stream is captured for the draft. Populated by
+        # ``set_dflash_layers_to_capture``; empty means no capture.
+        self.layers_to_capture: list[int] = []
+        self._dflash_incremental_callback = None
+        self._dflash_slot_bufs = None
+        self._dflash_capture_idx_map: dict[int, int] = {}
+
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
+
+    def _dspark_capture_stream(
+        self,
+        layer_idx: int,
+        prefix_sum: torch.Tensor,
+        block_residual: torch.Tensor,
+    ) -> torch.Tensor:
+        """Capture vLLM's completed-layer DSpark target stream.
+
+        vLLM captures ``prefix_sum + hidden_states`` immediately after the
+        named layer. This implementation accumulates the layer output into
+        ``prefix_sum`` before returning from the layer, so that sum is already
+        represented by ``prefix_sum``. Clone because later layers may update
+        the same storage in place.
+        """
+        del layer_idx, block_residual
+        return prefix_sum.clone()
 
     @torch.no_grad()
     def forward(
@@ -1811,17 +1865,33 @@ class KimiLinearModel(nn.Module):
             num_blocks, hidden_states.size(0), hidden_states.size(1)
         )
 
+        capture_layers = self.layers_to_capture
+        capture_dflash = bool(capture_layers)
+        capture_eagle3 = bool(self.eagle3_layers_to_capture)
+        aux_hidden_states: list[torch.Tensor] | None = (
+            [] if capture_dflash or capture_eagle3 else None
+        )
+
         prefix_sum = hidden_states
-        aux_hidden_states = [] if self.eagle3_layers_to_capture else None
         for layer_idx, layer in enumerate(self.layers):
             prefix_sum, block_residual = layer(
                 positions, prefix_sum, ctx, out_cache_loc, block_residual
             )
+            if capture_dflash and layer_idx in capture_layers:
+                captured = self._dspark_capture_stream(
+                    layer_idx, prefix_sum, block_residual
+                )
+                capture_idx = self._dflash_capture_idx_map.get(layer_idx)
+                if self._dflash_slot_bufs is not None and capture_idx is not None:
+                    num_tokens = captured.shape[0]
+                    self._dflash_slot_bufs[capture_idx][:num_tokens].copy_(captured)
+                    if self._dflash_incremental_callback is not None:
+                        self._dflash_incremental_callback(capture_idx, num_tokens)
+                assert aux_hidden_states is not None
+                aux_hidden_states.append(captured)
             # Clone: the copy must survive the next layer's in-place residual writes.
-            if (
-                aux_hidden_states is not None
-                and layer_idx + 1 in self.eagle3_layers_to_capture
-            ):
+            elif capture_eagle3 and layer_idx + 1 in self.eagle3_layers_to_capture:
+                assert aux_hidden_states is not None
                 aux_hidden_states.append(prefix_sum.clone())
 
         hidden_states = _apply_attn_res(
@@ -1868,6 +1938,38 @@ class KimiLinearForCausalLM(BaseCausalLM):
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_dflash_layers_to_capture(
+        self,
+        layer_ids: list[int],
+        incremental_callback=None,
+        slot_bufs: list | None = None,
+    ) -> None:
+        """Capture the K3 residual stream after each named target layer.
+
+        DFLASH/DSpark checkpoints name 0-indexed completed-layer outputs. The
+        per-layer return has already accumulated the layer output into K3's
+        prefix stream, matching vLLM's target-side capture contract.
+        """
+        num_layers = len(self.model.layers)
+        if len(set(layer_ids)) != len(layer_ids):
+            raise ValueError("DFLASH target_layer_ids must be unique.")
+        invalid = [val for val in layer_ids if val < 0 or val >= num_layers]
+        if invalid:
+            raise ValueError(
+                "DFLASH target_layer_ids must map to capturable target layer "
+                f"outputs. Got invalid ids {invalid}; valid range is "
+                f"[0, {num_layers - 1}] for {num_layers} target layers."
+            )
+        self.capture_aux_hidden_states = True
+        # Ascending: the draft concatenates the taps positionally, so the
+        # capture order is part of the weight contract.
+        self.model.layers_to_capture = sorted(layer_ids)
+        self.model._dflash_capture_idx_map = {
+            layer_idx: i for i, layer_idx in enumerate(self.model.layers_to_capture)
+        }
+        self.model._dflash_incremental_callback = incremental_callback
+        self.model._dflash_slot_bufs = slot_bufs
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         """Load the ``model.*`` / ``lm_head.*`` text weights.
@@ -2092,6 +2194,22 @@ class KimiK3ForConditionalGeneration(nn.Module):
 
     def get_embed_and_head(self):
         return self.language_model.get_embed_and_head()
+
+    def set_dflash_layers_to_capture(
+        self,
+        layer_ids: list[int],
+        incremental_callback=None,
+        slot_bufs: list | None = None,
+    ) -> None:
+        if self.language_model is None:
+            raise AttributeError(
+                "Kimi-K3 encoder-only mode cannot capture target hidden states."
+            )
+        self.language_model.set_dflash_layers_to_capture(
+            layer_ids,
+            incremental_callback=incremental_callback,
+            slot_bufs=slot_bufs,
+        )
 
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
         if self.language_model is None:

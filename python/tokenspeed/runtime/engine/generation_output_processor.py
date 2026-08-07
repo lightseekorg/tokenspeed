@@ -320,6 +320,7 @@ class OutputProcesser:
         spec_num_tokens: int | None = None,
         stream_interval: int = 1,
         enable_log_request_stats: bool = False,
+        physical_context_len: int | None = None,
         *,
         metrics: EngineMetrics,
     ) -> None:
@@ -334,6 +335,14 @@ class OutputProcesser:
         self.attn_tp_rank = attn_tp_rank
         self.spec_algorithm = spec_algorithm
         self.spec_num_tokens = spec_num_tokens
+        # Tripwire bound: per-request buffers (page tables, draft tables) are
+        # sized for this physical extent, and spec verify may legitimately
+        # commit up to it for a finished request lingering one overlap step.
+        # Committing PAST it means the one-lingering-step assumption broke
+        # (scheduler eviction timing, overlap depth) — the next KV write would
+        # go out of bounds and hang the attention kernel, so fail loudly here
+        # instead. None disables the check.
+        self.physical_context_len = physical_context_len
         self.stream_interval = stream_interval
         self.metrics = metrics
         self.enable_log_request_stats = enable_log_request_stats
@@ -347,6 +356,36 @@ class OutputProcesser:
         # handles. Entries for rids that never register are swept by TTL
         # to keep this bounded across a long-running server.
         self.pending_aborts: dict[str, float] = {}
+
+    def _check_physical_extent(
+        self, rid, request_state: RequestState, output_length: int
+    ) -> None:
+        """Raise if a decode step committed past the physical KV extent.
+
+        Verify may legitimately commit up to physical_context_len for a
+        finished request lingering one overlap step; every per-request table
+        is sized for exactly that. Going PAST it means the one-lingering-step
+        assumption broke (scheduler eviction timing, overlap depth) and the
+        next KV write would run out of bounds and hang the attention kernel —
+        fail loudly here instead.
+        """
+        if self.physical_context_len is None:
+            return
+        total_tokens = (
+            len(request_state.prompt_input_ids)
+            + len(request_state.output_ids)
+            + output_length
+        )
+        if total_tokens > self.physical_context_len:
+            raise RuntimeError(
+                "Committed token count exceeds the physical KV extent for "
+                f"request {rid}: prompt+output reaches {total_tokens} > "
+                f"physical_context_len={self.physical_context_len}. A "
+                "finished request lingered more than one overlap step past "
+                "context_len (see _SPEC_OVERSHOOT_SPANS in server_args.py); "
+                "the next KV write would run out of bounds and hang the "
+                "attention kernel."
+            )
 
     def log_accept_length(self, rid, request_state: RequestState):
         # When --enable-log-request-stats is on, the richer RequestStats line (which
@@ -706,6 +745,7 @@ class OutputProcesser:
 
             if is_decode_slot and self.spec_algorithm is not None:
                 request_state.spec_verify_ct += 1
+                self._check_physical_extent(rid, request_state, output_length)
 
             # With the capturable grammar pipeline the matcher is
             # advanced by the hostfunc; here we just read which token

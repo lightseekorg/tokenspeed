@@ -15,7 +15,7 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
-from tokenspeed.runtime.execution.model_executor import (  # noqa: E402
+from tokenspeed.runtime.execution.factory import (  # noqa: E402
     _eagle_aux_layer_ids,
 )
 from tokenspeed.runtime.models import kimi_k3  # noqa: E402
@@ -53,6 +53,7 @@ def test_capture_tensor_matches_post_layer_attnres_reference():
         output_attn_res_proj=None,
         output_attn_res_norm=None,
         norm=None,
+        layers_to_capture=[],
         eagle3_layers_to_capture=(2, 3),
     )
 

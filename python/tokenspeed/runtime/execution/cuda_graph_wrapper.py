@@ -219,7 +219,9 @@ class CudaGraphWrapper:
         self.device = config.device
         self.gpu_id = config.gpu_id
         self.global_rank = config.global_rank
-        self.context_len = config.context_len
+        # Physical extent: capture tables must cover the spec-verify overshoot
+        # of a finished request lingering one overlap step.
+        self.context_len = config.physical_context_len
         self.vocab_size = config.vocab_size
         self.grammar_backend = config.grammar_backend
         self.capture_bs = get_batch_sizes_to_capture(config)
@@ -640,6 +642,12 @@ class CudaGraphWrapper:
             )
         return out
 
+    def _any_backend_uses_cache_groups(self) -> bool:
+        return getattr(self.attn_backend, "uses_cache_groups", False) or (
+            self.draft_attn_backend is not None
+            and getattr(self.draft_attn_backend, "uses_cache_groups", False)
+        )
+
     def _cache_group_ids(self, pool) -> tuple[str, ...]:
         """Group ids for per-group CUDA-graph capture: real tables only
         arrive at replay, so capture needs just the ids to allocate its
@@ -959,7 +967,7 @@ class CudaGraphWrapper:
                 padded_bs,
                 req_pool_indices,
                 draft_seq_lens,
-                page_table=self.drafter.page_table,
+                page_table=self.drafter.cache_view.table,
                 forward_mode=draft_forward_mode,
                 **draft_attn_kwargs,
             )
@@ -1040,7 +1048,7 @@ class CudaGraphWrapper:
                     num_extends=num_extends,
                     req_pool_indices=req_pool_indices,
                     seq_lens=draft_prefill_seq_lens,
-                    page_table=self.drafter.page_table,
+                    page_table=self.drafter.cache_view.table,
                     forward_mode=forward_mode,
                     **draft_extend_kwargs,
                 )
@@ -1050,7 +1058,7 @@ class CudaGraphWrapper:
                         num_extends=0,
                         req_pool_indices=req_pool_indices,
                         seq_lens=draft_seq_lens,
-                        page_table=self.drafter.page_table,
+                        page_table=self.drafter.cache_view.table,
                         forward_mode=ForwardMode.DECODE,
                         **draft_kwargs,
                     )
@@ -1070,7 +1078,7 @@ class CudaGraphWrapper:
                     num_extends=0,
                     req_pool_indices=req_pool_indices,
                     seq_lens=draft_metadata_seq_lens,
-                    page_table=self.drafter.page_table,
+                    page_table=self.drafter.cache_view.table,
                     forward_mode=draft_forward_mode,
                     **draft_kwargs,
                 )
@@ -1216,12 +1224,9 @@ class CudaGraphWrapper:
                     self.token_to_kv_pool,
                 )
             # The backend's stale-table guard also covers the bs==0 idle
-            # replay: synthesize minimal valid tables for it.
-            if (
-                bs == 0
-                and not block_tables
-                and getattr(self.attn_backend, "uses_cache_groups", False)
-            ):
+            # replay: synthesize minimal valid tables for it. The draft's
+            # group-table consumption needs them for the same reason.
+            if bs == 0 and not block_tables and self._any_backend_uses_cache_groups():
                 block_tables = self._idle_block_tables(padded_bs)
             self._init_replay_metadata(
                 padded_bs,
@@ -1318,7 +1323,7 @@ class CudaGraphWrapper:
                     else None
                 ),
                 block_tables=(
-                    block_tables if self.attn_backend.uses_cache_groups else None
+                    block_tables if self._any_backend_uses_cache_groups() else None
                 ),
                 **cache_kwargs,
             )

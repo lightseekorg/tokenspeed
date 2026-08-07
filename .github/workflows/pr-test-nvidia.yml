@@ -89,7 +89,7 @@ jobs:
       - name: Build task matrix
         id: scan
         env:
-          TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS: h100,${{ vars.TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS }}
+          TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS: h100,b300,${{ vars.TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS }}
         run: |
           for stage in \
             unit:unit-test \

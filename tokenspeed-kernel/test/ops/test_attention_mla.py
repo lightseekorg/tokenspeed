@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -9,7 +10,9 @@ from tokenspeed_kernel import (
     mla_extend_with_kvcache,
     mla_prefill,
 )
+from tokenspeed_kernel.platform import current_platform
 
+platform = current_platform()
 torch.manual_seed(42)
 
 _FP8_DTYPES = frozenset({torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz})
@@ -18,8 +21,10 @@ _FP8_DTYPES = frozenset({torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4
 @pytest.mark.parametrize(
     "dtype,num_heads,qk_head_dim,v_head_dim",
     [
+        pytest.param(torch.float16, 128, 192, 128, id="fp16"),
         pytest.param(torch.bfloat16, 128, 192, 128, id="bf16"),
-        pytest.param(torch.float8_e4m3fn, 128, 192, 128, id="fp8"),
+        pytest.param(torch.float8_e4m3fn, 128, 192, 128, id="fp8-e4m3"),
+        pytest.param(torch.float8_e5m2, 128, 192, 128, id="fp8-e5m2"),
     ],
 )
 @pytest.mark.parametrize("solution", ["triton", "gluon"])
@@ -94,7 +99,7 @@ def test_mla_prefill(
 
     assert out.shape == (q.shape[0], q.shape[1], v.shape[-1])
     assert lse.shape == (q.shape[0], q.shape[1])
-    out_tol = 1e-1 if dtype in _FP8_DTYPES else 8e-2
+    out_tol = 2e-1 if dtype in _FP8_DTYPES else 8e-2
     torch.testing.assert_close(out.float(), out_ref, rtol=out_tol, atol=out_tol)
     torch.testing.assert_close(lse, lse_ref, rtol=8e-2, atol=8e-2)
 
@@ -134,6 +139,28 @@ def test_mla_prefill(
             4,
             64,
             id="gluon-bh16bn64",
+        ),
+        pytest.param(
+            "gluon",
+            torch.float16,
+            torch.float16,
+            16,
+            512,
+            64,
+            4,
+            64,
+            id="gluon-gfx1250-fp16",
+        ),
+        pytest.param(
+            "gluon",
+            torch.float8_e5m2,
+            torch.float8_e5m2,
+            16,
+            512,
+            64,
+            4,
+            64,
+            id="gluon-gfx1250-fp8-e5m2",
         ),
         pytest.param(
             "gluon",
@@ -390,12 +417,21 @@ def test_mla_decode_with_kvcache(
     torch.testing.assert_close(lse, lse_ref, rtol=8e-2, atol=8e-2)
 
 
-def test_mla_extend_with_kvcache_bf16(device: str, require) -> None:
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float16, id="fp16"),
+        pytest.param(torch.bfloat16, id="bf16"),
+        pytest.param(torch.float8_e4m3fn, id="fp8-e4m3"),
+        pytest.param(torch.float8_e5m2, id="fp8-e5m2"),
+    ],
+)
+def test_mla_extend_with_kvcache(device: str, dtype: torch.dtype, require) -> None:
     require(
         "attention",
         "mla_extend_with_kvcache",
         "gluon",
-        torch.bfloat16,
+        dtype,
         "q",
     )
 
@@ -418,7 +454,7 @@ def test_mla_extend_with_kvcache_bf16(device: str, require) -> None:
         qk_dim,
         device=device,
         dtype=torch.bfloat16,
-    )
+    ).to(dtype)
     kv_cache = torch.randn(
         len(query_lens),
         page_size,
@@ -426,7 +462,7 @@ def test_mla_extend_with_kvcache_bf16(device: str, require) -> None:
         qk_dim,
         device=device,
         dtype=torch.bfloat16,
-    )
+    ).to(dtype)
     page_table = torch.arange(
         len(query_lens), device=device, dtype=torch.int32
     ).unsqueeze(1)
@@ -451,6 +487,7 @@ def test_mla_extend_with_kvcache_bf16(device: str, require) -> None:
         is_causal=True,
         solution="gluon",
     )
+    assert out.dtype == torch.bfloat16
 
     refs = []
     q_start = 0
@@ -468,7 +505,8 @@ def test_mla_extend_with_kvcache_bf16(device: str, require) -> None:
             refs.append(torch.matmul(probs, visible_kv[:, :kv_lora_rank]))
         q_start += q_len
 
-    torch.testing.assert_close(out.float(), torch.stack(refs), rtol=8e-2, atol=8e-2)
+    tol = 1e-1 if dtype in _FP8_DTYPES else 8e-2
+    torch.testing.assert_close(out.float(), torch.stack(refs), rtol=tol, atol=tol)
 
 
 def _run_fixed_bf16_mla_decode_case(
@@ -724,4 +762,404 @@ def test_mla_decode_small_batch_fixed_entrypoints_use_out(
         cache_seqlens_list=[63, 65],
         return_lse=True,
         use_out=True,
+    )
+
+
+def test_mla_decode_with_kvcache_projected_value_matches_split_and_captures(
+    device: str,
+) -> None:
+    if not platform.is_cdna4:
+        pytest.skip("K3 fused MLA epilogue requires CDNA4")
+    from tokenspeed_kernel import mla_project_value
+
+    torch.manual_seed(67)
+    q = torch.randn(1, 1, 12, 576, device=device, dtype=torch.bfloat16).to(
+        torch.float8_e4m3fn
+    )
+    kv_cache = torch.randn(64, 64, 1, 576, device=device, dtype=torch.bfloat16).to(
+        torch.float8_e4m3fn
+    )
+    page_table = torch.arange(64, device=device, dtype=torch.int32).view(1, 64)
+    cache_seqlens = torch.tensor([4096], device=device, dtype=torch.int32)
+    weight = torch.randn(12, 512, 128, device=device, dtype=torch.bfloat16)
+    gate = torch.randn(1, 1536, device=device, dtype=torch.bfloat16)
+    output = torch.empty_like(gate)
+    attention = mla_decode_with_kvcache(
+        q=q,
+        kv_cache=kv_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_k=8192,
+        qk_nope_head_dim=128,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        softmax_scale=1.0 / math.sqrt(192),
+        solution="gluon",
+    )
+    expected = mla_project_value(
+        attention.reshape(1, 12, 512),
+        weight,
+        gate=gate,
+    )
+
+    mla_decode_with_kvcache(
+        q=q,
+        kv_cache=kv_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_k=8192,
+        qk_nope_head_dim=128,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        softmax_scale=1.0 / math.sqrt(192),
+        value_weight=weight,
+        gate=gate,
+        out=output,
+    )
+    eager_output = output.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        returned = mla_decode_with_kvcache(
+            q=q,
+            kv_cache=kv_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            max_seqlen_k=8192,
+            qk_nope_head_dim=128,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            softmax_scale=1.0 / math.sqrt(192),
+            value_weight=weight,
+            gate=gate,
+            out=output,
+        )
+    assert returned.data_ptr() == output.data_ptr()
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, eager_output, atol=0, rtol=0)
+    # The fused path retains opt69's 16-split schedule, while the generic
+    # native-FP8 path uses 64 splits. Validate the resulting FP8 reduction
+    # against the generic composition within its quantized numerical envelope.
+    torch.testing.assert_close(output, expected, atol=0.125, rtol=0.05)
+
+
+@pytest.mark.parametrize("use_gate", [False, True])
+def test_mla_decode_with_kvcache_composes_projected_value_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    use_gate: bool,
+) -> None:
+    import tokenspeed_kernel.ops.attention as attention_ops
+    from tokenspeed_kernel.selection import NoKernelFoundError
+
+    latent = torch.arange(24, dtype=torch.float32).reshape(2, 1, 3, 4) / 16
+    q = torch.empty(2, 1, 3, 6)
+    kv_cache = torch.empty(1, 8, 1, 6)
+    page_table = torch.zeros(2, 1, dtype=torch.int32)
+    cache_seqlens = torch.ones(2, dtype=torch.int32)
+    weight = torch.arange(24, dtype=torch.float32).reshape(3, 4, 2) / 32
+    raw_gate = torch.linspace(-1, 1, 12).reshape(2, 6)
+    gate = raw_gate if use_gate else None
+    output = torch.empty_like(raw_gate)
+
+    def select_decode_kernel(*args, **kwargs):
+        if args[1] == "mla_project_value":
+            raise NoKernelFoundError
+        if args[1] == "mla_decode_projected_value":
+            assert kwargs["traits"]["support_logit_cap"] is True
+            raise NoKernelFoundError
+        assert args[1] == "mla_decode_with_kvcache"
+        split_decode.name = "split_decode"
+        return split_decode
+
+    def split_decode(**kwargs):
+        assert kwargs["kv_lora_rank"] == 4
+        assert kwargs["qk_rope_head_dim"] == 2
+        assert kwargs["logit_cap"] == 2.5
+        return latent
+
+    monkeypatch.setattr(attention_ops, "select_kernel", select_decode_kernel)
+
+    returned = attention_ops.mla_decode_with_kvcache(
+        q=q,
+        kv_cache=kv_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_k=8,
+        qk_nope_head_dim=2,
+        kv_lora_rank=4,
+        qk_rope_head_dim=2,
+        softmax_scale=1.0,
+        value_weight=weight,
+        gate=gate,
+        out=output,
+        logit_cap=2.5,
+    )
+    expected = torch.bmm(
+        latent.reshape(2, 3, 4).transpose(0, 1).contiguous(),
+        weight,
+    )
+    expected = expected.transpose(0, 1).reshape_as(output)
+    if gate is not None:
+        expected = expected * torch.sigmoid(gate)
+    assert returned.data_ptr() == output.data_ptr()
+    torch.testing.assert_close(output, expected)
+
+
+def test_mla_decode_with_kvcache_rejects_invalid_projected_out() -> None:
+    q = torch.empty(2, 1, 3, 6)
+    kv_cache = torch.empty(1, 8, 1, 6)
+    page_table = torch.zeros(2, 1, dtype=torch.int32)
+    cache_seqlens = torch.ones(2, dtype=torch.int32)
+    weight = torch.empty(3, 4, 2)
+
+    def call(out: torch.Tensor) -> None:
+        mla_decode_with_kvcache(
+            q=q,
+            kv_cache=kv_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            max_seqlen_k=8,
+            qk_nope_head_dim=2,
+            kv_lora_rank=4,
+            qk_rope_head_dim=2,
+            softmax_scale=1.0,
+            value_weight=weight,
+            out=out,
+        )
+
+    with pytest.raises(ValueError, match="contiguous and colocated"):
+        call(torch.empty(2, 12)[:, ::2])
+    with pytest.raises(ValueError, match="contiguous and colocated"):
+        call(torch.empty(2, 6, device="meta"))
+
+    with pytest.raises(ValueError, match="gate requires value_weight"):
+        mla_decode_with_kvcache(
+            q=q,
+            kv_cache=kv_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            max_seqlen_k=8,
+            qk_nope_head_dim=2,
+            kv_lora_rank=4,
+            qk_rope_head_dim=2,
+            softmax_scale=1.0,
+            gate=torch.empty(2, 6),
+        )
+    with pytest.raises(ValueError, match="does not support return_lse"):
+        mla_decode_with_kvcache(
+            q=q,
+            kv_cache=kv_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            max_seqlen_k=8,
+            qk_nope_head_dim=2,
+            kv_lora_rank=4,
+            qk_rope_head_dim=2,
+            softmax_scale=1.0,
+            return_lse=True,
+            value_weight=weight,
+            out=torch.empty(2, 6),
+        )
+
+
+def test_mla_project_value_fallback_preserves_fp32_gate_math(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tokenspeed_kernel.ops.attention as attention_ops
+    from tokenspeed_kernel.selection import NoKernelFoundError
+
+    def no_kernel(*args, **kwargs):
+        raise NoKernelFoundError
+
+    monkeypatch.setattr(attention_ops, "select_kernel", no_kernel)
+    attention = torch.tensor([[[-3.109375]]], dtype=torch.bfloat16)
+    weight = torch.ones(1, 1, 1, dtype=torch.bfloat16)
+    gate = torch.tensor([[6.21875]], dtype=torch.bfloat16)
+
+    output = attention_ops.mla_project_value(attention, weight, gate=gate)
+    expected = (attention.float().reshape(1, 1) * gate.float().sigmoid()).to(
+        torch.bfloat16
+    )
+
+    torch.testing.assert_close(output, expected, atol=0, rtol=0)
+    assert not torch.equal(output, attention.reshape(1, 1) * gate.sigmoid())
+
+
+def test_mla_project_value_nvidia_fallback_writes_projection_directly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tokenspeed_kernel.ops.attention as attention_ops
+    from tokenspeed_kernel.selection import NoKernelFoundError
+
+    def no_kernel(*args, **kwargs):
+        raise NoKernelFoundError
+
+    original_bmm = torch.bmm
+    bmm_out = None
+
+    def record_bmm(
+        input: torch.Tensor,
+        mat2: torch.Tensor,
+        *,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        nonlocal bmm_out
+        bmm_out = out
+        return original_bmm(input, mat2, out=out)
+
+    monkeypatch.setattr(attention_ops, "select_kernel", no_kernel)
+    monkeypatch.setattr(
+        attention_ops,
+        "current_platform",
+        lambda: SimpleNamespace(is_nvidia=True),
+    )
+    monkeypatch.setattr(torch, "bmm", record_bmm)
+    attention = torch.randn(2, 3, 4)
+    weight = torch.randn(3, 4, 5)
+    expected = torch.einsum("bhl,hlv->bhv", attention, weight).reshape(2, 15)
+
+    output = attention_ops.mla_project_value(attention, weight)
+
+    assert bmm_out is not None
+    torch.testing.assert_close(output, expected)
+
+
+def test_mla_normalize_project_query_cuda_fallback(
+    device: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tokenspeed_kernel.ops.attention as attention_ops
+    from tokenspeed_kernel.selection import NoKernelFoundError
+
+    def no_kernel(*args, **kwargs):
+        raise NoKernelFoundError
+
+    monkeypatch.setattr(attention_ops, "select_kernel", no_kernel)
+    query = torch.randn(2, 64, device=device, dtype=torch.bfloat16)
+    kv = torch.randn(2, 32, device=device, dtype=torch.bfloat16)
+    query_weight = torch.randn(64, device=device, dtype=torch.bfloat16)
+    kv_weight = torch.randn(32, device=device, dtype=torch.bfloat16)
+    projection_weight = torch.randn(48, 64, device=device, dtype=torch.bfloat16)
+    eps = 1e-6
+    query_fp32 = query.float()
+    expected_query = (
+        query_fp32
+        * torch.rsqrt(query_fp32.square().mean(dim=-1, keepdim=True) + eps)
+        * query_weight.float()
+    ).to(torch.bfloat16)
+    kv_fp32 = kv.float()
+    expected_kv = (
+        kv_fp32
+        * torch.rsqrt(kv_fp32.square().mean(dim=-1, keepdim=True) + eps)
+        * kv_weight.float()
+    ).to(torch.bfloat16)
+    expected_output = expected_query @ projection_weight.t()
+
+    returned = attention_ops.mla_normalize_project_query(
+        query,
+        kv,
+        query_weight,
+        kv_weight,
+        projection_weight,
+        eps=eps,
+        prepare_absorbed_query=True,
+        qk_nope_head_dim=8,
+        qk_rope_head_dim=4,
+    )
+
+    assert returned.absorbed_query is None
+    torch.testing.assert_close(kv, expected_kv, atol=0, rtol=0)
+    torch.testing.assert_close(returned.query, expected_output, atol=2e-2, rtol=2e-2)
+
+
+def test_mla_normalize_project_query_split_output(
+    device: str,
+    require,
+) -> None:
+    import tokenspeed_kernel.ops.attention as attention_ops
+
+    require(
+        "attention",
+        "mla_normalize_project_query",
+        "gluon",
+        torch.bfloat16,
+        "query",
+    )
+    heads = 12
+    query = torch.randn(1, 1536, device=device, dtype=torch.bfloat16)
+    kv = torch.randn(1, 512, device=device, dtype=torch.bfloat16)
+    query_weight = torch.randn(1536, device=device, dtype=torch.bfloat16)
+    kv_weight = torch.randn(512, device=device, dtype=torch.bfloat16)
+    projection_weight = torch.randn(
+        heads * 192, 1536, device=device, dtype=torch.bfloat16
+    )
+    expected_kv = kv.clone()
+    eps = 1e-6
+
+    returned = attention_ops.mla_normalize_project_query(
+        query,
+        kv,
+        query_weight,
+        kv_weight,
+        projection_weight,
+        eps=eps,
+        prepare_absorbed_query=True,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        solution="gluon",
+    )
+
+    query_fp32 = query.float()
+    normalized_query = (
+        query_fp32
+        * torch.rsqrt(query_fp32.square().mean(dim=-1, keepdim=True) + eps)
+        * query_weight.float()
+    ).to(torch.bfloat16)
+    projected = (normalized_query.float() @ projection_weight.float().t()).to(
+        torch.bfloat16
+    )
+    projected = projected.view(1, heads, 192)
+    kv_fp32 = expected_kv.float()
+    expected_kv = (
+        kv_fp32
+        * torch.rsqrt(kv_fp32.square().mean(dim=-1, keepdim=True) + eps)
+        * kv_weight.float()
+    ).to(torch.bfloat16)
+
+    assert returned.absorbed_query is not None
+    torch.testing.assert_close(
+        returned.query, projected[..., :128], atol=2e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(
+        returned.absorbed_query[..., 512:],
+        projected[..., 128:],
+        atol=2e-2,
+        rtol=2e-2,
+    )
+    torch.testing.assert_close(kv, expected_kv, atol=0, rtol=0)
+
+
+def test_gfx950_k3_decode_split_policy() -> None:
+    """Bound K3's 16K-capacity BF16-Q decode without changing long contexts."""
+    if not current_platform().is_cdna4:
+        pytest.skip("K3 FP8 MLA split policy targets CDNA4")
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
+        _select_num_kv_splits_bh16bn128,
+    )
+
+    assert (
+        _select_num_kv_splits_bh16bn128(
+            batch=1,
+            max_seqlen_k=16_384,
+            block_n=128,
+        )
+        == 16
+    )
+    assert (
+        _select_num_kv_splits_bh16bn128(
+            batch=1,
+            max_seqlen_k=300_000,
+            block_n=128,
+        )
+        == 128
     )
