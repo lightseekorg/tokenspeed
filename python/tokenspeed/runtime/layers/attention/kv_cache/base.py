@@ -330,19 +330,37 @@ class CachePool:
 
 
 class LayerMappedKVPool:
-    """Wraps a KV pool to map global layer IDs to internal pool indices.
+    """Wraps a KV pool to map the caller's layer IDs to inner pool indices.
 
-    For hybrid models, only full attention layers have KV cache. This wrapper
-    translates global layer IDs (e.g., 3, 7, 11) to pool indices (0, 1, 2).
+    Two callers, one mechanism — a dict from the id a model layer carries to
+    the index its plane occupies in the wrapped pool:
+
+    - Hybrid models: layers carry global sparse ids (e.g. 3, 7, 11) while the
+      inner pool holds compact full-attention planes (0, 1, 2); the map is
+      ``{global_id: pool_idx}`` (the default built from ``layer_ids``).
+    - Draft views of the ONE merged pool: draft layers carry LOCAL ids
+      (0..n-1) while their planes are the continuation range
+      ``num_target_layers..``; the map is ``{local: global}`` (pass
+      ``layer_map`` explicitly).
     """
 
-    def __init__(self, inner_pool, full_attention_layer_ids: list[int]):
+    def __init__(
+        self,
+        inner_pool,
+        full_attention_layer_ids: list[int],
+        *,
+        layer_map: dict[int, int] | None = None,
+    ):
         self.inner = inner_pool
         self.layer_ids = list(full_attention_layer_ids)
-        self.layer_map = {
-            global_id: pool_idx
-            for pool_idx, global_id in enumerate(full_attention_layer_ids)
-        }
+        self.layer_map = (
+            dict(layer_map)
+            if layer_map is not None
+            else {
+                global_id: pool_idx
+                for pool_idx, global_id in enumerate(full_attention_layer_ids)
+            }
+        )
         # Expose page_size from inner pool for the scheduler
         self.page_size = getattr(inner_pool, "page_size", 1)
 
@@ -409,6 +427,18 @@ class LayerMappedKVPool:
     def get_mla_kv_buffer(self, layer, loc, dst_dtype=None):
         with self._mapped(layer):
             return self.inner.get_mla_kv_buffer(layer, loc, dst_dtype)
+
+    # DSA/MSA index-key planes are layer-indexed like the KV planes; a draft
+    # view must map its local layer ids onto the continuation range here too
+    # (an unmapped pass-through would read/write the target's planes).
+    def get_index_k_buffer(self, layer_id: int):
+        return self.inner.get_index_k_buffer(self._map(layer_id))
+
+    def set_index_k_buffer(self, layer_id: int, loc, index_k):
+        self.inner.set_index_k_buffer(self._map(layer_id), loc, index_k)
+
+    def gather_index_k(self, layer_id: int, slots):
+        return self.inner.gather_index_k(self._map(layer_id), slots)
 
     def __getattr__(self, name):
         return getattr(self.inner, name)

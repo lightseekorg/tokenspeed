@@ -72,6 +72,8 @@ class Eagle(BaseDrafter):
     Draft model runner that implements the Eagle/Eagle3 algorithm.
     """
 
+    shares_target_embed_head = True
+
     def __init__(
         self,
         spec_num_tokens: int,

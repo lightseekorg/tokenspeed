@@ -28,7 +28,7 @@ catch-up, decode windows, lookback stashes).
 Eagle-like MTP (MTP-Eagle: a single MTP layer chained on its own hidden,
 e.g. DeepSeek) stays in ``eagle.py``. Both register under
 ``--speculative-algorithm MTP``; ``ModelExecutor`` routes multi-depth
-draft model classes to this drafter (see ``_get_drafter_impl``).
+draft model classes to this drafter (see ``get_drafter_impl``).
 """
 
 from __future__ import annotations
@@ -302,6 +302,8 @@ class Mtp(BaseDrafter):
     """
     Draft model runner for original multi-depth MTP heads.
     """
+
+    shares_target_embed_head = True
 
     def __init__(
         self,

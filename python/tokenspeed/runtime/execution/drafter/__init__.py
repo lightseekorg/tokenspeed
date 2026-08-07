@@ -17,3 +17,63 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+
+"""Drafter registry: resolve a speculative algorithm to its drafter class."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
+
+    from tokenspeed.runtime.execution.drafter.base import BaseDrafter
+
+__all__ = ["get_drafter_impl"]
+
+
+def get_drafter_impl(spec_algo: str, model: torch.nn.Module) -> type[BaseDrafter]:
+    """Resolve the drafter class for ``spec_algo`` and a loaded draft model.
+
+    Args:
+        spec_algo: The speculative algorithm name from server args
+            (``EAGLE3``, ``MTP``, ``DFLASH``, or ``DSPARK``).
+        model: The loaded draft model; some algorithms route on its class.
+
+    Returns:
+        The ``BaseDrafter`` subclass to instantiate (not an instance).
+    """
+    # Imports are local: drafter modules pull in kernel ops and model code,
+    # and this package init must stay importable from lightweight contexts.
+    from tokenspeed.runtime.execution.drafter.dflash import DFlash
+    from tokenspeed.runtime.execution.drafter.dspark import DSpark
+    from tokenspeed.runtime.execution.drafter.eagle import Eagle
+    from tokenspeed.runtime.models.inkling_nextn import (
+        InklingForConditionalGenerationNextN,
+    )
+
+    DRAFTER_MAPPING = {
+        "EAGLE3": Eagle,
+        "MTP": Eagle,
+        "DFLASH": DFlash,
+        "DSPARK": DSpark,
+    }
+
+    # "MTP" covers two algorithms:
+    # (1) Eagle-like MTP (e.g. DeepSeek) stays on Eagle in eagle.py;
+    # (2) Vanilla MTP (e.g. Inkling) with multi-layer weights stays on Mtp in mtp.py.
+    if spec_algo == "DSPARK":
+        from tokenspeed.runtime.execution.drafter.deepseek_v4_dspark import (
+            DeepseekV4DSpark,
+        )
+        from tokenspeed.runtime.models.deepseek_v4_dspark import (
+            DeepseekV4ForCausalLMDSpark,
+        )
+
+        if isinstance(model, DeepseekV4ForCausalLMDSpark):
+            return DeepseekV4DSpark
+    if spec_algo == "MTP" and isinstance(model, InklingForConditionalGenerationNextN):
+        from tokenspeed.runtime.execution.drafter.mtp import Mtp
+
+        return Mtp
+    return DRAFTER_MAPPING[spec_algo]

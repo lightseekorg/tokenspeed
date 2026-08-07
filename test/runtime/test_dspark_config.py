@@ -15,13 +15,14 @@ import pytest
 import torch
 
 from tokenspeed.runtime.execution import model_executor as model_executor_module
+from tokenspeed.runtime.execution.drafter import get_drafter_impl
 from tokenspeed.runtime.execution.drafter.dflash import (
     DFlash,
     _resolve_block_geometry,
     _resolve_draft_query_width,
 )
 from tokenspeed.runtime.execution.drafter.dspark import DSpark
-from tokenspeed.runtime.execution.model_executor import ModelExecutor, _get_drafter_impl
+from tokenspeed.runtime.execution.model_executor import ModelExecutor
 from tokenspeed.runtime.layers.attention.configs.base import (
     resolve_speculative_num_tokens,
 )
@@ -146,7 +147,7 @@ def test_markov_params_default_to_disabled() -> None:
 
 
 def test_dspark_dispatches_to_dspark_drafter() -> None:
-    assert _get_drafter_impl("DSPARK", SimpleNamespace()) is DSpark
+    assert get_drafter_impl("DSPARK", SimpleNamespace()) is DSpark
 
 
 def test_step_acceptance_log_separates_committed_and_draft_tokens() -> None:
@@ -200,7 +201,7 @@ def test_step_token_log_aligns_drafts_with_predecessor_target_logits() -> None:
 
 
 def test_dflash_dispatch_is_unchanged_by_dspark() -> None:
-    assert _get_drafter_impl("DFLASH", SimpleNamespace()) is DFlash
+    assert get_drafter_impl("DFLASH", SimpleNamespace()) is DFlash
 
 
 # --------------------------------------------------------------------------

@@ -37,6 +37,12 @@ if TYPE_CHECKING:
 
 
 class BaseDrafter:
+    # Whether the draft model reuses the target's embedding and LM head
+    # weights (set via set_embed_and_head right after both models load, in
+    # create_model_runner, so the draft's own copies are dropped before the
+    # KV-cache budget is profiled).
+    shares_target_embed_head = False
+
     def __init__(
         self,
         spec_num_tokens: int,
@@ -62,6 +68,19 @@ class BaseDrafter:
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
         self.vocab_size = vocab_size
+
+    def wire_target(self, target_model: torch.nn.Module) -> None:
+        """Wire this drafter to the loaded target model.
+
+        Called once by ``ModelExecutor`` right after the drafter is
+        constructed. Subclasses that read target weights or install capture
+        hooks on the target override this; the default drafter needs nothing
+        from the target.
+
+        Args:
+            target_model: The target ``torch.nn.Module`` the drafter
+                speculates for.
+        """
 
     @abstractmethod
     def get_candidates(

@@ -520,3 +520,33 @@ def test_union_contract_flows_draft_groups_to_scheduler_config() -> None:
     plan_group = setup.spec.memory_plan.group("draft_swa")
     assert swa.cache_blocks_per_lcm_block == plan_group.cache_blocks_per_lcm_block
     assert swa.total_pages == plan_group.page_count
+
+
+def test_draft_view_maps_local_layer_ids_to_continuation_planes() -> None:
+    """Tripwire for the draft layer-map DIRECTION: a draft model's local
+    layer 0 must resolve to the merged pool's continuation plane
+    (num_target_layers), never to the target's layer 0. The inverse map
+    (the hybrid {global: pool_idx} convention) silently corrupts the
+    target's first layers with every draft KV write."""
+    from tokenspeed.runtime.layers.attention.kv_cache.base import LayerMappedKVPool
+
+    class _FakePool:
+        page_size = 4
+
+        def get_key_buffer(self, layer_id: int) -> int:
+            return layer_id
+
+    num_target_layers = 61
+    draft_pool = LayerMappedKVPool(
+        _FakePool(),
+        [num_target_layers + local for local in range(1)],
+        layer_map={local: num_target_layers + local for local in range(1)},
+    )
+    # Local draft layer 0 -> global continuation plane 61.
+    assert draft_pool.get_key_buffer(0) == num_target_layers
+    # A layer already carrying its global id (V4 MTP convention) passes through.
+    assert draft_pool.get_key_buffer(num_target_layers) == num_target_layers
+
+    # The hybrid default stays the inverse: global sparse ids -> compact slots.
+    hybrid_pool = LayerMappedKVPool(_FakePool(), [3, 7, 11])
+    assert hybrid_pool.get_key_buffer(7) == 1

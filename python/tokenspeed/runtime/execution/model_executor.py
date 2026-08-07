@@ -43,13 +43,7 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import active_forward
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
 from tokenspeed.runtime.execution.draft_page_staging import DraftPageStaging
-from tokenspeed.runtime.execution.drafter.deepseek_v4_dspark import (
-    DeepseekV4DSpark,
-)
-from tokenspeed.runtime.execution.drafter.dflash import DFlash
-from tokenspeed.runtime.execution.drafter.dspark import DSpark
-from tokenspeed.runtime.execution.drafter.eagle import Eagle
-from tokenspeed.runtime.execution.drafter.mtp import Mtp
+from tokenspeed.runtime.execution.drafter import get_drafter_impl
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -97,68 +91,6 @@ logger = get_colorful_logger(__name__)
 
 LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
 LOG_SPEC_ACCEPT_LENGTHS = envs.TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS.get()
-
-
-def _get_drafter_impl(spec_algo: str, model: torch.nn.Module):
-    from tokenspeed.runtime.models.inkling_nextn import (
-        InklingForConditionalGenerationNextN,
-    )
-
-    DRAFTER_MAPPING = {
-        "EAGLE3": Eagle,
-        "MTP": Eagle,
-        "DFLASH": DFlash,
-        "DSPARK": DSpark,
-    }
-
-    # "MTP" covers two algorithms:
-    # (1) Eagle-like MTP (e.g. DeepSeek) stays on Eagle in eagle.py;
-    # (2) Vanilla MTP (e.g. Inkling) with multi-layer weights stays on Mtp in mtp.py.
-    if spec_algo == "DSPARK":
-        from tokenspeed.runtime.models.deepseek_v4_dspark import (
-            DeepseekV4ForCausalLMDSpark,
-        )
-
-        if isinstance(model, DeepseekV4ForCausalLMDSpark):
-            return DeepseekV4DSpark
-    if spec_algo == "MTP" and isinstance(model, InklingForConditionalGenerationNextN):
-        return Mtp
-    else:
-        return DRAFTER_MAPPING[spec_algo]
-
-
-def _eagle_aux_layer_ids(hf_config) -> list[int] | None:
-    """Return EAGLE3 capture ids from a draft config, including K3 text config.
-
-    K3 wraps the language configuration in ``text_config``.  Draft exports may
-    place ``eagle_config`` either on that text config or on the top-level
-    wrapper, so inspect both without falling back to the target's defaults.
-    """
-    candidates = [hf_config]
-    text_config = (
-        hf_config.get("text_config")
-        if isinstance(hf_config, dict)
-        else getattr(hf_config, "text_config", None)
-    )
-    if text_config is not None:
-        candidates.append(text_config)
-
-    for config in candidates:
-        if isinstance(config, dict):
-            eagle_config = config.get("eagle_config")
-            direct_ids = config.get("eagle_aux_hidden_state_layer_ids")
-        else:
-            eagle_config = getattr(config, "eagle_config", None)
-            direct_ids = getattr(config, "eagle_aux_hidden_state_layer_ids", None)
-        if isinstance(eagle_config, dict):
-            ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
-        elif eagle_config is not None:
-            ids = getattr(eagle_config, "eagle_aux_hidden_state_layer_ids", None)
-        else:
-            ids = direct_ids
-        if ids:
-            return list(ids)
-    return None
 
 
 def _draft_idle_global_num_tokens_for_step(
@@ -241,8 +173,6 @@ class ModelExecutorConfig:
     spec_num_steps: int | None = None
     # spec_num_tokens == spec_num_steps + 1 for now (without Tree Attention)
     spec_num_tokens: int | None = None
-    # Explicit EAGLE3 capture ids; overrides the draft checkpoint's ids.
-    eagle3_layers_to_capture: list[int] | None = None
     overlap_schedule_depth: int = 0
     dp_sampling: bool = False
     dp_sampling_min_bs: int | None = None
@@ -344,7 +274,6 @@ class ModelExecutorConfig:
             spec_algo=server_args.speculative_algorithm,
             spec_num_steps=server_args.speculative_num_steps,
             spec_num_tokens=server_args.speculative_num_draft_tokens,
-            eagle3_layers_to_capture=server_args.eagle3_layers_to_capture,
             overlap_schedule_depth=overlap_schedule_depth,
             dp_sampling=server_args.dp_sampling,
             dp_sampling_min_bs=server_args.dp_sampling_min_bs,
@@ -489,7 +418,11 @@ class ModelExecutor:
             self.device,
         )
         if self.config.spec_algo is not None:
-            DrafterImpl = _get_drafter_impl(config.spec_algo, draft_model_runner.model)
+            # Model-to-model wiring (shared embed/head, eagle3 capture ids)
+            # already happened in create_model_runner, right after both
+            # models loaded. Here only the drafter instance is built and
+            # wired to the target.
+            DrafterImpl = get_drafter_impl(config.spec_algo, draft_model_runner.model)
             self.drafter = DrafterImpl(
                 spec_num_tokens=config.spec_num_tokens,
                 spec_num_steps=config.spec_num_steps,
@@ -501,53 +434,10 @@ class ModelExecutor:
                 token_to_kv_pool=draft_token_to_kv_pool,
                 vocab_size=config.vocab_size,
             )
-            if hasattr(self.drafter, "bind_target_model"):
-                self.drafter.bind_target_model(self.model_runner.model)
-            # The V4 checkpoint-local DSpark path shares the target's embed and
-            # LM head. Generic DSpark and DFlash ship their own draft weights.
-            if config.spec_algo in ("EAGLE3", "MTP") or isinstance(
-                self.drafter, DeepseekV4DSpark
-            ):
-                embed, head = self.model_runner.model.get_embed_and_head()
-                draft_model_runner.model.set_embed_and_head(embed, head)
+            self.drafter.wire_target(self.model_runner.model)
             MultimodalRuntime.wire_drafter(
                 self.drafter, self.model_runner.model_config.hf_config
             )
-            if config.spec_algo in ("EAGLE3",) and hasattr(
-                self.model_runner.model, "set_eagle3_layers_to_capture"
-            ):
-                # capture the layers the draft was trained on, not the default
-                aux_layer_ids = config.eagle3_layers_to_capture or _eagle_aux_layer_ids(
-                    draft_model_runner.model_config.hf_config
-                )
-                self.model_runner.model.set_eagle3_layers_to_capture(aux_layer_ids)
-            if config.spec_algo in ("DFLASH", "DSPARK") and not isinstance(
-                self.drafter, DeepseekV4DSpark
-            ):
-                if not hasattr(self.model_runner.model, "set_dflash_layers_to_capture"):
-                    raise ValueError(
-                        "DFLASH requires the target model to support "
-                        "set_dflash_layers_to_capture."
-                    )
-                incr_callback = None
-                incr_slot_bufs = None
-                if getattr(self.drafter, "_incremental_proj_enabled", False):
-                    incr_callback = self.drafter._on_capture_slot_ready
-                    incr_slot_bufs = self.drafter._incr_slot_bufs
-                self.model_runner.model.set_dflash_layers_to_capture(
-                    self.drafter.target_layer_ids,
-                    incremental_callback=incr_callback,
-                    slot_bufs=incr_slot_bufs,
-                )
-            if isinstance(self.drafter, DeepseekV4DSpark):
-                if not hasattr(self.model_runner.model, "set_dspark_layers_to_capture"):
-                    raise ValueError(
-                        "DSPARK requires the target model to support "
-                        "set_dspark_layers_to_capture."
-                    )
-                self.model_runner.model.set_dspark_layers_to_capture(
-                    self.drafter.target_layer_ids
-                )
         else:
             self.drafter = None
 

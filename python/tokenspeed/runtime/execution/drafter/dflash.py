@@ -223,13 +223,28 @@ class DFlash(BaseDrafter):
             (max_bs,), dtype=torch.int64, device=self.device
         )
 
-    def bind_target_model(self, target_model) -> None:
+    def wire_target(self, target_model) -> None:
         language_model = getattr(target_model, "language_model", target_model)
         self.target_model = target_model
         self.target_language_model = language_model
         self.embed_tokens = target_model.get_input_embeddings()
         self.lm_head = target_model.lm_head
         self.logits_processor = language_model.logits_processor
+        if not hasattr(target_model, "set_dflash_layers_to_capture"):
+            raise ValueError(
+                "DFLASH requires the target model to support "
+                "set_dflash_layers_to_capture."
+            )
+        incr_callback = None
+        incr_slot_bufs = None
+        if self._incremental_proj_enabled:
+            incr_callback = self._on_capture_slot_ready
+            incr_slot_bufs = self._incr_slot_bufs
+        target_model.set_dflash_layers_to_capture(
+            self.target_layer_ids,
+            incremental_callback=incr_callback,
+            slot_bufs=incr_slot_bufs,
+        )
 
     def _greedy_gather_capacity(self) -> int:
         """Max element count for the greedy head's tensor-parallel all-gather

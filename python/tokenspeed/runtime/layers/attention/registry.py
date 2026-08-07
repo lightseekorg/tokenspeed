@@ -604,9 +604,16 @@ def _create_draft_components(
     if config is None:
         return None, None
     num_layers = model_config.num_attention_layers
+    # Draft layers carry LOCAL ids (a NextN draft's one layer is layer 0);
+    # their planes are the merged plan's continuation range. The map must be
+    # {local: global} — the wrapper's default ({global: pool_idx}, the hybrid
+    # convention) is this map's INVERSE and would route every draft write to
+    # the target's first layers. Global ids (V4 MTP layers carry them) pass
+    # through _map's identity default unharmed.
     draft_pool = LayerMappedKVPool(
         pool,
         [num_target_layers + local for local in range(num_layers)],
+        layer_map={local: num_target_layers + local for local in range(num_layers)},
     )
     if is_hybrid_linear:
         backend = _create_hybrid_linear_attn_backend(
