@@ -1161,6 +1161,48 @@ TEST_F(CapacityBlockSuite, RetractsLargestRunningRequestImmediately) {
     EXPECT_EQ(scheduler_->PoolFreeBlocks(), 12);
 }
 
+class FusedRetractionL2TestSuite : public CapacityBlockSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = CapacityBlockSuite::MakeConfig();
+        cfg.disable_l2_cache = false;
+        cfg.disable_prefix_cache = false;
+        return cfg;
+    }
+
+    void CompleteStores(const ExecutionPlan& plan) {
+        for (const CacheOperation& operation : ExtractCacheOpsOfKind<WriteBackBatch>(plan)) {
+            for (std::uint32_t op_id : std::get<WriteBackBatch>(operation).op_ids) {
+                SendWriteBackDone(op_id);
+            }
+        }
+    }
+};
+
+TEST_F(FusedRetractionL2TestSuite, RetractionStoresTheLatestCompletedBoundary) {
+    Submit(MakeRequestSpec("r1", /*num_pages=*/2));
+    Submit(MakeRequestSpec("r2", /*num_pages=*/2, /*start=*/101));
+    ExecutionPlan prefill = PlanOnce();
+    CompleteStores(prefill);
+    SendForwardDone("r1", {42});
+    SendForwardDone("r2", {142});
+
+    ExecutionPlan first_decode = PlanOnce();
+    CompleteStores(first_decode);
+    SendForwardDone("r1", {43});
+    SendForwardDone("r2", {143});
+
+    ExecutionPlan second_decode = PlanOnce();
+    CompleteStores(second_decode);
+    SendForwardDone("r1", {44});
+    PlanOnce();  // r2 still has a forward result in flight, so retraction waits.
+    SendForwardDone("r2", {144});
+
+    const ExecutionPlan retraction = PlanOnce();
+    EXPECT_FALSE(ExtractCacheOpsOfKind<WriteBackBatch>(retraction).empty())
+        << "fused retraction must store the completed boundary before releasing request ownership";
+}
+
 // ---------------------------------------------------------------------------
 // Cache retract: a blocked round picks the largest Decoding/PrefillDone
 // request, releases every page and requeues it as a fresh prefill. Accepted

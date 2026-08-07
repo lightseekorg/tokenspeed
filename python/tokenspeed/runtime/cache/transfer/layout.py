@@ -125,6 +125,7 @@ def layout_from_lcm_plan(
     buffer: object,
     *,
     consumers: tuple[tuple[str, ...], ...],
+    group_ids: tuple[str, ...] | None = None,
 ) -> CacheTransferLayout:
     """Derive transfer rows directly from an LCM arena plan."""
 
@@ -135,8 +136,17 @@ def layout_from_lcm_plan(
         )
         for group in plan.groups
     }
+    groups_by_id = {group.group_id: group for group in plan.groups}
+    if group_ids is None:
+        ordered_groups = plan.groups
+    else:
+        if len(group_ids) != len(set(group_ids)):
+            raise ValueError("scheduler cache groups contain a duplicate group")
+        if set(group_ids) != set(groups_by_id):
+            raise ValueError("scheduler and transfer cache groups do not match")
+        ordered_groups = tuple(groups_by_id[group_id] for group_id in group_ids)
     groups = []
-    for group in plan.groups:
+    for group in ordered_groups:
         fields = []
         for field in fields_by_group[group.group_id]:
             plane = planes[field.plane_id]

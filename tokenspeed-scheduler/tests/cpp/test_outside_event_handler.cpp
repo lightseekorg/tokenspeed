@@ -122,6 +122,7 @@ protected:
         cfg.decode_input_tokens = 1;
         cfg.role = Role::kD;
         cfg.enable_l3_storage = false;
+        cfg.enable_pd_cache = true;
         cfg.disable_l2_cache = false;
         cfg.disable_prefix_cache = true;
 
@@ -132,6 +133,7 @@ protected:
         full.total_pages = cfg.device_allocator.total_pages;
         full.retention = PagedCacheGroupConfig::Retention::FullHistory;
         full.family = PagedCacheGroupFamily::History;
+        full.transfer_policy = PagedCacheTransferPolicy::FullSuffix;
         cfg.paged_cache_groups = {full};
         return cfg;
     }
@@ -173,6 +175,43 @@ TEST_F(DisaggDecodeAdmissionTestSuite, ReservesWholeDestinationAndSurvivesRemote
     EXPECT_EQ(decode->block_tables.at("full")[static_cast<std::size_t>(r0)].size(), 3u);
 }
 
+class DisaggDecodePriorityTestSuite : public DisaggDecodeAdmissionTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = DisaggDecodeAdmissionTestSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 5;
+        cfg.max_batch_size = 2;
+        cfg.paged_cache_groups.front().total_pages = cfg.device_allocator.total_pages;
+        return cfg;
+    }
+};
+
+TEST_F(DisaggDecodePriorityTestSuite, PrefillDoneDoesNotMixWithAnotherSubmittedRequest) {
+    Submit(MakeRequestSpec("a", /*num_pages=*/1));
+    SendBootstrapped("a");
+
+    const ExecutionPlan admission = PlanOnce();
+    ASSERT_EQ(FindForwardBatch(admission.Operations())->request_ids, (std::vector<std::string>{"a"}));
+    SendRemotePrefillDone("a", /*bootstrap_token=*/42);
+    Submit(MakeRequestSpec("b", /*num_pages=*/1, /*start=*/101));
+    SendBootstrapped("b");
+
+    const ExecutionPlan next = PlanOnce();
+    const ForwardBatch* forward = FindForwardBatch(next.Operations());
+    ASSERT_NE(forward, nullptr);
+    EXPECT_EQ(forward->request_ids, (std::vector<std::string>{"a"}))
+        << "the Decode role must not mix a Decode row with a remote prefill row";
+    EXPECT_EQ(scheduler_->DecodingSize(), 1u);
+
+    SendForwardDone("a", {43});
+    const ExecutionPlan following_plan = PlanOnce();
+    const ForwardBatch* following = FindForwardBatch(following_plan.Operations());
+    ASSERT_NE(following, nullptr);
+    EXPECT_EQ(following->request_ids, (std::vector<std::string>{"b"}))
+        << "the deferred remote prefill must run in the following batch";
+    EXPECT_EQ(following->NumExtends(), 1u);
+}
+
 class DecodeRetractionL2TestSuite : public DisaggDecodeAdmissionTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
@@ -193,6 +232,17 @@ protected:
         cfg.host_allocator.total_pages = 6;  // null parent + five retraction parents
         cfg.max_batch_size = 3;
         cfg.paged_cache_groups.front().total_pages = cfg.device_allocator.total_pages;
+        return cfg;
+    }
+};
+
+class DecodeRetractionMixedPrefillTestSuite : public DecodeRetractionL2TestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = DecodeRetractionL2TestSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 6;
+        cfg.paged_cache_groups.front().total_pages = cfg.device_allocator.total_pages;
+        cfg.max_batch_size = 2;
         return cfg;
     }
 };
@@ -300,6 +350,130 @@ TEST_F(DecodeRetractionL2TestSuite, RetractionLetsBlockedAdmissionRun) {
         << "a retracted request returns to Decode only after local prefill completes";
 }
 
+TEST_F(DecodeRetractionL2TestSuite, RemotePrefillInFlightStallsAdditionalAdmission) {
+    Submit({MakeRequestSpec("running", /*num_pages=*/2, /*start=*/1)});
+    SendBootstrapped("running");
+    PlanOnce();
+    SendRemotePrefillDone("running", /*bootstrap_token=*/42);
+    PlanOnce();
+    SendForwardDone("running", {43});
+
+    Submit({MakeRequestSpec("blocked-a", /*num_pages=*/2, /*start=*/101),
+            MakeRequestSpec("blocked-b", /*num_pages=*/2, /*start=*/201)});
+    SendBootstrapped("blocked-a");
+    SendBootstrapped("blocked-b");
+    std::vector<CacheOperation> write_back_ops;
+    for (std::int32_t token = 44; token < 48 && write_back_ops.empty(); ++token) {
+        const ExecutionPlan plan = PlanOnce();
+        write_back_ops = ExtractCacheOpsOfKind<WriteBackBatch>(plan);
+        if (FindRequestIndex(FindForwardBatch(plan.Operations()), "running") >= 0) {
+            SendForwardDone("running", {token});
+        }
+    }
+    ASSERT_EQ(write_back_ops.size(), 1u);
+    const auto& write_back = std::get<WriteBackBatch>(write_back_ops.front());
+    ASSERT_EQ(write_back.op_ids.size(), 1u);
+    SendWriteBackDone(write_back.op_ids.front());
+
+    const ExecutionPlan admitted = PlanOnce();
+    ASSERT_EQ(FindForwardBatch(admitted.Operations())->request_ids, (std::vector<std::string>{"blocked-a"}));
+
+    const ExecutionPlan stalled = PlanOnce();
+    const ForwardBatch* forward = FindForwardBatch(stalled.Operations());
+    ASSERT_NE(forward, nullptr);
+    EXPECT_TRUE(forward->request_ids.empty())
+        << "another admission must wait while the first remote prefill can still make progress";
+}
+
+TEST_F(DecodeRetractionL2TestSuite, PrefillDoneRunsBeforeRetractedRecovery) {
+    Submit({MakeRequestSpec("running", /*num_pages=*/2, /*start=*/1)});
+    SendBootstrapped("running");
+    PlanOnce();
+    SendRemotePrefillDone("running", /*bootstrap_token=*/42);
+    PlanOnce();
+    SendForwardDone("running", {43});
+
+    Submit({MakeRequestSpec("blocked", /*num_pages=*/2, /*start=*/101)});
+    SendBootstrapped("blocked");
+    std::vector<CacheOperation> write_back_ops;
+    for (std::int32_t token = 44; token < 48 && write_back_ops.empty(); ++token) {
+        const ExecutionPlan plan = PlanOnce();
+        write_back_ops = ExtractCacheOpsOfKind<WriteBackBatch>(plan);
+        if (FindRequestIndex(FindForwardBatch(plan.Operations()), "running") >= 0) {
+            SendForwardDone("running", {token});
+        }
+    }
+    ASSERT_EQ(write_back_ops.size(), 1u);
+    const auto& write_back = std::get<WriteBackBatch>(write_back_ops.front());
+    ASSERT_EQ(write_back.op_ids.size(), 1u);
+    SendWriteBackDone(write_back.op_ids.front());
+
+    PlanOnce();
+    SendRemotePrefillDone("blocked", /*bootstrap_token=*/142);
+
+    const ExecutionPlan next = PlanOnce();
+    const ForwardBatch* forward = FindForwardBatch(next.Operations());
+    ASSERT_NE(forward, nullptr);
+    ASSERT_FALSE(forward->request_ids.empty());
+    EXPECT_EQ(forward->request_ids.front(), "blocked")
+        << "a ready Decode request must run before recovery can consume its capacity";
+}
+
+TEST_F(DecodeRetractionMixedPrefillTestSuite, LocalRecoveryDoesNotBatchWithRemotePrefill) {
+    Submit({MakeRequestSpec("running", /*num_pages=*/2, /*start=*/1)});
+    SendBootstrapped("running");
+    PlanOnce();
+    SendRemotePrefillDone("running", /*bootstrap_token=*/42);
+    PlanOnce();
+    SendForwardDone("running", {43});
+
+    Submit({MakeRequestSpec("blocked-a", /*num_pages=*/2, /*start=*/101)});
+    SendBootstrapped("blocked-a");
+    std::vector<CacheOperation> write_back_ops;
+    for (std::int32_t token = 44; token < 60 && write_back_ops.empty(); ++token) {
+        const ExecutionPlan plan = PlanOnce();
+        write_back_ops = ExtractCacheOpsOfKind<WriteBackBatch>(plan);
+        if (FindRequestIndex(FindForwardBatch(plan.Operations()), "running") >= 0) {
+            SendForwardDone("running", {token});
+        }
+    }
+    ASSERT_EQ(write_back_ops.size(), 1u);
+    const auto& write_back = std::get<WriteBackBatch>(write_back_ops.front());
+    ASSERT_EQ(write_back.op_ids.size(), 1u);
+    SendWriteBackDone(write_back.op_ids.front());
+
+    const ExecutionPlan admitted = PlanOnce();
+    ASSERT_EQ(FindForwardBatch(admitted.Operations())->request_ids, (std::vector<std::string>{"blocked-a"}));
+    SendRemotePrefillDone("blocked-a", /*bootstrap_token=*/142);
+    SendAbortEvent("blocked-a");
+    Submit({MakeRequestSpec("blocked-b", /*num_pages=*/2, /*start=*/201)});
+    SendBootstrapped("blocked-b");
+
+    int local_recovery_chunks = 0;
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        const ExecutionPlan recovery = PlanOnce();
+        for (const CacheOperation& operation : ExtractCacheOpsOfKind<LoadBackBatch>(recovery)) {
+            const auto& load = std::get<LoadBackBatch>(operation);
+            for (std::uint32_t op_id : load.op_ids) {
+                SendLoadBackDone(op_id);
+            }
+        }
+        const ForwardBatch* forward = FindForwardBatch(recovery.Operations());
+        ASSERT_NE(forward, nullptr);
+        if (forward->request_ids.empty()) {
+            continue;
+        }
+        EXPECT_EQ(forward->request_ids, (std::vector<std::string>{"running"}));
+        EXPECT_TRUE(forward->IsLocalPrefill());
+        EXPECT_FALSE(scheduler_->PdTransferPinned("running"))
+            << "Decode-side local recovery must not wait for a nonexistent PD transfer completion";
+        if (++local_recovery_chunks == 2) {
+            break;
+        }
+    }
+    EXPECT_EQ(local_recovery_chunks, 2);
+}
+
 TEST_F(DecodeRetractionWithoutL2TestSuite, RetractionRecoversByLocalPrefillWithoutHostCache) {
     Submit({MakeRequestSpec("running", /*num_pages=*/1, /*start=*/1)});
     SendBootstrapped("running");
@@ -373,21 +547,22 @@ class PdSparseDecodeAdmissionTestSuite : public DisaggDecodeAdmissionTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = DisaggDecodeAdmissionTestSuite::MakeConfig();
-        cfg.device_allocator.total_pages = 6;  // null parent + five usable LCM parents
+        cfg.device_allocator.total_pages = 7;  // null parent + six usable LCM parents
         cfg.host_allocator.total_pages = 32;   // Keep retraction capacity outside these placement tests.
-        cfg.max_scheduled_tokens = 8;
+        cfg.max_scheduled_tokens = 2;
+        cfg.overlap_schedule_depth = 0;
         cfg.enable_pd_cache = true;
         cfg.disable_prefix_cache = false;
 
         PagedCacheGroupConfig full = cfg.paged_cache_groups.front();
         full.group_id = "full";
-        full.total_pages = 11;
+        full.total_pages = 13;
         full.cache_blocks_per_lcm_block = 2;
         full.transfer_policy = PagedCacheTransferPolicy::FullSuffix;
 
         PagedCacheGroupConfig state = full;
         state.group_id = "state";
-        state.total_pages = 6;
+        state.total_pages = 7;
         state.cache_blocks_per_lcm_block = 1;
         state.family = PagedCacheGroupFamily::State;
         state.transfer_policy = PagedCacheTransferPolicy::LatestSnapshot;
@@ -414,11 +589,31 @@ protected:
         SchedulerConfig cfg = PdSparseDecodeAdmissionTestSuite::MakeConfig();
         auto& state = cfg.paged_cache_groups[1];
         state.rows_per_page = 1;
-        state.total_pages = 11;
+        state.total_pages = 13;
         state.cache_blocks_per_lcm_block = 2;
         return cfg;
     }
 };
+
+class PdLocalRecoveryCapacityTestSuite : public PdSparseDecodeAdmissionTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = PdSparseDecodeAdmissionTestSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 9;  // null parent + eight usable parents
+        cfg.max_scheduled_tokens = 8;
+        cfg.paged_cache_groups[0].total_pages = 17;
+        cfg.paged_cache_groups[1].total_pages = 9;
+        return cfg;
+    }
+};
+
+TEST_F(PdLocalRecoveryCapacityTestSuite, SingleRequestCapacityIncludesLocalRecoveryWorkingSet) {
+    // Full KV uses ceil(tokens / 4) parents. A local-recovery chunk peaks at
+    // five State parents: one lookback plus four pages for an eight-token
+    // chunk, including the final decode reservation where applicable.
+    // Eight usable parents therefore admit at most 12 total tokens.
+    EXPECT_EQ(scheduler_->MaxSingleRequestTokens(), 12);
+}
 
 TEST_F(PdSparseDecodeAdmissionTestSuite, MaterializesHistoryAndLatestStateSnapshotAtomically) {
     Submit({MakeRequestSpec("r0", /*num_pages=*/4, /*start=*/1)});
@@ -441,7 +636,7 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, MaterializesHistoryAndLatestStateSnapsh
     ASSERT_EQ(plan.pages_to_zero.size(), 2u);
     EXPECT_EQ(plan.pages_to_zero.at("full"), full);
     EXPECT_EQ(plan.pages_to_zero.at("state"), (std::vector<std::int32_t>{state[3], state[4]}));
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 0);
+    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 1);
     EXPECT_TRUE(scheduler_->PdTransferPinned("r0"));
 
     SendRemotePrefillDone("r0", /*bootstrap_token=*/42);
@@ -454,7 +649,7 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, MaterializesHistoryAndLatestStateSnapsh
     ExecutionEvent succeeded;
     succeeded.With(PDEvent{pd::SucceededEvent{"r0"}});
     scheduler_->Advance(succeeded);
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 5);
+    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 6);
 }
 
 TEST_F(PdSmallStatePagesTestSuite, LatestSnapshotUsesTheStateGroupsPageSize) {

@@ -58,6 +58,65 @@ class CacheEventPayloadTest(unittest.TestCase):
 
 
 class GroupAwareWireTest(unittest.TestCase):
+    def test_pool_transfer_layout_matches_scheduler_group_order(self):
+        try:
+            from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        pool = CachePool.__new__(CachePool)
+        pool.layer_num = 2
+        pool.buffer = object()
+        pool.paged_cache_group_specs = (
+            SimpleNamespace(group_id="state"),
+            SimpleNamespace(group_id="full"),
+        )
+        pool.plan = SimpleNamespace(
+            num_lcm_blocks=4,
+            planes=(
+                SimpleNamespace(
+                    plane_id="shared",
+                    bytes_per_lcm_block=4096,
+                    arena_offset_bytes=0,
+                ),
+            ),
+            groups=(
+                SimpleNamespace(
+                    group_id="full",
+                    cache_blocks_per_lcm_block=32,
+                ),
+                SimpleNamespace(
+                    group_id="state",
+                    cache_blocks_per_lcm_block=1,
+                ),
+            ),
+            fields=(
+                SimpleNamespace(
+                    group_id="full",
+                    field_id="layer.1.k",
+                    plane_id="shared",
+                    field_offset_bytes=0,
+                    page_stride_bytes=128,
+                    payload_bytes=128,
+                ),
+                SimpleNamespace(
+                    group_id="state",
+                    field_id="layer.0.state",
+                    plane_id="shared",
+                    field_offset_bytes=0,
+                    page_stride_bytes=4096,
+                    payload_bytes=4096,
+                ),
+            ),
+        )
+
+        layout = pool.cache_transfer_layout()
+
+        self.assertEqual(
+            tuple(group.group_id for group in layout.groups),
+            ("state", "full"),
+        )
+
     def test_submit_plan_clears_layerwise_waits_without_load(self):
         try:
             from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
@@ -105,6 +164,7 @@ class GroupAwareWireTest(unittest.TestCase):
         executor.layout = SimpleNamespace(buffers=("device",))
         executor.host_storage = SimpleNamespace(host_buffer="host")
         executor.write_stream = object()
+        executor.transfer_backend = "dma"
         executor._write_acks = []
         ranges = [(0, 64, 128, 32)]
         executor._transfer_ranges = Mock(return_value=ranges)
@@ -125,6 +185,7 @@ class GroupAwareWireTest(unittest.TestCase):
             executor.host_storage.host_buffer,
             ranges,
             executor.write_stream,
+            backend="dma",
         )
         start.record.assert_called_once_with()
         start.wait.assert_called_once_with(executor.write_stream)
@@ -142,6 +203,7 @@ class GroupAwareWireTest(unittest.TestCase):
         executor._ready_load_op_ids = []
         executor._load_acks = []
         executor.load_stream = object()
+        executor.transfer_backend = "dma"
         executor.layout = SimpleNamespace(buffers=("device",), consumers=(("field",),))
         executor.host_storage = SimpleNamespace(host_buffer="host")
         executor._transfer_ranges = Mock(return_value=[(0, 64, 128, 32)])
@@ -224,6 +286,7 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
                 pool,
                 host_ratio=1.0,
                 host_size_gb=0,
+                io_backend="direct",
             )
 
         # Hand-derived Device ranges for blocks (full: 1, 4; state: 3).

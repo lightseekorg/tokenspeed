@@ -245,11 +245,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
 
     AdmissionMatch match = matchPrefixAtAdmission(request);
     const std::int32_t hit_tokens = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
-    const std::int32_t promotion_boundary_tokens =
-        !coordinator_.StreamsDeviceCacheToHost() &&
-                match.probe.device.prefix_closed_tokens > match.probe.device.num_common_tokens
-            ? match.probe.device.prefix_closed_tokens
-            : 0;
+    const std::int32_t promotion_boundary_tokens = coordinator_.PromotionBoundaryTokens(match.probe);
     _assert(promotion_boundary_tokens == 0 ||
                 (promotion_boundary_tokens % coordinator_.CacheBlockTokens() == 0 &&
                  promotion_boundary_tokens > hit_tokens && promotion_boundary_tokens < request->PrefillSize()),
@@ -442,7 +438,8 @@ std::optional<WriteBackOperation> Scheduler::beginRetraction(Request& request) {
 void Scheduler::retractForCapacity(PlanBuildContext& context, const std::vector<Request*>& candidates,
                                    std::vector<WriteBackOperation>& write_back_operations) {
     if ((config_.role != Role::kFused && config_.role != Role::kD) || !context.admission_failed ||
-        !pending_forward_results_.empty() || context.waits_for_store_ack || tier_transfers_.HasLoadBacksInFlight()) {
+        !pending_forward_results_.empty() || !pd_transfer_pins_.empty() || context.waits_for_store_ack ||
+        tier_transfers_.HasLoadBacksInFlight()) {
         return;
     }
 
@@ -487,6 +484,14 @@ void Scheduler::retractForCapacity(PlanBuildContext& context, const std::vector<
         }
     }
     FatalCheck(request_to_retract != nullptr, "LCM admission failed without a retractable request");
+    if (config_.HasHostCache() && request_to_retract->Is<fsm::Decoding>()) {
+        if (auto operation = beginRetraction(*request_to_retract)) {
+            write_back_operations.push_back(std::move(*operation));
+        }
+        spdlog::info("[Scheduler] retract: released request {} ({} tokens) with best-effort L2 store",
+                     request_to_retract->Id(), request_to_retract->TokenSize());
+        return;
+    }
     request_to_retract->Apply(fsm::RetractEvent{&coordinator_});
     spdlog::info("[Scheduler] retract: released request {} ({} tokens) for LCM capacity", request_to_retract->Id(),
                  request_to_retract->TokenSize());
@@ -497,7 +502,7 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
     PlanBuildContext context{plan};
     while (!recovery_queue_.empty()) {
         Request* request = findRequest(recovery_queue_.front());
-        if (request != nullptr && request->Is<fsm::Retracted>()) {
+        if (request != nullptr && !request->Is<fsm::Finished>()) {
             break;
         }
         recovery_queue_.pop_front();
@@ -509,22 +514,33 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
         }
     }
     const auto priority = [this](const Request* request) {
-        if (recovery_barrier_ && request->Id() == *recovery_barrier_) {
+        const bool recovery_front = !recovery_queue_.empty() && request->Id() == recovery_queue_.front();
+        const bool local_decode_prefill =
+            request->Is<fsm::Prefilling>() && request->PrefillSource() == fsm::PrefillSource::kLocal;
+        if (config_.role == Role::kD &&
+            (local_decode_prefill || request->Is<fsm::PrefillDone>() ||
+             (recovery_front && request->Is<fsm::Decoding>()))) {
+            // Keep the oldest retracted request at the head of line through
+            // local recovery and Decode completion. Starting another recovery
+            // earlier can make the two requests repeatedly evict each other.
             return 0;
         }
-        if (request->Is<fsm::Retracted>() && !recovery_queue_.empty() && request->Id() == recovery_queue_.front()) {
+        if (recovery_barrier_ && request->Id() == *recovery_barrier_) {
             return 1;
         }
-        if (request->Is<fsm::Prefilling>()) {
+        if (request->Is<fsm::Retracted>() && !recovery_queue_.empty() && request->Id() == recovery_queue_.front()) {
             return 2;
         }
-        if (request->Is<fsm::Submitted>()) {
+        if (request->Is<fsm::Prefilling>()) {
             return 3;
         }
-        if (request->Is<fsm::Decoding>() || request->Is<fsm::PrefillDone>()) {
-            return config_.enable_mixed_prefill_decode ? 2 : 4;
+        if (request->Is<fsm::Submitted>()) {
+            return 4;
         }
-        return 9;
+        if (request->Is<fsm::Decoding>() || request->Is<fsm::PrefillDone>()) {
+            return config_.enable_mixed_prefill_decode ? 3 : 5;
+        }
+        return 10;
     };
     std::ranges::sort(candidates, [&](const Request* lhs, const Request* rhs) {
         const int lhs_priority = priority(lhs);
@@ -547,6 +563,7 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
     std::vector<LoadBackOperation> load_back_operations;
     std::int32_t token_budget = config_.max_scheduled_tokens;
     bool pushed_prefill = false;
+    bool pushed_decode = false;
     auto push_operation = [&](auto operation) {
         if (recovery_barrier_ && operation.request_id == *recovery_barrier_) {
             recovery_barrier_.reset();
@@ -558,6 +575,9 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
             pushed_prefill = true;
         } else if (config_.role != Role::kD) {
             token_budget -= operation.input_length;
+        }
+        if constexpr (std::is_same_v<std::decay_t<decltype(operation)>, DecodeOperation>) {
+            pushed_decode = true;
         }
         operations.push_back(std::move(operation));
     };
@@ -576,13 +596,23 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
 
         if (request->Is<fsm::Prefilling>() &&
             (config_.role != Role::kD || request->PrefillSource() == fsm::PrefillSource::kLocal)) {
+            if (config_.role == Role::kD && pushed_decode) {
+                break;
+            }
             const std::int32_t reserve = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
             if (auto event = schedulePrefill(context, request, token_budget, reserve)) {
                 push_operation(applyEventAndBuildOperation(request, std::move(*event)));
-                if (config_.enable_pd_cache) {
+                // P-side pages stay pinned until the PD transfer completes.
+                // D-side local recovery has no corresponding PD ACK; its
+                // Host/Device lifetime is already owned by the L2 load ticket.
+                if (config_.enable_pd_cache && config_.role != Role::kD) {
                     pd_transfer_pins_.insert(request->Id());
                 }
                 trackPendingForwardResult(request);
+                if (config_.role == Role::kD) {
+                    // Decode-side recovery prefill runs in its own batch.
+                    break;
+                }
                 if (request->Is<fsm::Prefilling>()) {
                     // Admission reserves only this chunk, not the request's
                     // remaining prompt. Keep one incomplete prefill as the
@@ -598,11 +628,14 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
 
         if (request->Is<fsm::Retracted>() && !recovery_queue_.empty() &&
             request->Id() == recovery_queue_.front()) {
+            if (config_.role == Role::kD && pushed_decode) {
+                break;
+            }
             if (auto event = schedulePrefillFirstChunk(context, request, token_budget, config_.decode_input_tokens)) {
                 push_operation(applyEventAndBuildOperation(request, std::move(*event), load_back_operations));
-                recovery_queue_.pop_front();
                 trackPendingForwardResult(request);
-                if (request->Is<fsm::Prefilling>()) {
+                if (config_.role == Role::kD || request->Is<fsm::Prefilling>()) {
+                    // Keep a Decode-side recovery batch local-only.
                     break;
                 }
                 continue;
@@ -611,6 +644,9 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
         }
 
         if (request->Is<fsm::Submitted>()) {
+            if (config_.role == Role::kD && pushed_decode) {
+                break;
+            }
             const std::int32_t decode_input_tokens = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
             const std::int32_t prefill_budget = config_.role == Role::kD ? request->PrefillSize() : token_budget;
             if (auto event = schedulePrefillFirstChunk(context, request, prefill_budget, decode_input_tokens)) {
@@ -627,7 +663,7 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
         }
 
         if (request->Is<fsm::PrefillDone>() || (request->Is<fsm::Decoding>() && config_.role != Role::kP)) {
-            if (!config_.enable_mixed_prefill_decode && pushed_prefill) {
+            if ((config_.role == Role::kD || !config_.enable_mixed_prefill_decode) && pushed_prefill) {
                 break;
             }
             if (token_budget < state_prefill_reserve + config_.decode_input_tokens) {

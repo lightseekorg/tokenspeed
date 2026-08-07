@@ -83,7 +83,7 @@ public:
     struct AdmissionResult {
         std::int32_t device_prefix_tokens{0};
         std::int32_t host_prefix_tokens{0};
-        // Device-only boundary worth materializing for non-closed groups.
+        // Longer prefix-closed coverage worth materializing for non-closed groups.
         std::int32_t promotion_boundary_tokens{0};
         std::uint64_t access_epoch{0};
         std::vector<BlockTransfer> load_pairs;
@@ -103,6 +103,7 @@ public:
     // restored from the remote endpoint snapshot. Their aligned null holes do
     // not count as cache hits.
     PrefixProbe ProbeDecodeDevicePrefix(std::span<const std::string> content_hashes) const;
+    std::int32_t PromotionBoundaryTokens(const PrefixProbe& prefix) const;
     std::optional<AdmissionResult> Admit(PrefixProbe&& prefix, std::span<const GroupDemand> demands,
                                          std::optional<std::uint64_t> request_access_epoch = std::nullopt);
     bool CanAdmitAfterReleasing(

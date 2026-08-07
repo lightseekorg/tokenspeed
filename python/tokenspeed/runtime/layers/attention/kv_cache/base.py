@@ -259,6 +259,7 @@ class CachePool:
             self.plan,
             self._ensure_buffer(),
             consumers=tuple(tuple(fields) for fields in consumers),
+            group_ids=tuple(spec.group_id for spec in self.paged_cache_group_specs),
         )
 
     @torch.no_grad()

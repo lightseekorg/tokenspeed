@@ -336,6 +336,7 @@ class EventLoop:
                 draft_pool=draft_token_to_kv_pool,
                 host_ratio=server_args.kvstore_ratio,
                 host_size_gb=server_args.kvstore_size,
+                io_backend=server_args.kvstore_io_backend,
             )
             num_host_pages = self.l2_cache_executor.num_host_pages
         else:

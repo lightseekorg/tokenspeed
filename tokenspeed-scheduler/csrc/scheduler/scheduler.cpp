@@ -141,6 +141,20 @@ std::int64_t Scheduler::singleRequestParentsRequired(std::int32_t token_limit) c
     for (std::int32_t i = 0; i < coordinator_.NumGroups(); ++i) {
         const KvCacheManager& manager = coordinator_.GroupManager(i);
         const std::int64_t page_tokens = manager.CacheBlockTokens();
+        const auto local_prefill_peak = [&] {
+            // Across every prompt up to max_prompt_tokens, retain the largest
+            // resident window seen by either the first chunk or a later chunk.
+            const std::int64_t first_prompt = std::min(max_prompt_tokens, chunk_tokens);
+            std::int64_t pages = ceilDiv(first_prompt + decode_width + protected_tokens, page_tokens);
+            if (max_prompt_tokens > chunk_tokens) {
+                const std::int64_t later_prompt = std::min(max_prompt_tokens - chunk_tokens, chunk_tokens);
+                const std::int64_t lookback_pages = manager.BoundaryLookbackBlocks();
+                pages = std::max(pages, lookback_pages + ceilDiv(chunk_tokens, page_tokens));
+                pages = std::max(
+                    pages, lookback_pages + ceilDiv(later_prompt + decode_width + protected_tokens, page_tokens));
+            }
+            return pages;
+        };
         std::int64_t child_pages = 0;
         if (manager.MatchIsPrefixClosed()) {
             child_pages = ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, page_tokens);
@@ -152,24 +166,19 @@ std::int64_t Scheduler::singleRequestParentsRequired(std::int32_t token_limit) c
                 // The final prompt page may be full, so a non-zero decode
                 // reservation can span one more page than its own page count.
                 const std::int64_t reserved_tokens = decode_width + protected_tokens;
-                child_pages = reserved_tokens == 0 ? 1 : 1 + ceilDiv(reserved_tokens, page_tokens);
+                const std::int64_t snapshot_pages =
+                    reserved_tokens == 0 ? 1 : 1 + ceilDiv(reserved_tokens, page_tokens);
+                // A retracted Decode request may recover by locally
+                // recomputing its suffix. Old State checkpoints are
+                // evictable, but one recovery chunk and its lookback must fit.
+                child_pages = std::max(snapshot_pages, local_prefill_peak());
             } else {
                 // Decode-only restores its destination in one admission, so a
                 // non-sparse group cannot slide old prompt pages first.
                 child_pages = ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, page_tokens);
             }
         } else {
-            // Across every prompt up to max_prompt_tokens, retain the largest
-            // resident window seen by either the first chunk or a later chunk.
-            const std::int64_t first_prompt = std::min(max_prompt_tokens, chunk_tokens);
-            child_pages = ceilDiv(first_prompt + decode_width + protected_tokens, page_tokens);
-            if (max_prompt_tokens > chunk_tokens) {
-                const std::int64_t later_prompt = std::min(max_prompt_tokens - chunk_tokens, chunk_tokens);
-                const std::int64_t lookback_pages = manager.BoundaryLookbackBlocks();
-                child_pages = std::max(child_pages, lookback_pages + ceilDiv(chunk_tokens, page_tokens));
-                child_pages = std::max(
-                    child_pages, lookback_pages + ceilDiv(later_prompt + decode_width + protected_tokens, page_tokens));
-            }
+            child_pages = local_prefill_peak();
         }
         required_parents += ceilDiv(child_pages, manager.CacheBlocksPerLcmBlock());
     }

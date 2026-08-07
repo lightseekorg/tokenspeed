@@ -140,6 +140,61 @@ def test_lcm_layout_is_derived_from_planned_field_offsets():
     )
 
 
+def test_lcm_layout_uses_scheduler_group_order():
+    plane = SimpleNamespace(
+        plane_id="shared", bytes_per_lcm_block=4096, arena_offset_bytes=0
+    )
+    plan = SimpleNamespace(
+        num_lcm_blocks=4,
+        planes=(plane,),
+        # The memory planner sorts by group id, while the scheduler assigns
+        # numeric group ids in first-appearance order.
+        groups=(
+            SimpleNamespace(
+                group_id="full",
+                cache_blocks_per_lcm_block=32,
+                page_count=129,
+            ),
+            SimpleNamespace(
+                group_id="state",
+                cache_blocks_per_lcm_block=1,
+                page_count=5,
+            ),
+        ),
+        fields=(
+            SimpleNamespace(
+                group_id="full",
+                field_id="layer.1.k",
+                plane_id="shared",
+                field_offset_bytes=0,
+                page_stride_bytes=128,
+                payload_bytes=128,
+            ),
+            SimpleNamespace(
+                group_id="state",
+                field_id="layer.0.state",
+                plane_id="shared",
+                field_offset_bytes=0,
+                page_stride_bytes=4096,
+                payload_bytes=4096,
+            ),
+        ),
+    )
+
+    layout = layout_from_lcm_plan(
+        plan,
+        object(),
+        consumers=(("layer.0.state",), ("layer.1.k",)),
+        group_ids=("state", "full"),
+    )
+
+    assert tuple(group.group_id for group in layout.groups) == ("state", "full")
+    assert tuple(group.cache_blocks_per_lcm_block for group in layout.groups) == (
+        1,
+        32,
+    )
+
+
 def test_target_and_draft_layouts_share_scheduler_groups_but_keep_both_payloads():
     target = CacheTransferLayout(
         num_lcm_blocks=10,

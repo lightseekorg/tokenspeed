@@ -99,7 +99,11 @@ class L2CacheExecutor:
         draft_pool=None,
         host_ratio: float,
         host_size_gb: float,
+        io_backend: str,
     ):
+        if io_backend not in ("direct", "kernel"):
+            raise ValueError(f"unsupported KVStore IO backend {io_backend!r}")
+        self.transfer_backend = "dma" if io_backend == "direct" else "auto"
         target_layout = device_pool.cache_transfer_layout()
         draft_layout = (
             draft_pool.cache_transfer_layout() if draft_pool is not None else None
@@ -248,6 +252,11 @@ class L2CacheExecutor:
         if not transfers:
             self._ready_write_op_ids.extend(op_ids)
             return
+        logger.info(
+            "[L2] writeback started: operations=%d blocks=%d",
+            len(op_ids),
+            len(transfers),
+        )
         # Retraction is issued only after the scheduler has consumed every
         # outstanding forward result. Still order this stream explicitly after
         # current-stream work before reading the Device cache state.
@@ -260,6 +269,7 @@ class L2CacheExecutor:
             self.host_storage.host_buffer,
             self._transfer_ranges(transfers),
             self.write_stream,
+            backend=self.transfer_backend,
         )
         finish = torch.cuda.Event()
         finish.record(self.write_stream)
@@ -308,6 +318,7 @@ class L2CacheExecutor:
                     self.host_storage.host_buffer,
                     self._transfer_ranges(transfers, set(consumer)),
                     self.load_stream,
+                    backend=self.transfer_backend,
                 )
                 finish = torch.cuda.Event()
                 finish.record(self.load_stream)

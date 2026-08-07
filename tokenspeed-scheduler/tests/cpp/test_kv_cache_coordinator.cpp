@@ -1869,7 +1869,7 @@ TEST(CoordinatorPromotionTest, PureWindowGroupsHaveNoClosedCoverage) {
     EXPECT_EQ(probe.device.prefix_closed_tokens, 0);
 }
 
-TEST(CoordinatorPromotionTest, HostTierDisablesPromotion) {
+TEST(CoordinatorPromotionTest, HostTierPreservesDevicePromotion) {
     BlockPool device_pool(64);
     BlockPool host_pool(64);
     const std::vector<KvCacheSpec> specs = {
@@ -1893,6 +1893,72 @@ TEST(CoordinatorPromotionTest, HostTierDisablesPromotion) {
     KvCacheCoordinator::PrefixProbe probe = coordinator.ProbePrefix(hashes);
     ASSERT_EQ(probe.device.num_common_tokens, 16);
     ASSERT_EQ(probe.device.prefix_closed_tokens, 32);
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    std::vector<GroupDemand> demands = FreshDemands(tables, std::array<std::int32_t, 2>{0, 0});
+    const std::optional<KvCacheCoordinator::AdmissionResult> admission = coordinator.Admit(std::move(probe), demands);
+    ASSERT_TRUE(admission);
+    EXPECT_EQ(admission->promotion_boundary_tokens, 32);
+}
+
+TEST(CoordinatorPromotionTest, HostClosedCoverageCreatesPromotion) {
+    BlockPool device_pool(64);
+    BlockPool host_pool(64);
+    const std::vector<KvCacheSpec> specs = {
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+        {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, /*cache_block_tokens=*/4, device_pool, &host_pool);
+    const std::vector<std::string> hashes = ContentHashes({{0, 0, 0, 0},
+                                                           {1, 1, 1, 1},
+                                                           {2, 2, 2, 2},
+                                                           {3, 3, 3, 3},
+                                                           {4, 4, 4, 4},
+                                                           {5, 5, 5, 5},
+                                                           {6, 6, 6, 6},
+                                                           {7, 7, 7, 7}});
+    for (const std::string& hash : hashes) {
+        CacheForGroup(coordinator, host_pool, hash, /*group_id=*/0);
+    }
+    CacheForGroup(coordinator, host_pool, hashes[3], /*group_id=*/1);
+
+    KvCacheCoordinator::PrefixProbe probe = coordinator.ProbePrefix(hashes);
+    ASSERT_EQ(probe.host.num_common_tokens, 16);
+    ASSERT_EQ(probe.host.prefix_closed_tokens, 32);
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    std::vector<GroupDemand> demands = FreshDemands(tables, std::array<std::int32_t, 2>{0, 0});
+    const std::optional<KvCacheCoordinator::AdmissionResult> admission = coordinator.Admit(std::move(probe), demands);
+    ASSERT_TRUE(admission);
+    EXPECT_EQ(admission->promotion_boundary_tokens, 32);
+}
+
+TEST(CoordinatorPromotionTest, HostHitCoveringClosedBoundaryDoesNotCreatePromotion) {
+    BlockPool device_pool(64);
+    BlockPool host_pool(64);
+    const std::vector<KvCacheSpec> specs = {
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+        {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, /*cache_block_tokens=*/4, device_pool, &host_pool,
+                                                      /*stream_device_cache_to_host=*/false);
+    const std::vector<std::string> hashes = ContentHashes({{0, 0, 0, 0},
+                                                           {1, 1, 1, 1},
+                                                           {2, 2, 2, 2},
+                                                           {3, 3, 3, 3},
+                                                           {4, 4, 4, 4},
+                                                           {5, 5, 5, 5},
+                                                           {6, 6, 6, 6},
+                                                           {7, 7, 7, 7}});
+    for (const std::string& hash : hashes) {
+        CacheForGroup(coordinator, device_pool, hash, /*group_id=*/0);
+        CacheForGroup(coordinator, host_pool, hash, /*group_id=*/0);
+    }
+    CacheForGroup(coordinator, device_pool, hashes[3], /*group_id=*/1);
+    CacheForGroup(coordinator, host_pool, hashes[7], /*group_id=*/1);
+
+    KvCacheCoordinator::PrefixProbe probe = coordinator.ProbePrefix(hashes);
+    ASSERT_EQ(probe.device.num_common_tokens, 16);
+    ASSERT_EQ(probe.device.prefix_closed_tokens, 32);
+    ASSERT_EQ(probe.host.num_common_tokens, 32);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     std::vector<GroupDemand> demands = FreshDemands(tables, std::array<std::int32_t, 2>{0, 0});
     const std::optional<KvCacheCoordinator::AdmissionResult> admission = coordinator.Admit(std::move(probe), demands);

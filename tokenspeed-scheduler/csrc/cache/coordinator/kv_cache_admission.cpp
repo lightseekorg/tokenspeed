@@ -307,6 +307,13 @@ bool KvCacheCoordinator::CanAdmitAfterReleasing(
     return planner.Plan();
 }
 
+std::int32_t KvCacheCoordinator::PromotionBoundaryTokens(const PrefixProbe& prefix) const {
+    const std::int32_t matched_tokens = std::max(prefix.device.num_common_tokens, prefix.host.num_common_tokens);
+    const std::int32_t prefix_closed_tokens =
+        std::max(prefix.device.prefix_closed_tokens, prefix.host.prefix_closed_tokens);
+    return prefix_closed_tokens > matched_tokens ? prefix_closed_tokens : 0;
+}
+
 std::optional<KvCacheCoordinator::AdmissionResult> KvCacheCoordinator::Admit(
     PrefixProbe&& prefix, std::span<const GroupDemand> demands, std::optional<std::uint64_t> request_access_epoch) {
     _assert(demands.size() == groups_.size(), "demands/groups size mismatch");
@@ -332,11 +339,7 @@ std::optional<KvCacheCoordinator::AdmissionResult> KvCacheCoordinator::Admit(
                 "request access epoch was not issued by this coordinator");
     }
     const std::uint64_t access_epoch = request_access_epoch.has_value() ? *request_access_epoch : ++next_access_epoch_;
-    const std::int32_t promotion_boundary_tokens =
-        !stream_device_cache_to_host_ &&
-                plan.prefix.device.prefix_closed_tokens > plan.prefix.device.num_common_tokens
-            ? plan.prefix.device.prefix_closed_tokens
-            : 0;
+    const std::int32_t promotion_boundary_tokens = PromotionBoundaryTokens(plan.prefix);
     AcquiredPrefix acquired_prefix = acquirePrefix(std::move(plan.prefix), access_epoch);
     AdmissionResult result{
         .device_prefix_tokens = acquired_prefix.device.num_common_tokens,
