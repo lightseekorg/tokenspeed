@@ -46,56 +46,18 @@ Requirements: the torch caching allocator must NOT be in expandable-segments
 memory. If IPC export fails, callers fall back to the symm_mem path.
 """
 
-import ctypes
 from dataclasses import dataclass, field
 
 import torch
 import torch.distributed as dist
-
-_HIP = ctypes.CDLL("libamdhip64.so")
-_HIP_IPC_LAZY_ENABLE_PEER_ACCESS = 1
-
-
-class _hipIpcMemHandle(ctypes.Structure):
-    _fields_ = [("reserved", ctypes.c_char * 64)]
-
-
-_HIP.hipIpcGetMemHandle.argtypes = [ctypes.POINTER(_hipIpcMemHandle), ctypes.c_void_p]
-_HIP.hipIpcGetMemHandle.restype = ctypes.c_int
-_HIP.hipIpcOpenMemHandle.argtypes = [
-    ctypes.POINTER(ctypes.c_void_p),
-    _hipIpcMemHandle,
-    ctypes.c_uint,
-]
-_HIP.hipIpcOpenMemHandle.restype = ctypes.c_int
-_HIP.hipIpcCloseMemHandle.argtypes = [ctypes.c_void_p]
-_HIP.hipIpcCloseMemHandle.restype = ctypes.c_int
-_HIP.hipMemGetAddressRange.argtypes = [
-    ctypes.POINTER(ctypes.c_void_p),
-    ctypes.POINTER(ctypes.c_size_t),
-    ctypes.c_void_p,
-]
-_HIP.hipMemGetAddressRange.restype = ctypes.c_int
-
-
-def _check(err: int, what: str) -> None:
-    if err != 0:
-        raise RuntimeError(f"{what} failed with HIP error {err}")
+from tokenspeed_kernel.thirdparty.hip.hip_ipc import get_hip_ipc_library
 
 
 def _export_handle(ptr: int) -> tuple[bytes, int]:
     """Return (64-byte IPC handle for the containing allocation, offset of ptr)."""
-    base = ctypes.c_void_p()
-    size = ctypes.c_size_t()
-    _check(
-        _HIP.hipMemGetAddressRange(
-            ctypes.byref(base), ctypes.byref(size), ctypes.c_void_p(ptr)
-        ),
-        "hipMemGetAddressRange",
-    )
-    handle = _hipIpcMemHandle()
-    _check(_HIP.hipIpcGetMemHandle(ctypes.byref(handle), base), "hipIpcGetMemHandle")
-    return ctypes.string_at(ctypes.byref(handle), 64), ptr - base.value
+    hip = get_hip_ipc_library()
+    base, _size = hip.hipMemGetAddressRange(ptr)
+    return hip.hipIpcGetMemHandle(base), ptr - base
 
 
 def _open_base(raw: bytes, opened: dict[bytes, int]) -> int:
@@ -103,17 +65,9 @@ def _open_base(raw: bytes, opened: dict[bytes, int]) -> int:
     same handle twice is an error), returning its mapped base pointer."""
     if raw in opened:
         return opened[raw]
-    handle = _hipIpcMemHandle()
-    ctypes.memmove(ctypes.byref(handle), raw, 64)
-    out = ctypes.c_void_p()
-    _check(
-        _HIP.hipIpcOpenMemHandle(
-            ctypes.byref(out), handle, _HIP_IPC_LAZY_ENABLE_PEER_ACCESS
-        ),
-        "hipIpcOpenMemHandle",
-    )
-    opened[raw] = out.value
-    return out.value
+    out = get_hip_ipc_library().hipIpcOpenMemHandle(raw)
+    opened[raw] = out
+    return out
 
 
 @dataclass
@@ -131,8 +85,11 @@ class CoarseSymmBuffer:
     _opened_bases: list[int] = field(default_factory=list)
 
     def close(self) -> None:
+        if not self._opened_bases:
+            return
+        hip = get_hip_ipc_library()
         for base in self._opened_bases:
-            _HIP.hipIpcCloseMemHandle(ctypes.c_void_p(base))
+            hip.hipIpcCloseMemHandle(base)
         self._opened_bases = []
 
 
@@ -200,8 +157,9 @@ def alloc_coarse_symm(
     ]
     newly_opened_keys = set(opened) - opened_keys_before
     if failed_opens:
+        hip = get_hip_ipc_library()
         for key in newly_opened_keys:
-            _HIP.hipIpcCloseMemHandle(ctypes.c_void_p(opened.pop(key)))
+            hip.hipIpcCloseMemHandle(opened.pop(key))
         raise RuntimeError(
             "coarse HIP-IPC open failed on one or more ranks: "
             + "; ".join(failed_opens)

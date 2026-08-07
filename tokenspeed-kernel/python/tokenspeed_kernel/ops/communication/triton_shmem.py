@@ -1228,6 +1228,22 @@ def triton_shmem_allreduce_residual_rmsnorm(
     norm_out: torch.Tensor | None = None,
     residual_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run fused all-reduce, residual addition, and RMSNorm.
+
+    Args:
+        state: Initialized backend state owning communication workspaces.
+        input_tensor: Per-rank partial input of shape ``[M, N]``.
+        residual: Local residual tensor of shape ``[M, N]``.
+        weight: RMSNorm weight of shape ``[N]``.
+        eps: RMSNorm epsilon.
+        norm_out: Optional destination for the normalized result.
+        residual_out: Optional destination for all-reduced input plus residual.
+
+    Returns:
+        ``(norm_out, residual_out)``. Supplied destinations are returned;
+        omitted destinations may be newly allocated or state-owned ring views
+        that are reused according to the configured policy.
+    """
     m, n = input_tensor.shape
     use_oneshot = (not state._is_twoshot) or (
         state._oneshot_max_m > 0 and m <= state._oneshot_max_m

@@ -1855,17 +1855,19 @@ def allreduce_residual_rmsnorm(
                 hidden_dim,
                 input_tensor.dtype,
             )
-            ts_state = _ts_mod.TRITON_SHMEM_AR_RMSNORM_STATES.get(ts_key)
-            if ts_state is None:
-                ts_state = _ts_mod.create_triton_shmem_ar_rmsnorm_state(
+            ts_states = _ts_mod.TRITON_SHMEM_AR_RMSNORM_STATES
+            if ts_key not in ts_states:
+                # Cache None as a permanent decline for this complete policy key.
+                # Retrying may otherwise repeat distributed validation or memory
+                # setup during CUDA graph capture.
+                ts_states[ts_key] = _ts_mod.create_triton_shmem_ar_rmsnorm_state(
                     group=group,
                     rank_in_group=rank,
                     max_token_num=max_token_num,
                     hidden_dim=hidden_dim,
                     dtype=input_tensor.dtype,
                 )
-                if ts_state is not None:
-                    _ts_mod.TRITON_SHMEM_AR_RMSNORM_STATES[ts_key] = ts_state
+            ts_state = ts_states[ts_key]
             if ts_state is None or not _ts_mod.triton_shmem_can_run(
                 ts_state, input_tensor
             ):
