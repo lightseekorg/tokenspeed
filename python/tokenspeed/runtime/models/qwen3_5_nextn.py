@@ -27,8 +27,8 @@ from dataclasses import replace
 import torch
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
 from torch import nn
-from transformers import PretrainedConfig
 
+from tokenspeed.runtime.configs.base_config import BaseConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import (
     ForwardContext,
@@ -168,7 +168,7 @@ class Qwen3_5DraftForCausalLM(Qwen3_5ForCausalLM):
 class Qwen3_5ForConditionalGenerationNextN(nn.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         mapping: Mapping,
         quant_config=None,
         prefix: str = "",
@@ -192,7 +192,10 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
         )
         self.pre_fc_norm_hidden = RMSNorm_cls(config.hidden_size, config.rms_norm_eps)
         config.num_hidden_layers = 1
-        config.full_attention_interval = 1
+        # The draft is a single full-attention layer. ``layer_types`` is now a
+        # stored field (not a property recomputed from ``full_attention_interval``),
+        # so set the schedule explicitly.
+        config.layer_types = ["full_attention"]
         self.model = Qwen3_5DraftForCausalLM(
             config,
             mapping=self.mapping,
@@ -436,7 +439,7 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
 class Qwen3_5MoeForConditionalGenerationNextN(Qwen3_5ForConditionalGenerationNextN):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         mapping: Mapping,
         quant_config=None,
         prefix: str = "",

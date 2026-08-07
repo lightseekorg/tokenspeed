@@ -30,8 +30,8 @@ from collections.abc import Iterable
 
 import torch
 from torch import nn
-from transformers import LlamaConfig
 
+from tokenspeed.runtime.configs.base_config import BaseConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import (
     ForwardContext,
@@ -212,7 +212,7 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
 
     def __init__(
         self,
-        config: LlamaConfig,
+        config: BaseConfig,
         layer_id: int,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
@@ -441,7 +441,7 @@ class Eagle3LlamaModel(BaseTransformerModel):
 
     def __init__(
         self,
-        config: LlamaConfig,
+        config: BaseConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -598,7 +598,7 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
 
     def __init__(
         self,
-        config: LlamaConfig,
+        config: BaseConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",

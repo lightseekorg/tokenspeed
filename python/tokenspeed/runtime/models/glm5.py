@@ -32,9 +32,8 @@ from tokenspeed_kernel.ops.attention import (
     dsa_prefill_topk,
 )
 from torch import nn
-from transformers import PretrainedConfig
 
-from tokenspeed.runtime.configs.utils import get_rope_theta
+from tokenspeed.runtime.configs.base_config import BaseConfig, get_rope_theta
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
@@ -107,24 +106,19 @@ class GlmDsaDecodeWindow:
 def _glm_dsa_skip_indexer_topk(config, layer_id: int | None) -> bool:
     if layer_id is None:
         return False
+
     indexer_types = getattr(config, "indexer_types", None)
-    if indexer_types is not None and layer_id < len(indexer_types):
-        return indexer_types[layer_id] in ("S", "shared")
-    pattern = getattr(config, "index_topk_pattern", None)
-    if pattern is not None and layer_id < len(pattern):
-        return pattern[layer_id] in ("S", "shared")
-    freq = int(getattr(config, "index_topk_freq", 1) or 1)
-    if freq <= 1:
+    if indexer_types is None:
+        # No sharing schedule means every layer runs its own indexer.
         return False
-    offset = getattr(config, "index_skip_topk_offset", None)
-    if offset is None:
-        return max(layer_id - 1, 0) % freq != 0
-    if offset <= 0:
+
+    if not 0 <= layer_id < len(indexer_types):
         raise ValueError(
-            "index_skip_topk_offset must be positive; offset <= 0 marks "
-            "layer 0 as shared with no prior top-k to reuse"
+            f"`layer_id` ({layer_id}) is outside `indexer_types` length "
+            f"({len(indexer_types)})."
         )
-    return max(layer_id - offset + 1, 0) % freq != 0
+
+    return indexer_types[layer_id] in ("S", "shared")
 
 
 def _glm_dsa_rope_scaling(
@@ -141,7 +135,7 @@ def _glm_dsa_rope_scaling(
 class GlmDsaIndexer(nn.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         hidden_size: int,
         q_lora_rank: int,
         qk_rope_head_dim: int,
@@ -257,7 +251,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
 
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         mapping: Mapping,
         hidden_size: int,
         num_heads: int,
@@ -1017,7 +1011,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
 class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         layer_id: int,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
@@ -1170,7 +1164,7 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
 class GlmMoeDsaModel(DeepseekV3Model):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: BaseConfig,
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",

@@ -20,7 +20,6 @@
 
 """Model configuration helpers and derived runtime metadata."""
 
-import copy
 import json
 import math
 import os
@@ -30,20 +29,21 @@ from enum import IntEnum, auto
 
 import torch
 import yaml
-from transformers import PretrainedConfig
 
+from tokenspeed.runtime.configs.base_config import BaseConfig
+from tokenspeed.runtime.configs.utils import (
+    get_config,
+    get_context_length,
+    get_generation_config,
+    get_hf_text_config,
+    resolve_architecture,
+)
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     DEEPSEEK_V4_PAGE_SIZE,
 )
 from tokenspeed.runtime.layers.quantization import QUANTIZATION_METHODS
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import envs
-from tokenspeed.runtime.utils.hf_transformers_utils import (
-    get_config,
-    get_context_length,
-    get_generation_config,
-    resolve_architecture,
-)
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 logger = get_colorful_logger(__name__)
@@ -123,29 +123,40 @@ def override_model_config(model_config, ext_yaml):
 
     override_model_config: dict = ext_config.get("override_model_config", {})
     for k, v in override_model_config.items():
-        if hasattr(model_config, k):
-            old_v = model_config.__getattribute__(k)
-            if isinstance(v, dict):
-                new_v = copy.deepcopy(old_v)
-                new_v.__dict__.update(v)
-            else:
-                new_v = v
-            model_config.__setattr__(k, new_v)
-            logger.info("Override model config: %s=%r", k, new_v)
+        if not hasattr(model_config, k):
+            continue
+        old_v = getattr(model_config, k)
+        if isinstance(v, dict) and isinstance(old_v, BaseConfig):
+            # ``hf_config``/``hf_text_config`` field overrides are out of scope
+            # here; ``--hf-overrides`` applies them to the raw config before
+            # construction so ``__post_init__`` re-derives dependent fields.
+            # Skip rather than ``setattr``-ing a dict over the config object.
+            logger.warning(
+                "override_model_config does not override %r; use "
+                "--hf-overrides to override model config fields.",
+                k,
+            )
+            continue
+        if isinstance(v, dict) and isinstance(old_v, dict):
+            # Plain-dict members such as ``hf_generation_config``.
+            old_v.update(v)
+        else:
+            setattr(model_config, k, v)
+        logger.info("Override model config: %s=%r", k, getattr(model_config, k))
 
 
-def is_deepseek_v4(config: PretrainedConfig) -> bool:
+def is_deepseek_v4(config: BaseConfig) -> bool:
     return resolve_architecture(config) in _DEEPSEEK_V4_ARCHITECTURES
 
 
-def is_qwen4_exp(config: PretrainedConfig) -> bool:
+def is_qwen4_exp(config: BaseConfig) -> bool:
     return (
         getattr(config, "model_type", None) in {"qwen4_exp", "qwen4_exp_text"}
         or resolve_architecture(config) in _QWEN4_EXP_ARCHITECTURES
     )
 
 
-def is_deepseek_v4_nextn(config: PretrainedConfig) -> bool:
+def is_deepseek_v4_nextn(config: BaseConfig) -> bool:
     return resolve_architecture(config) == "DeepseekV4ForCausalLMNextN"
 
 
@@ -161,8 +172,14 @@ def configure_deepseek_v4_attention(model_config) -> None:
     model_config.v_head_dim = hf_config.head_dim
     model_config.index_head_dim = getattr(hf_config, "index_head_dim", None)
     model_config.scaling = 1 / math.sqrt(model_config.head_dim)
-    rope_scaling = getattr(hf_config, "rope_scaling", None)
-    if rope_scaling:
+
+    # DeepSeek V4 keys ``rope_parameters`` by rope-type label (``main`` /
+    # ``compress``) rather than a flat dict, so the YaRN mscale correction for
+    # compressed attention lives on the ``compress`` branch.
+    rope_scaling = getattr(hf_config, "rope_parameters", None)
+    if isinstance(rope_scaling, dict):
+        rope_scaling = rope_scaling.get("compress", rope_scaling)
+    if rope_scaling and "factor" in rope_scaling:
         mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
         scaling_factor = rope_scaling["factor"]
         mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
@@ -280,8 +297,8 @@ _ATTENTION_FAMILY_SPECS = (
 
 
 def _model_architectures(
-    hf_config: PretrainedConfig,
-    hf_text_config: PretrainedConfig,
+    hf_config: BaseConfig,
+    hf_text_config: BaseConfig,
 ) -> list[str]:
     return (
         [resolve_architecture(hf_config)]
@@ -291,8 +308,8 @@ def _model_architectures(
 
 
 def _resolve_attention_family(
-    hf_config: PretrainedConfig,
-    hf_text_config: PretrainedConfig,
+    hf_config: BaseConfig,
+    hf_text_config: BaseConfig,
 ) -> _AttentionFamilySpec | None:
     architectures = _model_architectures(hf_config, hf_text_config)
     for spec in _ATTENTION_FAMILY_SPECS:
@@ -302,8 +319,8 @@ def _resolve_attention_family(
 
 
 def _is_dflash2_mla(
-    hf_config: PretrainedConfig,
-    hf_text_config: PretrainedConfig,
+    hf_config: BaseConfig,
+    hf_text_config: BaseConfig,
 ) -> bool:
     architectures = _model_architectures(hf_config, hf_text_config)
     dflash_config = getattr(hf_text_config, "dflash_config", None) or getattr(
@@ -338,7 +355,7 @@ def _apply_attention_family_defaults(
 
 
 def _derive_num_attention_layers(
-    hf_config: PretrainedConfig,
+    hf_config: BaseConfig,
     num_hidden_layers: int,
 ) -> int:
     architectures = getattr(hf_config, "architectures", None) or []
@@ -354,7 +371,6 @@ class ModelConfig:
     def __init__(
         self,
         model_path: str,
-        trust_remote_code: bool = True,
         revision: str | None = None,
         context_length: int | None = None,
         model_override_args: dict | None = None,
@@ -371,13 +387,9 @@ class ModelConfig:
 
         # Parse args
         self.model_override_args = json.loads(model_override_args)
-        kwargs = {}
-        if override_config_file and override_config_file.strip():
-            kwargs["_configuration_file"] = override_config_file.strip()
 
         self.hf_config = get_config(
             model_path,
-            trust_remote_code=trust_remote_code,
             revision=revision,
             model_override_args=self.model_override_args,
             is_draft_worker=is_draft_worker,
@@ -386,13 +398,11 @@ class ModelConfig:
                 if is_draft_worker
                 else None
             ),
-            **kwargs,
+            override_config_file=override_config_file,
         )
         self.hf_generation_config = get_generation_config(
             self.model_path,
-            trust_remote_code=trust_remote_code,
             revision=revision,
-            **kwargs,
         )
 
         self.hf_text_config = get_hf_text_config(self.hf_config)
@@ -575,7 +585,9 @@ class ModelConfig:
             attention_family.configure(self)
         elif _is_dflash2_mla(self.hf_config, self.hf_text_config):
             configure_mla_attention(self)
-        elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
+        elif "MiniCPM3ForCausalLM" in (
+            getattr(self.hf_config, "architectures", None) or []
+        ):
             self.head_dim = 128
             self.attention_arch = AttentionArch.MLA
             self.kv_lora_rank = self.hf_config.kv_lora_rank
@@ -749,9 +761,7 @@ class ModelConfig:
         if eos_ids is None:
             eos_ids = set()
         if self.hf_generation_config:
-            generation_eos_ids = getattr(
-                self.hf_generation_config, "eos_token_id", None
-            )
+            generation_eos_ids = self.hf_generation_config.get("eos_token_id")
             if generation_eos_ids:
                 generation_eos_ids = (
                     {generation_eos_ids}
@@ -760,32 +770,6 @@ class ModelConfig:
                 )
                 eos_ids = eos_ids | generation_eos_ids
         return eos_ids
-
-
-def get_hf_text_config(config: PretrainedConfig):
-    """Get the "sub" config relevant to llm for multi modal models.
-    No op for pure text models.
-    """
-    class_name = resolve_architecture(config)
-    if class_name.startswith("Llava") and class_name.endswith("ForCausalLM"):
-        # We support non-hf version of llava models, so we do not want to
-        # read the wrong values from the unused default text_config.
-        # We set `dtype` of config to `torch.float16` for the weights, as
-        # `torch.float16` is default used for image features in
-        # `python/tokenspeed/runtime/models/llava.py`.
-        config.dtype = torch.float16
-        return config
-
-    if hasattr(config, "thinker_config"):
-        thinker_config = config.thinker_config
-        if hasattr(thinker_config, "text_config"):
-            return thinker_config.text_config
-        return thinker_config
-    if hasattr(config, "text_config"):
-        if not hasattr(config.text_config, "num_attention_heads"):
-            raise ValueError("text_config must define num_attention_heads")
-        return config.text_config
-    return config
 
 
 _STR_DTYPE_TO_TORCH_DTYPE = {
@@ -798,7 +782,7 @@ _STR_DTYPE_TO_TORCH_DTYPE = {
 
 
 def _get_and_verify_dtype(
-    config: PretrainedConfig,
+    config: BaseConfig,
     dtype: str | torch.dtype,
 ) -> torch.dtype:
     # config.dtype can be missing or None.
