@@ -165,9 +165,32 @@ def alloc_coarse_symm(
             + "; ".join(failed_opens)
         )
 
+    peer_ptrs_dev = None
+    local_table_error = None
+    try:
+        peer_ptrs_dev = torch.tensor(peer_ptrs, dtype=torch.uint64, device=device)
+    except Exception as exc:  # noqa: BLE001 - synchronize fallback across ranks
+        local_table_error = f"{type(exc).__name__}: {exc}"
+    table_errors: list = [None] * world_size
+    dist.all_gather_object(table_errors, local_table_error, group=group)
+    failed_tables = [
+        f"rank {rank}: {error}"
+        for rank, error in enumerate(table_errors)
+        if error is not None
+    ]
+    if failed_tables:
+        hip = get_hip_ipc_library()
+        for key in newly_opened_keys:
+            hip.hipIpcCloseMemHandle(opened.pop(key))
+        raise RuntimeError(
+            "coarse HIP-IPC pointer-table allocation failed on one or more ranks: "
+            + "; ".join(failed_tables)
+        )
+
+    assert peer_ptrs_dev is not None
     newly_opened = [opened[key] for key in newly_opened_keys]
     return CoarseSymmBuffer(
         tensor=tensor,
-        peer_ptrs_dev=torch.tensor(peer_ptrs, dtype=torch.uint64, device=device),
+        peer_ptrs_dev=peer_ptrs_dev,
         _opened_bases=newly_opened,
     )

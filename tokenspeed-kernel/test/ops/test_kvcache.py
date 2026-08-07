@@ -23,12 +23,40 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import (
+    gather_page_table_with_padding,
     index_k_block_split_scatter,
     transfer_kv_all_layer,
     transfer_kv_all_layer_mla,
     transfer_kv_per_layer,
     transfer_kv_per_layer_mla,
 )
+
+
+def test_gather_page_table_with_padding_masks_missing_batch_rows(device: str) -> None:
+    page_table = torch.tensor(
+        [[11, 12, 13, 14], [21, 22, 23, 24]],
+        dtype=torch.int32,
+        device=device,
+    )
+    # The replay bucket has one more row than this forward's page table.
+    seq_lens = torch.tensor([3, 2, 1], dtype=torch.int32, device=device)
+    out = torch.full((3, 4), -1, dtype=torch.int32, device=device)
+
+    gather_page_table_with_padding(
+        page_table=page_table,
+        seq_lens=seq_lens,
+        out=out,
+        bs=3,
+        max_num_pages=4,
+        page_size=1,
+        dummy_slot=0,
+    )
+
+    assert out.tolist() == [
+        [11, 12, 13, 0],
+        [21, 22, 0, 0],
+        [0, 0, 0, 0],
+    ]
 
 
 def test_transfer_kv_per_layer(device: str) -> None:

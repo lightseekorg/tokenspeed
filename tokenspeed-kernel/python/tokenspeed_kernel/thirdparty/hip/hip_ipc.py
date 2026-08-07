@@ -81,9 +81,7 @@ class HipIpcLibrary:
         """Export the allocation at ``ptr`` as an opaque 64-byte IPC handle."""
         handle = _hipIpcMemHandle()
         self._check(
-            self.lib.hipIpcGetMemHandle(
-                ctypes.byref(handle), ctypes.c_void_p(ptr)
-            ),
+            self.lib.hipIpcGetMemHandle(ctypes.byref(handle), ctypes.c_void_p(ptr)),
             "hipIpcGetMemHandle",
         )
         return ctypes.string_at(ctypes.byref(handle), _HIP_IPC_MEM_HANDLE_SIZE)

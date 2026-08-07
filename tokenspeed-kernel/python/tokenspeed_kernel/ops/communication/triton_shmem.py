@@ -61,9 +61,11 @@ fabric-bound either way; the win is entirely on local bandwidth.
 
 Scope (matches the Iris/native contract): AMD ROCm, bf16, 2-D
 ``(num_tokens, hidden)`` input, ``weight`` of shape ``(hidden,)``. The reduction
-spans ``group.size()`` ranks; symm_mem rendezvous accepts any process group, so
-this is not restricted to the whole world, but the current dispatch only
-exercises whole-world TP.
+spans a single-node pure-TP process group whose ranks execute the same ``M`` in
+the same order on one stream. Residual and weight must be replicated across the
+group. Captured public dispatch requires a profile-sized persistent output
+ring; direct graph capture is also supported when the caller supplies and owns
+persistent output tensors.
 """
 
 import logging
@@ -310,6 +312,28 @@ def _oneshot_max_m() -> int:
     bandwidth-optimality still wins at large M. The conservative default remains
     256; isolated width-specific crossovers require model-level serving gates."""
     return int(os.environ.get("TS_TRITON_SHMEM_ONESHOT_MAX_M", "256"))
+
+
+def _policy_is_consistent(group: dist.ProcessGroup) -> bool:
+    """Require every rank to resolve the same communication policy."""
+    local_policy = tuple((name, os.environ.get(name)) for name in _STATE_ENV_KEYS)
+    reports: list = [None] * group.size()
+    dist.all_gather_object(reports, local_policy, group=group)
+    first = reports[0]
+    mismatches = [
+        f"rank {rank}: {report!r}"
+        for rank, report in enumerate(reports)
+        if report != first
+    ]
+    if mismatches:
+        logger.warning(
+            "triton_shmem requires identical policy on every rank; "
+            "rank 0 resolved %r; mismatches: %s",
+            first,
+            "; ".join(mismatches),
+        )
+        return False
+    return True
 
 
 def _configuration_errors(
@@ -1014,6 +1038,22 @@ class TritonShmemAllReduceResidualRMSNorm:
         assert weight.shape == (self.hidden_dim,)
         assert input_tensor.is_contiguous() and residual.is_contiguous()
 
+        expected_shape = tuple(input_tensor.shape)
+        for name, output in (
+            ("norm_out", norm_out),
+            ("residual_out", residual_out),
+        ):
+            if output is not None and (
+                tuple(output.shape) != expected_shape
+                or output.dtype != self.dtype
+                or output.device != self.device
+                or not output.is_contiguous()
+            ):
+                raise ValueError(
+                    f"{name} must be contiguous {expected_shape} "
+                    f"{self.dtype} on {self.device}"
+                )
+
         m = input_tensor.shape[0]
         n = self.hidden_dim
         ws = self.world_size
@@ -1165,8 +1205,10 @@ def create_triton_shmem_ar_rmsnorm_state(
 ) -> "TritonShmemAllReduceResidualRMSNorm | None":
     """Create a triton_shmem (symm_mem) fused AR+RMSNorm state, or ``None``.
 
-    Returns ``None`` (so the caller can fall back) when the backend can't run on
-    this platform or state construction fails.
+    Returns ``None`` (so the caller can fall back) when the backend is
+    collectively ineligible. Unexpected construction failures propagate:
+    swallowing one rank's failure could split peers between this backend and
+    the ordinary collective fallback.
     """
     if not is_available():
         return None
@@ -1179,29 +1221,23 @@ def create_triton_shmem_ar_rmsnorm_state(
         device=resolved_device,
     ):
         return None
-    try:
-        return TritonShmemAllReduceResidualRMSNorm(
-            group=group,
-            rank_in_group=rank_in_group,
-            max_token_num=max_token_num,
-            hidden_dim=hidden_dim,
-            dtype=dtype,
-            device=resolved_device,
-        )
-    except Exception as exc:  # noqa: BLE001 - decline rather than crash forward
-        logger.warning("triton_shmem AR+RMSNorm state creation failed: %s", exc)
+    if not _policy_is_consistent(group):
         return None
+    return TritonShmemAllReduceResidualRMSNorm(
+        group=group,
+        rank_in_group=rank_in_group,
+        max_token_num=max_token_num,
+        hidden_dim=hidden_dim,
+        dtype=dtype,
+        device=resolved_device,
+    )
 
 
 def triton_shmem_can_run(
     state: "TritonShmemAllReduceResidualRMSNorm",
     input_tensor: torch.Tensor,
 ) -> bool:
-    """Decline captured calls without persistent profile-owned outputs.
-
-    An input-site ring is optional: states without one retain the generic
-    one-shot exit barrier, so their single symmetric input remains safe.
-    """
+    """Require profile-owned persistent outputs only while capturing."""
     if not torch.cuda.is_current_stream_capturing():
         return True
     eligible = (

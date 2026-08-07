@@ -103,9 +103,13 @@ def recommended_block_n(
 ) -> int:
     """Return the tuned blocked-kernel width."""
     selected = get_arch_profile(profile)
+    block_n_cap = max(
+        selected.block_n_min,
+        selected.block_n_bytes // dtype.itemsize,
+    )
     return min(
-        hidden_size,
-        max(selected.block_n_min, selected.block_n_bytes // dtype.itemsize),
+        block_n_cap,
+        1 << (hidden_size - 1).bit_length(),
     )
 
 
