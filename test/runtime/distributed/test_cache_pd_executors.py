@@ -311,6 +311,34 @@ def test_prefill_submits_typed_manifest_through_layerwise_sender() -> None:
     assert kwargs["destination_page_manifest"] == _destination_manifest()
 
 
+def test_prefill_layerwise_completion_does_not_require_retired_destination() -> None:
+    import tokenspeed.runtime.pd.prefill_executor as prefill_module
+
+    metadata_calls = []
+
+    class _Sender:
+        bootstrap_room = 9
+
+        def has_layerwise_transfer(self):
+            return True
+
+    executor = object.__new__(prefill_module.DisaggPrefillExecutor)
+    executor.cache_layout = _layout()
+    executor.senders = {"request-0": _Sender()}
+    executor.kv_manager = SimpleNamespace(
+        transfer_infos={},
+        set_prefill_metadata=lambda *args: metadata_calls.append(args),
+    )
+    executor._request_token = {"request-0": 42}
+    executor._layerwise_token_published = {"request-0"}
+
+    executor._cache_decode(_op())
+
+    assert metadata_calls == []
+    assert executor._request_token == {}
+    assert executor._layerwise_token_published == set()
+
+
 def test_cache_contract_epd_abort_notifies_decode() -> None:
     import tokenspeed.runtime.pd.prefill_executor as prefill_module
 

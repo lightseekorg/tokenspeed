@@ -357,9 +357,16 @@ class DisaggPrefillExecutor:
 
     def _cache_decode(self, op) -> None:
         pending = []
+        layerwise_pending = []
         for index, request_id in enumerate(op.request_ids):
             sender = self.senders.get(request_id)
             if sender is None:
+                continue
+            token = self._request_token.get(request_id)
+            if isinstance(token, bool) or not isinstance(token, int) or token < 0:
+                raise RuntimeError("Paged cache bootstrap token is unavailable")
+            if sender.has_layerwise_transfer():
+                layerwise_pending.append((request_id, sender, token))
                 continue
             transfer_infos = self.kv_manager.transfer_infos.get(
                 sender.bootstrap_room, {}
@@ -392,9 +399,6 @@ class DisaggPrefillExecutor:
                     destination.peer_cache_layout.num_pages_with_null
                 ),
             )
-            token = self._request_token.get(request_id)
-            if isinstance(token, bool) or not isinstance(token, int) or token < 0:
-                raise RuntimeError("Paged cache bootstrap token is unavailable")
             page_ids = np.asarray(
                 cache_manifest_page_ids(
                     manifest,
@@ -414,17 +418,17 @@ class DisaggPrefillExecutor:
                 )
             )
 
+        for request_id, sender, token in layerwise_pending:
+            if request_id not in self._layerwise_token_published:
+                self.kv_manager.set_prefill_metadata(
+                    sender.bootstrap_room,
+                    token,
+                    None,
+                )
+            self._layerwise_token_published.discard(request_id)
+            self._request_token.pop(request_id, None)
+
         for request_id, sender, aux_index, token, manifest, page_ids in pending:
-            if sender.has_layerwise_transfer():
-                if request_id not in self._layerwise_token_published:
-                    self.kv_manager.set_prefill_metadata(
-                        sender.bootstrap_room,
-                        token,
-                        None,
-                    )
-                self._layerwise_token_published.discard(request_id)
-                self._request_token.pop(request_id, None)
-                continue
             sender.send(
                 page_ids,
                 aux_index,
