@@ -216,7 +216,7 @@ def test_decode_publishes_manifest_through_legacy_receiver() -> None:
     assert executor._request_pool_indices == {"request-0": 7}
 
 
-def test_decode_publishes_only_extend_rows_from_mixed_batch() -> None:
+def test_decode_rejects_mixed_prefill_decode_batch() -> None:
     import tokenspeed.runtime.pd.decode_executor as decode_module
 
     calls = []
@@ -233,10 +233,11 @@ def test_decode_publishes_only_extend_rows_from_mixed_batch() -> None:
     op.extend_prefix_lens.append(5)
     op.prefill_lengths.append(5)
 
-    executor._cache_prefill(op)
+    with pytest.raises(RuntimeError, match="does not support mixed batches"):
+        executor._cache_prefill(op)
 
-    assert len(calls) == 1
-    assert executor._request_pool_indices == {"request-0": 7}
+    assert calls == []
+    assert executor._request_pool_indices == {}
 
 
 def test_prefill_submits_manifest_through_legacy_sender() -> None:

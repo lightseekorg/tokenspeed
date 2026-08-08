@@ -76,7 +76,11 @@ class DisaggDecodeExecutor:
     def _cache_prefill(self, op) -> None:
         pending = []
         num_extends = op.num_extends()
-        for index, request_id in enumerate(op.request_ids[:num_extends]):
+        if num_extends != len(op.request_ids):
+            raise RuntimeError(
+                "Paged cache decode destination admission does not support mixed batches"
+            )
+        for index, request_id in enumerate(op.request_ids):
             receiver = self.receivers.get(request_id)
             if receiver is None:
                 continue
