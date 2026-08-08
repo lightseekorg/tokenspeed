@@ -37,7 +37,6 @@ import torch
 import triton
 from tokenspeed_kernel.ops.attention.tokenspeed_mla import (
     get_num_sm,
-    mla_prefill_pdl_enabled,
     tokenspeed_mla_decode,
     tokenspeed_mla_prefill,
     warmup_compile_prefill,
@@ -175,7 +174,7 @@ class CuteDSLMLABackend(AttentionBackend):
             q_dtype=torch.float8_e4m3fn,
             d_qk=d_qk,
             d_v=self.v_head_dim,
-            enable_pdl=mla_prefill_pdl_enabled(pdl_enabled()),
+            enable_pdl=pdl_enabled(),
         )
 
         # Validate page_size
@@ -1032,7 +1031,7 @@ class CuteDSLMLABackend(AttentionBackend):
             return_lse=True,
             cum_seq_lens_q=cum_seq_lens_q,
             max_seq_len_q=max_q_len,
-            enable_pdl=mla_prefill_pdl_enabled(pdl_enabled()),
+            enable_pdl=pdl_enabled(),
             out=out,
         )
 
