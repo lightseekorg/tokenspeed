@@ -62,6 +62,7 @@ class CachePool:
         *,
         paged_cache_group_specs: tuple[PagedCacheGroupSpec, ...] = (),
         token_capacity: int | None = None,
+        backing_pool: CachePool | None = None,
     ):
         self.dtype = dtype
         self.rank = rank
@@ -90,8 +91,35 @@ class CachePool:
         # Allocate lazily when the first field is bound. Concrete pools do
         # that inside their memory-saver region, so the shared buffer keeps
         # the same sleep/wake lifetime as the legacy per-buffer allocations.
-        self.buffer: torch.Tensor | None = None
-        self._fields: dict[str, torch.Tensor] = {}
+        #
+        # A heterogeneous draft view (for example, an MHA Eagle3 head over an
+        # MLA target) binds its own field family but must not allocate another
+        # arena. Construction is deliberately target-first: the draft aliases
+        # the target's already-registered buffer and field registry. Sharing
+        # the registry is also required by pd_contract(), which validates that
+        # every field in the merged plan has acquired a runtime dtype.
+        self._backing_pool = backing_pool
+        if backing_pool is None:
+            self.buffer: torch.Tensor | None = None
+            self._fields: dict[str, torch.Tensor] = {}
+        else:
+            if backing_pool.plan != memory_plan:
+                raise ValueError("a cache view must share its backing pool's plan")
+            if backing_pool.buffer is None:
+                raise ValueError(
+                    "the backing cache pool must bind its fields before a view"
+                )
+            if paged_cache_group_specs:
+                raise ValueError(
+                    "a cache view must inherit, not republish, the runtime contract"
+                )
+            self.buffer = backing_pool.buffer
+            self._fields = backing_pool._fields
+            self.runtime_contract = backing_pool.runtime_contract
+            self.paged_cache_group_specs = backing_pool.paged_cache_group_specs
+            self.paged_cache_group_page_counts = (
+                backing_pool.paged_cache_group_page_counts
+            )
 
         # default state for optional layer-wise transfer control
         self.layer_transfer_counter = None
@@ -245,6 +273,12 @@ class CachePool:
         )
 
     def _ensure_buffer(self) -> torch.Tensor:
+        if self._backing_pool is not None:
+            buffer = self._backing_pool.buffer
+            if buffer is None:
+                raise RuntimeError("the backing cache pool released its buffer")
+            self.buffer = buffer
+            return buffer
         if self.buffer is None:
             self.buffer = torch.zeros(
                 self.plan.arena_bytes,
@@ -293,6 +327,10 @@ class CachePool:
     @torch.no_grad()
     def clear_kv_buffers(self) -> None:
         """Zero the shared cache buffer after sleep/wake remaps its storage."""
+        # The event loop visits both target and draft pools. A draft view owns
+        # no allocation; the target clears their shared arena exactly once.
+        if self._backing_pool is not None:
+            return
         if self.buffer is not None:
             self.buffer.zero_()
 
