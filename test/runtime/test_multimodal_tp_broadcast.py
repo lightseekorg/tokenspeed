@@ -1,7 +1,9 @@
 import pytest
 import torch
 
-from tokenspeed.runtime.multimodal.embedder import VisionEmbedder
+from tokenspeed.runtime.multimodal.encoder_feature_transport import (
+    EncoderFeatureTransport,
+)
 from tokenspeed.runtime.multimodal.inputs import Modality, MultimodalDataItem
 from tokenspeed.runtime.multimodal.shm_transport import ShmTensorHandle
 
@@ -17,67 +19,56 @@ def _shm_item(nbytes: int, dtype: torch.dtype = torch.bfloat16):
     )
 
 
-def _embedder(tp_size: int) -> VisionEmbedder:
-    embedder = VisionEmbedder()
-    embedder._vision_tp_group = tuple(range(tp_size))
-    embedder._vision_tp_process_group = object()
-    embedder._vision_tp_src_rank = 0
-    return embedder
+def _transport(tp_size: int) -> EncoderFeatureTransport:
+    transport = EncoderFeatureTransport()
+    transport._vision_tp_group = tuple(range(tp_size))
+    transport._vision_tp_process_group = object()
+    transport._vision_tp_src_rank = 0
+    return transport
 
 
-def test_tp2_broadcasts_at_128_mib():
-    embedder = _embedder(2)
+def test_tp_broadcast_selection():
+    tp2 = _transport(2)
+    assert not tp2._should_use_tp_broadcast([_shm_item(128 * 1024 * 1024 - 2)])
+    assert tp2._should_use_tp_broadcast([_shm_item(128 * 1024 * 1024)])
 
-    assert not embedder._should_move_shm_via_tp_broadcast(
-        [_shm_item(128 * 1024 * 1024 - 2)]
+    tp4 = _transport(4)
+    assert tp4._should_use_tp_broadcast([_shm_item(8 * 1024 * 1024) for _ in range(8)])
+    assert not tp4._should_use_tp_broadcast(
+        [
+            _shm_item(32 * 1024 * 1024, torch.bfloat16),
+            _shm_item(32 * 1024 * 1024, torch.float16),
+        ]
     )
-    assert embedder._should_move_shm_via_tp_broadcast([_shm_item(128 * 1024 * 1024)])
-
-
-def test_tp4_broadcasts_aggregate_64_mib_payload():
-    embedder = _embedder(4)
-    items = [_shm_item(8 * 1024 * 1024) for _ in range(8)]
-
-    assert embedder._should_move_shm_via_tp_broadcast(items)
-
-
-def test_tp_broadcast_requires_uniform_shm_dtype():
-    embedder = _embedder(4)
-    items = [
-        _shm_item(32 * 1024 * 1024, torch.bfloat16),
-        _shm_item(32 * 1024 * 1024, torch.float16),
-    ]
-
-    assert not embedder._should_move_shm_via_tp_broadcast(items)
-
-
-def test_tp_broadcast_rejects_inline_tensors():
-    embedder = _embedder(4)
-    items = [
-        _shm_item(64 * 1024 * 1024),
-        MultimodalDataItem(modality=Modality.IMAGE, feature=torch.empty(1)),
-    ]
-
-    assert not embedder._should_move_shm_via_tp_broadcast(items)
+    assert not tp4._should_use_tp_broadcast(
+        [
+            _shm_item(64 * 1024 * 1024),
+            MultimodalDataItem(modality=Modality.IMAGE, feature=torch.empty(1)),
+        ]
+    )
 
 
 def test_tp_broadcast_stays_on_model_stream(monkeypatch):
-    embedder = _embedder(2)
+    transport = _transport(2)
     items = [_shm_item(128 * 1024 * 1024)]
     moved = []
 
     monkeypatch.setattr(
-        embedder,
-        "_move_shm_via_tp_broadcast",
-        lambda pending, device: moved.append((pending, device)),
+        transport,
+        "_execute_tp_broadcasts",
+        lambda batches, device, *, mode: moved.append((batches, device, mode)),
     )
     monkeypatch.setattr(
-        embedder,
+        transport,
         "_h2d_stream_on",
         lambda _device: pytest.fail("TP broadcast must not use the H2D stream"),
     )
 
     device = torch.device("cuda")
-    embedder._move_features_to_device(items, device)
+    transport.move_to_device(items, device)
 
-    assert moved == [(items, device)]
+    assert len(moved) == 1
+    batches, moved_device, mode = moved[0]
+    assert moved_device == device
+    assert mode == "local"
+    assert [entry.item for entry in batches[0].entries] == items
