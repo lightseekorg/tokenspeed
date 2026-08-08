@@ -70,6 +70,18 @@ def _expert_float_parameter(
     )
 
 
+def _swiglu_parameters(
+    w: torch.nn.Module,
+) -> tuple[float | None, float | None, float | None]:
+    swiglu_arg = getattr(w, "swiglu_arg", None)
+    alpha = None if swiglu_arg is None else swiglu_arg.alpha
+    beta = getattr(w, "swiglu_beta", None)
+    limit = None if swiglu_arg is None else swiglu_arg.limit
+    if alpha is None and (beta is not None or limit is not None):
+        alpha = 1.0
+    return alpha, beta, limit
+
+
 if platform.is_nvidia:
     from flashinfer import (
         ActivationType,
@@ -170,14 +182,10 @@ if platform.is_nvidia:
         )
         w.w13_weight_global_scale = torch.nn.Parameter(ones, requires_grad=False)
         w.w2_weight_global_scale = torch.nn.Parameter(ones.clone(), requires_grad=False)
-        swiglu_arg = getattr(w, "swiglu_arg", None)
-        w.gemm1_alpha = _expert_float_parameter(
-            w, None if swiglu_arg is None else swiglu_arg.alpha
-        )
-        w.gemm1_beta = _expert_float_parameter(w, getattr(w, "swiglu_beta", None))
-        w.gemm1_clamp_limit = _expert_float_parameter(
-            w, None if swiglu_arg is None else swiglu_arg.limit
-        )
+        swiglu_alpha, swiglu_beta, swiglu_limit = _swiglu_parameters(w)
+        w.gemm1_alpha = _expert_float_parameter(w, swiglu_alpha)
+        w.gemm1_beta = _expert_float_parameter(w, swiglu_beta)
+        w.gemm1_clamp_limit = _expert_float_parameter(w, swiglu_limit)
         w.intermediate_size_per_partition = intermediate_size
         w.hidden_size_padded = hidden_size
         w.hidden_size_original = getattr(w, "hidden_size", hidden_size)

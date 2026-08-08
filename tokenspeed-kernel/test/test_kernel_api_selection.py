@@ -285,6 +285,14 @@ def test_mxfp4_cutlass_preprocessor_preserves_concatenated_checkpoint_values(
     assert torch.equal(swizzled[1], module.w2_weight_scale)
 
 
+def test_mxfp4_cutlass_clamped_swiglu_defaults_alpha() -> None:
+    module = torch.nn.Module()
+    module.swiglu_arg = type("SwigluArg", (), {"alpha": None, "limit": 7.0})()
+    module.swiglu_beta = None
+
+    assert _moe_cutlass_mxfp4._swiglu_parameters(module) == (1.0, None, 7.0)
+
+
 def test_mxfp4_cutlass_apply_uses_flashinfer_swizzled_activation_scales(monkeypatch):
     if not hasattr(_moe_cutlass_mxfp4, "flashinfer_cutlass_mxfp4_moe_apply"):
         pytest.skip("FlashInfer CUTLASS MXFP4 is NVIDIA-only")
