@@ -169,7 +169,7 @@ def test_cache_decode_destination_seeds_remote_prompt_cache_length(
     assert resets == [([7, 11], [1535, 3073])]
 
 
-def test_cache_factory_exposes_raw_slabs_as_mooncake_layers() -> None:
+def test_cache_factory_keeps_semantic_layers_separate_from_raw_slabs() -> None:
     from tokenspeed.runtime.pd.factory import get_kv_args
 
     layout = _layout()
@@ -180,13 +180,14 @@ def test_cache_factory_exposes_raw_slabs_as_mooncake_layers() -> None:
     )
     pool = SimpleNamespace(
         supports_disaggregation=True,
+        layer_num=43,
         get_pd_cache_contract=lambda: (layout, registrations),
     )
 
     kv_args = get_kv_args(0, 0, "mlx5_0", pool, None)
 
-    assert kv_args.target_layer_num == 2
-    assert kv_args.kv_layer_ids == [0, 1]
+    assert kv_args.target_layer_num == 43
+    assert kv_args.kv_layer_ids == list(range(43))
     assert kv_args.offsets == [(0,), (1,)]
     assert kv_args.kv_item_lens == [16, 16]
     assert kv_args.kv_unit_lens == [16, 16]
