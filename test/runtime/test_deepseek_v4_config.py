@@ -113,6 +113,7 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     _deepseek_v4_indexer_prefill_request_gather_plan,
     _deepseek_v4_indexer_token_split,
     _deepseek_v4_indexer_topk_from_logits,
+    _deepseek_v4_launch_indexer_topk_prefill,
     _deepseek_v4_mega_moe_max_num_tokens,
     _deepseek_v4_reorder_c4_ape_2604,
     _DeepseekV4TopKBuffer,
@@ -468,6 +469,74 @@ class TestDeepseekV4Config(unittest.TestCase):
             _deepseek_v4_indexer_token_split(ForwardMode.DECODE, metadata, 5),
             (0, 5),
         )
+
+    def test_deepseek_v4_sm120_prefill_topk_uses_tokenspeed_cuda_op(self):
+        calls = []
+        args = (object(), object(), object(), object(), 2048)
+        sm120 = SimpleNamespace(
+            is_nvidia=True,
+            arch_version=SimpleNamespace(major=12),
+        )
+        with (
+            patch.object(deepseek_v4_model, "_platform", sm120),
+            patch.object(
+                deepseek_v4_model,
+                "has_indexer_topk_prefill",
+                return_value=True,
+            ),
+            patch.object(
+                deepseek_v4_model,
+                "indexer_topk_prefill",
+                side_effect=lambda *values: calls.append(values),
+            ),
+        ):
+            _deepseek_v4_launch_indexer_topk_prefill(*args)
+
+        self.assertEqual(calls, [args])
+
+    def test_deepseek_v4_moe_leaves_routing_mode_to_kernel_selection(self):
+        captured = {}
+
+        class FakeGate(torch.nn.Module):
+            def __init__(self, *_args, **_kwargs):
+                super().__init__()
+                self.e_score_correction_bias = None
+
+        class FakeExperts(torch.nn.Module):
+            def __init__(self, **kwargs):
+                super().__init__()
+                captured.update(kwargs)
+                self.topk_output_format = object()
+
+        class FakeTopK(torch.nn.Module):
+            def __init__(self, **_kwargs):
+                super().__init__()
+
+        config = SimpleNamespace(
+            n_shared_experts=None,
+            routed_scaling_factor=1.0,
+            scoring_func="sqrtsoftplus",
+            n_routed_experts=256,
+            num_experts_per_tok=8,
+            hidden_size=7168,
+            moe_intermediate_size=2048,
+            norm_topk_prob=True,
+        )
+        mapping = SimpleNamespace(
+            moe=SimpleNamespace(tp_rank=0, tp_size=1, ep_rank=0, ep_size=1)
+        )
+        backend = SimpleNamespace(is_mega_moe=lambda: False)
+        quant_config = SimpleNamespace(ignored_layers=None)
+
+        with (
+            patch.object(deepseek_v4_model, "get_moe_backend", return_value=backend),
+            patch.object(deepseek_v4_model, "DeepseekV4MoEGate", FakeGate),
+            patch.object(deepseek_v4_model, "MoELayer", FakeExperts),
+            patch.object(deepseek_v4_model, "TopK", FakeTopK),
+        ):
+            DeepseekV4MoE(config, mapping, quant_config, 0, "model.layers.0.mlp")
+
+        self.assertIsNone(captured.get("routing_mode"))
 
     def test_spec_helpers_preserve_non_v4_backend_contracts(self):
         seq_lens = object()

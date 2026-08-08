@@ -223,3 +223,45 @@ def test_cuda_include_dirs_fall_back_from_partial_toolkit(
 
     assert str(cuda_include) not in include_dirs
     assert str(wheel_include) in include_dirs
+
+
+def test_attn_res_build_is_limited_to_supported_blackwell_architectures(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TOKENSPEED_KERNEL_BACKEND", "cuda")
+    monkeypatch.setattr(setuptools, "setup", lambda **_kwargs: None)
+    setup_namespace = runpy.run_path(str(SETUP_PY))
+    builder = setup_namespace["CudaKernelBuilder"]([], verbose=False)
+
+    assert builder._group_cuda_archs("attn_res", {"100a", "120a"}) == {"100a"}
+    assert builder._group_cuda_archs("rope", {"100a", "120a"}) == {
+        "100a",
+        "120a",
+    }
+
+
+def test_default_cuda_build_remains_sm10x(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TOKENSPEED_KERNEL_BACKEND", "cuda")
+    monkeypatch.delenv("FLASHINFER_CUDA_ARCH_LIST", raising=False)
+    monkeypatch.delenv("TOKENSPEED_CUDA_ARCH", raising=False)
+    monkeypatch.setattr(setuptools, "setup", lambda **_kwargs: None)
+    setup_namespace = runpy.run_path(str(SETUP_PY))
+    builder = setup_namespace["CudaKernelBuilder"]([], verbose=False)
+
+    assert builder._detect_cuda_archs() == {"100a", "103a"}
+    assert builder._group_cuda_archs("attn_res", builder._detect_cuda_archs()) == {
+        "100a",
+        "103a",
+    }
+
+
+def test_cuda_arch_override_preserves_family_suffix(monkeypatch) -> None:
+    monkeypatch.setenv("TOKENSPEED_KERNEL_BACKEND", "cuda")
+    monkeypatch.setattr(setuptools, "setup", lambda **_kwargs: None)
+    setup_namespace = runpy.run_path(str(SETUP_PY))
+    builder = setup_namespace["CudaKernelBuilder"]([], verbose=False)
+
+    assert builder._normalize_cuda_arch("120f") == "120f"
+    assert builder._normalize_cuda_arch("12.0f") == "120f"

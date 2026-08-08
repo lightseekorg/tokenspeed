@@ -1,0 +1,328 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+from __future__ import annotations
+
+import functools
+
+import torch
+from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+)
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
+
+platform = current_platform()
+
+
+def _reorder_w13(x: torch.Tensor, layout: str, dim: int) -> torch.Tensor:
+    if dim < 0:
+        dim += x.dim()
+    size = x.shape[dim]
+    if size % 2 != 0:
+        raise ValueError(f"expected even size in dim {dim}, got {size}")
+    if layout == "concatenated":
+        first, second = x.split(size // 2, dim=dim)
+        return torch.cat((second, first), dim=dim).contiguous()
+    if layout == "interleaved":
+        shape = list(x.shape)
+        paired = x.reshape(shape[:dim] + [size // 2, 2] + shape[dim + 1 :])
+        return torch.cat(
+            (paired.select(dim + 1, 1), paired.select(dim + 1, 0)), dim=dim
+        ).contiguous()
+    raise ValueError(f"unknown w13_input_layout: {layout!r}")
+
+
+def _expert_float_parameter(
+    w: torch.nn.Module,
+    value: float | None,
+) -> torch.nn.Parameter | None:
+    if value is None:
+        return None
+    return torch.nn.Parameter(
+        torch.full(
+            (w.w13_weight.shape[0],),
+            float(value),
+            dtype=torch.float32,
+            device=w.w13_weight.device,
+        ),
+        requires_grad=False,
+    )
+
+
+def _swiglu_parameters(
+    w: torch.nn.Module,
+) -> tuple[float | None, float | None, float | None]:
+    swiglu_arg = getattr(w, "swiglu_arg", None)
+    alpha = None if swiglu_arg is None else swiglu_arg.alpha
+    beta = getattr(w, "swiglu_beta", None)
+    limit = None if swiglu_arg is None else swiglu_arg.limit
+    if alpha is None and (beta is not None or limit is not None):
+        alpha = 1.0
+    return alpha, beta, limit
+
+
+if platform.is_nvidia:
+    from flashinfer import (
+        ActivationType,
+        block_scale_interleave,
+        cutlass_fused_moe,
+        mxfp8_quantize,
+    )
+    from flashinfer.fused_moe import cutlass_fused_moe_workspace_size
+    from flashinfer.fused_moe.core import get_cutlass_fused_moe_module
+    from flashinfer.quantization.fp8_quantization import (
+        get_mxfp8_quantization_sm100_module,
+    )
+
+    @functools.cache
+    def _mxfp4_workspace(
+        device: torch.device,
+        max_num_tokens: int,
+        hidden_size: int,
+        intermediate_size: int,
+        num_experts_total: int,
+        top_k: int,
+        x_dtype: torch.dtype,
+        weight_dtype: torch.dtype,
+        activation_type: ActivationType,
+        tp_size: int,
+        tp_rank: int,
+        ep_size: int,
+        ep_rank: int,
+    ) -> torch.Tensor:
+        """Own one persistent workspace per compatible worker-local MoE shape."""
+        workspace_size = cutlass_fused_moe_workspace_size(
+            max_num_tokens,
+            hidden_size,
+            intermediate_size,
+            num_experts_total,
+            top_k,
+            x_dtype=x_dtype,
+            weight_dtype=weight_dtype,
+            output_dtype=torch.bfloat16,
+            activation_type=activation_type,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            use_mxfp8_act_scaling=True,
+            device=device,
+        )
+        return torch.empty(workspace_size, dtype=torch.uint8, device=device)
+
+    def flashinfer_cutlass_mxfp4_moe_weights(
+        plan: dict,
+        w: torch.nn.Module,
+    ) -> None:
+        del plan
+        intermediate_size = w.w13_weight.shape[1] // 2
+        hidden_size = w.w2_weight.shape[1]
+        if intermediate_size % 128 != 0 or hidden_size % 128 != 0:
+            raise ValueError(
+                "FlashInfer SM12x MXFP4 MoE requires hidden and intermediate "
+                f"sizes divisible by 128, got {hidden_size} and {intermediate_size}"
+            )
+
+        w13_layout = getattr(w, "w13_input_layout", "concatenated")
+        w.w13_weight = torch.nn.Parameter(
+            _reorder_w13(w.w13_weight.data, w13_layout, 1),
+            requires_grad=False,
+        )
+        w.w13_weight_scale = torch.nn.Parameter(
+            block_scale_interleave(
+                _reorder_w13(w.w13_weight_scale.data, w13_layout, 1)
+            ).reshape_as(w.w13_weight_scale),
+            requires_grad=False,
+        )
+        w.w2_weight = torch.nn.Parameter(
+            w.w2_weight.data.contiguous(), requires_grad=False
+        )
+        w.w2_weight_scale = torch.nn.Parameter(
+            block_scale_interleave(w.w2_weight_scale.data.contiguous()).reshape_as(
+                w.w2_weight_scale
+            ),
+            requires_grad=False,
+        )
+        if hasattr(w, "w13_weight_bias"):
+            w.w13_weight_bias = torch.nn.Parameter(
+                _reorder_w13(w.w13_weight_bias.data, w13_layout, 1),
+                requires_grad=False,
+            )
+        if hasattr(w, "w2_weight_bias"):
+            w.w2_weight_bias = torch.nn.Parameter(
+                w.w2_weight_bias.data.contiguous(), requires_grad=False
+            )
+
+        num_local_experts = w.w13_weight.shape[0]
+        ones = torch.ones(
+            num_local_experts,
+            dtype=torch.float32,
+            device=w.w13_weight.device,
+        )
+        w.w13_weight_global_scale = torch.nn.Parameter(ones, requires_grad=False)
+        w.w2_weight_global_scale = torch.nn.Parameter(ones.clone(), requires_grad=False)
+        swiglu_alpha, swiglu_beta, swiglu_limit = _swiglu_parameters(w)
+        w.gemm1_alpha = _expert_float_parameter(w, swiglu_alpha)
+        w.gemm1_beta = _expert_float_parameter(w, swiglu_beta)
+        w.gemm1_clamp_limit = _expert_float_parameter(w, swiglu_limit)
+        w.intermediate_size_per_partition = intermediate_size
+        w.hidden_size_padded = hidden_size
+        w.hidden_size_original = getattr(w, "hidden_size", hidden_size)
+
+        if w.w13_weight.is_cuda:
+            major, minor = torch.cuda.get_device_capability(w.w13_weight.device)
+            get_cutlass_fused_moe_module(f"{major}{minor}")
+            get_mxfp8_quantization_sm100_module()
+
+    @register_kernel(
+        "moe",
+        "apply",
+        name="flashinfer_cutlass_mxfp4_moe_apply",
+        solution="flashinfer_cutlass",
+        weight_preprocessor=flashinfer_cutlass_mxfp4_moe_weights,
+        capability=CapabilityRequirement(
+            vendors=frozenset({"nvidia"}),
+            min_arch_version=ArchVersion(12, 0),
+            max_arch_version=ArchVersion(12, 1),
+        ),
+        signatures=format_signatures(
+            "x",
+            "dense",
+            {torch.float16, torch.bfloat16},
+        ),
+        traits={
+            "weight_dtype": frozenset({"mxfp4"}),
+            "activation": frozenset({"swiglu"}),
+            "routing_mode": frozenset({"precomputed_topk"}),
+            "supports_deferred_finalize": frozenset({False}),
+            "supports_ep": frozenset({True}),
+            "supports_all_to_all_ep": frozenset({False}),
+            "ispp_alignment": frozenset({128}),
+            "internal_activation_dtype": frozenset({"input"}),
+            "supports_bias": frozenset({True}),
+        },
+        priority=Priority.PERFORMANT,
+    )
+    def flashinfer_cutlass_mxfp4_moe_apply(
+        plan: dict,
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        num_tokens_global: int | None = None,
+        max_num_tokens_per_gpu: int | None = None,
+        do_finalize: bool = True,
+        enable_pdl: bool = False,
+    ) -> torch.Tensor:
+        del plan, router_logits, num_tokens_global, max_num_tokens_per_gpu
+        if not do_finalize:
+            raise ValueError("FlashInfer CUTLASS MXFP4 MoE requires finalization")
+        if topk_weights is None or topk_ids is None:
+            raise ValueError(
+                "FlashInfer CUTLASS MXFP4 MoE requires precomputed top-k routing"
+            )
+
+        hidden_padded = getattr(w, "hidden_size_padded", w.w2_weight.shape[1])
+        hidden_original = getattr(w, "hidden_size_original", hidden_padded)
+        if x.shape[0] == 0:
+            return x.new_empty((0, hidden_original), dtype=torch.bfloat16)
+        if x.shape[-1] > hidden_padded:
+            raise ValueError(
+                f"input hidden size {x.shape[-1]} exceeds prepared size {hidden_padded}"
+            )
+        if x.shape[-1] < hidden_padded:
+            x = torch.nn.functional.pad(x, (0, hidden_padded - x.shape[-1]))
+
+        x_quant, x_scale = mxfp8_quantize(
+            x,
+            True,
+            alignment=32,
+            enable_pdl=enable_pdl,
+        )
+        output = torch.empty(
+            (x.shape[0], hidden_padded),
+            dtype=torch.bfloat16,
+            device=x.device,
+        )
+        activation_type = (
+            ActivationType.Swiglu
+            if getattr(w, "gemm1_alpha", None) is None
+            else ActivationType.SwigluBias
+        )
+        tp_size = getattr(w, "tp_size", 1)
+        tp_rank = getattr(w, "tp_rank", 0)
+        ep_size = getattr(w, "ep_size", 1)
+        ep_rank = getattr(w, "ep_rank", 0)
+        packed_fc1_weights = w.w13_weight.view(torch.long)
+        packed_fc2_weights = w.w2_weight.view(torch.long)
+        workspace_buffer = _mxfp4_workspace(
+            x.device,
+            get_autotune_max_num_tokens(),
+            hidden_padded,
+            w.intermediate_size_per_partition,
+            w.w13_weight.shape[0] * ep_size,
+            topk_ids.shape[1],
+            x_quant.dtype,
+            packed_fc1_weights.dtype,
+            activation_type,
+            tp_size,
+            tp_rank,
+            ep_size,
+            ep_rank,
+        )
+        result = cutlass_fused_moe(
+            input=x_quant,
+            input_sf=x_scale,
+            swizzled_input_sf=True,
+            token_selected_experts=topk_ids.to(torch.int32),
+            token_final_scales=topk_weights.to(torch.float32),
+            fc1_expert_weights=packed_fc1_weights,
+            fc2_expert_weights=packed_fc2_weights,
+            fc1_expert_biases=getattr(w, "w13_weight_bias", None),
+            fc2_expert_biases=getattr(w, "w2_weight_bias", None),
+            output_dtype=torch.bfloat16,
+            output=output,
+            quant_scales=[
+                w.w13_weight_scale.contiguous().view(torch.int32),
+                w.w13_weight_global_scale,
+                w.w2_weight_scale.contiguous().view(torch.int32),
+                w.w2_weight_global_scale,
+            ],
+            swiglu_alpha=getattr(w, "gemm1_alpha", None),
+            swiglu_beta=getattr(w, "gemm1_beta", None),
+            swiglu_limit=getattr(w, "gemm1_clamp_limit", None),
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            use_mxfp8_act_scaling=True,
+            tune_max_num_tokens=get_autotune_max_num_tokens(),
+            enable_pdl=enable_pdl,
+            activation_type=activation_type,
+            workspace_buffer=workspace_buffer,
+        )[0]
+        if hidden_original != hidden_padded:
+            result = result[:, :hidden_original].contiguous()
+        return result

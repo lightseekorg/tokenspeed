@@ -285,12 +285,15 @@ if platform.is_nvidia:
                     (0, 0),
                     get_hybrid_num_tokens_buckets,
                     map_to_hybrid_bucket_uncapped,
-                    [_init_packed_fp4, autotuner_initializer_empty],
                 ),
             ),
             constraint_specs=(
                 ConstraintSpec(1, 0, lambda shapes: _round_up(shapes[0][0], 128)),
                 ConstraintSpec(7, 0, lambda shapes: _round_up(shapes[0][0], 128)),
+            ),
+            tensor_initializers=(
+                (0, _init_packed_fp4),
+                (6, autotuner_initializer_empty),
             ),
             use_cold_l2_cache=True,
         )

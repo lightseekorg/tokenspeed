@@ -43,10 +43,13 @@ try:
 except ImportError:
     deep_gemm = None  # type: ignore[assignment]
 
+from tokenspeed_kernel.ops.attention import prebuild_dsv4_sparse_mla
 from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
     has_indexer_mxfp4_paged_gather,
+    has_indexer_topk_prefill,
     has_persistent_topk,
     indexer_mxfp4_paged_gather,
+    indexer_topk_prefill,
     persistent_topk,
 )
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
@@ -721,16 +724,10 @@ def _deepseek_v4_indexer_topk_from_logits_prefill_op(
     row_ends: torch.Tensor | None = None,
     out: torch.Tensor,
 ) -> torch.Tensor:
-    """Use the local TRT-LLM CUDA prefill selector."""
+    """Use the architecture-compatible CUDA prefill selector."""
 
     if not logits.is_cuda or logits.dtype != torch.float32:
         raise RuntimeError("DeepSeek V4 prefill indexer requires CUDA float32 logits")
-    trtllm_ops = getattr(torch.ops, "trtllm", None)
-    if trtllm_ops is None or not hasattr(trtllm_ops, "indexer_topk_prefill"):
-        raise RuntimeError(
-            "DeepSeek V4 prefill indexer requires the CUDA prefill top-k op"
-        )
-
     num_rows = length_rows.numel()
     if num_rows == 0:
         return out[:0]
@@ -767,7 +764,7 @@ def _deepseek_v4_indexer_topk_from_logits_prefill_op(
 
     topk = out[:num_rows]
     topk.fill_(-1)
-    trtllm_ops.indexer_topk_prefill(
+    _deepseek_v4_launch_indexer_topk_prefill(
         logits,
         row_starts_for_kernel,
         row_ends_for_kernel,
@@ -775,6 +772,42 @@ def _deepseek_v4_indexer_topk_from_logits_prefill_op(
         topk_tokens,
     )
     return topk
+
+
+def _deepseek_v4_launch_indexer_topk_prefill(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    output: torch.Tensor,
+    topk_tokens: int,
+) -> None:
+    if _platform.is_nvidia and _platform.arch_version.major == 12:
+        if not has_indexer_topk_prefill():
+            raise RuntimeError(
+                "DeepSeek V4 prefill indexer on SM120 requires the "
+                "TokenSpeed CUDA prefill top-k op"
+            )
+        indexer_topk_prefill(
+            logits,
+            row_starts,
+            row_ends,
+            output,
+            topk_tokens,
+        )
+        return
+
+    trtllm_ops = getattr(torch.ops, "trtllm", None)
+    if trtllm_ops is None or not hasattr(trtllm_ops, "indexer_topk_prefill"):
+        raise RuntimeError(
+            "DeepSeek V4 prefill indexer requires the CUDA prefill top-k op"
+        )
+    trtllm_ops.indexer_topk_prefill(
+        logits,
+        row_starts,
+        row_ends,
+        output,
+        topk_tokens,
+    )
 
 
 @dataclass(frozen=True)
@@ -4233,6 +4266,7 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         del params_dict, moe_loader
         self.post_load_weights()
         self.warmup_deep_gemm()
+        self.warmup_flashinfer()
 
     def post_load_weights(self):
         mega_moe_experts: list[DeepseekV4MegaMoEExperts] = []
@@ -4261,6 +4295,10 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
 
         self._warmup_mega_moe_jit()
         self._warmup_prefill_jit()
+
+    def warmup_flashinfer(self) -> None:
+        if _platform.is_nvidia and _platform.arch_version.major == 12:
+            prebuild_dsv4_sparse_mla()
 
     def _warmup_mega_moe_jit(self) -> None:
         if os.environ.get("TOKENSPEED_DISABLE_MEGA_MOE_WARMUP") == "1":
