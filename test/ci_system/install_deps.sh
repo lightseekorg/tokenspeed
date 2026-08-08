@@ -66,8 +66,10 @@ run_as_root() {
     fi
 }
 
-ensure_flashinfer_jit_cache_for_gb200() {
-    if [[ "${CI_RUNNER_LABEL:-}" != gb200* ]]; then
+ensure_flashinfer_jit_cache() {
+    # GB200 and B200 runner images preinstall flashinfer-jit-cache; it must
+    # match the flashinfer-python pin exactly or flashinfer refuses to import.
+    if [[ "${CI_RUNNER_LABEL:-}" != gb200* && "${CI_RUNNER_LABEL:-}" != b200* ]]; then
         return 0
     fi
 
@@ -131,15 +133,31 @@ python3 -m pip install --upgrade --ignore-installed --break-system-packages \
     pip setuptools wheel
 
 # ============================================================
-# Step 3: Sync FlashInfer JIT cache on GB200
+# Step 3: Sync FlashInfer JIT cache on GB200/B200
 # ============================================================
-echo "=== Step 3: Sync FlashInfer JIT cache on GB200 ==="
-ensure_flashinfer_jit_cache_for_gb200
+echo "=== Step 3: Sync FlashInfer JIT cache on GB200/B200 ==="
+ensure_flashinfer_jit_cache
 
 # ============================================================
 # Step 4: Install tokenspeed-kernel
 # ============================================================
 echo "=== Step 4: Install tokenspeed-kernel ==="
+# Nightly flashinfer pins (X.Y.Z.devYYYYMMDD) never reach PyPI: pre-install
+# the python wheel from the GitHub nightly release so tokenspeed-kernel's ==
+# pin resolves against the already-installed version instead of PyPI.
+FLASHINFER_PIN="$(grep -E '^flashinfer-python==' "${CUDA_REQ}" | head -n1 | tr -d '[:space:]')"
+FLASHINFER_PIN_VERSION="${FLASHINFER_PIN##*==}"
+if [[ "${FLASHINFER_PIN_VERSION}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.dev([0-9]{8})$ ]]; then
+    NIGHTLY_TAG="nightly-v${BASH_REMATCH[1]}-${BASH_REMATCH[2]}"
+    NIGHTLY_BASE="https://github.com/flashinfer-ai/flashinfer/releases/download/${NIGHTLY_TAG}"
+    NIGHTLY_WHEEL="$(cache_remote_wheel "${NIGHTLY_BASE}/flashinfer_python-${FLASHINFER_PIN_VERSION}-py3-none-any.whl")"
+    # flashinfer-cubin must match too: runner images preinstall an older one
+    # and flashinfer's import-time version check refuses the mismatch.
+    NIGHTLY_CUBIN_WHEEL="$(cache_remote_wheel "${NIGHTLY_BASE}/flashinfer_cubin-${FLASHINFER_PIN_VERSION}-py3-none-any.whl")"
+    echo "Pre-installing nightly FlashInfer Python + cubin from GitHub release: ${NIGHTLY_TAG}"
+    pip_install_with_retry pip3 install --break-system-packages --no-deps \
+        "${NIGHTLY_WHEEL}" "${NIGHTLY_CUBIN_WHEEL}"
+fi
 cd ${WORKSPACE}
 export PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cu${CUINDEX}"
 TOKENSPEED_KERNEL_BACKEND=cuda FLASHINFER_CUDA_ARCH_LIST="${FI_ARCH}" \
@@ -150,12 +168,7 @@ pip_install_with_retry pip3 install tokenspeed-kernel/python/ --no-build-isolati
 # ============================================================
 echo "=== Step 5: Install TokenSpeed Scheduler ==="
 pip_install_with_retry pip3 install cmake ninja
-# Set TOKENSPEED_FLAT_KV=ON in a CI task env to build the scheduler with Flat KV.
-SCHEDULER_PIP_ARGS=()
-if [ "${TOKENSPEED_FLAT_KV:-OFF}" = "ON" ]; then
-    SCHEDULER_PIP_ARGS+=(--config-settings=cmake.define.TOKENSPEED_FLAT_KVCACHE=ON)
-fi
-pip_install_with_retry pip3 install tokenspeed-scheduler/ "${SCHEDULER_PIP_ARGS[@]}"
+pip_install_with_retry pip3 install tokenspeed-scheduler/
 
 # ============================================================
 # Step 6: Install TokenSpeed
@@ -209,7 +222,16 @@ fi
 FLASHINFER_PYTHON_SPEC="$(pin_version flashinfer-python)"
 if [ -n "${FLASHINFER_PYTHON_SPEC}" ]; then
     FLASHINFER_VERSION="${FLASHINFER_PYTHON_SPEC##*==}"
-    FLASHINFER_CUBIN_WHEEL_URL="https://github.com/flashinfer-ai/flashinfer/releases/download/v${FLASHINFER_VERSION}/flashinfer_cubin-${FLASHINFER_VERSION}-py3-none-any.whl"
+    # Nightlies version as X.Y.Z.devYYYYMMDD but tag as nightly-vX.Y.Z-YYYYMMDD,
+    # and never reach PyPI, so their python wheel also comes from the release.
+    FLASHINFER_RELEASE_BASE="https://github.com/flashinfer-ai/flashinfer/releases/download"
+    if [[ "${FLASHINFER_VERSION}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.dev([0-9]{8})$ ]]; then
+        FLASHINFER_RELEASE_TAG="nightly-v${BASH_REMATCH[1]}-${BASH_REMATCH[2]}"
+        FLASHINFER_PYTHON_SPEC="$(cache_remote_wheel "${FLASHINFER_RELEASE_BASE}/${FLASHINFER_RELEASE_TAG}/flashinfer_python-${FLASHINFER_VERSION}-py3-none-any.whl")"
+    else
+        FLASHINFER_RELEASE_TAG="v${FLASHINFER_VERSION}"
+    fi
+    FLASHINFER_CUBIN_WHEEL_URL="${FLASHINFER_RELEASE_BASE}/${FLASHINFER_RELEASE_TAG}/flashinfer_cubin-${FLASHINFER_VERSION}-py3-none-any.whl"
     FLASHINFER_CUBIN_WHEEL_SOURCE="$(cache_remote_wheel "${FLASHINFER_CUBIN_WHEEL_URL}")"
     echo "Force-reinstalling pinned FlashInfer Python: ${FLASHINFER_PYTHON_SPEC}"
     pip_install_with_retry pip3 install --break-system-packages \

@@ -55,13 +55,12 @@ from tokenspeed.cli.serve_smg import (
     _gateway_args_with_default_reasoning_parser,
     _gateway_args_with_defaults,
     _gateway_args_with_smg_disable_defaults,
+    _get_from_args,
     _is_deepseek_v4_model,
     _is_inkling_model,
     _is_kimi_k3_model,
     _prewarm_hf_tokenizer,
     _set_default_grpc_max_message_bytes,
-    _user_host_port_from_gateway_args,
-    _user_model_id,
     run_smg,
 )
 
@@ -99,14 +98,14 @@ def test_gateway_args_default_port_is_8000():
     gateway_args = _gateway_args_with_default_port(["--model", "/tmp/x"])
 
     assert gateway_args == ["--model", "/tmp/x", "--port", "8000"]
-    assert _user_host_port_from_gateway_args(gateway_args) == ("0.0.0.0", 8000)
+    assert _get_from_args(gateway_args, "--port") == "8000"
 
 
 def test_gateway_args_preserve_user_port():
     gateway_args = _gateway_args_with_default_port(["--port", "8413"])
 
     assert gateway_args == ["--port", "8413"]
-    assert _user_host_port_from_gateway_args(gateway_args) == ("0.0.0.0", 8413)
+    assert _get_from_args(gateway_args, "--port") == "8413"
 
 
 def test_gateway_args_default_reasoning_parser_is_passthrough():
@@ -244,19 +243,26 @@ def test_smg_disable_flag_set_covers_both():
     )
 
 
-def test_user_model_id_extracts_value():
+def test_get_from_args_extracts_value():
     assert (
-        _user_model_id(["--model", "nvidia/Qwen3.5-397B-A17B-NVFP4", "--port", "8000"])
+        _get_from_args(
+            ["--model", "nvidia/Qwen3.5-397B-A17B-NVFP4", "--port", "8000"], "--model"
+        )
         == "nvidia/Qwen3.5-397B-A17B-NVFP4"
     )
 
 
-def test_user_model_id_returns_none_when_absent():
-    assert _user_model_id(["--port", "8000"]) is None
+def test_get_from_args_returns_none_when_absent():
+    assert _get_from_args(["--port", "8000"], "--model") is None
 
 
-def test_user_model_id_returns_none_when_model_lacks_value():
-    assert _user_model_id(["--model"]) is None
+def test_get_from_args_returns_none_when_flag_lacks_value():
+    assert _get_from_args(["--model"], "--model") is None
+
+
+def test_get_from_args_takes_the_last_occurrence():
+    """Last-wins matches argparse, so appending a flag overrides an earlier one."""
+    assert _get_from_args(["--port", "8000", "--port", "8413"], "--port") == "8413"
 
 
 def test_deepseek_v4_model_id_gets_default_parsers():

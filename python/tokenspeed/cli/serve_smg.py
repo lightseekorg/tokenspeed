@@ -19,7 +19,16 @@
 # SOFTWARE.
 
 """``ts serve`` orchestrator: spawn smg gateway + gRPC engine, tag logs, probe
-readiness, and tear down gateway-first on shutdown."""
+readiness, and tear down gateway-first on shutdown.
+
+``ts serve`` is the full serving command; today its internals are the smg
+gateway plus the gRPC engine servicer. ``ts serve --headless`` is engine-only:
+nothing else is spawned here — an external frontend such as ``smg serve
+--backend tokenspeed --connection-mode zmq`` binds the msgpack ZMQ sockets and
+this engine dials in at ``tcp://{--data-parallel-address}:
+{--data-parallel-rpc-port}`` (default ``tcp://127.0.0.1:30500``). Headless
+mode implies ``--zmq-msgpack`` + ``--skip-tokenizer-init`` (see
+``launch_scheduler_headless``)."""
 
 from __future__ import annotations
 
@@ -34,16 +43,18 @@ from pathlib import Path
 
 from tokenspeed_kernel.platform import current_platform
 
-from tokenspeed.cli._argsplit import OrchestratorOpts, split_argv
+from tokenspeed.cli._argsplit import OrchestratorOpts, split_argv, split_headless_argv
 from tokenspeed.cli._logo import print_logo
 from tokenspeed.cli._logprefix import ENGINE_TAG, GATEWAY_TAG, tag_stream
 from tokenspeed.cli._proc import (
+    engine_argv,
     spawn_engine,
     spawn_gateway,
     terminate_then_kill,
     wait_grpc_serving,
     wait_http_ready,
 )
+from tokenspeed.runtime.utils.launcher import detect_topology
 from tokenspeed.runtime.utils.network import get_free_port
 from tokenspeed.runtime.utils.process import kill_process_tree
 
@@ -110,22 +121,31 @@ def _check_serve_extra_installed() -> None:
         sys.exit(1)
 
 
-def _user_host_port_from_gateway_args(gateway_args: list[str]) -> tuple[str, int]:
-    """Pull --host / --port out of the gateway-bound argv.
+def _get_from_args(
+    args: list[str], flag: str, default: str | None = None
+) -> str | None:
+    """Return the value following ``flag`` in a split argv.
 
-    Defaults match TokenSpeed's public serving endpoint. The argv MUST
-    be in canonical ``[--flag, value, ...]`` form as produced by
+    The argv MUST be in canonical ``[--flag, value, ...]`` form as produced by
     ``split_argv``; equals-form (``--port=8000``) is not handled here.
+
+    Args:
+        args: Engine- or gateway-side argv.
+        flag: Long-form flag to look up, including the leading dashes.
+        default: Returned when the flag is absent or is the final token.
+
+    Returns:
+        The value following the last occurrence of ``flag``, else ``default``.
+        Last-wins matches argparse, so a wrapper can append a flag to override
+        one already in the argv.
     """
-    host = DEFAULT_GATEWAY_HOST
-    port = DEFAULT_GATEWAY_PORT
-    it = iter(gateway_args)
-    for token in it:
-        if token == "--host":
-            host = next(it)
-        elif token == "--port":
-            port = int(next(it))
-    return host, port
+    try:
+        index = len(args) - 1 - args[::-1].index(flag)
+    except ValueError:
+        return default
+    if index + 1 >= len(args):
+        return default
+    return args[index + 1]
 
 
 def _gateway_args_with_default_port(gateway_args: list[str]) -> list[str]:
@@ -230,17 +250,6 @@ def _gateway_args_with_default_prometheus_port(gateway_args: list[str]) -> list[
     return [*gateway_args, "--prometheus-port", str(get_free_port())]
 
 
-def _user_model_id(gateway_args: list[str]) -> str | None:
-    """Return the value of ``--model`` from a split gateway argv, or ``None``."""
-    try:
-        idx = gateway_args.index("--model")
-    except ValueError:
-        return None
-    if idx + 1 >= len(gateway_args):
-        return None
-    return gateway_args[idx + 1]
-
-
 def _load_model_config(model_id: str | None) -> dict:
     """Best-effort read of ``<model_id>/config.json`` (empty dict on any miss)."""
     if not model_id:
@@ -325,7 +334,9 @@ def _args_with_default_model_parsers(
     reasoning_content after generation, while the engine uses the same parser
     name to defer json_schema grammars past the reasoning channel.
     """
-    model_id = _user_model_id(gateway_args) or _user_model_id(engine_args)
+    model_id = _get_from_args(gateway_args, "--model") or _get_from_args(
+        engine_args, "--model"
+    )
     engine_result = list(engine_args)
     gateway_result = list(gateway_args)
 
@@ -436,10 +447,9 @@ def _add_rl_control_port(engine_args: list[str]) -> tuple[list[str], str]:
     is present in the engine argv (allocating a free port if the user did not pin
     one) and return the matching ``rl_control_url``.
     """
-    if "--rl-control-port" in engine_args:
-        idx = engine_args.index("--rl-control-port")
-        port = int(engine_args[idx + 1])
-        return engine_args, f"http://127.0.0.1:{port}"
+    pinned = _get_from_args(engine_args, "--rl-control-port")
+    if pinned is not None:
+        return engine_args, f"http://127.0.0.1:{int(pinned)}"
     port = get_free_port()
     return [*engine_args, "--rl-control-port", str(port)], (f"http://127.0.0.1:{port}")
 
@@ -682,8 +692,35 @@ async def run_smg(
                     pass
 
 
+def _run_headless(argv: list[str]) -> None:
+    """``ts serve --headless``: run the scheduler-only launcher in-process.
+
+    No gateway, gRPC servicer, or control server: the external frontend owns
+    the HTTP surface, binds the ZMQ sockets, and does the (de)tokenization.
+    Reuses the ``python -m tokenspeed.runtime.entrypoints.engine``
+    implementation; ``argv`` is a plain ServerArgs argv.
+    """
+    try:
+        import setproctitle
+
+        setproctitle.setproctitle("ts-serve-headless")
+    except ImportError:
+        pass
+
+    from tokenspeed.runtime.entrypoints.engine import run_scheduler_headless_from_cli
+
+    run_scheduler_headless_from_cli(argv)
+
+
 def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
     """Entry point called from cli/__main__.py for ``ts serve``."""
+    headless_argv = split_headless_argv(raw_argv)
+    if headless_argv is not None:
+        # Engine-only: skip the orchestrator entirely, including its
+        # gRPC-specific env defaults and bundled-gateway install check.
+        _run_headless(headless_argv)
+        return
+
     _set_default_grpc_max_message_bytes()
 
     try:
@@ -701,18 +738,35 @@ def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
         split.engine, split.gateway
     )
     gateway_args = _gateway_args_with_defaults(gateway_args)
-    user_host, user_port = _user_host_port_from_gateway_args(gateway_args)
+    user_host = _get_from_args(gateway_args, "--host", DEFAULT_GATEWAY_HOST)
+    user_port = int(_get_from_args(gateway_args, "--port", str(DEFAULT_GATEWAY_PORT)))
 
-    model_id = _user_model_id(gateway_args)
-    if model_id is not None:
-        _prewarm_hf_tokenizer(model_id)
-    rc = asyncio.run(
-        run_smg(
-            engine_args=engine_args,
-            gateway_args=gateway_args,
-            opts=split.opts,
-            user_host=user_host,
-            user_port=user_port,
+    node_rank = _get_from_args(engine_args, "--node-rank")
+    if node_rank is None:
+        topology = detect_topology()
+        node_rank = 0 if topology is None else topology.node_rank
+    else:
+        node_rank = int(node_rank)
+
+    if node_rank == 0:
+        model_id = _get_from_args(gateway_args, "--model")
+        if model_id is not None:
+            _prewarm_hf_tokenizer(model_id)
+        rc = asyncio.run(
+            run_smg(
+                engine_args=engine_args,
+                gateway_args=gateway_args,
+                opts=split.opts,
+                user_host=user_host,
+                user_port=user_port,
+            )
         )
-    )
-    sys.exit(rc)
+        sys.exit(rc)
+    else:
+        # Non-zero-rank nodes never create a gRPC servicer, so they run the
+        # engine directly, skipping the gateway.
+        argv = engine_argv(engine_args, host=user_host, port=user_port)
+        logger.info(f"follower node: exec {' '.join(argv)}")
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.execv(argv[0], argv)

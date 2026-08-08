@@ -31,12 +31,19 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.attention import attn_merge_state
-from tokenspeed_kernel.ops.attention.tokenspeed_mla import mla_kv_pack_quantize_fp8
+from tokenspeed_kernel.ops.attention import (
+    attn_merge_state,
+    mla_project_value,
+)
+from tokenspeed_kernel.ops.attention.tokenspeed_mla import (
+    mla_kv_pack_quantize_fp8,
+    mla_prefill_pdl_enabled,
+)
 from tokenspeed_kernel.ops.attention.triton.mla_query_assemble import (
     mla_nope_query_fp8,
 )
 from tokenspeed_kernel.ops.embedding import apply_rope_mla
+from tokenspeed_kernel.ops.gemm import bmm
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.gemm.cute_dsl import (
     nvfp4_gemm_swiglu_nvfp4_quant,
@@ -115,7 +122,11 @@ from tokenspeed.runtime.moe.distribution_recorder import (
     get_global_expert_distribution_recorder,
 )
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
-from tokenspeed.runtime.utils import LazyValue, add_prefix, get_colorful_logger
+from tokenspeed.runtime.utils import (
+    LazyValue,
+    add_prefix,
+    get_colorful_logger,
+)
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import envs, global_server_args_dict
 from tokenspeed.runtime.utils.pdl import pdl_enabled
@@ -695,6 +706,8 @@ class DeepseekV3AttentionMLA(nn.Module):
         latent_cache: torch.Tensor,
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
+        output_gate: torch.Tensor | None = None,
+        absorbed_query: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The eager break: KV write + varlen prefill / absorb decode attention.
 
@@ -731,14 +744,27 @@ class DeepseekV3AttentionMLA(nn.Module):
                 input_num_tokens=num_prefill_tokens,
                 forward_mode=ForwardMode.EXTEND,
             )
-            self.forward_normal_chunked(
-                positions[:num_prefill_tokens],
-                q[:num_prefill_tokens],
-                latent_cache[:num_prefill_tokens],
-                prefill_ctx,
-                out_cache_loc[:num_prefill_tokens],
-                attn_output[:num_prefill_tokens],
-            )
+            # Use absorbed attention for cached-prefix extend when supported by
+            # the backend and profitable for this query shape; otherwise use
+            # normal chunked prefill.
+            if getattr(cmeta, "use_absorbed_cached_extend", False):
+                self.forward_absorb(
+                    positions[:num_prefill_tokens],
+                    q[:num_prefill_tokens],
+                    latent_cache[:num_prefill_tokens],
+                    prefill_ctx,
+                    out_cache_loc[:num_prefill_tokens],
+                    attn_output[:num_prefill_tokens],
+                )
+            else:
+                self.forward_normal_chunked(
+                    positions[:num_prefill_tokens],
+                    q[:num_prefill_tokens],
+                    latent_cache[:num_prefill_tokens],
+                    prefill_ctx,
+                    out_cache_loc[:num_prefill_tokens],
+                    attn_output[:num_prefill_tokens],
+                )
 
         if num_decode_tokens > 0:
             decode_ctx = replace(
@@ -755,6 +781,16 @@ class DeepseekV3AttentionMLA(nn.Module):
                 decode_ctx,
                 out_cache_loc[num_prefill_tokens:real_total],
                 attn_output[num_prefill_tokens:real_total],
+                output_gate=(
+                    None
+                    if output_gate is None
+                    else output_gate[num_prefill_tokens:real_total]
+                ),
+                absorbed_query=(
+                    None
+                    if absorbed_query is None
+                    else absorbed_query[num_prefill_tokens:real_total]
+                ),
             )
 
         return attn_output
@@ -767,6 +803,8 @@ class DeepseekV3AttentionMLA(nn.Module):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
         output: torch.Tensor,
+        output_gate: torch.Tensor | None = None,
+        absorbed_query: torch.Tensor | None = None,
     ) -> torch.Tensor:
         Q, K = self.forward_absorb_qkv_proj(
             q,
@@ -774,8 +812,16 @@ class DeepseekV3AttentionMLA(nn.Module):
             positions,
             ctx,
             out_cache_loc,
+            absorbed_query=absorbed_query,
         )
-        return self.forward_absorb_attn_v_proj(Q, K, ctx, out_cache_loc, output)
+        return self.forward_absorb_attn_v_proj(
+            Q,
+            K,
+            ctx,
+            out_cache_loc,
+            output,
+            output_gate=output_gate,
+        )
 
     def forward_absorb_qkv_proj(
         self,
@@ -784,38 +830,39 @@ class DeepseekV3AttentionMLA(nn.Module):
         positions,
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
+        absorbed_query: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Model-owned KV writes route their locations through the backend:
         # identity on the legacy path (base AttentionBackend hook), the
-        # group-derived locations on the FlatKV path.
+        # group-derived locations on the Paged cache path.
         out_cache_loc = ctx.attn_backend.select_out_cache_loc(
             self.attn_mqa, out_cache_loc, ctx.forward_mode
         )
-        q = q.view(-1, self.num_local_heads, self.qk_head_dim)
-        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-
-        Q = torch.empty(
-            q_nope.size(0),
-            self.num_local_heads,
-            self.kv_lora_rank + self.qk_rope_head_dim,
-            dtype=q_nope.dtype,
-            device=q_nope.device,
-        )
+        if absorbed_query is None:
+            q = q.view(-1, self.num_local_heads, self.qk_head_dim)
+            q_nope, q_pe = q.split(
+                [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+            )
+            Q = torch.empty(
+                q_nope.size(0),
+                self.num_local_heads,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+                dtype=q_nope.dtype,
+                device=q_nope.device,
+            )
+            query_pe_written = False
+        else:
+            q_nope = q
+            Q = absorbed_query
+            q_pe = Q[..., self.kv_lora_rank :]
+            query_pe_written = True
         # latent_cache contains normalized kv_a and k_pe before rotate.
         K = latent_cache.unsqueeze(1)
-        q_nope_out_view = Q[..., : self.kv_lora_rank]
-        if _is_amd:
-            q_nope_projected = torch.bmm(
-                q_nope.transpose(0, 1).contiguous(),
-                self.w_kc.contiguous(),
-            )
-            q_nope_out_view.copy_(q_nope_projected.transpose(0, 1))
-        else:
-            torch.bmm(
-                q_nope.transpose(0, 1),
-                self.w_kc,
-                out=q_nope_out_view.transpose(0, 1),
-            )
+        bmm(
+            q_nope.transpose(0, 1),
+            self.w_kc.transpose(1, 2),
+            out=Q[..., : self.kv_lora_rank].transpose(0, 1),
+        )
         # Model-owned fused FP8 decode: RoPE + quantize + KV cache write
         # all done here, so backend only needs to do attention.
         k_scale = getattr(self.attn_mqa, "k_scale_float", 1.0)
@@ -899,7 +946,8 @@ class DeepseekV3AttentionMLA(nn.Module):
             # NoPE + fp8: assemble the query straight into fp8; the KV write casts the bf16 latents in-kernel.
             Q = mla_nope_query_fp8(Q[..., : self.kv_lora_rank], q_pe)
         else:
-            Q[..., self.kv_lora_rank :] = q_pe
+            if not query_pe_written:
+                Q[..., self.kv_lora_rank :] = q_pe
 
         # For MLA kernel backends, write KV cache here (model-owned) so the
         # backend never has to. This unifies the FP8 fused path (written above)
@@ -922,6 +970,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         out_cache_loc: torch.Tensor,
         output: torch.Tensor,
         record_kv_cache: bool | None = None,
+        output_gate: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # MLA kernel backends: KV cache already written in forward_absorb_qkv_proj.
         # Other backends write KV in the attention backend.
@@ -934,6 +983,11 @@ class DeepseekV3AttentionMLA(nn.Module):
             k_for_attn = K
             v_for_attn = K[..., : self.kv_lora_rank]
 
+        use_projected_value_decode = (
+            output_gate is not None
+            and ctx.num_extends == 0
+            and ctx.attn_backend.supports_mla_projected_value_decode
+        )
         attn_output = self.attn_mqa(
             Q,
             k_for_attn,
@@ -942,22 +996,19 @@ class DeepseekV3AttentionMLA(nn.Module):
             out_cache_loc,
             save_kv_cache=need_save_kv,
             record_kv_cache=record_kv_cache,
+            value_weight=self.w_vc if use_projected_value_decode else None,
+            output_gate=output_gate if use_projected_value_decode else None,
+            projected_output=output if use_projected_value_decode else None,
         )
+        if use_projected_value_decode:
+            return attn_output
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
-        if _is_amd:
-            projected = torch.bmm(
-                attn_output.transpose(0, 1).contiguous(),
-                self.w_vc.contiguous(),
-            )
-            output.copy_(projected.transpose(0, 1).reshape_as(output))
-        else:
-            output_view = output.view(-1, self.num_local_heads, self.v_head_dim)
-            torch.bmm(
-                attn_output.transpose(0, 1),
-                self.w_vc,
-                out=output_view.transpose(0, 1),
-            )
-        return output
+        return mla_project_value(
+            attn_output,
+            self.w_vc.contiguous() if _is_amd else self.w_vc,
+            gate=output_gate,
+            out=output,
+        )
 
     def forward_normal_chunked(
         self,
@@ -986,7 +1037,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         out_cache_loc: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # See forward_absorb_qkv_proj: backend-selected write locations
-        # (identity off the FlatKV path).
+        # (identity off the Paged cache path).
         out_cache_loc = ctx.attn_backend.select_out_cache_loc(
             self.attn_mha, out_cache_loc, ctx.forward_mode
         )
@@ -1006,36 +1057,48 @@ class DeepseekV3AttentionMLA(nn.Module):
 
         # FP8 prefill: fused RoPE + FP8 quantize, direct FP8 KV cache write.
         # Disabled when k_scale != 1.0; mla_fp8_utils.py documents the current limitation.
+        # NoPE models (rotary_emb is None, e.g. Kimi-K3) quantize standalone:
+        # the quantize is otherwise fused into the RoPE kernel, and leaving
+        # them on the BF16 kernel meant a JIT compile of a variant the backend
+        # never pre-warms.
         k_scale = getattr(self.attn_mha, "k_scale_float", 1.0)
         use_fp8_prefill = (
             self.attention_backend in self._MLA_KERNEL_BACKENDS
             and getattr(ctx.attn_backend, "data_type", None) == torch.float8_e4m3fn
-            and self.rotary_emb is not None
             and k_scale == 1.0
         )
 
         if use_fp8_prefill:
-            # Expand k_pe from [tokens,1,rope] to [tokens,heads,rope] for GQA
-            k_pe_expanded = k_pe.expand(-1, self.num_local_heads, -1)
+
+            if self.rotary_emb is not None:
+                k_rope = k_pe.expand(-1, self.num_local_heads, -1)
+                cos_sin_cache = self.rotary_emb.cos_sin_cache
+                is_neox = self.rotary_emb.is_neox_style
+            else:
+                k_rope = k_pe
+                cos_sin_cache = None
+                is_neox = False
 
             q_fp8, k_fp8 = apply_rope_mla(
                 positions=positions,
                 q_rope=q_pe,
-                k_rope=k_pe_expanded,
+                k_rope=k_rope,
                 q_nope=q_nope,
                 k_nope=k_nope,
-                cos_sin_cache=self.rotary_emb.cos_sin_cache,
-                is_neox=getattr(self.rotary_emb, "is_neox_style", True),
+                cos_sin_cache=cos_sin_cache,
+                is_neox=is_neox,
                 quant_scale_q=1.0,
                 quant_scale_kv=k_scale,
-                enable_pdl=pdl_enabled(),
+                enable_pdl=mla_prefill_pdl_enabled(pdl_enabled()),
             )
 
-            v_fp8 = fp8_quantize(v, enable_pdl=pdl_enabled())
+            v_fp8 = fp8_quantize(v, enable_pdl=mla_prefill_pdl_enabled(pdl_enabled()))
 
             # Write FP8 KV cache directly (skip BF16→FP8 conversion in pool)
             k_pe_for_cache = k_fp8[:, 0:1, self.qk_nope_head_dim :]
-            kv_a_fp8 = fp8_quantize(kv_a, enable_pdl=pdl_enabled())
+            kv_a_fp8 = fp8_quantize(
+                kv_a, enable_pdl=mla_prefill_pdl_enabled(pdl_enabled())
+            )
             ctx.token_to_kv_pool.set_mla_kv_buffer(
                 self.attn_mha,
                 out_cache_loc,
@@ -1133,7 +1196,11 @@ class DeepseekV3AttentionMLA(nn.Module):
             if q.dtype == torch.float8_e4m3fn:
                 # FP8 Attention
                 k, v = mla_kv_pack_quantize_fp8(
-                    k_nope, k_pe, v, k_scale_inv=1.0 / k_scale, enable_pdl=pdl_enabled()
+                    k_nope,
+                    k_pe,
+                    v,
+                    k_scale_inv=1.0 / k_scale,
+                    enable_pdl=mla_prefill_pdl_enabled(pdl_enabled()),
                 )
             else:
                 # BF16 Attention
@@ -1162,7 +1229,7 @@ class DeepseekV3AttentionMLA(nn.Module):
                 chunk_output,
                 lse,
                 inplace=True,
-                enable_pdl=pdl_enabled(),
+                enable_pdl=mla_prefill_pdl_enabled(pdl_enabled()),
             )
 
         return output
@@ -1185,9 +1252,17 @@ class DeepseekV3DraftAttentionMLA(DeepseekV3AttentionMLA):
         latent_cache: torch.Tensor,
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
+        absorbed_query: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if ctx.accept_lengths is None:
-            return super()._attn(positions, q, latent_cache, ctx, out_cache_loc)
+            return super()._attn(
+                positions,
+                q,
+                latent_cache,
+                ctx,
+                out_cache_loc,
+                absorbed_query=absorbed_query,
+            )
 
         self._apply_correction(ctx)
 
@@ -1201,6 +1276,7 @@ class DeepseekV3DraftAttentionMLA(DeepseekV3AttentionMLA):
             positions,
             decode_ctx,
             out_cache_loc,
+            absorbed_query=absorbed_query,
         )
         Q = Q.index_select(0, ctx.gather_ids)
         attn_output = q.new_empty(ctx.bs, self.num_local_heads * self.v_head_dim)
@@ -1835,6 +1911,27 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
 # ---------------------------------------------------------------------------
 
 
+def _draft_rope_scaling(rope_scaling: dict | None) -> dict | None:
+    """Keep only yarn-style rope_scaling for the EAGLE3 MLA draft layer.
+
+    The layer implements plain rope and (deepseek-)yarn. transformers may
+    normalize plain rope into a factor-less ``{"rope_type": "default"}``
+    dict; anything else unsupported is dropped with a warning.
+    """
+    if not rope_scaling:
+        return None
+    if rope_scaling.get("rope_type", rope_scaling.get("type")) in (
+        "yarn",
+        "deepseek_yarn",
+    ):
+        return rope_scaling
+    if "factor" in rope_scaling:
+        logger.warning(
+            "EAGLE3 MLA draft ignores unsupported rope_scaling %s", rope_scaling
+        )
+    return None
+
+
 class Eagle3MlaDecoderLayer(nn.Module):
     """Single decoder layer for Eagle3 MLA draft model.
 
@@ -1856,7 +1953,7 @@ class Eagle3MlaDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.layer_id = layer_id
         rope_theta = get_rope_theta(config)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_scaling = _draft_rope_scaling(getattr(config, "rope_scaling", None))
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
 
         self.self_attn = DeepseekV3DraftAttentionMLA(
@@ -2157,6 +2254,7 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
         )
 
         self.load_lm_head_from_target = False
+        self._embed_loaded_from_checkpoint = False
         if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
@@ -2226,6 +2324,8 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
                 continue
             if "t2d" in name:
                 continue
+            if "embed_tokens" in name:
+                self._embed_loaded_from_checkpoint = True
 
             new_name = re.sub(r"^layers\.0\.", "midlayer.", name)
 
@@ -2273,8 +2373,22 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
             and self.config.target_hidden_size != self.config.hidden_size
         ):
             return
-        del self.model.embed_tokens.weight
-        self.model.embed_tokens.weight = embed
+        if self.model.embed_tokens.weight.shape == embed.shape:
+            # A TP-sharded target embedding would read out of bounds here.
+            del self.model.embed_tokens.weight
+            self.model.embed_tokens.weight = embed
+        elif not self._embed_loaded_from_checkpoint:
+            raise ValueError(
+                "EAGLE3 draft cannot share the target embedding "
+                f"(target {tuple(embed.shape)} vs draft "
+                f"{tuple(self.model.embed_tokens.weight.shape)}) and the draft "
+                "checkpoint provided no embed_tokens weight"
+            )
+        else:
+            logger.info(
+                "EAGLE3 draft keeps its own embedding; target shape %s differs",
+                tuple(embed.shape),
+            )
         if head is not None and self.load_lm_head_from_target:
             del self.lm_head.weight
             self.lm_head.weight = head

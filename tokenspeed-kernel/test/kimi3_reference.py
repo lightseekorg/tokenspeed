@@ -1,23 +1,9 @@
-"""Torch references shared by the Kimi K3 MXFP4 latent-MoE tests."""
+"""Torch references shared by the Kimi K3 MXFP4 tests."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
-
 import torch
 import torch.nn.functional as F
-
-
-def rms_norm(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float = 1e-5,
-) -> torch.Tensor:
-    """Kimi RMSNorm with FP32 variance accumulation."""
-
-    x_fp32 = x.float()
-    normalized = x_fp32 * torch.rsqrt(x_fp32.square().mean(dim=-1, keepdim=True) + eps)
-    return (normalized * weight.float()).to(x.dtype)
 
 
 def situ_and_mul(
@@ -77,9 +63,11 @@ def kda_recurrent(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Sequential KDA oracle for both prefill and decode."""
 
-    if q.shape != k.shape or q.shape != v.shape or q.shape != raw_g.shape:
-        raise ValueError("q, k, v, and raw_g must have matching shapes")
+    if q.shape != k.shape or q.shape != raw_g.shape:
+        raise ValueError("q, k, and raw_g must have matching shapes")
     tokens, heads, key_dim = q.shape
+    if v.shape[:2] != (tokens, heads):
+        raise ValueError("v must have the same token and head dimensions as q")
     value_dim = v.shape[-1]
     if state.shape != (heads, value_dim, key_dim):
         raise ValueError("invalid KDA state shape")
@@ -194,69 +182,3 @@ def a16w4_mxfp4_moe_reference(
         route_weights = topk_weights[token_ids, slot_ids].float().unsqueeze(-1)
         combined.index_add_(0, token_ids, output.float() * route_weights)
     return combined.to(hidden_states.dtype)
-
-
-def mxfp4_situ_latent_moe_reference(
-    hidden_states: torch.Tensor,
-    router_weight: torch.Tensor,
-    correction_bias: torch.Tensor,
-    down_proj_weight: torch.Tensor,
-    up_proj_weight: torch.Tensor,
-    w13_packed: torch.Tensor,
-    w13_scales: torch.Tensor,
-    w2_packed: torch.Tensor,
-    w2_scales: torch.Tensor,
-    *,
-    top_k: int,
-    num_expert_group: int,
-    topk_group: int,
-    scoring_func: str = "sigmoid",
-    renormalize: bool = True,
-    routed_scaling_factor: float = 1.0,
-    situ_beta: float = 1.0,
-    situ_linear_beta: float | None = None,
-    rms_norm_weight: torch.Tensor | None = None,
-    rms_norm_eps: float = 1e-6,
-    reduce_latent: Callable[[torch.Tensor], torch.Tensor] | None = None,
-    shared_expert: Callable[[torch.Tensor], torch.Tensor] | None = None,
-    reduce_shared: Callable[[torch.Tensor], torch.Tensor] | None = None,
-) -> torch.Tensor:
-    """K3 H-wide routing around packed latent routed experts."""
-
-    if (num_expert_group, topk_group, scoring_func) != (1, 1, "sigmoid"):
-        raise ValueError("the K3 reference expects one sigmoid routing group")
-    logits = F.linear(hidden_states.float(), router_weight.float())
-    scores = torch.sigmoid(logits)
-    selected = scores + correction_bias.float()
-    topk_ids = selected.topk(top_k, dim=-1, sorted=False).indices
-    topk_weights = scores.gather(1, topk_ids)
-    if top_k > 1 and renormalize:
-        topk_weights /= topk_weights.sum(-1, keepdim=True) + 1e-20
-    topk_weights *= routed_scaling_factor
-
-    routed_input = F.linear(hidden_states.float(), down_proj_weight.float()).to(
-        hidden_states.dtype
-    )
-    routed = a16w4_mxfp4_moe_reference(
-        routed_input,
-        w13_packed,
-        w13_scales,
-        w2_packed,
-        w2_scales,
-        topk_ids,
-        topk_weights,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
-    )
-    if reduce_latent is not None:
-        routed = reduce_latent(routed)
-    if rms_norm_weight is not None:
-        routed = rms_norm(routed, rms_norm_weight, eps=rms_norm_eps)
-    routed = F.linear(routed.float(), up_proj_weight.float()).to(hidden_states.dtype)
-
-    if shared_expert is None:
-        return routed
-    shared = shared_expert(hidden_states)
-    if reduce_shared is not None:
-        shared = reduce_shared(shared)
-    return routed + shared

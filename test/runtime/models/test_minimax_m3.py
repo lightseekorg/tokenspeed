@@ -182,6 +182,7 @@ def _msa_server_args(**overrides) -> SimpleNamespace:
         kv_cache_dtype="fp8_e4m3",
         kv_cache_quant_method="none",
         speculative_algorithm=None,
+        spec_context_pad=0,
         attention_backend="trtllm",
         drafter_attention_backend=None,
         block_size=128,
@@ -214,6 +215,9 @@ def test_msa_config_kv_cache_dtype_guards() -> None:
         )
 
 
+@pytest.mark.skipif(
+    torch.version.hip is not None, reason="FP8 MoE backends are NVIDIA-only"
+)
 def test_minimax_m3_tp4_meta_layout_and_loader(monkeypatch: pytest.MonkeyPatch) -> None:
     model = _build_model(monkeypatch, quant_config=_mxfp8_config())
 

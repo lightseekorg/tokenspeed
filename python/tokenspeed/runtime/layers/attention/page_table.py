@@ -64,8 +64,7 @@ def expand_page_table(
     else:
         if out.ndim != 2 or out.shape[0] < rows or out.shape[1] < max_kernel_pages:
             raise ValueError(
-                f"out shape {tuple(out.shape)} cannot hold "
-                f"({rows}, {max_kernel_pages})"
+                f"out shape {tuple(out.shape)} cannot hold ({rows}, {max_kernel_pages})"
             )
         if out.dtype != page_table.dtype or out.device != page_table.device:
             raise ValueError("out must have the same dtype and device as page_table")

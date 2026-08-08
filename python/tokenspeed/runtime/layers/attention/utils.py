@@ -72,46 +72,18 @@ def create_flashinfer_kv_indices_triton(
 
 def build_page_table(
     req_pool_indices: torch.Tensor,
-    req_to_page: torch.Tensor,
+    page_table: torch.Tensor,
     page_size: int,
     max_seq_len_k: int,
 ) -> torch.Tensor:
-    """Build page table from req_to_page.
+    """Build page table from a batch-ordered table.
 
-    req_to_page: [req_pool_size+1, max_pages] containing page IDs.
+    page_table: [bs, max_pages] page IDs, row i == batch position i (the
+    drafter's page table or the idle/warmup placeholder).
     Returns: [bs, max_pages_needed] page table slice.
     """
     max_pages = (max_seq_len_k + page_size - 1) // page_size
-    return req_to_page[req_pool_indices, :max_pages]
-
-
-def update_page_table_inplace(
-    page_table_buf: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-    req_to_page: torch.Tensor,
-    page_size: int,
-    max_seq_len_k: int,
-):
-    """Copy page table from req_to_page into pre-allocated CUDA graph buffer."""
-    max_pages = (max_seq_len_k + page_size - 1) // page_size
-    page_table_buf[:, :max_pages].copy_(req_to_page[req_pool_indices, :max_pages])
-
-
-def token_indices_from_pages(
-    req_pool_indices: torch.Tensor,
-    token_positions: torch.Tensor,
-    req_to_page: torch.Tensor,
-    page_size: int,
-) -> torch.Tensor:
-    """Convert token positions to KV slot indices using req_to_page.
-
-    token_positions: [bs, num_tokens] — token offsets within each request.
-    Returns: [bs, num_tokens] — KV cache slot IDs (page_id * page_size + offset).
-    """
-    page_indices = token_positions // page_size
-    offsets = token_positions % page_size
-    page_ids = req_to_page[req_pool_indices].gather(1, page_indices)
-    return page_ids * page_size + offsets
+    return page_table[: req_pool_indices.shape[0], :max_pages]
 
 
 # --- Page-based memory profiling ---
@@ -140,84 +112,3 @@ def profile_available_cache_memory_bytes(
         1 - gpu_memory_utilization
     )
     return int(cache_memory * (1 << 30))
-
-
-def profile_max_num_pages(
-    attn_config: BaseAttnConfig,
-    gpu_id: int,
-    tp_size: int,
-    gpu_memory_utilization: float,
-    page_size: int,
-    num_attention_layers: int,
-    total_gpu_memory: int,
-    world_group=None,
-    draft_attn_config: BaseAttnConfig | None = None,
-    draft_num_attention_layers: int | None = None,
-    cache_cell_size: int | None = None,
-    draft_cache_cell_size: int | None = None,
-):
-    cache_memory = profile_available_cache_memory_bytes(
-        attn_config,
-        gpu_id,
-        tp_size,
-        gpu_memory_utilization,
-        total_gpu_memory,
-        world_group,
-    )
-    if cache_cell_size is None:
-        cell_size = attn_config.cache_cell_size() * num_attention_layers
-    else:
-        cell_size = cache_cell_size
-    if draft_attn_config is not None:
-        if draft_cache_cell_size is None:
-            cell_size += (
-                draft_attn_config.cache_cell_size() * draft_num_attention_layers
-            )
-        else:
-            cell_size += draft_cache_cell_size
-    if cell_size <= 0:
-        raise ValueError(f"KV cache cell size must be positive, got {cell_size}")
-    max_num_token = cache_memory // cell_size
-    max_num_pages = (max_num_token + page_size - 1) // page_size
-    return max_num_pages
-
-
-def profile_cache_budget(
-    attn_config: BaseAttnConfig,
-    gpu_id: int,
-    tp_size: int,
-    mem_fraction_static: float,
-    page_size: int,
-    num_attention_layers: int,
-    total_gpu_memory: int,
-    mamba_memory_per_chunk: int,
-    mamba_ratio: float,
-    world_group=None,
-    draft_attn_config: BaseAttnConfig | None = None,
-    draft_num_attention_layers: int | None = None,
-) -> tuple[int, int, int]:
-    """Profile GPU memory and split between KV pages and mamba chunks.
-
-    Returns:
-        (kv_max_num_pages, mamba_pool_total_chunks, total_cache_memory_bytes)
-    """
-    total_cache_memory = profile_available_cache_memory_bytes(
-        attn_config,
-        gpu_id,
-        tp_size,
-        mem_fraction_static,
-        total_gpu_memory,
-        world_group,
-    )
-    cell_size = attn_config.cache_cell_size() * num_attention_layers
-    if draft_attn_config is not None:
-        cell_size += draft_attn_config.cache_cell_size() * draft_num_attention_layers
-
-    kv_memory = int(total_cache_memory / (1 + mamba_ratio))
-    mamba_memory = total_cache_memory - kv_memory
-
-    kv_cell_size = cell_size * page_size
-    kv_max_num_pages = int(kv_memory // kv_cell_size)
-    mamba_pool_total_chunks = max(int(mamba_memory // mamba_memory_per_chunk), 2)
-
-    return kv_max_num_pages, mamba_pool_total_chunks, total_cache_memory

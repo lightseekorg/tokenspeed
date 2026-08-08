@@ -31,7 +31,6 @@ from tokenspeed.runtime.layers.attention.configs.base import (
     BaseAttnConfig,
     resolve_dtype,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
@@ -48,8 +47,8 @@ class MSAConfig(BaseAttnConfig):
     layer_types: tuple[str, ...] = ()
     sliding_window_tokens: None = None
     max_scheduled_tokens: int = 0
-    # True iff server_args.disaggregation_mode != "null"; the pool's slab
-    # guards consume it.
+    # True iff server_args.disaggregation_mode != "null"; the pool's
+    # transfer-layout guard consumes it.
     pd_disaggregation_enabled: bool = False
 
     index_head_dim: int = 0
@@ -109,7 +108,7 @@ class MSAConfig(BaseAttnConfig):
         )
         return cls(
             device=server_args.device,
-            context_len=model_config.context_len,
+            context_len=model_config.context_len + server_args.spec_context_pad,
             backend_name="msa",
             full_attn_backend_name=full_attn_backend_name,
             num_attention_heads=model_config.num_attention_heads,
@@ -158,35 +157,3 @@ class MSAConfig(BaseAttnConfig):
                 index_cache_bytes * len(self.sparse_layer_ids) + num_layers - 1
             ) // num_layers
         return kv_cache_bytes + index_cache_bytes
-
-    def create_pool(
-        self,
-        num_layers: int,
-        max_total_num_tokens: int,
-        rank: int,
-        enable_memory_saver: bool,
-    ) -> BaseTokenToKVPool:
-        from tokenspeed.runtime.layers.attention.kv_cache.msa import (
-            MSATokenToKVPool,
-        )
-
-        return MSATokenToKVPool(
-            size=max_total_num_tokens,
-            dtype=self.kv_cache_dtype,
-            head_num=max(self.num_kv_heads // self.attn_tp_size, 1),
-            head_dim=self.head_dim,
-            layer_num=num_layers,
-            device=self.device,
-            enable_memory_saver=enable_memory_saver,
-            max_batch_size=self.max_bs,
-            max_context_len=self.context_len,
-            page_size=self.page_size,
-            rank=rank,
-            index_head_dim=self.index_head_dim,
-            index_dtype=self.dtype,
-            indexed_layer_ids=self.sparse_layer_ids,
-            layer_types=self.layer_types,
-            sliding_window_tokens=self.sliding_window_tokens,
-            max_scheduled_tokens=self.max_scheduled_tokens,
-            pd_disaggregation_enabled=self.pd_disaggregation_enabled,
-        )

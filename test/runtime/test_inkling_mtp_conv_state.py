@@ -18,22 +18,58 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-class TestInklingFlatContract(unittest.TestCase):
+class TestInklingCacheContract(unittest.TestCase):
     def test_wrapper_consumes_history_and_checkpoint_state(self):
         from tokenspeed.runtime.layers.attention.backends.inkling import (
             InklingAttnBackend,
         )
 
         class HistoryBackend:
-            flat_cache_consumer_families = frozenset({"history"})
+            cache_consumer_families = frozenset({"history"})
 
         backend = InklingAttnBackend.__new__(InklingAttnBackend)
         backend.inner = HistoryBackend()
 
         self.assertEqual(
-            backend.flat_cache_consumer_families,
+            backend.cache_consumer_families,
             frozenset({"history", "state"}),
         )
+
+    def test_checkpoint_publication_masks_padded_rows_before_indexing(self):
+        from tokenspeed.runtime.layers.attention.backends.inkling import (
+            InklingAttnBackend,
+            InklingConvMetadata,
+            ShortConvCheckpointMetadata,
+        )
+
+        x = torch.arange(6, dtype=torch.float32).view(3, 2)
+        state = torch.zeros((2, 2, 2), dtype=torch.float32)
+        checkpoint = torch.full((3, 2, 2), -1, dtype=torch.float32)
+        metadata = InklingConvMetadata(
+            query_start_loc=torch.tensor([0, 3, 3], dtype=torch.int32),
+            cache_indices=torch.tensor([1, -1], dtype=torch.int32),
+            has_initial_state=torch.tensor([True, False]),
+            is_decode=False,
+            checkpoints=ShortConvCheckpointMetadata(
+                restore_pages={"state": torch.zeros(2, dtype=torch.int32)},
+                write_pages={"state": torch.tensor([1, 0], dtype=torch.int32)},
+                write_requests=torch.arange(2),
+                packed_rows=torch.tensor([[1, 2], [3, 3]], dtype=torch.int64),
+                prior_state_rows=torch.tensor([[0, 1], [0, 1]], dtype=torch.int64),
+                packed_row_mask=torch.tensor([[True, True], [False, False]]),
+            ),
+        )
+
+        InklingAttnBackend.publish_shortconv_checkpoints(
+            x,
+            state,
+            (checkpoint,),
+            metadata,
+            "state",
+        )
+
+        self.assertTrue(torch.equal(checkpoint[1], x[1:3]))
+        self.assertTrue(torch.equal(checkpoint[0], torch.zeros_like(checkpoint[0])))
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")

@@ -3,9 +3,11 @@ from types import SimpleNamespace
 
 import torch
 
+from tokenspeed.runtime.execution.draft_page_staging import CacheView
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
 from tokenspeed.runtime.execution.drafter.eagle import Eagle, EagleDraftInput
 from tokenspeed.runtime.execution.drafter.mtp import (
+    Mtp,
     _committed_tail_update,
     _extend_depth_precompute,
     _extend_depth_shifted_ids_from,
@@ -26,6 +28,39 @@ def _make_eagle(spec_num_tokens: int = 4, max_bs: int = 8) -> Eagle:
 
 
 class TestDrafterAcceptIndexing(unittest.TestCase):
+    def test_mtp_lookback_stash_uses_request_pool_capacity(self):
+        max_bs = 16
+        request_pool_rows = 18
+        input_buffers = SimpleNamespace(
+            max_bs=max_bs,
+            seq_lens_buf=torch.zeros(max_bs, dtype=torch.int32),
+        )
+        model_runner = SimpleNamespace(
+            device="cpu",
+            mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=1)),
+            model=SimpleNamespace(draft_decode_lookback=True),
+            model_config=SimpleNamespace(hidden_size=8, dtype=torch.float32),
+        )
+        runtime_states = SimpleNamespace(
+            valid_cache_lengths=torch.zeros(request_pool_rows, dtype=torch.int32)
+        )
+        backend = SimpleNamespace(configure_draft_lookback=lambda _: True)
+
+        drafter = Mtp(
+            spec_num_tokens=4,
+            spec_num_steps=3,
+            draft_model_runner=model_runner,
+            cache_view=CacheView(
+                torch.zeros((max_bs, 4), dtype=torch.int32), page_size=128
+            ),
+            attn_backend=backend,
+            runtime_states=runtime_states,
+            input_buffers=input_buffers,
+        )
+
+        self.assertEqual(drafter._lookback_tokens_buf.shape[0], request_pool_rows)
+        self.assertEqual(drafter._lookback_hidden_buf.shape[0], request_pool_rows)
+
     def test_prepare_draft_input_ids_maps_media_then_clamps_to_vocab(self):
         drafter = _make_eagle()
         drafter.vocab_size = 100

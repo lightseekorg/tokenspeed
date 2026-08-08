@@ -23,57 +23,27 @@
 #include <cstdint>
 #include <map>
 #include <string>
-#include <variant>
+#include <utility>
 #include <vector>
 
 #include "scheduler/operations/inc.h"
 
 namespace tokenspeed {
 
-enum class FlatTerminalReason {
-    kPromptExceedsPoolCapacity,
-    kDecodeExceedsPoolCapacity,
-};
-
-struct FlatTerminalError {
-    std::string request_id;
-    FlatTerminalReason reason{FlatTerminalReason::kPromptExceedsPoolCapacity};
-    std::int32_t required_pages{0};
-    std::int32_t capacity_pages{0};
-    std::string message;
-};
-
 class ExecutionPlan {
 public:
     template <typename OperationType>
     ExecutionPlan& With(OperationType operation) {
-        operations_.emplace_back(operation);
-        return *this;
-    }
-
-    template <typename OperationType>
-    ExecutionPlan& With(std::vector<OperationType> ops) {
-        for (auto& op : ops) {
-            operations_.emplace_back(std::move(op));
-        }
+        operations_.emplace_back(std::move(operation));
         return *this;
     }
 
     const std::vector<Operation>& Operations() const { return operations_; }
 
-    // Flat KV-cache: requests terminalized this round as OOM -- the pool was wedged by
-    // unretractable mid-prefill holders (possibly the request itself, or a mutual wedge)
-    // with no Decoding/PrefillDone victim to retract. Always empty on the radix path.
-    std::vector<std::string> flat_oom_request_ids;
-    // Structured companion to flat_oom_request_ids. The legacy ID vector is
-    // retained for runtime compatibility while callers migrate to precise
-    // phase/reason diagnostics.
-    std::vector<FlatTerminalError> flat_terminal_errors;
-
-    // Flat KV-cache child pages newly assigned in this plan. Group identity is
+    // Cache child pages newly assigned in this plan. Group identity is
     // required because one LCM parent can still contain live sibling children.
     // The runtime clears these exact byte ranges before transfers/forward.
-    std::map<std::string, std::vector<std::int32_t>> flat_pages_to_zero;
+    std::map<std::string, std::vector<std::int32_t>> pages_to_zero;
 
 private:
     std::vector<Operation> operations_;

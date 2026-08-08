@@ -19,16 +19,16 @@ import pathlib
 import sys
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
-
-import torch
 
 _CONFIGS_DIR = (
     pathlib.Path(__file__).resolve().parents[2]
     / "python"
     / "tokenspeed"
     / "runtime"
-    / "configs"
+    / "layers"
+    / "attention"
+    / "kv_cache"
+    / "recipes"
 )
 
 
@@ -41,13 +41,32 @@ def _load(mod_name: str, file_name: str):
     return mod
 
 
-_generic = _load("tokenspeed.runtime.configs.paged_cache_spec", "paged_cache_spec.py")
+# Shadow the real module only while the v4 spec module binds its imports,
+# then restore: leaving it would fork PagedCacheGroupSpec into two classes
+# and fail the contract's isinstance check in later test files.
+_orig_generic = sys.modules.get(
+    "tokenspeed.runtime.layers.attention.kv_cache.recipes.spec"
+)
+_generic = _load(
+    "tokenspeed.runtime.layers.attention.kv_cache.recipes.spec",
+    "spec.py",
+)
 _v4 = _load(
     "tokenspeed_runtime_configs_deepseek_v4_cache_spec_smoke",
     "deepseek_v4_cache_spec.py",
 )
+if _orig_generic is not None:
+    sys.modules["tokenspeed.runtime.layers.attention.kv_cache.recipes.spec"] = (
+        _orig_generic
+    )
+else:
+    del sys.modules["tokenspeed.runtime.layers.attention.kv_cache.recipes.spec"]
 
 build_v4_cache_specs = _v4.build_v4_cache_specs
+deepseek_v4_lcm_blocks_needed = _v4.deepseek_v4_lcm_blocks_needed
+deepseek_v4_token_capacity_for_cache_pool = (
+    _v4.deepseek_v4_token_capacity_for_cache_pool
+)
 compute_max_logical_pages_for_capture = _generic.compute_max_logical_pages_for_capture
 compute_paged_cache_group_page_counts = _generic.compute_paged_cache_group_page_counts
 PagedCacheGroupSpec = _generic.PagedCacheGroupSpec
@@ -76,12 +95,12 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                     sliding_window_tokens=3 * raw_per_page + 1,
                 ),
             ]
-            common = dict(
-                max_live_requests=max_live_requests,
-                max_scheduled_tokens=1024,
-                max_total_tokens=4096,
-                max_context_len=4096,
-            )
+            common = {
+                "max_live_requests": max_live_requests,
+                "max_scheduled_tokens": 1024,
+                "max_total_tokens": 4096,
+                "max_context_len": 4096,
+            }
             for verify_width in (1, 2, 4, 8):
                 baseline = compute_paged_cache_group_page_counts(
                     specs,
@@ -216,12 +235,12 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             entry_stride_tokens=1,
             sliding_window_tokens=None,
         )
-        count_args = dict(
-            max_live_requests=1,
-            max_scheduled_tokens=8,
-            max_total_tokens=8,
-            max_context_len=8,
-        )
+        count_args = {
+            "max_live_requests": 1,
+            "max_scheduled_tokens": 8,
+            "max_total_tokens": 8,
+            "max_context_len": 8,
+        }
         for overrides, message in (
             ({"decode_input_tokens": -1}, "decode_input_tokens"),
             ({"overlap_schedule_depth": 2}, "overlap_schedule_depth"),
@@ -230,27 +249,29 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                 "decode_input_tokens",
             ),
         ):
-            with self.subTest(function="page_counts", overrides=overrides):
-                with self.assertRaisesRegex(ValueError, message):
-                    compute_paged_cache_group_page_counts(
-                        [spec], **count_args, **overrides
-                    )
+            with (
+                self.subTest(function="page_counts", overrides=overrides),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                compute_paged_cache_group_page_counts([spec], **count_args, **overrides)
 
         for overrides, message in (
             ({"max_context_len": -1}, "max_context_len"),
             ({"max_tokens_per_req": 0}, "max_tokens_per_req"),
             ({"overlap_schedule_depth": 2}, "overlap_schedule_depth"),
         ):
-            with self.subTest(function="capture_width", overrides=overrides):
-                with self.assertRaisesRegex(ValueError, message):
-                    compute_max_logical_pages_for_capture(
-                        spec,
-                        **{
-                            "max_context_len": 8,
-                            "max_tokens_per_req": 1,
-                            **overrides,
-                        },
-                    )
+            with (
+                self.subTest(function="capture_width", overrides=overrides),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                compute_max_logical_pages_for_capture(
+                    spec,
+                    **{
+                        "max_context_len": 8,
+                        "max_tokens_per_req": 1,
+                        **overrides,
+                    },
+                )
 
         invalid_specs = (
             (
@@ -267,12 +288,14 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             ),
         )
         for invalid_spec, message in invalid_specs:
-            with self.subTest(group=invalid_spec.group_id):
-                with self.assertRaisesRegex(ValueError, message):
-                    compute_max_logical_pages_for_capture(
-                        invalid_spec,
-                        max_context_len=8,
-                    )
+            with (
+                self.subTest(group=invalid_spec.group_id),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                compute_max_logical_pages_for_capture(
+                    invalid_spec,
+                    max_context_len=8,
+                )
 
     def test_overlap_schedule_enablement_truth_table(self):
         from tokenspeed.runtime.engine.scheduler_utils import (
@@ -325,12 +348,12 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
         )
 
     def test_page_counts_positive_finite_and_under_total_times_live(self):
-        inputs = dict(
-            max_live_requests=32,
-            max_scheduled_tokens=2048,
-            max_total_tokens=64 * 1024,
-            max_context_len=64 * 1024,
-        )
+        inputs = {
+            "max_live_requests": 32,
+            "max_scheduled_tokens": 2048,
+            "max_total_tokens": 64 * 1024,
+            "max_context_len": 64 * 1024,
+        }
         specs = build_v4_cache_specs(
             SimpleNamespace(sliding_window=128),
             layer_ratio=(1, 4, 128),
@@ -344,187 +367,94 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             self.assertTrue(math.isfinite(n), spec.group_id)
             self.assertLess(n, bound, spec.group_id)
 
-    def test_deepseek_v4_pool_exposes_scheduler_cache_groups(self):
-        from tokenspeed.runtime.layers.attention.kv_cache import (
-            deepseek_v4 as deepseek_v4_kv,
-        )
-        from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
-            DeepseekV4TokenToKVPool,
-            deepseek_v4_cache_layout_from_config,
+    def test_lcm_specs_preserve_group_page_sizes_and_publish_packing(self):
+        packing = {
+            "v4.swa_kv": 1,
+            "v4.c4a.compressor_state": 16,
+            "v4.c4a.compressed_kv": 2,
+            "v4.c128a.compressor_state": 32,
+            "v4.c128a.compressed_kv": 8,
+            "v4.c4a.indexer_compressor_state": 16,
+        }
+
+        specs = build_v4_cache_specs(
+            SimpleNamespace(sliding_window=128),
+            layer_ratio=(1, 4, 128),
+            cache_blocks_per_lcm_block=packing,
         )
 
-        hf_config = SimpleNamespace(
-            compress_ratios=(1, 4, 128),
-            head_dim=512,
-            qk_rope_head_dim=64,
-            index_head_dim=128,
-            sliding_window=128,
-        )
-        layout = deepseek_v4_cache_layout_from_config(
-            hf_config,
-            page_size=256,
-            use_fp4_indexer_cache=True,
-        )
-        pool = DeepseekV4TokenToKVPool(
-            size=1024,
-            model_dtype=torch.bfloat16,
-            layout=layout,
-            layer_num=3,
-            device="cpu",
-            enable_memory_saver=False,
-            max_batch_size=2,
-            max_context_len=1024,
-            page_size=256,
-            rank=0,
-            hf_config=hf_config,
-            max_scheduled_tokens=256,
-        )
-
-        group_ids = {spec.group_id for spec in pool.paged_cache_group_specs}
-        self.assertIn("v4.swa_kv", group_ids)
-        self.assertIn("v4.c4a.compressor_state", group_ids)
-        self.assertIn("v4.c128a.compressor_state", group_ids)
-        self.assertIn("v4.c4a.compressed_kv", group_ids)
-        self.assertIn("v4.c128a.compressed_kv", group_ids)
-        self.assertIn("v4.c4a.indexer_compressor_state", group_ids)
-        self.assertGreater(
-            pool.paged_cache_group_page_counts["v4.c4a.compressed_kv"], 1
-        )
-        self.assertFalse(hasattr(pool, "prefix_cache_state_policy"))
-        self.assertFalse(pool.supports_hierarchical_kv_cache)
         self.assertEqual(
-            pool.prefix_cache_required_group_ids,
-            (
-                "v4.c4a.compressed_kv",
-                "v4.c128a.compressed_kv",
-            ),
+            {spec.group_id: spec.cache_blocks_per_lcm_block for spec in specs},
+            packing,
+        )
+        rows = {spec.group_id: spec.rows_per_page for spec in specs}
+        self.assertEqual(rows["v4.swa_kv"], 64)
+        self.assertEqual(rows["v4.c4a.compressor_state"], 4)
+        self.assertEqual(rows["v4.c128a.compressor_state"], 8)
+
+    def test_c4_state_window_covers_wide_verify_blocks(self):
+        base = build_v4_cache_specs(
+            SimpleNamespace(sliding_window=128),
+            layer_ratio=(4,),
+        )
+        wide = build_v4_cache_specs(
+            SimpleNamespace(sliding_window=128),
+            layer_ratio=(4,),
+            decode_input_tokens=6,
         )
 
-        class FakePagedCacheScheduler:
-            @staticmethod
-            def paged_cache_group_total_pages(group_id: str) -> int:
-                return 11
-
-            @staticmethod
-            def paged_cache_group_available_pages(group_id: str) -> int:
-                return 4
-
-            @staticmethod
-            def paged_cache_group_failed_alloc_count(group_id: str) -> int:
-                return 2
-
-        pool.bind_paged_cache_scheduler(FakePagedCacheScheduler())
-        with (
-            patch.object(deepseek_v4_kv.logger, "isEnabledFor", return_value=True),
-            patch.object(deepseek_v4_kv.logger, "debug") as log_debug,
+        base_windows = {spec.group_id: spec.sliding_window_tokens for spec in base}
+        wide_windows = {spec.group_id: spec.sliding_window_tokens for spec in wide}
+        for group_id in (
+            "v4.c4a.compressor_state",
+            "v4.c4a.indexer_compressor_state",
         ):
-            pool.maybe_log_paged_cache_group_pages()
-        log_debug.assert_called_once()
-        logged_groups = log_debug.call_args.args[1]
-        self.assertIn("v4.swa_kv: used=7/11", logged_groups)
-        self.assertIn("v4.c4a.indexer_compressor_state", logged_groups)
-        self.assertIn("failed_alloc=2", logged_groups)
+            self.assertEqual(base_windows[group_id], 8)
+            self.assertEqual(wide_windows[group_id], 10)
 
-    def test_deepseek_v4_capacity_profile_matches_pool_buffers(self):
-        from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
-            DeepseekV4TokenToKVPool,
-            deepseek_v4_cache_layout_from_config,
-            profile_deepseek_v4_max_num_pages,
+    def test_lcm_capacity_is_the_inverse_of_parent_demand(self):
+        packing = {
+            "v4.swa_kv": 1,
+            "v4.c4a.compressor_state": 4,
+            "v4.c4a.compressed_kv": 2,
+            "v4.c128a.compressor_state": 1,
+            "v4.c128a.compressed_kv": 8,
+            "v4.c4a.indexer_compressor_state": 4,
+        }
+        specs = build_v4_cache_specs(
+            SimpleNamespace(sliding_window=128),
+            layer_ratio=(1, 4, 128),
+            cache_blocks_per_lcm_block=packing,
+        )
+        sizing = {
+            "logical_block_tokens": 256,
+            "max_live_requests": 1,
+            "max_scheduled_tokens": 256,
+            "max_context_len": 4096,
+        }
+        num_lcm_blocks = 100
+        capacity = deepseek_v4_token_capacity_for_cache_pool(
+            specs,
+            num_lcm_blocks=num_lcm_blocks,
+            upper_bound_tokens=4096,
+            **sizing,
         )
 
-        hf_config = SimpleNamespace(
-            compress_ratios=(1, 4, 128),
-            head_dim=512,
-            qk_rope_head_dim=64,
-            index_head_dim=128,
-            sliding_window=128,
-        )
-        layout = deepseek_v4_cache_layout_from_config(
-            hf_config,
-            page_size=64,
-            use_fp4_indexer_cache=True,
-        )
-
-        def make_pool(num_pages: int) -> DeepseekV4TokenToKVPool:
-            return DeepseekV4TokenToKVPool(
-                size=num_pages * layout.page_size,
-                model_dtype=torch.bfloat16,
-                layout=layout,
-                layer_num=3,
-                device="cpu",
-                enable_memory_saver=False,
-                max_batch_size=2,
-                max_context_len=1024,
-                page_size=layout.page_size,
-                rank=0,
-                hf_config=hf_config,
-                max_scheduled_tokens=1,
-            )
-
-        def buffer_bytes(pool: DeepseekV4TokenToKVPool) -> int:
-            tensors = []
-            tensors.extend(pool.swa_kv_buffer)
-            tensors.extend(pool.compressed_kv_buffer)
-            tensors.extend(pool.compressor_state_buffer)
-            tensors.extend(pool.indexer_kv_buffer)
-            tensors.extend(pool.indexer_state_buffer)
-            return sum(
-                tensor.numel() * tensor.element_size()
-                for tensor in tensors
-                if tensor is not None
-            )
-
-        target_pages = 8
-        current_bytes = buffer_bytes(make_pool(target_pages))
-        next_bytes = buffer_bytes(make_pool(target_pages + 1))
-
-        self.assertGreater(next_bytes, current_bytes)
-        self.assertEqual(
-            profile_deepseek_v4_max_num_pages(
-                layout=layout,
-                hf_config=hf_config,
-                layer_num=3,
-                max_live_requests=2,
-                max_scheduled_tokens=1,
-                max_context_len=1024,
-                available_cache_memory_bytes=current_bytes,
+        self.assertLessEqual(
+            deepseek_v4_lcm_blocks_needed(
+                specs,
+                token_capacity=capacity,
+                **sizing,
             ),
-            target_pages,
+            num_lcm_blocks,
         )
-
-        legacy_pages = current_bytes // (layout.cache_cell_size(3) * layout.page_size)
-        self.assertLess(legacy_pages, target_pages)
-
-    def test_deepseek_v4_profile_does_not_multiply_scheduled_tokens_by_requests(self):
-        from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
-            deepseek_v4_cache_layout_from_config,
-            profile_deepseek_v4_max_num_pages,
-        )
-
-        hf_config = SimpleNamespace(
-            compress_ratios=tuple([1, 1] + [4, 128] * 20 + [4, 1]),
-            head_dim=512,
-            qk_rope_head_dim=64,
-            index_head_dim=128,
-            sliding_window=128,
-        )
-        layout = deepseek_v4_cache_layout_from_config(
-            hf_config,
-            page_size=256,
-            use_fp4_indexer_cache=True,
-        )
-
         self.assertGreater(
-            profile_deepseek_v4_max_num_pages(
-                layout=layout,
-                hf_config=hf_config,
-                layer_num=43,
-                max_live_requests=160,
-                max_scheduled_tokens=8192,
-                max_context_len=4096,
-                available_cache_memory_bytes=80 * (1 << 30),
+            deepseek_v4_lcm_blocks_needed(
+                specs,
+                token_capacity=capacity + 1,
+                **sizing,
             ),
-            0,
+            num_lcm_blocks,
         )
 
 

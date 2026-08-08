@@ -39,7 +39,6 @@ from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import (
     _global_overrides,
     _oracles,
-    clear_config_overrides,
 )
 from utils import make_sample_specs
 
@@ -119,29 +118,6 @@ def a100_platform() -> PlatformInfo:
         ),
         runtime_features=frozenset({"runtime:cuda_graph"}),
         interconnect=InterconnectInfo(topology="nvlink_full"),
-    )
-
-
-@pytest.fixture
-def mi300_platform() -> PlatformInfo:
-    return PlatformInfo(
-        vendor="amd",
-        arch_version=ArchVersion(9, 4),
-        device_name="AMD Instinct MI300X",
-        device_count=8,
-        total_memory=192 * (1024**3),
-        memory_bandwidth=5300.0,
-        sm_count=304,
-        max_threads_per_sm=2048,
-        max_shared_memory_per_sm=65536,
-        sm_features=frozenset(
-            {
-                "tensor_core:f16",
-                "tensor_core:f8",
-            }
-        ),
-        runtime_features=frozenset(),
-        interconnect=InterconnectInfo(topology="pcie"),
     )
 
 
@@ -230,12 +206,10 @@ def fresh_registry(monkeypatch: pytest.MonkeyPatch):
     # Isolate tests with an empty singleton while preserving the built-in
     # registry for later integration tests in the same pytest process.
     monkeypatch.setattr(KernelRegistry, "_instance", None)
-    clear_config_overrides()
     _oracles.clear()
     _global_overrides.clear()
     yield
     KernelRegistry.reset()
-    clear_config_overrides()
     _oracles.clear()
     _global_overrides.clear()
 

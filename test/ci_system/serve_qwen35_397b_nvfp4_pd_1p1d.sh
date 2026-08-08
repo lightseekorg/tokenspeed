@@ -1,27 +1,34 @@
 #!/usr/bin/env bash
+# Qwen3.5 PD (prefill-decode) 1P-1D smoke/eval topology on a single node.
+# Workers use the unified TokenSpeed gRPC servicer; the SMG gateway keeps the
+# externally visible OpenAI-compatible HTTP API.
 set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+source "$SCRIPT_DIR/worker_cleanup.sh"
 
 MODEL=${MODEL:-nvidia/Qwen3.5-397B-A17B-NVFP4}
 SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-$MODEL}
 PREFILL_GPUS=${PREFILL_GPUS:-0,1}
 DECODE_GPUS=${DECODE_GPUS:-2,3}
-PREFILL_PORT=${PREFILL_PORT:-12346}
+PREFILL_PORT=${PREFILL_PORT:-18346}
 PREFILL_BOOTSTRAP_PORT=${PREFILL_BOOTSTRAP_PORT:-8998}
-DECODE_PORT=${DECODE_PORT:-12347}
+DECODE_PORT=${DECODE_PORT:-18347}
+PREFILL_DIST_INIT_ADDR=${PREFILL_DIST_INIT_ADDR:-127.0.0.1:12579}
+DECODE_DIST_INIT_ADDR=${DECODE_DIST_INIT_ADDR:-127.0.0.1:13580}
 LB_HOST=${LB_HOST:-0.0.0.0}
-LB_PORT=${LB_PORT:-12345}
+LB_PORT=${LB_PORT:-18345}
 PROMETHEUS_PORT=${PROMETHEUS_PORT:-18422}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.9}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-131072}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-16}
-KVSTORE_RATIO=${KVSTORE_RATIO:-0.5}
 WORLD_SIZE=${WORLD_SIZE:-2}
 ATTENTION_BACKEND=${ATTENTION_BACKEND:-trtllm}
 DRAFTER_ATTENTION_BACKEND=${DRAFTER_ATTENTION_BACKEND:-$ATTENTION_BACKEND}
 MOE_BACKEND=${MOE_BACKEND:-flashinfer_trtllm}
 QUANTIZATION=${QUANTIZATION:-nvfp4}
 KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-fp8_e4m3}
-ENABLE_MTP=${ENABLE_MTP:-1}
+ENABLE_MTP=${ENABLE_MTP:-0}
 MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS:-16}
 QUEUE_SIZE=${QUEUE_SIZE:-128}
 LOG_DIR=${PD_CI_LOG_DIR:-.ci-artifacts/pd-qwen35-397b-1p1d}
@@ -75,7 +82,7 @@ PYSNAPSHOT
 
 MODEL_PATH=${MODEL_PATH:-$(resolve_model_snapshot)}
 echo "[pd-1p1d] model=$MODEL served_model_name=$SERVED_MODEL_NAME model_path=$MODEL_PATH"
-echo "[pd-1p1d] prefill=${PREFILL_GPUS}/${PREFILL_PORT}/${PREFILL_BOOTSTRAP_PORT} decode=${DECODE_GPUS}/${DECODE_PORT} lb=${LB_HOST}:${LB_PORT}"
+echo "[pd-1p1d] prefill=${PREFILL_GPUS}/${PREFILL_PORT}/${PREFILL_BOOTSTRAP_PORT}/${PREFILL_DIST_INIT_ADDR} decode=${DECODE_GPUS}/${DECODE_PORT}/${DECODE_DIST_INIT_ADDR} lb=${LB_HOST}:${LB_PORT}"
 echo "[pd-1p1d] world_size=$WORLD_SIZE enable_mtp=$ENABLE_MTP moe_backend=$MOE_BACKEND attention_backend=$ATTENTION_BACKEND"
 
 pids=()
@@ -83,9 +90,8 @@ cleanup() {
   local code=$?
   trap - EXIT INT TERM
   if ((${#pids[@]})); then
-    echo "[pd-1p1d] stopping ${#pids[@]} processes"
-    kill "${pids[@]}" 2>/dev/null || true
-    wait "${pids[@]}" 2>/dev/null || true
+    stop_worker_pids \
+      "pd-1p1d" "${WORKER_SHUTDOWN_TIMEOUT:-30}" "${pids[@]}"
   fi
   exit "$code"
 }
@@ -107,6 +113,29 @@ wait_http() {
   echo "[pd-1p1d] $name ready at $url"
 }
 
+wait_serving() {
+  local role=$1
+  local pid=$2
+  local timeout=${3:-2400}
+  local log="$LOG_DIR/${role}.log"
+  local start
+  start=$(date +%s)
+  until grep -q "health status -> SERVING" "$log" 2>/dev/null; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "[pd-1p1d] $role exited before reaching SERVING (log=$log)" >&2
+      tail -n 200 "$log" >&2 || true
+      return 1
+    fi
+    if (( $(date +%s) - start > timeout )); then
+      echo "[pd-1p1d] timed out waiting for $role to reach SERVING (log=$log)" >&2
+      tail -n 200 "$log" >&2 || true
+      return 1
+    fi
+    sleep 5
+  done
+  echo "[pd-1p1d] $role SERVING"
+}
+
 COMMON_ARGS=(
   --model "$MODEL"
   --served-model-name "$SERVED_MODEL_NAME"
@@ -122,11 +151,9 @@ COMMON_ARGS=(
   --max-num-seqs "$MAX_NUM_SEQS"
   --quantization "$QUANTIZATION"
   --kv-cache-dtype "$KV_CACHE_DTYPE"
-  --kvstore-ratio "$KVSTORE_RATIO"
-  --enable-cache-report
+  --disable-kvstore
   --disaggregation-transfer-backend mooncake
-  --disaggregation-layerwise-interval 1
-  --skip-server-warmup
+  --disaggregation-layerwise-interval 0
 )
 
 if [[ "$ENABLE_MTP" == "1" ]]; then
@@ -148,45 +175,45 @@ start_worker() {
   local gpus=$2
   local port=$3
   local bootstrap_port=$4
+  local dist_init_addr=$5
   local log="$LOG_DIR/${role}.log"
-  echo "[pd-1p1d] starting ${role}: gpus=$gpus port=$port bootstrap=$bootstrap_port log=$log"
+  echo "[pd-1p1d] starting ${role}: gpus=$gpus port=$port bootstrap=${bootstrap_port:-none} log=$log"
   (
     export CUDA_VISIBLE_DEVICES="$gpus"
-    exec python3 test/ci_system/pd_http_worker.py \
+    exec python3 -m smg_grpc_servicer.tokenspeed \
       "${COMMON_ARGS[@]}" \
       --port "$port" \
-      --disaggregation-bootstrap-port "$bootstrap_port" \
+      --dist-init-addr "$dist_init_addr" \
+      ${bootstrap_port:+--disaggregation-bootstrap-port "$bootstrap_port"} \
       --disaggregation-mode "$role"
   ) >"$log" 2>&1 &
   pids+=("$!")
 }
 
-start_worker prefill "$PREFILL_GPUS" "$PREFILL_PORT" "$PREFILL_BOOTSTRAP_PORT"
-start_worker decode "$DECODE_GPUS" "$DECODE_PORT" "$PREFILL_BOOTSTRAP_PORT"
+# Each engine reserves a small control-plane port cluster around its
+# rendezvous address. Keep the P/D clusters disjoint while loading in parallel.
+start_worker prefill "$PREFILL_GPUS" "$PREFILL_PORT" "$PREFILL_BOOTSTRAP_PORT" "$PREFILL_DIST_INIT_ADDR"
+start_worker decode "$DECODE_GPUS" "$DECODE_PORT" "" "$DECODE_DIST_INIT_ADDR"
 
-wait_http prefill "http://127.0.0.1:${PREFILL_PORT}/v1/models" 2400
-wait_http decode "http://127.0.0.1:${DECODE_PORT}/v1/models" 2400
+wait_serving prefill "${pids[0]}" 2400
+wait_serving decode "${pids[1]}" 2400
 
 echo "[pd-1p1d] starting smg lb log=$LOG_DIR/lb.log"
 python3 -m smg launch \
   --pd-disaggregation \
-  --prefill "http://127.0.0.1:${PREFILL_PORT}" "$PREFILL_BOOTSTRAP_PORT" \
-  --decode "http://127.0.0.1:${DECODE_PORT}" \
+  --prefill "grpc://127.0.0.1:${PREFILL_PORT}" "$PREFILL_BOOTSTRAP_PORT" \
+  --decode "grpc://127.0.0.1:${DECODE_PORT}" \
   --host "$LB_HOST" \
   --port "$LB_PORT" \
   --model-path "$MODEL_PATH" \
   --tokenizer-path "$MODEL_PATH" \
-  --disable-tokenizer-autoload \
-  --policy round_robin \
+  --reasoning-parser passthrough \
   --prefill-policy round_robin \
   --decode-policy round_robin \
   --max-concurrent-requests "$MAX_CONCURRENT_REQUESTS" \
   --queue-size "$QUEUE_SIZE" \
   --queue-timeout-secs 1800 \
   --request-timeout-secs 1800 \
-  --worker-startup-timeout-secs 1800 \
-  --health-check-timeout-secs 60 \
-  --health-check-interval-secs 30 \
   --log-level info \
   --disable-retries \
   --disable-circuit-breaker \

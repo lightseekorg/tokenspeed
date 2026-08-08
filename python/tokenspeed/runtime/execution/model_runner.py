@@ -25,8 +25,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 from tokenspeed.runtime.execution.weight_loader import WeightLoader
 from tokenspeed.runtime.layers.moe.utils import initialize_moe_config
+from tokenspeed.runtime.multimodal.embedder import warmup_multimodal_encoders
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import global_server_args_dict_update
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -39,6 +41,33 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 logger = get_colorful_logger(__name__)
+
+
+def infer_multimodal_encoder_dtype(model: torch.nn.Module) -> str | None:
+    """Return the dtype of the loaded multimodal encoder when discoverable."""
+    for path in (
+        ("visual",),
+        ("vision_tower",),
+        ("audio_tower",),
+        ("model", "visual"),
+        ("model", "vision_tower"),
+        ("model", "audio_tower"),
+    ):
+        component = model
+        for name in path:
+            component = getattr(component, name, None)
+            if component is None:
+                break
+        else:
+            dtype = getattr(component, "dtype", None)
+            if isinstance(dtype, torch.dtype):
+                return str(dtype).removeprefix("torch.")
+            if isinstance(component, torch.nn.Module):
+                for tensors in (component.parameters(), component.buffers()):
+                    for tensor in tensors:
+                        if tensor.is_floating_point():
+                            return str(tensor.dtype).removeprefix("torch.")
+    return None
 
 
 class ModelRunner:
@@ -113,6 +142,36 @@ class ModelRunner:
         )
         self._model_forward_accepts_spec_step_idx = self._forward_accepts_kwarg(
             self.model, "spec_step_idx"
+        )
+
+    @property
+    def multimodal_encoder_dtype(self) -> str | None:
+        return infer_multimodal_encoder_dtype(self.model)
+
+    def prepare_multimodal_runtime(self) -> None:
+        """Prepare loaded multimodal encoders for serving.
+
+        This is an explicit post-load phase because it can execute substantial
+        GPU work. Language workers must call it before KV-cache memory
+        profiling so retained encoder graph pools and lazy buffers are included
+        in the cache budget. Encoder-only EPD workers call the same phase even
+        though they do not allocate a KV cache.
+        """
+        self.encoder_graph_wrappers = MultimodalRuntime.install_encoder_graphs(
+            self.model, self.server_args
+        )
+        if self.encoder_graph_wrappers:
+            logger.info(
+                "Multimodal encoder CUDA graphs installed for %s",
+                sorted(self.encoder_graph_wrappers),
+            )
+
+        warmup_device = torch.device(self.device)
+        if warmup_device.type == "cuda" and warmup_device.index is None:
+            warmup_device = torch.device("cuda", self.gpu_id)
+        warmup_multimodal_encoders(
+            self.model,
+            device=warmup_device,
         )
 
     @staticmethod

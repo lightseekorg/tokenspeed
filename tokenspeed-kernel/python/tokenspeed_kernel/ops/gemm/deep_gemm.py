@@ -21,11 +21,11 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, Platform
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import ScaleFormat, format_signatures
 
-_fp8_dtype = Platform.get().fp8e4m3fn.dtype
+_fp8_dtype = torch.float8_e4m3fn
 _MXFP8_SCALE = ScaleFormat(
     storage_dtype=torch.float32,
     granularity="block",
@@ -40,17 +40,21 @@ try:
         fp8_gemm_nt,
         get_mn_major_tma_aligned_tensor,
         get_num_sms,
+        get_pdl,
         m_grouped_fp8_gemm_nt_contiguous,
         m_grouped_fp8_gemm_nt_masked,
         set_num_sms,
+        set_pdl,
     )
 except ImportError:
     fp8_gemm_nt = None  # type: ignore[assignment]
+    get_pdl = None  # type: ignore[assignment]
     get_mn_major_tma_aligned_tensor = None  # type: ignore[assignment]
     get_num_sms = None  # type: ignore[assignment]
     m_grouped_fp8_gemm_nt_contiguous = None  # type: ignore[assignment]
     m_grouped_fp8_gemm_nt_masked = None  # type: ignore[assignment]
     set_num_sms = None  # type: ignore[assignment]
+    set_pdl = None  # type: ignore[assignment]
 
 if fp8_gemm_nt is not None:
 
@@ -67,6 +71,9 @@ if fp8_gemm_nt is not None:
         traits={
             "n_align_64": frozenset({True}),
             "k_align_128": frozenset({True}),
+            # On Blackwell, the installed 1d1d kernel consumes transformed
+            # UE8M0 scales and is reached through an explicit runtime override.
+            "block_scale_layout": frozenset({"canonical"}),
         },
         priority=Priority.SPECIALIZED + 2,
         tags={"throughput"},
@@ -81,12 +88,33 @@ if fp8_gemm_nt is not None:
         alpha: torch.Tensor | None = None,
         block_size: list[int] | None = None,
         out: torch.Tensor | None = None,
+        enable_pdl: bool = False,
     ) -> torch.Tensor:
+        """Run dense block-scaled FP8 DeepGEMM.
+
+        Args:
+            A: FP8 activation matrix.
+            B: FP8 weight matrix in ``[N, K]`` layout.
+            A_scales: Activation block scales in DeepGEMM's MN-major layout.
+            B_scales: Prepared weight block scales.
+            out_dtype: Requested output dtype.
+            alpha: Reserved for the common GEMM interface.
+            block_size: Block-scale shape from the common GEMM interface.
+            out: Optional output buffer.
+            enable_pdl: Keep DeepGEMM's launch mode in the surrounding
+                Programmatic Dependent Launch chain.
+
+        Returns:
+            The matrix product, converted to ``out_dtype``.
+        """
         assert (
             A_scales is not None
         ), "A_scales is required; online quantization should be done by the caller"
         if A_scales.dtype == torch.float32:
             A_scales = get_mn_major_tma_aligned_tensor(A_scales)
+        requested_pdl = bool(enable_pdl)
+        if get_pdl() != requested_pdl:
+            set_pdl(requested_pdl)
         N = B.shape[0]
         C = A.new_empty(A.shape[0], N, dtype=torch.bfloat16)
         fp8_gemm_nt((A, A_scales), (B, B_scales), C)

@@ -55,6 +55,7 @@ request's scatter ranges read from the first item's ``encoded`` tensor.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections import defaultdict
 from collections.abc import Callable, Sequence
@@ -74,13 +75,21 @@ from tokenspeed.runtime.multimodal.inputs import (
     MultimodalForwardContext,
     MultimodalInputs,
 )
-from tokenspeed.runtime.multimodal.shm_transport import ShmTensorHandle
 from tokenspeed.runtime.utils.env import envs
 
 EncoderFn = Callable[[list[MultimodalDataItem]], torch.Tensor]
+EncoderWarmupItemsFactory = Callable[[], list[MultimodalDataItem]]
 
 logger = logging.getLogger(__name__)
 LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
+# Small transfers are faster after staging the whole batch; larger transfers
+# benefit from overlapping each H2D enqueue with the next SHM-to-pinned copy.
+_INTERLEAVED_H2D_MIN_AVERAGE_BYTES = 1024 * 1024
+# One rank can stage the input and distribute it faster than every TP rank
+# repeating the host copy once the payload reaches this TP-scaled threshold.
+# Local B200 measurements put the break-even points near 128 MiB for TP2 and
+# 64 MiB for TP4.
+_TP_BROADCAST_BASE_MIN_BYTES = 256 * 1024 * 1024
 
 
 @dataclass
@@ -89,11 +98,61 @@ class EncoderSpec:
 
     Bundles the encoder callable with whether its output needs to be
     split into a main + deepstack pair via the model's
-    ``separate_deepstack_embeds`` hook.
+    ``separate_deepstack_embeds`` hook. ``make_warmup_items`` is optional so
+    each encoder family can describe its native startup input without the
+    startup path assuming a particular modality or feature layout.
     """
 
     fn: EncoderFn
     deepstack: bool = False
+    make_warmup_items: EncoderWarmupItemsFactory | None = None
+
+
+def warmup_multimodal_encoders(
+    model: Any,
+    *,
+    device: str | torch.device,
+) -> None:
+    """Run each registered encoder family's native synthetic input."""
+    if not getattr(model, "is_multimodal_active", False):
+        return
+
+    get_specs = getattr(model, "get_multimodal_encoder_specs", None)
+    if not callable(get_specs):
+        return
+
+    warmup_device = torch.device(device)
+    specs: dict[Modality, EncoderSpec] = get_specs()
+    for modality, spec in specs.items():
+        if spec.make_warmup_items is None:
+            continue
+        items = spec.make_warmup_items()
+        if not items:
+            continue
+
+        start = time.perf_counter()
+        try:
+            with torch.inference_mode():
+                output = spec.fn(items)
+                del output
+                if warmup_device.type == "cuda":
+                    torch.cuda.synchronize(warmup_device)
+        except Exception:
+            logger.exception(
+                "Multimodal encoder warmup failed: modality=%s",
+                modality.name.lower(),
+            )
+            raise
+        logger.info(
+            "Multimodal encoder warmup complete: modality=%s "
+            "feature_shapes=%s elapsed=%.3f ms",
+            modality.name.lower(),
+            [
+                tuple(item.feature.shape) if item.feature is not None else None
+                for item in items
+            ],
+            (time.perf_counter() - start) * 1000.0,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +298,21 @@ class MultimodalEmbedder:
             encoder_mapping.dp_rank if encoder_mapping is not None else 0
         )
         self._h2d_stream: torch.cuda.Stream | None = None
+        vision_tp_group = (
+            encoder_mapping.tp_group if encoder_mapping is not None else None
+        )
+        self._vision_tp_group = vision_tp_group
+        self._vision_tp_process_group = None
+        self._vision_tp_src_rank: int | None = None
+        if (
+            vision_tp_group is not None
+            and len(vision_tp_group) > 1
+            and process_group_manager.has_process_group("nccl", vision_tp_group)
+        ):
+            self._vision_tp_process_group = process_group_manager.get_process_group(
+                "nccl", vision_tp_group
+            )
+            self._vision_tp_src_rank = vision_tp_group[0]
 
     @property
     def has_encoder_dp(self) -> bool:
@@ -654,26 +728,67 @@ class MultimodalEmbedder:
         pending = [
             it
             for it in items
-            if isinstance(it.feature, (torch.Tensor, ShmTensorHandle))
-            and (isinstance(it.feature, ShmTensorHandle) or it.feature.device != device)
+            if it.feature_shm is not None
+            or (isinstance(it.feature, torch.Tensor) and it.feature.device != device)
         ]
         if not pending:
             return
 
-        for it in pending:
-            if isinstance(it.feature, ShmTensorHandle):
-                it.feature = it.feature.consume()
-
         if device.type != "cuda":
             for it in pending:
+                handle = it.feature_shm
+                if handle is not None:
+                    try:
+                        it.feature = handle.consume()
+                    finally:
+                        it.feature_shm = None
                 if isinstance(it.feature, torch.Tensor):
                     it.feature = it.feature.to(device, non_blocking=True)
+            return
+
+        shm_items = [item for item in pending if item.feature_shm is not None]
+        shm_count = len(shm_items)
+        shm_nbytes = sum(
+            item.feature_shm.nbytes()
+            for item in shm_items
+            if item.feature_shm is not None
+        )
+        use_tp_broadcast = self._should_move_shm_via_tp_broadcast(pending)
+        interleave_h2d = shm_nbytes > shm_count * _INTERLEAVED_H2D_MIN_AVERAGE_BYTES
+        defer_shm_cleanup = shm_count == 1 and interleave_h2d
+        if not use_tp_broadcast and not interleave_h2d:
+            for item in shm_items:
+                handle = item.feature_shm
+                assert handle is not None
+                try:
+                    item.feature = handle.consume()
+                finally:
+                    item.feature_shm = None
+
+        # Keep collectives on the model stream so their ordering matches other
+        # TP collectives queued by the forward pass on every rank.
+        if use_tp_broadcast:
+            self._move_shm_via_tp_broadcast(pending, device)
             return
 
         h2d = self._h2d_stream_on(device)
         current = torch.cuda.current_stream(device)
         with torch.cuda.stream(h2d):
             for it in pending:
+                handle = it.feature_shm
+                if handle is not None:
+                    if defer_shm_cleanup:
+                        try:
+                            it.feature = handle.copy_to_pinned()
+                            it.feature = it.feature.to(device, non_blocking=True)
+                        finally:
+                            handle.release()
+                            it.feature_shm = None
+                        continue
+                    try:
+                        it.feature = handle.consume()
+                    finally:
+                        it.feature_shm = None
                 if isinstance(it.feature, torch.Tensor):
                     it.feature = it.feature.to(device, non_blocking=True)
         current.wait_stream(h2d)
@@ -681,12 +796,86 @@ class MultimodalEmbedder:
             if isinstance(it.feature, torch.Tensor):
                 it.feature.record_stream(current)
 
+    def _should_move_shm_via_tp_broadcast(
+        self, items: list[MultimodalDataItem]
+    ) -> bool:
+        tp_group = self._vision_tp_group
+        if (
+            tp_group is None
+            or self._vision_tp_process_group is None
+            or self._vision_tp_src_rank is None
+            or not items
+            or not all(item.feature_shm is not None for item in items)
+        ):
+            return False
+
+        handles = []
+        for item in items:
+            handle = item.feature_shm
+            assert handle is not None
+            handles.append(handle)
+        dtype = handles[0].dtype
+        if any(handle.dtype != dtype for handle in handles):
+            return False
+        total_nbytes = sum(handle.nbytes() for handle in handles)
+        return total_nbytes >= _TP_BROADCAST_BASE_MIN_BYTES // len(tp_group)
+
+    def _move_shm_via_tp_broadcast(
+        self,
+        items: list[MultimodalDataItem],
+        device: torch.device,
+    ) -> None:
+        tp_group = self._vision_tp_group
+        process_group = self._vision_tp_process_group
+        src_rank = self._vision_tp_src_rank
+        assert tp_group is not None
+        assert process_group is not None
+        assert src_rank is not None
+
+        handles = []
+        for item in items:
+            handle = item.feature_shm
+            assert handle is not None
+            handles.append(handle)
+        dtype = handles[0].dtype
+
+        element_lengths = [math.prod(handle.shape) for handle in handles]
+        base = torch.empty(sum(element_lengths), dtype=dtype, device=device)
+        is_source = torch.distributed.get_rank() == src_rank
+        offset = 0
+        if is_source:
+            for item, handle, length in zip(
+                items, handles, element_lengths, strict=True
+            ):
+                try:
+                    if len(handles) == 1:
+                        handle.copy_into(base.narrow(0, offset, length))
+                    else:
+                        source = handle.consume().reshape(-1)
+                        base.narrow(0, offset, length).copy_(source, non_blocking=True)
+                finally:
+                    item.feature_shm = None
+                offset += length
+        else:
+            for item, handle in zip(items, handles, strict=True):
+                try:
+                    handle.release()
+                finally:
+                    item.feature_shm = None
+
+        torch.distributed.broadcast(base, src=src_rank, group=process_group)
+        offset = 0
+        for item, handle, length in zip(items, handles, element_lengths, strict=True):
+            item.feature = base.narrow(0, offset, length).view(handle.shape)
+            offset += length
+
     @staticmethod
     def _drop_raw_feature(item: MultimodalDataItem) -> bool:
-        if item.feature is None:
+        if item.feature is None and item.feature_shm is None:
             return False
-        if isinstance(item.feature, ShmTensorHandle):
-            item.feature.release()
+        if item.feature_shm is not None:
+            item.feature_shm.release()
+            item.feature_shm = None
         item.feature = None
         return True
 

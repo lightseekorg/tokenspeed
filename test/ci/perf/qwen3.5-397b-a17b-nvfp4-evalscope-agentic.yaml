@@ -1,6 +1,7 @@
 api_version: ci.tokenspeed.io/v1
 name: perf-qwen3.5-397b-a17b-nvfp4-agentic
 type: perf
+workflow_stage: model-test
 triggers:
   - per-commit
   - manual
@@ -9,11 +10,13 @@ runner:
     - gb200-4gpu-perf
 env:
   CI: "true"
+  TOKENSPEED_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN: "1"
 install:
   - bash test/ci_system/install_deps.sh
 server:
   command: >-
     ts serve
+    --disable-kvstore
     --model nvidia/Qwen3.5-397B-A17B-NVFP4
     --attn-tp-size 4
     --moe-tp-size 4

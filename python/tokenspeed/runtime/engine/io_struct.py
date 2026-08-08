@@ -20,18 +20,36 @@
 
 """
 The definition of objects transferred between different
-processes (TokenizerManager, DetokenizerManager, Controller).
+processes (frontend, controller, scheduler), plus the msgpack codec
+that carries them over ZMQ.
+
+Every type that crosses engine IPC is a ``msgspec.Struct`` deriving from
+``BaseReq``/``BaseBatchReq`` (tagged, keyword-only, array-encoded), so one
+tagged-union decoder per receiving socket replaces pickle. Tensors ride as
+msgpack ext-typed raw buffers with large payloads moved to out-of-band ZMQ
+frames (see ``MsgpackEncoder``). Pickle IPC remains available as a rollout
+escape hatch via ``TOKENSPEED_USE_PICKLE_IPC=1`` (read once at import).
+
+``GenerateReqInput``/``EmbeddingReqInput`` are the HTTP-layer request shapes
+(pre-tokenization, in-process only) and intentionally stay dataclasses.
 """
 
+from __future__ import annotations
+
 import copy
+import pickle
 import uuid
-from abc import ABC
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Literal
+from typing import Any, Literal, Union
 
-from tokenspeed.runtime.engine.request_types import BaseFinishReason
+import msgspec
+import numpy as np
+import torch
+
+from tokenspeed.runtime.multimodal.inputs import MultimodalInputs
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+from tokenspeed.runtime.utils.env import envs
 
 
 def _require(condition: bool, message: str) -> None:
@@ -39,10 +57,20 @@ def _require(condition: bool, message: str) -> None:
         raise ValueError(message)
 
 
-@dataclass
-class BaseReq(ABC):
-    rid: str | list[str] | None = field(default=None)
-    http_worker_ipc: str | None = field(default=None)
+class BaseReq(
+    msgspec.Struct, tag=True, tag_field="_tag", kw_only=True, array_like=True
+):
+    """Base for single-request IPC payloads.
+
+    ``tag=True`` prefixes the class name so a tagged-union decoder can
+    dispatch without pickled type info; ``array_like=True`` encodes fields
+    positionally (declaration order IS the wire contract — append only).
+    ``tag_field`` is renamed off the default so subclasses may declare a
+    field literally named ``type`` (it never appears in the array encoding).
+    """
+
+    rid: str | list[str] | None = None
+    http_worker_ipc: str | None = None
 
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
@@ -53,8 +81,35 @@ class BaseReq(ABC):
         return self.rid
 
 
-@dataclass
-class SessionParams:
+class BaseBatchReq(
+    msgspec.Struct, tag=True, tag_field="_tag", kw_only=True, array_like=True
+):
+    """Base for batched IPC payloads (parallel per-request columns)."""
+
+    rids: list[str] | None = None
+
+
+class PickleWrapper(msgspec.Struct, tag=True, tag_field="_tag", array_like=True):
+    """Explicit escape hatch: an opaque Python object as pickled bytes.
+
+    Only for fields whose values are genuinely arbitrary Python objects.
+    Multimodal payloads must NOT use this — they have typed structs with
+    ext-encoded tensor buffers.
+    """
+
+    data: bytes
+
+    @classmethod
+    def wrap(cls, obj: Any) -> "PickleWrapper | None":
+        if obj is None:
+            return None
+        return cls(pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL))
+
+    def unwrap(self) -> Any:
+        return pickle.loads(self.data)
+
+
+class SessionParams(msgspec.Struct, kw_only=True, array_like=True):
     id: str | None = None
     rid: str | None = None
     offset: int | None = None
@@ -399,31 +454,28 @@ class GenerateReqInput:
         return sub
 
 
-@dataclass
-class TokenizedGenerateReqInput:
-    # The request id
-    rid: str
-    # The input text
-    input_text: str
-    # The input token ids
-    input_ids: list[int]
+class TokenizedGenerateReqInput(BaseReq, kw_only=True):
+    # The input text (None on the token-id-only and input-embeds paths)
+    input_text: str | None = None
+    # The input token ids (None on the input-embeds path)
+    input_ids: list[int] | None = None
     # The sampling parameters
     sampling_params: SamplingParams
     # Whether to return the sampled token's logprob for this request.
-    return_logprob: bool
-    # Internal carry-over fields kept for pipeline/PD compatibility. The vLLM
+    return_logprob: bool = False
+    # Internal carry-over fields kept for pipeline/PD compatibility. The
     # output-logprob API only drives ``return_logprob``; InputProcessor sets
     # these to neutral values (logprob_start_len=-1, top_logprobs_num=0,
     # token_ids_logprob=None) since prompt logprobs, output top-k, and token-id
     # logprobs are not supported.
-    logprob_start_len: int
-    top_logprobs_num: int
-    token_ids_logprob: list[int]
+    logprob_start_len: int = -1
+    top_logprobs_num: int = 0
+    token_ids_logprob: list[int] | None = None
     # Whether to stream output
-    stream: bool
+    stream: bool = False
 
-    # The input embeds
-    input_embeds: list[list[list[float]]] | list[list[float]] | None = None
+    # The input embeds (nested float lists; shape varies by caller)
+    input_embeds: list | None = None
 
     # Session info for continual prompting
     session_params: SessionParams | None = None
@@ -444,12 +496,20 @@ class TokenizedGenerateReqInput:
     bootstrap_port: int | None = None
     bootstrap_room: int | None = None
 
-    input_multi_ids: list[list[int]] = None
+    input_multi_ids: list[list[int]] | None = None
     input_extra_infos: list[dict] | None = None
     # Original prompt ids before multimodal pad/hash replacement. The scheduler
     # uses input_ids, while detokenization must use these tokenizer-valid ids.
     input_ids_unpadded: list[int] | None = None
-    multimodal_inputs: Any | None = None
+    # Typed multimodal payload; tensors ride as ext-encoded raw buffers or
+    # out-of-band frames (or SHM handles on the in-host pickle-era path).
+    multimodal_inputs: MultimodalInputs | None = None
+
+    # Set by a transport that validates requests itself (the msgpack ZMQ path,
+    # which bypasses the tokenizer_manager's input processor). A non-None value
+    # makes RequestHandler admit the request pre-finished with FINISH_ABORT so
+    # the client receives a terminal abort instead of a silent drop.
+    validation_error: str | None = None
 
 
 @dataclass
@@ -545,34 +605,34 @@ class EmbeddingReqInput:
         return sub
 
 
-@dataclass
-class TokenizedEmbeddingReqInput:
-    # The request id
-    rid: str
+class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     # The input text
-    input_text: str
+    input_text: str | None = None
     # The input token ids
-    input_ids: list[int]
+    input_ids: list[int] | None = None
     # Placeholder sampling params field so request metadata can share one shape
     # with generation-oriented code paths.
     sampling_params: SamplingParams
     # Time at object instantiated
-    created_time: float
+    created_time: float = 0.0
 
 
-@dataclass
-class BatchTokenIDOut:
-    # The request id
-    rids: list[str]
-    # The finish reason
-    finished_reasons: list[BaseFinishReason]
+# Serialized form of BaseFinishReason.to_json() (or None while streaming) —
+# all values are msgpack-native primitives.
+FinishReasonDict = dict
+
+
+class BatchTokenIDOut(BaseBatchReq, kw_only=True):
+    # The finish reason (``BaseFinishReason.to_json()`` dicts, None mid-stream)
+    finished_reasons: list[FinishReasonDict | None]
     # For incremental decoding
     decoded_texts: list[str]
     decode_ids: list[list[int]]
     read_offsets: list[int]
-    # Only used when `--skip-tokenizer-init` is on
-    output_ids: list[int] | None
-    output_multi_ids: list[int] | None
+    # Only used when `--skip-tokenizer-init` is on. Per-request lists: the
+    # not-yet-sent slice of each request's generated ids (see stream_output).
+    output_ids: list[list[int]] | None
+    output_multi_ids: list[list[int]] | None
     # Detokenization configs
     skip_special_tokens: list[bool]
     spaces_between_special_tokens: list[bool]
@@ -587,8 +647,10 @@ class BatchTokenIDOut:
     # Logprobs
     input_token_logprobs_val: list[float]
     input_token_logprobs_idx: list[int]
-    output_token_logprobs_val: list[float]
-    output_token_logprobs_idx: list[int]
+    # Per-request lists, parallel to rids: the newly-decoded tokens' sampled
+    # logprobs/token ids this step, [] when logprobs are off (see stream_output).
+    output_token_logprobs_val: list[list[float]]
+    output_token_logprobs_idx: list[list[int]]
     input_top_logprobs_val: list[list]
     input_top_logprobs_idx: list[list]
     output_top_logprobs_val: list[list]
@@ -600,20 +662,87 @@ class BatchTokenIDOut:
 
     # Hidden states
     output_hidden_states: list[list[float]]
-    batch_accept_draft_tokens: list[float]
+    # Per-request draft-token acceptance (speculative decoding); None until
+    # the request finishes, empty when spec decoding is off.
+    batch_accept_draft_tokens: list[float | None]
 
     # Store some custom information, such as decoding status in multimodal scenarios, etc.
     output_extra_infos: list[dict[str, Any]]
 
-    generated_time: int
+    generated_time: float
 
 
-@dataclass
-class BatchStrOut:
-    # The request id
-    rids: list[str]
+def _finish_type(finished_reason) -> str:
+    """Reduce an OutputProcesser finish reason to its wire type string."""
+    if not finished_reason:
+        return ""
+    if isinstance(finished_reason, dict):
+        return finished_reason.get("type", "")
+    return str(finished_reason)
+
+
+class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
+    """Per-request slice of ``BatchTokenIDOut`` for a frontend that
+    detokenizes itself (the direct ZMQ scheduler drive).
+
+    Carries only what that frontend consumes, so per-step outputs skip the
+    incremental-detokenization columns (decoded_texts, decode_ids, ...) the
+    in-process frontend needs. Field ORDER is a cross-language wire
+    contract — do not reorder.
+    """
+
+    # Newly generated token ids per request this step, sourced from
+    # ``BatchTokenIDOut.output_ids``.
+    output_ids: list[list[int]]
+    # "" (not finished) or the finish-reason type ("stop", "length", "abort").
+    finished_reasons: list[str]
+    prompt_tokens: list[int]
+    completion_tokens: list[int]
+    cached_tokens: list[int]
+    # Sampled-token logprobs, parallel to rids: one inner list per request,
+    # holding the value/token-id of each newly-decoded token this step. Empty []
+    # for a request that did not ask for logprobs, so the columns stay
+    # non-ragged (always length == len(rids)).
+    output_token_logprobs_val: list[list[float]]
+    output_token_logprobs_idx: list[list[int]]
+
+    @classmethod
+    def from_full(cls, out: BatchTokenIDOut) -> "BatchTokenIDOutSlim":
+        # Token source: ``out.output_ids`` — the not-yet-sent slice of each
+        # request's generated ids. NOT ``out.decode_ids``: that is the
+        # incremental-detokenization window, which starts at the prompt tail
+        # for context and would leak prompt tokens to a frontend that
+        # detokenizes from scratch.
+        if out.output_ids is None:
+            # Substituting empty lists here while completion_tokens advances
+            # would silently lose tokens on the frontend; fail loud instead.
+            raise ValueError(
+                "BatchTokenIDOut.output_ids is None; the msgpack wire needs "
+                "the per-request generated token ids"
+            )
+        return cls(
+            rids=list(out.rids),
+            output_ids=[list(ids) for ids in out.output_ids],
+            finished_reasons=[_finish_type(fr) for fr in out.finished_reasons],
+            prompt_tokens=list(out.prompt_tokens),
+            completion_tokens=list(out.completion_tokens),
+            cached_tokens=list(out.cached_tokens),
+            output_token_logprobs_val=(
+                list(out.output_token_logprobs_val)
+                if out.output_token_logprobs_val is not None
+                else [[] for _ in out.rids]
+            ),
+            output_token_logprobs_idx=(
+                list(out.output_token_logprobs_idx)
+                if out.output_token_logprobs_idx is not None
+                else [[] for _ in out.rids]
+            ),
+        )
+
+
+class BatchStrOut(BaseBatchReq, kw_only=True):
     # The finish reason
-    finished_reasons: list[dict]
+    finished_reasons: list[FinishReasonDict | None]
     # The output decoded strings
     output_strs: list[str]
     # The token ids
@@ -641,33 +770,29 @@ class BatchStrOut:
 
     # Hidden states
     output_hidden_states: list[list[float]]
-    batch_accept_draft_tokens: list[float]
+    # See BatchTokenIDOut.batch_accept_draft_tokens (None mid-stream).
+    batch_accept_draft_tokens: list[float | None]
 
     # Store some custom information, such as decoding status in multimodal scenarios, etc.
     output_extra_infos: list[dict[str, Any]]
 
-    generated_time: int
+    generated_time: float
 
 
-@dataclass
-class BatchEmbeddingOut:
-    # The request id
-    rids: list[str]
+class BatchEmbeddingOut(BaseBatchReq, kw_only=True):
     # The finish reason
-    finished_reasons: list[BaseFinishReason]
-    # The output embedding
-    embeddings: list[list[float]] | list[dict]
+    finished_reasons: list[FinishReasonDict | None]
+    # The output embedding (dense rows or sparse dicts)
+    embeddings: list
     # Token counts
     prompt_tokens: list[int]
 
 
-@dataclass
-class FlushCacheReqInput:
+class FlushCacheReqInput(BaseReq, kw_only=True):
     pass
 
 
-@dataclass
-class FlushCacheReqOutput:
+class FlushCacheReqOutput(BaseReq, kw_only=True):
     success: bool
 
 
@@ -678,41 +803,34 @@ class FlushCacheReqOutput:
 PauseMode = Literal["abort", "wait", "keep"]
 
 
-@dataclass
-class PauseSchedulerReqInput:
+class PauseSchedulerReqInput(BaseReq, kw_only=True):
     # See PauseMode for how each mode treats in-flight requests.
     mode: PauseMode = "abort"
 
 
-@dataclass
-class PauseSchedulerReqOutput:
+class PauseSchedulerReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str = ""
 
 
-@dataclass
-class ResumeSchedulerReqInput:
+class ResumeSchedulerReqInput(BaseReq, kw_only=True):
     pass
 
 
-@dataclass
-class ResumeSchedulerReqOutput:
+class ResumeSchedulerReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str = ""
 
 
-@dataclass
-class IsSchedulerPausedReqInput:
+class IsSchedulerPausedReqInput(BaseReq, kw_only=True):
     pass
 
 
-@dataclass
-class IsSchedulerPausedReqOutput:
+class IsSchedulerPausedReqOutput(BaseReq, kw_only=True):
     is_paused: bool
 
 
-@dataclass
-class UpdateWeightFromDiskReqInput:
+class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):
     # The model path with the new weights
     model_path: str
     # The format to load the weights
@@ -721,8 +839,7 @@ class UpdateWeightFromDiskReqInput:
     weight_version: str | None = None
 
 
-@dataclass
-class UpdateWeightFromDiskReqOutput:
+class UpdateWeightFromDiskReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
     # Number of paused requests during weight sync.
@@ -735,8 +852,7 @@ DEFAULT_PACKED_BUFFER_SIZE_BYTES = 1024 * 1024 * 1024  # 1 GiB
 DEFAULT_PACKED_NUM_BUFFERS = 2
 
 
-@dataclass
-class UpdateWeightsFromDistributedReqInput:
+class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):
     # Weight-update metadata shared with the trainer's NCCL sender.
     names: list[str]
     dtype_names: list[str]
@@ -753,14 +869,12 @@ class UpdateWeightsFromDistributedReqInput:
     weight_version: str | None = None
 
 
-@dataclass
-class UpdateWeightsFromDistributedReqOutput:
+class UpdateWeightsFromDistributedReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
 
 
-@dataclass
-class UpdateWeightsFromTensorReqInput:
+class UpdateWeightsFromTensorReqInput(BaseReq, kw_only=True):
     # One serialized ``Dict[str, torch.Tensor]`` per world rank (engine.py fans
     # the payload out across ``mapping.world_size``).
     serialized_named_tensors: list[bytes]
@@ -770,14 +884,12 @@ class UpdateWeightsFromTensorReqInput:
     weight_version: str | None = None
 
 
-@dataclass
-class UpdateWeightsFromTensorReqOutput:
+class UpdateWeightsFromTensorReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
 
 
-@dataclass
-class InitWeightsUpdateGroupReqInput:
+class InitWeightsUpdateGroupReqInput(BaseReq, kw_only=True):
     # The master address
     master_address: str
     # The master port
@@ -792,104 +904,91 @@ class InitWeightsUpdateGroupReqInput:
     backend: str = "nccl"
 
 
-@dataclass
-class InitWeightsUpdateGroupReqOutput:
+class InitWeightsUpdateGroupReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
 
 
-@dataclass
-class DestroyWeightsUpdateGroupReqInput:
+class DestroyWeightsUpdateGroupReqInput(BaseReq, kw_only=True):
     # The group name to tear down (must match the init group_name).
     group_name: str = "weight_update_group"
 
 
-@dataclass
-class DestroyWeightsUpdateGroupReqOutput:
+class DestroyWeightsUpdateGroupReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
 
 
-@dataclass
-class GetWeightsByNameReqInput:
+class GetWeightsByNameReqInput(BaseReq, kw_only=True):
     name: str
     truncate_size: int = 100
 
 
-@dataclass
-class GetWeightsByNameReqOutput:
+class GetWeightsByNameReqOutput(BaseReq, kw_only=True):
     parameter: list
 
 
-@dataclass
-class ReleaseMemoryOccupationReqInput:
+class ReleaseMemoryOccupationReqInput(BaseReq, kw_only=True):
     # Memory regions to release. None ⇒ all ("weights" and "kv_cache").
     tags: list[str] | None = None
 
 
-@dataclass
-class ReleaseMemoryOccupationReqOutput:
+class ReleaseMemoryOccupationReqOutput(BaseReq, kw_only=True):
     success: bool = True
     message: str = ""
 
 
-@dataclass
-class ResumeMemoryOccupationReqInput:
+class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):
     # Memory regions to resume. None ⇒ all previously released tags.
     tags: list[str] | None = None
 
 
-@dataclass
-class ResumeMemoryOccupationReqOutput:
+class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):
     success: bool = True
     message: str = ""
 
 
-@dataclass
-class IsSleepingReqInput:
+class IsSleepingReqInput(BaseReq, kw_only=True):
     pass
 
 
-@dataclass
-class IsSleepingReqOutput:
+class IsSleepingReqOutput(BaseReq, kw_only=True):
     is_sleeping: bool
 
 
-@dataclass
-class AbortReq:
-    # The request id
-    rid: str
-
-
-@dataclass
-class GetInternalStateReq:
+class AbortReq(BaseReq, kw_only=True):
+    # The request id rides in the ``rid`` base field.
     pass
 
 
-@dataclass
-class GetInternalStateReqOutput:
-    internal_state: dict[Any, Any]
+class GetInternalStateReq(BaseReq, kw_only=True):
+    pass
 
 
-@dataclass
-class SetInternalStateReq:
+class GetInternalStateReqOutput(BaseReq, kw_only=True):
+    internal_state: dict[str, Any]
+
+
+class SetInternalStateReq(BaseReq, kw_only=True):
     server_args: dict[str, Any]
 
 
-@dataclass
-class SetInternalStateReqOutput:
+class SetInternalStateReqOutput(BaseReq, kw_only=True):
     updated: bool
     server_args: dict[str, Any]
 
 
-class ExpertDistributionReq(Enum):
+class ExpertDistributionReqType(Enum):
     START_RECORD = 1
     STOP_RECORD = 2
     DUMP_RECORD = 3
 
 
-@dataclass
-class ExpertDistributionReqOutput:
+class ExpertDistributionReq(BaseReq, kw_only=True):
+    action: ExpertDistributionReqType
+
+
+class ExpertDistributionReqOutput(BaseReq, kw_only=True):
     pass
 
 
@@ -898,8 +997,7 @@ class ProfileReqType(Enum):
     STOP_PROFILE = 2
 
 
-@dataclass
-class ProfileReq:
+class ProfileReq(BaseReq, kw_only=True):
     type: ProfileReqType
     output_dir: str | None = None
     start_step: int | None = None
@@ -911,70 +1009,59 @@ class ProfileReq:
     profile_id: str | None = None
 
 
-@dataclass
-class ProfileReqOutput:
+class ProfileReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
 
 
-@dataclass
-class ConfigureLoggingReq:
+class ConfigureLoggingReq(BaseReq, kw_only=True):
     log_requests: bool | None = None
     log_requests_level: int | None = None
     dump_requests_folder: str | None = None
     dump_requests_threshold: int | None = None
 
 
-@dataclass
-class OpenSessionReqInput:
+class OpenSessionReqInput(BaseReq, kw_only=True):
     capacity_of_str_len: int
     session_id: str | None = None
 
 
-@dataclass
-class CloseSessionReqInput:
+class CloseSessionReqInput(BaseReq, kw_only=True):
     session_id: str
 
 
-@dataclass
-class OpenSessionReqOutput:
+class OpenSessionReqOutput(BaseReq, kw_only=True):
     session_id: str | None
     success: bool
 
 
-@dataclass
-class HealthCheckOutput:
+class HealthCheckOutput(BaseReq, kw_only=True):
     pass
 
 
-@dataclass
-class RpcReqInput:
+class RpcReqInput(BaseReq, kw_only=True):
     method: str
     parameters: dict | None = None
 
 
-@dataclass
-class RpcReqOutput:
+class RpcReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
 
 
-@dataclass
-class GetLoadReqInput(BaseReq):
+class GetLoadReqInput(BaseReq, kw_only=True):
     pass
 
 
-@dataclass
-class GetLoadReqOutput(BaseReq):
+class GetLoadReqOutput(BaseReq, kw_only=True):
     dp_rank: int = 0
     num_reqs: int = 0
     num_waiting_reqs: int = 0
     num_pages: int = 0
 
 
-@dataclass
-class WatchLoadUpdateReq(BaseReq):
-    loads: list[GetLoadReqOutput] = field(default_factory=list)
+class WatchLoadUpdateReq(BaseReq, kw_only=True):
+    loads: list[GetLoadReqOutput] = []
 
 
 class BlockReqType(Enum):
@@ -982,6 +1069,267 @@ class BlockReqType(Enum):
     UNBLOCK = 2
 
 
-@dataclass
-class BlockReqInput(BaseReq):
-    type: BlockReqType = field(default_factory=BlockReqType.BLOCK)
+class BlockReqInput(BaseReq, kw_only=True):
+    type: BlockReqType = BlockReqType.BLOCK
+
+
+# ============================================================================
+# msgpack codec for engine IPC.
+#
+# Tensor scheme (shared with the SMG Rust engine-side codec): a tensor or
+# ndarray encodes as the tuple ``(dtype, shape, data)`` where ``data`` is
+# either an ext-typed raw byte view (``CUSTOM_TYPE_RAW_VIEW``) for small
+# payloads, or an integer index into the message's out-of-band ZMQ frames
+# (frame 0 is the primary msgpack buffer, so indices are one-based).
+# ============================================================================
+
+# msgpack extension type codes. 1 and 2 are reserved for pickled payloads in
+# the shared cross-codec numbering; this codec never emits them (opaque
+# objects must use an explicit PickleWrapper field instead).
+CUSTOM_TYPE_PICKLE = 1
+CUSTOM_TYPE_CLOUDPICKLE = 2
+CUSTOM_TYPE_RAW_VIEW = 3
+
+# Tensors/ndarrays below this many bytes are inlined in the primary buffer;
+# larger ones become dedicated zero-copy frames.
+MSGPACK_ZERO_COPY_THRESHOLD = 256
+
+# Rollout escape hatch: force the legacy pickle IPC end-to-end. Read once at
+# import; the senders/receivers below all consult it.
+USE_PICKLE_IPC = envs.TOKENSPEED_USE_PICKLE_IPC.get()
+
+
+def _tensor_bytes(tensor: torch.Tensor) -> memoryview:
+    """A flat uint8 view of ``tensor``'s data (CPU, contiguous)."""
+    t = tensor.detach()
+    if t.device.type != "cpu":
+        t = t.cpu()
+    if not t.is_contiguous():
+        t = t.contiguous()
+    return memoryview(t.reshape(-1).view(torch.uint8).numpy()).cast("B")
+
+
+class MsgpackEncoder:
+    """msgpack encoder with tensor/ndarray support and out-of-band buffers.
+
+    ``encode`` returns the list of ZMQ frames to send: the primary msgpack
+    buffer first, then one frame per large tensor (referenced by index from
+    the primary buffer). Not thread-safe while encoding.
+    """
+
+    def __init__(self, size_threshold: int = MSGPACK_ZERO_COPY_THRESHOLD) -> None:
+        self._encoder = msgspec.msgpack.Encoder(enc_hook=self._enc_hook)
+        self._aux_buffers: list | None = None
+        self._size_threshold = size_threshold
+
+    def encode(self, obj: Any) -> list:
+        try:
+            self._aux_buffers = bufs = [b""]
+            bufs[0] = self._encoder.encode(obj)
+            return bufs
+        finally:
+            self._aux_buffers = None
+
+    def _enc_hook(self, obj: Any) -> Any:
+        if isinstance(obj, torch.Tensor):
+            return self._encode_tensor(obj)
+        if isinstance(obj, np.ndarray) and obj.dtype.kind not in ("O", "V"):
+            return self._encode_ndarray(obj)
+        if isinstance(obj, torch.dtype):
+            return str(obj).removeprefix("torch.")
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.integer):
+            return int(obj)
+        raise TypeError(
+            f"Cannot msgpack-encode object of type {type(obj)}. Give the field "
+            "a precise msgspec-compatible type, or wrap a genuinely opaque "
+            "payload in an explicit PickleWrapper field."
+        )
+
+    def _stash(self, buf) -> "msgspec.msgpack.Ext | int":
+        """Inline small buffers as an ext raw view; frame out large ones."""
+        if buf.nbytes < self._size_threshold:
+            return msgspec.msgpack.Ext(CUSTOM_TYPE_RAW_VIEW, buf)
+        index = len(self._aux_buffers)
+        self._aux_buffers.append(buf)
+        return index
+
+    def _encode_tensor(self, obj: torch.Tensor) -> tuple:
+        assert self._aux_buffers is not None
+        dtype = str(obj.dtype).removeprefix("torch.")
+        return dtype, tuple(obj.shape), self._stash(_tensor_bytes(obj))
+
+    def _encode_ndarray(self, obj: np.ndarray) -> tuple:
+        assert self._aux_buffers is not None
+        arr = np.ascontiguousarray(obj)
+        return obj.dtype.str, obj.shape, self._stash(arr.reshape(-1).view("B").data)
+
+
+class MsgpackDecoder:
+    """msgpack decoder resolving tensors from inline ext views or aux frames.
+
+    ``decode`` accepts either a single buffer or the full frame list (frame 0
+    = primary buffer). Not thread-safe while decoding.
+    """
+
+    def __init__(self, ty: Any = None) -> None:
+        args = () if ty is None else (ty,)
+        self._decoder = msgspec.msgpack.Decoder(
+            *args, dec_hook=self._dec_hook, ext_hook=self._ext_hook
+        )
+        self._aux_buffers: Any = ()
+
+    def decode(self, bufs: Any) -> Any:
+        if isinstance(bufs, (bytes, bytearray, memoryview)):
+            return self._decoder.decode(bufs)
+        self._aux_buffers = bufs
+        try:
+            return self._decoder.decode(bufs[0])
+        finally:
+            self._aux_buffers = ()
+
+    def _dec_hook(self, ty: type, obj: Any) -> Any:
+        if ty is torch.dtype:
+            return getattr(torch, obj)
+        if isinstance(ty, type):
+            if issubclass(ty, torch.Tensor):
+                return self._decode_tensor(obj)
+            if issubclass(ty, np.ndarray):
+                return self._decode_ndarray(obj)
+        raise TypeError(f"Cannot msgpack-decode into unsupported type {ty}.")
+
+    def _ext_hook(self, code: int, data: memoryview) -> Any:
+        if code == CUSTOM_TYPE_RAW_VIEW:
+            return data
+        raise NotImplementedError(f"Extension type code {code} is not supported")
+
+    def _resolve_buffer(self, data) -> memoryview:
+        buf = self._aux_buffers[data] if isinstance(data, int) else data
+        return buf if isinstance(buf, memoryview) else memoryview(buf)
+
+    def _decode_tensor(self, arr: Any) -> torch.Tensor:
+        dtype, shape, data = arr
+        buffer = self._resolve_buffer(data)
+        torch_dtype = getattr(torch, dtype, None)
+        if not isinstance(torch_dtype, torch.dtype):
+            # numpy typestring (a field typed torch.Tensor fed an ndarray).
+            return torch.from_numpy(
+                np.frombuffer(buffer, dtype=np.dtype(dtype)).copy()
+            ).reshape(shape)
+        if not buffer.nbytes:  # torch.frombuffer rejects empty buffers
+            return torch.empty(shape, dtype=torch_dtype)
+        # frombuffer needs a writable buffer; received bytes are read-only, so
+        # copy into a bytearray the tensor then owns.
+        writable = buffer if not buffer.readonly else bytearray(buffer)
+        flat = torch.frombuffer(writable, dtype=torch.uint8)
+        return flat.view(torch_dtype).view(shape)
+
+    def _decode_ndarray(self, arr: Any) -> np.ndarray:
+        dtype, shape, data = arr
+        buffer = self._resolve_buffer(data)
+        return np.frombuffer(buffer, dtype=np.dtype(dtype)).copy().reshape(shape)
+
+
+def _walk_subclasses(base: type) -> list:
+    out = []
+    for sub in base.__subclasses__():
+        out.append(sub)
+        out.extend(_walk_subclasses(sub))
+    return out
+
+
+def ipc_message_union():
+    """The tagged union of every registered IPC message type.
+
+    Computed lazily so process roles that define extra ``BaseReq`` subclasses
+    (e.g. the EPD encode worker) are included as long as the defining module
+    is imported before the receiving socket is constructed.
+    """
+    types = tuple(
+        dict.fromkeys(
+            _walk_subclasses(BaseReq) + _walk_subclasses(BaseBatchReq) + [PickleWrapper]
+        )
+    )
+    return Union[types]  # noqa: UP007 — dynamic union over a runtime tuple
+
+
+class IpcSender:
+    """Engine-IPC sender wrapping a ZMQ PUSH/DEALER socket.
+
+    Exposes ``send_pyobj`` so existing call sites are unchanged; the payload
+    is msgpack (multipart, with out-of-band tensor frames) unless the
+    ``USE_PICKLE_IPC`` escape hatch is on. ``send`` accepts a pre-pickled
+    engine message from legacy off-thread serializers and transcodes it onto
+    the same wire. Works over both sync and asyncio sockets (asyncio sends
+    return the socket's future).
+    """
+
+    def __init__(self, socket) -> None:
+        self._socket = socket
+        self._encoder = MsgpackEncoder()
+
+    def send_pyobj(self, obj: Any, flags: int = 0):
+        if USE_PICKLE_IPC:
+            return self._socket.send_pyobj(obj, flags)
+        return self._socket.send_multipart(self._encoder.encode(obj), flags, copy=False)
+
+    def send(self, data, flags: int = 0):
+        # Legacy raw-frame surface: external callers that serialize an engine
+        # message off-thread hand this seam pickled bytes (the pre-msgpack wire).
+        # Transcode through the shared codec so every receiver on the channel
+        # sees one wire format; under the pickle escape hatch the bytes already
+        # match the wire and pass through untouched.
+        if USE_PICKLE_IPC:
+            return self._socket.send(data, flags)
+        return self.send_pyobj(pickle.loads(data), flags)
+
+    def close(self, linger: int | None = None) -> None:
+        self._socket.close(linger=linger)
+
+    def __getattr__(self, name: str):
+        # Raw socket surface (poll, setsockopt, ...) for callers that bypass
+        # the object codec.
+        return getattr(self._socket, name)
+
+
+class IpcReceiver:
+    """Engine-IPC receiver wrapping a sync ZMQ PULL socket.
+
+    ``recv_pyobj`` preserves the drain-loop contract: ``zmq.Again`` under
+    NOBLOCK when the socket is empty.
+    """
+
+    def __init__(self, socket) -> None:
+        self._socket = socket
+        self._decoder = MsgpackDecoder(ipc_message_union())
+
+    def recv_pyobj(self, flags: int = 0) -> Any:
+        if USE_PICKLE_IPC:
+            return self._socket.recv_pyobj(flags)
+        return self._decoder.decode(self._socket.recv_multipart(flags))
+
+    def close(self, linger: int | None = None) -> None:
+        self._socket.close(linger=linger)
+
+    def __getattr__(self, name: str):
+        return getattr(self._socket, name)
+
+
+class AsyncIpcReceiver:
+    """Engine-IPC receiver wrapping a ``zmq.asyncio`` PULL socket."""
+
+    def __init__(self, socket) -> None:
+        self._socket = socket
+        self._decoder = MsgpackDecoder(ipc_message_union())
+
+    async def recv_pyobj(self, flags: int = 0) -> Any:
+        if USE_PICKLE_IPC:
+            return await self._socket.recv_pyobj(flags)
+        return self._decoder.decode(await self._socket.recv_multipart(flags))
+
+    def close(self, linger: int | None = None) -> None:
+        self._socket.close(linger=linger)
+
+    def __getattr__(self, name: str):
+        return getattr(self._socket, name)

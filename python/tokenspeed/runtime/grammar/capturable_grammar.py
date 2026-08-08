@@ -98,6 +98,52 @@ class GrammarStepCompletion:
     advance_mask: list[bool] | None = None
 
 
+def create_grammar_runtime(
+    *,
+    grammar_backend: str,
+    disable_capturable: bool,
+    is_nvidia: bool,
+    max_bs: int,
+    vocab_size: int,
+    max_tokens_per_req: int,
+    device: str,
+) -> "CapturableGrammarExecutor | EagerGrammarBuffers | None":
+    """Build the per-executor grammar runtime, or ``None`` when disabled.
+
+    CUDA gets :class:`CapturableGrammarExecutor` (cudaLaunchHostFunc on a side
+    stream so the xgrammar fill + H2D overlap with the forward, and is also
+    CUDA-graph-capturable); everything else gets :class:`EagerGrammarBuffers`
+    (synchronous fallback). ``disable_capturable`` forces the eager path on
+    CUDA too, for parity-testing.
+
+    Args:
+        grammar_backend: Backend name from server args; ``"none"`` disables
+            grammar handling entirely.
+        disable_capturable: Force the eager fallback even on CUDA.
+        is_nvidia: Whether the current platform is an NVIDIA GPU.
+        max_bs: Maximum batch size the buffers must hold.
+        vocab_size: Vocabulary width of the bitmask rows.
+        max_tokens_per_req: Rows per request (spec-verify width, 1 otherwise).
+        device: Torch device for the buffers.
+
+    Returns:
+        The grammar runtime instance, or ``None`` when disabled.
+    """
+    if grammar_backend == "none":
+        return None
+    runtime_cls = (
+        CapturableGrammarExecutor
+        if is_nvidia and not disable_capturable
+        else EagerGrammarBuffers
+    )
+    return runtime_cls(
+        max_bs=max_bs,
+        vocab_size=vocab_size,
+        max_tokens_per_req=max_tokens_per_req,
+        device=device,
+    )
+
+
 class CapturableGrammarExecutor:
     """Buffers + hostfuncs for an in-graph grammar fill + apply."""
 

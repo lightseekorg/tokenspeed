@@ -119,6 +119,10 @@ What it supports:
 - Causal and non-causal execution
 - Optional LSE return (`return_lse=True`)
 - PDL enable/disable (`enable_pdl`)
+- TokenSpeed serving currently keeps PDL disabled across the Q/K/V FP8-input
+  producers and prefill-FMHA pipeline because that cross-kernel dependency can
+  intermittently expose incomplete inputs on Blackwell. Standalone kernel
+  callers can still select the PDL variant explicitly.
 - Kernel compile cache keyed by static config (`dtype`, `d_qk`, `d_v`, causal, LSE, PDL, etc.)
 - Skip-correction is enabled in the wrapped FMHA path.
 - ex2-emulation (disabled by default on B200, and not supported on B300)
@@ -157,7 +161,7 @@ What it supports:
   `H=64, q_len=4` is supported.
 - `split_kv` and `workspace_size` are computed and cached from runtime shape/device info.
 - `is_var_seq`, `is_persistent`, and `enable_pdl` affect scheduling/compile variants.
-- `causal_mask` is currently effective on the FP8 decode kernel path.
+- `causal_mask` supports causal and non-causal execution on FP16/BF16/FP8 paths.
 - Optional `out` tensor reuse
 - `is_var_seq` and `enable_pdl` controls
 

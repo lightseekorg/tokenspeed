@@ -43,9 +43,14 @@ class _StubTokenizer:
         return [0] * len(text)
 
 
-def _make_processor() -> InputProcessor:
+def _make_processor(
+    *, context_len: int = CONTEXT_LEN, max_req_input_len: int | None = None
+) -> InputProcessor:
     engine = SimpleNamespace(
-        context_len=CONTEXT_LEN,
+        context_len=context_len,
+        max_req_input_len=(
+            context_len - 1 if max_req_input_len is None else max_req_input_len
+        ),
         is_generation=True,
         tokenizer=_StubTokenizer(),
         logger=SimpleNamespace(warning=lambda *a, **k: None),
@@ -90,6 +95,22 @@ def test_explicit_within_limit_max_new_tokens_is_preserved():
     )
     out = _tokenize(obj)
     assert out.sampling_params.max_new_tokens == 30
+
+
+def test_prompt_over_scheduler_cache_limit_is_rejected():
+    obj = GenerateReqInput(input_ids=list(range(80)), sampling_params={})
+    obj.normalize_batch_and_arguments()
+    processor = _make_processor(context_len=100, max_req_input_len=79)
+    with pytest.raises(ValueError, match="maximum input length \\(79 tokens\\)"):
+        asyncio.run(processor.tokenize_one_request(obj))
+
+
+def test_generation_is_capped_to_cache_limited_context():
+    obj = GenerateReqInput(input_ids=list(range(10)), sampling_params={})
+    obj.normalize_batch_and_arguments()
+    processor = _make_processor(context_len=80, max_req_input_len=79)
+    out = asyncio.run(processor.tokenize_one_request(obj))
+    assert out.sampling_params.max_new_tokens == 70
 
 
 def test_resolved_cap_is_never_none():

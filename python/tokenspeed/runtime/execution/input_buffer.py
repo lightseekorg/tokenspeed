@@ -55,7 +55,6 @@ class InputBuffers:
         dummy_kv_slot: int,
         state_write_padding_pool_index: int,
         device: str = "cuda",
-        has_mamba: bool = False,
     ):
         self.device = device
         self.page_size = page_size
@@ -64,7 +63,6 @@ class InputBuffers:
         self.state_write_padding_pool_index = state_write_padding_pool_index
         self.max_bs = max_bs
         self.all_extends_mid_chunk = False
-        self.has_mamba = has_mamba
 
         with torch.device(device):
             # Initialise buffers to the *padding* values the captured graph
@@ -98,19 +96,6 @@ class InputBuffers:
             self.force_single_token_verify_buf = torch.zeros(max_bs, dtype=torch.bool)
             self.extend_prefix_lens_buf = torch.zeros(max_bs, dtype=torch.int32)
             self.extend_seq_lens_buf = torch.zeros(max_bs, dtype=torch.int32)
-            if has_mamba:
-                self.mamba_pool_indices_buf = torch.full(
-                    (max_bs,), -1, dtype=torch.int32
-                )
-                self.mamba_cow_src_indices_buf = torch.full(
-                    (max_bs,), -1, dtype=torch.int32
-                )
-                self.mamba_branching_seqlens_buf = torch.full(
-                    (max_bs,), -1, dtype=torch.int32
-                )
-                self.mamba_track_pool_indices_buf = torch.full(
-                    (max_bs,), -1, dtype=torch.int32
-                )
 
         # NOT pinned: python readers only; the H2D uses the per-step bulk pinned staging (_bulk_pinned).
         self.extend_prefix_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
@@ -139,9 +124,11 @@ class InputBuffers:
         self,
         forward_op,
         runtime_states: RuntimeStates,
-        req_to_page: torch.Tensor,
         total_tokens: int,
+        page_table: torch.Tensor,
     ):
+        # out_cache_loc derives from the per-forward, batch-ordered full-history
+        # table (row i == batch position i) exported by the scheduler.
         batch_size = len(forward_op.request_ids)
         num_extends = forward_op.num_extends()
 
@@ -266,7 +253,7 @@ class InputBuffers:
                 req_pool_indices=req_pool_indices_device,
                 valid_cache_lengths=runtime_states.valid_cache_lengths,
                 uniform_input_length=total_tokens // batch_size,
-                req_to_pages=req_to_page,
+                page_table=page_table,
                 page_size=self.page_size,
             )
             # Decode path's seq_lens / positions / out_cache_loc are done.
@@ -280,10 +267,9 @@ class InputBuffers:
             )
             compute_out_cache_loc(
                 out_cache_loc_ptr=self.out_cache_loc_buf[:total_tokens],
-                req_pool_indices=req_pool_indices_device,
                 input_lengths=input_lengths_device,
                 cache_start=valid_cache_lengths,
-                req_to_pages=req_to_page,
+                page_table=page_table,
                 page_size=self.page_size,
             )
 
@@ -408,53 +394,6 @@ class InputBuffers:
                 self.state_write_padding_pool_index
             )
             self.seq_lens_buf[batch_size:].fill_(1)
-
-        if (
-            self.has_mamba
-            and hasattr(forward_op, "mamba_pool_indices")
-            and forward_op.mamba_pool_indices
-        ):
-            (
-                mamba_pool_indices_cpu,
-                mamba_cow_src_indices_cpu,
-                mamba_branching_seqlens_cpu,
-                mamba_track_pool_indices_cpu,
-            ) = self._bulk_pinned(
-                (batch_size, torch.int32),
-                (batch_size, torch.int32),
-                (batch_size, torch.int32),
-                (batch_size, torch.int32),
-            )
-            mamba_pool_indices_cpu.copy_(
-                torch.as_tensor(forward_op.mamba_pool_indices, dtype=torch.int32)
-            )
-            mamba_cow_src_indices_cpu.copy_(
-                torch.as_tensor(forward_op.mamba_cow_src_indices, dtype=torch.int32)
-            )
-            mamba_branching_seqlens_cpu.copy_(
-                torch.as_tensor(forward_op.mamba_branching_seqlens, dtype=torch.int32)
-            )
-            mamba_track_pool_indices_cpu.copy_(
-                torch.as_tensor(forward_op.mamba_track_pool_indices, dtype=torch.int32)
-            )
-
-            self.mamba_pool_indices_buf[:batch_size].copy_(
-                mamba_pool_indices_cpu, non_blocking=True
-            )
-            self.mamba_cow_src_indices_buf[:batch_size].copy_(
-                mamba_cow_src_indices_cpu, non_blocking=True
-            )
-            self.mamba_branching_seqlens_buf[:batch_size].copy_(
-                mamba_branching_seqlens_cpu, non_blocking=True
-            )
-            self.mamba_track_pool_indices_buf[:batch_size].copy_(
-                mamba_track_pool_indices_cpu, non_blocking=True
-            )
-            if batch_size < self.mamba_pool_indices_buf.shape[0]:
-                self.mamba_pool_indices_buf[batch_size:].fill_(-1)
-                self.mamba_cow_src_indices_buf[batch_size:].fill_(-1)
-                self.mamba_branching_seqlens_buf[batch_size:].fill_(-1)
-                self.mamba_track_pool_indices_buf[batch_size:].fill_(-1)
 
         return decode_input_ids
 

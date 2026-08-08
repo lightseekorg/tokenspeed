@@ -278,6 +278,23 @@ class RequestHandler:
             eos_token_ids=self.hf_eos_token_id,
         )
 
+        # A transport that validates requests itself (msgpack ZMQ) marks
+        # rejected ones instead of dropping them; admit pre-finished so the
+        # client gets a terminal abort rather than a hung stream.
+        if getattr(recv_req, "validation_error", None):
+            req_state.finished_reason = FINISH_ABORT(
+                f"Invalid request: {recv_req.validation_error}"
+            )
+            return (
+                req_spec,
+                req_state,
+                BootstrapInfo(
+                    recv_req.bootstrap_host,
+                    recv_req.bootstrap_port,
+                    recv_req.bootstrap_room,
+                ),
+            )
+
         if (
             recv_req.session_params is not None
             and recv_req.session_params.id is not None

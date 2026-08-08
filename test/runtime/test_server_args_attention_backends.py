@@ -73,15 +73,19 @@ class TestAttentionBackendChoices(unittest.TestCase):
     def test_invalid_backend_rejected_on_both_flags(self):
         for flag in ("--attention-backend", "--drafter-attention-backend"):
             parser = self._build_parser()
-            with contextlib.redirect_stderr(io.StringIO()):
-                with self.assertRaises(SystemExit):
-                    parser.parse_args(["--model", "x", flag, "bogus"])
+            with (
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                parser.parse_args(["--model", "x", flag, "bogus"])
 
     def test_inline_detokenizer_flag_removed_from_cli(self):
         parser = self._build_parser()
-        with contextlib.redirect_stderr(io.StringIO()):
-            with self.assertRaises(SystemExit):
-                parser.parse_args(["--model", "x", "--enable-inline-detokenizer"])
+        with (
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit),
+        ):
+            parser.parse_args(["--model", "x", "--enable-inline-detokenizer"])
 
     def test_inline_detokenizer_is_forced_on(self):
         args = prepare_server_args(["--model", "x"])
@@ -130,6 +134,20 @@ class TestAttentionBackendChoices(unittest.TestCase):
                 logical_page_size=128,
             )
 
+    def test_lcm_group_page_sizes_are_published_before_backend_construction(self):
+        config = SimpleNamespace(group_page_sizes={"stale": 64})
+        spec = SimpleNamespace(
+            memory_plan=SimpleNamespace(logical_block_tokens=128),
+            layer_group_ids=("full_attention", "linear_attention_0"),
+        )
+
+        registry._set_cache_group_page_sizes(config, spec)
+
+        self.assertEqual(
+            config.group_page_sizes,
+            {"full_attention": 128, "linear_attention_0": 128},
+        )
+
     def test_mha_config_propagates_speculative_settings(self):
         server_args = SimpleNamespace(
             device="cuda",
@@ -146,6 +164,7 @@ class TestAttentionBackendChoices(unittest.TestCase):
             speculative_algorithm="EAGLE3",
             speculative_num_steps=3,
             speculative_num_draft_tokens=4,
+            spec_context_pad=12,  # 3 overshoot spans * 4 draft tokens
         )
         model_config = SimpleNamespace(
             context_len=4096,
@@ -159,6 +178,7 @@ class TestAttentionBackendChoices(unittest.TestCase):
 
         self.assertEqual(config.speculative_num_steps, 3)
         self.assertEqual(config.speculative_num_draft_tokens, 4)
+        self.assertEqual(config.context_len, 4108)
 
 
 if __name__ == "__main__":

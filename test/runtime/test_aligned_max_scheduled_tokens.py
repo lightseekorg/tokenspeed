@@ -36,12 +36,12 @@ def _group(
     group_id: str,
     family: PagedCacheGroupFamily,
     retention: PagedCacheRetention,
-    block_size: int = 0,
+    cache_block_tokens: int = 64,
     sliding_window_tokens: int | None = None,
 ) -> PagedCacheGroupConfig:
     kwargs = dict(
         group_id=group_id,
-        rows_per_page=64,
+        rows_per_page=cache_block_tokens,
         entry_stride_tokens=1,
         total_pages=8,
         retention=retention,
@@ -49,19 +49,16 @@ def _group(
     )
     if sliding_window_tokens is not None:
         kwargs["sliding_window_tokens"] = sliding_window_tokens
-    cfg = PagedCacheGroupConfig(**kwargs)
-    if block_size:
-        cfg.block_size = block_size
-    return cfg
+    return PagedCacheGroupConfig(**kwargs)
 
 
-def _kimi_k3_groups(block_size: int = 1536) -> list[PagedCacheGroupConfig]:
+def _kimi_k3_groups(cache_block_tokens: int = 1536) -> list[PagedCacheGroupConfig]:
     groups = [
         _group(
             "full_attention",
             PagedCacheGroupFamily.History,
             PagedCacheRetention.FullHistory,
-            block_size=block_size,
+            cache_block_tokens=cache_block_tokens,
         )
     ]
     groups.extend(
@@ -69,7 +66,7 @@ def _kimi_k3_groups(block_size: int = 1536) -> list[PagedCacheGroupConfig]:
             f"linear_attention_{i}",
             PagedCacheGroupFamily.State,
             PagedCacheRetention.FullHistory,
-            block_size=block_size,
+            cache_block_tokens=cache_block_tokens,
         )
         for i in range(3)
     )
@@ -79,14 +76,10 @@ def _kimi_k3_groups(block_size: int = 1536) -> list[PagedCacheGroupConfig]:
 class AlignedMaxScheduledTokensTest(unittest.TestCase):
     def test_kimi_k3_shape_floors_to_page_grain(self):
         # The observed production shape: 8192 % 1536 != 0 -> floor to 7680.
-        self.assertEqual(
-            aligned_max_scheduled_tokens(8192, _kimi_k3_groups(), 1536), 7680
-        )
+        self.assertEqual(aligned_max_scheduled_tokens(8192, _kimi_k3_groups()), 7680)
 
     def test_aligned_value_unchanged(self):
-        self.assertEqual(
-            aligned_max_scheduled_tokens(7680, _kimi_k3_groups(), 1536), 7680
-        )
+        self.assertEqual(aligned_max_scheduled_tokens(7680, _kimi_k3_groups()), 7680)
 
     def test_no_state_group_unchanged(self):
         groups = [
@@ -94,14 +87,14 @@ class AlignedMaxScheduledTokensTest(unittest.TestCase):
                 "full_attention",
                 PagedCacheGroupFamily.History,
                 PagedCacheRetention.FullHistory,
-                block_size=1536,
+                cache_block_tokens=1536,
             )
         ]
-        self.assertEqual(aligned_max_scheduled_tokens(8192, groups, 1536), 8192)
+        self.assertEqual(aligned_max_scheduled_tokens(8192, groups), 8192)
 
     def test_empty_and_none_groups_unchanged(self):
-        self.assertEqual(aligned_max_scheduled_tokens(8192, [], 64), 8192)
-        self.assertEqual(aligned_max_scheduled_tokens(8192, None, 64), 8192)
+        self.assertEqual(aligned_max_scheduled_tokens(8192, []), 8192)
+        self.assertEqual(aligned_max_scheduled_tokens(8192, None), 8192)
 
     def test_sliding_window_state_group_is_swa_not_snapshot(self):
         # V4-style SWA KV rides State family with SlidingWindow retention; it
@@ -111,28 +104,28 @@ class AlignedMaxScheduledTokensTest(unittest.TestCase):
                 "v4.swa_kv",
                 PagedCacheGroupFamily.State,
                 PagedCacheRetention.SlidingWindow,
-                block_size=1536,
+                cache_block_tokens=1536,
                 sliding_window_tokens=1536,
             )
         ]
-        self.assertEqual(aligned_max_scheduled_tokens(8192, groups, 1536), 8192)
+        self.assertEqual(aligned_max_scheduled_tokens(8192, groups), 8192)
 
-    def test_chunk_below_one_page_clamps_to_one_page(self):
-        # A chunk smaller than one page could never register a snapshot.
-        self.assertEqual(
-            aligned_max_scheduled_tokens(512, _kimi_k3_groups(), 1536), 1536
-        )
+    def test_chunk_below_one_page_is_rejected(self):
+        # Increasing the scheduler limit after executor buffers were sized
+        # would make the first aligned chunk overflow those buffers.
+        with self.assertRaisesRegex(ValueError, "minimum 1536"):
+            aligned_max_scheduled_tokens(512, _kimi_k3_groups())
 
-    def test_zero_block_size_falls_back_to_page_size(self):
+    def test_state_grain_comes_from_cache_block_tokens(self):
         groups = [
             _group(
                 "state",
                 PagedCacheGroupFamily.State,
                 PagedCacheRetention.FullHistory,
-                # block_size left 0 = unset -> global page size governs.
+                cache_block_tokens=96,
             )
         ]
-        self.assertEqual(aligned_max_scheduled_tokens(1000, groups, 96), 960)
+        self.assertEqual(aligned_max_scheduled_tokens(1000, groups), 960)
 
     def test_mixed_grains_use_lcm(self):
         groups = [
@@ -140,23 +133,21 @@ class AlignedMaxScheduledTokensTest(unittest.TestCase):
                 "state_a",
                 PagedCacheGroupFamily.State,
                 PagedCacheRetention.FullHistory,
-                block_size=64,
+                cache_block_tokens=64,
             ),
             _group(
                 "state_b",
                 PagedCacheGroupFamily.State,
                 PagedCacheRetention.FullHistory,
-                block_size=96,
+                cache_block_tokens=96,
             ),
         ]
         # lcm(64, 96) = 192; floor(1000 / 192) * 192 = 960.
-        self.assertEqual(aligned_max_scheduled_tokens(1000, groups, 64), 960)
+        self.assertEqual(aligned_max_scheduled_tokens(1000, groups), 960)
 
     def test_invalid_inputs_raise(self):
         with self.assertRaises(ValueError):
-            aligned_max_scheduled_tokens(0, _kimi_k3_groups(), 1536)
-        with self.assertRaises(ValueError):
-            aligned_max_scheduled_tokens(8192, _kimi_k3_groups(), 0)
+            aligned_max_scheduled_tokens(0, _kimi_k3_groups())
 
 
 if __name__ == "__main__":

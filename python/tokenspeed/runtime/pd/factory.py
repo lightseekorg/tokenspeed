@@ -20,8 +20,8 @@
 
 """Factories for PD KV transfer helpers."""
 
+from tokenspeed.runtime.pd.cache_protocol import validate_cache_slab_registrations
 from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
-from tokenspeed.runtime.pd.flatkv import validate_flatkv_slab_registrations
 from tokenspeed.runtime.pd.mooncake.entities import KVArgs, KVManagerArgs
 from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
 from tokenspeed.runtime.pd.utils import TransferBackend
@@ -39,15 +39,15 @@ def _get_contiguous_buf_unit_lens(pool, item_lens):
     return unit_lens
 
 
-def _get_flatkv_contract(pool):
+def _get_cache_contract(pool):
     if getattr(pool, "supports_disaggregation", False) is not True:
         return None
 
-    contract_getter = getattr(pool, "get_flatkv_pd_contract", None)
+    contract_getter = getattr(pool, "get_pd_cache_contract", None)
     if not callable(contract_getter):
         raise RuntimeError(
-            "cache pool advertises FlatKV disaggregation but is missing the "
-            "required get_flatkv_pd_contract() ABI"
+            "cache pool advertises cache-contract disaggregation but is missing the "
+            "required get_pd_cache_contract() ABI"
         )
     return contract_getter()
 
@@ -58,21 +58,15 @@ def get_kv_args(
     ib_device,
     token_to_kv_pool,
     draft_token_to_kv_pool,
-    mamba_pool=None,
 ):
-    flat_contract = _get_flatkv_contract(token_to_kv_pool)
-    if flat_contract is not None:
-        if draft_token_to_kv_pool is not None:
-            raise NotImplementedError(
-                "FlatKV PD does not support speculative/draft/MTP caches"
-            )
-        if mamba_pool is not None:
-            raise NotImplementedError(
-                "FlatKV PD state is stored in raw slabs; a separate state pool "
-                "is unsupported"
-            )
-        layout, registrations = flat_contract
-        registrations = validate_flatkv_slab_registrations(
+    cache_contract = _get_cache_contract(token_to_kv_pool)
+    if cache_contract is not None:
+        # One big model, one arena: the draft's continuation-layer planes
+        # live inside the same merged plan the contract describes, so slab
+        # pages carry the draft KV with no extra registration
+        # (draft_token_to_kv_pool is a layer-mapped view of the same pool).
+        layout, registrations = cache_contract
+        registrations = validate_cache_slab_registrations(
             registrations,
             layout=layout,
             peer="local",
@@ -88,7 +82,7 @@ def get_kv_args(
             draft_layer_num=0,
             kv_layer_ids=list(range(physical_slot_count)),
             # One logical Mooncake unit is one complete raw-slab page. This
-            # makes equal-TP FlatKV routes identity routes and prevents the
+            # makes equal-TP cache-contract routes identity routes and prevents the
             # generic heterogeneous-TP planner from splitting a raw page.
             kv_unit_lens=item_lens,
             state_data_ptrs=[],
@@ -104,45 +98,27 @@ def get_kv_args(
             aux_item_lens=[],
             ib_device=ib_device,
             gpu_id=gpu_id,
-            flat_layout=layout,
+            cache_layout=layout,
         )
 
+    # One big model, one pool: the pool's buffers already cover the draft's
+    # continuation layers (the pool binds every planned layer), so a single
+    # enumeration registers everything. The draft pool is a layer-mapped
+    # view of the same pool; only the layer partition is derived from it.
     kv_data_ptrs, kv_data_lens, kv_item_lens = (
         token_to_kv_pool.get_contiguous_buf_infos()
     )
     kv_unit_lens = _get_contiguous_buf_unit_lens(token_to_kv_pool, kv_item_lens)
     # [[layer0buf0, layer0buf1...], [layer1buf0, layer1buf1...], ...]
     offsets = token_to_kv_pool.get_layerwise_buf_info_offsets()
-    target_layer_num = token_to_kv_pool.layer_num
-    kv_layer_ids = list(getattr(token_to_kv_pool, "layer_ids", range(target_layer_num)))
-
-    if draft_token_to_kv_pool is not None:
-        draft_layer_num = draft_token_to_kv_pool.layer_num
-        # We should also transfer draft model kv cache. The indices are
-        # always shared with a target model.
-        draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
-            draft_token_to_kv_pool.get_contiguous_buf_infos()
-        )
-        draft_kv_unit_lens = _get_contiguous_buf_unit_lens(
-            draft_token_to_kv_pool, draft_kv_item_lens
-        )
-        draft_offsets = draft_token_to_kv_pool.get_layerwise_buf_info_offsets(
-            len(kv_data_ptrs)
-        )
-
-        kv_data_ptrs += draft_kv_data_ptrs
-        kv_data_lens += draft_kv_data_lens
-        kv_item_lens += draft_kv_item_lens
-        kv_unit_lens += draft_kv_unit_lens
-        offsets += draft_offsets
-        draft_base_layer_id = (
-            max(kv_layer_ids) + 1 if kv_layer_ids else target_layer_num
-        )
-        kv_layer_ids += list(
-            range(draft_base_layer_id, draft_base_layer_id + draft_layer_num)
-        )
-    else:
-        draft_layer_num = 0
+    total_layer_num = token_to_kv_pool.layer_num
+    kv_layer_ids = list(getattr(token_to_kv_pool, "layer_ids", range(total_layer_num)))
+    draft_layer_num = (
+        len(draft_token_to_kv_pool.layer_ids)
+        if draft_token_to_kv_pool is not None
+        else 0
+    )
+    target_layer_num = total_layer_num - draft_layer_num
 
     state_data_ptrs = []
     state_data_lens = []
@@ -150,14 +126,6 @@ def get_kv_args(
     state_unit_lens = []
     state_type = "none"
     state_layer_ids = []
-    if mamba_pool is not None:
-        state_data_ptrs, state_data_lens, state_item_lens = (
-            mamba_pool.get_contiguous_buf_infos()
-        )
-        state_unit_lens = _get_contiguous_buf_unit_lens(mamba_pool, state_item_lens)
-        state_layer_ids = mamba_pool.get_contiguous_buf_layer_ids()
-        state_type = "mamba"
-
     kv_args = KVArgs(
         engine_rank=engine_rank,
         kv_data_ptrs=kv_data_ptrs,
@@ -193,14 +161,14 @@ def create_kv_transfer(
     gloo_group,
     page_size,
 ):
-    if kv_args.flat_layout is not None:
+    if kv_args.cache_layout is not None:
         if backend not in (TransferBackend.MOONCAKE, TransferBackend.MOONCAKE.value):
             raise NotImplementedError(
-                "FlatKV PD currently supports only the Mooncake backend"
+                "Paged-cache PD currently supports only the Mooncake backend"
             )
         if args.enable_mla_l1_5_cache:
             raise NotImplementedError(
-                "FlatKV PD does not support MLA L1.5 or layerwise cache transfer"
+                "Paged-cache PD does not support MLA L1.5 or layerwise cache transfer"
             )
     if mode == "prefill":
         return DisaggPrefillExecutor(backend, args, kv_args, gloo_group, page_size)

@@ -25,6 +25,7 @@ import dataclasses
 import json
 import os
 import random
+import socket
 from typing import Literal
 
 from tokenspeed_kernel.ops.attention.triton.linear.chunk_delta_h import (
@@ -41,11 +42,26 @@ from tokenspeed.runtime.utils import (
     maybe_model_redirect,
     nullable_str,
 )
+from tokenspeed.runtime.utils.launcher import check_dist_init_port, detect_topology
 from tokenspeed.runtime.utils.network import is_port_available
 
 logger = get_colorful_logger(__name__)
 
 ENABLE_CP = os.environ.get("ENABLE_CP", "false").lower() in ("true", "1")
+
+# Spec-decode overshoot spans the physical KV extent must absorb past the
+# logical context_len. The overlap scheduler steps a finished request at most
+# ONE extra iteration (event_loop_overlap commits the previous step every
+# round, so the Finish event reaches the C++ scheduler before the next plan),
+# and termination is checked CPU-side against max_new_tokens, so verify can
+# commit past context_len for exactly that window:
+#   1. the finishing step's own accept (up to spec_num_tokens past the limit),
+#   2. the single lingering step's accept,
+#   3. the lingering step laying out its next draft block after that accept.
+# Hence 3 spans. Everything written past context_len belongs to a request
+# whose output is already truncated by max_new_tokens; the garbage KV is
+# evicted with the request one step later.
+_SPEC_OVERSHOOT_SPANS = 3
 
 
 def str_to_bool(value: str | bool) -> bool:
@@ -57,6 +73,21 @@ def str_to_bool(value: str | bool) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise argparse.ArgumentTypeError(f"invalid boolean value: {value!r}")
+
+
+def _uint16(value: str) -> int:
+    """argparse type for values packed as a two-byte identity (``<H``)."""
+    index = int(value)
+    if not 0 <= index <= 0xFFFF:
+        raise argparse.ArgumentTypeError(f"value must be in [0, 65535], got {value}")
+    return index
+
+
+def _nonempty_str(value: str) -> str:
+    """argparse type for string flags that must not be empty."""
+    if not value.strip():
+        raise argparse.ArgumentTypeError("value must be a non-empty string")
+    return value
 
 
 @dataclasses.dataclass
@@ -79,6 +110,20 @@ class ServerArgs:
     revision: str | None = None
     language_model_only: bool = False
 
+    # Direct SMG msgpack ZMQ path. When enabled, the scheduler skips the pickle
+    # PULL/PUSH IPC and instead connects to SMG (which binds the handshake/input/
+    # output sockets) over the msgpack wire. Default OFF;
+    # SMG tokenizes/detokenizes, so pair with --skip-tokenizer-init.
+    zmq_msgpack: bool = False
+    # The frontend handshake endpoint the scheduler dials; becomes the
+    # data-parallel rendezvous when DP is supported.
+    data_parallel_address: str = "127.0.0.1"
+    # Default chosen to avoid the 20000-29999 range used for derived
+    # per-worker handshake ports and common rendezvous defaults of
+    # co-located services.
+    data_parallel_rpc_port: int = 30500
+    zmq_engine_index: int = 0
+
     # Port for the HTTP server
     host: str = "127.0.0.1"
     port: int = 8000
@@ -95,15 +140,6 @@ class ServerArgs:
     block_size: int = 64
     # special kv cache
     mamba_ssm_dtype: str = "float32"
-    mamba_track_interval: int = 256
-    max_mamba_cache_size: int | None = None
-    mamba_full_memory_ratio: float = 0.9
-    enable_mamba_l2: bool = False
-    mamba_l2_host_slots: int = 0
-    mamba_l2_ratio: float = 2.0
-    mamba_l2_layout: str = "layer_first"
-    mamba_l2_io_backend: str = "kernel"
-    mamba_l2_host_gb: int = 0
 
     # Other runtime options
     stream_interval: int = 1
@@ -195,10 +231,11 @@ class ServerArgs:
     kvstore_storage_backend_extra_config: str | None = None
     enable_mla_l1_5_cache: bool = False
 
-    # Multi-node distributed serving
+    # Multi-node distributed serving. ``None`` means "not given by the user",
+    # which is what lets the launcher environment fill them in.
     dist_init_addr: str | None = None
-    nnodes: int = 1
-    node_rank: int = 0
+    nnodes: int | None = None
+    node_rank: int | None = None
 
     # Hugging Face model config overrides in JSON
     hf_overrides: str = "{}"
@@ -207,7 +244,6 @@ class ServerArgs:
     # Kernel backend
     attention_backend: str | None = None
     kda_backend: str = "auto"
-    moe_activation_dtype: str = "bf16"
     drafter_attention_backend: str | None = None
     sampling_backend: str | None = None
     dp_sampling: bool = False
@@ -254,10 +290,10 @@ class ServerArgs:
     disable_kvstore: bool = False
     enforce_eager: bool = False
     disable_cuda_graph_padding: bool = False
+    disable_autotune: bool = False
     enable_cudagraph_gc: bool = False
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
-    disable_custom_all_reduce: bool = False
     disable_overlap_schedule: bool = False
     disable_tf32: bool = False
     force_deterministic_rsag: bool = False
@@ -314,8 +350,22 @@ class ServerArgs:
     def mamba_cache_chunk_size(self) -> int:
         return max(FLA_CHUNK_SIZE, self.block_size)
 
+    @property
+    def spec_context_pad(self) -> int:
+        """Tokens the physical KV extent must hold past the logical context_len.
+
+        Zero without speculative decoding; see _SPEC_OVERSHOOT_SPANS for the
+        derivation. Sizing consumers (page tables, graph capture widths) add
+        this pad; user-semantic consumers (input validation, max_new_tokens
+        folding, stop checks) keep the logical context_len.
+        """
+        if self.speculative_algorithm is None:
+            return 0
+        return _SPEC_OVERSHOOT_SPANS * int(self.speculative_num_draft_tokens)
+
     def __post_init__(self):
         self.resolve_basic_defaults()
+        self.resolve_launcher_topology()
         self.resolve_parallelism()
         self.resolve_memory_and_scheduling()
         self.resolve_kernel_backends()
@@ -364,13 +414,29 @@ class ServerArgs:
             if draft_model is not None and self.speculative_draft_model_path is None:
                 self.speculative_draft_model_path = str(draft_model)
 
+            dspark_draft_model = self.speculative_draft_model_path
+            dspark_uses_base_model = self.speculative_algorithm == "DSPARK" and (
+                self.draft_model_path_use_base
+                or dspark_draft_model is None
+                or maybe_model_redirect(dspark_draft_model) == self.model
+            )
+            if dspark_uses_base_model:
+                self.draft_model_path_use_base = True
+
             num_speculative_tokens = config.get("num_speculative_tokens")
             if num_speculative_tokens is not None:
                 num_speculative_tokens = int(num_speculative_tokens)
-                if self.speculative_algorithm == "DFLASH":
+                if self.speculative_algorithm == "DFLASH" or (
+                    self.speculative_algorithm == "DSPARK"
+                    and not dspark_uses_base_model
+                ):
                     if self.speculative_num_draft_tokens is None:
                         self.speculative_num_draft_tokens = num_speculative_tokens
                     self.speculative_num_steps = max(num_speculative_tokens - 1, 0)
+                elif self.speculative_algorithm == "DSPARK":
+                    self.speculative_num_steps = num_speculative_tokens
+                    if self.speculative_num_draft_tokens is None:
+                        self.speculative_num_draft_tokens = num_speculative_tokens + 1
                 else:
                     self.speculative_num_steps = num_speculative_tokens
 
@@ -446,6 +512,42 @@ class ServerArgs:
             else:
                 self.sampling_backend = "greedy"
 
+    def resolve_launcher_topology(self):
+        """Fill in unset multi-node arguments from the launcher environment."""
+        topology = detect_topology()
+        if topology is None:
+            self.nnodes = 1 if self.nnodes is None else self.nnodes
+            self.node_rank = 0 if self.node_rank is None else self.node_rank
+            return
+
+        for flag, given, found in (
+            ("--nnodes", self.nnodes, topology.nnodes),
+            ("--node-rank", self.node_rank, topology.node_rank),
+        ):
+            if given is not None and given != found:
+                raise ValueError(
+                    f"{flag}={given} contradicts the {topology.source} environment, "
+                    f"which reports {found}. Drop the flag to use the launcher's "
+                    f"value, or correct the launch."
+                )
+
+        derived = []
+        if self.nnodes is None:
+            self.nnodes = topology.nnodes
+            derived.append(f"--nnodes {self.nnodes}")
+        if self.node_rank is None:
+            self.node_rank = topology.node_rank
+            derived.append(f"--node-rank {self.node_rank}")
+        if self.dist_init_addr is None:
+            check_dist_init_port(topology.dist_init_port)
+            self.dist_init_addr = topology.dist_init_addr
+            derived.append(f"--dist-init-addr {self.dist_init_addr}")
+        if derived:
+            logger.info(
+                f"node {self.node_rank}/{self.nnodes} on {socket.gethostname()}: "
+                f"derived from {topology.source}: {' '.join(derived)}"
+            )
+
     def resolve_parallelism(self):
         world_size = self.world_size
         nprocs_per_node = self.nprocs_per_node
@@ -481,12 +583,15 @@ class ServerArgs:
             world_size, attn_tp_size, attn_cp_size, attn_dp_size
         )
 
-        # Dense layers still default to full TP participation when no
-        # dedicated dense_tp_size is provided.
+        # Dense layers default to the attention replica's TP width
+        # (attn_tp_size x attn_cp_size == world_size // attn_dp_size). Without
+        # DP attention this is the full world, unchanged from before; with DP
+        # attention it keeps each dense all-reduce inside one replica (matching
+        # attn) instead of spanning the whole world, which would otherwise cross
+        # nodes and force attn_tp != dense_tp. Pass --dense-tp-size to override.
         dense_tp_size = self.dense_tp_size
         if self.dense_tp_size is None:
-            # dense always do tp now.
-            dense_tp_size = world_size
+            dense_tp_size = attn_tp_size * attn_cp_size
         dense_dp_size = None
 
         # --enable-expert-parallel auto-sets ep_size = world_size
@@ -547,9 +652,7 @@ class ServerArgs:
                     "--disaggregation-mode null (aggregate serving) or prefill"
                 )
             if self.mapping.nnodes != 1:
-                raise ValueError(
-                    "--mm-encoder-tp-mode data currently supports a single node only"
-                )
+                logger.warning("--mm-encoder-tp-mode data on nnodes>1 is experimental")
             if self.mapping.has_attn_cp:
                 raise ValueError(
                     "--mm-encoder-tp-mode data does not currently support "
@@ -572,7 +675,7 @@ class ServerArgs:
             self.drafter_attention_backend = self.attention_backend
 
         if (
-            self.speculative_algorithm == "MTP"
+            self.speculative_algorithm in ("MTP", "DSPARK")
             and self.speculative_draft_model_path is None
         ):
             self.draft_model_path_use_base = True
@@ -586,13 +689,30 @@ class ServerArgs:
         if self.speculative_draft_model_quantization == "unquant":
             self.speculative_draft_model_quantization = None
 
-        if self.speculative_algorithm == "DFLASH":
+        if self.speculative_algorithm in ("DFLASH", "DSPARK"):
             expected_steps = max(int(self.speculative_num_draft_tokens) - 1, 0)
             if self.speculative_num_steps == ServerArgs.speculative_num_steps:
                 self.speculative_num_steps = expected_steps
             elif self.speculative_num_steps != expected_steps:
                 raise ValueError(
                     "DFLASH requires speculative_num_steps to equal "
+                    "speculative_num_draft_tokens - 1. "
+                    f"Got {self.speculative_num_steps=} and "
+                    f"{self.speculative_num_draft_tokens=}."
+                )
+
+        if self.speculative_algorithm == "DSPARK" and self.draft_model_path_use_base:
+            if self.enable_prefix_caching:
+                raise ValueError(
+                    "DSPARK does not yet preserve its captured-context windows "
+                    "across prefix-cache hits; use --no-enable-prefix-caching."
+                )
+            expected_steps = max(int(self.speculative_num_draft_tokens) - 1, 0)
+            if self.speculative_num_steps == ServerArgs.speculative_num_steps:
+                self.speculative_num_steps = expected_steps
+            elif self.speculative_num_steps != expected_steps:
+                raise ValueError(
+                    "DSPARK requires speculative_num_steps to equal "
                     "speculative_num_draft_tokens - 1. "
                     f"Got {self.speculative_num_steps=} and "
                     f"{self.speculative_num_draft_tokens=}."
@@ -695,6 +815,15 @@ class ServerArgs:
 
     def validate_cache_options(self):
         if self.enable_kvstore and not self.enable_prefix_caching:
+            if self.speculative_algorithm == "DSPARK" and (
+                self.draft_model_path_use_base
+                or self.speculative_draft_model_path is None
+                or self.speculative_draft_model_path == self.model
+            ):
+                raise ValueError(
+                    "DSPARK currently requires both --disable-kvstore and "
+                    "--no-enable-prefix-caching."
+                )
             raise ValueError(
                 "KVStore and disabled prefix caching are mutually exclusive "
                 "and cannot be used at the same time. Please use only one of them."
@@ -799,6 +928,41 @@ class ServerArgs:
             default=ServerArgs.language_model_only,
             help="Skip vision/audio encoders on a multimodal checkpoint and "
             "run text-only. Multimodal requests are rejected.",
+        )
+        parser.add_argument(
+            "--zmq-msgpack",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.zmq_msgpack,
+            help="Drive the scheduler directly from SMG over the msgpack ZMQ "
+            "wire instead of the Python tokenizer_manager (pickle IPC). SMG "
+            "binds the handshake/input/output sockets; the scheduler connects "
+            "in. Pair with --skip-tokenizer-init.",
+        )
+        parser.add_argument(
+            "--data-parallel-address",
+            type=_nonempty_str,
+            default=ServerArgs.data_parallel_address,
+            help="Host of the frontend-bound handshake ROUTER the scheduler "
+            "connects to under --zmq-msgpack (default "
+            f"{ServerArgs.data_parallel_address}).",
+        )
+        parser.add_argument(
+            "--data-parallel-rpc-port",
+            type=_uint16,
+            default=ServerArgs.data_parallel_rpc_port,
+            help="Port of the frontend-bound handshake ROUTER (default "
+            f"{ServerArgs.data_parallel_rpc_port}, outside the smg frontend's "
+            "derived-port band 20000..=29999). `smg serve --backend "
+            "tokenspeed --connection-mode zmq` passes an explicit port "
+            "derived from the worker's ipc:// URL instead.",
+        )
+        parser.add_argument(
+            "--zmq-engine-index",
+            type=_uint16,
+            default=ServerArgs.zmq_engine_index,
+            help="This engine's index under --zmq-msgpack; used as the two-byte "
+            "little-endian ZMQ routing identity SMG addresses it by "
+            "(0..65535).",
         )
         parser.add_argument("--ext-yaml", type=str, default=None)
         parser.add_argument(
@@ -1019,62 +1183,6 @@ class ServerArgs:
             choices=["float32", "bfloat16"],
             help="It is used to tune mamba ssm dtype",
         )
-        parser.add_argument(
-            "--mamba-track-interval",
-            type=int,
-            default=ServerArgs.mamba_track_interval,
-            help="The interval to track the mamba state during decode.",
-        )
-        parser.add_argument(
-            "--max-mamba-cache-size",
-            type=int,
-            default=ServerArgs.max_mamba_cache_size,
-            help="The maximum number of Mamba cache chunks. If unset, the pool size is profiled from available memory.",
-        )
-        parser.add_argument(
-            "--mamba-full-memory-ratio",
-            type=float,
-            default=ServerArgs.mamba_full_memory_ratio,
-            help="Memory ratio used to split cache budget between Mamba state chunks and full-attention KV cache.",
-        )
-        parser.add_argument(
-            "--enable-mamba-l2",
-            action="store_true",
-            help="Enable host-memory L2 cache for Mamba state slots.",
-        )
-        parser.add_argument(
-            "--mamba-l2-host-slots",
-            type=int,
-            default=ServerArgs.mamba_l2_host_slots,
-            help="Number of host Mamba L2 slots. If 0, derive from --mamba-l2-host-gb or --mamba-l2-ratio.",
-        )
-        parser.add_argument(
-            "--mamba-l2-ratio",
-            type=float,
-            default=ServerArgs.mamba_l2_ratio,
-            help="Mamba host L2 slot ratio relative to device Mamba slots when host slots are not explicit.",
-        )
-        parser.add_argument(
-            "--mamba-l2-layout",
-            type=str,
-            choices=["layer_first"],
-            default=ServerArgs.mamba_l2_layout,
-            help="Mamba host L2 memory layout.",
-        )
-        parser.add_argument(
-            "--mamba-l2-io-backend",
-            type=str,
-            choices=["direct", "kernel"],
-            default=ServerArgs.mamba_l2_io_backend,
-            help="IO backend for Mamba L2 host/device transfers.",
-        )
-        parser.add_argument(
-            "--mamba-l2-host-gb",
-            type=int,
-            default=ServerArgs.mamba_l2_host_gb,
-            help="Mamba L2 host memory budget in GiB. Overrides --mamba-l2-ratio when host slots are not explicit.",
-        )
-
         parser.add_argument(
             "--max-prefill-tokens",
             metavar="MAX_PREFILL_TOKENS",
@@ -1302,7 +1410,8 @@ class ServerArgs:
             "--moe-backend",
             type=str,
             default=ServerArgs.moe_backend,
-            help="MoE runner backend: auto, triton, gluon, flashinfer_trtllm",
+            help="MoE runner backend: auto, triton, gluon, flashinfer_trtllm, "
+            "flashinfer_cutlass, flashinfer_cutedsl, deep_gemm, mega_moe",
         )
         parser.add_argument(
             "--draft-moe-backend",
@@ -1335,13 +1444,20 @@ class ServerArgs:
         parser.add_argument(
             "--dist-init-addr",
             type=str,
-            help="The host address for initializing distributed backend (e.g., `192.168.0.2:25000`).",
+            help="The host address for initializing distributed backend (e.g., `192.168.0.2:25000`). "
+            "Derived from the launcher environment under a multi-node Slurm step.",
         )
         parser.add_argument(
-            "--nnodes", type=int, default=ServerArgs.nnodes, help="The number of nodes."
+            "--nnodes",
+            type=int,
+            default=ServerArgs.nnodes,
+            help="The number of nodes. Derived from SLURM_STEP_NUM_NODES when unset.",
         )
         parser.add_argument(
-            "--node-rank", type=int, default=ServerArgs.node_rank, help="The node rank."
+            "--node-rank",
+            type=int,
+            default=ServerArgs.node_rank,
+            help="The node rank. Derived from SLURM_NODEID when unset.",
         )
 
         # Model override args
@@ -1384,23 +1500,14 @@ class ServerArgs:
             type=str,
             choices=["auto", "fla", "flashkda", "cutedsl_kda"],
             default=ServerArgs.kda_backend,
-            help="KDA (Kimi Delta Attention) prefill kernel policy: 'auto' "
-            "picks the fastest available kernel (cutedsl_kda > flashkda > fla); "
-            "'fla' forces the portable FLA scan; 'flashkda' the optional "
-            "FlashKDA library (source build, SM90+); 'cutedsl_kda' the "
+            help="KDA (Kimi Delta Attention) prefill kernel policy. On AMD, "
+            "this setting is ignored and compatible kernels are selected using "
+            "registry priority. On NVIDIA, 'auto' selects the fastest available "
+            "backend "
+            "(cutedsl_kda > flashkda > fla). Named backends are NVIDIA-specific: "
+            "'fla' uses the portable FLA scan, 'flashkda' uses the optional "
+            "FlashKDA library (source build, SM90+), and 'cutedsl_kda' uses the "
             "CuteDSL KDA AOT kernel (prebuilt, sm_103a). Decode is unaffected.",
-        )
-        parser.add_argument(
-            "--moe-activation-dtype",
-            type=str,
-            choices=["bf16", "mxfp8"],
-            default=ServerArgs.moe_activation_dtype,
-            help="MoE activation precision (Kimi-K3 fused SiTU MoE): 'bf16' "
-            "keeps bf16 activations (w4a16, default); 'mxfp8' block-quantizes "
-            "activations to fp8 (w4a8, mxfp8-act x mxfp4-weight). A run-wide "
-            "deployment choice, stable for the whole process; 'mxfp8' speeds up "
-            "large-batch prefill (~1.5x on the MoE) at a small decode cost and "
-            "requires the sidecar's w4a8 cubins. Weights stay mxfp4 either way.",
         )
         parser.add_argument(
             "--drafter-attention-backend",
@@ -1563,7 +1670,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE3", "MTP", "DFLASH"],
+            choices=["EAGLE3", "MTP", "DFLASH", "DSPARK"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -1639,6 +1746,14 @@ class ServerArgs:
             help="Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
         )
         parser.add_argument(
+            "--disable-autotune",
+            "--disable-flashinfer-autotune",
+            action="store_true",
+            help="Skip the startup kernel-tuning pass; tunable kernels use each "
+            "library's heuristic tactics instead. Speeds up startup for "
+            "debugging at the cost of serving performance.",
+        )
+        parser.add_argument(
             "--enable-cudagraph-gc",
             action="store_true",
             help="Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen during capture to speed up the process.",
@@ -1652,11 +1767,6 @@ class ServerArgs:
             "--enable-symm-mem",
             action="store_true",
             help="Enable NCCL symmetric memory for fast collectives.",
-        )
-        parser.add_argument(
-            "--disable-custom-all-reduce",
-            action="store_true",
-            help="Disable the custom all-reduce kernel and fall back to NCCL.",
         )
         parser.add_argument(
             "--disable-overlap-schedule",
@@ -1808,7 +1918,9 @@ class ServerArgs:
             "--dense-tp-size",
             type=int,
             default=ServerArgs.dense_tp_size,
-            help="Specify tp size for dense part, default equals nprocs-per-node, if non dp_attn && combine_dense mode, this parameter will be overridden by attn_tp_size",
+            help="Specify tp size for dense part. Defaults to the attention "
+            "replica width (attn_tp_size x attn_cp_size): the full world without "
+            "DP attention, one replica with it.",
         )
         parser.add_argument(
             "--moe-tp-size",
@@ -2001,6 +2113,11 @@ class ServerArgs:
             return f"http://[{self.host}]:{self.port}"
         return f"http://{self.host}:{self.port}"
 
+    def zmq_handshake_endpoint(self) -> str:
+        """The frontend handshake endpoint dialed under ``--zmq-msgpack``,
+        composed from ``--data-parallel-address``/``--data-parallel-rpc-port``."""
+        return f"tcp://{self.data_parallel_address}:{self.data_parallel_rpc_port}"
+
     def get_weight_transfer_config(self):
         """Parse ``--weight-transfer-config`` JSON into a ``WeightTransferConfig``."""
         from tokenspeed.runtime.engine.weight_transfer.config import (
@@ -2041,6 +2158,9 @@ class PortArgs:
     # The port for nccl initialization (torch.dist)
     nccl_port: int
 
+    # The resolved rendezvous address after moving past busy local ports.
+    dist_init_addr: str
+
     # The ipc filename for rpc call between Engine and Scheduler
     rpc_ipc_name: str
 
@@ -2071,6 +2191,12 @@ class PortArgs:
                     f"Example: --dist-init-addr 127.0.0.1:4000"
                 )
             dist_init_addr = ("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
+        elif server_args.dist_init_addr is None:
+            raise ValueError(
+                f"--dist-init-addr is required for nnodes={server_args.mapping.nnodes} "
+                "and could not be derived from the launcher environment. "
+                "Example: --dist-init-addr <head-node-ip>:20000"
+            )
         else:
             dist_init_addr = server_args.dist_init_addr.split(":")
         if len(dist_init_addr) != 2:
@@ -2081,12 +2207,18 @@ class PortArgs:
         dist_init_host, dist_init_port = dist_init_addr
         dist_init_port = int(dist_init_port)
 
-        # Scan forward until we find a port cluster where all derived ports are free.
-        # This handles the case where a previous engine instance left ports in
-        # TIME_WAIT or its child processes haven't fully terminated yet.
-        # Note: the port at offset +1 (formerly detokenizer_port) is intentionally
-        # skipped so the rest of the port layout stays stable for any external
-        # tooling that indexed off the historical port cluster.
+        # Scan forward until we find a port cluster where all derived ports are
+        # free. This handles the case where a previous engine instance left
+        # ports in TIME_WAIT or its child processes haven't fully terminated
+        # yet. Note: the port at offset +1 (formerly detokenizer_port) is
+        # intentionally skipped so the rest of the port layout stays stable for
+        # any external tooling that indexed off the historical port cluster.
+        #
+        # The whole cluster is bound on node 0 alone, so scanning is only
+        # meaningful there: is_port_available binds the local wildcard, and a
+        # follower moving its own base would simply address ports the head
+        # never bound. Multi-node therefore takes the cluster as derived and
+        # reports a conflict instead of relocating it.
         while True:
             port_base = dist_init_port + 1
             rpc_port = port_base + 2
@@ -2097,17 +2229,26 @@ class PortArgs:
             else:
                 scheduler_input_port = port_base + 2 + 1 + dp_rank
             rpc_ipc_port = scheduler_input_port + 1
-            if all(
-                is_port_available(p)
-                for p in [
-                    dist_init_port,
-                    port_base,
-                    rpc_port,
-                    metrics_ipc_port,
-                    scheduler_input_port,
-                    rpc_ipc_port,
-                ]
-            ):
+            cluster = [
+                dist_init_port,
+                port_base,
+                rpc_port,
+                metrics_ipc_port,
+                scheduler_input_port,
+                rpc_ipc_port,
+            ]
+            if server_args.mapping.nnodes > 1:
+                if server_args.node_rank == 0:
+                    busy = [p for p in cluster if not is_port_available(p)]
+                    if busy:
+                        raise ValueError(
+                            f"control-plane ports {busy} are already in use on the "
+                            "head node. Every node derives this cluster from "
+                            "--dist-init-addr, so it cannot be moved on one node "
+                            "alone; restart with a different --dist-init-addr port."
+                        )
+                break
+            if all(is_port_available(p) for p in cluster):
                 break
             dist_init_port += 10
 
@@ -2115,6 +2256,7 @@ class PortArgs:
             tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
             scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
             nccl_port=port,
+            dist_init_addr=f"{dist_init_host}:{dist_init_port}",
             rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
             metrics_ipc_name=f"tcp://{dist_init_host}:{metrics_ipc_port}",
             tokenizer_worker_ipc_name=None,

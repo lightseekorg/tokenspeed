@@ -5,10 +5,7 @@ set -e
 # ROCm/AMD MI355 install script for TokenSpeed CI.
 # ============================================================
 GFX_ARCH=${GFX_ARCH:-gfx950}
-ROCM_VERSION=${ROCM_VERSION:-7.2}
 BUILD_AND_DOWNLOAD_PARALLEL=${BUILD_AND_DOWNLOAD_PARALLEL:-16}
-
-ROCM_INDEX="https://download.pytorch.org/whl/rocm${ROCM_VERSION}"
 
 export MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL}
 WORKSPACE=${WORKSPACE:-$(pwd)}
@@ -34,7 +31,6 @@ pip_install_with_retry() {
 
 echo "=========================================="
 echo "GFX_ARCH=${GFX_ARCH}"
-echo "ROCM_VERSION=${ROCM_VERSION}"
 echo "WORKSPACE=${WORKSPACE}"
 echo "=========================================="
 
@@ -42,9 +38,16 @@ echo "=== Step 1: apt deps ==="
 sudo apt-get install -y openmpi-bin libopenmpi-dev libssl-dev pkg-config
 
 echo "=== Step 2: Upgrade pip/setuptools/wheel ==="
-python3 -m pip install --upgrade pip "setuptools<82" wheel
+pip install --upgrade pip "setuptools<82" wheel
 
-echo "=== Step 3: Install tokenspeed-kernel packages ==="
+echo "=== Step 3: Check PyTorch for ROCm ==="
+if ! pip3 show torch >/dev/null 2>&1; then
+    echo "torch is not installed; installing PyTorch for ROCm 7.2"
+    pip3 install torch==2.11.0 torchvision==0.26.0 \
+        --index-url https://download.pytorch.org/whl/rocm7.2
+fi
+
+echo "=== Step 4: Install tokenspeed-kernel packages ==="
 
 cd "${WORKSPACE}"
 # `tokenspeed-kernel` installs requirements/rocm.txt during its native build.
@@ -54,26 +57,20 @@ pip3 install --force-reinstall --no-deps \
     "${WORKSPACE}/tokenspeed-kernel-amd" --no-build-isolation
 
 cd "${WORKSPACE}"
-export PIP_EXTRA_INDEX_URL="${ROCM_INDEX}"
+
 TOKENSPEED_KERNEL_BACKEND=rocm \
 pip_install_with_retry pip3 install tokenspeed-kernel/python/ \
     --no-build-isolation -v
 
-echo "=== Step 4: Install TokenSpeed Scheduler ==="
+echo "=== Step 5: Install TokenSpeed Scheduler ==="
 pip_install_with_retry pip3 install cmake ninja
-# Set TOKENSPEED_FLAT_KV=ON in a CI task env to build the scheduler with Flat KV.
-SCHEDULER_PIP_ARGS=()
-if [ "${TOKENSPEED_FLAT_KV:-OFF}" = "ON" ]; then
-    SCHEDULER_PIP_ARGS+=(--config-settings=cmake.define.TOKENSPEED_FLAT_KVCACHE=ON)
-fi
-pip_install_with_retry pip3 install tokenspeed-scheduler/ "${SCHEDULER_PIP_ARGS[@]}"
+pip_install_with_retry pip3 install tokenspeed-scheduler/
 
-echo "=== Step 5: Install TokenSpeed ==="
+echo "=== Step 6: Install TokenSpeed ==="
 # tokenspeed-smg / -grpc-servicer / -grpc-proto are pinned in
 # python/pyproject.toml; pip resolves them from PyPI as part of the
 # editable install below.
-pip_install_with_retry pip3 install -e ./python --no-build-isolation \
-    --extra-index-url "${ROCM_INDEX}"
+pip_install_with_retry pip3 install -e ./python --no-build-isolation
 
 echo ""
 echo "=========================================="

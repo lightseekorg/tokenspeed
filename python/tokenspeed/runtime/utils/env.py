@@ -57,14 +57,13 @@ global_server_args_dict: dict = {
     "max_model_len": ServerArgs.max_model_len,
     "max_num_seqs": ServerArgs.max_num_seqs,
     "moe_backend": ServerArgs.moe_backend,
-    "moe_activation_dtype": ServerArgs.moe_activation_dtype,
     "enforce_eager": ServerArgs.enforce_eager,
     "max_cudagraph_capture_size": ServerArgs.max_cudagraph_capture_size,
     "cudagraph_capture_sizes": ServerArgs.cudagraph_capture_sizes,
     "disable_prefill_graph": ServerArgs.disable_prefill_graph,
     "prefill_graph_max_tokens": ServerArgs.prefill_graph_max_tokens,
-    "mamba_track_interval": ServerArgs.mamba_track_interval,
     "all2all_backend": ServerArgs.all2all_backend,
+    "deepep_mode": ServerArgs.deepep_mode,
 }
 
 
@@ -107,13 +106,13 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "max_model_len": server_args.max_model_len,
             "max_num_seqs": server_args.max_num_seqs,
             "moe_backend": server_args.moe_backend,
-            "moe_activation_dtype": server_args.moe_activation_dtype,
             "enforce_eager": server_args.enforce_eager,
             "max_cudagraph_capture_size": server_args.max_cudagraph_capture_size,
             "cudagraph_capture_sizes": server_args.cudagraph_capture_sizes,
             "disable_prefill_graph": server_args.disable_prefill_graph,
             "prefill_graph_max_tokens": server_args.prefill_graph_max_tokens,
             "all2all_backend": server_args.all2all_backend,
+            "deepep_mode": server_args.deepep_mode,
         }
     )
     pdl_enabled.cache_clear()
@@ -241,6 +240,7 @@ class Envs:
     TOKENSPEED_CUDA_COREDUMP_DIR = EnvStr("/tmp/tokenspeed_cuda_coredumps")
     TOKENSPEED_PROFILE_WITH_STACK = EnvBool(True)
     TOKENSPEED_TEST_REQUEST_TIME_STATS = EnvBool(False)
+    TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS = EnvBool(False)
     TOKENSPEED_PROFILER_DIR = EnvStr("/tmp")
     TOKENSPEED_CI_SMALL_KV_SIZE = EnvInt(-1)
     TOKENSPEED_NVTX = EnvBool(False)
@@ -297,6 +297,10 @@ class Envs:
     TOKENSPEED_ENABLE_TORCH_INFERENCE_MODE = EnvBool(True)
     TOKENSPEED_NUMA_AWARE_WORKER_AFFINITY = EnvBool(True)
     TOKENSPEED_REQUEST_CONVERSION_WORKERS = EnvInt(8)
+    # Rollout escape hatch: revert engine IPC (frontend <-> controller <->
+    # scheduler ZMQ hops) from msgpack back to pickle. Read once at import of
+    # engine.io_struct.
+    TOKENSPEED_USE_PICKLE_IPC = EnvBool(False)
 
     # Multimodal / VLM
     TOKENSPEED_LOG_MM_TIMING = EnvBool(False)

@@ -33,7 +33,6 @@ from tokenspeed_kernel.ops.gemm.fp8_utils import (
     static_quant_fp8,
     swizzle_mxfp8_scale,
 )
-from tokenspeed_kernel.platform import Platform
 from torch.nn.parameter import Parameter
 
 logger = logging.getLogger(__name__)
@@ -48,11 +47,16 @@ except ImportError:
     _transform_sf = None
 
 try:
-    from tokenspeed_kernel.ops.gemm.flashinfer import has_flashinfer_mxfp8
+    from tokenspeed_kernel.ops.gemm.flashinfer import (
+        has_flashinfer_fp8_blockscale,
+        has_flashinfer_mxfp8,
+        prepare_flashinfer_fp8_blockscale_weight_scales,
+    )
 except ImportError:
+    has_flashinfer_fp8_blockscale = None
     has_flashinfer_mxfp8 = None
+    prepare_flashinfer_fp8_blockscale_weight_scales = None
 
-from tokenspeed.runtime.layers.dense.utils import normalize_e4m3fn_to_e4m3fnuz
 from tokenspeed.runtime.layers.parameter import (
     BlockQuantScaleParameter,
     ModelWeightParameter,
@@ -62,8 +66,6 @@ from tokenspeed.runtime.layers.quantization.base_config import LinearMethodBase
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 from tokenspeed.runtime.layers.quantization.utils import convert_to_channelwise
 from tokenspeed.runtime.utils.pdl import pdl_enabled
-
-platform = Platform.get()
 
 
 class Fp8LinearMethod(LinearMethodBase):
@@ -208,20 +210,8 @@ class Fp8LinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if self.block_quant:
-            # If ROCm, normalize the weights and scales to e4m3fnuz
-            if platform.is_fp8e4m3fnuz:
-                # activation_scheme: dynamic
-                weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-                    weight=layer.weight,
-                    weight_scale=layer.weight_scale_inv,
-                    input_scale=None,
-                )
-                layer.input_scale = None
-            else:
-                weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
-            layer.weight.data = weight.data
-            layer.weight_scale_inv.data = weight_scale.data
             layer._use_deep_gemm_fp8 = False
+            layer._use_flashinfer_fp8_blockscale = False
             is_bmm = getattr(layer, "is_bmm", False)
             is_ue8m0 = getattr(self.quant_config, "scale_fmt", None) == "ue8m0"
             scale_requires_transform = (
@@ -298,6 +288,32 @@ class Fp8LinearMethod(LinearMethodBase):
                         layer.weight_scale_inv.data, N, K
                     )
                     layer._use_flashinfer_mxfp8 = True
+            if (
+                not layer._use_deep_gemm_fp8
+                and not layer._use_flashinfer_mxfp8
+                and not is_bmm
+                and has_flashinfer_fp8_blockscale is not None
+                and has_flashinfer_fp8_blockscale()
+                and prepare_flashinfer_fp8_blockscale_weight_scales is not None
+                and tuple(self.quant_config.weight_block_size) == (128, 128)
+                and layer.weight_scale_inv.dtype == torch.float32
+                and layer.weight_scale_inv.dim() == 2
+            ):
+                N, K = layer.weight.shape
+                if N % 128 == 0 and K % 128 == 0:
+                    prepared_scales = prepare_flashinfer_fp8_blockscale_weight_scales(
+                        layer.weight_scale_inv.data
+                    )
+                    buffer_name = "_flashinfer_fp8_weight_scales_mn"
+                    if buffer_name in layer._buffers:
+                        layer._buffers[buffer_name] = prepared_scales
+                    else:
+                        layer.register_buffer(
+                            buffer_name,
+                            prepared_scales,
+                            persistent=False,
+                        )
+                    layer._use_flashinfer_fp8_blockscale = True
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
 
@@ -368,19 +384,30 @@ class Fp8LinearMethod(LinearMethodBase):
                 override = "deep_gemm_mm_fp8_blockscale"
             elif getattr(layer, "_use_flashinfer_mxfp8", False):
                 override = "flashinfer_mm_mxfp8"
+            elif (
+                getattr(layer, "_use_flashinfer_fp8_blockscale", False)
+                and block_scale is None
+            ):
+                override = "flashinfer_mm_fp8_blockscale"
             else:
                 override = None
+            use_flashinfer_fp8_blockscale = override == "flashinfer_mm_fp8_blockscale"
             output = tokenspeed_kernel.mm(
                 input_2d,
                 layer.weight,
                 A_scales=block_scale,
-                B_scales=layer.weight_scale_inv,
+                B_scales=(
+                    layer._flashinfer_fp8_weight_scales_mn
+                    if use_flashinfer_fp8_blockscale
+                    else layer.weight_scale_inv
+                ),
                 bias=bias,
                 out_dtype=output_dtype,
                 quant="mxfp8",
                 block_size=self.quant_config.weight_block_size,
                 override=override,
                 enable_pdl=pdl_enabled(),
+                prepacked_scales=use_flashinfer_fp8_blockscale,
             )
             return output.to(dtype=output_dtype).view(*output_shape)
         else:

@@ -80,7 +80,6 @@ class DistributedConfig:
     max_num_tokens: int = 0
 
     # Feature flags
-    disable_custom_all_reduce: bool = False
     force_deterministic_rsag: bool = False
 
     # The full Mapping object for pg_manager initialization
@@ -110,7 +109,7 @@ class DistributedConfig:
             moe_ep_size=mapping.moe.ep_size,
             moe_ep_rank=mapping.moe.ep_rank,
             nccl_port=port_args.nccl_port,
-            dist_init_addr=server_args.dist_init_addr,
+            dist_init_addr=port_args.dist_init_addr,
             distributed_timeout_seconds=(
                 server_args.distributed_timeout_seconds
                 if server_args.distributed_timeout_seconds is not None
@@ -120,7 +119,6 @@ class DistributedConfig:
             nprocs_per_node=mapping.nprocs_per_node,
             hidden_size=hidden_size,
             max_num_tokens=max_num_tokens,
-            disable_custom_all_reduce=server_args.disable_custom_all_reduce,
             force_deterministic_rsag=server_args.force_deterministic_rsag,
             mapping=mapping,
         )
@@ -167,13 +165,15 @@ class DistributedInitializer:
         pg_manager.init_process_group(config.mapping.dense.tp_group)
         pg_manager.init_process_group(config.mapping.moe.tp_ep_group)
 
-        # Register Lamport one-shot all-reduce workspaces for the TP groups.
-        # AutoBackend routes small SUM all-reduces (<= 2 MB payload, i.e. the
-        # per-step decode reductions) through them; larger payloads and every
-        # other op keep using NCCL. Without this the one-shot backend is
-        # never armed and raw all_reduce callers (e.g. models whose comm
-        # cannot fuse into a norm) pay ring latency per layer.
-        if not config.disable_custom_all_reduce and config.hidden_size > 0:
+        # Register the trtllm one-shot all-reduce workspaces for the TP
+        # groups. AutoBackend routes small SUM all-reduces (<= 2 MB payload,
+        # i.e. the per-step decode reductions) through them; larger payloads
+        # and every other op keep using NCCL. Without this the one-shot
+        # backend is never armed and raw all_reduce callers (e.g. models whose
+        # comm cannot fuse into a norm) pay ring latency per layer.
+        # Unconditional: --force-deterministic-rsag is the escape hatch, and
+        # it overrides at dispatch (auto.py) rather than at registration.
+        if config.hidden_size > 0:
             from tokenspeed.runtime.distributed.comm_backend import (
                 get_global_backend,
             )

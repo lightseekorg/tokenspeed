@@ -22,8 +22,8 @@ from types import SimpleNamespace
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ci_system.ci_register import register_cuda_ci  # noqa: E402
-from runtime.test_inkling_reference_parity import (  # noqa: E402
+from ci_system.ci_register import register_cuda_ci
+from runtime.test_inkling_reference_parity import (
     _build_replica,
     _has_blackwell,
     _ref_sconv,
@@ -162,6 +162,8 @@ class _Harness:
             kv_cache_quant_method="none",
         )
         inner = MHAAttnBackend(config)
+        from cache_pool_test_utils import make_mha_memory_plan
+
         self.kv_pool = MHATokenToKVPool(
             size=1024,
             dtype=torch.bfloat16,
@@ -170,10 +172,17 @@ class _Harness:
             layer_num=text.num_hidden_layers,
             device=device,
             enable_memory_saver=False,
-            max_batch_size=4,
-            max_context_len=1024,
             page_size=PAGE_SIZE,
             rank=0,
+            layer_group_ids=("full_attention",) * text.num_hidden_layers,
+            memory_plan=make_mha_memory_plan(
+                size=1024,
+                page_size=PAGE_SIZE,
+                layer_num=text.num_hidden_layers,
+                kv_heads=text.num_key_value_heads,
+                head_dim=text.head_dim,
+                dtype=torch.bfloat16,
+            ),
         )
         conv_pool = InklingConvStatePool(
             num_layers=text.num_hidden_layers,
@@ -186,9 +195,9 @@ class _Harness:
         self.backend = InklingAttnBackend(inner, conv_pool)
         # Request slot REQ_SLOT owns pages [1, 2, ...] -> token locs 64+.
         max_pages = 1024 // PAGE_SIZE
-        self.req_to_page = torch.zeros(8, max_pages, dtype=torch.int32, device=device)
+        self.page_table = torch.zeros(8, max_pages, dtype=torch.int32, device=device)
         for p in range(max_pages - 1):
-            self.req_to_page[REQ_SLOT, p] = p + 1
+            self.page_table[REQ_SLOT, p] = p + 1
         self.seq_len = 0
 
     def _ctx(self, mode):
@@ -216,7 +225,7 @@ class _Harness:
             num_extends=1,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            req_to_page=self.req_to_page,
+            page_table=self.page_table,
             forward_mode=ForwardMode.EXTEND,
             extend_seq_lens=seq_lens,
             extend_seq_lens_cpu=torch.tensor([T]),
@@ -241,7 +250,7 @@ class _Harness:
             num_extends=0,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            req_to_page=self.req_to_page,
+            page_table=self.page_table,
             forward_mode=ForwardMode.DECODE,
         )
         out_cache_loc = self._token_locs(self.seq_len - 1, 1)

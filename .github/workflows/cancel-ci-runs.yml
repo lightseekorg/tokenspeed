@@ -1,0 +1,300 @@
+name: Cancel Active CI Runs
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: "Target one PR or every active Actions run"
+        required: true
+        default: pr
+        type: choice
+        options:
+          - pr
+          - all
+      pr_number:
+        description: "PR number (required when scope is pr)"
+        required: false
+        type: string
+      confirm:
+        description: 'Type "all" to confirm scope=all'
+        required: false
+        type: string
+      dry_run:
+        description: "List matching runs without cancelling them"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  cancel:
+    name: Cancel active CI runs
+    if: github.repository == 'lightseekorg/tokenspeed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Cancel matching runs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const scope = String(context.payload.inputs?.scope || "pr");
+            const rawPrNumber = String(
+              context.payload.inputs?.pr_number || "",
+            ).trim();
+            const confirmation = String(
+              context.payload.inputs?.confirm || "",
+            ).trim();
+            const dryRun =
+              String(context.payload.inputs?.dry_run || "false") === "true";
+
+            const validationErrors = [];
+            let prNumber = null;
+
+            if (scope === "pr") {
+              if (!/^[1-9]\d*$/.test(rawPrNumber)) {
+                validationErrors.push(
+                  "pr_number must be a positive integer when scope=pr.",
+                );
+              } else {
+                prNumber = Number(rawPrNumber);
+                if (!Number.isSafeInteger(prNumber)) {
+                  validationErrors.push("pr_number is too large.");
+                }
+              }
+              if (confirmation !== "") {
+                validationErrors.push("confirm must be empty when scope=pr.");
+              }
+            } else if (scope === "all") {
+              if (rawPrNumber !== "") {
+                validationErrors.push(
+                  "pr_number must be empty when scope=all.",
+                );
+              }
+              if (confirmation !== "" && confirmation !== "all") {
+                validationErrors.push(
+                  'confirm must be empty or the literal "all".',
+                );
+              }
+              if (!dryRun && confirmation !== "all") {
+                validationErrors.push(
+                  'Type "all" in confirm to cancel every active run.',
+                );
+              }
+            } else {
+              validationErrors.push("scope must be either pr or all.");
+            }
+
+            if (validationErrors.length > 0) {
+              core.setFailed(validationErrors.join(" "));
+              return;
+            }
+
+            const { owner, repo } = context.repo;
+            const controllerPath =
+              ".github/workflows/cancel-ci-runs.yml";
+            const activeStatuses = [
+              "queued",
+              "in_progress",
+              "waiting",
+              "requested",
+              "pending",
+            ];
+            const runsById = new Map();
+            const summaryRows = [];
+            const failures = [];
+            let targetDescription =
+              scope === "all"
+                ? "All active Actions runs"
+                : "PR #" + prNumber;
+            let fatalError = null;
+            let noMatches = false;
+
+            try {
+              let pull = null;
+              if (scope === "pr") {
+                const response = await github.rest.pulls.get({
+                  owner,
+                  repo,
+                  pull_number: prNumber,
+                });
+                pull = response.data;
+                const pullState = pull.merged ? "merged" : pull.state;
+                targetDescription =
+                  "PR #" + prNumber + " (" + pullState + ")";
+                core.notice("Targeting " + targetDescription + ".");
+              }
+
+              // The API accepts one status per request and caps each filtered
+              // search at 1,000 results. Active-only queries keep this bounded.
+              for (const status of activeStatuses) {
+                const runs = await github.paginate(
+                  github.rest.actions.listWorkflowRunsForRepo,
+                  {
+                    owner,
+                    repo,
+                    status,
+                    per_page: 100,
+                  },
+                );
+                for (const run of runs) {
+                  // A run may change status between queries, so deduplicate it.
+                  runsById.set(run.id, run);
+                }
+              }
+
+              const matchingRuns = [...runsById.values()]
+                .filter(
+                  (run) =>
+                    Number(run.id) !== Number(context.runId) &&
+                    run.path !== controllerPath,
+                )
+                .filter((run) => {
+                  if (scope === "all") {
+                    return true;
+                  }
+
+                  const associatedPull = (run.pull_requests || []).some(
+                    (candidate) => candidate.number === prNumber,
+                  );
+                  if (associatedPull) {
+                    return true;
+                  }
+
+                  // Some fork PR runs have no pull_requests association. Use
+                  // only an exact current-head fallback; repo and branch alone
+                  // could match a different PR from the same source branch.
+                  const runHeadRepo =
+                    run.head_repository?.full_name || null;
+                  const pullHeadRepo = pull.head.repo?.full_name || null;
+                  return (
+                    runHeadRepo !== null &&
+                    pullHeadRepo !== null &&
+                    runHeadRepo === pullHeadRepo &&
+                    run.head_branch === pull.head.ref &&
+                    run.head_sha === pull.head.sha
+                  );
+                })
+                .sort((left, right) => left.id - right.id);
+
+              if (matchingRuns.length === 0) {
+                noMatches = true;
+                core.notice(
+                  "No active runs matched the requested scope.",
+                );
+              } else if (scope === "all" && !dryRun) {
+                core.warning(
+                  "Cancelling " + matchingRuns.length +
+                    " active run(s) across the repository.",
+                );
+              }
+
+              async function cancelRun(run) {
+                if (dryRun) {
+                  core.notice(
+                    "Would cancel " + run.name + " run " + run.id + ".",
+                  );
+                  return "Dry run";
+                }
+
+                for (let attempt = 1; attempt <= 3; attempt += 1) {
+                  try {
+                    // GitHub recommends force-cancel only when a normal
+                    // cancellation request does not stop the run.
+                    await github.rest.actions.cancelWorkflowRun({
+                      owner,
+                      repo,
+                      run_id: run.id,
+                    });
+                    core.notice(
+                      "Cancellation requested for " + run.name +
+                        " run " + run.id + ".",
+                    );
+                    return "Cancellation requested";
+                  } catch (error) {
+                    if (error.status === 409) {
+                      core.notice(
+                        run.name + " run " + run.id +
+                          " is no longer cancellable.",
+                      );
+                      return "Not cancellable";
+                    }
+                    if (
+                      error.status >= 500 &&
+                      error.status < 600 &&
+                      attempt < 3
+                    ) {
+                      core.warning(
+                        "Cancellation attempt " + attempt + " for run " +
+                          run.id + " failed: " + error.message +
+                          ". Retrying.",
+                      );
+                      await new Promise((resolve) =>
+                        setTimeout(resolve, 2000),
+                      );
+                      continue;
+                    }
+
+                    const message =
+                      run.name + " run " + run.id + ": " + error.message;
+                    failures.push(message);
+                    core.warning("Failed to cancel " + message);
+                    return "Failed to cancel";
+                  }
+                }
+              }
+
+              for (const run of matchingRuns) {
+                const result = await cancelRun(run);
+                summaryRows.push([
+                  run.name,
+                  `<a href="${run.html_url}">${run.id}</a>`,
+                  run.status,
+                  result,
+                ]);
+              }
+            } catch (error) {
+              fatalError = error;
+              core.error("Unable to inspect active runs: " + error.message);
+            } finally {
+              core.summary.addHeading("Active CI cancellation summary");
+              core.summary.addRaw("Target: " + targetDescription).addEOL();
+              if (summaryRows.length > 0) {
+                core.summary.addTable([
+                  [
+                    { data: "Workflow", header: true },
+                    { data: "Run", header: true },
+                    { data: "Status", header: true },
+                    { data: "Result", header: true },
+                  ],
+                  ...summaryRows,
+                ]);
+              } else if (noMatches) {
+                core.summary.addRaw(
+                  "No active runs matched the requested scope.",
+                );
+              }
+              if (fatalError) {
+                core.summary.addEOL().addRaw(
+                  "Failed to inspect active runs: " + fatalError.message,
+                );
+              }
+              await core.summary.write();
+            }
+
+            if (fatalError) {
+              core.setFailed(
+                "Unable to inspect active runs: " + fatalError.message,
+              );
+            } else if (failures.length > 0) {
+              core.setFailed(
+                "Failed to cancel " + failures.length + " run(s).",
+              );
+            }

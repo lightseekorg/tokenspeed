@@ -93,3 +93,44 @@ def test_moe_layer_rejects_uneven_contiguous_ep_partition() -> None:
             ep_rank=0,
             ep_size=3,
         )
+
+
+def test_moe_layer_requests_dynamic_mxfp4_activations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = {}
+
+    class Mxfp4QuantConfig:
+        ignored_layers = None
+        exclude_modules = None
+        is_w4a8_fp8 = False
+        use_dynamic_mxfp4_activations = True
+
+        def moe_weight_dtype(self, prefix: str) -> str:
+            return "mxfp4"
+
+    def fake_moe_plan(weight_dtype: str, **kwargs) -> dict:
+        captured.update(kwargs)
+        return {
+            "solution": "triton",
+            "support_routing": False,
+            "supports_deferred_finalize": False,
+        }
+
+    auto_backend = type("AutoBackend", (), {"value": "auto"})()
+    monkeypatch.setattr(expert_module, "get_moe_backend", lambda: auto_backend)
+    monkeypatch.setattr(expert_module.tokenspeed_kernel, "moe_plan", fake_moe_plan)
+    monkeypatch.setattr(
+        expert_module, "create_layer_weights", lambda *args, **kwargs: None
+    )
+
+    MoELayer(
+        top_k=2,
+        num_experts=4,
+        hidden_size=128,
+        intermediate_size=128,
+        quant_config=Mxfp4QuantConfig(),
+        layer_index=0,
+    )
+
+    assert captured["internal_activation_dtype"] == "mxfp4"

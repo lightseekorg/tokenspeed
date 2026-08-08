@@ -19,7 +19,28 @@
 # SOFTWARE.
 
 """
-tokenspeed_kernel build script.
+Build and package tokenspeed_kernel.
+
+This script will automatically detect the CUDA or ROCm backend and install the
+appropriate dependencies, and compile the native kernels for the selected
+backend.
+
+Dependency handling
+===================
+
+Dependencies are split by purpose:
+
+* requirements/<backend>.txt contains core build and runtime dependencies.
+* requirements/<backend>-thirdparty.txt contains external kernel packages.
+
+Both files are combined into install_requires and recorded in wheel
+metadata. During a source or editable build, the native build step also
+installs the core backend file before compiling. Third-party dependencies are
+installed by the outer package installer from the generated metadata. They are
+not optional despite being kept in a separate file.
+
+Kernel compilation
+==================
 
 Compiles .cu files into shared libraries (.so) loaded via tvm_ffi.load_module().
 On systems without an NVIDIA CUDA build target, the build is skipped and the
@@ -430,6 +451,7 @@ KERNEL_GROUPS = [
         [
             CUDA_CSRC_DIR / "trtllm_allreduce.cu",
             CUDA_CSRC_DIR / "trtllm_allreduce_fusion.cu",
+            CUDA_CSRC_DIR / "trtllm_mnnvl_allreduce_fusion.cu",
             CUDA_CSRC_DIR / "trtllm_reducescatter_fusion.cu",
             CUDA_CSRC_DIR / "trtllm_allgather_fusion.cu",
             CUDA_CSRC_DIR / "minimax_reduce_rms.cu",
@@ -896,6 +918,8 @@ setup(
     install_requires=_selected_install_requires(),
     packages=find_packages(),
     package_data={
+        # Pre-swept flashinfer MoE tactic tables (see ops/tuning.py).
+        "tokenspeed_kernel.ops.moe.flashinfer": ["tactics/*.json"],
         "tokenspeed_kernel.thirdparty.cuda": ["objs/**/*.so"],
         # Vendored MiniMax MSA CuTe sources: cute/ has no __init__.py (it is
         # loaded via the upstream sys.path bootstrap), so ship it as data.

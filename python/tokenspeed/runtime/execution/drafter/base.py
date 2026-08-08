@@ -32,11 +32,17 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
-    from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 
 
 class BaseDrafter:
+    # Whether the draft model reuses the target's embedding and LM head
+    # weights (set via set_embed_and_head right after both models load, in
+    # create_model_runner, so the draft's own copies are dropped before the
+    # KV-cache budget is profiled).
+    shares_target_embed_head = False
+
     def __init__(
         self,
         spec_num_tokens: int,
@@ -44,10 +50,9 @@ class BaseDrafter:
         draft_model_runner: ModelRunner | None = None,
         runtime_states: RuntimeStates | None = None,
         input_buffers: InputBuffers | None = None,
-        page_size: int | None = None,
-        req_to_page: torch.Tensor | None = None,
+        cache_view=None,
         attn_backend: AttentionBackend | None = None,
-        token_to_kv_pool: BaseTokenToKVPool | None = None,
+        token_to_kv_pool: CachePool | None = None,
         vocab_size: int | None = None,
     ):
         self.spec_num_tokens = spec_num_tokens
@@ -55,11 +60,27 @@ class BaseDrafter:
         self.draft_model_runner = draft_model_runner
         self.runtime_states = runtime_states
         self.input_buffers = input_buffers
-        self.page_size = page_size
-        self.req_to_page = req_to_page
+        # Window onto the staged batch-ordered page table (row i == batch
+        # position i, draft-kernel page units, refreshed each forward by
+        # DraftPageStaging.publish). Write-location math goes through the
+        # view so page ids and page-size arithmetic stay out of drafters.
+        self.cache_view = cache_view
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
         self.vocab_size = vocab_size
+
+    def wire_target(self, target_model: torch.nn.Module) -> None:
+        """Wire this drafter to the loaded target model.
+
+        Called once by ``ModelExecutor`` right after the drafter is
+        constructed. Subclasses that read target weights or install capture
+        hooks on the target override this; the default drafter needs nothing
+        from the target.
+
+        Args:
+            target_model: The target ``torch.nn.Module`` the drafter
+                speculates for.
+        """
 
     @abstractmethod
     def get_candidates(

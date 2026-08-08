@@ -26,95 +26,71 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.tuning import freeze_autotuning
+import torch.distributed as dist
+from tokenspeed_kernel.ops.tuning import (
+    autotune,
+    set_autotune_max_num_tokens,
+    set_autotune_process_group,
+)
 from tokenspeed_kernel.platform import current_platform
 
-from tokenspeed.runtime.configs.model_config import ModelConfig
-from tokenspeed.runtime.configs.paged_cache_spec import (
-    scheduler_ext_flat_kvcache,
-    validate_flat_scheduler_config,
-)
+from tokenspeed.runtime.configs.model_config import AttentionArch, ModelConfig
 from tokenspeed.runtime.configs.utils import get_rope_parameters
-from tokenspeed.runtime.engine.scheduler_utils import (
-    flat_block_tables_from_forward_op,
-    paged_cache_block_table_base_offsets_from_forward_op,
-    paged_cache_block_tables_from_forward_op,
+from tokenspeed.runtime.distributed.process_group_manager import (
+    process_group_manager as pg_manager,
 )
-from tokenspeed.runtime.execution.cache_loc_kernel import update_block_table
+from tokenspeed.runtime.execution.breakable_cuda_graph import active_forward
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
-from tokenspeed.runtime.execution.drafter.dflash import DFlash
-from tokenspeed.runtime.execution.drafter.eagle import Eagle
-from tokenspeed.runtime.execution.drafter.mtp import Mtp
+from tokenspeed.runtime.execution.draft_page_staging import DraftPageStaging
+from tokenspeed.runtime.execution.drafter import get_drafter_impl
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
 from tokenspeed.runtime.execution.model_runner import ModelRunner
+from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 from tokenspeed.runtime.execution.nan_guard import NanGuard
 from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import ModelExecutionResult
-from tokenspeed.runtime.grammar.capturable_grammar import setup_grammar_step
-from tokenspeed.runtime.layers.attention.backends.flat_cache_metadata import (
-    FlatCacheBatchMetadata,
+from tokenspeed.runtime.grammar.capturable_grammar import (
+    create_grammar_runtime,
+    setup_grammar_step,
+)
+from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
+    CacheBatchMetadata,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    validate_scheduler_config,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.layers.paged_attention import (
     validate_paged_cache_group_ids,
 )
-from tokenspeed.runtime.multimodal.inputs import resolve_mm_pad_substitute_ids
 from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 from tokenspeed.runtime.sampling.dp_sampling_config import (
     DpSamplingRuntimeLimits,
-    DpSamplingTopology,
-    resolve_dp_sampling_runtime,
-    resolve_dp_sampling_support,
+    setup_dp_sampling,
 )
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.utils import get_colorful_logger, set_random_seed
 from tokenspeed.runtime.utils.common import maybe_inference_mode
 from tokenspeed.runtime.utils.env import envs
+from tokenspeed.runtime.utils.hf_transformers_utils import get_context_length
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
-    from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 logger = get_colorful_logger(__name__)
 
 LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
-
-
-def _get_drafter_impl(spec_algo: str, model: torch.nn.Module):
-    from tokenspeed.runtime.models.inkling_nextn import (
-        InklingForConditionalGenerationNextN,
-    )
-
-    DRAFTER_MAPPING = {"EAGLE3": Eagle, "MTP": Eagle, "DFLASH": DFlash}
-
-    # "MTP" covers two algorithms:
-    # (1) Eagle-like MTP (e.g. DeepSeek) stays on Eagle in eagle.py;
-    # (2) Vanilla MTP (e.g. Inkling) with multi-layer weights stays on Mtp in mtp.py.
-    if spec_algo == "MTP" and isinstance(model, InklingForConditionalGenerationNextN):
-        return Mtp
-    else:
-        return DRAFTER_MAPPING[spec_algo]
-
-
-def _eagle_aux_layer_ids(hf_config) -> list[int] | None:
-    """Draft's eagle_aux_hidden_state_layer_ids (nested or top-level), or None."""
-    eagle_config = getattr(hf_config, "eagle_config", None)
-    if isinstance(eagle_config, dict):
-        ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
-    elif eagle_config is not None:
-        ids = getattr(eagle_config, "eagle_aux_hidden_state_layer_ids", None)
-    else:
-        ids = getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None)
-    return list(ids) if ids else None
+LOG_SPEC_ACCEPT_LENGTHS = envs.TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS.get()
 
 
 def _draft_idle_global_num_tokens_for_step(
@@ -131,7 +107,14 @@ PREFILL_GRAPH_DEFAULT_MAX_TOKENS = 2048
 
 
 def _resolve_prefill_graph_max_tokens(server_args) -> int:
-    """Largest prefill-graph bucket: explicit value, or min(2048, chunk, kv budget)."""
+    """Largest prefill-graph bucket: explicit value, or min(2048, chunk, kv budget).
+
+    Returns 0 (graph off) when the MoE all-to-all backend is DeepEP: an
+    extend-shaped forward takes DeepEP's normal dispatch, whose per-expert
+    receive counts come back to the host, and a host sync cannot be captured.
+    """
+    if server_args.all2all_backend not in (None, "none"):
+        return 0
     if server_args.prefill_graph_max_tokens is not None:
         return int(server_args.prefill_graph_max_tokens)
     cap = PREFILL_GRAPH_DEFAULT_MAX_TOKENS
@@ -160,7 +143,14 @@ class ModelExecutorConfig:
     max_num_seqs: int
     chunked_prefill_size: int
     vocab_size: int
+    # Logical context limit (user semantics: input validation, max_new_tokens
+    # folding, stop checks all key off this).
     context_len: int
+    # Physical KV extent: context_len + ServerArgs.spec_context_pad. Spec
+    # verify on the overlap scheduler commits up to that pad past context_len
+    # for a request that already finished (see _SPEC_OVERSHOOT_SPANS in
+    # server_args.py); every buffer/table sized per request must use this.
+    physical_context_len: int
     device: str
     gpu_id: int
     global_rank: int
@@ -171,6 +161,7 @@ class ModelExecutorConfig:
     max_cudagraph_capture_size: int
     model_is_mrope: bool
     enable_nan_detection: bool = False
+    disable_autotune: bool = False
 
     # ====== DP =========
     data_parallel_size: int = 1
@@ -221,6 +212,37 @@ class ModelExecutorConfig:
         rope_parameters = get_rope_parameters(model_config.hf_text_config)
         model_is_mrope = bool(rope_parameters and "mrope_section" in rope_parameters)
 
+        # Spec verify commits positions up to physical_context_len - 1 for a
+        # finished request lingering one overlap step. Rope cos/sin tables are
+        # precomputed for the model's derived context length, so positions in
+        # the pad read past them when context_len is set flush against the
+        # model limit. The values only feed a dead request's garbage KV, but
+        # the read itself is out of table bounds — warn so the operator can
+        # lower --max-model-len by the pad.
+        physical_context_len = model_config.context_len + server_args.spec_context_pad
+        derived_context_len = get_context_length(model_config.hf_text_config)
+        if physical_context_len > derived_context_len:
+            logger.warning(
+                "physical context extent %s (context_len %s + spec overshoot "
+                "pad %s) exceeds the model's derived context length %s; "
+                "positions in the pad index past the precomputed rope tables. "
+                "Lower --max-model-len by at least %s to stay in bounds.",
+                physical_context_len,
+                model_config.context_len,
+                server_args.spec_context_pad,
+                derived_context_len,
+                physical_context_len - derived_context_len,
+            )
+
+        # DSA's sparse indexer reads the attention backend's
+        # ``chunked_prefill_metadata`` from inside the captured prefill segment,
+        # but the prefill graph rebinds only the live ForwardContext at replay --
+        # the backend metadata object stays frozen at capture-time (dummy) values.
+        # So the two are fundamentally incompatible; force eager prefill for DSA.
+        disable_prefill_graph = bool(server_args.disable_prefill_graph) or (
+            model_config.attention_arch == AttentionArch.DSA
+        )
+
         return ModelExecutorConfig(
             max_req_pool_size=max_req_pool_size,
             output_length=output_length,
@@ -230,6 +252,9 @@ class ModelExecutorConfig:
             chunked_prefill_size=server_args.chunked_prefill_size,
             vocab_size=model_config.vocab_size,
             context_len=model_config.context_len,
+            physical_context_len=(
+                model_config.context_len + server_args.spec_context_pad
+            ),
             device=server_args.device,
             gpu_id=gpu_id,
             global_rank=global_rank,
@@ -237,8 +262,9 @@ class ModelExecutorConfig:
             decode_log_interval=server_args.decode_log_interval,
             cudagraph_capture_sizes=server_args.cudagraph_capture_sizes,
             disable_cuda_graph_padding=server_args.disable_cuda_graph_padding,
+            disable_autotune=server_args.disable_autotune,
             max_cudagraph_capture_size=server_args.max_cudagraph_capture_size,
-            disable_prefill_graph=bool(server_args.disable_prefill_graph),
+            disable_prefill_graph=disable_prefill_graph,
             prefill_graph_max_tokens=_resolve_prefill_graph_max_tokens(server_args),
             prefill_graph_capture_sizes=server_args.prefill_graph_capture_sizes,
             model_is_mrope=model_is_mrope,
@@ -268,12 +294,11 @@ class ModelExecutor:
         config: ModelExecutorConfig,
         model_runner: ModelRunner,
         attn_backend: AttentionBackend,
-        token_to_kv_pool: BaseTokenToKVPool,
+        token_to_kv_pool: CachePool,
         sampling_backend: SamplingBackend,
         draft_model_runner: ModelRunner | None = None,
         draft_attn_backend: AttentionBackend | None = None,
-        draft_token_to_kv_pool: BaseTokenToKVPool | None = None,
-        mamba_pool: object | None = None,
+        draft_token_to_kv_pool: CachePool | None = None,
     ):
         self.device = config.device
         self.config = config
@@ -281,101 +306,108 @@ class ModelExecutor:
         self.sampling_backend = sampling_backend
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
-        # FlatKV contract pools publish a runtime
-        # contract; on that path per-step tables travel as
-        # FlatCacheBatchMetadata and the legacy req_to_page mirror is
-        # forbidden.
-        self._flat_runtime_contract = getattr(
-            token_to_kv_pool, "runtime_contract", None
+        # Every pool runs on the shared cache arena and publishes a runtime
+        # contract; the per-group tables travel as CacheBatchMetadata. Fail
+        # fast here rather than at the first forward or, worse, a CUDA-graph
+        # capture-path assert: a missing contract means the model family has
+        # no cache recipe yet, and an uncovered family means a backend that
+        # never reads that group's tables.
+        validate_scheduler_config(
+            attn_backend=attn_backend,
+            kv_pool=token_to_kv_pool,
         )
-        # Full-attention group mirrored into req_to_page each step (flat+spec).
-        _group_specs = getattr(token_to_kv_pool, "paged_cache_group_specs", ()) or ()
-        self._flat_full_group_id = next(
+        self._cache_runtime_contract = token_to_kv_pool.runtime_contract
+
+        # The batch-ordered full-history table backs out_cache_loc and the
+        # draft page table. First contract group with family=history and
+        # retention=full_history.
+        self._full_history_group_id = next(
             (
                 str(spec.group_id)
-                for spec in _group_specs
-                if getattr(spec, "family", "history") != "state"
-                and getattr(spec, "retention", None) == "full_history"
+                for spec in self._cache_runtime_contract.group_specs
+                if spec.family == "history" and spec.retention == "full_history"
             ),
             None,
         )
-        self._mirror_idx_cpu: torch.Tensor | None = None
-        self._mirror_idx_dev: torch.Tensor | None = None
-        self._mirror_row_buf: torch.Tensor | None = None
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
-        self._layerwise_mamba_cow_done = None
 
-        # Must precede CUDA-graph capture: unsupported flat combinations
-        # (e.g. spec on a backend without flat_spec_capable) would otherwise
-        # die on a capture-path assert instead of this actionable error.
-        validate_flat_scheduler_config(
-            flat_kvcache_ext=scheduler_ext_flat_kvcache(),
-            paged_cache_groups=_group_specs,
-            attn_backend=attn_backend,
-            kv_pool=token_to_kv_pool,
-            speculative_algorithm=config.spec_algo,
+        # fill_input_buffers indexes the scheduler table in logical pages; the drafter indexes draft_page_table in its backend's kernel pages.
+        self._logical_page_size = int(
+            getattr(draft_token_to_kv_pool, "page_size", 0) or config.logical_page_size
         )
-
-        if config.spec_algo is not None:
-            # The DFLASH overlap scheduler reserves a fresh draft block per
-            # decode step a request stays scheduled, including the few steps it
-            # lingers between finishing and eviction, so peak page count runs
-            # ~1 page past context_len + spec_num_tokens. Without headroom
-            # req_to_page overflows and the next draft block's page write goes
-            # out of bounds, hanging the attention kernel. Pad generously; a few
-            # int32 columns per request. Non-DFLASH algorithms do not need this.
-            draft_block_reservation_slack = (
-                config.spec_num_tokens * 64 if config.spec_algo == "DFLASH" else 0
+        self._draft_page_size = int(
+            getattr(draft_attn_backend, "page_size", 0) or self._logical_page_size
+        )
+        if self._logical_page_size % self._draft_page_size:
+            raise ValueError(
+                f"logical page size {self._logical_page_size} is not a multiple "
+                f"of the draft kernel page size {self._draft_page_size}"
             )
-            max_num_pages_per_req = (
-                config.context_len
-                + config.spec_num_tokens
-                + draft_block_reservation_slack
-                + config.logical_page_size
-                - 1
-            ) // config.logical_page_size
-        else:
-            max_num_pages_per_req = (
-                config.context_len + config.logical_page_size
-            ) // config.logical_page_size
+        draft_page_ratio = self._logical_page_size // self._draft_page_size
+        # The published table is already in kernel pages, so a draft backend
+        # that recorded a logical size (mark_cache_contract) would expand it a
+        # second time: ids land ratio× too deep in the pool and the draft
+        # attends garbage. Backends that consume kernel pages directly must
+        # not record (tokenspeed_mla), or the ratio must be 1 (flashmla @64).
+        backend_logical = getattr(draft_attn_backend, "_cache_logical_page_size", None)
+        if (
+            draft_page_ratio > 1
+            and backend_logical is not None
+            and int(backend_logical) != self._draft_page_size
+        ):
+            raise ValueError(
+                f"draft backend {type(draft_attn_backend).__name__} records "
+                f"logical page size {backend_logical} and would re-expand the "
+                f"draft page table that is already published in "
+                f"{self._draft_page_size}-token kernel pages "
+                f"(ratio {draft_page_ratio})"
+            )
+
+        # physical_context_len already covers the spec-verify overshoot of a
+        # finished request lingering one overlap step, including the lingering
+        # step's next draft block (see _SPEC_OVERSHOOT_SPANS in server_args.py).
+        # A write past this width would go out of bounds and hang the attention
+        # kernel; the output processor's physical-extent tripwire raises first.
+        max_num_pages_per_req = (
+            config.physical_context_len + self._draft_page_size - 1
+        ) // self._draft_page_size
 
         max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
 
-        self.req_to_page = torch.zeros(
-            (config.max_req_pool_size + 1, max_num_pages_per_req),
-            dtype=torch.int32,
+        # Address-stable staging of the full-history table for in-graph draft
+        # consumers; also the zero/dummy placeholder for idle/warmup forwards
+        # before the cache contract binds. Single writer; unit is the draft
+        # kernel page; publish scrubs [bs, padded_bs).
+        self._draft_staging = DraftPageStaging(
+            max_bs=max_bs,
+            max_pages_per_req=max_num_pages_per_req,
+            logical_page_size=self._logical_page_size,
+            draft_page_size=self._draft_page_size,
+            full_history_group_id=self._full_history_group_id,
+            enabled=not getattr(
+                attn_backend, "cache_group_tables_replace_draft_page_table", False
+            ),
             device=self.device,
         )
+        self.draft_page_table = self._draft_staging.table
         spec_num_tokens = config.spec_num_tokens if config.spec_algo is not None else 1
-        # Stride for indexing req_to_page when building drafter caller-side
-        # write locs. These locs are live on the radix arm only: on flat,
-        # every KV write (target and draft) takes the backend metadata's
-        # per-group out_cache_locs, and req_to_page is a verbatim mirror of
-        # the full-attention group's table kept for the non-flat fallbacks —
-        # the caller locs computed from it are never consumed there (the
-        # Inkling rel path asserts loc/row agreement).
-        self._draft_page_size = int(
-            getattr(draft_token_to_kv_pool, "page_size", 0) or config.logical_page_size
-        )
         self.input_buffers = InputBuffers(
             max_bs=max_bs,
             max_num_tokens=config.chunked_prefill_size,
-            page_size=self._draft_page_size,
+            # Indexes the scheduler's full-history table: logical page ids.
+            page_size=self._logical_page_size,
             # token_to_kv_pool allocates size+page_size slots; index `size` is
             # the reserved dummy slot (see MHATokenToKVPool._create_buffers).
             dummy_kv_slot=0,
             state_write_padding_pool_index=config.max_req_pool_size,
             device=self.device,
-            has_mamba=(mamba_pool is not None),
         )
         self.runtime_states = RuntimeStates(
             req_pool_size=config.max_req_pool_size,
-            context_len=config.context_len,
             vocab_size=config.vocab_size,
             device=self.device,
             output_length=config.output_length,
-            mamba_pool=mamba_pool,
         )
         # Sized like InputBuffers.max_bs so the padded graph-bucket bs fits.
         self.nan_guard = NanGuard.create(
@@ -384,98 +416,59 @@ class ModelExecutor:
             self.device,
         )
         if self.config.spec_algo is not None:
-            DrafterImpl = _get_drafter_impl(config.spec_algo, draft_model_runner.model)
+            # Model-to-model wiring (shared embed/head, eagle3 capture ids)
+            # already happened in create_model_runner, right after both
+            # models loaded. Here only the drafter instance is built and
+            # wired to the target.
+            DrafterImpl = get_drafter_impl(config.spec_algo, draft_model_runner.model)
             self.drafter = DrafterImpl(
                 spec_num_tokens=config.spec_num_tokens,
                 spec_num_steps=config.spec_num_steps,
                 draft_model_runner=draft_model_runner,
-                page_size=self._draft_page_size,
                 runtime_states=self.runtime_states,
                 input_buffers=self.input_buffers,
-                req_to_page=self.req_to_page,
+                cache_view=self._draft_staging.view,
                 attn_backend=draft_attn_backend,
                 token_to_kv_pool=draft_token_to_kv_pool,
                 vocab_size=config.vocab_size,
             )
-            if hasattr(self.drafter, "bind_target_model"):
-                self.drafter.bind_target_model(self.model_runner.model)
-            # EAGLE3/MTP share the target's embed + lm_head; DFLASH ships its
-            # own draft weights, so it must NOT inherit the target's.
-            if config.spec_algo in ("EAGLE3", "MTP"):
-                embed, head = self.model_runner.model.get_embed_and_head()
-                draft_model_runner.model.set_embed_and_head(embed, head)
-            target_hf = self.model_runner.model_config.hf_config
-            mm_pad_substitute_ids = resolve_mm_pad_substitute_ids(target_hf)
-            if mm_pad_substitute_ids and hasattr(
-                self.drafter, "set_mm_pad_substitute_ids"
-            ):
-                self.drafter.set_mm_pad_substitute_ids(mm_pad_substitute_ids)
-            if config.spec_algo in ("EAGLE3",) and hasattr(
-                self.model_runner.model, "set_eagle3_layers_to_capture"
-            ):
-                # capture the layers the draft was trained on, not the default
-                aux_layer_ids = _eagle_aux_layer_ids(
-                    draft_model_runner.model_config.hf_config
-                )
-                self.model_runner.model.set_eagle3_layers_to_capture(aux_layer_ids)
-            if config.spec_algo == "DFLASH":
-                if not hasattr(self.model_runner.model, "set_dflash_layers_to_capture"):
-                    raise ValueError(
-                        "DFLASH requires the target model to support "
-                        "set_dflash_layers_to_capture."
-                    )
-                incr_callback = None
-                incr_slot_bufs = None
-                if getattr(self.drafter, "_incremental_proj_enabled", False):
-                    incr_callback = self.drafter._on_capture_slot_ready
-                    incr_slot_bufs = self.drafter._incr_slot_bufs
-                self.model_runner.model.set_dflash_layers_to_capture(
-                    self.drafter.target_layer_ids,
-                    incremental_callback=incr_callback,
-                    slot_bufs=incr_slot_bufs,
-                )
+            self.drafter.wire_target(self.model_runner.model)
+            MultimodalRuntime.wire_drafter(
+                self.drafter, self.model_runner.model_config.hf_config
+            )
         else:
             self.drafter = None
 
-        # Single grammar handle: CapturableGrammarExecutor on CUDA (uses
-        # cudaLaunchHostFunc on a side stream so the xgrammar fill +
-        # H2D overlap with the forward, and is also CUDA-graph-capturable),
-        # EagerGrammarBuffers on non-CUDA (synchronous fallback).
-        # ``disable_capturable_grammar`` forces the eager path on CUDA too
-        # for parity-testing.
-        self.grammar_runtime = None
-        if config.grammar_backend != "none":
-            from tokenspeed.runtime.grammar.capturable_grammar import (
-                CapturableGrammarExecutor,
-                EagerGrammarBuffers,
-            )
-
-            use_captured = (
-                current_platform().is_nvidia and not config.disable_capturable_grammar
-            )
-            if use_captured:
-                self.grammar_runtime = CapturableGrammarExecutor(
-                    max_bs=max_bs,
-                    vocab_size=config.vocab_size,
-                    max_tokens_per_req=spec_num_tokens,
-                    device=self.device,
-                )
-            else:
-                self.grammar_runtime = EagerGrammarBuffers(
-                    max_bs=max_bs,
-                    vocab_size=config.vocab_size,
-                    max_tokens_per_req=spec_num_tokens,
-                    device=self.device,
-                )
+        self.grammar_runtime = create_grammar_runtime(
+            grammar_backend=config.grammar_backend,
+            disable_capturable=config.disable_capturable_grammar,
+            is_nvidia=current_platform().is_nvidia,
+            max_bs=max_bs,
+            vocab_size=config.vocab_size,
+            max_tokens_per_req=spec_num_tokens,
+            device=self.device,
+        )
 
         attn_backend.configure_runtime(
             sliding_window_size=model_runner.sliding_window_size,
-            req_to_page=self.req_to_page,
+            paged_cache_group_specs=tuple(token_to_kv_pool.paged_cache_group_specs),
+            paged_cache_group_page_counts=getattr(
+                token_to_kv_pool,
+                "paged_cache_group_page_counts",
+                None,
+            ),
         )
         if draft_attn_backend is not None:
             draft_attn_backend.configure_runtime(
                 sliding_window_size=model_runner.sliding_window_size,
-                req_to_page=self.req_to_page,
+                paged_cache_group_specs=tuple(
+                    getattr(draft_token_to_kv_pool, "paged_cache_group_specs", ())
+                ),
+                paged_cache_group_page_counts=getattr(
+                    draft_token_to_kv_pool,
+                    "paged_cache_group_page_counts",
+                    None,
+                ),
             )
 
         validate_paged_cache_group_ids(
@@ -488,38 +481,11 @@ class ModelExecutor:
                 draft_token_to_kv_pool.paged_cache_group_specs,
             )
 
-        processor = self.model_runner.model.logits_processor
-        dp_topology = DpSamplingTopology(
-            tp_rank=processor.tp_rank,
-            tp_size=processor.tp_size,
-            tp_group=processor.tp_group,
-            skip_all_gather=processor.skip_all_gather,
-            tie_word_embeddings=bool(
-                getattr(processor.config, "tie_word_embeddings", False)
-            ),
-        )
-        dp_support = resolve_dp_sampling_support(
+        self.dp_sampling_runtime_config = setup_dp_sampling(
+            model=self.model_runner.model,
+            sampling_backend=self.sampling_backend,
             requested=self.config.dp_sampling,
             drafter_available=self.drafter is not None,
-            backend_supports_verify=bool(
-                getattr(self.sampling_backend, "_SUPPORTS_DP_VERIFY", False)
-            ),
-            topology=dp_topology,
-        )
-
-        lm_head_rows = 0
-        if dp_support.enabled:
-            lm_head_weight = self.model_runner.model.lm_head.weight
-            if lm_head_weight.ndim < 1:
-                raise RuntimeError(
-                    "dp_sampling LM head weight must be at least 1D, got "
-                    f"{lm_head_weight.ndim}D"
-                )
-            lm_head_rows = int(lm_head_weight.shape[0])
-        dp_runtime_config = resolve_dp_sampling_runtime(
-            support=dp_support,
-            lm_head_rows=lm_head_rows,
-            topology=dp_topology,
             limits=DpSamplingRuntimeLimits(
                 runtime_vocab_size=self.config.vocab_size,
                 max_num_seqs=config.max_num_seqs,
@@ -529,26 +495,9 @@ class ModelExecutor:
                 device=self.device,
             ),
         )
-        self.dp_sampling_runtime_config = dp_runtime_config
         self._last_dp_sampling_route_log: (
             tuple[str, int, bool, int, int, bool, int] | None
         ) = None
-        if dp_runtime_config.enabled:
-            self.sampling_backend.configure_dp_sampling(dp_runtime_config)
-            processor.configure_dp_logits_layout(dp_runtime_config)
-        logger.info(
-            "Batch-DP spec-verify: requested=%s, infra_supports=%s, enabled=%s "
-            "min_bs=%s (drafter=%s, backend_supports_dp=%s, "
-            "tp_size=%s, tp_group=%s)",
-            dp_support.requested,
-            dp_support.infra_supports,
-            dp_support.enabled,
-            dp_runtime_config.min_bs,
-            dp_support.drafter_available,
-            dp_support.backend_supports_verify,
-            dp_support.tp_size,
-            dp_support.tp_group_set,
-        )
 
         self._active_multimodal_context = None
         self._active_positions_override = None
@@ -574,73 +523,41 @@ class ModelExecutor:
             logger.info("Finished prewarming Triton RSAG communication states")
 
         # Breakable prefill (extend) CUDA graphs, the extend-mode analogue of
-        # the decode wrapper above; captures in __init__, borrowing the decode
-        # capture stream so all graphs share one mempool-reuse domain.
+        # the decode wrapper above; borrows the decode capture stream so all
+        # graphs share one mempool-reuse domain.
         self.prefill_graph = PrefillGraph(
             model_runner=self.model_runner,
             attn_backend=attn_backend,
             token_to_kv_pool=token_to_kv_pool,
             input_buffers=self.input_buffers,
             config=config,
-            req_to_page=self.req_to_page,
+            page_table=self.draft_page_table,
             drafter=self.drafter,
-            decode_wrapper=self.forward_step,
         )
 
-        # Encoder CUDA graph: install model-built wrappers by overriding
-        # modality encoder callables (e.g. ``image_encoder``, ``video_encoder``).
-        # Multimodal-encoder analogue of ``forward_step``'s ``CudaGraphWrapper``.
-        self.encoder_graph_wrappers = {}
-        _mm_model = self.model_runner.model
-        if (
-            hasattr(_mm_model, "make_encoder_cudagraph_wrappers")
-            and getattr(_mm_model, "is_multimodal_active", True)
-            and envs.TOKENSPEED_MM_ENABLE_ENCODER_CUDA_GRAPH.get()
-            and self.model_runner.server_args.mm_attention_backend != "flashinfer_cudnn"
-        ):
-            self.encoder_graph_wrappers = _mm_model.make_encoder_cudagraph_wrappers(
-                _mm_model.mapping
-            )
+        self._autotune()
 
-            active_encoder_graph_wrappers = {}
-            for encoder_attr, wrapper in self.encoder_graph_wrappers.items():
-                if not hasattr(_mm_model, encoder_attr):
-                    logger.warning(
-                        "Skipping encoder CUDA graph wrapper for missing attribute %s",
-                        encoder_attr,
-                    )
-                    continue
-                setattr(_mm_model, encoder_attr, wrapper)
-                active_encoder_graph_wrappers[encoder_attr] = wrapper
+        if not self.forward_step.disable:
+            self.forward_step.capture()
+        if not self.prefill_graph.disable:
+            self.prefill_graph.capture(self.forward_step)
 
-            self.encoder_graph_wrappers = active_encoder_graph_wrappers
+        # Encoder graphs are installed before KV-cache sizing and retained by
+        # the model runner; preserve the executor-level handle for callers.
+        self.encoder_graph_wrappers = getattr(
+            self.model_runner, "encoder_graph_wrappers", {}
+        )
 
         self.execution_stream = torch.cuda.Stream()
         self.log_step = 0
         self._seen_prefill_ids: set[str] = set()
         self._prev_decode_bs: int = 0
         self._sentinel_neg1 = torch.tensor(-1, device=self.device, dtype=torch.int64)
-        if config.model_is_mrope:
-            mrope_decode_capacity = self.input_buffers.max_num_tokens
-            # Double-buffered pinned host staging for the decode delta copy.
-            # Under overlap scheduling the next decode forward is dispatched
-            # before the previous result is synchronized, so a single reused
-            # pinned buffer could be refilled by the next step while the prior
-            # step's ``non_blocking=True`` H2D copy is still reading it (a race
-            # that corrupts M-RoPE deltas). Ping-pong two buffers so a buffer is
-            # never overwritten while its copy is in flight (overlap depth 1).
-            self._mrope_decode_deltas_cpu = [
-                self._make_mrope_decode_deltas_cpu(mrope_decode_capacity),
-                self._make_mrope_decode_deltas_cpu(mrope_decode_capacity),
-            ]
-            self._mrope_decode_deltas_cpu_idx = 0
-            self._mrope_decode_deltas_buf = torch.zeros(
-                mrope_decode_capacity, device=self.device, dtype=torch.int64
-            )
-        else:
-            self._mrope_decode_deltas_cpu = None
-            self._mrope_decode_deltas_cpu_idx = 0
-            self._mrope_decode_deltas_buf = None
+        self.mm_runtime = MultimodalRuntime(
+            model_is_mrope=config.model_is_mrope,
+            input_buffers=self.input_buffers,
+            device=self.device,
+        )
         # Decode stats — accumulated from synced results (no GPU sync needed)
         self.num_generated_tokens = 0
         self.num_decode_steps = 0
@@ -648,17 +565,58 @@ class ModelExecutor:
 
         set_random_seed(48)
 
-        # Startup has tuned every size class it serves; serving must never autotune.
-        freeze_autotuning()
-
         logger.info("ModelExecutor initialized")
 
-    @staticmethod
-    def _make_mrope_decode_deltas_cpu(size: int) -> torch.Tensor:
-        try:
-            return torch.zeros(size, dtype=torch.int64, pin_memory=True)
-        except RuntimeError:
-            return torch.zeros(size, dtype=torch.int64)
+    def _autotune(self) -> None:
+        """Profile tunable kernels over one dummy prefill, before graph capture.
+
+        Runs a single extend forward at the largest token count a forward can
+        carry; the tuner enumerates every smaller shape bucket from it, so no
+        decode-sized pass is needed. Must precede capture: a captured graph
+        records the tactic chosen while it was recorded, so tuning afterwards
+        cannot change a replay. On distributed boots, per-tactic timings are
+        averaged over the world so every rank picks the same tactic.
+        """
+        num_tokens = int(self.config.chunked_prefill_size)
+        if num_tokens <= 0 or self.model_runner is None:
+            return
+
+        # The bucket mapper keys serving-time tactic lookups, so it must match
+        # any pre-swept table loaded earlier even when tuning itself is off.
+        set_autotune_max_num_tokens(num_tokens)
+        if self.config.disable_autotune:
+            logger.info(
+                "Kernel tuning disabled (--disable-autotune); tunable kernels "
+                "use heuristic tactics"
+            )
+            return
+
+        cpu_group = None
+        if self.config.world_size > 1:
+            cpu_group = pg_manager.get_process_group("gloo", self.config.world_group)
+
+        logger.info(f"Kernel tuning with a dummy prefill of {num_tokens} tokens")
+        ib = self.input_buffers
+        tic = time.time()
+        set_autotune_process_group(cpu_group)
+        with autotune(), maybe_inference_mode():
+            ctx = self.prefill_graph.make_dummy_batch(num_tokens, self.forward_step)
+            positions = (
+                ib.mrope_positions_buf[:, :num_tokens]
+                if self.config.model_is_mrope
+                else ib.positions_buf[:num_tokens]
+            )
+            with active_forward(ctx):
+                self.model_runner.forward(
+                    ctx=ctx,
+                    input_ids=ib.input_ids_buf[:num_tokens],
+                    positions=positions,
+                    out_cache_loc=ib.out_cache_loc_buf[:num_tokens],
+                )
+        set_autotune_process_group(None)
+        torch.cuda.synchronize()
+        dist.barrier()
+        logger.info(f"Kernel tuning finished in {time.time() - tic:.1f}s")
 
     @property
     def capturable_grammar(self):
@@ -691,58 +649,18 @@ class ModelExecutor:
             else None
         )
 
-    def _mirror_flat_full_table_into_req_to_page(
-        self, forward_op, flat_block_tables
-    ) -> None:
-        """Flat + spec: scatter the full-attention group's per-batch table
-        into req_to_page rows, restoring the radix contract for every
-        legacy consumer (input prep's out_cache_loc kernels, the drafter's
-        per-step location chains). The flat scheduler never populates
-        req_to_page itself; column tails zero-fill to the dummy page so
-        stale longer rows can't leak.
+    def _publish_draft_page_table(self, forward_op, block_tables) -> None:
+        """Stage the full-history table for the draft (see DraftPageStaging).
 
-        Never called on the FlatKV contract path: mirroring into
-        req_to_page would resurrect the forbidden legacy path.
+        The upcoming replay may read up to the widest captured batch; without
+        the wrapper's padded_bs at hand, scrub through the table end.
         """
-        if (
-            self._flat_runtime_contract is not None
-            or self.drafter is None
-            or not flat_block_tables
-            or self._flat_full_group_id is None
-        ):
-            return
-        table = flat_block_tables.get(self._flat_full_group_id)
-        if table is None:
+        if self.drafter is None:
             return
         bs = len(forward_op.request_pool_indices)
-        if self._mirror_idx_cpu is None or self._mirror_idx_cpu.shape[0] < bs:
-            cap = max(bs, self.input_buffers.max_bs)
-            self._mirror_idx_cpu = torch.empty(cap, dtype=torch.long, pin_memory=True)
-            self._mirror_idx_dev = torch.empty(
-                cap, dtype=torch.long, device=self.device
-            )
-        self._mirror_idx_cpu[:bs] = torch.tensor(
-            forward_op.request_pool_indices, dtype=torch.long
+        self._draft_staging.publish(
+            block_tables, bs=bs, padded_bs=self.draft_page_table.shape[0]
         )
-        self._mirror_idx_dev[:bs].copy_(self._mirror_idx_cpu[:bs], non_blocking=True)
-        idx = self._mirror_idx_dev[:bs]
-        width = table.shape[1]
-        max_width = self.req_to_page.shape[1]
-        if self._mirror_row_buf is None:
-            self._mirror_row_buf = torch.zeros(
-                (self.input_buffers.max_bs, max_width),
-                dtype=self.req_to_page.dtype,
-                device=self.device,
-            )
-        # Staged rows + index_copy_ (advanced-index setitem costs ~150us dispatch).
-        rows = self._mirror_row_buf[:bs]
-        rows[:, :width].copy_(table)
-        rows[:, :width].clamp_min_(
-            0
-        )  # -1 column pads -> dummy page 0 (negative locs otherwise)
-        if width < max_width:
-            rows[:, width:].zero_()
-        self.req_to_page.index_copy_(0, idx, rows)
 
     @nvtx_range("target_forward", color="red")
     def _run_target_forward(self, bs: int, ctx: ForwardContext, req_pool_indices):
@@ -755,11 +673,7 @@ class ModelExecutor:
             else:
                 positions = self.input_buffers.positions_buf[: ctx.input_num_tokens]
         # Prefill-graph replay when captured for this forward (the decode graph
-        # replays one level up: it captures the whole _forward_step). The mode
-        # check is LOAD-BEARING, not an optimization: the decode capture runs
-        # this dispatch before prefill_graph exists (it is constructed after
-        # the decode wrapper, whose capture stream it borrows), and decode-mode
-        # forwards must short-circuit before touching it.
+        # replays one level up: it captures the whole _forward_step).
         mode = ctx.forward_mode
         if (
             mode is not None
@@ -798,66 +712,6 @@ class ModelExecutor:
         ]
         return torch.where(force_mask, torch.ones_like(accept_lengths), accept_lengths)
 
-    def _cap_accept_to_context_len(
-        self,
-        accept_lengths: torch.Tensor,
-        decode_req_pool_indices: torch.Tensor,
-    ) -> torch.Tensor:
-        """Clamp spec-verify accept so committed length never exceeds
-        ``context_len``.
-
-        ``req_to_page`` is sized for ``context_len + spec_num_tokens`` pages. A
-        request at the context limit whose ``max_new_tokens`` termination lags a
-        step can accept past ``context_len``, so its next draft block needs a
-        page beyond ``req_to_page``'s width — an out-of-bounds access that hangs
-        the attention kernel. Clamping to the remaining budget keeps the table in
-        range; the request is still removed a step later. Deterministic in
-        ``valid_cache_lengths`` / ``accept_lengths``, so no cross-rank divergence.
-        """
-        if accept_lengths.numel() == 0:
-            return accept_lengths
-        committed = self.runtime_states.valid_cache_lengths.index_select(
-            0, decode_req_pool_indices
-        ).to(accept_lengths.dtype)
-        remaining = (self.config.context_len - committed).clamp_(min=0)
-        # In-place: the drafter reads this same buffer to size its next block.
-        accept_lengths.copy_(torch.minimum(accept_lengths, remaining))
-        return accept_lengths
-
-    def _clamp_committed_to_context_len(
-        self,
-        output_lengths: torch.Tensor,
-        num_extends: int,
-        bs: int,
-    ) -> torch.Tensor:
-        """Return ``output_lengths`` with decode rows clamped so committed KV
-        length never exceeds ``context_len`` (post-forward, outside the CUDA
-        graph).
-
-        The clamp must reach BOTH ``_update_runtime_state``
-        (``valid_cache_lengths``) and the ``ModelExecutionResult`` that drives
-        scheduler page reservation, so they stay in lock-step. Hence a FRESH
-        tensor, not the persistent ``_accept_length_buf``: the verify path also
-        mirrors accept counts into ``_output_pack_buf``, and an in-place clamp
-        would leave that mirror (read by the packed-D2H fast path) uncapped,
-        reserving a draft block past ``req_to_page``'s width and hanging the
-        kernel. A fresh tensor forces the safe two-D2H fallback.
-
-        Only decode rows ``[num_extends:bs]`` carry an accept delta; prefill rows
-        pass through. Deterministic, so no cross-rank divergence.
-        """
-        if bs <= num_extends:
-            return output_lengths
-        decode_rpi = self.input_buffers.req_pool_indices_buf[num_extends:bs]
-        committed = self.runtime_states.valid_cache_lengths.index_select(
-            0, decode_rpi
-        ).to(output_lengths.dtype)
-        remaining = (self.config.context_len - committed).clamp_(min=0)
-        capped_decode = torch.minimum(output_lengths[num_extends:bs], remaining)
-        if num_extends == 0:
-            return capped_decode
-        return torch.cat([output_lengths[:num_extends], capped_decode])
-
     @nvtx_range("sampling", color="yellow")
     def _run_sampling(
         self,
@@ -882,10 +736,6 @@ class ModelExecutor:
             accept_lengths = self._apply_force_single_token_verify(
                 accept_lengths, 0, num_decodes, ctx.decode_input_ids
             )
-            if self.config.spec_algo == "DFLASH":
-                accept_lengths = self._cap_accept_to_context_len(
-                    accept_lengths, sampling_info.req_pool_indices[:num_decodes]
-                )
             return output_tokens, accept_lengths
 
         logits = logits_output.next_token_logits
@@ -900,10 +750,6 @@ class ModelExecutor:
         decode_accept = self._apply_force_single_token_verify(
             decode_accept, num_extends, num_decodes, ctx.decode_input_ids
         )
-        if self.config.spec_algo == "DFLASH":
-            decode_accept = self._cap_accept_to_context_len(
-                decode_accept, sampling_info.req_pool_indices[num_extends:]
-            )
         if (
             prefill_out.next_token_logprobs is not None
             and decode_out.next_token_logprobs is not None
@@ -1089,178 +935,37 @@ class ModelExecutor:
 
     def accumulate_decode_stats(self, results: ModelExecutionResult, bs: int):
         """Accumulate decode stats from already-synced results. No GPU sync."""
-        self.num_generated_tokens += int(results.output_lengths.sum().item())
+        accept_lengths = results.output_lengths
+        self.num_generated_tokens += int(accept_lengths.sum().item())
         self.num_decode_steps += bs
-
-    @staticmethod
-    @torch.compile(dynamic=True)
-    def _compute_mtp_snapshot_indices(
-        valid_cache_lengths: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-        accept_lengths: torch.Tensor,
-        output_indices: torch.Tensor,
-        track_indices: torch.Tensor,
-        sentinel: torch.Tensor,
-        page_size: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Fused elementwise pipeline computing snapshot src/dst for MTP.
-
-        All operations are batched and fused by torch.compile into a single
-        Triton kernel (plus the two gathers), eliminating the ~14 individual
-        elementwise kernel launches of the eager implementation.
-        """
-        new_cl = valid_cache_lengths[req_pool_indices]
-        old_cl = new_cl - accept_lengths.to(new_cl.dtype)
-        first_boundary = ((old_cl // page_size) + 1) * page_size
-
-        step_raw = first_boundary - old_cl - 1
-        max_col = output_indices.shape[1] - 1
-        step = step_raw.clamp(min=0, max=max_col).to(torch.int64)
-
-        bs = req_pool_indices.shape[0]
-        req_range = torch.arange(bs, device=req_pool_indices.device)
-        src_raw = output_indices[req_range, step].to(torch.int64)
-        dst_raw = track_indices.to(torch.int64)
-
-        invalid = (
-            (first_boundary > new_cl)
-            | (dst_raw < 0)
-            | (src_raw < 0)
-            | (src_raw == dst_raw)
-            | (step_raw < 0)
-        )
-        src = torch.where(invalid, sentinel, src_raw)
-        dst = torch.where(invalid, sentinel, dst_raw)
-        return src, dst
-
-    def _snapshot_mamba_checkpoints(
-        self,
-        accept_lengths: torch.Tensor,
-        bs: int,
-        num_extends: int,
-    ) -> None:
-        """Snapshot mamba states to checkpoint slots at page boundaries.
-
-        Called after ``_update_runtime_state`` on the execution stream so
-        ``valid_cache_lengths`` already reflects the accepted tokens.
-
-        Non-MTP (accept_length == 1):
-            The working slot holds the up-to-date state for the new
-            cache_length.  Pass the kernel page_size so it copies only
-            when the new length is page-aligned.
-
-        MTP (accept_length > 1):
-            cache_length may jump over a page boundary.  The intermediate
-            state lives in ``mamba_output_indices[req, step]``.  Boundary
-            detection and source-slot selection are done entirely on GPU
-            with -1 sentinels so the snapshot kernel skips invalid entries
-            via its bounds check — no GPU-to-CPU sync, preserving
-            overlap-schedule pipelining.
-        """
-        if self.runtime_states.mamba_pool is None or num_extends > 0:
-            return
-        if not self.input_buffers.has_mamba:
-            return
-
-        req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
-        track_indices = self.input_buffers.mamba_track_pool_indices_buf[:bs]
-        page_size = self.config.logical_page_size
-        dev = req_pool_indices.device
-        sentinel = self._sentinel_neg1
-
-        if self.drafter is not None:
-            # -- MTP path: find the output slot at the crossed boundary --
-            backend = getattr(
-                self.attn_backend, "linear_attn_backend", self.attn_backend
+        if (
+            LOG_SPEC_ACCEPT_LENGTHS
+            and self.config.global_rank == 0
+            and self.config.spec_num_steps
+        ):
+            accepted_widths = [int(value) for value in accept_lengths.tolist()]
+            accepted_draft_tokens = [max(0, value - 1) for value in accepted_widths]
+            logger.info(
+                "Spec verify step. accept_lengths=%s, accepted_draft_tokens=%s",
+                accepted_widths,
+                accepted_draft_tokens,
             )
-            fm = getattr(backend, "forward_metadata", None)
-            if fm is None:
-                return
-            output_indices = fm.mamba_output_indices
-            if output_indices is None:
-                return
-
-            src, dst = self._compute_mtp_snapshot_indices(
-                self.runtime_states.valid_cache_lengths,
-                req_pool_indices,
-                accept_lengths[:bs].to(device=dev),
-                output_indices,
-                track_indices,
-                sentinel,
-                page_size,
-            )
-
-            self.runtime_states.snapshot_mamba_checkpoints(
-                src,
-                dst,
-                cache_lengths=None,
-                page_size=0,
-                num_valid=bs,
-            )
-        else:
-            # -- Non-MTP path: working slot IS the up-to-date state --
-            src_raw = self.input_buffers.mamba_pool_indices_buf[:bs].to(
-                device=dev, dtype=torch.int64
-            )
-            dst_raw = track_indices.to(device=dev, dtype=torch.int64)
-
-            invalid = (src_raw < 0) | (dst_raw < 0) | (src_raw == dst_raw)
-            src = torch.where(invalid, sentinel, src_raw)
-            dst = torch.where(invalid, sentinel, dst_raw)
-
-            cache_lengths = self.runtime_states.valid_cache_lengths[req_pool_indices]
-            self.runtime_states.snapshot_mamba_checkpoints(
-                src,
-                dst,
-                cache_lengths=cache_lengths,
-                page_size=page_size,
-                num_valid=bs,
-            )
-
-    def flush_mamba_draft_to_working_on_retract(self) -> None:
-        """Copy accepted draft mamba state -> working slot for all previous-batch requests.
-
-        Called from event_loop when retract WriteBackOps are detected.
-        Uses the previous decode iteration's input_buffers (still valid since
-        no new forward has overwritten them).
-        Runs on execution_stream to respect ordering with previous forward writes.
-        """
-        bs = self._prev_decode_bs
-        if bs <= 0:
-            return
-
-        backend = getattr(self.attn_backend, "linear_attn_backend", self.attn_backend)
-        pool = getattr(backend, "pool", None)
-        if pool is None:
-            return
-
-        sentinel = self._sentinel_neg1
-
-        with torch.cuda.stream(self.execution_stream):
-            req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
-            working = self.input_buffers.mamba_pool_indices_buf[:bs]
-
-            req = req_pool_indices.to(dtype=torch.int64)
-            current_input_size = int(pool.current_input_indices.shape[0])
-            in_bounds = (req >= 0) & (req < current_input_size)
-            safe_req = req.clamp(0, current_input_size - 1)
-            src_raw = pool.current_input_indices[safe_req].to(dtype=torch.int64)
-            src_raw = torch.where(in_bounds, src_raw, sentinel)
-            dst_raw = working.to(dtype=torch.int64)
-
-            invalid = (
-                (~in_bounds) | (src_raw < 0) | (dst_raw < 0) | (src_raw == dst_raw)
-            )
-            src = torch.where(invalid, sentinel, src_raw)
-            dst = torch.where(invalid, sentinel, dst_raw)
-
-            self.runtime_states.snapshot_mamba_checkpoints(
-                src,
-                dst,
-                cache_lengths=None,
-                page_size=0,
-                num_valid=bs,
-            )
+            candidates = getattr(results, "spec_candidate_tokens", None)
+            if candidates is not None:
+                verify_width = int(self.config.spec_num_tokens)
+                candidate_rows = candidates.view(bs, verify_width)
+                target_rows = results.output_tokens.view(bs, verify_width)
+                # Candidate column j+1 is verified by the target token sampled
+                # from column j. The final target column is the bonus token.
+                draft_rows = candidate_rows[:, 1:]
+                target_draft_rows = target_rows[:, :-1]
+                logger.info(
+                    "Spec token compare. anchor=%s, draft=%s, target=%s, match=%s",
+                    candidate_rows[:, 0].tolist(),
+                    draft_rows.tolist(),
+                    target_draft_rows.tolist(),
+                    draft_rows.eq(target_draft_rows).tolist(),
+                )
 
     def execute_forward_op_with_log(
         self,
@@ -1394,7 +1099,6 @@ class ModelExecutor:
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
-            req_to_page=self.req_to_page,
             bs=0,
             num_extends=0,
             input_num_tokens=0,
@@ -1424,12 +1128,16 @@ class ModelExecutor:
                 )
             # IDLE doesn't produce tokens, so no sampler/drafter call here —
             # only the model forward, which still participates in collectives.
+            # A rank that previously served a larger batch still has real page
+            # ids in the padded_bs rows the captured drafter steps read; their
+            # draft KV writes would alias live requests' pages (#955).
+            self._draft_staging.publish(None, bs=0, padded_bs=padded_bs)
             with nvtx_range("forward_step idle", color="blue"):
                 self.forward_step(
                     bs=0,
                     ctx=ctx,
                     sampling_info=sampling_info,
-                    req_to_page=self.req_to_page,
+                    page_table=self.draft_page_table,
                 )
             return
 
@@ -1465,7 +1173,6 @@ class ModelExecutor:
                 draft_ctx = ForwardContext(
                     attn_backend=self.drafter.attn_backend,
                     token_to_kv_pool=self.drafter.token_to_kv_pool,
-                    req_to_page=self.drafter.req_to_page,
                     bs=0,
                     num_extends=0,
                     input_num_tokens=0,
@@ -1482,278 +1189,93 @@ class ModelExecutor:
                     spec_step_idx=step_idx,
                 )
 
-    def update_block_table(self, forward_op) -> ModelExecutionResult:
-        # Update page tables on the default stream before switching to execution stream.
-        # HostTodevice segment begins
-        with nvtx_range("update_block_table", color="cyan"):
-            update_block_table(
-                forward_op=forward_op,
-                device=self.device,
-                req_to_page=self.req_to_page,
-            )
-
-    def zero_flat_cache_pages(self, pages):
+    def zero_cache_pages(self, pages):
         """Clear newly owned pages and return a CUDA completion event when needed."""
         if not pages:
             return None
-        zero_new_pages = getattr(self.token_to_kv_pool, "zero_new_pages", None)
-        zero_pages = getattr(self.token_to_kv_pool, "zero_pages", None)
-        if isinstance(pages, Mapping) and callable(zero_new_pages):
-            sanitizer = zero_new_pages
-            sanitizer_arg = pages
-        elif callable(zero_pages):
-            if isinstance(pages, Mapping):
-                page_ids = sorted(
-                    {
-                        int(page_id)
-                        for group_pages in pages.values()
-                        for page_id in group_pages
-                    }
+
+        def sanitize(pool, pool_pages) -> bool:
+            zero_new_pages = getattr(pool, "zero_new_pages", None)
+            zero_pages = getattr(pool, "zero_pages", None)
+            if isinstance(pool_pages, Mapping) and callable(zero_new_pages):
+                zero_new_pages(pool_pages)
+                return True
+            if callable(zero_pages):
+                page_ids = (
+                    sorted(
+                        {
+                            int(page_id)
+                            for group_pages in pool_pages.values()
+                            for page_id in group_pages
+                        }
+                    )
+                    if isinstance(pool_pages, Mapping)
+                    else pool_pages
                 )
-            else:
-                page_ids = pages
-            sanitizer = zero_pages
-            sanitizer_arg = page_ids
-        else:
-            # A pool only needs sanitization if it aliases recurrent-state and
-            # KV bytes in one slab (it then declares this and implements
-            # a sanitizer). Pure-attention pools do not alias state, so reused
-            # pages are overwritten and their tails are never read past seq_len.
-            # Still fail loudly if a pool that *declares* it needs zeroing
-            # forgot to implement it.
-            if getattr(self.token_to_kv_pool, "flat_kv_requires_page_zeroing", False):
+                zero_pages(page_ids)
+                return True
+            if getattr(pool, "paged_cache_requires_page_zeroing", False):
                 raise RuntimeError(
-                    "scheduler emitted flat pages to zero but the active KV "
+                    "scheduler emitted pages to zero but an active KV "
                     "pool does not implement physical-page sanitization"
                 )
+            return False
+
+        with nvtx_range("zero_cache_pages", color="purple"):
+            sanitized = sanitize(self.token_to_kv_pool, pages)
+            draft_pool = getattr(self, "draft_token_to_kv_pool", None)
+            if draft_pool is not None and getattr(
+                draft_pool,
+                "paged_cache_requires_page_zeroing",
+                False,
+            ):
+                draft_pages = pages
+                if isinstance(pages, Mapping):
+                    draft_group_ids = {
+                        str(spec.group_id)
+                        for spec in draft_pool.paged_cache_group_specs
+                    }
+                    draft_pages = {
+                        group_id: page_ids
+                        for group_id, page_ids in pages.items()
+                        if group_id in draft_group_ids
+                    }
+                if draft_pages:
+                    sanitized = sanitize(draft_pool, draft_pages) or sanitized
+        if not sanitized:
             return None
-        with nvtx_range("zero_flat_cache_pages", color="purple"):
-            sanitizer(sanitizer_arg)
         if torch.device(self.device).type != "cuda":
             return None
         done = torch.cuda.Event()
         done.record(torch.cuda.current_stream(self.device))
         return done
 
-    def reset_remote_prefill_mamba_inputs(self, forward_op) -> None:
-        if self.runtime_states.mamba_pool is None:
-            return
-        if not hasattr(self.attn_backend, "reset_current_inputs"):
-            return
-
-        num_extends = forward_op.num_extends()
-        if num_extends <= 0:
-            return
-
-        mamba_indices = list(getattr(forward_op, "mamba_pool_indices", []))
-        if not mamba_indices:
-            return
-
-        req_pool_indices = list(forward_op.request_pool_indices[:num_extends])
-        pairs = [
-            (int(req_pool_idx), int(mamba_idx))
-            for req_pool_idx, mamba_idx in zip(
-                req_pool_indices, mamba_indices[:num_extends]
-            )
-            if int(mamba_idx) >= 0
-        ]
-        if not pairs:
-            return
-
-        req_pool_tensor = torch.tensor(
-            [req_pool_idx for req_pool_idx, _ in pairs],
-            dtype=torch.int64,
-            device="cpu",
-            pin_memory=True,
-        ).to(self.device, non_blocking=True)
-        mamba_tensor = torch.tensor(
-            [mamba_idx for _, mamba_idx in pairs],
-            dtype=torch.int64,
-            device="cpu",
-            pin_memory=True,
-        ).to(self.device, non_blocking=True)
-        self.attn_backend.reset_current_inputs(req_pool_tensor, mamba_tensor)
-
-    @staticmethod
-    def _contains_retracted_decode(forward_op) -> bool:
-        # FlatForwardOperation stores hist_token_lens for decode rows only;
-        # non-recovery rows use -1.
-        return any(
-            hist_token_len != -1
-            for hist_token_len in getattr(forward_op, "hist_token_lens", ())
-        )
-
     @nvtx_range("reset_valid_cache_length", color="orange")
     def reset_valid_cache_length(self, forward_op) -> None:
-
         num_extends = forward_op.num_extends()
-        is_prefill = num_extends > 0
-
-        # Retraction recovery: scheduler pushes -1 per decode op, overriding to
-        # a real length only on ScheduleDecodeFromRetractedEvent. Decode rows
-        # may follow prefill rows in a mixed batch, so this cannot be gated on
-        # pure-decode mode.
-        has_retract = self._contains_retracted_decode(forward_op)
-
-        # Pure decode without retraction has nothing to do — skip the
-        # cross-stream wait + stream-context entry entirely.
-        if not is_prefill and not has_retract:
+        if num_extends == 0:
             return
-
-        if has_retract:
-            hist_token_lens_tensor = torch.tensor(
-                forward_op.hist_token_lens,
-                dtype=torch.int32,
-                device="cpu",
-                pin_memory=True,
-            )
-            decode_pool_indices = torch.tensor(
-                forward_op.request_pool_indices[num_extends:],
-                dtype=torch.int64,
-                device="cpu",
-                pin_memory=True,
-            )
-        else:
-            hist_token_lens_tensor = None
-            decode_pool_indices = None
 
         self.execution_stream.wait_stream(torch.cuda.current_stream())
 
         with torch.cuda.stream(self.execution_stream):
-            if is_prefill:
-                extend_request_pool_indices = torch.tensor(
-                    forward_op.request_pool_indices[:num_extends],
-                    dtype=torch.int64,
-                    device="cpu",
-                    pin_memory=True,
-                ).to(self.device, non_blocking=True)
+            extend_request_pool_indices = torch.tensor(
+                forward_op.request_pool_indices[:num_extends],
+                dtype=torch.int64,
+                device="cpu",
+                pin_memory=True,
+            ).to(self.device, non_blocking=True)
 
-                extend_prefix_lens = torch.tensor(
-                    forward_op.extend_prefix_lens,
-                    dtype=torch.int32,
-                    device="cpu",
-                    pin_memory=True,
-                ).to(self.device, non_blocking=True)
+            extend_prefix_lens = torch.tensor(
+                forward_op.extend_prefix_lens,
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=True,
+            ).to(self.device, non_blocking=True)
 
-                self.runtime_states.reset_states(
-                    extend_request_pool_indices, extend_prefix_lens
-                )
-
-            if hist_token_lens_tensor is not None:
-                # Apply retraction recovery: override valid_cache_lengths with hist_token_lens
-                # where the scheduler has specified a non-(-1) value, so that out_cache_loc
-                # and position IDs are computed against the retracted KV length.
-                pool_idx_dev = decode_pool_indices.to(self.device, non_blocking=True)
-                hist_dev = hist_token_lens_tensor.to(self.device, non_blocking=True)
-
-                mask_1d = hist_dev != -1
-                vcl = self.runtime_states.valid_cache_lengths[pool_idx_dev]
-
-                self.runtime_states.valid_cache_lengths[pool_idx_dev] = torch.where(
-                    mask_1d, hist_dev, vcl
-                )
-
-    def set_layerwise_mamba_cow_done(
-        self, cow_by_src: dict[int, list[int]] | None
-    ) -> None:
-        self._layerwise_mamba_cow_done = (
-            {
-                int(src): {int(dst) for dst in dsts}
-                for src, dsts in cow_by_src.items()
-                if dsts
-            }
-            if cow_by_src
-            else None
-        )
-
-    def _skip_completed_layerwise_mamba_cow(
-        self, forward_op, bs: int
-    ) -> torch.Tensor | None:
-        cow_done = self._layerwise_mamba_cow_done
-        self._layerwise_mamba_cow_done = None
-        if not cow_done or not getattr(self.input_buffers, "has_mamba", False):
-            return None
-        cow_src_indices = getattr(forward_op, "mamba_cow_src_indices", None)
-        working_indices = getattr(forward_op, "mamba_pool_indices", None)
-        if cow_src_indices is None or working_indices is None:
-            return None
-
-        cow_src_indices = list(cow_src_indices)[:bs]
-        working_indices = list(working_indices)[:bs]
-        skipped_mask = [False] * bs
-        changed = False
-        for i, (cow_src, working) in enumerate(zip(cow_src_indices, working_indices)):
-            cow_src = int(cow_src)
-            working = int(working)
-            if working in cow_done.get(cow_src, set()):
-                cow_src_indices[i] = -1
-                skipped_mask[i] = True
-                changed = True
-        if not changed:
-            return None
-
-        (cow_src_indices_cpu,) = self.input_buffers._bulk_pinned((bs, torch.int32))
-        cow_src_indices_cpu.copy_(torch.as_tensor(cow_src_indices, dtype=torch.int32))
-        cow_src_buf = self.input_buffers.mamba_cow_src_indices_buf
-        cow_src_buf[:bs].copy_(cow_src_indices_cpu, non_blocking=True)
-        return torch.tensor(skipped_mask, dtype=torch.bool, device=cow_src_buf.device)
-
-    @staticmethod
-    def _mamba_retract_reset_mask(
-        mamba_cow_src: torch.Tensor,
-        bs: int,
-        skipped_layerwise_cow_mask: torch.Tensor | None,
-    ) -> torch.Tensor:
-        reset_mask = mamba_cow_src[:bs] >= 0
-        if skipped_layerwise_cow_mask is not None:
-            reset_mask = reset_mask | skipped_layerwise_cow_mask[:bs].to(
-                device=reset_mask.device, dtype=torch.bool
+            self.runtime_states.reset_states(
+                extend_request_pool_indices, extend_prefix_lens
             )
-        return reset_mask
-
-    def _reset_mamba_current_inputs(
-        self,
-        *,
-        num_extends: int,
-        bs: int,
-        has_retract: bool,
-        mamba_pool_indices: torch.Tensor,
-        mamba_cow_src: torch.Tensor,
-        skipped_layerwise_cow_mask: torch.Tensor | None,
-    ) -> None:
-        if not hasattr(self.attn_backend, "reset_current_inputs"):
-            return
-
-        if num_extends > 0:
-            self.attn_backend.reset_current_inputs(
-                self.input_buffers.req_pool_indices_buf[:num_extends],
-                mamba_pool_indices[:num_extends],
-            )
-
-        if not has_retract:
-            return
-
-        # FlatForwardOperation places prefill rows first. Restrict recovery to
-        # the decode suffix so a prefix-cache COW on a prefill row cannot be
-        # mistaken for a retracted decode.
-        decode_begin = num_extends
-        decode_count = bs - decode_begin
-        if decode_count <= 0:
-            return
-        skipped_decode_mask = (
-            skipped_layerwise_cow_mask[decode_begin:bs]
-            if skipped_layerwise_cow_mask is not None
-            else None
-        )
-        retract_mask = self._mamba_retract_reset_mask(
-            mamba_cow_src[decode_begin:bs],
-            decode_count,
-            skipped_decode_mask,
-        )
-        self.attn_backend.reset_current_inputs(
-            self.input_buffers.req_pool_indices_buf[decode_begin:bs][retract_mask],
-            mamba_pool_indices[decode_begin:bs][retract_mask],
-        )
 
     def execute_forward_op(
         self,
@@ -1782,8 +1304,6 @@ class ModelExecutor:
         graph_padded_bs = 0
 
         with nvtx_range("pre_fill_setup", color="orange"):
-            has_retract = self._contains_retracted_decode(forward_op)
-
             # Wait for previous iteration's runtime state updates
             # (future_input_map, valid_cache_lengths) on execution_stream to
             # complete before reading them.
@@ -1793,46 +1313,49 @@ class ModelExecutor:
             bs = len(forward_op.request_ids)
             # Outside the graph: in-graph sites only OR into the flag buffer.
             self.nan_guard.reset(bs)
-            flat_cache_metadata = None
-            if self._flat_runtime_contract is not None and bs > 0:
-                # FlatKV contract path: validate + pack the per-group tables
-                # once, bound to this forward operation. The MLA backend
-                # consumes the full-attention table through this bridge;
-                # req_to_page is never populated.
-                flat_cache_metadata = FlatCacheBatchMetadata.from_forward_op(
+            cache_metadata = None
+            block_tables = {}
+            if bs > 0:
+                # Validate and pack the per-group tables once for this batch.
+                cache_metadata = CacheBatchMetadata.from_forward_op(
                     forward_op,
                     device=self.device,
-                    contract=self._flat_runtime_contract,
+                    contract=self._cache_runtime_contract,
                     num_requests=bs,
                 )
-                flat_block_tables = dict(
-                    flat_cache_metadata.tables(active_forward_op=forward_op)
-                )
-            else:
-                # Mirror the full group's flat table into req_to_page
-                # (flat+spec legacy consumers only).
-                flat_block_tables = flat_block_tables_from_forward_op(
-                    forward_op,
-                    device=self.device,
-                    num_reqs=bs,
-                )
-                self._mirror_flat_full_table_into_req_to_page(
-                    forward_op, flat_block_tables
-                )
+                block_tables = dict(cache_metadata.tables(active_forward_op=forward_op))
+            # out_cache_loc reads the batch-ordered full-history table (row i ==
+            # batch position i). Without a full-history group the zeroed draft
+            # table stands in (out_cache_loc then lands on the dummy page 0;
+            # such pools address their KV through their own per-group tables).
+            page_table = (
+                block_tables.get(self._full_history_group_id)
+                if self._full_history_group_id is not None
+                else None
+            )
+            if page_table is None:
+                page_table = self.draft_page_table
+            # Drafts read their pages from the batch-ordered draft page table.
+            self._publish_draft_page_table(forward_op, block_tables)
             decode_input_ids = self.input_buffers.fill_input_buffers(
                 forward_op=forward_op,
                 runtime_states=self.runtime_states,
-                req_to_page=self.req_to_page,
                 total_tokens=total_tokens,
+                page_table=page_table,
             )
+            if self.drafter is not None and hasattr(
+                self.drafter, "prepare_request_state"
+            ):
+                self.drafter.prepare_request_state(
+                    forward_op.request_ids,
+                    forward_op.request_pool_indices,
+                    num_extends,
+                )
             if timing_enabled:
                 input_fill_done = time.perf_counter()
                 input_fill_ms = (input_fill_done - timing_start) * 1000.0
-            skipped_layerwise_cow_mask = self._skip_completed_layerwise_mamba_cow(
-                forward_op, bs
-            )
             mrope_start = time.perf_counter() if timing_enabled else 0.0
-            self._active_positions_override = self._build_mrope_positions_override(
+            self._active_positions_override = self.mm_runtime.build_positions_override(
                 forward_op=forward_op,
                 multimodal_context=multimodal_context,
                 total_tokens=total_tokens,
@@ -1844,30 +1367,6 @@ class ModelExecutor:
 
             if num_extends <= 0:
                 self._prev_decode_bs = bs
-
-            if self.runtime_states.mamba_pool is not None and (
-                num_extends > 0 or has_retract
-            ):
-                mamba_pool_indices = self.input_buffers.mamba_pool_indices_buf[:bs]
-                mamba_cow_src = self.input_buffers.mamba_cow_src_indices_buf[:bs]
-                self.runtime_states.copy_mamba_states(
-                    mamba_pool_indices, mamba_cow_src, bs
-                )
-                if num_extends > 0:
-                    self.runtime_states.zero_mamba_states(
-                        mamba_pool_indices,
-                        mamba_cow_src,
-                        self.input_buffers.extend_prefix_lens_buf[:num_extends],
-                        num_extends,
-                    )
-                self._reset_mamba_current_inputs(
-                    num_extends=num_extends,
-                    bs=bs,
-                    has_retract=has_retract,
-                    mamba_pool_indices=mamba_pool_indices,
-                    mamba_cow_src=mamba_cow_src,
-                    skipped_layerwise_cow_mask=skipped_layerwise_cow_mask,
-                )
 
             grammar_completion = None
 
@@ -1916,7 +1415,6 @@ class ModelExecutor:
                 ctx = ForwardContext(
                     attn_backend=self.attn_backend,
                     token_to_kv_pool=self.token_to_kv_pool,
-                    req_to_page=self.req_to_page,
                     bs=bs,
                     num_extends=num_extends,
                     input_num_tokens=total_tokens,
@@ -1975,38 +1473,6 @@ class ModelExecutor:
                     f"forward_step ext={num_extends} dec={bs - num_extends}",
                     color="blue",
                 ):
-                    mamba_kwargs = (
-                        {
-                            "mamba_pool_indices": self.input_buffers.mamba_pool_indices_buf[
-                                :bs
-                            ],
-                            "mamba_cow_src_indices": self.input_buffers.mamba_cow_src_indices_buf[
-                                :bs
-                            ],
-                            "mamba_branching_seqlens": self.input_buffers.mamba_branching_seqlens_buf[
-                                :bs
-                            ],
-                            "mamba_track_pool_indices": self.input_buffers.mamba_track_pool_indices_buf[
-                                :bs
-                            ],
-                        }
-                        if self.input_buffers.has_mamba
-                        else {}
-                    )
-                    paged_cache_block_tables = paged_cache_block_tables_from_forward_op(
-                        forward_op,
-                        device=self.device,
-                        num_reqs=bs,
-                    )
-                    # flat_block_tables computed once in pre_fill above.
-                    (
-                        paged_cache_block_table_base_offsets,
-                        _paged_cache_block_table_base_offset_max,
-                    ) = paged_cache_block_table_base_offsets_from_forward_op(
-                        forward_op,
-                        device=self.device,
-                        num_reqs=bs,
-                    )
                     self._log_dp_sampling_route(bs, ctx)
                     forward_step_start = 0.0
                     if timing_enabled:
@@ -2021,7 +1487,7 @@ class ModelExecutor:
                         bs=bs,
                         ctx=ctx,
                         sampling_info=sampling_info,
-                        req_to_page=self.req_to_page,
+                        page_table=self.draft_page_table,
                         extend_with_prefix=extend_with_prefix,
                         extend_prefix_lens=self.input_buffers.extend_prefix_lens_buf[
                             :num_extends
@@ -2035,30 +1501,16 @@ class ModelExecutor:
                         extend_seq_lens_cpu=self.input_buffers.extend_seq_lens_cpu[
                             :num_extends
                         ],
-                        paged_cache_block_tables=paged_cache_block_tables,
-                        paged_cache_block_table_base_offsets=(
-                            paged_cache_block_table_base_offsets
+                        block_tables=block_tables,
+                        cache_metadata=cache_metadata,
+                        forward_batch=(
+                            forward_op if cache_metadata is not None else None
                         ),
-                        flat_block_tables=flat_block_tables,
-                        flat_cache_metadata=flat_cache_metadata,
-                        flat_cache_forward_op=(
-                            forward_op if flat_cache_metadata is not None else None
-                        ),
-                        **mamba_kwargs,
                     )
                     if timing_enabled:
                         forward_step_ms = (
                             time.perf_counter() - forward_step_start
                         ) * 1000.0
-
-                if self.config.spec_algo == "DFLASH":
-                    # Clamp the committed-length delta so no request grows past
-                    # context_len. Done here (outside the graph) so it reaches
-                    # both _update_runtime_state and the scheduler page
-                    # reservation; see _clamp_committed_to_context_len.
-                    output_lengths = self._clamp_committed_to_context_len(
-                        output_lengths, num_extends, bs
-                    )
 
                 # Update runtime state on execution_stream (NOT in the CUDA graph).
                 self._update_runtime_state(
@@ -2068,15 +1520,10 @@ class ModelExecutor:
                     input_lengths=self.input_buffers.input_lengths_buf[:bs],
                     num_extends=num_extends,
                 )
-                self._snapshot_mamba_checkpoints(
-                    output_lengths,
-                    bs,
-                    num_extends,
-                )
-
             with nvtx_range("output_d2h", color="green"):
                 output_d2h_start = time.perf_counter() if timing_enabled else 0.0
                 next_input_ids = None
+                spec_candidate_tokens = None
                 if (
                     capture_next_input_ids
                     and self.drafter is not None
@@ -2085,6 +1532,15 @@ class ModelExecutor:
                     next_input_ids = self.runtime_states.future_input_map.index_select(
                         0, self.input_buffers.req_pool_indices_buf[:num_extends]
                     ).to("cpu", non_blocking=True)
+
+                if (
+                    LOG_SPEC_ACCEPT_LENGTHS
+                    and self.config.spec_num_steps
+                    and num_extends == 0
+                ):
+                    spec_candidate_tokens = self.input_buffers.input_ids_buf[
+                        : bs * self.config.spec_num_tokens
+                    ].to("cpu", non_blocking=True)
 
                 # Defensive clamp into the valid vocab range (kept from the
                 # pre-pack path). An out-of-range token id -- e.g. a stale/corrupt
@@ -2126,18 +1582,9 @@ class ModelExecutor:
             if timing_enabled and (
                 num_extends > 0 or self.log_step < 64 or self.log_step % 100 == 0
             ):
-                has_mm = (
-                    multimodal_context is not None and multimodal_context.has_inputs()
+                has_mm, mm_count, mm_delta_count = MultimodalRuntime.timing_counts(
+                    multimodal_context
                 )
-                mm_count = 0
-                mm_delta_count = 0
-                if has_mm:
-                    for mm_input in multimodal_context.mm_inputs:
-                        if mm_input is None:
-                            continue
-                        mm_count += 1
-                        if mm_input.mrope_position_delta is not None:
-                            mm_delta_count += 1
                 logger.info(
                     "mm_timing forward_execute_ms total=%.3f input_fill=%.3f "
                     "mrope=%.3f sampling=%.3f forward_step=%.3f output_d2h=%.3f "
@@ -2167,6 +1614,7 @@ class ModelExecutor:
             grammar_completion=grammar_completion,
             next_input_ids=next_input_ids,
             output_nan_flags=output_nan_flags,
+            spec_candidate_tokens=spec_candidate_tokens,
         )
 
     def write_remote_spec_candidate_ids(
@@ -2179,153 +1627,3 @@ class ModelExecutor:
             self.runtime_states.write_remote_spec_candidate_ids(
                 req_pool_idx, candidate_ids
             )
-
-    def _expand_mrope_from_input(self, mm_input, seq_len: int) -> torch.Tensor:
-        # Cache delta expansion for retracted/chunked requests.
-        if mm_input.mrope_position_delta_repeated_cache is None:
-            mm_input.mrope_position_delta_repeated_cache = (
-                (mm_input.mrope_position_delta - 1).flatten().unsqueeze(0).repeat(3, 1)
-            )
-        return mm_input.mrope_position_delta_repeated_cache + seq_len
-
-    @staticmethod
-    def _mrope_delta_scalar(mm_input) -> int:
-        delta = getattr(mm_input, "mrope_position_delta_scalar", None)
-        if delta is not None:
-            return int(delta)
-        tensor = getattr(mm_input, "mrope_position_delta", None)
-        if tensor is None:
-            return 0
-        delta = int(tensor.flatten()[0].item())
-        mm_input.mrope_position_delta_scalar = delta
-        return delta
-
-    def _build_decode_mrope_positions_override(
-        self,
-        forward_op,
-        mm_inputs,
-        total_tokens: int,
-    ) -> torch.Tensor:
-        if (
-            self._mrope_decode_deltas_cpu is None
-            or self._mrope_decode_deltas_buf is None
-        ):
-            raise RuntimeError(
-                "M-RoPE decode buffers were not initialized for this model"
-            )
-
-        base_positions = self.input_buffers.positions_buf[:total_tokens]
-        # Ping-pong the pinned host staging buffer (see __init__): the previous
-        # step's non_blocking H2D copy may still be reading the other buffer.
-        cpu_staging = self._mrope_decode_deltas_cpu[self._mrope_decode_deltas_cpu_idx]
-        self._mrope_decode_deltas_cpu_idx ^= 1
-        token_deltas_cpu = cpu_staging[:total_tokens]
-
-        offset = 0
-        has_nonzero_delta = False
-        for batch_idx, input_len in enumerate(forward_op.input_lengths):
-            input_len = int(input_len)
-            if input_len <= 0:
-                continue
-
-            delta = 0
-            mm_input = mm_inputs[batch_idx] if batch_idx < len(mm_inputs) else None
-            # Honor scalar-only deltas: an upstream payload may set
-            # mrope_position_delta_scalar while leaving the tensor field
-            # mrope_position_delta as None (positions precomputed upstream).
-            # _mrope_delta_scalar handles scalar, tensor, and the absent case
-            # (returns 0), so call it whenever an mm_input is present.
-            if mm_input is not None:
-                delta = self._mrope_delta_scalar(mm_input)
-                has_nonzero_delta = has_nonzero_delta or delta != 0
-
-            token_deltas_cpu[offset : offset + input_len].fill_(delta)
-            offset += input_len
-
-        if offset != total_tokens:
-            token_deltas_cpu[offset:total_tokens].zero_()
-
-        if has_nonzero_delta:
-            token_deltas = self._mrope_decode_deltas_buf[:total_tokens]
-            token_deltas.copy_(token_deltas_cpu, non_blocking=True)
-            mrope_base = base_positions + token_deltas
-        else:
-            mrope_base = base_positions
-
-        self.input_buffers.mrope_positions_buf[:, :total_tokens].copy_(
-            mrope_base.unsqueeze(0).expand(3, -1)
-        )
-        return self.input_buffers.mrope_positions_buf[:, :total_tokens]
-
-    def _build_mrope_positions_override(
-        self,
-        forward_op,
-        multimodal_context,
-        total_tokens: int,
-    ) -> torch.Tensor | None:
-        if not self.config.model_is_mrope or total_tokens == 0:
-            return None
-
-        is_prefill = forward_op.num_extends() > 0
-        base_positions = self.input_buffers.positions_buf[:total_tokens]
-        mm_inputs = (
-            multimodal_context.mm_inputs
-            if multimodal_context is not None and multimodal_context.has_inputs()
-            else []
-        )
-        if not is_prefill:
-            return self._build_decode_mrope_positions_override(
-                forward_op=forward_op,
-                mm_inputs=mm_inputs,
-                total_tokens=total_tokens,
-            )
-
-        pos_chunks = torch.split(base_positions, list(forward_op.input_lengths), dim=0)
-        mrope_chunks = []
-        for batch_idx, base_chunk in enumerate(pos_chunks):
-            mm_input = mm_inputs[batch_idx] if batch_idx < len(mm_inputs) else None
-            # Fall back to linear only when there is neither a per-token mrope table
-            # nor a transferred scalar delta. A decode-only mm_input may carry just
-            # the delta (post-image decode positions = base+delta); it must skip the
-            # fallback and take the base+delta branch below.
-            if mm_input is None or (
-                mm_input.mrope_positions is None
-                and mm_input.mrope_position_delta is None
-            ):
-                mrope_chunks.append(base_chunk.unsqueeze(0).expand(3, -1))
-                continue
-
-            if (
-                is_prefill
-                and mm_input.mrope_positions is not None
-                and batch_idx < len(forward_op.extend_prefix_lens)
-            ):
-                start = int(forward_op.extend_prefix_lens[batch_idx])
-                end = start + int(forward_op.input_lengths[batch_idx])
-                positions = mm_input.mrope_positions[:, start:end]
-                if positions.numel() != 0:
-                    mrope_chunks.append(
-                        positions.to(device=self.device, dtype=torch.int64)
-                    )
-                    continue
-                if base_chunk.numel() == 1:
-                    seq_len = int(base_chunk[-1].item()) + 1
-                    mrope_chunks.append(
-                        self._expand_mrope_from_input(mm_input, seq_len).to(
-                            device=self.device, dtype=torch.int64
-                        )
-                    )
-                    continue
-
-            delta = mm_input.mrope_position_delta
-            if delta is None:
-                delta = torch.zeros(1, dtype=torch.int64)
-            delta = delta.flatten()[0].to(device=self.device, dtype=torch.int64)
-            # Decode positions need (mrope_delta - 1) + seq_len. positions_buf
-            # already stores the per-token zero-based position (seq_len - 1 for
-            # decode), so this is the same value without a GPU-to-CPU sync.
-            mrope_chunks.append((base_chunk + delta).unsqueeze(0).expand(3, -1))
-
-        mrope_positions = torch.cat(mrope_chunks, dim=1).contiguous()
-        self.input_buffers.mrope_positions_buf[:, :total_tokens].copy_(mrope_positions)
-        return self.input_buffers.mrope_positions_buf[:, :total_tokens]

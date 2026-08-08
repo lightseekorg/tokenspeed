@@ -65,7 +65,7 @@ __all__ = [
 ]
 
 _platform = Platform.get()
-_fp8_dtype = _platform.fp8e4m3fn.dtype
+_fp8_dtype = torch.float8_e4m3fn
 
 # Kernels that accept and own bias application inside their GEMM wrapper.
 # For any kernel not listed here, dispatch applies the bias with a post-GEMM
@@ -81,6 +81,7 @@ _KERNELS_WITH_FUSED_BIAS: frozenset[str] = frozenset(
 # Kernels that accept an ``enable_pdl`` kwarg for Programmatic Dependent Launch.
 _KERNELS_WITH_PDL: frozenset[str] = frozenset(
     {
+        "deep_gemm_mm_fp8_blockscale",
         "flashinfer_mm_nvfp4",
     }
 )
@@ -191,8 +192,12 @@ def _online_quantize_mxfp8(
     name because different backends require different scale layouts.
 
     Args:
+        A: Activation matrix to quantize.
+        block_size: Block-scale dimensions used by the selected GEMM.
+        kernel_name: Name of the selected GEMM implementation.
         enable_pdl: Request Programmatic Dependent Launch for the quantize
-            kernel. Only the flashinfer path honors it; other backends ignore it.
+            kernel. FlashInfer MXFP8 and DeepGEMM's UE8M0 path honor it;
+            other backends ignore it.
     """
     block_k = block_size[1]
 
@@ -266,18 +271,13 @@ def _online_quantize_mxfp8(
             column_major_scales=True,
             scale_tma_aligned=True,
             scale_ue8m0=_platform.is_blackwell_plus,
+            enable_pdl=enable_pdl,
         )
     elif kernel_name == "flashinfer_mm_fp8_blockscale":
-        from tokenspeed_kernel.ops.gemm.fp8_utils import (
-            per_token_group_quant_fp8,
-        )
+        from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
 
         return ensure_row_major_scales(
-            *per_token_group_quant_fp8(
-                A,
-                block_k,
-                column_major_scales=False,
-            ),
+            *per_token_group_quant_fp8(A, block_k, column_major_scales=False),
             group_major_scales=_platform.is_nvidia,
         )
     elif kernel_name == "triton_mm_fp8_blockscale":
@@ -333,6 +333,7 @@ def mm(
     quant: str | None = None,
     enable_pdl: bool = False,
     override: str | None = None,
+    prepacked_scales: bool = False,
 ) -> torch.Tensor:
     """Dense matrix multiply with automatic kernel selection.
 
@@ -363,6 +364,9 @@ def mm(
             from kernels that accept it.
         override: Force selection of a specific kernel by name (e.g.
             ``"cublaslt_mm_nvfp4"``). Bypasses heuristic scoring.
+        prepacked_scales: Whether the FP8 block scales already use the selected
+            kernel's prepared layout. This is supported only by FlashInfer's
+            FP8 ``[128, 128]`` block-scale GEMM.
     """
     out_dtype = out_dtype or (out.dtype if out is not None else A.dtype)
 
@@ -383,6 +387,12 @@ def mm(
             op="mm",
         )
 
+    block_scale_layout = (
+        "canonical_blackwell" if Platform.get().is_blackwell_plus else "canonical"
+    )
+    if prepacked_scales:
+        block_scale_layout = "flashinfer_mn"
+
     traits: dict[str, object] = {
         "n_align_16": N % 16 == 0,
         "k_align_16": K % 16 == 0,
@@ -393,6 +403,7 @@ def mm(
         "k_align_128": K % 128 == 0,
         "n_min_128": N >= 128,
         "k_min_128": K >= 128,
+        "block_scale_layout": block_scale_layout,
     }
 
     signature = _gemm_format_signature(
@@ -407,6 +418,11 @@ def mm(
         traits=traits,
         override=override,
     )
+    if prepacked_scales and kernel.name != "flashinfer_mm_fp8_blockscale":
+        raise ValueError(
+            "prepacked_scales is only supported by "
+            f"flashinfer_mm_fp8_blockscale, selected {kernel.name!r}"
+        )
 
     # Online activation quantization
     if (
@@ -417,9 +433,19 @@ def mm(
         assert (
             block_size is not None
         ), "block_size is required for online activation quantization"
-        A, A_scales = _online_quantize_mxfp8(
-            A, block_size, kernel.name, enable_pdl=enable_pdl
-        )
+        if prepacked_scales:
+            from tokenspeed_kernel.ops.gemm.fp8_utils import (
+                flashinfer_fp8_blockscale_quantize_prepacked,
+            )
+
+            A, A_scales = flashinfer_fp8_blockscale_quantize_prepacked(A, block_size[1])
+        else:
+            A, A_scales = _online_quantize_mxfp8(
+                A,
+                block_size,
+                kernel.name,
+                enable_pdl=enable_pdl,
+            )
 
     kernel_args = (A, B, A_scales, B_scales, out_dtype)
     kernel_kwargs: dict[str, object] = {
@@ -428,6 +454,9 @@ def mm(
     }
     if out is not None:
         kernel_kwargs["out"] = out
+    if prepacked_scales:
+        kernel_kwargs["prepacked_scales"] = True
+        kernel_kwargs["original_m"] = M
 
     fused_bias = bias is not None and kernel.name in _KERNELS_WITH_FUSED_BIAS
     if fused_bias:
@@ -534,6 +563,14 @@ def bmm(
         )
 
     traits: dict[str, object] = {
+        "batch": batch,
+        "m": M,
+        "n": N,
+        "k": K,
+        "a_inner_stride_one": A.stride(-1) == 1,
+        "b_n_stride_one": B.stride(1) == 1,
+        "out_inner_stride_one": out is None or out.stride(-1) == 1,
+        "out_dtype": out_dtype,
         "n_align_16": N % 16 == 0,
         "k_align_16": K % 16 == 0,
         "k_align_32": K % 32 == 0,

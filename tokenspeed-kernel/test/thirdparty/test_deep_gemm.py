@@ -33,7 +33,10 @@ platform = current_platform()
 
 
 @pytest.mark.skipif(not platform.is_nvidia, reason="Requires NVIDIA GPU")
-def test_deep_gemm_mm_fp8_blockscale_matches_reference(device: str) -> None:
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_deep_gemm_mm_fp8_blockscale_matches_reference(
+    device: str, enable_pdl: bool
+) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for DeepGEMM verification")
 
@@ -67,6 +70,7 @@ def test_deep_gemm_mm_fp8_blockscale_matches_reference(device: str) -> None:
         b_scales,
         torch.bfloat16,
         block_size=[128, 128],
+        enable_pdl=enable_pdl,
     )
 
     torch.cuda.synchronize()

@@ -383,10 +383,10 @@ class RTRunner:
         speculative_eagle_topk: Optional[int] = None,
         speculative_num_draft_tokens: Optional[int] = None,
         disable_overlap_schedule: bool = False,
-        disable_custom_all_reduce: bool = False,
         max_cudagraph_capture_size: int = 4,
         hf_overrides: Optional[dict[str, Any]] = None,
         disable_prefill_graph: bool = False,
+        disable_kvstore: bool = True,
         **kwargs,
     ):
         # Auto-assign port if not specified
@@ -430,9 +430,9 @@ class RTRunner:
             tokenizer=tokenizer,
             disable_overlap_schedule=disable_overlap_schedule,
             max_cudagraph_capture_size=max_cudagraph_capture_size,
-            disable_custom_all_reduce=disable_custom_all_reduce,
             hf_overrides=(json.dumps(hf_overrides) if hf_overrides else "{}"),
             disable_prefill_graph=disable_prefill_graph,
+            disable_kvstore=disable_kvstore,
             **spec_kwargs,
             **kwargs,
         )

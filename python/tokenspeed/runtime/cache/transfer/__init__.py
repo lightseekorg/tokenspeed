@@ -18,9 +18,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from tokenspeed.runtime.cache.transfer.kv_pool import KVCachePool
-from tokenspeed.runtime.cache.transfer.mamba_pool import MambaCachePool
-from tokenspeed.runtime.cache.transfer.pool import CachePool
 from tokenspeed.runtime.cache.transfer.types import (
     CacheKind,
     Location,
@@ -30,10 +27,7 @@ from tokenspeed.runtime.cache.transfer.types import (
 
 __all__ = [
     "CacheKind",
-    "CachePool",
-    "KVCachePool",
     "Location",
-    "MambaCachePool",
     "TransferBatch",
     "TransferUnit",
 ]

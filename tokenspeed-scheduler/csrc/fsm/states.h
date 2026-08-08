@@ -22,14 +22,12 @@
 
 #include <variant>
 
-#include "fsm/pd_states.h"
 #include "fsm/forward_states.h"
-#include "fsm/cache_states.h"
+#include "fsm/pd_states.h"
 
 // Put resources into each particular state
 namespace tokenspeed::fsm {
 
-using State = std::variant<Bootstrapping, Submitted, Prefetching, PrefetchDone, Aborting, Prefilling, PrefillDone,
-                           Decoding, Draining, WritingBack, Retracting, Retracted, Finished>;
+using State = std::variant<Bootstrapping, Submitted, Prefilling, PrefillDone, Decoding, Finished>;
 
 }  // namespace tokenspeed::fsm

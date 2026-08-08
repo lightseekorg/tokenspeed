@@ -2480,39 +2480,45 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         :return: True if the gemm can be implemented, False otherwise
         :rtype: bool
         """
-        can_implement = True
         # Skip unsupported types
         if not Sm100BlockScaledPersistentDenseGemmKernel.is_valid_dtypes_and_scale_factor_vec_size(
             ab_dtype, sf_dtype, sf_vec_size, c_dtype
         ):
-            can_implement = False
+            return False
         # Skip unsupported layouts
         if not Sm100BlockScaledPersistentDenseGemmKernel.is_valid_layouts(
             ab_dtype, c_dtype, a_major, b_major, c_major
         ):
-            can_implement = False
+            return False
         # Skip invalid mma tile shape and cluster shape
         if not Sm100BlockScaledPersistentDenseGemmKernel.is_valid_mma_tiler_and_cluster_shape(
             mma_tiler_mn, cluster_shape_mn
         ):
-            can_implement = False
+            return False
         # Skip illegal problem shape for load/store alignment
         if not Sm100BlockScaledPersistentDenseGemmKernel.is_valid_tensor_alignment(
             m, n, k, l, ab_dtype, c_dtype, a_major, b_major, c_major
         ):
-            can_implement = False
+            return False
 
         # Dense N must be divisible by the CTA N tile size.
         # CTA N tile = mma_tiler_mn[1] (e.g. 128 for (128,128), 256 for (256,256))
         cta_tile_shape_n = mma_tiler_mn[1]
         if n % cta_tile_shape_n != 0:
-            can_implement = False
+            return False
+        elif (n // cta_tile_shape_n) % cluster_shape_mn[1] != 0:
+            # The N tile count must be divisible by cluster_n: the persistent
+            # tile scheduler ceil-divides the CTA grid by the cluster shape and
+            # never bounds-checks the per-CTA tile coordinate, so the trailing
+            # CTAs of a non-dividing cluster store a phantom tile over real
+            # output rows and scale factors.
+            return False
 
         # cluster_m > 1 requires 2CTA mode (mma_m=256)
         if cluster_shape_mn[0] > 1 and mma_tiler_mn[0] != 256:
-            can_implement = False
+            return False
 
-        return can_implement
+        return True
 
     @cute.jit
     def wrapper(

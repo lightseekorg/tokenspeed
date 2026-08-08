@@ -320,6 +320,7 @@ class OutputProcesser:
         spec_num_tokens: int | None = None,
         stream_interval: int = 1,
         enable_log_request_stats: bool = False,
+        physical_context_len: int | None = None,
         *,
         metrics: EngineMetrics,
     ) -> None:
@@ -334,6 +335,14 @@ class OutputProcesser:
         self.attn_tp_rank = attn_tp_rank
         self.spec_algorithm = spec_algorithm
         self.spec_num_tokens = spec_num_tokens
+        # Tripwire bound: per-request buffers (page tables, draft tables) are
+        # sized for this physical extent, and spec verify may legitimately
+        # commit up to it for a finished request lingering one overlap step.
+        # Committing PAST it means the one-lingering-step assumption broke
+        # (scheduler eviction timing, overlap depth) — the next KV write would
+        # go out of bounds and hang the attention kernel, so fail loudly here
+        # instead. None disables the check.
+        self.physical_context_len = physical_context_len
         self.stream_interval = stream_interval
         self.metrics = metrics
         self.enable_log_request_stats = enable_log_request_stats
@@ -347,6 +356,36 @@ class OutputProcesser:
         # handles. Entries for rids that never register are swept by TTL
         # to keep this bounded across a long-running server.
         self.pending_aborts: dict[str, float] = {}
+
+    def _check_physical_extent(
+        self, rid, request_state: RequestState, output_length: int
+    ) -> None:
+        """Raise if a decode step committed past the physical KV extent.
+
+        Verify may legitimately commit up to physical_context_len for a
+        finished request lingering one overlap step; every per-request table
+        is sized for exactly that. Going PAST it means the one-lingering-step
+        assumption broke (scheduler eviction timing, overlap depth) and the
+        next KV write would run out of bounds and hang the attention kernel —
+        fail loudly here instead.
+        """
+        if self.physical_context_len is None:
+            return
+        total_tokens = (
+            len(request_state.prompt_input_ids)
+            + len(request_state.output_ids)
+            + output_length
+        )
+        if total_tokens > self.physical_context_len:
+            raise RuntimeError(
+                "Committed token count exceeds the physical KV extent for "
+                f"request {rid}: prompt+output reaches {total_tokens} > "
+                f"physical_context_len={self.physical_context_len}. A "
+                "finished request lingered more than one overlap step past "
+                "context_len (see _SPEC_OVERSHOOT_SPANS in server_args.py); "
+                "the next KV write would run out of bounds and hang the "
+                "attention kernel."
+            )
 
     def log_accept_length(self, rid, request_state: RequestState):
         # When --enable-log-request-stats is on, the richer RequestStats line (which
@@ -609,10 +648,10 @@ class OutputProcesser:
             else None
         )
         # Per-slot total prefill length as the OP sees it (C++ Request::PrefillSize()).
-        # After a flat retract the victim's generated tokens are rebased into the
+        # After a retract the victim's generated tokens are rebased into the
         # prefill window (RebasePrefill), so this can exceed the original prompt
         # length that RequestState.prefill_finished compares against.
-        prefill_lengths = getattr(forward_op, "prefill_lengths", None)
+        prefill_lengths = forward_op.prefill_lengths
         pt = 0
         for i, rid in enumerate(forward_op.request_ids):
             output_length = model_execution_results.output_lengths[i].item()
@@ -638,11 +677,10 @@ class OutputProcesser:
             # scheduled_time is stamped pre-forward in the event loop (queue end)
 
             # Mid-chunk extend slot by the op's own prefill_lengths (rebased after
-            # flat retract; C++ owes no result and the sampled token is garbage).
+            # retract; C++ owes no result and the sampled token is garbage).
             # Fresh requests: prefill_length == prompt length, same as the gate below.
             if (
                 not is_decode_slot
-                and prefill_lengths is not None
                 and forward_op.extend_prefix_lens[i] + forward_op.input_lengths[i]
                 < prefill_lengths[i]
             ):
@@ -707,6 +745,7 @@ class OutputProcesser:
 
             if is_decode_slot and self.spec_algorithm is not None:
                 request_state.spec_verify_ct += 1
+                self._check_physical_extent(rid, request_state, output_length)
 
             # With the capturable grammar pipeline the matcher is
             # advanced by the hostfunc; here we just read which token
@@ -764,6 +803,11 @@ class OutputProcesser:
             # passive client that still needs a terminating finish streamed.
             if request_state.to_abort and request_state.finished:
                 request_changes.append(make_extend_result_event(rid, new_ids))
+                if is_prefill_instance:
+                    # PD owns these pages until SucceededEvent or FailedEvent
+                    # fences the transfer. Keep the request state alive so the
+                    # prefill handoff can finish before the scheduler releases it.
+                    continue
                 request_changes.append(make_finish_event(rid))
                 if request_state.abort_notify_client:
                     stream_out_rids.append(rid)
@@ -828,7 +872,7 @@ class OutputProcesser:
     def finish_remote_prefill_only_request(self, req_id: str) -> list:
         """Finish after remote prefill when no decode step is needed.
 
-        FlatKV Prefill computes the first real output token.  A one-token
+        Paged cache Prefill computes the first real output token.  A one-token
         request is therefore already complete when Decode receives
         ``RemotePrefillDoneEvent`` and must not be scheduled for an additional
         decode forward. An aborted request follows the same transport fence
@@ -876,7 +920,8 @@ class OutputProcesser:
         # PD prefill node's terminal path (the other finish/abort logging lives in
         # post_process_forward_op). Self-guarded, so a no-op when the flag is off.
         self._log_request_stats(req_id, rs, time.time())
-        self.stream_output([req_id], [rs])
+        if not rs.to_abort or rs.abort_notify_client:
+            self.stream_output([req_id], [rs])
         # SucceededEvent already finishes the C++ FSM; no extra FinishEvent needed
         return []
 

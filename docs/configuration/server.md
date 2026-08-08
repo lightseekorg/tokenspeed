@@ -93,7 +93,7 @@ issue budget, while `--max-total-tokens` controls the global token pool.
 | --- | --- |
 | `--tensor-parallel-size`, `--tp` | Familiar alias for setting attention tensor parallel size. |
 | `--attn-tp-size` | Tensor parallel size for attention. |
-| `--dense-tp-size` | Tensor parallel size for dense layers. |
+| `--dense-tp-size` | Tensor parallel size for dense layers. Defaults to the attention replica width (attn TP x CP): the full world without DP attention, one replica with it. |
 | `--moe-tp-size` | Tensor parallel size for MoE layers. |
 | `--data-parallel-size` | Number of data-parallel replicas. |
 | `--mm-encoder-tp-mode` | Multimodal encoder parallelism: `weights` shards encoder weights with attention TP; `data` uses TP1 whole-item DP and currently requires aggregate serving, one node, and no attention context parallelism. |
@@ -173,6 +173,13 @@ draft model, and token count together.
 | `--decode-log-interval` | Decode batch log interval. |
 | `--enable-cache-report` | Include cached-token counts in OpenAI-compatible usage details. |
 | `--kv-events-config` | JSON config for KV cache mutation events. Set `enable_kv_cache_events` and a publisher such as `zmq` to publish device prefix-cache stores and removals. |
+
+Set `TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS=1` to log each speculative verify
+step's committed widths and accepted draft-token counts. This reads the
+already-synchronized CPU result and does not add a GPU synchronization, but it
+is intentionally verbose and should only be enabled while debugging. For
+decode-only batches it also logs the anchor, draft candidates, target verify
+tokens, and their position-wise matches.
 
 ### Per-Request Stats
 
