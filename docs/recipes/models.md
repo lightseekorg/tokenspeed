@@ -179,8 +179,22 @@ Notes:
 - The SMG packages pinned by TokenSpeed resolve `moonshotai/Kimi-K3` directly;
   a flattened local checkpoint and separately staged remote-code cache are no
   longer required.
-- The checkpoint carries no fp8 KV scaling factors; the loader defaults them
-  to 1.0 (a warning at load). Expect a small accuracy delta vs bf16 KV.
+- The checkpoint carries no FP8 KV scaling factors. When the target K3 uses its
+  required FP8 LCM cache, TokenSpeed keeps the separate K3 DSpark draft cache in
+  BF16 so context injection and draft attention match the reference precision.
+- DSpark proposal blocks use non-causal MLA draft attention. Both the `mla` and
+  `trtllm_mla` draft backends preserve every block row during eager execution
+  and CUDA graph capture. When K3's 128-token logical cache pages feed the
+  64-token TRT-LLM MLA kernel, the backend expands each logical page into its
+  two physical kernel pages before draft attention.
+- For Kimi K3, an eight-token verify window uses seven DSpark draft queries.
+  The anchor query directly predicts the first draft through the Markov head;
+  it must not be padded with an eighth, unused mask row.
+- Target features are captured from K3's completed-layer prefix stream before
+  the model-level AttnRes mix and final norm, matching the DSpark checkpoint's
+  vLLM training and inference contract.
+- Under tensor parallelism, the draft's final row-parallel MLP output is reduced
+  across TP ranks before `final_norm` and shared target-head sampling.
 - The vision encoder has 12 attention heads. For an 8-way text TP deployment,
   use `--mm-encoder-tp-mode data` so each rank runs the vision encoder at TP1
   on a different whole image.
@@ -260,8 +274,11 @@ tokenspeed serve moonshotai/Kimi-K3 \
 
 On gfx950, the replicated 7168↔3584 latent projections automatically select
 among a one-token Triton GEMV, tuned Gluon GEMMs, and the vendor GEMM according
-to the current token count. The fused sigmoid-bias top-k route supports the
-full scheduled token count.
+to the current token count. At TP8/EP8, eligible one-token decode also combines
+the routed MXFP4 experts with the shared-expert down projection, then applies
+their joint reduction before the fused latent up-projection epilogue. Other
+shapes and unsupported layouts retain the ordinary composed path. The fused
+sigmoid-bias top-k route supports the full scheduled token count.
 
 ## GLM5 / GLM5.2
 

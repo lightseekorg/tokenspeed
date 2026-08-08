@@ -24,7 +24,8 @@
 The package contains BF16, FP8, and dynamically quantized MXFP4 activation
 paths. It keeps the production stages behind stage-specific modules: prefill
 stage 1/2 and decode stage 1/2. ``moe.py`` provides the small-M end-to-end
-decode entry point, while ``routing.py`` exposes the fused decode top-k helpers.
+decode entry point, while ``routing.py`` exposes the fused dense
+top-k helpers used by decode and package prefill.
 """
 
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_stage1 import (
@@ -32,6 +33,9 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_stage1 import (
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_stage2 import (
     invoke_stage2_mxfp4_mfma_decode_gluon,
+)
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.latent_shared_decode import (
+    gluon_latent_expert_shared_decode_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe import gluon_mxfp4_moe_decode
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage1 import (
@@ -54,6 +58,7 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale import (
 __all__ = [
     "attach_prefill_aliases",
     "gather_package_cdna4_scale",
+    "gluon_latent_expert_shared_decode_gfx950",
     "gluon_mxfp4_moe_decode",
     "invoke_gluon_mxfp4_moe_stage1",
     "invoke_gluon_mxfp4_moe_stage2_1x2",

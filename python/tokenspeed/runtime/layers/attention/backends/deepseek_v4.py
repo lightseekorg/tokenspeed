@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import torch
 from tokenspeed_kernel.ops.attention.flash_mla import (
     flash_mla_sparse_fwd,
@@ -242,13 +244,14 @@ class DeepseekV4AttentionBackend(AttentionBackend):
 
     uses_paged_cache_groups = True
     uses_cache_groups = True
+    cache_group_tables_replace_draft_page_table = True
+    cache_active_pages_must_be_real = True
     cache_consumer_families = frozenset({"history", "state"})
     uses_padded_decode_token_mask = True
 
     def __init__(self, config) -> None:
         super().__init__(config)
         self.page_size = config.page_size
-        self.logical_page_size: int | None = None
         self.swa_storage_rows = int(
             getattr(config, "sliding_window_tokens", V4_KERNEL_BLOCK_ROWS * 2)
         )
@@ -276,6 +279,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self._decode_tile_metadata = {}
         self._cuda_graph_metadata = {}
         self._cuda_graph_paged_cache_block_tables: dict[str, torch.Tensor] = {}
+        self._expected_cache_group_ids: tuple[str, ...] | None = None
+        self._cache_group_raw_tokens_per_page: dict[str, int] = {}
+        self._cache_group_max_page_ids: dict[str, int] = {}
         # Per-sliding-group [max_bs] int32 buffers mirroring the block-table
         # buffers; populated by init_cuda_graph_state.
         self._cuda_graph_paged_cache_base_offsets: dict[str, torch.Tensor] = {}
@@ -297,14 +303,173 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self._cuda_graph_query_start_by_tokens_per_req: dict[int, torch.Tensor] = {}
         self._cuda_graph_token_to_req_by_tokens_per_req: dict[int, torch.Tensor] = {}
 
+    def _configure_cache_group_contract(
+        self,
+        paged_cache_group_specs=(),
+        paged_cache_group_page_counts=None,
+    ) -> tuple[tuple[object, ...], dict[str, int]]:
+        specs = tuple(paged_cache_group_specs or ())
+        group_ids = tuple(getattr(spec, "group_id", None) for spec in specs)
+        if any(not isinstance(group_id, str) or not group_id for group_id in group_ids):
+            raise RuntimeError(
+                "DeepSeek V4 cache group specs must use nonempty string IDs"
+            )
+        if len(group_ids) != len(set(group_ids)):
+            raise RuntimeError("DeepSeek V4 cache group specs contain duplicate IDs")
+        page_counts = dict(paged_cache_group_page_counts or {})
+        if not group_ids:
+            if page_counts:
+                raise RuntimeError(
+                    "DeepSeek V4 cache page counts require matching group specs"
+                )
+            raw_tokens_per_page: dict[str, int] = {}
+            max_page_ids: dict[str, int] = {}
+        else:
+            if set(page_counts) != set(group_ids):
+                raise RuntimeError(
+                    "DeepSeek V4 cache page counts disagree with group specs: "
+                    f"missing={sorted(set(group_ids) - set(page_counts))} "
+                    f"extra={sorted(set(page_counts) - set(group_ids))}"
+                )
+            invalid_counts = {
+                group_id: page_counts[group_id]
+                for group_id in group_ids
+                if not isinstance(page_counts[group_id], int)
+                or isinstance(page_counts[group_id], bool)
+                or page_counts[group_id] <= 1
+            }
+            if invalid_counts:
+                raise RuntimeError(
+                    "DeepSeek V4 cache groups must reserve page 0 and at least one "
+                    f"live page: {invalid_counts!r}"
+                )
+            raw_tokens_per_page = {}
+            for spec, group_id in zip(specs, group_ids, strict=True):
+                raw_tokens = int(spec.rows_per_page) * int(spec.entry_stride_tokens)
+                if raw_tokens <= 0:
+                    raise RuntimeError(
+                        "DeepSeek V4 cache group has invalid page geometry: "
+                        f"group={group_id!r} rows_per_page={spec.rows_per_page} "
+                        f"entry_stride_tokens={spec.entry_stride_tokens}"
+                    )
+                raw_tokens_per_page[group_id] = raw_tokens
+            max_page_ids = {
+                group_id: int(page_counts[group_id]) - 1 for group_id in group_ids
+            }
+
+        if self._expected_cache_group_ids is not None:
+            if (
+                self._expected_cache_group_ids != group_ids
+                or self._cache_group_raw_tokens_per_page != raw_tokens_per_page
+                or self._cache_group_max_page_ids != max_page_ids
+            ):
+                raise RuntimeError(
+                    "DeepSeek V4 cache group contract changed after initialization"
+                )
+        self._expected_cache_group_ids = group_ids
+        self._cache_group_raw_tokens_per_page = raw_tokens_per_page
+        self._cache_group_max_page_ids = max_page_ids
+        return specs, page_counts
+
+    def configure_runtime(self, **kwargs) -> None:
+        self._configure_cache_group_contract(
+            kwargs.pop("paged_cache_group_specs", ()),
+            kwargs.pop("paged_cache_group_page_counts", None),
+        )
+
     def _prepare_cache_group_tables(
         self,
-        block_tables: dict[str, torch.Tensor],
+        block_tables: Mapping[object, object],
         *,
+        bs: int,
+        actual_bs: int,
+        seq_lens: torch.Tensor,
+        device: torch.device,
+        phase: str,
         output_buffers: dict[str, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
-        materialized = {}
-        for group_id, table in block_tables.items():
+        if actual_bs < 0 or actual_bs > bs:
+            raise RuntimeError(
+                f"DeepSeek V4 {phase} actual_bs={actual_bs} must be within 0..{bs}"
+            )
+        if seq_lens.ndim != 1 or int(seq_lens.shape[0]) < actual_bs:
+            raise RuntimeError(
+                f"DeepSeek V4 {phase} seq_lens has shape {tuple(seq_lens.shape)}, "
+                f"expected at least {actual_bs} entries"
+            )
+        if not isinstance(block_tables, Mapping):
+            raise RuntimeError(
+                f"DeepSeek V4 {phase} cache tables must be a mapping, got "
+                f"{type(block_tables).__name__}"
+            )
+        expected = self._expected_cache_group_ids
+        if expected is None:
+            raise RuntimeError(
+                "DeepSeek V4 cache group specs were not initialized before " f"{phase}"
+            )
+        items = list(block_tables.items())
+        delivered: list[str] = []
+        for group_id, _ in items:
+            if not isinstance(group_id, str) or not group_id:
+                raise RuntimeError(
+                    f"DeepSeek V4 {phase} cache group IDs must be nonempty strings"
+                )
+            delivered.append(group_id)
+        delivered_ids = tuple(delivered)
+        if delivered_ids != expected:
+            delivered_set = set(delivered_ids)
+            expected_set = set(expected)
+            if delivered_set == expected_set:
+                detail = f"wrong order: got={delivered_ids!r} expected={expected!r}"
+            else:
+                detail = (
+                    f"missing={sorted(expected_set - delivered_set)} "
+                    f"extra={sorted(delivered_set - expected_set)}"
+                )
+            raise RuntimeError(f"DeepSeek V4 {phase} cache group mismatch: {detail}")
+
+        expected_device = torch.device(device)
+        if expected_device.type == "cuda" and expected_device.index is None:
+            expected_device = torch.device("cuda", torch.cuda.current_device())
+        validated: dict[str, torch.Tensor] = {}
+        for group_id, (_, value) in zip(delivered_ids, items, strict=True):
+            if not isinstance(value, torch.Tensor):
+                raise RuntimeError(
+                    f"DeepSeek V4 {phase} table {group_id!r} must be torch.Tensor"
+                )
+            table = value
+            if table.dtype != torch.int32:
+                raise RuntimeError(
+                    f"DeepSeek V4 {phase} table {group_id!r} must use torch.int32"
+                )
+            if table.device != expected_device:
+                raise RuntimeError(
+                    f"DeepSeek V4 {phase} table {group_id!r} is on "
+                    f"{table.device}, expected {expected_device}"
+                )
+            if table.ndim != 2:
+                raise RuntimeError(
+                    f"DeepSeek V4 {phase} table {group_id!r} must be rank 2"
+                )
+            if int(table.shape[0]) != bs:
+                raise RuntimeError(
+                    f"DeepSeek V4 {phase} table {group_id!r} has "
+                    f"{int(table.shape[0])} rows, expected bs={bs}"
+                )
+            if int(table.shape[1]) <= 0:
+                raise RuntimeError(
+                    f"DeepSeek V4 {phase} table {group_id!r} has zero width"
+                )
+            validated[group_id] = table
+
+        self._assert_active_cache_pages(
+            validated,
+            seq_lens=seq_lens,
+            actual_bs=actual_bs,
+            phase=phase,
+        )
+        materialized: dict[str, torch.Tensor] = {}
+        for group_id, table in validated.items():
             if output_buffers is None:
                 materialized[group_id] = table
                 continue
@@ -322,6 +487,75 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             out[:rows, :columns].copy_(table)
             materialized[group_id] = out[:rows]
         return materialized
+
+    def _assert_active_cache_pages(
+        self,
+        tables: Mapping[str, torch.Tensor],
+        *,
+        seq_lens: torch.Tensor,
+        actual_bs: int,
+        phase: str,
+    ) -> None:
+        """Check only each live row's active page on GPU hot paths."""
+        if actual_bs == 0:
+            return
+        live_seq_lens = seq_lens[:actual_bs].to(dtype=torch.int64)
+        seq_lens_valid = live_seq_lens.ge(0).all()
+        if live_seq_lens.device.type == "cpu":
+            if not bool(seq_lens_valid.item()):
+                raise RuntimeError(
+                    f"DeepSeek V4 {phase} sequence lengths must be nonnegative"
+                )
+        else:
+            torch._assert_async(
+                seq_lens_valid,
+                f"DeepSeek V4 {phase} sequence lengths must be nonnegative",
+            )
+        for group_id, table in tables.items():
+            raw_tokens_per_page = self._cache_group_raw_tokens_per_page.get(group_id)
+            max_page_id = self._cache_group_max_page_ids.get(group_id)
+            if raw_tokens_per_page is None or max_page_id is None:
+                raise RuntimeError(
+                    "DeepSeek V4 cache group contract is incomplete for "
+                    f"{group_id!r}"
+                )
+            live = table[:actual_bs]
+            required_page = torch.div(
+                live_seq_lens.clamp_min(1) - 1,
+                raw_tokens_per_page,
+                rounding_mode="floor",
+            )
+            width = int(table.shape[1])
+            in_bounds = required_page < width
+            safe_page = required_page.clamp(min=0, max=width - 1)
+            required_entries = live.gather(1, safe_page.unsqueeze(1)).squeeze(1)
+            has_tokens = live_seq_lens > 0
+            active_pages_valid = (
+                ~has_tokens
+                | (
+                    in_bounds
+                    & required_entries.gt(0)
+                    & required_entries.le(max_page_id)
+                )
+            ).all()
+            if table.device.type == "cpu":
+                page_ids_valid = ((live >= -1) & (live <= max_page_id)).all()
+                if not bool(page_ids_valid.item()):
+                    raise RuntimeError(
+                        f"DeepSeek V4 {phase} table {group_id!r} contains a page "
+                        f"ID outside -1..{max_page_id}"
+                    )
+                if not bool(active_pages_valid.item()):
+                    raise RuntimeError(
+                        f"DeepSeek V4 {phase} table {group_id!r} is missing a "
+                        "real page for an active sequence"
+                    )
+            else:
+                torch._assert_async(
+                    active_pages_valid,
+                    f"DeepSeek V4 {phase} table is missing a real active page "
+                    "or its page ID exceeds group capacity",
+                )
 
     def _cuda_graph_group_table_width(
         self,
@@ -620,13 +854,12 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         else:
             num_tokens = bs
         del kwargs
+        device = seq_lens.device
         # Batch-ordered base page table for ratio<=1 (uncompressed/SWA) indexer
         # layers, which have no dedicated group: the first (smallest-ratio)
         # compressed-KV full-history group's table (row i == batch position i).
         base_block_table = None
         if cache_metadata is not None:
-            logical_page_size = int(cache_metadata.block_size)
-            self.logical_page_size = logical_page_size
             scheduler_tables = dict(
                 cache_metadata.tables(active_forward_op=forward_batch)
             )
@@ -634,15 +867,30 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             if base_group_id is not None:
                 base_block_table = scheduler_tables[base_group_id]
             paged_cache_block_tables = self._prepare_cache_group_tables(
-                scheduler_tables
+                scheduler_tables,
+                bs=bs,
+                actual_bs=bs,
+                seq_lens=seq_lens,
+                device=device,
+                phase="eager",
             )
             paged_cache_block_table_base_offsets = {}
         elif block_tables:
             base_group_id = first_v4_compressed_kv_group_id(block_tables)
             if base_group_id is not None:
                 base_block_table = block_tables[base_group_id]
-            paged_cache_block_tables = self._prepare_cache_group_tables(block_tables)
-        device = seq_lens.device
+            paged_cache_block_tables = self._prepare_cache_group_tables(
+                block_tables,
+                bs=bs,
+                actual_bs=bs,
+                seq_lens=seq_lens,
+                device=device,
+                phase="eager",
+            )
+        elif bs > 0 and self._expected_cache_group_ids:
+            raise RuntimeError(
+                "DeepSeek V4 eager metadata is missing live cache group tables"
+            )
         req_pool_indices = req_pool_indices[:bs]
         seq_lens = seq_lens[:bs].to(torch.int32)
         query_lens = self._query_lens(
@@ -1690,12 +1938,14 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self,
         max_bs: int,
         paged_cache_group_specs=(),
+        paged_cache_group_page_counts=None,
         logical_page_size: int | None = None,
         max_tokens_per_req: int = 1,
         overlap_schedule_depth: int = 0,
     ):
-        if logical_page_size is not None:
-            self.logical_page_size = int(logical_page_size)
+        # logical_page_size accepted for signature uniformity with other
+        # backends; DSA derives its page geometry from cache metadata per step.
+        del logical_page_size
         self._decode_tile_metadata = {}
         self._cuda_graph_max_tokens_per_req = max(
             1,
@@ -1754,9 +2004,22 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             )
         self._cuda_graph_max_bs = max_bs
         self._cuda_graph_paged_cache_block_tables = {}
+        specs, page_counts = self._configure_cache_group_contract(
+            paged_cache_group_specs,
+            paged_cache_group_page_counts,
+        )
+        group_ids = self._expected_cache_group_ids
+        assert group_ids is not None
+        if not group_ids:
+            self._cuda_graph_paged_cache_base_offsets = {}
+            self._cuda_graph_is_valid_token = torch.ones(
+                max_tokens,
+                dtype=torch.bool,
+                device=self.device,
+            )
+            return
         self._cuda_graph_paged_cache_base_offsets = {}
-        for spec in tuple(paged_cache_group_specs or ()):
-            gid = str(spec.group_id)
+        for spec, gid in zip(specs, group_ids, strict=True):
             sliding = str(getattr(spec, "retention", "")) == "sliding_window"
             max_pages = self._cuda_graph_group_table_width(
                 spec,
@@ -1942,13 +2205,16 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             str(gid): off.to(device=self.device, dtype=torch.int32)
             for gid, off in paged_cache_block_table_base_offsets.items()
         }
-        metadata_paged = self._refresh_cuda_graph_paged_cache_block_tables(
-            bs,
-            {
-                str(group_id): table.to(device=self.device, dtype=torch.int32)
-                for group_id, table in paged_cache_block_tables.items()
-            },
-            pad_value=0,
+        metadata_paged = self._prepare_cache_group_tables(
+            paged_cache_block_tables,
+            bs=bs,
+            # Capture tables are placeholders and may name the null page. The
+            # first replay must replace every live row with authoritative data.
+            actual_bs=0,
+            seq_lens=capture_seq_lens,
+            device=self.device,
+            phase="capture",
+            output_buffers=self._cuda_graph_paged_cache_block_tables,
         )
         metadata_base_offsets = self._refresh_cuda_graph_base_offsets(
             bs,
@@ -2035,7 +2301,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         paged_cache_block_table_base_offsets = (
             kwargs.pop("paged_cache_block_table_base_offsets", None) or {}
         )
-        actual_bs = max(0, min(int(kwargs.pop("actual_bs", bs)), bs))
+        actual_bs = int(kwargs.pop("actual_bs", bs))
+        if actual_bs < 0 or actual_bs > bs:
+            raise RuntimeError(
+                f"DeepSeek V4 replay actual_bs={actual_bs} must be within 0..{bs}"
+            )
         num_tokens_arg = kwargs.pop("num_tokens", None)
         del kwargs
         if forward_mode is not None and not forward_mode.is_decode_or_idle():
@@ -2090,24 +2360,35 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             for gid, off in paged_cache_block_table_base_offsets.items()
         }
         if block_tables:
-            metadata_paged = self._refresh_cuda_graph_paged_cache_block_tables(
-                bs,
+            metadata_paged = self._prepare_cache_group_tables(
                 block_tables,
+                bs=bs,
                 actual_bs=actual_bs,
-                pad_value=-1,
+                seq_lens=seq_lens,
+                device=seq_lens.device,
+                phase="replay",
+                output_buffers=self._cuda_graph_paged_cache_block_tables,
             )
             metadata_base_offsets = {}
         elif cache_metadata is not None:
             scheduler_tables = dict(
                 cache_metadata.tables(active_forward_op=forward_batch)
             )
-            metadata_paged = self._refresh_cuda_graph_paged_cache_block_tables(
-                bs,
+            metadata_paged = self._prepare_cache_group_tables(
                 scheduler_tables,
+                bs=bs,
                 actual_bs=actual_bs,
-                pad_value=-1,
+                seq_lens=seq_lens,
+                device=seq_lens.device,
+                phase="replay",
+                output_buffers=self._cuda_graph_paged_cache_block_tables,
             )
             metadata_base_offsets = {}
+        elif actual_bs > 0 and self._expected_cache_group_ids:
+            raise RuntimeError(
+                "DeepSeek V4 replay is missing live cache group tables; "
+                "capture placeholders cannot be reused"
+            )
         else:
             metadata_paged = self._refresh_cuda_graph_paged_cache_block_tables(
                 bs,

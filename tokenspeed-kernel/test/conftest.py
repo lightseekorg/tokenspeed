@@ -39,7 +39,6 @@ from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import (
     _global_overrides,
     _oracles,
-    clear_config_overrides,
 )
 from utils import make_sample_specs
 
@@ -207,12 +206,10 @@ def fresh_registry(monkeypatch: pytest.MonkeyPatch):
     # Isolate tests with an empty singleton while preserving the built-in
     # registry for later integration tests in the same pytest process.
     monkeypatch.setattr(KernelRegistry, "_instance", None)
-    clear_config_overrides()
     _oracles.clear()
     _global_overrides.clear()
     yield
     KernelRegistry.reset()
-    clear_config_overrides()
     _oracles.clear()
     _global_overrides.clear()
 

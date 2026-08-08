@@ -77,6 +77,7 @@ class WireEngineCoreReadyResponse(msgspec.Struct):
     block_size: int = 0
     dp_stats_address: str | None = None
     dtype: str = "bfloat16"
+    multimodal_encoder_dtype: str | None = None
     vllm_version: str = ""
     world_size: int = 1
     data_parallel_size: int = 1

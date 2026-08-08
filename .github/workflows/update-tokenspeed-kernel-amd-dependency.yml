@@ -137,15 +137,18 @@ jobs:
           version = os.environ["VERSION"]
           target_version = Version(version)
 
-          rocm_path = Path("tokenspeed-kernel/python/requirements/rocm.txt")
-          rocm_text = rocm_path.read_text()
+          rocm_thirdparty_path = Path(
+              "tokenspeed-kernel/python/requirements/rocm-thirdparty.txt"
+          )
+          rocm_thirdparty_text = rocm_thirdparty_path.read_text()
           amd_versions = re.findall(
               r"(?m)^tokenspeed-kernel-amd>=([^\s]+)$",
-              rocm_text,
+              rocm_thirdparty_text,
           )
           if len(amd_versions) != 1:
               raise SystemExit(
-                  f"expected one tokenspeed-kernel-amd minimum in {rocm_path}"
+                  "expected one tokenspeed-kernel-amd minimum in "
+                  f"{rocm_thirdparty_path}"
               )
 
           setup_path = Path("tokenspeed-kernel/python/setup.py")
@@ -158,7 +161,7 @@ jobs:
               raise SystemExit(f"expected one BASE_VERSION in {setup_path}")
 
           current_versions = (
-              (rocm_path, amd_versions[0]),
+              (rocm_thirdparty_path, amd_versions[0]),
               (setup_path, kernel_versions[0]),
           )
           for path, current in current_versions:
@@ -169,16 +172,17 @@ jobs:
                   )
 
           if amd_versions[0] != version:
-              rocm_text, count = re.subn(
+              rocm_thirdparty_text, count = re.subn(
                   r"(?m)^tokenspeed-kernel-amd>=[^\n]+$",
                   f"tokenspeed-kernel-amd>={version}",
-                  rocm_text,
+                  rocm_thirdparty_text,
               )
               if count != 1:
                   raise SystemExit(
-                      f"expected one tokenspeed-kernel-amd minimum in {rocm_path}"
+                      "expected one tokenspeed-kernel-amd minimum in "
+                      f"{rocm_thirdparty_path}"
                   )
-              rocm_path.write_text(rocm_text)
+              rocm_thirdparty_path.write_text(rocm_thirdparty_text)
 
           if kernel_versions[0] != version:
               setup_text, count = re.subn(
@@ -192,7 +196,7 @@ jobs:
           PY
 
           if git diff --quiet -- \
-            tokenspeed-kernel/python/requirements/rocm.txt \
+            tokenspeed-kernel/python/requirements/rocm-thirdparty.txt \
             tokenspeed-kernel/python/setup.py; then
             echo "tokenspeed-kernel already matches tokenspeed-kernel-amd $VERSION."
             echo "changed=false" >> "$GITHUB_OUTPUT"
@@ -216,7 +220,7 @@ jobs:
               git ls-files --others --exclude-standard
             } | sort -u | while IFS= read -r path; do
               case "$path" in
-                tokenspeed-kernel/python/requirements/rocm.txt | \
+                tokenspeed-kernel/python/requirements/rocm-thirdparty.txt | \
                   tokenspeed-kernel/python/setup.py) ;;
                 *) echo "$path" ;;
               esac
@@ -248,14 +252,14 @@ jobs:
           VERSION: ${{ steps.prepare.outputs.version }}
         run: |
           if git diff --quiet -- \
-            tokenspeed-kernel/python/requirements/rocm.txt \
+            tokenspeed-kernel/python/requirements/rocm-thirdparty.txt \
             tokenspeed-kernel/python/setup.py; then
             echo "tokenspeed-kernel is unchanged after pre-commit; nothing to publish."
             exit 0
           fi
 
           git add \
-            tokenspeed-kernel/python/requirements/rocm.txt \
+            tokenspeed-kernel/python/requirements/rocm-thirdparty.txt \
             tokenspeed-kernel/python/setup.py
           git commit -s -m "build: sync tokenspeed-kernel with AMD ${VERSION}"
 

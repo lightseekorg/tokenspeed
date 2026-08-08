@@ -42,6 +42,9 @@ DENSE16_BLOCK_N = 128
 DENSE16_BLOCK_K = 64
 WARP_REDUCE_OUTPUTS = 1
 WARP_REDUCE_BLOCK_K = 1024
+BMM_M1_BLOCK_N = 32
+BMM_M1_NUM_WARPS = 4
+CDNA_WAVEFRONT_SIZE = 64
 MFMA_LDS_BLOCK_N = 256
 MFMA_LDS_BLOCK_K = 64
 MFMA_LDS_NUM_WARPS = 4
@@ -408,6 +411,58 @@ def _warp_reduce_smallm_kernel(
 
 
 @gluon.jit
+def _bmm_a16w16_m1_kernel(
+    a_ptr,
+    b_ptr,
+    output_ptr,
+    a_batch_stride,
+    b_batch_stride,
+    b_k_stride,
+    output_batch_stride,
+    K: gl.constexpr,
+    N: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    WAVEFRONT_SIZE: gl.constexpr,
+):
+    pid = gl.program_id(0)
+    num_pid_n: gl.constexpr = N // BLOCK_N
+    batch = pid // num_pid_n
+    pid_n = pid % num_pid_n
+    layout: gl.constexpr = gl.BlockedLayout(
+        [
+            (BLOCK_N + NUM_WARPS - 1) // NUM_WARPS,
+            K // WAVEFRONT_SIZE,
+        ],
+        [1, WAVEFRONT_SIZE],
+        [NUM_WARPS, 1],
+        [1, 0],
+    )
+    n_layout: gl.constexpr = gl.SliceLayout(1, layout)
+    k_layout: gl.constexpr = gl.SliceLayout(0, layout)
+    offs_n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=n_layout)
+    offs_k = gl.arange(0, K, layout=k_layout)
+    a = cdna4.buffer_load(
+        a_ptr,
+        (batch * a_batch_stride + offs_k).to(gl.int32),
+    ).to(gl.float32)
+    b = cdna4.buffer_load(
+        b_ptr,
+        (
+            batch * b_batch_stride
+            + offs_n[:, None].to(gl.int64)
+            + offs_k[None, :].to(gl.int64) * b_k_stride
+        ).to(gl.int32),
+    )
+    a = gl.convert_layout(a[None, :], layout)
+    result = gl.sum(b.to(gl.float32) * a, axis=1)
+    gl.store(
+        output_ptr + batch * output_batch_stride + offs_n,
+        result.to(output_ptr.dtype.element_ty),
+    )
+
+
+@gluon.jit
 def _mfma_lds_smallm_splitk_kernel(
     a_ptr,
     b_ptr,
@@ -661,6 +716,8 @@ def _mfma_lds_mediumm_kernel(
     a_ptr,
     b_ptr,
     c_ptr,
+    addend_a_ptr,
+    addend_b_ptr,
     M,
     N,
     K: gl.constexpr,
@@ -670,6 +727,10 @@ def _mfma_lds_mediumm_kernel(
     stride_bn,
     stride_cm,
     stride_cn,
+    stride_addend_am,
+    stride_addend_an,
+    stride_addend_bm,
+    stride_addend_bn,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
@@ -677,6 +738,7 @@ def _mfma_lds_mediumm_kernel(
     WARPS_N: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     GROUP_SIZE_M: gl.constexpr,
+    ADD3: gl.constexpr,
 ):
     """MFMA/LDS dense16 GEMM for selected 8 <= M <= 128 decode tiles."""
     pid = gl.program_id(axis=0)
@@ -985,6 +1047,35 @@ def _mfma_lds_mediumm_kernel(
     cn = pid_n * BLOCK_N + offs_cn
     c_offsets = offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn
     c_mask = (cm[:, None] < M) & (cn[None, :] < N)
+    if ADD3:
+        addend_a_offsets = (
+            offs_cm[:, None] * stride_addend_am + offs_cn[None, :] * stride_addend_an
+        )
+        addend_b_offsets = (
+            offs_cm[:, None] * stride_addend_bm + offs_cn[None, :] * stride_addend_bn
+        )
+        addend_a_base = (
+            addend_a_ptr
+            + pid_m * BLOCK_M * stride_addend_am
+            + pid_n * BLOCK_N * stride_addend_an
+        )
+        addend_b_base = (
+            addend_b_ptr
+            + pid_m * BLOCK_M * stride_addend_bm
+            + pid_n * BLOCK_N * stride_addend_bn
+        )
+        acc_store += cdna4.buffer_load(
+            ptr=addend_a_base,
+            offsets=addend_a_offsets,
+            mask=c_mask,
+            other=0.0,
+        )
+        acc_store += cdna4.buffer_load(
+            ptr=addend_b_base,
+            offsets=addend_b_offsets,
+            mask=c_mask,
+            other=0.0,
+        )
     c_base = c_ptr + pid_m * BLOCK_M * stride_cm + pid_n * BLOCK_N * stride_cn
     cdna4.buffer_store(
         ptr=c_base,
@@ -1059,18 +1150,15 @@ def _check_supported_dense16_shape(M: int, N: int, K: int) -> None:
 
 def _resolve_output(
     A: torch.Tensor,
-    M: int,
-    N: int,
+    shape: tuple[int, ...],
     out_dtype: torch.dtype,
     out: torch.Tensor | None,
     op_name: str,
 ) -> torch.Tensor:
     if out is None:
-        return torch.empty((M, N), device=A.device, dtype=out_dtype)
-    if out.shape != (M, N):
-        raise ValueError(
-            f"{op_name} output must have shape {(M, N)}, got {tuple(out.shape)}"
-        )
+        return torch.empty(shape, device=A.device, dtype=out_dtype)
+    if out.shape != shape:
+        raise ValueError(f"{op_name} output must have shape {shape}, got {out.shape}")
     if out.dtype != out_dtype:
         raise TypeError(f"{op_name} output dtype must be {out_dtype}, got {out.dtype}")
     if out.device != A.device:
@@ -1208,7 +1296,7 @@ def gluon_mm_a16w16_warp_reduce_smallm_gfx950(
         )
     _check_supported_dense16_shape(M, N, K)
 
-    C = _resolve_output(A, M, N, out_dtype, out, "small-M dense16 warp-reduce GEMM")
+    C = _resolve_output(A, (M, N), out_dtype, out, "small-M dense16 warp-reduce GEMM")
     total_outputs = M * N
     grid = (triton.cdiv(total_outputs, WARP_REDUCE_OUTPUTS),)
     _warp_reduce_smallm_kernel[grid](
@@ -1231,6 +1319,65 @@ def gluon_mm_a16w16_warp_reduce_smallm_gfx950(
 
     if alpha is not None:
         C.mul_(alpha.to(device=C.device, dtype=C.dtype))
+    return C
+
+
+def gluon_bmm_a16w16_gfx950(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out_dtype: torch.dtype,
+    *,
+    alpha: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """Compute the Kimi decode-head ``A @ B.T`` BMM shape."""
+    if A.ndim != 3 or B.ndim != 3:
+        return None
+    if A.dtype != torch.bfloat16 or B.dtype != torch.bfloat16:
+        return None
+    if out_dtype != torch.bfloat16 or alpha is not None:
+        return None
+    if not A.is_cuda or not B.is_cuda or A.device != B.device:
+        return None
+
+    batch, M, K = A.shape
+    batch_b, N, K_b = B.shape
+    if (
+        batch not in (12, 16)
+        or batch_b != batch
+        or M != 1
+        or N != 512
+        or K != 128
+        or K_b != K
+    ):
+        return None
+    if A.stride(-1) != 1 or B.stride(1) != 1:
+        return None
+
+    C = _resolve_output(
+        A,
+        (batch, M, N),
+        out_dtype,
+        out,
+        "small-M dense16 warp-reduce BMM",
+    )
+    _bmm_a16w16_m1_kernel[(batch * N // BMM_M1_BLOCK_N,)](
+        A,
+        B,
+        C,
+        A.stride(0),
+        B.stride(0),
+        B.stride(2),
+        C.stride(0),
+        K=K,
+        N=N,
+        BLOCK_N=BMM_M1_BLOCK_N,
+        NUM_WARPS=BMM_M1_NUM_WARPS,
+        WAVEFRONT_SIZE=CDNA_WAVEFRONT_SIZE,
+        num_warps=BMM_M1_NUM_WARPS,
+        num_stages=1,
+        waves_per_eu=0,
+    )
     return C
 
 
@@ -1290,7 +1437,7 @@ def gluon_mm_a16w16_mfma_lds_smallm_gfx950(
         )
 
     if out is not None:
-        _resolve_output(A, M, N, out_dtype, out, "small-M dense16 MFMA LDS GEMM")
+        _resolve_output(A, (M, N), out_dtype, out, "small-M dense16 MFMA LDS GEMM")
     if out is not None and M == MFMA_LDS_REDUCE_M:
         C = out
     else:
@@ -1401,11 +1548,13 @@ def gluon_mm_a16w16_mfma_lds_mediumm_gfx950(
         )
 
     block_m, block_n, block_k, warps_m, warps_n, num_buffers = config
-    C = _resolve_output(A, M, N, out_dtype, out, "medium-M dense16 MFMA LDS GEMM")
+    C = _resolve_output(A, (M, N), out_dtype, out, "medium-M dense16 MFMA LDS GEMM")
     grid = (triton.cdiv(M, block_m) * triton.cdiv(N, block_n),)
     _mfma_lds_mediumm_kernel[grid](
         A,
         B,
+        C,
+        C,
         C,
         M,
         N,
@@ -1416,6 +1565,10 @@ def gluon_mm_a16w16_mfma_lds_mediumm_gfx950(
         B.stride(0),
         C.stride(0),
         C.stride(1),
+        C.stride(0),
+        C.stride(1),
+        C.stride(0),
+        C.stride(1),
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_K=block_k,
@@ -1423,12 +1576,80 @@ def gluon_mm_a16w16_mfma_lds_mediumm_gfx950(
         WARPS_N=warps_n,
         NUM_BUFFERS=num_buffers,
         GROUP_SIZE_M=GROUP_SIZE_M,
+        ADD3=False,
         num_warps=warps_m * warps_n,
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )
 
     if alpha is not None:
         C.mul_(alpha.to(device=C.device, dtype=C.dtype))
+    return C
+
+
+def gluon_mm_a16w16_add3_m16_gfx950(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    addend_a: torch.Tensor,
+    addend_b: torch.Tensor,
+) -> torch.Tensor:
+    """Compute ``A @ B.T + addend_a + addend_b`` for the tuned M=16 tile."""
+    if A.shape != (16, 3584) or B.shape != (7168, 3584):
+        raise ValueError(
+            "M=16 dense16 add3 expects A [16, 3584] and B [7168, 3584], "
+            f"got A={tuple(A.shape)} B={tuple(B.shape)}"
+        )
+    for name, tensor in (
+        ("B", B),
+        ("addend_a", addend_a),
+        ("addend_b", addend_b),
+    ):
+        if tensor.device != A.device or tensor.dtype != A.dtype:
+            raise ValueError(f"M=16 dense16 add3 {name} must match A dtype and device")
+    if A.dtype not in _SUPPORTED_DTYPES or not A.is_cuda:
+        raise ValueError("M=16 dense16 add3 requires CUDA/HIP fp16 or bf16 tensors")
+    if not A.is_contiguous() or not B.is_contiguous():
+        raise ValueError("M=16 dense16 add3 requires contiguous GEMM inputs")
+    for name, tensor in (("addend_a", addend_a), ("addend_b", addend_b)):
+        if tensor.shape != (16, 7168) or tensor.stride(1) != 1:
+            raise ValueError(
+                f"M=16 dense16 add3 {name} must have shape [16, 7168] "
+                "and unit inner stride"
+            )
+
+    C = A.new_empty((16, 7168))
+    block_m, block_n, block_k = 16, 32, 128
+    warps_m, warps_n, num_buffers = 2, 2, 3
+    grid = (triton.cdiv(7168, block_n),)
+    _mfma_lds_mediumm_kernel[grid](
+        A,
+        B,
+        C,
+        addend_a,
+        addend_b,
+        16,
+        7168,
+        3584,
+        A.stride(0),
+        A.stride(1),
+        B.stride(1),
+        B.stride(0),
+        C.stride(0),
+        C.stride(1),
+        addend_a.stride(0),
+        addend_a.stride(1),
+        addend_b.stride(0),
+        addend_b.stride(1),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        WARPS_M=warps_m,
+        WARPS_N=warps_n,
+        NUM_BUFFERS=num_buffers,
+        GROUP_SIZE_M=1,
+        ADD3=True,
+        num_warps=warps_m * warps_n,
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+    )
     return C
 
 

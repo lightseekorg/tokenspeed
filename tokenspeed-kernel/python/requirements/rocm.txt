@@ -1,4 +1,7 @@
--r common.txt
-tokenspeed-kernel-amd>=0.1.3
---extra-index-url https://download.pytorch.org/whl/rocm7.2
-torch==2.11.0+rocm7.2
+packaging
+wheel
+psutil
+numpy
+torch
+tokenspeed-proton>=3.8.10.post20260721
+tokenspeed-triton>=3.8.10.post20260721

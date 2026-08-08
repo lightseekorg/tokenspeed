@@ -108,7 +108,7 @@ class MSAConfig(BaseAttnConfig):
         )
         return cls(
             device=server_args.device,
-            context_len=model_config.context_len,
+            context_len=model_config.context_len + server_args.spec_context_pad,
             backend_name="msa",
             full_attn_backend_name=full_attn_backend_name,
             num_attention_heads=model_config.num_attention_heads,

@@ -19,13 +19,14 @@
 # SOFTWARE.
 
 
-"""Fused routing exports used by the gfx950 A4W4 paths."""
+"""Fused routing exports used by gfx950 A4W4 decode and package prefill."""
 
 from __future__ import annotations
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_kernels import (
+    gluon_topk_route_supported,
     invoke_sigmoid_bias_topk_route_gluon,
     invoke_softmax_topk_route_gluon,
 )
@@ -143,8 +144,10 @@ def invoke_sigmoid_bias_topk_route_prefill_gluon(
     if correction_bias.shape != (router_logits.shape[1],):
         raise ValueError("correction_bias must have shape [num_experts]")
 
-    router_logits = router_logits.contiguous()
-    correction_bias = correction_bias.contiguous()
+    if not router_logits.is_contiguous():
+        router_logits = router_logits.contiguous()
+    if not correction_bias.is_contiguous():
+        correction_bias = correction_bias.contiguous()
     tokens, experts = router_logits.shape
     topk_ids = torch.empty(
         (tokens, topk), dtype=torch.int32, device=router_logits.device
@@ -179,6 +182,7 @@ def invoke_sigmoid_bias_topk_route_prefill_gluon(
 
 
 __all__ = [
+    "gluon_topk_route_supported",
     "invoke_sigmoid_bias_topk_route_gluon",
     "invoke_sigmoid_bias_topk_route_prefill_gluon",
     "invoke_softmax_topk_route_gluon",

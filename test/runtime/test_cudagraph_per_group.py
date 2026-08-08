@@ -79,6 +79,18 @@ class PadBlockTablesTest(_TorchCase):
         out = self.pad(tables, actual_bs=3, padded_bs=3)
         self.assertIs(out["full_attention"], tables["full_attention"])
 
+    def test_rejects_partial_or_oversized_batch_rows(self):
+        torch = self.torch
+        for rows in (2, 5):
+            with self.subTest(rows=rows), self.assertRaisesRegex(
+                RuntimeError, "expected actual_bs=3 or padded_bs=4"
+            ):
+                self.pad(
+                    {"full_attention": torch.ones((rows, 2), dtype=torch.int32)},
+                    actual_bs=3,
+                    padded_bs=4,
+                )
+
 
 class CacheGroupIdsTest(_TorchCase):
     """Wrapper-side capture contract: group ids only, no fabricated tensors."""
@@ -132,11 +144,18 @@ class DraftCacheGroupIdsTest(_TorchCase):
 
         self.group_ids = CudaGraphWrapper._draft_cache_group_ids
 
-    def _wrapper(self, *, draft_block_decode, families=("history",)):
+    def _wrapper(
+        self,
+        *,
+        draft_block_decode,
+        families=("history",),
+        reads_staged_draft_page_table=False,
+    ):
         return SimpleNamespace(
             draft_attn_backend=SimpleNamespace(
                 uses_cache_groups=True,
                 draft_block_decode=draft_block_decode,
+                reads_staged_draft_page_table=reads_staged_draft_page_table,
                 cache_consumer_families=frozenset(families),
             ),
             draft_token_to_kv_pool=SimpleNamespace(
@@ -150,6 +169,19 @@ class DraftCacheGroupIdsTest(_TorchCase):
     def test_dflash_does_not_capture_target_group_tables(self):
         self.assertEqual(
             self.group_ids(self._wrapper(draft_block_decode=True)),
+            (),
+        )
+
+    def test_mla_draft_reads_staged_page_table(self):
+        # MLA drafts consume only the batch-ordered staged draft page table, so
+        # the wrapper must not dispatch per-group tables to them.
+        self.assertEqual(
+            self.group_ids(
+                self._wrapper(
+                    draft_block_decode=False,
+                    reads_staged_draft_page_table=True,
+                )
+            ),
             (),
         )
 
@@ -238,7 +270,7 @@ class WrapperReplayGroupedTest(_TorchCase):
             src["full_attention"],
         )
 
-    def test_single_table_target_still_routes_group_tables_to_draft(self):
+    def test_single_table_target_pads_group_tables_before_draft_routing(self):
         torch = self.torch
         from tokenspeed.runtime.execution.cuda_graph_wrapper import (
             CudaGraphWrapper,
@@ -264,9 +296,14 @@ class WrapperReplayGroupedTest(_TorchCase):
             ),
             drafter=SimpleNamespace(
                 draft_seq_lens_buf=torch.zeros(2, dtype=torch.int32),
-                page_table=torch.zeros((2, MAX_NUM_PAGES), dtype=torch.int32),
+                cache_view=SimpleNamespace(
+                    table=torch.zeros((2, MAX_NUM_PAGES), dtype=torch.int32)
+                ),
             ),
             _draft_group_tables=lambda tables: tables,
+            _pad_block_tables_to_padded_bs=(
+                CudaGraphWrapper._pad_block_tables_to_padded_bs
+            ),
         )
         tables = {
             "full_attention": torch.tensor([[3, 4]], dtype=torch.int32),
@@ -283,7 +320,79 @@ class WrapperReplayGroupedTest(_TorchCase):
             block_tables=tables,
         )
 
-        self.assertIs(draft_call["block_tables"], tables)
+        padded = draft_call["block_tables"]
+        self.assertEqual(tuple(padded["full_attention"].shape), (2, 2))
+        self.assertTrue(
+            (padded["full_attention"][:1] == tables["full_attention"]).all()
+        )
+        self.assertTrue((padded["full_attention"][1:] == 0).all())
+
+    def test_target_and_draft_share_padded_replay_tables(self):
+        torch = self.torch
+        from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+            CudaGraphWrapper,
+        )
+
+        calls = {}
+
+        def record_target(bs, req_pool_indices, seq_lens, **kwargs):
+            calls["target"] = kwargs["block_tables"]
+
+        def record_draft(bs, req_pool_indices, seq_lens, **kwargs):
+            calls["draft"] = kwargs["block_tables"]
+
+        backend_contract = {
+            "uses_cache_groups": True,
+            "uses_paged_cache_groups": False,
+            "uses_padded_decode_token_mask": True,
+        }
+        mock = SimpleNamespace(
+            attn_backend=SimpleNamespace(
+                **backend_contract,
+                init_forward_metadata_replay_cuda_graph=record_target,
+            ),
+            draft_attn_backend=SimpleNamespace(
+                **backend_contract,
+                init_forward_metadata_replay_cuda_graph=record_draft,
+            ),
+            drafter=SimpleNamespace(
+                draft_seq_lens_buf=torch.zeros(4, dtype=torch.int32),
+                cache_view=SimpleNamespace(
+                    table=torch.zeros((4, MAX_NUM_PAGES), dtype=torch.int32)
+                ),
+            ),
+            _draft_group_tables=lambda tables: {
+                "full_attention": tables["full_attention"]
+            },
+            _pad_block_tables_to_padded_bs=(
+                CudaGraphWrapper._pad_block_tables_to_padded_bs
+            ),
+        )
+        tables = {
+            "full_attention": torch.arange(6, dtype=torch.int32).reshape(3, 2),
+            "state": torch.ones((3, 2), dtype=torch.int32),
+        }
+
+        CudaGraphWrapper._init_replay_metadata(
+            mock,
+            padded_bs=4,
+            actual_bs=3,
+            req_pool_indices=torch.arange(4, dtype=torch.int64),
+            seq_lens=torch.ones(4, dtype=torch.int32),
+            page_table=torch.zeros((4, MAX_NUM_PAGES), dtype=torch.int32),
+            forward_mode=_decode_forward_mode(),
+            block_tables=tables,
+        )
+
+        self.assertIs(
+            calls["draft"]["full_attention"],
+            calls["target"]["full_attention"],
+        )
+        self.assertEqual(set(calls["target"]), set(tables))
+        self.assertEqual(set(calls["draft"]), {"full_attention"})
+        for table in calls["target"].values():
+            self.assertEqual(tuple(table.shape), (4, 2))
+            self.assertTrue((table[3:] == 0).all())
 
 
 class WrapperCaptureGroupIdsTest(_TorchCase):
@@ -380,9 +489,13 @@ class WrapperEagerGroupGuardTest(_TorchCase):
                 )
             ),
             drafter=None,
+            draft_attn_backend=None,
             _can_use_graph=lambda bs, ctx: False,
             _init_forward_metadata=init_forward_metadata,
             _forward_func=lambda **kwargs: (None, None, None),
+        )
+        mock._any_backend_uses_cache_groups = (
+            lambda: CudaGraphWrapper._any_backend_uses_cache_groups(mock)
         )
         ctx = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
@@ -589,24 +702,14 @@ class BackendStateGroupShedTest(_BackendCase):
 
 
 class BackendReplayNoGroupBuffersTest(_BackendCase):
-    def _replay_with_recorded_gather(self, bs, block_tables=None):
-        # The single-table fill is a GPU Triton kernel; record the call
-        # instead of launching it on this test's CPU tensors.
-        from unittest import mock
-
-        import tokenspeed.runtime.layers.attention.backends.mha as mha_mod
-
-        with mock.patch.object(mha_mod, "gather_page_table_with_padding") as gather:
-            self._replay(bs, block_tables)
-        return gather
-
-    def test_replay_without_group_capture_needs_no_tables(self):
-        # No flat buffers captured (single-table path): replay without
-        # tables stays valid and fills the single-table single table.
+    def test_replay_without_group_capture_is_a_contract_violation(self):
+        # Every LCM pool publishes at least one history group, so the wrapper
+        # always passes cache_group_ids at capture; a replay that finds no
+        # per-group buffers means the contract was bypassed. The pre-LCM
+        # single-table gather fallback is gone — fail loudly instead.
         self._capture(2)
-        gather = self._replay_with_recorded_gather(2)
-        gather.assert_called_once()
-        self.assertEqual(self.backend.cuda_graph_page_tables, {})
+        with self.assertRaisesRegex(RuntimeError, "published no cache groups"):
+            self._replay(2)
 
 
 if __name__ == "__main__":

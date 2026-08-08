@@ -69,6 +69,7 @@ from tokenspeed_kernel.ops.activation.triton import (
     rmsnorm_gated_sigmoid,
     sigmoid_mul,
 )
+from tokenspeed_kernel.ops.attention import mla_normalize_project_query
 from tokenspeed_kernel.ops.attn_res import attn_res_fwd
 from tokenspeed_kernel.ops.communication import allreduce_fusion_lane
 from tokenspeed_kernel.ops.communication.multimem import (
@@ -87,6 +88,11 @@ from tokenspeed_kernel.ops.gemm import (
 )
 from tokenspeed_kernel.ops.gemm.triton_gemv import (
     decode_gemv,
+)
+from tokenspeed_kernel.ops.moe import (
+    latent_moe_decode_pipeline_available,
+    latent_moe_expert_shared,
+    latent_moe_input_projections,
 )
 from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
     situ_moe_unavailable_reason,
@@ -265,18 +271,14 @@ class KimiLinearMLP(nn.Module):
         self.act_fn = SituAndMul(
             beta=activation_situ_beta, linear_beta=activation_situ_linear_beta
         )
-        self._has_unquantized_shared_weights = (
-            is_shared_expert
-            and hasattr(self.gate_up_proj, "weight")
-            and hasattr(self.down_proj, "weight")
-        )
+        self.is_shared_expert = is_shared_expert
 
     def forward(
         self, x: torch.Tensor, down_out: torch.Tensor | None = None
     ) -> torch.Tensor:
         if x.size(0) == 0:
             return x
-        if self._has_unquantized_shared_weights:
+        if self.is_shared_expert:
             x = kimi3_shared_situ_projection(
                 x,
                 self.gate_up_proj.weight,
@@ -391,8 +393,15 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         ctx: "ForwardContext",
         comm_manager: CommManager,
         block_scale: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Project MLA Q, latent KV, and the local output gate in one GEMM."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Project MLA Q, latent KV, and the local output gate in one GEMM.
+
+        Returns:
+            query: Normalized and projected MLA query.
+            latent_cache: Compressed latent KV and RoPE cache row.
+            gate: Local output-gate shard.
+            absorbed_query: Optional decode query projected into latent key space.
+        """
         if block_scale is not None:
             qkv_gate = self.fused_qkv_a_proj_with_mqa(
                 hidden_states, block_scale, torch.bfloat16
@@ -430,11 +439,18 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
                 )
                 gate = projection.gate
         kv_a = latent_cache[..., : self.kv_lora_rank]
-        q_norm = torch.empty_like(q_a)
-        if q_a.size(0) > 0:
-            self.fused_qk_layernorm(input_q_a=q_a, input_kv_a=kv_a, output_q_a=q_norm)
-        q = decode_gemv(q_norm, self.q_b_proj.weight)
-        return q, latent_cache, gate
+        projection = mla_normalize_project_query(
+            q_a,
+            kv_a,
+            self.fused_qk_layernorm.weight_q_a,
+            self.fused_qk_layernorm.weight_kv_a,
+            self.q_b_proj.weight,
+            eps=self.q_a_layernorm.variance_epsilon,
+            prepare_absorbed_query=ctx is not None and ctx.num_extends == 0,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+        )
+        return projection.query, latent_cache, gate, projection.absorbed_query
 
     def forward(
         self,
@@ -448,7 +464,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         if hidden_states.shape[0] == 0:
             return hidden_states
         if self.use_output_gate:
-            q, latent_cache, gate = self._project_q_latent_gated(
+            q, latent_cache, gate, absorbed_query = self._project_q_latent_gated(
                 hidden_states, ctx, comm_manager, block_scale
             )
         else:
@@ -456,8 +472,22 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
                 hidden_states, ctx, comm_manager, block_scale
             )
             gate = None
-        attn_output = self._attn(positions, q, latent_cache, ctx, out_cache_loc)
-        if gate is not None:
+            absorbed_query = None
+        fuse_value_gate = (
+            gate is not None
+            and ctx.num_extends == 0
+            and ctx.attn_backend.supports_mla_projected_value_decode
+        )
+        attn_output = self._attn(
+            positions,
+            q,
+            latent_cache,
+            ctx,
+            out_cache_loc,
+            output_gate=gate if fuse_value_gate else None,
+            absorbed_query=absorbed_query,
+        )
+        if gate is not None and not fuse_value_gate:
             # Fused in-place fp32 sigmoid+mul; the gate shard matches the
             # head-sharded attn_output.
             attn_output = sigmoid_mul(attn_output, gate)
@@ -947,12 +977,14 @@ class KimiLinearMoE(nn.Module):
         # AUTO intentionally requests the flashinfer-backed SiTU plan when it was
         # registered at import time; AUTO cannot override MoELayer per model.
         self.use_trtllm_situ_moe = self.execution_plan.use_trtllm
-        if not self.execution_plan.use_native:
+        self.use_marlin_situ_moe = self.execution_plan.use_marlin
+        if not self.execution_plan.use_native and not self.use_marlin_situ_moe:
             if not self.use_trtllm_situ_moe:
                 raise RuntimeError(
-                    "Kimi-K3 MXFP4 SiTU MoE requires the native backend or the "
-                    "FlashInfer TRT-LLM backend; no portable SiTU Triton fallback "
-                    f"exists (selected MoE backend: {moe_backend.value!r})."
+                    "Kimi-K3 MXFP4 SiTU MoE requires the native, FlashInfer "
+                    "TRT-LLM, or Marlin (Hopper W4A16) backend; no portable SiTU "
+                    f"Triton fallback exists (selected MoE backend: "
+                    f"{moe_backend.value!r})."
                 )
             # Fail here with the actual reason instead of letting MoELayer's
             # kernel selection miss the (never-registered) SiTU kernel.
@@ -971,6 +1003,10 @@ class KimiLinearMoE(nn.Module):
             load_packaged_flashinfer_tuning_cache(
                 "kimi-k3", mapping.moe.ep_size, mapping.moe.tp_size
             )
+        if not self.execution_plan.use_native:
+            # Both the TRT-LLM and Marlin SiTU paths currently require a
+            # replicated-token all-reduce topology (attn TP == MoE TP*EP);
+            # Attn-DP/MoE-EP RSAG is not wired for either.
             if mapping.moe.has_tp_ep and mapping.attn.tp_size != mapping.moe.tp_ep_size:
                 raise ValueError(
                     "Kimi-K3's SiTU MoE currently requires a "
@@ -1023,11 +1059,11 @@ class KimiLinearMoE(nn.Module):
                 "activation_situ_linear_beta": situ_linear_beta,
             },
             routing_mode="precomputed_topk",
-            # Native gfx950 runs A16W4; FlashInfer's SiTU cubins require
-            # MXFP4 weights with MXFP8 activations.
+            # Native gfx950 and Hopper Marlin both run A16W4 (bf16 activations);
+            # FlashInfer's SiTU cubins require MXFP4 weights with MXFP8 acts.
             internal_activation_dtype_override=(
                 "input"
-                if self.execution_plan.use_native
+                if self.execution_plan.use_native or self.execution_plan.use_marlin
                 else "fp8" if self.execution_plan.use_trtllm else None
             ),
         )
@@ -1078,6 +1114,7 @@ class KimiLinearMoE(nn.Module):
             activation_situ_beta=situ_beta,
             activation_situ_linear_beta=situ_linear_beta,
         )
+        self.packed_input_projection_weight: torch.Tensor | None = None
         self.native_latent_moe = (
             LatentMoELayer(
                 router=self.gate,
@@ -1101,10 +1138,26 @@ class KimiLinearMoE(nn.Module):
                     alt_stream if self.execution_plan.overlap_shared_experts else None
                 ),
                 expert_parallel_group=mapping.moe.ep_group,
-                return_separate_outputs=True,
+                input_projections=self._latent_input_projections,
             )
             if self.execution_plan.use_native
             else None
+        )
+        # Dry-run exact registry selection for the fused decode pipeline.
+        self._use_fused_decode_pipeline = (
+            self.execution_plan.joint_moe_reduce
+            and latent_moe_decode_pipeline_available(
+                self.gate.weight,
+                self.routed_expert_down_proj.weight,
+                self.shared_experts.gate_up_proj.weight,
+                self.shared_experts.down_proj.weight,
+                self.experts.w13_weight,
+                self.experts.w13_weight_scale,
+                self.experts.w2_weight,
+                self.experts.w2_weight_scale,
+                self.experts.plan,
+                topk=self.top_k,
+            )
         )
 
         # A rank diverging on eligibility would strand peers in the collective.
@@ -1188,6 +1241,61 @@ class KimiLinearMoE(nn.Module):
             if not bool(flag.item()):
                 self._latent_tail = None
 
+    def pack_input_projection_weights(self) -> None:
+        """Back the router, routed-down, and shared gate/up weights with one tensor.
+
+        The three projections consume the same activation and reduce over the
+        same width, so one ``[experts + latent + 2 * shared, hidden]`` weight
+        lets a single GEMM replace three. Each module keeps a contiguous row
+        view of that tensor, so the rebinding adds no steady-state memory and
+        leaves the separate composition working unchanged.
+        """
+        modules = (
+            self.gate,
+            self.routed_expert_down_proj,
+            self.shared_experts.gate_up_proj,
+        )
+        # Held so the row views stay alive; deliberately not a registered
+        # buffer, which would duplicate every projection in the state dict.
+        # Any layout a packed GEMM cannot read is caught downstream by
+        # ``packed_projection_weight_view``, leaving the composition in place.
+        self.packed_input_projection_weight = torch.cat(
+            [module.weight for module in modules], dim=0
+        )
+        offset = 0
+        for module in modules:
+            rows = module.weight.shape[0]
+            module.weight.data = self.packed_input_projection_weight.narrow(
+                0, offset, rows
+            )
+            offset += rows
+
+    def _latent_input_projections(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Project the router, routed latent, and shared partial in one pass.
+
+        Returns ``None`` before the projection weights are concatenated, which
+        leaves the caller on the separate per-module projections.
+        """
+        if self.packed_input_projection_weight is None:
+            return None
+        router_logits, routed_input, shared_input = latent_moe_input_projections(
+            hidden_states,
+            self.gate.weight,
+            self.routed_expert_down_proj.weight,
+            self.shared_experts.gate_up_proj.weight,
+            gate_clamp=self.shared_experts.act_fn.beta,
+            up_clamp=self.shared_experts.act_fn.linear_beta,
+        )
+        # The shared experts hold reduce_results=False, so this partial is
+        # reduced by the layer's shared or joint reducer, not here.
+        shared_output = kimi3_shared_down_projection(
+            shared_input,
+            self.shared_experts.down_proj.weight,
+        )
+        return router_logits, routed_input, shared_output
+
     def _routed_experts(
         self,
         routed_in: torch.Tensor,
@@ -1195,11 +1303,11 @@ class KimiLinearMoE(nn.Module):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
     ) -> torch.Tensor:
-        """Run flashinfer's fused TRT-LLM SiTU MoE."""
-        if not self.use_trtllm_situ_moe:
+        """Run the precomputed-TopK SiTU MoE (TRT-LLM cubin or Hopper Marlin)."""
+        if not self.use_trtllm_situ_moe and not self.use_marlin_situ_moe:
             raise RuntimeError(
-                "Kimi-K3 has no portable SiTU Triton fallback; use the native "
-                "or FlashInfer TRT-LLM SiTU MoE path."
+                "Kimi-K3 has no portable SiTU Triton fallback; use the native, "
+                "FlashInfer TRT-LLM, or Marlin SiTU MoE path."
             )
         out = self.experts(
             hidden_states=routed_in,
@@ -1210,6 +1318,67 @@ class KimiLinearMoE(nn.Module):
         # The kernel returns this rank's pre-reduce partial; the selected
         # tail tier owns the combining reduction.
         return out
+
+    def _forward_fused_decode_pipeline(
+        self,
+        hidden_states: torch.Tensor,
+        prefix_sum: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the fused multi-launch K3 decode pipeline.
+
+        The input-projection operation produces router logits, the routed
+        latent, and the activated shared input from one packed weight. Routed
+        W13 and SiTU run separately; the next launch computes routed W2 beside
+        the shared down projection. One collective reduces both partials. The
+        final routed up projection adds ``prefix_sum`` and the shared output in
+        its epilogue when a specialized implementation is available. Top-k and
+        the optional routed norm remain separate launches.
+        """
+
+        router_logits, routed_input, shared_input = latent_moe_input_projections(
+            hidden_states,
+            self.gate.weight,
+            self.routed_expert_down_proj.weight,
+            self.shared_experts.gate_up_proj.weight,
+            gate_clamp=self.shared_experts.act_fn.beta,
+            up_clamp=self.shared_experts.act_fn.linear_beta,
+        )
+        topk_output = self.topk(hidden_states, router_logits)
+        routed_output = hidden_states.new_empty(
+            (hidden_states.shape[0], self.routed_expert_down_proj.weight.shape[0])
+        )
+        shared_output = hidden_states.new_empty(
+            (hidden_states.shape[0], self.shared_experts.down_proj.weight.shape[0])
+        )
+        routed_latent, shared_output = latent_moe_expert_shared(
+            routed_input,
+            self.experts.w13_weight,
+            self.experts.w13_weight_scale,
+            self.experts.w2_weight,
+            self.experts.w2_weight_scale,
+            topk_output.topk_weights,
+            topk_output.topk_ids,
+            shared_input,
+            self.shared_experts.down_proj.weight,
+            activation_clamp=float(self.experts.activation_situ_beta),
+            linear_clamp=self.experts.activation_situ_linear_beta,
+            expert_start=self.experts.ep_rank * self.experts.num_local_experts,
+            w13_interleaved=self.experts.w13_input_layout == "interleaved",
+            routed_out=routed_output,
+            shared_out=shared_output,
+        )
+        shared_output, routed_latent = all_reduce_two(
+            shared_output,
+            routed_latent,
+            group=self.mapping.moe.ep_group,
+        )
+        if self.routed_expert_norm is not None:
+            routed_latent = self.routed_expert_norm(routed_latent)
+        return self.native_latent_moe.finalize_output(
+            routed_latent,
+            prefix_sum,
+            shared_output,
+        )
 
     def forward(
         self,
@@ -1224,12 +1393,14 @@ class KimiLinearMoE(nn.Module):
         tiers fuse the accumulate in-kernel.
         """
         if self.native_latent_moe is not None:
-            routed_out, shared_out = self.native_latent_moe(
+            if self._use_fused_decode_pipeline and hidden_states.shape[0] == 1:
+                return self._forward_fused_decode_pipeline(hidden_states, prefix_sum)
+            return self.native_latent_moe(
                 hidden_states,
                 num_global_tokens=num_global_tokens,
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+                prefix_sum=prefix_sum,
             )
-            return add3(prefix_sum, routed_out, shared_out)
 
         num_tokens, hidden_size = hidden_states.shape
         if num_tokens == 0:
@@ -1876,8 +2047,33 @@ class KimiLinearModel(nn.Module):
         # One-based completed-layer ids; see set_eagle3_layers_to_capture.
         self.eagle3_layers_to_capture: tuple[int, ...] = ()
 
+        # DFLASH/DSpark speculative decoding: layer indices whose *output*
+        # stream is captured for the draft. Populated by
+        # ``set_dflash_layers_to_capture``; empty means no capture.
+        self.layers_to_capture: list[int] = []
+        self._dflash_incremental_callback = None
+        self._dflash_slot_bufs = None
+        self._dflash_capture_idx_map: dict[int, int] = {}
+
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
+
+    def _dspark_capture_stream(
+        self,
+        layer_idx: int,
+        prefix_sum: torch.Tensor,
+        block_residual: torch.Tensor,
+    ) -> torch.Tensor:
+        """Capture vLLM's completed-layer DSpark target stream.
+
+        vLLM captures ``prefix_sum + hidden_states`` immediately after the
+        named layer. This implementation accumulates the layer output into
+        ``prefix_sum`` before returning from the layer, so that sum is already
+        represented by ``prefix_sum``. Clone because later layers may update
+        the same storage in place.
+        """
+        del layer_idx, block_residual
+        return prefix_sum.clone()
 
     @torch.no_grad()
     def forward(
@@ -1904,17 +2100,33 @@ class KimiLinearModel(nn.Module):
             num_blocks, hidden_states.size(0), hidden_states.size(1)
         )
 
+        capture_layers = self.layers_to_capture
+        capture_dflash = bool(capture_layers)
+        capture_eagle3 = bool(self.eagle3_layers_to_capture)
+        aux_hidden_states: list[torch.Tensor] | None = (
+            [] if capture_dflash or capture_eagle3 else None
+        )
+
         prefix_sum = hidden_states
-        aux_hidden_states = [] if self.eagle3_layers_to_capture else None
         for layer_idx, layer in enumerate(self.layers):
             prefix_sum, block_residual = layer(
                 positions, prefix_sum, ctx, out_cache_loc, block_residual
             )
+            if capture_dflash and layer_idx in capture_layers:
+                captured = self._dspark_capture_stream(
+                    layer_idx, prefix_sum, block_residual
+                )
+                capture_idx = self._dflash_capture_idx_map.get(layer_idx)
+                if self._dflash_slot_bufs is not None and capture_idx is not None:
+                    num_tokens = captured.shape[0]
+                    self._dflash_slot_bufs[capture_idx][:num_tokens].copy_(captured)
+                    if self._dflash_incremental_callback is not None:
+                        self._dflash_incremental_callback(capture_idx, num_tokens)
+                assert aux_hidden_states is not None
+                aux_hidden_states.append(captured)
             # Clone: the copy must survive the next layer's in-place residual writes.
-            if (
-                aux_hidden_states is not None
-                and layer_idx + 1 in self.eagle3_layers_to_capture
-            ):
+            elif capture_eagle3 and layer_idx + 1 in self.eagle3_layers_to_capture:
+                assert aux_hidden_states is not None
                 aux_hidden_states.append(prefix_sum.clone())
 
         hidden_states = _apply_attn_res(
@@ -1961,6 +2173,38 @@ class KimiLinearForCausalLM(BaseCausalLM):
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_dflash_layers_to_capture(
+        self,
+        layer_ids: list[int],
+        incremental_callback=None,
+        slot_bufs: list | None = None,
+    ) -> None:
+        """Capture the K3 residual stream after each named target layer.
+
+        DFLASH/DSpark checkpoints name 0-indexed completed-layer outputs. The
+        per-layer return has already accumulated the layer output into K3's
+        prefix stream, matching vLLM's target-side capture contract.
+        """
+        num_layers = len(self.model.layers)
+        if len(set(layer_ids)) != len(layer_ids):
+            raise ValueError("DFLASH target_layer_ids must be unique.")
+        invalid = [val for val in layer_ids if val < 0 or val >= num_layers]
+        if invalid:
+            raise ValueError(
+                "DFLASH target_layer_ids must map to capturable target layer "
+                f"outputs. Got invalid ids {invalid}; valid range is "
+                f"[0, {num_layers - 1}] for {num_layers} target layers."
+            )
+        self.capture_aux_hidden_states = True
+        # Ascending: the draft concatenates the taps positionally, so the
+        # capture order is part of the weight contract.
+        self.model.layers_to_capture = sorted(layer_ids)
+        self.model._dflash_capture_idx_map = {
+            layer_idx: i for i, layer_idx in enumerate(self.model.layers_to_capture)
+        }
+        self.model._dflash_incremental_callback = incremental_callback
+        self.model._dflash_slot_bufs = slot_bufs
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         """Load the ``model.*`` / ``lm_head.*`` text weights.
@@ -2113,6 +2357,10 @@ class KimiLinearForCausalLM(BaseCausalLM):
                 * layer.mlp_res_proj.weight.reshape(-1).float()
             ).to(torch.bfloat16)
 
+        for layer in self.model.layers:
+            if getattr(layer, "is_moe_layer", False):
+                layer.block_sparse_moe.pack_input_projection_weights()
+
 
 # ===----------------------------------------------------------------------=== #
 # Registered multimodal wrapper
@@ -2181,6 +2429,22 @@ class KimiK3ForConditionalGeneration(nn.Module):
 
     def get_embed_and_head(self):
         return self.language_model.get_embed_and_head()
+
+    def set_dflash_layers_to_capture(
+        self,
+        layer_ids: list[int],
+        incremental_callback=None,
+        slot_bufs: list | None = None,
+    ) -> None:
+        if self.language_model is None:
+            raise AttributeError(
+                "Kimi-K3 encoder-only mode cannot capture target hidden states."
+            )
+        self.language_model.set_dflash_layers_to_capture(
+            layer_ids,
+            incremental_callback=incremental_callback,
+            slot_bufs=slot_bufs,
+        )
 
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
         if self.language_model is None:

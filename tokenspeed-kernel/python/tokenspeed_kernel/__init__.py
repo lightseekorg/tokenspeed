@@ -26,6 +26,7 @@ from tokenspeed_kernel.ops.activation import add3, situ_and_mul
 from tokenspeed_kernel.ops.attention import (
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
+    MLAQueryProjection,
     attn_merge_state,
     dsa_decode,
     dsa_decode_topk,
@@ -41,7 +42,9 @@ from tokenspeed_kernel.ops.attention import (
     mha_prefill,
     mla_decode_with_kvcache,
     mla_extend_with_kvcache,
+    mla_normalize_project_query,
     mla_prefill,
+    mla_project_value,
     mla_use_absorbed_extend,
     msa_decode_with_kvcache,
     msa_extend_with_kvcache,
@@ -67,6 +70,7 @@ from tokenspeed_kernel.ops.moe import (
     moe_process_weights,
     moe_sigmoid_bias_topk,
     moe_softmax_topk,
+    native_latent_moe_available,
 )
 from tokenspeed_kernel.ops.quantization import (
     quantize_fp8,
@@ -105,6 +109,9 @@ __all__ = [
     "mla_extend_with_kvcache",
     "mla_decode_with_kvcache",
     "mla_use_absorbed_extend",
+    "mla_normalize_project_query",
+    "mla_project_value",
+    "MLAQueryProjection",
     "dsa_prefill",
     "dsa_decode",
     "dsa_prefill_topk",
@@ -122,6 +129,7 @@ __all__ = [
     "add3",
     "situ_and_mul",
     # moe
+    "native_latent_moe_available",
     "moe_apply",
     "moe_plan",
     "moe_process_weights",

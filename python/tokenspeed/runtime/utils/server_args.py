@@ -49,6 +49,20 @@ logger = get_colorful_logger(__name__)
 
 ENABLE_CP = os.environ.get("ENABLE_CP", "false").lower() in ("true", "1")
 
+# Spec-decode overshoot spans the physical KV extent must absorb past the
+# logical context_len. The overlap scheduler steps a finished request at most
+# ONE extra iteration (event_loop_overlap commits the previous step every
+# round, so the Finish event reaches the C++ scheduler before the next plan),
+# and termination is checked CPU-side against max_new_tokens, so verify can
+# commit past context_len for exactly that window:
+#   1. the finishing step's own accept (up to spec_num_tokens past the limit),
+#   2. the single lingering step's accept,
+#   3. the lingering step laying out its next draft block after that accept.
+# Hence 3 spans. Everything written past context_len belongs to a request
+# whose output is already truncated by max_new_tokens; the garbage KV is
+# evicted with the request one step later.
+_SPEC_OVERSHOOT_SPANS = 3
+
 
 def str_to_bool(value: str | bool) -> bool:
     if isinstance(value, bool):
@@ -276,10 +290,10 @@ class ServerArgs:
     disable_kvstore: bool = False
     enforce_eager: bool = False
     disable_cuda_graph_padding: bool = False
+    disable_autotune: bool = False
     enable_cudagraph_gc: bool = False
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
-    disable_custom_all_reduce: bool = False
     disable_overlap_schedule: bool = False
     disable_tf32: bool = False
     force_deterministic_rsag: bool = False
@@ -336,6 +350,19 @@ class ServerArgs:
     def mamba_cache_chunk_size(self) -> int:
         return max(FLA_CHUNK_SIZE, self.block_size)
 
+    @property
+    def spec_context_pad(self) -> int:
+        """Tokens the physical KV extent must hold past the logical context_len.
+
+        Zero without speculative decoding; see _SPEC_OVERSHOOT_SPANS for the
+        derivation. Sizing consumers (page tables, graph capture widths) add
+        this pad; user-semantic consumers (input validation, max_new_tokens
+        folding, stop checks) keep the logical context_len.
+        """
+        if self.speculative_algorithm is None:
+            return 0
+        return _SPEC_OVERSHOOT_SPANS * int(self.speculative_num_draft_tokens)
+
     def __post_init__(self):
         self.resolve_basic_defaults()
         self.resolve_launcher_topology()
@@ -387,13 +414,29 @@ class ServerArgs:
             if draft_model is not None and self.speculative_draft_model_path is None:
                 self.speculative_draft_model_path = str(draft_model)
 
+            dspark_draft_model = self.speculative_draft_model_path
+            dspark_uses_base_model = self.speculative_algorithm == "DSPARK" and (
+                self.draft_model_path_use_base
+                or dspark_draft_model is None
+                or maybe_model_redirect(dspark_draft_model) == self.model
+            )
+            if dspark_uses_base_model:
+                self.draft_model_path_use_base = True
+
             num_speculative_tokens = config.get("num_speculative_tokens")
             if num_speculative_tokens is not None:
                 num_speculative_tokens = int(num_speculative_tokens)
-                if self.speculative_algorithm in ("DFLASH", "DSPARK"):
+                if self.speculative_algorithm == "DFLASH" or (
+                    self.speculative_algorithm == "DSPARK"
+                    and not dspark_uses_base_model
+                ):
                     if self.speculative_num_draft_tokens is None:
                         self.speculative_num_draft_tokens = num_speculative_tokens
                     self.speculative_num_steps = max(num_speculative_tokens - 1, 0)
+                elif self.speculative_algorithm == "DSPARK":
+                    self.speculative_num_steps = num_speculative_tokens
+                    if self.speculative_num_draft_tokens is None:
+                        self.speculative_num_draft_tokens = num_speculative_tokens + 1
                 else:
                     self.speculative_num_steps = num_speculative_tokens
 
@@ -632,7 +675,7 @@ class ServerArgs:
             self.drafter_attention_backend = self.attention_backend
 
         if (
-            self.speculative_algorithm == "MTP"
+            self.speculative_algorithm in ("MTP", "DSPARK")
             and self.speculative_draft_model_path is None
         ):
             self.draft_model_path_use_base = True
@@ -653,6 +696,23 @@ class ServerArgs:
             elif self.speculative_num_steps != expected_steps:
                 raise ValueError(
                     "DFLASH requires speculative_num_steps to equal "
+                    "speculative_num_draft_tokens - 1. "
+                    f"Got {self.speculative_num_steps=} and "
+                    f"{self.speculative_num_draft_tokens=}."
+                )
+
+        if self.speculative_algorithm == "DSPARK" and self.draft_model_path_use_base:
+            if self.enable_prefix_caching:
+                raise ValueError(
+                    "DSPARK does not yet preserve its captured-context windows "
+                    "across prefix-cache hits; use --no-enable-prefix-caching."
+                )
+            expected_steps = max(int(self.speculative_num_draft_tokens) - 1, 0)
+            if self.speculative_num_steps == ServerArgs.speculative_num_steps:
+                self.speculative_num_steps = expected_steps
+            elif self.speculative_num_steps != expected_steps:
+                raise ValueError(
+                    "DSPARK requires speculative_num_steps to equal "
                     "speculative_num_draft_tokens - 1. "
                     f"Got {self.speculative_num_steps=} and "
                     f"{self.speculative_num_draft_tokens=}."
@@ -755,6 +815,15 @@ class ServerArgs:
 
     def validate_cache_options(self):
         if self.enable_kvstore and not self.enable_prefix_caching:
+            if self.speculative_algorithm == "DSPARK" and (
+                self.draft_model_path_use_base
+                or self.speculative_draft_model_path is None
+                or self.speculative_draft_model_path == self.model
+            ):
+                raise ValueError(
+                    "DSPARK currently requires both --disable-kvstore and "
+                    "--no-enable-prefix-caching."
+                )
             raise ValueError(
                 "KVStore and disabled prefix caching are mutually exclusive "
                 "and cannot be used at the same time. Please use only one of them."
@@ -1677,6 +1746,14 @@ class ServerArgs:
             help="Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
         )
         parser.add_argument(
+            "--disable-autotune",
+            "--disable-flashinfer-autotune",
+            action="store_true",
+            help="Skip the startup kernel-tuning pass; tunable kernels use each "
+            "library's heuristic tactics instead. Speeds up startup for "
+            "debugging at the cost of serving performance.",
+        )
+        parser.add_argument(
             "--enable-cudagraph-gc",
             action="store_true",
             help="Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen during capture to speed up the process.",
@@ -1690,11 +1767,6 @@ class ServerArgs:
             "--enable-symm-mem",
             action="store_true",
             help="Enable NCCL symmetric memory for fast collectives.",
-        )
-        parser.add_argument(
-            "--disable-custom-all-reduce",
-            action="store_true",
-            help="Disable the custom all-reduce kernel and fall back to NCCL.",
         )
         parser.add_argument(
             "--disable-overlap-schedule",

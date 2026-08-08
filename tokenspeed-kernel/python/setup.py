@@ -19,7 +19,28 @@
 # SOFTWARE.
 
 """
-tokenspeed_kernel build script.
+Build and package tokenspeed_kernel.
+
+This script will automatically detect the CUDA or ROCm backend and install the
+appropriate dependencies, and compile the native kernels for the selected
+backend.
+
+Dependency handling
+===================
+
+Dependencies are split by purpose:
+
+* requirements/<backend>.txt contains core build and runtime dependencies.
+* requirements/<backend>-thirdparty.txt contains external kernel packages.
+
+Both files are combined into install_requires and recorded in wheel
+metadata. During a source or editable build, the native build step also
+installs the core backend file before compiling. Third-party dependencies are
+installed by the outer package installer from the generated metadata. They are
+not optional despite being kept in a separate file.
+
+Kernel compilation
+==================
 
 Compiles .cu files into shared libraries (.so) loaded via tvm_ffi.load_module().
 On systems without an NVIDIA CUDA build target, the build is skipped and the
@@ -339,6 +360,22 @@ KERNEL_GROUPS = [
             CUDA_CSRC_DIR / "flashinfer_marlin_binding.cu",
         ],
         [],
+    ),
+    (
+        "marlin_moe",
+        [
+            CUDA_CSRC_DIR / "marlin_moe" / "marlin_moe_binding.cu",
+        ],
+        [],
+        # -I marlin_moe/include first: the vendored Marlin GEMM only needs a
+        # tiny scalar_type.hpp + dtype-alias prelude (a trimmed drop-in), not
+        # the full sgl_kernel stack. -std=c++20 for scalar_type's constexpr;
+        # nvcc keeps the last -std, overriding the global c++17.
+        [
+            f"-I{CUDA_CSRC_DIR / 'marlin_moe' / 'include'}",
+            "-std=c++20",
+            "-Wno-deprecated-gpu-targets",
+        ],
     ),
     (
         "routing",

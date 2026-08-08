@@ -81,12 +81,7 @@ from collections.abc import Callable, Iterable
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.conv import (
-    sconv_decode,
-    sconv_decode_paged,
-    sconv_prefill,
-    sconv_prefill_paged,
-)
+from tokenspeed_kernel.ops.conv import inkling_ring_sconv, inkling_ring_sconv_update
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
 from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
@@ -144,10 +139,6 @@ _is_hopper_plus = current_platform().is_hopper_plus
 
 # Escape hatch: disable the rel-logits aux-stream fork (serial pre-attention).
 _ATTN_RELFORK = os.environ.get("INKLING_ATTN_RELFORK", "1") == "1"
-# Paged conv decode: signal PDL dependents after y, overlapping the pool-persist tail.
-_SCONV_EARLY_RELEASE = os.environ.get("INKLING_SCONV_EARLY_RELEASE", "0") == "1"
-
-
 # Hetero KV (#647 byte-uniform slots): full layers keep their native half KV
 # head count. Unconditional since 2026-07-15 (INKLING_HETERO_KV gate retired).
 _HETERO_KV = True
@@ -388,109 +379,16 @@ def _sconv_apply(
     md = backend.conv_metadata
 
     geo = backend.conv_columns if md.col_page_table is not None else None
-    checkpoint_mode = geo is not None and geo.get("mode") == "checkpoint"
-    if (
-        geo is not None
-        and not checkpoint_mode
-        and conv_group in ("attnconv", "mlpconv")
-    ):
-        if geo.get("hidden_group_of_layer") is None:
-            geo = None  # hidden sites stay rolling without their groups
-        else:
-            # Hidden-conv-as-swa: ATTN site's columns ride the layer's K slot, MLP site's its V slot.
-            table = md.col_page_table[geo["hidden_group_of_layer"][layer_id]]
-            bt = geo["hidden_block_tokens"]
-            cols = ctx.token_to_kv_pool.conv_slot_view(
-                layer_id, "k" if conv_group == "attnconv" else "v", bt, dim
-            )
-            if md.is_decode:
-                return sconv_decode_paged(
-                    x,
-                    weight,
-                    cols,
-                    table,
-                    md.col_seq_lens,
-                    block_tokens=bt,
-                    col_offset=0,
-                    activation=None,
-                    use_residual=True,
-                    enable_pdl=pdl_enabled(),
-                    early_release=_SCONV_EARLY_RELEASE,
-                )
-            return sconv_prefill_paged(
-                x,
-                weight,
-                cols,
-                table,
-                md.seq_idx,
-                md.query_start_loc,
-                md.col_prefix_lens,
-                block_tokens=bt,
-                col_offset=0,
-                lcm_align=geo["lcm_align"],
-                activation=None,
-                use_residual=True,
-            )
+    checkpoint_mode = geo is not None
 
-    if geo is not None and not checkpoint_mode and conv_group == "kvconv":
-        # kvconv-as-swa: columns stay 3D views — a 2D reshape would silently COPY, breaking persistence.
-        table = md.col_page_table[geo["conv_group_of_layer"][layer_id]]
-        k_cols, v_cols = ctx.token_to_kv_pool.kvconv_slot_views_for_layer(
-            layer_id, geo["block_tokens"]
-        )
-        half = dim // 2
-        if md.is_decode:
-            return sconv_decode_paged(
-                x,
-                weight,
-                k_cols,
-                table,
-                md.col_seq_lens,
-                block_tokens=geo["block_tokens"],
-                col_offset=0,
-                col_pool2=v_cols,
-                half_d=half,
-                activation=None,
-                use_residual=True,
-                enable_pdl=pdl_enabled(),
-                early_release=_SCONV_EARLY_RELEASE,
-            )
-        return sconv_prefill_paged(
-            x,
-            weight,
-            k_cols,
-            table,
-            md.seq_idx,
-            md.query_start_loc,
-            md.col_prefix_lens,
-            block_tokens=geo["block_tokens"],
-            col_offset=0,
-            col_pool2=v_cols,
-            half_d=half,
-            lcm_align=geo["lcm_align"],
-            activation=None,
-            use_residual=True,
-        )
-
-    # Channel slice of the layer's [slots, W-1, conv_dim] state buffer.
-    # Draft lookback window passes re-run the last D committed rows, so
-    # their conv init state is the LAGGED window (D rows behind); the
-    # backend's valid_len update then advances both windows off it.
-    pool_state = (
-        backend.draft_lag_conv_state_wd(layer_id)
-        if md.lookback > 0
-        else backend.conv_pool.layer_state_wd(layer_id)
-    )
-    state = pool_state[:, :, channel_offset : channel_offset + dim]
+    # Channel slice of the layer's [slots, R, conv_dim] ring.
+    state = backend.conv_pool.layer_state_wd(layer_id)[
+        :, :, channel_offset : channel_offset + dim
+    ]
 
     checkpoint_buffers = ()
     checkpoint_group = None
     if checkpoint_mode:
-        if md.lookback > 0 or md.update_mode == "valid_len":
-            raise RuntimeError(
-                "Inkling LCM checkpoints do not support draft ShortConv "
-                "state updates"
-            )
         if conv_group == "kvconv":
             checkpoint_group = "kvconv"
             checkpoint_buffers = ctx.token_to_kv_pool.kvconv_checkpoint_buffers(
@@ -509,34 +407,26 @@ def _sconv_apply(
                 group_id=checkpoint_group,
                 buffers=checkpoint_buffers,
             )
-            backend.restore_shortconv_checkpoint(
-                state,
-                checkpoint_buffers,
-                md,
-                checkpoint_group,
-            )
+            if md.needs_restore:
+                backend.restore_shortconv_checkpoint(
+                    state,
+                    checkpoint_buffers,
+                    md,
+                    checkpoint_group,
+                )
 
-    if md.is_decode:
-        # Fused conv + residual + in-place cache shift.
-        y = sconv_decode(
-            x,
-            weight,
-            state,
-            md.cache_indices,
-            activation=None,
-            use_residual=True,
-            enable_pdl=pdl_enabled(),
+    # In-kernel speculative boundary publish: every covered 128-boundary,
+    # accept-independent; rejected content is overwritten by a later round.
+    publish = None
+    if checkpoint_buffers:
+        publish = (
+            md.col_page_table[checkpoint_group],
+            checkpoint_buffers[0],
+            checkpoint_buffers[1] if len(checkpoint_buffers) == 2 else None,
+            geo["block_tokens"],
         )
-        if checkpoint_buffers and md.update_mode == "inplace":
-            backend.publish_shortconv_checkpoints(
-                x,
-                state,
-                checkpoint_buffers,
-                md,
-                checkpoint_group,
-            )
-        return y
-    y = sconv_prefill(
+
+    y = inkling_ring_sconv(
         x,
         weight,
         state,
@@ -544,27 +434,23 @@ def _sconv_apply(
         md.seq_idx,
         md.cache_indices,
         md.has_initial_state,
+        md.seq_lens,
         activation=None,
         use_residual=True,
+        publish=publish,
+        enable_pdl=pdl_enabled(),
     )
-    if checkpoint_buffers and md.update_mode == "inplace":
-        backend.publish_shortconv_checkpoints(
+    if md.needs_ring_update:
+        # Extend chunks can exceed the compute kernel's in-kernel persistence
+        # bound; refill the full ring depth in a follow-up pass.
+        inkling_ring_sconv_update(
             x,
             state,
-            checkpoint_buffers,
-            md,
-            checkpoint_group,
+            md.query_start_loc,
+            md.seq_lens,
+            md.cache_indices,
+            kernel_width=weight.shape[1],
         )
-    # Backend owns the window write: mode-dependent under spec decoding (verify stash / catch-up).
-    backend.apply_conv_state_update(
-        x,
-        state,
-        md,
-        layer_id,
-        channel_offset,
-        dim,
-        accept_lengths=getattr(ctx, "accept_lengths", None),
-    )
     return y
 
 
