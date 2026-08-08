@@ -135,6 +135,8 @@ class ServerArgs:
     chunked_prefill_size: int | None = None
     max_prefill_tokens: int = 8192
     enable_mixed_batch: bool = False
+    # Cap on distinct LoRA adapters per batch. 0 disables LoRA scheduling.
+    max_loras: int = 0
     # Kernel page size. Flat scheduler logical pages come from the LCM
     # runtime contract and must not overwrite this value.
     block_size: int = 64
@@ -1088,6 +1090,17 @@ class ServerArgs:
             type=int,
             default=ServerArgs.max_num_seqs,
             help="Maximum number of sequences to process concurrently.",
+        )
+        parser.add_argument(
+            "--max-loras",
+            metavar="MAX_LORAS",
+            type=int,
+            default=ServerArgs.max_loras,
+            help=(
+                "Maximum number of distinct LoRA adapters in a single batch. "
+                "Requests that would exceed it are deferred to a later step. "
+                "0 disables LoRA scheduling."
+            ),
         )
         parser.add_argument(
             "--max-total-tokens",

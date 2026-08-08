@@ -142,6 +142,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("block_size", &tokenspeed::SchedulerConfig::block_size)
         .def_rw("max_scheduled_tokens", &tokenspeed::SchedulerConfig::max_scheduled_tokens)
         .def_rw("max_batch_size", &tokenspeed::SchedulerConfig::max_batch_size)
+        .def_rw("max_loras", &tokenspeed::SchedulerConfig::max_loras)
         .def_rw("decode_input_tokens", &tokenspeed::SchedulerConfig::decode_input_tokens)
         .def_rw("overlap_schedule_depth", &tokenspeed::SchedulerConfig::overlap_schedule_depth)
         .def_rw("role", &tokenspeed::SchedulerConfig::role)
@@ -162,7 +163,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     nb::class_<tokenspeed::RequestSpec>(m, "RequestSpec")
         .def(nb::init<>())
         .def_rw("request_id", &tokenspeed::RequestSpec::request_id)
-        .def_rw("tokens", &tokenspeed::RequestSpec::tokens);
+        .def_rw("tokens", &tokenspeed::RequestSpec::tokens)
+        .def_rw("lora_id", &tokenspeed::RequestSpec::lora_id);
 
     nb::module_ forward_event = m.def_submodule("ForwardEvent");
     nb::class_<tokenspeed::forward::ExtendResult>(forward_event, "ExtendResult")

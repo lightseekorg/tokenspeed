@@ -50,6 +50,10 @@ struct SchedulerConfig {
 
     std::int32_t max_scheduled_tokens{};
     std::int32_t max_batch_size{};
+    // Cap on the number of *distinct* LoRA adapters in one batch; the runtime
+    // materializes one adapter slot per unique id, so exceeding it would
+    // overrun that fixed pool. 0 disables the cap (and LoRA serving with it).
+    std::int32_t max_loras{0};
     std::int32_t decode_input_tokens{1};
     // Number of scheduler iterations that may be dispatched before the
     // accepted decode length is committed. The current event loop supports
