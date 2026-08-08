@@ -43,7 +43,7 @@ pip install --upgrade pip "setuptools<82" wheel
 echo "=== Step 3: Check PyTorch for ROCm ==="
 if ! pip3 show torch >/dev/null 2>&1; then
     echo "torch is not installed; installing PyTorch for ROCm 7.2"
-    pip3 install torch torchvision \
+    pip3 install torch==2.11.0 torchvision==0.26.0 \
         --index-url https://download.pytorch.org/whl/rocm7.2
 fi
 
