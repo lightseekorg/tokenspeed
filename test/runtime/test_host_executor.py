@@ -67,6 +67,7 @@ class GroupAwareWireTest(unittest.TestCase):
         pool = CachePool.__new__(CachePool)
         pool.layer_num = 2
         pool.buffer = object()
+        pool._backing_pool = None
         pool.paged_cache_group_specs = (
             SimpleNamespace(group_id="state"),
             SimpleNamespace(group_id="full"),
