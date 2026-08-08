@@ -21,8 +21,11 @@
 """Inkling attention backend wrapper: dense MHA + engine-side sconv state.
 
 The C++ scheduler sees Inkling as a plain dense GQA model (KV pages only). The
-sconv rolling state — four short-causal-conv streams per decoder block,
-window ``W-1`` states per request — is managed entirely engine-side:
+sconv working state — four short-causal-conv streams per decoder block, a
+ring of the last ``R`` input rows per request — is managed entirely
+engine-side. The ring row of absolute position ``p`` is ``p % R``; positions
+derive from the through-chunk ``seq_lens``, so there is no stored cursor and
+rejected speculative rows are overwritten when their positions recur.
 
 * ``InklingConvStatePool`` holds one channel-concatenated conv buffer per layer,
   sized by the request-pool capacity and indexed by ``req_pool_indices``
@@ -51,7 +54,7 @@ from tokenspeed_kernel import (
     rel_mha_plan,
     rel_mha_prefill,
 )
-from tokenspeed_kernel.ops.conv import sconv_cache_update, seq_idx_from_cu_seqlens
+from tokenspeed_kernel.ops.conv import seq_idx_from_cu_seqlens
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import scrub_padding_tail
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -94,21 +97,9 @@ class InklingConvMetadata:
         is_decode: True when this is a single-token-per-request decode batch.
         seq_idx: ``[total_tokens]`` int32 sequence id per token (decode:
             the cached arange — token t belongs to request t).
-        update_mode: How the conv window is persisted after the forward.
-            ``inplace``: kernel-native update (normal decode/extend).
-            ``stash``: target verify — some chunk tokens may be REJECTED, so
-            stash the pre-conv chunk activations and defer the window write
-            to ``update_mamba_state_after_mtp_verify`` (post-verify hook).
-            ``valid_len``: draft catch-up — the chunk's valid prefix length
-            is already known (``ctx.accept_lengths``); write the window
-            ending at the accepted position inline.
-        tokens_per_req: Uniform tokens per request for the multi-token
-            decode modes (``stash``/``valid_len``).
-        lookback: Draft decode-window lookback rows (``valid_len`` only).
-            When > 0 the catch-up chunk carries ``lookback`` extra leading
-            rows that re-run the last committed positions of the previous
-            round, so the conv compute reads the LAGGED window (see
-            ``draft_lag_conv_state_wd``) instead of the main one.
+        seq_lens: ``[bs]`` int32 lengths THROUGH the chunk; the source of
+            every ring position (chunk token ``t`` of request ``si`` sits at
+            absolute position ``seq_lens[si] - (eos - t)``).
     """
 
     query_start_loc: torch.Tensor
@@ -116,28 +107,24 @@ class InklingConvMetadata:
     has_initial_state: torch.Tensor
     is_decode: bool
     seq_idx: torch.Tensor | None = None
-    update_mode: str = "inplace"
-    tokens_per_req: int = 1
-    lookback: int = 0
-    # Checkpoint groups: per-group tables {group: [bs, max_conv_blocks]} + lengths; None -> rolling state.
+    seq_lens: torch.Tensor | None = None
+    # Extend/mixed chunks can exceed the compute kernel's in-kernel
+    # persistence bound (R - (W-1)); True runs inkling_ring_sconv_update after it.
+    needs_ring_update: bool = False
+    # Checkpoint groups: per-group tables {group: [bs, max_conv_blocks]}; None -> no paged groups.
     col_page_table: dict[str, torch.Tensor] | None = None
-    col_seq_lens: torch.Tensor | None = None
     checkpoints: ShortConvCheckpointMetadata | None = None
-    # Lazy cache of ``_write_lag_extend``'s md-only index math (one forward's
-    # streams share it; md is rebuilt every forward).
-    lag_extend_cache: tuple | None = None
 
 
 class InklingConvStatePool:
-    """Engine-side rolling conv state for all sconv streams of all layers.
+    """Engine-side working state (ring) for all sconv streams of all layers.
 
-    Memory layout: ``[num_layers, num_slots, W-1, conv_dim]`` — the feature
-    dim is contiguous, which the runtime ``causal_conv1d`` kernels require
-    (``conv_state.stride(-2) == 1`` after the transposed view) and which
-    matches the ``tokenspeed_kernel.ops.conv`` sconv kernels' native
-    ``[slots, W-1, D]`` layout for the P2 swap-in. The four streams of a
-    block live at fixed channel offsets given by ``inkling_conv_stream_layout``;
-    modules take channel slices.
+    Memory layout: ``[num_layers, num_slots, R, conv_dim]`` — the feature dim
+    is contiguous (the ``tokenspeed_kernel.ops.conv`` kernels' contract). Ring
+    row of absolute position ``p`` is ``p % R``; ``R >= (W-1) + K + lookback``
+    so a round's pre-chunk tap reads and chunk-row writes never alias. The
+    four streams of a block live at fixed channel offsets given by
+    ``inkling_conv_stream_layout``; modules take channel slices.
     """
 
     def __init__(
@@ -146,6 +133,7 @@ class InklingConvStatePool:
         num_slots: int,
         conv_dim: int,
         kernel_size: int,
+        ring_size: int,
         dtype: torch.dtype,
         device: torch.device | str,
     ):
@@ -153,19 +141,15 @@ class InklingConvStatePool:
         self.num_slots = num_slots
         self.conv_dim = conv_dim
         self.kernel_size = kernel_size
+        self.ring_size = ring_size
         self.conv_state = torch.zeros(
-            (num_layers, num_slots, kernel_size - 1, conv_dim),
+            (num_layers, num_slots, ring_size, conv_dim),
             dtype=dtype,
             device=device,
         )
 
-    def layer_state(self, layer_id: int) -> torch.Tensor:
-        """One layer's state, viewed ``[num_slots, conv_dim, W-1]`` with the
-        feature dim contiguous (the causal_conv1d kernels' contract)."""
-        return self.conv_state[layer_id].transpose(1, 2)
-
     def layer_state_wd(self, layer_id: int) -> torch.Tensor:
-        """One layer's state in the native ``[num_slots, W-1, conv_dim]``
+        """One layer's ring in the native ``[num_slots, R, conv_dim]``
         layout (the tokenspeed_kernel ops/conv sconv kernels' contract)."""
         return self.conv_state[layer_id]
 
@@ -200,16 +184,10 @@ class InklingAttnBackend(AttentionBackend):
         # Spec decoding: >1 means decode rounds carry this many tokens/request (verify / catch-up).
         self.conv_spec_num_tokens = max(1, int(spec_num_tokens))
         self.conv_is_draft = is_draft
-        # Target-verify stash [num_layers, tokens, conv_dim]; pinned once CUDA graphs record it.
-        self._verify_stash: torch.Tensor | None = None
-        self._stash_pinned = False
-        # Draft decode-window lookback: D > 0 arms
-        # a second per-layer conv window that lags the committed frontier by
-        # D rows, so lookback rows convolve against the state they actually
-        # follow. Configured by the drafter via configure_draft_lookback.
+        # Draft decode-window lookback: D > 0 makes the catch-up chunk carry
+        # D extra leading rows that re-run committed positions (ring reads go
+        # D deeper). Configured by the drafter via configure_draft_lookback.
         self._draft_lookback = 0
-        self._draft_lag_conv_state: torch.Tensor | None = None
-        self._warned_mixed_spec = False
         # Persistent spec conv metadata buffers for CUDA graphs; sized in init_cuda_graph_state.
         self._graph_spec_qsl: torch.Tensor | None = None
         self._graph_spec_seq_idx: torch.Tensor | None = None
@@ -556,8 +534,6 @@ class InklingAttnBackend(AttentionBackend):
 
         cache_indices = req_pool_indices[:bs].to(torch.int32)
         seq_idx = None
-        update_mode = "inplace"
-        tokens_per_req = 1
         if forward_mode.is_extend_or_mixed():
             assert extend_seq_lens is not None and extend_prefix_lens is not None
             # Reuse the cumsum the inner backend just computed for this batch.
@@ -591,21 +567,10 @@ class InklingAttnBackend(AttentionBackend):
                 seq_idx = self._pfg_seq_idx
                 cache_indices = self._pfg_cache_indices
                 has_initial_state = self._pfg_has_initial_state
-            if (
-                forward_mode.is_mixed()
-                and self.conv_spec_num_tokens > 1
-                and not self._warned_mixed_spec
-            ):
-                # MIXED spec round decode rows keep the in-place update: rejected tails land in windows.
-                self._warned_mixed_spec = True
-                logger.warning(
-                    "Inkling sconv: MIXED batch during speculative decoding — "
-                    "decode-row conv windows are not rolled back this round."
-                )
         elif forward_mode.is_decode() and self.conv_spec_num_tokens > 1:
-            # Multi-token decode: verify -> stash (accept unknown); draft catch-up -> valid_len write.
+            # Multi-token decode: target verify / draft catch-up, k rows per
+            # request written speculatively at their ring positions.
             k = self.conv_spec_num_tokens
-            tokens_per_req = k
             device = req_pool_indices.device
             query_start_loc = torch.arange(
                 0, bs * k + 1, step=k, dtype=torch.int32, device=device
@@ -613,9 +578,6 @@ class InklingAttnBackend(AttentionBackend):
             seq_idx = seq_idx_from_cu_seqlens(query_start_loc, bs * k)
             has_initial_state = torch.ones(bs, dtype=torch.bool, device=device)
             is_decode = False
-            update_mode = "valid_len" if self.conv_is_draft else "stash"
-            if update_mode == "stash":
-                self._ensure_verify_stash(bs * k, device)
         else:
             query_start_loc = self._decode_query_start_loc(bs, req_pool_indices.device)
             # Decode: token t belongs to request t, so seq_idx is the same
@@ -654,57 +616,27 @@ class InklingAttnBackend(AttentionBackend):
             has_initial_state=has_initial_state,
             is_decode=is_decode,
             seq_idx=seq_idx,
-            update_mode=update_mode,
-            tokens_per_req=tokens_per_req,
-            col_page_table=col_page_table,
-            col_seq_lens=(
+            seq_lens=(
                 self._pfg_seq_lens
                 if pfg_total >= 0 and col_page_table is not None
-                else (seq_lens[:bs] if col_page_table is not None else None)
+                else seq_lens[:bs].to(torch.int32)
             ),
+            col_page_table=col_page_table,
             checkpoints=checkpoints,
+            needs_ring_update=forward_mode.is_extend_or_mixed(),
         )
 
     # ------------------------------------------------------------------
-    # Speculative-decoding conv state (eager path; CUDA graphs off for MTP)
+    # Speculative-decoding conv metadata
     # ------------------------------------------------------------------
-
-    def _ensure_verify_stash(self, num_tokens: int, device) -> None:
-        pool = self.conv_pool
-        if self._verify_stash is None or self._verify_stash.shape[1] < num_tokens:
-            if self._stash_pinned:
-                # Growing would leave captured graphs writing freed memory; pinned size = pool capacity.
-                raise RuntimeError(
-                    f"Inkling verify stash needs {num_tokens} rows but is "
-                    f"pinned at {self._verify_stash.shape[1]} by CUDA graphs."
-                )
-            self._verify_stash = torch.empty(
-                (pool.num_layers, num_tokens, pool.conv_dim),
-                dtype=pool.conv_state.dtype,
-                device=device,
-            )
-
-    def preallocate_verify_workspace(self, max_bs: int) -> None:
-        """Allocate target-verify state before cache capacity is reported."""
-        if self.conv_is_draft or self.conv_spec_num_tokens <= 1:
-            return
-        self._ensure_verify_stash(
-            max_bs * self.conv_spec_num_tokens,
-            self.conv_pool.conv_state.device,
-        )
 
     def fixed_workspace_bytes(self) -> int:
         """Return persistent ShortConv state owned outside the LCM arenas."""
-        tensors = (
-            self.conv_pool.conv_state,
-            self._verify_stash,
-            self._draft_lag_conv_state,
-        )
-        return sum(tensor.nbytes for tensor in tensors if tensor is not None)
+        return self.conv_pool.conv_state.nbytes
 
     def _spec_conv_metadata(self, bs: int) -> InklingConvMetadata:
         """Multi-token decode conv metadata over the persistent CUDA-graph
-        buffers (target verify: stash; draft catch-up: valid_len)."""
+        buffers (target verify / draft catch-up)."""
         k = self.conv_spec_num_tokens
         paged = getattr(self, "conv_columns", None) is not None
         return InklingConvMetadata(
@@ -713,14 +645,12 @@ class InklingAttnBackend(AttentionBackend):
             has_initial_state=self._graph_has_initial_state[:bs],
             is_decode=False,
             seq_idx=self._graph_spec_seq_idx[: bs * k],
-            update_mode="valid_len" if self.conv_is_draft else "stash",
-            tokens_per_req=k,
+            seq_lens=self._graph_seq_lens[:bs],
             col_page_table=(
                 {g: table[:bs] for g, table in self._graph_col_tables.items()}
                 if paged
                 else None
             ),
-            col_seq_lens=self._graph_seq_lens[:bs] if paged else None,
             checkpoints=self._refresh_graph_checkpoints(bs),
         )
 
@@ -734,36 +664,32 @@ class InklingAttnBackend(AttentionBackend):
             has_initial_state=self._graph_has_initial_state[:bs],
             is_decode=True,
             seq_idx=self._decode_qsl[:bs],
+            seq_lens=self._graph_seq_lens[:bs],
             col_page_table=(
                 {g: t[:bs] for g, t in self._graph_col_tables.items()}
                 if paged
                 else None
             ),
-            col_seq_lens=self._graph_seq_lens[:bs] if paged else None,
             checkpoints=self._refresh_graph_checkpoints(bs),
         )
 
     def configure_draft_lookback(self, lookback: int) -> bool:
         """Drafter hook (draft wrapper only): arm decode-window lookback.
 
-        Allocates the per-layer lagged conv window and makes every extend
-        chunk advance it (see ``_write_lag_extend``), so the first decode
-        round's lookback has a well-defined conv init state. Returns True
-        when armed; False when this backend cannot support it (target
-        wrapper, or paged draft conv).
+        Lookback rows are ring reads ``lookback`` positions behind the
+        committed frontier, so arming only widens the catch-up chunk; no
+        extra state is allocated. Returns True when armed; False when this
+        backend cannot support it (target wrapper, or paged draft conv).
         """
         if not self.conv_is_draft or lookback <= 0:
             return False
         if getattr(self, "conv_columns", None) is not None:
-            # Rolling state only: the lag recurrence has no paged variant.
             return False
         self._draft_lookback = int(lookback)
         # Arm the inner backend's grouped lookback-location stack (sized at graph
         # init, which runs after this): the lookback pass writes N + D rows
         # per request, so its cache write locations need their own variant.
         self.inner.draft_lookback = int(lookback)
-        if self._draft_lag_conv_state is None:
-            self._draft_lag_conv_state = torch.zeros_like(self.conv_pool.conv_state)
         return True
 
     def enter_draft_lookback_window(self, bs: int) -> bool:
@@ -775,7 +701,8 @@ class InklingAttnBackend(AttentionBackend):
         if (
             lookback <= 0
             or md is None
-            or md.update_mode != "valid_len"
+            or md.is_decode
+            or not self.conv_is_draft
             or md.col_page_table is not None
         ):
             return False
@@ -795,19 +722,11 @@ class InklingAttnBackend(AttentionBackend):
             has_initial_state=md.has_initial_state[:bs],
             is_decode=False,
             seq_idx=seq_idx_from_cu_seqlens(qsl, bs * tokens),
-            update_mode="valid_len",
-            tokens_per_req=tokens,
-            lookback=lookback,
+            # Same through-chunk lengths: the wider chunk keeps its end, the
+            # lookback rows extend it backwards.
+            seq_lens=md.seq_lens[:bs] if md.seq_lens is not None else None,
         )
         return True
-
-    def draft_lag_conv_state_wd(self, layer_id: int) -> torch.Tensor:
-        """One layer's lagged conv window, ``[num_slots, W-1, conv_dim]``.
-
-        Ends ``lookback + 1`` positions behind the committed frontier — the
-        state a decode-window lookback row actually follows.
-        """
-        return self._draft_lag_conv_state[layer_id]
 
     @staticmethod
     def restore_shortconv_checkpoint(
@@ -816,12 +735,18 @@ class InklingAttnBackend(AttentionBackend):
         metadata: InklingConvMetadata,
         group_id: str,
     ) -> None:
-        """Restore an aligned cached boundary into request rolling slots."""
+        """Restore an aligned cached boundary into request ring slots.
+
+        The checkpoint holds the ``W - 1`` inputs before the boundary; they
+        land at their positions' ring rows (``(boundary - W + 1 + j) % R``),
+        with the boundary derived per request as ``seq_lens - chunk_len``.
+        """
         checkpoints = metadata.checkpoints
         if checkpoints is None:
             return
         pages = checkpoints.restore_pages[group_id]
-        slots = metadata.cache_indices[: pages.shape[0]].to(torch.int64)
+        n = pages.shape[0]
+        slots = metadata.cache_indices[:n].to(torch.int64)
         valid = (pages > 0) & (slots >= 0)
         pages = pages.to(torch.int64).clamp_min(0)
         slots = slots.clamp_min(0)
@@ -832,10 +757,19 @@ class InklingAttnBackend(AttentionBackend):
         if restored.shape[-1] != state.shape[-1]:
             raise ValueError(
                 f"ShortConv checkpoint width {restored.shape[-1]} does not "
-                f"match rolling state width {state.shape[-1]}"
+                f"match ring width {state.shape[-1]}"
             )
-        current = state[slots]
-        state[slots] = torch.where(valid[:, None, None], restored, current)
+        w1 = restored.shape[1]
+        ring_size = state.shape[1]
+        qsl = metadata.query_start_loc[: n + 1].to(torch.int64)
+        boundary = metadata.seq_lens[:n].to(torch.int64) - (qsl[1:] - qsl[:-1])
+        rows = (
+            boundary.view(n, 1) - w1 + torch.arange(w1, device=state.device).view(1, w1)
+        ) % ring_size
+        current = state[slots.view(n, 1), rows]
+        state[slots.view(n, 1), rows] = torch.where(
+            valid.view(n, 1, 1), restored, current
+        )
 
     def register_shortconv_checkpoint_stream(
         self,
@@ -860,248 +794,6 @@ class InklingAttnBackend(AttentionBackend):
                 f"ShortConv checkpoint stream {key!r} changed storage buffer"
             )
 
-    def apply_conv_state_update(
-        self,
-        x: torch.Tensor,
-        state: torch.Tensor,
-        md: InklingConvMetadata,
-        layer_id: int,
-        channel_offset: int,
-        dim: int,
-        accept_lengths: torch.Tensor | None = None,
-    ) -> None:
-        """Persist one stream's conv window after a non-decode forward.
-
-        ``x`` is the stream's pre-conv chunk activations ``[tokens, dim]``;
-        ``state`` is the channel slice ``[slots, W-1, dim]`` of the layer's
-        pool buffer that the compute kernel just read (the LAGGED buffer on
-        lookback window passes).
-        """
-        if md.update_mode == "inplace":
-            if self._draft_lookback > 0 and md.col_page_table is None:
-                # Advance the lag window BEFORE the kernel overwrites the
-                # main one: short chunks borrow its pre-update rows.
-                self._write_lag_extend(state, x, md, layer_id, channel_offset, dim)
-            sconv_cache_update(
-                x,
-                state,
-                md.query_start_loc,
-                md.cache_indices,
-                md.has_initial_state,
-            )
-            return
-        if md.update_mode == "stash":
-            # Rejects unknown until verify: the compute kernel already wrote
-            # the scratch; the post-verify hook writes the final window.
-            return
-        assert md.update_mode == "valid_len"
-        if accept_lengths is None:
-            raise RuntimeError(
-                "Inkling draft catch-up conv update needs ctx.accept_lengths"
-            )
-        if md.lookback > 0:
-            # Lookback window pass: ``state`` is the LAG slice, whose old
-            # window ends exactly one row before the chunk's first row, so
-            # both targets gather off ONE shared pre-update ``[lag_old ||
-            # chunk]`` extension:
-            #   main window (ends at accept)      -> valid = accept + D
-            #   lag window (ends at accept - D)   -> valid = accept
-            main = self.conv_pool.layer_state_wd(layer_id)[
-                :, :, channel_offset : channel_offset + dim
-            ]
-            bs = md.cache_indices.shape[0]
-            accept = accept_lengths[:bs].to(torch.int64)
-            # PAD_SLOT_ID rows route to slot 0: the 1-based request pool
-            # reserves it (never live).
-            idx = md.cache_indices.long().clamp_min(0)
-            ext = torch.cat([state[idx], x.view(bs, md.tokens_per_req, dim)], dim=1)
-            w1 = state.shape[1]
-            main[idx] = self._gather_ext_window(
-                ext, accept + md.lookback, md.tokens_per_req, w1
-            )
-            state[idx] = self._gather_ext_window(ext, accept, md.tokens_per_req, w1)
-            return
-        self._write_window_at(
-            state, x, md.cache_indices, md.tokens_per_req, accept_lengths
-        )
-
-    @staticmethod
-    def _gather_ext_window(
-        ext: torch.Tensor,
-        valid_lens: torch.Tensor,
-        tokens_per_req: int,
-        w1: int,
-    ) -> torch.Tensor:
-        """Rows ``valid .. valid+W-2`` of the ``[old window || chunk]``
-        extension ``ext`` ``[bs, W-1+tokens_per_req, dim]`` — the window
-        after accepting ``valid`` chunk tokens per request (clamped to
-        ``[1, tokens_per_req]``)."""
-        bs, _, dim = ext.shape
-        a = valid_lens.long().clamp(1, tokens_per_req)
-        rows = a.view(bs, 1) + torch.arange(w1, device=ext.device).view(1, w1)
-        return ext.gather(1, rows.unsqueeze(-1).expand(bs, w1, dim))
-
-    @staticmethod
-    def _write_window_from(
-        dst: torch.Tensor,
-        src: torch.Tensor,
-        chunk: torch.Tensor,
-        cache_indices: torch.Tensor,
-        tokens_per_req: int,
-        valid_lens: torch.Tensor,
-    ) -> None:
-        """dst window <- last W-1 of ``[src window || chunk[:valid]]``.
-
-        ``dst``/``src``: ``[slots, W-1, dim]`` channel slices (``src``'s old
-        window must end one row before the chunk's first row); ``chunk``:
-        ``[bs*tokens_per_req, dim]``; ``valid_lens``: per-request count of
-        valid chunk positions (clamped to ``[1, tokens_per_req]``). The blend
-        handles ``valid < W-1`` by borrowing rows from the src window.
-        """
-        bs = cache_indices.shape[0]
-        # PAD_SLOT_ID rows route to slot 0: the 1-based request pool reserves it (never live).
-        idx = cache_indices.long().clamp_min(0)
-        ext = torch.cat([src[idx], chunk.view(bs, tokens_per_req, src.shape[2])], dim=1)
-        dst[idx] = InklingAttnBackend._gather_ext_window(
-            ext, valid_lens[:bs], tokens_per_req, src.shape[1]
-        )
-
-    @classmethod
-    def _write_window_at(
-        cls,
-        state: torch.Tensor,
-        chunk: torch.Tensor,
-        cache_indices: torch.Tensor,
-        tokens_per_req: int,
-        valid_lens: torch.Tensor,
-    ) -> None:
-        """working window <- last W-1 of ``[old window || chunk[:valid]]``."""
-        cls._write_window_from(
-            state, state, chunk, cache_indices, tokens_per_req, valid_lens
-        )
-
-    def _write_lag_extend(
-        self,
-        state: torch.Tensor,
-        x: torch.Tensor,
-        md: InklingConvMetadata,
-        layer_id: int,
-        channel_offset: int,
-        dim: int,
-    ) -> None:
-        """Advance the lag window across an EXTEND/MIXED chunk.
-
-        The lag target ends ``D`` rows behind the chunk end; chunks shorter
-        than ``D + W-1`` borrow trailing rows from the pre-update MAIN window
-        (``state``), which is contiguous with the chunk's first row. Fresh
-        prefills (``has_initial_state`` False) clamp into the chunk instead —
-        exact whenever the first chunk is at least ``D + W-1`` tokens.
-
-        MIXED decode rows share the extend chunk's inplace path, so their lag
-        (like their main window) is not rolled back to the accepted length
-        this round — same known wart, same bounded blast radius (the first
-        W-1 rows of the next lookback window's conv).
-        """
-        lag = self._draft_lag_conv_state[layer_id][
-            :, :, channel_offset : channel_offset + dim
-        ]
-        bs = md.cache_indices.shape[0]
-        w1 = state.shape[1]
-        idx, rows_old, chunk_rows, use_old = self._lag_extend_index_math(
-            md, w1, x.shape[0], x.device
-        )
-        old = state[idx]  # pre-update main window [bs, W-1, dim]
-        gathered_old = old.gather(1, rows_old.unsqueeze(-1).expand(bs, w1, dim))
-        gathered_chunk = x[chunk_rows].view(bs, w1, dim)
-        lag[idx] = torch.where(use_old, gathered_old, gathered_chunk)
-
-    def _lag_extend_index_math(
-        self,
-        md: InklingConvMetadata,
-        w1: int,
-        total: int,
-        device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """md-only index math of ``_write_lag_extend``, computed once per
-        forward and cached on the metadata object (rebuilt every forward),
-        so all ~4 streams x layers of the step reuse it.
-
-        Returns:
-            ``(idx, rows_old, chunk_rows, use_old)``: the [bs] pool slots,
-            the clamped [bs, w1] old-window gather rows, the flattened [bs*w1]
-            chunk gather rows, and the [bs, w1, 1] old-vs-chunk blend mask.
-        """
-        cached = getattr(md, "lag_extend_cache", None)
-        if cached is not None:
-            return cached
-        lookback = self._draft_lookback
-        bs = md.cache_indices.shape[0]
-        qsl = md.query_start_loc[: bs + 1].long()
-        lens = qsl[1:] - qsl[:-1]
-        idx = md.cache_indices.long().clamp_min(0)
-        valid = (lens - lookback).clamp_min(0)
-        # Rows over ext = [main_old(W-1) || chunk_r]: valid .. valid+W-2.
-        rows = valid.view(bs, 1) + torch.arange(w1, device=device).view(1, w1)
-        from_old = rows < w1
-        chunk_rows = (
-            (qsl[:-1].view(bs, 1) + (rows - w1).clamp_min(0))
-            .clamp(max=max(total - 1, 0))
-            .reshape(-1)
-        )
-        use_old = (from_old & md.has_initial_state[:bs].view(bs, 1)).unsqueeze(-1)
-        md.lag_extend_cache = (idx, rows.clamp(max=w1 - 1), chunk_rows, use_old)
-        return md.lag_extend_cache
-
-    def update_mamba_state_after_mtp_verify(self, accept_lengths, model) -> None:
-        """Post-verify hook (duck-typed from CudaGraphWrapper): select each
-        request's conv window at its accepted length from the stashed
-        activations. Name matches the generic executor hook.
-
-        Runs outside the captured graph once per MTP round, so it is batched
-        over all layers in one shot (the per-layer ``_write_window_at`` loop
-        is host-launch-bound). The blend is cat-free — two gathers selected
-        by ``where`` — to avoid materializing a ``[L, n, W-1+k, D]`` extension
-        buffer at full batch.
-        """
-        del model
-        md = self.conv_metadata
-        if md is None or md.update_mode != "stash":
-            return
-        pool = self.conv_pool
-        k = md.tokens_per_req
-        # Graph replay pads the batch; accept_lengths covers only the real, leading stash rows.
-        n = min(md.cache_indices.shape[0], accept_lengths.shape[0])
-        if n == 0:
-            return
-        state = pool.conv_state  # [L, slots, W-1, D]
-        num_layers, _, w1, dim = state.shape
-        # Padded rows carry PAD_SLOT_ID (-1): route their writes to slot 0,
-        # which the 1-based request pool reserves (never a live request).
-        idx = md.cache_indices[:n].long().clamp_min(0)
-        chunk = self._verify_stash[:, : n * k].unflatten(1, (n, k))
-        old = state[:, idx]  # [L, n, W-1, D]
-        a = accept_lengths[:n].long().clamp(1, k)
-        # Window after accepting `a` chunk tokens = rows a .. a+W-2 of the
-        # virtual [old || chunk] extension; row r reads old[r] when r < W-1,
-        # else chunk[r - (W-1)] (always an accepted position: r-(W-1) < a).
-        rows = a.view(n, 1) + self._cached_arange_w1(w1, state.device).view(1, w1)
-        from_old = (rows < w1).view(1, n, w1, 1)
-        rows_old = (
-            rows.clamp(max=w1 - 1).view(1, n, w1, 1).expand(num_layers, n, w1, dim)
-        )
-        rows_new = (
-            (rows - w1).clamp(min=0).view(1, n, w1, 1).expand(num_layers, n, w1, dim)
-        )
-        state[:, idx] = torch.where(
-            from_old, old.gather(2, rows_old), chunk.gather(2, rows_new)
-        )
-
-    def _cached_arange_w1(self, w1: int, device) -> torch.Tensor:
-        buf = getattr(self, "_arange_w1_buf", None)
-        if buf is None or buf.shape[0] != w1:
-            buf = self._arange_w1_buf = torch.arange(w1, device=device)
-        return buf
-
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor | None = None):
         """Drafter hook before each multi-step decode step: the catch-up
         (k tokens/request) metadata becomes single-token decode metadata."""
@@ -1125,6 +817,9 @@ class InklingAttnBackend(AttentionBackend):
             has_initial_state=has_initial,
             is_decode=True,
             seq_idx=query_start_loc[:bs],
+            seq_lens=(
+                seq_lens[:bs].to(torch.int32) if seq_lens is not None else md.seq_lens
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -1487,10 +1182,6 @@ class InklingAttnBackend(AttentionBackend):
             self._graph_spec_seq_idx = torch.repeat_interleave(
                 torch.arange(max_bs, dtype=torch.int32, device=device), k
             )
-            if not self.conv_is_draft:
-                # Pin stash at pool capacity: eager bs > graph max_bs must not realloc a graph-bound buffer.
-                self._ensure_verify_stash((self.conv_pool.num_slots - 2) * k, device)
-                self._stash_pinned = True
 
     def init_forward_metadata_capture_cuda_graph(
         self,

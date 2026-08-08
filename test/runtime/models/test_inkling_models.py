@@ -271,20 +271,19 @@ class TestInklingShortConvolution(unittest.TestCase):
         import torch
 
         from tokenspeed.runtime.layers.attention.backends.inkling import (
-            InklingAttnBackend,
             InklingConvStatePool,
         )
 
         pool = InklingConvStatePool(
-            num_layers, num_slots, conv_dim, kernel_size, torch.bfloat16, device
+            num_layers,
+            num_slots,
+            conv_dim,
+            kernel_size,
+            ring_size=9,
+            dtype=torch.bfloat16,
+            device=device,
         )
-        # _draft_lookback=0: the target-worker default (no lag window).
-        backend = SimpleNamespace(conv_pool=pool, conv_metadata=None, _draft_lookback=0)
-        # The real window-persist method; stateless in the default inplace
-        # mode, so binding it to the namespace mock is faithful.
-        backend.apply_conv_state_update = (
-            InklingAttnBackend.apply_conv_state_update.__get__(backend)
-        )
+        backend = SimpleNamespace(conv_pool=pool, conv_metadata=None)
         ctx = SimpleNamespace(attn_backend=backend)
         return ctx, backend, pool
 
@@ -325,6 +324,8 @@ class TestInklingShortConvolution(unittest.TestCase):
             has_initial_state=torch.zeros(2, dtype=torch.bool, device=device),
             is_decode=False,
             seq_idx=seq_idx_from_cu_seqlens(cu, total),
+            seq_lens=torch.tensor(lens, dtype=torch.int32, device=device),
+            needs_ring_update=True,
         )
         y = mod(x, ctx)
         zeros = torch.zeros(W - 1, dim, device=device)
@@ -336,11 +337,18 @@ class TestInklingShortConvolution(unittest.TestCase):
         full_x = [x[:13], x[13:]]
         for _step in range(3):
             xt = torch.randn(2, dim, device=device, dtype=torch.bfloat16)
+            qsl_step = torch.arange(3, dtype=torch.int32, device=device)
             backend.conv_metadata = InklingConvMetadata(
-                query_start_loc=torch.arange(3, dtype=torch.int32, device=device),
+                query_start_loc=qsl_step,
                 cache_indices=torch.tensor([1, 2], dtype=torch.int32, device=device),
                 has_initial_state=torch.ones(2, dtype=torch.bool, device=device),
                 is_decode=True,
+                seq_idx=qsl_step[:2],
+                seq_lens=torch.tensor(
+                    [len(full_x[0]) + 1, len(full_x[1]) + 1],
+                    dtype=torch.int32,
+                    device=device,
+                ),
             )
             yt = mod(xt, ctx)
             for i in range(2):
@@ -352,9 +360,9 @@ class TestInklingShortConvolution(unittest.TestCase):
                 full_x[i] = seq
 
         # Channels outside the slice untouched.
-        state = pool.layer_state(0)
-        self.assertTrue((state[:, :offset, :] == 0).all())
-        self.assertTrue((state[:, offset + dim :, :] == 0).all())
+        state = pool.layer_state_wd(0)
+        self.assertTrue((state[:, :, :offset] == 0).all())
+        self.assertTrue((state[:, :, offset + dim :] == 0).all())
 
 
 if __name__ == "__main__":

@@ -81,7 +81,7 @@ from collections.abc import Callable, Iterable
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.conv import inkling_sconv, sconv_cache_update
+from tokenspeed_kernel.ops.conv import inkling_ring_sconv, inkling_ring_sconv_update
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
 from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
@@ -381,25 +381,14 @@ def _sconv_apply(
     geo = backend.conv_columns if md.col_page_table is not None else None
     checkpoint_mode = geo is not None
 
-    # Channel slice of the layer's [slots, W-1, conv_dim] state buffer.
-    # Draft lookback window passes re-run the last D committed rows, so
-    # their conv init state is the LAGGED window (D rows behind); the
-    # backend's valid_len update then advances both windows off it.
-    pool_state = (
-        backend.draft_lag_conv_state_wd(layer_id)
-        if md.lookback > 0
-        else backend.conv_pool.layer_state_wd(layer_id)
-    )
-    state = pool_state[:, :, channel_offset : channel_offset + dim]
+    # Channel slice of the layer's [slots, R, conv_dim] ring.
+    state = backend.conv_pool.layer_state_wd(layer_id)[
+        :, :, channel_offset : channel_offset + dim
+    ]
 
     checkpoint_buffers = ()
     checkpoint_group = None
     if checkpoint_mode:
-        if md.lookback > 0 or md.update_mode == "valid_len":
-            raise RuntimeError(
-                "Inkling LCM checkpoints do not support draft ShortConv "
-                "state updates"
-            )
         if conv_group == "kvconv":
             checkpoint_group = "kvconv"
             checkpoint_buffers = ctx.token_to_kv_pool.kvconv_checkpoint_buffers(
@@ -428,47 +417,15 @@ def _sconv_apply(
     # In-kernel speculative boundary publish: every covered 128-boundary,
     # accept-independent; rejected content is overwritten by a later round.
     publish = None
-    if checkpoint_buffers and md.col_seq_lens is not None:
+    if checkpoint_buffers:
         publish = (
             md.col_page_table[checkpoint_group],
-            md.col_seq_lens,
             checkpoint_buffers[0],
             checkpoint_buffers[1] if len(checkpoint_buffers) == 2 else None,
             geo["block_tokens"],
         )
 
-    if md.is_decode:
-        y = inkling_sconv(
-            x,
-            weight,
-            state,
-            md.query_start_loc,
-            md.seq_idx,
-            md.cache_indices,
-            md.has_initial_state,
-            activation=None,
-            use_residual=True,
-            enable_pdl=pdl_enabled(),
-            publish=publish,
-        )
-        # The unified kernel does not shift the window; persist explicitly.
-        if md.update_mode == "inplace":
-            sconv_cache_update(
-                x,
-                state,
-                md.query_start_loc,
-                md.cache_indices,
-                md.has_initial_state,
-            )
-        return y
-    scratch = (
-        backend._verify_stash[
-            layer_id, : x.shape[0], channel_offset : channel_offset + dim
-        ]
-        if md.update_mode == "stash"
-        else None
-    )
-    y = inkling_sconv(
+    y = inkling_ring_sconv(
         x,
         weight,
         state,
@@ -476,22 +433,23 @@ def _sconv_apply(
         md.seq_idx,
         md.cache_indices,
         md.has_initial_state,
+        md.seq_lens,
         activation=None,
         use_residual=True,
-        scratch=scratch,
         publish=publish,
         enable_pdl=pdl_enabled(),
     )
-    # Backend owns the window write: mode-dependent under spec decoding (verify stash / catch-up).
-    backend.apply_conv_state_update(
-        x,
-        state,
-        md,
-        layer_id,
-        channel_offset,
-        dim,
-        accept_lengths=getattr(ctx, "accept_lengths", None),
-    )
+    if md.needs_ring_update:
+        # Extend chunks can exceed the compute kernel's in-kernel persistence
+        # bound; store the last W-1 rows in a follow-up pass.
+        inkling_ring_sconv_update(
+            x,
+            state,
+            md.query_start_loc,
+            md.seq_lens,
+            md.cache_indices,
+            kernel_width=weight.shape[1],
+        )
     return y
 
 

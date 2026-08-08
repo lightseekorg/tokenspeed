@@ -205,26 +205,22 @@ def _workspace_bytes(
     text_config,
     attn_config,
     num_layers: int,
-    verify_tokens: int = 0,
-    lagged_window: bool = False,
+    spec_tokens: int = 1,
 ) -> int:
     import torch
 
     from tokenspeed.runtime.configs.inkling_config import inkling_conv_total_dim
 
     rows = int(attn_config.max_bs) + 2
-    state_rows = int(text_config.sconv_kernel_size) - 1
+    # Must match _wrap_inkling_backend's ring sizing:
+    # (W-1) taps + K chunk rows + draft lookback depth (K-2).
+    spec_tokens = max(1, int(spec_tokens))
+    ring_rows = (
+        int(text_config.sconv_kernel_size) - 1 + spec_tokens + max(spec_tokens - 2, 0)
+    )
     conv_dim = inkling_conv_total_dim(text_config, attn_config.attn_tp_size)
     element_size = torch.bfloat16.itemsize
-    rolling = num_layers * rows * state_rows * conv_dim * element_size
-    verify = (
-        num_layers
-        * int(attn_config.max_bs)
-        * int(verify_tokens)
-        * conv_dim
-        * element_size
-    )
-    return rolling + verify + (rolling if lagged_window else 0)
+    return num_layers * rows * ring_rows * conv_dim * element_size
 
 
 def prepare_inkling_cache(
@@ -254,7 +250,7 @@ def prepare_inkling_cache(
         text_config=text_config,
         attn_config=attn_config,
         num_layers=text_config.num_hidden_layers,
-        verify_tokens=draft_tokens,
+        spec_tokens=draft_tokens,
     )
 
     draft_fields = None
@@ -291,10 +287,7 @@ def prepare_inkling_cache(
             text_config=draft_model_config.hf_config.get_text_config(),
             attn_config=draft_attn_config,
             num_layers=draft_num_layers,
-            lagged_window=(
-                num_steps > 1
-                and os.environ.get("INKLING_MTP_DECODE_LOOKBACK", "1") != "0"
-            ),
+            spec_tokens=draft_tokens,
         )
 
     max_padding_fraction = (
