@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import socket
 from types import SimpleNamespace
 
 import pytest
@@ -88,6 +89,11 @@ def test_multinode_owner_and_tp_transport() -> None:
     owner_items: list[MultimodalDataItem] = []
     tp_items: list[MultimodalDataItem] = []
     try:
+        hostnames: list[str | None] = [None] * dist.get_world_size()
+        dist.all_gather_object(hostnames, socket.gethostname())
+        if len(set(hostnames)) != 2:
+            pytest.skip("multinode transport coverage requires two distinct hosts")
+
         owner_items, expected = _publish_items(rank)
         prepare_shm_features([_request(owner_items)], dist.group.WORLD)
         assert all(item.feature_shm.is_cross_node for item in owner_items)
