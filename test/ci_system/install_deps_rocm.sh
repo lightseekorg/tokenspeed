@@ -7,8 +7,6 @@ set -e
 GFX_ARCH=${GFX_ARCH:-gfx950}
 BUILD_AND_DOWNLOAD_PARALLEL=${BUILD_AND_DOWNLOAD_PARALLEL:-16}
 
-ROCM_INDEX="https://repo.amd.com/rocm/whl-multi-arch/"
-
 export MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL}
 WORKSPACE=${WORKSPACE:-$(pwd)}
 
@@ -43,15 +41,11 @@ echo "=== Step 2: Upgrade pip/setuptools/wheel ==="
 pip install --upgrade pip "setuptools<82" wheel
 
 echo "=== Step 3: Check PyTorch for ROCm ==="
-python3 -m pip show torch >/dev/null || {
-    echo "torch is not installed" >&2
-    exit 1
-}
-python3 -m pip show torchvision >/dev/null || {
-    echo "torchvision is not installed" >&2
-    exit 1
-}
-python3 -c "import torch, torchvision; assert torch.version.hip, 'PyTorch does not include HIP support'; print(f'torch={torch.__version__} hip={torch.version.hip} torchvision={torchvision.__version__}')"
+if ! pip3 show torch >/dev/null 2>&1; then
+    echo "torch is not installed; installing PyTorch for ROCm 7.2"
+    pip3 install torch torchvision \
+        --index-url https://download.pytorch.org/whl/rocm7.2
+fi
 
 echo "=== Step 4: Install tokenspeed-kernel packages ==="
 
