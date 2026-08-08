@@ -356,7 +356,8 @@ public:
         std::vector<CacheBlockLocation> locations;
         for (const CacheEntry& cache_entry : cache_index->entries) {
             const CacheBlockLocation location = cache_entry.block_ref->Location();
-            const std::size_t released_owners = std::ranges::count(released_locations, location);
+            const std::uint32_t released_owners =
+                static_cast<std::uint32_t>(std::ranges::count(released_locations, location));
             if (cache_entry.block_ref.use_count() == 1 + released_owners) {
                 locations.push_back(location);
             }

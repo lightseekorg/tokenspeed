@@ -153,10 +153,9 @@ protected:
 
 TEST_F(StableCandidateOrderingSuite, ForwardOperationsTieBreakOnRequestId) {
     // TP-determinism regression: requests_ is unordered_map<string, ...> so
-    // candidates are visited in per-process random order. Without an Id()
-    // Without the request-id tiebreaker in buildForwardOperations, each rank picks a different
-    // request when the loop budget admits only a subset — making forward_op
-    // None on some ranks and non-None on others, which deadlocks NCCL.
+    // candidates are visited in per-process random order. Without the request-id
+    // tiebreaker, each rank can pick a different request when the loop budget
+    // admits only a subset, which deadlocks NCCL.
     Submit(MakeRequestSpec("r_ccc", 2, 300));
     Submit(MakeRequestSpec("r_aaa", 2, 100));
     Submit(MakeRequestSpec("r_bbb", 2, 200));

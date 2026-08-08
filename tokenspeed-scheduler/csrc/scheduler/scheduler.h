@@ -93,6 +93,8 @@ private:
     };
 
     struct PlanBuildContext {
+        explicit PlanBuildContext(ExecutionPlan& output_plan) : plan{output_plan} {}
+
         ExecutionPlan& plan;
         bool admission_failed{false};
         bool waits_for_store_ack{false};

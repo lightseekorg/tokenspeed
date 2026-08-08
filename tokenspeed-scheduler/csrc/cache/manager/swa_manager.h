@@ -115,7 +115,8 @@ public:
                 break;
             }
             const bool cached = ContainsCachedBlock(block);
-            const std::size_t released_owners = std::ranges::count(released_locations, block->Location());
+            const std::uint32_t released_owners =
+                static_cast<std::uint32_t>(std::ranges::count(released_locations, block->Location()));
             if ((cached && block.use_count() == 2 + released_owners) || (!cached && block.unique())) {
                 locations.push_back(block->Location());
             }

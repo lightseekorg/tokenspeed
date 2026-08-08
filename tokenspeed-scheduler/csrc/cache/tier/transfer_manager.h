@@ -45,7 +45,7 @@ public:
     void CompleteWriteBack(std::uint32_t op_id);
     void CompleteLoadBack(std::uint32_t op_id);
 
-    bool HasStoresInFlight() const;
+    bool HasStoresInFlight() const { return !write_backs_.empty(); }
     bool HasLoadBacksInFlight() const { return !load_backs_.empty(); }
     bool HasAnyInFlight() const { return !write_backs_.empty() || !load_backs_.empty(); }
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>> DeviceLocationsReleasedOnStoreAck() const;
@@ -57,16 +57,12 @@ private:
         CacheBlockRef host_block_ref;
     };
 
-    struct WriteBackTicket {
-        std::vector<StoreTicket> stores;
-    };
-
     std::uint32_t nextOpId() { return next_op_id_++; }
     LoadBackOperation startLoadBack(std::vector<BlockTransfer> block_transfers);
     std::vector<CacheTransfer> resolveTransfers(std::span<const BlockTransfer> block_transfers) const;
 
     KvCacheCoordinator& coordinator_;
-    std::unordered_map<std::uint32_t, WriteBackTicket> write_backs_;
+    std::unordered_map<std::uint32_t, std::vector<StoreTicket>> write_backs_;
     std::unordered_set<CacheKey, CacheKeyHash> store_keys_;
     // Each transfer pins both tiers until the runtime acknowledges the copy.
     std::unordered_map<std::uint32_t, std::vector<BlockTransfer>> load_backs_;

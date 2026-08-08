@@ -20,7 +20,6 @@
 
 #include "cache/tier/transfer_manager.h"
 
-#include <ranges>
 #include <utility>
 
 #include "utils.h"
@@ -30,8 +29,8 @@ namespace tokenspeed {
 std::vector<std::pair<std::uint32_t, CacheBlockLocation>> TierTransferManager::DeviceLocationsReleasedOnStoreAck()
     const {
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>> locations;
-    for (const auto& [_, write_back] : write_backs_) {
-        for (const StoreTicket& ticket : write_back.stores) {
+    for (const auto& [_, stores] : write_backs_) {
+        for (const StoreTicket& ticket : stores) {
             locations.emplace_back(ticket.key.group_id, ticket.device_block_ref->Location());
         }
     }
@@ -76,7 +75,7 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores() {
     for (const StoreTicket& ticket : tickets) {
         store_keys_.insert(ticket.key);
     }
-    const bool inserted = write_backs_.emplace(op_id, WriteBackTicket{.stores = std::move(tickets)}).second;
+    const bool inserted = write_backs_.emplace(op_id, std::move(tickets)).second;
     _assert(inserted, "duplicate store op id");
     return WriteBackOperation{op_id, std::move(transfers)};
 }
@@ -105,18 +104,14 @@ void TierTransferManager::CompleteWriteBack(std::uint32_t op_id) {
     if (it == write_backs_.end()) {
         return;
     }
-    WriteBackTicket write_back = std::move(it->second);
+    std::vector<StoreTicket> stores = std::move(it->second);
     write_backs_.erase(it);
-    for (const StoreTicket& ticket : write_back.stores) {
+    for (const StoreTicket& ticket : stores) {
         store_keys_.erase(ticket.key);
     }
-    for (StoreTicket& ticket : write_back.stores) {
+    for (StoreTicket& ticket : stores) {
         coordinator_.CacheHostBlock(ticket.host_block_ref, ticket.key);
     }
-}
-
-bool TierTransferManager::HasStoresInFlight() const {
-    return std::ranges::any_of(write_backs_, [](const auto& entry) { return !entry.second.stores.empty(); });
 }
 
 void TierTransferManager::CompleteLoadBack(std::uint32_t op_id) {

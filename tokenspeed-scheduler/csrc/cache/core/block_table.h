@@ -44,7 +44,6 @@ public:
     std::span<const CacheBlockRef> Blocks() const noexcept { return blocks_; }
     std::int32_t NumBlocks() const { return static_cast<std::int32_t>(blocks_.size()); }
     std::int32_t AvailableTokens() const { return available_tokens_; }
-    std::vector<CacheBlockRef> TakeBlocks() && { return std::move(blocks_); }
 
     CacheBlockRef EvictToNull(std::int32_t index) {
         _assert(0 <= index && index < static_cast<std::int32_t>(blocks_.size()), "EvictToNull index out of range");

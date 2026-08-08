@@ -135,12 +135,11 @@ PrefillOperation applyPrefillEvent(Request& request, Event& event, const KvCache
     request.Apply(event);
     const PrefillInfo info = request.CurrentPrefillInfo();
 
-    PrefillOperation operation{{
-        .request_id = request.Id(),
-        .request_pool_index = request.RequestPoolIndex(),
-        .input_length = info.extend_len,
-        .prefill_length = request.PrefillSize(),
-    }};
+    PrefillOperation operation;
+    operation.request_id = request.Id();
+    operation.request_pool_index = request.RequestPoolIndex();
+    operation.input_length = info.extend_len;
+    operation.prefill_length = request.PrefillSize();
     operation.input_ids.assign(info.input_ids.begin(), info.input_ids.end());
     operation.shifted_input_ids = info.shifted_input_ids;
     operation.extend_prefix_len = info.already_scheduled_len;
@@ -275,7 +274,8 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
             if (config_.paged_cache_groups[i].transfer_policy == PagedCacheTransferPolicy::LatestSnapshot) {
                 demands[i].num_tokens = request->PrefillSize();
                 demands[i].materialized_suffix_start =
-                    (request->PrefillSize() - 1) / coordinator_.GroupManager(i).CacheBlockTokens();
+                    (request->PrefillSize() - 1) /
+                    coordinator_.GroupManager(static_cast<std::int32_t>(i)).CacheBlockTokens();
             }
         }
     }
