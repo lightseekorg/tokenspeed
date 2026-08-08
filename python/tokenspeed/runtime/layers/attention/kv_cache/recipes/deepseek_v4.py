@@ -271,6 +271,7 @@ def prepare_deepseek_v4_cache(
             layer_ratio=merged_layout.layer_ratio,
             cache_blocks_per_lcm_block=packing,
             decode_input_tokens=decode_input_tokens,
+            pd_disaggregation_enabled=attn_config.pd_disaggregation_enabled,
         )
     )
     max_packing = max(packing.values())

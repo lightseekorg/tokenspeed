@@ -22,6 +22,7 @@ from typing import Any
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     PagedCacheGroupSpec,
+    apply_pd_transfer_policies,
     compute_paged_cache_group_page_counts,
 )
 
@@ -321,6 +322,7 @@ def build_v4_cache_specs(
     layer_ratio: Sequence[int],
     cache_blocks_per_lcm_block: Mapping[str, int] | None = None,
     decode_input_tokens: int = 1,
+    pd_disaggregation_enabled: bool = False,
 ) -> list[PagedCacheGroupSpec]:
     if (
         isinstance(decode_input_tokens, bool)
@@ -390,27 +392,28 @@ def build_v4_cache_specs(
                 family="state",
             )
         )
-    if cache_blocks_per_lcm_block is None:
-        return specs
-
-    packing = dict(cache_blocks_per_lcm_block)
-    group_ids = {spec.group_id for spec in specs}
-    if set(packing) != group_ids:
-        raise ValueError(
-            "DeepSeek V4 LCM packing must contain exactly the cache groups"
-        )
-    if any(
-        isinstance(count, bool) or not isinstance(count, int) or count <= 0
-        for count in packing.values()
-    ):
-        raise ValueError("DeepSeek V4 LCM packing values must be positive integers")
-    return [
-        replace(
-            spec,
-            cache_blocks_per_lcm_block=packing[spec.group_id],
-        )
-        for spec in specs
-    ]
+    if cache_blocks_per_lcm_block is not None:
+        packing = dict(cache_blocks_per_lcm_block)
+        group_ids = {spec.group_id for spec in specs}
+        if set(packing) != group_ids:
+            raise ValueError(
+                "DeepSeek V4 LCM packing must contain exactly the cache groups"
+            )
+        if any(
+            isinstance(count, bool) or not isinstance(count, int) or count <= 0
+            for count in packing.values()
+        ):
+            raise ValueError("DeepSeek V4 LCM packing values must be positive integers")
+        specs = [
+            replace(
+                spec,
+                cache_blocks_per_lcm_block=packing[spec.group_id],
+            )
+            for spec in specs
+        ]
+    if pd_disaggregation_enabled:
+        specs = apply_pd_transfer_policies(specs)
+    return specs
 
 
 def deepseek_v4_lcm_blocks_needed(
