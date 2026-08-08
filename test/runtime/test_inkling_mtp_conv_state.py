@@ -661,6 +661,51 @@ class TestCheckpointMetadata(unittest.TestCase):
             ),
         )
 
+    def test_fill_restore_false_leaves_restore_pages_untouched(self):
+        from types import SimpleNamespace
+
+        from tokenspeed.runtime.layers.attention.backends.inkling import (
+            InklingAttnBackend,
+        )
+
+        backend = InklingAttnBackend.__new__(InklingAttnBackend)
+        backend.conv_pool = SimpleNamespace(kernel_size=self.W)
+        backend.conv_columns = {
+            "block_tokens": 4,
+            "group_block_tokens": {"state": 4},
+        }
+        metadata = backend._new_checkpoint_metadata(
+            size=2,
+            groups=("state",),
+            device=torch.device("cuda"),
+            include_prefill_rows=False,
+        )
+        metadata.restore_pages["state"].fill_(-9)
+        table = torch.tensor([[11, 12, 13], [21, 22, 23]], device="cuda")
+        # before rows are aligned boundaries with real pages, so a restore
+        # fill would resolve them — fill_restore=False must not touch them.
+        backend._fill_checkpoint_metadata(
+            metadata,
+            before=torch.tensor([4, 8], device="cuda"),
+            after=torch.tensor([8, 12], device="cuda"),
+            query_start_loc=None,
+            col_page_table={"state": table},
+            write_endpoint=True,
+            fill_restore=False,
+        )
+        self.assertEqual(metadata.restore_pages["state"].tolist(), [-9, -9])
+        self.assertEqual(metadata.write_pages["state"].tolist(), [12, 23])
+
+        backend._fill_checkpoint_metadata(
+            metadata,
+            before=torch.tensor([4, 8], device="cuda"),
+            after=torch.tensor([8, 12], device="cuda"),
+            query_start_loc=None,
+            col_page_table={"state": table},
+            write_endpoint=True,
+        )
+        self.assertEqual(metadata.restore_pages["state"].tolist(), [11, 22])
+
 
 if __name__ == "__main__":
     unittest.main()

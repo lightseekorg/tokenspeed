@@ -407,12 +407,13 @@ def _sconv_apply(
                 group_id=checkpoint_group,
                 buffers=checkpoint_buffers,
             )
-            backend.restore_shortconv_checkpoint(
-                state,
-                checkpoint_buffers,
-                md,
-                checkpoint_group,
-            )
+            if md.needs_restore:
+                backend.restore_shortconv_checkpoint(
+                    state,
+                    checkpoint_buffers,
+                    md,
+                    checkpoint_group,
+                )
 
     # In-kernel speculative boundary publish: every covered 128-boundary,
     # accept-independent; rejected content is overwritten by a later round.

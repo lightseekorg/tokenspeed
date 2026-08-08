@@ -111,6 +111,10 @@ class InklingConvMetadata:
     # Extend/mixed chunks can exceed the compute kernel's in-kernel
     # persistence bound (R - (W-1)); True runs inkling_ring_sconv_update after it.
     needs_ring_update: bool = False
+    # Checkpoint restore is admission-only: True only on extend/mixed batches
+    # where some request has an aligned prefix hit (host-checked), so decode
+    # rounds and cold prefills skip the restore ops entirely.
+    needs_restore: bool = False
     # Checkpoint groups: per-group tables {group: [bs, max_conv_blocks]}; None -> no paged groups.
     col_page_table: dict[str, torch.Tensor] | None = None
     checkpoints: ShortConvCheckpointMetadata | None = None
@@ -308,6 +312,7 @@ class InklingAttnBackend(AttentionBackend):
         query_start_loc: torch.Tensor | None,
         col_page_table: dict[str, torch.Tensor],
         write_endpoint: bool,
+        fill_restore: bool = True,
     ) -> None:
         """Refresh fixed checkpoint buffers from one scheduler-visible endpoint."""
         geometry = self.conv_columns
@@ -317,18 +322,20 @@ class InklingAttnBackend(AttentionBackend):
         n = min(before.shape[0], after.shape[0], size)
 
         for group_id in groups:
-            metadata.restore_pages[group_id].zero_()
+            if fill_restore:
+                metadata.restore_pages[group_id].zero_()
             metadata.write_pages[group_id].zero_()
             if n == 0:
                 continue
             table = col_page_table[group_id][:n]
-            metadata.restore_pages[group_id][:n].copy_(
-                self._checkpoint_pages_at_boundaries(
-                    table,
-                    before[:n],
-                    page_size,
+            if fill_restore:
+                metadata.restore_pages[group_id][:n].copy_(
+                    self._checkpoint_pages_at_boundaries(
+                        table,
+                        before[:n],
+                        page_size,
+                    )
                 )
-            )
             if write_endpoint:
                 metadata.write_pages[group_id][:n].copy_(
                     self._checkpoint_pages_at_boundaries(
@@ -408,6 +415,9 @@ class InklingAttnBackend(AttentionBackend):
             write_endpoint=(
                 forward_mode.is_extend_or_mixed() or self.conv_spec_num_tokens == 1
             ),
+            # Restore is admission-only; decode/verify rings are always fresher
+            # than any checkpoint.
+            fill_restore=forward_mode.is_extend_or_mixed(),
         )
         return metadata
 
@@ -457,6 +467,7 @@ class InklingAttnBackend(AttentionBackend):
             query_start_loc=None,
             col_page_table=self._graph_col_tables,
             write_endpoint=self.conv_spec_num_tokens == 1,
+            fill_restore=False,
         )
         return self._checkpoint_metadata_view(self._graph_checkpoints, bs)
 
@@ -610,6 +621,17 @@ class InklingAttnBackend(AttentionBackend):
                 query_start_loc=query_start_loc,
                 extend_prefix_lens=extend_prefix_lens,
             )
+        needs_restore = False
+        if (
+            checkpoints is not None
+            and forward_mode.is_extend_or_mixed()
+            and extend_prefix_lens_cpu is not None
+        ):
+            # Host mirror of _checkpoint_pages_at_boundaries' aligned-boundary
+            # condition: restore only ever has a source page on such prefixes.
+            page_size = int(self.conv_columns["block_tokens"])
+            prefix = extend_prefix_lens_cpu[:bs]
+            needs_restore = bool(((prefix > 0) & (prefix % page_size == 0)).any())
         self.conv_metadata = InklingConvMetadata(
             query_start_loc=query_start_loc,
             cache_indices=cache_indices,
@@ -624,6 +646,7 @@ class InklingAttnBackend(AttentionBackend):
             col_page_table=col_page_table,
             checkpoints=checkpoints,
             needs_ring_update=forward_mode.is_extend_or_mixed(),
+            needs_restore=needs_restore,
         )
 
     # ------------------------------------------------------------------
