@@ -110,7 +110,7 @@ def test_kimi3_latent_projection_writes_out_and_captures(
     torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2])
+@pytest.mark.parametrize("num_tokens", [1, 2, 16])
 def test_kimi3_latent_projection_add3_matches_torch_and_captures(
     num_tokens: int,
 ) -> None:

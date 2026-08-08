@@ -31,6 +31,10 @@ from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
 
+# TP8/EP8 model measurements favor warp GEMV through M=8 and grouped MFMA
+# above it.
+_ROUTE_DIRECT_DECODE_MAX_TOKENS = 8
+
 
 if platform.is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
@@ -142,7 +146,7 @@ if platform.is_amd:
         num_local_experts = int(getattr(w, "num_local_experts", w.w13_weight.shape[0]))
         expert_start = int(getattr(w, "ep_rank", 0)) * num_local_experts
         use_route_direct_decode = (
-            0 < x.shape[0] <= 4
+            0 < x.shape[0] <= _ROUTE_DIRECT_DECODE_MAX_TOKENS
             and x.is_contiguous()
             and x.shape[1] % 256 == 0
             and two_intermediate % 2 == 0
