@@ -164,6 +164,7 @@ class TestAttentionBackendChoices(unittest.TestCase):
             speculative_algorithm="EAGLE3",
             speculative_num_steps=3,
             speculative_num_draft_tokens=4,
+            spec_context_pad=12,  # 3 overshoot spans * 4 draft tokens
         )
         model_config = SimpleNamespace(
             context_len=4096,
@@ -177,6 +178,7 @@ class TestAttentionBackendChoices(unittest.TestCase):
 
         self.assertEqual(config.speculative_num_steps, 3)
         self.assertEqual(config.speculative_num_draft_tokens, 4)
+        self.assertEqual(config.context_len, 4108)
 
 
 class TestDecodeHostL2(unittest.TestCase):

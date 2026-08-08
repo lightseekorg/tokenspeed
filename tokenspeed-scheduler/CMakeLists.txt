@@ -111,6 +111,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_swa_manager.cpp
         tests/cpp/test_match_host_pages.cpp
         tests/cpp/test_kv_cache_coordinator.cpp
+        tests/cpp/test_joint_match_invariants.cpp
         tests/cpp/test_forward_cache_ops.cpp
         tests/cpp/test_forward_batch.cpp
         tests/cpp/test_kv_cache_lifecycle.cpp

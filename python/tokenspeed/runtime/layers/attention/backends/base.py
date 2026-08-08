@@ -67,9 +67,15 @@ class AttentionBackend(ABC):
     # different hole/index semantics; a group-aware backend sets
     # this True. Default False keeps every existing backend on today's path.
     uses_cache_groups: bool = False
-    # False for group-aware backends whose spec-verify path is not wired yet.
-    cache_group_spec_capable: bool = True
+    # True when authoritative per-group tables also replace the shared
+    # full-history draft table for this backend. Keep this separate from
+    # uses_cache_groups: generic speculative backends still consume that table.
+    cache_group_tables_replace_draft_page_table: bool = False
+    # Capture helpers use a real writable page for every active group when
+    # the backend rejects the reserved null page for live sequence metadata.
+    cache_active_pages_must_be_real: bool = False
     uses_padded_decode_token_mask: bool = False
+    supports_mla_projected_value_decode: bool = False
     # Backend-owned cuda-graph cache-seqlens buffer the decode metadata views.
     draft_seq_lens_attr: str = "cuda_graph_seq_lens"
 

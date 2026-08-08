@@ -179,8 +179,22 @@ Notes:
 - The SMG packages pinned by TokenSpeed resolve `moonshotai/Kimi-K3` directly;
   a flattened local checkpoint and separately staged remote-code cache are no
   longer required.
-- The checkpoint carries no fp8 KV scaling factors; the loader defaults them
-  to 1.0 (a warning at load). Expect a small accuracy delta vs bf16 KV.
+- The checkpoint carries no FP8 KV scaling factors. When the target K3 uses its
+  required FP8 LCM cache, TokenSpeed keeps the separate K3 DSpark draft cache in
+  BF16 so context injection and draft attention match the reference precision.
+- DSpark proposal blocks use non-causal MLA draft attention. Both the `mla` and
+  `trtllm_mla` draft backends preserve every block row during eager execution
+  and CUDA graph capture. When K3's 128-token logical cache pages feed the
+  64-token TRT-LLM MLA kernel, the backend expands each logical page into its
+  two physical kernel pages before draft attention.
+- For Kimi K3, an eight-token verify window uses seven DSpark draft queries.
+  The anchor query directly predicts the first draft through the Markov head;
+  it must not be padded with an eighth, unused mask row.
+- Target features are captured from K3's completed-layer prefix stream before
+  the model-level AttnRes mix and final norm, matching the DSpark checkpoint's
+  vLLM training and inference contract.
+- Under tensor parallelism, the draft's final row-parallel MLP output is reduced
+  across TP ranks before `final_norm` and shared target-head sampling.
 - The vision encoder has 12 attention heads. For an 8-way text TP deployment,
   use `--mm-encoder-tp-mode data` so each rank runs the vision encoder at TP1
   on a different whole image.
@@ -245,8 +259,11 @@ tokenspeed serve moonshotai/Kimi-K3 \
 
 On gfx950, the replicated 7168↔3584 latent projections automatically select
 among a one-token Triton GEMV, tuned Gluon GEMMs, and the vendor GEMM according
-to the current token count. The fused sigmoid-bias top-k route supports the
-full scheduled token count.
+to the current token count. At TP8/EP8, eligible one-token decode also combines
+the routed MXFP4 experts with the shared-expert down projection, then applies
+their joint reduction before the fused latent up-projection epilogue. Other
+shapes and unsupported layouts retain the ordinary composed path. The fused
+sigmoid-bias top-k route supports the full scheduled token count.
 
 ## GLM5 / GLM5.2
 
@@ -288,7 +305,12 @@ tokenspeed serve Qwen/Qwen3-30B-A3B \
   --port 8000
 ```
 
-## Qwen3.8-max
+## Qwen3.8
+
+Qwen3.8 shares the hybrid linear-attention (GDN) / full-attention layer
+pattern with Qwen3.5.
+
+### Qwen3.8-Max
 
 Qwen3.8-max needs 16 GPUs, so it runs on two 8-GPU nodes. Launch
 `tokenspeed serve` on every node with the same command, changing only
@@ -302,7 +324,7 @@ This family has no parser auto-selection, so set `--reasoning-parser` and
 `--dist-init-addr` to node 0's own address and port throughout
 (`<node0-host>:25000` below).
 
-### TP16
+#### TP16
 
 One replica across both nodes. `--ep-size` defaults to 1, so the experts stay
 tensor-parallel over the full world and all-to-all stays out of the path. Keep
@@ -345,7 +367,7 @@ tokenspeed serve /path/to/qwen3.8-max-fp8 \
   --host 0.0.0.0 --port 8000
 ```
 
-### TP8 DP2 EP16 (DeepEP)
+#### TP8 DP2 EP16 (DeepEP)
 
 Two TP8 attention replicas, experts sharded across all 16 ranks, and expert
 routing on DeepEP dispatch/combine instead of all-gather:
@@ -401,13 +423,37 @@ Notes:
   `NVSHMEM_IB_SL`, and point `NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME` at the same
   interface as `NCCL_SOCKET_IFNAME`.
 
-### Choosing a layout
+#### Choosing a layout
 
 - TP16 has the lower TTFT and TPOT at batch 1-2: no dispatch/combine hop, and
   the single replica owns the whole batch.
 - The DeepEP layout pulls ahead from mid batch up, where its expert kernels and
   the second attention replica both pay off.
 
+### Qwen3.8-27B
+
+A dense 27B-class Qwen3.8 FP8 checkpoint on a single GPU, with self-speculative
+MTP (the draft model path points at the same checkpoint):
+
+```bash
+tokenspeed serve /path/to/qwen3.8-27b-fp8 \
+  --served-model-name qwen3.8-27b \
+  --world-size 1 \
+  --gpu-memory-utilization 0.9 \
+  --attention-backend trtllm \
+  --moe-backend flashinfer_trtllm \
+  --chunked-prefill-size 8192 \
+  --max-model-len 262144 \
+  --max-num-seqs 128 \
+  --kv-cache-dtype fp8_e4m3 \
+  --speculative-algorithm MTP \
+  --speculative-draft-model-path /path/to/qwen3.8-27b-fp8 \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --disable-kvstore \
+  --host 0.0.0.0 --port 8000
+```
 
 ## GPT-OSS 20B / 120B
 

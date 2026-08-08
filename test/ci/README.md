@@ -106,16 +106,18 @@ repositories. `pull_request` runs keep their existing behavior. The configured
 repository must also provide the matching self-hosted runner labels and any
 required secrets; this variable only controls the repository gate.
 
-The NVIDIA PR workflow excludes `h100` runners by default. To temporarily
-remove additional unavailable GPU runners from PR test matrices, set the
+The NVIDIA PR workflow excludes `h100` and `b300` runners by default, including
+for fork PRs where repository variables are unavailable. To temporarily remove
+additional unavailable GPU runners from PR test matrices, set the
 `TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS` repository variable to comma-separated,
-case-insensitive substrings such as `b300, mi355`. Matching uses the resolved
-runner label after applying `TOKENSPEED_B200_RUNNER_LABEL`; `b300` therefore
-matches both `b300-*` and `gb300-*`, while `mi355` matches
+case-insensitive substrings such as `gb200, mi355`. Matching uses the resolved
+runner label after applying `TOKENSPEED_B200_RUNNER_LABEL`; the built-in `b300`
+baseline therefore matches both `b300-*` and `gb300-*`, while `mi355` matches
 `amd-mi355-*`. Empty entries are ignored. If every runner in a workflow group
 is excluded, its matrix job is skipped while the workflow still finishes.
 This variable applies only to the three PR test workflows. Clear or unset it to
-restore all runner labels except the NVIDIA workflow's `h100` baseline.
+restore all runner labels except the NVIDIA workflow's `h100` and `b300`
+baselines.
 
 The CI system derives `SM` from common runner label prefixes by default:
 `h100`/`h200` use `sm90`, `b200`/`gb200` use `sm100`, and `b300`/`gb300` use

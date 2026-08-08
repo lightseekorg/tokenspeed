@@ -199,7 +199,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         # single-query rows sharing the SAME block-end seq_len, so each row
         # attends over the whole block. Mirrors the MHA draft_block_decode path;
         # target verify and ordinary trtllm decode are untouched.
-        self.draft_block_decode = bool(getattr(config, "draft_block_decode", False))
+        self.draft_block_decode = bool(config.draft_block_decode)
 
     # ------------------------------------------------------------------
     # Page table helpers
@@ -207,8 +207,6 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
 
     def _build_page_table(
         self,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
         bs: int,
         page_table: torch.Tensor,
         page_table_buf: torch.Tensor,
@@ -520,7 +518,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         device = seq_lens.device
         # Alias seq_lens (no copy, no mutation). cu_seqlens_k omitted:
         # the decode kernel doesn't read it. On the cache path the per-group
-        # tables route every read; the single-table single table would be dead work.
+        # tables route every read; a shared single page_table would be dead work.
         self.forward_decode_metadata = TRTLLMMHAMetadata(
             cache_seqlens_int32=seq_lens[:bs],
             max_seq_len_q=1,
@@ -529,9 +527,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             page_table=(
                 None
                 if group_page_tables
-                else self._build_page_table(
-                    req_pool_indices, seq_lens, bs, page_table, self.page_table_buf
-                )
+                else self._build_page_table(bs, page_table, self.page_table_buf)
             ),
             page_tables=group_page_tables,
             out_cache_locs=group_out_cache_locs,
@@ -653,9 +649,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             page_table=(
                 None
                 if group_page_tables
-                else self._build_page_table(
-                    req_pool_indices, seq_lens, bs, page_table, self.page_table_buf
-                )
+                else self._build_page_table(bs, page_table, self.page_table_buf)
             ),
             page_tables=group_page_tables,
             out_cache_locs=group_out_cache_locs,
@@ -689,9 +683,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         page_table = (
             None
             if group_page_tables
-            else self._build_page_table(
-                req_pool_indices, seq_lens, bs, page_table, self.page_table_buf
-            )
+            else self._build_page_table(bs, page_table, self.page_table_buf)
         )
 
         # Read the max from the pinned-CPU mirror — avoids a per-iter
@@ -844,7 +836,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         # cache_seqlens views the backend-owned cuda_graph_cache_seqlens (set in
         # init_cuda_graph_state).
         # Cache-group captures route reads through the per-group buffer views and
-        # replay never fills the single-table single table, so record page_table=None
+        # replay never fills a shared single page_table, so record page_table=None
         # instead of a slice of the never-filled zero buffer.
         metadata = TRTLLMMHAMetadata(
             cache_seqlens_int32=self.cuda_graph_cache_seqlens[:bs],

@@ -40,7 +40,9 @@ from tokenspeed_scheduler import (
     SchedulerConfig,
 )
 
-from tokenspeed.runtime.configs.cache_runtime import require_positive_int
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+    require_positive_int,
+)
 
 _CACHE_EVENT_TYPES = {
     "WriteBackDoneEvent": Cache.WriteBackDoneEvent,
@@ -533,3 +535,172 @@ def block_tables_from_forward_op(
     for key, arr, offset in packable:
         out[key] = packed[offset : offset + arr.size].view(arr.shape[0], arr.shape[1])
     return out
+
+
+def _classify_param(name: str) -> str:
+    """Bucket a parameter/buffer name into a weight group for the memory
+    summary. Names follow the Kimi-K3 / DeepSeek module layout."""
+    if "self_attn" in name or ".attn." in name or "kv_a" in name or "q_a" in name:
+        return "attention_weights"
+    if (
+        "experts" in name
+        or "block_sparse_moe" in name
+        or "routed_expert" in name
+        or "gate" in name
+    ) and "shared_experts" not in name:
+        return "moe_weights"
+    if (
+        "mlp" in name
+        or "shared_experts" in name
+        or "down_proj" in name
+        or "up_proj" in name
+        or "gate_proj" in name
+    ):
+        return "dense_mlp_weights"
+    return "other_weights"
+
+
+def _kv_pool_bytes(*pools) -> int:
+    """Best-effort total KV-buffer bytes across the given pools, deduped.
+
+    A draft pool is a ``LayerMappedKVPool`` view of the target's merged pool
+    (draft KV lives in the target arena), and its ``get_kv_size_bytes`` forwards
+    to that same inner pool -- so counting target + draft naively would double
+    the KV. Dedupe by the underlying (unwrapped) pool identity first.
+
+    Return types differ (int, or a tuple like MSA's (kv, index); a hybrid pool
+    may nest several) -- sum any numeric leaves.
+    """
+    seen: set[int] = set()
+    total = 0
+    for pool in pools:
+        if pool is None:
+            continue
+        underlying = getattr(pool, "inner", pool)
+        if id(underlying) in seen:
+            continue
+        seen.add(id(underlying))
+        getter = getattr(pool, "get_kv_size_bytes", None)
+        if getter is None:
+            continue
+        try:
+            result = getter()
+        except Exception:
+            continue
+
+        def _sum(x):
+            if isinstance(x, (int, float)):
+                return int(x)
+            if isinstance(x, (tuple, list)):
+                return sum(_sum(e) for e in x)
+            return 0
+
+        total += _sum(result)
+    return total
+
+
+def log_gpu_memory_summary(
+    model,
+    gpu_id: int,
+    rank: int,
+    logger,
+    draft_model=None,
+    kv_pool=None,
+    draft_kv_pool=None,
+) -> None:
+    """Log a per-rank GPU memory breakdown after model + KV pool are built.
+
+    Weight groups are summed from the model's parameters and buffers (deduped
+    by storage pointer). A draft model (speculative decoding) is summed
+    separately into its own row. KV cache / CUDA graphs / non-torch (context,
+    NCCL, DeepEP) are derived from the torch allocator and driver views, so the
+    summary is backend-agnostic. Best-effort: never raises into startup.
+    """
+    try:
+        GB = 1024**3
+        groups = {
+            "attention_weights": 0,
+            "moe_weights": 0,
+            "dense_mlp_weights": 0,
+            "other_weights": 0,
+        }
+        seen: set[int] = set()
+
+        def _accumulate(name, tensor, sink):
+            if tensor is None or not tensor.is_cuda:
+                return
+            ptr = tensor.data_ptr()
+            if ptr in seen:
+                return
+            seen.add(ptr)
+            sink[_classify_param(name)] += tensor.numel() * tensor.element_size()
+
+        for n, p in model.named_parameters():
+            _accumulate(n, p, groups)
+        for n, b in model.named_buffers():
+            _accumulate(n, b, groups)
+
+        weights_total = sum(groups.values()) / GB
+
+        # Draft model (MTP / DSpark) weights, deduped against target: shared
+        # tensors (e.g. embed/lm_head lent from the target) are already in
+        # ``seen`` and won't be double-counted.
+        draft_total = 0
+        if draft_model is not None:
+            draft_sink = {k: 0 for k in groups}
+            for n, p in draft_model.named_parameters():
+                _accumulate(n, p, draft_sink)
+            for n, b in draft_model.named_buffers():
+                _accumulate(n, b, draft_sink)
+            draft_total = sum(draft_sink.values())
+        draft_gb = draft_total / GB
+
+        free_bytes, total_bytes = torch.cuda.mem_get_info(gpu_id)
+        allocated = torch.cuda.memory_allocated(gpu_id) / GB
+        reserved = torch.cuda.memory_reserved(gpu_id) / GB
+        device_total = total_bytes / GB
+        device_free = free_bytes / GB
+        device_used = device_total - device_free
+        # KV pool bytes read straight from the pool buffers. Draft KV lives in
+        # the target's merged arena (its pool is a view), so dedupe to count once.
+        kv_cache_gb = _kv_pool_bytes(kv_pool, draft_kv_pool) / GB
+        # Allocated beyond the classified target+draft weights and the KV pool is
+        # activations + captured-graph private pools; non-torch is
+        # context/NCCL/DeepEP.
+        activations_and_graphs = max(
+            0.0, allocated - weights_total - draft_gb - kv_cache_gb
+        )
+        non_torch = max(0.0, device_used - reserved)
+
+        rows = [
+            ("Attention weights", groups["attention_weights"] / GB),
+            ("MoE weights", groups["moe_weights"] / GB),
+            ("Dense/MLP weights", groups["dense_mlp_weights"] / GB),
+            ("Other weights (embed/head/norm)", groups["other_weights"] / GB),
+        ]
+        if draft_model is not None:
+            rows.append(("Draft model weights", draft_gb))
+        rows += [
+            ("KV cache", kv_cache_gb),
+            ("Activations + CUDA graphs", activations_and_graphs),
+            ("Torch allocated (total)", allocated),
+            ("Torch reserved (allocator pool)", reserved),
+            ("Non-torch (context/NCCL/DeepEP)", non_torch),
+            ("Device used (nvidia-smi view)", device_used),
+            ("Device free", device_free),
+            ("Device total", device_total),
+        ]
+        name_width = max(len(n) for n, _ in rows)
+        sep = "+" + "-" * (name_width + 2) + "+" + "-" * 12 + "+"
+        lines = [
+            f"GPU memory summary (rank {rank}, gpu {gpu_id}, GB):",
+            sep,
+            f"| {'Component'.ljust(name_width)} | {'GB'.rjust(10)} |",
+            sep,
+        ]
+        for n, v in rows:
+            lines.append(f"| {n.ljust(name_width)} | {v:10.2f} |")
+        lines.append(sep)
+        logger.info("\n".join(lines))
+    except Exception:
+        logger.warning("Failed to log GPU memory summary", exc_info=True)

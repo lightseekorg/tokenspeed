@@ -8318,6 +8318,30 @@ def _maybe_gluon_package_mxfp4_prefill(
                     routed_scaling_factor=routed_scaling_factor,
                     normalize_topk_weights=normalize_topk_weights,
                 )
+            elif n_group == 1 and topk_group == 1:
+                from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.routing import (
+                    gluon_topk_route_supported,
+                    invoke_sigmoid_bias_topk_route_gluon,
+                )
+
+                if gluon_topk_route_supported(router_logits, top_k):
+                    topk_ids, topk_weights = invoke_sigmoid_bias_topk_route_gluon(
+                        router_logits,
+                        correction_bias,
+                        top_k,
+                        routed_scaling_factor=routed_scaling_factor,
+                        normalize_topk_weights=normalize_topk_weights,
+                    )
+                else:
+                    topk_weights, topk_ids = _biased_grouped_topk_reference(
+                        router_logits,
+                        correction_bias,
+                        top_k,
+                        n_group=n_group,
+                        topk_group=topk_group,
+                        routed_scaling_factor=routed_scaling_factor,
+                        normalize_topk_weights=normalize_topk_weights,
+                    )
             else:
                 topk_weights, topk_ids = _biased_grouped_topk_reference(
                     router_logits,

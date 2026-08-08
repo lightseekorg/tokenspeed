@@ -10,25 +10,24 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
 
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
-from tokenspeed.runtime.layers.attention.kv_cache.plan import (
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
-    plan_cache_fields,
+    solve_cache_layout,
 )
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 
 def _plan():
-    return plan_cache_fields(
+    return solve_cache_layout(
         (
             CacheFieldSpec("history", "history.k", "plane.a", (4,), 1),
             CacheFieldSpec("state", "state.ssm", "plane.b", (8,), 1),
         ),
         logical_block_tokens=4,
-        num_lcm_blocks=2,
         cache_blocks_per_lcm_block={"history": 2, "state": 1},
         max_padding_fraction=1.0,
-    )
+    ).with_num_lcm_blocks(2)
 
 
 class CachePoolContractTest(unittest.TestCase):

@@ -16,11 +16,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from dataclasses import replace
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from typing import Any
 
-from tokenspeed.runtime.configs.paged_cache_spec import (
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     PagedCacheGroupSpec,
     compute_paged_cache_group_page_counts,
 )
@@ -152,6 +152,96 @@ def deepseek_v4_indexer_fp8_layout_from_row_bytes(
     return index_head_dim, scale_bytes
 
 
+@dataclass(frozen=True)
+class DeepseekV4CacheLayout:
+    """Per-model cache geometry derived from the HF config: layer compress
+    ratios plus the per-row byte formulas the field shapes are built from."""
+
+    layer_ratio: tuple[int, ...]
+    head_dim: int
+    rope_head_dim: int
+    page_size: int
+    use_fp4_indexer_cache: bool
+    index_head_dim: int = 128
+
+    @property
+    def swa_token_stride(self) -> int:
+        return deepseek_v4_swa_token_stride(self.head_dim, self.rope_head_dim)
+
+    @property
+    def swa_scale_dim(self) -> int:
+        return deepseek_v4_swa_scale_dim(self.head_dim, self.rope_head_dim)
+
+    @property
+    def swa_row_bytes(self) -> int:
+        return self.swa_token_stride + self.swa_scale_dim
+
+    def swa_block_bytes(self, page_size: int | None = None) -> int:
+        if page_size is None:
+            page_size = self.page_size
+        block_bytes = page_size * self.swa_row_bytes
+        alignment = self.swa_token_stride
+        return ((block_bytes + alignment - 1) // alignment) * alignment
+
+    def storage_block_size(self, compress_ratio: int) -> int:
+        if compress_ratio > 1:
+            return max(1, DEEPSEEK_V4_COMPRESSED_LOGICAL_BLOCK_SIZE // compress_ratio)
+        return self.page_size
+
+    def compressor_state_block_size(self, compress_ratio: int) -> int:
+        if compress_ratio == 4:
+            return 4
+        if compress_ratio == 128:
+            return 8
+        return self.page_size
+
+    @property
+    def indexer_row_bytes(self) -> int:
+        if self.use_fp4_indexer_cache:
+            return deepseek_v4_indexer_mxfp4_row_bytes(self.index_head_dim)
+        return deepseek_v4_indexer_fp8_row_bytes(self.index_head_dim)
+
+    def state_width(self, layer_id: int, *, indexer: bool = False) -> int:
+        if indexer:
+            return self.index_head_dim * 2
+        return self.head_dim * (2 if self.layer_ratio[layer_id] == 4 else 1)
+
+
+def deepseek_v4_cache_layout_from_config(
+    hf_config,
+    page_size: int,
+    use_fp4_indexer_cache: bool,
+    layer_indices: Iterable[int] | None = None,
+) -> DeepseekV4CacheLayout:
+    compress_ratios = tuple(hf_config.compress_ratios)
+    if layer_indices is None:
+        layer_ratios = compress_ratios
+    else:
+        layer_indices = tuple(layer_indices)
+        if any(idx < 0 or idx >= len(compress_ratios) for idx in layer_indices):
+            raise ValueError(
+                "DeepSeek V4 cache layout layer index out of range: "
+                f"indices={layer_indices}, ratios={len(compress_ratios)}"
+            )
+        layer_ratios = [compress_ratios[idx] for idx in layer_indices]
+    raw_layer_ratios = tuple(int(x) for x in layer_ratios)
+    for ratio in raw_layer_ratios:
+        if ratio not in (0, 1, 4, 128):
+            raise ValueError(
+                "Unsupported DeepSeek V4 cache compress_ratio="
+                f"{ratio}; expected one of 0, 1, 4, or 128"
+            )
+
+    return DeepseekV4CacheLayout(
+        layer_ratio=tuple(max(1, ratio) for ratio in raw_layer_ratios),
+        head_dim=int(hf_config.head_dim),
+        rope_head_dim=int(hf_config.qk_rope_head_dim),
+        page_size=page_size,
+        use_fp4_indexer_cache=use_fp4_indexer_cache,
+        index_head_dim=int(getattr(hf_config, "index_head_dim", 128)),
+    )
+
+
 def v4_compressor_state_group_id(ratio: int) -> str:
     return f"v4.c{int(ratio)}a.compressor_state"
 
@@ -230,9 +320,23 @@ def build_v4_cache_specs(
     *,
     layer_ratio: Sequence[int],
     cache_blocks_per_lcm_block: Mapping[str, int] | None = None,
+    decode_input_tokens: int = 1,
 ) -> list[PagedCacheGroupSpec]:
+    if (
+        isinstance(decode_input_tokens, bool)
+        or not isinstance(decode_input_tokens, int)
+        or decode_input_tokens <= 0
+    ):
+        raise ValueError("decode_input_tokens must be a positive integer")
     swa_window = _resolve_sliding_window(hf_config)
     unique_compress_ratios = sorted({int(r) for r in layer_ratio if int(r) > 1})
+    # c4 compression consumes the prior four-token state plus every token in
+    # the target verify block. Preserve the historical eight-token window for
+    # verify widths <= 4 and grow it for wider block-speculative decoders.
+    c4_state_window = max(
+        _COMPRESSOR_STATE_WINDOW_TOKENS[4],
+        4 + decode_input_tokens,
+    )
 
     specs: list[PagedCacheGroupSpec] = [
         # SWA kv: trailing window only -> State family.
@@ -255,7 +359,11 @@ def build_v4_cache_specs(
                 retention="sliding_window",
                 rows_per_page=_COMPRESSOR_STATE_ROWS_PER_PAGE[ratio],
                 entry_stride_tokens=1,
-                sliding_window_tokens=_COMPRESSOR_STATE_WINDOW_TOKENS[ratio],
+                sliding_window_tokens=(
+                    c4_state_window
+                    if ratio == 4
+                    else _COMPRESSOR_STATE_WINDOW_TOKENS[ratio]
+                ),
                 family="state",
             )
         )
@@ -278,7 +386,7 @@ def build_v4_cache_specs(
                 retention="sliding_window",
                 rows_per_page=_COMPRESSOR_STATE_ROWS_PER_PAGE[4],
                 entry_stride_tokens=1,
-                sliding_window_tokens=_COMPRESSOR_STATE_WINDOW_TOKENS[4],
+                sliding_window_tokens=c4_state_window,
                 family="state",
             )
         )
@@ -405,7 +513,9 @@ __all__ = [
     "V4_INDEXER_COMPRESSOR_STATE_GROUP_ID",
     "V4_KERNEL_BLOCK_ROWS",
     "V4_SWA_KV_GROUP_ID",
+    "DeepseekV4CacheLayout",
     "build_v4_cache_specs",
+    "deepseek_v4_cache_layout_from_config",
     "deepseek_v4_indexer_fp8_layout_from_row_bytes",
     "deepseek_v4_indexer_fp8_row_bytes",
     "deepseek_v4_indexer_fp8_scale_bytes",

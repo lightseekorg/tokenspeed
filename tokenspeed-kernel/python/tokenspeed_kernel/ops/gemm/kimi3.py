@@ -12,6 +12,7 @@ a bandwidth-oriented fused Q/K/V/output-gate projection.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
@@ -410,9 +411,10 @@ def kimi3_latent_projection_add3(
         prefix: BF16 residual rows shaped ``[M, N]``.
         shared_output: BF16 shared-expert rows shaped ``[M, N]``.
         solution: ``"auto"`` selects the fused row-CTA GEMV for one-token
-            execution and otherwise composes the registered projection and
-            add kernels. ``"rowcta_gemv"`` and ``"composed"`` force either
-            implementation.
+            execution, the fused MFMA epilogue for the tuned M=16 tile, and
+            otherwise composes the registered projection and add kernels.
+            ``"rowcta_gemv"``, ``"gluon_mfma_add3"``, and ``"composed"``
+            force an implementation.
 
     Returns:
         ``prefix + hidden_states @ weight.T + shared_output`` shaped ``[M, N]``.
@@ -440,7 +442,7 @@ def kimi3_latent_projection_add3(
                 f"Kimi K3 latent projection {name} must have unit inner stride"
             )
 
-    if solution not in {"auto", "rowcta_gemv", "composed"}:
+    if solution not in {"auto", "rowcta_gemv", "gluon_mfma_add3", "composed"}:
         raise ValueError(f"unknown Kimi K3 projection-add3 solution {solution!r}")
     specialized = (
         hidden_states.is_cuda
@@ -451,7 +453,12 @@ def kimi3_latent_projection_add3(
         and (k, n) in _KIMI3_SHAPES
     )
     if solution == "auto":
-        solution = "rowcta_gemv" if m == 1 and specialized else "composed"
+        if m == 1 and specialized:
+            solution = "rowcta_gemv"
+        elif Platform.get().is_cdna4 and m == 16 and specialized:
+            solution = "gluon_mfma_add3"
+        else:
+            solution = "composed"
     if solution == "rowcta_gemv":
         if m != 1:
             raise ValueError("rowcta_gemv projection-add3 requires one input row")
@@ -463,6 +470,22 @@ def kimi3_latent_projection_add3(
         from tokenspeed_kernel.ops.gemm.triton_gemv import rowcta_gemv_add3
 
         return rowcta_gemv_add3(
+            hidden_states,
+            weight,
+            prefix,
+            shared_output,
+        )
+    if solution == "gluon_mfma_add3":
+        if not Platform.get().is_cdna4 or m != 16 or not specialized:
+            raise ValueError(
+                "gluon_mfma_add3 projection-add3 requires 16 contiguous CUDA "
+                "BF16 rows with the K3 3584->7168 shape on CDNA4"
+            )
+        from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+            gluon_mm_a16w16_add3_m16_gfx950,
+        )
+
+        return gluon_mm_a16w16_add3_m16_gfx950(
             hidden_states,
             weight,
             prefix,
@@ -715,6 +738,25 @@ def kimi3_qkvfab_projection(
     return torch.mm(hidden_states, weight.T, out=out)
 
 
+# Largest token count the hand-written router CUDA kernel still wins at; the
+# tensor-core GEMM takes over above it (see kimi3_router_projection docstring).
+_ROUTER_CUDA_MAX_TOKENS = 4
+
+
+@lru_cache(maxsize=1)
+def _mm_out_dtype_supported() -> bool:
+    """Whether ``torch.mm`` accepts ``out_dtype`` (BF16 in, FP32 out).
+
+    Exposed by torch >= 2.8 as the cublasLt BF16xBF16->FP32 epilogue; probed
+    once so older torch falls back to the CUDA-kernel/torch paths untouched.
+    """
+    try:
+        a = torch.empty(1, 2, dtype=torch.bfloat16, device="cuda")
+        return torch.mm(a, a.t(), out_dtype=torch.float32).dtype == torch.float32
+    except (TypeError, RuntimeError):
+        return False
+
+
 def kimi3_router_projection(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
@@ -730,7 +772,13 @@ def kimi3_router_projection(
         weight: BF16 router weight shaped ``[896, 7168]``.
         out: Optional contiguous FP32 output buffer shaped ``[M, 896]``.
         solution: ``"auto"`` selects a specialized CDNA4 or Hopper kernel
-            when eligible and otherwise falls back to Torch.
+            when eligible and otherwise falls back to Torch. On NVIDIA the
+            hand-written CUDA kernel serves ``M <= 4`` and ``"cublas"``
+            (``torch.mm`` with ``out_dtype``) serves larger batches: the CUDA
+            kernel's per-thread token loop runs on CUDA cores, so its time
+            grows linearly with M (4.0us at M=1 -> 34.8us at M=32 on B300)
+            while the tensor-core GEMM stays flat (~7.3us), crossing between
+            M=4 and M=8.
         enable_pdl: Enable programmatic dependent launch for the CUDA kernel.
 
     Returns:
@@ -743,7 +791,7 @@ def kimi3_router_projection(
         name="Kimi K3 router projection",
         out_dtype=torch.float32,
     )
-    if solution not in {"auto", "cuda", "triton_gemv", "torch"}:
+    if solution not in {"auto", "cuda", "cublas", "triton_gemv", "torch"}:
         raise ValueError(f"unknown Kimi K3 router solution {solution!r}")
     specialized = (
         hidden_states.is_cuda
@@ -759,9 +807,26 @@ def kimi3_router_projection(
         if platform.is_cdna4 and specialized and m == 1:
             solution = "triton_gemv"
         elif platform.is_hopper_plus and specialized:
-            solution = "cuda"
+            if m > _ROUTER_CUDA_MAX_TOKENS and _mm_out_dtype_supported():
+                solution = "cublas"
+            else:
+                solution = "cuda"
         else:
             solution = "torch"
+    if solution == "cublas":
+        if not specialized or not _mm_out_dtype_supported():
+            raise ValueError(
+                "Kimi K3 router cublas path requires contiguous BF16 "
+                "[M, 7168] input, [896, 7168] weight, and torch.mm out_dtype "
+                "support (torch >= 2.8)"
+            )
+        # cublasLt BF16xBF16 with FP32 accumulate AND FP32 store: same output
+        # semantics as the CUDA kernel, flat ~7.3us across M on B300.
+        logits = torch.mm(hidden_states, weight.t(), out_dtype=torch.float32)
+        if out is None:
+            return logits
+        out.copy_(logits)
+        return out
     if solution == "triton_gemv":
         if not specialized or m != 1:
             raise ValueError(

@@ -22,13 +22,15 @@
 
 Depthwise causal FIR convolution with a short window ``W`` (typically 4) and
 an optional residual connection, ``y = x + conv(window)``, as used by TML
-hybrid layers. The per-request convolution state (the last ``W - 1`` inputs)
-lives in a slot-indexed cache of shape ``[num_slots, W - 1, D]`` with
-D-contiguous rows; ``PAD_SLOT_ID`` (-1) marks padded batch rows that must
-never touch the cache.
+hybrid layers. The per-request convolution state lives in a slot-indexed ring
+of the last ``R`` input rows, shape ``[num_slots, R, D]`` with D-contiguous
+rows: the ring row of absolute position ``p`` is ``p % R``, positions derive
+from the through-chunk ``seq_lens``, and there is no stored cursor —
+speculative rows are overwritten when their positions recur.
+``PAD_SLOT_ID`` (-1) marks padded batch rows that must never touch the ring.
 
-The cache may be a channel-sliced view of a wider buffer
-(``cache[:, :, off:off + D]``): all kernels receive explicit strides, so only
+The ring may be a channel-sliced view of a wider buffer
+(``ring[:, :, off:off + D]``): all kernels receive explicit strides, so only
 ``conv_cache.stride(-1) == 1`` is required.
 """
 
@@ -39,25 +41,17 @@ import torch
 # Aliased because the conv.triton submodule import below rebinds the name ``triton``.
 from tokenspeed_kernel._triton import triton as _triton
 from tokenspeed_kernel.ops.conv.triton import (
-    _sconv_cache_update_kernel,
-    _sconv_decode_kernel,
-    _sconv_decode_paged_kernel,
-    _sconv_prefill_kernel,
-    _sconv_prefill_paged_kernel,
-    select_decode_config,
+    _inkling_ring_sconv_kernel,
+    _inkling_ring_sconv_update_kernel,
     select_prefill_config,
 )
-from tokenspeed_kernel.platform import current_platform
 
 PAD_SLOT_ID = -1
 
 __all__ = [
     "PAD_SLOT_ID",
-    "sconv_cache_update",
-    "sconv_decode",
-    "sconv_decode_paged",
-    "sconv_prefill",
-    "sconv_prefill_paged",
+    "inkling_ring_sconv",
+    "inkling_ring_sconv_update",
     "seq_idx_from_cu_seqlens",
 ]
 
@@ -87,7 +81,7 @@ def seq_idx_from_cu_seqlens(
     )
 
 
-def sconv_prefill(
+def inkling_ring_sconv(
     x: torch.Tensor,
     weight: torch.Tensor,
     conv_cache: torch.Tensor,
@@ -95,43 +89,60 @@ def sconv_prefill(
     seq_idx: torch.Tensor,
     cache_indices: torch.Tensor,
     has_initial_state: torch.Tensor,
+    seq_lens: torch.Tensor,
     *,
     activation: str | None = None,
     use_residual: bool = True,
+    publish: tuple | None = None,
+    enable_pdl: bool = False,
 ) -> torch.Tensor:
-    """Causal conv over ``[cached-prefix ++ chunk]`` for a varlen batch.
+    """Causal conv over ``[ring history ++ chunk]`` for a varlen batch.
 
     For each request, the convolution window at token ``t`` spans the last
-    ``W`` positions of ``[prefix ++ chunk]`` where ``prefix`` is the
-    request's ``[W - 1, D]`` conv cache row (zeros when the request has no
-    initial state or its slot is ``PAD_SLOT_ID``). The cache is read-only
-    here; call :func:`sconv_cache_update` afterwards to persist final states.
+    ``W`` positions; pre-chunk taps read the request's ring rows (zeros when
+    the request has no initial state or its slot is ``PAD_SLOT_ID``). Chunks
+    of at most ``R - (W - 1)`` tokens (decode/verify/catch-up shapes) are
+    persisted in-kernel at their positions' ring rows; call
+    :func:`inkling_ring_sconv_update` afterwards for longer chunks (prefill/extend).
 
     Args:
         x: Varlen-packed input ``[T, D]`` (e.g. bf16), D-contiguous.
         weight: Per-channel FIR taps ``[D, W]``; tap ``W - 1`` multiplies the
             current token.
-        conv_cache: Conv state cache ``[num_slots, W - 1, D]`` with
-            ``stride(-1) == 1``. May be a channel-sliced view of a wider
-            buffer. Not modified.
+        conv_cache: Conv state ring ``[num_slots, R, D]`` with
+            ``stride(-1) == 1`` and ``R >= W``. May be a channel-sliced view
+            of a wider buffer.
         cu_seqlens: Cumulative sequence lengths ``[B + 1]``, int32.
         seq_idx: Sequence index per token ``[T]``, int32 (see
             :func:`seq_idx_from_cu_seqlens`).
-        cache_indices: Cache slot per request ``[B]``, int32;
+        cache_indices: Ring slot per request ``[B]``, int32;
             ``PAD_SLOT_ID`` (-1) for padded rows.
-        has_initial_state: Bool ``[B]``; when False the prefix is zeros.
+        has_initial_state: Bool ``[B]``; when False pre-chunk taps are zeros.
+        seq_lens: Per-request lengths THROUGH the chunk ``[B]``, int32; the
+            absolute position of chunk token ``t`` is
+            ``seq_lens[si] - (eos - t)`` and every ring row derives from it.
         activation: Optional activation applied to the conv output before the
             residual: ``None`` (TML default), ``"silu"`` or ``"swish"``.
         use_residual: Add the residual connection ``y = x + conv(...)``.
+        publish: Optional speculative boundary-checkpoint publication as
+            ``(block_table, checkpoint, checkpoint_b, page_size)``:
+            ``block_table`` int32 ``[B, num_blocks]`` for the stream's cache
+            group (entries <= 0 are holes and skip the write), ``checkpoint``
+            ``[pages, W - 1, width_a]`` receiving channels ``[0, width_a)``
+            and ``checkpoint_b`` the rest (or None when one field covers all
+            channels). Every token landing exactly on a ``page_size``
+            boundary writes the conv window at its position —
+            accept-independent; later rounds covering the same boundary
+            overwrite rejected content.
+        enable_pdl: launch with Programmatic Dependent Launch (Hopper+).
 
     Returns:
         Output tensor ``[T, D]`` with the same dtype as ``x``.
     """
     T, D = x.shape
     W = weight.shape[1]
-    assert (
-        conv_cache.shape[1] == W - 1
-    ), f"conv_cache holds {conv_cache.shape[1]} states per slot, expected {W - 1}"
+    R = conv_cache.shape[1]
+    assert R >= W, f"conv ring holds {R} rows per slot, needs at least W={W}"
     assert conv_cache.stride(-1) == 1, "conv_cache must be D-contiguous"
 
     y = torch.empty_like(x)
@@ -141,8 +152,32 @@ def sconv_prefill(
     use_silu = activation in ("silu", "swish")
     block_t, block_d, num_warps, num_stages = select_prefill_config(T, D)
 
+    if publish is not None:
+        block_table, ckpt_a, ckpt_b, page_size = publish
+        a_width = ckpt_a.shape[-1]
+        a_strides = (ckpt_a.stride(0), ckpt_a.stride(1), ckpt_a.stride(2))
+        if ckpt_b is None:
+            assert a_width == D, "single checkpoint field must cover all channels"
+            ckpt_b = ckpt_a
+            b_strides = (0, 0, 0)
+        else:
+            assert (
+                a_width + ckpt_b.shape[-1] == D
+            ), "checkpoint fields must cover the stream's channels"
+            b_strides = (ckpt_b.stride(0), ckpt_b.stride(1), ckpt_b.stride(2))
+        bt_strides = (block_table.stride(0), block_table.stride(1))
+        num_blocks = block_table.shape[1]
+    else:
+        block_table = cache_indices
+        ckpt_a = ckpt_b = x
+        bt_strides = (0, 0)
+        a_strides = b_strides = (0, 0, 0)
+        a_width = D
+        num_blocks = 0
+        page_size = 1
+
     grid = (_triton.cdiv(T, block_t), _triton.cdiv(D, block_d))
-    _sconv_prefill_kernel[grid](
+    _inkling_ring_sconv_kernel[grid](
         x,
         weight,
         conv_cache,
@@ -151,6 +186,10 @@ def sconv_prefill(
         cache_indices,
         has_initial_state,
         y,
+        seq_lens,
+        block_table,
+        ckpt_a,
+        ckpt_b,
         x.stride(0),
         x.stride(1),
         y.stride(0),
@@ -160,153 +199,28 @@ def sconv_prefill(
         conv_cache.stride(0),
         conv_cache.stride(1),
         conv_cache.stride(2),
+        bt_strides[0],
+        bt_strides[1],
+        a_strides[0],
+        a_strides[1],
+        a_strides[2],
+        b_strides[0],
+        b_strides[1],
+        b_strides[2],
+        a_width,
+        num_blocks,
         T,
         D,
         USE_SILU=use_silu,
         USE_RESIDUAL=use_residual,
-        BLOCK_T=block_t,
-        BLOCK_D=block_d,
-        W=W,
-        W_POW2=_triton.next_power_of_2(W),
-        num_warps=num_warps,
-        num_stages=num_stages,
-    )
-    return y
-
-
-def sconv_cache_update(
-    x: torch.Tensor,
-    conv_cache: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    cache_indices: torch.Tensor,
-    has_initial_state: torch.Tensor,
-) -> None:
-    """Write back each request's final ``W - 1`` conv states, in place.
-
-    For requests with ``query_len >= W - 1`` the slot receives the last
-    ``W - 1`` input tokens. For shorter requests the old cache content is
-    shifted left by ``query_len`` (when ``has_initial_state`` is True) or
-    zero-filled (when False) before appending the new tokens. Rows with
-    ``cache_indices == PAD_SLOT_ID`` are skipped entirely — they never write
-    to any slot (the TML reference clamped them to slot 0 and clobbered it).
-
-    Args:
-        x: Varlen-packed input ``[T, D]`` that was fed to
-            :func:`sconv_prefill`.
-        conv_cache: Conv state cache ``[num_slots, W - 1, D]`` with
-            ``stride(-1) == 1``; updated in place. May be a channel-sliced
-            view of a wider buffer.
-        cu_seqlens: Cumulative sequence lengths ``[B + 1]``, int32.
-        cache_indices: Cache slot per request ``[B]``, int32;
-            ``PAD_SLOT_ID`` (-1) for padded rows.
-        has_initial_state: Bool ``[B]``; selects shift vs zero fill for the
-            ``query_len < W - 1`` path.
-
-    Returns:
-        None. ``conv_cache`` is modified in place.
-    """
-    B = cache_indices.shape[0]
-    D = x.shape[-1]
-    w_minus_1 = conv_cache.shape[1]
-    assert conv_cache.stride(-1) == 1, "conv_cache must be D-contiguous"
-    if B == 0:
-        return
-
-    block_d = min(_triton.next_power_of_2(D), 1024)
-    grid = (B, _triton.cdiv(D, block_d))
-    _sconv_cache_update_kernel[grid](
-        x,
-        conv_cache,
-        cu_seqlens,
-        cache_indices,
-        has_initial_state,
-        x.stride(0),
-        x.stride(1),
-        conv_cache.stride(0),
-        conv_cache.stride(1),
-        conv_cache.stride(2),
-        D,
-        BLOCK_D=block_d,
-        W_MINUS_1=w_minus_1,
-        num_warps=4,
-    )
-
-
-def sconv_decode(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    conv_cache: torch.Tensor,
-    cache_indices: torch.Tensor,
-    *,
-    activation: str | None = None,
-    use_residual: bool = True,
-    enable_pdl: bool = False,
-) -> torch.Tensor:
-    """Fused single-token decode: conv over ``[cache ++ x_t]`` + cache update.
-
-    Computes the causal conv for one new token per request, reading the
-    ``W - 1`` state tokens directly from the cache, then shifts each cache
-    row left by one and stores the new token — all in a single launch. Rows
-    with ``cache_indices == PAD_SLOT_ID`` still produce an output (conv over
-    a zeroed prefix) but never write to the cache.
-
-    Args:
-        x: Current tokens ``[B, D]`` (one per request).
-        weight: Per-channel FIR taps ``[D, W]``.
-        conv_cache: Conv state cache ``[num_slots, W - 1, D]`` with
-            ``stride(-1) == 1``; updated in place. May be a channel-sliced
-            view of a wider buffer.
-        cache_indices: Cache slot per request ``[B]``, int32;
-            ``PAD_SLOT_ID`` (-1) for padded rows.
-        activation: Optional activation applied to the conv output before the
-            residual: ``None`` (TML default), ``"silu"`` or ``"swish"``.
-        use_residual: Add the residual connection ``y = x + conv(...)``.
-        enable_pdl: launch with Programmatic Dependent Launch (Hopper+):
-            the kernel waits for its producer before the first load and
-            signals dependents after its last store.
-
-    Returns:
-        Output tensor ``[B, D]`` with the same dtype as ``x``.
-    """
-    T, D = x.shape
-    W = weight.shape[1]
-    assert (
-        conv_cache.shape[1] == W - 1
-    ), f"conv_cache holds {conv_cache.shape[1]} states per slot, expected {W - 1}"
-    assert conv_cache.stride(-1) == 1, "conv_cache must be D-contiguous"
-
-    y = torch.empty_like(x)
-    if T == 0:
-        return y
-
-    use_silu = activation in ("silu", "swish")
-    block_t, block_d, num_warps, num_stages = select_decode_config(T, D)
-
-    grid = (_triton.cdiv(T, block_t), _triton.cdiv(D, block_d))
-    _sconv_decode_kernel[grid](
-        x,
-        weight,
-        conv_cache,
-        cache_indices,
-        y,
-        x.stride(0),
-        x.stride(1),
-        y.stride(0),
-        y.stride(1),
-        weight.stride(0),
-        weight.stride(1),
-        conv_cache.stride(0),
-        conv_cache.stride(1),
-        conv_cache.stride(2),
-        T,
-        D,
-        USE_SILU=use_silu,
-        USE_RESIDUAL=use_residual,
-        BLOCK_T=block_t,
-        BLOCK_D=block_d,
-        W=W,
-        W_POW2=_triton.next_power_of_2(W),
+        PUBLISH=publish is not None,
+        PAGE_SIZE=page_size,
         ENABLE_PDL=enable_pdl,
+        R=R,
+        BLOCK_T=block_t,
+        BLOCK_D=block_d,
+        W=W,
+        W_POW2=_triton.next_power_of_2(W),
         num_warps=num_warps,
         num_stages=num_stages,
         **({"launch_pdl": True} if enable_pdl else {}),
@@ -314,198 +228,63 @@ def sconv_decode(
     return y
 
 
-def sconv_decode_paged(
+def inkling_ring_sconv_update(
     x: torch.Tensor,
-    weight: torch.Tensor,
-    col_pool: torch.Tensor,
-    page_table: torch.Tensor,
-    seq_lens: torch.Tensor,
-    *,
-    block_tokens: int,
-    col_offset: int = 0,
-    col_pool2: torch.Tensor | None = None,
-    half_d: int = 0,
-    activation: str | None = None,
-    use_residual: bool = True,
-    enable_pdl: bool = False,
-    early_release: bool = False,
-) -> torch.Tensor:
-    """Single-token decode conv over paged per-token input columns.
-
-    The conv group stores each token's raw conv INPUT column in paged
-    storage (SWA semantics, window ``W``), so state is position-addressed:
-    prefix hits and MTP rollbacks need no state reconstruction. Taps
-    ``0..W-2`` read positions ``pos-W+1..pos-1`` through ``page_table``
-    (zeros past holes / sequence start); the current token is read from
-    ``x`` and persisted to its own column slice.
-
-    Args:
-        x: Current tokens ``[B, D]`` (one per request).
-        weight: Per-channel FIR taps ``[D, W]``.
-        col_pool: Column pool ``[num_blocks, block_tokens, C]``; the last
-            dim must be contiguous, slot/row strides may carry slack (a
-            view over larger byte slots stays zero-copy).
-        page_table: ``[B, max_blocks]`` int32 block ids for the conv group;
-            ``-1`` marks holes (punched or padded rows).
-        seq_lens: ``[B]`` int32 lengths INCLUDING the current token.
-        block_tokens: Tokens per conv block (the group's block_size).
-        col_offset: First channel of this conv site's slice in the column.
-        activation: ``None`` (TML default), ``"silu"`` or ``"swish"``.
-        use_residual: Add the residual ``y = x + conv(...)``.
-        enable_pdl: Launch with Programmatic Dependent Launch (Hopper+).
-        col_pool2: Optional second column pool for the fused K+V call: taps
-            for channels ``[half_d, D)`` read/persist there instead of
-            ``col_pool`` (the two conv streams keep separate pages).
-        half_d: Channel split point for ``col_pool2``; 0 disables the split
-            (all channels ride ``col_pool``). When set, ``D == 2 * half_d``.
-        early_release: Signal PDL dependents right after the column persist
-            instead of at kernel end (lets the next kernel's prologue
-            overlap the epilogue).
-
-    Returns:
-        Conv output ``[B, D]``, same dtype as ``x``.
-    """
-    assert x.ndim == 2 and weight.ndim == 2 and col_pool.ndim == 3
-    assert col_pool.stride(-1) == 1, "col_pool last dim must be contiguous"
-    assert col_pool.shape[1] == block_tokens, (
-        f"col_pool rows-per-slot {col_pool.shape[1]} != block_tokens " f"{block_tokens}"
-    )
-    B, D = x.shape
-    W = weight.shape[1]
-    y = torch.empty_like(x)
-    block_t, block_d, num_warps, num_stages = select_decode_config(B, D)
-    if half_d:
-        # Fused K+V halves: a program must lie wholly in one half.
-        assert col_pool2 is not None and D == 2 * half_d
-        block_d = min(block_d, half_d)
-    grid = (_triton.cdiv(B, block_t), _triton.cdiv(D, block_d))
-    kwargs = {}
-    if current_platform().is_nvidia:
-        kwargs["launch_pdl"] = enable_pdl
-    _sconv_decode_paged_kernel[grid](
-        x,
-        weight,
-        col_pool,
-        col_pool2 if col_pool2 is not None else col_pool,
-        page_table,
-        seq_lens,
-        y,
-        x.stride(0),
-        x.stride(1),
-        y.stride(0),
-        y.stride(1),
-        weight.stride(0),
-        weight.stride(1),
-        col_pool.stride(0),
-        col_pool.stride(1),
-        col_pool.stride(2),
-        page_table.stride(0),
-        col_offset,
-        B,
-        D,
-        BT=block_tokens,
-        HALF_D=half_d,
-        USE_SILU=activation in ("silu", "swish"),
-        USE_RESIDUAL=use_residual,
-        BLOCK_T=block_t,
-        BLOCK_D=block_d,
-        W=W,
-        W_POW2=_triton.next_power_of_2(W),
-        ENABLE_PDL=enable_pdl,
-        EARLY_RELEASE=early_release,
-        num_warps=num_warps,
-        num_stages=num_stages,
-        **kwargs,
-    )
-    return y
-
-
-def sconv_prefill_paged(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    col_pool: torch.Tensor,
-    page_table: torch.Tensor,
-    seq_idx: torch.Tensor,
+    conv_cache: torch.Tensor,
     cu_seqlens: torch.Tensor,
-    prefix_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    cache_indices: torch.Tensor,
     *,
-    block_tokens: int,
-    col_offset: int = 0,
-    col_pool2: torch.Tensor | None = None,
-    half_d: int = 0,
-    lcm_align: int = 0,
-    activation: str | None = None,
-    use_residual: bool = True,
-) -> torch.Tensor:
-    """Varlen prefill conv over paged input columns (see sconv_decode_paged).
+    kernel_width: int,
+) -> None:
+    """Persist each request's last ``min(chunk_len, R)`` chunk rows into its
+    ring, in place — the full ring depth, so any consumer rewind (e.g. the
+    draft decode lookback window) finds its taps.
 
-    Taps resolve per position: inside the chunk -> ``x`` rows; inside the
-    cached prefix -> pool via ``page_table`` (holes read zero); before the
-    sequence -> zero. Every chunk token's column is persisted, so no
-    separate cache_update pass is needed.
+    Required after :func:`inkling_ring_sconv` for batches that may contain chunks
+    longer than ``R - (W - 1)`` (prefill/extend), which the compute kernel
+    does not persist. Requests at or under that bound exit early (already
+    written in-kernel); rows whose source position precedes the chunk are
+    skipped — the ring already holds them (no shift borrow).
 
     Args:
-        x: Varlen-packed chunk ``[T_total, D]``.
-        weight: Per-channel FIR taps ``[D, W]``.
-        col_pool / page_table / block_tokens / col_offset: See
-            :func:`sconv_decode_paged` (page_table is ``[num_reqs, max_blocks]``).
-        seq_idx: ``[T_total]`` int32 request index per token.
-        cu_seqlens: ``[num_reqs + 1]`` int32 chunk boundaries.
-        prefix_lens: ``[num_reqs]`` int32 cached-prefix length per request.
-        lcm_align: Restore-boundary alignment in tokens (the groups' LCM
-            block size). When > 0, only columns that future restores or the
-            next chunk/decode can tap (last ``W-1`` of each aligned window
-            and of the chunk) are persisted; 0 persists every column.
-        activation / use_residual: As in :func:`sconv_decode_paged`.
+        x: Varlen-packed input ``[T, D]`` that was fed to
+            :func:`inkling_ring_sconv`.
+        conv_cache: Conv state ring ``[num_slots, R, D]`` with
+            ``stride(-1) == 1``; updated in place. May be a channel-sliced
+            view of a wider buffer.
+        cu_seqlens: Cumulative sequence lengths ``[B + 1]``, int32.
+        seq_lens: Per-request lengths THROUGH the chunk ``[B]``, int32.
+        cache_indices: Ring slot per request ``[B]``, int32;
+            ``PAD_SLOT_ID`` (-1) rows are skipped entirely.
+        kernel_width: The conv window ``W`` (taps per channel).
 
     Returns:
-        Conv output ``[T_total, D]``, same dtype as ``x``.
+        None. ``conv_cache`` is modified in place.
     """
-    assert x.ndim == 2 and col_pool.ndim == 3 and col_pool.stride(-1) == 1
-    assert col_pool.shape[1] == block_tokens, (
-        f"col_pool rows-per-slot {col_pool.shape[1]} != block_tokens " f"{block_tokens}"
-    )
-    T, D = x.shape
-    W = weight.shape[1]
-    y = torch.empty_like(x)
-    block_t, block_d, num_warps, num_stages = select_prefill_config(T, D)
-    if half_d:
-        assert col_pool2 is not None and D == 2 * half_d
-        block_d = min(block_d, half_d)
-    grid = (_triton.cdiv(T, block_t), _triton.cdiv(D, block_d))
-    _sconv_prefill_paged_kernel[grid](
+    B = cache_indices.shape[0]
+    D = x.shape[-1]
+    R = conv_cache.shape[1]
+    assert conv_cache.stride(-1) == 1, "conv_cache must be D-contiguous"
+    if B == 0:
+        return
+
+    block_d = min(_triton.next_power_of_2(D), 1024)
+    grid = (B, _triton.cdiv(D, block_d))
+    _inkling_ring_sconv_update_kernel[grid](
         x,
-        weight,
-        col_pool,
-        col_pool2 if col_pool2 is not None else col_pool,
-        page_table,
-        seq_idx,
+        conv_cache,
         cu_seqlens,
-        prefix_lens,
-        y,
+        seq_lens,
+        cache_indices,
         x.stride(0),
         x.stride(1),
-        y.stride(0),
-        y.stride(1),
-        weight.stride(0),
-        weight.stride(1),
-        col_pool.stride(0),
-        col_pool.stride(1),
-        col_pool.stride(2),
-        page_table.stride(0),
-        col_offset,
-        T,
+        conv_cache.stride(0),
+        conv_cache.stride(1),
+        conv_cache.stride(2),
         D,
-        BT=block_tokens,
-        HALF_D=half_d,
-        LCM_ALIGN=lcm_align,
-        USE_SILU=activation in ("silu", "swish"),
-        USE_RESIDUAL=use_residual,
-        BLOCK_T=block_t,
         BLOCK_D=block_d,
-        W=W,
-        W_POW2=_triton.next_power_of_2(W),
-        num_warps=num_warps,
-        num_stages=num_stages,
+        R=R,
+        W_MINUS_1=kernel_width - 1,
+        num_warps=4,
     )
-    return y

@@ -22,6 +22,26 @@
 
 from tokenspeed_kernel.registry import error_fn
 
+# The prefill FMHA kernel accepts PDL, but enabling it across the Q/K/V FP8
+# producers and FMHA consumer can intermittently expose incomplete inputs on
+# Blackwell and make the FMHA output NaN. Keep the producers, consumer, merge,
+# and warmup on non-PDL variants until that cross-kernel dependency is fixed.
+MLA_PREFILL_PDL_SUPPORTED = False
+
+
+def mla_prefill_pdl_enabled(requested: bool) -> bool:
+    """Resolve PDL for the MLA FP8-input and prefill pipeline.
+
+    Args:
+        requested: Whether the runtime and device would otherwise enable PDL.
+
+    Returns:
+        ``True`` only when PDL was requested and the complete producer/consumer
+        pipeline is known to support it safely.
+    """
+    return requested and MLA_PREFILL_PDL_SUPPORTED
+
+
 try:
     from tokenspeed_mla import (
         get_num_sm,
@@ -38,8 +58,10 @@ except ImportError:
     warmup_compile_prefill = error_fn
 
 __all__ = [
+    "MLA_PREFILL_PDL_SUPPORTED",
     "get_num_sm",
     "mla_kv_pack_quantize_fp8",
+    "mla_prefill_pdl_enabled",
     "tokenspeed_mla_decode",
     "tokenspeed_mla_prefill",
     "warmup_compile_prefill",

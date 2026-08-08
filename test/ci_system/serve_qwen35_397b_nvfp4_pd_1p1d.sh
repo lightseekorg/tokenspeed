@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Qwen3.5 PD (prefill-decode) 1P-1D smoke/eval topology on a single node.
+# Workers use the unified TokenSpeed gRPC servicer; the SMG gateway keeps the
+# externally visible OpenAI-compatible HTTP API.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -19,7 +22,6 @@ PROMETHEUS_PORT=${PROMETHEUS_PORT:-18422}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.9}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-131072}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-16}
-KVSTORE_RATIO=${KVSTORE_RATIO:-0.5}
 WORLD_SIZE=${WORLD_SIZE:-2}
 ATTENTION_BACKEND=${ATTENTION_BACKEND:-trtllm}
 DRAFTER_ATTENTION_BACKEND=${DRAFTER_ATTENTION_BACKEND:-$ATTENTION_BACKEND}
@@ -111,6 +113,29 @@ wait_http() {
   echo "[pd-1p1d] $name ready at $url"
 }
 
+wait_serving() {
+  local role=$1
+  local pid=$2
+  local timeout=${3:-2400}
+  local log="$LOG_DIR/${role}.log"
+  local start
+  start=$(date +%s)
+  until grep -q "health status -> SERVING" "$log" 2>/dev/null; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "[pd-1p1d] $role exited before reaching SERVING (log=$log)" >&2
+      tail -n 200 "$log" >&2 || true
+      return 1
+    fi
+    if (( $(date +%s) - start > timeout )); then
+      echo "[pd-1p1d] timed out waiting for $role to reach SERVING (log=$log)" >&2
+      tail -n 200 "$log" >&2 || true
+      return 1
+    fi
+    sleep 5
+  done
+  echo "[pd-1p1d] $role SERVING"
+}
+
 COMMON_ARGS=(
   --model "$MODEL"
   --served-model-name "$SERVED_MODEL_NAME"
@@ -127,11 +152,8 @@ COMMON_ARGS=(
   --quantization "$QUANTIZATION"
   --kv-cache-dtype "$KV_CACHE_DTYPE"
   --disable-kvstore
-  --kvstore-ratio "$KVSTORE_RATIO"
-  --enable-cache-report
   --disaggregation-transfer-backend mooncake
   --disaggregation-layerwise-interval 0
-  --skip-server-warmup
 )
 
 if [[ "$ENABLE_MTP" == "1" ]]; then
@@ -155,14 +177,14 @@ start_worker() {
   local bootstrap_port=$4
   local dist_init_addr=$5
   local log="$LOG_DIR/${role}.log"
-  echo "[pd-1p1d] starting ${role}: gpus=$gpus port=$port bootstrap=$bootstrap_port log=$log"
+  echo "[pd-1p1d] starting ${role}: gpus=$gpus port=$port bootstrap=${bootstrap_port:-none} log=$log"
   (
     export CUDA_VISIBLE_DEVICES="$gpus"
-    exec python3 test/ci_system/pd_http_worker.py \
+    exec python3 -m smg_grpc_servicer.tokenspeed \
       "${COMMON_ARGS[@]}" \
       --port "$port" \
       --dist-init-addr "$dist_init_addr" \
-      --disaggregation-bootstrap-port "$bootstrap_port" \
+      ${bootstrap_port:+--disaggregation-bootstrap-port "$bootstrap_port"} \
       --disaggregation-mode "$role"
   ) >"$log" 2>&1 &
   pids+=("$!")
@@ -171,31 +193,27 @@ start_worker() {
 # Each engine reserves a small control-plane port cluster around its
 # rendezvous address. Keep the P/D clusters disjoint while loading in parallel.
 start_worker prefill "$PREFILL_GPUS" "$PREFILL_PORT" "$PREFILL_BOOTSTRAP_PORT" "$PREFILL_DIST_INIT_ADDR"
-start_worker decode "$DECODE_GPUS" "$DECODE_PORT" "$PREFILL_BOOTSTRAP_PORT" "$DECODE_DIST_INIT_ADDR"
+start_worker decode "$DECODE_GPUS" "$DECODE_PORT" "" "$DECODE_DIST_INIT_ADDR"
 
-wait_http prefill "http://127.0.0.1:${PREFILL_PORT}/v1/models" 2400
-wait_http decode "http://127.0.0.1:${DECODE_PORT}/v1/models" 2400
+wait_serving prefill "${pids[0]}" 2400
+wait_serving decode "${pids[1]}" 2400
 
 echo "[pd-1p1d] starting smg lb log=$LOG_DIR/lb.log"
 python3 -m smg launch \
   --pd-disaggregation \
-  --prefill "http://127.0.0.1:${PREFILL_PORT}" "$PREFILL_BOOTSTRAP_PORT" \
-  --decode "http://127.0.0.1:${DECODE_PORT}" \
+  --prefill "grpc://127.0.0.1:${PREFILL_PORT}" "$PREFILL_BOOTSTRAP_PORT" \
+  --decode "grpc://127.0.0.1:${DECODE_PORT}" \
   --host "$LB_HOST" \
   --port "$LB_PORT" \
   --model-path "$MODEL_PATH" \
   --tokenizer-path "$MODEL_PATH" \
-  --disable-tokenizer-autoload \
-  --policy round_robin \
+  --reasoning-parser passthrough \
   --prefill-policy round_robin \
   --decode-policy round_robin \
   --max-concurrent-requests "$MAX_CONCURRENT_REQUESTS" \
   --queue-size "$QUEUE_SIZE" \
   --queue-timeout-secs 1800 \
   --request-timeout-secs 1800 \
-  --worker-startup-timeout-secs 1800 \
-  --health-check-timeout-secs 60 \
-  --health-check-interval-secs 30 \
   --log-level info \
   --disable-retries \
   --disable-circuit-breaker \

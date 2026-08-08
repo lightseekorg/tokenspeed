@@ -20,8 +20,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import (
     quantize_store_kv_mxfp8,
@@ -29,9 +27,11 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     store_sf_interleaved,
 )
 
-from tokenspeed.runtime.configs import paged_cache_spec
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
-from tokenspeed.runtime.layers.attention.kv_cache.plan import CacheMemoryPlan
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheMemoryPlan
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    PagedCacheGroupSpec,
+)
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.pdl import pdl_enabled
@@ -53,21 +53,19 @@ class MHATokenToKVPool(CachePool):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
-        max_batch_size: int,
-        max_context_len: int,
         page_size: int,
         rank: int,
         *,
         memory_plan: CacheMemoryPlan,
+        paged_cache_group_specs: tuple[PagedCacheGroupSpec, ...] = (),
+        token_capacity: int | None = None,
         layer_types: tuple[str, ...] = (),
-        sliding_window_tokens: int | tuple[int | None, ...] | None = None,
-        max_scheduled_tokens: int = 0,
+        layer_group_ids: tuple[str, ...] = (),
         pd_disaggregation_enabled: bool = False,
-        extra_paged_groups: tuple = (),
-        slot_tokens: int | None = None,
-        group_page_sizes: dict | None = None,
         layer_kv_head_counts: tuple[int, ...] | None = None,
         kv_alloc_head_count: int | None = None,
+        field_layer_offset: int = 0,
+        backing_pool: CachePool | None = None,
     ):
         super().__init__(
             size,
@@ -76,6 +74,9 @@ class MHATokenToKVPool(CachePool):
             page_size,
             rank,
             memory_plan,
+            paged_cache_group_specs=paged_cache_group_specs,
+            token_capacity=token_capacity,
+            backing_pool=backing_pool,
         )
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -85,9 +86,9 @@ class MHATokenToKVPool(CachePool):
         self.head_num = head_num
         self.head_dim = head_dim
         self.layer_num = layer_num
-        # Largest per-group block span, used by byte-reinterpreted views.
-        self._slot_tokens = int(slot_tokens or page_size)
-        self._group_page_sizes = dict(group_page_sizes or {})
+        self._field_layer_offset = int(field_layer_offset)
+        if self._field_layer_offset < 0:
+            raise ValueError("field_layer_offset must be non-negative")
         # Fewer-head layers reinterpret the allocation width as more rows.
         self._layer_kv_head_counts = (
             tuple(int(h) for h in layer_kv_head_counts)
@@ -105,7 +106,17 @@ class MHATokenToKVPool(CachePool):
             int(kv_alloc_head_count) if kv_alloc_head_count else None
         )
         self._layer_types = tuple(layer_types or ())
-        self._sliding_window_tokens = sliding_window_tokens
+        # Physical group id per layer, from the cache recipe
+        # (CachePoolSpec.layer_group_ids) — the single source the scheduler
+        # groups are published from.
+        self.layer_cache_group_ids = tuple(layer_group_ids)
+        if len(self.layer_cache_group_ids) != layer_num:
+            raise ValueError(
+                f"layer_group_ids has {len(self.layer_cache_group_ids)} "
+                f"entries but the pool has {layer_num} layers; the cache "
+                "recipe must supply one group id per layer "
+                "(CachePoolSpec.layer_group_ids)"
+            )
         self._pd_disaggregation_enabled = pd_disaggregation_enabled
         self._create_buffers()
 
@@ -116,63 +127,21 @@ class MHATokenToKVPool(CachePool):
             v_size / GB,
         )
 
-        # Publication rule lives in paged_cache_spec.publish_paged_cache_groups
-        # (module-attr call so tests can patch the scheduler probe at call time).
-        published = self._publish_paged_cache_groups(
-            layer_types=self._layer_types,
-            sliding_window_tokens=sliding_window_tokens,
-            page_size=page_size,
-            page_sizes=self._group_page_sizes or None,
-            extra_groups=extra_paged_groups,
-            max_live_requests=max_batch_size,
-            max_scheduled_tokens=max_scheduled_tokens,
-            max_total_tokens=size,
-            max_context_len=max_context_len,
-        )
-        if published is None:
-            self.paged_cache_group_specs = ()
-            self.paged_cache_group_page_counts = {}
-        else:
-            specs, counts = published
-            self.paged_cache_group_specs = tuple(specs)
-            self.paged_cache_group_page_counts = counts
-
-    def _publish_paged_cache_groups(
-        self,
-        *,
-        layer_types: Sequence[str],
-        sliding_window_tokens: int | Sequence[int | None] | None,
-        page_size: int,
-        page_sizes: Mapping[str, int] | None,
-        extra_groups: Sequence[paged_cache_spec.PagedCacheGroupSpec],
-        max_live_requests: int,
-        max_scheduled_tokens: int,
-        max_total_tokens: int,
-        max_context_len: int,
-    ) -> tuple[list[paged_cache_spec.PagedCacheGroupSpec], dict[str, int]] | None:
-        return paged_cache_spec.publish_paged_cache_groups(
-            layer_types=layer_types,
-            sliding_window_tokens=sliding_window_tokens,
-            page_size=page_size,
-            page_sizes=page_sizes,
-            extra_groups=extra_groups,
-            max_live_requests=max_live_requests,
-            max_scheduled_tokens=max_scheduled_tokens,
-            max_total_tokens=max_total_tokens,
-            max_context_len=max_context_len,
-        )
+    def _field_layer_id(self, layer_id: int) -> int:
+        """Map this compute view's local layer id into the merged plan."""
+        return self._field_layer_offset + layer_id
 
     def _create_kv_buffers(self):
         self.k_buffer = [
-            self.field(f"layer.{layer_id}.k", self.store_dtype).view(
-                -1, self.head_num, self.head_dim
-            )
+            self.field(
+                f"layer.{self._field_layer_id(layer_id)}.k", self.store_dtype
+            ).view(-1, self.head_num, self.head_dim)
             for layer_id in range(self.layer_num)
         ]
         self.v_buffer = [
-            self.field(f"layer.{layer_id}.v", self.store_dtype).view(
-                -1, self.head_num, self.head_dim
-            )
+            self.field(
+                f"layer.{self._field_layer_id(layer_id)}.v", self.store_dtype
+            ).view(-1, self.head_num, self.head_dim)
             for layer_id in range(self.layer_num)
         ]
         aliased = len({buffer.data_ptr() for buffer in self.k_buffer}) < len(
@@ -188,19 +157,6 @@ class MHATokenToKVPool(CachePool):
             "KV layout: one buffer with %d per-layer K/V views",
             self.layer_num,
         )
-
-    def _layer_group_ids(self) -> tuple[str, ...]:
-        if not self._layer_types:
-            return ("full_attention",) * self.layer_num
-        group_ids = tuple(
-            paged_cache_spec.layer_group_ids(
-                layer_types=self._layer_types,
-                sliding_window_tokens=self._sliding_window_tokens,
-            )
-        )
-        if len(group_ids) != self.layer_num:
-            raise ValueError("cache group ids must cover every MHA layer")
-        return group_ids
 
     def _create_buffers(self):
         # Tag as "kv_cache", no CPU backup: KV is discarded on sleep and rebuilt
@@ -372,11 +328,17 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
             self._create_kv_buffers()
             self.k_scale_buffer = [
-                self.field(f"layer.{layer_id}.k_scale", torch.float8_e8m0fnu)
+                self.field(
+                    f"layer.{self._field_layer_id(layer_id)}.k_scale",
+                    torch.float8_e8m0fnu,
+                )
                 for layer_id in range(self.layer_num)
             ]
             self.v_scale_buffer = [
-                self.field(f"layer.{layer_id}.v_scale", torch.float8_e8m0fnu)
+                self.field(
+                    f"layer.{self._field_layer_id(layer_id)}.v_scale",
+                    torch.float8_e8m0fnu,
+                )
                 for layer_id in range(self.layer_num)
             ]
 

@@ -4,12 +4,21 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
-from tokenspeed.runtime.layers.attention.kv_cache.plan import (
-    CacheFieldSpec,
-    solve_cache_layout,
-)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes import (
     configured_token_limit,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4_cache_spec import (
+    DEEPSEEK_V4_COMPRESSED_LOGICAL_BLOCK_SIZE,
+    V4_KERNEL_BLOCK_ROWS,
+    DeepseekV4CacheLayout,
+    build_v4_cache_specs,
+    deepseek_v4_cache_layout_from_config,
+    deepseek_v4_lcm_blocks_needed,
+    deepseek_v4_token_capacity_for_cache_pool,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    CacheFieldSpec,
+    solve_cache_layout,
 )
 
 _LOGICAL_BLOCK_TOKENS = 256
@@ -18,8 +27,51 @@ _MAX_PADDING_FRACTION = 2.0
 
 @dataclass(frozen=True)
 class DeepseekV4PoolOptions:
-    layout: object
-    hf_config: object
+    layout: DeepseekV4CacheLayout
+
+
+def build_deepseek_v4_cache_fields(
+    layout: DeepseekV4CacheLayout,
+    *,
+    sliding_window: int,
+    logical_block_tokens: int = DEEPSEEK_V4_COMPRESSED_LOGICAL_BLOCK_SIZE,
+):
+    """Build DSV4 fields for one scheduler-wide logical page size."""
+    if sliding_window <= 0 or logical_block_tokens % sliding_window:
+        raise ValueError(
+            "DeepSeek V4 sliding_window must divide the logical block size"
+        )
+    if sliding_window % V4_KERNEL_BLOCK_ROWS:
+        raise ValueError(
+            "DeepSeek V4 sliding_window must be divisible by the SWA kernel page"
+        )
+
+    compressed_shapes = {
+        ratio: (layout.swa_block_bytes(layout.storage_block_size(ratio)),)
+        for ratio in set(layout.layer_ratio)
+        if ratio > 1
+    }
+    compressor_state_shapes = {
+        ratio: (
+            layout.compressor_state_block_size(ratio),
+            layout.head_dim * (2 if ratio == 4 else 1) * 2,
+        )
+        for ratio in set(layout.layer_ratio)
+        if ratio > 1
+    }
+    return deepseek_v4_cache_fields(
+        layer_ratios=layout.layer_ratio,
+        logical_block_tokens=logical_block_tokens,
+        swa_shape=(layout.swa_block_bytes(V4_KERNEL_BLOCK_ROWS),),
+        compressed_shapes=compressed_shapes,
+        compressor_state_shapes=compressor_state_shapes,
+        indexer_kv_shape=(V4_KERNEL_BLOCK_ROWS, layout.indexer_row_bytes),
+        indexer_state_shape=(
+            layout.compressor_state_block_size(4),
+            layout.index_head_dim * 2 * 2,
+        ),
+        kv_page_stride_alignment_bytes=layout.swa_token_stride,
+    )
 
 
 def solve_deepseek_v4_memory_layout(fields):
@@ -156,16 +208,8 @@ def prepare_deepseek_v4_cache(
     overlap_schedule_depth: int,
 ):
     """Build target and draft cache specs for DeepSeek V4."""
-    from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
-        build_v4_cache_specs,
-        deepseek_v4_lcm_blocks_needed,
-        deepseek_v4_token_capacity_for_cache_pool,
-    )
-    from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
-        build_deepseek_v4_cache_fields,
-        deepseek_v4_cache_layout_from_config,
-    )
-    from tokenspeed.runtime.layers.attention.kv_cache.setup import (
+    # Deferred: setup.py imports this recipe at module load.
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
         CachePoolSpec,
         CacheSetup,
     )
@@ -193,49 +237,29 @@ def prepare_deepseek_v4_cache(
         )
         return layout, fields
 
-    target_layout, target_fields = layout_and_fields(
-        model_config.hf_config,
-        attn_config,
-        layer_indices=range(model_config.num_attention_layers),
+    # One big model, one solve, one spec: V4's MTP layer already IS a
+    # continuation layer of the target config (compress_ratios carries
+    # num_hidden_layers + num_nextn entries, the draft layer indexed after
+    # the target's) — build the merged fields in one pass over the full
+    # layer range.
+    num_target_layers = model_config.num_attention_layers
+    num_draft_layers = (
+        draft_model_config.num_attention_layers if draft_attn_config is not None else 0
     )
-    # The c4 ring keeps eight rows: four prior rows plus the four verify rows.
-    if 4 in target_layout.layer_ratio and decode_input_tokens > 4:
-        raise ValueError(
-            "DeepSeek V4 c4 LCM cache supports at most four verify tokens; "
-            f"got {decode_input_tokens}"
-        )
-    target_layout_plan = solve_deepseek_v4_memory_layout(target_fields)
-    packing = dict(target_layout_plan.group_packing)
+    merged_source = (
+        draft_model_config.hf_config
+        if draft_attn_config is not None
+        else model_config.hf_config
+    )
+    merged_layout, merged_fields = layout_and_fields(
+        merged_source,
+        attn_config,
+        layer_indices=range(num_target_layers + num_draft_layers),
+    )
+    merged_layout_plan = solve_deepseek_v4_memory_layout(merged_fields)
+    packing = dict(merged_layout_plan.group_packing)
 
-    draft_layout = None
-    draft_fields = None
-    draft_packing = None
-    draft_layout_plan = None
-    draft_parent_bytes = 0
-    if draft_attn_config is not None:
-        draft_layer_start = draft_model_config.num_hidden_layers
-        draft_num_layers = draft_model_config.num_attention_layers
-        draft_layout, draft_fields = layout_and_fields(
-            draft_model_config.hf_config,
-            draft_attn_config,
-            layer_indices=range(
-                draft_layer_start,
-                draft_layer_start + draft_num_layers,
-            ),
-        )
-        draft_group_ids = {field.group_id for field in draft_fields}
-        draft_packing = {group_id: packing[group_id] for group_id in draft_group_ids}
-        draft_layout_plan = solve_cache_layout(
-            draft_fields,
-            logical_block_tokens=_LOGICAL_BLOCK_TOKENS,
-            cache_blocks_per_lcm_block=draft_packing,
-            alignment=256,
-            max_padding_fraction=float("inf"),
-        )
-        draft_parent_bytes = draft_layout_plan.lcm_block_bytes
-
-    parent_bytes = target_layout_plan.lcm_block_bytes + draft_parent_bytes
-    num_lcm_blocks = cache_budget_bytes // parent_bytes - 1
+    num_lcm_blocks = cache_budget_bytes // merged_layout_plan.lcm_block_bytes - 1
     if num_lcm_blocks < 1:
         raise ValueError(
             "DeepSeek V4 cache budget must hold a null parent and one usable parent"
@@ -244,8 +268,9 @@ def prepare_deepseek_v4_cache(
     specs = tuple(
         build_v4_cache_specs(
             model_config.hf_config,
-            layer_ratio=target_layout.layer_ratio,
+            layer_ratio=merged_layout.layer_ratio,
             cache_blocks_per_lcm_block=packing,
+            decode_input_tokens=decode_input_tokens,
         )
     )
     max_packing = max(packing.values())
@@ -275,43 +300,21 @@ def prepare_deepseek_v4_cache(
         **sizing,
     )
 
-    target_plan = target_layout_plan.with_num_lcm_blocks(num_lcm_blocks)
-    target_spec = CachePoolSpec(
-        family="deepseek_v4",
-        memory_plan=target_plan,
-        layer_types=tuple(str(ratio) for ratio in target_layout.layer_ratio),
-        layer_group_ids=tuple(
-            (f"v4.c{ratio}a.compressed_kv" if ratio > 1 else "v4.swa_kv")
-            for ratio in target_layout.layer_ratio
-        ),
-        state_field_dtypes={},
-        token_capacity=token_capacity,
-        pool_options=DeepseekV4PoolOptions(
-            layout=target_layout,
-            hf_config=model_config.hf_config,
-        ),
-    )
-    draft_spec = None
-    if draft_layout_plan is not None:
-        draft_plan = draft_layout_plan.with_num_lcm_blocks(num_lcm_blocks)
-        draft_spec = CachePoolSpec(
+    return CacheSetup(
+        spec=CachePoolSpec(
             family="deepseek_v4",
-            memory_plan=draft_plan,
-            layer_types=tuple(str(ratio) for ratio in draft_layout.layer_ratio),
+            memory_plan=merged_layout_plan.with_num_lcm_blocks(num_lcm_blocks),
+            layer_types=tuple(str(ratio) for ratio in merged_layout.layer_ratio),
             layer_group_ids=tuple(
                 (f"v4.c{ratio}a.compressed_kv" if ratio > 1 else "v4.swa_kv")
-                for ratio in draft_layout.layer_ratio
+                for ratio in merged_layout.layer_ratio
             ),
+            paged_cache_group_specs=specs,
             state_field_dtypes={},
             token_capacity=token_capacity,
-            pool_options=DeepseekV4PoolOptions(
-                layout=draft_layout,
-                hf_config=draft_model_config.hf_config,
-            ),
-        )
-    return CacheSetup(
-        target=target_spec,
-        draft=draft_spec,
+            pool_options=DeepseekV4PoolOptions(layout=merged_layout),
+        ),
+        num_draft_layers=num_draft_layers,
         cache_budget_bytes=cache_budget_bytes,
         fixed_workspace_bytes=0,
     )

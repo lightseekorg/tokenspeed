@@ -25,7 +25,10 @@ _CONFIGS_DIR = (
     / "python"
     / "tokenspeed"
     / "runtime"
-    / "configs"
+    / "layers"
+    / "attention"
+    / "kv_cache"
+    / "recipes"
 )
 
 
@@ -38,11 +41,26 @@ def _load(mod_name: str, file_name: str):
     return mod
 
 
-_generic = _load("tokenspeed.runtime.configs.paged_cache_spec", "paged_cache_spec.py")
+# Shadow the real module only while the v4 spec module binds its imports,
+# then restore: leaving it would fork PagedCacheGroupSpec into two classes
+# and fail the contract's isinstance check in later test files.
+_orig_generic = sys.modules.get(
+    "tokenspeed.runtime.layers.attention.kv_cache.recipes.spec"
+)
+_generic = _load(
+    "tokenspeed.runtime.layers.attention.kv_cache.recipes.spec",
+    "spec.py",
+)
 _v4 = _load(
     "tokenspeed_runtime_configs_deepseek_v4_cache_spec_smoke",
     "deepseek_v4_cache_spec.py",
 )
+if _orig_generic is not None:
+    sys.modules["tokenspeed.runtime.layers.attention.kv_cache.recipes.spec"] = (
+        _orig_generic
+    )
+else:
+    del sys.modules["tokenspeed.runtime.layers.attention.kv_cache.recipes.spec"]
 
 build_v4_cache_specs = _v4.build_v4_cache_specs
 deepseek_v4_lcm_blocks_needed = _v4.deepseek_v4_lcm_blocks_needed
@@ -373,6 +391,26 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
         self.assertEqual(rows["v4.swa_kv"], 64)
         self.assertEqual(rows["v4.c4a.compressor_state"], 4)
         self.assertEqual(rows["v4.c128a.compressor_state"], 8)
+
+    def test_c4_state_window_covers_wide_verify_blocks(self):
+        base = build_v4_cache_specs(
+            SimpleNamespace(sliding_window=128),
+            layer_ratio=(4,),
+        )
+        wide = build_v4_cache_specs(
+            SimpleNamespace(sliding_window=128),
+            layer_ratio=(4,),
+            decode_input_tokens=6,
+        )
+
+        base_windows = {spec.group_id: spec.sliding_window_tokens for spec in base}
+        wide_windows = {spec.group_id: spec.sliding_window_tokens for spec in wide}
+        for group_id in (
+            "v4.c4a.compressor_state",
+            "v4.c4a.indexer_compressor_state",
+        ):
+            self.assertEqual(base_windows[group_id], 8)
+            self.assertEqual(wide_windows[group_id], 10)
 
     def test_lcm_capacity_is_the_inverse_of_parent_demand(self):
         packing = {

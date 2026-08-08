@@ -89,6 +89,30 @@ def _rowcta_gemv_kernel(
     tl.store(out_ptr + n, tl.sum(acc).to(out_ptr.dtype.element_ty))
 
 
+# Registry dispatch: rowcta owns M == 1 while torch handles other shapes.
+_BF16_SIG = frozenset(
+    {
+        format_signature(
+            x=dense_tensor_format(torch.bfloat16),
+            weight=dense_tensor_format(torch.bfloat16),
+        )
+    }
+)
+
+
+@register_kernel(
+    "gemm",
+    "decode_gemv",
+    name="rowcta_gemv_triton",
+    solution="triton",
+    signatures=_BF16_SIG,
+    traits={
+        "m": frozenset({1}),
+        "n_min_128": frozenset({True}),
+        "k_min_128": frozenset({True}),
+    },
+    priority=Priority.SPECIALIZED,
+)
 def rowcta_gemv(
     x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None = None
 ) -> torch.Tensor:
@@ -118,42 +142,6 @@ def rowcta_gemv(
     return out
 
 
-# ---------------------------------------------------------------------------
-# Registry dispatch: the model calls decode_gemv unconditionally; the winner
-# per M comes from the kernel registry (rowcta owns M == 1, cublasLt-backed
-# torch.mm everything else). A future multi-M kernel (e.g. CuteDSL) slots in
-# by registering another spec -- no model change.
-# ---------------------------------------------------------------------------
-
-
-_BF16_SIG = frozenset(
-    {
-        format_signature(
-            x=dense_tensor_format(torch.bfloat16),
-            weight=dense_tensor_format(torch.bfloat16),
-        )
-    }
-)
-
-
-@register_kernel(
-    "gemm",
-    "decode_gemv",
-    name="rowcta_gemv_triton",
-    solution="triton",
-    signatures=_BF16_SIG,
-    # m=1 streaming only; n/k floors bound the validated envelope (N 2304-7168, K 1536-7168; N=7168 with K<=1536 loses to cublasLt).
-    traits={
-        "m": frozenset({1}),
-        "n_min_128": frozenset({True}),
-        "k_min_128": frozenset({True}),
-    },
-    priority=Priority.SPECIALIZED,
-)
-def _rowcta_spec(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    return rowcta_gemv(x, weight)
-
-
 @register_kernel(
     "gemm",
     "decode_gemv",
@@ -163,14 +151,20 @@ def _rowcta_spec(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     traits={},
     priority=Priority.PORTABLE,
 )
-def _torch_spec(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+def _torch_decode_gemv(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if out is not None:
+        return torch.mm(x, weight.t(), out=out)
     return x @ weight.t()
 
 
 @functools.lru_cache(maxsize=64)
 def _select(m: int, n: int, k: int, on_cuda: bool):
     if not on_cuda:
-        return _torch_spec
+        return _torch_decode_gemv
     from tokenspeed_kernel.registry import KernelRegistry
     from tokenspeed_kernel.selection import (
         spec_matches_shape_traits,
@@ -183,17 +177,34 @@ def _select(m: int, n: int, k: int, on_cuda: bool):
             spec, {"N": n, "K": k}
         ):
             return reg.get_impl(spec.name)
-    return _torch_spec
+    return _torch_decode_gemv
 
 
-def decode_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+def decode_gemv(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
     """``x @ weight.T`` with registry-selected decode kernels.
 
     Selection is cached per (M, N, K, device kind); the shape traits keep
     the specialized kernels inside their validated envelope and everything
     else routes to the portable fallback.
     """
-    return _select(x.shape[0], weight.shape[0], weight.shape[1], x.is_cuda)(x, weight)
+    expected = (x.shape[0], weight.shape[0])
+    if out is not None:
+        if (
+            tuple(out.shape) != expected
+            or out.dtype != x.dtype
+            or out.device != x.device
+            or out.stride(-1) != 1
+        ):
+            raise ValueError(f"out must match x and have shape {expected}")
+        if not out.is_contiguous():
+            return _torch_decode_gemv(x, weight, out)
+    return _select(x.shape[0], weight.shape[0], weight.shape[1], x.is_cuda)(
+        x, weight, out
+    )
 
 
 def rowcta_gemv_add3(

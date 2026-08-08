@@ -304,7 +304,7 @@ class BmmInputGenerator(GemmInputGenerator):
         **_: Any,
     ) -> dict[str, Any]:
         batch_size = B if B is not None else batch if batch is not None else 1
-        return self._generate_for_shape(
+        inputs = self._generate_for_shape(
             batch_shape=(batch_size,),
             M=M,
             N=N,
@@ -312,6 +312,9 @@ class BmmInputGenerator(GemmInputGenerator):
             a_layout="BMK",
             b_layout="BNK",
         )
+        if self.traits.get("b_n_stride_one") == frozenset({True}):
+            inputs["B"] = inputs["B"].transpose(1, 2).contiguous().transpose(1, 2)
+        return inputs
 
 
 set_input_generator("gemm", "mm", GemmInputGenerator)

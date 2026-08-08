@@ -182,6 +182,7 @@ def _msa_server_args(**overrides) -> SimpleNamespace:
         kv_cache_dtype="fp8_e4m3",
         kv_cache_quant_method="none",
         speculative_algorithm=None,
+        spec_context_pad=0,
         attention_backend="trtllm",
         drafter_attention_backend=None,
         block_size=128,

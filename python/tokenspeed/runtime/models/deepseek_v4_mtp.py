@@ -60,6 +60,25 @@ logger = logging.getLogger(__name__)
 
 
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
+_DSPARK_ONLY_WEIGHT_SUFFIXES = frozenset(
+    {
+        "main_norm.weight",
+        "main_proj.scale",
+        "main_proj.weight",
+    }
+)
+_MTP_CORE_WEIGHT_SUFFIXES = frozenset(
+    {
+        "e_proj.weight",
+        "enorm.weight",
+        "h_proj.weight",
+        "hc_head_base",
+        "hc_head_fn",
+        "hc_head_scale",
+        "hnorm.weight",
+        "norm.weight",
+    }
+)
 
 
 def _spec_layer_idx(config: PretrainedConfig, weight_name: str) -> int | None:
@@ -85,6 +104,33 @@ def _find_mtp_layer_idx(name: str) -> int:
         except ValueError:
             continue
     return 0
+
+
+def _mtp_checkpoint_weight(
+    config: PretrainedConfig,
+    name: str,
+) -> tuple[int, str] | None:
+    """Return the local MTP layer and suffix for a draft checkpoint weight."""
+
+    if name.startswith("mtp."):
+        parts = name.split(".", 2)
+        if len(parts) != 3:
+            return None
+        try:
+            return int(parts[1]), parts[2]
+        except ValueError:
+            return None
+
+    layer_idx = _spec_layer_idx(config, name)
+    if layer_idx is None:
+        return None
+    prefix = f"model.layers.{layer_idx}."
+    return layer_idx - int(config.num_hidden_layers), name[len(prefix) :]
+
+
+def _is_dspark_checkpoint_weight(config: PretrainedConfig, name: str) -> bool:
+    parsed = _mtp_checkpoint_weight(config, name)
+    return parsed is not None and parsed[1] in _DSPARK_ONLY_WEIGHT_SUFFIXES
 
 
 class DeepseekV4MTPSharedHead(nn.Module):
@@ -459,6 +505,12 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
         Accepts exactly the checkpoint names ``load_weights`` consumes:
         those ``_map_checkpoint_name`` resolves to a draft parameter.
         """
+        if _is_dspark_checkpoint_weight(self.config, name):
+            raise ValueError(
+                "DeepSeek V4 MTP cannot load a DSpark checkpoint. The checkpoint "
+                f"contains DSpark-only weight {name!r}; use the DSpark runtime or "
+                "a checkpoint with MTP e_proj/h_proj/hc_head weights."
+            )
         return self._map_checkpoint_name(name) is not None
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
@@ -476,7 +528,21 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
             ep_size=self.mapping.moe.ep_size,
         )
         loaded_params: set[str] = set()
+        core_weights_by_layer: dict[int, set[str]] = {
+            layer_idx: set() for layer_idx in range(self.model.num_mtp_layers)
+        }
+        dspark_weights: list[str] = []
         for raw_name, loaded_weight in weights:
+            parsed_weight = _mtp_checkpoint_weight(self.config, raw_name)
+            if parsed_weight is not None:
+                local_layer_idx, suffix = parsed_weight
+                if suffix in _DSPARK_ONLY_WEIGHT_SUFFIXES:
+                    dspark_weights.append(raw_name)
+                if (
+                    local_layer_idx in core_weights_by_layer
+                    and suffix in _MTP_CORE_WEIGHT_SUFFIXES
+                ):
+                    core_weights_by_layer[local_layer_idx].add(suffix)
             name = self._map_checkpoint_name(raw_name)
             if name is None:
                 continue
@@ -503,18 +569,24 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
 
-        missing_layers = []
-        for layer_idx in range(
-            self.model.mtp_start_layer_idx,
-            self.model.mtp_start_layer_idx + self.model.num_mtp_layers,
-        ):
-            if not any(f"model.layers.{layer_idx}." in name for name in loaded_params):
-                missing_layers.append(layer_idx)
-        if missing_layers:
+        if dspark_weights:
             raise ValueError(
-                "DeepSeek V4 MTP weights missing for speculative layer(s) "
-                f"{missing_layers}. Use a checkpoint that includes `mtp.*` "
-                "weights or disable NEXTN speculative decoding."
+                "DeepSeek V4 MTP cannot load a DSpark checkpoint. The checkpoint "
+                f"contains DSpark-only weight {dspark_weights[0]!r}; use the "
+                "DSpark runtime or a checkpoint with MTP e_proj/h_proj/hc_head "
+                "weights."
+            )
+        missing_core_weights = {
+            self.model.mtp_start_layer_idx
+            + local_layer_idx: sorted(_MTP_CORE_WEIGHT_SUFFIXES - seen)
+            for local_layer_idx, seen in core_weights_by_layer.items()
+            if seen != _MTP_CORE_WEIGHT_SUFFIXES
+        }
+        if missing_core_weights:
+            raise ValueError(
+                "DeepSeek V4 MTP checkpoint is missing required core weights: "
+                f"{missing_core_weights}. Use a complete MTP checkpoint or "
+                "disable NEXTN speculative decoding."
             )
         self.post_load_weights()
         return loaded_params

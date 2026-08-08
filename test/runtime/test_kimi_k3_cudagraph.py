@@ -135,6 +135,7 @@ def _bare_amd_mla_backend(
     backend.max_num_pages = _MAX_CTX // _PAGE_SIZE
     backend.is_draft = False
     backend.spec_num_tokens = spec_num_tokens
+    backend.draft_block_decode = False
     backend._cache_groups_bound = False
     backend._cache_contract_bound = False
     backend.decode_cuda_graph_metadata = {}

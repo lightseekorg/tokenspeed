@@ -25,7 +25,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
-from tokenspeed.runtime.configs.paged_cache_spec import PagedCacheGroupSpec
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    PagedCacheGroupSpec,
+)
 
 
 def cache_debug_enabled() -> bool:

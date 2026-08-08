@@ -24,6 +24,7 @@ from typing import Any
 import tokenspeed_kernel.ops.moe.deep_gemm  # noqa: F401
 import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.moe.gluon  # noqa: F401
+import tokenspeed_kernel.ops.moe.marlin  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton  # noqa: F401
 import torch
 from tokenspeed_kernel.registry import KernelRegistry
@@ -31,17 +32,27 @@ from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
-    "kimi3_native_moe_available",
+    "native_latent_moe_available",
+    "latent_moe_decode_pipeline_available",
+    "latent_moe_expert_shared",
+    "latent_moe_input_projections",
     "moe_apply",
     "moe_plan",
     "moe_process_weights",
     "moe_sigmoid_bias_topk",
+    "moe_softmax_topk",
 ]
 
-from tokenspeed_kernel.ops.moe.kimi3 import (  # noqa: E402
-    kimi3_native_moe_available,
+from tokenspeed_kernel.ops.moe.latent_decode import (  # noqa: E402
+    latent_moe_decode_pipeline_available,
+    latent_moe_expert_shared,
 )
+from tokenspeed_kernel.ops.moe.latent_input import (  # noqa: E402
+    latent_moe_input_projections,
+)
+from tokenspeed_kernel.ops.moe.native import native_latent_moe_available  # noqa: E402
 from tokenspeed_kernel.ops.moe.sigmoid_topk import moe_sigmoid_bias_topk  # noqa: E402
+from tokenspeed_kernel.ops.moe.softmax_topk import moe_softmax_topk  # noqa: E402
 
 
 def _normalize_weight_dtype(weight_dtype: str) -> str:

@@ -37,12 +37,12 @@ import torch
 import triton
 from tokenspeed_kernel.ops.attention.tokenspeed_mla import (
     get_num_sm,
+    mla_prefill_pdl_enabled,
     tokenspeed_mla_decode,
     tokenspeed_mla_prefill,
     warmup_compile_prefill,
 )
 
-from tokenspeed.runtime.configs.cache_runtime import cache_debug_enabled
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -54,6 +54,9 @@ from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
 )
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+    cache_debug_enabled,
+)
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.pdl import pdl_enabled
@@ -172,7 +175,7 @@ class CuteDSLMLABackend(AttentionBackend):
             q_dtype=torch.float8_e4m3fn,
             d_qk=d_qk,
             d_v=self.v_head_dim,
-            enable_pdl=pdl_enabled(),
+            enable_pdl=mla_prefill_pdl_enabled(pdl_enabled()),
         )
 
         # Validate page_size
@@ -232,8 +235,6 @@ class CuteDSLMLABackend(AttentionBackend):
         self,
         batch_size: int,
         max_blocks: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
         page_table: torch.Tensor,
         block_kv_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -576,9 +577,7 @@ class CuteDSLMLABackend(AttentionBackend):
                 q_len_per_req=q_len_per_req,
             )
         else:
-            block_kv_indices = self._create_block_kv_indices(
-                bs, max_blocks, req_pool_indices, seq_lens, page_table
-            )
+            block_kv_indices = self._create_block_kv_indices(bs, max_blocks, page_table)
             group_out_cache_loc = None
 
         self.forward_decode_metadata = CuteDSLMLADecodeMetadata(
@@ -716,9 +715,10 @@ class CuteDSLMLABackend(AttentionBackend):
         cache_group_ids: tuple[str, ...] = (),
         **kwargs,
     ):
-        # Structural gate: the contract sub-backend (or a wrapper passing cache
-        # group ids) takes the Paged cache capture path; DeepSeek's unmarked
-        # backend, which never sees either signal, keeps the non-cache path.
+        # Structural gate: the target (contract always marked by the registry)
+        # takes the Paged cache capture path; the MTP draft, whose
+        # mark_cache_contract deliberately early-returns, keeps the
+        # batch-ordered non-cache path.
         uses_cache_groups = bool(cache_group_ids) or self._cache_contract_bound
         if uses_cache_groups and self.is_draft:
             raise NotImplementedError(
@@ -821,8 +821,6 @@ class CuteDSLMLABackend(AttentionBackend):
             self._create_block_kv_indices(
                 bs,
                 metadata.block_kv_indices.shape[1],
-                req_pool_indices[:bs],
-                seq_lens[:bs],
                 page_table,
                 metadata.block_kv_indices,
             )
@@ -893,9 +891,6 @@ class CuteDSLMLABackend(AttentionBackend):
             metadata.group_out_cache_loc[
                 real_bs * replay_q_len : bs * replay_q_len
             ].zero_()
-
-    def get_cuda_graph_seq_len_fill_value(self):
-        return 1
 
     # ---- Forward: Decode ----
 
@@ -1037,7 +1032,7 @@ class CuteDSLMLABackend(AttentionBackend):
             return_lse=True,
             cum_seq_lens_q=cum_seq_lens_q,
             max_seq_len_q=max_q_len,
-            enable_pdl=pdl_enabled(),
+            enable_pdl=mla_prefill_pdl_enabled(pdl_enabled()),
             out=out,
         )
 

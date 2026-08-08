@@ -233,7 +233,6 @@ def _per_token_group_quant_8bit_packed_ue8m0(
     y_ptr,
     y_q_ptr,
     y_s_ptr,
-    group_size,
     # Num columns of y
     y_num_columns,
     # Stride from one packed scale column to the next of y_s
@@ -244,38 +243,79 @@ def _per_token_group_quant_8bit_packed_ue8m0(
     bit8_min,
     bit8_max,
     # Meta-parameters
-    BLOCK: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    PACK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     """Quantize per token group and pack UE8M0 scales for DeepGEMM."""
 
-    g_id = tl.program_id(0)
-    groups_per_row = y_num_columns // group_size
-    row = g_id // groups_per_row
-    group_col = g_id % groups_per_row
+    # One CTA owns all four exponent bytes of a packed int32. Besides avoiding
+    # atomic RMW contention, this lets the caller allocate the scale buffer
+    # without a preceding zero-fill kernel.
+    pid = tl.program_id(0)
+    groups_per_row = y_num_columns // GROUP_SIZE
+    packs_per_row = (groups_per_row + PACK - 1) // PACK
+    row = pid // packs_per_row
+    pack_col = pid % packs_per_row
 
-    y_offset = row.to(tl.int64) * y_num_columns + group_col.to(tl.int64) * group_size
-    y_ptr += y_offset
-    y_q_ptr += y_offset
+    BLOCK: tl.constexpr = GROUP_SIZE * PACK
+    col0 = pack_col * BLOCK
+    cols = col0 + tl.arange(0, BLOCK)
+    col_mask = cols < y_num_columns
 
-    scale_pack_col = group_col // 4
-    scale_pack_pos = group_col % 4
-    y_s_ptr += scale_pack_col.to(tl.int64) * y_s_col_stride + row.to(tl.int64)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
 
-    cols = tl.arange(0, BLOCK)
-    mask = cols < group_size
-
-    y = tl.load(y_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-    _absmax = tl.max(tl.abs(y))
+    row_offset = row.to(tl.int64) * y_num_columns
+    y = tl.load(y_ptr + row_offset + cols, mask=col_mask, other=0.0).to(tl.float32)
+    y = tl.reshape(y, (PACK, GROUP_SIZE))
+    _absmax = tl.max(tl.abs(y), axis=1)
     scale_raw = tl.maximum(_absmax / bit8_max, eps)
     exponent = tl.ceil(tl.log2(scale_raw))
     y_s = tl.exp2(exponent)
-    y_q = tl.clamp(y / y_s, bit8_min, bit8_max).to(y_q_ptr.dtype.element_ty)
+    y_q = tl.clamp(y / y_s[:, None], bit8_min, bit8_max).to(y_q_ptr.dtype.element_ty)
 
-    exponent_biased = tl.clamp(exponent + 127.0, 0.0, 255.0).to(tl.uint32)
-    packed_scale = exponent_biased << (scale_pack_pos * 8)
+    tl.store(
+        y_q_ptr + row_offset + cols,
+        tl.reshape(y_q, (BLOCK,)),
+        mask=col_mask,
+    )
 
-    tl.store(y_q_ptr + cols, y_q, mask=mask)
-    tl.atomic_or(y_s_ptr, packed_scale, sem="relaxed")
+    group_ids = pack_col * PACK + tl.arange(0, PACK)
+    group_mask = group_ids < groups_per_row
+    exponent_biased = tl.where(
+        group_mask, tl.clamp(exponent + 127.0, 0.0, 255.0), 0.0
+    ).to(tl.uint32)
+    packed_scale = tl.sum(exponent_biased << (tl.arange(0, PACK) * 8))
+    scale_offset = pack_col.to(tl.int64) * y_s_col_stride + row.to(tl.int64)
+    tl.store(y_s_ptr + scale_offset, packed_scale)
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+def _create_packed_ue8m0_scale(
+    x_shape,
+    device,
+    group_size: int,
+    *,
+    zero: bool,
+):
+    """Allocate the packed column-major UE8M0 scale view."""
+    assert len(x_shape) == 2, "UE8M0 packed scales currently require 2D input"
+    assert group_size == 128, "UE8M0 packed scales currently require group_size=128"
+    *x_batch, x_q_mn, x_q_k = x_shape
+    x_s_mn, x_s_k = x_q_mn, x_q_k // group_size
+    aligned_mn = align(x_s_mn, 4)
+    packed_k = ceil_div(x_s_k, 4)
+    scale_base = torch.empty(
+        (*x_batch, packed_k, aligned_mn),
+        device=device,
+        dtype=torch.int,
+    )
+    if zero:
+        scale_base.zero_()
+    return scale_base.transpose(-1, -2)[..., :x_s_mn, :]
 
 
 def create_per_token_group_quant_fp8_output_scale(
@@ -288,19 +328,12 @@ def create_per_token_group_quant_fp8_output_scale(
 ):
     if scale_ue8m0:
         assert column_major_scales and scale_tma_aligned
-        assert len(x_shape) == 2, "UE8M0 packed scales currently require 2D input"
-        assert group_size == 128, "UE8M0 packed scales currently require group_size=128"
-        *x_batch, x_q_mn, x_q_k = x_shape
-        x_s_mn, x_s_k = x_q_mn, x_q_k // group_size
-        aligned_mn = align(x_s_mn, 4)
-        packed_k = ceil_div(x_s_k, 4)
-        scale_base = torch.empty(
-            (*x_batch, packed_k, aligned_mn),
-            device=device,
-            dtype=torch.int,
+        return _create_packed_ue8m0_scale(
+            x_shape,
+            device,
+            group_size,
+            zero=True,
         )
-        scale_base.zero_()
-        return scale_base.transpose(-1, -2)[..., :x_s_mn, :]
     elif column_major_scales:
         if scale_tma_aligned:
             # aligned to 4 * sizeof(float)
@@ -332,6 +365,7 @@ def _per_token_group_quant_8bit_raw(
     column_major_scales: bool = False,
     scale_tma_aligned: bool = False,
     scale_ue8m0: bool = False,
+    enable_pdl: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Function to perform per-token-group quantization on an input tensor `x`.
 
@@ -343,6 +377,11 @@ def _per_token_group_quant_8bit_raw(
         group_size: The group size used for quantization.
         eps: The minimum to avoid dividing zero.
         dtype: The dype of output tensor.
+        column_major_scales: Store scale groups as columns.
+        scale_tma_aligned: Pad the scale storage for TMA alignment.
+        scale_ue8m0: Encode four power-of-two scale exponents per int32.
+        enable_pdl: Join a Programmatic Dependent Launch chain for the packed
+            UE8M0 kernel.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: The quantized tensor and the scaling factor for quantization.
@@ -368,14 +407,24 @@ def _per_token_group_quant_8bit_raw(
         bit8_min = info.min
 
     x_q = torch.empty_like(x, device=x.device, dtype=dtype)
-    x_s = create_per_token_group_quant_fp8_output_scale(
-        x_shape=x.shape,
-        device=x.device,
-        group_size=group_size,
-        column_major_scales=column_major_scales,
-        scale_tma_aligned=scale_tma_aligned,
-        scale_ue8m0=scale_ue8m0,
-    )
+    if scale_ue8m0:
+        # The packed kernel writes every byte of every valid scale word, so no
+        # initialization kernel is needed in front of the PDL chain.
+        x_s = _create_packed_ue8m0_scale(
+            x.shape,
+            x.device,
+            group_size,
+            zero=False,
+        )
+    else:
+        x_s = create_per_token_group_quant_fp8_output_scale(
+            x_shape=x.shape,
+            device=x.device,
+            group_size=group_size,
+            column_major_scales=column_major_scales,
+            scale_tma_aligned=scale_tma_aligned,
+            scale_ue8m0=False,
+        )
 
     M = x.numel() // group_size
     N = group_size
@@ -387,19 +436,24 @@ def _per_token_group_quant_8bit_raw(
     if scale_ue8m0:
         assert column_major_scales and scale_tma_aligned
         assert group_size == 128
-        _per_token_group_quant_8bit_packed_ue8m0[(M,)](
+        pack = 4
+        groups_per_row = x.shape[1] // group_size
+        packs_per_row = ceil_div(groups_per_row, pack)
+        _per_token_group_quant_8bit_packed_ue8m0[(x.shape[0] * packs_per_row,)](
             x,
             x_q,
             x_s,
-            group_size,
             x.shape[1],
             x_s.stride(-1),
             eps,
             bit8_min=bit8_min,
             bit8_max=bit8_max,
-            BLOCK=BLOCK,
-            num_warps=num_warps,
+            GROUP_SIZE=group_size,
+            PACK=pack,
+            ENABLE_PDL=enable_pdl,
+            num_warps=2,
             num_stages=num_stages,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     elif column_major_scales:
         _per_token_group_quant_8bit_colmajor[(M,)](
@@ -481,7 +535,22 @@ def per_token_group_quant_fp8(
     column_major_scales: bool = False,
     scale_tma_aligned: bool = False,
     scale_ue8m0: bool = False,
+    enable_pdl: bool = False,
 ):
+    """Quantize each contiguous token group to FP8 and return its scale.
+
+    Args:
+        x: Contiguous input tensor.
+        group_size: Number of values represented by one scale.
+        column_major_scales: Return group-major/TMA-friendly scale storage.
+        scale_tma_aligned: Pad scale storage to its backend alignment.
+        scale_ue8m0: Pack four UE8M0 exponent scales in each int32.
+        enable_pdl: Join a Programmatic Dependent Launch chain when using the
+            packed UE8M0 Triton kernel.
+
+    Returns:
+        The quantized FP8 tensor and its block scales.
+    """
     flashinfer_quantized = _flashinfer_sm90_per_token_group_quant_fp8(
         x,
         group_size,
@@ -507,6 +576,7 @@ def per_token_group_quant_fp8(
         column_major_scales=column_major_scales,
         scale_tma_aligned=scale_tma_aligned,
         scale_ue8m0=scale_ue8m0,
+        enable_pdl=enable_pdl,
     )
 
 

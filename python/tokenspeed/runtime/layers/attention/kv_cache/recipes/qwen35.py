@@ -1,10 +1,41 @@
 """Qwen3.5 cache field recipe."""
 
-from tokenspeed.runtime.layers.attention.kv_cache.plan import CacheFieldSpec
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
     build_hybrid_cache_setup,
     draft_cache_fields,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    CacheFieldSpec,
+    merge_continuation_layers,
+)
+
+
+def qwen_gdn_max_padding_fraction(*, layer_types, num_draft_layers: int) -> float:
+    """Allow the structural K/V planes added by a Qwen MTP draft.
+
+    Args:
+        layer_types: Target-only attention labels, before merging draft layers.
+        num_draft_layers: Number of full-attention MTP layers being merged.
+
+    Returns:
+        The Qwen-specific upper bound on unified-arena padding.
+
+    Raises:
+        ValueError: If the target has no full-attention layers.
+    """
+    num_full_attention_layers = sum(
+        layer_type == "full_attention" for layer_type in layer_types
+    )
+    if num_full_attention_layers == 0:
+        raise ValueError("Qwen3.5 cache requires at least one full-attention layer")
+
+    # If target-only recurrent padding is p <= 1, each mirrored draft layer's
+    # K/V planes increase it by (1 + p) / num_full_attention_layers.  Bound
+    # that increase by 2 without relaxing the original limit when no draft is
+    # present.  The derivation margin is intentionally the only headroom: if
+    # future cache geometry trips the guard, re-derive this bound rather than
+    # adding an epsilon or silently accepting an unbounded binding hole.
+    return 1.0 + 2.0 * num_draft_layers / num_full_attention_layers
 
 
 def qwen_gdn_cache_fields(
@@ -87,9 +118,10 @@ def prepare_qwen35_cache(
     overlap_schedule_depth: int,
 ):
     """Build target and optional draft cache specs for Qwen3.5."""
-    from tokenspeed.runtime.configs.paged_cache_spec import (
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
         FULL_ATTENTION,
         LINEAR_ATTENTION,
+        build_paged_cache_group_specs,
         split_recurrent_state_groups,
     )
 
@@ -160,20 +192,44 @@ def prepare_qwen35_cache(
             if field.field_id.endswith((".conv", ".ssm"))
         )
 
-    return build_hybrid_cache_setup(
-        family="qwen_gdn",
-        server_args=server_args,
+    (
+        merged_fields,
+        merged_layer_types,
+        merged_group_ids,
+        _,
+        num_draft_layers,
+    ) = merge_continuation_layers(
         fields=fields,
         layer_types=layer_types,
         group_ids=group_ids,
-        state_dtypes=state_dtypes,
-        layer_kv_head_counts=None,
         draft_fields=draft_fields,
         draft_layer_types=draft_layer_types,
         draft_group_ids=draft_group_ids,
-        draft_layer_kv_head_counts=None,
+    )
+    # ONE spec derivation over the merged layers: shared groups validate
+    # for consistent policy instead of the draft's being silently dropped.
+    group_specs = build_paged_cache_group_specs(
+        layer_types=merged_layer_types,
+        group_ids=merged_group_ids,
+        sliding_window_tokens=None,
+        page_size=logical_block_tokens,
+        pd_disaggregation_enabled=attn_config.pd_disaggregation_enabled,
+    )
+    return build_hybrid_cache_setup(
+        family="qwen_gdn",
+        server_args=server_args,
+        fields=merged_fields,
+        layer_types=merged_layer_types,
+        group_ids=merged_group_ids,
+        group_specs=group_specs,
+        state_dtypes=state_dtypes,
+        layer_kv_head_counts=None,
+        num_draft_layers=num_draft_layers,
         cache_budget_bytes=cache_budget_bytes,
         fixed_workspace_bytes=fixed_workspace_bytes,
         logical_block_tokens=logical_block_tokens,
-        max_padding_fraction=1.0,
+        max_padding_fraction=qwen_gdn_max_padding_fraction(
+            layer_types=layer_types,
+            num_draft_layers=num_draft_layers,
+        ),
     )

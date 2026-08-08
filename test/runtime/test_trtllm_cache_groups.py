@@ -45,8 +45,10 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
         device="cpu",
         groups=None,
     ):
-        from tokenspeed.runtime.configs.paged_cache_spec import PagedCacheGroupSpec
         from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+            PagedCacheGroupSpec,
+        )
 
         # Bypass __init__: the paths under test read only these attributes.
         # Capture/replay tests pass device="cuda" and declare their groups —
@@ -175,8 +177,6 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
         out = self.torch.empty((1, 4), dtype=self.torch.int32)
 
         page_table = b._build_page_table(
-            self.torch.tensor([1], dtype=self.torch.int32),
-            self.torch.tensor([256], dtype=self.torch.int32),
             1,
             page_table,
             out,

@@ -46,17 +46,30 @@ def kimi_tp8_plan(*, num_lcm_blocks: int = 7):
     return layout.with_num_lcm_blocks(num_lcm_blocks)
 
 
+def _kimi_group_specs(group_ids, layer_types, plan):
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+        build_paged_cache_group_specs,
+    )
+
+    return build_paged_cache_group_specs(
+        layer_types=layer_types,
+        group_ids=group_ids,
+        sliding_window_tokens=None,
+        page_size=plan.logical_block_tokens,
+    )
+
+
 def make_kimi_pool(device, usable_pages: int = 6, *, with_mla_dims: bool = True):
     from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
-    from tokenspeed.runtime.configs.paged_cache_spec import (
-        FULL_ATTENTION,
-        LINEAR_ATTENTION,
-    )
     from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
         HybridKDATokenToKVPool,
     )
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
         kimi_k3_layer_group_ids,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+        FULL_ATTENTION,
+        LINEAR_ATTENTION,
     )
 
     del with_mla_dims
@@ -77,13 +90,11 @@ def make_kimi_pool(device, usable_pages: int = 6, *, with_mla_dims: bool = True)
         layer_num=text_config.num_hidden_layers,
         device=device,
         enable_memory_saver=False,
-        max_batch_size=1,
-        max_context_len=131_072,
         page_size=plan.logical_block_tokens,
         rank=0,
         layer_types=layer_types,
         layer_group_ids=group_ids,
-        max_scheduled_tokens=8192,
+        paged_cache_group_specs=_kimi_group_specs(group_ids, layer_types, plan),
         state_field_dtypes={
             field_id: dtype
             for layer_id, layer_type in enumerate(layer_types)

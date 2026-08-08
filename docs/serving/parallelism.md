@@ -97,7 +97,10 @@ host sync cannot be captured. Decode graphs are unaffected.
 
 For block-scale FP8 decode on NVIDIA, the low-latency path keeps routing
 metadata in DeepEP's required contiguous int64/float32 formats across both
-collective legs. Its fused SwiGLU quantizer writes packed UE8M0 scales directly
+collective legs. Ordinary softmax routing selects experts and normalizes their
+weights in one Triton launch before dispatch, instead of materializing the
+full softmax and launching separate ATen top-k, reduction, and division kernels.
+Its fused SwiGLU quantizer writes packed UE8M0 scales directly
 in DeepGEMM's MN-major TMA layout, so padded rows need no zero-fill and the
 second expert GEMM needs no separate activation-scale transpose/pack pass.
 For sparse decode it launches a bounded number of row splits per expert and

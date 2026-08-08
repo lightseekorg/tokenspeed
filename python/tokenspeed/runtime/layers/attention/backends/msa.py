@@ -34,7 +34,6 @@ from tokenspeed_kernel import (
 )
 from tokenspeed_kernel.ops.kvcache.triton import (
     fused_fp8_set_kv_buffer,
-    gather_page_table_with_padding,
 )
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
@@ -91,7 +90,7 @@ class MSAExtendMetadata:
     max_extend_seq_len: int
     max_extend_prefix_len: int = 0
     # Per-group page tables (group_id -> [num_reqs, max_pages]); None on
-    # the single-table path. drop the single page_table.
+    # the cache path (DFLASH block-decode drafts still use it).
     page_tables: dict[str, torch.Tensor] | None = None
     # Per-group KV write locations (group_id -> [num_tokens] int32),
     # built with page_tables — same groups, same lifecycle.
@@ -116,7 +115,7 @@ class MSAAttnBackend(CacheGroupsMixin, AttentionBackend):
     """MiniMax sparse attention backend that routes through tokenspeed_kernel attention APIs."""
 
     # Unconditional: safety comes from the publication rule
-    # (paged_cache_spec.publish_paged_cache_groups) plus the replay
+    # (kv_cache.recipes.publish) plus the replay
     # stale-table guard. drop the flag.
     uses_cache_groups: bool = True
 
@@ -151,7 +150,7 @@ class MSAAttnBackend(CacheGroupsMixin, AttentionBackend):
 
         # DFLASH draft: expand decode metadata to spec_num_tokens rows/request
         # (whole block in one decode forward), with uniform non-causal seq_lens.
-        self.draft_block_decode = bool(getattr(config, "draft_block_decode", False))
+        self.draft_block_decode = bool(config.draft_block_decode)
 
         # Forward metadata is initialized in the runner per forward call
         self.forward_decode_metadata: MSADecodeMetadata | None = None
@@ -209,7 +208,7 @@ class MSAAttnBackend(CacheGroupsMixin, AttentionBackend):
                 self.draft_block_decode and self.spec_num_tokens > 1
             ), "paged cache groups are unsupported with DFLASH block decode"
             # The cache path routes every read/write through the per-group
-            # tables; the single-table single table would be dead work.
+            # tables; a shared single page_table would be dead work.
             page_table = None
             if forward_mode.is_extend_or_mixed():
                 assert extend_prefix_lens_cpu is not None
@@ -407,7 +406,7 @@ class MSAAttnBackend(CacheGroupsMixin, AttentionBackend):
             score_out.fill_(-float("inf"))
             metadata = MSADecodeMetadata(
                 # Cache-group captures route reads through the per-group tables and
-                # replay never fills the single-table single table, so mirror the
+                # replay never fills a shared single page_table, so mirror the
                 # eager cache path: page_table=None instead of a slice of the
                 # never-filled zero buffer.
                 page_table=(
@@ -443,18 +442,13 @@ class MSAAttnBackend(CacheGroupsMixin, AttentionBackend):
         # Fail loudly instead of replaying over stale/zero page tables.
         self._replay_stale_guard(bs, block_tables)
 
-        # Cache-group captures read only the per-group buffers; the single-table single
-        # table (cuda_graph_page_table) would be dead work there.
+        # Every pool publishes at least one history group now, so the
+        # per-group capture buffers always exist; the pre-LCM single-table
+        # gather has no remaining producer.
         if not self.cuda_graph_page_tables:
-            gather_page_table_with_padding(
-                page_table=page_table,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                out=self.cuda_graph_page_table,
-                bs=bs,
-                max_num_pages=self.max_num_pages,
-                page_size=self.page_size,
-                dummy_slot=0,
+            raise RuntimeError(
+                "MSA replay without per-group capture buffers: the pool "
+                "published no cache groups, which the LCM contract forbids"
             )
         if self.spec_num_tokens > 1 and not self.is_draft:
             self.cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs])

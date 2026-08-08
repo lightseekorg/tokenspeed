@@ -38,7 +38,10 @@ from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.comm_backend.base import CommBackend, Group
 
-_MAX_ONESHOT_BYTES = 2 * 1024 * 1024
+# Public: dispatch layers (AutoBackend, comm_ops) key size-based routing on
+# the one-shot admission window; tensors past it always take an NCCL path.
+MAX_ONESHOT_BYTES = 2 * 1024 * 1024
+_MAX_ONESHOT_BYTES = MAX_ONESHOT_BYTES
 
 
 class TrtllmAllReduceBackend(CommBackend):

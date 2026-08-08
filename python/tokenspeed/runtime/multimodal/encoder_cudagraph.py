@@ -35,7 +35,6 @@ from typing import Any, Protocol
 
 import torch
 
-from tokenspeed.runtime.distributed.comm_backend.registry import get_global_backend
 from tokenspeed.runtime.utils import logger
 
 
@@ -412,15 +411,14 @@ class EncoderCudaGraphWrapper:
             output = self.adapter.forward(input_buffers, metadata)
             output_buffer = torch.empty_like(output)
 
-        # Encoder TP > 1: capture must record per-layer all-reduce under the
-        # custom-AR capture context.
-        if self.capture_tp_size > 1 and self.capture_tp_group is not None:
-            ar_ctx: Any = get_global_backend().custom_ar.capture(self.capture_tp_group)
-        else:
-            ar_ctx = contextlib.nullcontext()
+        # Encoder TP > 1 used to capture under the custom-AR context. That
+        # backend never armed (its resources were gated on a flag nothing
+        # set), so this was already a nullcontext; the remaining AR paths
+        # (trtllm one-shot, NCCL) need no capture-time context.
+        ar_ctx: Any = contextlib.nullcontext()
 
         # No pool= argument: each budget graph gets its own private pool. A
-        # shared pool collides custom-AR IPC registrations across budgets.
+        # shared pool collided IPC registrations across budgets.
         graph = torch.cuda.CUDAGraph()
         with torch.inference_mode(), ar_ctx, torch.cuda.graph(graph):
             output = self.adapter.forward(input_buffers, metadata)

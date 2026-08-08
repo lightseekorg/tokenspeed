@@ -18,17 +18,4 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Kimi-K3 MoE kernel capabilities."""
-
-from __future__ import annotations
-
-from tokenspeed_kernel.platform import current_platform
-
-
-def kimi3_native_moe_available() -> bool:
-    """Return whether the current kernel backend provides native K3 latent MoE."""
-
-    return current_platform().is_amd
-
-
-__all__ = ["kimi3_native_moe_available"]
+from tokenspeed_kernel.ops.moe.marlin import mxfp4  # noqa: F401
