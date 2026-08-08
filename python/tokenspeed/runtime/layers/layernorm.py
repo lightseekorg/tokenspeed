@@ -168,32 +168,38 @@ class RMSNorm(torch.nn.Module):
         Forward method with allreduce fusion, prioritizing flashinfer fused operations
         """
 
-        if residual is not None:
+        needs_allreduce = residual is not None and len(group) > 1
+        if needs_allreduce and global_server_args_dict.get(
+            "enable_allreduce_fusion", False
+        ):
+            if _is_amd:
+                allreduce_residual_rmsnorm = triton_allreduce_residual_rmsnorm
+            else:
+                if not current_platform().is_nvidia:
+                    raise RuntimeError("Allreduce RMSNorm requires NVIDIA or AMD.")
+                allreduce_residual_rmsnorm = trtllm_allreduce_residual_rmsnorm
+            fused_result = allreduce_residual_rmsnorm(
+                input_tensor=x,
+                residual=residual,
+                weight=self.weight,
+                rank=rank,
+                group=_get_process_group(group),
+                eps=self.variance_epsilon,
+                max_token_num=global_server_args_dict["comm_fusion_max_num_tokens"],
+                block_quant_fp8=fuse_block_quant_fp8,
+                residual_reduce_scattered=residual_reduce_scattered,
+                max_sm_to_use=max_sm_to_use,
+                trigger_completion_at_end=trigger_completion_at_end,
+                has_partial_norm_out=has_partial_norm_out,
+                launch_with_pdl=pdl_enabled(),
+            )
+            if fused_result[0] is not None:
+                return fused_result
 
-            if len(group) > 1:
-                if _is_amd:
-                    allreduce_residual_rmsnorm = triton_allreduce_residual_rmsnorm
-                else:
-                    if not current_platform().is_nvidia:
-                        raise RuntimeError("Allreduce RMSNorm requires NVIDIA or AMD.")
-                    allreduce_residual_rmsnorm = trtllm_allreduce_residual_rmsnorm
-                fused_result = allreduce_residual_rmsnorm(
-                    input_tensor=x,
-                    residual=residual,
-                    weight=self.weight,
-                    rank=rank,
-                    group=_get_process_group(group),
-                    eps=self.variance_epsilon,
-                    max_token_num=global_server_args_dict["comm_fusion_max_num_tokens"],
-                    block_quant_fp8=fuse_block_quant_fp8,
-                    residual_reduce_scattered=residual_reduce_scattered,
-                    max_sm_to_use=max_sm_to_use,
-                    trigger_completion_at_end=trigger_completion_at_end,
-                    has_partial_norm_out=has_partial_norm_out,
-                    launch_with_pdl=pdl_enabled(),
-                )
-                if fused_result[0] is not None:
-                    return fused_result
+        if needs_allreduce:
+            from tokenspeed.runtime.distributed.comm_ops import all_reduce
+
+            x = all_reduce(x, group)
 
         result = self.forward(x, residual)
         if isinstance(result, tuple):
@@ -323,32 +329,38 @@ class GemmaRMSNorm(torch.nn.Module):
         fused kernel computes x * (1 + weight) matching GemmaRMSNorm semantics.
         """
 
-        if residual is not None:
+        needs_allreduce = residual is not None and len(group) > 1
+        if needs_allreduce and global_server_args_dict.get(
+            "enable_allreduce_fusion", False
+        ):
+            if _is_amd:
+                allreduce_residual_rmsnorm = triton_allreduce_residual_rmsnorm
+            else:
+                if not current_platform().is_nvidia:
+                    raise RuntimeError("Allreduce RMSNorm requires NVIDIA or AMD.")
+                allreduce_residual_rmsnorm = trtllm_allreduce_residual_rmsnorm
+            fused_result = allreduce_residual_rmsnorm(
+                input_tensor=x,
+                residual=residual,
+                weight=self.gemma_weight,
+                rank=rank,
+                group=_get_process_group(group),
+                eps=self.variance_epsilon,
+                max_token_num=global_server_args_dict["comm_fusion_max_num_tokens"],
+                block_quant_fp8=fuse_block_quant_fp8,
+                residual_reduce_scattered=residual_reduce_scattered,
+                max_sm_to_use=max_sm_to_use,
+                trigger_completion_at_end=trigger_completion_at_end,
+                has_partial_norm_out=has_partial_norm_out,
+                launch_with_pdl=pdl_enabled(),
+            )
+            if fused_result[0] is not None:
+                return fused_result
 
-            if len(group) > 1:
-                if _is_amd:
-                    allreduce_residual_rmsnorm = triton_allreduce_residual_rmsnorm
-                else:
-                    if not current_platform().is_nvidia:
-                        raise RuntimeError("Allreduce RMSNorm requires NVIDIA or AMD.")
-                    allreduce_residual_rmsnorm = trtllm_allreduce_residual_rmsnorm
-                fused_result = allreduce_residual_rmsnorm(
-                    input_tensor=x,
-                    residual=residual,
-                    weight=self.gemma_weight,
-                    rank=rank,
-                    group=_get_process_group(group),
-                    eps=self.variance_epsilon,
-                    max_token_num=global_server_args_dict["comm_fusion_max_num_tokens"],
-                    block_quant_fp8=fuse_block_quant_fp8,
-                    residual_reduce_scattered=residual_reduce_scattered,
-                    max_sm_to_use=max_sm_to_use,
-                    trigger_completion_at_end=trigger_completion_at_end,
-                    has_partial_norm_out=has_partial_norm_out,
-                    launch_with_pdl=pdl_enabled(),
-                )
-                if fused_result[0] is not None:
-                    return fused_result
+        if needs_allreduce:
+            from tokenspeed.runtime.distributed.comm_ops import all_reduce
+
+            x = all_reduce(x, group)
 
         result = self.forward(x, residual)
         if isinstance(result, tuple):

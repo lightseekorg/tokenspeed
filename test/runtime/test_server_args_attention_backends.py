@@ -19,6 +19,7 @@ import contextlib
 import io
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.layers.attention import registry
@@ -98,6 +99,36 @@ class TestAttentionBackendChoices(unittest.TestCase):
     def test_prepare_server_args_accepts_model_path_alias(self):
         args = prepare_server_args(["--model-path", "x"])
         self.assertEqual(args.model, "x")
+
+    def test_allreduce_fusion_has_explicit_disable_control(self):
+        parser = self._build_parser()
+        disabled = parser.parse_args(["--model", "x", "--disable-allreduce-fusion"])
+        enabled = parser.parse_args(["--model", "x", "--enable-allreduce-fusion"])
+        self.assertTrue(disabled.disable_allreduce_fusion)
+        self.assertFalse(disabled.enable_allreduce_fusion)
+        self.assertTrue(enabled.enable_allreduce_fusion)
+        self.assertFalse(enabled.disable_allreduce_fusion)
+
+    def test_triton_shmem_declines_attention_dp_before_model_init(self):
+        args = ServerArgs(model="x", enable_allreduce_fusion=True)
+        args.mapping = SimpleNamespace(
+            nnodes=1,
+            has_attn_tp=True,
+            has_attn_dp=True,
+            attn=SimpleNamespace(tp_size=4),
+            dense=SimpleNamespace(tp_size=4),
+        )
+        with mock.patch.dict(
+            os.environ, {"TS_ARNORM_BACKEND": "triton_shmem"}, clear=False
+        ):
+            args.resolve_communication()
+        self.assertFalse(args.enable_allreduce_fusion)
+        self.assertTrue(args.disable_allreduce_fusion)
+
+    def test_invalid_arnorm_backend_fails_during_arg_resolution(self):
+        with mock.patch.dict(os.environ, {"TS_ARNORM_BACKEND": "typo"}, clear=False):
+            with self.assertRaisesRegex(ValueError, "TS_ARNORM_BACKEND must be"):
+                prepare_server_args(["--model", "x"])
 
     def test_defaults_to_mha_for_mha(self):
         self.assertEqual(registry._get_default_backend_name(AttentionArch.MHA), "mha")
