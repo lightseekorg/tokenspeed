@@ -1,6 +1,6 @@
 #ifndef _data_types_cuh
 #define _data_types_cuh
-#include <sgl_kernel/utils.cuh>
+#include <utils.cuh>
 
 #include "marlin.cuh"
 

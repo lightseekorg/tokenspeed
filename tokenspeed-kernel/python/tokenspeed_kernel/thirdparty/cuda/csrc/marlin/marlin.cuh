@@ -1,6 +1,6 @@
 #pragma once
 
-#include <sgl_kernel/utils.cuh>
+#include <utils.cuh>
 
 #include <iostream>
 
