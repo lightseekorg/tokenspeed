@@ -26,6 +26,7 @@ WORLD_SIZE=${WORLD_SIZE:-2}
 ATTENTION_BACKEND=${ATTENTION_BACKEND:-trtllm}
 DRAFTER_ATTENTION_BACKEND=${DRAFTER_ATTENTION_BACKEND:-$ATTENTION_BACKEND}
 MOE_BACKEND=${MOE_BACKEND:-flashinfer_trtllm}
+DRAFT_MOE_BACKEND=${DRAFT_MOE_BACKEND:-flashinfer_cutlass}
 QUANTIZATION=${QUANTIZATION:-nvfp4}
 KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-fp8_e4m3}
 ENABLE_MTP=${ENABLE_MTP:-0}
@@ -164,6 +165,7 @@ if [[ "$ENABLE_MTP" == "1" ]]; then
     --speculative-eagle-topk 1
     --speculative-num-draft-tokens 4
     --drafter-attention-backend "$DRAFTER_ATTENTION_BACKEND"
+    --draft-moe-backend "$DRAFT_MOE_BACKEND"
   )
 elif [[ "$ENABLE_MTP" != "0" ]]; then
   echo "ENABLE_MTP must be 0 or 1" >&2

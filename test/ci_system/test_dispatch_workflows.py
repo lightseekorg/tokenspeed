@@ -50,13 +50,35 @@ def test_slurm_dispatch_lists_every_supported_trigger():
     assert set(choices) == {"all", "per-commit", "manual", "nightly", "debug"}
 
 
-def test_qwen35_agentic_allows_declared_80k_context():
+def test_qwen35_agentic_uses_stable_gb200_settings():
     task = load_yaml(
         REPO_ROOT / "test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-agentic.yaml"
     )
 
     assert "--max-model-len 80000" in task["server"]["command"]
+    assert "--draft-moe-backend flashinfer_cutlass" in task["server"]["command"]
     assert task["env"]["TOKENSPEED_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] == "1"
+
+
+def test_unmitigated_trtllm_mtp_draft_moe_configs_are_tracked():
+    intentionally_deferred = {
+        "test/ci/eval/glm-5.2-nvfp4-mtp-evalscope-aime26.yaml",
+        "test/ci/eval/inkling-nvfp4-mtp-evalscope-gsm8k.yaml",
+        "test/ci/eval/qwen3.5-122b-a10b-nvfp4-evalscope-ocr-bench.yaml",
+        "test/ci/eval/qwen3.5-397b-a17b-nvfp4-evalscope-aime25.yaml",
+    }
+    unmitigated = set()
+
+    for path in (REPO_ROOT / "test" / "ci").rglob("*.yaml"):
+        command = load_yaml(path).get("server", {}).get("command", "")
+        if (
+            "--speculative-algorithm MTP" in command
+            and "--moe-backend flashinfer_trtllm" in command
+            and "--draft-moe-backend" not in command
+        ):
+            unmitigated.add(path.relative_to(REPO_ROOT).as_posix())
+
+    assert unmitigated == intentionally_deferred
 
 
 def test_nvidia_arm_model_tests_allow_runner_wait_time():

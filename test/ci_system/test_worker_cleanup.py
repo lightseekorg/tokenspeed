@@ -35,3 +35,14 @@ def test_worker_launchers_use_bounded_cleanup():
         assert 'source "$SCRIPT_DIR/worker_cleanup.sh"' in script
         assert "stop_worker_pids" in script
         subprocess.run(["bash", "-n", ci_dir / name], check=True)
+
+
+def test_qwen35_worker_launchers_use_cutlass_for_mtp_draft_moe():
+    ci_dir = Path(__file__).parent
+    for name in (
+        "serve_qwen35_122b_nvfp4_epd_1e1p2d.sh",
+        "serve_qwen35_397b_nvfp4_pd_1p1d.sh",
+    ):
+        script = (ci_dir / name).read_text()
+        assert "DRAFT_MOE_BACKEND=${DRAFT_MOE_BACKEND:-flashinfer_cutlass}" in script
+        assert '--draft-moe-backend "$DRAFT_MOE_BACKEND"' in script

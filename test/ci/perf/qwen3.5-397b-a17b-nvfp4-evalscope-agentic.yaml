@@ -27,6 +27,7 @@ server:
     --trust-remote-code
     --attention-backend trtllm
     --moe-backend flashinfer_trtllm
+    --draft-moe-backend flashinfer_cutlass
     --quantization nvfp4
     --kv-cache-dtype fp8
     --speculative-algorithm MTP
@@ -96,6 +97,8 @@ perf_threshold: 0.9
 perf_reference:
   1:  [530, 11600]
   2:  [420, 17800]
-  4:  [270, 24400]
-  8:  [160, 31600]
+  # c4/c8 throughput measured after the CUTLASS draft-MoE switch in run 31254006915.
+  4:  [270, 21800]
+  8:  [160, 27800]
+  # Raise the older c16 baseline after a second sample confirms the measured ~35k.
   16: [78, 29000]

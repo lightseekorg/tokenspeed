@@ -25,6 +25,7 @@ server:
     --trust-remote-code
     --attention-backend trtllm
     --moe-backend flashinfer_trtllm
+    --draft-moe-backend flashinfer_cutlass
     --kv-cache-dtype fp8_e4m3
     --comm-fusion-max-num-tokens 4096
     --speculative-algorithm MTP

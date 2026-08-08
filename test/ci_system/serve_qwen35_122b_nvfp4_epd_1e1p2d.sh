@@ -47,6 +47,7 @@ KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-fp8_e4m3}
 ATTENTION_BACKEND=${ATTENTION_BACKEND:-trtllm}
 DRAFTER_ATTENTION_BACKEND=${DRAFTER_ATTENTION_BACKEND:-$ATTENTION_BACKEND}
 MOE_BACKEND=${MOE_BACKEND:-flashinfer_trtllm}
+DRAFT_MOE_BACKEND=${DRAFT_MOE_BACKEND:-flashinfer_cutlass}
 ENABLE_MTP=${ENABLE_MTP:-0}
 ENCODE_ROUTING_POLICY=${ENCODE_ROUTING_POLICY:-consistent_hashing}
 LOG_DIR=${EPD_CI_LOG_DIR:-.ci-artifacts/epd-qwen35-122b-1e1p2d}
@@ -173,6 +174,7 @@ if [[ "$ENABLE_MTP" == "1" ]]; then
     --speculative-eagle-topk 1
     --speculative-num-draft-tokens 4
     --drafter-attention-backend "$DRAFTER_ATTENTION_BACKEND"
+    --draft-moe-backend "$DRAFT_MOE_BACKEND"
   )
 elif [[ "$ENABLE_MTP" != "0" ]]; then
   echo "ENABLE_MTP must be 0 or 1" >&2
