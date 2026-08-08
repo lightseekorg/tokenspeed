@@ -43,7 +43,15 @@ echo "=== Step 2: Upgrade pip/setuptools/wheel ==="
 pip install --upgrade pip "setuptools<82" wheel
 
 echo "=== Step 3: Check PyTorch for ROCm ==="
-python3 -c "import torch; print(f'PyTorch version: {torch.__version__}, ROCm support: {torch.version.hip}')"
+python3 -m pip show torch >/dev/null || {
+    echo "torch is not installed" >&2
+    exit 1
+}
+python3 -m pip show torchvision >/dev/null || {
+    echo "torchvision is not installed" >&2
+    exit 1
+}
+python3 -c "import torch, torchvision; assert torch.version.hip, 'PyTorch does not include HIP support'; print(f'torch={torch.__version__} hip={torch.version.hip} torchvision={torchvision.__version__}')"
 
 echo "=== Step 4: Install tokenspeed-kernel packages ==="
 
