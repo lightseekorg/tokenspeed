@@ -494,6 +494,50 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         self.assertEqual(calls, [args])
 
+    def test_deepseek_v4_moe_leaves_routing_mode_to_kernel_selection(self):
+        captured = {}
+
+        class FakeGate(torch.nn.Module):
+            def __init__(self, *_args, **_kwargs):
+                super().__init__()
+                self.e_score_correction_bias = None
+
+        class FakeExperts(torch.nn.Module):
+            def __init__(self, **kwargs):
+                super().__init__()
+                captured.update(kwargs)
+                self.topk_output_format = object()
+
+        class FakeTopK(torch.nn.Module):
+            def __init__(self, **_kwargs):
+                super().__init__()
+
+        config = SimpleNamespace(
+            n_shared_experts=None,
+            routed_scaling_factor=1.0,
+            scoring_func="sqrtsoftplus",
+            n_routed_experts=256,
+            num_experts_per_tok=8,
+            hidden_size=7168,
+            moe_intermediate_size=2048,
+            norm_topk_prob=True,
+        )
+        mapping = SimpleNamespace(
+            moe=SimpleNamespace(tp_rank=0, tp_size=1, ep_rank=0, ep_size=1)
+        )
+        backend = SimpleNamespace(is_mega_moe=lambda: False)
+        quant_config = SimpleNamespace(ignored_layers=None)
+
+        with (
+            patch.object(deepseek_v4_model, "get_moe_backend", return_value=backend),
+            patch.object(deepseek_v4_model, "DeepseekV4MoEGate", FakeGate),
+            patch.object(deepseek_v4_model, "MoELayer", FakeExperts),
+            patch.object(deepseek_v4_model, "TopK", FakeTopK),
+        ):
+            DeepseekV4MoE(config, mapping, quant_config, 0, "model.layers.0.mlp")
+
+        self.assertIsNone(captured.get("routing_mode"))
+
     def test_spec_helpers_preserve_non_v4_backend_contracts(self):
         seq_lens = object()
         calls = []

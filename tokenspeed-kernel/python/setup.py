@@ -495,8 +495,8 @@ class CudaKernelBuilder:
     # FLASHINFER_CUDA_ARCH_LIST is accepted for compatibility, but TokenSpeed
     # docs prefer TOKENSPEED_CUDA_ARCH=100 on GB200.
     def _normalize_cuda_arch(self, arch):
-        has_suffix = arch.endswith("a")
-        arch_clean = arch.rstrip("a")
+        suffix = arch[-1] if arch.endswith(("a", "f")) else ""
+        arch_clean = arch[:-1] if suffix else arch
         if "." in arch_clean:
             major_s, minor_s = arch_clean.split(".", 1)
             major = int(major_s)
@@ -504,7 +504,7 @@ class CudaKernelBuilder:
         else:
             major = int(arch_clean[:-1])
             minor = int(arch_clean[-1])
-        suffix = "a" if has_suffix or major >= 9 else ""
+        suffix = suffix or ("a" if major >= 9 else "")
         return f"{major}{minor}{suffix}"
 
     def _detect_cuda_archs(self):

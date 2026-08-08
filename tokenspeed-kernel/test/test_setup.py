@@ -255,3 +255,13 @@ def test_default_cuda_build_includes_sm120_without_expanding_attn_res(
         "100a",
         "103a",
     }
+
+
+def test_cuda_arch_override_preserves_family_suffix(monkeypatch) -> None:
+    monkeypatch.setenv("TOKENSPEED_KERNEL_BACKEND", "cuda")
+    monkeypatch.setattr(setuptools, "setup", lambda **_kwargs: None)
+    setup_namespace = runpy.run_path(str(SETUP_PY))
+    builder = setup_namespace["CudaKernelBuilder"]([], verbose=False)
+
+    assert builder._normalize_cuda_arch("120f") == "120f"
+    assert builder._normalize_cuda_arch("12.0f") == "120f"
