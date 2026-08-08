@@ -94,6 +94,7 @@ from tokenspeed_kernel.ops.moe.flashinfer import (
     cutedsl_deepep_nvfp4 as _moe_cutedsl_deepep_nvfp4,
 )
 from tokenspeed_kernel.ops.moe.flashinfer import cutlass_fp8 as _moe_cutlass_fp8
+from tokenspeed_kernel.ops.moe.flashinfer import cutlass_mxfp4 as _moe_cutlass_mxfp4
 from tokenspeed_kernel.ops.moe.flashinfer import cutlass_nvfp4 as _moe_cutlass_nvfp4
 from tokenspeed_kernel.ops.moe.flashinfer import cutlass_unquant as _moe_cutlass_unquant
 from tokenspeed_kernel.ops.moe.flashinfer import trtllm_fp8 as _moe_trtllm_fp8
@@ -140,6 +141,7 @@ _RELOAD_MODULES = [
     _moe_deep_gemm,
     _moe_cutedsl_deepep_nvfp4,
     _moe_cutlass_fp8,
+    _moe_cutlass_mxfp4,
     _moe_cutlass_nvfp4,
     _moe_cutlass_unquant,
     _moe_trtllm_fp8,
@@ -187,6 +189,179 @@ def test_builtin_moe_preprocessor_links_are_callables():
     assert process_weight_kernels == []
 
     assert errors == []
+
+
+def test_mxfp4_cutlass_plan_is_available_on_sm120(
+    sm120_platform: PlatformInfo,
+) -> None:
+    if not hasattr(_moe_cutlass_mxfp4, "flashinfer_cutlass_mxfp4_moe_apply"):
+        pytest.skip("FlashInfer CUTLASS MXFP4 is NVIDIA-only")
+
+    real_platform = Platform.get()
+    try:
+        Platform.override(sm120_platform)
+        KernelRegistry.get().clear_cache()
+        plan = tokenspeed_kernel.moe_plan(
+            "mxfp4",
+            input_dtype=torch.bfloat16,
+            activation="swiglu",
+            routing_mode="precomputed_topk",
+            ep_size=4,
+            ispp=18432,
+            internal_activation_dtype="input",
+            with_bias=True,
+            solution="flashinfer_cutlass",
+        )
+
+        assert plan["apply_kernel_name"] == "flashinfer_cutlass_mxfp4_moe_apply"
+        assert (
+            plan["weight_preprocessor"].__name__
+            == "flashinfer_cutlass_mxfp4_moe_weights"
+        )
+    finally:
+        Platform.override(real_platform)
+        KernelRegistry.get().clear_cache()
+
+
+def test_mxfp4_cutlass_preprocessor_preserves_concatenated_checkpoint_values(
+    monkeypatch,
+):
+    if not hasattr(_moe_cutlass_mxfp4, "flashinfer_cutlass_mxfp4_moe_weights"):
+        pytest.skip("FlashInfer CUTLASS MXFP4 is NVIDIA-only")
+
+    module = torch.nn.Module()
+    module.hidden_size = 128
+    module.w13_input_layout = "concatenated"
+    module.swiglu_arg = None
+    module.swiglu_beta = None
+    module.w13_weight = torch.nn.Parameter(
+        torch.arange(256 * 64, dtype=torch.int64)
+        .remainder(256)
+        .to(torch.uint8)
+        .reshape(1, 256, 64),
+        requires_grad=False,
+    )
+    module.w13_weight_scale = torch.nn.Parameter(
+        torch.arange(256 * 4, dtype=torch.int64)
+        .remainder(256)
+        .to(torch.uint8)
+        .reshape(1, 256, 4),
+        requires_grad=False,
+    )
+    module.w2_weight = torch.nn.Parameter(
+        torch.zeros((1, 128, 64), dtype=torch.uint8), requires_grad=False
+    )
+    module.w2_weight_scale = torch.nn.Parameter(
+        torch.zeros((1, 128, 4), dtype=torch.uint8), requires_grad=False
+    )
+    original_weight = module.w13_weight.detach().clone()
+    original_scale = module.w13_weight_scale.detach().clone()
+
+    swizzled: list[torch.Tensor] = []
+
+    def fake_block_scale_interleave(scale: torch.Tensor) -> torch.Tensor:
+        swizzled.append(scale.clone())
+        return scale.reshape(-1)
+
+    monkeypatch.setattr(
+        _moe_cutlass_mxfp4,
+        "block_scale_interleave",
+        fake_block_scale_interleave,
+    )
+
+    _moe_cutlass_mxfp4.flashinfer_cutlass_mxfp4_moe_weights({}, module)
+
+    assert torch.equal(
+        module.w13_weight,
+        torch.cat((original_weight[:, 128:], original_weight[:, :128]), dim=1),
+    )
+    assert torch.equal(
+        module.w13_weight_scale,
+        torch.cat((original_scale[:, 128:], original_scale[:, :128]), dim=1),
+    )
+    assert len(swizzled) == 2
+    assert torch.equal(swizzled[0], module.w13_weight_scale)
+    assert torch.equal(swizzled[1], module.w2_weight_scale)
+
+
+def test_mxfp4_cutlass_apply_uses_flashinfer_swizzled_activation_scales(monkeypatch):
+    if not hasattr(_moe_cutlass_mxfp4, "flashinfer_cutlass_mxfp4_moe_apply"):
+        pytest.skip("FlashInfer CUTLASS MXFP4 is NVIDIA-only")
+
+    module = torch.nn.Module()
+    module.w13_weight = torch.nn.Parameter(
+        torch.zeros((1, 256, 64), dtype=torch.uint8), requires_grad=False
+    )
+    module.w2_weight = torch.nn.Parameter(
+        torch.zeros((1, 128, 64), dtype=torch.uint8), requires_grad=False
+    )
+    module.w13_weight_scale = torch.nn.Parameter(
+        torch.zeros((1, 256, 4), dtype=torch.uint8), requires_grad=False
+    )
+    module.w2_weight_scale = torch.nn.Parameter(
+        torch.zeros((1, 128, 4), dtype=torch.uint8), requires_grad=False
+    )
+    module.w13_weight_global_scale = torch.nn.Parameter(
+        torch.ones(1, dtype=torch.float32), requires_grad=False
+    )
+    module.w2_weight_global_scale = torch.nn.Parameter(
+        torch.ones(1, dtype=torch.float32), requires_grad=False
+    )
+    module.hidden_size_padded = 128
+    module.hidden_size_original = 128
+    module.ep_size = 1
+    module.ep_rank = 0
+    module.tp_size = 1
+    module.tp_rank = 0
+    module.gemm1_alpha = 1.702
+    module.gemm1_beta = 1.0
+    module.gemm1_clamp_limit = 7.0
+
+    quantize_call: dict[str, object] = {}
+    fused_call: dict[str, object] = {}
+
+    def fake_mxfp8_quantize(
+        x: torch.Tensor,
+        is_sf_swizzled_layout: bool,
+        *,
+        alignment: int,
+        enable_pdl: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        quantize_call.update(
+            is_sf_swizzled_layout=is_sf_swizzled_layout,
+            alignment=alignment,
+            enable_pdl=enable_pdl,
+        )
+        return x.to(torch.float8_e4m3fn), torch.ones(
+            (x.shape[0], x.shape[1] // 32), dtype=torch.uint8
+        )
+
+    def fake_cutlass_fused_moe(**kwargs):
+        fused_call.update(kwargs)
+        return [kwargs["output"]]
+
+    monkeypatch.setattr(_moe_cutlass_mxfp4, "mxfp8_quantize", fake_mxfp8_quantize)
+    monkeypatch.setattr(_moe_cutlass_mxfp4, "cutlass_fused_moe", fake_cutlass_fused_moe)
+
+    x = torch.ones((2, 128), dtype=torch.bfloat16)
+    result = _moe_cutlass_mxfp4.flashinfer_cutlass_mxfp4_moe_apply(
+        {},
+        x,
+        module,
+        torch.zeros((2, 1), dtype=torch.float32),
+        topk_weights=torch.ones((2, 1), dtype=torch.float32),
+        topk_ids=torch.zeros((2, 1), dtype=torch.int32),
+    )
+
+    assert result.shape == x.shape
+    assert quantize_call == {
+        "is_sf_swizzled_layout": True,
+        "alignment": 32,
+        "enable_pdl": False,
+    }
+    assert fused_call["input_sf"] is not None
+    assert fused_call["swizzled_input_sf"] is True
+    assert fused_call["activation_type"] == _moe_cutlass_mxfp4.ActivationType.SwigluBias
 
 
 def test_moe_process_weights_returns_for_no_preprocessing_plan():

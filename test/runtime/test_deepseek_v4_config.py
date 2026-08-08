@@ -113,6 +113,7 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     _deepseek_v4_indexer_prefill_request_gather_plan,
     _deepseek_v4_indexer_token_split,
     _deepseek_v4_indexer_topk_from_logits,
+    _deepseek_v4_launch_indexer_topk_prefill,
     _deepseek_v4_mega_moe_max_num_tokens,
     _deepseek_v4_reorder_c4_ape_2604,
     _DeepseekV4TopKBuffer,
@@ -468,6 +469,30 @@ class TestDeepseekV4Config(unittest.TestCase):
             _deepseek_v4_indexer_token_split(ForwardMode.DECODE, metadata, 5),
             (0, 5),
         )
+
+    def test_deepseek_v4_sm120_prefill_topk_uses_tokenspeed_cuda_op(self):
+        calls = []
+        args = (object(), object(), object(), object(), 2048)
+        sm120 = SimpleNamespace(
+            is_nvidia=True,
+            arch_version=SimpleNamespace(major=12),
+        )
+        with (
+            patch.object(deepseek_v4_model, "_platform", sm120),
+            patch.object(
+                deepseek_v4_model,
+                "has_indexer_topk_prefill",
+                return_value=True,
+            ),
+            patch.object(
+                deepseek_v4_model,
+                "indexer_topk_prefill",
+                side_effect=lambda *values: calls.append(values),
+            ),
+        ):
+            _deepseek_v4_launch_indexer_topk_prefill(*args)
+
+        self.assertEqual(calls, [args])
 
     def test_spec_helpers_preserve_non_v4_backend_contracts(self):
         seq_lens = object()
