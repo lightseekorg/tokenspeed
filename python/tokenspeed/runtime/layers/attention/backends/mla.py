@@ -108,8 +108,6 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
 
         self._cache_groups_bound = False
         self._cache_contract_bound = False
-        # Set by mark_cache_contract for a draft driven without cache metadata.
-        self._cache_logical_page_size: int | None = None
         self.max_context_len = config.context_len
         self.page_size = config.page_size
         self.max_num_pages = ceil_div(self.max_context_len, self.page_size)
@@ -646,7 +644,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             return
         if (
             self._cache_groups_bound
-            and self._cache_logical_page_size is not None
+            and self._cache_contract_bound
             and page_table is not None
         ):
             # Draft replay receives the already-expanded batch table published

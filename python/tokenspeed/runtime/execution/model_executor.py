@@ -344,25 +344,10 @@ class ModelExecutor:
                 f"logical page size {self._logical_page_size} is not a multiple "
                 f"of the draft kernel page size {self._draft_page_size}"
             )
-        draft_page_ratio = self._logical_page_size // self._draft_page_size
-        # The published table is already in kernel pages, so a draft backend
-        # that recorded a logical size (mark_cache_contract) would expand it a
-        # second time: ids land ratio× too deep in the pool and the draft
-        # attends garbage. Backends that consume kernel pages directly must
-        # not record (tokenspeed_mla), or the ratio must be 1 (flashmla @64).
-        backend_logical = getattr(draft_attn_backend, "_cache_logical_page_size", None)
-        if (
-            draft_page_ratio > 1
-            and backend_logical is not None
-            and int(backend_logical) != self._draft_page_size
-        ):
-            raise ValueError(
-                f"draft backend {type(draft_attn_backend).__name__} records "
-                f"logical page size {backend_logical} and would re-expand the "
-                f"draft page table that is already published in "
-                f"{self._draft_page_size}-token kernel pages "
-                f"(ratio {draft_page_ratio})"
-            )
+        # DraftPageStaging.publish expands the target full-history table into the
+        # draft backend's kernel pages once, and every draft backend reads that
+        # staged table as-is (identity). No backend re-expands with a logical
+        # size, so there is no double-expansion to guard against here.
 
         # physical_context_len already covers the spec-verify overshoot of a
         # finished request lingering one overlap step, including the lingering

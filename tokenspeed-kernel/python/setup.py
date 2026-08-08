@@ -362,6 +362,22 @@ KERNEL_GROUPS = [
         [],
     ),
     (
+        "marlin_moe",
+        [
+            CUDA_CSRC_DIR / "marlin_moe" / "marlin_moe_binding.cu",
+        ],
+        [],
+        # -I marlin_moe/include first: the vendored Marlin GEMM only needs a
+        # tiny scalar_type.hpp + dtype-alias prelude (a trimmed drop-in), not
+        # the full sgl_kernel stack. -std=c++20 for scalar_type's constexpr;
+        # nvcc keeps the last -std, overriding the global c++17.
+        [
+            f"-I{CUDA_CSRC_DIR / 'marlin_moe' / 'include'}",
+            "-std=c++20",
+            "-Wno-deprecated-gpu-targets",
+        ],
+    ),
+    (
         "routing",
         [
             CUDA_CSRC_DIR / "routing_flash.cu",

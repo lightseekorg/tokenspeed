@@ -21,7 +21,6 @@ def _backend(*, draft_block_decode: bool) -> TRTLLMMLABackend:
     backend.spec_num_tokens = 4
     backend.max_context_len = 64
     backend.page_size = 2
-    backend._cache_logical_page_size = backend.page_size
     backend.kv_lora_rank = 2
     backend.qk_nope_head_dim = 2
     backend.qk_rope_head_dim = 2
@@ -62,7 +61,7 @@ def test_eager_draft_page_table_is_not_expanded_twice() -> None:
 
 def test_graph_replay_draft_page_table_is_not_expanded_twice() -> None:
     backend = _backend(draft_block_decode=True)
-    backend.mark_cache_contract(logical_page_size=4)
+    backend.mark_cache_contract()
     backend.init_cuda_graph_state(max_bs=2)
     backend.init_forward_metadata_capture_cuda_graph(
         bs=2,
@@ -74,10 +73,12 @@ def test_graph_replay_draft_page_table_is_not_expanded_twice() -> None:
         [[6, 7, 10, 11], [14, 15, 18, 19]], dtype=torch.int32
     )
 
+    # DraftPageStaging publishes kernel pages; the replay must copy them as-is
+    # (identity), never re-expand. seq_lens fit the 4-page (page_size=2) table.
     backend.init_forward_metadata_replay_cuda_graph(
         bs=2,
         req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
-        seq_lens=torch.tensor([12, 12], dtype=torch.int32),
+        seq_lens=torch.tensor([8, 8], dtype=torch.int32),
         forward_mode=ForwardMode.DECODE,
         page_table=kernel_page_table,
     )
@@ -85,13 +86,6 @@ def test_graph_replay_draft_page_table_is_not_expanded_twice() -> None:
     block_table = backend.forward_decode_metadata.block_kv_indices
     assert block_table[:, :4].tolist() == kernel_page_table.tolist()
     assert block_table[:, 4:].eq(0).all()
-
-
-def test_cache_contract_rejects_incompatible_page_size() -> None:
-    backend = _backend(draft_block_decode=True)
-
-    with pytest.raises(ValueError, match="positive multiple"):
-        backend.mark_cache_contract(logical_page_size=3)
 
 
 def _layer() -> SimpleNamespace:

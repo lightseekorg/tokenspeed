@@ -252,7 +252,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     def __init__(self, config) -> None:
         super().__init__(config)
         self.page_size = config.page_size
-        self.logical_page_size: int | None = None
         self.swa_storage_rows = int(
             getattr(config, "sliding_window_tokens", V4_KERNEL_BLOCK_ROWS * 2)
         )
@@ -861,8 +860,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         # compressed-KV full-history group's table (row i == batch position i).
         base_block_table = None
         if cache_metadata is not None:
-            logical_page_size = int(cache_metadata.block_size)
-            self.logical_page_size = logical_page_size
             scheduler_tables = dict(
                 cache_metadata.tables(active_forward_op=forward_batch)
             )
@@ -1946,8 +1943,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         max_tokens_per_req: int = 1,
         overlap_schedule_depth: int = 0,
     ):
-        if logical_page_size is not None:
-            self.logical_page_size = int(logical_page_size)
+        # logical_page_size accepted for signature uniformity with other
+        # backends; DSA derives its page geometry from cache metadata per step.
+        del logical_page_size
         self._decode_tile_metadata = {}
         self._cuda_graph_max_tokens_per_req = max(
             1,

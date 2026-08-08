@@ -59,6 +59,19 @@ InputProjector = Callable[
 _SUPPORTED_EP_SIZES = {1, 2, 4, 8}
 
 
+def _marlin_moe_available() -> bool:
+    """Whether the Marlin W4A16 MXFP4 MoE path can run here (NVIDIA SM90+)."""
+    from tokenspeed_kernel.platform import ArchVersion, current_platform
+    from tokenspeed_kernel.thirdparty.cuda.marlin_moe import is_marlin_moe_available
+
+    platform = current_platform()
+    return (
+        platform.is_nvidia
+        and platform.arch_version >= ArchVersion(9, 0)
+        and is_marlin_moe_available()
+    )
+
+
 def kimi3_join_reduce_moe(
     routed_partial: torch.Tensor,
     shared_partial: torch.Tensor,
@@ -133,13 +146,14 @@ class Kimi3MoEExecutionPlan:
     use_trtllm: bool
     overlap_shared_experts: bool
     joint_moe_reduce: bool
+    use_marlin: bool = False
     fused_moe_ar: bool = False
     lane_latent_norm_ar: bool = False
     comm_fusion_max_num_tokens: int = 0
 
     @property
     def use_precomputed_topk(self) -> bool:
-        return self.use_native or self.use_trtllm
+        return self.use_native or self.use_trtllm or self.use_marlin
 
     @classmethod
     def build(
@@ -153,12 +167,24 @@ class Kimi3MoEExecutionPlan:
         """Select orchestration without exposing platform policy to the model."""
 
         use_native = native_latent_moe_available()
-        use_trtllm = not use_native and (
-            moe_backend.is_auto() or moe_backend.is_flashinfer_trtllm()
+        # Hopper (SM90) has no native FP4 tensor cores and no flashinfer SiTU
+        # cubin, so K3's MXFP4 SiTU MoE runs weight-only through the Marlin
+        # W4A16 GEMM with a fused Triton SiTU epilogue. AUTO picks it whenever
+        # neither the AMD-native nor the (Blackwell) TRT-LLM path is available;
+        # it can also be forced with ``--moe-backend marlin``.
+        use_marlin = not use_native and (
+            moe_backend.is_marlin()
+            or (moe_backend.is_auto() and _marlin_moe_available())
+        )
+        use_trtllm = (
+            not use_native
+            and not use_marlin
+            and (moe_backend.is_auto() or moe_backend.is_flashinfer_trtllm())
         )
         return cls(
             use_native=use_native,
             use_trtllm=use_trtllm,
+            use_marlin=use_marlin,
             overlap_shared_experts=(
                 use_native
                 and enforce_eager
