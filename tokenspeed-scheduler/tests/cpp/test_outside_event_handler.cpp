@@ -504,8 +504,7 @@ TEST_F(DecodeRetractionWithoutL2TestSuite, RetractionRecoversByLocalPrefillWitho
     ASSERT_NE(recovered, nullptr);
     EXPECT_EQ(recovered->request_ids, (std::vector<std::string>{"running"}));
     EXPECT_TRUE(recovered->IsLocalPrefill());
-    EXPECT_GT(recovered->input_lengths.front(), 0)
-        << "without Host L2, any missing suffix must be recomputed locally";
+    EXPECT_GT(recovered->input_lengths.front(), 0) << "without Host L2, any missing suffix must be recomputed locally";
     EXPECT_TRUE(ExtractCacheOpsOfKind<LoadBackBatch>(recovery).empty());
 }
 

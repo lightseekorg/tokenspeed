@@ -170,17 +170,15 @@ private:
                                         std::span<const std::size_t> match_order, std::int32_t num_cache_blocks,
                                         std::int32_t floor_tokens) const;
     template <CacheTier Tier>
-    CoordinatorMatch acquireTierWithKeys(std::span<const std::vector<CacheKey>> group_keys,
-                                         std::int32_t floor_tokens, PrefixProbe::Tier&& probe,
-                                         std::uint64_t access_epoch);
+    CoordinatorMatch acquireTierWithKeys(std::span<const std::vector<CacheKey>> group_keys, std::int32_t floor_tokens,
+                                         PrefixProbe::Tier&& probe, std::uint64_t access_epoch);
     AcquiredPrefix acquirePrefix(PrefixProbe&& probe, std::uint64_t access_epoch);
     template <CacheTier Tier>
     void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table, std::span<const CacheKey> keys,
                                  std::int32_t first_cache_block, std::uint64_t access_epoch,
                                  CacheBoundaryKind boundary_kind);
     template <CacheTier Tier>
-    void cacheCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand,
-                                      std::uint64_t access_epoch);
+    void cacheCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand, std::uint64_t access_epoch);
     void cacheDeviceCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand,
                                             std::uint64_t access_epoch);
     bool evictCachedBlock(std::uint32_t group_id, CacheBlockLocation location);

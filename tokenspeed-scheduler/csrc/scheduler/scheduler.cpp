@@ -150,8 +150,8 @@ std::int64_t Scheduler::singleRequestParentsRequired(std::int32_t token_limit) c
                 const std::int64_t later_prompt = std::min(max_prompt_tokens - chunk_tokens, chunk_tokens);
                 const std::int64_t lookback_pages = manager.BoundaryLookbackBlocks();
                 pages = std::max(pages, lookback_pages + ceilDiv(chunk_tokens, page_tokens));
-                pages = std::max(
-                    pages, lookback_pages + ceilDiv(later_prompt + decode_width + protected_tokens, page_tokens));
+                pages = std::max(pages,
+                                 lookback_pages + ceilDiv(later_prompt + decode_width + protected_tokens, page_tokens));
             }
             return pages;
         };

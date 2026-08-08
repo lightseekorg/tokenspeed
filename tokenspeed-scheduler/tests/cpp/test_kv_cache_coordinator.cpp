@@ -91,8 +91,7 @@ std::int32_t CacheForGroup(KvCacheCoordinator& coordinator, BlockPool& pool, con
 
 CacheBlockLocation CacheBoundaryForGroup(KvCacheCoordinator& coordinator, BlockPool& pool,
                                          const std::string& content_hash, std::uint32_t group_id,
-                                         std::uint64_t access_epoch,
-                                         std::int32_t logical_block_index,
+                                         std::uint64_t access_epoch, std::int32_t logical_block_index,
                                          CacheBoundaryKind boundary_kind = CacheBoundaryKind::kChunk) {
     KvCacheManager& manager = coordinator.GroupManager(static_cast<std::int32_t>(group_id));
     CacheBlockRef block_ref = pool.AcquireBlock(group_id, manager.CacheBlocksPerLcmBlock());
@@ -1939,7 +1938,7 @@ TEST(CoordinatorPromotionTest, HostHitCoveringClosedBoundaryDoesNotCreatePromoti
         {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
     };
     KvCacheCoordinator coordinator = MakeCoordinator(specs, /*cache_block_tokens=*/4, device_pool, &host_pool,
-                                                      /*stream_device_cache_to_host=*/false);
+                                                     /*stream_device_cache_to_host=*/false);
     const std::vector<std::string> hashes = ContentHashes({{0, 0, 0, 0},
                                                            {1, 1, 1, 1},
                                                            {2, 2, 2, 2},

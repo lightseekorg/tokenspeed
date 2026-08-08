@@ -26,7 +26,6 @@
 
 #include <gtest/gtest.h>
 
-
 namespace tokenspeed::test {
 
 // Generate a consecutive token sequence for test inputs.

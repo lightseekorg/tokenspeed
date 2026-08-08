@@ -282,8 +282,8 @@ KvCacheCoordinator::PrefixProbe KvCacheCoordinator::ProbeDecodeDevicePrefix(
     PrefixProbe out;
     out.group_keys = buildGroupKeys(content_hashes);
     const auto probe_device = [&](std::int32_t floor_tokens) {
-        PrefixProbe::Tier tier = probeTierWithKeys<CacheTier::kDevice>(out.group_keys, history_match_order,
-                                                                       num_cache_blocks, floor_tokens);
+        PrefixProbe::Tier tier =
+            probeTierWithKeys<CacheTier::kDevice>(out.group_keys, history_match_order, num_cache_blocks, floor_tokens);
         const std::int64_t covered_tokens =
             static_cast<std::int64_t>(tier.num_common_tokens) - static_cast<std::int64_t>(floor_tokens);
         _assert(covered_tokens >= 0, "decode destination state coverage is negative");
@@ -304,8 +304,8 @@ KvCacheCoordinator::PrefixProbe KvCacheCoordinator::ProbeDecodeDevicePrefix(
 
 KvCacheCoordinator::AcquiredPrefix KvCacheCoordinator::acquirePrefix(PrefixProbe&& probe, std::uint64_t access_epoch) {
     AcquiredPrefix out;
-    out.device = acquireTierWithKeys<CacheTier::kDevice>(probe.group_keys, /*floor_tokens=*/0,
-                                                         std::move(probe.device), access_epoch);
+    out.device = acquireTierWithKeys<CacheTier::kDevice>(probe.group_keys, /*floor_tokens=*/0, std::move(probe.device),
+                                                         access_epoch);
     if (host_pool_ != nullptr && !probe.host.per_group.empty()) {
         out.host = acquireTierWithKeys<CacheTier::kHost>(probe.group_keys, out.device.num_common_tokens,
                                                          std::move(probe.host), access_epoch);
@@ -570,10 +570,9 @@ void KvCacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, c
     }
     const std::int32_t first_cache_block = boundary_cache_block - lookback;
     std::vector<CacheKey> keys = keysForGroup(demand.page_hashes, groups_[group_index].Id());
-    cacheFullBlocksForGroup<Tier>(
-        group_index, *demand.table,
-        std::span<const CacheKey>{keys}.subspan(static_cast<std::size_t>(first_cache_block)), first_cache_block,
-        access_epoch, *demand.completed_boundary_kind);
+    cacheFullBlocksForGroup<Tier>(group_index, *demand.table,
+                                  std::span<const CacheKey>{keys}.subspan(static_cast<std::size_t>(first_cache_block)),
+                                  first_cache_block, access_epoch, *demand.completed_boundary_kind);
 }
 
 void KvCacheCoordinator::cacheDeviceCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand,

@@ -131,10 +131,10 @@ private:
             _assert(demand.table != nullptr, "group demand requires a block table");
             const KvCacheManager& manager = groups_[i].Manager();
             const std::int32_t device_blocks = manager.BlocksNeededFor(*demand.table, demand);
-            const std::int32_t host_blocks = prefix_.host.per_group.empty()
-                                                 ? 0
-                                                 : static_cast<std::int32_t>(std::ranges::count(
-                                                       prefix_.host.per_group[i].hits, std::uint8_t{1}));
+            const std::int32_t host_blocks =
+                prefix_.host.per_group.empty()
+                    ? 0
+                    : static_cast<std::int32_t>(std::ranges::count(prefix_.host.per_group[i].hits, std::uint8_t{1}));
             blocks_needed_[i] = static_cast<std::int64_t>(device_blocks) + host_blocks;
         }
 
@@ -218,9 +218,8 @@ private:
                 add_candidate(group_id, location);
             }
             if (demands_[i].num_computed_tokens >= 0) {
-                for (CacheBlockLocation location :
-                     manager.ReclaimableBlockLocationsAt(*demands_[i].table, demands_[i].num_computed_tokens,
-                                                         group_pending_store_releases)) {
+                for (CacheBlockLocation location : manager.ReclaimableBlockLocationsAt(
+                         *demands_[i].table, demands_[i].num_computed_tokens, group_pending_store_releases)) {
                     add_candidate(group_id, location);
                 }
             }

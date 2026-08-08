@@ -266,9 +266,9 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     std::vector<GroupDemand> demands =
         makeGroupDemands(tables, GroupDemand{.num_tokens = tokens_this_round, .reserve_tokens = decode_reserve});
 
-    const fsm::PrefillSource source =
-        config_.role == Role::kD && request->Is<fsm::Submitted>() ? fsm::PrefillSource::kRemote
-                                                                 : fsm::PrefillSource::kLocal;
+    const fsm::PrefillSource source = config_.role == Role::kD && request->Is<fsm::Submitted>()
+                                          ? fsm::PrefillSource::kRemote
+                                          : fsm::PrefillSource::kLocal;
     if (config_.enable_pd_cache && source == fsm::PrefillSource::kRemote) {
         for (std::size_t i = 0; i < demands.size(); ++i) {
             if (config_.paged_cache_groups[i].transfer_policy == PagedCacheTransferPolicy::LatestSnapshot) {
@@ -425,8 +425,8 @@ std::optional<WriteBackOperation> Scheduler::beginRetraction(Request& request) {
         updateCompletedPageHashes(request, cache_progress, num_computed_tokens, coordinator_.CacheBlockTokens());
     if (completed.boundary_kind) {
         coordinator_.CacheCompletedBlocks(request.BlockTablesRef(), cache_progress.page_hashes,
-                                          cache_progress.access_epoch, completed.first_new_page,
-                                          num_computed_tokens, *completed.boundary_kind);
+                                          cache_progress.access_epoch, completed.first_new_page, num_computed_tokens,
+                                          *completed.boundary_kind);
     }
     coordinator_.QueueCachedBlocksForStore(cache_progress.page_hashes);
     std::optional<WriteBackOperation> write_back = tier_transfers_.StartPendingStores();
@@ -462,11 +462,10 @@ void Scheduler::retractForCapacity(PlanBuildContext& context, const std::vector<
         recovery_barrier_ = context.capacity_blocker;
         if (!recovery_barrier_ || *recovery_barrier_ == victim->Id()) {
             const auto waiting = std::ranges::find_if(candidates, [victim](const Request* request) {
-                return request != victim &&
-                       (request->Is<fsm::Submitted>() || request->Is<fsm::Prefilling>());
+                return request != victim && (request->Is<fsm::Submitted>() || request->Is<fsm::Prefilling>());
             });
-            recovery_barrier_ = waiting == candidates.end() ? std::nullopt
-                                                             : std::optional<std::string>{(*waiting)->Id()};
+            recovery_barrier_ =
+                waiting == candidates.end() ? std::nullopt : std::optional<std::string>{(*waiting)->Id()};
         }
         if (auto operation = beginRetraction(*victim)) {
             write_back_operations.push_back(std::move(*operation));
@@ -517,9 +516,8 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
         const bool recovery_front = !recovery_queue_.empty() && request->Id() == recovery_queue_.front();
         const bool local_decode_prefill =
             request->Is<fsm::Prefilling>() && request->PrefillSource() == fsm::PrefillSource::kLocal;
-        if (config_.role == Role::kD &&
-            (local_decode_prefill || request->Is<fsm::PrefillDone>() ||
-             (recovery_front && request->Is<fsm::Decoding>()))) {
+        if (config_.role == Role::kD && (local_decode_prefill || request->Is<fsm::PrefillDone>() ||
+                                         (recovery_front && request->Is<fsm::Decoding>()))) {
             // Keep the oldest retracted request at the head of line through
             // local recovery and Decode completion. Starting another recovery
             // earlier can make the two requests repeatedly evict each other.
@@ -551,8 +549,7 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
     const bool has_local_prefill = std::ranges::any_of(candidates, [this](const Request* request) {
         return (request->Is<fsm::Prefilling>() && request->PrefillSource() == fsm::PrefillSource::kLocal) ||
                (config_.role != Role::kD && request->Is<fsm::Submitted>()) ||
-               (request->Is<fsm::Retracted>() && !recovery_queue_.empty() &&
-                request->Id() == recovery_queue_.front());
+               (request->Is<fsm::Retracted>() && !recovery_queue_.empty() && request->Id() == recovery_queue_.front());
     });
     const std::int32_t state_prefill_reserve =
         config_.enable_mixed_prefill_decode && coordinator_.HasMambaStateGroup() && has_local_prefill
@@ -626,8 +623,7 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
             continue;
         }
 
-        if (request->Is<fsm::Retracted>() && !recovery_queue_.empty() &&
-            request->Id() == recovery_queue_.front()) {
+        if (request->Is<fsm::Retracted>() && !recovery_queue_.empty() && request->Id() == recovery_queue_.front()) {
             if (config_.role == Role::kD && pushed_decode) {
                 break;
             }

@@ -78,8 +78,7 @@ std::int32_t CacheBlockFor(KvCacheCoordinator& coordinator, BlockPool& pool, con
 // this group alone can support, given which of its blocks are cached.
 // Full attention is prefix-closed; a sliding group needs its lookback run.
 std::int32_t GroupPrefixBlocks(const KvCacheCoordinator& coordinator, const BlockPool& pool,
-                               std::span<const std::string> hashes, std::uint32_t group_id,
-                               std::int32_t bound_blocks) {
+                               std::span<const std::string> hashes, std::uint32_t group_id, std::int32_t bound_blocks) {
     const KvCacheManager& manager = coordinator.GroupManager(static_cast<std::int32_t>(group_id));
     std::vector<CacheKey> keys;
     keys.reserve(hashes.size());

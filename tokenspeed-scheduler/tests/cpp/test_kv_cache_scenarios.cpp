@@ -1817,12 +1817,12 @@ TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
         AdmitForTest(coordinator, tables, GroupDemand{.num_tokens = 4, .reserve_tokens = 3});
     ASSERT_TRUE(admission);
 
-    request.Apply(fsm::SchedulePrefillFirstChunkEvent{
-        /*tokens_this_round=*/4,
-        /*reserve_num_tokens_in_next_schedule_event=*/3, &req_pool, fsm::PrefillSource::kRemote, &coordinator,
-        std::move(tables),
-        /*hit_tokens=*/0, fsm::CacheProgress{.access_epoch = admission->access_epoch},
-        /*load_pairs=*/{}});
+    request.Apply(fsm::SchedulePrefillFirstChunkEvent{/*tokens_this_round=*/4,
+                                                      /*reserve_num_tokens_in_next_schedule_event=*/3, &req_pool,
+                                                      fsm::PrefillSource::kRemote, &coordinator, std::move(tables),
+                                                      /*hit_tokens=*/0,
+                                                      fsm::CacheProgress{.access_epoch = admission->access_epoch},
+                                                      /*load_pairs=*/{}});
     ASSERT_TRUE(request.Is<fsm::Prefilling>());
 
     request.Apply(fsm::RemotePrefillDoneEvent{/*token=*/42});
@@ -1866,9 +1866,8 @@ TEST(RetractionStateFsmTest, RetractionTransitionsImmediatelyAndRebasesPrefill) 
     EXPECT_EQ(device_pool.NumEmptyLcmBlocks(), device_pool.NumLcmBlocks());
 
     std::vector<BlockTable> recovery_tables(coordinator.NumGroups());
-    auto recovery_admission = AdmitForTest(
-        coordinator, recovery_tables,
-        GroupDemand{.num_tokens = request.PrefillSize(), .reserve_tokens = 1});
+    auto recovery_admission = AdmitForTest(coordinator, recovery_tables,
+                                           GroupDemand{.num_tokens = request.PrefillSize(), .reserve_tokens = 1});
     ASSERT_TRUE(recovery_admission);
     request.Apply(fsm::SchedulePrefillFirstChunkEvent{
         request.PrefillSize(),
@@ -1902,12 +1901,12 @@ TEST(RetractEvent, PrefillDoneVictimReleasesPagesAndRequeues) {
     ASSERT_TRUE(admission);
 
     // Whole 4-token prompt in one chunk -> PrefillDone: holds pages, no decode yet.
-    request.Apply(fsm::SchedulePrefillFirstChunkEvent{
-        /*tokens_this_round=*/4,
-        /*reserve_num_tokens_in_next_schedule_event=*/1, &req_pool, fsm::PrefillSource::kLocal, &coordinator,
-        std::move(tables),
-        /*hit_tokens=*/0, fsm::CacheProgress{.access_epoch = admission->access_epoch},
-        /*load_pairs=*/{}});
+    request.Apply(fsm::SchedulePrefillFirstChunkEvent{/*tokens_this_round=*/4,
+                                                      /*reserve_num_tokens_in_next_schedule_event=*/1, &req_pool,
+                                                      fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
+                                                      /*hit_tokens=*/0,
+                                                      fsm::CacheProgress{.access_epoch = admission->access_epoch},
+                                                      /*load_pairs=*/{}});
     ASSERT_TRUE(request.Is<fsm::PrefillDone>());
     EXPECT_EQ(request.CacheProgress().access_epoch, admission->access_epoch);
     ASSERT_LT(pool.NumEmptyLcmBlocks(), 8);
@@ -1979,8 +1978,7 @@ TEST(EventFailurePath, ReqPoolExhaustionAtFirstChunkLeavesPoolBalanced) {
     EXPECT_THROW(
         request.Apply(fsm::SchedulePrefillFirstChunkEvent{/*tokens_this_round=*/4,
                                                           /*reserve_num_tokens_in_next_schedule_event=*/1, &req_pool,
-                                                          fsm::PrefillSource::kLocal, &coordinator,
-                                                          std::move(tables),
+                                                          fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
                                                           /*hit_tokens=*/0,
                                                           /*cache_progress=*/{},
                                                           /*load_pairs=*/{}}),

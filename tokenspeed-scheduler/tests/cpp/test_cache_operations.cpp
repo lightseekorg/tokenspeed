@@ -150,7 +150,7 @@ TEST(CacheOperationTest, RetractionStoreIsBestEffortAndUsesOrdinaryTransferPins)
         .cache_block_tokens = 2,
     }};
     KvCacheCoordinator coordinator = MakeCoordinator(specs, /*cache_block_tokens=*/2, device_pool, &host_pool,
-                                                      /*stream_device_cache_to_host=*/false);
+                                                     /*stream_device_cache_to_host=*/false);
     TierTransferManager transfers{coordinator};
 
     std::vector<BlockTable> tables(1);
@@ -180,7 +180,7 @@ TEST(CacheOperationTest, RetractionStoreSkipsWhenHostHasNoPlacement) {
         .cache_block_tokens = 2,
     }};
     KvCacheCoordinator coordinator = MakeCoordinator(specs, /*cache_block_tokens=*/2, device_pool, &host_pool,
-                                                      /*stream_device_cache_to_host=*/false);
+                                                     /*stream_device_cache_to_host=*/false);
     TierTransferManager transfers{coordinator};
 
     CacheBlockRef host_pin = host_pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);

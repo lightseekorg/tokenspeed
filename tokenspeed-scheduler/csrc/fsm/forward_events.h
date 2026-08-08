@@ -43,9 +43,9 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
     SchedulePrefillFirstChunkEvent(std::int32_t tokens_this_round,
                                    std::int32_t reserve_num_tokens_in_next_schedule_event,
                                    ReqPoolAllocator* req_pool_allocator, PrefillSource source,
-                                   KvCacheCoordinator* coordinator,
-                                   std::vector<BlockTable> block_tables, std::int32_t hit_tokens,
-                                   CacheProgress cache_progress, std::vector<BlockTransfer> load_pairs)
+                                   KvCacheCoordinator* coordinator, std::vector<BlockTable> block_tables,
+                                   std::int32_t hit_tokens, CacheProgress cache_progress,
+                                   std::vector<BlockTransfer> load_pairs)
         : tokens_this_round_{tokens_this_round},
           reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event},
           req_pool_allocator_{req_pool_allocator},

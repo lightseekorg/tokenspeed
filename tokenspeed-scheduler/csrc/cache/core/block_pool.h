@@ -91,7 +91,9 @@ public:
         return out;
     }
 
-    std::optional<std::uint32_t> BoundGroup(std::int32_t lcm_block_id) const { return lcmBlock(lcm_block_id).bound_group; }
+    std::optional<std::uint32_t> BoundGroup(std::int32_t lcm_block_id) const {
+        return lcmBlock(lcm_block_id).bound_group;
+    }
     std::int32_t OccupiedCount(std::int32_t lcm_block_id) const {
         return static_cast<std::int32_t>(lcmBlock(lcm_block_id).occupied_count);
     }
