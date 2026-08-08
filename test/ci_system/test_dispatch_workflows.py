@@ -50,12 +50,13 @@ def test_slurm_dispatch_lists_every_supported_trigger():
     assert set(choices) == {"all", "per-commit", "manual", "nightly", "debug"}
 
 
-def test_qwen35_agentic_allows_declared_80k_context():
+def test_qwen35_agentic_uses_stable_gb200_settings():
     task = load_yaml(
         REPO_ROOT / "test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-agentic.yaml"
     )
 
     assert "--max-model-len 80000" in task["server"]["command"]
+    assert "--draft-moe-backend flashinfer_cutlass" in task["server"]["command"]
     assert task["env"]["TOKENSPEED_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] == "1"
 
 
