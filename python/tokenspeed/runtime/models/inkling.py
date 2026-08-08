@@ -81,12 +81,7 @@ from collections.abc import Callable, Iterable
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.conv import (
-    inkling_sconv,
-    sconv_cache_update,
-    sconv_decode_paged,
-    sconv_prefill_paged,
-)
+from tokenspeed_kernel.ops.conv import inkling_sconv, sconv_cache_update
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
 from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
@@ -144,10 +139,6 @@ _is_hopper_plus = current_platform().is_hopper_plus
 
 # Escape hatch: disable the rel-logits aux-stream fork (serial pre-attention).
 _ATTN_RELFORK = os.environ.get("INKLING_ATTN_RELFORK", "1") == "1"
-# Paged conv decode: signal PDL dependents after y, overlapping the pool-persist tail.
-_SCONV_EARLY_RELEASE = os.environ.get("INKLING_SCONV_EARLY_RELEASE", "0") == "1"
-
-
 # Hetero KV (#647 byte-uniform slots): full layers keep their native half KV
 # head count. Unconditional since 2026-07-15 (INKLING_HETERO_KV gate retired).
 _HETERO_KV = True
@@ -388,89 +379,7 @@ def _sconv_apply(
     md = backend.conv_metadata
 
     geo = backend.conv_columns if md.col_page_table is not None else None
-    checkpoint_mode = geo is not None and geo.get("mode") == "checkpoint"
-    if (
-        geo is not None
-        and not checkpoint_mode
-        and conv_group in ("attnconv", "mlpconv")
-    ):
-        if geo.get("hidden_group_of_layer") is None:
-            geo = None  # hidden sites stay rolling without their groups
-        else:
-            # Hidden-conv-as-swa: ATTN site's columns ride the layer's K slot, MLP site's its V slot.
-            table = md.col_page_table[geo["hidden_group_of_layer"][layer_id]]
-            bt = geo["hidden_block_tokens"]
-            cols = ctx.token_to_kv_pool.conv_slot_view(
-                layer_id, "k" if conv_group == "attnconv" else "v", bt, dim
-            )
-            if md.is_decode:
-                return sconv_decode_paged(
-                    x,
-                    weight,
-                    cols,
-                    table,
-                    md.col_seq_lens,
-                    block_tokens=bt,
-                    col_offset=0,
-                    activation=None,
-                    use_residual=True,
-                    enable_pdl=pdl_enabled(),
-                    early_release=_SCONV_EARLY_RELEASE,
-                )
-            return sconv_prefill_paged(
-                x,
-                weight,
-                cols,
-                table,
-                md.seq_idx,
-                md.query_start_loc,
-                md.col_prefix_lens,
-                block_tokens=bt,
-                col_offset=0,
-                lcm_align=geo["lcm_align"],
-                activation=None,
-                use_residual=True,
-            )
-
-    if geo is not None and not checkpoint_mode and conv_group == "kvconv":
-        # kvconv-as-swa: columns stay 3D views — a 2D reshape would silently COPY, breaking persistence.
-        table = md.col_page_table[geo["conv_group_of_layer"][layer_id]]
-        k_cols, v_cols = ctx.token_to_kv_pool.kvconv_slot_views_for_layer(
-            layer_id, geo["block_tokens"]
-        )
-        half = dim // 2
-        if md.is_decode:
-            return sconv_decode_paged(
-                x,
-                weight,
-                k_cols,
-                table,
-                md.col_seq_lens,
-                block_tokens=geo["block_tokens"],
-                col_offset=0,
-                col_pool2=v_cols,
-                half_d=half,
-                activation=None,
-                use_residual=True,
-                enable_pdl=pdl_enabled(),
-                early_release=_SCONV_EARLY_RELEASE,
-            )
-        return sconv_prefill_paged(
-            x,
-            weight,
-            k_cols,
-            table,
-            md.seq_idx,
-            md.query_start_loc,
-            md.col_prefix_lens,
-            block_tokens=geo["block_tokens"],
-            col_offset=0,
-            col_pool2=v_cols,
-            half_d=half,
-            lcm_align=geo["lcm_align"],
-            activation=None,
-            use_residual=True,
-        )
+    checkpoint_mode = geo is not None
 
     # Channel slice of the layer's [slots, W-1, conv_dim] state buffer.
     # Draft lookback window passes re-run the last D committed rows, so

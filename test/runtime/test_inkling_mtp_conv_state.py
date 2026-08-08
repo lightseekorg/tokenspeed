@@ -189,7 +189,6 @@ class TestInklingConvSpecState(unittest.TestCase):
         backend = InklingAttnBackend.__new__(InklingAttnBackend)
         backend.conv_pool = pool
         backend.conv_columns = {
-            "mode": "checkpoint",
             "block_tokens": 4,
             "group_block_tokens": {"state": 4},
         }

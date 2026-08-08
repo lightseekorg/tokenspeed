@@ -496,7 +496,6 @@ def _inkling_conv_columns(pool, text_config):
     layer_labels = text_config.paged_cache_layer_types
     block_tokens = pool.plan.logical_block_tokens
     conv_columns = {
-        "mode": "checkpoint",
         "block_tokens": block_tokens,
         "conv_group_of_layer": ("kvconv",) * len(layer_labels),
         "hidden_group_of_layer": ("hiddenconv",) * len(layer_labels),

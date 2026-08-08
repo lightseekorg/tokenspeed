@@ -119,10 +119,9 @@ class InklingConvMetadata:
     update_mode: str = "inplace"
     tokens_per_req: int = 1
     lookback: int = 0
-    # Paged sconv: per-group tables {group: [bs, max_conv_blocks]} + lengths; None -> rolling state.
+    # Checkpoint groups: per-group tables {group: [bs, max_conv_blocks]} + lengths; None -> rolling state.
     col_page_table: dict[str, torch.Tensor] | None = None
     col_seq_lens: torch.Tensor | None = None
-    col_prefix_lens: torch.Tensor | None = None
     checkpoints: ShortConvCheckpointMetadata | None = None
     # Lazy cache of ``_write_lag_extend``'s md-only index math (one forward's
     # streams share it; md is rebuilt every forward).
@@ -402,11 +401,7 @@ class InklingAttnBackend(AttentionBackend):
         extend_prefix_lens: torch.Tensor | None,
     ) -> ShortConvCheckpointMetadata | None:
         geometry = getattr(self, "conv_columns", None)
-        if (
-            geometry is None
-            or geometry.get("mode") != "checkpoint"
-            or col_page_table is None
-        ):
+        if geometry is None or col_page_table is None:
             return None
         groups = tuple(geometry["group_block_tokens"])
         if forward_mode.is_extend_or_mixed():
@@ -563,11 +558,6 @@ class InklingAttnBackend(AttentionBackend):
         seq_idx = None
         update_mode = "inplace"
         tokens_per_req = 1
-        col_prefix_lens = (
-            extend_prefix_lens[:bs]
-            if col_page_table is not None and extend_prefix_lens is not None
-            else None
-        )
         if forward_mode.is_extend_or_mixed():
             assert extend_seq_lens is not None and extend_prefix_lens is not None
             # Reuse the cumsum the inner backend just computed for this batch.
@@ -599,7 +589,6 @@ class InklingAttnBackend(AttentionBackend):
                 self._pfg_has_initial_state[bs:].zero_()
                 query_start_loc = self._pfg_qsl
                 seq_idx = self._pfg_seq_idx
-                col_prefix_lens = self._pfg_prefix_lens
                 cache_indices = self._pfg_cache_indices
                 has_initial_state = self._pfg_has_initial_state
             if (
@@ -673,7 +662,6 @@ class InklingAttnBackend(AttentionBackend):
                 if pfg_total >= 0 and col_page_table is not None
                 else (seq_lens[:bs] if col_page_table is not None else None)
             ),
-            col_prefix_lens=col_prefix_lens,
             checkpoints=checkpoints,
         )
 
@@ -1424,15 +1412,11 @@ class InklingAttnBackend(AttentionBackend):
             )
             for g, bt in geo["group_block_tokens"].items()
         }
-        self._pfg_checkpoints = (
-            self._new_checkpoint_metadata(
-                size=self._pfg_max_bs + 1,
-                groups=tuple(geo["group_block_tokens"]),
-                device=device,
-                include_prefill_rows=True,
-            )
-            if geo.get("mode") == "checkpoint"
-            else None
+        self._pfg_checkpoints = self._new_checkpoint_metadata(
+            size=self._pfg_max_bs + 1,
+            groups=tuple(geo["group_block_tokens"]),
+            device=device,
+            include_prefill_rows=True,
         )
 
     def _pfg_refresh_col_tables(
@@ -1476,21 +1460,17 @@ class InklingAttnBackend(AttentionBackend):
                 self._graph_col_tables = {
                     g: torch.full(
                         (max_bs, -(-self.inner.max_context_len // bt)),
-                        (1 if self.conv_columns.get("mode") == "checkpoint" else -1),
+                        1,
                         dtype=torch.int32,
                         device=device,
                     )
                     for g, bt in groups.items()
                 }
-            self._graph_checkpoints = (
-                self._new_checkpoint_metadata(
-                    size=max_bs,
-                    groups=tuple(groups),
-                    device=device,
-                    include_prefill_rows=False,
-                )
-                if self.conv_columns.get("mode") == "checkpoint"
-                else None
+            self._graph_checkpoints = self._new_checkpoint_metadata(
+                size=max_bs,
+                groups=tuple(groups),
+                device=device,
+                include_prefill_rows=False,
             )
         self._graph_cache_indices = torch.full(
             (max_bs,), PAD_SLOT_ID, dtype=torch.int32, device=device
