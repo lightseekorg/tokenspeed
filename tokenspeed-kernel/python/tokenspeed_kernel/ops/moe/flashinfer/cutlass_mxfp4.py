@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+import functools
+
 import torch
 from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
 from tokenspeed_kernel.platform import (
@@ -75,10 +77,47 @@ if platform.is_nvidia:
         cutlass_fused_moe,
         mxfp8_quantize,
     )
+    from flashinfer.fused_moe import cutlass_fused_moe_workspace_size
     from flashinfer.fused_moe.core import get_cutlass_fused_moe_module
     from flashinfer.quantization.fp8_quantization import (
         get_mxfp8_quantization_sm100_module,
     )
+
+    @functools.cache
+    def _mxfp4_workspace(
+        device: torch.device,
+        max_num_tokens: int,
+        hidden_size: int,
+        intermediate_size: int,
+        num_experts_total: int,
+        top_k: int,
+        x_dtype: torch.dtype,
+        weight_dtype: torch.dtype,
+        activation_type: ActivationType,
+        tp_size: int,
+        tp_rank: int,
+        ep_size: int,
+        ep_rank: int,
+    ) -> torch.Tensor:
+        """Own one persistent workspace per compatible worker-local MoE shape."""
+        workspace_size = cutlass_fused_moe_workspace_size(
+            max_num_tokens,
+            hidden_size,
+            intermediate_size,
+            num_experts_total,
+            top_k,
+            x_dtype=x_dtype,
+            weight_dtype=weight_dtype,
+            output_dtype=torch.bfloat16,
+            activation_type=activation_type,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            use_mxfp8_act_scaling=True,
+            device=device,
+        )
+        return torch.empty(workspace_size, dtype=torch.uint8, device=device)
 
     def flashinfer_cutlass_mxfp4_moe_weights(
         plan: dict,
@@ -108,9 +147,9 @@ if platform.is_nvidia:
             w.w2_weight.data.contiguous(), requires_grad=False
         )
         w.w2_weight_scale = torch.nn.Parameter(
-            block_scale_interleave(
-                w.w2_weight_scale.data.contiguous()
-            ).reshape_as(w.w2_weight_scale),
+            block_scale_interleave(w.w2_weight_scale.data.contiguous()).reshape_as(
+                w.w2_weight_scale
+            ),
             requires_grad=False,
         )
         if hasattr(w, "w13_weight_bias"):
@@ -130,9 +169,7 @@ if platform.is_nvidia:
             device=w.w13_weight.device,
         )
         w.w13_weight_global_scale = torch.nn.Parameter(ones, requires_grad=False)
-        w.w2_weight_global_scale = torch.nn.Parameter(
-            ones.clone(), requires_grad=False
-        )
+        w.w2_weight_global_scale = torch.nn.Parameter(ones.clone(), requires_grad=False)
         swiglu_arg = getattr(w, "swiglu_arg", None)
         w.gemm1_alpha = _expert_float_parameter(
             w, None if swiglu_arg is None else swiglu_arg.alpha
@@ -221,14 +258,40 @@ if platform.is_nvidia:
             dtype=torch.bfloat16,
             device=x.device,
         )
+        activation_type = (
+            ActivationType.Swiglu
+            if getattr(w, "gemm1_alpha", None) is None
+            else ActivationType.SwigluBias
+        )
+        tp_size = getattr(w, "tp_size", 1)
+        tp_rank = getattr(w, "tp_rank", 0)
+        ep_size = getattr(w, "ep_size", 1)
+        ep_rank = getattr(w, "ep_rank", 0)
+        packed_fc1_weights = w.w13_weight.view(torch.long)
+        packed_fc2_weights = w.w2_weight.view(torch.long)
+        workspace_buffer = _mxfp4_workspace(
+            x.device,
+            get_autotune_max_num_tokens(),
+            hidden_padded,
+            w.intermediate_size_per_partition,
+            w.w13_weight.shape[0] * ep_size,
+            topk_ids.shape[1],
+            x_quant.dtype,
+            packed_fc1_weights.dtype,
+            activation_type,
+            tp_size,
+            tp_rank,
+            ep_size,
+            ep_rank,
+        )
         result = cutlass_fused_moe(
             input=x_quant,
             input_sf=x_scale,
             swizzled_input_sf=True,
             token_selected_experts=topk_ids.to(torch.int32),
             token_final_scales=topk_weights.to(torch.float32),
-            fc1_expert_weights=w.w13_weight.view(torch.long),
-            fc2_expert_weights=w.w2_weight.view(torch.long),
+            fc1_expert_weights=packed_fc1_weights,
+            fc2_expert_weights=packed_fc2_weights,
             fc1_expert_biases=getattr(w, "w13_weight_bias", None),
             fc2_expert_biases=getattr(w, "w2_weight_bias", None),
             output_dtype=torch.bfloat16,
@@ -242,18 +305,15 @@ if platform.is_nvidia:
             swiglu_alpha=getattr(w, "gemm1_alpha", None),
             swiglu_beta=getattr(w, "gemm1_beta", None),
             swiglu_limit=getattr(w, "gemm1_clamp_limit", None),
-            ep_size=getattr(w, "ep_size", 1),
-            ep_rank=getattr(w, "ep_rank", 0),
-            tp_size=getattr(w, "tp_size", 1),
-            tp_rank=getattr(w, "tp_rank", 0),
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
             use_mxfp8_act_scaling=True,
             tune_max_num_tokens=get_autotune_max_num_tokens(),
             enable_pdl=enable_pdl,
-            activation_type=(
-                ActivationType.Swiglu
-                if getattr(w, "gemm1_alpha", None) is None
-                else ActivationType.SwigluBias
-            ),
+            activation_type=activation_type,
+            workspace_buffer=workspace_buffer,
         )[0]
         if hidden_original != hidden_padded:
             result = result[:, :hidden_original].contiguous()

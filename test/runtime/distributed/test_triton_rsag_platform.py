@@ -49,9 +49,7 @@ def test_sm120_uses_fallback_for_all_collectives(monkeypatch) -> None:
         tensor + 2,
     )
     torch.testing.assert_close(
-        backend.token_reduce_scatter(
-            tensor, group=(0, 1), scattered_num_tokens=[1, 1]
-        ),
+        backend.token_reduce_scatter(tensor, group=(0, 1), scattered_num_tokens=[1, 1]),
         tensor + 3,
     )
     assert fallback.calls == [
@@ -71,7 +69,10 @@ def test_qualified_nvidia_architectures_keep_triton_path(major, monkeypatch) -> 
     expected = torch.ones(2, 8, dtype=torch.bfloat16)
     monkeypatch.setattr(triton_rsag, "all_gather", lambda *_args, **_kwargs: expected)
 
-    assert backend.token_all_gather(
-        torch.zeros(1, 8), group=(0, 1), scattered_num_tokens=[1, 1]
-    ) is expected
+    assert (
+        backend.token_all_gather(
+            torch.zeros(1, 8), group=(0, 1), scattered_num_tokens=[1, 1]
+        )
+        is expected
+    )
     assert fallback.calls == []

@@ -31,6 +31,7 @@ import-guarded on missing optional backend packages are skipped.
 
 from __future__ import annotations
 
+import copy
 import importlib
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -309,6 +310,7 @@ def test_mxfp4_cutlass_apply_uses_flashinfer_swizzled_activation_scales(monkeypa
     )
     module.hidden_size_padded = 128
     module.hidden_size_original = 128
+    module.intermediate_size_per_partition = 128
     module.ep_size = 1
     module.ep_rank = 0
     module.tp_size = 1
@@ -318,7 +320,7 @@ def test_mxfp4_cutlass_apply_uses_flashinfer_swizzled_activation_scales(monkeypa
     module.gemm1_clamp_limit = 7.0
 
     quantize_call: dict[str, object] = {}
-    fused_call: dict[str, object] = {}
+    fused_calls: list[dict[str, object]] = []
 
     def fake_mxfp8_quantize(
         x: torch.Tensor,
@@ -337,17 +339,32 @@ def test_mxfp4_cutlass_apply_uses_flashinfer_swizzled_activation_scales(monkeypa
         )
 
     def fake_cutlass_fused_moe(**kwargs):
-        fused_call.update(kwargs)
+        fused_calls.append(kwargs)
         return [kwargs["output"]]
 
     monkeypatch.setattr(_moe_cutlass_mxfp4, "mxfp8_quantize", fake_mxfp8_quantize)
     monkeypatch.setattr(_moe_cutlass_mxfp4, "cutlass_fused_moe", fake_cutlass_fused_moe)
+    monkeypatch.setattr(
+        _moe_cutlass_mxfp4,
+        "cutlass_fused_moe_workspace_size",
+        lambda *args, **kwargs: 256,
+    )
+    _moe_cutlass_mxfp4._mxfp4_workspace.cache_clear()
 
     x = torch.ones((2, 128), dtype=torch.bfloat16)
     result = _moe_cutlass_mxfp4.flashinfer_cutlass_mxfp4_moe_apply(
         {},
         x,
         module,
+        torch.zeros((2, 1), dtype=torch.float32),
+        topk_weights=torch.ones((2, 1), dtype=torch.float32),
+        topk_ids=torch.zeros((2, 1), dtype=torch.int32),
+    )
+    other_layer = copy.deepcopy(module)
+    _moe_cutlass_mxfp4.flashinfer_cutlass_mxfp4_moe_apply(
+        {},
+        x,
+        other_layer,
         torch.zeros((2, 1), dtype=torch.float32),
         topk_weights=torch.ones((2, 1), dtype=torch.float32),
         topk_ids=torch.zeros((2, 1), dtype=torch.int32),
@@ -359,9 +376,12 @@ def test_mxfp4_cutlass_apply_uses_flashinfer_swizzled_activation_scales(monkeypa
         "alignment": 32,
         "enable_pdl": False,
     }
-    assert fused_call["input_sf"] is not None
-    assert fused_call["swizzled_input_sf"] is True
-    assert fused_call["activation_type"] == _moe_cutlass_mxfp4.ActivationType.SwigluBias
+    first_call, second_call = fused_calls
+    assert first_call["input_sf"] is not None
+    assert first_call["swizzled_input_sf"] is True
+    assert first_call["activation_type"] == _moe_cutlass_mxfp4.ActivationType.SwigluBias
+    assert first_call["workspace_buffer"].numel() == 256
+    assert first_call["workspace_buffer"] is second_call["workspace_buffer"]
 
 
 def test_moe_process_weights_returns_for_no_preprocessing_plan():
