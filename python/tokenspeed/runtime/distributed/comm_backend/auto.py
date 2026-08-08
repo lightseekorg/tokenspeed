@@ -28,9 +28,6 @@ back to NCCL.
 import torch
 
 from tokenspeed.runtime.distributed.comm_backend.base import CommBackend, Group
-from tokenspeed.runtime.distributed.comm_backend.custom_allreduce import (
-    CustomAllReduceBackend,
-)
 from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
 from tokenspeed.runtime.distributed.comm_backend.triton_allreduce import (
     TritonAllReduceBackend,
@@ -48,7 +45,6 @@ class AutoBackend(CommBackend):
 
     def __init__(self):
         self._nccl = NcclBackend()
-        self._custom_ar = CustomAllReduceBackend(fallback=self._nccl)
         self._trtllm_ar = TrtllmAllReduceBackend(fallback=self._nccl)
         self._triton_ar = TritonAllReduceBackend(fallback=self._nccl)
         self._rsag = TritonRSAGBackend(fallback=self._nccl)
@@ -58,18 +54,11 @@ class AutoBackend(CommBackend):
         return self._nccl
 
     @property
-    def custom_ar(self) -> CustomAllReduceBackend:
-        return self._custom_ar
-
-    @property
     def trtllm_ar(self) -> TrtllmAllReduceBackend:
         return self._trtllm_ar
 
-    def configure(
-        self, use_pynccl: bool = False, use_custom_allreduce: bool = False
-    ) -> None:
+    def configure(self, use_pynccl: bool = False) -> None:
         self._nccl.configure(use_pynccl=use_pynccl)
-        self._custom_ar.configure(use_custom_allreduce=use_custom_allreduce)
 
     @staticmethod
     def _force_deterministic_rsag() -> bool:
@@ -112,11 +101,10 @@ class AutoBackend(CommBackend):
         # backend); the trtllm backend then runs Tier 2 (mnnvl vs IPC, by
         # payload bytes) inside _ar_fusion_workspace.
         #   1. force_deterministic_rsag ............ NCCL
-        #   2. same-node & custom_ar armed ......... custom_ar   (IPC-only)
-        #   3. trtllm_ar armed for this group ...... trtllm_ar   (mnnvl / IPC fusion)
-        #   4. group spans nodes ................... NCCL
-        #   5. triton_ar can run ................... triton_ar
-        #   6. otherwise ........................... NCCL
+        #   2. trtllm_ar armed for this group ...... trtllm_ar   (mnnvl / IPC fusion)
+        #   3. group spans nodes ................... NCCL
+        #   4. triton_ar can run ................... triton_ar
+        #   5. otherwise ........................... NCCL
         if self._force_deterministic_rsag():
             return self._nccl.all_reduce(tensor, group, op=op)
         spans_nodes = self._group_spans_nodes(group)
@@ -124,10 +112,7 @@ class AutoBackend(CommBackend):
         # armed for a group when that succeeded, so has_trtllm_ar() is itself
         # the "usable here" test. Checking it before the cross-node NCCL
         # fallback is what lets a cross-node group use mnnvl at all -- otherwise
-        # the workspace is armed and never called. custom_ar is IPC-only and
-        # stays gated to same-node groups.
-        if not spans_nodes and self._custom_ar.has_custom_ar(group):
-            return self._custom_ar.all_reduce(tensor, group, op=op)
+        # the workspace is armed and never called.
         if self._trtllm_ar.has_trtllm_ar(group):
             return self._trtllm_ar.all_reduce(tensor, group, op=op)
         if spans_nodes:
@@ -148,9 +133,7 @@ class AutoBackend(CommBackend):
         # The fused two-segment primitive currently exists only in Iris. Keep
         # all configured custom backends authoritative, and use the ordinary
         # two-call fallback for unsupported devices, dtypes, and sizes.
-        if not self._custom_ar.has_custom_ar(
-            group
-        ) and not self._trtllm_ar.has_trtllm_ar(group):
+        if not self._trtllm_ar.has_trtllm_ar(group):
             if self._triton_ar.can_run_two(first, second, group, op=op):
                 return self._triton_ar.all_reduce_two(
                     first,

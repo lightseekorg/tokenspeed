@@ -12,7 +12,6 @@ def backend(monkeypatch):
     instance = AutoBackend()
     monkeypatch.setattr(instance, "_nccl", Mock())
     monkeypatch.setattr(instance, "_rsag", Mock())
-    monkeypatch.setattr(instance, "_custom_ar", Mock())
     monkeypatch.setattr(instance, "_trtllm_ar", Mock())
     monkeypatch.setattr(instance, "_triton_ar", Mock())
     return instance
@@ -61,7 +60,6 @@ def test_force_deterministic_rsag_routes_all_reduce_to_nccl(backend, monkeypatch
     backend.all_reduce(tensor, group)
 
     backend._nccl.all_reduce.assert_called_once_with(tensor, group, op=None)
-    backend._custom_ar.has_custom_ar.assert_not_called()
     backend._trtllm_ar.has_trtllm_ar.assert_not_called()
     backend._triton_ar.can_run.assert_not_called()
 
@@ -75,6 +73,5 @@ def test_force_deterministic_rsag_routes_all_reduce_two_to_nccl(backend, monkeyp
     backend.all_reduce_two(first, second, group)
 
     backend._nccl.all_reduce_two.assert_called_once_with(first, second, group, op=None)
-    backend._custom_ar.has_custom_ar.assert_not_called()
     backend._trtllm_ar.has_trtllm_ar.assert_not_called()
     backend._triton_ar.can_run_two.assert_not_called()

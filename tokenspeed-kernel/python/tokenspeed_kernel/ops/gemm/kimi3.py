@@ -411,9 +411,10 @@ def kimi3_latent_projection_add3(
         prefix: BF16 residual rows shaped ``[M, N]``.
         shared_output: BF16 shared-expert rows shaped ``[M, N]``.
         solution: ``"auto"`` selects the fused row-CTA GEMV for one-token
-            execution and otherwise composes the registered projection and
-            add kernels. ``"rowcta_gemv"`` and ``"composed"`` force either
-            implementation.
+            execution, the fused MFMA epilogue for the tuned M=16 tile, and
+            otherwise composes the registered projection and add kernels.
+            ``"rowcta_gemv"``, ``"gluon_mfma_add3"``, and ``"composed"``
+            force an implementation.
 
     Returns:
         ``prefix + hidden_states @ weight.T + shared_output`` shaped ``[M, N]``.
@@ -441,7 +442,7 @@ def kimi3_latent_projection_add3(
                 f"Kimi K3 latent projection {name} must have unit inner stride"
             )
 
-    if solution not in {"auto", "rowcta_gemv", "composed"}:
+    if solution not in {"auto", "rowcta_gemv", "gluon_mfma_add3", "composed"}:
         raise ValueError(f"unknown Kimi K3 projection-add3 solution {solution!r}")
     specialized = (
         hidden_states.is_cuda
@@ -452,7 +453,12 @@ def kimi3_latent_projection_add3(
         and (k, n) in _KIMI3_SHAPES
     )
     if solution == "auto":
-        solution = "rowcta_gemv" if m == 1 and specialized else "composed"
+        if m == 1 and specialized:
+            solution = "rowcta_gemv"
+        elif Platform.get().is_cdna4 and m == 16 and specialized:
+            solution = "gluon_mfma_add3"
+        else:
+            solution = "composed"
     if solution == "rowcta_gemv":
         if m != 1:
             raise ValueError("rowcta_gemv projection-add3 requires one input row")
@@ -464,6 +470,22 @@ def kimi3_latent_projection_add3(
         from tokenspeed_kernel.ops.gemm.triton_gemv import rowcta_gemv_add3
 
         return rowcta_gemv_add3(
+            hidden_states,
+            weight,
+            prefix,
+            shared_output,
+        )
+    if solution == "gluon_mfma_add3":
+        if not Platform.get().is_cdna4 or m != 16 or not specialized:
+            raise ValueError(
+                "gluon_mfma_add3 projection-add3 requires 16 contiguous CUDA "
+                "BF16 rows with the K3 3584->7168 shape on CDNA4"
+            )
+        from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+            gluon_mm_a16w16_add3_m16_gfx950,
+        )
+
+        return gluon_mm_a16w16_add3_m16_gfx950(
             hidden_states,
             weight,
             prefix,

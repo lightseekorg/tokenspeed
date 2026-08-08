@@ -28,20 +28,14 @@ from tokenspeed.runtime.distributed.comm_backend.base import CommBackend
 _global_backend: CommBackend | None = None
 
 
-def initialize_comm_backend(
-    use_pynccl: bool = False,
-    use_custom_allreduce: bool = False,
-) -> CommBackend:
+def initialize_comm_backend(use_pynccl: bool = False) -> CommBackend:
     """Create and configure the global communication backend."""
     global _global_backend
 
     from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
 
     _global_backend = AutoBackend()
-    _global_backend.configure(
-        use_pynccl=use_pynccl,
-        use_custom_allreduce=use_custom_allreduce,
-    )
+    _global_backend.configure(use_pynccl=use_pynccl)
     return _global_backend
 
 
