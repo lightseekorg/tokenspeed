@@ -131,6 +131,7 @@ def deepseek_v4_cache_fields(
                 1,
                 exact_page_stride=False,
                 page_stride_alignment_bytes=kv_page_stride_alignment_bytes,
+                layer_id=layer_id,
             )
         )
         if ratio == 1:
@@ -157,6 +158,7 @@ def deepseek_v4_cache_fields(
                     1,
                     exact_page_stride=False,
                     page_stride_alignment_bytes=kv_page_stride_alignment_bytes,
+                    layer_id=layer_id,
                 ),
                 CacheFieldSpec(
                     state_group,
@@ -165,6 +167,7 @@ def deepseek_v4_cache_fields(
                     state_shape,
                     4,
                     exact_page_stride=False,
+                    layer_id=layer_id,
                 ),
             )
         )
@@ -182,6 +185,7 @@ def deepseek_v4_cache_fields(
                     tuple(indexer_kv_shape),
                     1,
                     exact_page_stride=False,
+                    layer_id=layer_id,
                 ),
                 CacheFieldSpec(
                     indexer_state_group,
@@ -190,6 +194,7 @@ def deepseek_v4_cache_fields(
                     tuple(indexer_state_shape),
                     4,
                     exact_page_stride=False,
+                    layer_id=layer_id,
                 ),
             )
         )

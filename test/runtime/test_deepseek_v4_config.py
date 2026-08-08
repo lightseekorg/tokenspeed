@@ -2294,12 +2294,12 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(
             {group.group_id: group.transfer_policy for group in cache_layout.groups},
             {
-                "v4.swa_kv": "latest_snapshot",
-                "v4.c4a.compressor_state": "latest_snapshot",
+                "v4.swa_kv": "full_suffix",
+                "v4.c4a.compressor_state": "full_suffix",
                 "v4.c4a.compressed_kv": "full_suffix",
-                "v4.c128a.compressor_state": "latest_snapshot",
+                "v4.c128a.compressor_state": "full_suffix",
                 "v4.c128a.compressed_kv": "full_suffix",
-                "v4.c4a.indexer_compressor_state": "latest_snapshot",
+                "v4.c4a.indexer_compressor_state": "full_suffix",
             },
         )
         self.assertEqual(
@@ -2310,6 +2310,37 @@ class TestDeepseekV4Config(unittest.TestCase):
             },
             {field.field_id for field in plan.fields},
         )
+        self.assertTrue(cache_layout.supports_layerwise_transfer)
+        self.assertEqual(
+            {
+                segment.layer_id
+                for group in cache_layout.groups
+                for segment in group.transfer_segments
+            },
+            {0, 1, 2},
+        )
+
+        from tokenspeed_scheduler import Scheduler
+
+        from tokenspeed.runtime.engine.scheduler_utils import (
+            make_config,
+            pool_to_paged_cache_groups,
+        )
+
+        scheduler_config = make_config(
+            num_device_pages=plan.num_lcm_blocks + 1,
+            max_scheduled_tokens=256,
+            max_batch_size=1,
+            page_size=plan.logical_block_tokens,
+            num_host_pages=0,
+            disable_l2_cache=True,
+            enable_l3_storage=False,
+            role="prefill",
+            paged_cache_groups=pool_to_paged_cache_groups(pool),
+            enable_mixed_prefill_decode=True,
+        )
+        scheduler_config.enable_pd_cache = True
+        Scheduler(scheduler_config)
 
     def test_deepseek_v4_kv_pool_rejects_nonpositive_size(self):
         config = SimpleNamespace(

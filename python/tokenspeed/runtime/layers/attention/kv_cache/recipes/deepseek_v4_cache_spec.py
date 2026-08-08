@@ -22,7 +22,6 @@ from typing import Any
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     PagedCacheGroupSpec,
-    apply_pd_transfer_policies,
     compute_paged_cache_group_page_counts,
 )
 
@@ -412,7 +411,10 @@ def build_v4_cache_specs(
             for spec in specs
         ]
     if pd_disaggregation_enabled:
-        specs = apply_pd_transfer_policies(specs)
+        # Every DeepSeek V4 group uses scheduler-managed history or a sliding
+        # destination table. Neither is a recurrent final-state snapshot, so
+        # Decode allocates the complete missing suffix for every group.
+        specs = [replace(spec, transfer_policy="full_suffix") for spec in specs]
     return specs
 
 

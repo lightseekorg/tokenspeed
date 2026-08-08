@@ -168,7 +168,7 @@ def create_kv_transfer(
             )
         if args.enable_mla_l1_5_cache:
             raise NotImplementedError(
-                "Paged-cache PD does not support MLA L1.5 or layerwise cache transfer"
+                "Paged-cache PD does not support MLA L1.5 cache transfer"
             )
     if mode == "prefill":
         return DisaggPrefillExecutor(backend, args, kv_args, gloo_group, page_size)

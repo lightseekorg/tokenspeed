@@ -209,6 +209,7 @@ class CachePDTransferSegment:
     page_zero_offset: int
     page_stride_bytes: int
     payload_bytes: int
+    layer_id: int | None = None
 
     def __post_init__(self) -> None:
         _integer("segment physical_slot", self.physical_slot)
@@ -217,6 +218,8 @@ class CachePDTransferSegment:
         _integer("segment page_zero_offset", self.page_zero_offset)
         _integer("segment page_stride_bytes", self.page_stride_bytes, 1)
         _integer("segment payload_bytes", self.payload_bytes, 1)
+        if self.layer_id is not None:
+            _integer("segment layer_id", self.layer_id)
         _require(
             self.payload_bytes <= self.page_stride_bytes,
             f"segment {self.field_id!r} payload exceeds its page stride",
@@ -452,6 +455,10 @@ class CachePDLayout:
             raise CachePDProtocolError("layout contains duplicate group IDs")
         covered: set[int] = set()
         for group in groups:
+            _require(
+                self.block_size % group.cache_blocks_per_lcm_block == 0,
+                f"group {group.group_id!r} packing must divide block_size",
+            )
             for slot in group.physical_slots:
                 if slot >= self.physical_slot_count:
                     raise CachePDProtocolError(
@@ -491,6 +498,14 @@ class CachePDLayout:
     @property
     def physical_slot_count(self) -> int:
         return len(self.physical_buffer_ids)
+
+    @property
+    def supports_layerwise_transfer(self) -> bool:
+        return all(
+            group.transfer_segments
+            and all(segment.layer_id is not None for segment in group.transfer_segments)
+            for group in self.groups
+        )
 
     @property
     def peer(self) -> CachePDPeerLayout:
@@ -633,6 +648,10 @@ def _logical_slots(
     raise CachePDProtocolError(f"unsupported transfer policy {policy!r}")
 
 
+def _group_block_size(layout: CachePDLayout, group: CachePDGroup) -> int:
+    return layout.block_size // group.cache_blocks_per_lcm_block
+
+
 def _group_page_count(group: CachePDGroup, num_pages_with_null: int) -> int:
     """Resolve one group's child-page capacity from the registered parents."""
     return 1 + (num_pages_with_null - 1) * group.cache_blocks_per_lcm_block
@@ -690,7 +709,7 @@ def validate_cache_manifest(
             layout_group.transfer_policy,
             manifest.prefix_len,
             manifest.prompt_len,
-            layout.block_size,
+            _group_block_size(layout, layout_group),
         )
         if len(group.page_ids) != len(required):
             raise CachePDProtocolError(
@@ -754,6 +773,64 @@ def cache_manifest_page_ids(
     return tuple(page_id for group in manifest.groups for page_id in group.page_ids)
 
 
+def project_cache_destination_manifest(
+    manifest: CachePDPageManifest,
+    *,
+    layout: CachePDLayout,
+    prefix_len: int,
+    prompt_len: int,
+    num_pages_with_null: int,
+) -> CachePDPageManifest:
+    """Project a full Decode allocation onto one Prefill transfer chunk."""
+    validate_cache_manifest(
+        manifest,
+        layout=layout,
+        num_pages_with_null=num_pages_with_null,
+        peer="destination",
+    )
+    if (
+        prefix_len < manifest.prefix_len
+        or prompt_len > manifest.prompt_len
+        or prefix_len >= prompt_len
+    ):
+        raise CachePDProtocolError(
+            "layerwise transfer window must be inside the destination manifest"
+        )
+    if prefix_len % layout.block_size:
+        raise CachePDProtocolError("layerwise transfer prefix_len must be page aligned")
+
+    groups = []
+    for layout_group, group in zip(layout.groups, manifest.groups, strict=True):
+        if layout_group.transfer_policy == "latest_snapshot":
+            pages = group.page_ids
+        else:
+            full_slots = _logical_slots(
+                layout_group.transfer_policy,
+                manifest.prefix_len,
+                manifest.prompt_len,
+                _group_block_size(layout, layout_group),
+            )
+            pages_by_slot = dict(zip(full_slots, group.page_ids, strict=True))
+            chunk_slots = _logical_slots(
+                layout_group.transfer_policy,
+                prefix_len,
+                prompt_len,
+                _group_block_size(layout, layout_group),
+            )
+            try:
+                pages = tuple(pages_by_slot[slot] for slot in chunk_slots)
+            except KeyError as exc:
+                raise CachePDProtocolError(
+                    "layerwise transfer window is outside the destination suffix"
+                ) from exc
+        groups.append(CachePDGroupPages(group.group_id, pages))
+    return CachePDPageManifest(
+        groups=tuple(groups),
+        prefix_len=prefix_len,
+        prompt_len=prompt_len,
+    )
+
+
 def build_cache_page_manifest(
     forward_op: object,
     *,
@@ -814,7 +891,7 @@ def build_cache_page_manifest(
             layout_group.transfer_policy,
             prefix_len,
             prompt_len,
-            layout.block_size,
+            _group_block_size(layout, layout_group),
         )
         if logical_slots[-1] >= table.shape[1]:
             raise CachePDProtocolError(
@@ -851,7 +928,7 @@ def build_cache_page_manifest(
                 layout_group.transfer_policy,
                 manifest.prefix_len,
                 manifest.prompt_len,
-                layout.block_size,
+                _group_block_size(layout, layout_group),
             ),
             strict=True,
         )
@@ -985,6 +1062,7 @@ def build_lcm_pd_cache_contract(
                     ),
                     page_stride_bytes=field.page_stride_bytes,
                     payload_bytes=field.payload_bytes,
+                    layer_id=field.layer_id,
                 )
             )
         transfer_groups.append(
@@ -1035,6 +1113,7 @@ def build_lcm_pd_cache_contract(
                 "element_size": field.element_size,
                 "field_offset_bytes": field.field_offset_bytes,
                 "page_stride_bytes": field.page_stride_bytes,
+                "layer_id": field.layer_id,
             }
             for field in fields
         ],
