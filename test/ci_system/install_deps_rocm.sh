@@ -47,7 +47,7 @@ pip install --upgrade pip "setuptools<82" wheel
 echo "=== Step 3: Install PyTorch for ROCm ==="
 pip install --index-url "${ROCM_INDEX}" \
 	"torch[device-${GFX_ARCH}]==2.11.0" \
-	"torchvision[device-${GFX_ARCH}]==0.26.0" \
+	"torchvision[device-${GFX_ARCH}]==0.26.0"
 
 echo "=== Step 4: Install tokenspeed-kernel packages ==="
 
