@@ -240,7 +240,7 @@ def test_attn_res_build_is_limited_to_supported_blackwell_architectures(
     }
 
 
-def test_default_cuda_build_includes_sm120_without_expanding_attn_res(
+def test_default_cuda_build_remains_sm10x(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("TOKENSPEED_KERNEL_BACKEND", "cuda")
@@ -250,7 +250,7 @@ def test_default_cuda_build_includes_sm120_without_expanding_attn_res(
     setup_namespace = runpy.run_path(str(SETUP_PY))
     builder = setup_namespace["CudaKernelBuilder"]([], verbose=False)
 
-    assert builder._detect_cuda_archs() == {"100a", "103a", "120f", "121a"}
+    assert builder._detect_cuda_archs() == {"100a", "103a"}
     assert builder._group_cuda_archs("attn_res", builder._detect_cuda_archs()) == {
         "100a",
         "103a",
