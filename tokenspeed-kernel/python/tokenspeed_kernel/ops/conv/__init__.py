@@ -39,10 +39,9 @@ import torch
 # Aliased because the conv.triton submodule import below rebinds the name ``triton``.
 from tokenspeed_kernel._triton import triton as _triton
 from tokenspeed_kernel.ops.conv.triton import (
+    _inkling_sconv_kernel,
     _sconv_cache_update_kernel,
-    _sconv_decode_kernel,
     _sconv_decode_paged_kernel,
-    _sconv_prefill_kernel,
     _sconv_prefill_paged_kernel,
     select_decode_config,
     select_prefill_config,
@@ -54,9 +53,8 @@ PAD_SLOT_ID = -1
 __all__ = [
     "PAD_SLOT_ID",
     "sconv_cache_update",
-    "sconv_decode",
     "sconv_decode_paged",
-    "sconv_prefill",
+    "inkling_sconv",
     "sconv_prefill_paged",
     "seq_idx_from_cu_seqlens",
 ]
@@ -87,7 +85,7 @@ def seq_idx_from_cu_seqlens(
     )
 
 
-def sconv_prefill(
+def inkling_sconv(
     x: torch.Tensor,
     weight: torch.Tensor,
     conv_cache: torch.Tensor,
@@ -98,6 +96,9 @@ def sconv_prefill(
     *,
     activation: str | None = None,
     use_residual: bool = True,
+    scratch: torch.Tensor | None = None,
+    publish: tuple | None = None,
+    enable_pdl: bool = False,
 ) -> torch.Tensor:
     """Causal conv over ``[cached-prefix ++ chunk]`` for a varlen batch.
 
@@ -123,6 +124,21 @@ def sconv_prefill(
         activation: Optional activation applied to the conv output before the
             residual: ``None`` (TML default), ``"silu"`` or ``"swish"``.
         use_residual: Add the residual connection ``y = x + conv(...)``.
+        scratch: Optional verify-scratch view ``[>= T, D]``; when given,
+            every chunk row of ``x`` is copied into it in-kernel (padded
+            rows included), replacing the eager per-stream copy.
+        publish: Optional speculative boundary-checkpoint publication as
+            ``(block_table, col_seq_lens, checkpoint, checkpoint_b,
+            page_size)``: ``block_table`` int32 ``[B, num_blocks]`` for the
+            stream's cache group (entries <= 0 are holes and skip the
+            write), ``col_seq_lens`` int32 ``[B]`` sequence lengths THROUGH
+            the chunk, ``checkpoint`` ``[pages, W - 1, width_a]`` receiving
+            channels ``[0, width_a)`` and ``checkpoint_b`` the rest (or
+            None when one field covers all channels). Every token landing
+            exactly on a ``page_size`` boundary writes the conv window at
+            its position — accept-independent; later rounds covering the
+            same boundary overwrite rejected content.
+        enable_pdl: launch with Programmatic Dependent Launch (Hopper+).
 
     Returns:
         Output tensor ``[T, D]`` with the same dtype as ``x``.
@@ -141,8 +157,38 @@ def sconv_prefill(
     use_silu = activation in ("silu", "swish")
     block_t, block_d, num_warps, num_stages = select_prefill_config(T, D)
 
+    write_scratch = scratch is not None
+    if write_scratch:
+        s_strides = (scratch.stride(0), scratch.stride(1))
+    else:
+        scratch = x
+        s_strides = (0, 0)
+    if publish is not None:
+        block_table, col_seq_lens, ckpt_a, ckpt_b, page_size = publish
+        a_width = ckpt_a.shape[-1]
+        a_strides = (ckpt_a.stride(0), ckpt_a.stride(1), ckpt_a.stride(2))
+        if ckpt_b is None:
+            assert a_width == D, "single checkpoint field must cover all channels"
+            ckpt_b = ckpt_a
+            b_strides = (0, 0, 0)
+        else:
+            assert (
+                a_width + ckpt_b.shape[-1] == D
+            ), "checkpoint fields must cover the stream's channels"
+            b_strides = (ckpt_b.stride(0), ckpt_b.stride(1), ckpt_b.stride(2))
+        bt_strides = (block_table.stride(0), block_table.stride(1))
+        num_blocks = block_table.shape[1]
+    else:
+        block_table = col_seq_lens = cache_indices
+        ckpt_a = ckpt_b = x
+        bt_strides = (0, 0)
+        a_strides = b_strides = (0, 0, 0)
+        a_width = D
+        num_blocks = 0
+        page_size = 1
+
     grid = (_triton.cdiv(T, block_t), _triton.cdiv(D, block_d))
-    _sconv_prefill_kernel[grid](
+    _inkling_sconv_kernel[grid](
         x,
         weight,
         conv_cache,
@@ -151,6 +197,11 @@ def sconv_prefill(
         cache_indices,
         has_initial_state,
         y,
+        scratch,
+        col_seq_lens,
+        block_table,
+        ckpt_a,
+        ckpt_b,
         x.stride(0),
         x.stride(1),
         y.stride(0),
@@ -160,16 +211,33 @@ def sconv_prefill(
         conv_cache.stride(0),
         conv_cache.stride(1),
         conv_cache.stride(2),
+        s_strides[0],
+        s_strides[1],
+        bt_strides[0],
+        bt_strides[1],
+        a_strides[0],
+        a_strides[1],
+        a_strides[2],
+        b_strides[0],
+        b_strides[1],
+        b_strides[2],
+        a_width,
+        num_blocks,
         T,
         D,
         USE_SILU=use_silu,
         USE_RESIDUAL=use_residual,
+        WRITE_SCRATCH=write_scratch,
+        PUBLISH=publish is not None,
+        PAGE_SIZE=page_size,
+        ENABLE_PDL=enable_pdl,
         BLOCK_T=block_t,
         BLOCK_D=block_d,
         W=W,
         W_POW2=_triton.next_power_of_2(W),
         num_warps=num_warps,
         num_stages=num_stages,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
     return y
 
@@ -192,7 +260,7 @@ def sconv_cache_update(
 
     Args:
         x: Varlen-packed input ``[T, D]`` that was fed to
-            :func:`sconv_prefill`.
+            :func:`inkling_sconv`.
         conv_cache: Conv state cache ``[num_slots, W - 1, D]`` with
             ``stride(-1) == 1``; updated in place. May be a channel-sliced
             view of a wider buffer.
@@ -230,88 +298,6 @@ def sconv_cache_update(
         W_MINUS_1=w_minus_1,
         num_warps=4,
     )
-
-
-def sconv_decode(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    conv_cache: torch.Tensor,
-    cache_indices: torch.Tensor,
-    *,
-    activation: str | None = None,
-    use_residual: bool = True,
-    enable_pdl: bool = False,
-) -> torch.Tensor:
-    """Fused single-token decode: conv over ``[cache ++ x_t]`` + cache update.
-
-    Computes the causal conv for one new token per request, reading the
-    ``W - 1`` state tokens directly from the cache, then shifts each cache
-    row left by one and stores the new token — all in a single launch. Rows
-    with ``cache_indices == PAD_SLOT_ID`` still produce an output (conv over
-    a zeroed prefix) but never write to the cache.
-
-    Args:
-        x: Current tokens ``[B, D]`` (one per request).
-        weight: Per-channel FIR taps ``[D, W]``.
-        conv_cache: Conv state cache ``[num_slots, W - 1, D]`` with
-            ``stride(-1) == 1``; updated in place. May be a channel-sliced
-            view of a wider buffer.
-        cache_indices: Cache slot per request ``[B]``, int32;
-            ``PAD_SLOT_ID`` (-1) for padded rows.
-        activation: Optional activation applied to the conv output before the
-            residual: ``None`` (TML default), ``"silu"`` or ``"swish"``.
-        use_residual: Add the residual connection ``y = x + conv(...)``.
-        enable_pdl: launch with Programmatic Dependent Launch (Hopper+):
-            the kernel waits for its producer before the first load and
-            signals dependents after its last store.
-
-    Returns:
-        Output tensor ``[B, D]`` with the same dtype as ``x``.
-    """
-    T, D = x.shape
-    W = weight.shape[1]
-    assert (
-        conv_cache.shape[1] == W - 1
-    ), f"conv_cache holds {conv_cache.shape[1]} states per slot, expected {W - 1}"
-    assert conv_cache.stride(-1) == 1, "conv_cache must be D-contiguous"
-
-    y = torch.empty_like(x)
-    if T == 0:
-        return y
-
-    use_silu = activation in ("silu", "swish")
-    block_t, block_d, num_warps, num_stages = select_decode_config(T, D)
-
-    grid = (_triton.cdiv(T, block_t), _triton.cdiv(D, block_d))
-    _sconv_decode_kernel[grid](
-        x,
-        weight,
-        conv_cache,
-        cache_indices,
-        y,
-        x.stride(0),
-        x.stride(1),
-        y.stride(0),
-        y.stride(1),
-        weight.stride(0),
-        weight.stride(1),
-        conv_cache.stride(0),
-        conv_cache.stride(1),
-        conv_cache.stride(2),
-        T,
-        D,
-        USE_SILU=use_silu,
-        USE_RESIDUAL=use_residual,
-        BLOCK_T=block_t,
-        BLOCK_D=block_d,
-        W=W,
-        W_POW2=_triton.next_power_of_2(W),
-        ENABLE_PDL=enable_pdl,
-        num_warps=num_warps,
-        num_stages=num_stages,
-        **({"launch_pdl": True} if enable_pdl else {}),
-    )
-    return y
 
 
 def sconv_decode_paged(

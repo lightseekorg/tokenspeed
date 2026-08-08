@@ -24,9 +24,8 @@ import pytest
 import torch
 from tokenspeed_kernel.ops.conv import (
     PAD_SLOT_ID,
+    inkling_sconv,
     sconv_cache_update,
-    sconv_decode,
-    sconv_prefill,
     seq_idx_from_cu_seqlens,
 )
 
@@ -50,6 +49,22 @@ def ref_sconv(
     xp = torch.cat([prefix, x]).float()
     y = sum(xp[w : w + len(x)] * weight[:, w].float() for w in range(weight.shape[1]))
     return (y + x.float() if use_residual else y).to(x.dtype)
+
+
+def unified_decode(x, weight, conv_cache, cache_indices):
+    """T=1-per-request call of the unified kernel (the former sconv_decode)."""
+    B = x.shape[0]
+    device = x.device
+    qsl = torch.arange(B + 1, dtype=torch.int32, device=device)
+    return inkling_sconv(
+        x,
+        weight,
+        conv_cache,
+        qsl,
+        qsl[:B],
+        cache_indices,
+        torch.ones(B, dtype=torch.bool, device=device),
+    )
 
 
 def ref_cache_row(
@@ -105,7 +120,7 @@ def test_sconv_prefill_varlen(D: int, use_residual: bool, device: str) -> None:
     has_initial_state = torch.tensor([True, False, True], device=device)
     cache_snapshot = conv_cache.clone()
 
-    y = sconv_prefill(
+    y = inkling_sconv(
         x,
         weight,
         conv_cache,
@@ -216,7 +231,18 @@ def test_sconv_decode(D: int, B: int, device: str) -> None:
         cache_indices[pad_rows] = PAD_SLOT_ID
     old_cache = conv_cache.clone()
 
-    y = sconv_decode(x, weight, conv_cache, cache_indices)
+    y = unified_decode(x, weight, conv_cache, cache_indices)
+
+    # Decode is read-only on the cache; persistence is a separate step.
+    assert torch.equal(conv_cache, old_cache)
+    qsl = torch.arange(B + 1, dtype=torch.int32, device=device)
+    sconv_cache_update(
+        x,
+        conv_cache,
+        qsl,
+        cache_indices,
+        torch.ones(B, dtype=torch.bool, device=device),
+    )
 
     zeros = torch.zeros(W - 1, D, device=device, dtype=DTYPE)
     for i in range(B):
@@ -247,7 +273,7 @@ def test_sconv_chained_prefill_update_decode(device: str) -> None:
     has_initial_state = torch.tensor([False, False], device=device)
 
     # Reference: one prefill over the full sequences (no initial state).
-    y_full = sconv_prefill(
+    y_full = inkling_sconv(
         x, weight, conv_cache, cu_seqlens, seq_idx, cache_indices, has_initial_state
     )
 
@@ -261,7 +287,7 @@ def test_sconv_chained_prefill_update_decode(device: str) -> None:
         [x[cu[i] : cu[i] + part_lens[i]] for i in range(len(lens))]
     ).contiguous()
 
-    y_part = sconv_prefill(
+    y_part = inkling_sconv(
         x_part,
         weight,
         conv_cache,
@@ -273,11 +299,14 @@ def test_sconv_chained_prefill_update_decode(device: str) -> None:
     sconv_cache_update(x_part, conv_cache, cu_part, cache_indices, has_initial_state)
 
     y_decode = []
+    qsl_step = torch.arange(len(lens) + 1, dtype=torch.int32, device=device)
+    ones_step = torch.ones(len(lens), dtype=torch.bool, device=device)
     for j in range(num_decode):
         x_step = torch.stack(
             [x[cu[i] + part_lens[i] + j] for i in range(len(lens))]
         ).contiguous()
-        y_decode.append(sconv_decode(x_step, weight, conv_cache, cache_indices))
+        y_decode.append(unified_decode(x_step, weight, conv_cache, cache_indices))
+        sconv_cache_update(x_step, conv_cache, qsl_step, cache_indices, ones_step)
 
     cu_p = cu_part.tolist()
     for i in range(len(lens)):
@@ -323,7 +352,7 @@ def test_sconv_channel_sliced_cache_view(device: str) -> None:
     outside[off : off + D] = False
 
     # Prefill on the view: correct output, cache untouched.
-    y = sconv_prefill(
+    y = inkling_sconv(
         x,
         weight,
         cache_view,
@@ -351,7 +380,15 @@ def test_sconv_channel_sliced_cache_view(device: str) -> None:
     # Decode on the view.
     snapshot = cache_full.clone()
     x_dec = torch.randn(B, D, device=device, dtype=DTYPE)
-    y_dec = sconv_decode(x_dec, weight, cache_view, cache_indices)
+    y_dec = unified_decode(x_dec, weight, cache_view, cache_indices)
+    assert torch.equal(cache_full, snapshot)  # decode is read-only now
+    sconv_cache_update(
+        x_dec,
+        cache_view,
+        torch.arange(B + 1, dtype=torch.int32, device=device),
+        cache_indices,
+        torch.ones(B, dtype=torch.bool, device=device),
+    )
     for i in range(B):
         ci = int(cache_indices[i])
         ref = ref_sconv(x_dec[i : i + 1], weight, snapshot[ci, :, off : off + D])

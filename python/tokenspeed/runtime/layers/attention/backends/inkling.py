@@ -60,7 +60,6 @@ from tokenspeed.runtime.layers.attention.backends.base import (
     init_backend_cuda_graph_state,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.common import maybe_inference_mode
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 logger = get_colorful_logger(__name__)
@@ -82,31 +81,6 @@ class ShortConvCheckpointMetadata:
 
 
 @dataclass
-class _CheckpointScatterClass:
-    """One batched scatter over checkpoint buffers sharing a storage, dtype
-    and channel width; destinations are flat element offsets into ``flat``."""
-
-    flat: torch.Tensor  # 1-D view spanning the buffers' shared storage
-    dtype: torch.dtype
-    layer: torch.Tensor  # [E] conv-state layer per entry
-    chan: torch.Tensor  # [E, width] conv-state channel coordinates
-    group_idx: torch.Tensor  # [E] row into the stacked per-group tensors
-    page_stride: torch.Tensor  # [E] storage elements per buffer page
-    dst_static: torch.Tensor  # [E, W-1, width] page-invariant flat offsets
-
-
-@dataclass
-class _CheckpointPublishPlan:
-    """Static scatter layout for ``_publish_accepted_shortconv_checkpoints``."""
-
-    groups: tuple[str, ...]
-    classes: tuple[_CheckpointScatterClass, ...]
-    num_streams: int
-    zero_src: torch.Tensor
-    zero_page: torch.Tensor
-
-
-@dataclass
 class InklingConvMetadata:
     """Per-forward metadata for the sconv state kernels.
 
@@ -118,8 +92,8 @@ class InklingConvMetadata:
         has_initial_state: ``[bs]`` bool; False for fresh prefills so stale
             slot contents are ignored.
         is_decode: True when this is a single-token-per-request decode batch.
-        seq_idx: ``[total_tokens]`` int32 sequence id per token (extend
-            batches only; None on decode).
+        seq_idx: ``[total_tokens]`` int32 sequence id per token (decode:
+            the cached arange — token t belongs to request t).
         update_mode: How the conv window is persisted after the forward.
             ``inplace``: kernel-native update (normal decode/extend).
             ``stash``: target verify — some chunk tokens may be REJECTED, so
@@ -655,6 +629,9 @@ class InklingAttnBackend(AttentionBackend):
                 self._ensure_verify_stash(bs * k, device)
         else:
             query_start_loc = self._decode_query_start_loc(bs, req_pool_indices.device)
+            # Decode: token t belongs to request t, so seq_idx is the same
+            # cached arange, one element shorter.
+            seq_idx = query_start_loc[:bs]
             has_initial_state = torch.ones(
                 bs, dtype=torch.bool, device=req_pool_indices.device
             )
@@ -768,6 +745,7 @@ class InklingAttnBackend(AttentionBackend):
             cache_indices=self._graph_cache_indices[:bs],
             has_initial_state=self._graph_has_initial_state[:bs],
             is_decode=True,
+            seq_idx=self._decode_qsl[:bs],
             col_page_table=(
                 {g: t[:bs] for g, t in self._graph_col_tables.items()}
                 if paged
@@ -871,71 +849,6 @@ class InklingAttnBackend(AttentionBackend):
         current = state[slots]
         state[slots] = torch.where(valid[:, None, None], restored, current)
 
-    @staticmethod
-    def publish_shortconv_checkpoints(
-        x: torch.Tensor,
-        state: torch.Tensor,
-        checkpoint_buffers: tuple[torch.Tensor, ...],
-        metadata: InklingConvMetadata,
-        group_id: str,
-    ) -> None:
-        """Publish completed boundaries without changing the rolling state."""
-        checkpoints = metadata.checkpoints
-        if checkpoints is None:
-            return
-        pages = checkpoints.write_pages[group_id]
-        if pages.numel() == 0:
-            return
-        if checkpoints.packed_rows is None:
-            # Single-token decode has already advanced the rolling window.
-            slots = metadata.cache_indices[: pages.shape[0]].to(torch.int64)
-            valid = (pages > 0) & (slots >= 0)
-            rows = state[slots.clamp_min(0)]
-        else:
-            requests = checkpoints.write_requests
-            slots = metadata.cache_indices[requests].to(torch.int64)
-            valid = (pages > 0) & (slots >= 0)
-            old_state = state[slots.clamp_min(0)]
-            old_rows = torch.gather(
-                old_state,
-                1,
-                checkpoints.prior_state_rows[..., None].expand(
-                    -1, -1, old_state.shape[-1]
-                ),
-            )
-            # Static prefill-graph metadata includes padded requests whose
-            # packed row is the one-past-end sentinel. Gather a safe row first;
-            # packed_row_mask discards it below.
-            safe_packed_rows = checkpoints.packed_rows.clamp(max=x.shape[0] - 1)
-            packed_rows = x[safe_packed_rows]
-            rows = torch.where(
-                checkpoints.packed_row_mask[..., None],
-                packed_rows,
-                old_rows,
-            )
-
-        offset = 0
-        pages = torch.where(
-            valid,
-            pages.to(torch.int64).clamp_min(0),
-            torch.zeros((), dtype=torch.int64, device=pages.device),
-        )
-        for buffer in checkpoint_buffers:
-            width = buffer.shape[-1]
-            new_rows = rows[..., offset : offset + width].to(buffer.dtype)
-            new_rows = torch.where(
-                valid[:, None, None],
-                new_rows,
-                torch.zeros((), dtype=new_rows.dtype, device=new_rows.device),
-            )
-            buffer[pages] = new_rows
-            offset += width
-        if offset != rows.shape[-1]:
-            raise ValueError(
-                f"ShortConv checkpoint buffers cover {offset} channels but "
-                f"rolling state has {rows.shape[-1]}"
-            )
-
     def register_shortconv_checkpoint_stream(
         self,
         *,
@@ -958,158 +871,6 @@ class InklingAttnBackend(AttentionBackend):
             raise RuntimeError(
                 f"ShortConv checkpoint stream {key!r} changed storage buffer"
             )
-
-    def _build_checkpoint_publish_plan(
-        self, state: torch.Tensor
-    ) -> _CheckpointPublishPlan:
-        """Precompute the batched-scatter layout of the registered checkpoint
-        streams.
-
-        Streams are grouped by ``(storage, dtype, width)`` so each class
-        publishes with one state gather plus one flat ``index_put_``,
-        keeping per-step launch count independent of layer count (the
-        per-stream loop used to dominate decode host time).
-        """
-        device = state.device
-        w1 = state.shape[2]
-        groups: list[str] = []
-        buckets: dict[tuple[int, torch.dtype, int], dict] = {}
-        for (
-            layer_id,
-            offset,
-            dim,
-            group_id,
-        ), buffers in self._checkpoint_streams.items():
-            if group_id not in groups:
-                groups.append(group_id)
-            field_offset = 0
-            for buffer in buffers:
-                if buffer.dim() != 3 or buffer.shape[1] != w1:
-                    raise ValueError(
-                        f"ShortConv checkpoint buffer shape {tuple(buffer.shape)} "
-                        f"does not match [pages, {w1}, width]"
-                    )
-                width = buffer.shape[-1]
-                key = (buffer.untyped_storage().data_ptr(), buffer.dtype, width)
-                bucket = buckets.setdefault(
-                    key,
-                    {
-                        "rep": buffer,
-                        "layer": [],
-                        "chan": [],
-                        "group": [],
-                        "base": [],
-                        "ps": [],
-                        "ws": [],
-                        "cs": [],
-                    },
-                )
-                page_stride, w_stride, c_stride = buffer.stride()
-                bucket["layer"].append(layer_id)
-                bucket["chan"].append(offset + field_offset)
-                bucket["group"].append(groups.index(group_id))
-                bucket["base"].append(buffer.storage_offset())
-                bucket["ps"].append(page_stride)
-                bucket["ws"].append(w_stride)
-                bucket["cs"].append(c_stride)
-                field_offset += width
-            if field_offset != dim:
-                raise ValueError(
-                    f"ShortConv checkpoint buffers cover {field_offset} "
-                    f"channels but stream width is {dim}"
-                )
-
-        classes = []
-        w_idx = torch.arange(w1, dtype=torch.int64, device=device)
-        for (_, dtype, width), bucket in buckets.items():
-            rep = bucket["rep"]
-            storage_numel = rep.untyped_storage().nbytes() // rep.element_size()
-            cols = {
-                name: torch.tensor(bucket[name], dtype=torch.int64, device=device)
-                for name in ("layer", "chan", "group", "base", "ps", "ws", "cs")
-            }
-            c_idx = torch.arange(width, dtype=torch.int64, device=device)
-            classes.append(
-                _CheckpointScatterClass(
-                    flat=rep.as_strided((storage_numel,), (1,), 0),
-                    dtype=dtype,
-                    layer=cols["layer"],
-                    chan=cols["chan"][:, None] + c_idx[None, :],
-                    group_idx=cols["group"],
-                    page_stride=cols["ps"],
-                    dst_static=(
-                        cols["base"][:, None, None]
-                        + w_idx[None, :, None] * cols["ws"][:, None, None]
-                        + c_idx[None, None, :] * cols["cs"][:, None, None]
-                    ),
-                )
-            )
-        return _CheckpointPublishPlan(
-            groups=tuple(groups),
-            classes=tuple(classes),
-            num_streams=len(self._checkpoint_streams),
-            zero_src=torch.zeros((), dtype=state.dtype, device=device),
-            zero_page=torch.zeros((), dtype=torch.int64, device=device),
-        )
-
-    def _publish_accepted_shortconv_checkpoints(
-        self, accept_lengths: torch.Tensor
-    ) -> None:
-        metadata = self.conv_metadata
-        geometry = getattr(self, "conv_columns", None)
-        checkpoint_streams = getattr(self, "_checkpoint_streams", None)
-        if (
-            not checkpoint_streams
-            or geometry is None
-            or metadata.col_page_table is None
-            or metadata.col_seq_lens is None
-        ):
-            return
-        n = min(metadata.cache_indices.shape[0], accept_lengths.shape[0])
-        if n == 0:
-            return
-        state = self.conv_pool.conv_state
-        plan = getattr(self, "_checkpoint_publish_plan", None)
-        if plan is None or plan.num_streams != len(checkpoint_streams):
-            plan = self._build_checkpoint_publish_plan(state)
-            self._checkpoint_publish_plan = plan
-        page_size = int(geometry["block_tokens"])
-        accepted_seq_lens = (
-            metadata.col_seq_lens[:n].to(torch.int64)
-            - metadata.tokens_per_req
-            + accept_lengths[:n].to(torch.int64)
-        )
-        pages = torch.stack(
-            [
-                self._checkpoint_pages_at_boundaries(
-                    metadata.col_page_table[group_id][:n],
-                    accepted_seq_lens,
-                    page_size,
-                )
-                for group_id in plan.groups
-            ]
-        )
-        slots = metadata.cache_indices[:n].to(torch.int64)
-        # [G, n]; invalid rows are routed to each buffer's reserved page 0.
-        valid = (slots >= 0)[None] & (pages > 0) & (accept_lengths[:n] > 0)[None]
-        pages = torch.where(valid, pages.to(torch.int64).clamp_min(0), plan.zero_page)
-        slots = slots.clamp_min(0)
-        w_idx = self._cached_arange_w1(state.shape[2], state.device)
-        for cls in plan.classes:
-            rows = state[
-                cls.layer[:, None, None, None],
-                slots[None, :, None, None],
-                w_idx[None, None, :, None],
-                cls.chan[:, None, None, :],
-            ]
-            rows = torch.where(
-                valid[cls.group_idx][:, :, None, None], rows, plan.zero_src
-            ).to(cls.dtype)
-            dst = (
-                cls.dst_static[:, None]
-                + (pages[cls.group_idx] * cls.page_stride[:, None])[:, :, None, None]
-            )
-            cls.flat[dst.reshape(-1)] = rows.reshape(-1)
 
     def apply_conv_state_update(
         self,
@@ -1142,10 +903,8 @@ class InklingAttnBackend(AttentionBackend):
             )
             return
         if md.update_mode == "stash":
-            # Rejects unknown until verify: stash; the post-verify hook writes the final window.
-            self._verify_stash[
-                layer_id, : x.shape[0], channel_offset : channel_offset + dim
-            ].copy_(x)
+            # Rejects unknown until verify: the compute kernel already wrote
+            # the scratch; the post-verify hook writes the final window.
             return
         assert md.update_mode == "valid_len"
         if accept_lengths is None:
@@ -1348,10 +1107,6 @@ class InklingAttnBackend(AttentionBackend):
         state[:, idx] = torch.where(
             from_old, old.gather(2, rows_old), chunk.gather(2, rows_new)
         )
-        # LCM field views may be inference tensors allocated during executor
-        # initialization, while this post-verify hook runs outside the forward.
-        with maybe_inference_mode():
-            self._publish_accepted_shortconv_checkpoints(accept_lengths[:n])
 
     def _cached_arange_w1(self, w1: int, device) -> torch.Tensor:
         buf = getattr(self, "_arange_w1_buf", None)
@@ -1375,11 +1130,13 @@ class InklingAttnBackend(AttentionBackend):
             has_initial = torch.ones(
                 bs, dtype=torch.bool, device=md.cache_indices.device
             )
+        query_start_loc = self._decode_query_start_loc(bs, md.cache_indices.device)
         self.conv_metadata = InklingConvMetadata(
-            query_start_loc=self._decode_query_start_loc(bs, md.cache_indices.device),
+            query_start_loc=query_start_loc,
             cache_indices=md.cache_indices,
             has_initial_state=has_initial,
             is_decode=True,
+            seq_idx=query_start_loc[:bs],
         )
 
     # ------------------------------------------------------------------

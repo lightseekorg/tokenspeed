@@ -82,9 +82,9 @@ from collections.abc import Callable, Iterable
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.conv import (
-    sconv_decode,
+    inkling_sconv,
+    sconv_cache_update,
     sconv_decode_paged,
-    sconv_prefill,
     sconv_prefill_paged,
 )
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
@@ -516,27 +516,50 @@ def _sconv_apply(
                 checkpoint_group,
             )
 
+    # In-kernel speculative boundary publish: every covered 128-boundary,
+    # accept-independent; rejected content is overwritten by a later round.
+    publish = None
+    if checkpoint_buffers and md.col_seq_lens is not None:
+        publish = (
+            md.col_page_table[checkpoint_group],
+            md.col_seq_lens,
+            checkpoint_buffers[0],
+            checkpoint_buffers[1] if len(checkpoint_buffers) == 2 else None,
+            geo["block_tokens"],
+        )
+
     if md.is_decode:
-        # Fused conv + residual + in-place cache shift.
-        y = sconv_decode(
+        y = inkling_sconv(
             x,
             weight,
             state,
+            md.query_start_loc,
+            md.seq_idx,
             md.cache_indices,
+            md.has_initial_state,
             activation=None,
             use_residual=True,
             enable_pdl=pdl_enabled(),
+            publish=publish,
         )
-        if checkpoint_buffers and md.update_mode == "inplace":
-            backend.publish_shortconv_checkpoints(
+        # The unified kernel does not shift the window; persist explicitly.
+        if md.update_mode == "inplace":
+            sconv_cache_update(
                 x,
                 state,
-                checkpoint_buffers,
-                md,
-                checkpoint_group,
+                md.query_start_loc,
+                md.cache_indices,
+                md.has_initial_state,
             )
         return y
-    y = sconv_prefill(
+    scratch = (
+        backend._verify_stash[
+            layer_id, : x.shape[0], channel_offset : channel_offset + dim
+        ]
+        if md.update_mode == "stash"
+        else None
+    )
+    y = inkling_sconv(
         x,
         weight,
         state,
@@ -546,15 +569,10 @@ def _sconv_apply(
         md.has_initial_state,
         activation=None,
         use_residual=True,
+        scratch=scratch,
+        publish=publish,
+        enable_pdl=pdl_enabled(),
     )
-    if checkpoint_buffers and md.update_mode == "inplace":
-        backend.publish_shortconv_checkpoints(
-            x,
-            state,
-            checkpoint_buffers,
-            md,
-            checkpoint_group,
-        )
     # Backend owns the window write: mode-dependent under spec decoding (verify stash / catch-up).
     backend.apply_conv_state_update(
         x,
