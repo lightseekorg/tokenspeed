@@ -237,7 +237,9 @@ def inkling_ring_sconv_update(
     *,
     kernel_width: int,
 ) -> None:
-    """Persist each request's last ``W - 1`` chunk rows into its ring, in place.
+    """Persist each request's last ``min(chunk_len, R)`` chunk rows into its
+    ring, in place — the full ring depth, so any consumer rewind (e.g. the
+    draft decode lookback window) finds its taps.
 
     Required after :func:`inkling_ring_sconv` for batches that may contain chunks
     longer than ``R - (W - 1)`` (prefill/extend), which the compute kernel

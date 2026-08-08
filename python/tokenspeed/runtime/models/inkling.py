@@ -441,7 +441,7 @@ def _sconv_apply(
     )
     if md.needs_ring_update:
         # Extend chunks can exceed the compute kernel's in-kernel persistence
-        # bound; store the last W-1 rows in a follow-up pass.
+        # bound; refill the full ring depth in a follow-up pass.
         inkling_ring_sconv_update(
             x,
             state,

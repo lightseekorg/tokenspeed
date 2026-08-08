@@ -153,13 +153,13 @@ def test_sconv_prefill_varlen(D: int, use_residual: bool, device: str) -> None:
         expected[2, (pre_lens[0] + j) % R] = x[cu[0] + j]
     assert torch.equal(conv_cache, expected)
 
-    # The follow-up pass persists the long chunk's last W-1 rows.
+    # The follow-up pass refills the full ring depth from the long chunk.
     inkling_ring_sconv_update(
         x, conv_cache, cu_seqlens, seq_lens, cache_indices, kernel_width=W
     )
-    for j in range(W - 1):
-        pos = seq_lens[1].item() - (W - 1) + j
-        expected[5, pos % R] = x[cu[2] - (W - 1) + j]
+    for j in range(R):
+        pos = seq_lens[1].item() - R + j
+        expected[5, pos % R] = x[cu[2] - R + j]
     assert torch.equal(conv_cache, expected)
 
 
@@ -184,11 +184,14 @@ def test_ring_update_bounds_and_pad(device: str) -> None:
 
     expected = old.clone()
     cu = cu_seqlens.tolist()
-    # Only chunks longer than R - (W-1) = 6 are written: lens 850 and 7.
+    # Only chunks longer than R - (W-1) = 6 are written: lens 850 and 7. Each
+    # persists its last min(chunk_len, R) rows (9 and 7 respectively).
     for i in (0, 2):
-        for j in range(W - 1):
-            pos = int(seq_lens[i]) - (W - 1) + j
-            expected[int(cache_indices[i]), pos % R] = x[cu[i + 1] - (W - 1) + j]
+        for j in range(R):
+            if lens[i] < R - j:
+                continue
+            pos = int(seq_lens[i]) - R + j
+            expected[int(cache_indices[i]), pos % R] = x[cu[i + 1] - R + j]
     assert torch.equal(conv_cache, expected)
 
 
@@ -213,10 +216,61 @@ def test_ring_update_small_ring_borrows_nothing(device: str) -> None:
 
     expected = old.clone()
     # chunk_len 2 > R - (W-1) = 1, so the update runs; source rows exist only
-    # for the last two window positions (j = 1, 2).
+    # for the last two ring positions (j = 2, 3).
     expected[3, (pre_len + 0) % small_r] = x[0]
     expected[3, (pre_len + 1) % small_r] = x[1]
     assert torch.equal(conv_cache, expected)
+
+
+def test_sconv_prefill_then_lookback_window(device: str) -> None:
+    """Round-1 draft lookback after a long prefill: the window starts at
+    ``through - lookback`` and its first taps read down to ``through - 5``,
+    deeper than W-1 — the ring_update pass must have persisted those rows."""
+    D = 2048
+    lb, k = 2, 4
+    prefill_len = 850
+    torch.manual_seed(7)
+    x_full = torch.randn(prefill_len + k, D, device=device, dtype=DTYPE)
+    weight = torch.randn(D, W, device=device, dtype=DTYPE) * 0.5
+    conv_cache = torch.randn(4, R, D, device=device, dtype=DTYPE)
+    cache_indices = torch.tensor([1], dtype=torch.int32, device=device)
+
+    x_pre = x_full[:prefill_len].contiguous()
+    cu_pre = _make_cu_seqlens([prefill_len], device)
+    pre_seq_lens = torch.tensor([prefill_len], dtype=torch.int32, device=device)
+    inkling_ring_sconv(
+        x_pre,
+        weight,
+        conv_cache,
+        cu_pre,
+        seq_idx_from_cu_seqlens(cu_pre, prefill_len),
+        cache_indices,
+        torch.tensor([False], device=device),
+        pre_seq_lens,
+    )
+    inkling_ring_sconv_update(
+        x_pre, conv_cache, cu_pre, pre_seq_lens, cache_indices, kernel_width=W
+    )
+
+    # Lookback window: lb committed rows rewritten + k fresh rows, positions
+    # prefill_len - lb .. prefill_len + k - lb - 1.
+    start = prefill_len - lb
+    x_win = x_full[start : start + lb + k].contiguous()
+    cu_win = _make_cu_seqlens([lb + k], device)
+    win_seq_lens = torch.tensor([start + lb + k], dtype=torch.int32, device=device)
+    y_win = inkling_ring_sconv(
+        x_win,
+        weight,
+        conv_cache,
+        cu_win,
+        seq_idx_from_cu_seqlens(cu_win, lb + k),
+        cache_indices,
+        torch.tensor([True], device=device),
+        win_seq_lens,
+    )
+
+    ref = ref_sconv(x_win, weight, x_full[start - (W - 1) : start])
+    torch.testing.assert_close(y_win, ref, atol=ATOL, rtol=RTOL)
 
 
 @pytest.mark.parametrize("D", [2048, 6144])

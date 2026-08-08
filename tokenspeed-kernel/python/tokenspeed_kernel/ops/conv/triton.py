@@ -33,8 +33,8 @@ Two kernels backing the public API in :mod:`tokenspeed_kernel.ops.conv`:
 - ``_inkling_ring_sconv_update_kernel``: ring persistence for chunks longer than
   ``R - (W-1)`` (prefill/extend), where the compute kernel must not write —
   a wrapped write could alias another tile's pre-chunk tap read. Launched
-  after the compute kernel, it stores the last ``W - 1`` chunk rows at their
-  positions' ring rows.
+  after the compute kernel, it stores the last ``min(chunk_len, R)`` chunk
+  rows at their positions' ring rows.
 
 Both kernels take explicit strides for the conv ring so channel-sliced views
 (``ring[:, :, off:off + D]``) work without a copy. ``PAD_SLOT_ID`` (-1) rows
@@ -342,7 +342,11 @@ def _inkling_ring_sconv_update_kernel(
     R: tl.constexpr,
     W_MINUS_1: tl.constexpr,
 ):
-    """Store the last ``W - 1`` chunk rows at their positions' ring rows.
+    """Store the last ``min(chunk_len, R)`` chunk rows at their positions'
+    ring rows — the full ring depth, so any consumer rewind (e.g. the draft
+    decode lookback window) finds its taps regardless of depth. This pass
+    runs after the compute kernel completes, so unlike the in-kernel writes
+    it has no aliasing bound.
 
     Grid: ``(B, cdiv(D, BLOCK_D))``. Requests whose chunk the compute kernel
     already persisted in-kernel (``chunk_len <= R - (W-1)``) exit early, as
@@ -367,12 +371,12 @@ def _inkling_ring_sconv_update_kernel(
     d_mask = d_off < D
     cache_base = conv_cache_ptr + ci.to(tl.int64) * stride_c_slot + d_off * stride_c_d
 
-    for j in tl.static_range(W_MINUS_1):
-        pos = through - W_MINUS_1 + j
-        if chunk_len >= W_MINUS_1 - j and pos >= 0:
+    for j in tl.static_range(R):
+        pos = through - R + j
+        if chunk_len >= R - j and pos >= 0:
             row = pos % R
             val = tl.load(
-                x_ptr + (end - W_MINUS_1 + j) * stride_x_t + d_off * stride_x_d,
+                x_ptr + (end - R + j) * stride_x_t + d_off * stride_x_d,
                 mask=d_mask,
                 other=0,
             )
