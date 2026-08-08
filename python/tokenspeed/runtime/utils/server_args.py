@@ -230,6 +230,8 @@ class ServerArgs:
     kvstore_storage_backend: str | None = None
     kvstore_storage_backend_extra_config: str | None = None
     enable_mla_l1_5_cache: bool = False
+    enable_gpt_oss_megakernel: bool = False
+    gpt_oss_megakernel_max_bs: int = 8
 
     # Multi-node distributed serving. ``None`` means "not given by the user",
     # which is what lets the launcher environment fill them in.
@@ -1174,6 +1176,20 @@ class ServerArgs:
             "--enable-mla-l1-5-cache",
             action="store_true",
             help="Enable MLA L1.5 cache in disaggregation paths.",
+        )
+        parser.add_argument(
+            "--enable-gpt-oss-megakernel",
+            action="store_true",
+            help="Run GPT-OSS decode as one persistent Triton megakernel "
+            "(gfx950, --world-size 1). Prefill, TP>1 and speculative "
+            "decode fall through to the normal per-op path.",
+        )
+        parser.add_argument(
+            "--gpt-oss-megakernel-max-bs",
+            type=int,
+            default=ServerArgs.gpt_oss_megakernel_max_bs,
+            help="Largest decode batch the GPT-OSS megakernel handles; "
+            "larger batches use the normal path.",
         )
         # Mamba Cache
         parser.add_argument(
