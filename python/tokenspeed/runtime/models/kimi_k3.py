@@ -976,10 +976,9 @@ class KimiLinearMoE(nn.Module):
         )
         # AUTO intentionally requests the flashinfer-backed SiTU plan when it was
         # registered at import time; AUTO cannot override MoELayer per model.
-        self.use_trtllm_situ_moe = self.execution_plan.use_trtllm
-        self.use_marlin_situ_moe = self.execution_plan.use_marlin
-        if not self.execution_plan.use_native and not self.use_marlin_situ_moe:
-            if not self.use_trtllm_situ_moe:
+        plan = self.execution_plan
+        if not plan.use_native and not plan.use_marlin:
+            if not plan.use_trtllm:
                 raise RuntimeError(
                     "Kimi-K3 MXFP4 SiTU MoE requires the native, FlashInfer "
                     "TRT-LLM, or Marlin (Hopper W4A16) backend; no portable SiTU "
@@ -1027,7 +1026,7 @@ class KimiLinearMoE(nn.Module):
             output_format=TopKOutputFormat.STANDARD,
             # bf16 weights out: makes the fused SiTU kernel's cast a no-op.
             topk_weights_dtype=(
-                torch.bfloat16 if self.use_trtllm_situ_moe else torch.float32
+                torch.bfloat16 if self.execution_plan.use_trtllm else torch.float32
             ),
         )
 
@@ -1304,7 +1303,8 @@ class KimiLinearMoE(nn.Module):
         max_num_tokens_per_gpu: int,
     ) -> torch.Tensor:
         """Run the precomputed-TopK SiTU MoE (TRT-LLM cubin or Hopper Marlin)."""
-        if not self.use_trtllm_situ_moe and not self.use_marlin_situ_moe:
+        plan = self.execution_plan
+        if not plan.use_trtllm and not plan.use_marlin:
             raise RuntimeError(
                 "Kimi-K3 has no portable SiTU Triton fallback; use the native, "
                 "FlashInfer TRT-LLM, or Marlin SiTU MoE path."
