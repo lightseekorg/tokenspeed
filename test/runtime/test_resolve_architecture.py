@@ -1,13 +1,13 @@
-"""Branch coverage for the architecture-resolution helpers in
-``hf_transformers_utils``: ``resolve_architecture`` (None-safe read) and
-``_materialize_architectures`` (pin the raw config.json value back onto
-the live config when ``from_pretrained`` lost it)."""
+"""Branch coverage for Hugging Face config loading and repair helpers."""
 
 # ruff: noqa: E402
 
+import json
 import os
 import sys
+import tempfile
 import unittest
+from unittest.mock import patch
 
 import torch
 from transformers import PretrainedConfig
@@ -23,6 +23,8 @@ from tokenspeed.runtime.configs.qwen3_5_config import Qwen3_5MoeTextConfig  # no
 from tokenspeed.runtime.configs.utils import get_rope_parameters  # noqa: E402
 from tokenspeed.runtime.utils.hf_transformers_utils import (
     _materialize_architectures,
+    _materialize_qwen3_5_text_config,
+    get_config,
 )
 from tokenspeed.runtime.utils.hf_transformers_utils import (  # noqa: E402
     get_hf_text_config as get_runtime_hf_text_config,
@@ -30,6 +32,24 @@ from tokenspeed.runtime.utils.hf_transformers_utils import (  # noqa: E402
 from tokenspeed.runtime.utils.hf_transformers_utils import (
     resolve_architecture,
 )
+
+_QWEN3_5_RAW_TEXT_CONFIG = {
+    "hidden_size": 4096,
+    "max_position_embeddings": 262144,
+    "num_attention_heads": 32,
+    "num_hidden_layers": 60,
+    "full_attention_interval": 4,
+}
+_QWEN3_5_RAW_CONFIG = {
+    "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+    "model_type": "qwen3_5_moe",
+    "text_config": _QWEN3_5_RAW_TEXT_CONFIG,
+}
+
+
+def _write_config(directory: str, raw_config: dict) -> None:
+    with open(os.path.join(directory, "config.json"), "w") as file:
+        json.dump(raw_config, file)
 
 
 class ResolveArchitectureTests(unittest.TestCase):
@@ -85,6 +105,165 @@ class Qwen3_5ConfigTests(unittest.TestCase):
         self.assertNotIn("mrope_section", config.rope_parameters)
         self.assertNotIn("mrope_interleaved", config.rope_parameters)
         self.assertEqual(get_rope_parameters(config), rope_parameters)
+
+    def test_default_config_serialization_still_round_trips(self) -> None:
+        config = Qwen3_5MoeConfig()
+        self.assertIsInstance(config.to_diff_dict(), dict)
+
+        with tempfile.TemporaryDirectory() as directory:
+            config.save_pretrained(directory)
+            restored = Qwen3_5MoeConfig.from_pretrained(directory)
+
+        self.assertEqual(restored.text_config.hidden_size, 2048)
+        self.assertEqual(restored.text_config.max_position_embeddings, 32768)
+
+
+class MaterializeQwen3_5TextConfigTests(unittest.TestCase):
+    def test_restores_exact_defaulted_text_config_from_raw_payload(self) -> None:
+        config = Qwen3_5MoeConfig()
+        self.assertEqual(config.text_config.hidden_size, 2048)
+        self.assertFalse(hasattr(config.text_config, "full_attention_interval"))
+
+        _materialize_qwen3_5_text_config(config, _QWEN3_5_RAW_CONFIG)
+
+        self.assertEqual(config.text_config.hidden_size, 4096)
+        self.assertEqual(config.text_config.max_position_embeddings, 262144)
+        self.assertEqual(config.text_config.full_attention_interval, 4)
+        self.assertEqual(len(config.text_config.layers_block_type), 60)
+
+    def test_rejects_missing_nested_text_config(self) -> None:
+        with self.assertRaisesRegex(ValueError, "nested text_config object"):
+            _materialize_qwen3_5_text_config(
+                Qwen3_5MoeConfig(),
+                {"model_type": "qwen3_5_moe"},
+            )
+
+    def test_rejects_missing_full_attention_interval(self) -> None:
+        raw_config = {
+            **_QWEN3_5_RAW_CONFIG,
+            "text_config": {"hidden_size": 4096},
+        }
+        with self.assertRaisesRegex(ValueError, "full_attention_interval"):
+            _materialize_qwen3_5_text_config(Qwen3_5MoeConfig(), raw_config)
+
+    def test_reports_materialization_mismatches(self) -> None:
+        # Protect against future config constructors dropping or normalizing
+        # checkpoint-defining kwargs while rebuilding the nested payload.
+        config = Qwen3_5MoeConfig()
+        with (
+            patch.object(
+                config,
+                "_ensure_text_config",
+                return_value=Qwen3_5MoeTextConfig(full_attention_interval=4),
+            ),
+            self.assertRaisesRegex(
+                ValueError,
+                "hidden_size: raw=4096, materialized=2048",
+            ),
+        ):
+            _materialize_qwen3_5_text_config(config, _QWEN3_5_RAW_CONFIG)
+
+
+class GetConfigSnapshotTests(unittest.TestCase):
+    def test_registered_config_uses_one_revision_pinned_snapshot(self) -> None:
+        defaulted_config = Qwen3_5MoeConfig()
+        with tempfile.TemporaryDirectory() as directory:
+            _write_config(directory, _QWEN3_5_RAW_CONFIG)
+            with (
+                patch(
+                    "tokenspeed.runtime.utils.hf_transformers_utils.snapshot_download",
+                    return_value=directory,
+                ) as download,
+                patch.object(
+                    Qwen3_5MoeConfig,
+                    "from_pretrained",
+                    return_value=defaulted_config,
+                ) as from_pretrained,
+            ):
+                config = get_config(
+                    "nvidia/Qwen3.5-397B-A17B-NVFP4",
+                    trust_remote_code=False,
+                    revision="checkpoint-revision",
+                )
+
+        download.assert_called_once_with(
+            "nvidia/Qwen3.5-397B-A17B-NVFP4",
+            revision="checkpoint-revision",
+            ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
+        )
+        from_pretrained.assert_called_once_with(directory)
+        self.assertEqual(config._name_or_path, "nvidia/Qwen3.5-397B-A17B-NVFP4")
+        self.assertEqual(config.text_config.hidden_size, 4096)
+        self.assertEqual(config.text_config.full_attention_interval, 4)
+
+    def test_text_only_qwen3_5_config_skips_wrapper_materialization(self) -> None:
+        raw_config = {
+            "architectures": ["Qwen3_5MoeForCausalLM"],
+            "model_type": "qwen3_5_moe_text",
+            **_QWEN3_5_RAW_TEXT_CONFIG,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            _write_config(directory, raw_config)
+            config = get_config(directory, trust_remote_code=False)
+
+        self.assertIsInstance(config, Qwen3_5MoeTextConfig)
+        self.assertEqual(config.hidden_size, 4096)
+        self.assertEqual(config.full_attention_interval, 4)
+
+    def test_model_overrides_apply_after_raw_config_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _write_config(directory, _QWEN3_5_RAW_CONFIG)
+            config = get_config(
+                directory,
+                trust_remote_code=False,
+                model_override_args={"max_position_embeddings": 8192},
+            )
+
+        self.assertEqual(config.text_config.max_position_embeddings, 8192)
+
+    def test_draft_worker_can_override_interval_after_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _write_config(directory, _QWEN3_5_RAW_CONFIG)
+            config = get_config(
+                directory,
+                trust_remote_code=False,
+                is_draft_worker=True,
+            )
+
+        self.assertEqual(
+            config.architectures,
+            ["Qwen3_5MoeForConditionalGenerationNextN"],
+        )
+        config.text_config.full_attention_interval = 1
+        self.assertEqual(
+            config.text_config.full_attention_layer_ids,
+            list(range(config.text_config.num_hidden_layers)),
+        )
+
+    def test_auto_config_branch_loads_resolved_local_snapshot(self) -> None:
+        raw_config = {
+            "architectures": ["UnregisteredForCausalLM"],
+            "model_type": "unregistered",
+        }
+        loaded_config = PretrainedConfig(architectures=["UnregisteredForCausalLM"])
+        with tempfile.TemporaryDirectory() as directory:
+            _write_config(directory, raw_config)
+            with patch(
+                "tokenspeed.runtime.utils.hf_transformers_utils.AutoConfig.from_pretrained",
+                return_value=loaded_config,
+            ) as from_pretrained:
+                config = get_config(
+                    directory,
+                    trust_remote_code=True,
+                    custom_argument="value",
+                )
+
+        from_pretrained.assert_called_once_with(
+            directory,
+            trust_remote_code=True,
+            custom_argument="value",
+        )
+        self.assertIs(config, loaded_config)
 
 
 class ConfigDtypeTests(unittest.TestCase):

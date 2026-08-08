@@ -186,6 +186,55 @@ def _materialize_architectures(config: PretrainedConfig, raw_config: dict) -> No
     config.__dict__["architectures"] = list(raw_archs)
 
 
+def _materialize_qwen3_5_text_config(
+    config: PretrainedConfig, raw_config: dict
+) -> None:
+    """Restore a Qwen3.5 wrapper's nested config from ``config.json``.
+
+    The wrapper's default construction path creates a plausible but incomplete
+    text config when ``from_pretrained`` loses the nested payload. Rebuild it
+    from the already-read snapshot and verify the checkpoint-defining fields
+    before any model code can observe those defaults.
+    """
+    if not isinstance(config, Qwen3_5Config):
+        return
+
+    raw_text_config = raw_config.get("text_config")
+    if not isinstance(raw_text_config, dict):
+        raise ValueError(
+            "Qwen3.5 config.json must contain a nested text_config object; "
+            f"got {type(raw_text_config).__name__}."
+        )
+    if "full_attention_interval" not in raw_text_config:
+        raise ValueError(
+            "Qwen3.5 config.json text_config is missing required field "
+            "full_attention_interval."
+        )
+
+    # This internal conversion hook selects the wrapper's matching text class
+    # (dense or MoE) and applies the same normalization as normal construction.
+    config.text_config = config._ensure_text_config(copy.deepcopy(raw_text_config))
+
+    mismatches = []
+    for field in (
+        "hidden_size",
+        "max_position_embeddings",
+        "num_hidden_layers",
+        "full_attention_interval",
+    ):
+        if field not in raw_text_config:
+            continue
+        expected = raw_text_config[field]
+        actual = getattr(config.text_config, field, None)
+        if actual != expected:
+            mismatches.append(f"{field}: raw={expected!r}, materialized={actual!r}")
+
+    if mismatches:
+        raise ValueError(
+            "Qwen3.5 text_config does not match config.json: " + "; ".join(mismatches)
+        )
+
+
 def _restore_raw_glm_dsa_fields(config: PretrainedConfig, raw_config: dict) -> None:
     if raw_config.get("architectures") != ["GlmMoeDsaForCausalLM"]:
         return
@@ -228,7 +277,9 @@ def get_config(
 
         with get_lock(model):
             model_path = snapshot_download(
-                model, ignore_patterns=["*.pt", "*.safetensors", "*.bin"]
+                model,
+                revision=revision,
+                ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
             )
 
     try:
@@ -241,18 +292,21 @@ def get_config(
             f"Failed to decode JSON from config file in {model}. Please ensure the file is valid JSON."
         )
 
+    # Construct from the same local config.json parsed above. For remote model
+    # IDs, snapshot_download has already selected ``revision`` exactly once.
     if raw_config.get("model_type", "llama") in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[raw_config["model_type"]]
-        config = config_class.from_pretrained(model, revision=revision)
-        setattr(config, "_name_or_path", model)
+        config = config_class.from_pretrained(model_path)
     else:
         try:
             config = AutoConfig.from_pretrained(
-                model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+                model_path, trust_remote_code=trust_remote_code, **kwargs
             )
         except ValueError as e:
             raise e
+    setattr(config, "_name_or_path", model)
 
+    _materialize_qwen3_5_text_config(config, raw_config)
     _materialize_architectures(config, raw_config)
     _restore_raw_glm_dsa_fields(config, raw_config)
 
