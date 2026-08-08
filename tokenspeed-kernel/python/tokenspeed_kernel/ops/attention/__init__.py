@@ -2679,7 +2679,31 @@ def dsv4_sparse_mla_decode(
     override: str | None = None,
     solution: str | None = None,
 ) -> torch.Tensor:
-    """Run DeepSeek V4 sparse MLA over its SWA and compressed KV pools."""
+    """Run DeepSeek V4 sparse MLA over its SWA and compressed KV pools.
+
+    Args:
+        q: BF16 query rows with shape ``[tokens, heads, 512]``.
+        swa_kv_cache: Packed SWA cache in NHD layout with shape
+            ``[pages, page_size, 1, bytes]``.
+        swa_indices: SWA cache indices with shape ``[tokens, topk]``.
+        swa_topk_lens: Active SWA index counts with shape ``[tokens]``.
+        compressed_kv_cache: Optional packed compressed cache with the same
+            NHD layout as ``swa_kv_cache``.
+        compressed_indices: Optional compressed-cache indices with shape
+            ``[tokens, topk]`` or ``[tokens, 1, topk]``.
+        compressed_topk_lens: Active compressed index counts with shape
+            ``[tokens]``. All three compressed-cache arguments must be
+            provided together.
+        softmax_scale: Scale applied to query-key logits before softmax.
+        sinks: Optional FP32 attention sink logits with shape ``[heads]``.
+        out: Optional BF16 output buffer with the same shape as ``q``.
+        override: Optional registered kernel name to force during selection.
+        solution: Optional kernel solution family to select.
+
+    Returns:
+        The BF16 attention result with shape ``[tokens, heads, 512]``. When
+        ``out`` is provided, the selected kernel writes to and returns it.
+    """
     if q.dim() != 3:
         raise ValueError(f"q must be [tokens, heads, 512], got {tuple(q.shape)}")
     if swa_kv_cache.dim() != 4 or swa_kv_cache.shape[2] != 1:

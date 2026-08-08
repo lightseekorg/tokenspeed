@@ -70,8 +70,8 @@ THIRDPARTY_DIR = ROOT / "tokenspeed_kernel" / "thirdparty"
 BASE_VERSION = "0.1.3"
 BACKEND_ENV = "TOKENSPEED_KERNEL_BACKEND"
 VALID_BACKENDS = {"cuda", "rocm"}
-DEFAULT_CUDA_ARCHS = ("100a", "103a")
-ATTN_RES_CUDA_ARCHS = frozenset(DEFAULT_CUDA_ARCHS)
+DEFAULT_CUDA_ARCHS = ("100a", "103a", "120f", "121a")
+ATTN_RES_CUDA_ARCHS = frozenset({"100a", "103a"})
 
 # CUDA kernels source and output directories
 CUDA_CSRC_DIR = THIRDPARTY_DIR / "cuda" / "csrc"

@@ -299,7 +299,10 @@ def _autotune_operands(m: int, k: int, i: int):
     ]
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="NVIDIA CUDA GPU required")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.cuda is None,
+    reason="NVIDIA CUDA GPU required",
+)
 def test_nvfp4_gemm_swiglu_autotune_initializers_are_input_indexed() -> None:
     from tokenspeed_kernel.ops.gemm.cute_dsl import (
         _Nvfp4GemmSwigluNvfp4QuantRunner,
