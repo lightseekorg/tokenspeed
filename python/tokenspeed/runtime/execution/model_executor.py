@@ -320,14 +320,12 @@ class ModelExecutor:
 
         # The batch-ordered full-history table backs out_cache_loc and the
         # draft page table. First contract group with family=history and
-        # retention=full_history -- the same selection CacheBatchMetadata
-        # exposes as ``first_full_attention_group_id``.
+        # retention=full_history.
         self._full_history_group_id = next(
             (
                 str(spec.group_id)
                 for spec in self._cache_runtime_contract.group_specs
-                if getattr(spec, "family", "history") == "history"
-                and getattr(spec, "retention", None) == "full_history"
+                if spec.family == "history" and spec.retention == "full_history"
             ),
             None,
         )

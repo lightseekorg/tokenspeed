@@ -35,7 +35,10 @@ from tokenspeed_kernel.ops.attention import (
     attn_merge_state,
     mla_project_value,
 )
-from tokenspeed_kernel.ops.attention.tokenspeed_mla import mla_kv_pack_quantize_fp8
+from tokenspeed_kernel.ops.attention.tokenspeed_mla import (
+    mla_kv_pack_quantize_fp8,
+    mla_prefill_pdl_enabled,
+)
 from tokenspeed_kernel.ops.attention.triton.mla_query_assemble import (
     mla_nope_query_fp8,
 )
@@ -1086,14 +1089,16 @@ class DeepseekV3AttentionMLA(nn.Module):
                 is_neox=is_neox,
                 quant_scale_q=1.0,
                 quant_scale_kv=k_scale,
-                enable_pdl=pdl_enabled(),
+                enable_pdl=mla_prefill_pdl_enabled(pdl_enabled()),
             )
 
-            v_fp8 = fp8_quantize(v, enable_pdl=pdl_enabled())
+            v_fp8 = fp8_quantize(v, enable_pdl=mla_prefill_pdl_enabled(pdl_enabled()))
 
             # Write FP8 KV cache directly (skip BF16→FP8 conversion in pool)
             k_pe_for_cache = k_fp8[:, 0:1, self.qk_nope_head_dim :]
-            kv_a_fp8 = fp8_quantize(kv_a, enable_pdl=pdl_enabled())
+            kv_a_fp8 = fp8_quantize(
+                kv_a, enable_pdl=mla_prefill_pdl_enabled(pdl_enabled())
+            )
             ctx.token_to_kv_pool.set_mla_kv_buffer(
                 self.attn_mha,
                 out_cache_loc,
@@ -1191,7 +1196,11 @@ class DeepseekV3AttentionMLA(nn.Module):
             if q.dtype == torch.float8_e4m3fn:
                 # FP8 Attention
                 k, v = mla_kv_pack_quantize_fp8(
-                    k_nope, k_pe, v, k_scale_inv=1.0 / k_scale, enable_pdl=pdl_enabled()
+                    k_nope,
+                    k_pe,
+                    v,
+                    k_scale_inv=1.0 / k_scale,
+                    enable_pdl=mla_prefill_pdl_enabled(pdl_enabled()),
                 )
             else:
                 # BF16 Attention
@@ -1220,7 +1229,7 @@ class DeepseekV3AttentionMLA(nn.Module):
                 chunk_output,
                 lse,
                 inplace=True,
-                enable_pdl=pdl_enabled(),
+                enable_pdl=mla_prefill_pdl_enabled(pdl_enabled()),
             )
 
         return output

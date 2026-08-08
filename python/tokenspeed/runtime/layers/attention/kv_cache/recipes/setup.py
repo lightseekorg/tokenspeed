@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import Literal
 
@@ -88,6 +88,52 @@ class CachePoolSpec:
             self.memory_plan.num_lcm_blocks
             * max_packing
             * self.memory_plan.logical_block_tokens
+        )
+
+    def layer_view(
+        self,
+        *,
+        first_layer: int,
+        num_layers: int,
+        family: CacheModelFamily | None = None,
+        publish_runtime_contract: bool = True,
+    ) -> CachePoolSpec:
+        """Describe one concrete compute view over this spec's shared arena.
+
+        The memory plan and scheduler geometry stay merged. Only per-layer
+        compute metadata is sliced; a secondary view inherits the target's
+        published contract instead of publishing the same groups again.
+        """
+        total_layers = len(self.layer_group_ids)
+        if first_layer < 0 or num_layers < 0:
+            raise ValueError("cache layer view bounds must be non-negative")
+        last_layer = first_layer + num_layers
+        if last_layer > total_layers:
+            raise ValueError(
+                f"cache layer view [{first_layer}, {last_layer}) exceeds "
+                f"the merged {total_layers}-layer spec"
+            )
+        if self.layer_types and len(self.layer_types) != total_layers:
+            raise ValueError("cache layer types must be empty or cover every layer")
+        if self.layer_kv_head_counts is not None and (
+            len(self.layer_kv_head_counts) != total_layers
+        ):
+            raise ValueError("cache KV head counts must cover every layer")
+        return replace(
+            self,
+            family=family or self.family,
+            layer_types=(
+                self.layer_types[first_layer:last_layer] if self.layer_types else ()
+            ),
+            layer_group_ids=self.layer_group_ids[first_layer:last_layer],
+            layer_kv_head_counts=(
+                self.layer_kv_head_counts[first_layer:last_layer]
+                if self.layer_kv_head_counts is not None
+                else None
+            ),
+            paged_cache_group_specs=(
+                self.paged_cache_group_specs if publish_runtime_contract else ()
+            ),
         )
 
 

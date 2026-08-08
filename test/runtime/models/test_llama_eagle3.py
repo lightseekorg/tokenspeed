@@ -6,12 +6,19 @@ per-aux-state ``fc_norm`` RMSNorms and the ``norm_output`` aux convention.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from transformers import LlamaConfig
 
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.layernorm import RMSNorm
+from tokenspeed.runtime.layers.paged_attention import (
+    PagedAttention,
+    validate_paged_cache_group_ids,
+)
 from tokenspeed.runtime.models.llama_eagle3 import LlamaForCausalLMEagle3
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -107,6 +114,26 @@ def test_eagle3_default_config_has_no_fc_norm(
     assert model.model.fc_norm is None
     assert model.model.input_norm is None
     assert model.model.norm_output is False
+
+
+def test_eagle3_attention_routes_to_full_attention_cache_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _build_model(monkeypatch, _draft_config())
+    paged_layers = [
+        module for module in model.modules() if isinstance(module, PagedAttention)
+    ]
+
+    assert paged_layers
+    assert {layer.group_id for layer in paged_layers} == {FULL_ATTENTION}
+    validate_paged_cache_group_ids(
+        model,
+        (
+            SimpleNamespace(group_id=FULL_ATTENTION),
+            # Mirrors the GPT-OSS target's hybrid cache groups.
+            SimpleNamespace(group_id="sliding_attention"),
+        ),
+    )
 
 
 def test_eagle3_fc_norm_and_norm_output_variant(

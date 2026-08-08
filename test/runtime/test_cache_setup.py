@@ -4,9 +4,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import tokenspeed.runtime.layers.attention.kv_cache.mha as mha_cache
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.configs.msa import MSAConfig
+from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 from tokenspeed.runtime.layers.attention.kv_cache.factory import create_cache_pool
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_mha import (
     HybridMHATokenToKVPool,
@@ -341,6 +343,7 @@ def test_ordinary_mla_reserves_null_parent_within_cache_budget() -> None:
 def test_ordinary_recipe_uses_the_draft_attention_family(
     family: str,
     target_config,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model_config = SimpleNamespace(num_attention_layers=2, hf_config=SimpleNamespace())
     draft_model_config = SimpleNamespace(
@@ -360,17 +363,153 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
         overlap_schedule_depth=0,
     )
 
-    # One big model: the draft's layers are continuation layers of the one
-    # merged spec, addressed as global layers 2..2 (after the 2 target
-    # layers); no separate pool or family exists.
+    # One arena, two concrete compute views: the MHA draft's fields are
+    # continuation layers in the merged plan, but an MLA/MSA target pool must
+    # not interpret them as target-shaped fields.
     assert setup.num_draft_layers == 1
     assert setup.num_target_layers == 2
+    with pytest.raises(ValueError, match="bounds must be non-negative"):
+        setup.spec.layer_view(first_layer=-1, num_layers=1)
+    with pytest.raises(ValueError, match="exceeds the merged"):
+        setup.spec.layer_view(first_layer=2, num_layers=2)
     draft_field_ids = {
         field.field_id
         for field in setup.spec.memory_plan.fields
         if field.field_id.startswith("layer.2.")
     }
     assert draft_field_ids  # the draft layer's fields are planned
+
+    target_spec = setup.spec.layer_view(first_layer=0, num_layers=2)
+    draft_spec = setup.spec.layer_view(
+        first_layer=2,
+        num_layers=1,
+        family="mha",
+        publish_runtime_contract=False,
+    )
+    target_pool = create_cache_pool(
+        target_spec,
+        target_config(),
+        num_layers=2,
+        rank=0,
+        enable_memory_saver=False,
+    )
+    unbound_pool = CachePool(
+        setup.spec.pool_size,
+        target_pool.dtype,
+        "cpu",
+        setup.spec.memory_plan.logical_block_tokens,
+        0,
+        setup.spec.memory_plan,
+    )
+    with pytest.raises(ValueError, match="must bind its fields before a view"):
+        CachePool(
+            setup.spec.pool_size,
+            target_pool.dtype,
+            "cpu",
+            setup.spec.memory_plan.logical_block_tokens,
+            0,
+            setup.spec.memory_plan,
+            backing_pool=unbound_pool,
+        )
+    with pytest.raises(ValueError, match="must inherit, not republish"):
+        CachePool(
+            setup.spec.pool_size,
+            target_pool.dtype,
+            "cpu",
+            setup.spec.memory_plan.logical_block_tokens,
+            0,
+            setup.spec.memory_plan,
+            paged_cache_group_specs=target_spec.paged_cache_group_specs,
+            backing_pool=target_pool,
+        )
+    with pytest.raises(ValueError, match="only supported by ordinary MHA pools"):
+        create_cache_pool(
+            target_spec,
+            target_config(),
+            num_layers=2,
+            rank=0,
+            enable_memory_saver=False,
+            backing_pool=target_pool,
+        )
+    draft_pool = create_cache_pool(
+        draft_spec,
+        draft_attn_config,
+        num_layers=1,
+        rank=0,
+        enable_memory_saver=False,
+        field_layer_offset=2,
+        backing_pool=target_pool,
+    )
+
+    assert type(draft_pool) is MHATokenToKVPool
+    assert draft_pool.buffer is target_pool.buffer
+    assert draft_pool._fields is target_pool._fields
+    assert draft_pool.runtime_contract is target_pool.runtime_contract
+    assert draft_pool.layer_transfer_counter is None
+    assert set(target_pool._fields) == {
+        field.field_id for field in setup.spec.memory_plan.fields
+    }
+
+    target_last_layer = target_pool.get_key_buffer(1).clone()
+
+    def _store_kv_cache(cache_k, cache_v, k_buffer, v_buffer, loc, *, enable_pdl):
+        del enable_pdl
+        k_buffer[loc] = cache_k
+        v_buffer[loc] = cache_v
+
+    monkeypatch.setattr(mha_cache, "store_kv_cache", _store_kv_cache)
+    cache_k = torch.tensor([[[1.0, 2.0]]], dtype=torch.bfloat16)
+    cache_v = torch.tensor([[[3.0, 4.0]]], dtype=torch.bfloat16)
+    draft_pool.set_kv_buffer(
+        SimpleNamespace(layer_id=0),
+        torch.tensor([0]),
+        cache_k,
+        cache_v,
+    )
+    assert torch.equal(draft_pool.get_key_buffer(0)[0], cache_k[0])
+    assert torch.equal(draft_pool.get_value_buffer(0)[0], cache_v[0])
+    assert torch.equal(target_pool.get_key_buffer(1), target_last_layer)
+
+    # Sleep/wake repair visits both objects; only the allocation owner clears.
+    draft_pool.clear_kv_buffers()
+    assert torch.equal(draft_pool.get_key_buffer(0)[0], cache_k[0])
+    target_pool.clear_kv_buffers()
+    assert not torch.count_nonzero(draft_pool.get_key_buffer(0))
+
+
+def test_heterogeneous_draft_guards_fail_fast() -> None:
+    from tokenspeed.runtime.layers.attention.registry import (
+        _create_draft_components,
+        _resolve_heterogeneous_draft_family,
+    )
+
+    assert (
+        _resolve_heterogeneous_draft_family(
+            "mla", "mha", pd_disaggregation_enabled=False
+        )
+        == "mha"
+    )
+    with pytest.raises(RuntimeError, match="require an MHA draft"):
+        _resolve_heterogeneous_draft_family(
+            "mha", "mla", pd_disaggregation_enabled=False
+        )
+    with pytest.raises(RuntimeError, match="PD disaggregation does not support"):
+        _resolve_heterogeneous_draft_family(
+            "msa", "mha", pd_disaggregation_enabled=True
+        )
+    with pytest.raises(RuntimeError, match="support ordinary drafts only"):
+        _create_draft_components(
+            server_args=None,
+            model_config=SimpleNamespace(num_attention_layers=1),
+            config=object(),
+            pool=None,
+            cache_spec=object(),
+            num_target_layers=1,
+            full_attn_backend_name=None,
+            is_hybrid_linear=True,
+            is_kda=False,
+            is_inkling=False,
+        )
 
 
 def test_hybrid_draft_layers_share_the_merged_plan() -> None:

@@ -134,7 +134,7 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         # per-group distribution (_draft_group_tables); the target reads the
         # richer cache_metadata instead and must stay off the block_tables
         # path (its capture/eager guards key on this flag).
-        self.uses_cache_groups = bool(getattr(config, "is_draft", False))
+        self.uses_cache_groups = bool(config.is_draft)
         self.page_size = PAGE_SIZE
         self.max_num_pages = (self.max_context_len + PAGE_SIZE - 1) // PAGE_SIZE
 
@@ -705,9 +705,6 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         # above.
         block_table = page_table[:bs]
         self.cuda_graph_kv_indices[:bs, : block_table.shape[1]].copy_(block_table)
-
-    def get_cuda_graph_seq_len_fill_value(self):
-        return 1
 
     # ------------------------------------------------------------------
     # Forward

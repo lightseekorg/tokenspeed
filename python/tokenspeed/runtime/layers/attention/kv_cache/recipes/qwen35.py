@@ -10,6 +10,34 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
 )
 
 
+def qwen_gdn_max_padding_fraction(*, layer_types, num_draft_layers: int) -> float:
+    """Allow the structural K/V planes added by a Qwen MTP draft.
+
+    Args:
+        layer_types: Target-only attention labels, before merging draft layers.
+        num_draft_layers: Number of full-attention MTP layers being merged.
+
+    Returns:
+        The Qwen-specific upper bound on unified-arena padding.
+
+    Raises:
+        ValueError: If the target has no full-attention layers.
+    """
+    num_full_attention_layers = sum(
+        layer_type == "full_attention" for layer_type in layer_types
+    )
+    if num_full_attention_layers == 0:
+        raise ValueError("Qwen3.5 cache requires at least one full-attention layer")
+
+    # If target-only recurrent padding is p <= 1, each mirrored draft layer's
+    # K/V planes increase it by (1 + p) / num_full_attention_layers.  Bound
+    # that increase by 2 without relaxing the original limit when no draft is
+    # present.  The derivation margin is intentionally the only headroom: if
+    # future cache geometry trips the guard, re-derive this bound rather than
+    # adding an epsilon or silently accepting an unbounded binding hole.
+    return 1.0 + 2.0 * num_draft_layers / num_full_attention_layers
+
+
 def qwen_gdn_cache_fields(
     *,
     layer_types,
@@ -200,5 +228,8 @@ def prepare_qwen35_cache(
         cache_budget_bytes=cache_budget_bytes,
         fixed_workspace_bytes=fixed_workspace_bytes,
         logical_block_tokens=logical_block_tokens,
-        max_padding_fraction=1.0,
+        max_padding_fraction=qwen_gdn_max_padding_fraction(
+            layer_types=layer_types,
+            num_draft_layers=num_draft_layers,
+        ),
     )

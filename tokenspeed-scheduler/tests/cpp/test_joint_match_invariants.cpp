@@ -144,8 +144,8 @@ TEST(JointMatchInvariantsTest, HitImpliesWarmUnderRandomCacheEvictSequences) {
             for (GroupId group = 0; group < static_cast<GroupId>(specs.size()); ++group) {
                 const std::int32_t own = GroupPrefixBlocks(coordinator, pool, hashes, group, common_blocks);
                 EXPECT_GE(own, common_blocks)
-                    << "round " << round << ": group " << group << " cannot recover the converged boundary ("
-                    << own << " < " << common_blocks << ")";
+                    << "round " << round << ": group " << group << " cannot recover the converged boundary (" << own
+                    << " < " << common_blocks << ")";
             }
 
             // Progress sanity: the convergence must not undershoot the

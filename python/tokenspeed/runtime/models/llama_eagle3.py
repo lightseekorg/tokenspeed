@@ -39,6 +39,7 @@ from tokenspeed.runtime.execution.context import (
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.activation import SiluAndMul
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.common import concat
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -72,14 +73,21 @@ logger = get_colorful_logger(__name__)
 class LlamaAttention(BaseLlamaAttention):
     """Eagle3 draft head attention.
 
-    Inherits ``__init__`` (with ``qkv_input_size=2*hidden_size`` for the
-    [embed || hidden] concat) and ``forward`` (= qkv_proj + o_proj scaffolding)
-    from base. Overrides ``_attn`` so the draft's first step skips dead
-    catch-up rows: on backends that support fused KV pre-write, q is sliced
-    to one live row per request and dispatched as DECODE; otherwise the
-    fallback runs the full N-row attn and post-slices the output. Inactive
-    draft steps delegate to base.
+    Inherits the projection setup (with ``qkv_input_size=2*hidden_size`` for
+    the [embed || hidden] concat) and ``forward`` (= qkv_proj + o_proj
+    scaffolding) from base. Overrides ``_attn`` so the draft's first step
+    skips dead catch-up rows: on backends that support fused KV pre-write, q
+    is sliced to one live row per request and dispatched as DECODE; otherwise
+    the fallback runs the full N-row attn and post-slices the output.
+    Inactive draft steps delegate to base.
     """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Llama Eagle3 drafts use full-history attention. Once draft KV layers
+        # share a multi-group target pool, the backend needs this explicit
+        # routing key rather than the single-table fallback.
+        self.attn.group_id = FULL_ATTENTION
 
     def _attn(
         self,

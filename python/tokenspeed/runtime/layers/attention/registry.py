@@ -42,6 +42,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.base import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.factory import create_cache_pool
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
+    CacheModelFamily,
     CachePoolSpec,
     prepare_cache_setup,
 )
@@ -54,10 +55,49 @@ from tokenspeed.runtime.layers.attention.utils import (
 
 logger = logging.getLogger(__name__)
 
+_ORDINARY_CACHE_FAMILIES = frozenset({"mha", "mla", "dsa", "msa"})
+
 if TYPE_CHECKING:
     from tokenspeed.runtime.configs.model_config import ModelConfig
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.utils.server_args import ServerArgs
+
+
+def _ordinary_cache_family(config: BaseAttnConfig | None) -> CacheModelFamily | None:
+    if type(config) is MHAConfig:
+        return "mha"
+    if type(config) is MLAConfig:
+        return "mla"
+    if isinstance(config, DSAConfig):
+        return "dsa"
+    if isinstance(config, MSAConfig):
+        return "msa"
+    return None
+
+
+def _resolve_heterogeneous_draft_family(
+    target_family: CacheModelFamily,
+    draft_family: CacheModelFamily | None,
+    *,
+    pd_disaggregation_enabled: bool,
+) -> CacheModelFamily | None:
+    """Validate and return the supported heterogeneous draft family."""
+    if (
+        target_family not in _ORDINARY_CACHE_FAMILIES
+        or draft_family is None
+        or draft_family == target_family
+    ):
+        return None
+    if draft_family != "mha":
+        raise RuntimeError(
+            "heterogeneous ordinary cache views currently require an MHA draft"
+        )
+    if pd_disaggregation_enabled:
+        raise RuntimeError(
+            "PD disaggregation does not support heterogeneous target/draft "
+            "cache families"
+        )
+    return draft_family
 
 
 def _pool_allocated_bytes(pool) -> int:
@@ -587,6 +627,7 @@ def _create_draft_components(
     model_config,
     config,
     pool,
+    cache_spec: CachePoolSpec | None,
     num_target_layers: int,
     full_attn_backend_name: str | None,
     is_hybrid_linear: bool,
@@ -604,6 +645,26 @@ def _create_draft_components(
     if config is None:
         return None, None
     num_layers = model_config.num_attention_layers
+    if cache_spec is not None:
+        if is_hybrid_linear or is_inkling:
+            raise RuntimeError(
+                "heterogeneous cache views currently support ordinary drafts only"
+            )
+        # The draft pool is a compute view, not an allocation: it binds local
+        # layer 0..N to the merged plan's continuation fields while sharing
+        # the target's buffer and global field registry. Its transfer counter
+        # stays local/None; heterogeneous PD is rejected before construction.
+        draft_pool = create_cache_pool(
+            cache_spec,
+            config,
+            num_layers=num_layers,
+            rank=pool.rank,
+            enable_memory_saver=False,
+            field_layer_offset=num_target_layers,
+            backing_pool=pool,
+        )
+        backend = _create_attn_backend(model_config.attention_arch, config)
+        return backend, draft_pool
     # Draft layers carry LOCAL ids (a NextN draft's one layer is layer 0);
     # their planes are the merged plan's continuation range. The map must be
     # {local: global} — the wrapper's default ({global: pool_idx}, the hybrid
@@ -818,6 +879,16 @@ def create_attn_components(
             )
         else:
             draft_full_attn_backend_name = draft_attn_config.backend_name
+    draft_cache_family = _ordinary_cache_family(draft_attn_config)
+    heterogeneous_draft_family = _resolve_heterogeneous_draft_family(
+        cache_family,
+        draft_cache_family,
+        pd_disaggregation_enabled=config.pd_disaggregation_enabled
+        or (
+            draft_attn_config is not None
+            and draft_attn_config.pd_disaggregation_enabled
+        ),
+    )
     cache_memory = profile_available_cache_memory_bytes(
         attn_config=config,
         gpu_id=gpu_id,
@@ -838,6 +909,19 @@ def create_attn_components(
         overlap_schedule_depth=overlap_schedule_depth,
     )
     spec = cache_setup.spec
+    target_spec = spec
+    draft_view_spec = None
+    if heterogeneous_draft_family is not None:
+        target_spec = spec.layer_view(
+            first_layer=0,
+            num_layers=cache_setup.num_target_layers,
+        )
+        draft_view_spec = spec.layer_view(
+            first_layer=cache_setup.num_target_layers,
+            num_layers=cache_setup.num_draft_layers,
+            family=heterogeneous_draft_family,
+            publish_runtime_contract=False,
+        )
     logical_page_size = spec.memory_plan.logical_block_tokens
     _validate_lcm_page_size(
         config,
@@ -877,7 +961,7 @@ def create_attn_components(
         server_args=server_args,
         model_config=model_config,
         config=config,
-        cache_spec=spec,
+        cache_spec=target_spec,
         rank=rank,
         enable_memory_saver=enable_memory_saver,
         full_attn_backend_name=target_full_attn_backend_name,
@@ -890,6 +974,7 @@ def create_attn_components(
         model_config=draft_model_config,
         config=draft_attn_config,
         pool=pool,
+        cache_spec=draft_view_spec,
         num_target_layers=cache_setup.num_target_layers,
         full_attn_backend_name=draft_full_attn_backend_name,
         is_hybrid_linear=draft_is_hybrid_gdn or draft_is_hybrid_mla_kda,

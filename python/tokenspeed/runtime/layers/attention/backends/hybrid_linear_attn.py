@@ -356,15 +356,13 @@ class MambaAttnBackend(AttentionBackend):
     def set_kv_pool(self, kv_pool) -> None:
         """Bind a unified pool that publishes state groups and component views."""
         self.kv_pool = kv_pool
-        contract = getattr(kv_pool, "runtime_contract", None)
+        contract = kv_pool.runtime_contract
         if contract is None:
             raise RuntimeError(
                 "MambaAttnBackend requires a KV pool with a runtime cache contract"
             )
         state_group_ids = tuple(
-            spec.group_id
-            for spec in contract.group_specs
-            if getattr(spec, "family", "history") == "state"
+            spec.group_id for spec in contract.group_specs if spec.family == "state"
         )
         if not state_group_ids:
             raise RuntimeError(
@@ -1252,9 +1250,6 @@ class MambaAttnBackend(AttentionBackend):
             in_by_group[gid] = state_in_pages
             out_by_group[gid] = state_out_pages
         return in_by_group, out_by_group
-
-    def get_cuda_graph_seq_len_fill_value(self):
-        return 1
 
     # ---- Forward ----
 

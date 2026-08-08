@@ -64,6 +64,8 @@ class MHATokenToKVPool(CachePool):
         pd_disaggregation_enabled: bool = False,
         layer_kv_head_counts: tuple[int, ...] | None = None,
         kv_alloc_head_count: int | None = None,
+        field_layer_offset: int = 0,
+        backing_pool: CachePool | None = None,
     ):
         super().__init__(
             size,
@@ -74,6 +76,7 @@ class MHATokenToKVPool(CachePool):
             memory_plan,
             paged_cache_group_specs=paged_cache_group_specs,
             token_capacity=token_capacity,
+            backing_pool=backing_pool,
         )
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -83,6 +86,9 @@ class MHATokenToKVPool(CachePool):
         self.head_num = head_num
         self.head_dim = head_dim
         self.layer_num = layer_num
+        self._field_layer_offset = int(field_layer_offset)
+        if self._field_layer_offset < 0:
+            raise ValueError("field_layer_offset must be non-negative")
         # Fewer-head layers reinterpret the allocation width as more rows.
         self._layer_kv_head_counts = (
             tuple(int(h) for h in layer_kv_head_counts)
@@ -121,17 +127,21 @@ class MHATokenToKVPool(CachePool):
             v_size / GB,
         )
 
+    def _field_layer_id(self, layer_id: int) -> int:
+        """Map this compute view's local layer id into the merged plan."""
+        return self._field_layer_offset + layer_id
+
     def _create_kv_buffers(self):
         self.k_buffer = [
-            self.field(f"layer.{layer_id}.k", self.store_dtype).view(
-                -1, self.head_num, self.head_dim
-            )
+            self.field(
+                f"layer.{self._field_layer_id(layer_id)}.k", self.store_dtype
+            ).view(-1, self.head_num, self.head_dim)
             for layer_id in range(self.layer_num)
         ]
         self.v_buffer = [
-            self.field(f"layer.{layer_id}.v", self.store_dtype).view(
-                -1, self.head_num, self.head_dim
-            )
+            self.field(
+                f"layer.{self._field_layer_id(layer_id)}.v", self.store_dtype
+            ).view(-1, self.head_num, self.head_dim)
             for layer_id in range(self.layer_num)
         ]
         aliased = len({buffer.data_ptr() for buffer in self.k_buffer}) < len(
@@ -318,11 +328,17 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
             self._create_kv_buffers()
             self.k_scale_buffer = [
-                self.field(f"layer.{layer_id}.k_scale", torch.float8_e8m0fnu)
+                self.field(
+                    f"layer.{self._field_layer_id(layer_id)}.k_scale",
+                    torch.float8_e8m0fnu,
+                )
                 for layer_id in range(self.layer_num)
             ]
             self.v_scale_buffer = [
-                self.field(f"layer.{layer_id}.v_scale", torch.float8_e8m0fnu)
+                self.field(
+                    f"layer.{self._field_layer_id(layer_id)}.v_scale",
+                    torch.float8_e8m0fnu,
+                )
                 for layer_id in range(self.layer_num)
             ]
 
