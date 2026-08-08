@@ -965,12 +965,14 @@ class KimiLinearMoE(nn.Module):
         # AUTO intentionally requests the flashinfer-backed SiTU plan when it was
         # registered at import time; AUTO cannot override MoELayer per model.
         self.use_trtllm_situ_moe = self.execution_plan.use_trtllm
-        if not self.execution_plan.use_native:
+        self.use_marlin_situ_moe = self.execution_plan.use_marlin
+        if not self.execution_plan.use_native and not self.use_marlin_situ_moe:
             if not self.use_trtllm_situ_moe:
                 raise RuntimeError(
-                    "Kimi-K3 MXFP4 SiTU MoE requires the native backend or the "
-                    "FlashInfer TRT-LLM backend; no portable SiTU Triton fallback "
-                    f"exists (selected MoE backend: {moe_backend.value!r})."
+                    "Kimi-K3 MXFP4 SiTU MoE requires the native, FlashInfer "
+                    "TRT-LLM, or Marlin (Hopper W4A16) backend; no portable SiTU "
+                    f"Triton fallback exists (selected MoE backend: "
+                    f"{moe_backend.value!r})."
                 )
             # Fail here with the actual reason instead of letting MoELayer's
             # kernel selection miss the (never-registered) SiTU kernel.
@@ -989,6 +991,10 @@ class KimiLinearMoE(nn.Module):
             load_packaged_flashinfer_tuning_cache(
                 "kimi-k3", mapping.moe.ep_size, mapping.moe.tp_size
             )
+        if not self.execution_plan.use_native:
+            # Both the TRT-LLM and Marlin SiTU paths currently require a
+            # replicated-token all-reduce topology (attn TP == MoE TP*EP);
+            # Attn-DP/MoE-EP RSAG is not wired for either.
             if mapping.moe.has_tp_ep and mapping.attn.tp_size != mapping.moe.tp_ep_size:
                 raise ValueError(
                     "Kimi-K3's SiTU MoE currently requires a "
@@ -1041,11 +1047,11 @@ class KimiLinearMoE(nn.Module):
                 "activation_situ_linear_beta": situ_linear_beta,
             },
             routing_mode="precomputed_topk",
-            # Native gfx950 runs A16W4; FlashInfer's SiTU cubins require
-            # MXFP4 weights with MXFP8 activations.
+            # Native gfx950 and Hopper Marlin both run A16W4 (bf16 activations);
+            # FlashInfer's SiTU cubins require MXFP4 weights with MXFP8 acts.
             internal_activation_dtype_override=(
                 "input"
-                if self.execution_plan.use_native
+                if self.execution_plan.use_native or self.execution_plan.use_marlin
                 else "fp8" if self.execution_plan.use_trtllm else None
             ),
         )
@@ -1205,11 +1211,11 @@ class KimiLinearMoE(nn.Module):
         max_num_tokens_per_gpu: int,
         skip_reduce: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run flashinfer's fused TRT-LLM SiTU MoE."""
-        if not self.use_trtllm_situ_moe:
+        """Run the precomputed-TopK SiTU MoE (TRT-LLM cubin or Hopper Marlin)."""
+        if not self.use_trtllm_situ_moe and not self.use_marlin_situ_moe:
             raise RuntimeError(
-                "Kimi-K3 has no portable SiTU Triton fallback; use the native "
-                "or FlashInfer TRT-LLM SiTU MoE path."
+                "Kimi-K3 has no portable SiTU Triton fallback; use the native, "
+                "FlashInfer TRT-LLM, or Marlin SiTU MoE path."
             )
         out = self.experts(
             hidden_states=routed_in,

@@ -441,7 +441,7 @@ class LayerMappedKVPool:
     # so the global id must be mapped to its pool slot first (mirrors
     # ``set_kv_buffer``). Reached via the DeepseekV3-style MLA chunked-prefill
     # path (Kimi-K3).
-    def set_mla_kv_buffer(self, layer, loc, cache_k_nope, cache_k_rope):
+    def set_mla_kv_buffer(self, layer, loc, cache_k_nope, cache_k_rope, sanitize=True):
         # Prefill breakable-graph padding contract: the dummy-batch capture (and
         # bucket-padding rows) whose ``out_cache_loc`` is the reserved
         # ``dummy_kv_slot`` can carry NaN into this fp8 KV write. The paged MLA
@@ -459,7 +459,7 @@ class LayerMappedKVPool:
                 loc,
                 cache_k_nope,
                 cache_k_rope,
-                sanitize=True,
+                sanitize=sanitize,
             )
 
     def get_mla_kv_buffer(self, layer, loc, dst_dtype=None):

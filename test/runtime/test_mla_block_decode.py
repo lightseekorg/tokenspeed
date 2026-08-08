@@ -197,7 +197,6 @@ def test_contract_draft_replay_does_not_expand_published_pages_twice() -> None:
     backend = _backend(spec_num_tokens=4, max_num_pages=4)
     backend._cache_contract_bound = True
     backend._cache_groups_bound = True
-    backend._cache_logical_page_size = 128
     backend.page_size = 64
     backend.init_cuda_graph_state(max_bs=1)
     backend._capture_block_decode_graph(bs=1, seq_lens=torch.tensor([10]))
@@ -219,7 +218,6 @@ def test_contract_draft_eager_does_not_expand_published_pages_twice() -> None:
     backend = _backend(spec_num_tokens=4, max_num_pages=4)
     backend._cache_contract_bound = True
     backend._cache_groups_bound = True
-    backend._cache_logical_page_size = 128
     backend.page_size = 64
 
     published = torch.tensor([[6, 7, 0, 1, 99]], dtype=torch.int32)

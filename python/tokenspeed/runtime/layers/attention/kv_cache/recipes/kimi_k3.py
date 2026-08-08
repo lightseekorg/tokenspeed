@@ -188,8 +188,16 @@ def build_kimi_k3_cache_fields(
 ) -> tuple[CacheFieldSpec, ...]:
     """Build target fields from the Kimi-K3 model configuration."""
     tp_size = _require_positive_int("tp_size", tp_size)
-    if mla_cache_dtype != torch.float8_e4m3fn:
-        raise ValueError("Kimi-K3 cache requires mla_cache_dtype=torch.float8_e4m3fn")
+    # fp8_e4m3 is the memory-lean default (matches the Blackwell tokenspeed_mla
+    # kernels). bf16 is the Hopper path: FlashMLA has no SM90 dense-fp8 MLA
+    # kernel, so on SM90 the MLA layers run bf16 (flashinfer ragged prefill +
+    # bf16 FlashMLA decode), mirroring how vLLM/sglang serve K3 on Hopper.
+    if mla_cache_dtype not in (torch.float8_e4m3fn, torch.bfloat16):
+        raise ValueError(
+            "Kimi-K3 cache requires mla_cache_dtype in "
+            "{torch.float8_e4m3fn, torch.bfloat16}, got "
+            f"{mla_cache_dtype}"
+        )
     if mla_quant_method == "per_token_head":
         raise ValueError("Kimi-K3 cache does not support per_token_head MLA cache")
     if getattr(text_config, "mla_use_nope", None) is not True:
@@ -268,11 +276,14 @@ def solve_kimi_k3_cache_layout(
         f"{LINEAR_ATTENTION}_1": linear_packing,
         f"{LINEAR_ATTENTION}_2": linear_packing,
     }
+
+    max_padding_fraction = float("inf") if num_draft_layers else 0.25
     layout = solve_cache_layout(
         fields,
         logical_block_tokens=_KIMI_K3_LOGICAL_BLOCK_TOKENS,
         cache_blocks_per_lcm_block=packing,
         alignment=256,
+        max_padding_fraction=max_padding_fraction,
     )
     if dict(layout.group_packing) != packing:
         raise ValueError(

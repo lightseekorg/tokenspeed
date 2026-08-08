@@ -138,7 +138,6 @@ def _bare_amd_mla_backend(
     backend.draft_block_decode = False
     backend._cache_groups_bound = False
     backend._cache_contract_bound = False
-    backend._cache_logical_page_size = None
     backend.decode_cuda_graph_metadata = {}
     backend.cuda_graph_page_table = None
     backend.cuda_graph_seq_lens = None

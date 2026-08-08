@@ -52,6 +52,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     cache_event_key,
     cache_event_to_payload,
     cache_sync_debug_enabled,
+    log_gpu_memory_summary,
     make_config,
     pool_to_paged_cache_groups,
     pop_common_cache_event_payloads,
@@ -299,6 +300,19 @@ class EventLoop:
             draft_attn_backend=draft_attn_backend,
             draft_token_to_kv_pool=draft_token_to_kv_pool,
         )
+
+        # Per-rank GPU memory breakdown (weights by group, KV/graph/non-torch).
+        # rank0 only; best-effort, never fails startup.
+        if attn_tp_rank == 0:
+            log_gpu_memory_summary(
+                target.model,
+                gpu_id,
+                global_rank,
+                logger,
+                draft_model=draft.model if draft is not None else None,
+                kv_pool=token_to_kv_pool,
+                draft_kv_pool=draft_token_to_kv_pool,
+            )
 
         self.max_model_len = self.model_config.context_len
         self.max_single_request_tokens = self.model_config.context_len

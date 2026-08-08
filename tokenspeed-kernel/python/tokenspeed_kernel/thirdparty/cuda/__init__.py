@@ -33,6 +33,12 @@ from tokenspeed_kernel.thirdparty.cuda.fused_topk_topp import (
     prepare_for_device as fused_topk_topp_prepare,
 )
 from tokenspeed_kernel.thirdparty.cuda.marlin import gptq_marlin_repack
+from tokenspeed_kernel.thirdparty.cuda.marlin_moe import (
+    is_marlin_moe_available,
+    marlin_make_workspace,
+    moe_align_block_size,
+    moe_wna16_marlin_gemm,
+)
 from tokenspeed_kernel.thirdparty.cuda.moe import moe_finalize_fuse_shared
 from tokenspeed_kernel.thirdparty.cuda.rmsnorm import rmsnorm_fused_parallel
 from tokenspeed_kernel.thirdparty.cuda.rope import apply_rope_with_cos_sin_cache_inplace
@@ -55,7 +61,11 @@ __all__ = [
     "fused_topk_topp_workspace_size",
     "gptq_marlin_repack",
     "hash_softplus_sqrt_topk_flash",
+    "is_marlin_moe_available",
+    "marlin_make_workspace",
+    "moe_align_block_size",
     "moe_finalize_fuse_shared",
+    "moe_wna16_marlin_gemm",
     "rmsnorm_fused_parallel",
     "routing_flash",
     "silu_and_mul_fuse_block_quant",
