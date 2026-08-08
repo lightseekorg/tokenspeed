@@ -4,7 +4,7 @@ import os
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr
+from contextlib import contextmanager, redirect_stderr
 from io import StringIO
 from types import MethodType, SimpleNamespace
 from typing import ClassVar
@@ -98,6 +98,7 @@ from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.quantization import QUANTIZATION_METHODS
 from tokenspeed.runtime.models import deepseek_v4 as deepseek_v4_model
 from tokenspeed.runtime.models.deepseek_v4 import (
+    DeepseekV4Attention,
     DeepseekV4Indexer,
     DeepseekV4MLP,
     DeepseekV4Model,
@@ -158,6 +159,7 @@ def _make_planned_deepseek_v4_pool(
     hf_config,
     *,
     num_lcm_blocks: int = 2,
+    pd_disaggregation_enabled: bool = False,
 ):
     fields = build_deepseek_v4_cache_fields(
         layout,
@@ -171,6 +173,7 @@ def _make_planned_deepseek_v4_pool(
         build_v4_cache_specs(
             hf_config,
             layer_ratio=layout.layer_ratio,
+            pd_disaggregation_enabled=pd_disaggregation_enabled,
         )
     )
     pool = HybridDeepseekV4TokenToKVPool(
@@ -467,6 +470,90 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(
             _deepseek_v4_indexer_token_split(ForwardMode.DECODE, metadata, 5),
             (0, 5),
+        )
+
+    def test_deepseek_v4_prefill_publishes_cache_readiness_after_writes(self):
+        attention = DeepseekV4Attention.__new__(DeepseekV4Attention)
+        torch.nn.Module.__init__(attention)
+        events = []
+        readiness_active = False
+
+        @contextmanager
+        def stream_scope(*, enable):
+            del enable
+
+            class Fork:
+                @contextmanager
+                def branch(self):
+                    yield
+
+            yield Fork()
+
+        @contextmanager
+        def record_pd_cache_step(forward_mode, save_kv_cache, record_kv_cache):
+            nonlocal readiness_active
+            self.assertEqual(forward_mode, ForwardMode.EXTEND)
+            self.assertFalse(save_kv_cache)
+            self.assertIsNone(record_kv_cache)
+            readiness_active = True
+            events.append("readiness-enter")
+            yield
+            events.append("readiness-exit")
+            readiness_active = False
+
+        def prefill_backend(**kwargs):
+            self.assertTrue(readiness_active)
+            events.append("attention")
+            return kwargs["q"]
+
+        q = torch.zeros((1, 1, 4), dtype=torch.bfloat16)
+        attention.stream_fork = SimpleNamespace(scope=stream_scope, aux_stream=None)
+        attention.rotary_emb = SimpleNamespace(
+            cos_sin_cache=torch.zeros((1, 4), dtype=torch.float32)
+        )
+        attention.compressor = None
+        attention.indexer = None
+        attention.attention_kind = "swa"
+        attention.cache_layer_index = 0
+        attention.compress_ratio = 1
+        attention.num_local_heads = 1
+        attention.padded_heads = 1
+        attention.head_dim = 4
+        attention.swa_window = 128
+        attention.scale = 0.5
+        attention.attn_sink = torch.zeros(1, dtype=torch.float32)
+        attention._project_q_kv = lambda _hidden_states: (q, q[:, 0], q[:, 0])
+        attention._insert_swa_cache = lambda **_kwargs: events.append("cache-write")
+        attention._project_attention_output = (
+            lambda output, _positions, _cos_sin_cache: output
+        )
+        backend = SimpleNamespace(
+            forward_metadata=object(),
+            record_pd_cache_step=record_pd_cache_step,
+            forward_deepseek_v4_prefill=prefill_backend,
+        )
+        ctx = SimpleNamespace(
+            dsa_compressor_slot_cache={},
+            dsa_swa_slot_mapping=torch.zeros(1, dtype=torch.int64),
+            token_to_kv_pool=SimpleNamespace(
+                swa_block_size=64,
+                get_swa_kv_buffer=lambda _layer_id: torch.empty(1),
+            ),
+            attn_backend=backend,
+            forward_mode=ForwardMode.EXTEND,
+        )
+
+        actual = attention.forward(
+            positions=torch.zeros(1, dtype=torch.int64),
+            hidden_states=torch.zeros((1, 4), dtype=torch.bfloat16),
+            ctx=ctx,
+            out_cache_loc=torch.zeros(1, dtype=torch.int64),
+        )
+
+        self.assertIs(actual, q)
+        self.assertEqual(
+            events,
+            ["cache-write", "readiness-enter", "attention", "readiness-exit"],
         )
 
     def test_spec_helpers_preserve_non_v4_backend_contracts(self):
@@ -2178,6 +2265,82 @@ class TestDeepseekV4Config(unittest.TestCase):
             tuple(pool.get_indexer_kv_buffer_2d(1).shape),
             (plan.group("v4.c4a.compressed_kv").page_count, 64 * 68),
         )
+
+    def test_deepseek_v4_pd_uses_typed_grouped_cache_contract(self):
+        config = SimpleNamespace(
+            compress_ratios=[1, 4, 128],
+            head_dim=512,
+            qk_rope_head_dim=64,
+            index_head_dim=128,
+            sliding_window=128,
+        )
+        layout = deepseek_v4_cache_layout_from_config(
+            config,
+            page_size=256,
+            use_fp4_indexer_cache=True,
+        )
+        pool, plan = _make_planned_deepseek_v4_pool(
+            layout,
+            config,
+            pd_disaggregation_enabled=True,
+        )
+
+        self.assertTrue(pool.supports_disaggregation)
+        cache_layout, registrations = pool.get_pd_cache_contract()
+        self.assertEqual(cache_layout.block_size, plan.logical_block_tokens)
+        self.assertEqual(cache_layout.physical_buffer_ids, ("lcm_arena",))
+        self.assertEqual(len(registrations), 1)
+        self.assertEqual(registrations[0].base_addr, pool.buffer.data_ptr())
+        self.assertEqual(
+            {group.group_id: group.transfer_policy for group in cache_layout.groups},
+            {
+                "v4.swa_kv": "full_suffix",
+                "v4.c4a.compressor_state": "full_suffix",
+                "v4.c4a.compressed_kv": "full_suffix",
+                "v4.c128a.compressor_state": "full_suffix",
+                "v4.c128a.compressed_kv": "full_suffix",
+                "v4.c4a.indexer_compressor_state": "full_suffix",
+            },
+        )
+        self.assertEqual(
+            {
+                segment.field_id
+                for group in cache_layout.groups
+                for segment in group.transfer_segments
+            },
+            {field.field_id for field in plan.fields},
+        )
+        self.assertTrue(cache_layout.supports_layerwise_transfer)
+        self.assertEqual(
+            {
+                segment.layer_id
+                for group in cache_layout.groups
+                for segment in group.transfer_segments
+            },
+            {0, 1, 2},
+        )
+
+        from tokenspeed_scheduler import Scheduler
+
+        from tokenspeed.runtime.engine.scheduler_utils import (
+            make_config,
+            pool_to_paged_cache_groups,
+        )
+
+        scheduler_config = make_config(
+            num_device_pages=plan.num_lcm_blocks + 1,
+            max_scheduled_tokens=256,
+            max_batch_size=1,
+            page_size=plan.logical_block_tokens,
+            num_host_pages=0,
+            disable_l2_cache=True,
+            enable_l3_storage=False,
+            role="prefill",
+            paged_cache_groups=pool_to_paged_cache_groups(pool),
+            enable_mixed_prefill_decode=True,
+        )
+        scheduler_config.enable_pd_cache = True
+        Scheduler(scheduler_config)
 
     def test_deepseek_v4_kv_pool_rejects_nonpositive_size(self):
         config = SimpleNamespace(

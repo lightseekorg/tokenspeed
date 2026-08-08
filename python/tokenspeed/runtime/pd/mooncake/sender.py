@@ -125,6 +125,8 @@ class MooncakeKVSender:
         wait_for_bootstrap_token: bool = False,
         spec_candidate_ids: list[int] | None = None,
         mamba_indices: npt.NDArray[np.int64] | None = None,
+        page_manifest: CachePDPageManifest | None = None,
+        destination_page_manifest: CachePDPageManifest | None = None,
     ):
         self._layerwise_transfer_started = True
         self.curr_idx = max(self.curr_idx, index_slice.stop)
@@ -156,6 +158,8 @@ class MooncakeKVSender:
             wait_for_bootstrap_token=wait_for_bootstrap_token,
             spec_candidate_ids=spec_candidate_ids,
             mamba_indices=mamba_indices,
+            page_manifest=page_manifest,
+            destination_page_manifest=destination_page_manifest,
         )
 
     def poll(self) -> TransferPoll:

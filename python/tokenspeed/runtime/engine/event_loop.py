@@ -387,7 +387,11 @@ class EventLoop:
             if server_args.enable_mla_l1_5_cache:
                 unsupported.append("MLA L1.5 cache transfer")
             if server_args.disaggregation_layerwise_interval > 0:
-                unsupported.append("layerwise cache transfer")
+                cache_layout, _ = token_to_kv_pool.get_pd_cache_contract()
+                if not cache_layout.supports_layerwise_transfer:
+                    unsupported.append(
+                        "layerwise cache transfer without per-layer segments"
+                    )
             if server_args.enable_memory_saver:
                 unsupported.append("memory saver/release")
             if server_args.enable_kvstore:

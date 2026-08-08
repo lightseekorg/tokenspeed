@@ -97,6 +97,7 @@ class TransferKVChunk:
     wait_for_bootstrap_token: bool = False
     spec_candidate_ids: list[int] | None = None
     page_manifest: CachePDPageManifest | None = None
+    destination_page_manifest: CachePDPageManifest | None = None
 
 
 @dataclasses.dataclass

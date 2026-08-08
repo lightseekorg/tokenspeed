@@ -57,6 +57,7 @@ class CacheFieldLayout:
     element_size: int
     field_offset_bytes: int
     page_stride_bytes: int
+    layer_id: int | None = None
 
     @property
     def payload_bytes(self) -> int:
@@ -208,6 +209,7 @@ class CacheFieldSpec:
     # stride to satisfy an alignment constraint (for example, a TMA row
     # stride). The planner applies this in bytes after group packing.
     page_stride_alignment_bytes: int = 1
+    layer_id: int | None = None
 
     @property
     def payload_bytes(self) -> int:
@@ -351,6 +353,9 @@ def continue_layer_fields(fields, *, first_layer_id: int) -> tuple[CacheFieldSpe
             field.element_size,
             exact_page_stride=field.exact_page_stride,
             page_stride_alignment_bytes=field.page_stride_alignment_bytes,
+            layer_id=(
+                None if field.layer_id is None else field.layer_id + first_layer_id
+            ),
         )
         for field in fields
     )
@@ -670,6 +675,7 @@ def solve_cache_layout(
                 field_offset_bytes=field_offsets[field.field_id],
                 page_stride_bytes=plane_bytes[field.plane_id]
                 // packing[field.group_id],
+                layer_id=field.layer_id,
             )
         )
 

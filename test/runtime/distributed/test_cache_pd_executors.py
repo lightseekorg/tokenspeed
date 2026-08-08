@@ -169,7 +169,7 @@ def test_cache_decode_destination_seeds_remote_prompt_cache_length(
     assert resets == [([7, 11], [1535, 3073])]
 
 
-def test_cache_factory_exposes_raw_slabs_as_mooncake_layers() -> None:
+def test_cache_factory_keeps_semantic_layers_separate_from_raw_slabs() -> None:
     from tokenspeed.runtime.pd.factory import get_kv_args
 
     layout = _layout()
@@ -180,13 +180,14 @@ def test_cache_factory_exposes_raw_slabs_as_mooncake_layers() -> None:
     )
     pool = SimpleNamespace(
         supports_disaggregation=True,
+        layer_num=43,
         get_pd_cache_contract=lambda: (layout, registrations),
     )
 
     kv_args = get_kv_args(0, 0, "mlx5_0", pool, None)
 
-    assert kv_args.target_layer_num == 2
-    assert kv_args.kv_layer_ids == [0, 1]
+    assert kv_args.target_layer_num == 43
+    assert kv_args.kv_layer_ids == list(range(43))
     assert kv_args.offsets == [(0,), (1,)]
     assert kv_args.kv_item_lens == [16, 16]
     assert kv_args.kv_unit_lens == [16, 16]
@@ -215,6 +216,30 @@ def test_decode_publishes_manifest_through_legacy_receiver() -> None:
     assert executor._request_pool_indices == {"request-0": 7}
 
 
+def test_decode_rejects_mixed_prefill_decode_batch() -> None:
+    import tokenspeed.runtime.pd.decode_executor as decode_module
+
+    calls = []
+    receiver = SimpleNamespace(
+        prefill=lambda *args, **kwargs: calls.append((args, kwargs))
+    )
+    executor = object.__new__(decode_module.DisaggDecodeExecutor)
+    executor.cache_layout = _layout()
+    executor.receivers = {"request-0": receiver}
+    executor._request_pool_indices = {}
+    op = _op()
+    op.request_ids.append("decode-0")
+    op.request_pool_indices.append(8)
+    op.extend_prefix_lens.append(5)
+    op.prefill_lengths.append(5)
+
+    with pytest.raises(RuntimeError, match="does not support mixed batches"):
+        executor._cache_prefill(op)
+
+    assert calls == []
+    assert executor._request_pool_indices == {}
+
+
 def test_prefill_submits_manifest_through_legacy_sender() -> None:
     import tokenspeed.runtime.pd.prefill_executor as prefill_module
 
@@ -227,6 +252,9 @@ def test_prefill_submits_manifest_through_legacy_sender() -> None:
 
         def send(self, *args, **kwargs):
             calls.append((args, kwargs))
+
+        def has_layerwise_transfer(self):
+            return False
 
     executor = object.__new__(prefill_module.DisaggPrefillExecutor)
     executor.cache_layout = layout
@@ -245,6 +273,72 @@ def test_prefill_submits_manifest_through_legacy_sender() -> None:
     assert kwargs["bootstrap_token"] == 42
     assert kwargs["page_manifest"].prompt_len == 5
     assert executor._request_token == {}
+
+
+def test_prefill_submits_typed_manifest_through_layerwise_sender() -> None:
+    import tokenspeed.runtime.pd.prefill_executor as prefill_module
+
+    layout = _layout()
+    destination = _destination_transfer_info(layout)
+    calls = []
+
+    class _Sender:
+        bootstrap_room = 9
+
+        def send_layerwise(self, *args, **kwargs):
+            calls.append((args, kwargs))
+
+    executor = object.__new__(prefill_module.DisaggPrefillExecutor)
+    executor.cache_layout = layout
+    executor._layerwise_enabled = True
+    executor._layerwise_interval = 2
+    executor._cache_transfer_progress = {}
+    executor.senders = {"request-0": _Sender()}
+    executor.kv_manager = SimpleNamespace(
+        transfer_infos={9: {destination.mooncake_session_id: destination}},
+        reserve_layerwise_cache_steps=lambda: 100,
+    )
+    op = _op()
+    op.input_lengths = [3]
+
+    executor._cache_prepare_prefill(op)
+
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[0].tolist() == [2, 3, 6]
+    assert args[1:] == (slice(0, 3), 7, True)
+    assert kwargs["begin_cache_step"] == 100
+    assert kwargs["layerwise_interval"] == 2
+    assert kwargs["page_manifest"].groups[0].page_ids == (2, 3)
+    assert kwargs["destination_page_manifest"] == _destination_manifest()
+
+
+def test_prefill_layerwise_completion_does_not_require_retired_destination() -> None:
+    import tokenspeed.runtime.pd.prefill_executor as prefill_module
+
+    metadata_calls = []
+
+    class _Sender:
+        bootstrap_room = 9
+
+        def has_layerwise_transfer(self):
+            return True
+
+    executor = object.__new__(prefill_module.DisaggPrefillExecutor)
+    executor.cache_layout = _layout()
+    executor.senders = {"request-0": _Sender()}
+    executor.kv_manager = SimpleNamespace(
+        transfer_infos={},
+        set_prefill_metadata=lambda *args: metadata_calls.append(args),
+    )
+    executor._request_token = {"request-0": 42}
+    executor._layerwise_token_published = {"request-0"}
+
+    executor._cache_decode(_op())
+
+    assert metadata_calls == []
+    assert executor._request_token == {}
+    assert executor._layerwise_token_published == set()
 
 
 def test_cache_contract_epd_abort_notifies_decode() -> None:
@@ -356,7 +450,7 @@ def _segmented_layout(
     return CachePDLayout(
         version=CACHE_PD_PROTOCOL_VERSION,
         layout_fingerprint="b" * 64,
-        block_size=2,
+        block_size=4,
         num_pages_with_null=capacity,
         physical_buffer_ids=("lcm_arena",),
         physical_page_bytes=1024,
@@ -375,6 +469,7 @@ def _segmented_layout(
                         page_zero_offset=history_k_offset,
                         page_stride_bytes=256,
                         payload_bytes=256,
+                        layer_id=0,
                     ),
                     CachePDTransferSegment(
                         physical_slot=0,
@@ -383,6 +478,7 @@ def _segmented_layout(
                         page_zero_offset=history_v_offset,
                         page_stride_bytes=256,
                         payload_bytes=256,
+                        layer_id=0,
                     ),
                 ),
             ),
@@ -400,6 +496,7 @@ def _segmented_layout(
                         page_zero_offset=state_offset,
                         page_stride_bytes=512,
                         payload_bytes=384,
+                        layer_id=1,
                     ),
                 ),
             ),
@@ -478,6 +575,68 @@ def test_shared_manager_resolves_lcm_group_segments() -> None:
             ],
             [256, 256, 256, 256, 384],
         )
+    ]
+
+
+def test_shared_manager_transfers_lcm_segments_as_layers_become_ready() -> None:
+    from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
+
+    layout = _segmented_layout(
+        capacity=5,
+        history_k_offset=768,
+        history_v_offset=2816,
+        state_offset=512,
+    )
+    source_manifest = CachePDPageManifest(
+        groups=(
+            CachePDGroupPages("history", (1, 2)),
+            CachePDGroupPages("state", (4,)),
+        ),
+        prefix_len=0,
+        prompt_len=4,
+    )
+    destination_manifest = CachePDPageManifest(
+        groups=(
+            CachePDGroupPages("history", (5, 6)),
+            CachePDGroupPages("state", (3,)),
+        ),
+        prefix_len=0,
+        prompt_len=4,
+    )
+    calls = []
+    manager = object.__new__(MooncakeKVManagerPrefill)
+    manager.layer_num = 2
+    manager.kv_args = SimpleNamespace(
+        cache_layout=layout,
+        kv_data_ptrs=[0x10000],
+        kv_item_lens=[1024],
+        state_type="none",
+    )
+    manager._wait_until_cache_step = lambda step: None
+    manager.engine = SimpleNamespace(
+        batch_transfer_sync=lambda session, src, dst, lengths: (
+            calls.append((session, src, dst, lengths)) or 0
+        )
+    )
+
+    assert (
+        manager.send_kvcache_layerwise(
+            "session",
+            np.asarray([1, 2, 4], dtype=np.int64),
+            [0x20000],
+            np.asarray([5, 6, 3], dtype=np.int64),
+            begin_cache_step=10,
+            interval=1,
+            src_page_manifest=source_manifest,
+            dst_page_manifest=destination_manifest,
+            dst_num_pages_with_null=layout.num_pages_with_null,
+            dst_page_zero_offsets=layout.peer.page_zero_offset_map(),
+        )
+        == 0
+    )
+    assert [lengths for _, _, _, lengths in calls] == [
+        [256, 256, 256, 256],
+        [384],
     ]
 
 
