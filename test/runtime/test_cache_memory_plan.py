@@ -123,6 +123,122 @@ class CacheMemoryPlanTest(unittest.TestCase):
         self.assertEqual(by_id["layer.1.k"].shape[0], 128)
         self.assertEqual(by_id["layer.0.ssm"].shape, (8, 128, 128))
 
+    def test_qwen_mtp_padding_allowance_tracks_draft_planes(self):
+        qwen = sys.modules[
+            "tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen35"
+        ]
+        for full_attention_layers, linear_value_heads in ((6, 16), (12, 64)):
+            with self.subTest(full_attention_layers=full_attention_layers):
+                layer_types = (
+                    "linear_attention",
+                    "linear_attention",
+                    "linear_attention",
+                    "full_attention",
+                ) * full_attention_layers
+                group_ids = (
+                    "linear_attention_0",
+                    "linear_attention_1",
+                    "linear_attention_2",
+                    "full_attention",
+                ) * full_attention_layers
+                conv_dim = 128 * 16 * 2 + 128 * linear_value_heads
+                target_fields = self.layouts_module.qwen_gdn_cache_fields(
+                    layer_types=layer_types,
+                    layer_group_ids=group_ids,
+                    logical_block_tokens=128,
+                    kv_shape=(128, 2, 256),
+                    kv_element_size=1,
+                    conv_shape=(conv_dim, 3),
+                    conv_element_size=2,
+                    ssm_shape=(linear_value_heads, 128, 128),
+                    ssm_element_size=4,
+                )
+                draft_fields = self.layouts_module.draft_cache_fields(
+                    layer_group_ids=("full_attention",),
+                    enabled_layer_ids=(0,),
+                    logical_block_tokens=128,
+                    layer_kv_heads=(2,),
+                    head_dim=256,
+                    kv_element_size=1,
+                )
+                merged_fields = target_fields + self.plan_module.continue_layer_fields(
+                    draft_fields,
+                    first_layer_id=len(layer_types),
+                )
+
+                target_layout = self.plan_module.solve_cache_layout(
+                    target_fields,
+                    logical_block_tokens=128,
+                    alignment=256,
+                    max_padding_fraction=1.0,
+                )
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "linear_attention_0.*padding fraction",
+                ):
+                    self.plan_module.solve_cache_layout(
+                        merged_fields,
+                        logical_block_tokens=128,
+                        alignment=256,
+                        max_padding_fraction=1.0,
+                    )
+
+                padding_limit = qwen.qwen_gdn_max_padding_fraction(
+                    layer_types=layer_types,
+                    num_draft_layers=1,
+                )
+                merged_layout = self.plan_module.solve_cache_layout(
+                    merged_fields,
+                    logical_block_tokens=128,
+                    alignment=256,
+                    max_padding_fraction=padding_limit,
+                )
+
+                def padding_fraction(layout, fields, group_id):
+                    raw_bytes = sum(
+                        field.payload_bytes
+                        for field in fields
+                        if field.group_id == group_id
+                    )
+                    packing = dict(layout.group_packing)[group_id]
+                    return layout.lcm_block_bytes / packing / raw_bytes - 1.0
+
+                target_padding = padding_fraction(
+                    target_layout,
+                    target_fields,
+                    "linear_attention_0",
+                )
+                merged_padding = padding_fraction(
+                    merged_layout,
+                    merged_fields,
+                    "linear_attention_0",
+                )
+                self.assertAlmostEqual(
+                    merged_padding,
+                    target_padding + (1.0 + target_padding) / full_attention_layers,
+                )
+                self.assertEqual(
+                    padding_fraction(
+                        merged_layout,
+                        merged_fields,
+                        "full_attention",
+                    ),
+                    0.0,
+                )
+                self.assertEqual(
+                    qwen.qwen_gdn_max_padding_fraction(
+                        layer_types=layer_types,
+                        num_draft_layers=0,
+                    ),
+                    1.0,
+                )
+
+        with self.assertRaisesRegex(ValueError, "full-attention layer"):
+            qwen.qwen_gdn_max_padding_fraction(
+                layer_types=("linear_attention",),
+                num_draft_layers=1,
+            )
+
     def test_ordinary_profile_reserves_null_page_inside_budget(self):
         ordinary = sys.modules[
             "tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary"
