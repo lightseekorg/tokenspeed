@@ -48,9 +48,6 @@ using bf16x2_t = __nv_bfloat162;
 using fp32x4_t = float4;
 
 namespace device {
-/// Forced-inline device-function qualifier used across the Marlin kernel.
-#define SGL_DEVICE __forceinline__ __device__
-
 /// Ceil-division used across the Marlin GEMM (host + device).
 template <typename T, typename U>
 __host__ __device__ constexpr auto div_ceil(T a, U b) {
