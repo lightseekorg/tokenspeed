@@ -24,8 +24,13 @@
 
 from __future__ import annotations
 
+import functools
+import logging
+
 import torch
 from tokenspeed_kernel._triton import tl, triton
+
+logger = logging.getLogger(__name__)
 
 DEEPSEEK_V4_HEAD_DIM = 512
 DEEPSEEK_V4_ROPE_DIM = 64
@@ -402,6 +407,25 @@ def _deepseek_v4_fused_sparse_compress_cache_kernel(
     )
 
 
+@functools.cache
+def _wide_compress_launch_supported(device: torch.device | int | None) -> bool:
+    """Return whether the wide sparse-compress launch is supported."""
+
+    try:
+        if not torch.cuda.is_available() or torch.version.hip is not None:
+            return False
+        capability = torch.cuda.get_device_capability(device)
+        supported = capability == (10, 0)
+        logger.info(
+            "DeepSeek V4 sparse-compress launch selection: capability=%s num_warps=%d",
+            capability,
+            16 if supported else 4,
+        )
+        return supported
+    except (AssertionError, RuntimeError, TypeError, ValueError):
+        return False
+
+
 def deepseek_v4_fused_sparse_compress_cache_insert(
     *,
     state_cache: torch.Tensor,
@@ -461,7 +485,12 @@ def deepseek_v4_fused_sparse_compress_cache_insert(
         TOKEN_STRIDE=DEEPSEEK_V4_SWA_TOKEN_STRIDE,
         SCALE_DIM=DEEPSEEK_V4_SWA_SCALE_DIM,
         KV_BLOCK_STRIDE=kv_cache_2d.stride(0),
-        num_warps=4,
+        num_warps=(
+            16
+            if compress_ratio >= 128
+            and _wide_compress_launch_supported(state_cache.device)
+            else 4
+        ),
     )
 
 
