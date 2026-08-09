@@ -35,7 +35,6 @@ class TestAutoBackendTopology:
         backend._nccl = Mock()
         backend._rsag = Mock()
         backend._triton_ar = Mock()
-        backend._custom_ar = Mock()
         backend._trtllm_ar = Mock()
         return backend
 
@@ -73,6 +72,10 @@ class TestAutoBackendTopology:
         getattr(backend._nccl, method).assert_not_called()
 
     def test_cross_node_all_reduce_falls_back_to_nccl(self, backend):
+        # trtllm_ar is still consulted for a cross-node group: its mnnvl
+        # workspace spans nodes, and it is only armed when that succeeded.
+        # NCCL is the fallback for when it is not armed.
+        backend._trtllm_ar.has_trtllm_ar.return_value = False
         tensor = Mock()
         backend._nccl.all_reduce.return_value = "nccl-result"
 
@@ -82,9 +85,18 @@ class TestAutoBackendTopology:
         backend._nccl.all_reduce.assert_called_once_with(
             tensor, tuple(range(8)), op=None
         )
-        backend._custom_ar.has_custom_ar.assert_not_called()
-        backend._trtllm_ar.has_trtllm_ar.assert_not_called()
         backend._triton_ar.can_run.assert_not_called()
+
+    def test_cross_node_all_reduce_uses_trtllm_when_armed(self, backend):
+        """An armed mnnvl workspace serves cross-node groups directly."""
+        backend._trtllm_ar.has_trtllm_ar.return_value = True
+        backend._trtllm_ar.all_reduce.return_value = "trtllm-result"
+        tensor = Mock()
+
+        result = backend.all_reduce(tensor, tuple(range(8)))
+
+        assert result == "trtllm-result"
+        backend._nccl.all_reduce.assert_not_called()
 
     def test_cross_node_last_dim_all_gather_falls_back_to_nccl(self, backend):
         tensor = Mock()

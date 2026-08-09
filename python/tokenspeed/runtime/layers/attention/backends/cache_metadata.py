@@ -56,13 +56,6 @@ class CacheBatchMetadata:
     max_page_ids: Mapping[str, int]
     block_size: int
     full_attention_group_id: str | None
-    # The FIRST ``family="history"`` + ``retention="full_history"`` group in
-    # contract order, or ``None`` when there is none. Unlike
-    # ``full_attention_group_id`` (which is ``None`` when several exist), this
-    # matches the executor's legacy ``next(...)`` selection so a multi-group
-    # pool (DeepSeek-V4) can resolve the same base page table it previously read
-    # through ``page_table``.
-    first_full_attention_group_id: str | None
     _forward_op: Any = field(repr=False, compare=False)
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -103,8 +96,7 @@ class CacheBatchMetadata:
         full_attention_ids = tuple(
             spec.group_id
             for spec in contract.group_specs
-            if getattr(spec, "family", "history") == "history"
-            and getattr(spec, "retention", None) == "full_history"
+            if spec.family == "history" and spec.retention == "full_history"
         )
         tables = block_tables_from_forward_op(
             forward_op,
@@ -122,9 +114,6 @@ class CacheBatchMetadata:
             full_attention_group_id=(
                 full_attention_ids[0] if len(full_attention_ids) == 1 else None
             ),
-            first_full_attention_group_id=(
-                full_attention_ids[0] if full_attention_ids else None
-            ),
             forward_op=forward_op,
         )
 
@@ -138,7 +127,6 @@ class CacheBatchMetadata:
         max_page_ids: Mapping[str, int],
         block_size: int,
         full_attention_group_id: str | None,
-        first_full_attention_group_id: str | None,
         forward_op: Any,
     ) -> CacheBatchMetadata:
         if tuple(group_tables) != group_ids:
@@ -176,11 +164,6 @@ class CacheBatchMetadata:
         )
         object.__setattr__(metadata, "block_size", block_size)
         object.__setattr__(metadata, "full_attention_group_id", full_attention_group_id)
-        object.__setattr__(
-            metadata,
-            "first_full_attention_group_id",
-            first_full_attention_group_id,
-        )
         # A strong reference makes Python/nanobind object identity safe against
         # id reuse until all metadata views become unreachable.
         object.__setattr__(metadata, "_forward_op", forward_op)
@@ -209,21 +192,6 @@ class CacheBatchMetadata:
             return self._group_tables[group_id]
         except KeyError:
             raise KeyError(f"missing paged cache group {group_id!r}") from None
-
-    def table_for_layer(
-        self,
-        pool: object,
-        layer_id: int,
-        *,
-        active_forward_op: Any,
-    ) -> torch.Tensor:
-        """Resolve a layer and return its fresh operation-bound table."""
-        self._validate_active_forward_op(active_forward_op)
-        group_id = pool.group_id_for_layer(layer_id)
-        return self.require_table(
-            group_id,
-            active_forward_op=active_forward_op,
-        )
 
     def require_full_attention_table(self, *, active_forward_op: Any) -> torch.Tensor:
         """Return the unique full-history history-group table.

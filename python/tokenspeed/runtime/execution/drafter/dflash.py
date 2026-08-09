@@ -24,7 +24,6 @@ import torch
 
 from tokenspeed.runtime.distributed.comm_ops import all_gather_into_tensor
 from tokenspeed.runtime.execution.cache_loc_kernel import (
-    compute_out_cache_loc_uniform,
     dflash_prepare_decode,
 )
 from tokenspeed.runtime.execution.context import ForwardContext
@@ -104,9 +103,8 @@ class DFlash(BaseDrafter):
         self,
         spec_num_tokens: int,
         spec_num_steps: int,
-        page_size: int,
         draft_model_runner: ModelRunner | None = None,
-        page_table: torch.Tensor | None = None,
+        cache_view=None,
         attn_backend=None,
         token_to_kv_pool=None,
         runtime_states: RuntimeStates | None = None,
@@ -119,8 +117,7 @@ class DFlash(BaseDrafter):
             draft_model_runner=draft_model_runner,
             runtime_states=runtime_states,
             input_buffers=input_buffers,
-            page_size=page_size,
-            page_table=page_table,
+            cache_view=cache_view,
             attn_backend=attn_backend,
             token_to_kv_pool=token_to_kv_pool,
             vocab_size=vocab_size,
@@ -173,8 +170,8 @@ class DFlash(BaseDrafter):
     def _init_native_buffers(self) -> None:
         if self.input_buffers is None:
             raise ValueError("Native DFLASH requires input buffers.")
-        if self.page_table is None:
-            raise ValueError("Native DFLASH requires page_table.")
+        if self.cache_view is None:
+            raise ValueError("Native DFLASH requires a staged cache view.")
         if self.attn_backend is None or self.token_to_kv_pool is None:
             raise ValueError("Native DFLASH requires draft attention components.")
 
@@ -226,13 +223,28 @@ class DFlash(BaseDrafter):
             (max_bs,), dtype=torch.int64, device=self.device
         )
 
-    def bind_target_model(self, target_model) -> None:
+    def wire_target(self, target_model) -> None:
         language_model = getattr(target_model, "language_model", target_model)
         self.target_model = target_model
         self.target_language_model = language_model
         self.embed_tokens = target_model.get_input_embeddings()
         self.lm_head = target_model.lm_head
         self.logits_processor = language_model.logits_processor
+        if not hasattr(target_model, "set_dflash_layers_to_capture"):
+            raise ValueError(
+                "DFLASH requires the target model to support "
+                "set_dflash_layers_to_capture."
+            )
+        incr_callback = None
+        incr_slot_bufs = None
+        if self._incremental_proj_enabled:
+            incr_callback = self._on_capture_slot_ready
+            incr_slot_bufs = self._incr_slot_bufs
+        target_model.set_dflash_layers_to_capture(
+            self.target_layer_ids,
+            incremental_callback=incr_callback,
+            slot_bufs=incr_slot_bufs,
+        )
 
     def _greedy_gather_capacity(self) -> int:
         """Max element count for the greedy head's tensor-parallel all-gather
@@ -895,12 +907,10 @@ class DFlash(BaseDrafter):
                 out=block_positions,
             )
 
-            compute_out_cache_loc_uniform(
-                out_cache_loc_ptr=cache_locs,
-                uniform_input_length=self.draft_query_width,
+            self.cache_view.out_cache_loc_uniform(
+                out=cache_locs,
                 cache_start=prefix_lens,
-                page_table=self.page_table,
-                page_size=self.page_size,
+                num_tokens=self.draft_query_width,
             )
 
         is_capturing = (
@@ -915,7 +925,7 @@ class DFlash(BaseDrafter):
                 num_extends=metadata_num_extends,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens_after,
-                page_table=self.page_table,
+                page_table=self.cache_view.table,
                 forward_mode=ForwardMode.DECODE,
                 extend_seq_lens=None,
                 extend_seq_lens_cpu=self.draft_extend_seq_lens_cpu[:bs],
@@ -1012,22 +1022,20 @@ class DFlash(BaseDrafter):
             draft_cache_locs = self.draft_out_cache_loc_buf[
                 : bs * self.draft_query_width
             ]
-            max_draft_prefix = (
-                self.page_table.shape[1] * self.page_size - self.draft_query_width
-            )
+            max_draft_prefix = self.cache_view.max_tokens - self.draft_query_width
             dflash_prepare_decode(
                 output_tokens=output_tokens,
                 accept_lengths=accept_lengths[:bs],
                 req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
                 valid_cache_lengths=self.runtime_states.valid_cache_lengths,
-                page_table=self.page_table,
+                page_table=self.cache_view.table,
                 draft_seq_lens=self.draft_seq_lens_buf[:bs],
                 block_ids=self.block_ids_buf[:bs],
                 block_positions=self.block_positions_buf[:bs],
                 out_cache_loc=draft_cache_locs,
                 verify_width=self.spec_num_tokens,
                 draft_query_width=self.draft_query_width,
-                page_size=self.page_size,
+                page_size=self.cache_view.page_size,
                 max_draft_prefix=max_draft_prefix,
             )
             return self._draft_native(current_tokens, prepared=True)
@@ -1058,9 +1066,7 @@ class DFlash(BaseDrafter):
 
         bs = base_ctx.bs
         req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
-        max_draft_prefix = (
-            self.page_table.shape[1] * self.page_size - self.draft_query_width
-        )
+        max_draft_prefix = self.cache_view.max_tokens - self.draft_query_width
 
         current_tokens = self.block_ids_buf[:bs, 0]
         draft_cache_locs = self.draft_out_cache_loc_buf[: bs * self.draft_query_width]
@@ -1069,14 +1075,14 @@ class DFlash(BaseDrafter):
             accept_lengths=accept_lengths[:bs],
             req_pool_indices=req_pool_indices,
             valid_cache_lengths=self.runtime_states.valid_cache_lengths,
-            page_table=self.page_table,
+            page_table=self.cache_view.table,
             draft_seq_lens=self.draft_seq_lens_buf[:bs],
             block_ids=self.block_ids_buf[:bs],
             block_positions=self.block_positions_buf[:bs],
             out_cache_loc=draft_cache_locs,
             verify_width=self.spec_num_tokens,
             draft_query_width=self.draft_query_width,
-            page_size=self.page_size,
+            page_size=self.cache_view.page_size,
             max_draft_prefix=max_draft_prefix,
         )
 

@@ -71,7 +71,7 @@ def _make_mxfp4_module(
     return module, raw
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8])
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 16])
 def test_ep_decode_matches_kimi_k3_shape_gfx950(
     num_tokens: int,
 ) -> None:
@@ -166,7 +166,7 @@ def test_ep_decode_matches_kimi_k3_shape_gfx950(
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8])
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 16])
 def test_ep_decode_all_remote_routes_return_zero_gfx950(
     num_tokens: int,
 ) -> None:

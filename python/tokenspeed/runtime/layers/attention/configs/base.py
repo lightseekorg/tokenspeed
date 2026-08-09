@@ -69,6 +69,10 @@ class BaseAttnConfig:
     kv_cache_dtype: torch.dtype
     # Tokens covered by one page as seen by the attention kernel.
     page_size: int
+    # Physical per-request KV extent: the model's logical context_len plus
+    # ServerArgs.spec_context_pad (spec verify overshoot for a finished request
+    # lingering one overlap step). Backends size page tables and clamp seq_lens
+    # against this; user-facing limits stay on the logical context_len.
     context_len: int
     max_bs: int
     max_graph_bs: int

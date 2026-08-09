@@ -108,7 +108,6 @@ class TestKimiK3Eagle3E2E(unittest.TestCase):
                     '{"thinking":true,"thinking_effort":"max"}',
                     "--enable-log-request-stats",
                     "--disable-kvstore",
-                    "--disable-custom-all-reduce",
                     "--force-deterministic-rsag",
                     "--enforce-eager",
                 ]

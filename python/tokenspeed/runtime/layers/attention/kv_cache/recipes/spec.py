@@ -61,87 +61,45 @@ LINEAR_ATTENTION = "linear_attention"
 STATE_LAYER_TYPES = frozenset({LINEAR_ATTENTION})
 
 
-def _kv_backend(attn_backend: object) -> object:
-    """The backend whose KV-table consumption matters for scheduler safety: the
-    backend itself, or a composite's full-attention sub-backend (hybrid's
-    per-layer KV routing lives there and is user-selectable). The linear
-    side consumes only the state group's table through its own explicit
-    path and is out of scope here.
-    """
-    sub = getattr(attn_backend, "full_attn_backend", None)
-    if sub is not None:
-        return _kv_backend(sub)
-    return attn_backend
-
-
 def validate_scheduler_config(
     *,
-    paged_cache_groups: Sequence[object],
     attn_backend: object,
     kv_pool: object,
-    speculative_algorithm: str | None = None,
 ) -> None:
-    """Validate the cache-group contract before constructing the scheduler.
+    """Validate that the attention backend consumes every cache-group family
+    the KV pool's runtime contract publishes.
 
-    A single-group backend may consume the scheduler's compatibility table.
-    Multi-group pools must consume the explicit per-group tables.
+    Args:
+        attn_backend: The (possibly composite) attention backend; composite
+            backends aggregate their sub-backends' consumer families in
+            their own ``cache_consumer_families``.
+        kv_pool: The KV pool whose ``runtime_contract`` group specs name the
+            required families.
+
+    Raises:
+        RuntimeError: When the pool publishes no runtime contract, or when a
+            contract family (e.g. a hybrid pool's ``state`` group) has no
+            consumer in the backend — that group's tables would go unread,
+            dying on a capture-path assert at best and silently reading the
+            wrong pages at worst.
     """
     contract = getattr(kv_pool, "runtime_contract", None)
-    pool_name = type(kv_pool).__name__
-    if speculative_algorithm is not None and not getattr(
-        attn_backend, "cache_group_spec_capable", True
-    ):
+    if contract is None:
         raise RuntimeError(
-            f"attention backend {type(attn_backend).__name__} does not support "
-            "cache groups with speculative decoding"
+            f"KV pool {type(kv_pool).__name__} publishes no "
+            "PagedCacheRuntimeContract. Every pool must be built from a "
+            "cache recipe (kv_cache.recipes.setup.prepare_cache_setup)."
         )
-    backend = _kv_backend(attn_backend)
-    backend_name = type(backend).__name__
-    uses_cache_groups = bool(getattr(backend, "uses_cache_groups", False))
-    if speculative_algorithm is not None and not getattr(
-        backend, "cache_group_spec_capable", True
-    ):
+    required_families = frozenset(spec.family for spec in contract.group_specs)
+    supported_families = frozenset(getattr(attn_backend, "cache_consumer_families", ()))
+    missing_families = required_families - supported_families
+    if missing_families:
         raise RuntimeError(
-            f"attention backend {backend_name} does not support cache groups "
-            "with speculative decoding"
+            "paged cache pool requires consumer families "
+            f"{sorted(required_families)}, but backend "
+            f"{type(attn_backend).__name__} is missing "
+            f"{sorted(missing_families)}"
         )
-    if len(paged_cache_groups) > 1 and not uses_cache_groups and contract is None:
-        # A table-blind backend on a multi-group pool would index every
-        # layer through the C++ single-table fallback (a first-group
-        # sample) — with slab-aliased layouts that silently corrupts KV
-        # past the sliding window. Refuse at startup instead.
-        #
-        # Contract pools are exempt from this flag check: their consumers
-        # travel contract-specific batch metadata and are validated by the
-        # family-coverage check below.
-        # The MLA sub-backend's uses_cache_groups flag deliberately
-        # stays False so DeepSeek keeps the single-table CUDA-graph
-        # capture path that flag routes.
-        raise RuntimeError(
-            f"KV pool {pool_name} publishes {len(paged_cache_groups)} cache "
-            f"groups but attention backend {backend_name} does not consume "
-            "per-group tables (uses_cache_groups=False); the single-"
-            "table fallback would serve one group's pages to every layer, "
-            "silently corrupting KV"
-        )
-    if not paged_cache_groups:
-        raise RuntimeError(
-            "the cache-group scheduler requires at least one paged-cache "
-            f"group, but KV pool {pool_name} publishes none"
-        )
-    if contract is not None:
-        required_families = frozenset(spec.family for spec in contract.group_specs)
-        supported_families = frozenset(
-            getattr(attn_backend, "cache_consumer_families", ())
-        )
-        missing_families = required_families - supported_families
-        if missing_families:
-            raise RuntimeError(
-                "paged cache pool requires consumer families "
-                f"{sorted(required_families)}, but backend "
-                f"{type(attn_backend).__name__} is missing "
-                f"{sorted(missing_families)}"
-            )
 
 
 def compute_paged_cache_group_page_counts(

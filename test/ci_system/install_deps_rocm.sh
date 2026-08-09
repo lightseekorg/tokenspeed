@@ -5,10 +5,7 @@ set -e
 # ROCm/AMD MI355 install script for TokenSpeed CI.
 # ============================================================
 GFX_ARCH=${GFX_ARCH:-gfx950}
-ROCM_VERSION=${ROCM_VERSION:-7.2}
 BUILD_AND_DOWNLOAD_PARALLEL=${BUILD_AND_DOWNLOAD_PARALLEL:-16}
-
-ROCM_INDEX="https://repo.amd.com/rocm/whl-multi-arch/"
 
 export MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL}
 WORKSPACE=${WORKSPACE:-$(pwd)}
@@ -34,7 +31,6 @@ pip_install_with_retry() {
 
 echo "=========================================="
 echo "GFX_ARCH=${GFX_ARCH}"
-echo "ROCM_VERSION=${ROCM_VERSION}"
 echo "WORKSPACE=${WORKSPACE}"
 echo "=========================================="
 
@@ -44,10 +40,12 @@ sudo apt-get install -y openmpi-bin libopenmpi-dev libssl-dev pkg-config
 echo "=== Step 2: Upgrade pip/setuptools/wheel ==="
 pip install --upgrade pip "setuptools<82" wheel
 
-echo "=== Step 3: Install PyTorch for ROCm ==="
-pip install --index-url "${ROCM_INDEX}" \
-	"torch[device-${GFX_ARCH}]==2.11.0" \
-	"torchvision[device-${GFX_ARCH}]==0.26.0" \
+echo "=== Step 3: Check PyTorch for ROCm ==="
+if ! pip3 show torch >/dev/null 2>&1; then
+    echo "torch is not installed; installing PyTorch for ROCm 7.2"
+    pip3 install torch==2.11.0 torchvision==0.26.0 \
+        --index-url https://download.pytorch.org/whl/rocm7.2
+fi
 
 echo "=== Step 4: Install tokenspeed-kernel packages ==="
 

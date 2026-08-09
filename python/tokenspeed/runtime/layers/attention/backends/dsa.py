@@ -194,9 +194,6 @@ class DSABackend(AttentionBackend):
             out=metadata._dsa_plan,
         )
 
-    def get_cuda_graph_seq_len_fill_value(self):
-        return self._dense_backend.get_cuda_graph_seq_len_fill_value()
-
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor | None = None):
         metadata = self.forward_decode_metadata
         if metadata is None or metadata.seq_lens_k is None:

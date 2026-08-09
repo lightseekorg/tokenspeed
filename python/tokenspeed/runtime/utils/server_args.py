@@ -49,6 +49,20 @@ logger = get_colorful_logger(__name__)
 
 ENABLE_CP = os.environ.get("ENABLE_CP", "false").lower() in ("true", "1")
 
+# Spec-decode overshoot spans the physical KV extent must absorb past the
+# logical context_len. The overlap scheduler steps a finished request at most
+# ONE extra iteration (event_loop_overlap commits the previous step every
+# round, so the Finish event reaches the C++ scheduler before the next plan),
+# and termination is checked CPU-side against max_new_tokens, so verify can
+# commit past context_len for exactly that window:
+#   1. the finishing step's own accept (up to spec_num_tokens past the limit),
+#   2. the single lingering step's accept,
+#   3. the lingering step laying out its next draft block after that accept.
+# Hence 3 spans. Everything written past context_len belongs to a request
+# whose output is already truncated by max_new_tokens; the garbage KV is
+# evicted with the request one step later.
+_SPEC_OVERSHOOT_SPANS = 3
+
 
 def str_to_bool(value: str | bool) -> bool:
     if isinstance(value, bool):
@@ -280,7 +294,6 @@ class ServerArgs:
     enable_cudagraph_gc: bool = False
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
-    disable_custom_all_reduce: bool = False
     disable_overlap_schedule: bool = False
     disable_tf32: bool = False
     force_deterministic_rsag: bool = False
@@ -336,6 +349,19 @@ class ServerArgs:
     @property
     def mamba_cache_chunk_size(self) -> int:
         return max(FLA_CHUNK_SIZE, self.block_size)
+
+    @property
+    def spec_context_pad(self) -> int:
+        """Tokens the physical KV extent must hold past the logical context_len.
+
+        Zero without speculative decoding; see _SPEC_OVERSHOOT_SPANS for the
+        derivation. Sizing consumers (page tables, graph capture widths) add
+        this pad; user-semantic consumers (input validation, max_new_tokens
+        folding, stop checks) keep the logical context_len.
+        """
+        if self.speculative_algorithm is None:
+            return 0
+        return _SPEC_OVERSHOOT_SPANS * int(self.speculative_num_draft_tokens)
 
     def __post_init__(self):
         self.resolve_basic_defaults()
@@ -1741,11 +1767,6 @@ class ServerArgs:
             "--enable-symm-mem",
             action="store_true",
             help="Enable NCCL symmetric memory for fast collectives.",
-        )
-        parser.add_argument(
-            "--disable-custom-all-reduce",
-            action="store_true",
-            help="Disable the custom all-reduce kernel and fall back to NCCL.",
         )
         parser.add_argument(
             "--disable-overlap-schedule",

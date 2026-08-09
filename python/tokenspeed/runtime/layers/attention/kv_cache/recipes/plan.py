@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import math
+import re
 from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -98,6 +99,100 @@ class CacheMemoryPlan:
                 return plane
         raise KeyError(plane_id)
 
+    def capacity_report(
+        self,
+        *,
+        window_tokens: Mapping[str, int] | None = None,
+        per_request_blocks: Mapping[str, int] | None = None,
+        max_num_seqs: int | None = None,
+    ) -> dict:
+        """Per-group capacity in its own consumption unit, plus dead bytes.
+
+        Heterogeneous groups consume in different units — full-attention
+        per token, state (KDA/Mamba) per request, sliding-window bounded by
+        the window — so a single token-denominated capacity misstates two
+        of the three. Callers name the special groups:
+
+        Args:
+            window_tokens: retention-bounded groups (sliding window): active
+                demand per request is at most the window, so capacity beyond
+                ``max_num_seqs × window`` is dead rows (stranded by the
+                static slab split).
+            per_request_blocks: per-request-constant groups (state): the
+                admission they support is ``page_count / blocks_per_req``.
+            max_num_seqs: admission bound used for dead-row estimates.
+
+        Returns:
+            ``{group_id: {"unit", "capacity", "supported_requests",
+            "dead_bytes", "binding_utilization"}}`` with
+            ``supported_requests`` None when unknown. Binding admission =
+            min over non-None supported_requests. ``binding_utilization``
+            is the fraction of a parent a binding of this group actually
+            uses (aliased slabs are sized by their widest tenant; a
+            narrower group's binding leaves the rest dead — the
+            binding hole).
+        """
+        window_tokens = dict(window_tokens or {})
+        per_request_blocks = dict(per_request_blocks or {})
+        group_bytes_per_block: dict[str, int] = {}
+        for field in self.fields:
+            group_bytes_per_block[field.group_id] = (
+                group_bytes_per_block.get(field.group_id, 0) + field.payload_bytes
+            )
+        report: dict[str, dict] = {}
+        for group in self.groups:
+            usable_pages = self.num_lcm_blocks * group.cache_blocks_per_lcm_block
+            block_bytes = group_bytes_per_block.get(group.group_id, 0)
+            binding_utilization = (
+                group.cache_blocks_per_lcm_block * block_bytes / self.lcm_block_bytes
+                if self.lcm_block_bytes
+                else 0.0
+            )
+            if group.group_id in per_request_blocks:
+                blocks_per_req = max(1, per_request_blocks[group.group_id])
+                supported = usable_pages // blocks_per_req
+                demand_pages = max_num_seqs * blocks_per_req if max_num_seqs else None
+                report[group.group_id] = {
+                    "unit": "requests",
+                    "capacity": supported,
+                    "supported_requests": supported,
+                    "dead_bytes": (
+                        max(0, usable_pages - demand_pages) * block_bytes
+                        if demand_pages is not None
+                        else None
+                    ),
+                    "binding_utilization": binding_utilization,
+                }
+                continue
+            token_capacity = usable_pages * self.logical_block_tokens
+            if group.group_id in window_tokens:
+                window = max(1, window_tokens[group.group_id])
+                demand_tokens = max_num_seqs * window if max_num_seqs else None
+                supported = token_capacity // window
+                report[group.group_id] = {
+                    "unit": "tokens",
+                    "capacity": token_capacity,
+                    "supported_requests": supported,
+                    "dead_bytes": (
+                        max(0, token_capacity - demand_tokens)
+                        // self.logical_block_tokens
+                        * block_bytes
+                        if demand_tokens is not None
+                        else None
+                    ),
+                    "binding_utilization": binding_utilization,
+                }
+                continue
+            report[group.group_id] = {
+                "unit": "tokens",
+                "capacity": token_capacity,
+                # Depends on per-request context length; unknown here.
+                "supported_requests": None,
+                "dead_bytes": 0,
+                "binding_utilization": binding_utilization,
+            }
+        return report
+
 
 @dataclass(frozen=True)
 class CacheFieldSpec:
@@ -172,6 +267,93 @@ class CacheLayout:
             planes=tuple(planes),
             fields=self.fields,
         )
+
+
+def merge_continuation_layers(
+    *,
+    fields,
+    layer_types: tuple[str, ...],
+    group_ids: tuple[str, ...],
+    layer_kv_head_counts: tuple[int, ...] | None = None,
+    draft_fields=None,
+    draft_layer_types: tuple[str, ...] = (),
+    draft_group_ids: tuple[str, ...] = (),
+    draft_layer_kv_head_counts: tuple[int, ...] | None = None,
+) -> tuple:
+    """Merge a draft model's per-layer vectors after the target's.
+
+    One big model: the draft's fields renumber via
+    :func:`continue_layer_fields`; every other per-layer vector is plain
+    concatenation. Returns ``(fields, layer_types, group_ids,
+    layer_kv_head_counts, num_draft_layers)`` — all target-shaped, so
+    downstream builders stay draft-oblivious.
+    """
+    merged_fields = tuple(fields)
+    merged_layer_types = tuple(layer_types)
+    merged_group_ids = tuple(group_ids)
+    merged_head_counts = layer_kv_head_counts
+    num_draft_layers = 0
+    if draft_fields is not None:
+        num_target_layers = len(merged_group_ids)
+        num_draft_layers = len(draft_group_ids)
+        if len(draft_layer_types) != num_draft_layers:
+            raise ValueError(
+                f"draft layer_types has {len(draft_layer_types)} entries but "
+                f"draft group_ids has {num_draft_layers}"
+            )
+        merged_fields += continue_layer_fields(
+            draft_fields, first_layer_id=num_target_layers
+        )
+        merged_layer_types += tuple(draft_layer_types)
+        merged_group_ids += tuple(draft_group_ids)
+        if bool(layer_kv_head_counts) != bool(draft_layer_kv_head_counts):
+            raise ValueError(
+                "layer_kv_head_counts must be supplied for both sides or neither"
+            )
+        if layer_kv_head_counts is not None:
+            merged_head_counts = tuple(layer_kv_head_counts) + tuple(
+                draft_layer_kv_head_counts
+            )
+    return (
+        merged_fields,
+        merged_layer_types,
+        merged_group_ids,
+        merged_head_counts,
+        num_draft_layers,
+    )
+
+
+def continue_layer_fields(fields, *, first_layer_id: int) -> tuple[CacheFieldSpec, ...]:
+    """Renumber per-layer fields as continuation layers of one big model.
+
+    Draft layers join the target's ``solve_cache_layout`` as ordinary
+    layers of the ONE merged model:
+    a draft model's local ``layer.{i}...`` field/plane ids become the
+    global ``layer.{first_layer_id + i}...``. Group ids are untouched: a
+    draft layer in a target group shares its page-id space and packing by
+    construction. No draft-specific namespace exists — the merged plan is
+    simply a model with more layers.
+    """
+    renumber = re.compile(r"^(?P<head>layer|unit|slot)\.(?P<idx>\d+)")
+
+    def _shift(identifier: str) -> str:
+        return renumber.sub(
+            lambda m: f"{m.group('head')}.{int(m.group('idx')) + first_layer_id}",
+            identifier,
+        )
+
+    return tuple(
+        CacheFieldSpec(
+            field.group_id,
+            _shift(field.field_id),
+            _shift(field.plane_id),
+            field.shape,
+            field.element_size,
+            exact_page_stride=field.exact_page_stride,
+            page_stride_alignment_bytes=field.page_stride_alignment_bytes,
+        )
+        for field in fields
+    )
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -321,16 +503,24 @@ def solve_cache_layout(
     ordered_group_ids = tuple(sorted(raw_by_group))
     has_explicit_packing = cache_blocks_per_lcm_block is not None
     if has_explicit_packing:
-        if set(cache_blocks_per_lcm_block) != set(ordered_group_ids):
+        unknown = set(cache_blocks_per_lcm_block) - set(ordered_group_ids)
+        if unknown:
             raise ValueError(
-                "cache_blocks_per_lcm_block must contain exactly the cache groups"
+                "cache_blocks_per_lcm_block names groups outside the plan: "
+                f"{sorted(unknown)}"
             )
-        packing = dict(cache_blocks_per_lcm_block)
         if any(
             isinstance(count, bool) or not isinstance(count, int) or count < 1
-            for count in packing.values()
+            for count in cache_blocks_per_lcm_block.values()
         ):
             raise ValueError("cache group packing must be a positive integer")
+        # Pinned groups take the caller's count; groups the caller leaves
+        # unpinned pack by their byte ratio as in the unpinned solve.
+        packing = _packing_by_group_ratio(raw_by_group)
+        constrained = _solve_packing(ordered_fields)
+        if constrained is not None:
+            packing.update(constrained)
+        packing.update(cache_blocks_per_lcm_block)
     else:
         packing = _packing_by_group_ratio(raw_by_group)
         constrained = _solve_packing(ordered_fields)

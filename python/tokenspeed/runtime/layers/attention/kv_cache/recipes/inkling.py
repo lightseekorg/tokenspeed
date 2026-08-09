@@ -8,6 +8,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
+    merge_continuation_layers,
 )
 
 
@@ -204,26 +205,22 @@ def _workspace_bytes(
     text_config,
     attn_config,
     num_layers: int,
-    verify_tokens: int = 0,
-    lagged_window: bool = False,
+    spec_tokens: int = 1,
 ) -> int:
     import torch
 
     from tokenspeed.runtime.configs.inkling_config import inkling_conv_total_dim
 
     rows = int(attn_config.max_bs) + 2
-    state_rows = int(text_config.sconv_kernel_size) - 1
+    # Must match _wrap_inkling_backend's ring sizing:
+    # (W-1) taps + K chunk rows + draft lookback depth (K-2).
+    spec_tokens = max(1, int(spec_tokens))
+    ring_rows = (
+        int(text_config.sconv_kernel_size) - 1 + spec_tokens + max(spec_tokens - 2, 0)
+    )
     conv_dim = inkling_conv_total_dim(text_config, attn_config.attn_tp_size)
     element_size = torch.bfloat16.itemsize
-    rolling = num_layers * rows * state_rows * conv_dim * element_size
-    verify = (
-        num_layers
-        * int(attn_config.max_bs)
-        * int(verify_tokens)
-        * conv_dim
-        * element_size
-    )
-    return rolling + verify + (rolling if lagged_window else 0)
+    return num_layers * rows * ring_rows * conv_dim * element_size
 
 
 def prepare_inkling_cache(
@@ -253,7 +250,7 @@ def prepare_inkling_cache(
         text_config=text_config,
         attn_config=attn_config,
         num_layers=text_config.num_hidden_layers,
-        verify_tokens=draft_tokens,
+        spec_tokens=draft_tokens,
     )
 
     draft_fields = None
@@ -290,10 +287,7 @@ def prepare_inkling_cache(
             text_config=draft_model_config.hf_config.get_text_config(),
             attn_config=draft_attn_config,
             num_layers=draft_num_layers,
-            lagged_window=(
-                num_steps > 1
-                and os.environ.get("INKLING_MTP_DECODE_LOOKBACK", "1") != "0"
-            ),
+            spec_tokens=draft_tokens,
         )
 
     max_padding_fraction = (
@@ -304,43 +298,48 @@ def prepare_inkling_cache(
         build_paged_cache_group_specs,
     )
 
-    # The published specs are the layer-group fold plus the paged sconv
-    # checkpoint groups (per-layer state columns outside the layer-type
-    # vocabulary); PD policies stamp the complete tuple.
+    (
+        merged_fields,
+        merged_layer_types,
+        merged_group_ids,
+        merged_head_counts,
+        num_draft_layers,
+    ) = merge_continuation_layers(
+        fields=fields,
+        layer_types=layer_types,
+        group_ids=layer_types,
+        layer_kv_head_counts=layer_kv_head_counts,
+        draft_fields=draft_fields,
+        draft_layer_types=draft_layer_types,
+        draft_group_ids=draft_group_ids,
+        draft_layer_kv_head_counts=draft_layer_kv_head_counts,
+    )
+    # ONE spec derivation over the merged layers (shared groups validate
+    # for consistent policy), plus the paged sconv checkpoint groups
+    # (per-layer state columns outside the layer-type vocabulary); PD
+    # policies stamp the complete tuple. Target and draft share the
+    # sliding window width by construction (same architecture family).
     group_specs = (
         *build_paged_cache_group_specs(
-            layer_types=layer_types,
-            group_ids=layer_types,
+            layer_types=merged_layer_types,
+            group_ids=merged_group_ids,
             sliding_window_tokens=attn_config.sliding_window_tokens,
             page_size=logical_block_tokens,
         ),
         *_checkpoint_groups(logical_block_tokens),
     )
-    draft_group_specs = ()
-    if draft_attn_config is not None:
-        draft_group_specs = build_paged_cache_group_specs(
-            layer_types=draft_layer_types,
-            group_ids=draft_group_ids,
-            sliding_window_tokens=draft_attn_config.sliding_window_tokens,
-            page_size=logical_block_tokens,
-        )
     if attn_config.pd_disaggregation_enabled:
         group_specs = tuple(apply_pd_transfer_policies(group_specs))
-        draft_group_specs = tuple(apply_pd_transfer_policies(draft_group_specs))
     return build_hybrid_cache_setup(
         family="inkling",
         server_args=server_args,
-        fields=fields,
-        layer_types=layer_types,
-        group_ids=layer_types,
+        fields=merged_fields,
+        layer_types=merged_layer_types,
+        group_ids=merged_group_ids,
         group_specs=group_specs,
         state_dtypes={},
-        layer_kv_head_counts=layer_kv_head_counts,
-        draft_fields=draft_fields,
-        draft_layer_types=draft_layer_types,
-        draft_group_ids=draft_group_ids,
-        draft_group_specs=draft_group_specs,
-        draft_layer_kv_head_counts=draft_layer_kv_head_counts,
+        layer_kv_head_counts=merged_head_counts,
+        num_draft_layers=num_draft_layers,
         cache_budget_bytes=cache_budget_bytes,
         fixed_workspace_bytes=fixed_workspace_bytes,
         logical_block_tokens=logical_block_tokens,

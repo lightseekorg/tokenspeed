@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import torch
 
+from tokenspeed.runtime.execution.draft_page_staging import CacheView
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
 from tokenspeed.runtime.execution.drafter.eagle import Eagle, EagleDraftInput
 from tokenspeed.runtime.execution.drafter.mtp import (
@@ -48,9 +49,10 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
         drafter = Mtp(
             spec_num_tokens=4,
             spec_num_steps=3,
-            page_size=128,
             draft_model_runner=model_runner,
-            page_table=torch.zeros((max_bs, 4), dtype=torch.int32),
+            cache_view=CacheView(
+                torch.zeros((max_bs, 4), dtype=torch.int32), page_size=128
+            ),
             attn_backend=backend,
             runtime_states=runtime_states,
             input_buffers=input_buffers,

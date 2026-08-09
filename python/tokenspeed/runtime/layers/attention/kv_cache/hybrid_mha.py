@@ -188,11 +188,17 @@ class HybridMHATokenToKVPoolMXFP8(
         self.store_dtype = torch.float8_e4m3fn
         super()._create_buffers()
         self.k_scale_buffer = [
-            self.field(f"layer.{layer_id}.k_scale", torch.float8_e8m0fnu)
+            self.field(
+                f"layer.{self._field_layer_id(layer_id)}.k_scale",
+                torch.float8_e8m0fnu,
+            )
             for layer_id in range(self.layer_num)
         ]
         self.v_scale_buffer = [
-            self.field(f"layer.{layer_id}.v_scale", torch.float8_e8m0fnu)
+            self.field(
+                f"layer.{self._field_layer_id(layer_id)}.v_scale",
+                torch.float8_e8m0fnu,
+            )
             for layer_id in range(self.layer_num)
         ]
 

@@ -791,7 +791,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         wrapper.attn_backend = FakeBackend("target")
         wrapper.draft_attn_backend = FakeBackend("draft")
         wrapper.drafter = SimpleNamespace(
-            page_table=torch.zeros((1, 1), dtype=torch.int32),
+            cache_view=SimpleNamespace(table=torch.zeros((1, 1), dtype=torch.int32)),
             draft_seq_lens_buf=torch.zeros(4, dtype=torch.int32),
         )
         wrapper.max_tokens_per_req = 4
@@ -873,7 +873,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         wrapper.draft_attn_backend = FakeBackend("draft")
         wrapper.max_tokens_per_req = 4
         wrapper.drafter = SimpleNamespace(
-            page_table=torch.zeros((1, 1), dtype=torch.int32),
+            cache_view=SimpleNamespace(table=torch.zeros((1, 1), dtype=torch.int32)),
             draft_seq_lens_buf=torch.tensor([0, 0], dtype=torch.int32),
         )
         wrapper.use_v4_mtp_paged_metadata = False
@@ -921,7 +921,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         wrapper.draft_attn_backend = FakeBackend("draft")
         wrapper.max_tokens_per_req = 4
         wrapper.drafter = SimpleNamespace(
-            page_table=torch.zeros((1, 1), dtype=torch.int32),
+            cache_view=SimpleNamespace(table=torch.zeros((1, 1), dtype=torch.int32)),
             draft_seq_lens_buf=torch.zeros(1, dtype=torch.int32),
         )
         wrapper.use_v4_mtp_paged_metadata = True
@@ -975,7 +975,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         wrapper.draft_attn_backend = FakeBackend("draft")
         wrapper.max_tokens_per_req = 4
         wrapper.drafter = SimpleNamespace(
-            page_table=torch.zeros((1, 1), dtype=torch.int32),
+            cache_view=SimpleNamespace(table=torch.zeros((1, 1), dtype=torch.int32)),
             draft_seq_lens_buf=torch.tensor([11, 12], dtype=torch.int32),
         )
 
@@ -5609,3 +5609,36 @@ class TestDeepseekV4Config(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_v4_merged_solve_draft_is_a_continuation_layer():
+    """One big model on V4: the MTP draft layer is simply the next layer of
+    the merged model (compress_ratios already carries it), so one solve
+    yields one plan whose draft fields share the target groups' packing."""
+    hf_config = SimpleNamespace(
+        num_hidden_layers=6,
+        compress_ratios=[0, 4, 128],
+        num_attention_heads=64,
+        head_dim=512,
+        qk_rope_head_dim=64,
+        sliding_window=128,
+        index_head_dim=128,
+    )
+    layout = deepseek_v4_cache_layout_from_config(
+        hf_config, page_size=64, use_fp4_indexer_cache=False
+    )
+    fields = build_deepseek_v4_cache_fields(
+        layout,
+        sliding_window=int(hf_config.sliding_window),
+        logical_block_tokens=256,
+    )
+    merged = solve_deepseek_v4_memory_layout(fields)
+    plan = merged.with_num_lcm_blocks(2)
+    # Every layer's swa field (all 6 layers incl. the MTP continuation
+    # layer) shares the one v4.swa_kv group — one packing, one page-id
+    # space for target and draft alike.
+    swa_fields = [f for f in plan.fields if f.group_id == "v4.swa_kv"]
+    assert len(swa_fields) == len(layout.layer_ratio)
+    packing = dict(merged.group_packing)
+    group = plan.group("v4.swa_kv")
+    assert group.page_count == 1 + 2 * packing["v4.swa_kv"]

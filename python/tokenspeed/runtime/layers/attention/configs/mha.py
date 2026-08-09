@@ -84,7 +84,7 @@ class MHAConfig(BaseAttnConfig):
         sliding_window_tokens = getattr(hf_config, "sliding_window", None)
         return cls(
             device=server_args.device,
-            context_len=model_config.context_len,
+            context_len=model_config.context_len + server_args.spec_context_pad,
             backend_name=(
                 server_args.attention_backend
                 if not is_draft

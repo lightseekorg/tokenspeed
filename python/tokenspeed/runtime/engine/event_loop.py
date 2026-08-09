@@ -52,6 +52,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     cache_event_key,
     cache_event_to_payload,
     cache_sync_debug_enabled,
+    log_gpu_memory_summary,
     make_config,
     pool_to_paged_cache_groups,
     pop_common_cache_event_payloads,
@@ -70,9 +71,6 @@ from tokenspeed.runtime.execution.factory import (
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.types import ModelExecutionResult
 from tokenspeed.runtime.grammar.capturable_grammar import GrammarStepInputs
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    validate_scheduler_config,
-)
 from tokenspeed.runtime.layers.attention.registry import create_attn_components
 from tokenspeed.runtime.metrics.collector import EngineMetrics
 from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
@@ -303,6 +301,19 @@ class EventLoop:
             draft_token_to_kv_pool=draft_token_to_kv_pool,
         )
 
+        # Per-rank GPU memory breakdown (weights by group, KV/graph/non-torch).
+        # rank0 only; best-effort, never fails startup.
+        if attn_tp_rank == 0:
+            log_gpu_memory_summary(
+                target.model,
+                gpu_id,
+                global_rank,
+                logger,
+                draft_model=draft.model if draft is not None else None,
+                kv_pool=token_to_kv_pool,
+                draft_kv_pool=draft_token_to_kv_pool,
+            )
+
         self.max_model_len = self.model_config.context_len
         self.max_single_request_tokens = self.model_config.context_len
         self.max_req_input_len = self.model_config.context_len - 1
@@ -397,12 +408,8 @@ class EventLoop:
                     "Paged-cache PD currently does not support: "
                     + ", ".join(unsupported)
                 )
-        validate_scheduler_config(
-            paged_cache_groups=paged_cache_groups,
-            attn_backend=attn_backend,
-            kv_pool=token_to_kv_pool,
-            speculative_algorithm=server_args.speculative_algorithm,
-        )
+        # Backend/pool compatibility is validated inside ModelExecutor
+        # (validate_scheduler_config), before CUDA-graph capture.
         self._paged_cache_groups = paged_cache_groups
         scheduler_cfg = make_config(
             num_device_pages=geometry.num_device_pages,
@@ -538,6 +545,9 @@ class EventLoop:
             ),
             stream_interval=self.server_args.stream_interval,
             enable_log_request_stats=self.server_args.enable_log_request_stats,
+            physical_context_len=(
+                self.model_config.context_len + self.server_args.spec_context_pad
+            ),
             metrics=self.metrics,
         )
         if server_args.disaggregation_mode != "null":

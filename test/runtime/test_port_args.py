@@ -37,7 +37,6 @@ def test_distributed_config_uses_resolved_dist_init_addr():
         mapping=mapping,
         dist_init_addr="127.0.0.1:8284",
         distributed_timeout_seconds=None,
-        disable_custom_all_reduce=False,
         force_deterministic_rsag=False,
     )
     port_args = PortArgs(

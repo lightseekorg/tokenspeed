@@ -83,6 +83,11 @@ from tokenspeed_kernel.ops.gemm import (
 from tokenspeed_kernel.ops.gemm.triton_gemv import (
     decode_gemv,
 )
+from tokenspeed_kernel.ops.moe import (
+    latent_moe_decode_pipeline_available,
+    latent_moe_expert_shared,
+    latent_moe_input_projections,
+)
 from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
     situ_moe_unavailable_reason,
 )
@@ -254,18 +259,14 @@ class KimiLinearMLP(nn.Module):
         self.act_fn = SituAndMul(
             beta=activation_situ_beta, linear_beta=activation_situ_linear_beta
         )
-        self._has_unquantized_shared_weights = (
-            is_shared_expert
-            and hasattr(self.gate_up_proj, "weight")
-            and hasattr(self.down_proj, "weight")
-        )
+        self.is_shared_expert = is_shared_expert
 
     def forward(
         self, x: torch.Tensor, down_out: torch.Tensor | None = None
     ) -> torch.Tensor:
         if x.size(0) == 0:
             return x
-        if self._has_unquantized_shared_weights:
+        if self.is_shared_expert:
             x = kimi3_shared_situ_projection(
                 x,
                 self.gate_up_proj.weight,
@@ -964,12 +965,14 @@ class KimiLinearMoE(nn.Module):
         # AUTO intentionally requests the flashinfer-backed SiTU plan when it was
         # registered at import time; AUTO cannot override MoELayer per model.
         self.use_trtllm_situ_moe = self.execution_plan.use_trtllm
-        if not self.execution_plan.use_native:
+        self.use_marlin_situ_moe = self.execution_plan.use_marlin
+        if not self.execution_plan.use_native and not self.use_marlin_situ_moe:
             if not self.use_trtllm_situ_moe:
                 raise RuntimeError(
-                    "Kimi-K3 MXFP4 SiTU MoE requires the native backend or the "
-                    "FlashInfer TRT-LLM backend; no portable SiTU Triton fallback "
-                    f"exists (selected MoE backend: {moe_backend.value!r})."
+                    "Kimi-K3 MXFP4 SiTU MoE requires the native, FlashInfer "
+                    "TRT-LLM, or Marlin (Hopper W4A16) backend; no portable SiTU "
+                    f"Triton fallback exists (selected MoE backend: "
+                    f"{moe_backend.value!r})."
                 )
             # Fail here with the actual reason instead of letting MoELayer's
             # kernel selection miss the (never-registered) SiTU kernel.
@@ -988,6 +991,10 @@ class KimiLinearMoE(nn.Module):
             load_packaged_flashinfer_tuning_cache(
                 "kimi-k3", mapping.moe.ep_size, mapping.moe.tp_size
             )
+        if not self.execution_plan.use_native:
+            # Both the TRT-LLM and Marlin SiTU paths currently require a
+            # replicated-token all-reduce topology (attn TP == MoE TP*EP);
+            # Attn-DP/MoE-EP RSAG is not wired for either.
             if mapping.moe.has_tp_ep and mapping.attn.tp_size != mapping.moe.tp_ep_size:
                 raise ValueError(
                     "Kimi-K3's SiTU MoE currently requires a "
@@ -1040,11 +1047,11 @@ class KimiLinearMoE(nn.Module):
                 "activation_situ_linear_beta": situ_linear_beta,
             },
             routing_mode="precomputed_topk",
-            # Native gfx950 runs A16W4; FlashInfer's SiTU cubins require
-            # MXFP4 weights with MXFP8 activations.
+            # Native gfx950 and Hopper Marlin both run A16W4 (bf16 activations);
+            # FlashInfer's SiTU cubins require MXFP4 weights with MXFP8 acts.
             internal_activation_dtype_override=(
                 "input"
-                if self.execution_plan.use_native
+                if self.execution_plan.use_native or self.execution_plan.use_marlin
                 else "fp8" if self.execution_plan.use_trtllm else None
             ),
         )
@@ -1095,6 +1102,7 @@ class KimiLinearMoE(nn.Module):
             activation_situ_beta=situ_beta,
             activation_situ_linear_beta=situ_linear_beta,
         )
+        self.packed_input_projection_weight: torch.Tensor | None = None
         self.native_latent_moe = (
             LatentMoELayer(
                 router=self.gate,
@@ -1118,11 +1126,82 @@ class KimiLinearMoE(nn.Module):
                     alt_stream if self.execution_plan.overlap_shared_experts else None
                 ),
                 expert_parallel_group=mapping.moe.ep_group,
-                return_separate_outputs=True,
+                input_projections=self._latent_input_projections,
             )
             if self.execution_plan.use_native
             else None
         )
+        # Dry-run exact registry selection for the fused decode pipeline.
+        self._use_fused_decode_pipeline = (
+            self.execution_plan.joint_moe_reduce
+            and latent_moe_decode_pipeline_available(
+                self.gate.weight,
+                self.routed_expert_down_proj.weight,
+                self.shared_experts.gate_up_proj.weight,
+                self.shared_experts.down_proj.weight,
+                self.experts.w13_weight,
+                self.experts.w13_weight_scale,
+                self.experts.w2_weight,
+                self.experts.w2_weight_scale,
+                self.experts.plan,
+                topk=self.top_k,
+            )
+        )
+
+    def pack_input_projection_weights(self) -> None:
+        """Back the router, routed-down, and shared gate/up weights with one tensor.
+
+        The three projections consume the same activation and reduce over the
+        same width, so one ``[experts + latent + 2 * shared, hidden]`` weight
+        lets a single GEMM replace three. Each module keeps a contiguous row
+        view of that tensor, so the rebinding adds no steady-state memory and
+        leaves the separate composition working unchanged.
+        """
+        modules = (
+            self.gate,
+            self.routed_expert_down_proj,
+            self.shared_experts.gate_up_proj,
+        )
+        # Held so the row views stay alive; deliberately not a registered
+        # buffer, which would duplicate every projection in the state dict.
+        # Any layout a packed GEMM cannot read is caught downstream by
+        # ``packed_projection_weight_view``, leaving the composition in place.
+        self.packed_input_projection_weight = torch.cat(
+            [module.weight for module in modules], dim=0
+        )
+        offset = 0
+        for module in modules:
+            rows = module.weight.shape[0]
+            module.weight.data = self.packed_input_projection_weight.narrow(
+                0, offset, rows
+            )
+            offset += rows
+
+    def _latent_input_projections(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Project the router, routed latent, and shared partial in one pass.
+
+        Returns ``None`` before the projection weights are concatenated, which
+        leaves the caller on the separate per-module projections.
+        """
+        if self.packed_input_projection_weight is None:
+            return None
+        router_logits, routed_input, shared_input = latent_moe_input_projections(
+            hidden_states,
+            self.gate.weight,
+            self.routed_expert_down_proj.weight,
+            self.shared_experts.gate_up_proj.weight,
+            gate_clamp=self.shared_experts.act_fn.beta,
+            up_clamp=self.shared_experts.act_fn.linear_beta,
+        )
+        # The shared experts hold reduce_results=False, so this partial is
+        # reduced by the layer's shared or joint reducer, not here.
+        shared_output = kimi3_shared_down_projection(
+            shared_input,
+            self.shared_experts.down_proj.weight,
+        )
+        return router_logits, routed_input, shared_output
 
     def _routed_experts(
         self,
@@ -1132,11 +1211,11 @@ class KimiLinearMoE(nn.Module):
         max_num_tokens_per_gpu: int,
         skip_reduce: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run flashinfer's fused TRT-LLM SiTU MoE."""
-        if not self.use_trtllm_situ_moe:
+        """Run the precomputed-TopK SiTU MoE (TRT-LLM cubin or Hopper Marlin)."""
+        if not self.use_trtllm_situ_moe and not self.use_marlin_situ_moe:
             raise RuntimeError(
-                "Kimi-K3 has no portable SiTU Triton fallback; use the native "
-                "or FlashInfer TRT-LLM SiTU MoE path."
+                "Kimi-K3 has no portable SiTU Triton fallback; use the native, "
+                "FlashInfer TRT-LLM, or Marlin SiTU MoE path."
             )
         out = self.experts(
             hidden_states=routed_in,
@@ -1152,6 +1231,67 @@ class KimiLinearMoE(nn.Module):
             out = all_reduce(out, self.mapping.moe.tp_ep_group)
         return out
 
+    def _forward_fused_decode_pipeline(
+        self,
+        hidden_states: torch.Tensor,
+        prefix_sum: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the fused multi-launch K3 decode pipeline.
+
+        The input-projection operation produces router logits, the routed
+        latent, and the activated shared input from one packed weight. Routed
+        W13 and SiTU run separately; the next launch computes routed W2 beside
+        the shared down projection. One collective reduces both partials. The
+        final routed up projection adds ``prefix_sum`` and the shared output in
+        its epilogue when a specialized implementation is available. Top-k and
+        the optional routed norm remain separate launches.
+        """
+
+        router_logits, routed_input, shared_input = latent_moe_input_projections(
+            hidden_states,
+            self.gate.weight,
+            self.routed_expert_down_proj.weight,
+            self.shared_experts.gate_up_proj.weight,
+            gate_clamp=self.shared_experts.act_fn.beta,
+            up_clamp=self.shared_experts.act_fn.linear_beta,
+        )
+        topk_output = self.topk(hidden_states, router_logits)
+        routed_output = hidden_states.new_empty(
+            (hidden_states.shape[0], self.routed_expert_down_proj.weight.shape[0])
+        )
+        shared_output = hidden_states.new_empty(
+            (hidden_states.shape[0], self.shared_experts.down_proj.weight.shape[0])
+        )
+        routed_latent, shared_output = latent_moe_expert_shared(
+            routed_input,
+            self.experts.w13_weight,
+            self.experts.w13_weight_scale,
+            self.experts.w2_weight,
+            self.experts.w2_weight_scale,
+            topk_output.topk_weights,
+            topk_output.topk_ids,
+            shared_input,
+            self.shared_experts.down_proj.weight,
+            activation_clamp=float(self.experts.activation_situ_beta),
+            linear_clamp=self.experts.activation_situ_linear_beta,
+            expert_start=self.experts.ep_rank * self.experts.num_local_experts,
+            w13_interleaved=self.experts.w13_input_layout == "interleaved",
+            routed_out=routed_output,
+            shared_out=shared_output,
+        )
+        shared_output, routed_latent = all_reduce_two(
+            shared_output,
+            routed_latent,
+            group=self.mapping.moe.ep_group,
+        )
+        if self.routed_expert_norm is not None:
+            routed_latent = self.routed_expert_norm(routed_latent)
+        return self.native_latent_moe.finalize_output(
+            routed_latent,
+            prefix_sum,
+            shared_output,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1165,12 +1305,14 @@ class KimiLinearMoE(nn.Module):
         the up-projection's store performs the accumulate in-kernel.
         """
         if self.native_latent_moe is not None:
-            routed_out, shared_out = self.native_latent_moe(
+            if self._use_fused_decode_pipeline and hidden_states.shape[0] == 1:
+                return self._forward_fused_decode_pipeline(hidden_states, prefix_sum)
+            return self.native_latent_moe(
                 hidden_states,
                 num_global_tokens=num_global_tokens,
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+                prefix_sum=prefix_sum,
             )
-            return add3(prefix_sum, routed_out, shared_out)
 
         num_tokens, hidden_size = hidden_states.shape
         if num_tokens == 0:
@@ -1985,6 +2127,10 @@ class KimiLinearForCausalLM(BaseCausalLM):
                 layer.mlp_res_norm.weight.float()
                 * layer.mlp_res_proj.weight.reshape(-1).float()
             ).to(torch.bfloat16)
+
+        for layer in self.model.layers:
+            if getattr(layer, "is_moe_layer", False):
+                layer.block_sparse_moe.pack_input_projection_weights()
 
 
 # ===----------------------------------------------------------------------=== #

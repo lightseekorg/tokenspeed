@@ -130,6 +130,11 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         # page size the group-table expansion targets.
         self._cache_groups_bound = False
         self._cache_contract_bound = False
+        # A draft consumes its history group table from the wrapper's
+        # per-group distribution (_draft_group_tables); the target reads the
+        # richer cache_metadata instead and must stay off the block_tables
+        # path (its capture/eager guards key on this flag).
+        self.uses_cache_groups = bool(config.is_draft)
         self.page_size = PAGE_SIZE
         self.max_num_pages = (self.max_context_len + PAGE_SIZE - 1) // PAGE_SIZE
 
@@ -148,6 +153,10 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
 
         # FlashMLA-specific
         self.draft_token_num = 0
+        # A block drafter (DFLASH/DSpark) drafts a whole block per pass; its
+        # captured decode graph seeds block-end lengths via
+        # ``fill_block_decode_seq_lens`` (see the drafter's is_capturing path).
+        self.draft_block_decode = bool(getattr(config, "draft_block_decode", False))
 
         if self.kv_cache_quant_method == "per_token_head":
             raise NotImplementedError(
@@ -225,6 +234,7 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
     ):
         cache_metadata = kwargs.pop("cache_metadata", None)
         forward_batch = kwargs.pop("forward_batch", None)
+        kwargs.pop("block_tables", None)
         group_table = None
         logical_page_size = None
         if cache_metadata is not None:
@@ -235,12 +245,13 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         elif self._draft_reads_batch_pages(bs, forward_mode):
             # The drafter drives this draft backend directly and passes no cache
             # metadata; it hands over the batch-ordered draft page table (row i
-            # is batch position i), which the executor fills from the target's
-            # full-history table. Those ids are scheduler pages, expanded to
-            # kernel pages with the recorded logical size.
+            # is batch position i). DraftPageStaging.publish already expanded the
+            # target's full-history scheduler pages into this backend's kernel
+            # pages (ratio logical/kernel), so the ids are ALREADY in kernel-page
+            # units here. Read them as kernel pages (identity expand).
             self._cache_groups_bound = True
             group_table = page_table[:bs]
-            logical_page_size = self._cache_logical_page_size
+            logical_page_size = self.page_size
         elif self._cache_groups_bound and bs > 0 and not forward_mode.is_idle():
             raise RuntimeError(
                 "FlashMLABackend is bound to Paged cache but received no paged "
@@ -559,7 +570,10 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
+        **kwargs,
     ):
+        # cache_group_ids arrives for the draft (uses_cache_groups); the
+        # persistent kv-indices buffer already exists, nothing to allocate.
         decode_no_spec = forward_mode.is_decode_or_idle() and self.spec_num_tokens == 1
         is_target_verify = (
             forward_mode.is_decode_or_idle()
@@ -660,15 +674,12 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
             return
 
         if self._draft_reads_batch_pages(bs, forward_mode):
-            # Draft replay: the batch-ordered draft page table holds scheduler
-            # pages; expand to kernel pages the same way eager draft does.
-            table = page_table[:bs]
-            expanded = self._expand_group_page_table(
-                table,
-                batch_size=bs,
-                logical_page_size=self._cache_logical_page_size,
-            )
-            self.cuda_graph_kv_indices[:bs, : expanded.shape[1]].copy_(expanded)
+            # Draft replay: DraftPageStaging.publish already expanded the target
+            # full-history table into this backend's kernel pages, so the
+            # batch-ordered draft page table holds kernel-page ids. Copy them
+            # as-is (identity), matching the eager draft path.
+            block_table = page_table[:bs]
+            self.cuda_graph_kv_indices[:bs, : block_table.shape[1]].copy_(block_table)
             return
 
         # Idle/warmup replay before the backend binds: page_table is an empty
@@ -677,8 +688,20 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         block_table = page_table[:bs]
         self.cuda_graph_kv_indices[:bs, : block_table.shape[1]].copy_(block_table)
 
-    def get_cuda_graph_seq_len_fill_value(self):
-        return 1
+    def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
+        """Publish block-end cache lengths inside a captured draft graph.
+
+        A block drafter runs its multi-token pass inside the captured graph and
+        writes the per-request block-end length here (one row per request; the
+        block's ``draft_query_width`` queries share it, non-causal). ``forward_decode``
+        repeats each row across the block's queries, so the graph keeps ``bs``
+        rows -- mirrors ``TRTLLMMLABackend.fill_block_decode_seq_lens``.
+        """
+        if not self.draft_block_decode:
+            raise RuntimeError("Block decode sequence lengths require DFLASH mode.")
+        self.cuda_graph_seq_lens_k[:bs].copy_(
+            block_seq_lens[:bs].clamp(self.spec_num_tokens, self.max_context_len)
+        )
 
     # ------------------------------------------------------------------
     # Forward
@@ -881,11 +904,26 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         ), f"{layer.tp_q_head_num=} != {self.num_q_heads=}"
         reshape_q = q.view(bs, -1, self.num_q_heads, layer.head_dim)
 
+        block_table = metadata.block_table[num_extends : num_extends + bs]
+        cache_seqlens = metadata.seq_lens_k.to(torch.int32) + cache_seqlens_offset
+        # Draft block-decode: forward_decode flattened q to one kernel row per
+        # drafted block position (bs == bs_orig * draft_query_width), but the
+        # group table and seq_lens carry one entry per request. Repeat each
+        # request's row across its block positions so every block query attends
+        # the whole block (block-diffusion), mirroring tokenspeed_mla's
+        # _expand_block_decode_metadata; the FlashMLA kernel requires
+        # cache_seqlens to be shape (num_kernel_rows).
+        src_rows = block_table.shape[0]
+        if self.is_draft and 0 < src_rows < bs and bs % src_rows == 0:
+            width = bs // src_rows
+            block_table = block_table.repeat_interleave(width, dim=0)
+            cache_seqlens = cache_seqlens.repeat_interleave(width)
+
         return flash_mla_with_kvcache(
             q=reshape_q,
             k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
-            block_table=metadata.block_table[num_extends : num_extends + bs],
-            cache_seqlens=metadata.seq_lens_k.to(torch.int32) + cache_seqlens_offset,
+            block_table=block_table,
+            cache_seqlens=cache_seqlens,
             head_dim_v=self.kv_lora_rank,
             tile_scheduler_metadata=metadata.flashmla_metadata,
             softmax_scale=layer.scaling,

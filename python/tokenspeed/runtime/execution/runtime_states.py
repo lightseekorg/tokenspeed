@@ -32,7 +32,6 @@ class RuntimeStates:
     def __init__(
         self,
         req_pool_size: int,
-        context_len: int,
         vocab_size: int,
         output_length: int,
         device: str = "cuda",

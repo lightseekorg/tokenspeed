@@ -15,7 +15,7 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
-from tokenspeed.runtime.execution.model_executor import (  # noqa: E402
+from tokenspeed.runtime.execution.factory import (  # noqa: E402
     _eagle_aux_layer_ids,
 )
 from tokenspeed.runtime.models import kimi_k3  # noqa: E402
