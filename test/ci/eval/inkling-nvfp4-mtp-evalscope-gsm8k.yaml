@@ -45,11 +45,14 @@ eval:
   install:
     - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
   command: >-
+    HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
     /tmp/evalscope-perf/bin/evalscope eval
     --model thinkingmachines/Inkling-NVFP4
     --api-url http://127.0.0.1:8000/v1
     --api-key EMPTY_TOKEN
     --datasets gsm8k
+    --dataset-hub huggingface
+    --dataset-args '{"gsm8k":{"dataset_id":"openai/gsm8k"}}'
     --eval-batch-size 16
     --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":8192}'
 report:

@@ -49,11 +49,14 @@ eval:
   # hit on --repeats duplicates, further reducing TTFT. Net effect: roughly
   # cancels the 3x sample cost, making this change cost-neutral overall.
   command: >-
+    HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
     /tmp/evalscope-perf/bin/evalscope eval
     --model ${GPT_OSS_EVAL_MODEL}
     --api-url http://127.0.0.1:8000/v1
     --api-key EMPTY_TOKEN
     --datasets gpqa_diamond
+    --dataset-hub huggingface
+    --dataset-args '{"gpqa_diamond":{"dataset_id":"Idavidrein/gpqa","subset_list":["gpqa_diamond"]}}'
     --eval-batch-size 64
     --repeats 3
 report:
