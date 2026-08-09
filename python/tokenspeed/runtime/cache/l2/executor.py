@@ -147,7 +147,7 @@ class L2CacheExecutor:
         )
 
         pool_layouts = [(device_pool, target_layout)]
-        if draft_pool is not None:
+        if draft_pool is not None and self.layout is not target_layout:
             pool_layouts.append((draft_pool, draft_layout))
         self._load_trackers = []
         for pool, layout in pool_layouts:

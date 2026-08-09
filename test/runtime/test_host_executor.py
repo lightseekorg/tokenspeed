@@ -58,6 +58,29 @@ class CacheEventPayloadTest(unittest.TestCase):
 
 
 class GroupAwareWireTest(unittest.TestCase):
+    def test_hybrid_state_access_waits_for_layer_load(self):
+        try:
+            from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
+                HybridKDATokenToKVPool,
+            )
+            from tokenspeed.runtime.layers.attention.kv_cache.hybrid_mha import (
+                HybridMHATokenToKVPool,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        for pool_type in (HybridMHATokenToKVPool, HybridKDATokenToKVPool):
+            with self.subTest(pool_type=pool_type.__name__):
+                tracker = Mock()
+                pool = pool_type.__new__(pool_type)
+                pool.layerwise_load_tracker = tracker
+                pool._state_buffers_by_layer = {3: ("conv", "recurrent")}
+                if pool_type is HybridMHATokenToKVPool:
+                    pool._state_layer_ids = (3,)
+
+                self.assertEqual(pool.get_component(3, "conv_state"), "conv")
+                tracker.wait_for_layer.assert_called_once_with(3)
+
     def test_pool_transfer_layout_matches_scheduler_group_order(self):
         try:
             from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool

@@ -308,6 +308,28 @@ def test_target_and_draft_layouts_share_scheduler_groups_but_keep_both_payloads(
     )
 
 
+def test_aliased_target_and_draft_layout_is_transferred_once():
+    buffer = object()
+    target = CacheTransferLayout(
+        num_lcm_blocks=10,
+        groups=(CacheGroupLayout("full", 16, (_field("layer.0.k"),)),),
+        buffers=(buffer,),
+        consumers=(("layer.0.k",),),
+    )
+    draft = CacheTransferLayout(
+        num_lcm_blocks=10,
+        groups=target.groups,
+        buffers=(buffer,),
+        consumers=target.consumers,
+    )
+
+    combined = combine_cache_transfer_layouts(target, draft)
+
+    assert combined.buffers == (buffer,)
+    assert combined.groups[0].fields == (_field("layer.0.k"),)
+    assert combined.consumers == (("layer.0.k",),)
+
+
 def test_draft_layout_must_use_target_block_geometry():
     target = CacheTransferLayout(
         10,

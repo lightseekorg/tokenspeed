@@ -267,6 +267,16 @@ def combine_cache_transfer_layouts(
         return target
     if draft.num_lcm_blocks != target.num_lcm_blocks:
         raise ValueError("target and draft cache layouts use different geometry")
+    if (
+        target.groups == draft.groups
+        and target.consumers == draft.consumers
+        and len(target.buffers) == len(draft.buffers)
+        and all(
+            target_buffer is draft_buffer
+            for target_buffer, draft_buffer in zip(target.buffers, draft.buffers)
+        )
+    ):
+        return target
 
     target_groups = {group.group_id: group for group in target.groups}
     draft_groups = {group.group_id: group for group in draft.groups}
