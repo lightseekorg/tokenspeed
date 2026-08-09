@@ -72,6 +72,7 @@ from tokenspeed_kernel.ops.activation.triton import (
 from tokenspeed_kernel.ops.attention import mla_normalize_project_query
 from tokenspeed_kernel.ops.attn_res import attn_res_fwd
 from tokenspeed_kernel.ops.communication import allreduce_fusion_lane
+from tokenspeed_kernel.ops.communication.fabric import fabric_allocation_supported
 from tokenspeed_kernel.ops.communication.multimem import (
     multimem_all_reduce_staged,
     multimem_available,
@@ -1164,6 +1165,13 @@ class KimiLinearMoE(nn.Module):
             # Staging buffers are per-width; equal widths would clobber the stage.
             and self.routed_hidden != config.hidden_size
             and multimem_available()
+            # Multicast can report available while symmetric-memory rendezvous
+            # hangs on a cross-node group without fabric/IMEX, so a job wider
+            # than one host must also clear the fabric probe.
+            and (
+                torch.distributed.get_world_size() <= torch.cuda.device_count()
+                or fabric_allocation_supported(torch.cuda.current_device())
+            )
         )
         tail_local = False
         if (
@@ -1214,6 +1222,7 @@ class KimiLinearMoE(nn.Module):
                     latent_size=self.routed_hidden,
                     rms_eps=self.routed_expert_norm.variance_epsilon,
                     device=torch.device("cuda", torch.cuda.current_device()),
+                    layer_id=layer_index,
                 )
                 logger.info("multicast latent tail engaged")
 

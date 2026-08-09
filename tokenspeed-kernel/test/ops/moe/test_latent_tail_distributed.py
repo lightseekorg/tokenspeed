@@ -101,6 +101,7 @@ def test_latent_tail_matches_reference(m):
         latent_size=L,
         rms_eps=EPS,
         device=dev,
+        layer_id=0,
     )
     routed, shared, rms_w, up_w = _inputs(rank, dev, m, seed=100)
     ref = _reference(routed, shared, rms_w, up_w)
@@ -122,6 +123,7 @@ def test_latent_tail_graph_replay():
         latent_size=L,
         rms_eps=EPS,
         device=dev,
+        layer_id=0,
     )
     routed, shared, rms_w, up_w = _inputs(rank, dev, 1, seed=200)
     for _ in range(3):
@@ -156,6 +158,7 @@ def test_latent_tail_fused_prefix_matches_eager(m):
         latent_size=L,
         rms_eps=EPS,
         device=dev,
+        layer_id=0,
     )
     routed, shared, rms_w, up_w = _inputs(rank, dev, m, seed=700)
     torch.manual_seed(900 + rank)

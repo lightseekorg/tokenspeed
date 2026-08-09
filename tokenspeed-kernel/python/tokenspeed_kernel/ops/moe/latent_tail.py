@@ -52,6 +52,23 @@ _LAMPORT_COPY_THREADS = 224
 _SUPPORTED_TP_SIZES = (8, 16)
 
 
+def _multicast_reachable() -> bool:
+    """Whether NVLS multicast can actually map across this job's ranks.
+
+    ``symm_mem`` importing is not enough: a cross-host group without fabric or
+    IMEX still reports multicast support locally and then hangs inside the
+    rendezvous instead of letting the caller fall back.
+    """
+    import torch.distributed as dist
+    from tokenspeed_kernel.ops.communication.fabric import fabric_allocation_supported
+
+    if not dist.is_initialized():
+        return False
+    if dist.get_world_size() <= torch.cuda.device_count():
+        return True
+    return fabric_allocation_supported(torch.cuda.current_device())
+
+
 def latent_tail_supported(
     *,
     tp_size: int,
@@ -74,7 +91,7 @@ def latent_tail_supported(
         from torch.distributed import _symmetric_memory  # noqa: F401
     except ImportError:
         return False
-    return True
+    return _multicast_reachable()
 
 
 @dataclass(frozen=True)
@@ -85,10 +102,17 @@ class _Contract:
     hidden_size: int
     latent_size: int
     rms_eps: float
+    # Layers must not share a mailbox: the gather releases its same-stream
+    # dependents before it rewrites sentinels, so the next layer's multicast
+    # shard can land in storage the previous layer is still clearing. Within a
+    # layer the next collective's completion-scoped wait orders the two; across
+    # layers that edge runs through every kernel in between and is not
+    # guaranteed. Keying on the layer keeps one mailbox per layer.
+    layer_id: int
 
 
 class KimiK3LatentTailOp:
-    """Process-wide multicast tail; one instance (and mailbox) per contract.
+    """Multicast tail for one model layer; one instance (and mailbox) each.
 
     Construction performs a collective symmetric-memory rendezvous — every
     rank in ``group`` must construct with identical arguments in lockstep
@@ -106,7 +130,19 @@ class KimiK3LatentTailOp:
         latent_size: int,
         rms_eps: float,
         device: torch.device,
+        layer_id: int,
     ) -> "KimiK3LatentTailOp":
+        """Return this layer's tail op, constructing it on first use.
+
+        Args:
+            group: Process group every rank constructs with, in lockstep.
+            hidden_size: Model hidden width.
+            latent_size: Routed-expert latent width.
+            rms_eps: Epsilon of the routed-expert RMS norm.
+            device: CUDA device owning the mailbox.
+            layer_id: Model layer index; part of the key so each layer gets
+                its own mailbox.
+        """
         contract = _Contract(
             group_id=id(group),
             tp_size=dist.get_world_size(group),
@@ -114,6 +150,7 @@ class KimiK3LatentTailOp:
             hidden_size=hidden_size,
             latent_size=latent_size,
             rms_eps=float(rms_eps),
+            layer_id=layer_id,
         )
         op = cls._instances.get(contract)
         if op is None:

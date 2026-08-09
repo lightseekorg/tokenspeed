@@ -124,7 +124,12 @@ def test_fused_tail_matches_reference(m):
         pytest.skip("fused latent tail unsupported here")
 
     op = KimiK3LatentTailOp.initialize(
-        group=dist.group.WORLD, hidden_size=H, latent_size=L, rms_eps=EPS, device=dev
+        group=dist.group.WORLD,
+        hidden_size=H,
+        latent_size=L,
+        rms_eps=EPS,
+        device=dev,
+        layer_id=0,
     )
     routed, shared, rms_w, up_w, prefix = _inputs(rank, dev, m, seed=11)
     ref = _reference(routed, shared, rms_w, up_w, prefix)
