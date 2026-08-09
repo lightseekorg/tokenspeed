@@ -30,6 +30,7 @@ from tokenspeed.runtime.cache.transfer.layout import (
     CacheTransferLayout,
     combine_cache_transfer_layouts,
     layout_from_lcm_plan,
+    select_layer_fields,
 )
 
 
@@ -192,6 +193,85 @@ def test_lcm_layout_uses_scheduler_group_order():
     assert tuple(group.cache_blocks_per_lcm_block for group in layout.groups) == (
         1,
         32,
+    )
+
+
+def test_merged_plan_views_filter_and_remap_fields_before_combining():
+    plane = SimpleNamespace(
+        plane_id="shared", bytes_per_lcm_block=4096, arena_offset_bytes=0
+    )
+    plan = SimpleNamespace(
+        num_lcm_blocks=4,
+        planes=(plane,),
+        groups=(
+            SimpleNamespace(group_id="full", cache_blocks_per_lcm_block=16),
+            SimpleNamespace(group_id="state", cache_blocks_per_lcm_block=1),
+            SimpleNamespace(group_id="draft_swa", cache_blocks_per_lcm_block=4),
+        ),
+        fields=(
+            SimpleNamespace(
+                group_id="full",
+                field_id="layer.0.k",
+                plane_id="shared",
+                field_offset_bytes=0,
+                page_stride_bytes=256,
+                payload_bytes=128,
+            ),
+            SimpleNamespace(
+                group_id="state",
+                field_id="layer.1.state",
+                plane_id="shared",
+                field_offset_bytes=256,
+                page_stride_bytes=4096,
+                payload_bytes=1024,
+            ),
+            SimpleNamespace(
+                group_id="draft_swa",
+                field_id="layer.2.k",
+                plane_id="shared",
+                field_offset_bytes=1280,
+                page_stride_bytes=1024,
+                payload_bytes=512,
+            ),
+        ),
+    )
+
+    target_fields, target_consumers = select_layer_fields(
+        plan.fields, first_layer=0, num_layers=2
+    )
+    draft_fields, draft_consumers = select_layer_fields(
+        plan.fields, first_layer=2, num_layers=1
+    )
+    target = layout_from_lcm_plan(
+        plan,
+        "shared-buffer",
+        consumers=target_consumers,
+        group_ids=("state", "full"),
+        field_ids=target_fields,
+    )
+    draft = layout_from_lcm_plan(
+        plan,
+        "shared-buffer",
+        consumers=draft_consumers,
+        group_ids=("draft_swa",),
+        field_ids=draft_fields,
+    )
+
+    combined = combine_cache_transfer_layouts(
+        target,
+        draft,
+        group_ids=("state", "full", "draft_swa"),
+    )
+
+    assert target.consumers == (("layer.0.k",), ("layer.1.state",))
+    assert draft.consumers == (("layer.2.k",),)
+    assert tuple(group.group_id for group in combined.groups) == (
+        "state",
+        "full",
+        "draft_swa",
+    )
+    assert tuple(field.field_id for field in combined.groups[2].fields) == (
+        "draft:layer.2.k",
     )
 
 

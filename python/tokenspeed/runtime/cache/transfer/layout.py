@@ -35,6 +35,45 @@ def _positive(name: str, value: int) -> int:
     return value
 
 
+def select_layer_fields(
+    fields: tuple[object, ...],
+    *,
+    first_layer: int,
+    num_layers: int,
+) -> tuple[frozenset[str], tuple[tuple[str, ...], ...]]:
+    """Select one compute view's fields and map global to local layer IDs.
+
+    Args:
+        fields: Fields from the merged target/draft memory plan.
+        first_layer: First global layer owned by this compute view.
+        num_layers: Number of local layer consumers in this view.
+
+    Returns:
+        Selected field IDs and one field tuple per local layer.
+    """
+    if first_layer < 0 or num_layers < 0:
+        raise ValueError("cache layer view bounds must be non-negative")
+    last_layer = first_layer + num_layers
+    selected = set()
+    consumers = [[] for _ in range(num_layers)]
+    for field in fields:
+        parts = field.field_id.split(".", 2)
+        if len(parts) != 3 or parts[0] != "layer":
+            raise ValueError(
+                f"cache field {field.field_id!r} is not owned by a model layer"
+            )
+        try:
+            layer_id = int(parts[1])
+        except ValueError as exc:
+            raise ValueError(
+                f"cache field {field.field_id!r} has an invalid layer id"
+            ) from exc
+        if first_layer <= layer_id < last_layer:
+            selected.add(field.field_id)
+            consumers[layer_id - first_layer].append(field.field_id)
+    return frozenset(selected), tuple(tuple(consumer) for consumer in consumers)
+
+
 @dataclass(frozen=True, slots=True)
 class CacheField:
     """One cache field stored as block rows in a device buffer."""
@@ -126,23 +165,51 @@ def layout_from_lcm_plan(
     *,
     consumers: tuple[tuple[str, ...], ...],
     group_ids: tuple[str, ...] | None = None,
+    field_ids: frozenset[str] | None = None,
 ) -> CacheTransferLayout:
-    """Derive transfer rows directly from an LCM arena plan."""
+    """Derive transfer rows for selected fields from an LCM arena plan.
+
+    Args:
+        plan: Shared physical cache geometry.
+        buffer: Device buffer that stores the plan.
+        consumers: Selected field IDs grouped by local layer.
+        group_ids: Optional scheduler order for the selected groups.
+        field_ids: Optional field subset owned by this compute view.
+
+    Returns:
+        A transfer layout over the selected view.
+    """
 
     planes = {plane.plane_id: plane for plane in plan.planes}
+    known_field_ids = {field.field_id for field in plan.fields}
+    if field_ids is None:
+        field_ids = frozenset(known_field_ids)
+    else:
+        unknown_fields = field_ids - known_field_ids
+        if unknown_fields:
+            raise ValueError(
+                f"selected cache fields are absent from the plan: {sorted(unknown_fields)}"
+            )
     fields_by_group = {
         group.group_id: tuple(
-            field for field in plan.fields if field.group_id == group.group_id
+            field
+            for field in plan.fields
+            if field.group_id == group.group_id and field.field_id in field_ids
         )
         for group in plan.groups
     }
     groups_by_id = {group.group_id: group for group in plan.groups}
+    selected_group_ids = {
+        group_id for group_id, fields in fields_by_group.items() if fields
+    }
     if group_ids is None:
-        ordered_groups = plan.groups
+        ordered_groups = tuple(
+            group for group in plan.groups if group.group_id in selected_group_ids
+        )
     else:
         if len(group_ids) != len(set(group_ids)):
             raise ValueError("scheduler cache groups contain a duplicate group")
-        if set(group_ids) != set(groups_by_id):
+        if set(group_ids) != selected_group_ids:
             raise ValueError("scheduler and transfer cache groups do not match")
         ordered_groups = tuple(groups_by_id[group_id] for group_id in group_ids)
     groups = []
@@ -182,8 +249,19 @@ def layout_from_lcm_plan(
 def combine_cache_transfer_layouts(
     target: CacheTransferLayout,
     draft: CacheTransferLayout | None,
+    *,
+    group_ids: tuple[str, ...] | None = None,
 ) -> CacheTransferLayout:
-    """Combine target and draft arenas that share scheduler CacheBlock IDs."""
+    """Combine target and draft views that share scheduler CacheBlock IDs.
+
+    Args:
+        target: Target model's local transfer view.
+        draft: Optional draft model's local transfer view.
+        group_ids: Optional scheduler order for the merged groups.
+
+    Returns:
+        One transfer layout containing every target and draft field.
+    """
 
     if draft is None:
         return target
@@ -192,13 +270,9 @@ def combine_cache_transfer_layouts(
 
     target_groups = {group.group_id: group for group in target.groups}
     draft_groups = {group.group_id: group for group in draft.groups}
-    unknown_groups = set(draft_groups) - set(target_groups)
-    if unknown_groups:
-        raise ValueError(
-            f"draft cache groups are absent from target: {sorted(unknown_groups)}"
-        )
-    for group_id, draft_group in draft_groups.items():
+    for group_id in set(target_groups) & set(draft_groups):
         target_group = target_groups[group_id]
+        draft_group = draft_groups[group_id]
         if (
             draft_group.cache_blocks_per_lcm_block
             != target_group.cache_blocks_per_lcm_block
@@ -206,6 +280,18 @@ def combine_cache_transfer_layouts(
             raise ValueError(
                 f"target and draft cache group {group_id!r} use different geometry"
             )
+
+    all_group_ids = set(target_groups) | set(draft_groups)
+    if group_ids is None:
+        ordered_group_ids = tuple(target_groups) + tuple(
+            group_id for group_id in draft_groups if group_id not in target_groups
+        )
+    else:
+        if len(group_ids) != len(set(group_ids)):
+            raise ValueError("scheduler cache groups contain a duplicate group")
+        if set(group_ids) != all_group_ids:
+            raise ValueError("scheduler and transfer cache groups do not match")
+        ordered_group_ids = group_ids
 
     draft_buffer_base = len(target.buffers)
 
@@ -221,19 +307,24 @@ def combine_cache_transfer_layouts(
         )
 
     groups = []
-    for target_group in target.groups:
-        fields = tuple(
-            namespaced_field(field, "target", 0) for field in target_group.fields
-        )
-        if draft_group := draft_groups.get(target_group.group_id):
+    for group_id in ordered_group_ids:
+        target_group = target_groups.get(group_id)
+        draft_group = draft_groups.get(group_id)
+        fields = ()
+        if target_group is not None:
+            fields = tuple(
+                namespaced_field(field, "target", 0) for field in target_group.fields
+            )
+        if draft_group is not None:
             fields += tuple(
                 namespaced_field(field, "draft", draft_buffer_base)
                 for field in draft_group.fields
             )
+        geometry = target_group if target_group is not None else draft_group
         groups.append(
             CacheGroupLayout(
-                group_id=target_group.group_id,
-                cache_blocks_per_lcm_block=target_group.cache_blocks_per_lcm_block,
+                group_id=group_id,
+                cache_blocks_per_lcm_block=geometry.cache_blocks_per_lcm_block,
                 fields=fields,
             )
         )

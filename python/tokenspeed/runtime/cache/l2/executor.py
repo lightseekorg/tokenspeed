@@ -108,7 +108,14 @@ class L2CacheExecutor:
         draft_layout = (
             draft_pool.cache_transfer_layout() if draft_pool is not None else None
         )
-        self.layout = combine_cache_transfer_layouts(target_layout, draft_layout)
+        scheduler_group_ids = tuple(
+            spec.group_id for spec in device_pool.paged_cache_group_specs
+        )
+        self.layout = combine_cache_transfer_layouts(
+            target_layout,
+            draft_layout,
+            group_ids=scheduler_group_ids or None,
+        )
         host_lcm_block_bytes = compute_host_lcm_block_bytes(self.layout)
         host_lcm_blocks = _num_host_lcm_blocks(
             host_lcm_block_bytes=host_lcm_block_bytes,

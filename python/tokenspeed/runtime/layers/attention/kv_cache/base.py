@@ -63,6 +63,7 @@ class CachePool:
         paged_cache_group_specs: tuple[PagedCacheGroupSpec, ...] = (),
         token_capacity: int | None = None,
         backing_pool: CachePool | None = None,
+        field_layer_offset: int = 0,
     ):
         self.dtype = dtype
         self.rank = rank
@@ -75,6 +76,9 @@ class CachePool:
             self.store_dtype = dtype
         self.device = device
         self.plan = memory_plan
+        self._field_layer_offset = int(field_layer_offset)
+        if self._field_layer_offset < 0:
+            raise ValueError("field_layer_offset must be non-negative")
         # The cache recipe is the single source of the scheduler group specs
         # (CachePoolSpec.paged_cache_group_specs); the pool aligns their
         # physical fields with the memory plan and publishes the runtime
@@ -328,7 +332,10 @@ class CachePool:
 
     def cache_transfer_layout(self):
         """Return the byte contract used by Host cache transfers."""
-        from tokenspeed.runtime.cache.transfer.layout import layout_from_lcm_plan
+        from tokenspeed.runtime.cache.transfer.layout import (
+            layout_from_lcm_plan,
+            select_layer_fields,
+        )
 
         try:
             layer_num = self.layer_num
@@ -336,25 +343,28 @@ class CachePool:
             raise RuntimeError(
                 f"{type(self).__name__} must expose layer_num for Host L2"
             ) from exc
-        consumers = [[] for _ in range(layer_num)]
-        for field in self.plan.fields:
-            parts = field.field_id.split(".", 2)
-            if len(parts) != 3 or parts[0] != "layer":
-                raise RuntimeError(
-                    f"cache field {field.field_id!r} is not owned by a model layer"
-                )
-            try:
-                layer_id = int(parts[1])
-                consumers[layer_id].append(field.field_id)
-            except (ValueError, IndexError) as exc:
-                raise RuntimeError(
-                    f"cache field {field.field_id!r} has an invalid layer id"
-                ) from exc
+        try:
+            field_ids, consumers = select_layer_fields(
+                self.plan.fields,
+                first_layer=self._field_layer_offset,
+                num_layers=layer_num,
+            )
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        local_group_ids = {
+            field.group_id for field in self.plan.fields if field.field_id in field_ids
+        }
+        scheduler_group_ids = tuple(
+            spec.group_id
+            for spec in self.paged_cache_group_specs
+            if spec.group_id in local_group_ids
+        )
         return layout_from_lcm_plan(
             self.plan,
             self._ensure_buffer(),
-            consumers=tuple(tuple(fields) for fields in consumers),
-            group_ids=tuple(spec.group_id for spec in self.paged_cache_group_specs),
+            consumers=consumers,
+            group_ids=scheduler_group_ids or None,
+            field_ids=field_ids,
         )
 
     @torch.no_grad()

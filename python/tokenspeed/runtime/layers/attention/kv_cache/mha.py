@@ -77,6 +77,7 @@ class MHATokenToKVPool(CachePool):
             paged_cache_group_specs=paged_cache_group_specs,
             token_capacity=token_capacity,
             backing_pool=backing_pool,
+            field_layer_offset=field_layer_offset,
         )
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -86,9 +87,6 @@ class MHATokenToKVPool(CachePool):
         self.head_num = head_num
         self.head_dim = head_dim
         self.layer_num = layer_num
-        self._field_layer_offset = int(field_layer_offset)
-        if self._field_layer_offset < 0:
-            raise ValueError("field_layer_offset must be non-negative")
         # Fewer-head layers reinterpret the allocation width as more rows.
         self._layer_kv_head_counts = (
             tuple(int(h) for h in layer_kv_head_counts)
