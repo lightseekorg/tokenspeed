@@ -18,20 +18,19 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""POSIX SHM handle for cross-process multimodal feature tensors.
+"""POSIX SHM representation and reachability for multimodal feature tensors.
 
-The lifecycle keeps the unlink race-free for tensor-parallel ranks while still
-allowing the model-side multimodal planner to deduplicate requests before any
-large payload copy happens:
-
-``publish`` (producer) -> ``attach`` (every rank, before barrier) ->
-``consume`` (only encoder misses) or ``release`` (deduplicated aliases).
+The request path discovers which ranks can open each producer-side SHM segment.
+Later encoder transport stages use that process-local reachability information
+to select a source without coupling this low-level module to encoder ownership
+or device-transfer policy.
 """
 
 from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Sequence
 from multiprocessing import shared_memory
 
 import msgspec
@@ -62,6 +61,10 @@ class ShmTensorHandle(msgspec.Struct, eq=False, dict=True):
     # Payload received over the CPU group when the producer's POSIX segment
     # lives on another host; also non-wire.
     _remote = None
+    # Populated by ``prepare_shm_features`` after every rank has attempted a
+    # local POSIX attach. These are process-local and never serialized.
+    _reachable_ranks = None
+    _group_size = None
 
     @classmethod
     def publish(cls, tensor: torch.Tensor) -> ShmTensorHandle:
@@ -79,9 +82,7 @@ class ShmTensorHandle(msgspec.Struct, eq=False, dict=True):
         return cls(shm_name=name, shape=tuple(tensor.shape), dtype=tensor.dtype)
 
     def attach(self) -> None:
-        """Open the SHM segment on this rank. Must run before the cross-rank
-        barrier so unlink in ``consume()`` cannot race another rank's open.
-        """
+        """Open the segment before peers may consume and unlink it."""
         if self._segment is None:
             self._segment = shared_memory.SharedMemory(name=self.shm_name)
 
@@ -102,10 +103,61 @@ class ShmTensorHandle(msgspec.Struct, eq=False, dict=True):
             n *= d
         return n * torch.empty((), dtype=self.dtype).element_size()
 
-    def peek_bytes(self) -> torch.Tensor:
-        """Copy the attached segment as flat bytes without consuming it."""
-        assert self._segment is not None
-        return torch.frombuffer(self._segment.buf, dtype=torch.uint8).clone()
+    def copy_bytes_into(self, destination: torch.Tensor) -> None:
+        """Copy this attached segment into a flat CPU uint8 destination."""
+        if self._segment is None:
+            raise RuntimeError(
+                f"ShmTensorHandle({self.shm_name!r}) is not attached on the "
+                "selected transport source rank"
+            )
+        if (
+            destination.device.type != "cpu"
+            or destination.dtype != torch.uint8
+            or destination.numel() != self.nbytes()
+        ):
+            raise ValueError(
+                "SHM byte destination must be a flat CPU uint8 tensor with "
+                f"{self.nbytes()} elements"
+            )
+        source = torch.frombuffer(self._segment.buf, dtype=torch.uint8)
+        destination.copy_(source)
+
+    def _set_reachability(
+        self, reachable_ranks: tuple[int, ...], group_size: int
+    ) -> None:
+        """Record process-local SHM reachability after discovery."""
+        if (
+            not reachable_ranks
+            or group_size < len(reachable_ranks)
+            or len(set(reachable_ranks)) != len(reachable_ranks)
+        ):
+            raise ValueError(
+                "Invalid SHM reachability: "
+                f"reachable={reachable_ranks}, group_size={group_size}"
+            )
+        self._reachable_ranks = reachable_ranks
+        self._group_size = group_size
+
+    @property
+    def is_cross_node(self) -> bool:
+        reachable_ranks = self._reachable_ranks
+        group_size = self._group_size
+        return (
+            reachable_ranks is not None
+            and group_size is not None
+            and len(reachable_ranks) != group_size
+        )
+
+    @property
+    def source_rank(self) -> int | None:
+        """Return the selected rank that can directly open this SHM."""
+        reachable_ranks = self._reachable_ranks
+        return reachable_ranks[0] if reachable_ranks else None
+
+    def is_reachable_from(self, rank: int) -> bool:
+        """Return whether ``rank`` can directly open this SHM."""
+        reachable_ranks = self._reachable_ranks
+        return reachable_ranks is not None and rank in reachable_ranks
 
     def set_remote(self, flat_bytes: torch.Tensor) -> None:
         self._remote = flat_bytes
@@ -208,6 +260,11 @@ class ShmTensorHandle(msgspec.Struct, eq=False, dict=True):
         if self._remote is not None:
             self._remote = None
             return
+        # A deferred non-owner on another host never received the payload and
+        # cannot unlink the producer's POSIX segment. Avoid a guaranteed failed
+        # SharedMemory open for every queued/aliased item on every remote rank.
+        if self._reachable_ranks is not None and self._segment is None:
+            return
         segment = self._segment
         self._segment = None
         try:
@@ -236,12 +293,46 @@ class ShmTensorHandle(msgspec.Struct, eq=False, dict=True):
             )
 
 
-def sync_shm_features(reqs, group, group_size: int) -> None:
-    """Attach SHM-backed features in ``reqs`` on every rank.
+def _discover_shm_reachability(handles: Sequence[ShmTensorHandle], group) -> None:
+    """Record which group ranks can attach each producer-side segment."""
+    group_size = torch.distributed.get_world_size(group)
+    attached = [handle.try_attach() for handle in handles]
+    local_flags = torch.tensor(attached, dtype=torch.uint8)
+    if group_size > 1:
+        gathered_flags = [torch.empty_like(local_flags) for _ in range(group_size)]
+        # Each rank contributes H bytes instead of all-reducing a P x H matrix.
+        torch.distributed.all_gather(gathered_flags, local_flags, group=group)
+        flags = torch.stack(gathered_flags)
+    else:
+        flags = local_flags.unsqueeze(0)
 
-    The barrier makes later consume/release unlink race-free in multi-rank
-    setups. Actual materialization is intentionally deferred until the
-    multimodal encoder planner has deduplicated the batch.
+    global_ranks = tuple(
+        torch.distributed.get_global_rank(group, group_rank)
+        for group_rank in range(group_size)
+    )
+    for index, handle in enumerate(handles):
+        local_group_ranks = flags[:, index].nonzero().flatten().tolist()
+        if not local_group_ranks:
+            raise RuntimeError(
+                f"multimodal shm segment {handle.shm_name!r} is not "
+                "reachable from any rank in the group"
+            )
+        reachable_ranks = tuple(global_ranks[int(rank)] for rank in local_group_ranks)
+        handle._set_reachability(reachable_ranks, group_size)
+
+
+def prepare_shm_features(
+    reqs: Sequence[object],
+    group,
+) -> None:
+    """Attach local SHM segments and record their rank reachability.
+
+    Args:
+        reqs: Requests that may carry SHM-backed multimodal features.
+        group: CPU process group whose ranks will later execute the request.
+
+    Returns:
+        None.
     """
     pending = [
         mm
@@ -258,41 +349,23 @@ def sync_shm_features(reqs, group, group_size: int) -> None:
         for item in mm.mm_items
         if item.feature_shm is not None
     ]
-    attached = [h.try_attach() for h in handles]
-    if group_size > 1:
-        # Ship payloads whose POSIX segment lives on another host once over
-        # the CPU group; same-host ranks keep the zero-copy shm path.
-        flags = torch.zeros((group_size, len(handles)), dtype=torch.uint8)
-        flags[torch.distributed.get_rank(group)] = torch.tensor(
-            attached, dtype=torch.uint8
-        )
-        torch.distributed.all_reduce(flags, group=group)
-        for i, handle in enumerate(handles):
-            owners = flags[:, i].nonzero().flatten()
-            if owners.numel() == 0:
-                raise RuntimeError(
-                    f"multimodal shm segment {handle.shm_name!r} is not "
-                    "reachable from any rank in the group"
-                )
-            if owners.numel() == group_size:
-                continue
-            src = torch.distributed.get_global_rank(group, int(owners[0]))
-            if attached[i]:
-                payload = handle.peek_bytes()
-            else:
-                # Pinned: consume() keeps its non_blocking H2D contract.
-                payload = torch.empty(
-                    handle.nbytes(), dtype=torch.uint8, pin_memory=True
-                )
-            torch.distributed.broadcast(payload, src=src, group=group)
-            if not attached[i]:
-                handle.set_remote(payload)
-        torch.distributed.barrier(group)
+    _discover_shm_reachability(handles, group)
+
+    cross_node_handles = 0
+    cross_node_bytes = 0
+    for handle in handles:
+        if handle.is_cross_node:
+            cross_node_handles += 1
+            cross_node_bytes += handle.nbytes()
+
     if LOG_MM_TIMING and started is not None:
         item_count = sum(len(mm.mm_items) for mm in pending)
         logger.info(
-            "mm_timing shm_attach_ms requests=%d items=%d elapsed=%.3f",
+            "mm_timing shm_attach_ms requests=%d items=%d elapsed=%.3f "
+            "cross_node_handles=%d cross_node_bytes=%d",
             len(pending),
             item_count,
             (time.perf_counter() - started) * 1000,
+            cross_node_handles,
+            cross_node_bytes,
         )

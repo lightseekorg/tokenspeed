@@ -326,6 +326,7 @@ def run_evalscope(
     eval_batch_size: int = 16,
     generation_config: Optional[dict] = None,
     dataset_args: Optional[dict] = None,
+    dataset_hub: str = "huggingface",
 ) -> dict:
     work_dir = tempfile.mkdtemp(prefix=f"evalscope-{dataset}-", dir="/tmp")
     api_url = base_url.rstrip("/")
@@ -342,6 +343,8 @@ def run_evalscope(
         "EMPTY_TOKEN",
         "--datasets",
         dataset,
+        "--dataset-hub",
+        dataset_hub,
         "--eval-batch-size",
         str(eval_batch_size),
         "--work-dir",
@@ -354,12 +357,17 @@ def run_evalscope(
     if dataset_args:
         cmd.extend(["--dataset-args", json.dumps(dataset_args)])
 
+    eval_env = os.environ.copy()
+    eval_env["HF_HOME"] = os.path.join(
+        os.environ.get("RUNNER_TEMP") or "/tmp", "hf-eval-cache"
+    )
     result = subprocess.run(
         cmd,
         check=True,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        env=eval_env,
     )
     print(result.stdout)
     score = _load_evalscope_score(work_dir, result.stdout)

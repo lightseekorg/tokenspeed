@@ -265,9 +265,7 @@ class MultimodalInputs(msgspec.Struct, eq=False, kw_only=True, array_like=True):
                 item.feature = None
 
     def attach_shm_features(self) -> None:
-        """Open every pending handle on this rank. Must run before the
-        cross-rank barrier in ``request_handler.recv_reqs``.
-        """
+        """Open every pending handle before peers may consume and unlink it."""
         for item in self.mm_items:
             if item.feature_shm is not None:
                 item.feature_shm.attach()

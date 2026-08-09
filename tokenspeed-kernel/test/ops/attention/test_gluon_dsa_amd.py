@@ -8,35 +8,23 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+from utils import is_cdna4, is_cdna5
 
-
-def _gfx_arch() -> str | None:
-    if not torch.cuda.is_available():
-        return None
-    arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
-    if "gfx950" in arch:
-        return "gfx950"
-    if "gfx1250" in arch:
-        return "gfx1250"
-    return None
-
-
-_GFX_ARCH = _gfx_arch()
-if _GFX_ARCH is None:
+if not (is_cdna4() or is_cdna5()):
     pytest.skip(
-        "AMD GFX950 or GFX1250 is required for Gluon DSA tests",
+        "AMD CDNA4 or CDNA5 is required for Gluon DSA tests",
         allow_module_level=True,
     )
 
+from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (  # noqa: E402
+    _trim_topk_slots_for_context,
+)
 
-if _GFX_ARCH == "gfx950":
+if is_cdna4():
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa import (  # noqa: E402
         sparse_mla as dsa_topk_backend,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
-        _trim_topk_slots_for_context,
-    )
-    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (  # noqa: E402
         gluon_dsa_decode_gfx950 as gluon_dsa_decode,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
@@ -73,7 +61,7 @@ torch.manual_seed(42)
     ((25, 512), (608, 1024), (1537, 2048)),
 )
 @pytest.mark.skipif(
-    _GFX_ARCH != "gfx950",
+    not is_cdna4(),
     reason="registered-width trimming is specific to the gfx950 implementation",
 )
 def test_dsa_attention_trims_topk_to_registered_context_width(

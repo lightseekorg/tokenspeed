@@ -105,9 +105,6 @@ from tokenspeed.runtime.distributed.comm_ops import (
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
 from tokenspeed.runtime.layers.activation import SituAndMul
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    FULL_ATTENTION,
-)
 from tokenspeed.runtime.layers.layernorm import (
     RMSNorm,
     _get_process_group,
@@ -350,13 +347,6 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             alt_stream=alt_stream,
             skip_rope=True,  # K3 MLA is NoPE (mla_use_nope=True)
         )
-        # The MLA layers belong to the Paged cache full_attention cache group. The
-        # inherited attn_mqa/attn_mha PagedAttention modules are
-        # built without a group_id; tag them so validate_paged_cache_group_ids
-        # binds them to the published full_attention table. (KDA layers have no
-        # PagedAttention and resolve their state group via group_id_for_layer.)
-        self.attn_mqa.group_id = FULL_ATTENTION
-        self.attn_mha.group_id = FULL_ATTENTION
         self.use_output_gate = config.mla_use_output_gate
         if self.use_output_gate:
             assert q_lora_rank is not None, "gated MLA assumes the q-lora path"
