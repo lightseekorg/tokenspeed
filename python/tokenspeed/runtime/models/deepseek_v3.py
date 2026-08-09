@@ -616,10 +616,6 @@ class DeepseekV3AttentionMLA(nn.Module):
         else:
             self.rotary_emb = None
 
-        # MLA is always full attention, so both modules declare that cache
-        # group. A pool publishing several groups -- a hybrid target, or a
-        # draft model sharing the target's unified pool -- rejects an untagged
-        # PagedAttention in validate_paged_cache_group_ids.
         self.attn_mqa = PagedAttention(
             self.num_local_heads,
             self.kv_lora_rank + self.qk_rope_head_dim,
