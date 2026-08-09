@@ -11,6 +11,9 @@
 ## Code changes
 
 * Add tests and update docs for the changed code.
+* Use absolute imports instead of relative imports.
+* Use the repository's full MIT license header for copyright notices; do not use
+  an abbreviated copyright-only header.
 * Before creating commits, run `pre-commit run --all-files` to format.
 * Do not substitute a narrower lint command for the repository hook before
   committing. Always run the exact `pre-commit run --all-files` command and
@@ -29,7 +32,7 @@
 
 ## tokenspeed-kernel
 
-Inside the root tokenspeed-kernel/ directory:
+Inside the root `tokenspeed-kernel/` directory:
 
 * All direct tokenspeed-triton imports should happen in `_triton.py` and then
   re-import to other places.
@@ -42,3 +45,11 @@ Inside the root tokenspeed-kernel/ directory:
 * Files under `ops/` should follow `<family>/<solution>` structure, like
   `gemm/trtllm.py` or `attention/triton/`.
 * When defining new public APIs, explain arguments and returns in docstring.
+
+## tokenspeed-kernel-amd
+
+Inside the root `tokenspeed-kernel-amd/` directory:
+
+* There should be no dependency on `tokenspeed-kernel`.
+* AMD Gluon Kernel tests should live in `tokenspeed-kernel/test/` to reuse
+  common platform utilities and reference computations.

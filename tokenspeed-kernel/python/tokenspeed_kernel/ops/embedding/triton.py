@@ -553,11 +553,17 @@ def _fp8_quantize_kernel(
     n_cols: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HAS_SCALE_TENSOR: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     token = tl.program_id(0)
     head = tl.program_id(1)
     offsets = tl.arange(0, BLOCK_N)
     mask = offsets < n_cols
+    # PDL: this kernel is launched with launch_pdl and may start while the
+    # producer (the projection GEMM) is still writing x; its stores are only
+    # guaranteed visible after griddepcontrol.wait.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     values = tl.load(
         x + token * x_stride_t + head * x_stride_h + offsets,
         mask=mask,
@@ -572,6 +578,8 @@ def _fp8_quantize_kernel(
         values_fp8,
         mask=(head < num_heads) & mask,
     )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def _fp8_quantize(
@@ -605,6 +613,7 @@ def _fp8_quantize(
         n_cols=x.shape[2],
         BLOCK_N=block_n,
         HAS_SCALE_TENSOR=isinstance(scale, torch.Tensor),
+        ENABLE_PDL=enable_pdl,
         num_warps=4,
         num_stages=1,
         **extra_kwargs,
@@ -645,9 +654,14 @@ def _mla_nope_quantize_fp8_kernel(
     BLOCK_R: tl.constexpr,
     HAS_SCALE_Q_TENSOR: tl.constexpr,
     HAS_SCALE_KV_TENSOR: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     token = tl.program_id(0)
     head = tl.program_id(1)
+    # PDL: launched with launch_pdl; the q/k inputs may still be in flight from
+    # the producer until griddepcontrol.wait orders them.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     if HAS_SCALE_Q_TENSOR:
         scale_q = tl.load(scale_q)
     if HAS_SCALE_KV_TENSOR:
@@ -699,6 +713,8 @@ def _mla_nope_quantize_fp8_kernel(
         (kr * scale_kv).to(tl.float8e4nv),
         mask=mask_r,
     )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def mla_nope_quantize_fp8_triton(
@@ -771,6 +787,7 @@ def mla_nope_quantize_fp8_triton(
         BLOCK_R=max(16, _next_power_of_2(rope_dim)),
         HAS_SCALE_Q_TENSOR=isinstance(quant_scale_q, torch.Tensor),
         HAS_SCALE_KV_TENSOR=isinstance(quant_scale_kv, torch.Tensor),
+        ENABLE_PDL=enable_pdl,
         **extra_kwargs,
     )
 

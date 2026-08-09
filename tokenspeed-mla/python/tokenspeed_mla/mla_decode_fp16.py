@@ -1437,8 +1437,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         lse_scale_ptr = cute.recast_ptr(storage, dtype=self.acc_dtype)
         smem_lse_scale = cute.make_tensor(lse_scale_ptr, cute.make_layout(MAX_SPLITS))
 
-        # Allow any subsequent dependent kernel to be early-launched.
-        cute.arch.griddepcontrol_launch_dependents()
+        # PDL: wait for the split-KV kernel to finish writing mAccO / mAccLSE
+        # before consuming the intermediate workspace.
+        cute.arch.griddepcontrol_wait()
 
         gLSE = mAccLSE[blk_coord[0], None, blk_coord[1], blk_coord[2]]
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -1504,8 +1505,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         for j in cutlass.range_constexpr(elements_per_thread):
             element_idx = tidx + j * self.threads_per_warp * self.num_compute_warps
             mO[blk_coord[0], element_idx, blk_coord[1], blk_coord[2]] = rO[j]
-        # PDL: wait for the split-KV kernel to finish writing mAccO / mAccLSE
-        cute.arch.griddepcontrol_wait()
+        # Allow any subsequent dependent kernel to be early-launched.
+        cute.arch.griddepcontrol_launch_dependents()
         return
 
     @staticmethod

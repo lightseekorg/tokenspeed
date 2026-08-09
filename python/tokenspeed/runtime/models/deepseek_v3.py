@@ -35,10 +35,7 @@ from tokenspeed_kernel.ops.attention import (
     attn_merge_state,
     mla_project_value,
 )
-from tokenspeed_kernel.ops.attention.tokenspeed_mla import (
-    mla_kv_pack_quantize_fp8,
-    mla_prefill_pdl_enabled,
-)
+from tokenspeed_kernel.ops.attention.tokenspeed_mla import mla_kv_pack_quantize_fp8
 from tokenspeed_kernel.ops.attention.triton.mla_query_assemble import (
     mla_nope_query_fp8,
 )
@@ -88,6 +85,9 @@ from tokenspeed.runtime.execution.context import (
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.activation import SiluAndMul
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    FULL_ATTENTION,
+)
 from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4LinearMethod
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -623,6 +623,7 @@ class DeepseekV3AttentionMLA(nn.Module):
             num_kv_heads=1,
             layer_id=layer_id,
             v_head_dim=self.kv_lora_rank,
+            group_id=FULL_ATTENTION,
         )
 
         self.attn_mha = PagedAttention(
@@ -632,6 +633,7 @@ class DeepseekV3AttentionMLA(nn.Module):
             num_kv_heads=self.num_local_heads,
             layer_id=layer_id,
             v_head_dim=self.v_head_dim,
+            group_id=FULL_ATTENTION,
         )
 
         self.w_kc = None
@@ -1089,16 +1091,14 @@ class DeepseekV3AttentionMLA(nn.Module):
                 is_neox=is_neox,
                 quant_scale_q=1.0,
                 quant_scale_kv=k_scale,
-                enable_pdl=mla_prefill_pdl_enabled(pdl_enabled()),
+                enable_pdl=pdl_enabled(),
             )
 
-            v_fp8 = fp8_quantize(v, enable_pdl=mla_prefill_pdl_enabled(pdl_enabled()))
+            v_fp8 = fp8_quantize(v, enable_pdl=pdl_enabled())
 
             # Write FP8 KV cache directly (skip BF16→FP8 conversion in pool)
             k_pe_for_cache = k_fp8[:, 0:1, self.qk_nope_head_dim :]
-            kv_a_fp8 = fp8_quantize(
-                kv_a, enable_pdl=mla_prefill_pdl_enabled(pdl_enabled())
-            )
+            kv_a_fp8 = fp8_quantize(kv_a, enable_pdl=pdl_enabled())
             ctx.token_to_kv_pool.set_mla_kv_buffer(
                 self.attn_mha,
                 out_cache_loc,
@@ -1196,11 +1196,7 @@ class DeepseekV3AttentionMLA(nn.Module):
             if q.dtype == torch.float8_e4m3fn:
                 # FP8 Attention
                 k, v = mla_kv_pack_quantize_fp8(
-                    k_nope,
-                    k_pe,
-                    v,
-                    k_scale_inv=1.0 / k_scale,
-                    enable_pdl=mla_prefill_pdl_enabled(pdl_enabled()),
+                    k_nope, k_pe, v, k_scale_inv=1.0 / k_scale, enable_pdl=pdl_enabled()
                 )
             else:
                 # BF16 Attention
@@ -1229,7 +1225,7 @@ class DeepseekV3AttentionMLA(nn.Module):
                 chunk_output,
                 lse,
                 inplace=True,
-                enable_pdl=mla_prefill_pdl_enabled(pdl_enabled()),
+                enable_pdl=pdl_enabled(),
             )
 
         return output

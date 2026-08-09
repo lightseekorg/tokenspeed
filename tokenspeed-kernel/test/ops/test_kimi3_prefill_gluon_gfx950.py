@@ -6,16 +6,13 @@ from __future__ import annotations
 
 import pytest
 import torch
+from utils import is_cdna4
 
-
-def _is_gfx950() -> bool:
-    return torch.cuda.is_available() and "gfx950" in getattr(
-        torch.cuda.get_device_properties(0), "gcnArchName", ""
+if not is_cdna4():
+    pytest.skip(
+        "AMD CDNA4 is required for Kimi K3 prefill Gluon tests",
+        allow_module_level=True,
     )
-
-
-if not _is_gfx950():
-    pytest.skip("gfx950 is required", allow_module_level=True)
 
 
 from tokenspeed_kernel.ops.attn_res import attn_res_fwd  # noqa: E402
