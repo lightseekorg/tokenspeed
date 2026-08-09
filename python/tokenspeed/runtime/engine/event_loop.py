@@ -53,6 +53,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     make_config,
     pool_to_paged_cache_groups,
     pop_common_cache_event_payloads,
+    resolve_dspark_prefix_replay_tokens,
     scheduler_cache_geometry_from_pool,
     should_use_overlap_schedule,
 )
@@ -205,6 +206,15 @@ class EventLoop:
             )
         else:
             draft_model_config = None
+
+        prefix_replay_tokens = resolve_dspark_prefix_replay_tokens(
+            speculative_algorithm=server_args.speculative_algorithm,
+            enable_prefix_caching=server_args.enable_prefix_caching,
+            enable_kvstore=server_args.enable_kvstore,
+            disaggregation_mode=server_args.disaggregation_mode,
+            draft_model_path_use_base=server_args.draft_model_path_use_base,
+            draft_model_config=draft_model_config,
+        )
 
         min_per_gpu_mem = self._init_distributed()
 
@@ -415,6 +425,7 @@ class EventLoop:
             decode_input_tokens=decode_input_tokens,
             overlap_schedule_depth=self.overlap_schedule_depth,
             disable_prefix_cache=not server_args.enable_prefix_caching,
+            prefix_replay_tokens=prefix_replay_tokens,
             paged_cache_groups=paged_cache_groups,
             enable_mixed_prefill_decode=server_args.enable_mixed_batch,
         )
@@ -424,7 +435,8 @@ class EventLoop:
             "max_scheduled_tokens=%s decode_input_tokens=%s "
             "overlap_schedule_depth=%s disable_l2_cache=%s "
             "max_batch_size=%s (global max_num_seqs=%s, dp_size=%s) "
-            "disable_prefix_cache=%s paged_cache_groups=%s",
+            "disable_prefix_cache=%s prefix_replay_tokens=%s "
+            "paged_cache_groups=%s",
             scheduler_cfg.block_size,
             scheduler_cfg.num_device_pages,
             scheduler_cfg.max_scheduled_tokens,
@@ -435,6 +447,7 @@ class EventLoop:
             server_args.max_num_seqs,
             self.dp_size,
             scheduler_cfg.disable_prefix_cache,
+            scheduler_cfg.prefix_replay_tokens,
             [group.group_id for group in paged_cache_groups],
         )
         self.scheduler = Scheduler(scheduler_cfg)
