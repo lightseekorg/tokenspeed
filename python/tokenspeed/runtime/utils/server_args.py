@@ -790,7 +790,7 @@ class ServerArgs:
                 )
 
     def _handle_kvstore(self):
-        if self.disaggregation_mode in ("decode", "encode"):
+        if self.disaggregation_mode == "encode":
             self.enable_kvstore = False
             logger.info(
                 "%s instance has set enable_kvstore to False!",
@@ -824,10 +824,11 @@ class ServerArgs:
                     "DSPARK currently requires both --disable-kvstore and "
                     "--no-enable-prefix-caching."
                 )
-            raise ValueError(
-                "KVStore and disabled prefix caching are mutually exclusive "
-                "and cannot be used at the same time. Please use only one of them."
-            )
+            if self.disaggregation_mode != "decode":
+                raise ValueError(
+                    "KVStore and disabled prefix caching are mutually exclusive "
+                    "and cannot be used at the same time. Please use only one of them."
+                )
 
     def validate(self):
         if (

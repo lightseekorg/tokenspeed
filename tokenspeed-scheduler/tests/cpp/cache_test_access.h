@@ -27,7 +27,7 @@
 #include <utility>
 #include <vector>
 
-#include "cache/kv_cache_coordinator.h"
+#include "cache/coordinator/kv_cache_coordinator.h"
 
 namespace tokenspeed {
 

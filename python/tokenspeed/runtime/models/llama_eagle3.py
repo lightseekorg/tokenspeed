@@ -39,7 +39,6 @@ from tokenspeed.runtime.execution.context import (
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.activation import SiluAndMul
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.common import concat
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -81,13 +80,6 @@ class LlamaAttention(BaseLlamaAttention):
     the fallback runs the full N-row attn and post-slices the output.
     Inactive draft steps delegate to base.
     """
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        # Llama Eagle3 drafts use full-history attention. Once draft KV layers
-        # share a multi-group target pool, the backend needs this explicit
-        # routing key rather than the single-table fallback.
-        self.attn.group_id = FULL_ATTENTION
 
     def _attn(
         self,

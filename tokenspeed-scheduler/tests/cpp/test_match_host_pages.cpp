@@ -25,9 +25,9 @@
 #include <string>
 #include <vector>
 
-#include "cache/block_pool.h"
-#include "cache/full_attn_manager.h"
-#include "cache/swa_manager.h"
+#include "cache/core/block_pool.h"
+#include "cache/manager/full_attn_manager.h"
+#include "cache/manager/swa_manager.h"
 
 namespace tokenspeed::test {
 namespace {

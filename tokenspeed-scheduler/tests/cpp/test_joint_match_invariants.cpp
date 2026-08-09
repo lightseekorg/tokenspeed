@@ -32,13 +32,14 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <random>
 #include <string>
 #include <vector>
 
-#include "cache/block_pool.h"
-#include "cache/cache_types.h"
-#include "cache/kv_cache_coordinator.h"
+#include "cache/coordinator/kv_cache_coordinator.h"
+#include "cache/core/block_pool.h"
+#include "cache/core/cache_types.h"
 #include "cache_test_access.h"
 #include "unit_test_helper.h"
 
@@ -54,14 +55,14 @@ std::vector<std::string> MakeHashes(std::int32_t count) {
     return hashes;
 }
 
-CacheKey KeyFor(const std::string& content_hash, GroupId group_id) {
+CacheKey KeyFor(const std::string& content_hash, std::uint32_t group_id) {
     return CacheKey{.namespace_id = kDefaultCacheNamespaceId, .group_id = group_id, .content_hash = content_hash};
 }
 
 std::uint64_t g_epoch = 0;
 
 std::int32_t CacheBlockFor(KvCacheCoordinator& coordinator, BlockPool& pool, const std::string& content_hash,
-                           GroupId group_id) {
+                           std::uint32_t group_id) {
     KvCacheManager& manager = coordinator.GroupManager(static_cast<std::int32_t>(group_id));
     CacheBlockRef block_ref = pool.AcquireBlock(group_id, manager.CacheBlocksPerLcmBlock());
     if (!block_ref) {
@@ -77,7 +78,7 @@ std::int32_t CacheBlockFor(KvCacheCoordinator& coordinator, BlockPool& pool, con
 // this group alone can support, given which of its blocks are cached.
 // Full attention is prefix-closed; a sliding group needs its lookback run.
 std::int32_t GroupPrefixBlocks(const KvCacheCoordinator& coordinator, const BlockPool& pool,
-                               std::span<const std::string> hashes, GroupId group_id, std::int32_t bound_blocks) {
+                               std::span<const std::string> hashes, std::uint32_t group_id, std::int32_t bound_blocks) {
     const KvCacheManager& manager = coordinator.GroupManager(static_cast<std::int32_t>(group_id));
     std::vector<CacheKey> keys;
     keys.reserve(hashes.size());
@@ -110,7 +111,7 @@ TEST(JointMatchInvariantsTest, HitImpliesWarmUnderRandomCacheEvictSequences) {
             // subset of the request's blocks (front-truncated to mimic the
             // sliding group's reclaim of slid-out blocks).
             std::vector<std::vector<std::int32_t>> cached_ids(specs.size());
-            for (GroupId group = 0; group < static_cast<GroupId>(specs.size()); ++group) {
+            for (std::uint32_t group = 0; group < static_cast<std::uint32_t>(specs.size()); ++group) {
                 std::uniform_int_distribution<std::int32_t> depth_dist(0, kBlocks);
                 std::uniform_int_distribution<std::int32_t> front_dist(0, 3);
                 const std::int32_t depth = depth_dist(rng);
@@ -123,7 +124,7 @@ TEST(JointMatchInvariantsTest, HitImpliesWarmUnderRandomCacheEvictSequences) {
 
             // Random evictions punch holes anywhere.
             std::uniform_int_distribution<std::int32_t> evict_count_dist(0, kBlocks);
-            for (GroupId group = 0; group < static_cast<GroupId>(specs.size()); ++group) {
+            for (std::uint32_t group = 0; group < static_cast<std::uint32_t>(specs.size()); ++group) {
                 std::int32_t to_evict = evict_count_dist(rng);
                 std::shuffle(cached_ids[group].begin(), cached_ids[group].end(), rng);
                 for (const std::int32_t lcm_block_id : cached_ids[group]) {
@@ -141,7 +142,7 @@ TEST(JointMatchInvariantsTest, HitImpliesWarmUnderRandomCacheEvictSequences) {
             // hit => warm: every group must independently support the
             // converged boundary. This is the property the draft relies on
             // (its KV is recoverable at every exposed boundary).
-            for (GroupId group = 0; group < static_cast<GroupId>(specs.size()); ++group) {
+            for (std::uint32_t group = 0; group < static_cast<std::uint32_t>(specs.size()); ++group) {
                 const std::int32_t own = GroupPrefixBlocks(coordinator, pool, hashes, group, common_blocks);
                 EXPECT_GE(own, common_blocks)
                     << "round " << round << ": group " << group << " cannot recover the converged boundary (" << own
@@ -185,7 +186,7 @@ TEST(JointMatchInvariantsTest, DraftOnlyGroupJoinsConvergenceAsOrdinaryGroup) {
     const auto match = MatchPrefixForTest(coordinator, hashes).device;
     const std::int32_t common_blocks = match.num_common_tokens / kBlockTokens;
     EXPECT_EQ(common_blocks, 5);
-    for (GroupId group = 0; group < 3; ++group) {
+    for (std::uint32_t group = 0; group < 3; ++group) {
         EXPECT_GE(GroupPrefixBlocks(coordinator, pool, hashes, group, common_blocks), common_blocks);
     }
 }

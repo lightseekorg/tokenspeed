@@ -22,15 +22,21 @@ from tokenspeed.runtime.engine.event_loop import _forward_op_executes_model_forw
 
 
 class FakeForwardOp:
-    def __init__(self, *, input_lengths, request_ids=None, num_extends=0):
+    def __init__(
+        self, *, input_lengths, request_ids=None, num_extends=0, local_prefill=False
+    ):
         self.input_lengths = input_lengths
         self.request_ids = request_ids or [
             f"req-{i}" for i in range(len(input_lengths))
         ]
         self._num_extends = num_extends
+        self._local_prefill = local_prefill
 
     def num_extends(self):
         return self._num_extends
+
+    def is_local_prefill(self):
+        return self._local_prefill
 
 
 def test_pd_decode_extend_only_does_not_require_idle_forward():
@@ -43,6 +49,12 @@ def test_pd_decode_extend_only_does_not_require_idle_forward():
 
 def test_pd_decode_decode_step_requires_idle_forward():
     op = FakeForwardOp(input_lengths=[1], num_extends=0)
+
+    assert _forward_op_executes_model_forward(op, is_disagg_decode=True)
+
+
+def test_pd_decode_local_recovery_prefill_executes_model_forward():
+    op = FakeForwardOp(input_lengths=[17], num_extends=1, local_prefill=True)
 
     assert _forward_op_executes_model_forward(op, is_disagg_decode=True)
 

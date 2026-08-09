@@ -156,6 +156,27 @@ def _run_item_dp_case(rank: int, device: torch.device, mapping: Mapping) -> None
     assert idle_calls == (1 if rank == 0 else 0)
     torch.testing.assert_close(idle_item.encoded, _encoded_rows(idle_item, 2, device))
 
+    # Equal rank-local row counts use all_gather_into_tensor directly into the
+    # final rank-major output buffer.
+    equal_items = [_item(50, 2), _item(60, 2)]
+    equal_calls: list[list[int]] = []
+
+    def equal_encoder(batch):
+        equal_calls.append([int(item.hash) for item in batch])
+        return _encoded_rows(batch[0], 2, device)
+
+    embedder._encode(
+        EncodePlan(misses_by_modality={Modality.IMAGE: equal_items}),
+        {Modality.IMAGE: EncoderSpec(equal_encoder)},
+        SimpleNamespace(),
+        device,
+        2,
+        torch.float32,
+    )
+    assert equal_calls == [[50] if rank == 0 else [60]]
+    for item in equal_items:
+        torch.testing.assert_close(item.encoded, _encoded_rows(item, 2, device))
+
 
 def _item_dp_worker(rank: int, world_size: int, port: int) -> None:
     device = torch.device(f"cuda:{rank}")

@@ -38,6 +38,9 @@ from tokenspeed.runtime.configs.utils import get_rope_theta
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.activation import SiluAndMul
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    FULL_ATTENTION,
+)
 from tokenspeed.runtime.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -192,6 +195,7 @@ class LlamaAttention(nn.Module):
             self.head_dim**-0.5,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            group_id=FULL_ATTENTION,
         )
 
     def forward(
@@ -261,7 +265,13 @@ class LlamaAttention(nn.Module):
         return create_fused_set_kv_buffer_arg(
             value=v.view(n, self.num_kv_heads, self.head_dim),
             layer=self.attn,
-            out_cache_loc=out_cache_loc,
+            # Cache path: prewrite at this layer's group locations. Identity on
+            # the legacy single-table path; without it a grouped pool would get
+            # the scheduler's locations and the write would miss the pages this
+            # layer reads.
+            out_cache_loc=ctx.attn_backend.select_out_cache_loc(
+                self.attn, out_cache_loc, ctx.forward_mode
+            ),
             token_to_kv_pool=ctx.token_to_kv_pool,
         )
 

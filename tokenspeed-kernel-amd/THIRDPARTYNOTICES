@@ -32,6 +32,14 @@ The GFX1250 MLA decode and cached-extend kernels are adapted from ROCm/AITER com
 Source:
 https://github.com/ROCm/aiter/blob/4a1cc773f34cbfc74387259e51262556ee38edd0/aiter/ops/triton/_gluon_kernels/gfx1250/attention/mla.py
 
+The GFX1250 DSA indexer-logit, sparse decode, and sparse prefill kernels are
+adapted from ROCm/AITER commit 00b271b95f8a3405fa211e509c63441040557305.
+Sources:
+https://github.com/ROCm/aiter/blob/00b271b95f8a3405fa211e509c63441040557305/aiter/ops/triton/_gluon_kernels/gfx1250/attention/fp8_mqa_logits.py
+https://github.com/ROCm/aiter/blob/00b271b95f8a3405fa211e509c63441040557305/aiter/ops/triton/gluon/pa_mqa_logits.py
+https://github.com/ROCm/aiter/blob/00b271b95f8a3405fa211e509c63441040557305/aiter/ops/triton/_gluon_kernels/gfx1250/attention/pa_decode_sparse.py
+https://github.com/ROCm/aiter/blob/00b271b95f8a3405fa211e509c63441040557305/aiter/ops/triton/_gluon_kernels/gfx1250/attention/pa_prefill_sparse.py
+
 Licensed under the MIT License, whose full license text is available below.
 
 ================================================================================

@@ -187,10 +187,11 @@ def aligned_max_scheduled_tokens(
     return max_scheduled_tokens - max_scheduled_tokens % grain
 
 
-def make_spec(rid: str, tokens: list[int]) -> RequestSpec:
+def make_spec(rid: str, tokens: list[int], max_new_tokens: int = 0) -> RequestSpec:
     spec = RequestSpec()
     spec.request_id = rid
     spec.tokens = tokens
+    spec.max_new_tokens = max_new_tokens
     return spec
 
 
@@ -350,8 +351,6 @@ def cache_event_to_payload(event) -> dict:
     return {
         "kind": kind,
         "op_id": int(event.op_id),
-        "success": bool(event.success),
-        "request_id": getattr(event, "request_id", ""),
     }
 
 
@@ -361,10 +360,6 @@ def cache_event_from_payload(payload: dict):
         raise ValueError(f"Unsupported cache event type: {kind}")
     event = _CACHE_EVENT_TYPES[kind]()
     event.op_id = int(payload["op_id"])
-    event.success = bool(payload["success"])
-    request_id = payload.get("request_id", "")
-    if request_id:
-        event.request_id = request_id
     return event
 
 
@@ -390,9 +385,7 @@ def pop_common_cache_event_payloads(
 
     ready_payloads = []
     for key in sorted(common_keys, key=lambda item: (item[1], item[0])):
-        payload = dict(rank_maps[0][key])
-        payload["success"] = all(rank_map[key]["success"] for rank_map in rank_maps)
-        ready_payloads.append(payload)
+        ready_payloads.append(dict(rank_maps[0][key]))
     return ready_payloads
 
 

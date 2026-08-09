@@ -142,6 +142,8 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
             raise ValueError(f"layer {layer_id} has no cache group") from exc
 
     def get_component(self, layer_id: int, component_name: str) -> torch.Tensor:
+        if self.layerwise_load_tracker is not None:
+            self.layerwise_load_tracker.wait_for_layer(layer_id)
         if component_name == "latent_kv":
             buffer = self.kv_buffer[layer_id]
             if buffer is None:
