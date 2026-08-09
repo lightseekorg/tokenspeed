@@ -82,11 +82,20 @@ def _resolve_heterogeneous_draft_family(
     pd_disaggregation_enabled: bool,
 ) -> CacheModelFamily | None:
     """Validate and return the supported heterogeneous draft family."""
-    if (
-        target_family not in _ORDINARY_CACHE_FAMILIES
-        or draft_family is None
-        or draft_family == target_family
-    ):
+    if draft_family is None:
+        return None
+    if target_family == "kimi_k3":
+        if draft_family != "mla":
+            raise RuntimeError(
+                "Kimi-K3 unified cache currently requires an ordinary MLA draft view"
+            )
+        if pd_disaggregation_enabled:
+            raise RuntimeError(
+                "PD disaggregation does not support heterogeneous target/draft "
+                "cache families"
+            )
+        return draft_family
+    if target_family not in _ORDINARY_CACHE_FAMILIES or draft_family == target_family:
         return None
     if draft_family != "mha":
         raise RuntimeError(
