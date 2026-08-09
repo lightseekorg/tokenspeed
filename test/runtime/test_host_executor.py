@@ -68,6 +68,7 @@ class GroupAwareWireTest(unittest.TestCase):
         pool.layer_num = 2
         pool.buffer = object()
         pool._backing_pool = None
+        pool._field_layer_offset = 0
         pool.paged_cache_group_specs = (
             SimpleNamespace(group_id="state"),
             SimpleNamespace(group_id="full"),
@@ -282,6 +283,9 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
                 self.load_tracker = tracker
 
         pool = SyntheticPool()
+        pool.paged_cache_group_specs = tuple(
+            SimpleNamespace(group_id=group.group_id) for group in layout.groups
+        )
         with patch.object(self.executor_module, "_HOST_MEM_HEADROOM_BYTES", 0):
             executor = self.executor_module.L2CacheExecutor(
                 pool,
