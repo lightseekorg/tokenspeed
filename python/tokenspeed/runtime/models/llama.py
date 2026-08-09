@@ -195,9 +195,6 @@ class LlamaAttention(nn.Module):
             self.head_dim**-0.5,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            # Llama attention is full-history; there is no sliding-window
-            # variant on this path. A model that grows one must thread the
-            # per-layer type through here the way gpt_oss does.
             group_id=FULL_ATTENTION,
         )
 
