@@ -67,6 +67,8 @@ class MLATokenToKVPool(CachePool):
         paged_cache_group_specs: tuple[PagedCacheGroupSpec, ...] = (),
         token_capacity: int | None = None,
         layer_group_ids: tuple[str, ...] = (),
+        field_layer_offset: int = 0,
+        backing_pool: CachePool | None = None,
     ):
         super().__init__(
             size,
@@ -77,6 +79,7 @@ class MLATokenToKVPool(CachePool):
             memory_plan,
             paged_cache_group_specs=paged_cache_group_specs,
             token_capacity=token_capacity,
+            backing_pool=backing_pool,
         )
         self.model_dtype = model_dtype
         self.quant_method = quant_method
@@ -84,6 +87,9 @@ class MLATokenToKVPool(CachePool):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.layer_num = layer_num
+        self._field_layer_offset = int(field_layer_offset)
+        if self._field_layer_offset < 0:
+            raise ValueError("field_layer_offset must be non-negative")
         self.kv_cache_dim = kv_lora_rank + qk_rope_head_dim
         # Physical group id per layer, from the cache recipe
         # (CachePoolSpec.layer_group_ids) — the single source the scheduler
@@ -102,6 +108,10 @@ class MLATokenToKVPool(CachePool):
 
         self._create_buffers()
 
+    def _field_layer_id(self, layer_id: int) -> int:
+        """Map this compute view's local layer id into the merged plan."""
+        return self._field_layer_offset + layer_id
+
     def _create_buffers(self) -> None:
         with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
             # The padded page 0 is used for writing dummy outputs from padded tokens.
@@ -109,22 +119,26 @@ class MLATokenToKVPool(CachePool):
                 self.kv_buffer = [
                     (
                         self.field(
-                            f"layer.{layer_id}.latent_kv", self.store_dtype
+                            f"layer.{self._field_layer_id(layer_id)}.latent_kv",
+                            self.store_dtype,
                         ).view(-1, 1, self.kv_lora_rank),
                         self.field(
-                            f"layer.{layer_id}.latent_scale", torch.float32
+                            f"layer.{self._field_layer_id(layer_id)}.latent_scale",
+                            torch.float32,
                         ).view(-1, 1, 1),
-                        self.field(f"layer.{layer_id}.rope_k", self.model_dtype).view(
-                            -1, 1, self.qk_rope_head_dim
-                        ),
+                        self.field(
+                            f"layer.{self._field_layer_id(layer_id)}.rope_k",
+                            self.model_dtype,
+                        ).view(-1, 1, self.qk_rope_head_dim),
                     )
                     for layer_id in range(self.layer_num)
                 ]
             else:
                 self.kv_buffer = [
-                    self.field(f"layer.{layer_id}.latent_kv", self.store_dtype).view(
-                        -1, 1, self.kv_cache_dim
-                    )
+                    self.field(
+                        f"layer.{self._field_layer_id(layer_id)}.latent_kv",
+                        self.store_dtype,
+                    ).view(-1, 1, self.kv_cache_dim)
                     for layer_id in range(self.layer_num)
                 ]
 

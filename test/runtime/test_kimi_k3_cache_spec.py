@@ -129,7 +129,7 @@ def test_k3_merged_solve_with_draft_shares_page_ids():
         layer_group_ids=("full_attention",),
         logical_block_tokens=128,
         latent_width=576,
-        element_size=1,
+        element_size=torch.bfloat16.itemsize,
     )
     merged = solve_kimi_k3_cache_layout(
         KimiLinearConfig(),
@@ -145,7 +145,9 @@ def test_k3_merged_solve_with_draft_shares_page_ids():
     draft_field = plan.field("layer.93.latent_kv")
     target_field = plan.field("layer.3.latent_kv")
     assert draft_field.group_id == target_field.group_id == "full_attention"
-    assert draft_field.page_stride_bytes == target_field.page_stride_bytes
+    assert draft_field.element_size == 2
+    assert target_field.element_size == 1
+    assert draft_field.page_stride_bytes == 2 * target_field.page_stride_bytes
     # One group -> one page-id space: same page_count by identity.
     assert plan.group("full_attention").page_count == 1 + 7 * 12
 

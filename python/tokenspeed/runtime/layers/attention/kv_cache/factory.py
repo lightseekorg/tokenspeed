@@ -26,9 +26,12 @@ def create_cache_pool(
     publishes the runtime contract (ModelExecutor fails fast without one).
     """
     if (backing_pool is not None or field_layer_offset) and not (
-        isinstance(config, MHAConfig) and spec.family == "mha"
+        (isinstance(config, MHAConfig) and spec.family == "mha")
+        or (type(config) is MLAConfig and spec.family == "mla")
     ):
-        raise ValueError("backing cache views are only supported by ordinary MHA pools")
+        raise ValueError(
+            "backing cache views are only supported by ordinary MHA or MLA pools"
+        )
     plan = spec.memory_plan
     if spec.family == "deepseek_v4":
         from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
@@ -201,6 +204,8 @@ def create_cache_pool(
                 paged_cache_group_specs=spec.paged_cache_group_specs,
                 token_capacity=spec.token_capacity,
                 layer_group_ids=spec.layer_group_ids,
+                field_layer_offset=field_layer_offset,
+                backing_pool=backing_pool,
             )
 
         if spec.family != "kimi_k3":
