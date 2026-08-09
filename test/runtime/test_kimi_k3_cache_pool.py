@@ -246,6 +246,14 @@ def test_kimi_k3_bf16_draft_uses_typed_view_over_fp8_target_arena() -> None:
     assert set(target_pool._fields) == {
         field.field_id for field in merged_spec.memory_plan.fields
     }
+    full_attention_segments = set(target_pool._block_byte_segments(FULL_ATTENTION, [1]))
+    for global_layer_id in range(93, 98):
+        field_id = f"layer.{global_layer_id}.latent_kv"
+        field = plan.field(field_id)
+        assert (
+            target_pool._field_block_byte_offset(field_id, 1),
+            field.payload_bytes,
+        ) in full_attention_segments
 
     target_layer = text_config.full_attention_layer_ids[0]
     target_before = target_pool.kv_buffer[target_layer].clone()
