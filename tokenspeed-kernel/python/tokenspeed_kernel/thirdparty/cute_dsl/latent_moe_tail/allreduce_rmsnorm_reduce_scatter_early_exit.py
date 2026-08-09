@@ -19,6 +19,7 @@ from cutlass import BFloat16, Float32, Int32, Int64, Uint32
 from .primitives import (
     NUM_LAMPORT_BUFFERS,
     PACKED_BYTES,
+    PDL_ENABLED,
     VEC_BF16,
     bf16x8_to_packed_u32x4,
     block_sum_specialized,
@@ -187,7 +188,7 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
             cluster=(1, self.cluster_ctas, 1),
             smem=(self.warps + self.cluster_ctas) * 4,
             stream=stream,
-            use_pdl=True,
+            use_pdl=PDL_ENABLED,
         )
 
     @cute.kernel

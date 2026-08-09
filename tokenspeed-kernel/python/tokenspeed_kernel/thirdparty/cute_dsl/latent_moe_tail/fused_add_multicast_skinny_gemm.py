@@ -15,6 +15,7 @@ from cutlass import BFloat16, Float32, Int64, const_expr
 from cutlass.cute.runtime import from_dlpack
 
 from .primitives import (
+    PDL_ENABLED,
     CUDAGraphCompatibleWrapper,
     bf16x2_to_u32,
     bf16x4_to_packed_u32x2,
@@ -120,7 +121,7 @@ class FusedAddMulticastSkinnyGemm:
             block=[self.block_size, 1, 1],
             smem=(self.num_rows * self.outputs_per_block * self.num_warps * 4),
             stream=stream,
-            use_pdl=True,
+            use_pdl=PDL_ENABLED,
             min_blocks_per_mp=1,
         )
 

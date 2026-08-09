@@ -14,6 +14,7 @@ import torch
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
 from .primitives import (
+    PDL_ENABLED,
     VEC_BF16,
     bf16x8_to_packed_u32x4,
     fragment_is_dirty,
@@ -55,7 +56,7 @@ class LamportCopy:
             grid=(self.ctas, 1, 1),
             block=(self.threads, 1, 1),
             stream=stream,
-            use_pdl=True,
+            use_pdl=PDL_ENABLED,
         )
 
     @cute.kernel

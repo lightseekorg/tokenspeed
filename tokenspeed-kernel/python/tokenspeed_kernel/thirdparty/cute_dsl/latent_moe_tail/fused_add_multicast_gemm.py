@@ -488,7 +488,7 @@ class FusedAddMulticastGemm:
             block=[self.threads_per_cta, 1, 1],
             cluster=(*self.cluster_shape_mn, 1),
             stream=stream,
-            use_pdl=True,
+            use_pdl=PDL_ENABLED,
         )
         return
 
