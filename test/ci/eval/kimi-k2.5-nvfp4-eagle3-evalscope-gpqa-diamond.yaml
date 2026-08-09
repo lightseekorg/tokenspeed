@@ -42,14 +42,20 @@ eval:
   install:
     - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
   command: >-
+    if [ "${TOKENSPEED_CI_FORK_PR:-false}" = "true" ];
+    then GPQA_DATASET_HUB=modelscope;
+    GPQA_DATASET_ARGS='{"gpqa_diamond":{"dataset_id":"AI-ModelScope/gpqa_diamond"}}';
+    else GPQA_DATASET_HUB=huggingface;
+    GPQA_DATASET_ARGS='{"gpqa_diamond":{"dataset_id":"Idavidrein/gpqa","subset_list":["gpqa_diamond"]}}';
+    fi;
     HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
     /tmp/evalscope-perf/bin/evalscope eval
     --model nvidia/Kimi-K2.5-NVFP4
     --api-url http://127.0.0.1:8000/v1
     --api-key EMPTY_TOKEN
     --datasets gpqa_diamond
-    --dataset-hub huggingface
-    --dataset-args '{"gpqa_diamond":{"dataset_id":"Idavidrein/gpqa","subset_list":["gpqa_diamond"]}}'
+    --dataset-hub "$GPQA_DATASET_HUB"
+    --dataset-args "$GPQA_DATASET_ARGS"
     --eval-batch-size 16
 report:
   github_step_summary: true
