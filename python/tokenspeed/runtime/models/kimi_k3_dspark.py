@@ -306,6 +306,18 @@ class K3DSparkModel(nn.Module):
             prefix=add_prefix("context_proj", prefix),
         )
         self.context_norm = RMSNorm(hidden_size, eps=eps)
+        # Drafts trained with ``fc_norm: true`` normalize each target tap on
+        # its own before the taps are concatenated and projected.
+        self.fc_norm = (
+            nn.ModuleList(
+                [
+                    RMSNorm(int(config.target_hidden_size), eps=eps)
+                    for _ in range(self.num_context_features)
+                ]
+            )
+            if bool(getattr(config, "fc_norm", False))
+            else None
+        )
 
         self.layers = nn.ModuleList(
             [
@@ -330,6 +342,22 @@ class K3DSparkModel(nn.Module):
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Concatenated target taps -> draft hidden space."""
+        if self.fc_norm is not None:
+            # Taps are concatenated in ascending target-layer order, which is
+            # the order ``fc_norm`` was trained in.
+            target_hidden = torch.cat(
+                [
+                    norm(chunk)
+                    for norm, chunk in zip(
+                        self.fc_norm,
+                        target_hidden.split(
+                            int(self.config.target_hidden_size), dim=-1
+                        ),
+                        strict=True,
+                    )
+                ],
+                dim=-1,
+            )
         return self.context_norm(self.context_proj(target_hidden)[0])
 
     def _finalize_hidden(

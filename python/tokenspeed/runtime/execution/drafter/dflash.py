@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -47,6 +48,21 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 
 logger = get_colorful_logger(__name__)
+
+
+AUX_HIDDEN_STREAM_ENV = "TOKENSPEED_DFLASH_AUX_STREAM"
+
+
+def _resolve_aux_hidden_stream(cfg) -> str:
+    """Which target residual stream this draft reads: config, env overrides."""
+    override = os.environ.get(AUX_HIDDEN_STREAM_ENV)
+    if override:
+        return override.strip().lower()
+    dflash_cfg = getattr(cfg, "dflash_config", {}) or {}
+    stream = dflash_cfg.get("aux_hidden_stream") or getattr(
+        cfg, "aux_hidden_stream", None
+    )
+    return str(stream or "prefix").lower()
 
 
 def _resolve_block_geometry(cfg, spec_num_tokens: int) -> tuple[int, int]:
@@ -245,6 +261,20 @@ class DFlash(BaseDrafter):
             incremental_callback=incr_callback,
             slot_bufs=incr_slot_bufs,
         )
+        self._wire_aux_hidden_stream(target_model)
+
+    def _wire_aux_hidden_stream(self, target_model) -> None:
+        """Tell the target which residual stream the draft was trained on."""
+        stream = _resolve_aux_hidden_stream(self.model.config)
+        setter = getattr(target_model, "set_dflash_aux_hidden_stream", None)
+        if setter is not None:
+            setter(stream)
+        elif stream != "prefix":
+            raise ValueError(
+                f"The draft asks for the {stream!r} target hidden stream but "
+                f"{type(target_model).__name__} does not implement "
+                "set_dflash_aux_hidden_stream, so it can only supply 'prefix'."
+            )
 
     def _greedy_gather_capacity(self) -> int:
         """Max element count for the greedy head's tensor-parallel all-gather
@@ -678,6 +708,14 @@ class DFlash(BaseDrafter):
         if not self._fused_kv_enabled:
             return
         if self._kv_aux_stream is None:
+            return
+        if getattr(self.draft_model_runner.model, "fc_norm", None) is not None:
+            # This path projects from pre-split ``fc`` columns instead of
+            # calling ``project_target_hidden``, so it would skip fc_norm.
+            logger.info(
+                "DFLASH incremental projection disabled: this draft normalizes "
+                "each target tap (fc_norm) before projecting."
+            )
             return
         try:
             fc = self.draft_model_runner.model.fc
