@@ -1222,7 +1222,7 @@ class KimiLinearMoE(nn.Module):
                     latent_size=self.routed_hidden,
                     rms_eps=self.routed_expert_norm.variance_epsilon,
                     device=torch.device("cuda", torch.cuda.current_device()),
-                    layer_id=layer_index,
+                    owner=prefix,
                 )
                 logger.info("multicast latent tail engaged")
 

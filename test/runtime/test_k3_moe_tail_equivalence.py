@@ -28,6 +28,14 @@ the decode path reaches MULTIMEM_AR. This file compares the tiers against each
 other directly on identical inputs, which is what makes a tier-specific
 numerical defect visible at all.
 
+The tiers are driven through ``KimiLinearMoE``'s own ``_tail_*`` methods, on an
+instance built by ``__new__`` with only the attributes those methods read. That
+matters: a test that re-derived norm+projection in torch would agree with
+itself no matter what ``routed_expert_norm``, ``kimi3_latent_projection_add3``,
+``kimi3_join_reduce_moe`` or the fused kernel's epilogue actually computed.
+Only ``mapping`` and ``execution_plan`` are stand-ins — they carry group and
+policy configuration, no arithmetic.
+
 The tolerance is deliberately loose, and not because any tier accumulates in
 bf16 — none does; every dot product runs in fp32. The paths differ in the
 order their collective sums the sixteen bf16 partials (in-switch ld_reduce vs
@@ -36,13 +44,15 @@ its GEMM result before adding the shared partial specifically so it matches
 the unfused chain's rounding. Bitwise agreement is therefore not expected;
 agreement within bf16 noise is.
 
-Normal one-GPU pytest runs skip this file. Exercise it with:
+``test_selector_boundaries`` is pure Python and runs in ordinary one-GPU CI.
+Everything else needs the collective; exercise it with:
 ``torchrun --standalone --nproc-per-node=8 -m pytest -q <this file>``.
 """
 
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -58,47 +68,107 @@ def _world_size() -> int:
     return int(os.environ.get("WORLD_SIZE", "1"))
 
 
-# 4 is included so a single node can cover the tiers; the fused tail itself
-# only supports 8 and 16 and skips itself below that.
-pytestmark = pytest.mark.skipif(
-    _world_size() not in {4, 8, 16},
-    reason="launch with torchrun world size 4, 8 or 16",
-)
-
-
 def _setup() -> tuple[int, torch.device]:
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager,
+    )
+
     if not dist.is_initialized():
         dist.init_process_group("nccl")
     local = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local)
+    # The runtime's collectives look groups up by rank tuple; serving registers
+    # them during distributed init, which this test does not run. Register the
+    # already-built world group rather than calling init_process_group: that
+    # would also build gloo groups, which this test never uses and which stall
+    # on a multi-node launch.
+    group = tuple(range(_world_size()))
+    if not process_group_manager.has_process_group("nccl", group):
+        process_group_manager.register_process_group("nccl", group, dist.group.WORLD)
     return dist.get_rank(), torch.device("cuda", local)
 
 
+def _agreed(ok: bool) -> bool:
+    """True only if every rank reports True — tiers must be entered together."""
+    flag = torch.tensor([int(ok)], dtype=torch.int32, device="cuda")
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    return bool(flag.item())
+
+
+def _build_moe(device: torch.device, *, latent_tail=None):
+    """A ``KimiLinearMoE`` carrying just what the tail methods touch.
+
+    Constructing the real module needs a config, loaded expert weights and a
+    parallel state this test has no use for, so the instance is built by
+    ``__new__`` and populated directly. The norm and projection are the
+    production modules with random weights; ``mapping`` and ``execution_plan``
+    are namespaces because the tail reads only group handles and policy flags
+    off them.
+    """
+    from tokenspeed.runtime.layers.layernorm import RMSNorm
+    from tokenspeed.runtime.layers.moe.latent import Kimi3LatentProjection
+    from tokenspeed.runtime.models.kimi_k3 import KimiLinearMoE
+
+    world = _world_size()
+    moe = object.__new__(KimiLinearMoE)
+    torch.nn.Module.__init__(moe)
+    moe.routed_hidden = L
+
+    with torch.device(device):
+        up_proj = Kimi3LatentProjection(L, H, params_dtype=torch.bfloat16)
+        # RMSNorm takes its dtype from the default; the checkpoint's is bf16,
+        # and its kernel rejects a weight that does not match the activation.
+        norm = RMSNorm(L, eps=EPS).to(torch.bfloat16)
+    # Weights are rank-identical: these are replicated in the model, and a
+    # per-rank difference here would show up as a tier disagreement.
+    gw = torch.Generator(device="cpu").manual_seed(7)
+    up_proj.weight.data.copy_((torch.randn(H, L, generator=gw) * 0.02).to(device))
+    norm.weight.data.copy_((torch.randn(L, generator=gw) * 0.1).to(device))
+    moe.routed_expert_up_proj = up_proj
+    moe.routed_expert_norm = norm
+
+    moe.mapping = SimpleNamespace(
+        moe=SimpleNamespace(
+            # tokenspeed groups are tuples of global ranks, not ProcessGroups.
+            tp_ep_group=tuple(range(world)),
+            tp_ep_size=world,
+            has_tp_ep=world > 1,
+        )
+    )
+    moe.execution_plan = SimpleNamespace(
+        fused_moe_ar=True,
+        lane_latent_norm_ar=False,
+        comm_fusion_max_num_tokens=8192,
+    )
+    moe._latent_tail = latent_tail
+    moe._multimem_ar_ok = True
+    return moe
+
+
 def _inputs(rank: int, device: torch.device, m: int, seed: int):
-    """Per-rank partials plus rank-identical weights and residual stream."""
+    """Per-rank partials plus the rank-identical residual stream."""
     g = torch.Generator(device="cpu").manual_seed(seed + rank)
     routed = (torch.randn(m, L, generator=g) * 0.1).to(device, torch.bfloat16)
     shared = (torch.randn(m, H, generator=g) * 0.1).to(device, torch.bfloat16)
     gw = torch.Generator(device="cpu").manual_seed(seed)
-    rms_w = (torch.randn(L, generator=gw) * 0.1).to(device, torch.bfloat16)
-    up_w = (torch.randn(H, L, generator=gw) * 0.02).to(device, torch.bfloat16)
     prefix = (torch.randn(m, H, generator=gw) * 0.1).to(device, torch.bfloat16)
-    return routed, shared, rms_w, up_w, prefix
+    return routed, shared, prefix
 
 
-def _reference(routed, shared, rms_w, up_w, prefix):
+def _reference(moe, routed, shared, prefix):
     """All-reduce both partials, RMS-norm the latent, up-project, accumulate.
 
-    Computed in fp32 so it is a fixed target for every tier rather than one
-    tier's arithmetic standing in for the truth.
+    Computed in fp32 from the same weights the tiers use, so it is a fixed
+    target rather than one tier's arithmetic standing in for the truth.
     """
     routed_sum = routed.float().clone()
     shared_sum = shared.float().clone()
     dist.all_reduce(routed_sum)
     dist.all_reduce(shared_sum)
     var = routed_sum.pow(2).mean(dim=-1, keepdim=True)
-    normed = routed_sum * torch.rsqrt(var + EPS) * rms_w.float()
-    return prefix.float() + normed @ up_w.float().T + shared_sum
+    normed = routed_sum * torch.rsqrt(var + EPS) * moe.routed_expert_norm.weight.float()
+    up_w = moe.routed_expert_up_proj.weight.float()
+    return prefix.float() + normed @ up_w.T + shared_sum
 
 
 def _rel_err(out: torch.Tensor, ref: torch.Tensor) -> float:
@@ -106,6 +176,58 @@ def _rel_err(out: torch.Tensor, ref: torch.Tensor) -> float:
     return (out.float() - ref).abs().max().item() / max(scale, 1e-6)
 
 
+def _run_separate_reduce(moe, routed, shared, prefix, m):
+    # The fork scope reduces and projects the routed side before the tier
+    # method sees it; serving does that on a side stream, order unchanged.
+    routed_proj = moe._reduce_project_routed(routed)
+    return moe._tail_separate_reduce(routed_proj, shared, prefix, m, H)
+
+
+def test_selector_boundaries():
+    """The tier map itself, with no GPU or collective involved."""
+    from tokenspeed.runtime.layers.moe.latent import (
+        K3MoETailTier,
+        select_k3_moe_tail_tier,
+    )
+
+    def pick(num_tokens, *, graph_phase=True, fused_max=16, fused_ar=True, mm=True):
+        return select_k3_moe_tail_tier(
+            num_tokens=num_tokens,
+            graph_phase=graph_phase,
+            tail_fusion_max_tokens=fused_max,
+            fused_moe_ar=fused_ar,
+            multimem_ok=mm,
+        )
+
+    assert pick(1) is K3MoETailTier.TAIL_FUSION
+    assert pick(16) is K3MoETailTier.TAIL_FUSION
+    # One past capacity must leave the fused tail rather than truncate.
+    assert pick(17) is not K3MoETailTier.TAIL_FUSION
+    # Outside the graph phase the fused tail is unreachable at any size.
+    assert pick(1, graph_phase=False) is not K3MoETailTier.TAIL_FUSION
+    # No fused tail compiled: capacity is 0 and the join tier takes decode.
+    assert pick(1, fused_max=0) is K3MoETailTier.FUSED_LANE_AR
+    assert pick(256) is K3MoETailTier.MULTIMEM_AR
+    assert pick(8192) is K3MoETailTier.MULTIMEM_AR
+    assert pick(8193) is not K3MoETailTier.MULTIMEM_AR
+    assert pick(256, mm=False) is K3MoETailTier.FUSED_LANE_AR
+    # fused_moe_ar reports the trtllm AR lane, which only the join tier uses.
+    # The fused tail owns its own multicast collective, so it outranks the
+    # flag rather than being gated by it; every other size falls to portable.
+    assert pick(1, fused_ar=False) is K3MoETailTier.TAIL_FUSION
+    for n in (17, 64, 256, 100_000):
+        assert pick(n, fused_ar=False) is K3MoETailTier.SEPARATE_REDUCE
+
+
+# 4 is included so a single node can cover the tiers; the fused tail itself
+# only supports 8 and 16 and skips itself below that.
+collective = pytest.mark.skipif(
+    _world_size() not in {4, 8, 16},
+    reason="launch with torchrun world size 4, 8 or 16",
+)
+
+
+@collective
 @pytest.mark.parametrize("m", [1, 4, 16])
 def test_fused_tail_matches_reference(m):
     """TAIL_FUSION: the decode tier, the only one with a fused kernel."""
@@ -115,62 +237,65 @@ def test_fused_tail_matches_reference(m):
     )
 
     rank, dev = _setup()
-    ok = latent_tail_supported(
-        tp_size=_world_size(), hidden_size=H, latent_size=L, dtype=torch.bfloat16
-    )
-    flag = torch.tensor([int(ok)], dtype=torch.int32, device="cuda")
-    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
-    if not bool(flag.item()):
+    if not _agreed(
+        latent_tail_supported(
+            tp_size=_world_size(), hidden_size=H, latent_size=L, dtype=torch.bfloat16
+        )
+    ):
         pytest.skip("fused latent tail unsupported here")
 
-    op = KimiK3LatentTailOp.initialize(
+    tail = KimiK3LatentTailOp.initialize(
         group=dist.group.WORLD,
         hidden_size=H,
         latent_size=L,
         rms_eps=EPS,
         device=dev,
-        layer_id=0,
+        owner="test.tail_fusion",
     )
-    routed, shared, rms_w, up_w, prefix = _inputs(rank, dev, m, seed=11)
-    ref = _reference(routed, shared, rms_w, up_w, prefix)
-    out = op(routed, shared, rms_w, up_w, prefix=prefix)
+    moe = _build_moe(dev, latent_tail=tail)
+    routed, shared, prefix = _inputs(rank, dev, m, seed=11)
+    ref = _reference(moe, routed, shared, prefix)
+    out = moe._tail_fusion(routed, shared, prefix)
     torch.cuda.synchronize()
     assert _rel_err(out, ref) < 0.05
 
 
+@collective
 @pytest.mark.parametrize("m", [256, 1024])
 def test_multimem_ar_matches_reference(m):
     """MULTIMEM_AR: in-switch staged reduces, then the replicated projection."""
-    from tokenspeed_kernel.ops.communication.multimem import (
-        multimem_all_reduce_staged,
-        multimem_available,
-        multimem_stage,
-    )
+    from tokenspeed_kernel.ops.communication.multimem import multimem_available
 
     rank, dev = _setup()
-    ok = multimem_available()
-    flag = torch.tensor([int(ok)], dtype=torch.int32, device="cuda")
-    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
-    if not bool(flag.item()):
+    if not _agreed(multimem_available()):
         pytest.skip("multimem unavailable here")
 
-    routed, shared, rms_w, up_w, prefix = _inputs(rank, dev, m, seed=22)
-    ref = _reference(routed, shared, rms_w, up_w, prefix)
-
-    group_name = dist.group.WORLD.group_name
-    routed_stage = multimem_stage(routed, group_name, m)
-    shared_stage = multimem_stage(shared, group_name, m)
-    assert routed_stage is not None and shared_stage is not None
-    routed_red = multimem_all_reduce_staged(routed_stage, group_name)
-    shared_red = multimem_all_reduce_staged(shared_stage, group_name)
-
-    var = routed_red.float().pow(2).mean(dim=-1, keepdim=True)
-    normed = routed_red.float() * torch.rsqrt(var + EPS) * rms_w.float()
-    out = prefix.float() + normed @ up_w.float().T + shared_red.float()
+    moe = _build_moe(dev)
+    routed, shared, prefix = _inputs(rank, dev, m, seed=22)
+    ref = _reference(moe, routed, shared, prefix)
+    out = moe._tail_multimem_ar(routed, shared, prefix, m, H)
     torch.cuda.synchronize()
     assert _rel_err(out, ref) < 0.05
 
 
+@collective
+@pytest.mark.parametrize("m", [1, MID_TOKENS, 1024])
+def test_fused_lane_ar_matches_reference(m):
+    """FUSED_LANE_AR: the join tier, reached by eager serving at every size.
+
+    Driven without a lane buffer — the lane only materializes at bs==1 inside
+    a captured graph, and the join's no-lane path is what eager traffic takes.
+    """
+    rank, dev = _setup()
+    moe = _build_moe(dev)
+    routed, shared, prefix = _inputs(rank, dev, m, seed=55)
+    ref = _reference(moe, routed, shared, prefix)
+    out = moe._tail_fused_lane_ar(routed, shared, prefix, None, m, H)
+    torch.cuda.synchronize()
+    assert _rel_err(out, ref) < 0.05
+
+
+@collective
 @pytest.mark.parametrize("m", [1, MID_TOKENS, 1024])
 def test_separate_reduce_matches_reference(m):
     """SEPARATE_REDUCE: the portable tier, reached whenever fused AR is off.
@@ -178,64 +303,67 @@ def test_separate_reduce_matches_reference(m):
     No end-to-end eval in this repo selects it, so this is its only coverage.
     """
     rank, dev = _setup()
-    routed, shared, rms_w, up_w, prefix = _inputs(rank, dev, m, seed=33)
-    ref = _reference(routed, shared, rms_w, up_w, prefix)
-
-    routed_red = routed.clone()
-    shared_red = shared.clone()
-    dist.all_reduce(routed_red)
-    dist.all_reduce(shared_red)
-    var = routed_red.float().pow(2).mean(dim=-1, keepdim=True)
-    normed = routed_red.float() * torch.rsqrt(var + EPS) * rms_w.float()
-    out = prefix.float() + normed @ up_w.float().T + shared_red.float()
+    moe = _build_moe(dev)
+    routed, shared, prefix = _inputs(rank, dev, m, seed=33)
+    ref = _reference(moe, routed, shared, prefix)
+    out = _run_separate_reduce(moe, routed, shared, prefix, m)
     torch.cuda.synchronize()
     assert _rel_err(out, ref) < 0.05
 
 
+@collective
 def test_tiers_agree_with_each_other():
     """The property that matters in serving: same input, same answer.
 
     A tier that is individually within tolerance of the reference can still
     sit on the opposite edge from another tier, and a request's tier depends
-    on batch size — so agreement between tiers is checked directly.
+    on batch size — so agreement between tiers is checked directly, at one
+    token count, with the selector's capacity rules bypassed.
     """
-    from tokenspeed_kernel.ops.communication.multimem import (
-        multimem_all_reduce_staged,
-        multimem_available,
-        multimem_stage,
+    from tokenspeed_kernel.ops.communication.multimem import multimem_available
+    from tokenspeed_kernel.ops.moe.latent_tail import (
+        KimiK3LatentTailOp,
+        latent_tail_supported,
     )
 
     rank, dev = _setup()
-    ok = multimem_available()
-    flag = torch.tensor([int(ok)], dtype=torch.int32, device="cuda")
-    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
-    if not bool(flag.item()):
-        pytest.skip("multimem unavailable here")
+    m = 16  # the fused tail's capacity ceiling; every other tier accepts it
 
-    m = 512  # inside the multimem window, above the fused tail's capacity
-    routed, shared, rms_w, up_w, prefix = _inputs(rank, dev, m, seed=44)
+    tail = None
+    if _agreed(
+        latent_tail_supported(
+            tp_size=_world_size(), hidden_size=H, latent_size=L, dtype=torch.bfloat16
+        )
+    ):
+        tail = KimiK3LatentTailOp.initialize(
+            group=dist.group.WORLD,
+            hidden_size=H,
+            latent_size=L,
+            rms_eps=EPS,
+            device=dev,
+            # A mailbox of its own; the name above owns the other one.
+            owner="test.tiers_agree",
+        )
+    moe = _build_moe(dev, latent_tail=tail)
+    routed, shared, prefix = _inputs(rank, dev, m, seed=44)
 
-    def project(routed_red, shared_red):
-        var = routed_red.float().pow(2).mean(dim=-1, keepdim=True)
-        normed = routed_red.float() * torch.rsqrt(var + EPS) * rms_w.float()
-        return prefix.float() + normed @ up_w.float().T + shared_red.float()
+    # Every tier reduces its partials in place, so each gets its own copies;
+    # feeding one tier the tensors a previous tier already reduced compares
+    # a single-reduced result against a twice-reduced one.
+    def fresh():
+        return routed.clone(), shared.clone(), prefix.clone()
 
-    nccl_r, nccl_s = routed.clone(), shared.clone()
-    dist.all_reduce(nccl_r)
-    dist.all_reduce(nccl_s)
-    separate = project(nccl_r, nccl_s)
-
-    mm_r = multimem_all_reduce_staged(
-        multimem_stage(routed, dist.group.WORLD.group_name, m),
-        dist.group.WORLD.group_name,
-    )
-    mm_s = multimem_all_reduce_staged(
-        multimem_stage(shared, dist.group.WORLD.group_name, m),
-        dist.group.WORLD.group_name,
-    )
-    multimem = project(mm_r, mm_s)
-
+    outs = {"separate_reduce": _run_separate_reduce(moe, *fresh(), m)}
+    r, s, p = fresh()
+    outs["fused_lane_ar"] = moe._tail_fused_lane_ar(r, s, p, None, m, H)
+    if _agreed(multimem_available()):
+        outs["multimem_ar"] = moe._tail_multimem_ar(*fresh(), m, H)
+    if tail is not None:
+        outs["tail_fusion"] = moe._tail_fusion(*fresh())
     torch.cuda.synchronize()
-    scale = separate.abs().max().item()
-    diff = (multimem - separate).abs().max().item() / max(scale, 1e-6)
-    assert diff < 0.02, f"multimem and separate-reduce disagree by {diff}"
+
+    base_name, base = next(iter(outs.items()))
+    scale = base.float().abs().max().item()
+    for name, out in outs.items():
+        diff = (out.float() - base.float()).abs().max().item() / max(scale, 1e-6)
+        assert diff < 0.02, f"{name} and {base_name} disagree by {diff}"

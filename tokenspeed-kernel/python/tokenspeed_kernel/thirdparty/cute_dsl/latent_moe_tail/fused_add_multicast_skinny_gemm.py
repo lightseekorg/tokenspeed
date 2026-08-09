@@ -74,6 +74,10 @@ class FusedAddMulticastSkinnyGemm:
         hidden_dim: int,
         config: SkinnyConfig,
     ) -> None:
+        # Bound here, in host Python: the JIT resolves names off self,
+        # not module globals, so reading the constant at the launch
+        # site itself fails to compile.
+        self.use_pdl = PDL_ENABLED
         if config.block_size % 32:
             raise ValueError("skinny block_size must be a multiple of 32")
         self.num_rows = num_rows
@@ -121,7 +125,7 @@ class FusedAddMulticastSkinnyGemm:
             block=[self.block_size, 1, 1],
             smem=(self.num_rows * self.outputs_per_block * self.num_warps * 4),
             stream=stream,
-            use_pdl=PDL_ENABLED,
+            use_pdl=self.use_pdl,
             min_blocks_per_mp=1,
         )
 

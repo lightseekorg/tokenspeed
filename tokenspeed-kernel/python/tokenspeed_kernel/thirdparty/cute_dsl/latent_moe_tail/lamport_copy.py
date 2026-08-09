@@ -38,6 +38,10 @@ class LamportCopy:
     def __init__(
         self, hidden_dim: int, ctas: int, threads: int, has_residual: bool = False
     ):
+        # Bound here, in host Python: the JIT resolves names off self,
+        # not module globals, so reading the constant at the launch
+        # site itself fails to compile.
+        self.use_pdl = PDL_ENABLED
         self.hidden_dim = hidden_dim
         self.ctas = ctas
         self.threads = threads
@@ -56,7 +60,7 @@ class LamportCopy:
             grid=(self.ctas, 1, 1),
             block=(self.threads, 1, 1),
             stream=stream,
-            use_pdl=PDL_ENABLED,
+            use_pdl=self.use_pdl,
         )
 
     @cute.kernel

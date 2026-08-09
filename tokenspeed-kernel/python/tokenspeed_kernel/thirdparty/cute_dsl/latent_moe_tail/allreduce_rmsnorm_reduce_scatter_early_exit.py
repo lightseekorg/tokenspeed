@@ -106,6 +106,10 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
         include_reduce_scatter: bool = True,
         include_routed: bool = True,
     ):
+        # Bound here, in host Python: the JIT resolves names off self,
+        # not module globals, so reading the constant at the launch
+        # site itself fails to compile.
+        self.use_pdl = PDL_ENABLED
         validate_shape(
             tp_size=tp_size,
             latent_dim=latent_dim,
@@ -188,7 +192,7 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
             cluster=(1, self.cluster_ctas, 1),
             smem=(self.warps + self.cluster_ctas) * 4,
             stream=stream,
-            use_pdl=PDL_ENABLED,
+            use_pdl=self.use_pdl,
         )
 
     @cute.kernel

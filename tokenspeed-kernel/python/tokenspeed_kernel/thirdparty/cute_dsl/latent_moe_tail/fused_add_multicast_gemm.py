@@ -55,7 +55,7 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from .fused_add_multicast_skinny_gemm import (
     FusedAddMulticastSkinnyGemmKernel,
 )
-from .primitives import CUDAGraphCompatibleWrapper
+from .primitives import PDL_ENABLED, CUDAGraphCompatibleWrapper
 
 
 def _as_cute(tensor: torch.Tensor, *, dynamic_m: bool = False):
@@ -294,6 +294,10 @@ class FusedAddMulticastGemm:
         cluster_shape_mn: tuple[int, int],
         b_prime_stages: int = 2,
     ):
+        # Bound here, in host Python: the JIT resolves names off self,
+        # not module globals, so reading the constant at the launch
+        # site itself fails to compile.
+        self.use_pdl = PDL_ENABLED
         self.acc_dtype = cutlass.Float32
         self.cluster_shape_mn = cluster_shape_mn
         self.mma_tiler = (*mma_tiler_mn, 1)
@@ -488,7 +492,7 @@ class FusedAddMulticastGemm:
             block=[self.threads_per_cta, 1, 1],
             cluster=(*self.cluster_shape_mn, 1),
             stream=stream,
-            use_pdl=PDL_ENABLED,
+            use_pdl=self.use_pdl,
         )
         return
 

@@ -102,17 +102,20 @@ class _Contract:
     hidden_size: int
     latent_size: int
     rms_eps: float
-    # Layers must not share a mailbox: the gather releases its same-stream
-    # dependents before it rewrites sentinels, so the next layer's multicast
-    # shard can land in storage the previous layer is still clearing. Within a
-    # layer the next collective's completion-scoped wait orders the two; across
-    # layers that edge runs through every kernel in between and is not
-    # guaranteed. Keying on the layer keeps one mailbox per layer.
-    layer_id: int
+    # Callers must not share a mailbox: the gather releases its same-stream
+    # dependents before it rewrites sentinels, so the next caller's multicast
+    # shard can land in storage the previous one is still clearing. Within a
+    # caller the next collective's completion-scoped wait orders the two;
+    # across callers that edge runs through every kernel in between and is not
+    # guaranteed. The owner string is the module's prefix rather than a layer
+    # index because a draft model repeats the base model's indices -- keying on
+    # the index alone would hand the speculative layer the base layer's
+    # mailbox.
+    owner: str
 
 
 class KimiK3LatentTailOp:
-    """Multicast tail for one model layer; one instance (and mailbox) each.
+    """Multicast tail for one calling module; one instance (and mailbox) each.
 
     Construction performs a collective symmetric-memory rendezvous — every
     rank in ``group`` must construct with identical arguments in lockstep
@@ -130,9 +133,9 @@ class KimiK3LatentTailOp:
         latent_size: int,
         rms_eps: float,
         device: torch.device,
-        layer_id: int,
+        owner: str,
     ) -> "KimiK3LatentTailOp":
-        """Return this layer's tail op, constructing it on first use.
+        """Return this caller's tail op, constructing it on first use.
 
         Args:
             group: Process group every rank constructs with, in lockstep.
@@ -140,8 +143,9 @@ class KimiK3LatentTailOp:
             latent_size: Routed-expert latent width.
             rms_eps: Epsilon of the routed-expert RMS norm.
             device: CUDA device owning the mailbox.
-            layer_id: Model layer index; part of the key so each layer gets
-                its own mailbox.
+            owner: Globally unique name for the calling module (its weight
+                prefix); part of the key so each caller gets its own mailbox.
+                Must be rank-identical -- it takes part in the rendezvous.
         """
         contract = _Contract(
             group_id=id(group),
@@ -150,7 +154,7 @@ class KimiK3LatentTailOp:
             hidden_size=hidden_size,
             latent_size=latent_size,
             rms_eps=float(rms_eps),
-            layer_id=layer_id,
+            owner=owner,
         )
         op = cls._instances.get(contract)
         if op is None:
