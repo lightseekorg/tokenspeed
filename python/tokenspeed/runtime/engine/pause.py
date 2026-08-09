@@ -58,15 +58,17 @@ from tokenspeed.runtime.engine.io_struct import (
 class _PendingDrain:
     """A deferred action resolved when the scheduler drains.
 
-    ``on_drained`` runs once ``scheduler_drained`` is true: it sends the success
-    reply and, for a memory release, frees GPU memory. ``on_cancelled`` runs if a
-    resume arrives before the drain completes: it sends the failure reply to the
-    correct communicator (pause vs release use different ZMQ channels, so the
-    action carries its own reply rather than the controller hard-coding one).
+    ``on_drained`` runs once ``scheduler_drained`` is true and ``ready`` (when
+    provided) succeeds: it sends the success reply and, for a memory release,
+    frees GPU memory. ``on_cancelled`` runs if a resume arrives before the drain
+    completes: it sends the failure reply to the correct communicator (pause vs
+    release use different ZMQ channels, so the action carries its own reply
+    rather than the controller hard-coding one).
     """
 
     on_drained: Callable[[], None]
     on_cancelled: Callable[[], None]
+    ready: Callable[[], bool] | None = None
 
 
 class PauseState(enum.IntEnum):
@@ -186,16 +188,22 @@ class PauseController:
         abort_inflight: bool,
         on_drained: Callable[[], None],
         on_cancelled: Callable[[], None],
+        ready: Callable[[], bool] | None = None,
     ) -> bool:
         """Start a wait-style drain (PAUSED_NEW, cancel grammar-queued) and arm a
         post-drain action. Returns False if a drain is already pending (the
         caller should send its own busy reply). ``abort_inflight=True`` also
         cancels in-flight requests (abort mode); False lets them finish (wait
-        mode / memory release)."""
+        mode / memory release). An optional ``ready`` gate can keep a drained
+        action pending while an asynchronous prerequisite completes."""
         if self._pending_drain is not None:
             return False
         self.state = PauseState.PAUSED_NEW
-        self._pending_drain = _PendingDrain(on_drained, on_cancelled)
+        self._pending_drain = _PendingDrain(
+            on_drained=on_drained,
+            on_cancelled=on_cancelled,
+            ready=ready,
+        )
         self._cancel_grammar_pending = True
         if abort_inflight:
             self._abort_all_pending = True
@@ -306,5 +314,7 @@ class PauseController:
         if not scheduler_drained(scheduler):
             return
         action = self._pending_drain
+        if action.ready is not None and not action.ready():
+            return
         self._pending_drain = None
         action.on_drained()

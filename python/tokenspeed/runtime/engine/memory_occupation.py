@@ -70,7 +70,7 @@ class MemoryOccupationController:
         pause_controller: PauseController,
         adapter,
         enabled: bool,
-        reset_caches_fn: Callable[[], None],
+        reset_caches_fn: Callable[[], bool],
         kv_repair_fn: Callable[[], None],
         kv_cache_release_allowed: bool = True,
     ) -> None:
@@ -120,16 +120,16 @@ class MemoryOccupationController:
             return
         # Defer the actual free until the scheduler drains. wait-mode: let
         # in-flight requests finish (the RL rollout is idle between steps).
+        # A post-finish L2 transfer can outlive the request; keep the release
+        # pending until ClearL1Cache can atomically invalidate its cache refs.
         self._pause.request_drain(
             abort_inflight=False,
             on_drained=lambda: self._finish_release(tags),
             on_cancelled=lambda: self._fail_release("resumed before release drained"),
+            ready=self._reset_caches if "kv_cache" in tags else None,
         )
 
     def _finish_release(self, tags: list[str]) -> None:
-        if "kv_cache" in tags:
-            # KV is discarded; any prefix-cache entry pointing at it is stale.
-            self._reset_caches()
         for tag in tags:
             self._adapter.pause(tag=tag)
             self.released_tags.add(tag)

@@ -1495,18 +1495,19 @@ class EventLoop:
     # Pause / resume helpers
     # ------------------------------------------------------------------
 
-    def _reset_caches_for_release(self) -> None:
+    def _reset_caches_for_release(self) -> bool:
         """Invalidate the prefix/single-table cache before KV is discarded on release.
 
         KV pages are re-mapped + zeroed on wake, so any retained prefix entry
         would be stale. The unsafe case (prefix caching on with no reset) is
         rejected up front in ``MemoryOccupationController.handle_release`` via
         ``kv_cache_release_allowed``, so by the time we get here either a clear
-        exists or prefix caching is off (nothing to invalidate).
+        exists or prefix caching is off (nothing to invalidate). Returns False
+        while an asynchronous cache transfer still pins L1 so the release can
+        remain pending and retry on the next event-loop iteration.
         """
         clear = getattr(self.scheduler, "clear_l1_cache", None)
-        if callable(clear) and not clear():
-            raise RuntimeError("L1 cache is still in use after scheduler drain")
+        return not callable(clear) or clear()
 
     def _kv_pools(self) -> list:
         """All KV pools whose pages are tagged ``kv_cache`` — the target pool and
