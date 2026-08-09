@@ -96,6 +96,35 @@ bool KvCacheCoordinator::ClearDeviceCache() {
     return true;
 }
 
+bool KvCacheCoordinator::ClearCache() {
+    if (host_pool_ == nullptr) {
+        return ClearDeviceCache();
+    }
+
+    std::vector<std::pair<std::uint32_t, CacheBlockLocation>> host_locations;
+    for (const CacheGroup& group : groups_) {
+        const KvCacheManager& manager = group.Manager();
+        std::vector<CacheBlockLocation> group_locations = manager.EvictableBlockLocations(*host_pool_);
+        if (static_cast<std::int32_t>(group_locations.size()) != manager.NumCachedBlocks(*host_pool_)) {
+            return false;
+        }
+        for (CacheBlockLocation location : group_locations) {
+            host_locations.emplace_back(group.Id(), location);
+        }
+    }
+
+    // ClearDeviceCache performs its complete pin check before mutation. Since
+    // Host was checked above, a false return leaves both tiers unchanged.
+    if (!ClearDeviceCache()) {
+        return false;
+    }
+    for (const auto& [group_id, location] : host_locations) {
+        _assert(groups_[group_id].Manager().EvictCachedBlock(*host_pool_, location).has_value(),
+                "clearable Host cache entry disappeared");
+    }
+    return true;
+}
+
 std::vector<CacheKey> KvCacheCoordinator::keysForGroup(std::span<const std::string> content_hashes,
                                                        std::uint32_t group_id) const {
     _assert(group_id < groups_.size(), "cache key group id out of range");

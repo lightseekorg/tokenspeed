@@ -110,7 +110,7 @@ class RequestHandler:
         recv_func,
         send_func,
         get_load_fn=None,
-        clear_l1_cache_fn=None,
+        clear_cache_fn=None,
         architectures: list[str] | None = None,
         pause_controller=None,
         memory_controller=None,
@@ -142,7 +142,7 @@ class RequestHandler:
         self.max_req_len = max_req_len
         self.vocab_size = vocab_size
         self.get_load_fn = get_load_fn
-        self.clear_l1_cache_fn = clear_l1_cache_fn
+        self.clear_cache_fn = clear_cache_fn
 
         self.tokenizer = get_tokenizer(
             server_args.tokenizer,
@@ -212,9 +212,7 @@ class RequestHandler:
                 logger.debug("AbortReq for rid=%s", recv_req.rid)
                 abort_rids.append(recv_req.rid)
             elif isinstance(recv_req, FlushCacheReqInput):
-                success = (
-                    self.clear_l1_cache_fn is not None and self.clear_l1_cache_fn()
-                )
+                success = self.clear_cache_fn is not None and self.clear_cache_fn()
                 self.send_func.send_pyobj(FlushCacheReqOutput(success=success))
             elif isinstance(recv_req, PauseSchedulerReqInput):
                 # State change + reply (abort/wait replies are deferred by the

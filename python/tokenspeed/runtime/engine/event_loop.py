@@ -519,7 +519,7 @@ class EventLoop:
             recv_func=self.recv_from_tokenizer,
             send_func=self.send_to_tokenizer,
             get_load_fn=self._get_load,
-            clear_l1_cache_fn=self.scheduler.clear_l1_cache,
+            clear_cache_fn=self.scheduler.clear_cache,
             architectures=self.model_config.hf_config.architectures,
             pause_controller=self._pause,
             memory_controller=self._memory,

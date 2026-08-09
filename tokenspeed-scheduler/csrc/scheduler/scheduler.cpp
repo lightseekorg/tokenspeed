@@ -217,6 +217,14 @@ std::vector<KvCacheEvent> Scheduler::DrainKvEvents() {
 }
 
 bool Scheduler::ClearL1Cache() {
+    return clearCache(false);
+}
+
+bool Scheduler::ClearCache() {
+    return clearCache(true);
+}
+
+bool Scheduler::clearCache(bool include_host) {
     const bool has_live_request =
         std::ranges::any_of(requests_, [](const auto& item) { return !item.second->template Is<fsm::Finished>(); });
     const bool has_pending_forward_results = !pending_forward_results_.empty();
@@ -229,11 +237,12 @@ bool Scheduler::ClearL1Cache() {
             has_live_request, has_pending_forward_results, has_pd_transfers, has_tier_transfers);
         return false;
     }
-    if (!coordinator_.ClearDeviceCache()) {
-        spdlog::info("[Scheduler] flush L1 cache rejected: cached blocks are still pinned");
+    const bool cleared = include_host ? coordinator_.ClearCache() : coordinator_.ClearDeviceCache();
+    if (!cleared) {
+        spdlog::info("[Scheduler] flush {}cache rejected: cached blocks are still pinned", include_host ? "" : "L1 ");
         return false;
     }
-    spdlog::info("[Scheduler] flush L1 cache completed");
+    spdlog::info("[Scheduler] flush {}cache completed", include_host ? "" : "L1 ");
     return true;
 }
 

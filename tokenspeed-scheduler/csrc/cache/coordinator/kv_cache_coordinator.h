@@ -129,6 +129,9 @@ public:
     // Clears only the Device prefix index. Returns false without mutation when
     // any cached block still has an owner outside its Manager.
     bool ClearDeviceCache();
+    // Clears both Device and Host prefix indexes. Returns false without
+    // mutation when either tier still has a pinned cached block.
+    bool ClearCache();
 
     struct StoreCandidate {
         CacheKey key;

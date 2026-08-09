@@ -59,6 +59,9 @@ public:
     // Testing/control-plane operation. A successful return means the complete
     // Device L1 prefix cache was removed; Host L2 is never touched.
     bool ClearL1Cache();
+    // Public flush operation. A successful return means both Device L1 and
+    // Host L2 prefix indexes were removed.
+    bool ClearCache();
 
     std::size_t WaitingSize() const;
     std::size_t DecodingSize() const;
@@ -81,6 +84,7 @@ public:
     std::int32_t HostPoolPinnedBlocks() const { return coordinator_.NumPinnedHostCachedBlocks(); }
 
 private:
+    bool clearCache(bool include_host);
     struct AdmissionMatch {
         KvCacheCoordinator::PrefixProbe probe;
         std::vector<std::string> candidate_page_hashes;

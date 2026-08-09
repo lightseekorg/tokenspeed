@@ -438,6 +438,25 @@ TEST(KvCacheCoordinatorTest, ClearDeviceCacheLeavesHostCacheUntouched) {
     EXPECT_EQ(host_pool.NumEmptyLcmBlocks(), 3);
 }
 
+TEST(KvCacheCoordinatorTest, ClearCacheRemovesDeviceAndHostEntries) {
+    BlockPool device_pool(4);
+    BlockPool host_pool(4);
+    const std::vector<KvCacheSpec> specs = {
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1}};
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, /*cache_block_tokens=*/4, device_pool, &host_pool);
+    const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}});
+
+    CacheForGroup(coordinator, device_pool, hashes[0], /*group_id=*/0);
+    CacheForGroup(coordinator, host_pool, hashes[0], /*group_id=*/0);
+
+    ASSERT_TRUE(coordinator.ClearCache());
+    const KvCacheCoordinator::PrefixProbe probe = coordinator.ProbePrefix(hashes);
+    EXPECT_EQ(probe.device.num_common_tokens, 0);
+    EXPECT_EQ(probe.host.num_common_tokens, 0);
+    EXPECT_EQ(device_pool.NumEmptyLcmBlocks(), 4);
+    EXPECT_EQ(host_pool.NumEmptyLcmBlocks(), 4);
+}
+
 TEST(KvCacheCoordinatorTest, ClearDeviceCacheRejectsPinnedEntryWithoutPartialMutation) {
     BlockPool pool(4);
     const std::vector<KvCacheSpec> specs = {
