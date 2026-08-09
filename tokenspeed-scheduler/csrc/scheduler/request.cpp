@@ -22,6 +22,8 @@
 
 #include <stdexcept>
 
+#include "fsm/forward_events.h"
+
 namespace tokenspeed {
 
 Request::Request(const RequestSpec& spec, std::int32_t page_size, Role role)

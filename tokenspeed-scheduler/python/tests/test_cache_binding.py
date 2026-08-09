@@ -48,19 +48,18 @@ def test_removed_storage_cache_api_is_not_exported():
 
 def test_cache_event_fields_are_bound():
     write_back = Cache.WriteBackDoneEvent()
-    write_back.success = True
-    assert write_back.success is True
+    write_back.op_id = 7
+    assert write_back.op_id == 7
 
     load_back = Cache.LoadBackDoneEvent()
-    load_back.success = True
-    assert load_back.success is True
+    load_back.op_id = 8
+    assert load_back.op_id == 8
 
 
 def test_execution_event_accepts_cache_events():
     execution_event = ExecutionEvent()
 
     write_back = Cache.WriteBackDoneEvent()
-    write_back.success = True
     assert execution_event.add_event(write_back) is execution_event
 
     load_back = Cache.LoadBackDoneEvent()

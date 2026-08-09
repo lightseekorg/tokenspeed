@@ -18,12 +18,12 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#include "cache/cache_block_ref.h"
+#include "cache/core/cache_block_ref.h"
 
 #include <limits>
 #include <utility>
 
-#include "cache/block_pool.h"
+#include "cache/core/block_pool.h"
 #include "utils.h"
 
 namespace tokenspeed {

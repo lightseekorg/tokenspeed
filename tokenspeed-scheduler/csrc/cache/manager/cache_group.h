@@ -21,19 +21,31 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 
-#include "cache/swa_manager.h"
+#include "cache/core/cache_types.h"
+#include "cache/manager/kv_cache_manager.h"
 
 namespace tokenspeed {
 
-// GDN/mamba semantics: hit the nearest P-boundary snapshot and retain only the
-// request's live state page. Completed pages remain cache-owned after the
-// request table releases them.
-class MambaStateManager : public SwaManager {
+// One attention group: spec plus the manager that owns its group identity.
+class CacheGroup {
 public:
-    explicit MambaStateManager(std::int32_t cache_block_tokens, std::int32_t cache_blocks_per_lcm_block = 1,
-                               GroupId group_id = 0)
-        : SwaManager(cache_block_tokens, cache_blocks_per_lcm_block, /*sliding_window=*/2, group_id) {}
+    CacheGroup(KvCacheSpec spec, std::unique_ptr<KvCacheManager> manager) : spec_{spec}, manager_{std::move(manager)} {}
+
+    CacheGroup(const CacheGroup&) = delete;
+    CacheGroup& operator=(const CacheGroup&) = delete;
+    CacheGroup(CacheGroup&&) = default;
+    CacheGroup& operator=(CacheGroup&&) = default;
+
+    KvCacheManager& Manager() { return *manager_; }
+    const KvCacheManager& Manager() const { return *manager_; }
+    const KvCacheSpec& Spec() const { return spec_; }
+    std::uint32_t Id() const { return manager_->Id(); }
+
+private:
+    KvCacheSpec spec_;
+    std::unique_ptr<KvCacheManager> manager_;
 };
 
 }  // namespace tokenspeed

@@ -23,18 +23,14 @@
 #include <cstdint>
 #include <variant>
 
-#include "core/types.h"
-
 namespace tokenspeed {
 namespace cache {
 struct WriteBackDone {
-    cache_op_id op_id{};
-    bool success;
+    std::uint32_t op_id{};
 };
 
 struct LoadBackDone {
-    cache_op_id op_id{0};
-    bool success{true};
+    std::uint32_t op_id{0};
 };
 
 };  // namespace cache

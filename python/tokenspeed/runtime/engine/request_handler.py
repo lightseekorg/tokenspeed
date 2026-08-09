@@ -110,6 +110,7 @@ class RequestHandler:
         recv_func,
         send_func,
         get_load_fn=None,
+        clear_cache_fn=None,
         architectures: list[str] | None = None,
         pause_controller=None,
         memory_controller=None,
@@ -141,6 +142,7 @@ class RequestHandler:
         self.max_req_len = max_req_len
         self.vocab_size = vocab_size
         self.get_load_fn = get_load_fn
+        self.clear_cache_fn = clear_cache_fn
 
         self.tokenizer = get_tokenizer(
             server_args.tokenizer,
@@ -210,9 +212,8 @@ class RequestHandler:
                 logger.debug("AbortReq for rid=%s", recv_req.rid)
                 abort_rids.append(recv_req.rid)
             elif isinstance(recv_req, FlushCacheReqInput):
-                # Prefix cache is owned by the scheduler path; acknowledge the
-                # control request here so API callers still get a typed reply.
-                self.send_func.send_pyobj(FlushCacheReqOutput(success=True))
+                success = self.clear_cache_fn is not None and self.clear_cache_fn()
+                self.send_func.send_pyobj(FlushCacheReqOutput(success=success))
             elif isinstance(recv_req, PauseSchedulerReqInput):
                 # State change + reply (abort/wait replies are deferred by the
                 # controller until the event loop observes a drained scheduler).
@@ -320,6 +321,7 @@ class RequestHandler:
             ),
             self.max_req_len - len(req_state.prompt_input_ids) - 1,
         )
+        req_spec.max_new_tokens = req_state.sampling_params.max_new_tokens
         return (
             req_spec,
             req_state,

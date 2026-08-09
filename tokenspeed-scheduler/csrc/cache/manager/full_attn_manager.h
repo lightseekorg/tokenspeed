@@ -24,9 +24,9 @@
 #include <cstdint>
 #include <span>
 
-#include "cache/block_pool.h"
-#include "cache/cache_types.h"
-#include "cache/kv_cache_manager.h"
+#include "cache/core/block_pool.h"
+#include "cache/core/cache_types.h"
+#include "cache/manager/kv_cache_manager.h"
 
 namespace tokenspeed {
 

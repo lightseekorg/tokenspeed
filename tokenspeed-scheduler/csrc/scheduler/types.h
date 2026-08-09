@@ -23,7 +23,7 @@
 #include <cstdint>
 #include <vector>
 
-#include "cache/cache_config.h"
+#include "cache/core/cache_config.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -41,12 +41,11 @@ struct SchedulerConfig {
 
     std::vector<PagedCacheGroupConfig> paged_cache_groups{};
 
-    // Streaming-sink enablement: an L2 host tier exists (> 1: page 0 is the null
-    // placeholder) and this role writes to it. Orthogonal to disable_prefix_cache by design:
-    // that flag gates MATCHING only, the sink gates STORING.
-    bool StreamingSinkEnabled() const {
-        return !disable_l2_cache && host_allocator.total_pages > 1 && role == Role::kFused;
-    }
+    bool HasHostCache() const { return !disable_l2_cache && host_allocator.total_pages > 1; }
+
+    // Decode uses Host cache only for best-effort Retraction and recovery. It
+    // does not continuously stream ordinary Device cache entries to Host.
+    bool StreamsDeviceCacheToHost() const { return HasHostCache() && role != Role::kD; }
 
     std::int32_t max_scheduled_tokens{};
     std::int32_t max_batch_size{};

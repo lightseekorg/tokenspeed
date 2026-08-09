@@ -20,101 +20,30 @@
 
 #pragma once
 
-#include <cstddef>
-#include <cstdint>
-#include <functional>
-#include <unordered_set>
-#include <utility>
-#include <variant>
+#include <map>
+#include <span>
+#include <string>
 #include <vector>
 
-#include "core/types.h"
+#include "cache/core/cache_types.h"
+#include "cache/coordinator/kv_cache_coordinator.h"
 
 namespace tokenspeed {
 
-struct TransferPair {
-    std::int32_t source{-1};
-    std::int32_t destination{-1};
+struct SchedulerConfig;
 
-    bool operator==(const TransferPair& other) const {
-        return source == other.source && destination == other.destination;
-    }
-};
+// One KvCacheSpec per config paged_cache_group (group_id = index); all groups share config.block_size.
+std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config);
 
-struct TransferPairHash {
-    std::size_t operator()(const TransferPair& pair) const {
-        const std::size_t source_hash = std::hash<std::int32_t>{}(pair.source);
-        const std::size_t destination_hash = std::hash<std::int32_t>{}(pair.destination);
-        return source_hash ^ (destination_hash + 0x9e3779b9 + (source_hash << 6) + (source_hash >> 2));
-    }
-};
+std::int32_t AlignPrefillChunk(std::int32_t first_pos, std::int32_t unscheduled, std::int32_t token_budget,
+                               std::int32_t page_size, std::int32_t promotion_boundary_tokens);
 
-struct WriteBackOperation {
-    cache_op_id op_id{0};
-    std::vector<TransferPair> transfers;  // DEVICE→HOST.
+void FreeRequest(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables);
 
-    WriteBackOperation() = default;
-    WriteBackOperation(cache_op_id op_id, std::vector<TransferPair> transfers)
-        : op_id{op_id}, transfers{std::move(transfers)} {}
-};
-
-struct WriteBackBatch {
-    std::vector<cache_op_id> op_ids;
-    std::vector<std::vector<std::int32_t>> src_pages;
-    std::vector<std::vector<std::int32_t>> dst_pages;
-
-    explicit WriteBackBatch(const std::vector<WriteBackOperation>& ops) {
-        std::unordered_set<TransferPair, TransferPairHash> seen;
-        for (const auto& op : ops) {
-            std::vector<std::int32_t> operation_sources;
-            std::vector<std::int32_t> operation_destinations;
-            for (const auto& transfer : op.transfers) {
-                if (seen.insert(transfer).second) {
-                    operation_sources.push_back(transfer.source);
-                    operation_destinations.push_back(transfer.destination);
-                }
-            }
-
-            op_ids.push_back(op.op_id);
-            src_pages.push_back(std::move(operation_sources));
-            dst_pages.push_back(std::move(operation_destinations));
-        }
-    }
-};
-
-struct LoadBackOperation {
-    cache_op_id op_id{0};
-    std::vector<TransferPair> transfers;  // HOST→DEVICE.
-
-    LoadBackOperation() = default;
-    LoadBackOperation(cache_op_id op_id, std::vector<TransferPair> transfers)
-        : op_id{op_id}, transfers{std::move(transfers)} {}
-};
-
-struct LoadBackBatch {
-    std::vector<cache_op_id> op_ids;
-    std::vector<std::vector<std::int32_t>> src_pages;
-    std::vector<std::vector<std::int32_t>> dst_pages;
-
-    explicit LoadBackBatch(const std::vector<LoadBackOperation>& ops) {
-        std::unordered_set<TransferPair, TransferPairHash> seen;
-        for (const auto& op : ops) {
-            std::vector<std::int32_t> operation_sources;
-            std::vector<std::int32_t> operation_destinations;
-            for (const auto& transfer : op.transfers) {
-                if (seen.insert(transfer).second) {
-                    operation_sources.push_back(transfer.source);
-                    operation_destinations.push_back(transfer.destination);
-                }
-            }
-
-            op_ids.push_back(op.op_id);
-            src_pages.push_back(std::move(operation_sources));
-            dst_pages.push_back(std::move(operation_destinations));
-        }
-    }
-};
-
-using CacheOperation = std::variant<LoadBackBatch, WriteBackBatch>;
+// One row per config group_id. Each manager resolves the group's LCM placement
+// to the kernel-visible page id.
+std::map<std::string, std::vector<std::int32_t>> BuildBlockTables(const KvCacheCoordinator& coordinator,
+                                                                  const std::vector<BlockTable>& tables,
+                                                                  std::span<const std::string> group_ids);
 
 }  // namespace tokenspeed

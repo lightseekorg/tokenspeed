@@ -24,8 +24,8 @@
 #include <utility>
 #include <vector>
 
-#include "cache/block_pool.h"
-#include "cache/cache_block_ref.h"
+#include "cache/core/block_pool.h"
+#include "cache/core/cache_block_ref.h"
 
 namespace tokenspeed::test {
 namespace {
