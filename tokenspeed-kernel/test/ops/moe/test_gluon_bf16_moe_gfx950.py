@@ -26,7 +26,7 @@ from utils import is_cdna4
 
 if not is_cdna4():
     pytest.skip(
-        "BF16-weight Gluon MoE is unavailable on this GPU",
+        "AMD CDNA4 is required for BF16-weight Gluon MoE tests",
         allow_module_level=True,
     )
 

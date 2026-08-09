@@ -6,7 +6,7 @@ import pytest
 import torch
 from tokenspeed_kernel.platform import current_platform
 
-if not (torch.cuda.is_available() and current_platform().is_cdna4):
+if not current_platform().is_cdna4:
     pytest.skip("AMD CDNA4 is required for Kimi routing tests", allow_module_level=True)
 
 

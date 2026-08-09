@@ -29,7 +29,7 @@
 
 ## tokenspeed-kernel
 
-Inside the root tokenspeed-kernel/ directory:
+Inside the root `tokenspeed-kernel/` directory:
 
 * All direct tokenspeed-triton imports should happen in `_triton.py` and then
   re-import to other places.
@@ -42,3 +42,11 @@ Inside the root tokenspeed-kernel/ directory:
 * Files under `ops/` should follow `<family>/<solution>` structure, like
   `gemm/trtllm.py` or `attention/triton/`.
 * When defining new public APIs, explain arguments and returns in docstring.
+
+## tokenspeed-kernel-amd
+
+Inside the root `tokenspeed-kernel-amd/` directory:
+
+* There should be no dependency on `tokenspeed-kernel`.
+* AMD Gluon Kernel tests should live in `tokenspeed-kernel/test/` to reuse
+  common platform utilities and reference computations.

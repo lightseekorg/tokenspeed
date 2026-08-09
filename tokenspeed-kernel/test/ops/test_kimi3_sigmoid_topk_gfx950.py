@@ -6,7 +6,10 @@ import torch
 from utils import is_cdna4
 
 if not is_cdna4():
-    pytest.skip("requires AMD CDNA4", allow_module_level=True)
+    pytest.skip(
+        "AMD CDNA4 is required for Kimi K3 Gluon sigmoid-bias top-k tests",
+        allow_module_level=True,
+    )
 
 
 @pytest.mark.parametrize("normalize", [False, True])

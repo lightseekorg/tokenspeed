@@ -13,7 +13,10 @@ from tokenspeed_kernel.ops.moe import moe_sigmoid_bias_topk
 from utils import is_cdna4
 
 if not is_cdna4():
-    pytest.skip("Kimi K3 projection tests require AMD CDNA4", allow_module_level=True)
+    pytest.skip(
+        "AMD CDNA4 is required for Kimi K3 projection tests",
+        allow_module_level=True,
+    )
 
 
 @pytest.mark.parametrize(

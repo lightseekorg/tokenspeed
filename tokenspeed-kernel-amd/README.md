@@ -43,11 +43,6 @@ tokenspeed-kernel-amd/
 │               └── moe/
 ```
 
-Tests are not kept here. Numerical and launch-configuration tests for these
-kernels live under `tokenspeed-kernel/test/ops/`, next to the tests for every
-other backend, and skip themselves unless `current_platform()` reports a
-matching AMD architecture.
-
 Public entry points currently remain architecture-specific. Consumers should import the implementation matching the target GPU, or use TokenSpeed-Kernel to select a compatible implementation through its registry.
 
 ## Usage

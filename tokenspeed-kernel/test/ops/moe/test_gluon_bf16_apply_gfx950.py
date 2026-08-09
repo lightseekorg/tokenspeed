@@ -26,7 +26,7 @@ from utils import is_cdna4
 
 if not is_cdna4():
     pytest.skip(
-        "Gluon bf16 MoE apply is gfx950 (CDNA4) only",
+        "AMD CDNA4 is required for Gluon bf16 MoE apply tests",
         allow_module_level=True,
     )
 

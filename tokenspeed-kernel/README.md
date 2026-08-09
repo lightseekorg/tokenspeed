@@ -97,25 +97,6 @@ All of them register through the same decorator and are scored by the same
 selection logic, so adding a backend is one new file in the right family
 folder.
 
-Tests live in `test/`, with `test/ops/<family>/` mirroring the layout above.
-This includes vendor-specific kernels — the AMD Gluon tests for
-`tokenspeed-kernel-amd` live here too, rather than beside that package.
-Tests that need a particular GPU gate themselves at import time on
-`current_platform()` (via the `is_cdna4` / `is_cdna5` / `is_amd` helpers in
-`test/utils.py`) and skip at module level elsewhere, so the whole suite stays
-collectable on every runner:
-
-```python
-from utils import is_cdna4
-
-if not is_cdna4():
-    pytest.skip("AMD CDNA4 is required for ...", allow_module_level=True)
-```
-
-Never hand-roll an architecture check against `gcnArchName` or
-`get_device_name()`: `current_platform()` is the one place that maps a device
-to an architecture, and it is what the kernels themselves dispatch on.
-
 ### Solution choices
 
 - **Triton** — in-tree; default portable JIT path for various kernels

@@ -6,7 +6,7 @@ from utils import is_amd, is_cdna4, is_cdna5
 
 if not is_amd():
     pytest.skip(
-        "MXFP4-weight Gluon MoE requires an AMD GPU",
+        "An AMD GPU is required for MXFP4-weight Gluon MoE tests",
         allow_module_level=True,
     )
 

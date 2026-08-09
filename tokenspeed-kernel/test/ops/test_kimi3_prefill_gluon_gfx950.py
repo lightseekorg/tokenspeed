@@ -9,7 +9,10 @@ import torch
 from utils import is_cdna4
 
 if not is_cdna4():
-    pytest.skip("AMD CDNA4 is required", allow_module_level=True)
+    pytest.skip(
+        "AMD CDNA4 is required for Kimi K3 prefill Gluon tests",
+        allow_module_level=True,
+    )
 
 
 from tokenspeed_kernel.ops.attn_res import attn_res_fwd  # noqa: E402

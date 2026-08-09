@@ -28,7 +28,10 @@ from kimi3_reference import (
 from utils import is_cdna4, make_mxfp4_moe_weights, make_round_robin_topk
 
 if not is_cdna4():
-    pytest.skip("MXFP4 SiTU Gluon tests require AMD CDNA4", allow_module_level=True)
+    pytest.skip(
+        "AMD CDNA4 is required for Gluon MXFP4 SiTU tests",
+        allow_module_level=True,
+    )
 
 import tokenspeed_kernel  # noqa: E402
 

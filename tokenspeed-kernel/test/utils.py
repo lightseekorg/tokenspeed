@@ -38,13 +38,9 @@ SampleRegistration = tuple[dict, Callable]
 def detected_platform() -> PlatformInfo | None:
     """Return the current platform, or ``None`` when none is usable.
 
-    ``current_platform()`` raises when PyTorch sees no GPU, or when it sees an
-    AMD architecture that ``tokenspeed-kernel`` does not support. Tests gate
-    themselves at import time, so turn that into a value they can branch on
-    instead of a collection error.
-
-    Returns:
-        The detected :class:`PlatformInfo`, or ``None`` if detection failed.
+    ``current_platform()`` raises when PyTorch sees no GPU or unsupported
+    architecture that. Tests gate themselves at import time, so turn that into
+    a value they can branch on instead of a collection error.
     """
     try:
         return current_platform()
@@ -52,22 +48,19 @@ def detected_platform() -> PlatformInfo | None:
         return None
 
 
+def is_amd() -> bool:
+    platform = detected_platform()
+    return platform is not None and platform.is_amd
+
+
 def is_cdna4() -> bool:
-    """Return whether the current GPU is AMD CDNA4 (gfx950)."""
     platform = detected_platform()
     return platform is not None and platform.is_cdna4
 
 
 def is_cdna5() -> bool:
-    """Return whether the current GPU is AMD CDNA5 (gfx1250)."""
     platform = detected_platform()
     return platform is not None and platform.is_cdna5
-
-
-def is_amd() -> bool:
-    """Return whether the current GPU is an AMD device."""
-    platform = detected_platform()
-    return platform is not None and platform.is_amd
 
 
 def make_mxfp4_moe_weights(
