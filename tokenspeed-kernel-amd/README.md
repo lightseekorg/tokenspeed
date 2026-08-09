@@ -28,19 +28,25 @@ Kernels are organized by AMD architecture and operator family. This keeps archit
 
 ```text
 tokenspeed-kernel-amd/
-├── python/
-│   └── tokenspeed_kernel_amd/
-│       └── ops/
-│           ├── gfx950/
-│           │   ├── attention/
-│           │   │   ├── mha/           # Multi-head attention
-│           │   │   ├── mla/           # Multi-head latent attention
-│           │   │   └── dsa/           # DeepSeek sparse attention
-│           │   ├── gemm/              # GEMM implementations
-│           │   └── moe/               # MoE implementations
-│           └── gfx1250/
-│               ├── attention/
-│               └── moe/
+└── python/
+    └── tokenspeed_kernel_amd/
+        └── ops/
+            ├── gfx950/
+            │   ├── attention/
+            │   │   ├── mha/   # Multi-head attention
+            │   │   ├── rmha/  # Relative-bias multi-head attention
+            │   │   ├── mla/   # Multi-head latent attention
+            │   │   ├── dsa/   # DeepSeek sparse attention
+            │   │   └── kda/   # Kimi delta attention
+            │   ├── gemm/      # GEMM implementations
+            │   ├── moe/       # MoE implementations
+            │   └── sampling/  # Sampling implementations
+            └── gfx1250/
+                ├── attention/
+                │   ├── mha/
+                │   ├── mla/
+                │   └── kda/
+                └── moe/
 ```
 
 Public entry points currently remain architecture-specific. Consumers should import the implementation matching the target GPU, or use TokenSpeed-Kernel to select a compatible implementation through its registry.
