@@ -249,4 +249,31 @@ TEST(CacheOperationTest, DecodeRejectsRequestWhoseMaximumExtentCannotFitDevice) 
     EXPECT_THROW(scheduler.SubmitRequests({spec}), std::invalid_argument);
 }
 
+TEST(CacheOperationTest, PrefillAcceptsPromptThatFitsWithoutReservingDecodeTokens) {
+    SchedulerConfig config;
+    config.block_size = 2;
+    config.device_allocator.total_pages = 4;
+    config.host_allocator.total_pages = 10;
+    config.max_scheduled_tokens = 8;
+    config.max_batch_size = 2;
+    config.role = Role::kP;
+    config.paged_cache_groups.push_back(PagedCacheGroupConfig{
+        .group_id = "full",
+        .rows_per_page = 2,
+        .entry_stride_tokens = 1,
+        .total_pages = 4,
+        .retention = PagedCacheGroupConfig::Retention::FullHistory,
+        .family = PagedCacheGroupFamily::History,
+    });
+    Scheduler scheduler{std::move(config)};
+    ASSERT_EQ(scheduler.MaxSingleRequestTokens(), 6);
+    RequestSpec spec{
+        .request_id = "prefill-only-capacity",
+        .tokens = {1, 2, 3, 4, 5, 6},
+        .max_new_tokens = 100,
+    };
+
+    EXPECT_NO_THROW(scheduler.SubmitRequests({spec}));
+}
+
 }  // namespace tokenspeed::test

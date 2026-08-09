@@ -325,9 +325,9 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
         if (spec.max_new_tokens < 0) {
             throw std::invalid_argument("Scheduler: max_new_tokens must be non-negative");
         }
-        const std::int64_t minimum_generation_reserve = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
-        const std::int64_t token_limit = static_cast<std::int64_t>(spec.tokens.size()) +
-                                         std::max<std::int64_t>(spec.max_new_tokens, minimum_generation_reserve);
+        const std::int64_t generation_reserve =
+            config_.role == Role::kP ? 0 : std::max<std::int64_t>(spec.max_new_tokens, config_.decode_input_tokens);
+        const std::int64_t token_limit = static_cast<std::int64_t>(spec.tokens.size()) + generation_reserve;
         if (token_limit > std::numeric_limits<std::int32_t>::max()) {
             throw std::invalid_argument("Scheduler: request token limit exceeds int32 range");
         }
