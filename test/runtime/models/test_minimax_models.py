@@ -204,7 +204,13 @@ class TestMiniMaxGSM8K(unittest.TestCase):
             limit=200,
             eval_batch_size=128,
             generation_config={"max_tokens": 512},
-            dataset_args={"gsm8k": {"few_shot_num": 5, "few_shot_random": False}},
+            dataset_args={
+                "gsm8k": {
+                    "dataset_id": "openai/gsm8k",
+                    "few_shot_num": 5,
+                    "few_shot_random": False,
+                }
+            },
         )
         print(f"{metrics=}")
         self.assertGreater(metrics["accuracy"], 0.70)

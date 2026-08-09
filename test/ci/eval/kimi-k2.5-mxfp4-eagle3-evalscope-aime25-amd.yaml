@@ -41,11 +41,14 @@ eval:
   install:
     - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
   command: >-
+    HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
     /tmp/evalscope-perf/bin/evalscope eval
     --model amd/Kimi-K2.5-MXFP4
     --api-url http://127.0.0.1:8000/v1
     --api-key EMPTY_TOKEN
     --datasets aime25
+    --dataset-hub huggingface
+    --dataset-args '{"aime25":{"dataset_id":"math-ai/aime25"}}'
     --limit 4
     --eval-batch-size 4
     --stream
