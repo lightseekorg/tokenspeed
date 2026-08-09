@@ -179,7 +179,9 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
 
     AdmissionMatch match;
     match.candidate_page_hashes = hashes;
-    if (config_.disable_prefix_cache) {
+    // Retraction recovery may reuse its own L2 snapshot even when ordinary
+    // request-to-request prefix reuse is disabled.
+    if (config_.disable_prefix_cache && !request->Is<fsm::Retracted>()) {
         match.probe = probe({});
         return match;
     }

@@ -257,6 +257,15 @@ protected:
     }
 };
 
+class DecodeRetractionNoPrefixCacheTestSuite : public DecodeRetractionL2TestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = DecodeRetractionL2TestSuite::MakeConfig();
+        cfg.disable_prefix_cache = true;
+        return cfg;
+    }
+};
+
 TEST_F(DecodeRetractionCapacityTestSuite, AdmissionDoesNotReserveFutureRetractionCapacity) {
     RequestSpec longest = MakeRequestSpec("a", /*num_pages=*/2, /*start=*/1);
     longest.max_new_tokens = 6;  // five-parent maximum retraction state
@@ -348,6 +357,40 @@ TEST_F(DecodeRetractionL2TestSuite, RetractionLetsBlockedAdmissionRun) {
     EXPECT_FALSE(ExtractCacheOpsOfKind<LoadBackBatch>(recovery).empty());
     EXPECT_EQ(scheduler_->DecodingSize(), 0u)
         << "a retracted request returns to Decode only after local prefill completes";
+}
+
+TEST_F(DecodeRetractionNoPrefixCacheTestSuite, RecoveryLoadsItsRetractionSnapshot) {
+    Submit({MakeRequestSpec("running", /*num_pages=*/2, /*start=*/1)});
+    SendBootstrapped("running");
+    PlanOnce();
+    SendRemotePrefillDone("running", /*bootstrap_token=*/42);
+    PlanOnce();
+    SendForwardDone("running", {43});
+
+    Submit({MakeRequestSpec("blocked", /*num_pages=*/2, /*start=*/101)});
+    SendBootstrapped("blocked");
+    std::vector<CacheOperation> write_back_ops;
+    for (std::int32_t token = 44; token < 48 && write_back_ops.empty(); ++token) {
+        const ExecutionPlan plan = PlanOnce();
+        write_back_ops = ExtractCacheOpsOfKind<WriteBackBatch>(plan);
+        const ForwardBatch* forward = FindForwardBatch(plan.Operations());
+        if (write_back_ops.empty() && forward != nullptr && !forward->request_ids.empty()) {
+            SendForwardDone("running", {token});
+        }
+    }
+    ASSERT_EQ(write_back_ops.size(), 1u);
+    const auto& write_back = std::get<WriteBackBatch>(write_back_ops.front());
+    ASSERT_EQ(write_back.op_ids.size(), 1u);
+    SendWriteBackDone(write_back.op_ids.front());
+
+    const ExecutionPlan admitted = PlanOnce();
+    ASSERT_EQ(FindForwardBatch(admitted.Operations())->request_ids, (std::vector<std::string>{"blocked"}));
+    SendRemotePrefillDone("blocked", /*bootstrap_token=*/142);
+    SendAbortEvent("blocked");
+
+    const ExecutionPlan recovery = PlanOnce();
+    EXPECT_FALSE(ExtractCacheOpsOfKind<LoadBackBatch>(recovery).empty())
+        << "disabling ordinary prefix caching must not hide a request's own retraction snapshot";
 }
 
 TEST_F(DecodeRetractionL2TestSuite, RemotePrefillInFlightStallsAdditionalAdmission) {
