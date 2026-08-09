@@ -31,6 +31,10 @@ Core components:
 
 For technical blogs, conference talks, and engineering articles from LightSeek Foundation, visit the [LightSeek Blog](https://lightseek.org/blog/).
 
+## Sponsors and Partners
+
+LightSeek's work is advanced by the support of [sponsors and partners](https://lightseek.org/sponsors) across the AI ecosystem.
+
 ## Performance Comparison
 
 <img src="https://raw.githubusercontent.com/lightseekorg/tokenspeed/main/assets/perf/tokenspeed-kimi-k2.5-performance.png" alt="TokenSpeed vs. TensorRT-LLM Pareto curves on agentic workload (Kimi K2.5, B200)" width="800" margin="10px"></img>

@@ -42,11 +42,14 @@ eval:
   install:
     - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
   command: >-
+    HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
     /tmp/evalscope-perf/bin/evalscope eval
     --model nvidia/Kimi-K2.5-NVFP4
     --api-url http://127.0.0.1:8000/v1
     --api-key EMPTY_TOKEN
     --datasets mmlu
+    --dataset-hub huggingface
+    --dataset-args '{"mmlu":{"dataset_id":"cais/mmlu"}}'
     --eval-batch-size 16
 report:
   github_step_summary: true

@@ -8,31 +8,50 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+from utils import is_cdna4, is_cdna5
 
+if not (is_cdna4() or is_cdna5()):
+    pytest.skip(
+        "AMD CDNA4 or CDNA5 is required for Gluon DSA tests",
+        allow_module_level=True,
+    )
 
-def _is_gfx950() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
-    return "gfx950" in arch
-
-
-if not _is_gfx950():
-    pytest.skip("AMD GFX950 is required for Gluon DSA tests", allow_module_level=True)
-
-
-from tokenspeed_kernel_amd.ops.gfx950.attention.dsa import (  # noqa: E402
-    sparse_mla as dsa_topk_gfx950,
-)
 from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (  # noqa: E402
     _trim_topk_slots_for_context,
-    gluon_dsa_decode_gfx950,
-    gluon_dsa_prefill_gfx950,
 )
-from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (  # noqa: E402
-    gluon_dsa_decode_topk_fp8_gfx950,
-    gluon_dsa_prefill_topk_fp8_gfx950,
-)
+
+if is_cdna4():
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa import (  # noqa: E402
+        sparse_mla as dsa_topk_backend,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
+        gluon_dsa_decode_gfx950 as gluon_dsa_decode,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
+        gluon_dsa_prefill_gfx950 as gluon_dsa_prefill,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (  # noqa: E402
+        gluon_dsa_decode_topk_fp8_gfx950 as gluon_dsa_decode_topk_fp8,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
+        gluon_dsa_prefill_topk_fp8_gfx950 as gluon_dsa_prefill_topk_fp8,
+    )
+else:
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa import (  # noqa: E402
+        sparse_mla as dsa_topk_backend,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.attention import (  # noqa: E402
+        gluon_dsa_decode_gfx1250 as gluon_dsa_decode,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.attention import (
+        gluon_dsa_prefill_gfx1250 as gluon_dsa_prefill,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.sparse_mla import (  # noqa: E402
+        gluon_dsa_decode_topk_fp8_gfx1250 as gluon_dsa_decode_topk_fp8,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.sparse_mla import (
+        gluon_dsa_prefill_topk_fp8_gfx1250 as gluon_dsa_prefill_topk_fp8,
+    )
 
 torch.manual_seed(42)
 
@@ -40,6 +59,10 @@ torch.manual_seed(42)
 @pytest.mark.parametrize(
     ("max_seqlen_k", "expected_topk"),
     ((25, 512), (608, 1024), (1537, 2048)),
+)
+@pytest.mark.skipif(
+    not is_cdna4(),
+    reason="registered-width trimming is specific to the gfx950 implementation",
 )
 def test_dsa_attention_trims_topk_to_registered_context_width(
     max_seqlen_k: int,
@@ -572,7 +595,7 @@ def test_dsa_decode_topk_fp8_glm52_cases(case: _TopKDecodeCase) -> None:
     )
     seq_lens = torch.tensor(case.seq_lens, device=device, dtype=torch.int32)
 
-    topk_slots, topk_lens = gluon_dsa_decode_topk_fp8_gfx950(
+    topk_slots, topk_lens = gluon_dsa_decode_topk_fp8(
         q,
         weights,
         seq_lens,
@@ -630,7 +653,7 @@ def test_dsa_prefill_topk_fp8_glm52_cases(case: _TopKPrefillCase) -> None:
         page_size,
     )
 
-    workspace_indices, topk_lens = gluon_dsa_prefill_topk_fp8_gfx950(
+    workspace_indices, topk_lens = gluon_dsa_prefill_topk_fp8(
         q,
         weights,
         kv_workspace_slots,
@@ -678,7 +701,7 @@ def test_dsa_prefill_topk_keeps_late_values_above_threshold() -> None:
     out = torch.empty((1, topk), device="cuda", dtype=torch.int32)
     lens_out = torch.empty((1,), device="cuda", dtype=torch.int32)
 
-    dsa_topk_gfx950._dsa_topk_indices(
+    dsa_topk_backend._dsa_topk_indices(
         logits,
         row_starts,
         row_ends,
@@ -721,7 +744,7 @@ def test_dsa_decode_topk_keeps_late_values_above_threshold() -> None:
     out = torch.empty((1, topk), device="cuda", dtype=torch.int32)
     lens_out = torch.empty((1,), device="cuda", dtype=torch.int32)
 
-    dsa_topk_gfx950._dsa_topk_indices(
+    dsa_topk_backend._dsa_topk_indices(
         logits,
         seq_lens,
         seq_lens,
@@ -754,7 +777,7 @@ def test_dsa_decode_topk_gluon_long_row_uses_radix_path() -> None:
         seq_len // page_size, device=device, dtype=torch.int32
     ).reshape(1, -1)
 
-    topk_slots, topk_lens = gluon_dsa_decode_topk_fp8_gfx950(
+    topk_slots, topk_lens = gluon_dsa_decode_topk_fp8(
         q,
         weights,
         seq_lens,
@@ -785,7 +808,7 @@ def test_dsa_prefill_topk_gluon_long_row_uses_radix_path() -> None:
     row_starts = torch.tensor([0], device=device, dtype=torch.int32)
     row_ends = torch.tensor([seq_len], device=device, dtype=torch.int32)
 
-    workspace_indices, topk_lens = gluon_dsa_prefill_topk_fp8_gfx950(
+    workspace_indices, topk_lens = gluon_dsa_prefill_topk_fp8(
         q,
         weights,
         kv_workspace_slots,
@@ -917,8 +940,8 @@ def _assert_slots_visible(
 @pytest.mark.parametrize(
     "mode,api",
     [
-        pytest.param("decode", gluon_dsa_decode_gfx950, id="decode"),
-        pytest.param("prefill", gluon_dsa_prefill_gfx950, id="prefill"),
+        pytest.param("decode", gluon_dsa_decode, id="decode"),
+        pytest.param("prefill", gluon_dsa_prefill, id="prefill"),
     ],
 )
 @pytest.mark.parametrize(
@@ -985,8 +1008,8 @@ def test_dsa_with_sparse_kvcache(mode: str, api, q_dtype: torch.dtype) -> None:
 @pytest.mark.parametrize(
     "mode,api",
     [
-        pytest.param("decode", gluon_dsa_decode_gfx950, id="decode"),
-        pytest.param("prefill", gluon_dsa_prefill_gfx950, id="prefill"),
+        pytest.param("decode", gluon_dsa_decode, id="decode"),
+        pytest.param("prefill", gluon_dsa_prefill, id="prefill"),
     ],
 )
 @pytest.mark.parametrize(
@@ -1077,7 +1100,7 @@ def test_dsa_decode_sparse_kvcache_trims_large_topk_for_tiny_lens() -> None:
     topk_slots[0, 0] = 2
     topk_slots[1, :3] = torch.tensor([0, 5, 7], device=device, dtype=torch.int32)
 
-    out = gluon_dsa_decode_gfx950(
+    out = gluon_dsa_decode(
         q=q,
         kv_cache=None,
         sparse_kv_cache=sparse_kv,
@@ -1154,9 +1177,9 @@ def test_dsa_glm52_selected_attention_cases(case: _DSACase) -> None:
         "page_size": page_size,
     }
     if case.mode == "decode":
-        out = gluon_dsa_decode_gfx950(q_len_per_req=case.q_len_per_req, **common_kwargs)
+        out = gluon_dsa_decode(q_len_per_req=case.q_len_per_req, **common_kwargs)
     else:
-        out = gluon_dsa_prefill_gfx950(**common_kwargs)
+        out = gluon_dsa_prefill(**common_kwargs)
 
     ref = _dsa_reference(
         q,

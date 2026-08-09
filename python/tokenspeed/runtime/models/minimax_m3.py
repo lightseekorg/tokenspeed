@@ -1602,7 +1602,7 @@ class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForCausalLM):
             prefix=add_prefix("patch_merge_mlp", prefix),
             bias=True,
         )
-        self.multimodal_embedder = MultimodalEmbedder()
+        self.multimodal_embedder = MultimodalEmbedder(encoder_mapping=mapping.vision)
         self.image_encoder = self.get_image_feature
         self.video_encoder = self.get_video_feature
 

@@ -6,17 +6,10 @@ from itertools import accumulate
 
 import pytest
 import torch
+from utils import is_cdna4
 
-
-def _is_gfx950() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
-    return "gfx950" in arch
-
-
-if not _is_gfx950():
-    pytest.skip("AMD GFX950 is required for Gluon KDA tests", allow_module_level=True)
+if not is_cdna4():
+    pytest.skip("AMD CDNA4 is required for Gluon KDA tests", allow_module_level=True)
 
 
 from tokenspeed_kernel_amd.ops.gfx950.attention.kda.prefill import (  # noqa: E402
