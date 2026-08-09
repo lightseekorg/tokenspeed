@@ -74,7 +74,7 @@ from tokenspeed_kernel.ops.attn_res import attn_res_fwd
 from tokenspeed_kernel.ops.communication import allreduce_fusion_lane
 from tokenspeed_kernel.ops.communication.multimem import (
     multimem_all_reduce_staged,
-    multimem_available_all_ranks,
+    multimem_available,
     multimem_prealloc,
     multimem_stage,
 )
@@ -1148,9 +1148,13 @@ class KimiLinearMoE(nn.Module):
             )
         )
 
-        # A rank diverging on eligibility would strand peers in the collective.
-        self._multimem_ar_ok = False
-        if (
+        # Tail capability negotiation. Both tiers can only be used when every
+        # rank agrees, and both allocate through collectives, so eligibility is
+        # settled here in one exchange: each rank votes on the local
+        # preconditions, one MIN all-reduce agrees the votes, and only then do
+        # the collective allocators run. Splitting this into a probe/agree pair
+        # per tier is what previously left four separate ways to strand a peer.
+        multimem_local = (
             torch.distributed.is_initialized()
             # EP is fine here (partials sum over tp_ep); the fused tail is not.
             and mapping.moe.tp_ep_size > 1
@@ -1159,18 +1163,9 @@ class KimiLinearMoE(nn.Module):
             and mapping.attn.cp_size == 1
             # Staging buffers are per-width; equal widths would clobber the stage.
             and self.routed_hidden != config.hidden_size
-        ):
-            self._multimem_ar_ok = multimem_available_all_ranks()
-            if self._multimem_ar_ok:
-                # Pre-size to the ceiling so serving never grows collectively.
-                self._multimem_ar_ok = multimem_prealloc(
-                    MULTIMEM_AR_MAX_TOKENS,
-                    (self.routed_hidden, config.hidden_size),
-                    torch.distributed.group.WORLD.group_name,
-                )
-
-        # Fused AR(latent)+norm+RS tail with 1/tp-sharded up-projection.
-        self._latent_tail = None
+            and multimem_available()
+        )
+        tail_local = False
         if (
             not self.execution_plan.use_native
             and self.routed_expert_norm is not None
@@ -1180,29 +1175,36 @@ class KimiLinearMoE(nn.Module):
             and mapping.attn.dp_size == 1
             and mapping.attn.cp_size == 1
         ):
-            from tokenspeed_kernel.ops.moe.latent_tail import (
-                KimiK3LatentTailOp,
-                latent_tail_supported,
+            from tokenspeed_kernel.ops.moe.latent_tail import latent_tail_supported
+
+            tail_local = latent_tail_supported(
+                tp_size=mapping.moe.tp_size,
+                hidden_size=config.hidden_size,
+                latent_size=self.routed_hidden,
+                dtype=torch.bfloat16,
             )
 
-            # Agree on the non-collective probe first: a rank entering the
-            # constructor's rendezvous alone would strand its peers.
-            supported = torch.tensor(
-                [
-                    int(
-                        latent_tail_supported(
-                            tp_size=mapping.moe.tp_size,
-                            hidden_size=config.hidden_size,
-                            latent_size=self.routed_hidden,
-                            dtype=torch.bfloat16,
-                        )
-                    )
-                ],
+        self._multimem_ar_ok = False
+        self._latent_tail = None
+        if torch.distributed.is_initialized():
+            votes = torch.tensor(
+                [int(multimem_local), int(tail_local)],
                 dtype=torch.int32,
                 device="cuda",
             )
-            torch.distributed.all_reduce(supported, op=torch.distributed.ReduceOp.MIN)
-            if bool(supported.item()):
+            torch.distributed.all_reduce(votes, op=torch.distributed.ReduceOp.MIN)
+            multimem_ok, tail_ok = (bool(v) for v in votes.tolist())
+
+            if multimem_ok:
+                # Pre-size to the ceiling so serving never grows collectively.
+                self._multimem_ar_ok = multimem_prealloc(
+                    MULTIMEM_AR_MAX_TOKENS,
+                    (self.routed_hidden, config.hidden_size),
+                    torch.distributed.group.WORLD.group_name,
+                )
+            if tail_ok:
+                from tokenspeed_kernel.ops.moe.latent_tail import KimiK3LatentTailOp
+
                 # Deliberately unguarded: the constructor rendezvouses, so a
                 # rank that failed mid-way has already stranded its peers.
                 # Propagating kills the whole job, which is the good outcome.
@@ -1214,14 +1216,6 @@ class KimiLinearMoE(nn.Module):
                     device=torch.device("cuda", torch.cuda.current_device()),
                 )
                 logger.info("multicast latent tail engaged")
-
-            # A rank diverging on tail eligibility would deadlock the collective.
-            flag = torch.tensor(
-                [int(self._latent_tail is not None)], dtype=torch.int32, device="cuda"
-            )
-            torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
-            if not bool(flag.item()):
-                self._latent_tail = None
 
     def pack_input_projection_weights(self) -> None:
         """Back the router, routed-down, and shared gate/up weights with one tensor.
@@ -1511,11 +1505,13 @@ class KimiLinearMoE(nn.Module):
             if routed_stage is not None
             else None
         )
-        if shared_stage is None:
-            # Stage miss is rank-uniform; MULTIMEM_AR implies fused_moe_ar,
-            # so the fused-lane tier is the next one down.
-            return self._tail_fused_lane_ar(
-                routed_out, shared_partial, prefix_sum, None, num_tokens, hidden_size
+        # Staging can only miss on dtype/rank/width, all of which the init-time
+        # negotiation already settled, so a miss here is a contract violation
+        # rather than a condition to fall back on.
+        if routed_stage is None or shared_stage is None:
+            raise RuntimeError(
+                "multimem staging failed after the tier was selected; the "
+                "init-time capability vote and the runtime shapes disagree"
             )
         routed_red = multimem_all_reduce_staged(routed_stage, group_name)
         shared_red = multimem_all_reduce_staged(shared_stage, group_name)
