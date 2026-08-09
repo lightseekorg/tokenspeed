@@ -11,6 +11,9 @@
 ## Code changes
 
 * Add tests and update docs for the changed code.
+* Use absolute imports instead of relative imports.
+* Use the repository's full MIT license header for copyright notices; do not use
+  an abbreviated copyright-only header.
 * Before creating commits, run `pre-commit run --all-files` to format.
 * Do not substitute a narrower lint command for the repository hook before
   committing. Always run the exact `pre-commit run --all-files` command and
