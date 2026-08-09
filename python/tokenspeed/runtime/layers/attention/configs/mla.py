@@ -36,20 +36,25 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 def resolve_mla_kv_cache_dtype(
     server_args: ServerArgs, model_config: ModelConfig, is_draft: bool
 ) -> torch.dtype:
-    """Resolve MLA cache precision without quantizing K3 DSpark context blindly.
+    """Resolve MLA cache precision. A K3 DSpark draft cannot diverge here.
 
     The public K3 DSpark checkpoint has no FP8 KV scales and its reference vLLM
-    launch uses the default BF16 cache. TokenSpeed's K3 target currently requires
-    FP8 LCM storage, but the draft owns a separate pool, so keep only that pool
-    in BF16. Other MLA drafts continue to honor the global cache setting.
+    launch uses the default BF16 cache, so a BF16 draft pool would be the
+    faithful choice. It is not available: the draft owns no pool. An MLA draft
+    takes the ``LayerMappedKVPool`` branch of ``_create_draft_components`` --
+    a view onto the target's buffer, which binds every ``latent_kv`` field with
+    one store dtype -- because ``create_cache_pool`` only accepts a backing view
+    for ordinary MHA pools. Planning the draft's continuation planes at a
+    different itemsize than the pool binds them with fails at startup with
+    ``field 'layer.<num_target_layers>.latent_kv': dtype itemsize does not
+    match plan``.
+
+    So the draft follows the target. On K3 that means FP8 context injection
+    where the reference is BF16, which costs acceptance rather than
+    correctness; restoring BF16 needs heterogeneous MLA backing views, not a
+    change here.
     """
-    hf_config = getattr(model_config, "hf_config", None)
-    if (
-        is_draft
-        and server_args.speculative_algorithm == "DSPARK"
-        and getattr(hf_config, "model_type", None) == "k3_dspark"
-    ):
-        return torch.bfloat16
+    del model_config, is_draft
     return resolve_dtype(server_args.kv_cache_dtype)
 
 

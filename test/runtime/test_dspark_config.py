@@ -67,13 +67,29 @@ def test_attention_query_width_matches_algorithm(
     assert resolve_speculative_num_tokens(args, is_draft) == expected
 
 
-def test_k3_dspark_draft_cache_stays_bf16_when_target_cache_is_fp8() -> None:
+def test_k3_dspark_draft_cache_follows_the_target_because_it_shares_the_pool() -> None:
+    """An MLA draft is a view onto the target's buffer, which binds one dtype.
+
+    A BF16 draft pool would match the reference vLLM launch, but planning the
+    draft's continuation planes at an itemsize the shared pool does not bind
+    them with fails at startup on ``layer.<num_target_layers>.latent_kv``.
+    """
     args = SimpleNamespace(kv_cache_dtype="fp8_e4m3", speculative_algorithm="DSPARK")
     config = SimpleNamespace(hf_config=SimpleNamespace(model_type="k3_dspark"))
-    assert resolve_mla_kv_cache_dtype(args, config, is_draft=True) == torch.bfloat16
+    assert (
+        resolve_mla_kv_cache_dtype(args, config, is_draft=True) == torch.float8_e4m3fn
+    )
     assert (
         resolve_mla_kv_cache_dtype(args, config, is_draft=False) == torch.float8_e4m3fn
     )
+
+
+def test_a_bf16_target_cache_still_gives_the_dspark_draft_bf16() -> None:
+    args = SimpleNamespace(kv_cache_dtype="auto", speculative_algorithm="DSPARK")
+    config = SimpleNamespace(hf_config=SimpleNamespace(model_type="k3_dspark"))
+    assert resolve_mla_kv_cache_dtype(
+        args, config, is_draft=True
+    ) == resolve_mla_kv_cache_dtype(args, config, is_draft=False)
 
 
 def test_other_mla_drafts_keep_the_requested_cache_dtype() -> None:
