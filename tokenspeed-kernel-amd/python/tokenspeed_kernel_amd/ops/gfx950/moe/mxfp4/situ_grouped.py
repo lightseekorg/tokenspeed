@@ -52,11 +52,6 @@ GROUPED_FUSED_ALIGN_MAX_ROUTES = 128
 # not skip the instruction.  A 16-token batch therefore issues 25.7M atomics to
 # perform 0.92M useful ones.
 #
-# Measured on the K3 shape (3584x512, 112 experts, top-k 16), atomics are
-# slower than the scratch buffer from 2 tokens up: 1.2x at 2 tokens, 2.2x at
-# 4, and 2.6-3.0x from 8 through 128.  They only come out ahead at 1 token,
-# and a different kernel handles that batch anyway.  Hence 0.
-#
 # The constant stays instead of deleting the atomic path outright, so the
 # comparison is easy to redo if the padding ever stops dominating.
 GROUPED_ATOMIC_COMBINE_MAX_TOKENS = 0
