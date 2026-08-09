@@ -25,6 +25,11 @@ The package contains BF16, FP8, and dynamically quantized MXFP4 activation
 paths. It keeps the production stages behind stage-specific modules: prefill
 stage 1/2 and decode stage 1/2, while ``routing.py`` exposes the fused dense
 top-k helpers used by decode and package prefill.
+
+The ``fused/`` subpackage holds the fused single-launch MoE family (pipelined
+ragged GEMM, warp/medium decode, ragged-metadata routing, activation
+quantization, and the model-facing dispatch policy). See ``README.md`` for
+how the staged files here and ``fused/`` relate.
 """
 
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_stage1 import (

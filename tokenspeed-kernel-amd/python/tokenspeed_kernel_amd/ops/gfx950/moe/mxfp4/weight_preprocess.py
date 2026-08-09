@@ -25,16 +25,21 @@ from typing import Any
 
 import torch
 
+# The gdot128 preshuffle below must mirror the MFMA geometry the fused
+# pipelined kernel reads with (fused/pipelined_program preshuffled-W layouts).
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._common import (
+    _GLUON_DOT_K_QUAD,
+    _GLUON_DOT_K_WIDTH,
+    _GLUON_DOT_N_LANE,
+    _GLUON_DOT_SUB_TILE_K,
+    _extract_gluon_raw_w,
+    _extract_gluon_raw_w_unshuffled,
+)
+
 # CDNA4 MXFP4 scale layout is defined once in mxfp4_cdna4_scale_layout so the
 # weight-scale (B) preshuffle here and the activation-scale (A) gather in
 # mxfp4.scale stays in lock-step. Local aliases preserve the
 # historical private names used throughout this module.
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
-    CDNA4_SCALE_K_BLOCK as _CDNA4_SCALE_K_BLOCK,
-)
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
-    CDNA4_SCALE_N_BLOCK as _CDNA4_SCALE_N_BLOCK,
-)
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
     MXFP4_BLOCK as _MXFP_BLOCK_SIZE,
 )
@@ -153,9 +158,122 @@ def _pad_w2_to_block_n(w: torch.nn.Module, block_n: int) -> None:
     )
 
 
-def _attach_gluon_preshuffle(w: torch.nn.Module) -> None:
-    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4 import fused as fused_mxfp_gfx950
+def shuffle_weight_for_gluon_dot_layout(
+    w: torch.Tensor,
+    *,
+    block_k_pk: int = 128,
+    block_n: int = 128,
+) -> torch.Tensor:
+    K_pk, N = w.shape[-2], w.shape[-1]
 
+    if block_k_pk <= 0 or block_k_pk % _GLUON_DOT_SUB_TILE_K != 0:
+        raise ValueError(
+            f"shuffle_weight_for_gluon_dot_layout requires block_k_pk "
+            f"to be a positive multiple of {_GLUON_DOT_SUB_TILE_K} "
+            f"(MFMA SUB_TILE_K); got {block_k_pk}."
+        )
+    if block_n <= 0 or block_n % _GLUON_DOT_N_LANE != 0:
+        raise ValueError(
+            f"shuffle_weight_for_gluon_dot_layout requires block_n to "
+            f"be a positive multiple of {_GLUON_DOT_N_LANE} (MFMA "
+            f"N_LANE); got {block_n}."
+        )
+    # The preshuffled W path uses tile-level predicates instead of a full
+    # per-element N mask, so N must be block_n-aligned. The combine GEMM pads
+    # W + W-scale at the backend before this helper sees the tensor; we still
+    # assert here to catch unaligned callers.
+    if N % block_n != 0:
+        raise ValueError(
+            f"shuffle_weight_for_gluon_dot_layout requires N "
+            f"divisible by block_n={block_n} (got N={N}); the kernel's "
+            f"preshuffled W path assumes block_n-aligned N. Pad the raw W "
+            f"and its e8m0 W-scale at the backend layer (W with zeros, "
+            f"scale with 127 = identity) BEFORE calling "
+            f"``swizzle_mxfp4`` and this helper; trim the kernel "
+            f"output back to the logical N in the high-level launcher."
+        )
+    k_tile_bytes = block_k_pk * block_n
+    # Zero-pad K_pk to a multiple of block_k_pk (kernel's k_limit_w
+    # masks the tail); supports gpt-oss-120b H=2880 etc.
+    K_pk_padded = (K_pk + block_k_pk - 1) // block_k_pk * block_k_pk
+    N_CTA_TILES = N // block_n
+
+    # In-tile dims: (n_block, k_block, k_quad, n_in_sub, k_within).
+    k_block_dim = block_k_pk // _GLUON_DOT_SUB_TILE_K
+    stride_n_in_sub = _GLUON_DOT_K_WIDTH
+    stride_k_quad = _GLUON_DOT_N_LANE * _GLUON_DOT_K_WIDTH
+    stride_k_block = _GLUON_DOT_K_QUAD * stride_k_quad
+    stride_n_block = k_block_dim * stride_k_block
+
+    # (k, n) -> shuffled HBM byte offset within one CTA tile.
+    k = torch.arange(block_k_pk, dtype=torch.int64).view(-1, 1)
+    n = torch.arange(block_n, dtype=torch.int64).view(1, -1)
+    k_within = k % _GLUON_DOT_K_WIDTH
+    k_quad = (k // _GLUON_DOT_K_WIDTH) % _GLUON_DOT_K_QUAD
+    k_block = k // _GLUON_DOT_SUB_TILE_K
+    n_in_sub = n % _GLUON_DOT_N_LANE
+    n_block_in_tile = n // _GLUON_DOT_N_LANE
+    in_tile_offset = (
+        n_block_in_tile * stride_n_block
+        + k_block * stride_k_block
+        + k_quad * stride_k_quad
+        + n_in_sub * stride_n_in_sub
+        + k_within
+    )
+
+    # Across CTA tiles: tile (kt, nt) -> byte (kt * N_CTA_TILES + nt) * k_tile_bytes.
+    K_grid_full = torch.arange(K_pk_padded, dtype=torch.int64).view(-1, 1)
+    N_grid_full = torch.arange(N, dtype=torch.int64).view(1, -1)
+    kt = K_grid_full // block_k_pk
+    nt = N_grid_full // block_n
+    k_in_tile = K_grid_full % block_k_pk
+    n_in_tile = N_grid_full % block_n
+    in_tile_2d = in_tile_offset[k_in_tile, n_in_tile]  # [K_pk_padded, N]
+    P = (kt * N_CTA_TILES + nt) * k_tile_bytes + in_tile_2d
+
+    leading_shape = list(w.shape[:-2])
+    leading = 1
+    for s in leading_shape:
+        leading *= s
+    w_kn = w.reshape(leading, K_pk, N)
+    # Zero-pad K_pk -> K_pk_padded; the kernel's k_limit_w masks the tail.
+    if K_pk_padded != K_pk:
+        pad = torch.zeros(
+            leading, K_pk_padded - K_pk, N, dtype=w.dtype, device=w.device
+        )
+        w_kn_padded = torch.cat([w_kn, pad], dim=-2)
+    else:
+        w_kn_padded = w_kn
+    # K-innermost flat source: src[e, n*K_pk_padded + k] = W[e, k, n].
+    w_nk_contig = w_kn_padded.transpose(-1, -2).contiguous()
+    src_flat = w_nk_contig.reshape(leading, K_pk_padded * N)
+
+    K_grid = (
+        torch.arange(K_pk_padded, dtype=torch.int64).view(-1, 1).expand(K_pk_padded, N)
+    )
+    N_grid = torch.arange(N, dtype=torch.int64).view(1, -1).expand(K_pk_padded, N)
+    src_idx_kn = (N_grid * K_pk_padded + K_grid).flatten().to(w.device)
+    P_flat = P.flatten().to(w.device)
+
+    src_in_kn_order = src_flat.index_select(-1, src_idx_kn)
+    out_flat = torch.empty(leading, K_pk_padded * N, dtype=w.dtype, device=w.device)
+    out_flat.scatter_(
+        -1,
+        P_flat.unsqueeze(0).expand_as(out_flat),
+        src_in_kn_order,
+    )
+
+    # Shape is (..., K_pk_padded, N); ``k_limit_w`` (= original K_pk)
+    # masks the padded tail. Launcher must pass logical K from X.
+    out = out_flat.view(*leading_shape, K_pk_padded, N)
+    out.is_shuffled_for_gluon_dot = True
+    out.original_k_pk = K_pk
+    out.gluon_dot_block_k_pk = block_k_pk
+    out.gluon_dot_block_n = block_n
+    return out
+
+
+def _attach_gluon_preshuffle(w: torch.nn.Module) -> None:
     targets = (
         ("w13_weight_triton_tensor", None),
         ("w2_weight_triton_tensor", getattr(w, "_w2_logical_n", None)),
@@ -164,9 +282,9 @@ def _attach_gluon_preshuffle(w: torch.nn.Module) -> None:
         wrapped = getattr(w, attr, None)
         if wrapped is None:
             continue
-        raw = fused_mxfp_gfx950._extract_gluon_raw_w(wrapped)
+        raw = _extract_gluon_raw_w(wrapped)
         try:
-            shuffled = fused_mxfp_gfx950.shuffle_weight_for_gluon_dot_layout(raw)
+            shuffled = shuffle_weight_for_gluon_dot_layout(raw)
         except (AssertionError, ValueError):
             continue
         if logical_n is not None and int(logical_n) != int(shuffled.shape[-1]):
@@ -177,13 +295,11 @@ def _attach_gluon_preshuffle(w: torch.nn.Module) -> None:
 
 
 def _attach_w2_logical_n(w: torch.nn.Module) -> None:
-    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4 import fused as fused_mxfp_gfx950
-
     logical_n = getattr(w, "_w2_logical_n", None)
     wrapped = getattr(w, "w2_weight_triton_tensor", None)
     if logical_n is None or wrapped is None:
         return
-    raw = fused_mxfp_gfx950._extract_gluon_raw_w_unshuffled(wrapped)
+    raw = _extract_gluon_raw_w_unshuffled(wrapped)
     if int(logical_n) != int(raw.shape[-1]):
         raw.original_n = int(logical_n)
         wrapped.original_n = int(logical_n)
