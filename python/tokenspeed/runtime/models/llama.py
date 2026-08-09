@@ -265,7 +265,13 @@ class LlamaAttention(nn.Module):
         return create_fused_set_kv_buffer_arg(
             value=v.view(n, self.num_kv_heads, self.head_dim),
             layer=self.attn,
-            out_cache_loc=out_cache_loc,
+            # Cache path: prewrite at this layer's group locations. Identity on
+            # the legacy single-table path; without it a grouped pool would get
+            # the scheduler's locations and the write would miss the pages this
+            # layer reads.
+            out_cache_loc=ctx.attn_backend.select_out_cache_loc(
+                self.attn, out_cache_loc, ctx.forward_mode
+            ),
             token_to_kv_pool=ctx.token_to_kv_pool,
         )
 
