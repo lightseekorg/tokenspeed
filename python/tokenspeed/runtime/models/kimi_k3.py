@@ -127,7 +127,6 @@ from tokenspeed.runtime.layers.linear import (
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.latent import (
     MULTIMEM_AR_MAX_TOKENS,
-    MULTIMEM_AR_MIN_TOKENS,
     K3MoETailTier,
     Kimi3LatentProjection,
     Kimi3MoEExecutionPlan,
@@ -1204,23 +1203,17 @@ class KimiLinearMoE(nn.Module):
             )
             torch.distributed.all_reduce(supported, op=torch.distributed.ReduceOp.MIN)
             if bool(supported.item()):
-                try:
-                    self._latent_tail = KimiK3LatentTailOp.initialize(
-                        group=torch.distributed.group.WORLD,
-                        hidden_size=config.hidden_size,
-                        latent_size=self.routed_hidden,
-                        rms_eps=self.routed_expert_norm.variance_epsilon,
-                        device=torch.device("cuda", torch.cuda.current_device()),
-                    )
-                    assert (
-                        self._latent_tail.max_num_tokens < MULTIMEM_AR_MIN_TOKENS
-                    ), "fused-tail capacity must stay below the multimem window"
-                    logger.info("multicast latent tail engaged")
-                except Exception:
-                    # A non-uniform mid-constructor failure would strand peers
-                    # in its collectives; die loudly instead of half-hanging.
-                    logger.exception("multicast latent tail init failed")
-                    raise
+                # Deliberately unguarded: the constructor rendezvouses, so a
+                # rank that failed mid-way has already stranded its peers.
+                # Propagating kills the whole job, which is the good outcome.
+                self._latent_tail = KimiK3LatentTailOp.initialize(
+                    group=torch.distributed.group.WORLD,
+                    hidden_size=config.hidden_size,
+                    latent_size=self.routed_hidden,
+                    rms_eps=self.routed_expert_norm.variance_epsilon,
+                    device=torch.device("cuda", torch.cuda.current_device()),
+                )
+                logger.info("multicast latent tail engaged")
 
             # A rank diverging on tail eligibility would deadlock the collective.
             flag = torch.tensor(

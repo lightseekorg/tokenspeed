@@ -100,6 +100,8 @@ def select_k3_moe_tail_tier(
     Returns:
         The best applicable ``K3MoETailTier``.
     """
+    # Tested first, so a fused-tail capacity that ever reached into the
+    # multimem window would still resolve here rather than overlap.
     if graph_phase and 1 <= num_tokens <= tail_fusion_max_tokens:
         return K3MoETailTier.TAIL_FUSION
     if not fused_moe_ar:
