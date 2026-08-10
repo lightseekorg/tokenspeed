@@ -17,10 +17,13 @@ env:
 install:
   - bash test/ci_system/install_deps.sh
 ut:
+  # A wedged GPU can leave pytest silent until GitHub cancels the 60-minute job.
+  # Bound each command so the latest-main retry workflow sees a real failure.
+  # If a test stalls, faulthandler dumps thread stacks before timeout stops it.
   commands:
-    - python3 -m pytest tokenspeed-kernel/test/test_numerics.py -v
-    - python3 -m pytest tokenspeed-kernel/test/thirdparty/test_trtllm_comm.py -v
-    - python3 -m pytest tokenspeed-kernel/test/thirdparty/test_cuda.py -v
-    - python3 -m pytest tokenspeed-kernel/test/ -v --ignore=tokenspeed-kernel/test/test_numerics.py --ignore=tokenspeed-kernel/test/thirdparty/test_trtllm_comm.py --ignore=tokenspeed-kernel/test/thirdparty/test_cuda.py
+    - timeout -k 1m "${CI_KERNEL_UT_TIMEOUT:-20m}" python3 -m pytest tokenspeed-kernel/test/test_numerics.py -v -o faulthandler_timeout=600
+    - timeout -k 1m "${CI_KERNEL_UT_TIMEOUT:-20m}" python3 -m pytest tokenspeed-kernel/test/thirdparty/test_trtllm_comm.py -v -o faulthandler_timeout=600
+    - timeout -k 1m "${CI_KERNEL_UT_TIMEOUT:-20m}" python3 -m pytest tokenspeed-kernel/test/thirdparty/test_cuda.py -v -o faulthandler_timeout=600
+    - timeout -k 1m "${CI_KERNEL_UT_TIMEOUT:-20m}" python3 -m pytest tokenspeed-kernel/test/ -v --ignore=tokenspeed-kernel/test/test_numerics.py --ignore=tokenspeed-kernel/test/thirdparty/test_trtllm_comm.py --ignore=tokenspeed-kernel/test/thirdparty/test_cuda.py -o faulthandler_timeout=600
 report:
   github_step_summary: true
