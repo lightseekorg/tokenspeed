@@ -187,6 +187,9 @@ Rules:
   under `tokenspeed serve` the engine's own port is allocated per node. The
   constant also stays clear of the kernel's ephemeral range, which is checked
   at startup. Pass `--dist-init-addr` to use a different port.
+- A single-node launch without `--dist-init-addr` places its initial local
+  control-port span below Linux's default ephemeral range. On hosts configured
+  with an ephemeral range that starts lower, set `--dist-init-addr` explicitly.
 
 Apply the same NCCL transport and channel settings on every node as well. In
 particular, do not mix IB and Socket selection or different

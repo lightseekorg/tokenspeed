@@ -42,12 +42,19 @@ from tokenspeed.runtime.utils import (
     maybe_model_redirect,
     nullable_str,
 )
-from tokenspeed.runtime.utils.launcher import check_dist_init_port, detect_topology
+from tokenspeed.runtime.utils.launcher import (
+    DIST_INIT_DEFAULT_PORT,
+    check_dist_init_port,
+    detect_topology,
+)
 from tokenspeed.runtime.utils.network import is_port_available
 
 logger = get_colorful_logger(__name__)
 
 ENABLE_CP = os.environ.get("ENABLE_CP", "false").lower() in ("true", "1")
+
+_DIST_INIT_PORT_SLOT_COUNT = 900
+_DIST_INIT_PORT_SLOT_WIDTH = 10
 
 # Spec-decode overshoot spans the physical KV extent must absorb past the
 # logical context_len. The overlap scheduler steps a finished request at most
@@ -2145,9 +2152,6 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
     return server_args
 
 
-ZMQ_TCP_PORT_DELTA = 233
-
-
 @dataclasses.dataclass
 class PortArgs:
     # The ipc filename for AsyncLLM to receive BatchTokenIDOut directly
@@ -2191,7 +2195,16 @@ class PortArgs:
                     f"When dp_size > 1 (dp_size={server_args.mapping.attn.dp_size}), you must provide --dist-init-addr. "
                     f"Example: --dist-init-addr 127.0.0.1:4000"
                 )
-            dist_init_addr = ("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
+            # Reserve slot 0 for the launcher default. With Linux's default
+            # ephemeral floor (32768), 900 ten-port slots keep the initial
+            # control span below it (max 32462). Modulo collisions are handled
+            # by the scan below; lower custom floors require --dist-init-addr.
+            dist_init_addr = (
+                "127.0.0.1",
+                DIST_INIT_DEFAULT_PORT
+                + (server_args.port % _DIST_INIT_PORT_SLOT_COUNT + 1)
+                * _DIST_INIT_PORT_SLOT_WIDTH,
+            )
         elif server_args.dist_init_addr is None:
             raise ValueError(
                 f"--dist-init-addr is required for nnodes={server_args.mapping.nnodes} "
