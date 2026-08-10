@@ -79,6 +79,7 @@ and `GET /model_info` to read the model path and version together.
 | `--max-total-tokens` | Override the automatically calculated token pool size. |
 | `--block-size` | KV cache block size. |
 | `--enable-prefix-caching` / `--no-enable-prefix-caching` | Enable or disable prefix cache reuse. |
+| `--max-loras` | Maximum number of *distinct* LoRA adapters the scheduler may place in one batch. A request that would introduce a further adapter is deferred to a later step; requests reusing an adapter already in the batch are never deferred, and base-model requests never count against the limit. Defaults to `0`, which disables LoRA scheduling entirely rather than admitting zero adapters. |
 | `--enforce-eager` | Disable CUDA graph execution. |
 | `--max-cudagraph-capture-size` | Largest batch size to capture with CUDA graphs. |
 | `--cudagraph-capture-sizes` | Explicit CUDA graph capture sizes. |
