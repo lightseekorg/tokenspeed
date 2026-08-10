@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <string>
 #include <variant>
 #include <vector>
 
@@ -46,7 +47,14 @@ struct KvBlockRemovedEvent {
 
 using KvCacheEvent = std::variant<KvBlockStoredEvent, KvBlockRemovedEvent>;
 
+// namespace_keys qualifies the block the same way the prefix cache's page
+// hashes are qualified, so two LoRA adapters sharing a token prefix publish
+// distinct block hashes. It must carry the same keys as the page hash for the
+// block, or an event consumer's view of what is cached diverges from the
+// scheduler's. An empty list leaves the hash byte-identical to a build without
+// namespacing, which is what keeps base-model event streams unchanged.
 std::uint64_t HashKvBlock(std::span<const std::int32_t> token_ids,
-                          std::optional<std::uint64_t> parent_hash = std::nullopt);
+                          std::optional<std::uint64_t> parent_hash = std::nullopt,
+                          std::span<const std::string> namespace_keys = {});
 
 }  // namespace tokenspeed

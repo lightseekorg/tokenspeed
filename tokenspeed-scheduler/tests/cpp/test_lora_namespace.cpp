@@ -21,10 +21,12 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
 
+#include "scheduler/kv_cache_events.h"
 #include "scheduler/page_hasher.h"
 
 namespace tokenspeed::test {
@@ -131,6 +133,46 @@ TEST(LoraNamespaceHashTest, AdvanceFromMidChainStaysIsolated) {
 
     EXPECT_NE(AdvancePagedHashes(spans, /*first_page=*/0, "", /*past_end_page=*/1, Keys(key)),
               AdvancePagedHashes(spans, /*first_page=*/0, "", /*past_end_page=*/1));
+}
+
+// ---- published KV-cache event hashes --------------------------------------
+// The event stream carries its own block hash lineage, separate from the page
+// hashes above. Namespacing only the page hashes would leave two adapters
+// publishing identical block hashes for the same prefix, so a cache-aware
+// consumer could hand one adapter's block to the other.
+
+TEST(LoraNamespaceKvEventTest, NoKeysIsByteIdenticalToUnnamespacedBlockHash) {
+    const std::vector<std::int32_t> tokens = {1, 2, 3, 4};
+    EXPECT_EQ(HashKvBlock(Tokens(tokens), std::nullopt, {}), HashKvBlock(Tokens(tokens), std::nullopt));
+    EXPECT_EQ(HashKvBlock(Tokens(tokens), std::optional<std::uint64_t>{7}, {}),
+              HashKvBlock(Tokens(tokens), std::optional<std::uint64_t>{7}));
+}
+
+TEST(LoraNamespaceKvEventTest, DifferentAdaptersPublishDifferentBlockHashes) {
+    const std::vector<std::int32_t> tokens = {1, 2, 3, 4};
+    const std::vector<std::string> key_a = {"1"};
+    const std::vector<std::string> key_b = {"2"};
+
+    const std::uint64_t base = HashKvBlock(Tokens(tokens), std::nullopt);
+    const std::uint64_t a = HashKvBlock(Tokens(tokens), std::nullopt, Keys(key_a));
+    const std::uint64_t b = HashKvBlock(Tokens(tokens), std::nullopt, Keys(key_b));
+
+    EXPECT_NE(a, b) << "adapters collide in the published event stream";
+    EXPECT_NE(a, base) << "adapter collides with the base model";
+    EXPECT_NE(b, base) << "adapter collides with the base model";
+}
+
+TEST(LoraNamespaceKvEventTest, NamespaceSurvivesTheParentChain) {
+    // The lineage is chained like the page hashes, so a divergence at the first
+    // block must keep later blocks apart even though their tokens match.
+    const std::vector<std::int32_t> first = {1, 2};
+    const std::vector<std::int32_t> second = {3, 4};
+    const std::vector<std::string> key_a = {"1"};
+    const std::vector<std::string> key_b = {"2"};
+
+    const std::uint64_t a0 = HashKvBlock(Tokens(first), std::nullopt, Keys(key_a));
+    const std::uint64_t b0 = HashKvBlock(Tokens(first), std::nullopt, Keys(key_b));
+    EXPECT_NE(HashKvBlock(Tokens(second), a0, Keys(key_a)), HashKvBlock(Tokens(second), b0, Keys(key_b)));
 }
 
 }  // namespace

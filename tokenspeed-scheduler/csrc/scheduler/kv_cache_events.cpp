@@ -51,7 +51,8 @@ void MixInt32(std::uint64_t& hash, std::int32_t value) {
 
 }  // namespace
 
-std::uint64_t HashKvBlock(std::span<const std::int32_t> token_ids, std::optional<std::uint64_t> parent_hash) {
+std::uint64_t HashKvBlock(std::span<const std::int32_t> token_ids, std::optional<std::uint64_t> parent_hash,
+                          std::span<const std::string> namespace_keys) {
     std::uint64_t hash = kFnvOffsetBasis;
     MixByte(hash, parent_hash.has_value() ? 1 : 0);
     if (parent_hash.has_value()) {
@@ -60,6 +61,19 @@ std::uint64_t HashKvBlock(std::span<const std::int32_t> token_ids, std::optional
     MixUint64(hash, static_cast<std::uint64_t>(token_ids.size()));
     for (std::int32_t token_id : token_ids) {
         MixInt32(hash, token_id);
+    }
+    // Terminal block, so an empty list can be skipped outright and leave the
+    // digest byte-identical to the un-namespaced form. A non-empty list writes
+    // its count and each key's length first, so no two distinct key lists can
+    // mix the same byte sequence.
+    if (!namespace_keys.empty()) {
+        MixUint64(hash, static_cast<std::uint64_t>(namespace_keys.size()));
+        for (const std::string& key : namespace_keys) {
+            MixUint64(hash, static_cast<std::uint64_t>(key.size()));
+            for (char c : key) {
+                MixByte(hash, static_cast<std::uint8_t>(c));
+            }
+        }
     }
     return hash;
 }
