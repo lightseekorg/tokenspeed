@@ -526,6 +526,35 @@ class GptOssDecoderLayer(CompiledMoEDecoderLayer):
 class GptOssModel(BaseTransformerModel):
     layer_cls = GptOssDecoderLayer
 
+    # Set by GptOssForCausalLM once the weight snapshots exist; None disables
+    # the megakernel and every request takes the inherited per-op path.
+    _megakernel = None
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        ctx: ForwardContext,
+        out_cache_loc: torch.Tensor,
+        input_embeds: torch.Tensor | None = None,
+    ):
+        """Replace the 36-layer loop with one persistent kernel launch.
+
+        The inherited forward returns POST-final-norm hidden states, so the
+        megakernel includes the final RMSNorm. Anything it does not support
+        falls through to the normal path -- prefill, TP>1, speculative decode,
+        Eagle3 aux capture, and batch sizes above the runner's max.
+        """
+        mk = self._megakernel
+        if mk is not None and mk.can_run(ctx, input_embeds, self.layers_to_capture):
+            hidden_states = self.embed_tokens(input_ids)
+            out = mk.run(hidden_states, positions, ctx, out_cache_loc)
+            # run() returns None when the paging metadata is not in the shape it
+            # expects; serve from the normal path rather than emit wrong tokens
+            if out is not None:
+                return out, None
+        return super().forward(input_ids, positions, ctx, out_cache_loc, input_embeds)
+
 
 class GptOssForCausalLM(BaseCausalLM):
     model_cls = GptOssModel
@@ -533,6 +562,104 @@ class GptOssForCausalLM(BaseCausalLM):
 
     def get_attention_sliding_window_size(self):
         return get_attention_sliding_window_size(self.config)
+
+    def process_weights_after_loading(self, module=None) -> None:
+        """Snapshot raw MXFP4 experts for the decode megakernel.
+
+        The loader walks ``model.named_modules()``, which yields the root first,
+        so this runs before every ``MoELayer.process_weights_after_loading`` --
+        i.e. before the gfx950 MoE preprocessor swizzles the weights and
+        ``_release_parameter``s the raw ones. ``post_quant_warmup`` runs after
+        that loop and would be too late.
+        """
+        import os
+
+        from tokenspeed.runtime.models.gpt_oss_megakernel import (
+            build_megakernel_moe_weights,
+            megakernel_enabled,
+        )
+        from tokenspeed.runtime.models.gpt_oss_megakernel.weights import (
+            probe_model_structure,
+        )
+
+        if not megakernel_enabled():
+            return
+        if os.environ.get("TOKENSPEED_GPT_OSS_MEGAKERNEL_PROBE", "0") != "0":
+            probe_model_structure(self.model)
+        self.megakernel_moe_weights = build_megakernel_moe_weights(self.model)
+        from tokenspeed.runtime.models.gpt_oss_megakernel import (
+            build_megakernel_attn_weights,
+        )
+
+        self.megakernel_attn_weights = build_megakernel_attn_weights(self.model)
+
+        if self.megakernel_moe_weights is None or self.megakernel_attn_weights is None:
+            logger.warning(
+                "megakernel: weight snapshot incomplete; staying on the "
+                "normal per-op path"
+            )
+            return
+        if self.config.num_attention_heads != 64 or self.config.hidden_size != 2880:
+            logger.warning(
+                "megakernel: kernel is specialised for gpt-oss-120b "
+                "shapes; staying on the normal path"
+            )
+            return
+        # Isolation variant: the MFMA megakernel (barrier read-poll + phase
+        # fusions, ~1.16x dev-harness, bit-exact). Opt in with env
+        # TOKENSPEED_GPT_OSS_MEGAKERNEL_MFMA=1; it swaps only the runner class
+        # (identical weight snapshot) and defaults use_dot=True. The shipped
+        # gpt_oss_megakernel package is untouched.
+        # Second isolation variant: MFMA + master-slave grid barrier (sharded
+        # arrival + single release flag published by pid 0, ~1.68x dev over the
+        # single-counter mfma barrier, bit-exact). Opt in with
+        # TOKENSPEED_GPT_OSS_MEGAKERNEL_MSBAR=1; it supersedes the plain MFMA
+        # flag. Both mfma modules and the shipped package are byte-untouched.
+        _use_msbar = os.environ.get("TOKENSPEED_GPT_OSS_MEGAKERNEL_MSBAR", "0") != "0"
+        _use_mfma = os.environ.get("TOKENSPEED_GPT_OSS_MEGAKERNEL_MFMA", "0") != "0"
+        if _use_msbar:
+            from tokenspeed.runtime.models.gpt_oss_megakernel_mfma_msbar.runner import (
+                GptOssMegakernelRunner,
+            )
+        elif _use_mfma:
+            from tokenspeed.runtime.models.gpt_oss_megakernel_mfma.runner import (
+                GptOssMegakernelRunner,
+            )
+        else:
+            from tokenspeed.runtime.models.gpt_oss_megakernel.runner import (
+                GptOssMegakernelRunner,
+            )
+
+        try:
+            self.model._megakernel = GptOssMegakernelRunner(
+                self.megakernel_attn_weights,
+                self.megakernel_moe_weights,
+                self.config,
+                max_bs=int(
+                    os.environ.get(
+                        "TOKENSPEED_GPT_OSS_MEGAKERNEL_MAX_BS",
+                        global_server_args_dict.get("gpt_oss_megakernel_max_bs", 8),
+                    )
+                ),
+                # fp8-activation path is ~4e-2 rel; precise fp32 dequant is
+                # ~2e-6 and is the default until eval shows fp8 is safe.
+                # The MFMA variant defaults use_dot=True in its own runner, but
+                # honour the env override when it is explicitly set.
+                use_dot=(
+                    os.environ.get(
+                        "TOKENSPEED_GPT_OSS_MEGAKERNEL_DOT",
+                        "1" if (_use_mfma or _use_msbar) else "0",
+                    )
+                    != "0"
+                ),
+            )
+        except Exception as exc:  # never break serving because of the megakernel
+            logger.warning(
+                "megakernel: runner construction failed (%s); staying on "
+                "the normal path",
+                exc,
+            )
+            self.model._megakernel = None
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
