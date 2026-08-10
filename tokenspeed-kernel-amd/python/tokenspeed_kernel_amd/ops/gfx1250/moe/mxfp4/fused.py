@@ -563,7 +563,11 @@ def create_descriptor(
 
         GatherIndx_ptr = GatherIndx + start_m
         offs_m_gather = off_m + gl.arange(0, NUM_INDICES, IDX_LAYOUT)
-        gathered_m = gl.load(GatherIndx_ptr + offs_m_gather).to(gl.int32)
+        gathered_m = gl.load(
+            GatherIndx_ptr + offs_m_gather,
+            mask=start_m + offs_m_gather < M,
+            other=0,
+        ).to(gl.int32)
 
         x_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=x_ptr,
@@ -599,7 +603,10 @@ def create_descriptor(
             x_scale_offs = off_m * stride_x_scale_m // PRESHUFFLE_FACTOR
             x_scale_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
                 base=x_scale_ptr + x_scale_offs,
-                shape=(M // PRESHUFFLE_FACTOR, K // SCALE_BLOCK * PRESHUFFLE_FACTOR),
+                shape=(
+                    (M + PRESHUFFLE_FACTOR - 1) // PRESHUFFLE_FACTOR,
+                    K // SCALE_BLOCK * PRESHUFFLE_FACTOR,
+                ),
                 strides=(stride_x_scale_m, stride_x_scale_k),
                 block_shape=(cfg.BLOCK_M_PRESHUFFLED, cfg.BLOCK_K_SCALE_PRESHUFFLED),
                 layout=cfg.shared_layout_x_scale,
@@ -1651,6 +1658,7 @@ def _matmul(
     stride_y_z,
     stride_y_m,
     stride_y_n,
+    XGlobalScale,
     X,
     stride_x_z,
     stride_x_m,
@@ -1856,6 +1864,9 @@ def _matmul(
         WMxScale_ptr = WMxScale
         w_scale_offs = 0
 
+    descriptor_m = M
+    if not cfg.USE_GATHER:
+        descriptor_m = eM - off_m
     x_desc, w_desc, x_scale_desc, w_scale_desc, gathered_m = create_descriptor(
         cfg,
         X_ptr,
@@ -1866,7 +1877,7 @@ def _matmul(
         off_k_x,
         w_offs,
         w_scale_offs,
-        M,
+        descriptor_m,
         N,
         K,
         stride_x_m,
@@ -1919,6 +1930,8 @@ def _matmul(
         acc = pgm.warp_pipeline(loop_k)
     else:
         acc = pgm.pipeline(loop_k)
+    if XGlobalScale is not None and not cfg.WITH_X_MX_SCALE:
+        acc *= gl.load(XGlobalScale).to(gl.float32)
 
     # bias
     b_dtype = B.dtype if B is not None else gl.float32
@@ -2119,6 +2132,7 @@ def matmul(
     precision_config: PrecisionConfig | None = None,
     fused_activation: FusedActivation | None = None,
     *,
+    x_global_scale: torch.Tensor | float | None = None,
     num_buffers: int = 2,
     scale_block: int = 32,
     block_m: int = 128,
@@ -2145,6 +2159,7 @@ def matmul(
         gather_indx: Optional source row indices for dispatch.
         scatter_indx: Optional destination row indices for combine writeback.
         precision_config: MX scale/output dtype configuration.
+        x_global_scale: Optional scalar activation dequantization scale.
         fused_activation: Optional SwiGLU activation descriptor.
 
     Returns:
@@ -2267,10 +2282,22 @@ def matmul(
     bias_stride = None if bias is None else bias.stride(0)
 
     swizzle_mx_scale = None if b_scale is None else b_scale.storage.layout.name
+    if x_global_scale is not None:
+        if isinstance(x_global_scale, torch.Tensor):
+            if x_global_scale.numel() != 1:
+                raise ValueError("x_global_scale must be scalar")
+            x_global_scale = x_global_scale.to(
+                device=a.device, dtype=torch.float32
+            ).contiguous()
+        else:
+            x_global_scale = torch.tensor(
+                [float(x_global_scale)], device=a.device, dtype=torch.float32
+            )
 
     kernel = _matmul[(grid,)](
         c_storage.data,
         *out_matmul.stride(),
+        x_global_scale,
         a_storage.data,
         *a_strides,
         a_scale,
@@ -2369,7 +2396,7 @@ def gluon_mxfp_dispatch_swiglu(
     x_scale_ragged_padded: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Dispatch GEMM + fused SwiGLU using the gfx1250 Gluon MoE kernel."""
-    del x_global_scale, use_warp_pipeline, use_slice_mn, use_slice_n
+    del use_warp_pipeline, use_slice_mn, use_slice_n
     del persistent, num_ctas, w_preshuffle, x_scale_ragged_padded
     if out_quant_scale is not None or out_quant_format is not None:
         raise NotImplementedError(
@@ -2396,6 +2423,7 @@ def gluon_mxfp_dispatch_swiglu(
         a_ragged_metadata=a_ragged_metadata,
         gather_indx=gather_tensor,
         precision_config=precision,
+        x_global_scale=x_global_scale,
         fused_activation=activation,
         scale_preshuffle=(scale_load_mode == "swizzle"),
         block_m=block_m,
@@ -2439,7 +2467,7 @@ def gluon_mxfp_combine(
     x_scale_ragged_padded: bool = False,
 ) -> torch.Tensor:
     """Combine GEMM using the gfx1250 Gluon MoE kernel."""
-    del x_global_scale, use_warp_pipeline, use_slice_mn, use_slice_n
+    del use_warp_pipeline, use_slice_mn, use_slice_n
     del persistent, num_ctas, w_preshuffle, x_scale_ragged_padded
     if gate_scal is not None:
         raise NotImplementedError(
@@ -2462,6 +2490,7 @@ def gluon_mxfp_combine(
         a_ragged_metadata=a_ragged_metadata,
         scatter_indx=scatter_tensor,
         precision_config=precision,
+        x_global_scale=x_global_scale,
         scale_preshuffle=(scale_load_mode == "swizzle"),
         block_m=block_m,
         block_n=block_n,
@@ -2626,7 +2655,9 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
     topk_weights = topk_weights.to(
         device=hidden_states.device, dtype=torch.float32
     ).contiguous()
-    if bool(((topk_ids < 0) | (topk_ids >= num_experts)).any().item()):
+    if not torch.cuda.is_current_stream_capturing() and bool(
+        ((topk_ids < 0) | (topk_ids >= num_experts)).any().item()
+    ):
         raise NotImplementedError(
             "gfx1250 Gluon MXFP4 combine does not support masked or EP-local top-k ids"
         )
@@ -2646,6 +2677,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         w13_weight,
         w13_mx_scale,
         x_format="e4m3",
+        x_global_scale=w13_weight.act_scale,
         bias=w13_bias,
         a_ragged_metadata=ragged_metadata,
         gather_indx=gather_indx,
@@ -2669,6 +2701,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         w2_weight,
         w2_mx_scale,
         x_format="e4m3",
+        x_global_scale=w2_weight.act_scale,
         bias=w2_bias,
         a_ragged_metadata=ragged_metadata,
         scatter_indx=scatter_indx,
@@ -2707,7 +2740,6 @@ def gluon_mxfp_ragged_matmul(
     **extra_kwargs,
 ) -> torch.Tensor:
     """Tokenspeed-style wrapper around ``matmul`` for routed MoE calls."""
-    del x_global_scale
     if out_dtype is None:
         out_dtype = x.dtype if x.dtype.is_floating_point else torch.bfloat16
     gather_indx = _adapt_index(gather_indx, "src_indx")
@@ -2748,6 +2780,7 @@ def gluon_mxfp_ragged_matmul(
             w_mx_scale,
             x_scale=x_mx_scale,
             x_format=x_format,
+            x_global_scale=x_global_scale,
             bias=bias,
             a_ragged_metadata=a_ragged_metadata,
             scatter_indx=scatter_indx,
@@ -2769,6 +2802,7 @@ def gluon_mxfp_ragged_matmul(
             w_mx_scale,
             x_scale=x_mx_scale,
             x_format=x_format,
+            x_global_scale=x_global_scale,
             bias=bias,
             a_ragged_metadata=a_ragged_metadata,
             gather_indx=gather_indx,
@@ -2791,6 +2825,7 @@ def gluon_mxfp_ragged_matmul(
         gather_indx=_index_tensor(gather_indx, "src_indx"),
         scatter_indx=_index_tensor(scatter_indx, "dst_indx"),
         precision_config=precision,
+        x_global_scale=x_global_scale,
         scale_preshuffle=scale_preshuffle,
         w_transpose=w_transpose,
         **launch_kwargs,
