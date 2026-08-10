@@ -34,6 +34,7 @@ mailbox (NVLS), and a barrier-free Lamport gather. Buffers come from stock
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 
 import torch
@@ -76,7 +77,17 @@ def latent_tail_supported(
     latent_size: int,
     dtype: torch.dtype,
 ) -> bool:
-    """Cheap, non-collective eligibility probe (no rendezvous)."""
+    """Cheap, non-collective eligibility probe (no rendezvous).
+
+    ``TOKENSPEED_DISABLE_K3_LATENT_TAIL=1`` forces this to False. The tail is
+    the branch's most invasive component -- it replaces the whole tail
+    collective with a multicast mailbox -- so an operator (or an A/B) needs to
+    be able to take it out of the picture without editing code or rebuilding.
+    Reported as unsupported rather than skipped later, so the tier selector
+    sees capacity 0 and every size falls to the ordinary tiers.
+    """
+    if os.environ.get("TOKENSPEED_DISABLE_K3_LATENT_TAIL") == "1":
+        return False
     if tp_size not in _SUPPORTED_TP_SIZES:
         return False
     if (hidden_size, latent_size) != (7168, 3584) or dtype != torch.bfloat16:
