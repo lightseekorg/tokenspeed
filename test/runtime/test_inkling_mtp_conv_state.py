@@ -20,6 +20,13 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+def _inert_publish(bs, dim, rows=3):
+    """Publish plumbing that never fires: a hole-only table."""
+    table = torch.zeros(bs, 64, dtype=torch.int32, device="cuda")
+    ckpt = torch.zeros(1, rows, dim, device="cuda")
+    return table, ckpt
+
+
 class TestInklingCacheContract(unittest.TestCase):
     def test_wrapper_consumes_history_and_checkpoint_state(self):
         from tokenspeed.runtime.layers.attention.backends.inkling import (
@@ -130,6 +137,10 @@ class TestInklingConvRingState(unittest.TestCase):
             cache_indices,
             torch.ones(self.BS, dtype=torch.bool).cuda(),
             seq_lens,
+            *_inert_publish(self.BS, self.DIM),
+            None,
+            num_extends=0,
+            page_size=128,
         )
 
         for i in range(self.BS):
@@ -169,6 +180,10 @@ class TestInklingConvRingState(unittest.TestCase):
             cache_indices,
             torch.ones(self.BS, dtype=torch.bool).cuda(),
             seq_lens,
+            *_inert_publish(self.BS, self.DIM),
+            None,
+            num_extends=0,
+            page_size=128,
         )
 
         expected = pre.clone()
@@ -208,6 +223,10 @@ class TestInklingConvRingState(unittest.TestCase):
             cache_indices,
             torch.ones(self.BS, dtype=torch.bool).cuda(),
             seq_lens,
+            *_inert_publish(self.BS, dim),
+            None,
+            num_extends=0,
+            page_size=128,
         )
 
         # Outside the channel slice (and other layers): unchanged.
@@ -221,50 +240,6 @@ class TestInklingConvRingState(unittest.TestCase):
                 self.assertTrue(
                     torch.equal(state[slot, (20 + j) % self.R], chunk[i * self.K + j])
                 )
-
-    def test_restore_into_ring_rows(self):
-        """Checkpoint restore lands the W-1 pre-boundary rows at their
-        positions' ring rows; invalid rows (hole page / PAD slot / unaligned
-        boundary) are untouched."""
-        from tokenspeed.runtime.layers.attention.backends.inkling import (
-            InklingAttnBackend,
-            InklingConvMetadata,
-        )
-
-        pool = self._make_pool()
-        state = pool.layer_state_wd(0)
-        pre = state.clone()
-        n = 4
-        buf = torch.randn(10, self.W - 1, self.DIM, device="cuda")
-        backend = InklingAttnBackend.__new__(InklingAttnBackend)
-        backend.conv_columns = {
-            "block_tokens": 128,
-            "group_block_tokens": {"state": 128},
-        }
-        table = torch.tensor(
-            # req0: boundary 128 -> page 5; req1: boundary 256 -> hole;
-            # req2: PAD slot; req3: unaligned boundary 131.
-            [[5, 0], [9, 0], [7, 0], [6, 6]],
-            dtype=torch.int32,
-            device="cuda",
-        )
-        md = InklingConvMetadata(
-            query_start_loc=torch.tensor([0, 4, 8, 12, 16], dtype=torch.int32).cuda(),
-            cache_indices=torch.tensor([2, 3, -1, 4], dtype=torch.int32).cuda(),
-            has_initial_state=torch.ones(n, dtype=torch.bool).cuda(),
-            is_decode=False,
-            seq_lens=torch.tensor([132, 260, 132, 135], dtype=torch.int32).cuda(),
-            col_page_table={"state": table},
-        )
-
-        backend.restore_shortconv_checkpoint(state, (buf,), md, "state")
-
-        expected = pre.clone()
-        # req0: boundary 132 - 4 = 128 -> positions 125..127.
-        for j, p in enumerate(range(125, 128)):
-            expected[2, p % self.R] = buf[5, j]
-        # req1: hole page; req2: PAD slot; req3: unaligned. All untouched.
-        self.assertTrue(torch.equal(state, expected))
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
@@ -335,6 +310,10 @@ class TestSconvUnifiedKernel(unittest.TestCase):
             cache_indices,
             torch.ones(B, dtype=torch.bool, device="cuda"),
             seq_lens,
+            *_inert_publish(B, self.DIM),
+            None,
+            num_extends=0,
+            page_size=128,
         )
 
         expected = pre.clone()
@@ -387,7 +366,11 @@ class TestSconvUnifiedKernel(unittest.TestCase):
             cache_indices,
             torch.ones(4, dtype=torch.bool, device="cuda"),
             seq_lens,
-            publish=(table, checkpoint, None, 8),
+            table,
+            checkpoint,
+            None,
+            num_extends=0,
+            page_size=8,
         )
 
         # req0: p*=4 -> page table[0,0]=11
@@ -438,9 +421,13 @@ class TestSconvUnifiedKernel(unittest.TestCase):
             qsl,
             seq_idx,
             cache_indices,
-            torch.zeros(1, dtype=torch.bool, device="cuda"),  # fresh: no borrow
+            torch.zeros(1, dtype=torch.bool, device="cuda"),  # fresh: no taps
             seq_lens,
-            publish=(table, checkpoint, None, page_size),
+            table,
+            checkpoint,
+            None,
+            num_extends=1,
+            page_size=page_size,
         )
 
         zeros = torch.zeros(self.W - 1, self.DIM, device="cuda")
@@ -473,7 +460,11 @@ class TestSconvUnifiedKernel(unittest.TestCase):
             cache_indices,
             torch.ones(1, dtype=torch.bool, device="cuda"),
             seq_lens,
-            publish=(table, field_a, field_b, 8),
+            table,
+            field_a,
+            field_b,
+            num_extends=0,
+            page_size=8,
         )
 
         window = self._ref_window(torch.zeros(3, self.DIM, device="cuda"), x, 4)
@@ -509,7 +500,11 @@ class TestSconvUnifiedKernel(unittest.TestCase):
             cache_indices,
             ones,
             seq_lens,
-            publish=(table, checkpoint, None, 8),
+            table,
+            checkpoint,
+            None,
+            num_extends=0,
+            page_size=8,
         )
         self.assertTrue(
             torch.equal(
@@ -532,7 +527,11 @@ class TestSconvUnifiedKernel(unittest.TestCase):
             cache_indices,
             ones,
             seq_lens,
-            publish=(table, checkpoint, None, 8),
+            table,
+            checkpoint,
+            None,
+            num_extends=0,
+            page_size=8,
         )
         expect = torch.stack([pre[1, 5 % self.R], x1[0], x2[0]])
         self.assertTrue(torch.equal(checkpoint[11], expect))
@@ -560,7 +559,11 @@ class TestSconvUnifiedKernel(unittest.TestCase):
                 cache_indices,
                 ones,
                 seq_lens,
-                publish=(table, checkpoint, None, 8),
+                table,
+                checkpoint,
+                None,
+                num_extends=0,
+                page_size=8,
             )
 
         run()  # warmup compiles outside capture

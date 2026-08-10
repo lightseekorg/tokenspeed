@@ -24,9 +24,7 @@ import pytest
 import torch
 from tokenspeed_kernel.ops.conv import (
     PAD_SLOT_ID,
-    inkling_ring_restore,
     inkling_ring_sconv,
-    inkling_ring_sconv_update,
     seq_idx_from_cu_seqlens,
 )
 
@@ -36,6 +34,7 @@ pytestmark = pytest.mark.skipif(
 
 W = 4
 R = 9  # current-config ring: (W-1) + K(4) + lookback(2); kernels read it from the cache shape
+P = 128  # conv checkpoint page size
 DTYPE = torch.bfloat16
 ATOL = 1e-2
 RTOL = 1e-2
@@ -65,10 +64,38 @@ def ring_rows_at(ring, slot, positions):
     return torch.stack([ring[slot, p % ring.shape[1]] for p in positions])
 
 
-def unified_decode(x, weight, conv_cache, cache_indices, seq_lens):
-    """T=1-per-request call of the unified kernel."""
+def inert_publish(B: int, D: int, device: str):
+    """Publish plumbing that never fires: a hole-only table."""
+    table = torch.zeros(B, 64, dtype=torch.int32, device=device)
+    ckpt = torch.zeros(1, W - 1, D, dtype=DTYPE, device=device)
+    return table, ckpt
+
+
+def make_ckpt(
+    B: int, D: int, device: str, *, num_pages: int = 8, dtype: torch.dtype = DTYPE
+):
+    """A checkpoint field plus an all-hole table for it."""
+    table = torch.zeros(B, 64, dtype=torch.int32, device=device)
+    ckpt = torch.randn(num_pages, W - 1, D, device=device).to(dtype)
+    return table, ckpt
+
+
+def decode(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    conv_cache: torch.Tensor,
+    cache_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    table: torch.Tensor | None = None,
+    ckpt_a: torch.Tensor | None = None,
+    ckpt_b: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """T=1-per-request call of the decode kernel (inert publish by default)."""
     B = x.shape[0]
     device = x.device
+    if table is None:
+        table, ckpt_a = inert_publish(B, x.shape[1], str(device))
     qsl = torch.arange(B + 1, dtype=torch.int32, device=device)
     return inkling_ring_sconv(
         x,
@@ -79,6 +106,11 @@ def unified_decode(x, weight, conv_cache, cache_indices, seq_lens):
         cache_indices,
         torch.ones(B, dtype=torch.bool, device=device),
         seq_lens,
+        table,
+        ckpt_a,
+        ckpt_b,
+        num_extends=0,
+        page_size=P,
     )
 
 
@@ -112,6 +144,9 @@ def _make_prefill_inputs(
 @pytest.mark.parametrize("D", [2048, 6144])
 @pytest.mark.parametrize("use_residual", [True, False])
 def test_sconv_prefill_varlen(D: int, use_residual: bool, device: str) -> None:
+    """Prefill taps read the checkpoint at the aligned chunk start (zeros
+    when cold); the last min(chunk_len + W-1, R) positions persist to the
+    ring in one launch (no epilogue), and covered boundaries publish."""
     lens = [3, 850, 1]
     pre_lens = [128, 0, 256]
     x, weight, conv_cache, cu_seqlens, seq_idx = _make_prefill_inputs(
@@ -122,10 +157,13 @@ def test_sconv_prefill_varlen(D: int, use_residual: bool, device: str) -> None:
     seq_lens = torch.tensor(
         [p + n for p, n in zip(pre_lens, lens)], dtype=torch.int32, device=device
     )
-    prefixes = [
-        torch.randn(W - 1, D, device=device, dtype=DTYPE) for _ in range(len(lens))
-    ]
-    seed_ring_prefix(conv_cache, 2, pre_lens[0], prefixes[0])
+    table, ckpt = make_ckpt(len(lens), D, device, num_pages=12)
+    # req0's prefix window lives at page 3 of its chunk-start boundary; give
+    # req1 real pages for its covered boundaries so publication is testable.
+    table[0, pre_lens[0] // P - 1] = 3
+    for col in range(850 // P):
+        table[1, col] = 4 + col  # pages 4..9 for boundaries 128..768
+    prefix0 = ckpt[3].to(DTYPE)
     cache_snapshot = conv_cache.clone()
 
     y = inkling_ring_sconv(
@@ -137,87 +175,134 @@ def test_sconv_prefill_varlen(D: int, use_residual: bool, device: str) -> None:
         cache_indices,
         has_initial_state,
         seq_lens,
+        table,
+        ckpt,
+        None,
+        num_extends=3,
+        page_size=P,
         use_residual=use_residual,
     )
 
     zeros = torch.zeros(W - 1, D, device=device, dtype=DTYPE)
     cu = cu_seqlens.tolist()
-    for i, prefix in enumerate((prefixes[0], zeros, zeros)):
+    for i, prefix in enumerate((prefix0, zeros, zeros)):
         s, e = cu[i], cu[i + 1]
         ref = ref_sconv(x[s:e], weight, prefix, use_residual=use_residual)
         torch.testing.assert_close(y[s:e], ref, atol=ATOL, rtol=RTOL)
 
-    # Short chunks are persisted in-kernel at their positions' ring rows;
-    # the long chunk (850 > R - (W-1)) and the PAD row leave the ring alone.
+    # Ring: req0 gets its 3 chunk rows plus the restored window (3 + 3 <= R);
+    # req1 gets its last R rows in-kernel; the PAD row leaves the ring alone.
     expected = cache_snapshot.clone()
+    for j in range(W - 1):
+        expected[2, (pre_lens[0] - (W - 1) + j) % R] = prefix0[j]
     for j in range(lens[0]):
         expected[2, (pre_lens[0] + j) % R] = x[cu[0] + j]
-    assert torch.equal(conv_cache, expected)
-
-    # The follow-up pass refills the full ring depth from the long chunk.
-    inkling_ring_sconv_update(
-        x, conv_cache, cu_seqlens, seq_lens, cache_indices, kernel_width=W
-    )
     for j in range(R):
-        pos = seq_lens[1].item() - R + j
+        pos = int(seq_lens[1]) - R + j
         expected[5, pos % R] = x[cu[2] - R + j]
     assert torch.equal(conv_cache, expected)
 
+    # Publication: every covered boundary of req1 got its window from x.
+    for col in range(850 // P):
+        boundary = (col + 1) * P
+        window = x[cu[1] + boundary - (W - 1) : cu[1] + boundary]
+        torch.testing.assert_close(ckpt[4 + col].to(DTYPE), window, atol=0, rtol=0)
 
-def test_ring_update_bounds_and_pad(device: str) -> None:
+
+def test_prefill_ring_write_gate(device: str) -> None:
+    """The pos >= through - R gate: chunk rows and the restored window get
+    exactly one writer each; positions older than R never land."""
     D = 2048
     lens = [850, 4, 7, 5]
-    pre_lens = [100, 40, 60, 30]
-    x, _, conv_cache, cu_seqlens, _ = _make_prefill_inputs(
+    pre_lens = [128, 128, 128, 0]
+    x, weight, conv_cache, cu_seqlens, seq_idx = _make_prefill_inputs(
         lens, D, device, num_slots=10, seed=1
     )
     cache_indices = torch.tensor(
         [2, 5, 7, PAD_SLOT_ID], dtype=torch.int32, device=device
     )
+    has_initial_state = torch.tensor([True, True, True, False], device=device)
     seq_lens = torch.tensor(
         [p + n for p, n in zip(pre_lens, lens)], dtype=torch.int32, device=device
     )
+    table, ckpt = make_ckpt(len(lens), D, device)
+    for i in range(3):
+        table[i, pre_lens[i] // P - 1] = i + 1
     old = conv_cache.clone()
 
-    inkling_ring_sconv_update(
-        x, conv_cache, cu_seqlens, seq_lens, cache_indices, kernel_width=W
+    inkling_ring_sconv(
+        x,
+        weight,
+        conv_cache,
+        cu_seqlens,
+        seq_idx,
+        cache_indices,
+        has_initial_state,
+        seq_lens,
+        table,
+        ckpt,
+        None,
+        num_extends=4,
+        page_size=P,
     )
 
     expected = old.clone()
     cu = cu_seqlens.tolist()
-    # Only chunks longer than R - (W-1) = 6 are written: lens 850 and 7. Each
-    # persists its last min(chunk_len, R) rows (9 and 7 respectively).
-    for i in (0, 2):
-        for j in range(R):
-            if lens[i] < R - j:
-                continue
-            pos = int(seq_lens[i]) - R + j
-            expected[int(cache_indices[i]), pos % R] = x[cu[i + 1] - R + j]
+    for i in range(3):
+        slot = int(cache_indices[i])
+        through = int(seq_lens[i])
+        # Restored window rows within the last R positions.
+        for j in range(W - 1):
+            pos = pre_lens[i] - (W - 1) + j
+            if pos >= through - R:
+                expected[slot, pos % R] = ckpt[i + 1, j].to(DTYPE)
+        # Chunk rows within the last R positions.
+        for j in range(lens[i]):
+            pos = pre_lens[i] + j
+            if pos >= through - R:
+                expected[slot, pos % R] = x[cu[i] + j]
     assert torch.equal(conv_cache, expected)
 
 
-def test_ring_update_small_ring_borrows_nothing(device: str) -> None:
-    """Non-spec ring (R=4): a 2-token chunk writes only in-chunk source rows;
-    the pre-chunk position's ring row is left as is (position addressing
-    needs no shift borrow)."""
+def test_prefill_small_ring_gate(device: str) -> None:
+    """Non-spec ring (R=4): a 2-token warm chunk keeps 2 chunk rows plus the
+    2 newest restored rows — exactly min(chunk_len + W-1, R) positions."""
     D = 2048
-    small_r = W  # non-spec ring: (W-1) + 1
+    small_r = W
     lens = [2]
-    pre_len = 10
-    x, _, conv_cache, cu_seqlens, _ = _make_prefill_inputs(
+    pre_len = 128
+    x, weight, conv_cache, cu_seqlens, seq_idx = _make_prefill_inputs(
         lens, D, device, ring=small_r, seed=2
     )
     cache_indices = torch.tensor([3], dtype=torch.int32, device=device)
+    has_initial_state = torch.tensor([True], device=device)
     seq_lens = torch.tensor([pre_len + lens[0]], dtype=torch.int32, device=device)
+    table, ckpt = make_ckpt(1, D, device)
+    table[0, pre_len // P - 1] = 2
     old = conv_cache.clone()
 
-    inkling_ring_sconv_update(
-        x, conv_cache, cu_seqlens, seq_lens, cache_indices, kernel_width=W
+    inkling_ring_sconv(
+        x,
+        weight,
+        conv_cache,
+        cu_seqlens,
+        seq_idx,
+        cache_indices,
+        has_initial_state,
+        seq_lens,
+        table,
+        ckpt,
+        None,
+        num_extends=1,
+        page_size=P,
     )
 
     expected = old.clone()
-    # chunk_len 2 > R - (W-1) = 1, so the update runs; source rows exist only
-    # for the last two ring positions (j = 2, 3).
+    through = pre_len + lens[0]
+    for j in range(W - 1):
+        pos = pre_len - (W - 1) + j
+        if pos >= through - small_r:
+            expected[3, pos % small_r] = ckpt[2, j].to(DTYPE)
     expected[3, (pre_len + 0) % small_r] = x[0]
     expected[3, (pre_len + 1) % small_r] = x[1]
     assert torch.equal(conv_cache, expected)
@@ -225,8 +310,8 @@ def test_ring_update_small_ring_borrows_nothing(device: str) -> None:
 
 def test_sconv_prefill_then_lookback_window(device: str) -> None:
     """Round-1 draft lookback after a long prefill: the window starts at
-    ``through - lookback`` and its first taps read down to ``through - 5``,
-    deeper than W-1 — the ring_update pass must have persisted those rows."""
+    ``through - lookback`` and its first taps read down to ``through - 5`` —
+    the prefill kernel's gated write must have persisted those rows."""
     D = 2048
     lb, k = 2, 4
     prefill_len = 850
@@ -235,6 +320,7 @@ def test_sconv_prefill_then_lookback_window(device: str) -> None:
     weight = torch.randn(D, W, device=device, dtype=DTYPE) * 0.5
     conv_cache = torch.randn(4, R, D, device=device, dtype=DTYPE)
     cache_indices = torch.tensor([1], dtype=torch.int32, device=device)
+    table, ckpt = inert_publish(1, D, device)
 
     x_pre = x_full[:prefill_len].contiguous()
     cu_pre = _make_cu_seqlens([prefill_len], device)
@@ -248,9 +334,11 @@ def test_sconv_prefill_then_lookback_window(device: str) -> None:
         cache_indices,
         torch.tensor([False], device=device),
         pre_seq_lens,
-    )
-    inkling_ring_sconv_update(
-        x_pre, conv_cache, cu_pre, pre_seq_lens, cache_indices, kernel_width=W
+        table,
+        ckpt,
+        None,
+        num_extends=1,
+        page_size=P,
     )
 
     # Lookback window: lb committed rows rewritten + k fresh rows, positions
@@ -268,10 +356,60 @@ def test_sconv_prefill_then_lookback_window(device: str) -> None:
         cache_indices,
         torch.tensor([True], device=device),
         win_seq_lens,
+        table,
+        ckpt,
+        None,
+        num_extends=0,
+        page_size=P,
     )
 
     ref = ref_sconv(x_win, weight, x_full[start - (W - 1) : start])
     torch.testing.assert_close(y_win, ref, atol=ATOL, rtol=RTOL)
+
+
+def test_prefill_checkpoint_taps_and_fp8(device: str) -> None:
+    """Tap sources per request: aligned prefix with a page reads the window;
+    a hole entry or a cold request taps zeros; a PAD row is inert. A single
+    fp8 field casts into the compute dtype."""
+    D = 8
+    lens = [2, 2, 2, 2]
+    pre_lens = [128, 256, 0, 128]
+    x, weight, conv_cache, cu_seqlens, seq_idx = _make_prefill_inputs(
+        lens, D, device, seed=3
+    )
+    cache_indices = torch.tensor(
+        [1, 2, 4, PAD_SLOT_ID], dtype=torch.int32, device=device
+    )
+    has_initial_state = torch.tensor([True, True, False, True], device=device)
+    seq_lens = torch.tensor(
+        [p + n for p, n in zip(pre_lens, lens)], dtype=torch.int32, device=device
+    )
+    table, ckpt = make_ckpt(len(lens), D, device, dtype=torch.float8_e5m2)
+    table[0, 0] = 3  # req0: aligned, real page
+    # req1: aligned boundary but hole entry (0) -> zeros
+    y = inkling_ring_sconv(
+        x,
+        weight,
+        conv_cache,
+        cu_seqlens,
+        seq_idx,
+        cache_indices,
+        has_initial_state,
+        seq_lens,
+        table,
+        ckpt,
+        None,
+        num_extends=4,
+        page_size=P,
+    )
+
+    zeros = torch.zeros(W - 1, D, device=device, dtype=DTYPE)
+    prefixes = [ckpt[3].to(DTYPE), zeros, zeros, zeros]
+    cu = cu_seqlens.tolist()
+    for i in range(len(lens)):
+        s, e = cu[i], cu[i + 1]
+        ref = ref_sconv(x[s:e], weight, prefixes[i])
+        torch.testing.assert_close(y[s:e], ref, atol=ATOL, rtol=RTOL)
 
 
 @pytest.mark.parametrize("D", [2048, 6144])
@@ -292,7 +430,7 @@ def test_sconv_decode(D: int, B: int, device: str) -> None:
         cache_indices[pad_rows] = PAD_SLOT_ID
     old_cache = conv_cache.clone()
 
-    y = unified_decode(x, weight, conv_cache, cache_indices, seq_lens)
+    y = decode(x, weight, conv_cache, cache_indices, seq_lens)
 
     expected = old_cache.clone()
     for i in range(B):
@@ -322,6 +460,7 @@ def test_sconv_verify_overwrite_after_rejection(device: str) -> None:
     weight = torch.randn(D, W, device=device, dtype=DTYPE) * 0.5
     conv_cache = torch.zeros(6, R, D, device=device, dtype=DTYPE)
     cache_indices = torch.tensor([1, 4], dtype=torch.int32, device=device)
+    table, ckpt = inert_publish(B, D, device)
     for b in range(B):
         seed_ring_prefix(
             conv_cache,
@@ -349,7 +488,19 @@ def test_sconv_verify_overwrite_after_rejection(device: str) -> None:
             [frontier[b] + K for b in range(B)], dtype=torch.int32, device=device
         )
         y = inkling_ring_sconv(
-            xs, weight, conv_cache, qsl, seq_idx, cache_indices, ones, seq_lens
+            xs,
+            weight,
+            conv_cache,
+            qsl,
+            seq_idx,
+            cache_indices,
+            ones,
+            seq_lens,
+            table,
+            ckpt,
+            None,
+            num_extends=0,
+            page_size=P,
         )
         for b in range(B):
             ref = ref_sconv(
@@ -376,8 +527,9 @@ def test_sconv_verify_overwrite_after_rejection(device: str) -> None:
             )
 
 
-def test_sconv_chained_prefill_update_decode(device: str) -> None:
-    """Full prefill == partial prefill + ring_update + 3 decode steps."""
+def test_sconv_chained_prefill_decode(device: str) -> None:
+    """Full prefill == partial prefill + 3 decode steps (no epilogue: the
+    prefill kernel persists its own tail)."""
     D = 2048
     num_decode = 3
     lens = [12, 16]
@@ -387,6 +539,7 @@ def test_sconv_chained_prefill_update_decode(device: str) -> None:
     cache_indices = torch.tensor([1, 3], dtype=torch.int32, device=device)
     has_initial_state = torch.tensor([False, False], device=device)
     full_seq_lens = cu_seqlens.diff().to(torch.int32)
+    table, ckpt = inert_publish(len(lens), D, device)
 
     # Reference: one prefill over the full sequences (no initial state).
     y_full = inkling_ring_sconv(
@@ -398,9 +551,15 @@ def test_sconv_chained_prefill_update_decode(device: str) -> None:
         cache_indices,
         has_initial_state,
         full_seq_lens,
+        table,
+        ckpt,
+        None,
+        num_extends=2,
+        page_size=P,
     )
 
-    # Chained: prefill over lens - 3 tokens, persist, then 3 decode steps.
+    # Chained: prefill over lens - 3 tokens (persists in-kernel), then 3
+    # decode steps over the ring.
     part_lens = [n - num_decode for n in lens]
     cu_part = _make_cu_seqlens(part_lens, device)
     T_part = sum(part_lens)
@@ -420,9 +579,11 @@ def test_sconv_chained_prefill_update_decode(device: str) -> None:
         cache_indices,
         has_initial_state,
         part_seq_lens,
-    )
-    inkling_ring_sconv_update(
-        x_part, conv_cache, cu_part, part_seq_lens, cache_indices, kernel_width=W
+        table,
+        ckpt,
+        None,
+        num_extends=2,
+        page_size=P,
     )
 
     y_decode = []
@@ -436,12 +597,12 @@ def test_sconv_chained_prefill_update_decode(device: str) -> None:
             device=device,
         )
         y_decode.append(
-            unified_decode(x_step, weight, conv_cache, cache_indices, step_seq_lens)
+            decode(x_step, weight, conv_cache, cache_indices, step_seq_lens)
         )
 
     cu_p = cu_part.tolist()
     for i in range(len(lens)):
-        s, e = cu[i], cu[i + 1]
+        s = cu[i]
         torch.testing.assert_close(
             y_full[s : s + part_lens[i]],
             y_part[cu_p[i] : cu_p[i + 1]],
@@ -458,13 +619,13 @@ def test_sconv_chained_prefill_update_decode(device: str) -> None:
 
 
 def test_sconv_channel_sliced_cache_view(device: str) -> None:
-    """Both ops must work on a channel-sliced view of a wider ring."""
+    """Both kernels must work on a channel-sliced view of a wider ring."""
     torch.manual_seed(6)
     D, off = 2048, 64
     D_total = D + 3 * off
     num_slots = 8
     lens = [5, 2]
-    pre_lens = [50, 31]
+    pre_lens = [128, 256]
     B = len(lens)
     T = sum(lens)
 
@@ -481,6 +642,9 @@ def test_sconv_channel_sliced_cache_view(device: str) -> None:
     seq_lens = torch.tensor(
         [p + n for p, n in zip(pre_lens, lens)], dtype=torch.int32, device=device
     )
+    table, ckpt = make_ckpt(B, D, device)
+    table[0, pre_lens[0] // P - 1] = 5
+    table[1, pre_lens[1] // P - 1] = 6
     snapshot = cache_full.clone()
 
     outside = torch.ones(D_total, dtype=torch.bool, device=device)
@@ -495,88 +659,133 @@ def test_sconv_channel_sliced_cache_view(device: str) -> None:
         cache_indices,
         has_initial_state,
         seq_lens,
+        table,
+        ckpt,
+        None,
+        num_extends=2,
+        page_size=P,
     )
     cu = cu_seqlens.tolist()
     for i in range(B):
         s, e = cu[i], cu[i + 1]
-        ci = int(cache_indices[i])
-        prefix = ring_rows_at(
-            snapshot[:, :, off : off + D], ci, range(pre_lens[i] - (W - 1), pre_lens[i])
-        )
-        ref = ref_sconv(x[s:e], weight, prefix)
+        ref = ref_sconv(x[s:e], weight, ckpt[5 + i].to(DTYPE))
         torch.testing.assert_close(y[s:e], ref, atol=ATOL, rtol=RTOL)
 
-    # Both chunks are short (<= R - (W-1)): persisted in-kernel, in-slice only.
+    # Chunk rows and restored windows persist in-slice only.
     expected_view = snapshot[:, :, off : off + D].clone()
     for i in range(B):
         ci = int(cache_indices[i])
+        through = int(seq_lens[i])
+        for j in range(W - 1):
+            pos = pre_lens[i] - (W - 1) + j
+            if pos >= through - R:
+                expected_view[ci, pos % R] = ckpt[5 + i, j].to(DTYPE)
         for j in range(lens[i]):
             expected_view[ci, (pre_lens[i] + j) % R] = x[cu[i] + j]
     assert torch.equal(cache_view, expected_view)
     assert torch.equal(cache_full[:, :, outside], snapshot[:, :, outside])
 
-    # ring_update on the view: no request exceeds the bound -> no-op.
-    before = cache_full.clone()
-    inkling_ring_sconv_update(
-        x, cache_view, cu_seqlens, seq_lens, cache_indices, kernel_width=W
-    )
-    assert torch.equal(cache_full, before)
 
+def test_decode_publish_boundary_and_split(device: str) -> None:
+    """The decode kernel publishes the at-most-one covered boundary: window
+    rows may borrow ring history, channels split across two fields."""
+    torch.manual_seed(8)
+    D, wa = 8, 5
+    B, K = 2, 4
+    conv_cache = torch.randn(6, R, D, device=device, dtype=DTYPE)
+    weight = torch.randn(D, W, device=device, dtype=DTYPE) * 0.5
+    cache_indices = torch.tensor([1, 2], dtype=torch.int32, device=device)
+    # req0's chunk crosses boundary 128 at its second token; req1 covers none.
+    seq_lens = torch.tensor([130, 260 + 3], dtype=torch.int32, device=device)
+    qsl = torch.arange(0, B * K + 1, K, dtype=torch.int32, device=device)
+    x = torch.randn(B * K, D, device=device, dtype=DTYPE)
+    ckpt_a = torch.zeros(8, W - 1, wa, dtype=DTYPE, device=device)
+    ckpt_b = torch.zeros(8, W - 1, D - wa, dtype=DTYPE, device=device)
+    table = torch.zeros(B, 64, dtype=torch.int32, device=device)
+    table[0, 0] = 7  # boundary 128 -> page 7
 
-@pytest.mark.parametrize("device", ["cuda"])
-def test_ring_restore(device: str) -> None:
-    """One launch restores the W-1 boundary rows into each request's ring;
-    hole pages, PAD slots and unaligned boundaries are skipped; channels
-    split across two checkpoint fields; fp8 sources cast to the ring dtype."""
-    torch.manual_seed(5)
-    D, P, pages = 8, 128, 6
-    wa = 5  # ckpt_a covers channels [0, 5), ckpt_b the rest
-    conv_cache = torch.randn(8, R, D, dtype=DTYPE, device=device)
-    pre = conv_cache.clone()
-    ckpt_a = torch.randn(pages, W - 1, wa, dtype=DTYPE, device=device)
-    ckpt_b = torch.randn(pages, W - 1, D - wa, dtype=DTYPE, device=device)
-
-    # req0: boundary 128 -> page 3; req1: hole; req2: PAD; req3: unaligned.
-    table = torch.tensor(
-        [[3, 0], [0, 0], [4, 0], [5, 5]], dtype=torch.int32, device=device
-    )
-    cu_seqlens = torch.tensor([0, 4, 8, 12, 16], dtype=torch.int32, device=device)
-    seq_lens = torch.tensor([132, 132, 132, 133], dtype=torch.int32, device=device)
-    cache_indices = torch.tensor(
-        [1, 2, PAD_SLOT_ID, 3], dtype=torch.int32, device=device
-    )
-
-    inkling_ring_restore(
+    inkling_ring_sconv(
+        x,
+        weight,
         conv_cache,
+        qsl,
+        seq_idx_from_cu_seqlens(qsl, B * K),
+        cache_indices,
+        torch.ones(B, dtype=torch.bool, device=device),
+        seq_lens,
+        table,
         ckpt_a,
         ckpt_b,
-        table,
-        cu_seqlens,
-        seq_lens,
-        cache_indices,
+        num_extends=0,
         page_size=P,
     )
 
-    expected = pre.clone()
-    for j, pos in enumerate(range(128 - (W - 1), 128)):
-        expected[1, pos % R, :wa] = ckpt_a[3, j]
-        expected[1, pos % R, wa:] = ckpt_b[3, j]
-    assert torch.equal(conv_cache, expected)
+    # req0: chunk positions 126..129; boundary token at abs_len 128 is chunk
+    # row 1; window = positions 125..127 = [ring row 125, chunk rows 0, 1].
+    ring125 = ring_rows_at(conv_cache, 1, [125])[0]  # untouched by this chunk
+    window = torch.stack([ring125, x[0], x[1]])
+    torch.testing.assert_close(ckpt_a[7], window[:, :wa], atol=0, rtol=0)
+    torch.testing.assert_close(ckpt_b[7], window[:, wa:], atol=0, rtol=0)
+    # req1 covered no boundary: nothing else written.
+    assert torch.equal(ckpt_a[:7], torch.zeros_like(ckpt_a[:7]))
+    assert torch.equal(ckpt_b[:7], torch.zeros_like(ckpt_b[:7]))
 
-    # Single fp8 field covering all channels casts into the ring dtype.
-    ckpt_fp8 = torch.randn(pages, W - 1, D, device=device).to(torch.float8_e5m2)
-    conv_cache.copy_(pre)
-    inkling_ring_restore(
-        conv_cache,
-        ckpt_fp8,
+
+def test_prefill_matches_decode_on_short_warm_chunks(device: str) -> None:
+    """Cross-kernel consistency: a short warm extend served by the prefill
+    kernel (checkpoint taps) must produce the same output as the decode
+    kernel over a ring seeded with the same window."""
+    torch.manual_seed(9)
+    D, B, k = 512, 2, 4
+    pre_lens = [128, 384]
+    x = torch.randn(B * k, D, device=device, dtype=DTYPE)
+    weight = torch.randn(D, W, device=device, dtype=DTYPE) * 0.5
+    qsl = torch.arange(0, B * k + 1, k, dtype=torch.int32, device=device)
+    seq_idx = seq_idx_from_cu_seqlens(qsl, B * k)
+    cache_indices = torch.tensor([1, 2], dtype=torch.int32, device=device)
+    ones = torch.ones(B, dtype=torch.bool, device=device)
+    seq_lens = torch.tensor([p + k for p in pre_lens], dtype=torch.int32, device=device)
+
+    table, ckpt = make_ckpt(B, D, device)
+    table[0, pre_lens[0] // P - 1] = 2
+    table[1, pre_lens[1] // P - 1] = 3
+
+    ring_a = torch.randn(4, R, D, device=device, dtype=DTYPE)
+    y_prefill = inkling_ring_sconv(
+        x,
+        weight,
+        ring_a,
+        qsl,
+        seq_idx,
+        cache_indices,
+        ones,
+        seq_lens,
+        table,
+        ckpt,
         None,
-        table,
-        cu_seqlens,
-        seq_lens,
-        cache_indices,
+        num_extends=2,
         page_size=P,
     )
-    expected = pre.clone()
-    for j, pos in enumerate(range(128 - (W - 1), 128)):
-        expected[1, pos % R] = ckpt_fp8[3, j].to(DTYPE)
-    assert torch.equal(conv_cache, expected)
+
+    ring_b = torch.randn(4, R, D, device=device, dtype=DTYPE)
+    for b in range(B):
+        seed_ring_prefix(
+            ring_b, int(cache_indices[b]), pre_lens[b], ckpt[2 + b].to(DTYPE)
+        )
+    inert_table, inert_ckpt = inert_publish(B, D, device)
+    y_decode = inkling_ring_sconv(
+        x,
+        weight,
+        ring_b,
+        qsl,
+        seq_idx,
+        cache_indices,
+        ones,
+        seq_lens,
+        inert_table,
+        inert_ckpt,
+        None,
+        num_extends=0,
+        page_size=P,
+    )
+    torch.testing.assert_close(y_prefill, y_decode, atol=0, rtol=0)

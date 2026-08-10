@@ -54,7 +54,7 @@ from tokenspeed_kernel import (
     rel_mha_plan,
     rel_mha_prefill,
 )
-from tokenspeed_kernel.ops.conv import inkling_ring_restore, seq_idx_from_cu_seqlens
+from tokenspeed_kernel.ops.conv import seq_idx_from_cu_seqlens
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import scrub_padding_tail
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -96,13 +96,12 @@ class InklingConvMetadata:
     is_decode: bool
     seq_idx: torch.Tensor | None = None
     seq_lens: torch.Tensor | None = None
-    # Extend/mixed chunks can exceed the compute kernel's in-kernel
-    # persistence bound (R - (W-1)); True runs inkling_ring_sconv_update after it.
-    needs_ring_update: bool = False
-    # Checkpoint restore is admission-only: True only on extend/mixed batches
-    # where some request has an aligned prefix hit (host-checked), so decode
-    # rounds and cold prefills skip the restore ops entirely.
-    needs_restore: bool = False
+    # Extend rows in the batch: 0 (decode-family rounds) or the batch's
+    # extend count. Selects the kernel (> 0 -> prefill: checkpoint taps,
+    # gated ring writes; 0 -> decode: ring taps, write-all). True mixes are
+    # rejected at metadata init; a future MIXED implementation would
+    # partition two launches at this count.
+    num_extends: int = 0
     # Checkpoint groups: per-group tables {group: [bs, max_conv_blocks]}; None -> no paged groups.
     col_page_table: dict[str, torch.Tensor] | None = None
 
@@ -253,6 +252,12 @@ class InklingAttnBackend(AttentionBackend):
         extend_prefix_lens_cpu: torch.Tensor | None = None,
         **kwargs,
     ):
+        if forward_mode.is_mixed():
+            raise RuntimeError(
+                "Inkling sconv does not support MIXED batches: the prefill "
+                "kernel hard-codes checkpoint taps at aligned chunk starts "
+                "and decode rows have none (run without --enable-mixed-batch)"
+            )
         # Paged sconv: conv groups ride block_tables, which the inner backend sheds — grab here.
         group_tables = kwargs.get("block_tables") or {}
         extend_total = (
@@ -352,13 +357,6 @@ class InklingAttnBackend(AttentionBackend):
                 bs, dtype=torch.bool, device=req_pool_indices.device
             )
             is_decode = True
-        needs_restore = False
-        if forward_mode.is_extend_or_mixed() and extend_prefix_lens_cpu is not None:
-            # Restore only ever has a source page on an aligned prefix (the
-            # publish gate); the kernel re-checks per request on device.
-            page_size = int(self.conv_columns["block_tokens"])
-            prefix = extend_prefix_lens_cpu[:bs]
-            needs_restore = bool(((prefix > 0) & (prefix % page_size == 0)).any())
         self.conv_metadata = InklingConvMetadata(
             query_start_loc=query_start_loc,
             cache_indices=cache_indices,
@@ -369,8 +367,7 @@ class InklingAttnBackend(AttentionBackend):
                 self._pfg_seq_lens if pfg_total >= 0 else seq_lens[:bs].to(torch.int32)
             ),
             col_page_table=col_page_table,
-            needs_ring_update=forward_mode.is_extend_or_mixed(),
-            needs_restore=needs_restore,
+            num_extends=num_extends,
         )
 
     # ------------------------------------------------------------------
@@ -462,33 +459,6 @@ class InklingAttnBackend(AttentionBackend):
             col_page_table=md.col_page_table,
         )
         return True
-
-    def restore_shortconv_checkpoint(
-        self,
-        state: torch.Tensor,
-        checkpoint_buffers: tuple[torch.Tensor, ...],
-        metadata: InklingConvMetadata,
-        group_id: str,
-    ) -> None:
-        """Restore an aligned cached boundary into request ring slots.
-
-        The checkpoint holds the ``W - 1`` inputs before the boundary; they
-        land at their positions' ring rows (``(boundary - W + 1 + j) % R``),
-        with the boundary derived per request as ``seq_lens - chunk_len``.
-        One kernel launch; requests without an aligned boundary, with a hole
-        page or a PAD slot are skipped in-kernel.
-        """
-        n = metadata.cache_indices.shape[0]
-        inkling_ring_restore(
-            state,
-            checkpoint_buffers[0],
-            checkpoint_buffers[1] if len(checkpoint_buffers) == 2 else None,
-            metadata.col_page_table[group_id][:n],
-            metadata.query_start_loc[: n + 1],
-            metadata.seq_lens[:n],
-            metadata.cache_indices,
-            page_size=int(self.conv_columns["block_tokens"]),
-        )
 
     def register_shortconv_checkpoint_stream(
         self,

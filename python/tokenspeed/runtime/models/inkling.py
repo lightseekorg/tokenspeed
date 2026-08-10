@@ -81,7 +81,7 @@ from collections.abc import Callable, Iterable
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.conv import inkling_ring_sconv, inkling_ring_sconv_update
+from tokenspeed_kernel.ops.conv import inkling_ring_sconv
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
 from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
@@ -374,8 +374,10 @@ def _sconv_apply(
     ``weight`` is ``[dim, W]``; ``channel_offset``/``dim`` select the state
     channels in the layer's conv pool buffer. Fusing adjacent streams (K+V)
     is just a wider ``dim`` with concatenated weights. The paged bridges are
-    mandatory: every stream restores at admission and publishes covered
-    boundaries; there is no rolling fallback.
+    mandatory and fused: extend chunks tap the checkpoint at their aligned
+    start (the prefill kernel never reads the ring), decode rounds tap the
+    ring (the decode kernel never reads the paged cache), and both publish
+    every covered boundary in-kernel.
     """
     backend = ctx.attn_backend
     md = backend.conv_metadata
@@ -402,24 +404,7 @@ def _sconv_apply(
         group_id=checkpoint_group,
         buffers=checkpoint_buffers,
     )
-    if md.needs_restore:
-        backend.restore_shortconv_checkpoint(
-            state,
-            checkpoint_buffers,
-            md,
-            checkpoint_group,
-        )
-
-    # In-kernel speculative boundary publish: every covered 128-boundary,
-    # accept-independent; rejected content is overwritten by a later round.
-    publish = (
-        md.col_page_table[checkpoint_group],
-        checkpoint_buffers[0],
-        checkpoint_buffers[1] if len(checkpoint_buffers) == 2 else None,
-        backend.conv_columns["block_tokens"],
-    )
-
-    y = inkling_ring_sconv(
+    return inkling_ring_sconv(
         x,
         weight,
         state,
@@ -428,23 +413,13 @@ def _sconv_apply(
         md.cache_indices,
         md.has_initial_state,
         md.seq_lens,
-        activation=None,
-        use_residual=True,
-        publish=publish,
+        md.col_page_table[checkpoint_group],
+        checkpoint_buffers[0],
+        checkpoint_buffers[1] if len(checkpoint_buffers) == 2 else None,
+        num_extends=md.num_extends,
+        page_size=backend.conv_columns["block_tokens"],
         enable_pdl=pdl_enabled(),
     )
-    if md.needs_ring_update:
-        # Extend chunks can exceed the compute kernel's in-kernel persistence
-        # bound; refill the full ring depth in a follow-up pass.
-        inkling_ring_sconv_update(
-            x,
-            state,
-            md.query_start_loc,
-            md.seq_lens,
-            md.cache_indices,
-            kernel_width=weight.shape[1],
-        )
-    return y
 
 
 class InklingRelLogitsProj(nn.Module):
