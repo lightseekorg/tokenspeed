@@ -41,6 +41,7 @@ import torch
 # Aliased because the conv.triton submodule import below rebinds the name ``triton``.
 from tokenspeed_kernel._triton import triton as _triton
 from tokenspeed_kernel.ops.conv.triton import (
+    _inkling_ring_restore_kernel,
     _inkling_ring_sconv_kernel,
     _inkling_ring_sconv_update_kernel,
     select_prefill_config,
@@ -50,6 +51,7 @@ PAD_SLOT_ID = -1
 
 __all__ = [
     "PAD_SLOT_ID",
+    "inkling_ring_restore",
     "inkling_ring_sconv",
     "inkling_ring_sconv_update",
     "seq_idx_from_cu_seqlens",
@@ -286,5 +288,91 @@ def inkling_ring_sconv_update(
         BLOCK_D=block_d,
         R=R,
         W_MINUS_1=kernel_width - 1,
+        num_warps=4,
+    )
+
+
+def inkling_ring_restore(
+    conv_cache: torch.Tensor,
+    ckpt_a: torch.Tensor,
+    ckpt_b: torch.Tensor | None,
+    block_table: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    cache_indices: torch.Tensor,
+    *,
+    page_size: int,
+) -> None:
+    """Restore each request's aligned-prefix boundary checkpoint into its
+    ring rows, in place, in one launch.
+
+    A restore source exists only where the prefix boundary
+    (``seq_lens - chunk_len``) is a positive ``page_size`` multiple whose
+    ``block_table`` entry is a real page; PAD slots, unaligned or zero
+    prefixes and hole pages (entries <= 0) are skipped per request.
+
+    Args:
+        conv_cache: Conv state ring ``[num_slots, R, D]`` with
+            ``stride(-1) == 1``; updated in place. May be a channel-sliced
+            view of a wider buffer.
+        ckpt_a: Checkpoint field ``[pages, W - 1, width_a]`` providing
+            channels ``[0, width_a)``.
+        ckpt_b: Checkpoint field providing the remaining channels, or None
+            when ``ckpt_a`` covers all ``D`` channels.
+        block_table: Int32 ``[B, num_blocks]`` for the stream's cache group.
+        cu_seqlens: Cumulative sequence lengths ``[B + 1]``, int32.
+        seq_lens: Per-request lengths THROUGH the chunk ``[B]``, int32.
+        cache_indices: Ring slot per request ``[B]``, int32;
+            ``PAD_SLOT_ID`` (-1) rows are skipped entirely.
+        page_size: Tokens per cache page of the stream's group.
+
+    Returns:
+        None. ``conv_cache`` is modified in place.
+    """
+    B = cache_indices.shape[0]
+    D = conv_cache.shape[-1]
+    R = conv_cache.shape[1]
+    assert conv_cache.stride(-1) == 1, "conv_cache must be D-contiguous"
+    if B == 0:
+        return
+
+    a_width = ckpt_a.shape[-1]
+    if ckpt_b is None:
+        assert a_width == D, "single checkpoint field must cover all channels"
+        ckpt_b = ckpt_a
+        b_strides = (0, 0, 0)
+    else:
+        assert (
+            a_width + ckpt_b.shape[-1] == D
+        ), "checkpoint fields must cover the stream's channels"
+        b_strides = (ckpt_b.stride(0), ckpt_b.stride(1), ckpt_b.stride(2))
+
+    block_d = min(_triton.next_power_of_2(D), 1024)
+    grid = (B, _triton.cdiv(D, block_d))
+    _inkling_ring_restore_kernel[grid](
+        ckpt_a,
+        ckpt_b,
+        conv_cache,
+        block_table,
+        cu_seqlens,
+        seq_lens,
+        cache_indices,
+        ckpt_a.stride(0),
+        ckpt_a.stride(1),
+        ckpt_a.stride(2),
+        b_strides[0],
+        b_strides[1],
+        b_strides[2],
+        conv_cache.stride(0),
+        conv_cache.stride(1),
+        conv_cache.stride(2),
+        block_table.stride(0),
+        block_table.stride(1),
+        D,
+        a_width,
+        BLOCK_D=block_d,
+        R=R,
+        W_MINUS_1=ckpt_a.shape[1],
+        PAGE_SIZE=page_size,
         num_warps=4,
     )

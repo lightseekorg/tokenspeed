@@ -24,6 +24,7 @@ import pytest
 import torch
 from tokenspeed_kernel.ops.conv import (
     PAD_SLOT_ID,
+    inkling_ring_restore,
     inkling_ring_sconv,
     inkling_ring_sconv_update,
     seq_idx_from_cu_seqlens,
@@ -520,3 +521,62 @@ def test_sconv_channel_sliced_cache_view(device: str) -> None:
         x, cache_view, cu_seqlens, seq_lens, cache_indices, kernel_width=W
     )
     assert torch.equal(cache_full, before)
+
+
+@pytest.mark.parametrize("device", ["cuda"])
+def test_ring_restore(device: str) -> None:
+    """One launch restores the W-1 boundary rows into each request's ring;
+    hole pages, PAD slots and unaligned boundaries are skipped; channels
+    split across two checkpoint fields; fp8 sources cast to the ring dtype."""
+    torch.manual_seed(5)
+    D, P, pages = 8, 128, 6
+    wa = 5  # ckpt_a covers channels [0, 5), ckpt_b the rest
+    conv_cache = torch.randn(8, R, D, dtype=DTYPE, device=device)
+    pre = conv_cache.clone()
+    ckpt_a = torch.randn(pages, W - 1, wa, dtype=DTYPE, device=device)
+    ckpt_b = torch.randn(pages, W - 1, D - wa, dtype=DTYPE, device=device)
+
+    # req0: boundary 128 -> page 3; req1: hole; req2: PAD; req3: unaligned.
+    table = torch.tensor(
+        [[3, 0], [0, 0], [4, 0], [5, 5]], dtype=torch.int32, device=device
+    )
+    cu_seqlens = torch.tensor([0, 4, 8, 12, 16], dtype=torch.int32, device=device)
+    seq_lens = torch.tensor([132, 132, 132, 133], dtype=torch.int32, device=device)
+    cache_indices = torch.tensor(
+        [1, 2, PAD_SLOT_ID, 3], dtype=torch.int32, device=device
+    )
+
+    inkling_ring_restore(
+        conv_cache,
+        ckpt_a,
+        ckpt_b,
+        table,
+        cu_seqlens,
+        seq_lens,
+        cache_indices,
+        page_size=P,
+    )
+
+    expected = pre.clone()
+    for j, pos in enumerate(range(128 - (W - 1), 128)):
+        expected[1, pos % R, :wa] = ckpt_a[3, j]
+        expected[1, pos % R, wa:] = ckpt_b[3, j]
+    assert torch.equal(conv_cache, expected)
+
+    # Single fp8 field covering all channels casts into the ring dtype.
+    ckpt_fp8 = torch.randn(pages, W - 1, D, device=device).to(torch.float8_e5m2)
+    conv_cache.copy_(pre)
+    inkling_ring_restore(
+        conv_cache,
+        ckpt_fp8,
+        None,
+        table,
+        cu_seqlens,
+        seq_lens,
+        cache_indices,
+        page_size=P,
+    )
+    expected = pre.clone()
+    for j, pos in enumerate(range(128 - (W - 1), 128)):
+        expected[1, pos % R] = ckpt_fp8[3, j].to(DTYPE)
+    assert torch.equal(conv_cache, expected)

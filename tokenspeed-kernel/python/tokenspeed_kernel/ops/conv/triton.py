@@ -20,7 +20,7 @@
 
 """Triton kernels for short causal convolution (sconv).
 
-Two kernels backing the public API in :mod:`tokenspeed_kernel.ops.conv`:
+Three kernels backing the public API in :mod:`tokenspeed_kernel.ops.conv`:
 
 - ``_inkling_ring_sconv_kernel``: THE sconv compute kernel — varlen-packed causal
   conv over a per-request ring of the last ``R`` input rows. The ring row of
@@ -35,6 +35,10 @@ Two kernels backing the public API in :mod:`tokenspeed_kernel.ops.conv`:
   a wrapped write could alias another tile's pre-chunk tap read. Launched
   after the compute kernel, it stores the last ``min(chunk_len, R)`` chunk
   rows at their positions' ring rows.
+- ``_inkling_ring_restore_kernel``: admission-time restore — copies the
+  ``W - 1`` checkpoint rows at each request's aligned prefix boundary from
+  the paged checkpoint field(s) into the positions' ring rows. Requests
+  with no aligned boundary (or a hole page, or a PAD slot) are skipped.
 
 Both kernels take explicit strides for the conv ring so channel-sliced views
 (``ring[:, :, off:off + D]``) work without a copy. ``PAD_SLOT_ID`` (-1) rows
@@ -385,3 +389,88 @@ def _inkling_ring_sconv_update_kernel(
                 val.to(conv_cache_ptr.dtype.element_ty),
                 mask=d_mask,
             )
+
+
+@triton.jit
+def _inkling_ring_restore_kernel(
+    ckpt_a_ptr,  # [pages, W-1, A_WIDTH]
+    ckpt_b_ptr,  # [pages, W-1, D - A_WIDTH] (ckpt_a when one field covers all)
+    conv_cache_ptr,  # [num_slots, R, D] ring
+    block_table_ptr,  # [B, num_blocks] int32, the stream's conv group
+    cu_seqlens_ptr,  # [B+1] int32
+    seq_lens_ptr,  # [B] int32 lengths THROUGH the chunk
+    cache_indices_ptr,  # [B] int32
+    stride_a_p,
+    stride_a_w,
+    stride_a_d,
+    stride_b_p,
+    stride_b_w,
+    stride_b_d,
+    stride_c_slot,
+    stride_c_w,
+    stride_c_d,
+    stride_t_b,
+    stride_t_n,
+    D,
+    A_WIDTH,
+    BLOCK_D: tl.constexpr,
+    R: tl.constexpr,
+    W_MINUS_1: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+):
+    """Copy each request's boundary checkpoint into its ring rows.
+
+    The boundary is the prefix length ``seq_lens - chunk_len``; a restore
+    source exists only when it is a positive ``PAGE_SIZE`` multiple whose
+    block-table entry is a real page (holes are 0). The ``W - 1`` checkpoint
+    rows land at their positions' ring rows (``(boundary - W + 1 + j) % R``).
+    Channels ``[0, A_WIDTH)`` come from ``ckpt_a``, the rest from ``ckpt_b``.
+
+    Grid: ``(B, cdiv(D, BLOCK_D))``.
+    """
+    pid_b = tl.program_id(0)
+    pid_d = tl.program_id(1)
+
+    ci = tl.load(cache_indices_ptr + pid_b)
+    if ci == -1:  # PAD_SLOT_ID
+        return
+    start = tl.load(cu_seqlens_ptr + pid_b).to(tl.int64)
+    end = tl.load(cu_seqlens_ptr + pid_b + 1).to(tl.int64)
+    through = tl.load(seq_lens_ptr + pid_b).to(tl.int32)
+    boundary = through - (end - start).to(tl.int32)
+    if boundary <= 0:
+        return
+    if boundary % PAGE_SIZE != 0:
+        return
+    page = tl.load(
+        block_table_ptr
+        + pid_b.to(tl.int64) * stride_t_b
+        + (boundary // PAGE_SIZE - 1).to(tl.int64) * stride_t_n
+    )
+    if page <= 0:  # hole: nothing published at this boundary
+        return
+
+    d_off = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    d_mask = d_off < D
+    in_a = d_off < A_WIDTH
+    a_base = ckpt_a_ptr + page.to(tl.int64) * stride_a_p + d_off * stride_a_d
+    b_base = (
+        ckpt_b_ptr + page.to(tl.int64) * stride_b_p + (d_off - A_WIDTH) * stride_b_d
+    )
+    cache_base = conv_cache_ptr + ci.to(tl.int64) * stride_c_slot + d_off * stride_c_d
+
+    for j in tl.static_range(W_MINUS_1):
+        row = (boundary - W_MINUS_1 + j) % R
+        # No `other`: masked-off lanes are discarded by the where/store
+        # masks, and an int filler cannot cast to fp8 sources.
+        va = tl.load(a_base + j * stride_a_w, mask=d_mask & in_a).to(
+            conv_cache_ptr.dtype.element_ty
+        )
+        vb = tl.load(b_base + j * stride_b_w, mask=d_mask & (~in_a)).to(
+            conv_cache_ptr.dtype.element_ty
+        )
+        tl.store(
+            cache_base + row.to(tl.int64) * stride_c_w,
+            tl.where(in_a, va, vb),
+            mask=d_mask,
+        )
