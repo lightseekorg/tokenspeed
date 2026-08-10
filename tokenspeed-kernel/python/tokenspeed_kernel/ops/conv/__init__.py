@@ -233,5 +233,6 @@ def inkling_ring_sconv(
         W_POW2=_triton.next_power_of_2(W),
         num_warps=num_warps,
         num_stages=num_stages,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
     return y
