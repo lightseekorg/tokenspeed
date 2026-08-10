@@ -18,6 +18,9 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 from tokenspeed.runtime.configs import Qwen3_5MoeConfig  # noqa: E402
+from tokenspeed.runtime.configs.model_config import (  # noqa: E402
+    _normalize_architecture_aliases_for_dispatch,
+)
 from tokenspeed.runtime.configs.model_config import get_hf_text_config  # noqa: E402
 from tokenspeed.runtime.configs.qwen3_5_config import Qwen3_5MoeTextConfig  # noqa: E402
 from tokenspeed.runtime.configs.utils import get_rope_parameters  # noqa: E402
@@ -141,6 +144,100 @@ class MaterializeArchitecturesTests(unittest.TestCase):
         self.assertEqual(
             config.architectures, ["Qwen3_5MoeForConditionalGenerationNextN"]
         )
+
+
+class ArchitectureDispatchNormalizationTests(unittest.TestCase):
+    def test_nemotron_llama_compatible_alias_maps_to_llama(self) -> None:
+        hf_config = PretrainedConfig(
+            architectures=["NemotronForCausalLM"],
+            hidden_act="silu",
+        )
+        hf_text_config = PretrainedConfig(
+            architectures=["NemotronForCausalLM"],
+            hidden_act="silu",
+        )
+
+        _normalize_architecture_aliases_for_dispatch(hf_config, hf_text_config)
+
+        self.assertEqual(hf_config.architectures, ["LlamaForCausalLM"])
+        self.assertEqual(hf_text_config.architectures, ["LlamaForCausalLM"])
+
+    def test_nemotron_incompatible_activation_is_left_unchanged(self) -> None:
+        hf_config = PretrainedConfig(
+            architectures=["NemotronForCausalLM"],
+            hidden_act="relu2",
+        )
+        hf_text_config = PretrainedConfig(
+            architectures=["NemotronForCausalLM"],
+            hidden_act="relu2",
+        )
+
+        _normalize_architecture_aliases_for_dispatch(hf_config, hf_text_config)
+
+        self.assertEqual(hf_config.architectures, ["NemotronForCausalLM"])
+        self.assertEqual(hf_text_config.architectures, ["NemotronForCausalLM"])
+
+    def test_nemotron_partial_rotary_is_left_unchanged(self) -> None:
+        hf_config = PretrainedConfig(
+            architectures=["NemotronForCausalLM"],
+            hidden_act="silu",
+            partial_rotary_factor=0.5,
+        )
+        hf_text_config = PretrainedConfig(
+            architectures=["NemotronForCausalLM"],
+            hidden_act="silu",
+            partial_rotary_factor=0.5,
+        )
+
+        _normalize_architecture_aliases_for_dispatch(hf_config, hf_text_config)
+
+        self.assertEqual(hf_config.architectures, ["NemotronForCausalLM"])
+        self.assertEqual(hf_text_config.architectures, ["NemotronForCausalLM"])
+
+    def test_nemotron_hybrid_architecture_is_left_unchanged(self) -> None:
+        # NVIDIA-Nemotron-3-Super-120B-A12B is published as NemotronH and is
+        # a hybrid Mamba/attention model, not a dense Llama checkpoint.
+        hf_config = PretrainedConfig(
+            architectures=["NemotronHForCausalLM"],
+            model_type="nemotron_h",
+            mamba_hidden_act="silu",
+            mlp_hidden_act="relu2",
+            partial_rotary_factor=1.0,
+            hybrid_override_pattern="MEME",
+        )
+        hf_text_config = PretrainedConfig(
+            architectures=["NemotronHForCausalLM"],
+            model_type="nemotron_h",
+            mamba_hidden_act="silu",
+            mlp_hidden_act="relu2",
+            partial_rotary_factor=1.0,
+            hybrid_override_pattern="MEME",
+        )
+
+        _normalize_architecture_aliases_for_dispatch(hf_config, hf_text_config)
+
+        self.assertEqual(hf_config.architectures, ["NemotronHForCausalLM"])
+        self.assertEqual(hf_text_config.architectures, ["NemotronHForCausalLM"])
+
+    def test_unknown_architecture_is_left_unchanged(self) -> None:
+        hf_config = PretrainedConfig(architectures=["SomeFutureForCausalLM"])
+        hf_text_config = PretrainedConfig(architectures=["SomeFutureForCausalLM"])
+
+        _normalize_architecture_aliases_for_dispatch(hf_config, hf_text_config)
+
+        self.assertEqual(hf_config.architectures, ["SomeFutureForCausalLM"])
+        self.assertEqual(hf_text_config.architectures, ["SomeFutureForCausalLM"])
+
+    def test_invalid_architectures_shape_is_ignored(self) -> None:
+        hf_config = PretrainedConfig()
+        hf_text_config = PretrainedConfig()
+        hf_config.architectures = "NemotronForCausalLM"
+        hf_text_config.architectures = None
+
+        _normalize_architecture_aliases_for_dispatch(hf_config, hf_text_config)
+
+        self.assertEqual(hf_config.architectures, "NemotronForCausalLM")
+        self.assertIsNone(hf_text_config.architectures)
 
 
 if __name__ == "__main__":
