@@ -32,10 +32,7 @@ import torch.distributed as dist
 import zmq
 from tokenspeed_scheduler import PD, Cache, ExecutionEvent, ForwardEvent, Scheduler
 
-from tokenspeed.runtime.cache.executor.memory_executor import (
-    MemoryExecutor,
-)
-from tokenspeed.runtime.cache.transfer.types import CacheKind
+from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -52,6 +49,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     cache_event_key,
     cache_event_to_payload,
     cache_sync_debug_enabled,
+    log_gpu_memory_summary,
     make_config,
     pool_to_paged_cache_groups,
     pop_common_cache_event_payloads,
@@ -118,7 +116,11 @@ def _forward_op_executes_model_forward(forward_op, *, is_disagg_decode: bool) ->
         return False
     if sum(forward_op.input_lengths) <= 0:
         return False
-    if is_disagg_decode and forward_op.num_extends() > 0:
+    if (
+        is_disagg_decode
+        and forward_op.num_extends() > 0
+        and not forward_op.is_local_prefill()
+    ):
         return False
     return True
 
@@ -300,6 +302,19 @@ class EventLoop:
             draft_token_to_kv_pool=draft_token_to_kv_pool,
         )
 
+        # Per-rank GPU memory breakdown (weights by group, KV/graph/non-torch).
+        # rank0 only; best-effort, never fails startup.
+        if attn_tp_rank == 0:
+            log_gpu_memory_summary(
+                target.model,
+                gpu_id,
+                global_rank,
+                logger,
+                draft_model=draft.model if draft is not None else None,
+                kv_pool=token_to_kv_pool,
+                draft_kv_pool=draft_token_to_kv_pool,
+            )
+
         self.max_model_len = self.model_config.context_len
         self.max_single_request_tokens = self.model_config.context_len
         self.max_req_input_len = self.model_config.context_len - 1
@@ -332,25 +347,17 @@ class EventLoop:
                     "the cache-group scheduler has no L3 storage tier; unset "
                     "--kvstore-storage-backend"
                 )
-            if getattr(token_to_kv_pool, "runtime_contract", None) is not None:
-                raise NotImplementedError(
-                    "the host tier does not support contract pools yet; pass "
-                    "--disable-kvstore"
-                )
-            self.memory_executor = MemoryExecutor(
+            self.l2_cache_executor = L2CacheExecutor(
                 device_pool=token_to_kv_pool,
+                draft_pool=draft_token_to_kv_pool,
                 host_ratio=server_args.kvstore_ratio,
                 host_size_gb=server_args.kvstore_size,
+                io_backend=server_args.kvstore_io_backend,
             )
-            num_host_pages = self.memory_executor.num_host_pages
+            num_host_pages = self.l2_cache_executor.num_host_pages
         else:
-            self.memory_executor = None
+            self.l2_cache_executor = None
             num_host_pages = 0
-
-        # The host tier acks loadbacks, so they join the in-flight accounting.
-        self._loadback_acks_expected = getattr(
-            self.memory_executor, "emits_loadback_acks", False
-        )
 
         self._kv_events_enabled = (
             EventPublisherFactory.is_enabled(server_args.kv_events_config)
@@ -376,8 +383,6 @@ class EventLoop:
                 unsupported.append("layerwise cache transfer")
             if server_args.enable_memory_saver:
                 unsupported.append("memory saver/release")
-            if server_args.enable_kvstore:
-                unsupported.append("KVStore/host cache")
             # Prefill is forced onto the non-overlap loop by
             # should_use_overlap_schedule(). Decode uses the ordinary overlap
             # loop and the scheduler's one-step protected cache reservation.
@@ -475,11 +480,11 @@ class EventLoop:
         # pause controller's drain machinery; frees memory via the memory-saver
         # adapter once the scheduler drains. See memory_occupation.py.
         # Releasing KV is only safe if any prefix cache it backs can be cleared:
-        # either prefix caching is off, or the scheduler exposes a reset. Decide
+        # either prefix caching is off, or the scheduler exposes a clear. Decide
         # once here (static config) and let the controller reject unsafe releases.
         kv_cache_release_allowed = (
             not self.server_args.enable_prefix_caching
-            or callable(getattr(self.scheduler, "reset_prefix_cache", None))
+            or callable(getattr(self.scheduler, "clear_l1_cache", None))
         )
         self._memory = MemoryOccupationController(
             send_func=self.send_to_tokenizer,
@@ -514,6 +519,7 @@ class EventLoop:
             recv_func=self.recv_from_tokenizer,
             send_func=self.send_to_tokenizer,
             get_load_fn=self._get_load,
+            clear_cache_fn=self.scheduler.clear_cache,
             architectures=self.model_config.hf_config.architectures,
             pause_controller=self._pause,
             memory_controller=self._memory,
@@ -720,9 +726,9 @@ class EventLoop:
             time.sleep(0.0005)
 
     def _commit_cache_results(self) -> None:
-        if self.memory_executor is None:
+        if self.l2_cache_executor is None:
             return
-        cache_results = self.memory_executor.poll_results()
+        cache_results = self.l2_cache_executor.poll_results()
         self._num_inflight_cache_ops -= len(cache_results)
         for event in cache_results:
             payload = cache_event_to_payload(event)
@@ -756,11 +762,9 @@ class EventLoop:
         for payload in ready_payloads:
             e = cache_event_from_payload(payload)
             logger.debug(
-                "[cache_poll] event: op_id=%s success=%s type=%s request_id=%s",
+                "[cache_poll] event: op_id=%s type=%s",
                 e.op_id,
-                e.success,
                 type(e).__name__,
-                getattr(e, "request_id", "N/A"),
             )
             ec.add_event(e)
         self.scheduler.advance(ec)
@@ -890,7 +894,7 @@ class EventLoop:
 
         elif isinstance(self.kv_transfer, DisaggDecodeExecutor):
             # Decode node
-            if forward_op.num_extends() > 0:
+            if forward_op.num_extends() > 0 and not forward_op.is_local_prefill():
                 # Path 2: new requests waiting for remote KV — trigger RDMA receive
                 self.kv_transfer.reset_valid_cache_length(
                     forward_op,
@@ -907,7 +911,7 @@ class EventLoop:
                 self.kv_transfer.execute(forward_op)
                 return None, None
             else:
-                # Path 3b: decode batch — normal forward
+                # Decode and local recovery-prefill batches execute normally.
                 self.model_executor.reset_valid_cache_length(forward_op)
                 return (
                     self.model_executor.execute_forward_op_with_log(
@@ -981,43 +985,16 @@ class EventLoop:
         )
 
     def _submit_cache_ops(self, execution_plan) -> None:
-        if self.memory_executor is None:
+        if self.l2_cache_executor is None:
             return
-        self.memory_executor.submit_plan(execution_plan)
+        self.l2_cache_executor.submit_plan(execution_plan)
         for op in execution_plan.cache:
             if isinstance(op, Cache.WriteBackOp):
                 self._num_inflight_cache_ops += len(op.op_ids)
             elif isinstance(op, Cache.LoadBackOp):
-                if self._loadback_acks_expected:
-                    self._num_inflight_cache_ops += len(op.op_ids)
+                self._num_inflight_cache_ops += len(op.op_ids)
             else:
                 raise ValueError(f"unsupported cache op kind: {type(op).__name__}")
-        self._setup_layerwise_loadback(execution_plan)
-
-    def _setup_layerwise_loadback(self, execution_plan) -> None:
-        host_exec = getattr(self.memory_executor, "host_exec", None)
-        available_pools = (
-            getattr(host_exec, "pools", {}) if host_exec is not None else {}
-        )
-        consumer_indices_by_kind: dict[CacheKind, list[int]] = {
-            kind: [] for kind in available_pools
-        }
-        for cache_op in execution_plan.cache:
-            if isinstance(cache_op, Cache.LoadBackOp):
-                for op_id in cache_op.op_ids:
-                    for kind in consumer_indices_by_kind:
-                        producer_idx = self.memory_executor.get_producer_index(
-                            kind, op_id
-                        )
-                        if (
-                            producer_idx is not None
-                            and producer_idx not in consumer_indices_by_kind[kind]
-                        ):
-                            consumer_indices_by_kind[kind].append(producer_idx)
-        for kind, consumer_indices in consumer_indices_by_kind.items():
-            self.memory_executor.set_consumer(
-                kind, consumer_indices if consumer_indices else -1
-            )
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1518,18 +1495,19 @@ class EventLoop:
     # Pause / resume helpers
     # ------------------------------------------------------------------
 
-    def _reset_caches_for_release(self) -> None:
+    def _reset_caches_for_release(self) -> bool:
         """Invalidate the prefix/single-table cache before KV is discarded on release.
 
         KV pages are re-mapped + zeroed on wake, so any retained prefix entry
         would be stale. The unsafe case (prefix caching on with no reset) is
         rejected up front in ``MemoryOccupationController.handle_release`` via
-        ``kv_cache_release_allowed``, so by the time we get here either a reset
-        exists or prefix caching is off (nothing to invalidate).
+        ``kv_cache_release_allowed``, so by the time we get here either a clear
+        exists or prefix caching is off (nothing to invalidate). Returns False
+        while an asynchronous cache transfer still pins L1 so the release can
+        remain pending and retry on the next event-loop iteration.
         """
-        reset = getattr(self.scheduler, "reset_prefix_cache", None)
-        if callable(reset):
-            reset()
+        clear = getattr(self.scheduler, "clear_l1_cache", None)
+        return not callable(clear) or clear()
 
     def _kv_pools(self) -> list:
         """All KV pools whose pages are tagged ``kv_cache`` — the target pool and
@@ -1586,10 +1564,6 @@ class EventLoop:
     def _shutdown_complete(self) -> bool:
         return self.shutdown_event.is_set()
 
-    def _pages_to_zero(self, execution_plan):
-        """Group-aware child pages assigned by the scheduler in this step."""
-        return execution_plan.pages_to_zero
-
     def event_loop(self):
         """Non-overlapping scheduler loop."""
         while not self._shutdown_complete():
@@ -1606,7 +1580,7 @@ class EventLoop:
             execution_plan = self.scheduler.next_execution_plan()
             self._publish_scheduler_kv_events()
             cache_zero_event = self.model_executor.zero_cache_pages(
-                self._pages_to_zero(execution_plan)
+                execution_plan.pages_to_zero
             )
             self._submit_cache_ops(execution_plan)
 
@@ -1759,7 +1733,7 @@ class EventLoop:
             self._publish_scheduler_kv_events()
 
             cache_zero_event = self.model_executor.zero_cache_pages(
-                self._pages_to_zero(execution_plan)
+                execution_plan.pages_to_zero
             )
             self._submit_cache_ops(execution_plan)
 

@@ -34,8 +34,8 @@
 
 #include <spdlog/spdlog.h>
 
+#include "cache/tier/transfer.h"
 #include "fsm/forward_states.h"
-#include "scheduler/operations/cache.h"
 #include "scheduler/operations/forward.h"
 #include "scheduler/page_hasher.h"
 #include "utils.h"
@@ -49,7 +49,13 @@ std::int64_t ceilDiv(std::int64_t value, std::int64_t divisor) {
     return (value + divisor - 1) / divisor;
 }
 
+std::int32_t hostPoolBlocks(const SchedulerConfig& config) {
+    return config.HasHostCache() ? config.host_allocator.total_pages - 1 : 0;
+}
+
 CacheKey eventKey(const CacheKey& key) {
+    // External events describe one scheduler-level boundary. Fold every
+    // group/child offset behind that boundary into the same accounting key.
     return CacheKey{
         .namespace_id = key.namespace_id,
         .group_id = 0,
@@ -63,9 +69,11 @@ Scheduler::Scheduler(SchedulerConfig config)
     : config_{std::move(config)},
       req_pool_allocator_{config_.max_batch_size},
       block_pool_{config_.device_allocator.total_pages - 1},
-      host_pool_{config_.StreamingSinkEnabled() ? config_.host_allocator.total_pages - 1 : 0},
+      host_pool_{hostPoolBlocks(config_)},
       coordinator_{MakeCoordinator(MakeSpecsFromConfig(config_), config_.block_size, block_pool_,
-                                   config_.StreamingSinkEnabled() ? &host_pool_ : nullptr)} {
+                                   host_pool_.NumLcmBlocks() > 0 ? &host_pool_ : nullptr,
+                                   config_.StreamsDeviceCacheToHost())},
+      tier_transfers_{coordinator_} {
     if (config_.block_size <= 0) {
         throw std::invalid_argument("Scheduler: block_size must be > 0");
     }
@@ -98,8 +106,13 @@ Scheduler::Scheduler(SchedulerConfig config)
     for (const PagedCacheGroupConfig& group : config_.paged_cache_groups) {
         group.Validate();
         cache_group_ids_.push_back(group.group_id);
+        const std::int32_t child_entries = config_.block_size / group.CacheBlockTokens();
+        if (cache_entries_per_event_boundary_ > std::numeric_limits<std::int32_t>::max() - child_entries) {
+            throw std::invalid_argument("Scheduler: cache entries per event boundary exceed int32 range");
+        }
+        cache_entries_per_event_boundary_ += child_entries;
     }
-    max_single_request_tokens_ = calculateMaxSingleRequestTokens();
+    max_single_request_tokens_ = calculateMaxSingleRequestTokens(block_pool_.NumLcmBlocks());
 
     if (config_.enable_kv_cache_events) {
         coordinator_.SetCacheMutationSink([this](const CacheKey& key, KvCacheCoordinator::CacheMutation mutation) {
@@ -128,6 +141,20 @@ std::int64_t Scheduler::singleRequestParentsRequired(std::int32_t token_limit) c
     for (std::int32_t i = 0; i < coordinator_.NumGroups(); ++i) {
         const KvCacheManager& manager = coordinator_.GroupManager(i);
         const std::int64_t page_tokens = manager.CacheBlockTokens();
+        const auto local_prefill_peak = [&] {
+            // Across every prompt up to max_prompt_tokens, retain the largest
+            // resident window seen by either the first chunk or a later chunk.
+            const std::int64_t first_prompt = std::min(max_prompt_tokens, chunk_tokens);
+            std::int64_t pages = ceilDiv(first_prompt + decode_width + protected_tokens, page_tokens);
+            if (max_prompt_tokens > chunk_tokens) {
+                const std::int64_t later_prompt = std::min(max_prompt_tokens - chunk_tokens, chunk_tokens);
+                const std::int64_t lookback_pages = manager.BoundaryLookbackBlocks();
+                pages = std::max(pages, lookback_pages + ceilDiv(chunk_tokens, page_tokens));
+                pages = std::max(pages,
+                                 lookback_pages + ceilDiv(later_prompt + decode_width + protected_tokens, page_tokens));
+            }
+            return pages;
+        };
         std::int64_t child_pages = 0;
         if (manager.MatchIsPrefixClosed()) {
             child_pages = ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, page_tokens);
@@ -139,32 +166,26 @@ std::int64_t Scheduler::singleRequestParentsRequired(std::int32_t token_limit) c
                 // The final prompt page may be full, so a non-zero decode
                 // reservation can span one more page than its own page count.
                 const std::int64_t reserved_tokens = decode_width + protected_tokens;
-                child_pages = reserved_tokens == 0 ? 1 : 1 + ceilDiv(reserved_tokens, page_tokens);
+                const std::int64_t snapshot_pages =
+                    reserved_tokens == 0 ? 1 : 1 + ceilDiv(reserved_tokens, page_tokens);
+                // A retracted Decode request may recover by locally
+                // recomputing its suffix. Old State checkpoints are
+                // evictable, but one recovery chunk and its lookback must fit.
+                child_pages = std::max(snapshot_pages, local_prefill_peak());
             } else {
                 // Decode-only restores its destination in one admission, so a
                 // non-sparse group cannot slide old prompt pages first.
                 child_pages = ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, page_tokens);
             }
         } else {
-            // Across every prompt up to max_prompt_tokens, retain the largest
-            // resident window seen by either the first chunk or a later chunk.
-            const std::int64_t first_prompt = std::min(max_prompt_tokens, chunk_tokens);
-            child_pages = ceilDiv(first_prompt + decode_width + protected_tokens, page_tokens);
-            if (max_prompt_tokens > chunk_tokens) {
-                const std::int64_t later_prompt = std::min(max_prompt_tokens - chunk_tokens, chunk_tokens);
-                const std::int64_t lookback_pages = manager.BoundaryLookbackBlocks();
-                child_pages = std::max(child_pages, lookback_pages + ceilDiv(chunk_tokens, page_tokens));
-                child_pages = std::max(
-                    child_pages, lookback_pages + ceilDiv(later_prompt + decode_width + protected_tokens, page_tokens));
-            }
+            child_pages = local_prefill_peak();
         }
         required_parents += ceilDiv(child_pages, manager.CacheBlocksPerLcmBlock());
     }
     return required_parents;
 }
 
-std::int32_t Scheduler::calculateMaxSingleRequestTokens() const {
-    const std::int64_t usable_parents = block_pool_.NumLcmBlocks();
+std::int32_t Scheduler::calculateMaxSingleRequestTokens(std::int64_t usable_parents) const {
     std::int64_t low = 0;
     std::int64_t high = std::numeric_limits<std::int32_t>::max();
     while (low < high) {
@@ -176,27 +197,6 @@ std::int32_t Scheduler::calculateMaxSingleRequestTokens() const {
         }
     }
     return static_cast<std::int32_t>(low);
-}
-
-void Scheduler::StoreLedger::Add(cache_op_id id, std::vector<StoreTicket> tickets) {
-    for (const StoreTicket& ticket : tickets) {
-        keys_.insert(ticket.key);
-    }
-    const bool inserted = ops_.emplace(id, std::move(tickets)).second;
-    _assert(inserted, "duplicate store op id");
-}
-
-std::vector<Scheduler::StoreTicket> Scheduler::StoreLedger::Retire(cache_op_id id) {
-    auto it = ops_.find(id);
-    if (it == ops_.end()) {
-        return {};
-    }
-    for (const StoreTicket& ticket : it->second) {
-        keys_.erase(ticket.key);
-    }
-    std::vector<StoreTicket> tickets = std::move(it->second);
-    ops_.erase(it);
-    return tickets;
 }
 
 Request* Scheduler::findRequest(const std::string& request_id) {
@@ -214,6 +214,36 @@ std::size_t Scheduler::groupIndex(const std::string& group_id) const {
 
 std::vector<KvCacheEvent> Scheduler::DrainKvEvents() {
     return std::exchange(kv_events_, {});
+}
+
+bool Scheduler::ClearL1Cache() {
+    return clearCache(false);
+}
+
+bool Scheduler::ClearCache() {
+    return clearCache(true);
+}
+
+bool Scheduler::clearCache(bool include_host) {
+    const bool has_live_request =
+        std::ranges::any_of(requests_, [](const auto& item) { return !item.second->template Is<fsm::Finished>(); });
+    const bool has_pending_forward_results = !pending_forward_results_.empty();
+    const bool has_pd_transfers = !pd_transfer_pins_.empty();
+    const bool has_tier_transfers = tier_transfers_.HasAnyInFlight();
+    if (has_live_request || has_pending_forward_results || has_pd_transfers || has_tier_transfers) {
+        spdlog::info(
+            "[Scheduler] flush L1 cache rejected: live_requests={} pending_forward_results={} pd_transfers={} "
+            "tier_transfers={}",
+            has_live_request, has_pending_forward_results, has_pd_transfers, has_tier_transfers);
+        return false;
+    }
+    const bool cleared = include_host ? coordinator_.ClearCache() : coordinator_.ClearDeviceCache();
+    if (!cleared) {
+        spdlog::info("[Scheduler] flush {}cache rejected: cached blocks are still pinned", include_host ? "" : "L1 ");
+        return false;
+    }
+    spdlog::info("[Scheduler] flush {}cache completed", include_host ? "" : "L1 ");
+    return true;
 }
 
 std::vector<CacheKey> Scheduler::registerKvEventPages(const Request& request, std::span<const std::string> page_hashes,
@@ -255,7 +285,7 @@ std::vector<CacheKey> Scheduler::registerKvEventPages(const Request& request, st
 
 void Scheduler::discardUncachedKvEventPages(std::span<const CacheKey> keys) {
     for (const CacheKey& key : keys) {
-        if (!cached_event_group_counts_.contains(key)) {
+        if (!cached_event_child_counts_.contains(key)) {
             kv_event_pages_.erase(key);
         }
     }
@@ -264,10 +294,10 @@ void Scheduler::discardUncachedKvEventPages(std::span<const CacheKey> keys) {
 void Scheduler::handleCacheMutation(const CacheKey& key, KvCacheCoordinator::CacheMutation mutation) {
     const CacheKey prefix_key = eventKey(key);
     if (mutation == KvCacheCoordinator::CacheMutation::kStored) {
-        std::int32_t& group_count = cached_event_group_counts_[prefix_key];
-        FatalCheck(group_count < coordinator_.NumGroups(), "duplicate group entry for one KV event boundary");
-        ++group_count;
-        if (group_count == coordinator_.NumGroups()) {
+        std::int32_t& child_count = cached_event_child_counts_[prefix_key];
+        FatalCheck(child_count < cache_entries_per_event_boundary_, "duplicate child entry for one KV event boundary");
+        ++child_count;
+        if (child_count == cache_entries_per_event_boundary_) {
             const auto page_it = kv_event_pages_.find(prefix_key);
             FatalCheck(page_it != kv_event_pages_.end(), "cached KV event boundary has no token descriptor");
             kv_events_.emplace_back(page_it->second);
@@ -275,33 +305,57 @@ void Scheduler::handleCacheMutation(const CacheKey& key, KvCacheCoordinator::Cac
         return;
     }
 
-    auto count_it = cached_event_group_counts_.find(prefix_key);
-    FatalCheck(count_it != cached_event_group_counts_.end() && count_it->second > 0,
+    auto count_it = cached_event_child_counts_.find(prefix_key);
+    FatalCheck(count_it != cached_event_child_counts_.end() && count_it->second > 0,
                "removed KV event boundary was not registered");
-    if (count_it->second == coordinator_.NumGroups()) {
+    if (count_it->second == cache_entries_per_event_boundary_) {
         const auto page_it = kv_event_pages_.find(prefix_key);
         FatalCheck(page_it != kv_event_pages_.end(), "removed KV event boundary has no token descriptor");
         kv_events_.emplace_back(KvBlockRemovedEvent{.block_hashes = page_it->second.block_hashes});
     }
     if (--count_it->second == 0) {
-        cached_event_group_counts_.erase(count_it);
+        cached_event_child_counts_.erase(count_it);
         kv_event_pages_.erase(prefix_key);
     }
 }
 
 void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
+    std::unordered_set<std::string> request_ids;
+    request_ids.reserve(request_specs.size());
+    std::vector<std::unique_ptr<Request>> pending_requests;
+    pending_requests.reserve(request_specs.size());
     for (const RequestSpec& spec : request_specs) {
-        auto request = std::make_unique<Request>(spec, config_.block_size, config_.role);
-        const bool inserted = requests_.emplace(spec.request_id, std::move(request)).second;
-        if (!inserted) {
+        if (spec.tokens.empty()) {
+            throw std::invalid_argument("Scheduler: request tokens must be non-empty");
+        }
+        if (requests_.contains(spec.request_id) || !request_ids.insert(spec.request_id).second) {
             throw std::invalid_argument("Scheduler: duplicate request id '" + spec.request_id + "'");
         }
+        if (spec.max_new_tokens < 0) {
+            throw std::invalid_argument("Scheduler: max_new_tokens must be non-negative");
+        }
+        const std::int64_t generation_reserve =
+            config_.role == Role::kP ? 0 : std::max<std::int64_t>(spec.max_new_tokens, config_.decode_input_tokens);
+        const std::int64_t token_limit = static_cast<std::int64_t>(spec.tokens.size()) + generation_reserve;
+        if (token_limit > std::numeric_limits<std::int32_t>::max()) {
+            throw std::invalid_argument("Scheduler: request token limit exceeds int32 range");
+        }
+        if (token_limit > max_single_request_tokens_) {
+            throw std::invalid_argument("Scheduler: request token limit exceeds paged-cache capacity");
+        }
+        pending_requests.push_back(std::make_unique<Request>(spec, config_.block_size, config_.role));
+    }
+
+    for (std::size_t i = 0; i < request_specs.size(); ++i) {
+        const bool inserted = requests_.emplace(request_specs[i].request_id, std::move(pending_requests[i])).second;
+        FatalCheck(inserted, "validated request id became duplicate before insertion");
     }
 }
 
 std::size_t Scheduler::WaitingSize() const {
-    return static_cast<std::size_t>(
-        std::ranges::count_if(requests_, [](const auto& item) { return item.second->template Is<fsm::Submitted>(); }));
+    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const auto& item) {
+        return item.second->template Is<fsm::Submitted>() || item.second->template Is<fsm::Retracted>();
+    }));
 }
 
 std::size_t Scheduler::DecodingSize() const {
@@ -343,7 +397,7 @@ std::int32_t Scheduler::PagedCacheGroupAvailablePages(const std::string& group_i
     const std::int32_t slots_per_parent = config_.paged_cache_groups[index].cache_blocks_per_lcm_block;
     std::int32_t available = block_pool_.NumEmptyLcmBlocks() * slots_per_parent;
     for (std::int32_t id = 1; id <= block_pool_.NumLcmBlocks(); ++id) {
-        if (block_pool_.BoundGroup(id) == static_cast<GroupId>(index)) {
+        if (block_pool_.BoundGroup(id) == static_cast<std::uint32_t>(index)) {
             available += slots_per_parent - block_pool_.OccupiedCount(id);
         }
     }
@@ -353,47 +407,6 @@ std::int32_t Scheduler::PagedCacheGroupAvailablePages(const std::string& group_i
 std::int32_t Scheduler::RequestTokenSize(const std::string& id) const {
     const auto it = requests_.find(id);
     return it == requests_.end() ? -1 : it->second->TokenSize();
-}
-
-void Scheduler::emitPendingStores(std::vector<WriteBackOperation>& write_back_operations) {
-    if (!config_.StreamingSinkEnabled()) {
-        return;
-    }
-
-    std::vector<TransferPair> transfers;
-    std::vector<StoreTicket> tickets;
-    std::unordered_set<CacheKey, CacheKeyHash> batch_keys;
-    for (auto& candidate : coordinator_.TakePendingStores()) {
-        if (coordinator_.ContainsHostCachedBlock(candidate.key) || store_ops_.InFlight(candidate.key) ||
-            !batch_keys.insert(candidate.key).second) {
-            candidate.block_ref.reset();
-            continue;
-        }
-
-        const KvCacheManager& manager = coordinator_.GroupManager(static_cast<std::int32_t>(candidate.key.group_id));
-        CacheBlockRef host_block_ref =
-            host_pool_.AcquireBlock(candidate.key.group_id, manager.CacheBlocksPerLcmBlock());
-        if (!host_block_ref) {
-            candidate.block_ref.reset();
-            continue;
-        }
-        transfers.push_back(TransferPair{
-            manager.ResolveKernelPageId(candidate.block_ref->Location()),
-            manager.ResolveKernelPageId(host_block_ref->Location()),
-        });
-        tickets.push_back(StoreTicket{
-            std::move(candidate.key),
-            std::move(candidate.block_ref),
-            std::move(host_block_ref),
-        });
-    }
-
-    if (transfers.empty()) {
-        return;
-    }
-    const cache_op_id op_id = allocateCacheOpId();
-    store_ops_.Add(op_id, std::move(tickets));
-    write_back_operations.emplace_back(op_id, std::move(transfers));
 }
 
 ExecutionPlan Scheduler::NextExecutionPlan() {
@@ -409,25 +422,28 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     candidates.reserve(requests_.size());
     for (auto& [_, request] : requests_) {
         if (request->Is<fsm::Submitted>() || request->Is<fsm::Prefilling>() || request->Is<fsm::PrefillDone>() ||
-            request->Is<fsm::Decoding>()) {
+            request->Is<fsm::Decoding>() || request->Is<fsm::Retracted>()) {
             candidates.push_back(request.get());
         }
     }
 
-    auto [forward_operations, load_back_operations] = buildForwardOperations(std::move(candidates));
-
     ExecutionPlan plan;
+    std::vector<WriteBackOperation> write_back_operations;
+    auto [forward_operations, load_back_operations] =
+        buildForwardOperations(plan, std::move(candidates), write_back_operations);
     plan.With(ForwardBatch{std::move(forward_operations)});
 
-    std::vector<WriteBackOperation> write_back_operations;
-    emitPendingStores(write_back_operations);
+    if (config_.StreamsDeviceCacheToHost()) {
+        if (auto store = tier_transfers_.StartPendingStores()) {
+            write_back_operations.push_back(std::move(*store));
+        }
+    }
     if (!write_back_operations.empty()) {
         plan.With(CacheOperation{WriteBackBatch{write_back_operations}});
     }
     if (!load_back_operations.empty()) {
         plan.With(CacheOperation{LoadBackBatch{load_back_operations}});
     }
-    plan.pages_to_zero = std::exchange(new_page_ids_, {});
     return plan;
 }
 

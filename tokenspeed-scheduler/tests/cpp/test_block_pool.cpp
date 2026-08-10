@@ -27,7 +27,7 @@
 
 #include <spdlog/sinks/stdout_color_sinks.h>
 
-#include "cache/block_pool.h"
+#include "cache/core/block_pool.h"
 
 namespace tokenspeed::test {
 namespace {
@@ -71,7 +71,7 @@ TEST(BlockPoolLcmPlacementTest, EmptyParentBindsToGroupOnFirstChild) {
 
     ASSERT_TRUE(first);
     EXPECT_EQ(first->Location(), (CacheBlockLocation{.lcm_block_id = 1, .slot_index = 0}));
-    EXPECT_EQ(pool.BoundGroup(1), std::optional<GroupId>{7});
+    EXPECT_EQ(pool.BoundGroup(1), std::optional<std::uint32_t>{7});
     EXPECT_EQ(pool.OccupiedCount(1), 1);
 }
 
@@ -91,7 +91,7 @@ TEST(BlockPoolLcmPlacementTest, NormalCapacityShortfallDoesNotMutatePartialParen
     std::vector<CacheBlockRef> blocks = pool.AcquireBlocks(/*group_id=*/7, /*cache_blocks_per_lcm_block=*/2, /*num=*/2);
 
     EXPECT_TRUE(blocks.empty());
-    EXPECT_EQ(pool.BoundGroup(1), std::optional<GroupId>{7});
+    EXPECT_EQ(pool.BoundGroup(1), std::optional<std::uint32_t>{7});
     EXPECT_EQ(pool.OccupiedCount(1), 1);
     EXPECT_TRUE(pool.IsOccupied(location));
 }
@@ -107,7 +107,7 @@ TEST(BlockPoolLcmPlacementTest, ParentRebindsOnlyAfterLastChildReleases) {
     CacheBlockRef rebound = pool.AcquireBlock(/*group_id=*/2, /*cache_blocks_per_lcm_block=*/8);
     ASSERT_TRUE(rebound);
     EXPECT_EQ(rebound->Location().slot_index, 0);
-    EXPECT_EQ(pool.BoundGroup(1), std::optional<GroupId>{2});
+    EXPECT_EQ(pool.BoundGroup(1), std::optional<std::uint32_t>{2});
 }
 
 TEST(BlockPoolLcmPlacementTest, ReleasedParentsRestoreBatchCapacity) {

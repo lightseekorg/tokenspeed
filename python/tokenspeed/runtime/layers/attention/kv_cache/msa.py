@@ -69,8 +69,8 @@ class MSATokenToKVPool(MHATokenToKVPool):
             }
 
     def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id)
+        if self.layerwise_load_tracker is not None:
+            self.layerwise_load_tracker.wait_for_layer(layer_id)
         if layer_id not in self.index_k_buffer:
             raise RuntimeError(f"Layer {layer_id} has no index-key cache.")
         return self.index_k_buffer[layer_id]

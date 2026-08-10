@@ -71,9 +71,6 @@ class _EventLoopHarness:
     def _shutdown_complete(self) -> bool:
         return EventLoop._shutdown_complete(self)
 
-    def _pages_to_zero(self, execution_plan):
-        return EventLoop._pages_to_zero(self, execution_plan)
-
     def _process_new_requests(self) -> None:
         self.trace.append("process_requests")
         # Exercise the important case where SIGTERM arrives during an

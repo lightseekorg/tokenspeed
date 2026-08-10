@@ -49,6 +49,8 @@ jobs:
       # Authenticate model downloads so cold runners do not hit anonymous
       # Hugging Face rate limits while starting `ts serve`.
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      # Cross-repository PRs cannot receive repository secrets.
+      TOKENSPEED_CI_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

@@ -23,7 +23,7 @@
 #include <variant>
 
 #include "scheduler/operations/forward.h"
-#include "scheduler/operations/cache.h"
+#include "cache/tier/transfer.h"
 
 namespace tokenspeed {
 

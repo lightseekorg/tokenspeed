@@ -45,11 +45,14 @@ eval:
   # under temp-1.0 sampling and jitters ~26-29/30 run-to-run. The 0.86 floor
   # below sits just under the observed 26/30 = 0.8667 minimum.
   command: >-
+    HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
     /tmp/evalscope-perf/bin/evalscope eval
     --model nvidia/MiniMax-M3-NVFP4
     --api-url http://127.0.0.1:8000/v1
     --api-key EMPTY_TOKEN
     --datasets aime25
+    --dataset-hub huggingface
+    --dataset-args '{"aime25":{"dataset_id":"math-ai/aime25"}}'
     --eval-batch-size 16
     --stream
     --generation-config '{"do_sample":true,"temperature":1.0,"top_p":0.95,"max_tokens":163840,"timeout":1800}'

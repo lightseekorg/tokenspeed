@@ -47,11 +47,14 @@ eval:
   install:
     - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
   command: >-
+    HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
     /tmp/evalscope-perf/bin/evalscope eval
     --model kimi-k3
     --api-url http://127.0.0.1:8000/v1
     --api-key EMPTY_TOKEN
     --datasets aime26
+    --dataset-hub huggingface
+    --dataset-args '{"aime26":{"dataset_id":"math-ai/aime26"}}'
     --eval-batch-size 16
     --stream
     --generation-config '{"do_sample":true,"temperature":1.0,"max_tokens":32768,"extra_body":{"reasoning_effort":"high"}}'

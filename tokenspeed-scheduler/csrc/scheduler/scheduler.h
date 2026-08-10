@@ -22,6 +22,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
 #include <optional>
@@ -31,16 +32,16 @@
 #include <unordered_set>
 #include <vector>
 
-#include "cache/block_pool.h"
-#include "core/types.h"
-#include "cache/forward_cache_ops.h"
-#include "cache/kv_cache_coordinator.h"
+#include "cache/coordinator/kv_cache_coordinator.h"
+#include "cache/core/block_pool.h"
+#include "cache/tier/transfer_manager.h"
 #include "fsm/forward_events.h"
 #include "fsm/pd_events.h"
 #include "resource/allocator/req_pool_allocator.h"
 #include "scheduler/execution_event.h"
 #include "scheduler/execution_plan.h"
 #include "scheduler/kv_cache_events.h"
+#include "scheduler/operations/cache.h"
 #include "scheduler/request.h"
 #include "scheduler/types.h"
 
@@ -55,6 +56,12 @@ public:
     ExecutionPlan NextExecutionPlan();
     void Advance(const ExecutionEvent& event);
     std::vector<KvCacheEvent> DrainKvEvents();
+    // Testing/control-plane operation. A successful return means the complete
+    // Device L1 prefix cache was removed; Host L2 is never touched.
+    bool ClearL1Cache();
+    // Public flush operation. A successful return means both Device L1 and
+    // Host L2 prefix indexes were removed.
+    bool ClearCache();
 
     std::size_t WaitingSize() const;
     std::size_t DecodingSize() const;
@@ -77,6 +84,7 @@ public:
     std::int32_t HostPoolPinnedBlocks() const { return coordinator_.NumPinnedHostCachedBlocks(); }
 
 private:
+    bool clearCache(bool include_host);
     struct AdmissionMatch {
         KvCacheCoordinator::PrefixProbe probe;
         std::vector<std::string> candidate_page_hashes;
@@ -88,14 +96,25 @@ private:
         std::vector<std::uint64_t> block_hashes;
     };
 
+    struct PlanBuildContext {
+        explicit PlanBuildContext(ExecutionPlan& output_plan) : plan{output_plan} {}
+
+        ExecutionPlan& plan;
+        bool admission_failed{false};
+        bool waits_for_store_ack{false};
+        std::optional<std::string> capacity_blocker;
+    };
+
     std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> buildForwardOperations(
-        std::vector<Request*> candidates);
-    std::optional<fsm::SchedulePrefillFirstChunkEvent> schedulePrefillFirstChunk(Request* request,
+        ExecutionPlan& plan, std::vector<Request*> candidates, std::vector<WriteBackOperation>& write_back_operations);
+    std::optional<fsm::SchedulePrefillFirstChunkEvent> schedulePrefillFirstChunk(PlanBuildContext& context,
+                                                                                 Request* request,
                                                                                  std::int32_t remaining,
                                                                                  std::int32_t decode_input_tokens);
-    std::optional<fsm::SchedulePrefillEvent> schedulePrefill(Request* request, std::int32_t remaining,
+    std::optional<fsm::SchedulePrefillEvent> schedulePrefill(PlanBuildContext& context, Request* request,
+                                                             std::int32_t remaining,
                                                              std::int32_t reserve_num_tokens_in_next_schedule_event);
-    std::optional<fsm::ScheduleDecodeEvent> scheduleDecode(Request* request);
+    std::optional<fsm::ScheduleDecodeEvent> scheduleDecode(PlanBuildContext& context, Request* request);
 
     PrefillOperation applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillFirstChunkEvent event,
                                                  std::vector<LoadBackOperation>& load_back_operations);
@@ -104,19 +123,22 @@ private:
 
     AdmissionMatch matchPrefixAtAdmission(Request* request);
     std::optional<KvCacheCoordinator::AdmissionResult> admit(
-        KvCacheCoordinator::PrefixProbe&& prefix, std::span<const GroupDemand> demands,
+        PlanBuildContext& context, KvCacheCoordinator::PrefixProbe&& prefix, std::span<const GroupDemand> demands,
         std::optional<std::uint64_t> request_access_epoch = std::nullopt);
-    std::optional<KvCacheCoordinator::AdmissionResult> admit(std::span<const GroupDemand> demands,
+    std::optional<KvCacheCoordinator::AdmissionResult> admit(PlanBuildContext& context,
+                                                             std::span<const GroupDemand> demands,
                                                              std::uint64_t request_access_epoch);
+    bool admitWithKvEventTracking(PlanBuildContext& context, Request& request, const fsm::CacheProgress& cache_progress,
+                                  std::int32_t new_page_hash_begin, std::span<const GroupDemand> demands);
     std::vector<CacheKey> registerKvEventPages(const Request& request, std::span<const std::string> page_hashes,
                                                std::int32_t first_page);
     void discardUncachedKvEventPages(std::span<const CacheKey> keys);
     void handleCacheMutation(const CacheKey& key, KvCacheCoordinator::CacheMutation mutation);
     void publishCompletedPages(Request& request);
-    void retractForCapacity(const std::vector<Request*>& candidates);
+    void retractForCapacity(PlanBuildContext& context, const std::vector<Request*>& candidates,
+                            std::vector<WriteBackOperation>& write_back_operations);
 
-    void emitPendingStores(std::vector<WriteBackOperation>& write_back_operations);
-    cache_op_id allocateCacheOpId() { return next_cache_op_id_++; }
+    std::optional<WriteBackOperation> beginRetraction(Request& request);
     std::size_t groupIndex(const std::string& group_id) const;
     Request* findRequest(const std::string& request_id);
 
@@ -131,7 +153,7 @@ private:
     void handleEvent(const forward::Finish& event);
     void handleEvent(const forward::UpdateReserveNumTokens& event);
 
-    std::int32_t calculateMaxSingleRequestTokens() const;
+    std::int32_t calculateMaxSingleRequestTokens(std::int64_t usable_parents) const;
     std::int64_t singleRequestParentsRequired(std::int32_t token_limit) const;
 
     SchedulerConfig config_;
@@ -141,46 +163,23 @@ private:
     BlockPool block_pool_;
     BlockPool host_pool_;
     KvCacheCoordinator coordinator_;
+    TierTransferManager tier_transfers_;
     std::vector<std::string> cache_group_ids_;
     std::int32_t max_single_request_tokens_{0};
 
-    std::map<std::string, std::vector<std::int32_t>> new_page_ids_;
     std::unordered_map<std::string, std::int32_t> pending_forward_results_;
     std::unordered_set<std::string> pd_transfer_pins_;
-    bool lcm_admission_failed_{false};
-
-    struct StoreTicket {
-        CacheKey key;
-        CacheBlockRef device_block_ref;
-        CacheBlockRef host_block_ref;
-    };
-
-    class StoreLedger {
-    public:
-        void Add(cache_op_id id, std::vector<StoreTicket> tickets);
-        std::vector<StoreTicket> Retire(cache_op_id id);
-        bool InFlight(const CacheKey& key) const { return keys_.contains(key); }
-        bool Empty() const { return ops_.empty(); }
-
-    private:
-        std::unordered_map<cache_op_id, std::vector<StoreTicket>> ops_;
-        std::unordered_set<CacheKey, CacheKeyHash> keys_;
-    };
-
-    struct LoadTicket {
-        std::vector<CacheBlockRef> host_pins;
-        std::vector<CacheBlockRef> device_blocks;
-    };
-
-    StoreLedger store_ops_;
-    std::unordered_map<cache_op_id, LoadTicket> load_ops_;
-    cache_op_id next_cache_op_id_{0};
+    std::deque<std::string> recovery_queue_;
+    std::optional<std::string> recovery_barrier_;
 
     std::unordered_map<std::string, std::unique_ptr<Request>> requests_;
     std::vector<KvCacheEvent> kv_events_;
     std::unordered_map<std::string, KvEventHashProgress> kv_event_hash_progress_;
     std::unordered_map<CacheKey, KvBlockStoredEvent, CacheKeyHash> kv_event_pages_;
-    std::unordered_map<CacheKey, std::int32_t, CacheKeyHash> cached_event_group_counts_;
+    // Number of resident child cache entries behind each scheduler-level
+    // boundary. A group may contribute more than one child entry.
+    std::unordered_map<CacheKey, std::int32_t, CacheKeyHash> cached_event_child_counts_;
+    std::int32_t cache_entries_per_event_boundary_{0};
 };
 
 }  // namespace tokenspeed

@@ -46,9 +46,11 @@ class MlaCacheGroupMixin:
     # MLA backends consume only the history (full-attention) cache family.
     cache_consumer_families = frozenset({"history"})
 
-    # Scheduler page size recorded for validating the draft cache contract;
-    # None until mark_cache_contract records it. See _draft_reads_batch_pages.
-    _cache_logical_page_size: int | None = None
+    # A draft MLA backend always reads the batch-ordered draft page table that
+    # DraftPageStaging publishes (single history group, already in kernel
+    # pages), never the wrapper's per-group table dispatch. This flag tells the
+    # CUDA-graph wrapper to skip that dispatch for MLA drafts.
+    reads_staged_draft_page_table = True
 
     def mark_cache_contract(self, logical_page_size: int | None = None) -> None:
         """Flag this backend as an LCM cache-group contract sub-backend.
@@ -56,71 +58,27 @@ class MlaCacheGroupMixin:
         Called by the registry before graph-state allocation. Eager forwards
         bind the group tables automatically once cache metadata arrives; this
         flag lets CUDA-graph capture size its per-group write-location buffer up
-        front.
-
-        ``logical_page_size`` is the pool's scheduler page size. A target learns
-        it per step from ``cache_metadata``, but a draft is driven directly by
-        the drafter, which passes no metadata -- it hands over a batch-ordered
-        draft page table that ``ModelExecutor`` has already translated into the
-        draft backend's kernel-page units.
+        front. ``logical_page_size`` is accepted for call-site uniformity with
+        other backends but unused: every MLA draft reads the batch-ordered draft
+        page table published by ``DraftPageStaging`` (already in kernel pages),
+        so no logical size ever needs to be recorded here.
         """
+        del logical_page_size
         self._cache_contract_bound = True
-        if logical_page_size is not None:
-            self._cache_logical_page_size = int(logical_page_size)
-
-    def _resolve_draft_group_table(self, block_tables) -> torch.Tensor | None:
-        """Full-history table when the wrapper hands the draft its group tables.
-
-        The wrapper subsets the batch's per-group tables to this backend's
-        consumer families (history only for MLA), so exactly one table is
-        expected. Ids are scheduler pages in the contract's logical size
-        recorded by :meth:`mark_cache_contract`.
-        """
-        if not block_tables or not self.is_draft:
-            return None
-        if self._cache_logical_page_size is None:
-            raise RuntimeError(
-                "draft received group tables before mark_cache_contract "
-                "recorded the scheduler's logical page size"
-            )
-        if len(block_tables) != 1:
-            raise RuntimeError(
-                "MLA draft consumes exactly one history group table, got "
-                f"{sorted(block_tables)}"
-            )
-        return next(iter(block_tables.values()))
-
-    def _bind_draft_group_table(
-        self, draft_group_table: torch.Tensor, bs: int
-    ) -> tuple[torch.Tensor, int]:
-        """Adopt the wrapper-distributed draft history table for this step.
-
-        Rows are batch-ordered scheduler pages; the logical size to expand
-        with is the one recorded by :meth:`mark_cache_contract`.
-        """
-        self._cache_groups_bound = True
-        return draft_group_table[:bs], self._cache_logical_page_size
 
     def _draft_reads_batch_pages(self, bs: int, forward_mode) -> bool:
         """True when this draft reads the published draft page table directly.
 
-        A contract-bound draft with a recorded logical page size is driven by
-        the drafter (no cache_metadata); the executor publishes the target's
+        A contract-bound MLA draft is always driven this way: the drafter runs
+        without cache_metadata, and ``ModelExecutor`` publishes the target's
         full-history table into the batch-ordered draft page table (row i ==
         batch position i), expanding scheduler pages into draft kernel pages
-        exactly once while publishing it.
-
-        This path is NOT redundant with the wrapper's group-table
-        distribution (:meth:`_bind_draft_group_table`): the wrapper drives
-        MTP/Eagle metadata inits and hands over group tables, but a
-        block-drafting drafter (DFLASH) initializes its backend directly
-        mid-step with only the staged draft page table — this fallback is
-        that mode's delivery path.
+        exactly once at publish time. The backend then reads those ids as-is
+        (identity expand); it never needs the scheduler's logical page size.
         """
         return (
             self.is_draft
             and self._cache_contract_bound
-            and self._cache_logical_page_size is not None
             and bs > 0
             and not forward_mode.is_idle()
         )

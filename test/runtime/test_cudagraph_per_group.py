@@ -144,11 +144,18 @@ class DraftCacheGroupIdsTest(_TorchCase):
 
         self.group_ids = CudaGraphWrapper._draft_cache_group_ids
 
-    def _wrapper(self, *, draft_block_decode, families=("history",)):
+    def _wrapper(
+        self,
+        *,
+        draft_block_decode,
+        families=("history",),
+        reads_staged_draft_page_table=False,
+    ):
         return SimpleNamespace(
             draft_attn_backend=SimpleNamespace(
                 uses_cache_groups=True,
                 draft_block_decode=draft_block_decode,
+                reads_staged_draft_page_table=reads_staged_draft_page_table,
                 cache_consumer_families=frozenset(families),
             ),
             draft_token_to_kv_pool=SimpleNamespace(
@@ -162,6 +169,19 @@ class DraftCacheGroupIdsTest(_TorchCase):
     def test_dflash_does_not_capture_target_group_tables(self):
         self.assertEqual(
             self.group_ids(self._wrapper(draft_block_decode=True)),
+            (),
+        )
+
+    def test_mla_draft_reads_staged_page_table(self):
+        # MLA drafts consume only the batch-ordered staged draft page table, so
+        # the wrapper must not dispatch per-group tables to them.
+        self.assertEqual(
+            self.group_ids(
+                self._wrapper(
+                    draft_block_decode=False,
+                    reads_staged_draft_page_table=True,
+                )
+            ),
             (),
         )
 

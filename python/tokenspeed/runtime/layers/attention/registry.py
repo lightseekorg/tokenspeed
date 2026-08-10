@@ -466,12 +466,20 @@ def _wrap_inkling_backend(inner, text_config, attn_config, *, num_layers, is_dra
         InklingConvStatePool,
     )
 
+    kernel_size = text_config.sconv_kernel_size
+    spec_tokens = max(1, int(getattr(attn_config, "speculative_num_draft_tokens", 1)))
+    # Ring row of absolute position p is p % R. R must keep a round's
+    # pre-chunk tap reads and chunk-row writes disjoint mod R:
+    # (W-1) history taps + K chunk rows + the draft's lookback depth
+    # (spec steps - 1 = K - 2). Uniform across target and draft.
+    ring_size = (kernel_size - 1) + spec_tokens + max(spec_tokens - 2, 0)
     conv_pool = InklingConvStatePool(
         num_layers=num_layers,
         # Row 0 is reserved (1-based indices); +2 covers it plus a padding slot
         num_slots=attn_config.max_bs + 2,
         conv_dim=inkling_conv_total_dim(text_config, attn_config.attn_tp_size),
-        kernel_size=text_config.sconv_kernel_size,
+        kernel_size=kernel_size,
+        ring_size=ring_size,
         dtype=torch.bfloat16,
         device=attn_config.device,
     )
@@ -496,7 +504,6 @@ def _inkling_conv_columns(pool, text_config):
     layer_labels = text_config.paged_cache_layer_types
     block_tokens = pool.plan.logical_block_tokens
     conv_columns = {
-        "mode": "checkpoint",
         "block_tokens": block_tokens,
         "conv_group_of_layer": ("kvconv",) * len(layer_labels),
         "hidden_group_of_layer": ("hiddenconv",) * len(layer_labels),
@@ -718,7 +725,6 @@ def _prepare_verify_workspace(
         )
     elif is_inkling:
         model_name = "Inkling"
-        backend.preallocate_verify_workspace(config.max_bs)
         if draft_backend is not None:
             lookback = (
                 int(server_args.speculative_num_steps) - 1

@@ -24,6 +24,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <variant>
@@ -33,9 +35,9 @@ namespace tokenspeed {
 
 struct ForwardOperationBase {
     std::string request_id;
-    std::int32_t request_pool_index;
-    std::int32_t input_length;
-    std::int32_t prefill_length;
+    std::int32_t request_pool_index{-1};
+    std::int32_t input_length{0};
+    std::int32_t prefill_length{0};
 
     // Per-group block tables. Rows use absolute logical-page indexing; null
     // holes are page 0 and rows are not compacted.
@@ -45,7 +47,8 @@ struct ForwardOperationBase {
 struct PrefillOperation : public ForwardOperationBase {
     std::vector<std::int32_t> input_ids;
     std::vector<std::int32_t> shifted_input_ids;
-    std::int32_t extend_prefix_len;
+    std::int32_t extend_prefix_len{0};
+    bool local_prefill{true};
 };
 
 struct DecodeOperation : public ForwardOperationBase {
@@ -74,9 +77,11 @@ struct ForwardBatch {
     // padded), exposed zero-copy to Python as a 2-D ndarray -- the nested
     // vectors above cost one PyLong per page id at every attribute access.
     std::map<std::string, std::vector<std::int32_t>> block_tables_contig;
+    bool local_prefill{false};
     explicit ForwardBatch(std::vector<ForwardOperation> ops) {
         std::stable_partition(ops.begin(), ops.end(),
                               [](const ForwardOperation& a) { return std::holds_alternative<PrefillOperation>(a); });
+        std::optional<bool> prefill_source;
         for (auto& op : ops) {
             std::visit(
                 [this](auto& inner) {
@@ -90,6 +95,11 @@ struct ForwardBatch {
                 },
                 op);
             if (auto* prefill = std::get_if<PrefillOperation>(&op)) {
+                if (prefill_source && *prefill_source != prefill->local_prefill) {
+                    throw std::logic_error("one ForwardBatch cannot mix local and remote prefills");
+                }
+                prefill_source = prefill->local_prefill;
+                local_prefill = prefill->local_prefill;
                 input_ids.insert(input_ids.end(), prefill->input_ids.begin(), prefill->input_ids.end());
                 shifted_input_ids.insert(shifted_input_ids.end(), prefill->shifted_input_ids.begin(),
                                          prefill->shifted_input_ids.end());
@@ -130,6 +140,7 @@ struct ForwardBatch {
 
     bool empty() const { return request_ids.empty(); }
     std::size_t NumExtends() const { return extend_prefix_lens.size(); }
+    bool IsLocalPrefill() const { return NumExtends() > 0 && local_prefill; }
 };
 
 }  // namespace tokenspeed

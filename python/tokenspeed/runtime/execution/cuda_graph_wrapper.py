@@ -660,10 +660,12 @@ class CudaGraphWrapper:
         """Per-group page tables consumed by the drafter.
 
         DFLASH block decode owns an independent draft page table and must stay
-        on that single-table path. Other draft heads share the target's page-id
-        space (EAGLE writes its own pool tensors at the same indices), so each
-        draft group consumes the target tables for the cache families declared
-        by its backend.
+        on that single-table path. MLA drafts likewise read only the staged
+        batch-ordered draft page table (single history group), so they opt out
+        via ``reads_staged_draft_page_table``. Other draft heads share the
+        target's page-id space (EAGLE writes its own pool tensors at the same
+        indices), so each draft group consumes the target tables for the cache
+        families declared by its backend.
 
         A draft pool that publishes its own specs (Inkling MTP: mixed full/SWA
         depths) names exactly the groups its layers carry. Older draft paths
@@ -674,6 +676,8 @@ class CudaGraphWrapper:
         ):
             return ()
         if getattr(self.draft_attn_backend, "draft_block_decode", False):
+            return ()
+        if getattr(self.draft_attn_backend, "reads_staged_draft_page_table", False):
             return ()
         families = frozenset(
             getattr(
