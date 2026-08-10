@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
-from dataclasses import replace
 
 import torch
 from torch import nn
@@ -155,14 +154,16 @@ class KimiK3DraftDecoderLayer(nn.Module):
             alt_stream=alt_stream,
         )
         # The fused-AR lane workspace is a singleton shaped around the base
-        # model's usage; the draft takes the plain reduce path. These moved
-        # onto the execution plan, so the old attribute writes landed on names
-        # nothing reads and the draft kept using the lane regardless.
-        self.block_sparse_moe.execution_plan = replace(
-            self.block_sparse_moe.execution_plan,
-            fused_moe_ar=False,
-            lane_latent_norm_ar=False,
-        )
+        # model's usage; the draft takes the plain reduce path.
+        #
+        # NOTE: these two writes have no effect. Both flags moved onto
+        # ``execution_plan``, and nothing reads the underscored attributes, so
+        # the draft has in fact been taking the fused lane. Making the intent
+        # effective again changes which tail tier the draft selects, which
+        # wants a speculative-decode run to validate -- see the tail tier
+        # selector in ``kimi_k3.py``.
+        self.block_sparse_moe._fused_moe_ar = False
+        self.block_sparse_moe._lane_latent_norm_ar = False
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
