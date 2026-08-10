@@ -118,6 +118,18 @@ def marlin_permute_scales(
     return s.reshape((-1, size_n)).contiguous()
 
 
+def marlin_permute_bias(b: torch.Tensor) -> torch.Tensor:
+    """Permute a per-expert bias row ``[size_n]`` into Marlin write-out order.
+
+    The kernel adds bias in the same fragment layout it reads per-channel
+    scales from, so bias uses the single (per-channel) scale permutation.
+    """
+    _, scale_perm_single = _get_scale_perms()
+    origin_shape = b.shape
+    b = b.reshape((-1, len(scale_perm_single)))[:, scale_perm_single]
+    return b.reshape(origin_shape).contiguous()
+
+
 def mxfp4_marlin_process_scales(marlin_scales: torch.Tensor) -> torch.Tensor:
     """Reorder + retype permuted MXFP4 scales for the bf16 Marlin path.
 
@@ -194,6 +206,7 @@ def moe_wna16_marlin_gemm(
     size_n: int,
     size_k: int,
     use_fp32_reduce: bool = True,
+    b_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run one grouped Marlin W4A16 GEMM over routed expert tokens.
 
@@ -220,6 +233,11 @@ def moe_wna16_marlin_gemm(
         is_ep: Expert-parallel mode; out-of-range expert ids are skipped.
         size_m/size_n/size_k: GEMM problem shape.
         use_fp32_reduce: Reduce partial tiles in fp32 scratch (recommended).
+        b_bias: Optional per-expert output bias ``[E, size_n]`` in the dtype
+            of ``a``, pre-permuted with :func:`marlin_permute_bias`. Added at
+            write-out before any route-weight scaling, so with
+            ``mul_topk_weights`` each route contributes
+            ``topk_weight * (x @ W + bias)``.
 
     Returns:
         ``c`` with dtype of ``a``.
@@ -250,17 +268,21 @@ def moe_wna16_marlin_gemm(
     empty_a = _empty(device, a.dtype)
     empty_i32 = _empty(device, torch.int32)
 
+    # One export per (ep, bias) specialization; shape/layout checks live in
+    # the kernel's RuntimeChecks, not here.
+    has_bias = b_bias is not None
     module = _load_marlin_moe_module()
-    fn = (
-        module.moe_wna16_marlin_gemm_bf16_ep
-        if is_ep
-        else module.moe_wna16_marlin_gemm_bf16
+    fn = getattr(
+        module,
+        "moe_wna16_marlin_gemm_bf16"
+        + ("_ep" if is_ep else "")
+        + ("_bias" if has_bias else ""),
     )
     fn(
         a,
         c,
         b_q_weight,
-        empty_a,  # b_bias
+        b_bias if has_bias else empty_a,
         b_scales,
         empty_a,  # global_scale
         empty_a,  # b_zeros
@@ -282,7 +304,7 @@ def moe_wna16_marlin_gemm(
         size_n,
         size_k,
         False,  # has_act_order
-        False,  # has_bias
+        has_bias,
         True,  # is_k_full
         False,  # has_zp
         num_groups,

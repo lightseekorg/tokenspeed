@@ -22,10 +22,11 @@
 
 Weight-only 4-bit experts: MXFP4 (E2M1 packed, E8M0 group-32 scales) weights
 are dequantized inside the Marlin grouped GEMM; activations stay bf16, so no
-FP4 tensor cores are required. This is the Hopper path for Kimi-K3, whose
-routed experts use the SiTU gated activation (applied as a fused Triton
-epilogue between the two GEMMs). Routing is precomputed upstream (the K3 gate
-the fused kernels cannot reproduce).
+FP4 tensor cores are required. This is the Hopper path for Kimi-K3 (SiTU
+gated activation, no bias) and gpt-oss (clamped SwiGLU, per-expert bias on
+both projections); the activation runs as a fused Triton epilogue between
+the two GEMMs, and bias is added by the GEMM write-out itself. Routing is
+precomputed upstream.
 
 The kernel and its weight repack use the vendored Marlin MoE; the grouped GEMM
 lives in ``thirdparty/cuda/csrc/marlin_moe`` and is pre-compiled.
@@ -41,6 +42,7 @@ from tokenspeed_kernel.signature import format_signatures
 from tokenspeed_kernel.thirdparty.cuda.marlin import gptq_marlin_repack
 from tokenspeed_kernel.thirdparty.cuda.marlin_moe import (
     marlin_make_workspace,
+    marlin_permute_bias,
     marlin_permute_scales,
     moe_align_block_size,
     moe_wna16_marlin_gemm,
@@ -135,6 +137,17 @@ def marlin_mxfp4_moe_weights(plan: dict, w: torch.nn.Module) -> None:
     w.w2_weight = torch.nn.Parameter(w2_marlin, requires_grad=False)
     w.w13_weight_scale = torch.nn.Parameter(w13_scale_marlin, requires_grad=False)
     w.w2_weight_scale = torch.nn.Parameter(w2_scale_marlin, requires_grad=False)
+
+    # Per-expert output biases (gpt-oss): the kernel adds them at write-out in
+    # the same fragment layout as per-channel scales, in activation dtype.
+    for name in ("w13_weight_bias", "w2_weight_bias"):
+        bias = getattr(w, name, None)
+        if bias is None:
+            continue
+        permuted = torch.stack(
+            [marlin_permute_bias(b) for b in bias.data.to(torch.bfloat16)]
+        )
+        setattr(w, name, torch.nn.Parameter(permuted, requires_grad=False))
     w._marlin_hidden_size = hidden
     w._marlin_ispp = ispp
     w._marlin_repacked = True
@@ -160,7 +173,7 @@ def marlin_mxfp4_moe_weights(plan: dict, w: torch.nn.Module) -> None:
         "supports_all_to_all_ep": frozenset({False}),
         "ispp_alignment": frozenset({MXFP4_BLOCK}),
         "internal_activation_dtype": frozenset({"input"}),
-        "supports_bias": frozenset({False}),
+        "supports_bias": frozenset({False, True}),
     },
     priority=Priority.PORTABLE,
 )
@@ -258,15 +271,24 @@ def marlin_mxfp4_precomputed_moe_apply(
         size_m=num_tokens,
         size_n=gemm1_n,
         size_k=hidden,
+        b_bias=getattr(w, "w13_weight_bias", None),
     ).view(-1, gemm1_n)
 
     beta = float(getattr(w, "activation_situ_beta", 1.0))
     linear_beta = getattr(w, "activation_situ_linear_beta", None)
+    swiglu_arg = getattr(w, "swiglu_arg", None)
     if activation == "situ":
         intermediate2 = situ_and_mul(
             intermediate1,
             beta=beta,
             linear_beta=None if linear_beta is None else float(linear_beta),
+        )
+    elif swiglu_arg is not None:
+        # gpt-oss clamped SwiGLU: gate·sigmoid(alpha·gate)·(up + 1).
+        from tokenspeed_kernel.ops.activation.triton import swiglu_oai
+
+        intermediate2 = swiglu_oai(
+            intermediate1, alpha=swiglu_arg.alpha, limit=swiglu_arg.limit
         )
     else:
         from tokenspeed_kernel.ops.activation.triton import silu_and_mul
@@ -274,7 +296,9 @@ def marlin_mxfp4_precomputed_moe_apply(
         intermediate2 = silu_and_mul(intermediate1)
 
     # GEMM2: fold the route weights in (mul_topk_weights) so finalize is a
-    # plain sum over top_k. EP-masked routes wrote nothing, so zero-init c.
+    # plain sum over top_k. Bias is added before that scaling, so each route
+    # contributes topk_weight * (x @ W2 + b2) and normalized route weights sum
+    # the bias in exactly once. EP-masked routes wrote nothing, so zero-init c.
     intermediate3 = moe_wna16_marlin_gemm(
         intermediate2,
         torch.zeros(num_tokens * top_k, hidden, dtype=x.dtype, device=x.device),
@@ -292,6 +316,7 @@ def marlin_mxfp4_precomputed_moe_apply(
         size_m=num_tokens * top_k,
         size_n=hidden,
         size_k=ispp,
+        b_bias=getattr(w, "w2_weight_bias", None),
     ).view(num_tokens, top_k, hidden)
 
     return intermediate3.sum(dim=1)

@@ -19,7 +19,8 @@
 // SOFTWARE.
 
 // Marlin WNA16 MoE GEMM (vendored), pre-compiled with the specializations
-// tokenspeed needs: bf16 activations, no expert bias.
+// tokenspeed needs: bf16 activations, with and without per-expert bias
+// (gpt-oss carries bias on both expert projections; Kimi-K3 carries none).
 // MXFP4 (E8M0 group-32 scales) is only numerically valid on the bf16
 // activation path, so no fp16 instantiation is exported.
 
@@ -35,6 +36,14 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(
     moe_wna16_marlin_gemm_bf16_ep,
     (moe_wna16_marlin_gemm<bf16_t, true, false>));
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(
+    moe_wna16_marlin_gemm_bf16_bias,
+    (moe_wna16_marlin_gemm<bf16_t, false, true>));
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(
+    moe_wna16_marlin_gemm_bf16_ep_bias,
+    (moe_wna16_marlin_gemm<bf16_t, true, true>));
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(
     moe_align_block_size,
