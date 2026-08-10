@@ -60,5 +60,8 @@ eval:
     --generation-config '{"do_sample":true,"temperature":1.0,"max_tokens":32768,"extra_body":{"reasoning_effort":"high"}}'
 report:
   github_step_summary: true
-# Measured 0.933 (28/30) on 8x MI350X with high reasoning effort.
-score_threshold: 0.90
+# Require at least 25/30 after MI350X scores of 29, 29, 26, and 28.
+# At the provisional 28/30 baseline, the old 27/30 gate has a 13.6%
+# false-failure rate; two consecutive failures at this gate are about
+# 0.02%, so investigate them instead of retrying.
+score_threshold: 0.83
