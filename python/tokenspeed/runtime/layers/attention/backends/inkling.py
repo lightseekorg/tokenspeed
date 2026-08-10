@@ -178,12 +178,19 @@ class InklingAttnBackend(AttentionBackend):
         inner: AttentionBackend,
         conv_pool: InklingConvStatePool,
         *,
+        conv_columns: dict,
         spec_num_tokens: int = 1,
         is_draft: bool = False,
     ):
         # Deliberately skip AttentionBackend.__init__: the wrapper mirrors inner via __getattr__.
         self.inner = inner
         self.conv_pool = conv_pool
+        # Paged conv geometry (see _inkling_conv_columns). Mandatory: the
+        # sconv state always has its paged bridges; there is no rolling mode.
+        self.conv_columns = conv_columns
+        # The conv groups are wrapper-owned: the inner mixin must skip their
+        # write-loc math and capture buffers (see cache_groups.py).
+        inner.engine_owned_group_ids = frozenset(conv_columns["group_block_tokens"])
         self.conv_metadata: InklingConvMetadata | None = None
         # Spec decoding: >1 means decode rounds carry this many tokens/request (verify / catch-up).
         self.conv_spec_num_tokens = max(1, int(spec_num_tokens))
@@ -385,9 +392,7 @@ class InklingAttnBackend(AttentionBackend):
         query_start_loc: torch.Tensor,
         extend_prefix_lens: torch.Tensor | None,
     ) -> ShortConvCheckpointMetadata | None:
-        geometry = getattr(self, "conv_columns", None)
-        if geometry is None or col_page_table is None:
-            return None
+        geometry = self.conv_columns
         groups = tuple(geometry["group_block_tokens"])
         if forward_mode.is_extend_or_mixed():
             if extend_prefix_lens is None:
@@ -493,7 +498,6 @@ class InklingAttnBackend(AttentionBackend):
     ):
         # Paged sconv: conv groups ride block_tables, which the inner backend sheds — grab here.
         group_tables = kwargs.get("block_tables") or {}
-        col_page_table = None
         extend_total = (
             int(sum(extend_seq_lens_cpu[:bs]))
             if forward_mode.is_extend_or_mixed() and extend_seq_lens_cpu is not None
@@ -508,27 +512,20 @@ class InklingAttnBackend(AttentionBackend):
             and bs <= self._pfg_max_bs
         ):
             pfg_total = extend_total
-        if getattr(self, "conv_columns", None) is not None:
-            groups = set(self.conv_columns["group_block_tokens"])
-            found = {g: group_tables.get(g) for g in groups}
-            missing = sorted(g for g, t in found.items() if t is None)
-            if pfg_total >= 0:
-                if missing:
-                    raise RuntimeError(
-                        f"paged sconv: prefill-graph statics are armed but "
-                        f"block_tables is missing conv groups {missing}"
-                    )
-                # The stream-ordered copy into the statics doubles as the plain path's clone() snapshot.
-                col_page_table = self._pfg_refresh_col_tables(found, bs)
-            elif not missing:
-                # clone(): the scheduler can recycle these live tables while extend kernels are in flight.
-                col_page_table = {g: t.clone() for g, t in found.items()}
-            elif len(missing) < len(found):
-                raise RuntimeError(
-                    f"paged sconv: block_tables delivered only part of "
-                    f"the conv groups (missing {missing}); refusing to mix "
-                    "paged and rolling conv state in one step"
-                )
+        groups = set(self.conv_columns["group_block_tokens"])
+        found = {g: group_tables.get(g) for g in groups}
+        missing = sorted(g for g, t in found.items() if t is None)
+        if missing:
+            raise RuntimeError(
+                f"paged sconv: block_tables is missing conv groups {missing}; "
+                "the paged conv bridges are mandatory (no rolling fallback)"
+            )
+        if pfg_total >= 0:
+            # The stream-ordered copy into the statics doubles as the plain path's clone() snapshot.
+            col_page_table = self._pfg_refresh_col_tables(found, bs)
+        else:
+            # clone(): the scheduler can recycle these live tables while extend kernels are in flight.
+            col_page_table = {g: t.clone() for g, t in found.items()}
         self.inner.init_forward_metadata(
             bs,
             num_extends,
@@ -560,7 +557,7 @@ class InklingAttnBackend(AttentionBackend):
             is_decode = False
             if extend_total is not None:
                 seq_idx = seq_idx_from_cu_seqlens(query_start_loc, extend_total)
-            if pfg_total >= 0 and col_page_table is not None:
+            if pfg_total >= 0:
                 # PFG statics: tail qsl closes the PAD request's empty chunk; tail seq_idx marks pads PAD.
                 self._pfg_qsl[: bs + 1].copy_(query_start_loc)
                 self._pfg_qsl[bs + 1 :].fill_(pfg_total)
@@ -598,11 +595,7 @@ class InklingAttnBackend(AttentionBackend):
                 bs, dtype=torch.bool, device=req_pool_indices.device
             )
             is_decode = True
-        if (
-            pfg_total >= 0
-            and self._pfg_checkpoints is not None
-            and col_page_table is not None
-        ):
+        if pfg_total >= 0 and self._pfg_checkpoints is not None:
             self._fill_checkpoint_metadata(
                 self._pfg_checkpoints,
                 before=self._pfg_prefix_lens,
@@ -622,11 +615,7 @@ class InklingAttnBackend(AttentionBackend):
                 extend_prefix_lens=extend_prefix_lens,
             )
         needs_restore = False
-        if (
-            checkpoints is not None
-            and forward_mode.is_extend_or_mixed()
-            and extend_prefix_lens_cpu is not None
-        ):
+        if forward_mode.is_extend_or_mixed() and extend_prefix_lens_cpu is not None:
             # Host mirror of _checkpoint_pages_at_boundaries' aligned-boundary
             # condition: restore only ever has a source page on such prefixes.
             page_size = int(self.conv_columns["block_tokens"])
@@ -639,9 +628,7 @@ class InklingAttnBackend(AttentionBackend):
             is_decode=is_decode,
             seq_idx=seq_idx,
             seq_lens=(
-                self._pfg_seq_lens
-                if pfg_total >= 0 and col_page_table is not None
-                else seq_lens[:bs].to(torch.int32)
+                self._pfg_seq_lens if pfg_total >= 0 else seq_lens[:bs].to(torch.int32)
             ),
             col_page_table=col_page_table,
             checkpoints=checkpoints,
@@ -661,7 +648,6 @@ class InklingAttnBackend(AttentionBackend):
         """Multi-token decode conv metadata over the persistent CUDA-graph
         buffers (target verify / draft catch-up)."""
         k = self.conv_spec_num_tokens
-        paged = getattr(self, "conv_columns", None) is not None
         return InklingConvMetadata(
             query_start_loc=self._graph_spec_qsl[: bs + 1],
             cache_indices=self._graph_cache_indices[:bs],
@@ -669,18 +655,15 @@ class InklingAttnBackend(AttentionBackend):
             is_decode=False,
             seq_idx=self._graph_spec_seq_idx[: bs * k],
             seq_lens=self._graph_seq_lens[:bs],
-            col_page_table=(
-                {g: table[:bs] for g, table in self._graph_col_tables.items()}
-                if paged
-                else None
-            ),
+            col_page_table={
+                g: table[:bs] for g, table in self._graph_col_tables.items()
+            },
             checkpoints=self._refresh_graph_checkpoints(bs),
         )
 
     def _graph_decode_conv_metadata(self, bs: int) -> InklingConvMetadata:
         """Single-token decode conv metadata over the persistent CUDA-graph
         buffers (shared by graph capture and replay)."""
-        paged = getattr(self, "conv_columns", None) is not None
         return InklingConvMetadata(
             query_start_loc=self._decode_qsl[: bs + 1],
             cache_indices=self._graph_cache_indices[:bs],
@@ -688,11 +671,7 @@ class InklingAttnBackend(AttentionBackend):
             is_decode=True,
             seq_idx=self._decode_qsl[:bs],
             seq_lens=self._graph_seq_lens[:bs],
-            col_page_table=(
-                {g: t[:bs] for g, t in self._graph_col_tables.items()}
-                if paged
-                else None
-            ),
+            col_page_table={g: t[:bs] for g, t in self._graph_col_tables.items()},
             checkpoints=self._refresh_graph_checkpoints(bs),
         )
 
@@ -701,12 +680,12 @@ class InklingAttnBackend(AttentionBackend):
 
         Lookback rows are ring reads ``lookback`` positions behind the
         committed frontier, so arming only widens the catch-up chunk; no
-        extra state is allocated. Returns True when armed; False when this
-        backend cannot support it (target wrapper, or paged draft conv).
+        extra state is allocated. Paged conv columns coexist with it: the
+        ring stays the working store, the columns are only the
+        publish/restore bridge. Returns True when armed; False when this
+        backend cannot support it (target wrapper).
         """
         if not self.conv_is_draft or lookback <= 0:
-            return False
-        if getattr(self, "conv_columns", None) is not None:
             return False
         self._draft_lookback = int(lookback)
         # Arm the inner backend's grouped lookback-location stack (sized at graph
@@ -721,13 +700,7 @@ class InklingAttnBackend(AttentionBackend):
         round's ``init_forward_metadata`` restores the plain shape."""
         lookback = self._draft_lookback
         md = self.conv_metadata
-        if (
-            lookback <= 0
-            or md is None
-            or md.is_decode
-            or not self.conv_is_draft
-            or md.col_page_table is not None
-        ):
+        if lookback <= 0 or md is None or md.is_decode or not self.conv_is_draft:
             return False
         # Cache write locations must widen to the lookback rows too; refusal falls
         # back to the plain window pass before any metadata is mutated.
@@ -748,6 +721,11 @@ class InklingAttnBackend(AttentionBackend):
             # Same through-chunk lengths: the wider chunk keeps its end, the
             # lookback rows extend it backwards.
             seq_lens=md.seq_lens[:bs] if md.seq_lens is not None else None,
+            # Paged draft conv rides through: the in-kernel publish resolves
+            # pages from the table by position, so a boundary rewritten by
+            # the lookback rows is re-published with committed content.
+            col_page_table=md.col_page_table,
+            checkpoints=md.checkpoints,
         )
         return True
 
@@ -764,10 +742,7 @@ class InklingAttnBackend(AttentionBackend):
         land at their positions' ring rows (``(boundary - W + 1 + j) % R``),
         with the boundary derived per request as ``seq_lens - chunk_len``.
         """
-        checkpoints = metadata.checkpoints
-        if checkpoints is None:
-            return
-        pages = checkpoints.restore_pages[group_id]
+        pages = metadata.checkpoints.restore_pages[group_id]
         n = pages.shape[0]
         slots = metadata.cache_indices[:n].to(torch.int64)
         valid = (pages > 0) & (slots >= 0)
@@ -843,6 +818,10 @@ class InklingAttnBackend(AttentionBackend):
             seq_lens=(
                 seq_lens[:bs].to(torch.int32) if seq_lens is not None else md.seq_lens
             ),
+            # Paged conv rides through every per-step rebuild: dropping the
+            # table silently disables the T=1 landing publish for the step.
+            col_page_table=md.col_page_table,
+            checkpoints=md.checkpoints,
         )
 
     # ------------------------------------------------------------------
@@ -1087,17 +1066,7 @@ class InklingAttnBackend(AttentionBackend):
                 caller treats this as capture failure and (world-agreed)
                 degrades to eager prefill.
         """
-        geo = getattr(self, "conv_columns", None)
-        if geo is None:
-            raise RuntimeError(
-                "Inkling prefill graph needs fully-paged sconv; rolling conv "
-                "state is per-batch-shaped and cannot be graphed by token bucket"
-            )
-        if geo.get("hidden_group_of_layer") is None:
-            raise RuntimeError(
-                "Inkling prefill graph needs paged hidden conv; the ATTN/MLP "
-                "sconv sites still run the rolling-state path"
-            )
+        geo = self.conv_columns
         device = self.conv_pool.conv_state.device
         self._pfg_max_bs = min(max_bs, self.conv_pool.num_slots - 2)
         self._pfg_seq_idx = torch.full(
@@ -1167,29 +1136,28 @@ class InklingAttnBackend(AttentionBackend):
         # seq_lens_buf; replay copies the live lengths in, so graph state does
         # not depend on the controller mutating a shared tensor in place.
         self._graph_seq_lens = torch.zeros(max_bs, dtype=torch.int32, device=device)
-        if getattr(self, "conv_columns", None) is not None:
-            # Adopted stacked views are filled by the mixin's packed unpack; pad rows hit dummy slot 0.
-            inner_tabs = getattr(self.inner, "cuda_graph_page_tables", {})
-            groups = self.conv_columns["group_block_tokens"]
-            self._graph_col_tables_adopted = all(g in inner_tabs for g in groups)
-            if self._graph_col_tables_adopted:
-                self._graph_col_tables = {g: inner_tabs[g] for g in groups}
-            else:
-                self._graph_col_tables = {
-                    g: torch.full(
-                        (max_bs, -(-self.inner.max_context_len // bt)),
-                        1,
-                        dtype=torch.int32,
-                        device=device,
-                    )
-                    for g, bt in groups.items()
-                }
-            self._graph_checkpoints = self._new_checkpoint_metadata(
-                size=max_bs,
-                groups=tuple(groups),
-                device=device,
-                include_prefill_rows=False,
-            )
+        # Adopted stacked views are filled by the mixin's packed unpack; pad rows hit dummy slot 0.
+        inner_tabs = getattr(self.inner, "cuda_graph_page_tables", {})
+        groups = self.conv_columns["group_block_tokens"]
+        self._graph_col_tables_adopted = all(g in inner_tabs for g in groups)
+        if self._graph_col_tables_adopted:
+            self._graph_col_tables = {g: inner_tabs[g] for g in groups}
+        else:
+            self._graph_col_tables = {
+                g: torch.full(
+                    (max_bs, -(-self.inner.max_context_len // bt)),
+                    1,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                for g, bt in groups.items()
+            }
+        self._graph_checkpoints = self._new_checkpoint_metadata(
+            size=max_bs,
+            groups=tuple(groups),
+            device=device,
+            include_prefill_rows=False,
+        )
         self._graph_cache_indices = torch.full(
             (max_bs,), PAD_SLOT_ID, dtype=torch.int32, device=device
         )
@@ -1251,29 +1219,28 @@ class InklingAttnBackend(AttentionBackend):
         if actual_bs is not None and actual_bs < bs:
             # Pad rows may carry stale indices aliasing LIVE slots; PAD_SLOT_ID keeps writes off them.
             self._graph_cache_indices[actual_bs:bs].fill_(PAD_SLOT_ID)
-        if getattr(self, "conv_columns", None) is not None:
-            group_tables = kwargs.get("block_tables") or {}
-            adopted_filled = getattr(
-                self, "_graph_col_tables_adopted", False
-            ) and getattr(self.inner, "_packed_group_unpack_ran", False)
-            for g, buf in self._graph_col_tables.items():
-                src = group_tables.get(g)
-                if src is None:
-                    raise RuntimeError(
-                        f"paged sconv replay: no {g!r} table in " "block_tables"
-                    )
-                if adopted_filled:
-                    # The inner mixin's packed unpack already filled the shared stack rows this step.
-                    continue
-                cols = min(src.shape[1], buf.shape[1])
-                rows = min(src.shape[0], bs)
-                buf[:rows, :cols].copy_(src[:rows, :cols])
-                if cols < buf.shape[1]:
-                    buf[:rows, cols:].fill_(-1)
-                if rows < bs:
-                    buf[rows:bs].fill_(-1)
-                if actual_bs is not None and actual_bs < min(bs, rows):
-                    buf[actual_bs:bs].fill_(-1)
+        group_tables = kwargs.get("block_tables") or {}
+        adopted_filled = getattr(self, "_graph_col_tables_adopted", False) and getattr(
+            self.inner, "_packed_group_unpack_ran", False
+        )
+        for g, buf in self._graph_col_tables.items():
+            src = group_tables.get(g)
+            if src is None:
+                raise RuntimeError(
+                    f"paged sconv replay: no {g!r} table in " "block_tables"
+                )
+            if adopted_filled:
+                # The inner mixin's packed unpack already filled the shared stack rows this step.
+                continue
+            cols = min(src.shape[1], buf.shape[1])
+            rows = min(src.shape[0], bs)
+            buf[:rows, :cols].copy_(src[:rows, :cols])
+            if cols < buf.shape[1]:
+                buf[:rows, cols:].fill_(-1)
+            if rows < bs:
+                buf[rows:bs].fill_(-1)
+            if actual_bs is not None and actual_bs < min(bs, rows):
+                buf[actual_bs:bs].fill_(-1)
         if self.conv_spec_num_tokens > 1:
             # Rebuild so the eager post-verify hook (outside the graph) sees this round's bs and mode.
             self.conv_metadata = self._spec_conv_metadata(bs)

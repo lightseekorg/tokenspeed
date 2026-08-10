@@ -603,64 +603,6 @@ class TestCheckpointMetadata(unittest.TestCase):
     W = 4
     DIM = 8
 
-    def test_checkpoint_metadata_keeps_only_chunk_endpoint(self):
-        from types import SimpleNamespace
-
-        from tokenspeed.runtime.layers.attention.backends.inkling import (
-            InklingAttnBackend,
-        )
-
-        backend = InklingAttnBackend.__new__(InklingAttnBackend)
-        backend.conv_pool = SimpleNamespace(kernel_size=self.W)
-        backend.conv_columns = {
-            "block_tokens": 4,
-            "group_block_tokens": {"state": 4},
-        }
-        metadata = backend._new_checkpoint_metadata(
-            size=2,
-            groups=("state",),
-            device=torch.device("cuda"),
-            include_prefill_rows=True,
-        )
-        pointers = tuple(
-            tensor.data_ptr()
-            for tensor in (
-                metadata.restore_pages["state"],
-                metadata.write_pages["state"],
-                metadata.packed_rows,
-            )
-        )
-        table = torch.tensor([[11, 12, 13], [21, 22, 23]], device="cuda")
-        backend._fill_checkpoint_metadata(
-            metadata,
-            before=torch.tensor([0, 7], device="cuda"),
-            after=torch.tensor([8, 8], device="cuda"),
-            query_start_loc=torch.tensor([0, 8, 9], device="cuda"),
-            col_page_table={"state": table},
-            write_endpoint=True,
-        )
-
-        self.assertEqual(metadata.restore_pages["state"].tolist(), [0, 0])
-        # Request 0 crosses two boundaries, but only its published endpoint is
-        # materialized. Request 1 borrows two rows from its prior window.
-        self.assertEqual(metadata.write_pages["state"].tolist(), [12, 22])
-        self.assertEqual(
-            metadata.packed_row_mask.tolist(), [[True] * 3, [False, False, True]]
-        )
-        self.assertEqual(metadata.packed_rows.tolist(), [[5, 6, 7], [6, 7, 8]])
-        self.assertEqual(metadata.prior_state_rows.tolist(), [[2, 2, 2], [1, 2, 2]])
-        self.assertEqual(
-            pointers,
-            tuple(
-                tensor.data_ptr()
-                for tensor in (
-                    metadata.restore_pages["state"],
-                    metadata.write_pages["state"],
-                    metadata.packed_rows,
-                )
-            ),
-        )
-
     def test_fill_restore_false_leaves_restore_pages_untouched(self):
         from types import SimpleNamespace
 
@@ -705,6 +647,100 @@ class TestCheckpointMetadata(unittest.TestCase):
             write_endpoint=True,
         )
         self.assertEqual(metadata.restore_pages["state"].tolist(), [11, 22])
+
+    def test_draft_lookback_window_keeps_paged_checkpoints(self):
+        """enter_draft_lookback_window must carry the paged bridges into the
+        widened metadata: the in-kernel publish resolves pages from
+        col_page_table by position, so dropping it (the old refusal path)
+        would silently disable draft publication on every decode round."""
+        from types import SimpleNamespace
+
+        from tokenspeed.runtime.layers.attention.backends.inkling import (
+            InklingAttnBackend,
+            InklingConvMetadata,
+        )
+
+        k, lookback, bs = 4, 2, 1
+        backend = InklingAttnBackend.__new__(InklingAttnBackend)
+        backend.conv_pool = SimpleNamespace(kernel_size=self.W)
+        backend.conv_columns = {
+            "block_tokens": 128,
+            "group_block_tokens": {"state": 128},
+        }
+        backend.conv_is_draft = True
+        backend.conv_spec_num_tokens = k
+        backend._draft_lookback = lookback
+        backend.inner = SimpleNamespace()
+        table = torch.tensor([[11, 12, 13]], dtype=torch.int32, device="cuda")
+        checkpoints = backend._new_checkpoint_metadata(
+            size=bs,
+            groups=("state",),
+            device=torch.device("cuda"),
+            include_prefill_rows=False,
+        )
+        seq_lens = torch.tensor([132], dtype=torch.int32, device="cuda")
+        qsl = torch.arange(0, bs * k + 1, k, dtype=torch.int32, device="cuda")
+        backend.conv_metadata = InklingConvMetadata(
+            query_start_loc=qsl,
+            cache_indices=torch.tensor([2], dtype=torch.int32, device="cuda"),
+            has_initial_state=torch.ones(bs, dtype=torch.bool, device="cuda"),
+            is_decode=False,
+            seq_idx=torch.zeros(bs * k, dtype=torch.int32, device="cuda"),
+            seq_lens=seq_lens,
+            col_page_table={"state": table[:bs]},
+            checkpoints=checkpoints,
+        )
+
+        self.assertTrue(backend.enter_draft_lookback_window(bs))
+
+        md = backend.conv_metadata
+        self.assertEqual(
+            md.query_start_loc.tolist(), [0, k + lookback], "widened chunk"
+        )
+        self.assertIsNotNone(md.col_page_table)
+        self.assertTrue(torch.equal(md.col_page_table["state"], table[:bs]))
+        self.assertIs(md.checkpoints, checkpoints)
+        # Same through-chunk end: the boundary the accept landed on (128)
+        # is inside the widened chunk (132 - 6, 132], so the kernel's
+        # positional publish re-covers it with committed rows.
+        self.assertEqual(md.seq_lens.tolist(), [132])
+
+    def test_advance_draft_metadata_keeps_paged_checkpoints(self):
+        """The classic per-step rebuild (catch-up -> T=1 decode metadata)
+        must also carry the paged bridges, or single-token draft steps
+        landing on a boundary silently skip their publish."""
+        from types import SimpleNamespace
+
+        from tokenspeed.runtime.layers.attention.backends.inkling import (
+            InklingAttnBackend,
+            InklingConvMetadata,
+        )
+
+        k, bs = 4, 2
+        backend = InklingAttnBackend.__new__(InklingAttnBackend)
+        backend.inner = SimpleNamespace()
+        backend._graph_has_initial_state = None
+        backend._decode_qsl = None
+        table = torch.tensor([[11, 12], [21, 22]], dtype=torch.int32, device="cuda")
+        checkpoints = object()
+        qsl = torch.arange(0, bs * k + 1, k, dtype=torch.int32, device="cuda")
+        backend.conv_metadata = InklingConvMetadata(
+            query_start_loc=qsl,
+            cache_indices=torch.tensor([2, 3], dtype=torch.int32, device="cuda"),
+            has_initial_state=torch.ones(bs, dtype=torch.bool, device="cuda"),
+            is_decode=False,
+            seq_idx=torch.zeros(bs * k, dtype=torch.int32, device="cuda"),
+            seq_lens=torch.tensor([200, 260], dtype=torch.int32, device="cuda"),
+            col_page_table={"state": table},
+            checkpoints=checkpoints,
+        )
+
+        backend.advance_draft_forward_metadata()
+
+        md = backend.conv_metadata
+        self.assertTrue(md.is_decode)
+        self.assertTrue(torch.equal(md.col_page_table["state"], table))
+        self.assertIs(md.checkpoints, checkpoints)
 
 
 if __name__ == "__main__":

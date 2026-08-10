@@ -4,7 +4,6 @@ import os
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
     build_hybrid_cache_setup,
-    draft_cache_fields,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
@@ -268,20 +267,11 @@ def prepare_inkling_cache(
             )
         draft_layer_types = tuple(draft_attn_config.layer_types)
         draft_group_ids = draft_layer_types
-        draft_layer_kv_head_counts = inkling_layer_kv_head_counts(draft_model_config)
-        per_rank_heads = tuple(
-            max(1, heads // draft_attn_config.attn_tp_size)
-            for heads in draft_layer_kv_head_counts
-        )
-        draft_fields = draft_cache_fields(
-            layer_group_ids=draft_group_ids,
-            enabled_layer_ids=range(draft_num_layers),
-            logical_block_tokens=logical_block_tokens,
-            layer_kv_heads=per_rank_heads,
-            head_dim=draft_attn_config.head_dim,
-            kv_element_size=draft_attn_config.kv_cache_dtype.itemsize,
-            kv_scale_block_size=32 if draft_attn_config.kv_cache_mxfp8 else 0,
-            kv_scale_element_size=1 if draft_attn_config.kv_cache_mxfp8 else 0,
+        # Same recipe as the target: the depth layers get kvconv/hiddenconv
+        # checkpoint fields as continuation tenants of the existing groups,
+        # so the draft conv ring gains the same publish/restore bridges.
+        draft_fields, draft_layer_kv_head_counts = _inkling_fields(
+            draft_attn_config, draft_model_config, logical_block_tokens
         )
         fixed_workspace_bytes += _workspace_bytes(
             text_config=draft_model_config.hf_config.get_text_config(),

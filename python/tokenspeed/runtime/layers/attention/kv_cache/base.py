@@ -521,5 +521,11 @@ class LayerMappedKVPool:
     def gather_index_k(self, layer_id: int, slots):
         return self.inner.gather_index_k(self._map(layer_id), slots)
 
+    def kvconv_checkpoint_buffers(self, layer_id: int):
+        return self.inner.kvconv_checkpoint_buffers(self._map(layer_id))
+
+    def hiddenconv_checkpoint_buffer(self, layer_id: int, component: str):
+        return self.inner.hiddenconv_checkpoint_buffer(self._map(layer_id), component)
+
     def __getattr__(self, name):
         return getattr(self.inner, name)
