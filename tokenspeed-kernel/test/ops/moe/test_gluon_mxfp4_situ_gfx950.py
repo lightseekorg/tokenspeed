@@ -532,7 +532,7 @@ def test_mxfp4_situ_virtual_ep_sum_matches_global_reference_gfx950(
     torch.testing.assert_close(actual, expected, atol=3e-4, rtol=3e-2)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8])
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 16])
 def test_mxfp4_situ_ep_paths_are_cuda_graph_capturable_gfx950(
     num_tokens: int,
 ) -> None:
@@ -571,9 +571,19 @@ def test_mxfp4_situ_ep_paths_are_cuda_graph_capturable_gfx950(
         solution="gluon",
     )
     tokenspeed_kernel.moe_process_weights(plan, module)
+    expected = tokenspeed_kernel.moe_apply(
+        plan,
+        hidden_states,
+        module,
+        router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    ).clone()
+    output = torch.empty_like(hidden_states)
+    module._situ_output_buffer = output
 
     def apply() -> torch.Tensor:
-        return tokenspeed_kernel.moe_apply(
+        result = tokenspeed_kernel.moe_apply(
             plan,
             hidden_states,
             module,
@@ -581,8 +591,11 @@ def test_mxfp4_situ_ep_paths_are_cuda_graph_capturable_gfx950(
             topk_weights=topk_weights,
             topk_ids=topk_ids,
         )
+        assert result.data_ptr() == output.data_ptr()
+        return result
 
     eager = apply().clone()
+    torch.testing.assert_close(eager, expected, atol=0.0, rtol=0.0)
     warmup_stream = torch.cuda.Stream()
     with torch.cuda.stream(warmup_stream):
         for _ in range(3):

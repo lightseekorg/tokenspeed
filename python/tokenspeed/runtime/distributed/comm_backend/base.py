@@ -21,10 +21,27 @@
 """Abstract base class for communication backends."""
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import overload
 
 import torch
 
 from tokenspeed.runtime.distributed.mapping import Group
+
+
+@dataclass(frozen=True)
+class AllReducePlan:
+    """Producer outputs paired with their selected reduction.
+
+    ``outputs`` must be fully written before calling :meth:`run`.
+    """
+
+    outputs: tuple[torch.Tensor, ...]
+    _run: Callable[[], tuple[torch.Tensor, ...]]
+
+    def run(self) -> tuple[torch.Tensor, ...]:
+        return self._run()
 
 
 class CommBackend(ABC):
@@ -36,38 +53,64 @@ class CommBackend(ABC):
 
     # ---- Collective ops ----
 
-    @abstractmethod
+    @overload
     def all_reduce(
         self, tensor: torch.Tensor, group: Group, op=None
     ) -> torch.Tensor: ...
 
-    def all_reduce_two(
+    @overload
+    def all_reduce(
+        self, tensor: tuple[torch.Tensor, ...], group: Group, op=None
+    ) -> tuple[torch.Tensor, ...]: ...
+
+    @abstractmethod
+    def all_reduce(
         self,
-        first: torch.Tensor,
-        second: torch.Tensor,
+        tensor: torch.Tensor | tuple[torch.Tensor, ...],
         group: Group,
         op=None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Reduce two tensors, falling back to two ordinary collectives."""
-        return (
-            self.all_reduce(first, group, op=op),
-            self.all_reduce(second, group, op=op),
-        )
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        """Reduce one tensor or a collection of independent tensors."""
+        if isinstance(tensor, torch.Tensor):
+            raise NotImplementedError
+        tensors = tensor
+        if len(tensors) == 0:
+            raise ValueError("all-reduce requires at least one tensor")
+        return tuple(self.all_reduce(value, group, op=op) for value in tensors)
 
     def prepare_all_reduce_lane(self, group: Group, hidden_dim: int) -> bool:
         """Prepare an implementation-specific one-shot lane when supported."""
 
         return False
 
-    def prepare_all_reduce_two(
+    def plan_all_reduce(
         self,
-        first_shape: tuple[int, ...],
-        second_shape: tuple[int, ...],
-        dtype: torch.dtype,
+        shapes: tuple[tuple[int, ...], ...],
+        like: torch.Tensor,
         group: Group,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """Return producer-direct collective buffers when supported."""
-        return None
+        op=None,
+    ) -> AllReducePlan:
+        """Allocate producer outputs and bind their reduction strategy.
+
+        Args:
+            shapes: Shapes of the outputs the producer will write.
+            like: Tensor providing dtype and device for ordinary allocations.
+            group: Global ranks participating in every reduction.
+            op: Reduction operation.
+
+        Returns:
+            A plan containing writable outputs and their reduction operation.
+        """
+        if not shapes:
+            raise ValueError("all-reduce plan requires at least one output")
+        outputs = tuple(like.new_empty(shape) for shape in shapes)
+
+        def run() -> tuple[torch.Tensor, ...]:
+            reduced = self.all_reduce(outputs, group, op=op)
+            assert isinstance(reduced, tuple)
+            return reduced
+
+        return AllReducePlan(outputs, run)
 
     def all_reduce_residual_attnres(
         self,

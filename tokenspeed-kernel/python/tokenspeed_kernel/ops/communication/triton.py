@@ -38,9 +38,8 @@ __all__ = [
     "all_gather_inner",
     "all_reduce_can_run",
     "all_reduce",
-    "all_reduce_two_can_run",
-    "all_reduce_two",
-    "all_reduce_two_staging",
+    "all_reduce_staging",
+    "all_reduce_symmetric",
     "all_reduce_residual_attnres_can_run",
     "all_reduce_residual_attnres",
     "allreduce_residual_rmsnorm",
@@ -1964,76 +1963,15 @@ def all_reduce(state: TritonCommState, tensor: torch.Tensor, op=None) -> torch.T
     raise AssertionError(f"Unsupported platform: {platform}")
 
 
-def all_reduce_two_can_run(
+def all_reduce_staging(
     state: TritonCommState,
-    first: torch.Tensor,
-    second: torch.Tensor,
-    op=None,
-) -> bool:
-    """Return whether one Iris launch can reduce both tensors."""
-    if op is None:
-        op = torch.distributed.ReduceOp.SUM
-    platform = current_platform()
-    return (
-        platform.is_amd
-        and op == torch.distributed.ReduceOp.SUM
-        and first.is_cuda
-        and second.is_cuda
-        and first.device == second.device == state.device
-        and first.is_contiguous()
-        and second.is_contiguous()
-        and first.dtype == second.dtype == torch.bfloat16
-        and first.numel() > 0
-        and second.numel() > 0
-        and first.numel() + second.numel() <= state.max_numel
-        and state.world_size > 1
-    )
-
-
-def all_reduce_two(
-    state: TritonCommState,
-    first: torch.Tensor,
-    second: torch.Tensor,
-    op=None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reduce two tensors with a single Iris launch on AMD."""
-    assert all_reduce_two_can_run(state, first, second, op=op)
-    platform = current_platform()
-    if platform.is_amd:
-        from . import iris as _iris_mod
-
-        key = (id(state.group), state.max_numel, first.dtype)
-        iris_state = _iris_mod.IRIS_AR_STATES.get(key)
-        if iris_state is None:
-            iris_state = _iris_mod.create_iris_state(
-                group=state.group,
-                rank_in_group=state.rank_in_group,
-                max_numel=state.max_numel,
-                dtype=first.dtype,
-                device=state.device,
-            )
-            _iris_mod.IRIS_AR_STATES[key] = iris_state
-        return _iris_mod.iris_all_reduce_two(
-            iris_state,
-            first,
-            second,
-            op=op,
-            safe=False,
-        )
-
-    raise AssertionError(f"Unsupported platform: {platform}")
-
-
-def all_reduce_two_staging(
-    state: TritonCommState,
-    first_shape: tuple[int, ...],
-    second_shape: tuple[int, ...],
+    shapes: tuple[tuple[int, ...], ...],
     dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Acquire Iris symmetric views for a producer-direct two-part reduction."""
+) -> tuple[torch.Tensor, ...]:
+    """Acquire consecutive Iris views for producer-direct reduction."""
     platform = current_platform()
     if not platform.is_amd or dtype != torch.bfloat16 or state.world_size != 8:
-        raise RuntimeError("symmetric two-part staging requires AMD TP8 BF16")
+        raise RuntimeError("symmetric staging requires AMD TP8 BF16")
     from . import iris as _iris_mod
 
     key = (id(state.group), state.max_numel, dtype)
@@ -2047,7 +1985,19 @@ def all_reduce_two_staging(
             device=state.device,
         )
         _iris_mod.IRIS_AR_STATES[key] = iris_state
-    return _iris_mod.iris_all_reduce_two_staging(iris_state, first_shape, second_shape)
+    return _iris_mod.iris_all_reduce_staging(iris_state, shapes)
+
+
+def all_reduce_symmetric(
+    state: TritonCommState,
+    tensors: tuple[torch.Tensor, ...],
+) -> tuple[torch.Tensor, ...]:
+    """Reduce consecutive Iris producer outputs in one launch."""
+    from . import iris as _iris_mod
+
+    key = (id(state.group), state.max_numel, tensors[0].dtype)
+    iris_state = _iris_mod.IRIS_AR_STATES[key]
+    return _iris_mod.iris_all_reduce_symmetric(iris_state, tensors)
 
 
 def all_reduce_residual_attnres_can_run(

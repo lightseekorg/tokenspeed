@@ -26,6 +26,7 @@ Groups are looked up from pg_manager internally via comm_backend.
 
 from dataclasses import dataclass
 from enum import IntEnum
+from typing import overload
 
 import torch
 import torch.distributed
@@ -46,6 +47,7 @@ from tokenspeed_kernel.ops.communication import (
 )
 
 from tokenspeed.runtime.distributed.comm_backend import (
+    AllReducePlan,
     CommBackend,
     Group,
     get_global_backend,
@@ -125,40 +127,34 @@ class FusionParams:
 # ---------------------------------------------------------------------------
 
 
+@overload
 def all_reduce(
     tensor: torch.Tensor,
     group: Group,
     backend: CommBackend | None = None,
     op: torch.distributed.ReduceOp = torch.distributed.ReduceOp.SUM,
-) -> torch.Tensor:
-    """All-reduce the tensor across the given communication group."""
-    if backend is None:
-        backend = get_global_backend()
-    return backend.all_reduce(tensor, group, op=op)
+) -> torch.Tensor: ...
 
 
-def all_reduce_two(
-    first: torch.Tensor,
-    second: torch.Tensor,
+@overload
+def all_reduce(
+    tensor: tuple[torch.Tensor, ...],
     group: Group,
     backend: CommBackend | None = None,
     op: torch.distributed.ReduceOp = torch.distributed.ReduceOp.SUM,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """All-reduce two tensors, using a fused backend primitive when available.
+) -> tuple[torch.Tensor, ...]: ...
 
-    Args:
-        first: First tensor to reduce.
-        second: Second tensor to reduce.
-        group: Global ranks participating in both reductions.
-        backend: Optional communication backend override.
-        op: Reduction operation.
 
-    Returns:
-        The two reduced tensors in input order.
-    """
+def all_reduce(
+    tensor: torch.Tensor | tuple[torch.Tensor, ...],
+    group: Group,
+    backend: CommBackend | None = None,
+    op: torch.distributed.ReduceOp = torch.distributed.ReduceOp.SUM,
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    """All-reduce one tensor or independent tensors across a group."""
     if backend is None:
         backend = get_global_backend()
-    return backend.all_reduce_two(first, second, group, op=op)
+    return backend.all_reduce(tensor, group, op=op)
 
 
 def prepare_all_reduce_lane(
@@ -221,17 +217,28 @@ def all_reduce_latent_norm(
     )
 
 
-def prepare_all_reduce_two(
-    first_shape: tuple[int, ...],
-    second_shape: tuple[int, ...],
-    dtype: torch.dtype,
+def plan_all_reduce(
+    shapes: tuple[tuple[int, ...], ...],
+    like: torch.Tensor,
     group: Group,
     backend: CommBackend | None = None,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Acquire producer-direct buffers for a fused two-part reduction."""
+    op: torch.distributed.ReduceOp = torch.distributed.ReduceOp.SUM,
+) -> AllReducePlan:
+    """Allocate producer outputs and bind the selected collective path.
+
+    Args:
+        shapes: Shapes of the outputs the producer will write.
+        like: Tensor providing dtype and device for ordinary allocations.
+        group: Global ranks participating in every reduction.
+        backend: Optional communication backend override.
+        op: Reduction operation.
+
+    Returns:
+        A plan containing writable outputs and their reduction operation.
+    """
     if backend is None:
         backend = get_global_backend()
-    return backend.prepare_all_reduce_two(first_shape, second_shape, dtype, group)
+    return backend.plan_all_reduce(shapes, like, group, op=op)
 
 
 def all_reduce_residual_attnres(

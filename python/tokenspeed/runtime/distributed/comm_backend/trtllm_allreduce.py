@@ -199,7 +199,14 @@ class TrtllmAllReduceBackend(CommBackend):
     # CommBackend interface
     # ------------------------------------------------------------------
 
-    def all_reduce(self, tensor: torch.Tensor, group: Group, op=None) -> torch.Tensor:
+    def all_reduce(
+        self,
+        tensor: torch.Tensor | tuple[torch.Tensor, ...],
+        group: Group,
+        op=None,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        if not isinstance(tensor, torch.Tensor):
+            return super().all_reduce(tensor, group, op=op)
 
         if op is None:
             op = torch.distributed.ReduceOp.SUM

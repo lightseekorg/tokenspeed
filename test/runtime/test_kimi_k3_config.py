@@ -411,9 +411,9 @@ class KimiK3RegistrationTests(unittest.TestCase):
 
         self.assertFalse(shared_calls[0]["reduce_results"])
         self.assertEqual(expert_calls[0]["internal_activation_dtype_override"], "input")
-        joint_reduce = layer.native_latent_moe.components["joint_reduce"]
-        self.assertIs(joint_reduce.func, kimi_k3.all_reduce_two)
-        self.assertEqual(joint_reduce.keywords, {"group": ep_group})
+        joint_plan = layer.native_latent_moe.components["joint_plan"]
+        self.assertIs(joint_plan.func, kimi_k3.plan_all_reduce)
+        self.assertEqual(joint_plan.keywords, {"group": ep_group})
 
     def test_mla_gate_projection_uses_api_selected_layout(self):
         from tokenspeed.runtime.models.kimi_k3 import KimiLinearMLAAttention

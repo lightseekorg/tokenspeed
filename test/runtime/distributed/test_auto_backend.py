@@ -1,9 +1,16 @@
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
 
+from tokenspeed.runtime.distributed.comm_backend import (
+    triton_allreduce as triton_module,
+)
 from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+from tokenspeed.runtime.distributed.comm_backend.triton_allreduce import (
+    TritonAllReduceBackend,
+)
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
@@ -64,41 +71,86 @@ def test_force_deterministic_rsag_routes_all_reduce_to_nccl(backend, monkeypatch
     backend._triton_ar.can_run.assert_not_called()
 
 
-def test_force_deterministic_rsag_routes_all_reduce_two_to_nccl(backend, monkeypatch):
+def test_force_deterministic_rsag_routes_all_reduce_collection_to_nccl(
+    backend, monkeypatch
+):
     monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", True)
     first = torch.empty(1, 4)
     second = torch.empty(1, 4)
+    third = torch.empty(1, 8)
     group = (0, 1)
 
-    backend.all_reduce_two(first, second, group)
+    tensors = (first, second, third)
+    backend._nccl.all_reduce.return_value = tensors
+    backend.all_reduce(tensors, group)
 
-    backend._nccl.all_reduce_two.assert_called_once_with(first, second, group, op=None)
+    backend._nccl.all_reduce.assert_called_once_with(tensors, group, op=None)
     backend._trtllm_ar.has_trtllm_ar.assert_not_called()
-    backend._triton_ar.can_run_two.assert_not_called()
+    backend._triton_ar.can_run.assert_not_called()
 
 
-def test_prepare_all_reduce_two_uses_triton(backend, monkeypatch):
+def test_all_reduce_rejects_empty_collection(backend):
+    with pytest.raises(ValueError, match="requires at least one tensor"):
+        backend.all_reduce((), (0, 1))
+
+
+def test_plan_all_reduce_uses_triton(backend, monkeypatch):
     monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", False)
     monkeypatch.setitem(global_server_args_dict, "mapping", None)
     backend._trtllm_ar.has_trtllm_ar.return_value = False
-    backend._triton_ar.prepare_all_reduce_two.return_value = "staging"
+    backend._triton_ar.plan_all_reduce.return_value = "plan"
+    like = torch.empty(1, 3584, dtype=torch.bfloat16)
+    shapes = ((1, 7168), (1, 3584))
 
-    result = backend.prepare_all_reduce_two(
-        (1, 7168), (1, 3584), torch.bfloat16, (0, 1)
+    result = backend.plan_all_reduce(shapes, like, (0, 1))
+
+    assert result == "plan"
+    backend._triton_ar.plan_all_reduce.assert_called_once_with(
+        shapes, like, (0, 1), op=None
     )
 
-    assert result == "staging"
-    backend._triton_ar.prepare_all_reduce_two.assert_called_once()
 
-
-def test_prepare_all_reduce_two_preserves_trtllm(backend, monkeypatch):
+def test_plan_all_reduce_preserves_trtllm(backend, monkeypatch):
     monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", False)
     monkeypatch.setitem(global_server_args_dict, "mapping", None)
     backend._trtllm_ar.has_trtllm_ar.return_value = True
+    like = torch.empty(1, 3584, dtype=torch.bfloat16)
+    shapes = ((1, 7168), (1, 3584))
 
-    result = backend.prepare_all_reduce_two(
-        (1, 7168), (1, 3584), torch.bfloat16, (0, 1)
+    result = backend.plan_all_reduce(shapes, like, (0, 1))
+
+    assert tuple(output.shape for output in result.outputs) == shapes
+    backend._triton_ar.plan_all_reduce.assert_not_called()
+
+
+def test_triton_plan_all_reduce_accepts_aligned_outputs(monkeypatch):
+    backend = TritonAllReduceBackend(fallback=Mock())
+    state = object()
+    shapes = ((3, 20), (2, 12), (4, 4))
+    outputs = tuple(torch.empty(shape, dtype=torch.bfloat16) for shape in shapes)
+    calls = []
+    like = SimpleNamespace(is_cuda=True, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(
+        triton_module,
+        "current_platform",
+        lambda: SimpleNamespace(is_cdna4=True),
+    )
+    monkeypatch.setattr(backend, "_get_or_create", lambda group: state)
+    monkeypatch.setattr(
+        triton_module,
+        "all_reduce_staging",
+        lambda actual_state, actual_shapes, dtype: outputs,
+    )
+    monkeypatch.setattr(
+        triton_module,
+        "all_reduce_symmetric",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or outputs,
     )
 
-    assert result is None
-    backend._triton_ar.prepare_all_reduce_two.assert_not_called()
+    plan = backend.plan_all_reduce(shapes, like, tuple(range(8)))
+
+    assert plan.outputs is outputs
+    assert plan.run() is outputs
+    assert calls[0][0] == (state, outputs)
+    assert calls[0][1] == {}

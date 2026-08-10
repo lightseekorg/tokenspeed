@@ -20,6 +20,8 @@
 
 """Triton all-reduce backend for latency-sensitive small AMD tensors."""
 
+import math
+
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.communication.triton import (
@@ -27,13 +29,17 @@ from tokenspeed_kernel.ops.communication.triton import (
     all_reduce_can_run,
     all_reduce_residual_attnres,
     all_reduce_residual_attnres_can_run,
-    all_reduce_two,
-    all_reduce_two_can_run,
-    all_reduce_two_staging,
+    all_reduce_staging,
+    all_reduce_symmetric,
     create_state,
 )
+from tokenspeed_kernel.platform import current_platform
 
-from tokenspeed.runtime.distributed.comm_backend.base import CommBackend, Group
+from tokenspeed.runtime.distributed.comm_backend.base import (
+    AllReducePlan,
+    CommBackend,
+    Group,
+)
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -79,55 +85,51 @@ class TritonAllReduceBackend(CommBackend):
         except Exception:
             return False
 
-    def all_reduce(self, tensor: torch.Tensor, group: Group, op=None) -> torch.Tensor:
+    def all_reduce(
+        self,
+        tensor: torch.Tensor | tuple[torch.Tensor, ...],
+        group: Group,
+        op=None,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        if not isinstance(tensor, torch.Tensor):
+            return self._fallback.all_reduce(tensor, group, op=op)
+
         state = self._get_or_create(group)
         if all_reduce_can_run(state, tensor, op=op):
             return all_reduce(state, tensor, op=op)
         return self._fallback.all_reduce(tensor, group, op=op)
 
-    def can_run_two(
+    def plan_all_reduce(
         self,
-        first: torch.Tensor,
-        second: torch.Tensor,
+        shapes: tuple[tuple[int, ...], ...],
+        like: torch.Tensor,
         group: Group,
         op=None,
-    ) -> bool:
-        if len(group) <= 1:
-            return False
-        try:
-            return all_reduce_two_can_run(
-                self._get_or_create(group),
-                first,
-                second,
-                op=op,
-            )
-        except Exception:
-            return False
+    ) -> AllReducePlan:
+        numels = tuple(math.prod(shape) for shape in shapes)
+        if not (
+            current_platform().is_cdna4
+            and like.is_cuda
+            and like.dtype == torch.bfloat16
+            and len(group) == 8
+            and numels
+            and all(numel > 0 and numel % 4 == 0 for numel in numels)
+            and sum(numels) <= self._max_numel
+            and (op is None or op == dist.ReduceOp.SUM)
+        ):
+            return super().plan_all_reduce(shapes, like, group, op=op)
 
-    def all_reduce_two(
-        self,
-        first: torch.Tensor,
-        second: torch.Tensor,
-        group: Group,
-        op=None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
         state = self._get_or_create(group)
-        if all_reduce_two_can_run(state, first, second, op=op):
-            return all_reduce_two(state, first, second, op=op)
-        return super().all_reduce_two(first, second, group, op=op)
-
-    def prepare_all_reduce_two(
-        self,
-        first_shape: tuple[int, ...],
-        second_shape: tuple[int, ...],
-        dtype: torch.dtype,
-        group: Group,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        if len(group) != 8 or dtype != torch.bfloat16:
-            return None
-        return all_reduce_two_staging(
-            self._get_or_create(group), first_shape, second_shape, dtype
+        outputs = all_reduce_staging(
+            state,
+            shapes,
+            like.dtype,
         )
+
+        def run() -> tuple[torch.Tensor, ...]:
+            return all_reduce_symmetric(state, outputs)
+
+        return AllReducePlan(outputs, run)
 
     def can_run_residual_attnres(
         self,

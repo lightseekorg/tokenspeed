@@ -80,9 +80,25 @@ def _ar_shape_cases() -> List[Tuple[int, ...]]:
     ]
 
 
-def _ar_two_shape_case() -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
-    """Production Kimi K3 shared-output and routed-latent decode widths."""
-    return (1, 7168), (1, 3584)
+def _ar_two_shape_cases() -> List[Tuple[Tuple[int, ...], Tuple[int, ...]]]:
+    """Aligned segment pairs, including K3 decode and larger token counts."""
+    return [
+        ((1, 7168), (1, 3584)),
+        ((2, 7168), (2, 3584)),
+        ((4, 7168), (4, 3584)),
+        ((8, 7168), (8, 3584)),
+        ((16, 7168), (16, 3584)),
+        ((3, 20), (2, 12)),
+    ]
+
+
+def _ar_output_shape_cases() -> List[Tuple[Tuple[int, ...], ...]]:
+    """Producer-direct collections spanning one, two, and three outputs."""
+    return [
+        *((first, second) for first, second in _ar_two_shape_cases()),
+        ((2, 16),),
+        ((3, 20), (2, 12), (4, 4)),
+    ]
 
 
 def _ar_worker_fn(rank, world_size, port, error_dict):
@@ -110,11 +126,13 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
         # process (which has no distributed context).
         from tokenspeed_kernel.ops.communication.iris import create_iris_state
 
-        first_shape, second_shape = _ar_two_shape_case()
+        output_shape_cases = _ar_output_shape_cases()
         max_numel = max(
             max(int(torch.tensor(s).prod()) for s in _ar_shape_cases()),
-            int(torch.tensor(first_shape).prod())
-            + int(torch.tensor(second_shape).prod()),
+            max(
+                sum(int(torch.tensor(shape).prod()) for shape in shapes)
+                for shapes in output_shape_cases
+            ),
         )
         state = create_iris_state(
             group=dist.group.WORLD,
@@ -124,18 +142,9 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
         )
         for shape in _ar_shape_cases():
             _check_all_reduce(state, rank, world_size, shape, device)
-        _check_all_reduce_two(
-            state,
-            rank,
-            world_size,
-            first_shape,
-            second_shape,
-            device,
-        )
         if world_size == 8:
-            _check_all_reduce_two_symmetric_staging(
-                state, rank, first_shape, second_shape, device
-            )
+            for shapes in output_shape_cases:
+                _check_all_reduce_symmetric_staging(state, rank, shapes, device)
             _check_all_reduce_residual_attnres(state, rank, device)
     finally:
         dist.destroy_process_group()
@@ -159,68 +168,41 @@ def _check_all_reduce(state, rank: int, world_size: int, shape, device) -> None:
     torch.testing.assert_close(result, expected, atol=0, rtol=0)
 
 
-def _check_all_reduce_two(
-    state,
-    rank: int,
-    world_size: int,
-    first_shape,
-    second_shape,
-    device,
-) -> None:
-    from tokenspeed_kernel.ops.communication.iris import iris_all_reduce_two
-
-    first = torch.full(
-        first_shape,
-        rank + 1,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    second = torch.full(
-        second_shape,
-        2 * (rank + 1),
-        dtype=torch.bfloat16,
-        device=device,
-    )
-
-    first_result, second_result = iris_all_reduce_two(state, first, second)
-
-    expected_value = world_size * (world_size + 1) // 2
-    torch.testing.assert_close(
-        first_result,
-        torch.full_like(first, expected_value),
-        atol=0,
-        rtol=0,
-    )
-    torch.testing.assert_close(
-        second_result,
-        torch.full_like(second, 2 * expected_value),
-        atol=0,
-        rtol=0,
-    )
-
-
-def _check_all_reduce_two_symmetric_staging(
-    state, rank: int, first_shape, second_shape, device
-) -> None:
+def _check_all_reduce_symmetric_staging(state, rank: int, shapes, device) -> None:
     from tokenspeed_kernel.ops.communication.iris import (
-        iris_all_reduce_two,
-        iris_all_reduce_two_staging,
+        iris_all_reduce_staging,
+        iris_all_reduce_symmetric,
     )
 
-    first, second = iris_all_reduce_two_staging(state, first_shape, second_shape)
-    first.fill_(rank + 1)
-    second.fill_(2 * (rank + 1))
-    first_result, second_result = iris_all_reduce_two(state, first, second, safe=False)
+    outputs = iris_all_reduce_staging(state, shapes)
+    for index, output in enumerate(outputs, start=1):
+        output.fill_(index * (rank + 1))
+    results = iris_all_reduce_symmetric(state, outputs)
     expected_value = 8 * 9 // 2
-    torch.testing.assert_close(
-        first_result, torch.full_like(first, expected_value), atol=0, rtol=0
-    )
-    torch.testing.assert_close(
-        second_result,
-        torch.full_like(second, 2 * expected_value),
-        atol=0,
-        rtol=0,
-    )
+    for index, (output, result) in enumerate(zip(outputs, results), start=1):
+        torch.testing.assert_close(
+            result,
+            torch.full_like(output, index * expected_value),
+            atol=0,
+            rtol=0,
+        )
+
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for index, output in enumerate(outputs, start=1):
+            output.fill_(index * (rank + 1))
+        graph_results = iris_all_reduce_symmetric(state, outputs)
+    dist.barrier()
+    graph.replay()
+    torch.cuda.synchronize()
+    for index, (output, result) in enumerate(zip(outputs, graph_results), start=1):
+        torch.testing.assert_close(
+            result,
+            torch.full_like(output, index * expected_value),
+            atol=0,
+            rtol=0,
+        )
 
 
 def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:

@@ -85,7 +85,6 @@ from tokenspeed_kernel.ops.gemm.triton_gemv import (
 )
 from tokenspeed_kernel.ops.moe import (
     latent_moe_decode_pipeline_available,
-    latent_moe_expert_shared,
     latent_moe_input_projections,
 )
 from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
@@ -98,10 +97,9 @@ from tokenspeed.runtime.configs.kimi_k3_config import KimiK3Config, KimiLinearCo
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import (
     all_reduce,
-    all_reduce_two,
+    plan_all_reduce,
     prepare_all_reduce_fusion,
     prepare_all_reduce_lane,
-    prepare_all_reduce_two,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
@@ -122,6 +120,7 @@ from tokenspeed.runtime.layers.moe.latent import (
     Kimi3MoEExecutionPlan,
     LatentMoELayer,
     kimi3_join_reduce_moe,
+    latent_moe_expert_shared_all_reduce,
 )
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
@@ -1115,8 +1114,8 @@ class KimiLinearMoE(nn.Module):
                     if self.execution_plan.joint_moe_reduce
                     else self._reduce_shared
                 ),
-                joint_reduce=(
-                    partial(all_reduce_two, group=mapping.moe.ep_group)
+                joint_plan=(
+                    partial(plan_all_reduce, group=mapping.moe.ep_group)
                     if self.execution_plan.joint_moe_reduce
                     else None
                 ),
@@ -1176,7 +1175,9 @@ class KimiLinearMoE(nn.Module):
             offset += rows
 
     def _latent_input_projections(
-        self, hidden_states: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        shared_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
         """Project the router, routed latent, and shared partial in one pass.
 
@@ -1198,6 +1199,7 @@ class KimiLinearMoE(nn.Module):
         shared_output = kimi3_shared_down_projection(
             shared_input,
             self.shared_experts.down_proj.weight,
+            out=shared_out,
         )
         return router_logits, routed_input, shared_output
 
@@ -1255,31 +1257,7 @@ class KimiLinearMoE(nn.Module):
             up_clamp=self.shared_experts.act_fn.linear_beta,
         )
         topk_output = self.topk(hidden_states, router_logits)
-        staging = prepare_all_reduce_two(
-            (hidden_states.shape[0], self.shared_experts.down_proj.weight.shape[0]),
-            (hidden_states.shape[0], self.routed_expert_down_proj.weight.shape[0]),
-            hidden_states.dtype,
-            self.mapping.moe.ep_group,
-        )
-        shared_staging, routed_staging = (
-            staging
-            if staging is not None
-            else (
-                hidden_states.new_empty(
-                    (
-                        hidden_states.shape[0],
-                        self.shared_experts.down_proj.weight.shape[0],
-                    )
-                ),
-                hidden_states.new_empty(
-                    (
-                        hidden_states.shape[0],
-                        self.routed_expert_down_proj.weight.shape[0],
-                    )
-                ),
-            )
-        )
-        routed_latent, shared_output = latent_moe_expert_shared(
+        routed_latent, shared_output = latent_moe_expert_shared_all_reduce(
             routed_input,
             self.experts.w13_weight,
             self.experts.w13_weight_scale,
@@ -1293,12 +1271,6 @@ class KimiLinearMoE(nn.Module):
             linear_clamp=self.experts.activation_situ_linear_beta,
             expert_start=self.experts.ep_rank * self.experts.num_local_experts,
             w13_interleaved=self.experts.w13_input_layout == "interleaved",
-            routed_out=routed_staging,
-            shared_out=shared_staging,
-        )
-        shared_output, routed_latent = all_reduce_two(
-            shared_output,
-            routed_latent,
             group=self.mapping.moe.ep_group,
         )
         return self.native_latent_moe.finalize_output(

@@ -31,9 +31,8 @@ from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
 
-# TP8/EP8 model measurements favor warp GEMV through M=8 and grouped MFMA
-# above it.
-_ROUTE_DIRECT_DECODE_MAX_TOKENS = 8
+# TP8/EP8 model measurements favor warp GEMV through M=16.
+_ROUTE_DIRECT_DECODE_MAX_TOKENS = 16
 
 
 if platform.is_amd:
@@ -153,6 +152,14 @@ if platform.is_amd:
             and intermediate % 256 == 0
             and int(w.w13_weight.shape[2]) * 2 == x.shape[1]
         )
+        output = getattr(w, "_situ_output_buffer", None)
+        if output is not None and (
+            output.shape != x.shape
+            or output.dtype != x.dtype
+            or output.device != x.device
+            or not output.is_contiguous()
+        ):
+            output = None
         if use_route_direct_decode:
             from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_decode import (
                 gluon_a16w4_situ_warp_decode_ep_gfx950,
@@ -177,6 +184,7 @@ if platform.is_amd:
                 w13_interleaved=(
                     getattr(w, "w13_input_layout", "concatenated") == "interleaved"
                 ),
+                routed_out=output,
             )
         return gluon_a16w4_situ_grouped_ep_gfx950(
             x,
@@ -189,6 +197,7 @@ if platform.is_amd:
             situ_beta=float(getattr(w, "activation_situ_beta", 1.0)),
             situ_linear_beta=getattr(w, "activation_situ_linear_beta", None),
             expert_start=expert_start,
+            out=output,
         )
 
     @register_kernel(
