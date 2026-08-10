@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_kernels import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_common import (
     _cdna4_swizzled_mxfp4_scale_offset,
 )
 
