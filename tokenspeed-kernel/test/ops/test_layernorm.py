@@ -7,6 +7,7 @@ from tokenspeed_kernel.ops.layernorm.triton import (
     fused_qk_rmsnorm_rope_gate,
     qk_rmsnorm,
     rmsnorm,
+    segmented_rmsnorm,
 )
 from tokenspeed_kernel.platform import current_platform
 
@@ -54,6 +55,51 @@ def test_rmsnorm_with_residual(
     ref = (x_float * torch.rsqrt(variance + eps) * weight).to(dtype)
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(residual_out, ref_residual, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("num_tokens", [1, 8, 127])
+@pytest.mark.parametrize("num_segments", [1, 5])
+@pytest.mark.parametrize("hidden_size", [128, 7168])
+def test_segmented_rmsnorm_matches_independent_norms(
+    dtype: torch.dtype,
+    num_tokens: int,
+    num_segments: int,
+    hidden_size: int,
+    device: str,
+) -> None:
+    eps = 1e-6
+    x = torch.randn(
+        num_tokens, num_segments, hidden_size, device=device, dtype=dtype
+    )
+    weight = torch.randn(
+        num_segments, hidden_size, device=device, dtype=torch.float32
+    )
+
+    out = segmented_rmsnorm(x, weight, eps)
+
+    x_float = x.to(torch.float32)
+    variance = x_float.pow(2).mean(dim=-1, keepdim=True)
+    ref = (x_float * torch.rsqrt(variance + eps) * weight).to(dtype)
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+    assert out.is_contiguous()
+
+
+def test_segmented_rmsnorm_out_parameter(device: str) -> None:
+    x = torch.randn(7, 5, 7168, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(5, 7168, device=device, dtype=torch.float32)
+    out = torch.empty_like(x)
+
+    result = segmented_rmsnorm(x, weight, 1e-6, out=out)
+
+    assert result is out
+    x_float = x.float()
+    ref = (
+        x_float
+        * torch.rsqrt(x_float.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+        * weight
+    ).to(x.dtype)
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
 
 def _gemma_ref(

@@ -279,15 +279,11 @@ def test_an_unmixed_tap_is_still_copied() -> None:
 # --------------------------------------------------------------------------
 
 
-class _Scale(torch.nn.Module):
-    """Stands in for RMSNorm with a factor that identifies which tap it is."""
-
+class _Norm(torch.nn.Module):
     def __init__(self, factor: float) -> None:
         super().__init__()
-        self.factor = factor
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return hidden_states * self.factor
+        self.weight = torch.nn.Parameter(torch.full((3,), factor))
+        self.variance_epsilon = 1e-6
 
 
 def _draft(fc_norm, width: int = 3, taps: int = 4):
@@ -295,6 +291,7 @@ def _draft(fc_norm, width: int = 3, taps: int = 4):
 
     holder = SimpleNamespace(
         fc_norm=fc_norm,
+        _fc_norm_weight=None,
         config=SimpleNamespace(target_hidden_size=width),
         context_proj=lambda hidden_states: (hidden_states, None),
         context_norm=lambda hidden_states: hidden_states,
@@ -310,19 +307,36 @@ def test_without_fc_norm_the_taps_reach_the_projection_untouched() -> None:
 
 def test_each_tap_is_normalized_on_its_own_before_the_projection() -> None:
     """Per-chunk, in ascending target-layer order -- the order fc_norm trained in."""
-    fc_norm = torch.nn.ModuleList([_Scale(f) for f in (1.0, 10.0, 100.0, 1000.0)])
-    concat = torch.ones(2, 12)
+    from tokenspeed.runtime.models import kimi_k3_dspark as dspark_module
 
-    out = _draft(fc_norm).project_target_hidden(concat)
+    fc_norm = torch.nn.ModuleList([_Norm(f) for f in (1.0, 10.0, 100.0, 1000.0)])
+    concat = torch.arange(1, 25, dtype=torch.float32).reshape(2, 12)
 
-    expected = torch.cat(
-        [torch.full((2, 3), f) for f in (1.0, 10.0, 100.0, 1000.0)], dim=-1
-    )
+    def reference(x, weight, eps):
+        x_float = x.float()
+        return (
+            x_float
+            * torch.rsqrt(x_float.pow(2).mean(dim=-1, keepdim=True) + eps)
+            * weight
+        ).to(x.dtype)
+
+    with mock.patch.object(
+        dspark_module, "segmented_rmsnorm", side_effect=reference
+    ) as fused:
+        out = _draft(fc_norm).project_target_hidden(concat)
+
+    expected = reference(
+        concat.unflatten(-1, (4, 3)),
+        torch.stack([norm.weight for norm in fc_norm]),
+        1e-6,
+    ).flatten(-2)
     torch.testing.assert_close(out, expected)
+    fused.assert_called_once()
+    assert out.shape == concat.shape
 
 
 def test_a_tap_count_that_disagrees_with_fc_norm_is_an_error() -> None:
     """strict=True: a 5-norm draft handed 4 taps must not silently normalize 4."""
-    fc_norm = torch.nn.ModuleList([_Scale(1.0) for _ in range(5)])
-    with pytest.raises(ValueError):
+    fc_norm = torch.nn.ModuleList([_Norm(1.0) for _ in range(5)])
+    with pytest.raises(ValueError, match="fc_norm expects 5 target taps"):
         _draft(fc_norm).project_target_hidden(torch.ones(2, 12))

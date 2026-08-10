@@ -40,6 +40,7 @@ from collections.abc import Iterable
 
 import torch
 from torch import nn
+from tokenspeed_kernel.ops.layernorm.triton import segmented_rmsnorm
 
 from tokenspeed.runtime.configs.kimi_k3_dspark_config import (
     K3_DSPARK_SKIPPED_WEIGHT_PREFIXES,
@@ -318,6 +319,7 @@ class K3DSparkModel(nn.Module):
             if bool(getattr(config, "fc_norm", False))
             else None
         )
+        self.register_buffer("_fc_norm_weight", None, persistent=False)
 
         self.layers = nn.ModuleList(
             [
@@ -343,21 +345,31 @@ class K3DSparkModel(nn.Module):
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Concatenated target taps -> draft hidden space."""
         if self.fc_norm is not None:
-            # Taps are concatenated in ascending target-layer order, which is
-            # the order ``fc_norm`` was trained in.
-            target_hidden = torch.cat(
-                [
-                    norm(chunk)
-                    for norm, chunk in zip(
-                        self.fc_norm,
-                        target_hidden.split(
-                            int(self.config.target_hidden_size), dim=-1
-                        ),
-                        strict=True,
-                    )
-                ],
-                dim=-1,
+            # Taps are concatenated in ascending target-layer order. Keep the
+            # segment axis explicit so one kernel can independently normalize
+            # every tap and write the already-concatenated output directly.
+            num_segments = len(self.fc_norm)
+            hidden_size = int(self.config.target_hidden_size)
+            expected_width = num_segments * hidden_size
+            if target_hidden.shape[-1] != expected_width:
+                raise ValueError(
+                    f"fc_norm expects {num_segments} target taps ({expected_width} "
+                    f"features), got {target_hidden.shape[-1]} features"
+                )
+            fc_norm_weight = self._fc_norm_weight
+            if fc_norm_weight is None:
+                # Production builds this once in post_load_weights. The lazy
+                # path keeps directly-constructed models and unit tests safe.
+                fc_norm_weight = torch.stack(
+                    [norm.weight.detach() for norm in self.fc_norm], dim=0
+                ).contiguous()
+                self._fc_norm_weight = fc_norm_weight
+            target_hidden = segmented_rmsnorm(
+                target_hidden.unflatten(-1, (num_segments, hidden_size)),
+                fc_norm_weight,
+                float(self.fc_norm[0].variance_epsilon),
             )
+            target_hidden = target_hidden.flatten(-2)
         return self.context_norm(self.context_proj(target_hidden)[0])
 
     def _finalize_hidden(
@@ -537,6 +549,12 @@ class K3DSparkModel(nn.Module):
             self_attn.w_kc, self_attn.w_vc = _prepare_mla_kv_b_proj_weights(
                 self_attn.kv_b_proj.weight, self_attn
             )
+        if self.fc_norm is not None:
+            # Checkpoint keys stay fc_norm.N.weight; only the serving layout is
+            # packed once so every decode step needs one kernel and no cat.
+            self._fc_norm_weight = torch.stack(
+                [norm.weight.detach() for norm in self.fc_norm], dim=0
+            ).contiguous()
 
 
 EntryClass = [K3DSparkModel]
