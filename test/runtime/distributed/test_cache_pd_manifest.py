@@ -31,6 +31,7 @@ from tokenspeed.runtime.pd.cache_protocol import (
     build_cache_page_manifest,
     build_lcm_pd_cache_contract,
     cache_manifest_page_ids,
+    project_cache_destination_manifest,
     validate_cache_manifest_pair,
     validate_cache_peer_layout,
     validate_cache_slab_registrations,
@@ -110,6 +111,63 @@ def test_transfer_policy_is_model_defined_not_inferred_from_family() -> None:
     )
 
     assert manifest.groups[1] == CachePDGroupPages("linear-a", (12, 13, 14))
+
+
+def test_manifest_uses_each_groups_child_page_size() -> None:
+    layout = CachePDLayout(
+        version=CACHE_PD_PROTOCOL_VERSION,
+        layout_fingerprint=_FINGERPRINT,
+        block_size=4,
+        num_pages_with_null=8,
+        physical_buffer_ids=("arena",),
+        physical_page_bytes=128,
+        groups=(
+            CachePDGroup(
+                "history",
+                "history",
+                "full_suffix",
+                (0,),
+                cache_blocks_per_lcm_block=2,
+            ),
+        ),
+    )
+    operation = SimpleNamespace(
+        block_tables_arrays=lambda: {"history": np.asarray([[1, 2, 3]], dtype=np.int32)}
+    )
+
+    manifest = build_cache_page_manifest(
+        operation,
+        layout=layout,
+        request_row=0,
+        prefix_len=0,
+        prompt_len=4,
+    )
+
+    assert manifest.groups == (CachePDGroupPages("history", (1, 2)),)
+
+
+def test_layerwise_destination_projection_selects_chunk_suffix() -> None:
+    full = build_cache_page_manifest(
+        _op(30),
+        layout=_layout(),
+        request_row=0,
+        prefix_len=4,
+        prompt_len=14,
+    )
+
+    chunk = project_cache_destination_manifest(
+        full,
+        layout=_layout(),
+        prefix_len=8,
+        prompt_len=12,
+        num_pages_with_null=_layout().num_pages_with_null,
+    )
+
+    assert chunk.groups == (
+        CachePDGroupPages("attention", (33,)),
+        CachePDGroupPages("linear-a", (44,)),
+        CachePDGroupPages("linear-b", (54,)),
+    )
 
 
 def test_layout_rejects_unbound_physical_slots() -> None:
@@ -355,7 +413,7 @@ def test_lcm_group_capacity_uses_its_cache_blocks_per_parent() -> None:
             ),
         ),
     )
-    tables = {"history": np.array([[5, 6]], dtype=np.int32)}
+    tables = {"history": np.array([[3, 4, 5, 6]], dtype=np.int32)}
     operation = SimpleNamespace(block_tables_arrays=lambda: tables)
 
     build_cache_page_manifest(
@@ -365,7 +423,7 @@ def test_lcm_group_capacity_uses_its_cache_blocks_per_parent() -> None:
         prefix_len=0,
         prompt_len=8,
     )
-    tables["history"][0, 1] = 7
+    tables["history"][0, 3] = 7
     with pytest.raises(CachePDProtocolError, match="invalid page ID"):
         build_cache_page_manifest(
             operation,
@@ -512,6 +570,7 @@ def _two_plane_lcm_plan(num_lcm_blocks: int):
                 field_offset_bytes=0,
                 page_stride_bytes=256,
                 payload_bytes=64,
+                layer_id=0,
             ),
             SimpleNamespace(
                 group_id="history",
@@ -522,6 +581,7 @@ def _two_plane_lcm_plan(num_lcm_blocks: int):
                 field_offset_bytes=0,
                 page_stride_bytes=256,
                 payload_bytes=64,
+                layer_id=0,
             ),
         ),
     )
@@ -569,6 +629,7 @@ def test_lcm_contract_registers_one_arena_and_preserves_group_geometry() -> None
                 field_offset_bytes=0,
                 page_stride_bytes=256,
                 payload_bytes=64,
+                layer_id=0,
             ),
         ),
     )

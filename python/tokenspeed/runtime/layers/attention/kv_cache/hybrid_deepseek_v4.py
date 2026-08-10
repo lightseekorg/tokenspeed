@@ -673,6 +673,17 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
     def zero_new_pages(self, new_page_ids: dict[str, list[int]]) -> None:
         self.zero_blocks(new_page_ids)
 
+    @property
+    def supports_disaggregation(self) -> bool:
+        return bool(self.paged_cache_group_specs) and all(
+            spec.transfer_policy is not None for spec in self.paged_cache_group_specs
+        )
+
+    def get_pd_cache_contract(self):
+        if not self.supports_disaggregation:
+            raise RuntimeError("DeepSeek V4 cache PD is not enabled")
+        return self.pd_contract(self.paged_cache_group_specs)
+
     def get_contiguous_buf_infos(self):
         raise RuntimeError("DeepSeek V4 transfer uses the cache contract")
 

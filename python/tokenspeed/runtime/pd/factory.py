@@ -59,6 +59,15 @@ def get_kv_args(
     token_to_kv_pool,
     draft_token_to_kv_pool,
 ):
+    total_layer_num = token_to_kv_pool.layer_num
+    kv_layer_ids = list(getattr(token_to_kv_pool, "layer_ids", range(total_layer_num)))
+    draft_layer_num = (
+        len(draft_token_to_kv_pool.layer_ids)
+        if draft_token_to_kv_pool is not None
+        else 0
+    )
+    target_layer_num = total_layer_num - draft_layer_num
+
     cache_contract = _get_cache_contract(token_to_kv_pool)
     if cache_contract is not None:
         # One big model, one arena: the draft's continuation-layer planes
@@ -78,9 +87,9 @@ def get_kv_args(
             kv_data_ptrs=[registration.base_addr for registration in registrations],
             kv_data_lens=[registration.length for registration in registrations],
             kv_item_lens=item_lens,
-            target_layer_num=physical_slot_count,
-            draft_layer_num=0,
-            kv_layer_ids=list(range(physical_slot_count)),
+            target_layer_num=target_layer_num,
+            draft_layer_num=draft_layer_num,
+            kv_layer_ids=kv_layer_ids,
             # One logical Mooncake unit is one complete raw-slab page. This
             # makes equal-TP cache-contract routes identity routes and prevents the
             # generic heterogeneous-TP planner from splitting a raw page.
@@ -111,15 +120,6 @@ def get_kv_args(
     kv_unit_lens = _get_contiguous_buf_unit_lens(token_to_kv_pool, kv_item_lens)
     # [[layer0buf0, layer0buf1...], [layer1buf0, layer1buf1...], ...]
     offsets = token_to_kv_pool.get_layerwise_buf_info_offsets()
-    total_layer_num = token_to_kv_pool.layer_num
-    kv_layer_ids = list(getattr(token_to_kv_pool, "layer_ids", range(total_layer_num)))
-    draft_layer_num = (
-        len(draft_token_to_kv_pool.layer_ids)
-        if draft_token_to_kv_pool is not None
-        else 0
-    )
-    target_layer_num = total_layer_num - draft_layer_num
-
     state_data_ptrs = []
     state_data_lens = []
     state_item_lens = []
@@ -168,7 +168,7 @@ def create_kv_transfer(
             )
         if args.enable_mla_l1_5_cache:
             raise NotImplementedError(
-                "Paged-cache PD does not support MLA L1.5 or layerwise cache transfer"
+                "Paged-cache PD does not support MLA L1.5 cache transfer"
             )
     if mode == "prefill":
         return DisaggPrefillExecutor(backend, args, kv_args, gloo_group, page_size)
