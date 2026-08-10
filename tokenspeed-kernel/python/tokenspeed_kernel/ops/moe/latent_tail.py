@@ -231,9 +231,13 @@ class KimiK3LatentTailOp:
             ``[M, 7168]`` post-communication hidden (up-projection + shared,
             plus ``prefix`` when provided).
         """
-        # Upstream-inherited hazard: the single mailbox's sentinel cleanup
-        # overlaps the next layer via PDL; remote stores are ordered only by
-        # the cross-rank latency window, not a sync edge.
+        # The gather's sentinel cleanup still overlaps successors via PDL, and
+        # a peer's multicast store into this rank's mailbox is ordered only by
+        # the cross-rank latency window, not by a sync edge. What makes that
+        # safe is the mailbox being private to this caller (see ``owner`` on
+        # ``_Contract``): it is reused a whole forward later, and no rank can
+        # drift that far ahead because every layer's gather blocks on its
+        # peers' data.
         m = routed_partial.shape[0]
         self._up_projection.ensure_compiled(m)
         latent, shared_shard = self._collective(
