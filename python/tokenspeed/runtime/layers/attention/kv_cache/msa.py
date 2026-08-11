@@ -79,8 +79,3 @@ class MSATokenToKVPool(MHATokenToKVPool):
         key_bytes, value_bytes = super().get_kv_size_bytes()
         index_bytes = sum(cache.nbytes for cache in self.index_k_buffer.values())
         return key_bytes + index_bytes, value_bytes
-
-    def get_contiguous_buf_infos(self):
-        raise NotImplementedError(
-            "MiniMax sparse cache transfer requires index-key side-cache support."
-        )

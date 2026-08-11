@@ -673,24 +673,3 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
 
     def zero_new_pages(self, new_page_ids: dict[str, list[int]]) -> None:
         self.zero_blocks(new_page_ids)
-
-    def get_contiguous_buf_infos(self):
-        raise RuntimeError("DeepSeek V4 transfer uses the cache contract")
-
-    def get_layerwise_buf_info_offsets(self, start_idx=0):
-        offsets = []
-        cursor = start_idx
-        for layer_id in range(self.layer_num):
-            layer_offsets = [cursor]
-            cursor += 1
-            for buffers in (
-                self.compressed_kv_buffer,
-                self.compressor_state_buffer,
-                self.indexer_kv_buffer,
-                self.indexer_state_buffer,
-            ):
-                if buffers[layer_id] is not None:
-                    layer_offsets.append(cursor)
-                    cursor += 1
-            offsets.append(layer_offsets)
-        return offsets

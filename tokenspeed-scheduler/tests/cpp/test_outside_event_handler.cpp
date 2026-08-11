@@ -649,6 +649,31 @@ protected:
     }
 };
 
+class PdSlidingSparseDecodeAdmissionTestSuite : public DisaggDecodeAdmissionTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = DisaggDecodeAdmissionTestSuite::MakeConfig();
+        cfg.block_size = 4;
+        cfg.device_allocator.total_pages = 8;
+        cfg.host_allocator.total_pages = 0;
+        cfg.max_scheduled_tokens = 16;
+        cfg.enable_pd_cache = true;
+        cfg.disable_prefix_cache = false;
+
+        PagedCacheGroupConfig sliding;
+        sliding.group_id = "sliding";
+        sliding.rows_per_page = 2;
+        sliding.entry_stride_tokens = 1;
+        sliding.total_pages = cfg.device_allocator.total_pages;
+        sliding.retention = PagedCacheGroupConfig::Retention::SlidingWindow;
+        sliding.sliding_window_tokens = 4;
+        sliding.family = PagedCacheGroupFamily::State;
+        sliding.transfer_policy = PagedCacheTransferPolicy::FullSuffix;
+        cfg.paged_cache_groups = {sliding};
+        return cfg;
+    }
+};
+
 TEST_F(PdLocalRecoveryCapacityTestSuite, SingleRequestCapacityIncludesLocalRecoveryWorkingSet) {
     // Full KV uses ceil(tokens / 4) parents. A local-recovery chunk peaks at
     // five State parents: one lookback plus four pages for an eight-token
@@ -738,6 +763,54 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, ReusesHistoryPrefixAndLeavesStatePrefix
     EXPECT_EQ(state[2], 0);
     EXPECT_GT(state[3], 0);
     EXPECT_GT(state[4], 0);
+}
+
+TEST_F(PdSlidingSparseDecodeAdmissionTestSuite, KeepsCachedPrefixIslandWhileMaterializingRemoteTail) {
+    // Seed a resumable W=4 lookback at raw-token boundary 8. At q=2 the
+    // cached island occupies slots [2, 4); earlier slots are null holes.
+    Submit({MakeRequestSpec("seed", /*num_pages=*/2, /*start=*/1)});
+    SendBootstrapped("seed");
+    const ExecutionPlan seed_admission = PlanOnce();
+    const ForwardBatch* seed_destination = FindForwardBatch(seed_admission.Operations());
+    ASSERT_NE(seed_destination, nullptr);
+    const auto seed_row = seed_destination->block_tables.at("sliding").at(0);
+    ASSERT_EQ(seed_row.size(), 5u);
+    EXPECT_EQ(seed_row[0], 0);
+    EXPECT_EQ(seed_row[1], 0);
+    EXPECT_GT(seed_row[2], 0);
+    EXPECT_GT(seed_row[3], 0);
+    EXPECT_GT(seed_row[4], 0);
+
+    SendRemotePrefillDone("seed", /*bootstrap_token=*/42);
+    const ExecutionPlan seed_decode = PlanOnce();
+    ASSERT_NE(FindForwardBatch(seed_decode.Operations()), nullptr);
+    ExecutionEvent seed_succeeded;
+    seed_succeeded.With(PDEvent{pd::SucceededEvent{"seed"}});
+    scheduler_->Advance(std::move(seed_succeeded));
+
+    // The longer request hits through token 8. Its retained remote tail begins
+    // at floor((16 - W + 1) / q)=6, leaving [4, 6) sparse while preserving the
+    // cached island and materializing the phase page for decode reserve.
+    Submit({MakeRequestSpec("long", /*num_pages=*/4, /*start=*/1)});
+    SendBootstrapped("long");
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* destination = FindForwardBatch(plan.Operations());
+    ASSERT_NE(destination, nullptr);
+    EXPECT_EQ(destination->extend_prefix_lens, (std::vector<std::int32_t>{8}));
+    EXPECT_EQ(destination->input_lengths, (std::vector<std::int32_t>{8}));
+
+    const auto& row = destination->block_tables.at("sliding").at(0);
+    ASSERT_EQ(row.size(), 9u);
+    EXPECT_EQ(row[0], 0);
+    EXPECT_EQ(row[1], 0);
+    EXPECT_EQ(row[2], seed_row[2]);
+    EXPECT_EQ(row[3], seed_row[3]);
+    EXPECT_EQ(row[4], 0);
+    EXPECT_EQ(row[5], 0);
+    EXPECT_GT(row[6], 0);
+    EXPECT_GT(row[7], 0);
+    EXPECT_GT(row[8], 0);
+    EXPECT_EQ(plan.pages_to_zero.at("sliding"), (std::vector<std::int32_t>{row[6], row[7], row[8]}));
 }
 
 TEST_F(PdSparseDecodeNoPrefixCacheTestSuite, RemoteBootstrapConsumesSparseTailBeforeNextDecode) {

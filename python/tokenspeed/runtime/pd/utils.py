@@ -32,8 +32,6 @@ from collections import deque
 from enum import Enum
 from typing import TYPE_CHECKING
 
-import numpy as np
-import numpy.typing as npt
 import requests
 import torch
 import torch.distributed as dist
@@ -131,16 +129,11 @@ class ReqToMetadataIdxAllocator:
 
 class TransferBackend(Enum):
     MOONCAKE = "mooncake"
-    MOONCAKE_ASYNC = "mooncake_async"
 
 
 class KVClassType(Enum):
     MANAGER_PREFILL = "manager_prefill"
     MANAGER_DECODE = "manager_decode"
-    # The async backend uses one role-agnostic manager (see get_kv_class's
-    # MOONCAKE_ASYNC branch); the sync backend splits into the prefill/decode
-    # managers above.
-    MANAGER = "manager"
     SENDER = "sender"
     RECEIVER = "receiver"
     BOOTSTRAP_SERVER = "bootstrap_server"
@@ -173,44 +166,7 @@ def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
         }
         return class_mapping.get(class_type)
 
-    if transfer_backend == TransferBackend.MOONCAKE_ASYNC:
-        from tokenspeed.runtime.pd.mooncake.async_conn import (
-            MooncakeAsyncKVManager,
-        )
-        from tokenspeed.runtime.pd.mooncake.conn import (
-            MooncakeKVBootstrapServer,
-        )
-        from tokenspeed.runtime.pd.mooncake.receiver import (
-            MooncakeKVReceiver,
-        )
-        from tokenspeed.runtime.pd.mooncake.sender import (
-            MooncakeKVSender,
-        )
-
-        class_mapping = {
-            KVClassType.MANAGER: MooncakeAsyncKVManager,
-            KVClassType.SENDER: MooncakeKVSender,
-            KVClassType.RECEIVER: (MooncakeKVReceiver),
-            KVClassType.BOOTSTRAP_SERVER: MooncakeKVBootstrapServer,
-        }
-        return class_mapping.get(class_type)
-
     raise ValueError(f"Unsupported transfer backend: {transfer_backend}")
-
-
-def kv_to_page_indices(kv_indices: np.ndarray, page_size: int):
-    # 1. The page is guaranteed to be full except the last page.
-    # 2. page index = kv_index // page_size
-    # The return vector is kv_indices[::page_size] // page_size
-    if page_size == 1:  # shortcut
-        return kv_indices
-
-    return kv_indices[::page_size] // page_size
-
-
-def kv_to_page_num(num_kv_indices: int, page_size: int):
-    # ceil(num_kv_indices / page_size)
-    return (num_kv_indices + page_size - 1) // page_size
 
 
 @dataclasses.dataclass
@@ -257,12 +213,6 @@ def register_disaggregation_server(
             res.status_code,
             res.text,
         )
-
-
-def is_mla_backend(target_kv_pool) -> bool:
-    from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
-
-    return isinstance(target_kv_pool, MLATokenToKVPool)
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None, err_type=None):
@@ -411,23 +361,6 @@ class MetadataBuffers:
                 ] = torch.tensor(
                     req.output_top_logprobs_idx[0], dtype=torch.int32, device="cpu"
                 )
-
-
-def group_concurrent_contiguous(
-    src_indices: npt.NDArray[np.int64], dst_indices: npt.NDArray[np.int64]
-) -> tuple[list[npt.NDArray[np.int64]], list[npt.NDArray[np.int64]]]:
-    """Vectorised NumPy implementation."""
-    if src_indices.size == 0:
-        return [], []
-
-    brk = np.where((np.diff(src_indices) != 1) | (np.diff(dst_indices) != 1))[0] + 1
-    src_groups = np.split(src_indices, brk)
-    dst_groups = np.split(dst_indices, brk)
-
-    src_groups = [g.tolist() for g in src_groups]
-    dst_groups = [g.tolist() for g in dst_groups]
-
-    return src_groups, dst_groups
 
 
 class StepCounter:

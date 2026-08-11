@@ -201,6 +201,14 @@ class AttentionBackend(ABC):
         """
         pass
 
+    def prepare_remote_cache_slots(self, slot_indices: list[int]) -> None:
+        """Clear model-specific restore state before remote cache admission."""
+        del slot_indices
+
+    def mark_remote_cache_ready(self, slot_index: int) -> None:
+        """Arm model-specific hydration after a remote cache transfer succeeds."""
+        del slot_index
+
     def register_step_counter(self, step_counter: StepCounter):
         self.step_counter = step_counter
 

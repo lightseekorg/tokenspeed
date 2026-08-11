@@ -805,6 +805,10 @@ def create_attn_components(
         server_args.attention_backend = "deepseek_v4"
     if is_deepseek_v4_draft_model:
         server_args.drafter_attention_backend = "deepseek_v4"
+    if (is_deepseek_v4_model or is_deepseek_v4_draft_model) and (
+        server_args.disaggregation_mode in ("prefill", "decode")
+    ):
+        raise NotImplementedError("DeepSeek V4 PD is not supported")
     if is_hybrid_linear:
         # GDN (Qwen3.5) / KDA (Kimi-K3) hybrid models always need
         # hybrid_linear_attn. Save the user's original choice for the
@@ -824,6 +828,8 @@ def create_attn_components(
         config.sliding_window_tokens = int(model_config.hf_config.sliding_window)
     if is_inkling and server_args.disaggregation_mode in ("prefill", "decode"):
         raise NotImplementedError("Inkling PD is not supported")
+    if isinstance(config, MSAConfig) and config.pd_disaggregation_enabled:
+        raise NotImplementedError("MSA PD is not supported")
     target_text_config = getattr(
         model_config.hf_config, "text_config", model_config.hf_config
     )

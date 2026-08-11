@@ -298,7 +298,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
     def test_guard_raises_on_pd_with_aliased_plan(self):
         with self.assertRaisesRegex(
             RuntimeError,
-            r"aliased MHA cache layout is incompatible with PD disaggregation"
+            r"aliased/sliding MHA CachePD support is deferred"
             r".*disaggregation_mode='null'",
         ):
             self._pool(pd_disaggregation_enabled=True)

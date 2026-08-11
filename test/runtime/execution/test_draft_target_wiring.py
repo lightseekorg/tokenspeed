@@ -77,6 +77,15 @@ def test_shares_target_embed_head_flags():
     assert not BaseDrafter.shares_target_embed_head
 
 
+def test_pd_layerwise_finalization_capability_matches_supported_drafters():
+    assert Eagle.supports_pd_layerwise_finalization
+    assert DFlash.supports_pd_layerwise_finalization
+    assert DSpark.supports_pd_layerwise_finalization
+    assert not Mtp.supports_pd_layerwise_finalization
+    assert not DeepseekV4DSpark.supports_pd_layerwise_finalization
+    assert not BaseDrafter.supports_pd_layerwise_finalization
+
+
 def test_wire_eagle3_shares_embed_head_and_installs_capture_ids():
     target, draft = mock.MagicMock(), mock.MagicMock()
     target.model.get_embed_and_head.return_value = ("EMBED", "HEAD")

@@ -93,7 +93,7 @@ class CachePool:
             )
         # Allocate lazily when the first field is bound. Concrete pools do
         # that inside their memory-saver region, so the shared buffer keeps
-        # the same sleep/wake lifetime as the legacy per-buffer allocations.
+        # the same sleep/wake lifetime as the former per-buffer allocations.
         #
         # A heterogeneous draft view (for example, an MHA Eagle3 head over an
         # MLA target) binds its own field family but must not allocate another
@@ -343,17 +343,6 @@ class CachePool:
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ) -> None:
-        raise NotImplementedError()
-
-    # Buffer metadata used by prefill/decode disaggregation.
-    def get_contiguous_buf_infos(self):
-        raise NotImplementedError()
-
-    def get_contiguous_buf_unit_lens(self):
-        return [1] * len(self.get_contiguous_buf_infos()[2])
-
-    # Layerwise buffer offsets used by prefill/decode disaggregation.
-    def get_layerwise_buf_info_offsets(self, start_idx=0):
         raise NotImplementedError()
 
 

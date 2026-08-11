@@ -27,7 +27,9 @@ import numpy as np
 import requests
 
 from tokenspeed.runtime.pd.base.status import TransferPoll
-from tokenspeed.runtime.pd.cache_protocol import CacheTransferContract
+from tokenspeed.runtime.pd.cache_protocol import (
+    CacheTransferContract,
+)
 from tokenspeed.runtime.pd.mooncake.conn import MooncakeKVManagerBase
 from tokenspeed.runtime.pd.mooncake.entities import KVArgs, KVManagerArgs
 from tokenspeed.runtime.pd.utils import DisaggregationMode
@@ -44,10 +46,6 @@ logger = get_colorful_logger(__name__)
 class PrefillParallelInfo:
     tp_size: int
     dp_size: int
-    kv_item_lens: tuple[int, ...] = ()
-    kv_unit_lens: tuple[int, ...] = ()
-    state_item_lens: tuple[int, ...] = ()
-    state_unit_lens: tuple[int, ...] = ()
     cache_layout: CacheTransferContract | None = None
 
     @property
@@ -96,9 +94,8 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
         self.max_failures = max(
             envs.TOKENSPEED_DISAGGREGATION_HEARTBEAT_MAX_FAILURE.get(), 1
         )
-        self.start_decode_thread()
         self.connection_pool: dict[str, dict[str, str | int]] = {}
-        self.required_prefill_response_num_table: dict[int, int] = {}
+        self.expected_prefill_ranks_table: dict[int, frozenset[int]] = {}
         self.prefill_response_tracker: dict[int, set[int]] = defaultdict(set)
 
         self.prefill_parallel_info: dict[str, PrefillParallelInfo] = {}
@@ -107,6 +104,9 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
         # fail to receive the KV Cache transfer done signal after bootstrapping.
         # These timeout requests should be aborted to release the tree cache.
         self.waiting_timeout = envs.TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT.get()
+        # The status and heartbeat threads read every field above, so publish
+        # their sockets only after the manager is fully initialized.
+        self.start_decode_thread()
 
     def start_decode_thread(self):
         self.rank_port = get_free_port()
@@ -122,7 +122,11 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
         def decode_thread():
             while True:
                 parts = self.server_socket.recv_multipart()
-                self._handle_prefill_status(*parse_prefill_status_message(parts))
+                try:
+                    parsed = parse_prefill_status_message(parts)
+                    self._handle_prefill_status(*parsed)
+                except Exception:
+                    logger.exception("Rejecting malformed Prefill status message")
 
         def heartbeat_checker():
             while True:
@@ -189,10 +193,26 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
         bootstrap_token: int,
         spec_candidate_ids: list[int] | None,
     ) -> None:
+        if bootstrap_room not in self.request_status:
+            return
         if status == TransferPoll.Success:
-            if bootstrap_room not in self.request_status:
+            expected_prefill_ranks = self.expected_prefill_ranks_table.get(
+                bootstrap_room
+            )
+            if expected_prefill_ranks is None:
+                self.record_failure(
+                    bootstrap_room,
+                    "Received KV completion before its transfer route was registered",
+                )
+                self.update_status(bootstrap_room, TransferPoll.Failed)
                 return
-
+            if prefill_rank not in expected_prefill_ranks:
+                self.record_failure(
+                    bootstrap_room,
+                    "Received KV completion from an unexpected Prefill TP rank",
+                )
+                self.update_status(bootstrap_room, TransferPoll.Failed)
+                return
             self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
             if bootstrap_token != -1:
                 self._pending_bootstrap_token_table.setdefault(
@@ -203,11 +223,16 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
                     bootstrap_room, spec_candidate_ids
                 )
 
-            expected_response_num = self.required_prefill_response_num_table.get(
-                bootstrap_room, 1
-            )
+            expected_response_num = len(expected_prefill_ranks)
             arrived_response_num = len(self.prefill_response_tracker[bootstrap_room])
             if arrived_response_num < expected_response_num:
+                return
+            if self.prefill_response_tracker[bootstrap_room] != expected_prefill_ranks:
+                self.record_failure(
+                    bootstrap_room,
+                    "Prefill TP completion set disagrees with the transfer route",
+                )
+                self.update_status(bootstrap_room, TransferPoll.Failed)
                 return
 
             # Store metadata before marking Success so generate_events() can read

@@ -331,6 +331,7 @@ class ModelExecutor:
         )
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
+        self._draft_final_step_counter = None
 
         # fill_input_buffers indexes the scheduler table in logical pages; the drafter indexes draft_page_table in its backend's kernel pages.
         self._logical_page_size = int(
@@ -863,6 +864,7 @@ class ModelExecutor:
             self.runtime_states.future_input_map[
                 self.input_buffers.state_write_req_pool_indices_buf[: ctx.bs]
             ] = next_round_input_ids.to(torch.int32)
+            self._record_draft_final_cache_step(ctx.num_extends)
 
         output_logprobs = logits_output.next_token_logprobs
         return output_tokens, accept_lengths, output_logprobs
@@ -1612,3 +1614,35 @@ class ModelExecutor:
             self.runtime_states.write_remote_spec_candidate_ids(
                 req_pool_idx, candidate_ids
             )
+
+    def register_draft_final_step_counter(self, step_counter) -> None:
+        """Publish one CachePD step after a supported drafter's complete run."""
+        if self.drafter is None or not getattr(
+            self.drafter, "supports_pd_layerwise_finalization", False
+        ):
+            raise RuntimeError(
+                "the speculative drafter cannot finalize layerwise CachePD writes"
+            )
+        if self.draft_attn_backend is None:
+            raise RuntimeError("draft-final CachePD readiness requires a draft backend")
+        if self.draft_attn_backend is self.attn_backend:
+            raise RuntimeError(
+                "draft-final CachePD readiness requires distinct target and draft backends"
+            )
+        self._draft_final_step_counter = step_counter
+
+    def _record_draft_final_cache_step(self, num_extends: int) -> None:
+        step_counter = self._draft_final_step_counter
+        if step_counter is not None and num_extends > 0:
+            step_counter.record_cache()
+
+    def prepare_remote_cache_slots(self, req_pool_indices: list[int]) -> None:
+        """Clear backend restore state before publishing RDMA destinations."""
+        slots = [int(slot) for slot in req_pool_indices]
+        with torch.cuda.stream(self.execution_stream):
+            self.attn_backend.prepare_remote_cache_slots(slots)
+
+    def mark_remote_cache_ready(self, req_pool_idx: int) -> None:
+        """Arm backend first-decode hydration after remote transfer success."""
+        with torch.cuda.stream(self.execution_stream):
+            self.attn_backend.mark_remote_cache_ready(int(req_pool_idx))

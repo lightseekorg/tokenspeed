@@ -97,6 +97,7 @@ def _resolve_draft_query_width(verify_width: int, sample_from_anchor: bool) -> i
 class DFlash(BaseDrafter):
     """DFlash block drafter backed by a native TokenSpeed draft model."""
 
+    supports_pd_layerwise_finalization = True
     sample_from_anchor = False
 
     def __init__(

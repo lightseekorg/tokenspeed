@@ -73,6 +73,7 @@ class Eagle(BaseDrafter):
     """
 
     shares_target_embed_head = True
+    supports_pd_layerwise_finalization = True
 
     def __init__(
         self,

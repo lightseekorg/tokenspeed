@@ -162,9 +162,9 @@ std::int64_t Scheduler::singleRequestParentsRequired(std::int32_t token_limit) c
         if (manager.MatchIsPrefixClosed()) {
             child_pages = ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, page_tokens);
         } else if (config_.role == Role::kD) {
+            const PagedCacheGroupConfig& group = config_.paged_cache_groups[static_cast<std::size_t>(i)];
             const bool latest_snapshot =
-                config_.enable_pd_cache && config_.paged_cache_groups[static_cast<std::size_t>(i)].transfer_policy ==
-                                               PagedCacheTransferPolicy::LatestSnapshot;
+                config_.enable_pd_cache && group.transfer_policy == PagedCacheTransferPolicy::LatestSnapshot;
             if (latest_snapshot) {
                 // The final prompt page may be full, so a non-zero decode
                 // reservation can span one more page than its own page count.
@@ -175,6 +175,16 @@ std::int64_t Scheduler::singleRequestParentsRequired(std::int32_t token_limit) c
                 // recomputing its suffix. Old State checkpoints are
                 // evictable, but one recovery chunk and its lookback must fit.
                 child_pages = std::max(snapshot_pages, local_prefill_peak());
+            } else if (config_.enable_pd_cache && group.retention == PagedCacheGroupConfig::Retention::SlidingWindow) {
+                const std::int64_t dense_pages =
+                    ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, page_tokens);
+                const std::int64_t window_pages = ceilDiv(static_cast<std::int64_t>(*group.sliding_window_tokens - 1) +
+                                                              decode_width + protected_tokens + page_tokens - 1,
+                                                          page_tokens);
+                // A sliding prefix probe can retain one older lookback island
+                // across null holes while the remote prompt tail is restored at
+                // absolute slots. Bound both intervals, capped by a dense table.
+                child_pages = std::min<std::int64_t>(dense_pages, manager.BoundaryLookbackBlocks() + window_pages);
             } else {
                 // Decode-only restores its destination in one admission, so a
                 // non-sparse group cannot slide old prompt pages first.

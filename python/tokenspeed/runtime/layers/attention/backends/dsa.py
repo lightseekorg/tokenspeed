@@ -461,6 +461,13 @@ class DSABackend(AttentionBackend):
             logit_cap=layer.logit_cap,
             k_scale=k_scale,
         )
+        # GLM's sparse-prefill path writes both the latent KV and index_k before
+        # entering this method, but bypasses AttentionBackend.forward and its
+        # normal PD readiness hook. Publish the layer only after the dependent
+        # sparse-attention launch has been enqueued, so layerwise transfer cannot
+        # observe either cache field before it is ready.
+        if getattr(self, "step_counter", None) is not None:
+            self.step_counter.record_cache()
         return out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_sparse_decode(

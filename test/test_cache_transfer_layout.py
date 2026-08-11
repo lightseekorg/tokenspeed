@@ -281,7 +281,7 @@ def test_merged_plan_views_filter_and_remap_fields_before_combining():
     )
 
 
-def test_target_and_draft_layouts_share_scheduler_groups_but_keep_both_payloads():
+def test_target_and_draft_layouts_must_share_one_arena():
     target = CacheTransferLayout(
         num_lcm_blocks=10,
         groups=(
@@ -298,20 +298,8 @@ def test_target_and_draft_layouts_share_scheduler_groups_but_keep_both_payloads(
         consumers=(("layer.0.k",),),
     )
 
-    combined = combine_cache_transfer_layouts(target, draft)
-
-    assert tuple(group.group_id for group in combined.groups) == ("full", "state")
-    assert combined.buffers == ("target", "draft")
-    assert tuple(field.field_id for field in combined.groups[0].fields) == (
-        "target:layer.0.k",
-        "draft:layer.0.k",
-    )
-    assert combined.groups[0].fields[1].device_buffer_index == 1
-    assert combined.consumers == (
-        ("target:layer.0.k",),
-        ("target:layer.1.state",),
-        ("draft:layer.0.k",),
-    )
+    with pytest.raises(ValueError, match="share one arena"):
+        combine_cache_transfer_layouts(target, draft)
 
 
 def test_aliased_target_and_draft_layout_is_transferred_once():

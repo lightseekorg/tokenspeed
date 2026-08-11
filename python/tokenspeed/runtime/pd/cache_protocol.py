@@ -22,8 +22,9 @@
 
 The cache recipe owns semantic group specs and the memory planner owns physical
 geometry. PD transports those objects directly instead of maintaining a second
-flattened layout schema. The same module also owns request page manifests and
-peer validation, keeping the lockstep PD wire surface in one place.
+physical layout schema. The same module owns the transfer schema, request page
+manifests, producer-step projection, and peer validation so all derived PD cache
+control data stays beside the protocol that consumes it.
 """
 
 from __future__ import annotations
@@ -619,9 +620,9 @@ def validate_cache_peer_layout(
             )
         local_fields = layout.fields_for_group(local_spec.group_id)
         peer_fields = peer_layout.fields_for_group(peer_spec.group_id)
-        if tuple(field.field_id for field in local_fields) != tuple(
-            field.field_id for field in peer_fields
-        ):
+        local_field_ids = tuple(field.field_id for field in local_fields)
+        peer_field_ids = tuple(field.field_id for field in peer_fields)
+        if local_field_ids != peer_field_ids:
             raise CacheContractError(
                 f"Paged cache P/D contract mismatch: group "
                 f"{local_spec.group_id!r} transfer field order"
@@ -683,32 +684,6 @@ def validate_cache_manifest(
             raise CacheContractError(
                 f"{peer} manifest group {group.group_id!r} has an out-of-bounds page"
             )
-
-
-def validate_cache_manifest_pair(
-    src_manifest: CachePDPageManifest,
-    dst_manifest: CachePDPageManifest,
-    src_layout: CacheTransferContract,
-    dst_layout: CacheTransferContract,
-) -> None:
-    validate_cache_manifest(src_manifest, layout=src_layout, peer="source")
-    validate_cache_manifest(dst_manifest, layout=dst_layout, peer="destination")
-    if (
-        src_manifest.prefix_len != dst_manifest.prefix_len
-        or src_manifest.prompt_len != dst_manifest.prompt_len
-    ):
-        raise CacheContractError("source/destination prefix_len or prompt_len disagree")
-
-
-def cache_manifest_page_ids(
-    manifest: CachePDPageManifest,
-    *,
-    layout: CacheTransferContract,
-    peer: str = "local",
-) -> tuple[int, ...]:
-    """Flatten a validated manifest into the legacy Mooncake page-vector order."""
-    validate_cache_manifest(manifest, layout=layout, peer=peer)
-    return tuple(page_id for group in manifest.groups for page_id in group.page_ids)
 
 
 def build_cache_page_manifest(
@@ -886,8 +861,6 @@ __all__ = [
     "build_cache_transfer_schema",
     "build_cache_transfer_contract",
     "build_pool_cache_transfer_contract",
-    "cache_manifest_page_ids",
     "validate_cache_manifest",
-    "validate_cache_manifest_pair",
     "validate_cache_peer_layout",
 ]

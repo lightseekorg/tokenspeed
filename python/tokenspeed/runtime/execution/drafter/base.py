@@ -43,6 +43,11 @@ class BaseDrafter:
     # KV-cache budget is profiled).
     shares_target_embed_head = False
 
+    # True only when ``run`` returns after every cache-writing draft pass has
+    # been enqueued on the caller's CUDA stream. CachePD uses that guarantee to
+    # publish one final readiness event for the complete speculative chain.
+    supports_pd_layerwise_finalization = False
+
     def __init__(
         self,
         spec_num_tokens: int,

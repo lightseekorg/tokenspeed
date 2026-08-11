@@ -19,23 +19,15 @@
 # SOFTWARE.
 
 
-import numpy as np
 import torch
 from tokenspeed_scheduler import PD, Forward
 
-from tokenspeed.runtime.execution.block_table import (
-    select_block_table,
-    unpadded_block_table_row,
-)
 from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo
 from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.pd.cache_protocol import build_cache_page_manifest
 from tokenspeed.runtime.pd.mooncake.decode import MooncakeKVManagerDecode
 from tokenspeed.runtime.pd.mooncake.receiver import MooncakeKVReceiver
-from tokenspeed.runtime.pd.utils import (
-    TransferBackend,
-    poll_and_all_reduce,
-)
+from tokenspeed.runtime.pd.utils import poll_and_all_reduce
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.dispatch import TypeBasedDispatcher
 
@@ -43,24 +35,19 @@ logger = get_colorful_logger(__name__)
 
 
 class DisaggDecodeExecutor:
-    def __init__(
-        self, backend: TransferBackend, args, kv_args, gloo_group, page_size: int
-    ):
-        self.transfer_backend = backend
-        self.bootstrap_port = args.bootstrap_port
-        self.page_size = page_size
+    def __init__(self, args, kv_args, gloo_group):
         self._dispatcher = TypeBasedDispatcher(
             [
-                (Forward.Batch, self._prefill),
+                (Forward.Batch, self._cache_prefill),
             ]
         )
-        self.uses_cache_contract = kv_args.cache_layout is not None
         self.cache_layout = kv_args.cache_layout
         self.receivers: dict[str, MooncakeKVReceiver] = {}
         self.kv_manager = MooncakeKVManagerDecode(args, kv_args)
         self.gloo_group = gloo_group
         self._local_states = {}
         self._request_pool_indices: dict[str, int] = {}
+        self._remote_cache_slots: dict[str, int] = {}
         self._remote_spec_candidate_ids: dict[str, tuple[int, list[int]]] = {}
 
     def _bootstrap(self, request_id, info):
@@ -75,9 +62,9 @@ class DisaggDecodeExecutor:
         num_extends = op.num_extends()
         if num_extends != len(op.request_ids):
             raise RuntimeError(
-                "Paged cache decode destination admission does not support mixed batches"
+                "CachePD Decode admission does not support mixed batches"
             )
-        for index, request_id in enumerate(op.request_ids):
+        for index, request_id in enumerate(op.request_ids[:num_extends]):
             receiver = self.receivers.get(request_id)
             if receiver is None:
                 continue
@@ -89,76 +76,20 @@ class DisaggDecodeExecutor:
                 prefix_len=prefix_len,
                 prompt_len=int(op.prefill_lengths[index]),
             )
-            page_ids = np.asarray(
-                tuple(
-                    page_id for group in manifest.groups for page_id in group.page_ids
-                ),
-                dtype=np.int64,
-            )
             pending.append(
                 (
                     request_id,
                     receiver,
                     op.request_pool_indices[index],
-                    prefix_len,
                     manifest,
-                    page_ids,
                 )
             )
 
-        # Validate every row before publishing any destination vector. A later
+        # Validate every row before publishing any destination manifest. A later
         # invalid row must not leave an earlier Prefill sender waiting forever.
-        for request_id, receiver, aux_index, prefix_len, manifest, page_ids in pending:
-            self._request_pool_indices[request_id] = aux_index
-            receiver.prefill(
-                page_ids,
-                aux_index,
-                prefix_len,
-                None,
-                page_manifest=manifest,
-            )
-
-    def _prefill(self, op):
-        if self.uses_cache_contract:
-            self._cache_prefill(op)
-            return
-        table = select_block_table(op)
-        page_rows = [
-            unpadded_block_table_row(table, row_index)
-            for row_index in range(len(table))
-        ]
-        logger.debug(
-            "[decode][_prefill] op: request_ids=%s page_rows=%s "
-            "request_pool_indices=%s extend_prefix_lens=%s",
-            list(op.request_ids),
-            page_rows,
-            list(op.request_pool_indices),
-            list(op.extend_prefix_lens),
-        )
-
-        for i, request_id in enumerate(op.request_ids):
-            if request_id not in self.receivers:
-                # Request failed and its receiver was cleaned up in generate_events;
-                # the scheduler may still dispatch its forward op one last time.
-                continue
-            extend_prefix_len = op.extend_prefix_lens[i]
-            # Exclude pages held only for reserved decode input token(s); P has
-            # source KV only through the logical end of the prompt.
-            prompt_end_page = (
-                op.prefill_lengths[i] + self.page_size - 1
-            ) // self.page_size
-            kv_indices = np.array(
-                page_rows[i][extend_prefix_len // self.page_size : prompt_end_page],
-                dtype=np.int64,
-            )
-            aux_index = op.request_pool_indices[i]
-            self._request_pool_indices[request_id] = aux_index
-            self.receivers[request_id].prefill(
-                kv_indices,
-                aux_index,
-                extend_prefix_len,
-                None,
-            )
+        for request_id, receiver, request_pool_index, manifest in pending:
+            self._request_pool_indices[request_id] = request_pool_index
+            receiver.prefill(page_manifest=manifest)
 
     def register(
         self,
@@ -212,18 +143,11 @@ class DisaggDecodeExecutor:
                 bootstrap_token, spec_candidate_ids = (
                     self.kv_manager.pop_prefill_metadata(bootstrap_room)
                 )
-                receiver = self.receivers[req_id]
-                if (
-                    spec_candidate_ids is not None
-                    and req_id in self._request_pool_indices
-                    and getattr(
-                        receiver,
-                        "supports_remote_spec_candidates",
-                        True,
-                    )
-                ):
+                request_pool_index = self._request_pool_indices[req_id]
+                self._remote_cache_slots[req_id] = request_pool_index
+                if spec_candidate_ids is not None:
                     self._remote_spec_candidate_ids[req_id] = (
-                        self._request_pool_indices[req_id],
+                        request_pool_index,
                         spec_candidate_ids,
                     )
                 logger.debug(
@@ -244,16 +168,11 @@ class DisaggDecodeExecutor:
         for req_id in to_remove:
             # Best-effort cleanup mirroring prefill side; request_id is stable
             # so without explicit pop these dicts would grow unbounded across
-            # failed requests. NOTE: _remote_spec_candidate_ids must NOT be
-            # popped here — its consumer pop_remote_spec_candidate_ids runs
-            # later inside event_loop._process_kv_transfer_events, after we return.
-            # That dict is small (one tuple per Success request, between
-            # generate_events emitting RemotePrefillDoneEvent and event_loop
-            # consuming it) and is naturally drained by the pop path; an
-            # eager pop here drops the spec candidates on the floor and the
-            # next decode forward reads uninitialized future_input_map tail,
-            # causing CUDA illegal memory access on embedding lookup.
-            self.receivers.pop(req_id, None)
+            # failed requests. The remote-cache/spec handoff dictionaries must
+            # stay alive until event_loop consumes the event after this returns.
+            receiver = self.receivers.pop(req_id, None)
+            if receiver is not None:
+                receiver.clear()
             self._request_pool_indices.pop(req_id, None)
             self._local_states.pop(req_id, None)
 
@@ -261,6 +180,9 @@ class DisaggDecodeExecutor:
 
     def pop_remote_spec_candidate_ids(self, request_id: str):
         return self._remote_spec_candidate_ids.pop(request_id, None)
+
+    def pop_remote_cache_slot(self, request_id: str) -> int | None:
+        return self._remote_cache_slots.pop(request_id, None)
 
     def reset_valid_cache_length(
         self, forward_op, runtime_states, execution_stream, device

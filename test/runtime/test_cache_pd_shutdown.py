@@ -131,16 +131,12 @@ def test_event_loop_finishes_current_iteration_then_observes_shutdown() -> None:
     ]
 
 
-@pytest.mark.parametrize("pd_cache_enabled", [False, True])
-def test_abort_uses_the_same_output_marker_for_every_layout(
-    pd_cache_enabled: bool,
-) -> None:
+def test_abort_uses_the_output_marker() -> None:
     calls = []
     output = SimpleNamespace(
         mark_abort=lambda request_id, **kwargs: calls.append((request_id, kwargs))
     )
     loop = SimpleNamespace(
-        _pd_cache_enabled=pd_cache_enabled,
         output_processor=output,
     )
 

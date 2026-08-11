@@ -146,9 +146,8 @@ class MHATokenToKVPool(CachePool):
         ) or len({buffer.data_ptr() for buffer in self.v_buffer}) < len(self.v_buffer)
         if aliased and self._pd_disaggregation_enabled:
             raise RuntimeError(
-                "aliased MHA cache layout is incompatible with PD "
-                "disaggregation: per-layer registrations would transfer the "
-                "same bytes more than once. Set disaggregation_mode='null'."
+                "aliased/sliding MHA CachePD support is deferred to a "
+                "model-support follow-up. Set disaggregation_mode='null'."
             )
         logger.info(
             "KV layout: one buffer with %d per-layer K/V views",
@@ -171,40 +170,6 @@ class MHATokenToKVPool(CachePool):
         k_size_bytes = sum(t.nbytes for t in k_caches.values())
         v_size_bytes = sum(t.nbytes for t in v_caches.values())
         return k_size_bytes, v_size_bytes
-
-    # for disagg
-    def get_contiguous_buf_infos(self):
-        # layer_num x [seq_len, head_num, head_dim]
-        # layer_num x [page_num, page_size, head_num, head_dim]
-        kv_data_ptrs = [
-            self._get_key_buffer(i).data_ptr() for i in range(self.layer_num)
-        ] + [self._get_value_buffer(i).data_ptr() for i in range(self.layer_num)]
-        kv_data_lens = [
-            self._get_key_buffer(i).nbytes for i in range(self.layer_num)
-        ] + [self._get_value_buffer(i).nbytes for i in range(self.layer_num)]
-        kv_item_lens = [
-            self._get_key_buffer(i)[0].nbytes * self.page_size
-            for i in range(self.layer_num)
-        ] + [
-            self._get_value_buffer(i)[0].nbytes * self.page_size
-            for i in range(self.layer_num)
-        ]
-        return kv_data_ptrs, kv_data_lens, kv_item_lens
-
-    def get_contiguous_buf_unit_lens(self):
-        key_units = [
-            self._get_key_buffer(i)[0, 0].nbytes for i in range(self.layer_num)
-        ]
-        value_units = [
-            self._get_value_buffer(i)[0, 0].nbytes for i in range(self.layer_num)
-        ]
-        return key_units + value_units
-
-    def get_layerwise_buf_info_offsets(self, start_idx=0):
-        return [
-            [start_idx + i * self.layer_num + layer_id for i in range(2)]
-            for layer_id in range(self.layer_num)
-        ]
 
     def _layer_row_view(self, buf: torch.Tensor, layer_id: int) -> torch.Tensor:
         """Per-layer token-row view over one byte-uniform cache field.

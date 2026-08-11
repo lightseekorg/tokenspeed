@@ -374,21 +374,30 @@ class EventLoop:
             and attn_tp_rank == 0
         )
 
-        # Adjunct enabled only when pool opts in AND prefix-caching switch is on.
-        self._pd_cache_enabled = bool(
-            server_args.disaggregation_mode in ("prefill", "decode")
-            and getattr(token_to_kv_pool, "supports_disaggregation", False) is True
+        self._pd_cache_enabled = server_args.disaggregation_mode in (
+            "prefill",
+            "decode",
         )
         if self._pd_cache_enabled:
+            if not token_to_kv_pool.supports_disaggregation:
+                raise RuntimeError(
+                    "PD disaggregation requires a unified cache contract"
+                )
             unsupported = []
-            if self.has_dp:
-                unsupported.append("data-parallel attention")
             if server_args.enable_mixed_batch:
                 unsupported.append("mixed prefill/decode batches")
-            if server_args.speculative_algorithm is not None:
-                unsupported.append("speculative/MTP decoding")
-            if server_args.enable_mla_l1_5_cache:
-                unsupported.append("MLA L1.5 cache transfer")
+            if (
+                server_args.speculative_algorithm is not None
+                and server_args.disaggregation_layerwise_interval > 0
+                and not getattr(
+                    self.model_executor.drafter,
+                    "supports_pd_layerwise_finalization",
+                    False,
+                )
+            ):
+                unsupported.append(
+                    f"{server_args.speculative_algorithm} layerwise transfer"
+                )
             if server_args.enable_memory_saver:
                 unsupported.append("memory saver/release")
             # Prefill is forced onto the non-overlap loop by
@@ -559,7 +568,6 @@ class EventLoop:
                 global_rank,
                 server_args.disaggregation_ib_device,
                 token_to_kv_pool,
-                draft_token_to_kv_pool,
                 model_config=self.model_config,
                 draft_model_config=draft_model_config,
             )
@@ -569,9 +577,6 @@ class EventLoop:
                 world_size=server_args.world_size or mapping.world_size,
                 dp_size=server_args.data_parallel_size or mapping.attn.dp_size,
                 attn_tp_rank=attn_tp_rank,
-                attn_dp_rank=dp_rank,
-                is_mla_backend=False,
-                draft_is_mla_backend=False,
                 enable_metrics=False,
                 served_model_name=server_args.served_model_name,
                 app_key=server_args.app_key,
@@ -584,7 +589,6 @@ class EventLoop:
                 args=pd_manager_args,
                 kv_args=kv_args,
                 gloo_group=self.attn_tp_cpu_group,
-                page_size=token_to_kv_pool.page_size,
             )
             self._setup_pd_layerwise_transfer(
                 server_args.disaggregation_layerwise_interval
@@ -627,10 +631,11 @@ class EventLoop:
 
         from tokenspeed.runtime.pd.utils import StepCounter
 
+        draft_attn_backend = self.model_executor.draft_attn_backend
         step_counter = StepCounter(self.model_executor.device, self.gpu_id)
         self.model_executor.attn_backend.register_step_counter(step_counter)
-        if self.model_executor.draft_attn_backend is not None:
-            self.model_executor.draft_attn_backend.register_step_counter(step_counter)
+        if draft_attn_backend is not None:
+            self.model_executor.register_draft_final_step_counter(step_counter)
         self.kv_transfer.register_layerwise_step_counter(step_counter, interval)
 
     def _is_epd_request(self, state) -> bool:
@@ -908,6 +913,9 @@ class EventLoop:
             # Decode node
             if forward_op.num_extends() > 0 and not forward_op.is_local_prefill():
                 # Path 2: new requests waiting for remote KV — trigger RDMA receive
+                self.model_executor.prepare_remote_cache_slots(
+                    list(forward_op.request_pool_indices[: forward_op.num_extends()])
+                )
                 self.kv_transfer.reset_valid_cache_length(
                     forward_op,
                     self.model_executor.runtime_states,
@@ -1374,6 +1382,7 @@ class EventLoop:
                         self.output_processor.finish_remote_prefill_only_request(req_id)
                     )
                 if isinstance(self.kv_transfer, DisaggDecodeExecutor):
+                    remote_cache_slot = self.kv_transfer.pop_remote_cache_slot(req_id)
                     candidate_info = self.kv_transfer.pop_remote_spec_candidate_ids(
                         req_id
                     )
@@ -1382,13 +1391,21 @@ class EventLoop:
                         self.model_executor.write_remote_spec_candidate_ids(
                             req_pool_idx, candidate_ids
                         )
+                    remaining_state = self.output_processor.rid_to_state.get(req_id)
+                    if (
+                        remote_cache_slot is not None
+                        and remaining_state is not None
+                        and not remaining_state.to_abort
+                        and not remaining_state.finished
+                    ):
+                        self.model_executor.mark_remote_cache_ready(remote_cache_slot)
             elif isinstance(event, PD.FailedEvent):
                 # A PD/EPD transfer failed: the decode KV receiver timed out (e.g. the
                 # prefill aborted on embedding timeout so the KV never arrives), or a
-                # transfer errored. Publish the client-visible failure here. Legacy
-                # PD still needs a following Forward.Abort because its C++ FailedEvent
-                # handler is a no-op; Paged cache FailedEvent atomically terminalizes and
-                # fences the leased scheduler resources itself.
+                # transfer errored. Publish the client-visible failure here. An
+                # encode-only EPD flow still needs a following Forward.Abort because
+                # its C++ FailedEvent handler is a no-op; CachePD FailedEvent
+                # atomically terminalizes and fences the leased scheduler resources.
                 req_id = event.request_id
                 state = self.output_processor.rid_to_state.get(req_id)
                 if state is not None:

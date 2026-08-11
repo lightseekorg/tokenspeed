@@ -52,6 +52,7 @@ from tokenspeed.runtime.pd.cache_protocol import (  # noqa: E402
     build_cache_layerwise_page_selection,
 )
 from tokenspeed.runtime.pd.mooncake.entities import (  # noqa: E402
+    TransferInfo,
     TransferKVChunk,
 )
 from tokenspeed.runtime.pd.transfer_plan import (  # noqa: E402
@@ -187,7 +188,6 @@ def test_prepare_cache_prefill_preflights_batch_and_reserves_once() -> None:
     destination = SimpleNamespace(
         is_dummy=False,
         page_manifest=destination_manifest,
-        peer_cache_layout=layout,
     )
     calls = []
 
@@ -409,9 +409,7 @@ def test_heterogeneous_zero_edge_interval_does_not_fall_back_to_identity() -> No
     manager = object.__new__(MooncakeKVManagerPrefill)
     manager.kv_args = SimpleNamespace(
         cache_layout=source_layout,
-        kv_data_ptrs=[0x10000],
-        kv_data_lens=[source_layout.plan.arena_bytes],
-        kv_item_lens=[source_layout.plan.lcm_block_bytes],
+        kv_data_ptr=0x10000,
     )
     manager.attn_tp_rank = 1
 
@@ -424,9 +422,7 @@ def test_heterogeneous_zero_edge_interval_does_not_fall_back_to_identity() -> No
     def blocks(begin, end):
         return list(
             manager._cache_transfer_blocks(
-                dst_ptrs=[0x20000],
-                src_indices=np.asarray((1, 2), dtype=np.int64),
-                dst_indices=np.asarray((3, 4), dtype=np.int64),
+                dst_ptr=0x20000,
                 src_manifest=None,
                 dst_manifest=destination_manifest,
                 transfer_fragments=rank_one_fragments,
@@ -446,14 +442,10 @@ def _layerwise_fanout_context():
     layout = _ordinary_layerwise_layout()
     manifest = make_manifest(("history", (3,)))
     requests = tuple(
-        SimpleNamespace(
+        TransferInfo(
             room=9,
             mooncake_session_id=f"session-{rank}",
             page_manifest=manifest,
-            peer_cache_layout=layout,
-            transfer_fragments=(),
-            endpoint=f"decode-{rank}",
-            dst_port=9000 + rank,
         )
         for rank in range(2)
     )
@@ -465,13 +457,13 @@ def _layerwise_fanout_context():
     manager.producer_step_count = manager.producer_schedule.step_count
     manager.session_lock = nullcontext()
     manager._is_session_failed = lambda _session: False
-    manager.resolve_transfer_indices = lambda _chunk, _request: SimpleNamespace(
-        src_indices=np.asarray([2], dtype=np.int64),
-        dst_indices=np.asarray([3], dtype=np.int64),
-    )
     manager.decode_kv_args_table = {
         request.mooncake_session_id: SimpleNamespace(
-            dst_kv_ptrs=[0x20000 + rank * 0x1000],
+            dst_kv_ptr=0x20000 + rank * 0x1000,
+            endpoint=f"decode-{rank}",
+            dst_port=9000 + rank,
+            peer_cache_layout=layout,
+            transfer_fragments=(),
         )
         for rank, request in enumerate(requests)
     }
@@ -485,11 +477,7 @@ def test_layerwise_fanout_is_layer_major_and_completes_once() -> None:
     manager, requests = _layerwise_fanout_context()
     chunk = TransferKVChunk(
         room=9,
-        prefill_kv_indices=np.asarray([2], dtype=np.int64),
-        index_slice=slice(0, 1),
         is_last=True,
-        prefill_aux_index=None,
-        mla_l1_5_args=None,
         bootstrap_token=42,
         begin_cache_step=100,
         layerwise_interval=2,
@@ -504,7 +492,7 @@ def test_layerwise_fanout_is_layer_major_and_completes_once() -> None:
     )
 
     def cache_transfer_blocks(**kwargs):
-        destination = kwargs["dst_ptrs"][0]
+        destination = kwargs["dst_ptr"]
         field_ids = kwargs["field_ids"]
         events.append(("prepare", destination, field_ids))
         yield (len(field_ids), destination, len(field_ids))
@@ -568,11 +556,7 @@ def test_layerwise_fanout_failure_aborts_before_later_intervals() -> None:
     manager, requests = _layerwise_fanout_context()
     chunk = TransferKVChunk(
         room=9,
-        prefill_kv_indices=np.asarray([2], dtype=np.int64),
-        index_slice=slice(0, 1),
         is_last=True,
-        prefill_aux_index=None,
-        mla_l1_5_args=None,
         begin_cache_step=100,
         layerwise_interval=2,
         cache_page_selection=_single_history_selection(),
@@ -602,3 +586,62 @@ def test_layerwise_fanout_failure_aborts_before_later_intervals() -> None:
     ]
     assert not any(event == ("wait", 103) for event in events)
     assert len(aborts) == 1
+
+
+def test_dsa_sparse_prefill_publishes_one_cache_step_after_cache_use(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import torch
+
+    from tokenspeed.runtime.layers.attention.backends import dsa as dsa_backend
+
+    events = []
+    backend = object.__new__(dsa_backend.DSABackend)
+    backend.index_topk = 2
+    backend.data_type = torch.bfloat16
+    backend.qk_nope_head_dim = 1
+    backend.kv_lora_rank = 1
+    backend.qk_rope_head_dim = 0
+    backend.page_size = 64
+    backend.step_counter = SimpleNamespace(record_cache=lambda: events.append("ready"))
+
+    monkeypatch.setattr(
+        dsa_backend,
+        "workspace_topk_to_global_slots",
+        lambda **_kwargs: torch.zeros((1, 2), dtype=torch.int64),
+    )
+
+    def fake_dsa_prefill(**_kwargs):
+        events.append("attention")
+        return torch.ones((1, 1, 1), dtype=torch.bfloat16)
+
+    monkeypatch.setattr(dsa_backend, "dsa_prefill", fake_dsa_prefill)
+    output = backend.forward_sparse_prefill(
+        q=torch.zeros((1, 1), dtype=torch.bfloat16),
+        layer=SimpleNamespace(
+            logit_cap=0,
+            tp_q_head_num=1,
+            v_head_dim=1,
+            head_dim=1,
+            layer_id=0,
+            k_scale_float=None,
+            scaling=1.0,
+        ),
+        token_to_kv_pool=SimpleNamespace(
+            quant_method=None,
+            get_key_buffer=lambda _layer_id: torch.zeros(1),
+        ),
+        block_tables=torch.zeros((1, 1), dtype=torch.int32),
+        seq_lens=torch.ones(1, dtype=torch.int32),
+        workspace_indices=torch.zeros((1, 2), dtype=torch.int64),
+        topk_lens=torch.ones(1, dtype=torch.int32),
+        kv_workspace_slots=torch.zeros(1, dtype=torch.int64),
+        max_seq_len=1,
+    )
+
+    assert output.shape == (1, 1)
+    assert events == ["attention", "ready"]
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

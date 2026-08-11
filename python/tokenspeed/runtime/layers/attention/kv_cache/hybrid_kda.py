@@ -168,9 +168,3 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
     def get_kv_size_bytes(self):
         assert self.buffer is not None
         return self.buffer.nbytes
-
-    def get_contiguous_buf_infos(self):
-        raise RuntimeError("KDA transfer uses get_pd_cache_contract()")
-
-    def get_layerwise_buf_info_offsets(self, start_idx=0):
-        raise RuntimeError("KDA transfer uses get_pd_cache_contract()")

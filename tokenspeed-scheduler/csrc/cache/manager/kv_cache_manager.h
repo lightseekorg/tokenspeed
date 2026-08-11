@@ -204,8 +204,6 @@ public:
         _assert(table.available_tokens_ == 0, "sparse suffix materialization requires a page boundary");
         _assert(table.blocks_.size() <= static_cast<std::size_t>(demand.materialized_suffix_start),
                 "sparse suffix overlaps the existing block table");
-        _assert(std::ranges::all_of(table.blocks_, [](const CacheBlockRef& block_ref) { return !block_ref; }),
-                "sparse suffix prefix must contain only null holes");
         _assert(demand.num_tokens > 0 && demand.reserve_tokens >= 0,
                 "sparse suffix materialization requires a positive extent");
         const std::int64_t extent = static_cast<std::int64_t>(demand.num_tokens) + demand.reserve_tokens;

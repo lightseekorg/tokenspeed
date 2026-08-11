@@ -173,9 +173,6 @@ class HybridMHATokenToKVPool(MHATokenToKVPool):
         assert self.buffer is not None
         self.buffer.zero_()
 
-    def get_contiguous_buf_infos(self):
-        raise RuntimeError("state MHA transfer uses get_pd_cache_contract()")
-
 
 class HybridMHATokenToKVPoolMXFP8(
     HybridMHATokenToKVPool,

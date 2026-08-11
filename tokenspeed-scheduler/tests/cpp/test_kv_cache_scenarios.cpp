@@ -1539,6 +1539,38 @@ TEST_F(RetractExactFitSuite, IncludesOverlapDecodeReserveInTokenCapacity) {
     EXPECT_EQ(scheduler.MaxSingleRequestTokens(), 7);
 }
 
+TEST(PdSlidingCapacityTest, CountsPrefixIslandPhasePageAndGroupPacking) {
+    SchedulerConfig cfg{};
+    cfg.block_size = 4;
+    cfg.device_allocator.total_pages = 3;  // null + two usable LCM parents
+    cfg.host_allocator.total_pages = 0;
+    cfg.max_scheduled_tokens = 16;
+    cfg.max_batch_size = 1;
+    cfg.decode_input_tokens = 1;
+    cfg.role = Role::kD;
+    cfg.enable_pd_cache = true;
+    cfg.disable_l2_cache = true;
+
+    PagedCacheGroupConfig sliding;
+    sliding.group_id = "sliding";
+    sliding.rows_per_page = 2;  // group q=2 while scheduler P=4
+    sliding.entry_stride_tokens = 1;
+    sliding.total_pages = 5;  // null + two parents packing two children each
+    sliding.cache_blocks_per_lcm_block = 2;
+    sliding.retention = PagedCacheGroupConfig::Retention::SlidingWindow;
+    sliding.sliding_window_tokens = 4;
+    sliding.family = PagedCacheGroupFamily::State;
+    sliding.transfer_policy = PagedCacheTransferPolicy::FullSuffix;
+    cfg.paged_cache_groups = {sliding};
+
+    Scheduler scheduler{std::move(cfg)};
+
+    // W=4, q=2 and a one-token decode reserve can require two cached
+    // lookback pages plus a three-page phase-shifted remote tail. The dense
+    // cap makes eight the exact maximum with four available child pages.
+    EXPECT_EQ(scheduler.MaxSingleRequestTokens(), 8);
+}
+
 TEST_F(RetractExactFitSuite, ReserveRefundBalances) {
     ASSERT_EQ(scheduler_->PoolFreeBlocks(), 8);
     Submit(MakeRequestSpec("a", /*num_pages=*/3));  // charge 2*ceil(7/2) = 8: exact fit
