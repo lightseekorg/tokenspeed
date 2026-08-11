@@ -95,36 +95,6 @@ class CommBackend(ABC):
 
         return AllReducePlan(outputs, run)
 
-    def all_reduce_residual_attnres(
-        self,
-        partial: torch.Tensor,
-        residual: torch.Tensor,
-        score_weight: torch.Tensor,
-        output_weight: torch.Tensor,
-        scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-        eps: float,
-        group: Group,
-        op=None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Reduce attention output, accumulate residual, and finish AttnRes.
-
-        Backends without a fused collective preserve the model's BF16
-        boundaries through the existing operations.
-        """
-        from tokenspeed_kernel.ops.activation.triton import attnres_combine
-
-        reduced = self.all_reduce(partial, group, op=op)
-        residual_out = residual + reduced
-        hidden = attnres_combine(
-            residual_out,
-            score_weight,
-            output_weight,
-            eps,
-            scratch,
-            torch.empty_like(residual_out),
-        )
-        return hidden, residual_out
-
     @abstractmethod
     def all_gather(
         self, tensor: torch.Tensor, group: Group, dim: int = 0

@@ -153,13 +153,6 @@ if platform.is_amd:
             and int(w.w13_weight.shape[2]) * 2 == x.shape[1]
         )
         output = getattr(w, "_situ_output_buffer", None)
-        if output is not None and (
-            output.shape != x.shape
-            or output.dtype != x.dtype
-            or output.device != x.device
-            or not output.is_contiguous()
-        ):
-            output = None
         if use_route_direct_decode:
             from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_decode import (
                 gluon_a16w4_situ_warp_decode_ep_gfx950,

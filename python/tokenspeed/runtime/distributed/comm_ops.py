@@ -26,7 +26,6 @@ Groups are looked up from pg_manager internally via comm_backend.
 
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import overload
 
 import torch
 import torch.distributed
@@ -127,24 +126,6 @@ class FusionParams:
 # ---------------------------------------------------------------------------
 
 
-@overload
-def all_reduce(
-    tensor: torch.Tensor,
-    group: Group,
-    backend: CommBackend | None = None,
-    op: torch.distributed.ReduceOp = torch.distributed.ReduceOp.SUM,
-) -> torch.Tensor: ...
-
-
-@overload
-def all_reduce(
-    tensor: tuple[torch.Tensor, ...],
-    group: Group,
-    backend: CommBackend | None = None,
-    op: torch.distributed.ReduceOp = torch.distributed.ReduceOp.SUM,
-) -> tuple[torch.Tensor, ...]: ...
-
-
 def all_reduce(
     tensor: torch.Tensor | tuple[torch.Tensor, ...],
     group: Group,
@@ -228,47 +209,6 @@ def plan_all_reduce(
     if backend is None:
         backend = get_global_backend()
     return backend.plan_all_reduce(shapes, like, group, op=op)
-
-
-def all_reduce_residual_attnres(
-    partial: torch.Tensor,
-    residual: torch.Tensor,
-    score_weight: torch.Tensor,
-    output_weight: torch.Tensor,
-    scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-    eps: float,
-    group: Group,
-    backend: CommBackend | None = None,
-    op: torch.distributed.ReduceOp = torch.distributed.ReduceOp.SUM,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reduce K3 attention output and finish its residual AttnRes mix.
-
-    Args:
-        partial: Per-rank attention output.
-        residual: Residual prefix accumulated after the reduction.
-        score_weight: Precomputed AttnRes scoring weight.
-        output_weight: RMSNorm weight applied to the mixed hidden row.
-        scratch: Block-side split AttnRes partial ``(m, s, acc)``.
-        eps: Shared AttnRes/RMSNorm epsilon.
-        group: Global ranks participating in the reduction.
-        backend: Optional communication backend override.
-        op: Reduction operation.
-
-    Returns:
-        The normalized mixed hidden row and new residual prefix.
-    """
-    if backend is None:
-        backend = get_global_backend()
-    return backend.all_reduce_residual_attnres(
-        partial,
-        residual,
-        score_weight,
-        output_weight,
-        scratch,
-        eps,
-        group,
-        op=op,
-    )
 
 
 def all_gather(
