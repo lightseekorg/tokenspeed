@@ -25,6 +25,7 @@ import numpy as np
 import numpy.typing as npt
 
 from tokenspeed.runtime.pd.cache_protocol import (
+    CachePDLayerwisePageSelection,
     CachePDPageManifest,
     CacheProducerSchedule,
     CacheTransferContract,
@@ -113,6 +114,9 @@ class TransferKVChunk:
     wait_for_bootstrap_token: bool = False
     spec_candidate_ids: list[int] | None = None
     page_manifest: CachePDPageManifest | None = None
+    # Process-local group-aware page window for CachePD layerwise transfer.
+    # Decode continues to publish one immutable full request manifest.
+    cache_page_selection: CachePDLayerwisePageSelection | None = None
 
 
 @dataclasses.dataclass

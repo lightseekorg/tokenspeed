@@ -581,13 +581,33 @@ def test_hybrid_draft_only_sliding_group_packs_by_ratio() -> None:
         _,
         num_draft_layers,
     ) = merge_continuation_layers(
-        fields=(CacheFieldSpec("full_attention", "layer.0.kv", "slot.0", (256,), 1),),
+        fields=(
+            CacheFieldSpec(
+                "full_attention",
+                "layer.0.kv",
+                "slot.0",
+                (256,),
+                1,
+            ),
+        ),
         layer_types=("full_attention",),
         group_ids=("full_attention",),
         draft_fields=(
-            CacheFieldSpec("full_attention", "layer.0.kv", "slot.0", (256,), 1),
+            CacheFieldSpec(
+                "full_attention",
+                "layer.0.kv",
+                "slot.0",
+                (256,),
+                1,
+            ),
             # Draft-only sliding-window layers: not present in the target plan.
-            CacheFieldSpec("draft_swa", "layer.1.kv", "slot.1", (256,), 1),
+            CacheFieldSpec(
+                "draft_swa",
+                "layer.1.kv",
+                "slot.1",
+                (256,),
+                1,
+            ),
         ),
         draft_layer_types=("full_attention", "sliding_attention"),
         draft_group_ids=("full_attention", "draft_swa"),

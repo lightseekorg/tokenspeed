@@ -26,7 +26,7 @@ import threading
 import time
 from collections import defaultdict
 from collections.abc import Iterator
-from itertools import islice
+from itertools import chain, islice
 
 import numpy as np
 import numpy.typing as npt
@@ -34,7 +34,9 @@ import requests
 
 from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.pd.cache_protocol import (
+    CachePDLayerwisePageSelection,
     CachePDPageManifest,
+    CacheProducerSchedule,
     CacheTransferContract,
     validate_cache_manifest_pair,
     validate_cache_peer_layout,
@@ -76,6 +78,24 @@ logger = get_colorful_logger(__name__)
 # Application-side descriptor batching keeps heterogeneous-TP row fragments
 # bounded in Python memory. This is not a Mooncake backend limit.
 _TRANSFER_DESCRIPTOR_BATCH_SIZE = 4096
+
+
+def _layerwise_page_ids(
+    selection: CachePDLayerwisePageSelection,
+    destination_manifest: CachePDPageManifest,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Flatten one validated process-local selection into Mooncake vectors."""
+    source = []
+    destination = []
+    for selected, destination_group in zip(
+        selection.groups, destination_manifest.groups, strict=True
+    ):
+        source.extend(selected.source_page_ids)
+        destination.extend(
+            destination_group.page_ids[position]
+            for position in selected.destination_positions
+        )
+    return tuple(source), tuple(destination)
 
 
 def _validate_cache_fragment_geometry(
@@ -188,8 +208,19 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         )
         self.state_layer_ids = list(getattr(self.kv_args, "state_layer_ids", []) or [])
         layer_ids = self.kv_layer_ids + self.state_layer_ids
+        self.producer_schedule: CacheProducerSchedule | None = (
+            self.kv_args.cache_producer_schedule
+        )
         self.layer_num = (
-            (max(layer_ids) + 1) if layer_ids else len(self.kv_args.offsets)
+            self.producer_schedule.step_count
+            if self.kv_args.cache_layout is not None
+            and self.producer_schedule is not None
+            else (max(layer_ids) + 1) if layer_ids else len(self.kv_args.offsets)
+        )
+        self.producer_step_count = (
+            self.producer_schedule.step_count
+            if self.producer_schedule is not None
+            else self.layer_num
         )
         self._kv_layer_to_index = {
             layer_id: i
@@ -241,6 +272,15 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
     def register_layerwise_step_counter(
         self, step_counter: StepCounter, interval: int
     ) -> None:
+        if self.kv_args.cache_layout is not None:
+            producer_schedule = self.kv_args.cache_producer_schedule
+            if producer_schedule is None:
+                raise ValueError(
+                    "layerwise cache transfer requires a producer schedule"
+                )
+            self.producer_schedule = producer_schedule
+            self.layer_num = producer_schedule.step_count
+            self.producer_step_count = producer_schedule.step_count
         self.step_counter = step_counter
         self.layerwise_interval = max(int(interval), 1)
 
@@ -249,7 +289,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             return 0
         cache_step, _ = self.step_counter.current_step()
         self.step_counter.advance_step(
-            delta_cache_step=self.layer_num,
+            delta_cache_step=self.producer_step_count,
             delta_aux_step=0,
         )
         return cache_step
@@ -368,6 +408,15 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         req: TransferInfo,
     ) -> TransferIndexResolution:
         self._validate_cache_transfer(kv_chunk, req)
+        if kv_chunk.cache_page_selection is not None:
+            src_pages, dst_pages = _layerwise_page_ids(
+                kv_chunk.cache_page_selection,
+                req.page_manifest,
+            )
+            return TransferIndexResolution(
+                src_indices=np.asarray(src_pages, dtype=np.int64),
+                dst_indices=np.asarray(dst_pages, dtype=np.int64),
+            )
         src_indices = kv_chunk.prefill_kv_indices
         dst_indices = req.dst_kv_indices[kv_chunk.index_slice]
 
@@ -399,6 +448,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             value is not None
             for value in (
                 kv_chunk.page_manifest,
+                kv_chunk.cache_page_selection,
                 req.page_manifest,
                 req.peer_cache_layout,
             )
@@ -410,11 +460,8 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 )
             return
 
-        if (
-            kv_chunk.page_manifest is None
-            or req.page_manifest is None
-            or req.peer_cache_layout is None
-        ):
+        selection = kv_chunk.cache_page_selection
+        if req.page_manifest is None or req.peer_cache_layout is None:
             raise ValueError(
                 "Paged cache transfer is missing layout or manifest metadata"
             )
@@ -425,21 +472,32 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             raise ValueError(
                 "Paged cache raw-slab transfer received legacy TP fragments"
             )
-        if not kv_chunk.is_last:
-            raise ValueError(
-                "Paged cache transfer must be submitted as one final chunk"
-            )
-        if kv_chunk.index_slice.start not in (
-            None,
-            0,
-        ) or kv_chunk.index_slice.step not in (
-            None,
-            1,
-        ):
-            raise ValueError(
-                "Paged cache transfer page vector must start at offset zero"
-            )
-
+        if selection is None:
+            if kv_chunk.page_manifest is None:
+                raise ValueError("Paged cache transfer is missing source manifest")
+            if not kv_chunk.is_last:
+                raise ValueError(
+                    "Paged cache full-manifest transfer must be one final chunk"
+                )
+            if kv_chunk.index_slice.start not in (
+                None,
+                0,
+            ) or kv_chunk.index_slice.step not in (
+                None,
+                1,
+            ):
+                raise ValueError(
+                    "Paged cache transfer page vector must start at offset zero"
+                )
+        else:
+            if kv_chunk.page_manifest is not None:
+                raise ValueError(
+                    "Paged cache layerwise transfer cannot carry a source manifest"
+                )
+            if kv_chunk.begin_cache_step is None:
+                raise ValueError(
+                    "Paged cache layerwise transfer is missing its producer step"
+                )
         local_tp_rank = self._validate_cache_route(req)
         local_segments = {
             (field.group_id, field.field_id): field for field in layout.plan.fields
@@ -491,6 +549,22 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             raise ValueError(
                 "Paged cache identity route has different rank-local field geometry"
             )
+        expected_full_dst = tuple(
+            page_id for group in req.page_manifest.groups for page_id in group.page_ids
+        )
+        if tuple(int(page) for page in req.dst_kv_indices) != expected_full_dst:
+            raise ValueError("Paged cache manifest and Mooncake page vector disagree")
+        if selection is not None:
+            expected_src, _ = _layerwise_page_ids(
+                selection,
+                req.page_manifest,
+            )
+            if tuple(int(page) for page in kv_chunk.prefill_kv_indices) != expected_src:
+                raise ValueError(
+                    "Paged cache layerwise selection and source page vector disagree"
+                )
+            return
+
         validate_cache_manifest_pair(
             kv_chunk.page_manifest,
             req.page_manifest,
@@ -667,10 +741,12 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         dst_ptrs: list[int],
         src_indices: npt.NDArray[np.int64],
         dst_indices: npt.NDArray[np.int64],
-        src_manifest: CachePDPageManifest,
+        src_manifest: CachePDPageManifest | None,
         dst_manifest: CachePDPageManifest,
         transfer_fragments: tuple[TransferPlanFragment, ...] = (),
         dst_cache_layout: CacheTransferContract | None = None,
+        page_selection: CachePDLayerwisePageSelection | None = None,
+        field_ids: frozenset[str] | None = None,
     ) -> Iterator[tuple[int, int, int]]:
         layout = self.kv_args.cache_layout
         if layout is None:
@@ -679,6 +755,12 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             raise ValueError(
                 "Paged cache transfer requires the complete destination layout"
             )
+        if (src_manifest is None) == (page_selection is None):
+            raise ValueError(
+                "Paged cache transfer requires exactly one source manifest or "
+                "layerwise page selection"
+            )
+
         cache_fragments = tuple(
             fragment
             for fragment in transfer_fragments
@@ -688,12 +770,14 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             raise ValueError("Paged cache transfer received legacy TP fragments")
 
         validate_cache_peer_layout(layout, dst_cache_layout)
-        validate_cache_manifest_pair(
-            src_manifest,
-            dst_manifest,
-            layout,
-            dst_cache_layout,
-        )
+        if page_selection is None:
+            assert src_manifest is not None
+            validate_cache_manifest_pair(
+                src_manifest,
+                dst_manifest,
+                layout,
+                dst_cache_layout,
+            )
         expected_arena_bytes = layout.plan.arena_bytes
         if (
             len(self.kv_args.kv_data_ptrs) != 1
@@ -781,7 +865,11 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                         f"Paged cache fragments overlap in {side} field {key!r}"
                     )
 
-        expected_page_count = sum(len(group.page_ids) for group in src_manifest.groups)
+        expected_page_count = (
+            sum(len(group.source_page_ids) for group in page_selection.groups)
+            if page_selection is not None
+            else sum(len(group.page_ids) for group in src_manifest.groups)
+        )
         if (
             len(src_indices) != expected_page_count
             or len(dst_indices) != expected_page_count
@@ -793,18 +881,32 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         # group is rejected.
         group_transfers = []
         page_offset = 0
+        source_groups = (
+            page_selection.groups if page_selection is not None else src_manifest.groups
+        )
         for group_spec, src_group, dst_group in zip(
-            layout.group_specs,
-            src_manifest.groups,
-            dst_manifest.groups,
-            strict=True,
+            layout.group_specs, source_groups, dst_manifest.groups, strict=True
         ):
-            page_count = len(src_group.page_ids)
+            source_page_ids = (
+                src_group.source_page_ids
+                if page_selection is not None
+                else src_group.page_ids
+            )
+            destination_page_ids = (
+                tuple(
+                    dst_group.page_ids[position]
+                    for position in src_group.destination_positions
+                )
+                if page_selection is not None
+                else dst_group.page_ids
+            )
+            page_count = len(source_page_ids)
             group_src_indices = src_indices[page_offset : page_offset + page_count]
             group_dst_indices = dst_indices[page_offset : page_offset + page_count]
             if (
-                tuple(int(page) for page in group_src_indices) != src_group.page_ids
-                or tuple(int(page) for page in group_dst_indices) != dst_group.page_ids
+                tuple(int(page) for page in group_src_indices) != source_page_ids
+                or tuple(int(page) for page in group_dst_indices)
+                != destination_page_ids
             ):
                 raise ValueError(
                     "Paged cache manifest and Mooncake page vector disagree"
@@ -826,6 +928,8 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                     key = (fragment.group_id, fragment.field_id)
                     src_segment = local_segments[key]
                     dst_segment = peer_segments[key]
+                    if field_ids is not None and src_segment.field_id not in field_ids:
+                        continue
                     for src_page, dst_page in zip(
                         group_src_indices, group_dst_indices, strict=True
                     ):
@@ -854,6 +958,8 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 continue
 
             for src_segment in layout.fields_for_group(group_spec.group_id):
+                if field_ids is not None and src_segment.field_id not in field_ids:
+                    continue
                 key = (group_spec.group_id, src_segment.field_id)
                 dst_segment = peer_segments[key]
                 if src_segment.payload_bytes != dst_segment.payload_bytes:
@@ -929,10 +1035,38 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                     transfer_blocks.append((src_addr, dst_addr, length))
         return transfer_blocks
 
-    def _wait_until_cache_step(self, target_step: int) -> None:
+    def _wait_until_cache_step(
+        self,
+        target_step: int,
+        *,
+        room: int | None = None,
+        session_ids: tuple[str, ...] = (),
+    ) -> None:
         if self.step_counter is None:
+            if room is not None:
+                raise ValueError(
+                    "Paged cache layerwise transfer has no producer step counter"
+                )
             return
+        next_session_check = time.monotonic()
         while True:
+            if room is not None and self.request_status.get(room) in (
+                None,
+                TransferPoll.Failed,
+            ):
+                raise ValueError(f"Paged cache layerwise wait aborted for room {room}")
+            now = time.monotonic()
+            if session_ids and now >= next_session_check:
+                with self.session_lock:
+                    failed = any(
+                        self._is_session_failed(session_id)
+                        for session_id in session_ids
+                    )
+                if failed:
+                    raise ValueError(
+                        f"Paged cache layerwise peer failed for room {room}"
+                    )
+                next_session_check = now + 0.1
             ready_step = self.step_counter.query_ready_cache_step()
             if StepCounter.is_step_ready(ready_step, target_step):
                 return
@@ -1004,7 +1138,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 return 0
 
         valid = (prefill_mamba_indices >= 0) & (dst_mamba_indices >= 0)
-        log_layerwise = getattr(self, "layerwise_debug", False)
+        log_layerwise = self.layerwise_debug
         if log_layerwise and begin_layer_id is not None and end_layer_id is not None:
             logger.info(
                 "[layerwise_transfer] session=%s layers=[%d,%d) "
@@ -1090,7 +1224,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         )
 
         interval = max(int(interval), 1)
-        log_layerwise = getattr(self, "layerwise_debug", False)
+        log_layerwise = self.layerwise_debug
         for begin_layer_id in range(0, self.layer_num, interval):
             end_layer_id = min(begin_layer_id + interval, self.layer_num)
             target_step = begin_cache_step + end_layer_id - 1
@@ -1155,6 +1289,135 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                     end_layer_id,
                 )
         return 0
+
+    @staticmethod
+    def _prime_transfer_blocks(
+        transfer_blocks: Iterator[tuple[int, int, int]],
+    ) -> Iterator[tuple[int, int, int]]:
+        """Run a lazy descriptor's complete preflight before the first DMA."""
+        iterator = iter(transfer_blocks)
+        try:
+            first = next(iterator)
+        except StopIteration:
+            return iter(())
+        return chain((first,), iterator)
+
+    def _send_cache_layerwise_fanout(
+        self,
+        kv_chunk: TransferKVChunk,
+        reqs: tuple[TransferInfo, ...],
+    ) -> bool:
+        """Wait one producer interval, then fan it out to every Decode peer."""
+        selection = kv_chunk.cache_page_selection
+
+        resolved_by_req = []
+        for req in reqs:
+            with self.session_lock:
+                session_failed = self._is_session_failed(req.mooncake_session_id)
+            if session_failed:
+                self.abort_room(
+                    kv_chunk.room,
+                    "Decode instance could be dead, remote Mooncake session "
+                    f"{req.mooncake_session_id} is not alive",
+                )
+                return False
+            registration = self.decode_kv_args_table.get(req.mooncake_session_id)
+            if registration is None:
+                raise ValueError(
+                    "Paged cache destination session has no registered buffers"
+                )
+            resolved_by_req.append(
+                (req, registration, self.resolve_transfer_indices(kv_chunk, req))
+            )
+
+        producer_schedule = self.producer_schedule
+        if producer_schedule is None:
+            raise ValueError("layerwise cache transfer requires a producer schedule")
+        producer_step_count = producer_schedule.step_count
+        interval = max(int(kv_chunk.layerwise_interval), 1)
+        for begin_step in range(0, producer_step_count, interval):
+            end_step = min(begin_step + interval, producer_step_count)
+            target_step = (
+                kv_chunk.begin_cache_step + end_step - 1
+            ) % StepCounter.COUNT_NUM_MAX
+            if self.layerwise_debug:
+                logger.info(
+                    "[cache_layerwise_transfer] room=%s producer_steps=[%d,%d) "
+                    "wait_cache_step=%d peers=%d",
+                    kv_chunk.room,
+                    begin_step,
+                    end_step,
+                    target_step,
+                    len(reqs),
+                )
+            self._wait_until_cache_step(
+                target_step,
+                room=kv_chunk.room,
+                session_ids=tuple(req.mooncake_session_id for req in reqs),
+            )
+
+            # Prime every peer's lazy generator before transferring to any
+            # peer. A later malformed layout cannot partially DMA this interval.
+            prepared = []
+            for req, registration, resolved in resolved_by_req:
+                assert req.page_manifest is not None
+                assert req.peer_cache_layout is not None
+                blocks = self._cache_transfer_blocks(
+                    dst_ptrs=registration.dst_kv_ptrs,
+                    src_indices=resolved.src_indices,
+                    dst_indices=resolved.dst_indices,
+                    src_manifest=None,
+                    dst_manifest=req.page_manifest,
+                    transfer_fragments=req.transfer_fragments,
+                    dst_cache_layout=req.peer_cache_layout,
+                    page_selection=selection,
+                    field_ids=producer_schedule.fields_in_range(begin_step, end_step),
+                )
+                prepared.append(
+                    (req, self._prime_transfer_blocks(blocks), time.monotonic())
+                )
+
+            for req, blocks, started_at in prepared:
+                ret = self._transfer_data(req.mooncake_session_id, blocks)
+                if self.kv_transfer_metrics:
+                    self.kv_transfer_metrics.observe_kv_transfer_latency(
+                        time.monotonic() - started_at
+                    )
+                if ret != 0:
+                    with self.session_lock:
+                        self.session_failures[req.mooncake_session_id] += 1
+                        self._mark_session_failed(
+                            req.mooncake_session_id, reason="send_cache_layerwise"
+                        )
+                    self.abort_room(
+                        kv_chunk.room,
+                        f"Failed to send Paged cache producer interval of "
+                        f"{kv_chunk.room} to {req.endpoint}:{req.dst_port}",
+                    )
+                    return False
+
+        if not kv_chunk.is_last:
+            return True
+
+        bootstrap_token, spec_candidate_ids = self._wait_prefill_metadata(
+            kv_chunk.room,
+            kv_chunk.bootstrap_token,
+            kv_chunk.spec_candidate_ids,
+        )
+        if self.check_status(kv_chunk.room) == TransferPoll.Failed:
+            return False
+        self.update_status(kv_chunk.room, TransferPoll.Success)
+        for req in reqs:
+            self.sync_status_to_decode_endpoint(
+                req.endpoint,
+                req.dst_port,
+                req.room,
+                TransferPoll.Success,
+                self.attn_tp_rank,
+                bootstrap_token=bootstrap_token,
+                spec_candidate_ids=spec_candidate_ids,
+            )
+        return True
 
     def sync_status_to_decode_endpoint(
         self,
@@ -1262,6 +1525,28 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                         kv_chunk.room,
                         "incomplete or inconsistent destination fanout metadata",
                     )
+                    continue
+                if kv_chunk.cache_page_selection is not None:
+                    try:
+                        self._send_cache_layerwise_fanout(
+                            kv_chunk, reqs_to_be_processed
+                        )
+                    except ValueError:
+                        raise
+                    except Exception as exc:
+                        logger.exception(
+                            "Paged cache layerwise transfer failed for room=%s",
+                            kv_chunk.room,
+                        )
+                        self.abort_room(
+                            kv_chunk.room,
+                            f"Paged cache layerwise transfer failed: {exc}",
+                        )
+                        continue
+                    if kv_chunk.room not in self.request_status or self.check_status(
+                        kv_chunk.room
+                    ) in (TransferPoll.Success, TransferPoll.Failed):
+                        self.transfer_infos.pop(kv_chunk.room, None)
                     continue
                 polls = []
                 dst_ranks_infos = []
@@ -1596,6 +1881,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         mamba_indices: npt.NDArray[np.int64] | None = None,
         spec_candidate_ids: list[int] | None = None,
         page_manifest: CachePDPageManifest | None = None,
+        cache_page_selection: CachePDLayerwisePageSelection | None = None,
     ):
         if self.disaggregation_mode != DisaggregationMode.PREFILL:
             raise RuntimeError("Transfer requests can only be added in prefill mode.")
@@ -1637,6 +1923,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 prefill_mamba_indices=mamba_indices,
                 spec_candidate_ids=spec_candidate_ids,
                 page_manifest=page_manifest,
+                cache_page_selection=cache_page_selection,
             )
         )
 

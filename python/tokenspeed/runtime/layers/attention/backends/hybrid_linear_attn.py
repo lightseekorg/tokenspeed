@@ -1847,9 +1847,11 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     def register_step_counter(self, step_counter):
         # Hybrid layerwise transfer needs one global step per model layer,
-        # including both full-attention and mamba layers. Record steps in this
-        # wrapper instead of in child backends to avoid double counting.
+        # including both full-attention and mamba layers. Normal attention
+        # dispatch records in this wrapper; model-owned chunked prefill bypasses
+        # that dispatch, so its full-attention child needs the same counter.
         self.step_counter = step_counter
+        self.full_attn_backend.register_step_counter(step_counter)
 
     def init_forward_metadata_capture_cuda_graph(self, *args, **kwargs):
         self.full_attn_backend.init_forward_metadata_capture_cuda_graph(*args, **kwargs)

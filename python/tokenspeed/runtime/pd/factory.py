@@ -176,6 +176,10 @@ def create_kv_transfer(
             raise NotImplementedError(
                 "Paged-cache PD currently supports only the Mooncake backend"
             )
+        if args.enable_mla_l1_5_cache:
+            raise NotImplementedError(
+                "Paged-cache PD does not support MLA L1.5 cache transfer"
+            )
     if mode == "prefill":
         return DisaggPrefillExecutor(backend, args, kv_args, gloo_group, page_size)
     elif mode == "decode":

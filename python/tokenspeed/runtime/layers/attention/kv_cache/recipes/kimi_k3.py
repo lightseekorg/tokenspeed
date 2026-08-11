@@ -238,6 +238,7 @@ def solve_kimi_k3_cache_layout(
     mla_cache_dtype: torch.dtype,
     mla_quant_method: str | None,
     draft_fields=None,
+    draft_layer_count: int = 0,
 ):
     """Solve Kimi-K3's capacity-independent P=128 LCM layout.
 
@@ -253,13 +254,27 @@ def solve_kimi_k3_cache_layout(
         mla_quant_method=mla_quant_method,
     )
     layer_group_ids = kimi_k3_layer_group_ids(text_config)
+    if (
+        isinstance(draft_layer_count, bool)
+        or not isinstance(draft_layer_count, int)
+        or draft_layer_count < 0
+    ):
+        raise ValueError("draft_layer_count must be a non-negative integer")
     num_draft_layers = 0
     if draft_fields is not None:
+        draft_fields = tuple(draft_fields)
+        if not draft_fields:
+            raise ValueError("draft_fields must not be empty")
+        if draft_layer_count < 1:
+            raise ValueError("draft_fields require a positive draft_layer_count")
+        num_draft_layers = draft_layer_count
         continued = continue_layer_fields(
-            draft_fields, first_layer_id=len(layer_group_ids)
+            draft_fields,
+            first_layer_id=len(layer_group_ids),
         )
-        num_draft_layers = len(continued)
         fields += continued
+    elif draft_layer_count:
+        raise ValueError("draft_layer_count requires draft_fields")
     mla_plane_bytes = _KIMI_K3_MLA_PACKING * next(
         field.payload_bytes for field in fields if field.group_id == FULL_ATTENTION
     )
@@ -439,6 +454,7 @@ def prepare_kimi_k3_cache(
         mla_cache_dtype=attn_config.kv_cache_dtype,
         mla_quant_method=attn_config.kv_cache_quant_method or None,
         draft_fields=draft_fields,
+        draft_layer_count=num_draft_layers,
     )
     reference_plan = merged_layout.with_num_lcm_blocks(1)
 

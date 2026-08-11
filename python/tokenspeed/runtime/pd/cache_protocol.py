@@ -549,6 +549,27 @@ class CachePDPageManifest:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class CachePDLayerwiseGroupSelection:
+    """Source pages for one group and their positions in Decode's manifest."""
+
+    source_page_ids: tuple[int, ...]
+    destination_positions: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CachePDLayerwisePageSelection:
+    """One prompt chunk's group-aware source-to-destination page selection.
+
+    This object stays process-local on Prefill. Decode publishes the full
+    request manifest once; each queued layerwise chunk references positions in
+    that immutable destination manifest instead of inventing a partial wire
+    manifest with ambiguous state-group semantics.
+    """
+
+    groups: tuple[CachePDLayerwiseGroupSelection, ...]
+
+
 def _logical_slots(
     policy: TransferPolicy,
     prefix_len: int,
@@ -586,6 +607,8 @@ def validate_cache_peer_layout(
         if (
             local_spec.family != peer_spec.family
             or local_spec.cache_block_tokens != peer_spec.cache_block_tokens
+            or local_spec.rows_per_page != peer_spec.rows_per_page
+            or local_spec.entry_stride_tokens != peer_spec.entry_stride_tokens
             or local_spec.retention != peer_spec.retention
             or local_spec.sliding_window_tokens != peer_spec.sliding_window_tokens
             or local_spec.transfer_policy != peer_spec.transfer_policy
@@ -746,16 +769,119 @@ def build_cache_page_manifest(
     )
 
 
+def build_cache_layerwise_page_selection(
+    forward_op: object,
+    *,
+    layout: CacheTransferContract,
+    request_row: int,
+    prefix_len: int,
+    prompt_len: int,
+    chunk_start: int,
+    chunk_end: int,
+) -> CachePDLayerwisePageSelection:
+    """Select pages that became transferable during one Prefill chunk.
+
+    Full-suffix groups publish newly completed retained pages (plus the final
+    partial page). Latest-snapshot groups publish only the prompt's final
+    snapshot. The returned destination positions refer to Decode's immutable
+    full manifest.
+    """
+    if prefix_len % layout.plan.logical_block_tokens:
+        raise CacheContractError("Paged cache PD prefix_len must be page aligned")
+    if prefix_len >= prompt_len:
+        raise CacheContractError("layerwise selection requires prefix_len < prompt_len")
+    if chunk_start >= chunk_end:
+        raise CacheContractError("layerwise selection requires chunk_start < chunk_end")
+    if chunk_end > prompt_len:
+        raise CacheContractError("layerwise selection requires chunk_end <= prompt_len")
+    is_final = chunk_end == prompt_len
+
+    mapping = forward_op.block_tables_arrays()  # type: ignore[attr-defined]
+    expected_ids = {group.group_id for group in layout.group_specs}
+    if set(mapping) != expected_ids:
+        raise CacheContractError(
+            "scheduler group IDs disagree with the Paged cache layout: "
+            f"missing={sorted(expected_ids - set(mapping))}, "
+            f"extra={sorted(set(mapping) - expected_ids)}"
+        )
+
+    selections = []
+    for spec in layout.group_specs:
+        table = mapping[spec.group_id]
+        final_slots = _logical_slots(
+            spec.transfer_policy,
+            prefix_len,
+            prompt_len,
+            spec.cache_block_tokens,
+            spec.retention,
+            spec.sliding_window_tokens,
+        )
+        if spec.transfer_policy == "full_suffix":
+            group_start_position = (
+                max(
+                    0,
+                    min(
+                        len(final_slots),
+                        chunk_start // spec.cache_block_tokens - final_slots[0],
+                    ),
+                )
+                if final_slots
+                else 0
+            )
+            ready_end = (
+                (chunk_end + spec.cache_block_tokens - 1) // spec.cache_block_tokens
+                if is_final
+                else chunk_end // spec.cache_block_tokens
+            )
+            ready_count = (
+                max(0, min(len(final_slots), ready_end - final_slots[0]))
+                if final_slots
+                else 0
+            )
+            destination_positions = tuple(range(group_start_position, ready_count))
+            logical_slots = tuple(
+                final_slots[position] for position in destination_positions
+            )
+        elif spec.transfer_policy == "latest_snapshot":
+            destination_positions = (0,) if is_final else ()
+            logical_slots = (final_slots[0],) if is_final else ()
+        if logical_slots and logical_slots[-1] >= table.shape[1]:
+            raise CacheContractError(
+                f"table {spec.group_id!r} misses logical slot " f"{logical_slots[-1]}"
+            )
+        source_page_ids = tuple(
+            int(table[request_row, logical_slot]) for logical_slot in logical_slots
+        )
+        group_capacity = layout.plan.group(spec.group_id).page_count
+        for logical_slot, page_id in zip(logical_slots, source_page_ids, strict=True):
+            if page_id <= 0 or page_id >= group_capacity:
+                raise CacheContractError(
+                    f"table {spec.group_id!r} logical slot {logical_slot} "
+                    f"has invalid page ID {page_id}"
+                )
+        selections.append(
+            CachePDLayerwiseGroupSelection(
+                source_page_ids=source_page_ids,
+                destination_positions=destination_positions,
+            )
+        )
+
+    return CachePDLayerwisePageSelection(groups=tuple(selections))
+
+
 __all__ = [
     "CacheContractError",
     "CacheFieldPartition",
     "CacheFieldTransferSpec",
     "CachePDGroupPages",
+    "CachePDLayerwiseGroupSelection",
+    "CachePDLayerwisePageSelection",
     "CachePDPageManifest",
     "CacheProducerSchedule",
     "CacheTransferContract",
     "CacheTransferSchema",
     "build_cache_fields_by_producer_step",
+    "build_cache_layerwise_page_selection",
     "build_cache_page_manifest",
     "build_cache_transfer_schema",
     "build_cache_transfer_contract",

@@ -24,7 +24,10 @@ import numpy as np
 import numpy.typing as npt
 
 from tokenspeed.runtime.pd.base.status import TransferPoll
-from tokenspeed.runtime.pd.cache_protocol import CachePDPageManifest
+from tokenspeed.runtime.pd.cache_protocol import (
+    CachePDLayerwisePageSelection,
+    CachePDPageManifest,
+)
 from tokenspeed.runtime.pd.mooncake.entities import KVTransferError
 from tokenspeed.runtime.utils import get_colorful_logger
 
@@ -53,9 +56,13 @@ class MooncakeKVSender:
         self.conclude_state = None
         self.curr_idx = 0
         self._layerwise_transfer_started = False
+        self._layerwise_final_submitted = False
 
     def has_layerwise_transfer(self) -> bool:
         return self._layerwise_transfer_started
+
+    def has_layerwise_final(self) -> bool:
+        return self._layerwise_final_submitted
 
     def send(
         self,
@@ -117,13 +124,11 @@ class MooncakeKVSender:
         wait_for_bootstrap_token: bool = False,
         spec_candidate_ids: list[int] | None = None,
         mamba_indices: npt.NDArray[np.int64] | None = None,
-        page_manifest: CachePDPageManifest | None = None,
+        cache_page_selection: CachePDLayerwisePageSelection | None = None,
     ):
         self._layerwise_transfer_started = True
+        self._layerwise_final_submitted = self._layerwise_final_submitted or is_last
         self.curr_idx = max(self.curr_idx, index_slice.stop)
-
-        if len(kv_indices) == 0 and not is_last:
-            return
 
         logger.info(
             "[MooncakeKVSender.send_layerwise] bootstrap_room=%s kv_indices_len=%d "
@@ -148,7 +153,7 @@ class MooncakeKVSender:
             wait_for_bootstrap_token=wait_for_bootstrap_token,
             spec_candidate_ids=spec_candidate_ids,
             mamba_indices=mamba_indices,
-            page_manifest=page_manifest,
+            cache_page_selection=cache_page_selection,
         )
 
     def poll(self) -> TransferPoll:

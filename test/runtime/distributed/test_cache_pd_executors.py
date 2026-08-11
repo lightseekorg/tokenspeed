@@ -326,6 +326,12 @@ def test_prefill_submits_manifest_through_legacy_sender() -> None:
     class _Sender:
         bootstrap_room = 9
 
+        def has_layerwise_final(self):
+            return False
+
+        def has_layerwise_transfer(self):
+            return False
+
         def send(self, *args, **kwargs):
             calls.append((args, kwargs))
 

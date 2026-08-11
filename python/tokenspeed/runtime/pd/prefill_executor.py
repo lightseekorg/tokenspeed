@@ -29,6 +29,7 @@ from tokenspeed.runtime.execution.block_table import (
 from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo
 from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.pd.cache_protocol import (
+    build_cache_layerwise_page_selection,
     build_cache_page_manifest,
     validate_cache_manifest_pair,
 )
@@ -180,11 +181,10 @@ class DisaggPrefillExecutor:
         )
 
     def prepare_prefill(self, op) -> None:
-        if not self._layerwise_enabled:
+        if not self._layerwise_enabled or op.num_extends() == 0:
             return
         if self.uses_cache_contract:
-            return
-        if op.num_extends() == 0:
+            self._prepare_cache_prefill(op)
             return
         table = select_block_table(op)
         begin_cache_step = self.kv_manager.reserve_layerwise_cache_steps()
@@ -211,6 +211,89 @@ class DisaggPrefillExecutor:
                 layerwise_interval=self._layerwise_interval,
                 wait_for_bootstrap_token=is_last,
                 mamba_indices=None,
+            )
+
+    def _prepare_cache_prefill(self, op) -> None:
+        """Preflight and enqueue one group-aware CachePD chunk per request.
+
+        Decode's manifest is immutable for the request. Each Prefill chunk
+        selects newly ready source pages and positions inside that manifest;
+        the producer step range is reserved once for the whole forward batch.
+        """
+        pending = []
+        for index, request_id in enumerate(op.request_ids[: op.num_extends()]):
+            sender = self.senders.get(request_id)
+            if sender is None:
+                logger.debug(
+                    "[prefill][prepare_prefill] skipping request_id=%s without sender",
+                    request_id,
+                )
+                self._drop_request_state(request_id)
+                continue
+            transfer_infos = self.kv_manager.transfer_infos.get(
+                sender.bootstrap_room, {}
+            )
+            if not transfer_infos:
+                raise RuntimeError("Paged cache destination metadata is unavailable")
+            destinations = tuple(
+                info for info in transfer_infos.values() if not info.is_dummy
+            )
+            # Idle representative ranks use the normal post-forward dummy
+            # completion path; they have no cache fields to overlap.
+            if not destinations:
+                continue
+            first = destinations[0]
+            if first.page_manifest is None or first.peer_cache_layout is None:
+                raise RuntimeError("Paged cache destination metadata is unavailable")
+            prefix_len = first.page_manifest.prefix_len
+            prompt_len = first.page_manifest.prompt_len
+            chunk_begin = int(op.extend_prefix_lens[index])
+            chunk_end = chunk_begin + int(op.input_lengths[index])
+            if chunk_end > prompt_len:
+                raise ValueError(
+                    "Paged cache Prefill chunk extends past Decode's prompt manifest"
+                )
+            is_last = chunk_end == prompt_len
+            selection = build_cache_layerwise_page_selection(
+                op,
+                layout=self.cache_layout,
+                request_row=index,
+                prefix_len=prefix_len,
+                prompt_len=prompt_len,
+                chunk_start=chunk_begin,
+                chunk_end=chunk_end,
+            )
+            source_pages = tuple(
+                page_id
+                for group in selection.groups
+                for page_id in group.source_page_ids
+            )
+            if not source_pages and not is_last:
+                continue
+            pending.append(
+                (
+                    sender,
+                    np.asarray(source_pages, dtype=np.int64),
+                    slice(0, 0),
+                    op.request_pool_indices[index],
+                    is_last,
+                    selection,
+                )
+            )
+
+        # The attention backend records one producer range for every forward,
+        # including batches whose current chunk completes no history page.
+        begin_cache_step = self.kv_manager.reserve_layerwise_cache_steps()
+        for sender, page_ids, index_slice, aux_index, is_last, selection in pending:
+            sender.send_layerwise(
+                page_ids,
+                index_slice,
+                aux_index,
+                is_last,
+                begin_cache_step=begin_cache_step,
+                layerwise_interval=self._layerwise_interval,
+                wait_for_bootstrap_token=is_last,
+                cache_page_selection=selection,
             )
 
     def _decode(self, op):
@@ -278,7 +361,7 @@ class DisaggPrefillExecutor:
             # bootstrap token still needs publishing on the last chunk.
             for request_id in op.request_ids:
                 sender = self.senders.get(request_id)
-                if sender is None or not sender.has_layerwise_transfer():
+                if sender is None or not sender.has_layerwise_final():
                     continue
                 token = self._request_token.get(request_id)
                 if isinstance(token, bool) or not isinstance(token, int) or token < 0:
@@ -290,6 +373,20 @@ class DisaggPrefillExecutor:
         for index, request_id in enumerate(op.request_ids):
             sender = self.senders.get(request_id)
             if sender is None:
+                continue
+            if sender.has_layerwise_final():
+                token = self._request_token.pop(request_id, None)
+                if request_id not in self._layerwise_token_published:
+                    if (
+                        isinstance(token, bool)
+                        or not isinstance(token, int)
+                        or token < 0
+                    ):
+                        raise RuntimeError("Paged cache bootstrap token is unavailable")
+                    self.kv_manager.set_prefill_metadata(
+                        sender.bootstrap_room, token, None
+                    )
+                self._layerwise_token_published.discard(request_id)
                 continue
             transfer_infos = self.kv_manager.transfer_infos.get(
                 sender.bootstrap_room, {}
@@ -348,6 +445,12 @@ class DisaggPrefillExecutor:
             token = self._request_token.get(request_id)
             if isinstance(token, bool) or not isinstance(token, int) or token < 0:
                 raise RuntimeError("Paged cache bootstrap token is unavailable")
+            page_ids = np.asarray(
+                tuple(
+                    page_id for group in manifest.groups for page_id in group.page_ids
+                ),
+                dtype=np.int64,
+            )
             pending.append(
                 (
                     request_id,
@@ -360,6 +463,11 @@ class DisaggPrefillExecutor:
             )
 
         for request_id, sender, aux_index, token, manifest, page_ids in pending:
+            # If an earlier non-final layerwise task was submitted but the
+            # final task was not, fall back to one complete typed transfer.
+            # The full-manifest ABI requires its flat page slice to start at 0.
+            if sender.has_layerwise_transfer() and not sender.has_layerwise_final():
+                sender.curr_idx = 0
             sender.send(
                 page_ids,
                 aux_index,
