@@ -22,7 +22,6 @@ import dataclasses
 import threading
 import time
 from contextlib import contextmanager
-from typing import Any
 
 import numpy as np
 import numpy.typing as npt
