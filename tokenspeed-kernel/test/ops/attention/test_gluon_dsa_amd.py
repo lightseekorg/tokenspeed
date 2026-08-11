@@ -948,7 +948,15 @@ def _assert_slots_visible(
     "q_dtype",
     [
         pytest.param(torch.bfloat16, id="q_bf16"),
-        pytest.param(torch.float8_e4m3fn, id="q_fp8"),
+        pytest.param(torch.float8_e4m3fn, id="q_e4m3"),
+        pytest.param(
+            torch.float8_e5m2,
+            id="q_e5m2",
+            marks=pytest.mark.skipif(
+                not is_cdna4(),
+                reason="E5M2 DSA support is specific to gfx950",
+            ),
+        ),
     ],
 )
 def test_dsa_with_sparse_kvcache(mode: str, api, q_dtype: torch.dtype) -> None:
@@ -1016,18 +1024,37 @@ def test_dsa_with_sparse_kvcache(mode: str, api, q_dtype: torch.dtype) -> None:
     "q_dtype",
     [
         pytest.param(torch.bfloat16, id="q_bf16"),
-        pytest.param(torch.float8_e4m3fn, id="q_fp8"),
+        pytest.param(torch.float8_e4m3fn, id="q_e4m3"),
+        pytest.param(
+            torch.float8_e5m2,
+            id="q_e5m2",
+            marks=pytest.mark.skipif(
+                not is_cdna4(),
+                reason="E5M2 DSA support is specific to gfx950",
+            ),
+        ),
     ],
 )
-def test_dsa_dense_kvcache(mode: str, api, q_dtype: torch.dtype) -> None:
+@pytest.mark.parametrize(
+    "kv_lora_rank",
+    [
+        pytest.param(128, id="rank_128"),
+        pytest.param(512, id="rank_512"),
+    ],
+)
+def test_dsa_dense_kvcache(
+    mode: str,
+    api,
+    q_dtype: torch.dtype,
+    kv_lora_rank: int,
+) -> None:
     device = "cuda"
     tokens = 3
     num_heads = 2
     num_slots = 16
     topk = 512
-    kv_lora_rank = 128
     qk_rope_head_dim = 64
-    qk_nope_head_dim = 128
+    qk_nope_head_dim = 192 if kv_lora_rank == 512 else 128
     softmax_scale = 1.0 / math.sqrt(qk_nope_head_dim + qk_rope_head_dim)
     q_bf16 = torch.randn(
         tokens,
@@ -1066,6 +1093,93 @@ def test_dsa_dense_kvcache(mode: str, api, q_dtype: torch.dtype) -> None:
         q,
         dequant_latent,
         dequant_rope,
+        topk_slots,
+        topk_lens,
+        softmax_scale,
+    )
+    assert out.shape == (tokens, num_heads, kv_lora_rank)
+    assert out.dtype == torch.bfloat16
+    torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
+
+
+@pytest.mark.skipif(
+    not is_cdna4(),
+    reason="dense FP8 specialization is specific to the gfx950 implementation",
+)
+@pytest.mark.parametrize(
+    "api",
+    [
+        pytest.param(gluon_dsa_decode, id="decode"),
+        pytest.param(gluon_dsa_prefill, id="prefill"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("valid_lengths", "max_seqlen_k"),
+    [
+        pytest.param((0, 1, 33, 2048), 2112, id="static-full-width"),
+        pytest.param((0, 1, 31, 33), 33, id="dynamic-short-list"),
+    ],
+)
+@pytest.mark.parametrize(
+    "fp8_dtype",
+    [
+        pytest.param(torch.float8_e4m3fn, id="e4m3"),
+        pytest.param(torch.float8_e5m2, id="e5m2"),
+    ],
+)
+def test_dsa_dense_fp8_glm52_production_shape(
+    api,
+    valid_lengths: tuple[int, ...],
+    max_seqlen_k: int,
+    fp8_dtype: torch.dtype,
+) -> None:
+    device = "cuda"
+    tokens = 4
+    num_heads = 16
+    num_slots = 2112
+    topk = 2048
+    kv_lora_rank = 512
+    qk_rope_head_dim = 64
+    qk_nope_head_dim = 192
+    softmax_scale = 1.0 / math.sqrt(qk_nope_head_dim + qk_rope_head_dim)
+    gen = _generator(device, 401)
+
+    q = _randn_bf16(
+        (tokens, num_heads, kv_lora_rank + qk_rope_head_dim),
+        device=device,
+        generator=gen,
+    ).to(fp8_dtype)
+    kv_cache = _randn_bf16(
+        (num_slots, kv_lora_rank + qk_rope_head_dim),
+        device=device,
+        generator=gen,
+    ).to(fp8_dtype)
+    topk_slots = torch.full((tokens, topk), -1, device=device, dtype=torch.int32)
+    topk_lens = torch.tensor(valid_lengths, device=device, dtype=torch.int32)
+    for token, count in enumerate(topk_lens.tolist()):
+        topk_slots[token, :count] = torch.randperm(
+            max_seqlen_k, device=device, generator=gen, dtype=torch.int32
+        )[:count]
+
+    out = api(
+        q=q,
+        kv_cache=kv_cache,
+        sparse_kv_cache=None,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        max_seqlen_k=max_seqlen_k,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        softmax_scale=softmax_scale,
+        page_size=64,
+        q_len_per_req=4 if api is gluon_dsa_decode else 1,
+    )
+
+    ref = _dsa_reference(
+        q,
+        kv_cache[:, :kv_lora_rank],
+        kv_cache[:, kv_lora_rank:],
         topk_slots,
         topk_lens,
         softmax_scale,
