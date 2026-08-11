@@ -229,7 +229,6 @@ class ServerArgs:
     kvstore_mem_layout: str = "layer_first"
     kvstore_storage_backend: str | None = None
     kvstore_storage_backend_extra_config: str | None = None
-    enable_mla_l1_5_cache: bool = False
 
     # Multi-node distributed serving. ``None`` means "not given by the user",
     # which is what lets the launcher environment fill them in.
@@ -1170,11 +1169,6 @@ class ServerArgs:
             type=str,
             default=ServerArgs.kvstore_storage_backend_extra_config,
             help="A dictionary in JSON string format containing extra configuration for the storage backend.",
-        )
-        parser.add_argument(
-            "--enable-mla-l1-5-cache",
-            action="store_true",
-            help="Enable MLA L1.5 cache in disaggregation paths.",
         )
         # Mamba Cache
         parser.add_argument(

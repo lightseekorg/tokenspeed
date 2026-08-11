@@ -45,7 +45,6 @@ class MooncakeKVManagerBase(DisaggManagerBase):
         self.args = args
         self.kv_args = kv_args
         self.attn_tp_rank = args.attn_tp_rank
-        self.src_mode = "ON" if bool(args.enable_mla_l1_5_cache) else "OFF"
         self.is_mla_backend = args.is_mla_backend
         self.draft_is_mla_backend = args.draft_is_mla_backend
         self.disaggregation_mode = disaggregation_mode
@@ -97,7 +96,6 @@ class MooncakeKVBootstrapServer(DisaggBootstrapServerBase):
     def __init__(self, port: int):
         # Set before super() -- super() starts the server thread, after which a
         # register PUT can call _ingest_put_extra and read these.
-        self.enable_mla_l1_5_cache = False
         self.prefill_kv_item_lens = []
         self.prefill_kv_unit_lens = []
         self.prefill_state_item_lens = []
@@ -127,11 +125,11 @@ class MooncakeKVBootstrapServer(DisaggBootstrapServerBase):
                 raise ValueError(
                     "Paged cache prefill ranks registered incompatible layouts"
                 )
-            if bool(data["enable_mla_l1_5_cache"]) or any(
+            if any(
                 data.get(field) for field in ("state_item_lens", "state_unit_lens")
             ):
                 raise ValueError(
-                    "Paged cache bootstrap cannot advertise MLA L1.5 or a state plane"
+                    "Paged cache bootstrap cannot advertise a state plane"
                 )
             kv_item_lens = data.get("kv_item_lens", [])
             kv_unit_lens = data.get("kv_unit_lens", [])
@@ -142,7 +140,6 @@ class MooncakeKVBootstrapServer(DisaggBootstrapServerBase):
                 )
             self.prefill_cache_layout_wire = canonical_wire
         self._registration_mode = mode
-        self.enable_mla_l1_5_cache = bool(data["enable_mla_l1_5_cache"])
         self.prefill_kv_item_lens = data.get("kv_item_lens", self.prefill_kv_item_lens)
         self.prefill_kv_unit_lens = data.get("kv_unit_lens", self.prefill_kv_unit_lens)
         self.prefill_state_item_lens = data.get(
@@ -154,7 +151,6 @@ class MooncakeKVBootstrapServer(DisaggBootstrapServerBase):
 
     def _extra_parallel_info(self) -> dict:
         extra = {
-            "enable_mla_l1_5_cache": self.enable_mla_l1_5_cache,
             "kv_item_lens": self.prefill_kv_item_lens,
             "kv_unit_lens": self.prefill_kv_unit_lens,
             "state_item_lens": self.prefill_state_item_lens,

@@ -1939,13 +1939,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         max_bs: int,
         paged_cache_group_specs=(),
         paged_cache_group_page_counts=None,
-        logical_page_size: int | None = None,
         max_tokens_per_req: int = 1,
         overlap_schedule_depth: int = 0,
     ):
-        # logical_page_size accepted for signature uniformity with other
-        # backends; DSA derives its page geometry from cache metadata per step.
-        del logical_page_size
         self._decode_tile_metadata = {}
         self._cuda_graph_max_tokens_per_req = max(
             1,
@@ -2004,7 +2000,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             )
         self._cuda_graph_max_bs = max_bs
         self._cuda_graph_paged_cache_block_tables = {}
-        specs, page_counts = self._configure_cache_group_contract(
+        specs, _ = self._configure_cache_group_contract(
             paged_cache_group_specs,
             paged_cache_group_page_counts,
         )

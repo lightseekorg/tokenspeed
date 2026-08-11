@@ -433,6 +433,7 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
         memory_plan: CacheMemoryPlan,
         paged_cache_group_specs: tuple[PagedCacheGroupSpec, ...],
         token_capacity: int,
+        pd_disaggregation_enabled: bool = False,
     ) -> None:
         if size <= 0:
             raise ValueError(f"DeepSeek V4 KV pool size must be positive, got {size}")
@@ -451,6 +452,7 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
             memory_plan=memory_plan,
             paged_cache_group_specs=paged_cache_group_specs,
             token_capacity=token_capacity,
+            pd_disaggregation_enabled=pd_disaggregation_enabled,
         )
         # Tag KV allocations as "kv_cache" (no CPU backup: discarded on sleep)
         # so release/resume_memory_occupation frees them. See memory_occupation.py.

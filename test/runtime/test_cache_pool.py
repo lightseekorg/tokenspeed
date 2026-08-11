@@ -59,26 +59,6 @@ class CachePoolContractTest(unittest.TestCase):
             pool.buffer.untyped_storage().data_ptr(),
         )
 
-    def test_expands_scheduler_blocks_for_a_kernel_view(self):
-        pool = CachePool(
-            size=16,
-            dtype=torch.uint8,
-            device="cpu",
-            page_size=4,
-            rank=0,
-            memory_plan=_plan(),
-        )
-        scheduler_table = torch.tensor([[1, 0, -1]], dtype=torch.int32)
-
-        actual = pool.expand_block_table(
-            "history",
-            scheduler_table,
-            kernel_block_tokens=2,
-        )
-
-        expected = torch.tensor([[2, 3, 0, 1, 0, 1]], dtype=torch.int32)
-        self.assertTrue(torch.equal(actual, expected))
-
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
 class CachePoolCudaTest(unittest.TestCase):
