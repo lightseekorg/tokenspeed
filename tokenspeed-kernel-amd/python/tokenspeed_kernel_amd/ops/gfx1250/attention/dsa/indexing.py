@@ -93,27 +93,28 @@ def _dsa_decode_logits_fp8_kernel(
         + block_offset.to(gl.int64) * num_groups
     )
 
-    scores = gl.zeros([BLOCK_N], gl.float32, layout=row_layout)
+    weighted_q = gl.zeros([BLOCK_D], gl.float32, layout=dim_layout)
     for head in gl.static_range(0, num_heads):
         q_vals = gl.load(
             q + (token * num_heads + head) * head_dim + dims,
             mask=dims < head_dim,
             other=0.0,
         ).to(gl.float32)
-        k_vals = gl.load(
-            index_k_fp8 + fp8_base[:, None] + dims[None, :],
-            mask=valid[:, None] & (dims[None, :] < head_dim),
-            other=0.0,
-        ).to(gl.float32)
-        # Per-row FP32 scales follow each page's FP8 payload.
-        k_scale = gl.load(
-            index_k_scale + scale_base,
-            mask=valid,
-            other=0.0,
-        ).to(gl.float32)
-        head_score = gl.sum(k_vals * k_scale[:, None] * q_vals[None, :], axis=1)
         head_weight = gl.load(weights + token * num_heads + head).to(gl.float32)
-        scores += head_score * head_weight
+        weighted_q += q_vals * head_weight
+
+    k_vals = gl.load(
+        index_k_fp8 + fp8_base[:, None] + dims[None, :],
+        mask=valid[:, None] & (dims[None, :] < head_dim),
+        other=0.0,
+    ).to(gl.float32)
+    # Per-row FP32 scales follow each page's FP8 payload.
+    k_scale = gl.load(
+        index_k_scale + scale_base,
+        mask=valid,
+        other=0.0,
+    ).to(gl.float32)
+    scores = gl.sum(k_vals * k_scale[:, None] * weighted_q[None, :], axis=1)
 
     scores *= softmax_scale
     scores = gl.where(valid, scores, -float("inf"))
@@ -171,26 +172,27 @@ def _dsa_prefill_logits_fp8_kernel(
         + block_offset * num_groups
     )
 
-    scores = gl.zeros([BLOCK_N], gl.float32, layout=row_layout)
+    weighted_q = gl.zeros([BLOCK_D], gl.float32, layout=dim_layout)
     for head in gl.static_range(0, num_heads):
         q_vals = gl.load(
             q + (token * num_heads + head) * head_dim + dims,
             mask=dims < head_dim,
             other=0.0,
         ).to(gl.float32)
-        k_vals = gl.load(
-            index_k_fp8 + fp8_base[:, None] + dims[None, :],
-            mask=valid[:, None] & (dims[None, :] < head_dim),
-            other=0.0,
-        ).to(gl.float32)
-        k_scale = gl.load(
-            index_k_scale + scale_base,
-            mask=valid,
-            other=0.0,
-        ).to(gl.float32)
-        head_score = gl.sum(k_vals * k_scale[:, None] * q_vals[None, :], axis=1)
         head_weight = gl.load(weights + token * num_heads + head).to(gl.float32)
-        scores += head_score * head_weight
+        weighted_q += q_vals * head_weight
+
+    k_vals = gl.load(
+        index_k_fp8 + fp8_base[:, None] + dims[None, :],
+        mask=valid[:, None] & (dims[None, :] < head_dim),
+        other=0.0,
+    ).to(gl.float32)
+    k_scale = gl.load(
+        index_k_scale + scale_base,
+        mask=valid,
+        other=0.0,
+    ).to(gl.float32)
+    scores = gl.sum(k_vals * k_scale[:, None] * weighted_q[None, :], axis=1)
 
     scores *= softmax_scale
     scores = gl.where(valid, scores, -float("inf"))
