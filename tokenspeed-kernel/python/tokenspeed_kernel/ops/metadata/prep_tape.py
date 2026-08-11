@@ -18,21 +18,24 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Declarative one-launch CUDA-graph replay metadata prep.
+"""Declarative CUDA-graph replay metadata prep.
 
 Attention backends refill the captured graph's persistent input buffers
 before every replay. Recorded eagerly that is a chain of tiny fills, copies
 and gathers -- tens of kernel launches for a few kilobytes. A
 :class:`PrepTape` records that chain ONCE against the persistent buffers
 (pointers never change across replays) and then executes it each step with
-one small H2D register upload plus one interpreter-kernel launch.
+one small H2D register upload plus one interpreter launch per stage. Operations
+within a stage run independently; call :meth:`PrepTape.barrier` between
+operations that have a memory dependency.
 
 Usage::
 
     tape = PrepTape(device)
-    tape.fill(buf_a, n=Reg.BS, value=-1)
-    tape.copy(dst_view, src_view, n=Reg.REAL_BS)
+    tape.fill(dst, n=Reg.BS, value=-1)
+    tape.barrier()
     tape.gather(dst, table, idx, n=Reg.REAL_BS, oob_value=-1)
+    tape.copy(dst_view, src_view, n=Reg.REAL_BS)
     tape.filltail(buf_b, live=Reg.REAL_BS, total=Reg.BS, value=0)
     tape.finalize()
     ...
@@ -96,13 +99,17 @@ def _check(t: torch.Tensor, name: str) -> torch.Tensor:
 
 
 class PrepTape:
-    """Records metadata prep ops and replays them in one kernel launch."""
+    """Record metadata operations in explicitly ordered parallel stages.
+
+    Operations within a stage must be independent. Use :meth:`barrier` to start
+    a new stream-ordered stage when operations have a memory dependency.
+    """
 
     def __init__(self, device) -> None:
         self._device = torch.device(device)
-        self._rows: list[list[int]] = []
+        self._stages: list[list[list[int]]] = [[]]
         self._keepalive: list[torch.Tensor] = []
-        self._descs: torch.Tensor | None = None
+        self._descs: torch.Tensor | tuple[torch.Tensor, ...] | None = None
         self._regs_dev = torch.zeros(32, dtype=torch.int64, device=self._device)
         self._regs_pinned = torch.zeros(32, dtype=torch.int64, pin_memory=True)
 
@@ -114,7 +121,7 @@ class PrepTape:
         for t in (dst, src, idx):
             if isinstance(t, torch.Tensor):
                 self._keepalive.append(t)
-        self._rows.append(
+        self._stages[-1].append(
             [
                 op,
                 dst.data_ptr() if isinstance(dst, torch.Tensor) else 0,
@@ -126,6 +133,15 @@ class PrepTape:
                 _ref(scalar),
             ]
         )
+
+    def barrier(self) -> None:
+        """Start a stream-ordered launch stage after the recorded operations.
+
+        Returns ``None``.
+        """
+        if self._descs is not None:
+            raise RuntimeError("tape already finalized")
+        self._stages.append([])
 
     def fill(self, dst: torch.Tensor, n: "int | Reg", value: "int | Reg") -> None:
         """``dst[0:n] = value``."""
@@ -220,7 +236,7 @@ class PrepTape:
         ``state_in[i] = rows[i, clamp((after-2)//P)]`` (0 when no history),
         ``state_out[i] = rows[i, clamp((after-1)//P)]``. ``rows`` and
         ``seq_lens`` are per-step tensors passed via pointer registers."""
-        self._rows.append(
+        self._stages[-1].append(
             [
                 _OP_STATE_PAGES,
                 _check(state_in, "state_in").data_ptr(),
@@ -237,19 +253,27 @@ class PrepTape:
     # -- execution ---------------------------------------------------------
 
     def finalize(self) -> None:
-        """Upload the descriptor table; the tape becomes immutable."""
-        self._descs = torch.tensor(
-            self._rows, dtype=torch.int64, device=self._device
-        ).view(-1, _FIELDS)
+        """Upload the explicitly recorded stages; the tape becomes immutable.
+
+        Operations in each stage share a launch. Stages separated by
+        :meth:`barrier` launch in order on the current stream.
+        """
+        stages = tuple(
+            torch.tensor(rows, dtype=torch.int64, device=self._device).view(-1, _FIELDS)
+            for rows in self._stages
+            if rows
+        )
+        # Keep the latency-critical one-stage dispatch path unchanged.
+        self._descs = stages[0] if len(stages) == 1 else stages
 
     def __len__(self) -> int:
-        return len(self._rows)
+        return sum(len(stage) for stage in self._stages)
 
     def run(self, regs: dict) -> None:
         """Execute the tape with this step's register values.
 
-        One pinned write + one async H2D + one kernel launch, regardless of
-        how many ops the tape holds.
+        Uses one pinned write and async H2D upload. Operations in a stage run
+        in one parallel kernel launch; explicit barriers add ordered launches.
         """
         from tokenspeed_kernel.ops.metadata.triton_tape import run_tape
 
