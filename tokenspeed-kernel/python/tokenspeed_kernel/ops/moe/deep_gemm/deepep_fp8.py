@@ -504,7 +504,10 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
         ),
         traits={
             "weight_dtype": frozenset({"fp8"}),
-            "activation": frozenset({"silu"}),
+            # The fused activation computes SiLU(gate)*up, i.e. gated SiLU ==
+            # SwiGLU; accept both names so DeepSeek-V4 (activation="swiglu")
+            # selects this kernel too.
+            "activation": frozenset({"silu", "swiglu"}),
             "routing_mode": frozenset({"precomputed_topk"}),
             "supports_deferred_finalize": frozenset({False}),
             "supports_ep": frozenset({True}),

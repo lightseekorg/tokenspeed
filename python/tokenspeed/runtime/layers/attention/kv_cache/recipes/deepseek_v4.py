@@ -74,7 +74,7 @@ def build_deepseek_v4_cache_fields(
     )
 
 
-def solve_deepseek_v4_memory_layout(fields):
+def solve_deepseek_v4_memory_layout(fields: list[CacheFieldSpec]):
     """Solve DSV4's power-of-two group packing for one physical parent."""
     raw_bytes: dict[str, int] = {}
     for field in fields:
@@ -220,8 +220,16 @@ def prepare_deepseek_v4_cache(
             return bool(override)
         attention_config = getattr(hf_config, "attention_config", None)
         if isinstance(attention_config, dict):
-            return bool(attention_config.get("use_fp4_indexer_cache", False))
-        return bool(getattr(attention_config, "use_fp4_indexer_cache", False))
+            configured = attention_config.get("use_fp4_indexer_cache", None)
+        else:
+            configured = getattr(attention_config, "use_fp4_indexer_cache", None)
+        if configured is not None:
+            return bool(configured)
+        # FP4 indexer tensor cores are Blackwell-only (SM100+); default to the
+        # FP8 indexer cache layout on Hopper (SM90) and earlier.
+        from tokenspeed_kernel.platform import current_platform
+
+        return current_platform().arch_version.major >= 10
 
     def layout_and_fields(config, runtime_config, *, layer_indices=None):
         layout = deepseek_v4_cache_layout_from_config(

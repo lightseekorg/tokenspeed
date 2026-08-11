@@ -87,8 +87,10 @@ __all__ = (
     "deepseek_v4_csa_compress_kv_cache_insert",
     "deepseek_v4_csa_indexer_cache_insert",
     "deepseek_v4_hca_compress_kv_cache_insert",
+    "deepseek_v4_prepare_indexer_q_fp8",
     "deepseek_v4_prepare_indexer_q_mxfp4",
     "dequantize_deepseek_v4_fp8_ds_mla_cache",
+    "gather_paged_indexer_fp8_cache",
     "fused_qnorm_rope_kv_insert",
     "read_deepseek_v4_indexer_fp8_cache",
     "read_deepseek_v4_indexer_mxfp4_cache",
@@ -311,6 +313,134 @@ def deepseek_v4_prepare_indexer_q_mxfp4(
         softmax_scale=softmax_scale,
         head_scale=head_scale,
     )
+
+
+def deepseek_v4_prepare_indexer_q_fp8(
+    index_q: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    weights: torch.Tensor,
+    softmax_scale: float,
+    head_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply indexer Q RoPE + Hadamard and return DeepGEMM-ready FP8 values.
+
+    Non-Blackwell (SM90) analogue of ``deepseek_v4_prepare_indexer_q_mxfp4``.
+    ``deep_gemm.fp8_paged_mqa_logits`` / ``fp8_mqa_logits`` consume the query as
+    a plain ``float8_e4m3fn`` tensor (no per-token query scale) with the softmax
+    and head scales folded into ``weights`` -- mirroring SGLang's
+    ``fused_q_indexer_rope_hadamard_quant``.
+
+    Args:
+        index_q: ``[tokens, heads, index_head_dim]`` bf16/fp32 indexer queries.
+        positions: ``[tokens]`` absolute token positions for RoPE.
+        cos_sin_cache: ``[max_pos, rope_dim]`` fused cos/sin cache.
+        weights: ``[tokens, heads]`` (or trailing singleton) indexer weights.
+        softmax_scale: ``index_head_dim**-0.5`` attention softmax scale.
+        head_scale: ``n_head**-0.5`` head normalization scale.
+
+    Returns:
+        Tuple of ``(q_fp8, weights_out)`` where ``q_fp8`` is
+        ``[tokens, heads, index_head_dim]`` ``float8_e4m3fn`` and
+        ``weights_out`` is ``[tokens, heads]`` float32 with both scales folded
+        in.
+    """
+
+    if index_q.dim() != 3:
+        raise ValueError(f"index_q must be [tokens, heads, dim], got {index_q.shape}")
+    rope_dim = int(cos_sin_cache.shape[-1])
+    if index_q.shape[-1] <= rope_dim:
+        raise ValueError(
+            f"index_q dim must be larger than rope_dim={rope_dim}, got {index_q.shape}"
+        )
+    if weights.dim() == 3:
+        weights = weights.squeeze(-1)
+    if weights.shape != index_q.shape[:2]:
+        raise ValueError(f"weights must be [tokens, heads], got {tuple(weights.shape)}")
+    if not index_q.is_cuda:
+        raise ValueError(
+            "deepseek_v4_prepare_indexer_q_fp8 only supports CUDA tensors."
+        )
+
+    weights_out = (weights.float() * float(softmax_scale) * float(head_scale)).float()
+    if index_q.shape[0] == 0:
+        q_fp8 = index_q.new_empty(index_q.shape, dtype=torch.float8_e4m3fn)
+        return q_fp8, weights_out
+
+    rotated = _apply_gptj_rope_tail_rows(
+        index_q,
+        positions,
+        cos_sin_cache,
+        rope_dim,
+    )
+    rotated = _deepseek_v4_hadamard_rotate(rotated)
+    q_fp8 = rotated.to(torch.bfloat16).to(torch.float8_e4m3fn).contiguous()
+    return q_fp8, weights_out
+
+
+def gather_paged_indexer_fp8_cache(
+    cache_2d: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seq_lens: torch.Tensor,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather ragged FP8 indexer keys for ``deep_gemm.fp8_mqa_logits``.
+
+    Torch analogue of the CUDA MXFP4 paged gather. Produces the fp8 keys and
+    their fp32 per-token scales laid out contiguously in ``cu_seq_lens`` order.
+
+    Args:
+        cache_2d: ``[pages, block_size * (index_head_dim + 4)]`` uint8 fp8 cache.
+        block_table: ``[num_reqs, max_blocks]`` int32 logical->physical pages.
+        cu_seq_lens: ``[num_reqs + 1]`` int32 cumulative compressed key lengths.
+        block_size: cache block size (tokens per page), e.g. 64.
+
+    Returns:
+        Tuple ``(k_fp8, k_scale)`` with ``k_fp8`` of shape ``[total_k, dim]``
+        ``float8_e4m3fn`` and ``k_scale`` of shape ``[total_k]`` float32.
+    """
+
+    if cache_2d.dtype != torch.uint8:
+        raise TypeError(f"cache_2d must be uint8, got {cache_2d.dtype}")
+    index_head_dim, scale_bytes = _indexer_fp8_layout_from_cache(cache_2d, block_size)
+    device = cache_2d.device
+    cu_seq_lens = cu_seq_lens.to(device=device, dtype=torch.int64)
+    total_rows = int(cu_seq_lens[-1].item()) if cu_seq_lens.numel() else 0
+    if total_rows == 0:
+        return (
+            torch.empty((0, index_head_dim), dtype=torch.float8_e4m3fn, device=device),
+            torch.empty((0,), dtype=torch.float32, device=device),
+        )
+
+    block_table = block_table.to(device=device, dtype=torch.int64)
+    row_ids = torch.arange(total_rows, device=device, dtype=torch.int64)
+    # searchsorted over the per-req end offsets maps each output row to its req.
+    req = torch.searchsorted(cu_seq_lens[1:].contiguous(), row_ids, right=True)
+    req = req.clamp_max(block_table.shape[0] - 1)
+    local = row_ids - cu_seq_lens[req]
+    logical_block = torch.div(local, block_size, rounding_mode="floor")
+    logical_block = logical_block.clamp_max(block_table.shape[1] - 1)
+    in_block = local % block_size
+    phys = block_table[req, logical_block]
+
+    page_base = phys * cache_2d.stride(0)
+    value_base = page_base + in_block * index_head_dim
+    scale_base = page_base + block_size * index_head_dim + in_block * scale_bytes
+
+    flat_cache = cache_2d.reshape(-1)
+    value_offsets = (
+        value_base[:, None]
+        + torch.arange(index_head_dim, device=device, dtype=torch.int64)[None, :]
+    )
+    scale_offsets = (
+        scale_base[:, None]
+        + torch.arange(scale_bytes, device=device, dtype=torch.int64)[None, :]
+    )
+    k_fp8 = flat_cache[value_offsets].contiguous().view(torch.float8_e4m3fn)
+    k_scale = (
+        flat_cache[scale_offsets].contiguous().view(torch.float32).reshape(total_rows)
+    )
+    return k_fp8, k_scale
 
 
 def _fp8_ds_mla_cache_rows(
