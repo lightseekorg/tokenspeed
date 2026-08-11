@@ -1,4 +1,4 @@
-FROM lightseekorg/tokenspeed-runner-amd:rocm7.2.4-pytorch-2.11.0-gfx950
+FROM lightseekorg/tokenspeed-runner-amd:rocm7.2.4-pytorch-2.13.0-gfx950
 
 USER root
 

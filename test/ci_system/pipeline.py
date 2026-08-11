@@ -61,6 +61,7 @@ JIT_CACHE_ENV_SUBDIRS = {
     "TRITON_CACHE_DIR": "triton",
     "CUTE_DSL_CACHE_DIR": "cute_dsl",
     "TORCHINDUCTOR_CACHE_DIR": "torchinductor",
+    "TORCH_EXTENSIONS_DIR": "torch_extensions",
 }
 RUNNER_SM_PREFIXES = (
     (("h100", "h200"), "sm90"),
@@ -446,6 +447,31 @@ def get_jit_cache_env(env: Dict[str, str]) -> Dict[str, str]:
     }
 
 
+def remove_stale_torch_extension_builds(env: Dict[str, str], dry_run: bool) -> None:
+    cache_root = env.get("TORCH_EXTENSIONS_DIR")
+    if not cache_root:
+        return
+
+    # Setup runs before new work on this runner, so any existing lock is stale.
+    for lock_path in sorted(Path(cache_root).glob("*/lock")):
+        extension_dir = lock_path.parent
+        if dry_run:
+            print(
+                f"[dry-run] remove stale torch extension build: {extension_dir}",
+                flush=True,
+            )
+            continue
+        print(
+            f"removing stale torch extension build: {extension_dir}",
+            flush=True,
+        )
+        shutil.rmtree(extension_dir, ignore_errors=True)
+        if lock_path.exists():
+            raise RuntimeError(
+                f"failed to remove stale torch extension build: {extension_dir}"
+            )
+
+
 def _pkill(
     pattern: str,
     signal_name: str,
@@ -574,6 +600,7 @@ def setup_runner(
 
         # Kill stale processes from previous run
         pgm.cleanup_stale(dry_run=dry_run)
+        remove_stale_torch_extension_builds(local_env, dry_run)
         shell_run(
             "bash test/ci_system/cleanup_nvidia_gpu_state.sh",
             env=local_env,
