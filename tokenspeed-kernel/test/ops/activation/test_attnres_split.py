@@ -81,16 +81,8 @@ def test_partial_dual_matches_two_singles(T, KB):
 
 @pytest.mark.parametrize("T,KB", [(1, 1), (1, 8), (4, 2), (32, 8)])
 def test_partial_dual_probes_are_independent(T, KB):
-    """Which slot a probe occupies must not change its result, bit for bit.
-
-    The mlp-side partial is hoisted onto the previous layer's sweep, where it
-    is still probe A of a dual but paired with a different probe B. If the two
-    probes influenced each other at all, moving one would silently perturb the
-    other, and greedy decoding would amplify it. Unlike the dual-vs-single
-    comparison above -- which legitimately differs at fp32 rounding because the
-    schedules contract fmas differently -- this one shares a schedule and must
-    be exact.
-    """
+    """Which slot a probe occupies must not change its result, bit for bit
+    (the hoist re-pairs probe A with a different probe B)."""
     torch.manual_seed(T * 31 + KB)
     blocks = torch.randn(KB, T, H, dtype=torch.bfloat16, device="cuda") * 0.1
     wp_a = torch.randn(H, dtype=torch.bfloat16, device="cuda") * 0.05
