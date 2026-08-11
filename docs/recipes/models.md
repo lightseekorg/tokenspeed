@@ -310,7 +310,7 @@ tokenspeed serve Qwen/Qwen3-30B-A3B \
 Qwen3.8 shares the hybrid linear-attention (GDN) / full-attention layer
 pattern with Qwen3.5.
 
-### Qwen3.8-Max
+### Qwen3.8-2.4T-A95B
 
 Qwen3.8-max needs 16 GPUs, so it runs on two 8-GPU nodes. Launch
 `tokenspeed serve` on every node with the same command, changing only
