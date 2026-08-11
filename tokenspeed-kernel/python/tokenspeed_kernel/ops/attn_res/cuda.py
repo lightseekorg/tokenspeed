@@ -51,6 +51,7 @@ if _HAS_CUDA_KERNEL:
         solution="cuda",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=format_signatures(

@@ -42,6 +42,12 @@ from tokenspeed.runtime.utils import ceil_div
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
+def supports_triton_rsag() -> bool:
+    """Whether the custom symmetric-memory collectives support this GPU."""
+    platform = current_platform()
+    return not (platform.is_nvidia and platform.arch_version.major == 12)
+
+
 class TritonRSAGBackend:
     """Backend using TritonRSAG for token-aware reduce_scatter / all_gather.
 
@@ -76,6 +82,8 @@ class TritonRSAGBackend:
         group: Group,
         dim: int = 0,
     ) -> torch.Tensor:
+        if not supports_triton_rsag():
+            return self._fallback.all_gather(tensor, group=group, dim=dim)
         if tensor.dim() != 2:
             return self._fallback.all_gather(tensor, group=group, dim=dim)
 
@@ -109,6 +117,12 @@ class TritonRSAGBackend:
         group: Group,
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
+        if not supports_triton_rsag():
+            return self._fallback.token_all_gather(
+                tensor,
+                group=group,
+                scattered_num_tokens=scattered_num_tokens,
+            )
         state = self._get_or_create(group, tensor.size(-1))
         return all_gather(state, tensor, token_list_in_group=scattered_num_tokens)
 
@@ -118,6 +132,12 @@ class TritonRSAGBackend:
         group: Group,
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
+        if not supports_triton_rsag():
+            return self._fallback.token_reduce_scatter(
+                tensor,
+                group=group,
+                scattered_num_tokens=scattered_num_tokens,
+            )
         state = self._get_or_create(group, tensor.size(-1))
         return reduce_scatter(state, tensor, token_list_in_group=scattered_num_tokens)
 
