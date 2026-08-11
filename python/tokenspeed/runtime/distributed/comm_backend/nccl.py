@@ -27,6 +27,7 @@ via custom ops.
 
 import torch
 import torch.distributed
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.comm_backend.base import CommBackend, Group
 
@@ -109,6 +110,10 @@ class NcclBackend(CommBackend):
         tensors = tensor
         if len(tensors) == 0:
             raise ValueError("all-reduce requires at least one tensor")
+        # RCCL supports arbitrary grouped collectives. Preserve NVIDIA's
+        # existing two-tensor grouping and reduce larger collections normally.
+        if not current_platform().is_amd and len(tensors) != 2:
+            return super().all_reduce(tensors, group, op=op)
         res = self._get_or_create_resources(group)
         if res["world_size"] == 1:
             return tensors

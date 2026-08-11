@@ -1,9 +1,13 @@
+from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
 
+from tokenspeed.runtime.distributed.comm_backend import nccl as nccl_module
 from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
@@ -85,6 +89,44 @@ def test_force_deterministic_rsag_routes_all_reduce_collection_to_nccl(
 def test_all_reduce_rejects_empty_collection(backend):
     with pytest.raises(ValueError, match="requires at least one tensor"):
         backend.all_reduce((), (0, 1))
+
+
+@pytest.mark.parametrize(
+    ("is_amd", "tensor_count", "expected_groups"),
+    [(True, 3, 1), (False, 2, 1), (False, 3, 0)],
+)
+def test_nccl_collection_grouping(monkeypatch, is_amd, tensor_count, expected_groups):
+    backend = NcclBackend()
+    group = (0, 1)
+    group_calls = []
+
+    @contextmanager
+    def coalescing_manager(*, group):
+        group_calls.append(group)
+        yield
+
+    monkeypatch.setattr(
+        nccl_module,
+        "current_platform",
+        lambda: SimpleNamespace(is_amd=is_amd),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_get_or_create_resources",
+        lambda _group: {
+            "world_size": 2,
+            "pynccl_comm": None,
+            "device_group": "device-group",
+        },
+    )
+    monkeypatch.setattr(torch.distributed, "_coalescing_manager", coalescing_manager)
+    all_reduce = Mock()
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+
+    tensors = tuple(torch.empty(1) for _ in range(tensor_count))
+    assert backend.all_reduce(tensors, group) == tensors
+    assert group_calls == ["device-group"] * expected_groups
+    assert all_reduce.call_count == tensor_count
 
 
 def test_plan_all_reduce_uses_triton(backend, monkeypatch):
