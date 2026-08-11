@@ -334,7 +334,7 @@ DeepEP legs and are unavailable without `--all2all-backend deepep`.
 ```bash
 # node 0 (serves the HTTP API)
 tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
-  --served-model-name qwen3.8-max \
+  --served-model-name Qwen/Qwen3.8-2.4T-A95B \
   --nnodes 2 --node-rank 0 --nprocs-per-node 8 --world-size 16 \
   --dist-init-addr <node0-host>:25000 \
   --attn-tp-size 16 \
@@ -351,7 +351,7 @@ tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
 
 # node 1 (same command, --node-rank 1)
 tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
-  --served-model-name qwen3.8-max \
+  --served-model-name Qwen/Qwen3.8-2.4T-A95B \
   --nnodes 2 --node-rank 1 --nprocs-per-node 8 --world-size 16 \
   --dist-init-addr <node0-host>:25000 \
   --attn-tp-size 16 \
@@ -375,7 +375,7 @@ routing on DeepEP dispatch/combine instead of all-gather:
 ```bash
 # node 0 (serves the HTTP API)
 tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
-  --served-model-name qwen3.8-max \
+  --served-model-name Qwen/Qwen3.8-2.4T-A95B \
   --nnodes 2 --node-rank 0 --nprocs-per-node 8 --world-size 16 \
   --dist-init-addr <node0-host>:25000 \
   --attn-tp-size 8 --data-parallel-size 2 --ep-size 16 \
@@ -394,7 +394,7 @@ tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
 
 # node 1 (same command, --node-rank 1)
 tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
-  --served-model-name qwen3.8-max \
+  --served-model-name Qwen/Qwen3.8-2.4T-A95B \
   --nnodes 2 --node-rank 1 --nprocs-per-node 8 --world-size 16 \
   --dist-init-addr <node0-host>:25000 \
   --attn-tp-size 8 --data-parallel-size 2 --ep-size 16 \
