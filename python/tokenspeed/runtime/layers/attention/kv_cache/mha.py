@@ -78,6 +78,7 @@ class MHATokenToKVPool(CachePool):
             token_capacity=token_capacity,
             backing_pool=backing_pool,
             field_layer_offset=field_layer_offset,
+            pd_disaggregation_enabled=pd_disaggregation_enabled,
         )
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -115,7 +116,6 @@ class MHATokenToKVPool(CachePool):
                 "recipe must supply one group id per layer "
                 "(CachePoolSpec.layer_group_ids)"
             )
-        self._pd_disaggregation_enabled = pd_disaggregation_enabled
         self._create_buffers()
 
         k_size, v_size = self.get_kv_size_bytes()

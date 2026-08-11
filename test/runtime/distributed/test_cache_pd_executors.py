@@ -83,9 +83,6 @@ def _destination_transfer_info(layout: CachePDLayout) -> TransferInfo:
         b"7",
         b"1",
         b"2",
-        b"0",
-        b"",
-        b"",
         b"",
         b"1",
         b"[]",
@@ -210,7 +207,7 @@ def test_decode_publishes_manifest_through_legacy_receiver() -> None:
     assert len(calls) == 1
     args, kwargs = calls[0]
     assert args[0].tolist() == [2, 3, 6]
-    assert args[1:5] == (7, 2, None, None)
+    assert args[1:] == (7, 2, None)
     assert kwargs["page_manifest"].groups[0].page_ids == (2, 3)
     assert executor._request_pool_indices == {"request-0": 7}
 
@@ -235,6 +232,7 @@ def test_prefill_submits_manifest_through_legacy_sender() -> None:
         transfer_infos={9: {destination.mooncake_session_id: destination}}
     )
     executor._request_token = {"request-0": 42}
+    executor._layerwise_enabled = False
 
     executor._cache_decode(_op())
 
@@ -284,7 +282,6 @@ def test_shared_manager_validates_manifest_before_dma() -> None:
         index_slice=slice(0, 3),
         is_last=True,
         prefill_aux_index=7,
-        mla_l1_5_args=None,
         page_manifest=source_manifest,
     )
     manager = object.__new__(MooncakeKVManagerPrefill)
@@ -481,6 +478,122 @@ def test_shared_manager_resolves_lcm_group_segments() -> None:
     ]
 
 
+def test_cache_transfer_blocks_filters_by_layer_range() -> None:
+    from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
+
+    layout = _segmented_layout(
+        capacity=5,
+        history_k_offset=768,
+        history_v_offset=2816,
+        state_offset=512,
+    )
+    source_manifest = CachePDPageManifest(
+        groups=(
+            CachePDGroupPages("history", (1, 2)),
+            CachePDGroupPages("state", (4,)),
+        ),
+        prefix_len=0,
+        prompt_len=4,
+    )
+    destination_manifest = CachePDPageManifest(
+        groups=(
+            CachePDGroupPages("history", (5, 6)),
+            CachePDGroupPages("state", (3,)),
+        ),
+        prefix_len=0,
+        prompt_len=4,
+    )
+    manager = object.__new__(MooncakeKVManagerPrefill)
+    manager.kv_args = SimpleNamespace(
+        cache_layout=layout,
+        kv_data_ptrs=[0x10000],
+        kv_item_lens=[1024],
+    )
+
+    def blocks_for(layer_range):
+        return manager._cache_transfer_blocks(
+            dst_ptrs=[0x20000],
+            src_indices=np.asarray([1, 2, 4], dtype=np.int64),
+            dst_indices=np.asarray([5, 6, 3], dtype=np.int64),
+            src_manifest=source_manifest,
+            dst_manifest=destination_manifest,
+            dst_num_pages_with_null=layout.num_pages_with_null,
+            dst_page_zero_offsets=layout.peer.page_zero_offset_map(),
+            layer_range=layer_range,
+        )
+
+    # layer.0 lives in the history group (k + v segments); layer.1 is the state
+    # group's ssm segment. Filtering by [0,1) drops the state slab entirely.
+    layer0 = blocks_for((0, 1))
+    assert [length for _, _, length in layer0] == [256, 256, 256, 256]
+    layer1 = blocks_for((1, 2))
+    assert [length for _, _, length in layer1] == [384]
+    # Union of the windows equals the unfiltered whole-request transfer.
+    assert blocks_for(None) == layer0 + layer1
+
+
+def test_cache_layerwise_streams_windows_gated_on_step() -> None:
+    from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
+
+    layout = _segmented_layout(
+        capacity=5,
+        history_k_offset=768,
+        history_v_offset=2816,
+        state_offset=512,
+    )
+    source_manifest = CachePDPageManifest(
+        groups=(
+            CachePDGroupPages("history", (1, 2)),
+            CachePDGroupPages("state", (4,)),
+        ),
+        prefix_len=0,
+        prompt_len=4,
+    )
+    destination_manifest = CachePDPageManifest(
+        groups=(
+            CachePDGroupPages("history", (5, 6)),
+            CachePDGroupPages("state", (3,)),
+        ),
+        prefix_len=0,
+        prompt_len=4,
+    )
+    waited_steps = []
+    sent = []
+    manager = object.__new__(MooncakeKVManagerPrefill)
+    manager.kv_args = SimpleNamespace(
+        cache_layout=layout,
+        kv_data_ptrs=[0x10000],
+        kv_item_lens=[1024],
+    )
+    manager.layer_num = 2
+    manager.layerwise_debug = False
+    manager._wait_until_cache_step = lambda step: waited_steps.append(step)
+    manager._transfer_data = lambda session, blocks: (
+        sent.append((session, [length for _, _, length in blocks])) or 0
+    )
+
+    ret = manager._cache_send_kvcache_layerwise(
+        "session",
+        np.asarray([1, 2, 4], dtype=np.int64),
+        [0x20000],
+        np.asarray([5, 6, 3], dtype=np.int64),
+        begin_cache_step=100,
+        interval=1,
+        src_page_manifest=source_manifest,
+        dst_page_manifest=destination_manifest,
+        dst_num_pages_with_null=layout.num_pages_with_null,
+        dst_page_zero_offsets=layout.peer.page_zero_offset_map(),
+    )
+
+    assert ret == 0
+    # One window per layer, each blocking on that layer's cache step first.
+    assert waited_steps == [100, 101]
+    assert sent == [
+        ("session", [256, 256, 256, 256]),
+        ("session", [384]),
+    ]
+
+
 def test_shared_manager_uses_destination_page_zero_offsets() -> None:
     from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
 
@@ -573,7 +686,6 @@ def test_cache_uses_equal_tp_identity_route() -> None:
     prefill = PrefillParallelInfo(
         tp_size=8,
         dp_size=1,
-        enable_mla_l1_5_cache=False,
         kv_item_lens=(16, 16),
         kv_unit_lens=(16, 16),
         cache_layout=layout.peer,

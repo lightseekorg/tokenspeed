@@ -115,8 +115,8 @@ def test_lcm_parent_demand_uses_per_group_packing() -> None:
 
 
 def test_k3_merged_solve_with_draft_shares_page_ids():
-    """One big model: a draft MLA layer joins the K3 solve as continuation
-    layer 93 in the full_attention group — same packing, same page-id
+    """One big model: five BF16 draft MLA layers join the K3 solve as
+    continuation layers 93-97 in the full_attention group — same packing/page-id
     space, one plan, one arena."""
     import torch
 
@@ -126,10 +126,10 @@ def test_k3_merged_solve_with_draft_shares_page_ids():
     )
 
     draft_fields = mla_cache_fields(
-        layer_group_ids=("full_attention",),
+        layer_group_ids=("full_attention",) * 5,
         logical_block_tokens=128,
         latent_width=576,
-        element_size=1,
+        element_size=torch.bfloat16.itemsize,
     )
     merged = solve_kimi_k3_cache_layout(
         KimiLinearConfig(),
@@ -138,22 +138,30 @@ def test_k3_merged_solve_with_draft_shares_page_ids():
         mla_quant_method=None,
         draft_fields=draft_fields,
     )
-    # 24 target MLA planes + 1 draft continuation plane.
-    assert len(merged.plane_bytes) == 25
+    # 24 target MLA planes + 5 draft continuation planes.
+    assert len(merged.plane_bytes) == 29
     assert dict(merged.group_packing)["full_attention"] == 12
     plan = merged.with_num_lcm_blocks(7)
-    draft_field = plan.field("layer.93.latent_kv")
     target_field = plan.field("layer.3.latent_kv")
-    assert draft_field.group_id == target_field.group_id == "full_attention"
-    assert draft_field.page_stride_bytes == target_field.page_stride_bytes
+    assert target_field.element_size == 1
+    target_plane_ids = {f"slot.{slot}" for slot in range(24)}
+    for global_layer_id in range(93, 98):
+        draft_field = plan.field(f"layer.{global_layer_id}.latent_kv")
+        assert draft_field.group_id == target_field.group_id == "full_attention"
+        assert draft_field.plane_id == f"slot.{global_layer_id}"
+        assert draft_field.plane_id not in target_plane_ids
+        assert draft_field.element_size == 2
+        assert draft_field.page_stride_bytes == 2 * target_field.page_stride_bytes
     # One group -> one page-id space: same page_count by identity.
     assert plan.group("full_attention").page_count == 1 + 7 * 12
+    assert merged.lcm_block_bytes == 30_081_024
+    assert plan.arena_bytes == 8 * merged.lcm_block_bytes
 
 
-def test_k3_binding_utilization_baseline_and_draft_widening():
+def test_k3_binding_utilization_with_real_bf16_draft_geometry():
     """Binding-hole metric on real K3 geometry: full bindings use
-    the whole parent; state bindings use 88.2%, dropping to ~84.7% when a
-    1-layer draft plane widens the parent (naive join)."""
+    the whole parent; state bindings use 88.2%, dropping to ~62.2% when the
+    five BF16 draft planes widen the parent."""
     import torch
 
     from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
@@ -175,10 +183,10 @@ def test_k3_binding_utilization_baseline_and_draft_widening():
         )
 
     draft_fields = mla_cache_fields(
-        layer_group_ids=("full_attention",),
+        layer_group_ids=("full_attention",) * 5,
         logical_block_tokens=128,
         latent_width=576,
-        element_size=1,
+        element_size=torch.bfloat16.itemsize,
     )
     merged = solve_kimi_k3_cache_layout(
         KimiLinearConfig(),
@@ -189,4 +197,4 @@ def test_k3_binding_utilization_baseline_and_draft_widening():
     ).with_num_lcm_blocks(10)
     widened = merged.capacity_report()
     assert abs(widened["full_attention"]["binding_utilization"] - 1.0) < 1e-3
-    assert abs(widened["linear_attention_0"]["binding_utilization"] - 0.847) < 1e-3
+    assert abs(widened["linear_attention_0"]["binding_utilization"] - 0.6224) < 1e-3

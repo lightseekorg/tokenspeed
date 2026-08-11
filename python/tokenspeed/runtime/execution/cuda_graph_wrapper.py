@@ -245,11 +245,6 @@ class CudaGraphWrapper:
                 "paged_cache_group_page_counts",
                 None,
             ),
-            logical_page_size=getattr(
-                getattr(token_to_kv_pool, "runtime_contract", None),
-                "block_size",
-                None,
-            ),
             max_tokens_per_req=self.max_tokens_per_req,
             overlap_schedule_depth=self.overlap_schedule_depth,
         )
@@ -263,11 +258,6 @@ class CudaGraphWrapper:
                 paged_cache_group_page_counts=getattr(
                     draft_token_to_kv_pool,
                     "paged_cache_group_page_counts",
-                    None,
-                ),
-                logical_page_size=getattr(
-                    getattr(draft_token_to_kv_pool, "runtime_contract", None),
-                    "block_size",
                     None,
                 ),
                 max_tokens_per_req=self.max_tokens_per_req,

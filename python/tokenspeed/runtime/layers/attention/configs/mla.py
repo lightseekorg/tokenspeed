@@ -40,8 +40,9 @@ def resolve_mla_kv_cache_dtype(
 
     The public K3 DSpark checkpoint has no FP8 KV scales and its reference vLLM
     launch uses the default BF16 cache. TokenSpeed's K3 target currently requires
-    FP8 LCM storage, but the draft owns a separate pool, so keep only that pool
-    in BF16. Other MLA drafts continue to honor the global cache setting.
+    FP8 LCM storage, so the unified arena exposes a separate BF16 compute view
+    for the draft continuation fields. Other MLA drafts continue to honor the
+    global cache setting.
     """
     hf_config = getattr(model_config, "hf_config", None)
     if (

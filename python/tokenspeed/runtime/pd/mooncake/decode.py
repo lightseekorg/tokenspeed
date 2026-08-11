@@ -44,7 +44,6 @@ logger = get_colorful_logger(__name__)
 class PrefillParallelInfo:
     tp_size: int
     dp_size: int
-    enable_mla_l1_5_cache: bool
     kv_item_lens: tuple[int, ...] = ()
     kv_unit_lens: tuple[int, ...] = ()
     state_item_lens: tuple[int, ...] = ()

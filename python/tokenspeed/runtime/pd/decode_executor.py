@@ -120,7 +120,6 @@ class DisaggDecodeExecutor:
                 aux_index,
                 prefix_len,
                 None,
-                None,
                 page_manifest=manifest,
             )
 
@@ -163,7 +162,6 @@ class DisaggDecodeExecutor:
                 kv_indices,
                 aux_index,
                 extend_prefix_len,
-                None,  # mla_l1_5_args
                 None,
             )
 
