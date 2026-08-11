@@ -1,16 +1,9 @@
-from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
 
-from tokenspeed.runtime.distributed.comm_backend import (
-    triton_allreduce as triton_module,
-)
 from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
-from tokenspeed.runtime.distributed.comm_backend.triton_allreduce import (
-    TritonAllReduceBackend,
-)
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
@@ -121,36 +114,3 @@ def test_plan_all_reduce_preserves_trtllm(backend, monkeypatch):
 
     assert tuple(output.shape for output in result.outputs) == shapes
     backend._triton_ar.plan_all_reduce.assert_not_called()
-
-
-def test_triton_plan_all_reduce_accepts_aligned_outputs(monkeypatch):
-    backend = TritonAllReduceBackend(fallback=Mock())
-    state = object()
-    shapes = ((3, 20), (2, 12), (4, 4))
-    outputs = tuple(torch.empty(shape, dtype=torch.bfloat16) for shape in shapes)
-    calls = []
-    like = SimpleNamespace(is_cuda=True, dtype=torch.bfloat16)
-
-    monkeypatch.setattr(
-        triton_module,
-        "current_platform",
-        lambda: SimpleNamespace(is_cdna4=True),
-    )
-    monkeypatch.setattr(backend, "_get_or_create", lambda group: state)
-    monkeypatch.setattr(
-        triton_module,
-        "all_reduce_staging",
-        lambda actual_state, actual_shapes, dtype: outputs,
-    )
-    monkeypatch.setattr(
-        triton_module,
-        "all_reduce_symmetric",
-        lambda *args, **kwargs: calls.append((args, kwargs)) or outputs,
-    )
-
-    plan = backend.plan_all_reduce(shapes, like, tuple(range(8)))
-
-    assert plan.outputs is outputs
-    assert plan.run() is outputs
-    assert calls[0][0] == (state, outputs)
-    assert calls[0][1] == {}

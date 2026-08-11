@@ -47,11 +47,11 @@ from tokenspeed_kernel.ops.communication import (
 )
 
 from tokenspeed.runtime.distributed.comm_backend import (
-    AllReducePlan,
     CommBackend,
     Group,
     get_global_backend,
 )
+from tokenspeed.runtime.distributed.comm_backend.base import AllReducePlan
 
 # Re-exported for reduce-strategy callers (e.g. kimi3_join_reduce_moe):
 # tensors past the one-shot admission window always take an NCCL path.
@@ -224,18 +224,7 @@ def plan_all_reduce(
     backend: CommBackend | None = None,
     op: torch.distributed.ReduceOp = torch.distributed.ReduceOp.SUM,
 ) -> AllReducePlan:
-    """Allocate producer outputs and bind the selected collective path.
-
-    Args:
-        shapes: Shapes of the outputs the producer will write.
-        like: Tensor providing dtype and device for ordinary allocations.
-        group: Global ranks participating in every reduction.
-        backend: Optional communication backend override.
-        op: Reduction operation.
-
-    Returns:
-        A plan containing writable outputs and their reduction operation.
-    """
+    """Allocate producer outputs and bind their collective."""
     if backend is None:
         backend = get_global_backend()
     return backend.plan_all_reduce(shapes, like, group, op=op)

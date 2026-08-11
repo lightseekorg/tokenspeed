@@ -80,8 +80,8 @@ def _ar_shape_cases() -> List[Tuple[int, ...]]:
     ]
 
 
-def _ar_two_shape_cases() -> List[Tuple[Tuple[int, ...], Tuple[int, ...]]]:
-    """Aligned segment pairs, including K3 decode and larger token counts."""
+def _ar_output_shape_cases() -> List[Tuple[Tuple[int, ...], ...]]:
+    """Producer-direct collections spanning one, two, and three outputs."""
     return [
         ((1, 7168), (1, 3584)),
         ((2, 7168), (2, 3584)),
@@ -89,13 +89,6 @@ def _ar_two_shape_cases() -> List[Tuple[Tuple[int, ...], Tuple[int, ...]]]:
         ((8, 7168), (8, 3584)),
         ((16, 7168), (16, 3584)),
         ((3, 20), (2, 12)),
-    ]
-
-
-def _ar_output_shape_cases() -> List[Tuple[Tuple[int, ...], ...]]:
-    """Producer-direct collections spanning one, two, and three outputs."""
-    return [
-        *((first, second) for first, second in _ar_two_shape_cases()),
         ((2, 16),),
         ((3, 20), (2, 12), (4, 4)),
     ]

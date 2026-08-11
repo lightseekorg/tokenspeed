@@ -45,7 +45,7 @@ class TestAutoBackendTopology:
 
     @pytest.mark.parametrize("method", ["token_all_gather", "token_reduce_scatter"])
     def test_cross_node_token_ops_fall_back_to_nccl(self, backend, method):
-        tensor = torch.empty(1)
+        tensor = Mock()
         scattered = [1] * 8
         getattr(backend._nccl, method).return_value = "nccl-result"
 
@@ -59,7 +59,7 @@ class TestAutoBackendTopology:
 
     @pytest.mark.parametrize("method", ["token_all_gather", "token_reduce_scatter"])
     def test_node_local_token_ops_use_rsag(self, backend, method):
-        tensor = torch.empty(1)
+        tensor = Mock()
         scattered = [1] * 4
         getattr(backend._rsag, method).return_value = "rsag-result"
 

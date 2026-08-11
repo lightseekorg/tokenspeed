@@ -23,7 +23,6 @@
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import overload
 
 import torch
 
@@ -32,16 +31,10 @@ from tokenspeed.runtime.distributed.mapping import Group
 
 @dataclass(frozen=True)
 class AllReducePlan:
-    """Producer outputs paired with their selected reduction.
-
-    ``outputs`` must be fully written before calling :meth:`run`.
-    """
+    """Writable producer outputs and their reduction."""
 
     outputs: tuple[torch.Tensor, ...]
-    _run: Callable[[], tuple[torch.Tensor, ...]]
-
-    def run(self) -> tuple[torch.Tensor, ...]:
-        return self._run()
+    run: Callable[[], tuple[torch.Tensor, ...]]
 
 
 class CommBackend(ABC):
@@ -52,16 +45,6 @@ class CommBackend(ABC):
     """
 
     # ---- Collective ops ----
-
-    @overload
-    def all_reduce(
-        self, tensor: torch.Tensor, group: Group, op=None
-    ) -> torch.Tensor: ...
-
-    @overload
-    def all_reduce(
-        self, tensor: tuple[torch.Tensor, ...], group: Group, op=None
-    ) -> tuple[torch.Tensor, ...]: ...
 
     @abstractmethod
     def all_reduce(

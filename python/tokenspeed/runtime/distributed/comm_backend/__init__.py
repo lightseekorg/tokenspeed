@@ -18,18 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from tokenspeed.runtime.distributed.comm_backend.base import (
-    AllReducePlan,
-    CommBackend,
-    Group,
-)
+from tokenspeed.runtime.distributed.comm_backend.base import CommBackend, Group
 from tokenspeed.runtime.distributed.comm_backend.registry import (
     get_global_backend,
     initialize_comm_backend,
 )
 
 __all__ = [
-    "AllReducePlan",
     "CommBackend",
     "Group",
     "get_global_backend",

@@ -287,7 +287,6 @@ def test_kimi3_moe_execution_policy_is_selected_outside_model() -> None:
     backend = SimpleNamespace(
         is_auto=lambda: True,
         is_flashinfer_trtllm=lambda: False,
-        is_marlin=lambda: False,
     )
 
     with mock.patch.object(

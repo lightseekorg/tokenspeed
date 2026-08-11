@@ -37,7 +37,7 @@ from tokenspeed_kernel.ops.moe import (
 )
 from torch import nn
 
-from tokenspeed.runtime.distributed.comm_backend import AllReducePlan
+from tokenspeed.runtime.distributed.comm_backend.base import AllReducePlan
 from tokenspeed.runtime.distributed.comm_ops import (
     COMM_ONESHOT_MAX_BYTES,
     all_reduce,
