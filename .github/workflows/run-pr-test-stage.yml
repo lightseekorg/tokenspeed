@@ -112,6 +112,9 @@ jobs:
         with:
           name: pr-test-${{ matrix.name }}-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}-logs
           path: ${{ env.WORK_DIR }}/.ci-artifacts/
+          # .ci-artifacts is a dot-directory; without this the default
+          # hidden-file filter drops everything under it.
+          include-hidden-files: true
           if-no-files-found: ignore
 
       - name: Cleanup work directory
