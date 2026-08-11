@@ -27,6 +27,7 @@ import torch
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
+from tokenspeed.runtime.execution.context import get_current_lora_manager
 from tokenspeed.runtime.layers.activation import SwigluArg
 from tokenspeed.runtime.layers.moe.topk import TopKOutput, TopKOutputFormat
 from tokenspeed.runtime.layers.moe.types import MoELayerSpec
@@ -272,6 +273,18 @@ class MoELayer(torch.nn.Module):
     def supports_deferred_finalize(self) -> bool:
         return self.plan["supports_deferred_finalize"]
 
+    @property
+    def supports_moe_lora(self) -> bool:
+        """Whether the planned apply kernel exposes the MoE LoRA hook seam.
+
+        The per-expert LoRA deltas have to land on the pre-activation gate/up
+        values and on the routed intermediate, so a kernel can only host them if
+        it exposes both in a layout the LoRA kernels can index. Today that is the
+        precomputed-topk Triton bf16 kernel; vendor-fused kernels and the
+        kernel-routing path return False.
+        """
+        return bool(self.plan.get("supports_moe_lora", False))
+
     def forward_zero_experts(self, topk_output):
         zero_expert_limit = self.num_experts
         if self.ep_num_redundant_experts is not None:
@@ -312,6 +325,29 @@ class MoELayer(torch.nn.Module):
         """
         if not do_finalize and not self.supports_deferred_finalize:
             raise AssertionError("MoELayer does not support do_finalize=False")
+
+        # Resolve any active MoE LoRA context and stash it on the module, since
+        # the planned apply kernel receives ``self`` as its weight module and
+        # reads the context from there. Raise rather than silently skipping LoRA
+        # on a kernel that has no seam -- a quietly base-model MoE layer inside
+        # an adapted model is far harder to notice than a failed request.
+        self._moe_lora_ctx = None
+        lora_manager = get_current_lora_manager()
+        if lora_manager is not None and getattr(lora_manager, "enable_moe_lora", False):
+            if not self.supports_moe_lora:
+                raise NotImplementedError(
+                    "MoE LoRA is not supported by the selected MoE kernel "
+                    f"({self.plan.get('apply_kernel_name')}); it requires the "
+                    "precomputed-topk Triton bf16 MoE kernel. Select the Triton "
+                    "MoE solution for LoRA-enabled MoE models."
+                )
+            if self.ep_size != 1:
+                raise NotImplementedError(
+                    "MoE LoRA currently supports local/tensor-parallel MoE only; "
+                    "expert-parallel dispatch needs the LoRA slot map dispatched "
+                    "with the tokens."
+                )
+            self._moe_lora_ctx = lora_manager.moe_lora_context
 
         if self.support_routing:
             return tokenspeed_kernel.moe_apply(
