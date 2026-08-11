@@ -105,11 +105,19 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
         fp32_internal: bool = False,
         include_reduce_scatter: bool = True,
         include_routed: bool = True,
+        use_pdl: bool | None = None,
     ):
-        # Bound here, in host Python: the JIT resolves names off self,
-        # not module globals, so reading the constant at the launch
-        # site itself fails to compile.
-        self.use_pdl = PDL_ENABLED
+        # The collective is the tail's FIRST kernel, so its PDL primary is
+        # whichever kernel the model ran last -- for K3 the flashinfer trtllm
+        # MoE chain, whose routing kernel fires its programmatic-launch
+        # trigger long before GEMM2/finalize finish writing the routed
+        # partial this kernel reads (see flashinfer#3835). A PDL launch here
+        # can therefore consume partially-written expert output. Plain launch
+        # restores full stream ordering against the producer; the
+        # up-projection and gather keep PDL, whose primaries are the tail's
+        # own kernels with sound trigger placement. (Bound in host Python:
+        # the JIT resolves names off self, not module globals.)
+        self.use_pdl = False if use_pdl is None else (use_pdl and PDL_ENABLED)
         validate_shape(
             tp_size=tp_size,
             latent_dim=latent_dim,

@@ -26,7 +26,12 @@ import os
 # become part of every compile cache key. Turning it off is always safe —
 # in-kernel griddepcontrol waits degenerate to no-ops and plain stream
 # ordering is strictly stronger.
-PDL_ENABLED = os.environ.get("TOKENSPEED_DISABLE_PDL") != "1"
+PDL_ENABLED = (
+    os.environ.get("TOKENSPEED_DISABLE_PDL") != "1"
+    # Tail-only kill-switch: disables PDL in just these four kernels while the
+    # rest of the model keeps it, isolating whose PDL chain costs accuracy.
+    and os.environ.get("TOKENSPEED_K3_TAIL_DISABLE_PDL") != "1"
+)
 
 NEG_ZERO_F32_BITS = 0x80000000
 NEG_ZERO_BF16_BITS = 0x8000
