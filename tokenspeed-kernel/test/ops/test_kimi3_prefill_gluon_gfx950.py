@@ -89,23 +89,31 @@ def test_attn_res_large_prefill_dispatch_boundary(monkeypatch) -> None:
         return lambda **kwargs: None
 
     monkeypatch.setattr(attn_res, "select_kernel", capture_selection)
-    norm = torch.empty(7168, device="meta", dtype=torch.bfloat16)
     cases = (
-        (16384, norm),
-        (16385, norm),
-        (65536, norm),
-        (65537, norm),
-        (32768, None),
+        (16384, 7168, True),
+        (16385, 7168, True),
+        (65536, 7168, True),
+        (65537, 7168, True),
+        (32768, 7168, False),
+        (64, 4096, True),
     )
-    for tokens, output_norm in cases:
-        layer = torch.empty(tokens, 7168, device="meta", dtype=torch.bfloat16)
-        history = torch.empty(11, tokens, 7168, device="meta", dtype=torch.bfloat16)
-        attn_res.attn_res_fwd(layer, history, norm, norm, out_norm_weight=output_norm)
+    for tokens, hidden, fuse_output_norm in cases:
+        weight = torch.empty(hidden, device="meta", dtype=torch.bfloat16)
+        layer = torch.empty(tokens, hidden, device="meta", dtype=torch.bfloat16)
+        history = torch.empty(11, tokens, hidden, device="meta", dtype=torch.bfloat16)
+        attn_res.attn_res_fwd(
+            layer,
+            history,
+            weight,
+            weight,
+            out_norm_weight=weight if fuse_output_norm else None,
+        )
 
     assert selected == [
         "gluon_attn_res_fwd_gfx950",
         "gluon_attn_res_fwd_gfx950",
         "gluon_attn_res_fwd_gfx950",
+        "torch_attn_res_fwd",
         "torch_attn_res_fwd",
         "torch_attn_res_fwd",
     ]

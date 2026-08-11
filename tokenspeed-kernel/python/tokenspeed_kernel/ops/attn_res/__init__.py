@@ -27,10 +27,9 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = ["attn_res_fwd"]
 
-# Common specialized-kernel coverage. The larger gfx950 bound is restricted to
-# the Kimi K3 shape and its fused output RMSNorm below.
-_SUPPORTED_H = frozenset({4096, 5120, 6144, 7168, 8192})
-_MAX_TOKENS = 16384
+# The Blackwell launcher instantiates aligned hidden sizes in [4096, 8192].
+# gfx950 currently specializes Kimi K3's H=7168 fused-output-norm path.
+_MAX_BLACKWELL_TOKENS = 16384
 _MAX_GFX950_TOKENS = 65536
 _MAX_N = 12
 
@@ -64,12 +63,16 @@ def attn_res_fwd(
     """
     T, H = layer_residual.shape
     N = block_residual.shape[0] + 1
-    max_tokens = (
-        _MAX_GFX950_TOKENS
-        if H == 7168 and out_norm_weight is not None and Platform.get().is_cdna4
-        else _MAX_TOKENS
-    )
-    eligible = H in _SUPPORTED_H and 1 <= T <= max_tokens and 1 <= N <= _MAX_N
+    platform = Platform.get()
+    if platform.is_cdna4:
+        eligible = (
+            H == 7168 and out_norm_weight is not None and 1 <= T <= _MAX_GFX950_TOKENS
+        )
+    else:
+        eligible = (
+            4096 <= H <= 8192 and H % 1024 == 0 and 1 <= T <= _MAX_BLACKWELL_TOKENS
+        )
+    eligible = eligible and 1 <= N <= _MAX_N
     signature = format_signature(
         layer_residual=dense_tensor_format(layer_residual.dtype),
         block_residual=dense_tensor_format(block_residual.dtype),
