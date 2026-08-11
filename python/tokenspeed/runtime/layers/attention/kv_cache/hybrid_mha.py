@@ -46,6 +46,7 @@ class HybridMHATokenToKVPool(MHATokenToKVPool):
         memory_plan: CacheMemoryPlan,
         layer_group_ids: tuple[str, ...],
         state_field_dtypes: Mapping[str, torch.dtype] | None = None,
+        pd_disaggregation_enabled: bool = False,
         **kwargs,
     ):
         group_ids = tuple(layer_group_ids)
@@ -63,7 +64,12 @@ class HybridMHATokenToKVPool(MHATokenToKVPool):
         if len(group_ids) != kwargs["layer_num"]:
             raise ValueError("cache group ids must cover every model layer")
 
-        super().__init__(memory_plan=memory_plan, layer_group_ids=group_ids, **kwargs)
+        super().__init__(
+            memory_plan=memory_plan,
+            layer_group_ids=group_ids,
+            pd_disaggregation_enabled=pd_disaggregation_enabled,
+            **kwargs,
+        )
 
     def _create_buffers(self) -> None:
         with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
@@ -133,15 +139,6 @@ class HybridMHATokenToKVPool(MHATokenToKVPool):
         return [
             self._state_buffers_by_layer[layer_id] for layer_id in self._state_layer_ids
         ]
-
-    @property
-    def supports_disaggregation(self) -> bool:
-        return self._pd_disaggregation_enabled
-
-    def get_pd_cache_contract(self):
-        if not self.supports_disaggregation:
-            raise RuntimeError("paged cache PD requires an enabled state MHA pool")
-        return self.pd_contract(self.paged_cache_group_specs)
 
     def group_id_for_layer(self, layer_id: int) -> str:
         try:

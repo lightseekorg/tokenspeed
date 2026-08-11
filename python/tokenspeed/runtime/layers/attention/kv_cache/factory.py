@@ -53,6 +53,7 @@ def create_cache_pool(
             memory_plan=plan,
             paged_cache_group_specs=spec.paged_cache_group_specs,
             token_capacity=spec.token_capacity,
+            pd_disaggregation_enabled=config.pd_disaggregation_enabled,
         )
     if isinstance(config, DSAConfig):
         from tokenspeed.runtime.layers.attention.kv_cache.dsa import (
@@ -76,6 +77,7 @@ def create_cache_pool(
             paged_cache_group_specs=spec.paged_cache_group_specs,
             token_capacity=spec.token_capacity,
             layer_group_ids=spec.layer_group_ids,
+            pd_disaggregation_enabled=config.pd_disaggregation_enabled,
         )
     if isinstance(config, MSAConfig):
         from tokenspeed.runtime.layers.attention.kv_cache.msa import (
@@ -201,6 +203,7 @@ def create_cache_pool(
                 paged_cache_group_specs=spec.paged_cache_group_specs,
                 token_capacity=spec.token_capacity,
                 layer_group_ids=spec.layer_group_ids,
+                pd_disaggregation_enabled=config.pd_disaggregation_enabled,
             )
 
         if spec.family != "kimi_k3":

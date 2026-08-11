@@ -44,9 +44,6 @@ from tokenspeed.runtime.pd.transfer_plan import (
     RankTransferPlan,
     encode_transfer_fragments,
 )
-from tokenspeed.runtime.pd.utils import (
-    PageTransferMetadata,
-)
 from tokenspeed.runtime.utils import (
     get_colorful_logger,
 )
@@ -78,9 +75,6 @@ def _get_prefill_parallel_info_from_server(
             return PrefillParallelInfo(
                 tp_size=int(prefill_parallel_info["prefill_tp_size"]),
                 dp_size=int(prefill_parallel_info["prefill_dp_size"]),
-                enable_mla_l1_5_cache=bool(
-                    prefill_parallel_info["enable_mla_l1_5_cache"]
-                ),
                 kv_item_lens=tuple(
                     int(x) for x in prefill_parallel_info.get("kv_item_lens", [])
                 ),
@@ -416,18 +410,6 @@ def _calc(kv_mgr, prefill_parallel_info: PrefillParallelInfo) -> ReceiverRoutePl
     if prefill_cache_layout is not None:
         raise RuntimeError("non-Paged cache decode connected to a Paged cache prefill")
 
-    if prefill_parallel_info.enable_mla_l1_5_cache:
-        if not kv_mgr.is_mla_backend:
-            raise RuntimeError(
-                "PD with MLA L1.5 cache is not yet supported for non-MLA models"
-            )
-        return _legacy_mla_route_plan(
-            target_tp_rank=None,
-            target_tp_ranks=range(prefill_tp_size_per_dp_rank),
-            required_dst_info_num=local_tp_size_per_dp_rank,
-            required_prefill_response_num=prefill_tp_size_per_dp_rank,
-        )
-
     if not kv_mgr.is_mla_backend:
         return _build_non_mla_route_plan(kv_mgr, prefill_parallel_info)
 
@@ -484,8 +466,6 @@ class MooncakeKVReceiver:
         self.session_id = self.kv_mgr.get_session_id()
         self.conclude_state = None
         self.init_time = None
-        self.prefill_enable_mla_l1_5_cache = None
-        self.dst_enable_mla_l1_5_cache = False
 
         self.kv_mgr.update_status(self.bootstrap_room, TransferPoll.Bootstrapping)
         logger.info(
@@ -649,7 +629,6 @@ class MooncakeKVReceiver:
         kv_indices: npt.NDArray[np.int64],
         aux_index: int | None = None,
         decode_prefix_len: int | None = 0,
-        mla_l1_5_args: PageTransferMetadata | None = None,
         mamba_indices: npt.NDArray[np.int64] | None = None,
         page_manifest: CachePDPageManifest | None = None,
     ):
@@ -679,12 +658,6 @@ class MooncakeKVReceiver:
                 num_pages_with_null=cache_layout.num_pages_with_null,
                 peer="destination",
             )
-        dst_page_transfer_mask = None
-        dst_page_local_indices = None
-        if mla_l1_5_args is not None:
-            dst_page_transfer_mask = mla_l1_5_args.page_transfer_mask
-            dst_page_local_indices = mla_l1_5_args.page_local_indices
-
         for bootstrap_info in self.bootstrap_infos:
             self.prefill_server_url = (
                 f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
@@ -715,21 +688,6 @@ class MooncakeKVReceiver:
                     (
                         str(self.decode_prefix_len).encode("ascii")
                         if not is_dummy
-                        else b""
-                    ),
-                    (
-                        str(int(self.dst_enable_mla_l1_5_cache)).encode("ascii")
-                        if not is_dummy
-                        else b""
-                    ),
-                    (
-                        dst_page_transfer_mask.tobytes()
-                        if (not is_dummy and dst_page_transfer_mask is not None)
-                        else b""
-                    ),
-                    (
-                        dst_page_local_indices.tobytes()
-                        if (not is_dummy and dst_page_local_indices is not None)
                         else b""
                     ),
                     (

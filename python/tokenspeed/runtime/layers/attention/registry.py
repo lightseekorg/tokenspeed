@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-import inspect
 import logging
 import os
 from typing import TYPE_CHECKING
@@ -994,11 +993,7 @@ def create_attn_components(
         mark_cache_contract = getattr(side_backend, "mark_cache_contract", None)
         if mark_cache_contract is None:
             continue
-        params = inspect.signature(mark_cache_contract).parameters
-        if "logical_page_size" in params:
-            mark_cache_contract(logical_page_size=side_pool.plan.logical_block_tokens)
-        else:
-            mark_cache_contract()
+        mark_cache_contract()
 
     _prepare_verify_workspace(
         server_args=server_args,

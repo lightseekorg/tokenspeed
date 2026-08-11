@@ -33,7 +33,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheMemor
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     PagedCacheGroupSpec,
 )
-from tokenspeed.runtime.layers.attention.page_table import expand_page_table
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.utils import get_colorful_logger
 
@@ -63,11 +62,17 @@ class CachePool:
         paged_cache_group_specs: tuple[PagedCacheGroupSpec, ...] = (),
         token_capacity: int | None = None,
         backing_pool: CachePool | None = None,
+        pd_disaggregation_enabled: bool = False,
     ):
         self.dtype = dtype
         self.rank = rank
         self.size = size
         self.page_size = page_size
+        # PD disaggregation transfers the whole LCM arena over the cache-group
+        # contract (get_pd_cache_contract): one physical parent page per
+        # Mooncake unit, so a strided multi-field arena moves correctly. Every
+        # contract-planned pool supports it uniformly.
+        self._pd_disaggregation_enabled = bool(pd_disaggregation_enabled)
         if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
             #  Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
             self.store_dtype = torch.uint8
@@ -201,44 +206,6 @@ class CachePool:
         self._fields[field_id] = view
         return view
 
-    def expand_block_table(
-        self,
-        group_id: str | None,
-        block_table: torch.Tensor,
-        *,
-        kernel_block_tokens: int,
-        max_kernel_blocks: int | None = None,
-        out: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Map scheduler CacheBlock IDs to the blocks consumed by a kernel."""
-        logical_block_tokens = self._scheduler_block_tokens(group_id)
-        return expand_page_table(
-            block_table,
-            logical_page_size=logical_block_tokens,
-            kernel_page_size=kernel_block_tokens,
-            max_kernel_pages=max_kernel_blocks,
-            out=out,
-        )
-
-    def _scheduler_block_tokens(self, group_id: str | None) -> int:
-        if group_id is None:
-            history_specs = tuple(
-                spec
-                for spec in self.paged_cache_group_specs
-                if spec.family == "history"
-            )
-            if len(history_specs) != 1:
-                raise ValueError(
-                    "cache pool must publish exactly one history group when "
-                    "the backend does not name a group"
-                )
-            return history_specs[0].cache_block_tokens
-        for spec in self.paged_cache_group_specs:
-            if spec.group_id == group_id:
-                return spec.cache_block_tokens
-        self.plan.group(group_id)
-        return self.plan.logical_block_tokens
-
     def zero_blocks(self, block_ids_by_group: dict[str, list[int]]) -> None:
         """Clear selected CacheBlocks without interpreting their field types."""
         buffer = self._ensure_buffer()
@@ -249,6 +216,24 @@ class CachePool:
         ]
         if segments:
             zero_byte_segments(buffer, segments)
+
+    @property
+    def supports_disaggregation(self) -> bool:
+        """True when this pool can move its KV over the PD cache-group contract.
+
+        Enabled by --disaggregation-mode; every contract-planned pool exposes
+        the same raw-slab transfer ABI (get_pd_cache_contract), so PD is a
+        uniform capability rather than a per-family special case.
+        """
+        return self._pd_disaggregation_enabled
+
+    def get_pd_cache_contract(self):
+        """Describe the LCM arena for PD transfer (layout + slab registrations)."""
+        if not self.supports_disaggregation:
+            raise RuntimeError(
+                "paged cache PD requires --disaggregation-mode on this pool"
+            )
+        return self.pd_contract(self.paged_cache_group_specs)
 
     def pd_contract(self, group_specs):
         buffer = self._ensure_buffer()

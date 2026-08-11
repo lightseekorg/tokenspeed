@@ -172,7 +172,6 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         cache_metadata = kwargs.pop("cache_metadata", None)
         forward_batch = kwargs.pop("forward_batch", None)
         group_table = None
-        logical_page_size = None
         published_draft_page_table = False
         if (
             cache_metadata is not None
@@ -188,11 +187,13 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             forward_batch = None
         if cache_metadata is not None:
             self._cache_groups_bound = True
-            group_table, logical_page_size = self._resolve_full_history_table(
+            group_table = self._resolve_full_history_table(
                 cache_metadata, forward_batch, bs
             )
             if cache_debug_enabled():
-                self._validate_live_pages(group_table, seq_lens[:bs], logical_page_size)
+                cache_metadata.validate_live_pages(
+                    seq_lens[:bs], active_forward_op=forward_batch
+                )
         elif self._draft_reads_batch_pages(bs, forward_mode):
             # The drafter drives the draft backend directly and passes no cache
             # metadata. ModelExecutor has already published and expanded the
@@ -217,7 +218,6 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
                 extend_seq_lens=extend_seq_lens[:num_extends],
                 extend_seq_lens_cpu=extend_seq_lens_cpu[:num_extends],
                 group_table=group_table,
-                logical_page_size=logical_page_size,
             )
 
         if (
@@ -234,7 +234,6 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
                 seq_lens=seq_lens,
                 page_table=page_table,
                 group_table=group_table,
-                logical_page_size=logical_page_size,
                 q_len_per_req=self._verify_q_len(forward_mode),
                 page_table_is_batch_ordered=published_draft_page_table,
             )
@@ -259,7 +258,6 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         extend_seq_lens: torch.Tensor,
         extend_seq_lens_cpu: torch.Tensor,
         group_table: torch.Tensor | None = None,
-        logical_page_size: int | None = None,
     ):
         extend_seq_lens_cpu_list = [int(x) for x in extend_seq_lens_cpu.tolist()]
         cum_extend_seq_lens = torch.zeros(
@@ -283,25 +281,19 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             torch.cumsum(seq_lens, dim=0, out=cum_seq_lens_kv[1:])
 
         if group_table is not None:
-            assert logical_page_size is not None
             group_out_cache_loc = self._extend_out_cache_loc(
                 group_table[: seq_lens.shape[0]],
                 extend_prefix_lens_cpu,
                 extend_seq_lens_cpu,
-                logical_page_size=logical_page_size,
                 validate_pages=cache_debug_enabled(),
             )
             chunk_page_table = group_table[: seq_lens.shape[0]]
             chunk_req_pool_indices = torch.arange(
                 seq_lens.shape[0], dtype=torch.int64, device=group_table.device
             )
-            chunk_page_size = logical_page_size
+            chunk_page_size = self.page_size
             if use_absorbed_cached_extend:
-                absorbed_page_table = self._expand_group_page_table(
-                    group_table,
-                    batch_size=seq_lens.shape[0],
-                    logical_page_size=logical_page_size,
-                )
+                absorbed_page_table = group_table[: seq_lens.shape[0]]
         else:
             # Idle/warmup placeholder: page_table is batch-ordered (row i ==
             # batch position i), so identity row indices apply.
@@ -378,22 +370,15 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         seq_lens: torch.Tensor,
         page_table: torch.Tensor,
         group_table: torch.Tensor | None = None,
-        logical_page_size: int | None = None,
         q_len_per_req: int = 1,
         page_table_is_batch_ordered: bool = False,
     ):
         if group_table is not None:
-            assert logical_page_size is not None
-            page_table = self._expand_group_page_table(
-                group_table,
-                batch_size=bs,
-                logical_page_size=logical_page_size,
-            )
+            page_table = group_table[:bs]
             group_out_cache_loc = self._cache_decode_out_cache_loc(
                 group_table,
                 seq_lens,
                 batch_size=bs,
-                logical_page_size=logical_page_size,
                 validate_pages=cache_debug_enabled(),
                 q_len_per_req=q_len_per_req,
             )
@@ -630,15 +615,10 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         width = self.max_num_pages
         rows = self.cuda_graph_page_table[: bs * spec, :width].view(bs, spec, width)
         if self._cache_groups_bound and cache_metadata is not None:
-            table, logical_page_size = self._resolve_full_history_table(
-                cache_metadata, forward_batch, 0
-            )
+            table = self._resolve_full_history_table(cache_metadata, forward_batch, 0)
             real_bs = min(int(table.shape[0]), bs)
             if real_bs > 0:
-                expanded = self._expand_group_page_table(
-                    table, batch_size=real_bs, logical_page_size=logical_page_size
-                )
-                rows[:real_bs].copy_(expanded[:, None, :width])
+                rows[:real_bs].copy_(table[:real_bs, None, :width])
             if real_bs < bs:
                 rows[real_bs:].zero_()
             return
@@ -722,24 +702,17 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         q_len = metadata.group_q_len_per_req
         real_bs = 0
         if cache_metadata is not None:
-            table, logical_page_size = self._resolve_full_history_table(
-                cache_metadata, forward_batch, 0
-            )
+            table = self._resolve_full_history_table(cache_metadata, forward_batch, 0)
             real_bs = min(int(table.shape[0]), bs)
             if real_bs > 0:
-                self._expand_group_page_table(
-                    table,
-                    batch_size=real_bs,
-                    logical_page_size=logical_page_size,
-                    out=metadata.page_table,
-                )
+                metadata.page_table[:real_bs, : table.shape[1]].copy_(table[:real_bs])
+                metadata.page_table[:real_bs, table.shape[1] :].zero_()
                 self._cache_decode_out_cache_loc(
                     table,
                     # The clamped copy: a request shorter than the verify
                     # window would otherwise resolve locations before its start.
                     self.cuda_graph_seq_lens,
                     batch_size=real_bs,
-                    logical_page_size=logical_page_size,
                     validate_pages=cache_debug_enabled(),
                     out=metadata.group_out_cache_loc,
                     q_len_per_req=q_len,

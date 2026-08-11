@@ -165,7 +165,6 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
         index_slice: slice,
         is_last: bool,
         aux_index: int | None = None,
-        mla_l1_5_args: tuple[Any, Any] | None = None,
     ):
         logger.debug("async manager add_transfer_request")
         if self.disaggregation_mode != DisaggregationMode.PREFILL:
@@ -201,7 +200,6 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
             index_slice=index_slice,
             is_last=is_last,
             prefill_aux_index=aux_index,
-            mla_l1_5_args=mla_l1_5_args,
         )
         self.current_transfer_batch.append((kv_chunk, shard_idx))
 

@@ -50,7 +50,6 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
         self._layer_types = tuple(layer_types)
         group_ids = tuple(layer_group_ids)
         self._group_ids_by_layer = dict(enumerate(group_ids))
-        self._pd_disaggregation_enabled = pd_disaggregation_enabled
         self._state_field_dtypes = dict(state_field_dtypes or {})
         self._state_buffers_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self.paged_cache_requires_page_zeroing = True
@@ -64,6 +63,7 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
         super().__init__(
             memory_plan=memory_plan,
             layer_group_ids=group_ids,
+            pd_disaggregation_enabled=pd_disaggregation_enabled,
             **kwargs,
         )
 
@@ -125,15 +125,6 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
     @property
     def state_slabs(self) -> list[tuple[torch.Tensor, torch.Tensor]]:
         return list(self._state_buffers_by_layer.values())
-
-    @property
-    def supports_disaggregation(self) -> bool:
-        return self._pd_disaggregation_enabled
-
-    def get_pd_cache_contract(self):
-        if not self.supports_disaggregation:
-            raise RuntimeError("paged cache PD requires an enabled KDA pool")
-        return self.pd_contract(self.paged_cache_group_specs)
 
     def group_id_for_layer(self, layer_id: int) -> str:
         try:
