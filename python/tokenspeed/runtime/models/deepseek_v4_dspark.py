@@ -25,6 +25,7 @@ from tokenspeed.runtime.layers.moe import (
     build_moe_checkpoint_loader,
 )
 from tokenspeed.runtime.layers.moe.expert import MoELayer
+from tokenspeed.runtime.layers.moe.utils import get_moe_backend
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -34,6 +35,7 @@ from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.deepseek_v4 import (
     DeepseekV4Compressor,
     DeepseekV4DecoderLayer,
+    DeepseekV4ForCausalLM,
     DeepseekV4MegaMoEExperts,
     hc_head,
     mhc_fused_hc,
@@ -666,9 +668,13 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             return None
         name = self._map_stage_name(stage_id, match.group(2))
         if name.endswith(".scale"):
+            # MegaMoE experts register block scales as ``w{13,2}_weight_scale``;
+            # the generic block-FP8 MoELayer (non-mega, e.g. flashinfer_cutlass
+            # on Hopper) registers ``..._weight_scale_inv``. Mirror
+            # DeepseekV4ForCausalLM._map_weight_name.
             scale_suffix = (
                 ".weight_scale"
-                if _EXPERT_SCALE_RE.search(name)
+                if _EXPERT_SCALE_RE.search(name) and get_moe_backend().is_mega_moe()
                 else ".weight_scale_inv"
             )
             name = name.removesuffix(".scale") + scale_suffix
@@ -726,6 +732,20 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             name = self._map_checkpoint_name(raw_name)
             if name is None:
                 continue
+            if (
+                name.endswith("attn.wo_a.weight")
+                and loaded_weight.dtype != torch.float8_e4m3fn
+                and params.get(name) is not None
+                and params[name].dtype == torch.float8_e4m3fn
+            ):
+                qweight, scale_inv = DeepseekV4ForCausalLM._block_quant_fp8_weight(
+                    loaded_weight
+                )
+                scale_name = name.replace(".weight", ".weight_scale_inv")
+                scale_param = params[scale_name]
+                scale_param.weight_loader(scale_param, scale_inv)
+                loaded.add(scale_name)
+                loaded_weight = qweight
             for param_name, weight_name, shard_id in stacked_mapping:
                 if weight_name not in name or ".experts." in name:
                     continue
@@ -755,6 +775,12 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 required.update(_STAGE_ZERO_CORE)
             if stage_id == self.model.num_stages - 1:
                 required.update(_LAST_STAGE_CORE)
+            for tensor_name, tensor in raw_attention[stage_id].items():
+                if (
+                    tensor_name.endswith(".weight")
+                    and tensor.dtype != torch.float8_e4m3fn
+                ):
+                    required.discard(f"attn.{tensor_name[:-7]}.scale")
             missing = sorted(required - seen)
             expected_expert_tensors = {
                 f"ffn.experts.{expert_id}.{projection}.{tensor_kind}"
@@ -792,8 +818,11 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             device = self.model.stages[stage_id].block.attn_norm.weight.device
 
             def dequant(name: str) -> torch.Tensor:
+                weight = source[f"{name}.weight"].to(device)
+                if weight.dtype != torch.float8_e4m3fn:
+                    return weight.to(torch.bfloat16)
                 return _block_dequant(
-                    source[f"{name}.weight"].to(device),
+                    weight,
                     source[f"{name}.scale"].to(device),
                 )
 

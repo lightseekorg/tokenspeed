@@ -87,8 +87,10 @@ __all__ = (
     "deepseek_v4_csa_compress_kv_cache_insert",
     "deepseek_v4_csa_indexer_cache_insert",
     "deepseek_v4_hca_compress_kv_cache_insert",
+    "deepseek_v4_prepare_indexer_q_fp8",
     "deepseek_v4_prepare_indexer_q_mxfp4",
     "dequantize_deepseek_v4_fp8_ds_mla_cache",
+    "gather_paged_indexer_fp8_cache",
     "fused_qnorm_rope_kv_insert",
     "read_deepseek_v4_indexer_fp8_cache",
     "read_deepseek_v4_indexer_mxfp4_cache",
@@ -239,7 +241,6 @@ def dequantize_deepseek_v4_fp8_ds_mla_cache(
     if slot_mapping.numel() == 0:
         return torch.empty(out_shape, device=cache_2d.device, dtype=torch.bfloat16)
 
-    flat_cache = cache_2d.reshape(-1)
     num_nope_blocks = nope_dim // DEEPSEEK_V4_FP8_QUANT_BLOCK
 
     slots = slot_mapping.to(torch.int64)
@@ -247,15 +248,18 @@ def dequantize_deepseek_v4_fp8_ds_mla_cache(
     safe_slots = torch.where(valid, slots, torch.zeros_like(slots))
     pages = torch.div(safe_slots, block_size, rounding_mode="floor")
     pos = safe_slots % block_size
-    page_base = pages * cache_2d.stride(0)
-    value_base = page_base + pos * token_stride
-    scale_base = page_base + block_size * token_stride + pos * scale_dim
+    # Index pages via advanced indexing on the 2-D cache, NOT via
+    # page * stride(0) into reshape(-1): on a strided field view of a larger
+    # LCM arena, reshape(-1) copies only the logical elements and
+    # physical-stride offsets read past its end.
+    value_base = pos * token_stride
+    scale_base = block_size * token_stride + pos * scale_dim
 
     value_offsets = (
         value_base[:, None]
         + torch.arange(token_stride, device=cache_2d.device, dtype=torch.int64)[None, :]
     )
-    row_bytes = flat_cache[value_offsets]
+    row_bytes = cache_2d[pages[:, None], value_offsets]
     nope = row_bytes[:, :nope_dim].contiguous().view(torch.float8_e4m3fn)
 
     scale_offsets = (
@@ -264,7 +268,9 @@ def dequantize_deepseek_v4_fp8_ds_mla_cache(
             None, :
         ]
     )
-    scales = torch.pow(2.0, flat_cache[scale_offsets].to(torch.int32) - 127)
+    scales = torch.pow(
+        2.0, cache_2d[pages[:, None], scale_offsets].to(torch.int32) - 127
+    )
     scales = scales.float().repeat_interleave(DEEPSEEK_V4_FP8_QUANT_BLOCK, dim=1)
 
     rope = row_bytes[:, nope_dim:token_stride].contiguous()
@@ -311,6 +317,140 @@ def deepseek_v4_prepare_indexer_q_mxfp4(
         softmax_scale=softmax_scale,
         head_scale=head_scale,
     )
+
+
+def deepseek_v4_prepare_indexer_q_fp8(
+    index_q: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    weights: torch.Tensor,
+    softmax_scale: float,
+    head_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply indexer Q RoPE + Hadamard and return DeepGEMM-ready FP8 values.
+
+    Non-Blackwell (SM90) analogue of ``deepseek_v4_prepare_indexer_q_mxfp4``.
+    ``deep_gemm.fp8_paged_mqa_logits`` / ``fp8_mqa_logits`` consume the query as
+    a plain ``float8_e4m3fn`` tensor (no per-token query scale) with the softmax
+    and head scales folded into ``weights`` -- mirroring SGLang's
+    ``fused_q_indexer_rope_hadamard_quant``.
+
+    Args:
+        index_q: ``[tokens, heads, index_head_dim]`` bf16/fp32 indexer queries.
+        positions: ``[tokens]`` absolute token positions for RoPE.
+        cos_sin_cache: ``[max_pos, rope_dim]`` fused cos/sin cache.
+        weights: ``[tokens, heads]`` (or trailing singleton) indexer weights.
+        softmax_scale: ``index_head_dim**-0.5`` attention softmax scale.
+        head_scale: ``n_head**-0.5`` head normalization scale.
+
+    Returns:
+        Tuple of ``(q_fp8, weights_out)`` where ``q_fp8`` is
+        ``[tokens, heads, index_head_dim]`` ``float8_e4m3fn`` and
+        ``weights_out`` is ``[tokens, heads]`` float32 with both scales folded
+        in.
+    """
+
+    if index_q.dim() != 3:
+        raise ValueError(f"index_q must be [tokens, heads, dim], got {index_q.shape}")
+    rope_dim = int(cos_sin_cache.shape[-1])
+    if index_q.shape[-1] <= rope_dim:
+        raise ValueError(
+            f"index_q dim must be larger than rope_dim={rope_dim}, got {index_q.shape}"
+        )
+    if weights.dim() == 3:
+        weights = weights.squeeze(-1)
+    if weights.shape != index_q.shape[:2]:
+        raise ValueError(f"weights must be [tokens, heads], got {tuple(weights.shape)}")
+    if not index_q.is_cuda:
+        raise ValueError(
+            "deepseek_v4_prepare_indexer_q_fp8 only supports CUDA tensors."
+        )
+
+    weights_out = (weights.float() * float(softmax_scale) * float(head_scale)).float()
+    if index_q.shape[0] == 0:
+        q_fp8 = index_q.new_empty(index_q.shape, dtype=torch.float8_e4m3fn)
+        return q_fp8, weights_out
+
+    rotated = _apply_gptj_rope_tail_rows(
+        index_q,
+        positions,
+        cos_sin_cache,
+        rope_dim,
+    )
+    rotated = _deepseek_v4_hadamard_rotate(rotated)
+    q_fp8 = rotated.to(torch.bfloat16).to(torch.float8_e4m3fn).contiguous()
+    return q_fp8, weights_out
+
+
+def gather_paged_indexer_fp8_cache(
+    cache_2d: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seq_lens: torch.Tensor,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather ragged FP8 indexer keys for ``deep_gemm.fp8_mqa_logits``.
+
+    Torch analogue of the CUDA MXFP4 paged gather. Produces the fp8 keys and
+    their fp32 per-token scales laid out contiguously in ``cu_seq_lens`` order.
+
+    Args:
+        cache_2d: ``[pages, block_size * (index_head_dim + 4)]`` uint8 fp8 cache.
+        block_table: ``[num_reqs, max_blocks]`` int32 logical->physical pages.
+        cu_seq_lens: ``[num_reqs + 1]`` int32 cumulative compressed key lengths.
+        block_size: cache block size (tokens per page), e.g. 64.
+
+    Returns:
+        Tuple ``(k_fp8, k_scale)`` with ``k_fp8`` of shape ``[total_k, dim]``
+        ``float8_e4m3fn`` and ``k_scale`` of shape ``[total_k]`` float32.
+    """
+
+    if cache_2d.dtype != torch.uint8:
+        raise TypeError(f"cache_2d must be uint8, got {cache_2d.dtype}")
+    index_head_dim, scale_bytes = _indexer_fp8_layout_from_cache(cache_2d, block_size)
+    device = cache_2d.device
+    cu_seq_lens = cu_seq_lens.to(device=device, dtype=torch.int64)
+    total_rows = int(cu_seq_lens[-1].item()) if cu_seq_lens.numel() else 0
+    if total_rows == 0:
+        return (
+            torch.empty((0, index_head_dim), dtype=torch.float8_e4m3fn, device=device),
+            torch.empty((0,), dtype=torch.float32, device=device),
+        )
+
+    block_table = block_table.to(device=device, dtype=torch.int64)
+    row_ids = torch.arange(total_rows, device=device, dtype=torch.int64)
+    # searchsorted over the per-req end offsets maps each output row to its req.
+    req = torch.searchsorted(cu_seq_lens[1:].contiguous(), row_ids, right=True)
+    req = req.clamp_max(block_table.shape[0] - 1)
+    local = row_ids - cu_seq_lens[req]
+    logical_block = torch.div(local, block_size, rounding_mode="floor")
+    logical_block = logical_block.clamp_max(block_table.shape[1] - 1)
+    in_block = local % block_size
+    phys = block_table[req, logical_block]
+
+    # Index pages via advanced indexing on the 2-D cache, NOT via
+    # page * stride(0) into reshape(-1): the indexer cache can be a strided
+    # field view of a larger LCM arena (stride(0) > shape[1]), where a
+    # flattened view only covers the logical elements and physical-stride
+    # offsets read past its end.
+    value_offsets = (
+        in_block[:, None] * index_head_dim
+        + torch.arange(index_head_dim, device=device, dtype=torch.int64)[None, :]
+    )
+    scale_offsets = (
+        block_size * index_head_dim
+        + in_block[:, None] * scale_bytes
+        + torch.arange(scale_bytes, device=device, dtype=torch.int64)[None, :]
+    )
+    k_fp8 = (
+        cache_2d[phys[:, None], value_offsets].contiguous().view(torch.float8_e4m3fn)
+    )
+    k_scale = (
+        cache_2d[phys[:, None], scale_offsets]
+        .contiguous()
+        .view(torch.float32)
+        .reshape(total_rows)
+    )
+    return k_fp8, k_scale
 
 
 def _fp8_ds_mla_cache_rows(
@@ -400,16 +540,17 @@ def _write_fp8_ds_mla_cache_rows_capturable(
     safe_slots = torch.where(valid, slots, torch.zeros_like(slots))
     block_idx = torch.div(safe_slots, kv_cache_block_size, rounding_mode="floor")
     pos_in_block = safe_slots % kv_cache_block_size
-    block_base = block_idx * kv_cache_2d.stride(0)
-    token_base = block_base + pos_in_block * token_stride
-    scale_base = (
-        block_base + kv_cache_block_size * token_stride + pos_in_block * scale_dim
-    )
+    token_base = pos_in_block * token_stride
+    scale_base = kv_cache_block_size * token_stride + pos_in_block * scale_dim
 
     value_bytes, scale_bytes, rope_bytes = _fp8_ds_mla_cache_rows(
         normed[:num_rows], positions[:num_rows], cos_sin_cache, compress_ratio
     )
-    flat_cache = kv_cache_2d.reshape(-1)
+    # Index blocks via advanced indexing on the 2-D cache, NOT via
+    # block * stride(0) into reshape(-1): the cache can be a strided field
+    # view of a larger LCM arena (stride(0) > shape[1]), where a flattened
+    # view only covers the logical elements and physical-stride offsets run
+    # past its end (or corrupt neighboring fields).
     value_offsets = (
         token_base[:, None]
         + torch.arange(
@@ -435,9 +576,9 @@ def _write_fp8_ds_mla_cache_rows_capturable(
             dtype=torch.int64,
         )[None, :]
     )
-    flat_cache[value_offsets] = value_bytes
-    flat_cache[scale_offsets] = scale_bytes
-    flat_cache[rope_offsets] = rope_bytes
+    kv_cache_2d[block_idx[:, None], value_offsets] = value_bytes
+    kv_cache_2d[block_idx[:, None], scale_offsets] = scale_bytes
+    kv_cache_2d[block_idx[:, None], rope_offsets] = rope_bytes
 
 
 def save_deepseek_v4_compressor_state(
@@ -526,7 +667,6 @@ def write_deepseek_v4_indexer_fp8_cache(
             f"got {tuple(cache_2d.shape)}"
         )
 
-    flat_cache = cache_2d.reshape(-1)
     num_actual = min(slot_mapping.numel(), index_k.shape[0])
     for token_idx in range(num_actual):
         slot = int(slot_mapping[token_idx].item())
@@ -534,12 +674,14 @@ def write_deepseek_v4_indexer_fp8_cache(
             continue
         page = slot // block_size
         pos = slot % block_size
-        page_base = page * cache_2d.stride(0)
-        value_base = page_base + pos * index_head_dim
-        scale_base = page_base + block_size * index_head_dim + pos * scale_bytes
+        # Row-index the 2-D cache (strided-view safe) instead of computing
+        # page * stride(0) offsets into reshape(-1).
+        page_row = cache_2d[page]
+        value_base = pos * index_head_dim
+        scale_base = block_size * index_head_dim + pos * scale_bytes
         q_bytes, scale = _fp8_e4m3_pow2_bytes(index_k[token_idx].float())
-        flat_cache[value_base : value_base + index_head_dim].copy_(q_bytes)
-        flat_cache[scale_base : scale_base + scale_bytes].copy_(
+        page_row[value_base : value_base + index_head_dim].copy_(q_bytes)
+        page_row[scale_base : scale_base + scale_bytes].copy_(
             scale.reshape(1).view(torch.uint8)
         )
 
@@ -621,13 +763,14 @@ def _write_deepseek_v4_indexer_fp8_cache_capturable(
     safe_slots = torch.where(valid, slots, torch.zeros_like(slots))
     pages = torch.div(safe_slots, block_size, rounding_mode="floor")
     pos = safe_slots % block_size
-    page_base = pages * cache_2d.stride(0)
-    value_base = page_base + pos * index_head_dim
-    scale_base = page_base + block_size * index_head_dim + pos * scale_bytes
 
-    flat_cache = cache_2d.reshape(-1)
+    # Index pages via advanced indexing on the 2-D cache, NOT via
+    # page * stride(0) into reshape(-1): the indexer cache can be a strided
+    # field view of a larger LCM arena (stride(0) > shape[1]), where a
+    # flattened view only covers the logical elements and physical-stride
+    # offsets run past its end (or silently corrupt neighboring fields).
     value_offsets = (
-        value_base[:, None]
+        pos[:, None] * index_head_dim
         + torch.arange(
             index_head_dim,
             device=cache_2d.device,
@@ -635,11 +778,14 @@ def _write_deepseek_v4_indexer_fp8_cache_capturable(
         )[None, :]
     )
     scale_offsets = (
-        scale_base[:, None]
+        block_size * index_head_dim
+        + pos[:, None] * scale_bytes
         + torch.arange(scale_bytes, device=cache_2d.device, dtype=torch.int64)[None, :]
     )
-    flat_cache[value_offsets] = value_bytes
-    flat_cache[scale_offsets] = scale.view(torch.uint8).reshape(num_rows, scale_bytes)
+    cache_2d[pages[:, None], value_offsets] = value_bytes
+    cache_2d[pages[:, None], scale_offsets] = scale.view(torch.uint8).reshape(
+        num_rows, scale_bytes
+    )
 
 
 def read_deepseek_v4_indexer_mxfp4_cache(
@@ -664,15 +810,17 @@ def read_deepseek_v4_indexer_mxfp4_cache(
     if slot_mapping.numel() == 0:
         return torch.empty(out_shape, device=cache_2d.device, dtype=torch.float32)
 
-    flat_cache = cache_2d.reshape(-1)
     slots = slot_mapping.to(torch.int64)
     valid = slots >= 0
     safe_slots = torch.where(valid, slots, torch.zeros_like(slots))
     pages = torch.div(safe_slots, block_size, rounding_mode="floor")
     pos = safe_slots % block_size
-    page_base = pages * cache_2d.stride(0)
-    value_base = page_base + pos * value_bytes
-    scale_base = page_base + block_size * value_bytes + pos * scale_bytes
+    # Index pages via advanced indexing on the 2-D cache, NOT via
+    # page * stride(0) into reshape(-1): on a strided field view of a larger
+    # LCM arena, reshape(-1) copies only the logical elements and
+    # physical-stride offsets read past its end.
+    value_base = pos * value_bytes
+    scale_base = block_size * value_bytes + pos * scale_bytes
 
     value_offsets = (
         value_base[:, None]
@@ -682,7 +830,7 @@ def read_deepseek_v4_indexer_mxfp4_cache(
             dtype=torch.int64,
         )[None, :]
     )
-    packed = flat_cache[value_offsets]
+    packed = cache_2d[pages[:, None], value_offsets]
 
     scale_offsets = (
         scale_base[:, None]
@@ -692,7 +840,9 @@ def read_deepseek_v4_indexer_mxfp4_cache(
             dtype=torch.int64,
         )[None, :]
     )
-    scales = torch.pow(2.0, flat_cache[scale_offsets].to(torch.int32) - 127)
+    scales = torch.pow(
+        2.0, cache_2d[pages[:, None], scale_offsets].to(torch.int32) - 127
+    )
     byte_scales = scales.float().repeat_interleave(
         DEEPSEEK_V4_MXFP4_BLOCK_SIZE // 2, dim=1
     )
@@ -727,18 +877,19 @@ def read_deepseek_v4_indexer_fp8_cache(
         device=cache_2d.device,
         dtype=torch.float32,
     )
-    flat_cache = cache_2d.reshape(-1)
     for token_idx, raw_slot in enumerate(slot_mapping.tolist()):
         slot = int(raw_slot)
         if slot < 0:
             continue
         page = slot // block_size
         pos = slot % block_size
-        page_base = page * cache_2d.stride(0)
-        value_base = page_base + pos * index_head_dim
-        scale_base = page_base + block_size * index_head_dim + pos * scale_bytes
-        scale = flat_cache[scale_base : scale_base + scale_bytes].view(torch.float32)[0]
-        values = flat_cache[value_base : value_base + index_head_dim].view(
+        # Row-index the 2-D cache (strided-view safe) instead of computing
+        # page * stride(0) offsets into reshape(-1).
+        page_row = cache_2d[page]
+        value_base = pos * index_head_dim
+        scale_base = block_size * index_head_dim + pos * scale_bytes
+        scale = page_row[scale_base : scale_base + scale_bytes].view(torch.float32)[0]
+        values = page_row[value_base : value_base + index_head_dim].view(
             torch.float8_e4m3fn
         )
         out[token_idx].copy_(values.float() * scale)

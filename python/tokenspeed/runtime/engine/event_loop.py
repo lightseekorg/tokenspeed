@@ -387,8 +387,6 @@ class EventLoop:
                 unsupported.append("mixed prefill/decode batches")
             if server_args.speculative_algorithm is not None:
                 unsupported.append("speculative/MTP decoding")
-            if server_args.enable_mla_l1_5_cache:
-                unsupported.append("MLA L1.5 cache transfer")
             if server_args.disaggregation_layerwise_interval > 0:
                 unsupported.append("layerwise cache transfer")
             if server_args.enable_memory_saver:
@@ -573,7 +571,6 @@ class EventLoop:
                 is_mla_backend=False,
                 draft_is_mla_backend=False,
                 enable_metrics=False,
-                enable_mla_l1_5_cache=server_args.enable_mla_l1_5_cache,
                 served_model_name=server_args.served_model_name,
                 app_key=server_args.app_key,
                 metrics_reporters=server_args.metrics_reporters,

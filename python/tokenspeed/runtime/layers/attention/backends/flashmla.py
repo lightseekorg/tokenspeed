@@ -236,10 +236,9 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         forward_batch = kwargs.pop("forward_batch", None)
         kwargs.pop("block_tables", None)
         group_table = None
-        logical_page_size = None
         if cache_metadata is not None:
             self._cache_groups_bound = True
-            group_table, logical_page_size = self._resolve_full_history_table(
+            group_table = self._resolve_full_history_table(
                 cache_metadata, forward_batch, bs
             )
         elif self._draft_reads_batch_pages(bs, forward_mode):
@@ -247,11 +246,9 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
             # metadata; it hands over the batch-ordered draft page table (row i
             # is batch position i). DraftPageStaging.publish already expanded the
             # target's full-history scheduler pages into this backend's kernel
-            # pages (ratio logical/kernel), so the ids are ALREADY in kernel-page
-            # units here. Read them as kernel pages (identity expand).
+            # pages, so the ids are ALREADY in kernel-page units here.
             self._cache_groups_bound = True
             group_table = page_table[:bs]
-            logical_page_size = self.page_size
         elif self._cache_groups_bound and bs > 0 and not forward_mode.is_idle():
             raise RuntimeError(
                 "FlashMLABackend is bound to Paged cache but received no paged "
@@ -271,7 +268,6 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
                 group_table=(
                     group_table[:num_extends] if group_table is not None else None
                 ),
-                logical_page_size=logical_page_size,
             )
         # Under is_draft, also fill decode_metadata under any forward_mode so
         # the drafter's multi-step loop has metadata. Wrapper pre-writes
@@ -289,7 +285,6 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
                 seq_lens,
                 page_table,
                 group_table=group_table,
-                logical_page_size=logical_page_size,
                 q_len_per_req=self._verify_q_len(forward_mode),
             )
 
@@ -334,24 +329,17 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         seq_lens: torch.Tensor,
         page_table: torch.Tensor,
         group_table: torch.Tensor | None = None,
-        logical_page_size: int | None = None,
         q_len_per_req: int = 1,
     ):
         if group_table is not None:
-            assert logical_page_size is not None
-            # Expand scheduler pages into FlashMLA's PAGE_SIZE kernel pages and
-            # resolve the write locations. Target verify writes the whole
-            # spec window (seq-N..seq-1); plain decode writes position seq-1.
-            block_table = self._expand_group_page_table(
-                group_table,
-                batch_size=bs,
-                logical_page_size=logical_page_size,
-            )
+            # The table is already in FlashMLA's PAGE_SIZE kernel pages; resolve
+            # the write locations. Target verify writes the whole spec window
+            # (seq-N..seq-1); plain decode writes position seq-1.
+            block_table = group_table[:bs]
             group_out_cache_loc = self._cache_decode_out_cache_loc(
                 group_table,
                 seq_lens,
                 batch_size=bs,
-                logical_page_size=logical_page_size,
                 validate_pages=cache_debug_enabled(),
                 q_len_per_req=q_len_per_req,
             )
@@ -423,7 +411,6 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         extend_seq_lens: torch.Tensor,
         extend_seq_lens_cpu: torch.Tensor,
         group_table: torch.Tensor | None = None,
-        logical_page_size: int | None = None,
     ):
         # EXTEND path — flashinfer ragged/paged prefill.
         if extend_prefix_lens is None:
@@ -440,37 +427,31 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
             not global_server_args_dict["mla_disable_ragged"] and extend_no_prefix
         )
 
-        # Paged cache path needs two differently-shaped views of the LCM
+        # Paged cache path needs two differently-shaped views of the kernel
         # full-history table:
         #   * flashinfer paged prefill (plan page_size=1) walks a PER-TOKEN slot
         #     table, so expand each token to its absolute latent slot.
         #   * chunked prefix replay (create_chunked_cache_kv_indices_paged) walks
-        #     a PAGE table, deriving slot = page_id*P + pos%P in-kernel, so it
-        #     takes the PAGE_SIZE-expanded page table with page_size=PAGE_SIZE.
+        #     the PAGE table directly, deriving slot = page_id*p + pos%p
+        #     in-kernel.
         # New-token write locations come from _extend_out_cache_loc either way.
         group_out_cache_loc = None
         if group_table is not None:
-            assert logical_page_size is not None
             prefill_table = self._group_per_token_slot_table(
                 group_table,
                 batch_size=seq_lens.shape[0],
-                logical_page_size=logical_page_size,
+                page_size=self.page_size,
                 max_context_len=self.max_context_len,
             ).to(torch.int32)
             prefill_req_pool_indices = torch.arange(
                 seq_lens.shape[0], dtype=torch.int64, device=prefill_table.device
             )
-            chunk_table = self._expand_group_page_table(
-                group_table,
-                batch_size=seq_lens.shape[0],
-                logical_page_size=logical_page_size,
-            )
+            chunk_table = group_table[: seq_lens.shape[0]]
             chunk_page_size = self.page_size
             group_out_cache_loc = self._extend_out_cache_loc(
                 group_table[: seq_lens.shape[0]],
                 extend_prefix_lens_cpu,
                 extend_seq_lens_cpu,
-                logical_page_size=logical_page_size,
                 validate_pages=cache_debug_enabled(),
             )
         else:
@@ -642,25 +623,34 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
             self.cuda_graph_seq_lens_k[:bs].copy_(seq_lens[:bs])
 
         cache_metadata = kwargs.get("cache_metadata")
-        if self._cache_groups_bound and cache_metadata is not None:
+        # Refresh from cache metadata whenever this backend is a contract
+        # sub-backend. Gating on _cache_groups_bound alone breaks a PD decode
+        # node: that flag is only latched in the eager init path, but a
+        # decode-only node receives its KV over the transfer and never runs an
+        # eager extend/decode forward — it only replays decode graphs. The flag
+        # would stay False, this refresh would be skipped, and the captured
+        # kernel would read a stale/zero kv-index table (the null page 0)
+        # instead of the transferred KV. _cache_contract_bound is set by the
+        # registry at startup for every contract sub-backend, so it is the
+        # correct gate here; latch _cache_groups_bound for the write-loc path.
+        if (
+            self._cache_groups_bound or self._cache_contract_bound
+        ) and cache_metadata is not None:
+            self._cache_groups_bound = True
             # Refresh the block table and per-request write locations in place
             # from the live full-history table (paged-cache path).
-            table, logical_page_size = self._resolve_full_history_table(
+            table = self._resolve_full_history_table(
                 cache_metadata, kwargs.get("forward_batch"), 0
             )
             real_bs = min(int(table.shape[0]), bs)
             if real_bs > 0:
-                expanded = self._expand_group_page_table(
-                    table, batch_size=real_bs, logical_page_size=logical_page_size
-                )
-                self.cuda_graph_kv_indices[:real_bs, : expanded.shape[1]].copy_(
-                    expanded
+                self.cuda_graph_kv_indices[:real_bs, : table.shape[1]].copy_(
+                    table[:real_bs]
                 )
                 self._cache_decode_out_cache_loc(
                     table,
                     self.cuda_graph_seq_lens_k,
                     batch_size=real_bs,
-                    logical_page_size=logical_page_size,
                     validate_pages=cache_debug_enabled(),
                     out=self.cuda_graph_group_out_cache_loc,
                     q_len_per_req=q_len,

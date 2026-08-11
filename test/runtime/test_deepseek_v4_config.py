@@ -1585,14 +1585,36 @@ class TestDeepseekV4Config(unittest.TestCase):
             "model.stages.0.main_proj.weight_scale_inv",
         )
         self.assertEqual(
-            model._map_checkpoint_name("mtp.1.ffn.experts.7.w1.scale"),
-            "model.stages.1.block.ffn.experts.7.w1.weight_scale",
-        )
-        self.assertEqual(
             model._map_checkpoint_name("mtp.2.markov_head.markov_w1.weight"),
             "model.markov_embedding.weight",
         )
         self.assertIsNone(model._map_checkpoint_name("mtp.3.norm.weight"))
+
+    def test_dspark_expert_scale_mapping_follows_moe_backend(self):
+        # Expert block scales land on `w{13,2}_weight_scale` params only under
+        # the mega-MoE backend; every other backend registers
+        # `..._weight_scale_inv` via create_fp8_block_scale_inverses.
+        model = object.__new__(DeepseekV4ForCausalLMDSpark)
+        model.model = SimpleNamespace(num_stages=3)
+
+        mega = SimpleNamespace(is_mega_moe=lambda: True)
+        non_mega = SimpleNamespace(is_mega_moe=lambda: False)
+        with patch(
+            "tokenspeed.runtime.models.deepseek_v4_dspark.get_moe_backend",
+            return_value=mega,
+        ):
+            self.assertEqual(
+                model._map_checkpoint_name("mtp.1.ffn.experts.7.w1.scale"),
+                "model.stages.1.block.ffn.experts.7.w1.weight_scale",
+            )
+        with patch(
+            "tokenspeed.runtime.models.deepseek_v4_dspark.get_moe_backend",
+            return_value=non_mega,
+        ):
+            self.assertEqual(
+                model._map_checkpoint_name("mtp.1.ffn.experts.7.w1.scale"),
+                "model.stages.1.block.ffn.experts.7.w1.weight_scale_inv",
+            )
 
     def test_dspark_attention_contract_uses_checkpoint_namespace(self):
         self.assertIn("attn.attn_sink", _ATTENTION_CHECKPOINT_TENSORS)
@@ -5069,6 +5091,13 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
 
         with (
+            # deep_gemm is unavailable on AMD runners; the guard only checks
+            # for None and every consumer below is patched out.
+            patch.object(
+                deepseek_v4_model,
+                "deep_gemm",
+                deepseek_v4_model.deep_gemm or SimpleNamespace(),
+            ),
             patch.object(
                 deepseek_v4_model,
                 "deepseek_v4_prepare_indexer_q_mxfp4",

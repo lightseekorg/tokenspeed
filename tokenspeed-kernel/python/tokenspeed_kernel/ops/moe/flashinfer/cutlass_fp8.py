@@ -69,7 +69,9 @@ if platform.is_nvidia:
         ),
         traits={
             "weight_dtype": frozenset({"fp8"}),
-            "activation": frozenset({"silu"}),
+            # The kernel invokes ActivationType.Swiglu (gated SiLU); accept both
+            # names so DeepSeek-V4 (activation="swiglu") selects this path.
+            "activation": frozenset({"silu", "swiglu"}),
             "routing_mode": frozenset({"precomputed_topk"}),
             "supports_deferred_finalize": frozenset({False}),
             "supports_ep": frozenset({True}),

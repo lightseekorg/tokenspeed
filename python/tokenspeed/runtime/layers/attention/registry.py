@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-import inspect
 import logging
 import os
 from typing import TYPE_CHECKING
@@ -82,11 +81,20 @@ def _resolve_heterogeneous_draft_family(
     pd_disaggregation_enabled: bool,
 ) -> CacheModelFamily | None:
     """Validate and return the supported heterogeneous draft family."""
-    if (
-        target_family not in _ORDINARY_CACHE_FAMILIES
-        or draft_family is None
-        or draft_family == target_family
-    ):
+    if draft_family is None:
+        return None
+    if target_family == "kimi_k3":
+        if draft_family != "mla":
+            raise RuntimeError(
+                "Kimi-K3 unified cache currently requires an ordinary MLA draft view"
+            )
+        if pd_disaggregation_enabled:
+            raise RuntimeError(
+                "PD disaggregation does not support heterogeneous target/draft "
+                "cache families"
+            )
+        return draft_family
+    if target_family not in _ORDINARY_CACHE_FAMILIES or draft_family == target_family:
         return None
     if draft_family != "mha":
         raise RuntimeError(
@@ -1005,11 +1013,7 @@ def create_attn_components(
         mark_cache_contract = getattr(side_backend, "mark_cache_contract", None)
         if mark_cache_contract is None:
             continue
-        params = inspect.signature(mark_cache_contract).parameters
-        if "logical_page_size" in params:
-            mark_cache_contract(logical_page_size=side_pool.plan.logical_block_tokens)
-        else:
-            mark_cache_contract()
+        mark_cache_contract()
 
     _prepare_verify_workspace(
         server_args=server_args,
