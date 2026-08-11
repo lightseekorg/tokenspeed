@@ -39,8 +39,9 @@ __all__ = [
     "all_gather_inner",
     "all_reduce_can_run",
     "all_reduce",
-    "all_reduce_staging_can_run",
-    "all_reduce_staging",
+    "symm_outputs_can_run",
+    "acquire_symm_outputs",
+    "all_reduce_symm_can_run",
     "all_reduce_symmetric",
     "allreduce_residual_rmsnorm",
     "create_dp_sampling_state",
@@ -1963,7 +1964,7 @@ def all_reduce(state: TritonCommState, tensor: torch.Tensor, op=None) -> torch.T
     raise AssertionError(f"Unsupported platform: {platform}")
 
 
-def all_reduce_staging_can_run(
+def symm_outputs_can_run(
     state: TritonCommState,
     shapes: tuple[tuple[int, ...], ...],
     dtype: torch.dtype,
@@ -1995,14 +1996,14 @@ def all_reduce_staging_can_run(
     )
 
 
-def all_reduce_staging(
+def acquire_symm_outputs(
     state: TritonCommState,
     shapes: tuple[tuple[int, ...], ...],
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, ...]:
     """Acquire consecutive Iris views for producer-direct reduction."""
-    if not all_reduce_staging_can_run(state, shapes, dtype):
-        raise RuntimeError("unsupported symmetric all-reduce staging request")
+    if not symm_outputs_can_run(state, shapes, dtype):
+        raise RuntimeError("unsupported symmetric all-reduce output request")
     from . import iris as _iris_mod
 
     key = (id(state.group), state.max_numel, dtype)
@@ -2016,7 +2017,26 @@ def all_reduce_staging(
             device=state.device,
         )
         _iris_mod.IRIS_AR_STATES[key] = iris_state
-    return _iris_mod.iris_all_reduce_staging(iris_state, shapes)
+    return _iris_mod.iris_acquire_outputs(iris_state, shapes)
+
+
+def all_reduce_symm_can_run(
+    state: TritonCommState,
+    tensors: tuple[torch.Tensor, ...],
+    op=None,
+) -> bool:
+    """Check whether tensors are Iris-owned symmetric all-reduce outputs."""
+    if op is None:
+        op = torch.distributed.ReduceOp.SUM
+    if not current_platform().is_cdna4 or op != torch.distributed.ReduceOp.SUM:
+        return False
+    if not tensors:
+        return False
+    from . import iris as _iris_mod
+
+    key = (id(state.group), state.max_numel, tensors[0].dtype)
+    iris_state = _iris_mod.IRIS_AR_STATES.get(key)
+    return iris_state is not None and iris_state.owns_outputs(tensors)
 
 
 def all_reduce_symmetric(

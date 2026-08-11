@@ -38,12 +38,11 @@ from tokenspeed_kernel.ops.moe import (
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
-from tokenspeed.runtime.distributed.comm_backend.base import AllReducePlan
 from tokenspeed.runtime.distributed.comm_ops import (
     COMM_ONESHOT_MAX_BYTES,
+    acquire_all_reduce_outputs,
     all_reduce,
     all_reduce_latent_norm,
-    plan_all_reduce,
     prepare_all_reduce_fusion,
     prepare_all_reduce_lane,
 )
@@ -52,9 +51,6 @@ from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
 TensorReducer = Callable[[torch.Tensor], torch.Tensor]
-TensorCollectionPlanner = Callable[
-    [tuple[tuple[int, ...], ...], torch.Tensor], AllReducePlan
-]
 # Projects hidden states to router logits, routed latent, and the unreduced
 # shared-expert partial in one pass, or returns None to use the modules.
 InputProjector = Callable[
@@ -160,7 +156,7 @@ def latent_moe_expert_shared_all_reduce(
     group: tuple[int, ...],
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Produce and reduce the routed latent and shared-expert output."""
-    plan = plan_all_reduce(
+    outputs = acquire_all_reduce_outputs(
         (
             (hidden_states.shape[0], shared_weight.shape[0]),
             tuple(hidden_states.shape),
@@ -168,7 +164,7 @@ def latent_moe_expert_shared_all_reduce(
         hidden_states,
         group,
     )
-    shared_out, routed_out = plan.outputs
+    shared_out, routed_out = outputs
     latent_moe_expert_shared(
         hidden_states,
         w13_weight,
@@ -186,7 +182,7 @@ def latent_moe_expert_shared_all_reduce(
         routed_out=routed_out,
         shared_out=shared_out,
     )
-    shared_out, routed_out = plan.execute_all_reduce()
+    shared_out, routed_out = all_reduce(outputs, group)
     return routed_out, shared_out
 
 
@@ -379,7 +375,7 @@ class LatentMoELayer(nn.Module):
         shared_experts: nn.Module | None = None,
         latent_reduce: TensorReducer | None = None,
         shared_reduce: TensorReducer | None = None,
-        joint_plan: TensorCollectionPlanner | None = None,
+        joint_reduce: bool = False,
         shared_expert_stream: torch.cuda.Stream | None = None,
         expert_parallel_group: tuple[int, ...] | None = None,
         return_separate_outputs: bool = False,
@@ -390,13 +386,11 @@ class LatentMoELayer(nn.Module):
             raise ValueError("input_projections requires shared_experts")
         if shared_reduce is not None and shared_experts is None:
             raise ValueError("shared_reduce requires shared_experts")
-        if joint_plan is not None and shared_experts is None:
-            raise ValueError("joint_plan requires shared_experts")
-        if joint_plan is not None and (
-            latent_reduce is not None or shared_reduce is not None
-        ):
+        if joint_reduce and shared_experts is None:
+            raise ValueError("joint_reduce requires shared_experts")
+        if joint_reduce and (latent_reduce is not None or shared_reduce is not None):
             raise ValueError(
-                "joint_plan cannot be combined with latent_reduce or shared_reduce"
+                "joint_reduce cannot be combined with latent_reduce or shared_reduce"
             )
         expert_parallel_size = int(getattr(experts, "ep_size", 1))
         num_experts = int(getattr(experts, "num_experts", 1))
@@ -416,7 +410,9 @@ class LatentMoELayer(nn.Module):
                     "expert_parallel_group size must match experts.ep_size: "
                     f"{len(expert_parallel_group)} != {expert_parallel_size}"
                 )
-        if expert_parallel_size > 1 and latent_reduce is None and joint_plan is None:
+        if joint_reduce and expert_parallel_group is None:
+            raise ValueError("joint_reduce requires expert_parallel_group")
+        if expert_parallel_size > 1 and latent_reduce is None and not joint_reduce:
             if expert_parallel_group is None:
                 raise ValueError(
                     "Kimi 3 EP requires expert_parallel_group or an explicit "
@@ -432,7 +428,8 @@ class LatentMoELayer(nn.Module):
         self.shared_experts = shared_experts
         self.latent_reduce = latent_reduce
         self.shared_reduce = shared_reduce
-        self.joint_plan = joint_plan
+        self.joint_reduce = joint_reduce
+        self.expert_parallel_group = expert_parallel_group
         self.stream_fork = StreamFork(shared_expert_stream)
         self.return_separate_outputs = return_separate_outputs
         self.input_projections = input_projections
@@ -493,16 +490,17 @@ class LatentMoELayer(nn.Module):
         )
 
         output_shape = (num_tokens, hidden_size)
-        reduction_plan = (
-            self.joint_plan(
+        reduction_outputs = (
+            acquire_all_reduce_outputs(
                 (output_shape, (num_tokens, int(self.experts.hidden_size))),
                 hidden_states,
+                self.expert_parallel_group,
             )
-            if self.joint_plan is not None and num_tokens > 0
+            if self.joint_reduce and num_tokens > 0
             else None
         )
         shared_target, routed_target = (
-            reduction_plan.outputs if reduction_plan is not None else (None, None)
+            reduction_outputs if reduction_outputs is not None else (None, None)
         )
         shared_output = None
         overlap_shared = (
@@ -615,10 +613,13 @@ class LatentMoELayer(nn.Module):
             _check_shape(shared_output, output_shape, "shared_reduce")
             shared_reduction_applied = True
 
-        if reduction_plan is not None:
-            shared_output, routed_latent = reduction_plan.execute_all_reduce()
-            _check_shape(shared_output, output_shape, "joint_plan shared output")
-            _check_shape(routed_latent, latent_shape, "joint_plan routed latent")
+        if reduction_outputs is not None:
+            shared_output, routed_latent = all_reduce(
+                reduction_outputs,
+                self.expert_parallel_group,
+            )
+            _check_shape(shared_output, output_shape, "joint shared output")
+            _check_shape(routed_latent, latent_shape, "joint routed latent")
             shared_reduction_applied = True
         elif self.latent_reduce is not None:
             routed_latent = self.latent_reduce(routed_latent)

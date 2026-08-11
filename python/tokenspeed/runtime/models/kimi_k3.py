@@ -97,7 +97,6 @@ from tokenspeed.runtime.configs.kimi_k3_config import KimiK3Config, KimiLinearCo
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import (
     all_reduce,
-    plan_all_reduce,
     prepare_all_reduce_fusion,
     prepare_all_reduce_lane,
 )
@@ -1114,11 +1113,7 @@ class KimiLinearMoE(nn.Module):
                     if self.execution_plan.joint_moe_reduce
                     else self._reduce_shared
                 ),
-                joint_plan=(
-                    partial(plan_all_reduce, group=mapping.moe.ep_group)
-                    if self.execution_plan.joint_moe_reduce
-                    else None
-                ),
+                joint_reduce=self.execution_plan.joint_moe_reduce,
                 shared_expert_stream=(
                     alt_stream if self.execution_plan.overlap_shared_experts else None
                 ),

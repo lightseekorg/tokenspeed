@@ -29,7 +29,6 @@ import torch
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.comm_backend.base import (
-    AllReducePlan,
     CommBackend,
     Group,
 )
@@ -125,6 +124,12 @@ class AutoBackend(CommBackend):
                 and sum(value.numel() * value.element_size() for value in tensors)
                 > self._triton_ar.producer_direct_max_bytes
             )
+            if (
+                not use_nccl
+                and current_platform().is_amd
+                and self._triton_ar.can_reduce_outputs(tensors, group, op=op)
+            ):
+                return self._triton_ar.all_reduce(tensors, group, op=op)
             if use_nccl and len(tensors) == 2:
                 return self._nccl.all_reduce_two(*tensors, group, op=op)
             return super().all_reduce(tensors, group, op=op)
@@ -156,28 +161,28 @@ class AutoBackend(CommBackend):
     def prepare_all_reduce_lane(self, group: Group, hidden_dim: int) -> bool:
         return self._trtllm_ar.ensure_group_lane(group, hidden_dim)
 
-    def plan_all_reduce(
+    def acquire_all_reduce_outputs(
         self,
         shapes: tuple[tuple[int, ...], ...],
         like: torch.Tensor,
         group: Group,
         op=None,
-    ) -> AllReducePlan:
-        """Select ordinary or producer-direct deferred reduction planning."""
+    ) -> tuple[torch.Tensor, ...]:
+        """Acquire ordinary or producer-direct all-reduce outputs."""
         if (
             self._force_deterministic_rsag()
             or self._group_spans_nodes(group)
             or self._trtllm_ar.has_trtllm_ar(group)
         ):
-            return super().plan_all_reduce(shapes, like, group, op=op)
-        if current_platform().is_amd and not self._triton_ar.can_plan_all_reduce(
+            return super().acquire_all_reduce_outputs(shapes, like, group, op=op)
+        if current_platform().is_amd and not self._triton_ar.can_acquire_outputs(
             shapes,
             like,
             group,
             op=op,
         ):
-            return super().plan_all_reduce(shapes, like, group, op=op)
-        return self._triton_ar.plan_all_reduce(
+            return super().acquire_all_reduce_outputs(shapes, like, group, op=op)
+        return self._triton_ar.acquire_all_reduce_outputs(
             shapes,
             like,
             group,

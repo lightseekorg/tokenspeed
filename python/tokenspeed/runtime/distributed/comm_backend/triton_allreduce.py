@@ -23,20 +23,17 @@
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.communication.triton import (
+    acquire_symm_outputs,
     all_reduce,
     all_reduce_can_run,
-    all_reduce_staging,
-    all_reduce_staging_can_run,
+    all_reduce_symm_can_run,
     all_reduce_symmetric,
     create_state,
+    symm_outputs_can_run,
 )
 from tokenspeed_kernel.platform import current_platform
 
-from tokenspeed.runtime.distributed.comm_backend.base import (
-    AllReducePlan,
-    CommBackend,
-    Group,
-)
+from tokenspeed.runtime.distributed.comm_backend.base import CommBackend, Group
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -100,6 +97,8 @@ class TritonAllReduceBackend(CommBackend):
         op=None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         if not isinstance(tensor, torch.Tensor):
+            if self.can_reduce_outputs(tensor, group, op=op):
+                return all_reduce_symmetric(self._instances[group], tensor)
             return super().all_reduce(tensor, group, op=op)
 
         state = self._get_or_create(group)
@@ -107,30 +106,25 @@ class TritonAllReduceBackend(CommBackend):
             return all_reduce(state, tensor, op=op)
         return self._fallback.all_reduce(tensor, group, op=op)
 
-    def plan_all_reduce(
+    def acquire_all_reduce_outputs(
         self,
         shapes: tuple[tuple[int, ...], ...],
         like: torch.Tensor,
         group: Group,
         op=None,
-    ) -> AllReducePlan:
-        """Acquire symmetric outputs and defer their Iris reduction."""
-        if not self.can_plan_all_reduce(shapes, like, group, op=op):
-            return super().plan_all_reduce(shapes, like, group, op=op)
+    ) -> tuple[torch.Tensor, ...]:
+        """Acquire symmetric outputs when Iris supports the request."""
+        if not self.can_acquire_outputs(shapes, like, group, op=op):
+            return super().acquire_all_reduce_outputs(shapes, like, group, op=op)
 
         state = self._get_or_create(group)
-        outputs = all_reduce_staging(
+        return acquire_symm_outputs(
             state,
             shapes,
             like.dtype,
         )
 
-        def reduce() -> tuple[torch.Tensor, ...]:
-            return all_reduce_symmetric(state, outputs)
-
-        return AllReducePlan(outputs, reduce)
-
-    def can_plan_all_reduce(
+    def can_acquire_outputs(
         self,
         shapes: tuple[tuple[int, ...], ...],
         like: torch.Tensor,
@@ -141,7 +135,17 @@ class TritonAllReduceBackend(CommBackend):
         if not current_platform().is_cdna4 or not like.is_cuda:
             return False
         state = self._get_or_create(group)
-        return all_reduce_staging_can_run(state, shapes, like.dtype, op=op)
+        return symm_outputs_can_run(state, shapes, like.dtype, op=op)
+
+    def can_reduce_outputs(
+        self,
+        tensors: tuple[torch.Tensor, ...],
+        group: Group,
+        op=None,
+    ) -> bool:
+        """Check whether tensors are this group's symmetric outputs."""
+        state = self._instances.get(group)
+        return state is not None and all_reduce_symm_can_run(state, tensors, op=op)
 
     def all_gather(
         self, tensor: torch.Tensor, group: Group, dim: int = 0

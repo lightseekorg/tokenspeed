@@ -21,29 +21,10 @@
 """Abstract base class for communication backends."""
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable
-from dataclasses import dataclass
 
 import torch
 
 from tokenspeed.runtime.distributed.mapping import Group
-
-
-@dataclass(frozen=True)
-class AllReducePlan:
-    """Writable producer outputs with a deferred all-reduce.
-
-    Creating a plan only acquires the output buffers and binds the backend's
-    reduction strategy; it does not launch a collective. The producer writes
-    into ``outputs`` first, then calls ``execute_all_reduce`` to reduce them.
-    """
-
-    outputs: tuple[torch.Tensor, ...]
-    _reduce: Callable[[], tuple[torch.Tensor, ...]]
-
-    def execute_all_reduce(self) -> tuple[torch.Tensor, ...]:
-        """Run the reduction after the producer has filled ``outputs``."""
-        return self._reduce()
 
 
 class CommBackend(ABC):
@@ -75,20 +56,14 @@ class CommBackend(ABC):
 
         return False
 
-    def plan_all_reduce(
+    def acquire_all_reduce_outputs(
         self,
         shapes: tuple[tuple[int, ...], ...],
         like: torch.Tensor,
         group: Group,
         op=None,
-    ) -> AllReducePlan:
-        """Plan producer-direct outputs and their deferred all-reduce.
-
-        Planning does not communicate. It allocates ordinary output tensors,
-        or lets an overriding backend acquire suitable staging buffers, and
-        returns them in ``AllReducePlan.outputs``. After a producer fills the
-        outputs, ``AllReducePlan.execute_all_reduce`` launches the bound
-        reduction strategy.
+    ) -> tuple[torch.Tensor, ...]:
+        """Acquire writable outputs for a later all-reduce.
 
         Args:
             shapes: Shapes of the outputs the producer will write.
@@ -97,18 +72,11 @@ class CommBackend(ABC):
             op: Reduction operation.
 
         Returns:
-            Writable outputs and their deferred reduction operation.
+            Writable outputs accepted by ``all_reduce`` after production.
         """
         if not shapes:
-            raise ValueError("all-reduce plan requires at least one output")
-        outputs = tuple(like.new_empty(shape) for shape in shapes)
-
-        def reduce() -> tuple[torch.Tensor, ...]:
-            reduced = self.all_reduce(outputs, group, op=op)
-            assert isinstance(reduced, tuple)
-            return reduced
-
-        return AllReducePlan(outputs, reduce)
+            raise ValueError("all-reduce requires at least one output")
+        return tuple(like.new_empty(shape) for shape in shapes)
 
     @abstractmethod
     def all_gather(

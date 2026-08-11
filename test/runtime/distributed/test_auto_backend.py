@@ -22,7 +22,8 @@ def backend(monkeypatch):
     monkeypatch.setattr(instance, "_trtllm_ar", Mock())
     monkeypatch.setattr(instance, "_triton_ar", Mock())
     instance._triton_ar.producer_direct_max_bytes = 1024 * 1024
-    instance._triton_ar.can_plan_all_reduce.return_value = True
+    instance._triton_ar.can_acquire_outputs.return_value = True
+    instance._triton_ar.can_reduce_outputs.return_value = False
     return instance
 
 
@@ -120,7 +121,7 @@ def test_triton_collection_fallback_reduces_each_tensor(monkeypatch):
     )
 
 
-def test_triton_plan_does_not_initialize_iris_off_cdna4(monkeypatch):
+def test_triton_output_acquisition_does_not_initialize_iris_off_cdna4(monkeypatch):
     fallback = Mock()
     backend = TritonAllReduceBackend(fallback)
     get_or_create = Mock(side_effect=AssertionError("must not initialize Iris"))
@@ -131,9 +132,9 @@ def test_triton_plan_does_not_initialize_iris_off_cdna4(monkeypatch):
         lambda: SimpleNamespace(is_cdna4=False),
     )
 
-    plan = backend.plan_all_reduce(((2, 4),), torch.empty(2, 4), (0, 1))
+    outputs = backend.acquire_all_reduce_outputs(((2, 4),), torch.empty(2, 4), (0, 1))
 
-    assert tuple(output.shape for output in plan.outputs) == ((2, 4),)
+    assert tuple(output.shape for output in outputs) == ((2, 4),)
     get_or_create.assert_not_called()
 
 
@@ -170,43 +171,46 @@ def test_amd_collection_past_iris_capacity_uses_grouped_rccl(
     backend._nccl.all_reduce_two.assert_called_once_with(*tensors, group, op=None)
 
 
-def test_plan_all_reduce_uses_triton(backend, monkeypatch):
+def test_acquire_all_reduce_outputs_uses_triton(backend, monkeypatch):
     monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", False)
     monkeypatch.setitem(global_server_args_dict, "mapping", None)
     backend._trtllm_ar.has_trtllm_ar.return_value = False
-    backend._triton_ar.plan_all_reduce.return_value = "plan"
+    expected = (torch.empty(1, 7168), torch.empty(1, 3584))
+    backend._triton_ar.acquire_all_reduce_outputs.return_value = expected
     like = torch.empty(1, 3584, dtype=torch.bfloat16)
     shapes = ((1, 7168), (1, 3584))
 
-    result = backend.plan_all_reduce(shapes, like, (0, 1))
+    result = backend.acquire_all_reduce_outputs(shapes, like, (0, 1))
 
-    assert result == "plan"
-    backend._triton_ar.plan_all_reduce.assert_called_once_with(
+    assert result is expected
+    backend._triton_ar.acquire_all_reduce_outputs.assert_called_once_with(
         shapes, like, (0, 1), op=None
     )
-    backend._triton_ar.can_plan_all_reduce.assert_called_once_with(
+    backend._triton_ar.can_acquire_outputs.assert_called_once_with(
         shapes, like, (0, 1), op=None
     )
 
 
-def test_plan_all_reduce_amd_uses_base_when_iris_is_ineligible(
+def test_acquire_all_reduce_outputs_amd_uses_base_when_iris_is_ineligible(
     backend,
     monkeypatch,
 ):
     monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", False)
     monkeypatch.setitem(global_server_args_dict, "mapping", None)
     backend._trtllm_ar.has_trtllm_ar.return_value = False
-    backend._triton_ar.can_plan_all_reduce.return_value = False
+    backend._triton_ar.can_acquire_outputs.return_value = False
     like = torch.empty(1, 3584, dtype=torch.bfloat16)
     shapes = ((1, 7168), (1, 3584))
 
-    result = backend.plan_all_reduce(shapes, like, (0, 1))
+    result = backend.acquire_all_reduce_outputs(shapes, like, (0, 1))
 
-    assert tuple(output.shape for output in result.outputs) == shapes
-    backend._triton_ar.plan_all_reduce.assert_not_called()
+    assert tuple(output.shape for output in result) == shapes
+    backend._triton_ar.acquire_all_reduce_outputs.assert_not_called()
 
 
-def test_plan_all_reduce_non_amd_keeps_existing_delegation(backend, monkeypatch):
+def test_acquire_all_reduce_outputs_non_amd_keeps_existing_delegation(
+    backend, monkeypatch
+):
     monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", False)
     monkeypatch.setitem(global_server_args_dict, "mapping", None)
     monkeypatch.setattr(
@@ -214,25 +218,53 @@ def test_plan_all_reduce_non_amd_keeps_existing_delegation(backend, monkeypatch)
         lambda: SimpleNamespace(is_amd=False),
     )
     backend._trtllm_ar.has_trtllm_ar.return_value = False
-    backend._triton_ar.plan_all_reduce.return_value = "plan"
+    expected = (torch.empty(1, 7168), torch.empty(1, 3584))
+    backend._triton_ar.acquire_all_reduce_outputs.return_value = expected
     like = torch.empty(1, 3584, dtype=torch.bfloat16)
     shapes = ((1, 7168), (1, 3584))
 
-    assert backend.plan_all_reduce(shapes, like, (0, 1)) == "plan"
-    backend._triton_ar.plan_all_reduce.assert_called_once_with(
+    assert backend.acquire_all_reduce_outputs(shapes, like, (0, 1)) is expected
+    backend._triton_ar.acquire_all_reduce_outputs.assert_called_once_with(
         shapes, like, (0, 1), op=None
     )
-    backend._triton_ar.can_plan_all_reduce.assert_not_called()
+    backend._triton_ar.can_acquire_outputs.assert_not_called()
 
 
-def test_plan_all_reduce_preserves_trtllm(backend, monkeypatch):
+def test_acquire_all_reduce_outputs_preserves_trtllm(backend, monkeypatch):
     monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", False)
     monkeypatch.setitem(global_server_args_dict, "mapping", None)
     backend._trtllm_ar.has_trtllm_ar.return_value = True
     like = torch.empty(1, 3584, dtype=torch.bfloat16)
     shapes = ((1, 7168), (1, 3584))
 
-    result = backend.plan_all_reduce(shapes, like, (0, 1))
+    result = backend.acquire_all_reduce_outputs(shapes, like, (0, 1))
 
-    assert tuple(output.shape for output in result.outputs) == shapes
-    backend._triton_ar.plan_all_reduce.assert_not_called()
+    assert tuple(output.shape for output in result) == shapes
+    backend._triton_ar.acquire_all_reduce_outputs.assert_not_called()
+
+
+def test_symmetric_outputs_route_back_to_triton(backend, monkeypatch):
+    monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", False)
+    backend._triton_ar.can_reduce_outputs.return_value = True
+    outputs = (torch.empty(1, 4), torch.empty(1, 8))
+    backend._triton_ar.all_reduce.return_value = outputs
+
+    assert backend.all_reduce(outputs, (0, 1)) is outputs
+    backend._triton_ar.all_reduce.assert_called_once_with(outputs, (0, 1), op=None)
+    backend._nccl.all_reduce.assert_not_called()
+
+
+def test_non_amd_collections_do_not_probe_symmetric_outputs(backend, monkeypatch):
+    monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", False)
+    monkeypatch.setattr(
+        "tokenspeed.runtime.distributed.comm_backend.auto.current_platform",
+        lambda: SimpleNamespace(is_amd=False),
+    )
+    backend._trtllm_ar.has_trtllm_ar.return_value = False
+    backend._triton_ar.can_run.return_value = False
+    tensors = (torch.empty(1, 4), torch.empty(1, 8))
+
+    backend.all_reduce(tensors, (0, 1))
+
+    backend._triton_ar.can_reduce_outputs.assert_not_called()
+    assert backend._nccl.all_reduce.call_count == 2

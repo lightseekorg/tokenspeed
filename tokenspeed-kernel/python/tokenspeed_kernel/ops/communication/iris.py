@@ -68,7 +68,7 @@ __all__ = [
     "IrisAllReduceResidualRMSNorm",
     "create_iris_state",
     "iris_all_reduce",
-    "iris_all_reduce_staging",
+    "iris_acquire_outputs",
     "iris_all_reduce_symmetric",
     "create_iris_rsag_state",
     "create_iris_ar_rmsnorm_state",
@@ -447,40 +447,41 @@ class IrisAllReduce(object):
             offset += numel
         return tuple(views)
 
-    def staging(
+    def acquire_outputs(
         self,
         shapes: tuple[tuple[int, ...], ...],
     ) -> tuple[torch.Tensor, ...]:
         """Return consecutive views of the symmetric Iris input buffer."""
         if not shapes or any(math.prod(shape) <= 0 for shape in shapes):
-            raise ValueError("Iris staging requires non-empty output shapes")
+            raise ValueError("Iris requires non-empty symmetric output shapes")
         if sum(math.prod(shape) for shape in shapes) > self.max_numel:
-            raise ValueError("Iris staging views exceed the input buffer")
+            raise ValueError("Iris symmetric outputs exceed the input buffer")
         return self._views(self._input_buf, shapes)
 
-    def _is_symmetric_staging(self, tensors: tuple[torch.Tensor, ...]) -> bool:
+    def owns_outputs(self, tensors: tuple[torch.Tensor, ...]) -> bool:
+        """Whether tensors are consecutive views of this symmetric buffer."""
+        if not tensors or any(
+            tensor.dtype != self.dtype
+            or tensor.device != self.device
+            or not tensor.is_contiguous()
+            or tensor.numel() <= 0
+            for tensor in tensors
+        ):
+            return False
         element_size = self._input_buf.element_size()
         offset = 0
         for tensor in tensors:
             if tensor.data_ptr() != self._input_buf.data_ptr() + offset * element_size:
                 return False
             offset += tensor.numel()
-        return True
+        return offset % 4 == 0 and offset <= self.max_numel
 
     def all_reduce_symmetric(
         self, tensors: tuple[torch.Tensor, ...]
     ) -> tuple[torch.Tensor, ...]:
         """Reduce consecutive producer outputs from symmetric memory."""
-        assert tensors and self._is_symmetric_staging(tensors)
-        assert all(
-            tensor.dtype == self.dtype
-            and tensor.device == self.device
-            and tensor.is_contiguous()
-            and tensor.numel() > 0
-            for tensor in tensors
-        )
+        assert self.owns_outputs(tensors)
         total_numel = sum(tensor.numel() for tensor in tensors)
-        assert total_numel % 4 == 0 and total_numel <= self.max_numel
         num_tiles = triton.cdiv(total_numel, self._producer_direct_block_size)
         num_programs = min(num_tiles, self._producer_direct_max_programs)
         outputs = self._views(
@@ -1085,12 +1086,12 @@ def iris_all_reduce(
     return state.all_reduce(tensor, op=op, safe=safe, async_op=async_op)
 
 
-def iris_all_reduce_staging(
+def iris_acquire_outputs(
     state: "IrisAllReduce",
     shapes: tuple[tuple[int, ...], ...],
 ) -> tuple[torch.Tensor, ...]:
     """Return consecutive symmetric producer-output views for Iris."""
-    return state.staging(shapes)
+    return state.acquire_outputs(shapes)
 
 
 def iris_all_reduce_symmetric(

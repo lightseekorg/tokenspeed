@@ -50,7 +50,6 @@ from tokenspeed.runtime.distributed.comm_backend import (
     Group,
     get_global_backend,
 )
-from tokenspeed.runtime.distributed.comm_backend.base import AllReducePlan
 
 # Re-exported for reduce-strategy callers (e.g. kimi3_join_reduce_moe):
 # tensors past the one-shot admission window always take an NCCL path.
@@ -198,22 +197,21 @@ def all_reduce_latent_norm(
     )
 
 
-def plan_all_reduce(
+def acquire_all_reduce_outputs(
     shapes: tuple[tuple[int, ...], ...],
     like: torch.Tensor,
     group: Group,
     backend: CommBackend | None = None,
     op: torch.distributed.ReduceOp = torch.distributed.ReduceOp.SUM,
-) -> AllReducePlan:
-    """Return writable producer outputs with a deferred all-reduce.
+) -> tuple[torch.Tensor, ...]:
+    """Acquire writable producer outputs for a later all-reduce.
 
-    This function does not launch a collective. Fill ``plan.outputs`` first,
-    then call ``plan.execute_all_reduce()`` to run the backend-selected
-    reduction.
+    This function does not launch a collective. Fill the returned outputs,
+    then pass them to ``all_reduce``.
     """
     if backend is None:
         backend = get_global_backend()
-    return backend.plan_all_reduce(shapes, like, group, op=op)
+    return backend.acquire_all_reduce_outputs(shapes, like, group, op=op)
 
 
 def all_gather(

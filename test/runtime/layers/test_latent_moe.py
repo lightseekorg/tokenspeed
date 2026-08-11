@@ -217,7 +217,7 @@ def test_kimi3_join_reduce_moe_grouped_reduce_for_large_partials(
     torch.testing.assert_close(shared, shared_partial + 20)
 
 
-def test_latent_expert_shared_owns_output_plan_and_reduction(
+def test_latent_expert_shared_acquires_outputs_and_reduces(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     hidden_states = torch.empty(2, 3)
@@ -225,21 +225,26 @@ def test_latent_expert_shared_owns_output_plan_and_reduction(
     routed_staging = torch.empty(2, 3)
     reduced_shared = torch.full_like(shared_staging, 7)
     reduced_routed = torch.full_like(routed_staging, 11)
-    plan = mock.Mock(outputs=(shared_staging, routed_staging))
-    plan.execute_all_reduce.return_value = reduced_shared, reduced_routed
 
-    def fake_plan(shapes, like, group):
+    def fake_acquire(shapes, like, group):
         assert shapes == ((2, 5), (2, 3))
         assert like is hidden_states
         assert group == (0, 1)
-        return plan
+        return shared_staging, routed_staging
+
+    def fake_all_reduce(outputs, group):
+        assert outputs[0] is shared_staging
+        assert outputs[1] is routed_staging
+        assert group == (0, 1)
+        return reduced_shared, reduced_routed
 
     def fake_producer(*_args, routed_out, shared_out, **_kwargs):
         assert routed_out is routed_staging
         assert shared_out is shared_staging
         return routed_out, shared_out
 
-    monkeypatch.setattr(latent_module, "plan_all_reduce", fake_plan)
+    monkeypatch.setattr(latent_module, "acquire_all_reduce_outputs", fake_acquire)
+    monkeypatch.setattr(latent_module, "all_reduce", fake_all_reduce)
     monkeypatch.setattr(latent_module, "latent_moe_expert_shared", fake_producer)
     placeholder = torch.empty(1)
 
@@ -464,23 +469,30 @@ def test_latent_moe_rejects_input_projections_without_shared_experts() -> None:
         _layer(input_projections=lambda hidden_states, shared_out: None)
 
 
-def test_latent_moe_plans_shared_and_routed_outputs() -> None:
-    plans = []
+def test_latent_moe_acquires_shared_and_routed_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    acquisitions = []
 
-    def joint_plan(shapes, like):
+    def acquire_outputs(shapes, like, group):
+        assert group == (0,)
         outputs = tuple(like.new_empty(shape) for shape in shapes)
-        plan = mock.Mock(outputs=outputs)
-        plan.execute_all_reduce.side_effect = lambda: (
-            outputs[0] + 5,
-            outputs[1] * 2,
-        )
-        plans.append(plan)
-        return plan
+        acquisitions.append(outputs)
+        return outputs
+
+    def reduce_outputs(outputs, group):
+        assert outputs is acquisitions[0]
+        assert group == (0,)
+        return outputs[0] + 5, outputs[1] * 2
+
+    monkeypatch.setattr(latent_module, "acquire_all_reduce_outputs", acquire_outputs)
+    monkeypatch.setattr(latent_module, "all_reduce", reduce_outputs)
 
     layer = _layer(
         routed_norm=_Norm(),
         shared_experts=_Shared(),
-        joint_plan=joint_plan,
+        joint_reduce=True,
+        expert_parallel_group=(0,),
     )
     hidden_states = torch.arange(12, dtype=torch.float32).view(3, 4)
 
@@ -490,8 +502,7 @@ def test_latent_moe_plans_shared_and_routed_outputs() -> None:
     routed = torch.cat((latent, torch.zeros_like(latent)), dim=-1)
     expected = routed + hidden_states * 4 + 5
     torch.testing.assert_close(actual, expected)
-    assert len(plans) == 1
-    plans[0].execute_all_reduce.assert_called_once_with()
+    assert len(acquisitions) == 1
 
 
 def test_latent_moe_can_return_separate_residual_components() -> None:
@@ -584,11 +595,12 @@ def test_latent_moe_prefix_requires_shared_experts() -> None:
 
 
 def test_latent_moe_rejects_joint_and_individual_reducers() -> None:
-    with pytest.raises(ValueError, match="joint_plan cannot be combined"):
+    with pytest.raises(ValueError, match="joint_reduce cannot be combined"):
         _layer(
             shared_experts=_Shared(),
             latent_reduce=lambda x: x,
-            joint_plan=lambda shapes, like: None,
+            joint_reduce=True,
+            expert_parallel_group=(0,),
         )
 
 

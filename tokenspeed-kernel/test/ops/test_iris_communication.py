@@ -83,7 +83,7 @@ def test_producer_direct_admission_supported_world_sizes(
     )
     state = SimpleNamespace(world_size=world_size, max_numel=32)
 
-    assert triton_ops.all_reduce_staging_can_run(
+    assert triton_ops.symm_outputs_can_run(
         state,
         ((3, 5), (1, 1)),
         dtype,
@@ -116,7 +116,7 @@ def test_producer_direct_admission_rejects_unsupported_requests(
     )
     state = SimpleNamespace(world_size=world_size, max_numel=32)
 
-    assert not triton_ops.all_reduce_staging_can_run(state, shapes, dtype, op)
+    assert not triton_ops.symm_outputs_can_run(state, shapes, dtype, op)
 
 
 def test_producer_direct_admission_is_cdna4_only(monkeypatch):
@@ -129,7 +129,7 @@ def test_producer_direct_admission_is_cdna4_only(monkeypatch):
     )
     state = SimpleNamespace(world_size=8, max_numel=32)
 
-    assert not triton_ops.all_reduce_staging_can_run(
+    assert not triton_ops.symm_outputs_can_run(
         state,
         ((4,),),
         torch.bfloat16,
@@ -207,7 +207,7 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
         for shape in _ar_shape_cases():
             _check_all_reduce(state, rank, world_size, shape, device)
         for shapes in output_shape_cases:
-            _check_all_reduce_symmetric_staging(
+            _check_all_reduce_symmetric_outputs(
                 state,
                 rank,
                 world_size,
@@ -221,7 +221,7 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             max_numel=max_numel,
             dtype=torch.float16,
         )
-        _check_all_reduce_symmetric_staging(
+        _check_all_reduce_symmetric_outputs(
             fp16_state,
             rank,
             world_size,
@@ -250,7 +250,7 @@ def _check_all_reduce(state, rank: int, world_size: int, shape, device) -> None:
     torch.testing.assert_close(result, expected, atol=0, rtol=0)
 
 
-def _check_all_reduce_symmetric_staging(
+def _check_all_reduce_symmetric_outputs(
     state,
     rank: int,
     world_size: int,
@@ -258,11 +258,13 @@ def _check_all_reduce_symmetric_staging(
     device,
 ) -> None:
     from tokenspeed_kernel.ops.communication.iris import (
-        iris_all_reduce_staging,
+        iris_acquire_outputs,
         iris_all_reduce_symmetric,
     )
 
-    outputs = iris_all_reduce_staging(state, shapes)
+    outputs = iris_acquire_outputs(state, shapes)
+    assert state.owns_outputs(outputs)
+    assert not state.owns_outputs(tuple(torch.empty_like(output) for output in outputs))
     for index, output in enumerate(outputs, start=1):
         output.fill_(index * (rank + 1))
     results = iris_all_reduce_symmetric(state, outputs)
@@ -345,7 +347,7 @@ def _ar_subgroup_worker_fn(rank, world_size, port, error_dict):
             (4, 7),
             device,
         )
-        _check_all_reduce_symmetric_staging(
+        _check_all_reduce_symmetric_outputs(
             state,
             group_rank,
             len(groups[group_index]),
