@@ -132,6 +132,55 @@ class TestGatherPagedIndexerFp8Cache(unittest.TestCase):
         self.assertEqual(k_fp8.shape, (0, INDEX_HEAD_DIM))
         self.assertEqual(k_scale.shape, (0,))
 
+    def test_write_and_gather_on_strided_arena_view(self):
+        """The indexer cache is a strided field view of a larger LCM arena.
+
+        Regression: computing page * stride(0) offsets into reshape(-1) is
+        only valid on contiguous caches. On a strided view reshape(-1) copies
+        just the logical elements, so stride-based offsets read/write out of
+        bounds (crashed serving with a device-side IndexKernel assert).
+        """
+
+        torch.manual_seed(0)
+        device = torch.device("cuda")
+        pages = 7
+        row_bytes = BLOCK * ROW_BYTES
+        arena_stride = row_bytes + 1024  # field view narrower than the arena
+        arena = torch.zeros((pages, arena_stride), dtype=torch.uint8, device=device)
+        cache = arena[:, :row_bytes]
+        self.assertFalse(cache.is_contiguous())
+
+        n = 100
+        rows = torch.randn((n, INDEX_HEAD_DIM), device=device, dtype=torch.bfloat16)
+        # Use the highest pages so stride-based addressing would land far
+        # outside the logical view.
+        slots = torch.arange(
+            pages * BLOCK - n, pages * BLOCK, device=device, dtype=torch.int64
+        )
+        _write_deepseek_v4_indexer_fp8_cache_capturable(
+            rows,
+            cache,
+            slots,
+            torch.ones(n, dtype=torch.bool, device=device),
+            block_size=BLOCK,
+        )
+        # Bytes outside the field view must stay untouched.
+        self.assertEqual(int(arena[:, row_bytes:].sum()), 0)
+
+        reference = read_deepseek_v4_indexer_fp8_cache(cache, slots, block_size=BLOCK)
+        rel_err = (reference - rows.float()).abs().max() / rows.float().abs().max()
+        # fp8e4m3 with power-of-two row scales quantizes to ~2^-4 relative
+        # granularity near the top of a binade.
+        self.assertLess(float(rel_err), 0.07)
+
+        block_table = torch.arange(pages, device=device, dtype=torch.int32).view(1, -1)
+        cu_seq_lens = torch.tensor([0, pages * BLOCK], dtype=torch.int32, device=device)
+        k_fp8, k_scale = gather_paged_indexer_fp8_cache(
+            cache, block_table, cu_seq_lens, BLOCK
+        )
+        gathered = k_fp8[-n:].float() * k_scale[-n:].unsqueeze(1)
+        torch.testing.assert_close(gathered, reference, rtol=0, atol=0)
+
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
 class TestPrepareIndexerQFp8(unittest.TestCase):
